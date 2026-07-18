@@ -941,6 +941,31 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
 const GREP_SKIP_DIRS: [&str; 5] = ["target", ".git", "node_modules", "data", ".terraform"];
 
 #[allow(clippy::too_many_arguments)]
+/// Python `Path.relative_to(root)` restricted to the grep_walk use:
+/// `path` is a FILE strictly below some walked dir, both inputs are
+/// pathlib-normalized. Pathlib compares PARTS, where the root part
+/// itself distinguishes `/` from the POSIX `//` root — a string
+/// `<root>/` prefix reproduces that exactly for a multi-component root
+/// (a normalized root never carries a trailing slash). The bare `/` and
+/// `//` roots are special-cased for totality: their string form IS the
+/// separator, and pathlib still refuses `/` vs `//` cross-root strips.
+fn py_relative_to(path: &Path, root: &Path) -> Option<String> {
+    let p = path.to_string_lossy();
+    let r = root.to_string_lossy();
+    if r == "/" {
+        let rest = p.strip_prefix('/')?;
+        if rest.starts_with('/') {
+            return None; // `//x` is NOT under the `/` root in pathlib
+        }
+        return Some(rest.to_string());
+    }
+    if r == "//" {
+        let rest = p.strip_prefix("//")?;
+        return Some(rest.to_string());
+    }
+    p.strip_prefix(&format!("{r}/")).map(str::to_string)
+}
+
 fn grep_walk(
     dir: &Path,
     root: &Path,
@@ -996,9 +1021,20 @@ fn grep_walk(
                 // Residual (ledger): CPython formats via repr(), which would
                 // escape a quote/control char inside a path — unreachable
                 // for real repo/fixture paths.
-                let rel = match path.strip_prefix(root) {
-                    Ok(p) => p.to_string_lossy().into_owned(),
-                    Err(_) => {
+                //
+                // PARITY (review r4 LOW-1): the check is a pathlib-PARTS
+                // string prefix, NOT Rust `strip_prefix` — Rust components
+                // collapse the POSIX `//` root into `/`, so a
+                // `//<root>/sub` path arg would strip successfully and
+                // fail OPEN (ok:true) where CPython raises ('//' and '/'
+                // are DIFFERENT root parts to pathlib). Both sides of the
+                // comparison are pathlib-normalized already (search_root
+                // via pathlib_lexical; repo root at config load), so a
+                // plain `<root>/` string prefix is exactly pathlib's
+                // parts-prefix rule for a multi-component root.
+                let rel = match py_relative_to(&path, root) {
+                    Some(p) => p,
+                    None => {
                         return Err(format!(
                             "'{}' is not in the subpath of '{}' OR one path is relative and the other is absolute.",
                             path.display(),
@@ -1974,6 +2010,41 @@ mod tests {
         assert_eq!(ok["ok"], json!(true));
         assert_eq!(ok["match_count"], json!(0));
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn grep_double_slash_root_path_errors_like_pathlib() {
+        // Review r4 LOW-1: pathlib treats the POSIX `//` root as a
+        // DIFFERENT root part from `/`, so `path="//<root>/sub"` is NOT
+        // in the subpath of `/<root>` — CPython raises the -32000
+        // ValueError on the first match. Rust `strip_prefix` collapses
+        // `//` and would fail OPEN (ok:true); the pathlib-parts
+        // `py_relative_to` must error with the `//`-quoted text.
+        let base = std::env::temp_dir().join(format!("tv-mcp-grepds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub").join("f.txt"), "GREP_DS_NEEDLE\n").unwrap();
+        let ctx = Ctx {
+            repo_root: base.clone(),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let double = format!("/{}/sub", base.display()); // "//tmp/.../sub"
+        let err = tool_grep_codebase(&ctx, "GREP_DS_NEEDLE", Some(&double), None).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "'{double}/f.txt' is not in the subpath of '{}' OR one path is relative and the other is absolute.",
+                base.display()
+            )
+        );
+        // Sanity: the error text really carries the preserved `//` root.
+        assert!(err.starts_with("'//"), "{err}");
+        // No match under the `//` root => relative_to never runs => ok
+        // empty on BOTH sides.
+        let ok = tool_grep_codebase(&ctx, "NO_SUCH_NEEDLE_DS", Some(&double), None).unwrap();
+        assert_eq!(ok["ok"], json!(true));
+        assert_eq!(ok["match_count"], json!(0));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

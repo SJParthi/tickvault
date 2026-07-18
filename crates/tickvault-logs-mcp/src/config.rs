@@ -146,14 +146,37 @@ pub fn endpoint_url(
 /// behavior: `.` components are dropped (`Path("a/./b")` == `Path("a/b")`,
 /// `Path("")` == `Path(".")`), while `..` is KEPT verbatim — pathlib
 /// pure-path construction/joins never resolve parent components. Purely
-/// lexical: no filesystem access, no symlink/canonicalization. (Accepted
-/// unreachable edge: POSIX's special `//`-root, which pathlib preserves,
-/// collapses to `/` here — no config/env value can legitimately carry it.)
+/// lexical: no filesystem access, no symlink/canonicalization.
+///
+/// POSIX `//`-root (review r4 LOW-1): pathlib preserves EXACTLY two
+/// leading slashes (POSIX grants `//` implementation-defined meaning);
+/// one or three-plus collapse to a single `/`, and interior runs always
+/// collapse. Verified live on the box python:
+/// `PurePosixPath('//a/b')` -> `//a/b`, `'///a/b'` -> `/a/b`,
+/// `'/a//b'` -> `/a/b`, `'//'` -> `//`, `'///'` -> `/`. Rust's
+/// `components()` collapses ALL leading slashes to one RootDir, so the
+/// double-slash root is re-attached from the raw byte prefix. This fn
+/// processes ARG-derived paths (grep_codebase `path`, app_log_tail date
+/// join) since review r3, so the edge is client-reachable, not just
+/// config/env-reachable.
 pub(crate) fn pathlib_lexical(path: &Path) -> PathBuf {
+    let leading_slashes = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .take_while(|&&b| b == b'/')
+        .count();
     let out: PathBuf = path
         .components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
         .collect();
+    if leading_slashes == 2 {
+        // `out` starts with the single collapsed `/` root; prepend one
+        // more to restore pathlib's preserved `//` root.
+        let mut s = std::ffi::OsString::from("/");
+        s.push(out.as_os_str());
+        return PathBuf::from(s);
+    }
     if out.as_os_str().is_empty() {
         PathBuf::from(".")
     } else {
@@ -538,6 +561,38 @@ mod tests {
         assert_eq!(
             pathlib_lexical(Path::new("./data/logs")),
             PathBuf::from("data/logs")
+        );
+    }
+
+    #[test]
+    fn pathlib_lexical_preserves_double_slash_root_like_pathlib() {
+        // Review r4 LOW-1. Verified live on the box python:
+        //   PurePosixPath('//a/b')   -> //a/b   (exactly-2 root preserved)
+        //   PurePosixPath('///a/b')  -> /a/b    (>=3 collapse)
+        //   PurePosixPath('/a//b')   -> /a/b    (interior runs collapse)
+        //   PurePosixPath('//')      -> //
+        //   PurePosixPath('///')     -> /
+        //   PurePosixPath('//a//b//')-> //a/b
+        //   PurePosixPath('////a')   -> /a
+        assert_eq!(pathlib_lexical(Path::new("//a/b")), PathBuf::from("//a/b"));
+        assert_eq!(pathlib_lexical(Path::new("///a/b")), PathBuf::from("/a/b"));
+        assert_eq!(pathlib_lexical(Path::new("/a//b")), PathBuf::from("/a/b"));
+        assert_eq!(pathlib_lexical(Path::new("//")), PathBuf::from("//"));
+        assert_eq!(pathlib_lexical(Path::new("///")), PathBuf::from("/"));
+        assert_eq!(
+            pathlib_lexical(Path::new("//a//b//")),
+            PathBuf::from("//a/b")
+        );
+        assert_eq!(pathlib_lexical(Path::new("////a")), PathBuf::from("/a"));
+        // PathBuf equality is component-wise and Rust collapses `//`, so
+        // the asserts above could pass vacuously — pin the raw strings.
+        assert_eq!(
+            pathlib_lexical(Path::new("//a/b")).as_os_str(),
+            std::ffi::OsStr::new("//a/b")
+        );
+        assert_eq!(
+            pathlib_lexical(Path::new("///a/b")).as_os_str(),
+            std::ffi::OsStr::new("/a/b")
         );
     }
 

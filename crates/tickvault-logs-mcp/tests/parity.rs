@@ -630,6 +630,18 @@ fn parity_transcript() {
                 "path": fixture_root.join("outside-grep").to_string_lossy(),
             }),
         );
+        // Review r4 LOW-1: a `//`-prefixed absolute path — pathlib
+        // PRESERVES the exactly-two-slash POSIX root, so both sides must
+        // quote the '//tmp/...' form in the -32000 ValueError text
+        // byte-for-byte (rust previously collapsed it to '/tmp/...').
+        s.call(
+            "grep_codebase",
+            "double-slash-root outside path → `//`-quoted ValueError parity",
+            json!({
+                "pattern": "TV_PARITY_OUTSIDE_NEEDLE",
+                "path": format!("/{}", fixture_root.join("outside-grep").display()),
+            }),
+        );
         s.call("run_doctor", "bash shim", json!({}));
         s.call("git_recent_log", "limit=3 (real git)", json!({"limit": 3}));
         s.call(

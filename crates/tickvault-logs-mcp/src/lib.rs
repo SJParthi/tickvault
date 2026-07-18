@@ -41,12 +41,28 @@
 //!     CPython 3.11 `Path.relative_to` ValueError text through the
 //!     -32000 `tool grep_codebase failed: ...` wrap (previously ok:true
 //!     with lossy absolute paths — a success-vs-error class divergence).
-//!     Residual: the replicated text quotes both paths with plain single
-//!     quotes; CPython uses repr(), which would escape a quote/control
-//!     character inside a path — unreachable for real repo/fixture paths.
+//!     Since review r4 (2026-07-18) the POSIX `//`-root is also
+//!     parity-matched: pathlib_lexical preserves an exactly-two-slash
+//!     root (pathlib rule) and the rel computation compares pathlib
+//!     PARTS, so `path="//<root>/sub"` errors like CPython ('//' and
+//!     '/' are different root parts) instead of failing open, and a
+//!     `//`-prefixed outside path quotes the `//` form byte-for-byte.
+//!     Residuals (exact list):
+//!       1. Quoting: the replicated text uses plain single quotes;
+//!          CPython uses repr(), which would escape a quote/control
+//!          character inside a path — unreachable for real repo/fixture
+//!          paths.
+//!       2. NUL byte in the `path` arg (review r4, 2026-07-18):
+//!          adversarial-client-only input. CPython raises -32000
+//!          "embedded null byte" at os.walk/open; Rust's read_dir Err is
+//!          swallowed by the walk's `else return Ok(())` arm, answering
+//!          ok:true with 0 matches. Divergence class: ok-empty-vs-error,
+//!          rust in the FAIL-SAFE direction (empty result, no error text,
+//!          no data exposure). Deliberately unchanged.
 //!   - app_log_tail `date` echoes: PARITY-MATCHED since review r3 — the
-//!     joined log path is pathlib-normalized (`.` components dropped),
-//!     so a dotted date like "x/./y" echoes `app.x/y.log` on both sides
+//!     joined log path is pathlib-normalized (`.` components dropped;
+//!     since review r4 the `//`-root rule matches pathlib too), so a
+//!     dotted date like "x/./y" echoes `app.x/y.log` on both sides
 //!     byte-for-byte. No residual.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
