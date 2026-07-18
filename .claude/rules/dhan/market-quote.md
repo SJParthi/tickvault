@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/api/src/handlers/quote.rs"
+  - "crates/core/src/quote/*.rs"
+  - "crates/trading/src/oms/market_data.rs"
+---
+
 # Dhan Market Quote REST Enforcement
 
 > **Ground truth:** `docs/dhan-ref/11-market-quote-rest.md`

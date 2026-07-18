@@ -1,3 +1,17 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/instrument/depth_dynamic_top_volume_selector.rs"
+  - "crates/app/src/depth_dynamic_pipeline_v2.rs"
+  - "crates/core/src/instrument/subscription_planner.rs"
+  - "crates/app/src/main.rs"
+  - "crates/core/src/pipeline/volume_monotonicity_guard.rs"
+  - "crates/core/src/parser/quote.rs"
+  - "crates/app/src/boot_smoke_test.rs"
+  - "crates/core/src/instrument/phase2_readiness_check.rs"
+  - "crates/core/src/notification/events.rs"
+---
+
 # Wave 5 Error Codes
 
 > **Authority:** This file is the runbook target for the four ErrorCode

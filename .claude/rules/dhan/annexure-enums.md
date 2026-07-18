@@ -1,3 +1,21 @@
+---
+paths:
+  - "crates/common/src/types.rs"
+  - "crates/common/src/order_types.rs"
+  - "crates/common/src/instrument_types.rs"
+  - "crates/common/src/constants.rs"
+  - "crates/common/src/error.rs"
+  - "crates/common/src/segment.rs"
+  - "crates/core/src/parser/types.rs"
+  - "crates/core/src/parser/disconnect.rs"
+  - "crates/core/src/websocket/types.rs"
+  - "crates/trading/src/oms/rate_limiter.rs"
+  - "crates/trading/src/oms/api_client.rs"
+  - "crates/trading/tests/gap_enforcement.rs"
+  - "crates/core/tests/gap_enforcement.rs"
+  - "crates/common/tests/schema_validation.rs"
+---
+
 # Dhan Annexure & Enums Enforcement
 
 > **Ground truth:** `docs/dhan-ref/08-annexure-enums.md`
