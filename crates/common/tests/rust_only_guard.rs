@@ -21,12 +21,15 @@
 //!
 //! HONEST LIMITATIONS (house source-scan conventions — stated, not hidden):
 //! - Comment awareness is LINE-level only: a line whose first non-whitespace
-//!   char is `#` is skipped. A trailing same-line comment (`cmd  # python`)
-//!   on a code line COUNTS as a hit; heredoc bodies and yml block scalars are
-//!   scanned as ordinary lines. Prose mentions of "python" inside string
-//!   literals of scanned file types therefore count — deliberate fail-loud
-//!   direction (a false positive is a visible allowlist edit, never a silent
-//!   miss).
+//!   char is `#` is skipped — EXCEPT a shebang (`#!...`), which is executable
+//!   interpreter selection, not a comment, and is scanned like any code line
+//!   (hostile review round 2: a pure-python file whose only python token was
+//!   `#!/usr/bin/env python3` previously passed GREEN). A trailing same-line
+//!   comment (`cmd  # python`) on a code line COUNTS as a hit; heredoc bodies
+//!   and yml block scalars are scanned as ordinary lines. Prose mentions of
+//!   "python" inside string literals of scanned file types therefore count —
+//!   deliberate fail-loud direction (a false positive is a visible allowlist
+//!   edit, never a silent miss).
 //! - The invocation allowlist is FILE-level: an already-allowlisted file can
 //!   gain an additional python invocation undetected until the file goes
 //!   fully clean (at which point the shrink rule forces its removal). Net
@@ -164,9 +167,14 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path.starts_with("scripts/git-hooks/")
 }
 
-/// Whole-line comment: first non-whitespace char is `#`.
+/// Whole-line comment: first non-whitespace char is `#` — but a shebang
+/// (`#!`) is NOT a comment: it selects the interpreter that EXECUTES the
+/// file, so it must be scanned for the python token like any code line
+/// (hostile review round 2, MED: `#!/usr/bin/env python3` previously
+/// slipped through as a "comment").
 fn is_comment_line(line: &str) -> bool {
-    line.trim_start().starts_with('#')
+    let t = line.trim_start();
+    t.starts_with('#') && !t.starts_with("#!")
 }
 
 /// Word-boundary match for `python` / `python[0-9]` (widened 2026-07-18 from
@@ -233,6 +241,29 @@ fn stale_invocation_sites(files: &[(String, String)], allowlist: &[&str]) -> Vec
         .collect()
 }
 
+/// Pure parse of `git ls-files -z` stdout: NUL-delimited bytes -> sorted
+/// path list. Extracted from the shell so the parse contract is
+/// unit-fixtured (hostile review round 2, LOW): trailing NUL never yields
+/// an empty entry, and a C-quoted (`"`-leading) path PANICS — with `-z`
+/// no path may ever arrive C-quoted; a leading `"` means the enumeration
+/// contract broke, and we fail LOUD rather than scan a mangled path list.
+fn parse_nul_delimited_paths(bytes: &[u8]) -> Vec<String> {
+    let mut files: Vec<String> = String::from_utf8_lossy(bytes)
+        .split('\0')
+        .map(str::to_string)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if let Some(quoted) = files.iter().find(|p| p.starts_with('"')) {
+        panic!(
+            "rust_only_guard: `git ls-files -z` returned a C-quoted path `{quoted}` — \
+             NUL-delimited enumeration must emit paths verbatim; refusing to scan a \
+             mangled path list"
+        );
+    }
+    files.sort();
+    files
+}
+
 fn assert_sorted_unique(allowlist: &[&str], name: &str) {
     for w in allowlist.windows(2) {
         assert!(
@@ -273,23 +304,9 @@ fn git_ls_files(pathspecs: &[&str]) -> Vec<String> {
         "rust_only_guard: `git ls-files` failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .split('\0')
-        .map(str::to_string)
-        .filter(|l| !l.is_empty())
-        .collect();
-    // Defense in depth: with `-z` no path may ever arrive C-quoted; a
-    // leading `"` means the enumeration contract broke — fail LOUD,
-    // never silently skip a mangled path.
-    if let Some(quoted) = files.iter().find(|p| p.starts_with('"')) {
-        panic!(
-            "rust_only_guard: `git ls-files -z` returned a C-quoted path `{quoted}` — \
-             NUL-delimited enumeration must emit paths verbatim; refusing to scan a \
-             mangled path list"
-        );
-    }
-    files.sort();
-    files
+    // Parse via the pure, self-tested NUL-parse core (fixtures in
+    // `guard_self_test` cover trailing-NUL + the C-quote fail-loud panic).
+    parse_nul_delimited_paths(&out.stdout)
 }
 
 /// All tracked invocation-scan targets, loaded as (path, content).
@@ -440,6 +457,45 @@ fn guard_self_test() {
     assert!(!content_has_python_invocation(commented_only));
     let live = "# header\npython3 scripts/x.py\n";
     assert!(content_has_python_invocation(live));
+
+    // Shebang rule (MED fix, 2026-07-18): `#!` is interpreter selection,
+    // NOT a comment — a python shebang alone must be a hit.
+    assert!(
+        !is_comment_line("#!/usr/bin/env python3"),
+        "a shebang line must not be treated as a comment"
+    );
+    assert!(
+        content_has_python_invocation("#!/usr/bin/env python3\nimport os\n"),
+        "a python shebang must be detected as an invocation"
+    );
+    assert!(
+        !content_has_python_invocation("#!/bin/bash\necho ok\n"),
+        "a bash shebang must not false-positive"
+    );
+    assert!(
+        !content_has_python_invocation("#!/usr/bin/env bash\necho ok\n# python3 in a comment\n"),
+        "ordinary `#` comment skipping must be unchanged by the shebang rule"
+    );
+
+    // NUL-parse fixtures (LOW fix, 2026-07-18): the pure `git ls-files -z`
+    // stdout parse. Normal NUL-joined input parses + sorts.
+    assert_eq!(
+        parse_nul_delimited_paths(b"b.sh\0a.sh"),
+        vec!["a.sh".to_string(), "b.sh".to_string()],
+        "NUL-joined input must parse and sort"
+    );
+    // Trailing NUL (git's actual output shape) yields NO empty entry.
+    assert_eq!(
+        parse_nul_delimited_paths(b"only.sh\0"),
+        vec!["only.sh".to_string()],
+        "trailing NUL must not produce an empty entry"
+    );
+    // A C-quoted (`"`-leading) entry breaks the -z contract and must PANIC.
+    assert!(
+        std::panic::catch_unwind(|| parse_nul_delimited_paths(b"\"mangled\\303\\244.sh\"\0"))
+            .is_err(),
+        "a C-quoted path must panic loudly, never be scanned"
+    );
 
     // New-site + stale-site detection over synthetic files.
     let files = vec![
