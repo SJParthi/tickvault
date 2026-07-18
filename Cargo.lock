@@ -4248,6 +4248,7 @@ name = "tickvault-aws-lambdas"
 version = "0.1.0"
 dependencies = [
  "aws-config",
+ "aws-lc-rs",
  "aws-sdk-cloudwatch",
  "aws-sdk-costexplorer",
  "aws-sdk-ec2",
@@ -4255,6 +4256,8 @@ dependencies = [
  "aws-sdk-ssm",
  "chrono",
  "lambda_runtime",
+ "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

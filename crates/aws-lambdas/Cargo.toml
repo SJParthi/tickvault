@@ -27,6 +27,14 @@ aws-sdk-ssm = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
 aws-sdk-cloudwatch = { workspace = true }
 aws-sdk-costexplorer = { workspace = true }
+# operator-control (phase 2b-3) extras — all pre-existing workspace pins:
+# aws-lc-rs (HMAC-SHA256 for the qdb console link token — the same crate the
+# workspace already pins for rustls/ed25519), regex (the python handler's
+# stdlib `re` gates: SQL LIMIT clamp + banned-keyword word boundaries),
+# reqwest (the GitHub main-HEAD provenance read — python used urllib).
+aws-lc-rs = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
 
 [[bin]]
 name = "budget-killswitch"
@@ -43,3 +51,7 @@ path = "src/bin/boot_heartbeat_gate.rs"
 [[bin]]
 name = "market-hours-liveness-gate"
 path = "src/bin/market_hours_liveness_gate.rs"
+
+[[bin]]
+name = "operator-control"
+path = "src/bin/operator_control.rs"

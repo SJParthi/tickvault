@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>tickvault — operator portal</title>
+<style>
+  :root{ color-scheme:dark; --bg:#070a12; --card:#111726cc; --line:#222c40; --txt:#e9eef7;
+         --mut:#8a93a6; --grn:#28d17c; --red:#ff5d6c; --amb:#f4b740; --blu:#4f8cff; --cyan:#38e1d6; }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; color:var(--txt);
+        min-height:100vh; padding:18px 14px 48px;
+        background:radial-gradient(1200px 600px at 10% -10%, #15233f55, transparent 60%),
+          radial-gradient(1000px 500px at 110% 0%, #1c2a1f55, transparent 55%),
+          linear-gradient(180deg,#070a12,#0a0f1c); background-attachment:fixed; }
+  .wrap{ max-width:920px; margin:0 auto; }
+  .hdr{ display:flex; align-items:center; gap:12px; margin-bottom:14px; }
+  .logo{ font-size:22px; font-weight:800; background:linear-gradient(90deg,#7fb2ff,#38e1d6,#28d17c);
+         -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .live{ display:flex; align-items:center; gap:7px; font-size:12px; color:var(--mut); margin-left:auto; }
+  .dot{ width:11px; height:11px; border-radius:50%; background:var(--red); }
+  .dot.on{ background:var(--grn); animation:pulse 1.6s infinite; }
+  @keyframes pulse{ 0%{box-shadow:0 0 0 0 #28d17caa} 70%{box-shadow:0 0 0 12px #28d17c00} 100%{box-shadow:0 0 0 0 #28d17c00} }
+  .tabs{ display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px; }
+  .tab{ padding:9px 14px; border-radius:11px; background:#0c1322; border:1px solid var(--line); color:var(--mut);
+        font-size:13px; font-weight:700; cursor:pointer; }
+  .tab.active{ color:#fff; background:linear-gradient(90deg,#1c3158,#163b39); border-color:#2f5fb0; }
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; margin-bottom:14px;
+         backdrop-filter:blur(6px); box-shadow:0 10px 30px #00000055; animation:rise .45s ease both; }
+  @keyframes rise{ from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none} }
+  .lbl{ font-size:11px; text-transform:uppercase; letter-spacing:1px; color:var(--mut); margin-bottom:12px; }
+  input,textarea{ width:100%; padding:12px; border-radius:11px; border:1px solid #2a3346; background:#070a12;
+        color:var(--txt); font-size:14px; font-family:inherit; }
+  textarea{ min-height:64px; font-family:ui-monospace,Menlo,monospace; }
+  button{ border:0; border-radius:12px; padding:13px 15px; font-size:14px; font-weight:700; cursor:pointer;
+          color:#06101e; transition:transform .08s; }
+  button:active{ transform:scale(.97); }
+  .b-blu{ background:linear-gradient(90deg,#4f8cff,#38e1d6); color:#fff; } .b-go{ background:linear-gradient(90deg,#28d17c,#7be0a3); }
+  .b-amb{ background:linear-gradient(90deg,#f4b740,#ffd479); } .b-stop{ background:linear-gradient(90deg,#ff5d6c,#ff8a93); color:#fff; }
+  .b-ghost{ background:#1a2336; color:var(--txt); }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; } .row>button{ flex:1 1 150px; }
+  .hero{ display:flex; gap:16px; flex-wrap:wrap; }
+  .bignum{ flex:2 1 240px; background:linear-gradient(135deg,#0e1626,#0a1120); border:1px solid var(--line);
+           border-radius:16px; padding:18px; position:relative; overflow:hidden; }
+  .bignum .n{ font-size:44px; font-weight:900; line-height:1; background:linear-gradient(90deg,#9fd0ff,#38e1d6);
+              -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .bignum .c{ font-size:12px; color:var(--mut); margin-top:6px; }
+  .bignum::after{ content:""; position:absolute; inset:0; background:linear-gradient(120deg,transparent 30%,#ffffff14 50%,transparent 70%);
+        transform:translateX(-120%); animation:shine 3.4s infinite; } @keyframes shine{ to{transform:translateX(120%)} }
+  .pills{ flex:1 1 160px; display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .pill{ border:1px solid var(--line); border-radius:13px; padding:12px; background:#070b15; }
+  .pill .v{ font-size:18px; font-weight:800; } .pill .k{ font-size:11px; color:var(--mut); margin-top:3px; }
+  .bar{ display:flex; align-items:center; gap:10px; margin:9px 0; }
+  .bar .name{ width:46px; font-size:12px; color:var(--mut); }
+  .bar .track{ flex:1; height:14px; background:#0a1120; border-radius:8px; overflow:hidden; border:1px solid var(--line); }
+  .bar .fill{ height:100%; width:0; border-radius:8px; background:linear-gradient(90deg,#4f8cff,#38e1d6); transition:width .9s cubic-bezier(.2,.8,.2,1); }
+  .bar .num{ width:60px; text-align:right; font-weight:700; font-size:13px; }
+  .shields{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
+  .shield{ border:1px solid var(--line); border-radius:14px; padding:14px; background:#070b15; animation:pop .45s ease both; }
+  @keyframes pop{ from{opacity:0; transform:scale(.94)} to{opacity:1} }
+  .shield .ttl{ font-size:12px; color:var(--mut); } .shield .st{ font-size:17px; font-weight:800; margin-top:5px; }
+  .shield.good{ border-color:#1d5b3d; box-shadow:0 0 18px #28d17c22; } .shield.bad{ border-color:#5b2330; box-shadow:0 0 18px #ff5d6c22; }
+  .shield.idle{ border-color:var(--line); box-shadow:none; opacity:.55; } .shield.idle .st{ color:var(--mut); }
+  .banner{ border:1px solid #3a3110; background:#141207; color:var(--amb); border-radius:12px; padding:12px 14px;
+           font-size:13px; margin-bottom:10px; }
+  details.fold>summary{ cursor:pointer; list-style:none; } details.fold>summary::-webkit-details-marker{ display:none; }
+  /* Visible disclosure affordance — the operator twice read the folded danger
+     zone as "the wipes were DELETED" because the fold had no visual cue. */
+  details.fold>summary::after{ content:' ▸'; color:var(--mut); font-size:12px; }
+  details.fold[open]>summary::after{ content:' ▾'; }
+  .strip{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; font-size:13px; font-weight:700; }
+  .danger-opt{ display:flex; gap:10px; align-items:flex-start; margin:12px 0; cursor:pointer; }
+  .danger-opt input{ width:auto; margin-top:3px; }
+  .ok{ color:var(--grn);} .bad{ color:var(--red);} .warn{ color:var(--amb);} .cy{ color:var(--cyan);}
+  .muted{ color:var(--mut); font-size:12px; }
+  pre{ background:#070b15; border:1px solid var(--line); border-radius:11px; padding:10px; overflow:auto;
+       font-size:11.5px; white-space:pre-wrap; max-height:300px; }
+  table{ width:100%; border-collapse:collapse; font-size:12px; } th,td{ text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th{ color:var(--mut); font-weight:600; }
+  .pr{ display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .pr .t{ flex:1 1 200px; } .pr .num{ color:var(--mut); font-weight:700; margin-right:6px; }
+  .badge{ font-size:11px; font-weight:800; padding:3px 9px; border-radius:20px; }
+  .badge.success{ background:#103a27; color:var(--grn);} .badge.pending{ background:#3a3110; color:var(--amb);}
+  .badge.failure{ background:#3a1620; color:var(--red);} .badge.unknown{ background:#1a2336; color:var(--mut);}
+  .mini{ padding:9px 12px; font-size:12px; flex:0 0 auto; }
+  .switch{ display:flex; align-items:center; gap:8px; font-size:12px; color:var(--mut); }
+  .toast{ position:fixed; left:50%; bottom:22px; transform:translateX(-50%) translateY(20px); background:#1a2336;
+          border:1px solid var(--line); padding:12px 18px; border-radius:12px; font-size:14px; opacity:0; transition:.25s;
+          pointer-events:none; box-shadow:0 10px 30px #000; } .toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
+  [hidden]{ display:none !important; }
+  .lock{ text-align:center; padding:26px 18px; } .lock .ic{ font-size:40px; }
+  .spin{ animation:spin 1s linear infinite; display:inline-block; } @keyframes spin{ to{transform:rotate(360deg)} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hdr">
+    <div class="logo">🛰️ tickvault</div>
+    <div class="live"><span class="dot" id="livedot"></span><span id="livetxt">offline</span></div>
+  </div>
+
+  <div class="card lock" id="lock">
+    <div class="ic">🔐</div>
+    <div class="lbl" style="margin-top:8px">device key</div>
+    <p class="muted" style="max-width:460px;margin:6px auto 14px">This portal only works on a device that holds your
+      secret key — your laptop and your phone. Anyone else who opens this link sees this screen and can do nothing.
+      Paste your key once; it is saved on THIS device only.</p>
+    <input id="tok" type="password" placeholder="paste your operator key" autocomplete="off">
+    <div class="row" style="margin-top:12px"><button class="b-blu" onclick="unlock()">🔓 Unlock this device</button></div>
+  </div>
+
+  <div id="app" hidden>
+    <div class="tabs">
+      <div class="tab active" data-t="overview" onclick="tab('overview')">📊 Overview</div>
+      <div class="tab" data-t="data" onclick="tab('data')">📈 Data</div>
+      <div class="tab" data-t="admin" onclick="tab('admin')">🛠️ Admin</div>
+    </div>
+
+    <!-- OVERVIEW -->
+    <section data-tab="overview">
+      <div class="card">
+        <div class="hero">
+          <div class="bignum"><div class="n" id="ticksbig">0</div><div class="c">official minute rows captured today</div><div class="c" id="feedsplit"></div></div>
+          <div class="pills">
+            <div class="pill"><div class="v" id="p_inst">—</div><div class="k">instance</div></div>
+            <div class="pill"><div class="v" id="p_app">—</div><div class="k">app</div></div>
+            <div class="pill"><div class="v" id="p_mkt">—</div><div class="k">market</div></div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:14px">
+          <button class="b-blu" id="refbtn" onclick="loadOverview()">🔄 Refresh now</button>
+          <button class="b-go" id="instbtn" onclick="instAct()" hidden>▶ Start instance</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px;margin-top:10px;flex-wrap:wrap">
+          <label class="switch"><input type="checkbox" id="auto" checked onchange="autotoggle()"> auto-refresh (8s)</label>
+          <label class="switch"><input type="checkbox" id="force_inst"> force (override market-hours guard)</label>
+          <span class="muted" id="updated"></span>
+        </div>
+        <div class="muted" style="margin-top:8px">One button, context-aware: ▶ Start when the box is stopped, ■ Stop when it is running. Stop is blocked 9:15 AM–3:30 PM IST Mon–Fri unless force is ticked.</div>
+      </div>
+      <div class="card">
+        <details class="fold" id="awsdetails">
+          <summary><div class="lbl" style="margin-bottom:6px">aws — tap to expand alarms + storage</div>
+            <div class="strip" id="awsstrip"><span class="muted">not loaded yet</span></div></summary>
+          <div class="row" style="margin:12px 0"><button class="b-ghost mini" onclick="loadAws()">🔄 Refresh AWS</button></div>
+          <div id="alarms"></div>
+          <div class="lbl" style="margin-top:14px">storage — disk space &amp; database size (on the box)</div>
+          <div class="shields" id="storage"></div>
+          <div class="muted" style="margin-top:8px">EBS auto-archives partitions &gt;90d to S3, and grows online — so it won't fill. Watch "DB size" climb day-by-day to see your GB/day. (Shows — when the box is stopped.)</div>
+        </details>
+      </div>
+      <div class="card"><div class="lbl">guarantees — live proof read from the box</div>
+        <div class="banner" id="stoppedbanner" hidden>⏸ Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start.</div>
+        <div class="shields" id="shields"></div></div>
+      <div class="card"><div class="lbl">feeds — per-broker official-candle pulls (toggle on/off)</div>
+        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadFeeds()">🔄 Load feeds</button></div>
+        <div id="feeds"><span class="muted">not loaded yet</span></div>
+        <div class="muted" id="feedsmsg" style="margin-top:8px"></div>
+        <div class="muted" style="margin-top:6px">Every feed the app reports appears here automatically (a future feed #3 needs zero portal changes). Turning a feed OFF asks for confirmation; disabling Dhan during live trading is refused by the app itself. The pull line below each feed comes from today's fetch log: how many minute-pulls succeeded / failed / were rate-limited, and how fast the successful pulls landed in the last hour.</div>
+      </div>
+      <div class="card"><div class="lbl">latency — how fast each official minute candle arrives after its minute closes</div>
+        <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
+        <div id="latrest" style="overflow:auto"></div>
+        <div class="muted" style="margin-top:6px">One row per (broker, pull type) read from today's fetch log on the box —
+          p50/p99 of "minute closed → data in hand", successful pulls only (approximate percentiles, 3 significant
+          figures, computed inside the database). Late repairs keep their real ≥60 s delay; unmeasured rows are
+          excluded, never faked as fast. "-" = no successful pulls recorded today for that pair.</div>
+        <div class="lbl" style="margin-top:14px">box-wide (shared by all pulls)</div>
+        <div class="shields" id="latnet"></div>
+        <div class="muted" style="margin-top:6px">DB round-trip / clock skew are box-wide. Order placement reads "—"
+          until live trading returns (the order path is dormant by design).</div>
+      </div>
+    </section>
+
+    <!-- DATA -->
+    <section data-tab="data" hidden>
+      <div class="card"><div class="lbl">official minute rows captured today (per table)</div><div id="bars"></div>
+        <div class="muted" style="margin-top:6px">spot = index minute candles · chain = option-chain snapshots · contracts = per-contract minute candles — all pulled once a minute from the brokers' official records.</div></div>
+      <div class="card">
+        <div class="lbl">database console &nbsp;<span class="badge unknown">READ-ONLY — writes are blocked server-side</span></div>
+        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="openQdbConsole()">🗄 Open QuestDB Console</button></div>
+        <div style="display:flex;gap:16px;flex-wrap:wrap">
+          <div style="flex:1 1 200px;min-width:180px">
+            <div class="lbl">tables</div>
+            <div class="row" style="margin-bottom:8px"><button class="b-ghost mini" onclick="loadDbTables()">🔄 Reload tables</button></div>
+            <div id="dbtables" style="max-height:420px;overflow:auto"><span class="muted">not loaded yet</span></div>
+          </div>
+          <div style="flex:2 1 380px;min-width:280px">
+            <div class="lbl">query</div>
+            <textarea id="dbsql" spellcheck="false">SELECT * FROM spot_1m_rest ORDER BY ts DESC LIMIT 50</textarea>
+            <div class="row" style="margin-top:10px">
+              <button class="b-blu" onclick="runDbSql()">▶ Run</button>
+              <button class="b-ghost" onclick="dbDownloadCsv()">⬇ Download CSV</button></div>
+            <div class="muted" id="dbcount" style="margin-top:8px"></div>
+            <div id="dbout" style="margin-top:10px;overflow:auto;max-height:480px"></div>
+            <div class="muted" style="margin-top:8px">Only single-statement SELECT / SHOW / EXPLAIN / WITH — mutations, ';' chaining and comments are rejected by the server. Row cap 1000 (a bigger LIMIT is clamped). Click a table on the left for its columns + first 100 rows.</div>
+          </div>
+        </div>
+        <div class="lbl" style="margin-top:16px">columns <span class="muted" id="dbcolname"></span></div>
+        <div id="dbcols" style="overflow:auto;max-height:320px"><span class="muted">click a table</span></div>
+      </div>
+    </section>
+
+    <!-- ADMIN -->
+    <section data-tab="admin" hidden>
+      <div class="card"><div class="lbl">app control</div>
+        <div class="row" style="margin-bottom:10px">
+          <button class="b-amb" onclick="act('restart-app')">♻ Restart app</button>
+          <button class="b-amb" onclick="act('restart-questdb')">♻ Restart QuestDB</button>
+          <button class="b-stop" onclick="act('stop-app')">⏹ Stop app</button></div>
+        <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.</div>
+        <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
+      </div>
+      <div class="card">
+        <details class="fold" id="danger">
+          <summary><span class="lbl" style="display:inline">⚠️ danger zone — destructive data actions (tap to open)</span> <span class="muted" style="font-size:11px">(contains: Wipe ALL · Docker reset · Bare nuke)</span></summary>
+          <div class="warn" id="dangerlock" hidden style="margin-top:10px">🔒 Locked until 3:30 PM IST — data-destructive actions are refused during market hours, even with force. A mid-market wipe destroys data that can never be re-fetched.</div>
+          <div class="muted" style="margin-top:10px">Pick ONE severity, then Execute. Every action still asks you to type its own confirm word — nothing fires from a mis-click.</div>
+          <label class="danger-opt"><input type="radio" name="danger" value="wipe">
+            <span><b>🗑️ Wipe ALL data → fresh start</b> — <span class="muted">deletes every legacy tick &amp; candle table AND today's official minute candles + the fetch log (spot / option-chain / per-contract tables) for BOTH brokers, plus every capture/replay file so NOTHING resurrects after restart — SEBI audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</span></span></label>
+          <label class="danger-opt"><input type="radio" name="danger" value="nuke">
+            <span><b style="color:#f66">☢ Full Docker nuke — wipes ALL data (QuestDB volumes) + fresh start</b> — <span class="muted">⚠️ NUCLEAR: stops the app, deletes Docker containers + volumes + images (full QuestDB wipe INCLUDING the SEBI-retention audit tables) + prune, then rebuilds QuestDB fresh + restarts the app. Box must be RUNNING. Asks you to type NUKE-DOCKER.</span></span></label>
+          <label class="danger-opt"><input type="radio" name="danger" value="erase">
+            <span><b>☢️ Bare Nuke → delete ALL &amp; leave EMPTY</b> — <span class="muted">☢️ Like Docker Desktop "delete all": removes <b>every</b> container + image + volume and does <b>NOT</b> rebuild — the box is left completely bare with <b>nothing running</b> (trading OFF until you redeploy). Asks you to type ERASE.</span></span></label>
+          <div class="row" style="margin-top:12px"><button class="b-stop" onclick="dangerExecute()">☠ Execute selected action</button></div>
+        </details>
+      </div>
+      <div class="card"><div class="lbl">device</div>
+        <div class="row"><button class="b-ghost" onclick="lock()">🔒 Lock / forget this device</button></div>
+        <div class="muted" style="margin-top:8px">Forgets the operator key on THIS device — the portal locks until the key is pasted again.</div>
+      </div>
+    </section>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+let TOKEN=localStorage.getItem('tv_token')||'';
+let timer=null, lastTicks=0, curTab='overview';
+
+function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2600); }
+function esc(s){ return String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textContent=on?'live':'offline'; }
+
+function unlock(){ const v=($('tok').value||'').trim(); if(!v){ toast('Paste your key first'); return; }
+  TOKEN=v; localStorage.setItem('tv_token',v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
+function lock(){ TOKEN=''; localStorage.removeItem('tv_token'); $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten on this device'); }
+
+function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
+  document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
+  if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); }
+
+async function call(action, extra){ if(!TOKEN){ toast('Locked'); return null; }
+  try{ const r=await fetch(location.href,{method:'POST',
+      headers:{'authorization':'Bearer '+TOKEN,'content-type':'application/json'},
+      body:JSON.stringify(Object.assign({action},extra||{}))});
+    const j=await r.json().catch(()=>({}));
+    if(r.status===401){ toast('Wrong key (401)'); setLive(false); return null; }
+    if(r.status===409){ toast(j.error||'Blocked during market hours'); return null; }
+    if(!r.ok){ toast(j.error||('Error '+r.status)); return null; }
+    return j;
+  }catch(e){ toast('Network error'); setLive(false); return null; } }
+
+function countUp(el,target){ target=parseInt(String(target).replace(/[^0-9]/g,''),10)||0; const from=lastTicks||0; lastTicks=target;
+  const t0=performance.now(),dur=900; function step(t){ const k=Math.min(1,(t-t0)/dur);
+    el.textContent=Math.round(from+(target-from)*(1-Math.pow(1-k,3))).toLocaleString(); if(k<1) requestAnimationFrame(step); } requestAnimationFrame(step); }
+
+// n === null means "count unreadable" — the bar renders '—' with an empty
+// track instead of a fabricated 0 (Rule 11, review fix M4).
+function bar(name,n,max){ const miss=(n==null); const pct=(!miss&&max>0)?Math.max(3,Math.round(100*n/max)):0;
+  return '<div class="bar"><div class="name">'+name+'</div><div class="track"><div class="fill" style="width:'+pct+'%"></div></div><div class="num">'+(miss?'—':n.toLocaleString())+'</div></div>'; }
+// Optional 4th arg picks the value colour explicitly: 'ok' green, 'warn' amber,
+// 'bad' red — so a critical state (red) is distinguishable from drift (amber).
+function shield(t,s,good,cls){ return '<div class="shield '+(good?'good':'bad')+'"><div class="ttl">'+t+'</div><div class="st '+(cls||(good?'ok':'warn'))+'">'+s+'</div></div>'; }
+// Greyed "box stopped" shield: neither good nor bad — the box is off, so the
+// guarantee is neither proven nor violated. Used ONLY when instance_state is
+// not 'running' (a RUNNING box with unreachable data keeps the REAL warnings).
+function shieldIdle(t){ return '<div class="shield idle"><div class="ttl">'+t+'</div><div class="st">—</div></div>'; }
+
+async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</span> Refreshing…'; const j=await call('view'); $('refbtn').textContent='🔄 Refresh now'; if(!j) return;
+  const appOk=j.app==='active', running=j.instance_state==='running'; setLive(appOk&&running);
+  // ONE context-aware instance button: ▶ Start when stopped, ■ Stop when
+  // running. Server-side market-hours guard on 'stop' is unchanged; the
+  // force checkbox next to it feeds through act().
+  instState=j.instance_state||'';
+  const ib=$('instbtn'); ib.hidden=false;
+  if(running){ ib.textContent='■ Stop instance'; ib.className='b-stop'; }
+  else{ ib.textContent='▶ Start instance'; ib.className='b-go'; }
+  // Honest hero (Rule 11, review fix M4): rows_today_total === "" means the
+  // box/QuestDB was unreachable — render '—' and skip the count-up, never an
+  // animated fabricated 0 (the _sum_counts docstring contract).
+  if(j.rows_today_total==null||j.rows_today_total===''){ $('ticksbig').textContent='—'; lastTicks=0; }
+  else countUp($('ticksbig'), j.rows_today_total);
+  $('p_inst').innerHTML='<span class="'+(running?'ok':'bad')+'">'+(j.instance_state||'?')+'</span>';
+  $('p_app').innerHTML='<span class="'+(appOk?'ok':'bad')+'">'+(appOk?'up':(j.app||'down'))+'</span>';
+  $('p_mkt').innerHTML='<span class="'+(j.market_hours?'warn':'')+'">'+(j.market_hours?'OPEN':'closed')+'</span>';
+  // Danger-zone hard-lock label: data-destructive actions are server-refused
+  // (409, no force escape) while the market is open — surface that BEFORE a click.
+  const dl=$('dangerlock'); if(dl) dl.hidden=!j.market_hours;
+  // Per-broker split of today's official minute rows — summed across the
+  // three live tables, rendered generically from whatever feeds QuestDB
+  // reports (no hardcoding; a future broker appears automatically).
+  const perFeed={};
+  Object.values(j.rows_by_feed||{}).forEach(t=>{ Object.keys(t||{}).forEach(f=>{ perFeed[f]=(perFeed[f]||0)+(parseInt(t[f],10)||0); }); });
+  const fbKeys=Object.keys(perFeed).sort();
+  $('feedsplit').textContent = fbKeys.length ? fbKeys.map(k=>k+': '+perFeed[k].toLocaleString()).join(' | ') : '';
+  // Data-tab bars: today's rows per LIVE table (spot / chain / contracts).
+  // An unreadable count (empty value — box/QuestDB unreachable) renders '—',
+  // never a fabricated 0 bar (Rule 11, review fix M4).
+  const rt=j.rows_today||{}, tkeys=['spot','chain','contracts'];
+  const vals=tkeys.map(k=>String(rt[k]==null?'':rt[k]).trim()===''?null:(parseInt(rt[k],10)||0));
+  const mx=Math.max(1,...vals.map(v=>v||0));
+  $('bars').innerHTML=tkeys.map((k,i)=>bar(k,vals[i],mx)).join('');
+  // Dedup-key check: the real spot_1m_rest upsert key is 4 columns
+  // (ts, security_id, exchange_segment, feed) per DEDUP_KEY_SPOT_1M_REST.
+  // Three distinct states:
+  //   4 = OK (green) · 0 = DEDUP disabled entirely (RED — duplicate rows will
+  //   accumulate) · any other number = schema drift (amber). A fetch failure
+  //   (box/QuestDB unreachable) renders "unreachable" (amber), never a fake 0.
+  // Stopped box → ONE calm banner + a greyed "—" shield instead of a scary
+  // "unreachable" warning. Gated STRICTLY on instance_state!=='running' — a
+  // RUNNING box with unreachable data keeps the real warnings below.
+  $('stoppedbanner').hidden=running;
+  if(!running){
+    $('shields').innerHTML=shieldIdle('Dedup key columns');
+  } else {
+  const dkRaw=String(j.dedup_key_columns||'').trim(), dkN=parseInt(dkRaw,10);
+  const dkUnknown=(dkRaw===''||isNaN(dkN)), keysOk=dkN===4;
+  let dkTxt,dkCls;
+  if(dkUnknown){ dkTxt='unreachable'; dkCls='warn'; }
+  else if(dkN===4){ dkTxt='4 ✅'; dkCls='ok'; }
+  else if(dkN===0){ dkTxt='0 — DEDUP disabled!'; dkCls='bad'; }
+  else { dkTxt=dkRaw+' — schema drift (expected 4)'; dkCls='warn'; }
+  $('shields').innerHTML=shield('Dedup key columns',dkTxt,keysOk,dkCls);
+  }
+  if(!$('feeds').dataset.loaded) loadFeeds();
+  if(!$('alarms').dataset.loaded) loadAws();
+  $('updated').textContent='updated '+new Date().toLocaleTimeString(); }
+
+// The one context-aware instance action. 'start' is never market-hours
+// blocked server-side; 'stop' keeps the guard — force feeds through act().
+let instState='';
+function instAct(){ act(instState==='running'?'stop':'start','force_inst'); }
+
+// FEEDS card. Rendered by ITERATING the app's own per-feed list — primarily the
+// health response's `feeds` array (one row per feed the app knows about), with
+// a generic fallback that derives feed names from the `<name>_enabled` keys of
+// GET /api/feeds. No feed name is hardcoded, so a future feed #3/#4 added to
+// the app automatically appears here with its own toggle. Errors are rendered
+// VERBATIM (esc()-wrapped) — never silent defaults.
+async function loadFeeds(){ $('feeds').dataset.loaded='1'; $('feeds').innerHTML='<span class="muted">loading…</span>'; $('feedsmsg').textContent='';
+  const j=await call('feeds-view'); if(!j){ $('feeds').innerHTML='<span class="warn">feeds-view request failed</span>'; return; }
+  let list=[];
+  if(j.health && Array.isArray(j.health.feeds) && j.health.feeds.length){
+    list=j.health.feeds.map(r=>({name:String(r.feed), enabled:!!r.enabled, lane:!!r.lane_running, h:r}));
+  } else if(j.feeds && typeof j.feeds==='object'){
+    list=Object.keys(j.feeds).filter(k=>k.endsWith('_enabled')).map(k=>k.slice(0,-'_enabled'.length))
+      .map(n=>({name:n, enabled:!!j.feeds[n+'_enabled'], lane:!!j.feeds[n+'_lane_running'], h:null}));
+  }
+  // Prefer the /api/feeds runtime flags when both payloads are present.
+  if(j.feeds && typeof j.feeds==='object'){ list.forEach(f=>{ if((f.name+'_enabled') in j.feeds){ f.enabled=!!j.feeds[f.name+'_enabled']; }
+    if((f.name+'_lane_running') in j.feeds){ f.lane=!!j.feeds[f.name+'_lane_running']; } }); }
+  if(!list.length){ $('feeds').innerHTML='<span class="warn">'+esc(j.feeds_error||j.health_error||'no feed data returned')+'</span>'; return; }
+  const vb=v=>({ok:'success',down:'failure',disabled:'unknown',unknown:'unknown'})[v]||'pending';
+  $('feeds').innerHTML=list.map(f=>{
+    // safe token for the onclick attribute (display uses esc()); the Lambda
+    // re-validates the same charset server-side before any shell command.
+    const safeName=String(f.name).toLowerCase().replace(/[^a-z0-9_-]/g,'');
+    const h=f.h; const badge=h?('<span class="badge '+vb(h.verdict)+'">'+esc(h.verdict||'?')+'</span>'):'<span class="badge unknown">no health</span>';
+    // REST-pull line (2026-07-16): today's fetch-log outcomes + last-hour
+    // prompt-pull latency from rest_fetch_audit — the old ticks/subscribed
+    // counters read frozen live-feed registries and are gone. "failed" =
+    // every non-ok, non-rate-limited outcome (error/empty/no_token/…) —
+    // EXCEPT skipped/boundary_skipped, which are minutes the leg never
+    // attempted (trading-day gate / missed boundaries), not pull failures
+    // (review fix L4; no_token IS a failure and stays counted).
+    const ra=(j.rest_audit||{})[f.name], rl=(j.rest_lat_hour||{})[f.name];
+    let pull;
+    if(ra && Object.keys(ra).length){
+      const ok=ra.ok||0, rlim=ra.rate_limited||0;
+      const failed=Object.keys(ra).filter(k=>k!=='ok'&&k!=='rate_limited'&&k!=='skipped'&&k!=='boundary_skipped').reduce((s,k)=>s+(ra[k]||0),0);
+      pull='pulls today: '+ok.toLocaleString()+' ok · '+failed.toLocaleString()+' failed · '+rlim.toLocaleString()+' rate-limited';
+      if(rl&&(rl.p50_ms!=null||rl.p99_ms!=null)) pull+=' — last hour: p50 '+fmtLagMs(rl.p50_ms)+' / p99 '+fmtLagMs(rl.p99_ms)+' after minute close';
+    } else { pull='no official-candle pulls recorded today'; }
+    const detail='<div class="muted">'+(h&&h.reason?esc(h.reason)+' · ':'')+pull+'</div>';
+    return '<div class="pr"><div class="t"><b>'+esc(f.name)+'</b> — <span class="'+(f.enabled?'ok':'bad')+'">'+(f.enabled?'ENABLED':'disabled')+'</span>'
+      +' · lane '+(f.lane?'<span class="ok">running</span>':'<span class="warn">not running</span>')+' '+badge+detail+'</div>'
+      +'<button class="'+(f.enabled?'b-stop':'b-go')+' mini" onclick="feedToggle(\''+safeName+'\','+(!f.enabled)+')">'+(f.enabled?'⏹ turn OFF':'▶ turn ON')+'</button></div>'; }).join('');
+  const errs=[j.feeds_error,j.health_error].filter(Boolean).join(' · ');
+  if(errs) $('feedsmsg').textContent=errs; }
+async function feedToggle(feed,enabled){
+  if(!enabled && !confirm('Turn OFF "'+feed+'"? Its official-candle pulls (spot + option chain) stop until you turn it back on.')){ toast('cancelled'); return; }
+  toast((enabled?'enabling ':'disabling ')+feed+'…');
+  const j=await call('feed-toggle',{feed:feed,enabled:enabled}); if(!j) return;
+  if(j.ok){ toast('✅ '+feed+' '+(enabled?'enabled':'disabled')); }
+  else{ // Surface the APP's own message verbatim — incl. the 409 Dhan
+        // live-trading guard ("refusing to disable the Dhan feed …").
+    const m=(j.app_response&&j.app_response.error)||j.error||('feed toggle failed (app status '+j.app_status+')');
+    $('feedsmsg').textContent='⚠ '+m; toast('⚠ '+String(m).slice(0,120)); }
+  setTimeout(loadFeeds,1200); }
+
+// Shared CSV → grid renderer (Data tab query box + DB tab reuse it).
+function parseCsv(csv){ const lines=(csv||'').split(/\r?\n/).filter(x=>x.length);
+  return lines.map(l=>l.split(',').map(c=>c.replace(/^"|"$/g,''))); }
+// QuestDB renders our IST-stored timestamps as "...T15:28:00.000000Z" — the
+// value is already IST (project storage convention); strip the noisy
+// microseconds + Z and the T so it reads "2026-06-01 15:28:00 IST".
+function tcell(c){ const m=/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z?$/.exec(c); return m? m[1]+' '+m[2]+' IST' : c; }
+// Renders rows (header + data, all esc()-wrapped) into el; returns data-row count.
+function renderGrid(el,rows){ if(!rows.length){ el.innerHTML='<span class="muted">no rows</span>'; return 0; }
+  let h='<table><tr>'+rows[0].map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>';
+  for(let i=1;i<rows.length;i++) h+='<tr>'+rows[i].map(c=>'<td>'+esc(tcell(c))+'</td>').join('')+'</tr>';
+  el.innerHTML=h+'</table>'; return rows.length-1; }
+
+// ---- DB console (read-only, lives in the Data tab) ----
+// Writes are blocked SERVER-SIDE by the hardened _is_safe_sql gate (single
+// statement, no comments, banned mutators) + the 1000-row cap — the UI is a
+// convenience, never the security boundary.
+let dbTables=[], dbCsv='';
+async function loadDbTables(){ $('dbtables').dataset.loaded='1'; $('dbtables').innerHTML='<span class="muted">loading…</span>';
+  const j=await call('sql',{query:'SELECT table_name FROM tables() ORDER BY table_name'});
+  if(!j){ $('dbtables').innerHTML='<span class="warn">load failed</span>'; return; }
+  dbTables=parseCsv(j.csv).slice(1).map(r=>r[0]).filter(Boolean);
+  if(!dbTables.length){ $('dbtables').innerHTML='<span class="warn">no tables returned — is the box running?</span>'; return; }
+  // Click handlers pass an INDEX into the just-fetched list — the table name
+  // used in follow-up queries always comes from QuestDB's own tables() output,
+  // never from user-typed input (no injection surface).
+  $('dbtables').innerHTML=dbTables.map((t,i)=>'<div style="padding:6px 0;border-bottom:1px solid var(--line)"><a href="#" style="color:var(--cyan);text-decoration:none;font-size:13px" onclick="dbPick('+i+');return false">'+esc(t)+'</a></div>').join(''); }
+async function dbPick(i){ const t=dbTables[i]; if(t==null) return;
+  $('dbcolname').textContent='— '+t; $('dbcols').innerHTML='<span class="muted">loading…</span>';
+  const j=await call('sql',{query:"SELECT * FROM table_columns('"+t.replace(/'/g,"''")+"')"});
+  if(j) renderGrid($('dbcols'),parseCsv(j.csv)); else $('dbcols').innerHTML='<span class="warn">columns load failed</span>';
+  $('dbsql').value='SELECT * FROM "'+t.replace(/"/g,'')+'" LIMIT 100';
+  runDbSql(); }
+async function runDbSql(){ const q=$('dbsql').value.trim(); if(!q){ toast('Type a query'); return; }
+  $('dbout').innerHTML='<span class="muted">running…</span>'; $('dbcount').textContent=''; dbCsv='';
+  const j=await call('sql',{query:q}); if(!j){ $('dbout').innerHTML=''; return; }
+  dbCsv=j.csv||''; const n=renderGrid($('dbout'),parseCsv(dbCsv));
+  $('dbcount').textContent=n+' row'+(n===1?'':'s')+(n>=1000?' — server cap 1000 reached':''); }
+async function openQdbConsole(){ const w=window.open('','_blank'); // open SYNC in the click (popup-safe) BEFORE the await
+  const j=await call('qdb_console_url');
+  if(j&&j.url){ if(w) w.location=j.url; else window.open(j.url,'_blank'); }
+  else { if(w) w.close(); } } // call() already toasts the {error}/non-ok case
+function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
+  const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([dbCsv],{type:'text/csv'}));
+  a.download='tickvault-query-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';
+  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href); }
+
+// AWS strip on Overview (spend $ · alarms firing · disk used %) — sourced from
+// the same aws_status action the old AWS tab used. The <details> expands to
+// the full alarm list + storage shields. Loaded once on first Overview load
+// (NOT on the 8s auto-refresh — aws_status does an SSM probe + Cost Explorer
+// call) and on demand via the 🔄 Refresh AWS button.
+async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTML='<span class="muted">loading…</span>'; $('alarms').innerHTML='<span class="muted">loading…</span>';
+  const j=await call('aws_status'); if(!j){ $('awsstrip').innerHTML='<span class="warn">AWS read failed — retry</span>'; $('alarms').innerHTML=''; return; }
+  const cwFail=(j.alarms_firing===null||j.alarms_firing===undefined), al=j.alarms_firing||[];
+  const alTxt=cwFail?'?':String(al.length), alCls=cwFail?'warn':(al.length?'bad':'ok');
+  $('awsstrip').innerHTML='<span>💵 $'+esc(j.cost_mtd_usd||'—')+' spent this month</span>'+
+    '<span class="'+alCls+'">🔔 '+alTxt+' alarm'+(alTxt==='1'?'':'s')+' firing</span>'+
+    '<span>💾 disk '+esc(j.disk_pct||'—')+' used</span>';
+  if(cwFail){ $('alarms').innerHTML='<span class="warn">CloudWatch read failed — retry.</span>'; }
+  else{ $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>'; }
+  const free=parseInt(j.disk_free_gb,10), pct=parseInt(j.disk_pct,10);
+  const freeOk=isNaN(free)?true:free>5; const pctOk=isNaN(pct)?true:pct<85;
+  $('storage').innerHTML=
+    shield('Disk free', (j.disk_free_gb?j.disk_free_gb+' GB':'—'), freeOk)+
+    shield('Disk used', (j.disk_used_gb?j.disk_used_gb+' GB ('+(j.disk_pct||'')+')':'—'), pctOk)+
+    shield('Database size', (j.db_size_gb?j.db_size_gb+' GB':'—'), true); }
+
+function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
+  if(n<1e6) return (n/1e3).toFixed(2)+' µs'; if(n<1e9) return (n/1e6).toFixed(2)+' ms'; return (n/1e9).toFixed(2)+' s'; }
+function fmtMs(s){ return (s===''||s==null)?'—':s+' ms'; }
+function fmtLagMs(v){ if(v==null) return '-'; v=Number(v);
+  if(v>=1000) return (v/1000).toFixed(2)+' s'; return v.toFixed(2)+' ms'; }
+// REST-era latency card (2026-07-16). The per-(broker, pull type) table
+// iterates the SERVER's j.rest_latency rows — sourced from today's
+// rest_fetch_audit on the box (feed + leg discovered from the data, never
+// hardcoded), so a future broker/leg gets its row with zero portal changes.
+// "-" = no successful pulls recorded today for that pair (never fake zeros).
+async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>';
+  $('latrest').innerHTML='<span class="muted">measuring…</span>';
+  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latrest').innerHTML=''; return; }
+  const rows=Array.isArray(j.rest_latency)?j.rest_latency:[];
+  if(rows.length){
+    let h='<table><tr><th>broker</th><th>pull type</th><th>ok pulls today</th><th>p50 after close</th><th>p99 after close</th></tr>';
+    rows.forEach(r=>{ h+='<tr><td><b>'+esc(String(r.feed))+'</b></td><td>'+esc(String(r.leg))+'</td>'
+      +'<td>'+Number(r.ok_rows||0).toLocaleString()+'</td>'
+      +'<td>'+esc(fmtLagMs(r.p50_ms))+'</td><td>'+esc(fmtLagMs(r.p99_ms))+'</td></tr>'; });
+    $('latrest').innerHTML=h+'</table>';
+  } else {
+    $('latrest').innerHTML='<span class="warn">no successful pulls recorded today — market closed, box just started, or the fetch log is unreachable</span>';
+  }
+  const skew=Math.abs(parseFloat(j.clock_skew_ms));
+  $('latnet').innerHTML=
+    shield('QuestDB round-trip (box-wide)', fmtMs(j.questdb_ms), true)+
+    shield('Clock skew (box-wide)', fmtMs(j.clock_skew_ms), isNaN(skew)||skew<50)+
+    shield('Order placement', fmtNs(j.order_place_avg_ns), true); }
+
+// forceId lets each tab keep its own force checkbox next to its own buttons:
+// Overview's instance button uses #force_inst, Admin's app controls use #force.
+async function act(action,forceId){ if(!confirm('Run "'+action+'" on the trading box?')) return;
+  const fEl=$(forceId||'force'); const force=!!(fEl&&fEl.checked); toast(action+'…');
+  const j=await call(action,{force}); if(j){ toast('✅ '+action+' sent'); setTimeout(loadOverview,1600); } }
+
+// Danger-zone severity picker → the UNCHANGED per-action functions. Each still
+// asks for its OWN typed confirm token (WIPE / NUKE-DOCKER / ERASE) — the
+// picker only chooses WHICH prompt fires; there is no token bypass path.
+function dangerExecute(){ const sel=document.querySelector('input[name="danger"]:checked');
+  if(!sel){ toast('Pick a danger-zone action first'); return; }
+  const fn={wipe:wipeData, nuke:dockerReset, erase:bareNuke}[sel.value];
+  if(fn) fn(); else toast('Unknown action'); }
+
+async function wipeData(){
+  if(prompt('This DELETES every stored market-data row — legacy ticks/candles AND the official minute candles + fetch log for BOTH brokers — then restarts empty. The box must be RUNNING. Type WIPE to confirm:')!=='WIPE'){ toast('cancelled'); return; }
+  toast('wiping → fresh start…');
+  const j=await call('wipe-questdb',{force:true,confirm:'WIPE'});
+  if(j&&j.ok){ toast('✅ wipe started — fresh data from next session'); setTimeout(loadOverview,4000); }
+  else { toast((j&&j.error)||'wipe failed — is the box running?'); } }
+async function dockerReset(){
+  if(prompt('☢ FULL DOCKER NUKE. Stops the app, DELETES Docker containers + volumes + images (full QuestDB wipe — ALL data INCLUDING the SEBI-retention audit tables) + prune, then rebuilds QuestDB fresh + restarts the app. The box must be RUNNING. Type NUKE-DOCKER to confirm:')!=='NUKE-DOCKER'){ toast('cancelled'); return; }
+  if(!confirm('Last check: every table is destroyed, including audit history. Continue?')){ toast('cancelled'); return; }
+  toast('☢ full docker nuke dispatched → wiping in background (~2-3 min)…');
+  const j=await call('docker-reset',{force:$('force').checked,confirm:'NUKE-DOCKER'});
+  if(!(j&&j.ok)){ toast((j&&j.error)||'docker-reset failed — is the box running?'); return; }
+  if(!j.command_id){ toast('⚠️ nuke dispatched but no command id — re-check the ticks count in ~3 min'); setTimeout(loadOverview,8000); return; }
+  pollNuke(j.command_id,0); }
+async function bareNuke(){
+  if(prompt('☢️ BARE NUKE. Deletes EVERY Docker container + image + volume and LEAVES THE BOX COMPLETELY EMPTY — nothing rebuilt, nothing running, trading OFF until you redeploy (exactly like deleting all three in Docker Desktop). Type ERASE to confirm:')!=='ERASE'){ toast('cancelled'); return; }
+  if(!confirm('Final check: the box is left BARE and DEAD (no QuestDB, no app). You will need to redeploy to bring it back. Continue?')){ toast('cancelled'); return; }
+  toast('☢️ bare nuke dispatched → erasing everything…');
+  const j=await call('docker-nuke-bare',{force:true,confirm:'ERASE'});
+  if(!(j&&j.ok)){ toast((j&&j.error)||'bare-nuke failed — is the box running?'); return; }
+  if(!j.command_id){ toast('⚠️ dispatched but no command id — re-check the box in ~1 min'); return; }
+  pollNuke(j.command_id,0); }
+// Poll the REAL nuke outcome instead of claiming success the instant it is
+// dispatched. The teardown runs for a minute or two; we show the truthful
+// result: complete, FAILED/PARTIAL (something still in-use), or still-running.
+async function pollNuke(cid,n){
+  if(n>40){ toast('⏳ still running after 3+ min — re-check the box manually'); setTimeout(loadOverview,4000); return; }
+  const s=await call('command-status',{command_id:cid}); const st=(s&&s.status)||'', out=(s&&s.stdout_tail)||'';
+  if(st==='Success'||st==='Failed'||st==='Cancelled'||st==='TimedOut'){
+    if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
+    else if(out.indexOf('bare-nuke-complete')>=0){ toast('☢️ BARE NUKE complete — 0 containers, 0 images, 0 volumes. Box is empty + DEAD (redeploy to restart).'); }
+    else if(out.indexOf('bare-nuke-PARTIAL')>=0){ toast('🟠 bare nuke PARTIAL — something is still in-use. '+(out.match(/BARE-NUKE-RESULT[^\n]*/)||[''])[0]); }
+    else if(out.indexOf('docker-reset-dispatched')>=0){ toast('✅ nuke complete — empty DB; app restarting'); }
+    else { toast('⚠️ nuke finished ('+st+') — re-check the box'); }
+    setTimeout(loadOverview,6000); return; }
+  setTimeout(()=>pollNuke(cid,n+1),5000); }
+
+function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ if(curTab==='overview') loadOverview(); },8000); }
+function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
+function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
+
+// Ready-made link support: a URL ending in #key=<secret> (or ?key=) auto-saves
+// the device key, strips it from the address bar, and unlocks — so the Telegram
+// link "just works" with zero typing. The fragment never reaches the server.
+(function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');
+  if(k){ try{ k=decodeURIComponent(k); }catch(e){} TOKEN=k; localStorage.setItem('tv_token',TOKEN);
+    try{ history.replaceState(null,'',location.pathname); }catch(e){} } })();
+if(TOKEN){ $('tok').value=TOKEN; $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
+</script>
+</body>
+</html>
