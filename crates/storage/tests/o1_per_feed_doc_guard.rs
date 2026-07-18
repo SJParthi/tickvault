@@ -99,9 +99,15 @@ fn doc_matches_code_every_feed_keyed_dedup_const_contains_feed() {
     // DELETED with the dead Dhan tick chain; the `ticks` table stays
     // read-only in QuestDB (SEBI) with its DB-side DEDUP config intact, but
     // there is no writer-side constant left to bind the doc to.
+    // Dead-code sweep batch 1 (2026-07-18): the `("prev_day_ohlcv_persistence.rs",
+    // "DEDUP_KEY_PREV_DAY_OHLCV")` row was removed — the file (the prev-day
+    // OHLCV writer) was DELETED as verified-dead (its sole feeder
+    // `prev_day_ohlcv_boot.rs` died in PR-C3, 2026-07-14; zero callers since).
+    // The `prev_day_ohlcv` table stays read-only in QuestDB (SEBI, forensic)
+    // with its DB-side DEDUP config intact — same shape as the DEDUP_KEY_TICKS
+    // row above; no writer-side constant remains to bind the doc to.
     let checks = [
         ("shadow_persistence.rs", "DEDUP_KEY_CANDLES"),
-        ("prev_day_ohlcv_persistence.rs", "DEDUP_KEY_PREV_DAY_OHLCV"),
         ("ws_event_audit_persistence.rs", "DEDUP_KEY_WS_EVENT_AUDIT"),
     ];
     for (file, const_name) in checks {
