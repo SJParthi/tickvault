@@ -11,7 +11,7 @@ paths:
 > **Scope:** every Wave 4 sub-PR session (Wave-4-A through Wave-4-E3)
 > MUST read + obey this file before any code change.
 > **Trigger:** always loaded by Claude Code sessions touching paths
-> under `.claude/rules/project/` or `.claude/plans/active-plan-wave-4.md`.
+> under `.claude/rules/project/` or `.claude/plans/active-plan-wave-4.md`. *(2026-07-18 rules diet: this file is now path-triggered via `paths:` frontmatter — see rules-diet-2026-07-18.md.)*
 
 This file is the canonical charter that every Wave 4 sub-PR session
 inherits. It encodes the operator's literal demands — restated honestly

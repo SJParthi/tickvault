@@ -24,7 +24,7 @@ paths:
 > `crates/common/src/error_code.rs::ErrorCode::OrderReady01GateRefused`.
 > **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs` requires
 > `ORDER-READY-01` + `OrderReady01GateRefused` verbatim — both appear here.
-> **Auto-load trigger:** always loaded (path is in `.claude/rules/project/`).
+> **Auto-load trigger:** always loaded (path is in `.claude/rules/project/`). *(2026-07-18 rules diet: this file is now path-triggered via `paths:` frontmatter — see rules-diet-2026-07-18.md.)*
 
 ---
 

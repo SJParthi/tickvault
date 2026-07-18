@@ -26,7 +26,7 @@ paths:
 > `CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD`),
 > `crates/core/src/notification/events.rs` (`Chain1mUnderlyingNotServed`,
 > `Chain1mUnderlyingServedRecovered`).
-> **Auto-load trigger:** Always loaded (path is in `.claude/rules/project/`).
+> **Auto-load trigger:** Always loaded (path is in `.claude/rules/project/`). *(2026-07-18 rules diet: this file is now path-triggered via `paths:` frontmatter — see rules-diet-2026-07-18.md.)*
 
 ---
 

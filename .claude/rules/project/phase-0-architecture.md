@@ -12,7 +12,7 @@ paths:
 > **Authority:** CLAUDE.md > `.claude/rules/project/operator-charter-forever.md` > this file > defaults.
 > **Scope:** Every PR touching Phase 0 work — audit tables, OMS, risk engine, indicator engine, defensive guards.
 > **Trigger:** Always loaded for sessions editing `crates/storage/src/*_audit_persistence.rs`,
-> `crates/trading/src/oms/*`, `crates/trading/src/indicator/*`, or `crates/app/src/main.rs` Step 6a-prime.
+> `crates/trading/src/oms/*`, `crates/trading/src/indicator/*`, or `crates/app/src/main.rs` Step 6a-prime. *(2026-07-18 rules diet: this file is now path-triggered via `paths:` frontmatter — see rules-diet-2026-07-18.md.)*
 > **Companion docs:** `docs/phases/phase-0-readme.md` (PR-by-PR history, audit-table family table).
 
 ## The Lean Lock contract (one line)
@@ -199,7 +199,7 @@ Before `dry_run = false` flips:
 ## How to read this file
 
 When opening a session that touches Phase 0 code, this file appears
-in your auto-loaded context alongside the operator-charter. Use it as
+in your auto-loaded context alongside the operator-charter. *(2026-07-18 rules diet: this file is now path-triggered via `paths:` frontmatter — see rules-diet-2026-07-18.md.)* Use it as
 the canonical mental model:
 
   * What pillar is the change touching? (Boot gate, defensive guard,
