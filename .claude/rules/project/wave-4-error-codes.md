@@ -15,6 +15,7 @@ paths:
   - "crates/core/src/auth/fast_boot_validation.rs"
   - "crates/app/tests/fast_boot_token_validation_wiring_guard.rs"
   - "crates/app/src/resource_monitor.rs"
+  - "crates/storage/src/resource_monitor.rs"
 ---
 
 # Wave 4 Error Codes (RESERVED — runbook stubs)

@@ -30,7 +30,7 @@ irrelevant to loading.
   governance/lock files, 503,052 B, + this note).
 - The 4 mega scope-locks (daily-universe, groww-second-feed, no-rest,
   ws-scope-lock; 279.6 KB combined) stay always-loaded — trimming them
-  is a separate operator-approved follow-up, not this PR.
+  is a separate follow-up PROPOSAL requiring operator approval, not this PR.
 
 ## Honest degradation
 

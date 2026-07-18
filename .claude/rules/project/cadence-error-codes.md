@@ -3,6 +3,9 @@ paths:
   - "crates/common/src/error_code.rs"
   - "crates/core/src/cadence/**"
   - "crates/app/src/cadence_boot.rs"
+  - "crates/app/src/dhan_cadence_executor.rs"
+  - "crates/app/src/groww_cadence_executor.rs"
+  - "crates/app/src/cadence_escalation.rs"
   - "crates/common/src/config.rs"
   - "config/base.toml"
 ---

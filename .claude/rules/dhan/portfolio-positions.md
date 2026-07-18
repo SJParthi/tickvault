@@ -3,6 +3,9 @@ paths:
   - "crates/trading/src/portfolio/*.rs"
   - "crates/trading/src/oms/position_tracker.rs"
   - "crates/api/src/handlers/portfolio.rs"
+  - "crates/trading/src/oms/api_client.rs"
+  - "crates/trading/src/oms/types.rs"
+  - "crates/app/src/orphan_position_watchdog_boot.rs"
 ---
 
 # Dhan Portfolio & Positions Enforcement

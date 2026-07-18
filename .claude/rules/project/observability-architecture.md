@@ -7,6 +7,7 @@ paths:
   - "crates/storage/tests/error_level_meta_guard.rs"
   - "crates/storage/src/instrument_persistence.rs"
   - ".claude/triage/**"
+  - "data/logs/**"
 ---
 
 # Zero-Touch Observability Architecture — SINGLE SOURCE OF TRUTH
