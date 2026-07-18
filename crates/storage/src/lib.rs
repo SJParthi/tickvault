@@ -120,7 +120,12 @@ pub mod feed_scoreboard_persistence;
 /// finding cell where a stored higher-TF candle disagrees with its
 /// recomputed-from-1m value (TF-VERIFY-01/02).
 pub mod tf_consistency_audit_persistence;
-pub mod tick_conservation_audit_persistence;
+// Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
+// `tick_conservation_audit_persistence` module DELETED — the Rust WRITER
+// only; the `tick_conservation_audit` QuestDB TABLE is RETAINED on disk
+// per SEBI 5y retention (no DDL drop anywhere). The 15:40 IST audit's
+// inputs all died with the live-WS retirements + the stage-2 tick-chain
+// deletion (#1631).
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
 // `historical_candles` QuestDB table. The module had no live consumers

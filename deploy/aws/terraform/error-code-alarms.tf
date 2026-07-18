@@ -5,12 +5,13 @@
 #   The CloudWatch-only migration (#O1/#O2/#O3) retired the
 #   Loki -> Alertmanager -> Telegram route with NO replacement, so an `error!`
 #   reached only the log sinks. On 2026-07-06 the 12:00 IST REST-CANARY-01
-#   probe failure produced ZERO pages. These 15 log metric filters + alarms
+#   probe failure produced ZERO pages. These 13 log metric filters + alarms
 #   (8 on 2026-07-06; +AGGREGATOR-DROP-01 on 2026-07-09; +WAL-SUSPEND-01 on
 #   2026-07-10; -REST-CANARY-01 retired + CROSS-VERIFY-1M-01/-02 +
 #   TICK-CONSERVE-01 added, then the two CROSS-VERIFY-1M entries RETIRED
 #   the same day by PR-C3 with their emit module, + the 5 REST-audit
-#   entries, all on 2026-07-14) on
+#   entries, all on 2026-07-14; -WS-REINJECT-01 on 2026-07-17;
+#   -TICK-CONSERVE-01 on 2026-07-18) on
 #   the /tickvault/<env>/app log group (the errors.jsonl stream) restore the
 #   route: error! -> errors.jsonl -> CloudWatch Logs -> filter -> tv_errcode_*
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
@@ -75,6 +76,18 @@
 # dead filter per the paging drift guard. New total: 14 filters + 14
 # alarms. FEED-STALL-01's earlier retirement pattern followed.
 #
+# 2026-07-18 UPDATE (tick-conservation retirement — dead-WS sweep
+# follow-up): -1 entry (TICK-CONSERVE-01, ~-$0.10/mo) -> its ONLY emit
+# site (crates/app/src/tick_conservation_boot.rs, the 15:40 IST
+# reconciler's Leak arm) was deleted with the audit modules — every audit
+# input died with the dead tick chain in the stage-2 sweep #1631 (no live
+# WAL frame writer, no processor outcome counters, nothing writes
+# `ticks`), so every run could only record `partial` and the filter could
+# never match again (a filter with no possible emit site is a dead filter
+# per the paging drift guard — the ws-reinject-01 / feed-stall-01
+# precedent). The `tick_conservation_audit` QuestDB TABLE is retained
+# (SEBI 5y, never dropped). New total: 13 filters + 13 alarms.
+#
 # 2026-07-14 UPDATE (REST-pipeline adversarial audit, GAP-01 + GAP-03 —
 # docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md): +5 entries ->
 # 17 filters + 17 alarms (~+$0.50/mo; on top of the same-day REST-CANARY-01
@@ -125,12 +138,10 @@ locals {
   #     caused it is not fixed by the episode aging out.
   #   - dh-906: a discrete per-order reject; OK = aged out, never "orders
   #     working again".
-  #   - tick-conserve-01 (2026-07-14): a daily ONE-SHOT audit finding —
-  #     the 15:40 IST conservation audit fires its residual once per day;
-  #     the auto-OK ~15 min later can never mean the residual was fixed.
-  #     Recovery signal = the NEXT trading day's clean run. (Its two
-  #     same-day siblings cross-verify-1m-01/-02 were retired hours later
-  #     by PR-C3 with their emit module — see the header note.)
+  #   (tick-conserve-01 was in this list from 2026-07-14 until its
+  #   2026-07-18 retirement with the tick-conservation audit modules —
+  #   dead-WS sweep follow-up; see the header note. Its two same-day
+  #   siblings cross-verify-1m-01/-02 had already retired in PR-C3.)
   # auth-gap-04 stays ok_recovery = true with a stated ambiguity (round-4):
   # its emit site returns Err from the boot mint path, systemd Restart=always
   # re-boots and re-emits roughly every failing boot cycle (each cycle spans
@@ -254,30 +265,18 @@ locals {
       ok_recovery = false # 2026-07-10: once-per-episode emitter - the auto-OK ~15 min later only means the datapoint aged out while the table may still be suspended (Rule-11 false-recovery; ws-reinject-01 precedent)
       desc        = "WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED - ingestion keeps ACKing rows while they silently stop becoming visible/applied (silent data-visibility loss; typical cause = a disk-full episode or a WAL apply error). Operator action: read the table/error_tag/error_message fields in the errors-jsonl stream, fix the underlying cause (df -h /data, QuestDB logs), then run ALTER TABLE <table> RESUME WAL in the QuestDB console - NEVER auto-executed (resuming into a still-broken disk replays the failure). NO recovered/OK page: the code fires once per suspension episode; recovery signal = the falling-edge recovery log + tv_questdb_wal_suspended_tables returning to 0. Runbook: .claude/rules/project/wal-suspension-error-codes.md"
     }
-    # TICK-CONSERVE-01 (added 2026-07-14 — automation-gaps PR-3): the
-    # 2026-07-10 automation audit found the High post-market audit codes
-    # were LOG-SINK-ONLY. Emit site:
-    # crates/app/src/tick_conservation_boot.rs (the 15:40 IST
-    # reconciler's Leak arm). A daily one-shot audit finding
-    # -> ok_recovery = false (the aggregator-drop-01 / ws-reinject-01
-    # precedent): the auto-OK ~15 min after the single datapoint ages out
-    # can never mean the residual was fixed (Rule-11 false-recovery); the
-    # real recovery signal is the NEXT trading day's clean run.
-    # (The sibling cross-verify-1m-01/-02 entries added by the SAME
-    # automation-gaps PR were RETIRED hours later in PR-C3, 2026-07-14 —
-    # their emit module `cross_verify_1m_boot.rs` was deleted with the
-    # Dhan instrument chain per the 2026-07-13 operator retirement
-    # directive, so the filters could never match again; leaving them
-    # would be dead filters per error_code_paging_filter_drift_guard.rs.)
-    "tick-conserve-01" = {
-      pattern     = "{ $.code = \"TICK-CONSERVE-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: daily one-shot data-accounting finding - the residual is a discrete event; aging out never means the accounting balanced (Rule-11 false-recovery)
-      desc        = "TICK-CONSERVE-01: the 15:40 IST daily tick-conservation audit found a positive residual - frames Dhan delivered (in the WAL) never reached the processor (delivery_residual: recovered by next-boot WAL replay) and/or ticks entered the pipeline but reached no known outcome (outcome_residual: a true in-process leak - investigate). Read the per-stage numbers in tick_conservation_audit + the 60s conservation ledger logs. NO recovered/OK page: a daily one-shot finding - the auto-OK ~15 min later only means the episode aged out; recovery = the next trading day's balanced row. Runbook: .claude/rules/project/tick-conservation-audit-error-codes.md"
-    }
+    # TICK-CONSERVE-01 (added 2026-07-14 — automation-gaps PR-3; RETIRED
+    # 2026-07-18 — tick-conservation retirement, dead-WS sweep follow-up):
+    # its ONLY emit site (crates/app/src/tick_conservation_boot.rs, the
+    # 15:40 IST reconciler's Leak arm) was deleted with the audit modules
+    # — every audit input died with the dead tick chain (stage-2 sweep
+    # #1631), so the filter could never match again (a filter with no
+    # possible emit site is a dead filter per
+    # error_code_paging_filter_drift_guard.rs — the ws-reinject-01 /
+    # cross-verify-1m-01/-02 precedent). The `tick_conservation_audit`
+    # QuestDB TABLE is retained (SEBI 5y, never dropped). Runbook
+    # retirement banner:
+    # .claude/rules/project/tick-conservation-audit-error-codes.md.
     # AUTH-GAP-05 (added 2026-07-14 — REST-audit GAP-01): the mid-session
     # forced token re-mint previously paged via app Telegram ONLY (no CW
     # backstop — a dead notifier silenced the token-death page entirely).
@@ -410,7 +409,8 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   alarm_actions = local.app_alarm_actions
   # ok_recovery = false (ws-reinject-01, proc-01, dh-906,
   # aggregator-drop-01 [2026-07-09], wal-suspend-01 [2026-07-10],
-  # cross-verify-1m-01/-02 + tick-conserve-01 [2026-07-14];
+  # cross-verify-1m-01/-02 + tick-conserve-01 [2026-07-14;
+  # tick-conserve-01 retired 2026-07-18 with the audit modules];
   # rest-canary-01 retired 2026-07-14 -
   # the one-shot/discrete emitters) suppresses the OK page: their auto-OK
   # ~15 min after the datapoint ages out would be a Rule-11 false

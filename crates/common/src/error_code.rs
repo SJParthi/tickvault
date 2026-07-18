@@ -562,14 +562,14 @@ pub enum ErrorCode {
     // Dhan live side to compare); its `cross_verify_1m_audit` table + CSVs
     // stay (forensic). Rule-file retirement banners carry the history.
 
-    // -----------------------------------------------------------------------
-    /// TICK-CONSERVE-01: the daily 15:40 IST end-to-end tick-conservation
-    /// audit found a positive residual — ticks Dhan delivered (counted in
-    /// the WAL disk log) did not all reach a known outcome
-    /// (DB row / filter counter). The audit row in `tick_conservation_audit`
-    /// carries the exact per-stage numbers. Severity::High (operator
-    /// directive 2026-06-10 "Go ahead to achieve zero tick loss").
-    TickConserve01DailyResidual,
+    // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
+    // TICK-CONSERVE-01 variant RETIRED — the daily 15:40 IST audit's every
+    // input died with the dead tick chain (stage-2 sweep #1631: no live WAL
+    // frame writer, no processor outcome counters, nothing writes `ticks`),
+    // so every run could only record `partial`. The audit modules were
+    // deleted; the `tick_conservation_audit` TABLE is retained (SEBI 5y,
+    // never dropped). Rule-file retirement banner:
+    // tick-conservation-audit-error-codes.md.
 
     // C4 sweep (2026-07-15): REST-CANARY-01 variant RETIRED — the canary
     // module + both spawn sites + its CloudWatch entry were deleted
@@ -1379,7 +1379,6 @@ impl ErrorCode {
             Self::BarMismatch02CrossCheckInconclusive => "BAR-MISMATCH-02",
             Self::BarMismatch03CrossCheckFailed => "BAR-MISMATCH-03",
             // Operator 2026-06-02: post-market 1-minute cross-verification
-            Self::TickConserve01DailyResidual => "TICK-CONSERVE-01",
             // DHAN-REST-400 (2026-06-10): scheduled REST-health canary
             // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => "INDEX-OHLC-02",
@@ -1547,10 +1546,6 @@ impl ErrorCode {
             | Self::AggregatorLag01TickLagDropped
             // PR #2.5 — INDEX-OHLC-02 is High (carry-over wrong but recoverable)
             | Self::IndexOhlc02DailyResetFailed
-            // Operator 2026-06-10 — daily tick-conservation residual (High:
-            // delivered-but-unaccounted ticks need operator eyes; the WAL
-            // still holds them durably, so this is not Critical data loss)
-            | Self::TickConserve01DailyResidual
             // WS-GAP-10 — order confirmations feed down in-market; the loop
             // self-retries but the operator must see it (2026-07-06 incident)
             | Self::WsGap10OrderUpdateOutage
@@ -1940,10 +1935,6 @@ impl ErrorCode {
             | Self::BarMismatch03CrossCheckFailed => {
                 ".claude/rules/project/phase-0-items-15-28-29-error-codes.md"
             }
-            // Operator 2026-06-10: daily tick-conservation audit
-            Self::TickConserve01DailyResidual => {
-                ".claude/rules/project/tick-conservation-audit-error-codes.md"
-            }
             // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => {
                 ".claude/rules/project/index-day-ohlc-tracker-error-codes.md"
@@ -2282,7 +2273,6 @@ impl ErrorCode {
             Self::BarMismatch01CorrectedFromHistorical,
             Self::BarMismatch02CrossCheckInconclusive,
             Self::BarMismatch03CrossCheckFailed,
-            Self::TickConserve01DailyResidual,
             // Day OHLC tracker for IDX_I (Ticker mode)
             Self::IndexOhlc02DailyResetFailed,
             // PR-A (2026-06-28): Groww shared-master persist
@@ -2768,11 +2758,12 @@ mod tests {
         // variant sweep): -1 WS-REINJECT-01 (WsReinject01Aborted RETIRED —
         // its only emitter, the orphaned wal_reinject.rs module, had zero
         // production callers; deleted with its dead paging filter) => 164.
-        // 2026-07-18 (full-fidelity order/position push-event capture):
-        // +1 ORDER-EVT-01 (OrderEvt01PersistFailed — order_update_events /
-        // position_update_events forensic-writer degrade; log-sink-only,
-        // High, auto-triage-safe) => 165.
-        assert_eq!(ErrorCode::all().len(), 165);
+        // 2026-07-18 (tick-conservation retirement, dead-WS sweep follow-up):
+        // -1 TICK-CONSERVE-01 (TickConserve01DailyResidual RETIRED — every
+        // audit input died with the dead tick chain in the stage-2 sweep
+        // #1631; the audit modules were deleted, the tick_conservation_audit
+        // TABLE is retained per SEBI 5y) => 163.
+        assert_eq!(ErrorCode::all().len(), 163);
     }
 
     #[test]
@@ -3269,8 +3260,6 @@ mod tests {
                 || s.starts_with("DISK-WATCHER-")
                 // zero-tick-loss 2026-06-09: WAL frame-spill writer hardening
                 || s.starts_with("WS-SPILL-")
-                // Operator 2026-06-10: daily end-to-end tick-conservation audit
-                || s.starts_with("TICK-CONSERVE-")
                 // Operator 2026-07-16: REST-era multi-TF candle derivation
                 || s.starts_with("FOLD-")
                 // Operator 2026-07-16 (PR-2): RAM residency stores
@@ -3284,6 +3273,10 @@ mod tests {
                 // 2026-07-17 (evidence-audit Fix PR C): the WS-REINJECT-
                 // prefix was likewise REMOVED with its only variant
                 // (`WsReinject01Aborted` — orphaned emit path deleted).
+                // 2026-07-18 (tick-conservation retirement): the
+                // TICK-CONSERVE- prefix was likewise REMOVED with its only
+                // variant (`TickConserve01DailyResidual` — every audit
+                // input died with the dead tick chain, stage-2 sweep).
                 // PR-A 2026-06-28: Groww shared-master persist
                 || s.starts_with("GROWW-MASTER-")
                 // §34 (2026-07-03): Groww multi-connection auto-scale ladder

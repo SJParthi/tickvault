@@ -590,10 +590,10 @@ pub const BACKLOG_TICK_AGE_MAX_SECS: u32 = 86_400;
 /// Base path for all secrets in SSM Parameter Store.
 ///
 /// Matches the repo name `tickvault`. The prior namespace was `/dlt` (from
-/// the dhan-live-trader legacy name). Run `scripts/migrate-ssm-dlt-to-
-/// tickvault.sh` once per environment to copy `/dlt/*` → `/tickvault/*`
-/// before this code is deployed; the script is idempotent and a `--delete`
-/// flag removes the old namespace after you verify the app boots cleanly.
+/// the dhan-live-trader legacy name). The one-shot `/dlt/*` → `/tickvault/*`
+/// migration has already been executed per environment; the migration
+/// script (`scripts/migrate-ssm-dlt-to-tickvault.sh`) was deleted in the
+/// rust-only phase 2a-2 purge and remains recoverable from git history.
 pub const SSM_SECRET_BASE_PATH: &str = "/tickvault";
 
 /// SSM service path segment for Dhan credentials.
@@ -3144,10 +3144,10 @@ pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 ///
 /// Archived segments are POST-confirmed-replay copies: their frames were
 /// re-injected into the live pipeline AND durably persisted before
-/// `confirm_replayed` moved them out of `replaying/`. The only reader of
-/// `archive/` after that point is the same-day 15:40 IST tick-conservation
-/// audit (`count_frames_for_ist_day`), which counts frames for the CURRENT
-/// day only (with a 3-day segment-creation pre-filter) — so even 2 days
+/// `confirm_replayed` moved them out of `replaying/`. No reader depends on
+/// aged archive segments (the last — the same-day 15:40 IST
+/// tick-conservation audit's current-day-only scan — retired 2026-07-18
+/// with the audit, the dead-WS sweep follow-up) — so even 2 days
 /// was audit-safe. 7 days is chosen instead (F3) because the archive is
 /// ALSO the only remaining copy for the documented confirm-on-channel
 /// residual (`confirm_replayed` archives on frames-IN-CHANNEL, not
