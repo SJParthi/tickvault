@@ -14,9 +14,11 @@
 //!    production code from exactly-once / must-exist scans
 //!    (token_manager.rs lost ~100 production lines this way).
 //! 2. **Prefix-only regions** — `main.rs` carries ~460 lines of PRODUCTION
-//!    code AFTER its `mod tests` block (`spawn_post_market_tasks`,
-//!    `spawn_daily_tick_conservation_task`, …); a `&src[..tests_mod_off]`
-//!    prefix is blind to needles (or duplicate needles) landing there.
+//!    code AFTER its `mod tests` block (`spawn_post_market_tasks`, …; the
+//!    other 2026-07-08 example, `spawn_daily_tick_conservation_task`, was
+//!    retired 2026-07-18 with the tick-conservation audit); a
+//!    `&src[..tests_mod_off]` prefix is blind to needles (or duplicate
+//!    needles) landing there.
 //! 3. **Comment matches** — `contains`/`matches` counting satisfied by a
 //!    COMMENT or doc-comment mention of the needle
 //!    (`LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS` appears in teardown comments),

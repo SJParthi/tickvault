@@ -155,11 +155,9 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
             "ensure_feed_episode_audit_table",
             "src/feed_scoreboard_boot.rs",
         ),
-        // tick_conservation_audit — 15:40 IST audit
-        (
-            "ensure_tick_conservation_audit_table",
-            "src/tick_conservation_boot.rs",
-        ),
+        // (tick_conservation_audit's ensure row retired 2026-07-18 with the
+        // tick-conservation audit modules — dead-WS sweep follow-up; the
+        // TABLE itself is retained per SEBI 5y, no DDL drop anywhere.)
         // index_constituency — ts-pin boot migration (SEBI, never dropped)
         (
             "ensure_index_constituency_table",

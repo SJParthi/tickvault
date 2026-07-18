@@ -39,23 +39,24 @@ fn test_main_spawns_ws_wal_archive_prune() {
         src.contains("WS_WAL_ARCHIVE_RETENTION_SECS"),
         "the prune must use the pinned WS_WAL_ARCHIVE_RETENTION_SECS \
          retention constant (7 days — audit-safe AND long-weekend-safe for \
-         the confirm-on-channel residual, F3; same-day 15:40 IST \
-         tick-conservation audit), never an ad-hoc literal"
+         the confirm-on-channel residual, F3), never an ad-hoc literal"
     );
     assert!(
         src.contains("WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS"),
         "the prune task must loop on the pinned 6h cadence constant"
     );
-    // The prune must read the SAME WAL dir the writer + conservation audit
-    // use (the single-source-of-truth helper), so the two can never drift.
+    // The prune must read the SAME WAL dir the writer uses (the
+    // single-source-of-truth helper — relocated 2026-07-18 from the retired
+    // tick_conservation_boot module into boot_helpers with the
+    // tick-conservation retirement), so the two can never drift.
     let prune_idx = src
         .find("ws_frame_spill::prune_archived_segments(")
         .expect("prune call present");
     let window = &src[prune_idx.saturating_sub(600)..prune_idx];
     assert!(
-        window.contains("tick_conservation_boot::ws_wal_dir()"),
+        window.contains("boot_helpers::ws_wal_dir()"),
         "the prune task must resolve the WAL dir via \
-         tick_conservation_boot::ws_wal_dir() (the shared single source of \
+         boot_helpers::ws_wal_dir() (the shared single source of \
          truth), not a hardcoded path"
     );
 }
