@@ -36,6 +36,12 @@
 //! - `*.rs`/`*.toml` are not scanned here — a Rust-side python spawn would be
 //!   a reviewed code change; extending the scan is the final zero-python
 //!   PR's business.
+//! - Hardened 2026-07-18 (hostile review round 1): the invocation token
+//!   matches `python` with ANY single optional ASCII digit suffix
+//!   (`python`, `python2`, `python3`, ... — not just `3`); the tracked,
+//!   extension-less `scripts/git-hooks/*` bash scripts are IN the scan
+//!   scope; and path enumeration is NUL-delimited (`git ls-files -z`), so
+//!   non-ASCII paths can never be silently mangled by git's `"..."` quoting.
 //!
 //! Cross-PR note: sibling deletion PRs (#1637 dead-python, #1645 aws-lambdas)
 //! will make `allowlist_shrinks_monotonically` FAIL on their restack until
@@ -144,7 +150,9 @@ fn stale_entries(allowlist: &[&str], tracked: &[String]) -> Vec<String> {
 
 /// Is this tracked path in scope for the invocation scan?
 /// Shell scripts, workflow/config yml+yaml, Makefiles, `.mcp.json`,
-/// terraform templates. `.py` and `.md` are excluded by construction.
+/// terraform templates, plus the extension-less tracked bash scripts under
+/// `scripts/git-hooks/` (pre-push / pre-commit / commit-msg — hostile
+/// review round 1). `.py` and `.md` are excluded by construction.
 fn is_invocation_scan_target(path: &str) -> bool {
     path.ends_with(".sh")
         || path.ends_with(".yml")
@@ -153,6 +161,7 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path == ".mcp.json"
         || path == "Makefile"
         || path.ends_with("/Makefile")
+        || path.starts_with("scripts/git-hooks/")
 }
 
 /// Whole-line comment: first non-whitespace char is `#`.
@@ -160,10 +169,12 @@ fn is_comment_line(line: &str) -> bool {
     line.trim_start().starts_with('#')
 }
 
-/// Word-boundary match for `python` / `python3` (mirrors the grep pattern
-/// `(^|[^[:alnum:]_.-])python3?([^[:alnum:]_-]|$)` the allowlist was built
-/// with): the char before must not be alnum/`_`/`.`/`-`; the char after the
-/// token (with an optional trailing `3`) must not be alnum/`_`/`-`.
+/// Word-boundary match for `python` / `python[0-9]` (widened 2026-07-18 from
+/// the original `python3?` grep pattern
+/// `(^|[^[:alnum:]_.-])python[0-9]?([^[:alnum:]_-]|$)` so `python2`-class
+/// tokens are also caught): the char before must not be alnum/`_`/`.`/`-`;
+/// the char after the token (with one optional trailing ASCII digit) must
+/// not be alnum/`_`/`-`.
 fn line_has_python_token(line: &str) -> bool {
     let bytes = line.as_bytes();
     let needle = b"python";
@@ -175,7 +186,7 @@ fn line_has_python_token(line: &str) -> bool {
             !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
         };
         let mut end = i + needle.len();
-        if end < bytes.len() && bytes[end] == b'3' {
+        if end < bytes.len() && bytes[end].is_ascii_digit() {
             end += 1;
         }
         let after_ok = end >= bytes.len() || {
@@ -246,7 +257,11 @@ fn repo_root() -> PathBuf {
 fn git_ls_files(pathspecs: &[&str]) -> Vec<String> {
     let root = repo_root();
     let mut cmd = Command::new("git");
+    // `-z` = NUL-delimited output: non-ASCII paths are emitted VERBATIM
+    // instead of C-quoted (`"..."`), which would silently defeat the
+    // extension/prefix checks (hostile review round 1, fix 3).
     cmd.arg("ls-files")
+        .arg("-z")
         .arg("--")
         .args(pathspecs)
         .current_dir(&root);
@@ -259,10 +274,20 @@ fn git_ls_files(pathspecs: &[&str]) -> Vec<String> {
         String::from_utf8_lossy(&out.stderr)
     );
     let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
+        .split('\0')
         .map(str::to_string)
         .filter(|l| !l.is_empty())
         .collect();
+    // Defense in depth: with `-z` no path may ever arrive C-quoted; a
+    // leading `"` means the enumeration contract broke — fail LOUD,
+    // never silently skip a mangled path.
+    if let Some(quoted) = files.iter().find(|p| p.starts_with('"')) {
+        panic!(
+            "rust_only_guard: `git ls-files -z` returned a C-quoted path `{quoted}` — \
+             NUL-delimited enumeration must emit paths verbatim; refusing to scan a \
+             mangled path list"
+        );
+    }
     files.sort();
     files
 }
@@ -314,8 +339,9 @@ fn allowlist_shrinks_monotonically() {
 }
 
 /// (c) NO NEW python-invocation site in .sh / .yml / .yaml / .tftpl /
-/// Makefile / .mcp.json (non-comment lines; file-level allowlist), and the
-/// site allowlist shrinks when a file goes python-clean or is deleted.
+/// Makefile / .mcp.json / scripts/git-hooks/* (non-comment lines;
+/// file-level allowlist), and the site allowlist shrinks when a file goes
+/// python-clean or is deleted.
 #[test]
 fn no_new_python_invocations() {
     assert_sorted_unique(INVOCATION_SITE_ALLOWLIST, "INVOCATION_SITE_ALLOWLIST");
@@ -324,8 +350,8 @@ fn no_new_python_invocations() {
     assert!(
         new.is_empty(),
         "RUST-ONLY VIOLATION: new python invocation site(s) {new:?} (non-comment `python`/\
-         `python3` token). The rust-only operator directive (2026-07-18) forbids new python \
-         invocations; this test is the gate. Do NOT extend INVOCATION_SITE_ALLOWLIST."
+         `python[0-9]` token). The rust-only operator directive (2026-07-18) forbids new \
+         python invocations; this test is the gate. Do NOT extend INVOCATION_SITE_ALLOWLIST."
     );
     let stale = stale_invocation_sites(&files, INVOCATION_SITE_ALLOWLIST);
     assert!(
@@ -373,6 +399,10 @@ fn guard_self_test() {
     assert!(is_invocation_scan_target("Makefile"));
     assert!(is_invocation_scan_target("sub/dir/Makefile"));
     assert!(is_invocation_scan_target(".mcp.json"));
+    // Extension-less git-hook bash scripts are IN scope (fix 2, 2026-07-18).
+    assert!(is_invocation_scan_target("scripts/git-hooks/pre-push"));
+    assert!(is_invocation_scan_target("scripts/git-hooks/pre-commit"));
+    assert!(is_invocation_scan_target("scripts/git-hooks/commit-msg"));
     assert!(!is_invocation_scan_target("scripts/foo.py"));
     assert!(!is_invocation_scan_target("docs/runbooks/foo.md"));
     assert!(!is_invocation_scan_target("crates/common/src/lib.rs"));
@@ -382,6 +412,10 @@ fn guard_self_test() {
     assert!(line_has_python_token("\tpython -m json.tool"));
     assert!(line_has_python_token("exec /usr/bin/python3.11 x"));
     assert!(line_has_python_token("\"command\": \"python3\","));
+    // pythonN widening (fix 1, 2026-07-18): any single digit suffix matches.
+    assert!(line_has_python_token("python2 legacy/x.py"));
+    assert!(line_has_python_token("/usr/bin/python2.7 y"));
+    assert!(line_has_python_token("python9 z"));
     assert!(
         !line_has_python_token("mypython3 x"),
         "prefix-joined must not match"
