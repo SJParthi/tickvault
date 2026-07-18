@@ -17,6 +17,13 @@
 //!  4. `matches` arrays (find_runbook_for_code, grep_codebase): sorted
 //!     by canonical JSON — filesystem traversal order is not part of
 //!     the parity contract.
+//!  5. pathlib subpath ValueError SUFFIX (grep_codebase outside-root
+//!     -32000 errors): CPython 3.12 (gh-84538) dropped the trailing
+//!     " OR one path is relative and the other is absolute." from
+//!     `PurePath.relative_to`'s message; the Rust port mirrors the
+//!     3.11-era long form. The stable prefix
+//!     `'<path>' is not in the subpath of '<root>'` stays load-bearing;
+//!     the version-variant suffix is stripped from BOTH sides.
 //!
 //! Sessions (env fixed at child spawn):
 //!  A: fixture logs + PATH shims (bash/docker/aws) + local HTTP mock;
@@ -386,6 +393,17 @@ fn normalize(tool: Option<&str>, resp: &Value) -> String {
         }
         if let Some(slot) = resp.pointer_mut("/result/content/0/text") {
             *slot = Value::String(canon(&inner));
+        }
+    }
+    // Rule 5: CPython-version-variant pathlib suffix (see module doc).
+    if let Some(msg) = resp.pointer("/error/message").and_then(Value::as_str) {
+        const SUBPATH: &str = " is not in the subpath of ";
+        const PY311_SUFFIX: &str = " OR one path is relative and the other is absolute.";
+        if msg.contains(SUBPATH) && msg.ends_with(PY311_SUFFIX) {
+            let stripped = msg[..msg.len() - PY311_SUFFIX.len()].to_string();
+            if let Some(slot) = resp.pointer_mut("/error/message") {
+                *slot = Value::String(stripped);
+            }
         }
     }
     canon(&resp)

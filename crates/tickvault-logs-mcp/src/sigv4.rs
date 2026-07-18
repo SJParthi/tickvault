@@ -75,6 +75,7 @@ impl AmzNow {
 /// builder for identical inputs (the request BODY is constructed manually
 /// in Python dict-insertion order with compact separators, because the
 /// body bytes feed the payload hash and therefore the signature).
+// APPROVED: argument list mirrors the Python builder positionally (golden-vector parity contract).
 #[allow(clippy::too_many_arguments)]
 pub fn build_cloudwatch_sigv4_request(
     region: &str,

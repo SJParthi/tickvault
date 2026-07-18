@@ -38,6 +38,18 @@ pub const ERRORS_JSONL_PREFIX: &str = "errors.jsonl";
 pub const SUMMARY_FILENAME: &str = "errors.summary.md";
 pub const AUTO_FIX_LOG: &str = "auto-fix.log";
 
+/// Subprocess poll granularity while waiting on a spawned child
+/// (parity: server.py subprocess timeout loop).
+const PROC_POLL_INTERVAL_MS: u64 = 25;
+/// Subprocess timeout for `scripts/doctor.sh` (parity: server.py timeout=120).
+const DOCTOR_TIMEOUT_SECS: u64 = 120;
+/// Subprocess timeout for `git log` (parity: server.py timeout=10).
+const GIT_LOG_TIMEOUT_SECS: u64 = 10;
+/// Subprocess timeout for `docker compose ps` (parity: server.py timeout=15).
+const DOCKER_PS_TIMEOUT_SECS: u64 = 15;
+/// Subprocess timeout for the read-only aws CLI fallback (parity: server.py timeout=30).
+const AWS_CLI_TIMEOUT_SECS: u64 = 30;
+
 // ---------------------------------------------------------------------------
 // Small CPython-parity helpers
 // ---------------------------------------------------------------------------
@@ -666,6 +678,7 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
         // never send the bearer over plaintext http to a non-local host.
         let (scheme, host) = split_scheme_host(&full);
         let host = host.unwrap_or_default();
+        // APPROVED: loopback allowlist for the plaintext-bearer refusal guard, never a connection target (security parity with server.py).
         let is_local = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
         if scheme != "https" && !is_local {
             return json!({
@@ -788,7 +801,7 @@ fn run_with_timeout(
                     let _ignored = child.wait();
                     return Err(ProcError::Timeout);
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(Duration::from_millis(PROC_POLL_INTERVAL_MS));
             }
             Err(e) => {
                 let _ignored = child.kill();
@@ -828,7 +841,7 @@ pub fn tool_run_doctor(ctx: &Ctx) -> Value {
         "bash",
         &["scripts/doctor.sh".to_string()],
         &ctx.repo_root,
-        Duration::from_secs(120),
+        Duration::from_secs(DOCTOR_TIMEOUT_SECS),
     ) {
         Ok(out) => out,
         Err(ProcError::Timeout) => {
@@ -879,7 +892,7 @@ pub fn tool_git_recent_log(ctx: &Ctx, limit: i64) -> Value {
             format!("--pretty=format:{fmt}"),
         ],
         &ctx.repo_root,
-        Duration::from_secs(10),
+        Duration::from_secs(GIT_LOG_TIMEOUT_SECS),
     ) {
         Ok(out) => out,
         Err(ProcError::Timeout) => return json!({"ok": false, "error": "git log timed out"}),
@@ -916,7 +929,7 @@ pub fn tool_docker_status(ctx: &Ctx) -> Value {
             "json".to_string(),
         ],
         &ctx.repo_root,
-        Duration::from_secs(15),
+        Duration::from_secs(DOCKER_PS_TIMEOUT_SECS),
     ) {
         Ok(out) => out,
         Err(ProcError::Spawn(_)) => {
@@ -998,6 +1011,7 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
 
 const GREP_SKIP_DIRS: [&str; 5] = ["target", ".git", "node_modules", "data", ".terraform"];
 
+// APPROVED: signature mirrors the archived Python helper for byte-parity.
 #[allow(clippy::too_many_arguments)]
 /// Python `Path.relative_to(root)` restricted to the grep_walk use:
 /// `path` is a FILE strictly below some walked dir, both inputs are
@@ -1459,7 +1473,7 @@ pub fn tool_cloudwatch_logs(
         &argv[0],
         &argv[1..],
         &ctx.repo_root,
-        Duration::from_secs(30),
+        Duration::from_secs(AWS_CLI_TIMEOUT_SECS),
     ) {
         Ok(out) => out,
         Err(ProcError::Spawn(_)) => {
@@ -1530,7 +1544,7 @@ const DESC_GIT: &str = "Return the last N commits on the current branch with sha
 const DESC_API: &str = "HTTP GET against the tickvault app's own REST API (port 3001 by default). Paths: /health, /api/stats, /api/quote/{security_id}, /api/instruments/diagnostic, /api/option-chain, /api/pcr, /api/index-constituency. Returns status + json (or text).";
 const DESC_DOCKER: &str = "Return `docker compose ps --format json` for the tickvault stack. Gives Claude container name/service/state/health without shelling into the host.";
 const DESC_APP_LOG: &str = "Last N lines of data/logs/app.YYYY-MM-DD.log (full INFO/DEBUG output, not just ERRORs). Optional `date` (YYYY-MM-DD) picks a different day; defaults to today UTC.";
-const DESC_CLOUDWATCH: &str = "Read recent PROD logs — fully automated, no human paste/download. PREFERRED: direct CloudWatch read via a SigV4-signed HTTPS request — the ONLY input is a read-only AWS key in the env (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN], AWS_DEFAULT_REGION); no aws CLI, no portal, no boto3. NEXT: the operator-control dashboard's logs endpoint (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). FALLBACK: read-only aws CLI on /tickvault/prod/app. Args: minutes (lookback; SigV4 + aws paths), filter_pattern (CloudWatch filter on SigV4 + aws, substring on portal, e.g. \"ERROR\" or \"WS-GAP-05\"), limit (default 100). The AWS secret/token is NEVER logged nor returned. Clear ok=false error if no path is configured.";
+const DESC_CLOUDWATCH: &str = "Read recent PROD logs — fully automated, no human paste/download. PREFERRED: direct CloudWatch read via a SigV4-signed HTTPS request — the ONLY input is a read-only AWS key in the env (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN], AWS_DEFAULT_REGION); no aws CLI, no portal, no boto3. NEXT: the operator-control dashboard's logs endpoint (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). FALLBACK: read-only aws CLI on /tickvault/prod/app. Args: minutes (lookback; SigV4 + aws paths), filter_pattern (CloudWatch filter on SigV4 + aws, substring on portal, e.g. \"ERROR\" or \"WS-GAP-05\"), limit (default 100). The AWS secret/token is NEVER logged nor returned. Clear ok=false error if no path is configured."; // secret-scan-ignore: env-var NAMES in a tool description, no credential value
 
 /// (name, description) pairs in registry order — used by the self-test.
 pub fn tool_descriptions() -> Vec<(&'static str, &'static str)> {
