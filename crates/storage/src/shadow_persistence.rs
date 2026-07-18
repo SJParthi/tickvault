@@ -492,15 +492,25 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     // last swept — re-run exactly once and rewrite the marker at the new
     // version. Deleting the file still forces a manual re-run.
     let marker_path = std::path::Path::new(LEGACY_DROP_MARKER_PATH);
-    if let Ok(content) = std::fs::read_to_string(marker_path)
-        && marker_records_current_version(&content)
-    {
-        tracing::debug!(
-            marker = LEGACY_DROP_MARKER_PATH,
-            version = LEGACY_DROP_SWEEP_VERSION,
-            "legacy candle cleanup already done at the current sweep version — skipping"
-        );
-        return;
+    if marker_path.exists() {
+        // The exists() check is the fast-path short-circuit the PR #798
+        // ratchet (crates/common/tests/legacy_drop_marker_gate_guard.rs)
+        // pins; the version compare inside decides whether the existing
+        // marker still covers the CURRENT drop list.
+        if let Ok(content) = std::fs::read_to_string(marker_path)
+            && marker_records_current_version(&content)
+        {
+            tracing::debug!(
+                marker = LEGACY_DROP_MARKER_PATH,
+                version = LEGACY_DROP_SWEEP_VERSION,
+                "legacy candle cleanup already done at the current sweep version — skipping (PR #798)"
+            );
+            return;
+        }
+        // Marker exists but records an OLDER version (or is unreadable /
+        // garbage): the drop list was extended since that deployment last
+        // swept — fall through, re-run exactly once, and rewrite the
+        // marker at the current version below.
     }
 
     let base_url = format!(
