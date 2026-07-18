@@ -1141,8 +1141,10 @@ impl OrderManagementSystem {
     /// C2 (fix-round 2026-07-14): the copy is MONOTONE — a REGRESSING (or
     /// negative garbage) `traded_qty` is refused with a `warn!` so an
     /// out-of-order/garbage update can never lower the delta baseline and
-    /// inflate the next fill (the `reconcile()` path stays the only
-    /// sanctioned downward correction). The avg-price copy is guarded the
+    /// inflate the next fill (the TERMINAL `reconcile()` arm is the only
+    /// sanctioned downward copy — the B1 contract; the NON-TERMINAL
+    /// reconcile arm REFUSES downward copies, the 2026-07-18 guard). The
+    /// avg-price copy is guarded the
     /// same way: a non-finite / non-positive wire `avg_traded_price` (the
     /// serde-default reality on non-fill updates) never poisons the tracked
     /// cumulative VWAP the delta-price math depends on.
@@ -1159,8 +1161,8 @@ impl OrderManagementSystem {
                 tracked_qty = order.traded_qty,
                 update_qty = update.traded_qty,
                 "OMS-GAP-01: REGRESSING traded_qty on a fill path — copy refused \
-                 (out-of-order/garbage update; reconcile() is the only sanctioned \
-                 downward correction)"
+                 (out-of-order/garbage update; the TERMINAL reconcile() arm is \
+                 the only sanctioned downward copy)"
             );
         }
         order.updated_at_us = now_epoch_us();

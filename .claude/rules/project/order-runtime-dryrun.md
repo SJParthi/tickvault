@@ -168,13 +168,25 @@ is CLOSED:** the reconcile non-terminal arm now REFUSES the downward
 `traded_qty` copy (mirroring the C2 WS-side monotone guard's comparison
 semantics): the local `(traded_qty, avg_traded_price)` pair stands,
 `needs_reconciliation` stays `true` (a refused correction is NOT
-consumed), and ONE coded `error!(code = OMS-GAP-02)` divergence line
-names the order id + local vs broker qty. Upward/equal copies and the
+consumed), and a coded `error!(code = OMS-GAP-02)` divergence line names
+the order id + local vs broker qty — emitted per refusal per reconcile
+pass while the divergence persists (bounded by the reconcile cadence;
+clears when the broker book catches up — the C8 upward-error precedent),
+NOT edge-latched. Upward/equal copies and the
 terminal arms are unchanged; the dry-run early return still precedes
 every correction. Bite-proven test:
 `live_mode_reconcile_refuses_downward_copy_no_double_fill`
 (engine.rs test module — pre-fix it double-emitted a `FillEvent` on WS
 redelivery; post-fix the redelivery is delta 0 / `None`).
+Flagged pre-live follow-up: the non-terminal arm still ADOPTS the
+snapshot's STATUS before the downward guard runs, so a snapshot proven
+stale by the qty check can still regress the order's status
+(pre-existing adoption; no double-count path — status is not a fill
+baseline); refusing status alongside qty on a proven-stale snapshot is a
+flagged pre-live follow-up. The terminal arm's silent unconditional
+downward copy remains the documented B1 contract (pinned by
+`live_mode_reconcile_terminal_applies_fill_but_never_status`) — out of
+this guard's scope.
 
 ## §4. Scope guard — EXPLICITLY OUT (a violating PR is REJECTED)
 
