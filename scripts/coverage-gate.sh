@@ -166,12 +166,27 @@ fi
 TSV_FILE="$(mktemp)"
 trap 'rm -f "$TSV_FILE"' EXIT
 
+# FAIL CLOSED on a PRESENT null/non-numeric lines.count / lines.covered
+# (review round 2 fix, 2026-07-18): the previous `// 0` turned an explicit
+# JSON null into 0 and let a string ride into awk (where `+0` coerces to 0),
+# so a corrupt report read 100.00% PASS. The old python crashed with a
+# TypeError there (exit 1); restore that fail-closed contract with a named
+# jq error (set -e aborts the gate on jq's non-zero exit). A MISSING key
+# stays 0 — the old python `.get(..., 0)` was equally open there, and the
+# parity contract deliberately keeps missing-key behavior unchanged.
 jq -r '
+  def req_num($k):
+    (.summary.lines // {}) as $l
+    | if ($l | has($k))
+      then ($l[$k]
+            | if type == "number" then .
+              else error("summary.lines.\($k) is present but \(type) — corrupt coverage JSON; refusing to treat it as 0 (fail closed)") end)
+      else 0 end;
   (.data // [])[]
   | (.files // [])[]
   | [ (.filename // ""),
-      (.summary.lines.count // 0),
-      (.summary.lines.covered // 0) ]
+      req_num("count"),
+      req_num("covered") ]
   | @tsv
 ' "$COVERAGE_JSON" > "$TSV_FILE"
 

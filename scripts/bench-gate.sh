@@ -114,11 +114,32 @@ while IFS= read -r f; do
   # mean.point_estimate defaults to 0 when absent; the CI lower bound is NA
   # when confidence_interval is absent, not an object, or lower_bound is
   # null (the python isinstance(ci, dict) + .get() semantics).
-  vals=$(jq -r '[ (.mean.point_estimate // 0),
+  # FAIL CLOSED on a PRESENT null/non-numeric mean.point_estimate or a
+  # present NON-NULL non-numeric lower_bound (review round 2 fix,
+  # 2026-07-18): the previous `// 0` / awk `+0` coerced them to 0, so a
+  # real +30% regression with a corrupt lower_bound silently PASSED. The
+  # old python crashed there (TypeError, exit 1). Parity kept byte-
+  # identical everywhere else: an ABSENT mean/point_estimate is still 0
+  # (documented python-parity), and a null/absent lower_bound (or a
+  # non-object confidence_interval) still takes the NA fallback.
+  vals=$(jq -r '[ ((.mean // {}) as $m
+                   | if ($m | type) == "object" and ($m | has("point_estimate"))
+                     then ($m.point_estimate
+                           | if type == "number" then . else "CORRUPT" end)
+                     else 0 end),
                   ((.mean.confidence_interval // {}) as $ci
                    | if ($ci | type) == "object"
-                     then (($ci.lower_bound // "NA") | tostring)
+                     then ($ci.lower_bound as $lb
+                           | if $lb == null then "NA"
+                             elif ($lb | type) == "number" then ($lb | tostring)
+                             else "CORRUPT" end)
                      else "NA" end) ] | @tsv' "$f")
+  case "$vals" in
+    *CORRUPT*)
+      echo "ERROR: $f: mean.point_estimate or confidence_interval.lower_bound is present but non-numeric — corrupt Criterion output; refusing to coerce it to 0 (fail closed)" >&2
+      exit 1
+      ;;
+  esac
   printf 'C\t%s\t%s\n' "$rel" "$vals" >> "$RECORDS_FILE"
 done < <(find "$CRITERION_DIR" -name "estimates.json" -path "*/change/*" 2>/dev/null | sort)
 
