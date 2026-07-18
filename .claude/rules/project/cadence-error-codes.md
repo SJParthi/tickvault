@@ -1,3 +1,12 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/cadence/**"
+  - "crates/app/src/cadence_boot.rs"
+  - "crates/common/src/config.rs"
+  - "config/base.toml"
+---
+
 # Judge-Locked Cadence Scheduler — Error Codes (CADENCE-01 / CADENCE-02 / CADENCE-03)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

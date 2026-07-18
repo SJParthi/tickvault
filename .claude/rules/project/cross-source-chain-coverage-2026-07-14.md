@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/app/src/option_chain_1m_boot.rs"
+  - "crates/app/src/spot_1m_rest_boot.rs"
+  - "crates/common/src/constants.rs"
+---
+
 # Cross-Source Chain Coverage + Dhan Chain Capture Hardening (Operator Directive 2026-07-14)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

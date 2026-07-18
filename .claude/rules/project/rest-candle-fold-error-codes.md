@@ -1,3 +1,13 @@
+---
+paths:
+  - "crates/app/src/rest_candle_fold.rs"
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/config.rs"
+  - "config/base.toml"
+  - "crates/app/src/spot_1m_rest_boot.rs"
+  - "crates/app/src/groww_spot_1m_boot.rs"
+---
+
 # REST-Era Multi-TF Candle Derivation — Error Codes (FOLD-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

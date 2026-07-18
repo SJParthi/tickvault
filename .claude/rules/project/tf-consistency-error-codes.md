@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/tf_consistency_boot.rs"
+  - "crates/storage/src/tf_consistency_audit_persistence.rs"
+  - "crates/common/src/config.rs"
+---
+
 # Daily Timeframe-Consistency Verifier — Error Codes (TF-VERIFY-01 / TF-VERIFY-02)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/storage/src/http_client.rs"
+  - "crates/storage/src/boot_probe.rs"
+  - "crates/app/src/oms_wiring.rs"
+---
+
 # Panic-Free HTTP Client Construction — Error Codes (HTTP-CLIENT-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F > this file.

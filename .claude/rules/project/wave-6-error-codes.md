@@ -1,3 +1,22 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/storage/src/shadow_persistence.rs"
+  - "crates/storage/src/seal_writer_loop.rs"
+  - "crates/app/tests/seal_drop_paging_wiring_guard.rs"
+  - "crates/storage/tests/wave_6_aggregator_alert_guard.rs"
+  - "crates/trading/src/aggregator/multi_tf.rs"
+  - "crates/app/src/groww_bridge.rs"
+  - "crates/app/src/main.rs"
+  - "crates/trading/src/candles/heartbeat.rs"
+  - "crates/trading/src/aggregator/heartbeat.rs"
+  - "crates/trading/src/aggregator/boundary_timer.rs"
+  - "crates/trading/src/candles/multi_tf_aggregator.rs"
+  - "crates/trading/src/candles/aggregator_cell.rs"
+  - "crates/app/tests/aggregation_task_wiring_guard.rs"
+  - "crates/storage/src/ws_frame_spill.rs"
+---
+
 # Wave 6 Error Codes
 
 > **Authority:** This file is the runbook target for the Wave 6 ErrorCode

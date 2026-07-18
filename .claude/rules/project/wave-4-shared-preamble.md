@@ -1,3 +1,10 @@
+---
+paths:
+  - ".claude/plans/active-plan-wave-4.md"
+  - ".claude/rules/project/wave-4-*.md"
+  - "crates/common/tests/wave4_section8_wording_guard.rs"
+---
+
 # Wave 4 — Shared Preamble (auto-loaded canonical charter)
 
 > **Authority:** CLAUDE.md > this file > defaults.

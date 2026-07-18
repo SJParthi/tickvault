@@ -1,3 +1,22 @@
+---
+paths:
+  - "crates/core/src/historical/candle_fetcher.rs"
+  - "crates/core/src/instrument/preopen_self_test.rs"
+  - "crates/core/src/instrument/depth_20_dynamic_subscriber.rs"
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/notification/events.rs"
+  - "crates/storage/src/oom_monitor.rs"
+  - "crates/app/src/main.rs"
+  - "crates/core/src/auth/secret_manager.rs"
+  - "crates/core/src/network/ip_monitor.rs"
+  - "crates/core/src/auth/token_manager.rs"
+  - "crates/core/src/auth/mid_session_watchdog.rs"
+  - "crates/core/src/auth/token_health_gauge.rs"
+  - "crates/core/src/auth/fast_boot_validation.rs"
+  - "crates/app/tests/fast_boot_token_validation_wiring_guard.rs"
+  - "crates/app/src/resource_monitor.rs"
+---
+
 # Wave 4 Error Codes (RESERVED — runbook stubs)
 
 > **Authority:** This file is the runbook target for the new ErrorCode

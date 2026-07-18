@@ -1,3 +1,19 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/spot_1m_rest_boot.rs"
+  - "crates/app/src/option_chain_1m_boot.rs"
+  - "crates/app/src/groww_spot_1m_boot.rs"
+  - "crates/app/src/groww_option_chain_1m_boot.rs"
+  - "crates/app/src/groww_contract_1m_boot.rs"
+  - "crates/storage/src/spot_1m_rest_persistence.rs"
+  - "crates/storage/src/option_chain_1m_persistence.rs"
+  - "crates/storage/src/option_contract_1m_rest_persistence.rs"
+  - "crates/storage/src/rest_fetch_audit_persistence.rs"
+  - "crates/common/src/config.rs"
+  - "crates/app/src/dhan_data_api_limiter.rs"
+---
+
 # Per-Minute REST 1m Pipeline — Error Codes (SPOT1M-01 / SPOT1M-02 / CHAIN-01..04)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

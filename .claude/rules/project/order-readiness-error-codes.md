@@ -1,3 +1,12 @@
+---
+paths:
+  - "crates/trading/src/oms/order_readiness.rs"
+  - "crates/trading/src/oms/error_taxonomy.rs"
+  - "crates/trading/src/oms/api_client.rs"
+  - "crates/trading/src/oms/engine.rs"
+  - "crates/common/src/error_code.rs"
+---
+
 # Order-Readiness Gate + Order-Path Dhan Error Taxonomy — Error Codes (ORDER-READY-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

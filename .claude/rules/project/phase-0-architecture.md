@@ -1,3 +1,12 @@
+---
+paths:
+  - "crates/storage/src/*_audit_persistence.rs"
+  - "crates/trading/src/oms/**"
+  - "crates/trading/src/indicator/**"
+  - "crates/app/src/main.rs"
+  - "crates/storage/src/static_ip_audit_persistence.rs"
+---
+
 # Phase 0 Architecture (auto-loaded rule)
 
 > **Authority:** CLAUDE.md > `.claude/rules/project/operator-charter-forever.md` > this file > defaults.

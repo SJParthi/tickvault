@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/trading/src/oms/margin_gate.rs"
+  - "crates/trading/src/oms/types.rs"
+  - "crates/trading/src/oms/api_client.rs"
+---
+
 # Dhan Funds & Margin Enforcement
 
 > **Ground truth:** `docs/dhan-ref/13-funds-margin.md`
