@@ -461,7 +461,7 @@ jobs:
           set -euo pipefail
           cargo llvm-cov clean --workspace
           # DHAT zero-alloc tests (dhat_instrument_registry / dhat_token_handle /
-          # dhat_feed_lag_ring) assert EXACT heap-allocation counts. Under
+          # dhat_feed_presence) assert EXACT heap-allocation counts. Under
           # llvm-cov the coverage instrumentation ITSELF adds allocations, so
           # those assertions fail (exit 101) and abort the whole coverage run —
           # this is why "Coverage & Perf" was RED on main for days and never
@@ -680,7 +680,6 @@ jobs:
           crates/app/tests/dhat_mark_forward.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_cadence_decide.rs
-          crates/core/tests/dhat_feed_lag_ring.rs
           crates/core/tests/dhat_feed_presence.rs
           crates/core/tests/dhat_instrument_registry.rs
           crates/core/tests/dhat_moneyness.rs
@@ -730,7 +729,6 @@ jobs:
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
             --test dhat_cadence_decide \
-            --test dhat_feed_lag_ring \
             --test dhat_feed_presence \
             --test dhat_instrument_registry \
             --test dhat_moneyness \
@@ -758,8 +756,10 @@ jobs:
           # adds dhat_cadence_decide: 10 -> 11.
           # 2026-07-17 (stage-2 dead-WS sweep): dhat_feed_consumer +
           # dhat_prev_close_writer deleted with the dead tick chain: 11 -> 9.
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-07-17 (dashboard tidy): dhat_feed_lag_ring deleted with the
+          # Dhan-lag publisher chain (run_dhan_lag_publisher/FeedLagRing): 9 -> 8.
+          if [ "$ran" -ne 8 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 8 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 

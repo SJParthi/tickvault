@@ -5,8 +5,10 @@
 //! stage-2 of the dead-WS sweep (2026-07-17) deleted it after both live
 //! feeds retired (Dhan 2026-07-13, Groww 2026-07-15). What remains here is
 //! the surviving cold/RAM surface: the chain snapshot/day stores (the RAM
-//! decision surface), `feed_lag_monitor` (live consumers: the scoreboard
-//! day-lag drain + the midnight histogram reset), and `feed_presence`.
+//! decision surface), `feed_lag_monitor` (day-lag histograms only since
+//! 2026-07-17 — the Dhan lag ring/publisher half was deleted with the dead
+//! Dhan-lag chain; live consumers: the scoreboard day-lag drain + the
+//! midnight histogram reset), and `feed_presence`.
 //!
 //! ## Movers retirement
 //!
@@ -34,7 +36,9 @@ pub mod chain_snapshot;
 // `prev_oi_cache`, `volume_delta_tracker`, `volume_monotonicity_guard`,
 // `prev_close_writer`. Zero production callers re-verified (the spawn sites
 // died in PR-C2/C3; the Groww bridge died 2026-07-15). `feed_lag_monitor`
-// is KEPT — main.rs's midnight `reset_day_lag_histogram` + the scoreboard's
-// `day_lag_summary` drain are live consumers.
+// is KEPT (day-lag-histogram half only — its Dhan lag ring/publisher half
+// was deleted 2026-07-17, dashboard tidy) — main.rs's midnight
+// `reset_day_lag_histogram` + the scoreboard's `day_lag_summary` drain are
+// live consumers.
 pub mod feed_lag_monitor;
 pub mod feed_presence;

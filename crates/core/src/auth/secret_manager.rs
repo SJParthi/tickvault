@@ -1497,13 +1497,6 @@ mod tests {
         );
     }
 
-    /// Silent-feed hardening Item 4 (2026-07-06 incident): the Dhan
-    /// exchange-lag p99 publisher MUST be spawned via its supervisor
-    /// (respawn + counter — WS-GAP-05 / SLO-03 pattern). A bare
-    /// `tokio::spawn` would regress the exact silent-task-death class the
-    /// SLO-03 incident proved: the `tv_dhan_exchange_lag_p99_seconds`
-    /// stream stops with no error!, no counter, no respawn, and the lag
-    /// alarm false-OKs on missing data (`notBreaching`).
     /// Scoreboard PR-D meta-guard: main.rs MUST (a) init the per-instrument
     /// presence registry in the process-global boot prefix BEFORE the Groww
     /// feed spawns (the boot-read fold gate; single boot path since PR-C2,

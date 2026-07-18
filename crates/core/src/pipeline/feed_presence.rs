@@ -31,8 +31,9 @@
 //! presence, and is REPORTED at drain time (named in logs, bounded sample)
 //! — never silently dropped (Rule 11).
 //!
-//! **Hot fold** ([`record_presence`], co-located with the DHAT-proven
-//! `record_dhan_tick` / `record_groww_tick` call sites): one lock-free
+//! **Hot fold** ([`record_presence`], historically co-located with the
+//! DHAT-proven feed-lag fold call sites — both deleted with the live feeds;
+//! the Dhan lag ring itself was deleted 2026-07-17): one lock-free
 //! papaya read + one relaxed `fetch_or` into the slot's 375-bit minute
 //! bitset (`[AtomicU64; 6]` per slot per feed). Minute index is pure
 //! integer math over the exchange timestamp the sites ALREADY hold — zero

@@ -117,47 +117,12 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
   .card .meta b{color:var(--ink);font-family:var(--mono);font-variant-numeric:tabular-nums;}
   .lastTick{color:var(--good);font-weight:700;}
 
-  .gridBox{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px 20px;}
-  .connGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(22px,1fr));gap:7px;}
-  .sq{position:relative;aspect-ratio:1;border-radius:5px;background:rgba(44,224,132,.85);cursor:default;
-    animation:glow 2.6s ease-in-out infinite;}
-  .sq:nth-child(3n){animation-delay:.5s}.sq:nth-child(5n){animation-delay:1.1s}.sq:nth-child(7n){animation-delay:1.7s}
-  @keyframes glow{0%,100%{box-shadow:0 0 3px rgba(44,224,132,.35)}50%{box-shadow:0 0 10px rgba(44,224,132,.8)}}
-  .sq.warn{background:rgba(255,179,46,.9);animation:blinkWarn 1.1s ease-in-out infinite;}
-  .sq.bad{background:rgba(255,80,99,.9);animation:blinkWarn .9s ease-in-out infinite;}
+  /* (Conn-grid + speed/race CSS removed 2026-07-17 — dashboard tidy: the
+     Connections + Speed sections' data producers — the Groww sidecar status
+     files and the shadow-parity TSV — were deleted with the live feeds.
+     blinkWarn stays: the problems panel's .sev dots use it.) */
   @keyframes blinkWarn{0%,100%{opacity:1;box-shadow:0 0 4px rgba(255,179,46,.5)}50%{opacity:.45;box-shadow:0 0 12px rgba(255,179,46,.9)}}
-  .sq:hover::after{content:attr(data-tip);position:absolute;bottom:130%;left:50%;transform:translateX(-50%);
-    white-space:nowrap;background:#03070b;border:1px solid var(--line);color:var(--ink);
-    font-size:12px;padding:7px 10px;border-radius:8px;z-index:20;box-shadow:0 8px 22px rgba(0,0,0,.6);}
-  .gridLegend{display:flex;gap:20px;margin-top:14px;font-size:13px;color:var(--dim);flex-wrap:wrap;}
-  .chipDot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:7px;vertical-align:-1px;}
   .emptyNote{color:var(--faint);font-size:13.5px;padding:6px 0;}
-
-  .race{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;}
-  .latRow{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:18px;}
-  .latCard{flex:1 1 180px;background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:12px 16px;}
-  .latCard .who{font-size:13px;color:var(--dim);margin-bottom:4px;}
-  .latVal{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:30px;font-weight:700;}
-  .latVal small{font-size:14px;color:var(--dim);}
-  .latVal.flash{animation:flash .7s ease;}
-  @keyframes flash{0%{color:var(--accent);text-shadow:0 0 14px rgba(63,184,255,.8)}100%{color:var(--ink);text-shadow:none}}
-  .latNote{font-size:12px;color:var(--faint);margin-top:4px;}
-  .lane{position:relative;height:46px;border-radius:10px;margin:10px 0;border:1px solid var(--line);
-    background:repeating-linear-gradient(90deg,var(--bg2) 0 46px,#0d1826 46px 92px);overflow:hidden;}
-  .lane .fill{position:absolute;inset:0 auto 0 0;width:0;border-radius:10px;}
-  .lane.py .fill{background:linear-gradient(90deg,transparent,rgba(255,179,46,.28));animation:fillrun 3.8s linear infinite;}
-  .lane.rs .fill{background:linear-gradient(90deg,transparent,rgba(44,224,132,.30));animation:fillrun 2.9s linear infinite;}
-  @keyframes fillrun{0%{width:0}92%{width:100%}100%{width:100%}}
-  .runner{position:absolute;top:50%;left:0;transform:translateY(-50%);font-size:26px;
-    filter:drop-shadow(0 0 6px rgba(0,0,0,.6));}
-  .lane.py .runner{animation:run 3.8s linear infinite;}
-  .lane.rs .runner{animation:run 2.9s linear infinite;}
-  @keyframes run{0%{left:2px}92%{left:calc(100% - 34px)}100%{left:calc(100% - 34px)}}
-  .laneTag{position:absolute;top:50%;right:12px;transform:translateY(-50%);font-size:12.5px;color:var(--dim);
-    font-family:var(--mono);}
-  .banner{margin-top:14px;background:rgba(44,224,132,.1);border:1px solid rgba(44,224,132,.35);
-    color:var(--good);border-radius:12px;padding:12px 16px;font-weight:700;font-size:14.5px;text-align:center;}
-  .banner.pending{background:rgba(255,179,46,.08);border-color:rgba(255,179,46,.3);color:var(--warn);}
 
   .dbStrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;}
   .dbCell{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 18px;}
@@ -205,24 +170,11 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
     <div class="feeds" id="feedCards"></div>
   </section>
 
-  <!-- 3. CONNECTION GRID -->
-  <section class="s3" id="board-conns" aria-label="Connections">
-    <h2>🔌 <b id="connHead">Groww connections</b> — each square is one phone line to the market</h2>
-    <div class="gridBox">
-      <div class="connGrid" id="connGrid"></div>
-      <div class="gridLegend" id="connLegend"></div>
-    </div>
-  </section>
-
-  <!-- 4. LATENCY + RACE -->
-  <section class="s4" id="board-race" aria-label="Speed">
-    <h2>⚡ <b>Speed check</b> — how fresh is each price when it reaches us?</h2>
-    <div class="race">
-      <div class="latRow" id="latRow"></div>
-      <div id="lanes"></div>
-      <div class="banner pending" id="raceBanner">🏁 race pending (needs live ticks)</div>
-    </div>
-  </section>
+  <!-- (Sections 3 "Connections" + 4 "Speed check" removed 2026-07-17 —
+       dashboard tidy: their data producers, the Groww sidecar status files
+       and the Python-vs-Rust shadow-parity TSV, were deleted with the live
+       feeds (Groww 2026-07-15; shadow client with it), so both panels could
+       only ever render permanent empty/pending states.) -->
 
   <!-- 5. DATABASE -->
   <section class="s5" id="board-db" aria-label="Database">
@@ -280,7 +232,6 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
     return secs + "s";
   }
   function fmtMb(bytes) { return (bytes / (1024 * 1024)).toFixed(0); }
-  function fmtMsFromNs(ns) { return (ns / 1e6).toFixed(1); }
 
   // ---------- smooth count-up (keyed per element id) ----------
   var shown = {};
@@ -373,96 +324,8 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
     if (!box.firstChild) box.appendChild(el("div", "emptyNote", "No feed information yet."));
   }
 
-  // ---------- 3. connection grid ----------
-  function renderConns(d) {
-    var grid = document.getElementById("connGrid");
-    var legend = document.getElementById("connLegend");
-    var head = document.getElementById("connHead");
-    grid.replaceChildren(); legend.replaceChildren();
-    var conns = d.connections || [];
-    head.textContent = conns.length + " Groww connection" + (conns.length === 1 ? "" : "s");
-    if (conns.length === 0) {
-      grid.appendChild(el("div", "emptyNote", "No connection status yet — feed off or not started."));
-      return;
-    }
-    var good = 0, warn = 0, bad = 0;
-    conns.forEach(function (c) {
-      var fresh = c.age_secs !== null && c.age_secs !== undefined && c.age_secs < 600;
-      var cls;
-      if (c.event === "streaming" && fresh) { cls = ""; good++; }
-      else if (c.event === "streaming" || c.event === "subscribed" || c.event === "connected") { cls = "warn"; warn++; }
-      else { cls = "bad"; bad++; }
-      var sq = el("div", "sq " + cls);
-      sq.setAttribute("data-tip",
-        "GROWW-" + String(c.conn_id).padStart(2, "0") +
-        " · " + fmtInt(c.subscribed_total) + " subscribed · " + c.event +
-        " · " + fmtInt(c.emitted) + " ticks · updated " + fmtAge(c.age_secs));
-      grid.appendChild(sq);
-    });
-    function leg(color, text) {
-      var s = el("span");
-      var chip = el("span", "chipDot"); chip.style.background = color;
-      s.appendChild(chip); s.appendChild(document.createTextNode(text));
-      legend.appendChild(s);
-    }
-    leg("var(--good)", "Streaming prices (" + good + ")");
-    leg("var(--warn)", "Connected / waiting (" + warn + ")");
-    leg("var(--bad)", "Stale or unknown (" + bad + ")");
-    var hint = el("span", null, "Hover any square for details");
-    hint.style.marginLeft = "auto"; hint.style.color = "var(--faint)";
-    legend.appendChild(hint);
-  }
-
-  // ---------- 4. speed / race ----------
-  function latCard(who, valueText, smallUnit, note, goodColor) {
-    var c = el("div", "latCard");
-    c.appendChild(el("div", "who", who));
-    var v = el("div", "latVal", valueText);
-    if (smallUnit) v.appendChild(el("small", null, smallUnit));
-    if (goodColor) v.style.color = "var(--good)";
-    c.appendChild(v);
-    if (note) c.appendChild(el("div", "latNote", note));
-    return c;
-  }
-  function renderRace(d) {
-    var row = document.getElementById("latRow");
-    var lanes = document.getElementById("lanes");
-    var banner = document.getElementById("raceBanner");
-    row.replaceChildren(); lanes.replaceChildren();
-    row.appendChild(latCard("🔷 DHAN", "~1", "s", "Dhan's clock only counts whole seconds"));
-    var race = d.race;
-    if (!race || !race.metrics) {
-      banner.className = "banner pending";
-      banner.textContent = "🏁 race pending (needs live ticks)";
-      return;
-    }
-    var m = race.metrics;
-    if (typeof m.latency_all_p50_ns === "number") {
-      row.appendChild(latCard("🐍 vs 🦀 recorder gap · typical (p50)", fmtMsFromNs(m.latency_all_p50_ns), "ms",
-        "how far apart the two recorders stamp the same tick", true));
-    }
-    if (typeof m.latency_all_p99_ns === "number") {
-      row.appendChild(latCard("🐍 vs 🦀 recorder gap · worst 1% (p99)", fmtMsFromNs(m.latency_all_p99_ns), "ms",
-        "from " + race.date + "'s comparison"));
-    }
-    function lane(cls, emoji, tag) {
-      var l = el("div", "lane " + cls);
-      l.appendChild(el("div", "fill"));
-      l.appendChild(el("span", "runner", emoji));
-      l.appendChild(el("span", "laneTag", tag));
-      return l;
-    }
-    lanes.appendChild(lane("py", "🐍", "Python · " + fmtInt(m.python_total_lines || 0) + " ticks"));
-    lanes.appendChild(lane("rs", "🦀", "Rust · " + fmtInt(m.rust_total_lines || 0) + " ticks"));
-    banner.className = "banner";
-    var matched = m.matched || 0;
-    var missPy = m.missing_in_python; var missRs = m.missing_in_rust;
-    var mism = m.ltp_mismatch;
-    banner.textContent = "🏁 " + fmtInt(matched) + " price updates matched exactly (" + race.date + ")" +
-      " · missing: Python " + (missPy === undefined ? "—" : fmtInt(missPy)) +
-      ", Rust " + (missRs === undefined ? "—" : fmtInt(missRs)) +
-      " · price mismatches: " + (mism === undefined ? "—" : fmtInt(mism));
-  }
+  // (renderConns + renderRace deleted 2026-07-17 — dashboard tidy; their
+  // sections + payload fields are gone, see the HTML comment above.)
 
   // ---------- 5. database ----------
   function dbCell(label, node) {
@@ -560,8 +423,6 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
       var d = await res.json();
       renderStatus(d);
       renderFeeds(d);
-      renderConns(d);
-      renderRace(d);
       renderDb(d);
       updatedBox.className = "updated";
       updatedText.textContent = "Updated " + new Date().toLocaleTimeString();
@@ -616,18 +477,18 @@ mod tests {
 
     #[test]
     fn test_board_page_has_all_section_markers() {
-        for marker in [
-            "board-status",
-            "board-feeds",
-            "board-conns",
-            "board-race",
-            "board-db",
-            "board-problems",
-        ] {
+        // (board-conns + board-race markers removed 2026-07-17 — dashboard
+        // tidy: their producers, the Groww sidecar status files + the
+        // shadow-parity TSV, were deleted with the live feeds.)
+        for marker in ["board-status", "board-feeds", "board-db", "board-problems"] {
             assert!(BOARD_HTML.contains(marker), "section marker {marker}");
         }
-        // Honest race-pending copy when no parity file exists yet.
-        assert!(BOARD_HTML.contains("race pending (needs live ticks)"));
+        for retired in ["board-conns", "board-race", "race pending"] {
+            assert!(
+                !BOARD_HTML.contains(retired),
+                "retired live-feed-era section resurrected: {retired}"
+            );
+        }
     }
 
     #[test]

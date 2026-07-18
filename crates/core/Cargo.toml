@@ -94,9 +94,6 @@ harness = false
 # slo_score.rs contract stub + the SLO-01/02/03 variants (wave-3-d PARK
 # banner: "Phase C variant cleanup").
 
-[[bench]]
-name = "feed_lag_ring"
-harness = false
 
 [[bench]]
 name = "feed_presence"
