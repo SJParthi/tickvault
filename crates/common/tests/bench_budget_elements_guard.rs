@@ -67,6 +67,7 @@ fn bench_gate_divides_median_by_element_count() {
 // bench (crates/core/benches/full_tick_processing.rs) measured the deleted
 // tick chain and was deleted with it, so the row was removed from
 // benchmark-budgets.toml (dated comment there). The surviving hot-path
-// budgets (dispatch_frame/pipeline/feed_presence/moneyness) keep their own
+// budgets (dispatch_frame/pipeline/moneyness — feed_presence retired
+// 2026-07-18 with the presence registry) keep their own
 // bench-gate enforcement (the feed_lag key retired 2026-07-17 with the dead
 // Dhan-lag ring/publisher chain — dashboard tidy).

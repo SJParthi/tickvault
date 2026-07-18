@@ -122,7 +122,7 @@ Namespace `Tickvault/Prod`, dimension `host`. Add panels for:
 | QuestDB connected | `tv_questdb_disconnected_seconds` | `0` |
 | Silent instruments | `tv_tick_gap_instruments_silent` | `0` |
 | Token life left | `tv_token_remaining_seconds` | `> 14400` |
-| Ticks dropped | `tv_spill_dropped_total` | `0` |
+| Ticks dropped | `tv_spill_dropped_total` *(retired 2026-07-18 — stage-4 dead-producer sweep; zero emit sites)* | `0` |
 | Candles sealed | `tv_aggregator_seals_emitted_total` | rising |
 | Overall score | `tv_realtime_guarantee_score` | `≥ 0.95` |
 | Clock skew | `tv_clock_skew_seconds` | `< 2` |

@@ -95,9 +95,8 @@ harness = false
 # banner: "Phase C variant cleanup").
 
 
-[[bench]]
-name = "feed_presence"
-harness = false
+# [[bench]] feed_presence removed 2026-07-18 (stage-4 dead-producer sweep)
+# with the deleted producer-less presence registry.
 
 [[bench]]
 name = "moneyness"

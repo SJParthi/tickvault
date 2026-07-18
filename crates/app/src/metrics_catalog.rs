@@ -63,14 +63,9 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-// Scoreboard PR-D (2026-07-11) — per-instrument presence registry
-// (`tickvault_core::pipeline::feed_presence`): deliberately ZERO metrics.
-// The hot fold is metrics-free by design (one papaya read + one relaxed
-// fetch_or; unregistered-fold / overflow counters are internal atomics
-// surfaced by the 15:45 drain's log line + the SCOREBOARD-01 error arms),
-// and per-instrument coverage is QuestDB-side data (`feed_coverage_daily`)
-// — never re-published as CloudWatch series (the design-§6 cost stance:
-// the scoreboard's ONE new EMF series remains the PR-C Groww lag gauge).
+// Scoreboard PR-D presence registry: DELETED 2026-07-18 (stage-4
+// dead-producer sweep) — it carried deliberately ZERO metrics, so no
+// catalog change accompanies the deletion.
 
 /// Metric name for the per-component memory estimate gauge.
 ///

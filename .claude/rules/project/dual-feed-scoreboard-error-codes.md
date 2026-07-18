@@ -208,7 +208,14 @@ asymmetry stays stated on every surface: Dhan carries a ≥1s whole-second
 quantization floor while Groww is millisecond-precise but measured at the
 sidecar capture instant one hop downstream of the socket (`lag_floor_ms`
 column: 1000 dhan / 1 groww). **Per-instrument coverage is LIVE since
-PR-D (2026-07-11):** the in-memory `FeedPresenceRegistry`
+PR-D (2026-07-11)** *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the
+`FeedPresenceRegistry` (`feed_presence.rs` + `presence_registration.rs`) was
+DELETED — its record/register producers died with the live feeds (Dhan
+2026-07-13, Groww 2026-07-15), so the registry was structurally unfeedable
+and every drain read `None`; `coverage_source` degrades honestly to the
+documented `sql_backfill` fallback, the `feed_coverage_daily` table +
+historical `in_memory`/`mixed` rows + the keep-better guard stay, and the
+day-lag −1 sentinels follow the same REST-only-runtime dormancy class)*:** the in-memory `FeedPresenceRegistry`
 (`crates/core/src/pipeline/feed_presence.rs`) folds one relaxed
 `fetch_or` per tick into per-slot 375-minute bitsets at the SAME
 DHAT-proven persist sites as the lag rings (both Dhan arms +
