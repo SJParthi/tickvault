@@ -93,6 +93,19 @@
 //!     bodies (CloudWatch filterPattern) remain raw UTF-8 vs Python's
 //!     escaped form — semantically identical JSON, each side signs its
 //!     own bytes, not part of the parity wire.
+//!   - errors.jsonl files containing invalid UTF-8 (review LOW-1,
+//!     2026-07-18): the python oracle's `read_text()` raised
+//!     UnicodeDecodeError → the -32000 `tool ... failed:` LOUD failure
+//!     for the whole call. Rust lossy-decodes (U+FFFD replacement — the
+//!     pre-existing app_log_tail behavior) in tail_errors /
+//!     list_novel_signatures / signature_history: the binary line fails
+//!     the per-line JSON parse and is skipped, every valid JSON line
+//!     still parses. Strictly MORE AVAILABLE than python (valid lines
+//!     preserved instead of a whole-call error). Pre-fix Rust silently
+//!     dropped the WHOLE file while still listing it in files_scanned —
+//!     the worst of both. A genuinely unreadable file (io error) keeps
+//!     the skip-continue semantics. The parity transcript uses
+//!     valid-UTF-8 files only, so the byte-parity gate is unaffected.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]

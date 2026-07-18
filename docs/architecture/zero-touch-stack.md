@@ -109,7 +109,7 @@ AWS path (opt-in):
 | 5.1, 5.2 | `7b87ab2` | `summary_writer` tokio task, FNV-1a signature grouping, 18 unit tests; `make status` integration. |
 | 6.1, 6.2 | `a3145e9` | `error-rules.yaml` (7 seed rules), `error-triage.sh` shell hook, 3 auto-fix scripts, 7-test `triage_rules_guard`. |
 | 7.1 | `a3145e9` | `claude-loop-prompt.md` runbook. |
-| 7.2 | `8c53928` | `scripts/mcp-servers/tickvault-logs/server.py` — 5-tool MCP (`tail_errors`, `list_novel_signatures`, `summary_snapshot`, `triage_log_tail`, `signature_history`); 7-test `tickvault_logs_mcp_guard`. |
+| 7.2 | `8c53928` | The Python `tickvault-logs` MCP server (`server.py`, historical) — 5-tool MCP (`tail_errors`, `list_novel_signatures`, `summary_snapshot`, `triage_log_tail`, `signature_history`); 7-test `tickvault_logs_mcp_guard`. _(2026-07-18 Rust cutover — the Python server was deleted; replaced by `crates/tickvault-logs-mcp`, launched via `scripts/mcp-servers/tickvault-logs-launch.sh`.)_ |
 | 8.1 | `a3145e9`, `a81206f` | `scripts/auto-fix-{restart-depth,refresh-instruments,clear-spill}.sh`. |
 | 8.2 | `c68346d` | `deploy/aws/lambda/claude-triage/` Lambda + `claude-triage-lambda.tf` (opt-in); 7-test `claude_triage_lambda_guard`. _(RETIRED 2026-07-18 — claude-triage lambda deleted in the Rust-only purge, never provisioned (0 of 13 AWS functions); the guard was deleted with it. See git history.)_ |
 | 9.1 | `1cdd78a` | `operator-health.json` single-page Grafana dashboard (14 panels); 7-test `operator_health_dashboard_guard`. _(RETIRED in the CloudWatch-only migration #O1; the dashboard tree + its guard were deleted. CloudWatch Dashboards replace operator visualization in prod.)_ |
@@ -132,7 +132,7 @@ AWS path (opt-in):
 | Claude loop prompt | `.claude/triage/claude-loop-prompt.md` |
 | Shell triage hook | `.claude/hooks/error-triage.sh` |
 | Auto-fix scripts | `scripts/auto-fix-*.sh` |
-| MCP log server | `scripts/mcp-servers/tickvault-logs/server.py` |
+| MCP log server | `crates/tickvault-logs-mcp` _(2026-07-18 Rust cutover — the Python server was deleted; launched via `scripts/mcp-servers/tickvault-logs-launch.sh`)_ |
 | AWS triage Lambda | RETIRED 2026-07-18 — `deploy/aws/lambda/claude-triage/handler.py` deleted in the Rust-only purge, never provisioned (0 of 13 AWS functions); see git history |
 | Lambda Terraform | RETIRED 2026-07-18 — `deploy/aws/terraform/claude-triage-lambda.tf` deleted with the lambda; see git history |
 | Logs shipping (current) | CloudWatch Logs agent → CloudWatch Logs _(Loki/Alloy retired in the CloudWatch-only migration #O1–#O3)_ |
