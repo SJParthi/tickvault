@@ -130,43 +130,20 @@ resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_missing" {
 # ---------------------------------------------------------------------------
 # Boot-window gate Lambda — enables the alarm's actions during the morning boot
 # window and disables them otherwise. Pattern mirrors budget-guards.tf.
+#
+# 2026-07-18 (rust-only phase 2b-1): the inline Python heredoc was PORTED to
+# Rust — crates/aws-lambdas/src/alarm_gate.rs (lib logic + unit tests) +
+# src/bin/boot_heartbeat_gate.rs (thin bootstrap bin). Behavior parity:
+# mode="open" (08:50 IST) → enable actions + reset the alarm to OK with the
+# exact 'boot-heartbeat window opened (08:50 IST)' reason; any other mode
+# (incl. missing) → close, disabling actions — so the nightly/weekend stop
+# (metric goes missing intentionally) never pages. (2026-07-09: close was
+# moved 09:10 → 09:20 to close the market-open seam; see the header note.)
+# The zip is built in CI by the build-lambdas job (terraform-apply.yml) and
+# downloaded into ${path.module}/.lambda-zips/ before plan/apply;
+# source_code_hash is a digest of the Rust SOURCE (Rust builds are not
+# bit-reproducible, so hashing the zip would churn every build).
 # ---------------------------------------------------------------------------
-data "archive_file" "tv_boot_heartbeat_gate_zip" {
-  type        = "zip"
-  output_path = "${path.module}/.tv-boot-heartbeat-gate.zip"
-  source {
-    content  = <<-PYEOF
-import os, boto3
-
-cw = boto3.client('cloudwatch')
-
-ALARM_NAME = os.environ['ALARM_NAME']
-
-# mode="open"  (08:50 IST) -> enable alarm actions for the boot window.
-# mode="close" (09:20 IST) -> disable them again so the nightly/weekend stop
-#                             (metric goes missing intentionally) never pages.
-#                             (2026-07-09: was 09:10 — moved to 09:20 to close
-#                             the market-open seam; see the header note.)
-def handler(event, context):
-    mode = (event or {}).get('mode', 'close')
-    if mode == 'open':
-        cw.enable_alarm_actions(AlarmNames=[ALARM_NAME])
-        # Reset to OK on open so a stale ALARM from a prior window does not
-        # immediately re-fire on the first enabled evaluation.
-        cw.set_alarm_state(
-            AlarmName=ALARM_NAME,
-            StateValue='OK',
-            StateReason='boot-heartbeat window opened (08:50 IST)',
-        )
-        print(f"enabled actions for {ALARM_NAME}")
-        return {'mode': mode, 'enabled': True}
-    cw.disable_alarm_actions(AlarmNames=[ALARM_NAME])
-    print(f"disabled actions for {ALARM_NAME}")
-    return {'mode': mode, 'enabled': False}
-PYEOF
-    filename = "index.py"
-  }
-}
 
 resource "aws_iam_role" "tv_boot_heartbeat_gate" {
   name = "tv-${var.environment}-boot-heartbeat-gate-role"
@@ -205,11 +182,12 @@ resource "aws_iam_role_policy" "tv_boot_heartbeat_gate" {
 
 resource "aws_lambda_function" "tv_boot_heartbeat_gate" {
   function_name    = "tv-${var.environment}-boot-heartbeat-gate"
-  filename         = data.archive_file.tv_boot_heartbeat_gate_zip.output_path
-  source_code_hash = data.archive_file.tv_boot_heartbeat_gate_zip.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/boot-heartbeat-gate.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
   role             = aws_iam_role.tv_boot_heartbeat_gate.arn
-  handler          = "index.handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 30
   memory_size      = 128
   environment {

@@ -182,6 +182,66 @@ jobs:
       - name: Bootstrap S3 state backend + DynamoDB lock (idempotent)
         run: bash scripts/aws-bootstrap-state-backend.sh "${{ steps.aws_account.outputs.account_id }}" "${{ env.AWS_REGION }}"
 
+      # rust-only phase 2b-1 (2026-07-18): the 4 operational Lambdas
+      # (daily-budget-digest, boot-heartbeat-gate, market-hours-liveness-gate,
+      # budget-killswitch) are Rust bins in crates/aws-lambdas, packaged as
+      # provided.al2023/arm64 bootstrap zips into
+      # deploy/aws/terraform/.lambda-zips/. Terraform reads them via
+      # `filename` + `file(".lambda-zips/source.digest")` at PLAN and APPLY
+      # time, so this step runs on BOTH runners (the apply runner re-plans —
+      # see the archive_file note on the apply step). source.digest hashes
+      # the Rust SOURCE (crate git tree + Cargo.lock), not the zip — Rust
+      # builds are not bit-reproducible, so hashing the zip would churn
+      # every apply with zero source change.
+      #
+      # Install-pinning honesty (2026-07-18): the cargo-lambda 1.9.1 prebuilt
+      # release download was proxy-blocked from the dev sandbox, so its
+      # sha256 could not be computed/verified there. The install is therefore
+      # VERSION-pinned via crates.io (`cargo install cargo-lambda@1.9.1
+      # --locked` — the crate's own Cargo.lock pins its dependency tree)
+      # instead of an unverifiable sha-pinned binary download.
+      #
+      # 2026-07-18 (hostile-review r1 F1): the --arm64 cross-compile on the
+      # x86_64 runner needs ZIG (cargo-lambda delegates to cargo-zigbuild;
+      # the first live run died with "Zig is not installed" AFTER a ~8 min
+      # uncached cargo-lambda install). Zig is now installed version-pinned
+      # up front (ziglang==0.14.1 PyPI wheel — cargo-lambda's documented
+      # pip install path; cargo-zigbuild finds it via `python3 -m ziglang`).
+      # The former best-effort aarch64-musl fallback is DELETED
+      # (2026-07-18): its `if cargo install ...; then build; else fallback`
+      # shape made the fallback unreachable for BUILD failures inside the
+      # then-branch, and the musl path was shaky for aws-lc-rs anyway — the
+      # flow is now linear and every failure is loud. The ~8 min uncached
+      # cargo-lambda install is absorbed by the adjacent actions/cache step
+      # (tag-pinned @v4, this workflow's house action-pinning style).
+      - name: Cache cargo-lambda
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-lambda
+          key: cargo-lambda-1.9.1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build Rust lambda zips
+        run: |
+          set -euo pipefail
+          ZIP_DIR="${{ env.TF_DIR }}/.lambda-zips"
+          mkdir -p "${ZIP_DIR}"
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch"
+          # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
+          # (--break-system-packages: ubuntu-24.04 system pip is PEP-668
+          # externally-managed; harmless where the runner image already
+          # sets PIP_BREAK_SYSTEM_PACKAGES.) Fails loudly under set -e.
+          pip3 install --break-system-packages ziglang==0.14.1
+          # cargo-lambda: cache-restored or version-pinned install; a failed
+          # install fails the step (no silent fallback — 2026-07-18 F1 fix).
+          command -v cargo-lambda >/dev/null 2>&1 || cargo install cargo-lambda@1.9.1 --locked
+          cargo lambda build --release --arm64 --output-format zip -p tickvault-aws-lambdas
+          for b in ${BINS}; do
+            cp "target/lambda/${b}/bootstrap.zip" "${ZIP_DIR}/${b}.zip"
+          done
+          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
+          printf '%s' "${SRC_DIGEST}" > "${ZIP_DIR}/source.digest"
+          ls -la "${ZIP_DIR}"
+
       - name: terraform fmt -check
         run: terraform -chdir=${{ env.TF_DIR }} fmt -check -recursive
 
@@ -322,6 +382,40 @@ jobs:
         with:
           name: terraform-plan-${{ github.sha }}
           path: ${{ env.TF_DIR }}/
+
+      # rust-only phase 2b-1: the apply runner RE-PLANS (see the apply step
+      # note), so it must rebuild the .lambda-zips/ Rust bootstrap zips +
+      # source.digest locally, exactly like the plan runner. Same
+      # version-pinned install path + zig install + linear no-fallback flow
+      # (2026-07-18 hostile-review r1 F1 fix — full rationale on the plan
+      # job's twin step; KEEP the two Cache/Build steps textually identical).
+      - name: Cache cargo-lambda
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-lambda
+          key: cargo-lambda-1.9.1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build Rust lambda zips
+        run: |
+          set -euo pipefail
+          ZIP_DIR="${{ env.TF_DIR }}/.lambda-zips"
+          mkdir -p "${ZIP_DIR}"
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch"
+          # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
+          # (--break-system-packages: ubuntu-24.04 system pip is PEP-668
+          # externally-managed; harmless where the runner image already
+          # sets PIP_BREAK_SYSTEM_PACKAGES.) Fails loudly under set -e.
+          pip3 install --break-system-packages ziglang==0.14.1
+          # cargo-lambda: cache-restored or version-pinned install; a failed
+          # install fails the step (no silent fallback — 2026-07-18 F1 fix).
+          command -v cargo-lambda >/dev/null 2>&1 || cargo install cargo-lambda@1.9.1 --locked
+          cargo lambda build --release --arm64 --output-format zip -p tickvault-aws-lambdas
+          for b in ${BINS}; do
+            cp "target/lambda/${b}/bootstrap.zip" "${ZIP_DIR}/${b}.zip"
+          done
+          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
+          printf '%s' "${SRC_DIGEST}" > "${ZIP_DIR}/source.digest"
+          ls -la "${ZIP_DIR}"
 
       - name: terraform init (with S3 backend)
         run: |

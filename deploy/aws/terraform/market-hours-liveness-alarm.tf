@@ -215,103 +215,30 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
 #     alarm RETIRED 2026-07-15 with the Groww live-feed retirement — the
 #     seals metric lost its last live producer; historical)
 # ---------------------------------------------------------------------------
-data "archive_file" "tv_market_hours_liveness_gate_zip" {
-  type        = "zip"
-  output_path = "${path.module}/.tv-market-hours-liveness-gate.zip"
-  source {
-    content  = <<-PYEOF
-import os, boto3
-from datetime import datetime, timedelta, timezone
-
-cw = boto3.client('cloudwatch')
-ec2 = boto3.client('ec2')
-ssm = boto3.client('ssm')
-
-ALARM_NAMES = [n.strip() for n in os.environ['ALARM_NAMES'].split(',') if n.strip()]
-INSTANCE_ID = os.environ['EC2_INSTANCE_ID']
-HOLIDAY_STOP_PARAM = os.environ['HOLIDAY_STOP_PARAM']
-IST = timedelta(hours=5, minutes=30)
-
-# mode="open"  (09:20 IST) -> enable alarm actions for the market-hours window,
-#                             but ONLY if the tv-app box is actually up.
-# mode="close" (15:35 IST) -> disable them again so the intentional off-hours
-#                             state (metric missing on the nightly/weekend
-#                             stop, or legitimately-zero score/seals while the
-#                             box idles outside market hours) never pages.
-#
-# WEEKDAY-NSE-HOLIDAY SAFETY (2026-07-07 review fix): the open cron is a plain
-# MON-FRI schedule with no NSE-holiday awareness, and on weekday NSE holidays
-# the box SELF-STOPS at boot (deploy/aws/holiday-gate.sh, ~08:32 IST). Enabling
-# the breaching-on-missing members of ALARM_NAMES (market-hours-liveness,
-# app-log-ingestion-silent) against an intentionally-stopped box would
-# false-page every weekday holiday (~09:25 / ~09:35 IST). So "open" first asks
-# EC2 whether the instance is up; a not-up box (holiday self-stop or operator
-# manual stop) keeps its actions DISABLED and skips the OK reset.
-# FAIL-OPEN: any DescribeInstances error enables as before — a real trading
-# day must never lose the liveness page (mirror of holiday-gate.sh's
-# fail-open philosophy, pointed the other way).
-def holiday_stop_is_today():
-    # ROUND-3 hardening (2026-07-07): deploy/aws/holiday-gate.sh stamps
-    # today's IST date into HOLIDAY_STOP_PARAM right BEFORE it self-stops the
-    # box on a weekday NSE holiday. Marker == today is AUTHORITATIVE for
-    # "intentionally stopped today" — unlike the single instance-state sample
-    # below, it cannot be raced by a holiday-blind restarter briefly bringing
-    # the box up around 09:20 IST (the restart-war window). Stale markers
-    # (a previous holiday's date) never match today. FAIL-OPEN: any SSM error
-    # / missing param = not a holiday — a real trading day must never lose
-    # the liveness page.
-    try:
-        raw = (ssm.get_parameter(Name=HOLIDAY_STOP_PARAM)['Parameter']['Value'] or '').strip()
-        today_ist = (datetime.now(timezone.utc) + IST).strftime('%Y-%m-%d')
-        return raw == today_ist
-    except Exception as e:
-        print(f"holiday-stop marker unavailable ({e}) -- fail-open, not a holiday")
-        return False
-
-def instance_is_up():
-    try:
-        r = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
-        state = r['Reservations'][0]['Instances'][0]['State']['Name']
-        # 'pending' counts as up: a late trading-day start must still arm the
-        # window (the OK reset + 5-15 min evaluation absorb the boot).
-        return state in ('running', 'pending'), state
-    except Exception as e:
-        print(f"describe_instances failed ({e}) -- fail-open, treating as up")
-        return True, 'unknown'
-
-def handler(event, context):
-    mode = (event or {}).get('mode', 'close')
-    if mode == 'open':
-        # Marker check FIRST — race-proof (round 3); instance state second —
-        # covers the marker-less manual-stop case (round 1).
-        if holiday_stop_is_today():
-            print(f"holiday-stop marker == today (NSE holiday self-stop); "
-                  f"leaving actions disabled for {ALARM_NAMES}")
-            return {'mode': mode, 'enabled': False, 'holiday_stop': True}
-        up, state = instance_is_up()
-        if not up:
-            print(f"instance {INSTANCE_ID} state={state} -- intentional stop "
-                  f"(NSE holiday self-stop / manual); leaving actions disabled "
-                  f"for {ALARM_NAMES}")
-            return {'mode': mode, 'enabled': False, 'instance_state': state}
-        cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)
-        # Reset to OK on open so a stale ALARM from a prior window does not
-        # immediately re-fire on the first enabled evaluation.
-        for name in ALARM_NAMES:
-            cw.set_alarm_state(
-                AlarmName=name,
-                StateValue='OK',
-                StateReason='market-hours window opened (09:20 IST)',
-            )
-        print(f"enabled actions for {ALARM_NAMES}")
-        return {'mode': mode, 'enabled': True}
-    cw.disable_alarm_actions(AlarmNames=ALARM_NAMES)
-    print(f"disabled actions for {ALARM_NAMES}")
-    return {'mode': mode, 'enabled': False}
-PYEOF
-    filename = "index.py"
-  }
-}
+# 2026-07-18 (rust-only phase 2b-1): the inline Python heredoc was PORTED to
+# Rust — crates/aws-lambdas/src/market_hours_gate.rs (lib logic + unit
+# tests) + src/bin/market_hours_liveness_gate.rs (thin bootstrap bin).
+# Behavior parity, unchanged env contract (ALARM_NAMES comma-list,
+# EC2_INSTANCE_ID, HOLIDAY_STOP_PARAM):
+#   mode="open"  (09:20 IST) → enable the gated alarms' actions, but ONLY if
+#     (a) the holiday-stop marker != today (checked FIRST — round-3
+#         race-proof; FAIL-OPEN on any SSM error: not a holiday) and
+#     (b) the tv-app box is up ('running'/'pending'; FAIL-OPEN on any
+#         DescribeInstances error — a real trading day must never lose the
+#         liveness page), then reset each alarm to OK with the exact
+#         'market-hours window opened (09:20 IST)' reason.
+#   mode="close" (15:35 IST) → disable them again so the intentional
+#     off-hours state never pages.
+# The weekday-NSE-holiday safety chain (2026-07-07 rounds 1+3) lives on in
+# the Rust port and is ratcheted by
+# crates/app/tests/cloudwatch_agent_glob_guard.rs
+# (test_gate_lambda_open_is_holiday_safe +
+#  test_gate_lambda_open_checks_holiday_marker_first — repointed at the
+# Rust source in the same PR as this heredoc removal).
+# The zip is built in CI by the build-lambdas job (terraform-apply.yml) and
+# downloaded into ${path.module}/.lambda-zips/ before plan/apply;
+# source_code_hash is a digest of the Rust SOURCE (Rust builds are not
+# bit-reproducible, so hashing the zip would churn every build).
 
 resource "aws_iam_role" "tv_market_hours_liveness_gate" {
   name = "tv-${var.environment}-market-hours-liveness-gate-role"
@@ -372,11 +299,12 @@ resource "aws_iam_role_policy" "tv_market_hours_liveness_gate" {
 
 resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
   function_name    = "tv-${var.environment}-market-hours-liveness-gate"
-  filename         = data.archive_file.tv_market_hours_liveness_gate_zip.output_path
-  source_code_hash = data.archive_file.tv_market_hours_liveness_gate_zip.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/market-hours-liveness-gate.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
   role             = aws_iam_role.tv_market_hours_liveness_gate.arn
-  handler          = "index.handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 30
   memory_size      = 128
   environment {
