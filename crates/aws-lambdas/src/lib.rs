@@ -28,4 +28,6 @@ pub mod events;
 pub mod logging;
 pub mod market_hours_gate;
 pub mod operator_control;
+pub mod operator_control_action_commands;
+pub mod operator_control_commands;
 pub mod time;

@@ -4,6 +4,21 @@
 //! script, NEVER hand-transcribed. Byte-exact with `_VIEW_COMMANDS`,
 //! `_LATENCY_COMMANDS`, `_STORAGE_COMMANDS`, `_FEEDS_VIEW_COMMANDS` and
 //! `_rest_latency_sql()`.
+//!
+//! The `=` in `upsertKey=true` MUST stay URL-encoded as %3D in the
+//! DEDUP_KEYS view command — it is the ONLY view query carrying a raw `=`
+//! inside the ?query= value, which the QuestDB /exp query-string parser
+//! mis-handled, returning empty so the dashboard dedup panel showed "?".
+//! The encoded form yields a clean count of the 4 upsert-key columns — the
+//! REAL `spot_1m_rest` DEDUP key is (ts, security_id, exchange_segment, feed)
+//! per DEDUP_KEY_SPOT_1M_REST in crates/storage/src/spot_1m_rest_persistence.rs
+//! (the designated ts is always an upsertKey column).
+//!
+//! REST-era scope (2026-07-16 cleanup): every live-feed WebSocket is deleted
+//! (Dhan 2026-07-13, Groww 2026-07-15), so the old per-feed WS TCP/TLS probes
+//! to api-feed.dhan.co / socket-api.groww.in and the lag-percentile grid over
+//! `ticks` are all retired — those hosts appear in THIS comment only, never in
+//! any command below (the retired-hosts absence scan pins that).
 
 /// python: `_VIEW_COMMANDS` (handler.py:332-355).
 pub const VIEW_COMMANDS: [&str; 13] = [
