@@ -200,6 +200,11 @@ pub mod partition_archive;
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
 pub mod order_audit_persistence;
+// Full-fidelity order/position push-event capture (design 2026-07-18;
+// ORDER-EVT-01): one row per received broker push event, BOTH feeds —
+// the capture companions of the lossy 11-field BrokerOrderEvent seam.
+pub mod order_update_events_persistence;
+pub mod position_update_events_persistence;
 // Cluster-C order-side observability (2026-07-14): daily P&L snapshot
 // audit — rebuild of the Phase-0 Item-25 table deleted in #T4 (2026-05-20);
 // the OnEod row is the daily heartbeat/denominator (STORAGE-GAP-03).
