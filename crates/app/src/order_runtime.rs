@@ -899,6 +899,12 @@ async fn run_order_runtime(
     // closed channel instantly: a permanent flap that reset the paper book
     // at every backoff step from 15:31 through post-close).
     let mut mark_channel_open = true;
+    // 2026-07-18: distinguishes the legit day-complete close from a
+    // producer-less boot (the PR #1624 class — every mark_forward call
+    // site config-dead, sole sender dropped at boot, channel closed
+    // before the first mark). Wording-only: control flow is identical
+    // (Fix F's disarm-and-continue stands; no clean_exit respawn flap).
+    let mut saw_any_mark = false;
     let mut housekeeping = tokio::time::interval(Duration::from_secs(HOUSEKEEPING_TICK_SECS));
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -961,16 +967,29 @@ async fn run_order_runtime(
             // day-scoped producers close the channel — Fix F) ----
             mark = mark_rx.recv(), if mark_channel_open => {
                 let Some(first) = mark else {
-                    warn!(
-                        "order runtime: mark channel closed (day-scoped mark \
-                         producers finished) — mark arm disarmed; the runtime \
-                         stays live (order updates, reconcile, 15:30 sweep and \
-                         16:00 reset keep running; marks resume at the next \
-                         process boot)"
-                    );
+                    if saw_any_mark {
+                        warn!(
+                            "order runtime: mark channel closed (day-scoped mark \
+                             producers finished) — mark arm disarmed; the runtime \
+                             stays live (order updates, reconcile, 15:30 sweep and \
+                             16:00 reset keep running; marks resume at the next \
+                             process boot)"
+                        );
+                    } else {
+                        // 2026-07-18: zero marks EVER arrived — this is a
+                        // producer-less configuration (no live mark source
+                        // wired), NOT the benign ~15:31 day-complete close.
+                        warn!(
+                            "order runtime: mark channel closed before any mark \
+                             arrived — no live mark producer is configured; paper \
+                             fills and P&L marks will not update (order updates, \
+                             reconcile, 15:30 sweep and 16:00 reset keep running)"
+                        );
+                    }
                     mark_channel_open = false;
                     continue;
                 };
+                saw_any_mark = true;
                 let mut processed = 0usize;
                 let mut next = Some(first);
                 while let Some(m) = next {
