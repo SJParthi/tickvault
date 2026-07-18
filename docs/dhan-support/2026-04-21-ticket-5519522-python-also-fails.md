@@ -234,6 +234,8 @@ server-side disposition of our requests would unblock us.
   [`scripts/depth200-quick-test.py`](https://github.com/SJParthi/tickvault/blob/main/scripts/depth200-quick-test.py)
   — you can run it on your side against a test account if useful.
 
+> (2026-07-18: the linked repro script was removed from the tree in the Rust-only purge; retrieve it via git history at any pre-2026-07-18 commit.)
+
 Thanks very much for the continued attention on this one.
 
 Best,
