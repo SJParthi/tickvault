@@ -181,7 +181,7 @@ merge-cleanness after both sessions finish (see PR 276 and PR 277).
 | Every Prometheus alert required by a runbook exists | RETIRED — both cited guards are deleted (`resilience_sla_alert_guard` with Prometheus #O2/#O3; `zero_tick_loss_alert_guard` 2026-07-18 with the tick rescue ring); alarm coverage is CloudWatch-side (`error-code-alarms.tf` / `app-alarms.tf` + their wiring guards) |
 | Every dashboard panel required by morning-ops exists | `operator_health_dashboard_guard` |
 | Every MCP tool name the Claude loop prompt depends on exists | `tickvault_logs_mcp_guard` |
-| Every AWS Lambda scaffold stays count-gated off until EC2 | `claude_triage_lambda_guard` |
+| Every AWS Lambda scaffold stays count-gated off until EC2 | `claude_triage_lambda_guard` _(deleted 2026-07-18 with the claude-triage lambda in the Rust-only purge; see git history)_ |
 | Every Loki/Alloy service stays opt-in | `loki_alloy_profile_guard` |
 | Every ErrorCode variant appears in a rule file AND vice-versa | `error_code_rule_file_crossref` |
 | Every flush/drain/persist failure emits ERROR (not WARN) | `error_level_meta_guard` — 28 phrases pinned |

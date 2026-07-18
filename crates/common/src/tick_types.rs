@@ -137,88 +137,11 @@ pub struct DeepDepthLevel {
     pub orders: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Option Greeks — computed from Black-Scholes in trading crate
-// ---------------------------------------------------------------------------
-
-/// Computed option Greeks snapshot for a single contract.
-///
-/// Lives in `common` so storage, core, and api crates can reference it
-/// without depending on the trading crate. The trading crate's
-/// `greeks::black_scholes::compute_greeks()` produces these values.
-///
-/// `Copy` for zero-allocation on hot path. All values are f64 for precision.
-#[derive(Debug, Clone, Copy)]
-pub struct OptionGreeksSnapshot {
-    /// Implied volatility (annualized, e.g., 0.30 = 30%).
-    pub iv: f64,
-    /// Rate of change of option price w.r.t. underlying price.
-    /// CE: [0, 1], PE: [-1, 0].
-    pub delta: f64,
-    /// Rate of change of delta w.r.t. underlying price.
-    /// Always positive. Highest for ATM options.
-    pub gamma: f64,
-    /// Daily time decay (negative for long options).
-    pub theta: f64,
-    /// Sensitivity to 1% change in IV. Always positive.
-    pub vega: f64,
-    /// Black-Scholes theoretical price.
-    pub bs_price: f64,
-    /// Intrinsic value: max(S-K, 0) for CE, max(K-S, 0) for PE.
-    pub intrinsic: f64,
-    /// Extrinsic (time) value: market_price - intrinsic.
-    pub extrinsic: f64,
-    /// Put-Call Ratio for the underlying at this snapshot time.
-    /// NaN or 0.0 if not computed.
-    pub pcr: f64,
-}
-
-impl Default for OptionGreeksSnapshot {
-    fn default() -> Self {
-        Self {
-            iv: 0.0,
-            delta: 0.0,
-            gamma: 0.0,
-            theta: 0.0,
-            vega: 0.0,
-            bs_price: 0.0,
-            intrinsic: 0.0,
-            extrinsic: 0.0,
-            pcr: 0.0,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GreeksEnricher — trait for inline Greeks computation on the hot path
-// ---------------------------------------------------------------------------
-
-/// Trait for enriching ticks with Greeks data on the hot path.
-///
-/// Implemented in `crates/trading` (InlineGreeksComputer) and injected into
-/// `crates/core` tick_processor via generic `<G: GreeksEnricher>` (monomorphized, no vtable).
-///
-/// # Contract
-/// - `enrich()` is called once per valid tick, BEFORE persistence and broadcast.
-/// - For index/equity ticks: updates internal underlying LTP cache, no Greeks.
-/// - For F&O option ticks: mutates `tick.iv`, `tick.delta`, `tick.gamma`,
-///   `tick.theta`, `tick.vega` in-place. Leaves them as NAN if computation fails.
-/// - Must be O(1) per tick (HashMap lookups + Jaeckel IV solver).
-/// - Must not allocate on the hot path (all maps pre-allocated).
-pub trait GreeksEnricher: Send {
-    /// Enrich a parsed tick with Greeks. Mutates Greeks fields in place.
-    fn enrich(&mut self, tick: &mut ParsedTick);
-}
-
-/// No-op implementation of `GreeksEnricher` for when Greeks are disabled.
-/// Used as the concrete type parameter when `greeks_enricher = None`.
-/// Zero-size type — compiler eliminates all related code completely.
-pub struct NoopGreeksEnricher;
-
-impl GreeksEnricher for NoopGreeksEnricher {
-    #[inline(always)]
-    fn enrich(&mut self, _tick: &mut ParsedTick) {}
-}
+// Dead-code batch 2 (2026-07-18): `OptionGreeksSnapshot`, `GreeksEnricher` +
+// `NoopGreeksEnricher`, and `DhanDailyResponse` DELETED — zero production
+// callers (the generic tick-processor Greeks consumer died in stage 2; the
+// prev-day daily fetch died in PR-C3). `DhanIntradayResponse` stays (pinned
+// by common/tests/schema_validation.rs).
 
 /// Response from Dhan's intraday charts API.
 ///
@@ -273,54 +196,6 @@ where
 }
 
 impl DhanIntradayResponse {
-    /// Returns the number of candles in this response.
-    pub fn len(&self) -> usize {
-        self.timestamp.len()
-    }
-
-    /// Returns true if the response contains no candles.
-    pub fn is_empty(&self) -> bool {
-        self.timestamp.is_empty()
-    }
-
-    /// Validates that all parallel arrays have the same length.
-    pub fn is_consistent(&self) -> bool {
-        let n = self.timestamp.len();
-        self.open.len() == n
-            && self.high.len() == n
-            && self.low.len() == n
-            && self.close.len() == n
-            && self.volume.len() == n
-            && (self.open_interest.is_empty() || self.open_interest.len() == n)
-    }
-}
-
-/// Response from Dhan's daily charts API (`/charts/historical`).
-///
-/// Same columnar parallel array format as `DhanIntradayResponse`.
-/// Daily timestamps represent IST midnight as UTC epoch seconds.
-#[derive(Debug, serde::Deserialize)]
-pub struct DhanDailyResponse {
-    /// Opening prices per candle.
-    pub open: Vec<f64>,
-    /// High prices per candle.
-    pub high: Vec<f64>,
-    /// Low prices per candle.
-    pub low: Vec<f64>,
-    /// Closing prices per candle.
-    pub close: Vec<f64>,
-    /// Volume per candle (Dhan may return as int or float).
-    #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
-    pub volume: Vec<i64>,
-    /// Timestamps as UTC epoch seconds from Dhan V2 REST API.
-    #[serde(deserialize_with = "deserialize_f64_as_i64_vec")]
-    pub timestamp: Vec<i64>,
-    /// Open interest per candle (present when `oi: true` in request).
-    #[serde(default, deserialize_with = "deserialize_f64_as_i64_vec_or_default")]
-    pub open_interest: Vec<i64>,
-}
-
-impl DhanDailyResponse {
     /// Returns the number of candles in this response.
     pub fn len(&self) -> usize {
         self.timestamp.len()
@@ -450,22 +325,6 @@ mod tests {
         assert!(resp.is_consistent());
     }
 
-    #[test]
-    fn test_daily_response_consistent() {
-        let resp = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![102.0, 103.0],
-            low: vec![99.0, 100.0],
-            close: vec![101.0, 102.0],
-            volume: vec![100_000, 200_000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
-        };
-        assert!(!resp.is_empty());
-        assert_eq!(resp.len(), 2);
-        assert!(resp.is_consistent());
-    }
-
     // -----------------------------------------------------------------------
     // DhanIntradayResponse deserialization (JSON → struct)
     // -----------------------------------------------------------------------
@@ -587,39 +446,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Coverage: DhanDailyResponse::is_consistent — non-empty OI mismatch
-    // (line 276: open_interest.len() == n branch)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_daily_response_inconsistent_oi_length() {
-        let resp = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![102.0, 103.0],
-            low: vec![99.0, 100.0],
-            close: vec![101.0, 102.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![5000], // 1 element vs 2 candles — inconsistent
-        };
-        assert!(!resp.is_consistent());
-    }
-
-    #[test]
-    fn test_daily_response_consistent_with_oi() {
-        let resp = DhanDailyResponse {
-            open: vec![100.0],
-            high: vec![102.0],
-            low: vec![99.0],
-            close: vec![101.0],
-            volume: vec![1000],
-            timestamp: vec![1700000000],
-            open_interest: vec![5000], // Same length as other arrays
-        };
-        assert!(resp.is_consistent());
-    }
-
-    // -----------------------------------------------------------------------
     // Coverage: deserialize_f64_as_i64_vec error path (line 197)
     // -----------------------------------------------------------------------
 
@@ -654,135 +480,6 @@ mod tests {
             volume: vec![1000, 2000],
             timestamp: vec![1700000000, 1700000060],
             open_interest: vec![5000], // 1 element vs 2 candles
-        };
-        assert!(!resp.is_consistent());
-    }
-
-    // --- OptionGreeksSnapshot ---
-
-    #[test]
-    fn test_option_greeks_snapshot_default_all_zeros() {
-        let g = OptionGreeksSnapshot::default();
-        assert_eq!(g.iv, 0.0);
-        assert_eq!(g.delta, 0.0);
-        assert_eq!(g.gamma, 0.0);
-        assert_eq!(g.theta, 0.0);
-        assert_eq!(g.vega, 0.0);
-        assert_eq!(g.bs_price, 0.0);
-        assert_eq!(g.intrinsic, 0.0);
-        assert_eq!(g.extrinsic, 0.0);
-        assert_eq!(g.pcr, 0.0);
-    }
-
-    #[test]
-    fn test_option_greeks_snapshot_is_copy() {
-        let g = OptionGreeksSnapshot {
-            iv: 0.25,
-            delta: 0.55,
-            gamma: 0.0013,
-            theta: -15.0,
-            vega: 12.5,
-            bs_price: 350.0,
-            intrinsic: 200.0,
-            extrinsic: 150.0,
-            pcr: 1.2,
-        };
-        let copy = g; // Copy, not move
-        assert_eq!(g.iv, copy.iv);
-        assert_eq!(g.delta, copy.delta);
-        assert_eq!(g.pcr, copy.pcr);
-    }
-
-    // --- DhanDailyResponse deserialization from JSON ---
-
-    #[test]
-    fn test_daily_response_full_json_deserialize() {
-        let json = r#"{
-            "open": [100.0, 101.0],
-            "high": [102.0, 103.0],
-            "low": [99.0, 100.0],
-            "close": [101.0, 102.0],
-            "volume": [100000.0, 200000.0],
-            "timestamp": [1700000000.0, 1700086400.0],
-            "open_interest": [5000.0, 6000.0]
-        }"#;
-        let resp: DhanDailyResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.len(), 2);
-        assert!(resp.is_consistent());
-        assert_eq!(resp.volume, vec![100000, 200000]);
-        assert_eq!(resp.timestamp, vec![1700000000, 1700086400]);
-        assert_eq!(resp.open_interest, vec![5000, 6000]);
-    }
-
-    #[test]
-    fn test_daily_response_empty_json_deserialize() {
-        let json = r#"{
-            "open": [],
-            "high": [],
-            "low": [],
-            "close": [],
-            "volume": [],
-            "timestamp": []
-        }"#;
-        let resp: DhanDailyResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.is_empty());
-        assert_eq!(resp.len(), 0);
-        assert!(resp.is_consistent());
-    }
-
-    #[test]
-    fn test_daily_response_missing_oi_defaults_empty() {
-        let json = r#"{
-            "open": [100.0],
-            "high": [102.0],
-            "low": [99.0],
-            "close": [101.0],
-            "volume": [1000.0],
-            "timestamp": [1700000000.0]
-        }"#;
-        let resp: DhanDailyResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.open_interest.is_empty());
-        assert!(resp.is_consistent());
-    }
-
-    #[test]
-    fn test_daily_response_inconsistent_open_length() {
-        let resp = DhanDailyResponse {
-            open: vec![100.0], // 1 vs 2
-            high: vec![102.0, 103.0],
-            low: vec![99.0, 100.0],
-            close: vec![101.0, 102.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
-        };
-        assert!(!resp.is_consistent());
-    }
-
-    #[test]
-    fn test_daily_response_inconsistent_close_length() {
-        let resp = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![102.0, 103.0],
-            low: vec![99.0, 100.0],
-            close: vec![101.0], // 1 vs 2
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
-        };
-        assert!(!resp.is_consistent());
-    }
-
-    #[test]
-    fn test_daily_response_inconsistent_volume_length() {
-        let resp = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![102.0, 103.0],
-            low: vec![99.0, 100.0],
-            close: vec![101.0, 102.0],
-            volume: vec![1000], // 1 vs 2
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
         };
         assert!(!resp.is_consistent());
     }
@@ -831,36 +528,6 @@ mod tests {
         assert!(!resp.is_consistent());
     }
 
-    // --- DhanDailyResponse inconsistent low/high lengths ---
-
-    #[test]
-    fn test_daily_response_inconsistent_low_length() {
-        let resp = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![102.0, 103.0],
-            low: vec![99.0], // 1 vs 2
-            close: vec![101.0, 102.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
-        };
-        assert!(!resp.is_consistent());
-    }
-
-    #[test]
-    fn test_daily_response_inconsistent_high_length() {
-        let resp = DhanDailyResponse {
-            open: vec![100.0, 101.0],
-            high: vec![102.0], // 1 vs 2
-            low: vec![99.0, 100.0],
-            close: vec![101.0, 102.0],
-            volume: vec![1000, 2000],
-            timestamp: vec![1700000000, 1700086400],
-            open_interest: vec![],
-        };
-        assert!(!resp.is_consistent());
-    }
-
     // --- ParsedTick Debug impl ---
 
     #[test]
@@ -889,58 +556,5 @@ mod tests {
         };
         let debug = format!("{:?}", level);
         assert!(debug.contains("MarketDepthLevel"));
-    }
-
-    // --- OptionGreeksSnapshot Debug impl ---
-
-    #[test]
-    fn test_option_greeks_snapshot_debug_output() {
-        let g = OptionGreeksSnapshot::default();
-        let debug = format!("{:?}", g);
-        assert!(debug.contains("OptionGreeksSnapshot"));
-    }
-
-    #[test]
-    fn test_option_greeks_snapshot_typical_atm_call() {
-        let g = OptionGreeksSnapshot {
-            iv: 0.20,
-            delta: 0.53,
-            gamma: 0.00132,
-            theta: -15.15,
-            vega: 12.18,
-            bs_price: 340.0,
-            intrinsic: 100.0,
-            extrinsic: 240.0,
-            pcr: 0.85,
-        };
-        // ATM call: delta near 0.5
-        assert!(g.delta > 0.4 && g.delta < 0.6);
-        // Theta always negative for long options
-        assert!(g.theta < 0.0);
-        // Vega always positive
-        assert!(g.vega > 0.0);
-    }
-
-    #[test]
-    fn test_noop_greeks_enricher_is_zero_side_effect() {
-        // Covers `impl GreeksEnricher for NoopGreeksEnricher::enrich`
-        // (tick_types.rs:217-220). The no-op enricher must not mutate
-        // any stable field of the ParsedTick it is given.
-        let mut enricher = NoopGreeksEnricher;
-        let mut tick = ParsedTick {
-            security_id: 1333,
-            last_traded_price: 100.5,
-            exchange_timestamp: 1_700_000_000,
-            volume: 42,
-            ..ParsedTick::default()
-        };
-        enricher.enrich(&mut tick);
-        assert_eq!(tick.security_id, 1333);
-        assert!((tick.last_traded_price - 100.5).abs() < f32::EPSILON);
-        assert_eq!(tick.exchange_timestamp, 1_700_000_000);
-        assert_eq!(tick.volume, 42);
-        // IV/delta/etc. stay NaN — no enrichment happened.
-        assert!(tick.iv.is_nan());
-        assert!(tick.delta.is_nan());
     }
 }
