@@ -34,36 +34,12 @@ const COMPOSE_UP_MAX_RETRIES: u32 = 5;
 /// Initial delay between `docker compose up -d` retries.
 const COMPOSE_UP_RETRY_DELAY: Duration = Duration::from_secs(10);
 
-/// Interval for infrastructure watchdog container health checks.
-pub const INFRA_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Maximum wait time for Docker daemon to start after launching Docker Desktop.
 const DOCKER_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Polling interval when waiting for services to become healthy.
 const INFRA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Timeout for QuestDB liveness HTTP check (SELECT 1).
-///
-/// 15s is high enough that a QuestDB under heavy ILP ingestion pressure
-/// (ticks + deep depth + candles + OBI + movers) does not trip the check
-/// just because the HTTP `/exec` endpoint is momentarily slow. It's still
-/// low enough that a real outage surfaces inside one watchdog cycle.
-const QUESTDB_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Consecutive liveness failures required before alerting.
-///
-/// One slow `SELECT 1` under load is NOT an outage. We require three
-/// back-to-back failures (15-minute window at the 5-minute watchdog cadence)
-/// before paging. Recovery resets the counter.
-pub const QUESTDB_LIVENESS_FAILURE_THRESHOLD: u32 = 3;
-
-/// Idle timeout for pooled liveness HTTP connections. Must be longer than
-/// the watchdog cadence (5 minutes) to benefit from keep-alive.
-const QUESTDB_LIVENESS_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// TCP keep-alive probe interval for pooled liveness connections.
-const QUESTDB_LIVENESS_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 // O(1) EXEMPT: end
 
 /// Path to docker-compose file relative to project root.
@@ -677,9 +653,6 @@ pub async fn enforce_clock_skew_at_boot(
 // System health checks (cold path — called once at boot or periodically)
 // ---------------------------------------------------------------------------
 
-/// Minimum free disk space percentage before alerting.
-pub const MIN_FREE_DISK_PERCENT: u64 = 5;
-
 // `MEMORY_RSS_ALERT_MB` (legacy 1 GB single-process gauge alert,
 // PR #497) was RETIRED 2026-05-08 per the Wave-5 in-memory-store
 // plan §AA / L122. The legacy threshold would fire instantly under
@@ -690,89 +663,6 @@ pub const MIN_FREE_DISK_PERCENT: u64 = 5;
 // `crate::subsystem_memory`. The catalog ratchet
 // (`crate::metrics_catalog::tests`) blocks any code path from
 // re-introducing the constant under the old name.
-
-/// Checks available disk space and returns the free percentage.
-///
-/// Best-effort: returns `None` on failure or unsupported platforms.
-/// Does not block boot.
-pub fn check_disk_space() -> Option<u64> {
-    #[cfg(unix)]
-    {
-        let output = std::process::Command::new("df")
-            .args(["/", "--output=pcent"])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Output looks like "Use%\n 42%\n"
-        let percent_used: u64 = stdout
-            .lines()
-            .nth(1)?
-            .trim()
-            .trim_end_matches('%')
-            .parse()
-            .ok()?;
-        let percent_free = 100_u64.saturating_sub(percent_used);
-
-        if percent_free < MIN_FREE_DISK_PERCENT {
-            tracing::error!(
-                percent_free,
-                percent_used,
-                "LOW DISK SPACE — less than {}% free",
-                MIN_FREE_DISK_PERCENT
-            );
-        } else {
-            info!(percent_free, "disk space OK");
-        }
-
-        Some(percent_free)
-    }
-
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
-
-/// Reads current process RSS from `/proc/self/status` (Linux) or `ps` (macOS).
-///
-/// Returns RSS in MB, or `None` on failure. Best-effort — does not block boot.
-///
-/// **2026-05-08 (L122)**: the legacy ERROR-on-threshold path was removed
-/// in favour of the per-component `tv-rss-per-subsystem-high` Prometheus
-/// alert (defined in `subsystem_memory`). This helper is retained as a
-/// pure read so the periodic-task loop can publish RSS for the
-/// reconciliation ratchet against
-/// `tv_subsystem_memory_estimated_bytes{component=...}`.
-pub fn check_memory_rss() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        for line in status.lines() {
-            if line.starts_with("VmRSS:") {
-                let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-                return Some(kb / 1024);
-            }
-        }
-        None
-    }
-
-    #[cfg(all(not(target_os = "linux"), unix))]
-    {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p"])
-            .arg(std::process::id().to_string())
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let kb: u64 = stdout.trim().parse().ok()?;
-        Some(kb / 1024)
-    }
-
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
 
 /// C1: Sends systemd watchdog heartbeat (`WATCHDOG=1`) via `$NOTIFY_SOCKET`.
 ///
@@ -839,323 +729,9 @@ pub fn notify_systemd_ready() {
 ///
 /// Exports the value as a Prometheus gauge for monitoring unbounded disk growth.
 // TEST-EXEMPT: requires data/spill directory with files — tested indirectly by tick_resilience integration tests
-pub fn check_spill_file_size() -> u64 {
-    let dir = match std::fs::read_dir("data/spill") {
-        Ok(d) => d,
-        Err(_) => {
-            metrics::gauge!("tv_spill_files_total_bytes").set(0.0);
-            return 0;
-        }
-    };
-
-    let mut total_bytes: u64 = 0;
-    let mut file_count: u64 = 0;
-    for entry in dir.flatten() {
-        if let Ok(meta) = entry.metadata()
-            && meta.is_file()
-        {
-            total_bytes = total_bytes.saturating_add(meta.len());
-            file_count = file_count.saturating_add(1);
-        }
-    }
-    metrics::gauge!("tv_spill_files_total_bytes").set(total_bytes as f64);
-    metrics::gauge!("tv_spill_file_count").set(file_count as f64);
-    total_bytes
-}
-
 /// C4: Removes spill files older than `SPILL_FILE_MAX_AGE_SECS` (7 days).
 ///
 /// Called during the periodic health check. Only deletes files that have
-/// already been drained (old date-stamped files from recovered outages).
-/// Returns the number of files cleaned up.
-// TEST-EXEMPT: requires data/spill directory — tested by unit test below
-pub fn cleanup_old_spill_files() -> usize {
-    use tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS;
-
-    let dir = match std::fs::read_dir("data/spill") {
-        Ok(d) => d,
-        Err(_) => return 0,
-    };
-
-    let max_age = Duration::from_secs(SPILL_FILE_MAX_AGE_SECS);
-    let mut cleaned = 0_usize;
-
-    for entry in dir.flatten() {
-        let meta = match entry.metadata() {
-            Ok(m) if m.is_file() => m,
-            _ => continue,
-        };
-        let age = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .unwrap_or(Duration::ZERO);
-
-        if age > max_age {
-            let path = entry.path();
-            if std::fs::remove_file(&path).is_ok() {
-                info!(path = %path.display(), age_days = age.as_secs() / 86400, "removed old spill file");
-                cleaned = cleaned.saturating_add(1);
-            }
-        }
-    }
-
-    if cleaned > 0 {
-        metrics::counter!("tv_spill_files_cleaned_total").increment(cleaned as u64);
-    }
-    cleaned
-}
-
-/// Cached reqwest client for QuestDB liveness checks.
-///
-/// Built once at first use — reuses TCP connection and keepalive across
-/// watchdog cycles. Eliminates the per-check handshake that was pushing
-/// the old 5s timeout under load.
-// O(1) EXEMPT: OnceLock initialized once at first watchdog tick, cold path
-static QUESTDB_LIVENESS_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-
-/// Consecutive liveness failure counter — used by the watchdog loop to
-/// decide when to alert. Reset on any success.
-// O(1) EXEMPT: boot-time static — single watchdog task updates it
-pub static QUESTDB_LIVENESS_FAILURES: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-
-/// Returns the cached liveness client, building it on first call.
-///
-/// Client reuses TCP connections via keep-alive and has a small pool
-/// (2 idle per host) so the liveness check does not compete with the
-/// app's other reqwest users.
-fn liveness_client() -> &'static reqwest::Client {
-    QUESTDB_LIVENESS_CLIENT.get_or_init(|| {
-        // Build is fallible in theory; in practice the default reqwest
-        // builder only fails if TLS init fails, which would have already
-        // killed boot. A failure here is a programming error — return a
-        // default client that will error on every request (and trip the
-        // liveness failure counter).
-        reqwest::Client::builder()
-            .timeout(QUESTDB_LIVENESS_TIMEOUT)
-            .pool_max_idle_per_host(2)
-            .pool_idle_timeout(QUESTDB_LIVENESS_POOL_IDLE_TIMEOUT)
-            .tcp_keepalive(QUESTDB_LIVENESS_TCP_KEEPALIVE)
-            .build()
-            .unwrap_or_else(|err| {
-                tracing::error!(?err, "liveness client build failed — using default");
-                reqwest::Client::new()
-            })
-    })
-}
-
-/// Outcome of a single QuestDB liveness probe.
-///
-/// Callers must track the consecutive-failure counter to decide when
-/// to actually page. A single `Failure` is NOT an outage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuestDbLivenessOutcome {
-    /// `SELECT 1` returned 2xx within `QUESTDB_LIVENESS_TIMEOUT`.
-    Success,
-    /// Check failed (timeout, network error, non-2xx response).
-    Failure,
-}
-
-impl QuestDbLivenessOutcome {
-    #[must_use]
-    pub const fn is_success(self) -> bool {
-        matches!(self, Self::Success)
-    }
-}
-
-/// C3: Pings QuestDB via HTTP `SELECT 1` to verify it's alive.
-///
-/// Uses a cached reqwest client (keep-alive, pooled) to avoid per-check
-/// handshake overhead. Returns a typed outcome so callers can track
-/// consecutive failures before alerting.
-///
-/// Exports `tv_questdb_alive` gauge (1.0 on success, 0.0 on failure) and
-/// `tv_questdb_liveness_latency_ms` histogram (observed on every outcome).
-// TEST-EXEMPT: requires running QuestDB — tested indirectly by storage integration tests
-pub async fn check_questdb_liveness(config: &QuestDbConfig) -> QuestDbLivenessOutcome {
-    let url = format!(
-        "http://{}:{}/exec?query=SELECT%201",
-        config.host, config.http_port
-    );
-    let client = liveness_client();
-
-    let started_at = std::time::Instant::now();
-    let outcome = match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => QuestDbLivenessOutcome::Success,
-        Ok(resp) => {
-            tracing::warn!(
-                status = %resp.status(),
-                "QuestDB liveness check returned non-2xx"
-            );
-            QuestDbLivenessOutcome::Failure
-        }
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "QuestDB liveness check failed — SELECT 1 did not respond"
-            );
-            QuestDbLivenessOutcome::Failure
-        }
-    };
-    let elapsed_ms = started_at.elapsed().as_millis() as f64;
-
-    metrics::histogram!("tv_questdb_liveness_latency_ms").record(elapsed_ms);
-    match outcome {
-        QuestDbLivenessOutcome::Success => {
-            metrics::gauge!("tv_questdb_alive").set(1.0);
-            QUESTDB_LIVENESS_FAILURES.store(0, std::sync::atomic::Ordering::Release);
-        }
-        QuestDbLivenessOutcome::Failure => {
-            metrics::gauge!("tv_questdb_alive").set(0.0);
-            QUESTDB_LIVENESS_FAILURES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        }
-    }
-
-    outcome
-}
-
-/// Returns the current consecutive-failure count for the liveness check.
-#[must_use]
-pub fn questdb_liveness_failures() -> u32 {
-    QUESTDB_LIVENESS_FAILURES.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Exports system metrics to Prometheus gauges.
-///
-/// Called periodically by the watchdog task (cold path).
-pub fn export_system_metrics() {
-    // Thread count (Linux only)
-    #[cfg(target_os = "linux")]
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if line.starts_with("Threads:")
-                && let Some(count_str) = line.split_whitespace().nth(1)
-                && let Ok(count) = count_str.parse::<u64>()
-            {
-                metrics::gauge!("tv_process_threads").set(count as f64);
-            }
-        }
-    }
-
-    // Open file descriptors (Unix only)
-    #[cfg(unix)]
-    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
-        let count = entries.count();
-        metrics::gauge!("tv_process_open_fds").set(count as f64);
-    }
-}
-
-/// Checks Docker container health and auto-restarts any unhealthy/exited containers.
-///
-/// Runs `docker compose ps` to detect container state, then `docker compose up -d`
-/// for any that are not running. Returns the number of containers restarted.
-///
-/// Called by the periodic health check loop (every 5 minutes). Best-effort —
-/// if Docker is not available, returns 0 without blocking.
-// TEST-EXEMPT: requires Docker daemon — tested by manual integration
-pub async fn check_and_restart_containers() -> usize {
-    use tokio::process::Command;
-
-    // Quick check: is Docker daemon even running?
-    if !is_docker_daemon_running().await {
-        warn!("Docker daemon not running — cannot check container health");
-        metrics::gauge!("tv_docker_containers_healthy").set(0.0);
-        return 0;
-    }
-
-    // Resolve a working compose front-end (issue #1505). Without this, a
-    // broken `docker compose` CLI made `ps` exit 125 with EMPTY stdout,
-    // which parsed as "0 containers, 0 unhealthy" — a silent false-OK that
-    // disabled the whole restart path.
-    let Some(cli) = resolve_compose_cli().await else {
-        warn!(
-            "container watchdog: no usable Docker Compose CLI (the \
-             `unknown shorthand flag: 'f'` failure class) — cannot inspect \
-             or restart containers this cycle; see the boot-time error for \
-             the fix"
-        );
-        return 0;
-    };
-
-    // Get container status via compose ps.
-    let output = match Command::new(cli.program())
-        .args(compose_cli_args(
-            cli,
-            DOCKER_COMPOSE_PATH,
-            &["ps", "--format", "{{.Name}} {{.State}}"],
-        ))
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(err) => {
-            warn!(?err, "failed to run docker compose ps");
-            return 0;
-        }
-    };
-    if !output.status.success() {
-        // A failed `ps` must NOT fall through to parsing empty stdout as
-        // "0 containers, all healthy" (no-false-OK rule).
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(
-            exit = ?output.status.code(),
-            stderr = %stderr.trim(),
-            "docker compose ps failed — skipping container health cycle"
-        );
-        return 0;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let (total_containers, unhealthy_containers, unhealthy_names) = parse_container_health(&stdout);
-
-    metrics::gauge!("tv_docker_containers_total").set(total_containers as f64);
-    metrics::gauge!("tv_docker_containers_healthy")
-        .set((total_containers.saturating_sub(unhealthy_containers)) as f64);
-
-    if unhealthy_containers == 0 {
-        debug!(total_containers, "all Docker containers healthy");
-        return 0;
-    }
-
-    // Containers are unhealthy — attempt restart.
-    tracing::error!(
-        unhealthy_containers,
-        names = ?unhealthy_names,
-        "unhealthy Docker containers detected — attempting docker compose up -d"
-    );
-
-    let restart_result = Command::new(cli.program())
-        .args(compose_cli_args(cli, DOCKER_COMPOSE_PATH, &["up", "-d"]))
-        .output()
-        .await;
-
-    match restart_result {
-        Ok(output) if output.status.success() => {
-            info!(
-                unhealthy_containers,
-                names = ?unhealthy_names,
-                "docker compose up -d completed — containers restarting"
-            );
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::error!(
-                stderr = %stderr.trim(),
-                "docker compose up -d failed during watchdog restart"
-            );
-        }
-        Err(err) => {
-            tracing::error!(
-                ?err,
-                "failed to execute docker compose up -d during watchdog"
-            );
-        }
-    }
-
-    unhealthy_containers
-}
-
 /// Pure parser for `docker compose ps --format "{{.Name}} {{.State}}"` output.
 /// Returns `(total, unhealthy, unhealthy_names)`. A container is "healthy" iff
 /// its line contains `running`; everything else (exited / restarting / created)
@@ -1537,38 +1113,6 @@ mod tests {
             !is_service_reachable("127.0.0.1", 1),
             "port 1 should not be reachable"
         );
-    }
-
-    #[test]
-    fn test_questdb_liveness_outcome_is_success() {
-        assert!(QuestDbLivenessOutcome::Success.is_success());
-        assert!(!QuestDbLivenessOutcome::Failure.is_success());
-    }
-
-    #[test]
-    fn test_questdb_liveness_failures_initial_zero() {
-        // Counter starts at zero and is observable via the public getter.
-        // Note: this is a static counter, so concurrent tests may see a
-        // non-zero value. We only assert the getter is readable and returns
-        // a plausible u32 — the behavioral assertion lives in the integration
-        // test that runs against a mocked failing client.
-        let _failures: u32 = questdb_liveness_failures();
-    }
-
-    #[test]
-    fn test_questdb_liveness_timeout_is_reasonable() {
-        // 15s is long enough to ride out a slow SELECT under ILP pressure,
-        // short enough that a real outage surfaces within one watchdog cycle.
-        assert!(QUESTDB_LIVENESS_TIMEOUT.as_secs() >= 10);
-        assert!(QUESTDB_LIVENESS_TIMEOUT.as_secs() <= 30);
-    }
-
-    #[test]
-    fn test_questdb_liveness_failure_threshold_requires_multiple() {
-        // A single failure must NOT alert — one slow query is not an outage.
-        assert!(QUESTDB_LIVENESS_FAILURE_THRESHOLD >= 2);
-        // But we must not wait forever before paging.
-        assert!(QUESTDB_LIVENESS_FAILURE_THRESHOLD <= 10);
     }
 
     #[test]
@@ -2348,17 +1892,6 @@ mod tests {
     // Disk space monitoring tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_disk_space_threshold() {
-        assert_eq!(super::MIN_FREE_DISK_PERCENT, 5);
-    }
-
-    #[test]
-    fn test_disk_space_check() {
-        // Best-effort — may return None on some platforms.
-        let _result = super::check_disk_space();
-    }
-
     // -----------------------------------------------------------------------
     // Memory RSS monitoring tests
     // -----------------------------------------------------------------------
@@ -2392,16 +1925,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_memory_rss_check() {
-        // Should return Some on both Linux and macOS.
-        let result = super::check_memory_rss();
-        assert!(
-            result.is_some(),
-            "should be able to read RSS on this platform"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // System metrics export tests
     // -----------------------------------------------------------------------
@@ -2413,70 +1936,21 @@ mod tests {
         metrics::gauge!("tv_process_open_fds").set(10.0_f64);
     }
 
-    #[test]
-    fn test_export_system_metrics_no_panic() {
-        // Exercise the function — should not panic regardless of platform.
-        super::export_system_metrics();
-    }
-
     // -----------------------------------------------------------------------
     // check_disk_space: result value validation
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_check_disk_space_returns_reasonable_value() {
-        if let Some(percent_free) = super::check_disk_space() {
-            assert!(
-                percent_free <= 100,
-                "free disk percentage must be <= 100, got {percent_free}"
-            );
-        }
-    }
 
     // -----------------------------------------------------------------------
     // check_memory_rss: result value validation
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_check_memory_rss_returns_positive_value() {
-        if let Some(rss_mb) = super::check_memory_rss() {
-            assert!(rss_mb > 0, "process RSS must be positive, got {rss_mb} MB");
-        }
-    }
-
-    #[test]
-    fn test_check_memory_rss_below_reasonable_limit() {
-        if let Some(rss_mb) = super::check_memory_rss() {
-            // Test process should use much less than 4GB
-            assert!(
-                rss_mb < 4096,
-                "test process RSS should be below 4GB, got {rss_mb} MB"
-            );
-        }
-    }
-
     // -----------------------------------------------------------------------
     // export_system_metrics: idempotent
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_export_system_metrics_idempotent() {
-        super::export_system_metrics();
-        super::export_system_metrics();
-        // No panic on repeated calls
-    }
-
     // -----------------------------------------------------------------------
     // Constants: MIN_FREE_DISK_PERCENT — `MEMORY_RSS_ALERT_MB` retired (L122)
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_disk_threshold_in_valid_range() {
-        assert!(
-            super::MIN_FREE_DISK_PERCENT > 0 && super::MIN_FREE_DISK_PERCENT < 50,
-            "threshold must be between 1% and 49%"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // Watchdog & retry constants
@@ -2689,21 +2163,6 @@ mod tests {
         assert!(ComposeOutcome::Critical.is_critical());
         assert!(!ComposeOutcome::Succeeded.is_critical());
         assert!(!ComposeOutcome::DegradedServiceUp.is_critical());
-    }
-
-    #[test]
-    fn test_watchdog_interval_is_reasonable() {
-        assert!(
-            INFRA_WATCHDOG_INTERVAL.as_secs() >= 30 && INFRA_WATCHDOG_INTERVAL.as_secs() <= 300,
-            "watchdog interval must be between 30s and 5min"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_check_and_restart_containers_no_panic() {
-        // Exercises the function — result depends on Docker availability.
-        // Must not panic regardless of whether Docker is installed.
-        let _result = check_and_restart_containers().await;
     }
 
     // -----------------------------------------------------------------
