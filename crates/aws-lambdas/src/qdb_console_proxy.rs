@@ -637,7 +637,11 @@ pub fn handle_core(event: &Value, qdb_base: &str, upstream: &mut dyn Upstream) -
 /// The live relay client. Redirect policy is NONE (the `_NoFollowRedirect`
 /// port — a 3xx must surface to [`handle_core`] un-followed and un-read),
 /// with the Python single-timeout semantics mapped to
-/// `connect_timeout` + per-recv `read_timeout` and NO total timeout.
+/// `connect_timeout` + the blocking client's op-level `timeout` (reqwest
+/// 0.13's blocking builder exposes no per-recv `read_timeout`; its
+/// `timeout` covers connect/read/write ops — a deliberate, documented
+/// deviation that is strictly TIGHTER than Python's per-socket-op
+/// timeout, never looser).
 pub struct ReqwestUpstream {
     client: reqwest::blocking::Client,
 }
@@ -662,7 +666,10 @@ impl ReqwestUpstream {
             // hang draining it).
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(connect)
-            .read_timeout(read)
+            // Op-level timeout (see the struct doc): reqwest 0.13's blocking
+            // builder has no `read_timeout`; `timeout` bounds connect/read/
+            // write operations — a tighter-than-Python envelope.
+            .timeout(read)
             .build()?;
         Ok(Self { client })
     }
