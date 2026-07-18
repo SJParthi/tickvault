@@ -93,20 +93,11 @@ resource "aws_cloudwatch_dashboard" "operator" {
       },
 
       # ----- Row 2: market-data flow + WebSocket health -----
-      {
-        type   = "metric"
-        x      = 0
-        y      = 8
-        width  = 8
-        height = 6
-        properties = {
-          title   = "Candle seals emitted (data flowing during market hours)"
-          region  = local.dash_region
-          view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_aggregator_seals_emitted_total", { stat = "Sum" }]]
-          period  = 300
-        }
-      },
+      # ("Candle seals emitted" widget retired 2026-07-17 — stage-3 dead-WS
+      # sweep: tv_aggregator_seals_emitted_total's emit site (the seal
+      # routing fan-in) was deleted with the tick aggregator; the series can
+      # never publish again. Seal-chain liveness lives in the seal-writer
+      # drain counters + tv_rest_candle_fold_heartbeat_total.)
       # ("Feed last-tick age" widget retired 2026-07-15 — its sole producer,
       # the Groww bridge liveness stamp, was deleted with the Groww live feed;
       # the series can never publish again.)
@@ -326,24 +317,10 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
       # ----- Row 2 (PR-D): catch-up seals per feed -----
       # ("Feed helper restarts" widget retired 2026-07-15 — the stall-restart
       # counters died with the Groww live feed's stall watchdog.)
-      {
-        type   = "metric"
-        x      = 12
-        y      = 8
-        width  = 12
-        height = 6
-        properties = {
-          title  = "Late catch-up candle seals per feed (delivery backlog signal)"
-          region = local.dash_region
-          view   = "timeSeries"
-          metrics = [
-            [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "dhan"]
-            # (feed=groww series retired 2026-07-15 — spawn_groww_catchup_seal deleted with the Groww live feed; groww rows can never increment again)
-          ]
-          period = 300
-          stat   = "Sum"
-        }
-      },
+      # ("Late catch-up candle seals per feed" widget retired 2026-07-17 —
+      # stage-3 dead-WS sweep: tv_boundary_catchup_total's writer (the
+      # watermark catch-up sealer inside the tick aggregator) is deleted;
+      # the series can never publish again.)
 
       # ----- Row 3 (PR-D): WS health | feed-focused alarm strip -----
       {
@@ -372,7 +349,9 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
           alarms = [
             # feed_stall_restarts + groww_exchange_lag_p99_high retired
             # 2026-07-15 with the Groww live feed.
-            aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.arn,
+            # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3
+            # dead-WS sweep — the tick aggregator, its metric's writer,
+            # is deleted).
             aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.arn
           ]
         }

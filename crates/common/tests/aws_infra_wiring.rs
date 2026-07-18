@@ -184,11 +184,13 @@ fn test_cloudwatch_operator_dashboard_exists() {
     // lag gauge — the score widget retired with the PARKed SLO publisher.)
     // (2026-07-15: the Groww lag gauge replaced by tv_rest_1m_fire_heartbeat
     // — its sample producer died with the Groww live feed.)
+    // (2026-07-17, stage-3 dead-WS sweep: tv_aggregator_seals_emitted_total
+    // left this list — its widget retired with the tick aggregator; the
+    // series can never publish again.)
     for metric in &[
         "tv_rest_1m_fire_heartbeat",
         "tv_questdb_disconnected_seconds",
         "tv_token_remaining_seconds",
-        "tv_aggregator_seals_emitted_total",
     ] {
         assert!(
             dash.contains(metric),
