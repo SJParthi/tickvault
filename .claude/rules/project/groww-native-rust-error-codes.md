@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/feed/groww/native/**"
+  - "crates/app/src/groww_native_shadow.rs"
+---
+
 # Groww Native-Rust Shadow Client — Error Codes (GROWW-NATIVE-01..04)
 
 > **⚠ RETIRED 2026-07-15 (Groww live feed deleted — operator Q1, received directly in this session: *"remove

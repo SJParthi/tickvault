@@ -1,3 +1,10 @@
+---
+paths:
+  - "docs/dhan-ref/04-full-market-depth-websocket.md"
+  - ".claude/rules/project/websocket-connection-scope-lock.md"
+  - ".claude/rules/dhan/live-market-feed.md"
+---
+
 # Dhan Full Market Depth Enforcement (STUB — depth is FORBIDDEN at runtime)
 
 > **Ground truth:** `docs/dhan-ref/04-full-market-depth-websocket.md`

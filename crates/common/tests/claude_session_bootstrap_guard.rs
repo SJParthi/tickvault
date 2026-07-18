@@ -226,6 +226,56 @@ fn validate_automation_runs_placeholder_fallback_test() {
     );
 }
 
+// 2026-07-18 (rust-only phase 2c, pre-cutover): the Rust MCP port must
+// carry the SAME placeholder-aware env resolution as server.py — the
+// `${TICKVAULT_LOGS_DIR}` literal-passthrough class (PR #288) applies
+// identically to the Rust binary once the cutover PR points .mcp.json at
+// it. ADDITIVE twin of `mcp_server_has_placeholder_aware_env_resolution`;
+// the python pins above stay untouched during the parallel-run window.
+#[test]
+fn rust_mcp_port_has_placeholder_aware_env_resolution() {
+    let src = read("crates/tickvault-logs-mcp/src/config.rs");
+    assert!(
+        src.contains("fn is_resolved"),
+        "config.rs must define is_resolved() rejecting ${{...}} placeholders \
+         (server.py _is_resolved parity)"
+    );
+    assert!(
+        src.contains("starts_with(\"${\")"),
+        "is_resolved() must explicitly check the `${{` placeholder prefix"
+    );
+    // Every env-backed accessor must gate through is_resolved.
+    for accessor in [
+        "fn active_profile",
+        "fn endpoint_url",
+        "fn logs_dir",
+        "fn logs_source",
+    ] {
+        let pos = src
+            .find(accessor)
+            .unwrap_or_else(|| panic!("config.rs missing `{accessor}`"));
+        // Bound the scan to the accessor's local region (next `pub fn` or
+        // 2KB, whichever first) — same spirit as the python body scan.
+        let tail = &src[pos..];
+        let body_end = tail[accessor.len()..]
+            .find("\npub fn ")
+            .map(|n| n + accessor.len())
+            .unwrap_or_else(|| tail.len().min(2048));
+        let body = &tail[..body_end];
+        assert!(
+            body.contains("is_resolved"),
+            "{accessor} must use the is_resolved() gatekeeper — raw env \
+             truthy check lets ${{...}} placeholders through"
+        );
+    }
+    // The placeholder-fallback behaviour twins (test_placeholder_fallback.py
+    // asserts) live as unit tests inside the crate itself.
+    assert!(
+        src.contains("placeholder"),
+        "config.rs should carry the placeholder-fallback unit-test twins"
+    );
+}
+
 #[test]
 fn bootstrap_supports_profile_auto_switch() {
     // PR #288 (#10): bootstrap auto-switches from a dead profile to a

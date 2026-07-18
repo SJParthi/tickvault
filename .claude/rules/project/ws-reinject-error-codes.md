@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/app/src/wal_reinject.rs"
+  - "crates/app/src/main.rs"
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/constants.rs"
+---
+
 # Bounded WAL Frame Re-Injection — Error Codes (WS-REINJECT-01)
 
 > **⚠ RETIRED 2026-07-17 (dead live-WS sweep stage 1 — operator directive

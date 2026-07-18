@@ -1,3 +1,12 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/config.rs"
+  - "crates/app/src/brutex_crossverify_boot.rs"
+  - "crates/app/src/brutex_crossverify_compare.rs"
+  - "crates/storage/src/brutex_crossverify_persistence.rs"
+---
+
 # BruteX↔TickVault Daily Cross-Verification — Error Codes (BRUTEX-XVERIFY-01 / BRUTEX-XVERIFY-02)
 
 > **⚠ 2026-07-15 dormancy note (Groww live feed retired — operator Q1, received directly in this session:

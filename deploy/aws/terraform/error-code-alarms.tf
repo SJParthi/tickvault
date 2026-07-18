@@ -5,12 +5,13 @@
 #   The CloudWatch-only migration (#O1/#O2/#O3) retired the
 #   Loki -> Alertmanager -> Telegram route with NO replacement, so an `error!`
 #   reached only the log sinks. On 2026-07-06 the 12:00 IST REST-CANARY-01
-#   probe failure produced ZERO pages. These 13 log metric filters + alarms
+#   probe failure produced ZERO pages. These 11 log metric filters + alarms
 #   (8 on 2026-07-06; +AGGREGATOR-DROP-01 on 2026-07-09; +WAL-SUSPEND-01 on
 #   2026-07-10; -REST-CANARY-01 retired + CROSS-VERIFY-1M-01/-02 +
 #   TICK-CONSERVE-01 added, then the two CROSS-VERIFY-1M entries RETIRED
 #   the same day by PR-C3 with their emit module, + the 5 REST-audit
-#   entries, all on 2026-07-14; -WS-REINJECT-01 on 2026-07-17;
+#   entries, all on 2026-07-14; -WS-GAP-07 on 2026-07-13 (PR-C2, #1522);
+#   -FEED-STALL-01 on 2026-07-15 (#1581); -WS-REINJECT-01 on 2026-07-17;
 #   -TICK-CONSERVE-01 on 2026-07-18) on
 #   the /tickvault/<env>/app log group (the errors.jsonl stream) restore the
 #   route: error! -> errors.jsonl -> CloudWatch Logs -> filter -> tv_errcode_*
@@ -86,7 +87,13 @@
 # never match again (a filter with no possible emit site is a dead filter
 # per the paging drift guard — the ws-reinject-01 / feed-stall-01
 # precedent). The `tick_conservation_audit` QuestDB TABLE is retained
-# (SEBI 5y, never dropped). New total: 13 filters + 13 alarms.
+# (SEBI 5y, never dropped). New total: 11 filters + 11 alarms —
+# mechanically RECOUNTED against the live error_code_alerts map at the
+# 2026-07-18 merge of origin/main: the prior running-total chain had
+# drifted +2 because the -WS-GAP-07 (PR-C2 #1522, 2026-07-13) and
+# -FEED-STALL-01 (#1581, 2026-07-15) retirements decremented the map
+# without updating this chain (PR-C3's "15" and ws-reinject's "14"
+# inherited the drift; actual counts were 14 and 12).
 #
 # 2026-07-14 UPDATE (REST-pipeline adversarial audit, GAP-01 + GAP-03 —
 # docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md): +5 entries ->

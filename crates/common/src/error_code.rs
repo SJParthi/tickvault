@@ -2758,12 +2758,17 @@ mod tests {
         // variant sweep): -1 WS-REINJECT-01 (WsReinject01Aborted RETIRED —
         // its only emitter, the orphaned wal_reinject.rs module, had zero
         // production callers; deleted with its dead paging filter) => 164.
+        // 2026-07-18 (full-fidelity order/position push-event capture):
+        // +1 ORDER-EVT-01 (OrderEvt01PersistFailed — order_update_events /
+        // position_update_events forensic-writer degrade; log-sink-only,
+        // High, auto-triage-safe) => 165.
         // 2026-07-18 (tick-conservation retirement, dead-WS sweep follow-up):
         // -1 TICK-CONSERVE-01 (TickConserve01DailyResidual RETIRED — every
         // audit input died with the dead tick chain in the stage-2 sweep
         // #1631; the audit modules were deleted, the tick_conservation_audit
-        // TABLE is retained per SEBI 5y) => 163.
-        assert_eq!(ErrorCode::all().len(), 163);
+        // TABLE is retained per SEBI 5y) => 164, mechanically recounted
+        // against the merged all() vec at this merge of origin/main.
+        assert_eq!(ErrorCode::all().len(), 164);
     }
 
     #[test]
