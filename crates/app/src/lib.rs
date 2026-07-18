@@ -45,6 +45,11 @@ pub mod brutex_crossverify_boot;
 // `.claude/rules/project/cadence-error-codes.md`.
 pub mod cadence_boot;
 pub(crate) mod cadence_escalation;
+// Boot-time candle-table DDL + retired-object sweep (Track A, 2026-07-18):
+// re-homes the pre-#1522 drop-legacy → ensure-candles → named-views chain
+// behind a bounded quiet probe; awaited from `build_shared_infra` BEFORE
+// the seal-writer spawn (the fresh-volume no-DEDUP fix).
+pub mod candle_ddl_boot;
 /// Real Dhan cadence executor — limiter-free, gate-pacing honored (the runner
 /// pre-acquires gates; this executor issues ONE bounded request per call).
 pub mod dhan_cadence_executor;

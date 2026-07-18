@@ -224,6 +224,17 @@ pub struct GrowwCadenceExecutor {
     /// Typed Telegram sink for the escalation/recovery events (`None` in
     /// tests — the coded `error!` lines still fire).
     notifier: Option<Arc<NotificationService>>,
+    /// Order-runtime mark tap (2026-07-18 — re-homed a SECOND time, from
+    /// the stood-down legacy Groww per-minute legs to this executor's
+    /// spot persist-confirm seam; PR #1624's cutover left the mark
+    /// channel producer-less). GROWW LANE ONLY: the Dhan cadence
+    /// executor must NEVER carry this tap — Dhan spot sids (13/25/51
+    /// IDX_I) are a DIFFERENT id space than the Groww-native u64s
+    /// (bit-62 `stable_index_security_id`) the paper book keys on, so
+    /// cross-feeding would double-key the same instrument invisibly to
+    /// the first-seen-SEGMENT tripwire (segments match across the
+    /// split). `None` ⇒ `[order_runtime]` disabled — zero work.
+    mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 }
 
 impl GrowwCadenceExecutor {
@@ -234,6 +245,7 @@ impl GrowwCadenceExecutor {
     pub fn new(
         questdb: &QuestDbConfig,
         notifier: Option<Arc<NotificationService>>,
+        mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
@@ -260,6 +272,7 @@ impl GrowwCadenceExecutor {
             expiry_cache: Mutex::new(None),
             escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier,
+            mark_forwarder,
         })
     }
 
@@ -283,6 +296,7 @@ impl GrowwCadenceExecutor {
             expiry_cache: Mutex::new(None),
             escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier: None,
+            mark_forwarder: None,
         }
     }
 
@@ -585,6 +599,30 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         &candle,
                     ),
                 ]);
+                // Order-runtime mark tap (2026-07-18 — re-homed from the
+                // stood-down legacy spot leg's persist-confirm site):
+                // forward the OWN-FIRE just-closed close ONLY after the
+                // flush ACK (a mark must never reference a price the
+                // audit record does not back — the legacy
+                // groww_spot_1m_boot.rs gating mirrored verbatim).
+                // GROWW LANE ONLY — never the Dhan executor: Dhan sids
+                // (13/25/51) are a different id space than the
+                // Groww-native u64s the paper book keys on;
+                // cross-feeding would double-key instruments invisibly
+                // to the first-seen-segment tripwire. Best-effort
+                // try_send; a full channel drops the mark (counted —
+                // the next minute close supersedes it); None ⇒ runtime
+                // disabled, zero work.
+                if let Some(forwarder) = self.mark_forwarder.as_ref() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    // APPROVED: MarkUpdate carries f32 by contract (the
+                    // wire LTP precision); price-level narrowing only.
+                    forwarder.mark_forward(
+                        sid_u64,
+                        EXCHANGE_SEGMENT_IDX_I,
+                        candle.close as f32,
+                    );
+                }
             } else {
                 // Defensive: stable_index_security_id is bit-62 positive
                 // by construction — a negative id here is a code bug.

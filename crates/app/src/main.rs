@@ -525,10 +525,12 @@ async fn main() -> Result<()> {
     // byte-identical. The receiver is stashed in a take-once slot for the
     // Dhan REST-only stack's Phase 5b (`spawn_dhan_rest_stack` — the
     // runtime's single spawn site; 2026-07-17 correction: Phase 5a is the
-    // RETIRED order-update WS slot); the forwarder now rides into the Groww
-    // per-minute REST legs (spot + contract — the live-tick bridge tap died
-    // with the retired Groww live feed): marks are the OWN-FIRE just-closed
-    // 1m candle closes, forwarded at each leg's persist-confirm choke point.
+    // RETIRED order-update WS slot); the forwarder now rides into the GROWW
+    // CADENCE EXECUTOR (re-homed 2026-07-18 — the cadence lane owns the
+    // per-minute pulls; the legacy per-minute REST legs' taps are
+    // config-dead unless a legacy leg is re-enabled): marks are the
+    // OWN-FIRE just-closed 1m candle closes, forwarded at the executor's
+    // persist-confirm choke point.
     let (order_runtime_mark_forwarder, order_runtime_mark_rx_slot, order_runtime_marks_wanted) =
         if config.order_runtime.enabled {
             let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
@@ -1642,7 +1644,10 @@ async fn main() -> Result<()> {
         &config,
         &notifier,
         &trading_calendar,
-        order_runtime_mark_forwarder,
+        // Clone: the ORIGINAL rides into the cadence scheduler below —
+        // since PR #1624 the cadence Groww executor is the LIVE mark
+        // producer (these legacy legs are config-OFF at HEAD).
+        order_runtime_mark_forwarder.clone(),
     );
 
     // Groww order/position PUSH channel — Stage D (operator-authorized
@@ -1699,6 +1704,14 @@ async fn main() -> Result<()> {
         &trading_calendar,
         &feed_runtime,
         &notifier,
+        // Order-runtime mark tap (2026-07-18): the GROWW cadence
+        // executor's spot persist-confirm seam is the live mark source
+        // (re-homed from the stood-down legacy legs). Threaded to the
+        // GROWW lane ONLY — NEVER the Dhan executor: Dhan sids
+        // (13/25/51) are a different id space than the Groww-native
+        // u64s the paper book keys on; cross-feeding would double-key
+        // instruments invisibly to the first-seen-segment tripwire.
+        order_runtime_mark_forwarder,
     );
 
     // -----------------------------------------------------------------------
@@ -2386,6 +2399,16 @@ async fn build_shared_infra(
             );
         }
     }
+
+    // --- Candle DDL + retired-object sweep (Track A, 2026-07-18) ---
+    // AWAITED INLINE, BEFORE the seal-writer spawn: the 21 `candles_<tf>`
+    // tables must be ensured WITH `DEDUP ENABLE UPSERT KEYS` before the
+    // REST-era bar-fold's first seal can reach ILP, or a fresh QuestDB
+    // volume auto-creates them WITHOUT DEDUP (silent duplicate-row window
+    // — the bug the PR-C2/#1581 lane deletions left behind). Bounded by
+    // the module's 60s quiet-probe; a down QuestDB skips the DDL loudly.
+    // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+    tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
