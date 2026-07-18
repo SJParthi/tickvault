@@ -202,6 +202,13 @@ fn build_fixtures(fixture_root: &Path) {
         &logs.join("auto-fix.log"),
         "2026-07-18 05:00:01 triage: rule clear-spill matched\n2026-07-18 05:00:02 triage: executed ok\n2026-07-18 05:05:00 triage: no novel signatures\n2026-07-18 05:10:00 triage: rule dh-904 matched\n2026-07-18 05:10:01 triage: escalated to operator\n",
     );
+    // Absolute-outside-root grep fixture (review r3 parity step): exactly
+    // ONE file with ONE matching line, no subdirs — the FIRST-match
+    // ValueError is deterministic on both sides regardless of walk order.
+    write(
+        &fixture_root.join("outside-grep").join("needle.txt"),
+        "TV_PARITY_OUTSIDE_NEEDLE one line\n",
+    );
     write(
         &logs.join("app.2026-07-18.log"),
         "boot step 1 config ok\nboot step 2 observability ok\nboot step 3 logging ok\nboot step 4 notification ok\nboot step 5 auth ok\nboot step 6 questdb ddl ok\nboot step 7 universe locked\nboot step 8 api listening\n",
@@ -470,9 +477,14 @@ fn spawn_session(
     // Rust child additionally pins the repo root (Python derives it from
     // server.py's file location).
     let mut rs_envs = envs.clone();
+    // Python resolves its root via Path(__file__).resolve(); pin the Rust
+    // child to the SAME resolved form so absolute-root echoes (the grep
+    // outside-root -32000 ValueError text) compare byte-for-byte even
+    // when the checkout path traverses a symlink.
+    let root_resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
     rs_envs.push((
         "TICKVAULT_MCP_REPO_ROOT".to_string(),
-        root.to_string_lossy().into_owned(),
+        root_resolved.to_string_lossy().into_owned(),
     ));
     let rs = McpChild::spawn(
         &format!("rust[{session}]"),
@@ -593,6 +605,30 @@ fn parity_transcript() {
             "grep_codebase",
             "invalid regex (detail masked)",
             json!({"pattern": "((("}),
+        );
+        // Review r3 LOW-a: an absolute `path` OUTSIDE the repo root whose
+        // walk finds a match must yield the IDENTICAL -32000
+        // `tool grep_codebase failed: '<file>' is not in the subpath of
+        // '<root>' ...` error on both sides (python: pathlib ValueError;
+        // rust: the mirrored strip_prefix arm). Deterministic: the fixture
+        // dir holds exactly one file with one matching line.
+        s.call(
+            "grep_codebase",
+            "absolute path outside root → -32000 ValueError parity",
+            json!({
+                "pattern": "TV_PARITY_OUTSIDE_NEEDLE",
+                "path": fixture_root.join("outside-grep").to_string_lossy(),
+            }),
+        );
+        // Same outside dir, no match: python never reaches relative_to —
+        // both sides answer ok:true with zero matches.
+        s.call(
+            "grep_codebase",
+            "absolute path outside root, no match → ok empty",
+            json!({
+                "pattern": "TV_PARITY_NO_SUCH_NEEDLE",
+                "path": fixture_root.join("outside-grep").to_string_lossy(),
+            }),
         );
         s.call("run_doctor", "bash shim", json!({}));
         s.call("git_recent_log", "limit=3 (real git)", json!({"limit": 3}));

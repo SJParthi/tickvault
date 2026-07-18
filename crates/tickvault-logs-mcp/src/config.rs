@@ -149,7 +149,7 @@ pub fn endpoint_url(
 /// lexical: no filesystem access, no symlink/canonicalization. (Accepted
 /// unreachable edge: POSIX's special `//`-root, which pathlib preserves,
 /// collapses to `/` here — no config/env value can legitimately carry it.)
-fn pathlib_lexical(path: &Path) -> PathBuf {
+pub(crate) fn pathlib_lexical(path: &Path) -> PathBuf {
     let out: PathBuf = path
         .components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))

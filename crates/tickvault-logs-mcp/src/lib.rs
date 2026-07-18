@@ -31,6 +31,23 @@
 //!     the grep invalid-regex error detail, and `matches`-array sort
 //!     order; transport-error text is NOT masked — the parity transcript
 //!     AVOIDS transport-error paths (the mock HTTP server is always up).
+//!   - stdout write failures (broken pipe): this binary ignores stdout
+//!     write/flush errors and exits 0 at stdin EOF; CPython dies exit 1
+//!     with a BrokenPipeError traceback on stderr. Unreachable in the
+//!     real MCP lifecycle (the client holds the pipe open until it
+//!     closes our stdin); the Rust direction is strictly safer.
+//!   - grep_codebase with an absolute `path` outside the repo root:
+//!     PARITY-MATCHED since review r3 — the first match returns the
+//!     CPython 3.11 `Path.relative_to` ValueError text through the
+//!     -32000 `tool grep_codebase failed: ...` wrap (previously ok:true
+//!     with lossy absolute paths — a success-vs-error class divergence).
+//!     Residual: the replicated text quotes both paths with plain single
+//!     quotes; CPython uses repr(), which would escape a quote/control
+//!     character inside a path — unreachable for real repo/fixture paths.
+//!   - app_log_tail `date` echoes: PARITY-MATCHED since review r3 — the
+//!     joined log path is pathlib-normalized (`.` components dropped),
+//!     so a dotted date like "x/./y" echoes `app.x/y.log` on both sides
+//!     byte-for-byte. No residual.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]

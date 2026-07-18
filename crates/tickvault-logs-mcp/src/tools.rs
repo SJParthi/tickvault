@@ -895,7 +895,12 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
         Some(d) => d.to_string(),
         None => chrono::Utc::now().format("%Y-%m-%d").to_string(),
     };
-    let log_file = log_dir.join(format!("app.{date}.log"));
+    // PARITY (review r3 LOW-b): Python builds `log_dir / f"app.{date}.log"`
+    // with pathlib, which drops `.` components at parse time — an
+    // arg-derived date like "x/./y" must echo `.../app.x/y.log`, never
+    // `.../app.x/./y.log`. Same file on disk either way (POSIX); only the
+    // echoed string differs.
+    let log_file = config::pathlib_lexical(&log_dir.join(format!("app.{date}.log")));
     if !log_file.exists() {
         return json!({
             "ok": false,
@@ -943,12 +948,12 @@ fn grep_walk(
     file_glob: Option<&str>,
     max_matches: usize,
     matches: &mut Vec<Value>,
-) {
+) -> Result<(), String> {
     if matches.len() >= max_matches {
-        return;
+        return Ok(());
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+        return Ok(());
     };
     let mut subdirs: Vec<PathBuf> = Vec::new();
     for entry in rd.flatten() {
@@ -978,10 +983,29 @@ fn grep_walk(
         let text = py_textmode(&decode_utf8_ignore(&bytes));
         for (idx, line) in py_file_lines(&text).iter().enumerate() {
             if regex.is_match(line) {
-                let rel = path
-                    .strip_prefix(root)
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                // PARITY (review r3 LOW-a): Python's
+                // `full_path.relative_to(root)` raises ValueError on the
+                // FIRST match under an absolute `path` arg outside the repo
+                // root; the dispatcher wraps it as the -32000
+                // `tool grep_codebase failed: ...` error. Mirror the CPython
+                // 3.11 text byte-for-byte (verified live:
+                // `'/x/y' is not in the subpath of '/a' OR one path is
+                // relative and the other is absolute.`). Relative `../`
+                // escapes NEVER take this arm on either side — both are
+                // lexical prefix matches that yield ../-prefixed rel paths.
+                // Residual (ledger): CPython formats via repr(), which would
+                // escape a quote/control char inside a path — unreachable
+                // for real repo/fixture paths.
+                let rel = match path.strip_prefix(root) {
+                    Ok(p) => p.to_string_lossy().into_owned(),
+                    Err(_) => {
+                        return Err(format!(
+                            "'{}' is not in the subpath of '{}' OR one path is relative and the other is absolute.",
+                            path.display(),
+                            root.display()
+                        ));
+                    }
+                };
                 matches.push(json!({
                     "file": rel,
                     "line": idx + 1,
@@ -999,27 +1023,35 @@ fn grep_walk(
         // outer-loop break).
     }
     for sub in subdirs {
-        grep_walk(&sub, root, regex, file_glob, max_matches, matches);
+        grep_walk(&sub, root, regex, file_glob, max_matches, matches)?;
         if matches.len() >= max_matches {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 /// server.py `tool_grep_codebase` (max_matches fixed at 200 — the Python
-/// registry never passes it).
+/// registry never passes it). `Err` = the CPython `Path.relative_to`
+/// ValueError for a match under an absolute `path` outside the repo root;
+/// the dispatcher maps it to the -32000 `tool grep_codebase failed: ...`
+/// wrap exactly like the Python `except`.
 pub fn tool_grep_codebase(
     ctx: &Ctx,
     pattern: &str,
     path: Option<&str>,
     file_glob: Option<&str>,
-) -> Value {
+) -> Result<Value, String> {
     let max_matches = 200usize;
     let root = &ctx.repo_root;
+    // pathlib-normalize the arg-derived search root (Python's
+    // `root / path` drops `.` components at Path construction) so every
+    // downstream path echo — rel matches AND the outside-root error —
+    // uses the same string form as CPython.
     let search_root = match path {
         Some(p) => {
             let pb = PathBuf::from(p);
-            if pb.is_absolute() { pb } else { root.join(pb) }
+            config::pathlib_lexical(&if pb.is_absolute() { pb } else { root.join(pb) })
         }
         None => root.clone(),
     };
@@ -1029,11 +1061,11 @@ pub fn tool_grep_codebase(
             // Rust regex error text differs from CPython `re.error` —
             // the harness verifies the "invalid regex: " prefix on both
             // sides then masks the detail.
-            return json!({
+            return Ok(json!({
                 "ok": false,
                 "pattern": pattern,
                 "error": format!("invalid regex: {err}"),
-            });
+            }));
         }
     };
     let mut matches: Vec<Value> = Vec::new();
@@ -1044,14 +1076,14 @@ pub fn tool_grep_codebase(
         file_glob,
         max_matches,
         &mut matches,
-    );
-    json!({
+    )?;
+    Ok(json!({
         "ok": true,
         "pattern": pattern,
         "match_count": matches.len(),
         "truncated": matches.len() >= max_matches,
         "matches": matches,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,12 +1751,7 @@ pub fn call_tool(
             Ok(pattern) => {
                 let path = get_opt_str(args, "path");
                 let file_glob = get_opt_str(args, "file_glob");
-                Ok(tool_grep_codebase(
-                    ctx,
-                    &pattern,
-                    path.as_deref(),
-                    file_glob.as_deref(),
-                ))
+                tool_grep_codebase(ctx, &pattern, path.as_deref(), file_glob.as_deref())
             }
             Err(e) => Err(e),
         },
@@ -1918,5 +1945,74 @@ mod tests {
         let dup = files.iter().find(|(n, _)| n.ends_with("-05")).unwrap();
         assert_eq!(std::fs::read_to_string(&dup.1).unwrap(), "machine");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn grep_absolute_path_outside_root_errors_with_python_valueerror_text() {
+        let outside = std::env::temp_dir().join(format!("tv-mcp-grepout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("needle.txt"), "GREP_OUT_NEEDLE here\n").unwrap();
+        let ctx = Ctx {
+            repo_root: PathBuf::from("/definitely-not-a-real-root"),
+            cfg: config::EndpointsConfig::default(),
+        };
+        // CPython 3.11 `Path.relative_to` text, verified live:
+        //   ValueError: '/x/y' is not in the subpath of '/a' OR one path is
+        //   relative and the other is absolute.
+        let err = tool_grep_codebase(&ctx, "GREP_OUT_NEEDLE", outside.to_str(), None).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "'{}' is not in the subpath of '/definitely-not-a-real-root' OR one path is relative and the other is absolute.",
+                outside.join("needle.txt").display()
+            )
+        );
+        // No match under the outside dir => Python never reaches
+        // relative_to => ok:true, zero matches on BOTH sides.
+        let ok = tool_grep_codebase(&ctx, "NO_SUCH_NEEDLE_ZZZ", outside.to_str(), None).unwrap();
+        assert_eq!(ok["ok"], json!(true));
+        assert_eq!(ok["match_count"], json!(0));
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn grep_relative_escape_still_returns_dotdot_prefixed_paths() {
+        // Review r3 nuance pin: a RELATIVE `../` escape is a lexical prefix
+        // match on both sides (pathlib keeps `..` verbatim) — it must stay
+        // ok:true with ../-prefixed rel paths, never the ValueError arm.
+        let base = std::env::temp_dir().join(format!("tv-mcp-grepdd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("root")).unwrap();
+        std::fs::create_dir_all(base.join("sibling")).unwrap();
+        std::fs::write(base.join("sibling").join("f.txt"), "GREP_DD_NEEDLE\n").unwrap();
+        let ctx = Ctx {
+            repo_root: base.join("root"),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let out = tool_grep_codebase(&ctx, "GREP_DD_NEEDLE", Some("../sibling"), None).unwrap();
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["match_count"], json!(1));
+        assert_eq!(out["matches"][0]["file"], json!("../sibling/f.txt"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_log_tail_dotted_date_error_echo_is_pathlib_normalized() {
+        // Review r3 LOW-b: Python echoes `.../app.x/y.log` (pathlib drops
+        // the `.` component at parse time); the Rust echo must match.
+        let ctx = Ctx {
+            repo_root: std::env::temp_dir().join(format!("tv-mcp-alt-{}", std::process::id())),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let out = tool_app_log_tail(&ctx, 5, Some("x/./y"));
+        assert_eq!(out["ok"], json!(false));
+        let err = out["error"].as_str().unwrap();
+        assert!(err.starts_with("log file not found: "), "{err}");
+        assert!(
+            err.ends_with("app.x/y.log"),
+            "python drops the `.` component: {err}"
+        );
+        assert!(!err.contains("/./"), "{err}");
     }
 }

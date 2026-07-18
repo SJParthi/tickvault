@@ -164,6 +164,11 @@ fn run_loop<R: BufRead, W: Write>(ctx: &Ctx, mut input: R, mut out: W) {
             continue;
         };
         if let Ok(s) = serde_json::to_string(&resp) {
+            // Deliberate deviation (ledger in lib.rs): a stdout write
+            // failure (broken pipe) is swallowed and the loop runs to
+            // stdin EOF + exit 0; CPython dies exit 1 with a
+            // BrokenPipeError traceback. Unreachable in the real MCP
+            // lifecycle; the Rust direction is safer.
             let _ignored = writeln!(out, "{s}");
             let _ignored = out.flush();
         }
