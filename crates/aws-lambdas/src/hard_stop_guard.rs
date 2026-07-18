@@ -194,14 +194,22 @@ pub fn classify_in_window_action(mtd: Option<f64>, budget_kill_usd: f64) -> &'st
 /// Python `spend_bucket` — which 10%-of-stop-budget bucket the MTD spend
 /// sits in. Total, never panics: unknown/negative spend or a non-positive
 /// kill line clamps to bucket 0; the percentage is capped at 999 so a
-/// runaway spend cannot overflow anything (NaN saturates to 0 via `as`).
+/// runaway spend cannot overflow anything. NaN parity with the python
+/// oracle: python's `int(min(nan, 999.0) // 10)` raised ValueError and the
+/// `except` arm returned 0 (Rust `f64::min` ignores NaN, so this is mapped
+/// explicitly below); `+inf` takes python's `min(inf, 999.0) == 999.0`
+/// path -> bucket 99, which Rust's `min` already matches.
 pub fn spend_bucket(mtd: Option<f64>, budget_kill_usd: f64) -> i64 {
     let Some(mtd) = mtd else { return 0 };
     if mtd < 0.0 || budget_kill_usd <= 0.0 {
         return 0;
     }
     let pct = (mtd / budget_kill_usd) * 100.0;
-    // APPROVED: floor of a value capped at 999 / BUCKET_PCT_STEP — always fits i64; NaN saturates to 0.
+    if pct.is_nan() {
+        // Python oracle: int(nan) raises -> except -> 0.
+        return 0;
+    }
+    // APPROVED: floor of a value capped at 999 / BUCKET_PCT_STEP — always fits i64; NaN returned 0 above.
     #[allow(clippy::cast_possible_truncation)]
     let bucket = (pct.min(999.0) / BUCKET_PCT_STEP as f64).floor() as i64;
     bucket
@@ -1313,6 +1321,14 @@ mod tests {
         assert_eq!(spend_bucket(Some(-1.0), 55.0), 0);
         assert_eq!(spend_bucket(Some(10.0), 0.0), 0);
         assert_eq!(spend_bucket(Some(1e12), 55.0), 99); // capped
+        // Python-oracle parity (verified: python3 try/except spend_bucket):
+        // nan -> 0 (int(nan) raised -> except -> 0), +inf -> 99
+        // (min(inf, 999.0) == 999.0), -inf -> 0 (mtd < 0), inf/inf -> 0
+        // (nan pct -> raised -> 0).
+        assert_eq!(spend_bucket(Some(f64::NAN), 55.0), 0);
+        assert_eq!(spend_bucket(Some(f64::INFINITY), 55.0), 99);
+        assert_eq!(spend_bucket(Some(f64::NEG_INFINITY), 55.0), 0);
+        assert_eq!(spend_bucket(Some(f64::INFINITY), f64::INFINITY), 0);
     }
 
     #[test]
