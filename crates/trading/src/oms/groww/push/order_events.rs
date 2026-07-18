@@ -409,6 +409,23 @@ mod tests {
     use super::super::proto::{OrderDetailUpdate, PositionInfo, StageAndTimeStamp, SymbolInfo};
     use super::*;
 
+    /// Review round 1 Fix 1: the construction-gating accessors mirror
+    /// channel liveness exactly — a disabled capture reports both gates
+    /// off (producers then skip record construction entirely), a live
+    /// capture reports both on.
+    #[test]
+    fn test_orders_enabled_and_positions_enabled_mirror_channel_liveness() {
+        let disabled = GrowwPushCapture::disabled();
+        assert!(!disabled.orders_enabled());
+        assert!(!disabled.positions_enabled());
+
+        let (order_tx, _order_rx) = mpsc::channel(1);
+        let (position_tx, _position_rx) = mpsc::channel(1);
+        let live = GrowwPushCapture::new(order_tx, position_tx);
+        assert!(live.orders_enabled());
+        assert!(live.positions_enabled());
+    }
+
     fn sample_detail() -> OrderDetailUpdate {
         OrderDetailUpdate {
             qty: 50,
