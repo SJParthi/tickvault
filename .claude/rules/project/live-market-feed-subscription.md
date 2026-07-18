@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/core/src/websocket/connection_pool.rs"
+  - "crates/core/src/websocket/connection.rs"
+  - "crates/core/src/instrument/subscription_planner.rs"
+  - "crates/core/src/websocket/subscription_builder.rs"
+---
+
 # Live Market Feed WebSocket Subscription Rules
 
 > **Authority:** CLAUDE.md > this file.

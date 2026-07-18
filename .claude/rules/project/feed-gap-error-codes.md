@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/storage/src/feed_gap_audit_persistence.rs"
+  - "crates/app/src/groww_bridge.rs"
+  - "crates/app/src/feed_scoreboard_boot.rs"
+---
+
 # Feed Gap-Episode Forensics — Error Codes (FEED-GAP-01)
 
 > **⚠ RETIRED 2026-07-15 (Groww live feed deleted — operator Q1, received directly in this session: *"remove

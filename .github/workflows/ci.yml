@@ -619,6 +619,8 @@ jobs:
           done
           echo "== questdb-console-gate-matrix.sh (terraform-apply.yml console smoke-gate scenarios) =="
           bash scripts/questdb-console-gate-matrix.sh
+          echo "== all-green-equivalence-matrix.sh (all-green jq verdict vs frozen fixture table) =="
+          bash scripts/all-green-equivalence-matrix.sh
 
   # -------------------------------------------------------------------------
   # DHAT Zero-Alloc — dedicated lane for the hot-path allocation ratchets
@@ -869,39 +871,58 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          python3 - <<'PYEOF'
-          import json, os, sys
-
-          needs = json.loads(os.environ["NEEDS_JSON"])
-          event = os.environ["EVENT_NAME"]
-
-          # Jobs that are PR-only by design (their own `if:` skips them on
-          # push-to-main). A 'skipped' result for these is legitimate ONLY on
-          # push events and on workflow_dispatch runs (the post-merge catch-up
-          # dispatcher fires this workflow on main to stand in for a
-          # bot-merge-suppressed push run — same non-PR semantics); on a
-          # pull_request event they MUST have run.
-          PR_ONLY_JOBS = {"commit-lint", "design-first-wall", "local-runtime-block"}
-          NON_PR_EVENTS = {"push", "workflow_dispatch"}
-
-          failed = []
-          for job, meta in sorted(needs.items()):
-              result = meta.get("result")
-              if result == "success":
-                  continue
-              if result == "skipped" and event in NON_PR_EVENTS and job in PR_ONLY_JOBS:
-                  continue
-              # Everything else — failure, cancelled, or an unexpected skip —
-              # fails the gate. 'skipped' counts as FAILURE on pull_request
-              # events so a silently-skipped job can never fake green.
-              failed.append(f"{job}={result}")
-
-          if failed:
-              print("::error::All Green FAILED — non-success needed jobs: "
-                    + ", ".join(failed))
-              sys.exit(1)
-          print(f"All Green: every needed job succeeded (event={event}).")
-          PYEOF
+          # ALL-GREEN-VERDICT-BEGIN (extracted verbatim by
+          # scripts/all-green-equivalence-matrix.sh — keep these two markers
+          # intact; the harness pins this exact shell+jq program against a
+          # frozen expected-output table and ABORTS loudly if extraction
+          # comes back empty).
+          #
+          # Language port 2026-07-18 (rust-only purge Phase 2a-1 —
+          # merge-gate-lock-2026-07-04.md §5.1 dated amendment): the former
+          # inline `python3 - <<'PYEOF'` evaluator, re-expressed in jq+shell
+          # with BYTE-EQUIVALENT semantics (jq ships preinstalled on the
+          # GitHub ubuntu runner images). Semantics UNCHANGED:
+          # - iterate needed jobs sorted by name;
+          # - result == "success" passes;
+          # - result == "skipped" passes ONLY for the PR-only jobs
+          #   {commit-lint, design-first-wall, local-runtime-block} — whose
+          #   own `if:` skips them on push-to-main — and ONLY on the non-PR
+          #   events {push, workflow_dispatch} (the post-merge catch-up
+          #   dispatcher fires this workflow on main to stand in for a
+          #   bot-merge-suppressed push run — same non-PR semantics); on a
+          #   pull_request event they MUST have run;
+          # - everything else — failure, cancelled, or an unexpected skip —
+          #   fails the gate ('skipped' counts as FAILURE on pull_request
+          #   events so a silently-skipped job can never fake green); a
+          #   missing job result renders as the literal `None`, exactly as
+          #   the old evaluator's meta.get("result") did.
+          command -v jq >/dev/null 2>&1 || { echo "::error::jq not found on the runner — All Green verdict cannot run"; exit 1; }
+          verdict="$(jq -rn '
+            (env.NEEDS_JSON | fromjson) as $needs
+            | env.EVENT_NAME as $event
+            | [ $needs
+                | to_entries
+                | sort_by(.key)[]
+                | .key as $job
+                | .value.result as $result
+                | select(
+                    (
+                      ($result == "success")
+                      or ($result == "skipped"
+                          and ($event | IN("push", "workflow_dispatch"))
+                          and ($job | IN("commit-lint", "design-first-wall", "local-runtime-block")))
+                    ) | not
+                  )
+                | "\($job)=\(if $result == null then "None" else $result end)"
+              ] as $failed
+            | if ($failed | length) > 0
+              then "::error::All Green FAILED — non-success needed jobs: " + ($failed | join(", "))
+              else "All Green: every needed job succeeded (event=\($event))."
+              end
+          ')"
+          printf '%s\n' "$verdict"
+          case "$verdict" in "::error::"*) exit 1 ;; esac
+          # ALL-GREEN-VERDICT-END
 
   # -------------------------------------------------------------------------
   # Enable Auto-Merge — armed ONLY after All Green succeeds (merge-gate

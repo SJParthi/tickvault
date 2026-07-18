@@ -1,3 +1,14 @@
+---
+paths:
+  - "crates/core/src/auth/*.rs"
+  - "crates/common/src/config.rs"
+  - "crates/core/src/network/ip_monitor.rs"
+  - "crates/core/src/network/ip_verifier.rs"
+  - "crates/core/src/websocket/connection.rs"
+  - "crates/trading/src/oms/api_client.rs"
+  - "scripts/setup-secrets.sh"
+---
+
 # Dhan Authentication Enforcement
 
 > **Ground truth:** `docs/dhan-ref/02-authentication.md`

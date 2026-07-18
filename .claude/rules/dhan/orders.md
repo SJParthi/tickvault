@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/trading/src/oms/*.rs"
+  - "crates/trading/src/order_manager.rs"
+  - "crates/common/src/order_types.rs"
+  - "crates/api/src/handlers/orders.rs"
+---
+
 # Dhan Orders Enforcement
 
 > **Ground truth:** `docs/dhan-ref/07-orders.md`

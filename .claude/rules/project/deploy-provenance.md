@@ -1,3 +1,20 @@
+---
+paths:
+  - "crates/common/build.rs"
+  - "crates/common/src/build_info.rs"
+  - "crates/api/src/handlers/health.rs"
+  - "crates/core/src/notification/events.rs"
+  - ".github/workflows/deploy-aws.yml"
+  - ".github/workflows/terraform-apply.yml"
+  - "deploy/aws/lambda/operator-control/handler.py"
+  - "deploy/aws/lambda/deploy-watchdog/handler.py"
+  - "deploy/aws/terraform/operator-control-lambda.tf"
+  - "deploy/aws/terraform/deploy-watchdog-lambda.tf"
+  - "deploy/aws/terraform/oidc.tf"
+  - "deploy/aws/terraform/variables.tf"
+  - "deploy/aws/terraform/outputs.tf"
+---
+
 # Deploy Provenance — B9 (git SHA stamped end-to-end)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F > this file.

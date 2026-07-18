@@ -1,3 +1,9 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/storage/src/ws_frame_spill.rs"
+---
+
 # WAL Frame-Spill Writer — Error Codes (WS-SPILL-01 / WS-SPILL-02)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F > this file.

@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/trading/src/oms/api_client.rs"
+  - "crates/trading/src/oms/types.rs"
+  - "crates/trading/src/oms/conditional.rs"
+  - "crates/trading/tests/conditional_gate_guard.rs"
+---
+
 # Dhan Conditional Trigger & Multi Order Enforcement
 
 > **Ground truth:** `docs/dhan-ref/07c-conditional-trigger.md`

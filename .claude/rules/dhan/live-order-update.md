@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/core/src/websocket/order_update*.rs"
+  - "crates/core/src/order_monitor/*.rs"
+  - "crates/trading/src/oms/order_tracker.rs"
+---
+
 # Dhan Live Order Update WebSocket Enforcement
 
 > **Ground truth:** `docs/dhan-ref/10-live-order-update-websocket.md`
