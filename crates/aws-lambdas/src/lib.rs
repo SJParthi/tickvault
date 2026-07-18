@@ -27,4 +27,5 @@ pub mod clients;
 pub mod events;
 pub mod logging;
 pub mod market_hours_gate;
+pub mod qdb_console_proxy;
 pub mod time;

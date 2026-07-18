@@ -206,6 +206,20 @@ flate2 = "1.1.9"
 # precedent above. Flagged in the PR body for operator visibility.
 regex = "1.12.3"
 
+# ---- Section 11d: QuestDB-console Lambda pair (rust-only phase 2b-3) ----
+# 2026-07-18: the qdb-console-proxy / qdb-console-front handler.py ports
+# need base64 body envelopes (Python `base64.b64encode`), percent-decoding
+# for the traversal gate (Python `urllib.parse.unquote`), and urlencoded
+# query parsing (Python `urllib.parse.parse_qs`). NONE is a new
+# supply-chain root — all three were ALREADY resolved in Cargo.lock
+# (base64 0.22.1 via the aws smithy family, percent-encoding 2.3.2 +
+# form_urlencoded 1.2.2 via url/reqwest); this promotes them to direct
+# pins — the aws-lc-rs / flate2 / regex promotion precedent above.
+# Flagged in the PR body for operator visibility.
+base64 = "0.22.1"
+percent-encoding = "2.3.2"
+form_urlencoded = "1.2.2"
+
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }
 
