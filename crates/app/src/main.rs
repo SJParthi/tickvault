@@ -1644,7 +1644,10 @@ async fn main() -> Result<()> {
         &config,
         &notifier,
         &trading_calendar,
-        order_runtime_mark_forwarder,
+        // Clone: the ORIGINAL rides into the cadence scheduler below —
+        // since PR #1624 the cadence Groww executor is the LIVE mark
+        // producer (these legacy legs are config-OFF at HEAD).
+        order_runtime_mark_forwarder.clone(),
     );
 
     // Groww order/position PUSH channel — Stage D (operator-authorized
@@ -1701,6 +1704,14 @@ async fn main() -> Result<()> {
         &trading_calendar,
         &feed_runtime,
         &notifier,
+        // Order-runtime mark tap (2026-07-18): the GROWW cadence
+        // executor's spot persist-confirm seam is the live mark source
+        // (re-homed from the stood-down legacy legs). Threaded to the
+        // GROWW lane ONLY — NEVER the Dhan executor: Dhan sids
+        // (13/25/51) are a different id space than the Groww-native
+        // u64s the paper book keys on; cross-feeding would double-key
+        // instruments invisibly to the first-seen-segment tripwire.
+        order_runtime_mark_forwarder,
     );
 
     // -----------------------------------------------------------------------
