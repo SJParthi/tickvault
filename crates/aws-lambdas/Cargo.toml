@@ -48,3 +48,7 @@ path = "src/bin/market_hours_liveness_gate.rs"
 [[bin]]
 name = "telegram-webhook"
 path = "src/bin/telegram_webhook.rs"
+
+[[bin]]
+name = "market-open-readiness"
+path = "src/bin/market_open_readiness.rs"
