@@ -268,6 +268,23 @@ pub fn create_error_log_writer() -> Option<std::fs::File> {
 }
 
 // ---------------------------------------------------------------------------
+// WS-frame WAL directory (single source of truth)
+// ---------------------------------------------------------------------------
+
+/// The single source of truth for the WS-frame WAL directory — the SAME
+/// derivation as main.rs STAGE-C boot wiring. Hostile-review H1: the env
+/// derivation was previously copy-pasted at two main.rs sites and could
+/// drift; both now call this. Relocated 2026-07-18 from the retired
+/// `tick_conservation_boot` module (dead-WS sweep follow-up) — the STAGE-C
+/// replay + archive-prune + confirm sites survive the audit's retirement.
+#[must_use]
+pub fn ws_wal_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()), // O(1) EXEMPT: boot-time
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Clock drift check
 // ---------------------------------------------------------------------------
 
@@ -353,6 +370,16 @@ pub const WATCHDOG_INTERVAL_SECS: u64 = 30;
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    #[test]
+    fn test_ws_wal_dir_default() {
+        // Single source of truth for the WAL dir (hostile-review H1) —
+        // default matches the STAGE-C boot wiring. Relocated 2026-07-18
+        // from the retired tick_conservation_boot module.
+        if std::env::var("TV_WS_WAL_DIR").is_err() {
+            assert_eq!(ws_wal_dir(), std::path::PathBuf::from("./data/ws_wal"));
+        }
+    }
 
     // -----------------------------------------------------------------------
     // resolve_config_env — env-var precedence (TV_ENVIRONMENT > ENVIRONMENT > prod)

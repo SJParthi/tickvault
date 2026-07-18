@@ -80,16 +80,10 @@ fires one edge-latched ERROR per (table, suspension episode) — a merely-DOWN
 QuestDB never fires it, the boot-probe escalation codes own the down-server
 page; recovery = the operator's
 `ALTER TABLE <t> RESUME WAL`, never auto-executed; runbook
-`.claude/rules/project/wal-suspension-error-codes.md`**)**, **TICK-CONSERVE-01
-(added 2026-07-14, automation-gaps PR-3** — the 2026-07-10 automation audit
-found the High post-market audit codes were log-sink-only: a 15:40 IST
-tick-conservation residual paged nobody; a daily one-shot audit finding, so
-its alarm sets `ok_recovery = false` — the auto-OK ~15 min after the
-datapoint ages out can never mean the residual was fixed (Rule-11); recovery
-= the next trading day's clean run; runbook
-`.claude/rules/project/tick-conservation-audit-error-codes.md`. The two
-sibling cross-verify entries added by the same PR retired hours later — see
-"Retired paging entries" below**)**, **AUTH-GAP-05
+`.claude/rules/project/wal-suspension-error-codes.md`**)** (the
+TICK-CONSERVE-01 entry added here 2026-07-14 by automation-gaps PR-3 left
+this list 2026-07-18 — its emit site was deleted with the retired
+tick-conservation audit; see "Retired paging entries" below), **AUTH-GAP-05
 (added 2026-07-14, REST-audit gap 01** — SCOPED to the mint-FAILURE arm only
 via `$.cooldown_skip IS FALSE` (the boolean field exists only on that
 emission; IS FALSE additionally excludes the same-day noise-lock H3
@@ -142,7 +136,17 @@ sweep stage 1) — its only emit site, `crates/app/src/wal_reinject.rs`
 was deleted in that cleanup, so the filter could never match again; the tf
 map entry was removed in the same PR (dated note in
 `error-code-alarms.tf`; the `WsReinject01Aborted` variant retirement is
-the post-sibling-merge variant sweep).
+the post-sibling-merge variant sweep). The `tick-conserve-01` filter+alarm
+was RETIRED 2026-07-18 (tick-conservation retirement — dead-WS sweep
+follow-up) — its only emit site, `crates/app/src/tick_conservation_boot.rs`
+(the 15:40 IST reconciler's Leak arm), was deleted with the audit modules:
+every audit input died with the dead tick chain in the stage-2 sweep #1631
+(no live WAL frame writer, no processor outcome counters, nothing writes
+`ticks`), so every run could only record `partial` and the filter could
+never match again; the tf map entry was removed in the same PR (dated note
+in `error-code-alarms.tf`; the `TickConserve01DailyResidual` variant
+retired in the same PR; the `tick_conservation_audit` QuestDB TABLE is
+retained — SEBI 5y, never dropped).
 
 > Removed from the filtered+alarmed set: the Dhan REST canary code
 > (RETIRED 2026-07-14 with its module + both spawn sites + the

@@ -24,7 +24,7 @@
 //!    `/tickvault/<env>/deploy/binary-git-sha` control-plane param,
 //!    fail-soft to `process_restart`).
 //! 2. [`run_feed_scoreboard`] — the 15:45 IST daily aggregation
-//!    (`tick_conservation_boot` idiom: pure decide fn with the RunCatchUp
+//!    (the retired tick-conservation audit's idiom: pure decide fn with the RunCatchUp
 //!    late-boot variant + the `TICKVAULT_SCOREBOARD_NOW` operator override
 //!    (+ `TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD` past-day backfill) + the
 //!    trading-day gate). Classifies today's disconnect episodes from
@@ -67,7 +67,14 @@ use tickvault_storage::feed_scoreboard_persistence::{
     ScoreboardOutcome, ensure_feed_scoreboard_tables,
 };
 
-use crate::tick_conservation_boot::parse_questdb_count;
+/// Parses the QuestDB `/exec` count response (`{"dataset":[[N]]}`). Pure.
+/// Relocated 2026-07-18 from the retired `tick_conservation_boot` module
+/// (dead-WS sweep follow-up) — this module is the sole surviving consumer.
+#[must_use]
+pub fn parse_questdb_count(body: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("dataset")?.get(0)?.get(0)?.as_i64()
+}
 
 /// IST seconds-of-day of the DETERMINISTIC daily-row timestamp (15:45:00).
 /// This stamps `feed_scoreboard_daily.ts` regardless of when the run
@@ -122,10 +129,11 @@ const SCOREBOARD_HTTP_TIMEOUT_SECS: u64 = 10;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
-/// Decision for WHEN the daily scoreboard should fire. Mirrors
-/// `tick_conservation_boot::ConservationStart` (the RunCatchUp variant is
-/// the audit-fix-#2 idiom: a late trading-day boot runs once immediately —
-/// day-1 / backfill friendly — instead of skipping the day).
+/// Decision for WHEN the daily scoreboard should fire. Mirrors the retired
+/// tick-conservation audit's `ConservationStart` idiom (module deleted
+/// 2026-07-18; the RunCatchUp variant is the audit-fix-#2 idiom: a late
+/// trading-day boot runs once immediately — day-1 / backfill friendly —
+/// instead of skipping the day).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScoreboardStart {
     /// Not a trading day and not forced → do not run.
@@ -882,10 +890,9 @@ pub fn should_keep_feed_off_outcome(
 }
 
 /// Ticks a feed delivered today (feed-filtered + day-windowed). LOCAL
-/// builder with MICROS literals — deliberately NOT the
-/// `tick_conservation_boot::build_conservation_ticks_count_sql` reuse: that
-/// shipped builder embeds NANOS literals (the same silent-zero bug class,
-/// pre-existing on main — reported for a separate fix PR).
+/// builder with MICROS literals — deliberately NOT a reuse of the retired
+/// tick-conservation audit's count-SQL builder (module deleted 2026-07-18):
+/// that builder embedded NANOS literals (the same silent-zero bug class).
 #[must_use]
 pub fn build_scoreboard_ticks_count_sql(feed: &str, target_ist_day: u64) -> String {
     let (start, end) = day_bounds_micros(target_ist_day);
@@ -3928,6 +3935,18 @@ pub async fn run_feed_scoreboard(
 mod tests {
     use super::*;
     use tickvault_common::feed_blame::BlameClass;
+
+    #[test]
+    fn test_parse_questdb_count() {
+        // Relocated 2026-07-18 with the fn from the retired
+        // tick_conservation_boot module.
+        assert_eq!(
+            parse_questdb_count(r#"{"dataset":[[42]],"count":1}"#),
+            Some(42)
+        );
+        assert_eq!(parse_questdb_count(r#"{"dataset":[]}"#), None);
+        assert_eq!(parse_questdb_count("not json"), None);
+    }
 
     const DAY: u64 = 20_644; // an arbitrary IST day number
     fn day_ts(secs_into_day: i64) -> i64 {
