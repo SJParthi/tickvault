@@ -501,8 +501,8 @@ async fn main() -> Result<()> {
     feed_runtime.set_dhan_disable_allowed(config.strategy.dry_run);
     // PR-C2 (2026-07-13): the D2b `LaneState` FSM seed that lived here is
     // deleted with the Dhan live-WS lane — no pool, no lane FSM, no runtime
-    // cold-start supervisor. `mark_dhan_lane_running()` /
-    // `mark_dhan_pool_present()` stay permanently unset (no pool-spawn site
+    // cold-start supervisor. the old lane-running /
+    // pool-present markers stay permanently unset (no pool-spawn site
     // exists anymore).
     info!(
         dhan_enabled = feeds.dhan_enabled,
@@ -2928,8 +2928,6 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
-    use tickvault_app::boot_helpers::create_log_file_writer;
-
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
 
@@ -3012,7 +3010,6 @@ mod tests {
     #[test]
     fn test_boot_helper_functions_callable() {
         let _ = compute_market_close_sleep("15:30:00");
-        let _ = create_log_file_writer();
     }
 
     #[test]
