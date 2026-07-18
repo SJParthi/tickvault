@@ -381,13 +381,13 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.questdb_disconnected.alarm_name,
     # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
     aws_cloudwatch_metric_alarm.token_remaining_low.alarm_name,
-    aws_cloudwatch_metric_alarm.spill_dropped.alarm_name,
-    aws_cloudwatch_metric_alarm.dlq_ticks.alarm_name,
+    # spill_dropped + dlq_ticks retired 2026-07-18 (stage-4 unit A —
+    # dead-tick alarm chains; the ticks table has no writer anymore).
     # aggregator_no_seals retired 2026-07-15 (Groww live-feed retirement —
     # the seals metric lost its last live producer; see section 9 note).
     aws_cloudwatch_metric_alarm.orders_rejected.alarm_name,
     aws_cloudwatch_metric_alarm.clock_skew_high.alarm_name,
     aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,
-    aws_cloudwatch_metric_alarm.late_tick_after_boundary.alarm_name,
+    # late_tick_after_boundary retired 2026-07-18 (stage-4 unit A).
   ]
 }

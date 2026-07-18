@@ -172,8 +172,7 @@ resource "aws_cloudwatch_dashboard" "operator" {
             aws_cloudwatch_metric_alarm.questdb_disconnected.arn,
             aws_cloudwatch_metric_alarm.token_remaining_low.arn,
             # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
-            aws_cloudwatch_metric_alarm.spill_dropped.arn,
-            aws_cloudwatch_metric_alarm.dlq_ticks.arn,
+            # spill_dropped + dlq_ticks retired 2026-07-18 (stage-4 unit A).
             aws_cloudwatch_metric_alarm.clock_skew_high.arn,
             aws_cloudwatch_metric_alarm.high_cpu.arn,
             aws_cloudwatch_metric_alarm.disk_used_high.arn
