@@ -234,7 +234,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [common, storage, core, trading, api, app]
+        # aws-lambdas joined 2026-07-18 (rust-only phase 2b-1) — a matrix
+        # ENTRY, not a new job, so the all-green needs list is untouched.
+        crate: [common, storage, core, trading, api, app, aws-lambdas]
         # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature was
         # DELETED with the Dhan instrument chain (operator Q3, 2026-07-13 —
         # websocket-connection-scope-lock.md "2026-07-13 Amendment" §B); the

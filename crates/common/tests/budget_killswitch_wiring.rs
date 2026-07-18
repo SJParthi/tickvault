@@ -29,11 +29,18 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())) // APPROVED: test
 }
 
+// 2026-07-18 (rust-only phase 2b-1): the Python handler.py/test_handler.py
+// were PORTED to crates/aws-lambdas (lib module budget_killswitch + the
+// budget-killswitch [[bin]], built via cargo-lambda as a provided.al2023
+// bootstrap zip). The three source-shape pins below repoint from the Python
+// files to the Rust port — same Z+ L7 invariant: the kill-switch source must
+// exist, must expose the Lambda entry point, and must carry runnable tests.
+
 #[test]
 fn test_killswitch_lambda_source_exists() {
     for rel in &[
-        "deploy/aws/lambda/budget-killswitch/handler.py",
-        "deploy/aws/lambda/budget-killswitch/test_handler.py",
+        "crates/aws-lambdas/src/budget_killswitch.rs",
+        "crates/aws-lambdas/src/bin/budget_killswitch.rs",
     ] {
         let path = workspace_root().join(rel);
         assert!(
@@ -45,23 +52,42 @@ fn test_killswitch_lambda_source_exists() {
 }
 
 #[test]
-fn test_killswitch_handler_is_python_module() {
-    let body = read("deploy/aws/lambda/budget-killswitch/handler.py");
+fn test_killswitch_handler_entry_point_is_wired() {
+    // The bin is THIN glue: lambda_runtime::run -> lib handle(). Both halves
+    // must stay wired or the deployed bootstrap does nothing.
+    let lib = read("crates/aws-lambdas/src/budget_killswitch.rs");
     assert!(
-        body.contains("def lambda_handler"),
-        "Z+ L7 COOLDOWN ratchet: handler.py missing lambda_handler entry \
-         point — AWS Lambda runtime expects handler.lambda_handler."
+        lib.contains("pub async fn handle"),
+        "Z+ L7 COOLDOWN ratchet: budget_killswitch.rs lost its `handle` \
+         entry point — the bootstrap bin has nothing to call."
+    );
+    let bin = read("crates/aws-lambdas/src/bin/budget_killswitch.rs");
+    assert!(
+        bin.contains("budget_killswitch::handle") && bin.contains("lambda_runtime::run"),
+        "Z+ L7 COOLDOWN ratchet: the budget-killswitch bin no longer wires \
+         lambda_runtime::run to budget_killswitch::handle."
     );
 }
 
 #[test]
-fn test_killswitch_test_handler_is_executable_via_unittest() {
-    let body = read("deploy/aws/lambda/budget-killswitch/test_handler.py");
-    assert!(
-        body.contains("unittest.main()") || body.contains("import unittest"),
-        "Z+ L7 COOLDOWN ratchet: test_handler.py is not a unittest module — \
-         CI cannot run it as `python3 -m unittest test_handler`."
-    );
+fn test_killswitch_port_keeps_the_python_test_parity_suite() {
+    // The 11 Python unit tests were ported 1:1 (plus Rust-side additions).
+    // Spot-pin the three safety-critical ones so a future refactor cannot
+    // silently drop the parity suite (`cargo test -p tickvault-aws-lambdas`
+    // runs them in the Test (aws-lambdas) CI matrix lane).
+    let lib = read("crates/aws-lambdas/src/budget_killswitch.rs");
+    for pin in [
+        "mod tests",
+        "test_payload_includes_kill_switch_marker",
+        "test_missing_instance_id_returns_not_ok",
+        "test_missing_topic_arn_returns_not_ok",
+    ] {
+        assert!(
+            lib.contains(pin),
+            "Z+ L7 COOLDOWN ratchet: budget_killswitch.rs lost `{pin}` — \
+             the ported Python parity suite is no longer intact."
+        );
+    }
 }
 
 #[test]

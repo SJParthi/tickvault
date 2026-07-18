@@ -1,0 +1,44 @@
+# tickvault-aws-lambdas — the 4 operational AWS Lambdas as Rust bins
+# (rust-only phase 2b-1, 2026-07-18).
+#
+# Each [[bin]] is THIN glue (lambda_runtime::run + one lib call) — ALL logic
+# lives in src/lib.rs modules so the thin-bin coverage rule holds (main.rs
+# glue is structurally uncoverable by llvm-cov; the lib is what the floor
+# measures). Built for AWS via cargo-lambda (provided.al2023, arm64,
+# handler = "bootstrap") in .github/workflows/terraform-apply.yml.
+[package]
+name = "tickvault-aws-lambdas"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+lambda_runtime = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-sns = { workspace = true }
+aws-sdk-ssm = { workspace = true }
+aws-sdk-ec2 = { workspace = true }
+aws-sdk-cloudwatch = { workspace = true }
+aws-sdk-costexplorer = { workspace = true }
+
+[[bin]]
+name = "budget-killswitch"
+path = "src/bin/budget_killswitch.rs"
+
+[[bin]]
+name = "daily-budget-digest"
+path = "src/bin/daily_budget_digest.rs"
+
+[[bin]]
+name = "boot-heartbeat-gate"
+path = "src/bin/boot_heartbeat_gate.rs"
+
+[[bin]]
+name = "market-hours-liveness-gate"
+path = "src/bin/market_hours_liveness_gate.rs"

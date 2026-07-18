@@ -46,3 +46,12 @@ trading = 96.9
 storage = 90.1
 api     = 98.6
 app     = 63.3
+# aws-lambdas: NEW crate (2026-07-18, rust-only phase 2b-1 — the 4 AWS
+# Lambdas as Rust bins). MEASURED-then-ratcheted per the phase-2 design:
+# local `cargo llvm-cov -p tickvault-aws-lambdas` measured 64.92% lines
+# (935 lines, 328 missed — the misses are the 4 thin [[bin]] glue files,
+# clients.rs SDK construction, and the async AWS-call glue, all
+# structurally unexercisable without a live AWS account; every pure
+# decision/formatting fn is covered). Floor per the standing formula:
+# measured 64.92 rounded down to one decimal (64.9) minus 0.1 = 64.8.
+aws-lambdas = 64.8

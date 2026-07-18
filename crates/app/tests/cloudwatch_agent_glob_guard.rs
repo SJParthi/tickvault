@@ -331,6 +331,10 @@ fn test_alarm_is_gated_by_market_hours_lambda() {
 /// fail OPEN on an EC2 API error so a real trading day never loses the page.
 #[test]
 fn test_gate_lambda_open_is_holiday_safe() {
+    // 2026-07-18 (rust-only phase 2b-1): the gate Lambda's Python heredoc was
+    // PORTED to Rust (crates/aws-lambdas/src/market_hours_gate.rs) — the
+    // env-var + IAM pins stay in the tf; the LOGIC pins repoint to the Rust
+    // source (the budget_killswitch_wiring.rs repoint precedent).
     let tf = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
     let norm = normalized(&tf);
     for (pin, why) in [
@@ -338,21 +342,6 @@ fn test_gate_lambda_open_is_holiday_safe() {
             "EC2_INSTANCE_ID = aws_instance.tv_app.id",
             "the gate Lambda must know WHICH instance to check — the cycle-free \
              env-var pattern proven by start-watchdog-lambda.tf",
-        ),
-        (
-            "ec2.describe_instances(InstanceIds=[INSTANCE_ID])",
-            "the open path must ask EC2 whether the box is up before enabling \
-             the breaching-on-missing alarms (holiday self-stop = box OFF)",
-        ),
-        (
-            "fail-open, treating as up",
-            "an EC2 API error must NEVER suppress the trading-day liveness page \
-             — the check fails open, exactly mirroring holiday-gate.sh",
-        ),
-        (
-            "leaving actions disabled",
-            "a not-up box (NSE holiday self-stop / operator manual stop) must \
-             skip BOTH the enable and the OK reset",
         ),
         (
             "\"ec2:DescribeInstances\"",
@@ -369,13 +358,37 @@ fn test_gate_lambda_open_is_holiday_safe() {
              + treat_missing_data=breaching)."
         );
     }
+    let rs = read("crates/aws-lambdas/src/market_hours_gate.rs");
+    for (pin, why) in [
+        (
+            ".describe_instances()",
+            "the open path must ask EC2 whether the box is up before enabling \
+             the breaching-on-missing alarms (holiday self-stop = box OFF)",
+        ),
+        (
+            "fail-open, treating as up",
+            "an EC2 API error must NEVER suppress the trading-day liveness page \
+             — the check fails open, exactly mirroring holiday-gate.sh",
+        ),
+        (
+            "leaving actions disabled",
+            "a not-up box (NSE holiday self-stop / operator manual stop) must \
+             skip BOTH the enable and the OK reset",
+        ),
+    ] {
+        assert!(
+            rs.contains(pin),
+            "market_hours_gate.rs lost the holiday-safety pin `{pin}` — {why}. \
+             Regressing this restores the weekday-NSE-holiday false page."
+        );
+    }
     // The enable call must come AFTER the instance-up guard in the Lambda
     // source (source-order scan, house pattern).
-    let guard_pos = tf
-        .find("if not up:")
-        .expect("gate Lambda must carry the `if not up:` holiday guard arm"); // APPROVED: test
-    let enable_pos = tf
-        .find("cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)")
+    let guard_pos = rs
+        .find("if !instance_up")
+        .expect("gate Lambda must carry the instance-up holiday guard arm"); // APPROVED: test
+    let enable_pos = rs
+        .find(".enable_alarm_actions()")
         .expect("gate Lambda must still enable alarm actions on open"); // APPROVED: test
     assert!(
         guard_pos < enable_pos,
@@ -396,6 +409,9 @@ fn test_gate_lambda_open_is_holiday_safe() {
 /// marker-less manual-stop case, and must fail OPEN on any SSM error.
 #[test]
 fn test_gate_lambda_open_checks_holiday_marker_first() {
+    // 2026-07-18 (rust-only phase 2b-1): env-var + IAM pins stay in the tf;
+    // the marker-read LOGIC pins repoint to the Rust port
+    // (crates/aws-lambdas/src/market_hours_gate.rs).
     let tf = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
     let norm = normalized(&tf);
     for (pin, why) in [
@@ -403,16 +419,6 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
             "HOLIDAY_STOP_PARAM = \"/tickvault/${var.environment}/holiday-stop-date\"",
             "the gate Lambda must be told WHERE holiday-gate.sh stamps the \
              intentional-stop marker",
-        ),
-        (
-            "ssm.get_parameter(Name=HOLIDAY_STOP_PARAM)",
-            "the open path must READ the marker — marker == today is the only \
-             race-proof 'intentionally stopped today' signal",
-        ),
-        (
-            "fail-open, not a holiday",
-            "an SSM error / missing marker must NEVER suppress the trading-day \
-             liveness page — the marker check fails open",
         ),
         (
             "parameter/tickvault/${var.environment}/holiday-stop-date",
@@ -428,15 +434,39 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
              up-burst bracketing the single 09:20 instance-state sample)."
         );
     }
-    // Source order: marker check BEFORE the instance-up guard BEFORE enable.
-    let marker_pos = tf
-        .find("if holiday_stop_is_today():")
+    let rs = read("crates/aws-lambdas/src/market_hours_gate.rs");
+    for (pin, why) in [
+        (
+            ".get_parameter().name(&holiday_param)",
+            "the open path must READ the marker — marker == today is the only \
+             race-proof 'intentionally stopped today' signal",
+        ),
+        (
+            "fail-open, not a holiday",
+            "an SSM error / missing marker must NEVER suppress the trading-day \
+             liveness page — the marker check fails open",
+        ),
+        (
+            "holiday_marker_matches_today",
+            "the marker compare must go through the unit-tested pure fn \
+             (trim + exact-today match; stale markers never match)",
+        ),
+    ] {
+        assert!(
+            rs.contains(pin),
+            "market_hours_gate.rs lost the round-3 marker pin `{pin}` — {why}."
+        );
+    }
+    // Source order: marker check BEFORE the instance-up guard BEFORE enable
+    // (the pure open_decision fn + the handle's decision match).
+    let marker_pos = rs
+        .find("if holiday_stop_today")
         .expect("gate Lambda open path must carry the holiday-marker guard arm"); // APPROVED: test
-    let up_guard_pos = tf
-        .find("if not up:")
+    let up_guard_pos = rs
+        .find("if !instance_up")
         .expect("gate Lambda must keep the round-1 instance-up guard arm"); // APPROVED: test
-    let enable_pos = tf
-        .find("cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)")
+    let enable_pos = rs
+        .find(".enable_alarm_actions()")
         .expect("gate Lambda must still enable alarm actions on open"); // APPROVED: test
     assert!(
         marker_pos < up_guard_pos && up_guard_pos < enable_pos,
