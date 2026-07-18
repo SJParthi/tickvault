@@ -142,11 +142,34 @@ pub fn endpoint_url(
     default.to_string()
 }
 
-/// Python `_logs_dir`.
+/// Lexical dot-normalization matching Python `pathlib`'s parse-time
+/// behavior: `.` components are dropped (`Path("a/./b")` == `Path("a/b")`,
+/// `Path("")` == `Path(".")`), while `..` is KEPT verbatim — pathlib
+/// pure-path construction/joins never resolve parent components. Purely
+/// lexical: no filesystem access, no symlink/canonicalization. (Accepted
+/// unreachable edge: POSIX's special `//`-root, which pathlib preserves,
+/// collapses to `/` here — no config/env value can legitimately carry it.)
+fn pathlib_lexical(path: &Path) -> PathBuf {
+    let out: PathBuf = path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Python `_logs_dir`. Every branch mirrors CPython's `Path(...)`
+/// construction, which drops `.` components at parse time — the shipped
+/// default `logs_dir_local = "./data/logs"` must join to
+/// `<root>/data/logs`, never `<root>/./data/logs` (the joined string
+/// echoes into tool outputs: `dir` / `path` / `log_dir` fields).
 pub fn logs_dir(env: &dyn Env, cfg: &EndpointsConfig, repo_root: &Path) -> PathBuf {
     let override_val = env.get("TICKVAULT_LOGS_DIR");
     if is_resolved(override_val.as_deref()) {
-        return PathBuf::from(override_val.unwrap_or_default());
+        return pathlib_lexical(Path::new(&override_val.unwrap_or_default()));
     }
     let profile = active_profile(env, cfg);
     if let Some(profile_cfg) = cfg.profiles.get(&profile)
@@ -155,11 +178,11 @@ pub fn logs_dir(env: &dyn Env, cfg: &EndpointsConfig, repo_root: &Path) -> PathB
     {
         let cfg_path = PathBuf::from(from_config);
         if cfg_path.is_absolute() {
-            return cfg_path;
+            return pathlib_lexical(&cfg_path);
         }
-        return repo_root.join(cfg_path);
+        return pathlib_lexical(&repo_root.join(cfg_path));
     }
-    repo_root.join("data").join("logs")
+    pathlib_lexical(&repo_root.join("data").join("logs"))
 }
 
 /// Python `_logs_source`: "http" or "local".
@@ -438,6 +461,71 @@ mod tests {
             logs_dir(&env, &cfg, Path::new("/repo")),
             PathBuf::from("/abs/logs")
         );
+    }
+
+    // --- pathlib dot-normalization parity (hostile-review r1 finding 1) ---
+    #[test]
+    fn logs_dir_shipped_dotted_relative_value_joins_like_pathlib() {
+        // The LITERAL shipped default in config/claude-mcp-endpoints.toml is
+        // "./data/logs". Python: Path("/repo") / "./data/logs" drops the
+        // leading `.` at construction => "/repo/data/logs". The Rust join
+        // must produce the identical string (it echoes into tool outputs).
+        let env = MapEnv::default();
+        let cfg = cfg_with_profile("local", "local", &[("logs_dir_local", "./data/logs")]);
+        assert_eq!(
+            logs_dir(&env, &cfg, Path::new("/repo")),
+            PathBuf::from("/repo/data/logs")
+        );
+    }
+
+    #[test]
+    fn logs_dir_dot_normalization_keeps_parent_components() {
+        // pathlib drops ONLY `.`; `..` is kept verbatim in pure-path joins
+        // (no lexical parent resolution, no symlink resolution).
+        let env = MapEnv::default();
+        let cfg = cfg_with_profile(
+            "local",
+            "local",
+            &[("logs_dir_local", "./sub/../data/./logs")],
+        );
+        assert_eq!(
+            logs_dir(&env, &cfg, Path::new("/repo")),
+            PathBuf::from("/repo/sub/../data/logs")
+        );
+    }
+
+    #[test]
+    fn logs_dir_absolute_dotted_config_value_is_dot_normalized() {
+        // Python Path("/abs/./data/logs") == Path("/abs/data/logs").
+        let env = MapEnv::default();
+        let cfg = cfg_with_profile("local", "local", &[("logs_dir_local", "/abs/./data/logs")]);
+        assert_eq!(
+            logs_dir(&env, &cfg, Path::new("/repo")),
+            PathBuf::from("/abs/data/logs")
+        );
+    }
+
+    #[test]
+    fn logs_dir_env_override_is_dot_normalized() {
+        // Python Path(override) also drops `.` at construction.
+        let env = env(&[("TICKVAULT_LOGS_DIR", "/x/./y")]);
+        let cfg = EndpointsConfig {
+            active: "local".to_string(),
+            profiles: BTreeMap::new(),
+        };
+        assert_eq!(
+            logs_dir(&env, &cfg, Path::new("/repo")),
+            PathBuf::from("/x/y")
+        );
+    }
+
+    #[test]
+    fn pathlib_lexical_empty_and_lone_dot_match_python() {
+        // Python Path("") == Path(".") == PosixPath("."): both normalize
+        // to "." here so the echoed string can never be empty.
+        assert_eq!(pathlib_lexical(Path::new("")), PathBuf::from("."));
+        assert_eq!(pathlib_lexical(Path::new(".")), PathBuf::from("."));
+        assert_eq!(pathlib_lexical(Path::new("./")), PathBuf::from("."));
     }
 
     // --- config loading fallbacks -----------------------------------------

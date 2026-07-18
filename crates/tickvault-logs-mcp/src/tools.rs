@@ -11,8 +11,10 @@
 //!     instead of CPython's TypeError text.
 //!   - OS/library-level failure TEXT (spawn errors, transport errors,
 //!     invalid-regex details, JSON-decode details) differs from CPython's
-//!     exception strings; the surrounding JSON shape is identical and the
-//!     harness masks exactly those fields.
+//!     exception strings; the surrounding JSON shape is identical. The
+//!     parity harness masks ONLY cutoff_utc, the grep invalid-regex error
+//!     detail, and sorts `matches` arrays — transport-error text is NOT
+//!     masked; the transcript AVOIDS those paths (the mock is always up).
 //!   - Invalid UTF-8 in log files: Python read_text() raises (tool error);
 //!     Rust skips the file (tail/history) — the app's sinks are UTF-8.
 
@@ -215,12 +217,24 @@ fn parse_event_ts(ev: &Map<String, Value>) -> Option<chrono::DateTime<chrono::Fi
     chrono::DateTime::parse_from_rfc3339(&normalised).ok()
 }
 
+/// Pure cutoff computation for `since_minutes` — MINUTES scale, never
+/// seconds (Python: `datetime.now(timezone.utc) - timedelta(minutes=...)`).
+/// Pinned with an injected `now` by `tests::novel_cutoff_is_minutes_scale`:
+/// a `Duration::minutes` -> `Duration::seconds` mutation moves the cutoff
+/// 60x closer to `now` and fails that test.
+fn novel_cutoff(
+    now: chrono::DateTime<chrono::Utc>,
+    since_minutes: i64,
+) -> chrono::DateTime<chrono::Utc> {
+    now - chrono::Duration::minutes(since_minutes)
+}
+
 /// server.py `tool_list_novel_signatures`.
 pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Value {
     use std::collections::HashMap;
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
-    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(since_minutes);
+    let cutoff = novel_cutoff(chrono::Utc::now(), since_minutes);
 
     let mut order: Vec<String> = Vec::new();
     let mut first_seen: HashMap<String, NovelInfo> = HashMap::new();
@@ -504,7 +518,10 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
     let resp = match client.get(&full).send() {
         Ok(r) => r,
         Err(e) => {
-            // Transport error text differs from urllib's — harness masks.
+            // Transport error text differs from urllib's — a documented
+            // deviation the parity transcript AVOIDS (the mock HTTP server
+            // is always up, so this arm is unreachable in parity); the
+            // harness does NOT mask transport-error text.
             return json!({"ok": false, "query": query, "error": e.to_string()});
         }
     };
@@ -1775,6 +1792,27 @@ mod tests {
             assert_eq!(arr[i]["name"], *name);
             assert_eq!(arr[i]["description"], *desc);
         }
+    }
+
+    #[test]
+    fn novel_cutoff_is_minutes_scale() {
+        use chrono::TimeZone;
+        // Injected deterministic `now` — no wall clock anywhere.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+        // Fixture event first_seen at now - 30 minutes, compared with the
+        // SAME `ts >= cutoff` inclusion rule the tool uses.
+        let first_seen = now - chrono::Duration::minutes(30);
+        assert!(
+            first_seen >= novel_cutoff(now, 60),
+            "event at now-30min must be INCLUDED at since_minutes=60"
+        );
+        assert!(
+            first_seen < novel_cutoff(now, 10),
+            "event at now-30min must be EXCLUDED at since_minutes=10"
+        );
+        // Exact scale pin: 60 MINUTES == 3600 seconds. A minutes->seconds
+        // mutation yields now - 60s here and fails.
+        assert_eq!(novel_cutoff(now, 60), now - chrono::Duration::seconds(3600));
     }
 
     #[test]

@@ -704,6 +704,43 @@ fn parity_transcript() {
     }
 
     // ------------------------------------------------------------------
+    // Session D — config-file logs_dir branch (hostile-review r1 finding
+    // 1): NO TICKVAULT_LOGS_DIR env override, so both children resolve
+    // the logs dir from `logs_dir_local` in the endpoints config. The
+    // value carries a `/./` component — Python's pathlib drops it at
+    // construction; the Rust side must dot-normalize identically (the
+    // string echoes into `dir`/`path` fields). The configured path is
+    // ABSOLUTE (fixture root), so the two children's differing repo-root
+    // derivations are inert and the session stays deterministic.
+    // ------------------------------------------------------------------
+    {
+        let cfg_file = fixture_root.join("parity-endpoints.toml");
+        std::fs::write(
+            &cfg_file,
+            format!(
+                "active = \"parity\"\n\n[profiles.parity]\nlogs_dir_local = \"{}/./data/logs\"\nlogs_source = \"local\"\n",
+                fixture_root.display()
+            ),
+        )
+        .expect("write parity endpoints config");
+        let cfg_file_str = cfg_file.to_string_lossy().into_owned();
+        let common_no_logs_dir: Vec<(String, String)> = common
+            .iter()
+            .filter(|(k, _)| k != "TICKVAULT_LOGS_DIR")
+            .cloned()
+            .collect();
+        let mut s = spawn_session(
+            "D",
+            &common_no_logs_dir,
+            &[("TICKVAULT_MCP_ENDPOINTS_CONFIG", cfg_file_str.as_str())],
+        );
+        s.rpc("(rpc)", "initialize", "initialize");
+        s.call("tail_errors", "config-file dotted logs dir", json!({}));
+        s.call("summary_snapshot", "config-file dotted logs dir", json!({}));
+        rows.append(&mut s.rows);
+    }
+
+    // ------------------------------------------------------------------
     // Report + verdict
     // ------------------------------------------------------------------
     eprintln!("\nPER-STEP PARITY TABLE (byte-identical after documented normalization):");

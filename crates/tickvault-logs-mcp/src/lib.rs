@@ -27,8 +27,10 @@
 //!   - Error TEXT for OS/library-level failures (spawn errors, HTTP
 //!     transport errors, invalid-regex details) necessarily differs from
 //!     CPython's exception strings; the surrounding JSON shape is
-//!     identical and the parity harness masks exactly those documented
-//!     fields.
+//!     identical. The parity harness's masking covers ONLY cutoff_utc,
+//!     the grep invalid-regex error detail, and `matches`-array sort
+//!     order; transport-error text is NOT masked — the parity transcript
+//!     AVOIDS transport-error paths (the mock HTTP server is always up).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
