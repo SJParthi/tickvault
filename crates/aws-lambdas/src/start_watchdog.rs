@@ -126,9 +126,30 @@ pub fn is_within_operating_hours(now_utc: DateTime<Utc>) -> bool {
     (OPERATING_OPEN_IST_MINUTES..OPERATING_CLOSE_IST_MINUTES).contains(&minutes)
 }
 
+/// Expand a python-3.11+-accepted HOUR-only ISO time ("2026-07-03T06",
+/// "2026-07-03 06+05:30") into minute precision ("…T06:00…") so the chrono
+/// format ladder can parse it. Returns None when the shape is not the
+/// hour-only pattern (date + separator + exactly 2 hour digits, then end
+/// or an offset start) — the caller falls through with the original string.
+fn expand_hour_only_time(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 13 || !(bytes[10] == b'T' || bytes[10] == b' ') {
+        return None;
+    }
+    if !(bytes[11].is_ascii_digit() && bytes[12].is_ascii_digit()) {
+        return None;
+    }
+    match bytes.get(13) {
+        None => Some(format!("{raw}:00")),
+        Some(b'+' | b'-' | b'Z' | b'z') => Some(format!("{}:00{}", &raw[..13], &raw[13..])),
+        Some(_) => None,
+    }
+}
+
 /// Python `datetime.fromisoformat(raw)` + naive-as-IST interpretation.
-/// Accepts an offset-aware ISO timestamp, a naive `YYYY-MM-DDTHH:MM:SS[.f]`
-/// (interpreted as IST — the operator's plain local paste), or a bare date.
+/// Accepts an offset-aware ISO timestamp (seconds, minute, or hour
+/// precision), a naive `YYYY-MM-DD[T ]HH[:MM[:SS[.f]]]` (interpreted as
+/// IST — the operator's plain local paste), or a bare date.
 /// Garbage -> None (the guard stays armed — budget protection wins).
 pub fn parse_keep_alive_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     let raw = raw.trim();
@@ -138,21 +159,47 @@ pub fn parse_keep_alive_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
         return Some(dt.with_timezone(&Utc));
     }
-    // Python fromisoformat also accepts offsets without a colon (+0530) and
-    // a space separator; tolerate both forms.
-    for fmt in ["%Y-%m-%dT%H:%M:%S%.f%z", "%Y-%m-%d %H:%M:%S%.f%z"] {
+    // Python 3.11+ fromisoformat (the lambda runtime is python3.12) accepts
+    // HOUR-only times ("2026-07-03T06", with or without an offset) —
+    // oracle-verified. chrono has no hour-only arm that defaults the minute,
+    // so expand "…THH" to "…THH:00" and fall through the same ladder.
+    let expanded = expand_hour_only_time(raw);
+    let raw = expanded.as_deref().unwrap_or(raw);
+    // chrono's `%z` does not accept the trailing `Z` python fromisoformat
+    // does ("2026-07-03T06:00Z" — oracle-verified); normalize it to an
+    // explicit +00:00 offset. (Seconds-precision `…SSZ` was already handled
+    // by the RFC3339 arm above, so this only serves the short forms.)
+    let zulu = raw
+        .strip_suffix(['Z', 'z'])
+        .map(|head| format!("{head}+00:00"));
+    let raw = zulu.as_deref().unwrap_or(raw);
+    // Python fromisoformat also accepts offsets without a colon (+0530), a
+    // trailing Z, a space separator, and MINUTE-precision times without
+    // seconds ("2026-07-03T06:00" — oracle-verified on python3.12); tolerate
+    // all of these forms.
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.f%z",
+        "%Y-%m-%d %H:%M:%S%.f%z",
+        "%Y-%m-%dT%H:%M%z",
+        "%Y-%m-%d %H:%M%z",
+    ] {
         if let Ok(dt) = DateTime::parse_from_str(raw, fmt) {
             return Some(dt.with_timezone(&Utc));
         }
     }
-    let naive = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
-        .iter()
-        .find_map(|fmt| NaiveDateTime::parse_from_str(raw, fmt).ok())
-        .or_else(|| {
-            NaiveDate::parse_from_str(raw, "%Y-%m-%d")
-                .ok()
-                .and_then(|d| d.and_hms_opt(0, 0, 0))
-        })?;
+    let naive = [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ]
+    .iter()
+    .find_map(|fmt| NaiveDateTime::parse_from_str(raw, fmt).ok())
+    .or_else(|| {
+        NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+    })?;
     // Operator wrote a naive local (IST) timestamp.
     ist()
         .from_local_datetime(&naive)
@@ -1367,6 +1414,83 @@ mod tests {
         .await;
         assert_eq!(out["stopped"], json!(false));
         assert_eq!(out["skipped"], json!("keep_alive"));
+    }
+
+    #[test]
+    fn test_parse_keep_alive_minute_precision_matches_python_oracle() {
+        // Oracle: python3 datetime.fromisoformat (lambda runtime python3.12)
+        // ACCEPTS minute-precision forms — verified 2026-07-18:
+        //   '2026-07-03T06:00'        -> datetime(2026, 7, 3, 6, 0)
+        //   '2026-07-03 06:00'        -> datetime(2026, 7, 3, 6, 0)
+        //   '2026-07-03T06:00+05:30'  -> datetime(..., tzinfo=+05:30)
+        //   '2026-07-03T06:00+0530'   -> datetime(..., tzinfo=+05:30)
+        //   '2026-07-03T06:00Z'       -> datetime(..., tzinfo=UTC)
+        // Naive forms are the operator's plain IST paste -> 06:00 IST
+        // == 00:30 UTC.
+        let ist_0030_utc = utc(2026, 7, 3, 0, 30);
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06:00"),
+            Some(ist_0030_utc)
+        );
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03 06:00"),
+            Some(ist_0030_utc)
+        );
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06:00+05:30"),
+            Some(ist_0030_utc)
+        );
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03 06:00+0530"),
+            Some(ist_0030_utc)
+        );
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06:00Z"),
+            Some(utc(2026, 7, 3, 6, 0))
+        );
+    }
+
+    #[test]
+    fn test_parse_keep_alive_hour_only_matches_python312_oracle() {
+        // Oracle: python3.11+/3.12 fromisoformat ALSO accepts hour-only
+        // times (rejected in <=3.10; the lambda runtime is python3.12) —
+        // verified 2026-07-18:
+        //   '2026-07-03T06'        -> datetime(2026, 7, 3, 6, 0)
+        //   '2026-07-03 06'        -> datetime(2026, 7, 3, 6, 0)
+        //   '2026-07-03T06+05:30'  -> datetime(..., tzinfo=+05:30)
+        //   '2026-07-03T06Z'       -> datetime(..., tzinfo=UTC)
+        let ist_0030_utc = utc(2026, 7, 3, 0, 30);
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06"),
+            Some(ist_0030_utc)
+        );
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03 06"),
+            Some(ist_0030_utc)
+        );
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06+05:30"),
+            Some(ist_0030_utc)
+        );
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06Z"),
+            Some(utc(2026, 7, 3, 6, 0))
+        );
+    }
+
+    #[test]
+    fn test_parse_keep_alive_garbage_still_rejected() {
+        // Garbage must keep returning None — the curfew guard stays armed.
+        for garbage in [
+            "not-a-timestamp",
+            "2026-07-03Tgarbage",
+            "2026-07-03T99:99",
+            "2026-13-40T06:00",
+            "T06:00",
+            "",
+        ] {
+            assert_eq!(parse_keep_alive_timestamp(garbage), None, "{garbage:?}");
+        }
     }
 
     #[tokio::test]
