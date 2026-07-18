@@ -186,7 +186,12 @@ jobs:
             TOTAL=$(grep -oE '[0-9]+ mutants tested' mutation-results.clean.txt 2>/dev/null | tail -1 | cut -d' ' -f1 || true)
             TOTAL=${TOTAL:-0}; MISSED=${MISSED:-0}; CAUGHT=${CAUGHT:-0}; TIMEOUT=${TIMEOUT:-0}
             if [ "$TOTAL" -gt 0 ]; then
-              SCORE=$(python3 -c "print(f'{$CAUGHT / $TOTAL * 100:.1f}')")
+              # Language port 2026-07-18 (rust-only purge Phase 2a-1): the
+              # former python3 f'{c / t * 100:.1f}' one-liner, re-expressed as
+              # awk printf "%.1f" — both format the same IEEE-754 double with
+              # correctly-rounded decimal output (byte-identical values;
+              # spot-checked across the caught/total range in the porting PR).
+              SCORE=$(awk -v c="$CAUGHT" -v t="$TOTAL" 'BEGIN{printf "%.1f", c / t * 100}')
             else
               SCORE="N/A"
             fi
