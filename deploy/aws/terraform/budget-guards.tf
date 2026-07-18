@@ -127,15 +127,13 @@ resource "aws_lambda_permission" "tv_daily_budget_digest_eventbridge" {
 
 # --------- Hard Auto-Stop Guard Lambda ---------
 
-# Lambda source — packaged from deploy/aws/lambda/hard-stop-guard/
-# (mirrors the budget-killswitch packaging idiom; the handler carries the
-# GAP 1 breach->stop+disable logic with unit tests in test_handler.py).
-data "archive_file" "tv_hard_stop_guard_zip" {
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/hard-stop-guard"
-  output_path = "${path.module}/.tv-hard-stop-guard.zip"
-  excludes    = ["README.md", "test_handler.py", "__pycache__", "*.pyc"]
-}
+# 2026-07-18 (rust-only phase 2b-2 wave 2): ported from python
+# (deploy/aws/lambda/hard-stop-guard/handler.py, deleted in the same PR) to
+# the Rust binary `hard-stop-guard` in crates/aws-lambdas
+# (src/hard_stop_guard.rs — GAP 1 breach->stop+disable logic, 34 tests
+# ported 1:1). Packaged by the terraform-apply workflow's cargo-lambda
+# build step into .lambda-zips/ (same idiom as tv_daily_budget_digest
+# above).
 
 resource "aws_iam_role" "tv_hard_stop_guard" {
   name = "tv-prod-hard-stop-guard-role"
@@ -207,11 +205,12 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
 
 resource "aws_lambda_function" "tv_hard_stop_guard" {
   function_name    = "tv-prod-hard-stop-guard"
-  filename         = data.archive_file.tv_hard_stop_guard_zip.output_path
-  source_code_hash = data.archive_file.tv_hard_stop_guard_zip.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/hard-stop-guard.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
   role             = aws_iam_role.tv_hard_stop_guard.arn
-  handler          = "handler.lambda_handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 30
   memory_size      = 128
   environment {
