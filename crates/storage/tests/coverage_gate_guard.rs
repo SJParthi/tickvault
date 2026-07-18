@@ -58,7 +58,7 @@ fn coverage_json(entries: &[String]) -> String {
 /// The crates listed in `quality/crate-coverage-thresholds.toml` `[crates]`
 /// (their listing is separately pinned by
 /// `crates/common/tests/coverage_threshold_lockdown.rs::coverage_lockdown_required_crates_are_listed`).
-const THRESHOLD_CRATES: [&str; 7] = [
+const THRESHOLD_CRATES: [&str; 8] = [
     "common",
     "core",
     "trading",
@@ -66,6 +66,7 @@ const THRESHOLD_CRATES: [&str; 7] = [
     "api",
     "app",
     "aws-lambdas",
+    "tickvault-logs-mcp",
 ];
 
 /// Fully-covered file entries for every threshold-listed crate EXCEPT the

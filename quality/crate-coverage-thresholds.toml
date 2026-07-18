@@ -1,7 +1,5 @@
-# =============================================================================
-# tickvault — Per-Crate Coverage Thresholds
-# =============================================================================
-# Used by: scripts/coverage-gate.sh (CI Stage 6)
+# ======================================================================# tickvault — Per-Crate Coverage Thresholds
+# ======================================================================# Used by: scripts/coverage-gate.sh (CI Stage 6)
 #
 # All values are line coverage percentages.
 # Any crate not listed uses the default threshold.
@@ -22,8 +20,7 @@
 #
 # Measured baseline (2026-06-10, main @ a6fe35c4):
 #   common 99.57 | api 98.71 | trading 97.02 | storage 91.35 | core 90.38 | app 63.43
-# =============================================================================
-
+# ======================================================================
 # Default threshold for any crate not explicitly listed
 default = 63.0
 
@@ -55,3 +52,14 @@ app     = 63.3
 # decision/formatting fn is covered). Floor per the standing formula:
 # measured 64.92 rounded down to one decimal (64.9) minus 0.1 = 64.8.
 aws-lambdas = 64.8
+# tickvault-logs-mcp: INITIAL floor (2026-07-18, rust-only phase 2c — the
+# new Rust MCP crate). Locally measured 85.83% line coverage (cargo
+# llvm-cov -p tickvault-logs-mcp, all targets — the parity integration
+# test's subprocess coverage IS captured via LLVM_PROFILE_FILE
+# inheritance), but this is a dev-sandbox measurement, not the CI
+# Coverage & Perf environment. Initial floor set CONSERVATIVELY at 80.0
+# to absorb CI-side variance (nextest partitioning, subprocess profraw
+# collection); RATCHET to the standing formula (measured rounded down to
+# one decimal minus 0.1) in a follow-up once the first post-merge CI
+# measurement lands.
+tickvault-logs-mcp = 80.0

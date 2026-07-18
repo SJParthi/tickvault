@@ -45,6 +45,12 @@ use std::path::Path;
 /// floor per the standing formula = 64.9 - 0.1 = 64.8 (the misses are the
 /// thin [[bin]] glue + SDK client construction + live-AWS async glue —
 /// structurally unexercisable without a live AWS account).
+///
+/// tickvault-logs-mcp pin added 2026-07-18 (rust-only phase 2c): initial
+/// CONSERVATIVE floor 80.0 from a dev-sandbox measurement of 85.83%
+/// (cargo llvm-cov, all targets incl. the parity harness subprocess
+/// coverage); ratchet to the standing measured-minus-0.1 formula after
+/// the first CI Coverage & Perf measurement.
 const PINNED_DEFAULT_FLOOR: f64 = 63.0;
 const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     ("common", 99.5),
@@ -54,6 +60,7 @@ const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     ("api", 98.6),
     ("app", 63.3),
     ("aws-lambdas", 64.8),
+    ("tickvault-logs-mcp", 80.0),
 ];
 
 fn read_thresholds_toml() -> String {
@@ -188,6 +195,8 @@ fn coverage_lockdown_required_crates_are_listed() {
         "api",
         "app",
         "aws-lambdas",
+        // 2026-07-18 (rust-only phase 2c): the Rust MCP crate.
+        "tickvault-logs-mcp",
     ];
     let mut missing = Vec::new();
     for crate_name in required {
@@ -205,13 +214,14 @@ fn coverage_lockdown_required_crates_are_listed() {
 
 #[test]
 fn coverage_lockdown_pinned_floors_are_sane() {
-    // The pins themselves must stay in (0, 100] and cover all 7 crates —
+    // The pins themselves must stay in (0, 100] and cover all 8 crates —
     // guards against a typo'd pin (e.g. 9.5 instead of 99.5) silently
-    // weakening the lockdown.
+    // weakening the lockdown. (6 -> 8 on 2026-07-18: aws-lambdas, rust-only
+    // phase 2b-1 + tickvault-logs-mcp, rust-only phase 2c.)
     assert_eq!(
         PINNED_CRATE_FLOORS.len(),
-        7,
-        "S3-7: expected exactly 7 pinned crate floors"
+        8,
+        "S3-7: expected exactly 8 pinned crate floors"
     );
     assert!(PINNED_DEFAULT_FLOOR > 0.0 && PINNED_DEFAULT_FLOOR <= 100.0);
     for (name, floor) in PINNED_CRATE_FLOORS {
