@@ -101,7 +101,17 @@ extract_gate() {
           emit_err("gate step run block is empty or mis-indented")
         body_indent = ind
       }
-      if (ind < body_indent) finish()   # block ended (trailing blanks clipped)
+      # Block end vs mid-body dedent (review round 1 fix, 2026-07-18): only a
+      # dedent to AT-OR-ABOVE the step level (the next step / next job key)
+      # legitimately ends the block. A non-blank line whose indent falls
+      # STRICTLY BETWEEN the step indent and the body indent is a malformed /
+      # drifted run block — the old code silently finish()ed there with a
+      # TRUNCATED extraction (rc=0), so scenarios ran against a prefix of the
+      # real gate script. Fail-closed loudly instead (same abort-not-run-
+      # truncated contract as every other drift arm).
+      if (ind <= step_indent && ind < body_indent) finish()   # block ended (trailing blanks clipped)
+      if (ind < body_indent)
+        emit_err("mid-body dedent inside the gate run block (indent " ind " is between the step indent " step_indent " and the body indent " body_indent ") — refusing a TRUNCATED extraction")
       for (i = 0; i < pending_blanks; i++) body = body "\n"
       pending_blanks = 0
       body = body substr($0, body_indent + 1) "\n"

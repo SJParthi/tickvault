@@ -93,7 +93,17 @@ while IFS= read -r f; do
   [ -n "$f" ] || continue
   rel="${f#"$CRITERION_DIR"/}"
   rel="${rel%/estimates.json}"
-  median=$(jq -r '.median.point_estimate // 0' "$f")
+  # FAIL CLOSED on a null/missing/non-numeric median (review round 1 fix,
+  # 2026-07-18): the previous `.median.point_estimate // 0` turned an
+  # explicit JSON null into 0ns — a corrupt estimates.json silently PASSED
+  # every budget. The old python raised TypeError there (exit 1); restore
+  # that fail-closed contract with a named error instead of a stack trace.
+  median=$(jq -r '(try .median.point_estimate catch null)
+                  | if type == "number" then . else "CORRUPT" end' "$f")
+  if [ "$median" = "CORRUPT" ] || [ -z "$median" ]; then
+    echo "ERROR: $f: median.point_estimate is null/missing/non-numeric — corrupt Criterion output; refusing to treat it as 0ns (fail closed)" >&2
+    exit 1
+  fi
   printf 'N\t%s\t%s\n' "$rel" "$median" >> "$RECORDS_FILE"
 done < <(printf '%s\n' "$ESTIMATE_FILES" | sort)
 

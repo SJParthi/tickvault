@@ -301,10 +301,30 @@ END {
   }
 
   failed = 0
+  # EXACT-INTEGER ENVELOPE GUARD (review round 1 fix, 2026-07-18): the
+  # cross-multiplication below is exact ONLY while every product stays
+  # below 2^53. Beyond it, a 1-ulp rounding of either product can FLIP the
+  # verdict — the review round 1 case: floor=99.999999, count=99999999,
+  # covered=99999998 has true verdict FAIL (LHS=9999999800000000 <
+  # RHS=9999999800000001) but both products exceed 2^53 and round to the
+  # same double, yielding a false PASS. Real per-crate line counts are
+  # ~1e6-class (the review round 1 envelope math: ~2.3e7-class counts already
+  # approach the bound at d<=6), so a breach means implausible input:
+  # FAIL LOUDLY rather than risk a rounded verdict.
+  TWO53 = 9007199254740992
   for (i = 1; i <= rn; i++) {
     name = rkeys[i]
     traw = (name in thr_raw) ? thr_raw[name] : default_thr
     parse_dec(traw)
+    if ((cov[name] > TWO53 / (100 * G_pow)) || \
+        (G_scaled > 0 && cnt[name] > TWO53 / G_scaled)) {
+      printf "  ERROR: EXACT-INTEGER ENVELOPE EXCEEDED for crate %s (count=%d covered=%d threshold=%s):\n", name, cnt[name], cov[name], frepr(traw)
+      print "         a scaled product of the exact comparison would exceed 2^53, where IEEE"
+      print "         rounding can flip the verdict by 1 ulp — refusing a possibly-rounded"
+      print "         verdict (fail-closed). Real line counts are ~1e6-class; inspect the"
+      print "         coverage JSON for corruption."
+      exit 1
+    }
     if (cnt[name] == 0) {
       # zero countable lines == 100% by definition (same as before)
       ok = (100 * G_pow >= G_scaled)
