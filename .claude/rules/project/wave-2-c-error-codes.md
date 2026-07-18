@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/infra.rs"
+  - "crates/common/src/constants.rs"
+  - "crates/core/src/notification/events.rs"
+---
+
 # Wave 2-C Error Codes
 
 > **Authority:** This file is the runbook target for the new ErrorCode

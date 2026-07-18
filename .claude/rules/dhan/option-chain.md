@@ -1,3 +1,12 @@
+---
+paths:
+  - "crates/core/src/option_chain/*.rs"
+  - "crates/trading/src/strategy/option_chain*.rs"
+  - "crates/api/src/handlers/option_chain.rs"
+  - "crates/app/src/option_chain_1m_boot.rs"
+  - "crates/storage/src/option_chain_1m_persistence.rs"
+---
+
 # Dhan Option Chain Enforcement
 
 > **⚠ MODULE RETIRED 2026-06-28.** The `crates/core/src/option_chain/` REST subsystem (client + minute scheduler + expiry warmup + caches), its config, its `OPTION-CHAIN-01..08` error codes, and its notifications were DELETED per operator directive 2026-06-28 ("drop the option chain entire implementations and its table also"). It was disabled since 2026-06-02 (no Dhan Option Chain Data API entitlement) with no live consumer; its QuestDB table was dropped 2026-06-23. This enforcement file is retained for reference IF the option-chain REST API is ever re-introduced; the trigger paths below currently match no live code.

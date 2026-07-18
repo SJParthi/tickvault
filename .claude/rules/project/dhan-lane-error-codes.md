@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/api/src/feed_state.rs"
+  - "crates/app/src/dhan_activation.rs"
+  - "crates/app/src/main.rs"
+---
+
 # Runtime Dhan-Lane Cold-Start FSM — Error Codes (DHAN-LANE-01..04)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

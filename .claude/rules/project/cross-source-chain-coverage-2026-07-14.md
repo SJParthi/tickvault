@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/app/src/option_chain_1m_boot.rs"
+  - "crates/app/src/spot_1m_rest_boot.rs"
+  - "crates/common/src/constants.rs"
+---
+
 # Cross-Source Chain Coverage + Dhan Chain Capture Hardening (Operator Directive 2026-07-14)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
@@ -19,7 +26,7 @@
 > `CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD`),
 > `crates/core/src/notification/events.rs` (`Chain1mUnderlyingNotServed`,
 > `Chain1mUnderlyingServedRecovered`).
-> **Auto-load trigger:** Always loaded (path is in `.claude/rules/project/`).
+> **Auto-load trigger:** Always loaded (path is in `.claude/rules/project/`). *(2026-07-18 rules diet: this file is now path-triggered via `paths:` frontmatter — see rules-diet-2026-07-18.md.)*
 
 ---
 

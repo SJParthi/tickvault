@@ -1,3 +1,9 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/feed/groww/shared_master_writer.rs"
+---
+
 # Groww Shared-Master Persist — Error Codes (GROWW-MASTER-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

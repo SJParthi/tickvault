@@ -1,3 +1,16 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/instrument/orphan_position_watchdog.rs"
+  - "crates/storage/src/orphan_position_audit_persistence.rs"
+  - "crates/core/src/notification/events.rs"
+  - "crates/app/src/main.rs"
+  - "crates/trading/src/orphan_position_watchdog.rs"
+  - "crates/app/src/orphan_position_watchdog_boot.rs"
+  - "crates/core/src/auth/secret_manager.rs"
+  - "crates/app/tests/orphan_position_watchdog_wiring_guard.rs"
+---
+
 # Phase 0 Item 20 Error Codes
 
 > **Authority:** This file is the runbook target for the
