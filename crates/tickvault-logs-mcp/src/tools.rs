@@ -222,19 +222,77 @@ fn parse_event_ts(ev: &Map<String, Value>) -> Option<chrono::DateTime<chrono::Fi
 /// Pinned with an injected `now` by `tests::novel_cutoff_is_minutes_scale`:
 /// a `Duration::minutes` -> `Duration::seconds` mutation moves the cutoff
 /// 60x closer to `now` and fails that test.
+///
+/// NEVER panics for ANY i64 (PR #1644 R6 CRITICAL: bare
+/// `chrono::Duration::minutes` aborted the whole server for
+/// |m| >= 153_722_867_280_913). `Err` replicates CPython's exception
+/// bands BYTE-EXACTLY (empirically mapped against the merge-base
+/// server.py, 2026-07-18; each `str(exc)` is wrapped by the dispatch
+/// into `-32000 tool list_novel_signatures failed: {msg}`):
+///  1. `timedelta(minutes=m)` computes `days = floor(m / 1440)` and
+///     converts it to a C int (32-bit) BEFORE the magnitude check —
+///     `days` outside i32 (|m| >= 3_092_376_453_120 pos /
+///     -3_092_376_453_121 neg, incl. i64::MIN/MAX) raises
+///     `OverflowError: Python int too large to convert to C int`.
+///  2. `days` inside i32 but |days| > 999_999_999 raises
+///     `OverflowError: days={days}; must have magnitude <= 999999999`.
+///  3. timedelta constructible but `now - td` outside Python's datetime
+///     range [0001-01-01T00:00:00, 9999-12-31T23:59:59.999999] raises
+///     `OverflowError: date value out of range`.
+///  4. otherwise the cutoff is returned (the whole Python success band
+///     sits far inside chrono's representable/Duration ranges — max
+///     |m| in it is ~4.2e9 minutes, vs chrono's 1.5e14 bound).
 fn novel_cutoff(
     now: chrono::DateTime<chrono::Utc>,
     since_minutes: i64,
-) -> chrono::DateTime<chrono::Utc> {
-    now - chrono::Duration::minutes(since_minutes)
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let days = since_minutes.div_euclid(1440);
+    if days > i64::from(i32::MAX) || days < i64::from(i32::MIN) {
+        return Err("Python int too large to convert to C int".to_string());
+    }
+    if days.abs() > 999_999_999 {
+        return Err(format!("days={days}; must have magnitude <= 999999999"));
+    }
+    let out_of_range = || "date value out of range".to_string();
+    // try_minutes cannot fail here (|m| <= ~1.44e12 after the days
+    // checks, far below chrono's 1.5e14 bound) — but never panic.
+    let delta = chrono::Duration::try_minutes(since_minutes).ok_or_else(out_of_range)?;
+    // checked_sub_signed None == outside chrono's ±262k-year range,
+    // which is strictly outside Python's year 1..=9999 range too.
+    let cutoff = now.checked_sub_signed(delta).ok_or_else(out_of_range)?;
+    if cutoff < py_datetime_min() || cutoff > py_datetime_max() {
+        return Err(out_of_range());
+    }
+    Ok(cutoff)
 }
 
-/// server.py `tool_list_novel_signatures`.
-pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Value {
+/// Python `datetime.min` as aware-UTC: 0001-01-01T00:00:00.
+fn py_datetime_min() -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    chrono::Utc
+        .with_ymd_and_hms(1, 1, 1, 0, 0, 0)
+        .single()
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+}
+
+/// Python `datetime.max` as aware-UTC: 9999-12-31T23:59:59.999999.
+fn py_datetime_max() -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    chrono::Utc
+        .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
+        .single()
+        .map(|dt| dt + chrono::Duration::microseconds(999_999))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+}
+
+/// server.py `tool_list_novel_signatures`. `Err` == the Python
+/// OverflowError bands of `novel_cutoff` (computed FIRST, before any
+/// file I/O — same order as Python's line-312 cutoff).
+pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value, String> {
     use std::collections::HashMap;
+    let cutoff = novel_cutoff(chrono::Utc::now(), since_minutes)?;
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
-    let cutoff = novel_cutoff(chrono::Utc::now(), since_minutes);
 
     let mut order: Vec<String> = Vec::new();
     let mut first_seen: HashMap<String, NovelInfo> = HashMap::new();
@@ -303,13 +361,13 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Value {
     // cutoff_utc: shape-parity only (isoformat of an aware-UTC now); the
     // harness masks this volatile field.
     let cutoff_fixed = cutoff.fixed_offset();
-    json!({
+    Ok(json!({
         "dir": dir_path.to_string_lossy(),
         "since_minutes": since_minutes,
         "cutoff_utc": py_isoformat(&cutoff_fixed),
         "novel_count": novel.len(),
         "novel": novel,
-    })
+    }))
 }
 
 /// server.py `tool_summary_snapshot`.
@@ -1757,7 +1815,7 @@ pub fn call_tool(
             Ok(tool_tail_errors(ctx, limit, code.as_deref()))
         }
         "list_novel_signatures" => match get_int(args, "since_minutes", 60) {
-            Ok(v) => Ok(tool_list_novel_signatures(ctx, v)),
+            Ok(v) => tool_list_novel_signatures(ctx, v),
             Err(e) => Err(e),
         },
         "summary_snapshot" => Ok(tool_summary_snapshot(ctx)),
@@ -1866,16 +1924,117 @@ mod tests {
         // SAME `ts >= cutoff` inclusion rule the tool uses.
         let first_seen = now - chrono::Duration::minutes(30);
         assert!(
-            first_seen >= novel_cutoff(now, 60),
+            first_seen >= novel_cutoff(now, 60).unwrap(),
             "event at now-30min must be INCLUDED at since_minutes=60"
         );
         assert!(
-            first_seen < novel_cutoff(now, 10),
+            first_seen < novel_cutoff(now, 10).unwrap(),
             "event at now-30min must be EXCLUDED at since_minutes=10"
         );
         // Exact scale pin: 60 MINUTES == 3600 seconds. A minutes->seconds
         // mutation yields now - 60s here and fails.
-        assert_eq!(novel_cutoff(now, 60), now - chrono::Duration::seconds(3600));
+        assert_eq!(
+            novel_cutoff(now, 60).unwrap(),
+            now - chrono::Duration::seconds(3600)
+        );
+    }
+
+    /// PR #1644 R6 CRITICAL: `novel_cutoff` must NEVER panic and must
+    /// replicate CPython's OverflowError bands byte-exactly. Thresholds
+    /// below were binary-searched against the merge-base server.py's
+    /// `timedelta(minutes=m)` / `now - td` on 2026-07-18 with the SAME
+    /// injected `now` (2026-07-18T10:00:00Z).
+    #[test]
+    fn novel_cutoff_python_overflow_bands() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 18, 10, 0, 0).unwrap();
+        let cint = "Python int too large to convert to C int";
+        let range = "date value out of range";
+
+        // Band 1 — C-int (32-bit days) overflow, both signs, incl. the
+        // exact boundaries and i64 extremes (the pre-fix panic values).
+        for v in [
+            3_092_376_453_120_i64, // days = 2^31 (first C-int, positive)
+            -3_092_376_453_121,    // days = -2^31 - 1 (first C-int, negative)
+            153_722_867_280_913,   // chrono's old panic threshold
+            i64::MAX,
+            i64::MIN,
+        ] {
+            assert_eq!(novel_cutoff(now, v).unwrap_err(), cint, "v={v}");
+        }
+
+        // Band 2 — timedelta days-magnitude message EMBEDS floor(m/1440).
+        assert_eq!(
+            novel_cutoff(now, 1_440_000_000_000).unwrap_err(),
+            "days=1000000000; must have magnitude <= 999999999"
+        );
+        assert_eq!(
+            novel_cutoff(now, 3_092_376_453_119).unwrap_err(),
+            "days=2147483647; must have magnitude <= 999999999"
+        );
+        assert_eq!(
+            novel_cutoff(now, -1_439_999_998_561).unwrap_err(),
+            "days=-1000000000; must have magnitude <= 999999999"
+        );
+        assert_eq!(
+            novel_cutoff(now, -3_092_376_453_120).unwrap_err(),
+            "days=-2147483648; must have magnitude <= 999999999"
+        );
+
+        // Band 3 — timedelta constructible, subtraction outside Python's
+        // year 1..=9999 datetime range.
+        assert_eq!(novel_cutoff(now, 1_000_000_000_000).unwrap_err(), range);
+        assert_eq!(novel_cutoff(now, 1_439_999_999_999).unwrap_err(), range);
+        assert_eq!(novel_cutoff(now, -1_000_000_000_000).unwrap_err(), range);
+        assert_eq!(novel_cutoff(now, -1_439_999_998_560).unwrap_err(), range);
+        // Exact OK/range boundaries for THIS `now` (python-probed).
+        assert!(novel_cutoff(now, 1_065_332_760).is_ok());
+        assert_eq!(novel_cutoff(now, 1_065_332_761).unwrap_err(), range);
+        assert!(novel_cutoff(now, -4_193_632_199).is_ok());
+        assert_eq!(novel_cutoff(now, -4_193_632_200).unwrap_err(), range);
+
+        // Band 4 — success band (incl. negatives: cutoff in the future).
+        assert_eq!(
+            novel_cutoff(now, -60).unwrap(),
+            now + chrono::Duration::minutes(60)
+        );
+        assert_eq!(novel_cutoff(now, 0).unwrap(), now);
+    }
+
+    /// No-panic ladder across the full i64 domain (the R6 DoS class):
+    /// every value must return Ok or Err — never abort the process.
+    #[test]
+    fn novel_cutoff_never_panics_ladder() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 18, 10, 0, 0).unwrap();
+        let mut ladder: Vec<i64> = vec![i64::MIN, i64::MAX, 0];
+        let mut v: i64 = 1;
+        while v < i64::MAX / 7 {
+            ladder.push(v);
+            ladder.push(-v);
+            ladder.push(v.saturating_add(1));
+            ladder.push(-v.saturating_sub(1));
+            v = v.saturating_mul(7);
+        }
+        for b in [
+            1_065_332_760_i64,
+            4_193_632_200,
+            1_439_999_998_560,
+            1_439_999_999_999,
+            1_440_000_000_000,
+            3_092_376_453_119,
+            3_092_376_453_120,
+            153_722_867_280_912,
+            153_722_867_280_913,
+        ] {
+            for d in [-1_i64, 0, 1] {
+                ladder.push(b.saturating_add(d));
+                ladder.push(-b.saturating_add(d));
+            }
+        }
+        for m in ladder {
+            let _ = novel_cutoff(now, m); // must not panic
+        }
     }
 
     #[test]

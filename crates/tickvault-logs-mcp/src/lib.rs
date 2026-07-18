@@ -64,6 +64,17 @@
 //!     since review r4 the `//`-root rule matches pathlib too), so a
 //!     dotted date like "x/./y" echoes `app.x/y.log` on both sides
 //!     byte-for-byte. No residual.
+//!   - list_novel_signatures `since_minutes` overflow: PARITY-MATCHED
+//!     since review r6 (2026-07-18) — the bare `Duration::minutes` call
+//!     PANICKED (whole-process abort, all later requests dropped) for
+//!     |m| >= 153_722_867_280_913. `novel_cutoff` now replicates
+//!     CPython's OverflowError bands byte-for-byte through the -32000
+//!     wrap (empirically mapped, thresholds in the fn doc): 32-bit
+//!     C-int days overflow ("Python int too large to convert to C
+//!     int"), timedelta days magnitude ("days={n}; must have magnitude
+//!     <= 999999999"), and "date value out of range" for cutoffs
+//!     outside Python's year 1..=9999 — and the server keeps serving.
+//!     No residual.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]

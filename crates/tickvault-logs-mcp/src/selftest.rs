@@ -90,7 +90,11 @@ pub fn run(ctx: &Ctx) -> i32 {
     ));
     emit("");
     emit("--- tool_list_novel_signatures(since_minutes=60) demo ---");
-    let novel_out = tools::tool_list_novel_signatures(ctx, 60);
+    // since_minutes=60 is deep inside the Python success band, so the
+    // Err arm is unreachable here (Python's demo would crash if it ever
+    // raised); degrade to a visible error object rather than panic.
+    let novel_out = tools::tool_list_novel_signatures(ctx, 60)
+        .unwrap_or_else(|e| serde_json::json!({"error": e}));
     emit(py_slice_chars(
         &dumps_indent2(&compact_novel_demo(&novel_out)),
         400,

@@ -565,6 +565,35 @@ fn parity_transcript() {
             "since window empty (cutoff masked)",
             json!({"since_minutes": 0}),
         );
+        // PR #1644 R6 CRITICAL: since_minutes overflow bands must be
+        // byte-identical -32000 errors (never a Rust panic/abort).
+        s.call(
+            "list_novel_signatures",
+            "since_minutes=i64::MAX → C-int band -32000",
+            json!({"since_minutes": 9_223_372_036_854_775_807_i64}),
+        );
+        s.call(
+            "list_novel_signatures",
+            "since_minutes=1e12 → date-range band -32000",
+            json!({"since_minutes": 1_000_000_000_000_i64}),
+        );
+        s.call(
+            "list_novel_signatures",
+            "since_minutes=1.44e12 → days-magnitude band -32000",
+            json!({"since_minutes": 1_440_000_000_000_i64}),
+        );
+        s.call(
+            "list_novel_signatures",
+            "since_minutes=i64::MIN → C-int band -32000",
+            json!({"since_minutes": -9_223_372_036_854_775_808_i64}),
+        );
+        // Keeps-serving proof: same session, next request answered on
+        // BOTH sides after the overflow errors above.
+        s.call(
+            "tail_errors",
+            "server keeps serving after since_minutes errors",
+            json!({"limit": 1}),
+        );
         s.call("summary_snapshot", "fixture summary", json!({}));
         s.call("triage_log_tail", "limit=3", json!({"limit": 3}));
         s.call("triage_log_tail", "default limit", json!({}));
