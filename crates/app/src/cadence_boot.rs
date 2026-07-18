@@ -78,6 +78,13 @@ pub fn spawn_cadence_scheduler(
     // flags (fix round 2026-07-17) — see the deps wiring below.
     _feed_runtime: &Arc<FeedRuntimeState>,
     notifier: &Arc<NotificationService>,
+    // Order-runtime mark tap (2026-07-18): threaded into the GROWW
+    // executor ONLY — the Dhan executor must NEVER carry it (Dhan sids
+    // 13/25/51 are a different id space than the Groww-native u64s the
+    // paper book keys on; cross-feeding would double-key instruments
+    // invisibly to the first-seen-segment tripwire). `None` when
+    // `[order_runtime]` is disabled.
+    groww_mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 ) -> Option<Arc<Notify>> {
     if !config.cadence.enabled {
         info!("cadence: disabled by [cadence] config — nothing spawned");
@@ -111,6 +118,7 @@ pub fn spawn_cadence_scheduler(
     let groww_executor = match GrowwCadenceExecutor::new(
         &config.questdb,
         Some(Arc::clone(notifier)),
+        groww_mark_forwarder,
     ) {
         Ok(exec) => Arc::new(exec),
         Err(err) => {
