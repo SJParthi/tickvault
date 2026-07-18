@@ -3319,11 +3319,21 @@ mod tests {
             timezone: "Asia/Kolkata".to_string(),
             max_orders_per_second: 10,
             // TODAY is a declared holiday → is_trading_day_today() is
-            // false regardless of the weekday the test runs on.
-            nse_holidays: vec![NseHolidayEntry {
-                date: today_ist().format("%Y-%m-%d").to_string(),
-                name: "synthetic test holiday".to_string(),
-            }],
+            // false — but ONLY on weekdays: TradingCalendar::from_config
+            // REJECTS weekend-dated holidays, and a weekend today is
+            // already non-trading without the entry (fixes the
+            // Saturday/Sunday CI flake, 2026-07-18).
+            nse_holidays: if matches!(
+                chrono::Datelike::weekday(&today_ist()),
+                chrono::Weekday::Sat | chrono::Weekday::Sun
+            ) {
+                vec![]
+            } else {
+                vec![NseHolidayEntry {
+                    date: today_ist().format("%Y-%m-%d").to_string(),
+                    name: "synthetic test holiday".to_string(),
+                }]
+            },
             muhurat_trading_dates: vec![],
             nse_mock_trading_dates: vec![],
         };

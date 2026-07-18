@@ -4287,10 +4287,22 @@ mod tests {
             data_collection_end: "15:30:00".to_string(),
             timezone: "Asia/Kolkata".to_string(),
             max_orders_per_second: 10,
-            nse_holidays: vec![NseHolidayEntry {
-                date: today_ist().format("%Y-%m-%d").to_string(),
-                name: "coverage-test holiday".to_string(),
-            }],
+            // TODAY is stamped a declared holiday so is_trading_day_today()
+            // is false — but ONLY on weekdays: TradingCalendar::from_config
+            // REJECTS weekend-dated holidays, and a weekend today is already
+            // non-trading without the entry (fixes the Saturday/Sunday CI
+            // flake, 2026-07-18 — the fixture panicked every weekend run).
+            nse_holidays: if matches!(
+                chrono::Datelike::weekday(&today_ist()),
+                chrono::Weekday::Sat | chrono::Weekday::Sun
+            ) {
+                vec![]
+            } else {
+                vec![NseHolidayEntry {
+                    date: today_ist().format("%Y-%m-%d").to_string(),
+                    name: "coverage-test holiday".to_string(),
+                }]
+            },
             muhurat_trading_dates: vec![],
             nse_mock_trading_dates: vec![],
         };
