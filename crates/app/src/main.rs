@@ -526,10 +526,12 @@ async fn main() -> Result<()> {
     // byte-identical. The receiver is stashed in a take-once slot for the
     // Dhan REST-only stack's Phase 5b (`spawn_dhan_rest_stack` — the
     // runtime's single spawn site; 2026-07-17 correction: Phase 5a is the
-    // RETIRED order-update WS slot); the forwarder now rides into the Groww
-    // per-minute REST legs (spot + contract — the live-tick bridge tap died
-    // with the retired Groww live feed): marks are the OWN-FIRE just-closed
-    // 1m candle closes, forwarded at each leg's persist-confirm choke point.
+    // RETIRED order-update WS slot); the forwarder now rides into the GROWW
+    // CADENCE EXECUTOR (re-homed 2026-07-18 — the cadence lane owns the
+    // per-minute pulls; the legacy per-minute REST legs' taps are
+    // config-dead unless a legacy leg is re-enabled): marks are the
+    // OWN-FIRE just-closed 1m candle closes, forwarded at the executor's
+    // persist-confirm choke point.
     let (order_runtime_mark_forwarder, order_runtime_mark_rx_slot, order_runtime_marks_wanted) =
         if config.order_runtime.enabled {
             let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<

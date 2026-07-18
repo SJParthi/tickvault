@@ -215,10 +215,16 @@ pub struct GrowwSpot1mTaskParams {
     pub burst: Arc<GrowwRestBurstState>,
     /// Order-runtime mark tap (dry-run PR, 2026-07-14; re-homed 2026-07-16
     /// after the Groww live feed retired): `Some` ONLY when
-    /// `[order_runtime].enabled`. Marks are the OWN-FIRE just-closed-minute
-    /// candle CLOSES, forwarded AFTER the persist flush ACK — backfill,
-    /// sweep and warm-up NEVER produce marks (stale prices must not fill
-    /// paper orders). `None` ⇒ the tap is structurally absent (no-op).
+    /// `[order_runtime].enabled`. Since 2026-07-18 the LIVE mark producer
+    /// is the GROWW CADENCE EXECUTOR's persist-confirm seam
+    /// (`groww_cadence_executor.rs` — the cadence lane owns the per-minute
+    /// pulls); this LEGACY-leg field is CONFIG-DEAD on the cadence-enabled
+    /// prod shape (the §0b RS3 mutual exclusion stands this leg down) and
+    /// fires only if the legacy `[groww_spot_1m]` leg is re-enabled. Marks
+    /// are the OWN-FIRE just-closed-minute candle CLOSES, forwarded AFTER
+    /// the persist flush ACK — backfill, sweep and warm-up NEVER produce
+    /// marks (stale prices must not fill paper orders). `None` ⇒ the tap
+    /// is structurally absent (no-op).
     pub mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 }
 
