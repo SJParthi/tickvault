@@ -99,25 +99,31 @@ resource "aws_iam_role_policy" "start_watchdog" {
 }
 
 # ---------------------------------------------------------------------------
-# Lambda source — packaged from deploy/aws/lambda/start-watchdog/
+# Lambda source — Rust bin (rust-only phase 2b-2 wave 2, 2026-07-18).
+#
+# The Python handler (deploy/aws/lambda/start-watchdog/handler.py) was
+# PORTED to Rust — crates/aws-lambdas/src/start_watchdog.rs (lib logic;
+# all 31 python tests ported 1:1 to Rust unit tests) +
+# src/bin/start_watchdog.rs (thin bootstrap bin). Behavior parity: same
+# mode dispatch (ping/check/stop_check/curfew_check), same SNS
+# Subject/Message strings, same IST curfew math (08:00-17:00 Mon-Fri),
+# same keep-alive/holiday-stop SSM semantics, same 45-min launch grace.
+# The zip is built in CI by the build-lambdas job (terraform-apply.yml)
+# into ${path.module}/.lambda-zips/ before plan/apply; source_code_hash is
+# a digest of the Rust SOURCE (Rust builds are not bit-reproducible, so
+# hashing the zip would churn every build with zero source change).
 # ---------------------------------------------------------------------------
-
-data "archive_file" "start_watchdog" {
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/start-watchdog"
-  output_path = "${path.module}/.start-watchdog.zip"
-  excludes    = ["README.md", "test_handler.py", "__pycache__", "*.pyc"]
-}
 
 resource "aws_lambda_function" "start_watchdog" {
   function_name    = "tv-${var.environment}-start-watchdog"
   role             = aws_iam_role.start_watchdog.arn
-  handler          = "handler.lambda_handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 30
   memory_size      = 128
-  filename         = data.archive_file.start_watchdog.output_path
-  source_code_hash = data.archive_file.start_watchdog.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/start-watchdog.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
 
   environment {
     variables = {
