@@ -1570,26 +1570,15 @@ rules:
   # -----------------------------------------------------------------------
   # Daily end-to-end tick-conservation audit (2026-06-10, operator
   # directive "Go ahead to achieve zero tick loss")
+  # RETIRED 2026-07-18 (tick-conservation retirement — dead-WS sweep
+  # follow-up): the tick-conserve-01-daily-residual-escalate rule was
+  # removed with the audit modules — the TickConserve01DailyResidual
+  # ErrorCode variant, its emit site (tick_conservation_boot.rs), and its
+  # CloudWatch filter+alarm all retired in the same PR (every audit input
+  # died with the dead tick chain, stage-2 sweep #1631). The
+  # tick_conservation_audit QuestDB TABLE is retained (SEBI 5y). Rule-file
+  # retirement banner: tick-conservation-audit-error-codes.md.
   # -----------------------------------------------------------------------
-
-  - name: tick-conserve-01-daily-residual-escalate
-    match:
-      code: TICK-CONSERVE-01
-    action: escalate
-    runbook_path: .claude/rules/project/tick-conservation-audit-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      TICK-CONSERVE-01 = the 15:40 IST end-to-end conservation audit found a
-      positive residual: ticks Dhan delivered (counted durably in the WAL
-      disk log) did not all reach a known outcome (DB row / filter counter).
-      Severity::High, data-accounting signal — NOT auto-fixable: a positive
-      delivery_residual means frames are in the WAL awaiting next-boot
-      replay (verify tv_wal_replay_recovered_total picks them up); a
-      positive outcome_residual is a true in-process leak needing root-cause
-      against the 60s conservation ledger. Operator inspects the
-      tick_conservation_audit row for the exact per-stage numbers. Fires at
-      most once per trading day by construction (15:40 scheduler).
 
   # -----------------------------------------------------------------------
   # REST-health canary (2026-06-10, task DHAN-REST-400)

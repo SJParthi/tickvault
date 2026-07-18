@@ -683,7 +683,7 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Single source of truth for the WAL dir (hostile-review H1: shared
     // with the 15:40 conservation audit so the two sites can never drift).
-    let ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+    let ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
     let ws_wal_dir = ws_wal_path.display().to_string(); // O(1) EXEMPT: boot-time
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
@@ -1280,7 +1280,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async {
         use std::time::Duration;
         loop {
-            let wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
+            let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
             let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
@@ -1559,13 +1559,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Daily 15:40 IST per-feed tick-conservation audit — PROCESS-GLOBAL
-    // (2026-07-02 adversarial-sweep fix). Previously nested inside the
-    // Dhan-gated `spawn_post_market_tasks`, so a Groww-only session ran ZERO
-    // conservation audits and runtime Dhan enable cycles duplicated the task.
-    // Spawned exactly once here; each lane's run is gated at 15:40 on the
-    // truthful runtime feed flags. See `spawn_daily_tick_conservation_task`.
-    spawn_daily_tick_conservation_task(&config, &trading_calendar, &feed_runtime);
+    // Tick-conservation retirement (2026-07-18): the daily 15:40 IST
+    // conservation audit spawn was DELETED — its inputs (live WAL frames,
+    // processor counters, `ticks` writes) all died with the live-WS
+    // retirements; the `tick_conservation_audit` table stays (SEBI).
 
     // Daily 15:25 IST orphan-position watchdog — PROCESS-GLOBAL
     // (2026-07-14 re-home; the tick-conservation hoist precedent directly
@@ -1836,7 +1833,7 @@ async fn main() -> Result<()> {
         // Acceptable post-retirement: no consumer exists to re-replay into,
         // and NOT confirming would re-stage the unreadable segments forever
         // (the WS-REINJECT-01 growth-storm class).
-        let confirm_ws_wal_path = tickvault_app::tick_conservation_boot::ws_wal_dir();
+        let confirm_ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
         tickvault_storage::ws_frame_spill::confirm_replayed(&confirm_ws_wal_path);
     }
 
@@ -3151,116 +3148,14 @@ mod tests {
     }
 }
 
-/// Daily 15:40 IST tick-conservation audit — PROCESS-GLOBAL (2026-07-02
-/// adversarial-sweep fix). This used to live inside `spawn_post_market_tasks`,
-/// whose two call sites are BOTH Dhan-gated (fast-boot `dhan_enabled` filter +
-/// `start_dhan_lane`), so a Groww-only session (`dhan_enabled=false`) ran ZERO
-/// conservation audits all day — a silent audit-coverage hole — and every
-/// runtime Dhan enable cycle spawned a DUPLICATE conservation task. It is now
-/// spawned exactly once from `main()`'s process-global prefix, independent of
-/// which feeds are enabled; each lane's run is gated at 15:40 on the truthful
-/// runtime "is this feed on" Arc, so a disabled lane writes no misleading zero
-/// row. Honest envelope: a feed toggled OFF at 15:40 after a full ON day skips
-/// its row that day.
-///
-/// Reconciles, per feed: the durable delivered-count (Dhan WAL frames / Groww
-/// sidecar NDJSON) against the processor outcome counters (Dhan) and the
-/// feed-filtered QuestDB `ticks` row count, then writes one forensic row per
-/// feed to `tick_conservation_audit`. Dhan residual > 0 → error!
-/// TICK-CONSERVE-01 (Telegram). Cold path, fail-soft, market-hours-gated
-/// (audit Rule 3). Runbook:
-/// `.claude/rules/project/tick-conservation-audit-error-codes.md`.
-// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (decide_conservation_start / boot_covers_full_session / build_conservation_ticks_count_sql); spawn site pinned by tick_conservation_wiring_guard.rs.
-fn spawn_daily_tick_conservation_task(
-    config: &ApplicationConfig,
-    trading_calendar: &std::sync::Arc<TradingCalendar>,
-    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
-) {
-    let tc_qcfg = config.questdb.clone();
-    let tc_metrics_port = config.observability.metrics_port;
-    let tc_calendar = std::sync::Arc::clone(trading_calendar);
-    // Single source of truth for the WAL dir (shared with STAGE-C).
-    let tc_wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
-    let tc_feed_runtime = std::sync::Arc::clone(feed_runtime);
-    tokio::spawn(async move {
-        use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-        use tickvault_app::tick_conservation_boot::{
-            ConservationStart, boot_covers_full_session, decide_conservation_start,
-            run_tick_conservation_audit,
-        };
-        use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
-        let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-            return;
-        };
-        let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-        let today_ist = boot_ist.date_naive();
-        let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
-        let force_now = std::env::var("TICKVAULT_TICK_CONSERVE_NOW")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let is_trading_day = tc_calendar.is_trading_day(today_ist);
-        match decide_conservation_start(boot_secs_of_day, is_trading_day, force_now) {
-            ConservationStart::SkipNonTradingDay => {
-                info!("tick_conservation: skipping (non-trading day)");
-                return;
-            }
-            ConservationStart::RunCatchUp => {
-                // Audit fix #2 (2026-07-03): a trading-day boot past 15:40 IST
-                // used to SKIP the day's audit entirely — a post-incident
-                // evening recovery boot left no forensic WAL-vs-DB row. Run
-                // once, immediately; the row is honestly `partial` (post-09:00
-                // boot counters cannot vouch for the session) but the WAL
-                // frame count + QuestDB row count for the day ARE recorded.
-                info!(
-                    now = %boot_ist.time(),
-                    "tick_conservation: late boot (past 15:40 IST) — running \
-                     the day's audit now as a catch-up"
-                );
-            }
-            ConservationStart::RunNow => {
-                info!(
-                    "tick_conservation: TICKVAULT_TICK_CONSERVE_NOW set — running \
-                     on-demand NOW (operator dry-run)"
-                );
-            }
-            ConservationStart::SleepThenRun(secs_until) => {
-                info!(secs_until, "tick_conservation: sleeping until 15:40:00 IST");
-                tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
-            }
-        }
-
-        // IST day number for WAL attribution + the ticks-table window
-        // (ts stores IST-epoch nanos — data-integrity.md).
-        let now_utc_secs = Utc::now().timestamp();
-        let ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-        // APPROVED: epoch day number fits u64 trivially.
-        let target_ist_day = ist_secs.max(0) as u64 / 86_400;
-        let trading_date_ist_nanos = i64::try_from(target_ist_day)
-            .unwrap_or(0)
-            .saturating_mul(86_400)
-            .saturating_mul(1_000_000_000);
-        let run_ts_ist_nanos = ist_secs.saturating_mul(1_000_000_000);
-
-        // Dhan lane — runtime-gated (symmetric with the Groww gate below) so a
-        // Groww-only session writes no misleading zero-balanced Dhan row.
-        if tc_feed_runtime.is_enabled(tickvault_common::feed::Feed::Dhan) {
-            run_tick_conservation_audit(
-                &tc_wal_dir,
-                &tc_qcfg,
-                tc_metrics_port,
-                target_ist_day,
-                trading_date_ist_nanos,
-                run_ts_ist_nanos,
-                boot_covers_full_session(boot_secs_of_day),
-            )
-            .await;
-            info!("PROOF: tick_conservation audit fired @ 15:40:00 IST");
-        } else {
-            debug!("tick_conservation: Dhan run skipped (Dhan feed disabled this session)");
-        }
-    });
-    info!("tick_conservation: daily per-feed WAL/NDJSON-vs-DB audit task spawned (process-global)");
-}
+// Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up): the
+// daily 15:40 IST `spawn_daily_tick_conservation_task` was DELETED here —
+// every input was dead on the REST-only runtime (no live WAL frame writer,
+// no processor counters, nothing writes `ticks` since the stage-2 sweep
+// #1631), so every run could only record `partial`/no-data rows. The
+// QuestDB `tick_conservation_audit` TABLE is retained (SEBI, forensic).
+// Runbook retirement banner:
+// `.claude/rules/project/tick-conservation-audit-error-codes.md`.
 
 /// Dual-feed scoreboard (operator directive 2026-07-10) — PROCESS-GLOBAL,
 /// spawned exactly once from `main()`'s prefix, gated on `[scoreboard]

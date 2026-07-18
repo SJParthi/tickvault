@@ -13,7 +13,7 @@
 //! spawn; this guard fails the build if that wiring silently dies again.
 //!
 //! Mirrors the codebase's `*_is_wired` guard pattern
-//! (`tick_conservation_wiring_guard.rs`, `orphan_position_watchdog_wiring_guard.rs`).
+//! (`orphan_position_watchdog_wiring_guard.rs`).
 //! Reads `main.rs` SOURCE text, so it runs on the default build independent of
 //! any feature flag.
 

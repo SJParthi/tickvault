@@ -147,7 +147,8 @@ mod tests {
     use super::*;
 
     /// Guard that removes its unique temp dir on drop (no `tempfile` dep —
-    /// mirrors the `TmpDir` pattern in `tick_conservation_boot.rs`).
+    /// the house `TmpDir` pattern, originally from the retired
+    /// `tick_conservation_boot.rs`).
     struct TmpDir(PathBuf);
     impl Drop for TmpDir {
         fn drop(&mut self) {

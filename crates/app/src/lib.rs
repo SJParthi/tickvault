@@ -108,7 +108,13 @@ pub mod feed_scoreboard_boot;
 // verifies the PREVIOUS trading day (TF-VERIFY-01/02).
 pub mod spot_crossverify_boot;
 pub mod tf_consistency_boot;
-pub mod tick_conservation_boot;
+// Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
+// `tick_conservation_boot` module DELETED — the 15:40 IST WAL-vs-DB daily
+// audit's every input died with the live-WS retirements (Dhan 2026-07-13,
+// Groww 2026-07-15) + the stage-2 tick-chain deletion (#1631); the shared
+// `ws_wal_dir()` helper relocated to `boot_helpers`, `parse_questdb_count`
+// to `feed_scoreboard_boot`. The `tick_conservation_audit` QuestDB table
+// is RETAINED (SEBI, forensic).
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the
 // operator-locked pre-open equilibrium open-price gap.
