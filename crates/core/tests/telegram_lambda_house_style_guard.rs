@@ -98,10 +98,14 @@ fn guard_new_state_reason_never_in_telegram_text() {
         "the legacy 'Reason: {{reason}}' raw-threshold line must never \
          return to the Telegram text path (house-style contract)"
     );
-    // Every executable reference to NewStateReason must live on the
-    // tracing forensics binding (CloudWatch Logs), never in a rendered
-    // text. Comments/doc lines are allowed to explain the rule in prose.
-    let mut executable_refs = 0usize;
+    // Every executable reference to NewStateReason must live on either
+    // (1) the tracing forensics binding (CloudWatch Logs) or (2) the
+    // fallback REDACTOR's key constant (MED-1 fix round — the scanner
+    // that BLANKS the value when a valid-but->128-deep alarm JSON fails
+    // serde_json's recursion limit and takes the plain-SNS fallback).
+    // Never in a rendered text. Comments/doc lines may explain in prose.
+    let mut forensics_refs = 0usize;
+    let mut redactor_key_refs = 0usize;
     for (idx, line) in prod.lines().enumerate() {
         if !line.contains("NewStateReason") {
             continue;
@@ -110,19 +114,41 @@ fn guard_new_state_reason_never_in_telegram_text() {
         if trimmed.starts_with("//") {
             continue;
         }
-        executable_refs += 1;
-        assert!(
-            line.contains("forensics_reason"),
-            "telegram_webhook.rs line {}: NewStateReason outside the \
-             forensics binding: {line:?}",
-            idx + 1
-        );
+        if line.contains("forensics_reason") {
+            forensics_refs += 1;
+        } else if trimmed.starts_with("const KEY:") {
+            redactor_key_refs += 1;
+        } else {
+            panic!(
+                "telegram_webhook.rs line {}: NewStateReason outside the \
+                 forensics binding / redactor key const: {line:?}",
+                idx + 1
+            );
+        }
     }
     assert_eq!(
-        executable_refs, 1,
-        "exactly ONE executable NewStateReason reference (the forensics \
-         binding feeding the alarm-forensics tracing line)"
+        forensics_refs, 1,
+        "exactly ONE forensics-binding NewStateReason reference (feeding \
+         the alarm-forensics tracing line)"
     );
+    assert_eq!(
+        redactor_key_refs, 1,
+        "exactly ONE redactor key-const NewStateReason reference (the \
+         fallback scanner that blanks the value)"
+    );
+    // The redaction + cap are WIRED into the plain-SNS fallback — the
+    // parse-failure arm can never dump raw forensic text into Telegram.
+    for needle in [
+        "pub fn redact_new_state_reason(",
+        "cap_fallback_body(redact_new_state_reason(&raw_body))",
+        "PLAIN_FALLBACK_BODY_MAX_CHARS",
+    ] {
+        assert!(
+            prod.contains(needle),
+            "telegram_webhook.rs fallback redaction chain regressed — \
+             missing {needle:?}"
+        );
+    }
     // …and the forensics binding feeds ONLY the CloudWatch-Logs tracing
     // event, which exists.
     assert!(

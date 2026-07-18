@@ -30,7 +30,20 @@
 //!   real converted time — both satisfy the `H:MM AM|PM` format contract.
 //! - python `str(dict)` renders `{'k': 'v'}`; Rust renders the serde_json
 //!   representation `{"k":"v"}` for non-string SNS Message bodies (only
-//!   reachable on malformed publishes; no raw alarm JSON either way).
+//!   reachable on crafted/malformed publishes).
+//! - serde_json enforces a 128-level recursion limit that python's
+//!   `json.loads` did not share at moderate depth: a VALID alarm JSON
+//!   carrying a >128-deep irrelevant nested field parsed in python
+//!   (depth ~200 → house line; extreme ~1000+ depth raised
+//!   RecursionError → the fail-open generic safe line — oracle-verified
+//!   2026-07-18 against the recovered handler.py) but fails
+//!   `parse_alarm` here and takes the plain-SNS fallback instead. That
+//!   fallback is therefore REDACTED (`redact_new_state_reason` blanks
+//!   every `"NewStateReason"` value, escape-aware) and length-capped
+//!   (`PLAIN_FALLBACK_BODY_MAX_CHARS`), so raw forensic text still
+//!   NEVER reaches the Telegram body — a fail-safe divergence,
+//!   unreachable from real CloudWatch publishes (real alarm JSON is
+//!   shallow; reaching this arm requires a crafted `sns:Publish`).
 //! - python `_fold_records(cache=None)` optionality collapsed: every call
 //!   site (lambda handler + all tests) passes a cache, so the Rust fn
 //!   takes `&mut HashMap` unconditionally.
@@ -353,8 +366,99 @@ pub fn parse_alarm(message: &Value) -> Option<Value> {
     None
 }
 
+/// Character cap on the plain-SNS fallback body (Telegram's hard message
+/// limit is 4096 chars; cap + marker stays well under it). Python had no
+/// cap — the fallback arm is already a divergence-documented fail-safe
+/// (module ledger), and ordinary deploy/operator publishes are far
+/// shorter, so byte-parity for them is unaffected.
+pub const PLAIN_FALLBACK_BODY_MAX_CHARS: usize = 3500;
+
+/// Blank the VALUE of every unescaped `"NewStateReason"` JSON field in
+/// `text` (MED-1 fix): the plain-SNS fallback can receive a VALID alarm
+/// JSON that serde_json refused on its 128-level recursion limit, and the
+/// house contract is that `NewStateReason` forensic text NEVER reaches
+/// the Telegram body — on ANY input, parse-failure fallbacks included.
+///
+/// Hand scanner, escape-aware: a string value is scanned with `\`
+/// consuming the next byte, so `\"` inside the value never terminates
+/// the redaction early. A non-string or unterminated value (never
+/// emitted by real CloudWatch — crafted input only) is redacted to the
+/// end of the text, fail-safe. Ordinary non-JSON messages contain no
+/// `"NewStateReason"` key, so this is a byte-exact no-op for them
+/// (python plain-fallback parity preserved; oracle-verified).
+pub fn redact_new_state_reason(text: &str) -> String {
+    const KEY: &str = "\"NewStateReason\"";
+    if !text.contains(KEY) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(KEY) {
+        let after_key = pos + KEY.len();
+        out.push_str(&rest[..after_key]);
+        rest = &rest[after_key..];
+        let b = rest.as_bytes();
+        let mut j = 0usize;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < b.len() && b[j] == b':' {
+            j += 1;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            out.push_str(&rest[..j]);
+            if j < b.len() && b[j] == b'"' {
+                // JSON string value — blank its content, honoring escapes.
+                let mut k = j + 1;
+                let mut closed = false;
+                while k < b.len() {
+                    match b[k] {
+                        b'\\' => k += 2, // escape consumes the next byte
+                        b'"' => {
+                            closed = true;
+                            break;
+                        }
+                        _ => k += 1,
+                    }
+                }
+                out.push_str("\"[redacted]");
+                if closed {
+                    out.push('"');
+                    rest = &rest[k + 1..];
+                } else {
+                    // Unterminated string — redact to the end, fail-safe.
+                    rest = "";
+                }
+            } else {
+                // Non-string value (crafted input only): redact to the
+                // end rather than attempt balanced-JSON skipping.
+                out.push_str("[redacted]");
+                rest = "";
+            }
+        }
+        // No colon after the key: a bare occurrence (e.g. the literal
+        // key name as a string VALUE) — nothing to redact; the loop
+        // continues scanning the remainder.
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Cap the fallback body at [`PLAIN_FALLBACK_BODY_MAX_CHARS`] chars
+/// (char-boundary safe). Ordinary publishes never reach the cap.
+fn cap_fallback_body(body: String) -> String {
+    match body.char_indices().nth(PLAIN_FALLBACK_BODY_MAX_CHARS) {
+        None => body,
+        Some((cut, _)) => format!("{}…[truncated]", &body[..cut]),
+    }
+}
+
 /// Format a non-CloudWatch SNS publish (e.g., from the deploy-aws
-/// workflow). Python parity: `_format_plain_sns`.
+/// workflow). Python parity: `_format_plain_sns` — byte-identical for
+/// ordinary messages; diverges ONLY when the text carries a
+/// `"NewStateReason"` field (redacted) or exceeds the fallback cap
+/// (truncated) — both fail-safe, module-ledger documented.
 pub fn format_plain_sns(subject: Option<&Value>, message: &Value) -> String {
     let subject_s: Option<String> = match subject {
         None | Some(Value::Null) => None,
@@ -363,12 +467,16 @@ pub fn format_plain_sns(subject: Option<&Value>, message: &Value) -> String {
         Some(other) => Some(other.to_string()),
     };
     let emoji = severity_emoji(subject_s.as_deref().unwrap_or(""), None);
-    let body = match message {
+    let raw_body = match message {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
+    let body = cap_fallback_body(redact_new_state_reason(&raw_body));
     match subject_s {
-        Some(s) => format!("{emoji} {s}\n{body}"),
+        Some(s) => {
+            let s = redact_new_state_reason(&s);
+            format!("{emoji} {s}\n{body}")
+        }
         None => format!("{emoji} {body}"),
     }
 }
@@ -1155,6 +1263,135 @@ mod tests {
     fn test_no_subject_falls_back_to_bell() {
         let out = format_plain_sns(None, &json!("operator-test"));
         assert!(out.starts_with("🔔"));
+    }
+
+    // ---- DeepNestFallbackRedaction (MED-1 fix round, rust-only) ----
+    //
+    // A VALID alarm JSON with a >128-deep irrelevant nested field trips
+    // serde_json's recursion limit → `parse_alarm` returns None → the
+    // plain-SNS fallback fires. The contract: NewStateReason forensic
+    // text NEVER reaches the Telegram body, on ANY input.
+
+    fn deep_alarm_json(depth: usize) -> String {
+        let deep = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        format!(
+            "{{\"AlarmName\":\"tv-prod-feed-stall\",\
+             \"NewStateValue\":\"ALARM\",\
+             \"NewStateReason\":\"Threshold Crossed: 1 datapoint SECRETFORENSIC\",\
+             \"StateChangeTime\":\"2026-07-18T10:00:00.000+0000\",\
+             \"Extra\":{deep}}}"
+        )
+    }
+
+    #[test]
+    fn test_deep_nest_200_valid_alarm_never_leaks_new_state_reason() {
+        // python oracle (recovered handler.py, 2026-07-18): depth-200
+        // PARSES in python → house line '🆘 Feed stall\n3:30 PM IST'.
+        // Rust diverges (ledger): redacted, capped plain fallback.
+        let msg = deep_alarm_json(200);
+        let mut cache = HashMap::new();
+        let texts = fold_records(&[json!({"Sns": {"Message": msg}})], 0.0, &mut cache);
+        assert_eq!(texts.len(), 1);
+        assert!(!texts[0].contains("SECRETFORENSIC"));
+        assert!(!texts[0].contains("Threshold Crossed"));
+        assert!(texts[0].contains("[redacted]"));
+    }
+
+    #[test]
+    fn test_deep_nest_2000_valid_alarm_never_leaks_and_never_panics() {
+        // python oracle: depth-2000 raised RecursionError in json.loads →
+        // fail-open generic safe line. Rust: fast serde_json refusal at
+        // depth 128 → redacted + capped plain fallback. No panic, no
+        // stack overflow, no forensic content either way.
+        let msg = deep_alarm_json(2000);
+        let mut cache = HashMap::new();
+        let texts = fold_records(&[json!({"Sns": {"Message": msg}})], 0.0, &mut cache);
+        assert_eq!(texts.len(), 1);
+        assert!(!texts[0].contains("SECRETFORENSIC"));
+        assert!(!texts[0].contains("Threshold Crossed"));
+        assert!(texts[0].contains("[redacted]"));
+        // The 4000+ bracket tail is capped under Telegram's 4096 limit.
+        assert!(texts[0].chars().count() <= PLAIN_FALLBACK_BODY_MAX_CHARS + 64);
+        assert!(texts[0].ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn test_plain_fallback_ordinary_messages_byte_parity_with_python_oracle() {
+        // Redaction + cap MUST be byte-exact no-ops on ordinary non-JSON
+        // publishes. Oracle: python3 on the recovered handler.py
+        // (git show 3a44ffd^:deploy/aws/lambda/telegram-webhook/handler.py),
+        // run 2026-07-18:
+        //   _format_plain_sns("DLT deploy OK", "commit=abc ref=main")
+        //     == '✅ DLT deploy OK\ncommit=abc ref=main'
+        //   _format_plain_sns(None, "operator-test") == '🔔 operator-test'
+        //   _format_plain_sns("Deploy FAILED", "step=build exit=101")
+        //     == '🆘 Deploy FAILED\nstep=build exit=101'
+        assert_eq!(
+            format_plain_sns(Some(&json!("DLT deploy OK")), &json!("commit=abc ref=main")),
+            "✅ DLT deploy OK\ncommit=abc ref=main"
+        );
+        assert_eq!(
+            format_plain_sns(None, &json!("operator-test")),
+            "🔔 operator-test"
+        );
+        assert_eq!(
+            format_plain_sns(Some(&json!("Deploy FAILED")), &json!("step=build exit=101")),
+            "🆘 Deploy FAILED\nstep=build exit=101"
+        );
+    }
+
+    #[test]
+    fn test_redactor_blanks_value_with_escaped_quotes_and_keeps_siblings() {
+        let s = r#"{"NewStateReason": "Threshold \"Crossed\": secret", "Other": "keep"}"#;
+        let out = redact_new_state_reason(s);
+        assert!(!out.contains("secret"));
+        assert!(!out.contains("Crossed"));
+        assert!(out.contains("\"[redacted]\""));
+        assert!(out.contains(r#""Other": "keep""#));
+    }
+
+    #[test]
+    fn test_redactor_is_noop_on_ordinary_text() {
+        assert_eq!(
+            redact_new_state_reason("commit=abc ref=main"),
+            "commit=abc ref=main"
+        );
+        // The bare key name as a string VALUE (no colon) is left alone —
+        // it carries no forensic content.
+        let bare = r#"{"note": "NewStateReason"}"#;
+        assert_eq!(redact_new_state_reason(bare), bare);
+    }
+
+    #[test]
+    fn test_redactor_non_string_and_unterminated_values_redact_to_end() {
+        let out = redact_new_state_reason(r#"{"NewStateReason": {"deep": "secret"}}"#);
+        assert!(!out.contains("secret"));
+        assert!(out.ends_with("[redacted]"));
+        let out2 = redact_new_state_reason(r#"{"NewStateReason": "unterminated secret"#);
+        assert!(!out2.contains("secret"));
+        // Trailing backslash at end-of-input must not panic or overrun.
+        let out3 = redact_new_state_reason("{\"NewStateReason\": \"x\\");
+        assert!(!out3.contains('x') || out3.contains("[redacted]"));
+        assert!(out3.contains("[redacted]"));
+    }
+
+    #[test]
+    fn test_redactor_handles_multiple_occurrences() {
+        let s = r#"{"NewStateReason":"one secret","Nested":{"NewStateReason":"two secret"}}"#;
+        let out = redact_new_state_reason(s);
+        assert!(!out.contains("secret"));
+        assert_eq!(out.matches("[redacted]").count(), 2);
+    }
+
+    #[test]
+    fn test_fallback_body_cap_truncates_long_bodies_only() {
+        let long = "x".repeat(PLAIN_FALLBACK_BODY_MAX_CHARS + 500);
+        let out = format_plain_sns(None, &json!(long));
+        assert!(out.ends_with("…[truncated]"));
+        assert!(out.chars().count() <= PLAIN_FALLBACK_BODY_MAX_CHARS + 64);
+        let short = "y".repeat(100);
+        let out2 = format_plain_sns(None, &json!(short.clone()));
+        assert_eq!(out2, format!("🔔 {short}"));
     }
 
     // ---- LambdaHandlerDelivery (Python: 3 tests) ----
