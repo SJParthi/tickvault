@@ -67,9 +67,9 @@ use tickvault_core::notification::{NotificationEvent, NotificationService};
 // pcr_snapshots / dhan_option_chain_raw / greeks_verification tables.
 
 // PR #3 (2026-05-19): `InlineGreeksComputer` retired alongside the
-// trading::greeks module. `build_inline_greeks_enricher` below now
-// returns `Option<NoopGreeksEnricher>::None` so the tick processor's
-// generic over `GreeksEnricher` keeps compiling without computing.
+// trading::greeks module. Dead-code batch 2 (2026-07-18): the leftover
+// `GreeksEnricher`/`NoopGreeksEnricher` trait pair in tick_types was
+// DELETED too (its generic tick-processor consumer died in stage 2).
 
 // `build_router` was the legacy entry point; both boot paths now use
 // `build_router_with_auth` directly with an SSM-resolved `ApiAuthConfig`
