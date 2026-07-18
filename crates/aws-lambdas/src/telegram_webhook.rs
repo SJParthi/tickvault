@@ -284,10 +284,10 @@ fn strip_env_prefix(name: &str) -> &str {
             .chars()
             .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
             .count();
-        if run > 0 {
-            if let Some(tail) = rest[run..].strip_prefix('-') {
-                return tail;
-            }
+        if run > 0
+            && let Some(tail) = rest[run..].strip_prefix('-')
+        {
+            return tail;
         }
     }
     name
@@ -300,7 +300,7 @@ pub fn alarm_phrase(alarm_name: &str) -> String {
     if let Some((_, phrase)) = ALARM_PHRASES.iter().find(|(k, _)| *k == key) {
         return (*phrase).to_string();
     }
-    let spaced = key.replace('-', " ").replace('_', " ");
+    let spaced = key.replace(['-', '_'], " ");
     let words = spaced.trim();
     if words.is_empty() {
         return "A cloud alarm changed state".to_string();
@@ -763,7 +763,7 @@ mod tests {
                     && s.chars().next().is_some_and(|c| c.is_ascii_digit())
                     && {
                         let colon = s.find(':').unwrap_or(0);
-                        colon >= 1 && colon <= 2
+                        (1..=2).contains(&colon)
                     }
             }
             fn ends_with_clock(head: &str) -> bool {

@@ -18,9 +18,9 @@
 //!
 //! * desired == deployed  -> healthy, stay SILENT (no spam).
 //! * desired != deployed  -> the cron missed (or is late) -> trigger
-//!   `deploy-aws-after-close.yml` via workflow_dispatch (itself idempotent
-//!   + market-hours-guarded, so a double-fire with the cron is a safe
-//!   no-op) AND publish a Severity::High Telegram.
+//!   `deploy-aws-after-close.yml` via workflow_dispatch (itself
+//!   idempotent and market-hours-guarded, so a double-fire with the
+//!   cron is a safe no-op) AND publish a Severity::High Telegram.
 //! * either sha unknown (GitHub API blip / no deploy history) -> stay
 //!   SILENT and log WARNING. The watchdog NEVER dispatches on uncertainty
 //!   — a spurious deploy is worse than waiting for the next
