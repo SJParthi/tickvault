@@ -102,9 +102,9 @@ RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
     -H "Content-Type: application/json" \
     -d "{\"chat_id\": \"${TG_CHAT}\", \"text\": \"tickvault: Bootstrap complete. Telegram active.\", \"parse_mode\": \"HTML\"}" 2>/dev/null)
 
-OK=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
+OK=$(echo "${RESPONSE}" | jq -r '.ok // false' 2>/dev/null || echo "false")
 
-if [ "${OK}" = "True" ]; then
+if [ "${OK}" = "true" ]; then
     echo -e "${GREEN}sent! Check your Telegram.${NC}"
 else
     echo -e "${YELLOW}failed (check bot token/chat ID in AWS SSM Console)${NC}"
