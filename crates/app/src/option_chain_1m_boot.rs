@@ -160,6 +160,29 @@ pub struct OptionChain1mTaskParams {
     /// spot leg just finished firing). `None` when the spot leg is
     /// disabled — the fallback timer then paces every chain fire.
     pub spot_minute_done: Option<tokio::sync::watch::Receiver<Option<u32>>>,
+    /// Whether the cadence scheduler lane (`[cadence]`) is enabled —
+    /// context for the probe-only verdict wording (2026-07-18 canary
+    /// reword): since the 2026-07-17 stand-down the cadence lane records
+    /// the SAME per-minute chains, so "this leg is disabled" must never
+    /// read as "capture is off" while the cadence lane is on.
+    pub cadence_enabled: bool,
+}
+
+/// Plain-language capture-state note for the probe-only paths (this
+/// dedicated leg disabled) — context-accurate per the 2026-07-17 cadence
+/// stand-down: a disabled dedicated leg does NOT mean capture is off while
+/// the cadence scheduler lane records the same per-minute chains; only
+/// with BOTH lanes disabled is "recording is OFF" the truth. Pure; shared
+/// by the Dhan and Groww probe paths so the wording has ONE source.
+#[must_use]
+pub(crate) fn probe_capture_state_note(cadence_enabled: bool) -> &'static str {
+    if cadence_enabled {
+        "this dedicated leg stays idle — per-minute chain capture continues \
+         via the cadence scheduler lane"
+    } else {
+        "chain recording is not running (this leg AND the cadence scheduler \
+         lane are both disabled) — enable one of them to record"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,10 +1132,11 @@ pub async fn run_option_chain_1m_probe(params: OptionChain1mTaskParams) {
                 symbol = probe_symbol,
                 expiries = expiries.len(),
                 config_key = "[option_chain_1m].enabled",
+                capture_state = probe_capture_state_note(params.cadence_enabled),
                 "option_chain_1m: entitlement probe PASSED — chain data is \
-                 available; pipeline stays OFF until the config is flipped \
-                 (the Telegram body carries the plain-English action; the \
-                 exact key lives HERE)"
+                 available (capture_state carries the context-accurate leg \
+                 state; the Telegram body carries the plain-English action; \
+                 the exact key lives HERE)"
             );
             params
                 .notifier
@@ -1122,7 +1146,8 @@ pub async fn run_option_chain_1m_probe(params: OptionChain1mTaskParams) {
             info!(
                 detail = %failure.msg,
                 "option_chain_1m: entitlement probe verdict — NOT entitled \
-                 (DH-902/806 class); pipeline stays OFF"
+                 (DH-902/806 class); chain data cannot be recorded on this \
+                 account until the subscription is bought"
             );
             params
                 .notifier
@@ -2783,6 +2808,53 @@ pub fn spawn_supervised_option_chain_1m(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- probe capture-state note (2026-07-18 canary reword) ----------------
+
+    /// Cadence lane ON: a disabled dedicated leg must read as IDLE with
+    /// capture continuing via the cadence scheduler — never as "recording
+    /// is off" and never with the retired "flip the config" instruction
+    /// (the 2026-07-17 RS3 mutual exclusion REJECTS that flip while the
+    /// cadence lane is on).
+    #[test]
+    fn test_probe_capture_state_note_cadence_on_never_claims_off() {
+        let note = probe_capture_state_note(true);
+        assert!(
+            note.contains("capture continues"),
+            "must say capture continues: {note}"
+        );
+        assert!(
+            note.contains("cadence scheduler"),
+            "must name the recording lane: {note}"
+        );
+        assert!(
+            !note.to_lowercase().contains("off"),
+            "cadence-on note must never claim capture is off: {note}"
+        );
+        assert!(
+            !note.contains("config is flipped") && !note.contains("turn ON"),
+            "stale flip-the-config instruction: {note}"
+        );
+    }
+
+    /// BOTH lanes disabled: the genuinely-off wording stays accurate —
+    /// names BOTH lanes and carries the enable action.
+    #[test]
+    fn test_probe_capture_state_note_both_off_is_accurate_off() {
+        let note = probe_capture_state_note(false);
+        assert!(
+            note.contains("not running"),
+            "must state recording is not running: {note}"
+        );
+        assert!(
+            note.contains("both disabled"),
+            "must name BOTH lanes as the cause: {note}"
+        );
+        assert!(
+            note.contains("enable one"),
+            "must carry the enable action: {note}"
+        );
+    }
 
     // ---- moneyness glue (2026-07-14) -----------------------------------------
 

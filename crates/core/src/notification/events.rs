@@ -830,8 +830,11 @@ pub enum NotificationEvent {
     },
 
     /// The boot-time option-chain probe CONFIRMED the account IS entitled
-    /// to option-chain data while the pipeline is switched OFF — one Info
-    /// ping telling the operator the recording can be turned on.
+    /// to option-chain data while this dedicated pipeline is disabled —
+    /// one Info ping confirming the minute-cadence engine's per-minute
+    /// chain pulls have the data they need (2026-07-18 reword: a disabled
+    /// dedicated leg is never presented as "recording is off" while the
+    /// cadence lane records the same chains).
     ChainEntitlementConfirmed,
 
     /// The day-start expiry-date lookup for the option chain failed after
@@ -3411,9 +3414,11 @@ impl NotificationEvent {
                          Today's one-time check confirmed the Dhan account has \
                          NO option chain data subscription (Dhan said: \
                          {detail}).\n\
-                         Nothing is broken — option chain recording is switched \
-                         off and stays off. Buy the subscription with Dhan \
-                         if you want this data."
+                         Nothing is broken on our side — no setting is at \
+                         fault; Dhan option chain data cannot be recorded \
+                         until the subscription is bought with Dhan. If the \
+                         minute-cadence engine is on, its own alerts will \
+                         show the failed Dhan chain pulls until then."
                     )
                 }
             }
@@ -8864,6 +8869,22 @@ mod tests {
         let msg = probe.to_message();
         assert!(msg.contains("NOT available"), "got: {msg}");
         assert!(msg.contains("Nothing is broken"), "got: {msg}");
+        // 2026-07-18 canary reword: the probe verdict must never attribute
+        // the missing data to a recording switch — since the 2026-07-17
+        // cadence stand-down the minute-cadence engine records the chains,
+        // so the only honest cause here is the missing subscription.
+        assert!(
+            !msg.to_lowercase().contains("switched off"),
+            "stale switch attribution: {msg}"
+        );
+        assert!(
+            msg.contains("until the subscription is bought"),
+            "must name the real cause + action: {msg}"
+        );
+        assert!(
+            msg.contains("minute-cadence engine"),
+            "must point at the lane that records today: {msg}"
+        );
         // Payload detail is HTML-escaped like every String arm.
         let hostile = NotificationEvent::ChainEntitlementAbsent {
             pipeline_enabled: false,

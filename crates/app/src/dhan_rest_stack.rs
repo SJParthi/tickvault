@@ -948,6 +948,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
             rest_api_base_url: config.dhan.rest_api_base_url.clone(),
             client_id: client_id.clone(),
             spot_minute_done: spot_minute_done_rx,
+            cadence_enabled: config.cadence.enabled,
         };
         if config.option_chain_1m.enabled {
             let _chain1m_supervisor =

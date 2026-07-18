@@ -3385,6 +3385,7 @@ fn spawn_groww_spot_1m_leg(
                     burst: std::sync::Arc::clone(&burst),
                     minute_done_tx: chain_minute_done_tx,
                     anchor_store: contract_anchor_store.clone(),
+                    cadence_enabled: config.cadence.enabled,
                 },
             );
         info!(
@@ -3434,6 +3435,7 @@ fn spawn_groww_spot_1m_leg(
                     burst: std::sync::Arc::clone(&burst),
                     minute_done_tx: None,
                     anchor_store: None,
+                    cadence_enabled: config.cadence.enabled,
                 },
             ),
         );
