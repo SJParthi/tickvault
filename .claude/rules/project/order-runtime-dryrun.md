@@ -207,6 +207,30 @@ directions landed.**
 > orphan warns, never silent fills); cross-segment sid collisions are
 > loudly SKIPPED, not composite-keyed (§3)."
 
+**2026-07-18 truth-sync (marks re-homed a SECOND time — the cadence
+cutover):** PR #1624's cadence cutover stood the legacy Groww per-minute
+legs down (`[groww_spot_1m]` / `[groww_contract_1m]` enabled = false in
+base.toml), which left the mark channel with ZERO producers — the sole
+sender dropped at boot and the Fix-F arm read the closed channel as the
+benign day-complete state (paper fills + P&L marks silently dead; the
+daily paper self-test failed loudly at its 180s AwaitingMark timeout,
+OMS-GAP-06 log-sink-only). The marks are now re-homed from the
+stood-down legacy legs to the GROWW CADENCE EXECUTOR's spot
+persist-confirm seam (`groww_cadence_executor.rs` — the own-fire close
+forwarded after the spot_1m_rest flush ACK + fold handoff, the legacy
+gating mirrored verbatim; ~4 spot marks per minute close). The Dhan
+cadence executor is DELIBERATELY excluded: Dhan spot sids (13/25/51
+IDX_I) are a different id space than the Groww-native u64s the paper
+book keys on — cross-feeding would double-key instruments invisibly to
+the §3 first-seen-segment tripwire (segments match across the split).
+Honest residual: contract-leg OPTION marks remain dead on the cadence
+path — the cadence lane fetches chains, not per-contract candles, so
+only index spot marks flow. The Fix-F closed-channel warn now
+distinguishes never-any-mark ("mark channel closed before any mark
+arrived — no live mark producer is configured") from the benign
+day-complete close; control flow unchanged. Ratchet:
+`crates/app/tests/cadence_mark_source_guard.rs`.
+
 ## §6. Trigger / auto-load
 
 This rule activates when editing:
