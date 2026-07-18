@@ -224,6 +224,36 @@ fn test_order_runtime_fix_f_distinguishes_never_any_mark() {
 }
 
 #[test]
+fn test_order_runtime_abnormal_mid_session_death_arm_is_coded() {
+    // MED-1 (2026-07-18): the disarm arm's THIRD case — marks flowed and
+    // the channel closed BEFORE the 15:30 IST close boundary — must stay a
+    // coded OMS-GAP-02 error! + a static counter. Scan the None-arm window
+    // (from `let Some(first) = mark else` forward) of the comment-stripped
+    // production region so the lagged-receiver arm's own OmsGapReconciliation
+    // emit can never vacuously satisfy the needle.
+    let src = app_src("src/order_runtime.rs");
+    let prod = strip_line_comments(production_region(&src));
+    let at = prod
+        .find("let Some(first) = mark else")
+        .expect("order_runtime.rs lost the mark-channel None (disarm) arm");
+    let window = &prod[at..(at + 2_500).min(prod.len())];
+    for needle in [
+        "OmsGapReconciliation.code_str()",
+        "tv_order_runtime_mark_producer_lost_total",
+        "mark channel closed MID-SESSION after",
+        "TICK_PERSIST_END_SECS_OF_DAY_IST",
+    ] {
+        assert!(
+            window.contains(needle),
+            "order_runtime.rs mark-channel disarm arm lost `{needle}` — the \
+             abnormal MID-SESSION producer-death case is no longer a coded \
+             OMS-GAP-02 error + counter (a mid-session mark-producer death \
+             would freeze paper fills + P&L marks silently)"
+        );
+    }
+}
+
+#[test]
 fn test_scanner_self_check() {
     // The stripper removes a comment-borne needle but keeps code + URLs.
     let stripped = strip_line_comments(
