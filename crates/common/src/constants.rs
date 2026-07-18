@@ -1205,9 +1205,10 @@ pub const INDEX_SYMBOL_ALIASES: &[(&str, &str)] = &[
     // Groww→Dhan spelling bridges (2026-06-28): the Groww index DISPLAY `name`
     // for these three differs from the Dhan-allowlist trading-symbol spelling,
     // so the Groww index-coverage audit would falsely flag them absent. Additive
-    // (alias→canonical) — they only ADD a fallback match, never remove one, so
-    // the Dhan-side `extract_indices` path is unaffected for already-matching
-    // rows. Stored already-normalized (uppercase, single-spaced).
+    // (alias→canonical) — they only ADD a fallback match, never remove one
+    // for already-matching rows (the Dhan-side index-extraction consumer was
+    // DELETED 2026-07-18, dead-code batch 2; the canonicalizer remains the
+    // consumer). Stored already-normalized (uppercase, single-spaced).
     ("NIFTY MIDCAP SELECT", "MIDCPNIFTY"),
     ("NIFTY MIDCAP 50", "NIFTYMCAP50"),
     ("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"),
