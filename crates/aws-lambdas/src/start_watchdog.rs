@@ -25,7 +25,9 @@
 //! assertions). The real SDK impls are thin, uncovered-by-design shells
 //! (UNPROVEN until deploy — a live Lambda invoke is the only real probe).
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Offset, Timelike, Utc};
+use chrono::{
+    DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Offset, TimeZone, Timelike, Utc,
+};
 use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
