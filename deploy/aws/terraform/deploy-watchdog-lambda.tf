@@ -85,25 +85,31 @@ resource "aws_iam_role_policy" "deploy_watchdog" {
 }
 
 # ---------------------------------------------------------------------------
-# Lambda source — packaged from deploy/aws/lambda/deploy-watchdog/
+# Lambda source — Rust bin (rust-only phase 2b-2 wave 1, 2026-07-18).
+#
+# The Python handler (deploy/aws/lambda/deploy-watchdog/handler.py) was
+# PORTED to Rust — crates/aws-lambdas/src/deploy_watchdog.rs (lib logic;
+# every python test ported to Rust unit tests) + src/bin/deploy_watchdog.rs
+# (thin bootstrap bin). Behavior parity: same is_stale / binary_is_stale
+# never-dispatch-on-uncertainty contract, same GitHub desired/deployed sha
+# reads + workflow_dispatch, same B9 tv_binary_main_sha_mismatch metric
+# publish (skip-on-unknown), same SNS pages. The zip is built in CI by the
+# build-lambdas job (terraform-apply.yml) into ${path.module}/.lambda-zips/
+# before plan/apply; source_code_hash is a digest of the Rust SOURCE (Rust
+# builds are not bit-reproducible, so hashing the zip would churn every
+# build with zero source change).
 # ---------------------------------------------------------------------------
-
-data "archive_file" "deploy_watchdog" {
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/deploy-watchdog"
-  output_path = "${path.module}/.deploy-watchdog.zip"
-  excludes    = ["README.md", "test_handler.py", "__pycache__", "*.pyc"]
-}
 
 resource "aws_lambda_function" "deploy_watchdog" {
   function_name    = "tv-${var.environment}-deploy-watchdog"
   role             = aws_iam_role.deploy_watchdog.arn
-  handler          = "handler.lambda_handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 30
   memory_size      = 128
-  filename         = data.archive_file.deploy_watchdog.output_path
-  source_code_hash = data.archive_file.deploy_watchdog.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/deploy-watchdog.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
 
   environment {
     variables = {
