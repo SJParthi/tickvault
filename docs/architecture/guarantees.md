@@ -50,9 +50,9 @@ But we CAN mechanically guarantee:
 
 | Claim | Proof file | Test name |
 |---|---|---|
-| CloudWatch alarm fires when `tv_ticks_dropped_total > 0` (the FINAL irrecoverable tick-loss breach — added #989) | `deploy/aws/terraform/app-alarms.tf` (`tv-${env}-ticks-dropped`) | `crates/common/tests/cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_thirteen` |
-| Alarm fires when disk spill is dropping (`tv_spill_dropped_total`) | same tf (`tv-${env}-spill-dropped`) | same guard (every alarm metric has a Rust emit-site) |
-| Alarm fires when DLQ catches ticks (`tv_dlq_ticks_total`) | same tf (`tv-${env}-dlq-ticks`) | same guard |
+| CloudWatch alarm fires when `tv_ticks_dropped_total > 0` (the FINAL irrecoverable tick-loss breach — added #989) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | `deploy/aws/terraform/app-alarms.tf` (`tv-${env}-ticks-dropped`) | `crates/common/tests/cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_thirteen` |
+| Alarm fires when disk spill is dropping (`tv_spill_dropped_total`) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | same tf (`tv-${env}-spill-dropped`) | same guard (every alarm metric has a Rust emit-site) |
+| Alarm fires when DLQ catches ticks (`tv_dlq_ticks_total`) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | same tf (`tv-${env}-dlq-ticks`) | same guard |
 | Every alarm metric is published by the CW agent (EMF filter) | `deploy/aws/terraform/user-data.sh.tftpl` | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_is_in_emf_filter_list` |
 | Every alarm metric has a real Rust emit-site (no dead alarms) | crates/ (`counter!`/`gauge!`) | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_has_a_rust_emit_site` |
 | `ticks_dropped_total` counter field still emitted from storage | `crates/storage/src/tick_persistence.rs` | `crates/storage/tests/zero_tick_loss_alert_guard.rs` |

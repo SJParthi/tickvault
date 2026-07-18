@@ -43,6 +43,28 @@ died with the live-WS retirements):
 Net ≈ **−$0.70/mo pre-GST (~−₹70/mo incl. 18% GST at ₹85/$)** — the real
 gain is the freed dashboard slot + ~730 LoC of dead monitoring code.
 
+## COST NOTE 2026-07-18 — dead live-WS sweep stage 4 (−~$0.40/mo alarms; −4 EMF series)
+
+The stage-4 dead-producer sweep (this PR) retired the 4 dead-tick alarm
+chains whose emit sites died with the stage-2 tick-chain deletion
+(2026-07-17 — `tick_persistence.rs` ring/spill/DLQ counters + the
+`tick_processor.rs` post-close check); billing magnitudes Assumed at
+CloudWatch list rates (active-series-hours decay to $0 once producers
+stop publishing):
+
+- **−4 alarms ≈ −$0.40/mo (Verified against the terraform diff):**
+  `tv-<env>-spill-dropped`, `tv-<env>-dlq-ticks`, `tv-<env>-ticks-dropped`,
+  `tv-<env>-late-tick-after-boundary` (app-alarms.tf; all ungated —
+  no window-gate edit).
+- **−4 EMF selector names ≈ −$1.20/mo at full density (Assumed; already
+  $0 in practice — the producers stopped 2026-07-17):**
+  `tv_spill_dropped_total`, `tv_dlq_ticks_total`, `tv_ticks_dropped_total`,
+  `tv_late_tick_after_boundary_total` removed from both selector copies
+  (cloudwatch-agent.json + user-data.sh.tftpl).
+
+The seal-side loss pagers (seal-drop-alarm.tf + the AGGREGATOR-DROP-01
+errcode alarm) are UNTOUCHED.
+
 ## COST NOTE 2026-07-17 — dead live-WS sweep stage 3 (−~$0.70/mo)
 
 The stage-3 sweep (this PR) deleted the publisher-less 21-TF TICK aggregator

@@ -191,21 +191,13 @@ fn test_every_alarm_metric_has_a_rust_emit_site() {
         !names.is_empty(),
         "ratchet self-check: app-alarms.tf produced 0 metric_name entries — parser broken"
     );
-    // DEAD-MONITOR allowlist (stage-2 dead-WS sweep, 2026-07-17): these 4
-    // alarm metrics' ONLY emit sites lived in the deleted dead Dhan tick
-    // chain (tick_persistence.rs ring/spill/DLQ counters + the aggregator
-    // late-tick arm fed by the deleted tick_processor.rs). The alarms in
-    // app-alarms.tf are now DEAD MONITORS (their series stopped the day the
-    // live feeds retired — 2026-07-13/15 — the code deletion changes no
-    // runtime behavior). Terraform retirement is deliberately DEFERRED to
-    // the dashboard PR per the sweep's task scope; entries here MUST be
-    // removed in lockstep when that PR deletes the alarms.
-    let dead_monitor_pending_tf_retirement: &[&str] = &[
-        "tv_spill_dropped_total",
-        "tv_dlq_ticks_total",
-        "tv_ticks_dropped_total",
-        "tv_late_tick_after_boundary_total",
-    ];
+    // DEAD-MONITOR allowlist — EMPTIED 2026-07-18 (stage-4 dead-producer
+    // sweep): the 4 dead-tick alarm resources (spill-dropped, dlq-ticks,
+    // ticks-dropped, late-tick-after-boundary) were deleted from
+    // app-alarms.tf in the same PR, so the stage-2 allowlist entries were
+    // removed per the lockstep contract below. The scaffold stays so any
+    // future deliberate dead-monitor window re-uses it.
+    let dead_monitor_pending_tf_retirement: &[&str] = &[];
     let mut missing = Vec::new();
     for name in &names {
         if dead_monitor_pending_tf_retirement.contains(&name.as_str()) {
@@ -429,15 +421,22 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // dead Dhan-lag chain (spawn sites + tick source died PR-C2 2026-07-13 /
     // stage-2 sweep 2026-07-17). Cost: -2 custom metric series (~-$0.60/mo)
     // — dated note in aws-budget.md (COST NOTE 2026-07-17).
+    // 11 (was 15) since 2026-07-18 (stage-4 dead-producer sweep): REMOVED
+    // the 4 dead-tick names — tv_spill_dropped_total, tv_dlq_ticks_total,
+    // tv_ticks_dropped_total, tv_late_tick_after_boundary_total — their
+    // emit sites (tick_persistence.rs ring/spill/DLQ + the tick_processor.rs
+    // post-close check) were deleted in the stage-2 sweep (2026-07-17), so
+    // the names could never publish a datapoint again. Cost: -4 custom
+    // metric series (~-$1.20/mo, Assumed — series-hours decay to $0 once
+    // producers stop) — dated note in aws-budget.md (COST NOTE 2026-07-18).
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        15,
-        "Z+ L2 VERIFY ratchet: expected exactly 15 names in the MAIN EMF \
-         metric_selectors list (19 post-Groww-retirement minus the 2 dead \
-         aggregator names and the 2 dead Dhan lag names, all retired \
-         2026-07-17); found {}: {names:?}",
+        11,
+        "Z+ L2 VERIFY ratchet: expected exactly 11 names in the MAIN EMF \
+         metric_selectors list (15 post-dashboard-tidy minus the 4 dead-tick \
+         names retired 2026-07-18, stage-4); found {}: {names:?}",
         names.len()
     );
     for required in [
@@ -986,10 +985,20 @@ fn test_app_alarms_count_is_twenty_two() {
     // dead Dhan-lag chain, so the alarm was a permanently-missing-data
     // dead monitor. Cost: -1 alarm (~-$0.10/mo) — dated notes in
     // silent-feed-alarms.tf + aws-budget.md (COST NOTE 2026-07-17).
+    // 5 (was 9) since 2026-07-18 (stage-4 dead-producer sweep): REMOVED
+    // tv_spill_dropped_total (alarm tv-<env>-spill-dropped),
+    // tv_dlq_ticks_total (tv-<env>-dlq-ticks), tv_ticks_dropped_total
+    // (tv-<env>-ticks-dropped) and tv_late_tick_after_boundary_total
+    // (tv-<env>-late-tick-after-boundary) — their emit sites (the
+    // tick_persistence.rs ring/spill/DLQ counters + the tick_processor.rs
+    // post-close check) were deleted in the stage-2 sweep (2026-07-17), so
+    // all four alarms were permanently-dead monitors. Cost: -4 alarms
+    // (~-$0.40/mo) — dated notes in app-alarms.tf + aws-budget.md
+    // (COST NOTE 2026-07-18).
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 9,
-        "Z+ L2 VERIFY ratchet: expected exactly 9 app-level CloudWatch alarm \
+        count, 5,
+        "Z+ L2 VERIFY ratchet: expected exactly 5 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \

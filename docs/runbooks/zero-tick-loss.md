@@ -1,5 +1,8 @@
 # Runbook — Zero-tick-loss breach
 
+> **⚠ RETIRED 2026-07-18 (stage-4 dead-producer sweep):** the tick ring→spill→DLQ chain this runbook pages on (`tick_persistence.rs`) was DELETED in the stage-2 dead-WS sweep (2026-07-17) — the runtime is REST-only and nothing writes the `ticks` table anymore. The `tv_spill_dropped_total` / `tv_dlq_ticks_total` / `tv_ticks_dropped_total` metrics have ZERO emit sites and their CloudWatch alarms were deleted from `app-alarms.tf` (2026-07-18). The candle-side seal chain keeps its own pagers (seal-drop-alarm.tf + AGGREGATOR-DROP-01). Content below retained as historical audit.
+
+
 **When it fires:** `TicksDropped`, `TickBufferActive`,
 `TickDiskSpillActive`, `TickDataLoss`, `STORAGE-GAP-01`,
 `BroadcastLagTickLoss`, `WebSocketBackpressure`.
