@@ -1,3 +1,15 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/feed_blame.rs"
+  - "crates/storage/src/feed_scoreboard_persistence.rs"
+  - "crates/storage/src/feed_episode_audit_persistence.rs"
+  - "crates/app/src/feed_scoreboard_boot.rs"
+  - "crates/app/src/groww_sidecar_supervisor.rs"
+  - "crates/core/src/pipeline/feed_presence.rs"
+  - "crates/core/src/instrument/presence_registration.rs"
+---
+
 # Dual-Feed Scoreboard — Error Codes (SCOREBOARD-01)
 
 > **⚠ 2026-07-15 dormancy note (Groww live feed retired — operator Q1, received directly in this session:

@@ -1,3 +1,16 @@
+---
+paths:
+  - "crates/trading/src/oms/api_client.rs"
+  - "crates/trading/src/oms/rate_limiter.rs"
+  - "crates/trading/src/oms/mod.rs"
+  - "crates/common/src/constants.rs"
+  - "crates/common/src/config.rs"
+  - "crates/common/src/error.rs"
+  - "crates/core/src/historical/candle_fetcher.rs"
+  - "crates/core/src/websocket/connection_pool.rs"
+  - "crates/api/src/handlers/quote.rs"
+---
+
 # Dhan API Introduction & Rate Limits Enforcement
 
 > **Ground truth:** `docs/dhan-ref/01-introduction-and-rate-limits.md`

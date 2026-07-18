@@ -1,3 +1,12 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/trading/src/oms/groww/margin.rs"
+  - "crates/trading/src/oms/margin_gate.rs"
+  - "crates/common/src/config.rs"
+  - "config/base.toml"
+---
+
 # Groww Pre-Trade Margin Surface — Error Codes (GROWW-MARG-01..05)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

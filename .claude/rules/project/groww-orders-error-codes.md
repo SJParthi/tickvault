@@ -1,3 +1,14 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/config.rs"
+  - "config/base.toml"
+  - "crates/common/src/constants.rs"
+  - "crates/core/src/notification/events.rs"
+  - "crates/common/src/broker_order_events.rs"
+  - "crates/trading/src/oms/groww/**"
+---
+
 # Groww Regular Orders — Error Codes (GROWW-ORD-01..10)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

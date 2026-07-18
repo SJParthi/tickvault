@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/groww_sidecar_supervisor.rs"
+  - "crates/common/src/feed_health.rs"
+---
+
 # Feed-Agnostic Sidecar Stall-Watchdog — Error Codes (FEED-STALL-01 / FEED-SUPERVISOR-01)
 
 > **⚠ RETIRED 2026-07-15 (Groww live feed deleted — operator Q1, received directly in this session: *"remove

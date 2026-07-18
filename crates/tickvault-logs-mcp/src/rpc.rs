@@ -1,0 +1,418 @@
+//! Hand-rolled JSON-RPC 2.0 over newline-delimited stdio — the exact
+//! MCP 2024-11-05 subset server.py implements: `initialize`,
+//! `tools/list`, `tools/call`, `notifications/initialized` (silent),
+//! unknown method → -32601, parse error → -32700 with `id: null`.
+//!
+//! Documented bounded deviations from CPython (transcript never hits
+//! them): a syntactically-valid NON-OBJECT request line (e.g. `5`) gets a
+//! "method not found" error here where Python would crash with an
+//! AttributeError; a truthy non-object `params` / `arguments` is treated
+//! as empty here where Python would raise mid-handler.
+
+use std::io::{BufRead, Write};
+
+use serde_json::{Map, Value, json};
+
+use crate::config::Ctx;
+use crate::tools;
+
+/// Python `f"{value}"` rendering of a JSON value pulled from the request
+/// (`unknown tool: {name}` / `method not found: {method}`): `None`,
+/// `True`/`False`, bare strings, number repr.
+fn py_display(v: &Value) -> String {
+    match v {
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn envelope_result(id: &Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn envelope_error(id: &Value, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message},
+    })
+}
+
+/// Handle one parsed request. `None` = notification (no response line).
+pub fn handle_request(ctx: &Ctx, req: &Value) -> Option<Value> {
+    // Python: req_id = req.get("id") — missing id serializes as null.
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    // Python: method = req.get("method", "") — string compare below, so a
+    // non-string method never matches and falls through to -32601.
+    let method_val = req
+        .get("method")
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let method = method_val.as_str().unwrap_or("");
+    // Python: params = req.get("params") or {} (falsy → {}).
+    let params: Map<String, Value> = match req.get("params") {
+        Some(Value::Object(m)) => m.clone(),
+        _ => Map::new(),
+    };
+
+    match method {
+        "initialize" => Some(envelope_result(
+            &id,
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {
+                    "name": "tickvault-logs",
+                    "version": "0.1.0",
+                },
+            }),
+        )),
+        "tools/list" => Some(envelope_result(
+            &id,
+            json!({"tools": tools::tools_list_json()}),
+        )),
+        "tools/call" => {
+            let name_val = params.get("name").cloned().unwrap_or(Value::Null);
+            let name = name_val.as_str().unwrap_or("");
+            // Python: arguments = params.get("arguments") or {}.
+            let arguments: Map<String, Value> = match params.get("arguments") {
+                Some(Value::Object(m)) => m.clone(),
+                _ => Map::new(),
+            };
+            match tools::call_tool(ctx, name, &arguments) {
+                Some(Ok(result)) => {
+                    // Python: json.dumps(result, indent=2) — 2-space
+                    // indent, ": " separators, ensure_ascii=True (the
+                    // default). serde_json pretty matches the shape and
+                    // escape forms; the ensure_ascii post-pass (review
+                    // r8, 2026-07-18) matches the non-ASCII escaping
+                    // too, so only key ORDER differs (sorted vs
+                    // insertion — the harness's documented
+                    // normalization).
+                    let text = crate::pycompat::ensure_ascii(
+                        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+                    );
+                    Some(envelope_result(
+                        &id,
+                        json!({"content": [{"type": "text", "text": text}]}),
+                    ))
+                }
+                Some(Err(msg)) => Some(envelope_error(
+                    &id,
+                    -32000,
+                    &format!("tool {} failed: {msg}", py_display(&name_val)),
+                )),
+                None => Some(envelope_error(
+                    &id,
+                    -32601,
+                    &format!("unknown tool: {}", py_display(&name_val)),
+                )),
+            }
+        }
+        "notifications/initialized" => None,
+        _ => Some(envelope_error(
+            &id,
+            -32601,
+            &format!("method not found: {}", py_display(&method_val)),
+        )),
+    }
+}
+
+/// One stdin line → optional response value. Mirrors `_run_stdio_loop`'s
+/// per-line body: strip, skip empty, parse error → `id: null` -32700.
+pub fn process_line(ctx: &Ctx, raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(req) => handle_request(ctx, &req),
+        Err(_) => Some(envelope_error(&Value::Null, -32700, "parse error")),
+    }
+}
+
+/// The stdio loop: newline-delimited requests in, newline-delimited
+/// responses out, flush after every response (server.py flushes per
+/// write).
+///
+/// Lines are read as RAW BYTES (`read_until(b'\n')`) and converted with
+/// `from_utf8_lossy` — review round-2 fix: the previous `lines()` iterator
+/// yielded `Err(InvalidData)` on an invalid-UTF-8 line and silently broke
+/// the loop, dropping every SUBSEQUENT valid request (false-OK exit 0),
+/// where Python (surrogateescape locale) answers -32700 for the bad line
+/// and keeps serving. Valid UTF-8 input converts byte-identically, so
+/// existing byte-parity is untouched; an invalid-UTF-8 line becomes a
+/// `U+FFFD`-carrying string that fails JSON parse and rides the existing
+/// -32700 `id: null` path — Python's behavior class. Genuine I/O errors
+/// still end the loop.
+pub fn run_stdio_loop(ctx: &Ctx) {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run_loop(ctx, stdin.lock(), stdout.lock());
+}
+
+/// Generic body of [`run_stdio_loop`] over any reader/writer so the
+/// invalid-UTF-8 continuation behavior is unit-testable.
+fn run_loop<R: BufRead, W: Write>(ctx: &Ctx, mut input: R, mut out: W) {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        match input.read_until(b'\n', &mut buf) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break, // genuine I/O error — not a decode error
+        }
+        let raw = String::from_utf8_lossy(&buf);
+        let Some(resp) = process_line(ctx, &raw) else {
+            continue;
+        };
+        if let Ok(s) = serde_json::to_string(&resp) {
+            // Python's envelope writes (_respond/_respond_error) use
+            // json.dumps with the ensure_ascii=True default too, so the
+            // same post-pass applies to the whole wire line (review r8,
+            // 2026-07-18). Tool-result inner text is already ASCII by
+            // then; this covers envelope-level non-ASCII (e.g. a
+            // client-supplied non-ASCII tool name echoed into an error
+            // message).
+            let s = crate::pycompat::ensure_ascii(&s);
+            // Deliberate deviation (ledger in lib.rs): a stdout write
+            // failure (broken pipe) is swallowed and the loop runs to
+            // stdin EOF + exit 0; CPython dies exit 1 with a
+            // BrokenPipeError traceback. Unreachable in the real MCP
+            // lifecycle; the Rust direction is safer.
+            let _ignored = writeln!(out, "{s}");
+            let _ignored = out.flush();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EndpointsConfig;
+
+    fn test_ctx() -> Ctx {
+        // A fresh, empty repo root — the rpc-layer tests below only
+        // dispatch tools that tolerate missing dirs.
+        let root = std::env::temp_dir().join(format!(
+            "tv-logs-mcp-rpc-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ignored = std::fs::create_dir_all(&root);
+        Ctx {
+            repo_root: root,
+            cfg: EndpointsConfig::default(),
+        }
+    }
+
+    #[test]
+    fn initialize_shape_matches_server_py() {
+        let ctx = test_ctx();
+        let resp = handle_request(&ctx, &json!({"id": 1, "method": "initialize"})).unwrap();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 1);
+        assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(resp["result"]["capabilities"]["tools"], json!({}));
+        assert_eq!(resp["result"]["serverInfo"]["name"], "tickvault-logs");
+        assert_eq!(resp["result"]["serverInfo"]["version"], "0.1.0");
+    }
+
+    #[test]
+    fn tools_list_has_all_14_tools() {
+        let ctx = test_ctx();
+        let resp = handle_request(&ctx, &json!({"id": 2, "method": "tools/list"})).unwrap();
+        let arr = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(arr.len(), 14);
+        for tool in arr {
+            assert!(tool["name"].is_string());
+            assert!(tool["description"].is_string());
+            assert_eq!(tool["inputSchema"]["type"], "object");
+        }
+    }
+
+    #[test]
+    fn unknown_tool_message_matches_python_fstring() {
+        let ctx = test_ctx();
+        let resp = handle_request(
+            &ctx,
+            &json!({"id": 3, "method": "tools/call", "params": {"name": "nope"}}),
+        )
+        .unwrap();
+        assert_eq!(resp["error"]["code"], -32601);
+        assert_eq!(resp["error"]["message"], "unknown tool: nope");
+
+        // Missing name → Python `None`.
+        let resp = handle_request(&ctx, &json!({"id": 4, "method": "tools/call"})).unwrap();
+        assert_eq!(resp["error"]["message"], "unknown tool: None");
+    }
+
+    #[test]
+    fn tool_error_maps_to_32000_with_python_keyerror_shape() {
+        let ctx = test_ctx();
+        // signature_history without `signature` → Python KeyError repr `'signature'`.
+        let resp = handle_request(
+            &ctx,
+            &json!({
+                "id": 5,
+                "method": "tools/call",
+                "params": {"name": "signature_history", "arguments": {}},
+            }),
+        )
+        .unwrap();
+        assert_eq!(resp["error"]["code"], -32000);
+        assert_eq!(
+            resp["error"]["message"],
+            "tool signature_history failed: 'signature'"
+        );
+    }
+
+    #[test]
+    fn unknown_method_and_notification() {
+        let ctx = test_ctx();
+        let resp = handle_request(&ctx, &json!({"id": 6, "method": "bogus/x"})).unwrap();
+        assert_eq!(resp["error"]["code"], -32601);
+        assert_eq!(resp["error"]["message"], "method not found: bogus/x");
+
+        // Missing method → "" per Python req.get("method", "").
+        let resp = handle_request(&ctx, &json!({"id": 7})).unwrap();
+        assert_eq!(resp["error"]["message"], "method not found: ");
+
+        assert!(
+            handle_request(&ctx, &json!({"method": "notifications/initialized"})).is_none(),
+            "notifications must be silent"
+        );
+    }
+
+    #[test]
+    fn process_line_parse_error_and_blank_skip() {
+        let ctx = test_ctx();
+        assert!(process_line(&ctx, "").is_none());
+        assert!(process_line(&ctx, "   \t").is_none());
+        let resp = process_line(&ctx, "{not json").unwrap();
+        assert_eq!(resp["id"], Value::Null);
+        assert_eq!(resp["error"]["code"], -32700);
+        assert_eq!(resp["error"]["message"], "parse error");
+    }
+
+    #[test]
+    fn tools_call_success_wraps_pretty_text_content() {
+        let ctx = test_ctx();
+        // find_runbook_for_code on a temp repo root: no runbook dirs →
+        // zero matches, no filesystem dependency beyond missing dirs.
+        let resp = handle_request(
+            &ctx,
+            &json!({
+                "id": 8,
+                "method": "tools/call",
+                "params": {"name": "find_runbook_for_code", "arguments": {"code": "ZZZ-00"}},
+            }),
+        )
+        .unwrap();
+        let content = resp["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        let text = content[0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["code"], "ZZZ-00");
+        assert_eq!(parsed["match_count"], 0);
+        // indent=2 shape.
+        assert!(text.contains("\n  \""));
+    }
+
+    #[test]
+    fn invalid_utf8_line_answers_32700_and_loop_continues() {
+        // Review round-2 fix: an invalid-UTF-8 line must NOT silently end
+        // the loop — it answers -32700 (id null) and the NEXT valid
+        // request is still served (Python surrogateescape behavior class).
+        let ctx = test_ctx();
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"\xff\xfe{bad\n");
+        input.extend_from_slice(br#"{"id": 9, "method": "initialize"}"#);
+        input.push(b'\n');
+        let mut out: Vec<u8> = Vec::new();
+        run_loop(&ctx, std::io::Cursor::new(input), &mut out);
+        let text = String::from_utf8(out).unwrap();
+        let mut lines = text.lines();
+        let first: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(first["id"], Value::Null);
+        assert_eq!(first["error"]["code"], -32700);
+        assert_eq!(first["error"]["message"], "parse error");
+        let second: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(second["id"], 9);
+        assert_eq!(second["result"]["protocolVersion"], "2024-11-05");
+        assert!(lines.next().is_none(), "exactly two response lines");
+    }
+
+    #[test]
+    fn inner_text_is_ensure_ascii_escaped_like_python_json_dumps() {
+        // Review r8 (2026-07-18): a runbook carrying an em-dash + an
+        // astral char must reach the inner tool-result text as CPython
+        // json.dumps (ensure_ascii=True) escapes — never raw UTF-8.
+        // Golden fragment derived from python3 json.dumps (2026-07-18):
+        // '—' -> the 6-char literal backslash-u2014, '𝕊' -> the
+        // surrogate pair backslash-ud835 backslash-udd4a.
+        let ctx = test_ctx();
+        let runbooks = ctx.repo_root.join("docs").join("runbooks");
+        let _ignored = std::fs::create_dir_all(&runbooks);
+        std::fs::write(
+            runbooks.join("r8-ensure-ascii-unit.md"),
+            "R8-UNIT-01 em\u{2014}dash and astral \u{1d54a}\n",
+        )
+        .unwrap();
+        let resp = handle_request(
+            &ctx,
+            &json!({
+                "id": 10,
+                "method": "tools/call",
+                "params": {"name": "find_runbook_for_code", "arguments": {"code": "R8-UNIT-01"}},
+            }),
+        )
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("em\\u2014dash and astral \\ud835\\udd4a"),
+            "inner text not python-escaped: {text}"
+        );
+        assert!(
+            text.bytes().all(|b| b < 0x7f),
+            "inner text must be pure ASCII after ensure_ascii: {text}"
+        );
+        // Round-trips to the original content for JSON-parsing clients.
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let preview = parsed["matches"][0]["preview"].as_str().unwrap();
+        assert_eq!(preview, "R8-UNIT-01 em\u{2014}dash and astral \u{1d54a}");
+        let _ignored = std::fs::remove_dir_all(ctx.repo_root.join("docs"));
+    }
+
+    #[test]
+    fn envelope_line_is_ensure_ascii_escaped_like_python_json_dumps() {
+        // Review r8 (2026-07-18): python's _respond/_respond_error dumps
+        // use ensure_ascii=True too — a non-ASCII tool name echoed into
+        // the -32601 message must ride the wire escaped
+        // (python3 json.dumps('na\u{ef}ve') escapes to backslash-u00ef).
+        let ctx = test_ctx();
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(
+            format!(
+                "{}\n",
+                json!({"id": 11, "method": "tools/call", "params": {"name": "na\u{ef}ve"}})
+            )
+            .as_bytes(),
+        );
+        let mut out: Vec<u8> = Vec::new();
+        run_loop(&ctx, std::io::Cursor::new(input), &mut out);
+        let line = String::from_utf8(out).unwrap();
+        assert!(
+            line.contains("unknown tool: na\\u00efve"),
+            "envelope not python-escaped: {line}"
+        );
+        assert!(
+            line.bytes().all(|b| b < 0x7f),
+            "wire line must be pure ASCII after ensure_ascii: {line}"
+        );
+    }
+}

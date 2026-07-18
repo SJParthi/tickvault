@@ -1,3 +1,8 @@
+---
+paths:
+  - "crates/common/src/constants.rs"
+---
+
 # Dhan Release Notes Enforcement
 
 > **Ground truth:** `docs/dhan-ref/16-release-notes.md`

@@ -49,6 +49,7 @@ use tickvault_storage::order_audit_persistence::{
 use tickvault_trading::oms::groww::events::{
     GrowwPushEventSink, GrowwPushFanOut, PUSH_EVENT_CHANNEL_CAPACITY, PushSinkDelivery,
 };
+use tickvault_trading::oms::groww::push::order_events::GrowwPushCapture;
 use tickvault_trading::oms::groww::push::runner::{
     GrowwAccessTokenProvider, run_groww_push_supervised,
 };
@@ -351,7 +352,12 @@ impl GrowwAccessTokenProvider for SsmGrowwTokenProvider {
 /// Paper/live mode follows [`GROWW_ORDER_LIVE_FIRE`] (Gate 3 — hardcoded
 /// `false` today, so every row is `mode='paper'`). The caller gates this
 /// on the runtime `[groww_orders] order_push_enabled` flag (Gate 1).
-pub fn spawn_groww_order_push(questdb: &QuestDbConfig) {
+///
+/// `capture` is the ADDITIVE full-fidelity capture lane
+/// (`order_update_events` / `position_update_events` — ORDER-EVT-01):
+/// pass [`GrowwPushCapture::disabled()`] when `[order_update_events]` is
+/// off; the lossy 11-field audit lane above is untouched either way.
+pub fn spawn_groww_order_push(questdb: &QuestDbConfig, capture: GrowwPushCapture) {
     let (sink, rx) = AuditPushSink::channel();
     let fan_out = Arc::new(GrowwPushFanOut::new(vec![Arc::new(sink)]));
     let provider: Arc<dyn GrowwAccessTokenProvider> = Arc::new(SsmGrowwTokenProvider);
@@ -367,7 +373,9 @@ pub fn spawn_groww_order_push(questdb: &QuestDbConfig) {
         paper,
         "groww order push: spawning supervised receive-only order/position channel (audit sink)"
     );
-    tokio::spawn(run_groww_push_supervised(provider, fan_out, stop_rx));
+    tokio::spawn(run_groww_push_supervised(
+        provider, fan_out, capture, stop_rx,
+    ));
     tokio::spawn(run_groww_order_audit_consumer(rx, questdb.clone(), paper));
 }
 

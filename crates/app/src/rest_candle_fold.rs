@@ -141,13 +141,16 @@ const _: () = assert!(
     "fold session close must equal MARKET_CLOSE_IST_NANOS"
 );
 
-/// Per-(feed, SID, day) catch-up row LIMIT. A full session is 375 minutes,
-/// so 500 leaves headroom; hitting the LIMIT is a loud truncation tripwire
-/// (the tf_consistency precedent — a partial fold is never trusted).
+/// Per-(feed, SID, day) catch-up row CAP. A full session is 375 minutes,
+/// so 500 leaves headroom; the query fetches `cap + 1` (the 2026-07-18
+/// LIMIT+1 probe — the tf_consistency/#1630 convention) and `> cap` rows
+/// is the loud truncation tripwire (a partial fold is never trusted; an
+/// exact-boundary `== cap` day is complete).
 pub const FOLD_CATCHUP_1M_ROW_LIMIT: usize = 500;
 
-/// Discovery LIMIT for `SELECT DISTINCT security_id, exchange_segment`.
-/// The spot legs pin 4 SIDs/feed; 64 is a generous tripwire bound.
+/// Discovery row CAP for `SELECT DISTINCT security_id, exchange_segment`.
+/// The spot legs pin 4 SIDs/feed; 64 is a generous bound. Fetched as
+/// `cap + 1` (LIMIT+1 probe); `> cap` rows trips the M4 tripwire.
 pub const FOLD_DISCOVERY_ROW_LIMIT: usize = 64;
 
 /// Response-size cap for `/exec` reads (the tf_consistency 8 MiB precedent).
@@ -978,7 +981,11 @@ pub fn apply_bar_batch(
 
 /// SQL for one (feed, sid, segment, day)'s 1m bars from `spot_1m_rest`.
 /// Micros WHERE window + `(ts / 1) * 1000` nanos projection + explicit LIMIT
-/// (the tf_consistency `select_1m_sql` shape).
+/// (the tf_consistency `select_1m_sql` shape). The emitted `LIMIT` is
+/// `limit + 1` — the house LIMIT+1 truncation probe (2026-07-18 convention
+/// unification, the #1630 spot_crossverify precedent): an exact-boundary
+/// dataset of `limit` rows is legitimately complete, while `> limit` rows
+/// proves genuine truncation ([`parse_spot_bars`] flags on `len > limit`).
 pub fn spot_bars_sql(
     security_id: i64,
     segment: &str,
@@ -988,21 +995,25 @@ pub fn spot_bars_sql(
 ) -> String {
     let start_micros = day_start_nanos / 1_000;
     let end_micros = start_micros + 86_400_000_000;
+    let fetch_limit = limit.saturating_add(1);
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, open, high, low, close, volume \
          FROM spot_1m_rest \
          WHERE security_id = {security_id} AND exchange_segment = '{segment}' \
          AND feed = '{feed}' AND ts >= {start_micros} AND ts < {end_micros} \
-         ORDER BY ts ASC LIMIT {limit}"
+         ORDER BY ts ASC LIMIT {fetch_limit}"
     )
 }
 
 /// SQL discovering the per-feed spot instrument set over the catch-up window.
+/// Emits `LIMIT limit + 1` (the house LIMIT+1 truncation probe — see
+/// [`spot_bars_sql`]); [`parse_spot_discovery`] flags on `len > limit`.
 pub fn spot_discovery_sql(feed: &str, window_start_nanos: i64, limit: usize) -> String {
     let start_micros = window_start_nanos / 1_000;
+    let fetch_limit = limit.saturating_add(1);
     format!(
         "SELECT DISTINCT security_id, exchange_segment FROM spot_1m_rest \
-         WHERE feed = '{feed}' AND ts >= {start_micros} LIMIT {limit}"
+         WHERE feed = '{feed}' AND ts >= {start_micros} LIMIT {fetch_limit}"
     )
 }
 
@@ -1018,12 +1029,15 @@ pub struct SpotBarRow {
 }
 
 /// Parses a QuestDB `/exec` dataset of spot bars. Returns `(rows, truncated)`
-/// where `truncated` means the explicit LIMIT was hit (partial day — the
-/// caller degrades loudly, never trusts a partial fold).
+/// where `truncated` means MORE than `limit` rows came back (the query
+/// fetches `limit + 1` — [`spot_bars_sql`] — so `len > limit` proves genuine
+/// truncation while an exact-boundary `len == limit` day is legitimately
+/// complete; 2026-07-18 LIMIT+1 convention unification). A truncated day is
+/// still never partially folded — the caller degrades loudly and discards.
 pub fn parse_spot_bars(body: &str, limit: usize) -> Option<(Vec<SpotBarRow>, bool)> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let dataset = value.get("dataset")?.as_array()?;
-    let truncated = dataset.len() >= limit;
+    let truncated = dataset.len() > limit;
     let mut rows = Vec::with_capacity(dataset.len());
     for row in dataset {
         let cells = row.as_array()?;
@@ -1058,13 +1072,16 @@ pub fn parse_spot_bars(body: &str, limit: usize) -> Option<(Vec<SpotBarRow>, boo
 /// refusing any segment outside the known allowlist (second-order-injection
 /// defense — the tf_consistency `is_allowlisted_segment` precedent).
 ///
-/// Returns `(pairs, truncated)` — `truncated` means the dataset reached the
-/// explicit LIMIT (M4 tripwire: a partial instrument set is NEVER silently
-/// folded; the caller skips that feed's catch-up loudly).
+/// Returns `(pairs, truncated)` — `truncated` means the dataset carries MORE
+/// than `limit` rows (the query fetches `limit + 1` — [`spot_discovery_sql`];
+/// an exact-boundary `len == limit` set is complete, 2026-07-18 LIMIT+1
+/// convention unification). M4 tripwire unchanged: a truncated instrument
+/// set is NEVER silently folded; the caller skips that feed's catch-up
+/// loudly.
 pub fn parse_spot_discovery(body: &str, limit: usize) -> Option<(Vec<(i64, String)>, bool)> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let dataset = value.get("dataset")?.as_array()?;
-    let truncated = dataset.len() >= limit;
+    let truncated = dataset.len() > limit;
     let mut out = Vec::with_capacity(dataset.len());
     for row in dataset {
         let cells = row.as_array()?;
@@ -1754,9 +1771,10 @@ async fn boot_catchup(runtime: &mut FoldRuntime, catchup_days: u32, today: Naive
                 stage = "discovery_truncated",
                 feed = feed.as_str(),
                 limit = FOLD_DISCOVERY_ROW_LIMIT,
-                "rest_candle_fold: boot catch-up discovery hit its LIMIT — the \
-                 instrument set is partial; this feed's catch-up is SKIPPED this \
-                 boot (raise the named constant in a reviewed PR, never silently)"
+                "rest_candle_fold: boot catch-up discovery exceeded its row cap \
+                 (LIMIT+1 probe) — the instrument set is partial; this feed's \
+                 catch-up is SKIPPED this boot (raise the named constant in a \
+                 reviewed PR, never silently)"
             );
             continue;
         }
@@ -2714,7 +2732,9 @@ mod tests {
         assert!(sql.contains("feed = 'dhan'"));
         assert!(sql.contains("ts >= 1752000000000000"));
         assert!(sql.contains("ts < 1752086400000000"));
-        assert!(sql.contains("ORDER BY ts ASC LIMIT 500"));
+        // 2026-07-18 LIMIT+1 probe: the query fetches ONE row past the cap
+        // so an exact-boundary day is never a false PARTIAL.
+        assert!(sql.contains("ORDER BY ts ASC LIMIT 501"));
     }
 
     #[test]
@@ -2722,7 +2742,8 @@ mod tests {
         let sql = spot_discovery_sql("groww", 1_752_000_000_000_000_000, 64);
         assert!(sql.contains("DISTINCT security_id, exchange_segment"));
         assert!(sql.contains("feed = 'groww'"));
-        assert!(sql.contains("LIMIT 64"));
+        // 2026-07-18 LIMIT+1 probe (cap 64 → fetch 65).
+        assert!(sql.contains("LIMIT 65"));
     }
 
     #[test]
@@ -2734,9 +2755,13 @@ mod tests {
         assert!(!truncated);
         assert_eq!(rows[0].open, 100.0);
         assert_eq!(rows[1].volume, 20);
-        // LIMIT == dataset length → truncated tripwire.
-        let (_, truncated2) = parse_spot_bars(body, 2).expect("parse");
-        assert!(truncated2);
+        // 2026-07-18 LIMIT+1 semantics: an EXACT-boundary dataset
+        // (len == limit) is legitimately complete — only len > limit
+        // (the +1 fetch row came back) proves truncation.
+        let (_, at_boundary) = parse_spot_bars(body, 2).expect("parse");
+        assert!(!at_boundary, "dataset.len() == limit is a COMPLETE day");
+        let (_, truncated2) = parse_spot_bars(body, 1).expect("parse");
+        assert!(truncated2, "dataset.len() > limit must flag truncated");
         // Malformed body → None, never a panic.
         assert!(parse_spot_bars("not json", 10).is_none());
         assert!(parse_spot_bars(r#"{"dataset":[[1]]}"#, 10).is_none());
@@ -2752,10 +2777,15 @@ mod tests {
         assert_eq!(pairs[0], (13, "IDX_I".to_string()));
         assert_eq!(pairs[1], (51, "IDX_I".to_string()));
         assert!(!truncated);
-        // M4: dataset length == LIMIT trips the truncation tripwire (the
-        // caller skips that feed's catch-up loudly, never a partial fold).
-        let (_, truncated_at_limit) = parse_spot_discovery(body, 3).expect("parse");
-        assert!(truncated_at_limit);
+        // 2026-07-18 LIMIT+1 semantics: a dataset AT the cap is complete;
+        // only MORE than the cap trips the M4 tripwire (the caller skips
+        // that feed's catch-up loudly, never a partial fold). The raw
+        // dataset length (3, poisoned row included) is what the probe
+        // measures — truncation is a QUERY-completeness fact.
+        let (_, at_boundary) = parse_spot_discovery(body, 3).expect("parse");
+        assert!(!at_boundary, "dataset.len() == limit is a COMPLETE set");
+        let (_, truncated_over_limit) = parse_spot_discovery(body, 2).expect("parse");
+        assert!(truncated_over_limit, "dataset.len() > limit must flag");
     }
 
     #[test]

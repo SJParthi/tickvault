@@ -58,7 +58,15 @@ fn coverage_json(entries: &[String]) -> String {
 /// The crates listed in `quality/crate-coverage-thresholds.toml` `[crates]`
 /// (their listing is separately pinned by
 /// `crates/common/tests/coverage_threshold_lockdown.rs::coverage_lockdown_required_crates_are_listed`).
-const THRESHOLD_CRATES: [&str; 6] = ["common", "core", "trading", "storage", "api", "app"];
+const THRESHOLD_CRATES: [&str; 7] = [
+    "common",
+    "core",
+    "trading",
+    "storage",
+    "api",
+    "app",
+    "tickvault-logs-mcp",
+];
 
 /// Fully-covered file entries for every threshold-listed crate EXCEPT the
 /// ones in `except` (the test then appends its own crafted entry for those).
@@ -149,19 +157,39 @@ fn coverage_gate_fails_below_threshold_crate() {
     );
 }
 
-/// Source-scan ratchet: the start-anchored `re.match(r'crates/` pattern must
+/// Source-scan ratchet: the start-anchored match-on-`crates/` pattern must
 /// never return to the gate script.
+///
+/// 2026-07-18 amendment (PR #1642 review round 1 / rust-only Phase 2a-2):
+/// the gate's inline python was replaced by awk, so the python-era literal
+/// `re.search(r'crates/` no longer exists and this pin went stale (the exact
+/// CI failure on head e5586994). The INTENT is unchanged and re-pinned on
+/// the awk shape: aggregation must use awk's `match()` (LEFTMOST match —
+/// re.search semantics) on an UNANCHORED `crates/<name>/` regex, and a
+/// start-anchored `/^crates\//` shape (GAP #0: vacuous pass on absolute
+/// llvm-cov paths) stays banned in BOTH eras' spellings. The behavioral
+/// tests above (absolute-path aggregation + fail-closed) still execute the
+/// real script, so the intent is enforced by execution, not just by literal.
 #[test]
 fn coverage_gate_source_has_no_anchored_match() {
     let src = std::fs::read_to_string(repo_root().join("scripts/coverage-gate.sh")).unwrap();
     assert!(
         !src.contains("re.match(r'crates/"),
         "scripts/coverage-gate.sh reintroduced start-anchored re.match on crates/ \
-         — this is GAP #0 (vacuous pass on absolute llvm-cov paths); use re.search"
+         — this is GAP #0 (vacuous pass on absolute llvm-cov paths); use a \
+         leftmost (unanchored) match"
     );
     assert!(
-        src.contains("re.search(r'crates/"),
-        "scripts/coverage-gate.sh must aggregate crates via re.search"
+        !src.contains(r"match(fn, /^crates"),
+        "scripts/coverage-gate.sh reintroduced a start-anchored awk match on \
+         crates/ — this is GAP #0 (vacuous pass on absolute llvm-cov paths); \
+         the aggregation regex must stay unanchored"
+    );
+    assert!(
+        src.contains(r"match(fn, /crates\/[^\/]+\//)"),
+        "scripts/coverage-gate.sh must aggregate crates via awk's leftmost \
+         match() on the unanchored crates/<name>/ regex (the re.search \
+         semantics of the pre-2026-07-18 python implementation)"
     );
     assert!(
         src.contains("refusing vacuous pass"),

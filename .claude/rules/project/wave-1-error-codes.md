@@ -1,3 +1,16 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/pipeline/prev_close_writer.rs"
+  - "crates/core/src/instrument/phase2_emit_guard.rs"
+  - "crates/core/src/pipeline/prev_close_persist.rs"
+  - "crates/core/src/pipeline/first_seen_set.rs"
+  - "crates/app/src/main.rs"
+  - "crates/core/src/option_chain/prev_oi.rs"
+  - "crates/core/src/instrument/bhavcopy_cross_check.rs"
+  - "crates/app/src/prev_day_cache_loader.rs"
+---
+
 # Wave 1 Error Codes
 
 > **Authority:** This file is the runbook target for the eight new

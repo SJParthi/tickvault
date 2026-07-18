@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/storage/src/http_client.rs"
+  - "crates/storage/src/boot_probe.rs"
+  - "crates/app/src/oms_wiring.rs"
+---
+
 # Panic-Free HTTP Client Construction — Error Codes (HTTP-CLIENT-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F > this file.
@@ -55,7 +63,7 @@ The site logs `error!(code = "HTTP-CLIENT-01", ...)`, increments
 | Site label | What degrades |
 |---|---|
 | `boot_probe` | one QuestDB readiness probe invocation returns `BootProbeError::ClientBuild` (typed) — the every-5s/10s scheduler retries next tick |
-| `instrument_fetch_audit_ensure` | fetch-audit DDL skipped this boot (idempotent — next boot re-runs) |
+| `instrument_fetch_audit_ensure` | **RETIRED 2026-07-18** (dead-code sweep batch 1, zero callers since PR-C3): the emit site — `instrument_fetch_audit_persistence.rs`, whose fetch-audit DDL leg lost its last caller when the Phase-C instrument chain died — was deleted; the `instrument_fetch_audit` TABLE stays (SEBI forensic, partition-manager sweep string). No src site carries this label anymore |
 | `shadow_ensure_tables` | candle-table DDL skipped this boot (idempotent) |
 | `shadow_drop_legacy` | legacy candle cleanup skipped (marker not written — next boot retries) |
 | `lifecycle_ensure` / `lifecycle_audit_ensure` | lifecycle DDL skipped this boot (idempotent) |
@@ -109,8 +117,11 @@ not per-emission.
 - `crates/storage/src/http_client.rs` (shared client + typed error)
 - `crates/storage/src/boot_probe.rs` (shared-client consumer +
   `BootProbeError::ClientBuild`)
-- Degrade sites: `crates/storage/src/{instrument_fetch_audit_persistence,
-  shadow_persistence, instrument_lifecycle_persistence, tick_persistence}.rs`
+- Degrade sites: `crates/storage/src/{shadow_persistence,
+  instrument_lifecycle_persistence}.rs` (dead-code sweep batch 1,
+  2026-07-18: `instrument_fetch_audit_persistence.rs` deleted — see the
+  RETIRED site row above; `tick_persistence.rs` died earlier with the
+  Stage-2 dead-WS sweep, 2026-07-17)
 - Attribution branches (2026-07-03 review Fix 3): `crates/app/src/main.rs` +
   `crates/core/src/pipeline/tick_processor.rs` — a `BootProbeError::
   ClientBuild` from `wait_for_questdb_ready` logs HTTP-CLIENT-01 (host

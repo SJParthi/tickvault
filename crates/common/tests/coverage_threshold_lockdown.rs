@@ -38,6 +38,12 @@ use std::path::Path;
 /// code lost coverage. New floor per the standing formula: 90.2 - 0.1 =
 /// 90.1. This edit is exactly the visible-review act this test exists to
 /// force; the up-only ratchet resumes from 90.1.
+///
+/// tickvault-logs-mcp pin added 2026-07-18 (rust-only phase 2c): initial
+/// CONSERVATIVE floor 80.0 from a dev-sandbox measurement of 85.83%
+/// (cargo llvm-cov, all targets incl. the parity harness subprocess
+/// coverage); ratchet to the standing measured-minus-0.1 formula after
+/// the first CI Coverage & Perf measurement.
 const PINNED_DEFAULT_FLOOR: f64 = 63.0;
 const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     ("common", 99.5),
@@ -46,6 +52,7 @@ const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     ("storage", 90.1),
     ("api", 98.6),
     ("app", 63.3),
+    ("tickvault-logs-mcp", 80.0),
 ];
 
 fn read_thresholds_toml() -> String {
@@ -172,7 +179,16 @@ fn coverage_lockdown_every_crate_at_or_above_pinned_floor() {
 #[test]
 fn coverage_lockdown_required_crates_are_listed() {
     let content = read_thresholds_toml();
-    let required = ["common", "core", "trading", "storage", "api", "app"];
+    let required = [
+        "common",
+        "core",
+        "trading",
+        "storage",
+        "api",
+        "app",
+        // 2026-07-18 (rust-only phase 2c): the Rust MCP crate.
+        "tickvault-logs-mcp",
+    ];
     let mut missing = Vec::new();
     for crate_name in required {
         // Expect a line like `common  = 99.5` inside [crates].
@@ -189,13 +205,14 @@ fn coverage_lockdown_required_crates_are_listed() {
 
 #[test]
 fn coverage_lockdown_pinned_floors_are_sane() {
-    // The pins themselves must stay in (0, 100] and cover all 6 crates —
+    // The pins themselves must stay in (0, 100] and cover all 7 crates —
     // guards against a typo'd pin (e.g. 9.5 instead of 99.5) silently
-    // weakening the lockdown.
+    // weakening the lockdown. (6 -> 7 on 2026-07-18: tickvault-logs-mcp,
+    // rust-only phase 2c.)
     assert_eq!(
         PINNED_CRATE_FLOORS.len(),
-        6,
-        "S3-7: expected exactly 6 pinned crate floors"
+        7,
+        "S3-7: expected exactly 7 pinned crate floors"
     );
     assert!(PINNED_DEFAULT_FLOOR > 0.0 && PINNED_DEFAULT_FLOOR <= 100.0);
     for (name, floor) in PINNED_CRATE_FLOORS {
