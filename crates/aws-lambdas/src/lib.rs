@@ -27,5 +27,6 @@ pub mod clients;
 pub mod events;
 pub mod logging;
 pub mod market_hours_gate;
+pub mod market_open_readiness;
 pub mod telegram_webhook;
 pub mod time;

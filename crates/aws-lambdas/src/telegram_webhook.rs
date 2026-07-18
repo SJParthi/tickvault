@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, FixedOffset, NaiveDateTime, Offset, TimeZone, Timelike, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Offset, Timelike, Utc};
 use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
