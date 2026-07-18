@@ -112,8 +112,8 @@ field):
 | stage | Meaning |
 |---|---|
 | `catchup_query` | a boot catch-up / PAST-day refold `/exec` read failed — HTTP client build failure, transport error, non-2xx, or the STREAMED 8 MiB response cap refused the body (the cap is enforced chunk-by-chunk during the read — a chunked-transfer response without Content-Length can never buffer unbounded). That day/feed is skipped (counted); the next dirty mark or the next boot retries. Round-2 LOW-4: this stage (with `reason="no_http_client"`) also covers the drain finding NO HTTP client for the task incarnation — the queued past-day marks are dropped LOUDLY (counted under `dropped{reason="no_http_client"}`; the client is built once at task start and can never appear later, so keeping the marks would spin the debounce forever) and the next boot's catch-up re-derives. |
-| `catchup_parse` | the `/exec` body was unparsable, the explicit row LIMIT was hit (a truncated day is NEVER partially folded — the tf_consistency tripwire discipline), or a poisoned segment value failed the allowlist (skipped, never re-queried). |
-| `discovery_truncated` | the boot catch-up's per-feed instrument discovery hit ITS row LIMIT — a partial instrument set is never trusted; the whole (feed, day) fold pass is skipped LOUDLY (2026-07-16 hostile-review M4). |
+| `catchup_parse` | the `/exec` body was unparsable, the query returned MORE than its row cap (a truncated day is NEVER partially folded — the tf_consistency tripwire discipline; *2026-07-18: the query fetches cap + 1 rows per the LIMIT+1 probe convention, so only `len > cap` flags — an exactly-cap day is legitimately complete; previously the query fetched exactly `LIMIT cap` and refused at `len >= cap`, a zero-headroom false-PARTIAL — the #1630 class; ratcheted by `crates/app/tests/truncation_probe_convention_guard.rs`*), or a poisoned segment value failed the allowlist (skipped, never re-queried). |
+| `discovery_truncated` | the boot catch-up's per-feed instrument discovery returned MORE than ITS row cap (*2026-07-18: cap + 1 fetched, `> cap` flags — same LIMIT+1 probe convention*) — a partial instrument set is never trusted; the whole (feed, day) fold pass is skipped LOUDLY (2026-07-16 hostile-review M4). |
 | `refold_stale_read` | a PAST-day refold's `/exec` read did NOT yet contain the triggering repair minute (ILP-flush-ACK → WAL-apply visibility lag) — the refold is NOT emitted (would regress correct candles). Round-2 LOW-7 wording: `tv_rest_candle_fold_errors_total{stage="refold_stale_read"}` increments on EVERY failed attempt (each re-queue logs a coalesced `warn!`); the `error!` fires only on the EXHAUSTED arm (5 attempts). Round-2 scope: this stage exists ONLY on the past-day cold path — the current day refolds from the in-RAM day-map with no `/exec` read (2026-07-16 hostile-review M2 + round-2 HIGH). |
 | `seal_send` | a sealed bucket could not be handed to the seal-writer channel (channel full past the boot-path pacing budget / global sender missing), or a confirmed-bar handoff was dropped (fold channel full/closed). Round-3: a CLOSED seal channel (seal-writer gone — shutdown/teardown) is labeled DISTINCTLY (`dropped{reason="seal_channel_closed"}`) on both the live and paced paths, never conflated with backpressure. |
 | `future_dated` | (round-3 — the BOUNDARY-01 future-skew class) a live bar's IST date is AFTER the wall-clock IST today — it can never roll the live day forward; dropped + counted (`dropped{reason="future_dated"}`), ONE coalesced coded error per drained batch (≤1/minute at the legs' fire cadence). |
@@ -129,9 +129,10 @@ field):
 2. `catchup_query` / `catchup_parse` sustained → QuestDB `/exec` is
    degraded; run `make doctor` (cross-check BOOT-01/BOOT-02,
    WAL-SUSPEND-01 — the sibling post-market readers share the target).
-   A LIMIT-hit (`catchup_parse`) on a legitimate day means the day's
-   `spot_1m_rest` row count outgrew the 500-row envelope — raise the
-   named constant in a reviewed PR, never silently.
+   An over-cap trip (`catchup_parse` — `len > 500` per the 2026-07-18
+   LIMIT+1 probe; an exactly-500-row day is complete) on a legitimate day
+   means the day's `spot_1m_rest` row count outgrew the 500-row envelope —
+   raise the named constant in a reviewed PR, never silently.
 3. `seal_send` with `reason="seal_channel_full"` → the seal-writer is
    backed up; cross-check AGGREGATOR-SEAL-01 / AGGREGATOR-DROP-01 and
    QuestDB ILP health. With `reason="no_seal_sender"` → a boot-ordering
