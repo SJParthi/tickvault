@@ -528,6 +528,19 @@ mod tests {
         assert_eq!(pathlib_lexical(Path::new("./")), PathBuf::from("."));
     }
 
+    #[test]
+    fn pathlib_lexical_drops_leading_curdir_on_relative_path() {
+        // The MUTATION-KILLING case for the CurDir filter (review round-2):
+        // Rust's `components()` already drops NON-leading `.` segments, so
+        // only a LEADING `./` on a relative path ever reaches the filter —
+        // and Path equality is component-wise, so without the filter this
+        // returns `./data/logs` != `data/logs` and the assert fails.
+        assert_eq!(
+            pathlib_lexical(Path::new("./data/logs")),
+            PathBuf::from("data/logs")
+        );
+    }
+
     // --- config loading fallbacks -----------------------------------------
     #[test]
     fn missing_config_file_falls_back_to_local_default() {

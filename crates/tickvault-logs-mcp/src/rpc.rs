@@ -131,14 +131,35 @@ pub fn process_line(ctx: &Ctx, raw: &str) -> Option<Value> {
 /// The stdio loop: newline-delimited requests in, newline-delimited
 /// responses out, flush after every response (server.py flushes per
 /// write).
+///
+/// Lines are read as RAW BYTES (`read_until(b'\n')`) and converted with
+/// `from_utf8_lossy` — review round-2 fix: the previous `lines()` iterator
+/// yielded `Err(InvalidData)` on an invalid-UTF-8 line and silently broke
+/// the loop, dropping every SUBSEQUENT valid request (false-OK exit 0),
+/// where Python (surrogateescape locale) answers -32700 for the bad line
+/// and keeps serving. Valid UTF-8 input converts byte-identically, so
+/// existing byte-parity is untouched; an invalid-UTF-8 line becomes a
+/// `U+FFFD`-carrying string that fails JSON parse and rides the existing
+/// -32700 `id: null` path — Python's behavior class. Genuine I/O errors
+/// still end the loop.
 pub fn run_stdio_loop(ctx: &Ctx) {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    for line in stdin.lock().lines() {
-        let Ok(raw) = line else {
-            break;
-        };
+    run_loop(ctx, stdin.lock(), stdout.lock());
+}
+
+/// Generic body of [`run_stdio_loop`] over any reader/writer so the
+/// invalid-UTF-8 continuation behavior is unit-testable.
+fn run_loop<R: BufRead, W: Write>(ctx: &Ctx, mut input: R, mut out: W) {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        match input.read_until(b'\n', &mut buf) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break, // genuine I/O error — not a decode error
+        }
+        let raw = String::from_utf8_lossy(&buf);
         let Some(resp) = process_line(ctx, &raw) else {
             continue;
         };
@@ -281,5 +302,29 @@ mod tests {
         assert_eq!(parsed["match_count"], 0);
         // indent=2 shape.
         assert!(text.contains("\n  \""));
+    }
+
+    #[test]
+    fn invalid_utf8_line_answers_32700_and_loop_continues() {
+        // Review round-2 fix: an invalid-UTF-8 line must NOT silently end
+        // the loop — it answers -32700 (id null) and the NEXT valid
+        // request is still served (Python surrogateescape behavior class).
+        let ctx = test_ctx();
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"\xff\xfe{bad\n");
+        input.extend_from_slice(br#"{"id": 9, "method": "initialize"}"#);
+        input.push(b'\n');
+        let mut out: Vec<u8> = Vec::new();
+        run_loop(&ctx, std::io::Cursor::new(input), &mut out);
+        let text = String::from_utf8(out).unwrap();
+        let mut lines = text.lines();
+        let first: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(first["id"], Value::Null);
+        assert_eq!(first["error"]["code"], -32700);
+        assert_eq!(first["error"]["message"], "parse error");
+        let second: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(second["id"], 9);
+        assert_eq!(second["result"]["protocolVersion"], "2024-11-05");
+        assert!(lines.next().is_none(), "exactly two response lines");
     }
 }
