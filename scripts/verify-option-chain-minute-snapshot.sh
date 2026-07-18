@@ -52,9 +52,7 @@ run_check() {
   local verdict_fn="$3"
 
   local sql_enc
-  sql_enc=$(printf '%s' "$sql" | jq -sRr @uri 2>/dev/null || python3 -c \
-    'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""))' \
-    <<<"$sql")
+  sql_enc=$(printf '%s' "$sql" | jq -sRr @uri)
 
   local body
   if ! body=$(curl -fsS --max-time 5 "${QDB_URL}?query=${sql_enc}" 2>/dev/null); then
