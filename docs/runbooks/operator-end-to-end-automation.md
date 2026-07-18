@@ -296,7 +296,7 @@ Operator question: *"every day for extreme complete automation I need to provide
 
 ### Path 1 (the primary) — extending the MCP server
 
-Today `scripts/mcp-servers/tickvault-logs/server.py` exposes tools that read LOCAL `data/logs/*` files. Extension:
+Today the Rust-native MCP server (`crates/tickvault-logs-mcp/src/tools.rs`, launched via `scripts/mcp-servers/tickvault-logs-launch.sh` — the Python `server.py` was deleted in the 2026-07-18 Phase-2c cutover) exposes tools that read LOCAL `data/logs/*` files. Extension (pseudocode below predates the cutover):
 
 ```python
 # Pseudocode for the extension
