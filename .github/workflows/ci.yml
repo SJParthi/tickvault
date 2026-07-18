@@ -599,28 +599,24 @@ jobs:
         shell: bash
         run: make lambda-test
 
-      # QuestDB console lambda suites + deploy-gate scenario harness
-      # (2026-07-06 shell-hang fix; simplified in the 2026-07-08 closure
-      # pass). Before this step the console lambda Python suites ran in NO CI
-      # lane — a PR reverting the B4 r3 handler fix would merge with every
-      # check green. Both suites are stdlib-only (<1s) and run unconditionally
-      # inside this already-All-Green-gated job (a step in an existing needed
-      # job, NOT a new job — merge-gate-lock §5 forbids a PR-relevant job
-      # outside all-green's needs list). The harness self-extracts the
-      # console smoke-gate step from terraform-apply.yml and drives its
-      # decision tree end-to-end through stubbed terraform/aws/curl/sleep;
-      # it ABORTS loudly if the gate step is deleted or renamed. Honest
-      # residual: a `continue-on-error:` added to the gate step is NOT
-      # caught (the harness executes the step's script, not its YAML
-      # attributes), and nothing ratchets this ci.yml step's own existence.
-      - name: QuestDB console lambda unit tests (back + front)
+      # QuestDB console deploy-gate scenario harness (2026-07-06 shell-hang
+      # fix; simplified in the 2026-07-08 closure pass). 2026-07-18
+      # (rust-only phase 2b-3): the two console lambda Python unittest
+      # suites that used to run here were RETIRED with the handlers — the
+      # 31+61 tests are ported 1:1 into crates/aws-lambdas
+      # (qdb_console_proxy.rs / qdb_console_front.rs) and run in the
+      # Test (aws-lambdas-adjacent) cargo lanes. The two harnesses below
+      # remain: the smoke-gate harness self-extracts the console smoke-gate
+      # step from terraform-apply.yml and drives its decision tree
+      # end-to-end through stubbed terraform/aws/curl/sleep; it ABORTS
+      # loudly if the gate step is deleted or renamed. Honest residual: a
+      # `continue-on-error:` added to the gate step is NOT caught (the
+      # harness executes the step's script, not its YAML attributes), and
+      # nothing ratchets this ci.yml step's own existence.
+      - name: QuestDB console deploy-gate + all-green harnesses
         shell: bash
         run: |
           set -euo pipefail
-          for d in deploy/aws/lambda/questdb-console-proxy deploy/aws/lambda/questdb-console-front; do
-            echo "== ${d} =="
-            (cd "$d" && python3 -m unittest test_handler -v)
-          done
           echo "== questdb-console-gate-matrix.sh (terraform-apply.yml console smoke-gate scenarios) =="
           bash scripts/questdb-console-gate-matrix.sh
           echo "== all-green-equivalence-matrix.sh (all-green jq verdict vs frozen fixture table) =="
