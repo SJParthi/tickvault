@@ -1,7 +1,9 @@
 //! Loom concurrency tests for tick pipeline atomic patterns.
 //!
 //! The tick processor uses several shared atomic primitives across tasks:
-//! - `StorageGate` (`Arc<AtomicBool>`) — scheduler writes, tick processor reads
+//! - storage-gate `Arc<AtomicBool>` — writer opens/closes, tick processor reads
+//!   (the former `scheduler::StorageGate` module was DELETED 2026-07-18,
+//!   dead-code batch 2; the atomic PATTERN under test is unchanged)
 //! - Atomic tick counters — multiple producers increment, monitor reads
 //! - Connection health atomics — reconnection counter + state mutex
 //!
@@ -17,11 +19,11 @@ mod loom_tests {
     use loom::thread;
 
     // -----------------------------------------------------------------------
-    // StorageGate pattern: scheduler stores, tick processor loads
+    // storage-gate pattern: writer stores, tick processor loads
     // -----------------------------------------------------------------------
 
     /// Verifies that a gate opened by the scheduler is visible to the tick
-    /// processor across threads — mirrors the `StorageGate` pattern where
+    /// processor across threads — mirrors the storage-gate pattern where
     /// the scheduler opens/closes the gate and the tick processor checks it
     /// on every tick.
     #[test]
