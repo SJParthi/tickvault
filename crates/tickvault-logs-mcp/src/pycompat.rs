@@ -201,6 +201,40 @@ pub fn decode_utf8_replace(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// Python `json.dumps(..., ensure_ascii=True)` (the DEFAULT) emulation —
+/// review r8, 2026-07-18: post-process a serde_json dump so every char at
+/// or above U+007F becomes CPython's `\uXXXX` escape (lowercase 4-digit
+/// hex; astral chars as a UTF-16 surrogate PAIR: U+1D54A becomes
+/// backslash-u d835 then backslash-u dd4a — both verified against
+/// CPython 3.x `json.dumps`). CPython also escapes DEL (U+007F) as
+/// backslash-u 007f, which serde leaves raw, so the boundary is
+/// `>= 0x7f`, not strictly-greater.
+///
+/// Safe as a post-pass, never double-escaping: serde_json escapes only
+/// `"`/`\`/controls < 0x20 (short forms `\"` `\\` `\b` `\f` `\n` `\r`
+/// `\t`, else lowercase `\u00XX` — the SAME forms CPython emits), so
+/// every escape sequence in serde output is pure ASCII < 0x7F, and any
+/// char >= U+007F is always literal string content.
+pub fn ensure_ascii(s: &str) -> String {
+    if s.bytes().all(|b| b < 0x7f) {
+        return s.to_string();
+    }
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if (c as u32) < 0x7f {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                // Infallible: fmt::Write for String never errors.
+                let _ignored = write!(out, "\\u{unit:04x}");
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +298,55 @@ mod tests {
     fn utf8_ignore_drops_invalid_bytes() {
         assert_eq!(decode_utf8_ignore(b"ab\xffcd"), "abcd");
         assert_eq!(decode_utf8_replace(b"ab\xffcd"), "ab\u{fffd}cd");
+    }
+
+    // Review r8 (2026-07-18): goldens below are CPython outputs, derived
+    // by running `python3 -c "import json; print(json.dumps(...))"`
+    // (CPython 3.x, 2026-07-18) and pasting the results verbatim.
+    #[test]
+    fn ensure_ascii_matches_python_json_dumps_golden() {
+        // python3: json.dumps({"text": "ASCII é — 日本語 𝕊 \x01 end"},
+        // indent=2) ==
+        // '{\n  "text": "ASCII \\u00e9 \\u2014 \\u65e5\\u672c\\u8a9e
+        //  \\ud835\\udd4a \\u0001 end"\n}'
+        let v = serde_json::json!({"text": "ASCII \u{e9} \u{2014} \u{65e5}\u{672c}\u{8a9e} \u{1d54a} \u{1} end"});
+        let dumped = ensure_ascii(&serde_json::to_string_pretty(&v).unwrap());
+        assert_eq!(
+            dumped,
+            "{\n  \"text\": \"ASCII \\u00e9 \\u2014 \\u65e5\\u672c\\u8a9e \\ud835\\udd4a \\u0001 end\"\n}"
+        );
+    }
+
+    #[test]
+    fn ensure_ascii_del_and_boundary_chars() {
+        // python3: json.dumps('~\x7f\x80\xa0') == '"~\\u007f\\u0080\\u00a0"'
+        // — DEL (0x7f) IS escaped by CPython; serde leaves it raw.
+        let v = serde_json::Value::String("~\u{7f}\u{80}\u{a0}".to_string());
+        assert_eq!(
+            ensure_ascii(&serde_json::to_string(&v).unwrap()),
+            "\"~\\u007f\\u0080\\u00a0\""
+        );
+        // python3: json.dumps('𝕊') == '"\\ud835\\udd4a"' — lowercase
+        // surrogate PAIR for an astral char.
+        let astral = serde_json::Value::String("\u{1d54a}".to_string());
+        assert_eq!(
+            ensure_ascii(&serde_json::to_string(&astral).unwrap()),
+            "\"\\ud835\\udd4a\""
+        );
+    }
+
+    #[test]
+    fn ensure_ascii_pure_ascii_passthrough_never_double_escapes() {
+        // serde's own escapes (controls, quote, backslash) are all-ASCII
+        // and identical to CPython's — python3: json.dumps('\x01\x1f"\\\t')
+        // == '"\\u0001\\u001f\\"\\\\\\t"'. The post-pass must leave them
+        // untouched, including an already-escaped backslash-u2014
+        // 6-char literal sequence.
+        let v = serde_json::Value::String("\u{1}\u{1f}\"\\\t".to_string());
+        let dumped = serde_json::to_string(&v).unwrap();
+        assert_eq!(dumped, "\"\\u0001\\u001f\\\"\\\\\\t\"");
+        assert_eq!(ensure_ascii(&dumped), dumped);
+        let already = "\"a\\u2014b\"";
+        assert_eq!(ensure_ascii(already), already);
     }
 }

@@ -85,10 +85,16 @@ pub fn handle_request(ctx: &Ctx, req: &Value) -> Option<Value> {
             match tools::call_tool(ctx, name, &arguments) {
                 Some(Ok(result)) => {
                     // Python: json.dumps(result, indent=2) — 2-space
-                    // indent, ": " separators; serde_json pretty matches
-                    // the shape (key ORDER differs: sorted vs insertion —
-                    // the harness's documented normalization).
-                    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+                    // indent, ": " separators, ensure_ascii=True (the
+                    // default). serde_json pretty matches the shape and
+                    // escape forms; the ensure_ascii post-pass (review
+                    // r8, 2026-07-18) matches the non-ASCII escaping
+                    // too, so only key ORDER differs (sorted vs
+                    // insertion — the harness's documented
+                    // normalization).
+                    let text = crate::pycompat::ensure_ascii(
+                        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+                    );
                     Some(envelope_result(
                         &id,
                         json!({"content": [{"type": "text", "text": text}]}),
@@ -164,6 +170,14 @@ fn run_loop<R: BufRead, W: Write>(ctx: &Ctx, mut input: R, mut out: W) {
             continue;
         };
         if let Ok(s) = serde_json::to_string(&resp) {
+            // Python's envelope writes (_respond/_respond_error) use
+            // json.dumps with the ensure_ascii=True default too, so the
+            // same post-pass applies to the whole wire line (review r8,
+            // 2026-07-18). Tool-result inner text is already ASCII by
+            // then; this covers envelope-level non-ASCII (e.g. a
+            // client-supplied non-ASCII tool name echoed into an error
+            // message).
+            let s = crate::pycompat::ensure_ascii(&s);
             // Deliberate deviation (ledger in lib.rs): a stdout write
             // failure (broken pipe) is swallowed and the loop runs to
             // stdin EOF + exit 0; CPython dies exit 1 with a
@@ -331,5 +345,74 @@ mod tests {
         assert_eq!(second["id"], 9);
         assert_eq!(second["result"]["protocolVersion"], "2024-11-05");
         assert!(lines.next().is_none(), "exactly two response lines");
+    }
+
+    #[test]
+    fn inner_text_is_ensure_ascii_escaped_like_python_json_dumps() {
+        // Review r8 (2026-07-18): a runbook carrying an em-dash + an
+        // astral char must reach the inner tool-result text as CPython
+        // json.dumps (ensure_ascii=True) escapes — never raw UTF-8.
+        // Golden fragment derived from python3 json.dumps (2026-07-18):
+        // '—' -> the 6-char literal backslash-u2014, '𝕊' -> the
+        // surrogate pair backslash-ud835 backslash-udd4a.
+        let ctx = test_ctx();
+        let runbooks = ctx.repo_root.join("docs").join("runbooks");
+        let _ignored = std::fs::create_dir_all(&runbooks);
+        std::fs::write(
+            runbooks.join("r8-ensure-ascii-unit.md"),
+            "R8-UNIT-01 em\u{2014}dash and astral \u{1d54a}\n",
+        )
+        .unwrap();
+        let resp = handle_request(
+            &ctx,
+            &json!({
+                "id": 10,
+                "method": "tools/call",
+                "params": {"name": "find_runbook_for_code", "arguments": {"code": "R8-UNIT-01"}},
+            }),
+        )
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("em\\u2014dash and astral \\ud835\\udd4a"),
+            "inner text not python-escaped: {text}"
+        );
+        assert!(
+            text.bytes().all(|b| b < 0x7f),
+            "inner text must be pure ASCII after ensure_ascii: {text}"
+        );
+        // Round-trips to the original content for JSON-parsing clients.
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let preview = parsed["matches"][0]["preview"].as_str().unwrap();
+        assert_eq!(preview, "R8-UNIT-01 em\u{2014}dash and astral \u{1d54a}");
+        let _ignored = std::fs::remove_dir_all(ctx.repo_root.join("docs"));
+    }
+
+    #[test]
+    fn envelope_line_is_ensure_ascii_escaped_like_python_json_dumps() {
+        // Review r8 (2026-07-18): python's _respond/_respond_error dumps
+        // use ensure_ascii=True too — a non-ASCII tool name echoed into
+        // the -32601 message must ride the wire escaped
+        // (python3 json.dumps('na\u{ef}ve') escapes to backslash-u00ef).
+        let ctx = test_ctx();
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(
+            format!(
+                "{}\n",
+                json!({"id": 11, "method": "tools/call", "params": {"name": "na\u{ef}ve"}})
+            )
+            .as_bytes(),
+        );
+        let mut out: Vec<u8> = Vec::new();
+        run_loop(&ctx, std::io::Cursor::new(input), &mut out);
+        let line = String::from_utf8(out).unwrap();
+        assert!(
+            line.contains("unknown tool: na\\u00efve"),
+            "envelope not python-escaped: {line}"
+        );
+        assert!(
+            line.bytes().all(|b| b < 0x7f),
+            "wire line must be pure ASCII after ensure_ascii: {line}"
+        );
     }
 }

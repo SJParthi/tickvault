@@ -75,6 +75,24 @@
 //!     <= 999999999"), and "date value out of range" for cutoffs
 //!     outside Python's year 1..=9999 — and the server keeps serving.
 //!     No residual.
+//!   - Non-ASCII JSON escaping (`json.dumps` `ensure_ascii=True`):
+//!     PARITY-MATCHED since review r8 (2026-07-18) — the inner
+//!     tool-result text, the outer JSON-RPC envelope line, and the
+//!     self-test demo blocks all pass through
+//!     `pycompat::ensure_ascii`, replicating CPython's default escaping
+//!     (every char >= U+007F, DEL included, as lowercase `\uXXXX`;
+//!     astral chars as UTF-16 surrogate pairs). Previously raw UTF-8
+//!     rode the wire (e.g. a runbook em-dash), a byte divergence the
+//!     harness's inner canonicalization absorbed but real-transcript
+//!     byte diffing showed. Verified live: the inner tool-result text
+//!     for find_runbook_for_code("WS-GAP-05") over the real repo is now
+//!     byte-identical to server.py's. No ESCAPING residual on the stdio
+//!     wire; the envelope's key ORDER (insertion vs sorted) and compact
+//!     vs `", "`/`": "` separators remain the pre-existing documented
+//!     canonicalization, unrelated to escaping. Outbound HTTP request
+//!     bodies (CloudWatch filterPattern) remain raw UTF-8 vs Python's
+//!     escaped form — semantically identical JSON, each side signs its
+//!     own bytes, not part of the parity wire.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]

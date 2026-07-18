@@ -16,7 +16,11 @@ use crate::pycompat::py_slice_chars;
 use crate::tools;
 
 fn dumps_indent2(v: &Value) -> String {
-    serde_json::to_string_pretty(v).unwrap_or_default()
+    // Python's demo blocks are json.dumps(..., indent=2) with the
+    // ensure_ascii=True default; the [:400] slice runs over the ESCAPED
+    // string, so escape BEFORE the caller's py_slice_chars (review r8,
+    // 2026-07-18).
+    crate::pycompat::ensure_ascii(&serde_json::to_string_pretty(v).unwrap_or_default())
 }
 
 /// Python's novel-demo compaction: keep every top-level key, but replace

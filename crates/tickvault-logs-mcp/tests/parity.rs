@@ -209,6 +209,18 @@ fn build_fixtures(fixture_root: &Path) {
         &fixture_root.join("outside-grep").join("needle.txt"),
         "TV_PARITY_OUTSIDE_NEEDLE one line\n",
     );
+    // Review r8 ensure_ascii fixture: a runbook whose preview carries an
+    // em-dash, é, CJK and an ASTRAL char, scanned by session E (which
+    // roots BOTH servers at the fixture tree). Exactly ONE file matches
+    // the code, so the matches order is moot and the RAW inner text is
+    // byte-comparable.
+    write(
+        &fixture_root
+            .join("docs")
+            .join("runbooks")
+            .join("r8-ensure-ascii.md"),
+        "# R8 ensure_ascii parity fixture\n\ncontext before \u{2014} \u{e9}\nR8-ASCII-01 \u{2014} em-dash \u{e9} \u{65e5}\u{672c}\u{8a9e} \u{1d54a}\ncontext after\n",
+    );
     write(
         &logs.join("app.2026-07-18.log"),
         "boot step 1 config ok\nboot step 2 observability ok\nboot step 3 logging ok\nboot step 4 notification ok\nboot step 5 auth ok\nboot step 6 questdb ddl ok\nboot step 7 universe locked\nboot step 8 api listening\n",
@@ -430,6 +442,53 @@ impl Session {
         self.next_id += 1;
         let req = json!({"jsonrpc": "2.0", "id": self.next_id, "method": method});
         self.step(label, case, req, None);
+    }
+
+    /// Review r8: like `call`, but compares the inner `content[0].text`
+    /// payloads RAW — no inner canonicalization — so the ensure_ascii
+    /// escaping path is byte-pinned, not absorbed. Only valid for steps
+    /// whose Python insertion key order coincides with serde's sorted
+    /// order (find_runbook_for_code: code/match_count/matches and
+    /// file/first_line/preview are both coincidentally alphabetical)
+    /// with at most ONE match (traversal order moot).
+    fn call_raw_text(&mut self, tool: &str, case: &'static str, args: Value) {
+        self.next_id += 1;
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": args},
+        });
+        let py_resp = self.py.request(&req);
+        let rs_resp = self.rs.request(&req);
+        let extract = |resp: &Value, label: &str| -> String {
+            resp.pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{label}: no content text: {resp}"))
+                .to_string()
+        };
+        let py_text = extract(&py_resp, "python");
+        let rs_text = extract(&rs_resp, "rust");
+        // Non-vacuity: Python really escaped the fixture's non-ASCII —
+        // the em-dash rides as the 6-char backslash-u2014 literal, the
+        // astral char as a lowercase surrogate PAIR, and the payload is
+        // pure ASCII (so a raw-UTF-8 regression can never pass).
+        assert!(
+            py_text.contains("\\u2014") && py_text.contains("\\ud835\\udd4a"),
+            "python inner text lost its ensure_ascii escapes: {py_text}"
+        );
+        assert!(
+            py_text.bytes().all(|b| b < 0x7f),
+            "python inner text not pure ASCII: {py_text}"
+        );
+        let ok = py_text == rs_text;
+        self.rows.push(Row {
+            session: self.session,
+            tool: format!("{tool} (raw bytes)"),
+            case,
+            ok,
+            diff: if ok { None } else { Some((py_text, rs_text)) },
+        });
     }
 }
 
@@ -814,6 +873,66 @@ fn parity_transcript() {
         s.rpc("(rpc)", "initialize", "initialize");
         s.call("tail_errors", "config-file dotted logs dir", json!({}));
         s.call("summary_snapshot", "config-file dotted logs dir", json!({}));
+        rows.append(&mut s.rows);
+    }
+
+    // ------------------------------------------------------------------
+    // Session E — review r8 ensure_ascii RAW-byte pin. find_runbook must
+    // scan a DETERMINISTIC runbook tree (the real repo's rules churn), so
+    // the Python child runs a runtime COPY of server.py placed inside
+    // the fixture tree — its `__file__`-derived repo root becomes the
+    // fixture root (the shim precedent: runtime-generated, never
+    // committed) — and the Rust child is pinned to the same root via
+    // TICKVAULT_MCP_REPO_ROOT.
+    // ------------------------------------------------------------------
+    {
+        let real_server = repo_root()
+            .join("scripts")
+            .join("mcp-servers")
+            .join("tickvault-logs")
+            .join("server.py");
+        let server_copy = fixture_root
+            .join("scripts")
+            .join("mcp-servers")
+            .join("tickvault-logs")
+            .join("server.py");
+        std::fs::create_dir_all(server_copy.parent().unwrap()).expect("mkdir server copy");
+        std::fs::copy(&real_server, &server_copy).expect("copy server.py into fixture tree");
+        let py = McpChild::spawn(
+            "python[E]",
+            &python3(),
+            &[server_copy.to_string_lossy().into_owned()],
+            &common,
+        );
+        // Match Python's Path(__file__).resolve()-derived root exactly
+        // (symlinked temp dirs), like spawn_session does for the repo.
+        let fixture_resolved = fixture_root
+            .canonicalize()
+            .unwrap_or_else(|_| fixture_root.clone());
+        let mut rs_envs = common.clone();
+        rs_envs.push((
+            "TICKVAULT_MCP_REPO_ROOT".to_string(),
+            fixture_resolved.to_string_lossy().into_owned(),
+        ));
+        let rs = McpChild::spawn(
+            "rust[E]",
+            Path::new(env!("CARGO_BIN_EXE_tickvault-logs-mcp")),
+            &[],
+            &rs_envs,
+        );
+        let mut s = Session {
+            py,
+            rs,
+            next_id: 0,
+            session: "E",
+            rows: Vec::new(),
+        };
+        s.rpc("(rpc)", "initialize", "initialize");
+        s.call_raw_text(
+            "find_runbook_for_code",
+            "non-ASCII runbook preview → ensure_ascii raw bytes",
+            json!({"code": "R8-ASCII-01"}),
+        );
         rows.append(&mut s.rows);
     }
 
