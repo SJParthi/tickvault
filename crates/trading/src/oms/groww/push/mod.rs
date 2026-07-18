@@ -23,7 +23,7 @@
 //!   ([`runner`]) — the Stage D app consumer wires its spawn behind the
 //!   `order_push_enabled` config gate; nothing in this crate spawns it.
 //!
-//! # Module layout (9 files)
+//! # Module layout (10 files)
 //! | File | Contents |
 //! |---|---|
 //! | [`nats`] | bounds-checked NATS text-protocol framing parser + frame builders |
@@ -33,7 +33,8 @@
 //! | [`subjects`] | order/position update subject builders (`…updates.apex.<subscriptionId>`) |
 //! | [`proto`] | protobuf decoders for `OrderDetailsBroadCastDto` + `PositionDetailProto` |
 //! | [`order_mapper`] | pure total mapper: `OrderDetailsBroadCastDto` → the neutral `BrokerOrderEvent` seam (Stage C) |
-//! | [`position`] | position updates: decode + count + log ONLY (the table write is a later session; Stage C) |
+//! | [`position`] | position updates: decode + count + log + best-effort full-fidelity capture (Stage C; capture 2026-07-18) |
+//! | [`order_events`] | full-fidelity capture builders + the bounded [`GrowwPushCapture`] producer sink (`ORDER-EVT-01`, 2026-07-18) |
 //! | [`runner`] | the supervised bootstrap + read-loop runner (`GROWW-PUSH-01..04` taxonomy; Stage C) |
 //!
 //! # Secrets
@@ -51,6 +52,7 @@
 pub mod connect;
 pub mod nats;
 pub mod nkey;
+pub mod order_events;
 pub mod order_mapper;
 pub mod position;
 pub mod proto;
@@ -68,3 +70,9 @@ pub use socket_token::SocketTokenError;
 pub use order_mapper::{map_order_broadcast, map_order_detail};
 pub use position::{PositionHandleOutcome, handle_position_payload};
 pub use runner::{GrowwAccessTokenProvider, run_groww_push_supervised};
+
+// Full-fidelity capture lane (ORDER-EVT-01, 2026-07-18): the bounded
+// producer sink the app consumer constructs + the pure record builders.
+pub use order_events::{
+    GrowwPushCapture, build_groww_order_event_record, build_groww_position_event_record,
+};

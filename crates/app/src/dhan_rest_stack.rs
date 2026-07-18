@@ -206,6 +206,13 @@ pub struct DhanRestStackParams {
     /// `spawn_token_health_writer` died with the lane, and without a writer
     /// GET /health would report the token invalid forever.
     pub health: tickvault_api::state::SharedHealthStatus,
+    /// Full-fidelity `order_update_events` capture sender (ORDER-EVT-01,
+    /// 2026-07-18) — handed to the Phase 5a paper consumer so every Dhan
+    /// order push lands one forensic capture record alongside the paper
+    /// audit row. `None` = the capture subsystem is disabled (config).
+    pub order_update_events_tx: Option<
+        tokio::sync::mpsc::Sender<tickvault_common::broker_order_events::OrderUpdateEventRecord>,
+    >,
 }
 
 /// Cadence (seconds) of the /health token-block writer (PR-C2 re-home of
@@ -784,6 +791,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 config.questdb.clone(),
                 order_push_sender.clone(),
                 first_push_rx,
+                params.order_update_events_tx.clone(),
             );
         // The 2026-07-14 Dhan noise lock stands: this socket pages NOTHING —
         // NO NotificationService is handed to the connection.
