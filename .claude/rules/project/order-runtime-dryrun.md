@@ -163,6 +163,18 @@ returns before any broker REST reconcile (engine.rs ~:1271), so the
 hazard is live-mode-only. The hazard site carries a matching in-code
 comment block. **No `dry_run = false` flip without one of the fix
 directions landed.**
+**2026-07-18 update — direction (a) LANDED; this mandatory-pre-live item
+is CLOSED:** the reconcile non-terminal arm now REFUSES the downward
+`traded_qty` copy (mirroring the C2 WS-side monotone guard's comparison
+semantics): the local `(traded_qty, avg_traded_price)` pair stands,
+`needs_reconciliation` stays `true` (a refused correction is NOT
+consumed), and ONE coded `error!(code = OMS-GAP-02)` divergence line
+names the order id + local vs broker qty. Upward/equal copies and the
+terminal arms are unchanged; the dry-run early return still precedes
+every correction. Bite-proven test:
+`live_mode_reconcile_refuses_downward_copy_no_double_fill`
+(engine.rs test module — pre-fix it double-emitted a `FillEvent` on WS
+redelivery; post-fix the redelivery is delta 0 / `None`).
 
 ## §4. Scope guard — EXPLICITLY OUT (a violating PR is REJECTED)
 
