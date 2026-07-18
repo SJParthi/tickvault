@@ -20,6 +20,8 @@ We have isolated the root cause of our 2+ week depth-200 disconnect issue (origi
 | SDK | `dhanhq==2.2.0rc1` (your official Python package) |
 | Test script | `scripts/dhan-200-depth-repro/check_depth_200.py` (in our repo) |
 
+> (2026-07-18: the test script named above was removed from the tree in the Rust-only purge; retrieve it via git history at any pre-2026-07-18 commit.)
+
 ---
 
 ## The smoking gun — same script, same SID, only the token source changed
