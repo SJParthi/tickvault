@@ -43,7 +43,7 @@ of the file layer. On AWS, CloudWatch alarms flow into an opt-in
 Lambda that runs `tmux send-keys` to trigger a Claude Code session
 on the EC2 instance. Every layer has a pinned Rust meta-guard
 blocking regression. Validation: `make validate-automation` runs
-28 checks in 30 seconds.
+25 checks in 30 seconds.
 
 ## Visual flow (ASCII)
 
@@ -113,7 +113,7 @@ AWS path (opt-in):
 | 8.1 | `a3145e9`, `a81206f` | `scripts/auto-fix-{restart-depth,refresh-instruments,clear-spill}.sh`. |
 | 8.2 | `c68346d` | `deploy/aws/lambda/claude-triage/` Lambda + `claude-triage-lambda.tf` (opt-in); 7-test `claude_triage_lambda_guard`. _(RETIRED 2026-07-18 — claude-triage lambda deleted in the Rust-only purge, never provisioned (0 of 13 AWS functions); the guard was deleted with it. See git history.)_ |
 | 9.1 | `1cdd78a` | `operator-health.json` single-page Grafana dashboard (14 panels); 7-test `operator_health_dashboard_guard`. _(RETIRED in the CloudWatch-only migration #O1; the dashboard tree + its guard were deleted. CloudWatch Dashboards replace operator visualization in prod.)_ |
-| 9.2 | `a81206f`, extended each phase | `scripts/validate-automation.sh` + `make validate-automation` — 28 end-to-end checks. |
+| 9.2 | `a81206f`, extended each phase | `scripts/validate-automation.sh` + `make validate-automation` — 25 end-to-end checks. |
 | 10.1 | `275157a` | `zero_tick_loss_alert_guard` — pins tick-loss metric emissions + buffer capacity constant + doc coherence. _(Post #O3 the 4 Prometheus alert-rule assertions were removed when the Prometheus container retired; the early-warning signal moved to CloudWatch Alarms over the same metrics, which the guard still pins as EMITTED.)_ |
 | 11 | `897f7b6` | `resilience_sla_alert_guard` — 6 tests pin WS/QuestDB/Valkey SLA alerts. |
 | 12.1 | existing `quality/crate-coverage-thresholds.toml` | 100% line-coverage floor per crate, enforced by `scripts/coverage-gate.sh`. |
@@ -140,7 +140,7 @@ AWS path (opt-in):
 | Operator dashboard (current) | CloudWatch Dashboards _(the local Grafana `operator-health.json` + its tree were retired #O1)_ |
 | Validate automation | `scripts/validate-automation.sh` |
 
-## All 28 validate-automation.sh checks
+## All 25 validate-automation.sh checks
 
 Run `make validate-automation` to exercise all of these in ~30 seconds.
 
