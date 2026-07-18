@@ -140,142 +140,198 @@ if [ -z "$DEFAULT_THRESHOLD" ]; then
   DEFAULT_THRESHOLD="99.0"
 fi
 
-# Extract per-crate coverage from llvm-cov JSON using python3 (available on GHA runners)
-# llvm-cov JSON format: { "data": [ { "files": [ { "filename": "...", "summary": { "lines": { "percent": N } } } ] } ] }
+# Extract per-crate coverage from llvm-cov JSON using jq, then enforce the
+# thresholds in awk with EXACT scaled-integer arithmetic (rust-only purge
+# Phase 2a-2, 2026-07-18: replaces the inline python3/Fraction block — same
+# semantics, same output, same exit codes).
+# llvm-cov JSON format: { "data": [ { "files": [ { "filename": "...", "summary": { "lines": { "count": N, "covered": M } } } ] } ] }
 #
-# 2026-07-10: file paths + default threshold are passed via ENVIRONMENT, not
-# interpolated into the python source — a path containing a quote can no
-# longer break/inject the python program (adversarial-review MEDIUM).
-TV_GATE_COVERAGE_JSON="$COVERAGE_JSON" \
-TV_GATE_THRESHOLDS_FILE="$THRESHOLDS_FILE" \
-TV_GATE_DEFAULT_THRESHOLD="$DEFAULT_THRESHOLD" \
-python3 -c "
-import json, sys, re, os
-from fractions import Fraction
+# EXACTNESS CONTRACT (unchanged from the Fraction implementation this
+# replaces): thresholds are EXACT decimals, never binary floats. A computed
+# pct like covered/count*100.0 for a ratio of exactly 0.995 evaluates to
+# 99.49999999999999 in binary float and would FAIL a >= 99.5 gate even
+# though the true value EQUALS the threshold. A ratchet floor means 'at
+# least the threshold' — exact-equal MUST pass. The comparison below is
+# therefore integer CROSS-MULTIPLICATION: with threshold = T/10^d
+# (T, d integers parsed from the decimal string),
+#     covered*100/count >= T/10^d   <=>   covered*100*10^d >= T*count
+# All operands are integers far below 2^53 (d capped at 6; line counts are
+# ~1e6-class), so awk's IEEE doubles represent every term EXACTLY and the
+# comparison is exact rational arithmetic — no rounding anywhere. The
+# 2-decimal pct shown in the report is display-only, never compared.
+#
+# File paths + the default threshold are passed via awk -v / argv, never
+# interpolated into the program text (the 2026-07-10 injection posture kept).
 
-with open(os.environ['TV_GATE_COVERAGE_JSON']) as f:
-    data = json.load(f)
+TSV_FILE="$(mktemp)"
+trap 'rm -f "$TSV_FILE"' EXIT
 
-# Parse thresholds TOML (simple key=value parser — no toml library needed).
-# Thresholds are kept as EXACT decimals (Fraction), never binary floats:
-# float('99.5') is exact, but a computed pct like covered/count*100.0 for a
-# ratio of exactly 0.995 evaluates to 99.49999999999999 in binary float and
-# would FAIL a >= 99.5 gate even though the true value EQUALS the threshold.
-# A ratchet floor means 'at least the threshold' — exact-equal MUST pass, so
-# the comparison below is done in exact rational arithmetic.
-thresholds = {}
-default_threshold = Fraction(os.environ['TV_GATE_DEFAULT_THRESHOLD'])
-in_crates = False
-with open(os.environ['TV_GATE_THRESHOLDS_FILE']) as f:
-    for line in f:
-        line = line.strip()
-        # Skip comment/blank lines (2026-07-10): a future '# floor = x'
-        # comment inside [crates] must not become a garbage 'missing crate'
-        # or crash Fraction() with a ValueError.
-        if not line or line.startswith('#'):
-            continue
-        if line == '[crates]':
-            in_crates = True
-            continue
-        if line.startswith('[') and line != '[crates]':
-            in_crates = False
-            continue
-        if in_crates and '=' in line:
-            key, val = line.split('=', 1)
-            thresholds[key.strip()] = Fraction(val.strip())
+jq -r '
+  (.data // [])[]
+  | (.files // [])[]
+  | [ (.filename // ""),
+      (.summary.lines.count // 0),
+      (.summary.lines.covered // 0) ]
+  | @tsv
+' "$COVERAGE_JSON" > "$TSV_FILE"
 
-# FAIL-CLOSED (2026-07-10, adversarial-review HIGH): zero parsed [crates]
-# entries would make the crate-presence assert below vacuous (nothing to
-# require) and silently collapse EVERY crate onto the default floor. The
-# thresholds file always lists the workspace crates (also pinned by
-# crates/common/tests/coverage_threshold_lockdown.rs).
-if not thresholds:
-    print('  ERROR: parsed 0 entries from the [crates] section of the thresholds TOML —')
-    print('         refusing vacuous crate-presence pass. Check ' + os.environ['TV_GATE_THRESHOLDS_FILE'])
-    sys.exit(1)
+LC_ALL=C awk -F'\t' \
+  -v tf="$THRESHOLDS_FILE" \
+  -v default_thr="$DEFAULT_THRESHOLD" \
+'
+function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+# parse_dec: parse a decimal string like "99.5" into G_scaled/G_pow so that
+# value == G_scaled / G_pow, all-integer. Dies loudly on anything that is
+# not a plain non-negative decimal (the old Fraction() call crashed there).
+function parse_dec(v,   ip, fp, i) {
+  if (v !~ /^[0-9]+(\.[0-9]+)?$/) {
+    print "  ERROR: invalid threshold value (expected a plain decimal): " v
+    died = 1; exit 1
+  }
+  if (v ~ /\./) {
+    ip = v; sub(/\..*$/, "", ip)
+    fp = v; sub(/^[^.]*\./, "", fp)
+  } else { ip = v; fp = "" }
+  if (length(fp) > 6) {
+    # keeps every term of the cross-multiplication exactly below 2^53
+    print "  ERROR: threshold has more than 6 decimal places: " v
+    died = 1; exit 1
+  }
+  G_pow = 1
+  for (i = 0; i < length(fp); i++) G_pow *= 10
+  G_scaled = ip * G_pow + (fp == "" ? 0 : fp + 0)
+}
+# frepr: render a decimal threshold string the way python float repr did
+# ("50" -> "50.0", "99.50" -> "99.5", "63.3" -> "63.3") — display only.
+function frepr(v,   s) {
+  s = v
+  if (s !~ /\./) return s ".0"
+  sub(/0+$/, "", s)
+  if (s ~ /\.$/) s = s "0"
+  return s
+}
+function sort_keys(arr, out,   k, n, i, j, t) {
+  n = 0
+  for (k in arr) out[++n] = k
+  for (i = 2; i <= n; i++) {
+    t = out[i]
+    for (j = i - 1; j >= 1 && out[j] > t; j--) out[j + 1] = out[j]
+    out[j + 1] = t
+  }
+  return n
+}
+# ---- thresholds TOML (simple key=value parser — comment/blank lines and
+# ---- non-[crates] sections skipped, exactly as before) ----
+FILENAME == tf {
+  line = trim($0)
+  if (line == "" || line ~ /^#/) next
+  if (line == "[crates]") { in_crates = 1; next }
+  if (line ~ /^\[/) { in_crates = 0; next }
+  if (in_crates && index(line, "=") > 0) {
+    eq = index(line, "=")
+    key = trim(substr(line, 1, eq - 1))
+    val = trim(substr(line, eq + 1))
+    parse_dec(val)   # validate loudly at parse time
+    thr_raw[key] = val
+  }
+  next
+}
+# ---- coverage TSV: aggregate per-crate (first "crates/<name>/" segment,
+# ---- leftmost match — the re.search semantics; absolute paths supported) ----
+{
+  fn = $1; count = $2 + 0; covered = $3 + 0
+  if (match(fn, /crates\/[^\/]+\//)) {
+    name = substr(fn, RSTART + 7, RLENGTH - 8)
+    cnt[name] += count
+    cov[name] += covered
+  }
+}
+END {
+  if (died) exit 1
 
-# Aggregate per-crate: group files by crate name (crates/<name>/...)
-crate_lines = {}
-for entry in data.get('data', []):
-    for file_info in entry.get('files', []):
-        filename = file_info.get('filename', '')
-        summary = file_info.get('summary', {}).get('lines', {})
-        count = summary.get('count', 0)
-        covered = summary.get('covered', 0)
+  # default threshold must itself be a valid decimal
+  parse_dec(default_thr)
 
-        # Extract crate name from path: .../crates/<crate_name>/src/...
-        # cargo-llvm-cov emits ABSOLUTE paths (/home/runner/work/.../crates/...),
-        # so this must be re.search, NOT re.match (start-anchored re.match
-        # matched zero files and made the gate pass vacuously — see
-        # .claude/plans/research/coverage-gaps.md §2, GAP #0).
-        match = re.search(r'crates/([^/]+)/', filename)
-        if match:
-            crate_name = match.group(1)
-            if crate_name not in crate_lines:
-                crate_lines[crate_name] = {'count': 0, 'covered': 0}
-            crate_lines[crate_name]['count'] += count
-            crate_lines[crate_name]['covered'] += covered
+  nthr = 0; for (k in thr_raw) nthr++
+  # FAIL-CLOSED (2026-07-10, adversarial-review HIGH): zero parsed [crates]
+  # entries would make the crate-presence assert below vacuous and silently
+  # collapse EVERY crate onto the default floor.
+  if (nthr == 0) {
+    print "  ERROR: parsed 0 entries from the [crates] section of the thresholds TOML —"
+    print "         refusing vacuous crate-presence pass. Check " tf
+    exit 1
+  }
 
-# FAIL-CLOSED: an empty aggregation map means the report's paths matched no
-# crate at all — checking nothing must never count as passing (audit-findings
-# Rule 11: no false-OK signals).
-if not crate_lines:
-    print('  ERROR: gate matched 0 files under crates/ — refusing vacuous pass.')
-    print('         (coverage JSON paths did not contain \"crates/<name>/\")')
-    sys.exit(1)
+  nrep = 0; for (k in cnt) nrep++
+  # FAIL-CLOSED: an empty aggregation map means the report paths matched no
+  # crate at all — checking nothing must never count as passing (Rule 11).
+  if (nrep == 0) {
+    print "  ERROR: gate matched 0 files under crates/ — refusing vacuous pass."
+    print "         (coverage JSON paths did not contain \"crates/<name>/\")"
+    exit 1
+  }
 
-# CRATE-PRESENCE ASSERT (2026-07-10, audit follow-up row 9 — Rule 11
-# false-OK class): every crate listed in the thresholds TOML MUST be
-# present in the parsed report. Before this assert, a crate that silently
-# vanished from the report (renamed crate directory, an llvm-cov
-# flag/--ignore-filename-regex change, or a partial run) was simply never
-# iterated by the loop below — its floor passed VACUOUSLY while the
-# all-crates-vanished check above stayed green. Fail-closed: any missing
-# crate hard-fails the gate and is named loudly.
-missing = sorted(c for c in thresholds if c not in crate_lines)
-if missing:
-    for crate_name in missing:
-        print(f'  MISSING: {crate_name:15s} listed in thresholds TOML but ABSENT from the coverage report')
-    print('')
-    print('  ERROR: crate-presence assert FAILED — refusing vacuous pass for the crate(s) above.')
-    print('         Causes: crate renamed/removed (update quality/crate-coverage-thresholds.toml')
-    print('         in the same PR), an llvm-cov flag/filter change, or a partial coverage run.')
-    sys.exit(1)
+  tn = sort_keys(thr_raw, tkeys)
+  rn = sort_keys(cnt, rkeys)
 
-# Inverse direction (warn-only, 2026-07-10): a crate present in the report
-# but NOT in the thresholds TOML is still enforced at the default floor by
-# the loop below — but a new crate should get an explicit ratcheted floor,
-# so name it loudly here instead of letting it ride the default silently.
-for crate_name in sorted(c for c in crate_lines if c not in thresholds):
-    print(f'  WARN: {crate_name:15s} in report but has NO explicit floor in thresholds TOML — enforced at default ({float(default_threshold)}%). Add a ratcheted floor.')
+  # CRATE-PRESENCE ASSERT (2026-07-10, audit follow-up row 9 — Rule 11
+  # false-OK class): every crate listed in the thresholds TOML MUST be
+  # present in the parsed report; any missing crate hard-fails, named.
+  miss = 0
+  for (i = 1; i <= tn; i++) {
+    if (!(tkeys[i] in cnt)) {
+      printf "  MISSING: %-15s listed in thresholds TOML but ABSENT from the coverage report\n", tkeys[i]
+      miss = 1
+    }
+  }
+  if (miss) {
+    print ""
+    print "  ERROR: crate-presence assert FAILED — refusing vacuous pass for the crate(s) above."
+    print "         Causes: crate renamed/removed (update quality/crate-coverage-thresholds.toml"
+    print "         in the same PR), an llvm-cov flag/filter change, or a partial coverage run."
+    exit 1
+  }
 
-failed = False
-for crate_name in sorted(crate_lines.keys()):
-    info = crate_lines[crate_name]
-    if info['count'] == 0:
-        pct = Fraction(100)
-    else:
-        # EXACT rational percentage — no binary-float rounding error.
-        pct = Fraction(info['covered'] * 100, info['count'])
-    threshold = thresholds.get(crate_name, default_threshold)
-    # Exact comparison: pct == threshold PASSES (ratchet = 'at least').
-    status = 'PASS' if pct >= threshold else 'FAIL'
-    if status == 'FAIL':
-        failed = True
-    # Display at 2 decimals so a value just below the threshold can no
-    # longer be printed as visually EQUAL to it (the old 1-decimal display
-    # showed 'FAIL: 99.5% (threshold: 99.5%)' for a true 99.46%).
-    print(f'  {status}: {crate_name:15s} {float(pct):7.2f}% (threshold: {float(threshold)}%)')
+  # Inverse direction (warn-only, 2026-07-10): a crate in the report with no
+  # explicit floor still rides the default — but name it loudly.
+  for (i = 1; i <= rn; i++) {
+    if (!(rkeys[i] in thr_raw)) {
+      printf "  WARN: %-15s in report but has NO explicit floor in thresholds TOML — enforced at default (%s%%). Add a ratcheted floor.\n", rkeys[i], frepr(default_thr)
+    }
+  }
 
-if failed:
-    print('')
-    print('  Per-crate coverage gate FAILED.')
-    sys.exit(1)
-else:
-    print('')
-    print('  All crates meet coverage thresholds.')
-    print('  Crate-presence assert: all', len(thresholds), 'threshold-listed crates found in the report.')
-    sys.exit(0)
-"
+  failed = 0
+  for (i = 1; i <= rn; i++) {
+    name = rkeys[i]
+    traw = (name in thr_raw) ? thr_raw[name] : default_thr
+    parse_dec(traw)
+    if (cnt[name] == 0) {
+      # zero countable lines == 100% by definition (same as before)
+      ok = (100 * G_pow >= G_scaled)
+      pct = 100
+    } else {
+      # EXACT comparison: pct == threshold PASSES (ratchet = at least).
+      ok = (cov[name] * 100 * G_pow >= G_scaled * cnt[name])
+      # display value only — one IEEE division of exact integers, which is
+      # the correctly-rounded double of the true ratio (same double the old
+      # float(Fraction(covered*100, count)) produced)
+      pct = (cov[name] * 100) / cnt[name]
+    }
+    st = ok ? "PASS" : "FAIL"
+    if (!ok) failed = 1
+    # 2-decimal display so a value just below the threshold can no longer
+    # print as visually EQUAL to it.
+    printf "  %s: %-15s %7.2f%% (threshold: %s%%)\n", st, name, pct, frepr(traw)
+  }
+
+  print ""
+  if (failed) {
+    print "  Per-crate coverage gate FAILED."
+    exit 1
+  }
+  print "  All crates meet coverage thresholds."
+  print "  Crate-presence assert: all " tn " threshold-listed crates found in the report."
+}
+' "$THRESHOLDS_FILE" "$TSV_FILE"
 
 exit $?

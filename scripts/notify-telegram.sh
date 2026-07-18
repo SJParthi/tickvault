@@ -73,12 +73,12 @@ RESPONSE=$(curl -s -X POST "${TELEGRAM_API}/bot${BOT_TOKEN}/sendMessage" \
     -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"${MESSAGE}\", \"parse_mode\": \"HTML\"}")
 
 # Check response
-OK=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null)
+OK=$(echo "${RESPONSE}" | jq -r '.ok // false' 2>/dev/null || echo "false")
 
-if [ "${OK}" = "True" ]; then
+if [ "${OK}" = "true" ]; then
     echo "Telegram notification sent successfully"
 else
     echo "ERROR: Telegram send failed"
-    echo "${RESPONSE}" | python3 -m json.tool 2>/dev/null || echo "${RESPONSE}"
+    echo "${RESPONSE}" | jq . 2>/dev/null || echo "${RESPONSE}"
     exit 1
 fi
