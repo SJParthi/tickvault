@@ -1,3 +1,9 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/instrument/index_futures.rs"
+---
+
 # FUTIDX-4 Index-Futures Subscription — Error Codes (FUTIDX-01 / FUTIDX-02)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

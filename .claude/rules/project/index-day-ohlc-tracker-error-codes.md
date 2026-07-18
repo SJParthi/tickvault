@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/trading/src/in_mem/day_ohlc_tracker.rs"
+  - "crates/app/src/day_ohlc_orchestrator.rs"
+---
+
 # Index Day OHLC Tracker — Error Codes
 
 > **Authority:** CLAUDE.md > operator-charter-forever.md > this file.

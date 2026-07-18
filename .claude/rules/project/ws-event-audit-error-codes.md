@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/ws_event_types.rs"
+  - "crates/storage/src/ws_event_audit_persistence.rs"
+---
+
 # WebSocket Lifecycle Audit — Error Codes (AUDIT-WS-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C > this file.

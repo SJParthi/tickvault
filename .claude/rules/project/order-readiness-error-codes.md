@@ -1,3 +1,12 @@
+---
+paths:
+  - "crates/trading/src/oms/order_readiness.rs"
+  - "crates/trading/src/oms/error_taxonomy.rs"
+  - "crates/trading/src/oms/api_client.rs"
+  - "crates/trading/src/oms/engine.rs"
+  - "crates/common/src/error_code.rs"
+---
+
 # Order-Readiness Gate + Order-Path Dhan Error Taxonomy — Error Codes (ORDER-READY-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
@@ -15,7 +24,7 @@
 > `crates/common/src/error_code.rs::ErrorCode::OrderReady01GateRefused`.
 > **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs` requires
 > `ORDER-READY-01` + `OrderReady01GateRefused` verbatim — both appear here.
-> **Auto-load trigger:** always loaded (path is in `.claude/rules/project/`).
+> **Auto-load trigger:** always loaded (path is in `.claude/rules/project/`). *(2026-07-18 rules diet: this file is now path-triggered via `paths:` frontmatter — see rules-diet-2026-07-18.md.)*
 
 ---
 

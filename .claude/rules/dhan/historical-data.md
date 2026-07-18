@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/core/src/historical/*.rs"
+  - "crates/storage/src/candle_persistence.rs"
+  - "crates/core/src/pipeline/candle_aggregator.rs"
+  - "crates/core/tests/deterministic_replay.rs"
+---
+
 # Dhan Historical Data Enforcement
 
 > **Ground truth:** `docs/dhan-ref/05-historical-data.md`

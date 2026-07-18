@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/tick_conservation_boot.rs"
+  - "crates/storage/src/tick_conservation_audit_persistence.rs"
+---
+
 # Daily Tick-Conservation Audit — Error Codes (TICK-CONSERVE-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C > this file.

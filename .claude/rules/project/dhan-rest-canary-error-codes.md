@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/rest_canary_boot.rs"
+  - "crates/common/src/url_join.rs"
+---
+
 # Dhan REST-Health Canary — Error Codes (REST-CANARY-01)
 
 > **⚠ RETIRED 2026-07-14 (operator Dhan noise lock —
