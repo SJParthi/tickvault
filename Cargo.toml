@@ -180,6 +180,15 @@ aws-sdk-s3 = { version = "=1.138.0", default-features = false, features = ["beha
 # it to a direct pin — the aws-lc-rs promotion precedent above.
 flate2 = "1.1.9"
 
+# ---- Section 11c: Regex (tickvault-logs-mcp grep_codebase) ----
+# 2026-07-18 (rust-only phase 2c): the Rust port of the tickvault-logs MCP
+# server's `grep_codebase` tool needs a regex engine (the Python original
+# uses stdlib `re`). NOT a new supply-chain root — regex 1.12.3 was ALREADY
+# resolved in Cargo.lock (transitive via criterion/proptest and others);
+# this promotes it to a direct pin — the aws-lc-rs / flate2 promotion
+# precedent above. Flagged in the PR body for operator visibility.
+regex = "1.12.3"
+
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }
 
