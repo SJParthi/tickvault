@@ -179,6 +179,53 @@ Any such PR MUST be rejected in review even if the operator approves verbally �
 
 ---
 
+## §5.1. 2026-07-18 amendment — All Green verdict implementation language (rust-only purge Phase 2a-1)
+
+**Operator directive (2026-07-13, rust-only purge — verbatim):** *"our entire
+tickvault repository should be entirely RUST O(1) even now and in the future
+always — nowhere should even the word python be used."*
+
+Under that directive the All Green verdict step's inline `python3 - <<'PYEOF'`
+heredoc (ci.yml `all-green` job, "Verify every needed job succeeded") is
+re-expressed as a **jq+shell** program with **BYTE-EQUIVALENT semantics** (jq
+is preinstalled on the GitHub ubuntu runner images):
+
+- same PR-only-jobs set `{commit-lint, design-first-wall, local-runtime-block}`;
+- same non-PR-events set `{push, workflow_dispatch}`;
+- same skipped-counts-as-FAILURE-on-pull_request rule (a `skipped` result is
+  tolerated ONLY for a PR-only job on a non-PR event);
+- same iteration order (needed jobs sorted by name), same
+  `::error::All Green FAILED — non-success needed jobs: <job>=<result>, …`
+  line on stdout (a missing job result renders as the literal `None`, exactly
+  as the old evaluator's `meta.get("result")` did), same success line
+  `All Green: every needed job succeeded (event=<event>).`, same exit codes
+  (0 green / 1 red).
+
+**Equivalence-evidence requirement (binding on the porting PR and any future
+re-port):** the language port lands ONLY with a fixture-matrix proof — every
+fixture (job results {success, failure, cancelled, skipped, missing-result} ×
+the PR-only-job skip combinations × events {pull_request, push,
+workflow_dispatch, schedule}, ≥40 cases) run through BOTH the old python
+heredoc and the new jq program, with byte-identical stdout + stderr + exit
+codes, pasted verbatim in the PR body. The frozen expected-output table is
+pinned in-repo by `scripts/all-green-equivalence-matrix.sh` (run in CI inside
+the existing Repo Guards console-gate step — a step in an existing needed job,
+NOT a new job, per this file's §5 no-job-outside-the-needs-list row), so no
+python survives in the harness and any future drift in the jq program fails CI.
+
+**This is an implementation-language change ONLY.** The §2 one-line rule, the
+`all-green` `needs:` list, and every §5 REJECT row are UNCHANGED and **bind the
+NEW jq evaluator verbatim** — removing/renaming/weakening the `all-green` job
+or its `needs:` list, treating `skipped` as success outside the
+PR-only-jobs-on-push/workflow_dispatch carve-out, or changing the SETS or the
+skip semantics inside the jq program remains a §5 REJECT without its own dated
+operator quote. The same-PR mutation.yml score one-liner
+(`python3 -c "print(f'{…:.1f}')"` → `awk 'BEGIN{printf "%.1f", …}'`) is ported
+under the same directive — identical IEEE-double formatting, not a
+gate-semantics surface (mutation is a scheduled lane per §3 row 5).
+
+---
+
 ## §6. Auto-driver / Insta-reel explanation
 
 > Sir, imagine the juice shop had ten quality checks — but the delivery boy was told "leave the moment the FIRST FOUR pass." So bottles went out while the last six checks were still running, and three times the taste test FAILED seconds after the bottle had already left. The new rule: ONE final inspector called "All Green" stands at the door. He does nothing himself — he just looks at ALL ten check sheets and only stamps the bottle when every single one says PASS. The delivery boy is not even TOLD about the bottle until All Green stamps it. And the overnight deep tests (the 18-hour lab analysis) still happen every week — we just stopped PRETENDING they happened per-bottle when they physically cannot.
