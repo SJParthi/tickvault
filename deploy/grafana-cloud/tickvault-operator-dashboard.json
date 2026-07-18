@@ -123,19 +123,6 @@
       "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" }, "namespace": "Tickvault/Prod", "metricName": "tv_feed_last_tick_age_seconds", "statistic": "Maximum", "dimensions": { "host": "*" }, "region": "ap-south-1", "matchExact": false } ]
     },
     {
-      "id": 8,
-      "type": "stat",
-      "title": "Ticks dropped (0 = good)",
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 4 },
-      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
-      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
-      "targets": [
-        { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" }, "namespace": "Tickvault/Prod", "metricName": "tv_spill_dropped_total", "statistic": "Maximum", "dimensions": { "host": "*" }, "region": "ap-south-1", "matchExact": false },
-        { "refId": "B", "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" }, "namespace": "Tickvault/Prod", "metricName": "tv_dlq_ticks_total", "statistic": "Maximum", "dimensions": { "host": "*" }, "region": "ap-south-1", "matchExact": false }
-      ]
-    },
-    {
       "id": 9,
       "type": "stat",
       "title": "Orders rejected (0 = good)",
@@ -144,16 +131,6 @@
       "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
       "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
       "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" }, "namespace": "Tickvault/Prod", "metricName": "tv_orders_rejected_total", "statistic": "Maximum", "dimensions": { "host": "*" }, "region": "ap-south-1", "matchExact": false } ]
-    },
-    {
-      "id": 10,
-      "type": "timeseries",
-      "title": "Candles sealed (should keep rising during market hours)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" },
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single" } },
-      "targets": [ { "refId": "A", "datasource": { "type": "cloudwatch", "uid": "${DS_CLOUDWATCH}" }, "namespace": "Tickvault/Prod", "metricName": "tv_aggregator_seals_emitted_total", "statistic": "Maximum", "dimensions": { "host": "*" }, "region": "ap-south-1", "matchExact": false } ]
     },
     {
       "id": 11,

@@ -107,6 +107,14 @@ downgrade OR market-hours-gate removal fails the build.
 
 ## AGGREGATOR-LATE-01 — tick arrived after its bucket sealed (discarded)
 
+> **⚠ EMIT SITES DELETED 2026-07-17 (stage-3 dead-WS sweep):** the 21-TF TICK
+> aggregator (`multi_tf_aggregator.rs` / `aggregator_cell.rs` — the late-arm
+> emit sites) was DELETED — it had ZERO tick publishers after the live-WS
+> retirements (Dhan 2026-07-13, Groww 2026-07-15); the REST-only runtime
+> derives candles via the bar-fold (FOLD-01). The `AggregatorLate01...`
+> variant is RETAINED; the code can never fire again. Content below retained
+> as historical audit.
+
 **REVISED 2026-06-05 (operator lock — Option B "late tick re-folds its own
 minute"):** a late tick whose `exchange_timestamp` floors to the
 MOST-RECENTLY sealed bucket is NO LONGER discarded — it re-folds its OWN
@@ -232,6 +240,14 @@ verified holes, both fixed on branch `claude/fix-candle-writer-recovery`:
 
 ## AGGREGATOR-HB-01 — per-minute aggregator seal-burst heartbeat (positive signal)
 
+> **⚠ EMIT SITES DELETED 2026-07-17 (stage-3 dead-WS sweep):**
+> `crates/trading/src/candles/heartbeat.rs` (the sole emit surface) was
+> DELETED with the publisher-less tick aggregator. The
+> `AggregatorHb01Heartbeat` variant is RETAINED; the positive-signal role
+> for the surviving REST-era chain is `tv_rest_candle_fold_heartbeat_total`
+> + the seal-writer progress report. Content below retained as historical
+> audit.
+
 **Trigger:** every minute boundary, after the seal burst completes, the
 aggregator emits a coalesced 60s heartbeat carrying
 `(seals_emitted, seals_dropped, late_ticks_discarded)`. Severity::Info.
@@ -248,6 +264,17 @@ becomes `aggregator_health`).
 **Source:** `crates/trading/src/aggregator/heartbeat.rs::emit_seal_burst_heartbeat`.
 
 ## BOUNDARY-01 — missed-boundary catch-up seal fired
+
+> **⚠ EMIT SITES DELETED 2026-07-17 (stage-3 dead-WS sweep):** the watermark
+> catch-up sealer (`multi_tf_aggregator.rs::catch_up_seal_all` + the main.rs
+> Task 4 driver) and the IST-midnight/close-time force-seal tasks were
+> DELETED with the publisher-less tick aggregator. The
+> `Boundary01CatchupSeal` variant is RETAINED; the
+> `tv-<env>-boundary-catchup-storm-dhan` alarm, its window-gate entry, the
+> dashboard widget and the [host,feed] EMF declaration were retired in the
+> SAME PR (dated notes in silent-feed-alarms.tf S2 /
+> market-hours-liveness-alarm.tf / dashboard.tf / app-alarms.tf). Content
+> below retained as historical audit.
 
 **Trigger:** the boundary timer detected `last_seen_minute < expected_minute - 1`
 (one or more minute boundaries skipped, typically due to OS scheduler
@@ -424,6 +451,13 @@ floor. Both fixes landed:
    IST cross-verify (CROSS-VERIFY-1M-01 — paging since 2026-07-14).
 
 ## AGGREGATOR-LAG-01 — candle aggregator tick-broadcast lagged (zero-tick-loss PR-8b, H2-lite)
+
+> **⚠ EMIT SITES DELETED 2026-07-17 (stage-3 dead-WS sweep):** the emit site
+> (the aggregator subscriber's `RecvError::Lagged` arm in main.rs) was
+> DELETED with the tick-aggregator driver — the broadcast had no publisher.
+> The `AggregatorLag01TickLagDropped` variant is RETAINED; the storage-side
+> `aggregator_lag_loud_guard.rs` ratchet was deleted with its subject.
+> Content below retained as historical audit.
 
 **Trigger:** the candle aggregator's `tokio::broadcast` receiver
 (`spawn_seal_writer_loop` in `crates/app/src/main.rs`) returned

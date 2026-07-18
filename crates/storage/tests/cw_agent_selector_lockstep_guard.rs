@@ -105,11 +105,15 @@ fn cw_agent_selector_ships_heartbeat_and_drops_groww_live_metrics() {
         "tv_feed_last_tick_age_seconds",
         "tv_feed_sidecar_stall_restart_total",
         "tv_groww_exchange_lag_p99_seconds",
+        // 2026-07-17 (dashboard tidy): the 2 Dhan lag names retired with
+        // the dead Dhan-lag ring/publisher chain in feed_lag_monitor.rs.
+        "tv_dhan_exchange_lag_p99_seconds",
+        "tv_dhan_lag_samples_excluded_total",
     ] {
         assert!(
             !live.contains(retired),
-            "cw-agent metric_selectors resurrected retired Groww-live metric \
-             {retired} (producer deleted 2026-07-15 — a dead name implies \
+            "cw-agent metric_selectors resurrected retired live-feed-era metric \
+             {retired} (producer deleted — a dead name implies \
              coverage that can never be published again)"
         );
     }

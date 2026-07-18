@@ -28,7 +28,7 @@
 //! here are strictly zero-alloc per call.
 //!
 //! Budget: ≤ 1 KiB / ≤ 8 blocks across 10,000 calls — same class as
-//! `dhat_feed_presence.rs` (core).
+//! `dhat_token_handle.rs` (core).
 //!
 //! CI ENFORCEMENT: deliberately UN-gated (no `#![cfg(feature = "dhat")]`) —
 //! the house pattern — so the normal Test (app) nextest lane runs it on

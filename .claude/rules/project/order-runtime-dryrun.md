@@ -163,6 +163,30 @@ returns before any broker REST reconcile (engine.rs ~:1271), so the
 hazard is live-mode-only. The hazard site carries a matching in-code
 comment block. **No `dry_run = false` flip without one of the fix
 directions landed.**
+**2026-07-18 update — direction (a) LANDED; this mandatory-pre-live item
+is CLOSED:** the reconcile non-terminal arm now REFUSES the downward
+`traded_qty` copy (mirroring the C2 WS-side monotone guard's comparison
+semantics): the local `(traded_qty, avg_traded_price)` pair stands,
+`needs_reconciliation` stays `true` (a refused correction is NOT
+consumed), and a coded `error!(code = OMS-GAP-02)` divergence line names
+the order id + local vs broker qty — emitted per refusal per reconcile
+pass while the divergence persists (bounded by the reconcile cadence;
+clears when the broker book catches up — the C8 upward-error precedent),
+NOT edge-latched. Upward/equal copies and the
+terminal arms are unchanged; the dry-run early return still precedes
+every correction. Bite-proven test:
+`live_mode_reconcile_refuses_downward_copy_no_double_fill`
+(engine.rs test module — pre-fix it double-emitted a `FillEvent` on WS
+redelivery; post-fix the redelivery is delta 0 / `None`).
+Flagged pre-live follow-up: the non-terminal arm still ADOPTS the
+snapshot's STATUS before the downward guard runs, so a snapshot proven
+stale by the qty check can still regress the order's status
+(pre-existing adoption; no double-count path — status is not a fill
+baseline); refusing status alongside qty on a proven-stale snapshot is a
+flagged pre-live follow-up. The terminal arm's silent unconditional
+downward copy remains the documented B1 contract (pinned by
+`live_mode_reconcile_terminal_applies_fill_but_never_status`) — out of
+this guard's scope.
 
 ## §4. Scope guard — EXPLICITLY OUT (a violating PR is REJECTED)
 
@@ -225,7 +249,32 @@ book keys on — cross-feeding would double-key instruments invisibly to
 the §3 first-seen-segment tripwire (segments match across the split).
 Honest residual: contract-leg OPTION marks remain dead on the cadence
 path — the cadence lane fetches chains, not per-contract candles, so
-only index spot marks flow. The Fix-F closed-channel warn now
+only index spot marks flow. *(Closed at the PLUMBING level 2026-07-18
+same-day: the chain cadence seam now forwards one mark per RESOLVED
+option contract leg after the option_chain_1m flush ACK — identities
+are REAL exchange_token u64s resolved via the day-cached
+`resolve_groww_contract_books` machinery piggybacked on the
+expiry-list master download (zero extra REST); an unresolved
+strike/leg is counted (`tv_cadence_option_mark_unresolved_total`) +
+skipped, never a synthetic id; only finite >0 LTPs forward, bounded
+≤~1.1K try_sends/min vs the 8,192-default mark channel. PLUMBING ONLY
+today — no option position can exist in paper mode (IDX_I-only
+self-test, no strategy), so option marks match zero positions and
+restore nothing today; they pre-wire option-leg unrealized P&L for
+future option orders. Same day, order_observability.rs stopped
+hardcoding `feed:"dhan"` on order_audit/pnl_audit rows —
+`OrderSideWiring` carries the lane's feed discriminant. Honest
+envelope: option-contract marks resolve only while the book expiry —
+the flat nearest ≥ today from the Groww master — equals the cadence
+fire's day-locked policy expiry, true today for NIFTY/SENSEX by
+construction and for BANKNIFTY under the Assumed no-weeklies
+monthly-only regime; on any divergence day (weeklies returning, or a
+cross-broker `expiry_disagreement` Dhan-wins override re-keying the
+Groww fire) 100% of the affected underlying's option marks are
+counted-unresolved (`tv_cadence_option_mark_unresolved_total`,
+fail-closed, never misattributed) until the cadence §3e book
+delegation lands.)* The Fix-F
+closed-channel warn now
 distinguishes never-any-mark ("mark channel closed before any mark
 arrived — no live mark producer is configured") from the benign
 day-complete close; control flow unchanged. Ratchet:
