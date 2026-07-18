@@ -14,8 +14,9 @@ VPC + subnet + IGW · Security group · EC2 **m8g.large** (Graviton4, 2 vCPU,
 8 GiB) AL2023 arm64 + **EBS gp3 30 GB** encrypted · IAM instance role + GitHub
 OIDC role · SNS topic + email sub · EventBridge **weekday** start/stop crons
 (08:30 / 16:30 IST) · CloudWatch alarms + log group · AWS Budget **$25** ·
-S3 cold bucket (5-yr SEBI lifecycle) · 3 Lambdas (telegram-webhook,
-budget-killswitch, claude-triage). **Elastic IP is NOT created** (`enable_eip=false`).
+S3 cold bucket (5-yr SEBI lifecycle) · 2 Lambdas (telegram-webhook,
+budget-killswitch; claude-triage RETIRED 2026-07-18 — deleted, never
+provisioned; see git history). **Elastic IP is NOT created** (`enable_eip=false`).
 
 ---
 
