@@ -210,8 +210,13 @@ for crate in $CRATES_TO_CHECK; do
   CRATE_DIR="crates/$crate"
   [ ! -d "$CRATE_DIR" ] && continue
 
-  # Get required types for this crate
-  REQUIRED_VAR="REQUIRED_${crate}"
+  # Get required types for this crate. Hyphenated crate names (aws-lambdas,
+  # phase 2b-1) are sanitized to underscores — a raw hyphen makes the
+  # indirection an INVALID bash variable name ("${!REQUIRED_aws-lambdas:-}"
+  # aborts the whole guard with "invalid variable name" instead of taking
+  # the designed SKIP path below). Existing crate names carry no hyphen, so
+  # behavior is byte-identical for them.
+  REQUIRED_VAR="REQUIRED_${crate//-/_}"
   REQUIRED_TYPES="${!REQUIRED_VAR:-}"
 
   if [ -z "$REQUIRED_TYPES" ]; then

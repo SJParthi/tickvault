@@ -26,116 +26,25 @@
 # =============================================================================
 
 # --------- Daily Budget Digest Lambda ---------
-
-data "archive_file" "tv_daily_budget_digest_zip" {
-  type        = "zip"
-  output_path = "${path.module}/.tv-daily-budget-digest.zip"
-  source {
-    content  = <<-PYEOF
-import os, json, boto3
-from datetime import datetime, timedelta, timezone
-
-ce  = boto3.client('ce', region_name='us-east-1')  # Cost Explorer is us-east-1 only
-sns = boto3.client('sns')
-
-INR_PER_USD = 85    # rupee display rate (what you actually pay incl GST)
-GST_MULT    = 1.18  # India GST 18%
-# The REAL ceiling is the AWS Budget that auto-stops the box (budget.tf
-# limit_amount): $55/month measured on UnblendedCost (pre-GST USD, TOTAL
-# account spend — the budget cost_filter was removed 2026-06-30). Comparing
-# month-to-date USD against $55 makes the digest "% used" match the kill-switch
-# EXACTLY. KEEP THIS IN SYNC with budget.tf limit_amount — the digest reads
-# BUDGET_USD, the native Budget Action + killswitch fire at limit_amount.
-BUDGET_USD  = 55.0
-
-# Friendly labels for the Cost Explorer SERVICE dimension (substring match).
-SERVICE_LABELS = [
-    ('Elastic Compute Cloud', 'EC2 compute'),
-    ('EC2 - Other',           'EBS + transfer'),
-    ('Virtual Private Cloud', 'Public IP / VPC'),
-    ('CloudWatch',            'CloudWatch'),
-    ('Simple Storage',        'S3 storage'),
-    ('Simple Notification',   'SNS alerts'),
-    ('Lambda',                'Lambda'),
-    ('Key Management',        'KMS'),
-]
-
-def label_for(svc):
-    for needle, nice in SERVICE_LABELS:
-        if needle in svc:
-            return nice
-    return svc
-
-def inr(usd):
-    return usd * INR_PER_USD * GST_MULT
-
-def get_total(start, end):
-    r = ce.get_cost_and_usage(
-        TimePeriod={'Start': start, 'End': end},
-        Granularity='DAILY',
-        Metrics=['UnblendedCost'],
-    )
-    return sum(float(d['Total']['UnblendedCost']['Amount']) for d in r['ResultsByTime'])
-
-def get_by_service(start, end):
-    r = ce.get_cost_and_usage(
-        TimePeriod={'Start': start, 'End': end},
-        Granularity='DAILY',
-        Metrics=['UnblendedCost'],
-        GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}],
-    )
-    agg = {}
-    for d in r['ResultsByTime']:
-        for g in d['Groups']:
-            usd = float(g['Metrics']['UnblendedCost']['Amount'])
-            if usd <= 0:
-                continue
-            key = label_for(g['Keys'][0])
-            agg[key] = agg.get(key, 0.0) + usd
-    return agg
-
-def handler(event, context):
-    today_utc = datetime.now(timezone.utc).date()
-    yest_utc  = today_utc - timedelta(days=1)
-    mtd_start = today_utc.replace(day=1)
-
-    # Cost Explorer "end" is exclusive — yesterday's full day = today as end
-    yday_usd = get_total(str(yest_utc), str(today_utc))
-    mtd_usd  = get_total(str(mtd_start), str(today_utc))
-    by_svc   = get_by_service(str(mtd_start), str(today_utc))
-
-    pct = (mtd_usd / BUDGET_USD) * 100 if BUDGET_USD else 0
-    emoji = '🟢' if pct < 50 else ('🟡' if pct < 80 else ('🟠' if pct < 100 else '🔴'))
-
-    days_in_month  = (today_utc.replace(month=today_utc.month % 12 + 1, day=1) - timedelta(days=1)).day if today_utc.month < 12 else 31
-    days_remaining = days_in_month - today_utc.day
-    forecast_usd   = (mtd_usd / today_utc.day) * days_in_month if today_utc.day else mtd_usd
-
-    lines = [
-        f"{emoji} *AWS Cost — tickvault*",
-        f"_Yesterday_:   ₹{inr(yday_usd):.0f}   ($${yday_usd:.2f})",
-        f"_This month_:  ₹{inr(mtd_usd):.0f}   ($${mtd_usd:.2f})",
-        f"_Of $55 stop-budget_: {pct:.0f}%",
-        f"_Forecast EOM_: ₹{inr(forecast_usd):.0f}   ($${forecast_usd:.2f})",
-        f"_Days left_:   {days_remaining}",
-        "",
-        "*Where it goes (this month):*",
-    ]
-    for nice, usd in sorted(by_svc.items(), key=lambda kv: -kv[1]):
-        lines.append(f"  {nice:<16} ₹{inr(usd):.0f}  ($${usd:.2f})")
-    if not by_svc:
-        lines.append("  (no spend yet this month)")
-
-    sns.publish(
-        TopicArn=os.environ['ALERTS_TOPIC_ARN'],
-        Subject='[BUDGET] daily AWS cost',
-        Message="\n".join(lines),
-    )
-    return {'ok': True, 'mtd_usd': mtd_usd, 'pct': pct}
-PYEOF
-    filename = "index.py"
-  }
-}
+#
+# 2026-07-18 (rust-only phase 2b-1): the inline Python heredoc was PORTED to
+# Rust — crates/aws-lambdas/src/budget_digest.rs (lib logic + unit tests) +
+# src/bin/daily_budget_digest.rs (thin bootstrap bin). Behavior parity:
+# same Cost Explorer queries (us-east-1, DAILY UnblendedCost, exclusive
+# end), same INR_PER_USD=85 / GST_MULT=1.18 / BUDGET_USD=55 constants
+# (KEEP IN SYNC with budget.tf limit_amount), same emoji thresholds, same
+# Telegram line format, same '[BUDGET] daily AWS cost' subject, same
+# {'ok','mtd_usd','pct'} return. The zip is built in CI by the
+# build-lambdas job (terraform-apply.yml) and downloaded into
+# ${path.module}/.lambda-zips/ before plan/apply; source_code_hash is a
+# digest of the Rust SOURCE (Rust builds are not bit-reproducible, so
+# hashing the zip would churn every build with zero source change).
+# 2026-07-18 (hostile-review r1 N3): a LOCAL operator `terraform plan`
+# requires running the CI build step's cargo-lambda command first (the
+# `file(".lambda-zips/source.digest")` reads fail otherwise) — CI-only
+# planning is the intended contract; and a toolchain/cargo-lambda version
+# bump alone does NOT change the digest (binaries redeploy on the next
+# source / Cargo.lock change). Applies to all four .lambda-zips lambdas.
 
 resource "aws_iam_role" "tv_daily_budget_digest" {
   name = "tv-prod-daily-budget-digest-role"
@@ -176,11 +85,12 @@ resource "aws_iam_role_policy" "tv_daily_budget_digest" {
 
 resource "aws_lambda_function" "tv_daily_budget_digest" {
   function_name    = "tv-prod-daily-budget-digest"
-  filename         = data.archive_file.tv_daily_budget_digest_zip.output_path
-  source_code_hash = data.archive_file.tv_daily_budget_digest_zip.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/daily-budget-digest.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
   role             = aws_iam_role.tv_daily_budget_digest.arn
-  handler          = "index.handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 30
   memory_size      = 128
   environment {
