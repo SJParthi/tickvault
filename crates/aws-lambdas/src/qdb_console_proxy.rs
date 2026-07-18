@@ -52,11 +52,12 @@ pub const QDB_CONSOLE_BUILD: &str = "b4-qdb-console-2026-07-06-r3";
 
 /// Single-timeout tradeoff (Python FIX 8): urllib's `timeout` was the
 /// SOCKET-op timeout (it bounded BOTH the connect attempt AND each blocking
-/// recv). The Rust live client maps this 1:1 as `connect_timeout` +
-/// `read_timeout` (per-read inactivity), deliberately with NO total request
-/// timeout — a DRIBBLING body (>=1 byte per <12s recv) resets the per-recv
-/// timer each time and is bounded by the back Lambda's 26s timeout instead
-/// (questdb-console.tf), exactly the Python honest bound.
+/// recv). The Rust live client maps this as `connect_timeout` + the blocking
+/// client's op-level `timeout` (reqwest 0.13's blocking builder exposes no
+/// per-recv `read_timeout`) — a strictly TIGHTER envelope than Python's:
+/// a DRIBBLING body that Python would let run to the back Lambda's 26s
+/// timeout (questdb-console.tf) is bounded at 12s here. Documented
+/// deviation; never looser than the oracle.
 pub const TIMEOUT_SECS: u64 = 12;
 
 /// Keep base64+JSON under Lambda's 6 MiB invoke envelope.
@@ -128,7 +129,7 @@ pub const SQL_ALLOWED_FUNCS: [&str; 12] = [
 
 /// Python `\w` word-character test (`re` str patterns are unicode-aware):
 /// letters, digits, underscore.
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
@@ -330,7 +331,7 @@ pub fn classify_path(method: &str, path: &str) -> PathKind {
 /// pairs, '+' as space, percent-decoded UTF-8 with replacement, BLANK values
 /// dropped (parse_qs default `keep_blank_values=False`), first survivor
 /// wins.
-fn query_param(raw_query: &str, name: &str) -> String {
+pub(crate) fn query_param(raw_query: &str, name: &str) -> String {
     for (k, v) in form_urlencoded::parse(raw_query.as_bytes()) {
         if k == name && !v.is_empty() {
             return v.into_owned();
@@ -1110,6 +1111,9 @@ mod tests {
     }
 
     #[test]
+    // The python test pins the CONSTANT itself — a constant assertion is
+    // the point (ratchet on the cap value), so the lint is waived here.
+    #[allow(clippy::assertions_on_constants)]
     fn body_cap_constant_within_6mib_envelope() {
         assert!(MAX_BODY_BYTES <= 4_100_000);
     }

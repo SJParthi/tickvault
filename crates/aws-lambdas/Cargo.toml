@@ -35,6 +35,11 @@ reqwest = { workspace = true, features = ["blocking"] }
 base64 = { workspace = true }
 percent-encoding = { workspace = true }
 form_urlencoded = { workspace = true }
+# The console FRONT (phase 2b-3) invokes the back relay via the Lambda API
+# and signs/verifies its HMAC session tokens with aws-lc-rs (the workspace's
+# existing crypto provider — no new crypto root).
+aws-sdk-lambda = { workspace = true }
+aws-lc-rs = { workspace = true }
 
 [[bin]]
 name = "budget-killswitch"
@@ -55,3 +60,7 @@ path = "src/bin/market_hours_liveness_gate.rs"
 [[bin]]
 name = "qdb-console-proxy"
 path = "src/bin/qdb_console_proxy.rs"
+
+[[bin]]
+name = "qdb-console-front"
+path = "src/bin/qdb_console_front.rs"
