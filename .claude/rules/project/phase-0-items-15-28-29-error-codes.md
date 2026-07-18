@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/storage/src/bar_correction_audit_persistence.rs"
+  - "crates/core/src/historical/post_open_cross_check.rs"
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/main.rs"
+---
+
 # Phase 0 Items 15+28+29 Error Codes
 
 > **Authority:** This file is the runbook target for the three

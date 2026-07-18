@@ -1,3 +1,13 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/trading/src/in_mem/spot_bar_store.rs"
+  - "crates/core/src/pipeline/chain_day_store.rs"
+  - "crates/app/src/market_ram_store_boot.rs"
+  - "crates/common/src/config.rs"
+  - "config/base.toml"
+---
+
 # RAM Residency Stores — Error Codes (RAMSTORE-01)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

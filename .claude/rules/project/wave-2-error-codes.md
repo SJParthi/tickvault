@@ -1,3 +1,28 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/websocket/connection.rs"
+  - "crates/core/src/websocket/connection_pool.rs"
+  - "crates/core/src/pipeline/tick_gap_detector.rs"
+  - "crates/core/src/websocket/rate_limit_cooldown.rs"
+  - "crates/app/src/main.rs"
+  - "crates/app/tests/ws_rate_limit_cooldown_wiring_guard.rs"
+  - "crates/core/src/websocket/types.rs"
+  - "crates/core/src/websocket/order_update_connection.rs"
+  - "crates/core/src/auth/token_manager.rs"
+  - "crates/app/src/infra.rs"
+  - "crates/storage/src/phase2_audit_persistence.rs"
+  - "crates/storage/src/depth_rebalance_audit_persistence.rs"
+  - "crates/storage/src/ws_reconnect_audit_persistence.rs"
+  - "crates/storage/src/boot_audit_persistence.rs"
+  - "crates/storage/src/selftest_audit_persistence.rs"
+  - "crates/storage/src/order_audit_persistence.rs"
+  - "crates/app/src/order_observability.rs"
+  - "crates/storage/src/pnl_audit_persistence.rs"
+  - "crates/storage/src/s3_archive.rs"
+  - "crates/storage/src/disk_health_watcher.rs"
+---
+
 # Wave 2 Error Codes
 
 > **Authority:** This file is the runbook target for the new ErrorCode

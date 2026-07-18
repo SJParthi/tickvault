@@ -1,3 +1,14 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/feed/groww/shard_cutter.rs"
+  - "crates/common/src/config.rs"
+  - "crates/app/src/groww_scale_ladder.rs"
+  - "crates/storage/src/groww_scale_audit_persistence.rs"
+  - "crates/app/src/groww_scale_lock.rs"
+  - "crates/core/src/instance_lock.rs"
+---
+
 # Groww Auto-Scale Ladder — Error Codes (GROWW-SCALE-01..05)
 
 > **⚠ RETIRED 2026-07-15 (Groww live feed deleted — operator Q1, received directly in this session: *"remove

@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/instrument/market_open_self_test.rs"
+  - "crates/core/src/notification/events.rs"
+---
+
 # Wave 3-C Error Codes
 
 > **Authority:** This file is the runbook target for the new ErrorCode

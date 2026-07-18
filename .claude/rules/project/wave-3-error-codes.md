@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/notification/coalescer.rs"
+  - "crates/core/src/notification/service.rs"
+  - "crates/core/src/notification/episode.rs"
+---
+
 # Wave 3 Error Codes
 
 > **Authority:** This file is the runbook target for the new ErrorCode
