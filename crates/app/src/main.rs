@@ -2865,6 +2865,16 @@ async fn build_shared_infra(
         }
     }
 
+    // --- Candle DDL + retired-object sweep (Track A, 2026-07-18) ---
+    // AWAITED INLINE, BEFORE the seal-writer spawn: the 21 `candles_<tf>`
+    // tables must be ensured WITH `DEDUP ENABLE UPSERT KEYS` before the
+    // REST-era bar-fold's first seal can reach ILP, or a fresh QuestDB
+    // volume auto-creates them WITHOUT DEDUP (silent duplicate-row window
+    // — the bug the PR-C2/#1581 lane deletions left behind). Bounded by
+    // the module's 60s quiet-probe; a down QuestDB skips the DDL loudly.
+    // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+    tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
+
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
 
