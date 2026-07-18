@@ -89,6 +89,9 @@ _ENV_PREFIX_RE = re.compile(r"^tv-[a-z0-9]+-")
 # subject would otherwise be ambiguous. The OK flip reuses the phrase
 # verbatim, so recoveries carry the same tag automatically.
 ALARM_PHRASES: dict[str, str] = {
+    # 2026-07-18 (stage-4 dead-producer sweep): the dlq-ticks /
+    # late-tick-after-boundary / spill-dropped / ticks-dropped alarm slugs
+    # were retired with their deleted tick-chain alarms; mappings removed.
     "aggregator-no-seals": "Candle building has stopped during market hours",
     "binary-sha-stale": "The running app is more than a day behind the latest approved code",
     "boot-heartbeat-missing": "The app did not start on time this morning",
@@ -97,11 +100,9 @@ ALARM_PHRASES: dict[str, str] = {
     "cpu-high-5min": "Server CPU has been very high for 5 minutes",
     "disk-used-high": "Server disk is almost full",
     "disk-watcher-respawn": "The disk monitor keeps restarting",
-    "dlq-ticks": "Some market data overflowed into the emergency backup",
     "ebs-write-latency-high": "Disk writes have become very slow",
     "eventbridge-dlq-depth": "Scheduled cloud tasks are failing and piling up",
     "instance-status-failed": "The cloud server is failing its health checks",
-    "late-tick-after-boundary": "Market data is arriving too late to build candles",
     "logs-ingestion-runaway": "Log volume is growing abnormally fast",
     "market-hours-liveness-missing": "🖥️ HOST: the app has gone silent during market hours",
     "mem-used-high": "Server memory is almost full",
@@ -112,11 +113,9 @@ ALARM_PHRASES: dict[str, str] = {
     "questdb-console-front-errors": "The database console page is failing",
     "questdb-disconnected": "The database has been unreachable for too long",
     "realtime-guarantee-critical": "Overall system health has dropped to critical",
-    "spill-dropped": "Live market data overflowed the safety buffer",
     "system-status-failed": "The cloud hardware is failing its health checks",
     "telegram-webhook-errors": "The Telegram alert relay itself is failing",
     "tick-gap-instruments-silent": "🔷 DHAN: some instruments have stopped sending prices",
-    "ticks-dropped": "Live market data is being lost",
     "token-remaining-low": "🔷 DHAN: access token expires soon — spot-1m + option-chain pulls will stop",
     "ws-failed-connections": "🔷 DHAN: the live market data connection keeps failing",
     "ws-frame-dropped-no-wal": "Live market data arrived but could not be saved",

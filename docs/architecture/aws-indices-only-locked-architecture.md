@@ -388,7 +388,7 @@ The operator demanded these are NEVER compromised. Checking at 4-SID scope:
 ## §B. Honest 100% claim (mandatory per operator-charter §F)
 
 > "100% inside the tested envelope of the 4-SID indices-only scope on AWS t4g.small ap-south-1:
-> - Zero tick loss bounded by 100,000-tick rescue ring (≥83 minutes of buffer at 20 ticks/sec peak) → NDJSON spill → DLQ NDJSON.
+> - Zero data loss bounded by the 200,000-seal ring (`SEAL_BUFFER_CAPACITY`) → NDJSON spill → DLQ _(2026-07-18: the 100K tick rescue ring was deleted with the dead tick writer, stage-4 sweep — the seal chain is the live absorption tier)_.
 > - WebSocket detect-and-reconnect ≤5s; sleep-until-open post-close; SubscribeRxGuard preserves subscriptions across reconnects.
 > - QuestDB outage absorbed up to ring capacity; CloudWatch alarm fires within 30s of disconnect; operator paged via SMS+Telegram+Email simultaneously.
 > - Hot path O(1) per yata indicator update; bench-gated ≤100ns p99.
@@ -455,7 +455,7 @@ Reading: every dimension of AWS-side operational support must be wired, not aspi
 | Lambda invocation (SNS→Telegram bridge) | Lambda async invocation has **2 automatic retries + on-failure DLQ** |
 | EC2 stop/start API call | CloudTrail records the API call regardless of success/failure |
 | CloudWatch metric publish | Tickvault keeps a local circular buffer; on CW outage, retries on next interval. If sustained, falls back to disk log → CW Logs |
-| Tick from Dhan WS | Operator-charter §F: **bounded zero loss** via rescue ring (100K) → NDJSON spill → DLQ NDJSON |
+| Tick from Dhan WS | Operator-charter §F: **bounded zero loss** via the seal chain — 200K seal ring → NDJSON spill → DLQ _(2026-07-18: the 100K tick rescue ring retired with the dead tick writer; the Dhan live WS itself retired 2026-07-13)_ |
 
 ### §11.3 The "Retrigger" lock — failed alarms re-fire
 
@@ -945,7 +945,7 @@ Each is operator-readable on phone in 5 seconds:
 |---|---|---|
 | "Never disconnect" | SEBI 24h JWT forces reconnect | Invisible reconnect ≤5s |
 | "Never outage" | AWS region 99.99% SLA = 4.3min/mo possible | Telegram + SMS + Call within 60s of detection |
-| "Never miss a tick" | Network packets can drop | 100K-tick rescue ring → NDJSON spill → DLQ catches all |
+| "Never miss a tick" | Network packets can drop | 200K seal ring → NDJSON spill → DLQ _(2026-07-18: tick rescue ring deleted with the dead tick writer; the seal chain is the live tier)_ |
 | "Never fail" | QuestDB is third-party | Absorbs via 3-tier; alarm within 30s |
 | "100% guarantee no hallucination" | Words are not proof | Every claim has a ratchet test that fails build on regression |
 

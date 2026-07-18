@@ -191,21 +191,13 @@ fn test_every_alarm_metric_has_a_rust_emit_site() {
         !names.is_empty(),
         "ratchet self-check: app-alarms.tf produced 0 metric_name entries — parser broken"
     );
-    // DEAD-MONITOR allowlist (stage-2 dead-WS sweep, 2026-07-17): these 4
-    // alarm metrics' ONLY emit sites lived in the deleted dead Dhan tick
-    // chain (tick_persistence.rs ring/spill/DLQ counters + the aggregator
-    // late-tick arm fed by the deleted tick_processor.rs). The alarms in
-    // app-alarms.tf are now DEAD MONITORS (their series stopped the day the
-    // live feeds retired — 2026-07-13/15 — the code deletion changes no
-    // runtime behavior). Terraform retirement is deliberately DEFERRED to
-    // the dashboard PR per the sweep's task scope; entries here MUST be
-    // removed in lockstep when that PR deletes the alarms.
-    let dead_monitor_pending_tf_retirement: &[&str] = &[
-        "tv_spill_dropped_total",
-        "tv_dlq_ticks_total",
-        "tv_ticks_dropped_total",
-        "tv_late_tick_after_boundary_total",
-    ];
+    // DEAD-MONITOR allowlist — EMPTIED 2026-07-18 (stage-4 dead-producer
+    // sweep): the 4 dead-tick alarm resources (spill-dropped, dlq-ticks,
+    // ticks-dropped, late-tick-after-boundary) were deleted from
+    // app-alarms.tf in the same PR, so the stage-2 allowlist entries were
+    // removed per the lockstep contract below. The scaffold stays so any
+    // future deliberate dead-monitor window re-uses it.
+    let dead_monitor_pending_tf_retirement: &[&str] = &[];
     let mut missing = Vec::new();
     for name in &names {
         if dead_monitor_pending_tf_retirement.contains(&name.as_str()) {
@@ -422,21 +414,36 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // + tv_aggregator_close_pct_nonzero_total (its emit site, the deleted
     // per-tick seal write boundary). Dated notes in app-alarms.tf header +
     // aws-budget.md (COST NOTE 2026-07-17).
+    // 15 (was 17) since 2026-07-17 (dashboard tidy): REMOVED the 2 Dhan lag
+    // names — tv_dhan_exchange_lag_p99_seconds +
+    // tv_dhan_lag_samples_excluded_total — their only emit sites (the Dhan
+    // lag ring/publisher half of feed_lag_monitor.rs) were deleted with the
+    // dead Dhan-lag chain (spawn sites + tick source died PR-C2 2026-07-13 /
+    // stage-2 sweep 2026-07-17). Cost: -2 custom metric series (~-$0.60/mo)
+    // — dated note in aws-budget.md (COST NOTE 2026-07-17).
+    // 11 (was 15) since 2026-07-18 (stage-4 dead-producer sweep): REMOVED
+    // the 4 dead-tick names — tv_spill_dropped_total, tv_dlq_ticks_total,
+    // tv_ticks_dropped_total, tv_late_tick_after_boundary_total — their
+    // emit sites (tick_persistence.rs ring/spill/DLQ + the tick_processor.rs
+    // post-close check) were deleted in the stage-2 sweep (2026-07-17), so
+    // the names could never publish a datapoint again. Cost: -4 custom
+    // metric series (~-$1.20/mo, Assumed — series-hours decay to $0 once
+    // producers stop) — dated note in aws-budget.md (COST NOTE 2026-07-18).
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        17,
-        "Z+ L2 VERIFY ratchet: expected exactly 17 names in the MAIN EMF \
-         metric_selectors list (19 post-Groww-retirement minus the 2 dead \
-         aggregator names retired 2026-07-17); found {}: {names:?}",
+        11,
+        "Z+ L2 VERIFY ratchet: expected exactly 11 names in the MAIN EMF \
+         metric_selectors list (15 post-dashboard-tidy minus the 4 dead-tick \
+         names retired 2026-07-18, stage-4); found {}: {names:?}",
         names.len()
     );
     for required in [
         "tv_process_rss_bytes",
         "tv_subsystem_memory_estimated_bytes",
-        "tv_dhan_exchange_lag_p99_seconds",
-        "tv_dhan_lag_samples_excluded_total",
+        // tv_dhan_exchange_lag_p99_seconds + tv_dhan_lag_samples_excluded_total
+        // retired 2026-07-17 (dashboard tidy — dead Dhan-lag chain deleted).
         "tv_rest_1m_fire_heartbeat",
         // 2026-07-14 cluster-C order-side (dormant until cluster A / Phase-1):
         "tv_daily_pnl",
@@ -604,43 +611,11 @@ fn test_emf_metric_namespace_is_tickvault_prod_in_both_configs() {
     }
 }
 
-/// Extract the body of a single `resource "aws_cloudwatch_metric_alarm" "<name>"`
-/// block from a terraform file body (brace-balanced scan from the header line).
-fn alarm_resource_block(body: &str, resource_name: &str) -> String {
-    let header = format!("resource \"aws_cloudwatch_metric_alarm\" \"{resource_name}\"");
-    let start = body
-        .find(&header)
-        .unwrap_or_else(|| panic!("resource block {resource_name} not found")); // APPROVED: test
-    let rest = &body[start..];
-    let open = rest.find('{').expect("resource block has an opening brace"); // APPROVED: test
-    let mut depth = 0usize;
-    for (i, ch) in rest[open..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return rest[..open + i + 1].to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unbalanced braces in resource block {resource_name}"); // APPROVED: test
-}
-
-/// True iff `attr = value` (any whitespace around `=`) appears in the block.
-fn block_has_attr(block: &str, attr: &str, value: &str) -> bool {
-    block.lines().any(|l| {
-        let t = l.trim();
-        t.strip_prefix(attr)
-            .map(|rest| {
-                let rest = rest.trim_start();
-                rest.starts_with('=') && rest[1..].trim() == value
-            })
-            .unwrap_or(false)
-    })
-}
+// Helpers alarm_resource_block / block_has_attr DELETED 2026-07-17 with
+// their last caller (test_silent_feed_alarms_are_window_gated — both
+// silent-feed alarms retired the same day; see
+// test_silent_feed_alarms_fully_retired). Recover from git history if a
+// silent-feed alarm is ever re-added.
 
 /// Extract the string literal assigned to `pub const <name>: &str = "...";`
 /// in `crates/app/src/observability.rs`. If the RHS is another constant
@@ -741,31 +716,28 @@ fn test_cw_agent_collects_machine_log_paths() {
 // operator quote.
 
 #[test]
-fn test_silent_feed_alarms_are_window_gated() {
-    // The remaining silent-feed alarms (2026-07-06 hardening; the 2026-07-11
-    // groww lag mirror retired 2026-07-15 with the Groww live feed) follow the house
-    // market-hours-gate pattern
-    // (Rule 3): actions_enabled=false + appended to the window-gate Lambda
-    // ALARM_NAMES (09:20-15:35 IST Mon-Fri). The SLO publisher runs 24/7
-    // with off-hours dimension dips; the lag gauges go stale after close
-    // (the tick-gap gauge peer retired in PR-C3, 2026-07-14) — every one
-    // of them false-pages without the gate.
+fn test_silent_feed_alarms_fully_retired() {
+    // 2026-07-17: BOTH remaining silent-feed alarms retired the same day —
+    // boundary_catchup_storm_dhan with the stage-3 tick-aggregator deletion
+    // (its metric's writer died) and dhan_exchange_lag_p99_high with the
+    // dead Dhan-lag publisher chain (dashboard tidy). This replaces
+    // test_silent_feed_alarms_are_window_gated (its per-alarm loop is now
+    // empty) with a NON-VACUOUS retirement pin: no alarm resource may
+    // reappear in silent-feed-alarms.tf, and neither retired alarm may
+    // reappear in the window-gate Lambda ALARM_NAMES join.
     let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
     let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
-    // PR-C2 (2026-07-13): realtime_guarantee_degraded left this list — the
-    // alarm retired with the PARKed SLO publisher.
-    // Stage-3 (2026-07-17): boundary_catchup_storm_dhan left this list — the
-    // alarm retired with the tick-aggregator deletion (its metric's writer).
-    for name in ["dhan_exchange_lag_p99_high"] {
-        let block = alarm_resource_block(&tf, name);
+    assert!(
+        !tf.contains("resource \"aws_cloudwatch_metric_alarm\""),
+        "silent-feed-alarms.tf must carry ZERO alarm resources after the \
+         2026-07-17 retirements — re-adding one needs a dated rule-file \
+         note + window-gate wiring + a cost note (aws-budget.md)"
+    );
+    for name in ["boundary_catchup_storm_dhan", "dhan_exchange_lag_p99_high"] {
         assert!(
-            block_has_attr(&block, "actions_enabled", "false"),
-            "{name} must ship actions_enabled=false (gate Lambda owns the window)"
-        );
-        assert!(
-            gate.contains(&format!("aws_cloudwatch_metric_alarm.{name}.alarm_name")),
-            "{name} must be in the window-gate Lambda ALARM_NAMES join \
-             (market-hours-liveness-alarm.tf)"
+            !gate.contains(&format!("aws_cloudwatch_metric_alarm.{name}.alarm_name")),
+            "{name} was retired 2026-07-17 and must NOT reappear in the \
+             window-gate Lambda ALARM_NAMES join (market-hours-liveness-alarm.tf)"
         );
     }
 }
@@ -1006,10 +978,27 @@ fn test_app_alarms_count_is_twenty_two() {
     // deleted; a retained alarm would orphan a dead monitor the window gate
     // kept arming daily. Cost: -1 alarm (~-$0.10/mo) — dated notes in
     // silent-feed-alarms.tf S2 + aws-budget.md (COST NOTE 2026-07-17).
+    // 9 (was 10) since 2026-07-17 (dashboard tidy): REMOVED
+    // tv_dhan_exchange_lag_p99_seconds (alarm
+    // tv-<env>-dhan-exchange-lag-p99-high) — its only publisher
+    // (run_dhan_lag_publisher, dormant since PR-C2) was deleted with the
+    // dead Dhan-lag chain, so the alarm was a permanently-missing-data
+    // dead monitor. Cost: -1 alarm (~-$0.10/mo) — dated notes in
+    // silent-feed-alarms.tf + aws-budget.md (COST NOTE 2026-07-17).
+    // 5 (was 9) since 2026-07-18 (stage-4 dead-producer sweep): REMOVED
+    // tv_spill_dropped_total (alarm tv-<env>-spill-dropped),
+    // tv_dlq_ticks_total (tv-<env>-dlq-ticks), tv_ticks_dropped_total
+    // (tv-<env>-ticks-dropped) and tv_late_tick_after_boundary_total
+    // (tv-<env>-late-tick-after-boundary) — their emit sites (the
+    // tick_persistence.rs ring/spill/DLQ counters + the tick_processor.rs
+    // post-close check) were deleted in the stage-2 sweep (2026-07-17), so
+    // all four alarms were permanently-dead monitors. Cost: -4 alarms
+    // (~-$0.40/mo) — dated notes in app-alarms.tf + aws-budget.md
+    // (COST NOTE 2026-07-18).
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 10,
-        "Z+ L2 VERIFY ratchet: expected exactly 10 app-level CloudWatch alarm \
+        count, 5,
+        "Z+ L2 VERIFY ratchet: expected exactly 5 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \

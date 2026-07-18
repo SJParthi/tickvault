@@ -8,7 +8,8 @@
 //! ## Shape
 //! A fixed 6-slot registry (`Feed::COUNT` 2 × [`ChainUnderlying::COUNT`] 3)
 //! of `arc_swap::ArcSwap<ChainMoneynessSnapshot>`, house `OnceLock` pattern
-//! (the `feed_presence::GLOBAL` precedent in this same directory). Each
+//! (the retired `feed_presence::GLOBAL` precedent — registry deleted
+//! 2026-07-18, stage-4 dead-producer sweep). Each
 //! chain leg's per-minute fire PUBLISHES one whole snapshot (atomic
 //! pointer swap — a reader can never see minute N's header with minute
 //! N+1's rows); readers `load()` lock-free with ZERO allocation (the
@@ -213,7 +214,7 @@ impl ChainMoneynessSnapshot {
 const SLOT_COUNT: usize = Feed::COUNT * ChainUnderlying::COUNT;
 
 /// Process-global registry (house `OnceLock` pattern — mirrors
-/// `feed_presence::GLOBAL` in this directory). Lazily seeded with empty
+/// the retired `feed_presence::GLOBAL`). Lazily seeded with empty
 /// sentinels on first touch — no init-order failure class.
 static SLOTS: OnceLock<[ArcSwap<ChainMoneynessSnapshot>; SLOT_COUNT]> = OnceLock::new();
 

@@ -70,13 +70,17 @@
 
 ### Track B — dashboard tidy
 
-- [ ] B1: retire the `tv-${var.environment}-scoreboard` CloudWatch dashboard
+- [x] B1: retire the `tv-${var.environment}-scoreboard` CloudWatch dashboard
   (deploy/aws/terraform/dashboard.tf:281 — free-tier slot 2; the dual-feed
   comparison concluded with the live-feed retirements) with a dated note.
   - Files: deploy/aws/terraform/dashboard.tf
   - Tests: dashboard guard test updates (crates/common/tests /
     crates/app/tests terraform-shape guards that pin dashboard widgets)
-- [ ] B2: delete the dead Dhan-lag chain — `run_dhan_lag_publisher`
+  - Impl: dashboard.tf scoreboard resource deleted + dated 2026-07-17
+    retirement note (frees free-tier slot #2); aws_infra_wiring.rs
+    operator-dashboard pin unchanged (all pinned metrics still charted —
+    35/35 green)
+- [x] B2: delete the dead Dhan-lag chain — `run_dhan_lag_publisher`
   (crates/core/src/pipeline/feed_lag_monitor.rs:626; its Dhan tick feeder
   died with the 2026-07-13 lane retirement + the #1631 stage-2 sweep) + the
   2 EMF allowlist entries (`tv_dhan_exchange_lag_p99_seconds`,
@@ -93,21 +97,47 @@
   - Tests: crates/common/tests/metrics_catalog.rs update, alarm/EMF
     lockstep guard updates (crates/common/tests terraform wiring guards),
     scoped `cargo test -p tickvault-core -p tickvault-app`
-- [ ] B3: remove dead widgets from the `tv-${var.environment}-operator`
+  - Impl: feed_lag_monitor.rs ring/publisher half deleted (day-histogram
+    scoreboard half KEPT — DailyLagHistogram/day_lag_summary; 4 tests
+    green); benches/feed_lag_ring.rs + tests/dhat_feed_lag_ring.rs git
+    rm'd + benchmark-budgets.toml key removed; EMF allowlist 19→17 in
+    BOTH cloudwatch-agent.json + user-data.sh.tftpl (byte-identical,
+    cw_agent_selector_lockstep_guard 4/4); silent-feed-alarms.tf S3
+    dhan-lag alarm retired with dated note (DEVIATION: only ONE lag alarm
+    existed — the Groww S4 twin was already retired 2026-07-15, so the
+    delta is −1 alarm not −2); market-hours-liveness-alarm.tf window-gate
+    ALARM_NAMES 4→3; aws-budget.md COST NOTE 2026-07-17 (−~$0.70/mo)
+- [x] B3: remove dead widgets from the `tv-${var.environment}-operator`
   dashboard (dashboard.tf:27) whose metrics lost their producers in the
   live-WS retirements.
   - Files: deploy/aws/terraform/dashboard.tf
   - Tests: dashboard widget guard updates (same guard files as B1)
-- [ ] B4: remove /board page dead sections §3-4 (live-feed-era panels with
+  - Impl: operator dashboard WebSocket-health widget (tv_websocket_* — WS
+    pool deleted PR-C2/#1581) + spill/DLQ widget (tv_spill_*/tv_dlq_* —
+    tick writer deleted #1631) removed with dated notes; every widget
+    whose metric still has a live producer KEPT (per-widget verification
+    in the PR body); the sibling app-alarms.tf dead-monitor alarms are
+    deliberately NOT touched (flagged follow-up in the cost note)
+- [x] B4: remove /board page dead sections §3-4 (live-feed-era panels with
   no producer).
   - Files: crates/api/src/handlers/board.rs,
     crates/api/src/handlers/board_page.rs
   - Tests: board page unit tests in tickvault-api (render + section
     assertions updated), scoped `cargo test -p tickvault-api`
-- [ ] B5: remove dead /dashboard status chips (retired-feed chips).
+  - Impl: board_page.rs sections 3 (board-conns) + 4 (board-race) HTML/JS
+    removed with dated note; board.rs connections/race response fields +
+    the whole file-view scan chain (groww_dir/scan_connections/
+    newest_parity_race etc.) deleted; section-marker test now asserts the
+    retired markers ABSENT; api suite green
+- [x] B5: remove dead /dashboard status chips (retired-feed chips).
   - Files: crates/api/src/handlers/dashboard_page.rs
   - Tests: dashboard page unit tests in tickvault-api
-- [ ] B6: remove dead /feeds toggles for retired lanes (both live-WS enables
+  - Impl: NO-OP by verification (DEVIATION) — every subsystem chip on
+    /dashboard maps to a LIVE health.rs verdict (websocket/order_update/
+    questdb/token/pipeline/tick_persistence render real SubsystemInfo
+    state); no dead chip exists, so no edit — recorded here per the
+    unsure-=-KEEP rule
+- [x] B6: remove dead /feeds toggles for retired lanes (both live-WS enables
   are 409-refused — the dead toggle UI goes; the read-only health view
   stays).
   - Files: crates/api/src/handlers/feeds.rs,
@@ -115,13 +145,79 @@
     only if a route is dropped)
   - Tests: existing feeds handler tests updated (the 409-refusal tests are
     KEPT), scoped `cargo test -p tickvault-api`
-- [ ] B7: update every guard test pinned to the pre-tidy shapes (terraform
+  - Impl: KEEP + note (DEVIATION) — the toggle UI is generic over
+    `Feed::ALL` with `is_runtime_toggleable()` from the protected
+    crates/common/src/feed.rs (DO-NOT-TOUCH surface); the enable
+    direction is already 409-refused by the retained retirement refusals
+    whose tests the brief mandates KEEPING, and the disable direction
+    remains a legitimate operator action — removing the buttons would
+    orphan the kept 409 tests and require a common-crate edit; no route
+    dropped, no edit
+- [x] B7: update every guard test pinned to the pre-tidy shapes (terraform
   wiring guards, page/body guards, metrics catalog) in the SAME PR so All
   Green stays the choke point — never `continue-on-error`, never a weakened
   needle.
   - Files: crates/common/tests/*.rs (terraform + metrics guards),
     crates/app/tests/*.rs, crates/api/tests/*.rs (as matched)
   - Tests: the guards themselves (build-failing)
+  - Impl: cloudwatch_app_alarms_wiring.rs EMF count 19→17 (16/16 green);
+    cw_agent_selector_lockstep_guard.rs (4/4); metrics_catalog.rs lag
+    entries removed (9/9); aws_infra_wiring.rs unchanged-and-green
+    (35/35); board_page section-marker test updated (11 board tests
+    green); observability-architecture.md paging list grep-verified — NO
+    lag/scoreboard entry exists, so no rule-file paging edit owed
+
+### Stage-4 — dead-producer observability sweep (2026-07-18)
+
+- [x] S1: retire the 4 dead-tick alarm chains (tv_spill_dropped_total,
+  tv_dlq_ticks_total, tv_ticks_dropped_total,
+  tv_late_tick_after_boundary_total) — zero emit sites since the stage-2
+  tick-chain deletion 2026-07-17; delete the 4 app-alarms.tf resources,
+  remove the 4 names from BOTH EMF selector copies (byte-identical), empty
+  the stage-2 dead-monitor allowlist, re-pin alarm count 9→5 + EMF 15→11,
+  factual dated notes in guarantees.md / zero-tick-loss runbook /
+  operator docs / aws-budget.md COST NOTE 2026-07-18.
+  - Files: deploy/aws/terraform/app-alarms.tf, deploy/aws/cloudwatch-agent.json,
+    deploy/aws/terraform/user-data.sh.tftpl,
+    crates/common/tests/cloudwatch_app_alarms_wiring.rs,
+    deploy/grafana-cloud/tickvault-operator-dashboard.json,
+    docs/architecture/guarantees.md, docs/runbooks/zero-tick-loss.md,
+    .claude/rules/project/aws-budget.md
+  - Tests: test_every_alarm_metric_has_a_rust_emit_site,
+    test_app_alarms_count_is_twenty_two (pin 5),
+    test_emf_metric_selectors_name_count_is_pinned (pin 11),
+    cw_agent_selector_lockstep_guard (4 tests)
+- [x] S2: delete the producer-less feed-presence registry
+  (feed_presence.rs + presence_registration.rs + dhat_feed_presence.rs +
+  bench + budget + config flag + main.rs/scoreboard wiring); the
+  scoreboard coverage path degrades honestly to its existing sql_backfill
+  arm; ci.yml DHAT lane drift list + count updated.
+  - Files: crates/core/src/pipeline/feed_presence.rs (delete),
+    crates/core/src/instrument/presence_registration.rs (delete),
+    crates/core/tests/dhat_feed_presence.rs (delete),
+    crates/core/benches/feed_presence.rs (delete), crates/app/src/main.rs,
+    crates/app/src/feed_scoreboard_boot.rs, crates/common/src/config.rs,
+    config/base.toml, .github/workflows/ci.yml,
+    quality/benchmark-budgets.toml,
+    crates/core/src/auth/secret_manager.rs
+  - Tests: feed_scoreboard_boot unit tests, bench_budget guard,
+    cargo test -p tickvault-core --features dhat --no-run
+- [x] S3: MED-2 — delete the consumer-less TICK_BUFFER_CAPACITY orphan
+  (constants.rs, minimal flagged edit) + zero_tick_loss_alert_guard.rs
+  (its seal-ring rationale is factually false) +
+  chaos_burst_indices_only.rs; re-point every honest-100% template line
+  at the LIVE envelope (SEAL_BUFFER_CAPACITY 200_000, ratcheted by
+  seal_ring.rs) and rewrite wave4_section8_wording_guard.rs in lockstep.
+  - Files: crates/common/src/constants.rs,
+    crates/storage/tests/zero_tick_loss_alert_guard.rs (delete),
+    crates/storage/tests/chaos_burst_indices_only.rs (delete),
+    crates/common/tests/wave4_section8_wording_guard.rs,
+    .claude/rules/project/operator-charter-forever.md,
+    .claude/rules/project/per-wave-guarantee-matrix.md,
+    .claude/rules/project/wave-4-shared-preamble.md (+ sibling rule lines)
+  - Tests: wave4_section8_wording_guard (rewritten),
+    seal_ring.rs::test_seal_buffer_capacity_constant_is_locked_value,
+    constants.rs unit tests
 
 ## Design
 
