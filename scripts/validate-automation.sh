@@ -123,11 +123,12 @@ run_check "auto-fix clear-spill executable" \
 run_check "error-triage hook executable" \
     test -x .claude/hooks/error-triage.sh
 # 2026-07-18 (rust-only phase 2c, CUTOVER): .mcp.json launches the Rust
-# server via the launcher; server.py + test_placeholder_fallback.py are
-# DELETED from git (the parity harness re-materializes server.py from
-# pinned git history). The self-test check exercises the REAL .mcp.json
-# launch path (launcher -> prebuilt release binary, else cargo run);
-# the placeholder-env fallback twins live in the crate's config.rs tests.
+# server via the launcher; the python server + its placeholder-fallback
+# test are DELETED from git (the parity harness re-materializes server.py
+# from pinned git history). The self-test check exercises the REAL
+# .mcp.json launch path (launcher -> prebuilt release binary, else cargo
+# run); the placeholder-env fallback twins live in the crate's config.rs
+# tests.
 run_check "tickvault-logs MCP launcher present + executable" \
     test -x scripts/mcp-servers/tickvault-logs-launch.sh
 run_check "tickvault-logs MCP self-test passes (rust, via launcher)" \
