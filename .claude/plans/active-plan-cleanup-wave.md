@@ -187,7 +187,7 @@
     test_app_alarms_count_is_twenty_two (pin 5),
     test_emf_metric_selectors_name_count_is_pinned (pin 11),
     cw_agent_selector_lockstep_guard (4 tests)
-- [ ] S2: delete the producer-less feed-presence registry
+- [x] S2: delete the producer-less feed-presence registry
   (feed_presence.rs + presence_registration.rs + dhat_feed_presence.rs +
   bench + budget + config flag + main.rs/scoreboard wiring); the
   scoreboard coverage path degrades honestly to its existing sql_backfill

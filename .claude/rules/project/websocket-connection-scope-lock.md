@@ -288,7 +288,7 @@ row Verified with file:line evidence):
 `index_extractor` (`NSE_INDEX_ALLOWLIST` + `canonicalize_index_symbol`),
 `index_futures.rs` (the §36 selector — DE-GATED from the `daily_universe_fetcher` cargo
 feature, else the Groww §36.7 futures silently drop = a scope violation),
-`instrument_snapshot::is_valid_trading_date`, `presence_registration::ist_day_from_date`,
+`instrument_snapshot::is_valid_trading_date`, `presence_registration::ist_day_from_date` *(retired 2026-07-18, stage-4 — caller-less after the presence registry deleted; the scoreboard derives the IST day itself)*,
 `storage::lifecycle_reconciler::classify_transition`, the `instrument_lifecycle` /
 `index_constituency` / `instrument_fetch_audit` TABLES (SEBI never-delete), the ts-pin
 migration, the Groww `shared_master_writer`, the scoreboard, `feed_presence`, and the
