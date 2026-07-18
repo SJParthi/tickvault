@@ -142,8 +142,15 @@ pub fn groww_chain_identity(
 }
 
 /// Day-keyed contract-identity index for the chain mark tap:
-/// `(underlying, strike_paise, leg)` → `(exchange_token u64, segment_code)`.
-type ContractMarkIndex = std::collections::HashMap<(&'static str, i64, &'static str), (u64, u8)>;
+/// `(underlying, expiry, strike_paise, leg)` →
+/// `(exchange_token u64, segment_code)`. Expiry is IN the key (R1 review,
+/// 2026-07-18): the chain fire's expiry is the cadence DAY-LOCKED policy
+/// expiry (BANKNIFTY = month-last) while the books resolve at
+/// `select_current_option_expiry` (flat nearest ≥ today) — on a
+/// divergence day the mismatched leg must go UNRESOLVED (counted), never
+/// silently resolve to the WRONG-expiry token (id-discipline class).
+type ContractMarkIndex =
+    std::collections::HashMap<(&'static str, NaiveDate, i64, &'static str), (u64, u8)>;
 
 /// Integer-paise strike key — float-equality-free join between the chain
 /// response's vendor strike keys and the master-derived contract book's
@@ -177,7 +184,7 @@ fn build_contract_mark_index(books: &[GrowwContractBook]) -> ContractMarkIndex {
                     && let Ok(token) = u64::try_from(contract.token)
                 {
                     index
-                        .entry((book.underlying, key, leg))
+                        .entry((book.underlying, book.expiry, key, leg))
                         .or_insert((token, seg_code));
                 }
             }
@@ -1127,8 +1134,14 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                             if !leg.ltp.is_finite() || leg.ltp <= 0.0 {
                                 continue;
                             }
-                            let resolved = strike_paise_key(leg.strike)
-                                .and_then(|key| index.get(&(underlying, key, leg.leg)));
+                            // Expiry is part of the identity key: the
+                            // fire's DAY-LOCKED policy expiry must match
+                            // the index book's expiry or the leg goes
+                            // UNRESOLVED (fail-closed — never a
+                            // wrong-expiry token).
+                            let resolved = strike_paise_key(leg.strike).and_then(|key| {
+                                index.get(&(underlying, expiry_date, key, leg.leg))
+                            });
                             match resolved {
                                 Some(&(token, seg_code)) => {
                                     #[allow(clippy::cast_possible_truncation)]
@@ -1146,11 +1159,20 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                     }
                     None => {
                         // No same-day index (master download not yet run /
-                        // failed) — every leg is identity-unresolved;
-                        // counted, never a synthetic id, never a download
-                        // on the chain fire's critical path.
+                        // failed) — every WOULD-HAVE-FORWARDED leg is
+                        // identity-unresolved; counted, never a synthetic
+                        // id, never a download on the chain fire's
+                        // critical path. Non-finite/≤0-LTP legs are
+                        // skipped FIRST in BOTH arms (R1 review,
+                        // 2026-07-18): unresolved = a leg that would have
+                        // become a mark but could not resolve.
+                        let would_forward = chain
+                            .legs
+                            .iter()
+                            .filter(|leg| leg.ltp.is_finite() && leg.ltp > 0.0)
+                            .count();
                         metrics::counter!("tv_cadence_option_mark_unresolved_total")
-                            .increment(u64::try_from(chain.legs.len()).unwrap_or(u64::MAX));
+                            .increment(u64::try_from(would_forward).unwrap_or(u64::MAX));
                     }
                 }
             }
@@ -1355,19 +1377,60 @@ mod tests {
             ],
         };
         let index = build_contract_mark_index(std::slice::from_ref(&book));
+        let e = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
         assert_eq!(
-            index.get(&("NIFTY", 2_550_000, "CE")),
+            index.get(&("NIFTY", e, 2_550_000, "CE")),
             Some(&(
                 12345_u64,
                 tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO
             ))
         );
         // One-sided strike: no PE entry fabricated.
-        assert_eq!(index.get(&("NIFTY", 2_550_000, "PE")), None);
+        assert_eq!(index.get(&("NIFTY", e, 2_550_000, "PE")), None);
         // Non-representable token: no entry — the tap counts it
         // unresolved instead of guessing an id.
-        assert_eq!(index.get(&("NIFTY", 2_560_000, "PE")), None);
+        assert_eq!(index.get(&("NIFTY", e, 2_560_000, "PE")), None);
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn test_contract_mark_index_expiry_mismatch_never_resolves() {
+        // R1 review (2026-07-18, MEDIUM): the chain fire's DAY-LOCKED
+        // policy expiry (E1) can diverge from the book's
+        // select_current_option_expiry (E2 — e.g. BANKNIFTY month-last
+        // vs flat nearest). A book built at E2 must NOT resolve a leg
+        // fired at E1 — the tap's `index.get` returns None and the leg
+        // is COUNTED unresolved (fail-closed), never misattributed to
+        // the wrong-expiry exchange_token.
+        use crate::groww_contract_1m_boot::{GrowwContractRef, GrowwStrikeSlot};
+        let e1 = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(); // fire's policy expiry
+        let e2 = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(); // book's flat-nearest expiry
+        let book = GrowwContractBook {
+            underlying: "BANKNIFTY",
+            exchange: "NSE",
+            segment: "NSE_FNO",
+            underlying_security_id: 2,
+            expiry: e2,
+            strikes: vec![GrowwStrikeSlot {
+                strike: 57000.0,
+                ce: Some(GrowwContractRef {
+                    groww_symbol: "NSE-BANKNIFTY-30Jul26-57000-CE".to_string(),
+                    token: 98765,
+                }),
+                pe: None,
+            }],
+        };
+        let index = build_contract_mark_index(std::slice::from_ref(&book));
+        // Same underlying/strike/leg at the FIRE's expiry E1: unresolved.
+        assert_eq!(index.get(&("BANKNIFTY", e1, 5_700_000, "CE")), None);
+        // Matching expiry E2 resolves normally (happy path).
+        assert_eq!(
+            index.get(&("BANKNIFTY", e2, 5_700_000, "CE")),
+            Some(&(
+                98765_u64,
+                tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO
+            ))
+        );
     }
 
     fn master_row(
