@@ -29,6 +29,7 @@ pub mod budget_digest;
 pub mod budget_killswitch;
 pub mod clients;
 pub mod events;
+pub mod hard_stop_guard;
 pub mod logging;
 pub mod market_hours_gate;
 pub mod start_watchdog;
