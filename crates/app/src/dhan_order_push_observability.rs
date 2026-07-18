@@ -17,9 +17,12 @@
 //! stage pattern mirrored from `order_observability.rs` — NO new
 //! ErrorCode. No live orders; `dry_run` is untouched.
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
+use tickvault_common::broker_order_events::{
+    OrderUpdateEventRecord, build_dhan_order_event_record,
+};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::IST_UTC_OFFSET_NANOS;
 use tickvault_common::error_code::ErrorCode;
@@ -211,15 +214,55 @@ fn persist_push_row(writer: &mut OrderAuditWriter, row: &OrderAuditRow) {
 }
 
 // ---------------------------------------------------------------------------
+// Full-fidelity capture publish (ORDER-EVT-01 sink_drop semantics — the
+// Dhan producer half of the order_update_events capture lane, 2026-07-18)
+// ---------------------------------------------------------------------------
+
+/// Best-effort `try_send` of one Dhan full-fidelity capture record into the
+/// `order_update_events` consumer channel. `None` sender (capture disabled)
+/// is a silent no-op; a FULL or CLOSED channel drops the ROW loudly
+/// (counted + coded `ORDER-EVT-01 stage="sink_drop"`) and NEVER blocks or
+/// fails the paper-audit path — the capture is additive forensics.
+fn publish_dhan_event_record(
+    events_tx: Option<&mpsc::Sender<OrderUpdateEventRecord>>,
+    record: OrderUpdateEventRecord,
+) {
+    let Some(tx) = events_tx else {
+        return;
+    };
+    if let Err(e) = tx.try_send(record) {
+        let reason = match e {
+            mpsc::error::TrySendError::Full(_) => "full",
+            mpsc::error::TrySendError::Closed(_) => "closed",
+        };
+        metrics::counter!("tv_order_update_events_dropped_total", "reason" => reason).increment(1);
+        error!(
+            code = ErrorCode::OrderEvt01PersistFailed.code_str(),
+            stage = "sink_drop",
+            feed = "dhan",
+            channel = "order",
+            reason,
+            "ORDER-EVT-01: dhan order push-event capture record dropped — the \
+             capture consumer channel is {reason}; the forensic row for this \
+             event is lost (best-effort capture; the paper audit path and the \
+             feed are unaffected)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The consumer loop + supervisor
 // ---------------------------------------------------------------------------
 
 /// Inner consumer: ensures the `order_audit` table once (idempotent,
 /// subsystem-owned lazy ensure), then drains the broadcast — one paper
-/// audit row + one bounded-label counter increment per received update.
+/// audit row + one bounded-label counter increment per received update,
+/// plus one best-effort full-fidelity capture record (`order_update_events`)
+/// when the capture channel is wired.
 async fn run_dhan_order_push_consumer(
     questdb: QuestDbConfig,
     mut rx: broadcast::Receiver<OrderUpdate>,
+    events_tx: Option<mpsc::Sender<OrderUpdateEventRecord>>,
 ) {
     ensure_order_audit_table(&questdb).await;
     let mut writer = OrderAuditWriter::new(&questdb);
@@ -229,7 +272,15 @@ async fn run_dhan_order_push_consumer(
             Ok(update) => {
                 let status = order_status_label(&update.status);
                 metrics::counter!("tv_dhan_order_updates_total", "status" => status).increment(1);
-                let row = order_update_to_audit_row(&update, now_ist_nanos());
+                let ts_ist_nanos = now_ist_nanos();
+                // Full-fidelity capture lane (additive, best-effort) —
+                // BEFORE the blocking audit flush so a slow QuestDB leg
+                // never delays the receipt-stamped capture publish.
+                publish_dhan_event_record(
+                    events_tx.as_ref(),
+                    build_dhan_order_event_record(&update, ts_ist_nanos),
+                );
+                let row = order_update_to_audit_row(&update, ts_ist_nanos);
                 persist_push_row(&mut writer, &row);
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -265,6 +316,7 @@ pub fn spawn_dhan_order_push_consumer(
     questdb: QuestDbConfig,
     sender: broadcast::Sender<OrderUpdate>,
     first_rx: broadcast::Receiver<OrderUpdate>,
+    events_tx: Option<mpsc::Sender<OrderUpdateEventRecord>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut pending_first_rx = Some(first_rx);
@@ -275,8 +327,12 @@ pub fn spawn_dhan_order_push_consumer(
                 None => sender.subscribe(),
             };
             let qdb = questdb.clone();
+            let capture_tx = events_tx.clone();
             let run_started = std::time::Instant::now();
-            let inner = tokio::spawn(async move { run_dhan_order_push_consumer(qdb, rx).await });
+            let inner =
+                tokio::spawn(
+                    async move { run_dhan_order_push_consumer(qdb, rx, capture_tx).await },
+                );
             let reason = match inner.await {
                 // The inner loop is infinite while the supervisor holds a
                 // sender clone — a clean return is abnormal.
@@ -427,6 +483,46 @@ mod tests {
         assert_eq!(row.security_id, -1);
         assert_eq!(row.event, OrderAuditEvent::Cancelled);
         assert_eq!(row.order_status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_publish_dhan_event_record_delivers_into_the_capture_channel() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let update = update_with("TRADED");
+        publish_dhan_event_record(Some(&tx), build_dhan_order_event_record(&update, 909));
+        let rec = rx
+            .recv()
+            .await
+            .unwrap_or_else(|| panic!("capture record expected"));
+        assert_eq!(rec.ts_ist_nanos, 909);
+        assert_eq!(rec.order_id, "112111182045");
+        assert_eq!(rec.raw_status, "TRADED");
+        assert_eq!(rec.feed, tickvault_common::feed::Feed::Dhan);
+    }
+
+    #[tokio::test]
+    async fn test_publish_dhan_event_record_none_sender_is_a_noop() {
+        // Capture disabled: no channel, no panic, no side effect.
+        let update = update_with("PENDING");
+        publish_dhan_event_record(None, build_dhan_order_event_record(&update, 1));
+    }
+
+    #[tokio::test]
+    async fn test_publish_dhan_event_record_full_channel_drops_without_blocking() {
+        let (tx, _rx) = mpsc::channel(1);
+        let update = update_with("PENDING");
+        // Fill the single slot, then publish again — must return (drop),
+        // never block the consumer loop.
+        publish_dhan_event_record(Some(&tx), build_dhan_order_event_record(&update, 1));
+        publish_dhan_event_record(Some(&tx), build_dhan_order_event_record(&update, 2));
+    }
+
+    #[tokio::test]
+    async fn test_publish_dhan_event_record_closed_channel_drops_without_panic() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let update = update_with("CANCELLED");
+        publish_dhan_event_record(Some(&tx), build_dhan_order_event_record(&update, 3));
     }
 
     #[test]
