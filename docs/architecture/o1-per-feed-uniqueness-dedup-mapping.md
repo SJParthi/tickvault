@@ -35,7 +35,7 @@ nothing ever turns into a scan.
 | O(1) claim | Mechanism (real code) | Verified | Build-failing guard |
 |---|---|---|---|
 | **O(1) uniqueness** | composite key `(security_id, exchange_segment)` (I-P1-11); `feed` added for per-feed rows. `InstrumentRegistry.by_composite: HashMap<(SecurityId, ExchangeSegment), _>` (`crates/common/src/instrument_registry.rs`) | ✅ TRUE | `dedup_segment_meta_guard::every_dedup_key_with_security_id_must_include_segment` + `per_feed_market_data_dedup_keys_must_include_feed`; banned-pattern scanner cat-5 (no `HashSet<u32>` on instrument paths) |
-| **O(1) deduplication** | QuestDB `DEDUP UPSERT KEYS(...)` = **amortized O(1) hash upsert** at the DB; in-RAM a bounded ring (`TICK_BUFFER_CAPACITY`=100K, O(1) append) prevents loss. **Caveat: dedup is QuestDB-side, NOT in-memory** — duplicates may briefly coexist in the ring and collapse at DB write (correct by design). `capture_seq` is the replay-stable tiebreaker. | ✅ TRUE (DB) / ⚠️ by-design (no in-RAM dedup) | the 3 `dedup_segment_meta_guard` tests + `chaos_index_same_value_burst_preserved.rs` |
+| **O(1) deduplication** | QuestDB `DEDUP UPSERT KEYS(...)` = **amortized O(1) hash upsert** at the DB; in-RAM a bounded ring prevented loss *(the tick ring + its constant retired 2026-07-18 with the dead tick chain — the live bounded ring is the 200,000-seal `SEAL_BUFFER_CAPACITY` ring)*. **Caveat: dedup is QuestDB-side, NOT in-memory** — duplicates may briefly coexist in the ring and collapse at DB write (correct by design). `capture_seq` is the replay-stable tiebreaker. | ✅ TRUE (DB) / ⚠️ by-design (no in-RAM dedup) | the 3 `dedup_segment_meta_guard` tests + `chaos_index_same_value_burst_preserved.rs` |
 | **O(1) mapping** | instrument registry = **std `HashMap`, immutable, `Arc`-shared** (built once at boot, O(1) `get_with_segment`). ISIN→security_id constituent map built ONCE then O(1)/lookup (`constituent_resolver.rs`). **NOTE: the registry is std HashMap, NOT papaya** — papaya is reserved for future dynamic structures; the immutable Arc-shared registry needs no MVCC. | ✅ TRUE | `dhat_instrument_registry.rs` (zero-alloc `get` ×1000) + Criterion `registry_get=50ns` |
 | **O(1) latency** | binary parse = fixed-offset `from_le_bytes` (no loop/alloc, `crates/core/src/parser/*.rs`); bounded SPSC (`rtrb`) + bounded broadcast (no unbounded channels); `feed` stamped as `&'static str`/`Copy` enum (`Feed::as_str` const fn) — zero-alloc | ✅ TRUE | `dhat_ws_reader_zero_alloc.rs` (0 allocs/1000 iters) + Criterion budgets `dispatch_frame=10ns`/`pipeline=100ns` + `bench-gate.sh` 5% gate |
 
@@ -82,8 +82,8 @@ feeds watch — keying by feed would duplicate the universe, breaking I-P1-11).
 ## §4. The HONEST envelope (mandatory wording — `operator-charter-forever.md` §F)
 
 > "100% inside the tested envelope, with ratcheted regression coverage: ≤60s
-> QuestDB outage absorbed by rescue→spill→DLQ; ≤100,000-tick ring buffer
-> capacity (`TICK_BUFFER_CAPACITY`, ratcheted by `zero_tick_loss_alert_guard.rs`);
+> QuestDB outage absorbed by rescue→spill→DLQ; ≤200,000-seal ring buffer
+> capacity (`SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`);
 > bench-gated O(1) hot path; composite-key `(security_id, exchange_segment)`
 > uniqueness pinned by `dedup_segment_meta_guard.rs`; chaos-tested 65h weekend
 > sleep/wake. Beyond the envelope, DLQ NDJSON catches every payload as

@@ -366,7 +366,7 @@ const LEGACY_EXTRA_CANDLE_MATVIEW_NAMES: [&str; 5] = [
 /// SEBI 5-year retention obligation and must never be auto-dropped; the
 /// other audit tables were already retired with their own boot wiring in
 /// #T2. This list is ONLY the instrument / misc / greeks tables.
-const RETIRED_QUESTDB_TABLES: [&str; 14] = [
+const RETIRED_QUESTDB_TABLES: [&str; 18] = [
     // #T3 — instrument tables
     "fno_underlyings",
     "derivative_contracts",
@@ -384,8 +384,59 @@ const RETIRED_QUESTDB_TABLES: [&str; 14] = [
     "greeks_verification",
     // dead REST-era feed tables (drop-sweep 2026-07-17)
     "deep_market_depth",
-    "movers_1s",
+    // Track A drop extension (2026-07-18, operator-approved cleanup wave):
+    // - `historical_candles`: no live writer since the 2026-05-26 Dhan
+    //   historical chain deletion (PR-E); remaining refs are history-only.
+    // - `stock_movers` / `option_movers`: movers runtime deleted 2026-05-19
+    //   (AWS-lifecycle PRs #2-#4); the per-timeframe movers grid (matview OR
+    //   table era) is swept by `retired_movers_object_names()` below.
+    // - the two movers one-shot migration MARKER tables.
+    "historical_candles",
+    "stock_movers",
+    "option_movers",
+    "movers_migration_2026_05_01",
+    "movers_legacy_retire_2026_05_03",
 ];
+
+/// Every per-timeframe `movers_*` object name any deployment era could
+/// still physically hold (enumerated from the deleted
+/// `movers_base_persistence.rs` history, commit `7f259d79^`):
+///
+/// - the 25-matview era: `movers_{5s,10s,15s,30s,1m..15m,30m,1h,2h,3h,4h,1d}`
+/// - the legacy 24 `movers_unified_*` matviews:
+///   `movers_unified_{5s,15s,30s,1m..15m,30m,1h,2h,3h,4h,1d}`
+/// - the legacy 25 plain TABLES:
+///   `movers_{1s,2s,3s,5s,10s,15s,20s,30s,1m..15m,30m,1h}`
+///
+/// Because the SAME name was a matview in one era and a plain table in
+/// another, the sweep issues BOTH `DROP MATERIALIZED VIEW IF EXISTS` and
+/// `DROP TABLE IF EXISTS` for every name in the union (53 names). Both
+/// forms are idempotent no-ops when the name is absent or held by the
+/// other object kind (a non-2xx is logged `warn!` and never blocks boot).
+fn retired_movers_object_names() -> Vec<String> {
+    let sub_minute = ["1s", "2s", "3s", "5s", "10s", "15s", "20s", "30s"];
+    let super_minute = ["30m", "1h", "2h", "3h", "4h", "1d"];
+    let mut names = Vec::with_capacity(53);
+    for sfx in sub_minute {
+        names.push(format!("movers_{sfx}"));
+    }
+    for m in 1..=15u8 {
+        names.push(format!("movers_{m}m"));
+    }
+    for sfx in super_minute {
+        names.push(format!("movers_{sfx}"));
+    }
+    for sfx in ["5s", "15s", "30s"] {
+        names.push(format!("movers_unified_{sfx}"));
+    }
+    for m in 1..=15u8 {
+        names.push(format!("movers_unified_{m}m"));
+    }
+    for sfx in super_minute {
+        names.push(format!("movers_unified_{sfx}"));
+    }
+    names
+}
 
 /// Idempotently drop every legacy QuestDB object so the live schema
 /// converges to the 24-table KEEP set.
@@ -399,6 +450,8 @@ const RETIRED_QUESTDB_TABLES: [&str; 14] = [
 /// 4. The `aggregator_seal_audit` table (#T2a table cleanup).
 /// 5. The instrument / misc / greeks tables retired by #T3, #T4 and the
 ///    PR #3 greeks teardown (`RETIRED_QUESTDB_TABLES`).
+/// 6. The dead per-timeframe movers grid (`retired_movers_object_names`)
+///    — matview drop THEN table drop per name (era-dependent object kind).
 ///
 /// Each statement is `DROP … IF EXISTS`, so this is safe to call on every
 /// boot regardless of which objects actually exist. Failures are logged at
@@ -430,17 +483,34 @@ const RETIRED_QUESTDB_TABLES: [&str; 14] = [
 /// Marker path: `data/state/legacy_candle_objects_dropped.marker`.
 /// To re-run the cleanup (e.g. after restoring from a stale backup),
 /// `rm` the marker file.
-// WIRING-EXEMPT: boot wiring lives in crates/app/src/main.rs before ensure_shadow_candle_tables; integration-covered by CI boot + `make doctor`.
+// WIRING-EXEMPT: boot wiring lives in crates/app/src/candle_ddl_boot.rs (awaited from `build_shared_infra` before the seal-writer spawn — the Track A 2026-07-18 re-wire; pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs); integration-covered by CI boot + `make doctor`.
 pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
-    // PR #798 marker-file gate — skip the entire cleanup loop on
-    // deployments where it has already run successfully.
+    // PR #798 marker-file gate, VERSIONED (Track A, 2026-07-18) — skip the
+    // cleanup loop only when the marker records the CURRENT sweep version.
+    // A pre-version marker (the original PR #798 free-text content) or a
+    // lower version means the drop list was extended since that deployment
+    // last swept — re-run exactly once and rewrite the marker at the new
+    // version. Deleting the file still forces a manual re-run.
     let marker_path = std::path::Path::new(LEGACY_DROP_MARKER_PATH);
     if marker_path.exists() {
-        tracing::debug!(
-            marker = LEGACY_DROP_MARKER_PATH,
-            "legacy candle cleanup already done on this deployment — skipping (PR #798)"
-        );
-        return;
+        // The exists() check is the fast-path short-circuit the PR #798
+        // ratchet (crates/common/tests/legacy_drop_marker_gate_guard.rs)
+        // pins; the version compare inside decides whether the existing
+        // marker still covers the CURRENT drop list.
+        if let Ok(content) = std::fs::read_to_string(marker_path)
+            && marker_records_current_version(&content)
+        {
+            tracing::debug!(
+                marker = LEGACY_DROP_MARKER_PATH,
+                version = LEGACY_DROP_SWEEP_VERSION,
+                "legacy candle cleanup already done at the current sweep version — skipping (PR #798)"
+            );
+            return;
+        }
+        // Marker exists but records an OLDER version (or is unreadable /
+        // garbage): the drop list was extended since that deployment last
+        // swept — fall through, re-run exactly once, and rewrite the
+        // marker at the current version below.
     }
 
     let base_url = format!(
@@ -531,6 +601,28 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         run_drop_ddl(&client, &base_url, table, &ddl).await;
     }
 
+    // 6. Drop the dead per-timeframe movers grid (Track A, 2026-07-18).
+    //    The movers runtime was deleted 2026-05-19 (AWS-lifecycle PRs
+    //    #2-#4); across eras these names were MATERIALIZED VIEWS or plain
+    //    TABLES, so each name gets BOTH drop forms. TWO PASSES, matviews
+    //    first: on the matview-era vintage the `movers_5s..1d` /
+    //    `movers_unified_*` matviews cascade from the `movers_1s` base
+    //    table, and a base table with live dependent matviews refuses to
+    //    drop — a single interleaved pass would attempt the `movers_1s`
+    //    TABLE drop (grid position 1) before its dependents are gone,
+    //    warn, and leave it orphaned FOREVER (the marker is still
+    //    written). Dropping every matview first makes every subsequent
+    //    table drop dependency-free. Both forms are `IF EXISTS`
+    //    idempotent; a form mismatch is a logged warn, never a blocker.
+    for name in retired_movers_object_names() {
+        let view_ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {name};");
+        run_drop_ddl(&client, &base_url, &name, &view_ddl).await;
+    }
+    for name in retired_movers_object_names() {
+        let table_ddl = format!("DROP TABLE IF EXISTS {name};");
+        run_drop_ddl(&client, &base_url, &name, &table_ddl).await;
+    }
+
     // PR #798 (operator-locked 2026-05-25) — write one-shot marker so
     // subsequent boots skip the entire cleanup loop. Best-effort: if
     // the marker can't be written (disk full, perms), the cleanup just
@@ -546,10 +638,7 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         );
         return;
     }
-    if let Err(err) = std::fs::write(
-        marker_path,
-        "PR #798 marker — legacy candle objects cleaned up on this deployment.\n",
-    ) {
+    if let Err(err) = std::fs::write(marker_path, legacy_drop_marker_content()) {
         tracing::warn!(
             ?err,
             path = LEGACY_DROP_MARKER_PATH,
@@ -569,6 +658,36 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
 /// after restoring from an older QuestDB backup that still has the
 /// legacy matviews), delete the file.
 const LEGACY_DROP_MARKER_PATH: &str = "data/state/legacy_candle_objects_dropped.marker";
+
+/// Track A (2026-07-18) — the one-shot marker is now VERSIONED. Bump this
+/// integer whenever the drop set is EXTENDED (new retired tables/matviews)
+/// so every existing deployment re-runs the sweep exactly once for the new
+/// list, then re-parks. Version history:
+/// - (unversioned) PR #798 original marker — the pre-2026-07-18 sweep
+/// - 2: historical_candles + stock/option_movers + the movers timeframe
+///   grid (matview+table dual-drop) + the movers migration marker tables
+const LEGACY_DROP_SWEEP_VERSION: u32 = 2;
+
+/// The marker line the versioned gate greps for. Kept on its own line so a
+/// future version bump changes exactly one token.
+fn legacy_drop_marker_content() -> String {
+    format!(
+        "legacy candle/table drop sweep complete on this deployment.\n\
+         sweep_version={LEGACY_DROP_SWEEP_VERSION}\n"
+    )
+}
+
+/// True when the marker file content records a sweep version >= the
+/// current [`LEGACY_DROP_SWEEP_VERSION`]. The original PR #798 marker had
+/// no version line — it parses as version 0 and re-arms the sweep once.
+fn marker_records_current_version(content: &str) -> bool {
+    content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("sweep_version="))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        >= LEGACY_DROP_SWEEP_VERSION
+}
 
 /// Issue one DROP DDL statement to QuestDB's `/exec` endpoint.
 ///
@@ -684,6 +803,12 @@ mod tests {
         assert!(
             marker.exists(),
             "first run must write the one-shot marker (PR #798 gate)"
+        );
+        let written = std::fs::read_to_string(marker).expect("marker readable");
+        assert!(
+            marker_records_current_version(&written),
+            "marker must record the CURRENT sweep version so the versioned \
+             gate parks the sweep: {written:?}"
         );
 
         // Second run: marker present → early skip (no HTTP traffic needed).
@@ -818,12 +943,68 @@ mod tests {
     }
 
     #[test]
-    fn test_retired_questdb_tables_count_is_fourteen_and_unique() {
-        assert_eq!(RETIRED_QUESTDB_TABLES.len(), 14);
+    fn test_retired_questdb_tables_count_is_eighteen_and_unique() {
+        assert_eq!(RETIRED_QUESTDB_TABLES.len(), 18);
         let mut seen = std::collections::HashSet::new();
         for table in RETIRED_QUESTDB_TABLES {
             assert!(seen.insert(table), "duplicate retired table: {table}");
         }
+        // Track A drop extension (2026-07-18) — the approved additions are
+        // pinned by name so a silent list rollback fails the build.
+        for expected in [
+            "historical_candles",
+            "stock_movers",
+            "option_movers",
+            "movers_migration_2026_05_01",
+            "movers_legacy_retire_2026_05_03",
+        ] {
+            assert!(
+                RETIRED_QUESTDB_TABLES.contains(&expected),
+                "approved retired table missing from the drop list: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retired_movers_grid_is_53_unique_movers_names() {
+        let names = retired_movers_object_names();
+        assert_eq!(names.len(), 53, "movers grid must cover all 53 era names");
+        let mut seen = std::collections::HashSet::new();
+        for name in &names {
+            assert!(seen.insert(name.clone()), "duplicate movers name: {name}");
+            assert!(
+                name.starts_with("movers_"),
+                "movers grid must only contain movers_* names: {name}"
+            );
+        }
+        // The #1615-era single-table entry moved into the grid — it must
+        // stay covered (matview AND table drop) and must not silently drop
+        // out of the sweep.
+        assert!(seen.contains("movers_1s"));
+        assert!(seen.contains("movers_unified_1d"));
+        // The grid must never collide with a live Engine-B candle table or
+        // any audit table (SEBI retention).
+        for name in &names {
+            assert!(!candle_table_names().contains(&name.as_str()));
+            assert!(!name.ends_with("_audit"));
+        }
+    }
+
+    #[test]
+    fn test_legacy_drop_marker_versioning_rearm_semantics() {
+        // Current-version marker content parks the sweep.
+        assert!(marker_records_current_version(&legacy_drop_marker_content()));
+        // The original unversioned PR #798 marker re-arms exactly once.
+        assert!(!marker_records_current_version(
+            "PR #798 marker — legacy candle objects cleaned up on this deployment.\n"
+        ));
+        // A lower version re-arms; a higher (future) version stays parked.
+        assert!(!marker_records_current_version("sweep_version=1\n"));
+        assert!(marker_records_current_version("sweep_version=99\n"));
+        // Garbage never parks the sweep (fail-open toward re-running the
+        // idempotent IF-EXISTS drops).
+        assert!(!marker_records_current_version("sweep_version=abc\n"));
+        assert!(!marker_records_current_version(""));
     }
 
     #[test]
@@ -837,12 +1018,13 @@ mod tests {
                 !engine_b.contains(&table),
                 "retired table {table} must not be a KEEP-24 candle table"
             );
+            // Track A (2026-07-18): `historical_candles` moved from the
+            // KEEP guard into the drop list (no live writer since the
+            // 2026-05-26 Dhan historical chain deletion — operator-approved
+            // drop). `ticks` stays KEEP (the scoreboard reads it).
             assert!(
-                !matches!(
-                    table,
-                    "ticks" | "historical_candles" | "option_chain_minute_snapshot"
-                ),
-                "retired table {table} must not be a KEEP-24 table"
+                !matches!(table, "ticks" | "option_chain_minute_snapshot"),
+                "retired table {table} must not be a KEEP table"
             );
             assert!(
                 !table.ends_with("_audit") && table != "order_audit",
