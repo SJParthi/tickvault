@@ -230,6 +230,15 @@ distinguishes never-any-mark ("mark channel closed before any mark
 arrived — no live mark producer is configured") from the benign
 day-complete close; control flow unchanged. Ratchet:
 `crates/app/tests/cadence_mark_source_guard.rs`.
+MED-1 fold-in (same day): the closed-channel disarm arm now splits
+THREE ways — the never-any-mark producer-less-boot warn; an abnormal
+MID-SESSION producer death (marks flowed AND the close was observed
+before the 15:30 IST close boundary the runtime's close-sweep already
+uses) = a coded OMS-GAP-02 `error!` naming the mark count + the
+`tv_order_runtime_mark_producer_lost_total` counter, log-sink-only
+delivery boundary (no new alarm, no terraform change); and the benign
+post-session day-complete warn. All three arms keep the identical
+disarm-and-continue control flow (no respawn, no break).
 
 ## §6. Trigger / auto-load
 
