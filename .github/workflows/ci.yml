@@ -687,7 +687,6 @@ jobs:
           crates/core/tests/dhat_telegram_dispatcher.rs
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
-          crates/trading/tests/dhat_multi_tf_consume_tick.rs
           crates/trading/tests/dhat_risk_engine.rs
           EOF
           )
@@ -776,9 +775,10 @@ jobs:
         run: |
           set -euo pipefail
           # dhat_bar_cache_lookup DELETED with the dead in_mem::bar_cache
-          # module (dead live-WS sweep stage 1, 2026-07-17) — target count 3→2.
+          # module (dead live-WS sweep stage 1, 2026-07-17); dhat_multi_tf_
+          # consume_tick DELETED with the tick aggregator (stage-3 sweep,
+          # 2026-07-17) — target count 3→2→1.
           cargo test -p tickvault-trading \
-            --test dhat_multi_tf_consume_tick \
             --test dhat_risk_engine \
             2>&1 | tee /tmp/dhat-trading.log
           if grep -q 'running 0 tests' /tmp/dhat-trading.log; then
@@ -786,8 +786,8 @@ jobs:
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
-          if [ "$ran" -ne 2 ]; then
-            echo "::error::trading DHAT step executed $ran targets, expected 2 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 1 ]; then
+            echo "::error::trading DHAT step executed $ran targets, expected 1 — a --test flag was dropped from this step."
             exit 1
           fi
 

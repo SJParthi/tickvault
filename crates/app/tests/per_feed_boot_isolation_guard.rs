@@ -186,10 +186,13 @@ fn dhan_off_skips_auth_and_instruments_via_the_lane_gate() {
 #[test]
 fn api_server_up_in_dhan_off_mode() {
     // A Dhan-OFF (Groww-only) boot must STILL bring up the HTTP API server
-    // (so `/api/feeds` is reachable) + the candle seal-writer + the 21-TF
-    // aggregator + the single process run-loop. PR-C2 re-shape (2026-07-13):
-    // there is only ONE boot path now — `build_shared_infra` runs
-    // unconditionally and `run_process_runloop` closes main().
+    // (so `/api/feeds` is reachable) + the candle seal-writer + the single
+    // process run-loop. PR-C2 re-shape (2026-07-13): there is only ONE boot
+    // path now — `build_shared_infra` runs unconditionally and
+    // `run_process_runloop` closes main(). Stage-3 dead-WS sweep
+    // (2026-07-17): the 21-TF tick-aggregator pin retired with
+    // `spawn_engine_b_aggregator` — the seal-writer stays, fed by the
+    // REST-era candle fold (FOLD-01).
     let src = read_main_rs();
 
     // (1) build_shared_infra is called before the Dhan REST stack spawn.
@@ -202,12 +205,12 @@ fn api_server_up_in_dhan_off_mode() {
     assert!(
         shared_call < stack_spawn,
         "build_shared_infra MUST be called BEFORE the Dhan REST stack spawn so \
-         the PROCESS-shared infra (API + seal-writer + aggregator) is up \
+         the PROCESS-shared infra (API + seal-writer) is up \
          regardless of the Dhan surface (C1/C2 fix lineage)."
     );
 
     // (2) build_shared_infra must actually build the API server, /api/feeds
-    //     routes, the seal-writer, and the aggregator.
+    //     routes, and the seal-writer.
     let shared = src
         .find("async fn build_shared_infra(")
         .expect("build_shared_infra must exist (D2 Stage 2)");
@@ -218,9 +221,8 @@ fn api_server_up_in_dhan_off_mode() {
         ("build_router_with_auth", "the /api/feeds toggle routes"),
         (
             "spawn_seal_writer_loop",
-            "the candle seal-writer (Groww candles seal — C2)",
+            "the candle seal-writer (the fold's candles seal — C2 lineage)",
         ),
-        ("spawn_engine_b_aggregator", "the 21-TF aggregator"),
     ] {
         assert!(
             body.contains(needle),

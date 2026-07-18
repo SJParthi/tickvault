@@ -33,6 +33,9 @@
 # tv_dhan_lag_samples_excluded_total) + 3 alarms (~$0.30/mo) ≈ $1.50/mo —
 # inside the $35/mo pre-GST budget alarm ceiling. aws-budget.md carries the
 # matching dated note.
+# COST UPDATE (2026-07-17, stage-3 dead-WS sweep): the boundary-catchup
+# alarm + its 2 [host,feed] series retired (S2 note below) — net
+# ≈ -$0.70/mo vs the 2026-07-06 figure.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -44,70 +47,22 @@
 # coverage lives on in the per-feed lag + catch-up-storm alarms below.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# S2. BOUNDARY-01 catch-up seal STORM on the Dhan feed
-#
-# The incident ran 9k-11.5k catch-up seals/10min all day — a stalled/lagging
-# Dhan tick stream forcing the watermark catch-up sealer to do the
-# aggregator's work — with zero CW visibility.
-#
-# PER-FEED DIMENSION IS RULE-11-MANDATORY: Groww's 60s catch-up lateness
-# margin makes catch-up sealing its ROUTINE steady-state path for quiet SIDs
-# (~767 SIDs x 21 TFs) — a host-only folded series would either mask a Dhan
-# storm under the Groww baseline or page on healthy Groww behaviour. Hence
-# the explicit { host, feed=dhan } dimensions map (NOT local.app_dimensions)
-# + the second emf_processor metric_declaration with dimensions
-# [["host","feed"]] in cloudwatch-agent.json / user-data.sh.tftpl.
-#
-# Rule 12 semantics: the CW agent ships prometheus counters as per-scrape
-# DELTAS, so Sum over 300s IS increase(5m) — house precedent:
-# tv_disk_watcher_respawn_total (app-alarms.tf #16, Sum/5m).
-#
-# 10-min sustained (2 x 5min): a bounded one-shot restart catch-up wave
-# (<= ~25K seals) drains inside one 5-min period -> absorbed; the 08:30 IST
-# boot wave sits outside the 09:20-15:35 gate window anyway. Incident rate
-# ~4.5-5.75k/5min = 2.25-2.9x threshold -> pages at minute 10.
-#
-# HONESTY — threshold 2000 is PROVISIONAL: the healthy Dhan per-feed Sum(5m)
-# floor is UNMEASURED (the metric was never exported before 2026-07-06); the
-# incident rate gives 4-10x headroom over any plausible healthy floor.
-# MANDATED FOLLOW-UP: observe the exported per-feed Sum(5m) distribution for
-# one trading week and ratchet the threshold with a dated note if the healthy
-# floor approaches 2000.
-#
-# DORMANT SINCE PR-C2 (2026-07-14, Dhan live-WS lane deletion): the feed=dhan
-# `tv_boundary_catchup_total` series lost ALL writers with the lane — the
-# Dhan Engine-B aggregator instance has zero tick publishers, so its catch-up
-# driver can never seal (and the whole universe chain deletes in C3). The
-# alarm is dormant-SAFE (treat_missing_data=notBreaching + actions off by
-# default under the window gate), never a false page. Its removal-vs-retain
-# decision lands in PR-C3 alongside the detector/aggregator-chain deletion —
-# NOT silently dropped here (merge-gate discipline: writer-less alarms get a
-# dated note or a same-PR retirement; C3 owns this one's fate).
+# S2. BOUNDARY-01 catch-up seal storm — RETIRED 2026-07-17 (stage-3 dead-WS
+# sweep). The alarm's metric, tv_boundary_catchup_total, lost its LAST
+# possible writer with this PR: the 21-TF TICK aggregator (the watermark
+# catch-up sealer that incremented it) is DELETED — no tick publisher exists
+# on the REST-only runtime, so the per-feed series can never emit a
+# datapoint again. The S2 dormancy note (dated 2026-07-14, PR-C2) had
+# assigned this alarm's removal-vs-retain fate to the aggregator-chain
+# deletion PR — this is that PR. Removed in lockstep: the window-gate
+# ALARM_NAMES entry (market-hours-liveness-alarm.tf), the dashboard
+# catch-up widget + alarm-strip ARN (dashboard.tf), and the second
+# [host,feed] EMF metric_declaration in cloudwatch-agent.json /
+# user-data.sh.tftpl. Cost: -1 alarm (~-$0.10/mo) - 2 [host,feed] series
+# (~-$0.60/mo) — dated note in aws-budget.md (COST NOTE 2026-07-17,
+# stage-3). The BOUNDARY-01 runbook (wave-6-error-codes.md) carries the
+# matching EMIT-SITES-DELETED banner; the ErrorCode variant is RETAINED.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "boundary_catchup_storm_dhan" {
-  alarm_name          = "tv-${var.environment}-boundary-catchup-storm-dhan"
-  alarm_description   = "BOUNDARY-01 catch-up seal storm on feed=dhan — > 2000 catch-up-sealed candles per 5 min sustained for 10 min in-market (PROVISIONAL threshold, 2026-07-06: healthy floor unmeasured; observe one trading week + ratchet with a dated note). The Dhan tick stream is stalling/lagging enough that the watermark catch-up sealer is doing the aggregator's work (2026-07-06 incident: 9k-11.5k/10min all day). Actions gated to 09:20-15:35 IST Mon-Fri. See BOUNDARY-01 runbook (wave-6-error-codes.md)."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  datapoints_to_alarm = 2
-  metric_name         = "tv_boundary_catchup_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 2000
-  treat_missing_data  = "notBreaching"
-  # Explicit per-feed dimensions — this alarm watches the Dhan series ONLY
-  # (the [host,feed] EMF declaration publishes dhan + groww separately).
-  dimensions = {
-    host = "tickvault-prod"
-    feed = "dhan"
-  }
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = local.app_alarm_ok
-}
 
 # ---------------------------------------------------------------------------
 # S3. Dhan exchange->receive lag p99 high
@@ -183,9 +138,9 @@ resource "aws_cloudwatch_metric_alarm" "dhan_exchange_lag_p99_high" {
 
 
 output "silent_feed_cloudwatch_alarms" {
-  description = "2 silent-feed degradation alarms (2026-07-06 incident hardening; the SLO 0.80-0.95 dead-band alarm retired PR-C2 2026-07-13 with the PARKed SLO publisher; the Groww lag mirror retired 2026-07-15 with the Groww live feed): per-feed BOUNDARY-01 catch-up storm (dhan, PROVISIONAL 2000/5m x2), Dhan exchange->receive lag p99 > 10s x10min. All market-hours-gated via the window-gate Lambda; the retuned tick-gap alarm history stays in app-alarms.tf."
+  description = "1 silent-feed degradation alarm (2026-07-06 incident hardening; the SLO 0.80-0.95 dead-band alarm retired PR-C2 2026-07-13 with the PARKed SLO publisher; the Groww lag mirror retired 2026-07-15 with the Groww live feed; the BOUNDARY-01 catch-up-storm alarm retired 2026-07-17 with the tick aggregator — stage-3 dead-WS sweep, S2 note above): Dhan exchange->receive lag p99 > 10s x10min. Market-hours-gated via the window-gate Lambda; the retuned tick-gap alarm history stays in app-alarms.tf."
   value = [
-    aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
+    # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS sweep).
     aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
     # groww_exchange_lag_p99_high retired 2026-07-15 (Groww live feed).
   ]

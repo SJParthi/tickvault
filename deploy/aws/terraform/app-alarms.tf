@@ -32,6 +32,12 @@
 # 2026-07-06 groww feed-down alerting: +3 selected metrics
 # (tv_groww_ws_active, tv_feed_last_tick_age_seconds,
 # tv_feed_sidecar_stall_restart_total) ≈ +$0.90/mo, +2 alarms ≈ +$0.20/mo.
+# 2026-07-17 (stage-3 dead-WS sweep): the 2 [host,feed] boundary-catchup
+# declarations AND the tv_aggregator_seals_emitted_total +
+# tv_aggregator_close_pct_nonzero_total main-list names are RETIRED — the
+# tick aggregator (their writers' owner) is deleted. Main EMF list is now
+# 17 names / no second declaration; the historical 27/29 figures below are
+# retained as dated audit. See aws-budget.md COST NOTE 2026-07-17.
 #
 # Cost honesty:
 #   - CloudWatch free tier: 10 alarms + 10 custom metrics + 5GB logs.
@@ -225,9 +231,10 @@ resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
 # the 2026-07-13 Dhan live-WS retirement — so the metric can never emit a
 # datapoint again and the alarm (treat_missing_data = notBreaching) was a
 # permanently-dead monitor that the window gate kept arming daily. The
-# dormant seal_routing emit site + the EMF selector row survive this PR;
-# the committed C-phase candle-machinery follow-up owns their full
-# retirement (.claude/plans/active-plan-groww-live-off.md).
+# dormant seal_routing emit site + the EMF selector row survived that PR;
+# BOTH are now RETIRED (2026-07-17, stage-3 dead-WS sweep — seal_routing
+# deleted with the tick aggregator; the selector rows left the EMF list
+# the same day).
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

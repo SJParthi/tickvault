@@ -36,7 +36,7 @@
 //!
 //! Pinned by `test_compute_*_pct_handles_zero_baseline_without_nan`.
 
-use crate::candles::aggregator_cell::LiveCandleState;
+use crate::candles::live_candle_state::LiveCandleState;
 
 /// Frozen-per-day reference values for one `(security_id,
 /// exchange_segment)` instrument. Copy so the lookup hot path is

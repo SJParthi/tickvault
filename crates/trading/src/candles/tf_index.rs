@@ -38,6 +38,10 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 /// The NSE regular session closes at 15:30:00 — the candle window is
 /// the half-open interval `[09:15:00, 15:30:00)`, so the last 1-minute
 /// candle is `[15:29:00, 15:30:00)` (stamped 15:29). 375 1m candles/day.
+/// Test-only since the stage-3 dead-WS sweep (2026-07-17): its sole
+/// production consumer was the DELETED tick aggregator's session-window
+/// truncation; the pin tests below keep the canonical value asserted.
+#[cfg(test)]
 pub(crate) const MARKET_CLOSE_SECS_OF_DAY_IST: u32 = 55_800;
 
 /// Runtime-indexable handle for the 21 candle timeframes.
