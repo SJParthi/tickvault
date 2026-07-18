@@ -32,6 +32,12 @@
 # 2026-07-06 groww feed-down alerting: +3 selected metrics
 # (tv_groww_ws_active, tv_feed_last_tick_age_seconds,
 # tv_feed_sidecar_stall_restart_total) ≈ +$0.90/mo, +2 alarms ≈ +$0.20/mo.
+# 2026-07-17 (stage-3 dead-WS sweep): the 2 [host,feed] boundary-catchup
+# declarations AND the tv_aggregator_seals_emitted_total +
+# tv_aggregator_close_pct_nonzero_total main-list names are RETIRED — the
+# tick aggregator (their writers' owner) is deleted. Main EMF list is now
+# 17 names / no second declaration; the historical 27/29 figures below are
+# retained as dated audit. See aws-budget.md COST NOTE 2026-07-17.
 #
 # Cost honesty:
 #   - CloudWatch free tier: 10 alarms + 10 custom metrics + 5GB logs.
@@ -154,68 +160,17 @@ resource "aws_cloudwatch_metric_alarm" "token_remaining_low" {
 }
 
 # ---------------------------------------------------------------------------
-# 7. Spill ring dropping ticks — backpressure breach, downstream slow
+# 7/8/8b. Tick backpressure-chain alarms — RETIRED 2026-07-18 (stage-4
+# dead-producer sweep). The three alarms (tv-${env}-spill-dropped,
+# tv-${env}-dlq-ticks, tv-${env}-ticks-dropped) monitored the tick
+# ring->spill->DLQ chain in tick_persistence.rs, which was DELETED in the
+# stage-2 dead-WS sweep (2026-07-17) — the runtime is REST-only and nothing
+# writes the ticks table anymore, so tv_spill_dropped_total /
+# tv_dlq_ticks_total / tv_ticks_dropped_total have ZERO emit sites and the
+# alarms (treat_missing_data = notBreaching) were permanently-dead monitors.
+# The candle-side seal chain keeps its own pagers (seal-drop-alarm.tf +
+# the AGGREGATOR-DROP-01 errcode alarm).
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "spill_dropped" {
-  alarm_name          = "tv-${var.environment}-spill-dropped"
-  alarm_description   = "Spill writer is dropping ticks — rescue ring + spill both saturated. DLQ NDJSON catches them. See STORAGE-GAP-03."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_spill_dropped_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
-
-# ---------------------------------------------------------------------------
-# 8. DLQ catching ticks — last-resort sink in use
-# ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "dlq_ticks" {
-  alarm_name          = "tv-${var.environment}-dlq-ticks"
-  alarm_description   = "Dead-letter queue is catching ticks — all upstream tiers (ring + spill) saturated. Investigate immediately."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_dlq_ticks_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
-
-# ---------------------------------------------------------------------------
-# 8b. Tick PERMANENTLY dropped — the final zero-tick-loss breach
-#
-# `tv_ticks_dropped_total` increments ONLY when the rescue ring AND the disk
-# spill AND the DLQ NDJSON all failed for a tick (tick_persistence.rs). This
-# is strictly more severe than `tv_spill_dropped_total` / `tv_dlq_ticks_total`
-# (which still recover the payload downstream): a non-zero value here means a
-# tick was IRRECOVERABLY lost. It is the operator's #1 invariant breach, so it
-# gets its own dedicated alarm even though the upstream tiers also alarm.
-# ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
-  alarm_name          = "tv-${var.environment}-ticks-dropped"
-  alarm_description   = "A tick was PERMANENTLY dropped — rescue ring + disk spill + DLQ NDJSON ALL failed. Irrecoverable zero-tick-loss breach (host OOM + disk full + dlq dir unwritable). Investigate immediately. MUST always be 0."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_ticks_dropped_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
 
 # ---------------------------------------------------------------------------
 # 9. Aggregator no-seals alarm — RETIRED 2026-07-15 (Groww live-feed
@@ -225,9 +180,10 @@ resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
 # the 2026-07-13 Dhan live-WS retirement — so the metric can never emit a
 # datapoint again and the alarm (treat_missing_data = notBreaching) was a
 # permanently-dead monitor that the window gate kept arming daily. The
-# dormant seal_routing emit site + the EMF selector row survive this PR;
-# the committed C-phase candle-machinery follow-up owns their full
-# retirement (.claude/plans/active-plan-groww-live-off.md).
+# dormant seal_routing emit site + the EMF selector row survived that PR;
+# BOTH are now RETIRED (2026-07-17, stage-3 dead-WS sweep — seal_routing
+# deleted with the tick aggregator; the selector rows left the EMF list
+# the same day).
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -374,32 +330,12 @@ resource "aws_cloudwatch_metric_alarm" "disk_watcher_respawn" {
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Post-close tick anomaly — Dhan stamped a tick at/after 15:30:00 IST.
-# Hot-path-safe equivalent of the retired LastTickAfterBoundary Telegram
-# variant (2026-06-12): the per-tick check + tv_late_tick_after_boundary_total
-# counter live in tick_processor.rs; this alarm pages on the counter instead of
-# threading a notifier into the hot path. SHOULD be zero — Dhan's session ends
-# 15:30:00.000 exclusive. The box restarts daily (08:30 IST) so the counter is
-# fresh each session; Maximum > 0 = a post-close tick happened today. Low
-# priority / data-quality (correlate Dhan-side ingestion lag or local clock skew).
-# treat_missing_data = notBreaching: metric is absent when the box is stopped
-# (16:30 IST / weekends) — must not hold the alarm FIRING across that gap.
+# Post-close tick anomaly alarm — RETIRED 2026-07-18 (stage-4 dead-producer
+# sweep). Its metric, tv_late_tick_after_boundary_total, lost its only emit
+# site when the per-tick check in tick_processor.rs was deleted with the dead
+# Dhan tick chain (2026-07-17, stage-2 sweep) — the metric can never emit a
+# datapoint again, so the alarm was a permanently-dead monitor.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "late_tick_after_boundary" {
-  alarm_name          = "tv-${var.environment}-late-tick-after-boundary"
-  alarm_description   = "Dhan stamped a tick at/after 15:30:00 IST (post-market close). Informational data-quality signal — should be zero; correlate Dhan-side ingestion lag or local clock skew."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "tv_late_tick_after_boundary_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Maximum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
-}
 
 # ---------------------------------------------------------------------------
 # 17. Host memory > 80% — the "time to upgrade" capacity signal.
@@ -445,13 +381,13 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.questdb_disconnected.alarm_name,
     # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
     aws_cloudwatch_metric_alarm.token_remaining_low.alarm_name,
-    aws_cloudwatch_metric_alarm.spill_dropped.alarm_name,
-    aws_cloudwatch_metric_alarm.dlq_ticks.alarm_name,
+    # spill_dropped + dlq_ticks retired 2026-07-18 (stage-4 unit A —
+    # dead-tick alarm chains; the ticks table has no writer anymore).
     # aggregator_no_seals retired 2026-07-15 (Groww live-feed retirement —
     # the seals metric lost its last live producer; see section 9 note).
     aws_cloudwatch_metric_alarm.orders_rejected.alarm_name,
     aws_cloudwatch_metric_alarm.clock_skew_high.alarm_name,
     aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,
-    aws_cloudwatch_metric_alarm.late_tick_after_boundary.alarm_name,
+    # late_tick_after_boundary retired 2026-07-18 (stage-4 unit A).
   ]
 }

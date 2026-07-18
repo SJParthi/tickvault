@@ -146,9 +146,12 @@ const _: () = assert!(
 /// 15:29:59 — so any window whose effective end lands within this margin
 /// of the 15:30:00 close can NEVER seal intraday on the prod schedule
 /// (e.g. the 2m penultimate `[15:27, 15:29)` window, E = 55_740, plus
-/// every final window). Mirrors
-/// `tickvault_trading::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW`
-/// (= 60) — equality tripwire-pinned in the tests below.
+/// every final window). Historically mirrored the tick aggregator's
+/// `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW` (= 60); the aggregator was
+/// DELETED in the stage-3 dead-WS sweep (2026-07-17), so this value is
+/// FROZEN here as the historical margin — it still governs the carve-out
+/// when verifying live-era Groww days (whose tail buckets were left
+/// unsealed by exactly that margin).
 pub const GROWW_CATCHUP_MARGIN_SECS: u32 = 60;
 
 /// Task slug for the once-per-trading-day delivery marker
@@ -3403,16 +3406,18 @@ mod tests {
         ));
     }
 
-    /// TRIPWIRE (refuter round 2): the verifier's margin mirror must equal
-    /// the aggregator's own Groww catch-up lateness margin — editing either
-    /// constant alone fails the build.
+    /// The verifier's margin is FROZEN at the historical aggregator value
+    /// (60 s). The cross-crate tripwire against
+    /// `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW` was retired with the tick
+    /// aggregator (stage-3 dead-WS sweep, 2026-07-17) — this local pin keeps
+    /// the historical carve-out value asserted.
     #[test]
-    fn test_groww_catchup_margin_matches_aggregator_constant() {
+    fn test_groww_catchup_margin_frozen_at_historical_value() {
         assert_eq!(
-            GROWW_CATCHUP_MARGIN_SECS,
-            tickvault_trading::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW,
-            "GROWW_CATCHUP_MARGIN_SECS drifted from the aggregator's \
-             CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW"
+            GROWW_CATCHUP_MARGIN_SECS, 60,
+            "GROWW_CATCHUP_MARGIN_SECS is the FROZEN historical Groww \
+             catch-up margin — changing it silently re-classifies which \
+             live-era tail buckets the carve-out exempts"
         );
     }
 
