@@ -1,3 +1,15 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/feed_blame.rs"
+  - "crates/storage/src/feed_scoreboard_persistence.rs"
+  - "crates/storage/src/feed_episode_audit_persistence.rs"
+  - "crates/app/src/feed_scoreboard_boot.rs"
+  - "crates/app/src/groww_sidecar_supervisor.rs"
+  - "crates/core/src/pipeline/feed_presence.rs"
+  - "crates/core/src/instrument/presence_registration.rs"
+---
+
 # Dual-Feed Scoreboard — Error Codes (SCOREBOARD-01)
 
 > **⚠ 2026-07-15 dormancy note (Groww live feed retired — operator Q1, received directly in this session:
@@ -188,7 +200,10 @@ blame upgrades to broker only on corroboration (Dhan codes, WS-GAP-09
 overlap ±120s, stall-watchdog semantics). **Lag columns are LIVE since PR-C (2026-07-11):** the per-feed
 in-memory DAY histograms (fed by the same `record_*_tick` calls that drive
 the live lag gauges — `tv_dhan_exchange_lag_p99_seconds` +
-`tv_groww_exchange_lag_p99_seconds`; replay/re-tail excluded at record time,
+`tv_groww_exchange_lag_p99_seconds` *(2026-07-17: the Dhan lag gauge was
+deleted with the dead Dhan-lag publisher chain — the day histograms' Dhan
+side reads −1 sentinels; the Groww gauge died 2026-07-15 with the Groww
+live feed)*; replay/re-tail excluded at record time,
 never a SQL approximation over the replay-contaminated `received_at` column)
 drain into `lag_p50_ms`/`lag_p99_ms`/`lag_max_ms`/`lag_samples` on same-day
 runs; a rerun/backfill that measured nothing folds the day's EXISTING
@@ -205,7 +220,14 @@ asymmetry stays stated on every surface: Dhan carries a ≥1s whole-second
 quantization floor while Groww is millisecond-precise but measured at the
 sidecar capture instant one hop downstream of the socket (`lag_floor_ms`
 column: 1000 dhan / 1 groww). **Per-instrument coverage is LIVE since
-PR-D (2026-07-11):** the in-memory `FeedPresenceRegistry`
+PR-D (2026-07-11)** *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the
+`FeedPresenceRegistry` (`feed_presence.rs` + `presence_registration.rs`) was
+DELETED — its record/register producers died with the live feeds (Dhan
+2026-07-13, Groww 2026-07-15), so the registry was structurally unfeedable
+and every drain read `None`; `coverage_source` degrades honestly to the
+documented `sql_backfill` fallback, the `feed_coverage_daily` table +
+historical `in_memory`/`mixed` rows + the keep-better guard stay, and the
+day-lag −1 sentinels follow the same REST-only-runtime dormancy class)*:** the in-memory `FeedPresenceRegistry`
 (`crates/core/src/pipeline/feed_presence.rs`) folds one relaxed
 `fetch_or` per tick into per-slot 375-minute bitsets at the SAME
 DHAT-proven persist sites as the lag rings (both Dhan arms +

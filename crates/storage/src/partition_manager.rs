@@ -153,6 +153,13 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // pnl heartbeat row); `feed` is in both DEDUP keys.
     "order_audit",
     "pnl_audit",
+    // ORDER-EVT-01 (2026-07-18, full-fidelity push-event capture): one row
+    // per received broker order/position push event, BOTH feeds — the same
+    // Standard 90d order-audit class as order_audit/pnl_audit above (90d hot
+    // in QuestDB, then the DAY sweep's detach→S3-archive cold path). Tiny in
+    // paper mode (a handful of rows/day); `feed` is in both DEDUP keys.
+    "order_update_events",
+    "position_update_events",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.

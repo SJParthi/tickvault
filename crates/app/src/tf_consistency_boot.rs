@@ -84,19 +84,24 @@ const TF_VERIFY_HTTP_TIMEOUT_SECS: u64 = 15;
 /// bounded query result (≤3,000 rows).
 pub const TF_VERIFY_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Explicit SQL `LIMIT` on the per-SID `candles_1m` day query. Sized above
-/// the theoretical max (375 rows/day) so a healthy day can never touch it;
-/// `returned == limit` is the truncation TRIPWIRE (read-degraded, never a
-/// silent partial compare — QuestDB's `/exec` default row cap is
-/// unverified-live, so this design refuses to depend on it either way).
+/// Row CAP on the per-SID `candles_1m` day query. Sized above the
+/// theoretical max (375 rows/day) so a healthy day can never touch it. The
+/// emitted SQL `LIMIT` is `cap + 1` (the 2026-07-18 LIMIT+1 probe — the
+/// #1630 spot_crossverify convention): `returned > cap` is the truncation
+/// TRIPWIRE (read-degraded, never a silent partial compare — QuestDB's
+/// `/exec` default row cap is unverified-live, so this design refuses to
+/// depend on it either way), while an exact-boundary `== cap` dataset is
+/// legitimately complete.
 pub const TF_VERIFY_1M_ROW_LIMIT: usize = 500;
 
-/// Explicit SQL `LIMIT` on the per-SID 19-way higher-TF UNION query. Sized
-/// above the arithmetic worst case (Σ per-TF daily bucket counts = 903).
+/// Row CAP on the per-SID 19-way higher-TF UNION query. Sized above the
+/// arithmetic worst case (Σ per-TF daily bucket counts = 903); fetched as
+/// `cap + 1` (LIMIT+1 probe), truncation = `> cap`.
 pub const TF_VERIFY_TF_UNION_ROW_LIMIT: usize = 2_000;
 
-/// Explicit SQL `LIMIT` on the per-feed instrument-discovery query. Sized
-/// above the `MAX_DAILY_UNIVERSE_SIZE = 1200` envelope.
+/// Row CAP on the per-feed instrument-discovery query. Sized above the
+/// `MAX_DAILY_UNIVERSE_SIZE = 1200` envelope; fetched as `cap + 1`
+/// (LIMIT+1 probe), truncation = `> cap`.
 pub const TF_VERIFY_DISCOVERY_ROW_LIMIT: usize = 3_000;
 
 /// Audit-row blast-radius cap per run: a systemic bug (e.g. an anchoring
@@ -146,9 +151,12 @@ const _: () = assert!(
 /// 15:29:59 — so any window whose effective end lands within this margin
 /// of the 15:30:00 close can NEVER seal intraday on the prod schedule
 /// (e.g. the 2m penultimate `[15:27, 15:29)` window, E = 55_740, plus
-/// every final window). Mirrors
-/// `tickvault_trading::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW`
-/// (= 60) — equality tripwire-pinned in the tests below.
+/// every final window). Historically mirrored the tick aggregator's
+/// `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW` (= 60); the aggregator was
+/// DELETED in the stage-3 dead-WS sweep (2026-07-17), so this value is
+/// FROZEN here as the historical margin — it still governs the carve-out
+/// when verifying live-era Groww days (whose tail buckets were left
+/// unsealed by exactly that margin).
 pub const GROWW_CATCHUP_MARGIN_SECS: u32 = 60;
 
 /// Task slug for the once-per-trading-day delivery marker
@@ -751,11 +759,14 @@ pub fn select_1m_sql(
     day_start_ist_nanos: i64,
 ) -> String {
     let (start, end) = day_bounds_micros(day_start_ist_nanos);
+    // 2026-07-18 LIMIT+1 probe: fetch ONE row past the cap so an
+    // exact-boundary day is complete; `> cap` rows proves truncation.
+    let fetch_limit = TF_VERIFY_1M_ROW_LIMIT.saturating_add(1);
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, open, high, low, close, volume, tick_count \
          FROM candles_1m \
          WHERE security_id = {security_id} AND segment = '{segment}' AND feed = '{feed}' \
-         AND ts >= {start} AND ts < {end} ORDER BY ts ASC LIMIT {TF_VERIFY_1M_ROW_LIMIT}"
+         AND ts >= {start} AND ts < {end} ORDER BY ts ASC LIMIT {fetch_limit}"
     )
 }
 
@@ -787,8 +798,10 @@ pub fn select_tf_union_sql(
     // M4: wrap the UNION in a subquery so the LIMIT binds to the WHOLE
     // union (the discovery-builder shape) — a bare LIMIT after the last
     // UNION ALL arm binds unreliably on QuestDB.
+    // 2026-07-18 LIMIT+1 probe (see select_1m_sql).
+    let fetch_limit = TF_VERIFY_TF_UNION_ROW_LIMIT.saturating_add(1);
     format!(
-        "SELECT * FROM ({}) LIMIT {TF_VERIFY_TF_UNION_ROW_LIMIT}",
+        "SELECT * FROM ({}) LIMIT {fetch_limit}",
         arms.join(" UNION ALL ")
     )
 }
@@ -811,8 +824,10 @@ pub fn select_instruments_sql(feed: &str, day_start_ist_nanos: i64) -> String {
             )
         })
         .collect();
+    // 2026-07-18 LIMIT+1 probe (see select_1m_sql).
+    let fetch_limit = TF_VERIFY_DISCOVERY_ROW_LIMIT.saturating_add(1);
     format!(
-        "SELECT DISTINCT security_id, segment FROM ({}) LIMIT {TF_VERIFY_DISCOVERY_ROW_LIMIT}",
+        "SELECT DISTINCT security_id, segment FROM ({}) LIMIT {fetch_limit}",
         arms.join(" UNION ALL ")
     )
 }
@@ -871,14 +886,17 @@ fn candle_row_from_cols(cols: &[serde_json::Value], offset: usize) -> Option<Can
     })
 }
 
-/// Parse the per-SID `candles_1m` dataset. `truncated` = the dataset hit
-/// the query's LIMIT (the tripwire — never a silent partial compare).
+/// Parse the per-SID `candles_1m` dataset. `truncated` = MORE than `limit`
+/// rows came back (the query fetches `limit + 1` — the 2026-07-18 LIMIT+1
+/// probe — so `len > limit` proves genuine truncation while an
+/// exact-boundary `len == limit` day is legitimately complete; the tripwire
+/// is still never a silent partial compare).
 ///
 /// # Errors
 /// Malformed body (not JSON / no dataset). Individual bad rows are skipped.
 pub fn parse_1m_dataset(body: &str, limit: usize) -> Result<(Vec<CandleRow>, bool), String> {
     let rows = json_dataset(body)?;
-    let truncated = rows.len() >= limit;
+    let truncated = rows.len() > limit;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let Some(cols) = row.as_array() else { continue };
@@ -900,7 +918,7 @@ pub fn parse_tf_union_dataset(
     limit: usize,
 ) -> Result<(Vec<(TfIndex, CandleRow)>, bool), String> {
     let rows = json_dataset(body)?;
-    let truncated = rows.len() >= limit;
+    let truncated = rows.len() > limit;
     // PERF: the label→TfIndex lookup table is hoisted ABOVE the row loop —
     // a fresh tf_verify_targets() Vec per ROW allocated quadratically.
     let targets = tf_verify_targets();
@@ -934,7 +952,7 @@ pub fn parse_instruments_dataset(
     limit: usize,
 ) -> Result<(Vec<(i64, String)>, bool), String> {
     let rows = json_dataset(body)?;
-    let truncated = rows.len() >= limit;
+    let truncated = rows.len() > limit;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let Some(cols) = row.as_array() else { continue };
@@ -1354,8 +1372,9 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
                     count_query_failure(&mut stats, "truncated");
                     warn!(
                         feed = p.feed,
-                        "tf_consistency: instrument discovery hit its LIMIT — \
-                         coverage partial (truncation tripwire)"
+                        "tf_consistency: instrument discovery exceeded its row \
+                         cap (LIMIT+1 probe) — coverage partial; the pass reads \
+                         degraded (truncation tripwire)"
                     );
                 }
                 rows
@@ -1527,13 +1546,14 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
         // truncation first made every FAST-arm boot (empty always_on set)
         // a guaranteed daily Degraded page. The exclusion is still sound
         // on a TRUNCATED row set: with 1m DEDUP engaged the session
-        // window holds at most 375 distinct 1m rows (< the 500 LIMIT —
+        // window holds at most 375 distinct 1m rows (< the 500-row cap —
         // pinned by the `TF_VERIFY_1M_ROW_LIMIT > 375` assertion below),
-        // so a truncated (>= LIMIT-row) response carries out-of-session
+        // so a truncated (> cap rows; the query fetches cap + 1 per the
+        // 2026-07-18 LIMIT+1 probe) response carries out-of-session
         // rows, and under the query's ORDER BY ts ASC the pre-open rows
         // sort into the returned prefix (even a purely post-close
-        // overflow lands inside the LIMIT because in-session rows fill
-        // at most 375 of its slots). If 1m DEDUP were broken (duplicate
+        // overflow lands inside the returned set because in-session rows
+        // fill at most 375 of its slots). If 1m DEDUP were broken (duplicate
         // keys inflating the in-session count past the LIMIT with zero
         // out-of-session rows), this exclusion simply does not fire and
         // the instrument falls through to the LOUD Query-A truncation
@@ -2945,7 +2965,8 @@ mod tests {
         assert!(sql.contains("segment = 'IDX_I'"), "{sql}");
         assert!(sql.contains("feed = 'dhan'"), "{sql}");
         assert!(sql.contains("ORDER BY ts ASC"), "{sql}");
-        assert!(sql.contains("LIMIT 500"), "explicit LIMIT tripwire: {sql}");
+        // 2026-07-18 LIMIT+1 probe: cap 500 → fetch 501.
+        assert!(sql.contains("LIMIT 501"), "explicit LIMIT+1 probe: {sql}");
         assert!(sql.contains("tick_count"), "{sql}");
     }
 
@@ -2977,9 +2998,10 @@ mod tests {
             sql.starts_with("SELECT * FROM ("),
             "union must be wrapped so LIMIT binds to the whole union: {sql}"
         );
+        // 2026-07-18 LIMIT+1 probe: cap 2,000 → fetch 2,001.
         assert!(
-            sql.ends_with(") LIMIT 2000"),
-            "explicit whole-union LIMIT tripwire: {sql}"
+            sql.ends_with(") LIMIT 2001"),
+            "explicit whole-union LIMIT+1 probe: {sql}"
         );
     }
 
@@ -2992,7 +3014,8 @@ mod tests {
         assert!(sql.contains("FROM candles_4h"), "{sql}");
         assert!(!sql.contains("candles_1d"), "{sql}");
         assert!(sql.contains("feed = 'dhan'"), "{sql}");
-        assert!(sql.ends_with("LIMIT 3000"), "{sql}");
+        // 2026-07-18 LIMIT+1 probe: cap 3,000 → fetch 3,001.
+        assert!(sql.ends_with("LIMIT 3001"), "{sql}");
     }
 
     // -------------------------------------------------------------------
@@ -3013,13 +3036,16 @@ mod tests {
         // Malformed body errors (never a silent empty pass).
         assert!(parse_1m_dataset("not json", 500).is_err());
         assert!(parse_1m_dataset("{}", 500).is_err());
-        // At-cap dataset flags the truncation tripwire.
+        // 2026-07-18 LIMIT+1 semantics: an at-cap dataset is COMPLETE;
+        // only MORE than the cap (the +1 probe row) trips the tripwire.
         let two_rows = r#"{"dataset":[
             [1,1.0,1.0,1.0,1.0,1,1],
             [2,1.0,1.0,1.0,1.0,1,1]
         ]}"#;
-        let (_, truncated) = parse_1m_dataset(two_rows, 2).expect("parse");
-        assert!(truncated, "returned == LIMIT must trip");
+        let (_, at_cap) = parse_1m_dataset(two_rows, 2).expect("parse");
+        assert!(!at_cap, "returned == cap is a COMPLETE exact-boundary day");
+        let (_, truncated) = parse_1m_dataset(two_rows, 1).expect("parse");
+        assert!(truncated, "returned > cap must trip");
     }
 
     #[test]
@@ -3035,7 +3061,10 @@ mod tests {
         assert_eq!(rows[0].0, TfIndex::M5);
         assert_eq!(rows[1].0, TfIndex::M30);
         assert!(parse_tf_union_dataset("nope", 10).is_err());
-        let (_, truncated) = parse_tf_union_dataset(body, 3).expect("parse");
+        // 2026-07-18 LIMIT+1 semantics: at-cap complete, over-cap trips.
+        let (_, at_cap) = parse_tf_union_dataset(body, 3).expect("parse");
+        assert!(!at_cap);
+        let (_, truncated) = parse_tf_union_dataset(body, 2).expect("parse");
         assert!(truncated);
     }
 
@@ -3048,7 +3077,10 @@ mod tests {
             vec![(13, "IDX_I".to_string()), (1333, "NSE_EQ".to_string())]
         );
         assert!(!truncated);
-        let (_, truncated) = parse_instruments_dataset(body, 3).expect("parse");
+        // 2026-07-18 LIMIT+1 semantics: at-cap complete, over-cap trips.
+        let (_, at_cap) = parse_instruments_dataset(body, 3).expect("parse");
+        assert!(!at_cap);
+        let (_, truncated) = parse_instruments_dataset(body, 2).expect("parse");
         assert!(truncated);
         assert!(parse_instruments_dataset("x", 10).is_err());
     }
@@ -3403,16 +3435,18 @@ mod tests {
         ));
     }
 
-    /// TRIPWIRE (refuter round 2): the verifier's margin mirror must equal
-    /// the aggregator's own Groww catch-up lateness margin — editing either
-    /// constant alone fails the build.
+    /// The verifier's margin is FROZEN at the historical aggregator value
+    /// (60 s). The cross-crate tripwire against
+    /// `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW` was retired with the tick
+    /// aggregator (stage-3 dead-WS sweep, 2026-07-17) — this local pin keeps
+    /// the historical carve-out value asserted.
     #[test]
-    fn test_groww_catchup_margin_matches_aggregator_constant() {
+    fn test_groww_catchup_margin_frozen_at_historical_value() {
         assert_eq!(
-            GROWW_CATCHUP_MARGIN_SECS,
-            tickvault_trading::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW,
-            "GROWW_CATCHUP_MARGIN_SECS drifted from the aggregator's \
-             CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW"
+            GROWW_CATCHUP_MARGIN_SECS, 60,
+            "GROWW_CATCHUP_MARGIN_SECS is the FROZEN historical Groww \
+             catch-up margin — changing it silently re-classifies which \
+             live-era tail buckets the carve-out exempts"
         );
     }
 
@@ -3714,18 +3748,19 @@ mod tests {
         );
     }
 
-    /// Refuter round 3: a >LIMIT always-on instrument (GIFT Nifty's ~21h
+    /// Refuter round 3: a >cap always-on instrument (GIFT Nifty's ~21h
     /// day) parses truncated=true AND its returned prefix still carries
     /// out-of-session rows (ORDER BY ts ASC sorts pre-open rows first;
-    /// the session window holds at most 375 rows < the LIMIT) — so the
+    /// the session window holds at most 375 rows < the cap) — so the
     /// exclusion decision fires and the instrument is skipped WITHOUT a
     /// truncation degrade or page.
     #[test]
     fn test_truncated_always_on_prefix_still_excluded_not_degraded() {
-        // Simulate the truncated response of a >LIMIT always-on day: the
+        // Simulate the truncated response of a >cap always-on day: the
         // first returned rows are pre-open (00:00 IST onward), exactly as
-        // ORDER BY ts ASC delivers them. LIMIT 4 stands in for the 500.
-        let limit = 4;
+        // ORDER BY ts ASC delivers them. Cap 3 stands in for the 500 (the
+        // 2026-07-18 LIMIT+1 probe fetches cap + 1 = 4 rows).
+        let limit = 3;
         let body = format!(
             r#"{{"dataset":[
                 [{a},1.0,1.0,1.0,1.0,0,1],
@@ -3739,14 +3774,17 @@ mod tests {
             d = DAY_START + 33_360 * NANOS_PER_SEC,
         );
         let (rows, truncated) = parse_1m_dataset(&body, limit).expect("parse");
-        assert!(truncated, "at-LIMIT response must flag the tripwire");
+        assert!(
+            truncated,
+            "over-cap (cap+1-row) response must flag the tripwire"
+        );
         assert!(
             has_out_of_session_1m_row(&rows, DAY_START),
             "the truncated prefix must still expose the out-of-session \
              rows, so the exclusion (NOT a degrade) decides the instrument"
         );
         // The real-limit arithmetic backing the reasoning: a truncated
-        // (>= LIMIT-row) response cannot be all in-session (375 max).
+        // (> cap-row) response cannot be all in-session (375 max).
         assert!(TF_VERIFY_1M_ROW_LIMIT > 375);
     }
 }

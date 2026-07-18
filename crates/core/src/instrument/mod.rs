@@ -16,7 +16,9 @@
 //! `l3_anomaly_check`, `nse_holiday_cross_check`), the warm-boot
 //! plan-snapshot machinery (`instrument_snapshot` trimmed to its surviving
 //! path-traversal guard), the Dhan presence slot build
-//! (`presence_registration` trimmed to `ist_day_from_date`), and the
+//! (`presence_registration` — DELETED 2026-07-18, stage-4: its last
+//! surviving fn `ist_day_from_date` had zero callers after the presence
+//! registry retired), and the
 //! subscription planner/distribution (`subscription_planner`,
 //! `subscription_distribution` — scope-lock §B item 2, with the
 //! `SubscriptionScope` enum + `LOCKED_UNIVERSE`).
@@ -30,7 +32,6 @@
 //! | `index_futures` | the §36.7 shared FUTIDX expiry selector — the GROWW futures leg stands (de-gated in C1; must never regain a feature gate) |
 //! | `csv_row` | the shared instrument-row TYPE the two modules above consume (split out of the deleted parser) |
 //! | `instrument_snapshot` | trimmed to `is_valid_trading_date` (the fail-closed date/path-traversal guard — Groww activation consumes) |
-//! | `presence_registration` | trimmed to `ist_day_from_date` (the shared IST day-number convention — Groww presence + scoreboard consume) |
 //! | `market_open_self_test` | dormant contract stub (pure evaluator; its spawner died with the lane in C2 — RETAINED by the C4 sweep 2026-07-15: its SELFTEST-01/02 codes were not in the operator-authorized C4 deletion set; a future sweep needs its own ruling) |
 //!
 //! `slo_score` was DELETED in the C4 sweep (2026-07-15) with its bench +
@@ -47,4 +48,3 @@ pub mod index_extractor;
 pub mod index_futures;
 pub mod instrument_snapshot;
 pub mod market_open_self_test;
-pub mod presence_registration;

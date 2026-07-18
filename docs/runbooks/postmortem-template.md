@@ -1,7 +1,7 @@
 # Incident Postmortem — Template
 
 > **When to use:** any incident that causes a Telegram alert with
-> severity `high` or `critical`, OR any `tv_ticks_dropped_total > 0`
+> severity `high` or `critical`, OR any `tv_ticks_dropped_total > 0` *(metric retired 2026-07-18 — stage-4; the live loss signal is the seal-drop pager)*
 > event, OR any SEBI-audit-relevant discrepancy.
 >
 > **Time limit:** draft within 24h of incident resolution. Published

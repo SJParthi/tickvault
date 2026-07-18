@@ -37,9 +37,8 @@
 
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
-    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, IstTimer, check_clock_drift, compute_close_seal_sleep,
-    compute_market_close_sleep, create_error_log_writer, format_bind_addr,
-    should_emit_post_market_alert,
+    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
+    create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
 use tickvault_app::{infra, observability, subsystem_memory};
 
@@ -526,10 +525,12 @@ async fn main() -> Result<()> {
     // byte-identical. The receiver is stashed in a take-once slot for the
     // Dhan REST-only stack's Phase 5b (`spawn_dhan_rest_stack` — the
     // runtime's single spawn site; 2026-07-17 correction: Phase 5a is the
-    // RETIRED order-update WS slot); the forwarder now rides into the Groww
-    // per-minute REST legs (spot + contract — the live-tick bridge tap died
-    // with the retired Groww live feed): marks are the OWN-FIRE just-closed
-    // 1m candle closes, forwarded at each leg's persist-confirm choke point.
+    // RETIRED order-update WS slot); the forwarder now rides into the GROWW
+    // CADENCE EXECUTOR (re-homed 2026-07-18 — the cadence lane owns the
+    // per-minute pulls; the legacy per-minute REST legs' taps are
+    // config-dead unless a legacy leg is re-enabled): marks are the
+    // OWN-FIRE just-closed 1m candle closes, forwarded at the executor's
+    // persist-confirm choke point.
     let (order_runtime_mark_forwarder, order_runtime_mark_rx_slot, order_runtime_marks_wanted) =
         if config.order_runtime.enabled {
             let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
@@ -551,24 +552,13 @@ async fn main() -> Result<()> {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
         };
-    // ── per-instrument presence registry init — PROCESS-GLOBAL boot prefix ──
-    // Scoreboard PR-D fix round 1 (review HIGH; 2026-07-15: the Groww
-    // activation watcher this originally ordered against retired with the
-    // Groww live feed — init stays the single process-global site): init
-    // MUST precede any registration producer AND both boot arms'
-    // `load_instruments` — `feed_presence::register_instruments` is a
-    // GLOBAL.get() free fn that silently no-ops pre-init, so the previous
-    // fast-arm init site (~1,000 lines after its load_instruments)
-    // deterministically skipped the Dhan universe registration on every
-    // crash-recovery boot, and the Groww watcher could register after a
-    // later init — a same-day 15:45 drain of that half-registered registry
-    // persisted a false one-sided "Groww won every minute" verdict. ONE
-    // init site (the process-global-prefix pattern the lag publisher +
-    // ts-pin migration already use); ordering pinned by the
-    // `test_feed_presence_is_wired_into_main` source-order ratchet.
-    tickvault_core::pipeline::feed_presence::init_feed_presence(
-        config.scoreboard.enabled && config.scoreboard.presence_fold_enabled,
-    );
+    // ── per-instrument presence registry — RETIRED 2026-07-18 (stage-4
+    // dead-producer sweep): the registry
+    // (crates/core/src/pipeline/feed_presence.rs) was deleted — its
+    // record/register producers died with the live feeds (Dhan 2026-07-13,
+    // Groww 2026-07-15), so the boot init armed a registry nothing could
+    // ever feed. Scoreboard coverage degrades honestly to the SQL
+    // minute-set approximation (coverage_source = sql_backfill).
     // ── index_constituency ts-pin migration — PROCESS-GLOBAL boot prefix ──
     // F13/F14 hardening (2026-07-05): the one-shot, marker-gated TRUNCATE
     // migration runs here — BEFORE the [groww_universe] daily rider and regardless
@@ -1440,10 +1430,11 @@ async fn main() -> Result<()> {
     // Build the PROCESS-shared infra ONCE here: notifier (+ Docker auto-start),
     // health registry, seal-writer (installs the process-wide global_seal_sender),
     // the tick broadcast (the order-update broadcast retired in PR-C3,
-    // 2026-07-14), the obs / 21-TF aggregator / tick-storage
-    // subscriber tasks, and the axum API server (incl. /api/feeds, so the
-    // toggle endpoint exists regardless of feed state). The single
-    // `run_process_runloop` below keeps the process alive.
+    // 2026-07-14), the obs / tick-storage subscriber tasks (the 21-TF tick
+    // aggregator retired in the stage-3 dead-WS sweep, 2026-07-17), and the
+    // axum API server (incl. /api/feeds, so the toggle endpoint exists
+    // regardless of feed state). The single `run_process_runloop` below keeps
+    // the process alive.
     // =======================================================================
     let SharedInfraHandles {
         notifier,
@@ -1454,8 +1445,6 @@ async fn main() -> Result<()> {
         &config,
         std::sync::Arc::clone(&feed_runtime),
         std::sync::Arc::clone(&feed_health),
-        std::sync::Arc::clone(&trading_calendar),
-        std::sync::Arc::clone(&prev_day_cache),
         std::sync::Arc::clone(&tick_storage),
     )
     .await?;
@@ -1644,8 +1633,29 @@ async fn main() -> Result<()> {
         &config,
         &notifier,
         &trading_calendar,
-        order_runtime_mark_forwarder,
+        // Clone: the ORIGINAL rides into the cadence scheduler below —
+        // since PR #1624 the cadence Groww executor is the LIVE mark
+        // producer (these legacy legs are config-OFF at HEAD).
+        order_runtime_mark_forwarder.clone(),
     );
+
+    // Full-fidelity order/position PUSH-event capture (ORDER-EVT-01,
+    // 2026-07-18 — `.claude/rules/project/order-update-events-error-codes.md`):
+    // config-gated (`[order_update_events]`) supervised consumer draining
+    // the two capture channels into the NEW order_update_events /
+    // position_update_events tables. ADDITIVE forensic lane — the lossy
+    // 11-field order_audit lane and the hint lane are untouched. The Dhan
+    // sender rides into DhanRestStackParams below; the pair feeds
+    // GrowwPushCapture under the groww_orders feature.
+    let (order_update_events_tx, position_update_events_tx) =
+        tickvault_app::order_update_events_boot::spawn_order_update_events_capture(
+            &config.order_update_events,
+            &config.questdb,
+        );
+    #[cfg(not(feature = "groww_orders"))]
+    // The position producer is groww_orders-only — without the feature the
+    // sender drops here (the consumer handles the closed side gracefully).
+    let _ = position_update_events_tx;
 
     // Groww order/position PUSH channel — Stage D (operator-authorized
     // paper-mode receive-only build, 2026-07-17): the supervised
@@ -1657,7 +1667,25 @@ async fn main() -> Result<()> {
     #[cfg(feature = "groww_orders")]
     {
         if config.groww_orders.order_push_enabled {
-            tickvault_app::groww_order_observability::spawn_groww_order_push(&config.questdb);
+            // The ADDITIVE capture lane rides only when [order_update_events]
+            // is enabled; disabled ⇒ the push runner runs capture-free.
+            let capture = match (
+                order_update_events_tx.clone(),
+                position_update_events_tx.clone(),
+            ) {
+                (Some(orders), Some(positions)) => {
+                    tickvault_trading::oms::groww::push::order_events::GrowwPushCapture::new(
+                        orders, positions,
+                    )
+                }
+                _ => {
+                    tickvault_trading::oms::groww::push::order_events::GrowwPushCapture::disabled()
+                }
+            };
+            tickvault_app::groww_order_observability::spawn_groww_order_push(
+                &config.questdb,
+                capture,
+            );
         } else {
             info!(
                 "groww order push disabled (config) — receive-only order/position channel not spawned"
@@ -1701,6 +1729,14 @@ async fn main() -> Result<()> {
         &trading_calendar,
         &feed_runtime,
         &notifier,
+        // Order-runtime mark tap (2026-07-18): the GROWW cadence
+        // executor's spot persist-confirm seam is the live mark source
+        // (re-homed from the stood-down legacy legs). Threaded to the
+        // GROWW lane ONLY — NEVER the Dhan executor: Dhan sids
+        // (13/25/51) are a different id space than the Groww-native
+        // u64s the paper book keys on; cross-feeding would double-key
+        // instruments invisibly to the first-seen-segment tripwire.
+        order_runtime_mark_forwarder,
     );
 
     // -----------------------------------------------------------------------
@@ -1886,6 +1922,10 @@ async fn main() -> Result<()> {
             // with the lane).
             mark_rx_slot: std::sync::Arc::clone(&order_runtime_mark_rx_slot),
             marks_wanted: std::sync::Arc::clone(&order_runtime_marks_wanted),
+            // ORDER-EVT-01 (2026-07-18): the full-fidelity capture sender the
+            // Phase 5a paper consumer publishes each Dhan order push into.
+            // None = the [order_update_events] capture lane is disabled.
+            order_update_events_tx: order_update_events_tx.clone(),
             // PR-C2: the stack owns the /health token-block writer.
             health: health_status.clone(),
         },
@@ -2081,39 +2121,29 @@ async fn run_slow_boot_observability(
 // compute_market_close_sleep is now in boot_helpers module (lib.rs).
 
 // ---------------------------------------------------------------------------
-// Helper: Engine B — multi-TF candle aggregator (shared by fast + slow boot)
+// Helper: seal-writer loop — the shared candle seal chain
 // ---------------------------------------------------------------------------
+//
+// Stage-3 dead-WS sweep (2026-07-17): `spawn_engine_b_aggregator` — the 21-TF
+// TICK aggregator driver (per-tick fold subscriber, AGGREGATOR-HB-01
+// heartbeat, IST-midnight + 15:30:05 close-time force-seal tasks, BOUNDARY-01
+// watermark catch-up) — is DELETED. Both live feeds are retired (Dhan
+// 2026-07-13, Groww 2026-07-15), so the aggregator had NO tick input on the
+// REST-only runtime; the sole surviving seal PRODUCER is the REST-era candle
+// fold (`rest_candle_fold.rs`, FOLD-01), which emits `BufferedSeal`s straight
+// into the global seal Sender installed below.
 
-/// Candle-engine re-architecture #T1b — wire Engine B (the only candle
-/// engine).
-///
-/// Spawns three tokio tasks, all driven off the live tick broadcast:
-///
-/// 1. **Aggregator subscriber** — folds every live tick into the 21-TF
-///    [`MultiTfAggregator`]; on each TF boundary cross the sealed
-///    candle is pct-stamped and pushed into the seal-writer ring (which
-///    drains to the 21 plain `candles_<tf>` tables).
-/// 2. **Per-minute heartbeat** — coalesced 60s structured log of
-///    seals-emitted / dropped / late-discarded (AGGREGATOR-HB-01).
-/// 3. **IST-midnight force-seal** — at IST 00:00:00 each trading day,
-///    force-seals every open bucket of every instrument so day-N state
-///    never fuses into day-(N+1)'s first bar. Replaces the deleted
-///    Engine-C `run_midnight_rollover_task_with_fanout`.
-///
-/// The single boot path calls this from `build_shared_infra` (PR-C2,
-/// 2026-07-13 — the fast crash-recovery arm is deleted).
-// WIRING-EXEMPT: call site is `build_shared_infra` below.
 /// Spawns the Wave 6 seal-writer loop and publishes its GLOBAL seal Sender so
-/// the multi-TF aggregator (Engine B) can emit sealed candles into the
+/// the REST-era candle fold (FOLD-01) can emit sealed candles into the
 /// `candles_<tf>` tables.
 ///
-/// MUST run on BOTH boot paths. If the Sender is never published,
-/// `global_seal_sender()` returns None and the aggregator's per-tick closure
-/// skips every tick (`else { continue }`), leaving `candles_*` empty. This is
-/// the 2026-06-01 `candles_1m=0` bug: the seal-writer was wired in the slow
-/// boot path only, so FAST BOOT captured ticks but sealed no candles.
-/// `set_global_seal_sender` is idempotent (first installer wins), so calling
-/// this on whichever boot path runs is safe.
+/// MUST run before the fold spawns. If the Sender is never published,
+/// `global_seal_sender()` returns None and every fold seal emission degrades
+/// loudly (`dropped{reason="no_seal_sender"}`), leaving `candles_*` empty.
+/// This is the 2026-06-01 `candles_1m=0` bug class: the seal-writer was wired
+/// in the slow boot path only, so FAST BOOT captured ticks but sealed no
+/// candles. `set_global_seal_sender` is idempotent (first installer wins), so
+/// calling this on whichever boot path runs is safe.
 fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConfig) {
     use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
     use tickvault_storage::seal_writer_runner::SealWriterRunner;
@@ -2153,509 +2183,43 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
     }
 }
 
-fn spawn_engine_b_aggregator(
-    tick_broadcast_sender: &tokio::sync::broadcast::Sender<
-        tickvault_common::tick_types::ParsedTick,
-    >,
-    prev_day_cache: std::sync::Arc<tickvault_trading::in_mem::PrevDayCache>,
-    trading_calendar: std::sync::Arc<TradingCalendar>,
-) {
-    use tickvault_storage::seal_writer_runner::global_seal_sender;
-    // C2: `BufferedSeal` / `TfIndex` / `stamp_seal_pct_fields` are no longer used
-    // directly here — the per-seal routing body moved into
-    // `tickvault_app::seal_routing::route_seal` (behavior-preserving).
-    use tickvault_trading::candles::{AggregatorHeartbeatCounters, MultiTfAggregator};
-
-    // 11K-instrument capacity (matches MAX_TOTAL_SUBSCRIPTIONS headroom
-    // per `aws-budget.md`). HashMap grows lazily so this is a hint.
-    const AGGREGATOR_CAPACITY: usize = 11_000;
-
-    // §30: GIFT Nifty (always-on) candles must form across its full ~21h
-    // session — pass the boot-installed exemption set into the aggregator.
-    let aggregator = std::sync::Arc::new(
-        MultiTfAggregator::with_capacity(AGGREGATOR_CAPACITY)
-            .with_always_on(tickvault_common::always_on::current()),
-    );
-
-    // --- Task 1: aggregator subscriber (per-tick fold + seal) ---
-    let agg_clone = std::sync::Arc::clone(&aggregator);
-    let prev_day_cache_for_agg = std::sync::Arc::clone(&prev_day_cache);
-    let heartbeat = AggregatorHeartbeatCounters::new();
-    let heartbeat_writer = heartbeat.clone();
-    let heartbeat_reader = heartbeat.clone();
-    let mut tick_rx = tick_broadcast_sender.subscribe();
-
-    tokio::spawn(async move {
-        loop {
-            match tick_rx.recv().await {
-                Ok(tick) => {
-                    let Some(sender) = global_seal_sender() else {
-                        continue;
-                    };
-                    let stats = agg_clone.consume_tick(
-                        &tick,
-                        tick.exchange_segment_code,
-                        // Dhan feed: re-fold 1-bucket-late ticks (Option B); the
-                        // `u32` Quote-packet volume needs no override (None ⇒ the
-                        // cell reads tick.volume). Byte-identical to the
-                        // pre-FeedStrategy Dhan behaviour.
-                        tickvault_trading::candles::FeedStrategy::DHAN,
-                        None,
-                        |tf, state| {
-                            // C2 (behavior-preserving): the per-seal routing body
-                            // now lives in the shared `route_seal`. Dhan policy:
-                            // drop the D1 seal (1d is historical-only per
-                            // `live-feed-purity.md` rule 10), stamp the prev-day
-                            // pct fields from `prev_day_cache_for_agg`, and drive
-                            // the heartbeat + `tv_aggregator_*` counters. The
-                            // emitted output (counters, drop label, BufferedSeal
-                            // fields, D1-drop, pct-stamp) is byte-identical to the
-                            // pre-C2 inline closure.
-                            tickvault_app::seal_routing::route_seal(
-                                tickvault_app::seal_routing::SealRouteParams {
-                                    feed: tickvault_common::feed::Feed::Dhan,
-                                    drop_d1: true,
-                                    prev_day_cache: Some(prev_day_cache_for_agg.as_ref()),
-                                    heartbeat: Some(&heartbeat_writer),
-                                    feed_health_on_m1: None,
-                                },
-                                tick.security_id,
-                                tick.exchange_segment_code,
-                                tf,
-                                state,
-                                sender,
-                            );
-                        },
-                    );
-                    if stats.late_count > 0 {
-                        metrics::counter!("tv_aggregator_late_ticks_discarded_total")
-                            .increment(u64::from(stats.late_count));
-                        heartbeat_writer.record_late_ticks(u64::from(stats.late_count));
-                    }
-                    // Option B: a 1-bucket-late tick re-folded its OWN minute's
-                    // high/low/close and was re-emitted via on_seal (UPSERT
-                    // replaced the candle row). Observable, not a silent merge.
-                    if stats.amended_count > 0 {
-                        metrics::counter!("tv_aggregator_amended_ticks_total")
-                            .increment(u64::from(stats.amended_count));
-                        heartbeat_writer.record_amended_ticks(u64::from(stats.amended_count));
-                    }
-                    if !stats.instrument_found {
-                        agg_clone.pre_populate(std::iter::once((
-                            tick.security_id,
-                            tick.exchange_segment_code,
-                        )));
-                        metrics::counter!("tv_aggregator_instruments_lazy_inserted_total")
-                            .increment(1);
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    metrics::counter!("tv_aggregator_tick_lag_total").increment(skipped);
-                    // H2-lite (zero-tick-loss PR-8b): the aggregator fell so far
-                    // behind the ~52s TICK_BROADCAST_CAPACITY buffer that the
-                    // broadcast dropped `skipped` ticks from ITS view. This was a
-                    // SILENT counter bump; make it LOUD (audit Rule 5 — a
-                    // candle-data-loss event must be `error!`, never silent).
-                    //
-                    // CRITICAL ASSURANCE: the dropped ticks are NOT lost and NOT
-                    // reordered. The lossless + ORDERED durable record is the WAL
-                    // frame spill (`ws_frame_spill`: raw frames captured by the WS
-                    // read loop BEFORE any broadcast fan-out — single-producer FIFO
-                    // segments, ring→spill→DLQ, replayed in append order on boot).
-                    // This broadcast `Lagged` is downstream of that WAL, so it can
-                    // only affect the DERIVED candles for this window — never the
-                    // durable tick record, and never tick ORDER. The 15:31 IST
-                    // post-market 1-minute cross-verify pinpoints the affected
-                    // minutes, rebuildable from the WAL-backed, ts-ordered `ticks`
-                    // table. Tick routing + order on the live read loop are
-                    // untouched by this change.
-                    tracing::error!(
-                        skipped,
-                        code =
-                            tickvault_common::error_code::ErrorCode::AggregatorLag01TickLagDropped
-                                .code_str(),
-                        "candle aggregator tick-broadcast LAGGED — derived candles for this \
-                         window may under-count; ticks remain safe + ordered in the ticks table; \
-                         rebuild via the post-market 1m cross-verify"
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    tracing::info!("Engine B aggregator subscriber: broadcast closed, exiting");
-                    break;
-                }
-            }
-        }
-    });
-    tracing::info!(
-        aggregator_capacity = AGGREGATOR_CAPACITY,
-        "candle-engine #T1b — multi-TF aggregator task spawned (Engine B)"
-    );
-
-    // --- Task 2: per-minute heartbeat ---
-    const AGGREGATOR_HEARTBEAT_INTERVAL_SECS: u64 = 60;
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
-        ));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let snap = heartbeat_reader.drain();
-            if !snap.is_active() {
-                continue;
-            }
-            tracing::info!(
-                seals_emitted = snap.seals_emitted,
-                seals_dropped = snap.seals_dropped,
-                late_ticks_discarded = snap.late_ticks_discarded,
-                close_pct_nonzero = snap.close_pct_nonzero,
-                interval_secs = AGGREGATOR_HEARTBEAT_INTERVAL_SECS,
-                "aggregator heartbeat (AGGREGATOR-HB-01)"
-            );
-        }
-    });
-    tracing::info!("candle-engine #T1b — aggregator heartbeat task spawned");
-
-    // --- Task 3: IST-midnight boundary force-seal ---
-    // Replaces the deleted Engine-C `run_midnight_rollover_task_with_fanout`.
-    // At IST 00:00:00 each trading day, force-seals every open bucket so
-    // day-N candle state never fuses into day-(N+1)'s first bar. Each
-    // sealed bar is pct-stamped and routed into the SAME seal-writer ring
-    // the per-tick path uses (`global_seal_sender()`).
-    let agg_for_boundary = std::sync::Arc::clone(&aggregator);
-    let prev_day_cache_for_boundary = std::sync::Arc::clone(&prev_day_cache);
-    // Cloned BEFORE Task 3 moves `trading_calendar` — Task 3b (close-time
-    // force-seal) and Task 4 (the watermark catch-up seal below) share the
-    // same calendar gate.
-    let calendar_for_catchup = std::sync::Arc::clone(&trading_calendar);
-    let calendar_for_close_seal = std::sync::Arc::clone(&trading_calendar);
+/// Spawns the RELOCATED scoreboard IST-midnight reset task (stage-3 dead-WS
+/// sweep, 2026-07-17).
+///
+/// These two cold, day-boundary resets previously lived inside the deleted
+/// `spawn_engine_b_aggregator` Task 3 (the IST-midnight force-seal loop) —
+/// per the sweep contract the cluster-D resets are RELOCATED, never deleted:
+///
+/// 1. `feed_lag_monitor::reset_day_lag_histogram(Feed::Dhan)` — clears the
+///    scorecard DAY lag distribution at every IST midnight (Scoreboard PR-C;
+///    a Saturday midnight must still clear Friday's distribution before
+///    Monday's scorecard row). Cold, O(96).
+/// 2. (RETIRED 2026-07-18, stage-4) `feed_presence::reset_daily` — the
+///    presence registry was deleted with its producer-less module; only the
+///    day-lag reset remains.
+///
+/// Honest note: both writers are dormant on the REST-only runtime (the live
+/// feeds are retired), so these resets are currently no-op hygiene — kept so
+/// the cluster-D day-boundary contract survives until its own stage decides
+/// the modules' fate. Deliberately NO trading-day gate: the resets must fire
+/// on EVERY midnight (the deleted Task 3 ran them before its gate too).
+fn spawn_scoreboard_midnight_reset_task() {
     tokio::spawn(async move {
         loop {
             // Sleep until the next IST midnight (bounded helper, ≤ 24h).
             let sleep_secs = tickvault_common::market_hours::secs_until_next_ist_midnight().max(1);
             tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-
-            // Scoreboard PR-C: reset the Dhan DAY lag histogram at every
-            // IST midnight — BEFORE the trading-day gate below (a
-            // Saturday-midnight `continue` must still clear Friday's
-            // distribution before Monday's scorecard row). Cold, O(96).
             tickvault_core::pipeline::feed_lag_monitor::reset_day_lag_histogram(
                 tickvault_common::feed::Feed::Dhan,
             );
-            // Scoreboard PR-D: reset the Dhan presence bitsets at the same
-            // boundary (belt-and-braces — the day-change clear at
-            // registration is the backstop). Cold, O(slots × 6).
-            tickvault_core::pipeline::feed_presence::reset_daily(
-                tickvault_common::feed::Feed::Dhan,
-            );
-
-            // Only force-seal on trading days — a non-trading-day
-            // midnight has no open buckets worth flushing. `is_trading_day_today`
-            // reads the IST calendar date internally.
-            if !trading_calendar.is_trading_day_today() {
-                tracing::info!("IST-midnight force-seal: skipping (non-trading day)");
-                continue;
-            }
-
-            let Some(sender) = global_seal_sender() else {
-                tracing::warn!("IST-midnight force-seal: seal sender not installed — skipping");
-                continue;
-            };
-
-            let mut sealed: u64 = 0;
-            let mut dropped: u64 = 0;
-            agg_for_boundary.force_seal_all(|security_id, segment_code, tf, state| {
-                // C2 (behavior-preserving): the per-seal routing body now lives
-                // in the shared `route_seal`. This IST-midnight Dhan path uses
-                // the SAME Dhan policy as the per-tick site (drop D1, pct-stamp,
-                // fire the `tv_aggregator_*` counters) but carries NO heartbeat —
-                // it keeps its own local `sealed`/`dropped` running counts from
-                // the returned `SealOutcome`. Byte-identical to the pre-C2 inline
-                // closure.
-                match tickvault_app::seal_routing::route_seal(
-                    tickvault_app::seal_routing::SealRouteParams {
-                        feed: tickvault_common::feed::Feed::Dhan,
-                        drop_d1: true,
-                        prev_day_cache: Some(prev_day_cache_for_boundary.as_ref()),
-                        heartbeat: None,
-                        feed_health_on_m1: None,
-                    },
-                    security_id,
-                    segment_code,
-                    tf,
-                    state,
-                    sender,
-                ) {
-                    tickvault_app::seal_routing::SealOutcome::Sent => {
-                        sealed = sealed.saturating_add(1);
-                    }
-                    tickvault_app::seal_routing::SealOutcome::DroppedFull => {
-                        dropped = dropped.saturating_add(1);
-                    }
-                    // D1 is dropped at the write boundary — not counted as a
-                    // mpsc-full drop (matches the pre-C2 early-`return`).
-                    tickvault_app::seal_routing::SealOutcome::DroppedD1 => {}
-                }
-            });
-            // F2 self-heal (2026-07-03): restart the day's event-time
-            // watermark from 0 so (a) a POISONED watermark (garbage
-            // future-dated tick advanced the never-regressing fetch_max past
-            // the future-skew guard, disabling catch-up) self-heals within
-            // one day, and (b) each day's watermark rebuilds from the day's
-            // first real tick. The catch-up driver's watermark==0 gate keeps
-            // the scan idle until then.
-            agg_for_boundary.reset_watermark();
             tracing::info!(
-                sealed,
-                dropped,
-                "IST-midnight force-seal complete — open buckets flushed (watermark reset)"
+                "scoreboard IST-midnight reset fired (day lag histogram; the \
+                 presence-bitset reset retired 2026-07-18 with the deleted \
+                 presence registry)"
             );
         }
     });
-    tracing::info!("candle-engine #T1b — IST-midnight force-seal task spawned");
-
-    // --- Task 3b: 15:30:05 IST close-time force-seal (2026-07-03) ---
-    // The LAST session minute (the 15:29 M1 bar — and every TF's final
-    // bucket) never sealed intraday: a bucket seals only on the SAME
-    // instrument's next tick, and the session gate discards ≥15:30:00
-    // ticks BEFORE they can roll the bucket, so the final buckets waited
-    // for the IST-midnight force-seal — which the 16:30 IST instance
-    // auto-stop destroys (RAM state lost). This task closes that gap:
-    // at 15:30:05 IST on trading days it force-seals every NON-always-on
-    // instrument via `force_seal_all_session_scoped` (GIFT Nifty's ~21h
-    // session must NOT be truncated at NSE close — only the midnight
-    // task seals always-on cells) and routes each seal through the SAME
-    // `route_seal` Dhan policy as Task 3.
-    //
-    // Ordering vs the 15:30:00.8 market-close pipeline stop: DELIBERATELY
-    // a parallel timer, NOT a close-sequence hook — the close sequence
-    // (`run_until_shutdown`) only aborts WS/tick-processor/trading
-    // handles; the aggregator Arc, `global_seal_sender()` and the
-    // seal-writer loop stay alive until final app shutdown, so this task
-    // runs safely after the stop (single boot path since PR-C2).
-    //
-    // Idempotent vs the midnight seal: `force_seal` on emptied slots
-    // returns None (0 double-flushes) and any duplicate row is absorbed
-    // by the candle tables' DEDUP UPSERT KEYS. Never fires mid-session:
-    // the trigger instant is fixed strictly after the [09:15, 15:30)
-    // session-gate window closes. Same bare-spawn supervision level as
-    // the sibling Task 3 midnight force-seal.
-    let agg_for_close_seal = std::sync::Arc::clone(&aggregator);
-    let prev_day_cache_for_close_seal = std::sync::Arc::clone(&prev_day_cache);
-    tokio::spawn(async move {
-        loop {
-            // Sleep until the next 15:30:05 IST (bounded helper, ≤ 24h;
-            // returns tomorrow's trigger when at/past today's, never 0).
-            tokio::time::sleep(compute_close_seal_sleep()).await;
-
-            // Only force-seal on trading days — a weekend/holiday 15:30:05
-            // has no open buckets worth flushing.
-            if !calendar_for_close_seal.is_trading_day_today() {
-                tracing::info!("close-time force-seal: skipping (non-trading day)");
-                continue;
-            }
-
-            let Some(sender) = global_seal_sender() else {
-                tracing::warn!("close-time force-seal: seal sender not installed — skipping");
-                continue;
-            };
-
-            let mut sealed: u64 = 0;
-            let mut dropped: u64 = 0;
-            agg_for_close_seal.force_seal_all_session_scoped(
-                |security_id, segment_code, tf, state| {
-                    match tickvault_app::seal_routing::route_seal(
-                        tickvault_app::seal_routing::SealRouteParams {
-                            feed: tickvault_common::feed::Feed::Dhan,
-                            drop_d1: true,
-                            prev_day_cache: Some(prev_day_cache_for_close_seal.as_ref()),
-                            heartbeat: None,
-                            feed_health_on_m1: None,
-                        },
-                        security_id,
-                        segment_code,
-                        tf,
-                        state,
-                        sender,
-                    ) {
-                        tickvault_app::seal_routing::SealOutcome::Sent => {
-                            sealed = sealed.saturating_add(1);
-                        }
-                        tickvault_app::seal_routing::SealOutcome::DroppedFull => {
-                            dropped = dropped.saturating_add(1);
-                        }
-                        // D1 is dropped at the write boundary — not counted
-                        // as a mpsc-full drop (same policy as Task 3).
-                        tickvault_app::seal_routing::SealOutcome::DroppedD1 => {}
-                    }
-                },
-            );
-            // NOTE: no `reset_watermark()` here — the watermark reset is the
-            // IST-midnight task's cross-day duty; post-close ticks must keep
-            // advancing it for the BOUNDARY-01 catch-up driver.
-            tracing::info!(
-                sealed,
-                dropped,
-                "close-time force-seal complete — final session buckets flushed"
-            );
-        }
-    });
-    tracing::info!("candle-engine #T1b — 15:30:05 IST close-time force-seal task spawned");
-
-    // --- Task 4: watermark-aware per-minute catch-up seal (BOUNDARY-01) ---
-    // Bounds candle seal lag WITHOUT mass-discarding backlogged ticks. A
-    // bucket seals today only on the SAME instrument's next tick or at IST
-    // midnight — an instrument that stops ticking mid-session leaves its
-    // candle rows absent for hours, and the final session minute (the 15:29
-    // M1 bar) is structurally absent until midnight because the
-    // out-of-session gate blocks ≥15:30 ticks from folding. This task closes
-    // both gaps SAFELY: every CATCHUP_SEAL_POLL_INTERVAL_SECS it reads the
-    // Dhan aggregator instance's event-time watermark (max exchange_timestamp
-    // ever consumed — post-close ticks still advance it) and gates via the
-    // shared pure `compute_catchup_cutoff`: scan ONLY when the watermark
-    // ADVANCED since the last scan AND is not POISONED (more than the
-    // future-skew guard ahead of the IST wall clock — a garbage future-dated
-    // tick advanced the never-regressing fetch_max); the cutoff is
-    // min(watermark − CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN, now_ist) so a
-    // bucket can never seal before the wall clock passes its end. Buckets
-    // past that cutoff are still potentially being filled by a backlogged
-    // stream and stay open — a naive wall-clock force-seal here would
-    // convert the backlog into DiscardLate drops and corrupt candles on
-    // re-open. A STALLED watermark (dead feed / broadcast starvation) gets
-    // NO catch-up seals — FEED-STALL-01 owns the dead-feed page; no "assume
-    // dead then force-seal anyway" escape hatch exists by design. A POISONED
-    // watermark disables catch-up (coalesced BOUNDARY-01 error,
-    // reason=watermark_future_skew) until the IST-midnight watermark reset
-    // self-heals it. Same bare-spawn supervision level as the sibling Task 3
-    // midnight force-seal.
-    let agg_for_catchup = std::sync::Arc::clone(&aggregator);
-    let prev_day_cache_for_catchup = std::sync::Arc::clone(&prev_day_cache);
-    let heartbeat_for_catchup = heartbeat.clone();
-    tokio::spawn(async move {
-        use tickvault_trading::candles::{
-            CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN, CATCHUP_SEAL_POLL_INTERVAL_SECS,
-            CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS, compute_catchup_cutoff,
-        };
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            CATCHUP_SEAL_POLL_INTERVAL_SECS,
-        ));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_scanned_watermark: u32 = 0;
-        // Edge latch for the poisoned-watermark error — ONE coalesced line
-        // per poisoning episode (audit Rule 4), not one per 5 s wave.
-        let mut poison_logged = false;
-        loop {
-            interval.tick().await;
-            let watermark = agg_for_catchup.watermark_secs();
-            // IST wall-clock now (epoch seconds) — the SAME canonical
-            // Utc::now + IST-offset path the market-hours helpers use
-            // (audit-findings Rule 3). A pre-1970 / post-2106 degenerate
-            // clock maps to 0, which makes every watermark look poisoned →
-            // catch-up stays disabled (fail-closed, BOOT-03-class posture).
-            let now_ist_secs = u32::try_from(chrono::Utc::now().timestamp().saturating_add(
-                i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
-            ))
-            .unwrap_or(0);
-            let Some(cutoff) = compute_catchup_cutoff(
-                watermark,
-                last_scanned_watermark,
-                now_ist_secs,
-                CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN,
-                CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS,
-            ) else {
-                // None = no tick yet / watermark unchanged (self-gate) /
-                // POISONED. Only the poisoned arm is observable: watermark
-                // non-zero and advanced, yet the gate refused — meaning it
-                // sits past now + guard. last_scanned is NOT updated, so
-                // scanning resumes the moment the watermark self-heals
-                // (IST-midnight reset_watermark).
-                if watermark != 0 && watermark != last_scanned_watermark {
-                    metrics::counter!(
-                        "tv_boundary_catchup_skipped_total",
-                        "feed" => "dhan", "reason" => "future_skew"
-                    )
-                    .increment(1);
-                    if !poison_logged {
-                        poison_logged = true;
-                        tracing::error!(
-                            code = tickvault_common::error_code::ErrorCode::Boundary01CatchupSeal
-                                .code_str(),
-                            reason = "watermark_future_skew",
-                            feed = "dhan",
-                            watermark_secs = watermark,
-                            now_ist_secs,
-                            "BOUNDARY-01: poisoned event-time watermark (further ahead of the \
-                             IST wall clock than host skew allows) — catch-up sealing disabled \
-                             until the IST-midnight watermark reset self-heals it"
-                        );
-                    }
-                }
-                continue;
-            };
-            poison_logged = false;
-            // Trading-day gate — mirrors the Task 3 midnight force-seal.
-            if !calendar_for_catchup.is_trading_day_today() {
-                continue;
-            }
-            let Some(sender) = global_seal_sender() else {
-                // Seal-writer not installed yet — retry next wave WITHOUT
-                // consuming the watermark advance (no seal is lost).
-                continue;
-            };
-            last_scanned_watermark = watermark;
-            // F5 (2026-07-03): count only ROUTED catch-up seals — Dhan drops
-            // D1 at the write boundary (`live-feed-purity.md` rule 10), so a
-            // D1 catch-up seal must not inflate the counter or the coalesced
-            // `seals` count. DroppedFull IS counted here (the row reaches the
-            // ring→spill→DLQ absorption chain and is separately counted by
-            // `tv_seal_mpsc_dropped_total`).
-            let mut routed: u64 = 0;
-            agg_for_catchup.catch_up_seal_all(cutoff, |security_id, segment_code, tf, state| {
-                // EXACT same Dhan routing policy as the per-tick seal site
-                // (spawn_engine_b_aggregator Task 1): drop D1, pct-stamp from
-                // the prev-day cache, drive the heartbeat + tv_aggregator_*
-                // counters.
-                match tickvault_app::seal_routing::route_seal(
-                    tickvault_app::seal_routing::SealRouteParams {
-                        feed: tickvault_common::feed::Feed::Dhan,
-                        drop_d1: true,
-                        prev_day_cache: Some(prev_day_cache_for_catchup.as_ref()),
-                        heartbeat: Some(&heartbeat_for_catchup),
-                        feed_health_on_m1: None,
-                    },
-                    security_id,
-                    segment_code,
-                    tf,
-                    state,
-                    sender,
-                ) {
-                    // D1 dropped at the write boundary — not a routed seal.
-                    tickvault_app::seal_routing::SealOutcome::DroppedD1 => {}
-                    tickvault_app::seal_routing::SealOutcome::Sent
-                    | tickvault_app::seal_routing::SealOutcome::DroppedFull => {
-                        routed = routed.saturating_add(1);
-                        metrics::counter!("tv_boundary_catchup_total", "feed" => "dhan")
-                            .increment(1);
-                    }
-                }
-            });
-            if routed > 0 {
-                // ONE coalesced line per scan wave — never per-seal spam.
-                tracing::warn!(
-                    code =
-                        tickvault_common::error_code::ErrorCode::Boundary01CatchupSeal.code_str(),
-                    feed = "dhan",
-                    seals = routed,
-                    cutoff_secs = cutoff,
-                    watermark_secs = watermark,
-                    "BOUNDARY-01: watermark catch-up sealed lagging candle bucket(s) — \
-                     late but correct; buckets past the watermark stay open for the backlog"
-                );
-            }
-        }
-    });
-    tracing::info!("candle-engine #T1b — watermark catch-up seal task spawned (BOUNDARY-01)");
+    tracing::info!("scoreboard IST-midnight reset task spawned (relocated, stage-3 sweep)");
 }
 
 // ---------------------------------------------------------------------------
@@ -2722,11 +2286,12 @@ struct SharedInfraHandles {
 
 /// Builds the PROCESS-shared infra ONCE for BOTH the Dhan-OFF and Dhan-ON-slow
 /// boot paths: strict notifier (+ optional coalescer), health registry,
-/// seal-writer (installs the process-wide `global_seal_sender`), the 21-TF
-/// Engine-B aggregator, the tick broadcast channel (the order-update
-/// broadcast retired in PR-C3, 2026-07-14), the
+/// seal-writer (installs the process-wide `global_seal_sender` — fed by the
+/// REST-era candle fold since the stage-3 dead-WS sweep deleted the 21-TF
+/// tick aggregator, 2026-07-17), the tick broadcast channel (the
+/// order-update broadcast retired in PR-C3, 2026-07-14), the
 /// observability + tick-storage subscriber tasks (which `.subscribe()` to the
-/// tick broadcast BEFORE the lane's tick processor publishes — the
+/// tick broadcast BEFORE anything could publish — the
 /// subscribe-before-publish / zero-tick-loss invariant, preserved by
 /// construction), and the axum API server (incl. /api/feeds — so the toggle
 /// endpoint exists even with Dhan OFF).
@@ -2738,8 +2303,6 @@ async fn build_shared_infra(
     config: &ApplicationConfig,
     feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
-    trading_calendar: std::sync::Arc<TradingCalendar>,
-    prev_day_cache: std::sync::Arc<tickvault_trading::in_mem::PrevDayCache>,
     tick_storage: std::sync::Arc<tickvault_trading::in_mem::TickStorage>,
 ) -> Result<SharedInfraHandles> {
     // --- Notifier (strict) + Docker infra (parallel — independent) ---
@@ -2865,14 +2428,27 @@ async fn build_shared_infra(
         }
     }
 
+    // --- Candle DDL + retired-object sweep (Track A, 2026-07-18) ---
+    // AWAITED INLINE, BEFORE the seal-writer spawn: the 21 `candles_<tf>`
+    // tables must be ensured WITH `DEDUP ENABLE UPSERT KEYS` before the
+    // REST-era bar-fold's first seal can reach ILP, or a fresh QuestDB
+    // volume auto-creates them WITHOUT DEDUP (silent duplicate-row window
+    // — the bug the PR-C2/#1581 lane deletions left behind). Bounded by
+    // the module's 60s quiet-probe; a down QuestDB skips the DDL loudly.
+    // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+    tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
+
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
 
+    // --- Scoreboard IST-midnight resets (RELOCATED, stage-3 sweep) ---
+    spawn_scoreboard_midnight_reset_task();
+
     // --- Tick broadcast channel (PROCESS-shared) ---
-    // Held for the process lifetime so the aggregator subscriber never wakes on
-    // a disconnected channel. With Dhan OFF nothing publishes Dhan ticks into
-    // the tick broadcast, but the channel + aggregator still run so the wiring
-    // is identical to the Dhan-ON path (Groww runs its OWN aggregator instance).
+    // Held for the process lifetime so the subscriber tasks never wake on a
+    // disconnected channel. PUBLISHER-LESS on the REST-only runtime (the
+    // lane's `run_tick_processor` died with the Dhan live WS; the Groww
+    // bridge died 2026-07-15) — the consumers below idle by construction.
     let (tick_broadcast_sender, _tick_broadcast_default_rx) =
         tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
             tickvault_common::constants::TICK_BROADCAST_CAPACITY,
@@ -2880,19 +2456,13 @@ async fn build_shared_infra(
     // PR-C3 (2026-07-14): the order-update broadcast channel was removed
     // (publisher + subscriber both retired — see the SharedInfraHandles note).
 
-    // --- Subscriber tasks: obs + 21-TF aggregator + tick-storage ---
-    // ALL three `.subscribe()` to `tick_broadcast_sender` HERE, in the hoisted
+    // --- Subscriber tasks: obs + tick-storage ---
+    // Both `.subscribe()` to `tick_broadcast_sender` HERE, in the hoisted
     // prefix, before anything could publish — subscribe-before-publish is
-    // preserved by construction. PR-C2 (2026-07-14): the broadcast is
-    // PUBLISHER-LESS (the lane's `run_tick_processor` is deleted; Groww runs
-    // its own writer + aggregator instance), so these consumers idle. The
-    // wiring stays: the `spawn_seal_writer_loop` above installed the
-    // process-wide `global_seal_sender` — since 2026-07-15 (Groww live-feed
-    // retirement) it has NO live-producing aggregator either (the Groww
-    // instance died with the bridge), so the whole seal chain is DORMANT on
-    // the REST-only runtime — and this Dhan aggregator instance's force-seal
-    // tasks are idempotent no-ops on its empty state. The committed C-phase
-    // follow-up retires the candle machinery wholesale.
+    // preserved by construction. Stage-3 dead-WS sweep (2026-07-17): the
+    // 21-TF TICK aggregator driver (`spawn_engine_b_aggregator`) is DELETED —
+    // the seal-writer above stays, fed exclusively by the REST-era candle
+    // fold (FOLD-01) further below.
     {
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
@@ -2902,11 +2472,6 @@ async fn build_shared_infra(
         });
         info!("slow-boot observability consumer started");
     }
-    spawn_engine_b_aggregator(
-        &tick_broadcast_sender,
-        std::sync::Arc::clone(&prev_day_cache),
-        std::sync::Arc::clone(&trading_calendar),
-    );
     {
         let tick_storage_rx = tick_broadcast_sender.subscribe();
         let storage_for_consumer = std::sync::Arc::clone(&tick_storage);
@@ -2922,13 +2487,13 @@ async fn build_shared_infra(
             "L10 tick_storage broadcast consumer spawned + IST 09:15 reset task running"
         );
     }
-    // (2026-07-15 wording fix: with the Groww live feed retired the aggregator
-    // has NO live tick producer — candle aggregation is DORMANT machinery on a
-    // REST-only boot; the committed C-phase follow-up owns its retirement.)
+    // (Stage-3 dead-WS sweep 2026-07-17: the 21-TF tick aggregator is
+    // DELETED — the seal-writer is fed exclusively by the REST-era candle
+    // fold, FOLD-01.)
     info!(
-        "SHARED-INFRA BOOT: seal-writer + 21-TF aggregator running (DORMANT — no live \
-         tick producer on the REST-only runtime; candle machinery retires in the \
-         committed C-phase follow-up)"
+        "SHARED-INFRA BOOT: seal-writer running — candles seal from the REST-era \
+         bar fold (FOLD-01); the tick aggregator was retired in the stage-3 \
+         dead-WS sweep"
     );
 
     // --- RAM residency stores (operator directive 2026-07-16, PR-2) ---
@@ -3848,6 +3413,7 @@ fn spawn_groww_spot_1m_leg(
                     burst: std::sync::Arc::clone(&burst),
                     minute_done_tx: chain_minute_done_tx,
                     anchor_store: contract_anchor_store.clone(),
+                    cadence_enabled: config.cadence.enabled,
                 },
             );
         info!(
@@ -3897,6 +3463,7 @@ fn spawn_groww_spot_1m_leg(
                     burst: std::sync::Arc::clone(&burst),
                     minute_done_tx: None,
                     anchor_store: None,
+                    cadence_enabled: config.cadence.enabled,
                 },
             ),
         );

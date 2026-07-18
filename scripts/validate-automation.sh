@@ -78,8 +78,14 @@ run_check "triage_rules_guard" \
     cargo test -p tickvault-common --test triage_rules_guard
 run_check "error_level_meta_guard" \
     cargo test -p tickvault-storage --test error_level_meta_guard
-run_check "zero_tick_loss_alert_guard" \
-    cargo test -p tickvault-storage --test zero_tick_loss_alert_guard
+# 2026-07-18 (stage-4 dead-producer sweep): zero_tick_loss_alert_guard was
+# DELETED with the tick rescue ring + TICK_BUFFER_CAPACITY (the tick writer
+# died in the stage-2 sweep 2026-07-17). The live absorption-tier ratchet is
+# the seal-ring suite (SEAL_BUFFER_CAPACITY L-C1 lock, incl.
+# test_seal_buffer_capacity_constant_is_locked_value) in
+# crates/trading/src/candles/seal_ring.rs.
+run_check "seal_ring ratchet (SEAL_BUFFER_CAPACITY)" \
+    cargo test -p tickvault-trading --lib candles::seal_ring
 run_check "summary_writer unit tests" \
     cargo test -p tickvault-core --lib notification::summary_writer
 run_check "observability library tests" \
@@ -125,6 +131,14 @@ run_check "tickvault-logs MCP self-test passes" \
     python3 scripts/mcp-servers/tickvault-logs/server.py --self-test
 run_check "tickvault-logs MCP placeholder-env fallback" \
     python3 scripts/mcp-servers/tickvault-logs/test_placeholder_fallback.py
+# 2026-07-18 (rust-only phase 2c, PRE-CUTOVER): the Rust port
+# crates/tickvault-logs-mcp is dual-pinned alongside server.py during the
+# parallel-run window. The python checks above stay until the separate
+# cutover PR swaps .mcp.json after live parallel-run validation.
+run_check "tickvault-logs Rust MCP crate present" \
+    test -f crates/tickvault-logs-mcp/src/main.rs
+run_check "tickvault-logs Rust MCP unit tests pass" \
+    cargo test -p tickvault-logs-mcp --lib
 
 echo ""
 echo "--- source-code invariants ---"

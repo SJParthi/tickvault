@@ -234,7 +234,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [common, storage, core, trading, api, app]
+        # 2026-07-18 (rust-only phase 2c): `logs-mcp` = the new
+        # crates/tickvault-logs-mcp crate (matrix entry expands to
+        # `tickvault-logs-mcp` via the `tickvault-${{ matrix.crate }}`
+        # run line below).
+        crate: [common, storage, core, trading, api, app, logs-mcp]
         # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature was
         # DELETED with the Dhan instrument chain (operator Q3, 2026-07-13 —
         # websocket-connection-scope-lock.md "2026-07-13 Amendment" §B); the
@@ -461,7 +465,7 @@ jobs:
           set -euo pipefail
           cargo llvm-cov clean --workspace
           # DHAT zero-alloc tests (dhat_instrument_registry / dhat_token_handle /
-          # dhat_feed_lag_ring) assert EXACT heap-allocation counts. Under
+          # dhat_moneyness) assert EXACT heap-allocation counts. Under
           # llvm-cov the coverage instrumentation ITSELF adds allocations, so
           # those assertions fail (exit 101) and abort the whole coverage run —
           # this is why "Coverage & Perf" was RED on main for days and never
@@ -617,6 +621,8 @@ jobs:
           done
           echo "== questdb-console-gate-matrix.sh (terraform-apply.yml console smoke-gate scenarios) =="
           bash scripts/questdb-console-gate-matrix.sh
+          echo "== all-green-equivalence-matrix.sh (all-green jq verdict vs frozen fixture table) =="
+          bash scripts/all-green-equivalence-matrix.sh
 
   # -------------------------------------------------------------------------
   # DHAT Zero-Alloc — dedicated lane for the hot-path allocation ratchets
@@ -680,14 +686,11 @@ jobs:
           crates/app/tests/dhat_mark_forward.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_cadence_decide.rs
-          crates/core/tests/dhat_feed_lag_ring.rs
-          crates/core/tests/dhat_feed_presence.rs
           crates/core/tests/dhat_instrument_registry.rs
           crates/core/tests/dhat_moneyness.rs
           crates/core/tests/dhat_telegram_dispatcher.rs
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
-          crates/trading/tests/dhat_multi_tf_consume_tick.rs
           crates/trading/tests/dhat_risk_engine.rs
           EOF
           )
@@ -731,8 +734,6 @@ jobs:
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
             --test dhat_cadence_decide \
-            --test dhat_feed_lag_ring \
-            --test dhat_feed_presence \
             --test dhat_instrument_registry \
             --test dhat_moneyness \
             --test dhat_telegram_dispatcher \
@@ -759,8 +760,12 @@ jobs:
           # adds dhat_cadence_decide: 10 -> 11.
           # 2026-07-17 (stage-2 dead-WS sweep): dhat_feed_consumer +
           # dhat_prev_close_writer deleted with the dead tick chain: 11 -> 9.
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-07-17 (dashboard tidy): dhat_feed_lag_ring deleted with the
+          # Dhan-lag publisher chain (run_dhan_lag_publisher/FeedLagRing): 9 -> 8.
+          # 2026-07-18 (stage-4 dead-producer sweep): dhat_feed_presence
+          # deleted with the producer-less presence registry: 8 -> 7.
+          if [ "$ran" -ne 7 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 7 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
@@ -776,9 +781,10 @@ jobs:
         run: |
           set -euo pipefail
           # dhat_bar_cache_lookup DELETED with the dead in_mem::bar_cache
-          # module (dead live-WS sweep stage 1, 2026-07-17) — target count 3→2.
+          # module (dead live-WS sweep stage 1, 2026-07-17); dhat_multi_tf_
+          # consume_tick DELETED with the tick aggregator (stage-3 sweep,
+          # 2026-07-17) — target count 3→2→1.
           cargo test -p tickvault-trading \
-            --test dhat_multi_tf_consume_tick \
             --test dhat_risk_engine \
             2>&1 | tee /tmp/dhat-trading.log
           if grep -q 'running 0 tests' /tmp/dhat-trading.log; then
@@ -786,8 +792,8 @@ jobs:
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
-          if [ "$ran" -ne 2 ]; then
-            echo "::error::trading DHAT step executed $ran targets, expected 2 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 1 ]; then
+            echo "::error::trading DHAT step executed $ran targets, expected 1 — a --test flag was dropped from this step."
             exit 1
           fi
 
@@ -867,39 +873,58 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          python3 - <<'PYEOF'
-          import json, os, sys
-
-          needs = json.loads(os.environ["NEEDS_JSON"])
-          event = os.environ["EVENT_NAME"]
-
-          # Jobs that are PR-only by design (their own `if:` skips them on
-          # push-to-main). A 'skipped' result for these is legitimate ONLY on
-          # push events and on workflow_dispatch runs (the post-merge catch-up
-          # dispatcher fires this workflow on main to stand in for a
-          # bot-merge-suppressed push run — same non-PR semantics); on a
-          # pull_request event they MUST have run.
-          PR_ONLY_JOBS = {"commit-lint", "design-first-wall", "local-runtime-block"}
-          NON_PR_EVENTS = {"push", "workflow_dispatch"}
-
-          failed = []
-          for job, meta in sorted(needs.items()):
-              result = meta.get("result")
-              if result == "success":
-                  continue
-              if result == "skipped" and event in NON_PR_EVENTS and job in PR_ONLY_JOBS:
-                  continue
-              # Everything else — failure, cancelled, or an unexpected skip —
-              # fails the gate. 'skipped' counts as FAILURE on pull_request
-              # events so a silently-skipped job can never fake green.
-              failed.append(f"{job}={result}")
-
-          if failed:
-              print("::error::All Green FAILED — non-success needed jobs: "
-                    + ", ".join(failed))
-              sys.exit(1)
-          print(f"All Green: every needed job succeeded (event={event}).")
-          PYEOF
+          # ALL-GREEN-VERDICT-BEGIN (extracted verbatim by
+          # scripts/all-green-equivalence-matrix.sh — keep these two markers
+          # intact; the harness pins this exact shell+jq program against a
+          # frozen expected-output table and ABORTS loudly if extraction
+          # comes back empty).
+          #
+          # Language port 2026-07-18 (rust-only purge Phase 2a-1 —
+          # merge-gate-lock-2026-07-04.md §5.1 dated amendment): the former
+          # inline `python3 - <<'PYEOF'` evaluator, re-expressed in jq+shell
+          # with BYTE-EQUIVALENT semantics (jq ships preinstalled on the
+          # GitHub ubuntu runner images). Semantics UNCHANGED:
+          # - iterate needed jobs sorted by name;
+          # - result == "success" passes;
+          # - result == "skipped" passes ONLY for the PR-only jobs
+          #   {commit-lint, design-first-wall, local-runtime-block} — whose
+          #   own `if:` skips them on push-to-main — and ONLY on the non-PR
+          #   events {push, workflow_dispatch} (the post-merge catch-up
+          #   dispatcher fires this workflow on main to stand in for a
+          #   bot-merge-suppressed push run — same non-PR semantics); on a
+          #   pull_request event they MUST have run;
+          # - everything else — failure, cancelled, or an unexpected skip —
+          #   fails the gate ('skipped' counts as FAILURE on pull_request
+          #   events so a silently-skipped job can never fake green); a
+          #   missing job result renders as the literal `None`, exactly as
+          #   the old evaluator's meta.get("result") did.
+          command -v jq >/dev/null 2>&1 || { echo "::error::jq not found on the runner — All Green verdict cannot run"; exit 1; }
+          verdict="$(jq -rn '
+            (env.NEEDS_JSON | fromjson) as $needs
+            | env.EVENT_NAME as $event
+            | [ $needs
+                | to_entries
+                | sort_by(.key)[]
+                | .key as $job
+                | .value.result as $result
+                | select(
+                    (
+                      ($result == "success")
+                      or ($result == "skipped"
+                          and ($event | IN("push", "workflow_dispatch"))
+                          and ($job | IN("commit-lint", "design-first-wall", "local-runtime-block")))
+                    ) | not
+                  )
+                | "\($job)=\(if $result == null then "None" else $result end)"
+              ] as $failed
+            | if ($failed | length) > 0
+              then "::error::All Green FAILED — non-success needed jobs: " + ($failed | join(", "))
+              else "All Green: every needed job succeeded (event=\($event))."
+              end
+          ')"
+          printf '%s\n' "$verdict"
+          case "$verdict" in "::error::"*) exit 1 ;; esac
+          # ALL-GREEN-VERDICT-END
 
   # -------------------------------------------------------------------------
   # Enable Auto-Merge — armed ONLY after All Green succeeds (merge-gate

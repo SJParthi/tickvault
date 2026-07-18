@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/instrument/daily_universe_orchestrator.rs"
+  - "crates/app/src/daily_universe_boot.rs"
+---
+
 # NTM Constituency — Error Codes (NTM Sub-PR #10)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C > this file.

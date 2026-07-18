@@ -191,21 +191,13 @@ fn test_every_alarm_metric_has_a_rust_emit_site() {
         !names.is_empty(),
         "ratchet self-check: app-alarms.tf produced 0 metric_name entries — parser broken"
     );
-    // DEAD-MONITOR allowlist (stage-2 dead-WS sweep, 2026-07-17): these 4
-    // alarm metrics' ONLY emit sites lived in the deleted dead Dhan tick
-    // chain (tick_persistence.rs ring/spill/DLQ counters + the aggregator
-    // late-tick arm fed by the deleted tick_processor.rs). The alarms in
-    // app-alarms.tf are now DEAD MONITORS (their series stopped the day the
-    // live feeds retired — 2026-07-13/15 — the code deletion changes no
-    // runtime behavior). Terraform retirement is deliberately DEFERRED to
-    // the dashboard PR per the sweep's task scope; entries here MUST be
-    // removed in lockstep when that PR deletes the alarms.
-    let dead_monitor_pending_tf_retirement: &[&str] = &[
-        "tv_spill_dropped_total",
-        "tv_dlq_ticks_total",
-        "tv_ticks_dropped_total",
-        "tv_late_tick_after_boundary_total",
-    ];
+    // DEAD-MONITOR allowlist — EMPTIED 2026-07-18 (stage-4 dead-producer
+    // sweep): the 4 dead-tick alarm resources (spill-dropped, dlq-ticks,
+    // ticks-dropped, late-tick-after-boundary) were deleted from
+    // app-alarms.tf in the same PR, so the stage-2 allowlist entries were
+    // removed per the lockstep contract below. The scaffold stays so any
+    // future deliberate dead-monitor window re-uses it.
+    let dead_monitor_pending_tf_retirement: &[&str] = &[];
     let mut missing = Vec::new();
     for name in &names {
         if dead_monitor_pending_tf_retirement.contains(&name.as_str()) {
@@ -373,8 +365,9 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // its OWN name, never a feed label on the Dhan gauge; alarmed in
     // silent-feed-alarms.tf S4). The Groww exclusion/clamp counters stay
     // /metrics-only (₹0). tv_boundary_catchup_total is NOT in this list —
-    // it publishes ONLY via the SECOND [host,feed] declaration (host-only
-    // folding would mask a Dhan storm under the Groww baseline).
+    // it published ONLY via the SECOND [host,feed] declaration until that
+    // declaration retired 2026-07-17 with the tick aggregator (stage-3
+    // dead-WS sweep).
     // Cost note: each custom metric series is ~$0.30/mo.
     // If you intentionally add/remove a name, update BOTH configs + this pin.
     //
@@ -415,22 +408,42 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // tv_groww_exchange_lag_p99_seconds — and ADDED tv_rest_1m_fire_heartbeat
     // (the re-pointed market-hours liveness alarm's per-fire gauge). Net
     // -3 series; dated note in aws-budget.md (COST NOTE 2026-07-15).
+    // 17 (was 19) since 2026-07-17 (stage-3 dead-WS sweep — the 21-TF tick
+    // aggregator deletion): REMOVED tv_aggregator_seals_emitted_total (its
+    // emit site, the seal_routing fan-in, was deleted with the aggregator)
+    // + tv_aggregator_close_pct_nonzero_total (its emit site, the deleted
+    // per-tick seal write boundary). Dated notes in app-alarms.tf header +
+    // aws-budget.md (COST NOTE 2026-07-17).
+    // 15 (was 17) since 2026-07-17 (dashboard tidy): REMOVED the 2 Dhan lag
+    // names — tv_dhan_exchange_lag_p99_seconds +
+    // tv_dhan_lag_samples_excluded_total — their only emit sites (the Dhan
+    // lag ring/publisher half of feed_lag_monitor.rs) were deleted with the
+    // dead Dhan-lag chain (spawn sites + tick source died PR-C2 2026-07-13 /
+    // stage-2 sweep 2026-07-17). Cost: -2 custom metric series (~-$0.60/mo)
+    // — dated note in aws-budget.md (COST NOTE 2026-07-17).
+    // 11 (was 15) since 2026-07-18 (stage-4 dead-producer sweep): REMOVED
+    // the 4 dead-tick names — tv_spill_dropped_total, tv_dlq_ticks_total,
+    // tv_ticks_dropped_total, tv_late_tick_after_boundary_total — their
+    // emit sites (tick_persistence.rs ring/spill/DLQ + the tick_processor.rs
+    // post-close check) were deleted in the stage-2 sweep (2026-07-17), so
+    // the names could never publish a datapoint again. Cost: -4 custom
+    // metric series (~-$1.20/mo, Assumed — series-hours decay to $0 once
+    // producers stop) — dated note in aws-budget.md (COST NOTE 2026-07-18).
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        19,
-        "Z+ L2 VERIFY ratchet: expected exactly 19 names in the MAIN EMF \
-         metric_selectors list (22 post-PR-C3 minus the 4 Groww-live names \
-         retired 2026-07-15 plus the tv_rest_1m_fire_heartbeat liveness \
-         gauge); found {}: {names:?}",
+        11,
+        "Z+ L2 VERIFY ratchet: expected exactly 11 names in the MAIN EMF \
+         metric_selectors list (15 post-dashboard-tidy minus the 4 dead-tick \
+         names retired 2026-07-18, stage-4); found {}: {names:?}",
         names.len()
     );
     for required in [
         "tv_process_rss_bytes",
         "tv_subsystem_memory_estimated_bytes",
-        "tv_dhan_exchange_lag_p99_seconds",
-        "tv_dhan_lag_samples_excluded_total",
+        // tv_dhan_exchange_lag_p99_seconds + tv_dhan_lag_samples_excluded_total
+        // retired 2026-07-17 (dashboard tidy — dead Dhan-lag chain deleted).
         "tv_rest_1m_fire_heartbeat",
         // 2026-07-14 cluster-C order-side (dormant until cluster A / Phase-1):
         "tv_daily_pnl",
@@ -445,117 +458,27 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     }
 }
 
-/// Split an agent-config body into its individual `metric_declaration`
-/// array objects (brace-balanced scan from the array opener).
-///
-/// Round-2 hardening (2026-07-07, finding 2): the per-feed ratchet
-/// previously used three INDEPENDENT whole-file substring checks — a
-/// multi-declaration reshuffle that kept a `[host,feed]` declaration for a
-/// DIFFERENT selector while moving `^tv_boundary_catchup_total$` into a new
-/// host-only declaration would have passed every check while the
-/// boundary_catchup_storm_dhan alarm (dimensions { host, feed = "dhan" })
-/// evaluated against a permanently-empty series. This parser lets the test
-/// bind selector and dimensions WITHIN one declaration object.
-fn emf_declaration_objects(body: &str) -> Vec<String> {
-    let marker = "\"metric_declaration\": [";
-    let mut out = Vec::new();
-    let Some(idx) = body.find(marker) else {
-        return out;
-    };
-    let rest = &body[idx + marker.len()..];
-    let mut depth = 0usize;
-    let mut start = None;
-    for (i, ch) in rest.char_indices() {
-        match ch {
-            '{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0
-                    && let Some(s) = start.take()
-                {
-                    out.push(rest[s..=i].to_string());
-                }
-            }
-            ']' if depth == 0 => break, // end of the metric_declaration array
-            _ => {}
-        }
-    }
-    out
-}
-
 #[test]
-fn test_second_emf_declaration_publishes_boundary_catchup_per_feed() {
-    // 2026-07-06 (silent-feed incident hardening): tv_boundary_catchup_total
-    // MUST be published under dimensions [host, feed] via a SECOND
-    // metric_declaration in BOTH agent configs. Per-feed is Rule-11-mandatory:
-    // Groww's 60s catch-up lateness margin makes catch-up sealing its ROUTINE
-    // steady-state path for quiet SIDs — a host-only folded series would
-    // either mask a Dhan storm under the Groww baseline or page on healthy
-    // Groww behaviour. The boundary_catchup_storm_dhan alarm
-    // (silent-feed-alarms.tf) keys on { host, feed = "dhan" }.
+fn test_boundary_catchup_emf_declaration_stays_retired() {
+    // RETIRED 2026-07-17 (stage-3 dead-WS sweep): the original
+    // test_second_emf_declaration_publishes_boundary_catchup_per_feed pinned
+    // the [host,feed] declaration for tv_boundary_catchup_total. Its writer
+    // — the watermark catch-up sealer inside the 21-TF tick aggregator — is
+    // DELETED (no tick publisher exists on the REST-only runtime), so the
+    // declaration was a dead selector. Negative pin: neither agent config
+    // may re-declare the metric (re-adding it without a live writer would
+    // ship a permanently-empty paid series).
     for rel in [
         "deploy/aws/terraform/user-data.sh.tftpl",
         "deploy/aws/cloudwatch-agent.json",
     ] {
         let body = read(rel);
         assert!(
-            body.contains("\"dimensions\": [[\"host\", \"feed\"]]"),
-            "Z+ L2 VERIFY ratchet: {rel} must carry the SECOND metric_declaration with \
-             dimensions [[\"host\", \"feed\"]] — the per-feed BOUNDARY-01 export."
-        );
-        assert!(
-            body.contains("\"metric_selectors\": [\"^tv_boundary_catchup_total$\"]"),
-            "Z+ L2 VERIFY ratchet: {rel} must select ^tv_boundary_catchup_total$ in the \
-             per-feed declaration — without it the boundary-catchup-storm-dhan alarm \
-             evaluates against a permanently-empty metric."
-        );
-        // The per-feed declaration must NOT fold the metric host-only too:
-        // publishing BOTH a host-only and a [host,feed] series would double
-        // the cost and re-introduce the masked/folded series.
-        let main_names = emf_declared_names(&body, "metric_selectors");
-        assert!(
-            !main_names.iter().any(|n| n == "tv_boundary_catchup_total"),
-            "Z+ L2 VERIFY ratchet: {rel} must NOT list tv_boundary_catchup_total in the \
-             MAIN host-only declaration — it publishes ONLY under [host, feed]."
-        );
-        // Round-2 hardening (2026-07-07, finding 2): bind selector ↔
-        // dimensions WITHIN a single declaration object. The three checks
-        // above are independent whole-file substrings — a reshuffle that
-        // kept a [host,feed] declaration for a DIFFERENT selector while
-        // moving the boundary-catchup selector into a host-only declaration
-        // (outside the main alternation) would pass them all while the
-        // per-feed alarm watched a permanently-empty series.
-        let decls = emf_declaration_objects(&body);
-        assert!(
-            decls.len() >= 2,
-            "parser self-check: expected >= 2 metric_declaration objects in {rel}, found {} — \
-             emf_declaration_objects broken or the array collapsed",
-            decls.len()
-        );
-        let catchup: Vec<&String> = decls
-            .iter()
-            .filter(|d| d.contains("tv_boundary_catchup_total"))
-            .collect();
-        assert_eq!(
-            catchup.len(),
-            1,
-            "Z+ L2 VERIFY ratchet: {rel} must have EXACTLY ONE metric_declaration selecting \
-             tv_boundary_catchup_total (found {}) — a second declaration (e.g. host-only) \
-             would double-publish or fold the per-feed series",
-            catchup.len()
-        );
-        assert!(
-            catchup[0].contains("\"dimensions\": [[\"host\", \"feed\"]]")
-                && catchup[0].contains("\"metric_selectors\": [\"^tv_boundary_catchup_total$\"]"),
-            "Z+ L2 VERIFY ratchet: {rel} — the declaration selecting tv_boundary_catchup_total \
-             must ITSELF carry dimensions [[\"host\", \"feed\"]] + the anchored single-name \
-             selector (the boundary_catchup_storm_dhan alarm keys on {{ host, feed = dhan }}):\n{}",
-            catchup[0]
+            !body.contains("tv_boundary_catchup_total"),
+            "stage-3 retirement pin: {rel} must NOT declare \
+             tv_boundary_catchup_total — its writer (the tick aggregator's \
+             catch-up sealer) was deleted 2026-07-17; a re-added selector \
+             would publish a permanently-empty series."
         );
     }
 }
@@ -607,9 +530,9 @@ fn test_deployed_emf_declaration_is_superset_of_every_alarm_metric() {
     // declaration, or the agent never publishes it and the alarm evaluates
     // against a permanently-empty metric (treat_missing_data=breaching pages
     // forever). This is the name-set superset check the restore fix pins.
-    // 2026-07-06: union across ALL metric_declaration entries — the per-feed
-    // [host,feed] second declaration carries tv_boundary_catchup_total, which
-    // backs the boundary-catchup-storm-dhan alarm.
+    // 2026-07-06: union across ALL metric_declaration entries. (2026-07-17:
+    // the per-feed [host,feed] boundary-catchup declaration + its alarm
+    // retired with the stage-3 tick-aggregator deletion.)
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let declared = emf_all_declared_names(&user_data);
     let alarms = alarm_metric_names();
@@ -653,24 +576,20 @@ fn test_reference_cloudwatch_agent_json_matches_deployed_emf_declaration() {
             .filter(|n| !deployed_names.contains(n))
             .collect::<Vec<_>>(),
     );
-    // 2026-07-06: the SECOND (per-feed) declaration must not drift either —
-    // compare the union across ALL declarations in both files.
+    // 2026-07-06: compare the union across ALL declarations in both files.
+    // (2026-07-17, stage-3 dead-WS sweep: the per-feed
+    // tv_boundary_catchup_total declaration retired with the tick
+    // aggregator — the union check now covers whatever declarations remain,
+    // and the boundary-catchup-must-exist assert died with the declaration;
+    // its stays-retired negative pin lives in
+    // test_boundary_catchup_emf_declaration_stays_retired.)
     let deployed_all = emf_all_declared_names(&user_data);
     let reference_all = emf_all_declared_names(&reference);
     assert_eq!(
         deployed_all, reference_all,
         "Z+ L3 RECONCILE drift-guard: the UNION of EMF-declared names (all \
-         metric_declaration entries, incl. the 2026-07-06 per-feed \
-         tv_boundary_catchup_total declaration) has drifted between the deployed \
+         metric_declaration entries) has drifted between the deployed \
          user-data.sh.tftpl and the reference cloudwatch-agent.json."
-    );
-    assert!(
-        deployed_all
-            .iter()
-            .any(|n| n == "tv_boundary_catchup_total"),
-        "Z+ L3 RECONCILE drift-guard: tv_boundary_catchup_total must be declared \
-         (per-feed second declaration) — emf_all_declared_names parser broken or \
-         the declaration was deleted."
     );
 }
 
@@ -692,43 +611,11 @@ fn test_emf_metric_namespace_is_tickvault_prod_in_both_configs() {
     }
 }
 
-/// Extract the body of a single `resource "aws_cloudwatch_metric_alarm" "<name>"`
-/// block from a terraform file body (brace-balanced scan from the header line).
-fn alarm_resource_block(body: &str, resource_name: &str) -> String {
-    let header = format!("resource \"aws_cloudwatch_metric_alarm\" \"{resource_name}\"");
-    let start = body
-        .find(&header)
-        .unwrap_or_else(|| panic!("resource block {resource_name} not found")); // APPROVED: test
-    let rest = &body[start..];
-    let open = rest.find('{').expect("resource block has an opening brace"); // APPROVED: test
-    let mut depth = 0usize;
-    for (i, ch) in rest[open..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return rest[..open + i + 1].to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unbalanced braces in resource block {resource_name}"); // APPROVED: test
-}
-
-/// True iff `attr = value` (any whitespace around `=`) appears in the block.
-fn block_has_attr(block: &str, attr: &str, value: &str) -> bool {
-    block.lines().any(|l| {
-        let t = l.trim();
-        t.strip_prefix(attr)
-            .map(|rest| {
-                let rest = rest.trim_start();
-                rest.starts_with('=') && rest[1..].trim() == value
-            })
-            .unwrap_or(false)
-    })
-}
+// Helpers alarm_resource_block / block_has_attr DELETED 2026-07-17 with
+// their last caller (test_silent_feed_alarms_are_window_gated — both
+// silent-feed alarms retired the same day; see
+// test_silent_feed_alarms_fully_retired). Recover from git history if a
+// silent-feed alarm is ever re-added.
 
 /// Extract the string literal assigned to `pub const <name>: &str = "...";`
 /// in `crates/app/src/observability.rs`. If the RHS is another constant
@@ -829,29 +716,28 @@ fn test_cw_agent_collects_machine_log_paths() {
 // operator quote.
 
 #[test]
-fn test_silent_feed_alarms_are_window_gated() {
-    // The remaining silent-feed alarms (2026-07-06 hardening; the 2026-07-11
-    // groww lag mirror retired 2026-07-15 with the Groww live feed) follow the house
-    // market-hours-gate pattern
-    // (Rule 3): actions_enabled=false + appended to the window-gate Lambda
-    // ALARM_NAMES (09:20-15:35 IST Mon-Fri). The SLO publisher runs 24/7
-    // with off-hours dimension dips; the lag gauges go stale after close
-    // (the tick-gap gauge peer retired in PR-C3, 2026-07-14) — every one
-    // of them false-pages without the gate.
+fn test_silent_feed_alarms_fully_retired() {
+    // 2026-07-17: BOTH remaining silent-feed alarms retired the same day —
+    // boundary_catchup_storm_dhan with the stage-3 tick-aggregator deletion
+    // (its metric's writer died) and dhan_exchange_lag_p99_high with the
+    // dead Dhan-lag publisher chain (dashboard tidy). This replaces
+    // test_silent_feed_alarms_are_window_gated (its per-alarm loop is now
+    // empty) with a NON-VACUOUS retirement pin: no alarm resource may
+    // reappear in silent-feed-alarms.tf, and neither retired alarm may
+    // reappear in the window-gate Lambda ALARM_NAMES join.
     let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
     let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
-    // PR-C2 (2026-07-13): realtime_guarantee_degraded left this list — the
-    // alarm retired with the PARKed SLO publisher.
+    assert!(
+        !tf.contains("resource \"aws_cloudwatch_metric_alarm\""),
+        "silent-feed-alarms.tf must carry ZERO alarm resources after the \
+         2026-07-17 retirements — re-adding one needs a dated rule-file \
+         note + window-gate wiring + a cost note (aws-budget.md)"
+    );
     for name in ["boundary_catchup_storm_dhan", "dhan_exchange_lag_p99_high"] {
-        let block = alarm_resource_block(&tf, name);
         assert!(
-            block_has_attr(&block, "actions_enabled", "false"),
-            "{name} must ship actions_enabled=false (gate Lambda owns the window)"
-        );
-        assert!(
-            gate.contains(&format!("aws_cloudwatch_metric_alarm.{name}.alarm_name")),
-            "{name} must be in the window-gate Lambda ALARM_NAMES join \
-             (market-hours-liveness-alarm.tf)"
+            !gate.contains(&format!("aws_cloudwatch_metric_alarm.{name}.alarm_name")),
+            "{name} was retired 2026-07-17 and must NOT reappear in the \
+             window-gate Lambda ALARM_NAMES join (market-hours-liveness-alarm.tf)"
         );
     }
 }
@@ -990,32 +876,13 @@ fn test_hcl_stripper_and_join_locator_reject_commented_out_members() {
 // app-alarms.tf (their pool-watchdog gauge emitters were deleted with the
 // lane; dated notes in app-alarms.tf + the gate ALARM_NAMES join).
 
-#[test]
-fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
-    // Rule-11 pin: the catch-up storm alarm must key on the EXPLICIT
-    // { host, feed = "dhan" } dimensions map — NOT local.app_dimensions
-    // (host-only). Groww's 60s catch-up margin makes catch-up sealing its
-    // ROUTINE steady state; a host-only series either masks a Dhan storm
-    // under the Groww baseline or pages on healthy Groww behaviour.
-    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
-    let block = alarm_resource_block(&tf, "boundary_catchup_storm_dhan");
-    assert!(
-        block_has_attr(&block, "host", "\"tickvault-prod\"")
-            && block_has_attr(&block, "feed", "\"dhan\""),
-        "boundary_catchup_storm_dhan must carry the explicit {{ host, feed = dhan }} \
-         dimensions map:\n{block}"
-    );
-    assert!(
-        !block.contains("local.app_dimensions"),
-        "boundary_catchup_storm_dhan must NOT use local.app_dimensions (host-only folding \
-         masks a Dhan storm under the Groww catch-up baseline)"
-    );
-    assert!(
-        block_has_attr(&block, "statistic", "\"Sum\"") && block_has_attr(&block, "period", "300"),
-        "boundary_catchup_storm_dhan must evaluate Sum/300s — the CW agent ships counters \
-         as per-scrape DELTAS, so Sum over 5m IS increase(5m) (Rule 12)"
-    );
-}
+// RETIRED (2026-07-17 — stage-3 dead-WS sweep):
+// test_boundary_catchup_alarm_uses_per_feed_dimensions died with the alarm
+// it pinned — boundary_catchup_storm_dhan was removed from
+// silent-feed-alarms.tf because its metric's writer (the watermark catch-up
+// sealer inside the 21-TF tick aggregator) was deleted; the series can
+// never publish again. The stays-retired negative pin for the EMF selector
+// lives in test_boundary_catchup_emf_declaration_stays_retired.
 
 #[test]
 fn test_app_alarms_count_is_twenty_two() {
@@ -1105,10 +972,33 @@ fn test_app_alarms_count_is_twenty_two() {
     // monitor the window gate kept arming daily. Cost: -1 alarm
     // (~-$0.10/mo) — dated notes in app-alarms.tf section 9 +
     // aws-budget.md (COST NOTE 2026-07-15).
+    // 10 (was 11) since 2026-07-17 (stage-3 dead-WS sweep): REMOVED
+    // tv_boundary_catchup_total (alarm tv-<env>-boundary-catchup-storm-dhan)
+    // — its writer, the tick aggregator's watermark catch-up sealer, is
+    // deleted; a retained alarm would orphan a dead monitor the window gate
+    // kept arming daily. Cost: -1 alarm (~-$0.10/mo) — dated notes in
+    // silent-feed-alarms.tf S2 + aws-budget.md (COST NOTE 2026-07-17).
+    // 9 (was 10) since 2026-07-17 (dashboard tidy): REMOVED
+    // tv_dhan_exchange_lag_p99_seconds (alarm
+    // tv-<env>-dhan-exchange-lag-p99-high) — its only publisher
+    // (run_dhan_lag_publisher, dormant since PR-C2) was deleted with the
+    // dead Dhan-lag chain, so the alarm was a permanently-missing-data
+    // dead monitor. Cost: -1 alarm (~-$0.10/mo) — dated notes in
+    // silent-feed-alarms.tf + aws-budget.md (COST NOTE 2026-07-17).
+    // 5 (was 9) since 2026-07-18 (stage-4 dead-producer sweep): REMOVED
+    // tv_spill_dropped_total (alarm tv-<env>-spill-dropped),
+    // tv_dlq_ticks_total (tv-<env>-dlq-ticks), tv_ticks_dropped_total
+    // (tv-<env>-ticks-dropped) and tv_late_tick_after_boundary_total
+    // (tv-<env>-late-tick-after-boundary) — their emit sites (the
+    // tick_persistence.rs ring/spill/DLQ counters + the tick_processor.rs
+    // post-close check) were deleted in the stage-2 sweep (2026-07-17), so
+    // all four alarms were permanently-dead monitors. Cost: -4 alarms
+    // (~-$0.40/mo) — dated notes in app-alarms.tf + aws-budget.md
+    // (COST NOTE 2026-07-18).
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 11,
-        "Z+ L2 VERIFY ratchet: expected exactly 11 app-level CloudWatch alarm \
+        count, 5,
+        "Z+ L2 VERIFY ratchet: expected exactly 5 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \

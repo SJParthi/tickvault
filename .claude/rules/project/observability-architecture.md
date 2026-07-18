@@ -1,3 +1,15 @@
+---
+paths:
+  - "crates/app/src/observability.rs"
+  - "crates/app/src/main.rs"
+  - "crates/common/src/error_code.rs"
+  - "crates/common/tests/error_code_*.rs"
+  - "crates/storage/tests/error_level_meta_guard.rs"
+  - "crates/storage/src/instrument_persistence.rs"
+  - ".claude/triage/**"
+  - "data/logs/**"
+---
+
 # Zero-Touch Observability Architecture — SINGLE SOURCE OF TRUTH
 
 > **Authority:** CLAUDE.md > this file > defaults.

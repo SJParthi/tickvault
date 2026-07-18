@@ -1,3 +1,14 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/instrument/slo_score.rs"
+  - "crates/core/src/notification/events.rs"
+  - "crates/core/benches/slo_score.rs"
+  - "crates/app/src/main.rs"
+  - "crates/storage/src/disk_health_watcher.rs"
+  - "crates/core/src/auth/secret_manager.rs"
+---
+
 # Wave 3-D Error Codes
 
 > **⚠ SLO PUBLISHER PARKED 2026-07-13 (PR-C2 — Dhan live-WS lane deletion; operator PARK ruling recorded in `.claude/plans/active-plan-dhan-live-off-c2-lane-deletion.md`):** the 10s SLO evaluator/publisher (`spawn_slo_publisher_task` / `spawn_supervised_slo_publisher` in main.rs) was DELETED with the lane — its six dimensions were dominated by the retired Dhan inputs (WS pool health, Dhan tick freshness, Phase-2 outcome), so the composite could never again read honestly on the Groww-only runtime. Effects: `tv_realtime_guarantee_score` + the `tv_realtime_guarantee_dimension` gauges are no longer published; the `tv-<env>-realtime-guarantee-critical` + `-degraded` CloudWatch alarms were REMOVED in the SAME PR (2026-07-14 truth-sync: an earlier revision of this banner said "full terraform removal is a flagged Phase C follow-up" — stale; PR-C2 itself retired both alarms, their window-gate armed-list entries, the score's EMF allowlist rows, and its fallback log-metric-filter — see the dated notes in app-alarms.tf / silent-feed-alarms.tf / metrics-log-metric-filters.tf); the SLO-01/SLO-02 emit sites died with the publisher; SLO-03 (the publisher-respawn supervisor code) has no emitter. The `slo_score.rs` pure evaluator + the `SloXX` ErrorCode variants were RETAINED (contract stubs) pending either a Groww-scoped SLO re-design with a fresh dated operator quote, or Phase C variant cleanup — **the C4 sweep (2026-07-15) executed that cleanup: `slo_score.rs`, its bench, its budget keys, and the SLO-01/02/03 variants are DELETED** (a future Groww-scoped SLO re-design starts fresh with its own dated quote). The market-hours liveness alarm was re-pointed off the score to `tv_groww_exchange_lag_p99_seconds` in Phase A (2026-07-13). Content below retained for historical audit.
@@ -56,7 +67,7 @@ into a worse tier does.
 | `QDB_health` | `1` if QuestDB connected else `0` | persist failures cascading; rescue ring buffering |
 | `Tick_freshness` | fraction of subscribed SIDs with a tick in the last `30s` (`1 − silent/universe`, clamped; INDIA VIX excluded from the silent count; pinned `1` outside market hours AND during the NSE pre-open window [09:00, 09:15) IST — the 2026-07-08 pre-open pin: auction-window silence is not degradation, and the 9-of-15 degraded alarm's lookback at the 09:20 gate-open must not hold pre-open breaching datapoints; fractional coverage per the 2026-07-03 #1342 fix, computed by `compute_tick_freshness`) | silent socket; depth/main feed stalled |
 | `Token_freshness` | `1` if token expiry `> 4h` away | JWT will die mid-session unless force-renewed |
-| `Spill_health` | `1` if `rate(tv_spill_dropped_total[5m]) == 0` | rescue ring overflow → DLQ |
+| `Spill_health` | `1` if `rate(tv_spill_dropped_total[5m]) == 0` *(metric + alarm retired 2026-07-18, stage-4 — emit sites died with the stage-2 tick-chain deletion)* | rescue ring overflow → DLQ |
 | `Phase2_health` | `1` if today's Phase 2 outcome was `Complete` | stock F&O subscription empty for the day |
 
 **Score = pure multiplicative product** of the six dimensions, all

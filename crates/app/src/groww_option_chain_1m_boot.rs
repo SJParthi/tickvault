@@ -132,7 +132,8 @@ use crate::groww_rest_burst::{
 };
 use crate::option_chain_1m_boot::{
     MAX_PLAUSIBLE_STRIKE, MAX_STRIKES_PER_CHAIN, MoneynessWarnLatches, chain_minute_fully_failed,
-    classify_chain_legs, publish_chain_moneyness_snapshot, record_chain_moneyness_observability,
+    classify_chain_legs, probe_capture_state_note, publish_chain_moneyness_snapshot,
+    record_chain_moneyness_observability,
 };
 use crate::spot_1m_rest_boot::{
     EdgeAction, FailureEdge, accumulation_within_cap, count_missed_boundaries,
@@ -188,6 +189,12 @@ pub struct GrowwChain1mTaskParams {
     /// the contract leg is disabled. Poisoning-safe lock (release builds
     /// abort on panic anyway); the map is 3 entries, cold path.
     pub anchor_store: Option<GrowwChainAnchorStore>,
+    /// Whether the cadence scheduler lane (`[cadence]`) is enabled —
+    /// context for the probe-only verdict wording (2026-07-18 canary
+    /// reword): since the 2026-07-17 stand-down the cadence lane records
+    /// the SAME per-minute chains, so "this leg is disabled" must never
+    /// read as "capture is off" while the cadence lane is on.
+    pub cadence_enabled: bool,
 }
 
 /// One chain-leg ATM anchor: the latest REAL vendor `underlying_ltp` plus
@@ -2390,10 +2397,11 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
         info!(
             detail = %detail,
             config_key = "[groww_option_chain_1m].enabled",
+            capture_state = probe_capture_state_note(params.cadence_enabled),
             "groww_chain_1m: probe PASSED — chain data answered for every \
-             underlying; pipeline stays OFF until the config is flipped \
-             (the Telegram body carries the plain-English action; the exact \
-             key lives HERE)"
+             underlying (capture_state carries the context-accurate leg \
+             state; the Telegram body carries the plain-English action; the \
+             exact key lives HERE)"
         );
     } else if in_session {
         error!(
@@ -2401,8 +2409,9 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
             stage = "probe",
             feed = OPTION_CHAIN_1M_FEED_GROWW,
             detail = %detail,
-            "CHAIN-02: Groww chain probe did NOT pass — verdict reported; \
-             pipeline stays OFF (tomorrow's boot re-probes)"
+            capture_state = probe_capture_state_note(params.cadence_enabled),
+            "CHAIN-02: Groww chain probe did NOT pass — verdict reported \
+             (tomorrow's boot re-probes)"
         );
     } else {
         // LOW-3 probe honesty: an off-hours miss is NOT a failure verdict
@@ -3217,6 +3226,7 @@ mod tests {
             ),
             minute_done_tx: None,
             anchor_store: None,
+            cadence_enabled: false,
         }
     }
 
@@ -3307,6 +3317,24 @@ mod tests {
         assert_eq!(actions[0].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
+    /// Weekend-proof synthetic-holiday date: today when Mon-Fri, else the
+    /// following Monday. `TradingCalendar::from_config` REJECTS
+    /// weekend-dated NSE holidays ("falls on a weekend"), so a fixture
+    /// stamping raw wall-clock today panicked every Sat/Sun CI run.
+    /// `is_trading_day_today()` stays `false` either way: on a weekday
+    /// today IS the holiday; on a weekend today is a weekend.
+    /// Deterministic (pure function of the IST wall-clock date).
+    fn next_weekday_ist() -> NaiveDate {
+        let mut d = today_ist();
+        while matches!(
+            chrono::Datelike::weekday(&d),
+            chrono::Weekday::Sat | chrono::Weekday::Sun
+        ) {
+            d = d.succ_opt().expect("valid date");
+        }
+        d
+    }
+
     fn non_trading_params() -> GrowwChain1mTaskParams {
         use tickvault_common::config::{NseHolidayEntry, TradingConfig};
         let mut params = test_params();
@@ -3318,10 +3346,12 @@ mod tests {
             data_collection_end: "15:30:00".to_string(),
             timezone: "Asia/Kolkata".to_string(),
             max_orders_per_second: 10,
-            // TODAY is a declared holiday → is_trading_day_today() is
-            // false regardless of the weekday the test runs on.
+            // The NEXT WEEKDAY (today on Mon-Fri, Monday on a weekend) is
+            // a declared holiday → is_trading_day_today() is false
+            // regardless of the weekday the test runs on, and the holiday
+            // date always passes the weekend-reject calendar validation.
             nse_holidays: vec![NseHolidayEntry {
-                date: today_ist().format("%Y-%m-%d").to_string(),
+                date: next_weekday_ist().format("%Y-%m-%d").to_string(),
                 name: "synthetic test holiday".to_string(),
             }],
             muhurat_trading_dates: vec![],

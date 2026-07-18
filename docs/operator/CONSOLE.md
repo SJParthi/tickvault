@@ -66,10 +66,10 @@
 - [`tv-prod-clock-skew-high`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-clock-skew-high)
 - [`tv-prod-cpu-high-5min`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-cpu-high-5min)
 - [`tv-prod-disk-used-high`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-disk-used-high)
-- [`tv-prod-dlq-ticks`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-dlq-ticks)
+- [`tv-prod-dlq-ticks`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-dlq-ticks) *(retired 2026-07-18 — stage-4)*
 - [`tv-prod-questdb-disconnected`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-questdb-disconnected)
 - [`tv-prod-realtime-guarantee-critical`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-realtime-guarantee-critical)
-- [`tv-prod-spill-dropped`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-spill-dropped)
+- [`tv-prod-spill-dropped`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-spill-dropped) *(retired 2026-07-18 — stage-4)*
 - [`tv-prod-tick-gap-instruments-silent`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-tick-gap-instruments-silent)
 - [`tv-prod-token-remaining-low`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-token-remaining-low)
 - [`tv-prod-ws-pool-all-dead`](https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/tv-prod-ws-pool-all-dead)

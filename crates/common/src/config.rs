@@ -224,6 +224,13 @@ pub struct ApplicationConfig {
     /// Absent section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub dhan_order_push: DhanOrderPushConfig,
+    /// `[order_update_events]` — full-fidelity order/position push-event
+    /// capture into `order_update_events` / `position_update_events`
+    /// (ORDER-EVT-01; additive forensic lane beside the lossy
+    /// `order_audit` lane). Absent section ⇒ DISABLED (fail-safe default
+    /// off); `config/base.toml` opts in.
+    #[serde(default)]
+    pub order_update_events: OrderUpdateEventsConfig,
     /// `[groww_rest_burst]` — the 2026-07-14 Groww REST burst auto-ladder
     /// (operator approval "approved and go ahead with the recommendation";
     /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
@@ -409,12 +416,17 @@ pub struct ScoreboardConfig {
     #[serde(default = "default_scoreboard_enabled")]
     pub telegram_enabled: bool,
     /// Populate the per-instrument `feed_coverage_daily` detail rows
-    /// (~1.5K/day). Consumed by PR-4 (presence registry); the table +
-    /// flag ship in PR-A so the config surface is stable.
+    /// (~1.5K/day). INERT since 2026-07-18 (stage-4 dead-producer sweep):
+    /// the presence registry — the rows' only source — was deleted, so no
+    /// detail row can be built; the field is retained so existing config
+    /// files keep parsing (the table + historical rows stay).
     #[serde(default = "default_scoreboard_enabled")]
     pub coverage_detail_rows: bool,
-    /// Hot-path per-tick presence fold (PR-4). `false` ⇒ coverage via SQL
-    /// totals only; per-instrument unique-wins "unavailable".
+    /// Hot-path per-tick presence fold. INERT since 2026-07-18 (stage-4
+    /// dead-producer sweep): the presence registry was deleted (its
+    /// record/register producers died with the live feeds), so nothing
+    /// reads this flag anymore; retained so existing config files keep
+    /// parsing. Coverage is the SQL approximation (`sql_backfill`).
     #[serde(default = "default_scoreboard_enabled")]
     pub presence_fold_enabled: bool,
     /// Groww exchange→receipt lag histogram fold (PR-3). Until it ships,
@@ -1786,6 +1798,27 @@ pub struct GrowwUniverseConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DhanOrderPushConfig {
     /// Master switch for the paper-mode order-update push channel.
+    /// Default OFF (fail-safe).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[order_update_events]` — full-fidelity order/position PUSH-event
+/// capture (ORDER-EVT-01; `.claude/rules/project/order-update-events-error-codes.md`):
+/// when enabled, the app spawns one supervised consumer draining the two
+/// capture channels (Dhan order updates + Groww order/position push
+/// records) into the NEW `order_update_events` / `position_update_events`
+/// QuestDB tables. ADDITIVE forensic lane — the lossy 11-field
+/// `order_audit` lane and the hint lane are untouched; zero Telegram,
+/// zero order-path involvement, cold path only.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[order_update_events]` section (or a TOML written before this
+/// PR) disables the capture entirely. `config/base.toml` opts in with
+/// `enabled = true`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OrderUpdateEventsConfig {
+    /// Master switch for the full-fidelity push-event capture consumer.
     /// Default OFF (fail-safe).
     #[serde(default)]
     pub enabled: bool,
@@ -4204,6 +4237,7 @@ mod tests {
             groww_contract_1m: GrowwContract1mConfig::default(),
             order_runtime: OrderRuntimeConfig::default(),
             dhan_order_push: DhanOrderPushConfig::default(),
+            order_update_events: OrderUpdateEventsConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
@@ -6177,6 +6211,46 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.dhan_order_push.enabled);
+    }
+
+    /// Full-fidelity push-event capture (ORDER-EVT-01): the
+    /// `[order_update_events]` section defaults OFF (fail-safe) whether the
+    /// section is absent, empty, or pre-dates the feature; explicit ON
+    /// round-trips.
+    #[test]
+    fn test_order_update_events_config_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = OrderUpdateEventsConfig::default();
+        assert!(
+            !d.enabled,
+            "order_update_events must default OFF (fail-safe)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            order_update_events: OrderUpdateEventsConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [order_update_events] must default, not error");
+        assert!(!missing.order_update_events.enabled);
+        // Empty section (no keys) → disabled.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[order_update_events]\n"))
+            .extract()
+            .expect("empty [order_update_events] must default, not error");
+        assert!(!empty.order_update_events.enabled);
+        // Explicit ON round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[order_update_events]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.order_update_events.enabled);
     }
 
     /// Order runtime validation: the 60s reconcile floor + the bounded

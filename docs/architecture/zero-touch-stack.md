@@ -152,7 +152,7 @@ Run `make validate-automation` to exercise all of these in ~30 seconds.
 3. `error_code_tag_guard` (2 tests)
 4. `triage_rules_guard` (7 tests)
 5. `error_level_meta_guard` (2 tests)
-6. `zero_tick_loss_alert_guard` (7 tests)
+6. seal-ring ratchet suite (`candles::seal_ring` lib tests) _(2026-07-18: `zero_tick_loss_alert_guard` was DELETED with the tick rescue ring in the stage-4 dead-producer sweep)_
 7. `summary_writer` unit tests (18 tests)
 8. `observability` library tests (37 tests)
 9. `observability_chain_e2e` (4 tests)
@@ -177,7 +177,7 @@ Run `make validate-automation` to exercise all of these in ~30 seconds.
 | Every `error!` reaches Telegram within ~15s | CloudWatch Alarms (over the metrics formerly scraped by Prometheus) + `error-level` tracing layer |
 | No flush/persist/drain failure is silenced | `error_level_meta_guard` — 28 phrases pinned |
 | Every ErrorCode has rule docs | `error_code_rule_file_crossref` forward+reverse |
-| Zero-tick-loss metrics are emitted (alarms in CloudWatch) | `zero_tick_loss_alert_guard` — metric + buffer capacity + doc pinned (the 4 Prometheus alert-rule assertions retired #O3; alarms moved to CloudWatch) |
+| Seal-chain capacity + drop paging stay ratcheted | `seal_ring.rs` lib suite pins `SEAL_BUFFER_CAPACITY`; AGGREGATOR-DROP-01 pagers pinned by `seal_drop_paging_wiring_guard.rs` _(2026-07-18: `zero_tick_loss_alert_guard` + its tick metrics were DELETED with the tick rescue ring, stage-4 sweep)_ |
 | WS/QuestDB SLA chaos coverage exists | `resilience_sla_alert_guard` Prometheus-side assertions retired #O2/#O3; chaos tests (`chaos_questdb_*`, `chaos_ws_*`, `chaos_valkey_kill`) remain |
 | Operator dashboard has every required widget | CloudWatch Dashboards _(the Grafana `operator_health_dashboard_guard` was retired with Grafana #O1)_ |
 | Loki/Alloy not in the default stack | RETIRED — Loki/Alloy removed entirely in the CloudWatch-only migration |
