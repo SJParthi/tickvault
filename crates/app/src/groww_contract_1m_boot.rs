@@ -675,7 +675,7 @@ fn contract_ohlc_implausible(c: &GrowwCandleRow) -> bool {
 /// BETWEEN `select_candle_row`'s doc + `#[must_use]` and its `fn`,
 /// stealing both — the doc/attribute now sit back on their owner below.)
 #[must_use]
-fn contract_segment_code(segment: &'static str) -> u8 {
+pub(crate) fn contract_segment_code(segment: &'static str) -> u8 {
     match segment {
         "NSE_FNO" => tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO,
         "BSE_FNO" => tickvault_common::constants::EXCHANGE_SEGMENT_BSE_FNO,
