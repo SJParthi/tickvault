@@ -64,6 +64,7 @@ use super::super::events::GrowwPushFanOut;
 use super::connect::{build_connect_frame, extract_nonce};
 use super::nats::{self, NatsParseError, NatsServerOp};
 use super::nkey::GrowwSessionKeypair;
+use super::order_events::{GrowwPushCapture, build_groww_order_event_record, now_ist_epoch_nanos};
 use super::order_mapper::map_order_broadcast;
 use super::position;
 use super::proto::decode_order_details_broadcast;
@@ -266,10 +267,16 @@ struct DrainActions {
     pongs: u32,
 }
 
-/// Handle one routed MSG frame: order frames decode → map → fan-out;
-/// position frames decode + count + log; unknown subjects are counted and
+/// Handle one routed MSG frame: order frames decode → map → fan-out (+ the
+/// ADDITIVE full-fidelity capture record, best-effort); position frames
+/// decode + count + log + capture; unknown subjects are counted and
 /// skipped. A decode failure NEVER ends the session (GROWW-PUSH-03).
-fn handle_msg(subject: &str, payload: &[u8], fan_out: &GrowwPushFanOut) {
+fn handle_msg(
+    subject: &str,
+    payload: &[u8],
+    fan_out: &GrowwPushFanOut,
+    capture: &GrowwPushCapture,
+) {
     match route_subject(subject) {
         Some(PushStream::Order) => match decode_order_details_broadcast(payload) {
             Ok(dto) => {
@@ -280,6 +287,12 @@ fn handle_msg(subject: &str, payload: &[u8], fan_out: &GrowwPushFanOut) {
                     debug!(
                         "groww push: order frame carried no order detail (stage-only) — skipped"
                     );
+                }
+                // ADDITIVE full-fidelity capture lane (ORDER-EVT-01): every
+                // decoded field → the order_update_events forensic table.
+                // Best-effort try_send; never blocks or fails this loop.
+                if let Some(record) = build_groww_order_event_record(&dto, now_ist_epoch_nanos()) {
+                    capture.publish_order(record);
                 }
             }
             Err(e) => {
@@ -294,9 +307,10 @@ fn handle_msg(subject: &str, payload: &[u8], fan_out: &GrowwPushFanOut) {
             }
         },
         Some(PushStream::Position) => {
-            // Decode + count + log only — the position-table write is a
-            // separate session's follow-up.
-            let _outcome = position::handle_position_payload(payload);
+            // Decode + count + log + best-effort full-fidelity capture
+            // (position_update_events — ORDER-EVT-01 subsystem).
+            let _outcome =
+                position::handle_position_payload(payload, capture, now_ist_epoch_nanos());
         }
         None => {
             metrics::counter!("tv_groww_push_decode_errors_total", "kind" => "unknown_subject")
@@ -313,6 +327,7 @@ fn handle_msg(subject: &str, payload: &[u8], fan_out: &GrowwPushFanOut) {
 fn drain_frames(
     buf: &mut Vec<u8>,
     fan_out: &GrowwPushFanOut,
+    capture: &GrowwPushCapture,
 ) -> Result<DrainActions, SessionError> {
     let mut pos: usize = 0;
     let mut pongs: u32 = 0;
@@ -331,7 +346,7 @@ fn drain_frames(
                     }
                     NatsServerOp::Msg {
                         subject, payload, ..
-                    } => handle_msg(subject, payload, fan_out),
+                    } => handle_msg(subject, payload, fan_out, capture),
                 }
                 pos += consumed;
             }
@@ -376,6 +391,7 @@ async fn wait_or_stop(stop_rx: &mut watch::Receiver<bool>, secs: u64) -> bool {
 async fn run_one_session(
     provider: &dyn GrowwAccessTokenProvider,
     fan_out: &GrowwPushFanOut,
+    capture: &GrowwPushCapture,
     stop_rx: &mut watch::Receiver<bool>,
 ) -> SessionEnd {
     let failed = |error: SessionError, connected: bool| SessionEnd::Failed { error, connected };
@@ -512,7 +528,7 @@ async fn run_one_session(
                         if buf.len() > MAX_READ_BUFFER_BYTES {
                             return failed(SessionError::BufferOverflow, true);
                         }
-                        let actions = match drain_frames(&mut buf, fan_out) {
+                        let actions = match drain_frames(&mut buf, fan_out, capture) {
                             Ok(a) => a,
                             Err(e) => return failed(e, true),
                         };
@@ -564,6 +580,7 @@ fn try_extract_handshake_nonce(buf: &mut Vec<u8>) -> Result<Option<String>, Sess
 async fn run_groww_push_loop(
     provider: Arc<dyn GrowwAccessTokenProvider>,
     fan_out: Arc<GrowwPushFanOut>,
+    capture: GrowwPushCapture,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     let mut consecutive_failures: u32 = 0;
@@ -572,7 +589,7 @@ async fn run_groww_push_loop(
             return;
         }
         let session_start = Instant::now();
-        match run_one_session(provider.as_ref(), &fan_out, &mut stop_rx).await {
+        match run_one_session(provider.as_ref(), &fan_out, &capture, &mut stop_rx).await {
             SessionEnd::Shutdown => return,
             SessionEnd::Failed { error, connected } => {
                 if !connected {
@@ -631,6 +648,7 @@ async fn run_groww_push_loop(
 pub async fn run_groww_push_supervised(
     provider: Arc<dyn GrowwAccessTokenProvider>,
     fan_out: Arc<GrowwPushFanOut>,
+    capture: GrowwPushCapture,
     stop_rx: watch::Receiver<bool>,
 ) {
     let mut outer_stop = stop_rx.clone();
@@ -642,6 +660,7 @@ pub async fn run_groww_push_supervised(
         let handle = tokio::spawn(run_groww_push_loop(
             Arc::clone(&provider),
             Arc::clone(&fan_out),
+            capture.clone(),
             stop_rx.clone(),
         ));
         let reason: &'static str = match handle.await {
@@ -823,7 +842,8 @@ mod tests {
     fn drain_counts_pings_and_removes_consumed_bytes() {
         let fan_out = GrowwPushFanOut::new(Vec::new());
         let mut buf = b"PING\r\nPING\r\n+OK\r\nPI".to_vec();
-        let actions = drain_frames(&mut buf, &fan_out).unwrap_or_else(|e| panic!("drain: {e}"));
+        let actions = drain_frames(&mut buf, &fan_out, &GrowwPushCapture::disabled())
+            .unwrap_or_else(|e| panic!("drain: {e}"));
         assert_eq!(actions.pongs, 2);
         // The partial trailing frame stays for the next read.
         assert_eq!(buf, b"PI");
@@ -834,7 +854,8 @@ mod tests {
         let (sink, mut rx) = BoundedPushEventSink::channel("test_runner");
         let fan_out = GrowwPushFanOut::new(vec![std::sync::Arc::new(sink)]);
         let mut buf = msg_frame("stocks_fo/order/updates.apex.sub-1", &order_payload_bytes());
-        let actions = drain_frames(&mut buf, &fan_out).unwrap_or_else(|e| panic!("drain: {e}"));
+        let actions = drain_frames(&mut buf, &fan_out, &GrowwPushCapture::disabled())
+            .unwrap_or_else(|e| panic!("drain: {e}"));
         assert_eq!(actions.pongs, 0);
         assert!(buf.is_empty());
         let event = rx
@@ -844,12 +865,31 @@ mod tests {
     }
 
     #[test]
+    fn drain_publishes_an_order_capture_record_into_the_capture_sink() {
+        let fan_out = GrowwPushFanOut::new(Vec::new());
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(4);
+        let (pos_tx, _pos_rx) = tokio::sync::mpsc::channel(4);
+        let capture = GrowwPushCapture::new(order_tx, pos_tx);
+        let mut buf = msg_frame("stocks_fo/order/updates.apex.sub-1", &order_payload_bytes());
+        let actions =
+            drain_frames(&mut buf, &fan_out, &capture).unwrap_or_else(|e| panic!("drain: {e}"));
+        assert_eq!(actions.pongs, 0);
+        let record = order_rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("one capture record expected"));
+        assert_eq!(record.order_id, "AB");
+        assert_eq!(record.source, "push");
+        assert!(record.ts_ist_nanos > 0);
+    }
+
+    #[test]
     fn drain_skips_a_corrupt_order_payload_and_survives() {
         let fan_out = GrowwPushFanOut::new(Vec::new());
         // Length-delimited field claiming 100 bytes with 1 present.
         let mut buf = msg_frame("stocks_fo/order/updates.apex.sub-1", &[0x12, 0x64, 0x00]);
         buf.extend_from_slice(b"PING\r\n");
-        let actions = drain_frames(&mut buf, &fan_out).unwrap_or_else(|e| panic!("drain: {e}"));
+        let actions = drain_frames(&mut buf, &fan_out, &GrowwPushCapture::disabled())
+            .unwrap_or_else(|e| panic!("drain: {e}"));
         // The session survived the decode failure and still saw the PING.
         assert_eq!(actions.pongs, 1);
         assert!(buf.is_empty());
@@ -859,7 +899,7 @@ mod tests {
     fn drain_ends_the_session_on_a_server_err() {
         let fan_out = GrowwPushFanOut::new(Vec::new());
         let mut buf = b"-ERR 'Authorization Violation'\r\n".to_vec();
-        match drain_frames(&mut buf, &fan_out) {
+        match drain_frames(&mut buf, &fan_out, &GrowwPushCapture::disabled()) {
             Err(SessionError::ServerErr { auth, sanitized }) => {
                 assert!(auth);
                 assert!(sanitized.contains("Authorization"));
@@ -872,7 +912,7 @@ mod tests {
     fn drain_ends_the_session_on_a_framing_violation() {
         let fan_out = GrowwPushFanOut::new(Vec::new());
         let mut buf = b"BOGUS\r\n".to_vec();
-        match drain_frames(&mut buf, &fan_out) {
+        match drain_frames(&mut buf, &fan_out, &GrowwPushCapture::disabled()) {
             Err(SessionError::Framing(NatsParseError::UnknownVerb)) => {}
             other => panic!("expected framing error, got {:?}", other.map(|a| a.pongs)),
         }
