@@ -306,11 +306,13 @@ fn every_audit_dedup_key_must_include_designated_timestamp_ts() {
 // subset — its declaration site (`tick_persistence.rs`) was deleted with the
 // dead Dhan tick chain (no live `ticks` writer remains; the table is
 // read-only, SEBI-retained). The surviving three keys stay pinned.
-const FEED_KEYED_MARKET_DATA_KEYS: &[&str] = &[
-    "DEDUP_KEY_CANDLES",
-    "DEDUP_KEY_PREV_DAY_OHLCV",
-    "DEDUP_KEY_WS_EVENT_AUDIT",
-];
+// Dead-code sweep batch 1 (2026-07-18): `DEDUP_KEY_PREV_DAY_OHLCV` removed
+// from this subset — its declaration site (`prev_day_ohlcv_persistence.rs`)
+// was deleted as verified-dead (feeder `prev_day_ohlcv_boot.rs` gone since
+// PR-C3, 2026-07-14; zero callers). The `prev_day_ohlcv` table stays
+// read-only, SEBI-retained, DB-side DEDUP config intact — the same shape as
+// the DEDUP_KEY_TICKS removal above. The surviving two keys stay pinned.
+const FEED_KEYED_MARKET_DATA_KEYS: &[&str] = &["DEDUP_KEY_CANDLES", "DEDUP_KEY_WS_EVENT_AUDIT"];
 
 #[test]
 fn per_feed_market_data_dedup_keys_must_include_feed() {
