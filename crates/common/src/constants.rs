@@ -590,10 +590,10 @@ pub const BACKLOG_TICK_AGE_MAX_SECS: u32 = 86_400;
 /// Base path for all secrets in SSM Parameter Store.
 ///
 /// Matches the repo name `tickvault`. The prior namespace was `/dlt` (from
-/// the dhan-live-trader legacy name). Run `scripts/migrate-ssm-dlt-to-
-/// tickvault.sh` once per environment to copy `/dlt/*` → `/tickvault/*`
-/// before this code is deployed; the script is idempotent and a `--delete`
-/// flag removes the old namespace after you verify the app boots cleanly.
+/// the dhan-live-trader legacy name). The one-shot `/dlt/*` → `/tickvault/*`
+/// migration has already been executed per environment; the migration
+/// script (`scripts/migrate-ssm-dlt-to-tickvault.sh`) was deleted in the
+/// rust-only phase 2a-2 purge and remains recoverable from git history.
 pub const SSM_SECRET_BASE_PATH: &str = "/tickvault";
 
 /// SSM service path segment for Dhan credentials.
