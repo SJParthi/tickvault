@@ -487,10 +487,14 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
     //      call site — a moved/unconditional enable before the decision
     //      fails;
     // (iii) the NEAREST PRECEDING `OpenDecision::Enable =>` match-arm token
-    //       also sits after that call site — the enable can only live
-    //       inside the handle() decision match's Enable arm (the first
+    //       also sits after that call site (the first
     //       `OpenDecision::Enable =>` in the file belongs to the
-    //       open_result renderer and must NOT satisfy this).
+    //       open_result renderer and must NOT satisfy this). NOTE
+    //       (2026-07-18 r2): (iii) alone does NOT prove the enable lives
+    //       inside the match — a single enable moved to just AFTER the
+    //       decision match (before `Ok(open_result`) still has the
+    //       (gutted) Enable arm as its nearest preceding token; (iv)
+    //       below closes exactly that probe shape.
     let enable_count = rs.matches(".enable_alarm_actions()").count();
     assert_eq!(
         enable_count, 1,
@@ -517,6 +521,54 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
          belong to handle()'s decision match (after `let decision = \
          open_decision(`), not the open_result renderer earlier in the file \
          — otherwise the enable is not gated by the computed decision"
+    );
+    // 2026-07-18 (hostile-review r2 LOW): pins (i)+(ii)+(iii) alone were
+    // still probeable — gut the Enable arm's enable chain and insert ONE
+    // unconditional `.enable_alarm_actions()` just AFTER the decision
+    // match (before `Ok(open_result`): the count stays 1, both orderings
+    // hold, yet the enable is unconditional (the exact holiday-false-page
+    // shape this guard exists for). (iv) closes that shape: the single
+    // enable occurrence must lie INSIDE the `match &decision {` block's
+    // brace span (naive byte-level brace-depth scan from the match's
+    // opening brace to its matching close). Named residuals (accepted
+    // class per the house source-scan conventions): the brace scan does
+    // not lex string literals or comments — a brace character added
+    // inside either, within the match block, skews the computed span;
+    // the needle scans still count comment-text matches and miss
+    // aliased / UFCS / macro-wrapped enable calls; and an attacker
+    // relocating the enable together with a fabricated surrounding
+    // `match &decision {` block is beyond a text scan.
+    let match_token = "match &decision {";
+    assert_eq!(
+        rs.matches(match_token).count(),
+        1,
+        "market_hours_gate.rs must carry exactly one `match &decision {{` \
+         block — the (iv) arm-span pin keys on it"
+    );
+    let match_start = rs.find(match_token).expect("match &decision block"); // APPROVED: test
+    let open_brace = match_start + match_token.len() - 1;
+    let mut depth: i32 = 0;
+    let mut match_end = None;
+    for (i, b) in rs.as_bytes().iter().enumerate().skip(open_brace) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    match_end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let match_end = match_end.expect("match &decision block must have a matching closing brace"); // APPROVED: test
+    assert!(
+        decision_call_pos < match_start && match_start < enable_pos && enable_pos < match_end,
+        "the single .enable_alarm_actions() call must sit INSIDE handle()'s \
+         `match &decision` block span — an enable moved after the match \
+         (even before `Ok(open_result`) is unconditional and re-opens the \
+         holiday false-page window"
     );
 }
 
