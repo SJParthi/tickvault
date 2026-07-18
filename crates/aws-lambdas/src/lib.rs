@@ -24,6 +24,7 @@ pub mod alarm_gate;
 pub mod budget_digest;
 pub mod budget_killswitch;
 pub mod clients;
+pub mod deploy_watchdog;
 pub mod events;
 pub mod logging;
 pub mod market_hours_gate;

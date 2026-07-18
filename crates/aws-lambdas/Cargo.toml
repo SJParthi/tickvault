@@ -52,3 +52,7 @@ path = "src/bin/telegram_webhook.rs"
 [[bin]]
 name = "market-open-readiness"
 path = "src/bin/market_open_readiness.rs"
+
+[[bin]]
+name = "deploy-watchdog"
+path = "src/bin/deploy_watchdog.rs"
