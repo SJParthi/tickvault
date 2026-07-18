@@ -69,6 +69,22 @@ const QUESTDB_LIVENESS_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// Path to docker-compose file relative to project root.
 const DOCKER_COMPOSE_PATH: &str = "deploy/docker/docker-compose.yml";
 
+/// System-wide docker CLI plugin locations probed for the Compose v2 plugin
+/// binary when neither `docker compose` nor `docker-compose` resolves
+/// (issue #1505 — mirrors the `scripts/ensure-questdb.sh` rung-3c ladder).
+///
+/// Deliberately EXCLUDES the per-user `~/.docker/cli-plugins/` directory:
+/// the systemd unit runs with `ProtectHome=true`, so a per-user plugin is
+/// invisible in exactly the hardened service context that needs the
+/// fallback — that invisibility is the #1505 root cause, and probing it
+/// here would make dev-shell behaviour diverge from the service context.
+/// Ratcheted by `test_compose_plugin_system_paths_are_system_wide`.
+const COMPOSE_PLUGIN_SYSTEM_PATHS: [&str; 3] = [
+    "/usr/local/lib/docker/cli-plugins/docker-compose",
+    "/usr/libexec/docker/cli-plugins/docker-compose",
+    "/usr/lib/docker/cli-plugins/docker-compose",
+];
+
 /// macOS Docker Desktop application name for `open -a`.
 const DOCKER_DESKTOP_APP_NAME: &str = "Docker";
 
@@ -152,6 +168,74 @@ pub fn classify_compose_outcome(
     } else {
         ComposeOutcome::Critical
     }
+}
+
+// ---------------------------------------------------------------------------
+// Compose CLI resolution (issue #1505, 2026-07-18)
+// ---------------------------------------------------------------------------
+// `unknown shorthand flag: 'f'` from `docker compose -f … up` is the docker
+// CLI parsing `-f` at TOP LEVEL because no Compose v2 plugin is resolvable
+// in the invoking context (e.g. the plugin lives under
+// `~/.docker/cli-plugins/`, hidden from the systemd service by
+// `ProtectHome=true`). That failure is DETERMINISTIC — retrying the same
+// invocation is noise, not recovery. Mirror the `scripts/ensure-questdb.sh`
+// ladder (v2 → v1 → plugin-by-absolute-path) so a cold boot can bring
+// QuestDB up even when the `docker compose` front-end is broken, and fail
+// LOUDLY (once, with the actionable cause) when no compose front-end exists.
+
+/// A resolved, working Docker Compose front-end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeCli {
+    /// `docker compose …` — the modern v2 plugin resolved by the docker CLI.
+    DockerComposeV2,
+    /// `docker-compose …` — the standalone v1 binary on `PATH`.
+    StandaloneV1,
+    /// The Compose v2 plugin binary invoked DIRECTLY by absolute path
+    /// (plugin present at a system path but not resolvable via `docker`).
+    PluginPath(&'static str),
+}
+
+impl ComposeCli {
+    /// The program to exec for this front-end.
+    fn program(self) -> &'static str {
+        match self {
+            ComposeCli::DockerComposeV2 => "docker",
+            ComposeCli::StandaloneV1 => "docker-compose",
+            ComposeCli::PluginPath(path) => path,
+        }
+    }
+
+    /// Human-readable label for logs.
+    fn label(self) -> &'static str {
+        match self {
+            ComposeCli::DockerComposeV2 => "docker compose (v2 plugin)",
+            ComposeCli::StandaloneV1 => "docker-compose (v1 standalone)",
+            ComposeCli::PluginPath(_) => "compose v2 plugin by absolute path",
+        }
+    }
+}
+
+/// Pure builder for a full compose argument vector for the given front-end.
+///
+/// R1 (2026-06-30) ratchet, generalized for #1505: for the `docker`
+/// front-end the `compose` SUBCOMMAND comes FIRST, then `-f <file>` — the
+/// LEGACY form `docker -f <file> compose …` (flag before subcommand) fails
+/// with `unknown shorthand flag: 'f'` (exit 125), which made every boot
+/// compose attempt fail → QuestDB never starts on a cold box. For the
+/// v1 / plugin-by-path front-ends the PROGRAM ITSELF is compose, so there
+/// is no subcommand and `-f` comes first. Tested by
+/// `test_docker_compose_up_args_compose_subcommand_first` and
+/// `test_compose_cli_args_v1_and_plugin_have_no_compose_subcommand`.
+#[must_use]
+fn compose_cli_args<'a>(cli: ComposeCli, compose_path: &'a str, tail: &[&'a str]) -> Vec<&'a str> {
+    let mut args: Vec<&'a str> = Vec::with_capacity(3 + tail.len());
+    if matches!(cli, ComposeCli::DockerComposeV2) {
+        args.push("compose");
+    }
+    args.push("-f");
+    args.push(compose_path);
+    args.extend_from_slice(tail);
+    args
 }
 
 // ---------------------------------------------------------------------------
@@ -254,27 +338,55 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         );
     }
 
-    // Run docker compose up -d with retries.
+    // Run compose up -d with retries — via the resolved compose front-end
+    // (issue #1505). A missing compose CLI is DETERMINISTIC: `docker compose
+    // -f …` degrades to the docker top-level flag parse and fails
+    // `unknown shorthand flag: 'f'` (exit 125) on every attempt, so retrying
+    // adds noise, not recovery — log it loudly ONCE with the actionable
+    // cause and skip the retry loop entirely.
     let mut compose_succeeded = false;
-    for attempt in 1..=COMPOSE_UP_MAX_RETRIES {
-        match run_docker_compose_up(&env_vars).await {
-            Ok(()) => {
-                info!(
-                    attempt,
-                    "docker compose started — waiting for services to be healthy"
-                );
-                compose_succeeded = true;
-                break;
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    attempt,
-                    max_attempts = COMPOSE_UP_MAX_RETRIES,
-                    "docker compose up failed — retrying"
-                );
-                if attempt < COMPOSE_UP_MAX_RETRIES {
-                    tokio::time::sleep(COMPOSE_UP_RETRY_DELAY).await;
+    match resolve_compose_cli().await {
+        None => {
+            metrics::counter!("tv_boot_compose_cli_unavailable_total").increment(1);
+            tracing::error!(
+                probed_system_paths = ?COMPOSE_PLUGIN_SYSTEM_PATHS,
+                "no usable Docker Compose CLI in this context — `docker compose`, \
+                 `docker-compose`, and the system plugin paths all failed to \
+                 resolve (the `unknown shorthand flag: 'f'` failure class; a \
+                 per-user ~/.docker/cli-plugins plugin is invisible under \
+                 ProtectHome=true). Install the Compose v2 plugin at \
+                 /usr/local/lib/docker/cli-plugins/docker-compose (the deploy \
+                 workflow + user-data ensure this since 2026-07-14). Skipping \
+                 the compose retry loop — retrying a missing CLI is \
+                 deterministic noise"
+            );
+        }
+        Some(cli) => {
+            info!(
+                compose_cli = cli.label(),
+                "resolved Docker Compose front-end"
+            );
+            for attempt in 1..=COMPOSE_UP_MAX_RETRIES {
+                match run_docker_compose_up(cli, &env_vars).await {
+                    Ok(()) => {
+                        info!(
+                            attempt,
+                            "docker compose started — waiting for services to be healthy"
+                        );
+                        compose_succeeded = true;
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            attempt,
+                            max_attempts = COMPOSE_UP_MAX_RETRIES,
+                            "docker compose up failed — retrying"
+                        );
+                        if attempt < COMPOSE_UP_MAX_RETRIES {
+                            tokio::time::sleep(COMPOSE_UP_RETRY_DELAY).await;
+                        }
+                    }
                 }
             }
         }
@@ -952,16 +1064,27 @@ pub async fn check_and_restart_containers() -> usize {
         return 0;
     }
 
-    // Get container status via docker compose ps.
-    let output = match Command::new("docker")
-        .args([
-            "compose",
-            "-f",
+    // Resolve a working compose front-end (issue #1505). Without this, a
+    // broken `docker compose` CLI made `ps` exit 125 with EMPTY stdout,
+    // which parsed as "0 containers, 0 unhealthy" — a silent false-OK that
+    // disabled the whole restart path.
+    let Some(cli) = resolve_compose_cli().await else {
+        warn!(
+            "container watchdog: no usable Docker Compose CLI (the \
+             `unknown shorthand flag: 'f'` failure class) — cannot inspect \
+             or restart containers this cycle; see the boot-time error for \
+             the fix"
+        );
+        return 0;
+    };
+
+    // Get container status via compose ps.
+    let output = match Command::new(cli.program())
+        .args(compose_cli_args(
+            cli,
             DOCKER_COMPOSE_PATH,
-            "ps",
-            "--format",
-            "{{.Name}} {{.State}}",
-        ])
+            &["ps", "--format", "{{.Name}} {{.State}}"],
+        ))
         .output()
         .await
     {
@@ -971,6 +1094,17 @@ pub async fn check_and_restart_containers() -> usize {
             return 0;
         }
     };
+    if !output.status.success() {
+        // A failed `ps` must NOT fall through to parsing empty stdout as
+        // "0 containers, all healthy" (no-false-OK rule).
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            exit = ?output.status.code(),
+            stderr = %stderr.trim(),
+            "docker compose ps failed — skipping container health cycle"
+        );
+        return 0;
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let (total_containers, unhealthy_containers, unhealthy_names) = parse_container_health(&stdout);
@@ -991,8 +1125,8 @@ pub async fn check_and_restart_containers() -> usize {
         "unhealthy Docker containers detected — attempting docker compose up -d"
     );
 
-    let restart_result = Command::new("docker")
-        .args(["compose", "-f", DOCKER_COMPOSE_PATH, "up", "-d"])
+    let restart_result = Command::new(cli.program())
+        .args(compose_cli_args(cli, DOCKER_COMPOSE_PATH, &["up", "-d"]))
         .output()
         .await;
 
@@ -1061,15 +1195,22 @@ pub async fn container_health_counts() -> (usize, usize) {
     if !is_docker_daemon_running().await {
         return (0, 0);
     }
-    let output = match Command::new("docker")
-        .args([
-            "compose",
-            "-f",
+    // Issue #1505: resolve a working compose front-end first — a broken
+    // `docker compose` CLI made this `ps` exit 125 with empty stdout, which
+    // parsed as an unlabelled (0, 0) instead of an honest failure.
+    let Some(cli) = resolve_compose_cli().await else {
+        warn!(
+            "container_health_counts: no usable Docker Compose CLI — \
+             reporting (0, 0)"
+        );
+        return (0, 0);
+    };
+    let output = match Command::new(cli.program())
+        .args(compose_cli_args(
+            cli,
             DOCKER_COMPOSE_PATH,
-            "ps",
-            "--format",
-            "{{.Name}} {{.State}}",
-        ])
+            &["ps", "--format", "{{.Name}} {{.State}}"],
+        ))
         .output()
         .await
     {
@@ -1079,6 +1220,15 @@ pub async fn container_health_counts() -> (usize, usize) {
             return (0, 0);
         }
     };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            exit = ?output.status.code(),
+            stderr = %stderr.trim(),
+            "container_health_counts: docker compose ps failed — reporting (0, 0)"
+        );
+        return (0, 0);
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let (total, unhealthy, _names) = parse_container_health(&stdout);
     (total.saturating_sub(unhealthy), total)
@@ -1219,38 +1369,77 @@ fn is_service_reachable(host: &str, port: u16) -> bool {
     .is_ok()
 }
 
-/// Runs `docker compose up -d --force-recreate` with the given environment variables.
+/// True when `program args…` exits 0 (stdout/stderr discarded). Used only
+/// for cold-path CLI capability probes.
+async fn probe_command_succeeds(program: &str, args: &[&str]) -> bool {
+    use tokio::process::Command;
+
+    Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// True when `path` is an existing regular file with an execute bit set.
+fn is_executable_file(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(path)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+    }
+}
+
+/// Resolves a working Compose front-end: `docker compose` (v2) →
+/// `docker-compose` (v1) → the plugin binary at a system path
+/// (issue #1505 — the same ladder as `scripts/ensure-questdb.sh`).
+///
+/// `None` means NO compose CLI exists in this context — a DETERMINISTIC
+/// failure (the `unknown shorthand flag: 'f'` class); callers log it loudly
+/// ONCE and skip retries instead of hammering a broken CLI. Re-probed per
+/// call (cold path only) so a deploy that installs the plugin mid-session
+/// heals without an app restart.
+async fn resolve_compose_cli() -> Option<ComposeCli> {
+    if probe_command_succeeds("docker", &["compose", "version"]).await {
+        return Some(ComposeCli::DockerComposeV2);
+    }
+    if probe_command_succeeds("docker-compose", &["version"]).await {
+        return Some(ComposeCli::StandaloneV1);
+    }
+    COMPOSE_PLUGIN_SYSTEM_PATHS
+        .into_iter()
+        .find(|path| is_executable_file(path))
+        .map(ComposeCli::PluginPath)
+}
+
+/// Runs `<compose front-end> -f <file> up -d --force-recreate` with the given
+/// environment variables, via the resolved [`ComposeCli`].
 ///
 /// `--force-recreate` ensures containers with updated configs (healthchecks,
 /// dashboard JSON, Alloy config) are recreated automatically. Docker only
 /// recreates containers whose config hash actually changed — no-op for unchanged.
-/// Pure builder for the boot-time `docker compose up` argument vector.
-///
-/// R1 (2026-06-30) — the args MUST use the MODERN Compose-v2 form where the
-/// `compose` SUBCOMMAND comes FIRST, then `-f <file>`. The LEGACY form
-/// `docker -f <file> compose ... ` (flag before subcommand) fails with
-/// `unknown shorthand flag: 'f'` (exit 125), which makes every retry of the
-/// Docker-startup fail → QuestDB never starts → every subsequent ILP/DB write
-/// fails (the prod cascade this guards against). This extraction makes the
-/// arg ORDER unit-testable so a refactor can never silently reintroduce the
-/// legacy form. Tested by `test_docker_compose_up_args_compose_subcommand_first`.
-#[must_use]
-fn docker_compose_up_args(compose_path: &str) -> [&str; 6] {
-    [
-        "compose",
-        "-f",
-        compose_path,
-        "up",
-        "-d",
-        "--force-recreate",
-    ]
-}
-
-async fn run_docker_compose_up(env_vars: &[(&str, String)]) -> Result<()> {
+/// The argument vector comes from the pure [`compose_cli_args`] builder so the
+/// R1 (2026-06-30) subcommand-before-`-f` ordering stays unit-ratcheted.
+async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> Result<()> {
     use tokio::process::Command;
 
-    let mut cmd = Command::new("docker");
-    cmd.args(docker_compose_up_args(DOCKER_COMPOSE_PATH));
+    let mut cmd = Command::new(cli.program());
+    cmd.args(compose_cli_args(
+        cli,
+        DOCKER_COMPOSE_PATH,
+        &["up", "-d", "--force-recreate"],
+    ));
 
     for (key, value) in env_vars {
         cmd.env(key, value);
@@ -1690,7 +1879,7 @@ mod tests {
         // If Docker is not installed/running, docker compose should fail
         // gracefully with an error result (not panic).
         let env_vars: Vec<(&str, String)> = vec![];
-        let result = run_docker_compose_up(&env_vars).await;
+        let result = run_docker_compose_up(ComposeCli::DockerComposeV2, &env_vars).await;
         // Result depends on whether Docker is available in test env.
         // We just verify it doesn't panic.
         let _ = result;
@@ -1788,7 +1977,7 @@ mod tests {
             ("TV_TELEGRAM_BOT_TOKEN", "bot_token".to_string()),
             ("TV_TELEGRAM_CHAT_ID", "chat_id".to_string()),
         ];
-        let result = run_docker_compose_up(&env_vars).await;
+        let result = run_docker_compose_up(ComposeCli::DockerComposeV2, &env_vars).await;
         // May succeed or fail depending on Docker — just verify no panic.
         let _ = result;
     }
@@ -1797,7 +1986,8 @@ mod tests {
     async fn test_run_docker_compose_up_result_is_result_type() {
         // Verify the return type is Result<()>.
         let env_vars: Vec<(&str, String)> = vec![];
-        let result: Result<()> = run_docker_compose_up(&env_vars).await;
+        let result: Result<()> =
+            run_docker_compose_up(ComposeCli::DockerComposeV2, &env_vars).await;
         // The error should contain "docker compose" or similar context.
         if let Err(err) = &result {
             let msg = format!("{err:?}");
@@ -2022,7 +2212,7 @@ mod tests {
             ("TV_TELEGRAM_BOT_TOKEN", "123:ABC".to_string()),
             ("TV_TELEGRAM_CHAT_ID", "-12345".to_string()),
         ];
-        let result = run_docker_compose_up(&env_vars).await;
+        let result = run_docker_compose_up(ComposeCli::DockerComposeV2, &env_vars).await;
         // Docker may or may not be available — just verify the function runs.
         let _ = result;
     }
@@ -2312,7 +2502,11 @@ mod tests {
         // which makes Docker-startup fail → QuestDB never starts → every ILP/DB
         // write fails (the prod cascade). This pins the modern order so a
         // refactor can never reintroduce the legacy form.
-        let args = docker_compose_up_args("deploy/docker/docker-compose.yml");
+        let args = compose_cli_args(
+            ComposeCli::DockerComposeV2,
+            "deploy/docker/docker-compose.yml",
+            &["up", "-d", "--force-recreate"],
+        );
         assert_eq!(
             args[0], "compose",
             "the `compose` subcommand MUST be the first arg (modern Compose v2), \
@@ -2326,6 +2520,7 @@ mod tests {
         assert_eq!(args[2], "deploy/docker/docker-compose.yml");
         assert_eq!(args[3], "up");
         assert_eq!(args[4], "-d");
+        assert_eq!(args[5], "--force-recreate");
         // `compose` must appear BEFORE `-f` in the full vector.
         let compose_pos = args.iter().position(|a| *a == "compose").unwrap();
         let f_pos = args.iter().position(|a| *a == "-f").unwrap();
@@ -2333,6 +2528,114 @@ mod tests {
             compose_pos < f_pos,
             "`compose` (at {compose_pos}) must precede `-f` (at {f_pos})"
         );
+        // The docker-v2 front-end program is `docker` itself.
+        assert_eq!(ComposeCli::DockerComposeV2.program(), "docker");
+    }
+
+    // -----------------------------------------------------------------------
+    // Compose CLI resolution ladder (issue #1505, 2026-07-18)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compose_cli_args_v1_and_plugin_have_no_compose_subcommand() {
+        // For the v1 standalone binary and the plugin-by-absolute-path
+        // front-ends, the PROGRAM ITSELF is compose: injecting a `compose`
+        // subcommand would fail ("no such command"), and `-f` must come
+        // first instead.
+        for cli in [
+            ComposeCli::StandaloneV1,
+            ComposeCli::PluginPath("/usr/local/lib/docker/cli-plugins/docker-compose"),
+        ] {
+            let args = compose_cli_args(cli, "deploy/docker/docker-compose.yml", &["up", "-d"]);
+            assert_eq!(
+                args[0],
+                "-f",
+                "{}: `-f` must be the first arg — the program itself is compose",
+                cli.label()
+            );
+            assert_eq!(args[1], "deploy/docker/docker-compose.yml");
+            assert_eq!(&args[2..], ["up", "-d"]);
+            assert!(
+                !args.contains(&"compose"),
+                "{}: must NOT inject a `compose` subcommand",
+                cli.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_compose_cli_program_shapes() {
+        assert_eq!(ComposeCli::DockerComposeV2.program(), "docker");
+        assert_eq!(ComposeCli::StandaloneV1.program(), "docker-compose");
+        let plugin = ComposeCli::PluginPath(COMPOSE_PLUGIN_SYSTEM_PATHS[0]);
+        assert_eq!(plugin.program(), COMPOSE_PLUGIN_SYSTEM_PATHS[0]);
+        // Labels are non-empty operator-facing strings.
+        for cli in [
+            ComposeCli::DockerComposeV2,
+            ComposeCli::StandaloneV1,
+            plugin,
+        ] {
+            assert!(!cli.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_compose_cli_args_appends_tail_in_order() {
+        let tail = ["ps", "--format", "{{.Name}} {{.State}}"];
+        let args = compose_cli_args(ComposeCli::DockerComposeV2, "x.yml", &tail);
+        assert_eq!(
+            args,
+            vec!["compose", "-f", "x.yml", &tail[0], &tail[1], &tail[2]]
+        );
+    }
+
+    #[test]
+    fn test_compose_plugin_system_paths_are_system_wide() {
+        // Issue #1505 ratchet: the fallback probes SYSTEM-WIDE plugin dirs
+        // only. The per-user ~/.docker/cli-plugins/ dir is invisible to the
+        // systemd service under ProtectHome=true — probing it would make
+        // dev-shell behaviour diverge from the hardened service context
+        // (the exact divergence that masked the prod breakage).
+        assert!(!COMPOSE_PLUGIN_SYSTEM_PATHS.is_empty());
+        for path in COMPOSE_PLUGIN_SYSTEM_PATHS {
+            assert!(
+                path.starts_with('/'),
+                "plugin path must be absolute: {path}"
+            );
+            assert!(
+                path.ends_with("cli-plugins/docker-compose"),
+                "plugin path must point at the compose plugin binary: {path}"
+            );
+            assert!(
+                !path.starts_with("/home") && !path.contains("/.docker/"),
+                "per-user plugin dirs are FORBIDDEN (ProtectHome=true): {path}"
+            );
+        }
+        // The deploy workflow + user-data install target must be probed FIRST.
+        assert_eq!(
+            COMPOSE_PLUGIN_SYSTEM_PATHS[0],
+            "/usr/local/lib/docker/cli-plugins/docker-compose"
+        );
+    }
+
+    #[test]
+    fn test_is_executable_file_nonexistent_is_false() {
+        assert!(!is_executable_file(
+            "/nonexistent/tv-issue-1505/docker-compose"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_probe_command_succeeds_missing_program_is_false() {
+        // A program that does not exist must probe false, never error/panic.
+        assert!(!probe_command_succeeds("tv-no-such-program-1505", &["version"]).await);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_compose_cli_no_panic() {
+        // Result depends on the host (compose may or may not be installed);
+        // the resolution ladder itself must never panic.
+        let _cli: Option<ComposeCli> = resolve_compose_cli().await;
     }
 
     // -----------------------------------------------------------------------

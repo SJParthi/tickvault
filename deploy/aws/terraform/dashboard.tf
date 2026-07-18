@@ -93,20 +93,11 @@ resource "aws_cloudwatch_dashboard" "operator" {
       },
 
       # ----- Row 2: market-data flow + WebSocket health -----
-      {
-        type   = "metric"
-        x      = 0
-        y      = 8
-        width  = 8
-        height = 6
-        properties = {
-          title   = "Candle seals emitted (data flowing during market hours)"
-          region  = local.dash_region
-          view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_aggregator_seals_emitted_total", { stat = "Sum" }]]
-          period  = 300
-        }
-      },
+      # ("Candle seals emitted" widget retired 2026-07-17 — stage-3 dead-WS
+      # sweep: tv_aggregator_seals_emitted_total's emit site (the seal
+      # routing fan-in) was deleted with the tick aggregator; the series can
+      # never publish again. Seal-chain liveness lives in the seal-writer
+      # drain counters + tv_rest_candle_fold_heartbeat_total.)
       # ("Feed last-tick age" widget retired 2026-07-15 — its sole producer,
       # the Groww bridge liveness stamp, was deleted with the Groww live feed;
       # the series can never publish again.)

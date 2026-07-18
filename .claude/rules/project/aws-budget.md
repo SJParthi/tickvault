@@ -24,11 +24,13 @@ died with the live-WS retirements):
   tick source with the Dhan live-WS lane deletion (PR-C2, 2026-07-13) and
   is deleted in this PR; a permanently-missing-data dead monitor (the
   groww-exchange-lag S4 precedent, 2026-07-15). Window-gate ALARM_NAMES
-  trimmed 4 → 3 in lockstep.
+  trimmed 3 → 2 in lockstep (the same-day stage-3 sweep had already
+  retired boundary-catchup-storm-dhan, 4 → 3).
 - **−2 EMF allowlist series ≈ −$0.60/mo (names Verified; billing
   Assumed):** tv_dhan_exchange_lag_p99_seconds +
   tv_dhan_lag_samples_excluded_total (cloudwatch-agent.json +
-  user-data.sh.tftpl, 19 → 17 names).
+  user-data.sh.tftpl, 17 → 15 names — the same-day stage-3 sweep had
+  already removed the 2 dead aggregator names, 19 → 17).
 - **−1 CloudWatch dashboard: ₹0 (Verified):** `tv-<env>-scoreboard`
   (dashboard.tf) — its Dhan-vs-Groww lag-trend widgets charted only the
   dead lag gauges; frees dashboard slot #2 of the 3-slot free tier.
@@ -40,6 +42,36 @@ died with the live-WS retirements):
 
 Net ≈ **−$0.70/mo pre-GST (~−₹70/mo incl. 18% GST at ₹85/$)** — the real
 gain is the freed dashboard slot + ~730 LoC of dead monitoring code.
+
+## COST NOTE 2026-07-17 — dead live-WS sweep stage 3 (−~$0.70/mo)
+
+The stage-3 sweep (this PR) deleted the publisher-less 21-TF TICK aggregator
+and its main.rs driver tasks — both live feeds are retired, so no tick
+publisher exists and the aggregator's metrics lost their last possible
+writers. Retired in lockstep (dated notes in `silent-feed-alarms.tf` S2 +
+`app-alarms.tf` header + `market-hours-liveness-alarm.tf` +
+`dashboard.tf`; billing magnitudes Assumed at CloudWatch list rates —
+active-series-hours decay to $0 once producers stop publishing):
+
+- **−1 alarm ≈ −$0.10/mo (Verified against the terraform diff):**
+  `boundary_catchup_storm_dhan` (silent-feed-alarms.tf) — its metric
+  `tv_boundary_catchup_total` was written only by the deleted aggregator's
+  watermark catch-up sealer. Its window-gate ALARM_NAMES entry (gate now
+  arms 3 alarms) and its dashboard widget + alarm-strip ARN left in the
+  same PR.
+- **−2 [host,feed] series ≈ −$0.60/mo (Assumed):** the second EMF
+  `metric_declaration` (`^tv_boundary_catchup_total$` under [host,feed])
+  deleted from `cloudwatch-agent.json` + `user-data.sh.tftpl`.
+- **−2 main-list EMF names ≈ $0 marginal (dormant since PR-C2/stage-2):**
+  `tv_aggregator_seals_emitted_total` + `tv_aggregator_close_pct_nonzero_total`
+  removed from the host-only selector (17 names remain) — their emit sites
+  (seal_routing.rs + the main.rs close-pct proof counter) died with the
+  aggregator drivers.
+
+Net ≈ **−$0.70/mo** — the seal-drop pagers (AGGREGATOR-DROP-01 errcode
+alarm + `tv-<env>-seal-writer-dropped`, seal-drop-alarm.tf) are UNTOUCHED:
+their subject, the storage seal-writer chain, survives with
+`rest_candle_fold` as its sole producer.
 
 ## COST NOTE 2026-07-17 — dead live-WS sweep stage 1 (−~$0.10/mo)
 

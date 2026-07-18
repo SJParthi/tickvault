@@ -45,6 +45,11 @@ pub mod brutex_crossverify_boot;
 // `.claude/rules/project/cadence-error-codes.md`.
 pub mod cadence_boot;
 pub(crate) mod cadence_escalation;
+// Boot-time candle-table DDL + retired-object sweep (Track A, 2026-07-18):
+// re-homes the pre-#1522 drop-legacy → ensure-candles → named-views chain
+// behind a bounded quiet probe; awaited from `build_shared_infra` BEFORE
+// the seal-writer spawn (the fresh-volume no-DEDUP fix).
+pub mod candle_ddl_boot;
 /// Real Dhan cadence executor — limiter-free, gate-pacing honored (the runner
 /// pre-acquires gates; this executor issues ONE bounded request per call).
 pub mod dhan_cadence_executor;
@@ -171,9 +176,6 @@ pub mod market_ram_store_boot;
 /// stored month. FOLD-01 runbook:
 /// `.claude/rules/project/rest-candle-fold-error-codes.md`.
 pub mod rest_candle_fold;
-/// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
-/// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
-pub mod seal_routing;
 /// Pure shutdown classifier (Telegram cleanliness overhaul, 2026-07-15):
 /// signal kind × runtime source × IST clock × trading calendar →
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
