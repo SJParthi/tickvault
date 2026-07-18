@@ -234,11 +234,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # aws-lambdas joined 2026-07-18 (rust-only phase 2b-1) — a matrix
+        # ENTRY, not a new job, so the all-green needs list is untouched.
         # 2026-07-18 (rust-only phase 2c): `logs-mcp` = the new
         # crates/tickvault-logs-mcp crate (matrix entry expands to
         # `tickvault-logs-mcp` via the `tickvault-${{ matrix.crate }}`
         # run line below).
-        crate: [common, storage, core, trading, api, app, logs-mcp]
+        crate: [common, storage, core, trading, api, app, aws-lambdas, logs-mcp]
         # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature was
         # DELETED with the Dhan instrument chain (operator Q3, 2026-07-13 —
         # websocket-connection-scope-lock.md "2026-07-13 Amendment" §B); the

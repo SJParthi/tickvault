@@ -331,6 +331,10 @@ fn test_alarm_is_gated_by_market_hours_lambda() {
 /// fail OPEN on an EC2 API error so a real trading day never loses the page.
 #[test]
 fn test_gate_lambda_open_is_holiday_safe() {
+    // 2026-07-18 (rust-only phase 2b-1): the gate Lambda's Python heredoc was
+    // PORTED to Rust (crates/aws-lambdas/src/market_hours_gate.rs) — the
+    // env-var + IAM pins stay in the tf; the LOGIC pins repoint to the Rust
+    // source (the budget_killswitch_wiring.rs repoint precedent).
     let tf = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
     let norm = normalized(&tf);
     for (pin, why) in [
@@ -338,21 +342,6 @@ fn test_gate_lambda_open_is_holiday_safe() {
             "EC2_INSTANCE_ID = aws_instance.tv_app.id",
             "the gate Lambda must know WHICH instance to check — the cycle-free \
              env-var pattern proven by start-watchdog-lambda.tf",
-        ),
-        (
-            "ec2.describe_instances(InstanceIds=[INSTANCE_ID])",
-            "the open path must ask EC2 whether the box is up before enabling \
-             the breaching-on-missing alarms (holiday self-stop = box OFF)",
-        ),
-        (
-            "fail-open, treating as up",
-            "an EC2 API error must NEVER suppress the trading-day liveness page \
-             — the check fails open, exactly mirroring holiday-gate.sh",
-        ),
-        (
-            "leaving actions disabled",
-            "a not-up box (NSE holiday self-stop / operator manual stop) must \
-             skip BOTH the enable and the OK reset",
         ),
         (
             "\"ec2:DescribeInstances\"",
@@ -369,13 +358,37 @@ fn test_gate_lambda_open_is_holiday_safe() {
              + treat_missing_data=breaching)."
         );
     }
+    let rs = read("crates/aws-lambdas/src/market_hours_gate.rs");
+    for (pin, why) in [
+        (
+            ".describe_instances()",
+            "the open path must ask EC2 whether the box is up before enabling \
+             the breaching-on-missing alarms (holiday self-stop = box OFF)",
+        ),
+        (
+            "fail-open, treating as up",
+            "an EC2 API error must NEVER suppress the trading-day liveness page \
+             — the check fails open, exactly mirroring holiday-gate.sh",
+        ),
+        (
+            "leaving actions disabled",
+            "a not-up box (NSE holiday self-stop / operator manual stop) must \
+             skip BOTH the enable and the OK reset",
+        ),
+    ] {
+        assert!(
+            rs.contains(pin),
+            "market_hours_gate.rs lost the holiday-safety pin `{pin}` — {why}. \
+             Regressing this restores the weekday-NSE-holiday false page."
+        );
+    }
     // The enable call must come AFTER the instance-up guard in the Lambda
     // source (source-order scan, house pattern).
-    let guard_pos = tf
-        .find("if not up:")
-        .expect("gate Lambda must carry the `if not up:` holiday guard arm"); // APPROVED: test
-    let enable_pos = tf
-        .find("cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)")
+    let guard_pos = rs
+        .find("if !instance_up")
+        .expect("gate Lambda must carry the instance-up holiday guard arm"); // APPROVED: test
+    let enable_pos = rs
+        .find(".enable_alarm_actions()")
         .expect("gate Lambda must still enable alarm actions on open"); // APPROVED: test
     assert!(
         guard_pos < enable_pos,
@@ -396,6 +409,9 @@ fn test_gate_lambda_open_is_holiday_safe() {
 /// marker-less manual-stop case, and must fail OPEN on any SSM error.
 #[test]
 fn test_gate_lambda_open_checks_holiday_marker_first() {
+    // 2026-07-18 (rust-only phase 2b-1): env-var + IAM pins stay in the tf;
+    // the marker-read LOGIC pins repoint to the Rust port
+    // (crates/aws-lambdas/src/market_hours_gate.rs).
     let tf = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
     let norm = normalized(&tf);
     for (pin, why) in [
@@ -403,16 +419,6 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
             "HOLIDAY_STOP_PARAM = \"/tickvault/${var.environment}/holiday-stop-date\"",
             "the gate Lambda must be told WHERE holiday-gate.sh stamps the \
              intentional-stop marker",
-        ),
-        (
-            "ssm.get_parameter(Name=HOLIDAY_STOP_PARAM)",
-            "the open path must READ the marker — marker == today is the only \
-             race-proof 'intentionally stopped today' signal",
-        ),
-        (
-            "fail-open, not a holiday",
-            "an SSM error / missing marker must NEVER suppress the trading-day \
-             liveness page — the marker check fails open",
         ),
         (
             "parameter/tickvault/${var.environment}/holiday-stop-date",
@@ -428,21 +434,140 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
              up-burst bracketing the single 09:20 instance-state sample)."
         );
     }
-    // Source order: marker check BEFORE the instance-up guard BEFORE enable.
-    let marker_pos = tf
-        .find("if holiday_stop_is_today():")
+    let rs = read("crates/aws-lambdas/src/market_hours_gate.rs");
+    for (pin, why) in [
+        (
+            ".get_parameter().name(&holiday_param)",
+            "the open path must READ the marker — marker == today is the only \
+             race-proof 'intentionally stopped today' signal",
+        ),
+        (
+            "fail-open, not a holiday",
+            "an SSM error / missing marker must NEVER suppress the trading-day \
+             liveness page — the marker check fails open",
+        ),
+        (
+            "holiday_marker_matches_today",
+            "the marker compare must go through the unit-tested pure fn \
+             (trim + exact-today match; stale markers never match)",
+        ),
+    ] {
+        assert!(
+            rs.contains(pin),
+            "market_hours_gate.rs lost the round-3 marker pin `{pin}` — {why}."
+        );
+    }
+    // Source order: marker check BEFORE the instance-up guard BEFORE enable
+    // (the pure open_decision fn + the handle's decision match).
+    let marker_pos = rs
+        .find("if holiday_stop_today")
         .expect("gate Lambda open path must carry the holiday-marker guard arm"); // APPROVED: test
-    let up_guard_pos = tf
-        .find("if not up:")
+    let up_guard_pos = rs
+        .find("if !instance_up")
         .expect("gate Lambda must keep the round-1 instance-up guard arm"); // APPROVED: test
-    let enable_pos = tf
-        .find("cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)")
+    let enable_pos = rs
+        .find(".enable_alarm_actions()")
         .expect("gate Lambda must still enable alarm actions on open"); // APPROVED: test
     assert!(
         marker_pos < up_guard_pos && up_guard_pos < enable_pos,
         "gate Lambda open ordering must be marker-check -> instance-up-check -> \
          enable; the marker is race-proof, the instance sample is not — \
          checking the sample first (or enabling first) re-opens the raced \
+         holiday false-page window"
+    );
+    // 2026-07-18 (hostile-review r1 F2/M4): the pure-fn refactor made the
+    // plain token-order scan above VACUOUS on its own — the `if
+    // holiday_stop_today` / `if !instance_up` tokens live in the pure
+    // `open_decision` fn near the TOP of the file, so an unconditional
+    // `.enable_alarm_actions()` inserted in handle() right after client
+    // construction still ordered AFTER them and passed. Strengthened:
+    // (i) exactly ONE enable occurrence in the whole file (the close path
+    //     uses disable_alarm_actions) — an inserted second enable fails;
+    // (ii) the enable sits AFTER handle()'s `let decision = open_decision(`
+    //      call site — a moved/unconditional enable before the decision
+    //      fails;
+    // (iii) the NEAREST PRECEDING `OpenDecision::Enable =>` match-arm token
+    //       also sits after that call site (the first
+    //       `OpenDecision::Enable =>` in the file belongs to the
+    //       open_result renderer and must NOT satisfy this). NOTE
+    //       (2026-07-18 r2): (iii) alone does NOT prove the enable lives
+    //       inside the match — a single enable moved to just AFTER the
+    //       decision match (before `Ok(open_result`) still has the
+    //       (gutted) Enable arm as its nearest preceding token; (iv)
+    //       below closes exactly that probe shape.
+    let enable_count = rs.matches(".enable_alarm_actions()").count();
+    assert_eq!(
+        enable_count, 1,
+        "market_hours_gate.rs must carry exactly ONE .enable_alarm_actions() \
+         call (inside the OpenDecision::Enable match arm) — any additional \
+         occurrence is an unconditional-enable mutation re-opening the \
+         holiday false-page window"
+    );
+    let decision_call_pos = rs
+        .find("let decision = open_decision(")
+        .expect("handle() must route the open path through the pure open_decision fn"); // APPROVED: test
+    assert!(
+        decision_call_pos < enable_pos,
+        "the single .enable_alarm_actions() call must come AFTER handle()'s \
+         `let decision = open_decision(` call site — enabling before the \
+         decision is computed re-opens the holiday false-page window"
+    );
+    let enable_arm_pos = rs[..enable_pos]
+        .rfind("OpenDecision::Enable =>")
+        .expect("the enable call must be preceded by an OpenDecision::Enable match arm"); // APPROVED: test
+    assert!(
+        decision_call_pos < enable_arm_pos,
+        "the OpenDecision::Enable arm guarding .enable_alarm_actions() must \
+         belong to handle()'s decision match (after `let decision = \
+         open_decision(`), not the open_result renderer earlier in the file \
+         — otherwise the enable is not gated by the computed decision"
+    );
+    // 2026-07-18 (hostile-review r2 LOW): pins (i)+(ii)+(iii) alone were
+    // still probeable — gut the Enable arm's enable chain and insert ONE
+    // unconditional `.enable_alarm_actions()` just AFTER the decision
+    // match (before `Ok(open_result`): the count stays 1, both orderings
+    // hold, yet the enable is unconditional (the exact holiday-false-page
+    // shape this guard exists for). (iv) closes that shape: the single
+    // enable occurrence must lie INSIDE the `match &decision {` block's
+    // brace span (naive byte-level brace-depth scan from the match's
+    // opening brace to its matching close). Named residuals (accepted
+    // class per the house source-scan conventions): the brace scan does
+    // not lex string literals or comments — a brace character added
+    // inside either, within the match block, skews the computed span;
+    // the needle scans still count comment-text matches and miss
+    // aliased / UFCS / macro-wrapped enable calls; and an attacker
+    // relocating the enable together with a fabricated surrounding
+    // `match &decision {` block is beyond a text scan.
+    let match_token = "match &decision {";
+    assert_eq!(
+        rs.matches(match_token).count(),
+        1,
+        "market_hours_gate.rs must carry exactly one `match &decision {{` \
+         block — the (iv) arm-span pin keys on it"
+    );
+    let match_start = rs.find(match_token).expect("match &decision block"); // APPROVED: test
+    let open_brace = match_start + match_token.len() - 1;
+    let mut depth: i32 = 0;
+    let mut match_end = None;
+    for (i, b) in rs.as_bytes().iter().enumerate().skip(open_brace) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    match_end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let match_end = match_end.expect("match &decision block must have a matching closing brace"); // APPROVED: test
+    assert!(
+        decision_call_pos < match_start && match_start < enable_pos && enable_pos < match_end,
+        "the single .enable_alarm_actions() call must sit INSIDE handle()'s \
+         `match &decision` block span — an enable moved after the match \
+         (even before `Ok(open_result`) is unconditional and re-opens the \
          holiday false-page window"
     );
 }
