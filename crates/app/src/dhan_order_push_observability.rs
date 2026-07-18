@@ -275,11 +275,17 @@ async fn run_dhan_order_push_consumer(
                 let ts_ist_nanos = now_ist_nanos();
                 // Full-fidelity capture lane (additive, best-effort) —
                 // BEFORE the blocking audit flush so a slow QuestDB leg
-                // never delays the receipt-stamped capture publish.
-                publish_dhan_event_record(
-                    events_tx.as_ref(),
-                    build_dhan_order_event_record(&update, ts_ist_nanos),
-                );
+                // never delays the receipt-stamped capture publish. Record
+                // CONSTRUCTION is gated on a live capture channel — a
+                // disabled capture builds nothing (review round 1 HIGH;
+                // `ts_ist_nanos` stays unconditional: the audit row below
+                // needs it either way).
+                if let Some(tx) = events_tx.as_ref() {
+                    publish_dhan_event_record(
+                        Some(tx),
+                        build_dhan_order_event_record(&update, ts_ist_nanos),
+                    );
+                }
                 let row = order_update_to_audit_row(&update, ts_ist_nanos);
                 persist_push_row(&mut writer, &row);
             }

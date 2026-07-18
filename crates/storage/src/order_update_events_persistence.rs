@@ -31,7 +31,7 @@ use tracing::{error, warn};
 use tickvault_common::broker_order_events::OrderUpdateEventRecord;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::sanitize::sanitize_audit_string;
+use tickvault_common::sanitize::{MAX_AUDIT_STR_LEN, sanitize_ilp_string, sanitize_ilp_symbol};
 
 /// QuestDB table name — one row per received order push event.
 pub const ORDER_UPDATE_EVENTS_TABLE: &str = "order_update_events";
@@ -45,9 +45,21 @@ pub const DEDUP_KEY_ORDER_UPDATE_EVENTS: &str = "ts, trading_date_ist, feed, ord
 /// `reject_reason` column hard cap — bounded broker text, never raw bodies.
 pub const ORDER_UPDATE_EVENTS_REJECT_REASON_MAX_CHARS: usize = 300;
 
+/// `remarks` column hard cap — DELIBERATELY the same 300-char bound as
+/// `reject_reason` (both are short free-form broker text; a named alias so
+/// the reuse is a documented decision, not a silent constant grab —
+/// review round 1 Fix 8).
+pub const ORDER_UPDATE_EVENTS_REMARKS_MAX_CHARS: usize =
+    ORDER_UPDATE_EVENTS_REJECT_REASON_MAX_CHARS;
+
 /// `stage_trail` / `detail_raw` column hard cap — the bounded full-fidelity
 /// remainder (a hostile broker string can never bloat a row).
-pub const ORDER_UPDATE_EVENTS_DETAIL_MAX_CHARS: usize = 2000;
+///
+/// Equal to [`MAX_AUDIT_STR_LEN`] (1024) BY CONSTRUCTION: the ILP STRING
+/// sanitiser (`sanitize_ilp_string`) caps internally at that length, so a
+/// larger declared cap here would be dead (review round 1 LOW-1 — the
+/// originally-declared 2000 was unreachable). One honest bound, one source.
+pub const ORDER_UPDATE_EVENTS_DETAIL_MAX_CHARS: usize = MAX_AUDIT_STR_LEN;
 
 /// Sentinel for a SYMBOL value that is empty/not-applicable at row time
 /// (empty ILP tag values are invalid in classic line protocol — the
@@ -362,23 +374,32 @@ impl OrderUpdateEventsWriter {
         };
         // Never write an empty ILP SYMBOL value — map to the "n/a" house
         // sentinel (checked AFTER sanitize, so a hostile all-control-char
-        // input cannot sneak an empty tag through either).
+        // input cannot sneak an empty tag through either). SYMBOL values go
+        // through the ILP TAG sanitiser (`sanitize_ilp_symbol` — strips the
+        // tag delimiters `,`/`=` + control chars, 256-byte cap); the SQL
+        // sanitiser (`sanitize_audit_string`) is the WRONG choke point for
+        // ILP (quote-doubling would corrupt stored text — review round 1
+        // SECURITY MEDIUM-1).
         let symbol_or_na = |value: &str| -> String {
-            let sanitized = sanitize_audit_string(value);
+            let sanitized = sanitize_ilp_symbol(value);
             if sanitized.is_empty() {
                 ORDER_UPDATE_EVENTS_SYMBOL_NA.to_string()
             } else {
-                sanitized
+                sanitized.into_owned()
             }
         };
+        // STRING (field) values go through the ILP STRING sanitiser —
+        // preserves `,`/`=`/`'`/`;`/`"` verbatim (questdb-rs escapes the
+        // genuinely ILP-special chars itself), strips control/BiDi, and
+        // caps internally at MAX_AUDIT_STR_LEN.
         let bounded = |value: &str, cap: usize| -> String {
-            sanitize_audit_string(value).chars().take(cap).collect()
+            sanitize_ilp_string(value).chars().take(cap).collect()
         };
         let reject_reason = bounded(
             &r.reject_reason,
             ORDER_UPDATE_EVENTS_REJECT_REASON_MAX_CHARS,
         );
-        let remarks = bounded(&r.remarks, ORDER_UPDATE_EVENTS_REJECT_REASON_MAX_CHARS);
+        let remarks = bounded(&r.remarks, ORDER_UPDATE_EVENTS_REMARKS_MAX_CHARS);
         let stage_trail = bounded(&r.stage_trail, ORDER_UPDATE_EVENTS_DETAIL_MAX_CHARS);
         let detail_raw = bounded(&r.detail_raw, ORDER_UPDATE_EVENTS_DETAIL_MAX_CHARS);
         self.buffer
@@ -611,7 +632,7 @@ mod tests {
             contract_id: String::new(),
             gui_order_id: String::new(),
             stage_trail: String::new(),
-            detail_raw: "client_id=1106656882".to_string(),
+            detail_raw: "product_code=V lot_size=75".to_string(),
         }
     }
 
@@ -718,7 +739,8 @@ mod tests {
     }
 
     /// `reject_reason` bounded ≤300; `detail_raw`/`stage_trail` bounded
-    /// ≤2000 — a hostile broker string can never bloat a row.
+    /// ≤`MAX_AUDIT_STR_LEN` (1024) — a hostile broker string can never
+    /// bloat a row.
     #[test]
     fn test_append_order_update_event_string_caps() {
         let mut w = OrderUpdateEventsWriter::for_test();
@@ -750,11 +772,11 @@ mod tests {
         );
         assert!(
             field("detail_raw").matches('d').count() <= ORDER_UPDATE_EVENTS_DETAIL_MAX_CHARS,
-            "detail_raw must be capped at 2000"
+            "detail_raw must be capped at MAX_AUDIT_STR_LEN"
         );
         assert!(
             field("stage_trail").matches('s').count() <= ORDER_UPDATE_EVENTS_DETAIL_MAX_CHARS,
-            "stage_trail must be capped at 2000"
+            "stage_trail must be capped at MAX_AUDIT_STR_LEN"
         );
     }
 

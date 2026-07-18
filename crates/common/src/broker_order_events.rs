@@ -410,9 +410,12 @@ pub struct OrderUpdateEventRecord {
     /// Groww stage trail (`stageName@timeStampFromMidNight` pairs); empty
     /// elsewhere. Bounded + sanitized by the storage writer.
     pub stage_trail: String,
-    /// Sanitized full-fidelity remainder (Dhan ClientId/ProductName/
-    /// DisplayName/Isin/LotSize/StrikePrice/ExpiryDate/DiscQtyRem etc.).
-    /// Bounded by the storage writer (~2000 chars).
+    /// Sanitized full-fidelity remainder (Dhan ProductName/DisplayName/
+    /// Isin/LotSize/StrikePrice/ExpiryDate/DiscQtyRem etc. — Dhan ClientId
+    /// is deliberately NOT persisted: house redaction class,
+    /// account-constant, zero forensic value — dated decision 2026-07-18).
+    /// ILP-sanitized + bounded by the storage writer
+    /// (`ORDER_UPDATE_EVENTS_DETAIL_MAX_CHARS`).
     pub detail_raw: String,
 }
 
@@ -616,9 +619,11 @@ pub fn build_dhan_order_event_record(
         stage_trail: String::new(),
         // The full-fidelity remainder — every wire field WITHOUT a
         // first-class column (the storage writer sanitizes + bounds it).
+        // Dhan ClientId is deliberately NOT persisted (house redaction
+        // class; account-constant, zero forensic value — dated decision
+        // 2026-07-18).
         detail_raw: format!(
-            "client_id={} product_code={} segment={} display_name={} isin={} lot_size={} strike_price={} expiry_date={} disc_qty_rem={}",
-            update.client_id,
+            "product_code={} segment={} display_name={} isin={} lot_size={} strike_price={} expiry_date={} disc_qty_rem={}",
             update.product,
             update.segment,
             update.display_name,
@@ -1009,7 +1014,7 @@ mod tests {
             contract_id: String::new(),
             gui_order_id: String::new(),
             stage_trail: String::new(),
-            detail_raw: "client_id=1106656882".to_owned(),
+            detail_raw: "product_code=V lot_size=75".to_owned(),
         };
         assert_eq!(rec.feed, Feed::Dhan);
         assert_eq!(rec.status, "FILLED");
@@ -1274,8 +1279,15 @@ mod tests {
         );
 
         // detail_raw remainder — the fields without first-class columns.
+        // Dhan ClientId is deliberately NOT persisted (house redaction
+        // class; account-constant, zero forensic value — dated decision
+        // 2026-07-18): pinned as an ABSENCE.
+        assert!(
+            !rec.detail_raw.contains(client_id.as_str()),
+            "detail_raw must NOT carry the Dhan ClientId (redaction class): {}",
+            rec.detail_raw
+        );
         for needle in [
-            client_id.as_str(),
             "product_code=V",
             "segment=D",
             display_name.as_str(),

@@ -291,7 +291,13 @@ fn handle_msg(
                 // ADDITIVE full-fidelity capture lane (ORDER-EVT-01): every
                 // decoded field → the order_update_events forensic table.
                 // Best-effort try_send; never blocks or fails this loop.
-                if let Some(record) = build_groww_order_event_record(&dto, now_ist_epoch_nanos()) {
+                // Record CONSTRUCTION (and the per-frame SystemTime read)
+                // is gated on a live capture channel — a disabled capture
+                // pays zero build cost (review round 1 HIGH).
+                if capture.orders_enabled()
+                    && let Some(record) =
+                        build_groww_order_event_record(&dto, now_ist_epoch_nanos())
+                {
                     capture.publish_order(record);
                 }
             }
@@ -308,9 +314,9 @@ fn handle_msg(
         },
         Some(PushStream::Position) => {
             // Decode + count + log + best-effort full-fidelity capture
-            // (position_update_events — ORDER-EVT-01 subsystem).
-            let _outcome =
-                position::handle_position_payload(payload, capture, now_ist_epoch_nanos());
+            // (position_update_events — ORDER-EVT-01 subsystem). The
+            // receipt-stamp closure is invoked ONLY when capture is live.
+            let _outcome = position::handle_position_payload(payload, capture, now_ist_epoch_nanos);
         }
         None => {
             metrics::counter!("tv_groww_push_decode_errors_total", "kind" => "unknown_subject")

@@ -29,6 +29,8 @@
 //! COLD-PATH: these builders run per push event (a handful per session),
 //! never on the tick hot path.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tickvault_common::broker_order_events::{
     BrokerOrderStatus, OrderUpdateEventRecord, PositionUpdateEventRecord, next_event_seq,
 };
@@ -36,7 +38,7 @@ use tickvault_common::constants::IST_UTC_OFFSET_NANOS;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{debug, error};
 
 use super::proto::{
     ExchangePosition, OrderDetailsBroadCastDto, PositionDetailProto, buy_sell_name, duration_name,
@@ -311,13 +313,30 @@ impl GrowwPushCapture {
         Self::default()
     }
 
+    /// True when the ORDER capture channel is live. Producers gate record
+    /// CONSTRUCTION on this so a disabled capture pays zero build cost —
+    /// no record struct, no `SystemTime` read (review round 1 HIGH,
+    /// hot-path rule: work is hoisted behind the gate, not just the send).
+    #[must_use]
+    pub fn orders_enabled(&self) -> bool {
+        self.orders.is_some()
+    }
+
+    /// True when the POSITION capture channel is live (see
+    /// [`Self::orders_enabled`] for the construction-gating contract).
+    #[must_use]
+    pub fn positions_enabled(&self) -> bool {
+        self.positions.is_some()
+    }
+
     /// Publish an ORDER capture record (best-effort, never blocking).
     pub fn publish_order(&self, record: OrderUpdateEventRecord) {
         let Some(tx) = self.orders.as_ref() else {
             return;
         };
-        if let Err(err) = tx.try_send(record) {
-            record_sink_drop("order", err_reason(&err));
+        match tx.try_send(record) {
+            Ok(()) => rearm_sink_drop_latch(&ORDER_SINK_DROP_LATCHED),
+            Err(err) => record_sink_drop("order", err_reason(&err), &ORDER_SINK_DROP_LATCHED),
         }
     }
 
@@ -326,8 +345,11 @@ impl GrowwPushCapture {
         let Some(tx) = self.positions.as_ref() else {
             return;
         };
-        if let Err(err) = tx.try_send(record) {
-            record_sink_drop("position", err_reason(&err));
+        match tx.try_send(record) {
+            Ok(()) => rearm_sink_drop_latch(&POSITION_SINK_DROP_LATCHED),
+            Err(err) => {
+                record_sink_drop("position", err_reason(&err), &POSITION_SINK_DROP_LATCHED);
+            }
         }
     }
 }
@@ -340,9 +362,37 @@ fn err_reason<T>(err: &mpsc::error::TrySendError<T>) -> &'static str {
     }
 }
 
+/// Per-channel sink-drop episode latches (review round 1 LOW / Fix 6 —
+/// audit-findings Rule 4 edge discipline): the FIRST refused publish of an
+/// episode logs the coded `error!`; every subsequent drop in the same
+/// episode is counted-only (`debug!`). A successful publish on the same
+/// channel re-arms the latch, so the NEXT episode's first drop is loud
+/// again. Counters stay per-event (the trend is never lost).
+static ORDER_SINK_DROP_LATCHED: AtomicBool = AtomicBool::new(false);
+static POSITION_SINK_DROP_LATCHED: AtomicBool = AtomicBool::new(false);
+
+/// Re-arm a sink-drop latch on the falling edge (a successful publish).
+fn rearm_sink_drop_latch(latch: &AtomicBool) {
+    if latch.load(Ordering::Relaxed) {
+        latch.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Count + code one refused capture publish (ORDER-EVT-01 `sink_drop`).
-fn record_sink_drop(channel: &'static str, reason: &'static str) {
+/// Edge-latched per channel: `error!` on the episode's first drop only.
+fn record_sink_drop(channel: &'static str, reason: &'static str, latch: &AtomicBool) {
     metrics::counter!("tv_order_update_events_dropped_total", "reason" => reason).increment(1);
+    if latch.swap(true, Ordering::Relaxed) {
+        debug!(
+            stage = "sink_drop",
+            feed = "groww",
+            channel,
+            reason,
+            "push-event capture row dropped ({channel}, {reason}) — episode already \
+             reported; counted only"
+        );
+        return;
+    }
     error!(
         code = ErrorCode::OrderEvt01PersistFailed.code_str(),
         stage = "sink_drop",
@@ -358,6 +408,23 @@ fn record_sink_drop(channel: &'static str, reason: &'static str) {
 mod tests {
     use super::super::proto::{OrderDetailUpdate, PositionInfo, StageAndTimeStamp, SymbolInfo};
     use super::*;
+
+    /// Review round 1 Fix 1: the construction-gating accessors mirror
+    /// channel liveness exactly — a disabled capture reports both gates
+    /// off (producers then skip record construction entirely), a live
+    /// capture reports both on.
+    #[test]
+    fn test_orders_enabled_and_positions_enabled_mirror_channel_liveness() {
+        let disabled = GrowwPushCapture::disabled();
+        assert!(!disabled.orders_enabled());
+        assert!(!disabled.positions_enabled());
+
+        let (order_tx, _order_rx) = mpsc::channel(1);
+        let (position_tx, _position_rx) = mpsc::channel(1);
+        let live = GrowwPushCapture::new(order_tx, position_tx);
+        assert!(live.orders_enabled());
+        assert!(live.positions_enabled());
+    }
 
     fn sample_detail() -> OrderDetailUpdate {
         OrderDetailUpdate {
@@ -418,14 +485,41 @@ mod tests {
     #[test]
     fn test_build_groww_order_event_record_maps_every_detail_field() {
         let dto = sample_dto();
+        // EXHAUSTIVE destructure (no `..`) — the Dhan completeness-test
+        // pattern (`test_dhan_order_update_record_covers_every_field`): a
+        // NEW OrderDetailUpdate field fails this test at compile time until
+        // its capture mapping is asserted here (review round 1 Fix 7).
+        let OrderDetailUpdate {
+            qty,
+            price_paise,
+            trigger_price_paise,
+            filled_qty,
+            remaining_qty,
+            avg_fill_price_paise,
+            groww_order_id,
+            exchange_order_id,
+            order_status,
+            duration,
+            exchange,
+            segment,
+            product,
+            order_type,
+            buy_sell,
+            remark,
+            contract_id,
+            gui_order_id,
+        } = dto.order_detail.clone().unwrap_or_else(|| {
+            panic!("sample dto must carry an order detail");
+        });
         let rec = build_groww_order_event_record(&dto, 123).unwrap_or_else(|| {
             panic!("record expected");
         });
         assert_eq!(rec.ts_ist_nanos, 123);
         assert_eq!(rec.feed, Feed::Groww);
         assert!(rec.event_seq >= 1);
+        assert_eq!(rec.order_id, groww_order_id);
         assert_eq!(rec.order_id, "GMK1234567890");
-        assert_eq!(rec.exch_order_id, "1100000012345678");
+        assert_eq!(rec.exch_order_id, exchange_order_id);
         assert_eq!(rec.correlation_id, "");
         assert_eq!(rec.status, "FILLED");
         assert_eq!(rec.raw_status, "EXECUTED");
@@ -437,18 +531,19 @@ mod tests {
         assert_eq!(rec.exchange, "NSE");
         assert_eq!(rec.exchange_segment, "FNO");
         assert_eq!(rec.security_id, -1);
-        assert_eq!(rec.symbol, "NIFTY25JAN25000CE");
-        assert_eq!(rec.quantity, 50);
+        assert_eq!(rec.symbol, contract_id);
+        assert_eq!(rec.quantity, i64::from(qty));
         assert_eq!(rec.disclosed_qty, -1);
-        assert_eq!(rec.remaining_qty, 30);
-        assert_eq!(rec.traded_qty, 20);
+        assert_eq!(rec.remaining_qty, i64::from(remaining_qty));
+        assert_eq!(rec.traded_qty, i64::from(filled_qty));
+        assert!((rec.price - paise_to_rupees(price_paise)).abs() < 1e-9);
         assert!((rec.price - 12_345.0).abs() < 1e-9);
-        assert!((rec.trigger_price - 12_000.0).abs() < 1e-9);
-        assert!((rec.avg_traded_price - 12_344.0).abs() < 1e-9);
+        assert!((rec.trigger_price - paise_to_rupees(trigger_price_paise)).abs() < 1e-9);
+        assert!((rec.avg_traded_price - paise_to_rupees(avg_fill_price_paise)).abs() < 1e-9);
         assert!((rec.last_traded_price - 0.0).abs() < f64::EPSILON);
         // EXECUTED is not a reject-class status → reject_reason stays empty.
         assert_eq!(rec.reject_reason, "");
-        assert_eq!(rec.remarks, "ok");
+        assert_eq!(rec.remarks, remark);
         assert_eq!(rec.source, "push");
         assert_eq!(rec.off_mkt_flag, "");
         assert_eq!(rec.opt_type, "");
@@ -466,11 +561,25 @@ mod tests {
         assert_eq!(rec.exchange_time, "");
         assert_eq!(rec.exchange_ts_ms, -1);
         assert_eq!(rec.contract_id, "NIFTY25JAN25000CE");
-        assert_eq!(rec.gui_order_id, "gui-1");
+        assert_eq!(rec.gui_order_id, gui_order_id);
         assert_eq!(rec.stage_trail, "ACKED@34200000|EXECUTED@34200500");
-        assert!(rec.detail_raw.contains("order_status=6"));
-        assert!(rec.detail_raw.contains("price_paise=1234500"));
-        assert!(rec.detail_raw.contains("buy_sell=0"));
+        // Every RAW enum discriminant survives verbatim in detail_raw (the
+        // full-fidelity remainder) — uses the destructured bindings so the
+        // exhaustiveness above is also load-bearing.
+        assert!(
+            rec.detail_raw
+                .contains(&format!("order_status={order_status}"))
+        );
+        assert!(
+            rec.detail_raw
+                .contains(&format!("price_paise={price_paise}"))
+        );
+        assert!(rec.detail_raw.contains(&format!("buy_sell={buy_sell}")));
+        assert!(rec.detail_raw.contains(&format!("duration={duration}")));
+        assert!(rec.detail_raw.contains(&format!("exchange={exchange}")));
+        assert!(rec.detail_raw.contains(&format!("segment={segment}")));
+        assert!(rec.detail_raw.contains(&format!("product={product}")));
+        assert!(rec.detail_raw.contains(&format!("order_type={order_type}")));
     }
 
     #[test]
