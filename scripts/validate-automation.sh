@@ -92,8 +92,11 @@ run_check "observability_chain_e2e" \
 # migration. Their checks are removed here so the sweep reflects reality.
 run_check "tickvault_logs_mcp_guard" \
     cargo test -p tickvault-common --test tickvault_logs_mcp_guard
-run_check "claude_triage_lambda_guard" \
-    cargo test -p tickvault-common --test claude_triage_lambda_guard
+# NOTE (2026-07-18 de-stale): claude_triage_lambda_guard was DELETED in the
+# Rust-only purge Phase 1 — the claude-triage Lambda scaffold it pinned
+# (deploy/aws/lambda/claude-triage/ + claude-triage-lambda.tf, wired-disabled,
+# never opted in) was removed; its check is removed here so the sweep
+# reflects reality. The LOCAL triage loop (.claude/triage/) is unaffected.
 run_check "loki_alloy_profile_guard" \
     cargo test -p tickvault-common --test loki_alloy_profile_guard
 run_check "runbook_cross_link_guard" \
