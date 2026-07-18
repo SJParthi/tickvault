@@ -3145,10 +3145,10 @@ pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 ///
 /// Archived segments are POST-confirmed-replay copies: their frames were
 /// re-injected into the live pipeline AND durably persisted before
-/// `confirm_replayed` moved them out of `replaying/`. The only reader of
-/// `archive/` after that point is the same-day 15:40 IST tick-conservation
-/// audit (`count_frames_for_ist_day`), which counts frames for the CURRENT
-/// day only (with a 3-day segment-creation pre-filter) — so even 2 days
+/// `confirm_replayed` moved them out of `replaying/`. No reader depends on
+/// aged archive segments (the last — the same-day 15:40 IST
+/// tick-conservation audit's current-day-only scan — retired 2026-07-18
+/// with the audit, the dead-WS sweep follow-up) — so even 2 days
 /// was audit-safe. 7 days is chosen instead (F3) because the archive is
 /// ALSO the only remaining copy for the documented confirm-on-channel
 /// residual (`confirm_replayed` archives on frames-IN-CHANNEL, not
