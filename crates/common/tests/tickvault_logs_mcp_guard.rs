@@ -139,13 +139,39 @@ fn launcher_exists_executable_and_rust_only() {
         );
     }
     let src = load_text(LAUNCHER_SH);
+    // 2026-07-18 review MED-1 hardening: comment-strip the launcher
+    // source before pinning the launch lines — the pre-hardening
+    // substring asserts were satisfiable by the launcher's HEADER
+    // COMMENT alone (a deleted exec line with the comment intact still
+    // passed). Whole-line `#` comments are stripped; the `#!` shebang
+    // is kept (it is code, not commentary).
+    let code: String = src
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') || t.starts_with("#!")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        src.contains("release/tickvault-logs-mcp"),
-        "launcher must prefer the prebuilt release binary"
+        code.contains("release/tickvault-logs-mcp"),
+        "launcher must prefer the prebuilt release binary (in CODE, not a comment)"
     );
     assert!(
-        src.contains("cargo run --release -q -p tickvault-logs-mcp"),
-        "launcher must fall back to cargo run --release (build-on-first-use)"
+        code.contains("exec \"$BIN\""),
+        "launcher must exec the prebuilt binary via `exec \"$BIN\"` (in CODE, \
+         not a comment)"
+    );
+    assert!(
+        code.contains("exec cargo run --release -q -p tickvault-logs-mcp"),
+        "launcher must fall back to `exec cargo run --release` \
+         (build-on-first-use) in CODE, not a comment"
+    );
+    assert!(
+        code.contains("no launch path executed"),
+        "launcher must keep the fail-loud safety tail (`no launch path \
+         executed` + exit 1) after the final exec — it catches any future \
+         deletion/regression of the exec lines"
     );
     assert!(
         !src.to_ascii_lowercase().contains("python"),

@@ -24,3 +24,4 @@ if [ -x "$BIN" ]; then
     exec "$BIN" "$@"
 fi
 exec cargo run --release -q -p tickvault-logs-mcp -- "$@"
+echo "tickvault-logs-launch: FATAL - no launch path executed" >&2; exit 1
