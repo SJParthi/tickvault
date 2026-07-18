@@ -11,7 +11,7 @@
 //! 10,000 calls.
 //!
 //! Budget: ≤ 1 KiB / ≤ 8 blocks across the whole measured region — the
-//! same class as `dhat_feed_presence.rs` / `dhat_feed_lag_ring.rs` (the
+//! same class as `dhat_feed_presence.rs` (the
 //! loop delta itself must be 0 allocations; the budget headroom absorbs
 //! only cross-thread phantom noise per dhat_support).
 //!

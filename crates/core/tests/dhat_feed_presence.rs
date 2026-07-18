@@ -15,7 +15,8 @@
 //! profiler window; the out-of-session arm returns before any lookup.
 //!
 //! Budget: ≤ 1 KiB / ≤ 8 blocks across 10,000 calls — same class as
-//! `dhat_feed_lag_ring.rs`.
+//! `dhat_moneyness.rs` (the former `dhat_feed_lag_ring.rs` peer was
+//! deleted 2026-07-17 with the dead Dhan-lag ring).
 //!
 //! CI ENFORCEMENT: deliberately UN-gated (no `#![cfg(feature = "dhat")]`)
 //! — the house pattern — so the normal Test (core) nextest lane runs it on

@@ -415,22 +415,29 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // tv_groww_exchange_lag_p99_seconds — and ADDED tv_rest_1m_fire_heartbeat
     // (the re-pointed market-hours liveness alarm's per-fire gauge). Net
     // -3 series; dated note in aws-budget.md (COST NOTE 2026-07-15).
+    // 17 (was 19) since 2026-07-17 (dashboard tidy): REMOVED the 2 Dhan lag
+    // names — tv_dhan_exchange_lag_p99_seconds +
+    // tv_dhan_lag_samples_excluded_total — their only emit sites (the Dhan
+    // lag ring/publisher half of feed_lag_monitor.rs) were deleted with the
+    // dead Dhan-lag chain (spawn sites + tick source died PR-C2 2026-07-13 /
+    // stage-2 sweep 2026-07-17). Cost: -2 custom metric series (~-$0.60/mo)
+    // — dated note in aws-budget.md (COST NOTE 2026-07-17).
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        19,
-        "Z+ L2 VERIFY ratchet: expected exactly 19 names in the MAIN EMF \
-         metric_selectors list (22 post-PR-C3 minus the 4 Groww-live names \
-         retired 2026-07-15 plus the tv_rest_1m_fire_heartbeat liveness \
-         gauge); found {}: {names:?}",
+        17,
+        "Z+ L2 VERIFY ratchet: expected exactly 17 names in the MAIN EMF \
+         metric_selectors list (19 post-2026-07-15 minus the 2 Dhan lag \
+         names retired 2026-07-17 with the dead Dhan-lag chain); \
+         found {}: {names:?}",
         names.len()
     );
     for required in [
         "tv_process_rss_bytes",
         "tv_subsystem_memory_estimated_bytes",
-        "tv_dhan_exchange_lag_p99_seconds",
-        "tv_dhan_lag_samples_excluded_total",
+        // tv_dhan_exchange_lag_p99_seconds + tv_dhan_lag_samples_excluded_total
+        // retired 2026-07-17 (dashboard tidy — dead Dhan-lag chain deleted).
         "tv_rest_1m_fire_heartbeat",
         // 2026-07-14 cluster-C order-side (dormant until cluster A / Phase-1):
         "tv_daily_pnl",
@@ -842,7 +849,9 @@ fn test_silent_feed_alarms_are_window_gated() {
     let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
     // PR-C2 (2026-07-13): realtime_guarantee_degraded left this list — the
     // alarm retired with the PARKed SLO publisher.
-    for name in ["boundary_catchup_storm_dhan", "dhan_exchange_lag_p99_high"] {
+    // 2026-07-17 (dashboard tidy): dhan_exchange_lag_p99_high left this
+    // list — retired with the dead Dhan-lag publisher chain.
+    for name in ["boundary_catchup_storm_dhan"] {
         let block = alarm_resource_block(&tf, name);
         assert!(
             block_has_attr(&block, "actions_enabled", "false"),
@@ -1105,10 +1114,17 @@ fn test_app_alarms_count_is_twenty_two() {
     // monitor the window gate kept arming daily. Cost: -1 alarm
     // (~-$0.10/mo) — dated notes in app-alarms.tf section 9 +
     // aws-budget.md (COST NOTE 2026-07-15).
+    // 10 (was 11) since 2026-07-17 (dashboard tidy): REMOVED
+    // tv_dhan_exchange_lag_p99_seconds (alarm
+    // tv-<env>-dhan-exchange-lag-p99-high) — its only publisher
+    // (run_dhan_lag_publisher, dormant since PR-C2) was deleted with the
+    // dead Dhan-lag chain, so the alarm was a permanently-missing-data
+    // dead monitor. Cost: -1 alarm (~-$0.10/mo) — dated notes in
+    // silent-feed-alarms.tf + aws-budget.md (COST NOTE 2026-07-17).
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 11,
-        "Z+ L2 VERIFY ratchet: expected exactly 11 app-level CloudWatch alarm \
+        count, 10,
+        "Z+ L2 VERIFY ratchet: expected exactly 10 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \
