@@ -91,7 +91,7 @@ drift/missing-tick problem against an independent second source.
 
 - **Exactly ≤2 Dhan WebSocket connections** (1 main-feed + 1 order-update). Groww does NOT add a Dhan connection. The `SubscriptionScope` enum, `effective_main_feed_pool_size`, the Dhan subscription planner, and `indices4only_scope_lock_guard.rs` are untouched.
 - **Dhan pipeline, tables, boot path** — not modified. Groww default-OFF ⇒ zero behaviour change until explicitly enabled.
-- **The resilience architecture is REUSED, never redesigned** — WAL frame spill (`ws_frame_spill.rs`), rescue ring (`TICK_BUFFER_CAPACITY`), disk spill (NDJSON), DLQ, tick processor, 1-minute aggregator. Groww plugs into these as a second producer; it does not change their design.
+- **The resilience architecture is REUSED, never redesigned** — WAL frame spill (`ws_frame_spill.rs`), rescue ring *(constant retired 2026-07-18 with the dead tick chain — stage-4 sweep)*, disk spill (NDJSON), DLQ, tick processor, 1-minute aggregator. Groww plugs into these as a second producer; it does not change their design.
 - **Composite uniqueness** `(security_id/symbol, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS on the SHARED tables, now extended with `feed` so multi-feed rows never collide (`ticks` key = `(ts, security_id, segment, capture_seq, feed)`).
 - **Indicators/strategies boundary** (daily-universe lock §28) — untouched. Groww is feed + 1m candles + parity check only; it drives NO strategy and places NO order (superseded for the GATED order-side build by §39, 2026-07-14 — the order-side is BUILT behind the 4-gate live-fire lattice; live fire still locked, §28 strategy wiring still frozen).
 
@@ -130,8 +130,9 @@ must update this rule file FIRST with a dated quote, only then can the PR land.
 When any PR / commit / Telegram for this work invokes "100% guarantee", qualify it exactly:
 
 > "100% inside the tested envelope, with ratcheted regression coverage: Groww feed reuses the
-> existing zero-tick-loss chain (ring → NDJSON spill → DLQ — `TICK_BUFFER_CAPACITY`, ratcheted
-> by `zero_tick_loss_alert_guard.rs`); Groww default OFF ⇒ Dhan-only behaviour is byte-identical;
+> existing zero-tick-loss chain (ring → NDJSON spill → DLQ — chain + constant retired 2026-07-18
+> with the dead tick chain, stage-4 sweep; the live absorption tier is the 200,000-seal ring,
+> `SEAL_BUFFER_CAPACITY`/`seal_ring.rs`); Groww default OFF ⇒ Dhan-only behaviour is byte-identical;
 > per-feed enable/disable is an O(1) boot-time config read + per-feed pipeline isolation; the
 > live-vs-backtest parity check is an EXACT 1-minute OHLCV compare that NAMES every mismatched
 > minute (never a false 'all match' on an empty/partial set, per audit Rule 11). Groww's

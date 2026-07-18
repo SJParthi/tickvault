@@ -169,9 +169,19 @@ check_cargo_test P "Metrics catalog no-drift" \
 # operator_health_dashboard_guard were DELETED in the CloudWatch-only migration
 # (Prometheus/Alertmanager/Grafana removed, #O1/#O2/#O3). Their audit rows are
 # removed so the 100% board reflects reality.
-check_cargo_test P "Zero-tick-loss alert guard" \
-    tickvault-storage zero_tick_loss_alert_guard \
-    "crates/storage/tests/zero_tick_loss_alert_guard.rs"
+# 2026-07-18 (stage-4 dead-producer sweep): zero_tick_loss_alert_guard was
+# DELETED with the tick rescue ring + TICK_BUFFER_CAPACITY (tick writer died
+# in the stage-2 sweep 2026-07-17). Re-pointed to the LIVE absorption-tier
+# ratchet: the seal-ring lib suite (SEAL_BUFFER_CAPACITY L-C1 lock, incl.
+# test_seal_buffer_capacity_constant_is_locked_value). Inline because
+# check_cargo_test only handles --test integration targets.
+if cargo test -p tickvault-trading --offline --lib candles::seal_ring --quiet > /tmp/100pct-audit-$$.log 2>&1; then
+    record P PASS "Seal-ring capacity ratchet (SEAL_BUFFER_CAPACITY)" \
+        "crates/trading/src/candles/seal_ring.rs (lib tests)"
+else
+    record P GAP "Seal-ring capacity ratchet (SEAL_BUFFER_CAPACITY)" \
+        "test failed: cargo test -p tickvault-trading --lib candles::seal_ring (see /tmp/100pct-audit-$$.log)"
+fi
 
 check_cargo_test P "Triage rules schema guard" \
     tickvault-common triage_rules_guard \
@@ -281,8 +291,11 @@ fi
 # =============================================================================
 # LAYERED ASYMPTOTIC (L — defense in depth, NOT absolute)
 # =============================================================================
-record L PASS "Zero tick loss (asymptotic)" \
-    "Layers: WS reconnect<2s + spill-to-disk + replay-on-recovery + DEDUP + tv_ticks_dropped_total alert + daily cross-check. NOT absolute — upstream network CAN drop packets."
+# 2026-07-18 truth-sync: the tv_ticks_dropped_total alert + tick rescue ring
+# retired with the dead tick writer (stage-2/4 sweeps); the live defense is
+# the candle-side seal chain.
+record L PASS "Zero data loss (asymptotic)" \
+    "Layers: seal ring (SEAL_BUFFER_CAPACITY 200K) -> NDJSON spill -> DLQ + DEDUP-idempotent replay + AGGREGATOR-DROP-01 pagers (errcode log-filter alarm + tv-<env>-seal-writer-dropped counter alarm). NOT absolute — upstream vendor CAN omit data."
 
 record L PASS "Zero WS disconnect (asymptotic)" \
     "Layers: 5 conns/pool + state machine + ping/pong + auto-reconnect + DATA-805 handler + kill-switch on cascade. NOT absolute — Dhan CAN send code 50."
