@@ -367,6 +367,7 @@ All images pinned with SHA256 digest. Config in `deploy/docker/docker-compose.ym
 ## ENFORCEMENT RULES
 
 Auto-loaded `.claude/rules/` files by directory:
+*(2026-07-18: per-path loading is real only for files carrying `paths:` frontmatter; this PR added it to all dhan/ + runbook-class project files — see rules-diet-2026-07-18.md.)*
 
 ### Dhan API rules (21 files in `dhan/`)
 | Rule File | Enforces |

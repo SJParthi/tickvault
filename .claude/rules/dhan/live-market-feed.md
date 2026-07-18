@@ -1,3 +1,18 @@
+---
+paths:
+  - "crates/core/src/parser/*.rs"
+  - "crates/core/src/websocket/*.rs"
+  - "crates/core/src/pipeline/tick_processor.rs"
+  - "crates/core/src/pipeline/candle_aggregator.rs"
+  - "crates/common/src/constants.rs"
+  - "crates/common/src/tick_types.rs"
+  - "crates/storage/src/tick_persistence.rs"
+  - "crates/core/tests/websocket_protocol_e2e.rs"
+  - "crates/core/tests/parser_pipeline.rs"
+  - "crates/core/tests/snapshot_parser.rs"
+  - "crates/core/benches/tick_parser.rs"
+---
+
 # Dhan Live Market Feed WebSocket Enforcement
 
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`

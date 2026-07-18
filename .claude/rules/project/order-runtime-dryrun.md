@@ -1,3 +1,15 @@
+---
+paths:
+  - "crates/app/src/order_runtime.rs"
+  - "crates/app/src/oms_wiring.rs"
+  - "crates/app/src/dhan_rest_stack.rs"
+  - "crates/trading/src/oms/engine.rs"
+  - "crates/trading/src/oms/types.rs"
+  - "crates/trading/src/risk/engine.rs"
+  - "crates/common/src/config.rs"
+  - "config/base.toml"
+---
+
 # Dry-Run Order Runtime — Error Codes, Socket-Free Shape & Pre-Live Follow-Ups
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
