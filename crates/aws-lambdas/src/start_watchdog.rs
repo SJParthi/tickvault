@@ -126,26 +126,6 @@ pub fn is_within_operating_hours(now_utc: DateTime<Utc>) -> bool {
     (OPERATING_OPEN_IST_MINUTES..OPERATING_CLOSE_IST_MINUTES).contains(&minutes)
 }
 
-/// Expand a python-3.11+-accepted HOUR-only ISO time ("2026-07-03T06",
-/// "2026-07-03 06+05:30") into minute precision ("…T06:00…") so the chrono
-/// format ladder can parse it. Returns None when the shape is not the
-/// hour-only pattern (date + separator + exactly 2 hour digits, then end
-/// or an offset start) — the caller falls through with the original string.
-fn expand_hour_only_time(raw: &str) -> Option<String> {
-    let bytes = raw.as_bytes();
-    if bytes.len() < 13 || !(bytes[10] == b'T' || bytes[10] == b' ') {
-        return None;
-    }
-    if !(bytes[11].is_ascii_digit() && bytes[12].is_ascii_digit()) {
-        return None;
-    }
-    match bytes.get(13) {
-        None => Some(format!("{raw}:00")),
-        Some(b'+' | b'-' | b'Z' | b'z') => Some(format!("{}:00{}", &raw[..13], &raw[13..])),
-        Some(_) => None,
-    }
-}
-
 /// True when chrono parsed a leap-second time (`:60`), which it represents
 /// as `nanosecond() >= 1_000_000_000`. Python `fromisoformat` REJECTS
 /// second=60 ("ValueError: second must be in 0..59" — oracle-verified), so
@@ -154,75 +134,221 @@ fn is_chrono_leap_second(nanos: u32) -> bool {
     nanos >= 1_000_000_000
 }
 
+/// A shape-validated, canonicalized keep-alive timestamp, produced by
+/// [`normalize_keep_alive_shape`] and consumed by
+/// [`parse_keep_alive_timestamp`].
+enum KeepAliveShape {
+    /// Bare `YYYY-MM-DD` — midnight IST (the operator's date-only paste).
+    DateOnly,
+    /// `YYYY-MM-DDTHH:MM:SS[.ffffff]` — naive, interpreted as IST.
+    Naive(String),
+    /// `YYYY-MM-DDTHH:MM:SS[.ffffff]+HH:MM` — offset-aware.
+    Aware(String),
+}
+
+/// Strict shape gate + canonicalizer for the keep-alive timestamp.
+///
+/// This runs BEFORE any chrono call so that chrono's lenient parsing can
+/// never accept a shape python `fromisoformat` rejects: chrono numeric
+/// fields match 1..=2 digits (python requires exactly 2 — "…T6:00" must
+/// reject), `parse_from_rfc3339` tolerates lowercase `z` (python rejects
+/// it — review finding G1-1), and `%z` has its own leniencies. The gate
+/// enforces exact digit counts and an UPPERCASE-`Z`-only designator, then
+/// emits a fully-canonical string (`T` separator, minute/second expanded
+/// to `:00`, fraction truncated to 6 digits, offset as `+HH:MM`) that the
+/// caller parses with a single strict chrono format per shape.
+///
+/// Accepted grammar (python-accept subset, oracle-verified 2026-07-18):
+/// - date: extended `YYYY-MM-DD` only
+/// - separator: ANY single character (python 3.11+ accepts any single
+///   unicode char — `t`, `x`, even a digit; all oracle-verified)
+/// - time: `HH`, `HH:MM`, `HH:MM:SS`, `HH:MM:SS.f{1,}` (dot only; the
+///   fraction keeps its first 6 digits — python truncates to microseconds)
+/// - offset: none, `Z` (uppercase only), `[+-]HH`, `[+-]HH:MM`, `[+-]HHMM`
+///   (offset minutes must be <= 59; hour range is value-checked by chrono)
+fn normalize_keep_alive_shape(raw: &str) -> Option<KeepAliveShape> {
+    fn two_digits(b: &[u8], at: usize) -> bool {
+        b.len() >= at + 2 && b[at].is_ascii_digit() && b[at + 1].is_ascii_digit()
+    }
+    let b = raw.as_bytes();
+    // Extended-format date: YYYY-MM-DD. (Basic "20260703" is a documented
+    // fail-closed divergence — see `parse_keep_alive_timestamp`.)
+    if b.len() < 10
+        || !b[..4].iter().all(u8::is_ascii_digit)
+        || b[4] != b'-'
+        || !two_digits(b, 5)
+        || b[7] != b'-'
+        || !two_digits(b, 8)
+    {
+        return None;
+    }
+    // Python's MINYEAR is 1 — fromisoformat rejects year 0000
+    // (oracle-verified); chrono would happily parse it. Fail closed.
+    if b[..4] == *b"0000" {
+        return None;
+    }
+    if b.len() == 10 {
+        return Some(KeepAliveShape::DateOnly);
+    }
+    // Consume ONE separator character (any single char — python parity;
+    // multi-byte safe) and normalize it to 'T' in the canonical output.
+    let time = {
+        let mut chars = raw[10..].chars();
+        let _sep = chars.next()?;
+        chars.as_str()
+    };
+    let tb = time.as_bytes();
+    if !two_digits(tb, 0) {
+        return None;
+    }
+    let hour = &time[..2];
+    let mut i = 2usize;
+    let (mut minute, mut second) = ("00", "00");
+    let mut fraction = "";
+    if tb.get(i) == Some(&b':') {
+        if !two_digits(tb, i + 1) {
+            return None;
+        }
+        minute = &time[i + 1..i + 3];
+        i += 3;
+        if tb.get(i) == Some(&b':') {
+            if !two_digits(tb, i + 1) {
+                return None;
+            }
+            second = &time[i + 1..i + 3];
+            i += 3;
+            if tb.get(i) == Some(&b'.') {
+                let start = i + 1;
+                let mut j = start;
+                while j < tb.len() && tb[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j == start {
+                    // Bare trailing dot ("06:00:00.") — python rejects too.
+                    return None;
+                }
+                // Python truncates fractional seconds to microseconds;
+                // keep exactly the first 6 digits for value parity (G1-3).
+                fraction = &time[start..(start + 6).min(j)];
+                i = j;
+            }
+        }
+    }
+    // Offset: '' (naive), 'Z' (UPPERCASE only — python rejects a lowercase
+    // 'z' designator in every shape, oracle-verified; G1-1), or a sign
+    // followed by HH / HH:MM / HHMM. Anything else rejects the whole input.
+    let offset = &time[i..];
+    let canonical_offset = match offset.as_bytes() {
+        [] => None,
+        [b'Z'] => Some("+00:00".to_string()),
+        [sign @ (b'+' | b'-'), ..] => {
+            let sign = *sign as char;
+            let digits = &offset[1..];
+            let db = digits.as_bytes();
+            let (oh, om) = if db.len() == 2 && two_digits(db, 0) {
+                (&digits[..2], "00")
+            } else if db.len() == 4 && db.iter().all(u8::is_ascii_digit) {
+                (&digits[..2], &digits[2..4])
+            } else if db.len() == 5 && db[2] == b':' && two_digits(db, 0) && two_digits(db, 3) {
+                (&digits[..2], &digits[3..5])
+            } else {
+                return None;
+            };
+            // Fail-closed divergence: python OVERFLOWS offset minutes >= 60
+            // into hours ("+05:99" -> +06:39, oracle-verified); we refuse.
+            if om.parse::<u32>().ok()? >= 60 {
+                return None;
+            }
+            Some(format!("{sign}{oh}:{om}"))
+        }
+        _ => return None,
+    };
+    let date = &raw[..10];
+    let mut canon = format!("{date}T{hour}:{minute}:{second}");
+    if !fraction.is_empty() {
+        canon.push('.');
+        canon.push_str(fraction);
+    }
+    Some(match canonical_offset {
+        None => KeepAliveShape::Naive(canon),
+        Some(off) => {
+            canon.push_str(&off);
+            KeepAliveShape::Aware(canon)
+        }
+    })
+}
+
 /// Python `datetime.fromisoformat(raw)` + naive-as-IST interpretation.
-/// Accepts an offset-aware ISO timestamp (seconds, minute, or hour
-/// precision), a naive `YYYY-MM-DD[T ]HH[:MM[:SS[.f]]]` (interpreted as
-/// IST — the operator's plain local paste), or a bare date.
-/// Garbage -> None (the guard stays armed — budget protection wins).
+/// Accepts an offset-aware ISO timestamp (fraction, second, minute, or
+/// hour precision), a naive `YYYY-MM-DD[<sep>]HH[:MM[:SS[.f]]]`
+/// (interpreted as IST — the operator's plain local paste), or a bare
+/// date. Garbage -> None (the guard stays armed — budget protection wins).
+///
+/// The strict shape gate ([`normalize_keep_alive_shape`]) canonicalizes
+/// the input BEFORE any chrono call, so chrono leniencies (1-digit numeric
+/// fields, lowercase `z` in RFC3339, `%z` quirks) can never accept a shape
+/// python rejects. Chrono then does VALUE validation only (month 13,
+/// Feb 30, hour 24, second 61, offset magnitude >= 24h all reject —
+/// oracle-parity), plus the explicit leap-second (`:60`) rejection.
+///
+/// # Deliberate divergences from python fromisoformat (fail-closed)
+///
+/// Python 3.12 (the lambda runtime) ACCEPTS all of the following shapes;
+/// this parser REJECTS them (None -> the curfew guard stays armed, i.e.
+/// every divergence is in the budget-safe direction). Each was
+/// oracle-verified against python3.12 on 2026-07-18 via an exhaustive
+/// differential sweep (separators x precisions x suffixes grid):
+/// - comma fractional-second separator ("…06:00:00,5")
+/// - ISO basic-format dates/times ("20260703", "20260703T060708",
+///   "2026-07-03T060708", "20260703T06:07:08" and other mixed forms)
+/// - ISO week dates ("2026-W27-5", "2026-W27-5T06:07:08")
+/// - fractional hours and minutes ("…06.5", "…06:07.5" — python reads
+///   06:30:00 / 06:07:30)
+/// - offsets with a seconds component ("+05:30:00", "+053015",
+///   "+05:30:00.123456")
+/// - offset minutes >= 60 ("+05:99" — python overflows to +06:39)
+/// - a space between the time and the offset ("…06:00:00 +05:30") — and in
+///   fact ANY single character there ("…06:07:08xZ"): CPython reuses its
+///   any-separator rule between the time and the tzinfo part
+/// - an empty fraction directly before an offset ("…06:07:08.Z")
+/// - fractional-second precision beyond what chrono's grammar shares with
+///   python is NOT a divergence: both truncate — python to 6 digits
+///   natively, this parser by keeping the first 6 fraction digits (G1-3:
+///   the previous nanosecond-preserving behavior is replaced with exact
+///   microsecond parity).
 pub fn parse_keep_alive_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
-        if is_chrono_leap_second(dt.nanosecond()) {
-            return None;
+    match normalize_keep_alive_shape(raw)? {
+        KeepAliveShape::DateOnly => {
+            let naive = NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))?;
+            ist()
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc))
         }
-        return Some(dt.with_timezone(&Utc));
-    }
-    // Python 3.11+ fromisoformat (the lambda runtime is python3.12) accepts
-    // HOUR-only times ("2026-07-03T06", with or without an offset) —
-    // oracle-verified. chrono has no hour-only arm that defaults the minute,
-    // so expand "…THH" to "…THH:00" and fall through the same ladder.
-    let expanded = expand_hour_only_time(raw);
-    let raw = expanded.as_deref().unwrap_or(raw);
-    // chrono's `%z` does not accept the trailing `Z` python fromisoformat
-    // does ("2026-07-03T06:00Z" — oracle-verified); normalize it to an
-    // explicit +00:00 offset. (Seconds-precision `…SSZ` was already handled
-    // by the RFC3339 arm above, so this only serves the short forms.)
-    let zulu = raw
-        .strip_suffix(['Z', 'z'])
-        .map(|head| format!("{head}+00:00"));
-    let raw = zulu.as_deref().unwrap_or(raw);
-    // Python fromisoformat also accepts offsets without a colon (+0530), a
-    // trailing Z, a space separator, and MINUTE-precision times without
-    // seconds ("2026-07-03T06:00" — oracle-verified on python3.12); tolerate
-    // all of these forms.
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%S%.f%z",
-        "%Y-%m-%d %H:%M:%S%.f%z",
-        "%Y-%m-%dT%H:%M%z",
-        "%Y-%m-%d %H:%M%z",
-    ] {
-        if let Ok(dt) = DateTime::parse_from_str(raw, fmt) {
+        KeepAliveShape::Naive(canon) => {
+            // Operator wrote a naive local (IST) timestamp.
+            let naive = NaiveDateTime::parse_from_str(&canon, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .filter(|dt| !is_chrono_leap_second(dt.nanosecond()))?;
+            ist()
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc))
+        }
+        KeepAliveShape::Aware(canon) => {
+            let dt = DateTime::parse_from_str(&canon, "%Y-%m-%dT%H:%M:%S%.f%z").ok()?;
             if is_chrono_leap_second(dt.nanosecond()) {
                 return None;
             }
-            return Some(dt.with_timezone(&Utc));
+            Some(dt.with_timezone(&Utc))
         }
     }
-    let naive = [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M",
-    ]
-    .iter()
-    .find_map(|fmt| {
-        NaiveDateTime::parse_from_str(raw, fmt)
-            .ok()
-            .filter(|dt| !is_chrono_leap_second(dt.nanosecond()))
-    })
-    .or_else(|| {
-        NaiveDate::parse_from_str(raw, "%Y-%m-%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-    })?;
-    // Operator wrote a naive local (IST) timestamp.
-    ist()
-        .from_local_datetime(&naive)
-        .single()
-        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Python `(dt + IST_OFFSET).strftime("%I:%M %p").lstrip("0")` — 12-hour IST
@@ -1513,6 +1639,146 @@ mod tests {
             "2026-06-30 23:59:60.5",
         ] {
             assert_eq!(parse_keep_alive_timestamp(garbage), None, "{garbage:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_keep_alive_accepted_parity_vectors_match_python_oracle() {
+        // Differential-sweep ACCEPTED-PARITY set (python3.12 oracle,
+        // 2026-07-18): every shape below is accepted by BOTH python
+        // fromisoformat and this parser, with identical values.
+        let ist_0030_utc = utc(2026, 7, 3, 0, 30);
+        for accepted in [
+            // Any single separator char (python 3.11+ rule) — lowercase
+            // 't', 'x', even a digit — all normalize to the same instant.
+            "2026-07-03t06:00",
+            "2026-07-03x06:00",
+            "2026-07-03606:00",
+        ] {
+            assert_eq!(
+                parse_keep_alive_timestamp(accepted),
+                Some(ist_0030_utc),
+                "{accepted:?}"
+            );
+        }
+        // Hour-only offset "+05" (python reads +05:00).
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06:00:00+05"),
+            Some(utc(2026, 7, 3, 1, 0))
+        );
+        // Basic 4-digit offset without a colon, negative sign.
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06:00:00-0530"),
+            Some(utc(2026, 7, 3, 11, 30))
+        );
+        // "-0000" == UTC (python-accepted; RFC3339 would reject it).
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06:00:00-0000"),
+            Some(utc(2026, 7, 3, 6, 0))
+        );
+        // Bare date -> midnight IST == 18:30 UTC the previous day.
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03"),
+            Some(utc(2026, 7, 2, 18, 30))
+        );
+    }
+
+    #[test]
+    fn test_parse_keep_alive_fraction_truncates_to_microseconds_like_python() {
+        // G1-3: python truncates fractional seconds to microseconds
+        // (".9999999" -> .999999, ".123456789012" -> .123456 —
+        // oracle-verified 2026-07-18). This parser keeps exactly the first
+        // 6 fraction digits so the values match python EXACTLY (the
+        // previous nanosecond-preserving behavior diverged sub-micro).
+        let expect = ist()
+            .with_ymd_and_hms(2026, 7, 3, 6, 0, 0)
+            .unwrap()
+            .with_nanosecond(999_999_000)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06:00:00.9999999"),
+            Some(expect)
+        );
+        let expect = utc(2026, 7, 3, 6, 0).with_nanosecond(123_456_000).unwrap();
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03T06:00:00.123456789012Z"),
+            Some(expect)
+        );
+    }
+
+    #[test]
+    fn test_parse_keep_alive_lowercase_z_rejected_like_python() {
+        // G1-1: python fromisoformat REJECTS a lowercase 'z' designator in
+        // EVERY shape (oracle-verified 2026-07-18) — chrono's RFC3339 arm
+        // and the old ['Z', 'z'] normalization used to accept these four,
+        // silently suppressing the curfew. The shape gate now refuses them
+        // before any chrono call.
+        for lower_z in [
+            "2026-07-03T06:00:00z",
+            "2026-07-03T06:00z",
+            "2026-07-03T06z",
+            "2026-07-03 06:00z",
+            "2026-07-03T06:00:00.5z",
+        ] {
+            assert_eq!(parse_keep_alive_timestamp(lower_z), None, "{lower_z:?}");
+        }
+        // The SEPARATOR position still accepts 'z' (python accepts any
+        // single separator char there — parity, not a designator).
+        assert_eq!(
+            parse_keep_alive_timestamp("2026-07-03z06:00"),
+            Some(utc(2026, 7, 3, 0, 30))
+        );
+    }
+
+    #[test]
+    fn test_parse_keep_alive_python_rejected_shapes_stay_rejected() {
+        // Differential-sweep UNSAFE-DIRECTION set: python REJECTS all of
+        // these (oracle-verified 2026-07-18); accepting any of them would
+        // suppress the curfew on a shape the python lambda never honored.
+        // chrono's lenient 1..=2-digit numeric parsing (and year-0 support)
+        // would accept several without the strict shape gate.
+        for rejected in [
+            "2026-07-03T6:00",           // 1-digit hour
+            "2026-07-03T06:0",           // 1-digit minute
+            "2026-7-03T06:00",           // 1-digit month
+            "2026-07-3T06:00",           // 1-digit day
+            "126-07-03T06:00",           // 3-digit year
+            "02026-07-03T06:00",         // 5-digit year
+            "0000-01-01T00:00",          // python MINYEAR is 1
+            "2026-07-03T 06:00",         // space after the separator
+            "2026-07-03T06:00:00+5:30",  // 1-digit offset hour
+            "2026-07-03T06:00:00+24:00", // offset magnitude >= 24h
+            "2026-07-03T06:00:00.",      // bare trailing fraction dot
+        ] {
+            assert_eq!(parse_keep_alive_timestamp(rejected), None, "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_keep_alive_documented_failsafe_divergences_reject() {
+        // Deliberate fail-closed divergences: python3.12 ACCEPTS every
+        // shape below (oracle-verified 2026-07-18); this parser REJECTS
+        // them (None -> the curfew guard stays armed — the budget-safe
+        // direction). Full list on `parse_keep_alive_timestamp`'s doc.
+        for divergent in [
+            "2026-07-03T06:00:00,5",        // comma fraction
+            "20260703",                     // basic-format date
+            "20260703T060708",              // basic date+time
+            "2026-07-03T060708",            // basic time, extended date
+            "20260703T06:07:08",            // extended time, basic date
+            "2026-W27-5",                   // ISO week date
+            "2026-W27-5T06:07:08",          // ISO week date + time
+            "2026-07-03T06.5",              // fractional hour
+            "2026-07-03T06:07.5",           // fractional minute
+            "2026-07-03T06:00:00+05:30:00", // offset with seconds
+            "2026-07-03T06:00:00+053015",   // basic offset with seconds
+            "2026-07-03T06:00:00+05:99",    // offset minutes >= 60
+            "2026-07-03T06:00:00 +05:30",   // space before the offset
+            "2026-07-03T06:07:08xZ",        // arbitrary char before tz
+            "2026-07-03T06:07:08.Z",        // empty fraction before tz
+        ] {
+            assert_eq!(parse_keep_alive_timestamp(divergent), None, "{divergent:?}");
         }
     }
 
