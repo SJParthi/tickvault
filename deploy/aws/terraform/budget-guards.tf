@@ -39,6 +39,12 @@
 # ${path.module}/.lambda-zips/ before plan/apply; source_code_hash is a
 # digest of the Rust SOURCE (Rust builds are not bit-reproducible, so
 # hashing the zip would churn every build with zero source change).
+# 2026-07-18 (hostile-review r1 N3): a LOCAL operator `terraform plan`
+# requires running the CI build step's cargo-lambda command first (the
+# `file(".lambda-zips/source.digest")` reads fail otherwise) — CI-only
+# planning is the intended contract; and a toolchain/cargo-lambda version
+# bump alone does NOT change the digest (binaries redeploy on the next
+# source / Cargo.lock change). Applies to all four .lambda-zips lambdas.
 
 resource "aws_iam_role" "tv_daily_budget_digest" {
   name = "tv-prod-daily-budget-digest-role"

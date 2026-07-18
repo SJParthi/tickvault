@@ -475,6 +475,49 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
          checking the sample first (or enabling first) re-opens the raced \
          holiday false-page window"
     );
+    // 2026-07-18 (hostile-review r1 F2/M4): the pure-fn refactor made the
+    // plain token-order scan above VACUOUS on its own — the `if
+    // holiday_stop_today` / `if !instance_up` tokens live in the pure
+    // `open_decision` fn near the TOP of the file, so an unconditional
+    // `.enable_alarm_actions()` inserted in handle() right after client
+    // construction still ordered AFTER them and passed. Strengthened:
+    // (i) exactly ONE enable occurrence in the whole file (the close path
+    //     uses disable_alarm_actions) — an inserted second enable fails;
+    // (ii) the enable sits AFTER handle()'s `let decision = open_decision(`
+    //      call site — a moved/unconditional enable before the decision
+    //      fails;
+    // (iii) the NEAREST PRECEDING `OpenDecision::Enable =>` match-arm token
+    //       also sits after that call site — the enable can only live
+    //       inside the handle() decision match's Enable arm (the first
+    //       `OpenDecision::Enable =>` in the file belongs to the
+    //       open_result renderer and must NOT satisfy this).
+    let enable_count = rs.matches(".enable_alarm_actions()").count();
+    assert_eq!(
+        enable_count, 1,
+        "market_hours_gate.rs must carry exactly ONE .enable_alarm_actions() \
+         call (inside the OpenDecision::Enable match arm) — any additional \
+         occurrence is an unconditional-enable mutation re-opening the \
+         holiday false-page window"
+    );
+    let decision_call_pos = rs
+        .find("let decision = open_decision(")
+        .expect("handle() must route the open path through the pure open_decision fn"); // APPROVED: test
+    assert!(
+        decision_call_pos < enable_pos,
+        "the single .enable_alarm_actions() call must come AFTER handle()'s \
+         `let decision = open_decision(` call site — enabling before the \
+         decision is computed re-opens the holiday false-page window"
+    );
+    let enable_arm_pos = rs[..enable_pos]
+        .rfind("OpenDecision::Enable =>")
+        .expect("the enable call must be preceded by an OpenDecision::Enable match arm"); // APPROVED: test
+    assert!(
+        decision_call_pos < enable_arm_pos,
+        "the OpenDecision::Enable arm guarding .enable_alarm_actions() must \
+         belong to handle()'s decision match (after `let decision = \
+         open_decision(`), not the open_result renderer earlier in the file \
+         — otherwise the enable is not gated by the computed decision"
+    );
 }
 
 /// Round-3 review fix (2026-07-07): the holiday-stop marker chain. Every

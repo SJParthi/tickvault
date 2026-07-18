@@ -181,6 +181,44 @@ pub fn sum_amounts<'a, I: IntoIterator<Item = &'a str>>(amounts: I) -> Result<f6
     Ok(total)
 }
 
+/// Require a Cost Explorer response key — Python parity (hostile-review r1
+/// F4): the heredoc's `d['Total']['UnblendedCost']['Amount']` /
+/// `g['Keys'][0]` / `g['Metrics'][...]` chains RAISE KeyError/IndexError on
+/// any missing key, so the Lambda errors and its Errors metric fires. A
+/// silent skip here would render a false-OK ₹0 digest. Amount PARSE
+/// failures stay loud separately (`sum_amounts` + the by-service parse).
+pub fn require_key<T>(value: Option<T>, key: &str) -> Result<T, Error> {
+    value.ok_or_else(|| {
+        Error::from(format!(
+            "Cost Explorer response missing {key:?} (python KeyError parity — never a silent $0 digest)"
+        ))
+    })
+}
+
+/// Pull a day's `Total.UnblendedCost.Amount` string — errors loudly on any
+/// missing key (python KeyError parity, hostile-review r1 F4).
+pub fn day_unblended_amount(
+    day: &aws_sdk_costexplorer::types::ResultByTime,
+) -> Result<&str, Error> {
+    let total = require_key(day.total(), "Total")?;
+    let metric = require_key(total.get("UnblendedCost"), "Total.UnblendedCost")?;
+    require_key(metric.amount(), "Total.UnblendedCost.Amount")
+}
+
+/// Pull a group's `(Keys[0], Metrics.UnblendedCost.Amount)` pair — errors
+/// loudly on any missing key (python KeyError/IndexError parity,
+/// hostile-review r1 F4).
+pub fn group_service_amount(g: &aws_sdk_costexplorer::types::Group) -> Result<(&str, &str), Error> {
+    let svc = require_key(g.keys().first(), "Groups[].Keys[0]")?;
+    let metrics = require_key(g.metrics(), "Groups[].Metrics")?;
+    let metric = require_key(
+        metrics.get("UnblendedCost"),
+        "Groups[].Metrics.UnblendedCost",
+    )?;
+    let amount = require_key(metric.amount(), "Groups[].Metrics.UnblendedCost.Amount")?;
+    Ok((svc.as_str(), amount))
+}
+
 /// The success return — Python parity: `{'ok': True, 'mtd_usd': .., 'pct': ..}`.
 pub fn success_result(mtd_usd: f64, pct: f64) -> Value {
     json!({"ok": true, "mtd_usd": mtd_usd, "pct": pct})
@@ -244,13 +282,12 @@ async fn get_total(
         .metrics("UnblendedCost")
         .send()
         .await?;
-    let amounts: Vec<&str> = r
-        .results_by_time()
-        .iter()
-        .filter_map(|d| d.total())
-        .filter_map(|t| t.get("UnblendedCost"))
-        .filter_map(|m| m.amount())
-        .collect();
+    // Hostile-review r1 F4: missing keys ERROR loudly (python KeyError
+    // parity), never a silent skip into a false-OK ₹0 digest.
+    let mut amounts: Vec<&str> = Vec::with_capacity(r.results_by_time().len());
+    for day in r.results_by_time() {
+        amounts.push(day_unblended_amount(day)?);
+    }
     sum_amounts(amounts)
 }
 
@@ -277,20 +314,13 @@ async fn get_by_service(
     let mut out = Vec::new();
     for day in r.results_by_time() {
         for g in day.groups() {
-            let Some(svc) = g.keys().first() else {
-                continue;
-            };
-            let Some(amount) = g
-                .metrics()
-                .and_then(|m| m.get("UnblendedCost"))
-                .and_then(|m| m.amount())
-            else {
-                continue;
-            };
+            // Hostile-review r1 F4: missing Keys/Metrics keys ERROR loudly
+            // (python KeyError/IndexError parity), never a silent skip.
+            let (svc, amount) = group_service_amount(g)?;
             let usd = amount
                 .parse::<f64>()
                 .map_err(|e| Error::from(format!("bad Cost Explorer amount {amount:?}: {e}")))?;
-            out.push((svc.clone(), usd));
+            out.push((svc.to_string(), usd));
         }
     }
     Ok(out)
@@ -441,6 +471,76 @@ mod tests {
     #[test]
     fn test_sum_amounts_rejects_garbage_like_python_float() {
         assert!(sum_amounts(["1.5", "not-a-number"]).is_err());
+    }
+
+    #[test]
+    fn test_day_unblended_amount_missing_keys_error_loudly() {
+        use aws_sdk_costexplorer::types::{MetricValue, ResultByTime};
+        // Hostile-review r1 F4: a day with NO Total must ERROR (python
+        // KeyError parity), never silently skip into a false-OK ₹0.
+        let no_total = ResultByTime::builder().build();
+        assert!(day_unblended_amount(&no_total).is_err());
+        // Total present but the UnblendedCost metric missing also errors.
+        let wrong_metric = ResultByTime::builder()
+            .total("SomethingElse", MetricValue::builder().amount("1").build())
+            .build();
+        assert!(day_unblended_amount(&wrong_metric).is_err());
+        // Metric present but Amount missing also errors.
+        let no_amount = ResultByTime::builder()
+            .total("UnblendedCost", MetricValue::builder().build())
+            .build();
+        assert!(day_unblended_amount(&no_amount).is_err());
+    }
+
+    #[test]
+    fn test_day_unblended_amount_normal_shape_unchanged() {
+        use aws_sdk_costexplorer::types::{MetricValue, ResultByTime};
+        let day = ResultByTime::builder()
+            .total(
+                "UnblendedCost",
+                MetricValue::builder().amount("1.25").build(),
+            )
+            .build();
+        assert_eq!(day_unblended_amount(&day).unwrap(), "1.25");
+    }
+
+    #[test]
+    fn test_group_service_amount_missing_keys_error_loudly() {
+        use aws_sdk_costexplorer::types::{Group, MetricValue};
+        // No Keys → error (python g['Keys'][0] IndexError parity).
+        let no_keys = Group::builder()
+            .metrics("UnblendedCost", MetricValue::builder().amount("1").build())
+            .build();
+        assert!(group_service_amount(&no_keys).is_err());
+        // No Metrics → error (python g['Metrics'] KeyError parity).
+        let no_metrics = Group::builder().keys("AWS Lambda").build();
+        assert!(group_service_amount(&no_metrics).is_err());
+        // Metrics present but UnblendedCost missing → error.
+        let wrong_metric = Group::builder()
+            .keys("AWS Lambda")
+            .metrics("SomethingElse", MetricValue::builder().amount("1").build())
+            .build();
+        assert!(group_service_amount(&wrong_metric).is_err());
+    }
+
+    #[test]
+    fn test_group_service_amount_normal_shape_unchanged() {
+        use aws_sdk_costexplorer::types::{Group, MetricValue};
+        let g = Group::builder()
+            .keys("AWS Lambda")
+            .metrics(
+                "UnblendedCost",
+                MetricValue::builder().amount("0.5").build(),
+            )
+            .build();
+        assert_eq!(group_service_amount(&g).unwrap(), ("AWS Lambda", "0.5"));
+    }
+
+    #[test]
+    fn test_require_key_some_passes_none_errors() {
+        assert_eq!(require_key(Some(7_u8), "K").unwrap(), 7);
+        let err = require_key(None::<u8>, "Total").unwrap_err();
+        assert!(err.to_string().contains("Total"), "{err}");
     }
 
     #[test]

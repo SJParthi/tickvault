@@ -32,6 +32,19 @@ pub fn state_counts_as_up(state: &str) -> bool {
     matches!(state, "running" | "pending")
 }
 
+/// Classify the DescribeInstances result SHAPE. `None` = the call
+/// SUCCEEDED but the reservations/instances/state chain was missing —
+/// FAIL-OPEN (up), exactly like the Err arm (hostile-review r1 F3):
+/// the Python heredoc's doctrine is "a real trading day must never lose
+/// the liveness page", and the python failed OPEN on a missing shape;
+/// only a POSITIVE non-up state may leave the alarms disabled.
+pub fn classify_instance_state(state: Option<String>) -> (bool, String) {
+    match state {
+        Some(s) => (state_counts_as_up(&s), s),
+        None => (true, "unknown".to_string()),
+    }
+}
+
 /// Python parity: `[n.strip() for n in raw.split(',') if n.strip()]`.
 pub fn parse_alarm_names(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -136,17 +149,16 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
         .send()
         .await
     {
-        Ok(r) => {
-            let state = r
-                .reservations()
+        // Missing shape on a SUCCESSFUL call routes through
+        // classify_instance_state's None arm → fail-open (python parity).
+        Ok(r) => classify_instance_state(
+            r.reservations()
                 .first()
                 .and_then(|res| res.instances().first())
                 .and_then(|i| i.state())
                 .and_then(|s| s.name())
-                .map(|n| n.as_str().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            (state_counts_as_up(&state), state)
-        }
+                .map(|n| n.as_str().to_string()),
+        ),
         Err(e) => {
             warn!(error = %e, "describe_instances failed -- fail-open, treating as up");
             (true, "unknown".to_string())
@@ -243,6 +255,24 @@ mod tests {
         assert!(!state_counts_as_up("stopping"));
         assert!(!state_counts_as_up("terminated"));
         assert!(!state_counts_as_up("shutting-down"));
+    }
+
+    #[test]
+    fn test_classify_instance_state_missing_shape_fails_open_as_up() {
+        // Hostile-review r1 F3: a SUCCESSFUL DescribeInstances whose
+        // reservations/instances/state shape is missing must fail OPEN
+        // (up=true) exactly like the Err arm — python parity: a real
+        // trading day must never lose the liveness page.
+        assert_eq!(classify_instance_state(None), (true, "unknown".to_string()));
+        // A POSITIVE state still classifies normally.
+        assert_eq!(
+            classify_instance_state(Some("running".to_string())),
+            (true, "running".to_string())
+        );
+        assert_eq!(
+            classify_instance_state(Some("stopped".to_string())),
+            (false, "stopped".to_string())
+        );
     }
 
     #[test]
