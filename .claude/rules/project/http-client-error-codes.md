@@ -109,8 +109,11 @@ not per-emission.
 - `crates/storage/src/http_client.rs` (shared client + typed error)
 - `crates/storage/src/boot_probe.rs` (shared-client consumer +
   `BootProbeError::ClientBuild`)
-- Degrade sites: `crates/storage/src/{instrument_fetch_audit_persistence,
-  shadow_persistence, instrument_lifecycle_persistence, tick_persistence}.rs`
+- Degrade sites: `crates/storage/src/{shadow_persistence,
+  instrument_lifecycle_persistence}.rs` (dead-code sweep batch 1,
+  2026-07-18: `instrument_fetch_audit_persistence.rs` deleted — see the
+  RETIRED site row above; `tick_persistence.rs` died earlier with the
+  Stage-2 dead-WS sweep, 2026-07-17)
 - Attribution branches (2026-07-03 review Fix 3): `crates/app/src/main.rs` +
   `crates/core/src/pipeline/tick_processor.rs` — a `BootProbeError::
   ClientBuild` from `wait_for_questdb_ready` logs HTTP-CLIENT-01 (host
