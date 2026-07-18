@@ -98,7 +98,7 @@ pub struct GuardInstance {
 /// EC2 surface. `Err` mirrors a raised boto3 exception (uncaught in python —
 /// it propagates out of the handler); `Ok(None)` mirrors an empty
 /// Reservations/Instances response (python would IndexError — also fatal).
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait Ec2Api {
     async fn describe(&self, instance_id: &str) -> Result<Option<GuardInstance>, String>;
     async fn stop_instances(&self, instance_id: &str) -> Result<(), String>;
@@ -106,27 +106,27 @@ pub trait Ec2Api {
 
 /// SNS surface. Python does NOT catch publish exceptions — an `Err` here
 /// propagates out of the handler exactly like the raised boto3 error would.
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait SnsApi {
     async fn publish(&self, topic_arn: &str, subject: &str, message: &str) -> Result<(), String>;
 }
 
 /// EventBridge surface — `events:DisableRule` only. Errors are CAUGHT by
 /// the breach path (page-don't-crash) and reported honestly in the page.
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait EventsApi {
     async fn disable_rule(&self, name: &str) -> Result<(), String>;
 }
 
 /// Cost Explorer surface — the raw `Amount` strings per result period
 /// (python sums `float(d["Total"]["UnblendedCost"]["Amount"])`).
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait CeApi {
     async fn unblended_amounts(&self, start: &str, end: &str) -> Result<Vec<String>, String>;
 }
 
 /// SSM surface for the change-only ping state (get + put).
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait SsmApi {
     async fn get_parameter(&self, name: &str) -> Result<String, String>;
     async fn put_parameter(&self, name: &str, value: &str) -> Result<(), String>;
@@ -201,6 +201,7 @@ pub fn spend_bucket(mtd: Option<f64>, budget_kill_usd: f64) -> i64 {
         return 0;
     }
     let pct = (mtd / budget_kill_usd) * 100.0;
+    // APPROVED: floor of a value capped at 999 / BUCKET_PCT_STEP — always fits i64; NaN saturates to 0.
     #[allow(clippy::cast_possible_truncation)]
     let bucket = (pct.min(999.0) / BUCKET_PCT_STEP as f64).floor() as i64;
     bucket

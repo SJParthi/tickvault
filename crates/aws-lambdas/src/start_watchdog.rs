@@ -93,7 +93,7 @@ pub struct InstanceDesc {
 
 /// EC2 surface. `Err` mirrors a raised boto3 exception; `Ok(None)` mirrors
 /// an empty Reservations/Instances response ("not-found").
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait Ec2Api {
     async fn describe(&self, instance_id: &str) -> Result<Option<InstanceDesc>, String>;
     async fn start_instances(&self, instance_id: &str) -> Result<(), String>;
@@ -103,14 +103,14 @@ pub trait Ec2Api {
 /// SSM surface. `Err` mirrors a raised boto3 exception (ParameterNotFound,
 /// AccessDenied, ...); `Ok` returns the raw parameter Value (may be empty —
 /// Python's `.get("Value") or ""`).
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait SsmApi {
     async fn get_parameter(&self, name: &str) -> Result<String, String>;
 }
 
 /// SNS surface. Python does NOT catch publish exceptions — an `Err` here
 /// propagates out of the handler exactly like the raised boto3 error would.
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait SnsApi {
     async fn publish(&self, topic_arn: &str, subject: &str, message: &str) -> Result<(), String>;
 }
