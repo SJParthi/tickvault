@@ -58,9 +58,9 @@ common, storage, trading, app.
   empty symbols).
 - Non-finite prices (NaN/inf from f64 math): clamped to 0.0 + counted
   (`tv_order_update_events_nonfinite_clamped_total`).
-- Oversized strings: `reject_reason` ≤300 chars, `detail_raw` ≤2000 chars via
-  the house sanitize choke point (control/BiDi strip) — a hostile broker
-  string can never bloat a row or inject ILP.
+- Oversized strings: `reject_reason` ≤300 chars, `detail_raw` ≤1024 chars
+  (`MAX_AUDIT_STR_LEN`) via the house sanitize choke point (control/BiDi
+  strip) — a hostile broker string can never bloat a row or inject ILP.
 - Sink full/closed (slow QuestDB, shutdown): `try_send` refused → drop counted
   `tv_order_update_events_dropped_total{reason="full"|"closed"}` + ONE coded
   `error!` (stage `sink_drop`) — best-effort forensics; the push read loop and
@@ -102,7 +102,7 @@ common, storage, trading, app.
   column (both tables), DEDUP key consts EXACT
   (`ts, trading_date_ist, feed, order_id, event_seq` /
   `ts, trading_date_ist, feed, symbol_isin, event_seq`), ILP conf targets
-  http port not tcp (ratchet), non-finite clamp, sanitize caps (300/2000),
+  http port not tcp (ratchet), non-finite clamp, sanitize caps (300 / 1024 via `MAX_AUDIT_STR_LEN`),
   paise→rupees conversion, mock-HTTP flush ACK tests (200/500/unreachable →
   discard_pending), `dedup_segment_meta_guard` (feed-in-key) green,
   `partition_retention_coverage_guard` green with both tables registered.

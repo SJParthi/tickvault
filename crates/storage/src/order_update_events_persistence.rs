@@ -31,10 +31,29 @@ use tracing::{error, warn};
 use tickvault_common::broker_order_events::OrderUpdateEventRecord;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::sanitize::{MAX_AUDIT_STR_LEN, sanitize_ilp_string, sanitize_ilp_symbol};
+use tickvault_common::sanitize::{
+    MAX_AUDIT_STR_LEN, sanitize_audit_string, sanitize_ilp_string, sanitize_ilp_symbol,
+};
 
 /// QuestDB table name — one row per received order push event.
 pub const ORDER_UPDATE_EVENTS_TABLE: &str = "order_update_events";
+
+/// Log-interpolation bound for broker identities (round-2 polish — the
+/// `order_update_events_boot.rs::log_safe_id` house pattern, mirrored
+/// locally because the app crate is not reachable from storage).
+pub(crate) const LOG_SAFE_ID_MAX_CHARS: usize = 64;
+
+/// Bounded + sanitized broker identity for LOG interpolation — strips
+/// control/BiDi chars and caps the length so a crafted multi-KB vendor
+/// `order_id` cannot amplify `errors.log` (cold warn-path alloc is fine).
+/// The PERSISTED values are separately ILP-sanitized + bounded below;
+/// `sanitize_audit_string` is the LOG choke point only, never the ILP one.
+pub(crate) fn log_safe_id(raw: &str) -> String {
+    sanitize_audit_string(raw)
+        .chars()
+        .take(LOG_SAFE_ID_MAX_CHARS)
+        .collect()
+}
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule);
 /// `trading_date_ist` in-key (phase-0 composite-DEDUP rule 1); `feed`
@@ -364,7 +383,7 @@ impl OrderUpdateEventsWriter {
             } else {
                 metrics::counter!("tv_order_update_events_nonfinite_clamped_total").increment(1);
                 warn!(
-                    order_id = %r.order_id,
+                    order_id = %log_safe_id(&r.order_id),
                     field,
                     raw = value,
                     "order_update_events: non-finite value clamped to 0.0 to avoid QuestDB reject"
@@ -777,6 +796,51 @@ mod tests {
         assert!(
             field("stage_trail").matches('s').count() <= ORDER_UPDATE_EVENTS_DETAIL_MAX_CHARS,
             "stage_trail must be capped at MAX_AUDIT_STR_LEN"
+        );
+    }
+
+    /// Round-2 polish: the log-interpolation choke point strips
+    /// control/BiDi chars and caps at 64 chars, so a crafted multi-KB
+    /// vendor id can never amplify `errors.log`.
+    #[test]
+    fn test_log_safe_id_strips_controls_and_caps_at_64() {
+        let hostile = format!("evil\u{202e}\u{0007}{}", "A".repeat(500));
+        let safe = log_safe_id(&hostile);
+        assert!(safe.chars().count() <= LOG_SAFE_ID_MAX_CHARS);
+        assert!(!safe.contains('\u{202e}'), "BiDi override must be stripped");
+        assert!(!safe.contains('\u{0007}'), "control char must be stripped");
+        assert!(safe.starts_with("evil"));
+        assert_eq!(log_safe_id(""), "");
+    }
+
+    /// Round-2 polish source-scan pin: BOTH writers' non-finite-clamp
+    /// `warn!` sites interpolate broker identities ONLY through the
+    /// bounded `log_safe_id` choke point — never raw vendor strings.
+    /// Needles are concat!-assembled so this test's own source can never
+    /// satisfy (positive) or trip (negative) the scan.
+    #[test]
+    fn test_nonfinite_warn_sites_route_ids_through_log_safe_id() {
+        let order_src = include_str!("order_update_events_persistence.rs");
+        let position_src = include_str!("position_update_events_persistence.rs");
+        let order_safe = concat!("order_id = %log_safe_id(", "&r.order_id)");
+        let order_raw = concat!("order_id = %r.", "order_id");
+        assert!(
+            order_src.contains(order_safe),
+            "order writer warn! must route order_id through log_safe_id"
+        );
+        assert!(
+            !order_src.contains(order_raw),
+            "order writer must not interpolate the raw vendor order_id"
+        );
+        let position_safe = concat!("symbol_isin = %log_safe_id(", "&r.symbol_isin)");
+        let position_raw = concat!("symbol_isin = %r.", "symbol_isin");
+        assert!(
+            position_src.contains(position_safe),
+            "position writer warn! must route symbol_isin through log_safe_id"
+        );
+        assert!(
+            !position_src.contains(position_raw),
+            "position writer must not interpolate the raw vendor symbol_isin"
         );
     }
 

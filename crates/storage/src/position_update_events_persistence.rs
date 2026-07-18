@@ -31,6 +31,8 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::{MAX_AUDIT_STR_LEN, sanitize_ilp_string, sanitize_ilp_symbol};
 
+use crate::order_update_events_persistence::log_safe_id;
+
 /// QuestDB table name — one row per received position push event.
 pub const POSITION_UPDATE_EVENTS_TABLE: &str = "position_update_events";
 
@@ -310,7 +312,7 @@ impl PositionUpdateEventsWriter {
             } else {
                 metrics::counter!("tv_order_update_events_nonfinite_clamped_total").increment(1);
                 warn!(
-                    symbol_isin = %r.symbol_isin,
+                    symbol_isin = %log_safe_id(&r.symbol_isin),
                     field,
                     raw = value,
                     "position_update_events: non-finite value clamped to 0.0 to avoid QuestDB reject"
