@@ -132,7 +132,8 @@ use crate::groww_rest_burst::{
 };
 use crate::option_chain_1m_boot::{
     MAX_PLAUSIBLE_STRIKE, MAX_STRIKES_PER_CHAIN, MoneynessWarnLatches, chain_minute_fully_failed,
-    classify_chain_legs, publish_chain_moneyness_snapshot, record_chain_moneyness_observability,
+    classify_chain_legs, probe_capture_state_note, publish_chain_moneyness_snapshot,
+    record_chain_moneyness_observability,
 };
 use crate::spot_1m_rest_boot::{
     EdgeAction, FailureEdge, accumulation_within_cap, count_missed_boundaries,
@@ -188,6 +189,12 @@ pub struct GrowwChain1mTaskParams {
     /// the contract leg is disabled. Poisoning-safe lock (release builds
     /// abort on panic anyway); the map is 3 entries, cold path.
     pub anchor_store: Option<GrowwChainAnchorStore>,
+    /// Whether the cadence scheduler lane (`[cadence]`) is enabled —
+    /// context for the probe-only verdict wording (2026-07-18 canary
+    /// reword): since the 2026-07-17 stand-down the cadence lane records
+    /// the SAME per-minute chains, so "this leg is disabled" must never
+    /// read as "capture is off" while the cadence lane is on.
+    pub cadence_enabled: bool,
 }
 
 /// One chain-leg ATM anchor: the latest REAL vendor `underlying_ltp` plus
@@ -2390,10 +2397,11 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
         info!(
             detail = %detail,
             config_key = "[groww_option_chain_1m].enabled",
+            capture_state = probe_capture_state_note(params.cadence_enabled),
             "groww_chain_1m: probe PASSED — chain data answered for every \
-             underlying; pipeline stays OFF until the config is flipped \
-             (the Telegram body carries the plain-English action; the exact \
-             key lives HERE)"
+             underlying (capture_state carries the context-accurate leg \
+             state; the Telegram body carries the plain-English action; the \
+             exact key lives HERE)"
         );
     } else if in_session {
         error!(
@@ -2401,8 +2409,9 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
             stage = "probe",
             feed = OPTION_CHAIN_1M_FEED_GROWW,
             detail = %detail,
-            "CHAIN-02: Groww chain probe did NOT pass — verdict reported; \
-             pipeline stays OFF (tomorrow's boot re-probes)"
+            capture_state = probe_capture_state_note(params.cadence_enabled),
+            "CHAIN-02: Groww chain probe did NOT pass — verdict reported \
+             (tomorrow's boot re-probes)"
         );
     } else {
         // LOW-3 probe honesty: an off-hours miss is NOT a failure verdict
@@ -3217,6 +3226,7 @@ mod tests {
             ),
             minute_done_tx: None,
             anchor_store: None,
+            cadence_enabled: false,
         }
     }
 
