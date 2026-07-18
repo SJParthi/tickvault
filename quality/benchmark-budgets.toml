@@ -31,10 +31,12 @@ ws_reader_frame_handle   = 5000         # <5μs  — STAGE-D P7.6: counter bump 
 # slo_score_evaluate_* budgets removed in the C4 sweep (2026-07-15) with the
 # deleted slo_score.rs contract stub + its bench (wave-3-d PARK banner).
 
-# Silent-feed hardening Item 4 (2026-07-06 incident) — Dhan exchange-lag monitor.
-feed_lag_record_dhan_tick = 100          # <100ns — HOT PATH ring write (dwell check + clock alignment + two relaxed atomic stores + head bump + two relaxed day-histogram RMWs since scoreboard PR-C; zero-alloc, DHAT-ratcheted by dhat_feed_lag_ring.rs). Regression past this means an allocation or a lock entered the per-tick observation.
-feed_presence_record = 100               # <100ns — HOT PATH presence fold (scoreboard PR-D: enabled check + minute math + one lock-free papaya read + one relaxed fetch_or; zero-alloc, DHAT-ratcheted by dhat_feed_presence.rs). Same budget class as the feed_lag hot targets — the papaya hash+read dominates.
-feed_lag_p99_window = 5000000            # <5ms — COLD path: publisher p99 over a full 32,768-sample window via select_nth_unstable. Honestly O(N-window), NOT O(1) — runs on the supervised 10s task off the tick thread (cold-budget class; the former tick_gap_scan_gaps_full_universe peer budget retired in PR-C3, 2026-07-14).
+# Silent-feed hardening Item 4 (2026-07-06 incident) — Dhan exchange-lag
+# monitor budgets (feed_lag_record_dhan_tick, feed_lag_p99_window) removed
+# 2026-07-17 (dashboard tidy): their bench (crates/core/benches/feed_lag_ring.rs)
+# and the whole ring/publisher half of feed_lag_monitor.rs were deleted with
+# the dead Dhan-lag chain (zero producers after the live-WS retirements).
+feed_presence_record = 100               # <100ns — HOT PATH presence fold (scoreboard PR-D: enabled check + minute math + one lock-free papaya read + one relaxed fetch_or; zero-alloc, DHAT-ratcheted by dhat_feed_presence.rs). Same budget class as the moneyness hot targets — the papaya hash+read dominates.
 
 # Moneyness classification (2026-07-14, operator directive) — one key, two benches.
 moneyness = 50                           # <50ns — matches moneyness/classify (2-arm label parse + three integer compares, zero-alloc) AND moneyness/snapshot_read (one lock-free arc-swap load — the token_handle/load class). DHAT-ratcheted by dhat_moneyness.rs. Key checked bidirectionally against every other budget key and bench name (incl. the since-removed should_emit_snapshot key, deleted 2026-07-17 as an orphaned budget — neither string contained the other); repo-wide grep for "moneyness" was zero hits before this feature.
@@ -47,7 +49,8 @@ moneyness = 50                           # <50ns — matches moneyness/classify 
 # tick chain (parse → enricher → tick writer → broadcast → monotonicity
 # guard) and was deleted with it. The operator's per-tick latency gates for
 # the SURVIVING hot paths stand: dispatch_frame/pipeline (parser),
-# feed_lag_record_dhan_tick, feed_presence_record, moneyness.
+# feed_presence_record, moneyness (feed_lag_record_dhan_tick retired
+# 2026-07-17 with the dead Dhan-lag chain).
 
 # Trading crate — OMS
 oms_state_transition     = 100          # <100ns — matches oms/state_transition

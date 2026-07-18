@@ -188,7 +188,10 @@ blame upgrades to broker only on corroboration (Dhan codes, WS-GAP-09
 overlap ±120s, stall-watchdog semantics). **Lag columns are LIVE since PR-C (2026-07-11):** the per-feed
 in-memory DAY histograms (fed by the same `record_*_tick` calls that drive
 the live lag gauges — `tv_dhan_exchange_lag_p99_seconds` +
-`tv_groww_exchange_lag_p99_seconds`; replay/re-tail excluded at record time,
+`tv_groww_exchange_lag_p99_seconds` *(2026-07-17: the Dhan lag gauge was
+deleted with the dead Dhan-lag publisher chain — the day histograms' Dhan
+side reads −1 sentinels; the Groww gauge died 2026-07-15 with the Groww
+live feed)*; replay/re-tail excluded at record time,
 never a SQL approximation over the replay-contaminated `received_at` column)
 drain into `lag_p50_ms`/`lag_p99_ms`/`lag_max_ms`/`lag_samples` on same-day
 runs; a rerun/backfill that measured nothing folds the day's EXISTING

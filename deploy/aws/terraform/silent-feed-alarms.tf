@@ -65,64 +65,17 @@
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# S3. Dhan exchange->receive lag p99 high
-#
-# The incident's PRIMARY signal: exchange-timestamp -> receive-instant lag
-# p99 46s / max 199s all day, with no metric measuring it
-# (tv_wire_to_done_duration_ns is receive->done only). The
-# tv_dhan_exchange_lag_p99_seconds gauge is published by the supervised
-# feed-lag monitor (crates/core/src/pipeline/feed_lag_monitor.rs), spawned
-# from BOTH boot arms (fast crash-recovery + start_dhan_lane — round-1 fix
-# 2026-07-07; lane-only wiring left this alarm silently notBreaching for
-# the whole session after any mid-market crash restart): trailing 60s
-# window, recomputed every 10s, in-session only (Rule 3 — the regular
-# [09:00,15:30) IST window plus the Muhurat [18:00,19:30) window when
-# active; NOTE the action gate below stays 09:20-15:35, so Muhurat
-# publication is gauge-visibility only, not paging), >= 50 samples
-# or nothing published (Rule 11 — an empty window must never read as
-# "perfect lag"; feed-dead is owned by the silent-instruments + WS alarms
-# via notBreaching). Unlabeled, dhan-only NAME — sidesteps the host-only EMF
-# dimension label-folding trap; a future Groww gauge gets its own name.
-#
-# QUANTIZATION HONESTY: Dhan LTT is u32 whole IST SECONDS (ticker.rs bytes
-# 12-15 / quote.rs bytes 14-17) -> >= 1s measurement floor; healthy p99
-# reads ~1-2s and can never read 0; sub-second wire lag is UNMEASURABLE for
-# feed=dhan. Threshold 10s sits 10x above that floor.
-#
-# Strict 10-of-10 is safe HERE (unlike the flap-prone signals above): the
-# metric is itself a trailing-60s p99 recomputed every 10s, so a one-burst
-# transient decays out of the window within ~60s and cannot hold 10
-# consecutive breaching minutes. The incident's all-day p99 46s pages at
-# minute 10.
-#
-# DORMANT SINCE PR-C2 (2026-07-14, Dhan live-WS lane deletion): the Dhan half
-# of the feed-lag monitor (`run_dhan_lag_publisher` / `record_dhan_tick`)
-# lost its spawn site + tick source with the lane, so
-# `tv_dhan_exchange_lag_p99_seconds` is never published again. The alarm is
-# dormant-SAFE (treat_missing_data=notBreaching + actions off by default
-# under the window gate), never a false page. Its removal-vs-retain decision
-# lands in PR-C3 with the rest of the Dhan-lag detector surface — NOT
-# silently dropped here (dated-note-or-same-PR-retirement discipline).
+# S3 RETIRED (2026-07-17 — dashboard tidy): the dhan_exchange_lag_p99_high
+# alarm watched tv_dhan_exchange_lag_p99_seconds, whose ONLY publisher
+# (`run_dhan_lag_publisher` in feed_lag_monitor.rs) lost its spawn site +
+# tick source with the Dhan live-WS lane deletion (PR-C2, 2026-07-13) and is
+# DELETED in this PR together with the whole ring/publisher half of the
+# feed-lag monitor. The gauge (and its companion counter
+# tv_dhan_lag_samples_excluded_total) can never be published again, so the
+# alarm was a permanently-missing-data dead monitor. Removed with its
+# window-gate ALARM_NAMES row and the 2 EMF allowlist entries; dated cost
+# note in aws-budget.md (COST NOTE 2026-07-17, dashboard tidy).
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "dhan_exchange_lag_p99_high" {
-  alarm_name          = "tv-${var.environment}-dhan-exchange-lag-p99-high"
-  alarm_description   = "Dhan exchange->receive lag p99 > 10s for 10 consecutive in-market minutes (2026-07-06 incident signal: p99 46s / max 199s all day). Trailing-60s p99; boot-time WAL-replay rows excluded via the two-condition discriminator (>=60s receipt-capture dwell AND pre-boot capture instant — live rows delayed >60s in-pipeline by a consumer stall are KEPT, round-2 fix 2026-07-07); >= 50 samples required. NOTE: Dhan LTT is whole IST seconds -> >= 1s measurement floor (healthy p99 ~1-2s, never 0); the 10s threshold sits 10x above the floor. Actions gated to 09:20-15:35 IST Mon-Fri. See WS-GAP-06 runbook + feed_lag_monitor module docs."
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 10
-  datapoints_to_alarm = 10
-  metric_name         = "tv_dhan_exchange_lag_p99_seconds"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Maximum"
-  threshold           = 10
-  treat_missing_data  = "notBreaching"
-  dimensions          = local.app_dimensions
-  # Actions OFF by default; the market-hours gate Lambda flips them ON
-  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = local.app_alarm_ok
-}
 
 # ---------------------------------------------------------------------------
 # S4 RETIRED (2026-07-15 — Groww live-feed retirement): the
@@ -138,10 +91,10 @@ resource "aws_cloudwatch_metric_alarm" "dhan_exchange_lag_p99_high" {
 
 
 output "silent_feed_cloudwatch_alarms" {
-  description = "1 silent-feed degradation alarm (2026-07-06 incident hardening; the SLO 0.80-0.95 dead-band alarm retired PR-C2 2026-07-13 with the PARKed SLO publisher; the Groww lag mirror retired 2026-07-15 with the Groww live feed; the BOUNDARY-01 catch-up-storm alarm retired 2026-07-17 with the tick aggregator — stage-3 dead-WS sweep, S2 note above): Dhan exchange->receive lag p99 > 10s x10min. Market-hours-gated via the window-gate Lambda; the retuned tick-gap alarm history stays in app-alarms.tf."
+  description = "0 silent-feed degradation alarms remain (2026-07-06 incident hardening history; the SLO 0.80-0.95 dead-band alarm retired PR-C2 2026-07-13 with the PARKed SLO publisher; the Groww lag mirror retired 2026-07-15 with the Groww live feed; the BOUNDARY-01 catch-up-storm alarm retired 2026-07-17 with the tick aggregator — stage-3 dead-WS sweep, S2 note above; the Dhan lag mirror retired 2026-07-17 with the dead Dhan-lag publisher chain). File retained for the dated retirement notes; the retuned tick-gap alarm history stays in app-alarms.tf."
   value = [
     # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS sweep).
-    aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
+    # dhan_exchange_lag_p99_high retired 2026-07-17 (dead Dhan-lag chain).
     # groww_exchange_lag_p99_high retired 2026-07-15 (Groww live feed).
   ]
 }
