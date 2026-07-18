@@ -60,6 +60,7 @@ use crate::time::IST_OFFSET_SECS;
 ///      fails, that page AND this heuristic are both silent for that
 ///      window — the boot-heartbeat backstop below covers it;
 ///   3. a manual portal stop — operator-initiated by definition.
+///
 /// EC2 never self-stops on app FAILURE, and the boot-heartbeat gate
 /// window (08:50-09:10) is the backstop pager for anything this
 /// heuristic misreads. Python parity: `HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES`.
@@ -121,13 +122,12 @@ pub fn classify_readiness(
             NOT_BOOTED_PAGE
         };
     }
-    if let Some(launch) = launch_time_utc {
-        if (state == "stopping" || state == "stopped")
-            && is_today_ist(launch, now_utc)
-            && ist_minutes_of_day(launch) >= HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES
-        {
-            return HOLIDAY_SILENT; // 08:30 start then self-stop = holiday gate
-        }
+    if let Some(launch) = launch_time_utc
+        && (state == "stopping" || state == "stopped")
+        && is_today_ist(launch, now_utc)
+        && ist_minutes_of_day(launch) >= HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES
+    {
+        return HOLIDAY_SILENT; // 08:30 start then self-stop = holiday gate
     }
     NOT_RUNNING_PAGE // stopped-old / pending / shutting-down / unknown / not-found
 }
