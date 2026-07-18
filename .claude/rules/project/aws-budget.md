@@ -10,6 +10,61 @@
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
 
+## COST NOTE 2026-07-17 — dashboard tidy (−~$0.70/mo + 1 free-tier dashboard slot)
+
+The dashboard-tidy PR (cleanup wave, Track B) retired the dead Dhan-lag
+observability chain and the scoreboard dashboard (Verified against the
+terraform diff in this PR; billing magnitudes Assumed at CloudWatch list
+rates — active-series-hours were already $0-decaying since the producers
+died with the live-WS retirements):
+
+- **−1 alarm ≈ −$0.10/mo (Verified):** dhan-exchange-lag-p99-high
+  (silent-feed-alarms.tf S3) — its only publisher
+  (`run_dhan_lag_publisher`, feed_lag_monitor.rs) lost its spawn site +
+  tick source with the Dhan live-WS lane deletion (PR-C2, 2026-07-13) and
+  is deleted in this PR; a permanently-missing-data dead monitor (the
+  groww-exchange-lag S4 precedent, 2026-07-15). Window-gate ALARM_NAMES
+  trimmed 3 → 2 in lockstep (the same-day stage-3 sweep had already
+  retired boundary-catchup-storm-dhan, 4 → 3).
+- **−2 EMF allowlist series ≈ −$0.60/mo (names Verified; billing
+  Assumed):** tv_dhan_exchange_lag_p99_seconds +
+  tv_dhan_lag_samples_excluded_total (cloudwatch-agent.json +
+  user-data.sh.tftpl, 17 → 15 names — the same-day stage-3 sweep had
+  already removed the 2 dead aggregator names, 19 → 17).
+- **−1 CloudWatch dashboard: ₹0 (Verified):** `tv-<env>-scoreboard`
+  (dashboard.tf) — its Dhan-vs-Groww lag-trend widgets charted only the
+  dead lag gauges; frees dashboard slot #2 of the 3-slot free tier.
+- Dead-widget trim on the KEPT `tv-<env>-operator` dashboard (₹0):
+  WebSocket-health / spill-dropped / DLQ-ticks widgets removed — their
+  metrics have ZERO producers post live-WS retirements; their app-alarms.tf
+  alarms are deliberately NOT touched here (flagged follow-up, dated notes
+  in dashboard.tf).
+
+Net ≈ **−$0.70/mo pre-GST (~−₹70/mo incl. 18% GST at ₹85/$)** — the real
+gain is the freed dashboard slot + ~730 LoC of dead monitoring code.
+
+## COST NOTE 2026-07-18 — dead live-WS sweep stage 4 (−~$0.40/mo alarms; −4 EMF series)
+
+The stage-4 dead-producer sweep (this PR) retired the 4 dead-tick alarm
+chains whose emit sites died with the stage-2 tick-chain deletion
+(2026-07-17 — `tick_persistence.rs` ring/spill/DLQ counters + the
+`tick_processor.rs` post-close check); billing magnitudes Assumed at
+CloudWatch list rates (active-series-hours decay to $0 once producers
+stop publishing):
+
+- **−4 alarms ≈ −$0.40/mo (Verified against the terraform diff):**
+  `tv-<env>-spill-dropped`, `tv-<env>-dlq-ticks`, `tv-<env>-ticks-dropped`,
+  `tv-<env>-late-tick-after-boundary` (app-alarms.tf; all ungated —
+  no window-gate edit).
+- **−4 EMF selector names ≈ −$1.20/mo at full density (Assumed; already
+  $0 in practice — the producers stopped 2026-07-17):**
+  `tv_spill_dropped_total`, `tv_dlq_ticks_total`, `tv_ticks_dropped_total`,
+  `tv_late_tick_after_boundary_total` removed from both selector copies
+  (cloudwatch-agent.json + user-data.sh.tftpl).
+
+The seal-side loss pagers (seal-drop-alarm.tf + the AGGREGATOR-DROP-01
+errcode alarm) are UNTOUCHED.
+
 ## COST NOTE 2026-07-17 — dead live-WS sweep stage 3 (−~$0.70/mo)
 
 The stage-3 sweep (this PR) deleted the publisher-less 21-TF TICK aggregator
@@ -381,7 +436,7 @@ This rule activates when editing files matching:
 - `deploy/aws/*`
 - `scripts/aws-*`
 - `crates/app/src/infra.rs`
-- `crates/common/src/constants.rs` (`TICK_BUFFER_CAPACITY`)
+- `crates/trading/src/candles/seal_ring.rs` (`SEAL_BUFFER_CAPACITY` — seal ring RAM budget)
 - `crates/trading/src/indicator/*` (RAM-first guard)
 - `crates/trading/src/strategy/*` (RAM-first guard)
-- Any file containing `t4g.medium`, `t4g`, `c7i`, `c8g`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`, `TICK_BUFFER_CAPACITY`
+- Any file containing `t4g.medium`, `t4g`, `c7i`, `c8g`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`, `SEAL_BUFFER_CAPACITY`

@@ -178,7 +178,7 @@ merge-cleanness after both sessions finish (see PR 276 and PR 277).
 | Every `error!` with a tracked code has a `code =` field | `error_code_tag_guard` — meta-test fails build |
 | Every triage rule has a real script path + runbook path | `triage_rules_guard` — meta-test fails build |
 | Every runbook reference resolves OR is allowlisted with TODO | `runbook_cross_link_guard` — meta-test fails build |
-| Every Prometheus alert required by a runbook exists | `zero_tick_loss_alert_guard` + `resilience_sla_alert_guard` |
+| Every Prometheus alert required by a runbook exists | RETIRED — both cited guards are deleted (`resilience_sla_alert_guard` with Prometheus #O2/#O3; `zero_tick_loss_alert_guard` 2026-07-18 with the tick rescue ring); alarm coverage is CloudWatch-side (`error-code-alarms.tf` / `app-alarms.tf` + their wiring guards) |
 | Every dashboard panel required by morning-ops exists | `operator_health_dashboard_guard` |
 | Every MCP tool name the Claude loop prompt depends on exists | `tickvault_logs_mcp_guard` |
 | Every AWS Lambda scaffold stays count-gated off until EC2 | `claude_triage_lambda_guard` _(deleted 2026-07-18 with the claude-triage lambda in the Rust-only purge; see git history)_ |

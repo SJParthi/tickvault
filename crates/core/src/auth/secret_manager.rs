@@ -1497,49 +1497,18 @@ mod tests {
         );
     }
 
-    /// Silent-feed hardening Item 4 (2026-07-06 incident): the Dhan
-    /// exchange-lag p99 publisher MUST be spawned via its supervisor
-    /// (respawn + counter — WS-GAP-05 / SLO-03 pattern). A bare
-    /// `tokio::spawn` would regress the exact silent-task-death class the
-    /// SLO-03 incident proved: the `tv_dhan_exchange_lag_p99_seconds`
-    /// stream stops with no error!, no counter, no respawn, and the lag
-    /// alarm false-OKs on missing data (`notBreaching`).
     /// Scoreboard PR-D meta-guard: main.rs MUST (a) init the per-instrument
     /// presence registry in the process-global boot prefix BEFORE the Groww
     /// feed spawns (the boot-read fold gate; single boot path since PR-C2,
     /// 2026-07-13 — the fast crash-recovery arm was deleted with the Dhan
     /// live-WS lane) and (b) reset the presence bitsets in the IST-midnight
     /// task next to the day-lag histogram reset.
-    #[test]
-    fn test_feed_presence_is_wired_into_main() {
-        let main_rs = std::fs::read_to_string("../app/src/main.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
-            .expect("main.rs must be readable");
-        let init_needle = "feed_presence::init_feed_presence(";
-        let init_sites = main_rs
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//") && !t.starts_with("///") && t.contains(init_needle)
-            })
-            .count();
-        assert_eq!(
-            init_sites, 1,
-            "feed_presence::init_feed_presence must be called at EXACTLY 1 \
-             main.rs site (the PROCESS-GLOBAL boot prefix — PR-D fix round \
-             1, 2026-07-11); found {init_sites}."
-        );
-        // (2026-07-15 Groww live-feed deletion: the run_groww_activation_watcher
-        // ordering pin retired with the watcher — init_feed_presence remains
-        // the single process-global-prefix site pinned by the count above.)
-        assert!(
-            main_rs.contains("feed_presence::reset_daily("),
-            "the main.rs IST-midnight task must reset the Dhan presence \
-             bitsets (feed_presence::reset_daily) next to \
-             reset_day_lag_histogram — without it a long-lived process \
-             bleeds Friday's minutes into Monday's coverage rows."
-        );
-    }
+    // RETIRED (2026-07-18, stage-4 dead-producer sweep):
+    // test_feed_presence_is_wired_into_main died with the machinery it
+    // pinned — the per-instrument presence registry
+    // (pipeline/feed_presence.rs) was deleted; its record/register
+    // producers died with the live feeds (Dhan 2026-07-13, Groww
+    // 2026-07-15), so the wired init armed a registry nothing could feed.
 
     // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
     // retirement directive per websocket-connection-scope-lock.md

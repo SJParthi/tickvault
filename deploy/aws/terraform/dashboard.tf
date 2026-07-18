@@ -101,58 +101,17 @@ resource "aws_cloudwatch_dashboard" "operator" {
       # ("Feed last-tick age" widget retired 2026-07-15 — its sole producer,
       # the Groww bridge liveness stamp, was deleted with the Groww live feed;
       # the series can never publish again.)
-      {
-        type   = "metric"
-        x      = 16
-        y      = 8
-        width  = 8
-        height = 6
-        properties = {
-          title  = "WebSocket health"
-          region = local.dash_region
-          view   = "timeSeries"
-          metrics = [
-            # tv_order_update_ws_active panel row REMOVED 2026-07-14 (Dhan
-            # noise lock fix round M4): the order-update WS spawn is retired,
-            # so the gauge has zero reachable writers — a dead-metric panel
-            # would render as missing data and mislead triage.
-            [local.dash_namespace, "tv_websocket_pool_all_dead", { label = "pool all dead (1=bad)" }],
-            [local.dash_namespace, "tv_websocket_failed_connections_count", { label = "failed conns" }]
-          ]
-          period = 60
-          stat   = "Maximum"
-        }
-      },
+      # ("WebSocket health" widget retired 2026-07-17 — dashboard tidy:
+      # tv_websocket_pool_all_dead + tv_websocket_failed_connections_count
+      # have ZERO producers in crates/*/src after the live-WS retirements
+      # (Dhan 2026-07-13, Groww 2026-07-15); a dead-metric panel would
+      # render as missing data and mislead triage.)
 
       # ----- Row 3: data-integrity / loss signals -----
-      {
-        type   = "metric"
-        x      = 0
-        y      = 14
-        width  = 8
-        height = 6
-        properties = {
-          title   = "Tick spill dropped (0 = no loss)"
-          region  = local.dash_region
-          view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_spill_dropped_total", { stat = "Sum" }]]
-          period  = 300
-        }
-      },
-      {
-        type   = "metric"
-        x      = 8
-        y      = 14
-        width  = 8
-        height = 6
-        properties = {
-          title   = "DLQ ticks (recoverable overflow — 0 = none)"
-          region  = local.dash_region
-          view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_dlq_ticks_total", { stat = "Sum" }]]
-          period  = 300
-        }
-      },
+      # ("Tick spill dropped" + "DLQ ticks" widgets retired 2026-07-17 —
+      # dashboard tidy: tv_spill_dropped_total + tv_dlq_ticks_total have
+      # ZERO producers after the stage-2 dead-WS sweep (2026-07-17) deleted
+      # the dead tick-writer chain; both series can never publish again.)
       {
         type   = "metric"
         x      = 16
@@ -213,8 +172,7 @@ resource "aws_cloudwatch_dashboard" "operator" {
             aws_cloudwatch_metric_alarm.questdb_disconnected.arn,
             aws_cloudwatch_metric_alarm.token_remaining_low.arn,
             # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
-            aws_cloudwatch_metric_alarm.spill_dropped.arn,
-            aws_cloudwatch_metric_alarm.dlq_ticks.arn,
+            # spill_dropped + dlq_ticks retired 2026-07-18 (stage-4 unit A).
             aws_cloudwatch_metric_alarm.clock_skew_high.arn,
             aws_cloudwatch_metric_alarm.high_cpu.arn,
             aws_cloudwatch_metric_alarm.disk_used_high.arn
@@ -250,124 +208,13 @@ resource "aws_cloudwatch_dashboard" "operator" {
 }
 
 # =============================================================================
-# CloudWatch Dashboard #2 — dual-feed scoreboard live trends (scoreboard PR-C)
+# CloudWatch Dashboard #2 (tv-<env>-scoreboard) RETIRED 2026-07-17 — dashboard
+# tidy. The dual-feed scoreboard dashboard's live-trend widgets charted the
+# Dhan/Groww exchange-lag gauges (producers deleted with the dead Dhan-lag
+# publisher chain, 2026-07-17), the stall/WS series (producers deleted with
+# the live-feed retirements 2026-07-13/2026-07-15), and a feed-focused alarm
+# strip over retired alarms. Coverage, blame and the daily verdict continue to
+# live in the 3:45 PM IST Telegram scorecard + the QuestDB scoreboard tables
+# (feed_scoreboard_daily / feed_coverage_daily / feed_episode_audit) — those
+# are unaffected. Frees dashboard slot #2 of the 3-slot CloudWatch free tier.
 # =============================================================================
-# Free tier: 3 dashboards; this is dashboard #2 of 3 (slot verified free
-# 2026-07-10, dual-feed scoreboard design §6). LIVE TRENDS ONLY — coverage,
-# blame and the daily verdict live in the 3:45 PM IST Telegram scorecard +
-# the QuestDB scoreboard tables (feed_scoreboard_daily / feed_episode_audit);
-# no fake CW series is charted for QuestDB-side data.
-#
-# Row 1 (PR-C scope): Dhan vs Groww exchange-lag p99 side by side — the
-# Groww gauge is the ONE new EMF series of PR-C (+$0.30/mo, 27-name
-# allowlist). Resolution asymmetry is stated on the widget title: Dhan's
-# whole-second price clock gives it a >=1s floor; Groww is millisecond-
-# precise but measured one hop downstream (sidecar capture instant).
-# Rows 2-4 (scoreboard PR-D): stall counters + catch-up seals + WS health +
-# a feed-focused alarm strip + the honesty text widget — EXISTING metrics
-# and alarms only, ZERO new EMF series (design §6: total scoreboard cost
-# stays the single PR-C gauge).
-# =============================================================================
-resource "aws_cloudwatch_dashboard" "scoreboard" {
-  dashboard_name = "tv-${var.environment}-scoreboard"
-
-  dashboard_body = jsonencode({
-    widgets = [
-      {
-        type   = "text"
-        x      = 0
-        y      = 0
-        width  = 24
-        height = 2
-        properties = {
-          markdown = "# tickvault — dual-feed scoreboard (${var.environment})\nLive Dhan-vs-Groww feed trends. Coverage, blame and the daily verdict live in the 3:45 PM IST Telegram scorecard + the QuestDB scoreboard tables — this page is live trends only."
-        }
-      },
-      {
-        type   = "metric"
-        x      = 0
-        y      = 2
-        width  = 12
-        height = 6
-        properties = {
-          title   = "Dhan price delay, worst 1% (seconds — whole-second clock, floor ~1s)"
-          region  = local.dash_region
-          view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_dhan_exchange_lag_p99_seconds"]]
-          period  = 60
-          stat    = "Maximum"
-        }
-      },
-      {
-        type   = "metric"
-        x      = 12
-        y      = 2
-        width  = 12
-        height = 6
-        properties = {
-          title   = "REST 1m fire heartbeat over time (official minute-candle pulls alive)"
-          region  = local.dash_region
-          view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_rest_1m_fire_heartbeat"]]
-          period  = 60
-          stat    = "Maximum"
-        }
-      },
-
-      # ----- Row 2 (PR-D): catch-up seals per feed -----
-      # ("Feed helper restarts" widget retired 2026-07-15 — the stall-restart
-      # counters died with the Groww live feed's stall watchdog.)
-      # ("Late catch-up candle seals per feed" widget retired 2026-07-17 —
-      # stage-3 dead-WS sweep: tv_boundary_catchup_total's writer (the
-      # watermark catch-up sealer inside the tick aggregator) is deleted;
-      # the series can never publish again.)
-
-      # ----- Row 3 (PR-D): WS health | feed-focused alarm strip -----
-      {
-        type   = "metric"
-        x      = 0
-        y      = 14
-        width  = 12
-        height = 6
-        properties = {
-          title   = "Dhan WebSocket connections active (0 = feed dead)"
-          region  = local.dash_region
-          view    = "timeSeries"
-          metrics = [[local.dash_namespace, "tv_websocket_connections_active"]]
-          period  = 60
-          stat    = "Minimum"
-        }
-      },
-      {
-        type   = "alarm"
-        x      = 12
-        y      = 14
-        width  = 12
-        height = 6
-        properties = {
-          title = "Feed alarm status (red = firing -> already paged)"
-          alarms = [
-            # feed_stall_restarts + groww_exchange_lag_p99_high retired
-            # 2026-07-15 with the Groww live feed.
-            # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3
-            # dead-WS sweep — the tick aggregator, its metric's writer,
-            # is deleted).
-            aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.arn
-          ]
-        }
-      },
-
-      # ----- Row 4 (PR-D): honesty text — no fake CW series for QuestDB data -----
-      {
-        type   = "text"
-        x      = 0
-        y      = 20
-        width  = 24
-        height = 2
-        properties = {
-          markdown = "**Coverage, blame and the daily verdict** live in the 3:45 PM IST Telegram scorecard + the QuestDB tables (`feed_scoreboard_daily` / `feed_coverage_daily` / `feed_episode_audit`) — per-instrument coverage is QuestDB-side data and is deliberately NOT re-published as CloudWatch series (zero extra EMF cost). This page is live trends only."
-        }
-      }
-    ]
-  })
-}

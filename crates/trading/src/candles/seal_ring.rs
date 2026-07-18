@@ -12,8 +12,8 @@
 //! midnight burst force-seals every open bucket across all 21 TFs in a
 //! single tokio yield, and the persistence path differs (21 distinct
 //! plain candle tables, one ILP `Sender` per TF). A dedicated ring
-//! keeps the seal absorption budget independent of the tick path's
-//! `TICK_BUFFER_CAPACITY`.
+//! keeps the seal absorption budget independent of the (since-retired)
+//! tick path's rescue ring.
 //!
 //! ## RAM budget
 //!

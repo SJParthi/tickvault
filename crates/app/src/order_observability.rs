@@ -160,6 +160,12 @@ pub struct OrderSideWiring {
     /// NSE trading calendar — gates the OnEod heartbeat + reconcile so a
     /// weekend/holiday manual run never writes a bogus trading-day row.
     pub calendar: Arc<TradingCalendar>,
+    /// The broker lane whose OMS feeds this consumer — stamps every
+    /// order_audit / pnl_audit row's `feed` column (one consumer == one
+    /// lane; the dormant Dhan-lane spawn sites pass "dhan", a future
+    /// Groww-OMS lane passes "groww" — the type can no longer silently
+    /// mislabel a non-Dhan consumer with a hardcoded literal).
+    pub feed: &'static str,
 }
 
 /// Process-day ledger: `received` (row-producing messages enqueued),
@@ -580,7 +586,7 @@ fn persist_order_row(
     stats.appended.fetch_add(1, Ordering::Relaxed);
 }
 
-fn base_row(dry_run: bool) -> OrderAuditRow {
+fn base_row(dry_run: bool, feed: &'static str) -> OrderAuditRow {
     let ts = now_ist_nanos();
     OrderAuditRow {
         ts_ist_nanos: ts,
@@ -589,7 +595,7 @@ fn base_row(dry_run: bool) -> OrderAuditRow {
         correlation_id: String::new(),
         leg: ORDER_AUDIT_LEG_SINGLE,
         event: OrderAuditEvent::Placed,
-        feed: "dhan",
+        feed,
         mode: if dry_run { "paper" } else { "live" },
         security_id: -1,
         exchange_segment: "n/a",
@@ -657,7 +663,7 @@ pub(crate) async fn run_order_side_consumer(
                         OrderAuditEvent::CircuitClosed => "ok",
                         _ => "failed",
                     },
-                    ..base_row(wiring.dry_run)
+                    ..base_row(wiring.dry_run, wiring.feed)
                 };
                 persist_order_row(&mut order_writer, &stats, &row);
 
@@ -736,7 +742,7 @@ pub(crate) async fn run_order_side_consumer(
                     price,
                     order_status: "pending",
                     outcome: "ok",
-                    ..base_row(wiring.dry_run)
+                    ..base_row(wiring.dry_run, wiring.feed)
                 };
                 persist_order_row(&mut order_writer, &stats, &row);
             }
@@ -751,7 +757,7 @@ pub(crate) async fn run_order_side_consumer(
                     security_id: i64::try_from(security_id).unwrap_or(-1),
                     outcome: "failed",
                     detail,
-                    ..base_row(wiring.dry_run)
+                    ..base_row(wiring.dry_run, wiring.feed)
                 };
                 persist_order_row(&mut order_writer, &stats, &row);
             }
@@ -761,7 +767,7 @@ pub(crate) async fn run_order_side_consumer(
                     order_id,
                     event: OrderAuditEvent::Cancelled,
                     outcome: "ok",
-                    ..base_row(wiring.dry_run)
+                    ..base_row(wiring.dry_run, wiring.feed)
                 };
                 persist_order_row(&mut order_writer, &stats, &row);
             }
@@ -771,7 +777,7 @@ pub(crate) async fn run_order_side_consumer(
                     event: OrderAuditEvent::CancelFailed,
                     outcome: "failed",
                     detail,
-                    ..base_row(wiring.dry_run)
+                    ..base_row(wiring.dry_run, wiring.feed)
                 };
                 persist_order_row(&mut order_writer, &stats, &row);
             }
@@ -821,7 +827,7 @@ pub(crate) async fn run_order_side_consumer(
                     realized_pnl: realized,
                     unrealized_pnl: unrealized,
                     mode: if wiring.dry_run { "paper" } else { "live" },
-                    feed: "dhan",
+                    feed: wiring.feed,
                 };
                 let mut eod_flushed = false;
                 match pnl_writer.append_pnl_audit_row(&eod_row) {
@@ -1157,6 +1163,42 @@ mod tests {
     /// IST midnight derivation is stable across the day and floors to the
     /// same nanos for any instant within one IST day.
     #[test]
+    fn test_base_row_feed_comes_from_the_wiring_field_not_a_literal() {
+        // Item 1 (2026-07-18): the row feed is the WIRING's lane
+        // discriminant — pre-fix `base_row` hardcoded "dhan" and a
+        // future Groww-OMS consumer would have silently mislabeled every
+        // order_audit / pnl_audit row (feed is IN the DEDUP keys).
+        let dhan = base_row(true, "dhan");
+        assert_eq!(dhan.feed, "dhan");
+        assert_eq!(dhan.mode, "paper");
+        let groww = base_row(false, "groww");
+        assert_eq!(groww.feed, "groww");
+        assert_eq!(groww.mode, "live");
+    }
+
+    #[test]
+    fn test_no_hardcoded_feed_literal_in_production_region() {
+        // Companion pin: the PnlEod PnlAuditRow (and every other row) must
+        // stamp `wiring.feed` / the `base_row` arg — never a `feed: "dhan"`
+        // literal in the production region (the pre-2026-07-18 shape).
+        let src = include_str!("order_observability.rs");
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production region exists");
+        assert_eq!(
+            prod.matches("feed: \"dhan\"").count(),
+            0,
+            "production region must not hardcode feed: \"dhan\" — thread \
+             OrderSideWiring.feed instead"
+        );
+        assert!(
+            prod.contains("feed: wiring.feed"),
+            "PnlEod row stamps wiring.feed"
+        );
+    }
+
+    #[test]
     fn test_ist_midnight_nanos_floors_within_day() {
         let midnight = 1_769_990_400_000_000_000_i64; // an IST midnight
         assert_eq!(ist_midnight_nanos(midnight), midnight);
@@ -1241,6 +1283,7 @@ mod tests {
             questdb: unreachable_questdb(),
             dry_run,
             calendar: Arc::new(calendar),
+            feed: "dhan",
         }
     }
 
