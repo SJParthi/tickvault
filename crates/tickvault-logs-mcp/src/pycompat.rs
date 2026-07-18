@@ -56,6 +56,7 @@ pub fn py_splitlines(s: &str) -> Vec<&str> {
 }
 
 /// Python `line.rstrip("\n")` — strip trailing `\n` chars only.
+// WIRING-EXEMPT: parity-shim helper landed dormant on main via #1644 (phase 2c, pre-cutover — call sites arrive with the MCP cutover PR); annotated 2026-07-18 because the local wiring guard diffs the whole merge range and flags main's own fn.
 pub fn py_rstrip_newline(s: &str) -> &str {
     s.trim_end_matches('\n')
 }
