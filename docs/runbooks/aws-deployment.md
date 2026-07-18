@@ -54,7 +54,6 @@ deploy/aws/terraform/
 ├── budget.tf                    # $25/mo budget cap
 ├── sns-subscriptions.tf         # SMS/email/HTTPS subscriptions
 ├── budget-killswitch-lambda.tf  # auto-stop on budget breach
-├── claude-triage-lambda.tf      # triage Lambda
 ├── telegram-webhook-lambda.tf   # SNS → Telegram bridge Lambda
 └── README.md                    # module readme
 ```
