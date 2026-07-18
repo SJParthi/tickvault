@@ -66,6 +66,9 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // `instrument_lifecycle` (also a pinned-ts current-state master).
     // TICK-CONSERVE-01 (2026-06-10): one row per daily conservation-audit
     // run — same SEBI-audit class + DAY partitioning as cross_verify_1m_audit.
+    // (Audit RETIRED 2026-07-18 with its modules + ErrorCode — dead-WS sweep
+    // follow-up; the TABLE stays retained/swept here per SEBI 5y, exactly
+    // like cross_verify_1m_audit above whose writer also retired.)
     "tick_conservation_audit",
     // AUDIT-WS-01 (2026-06-12): one row per WebSocket lifecycle event —
     // same SEBI-audit class + DAY partitioning as the audit tables above.

@@ -7,6 +7,26 @@ paths:
 
 # Daily Tick-Conservation Audit — Error Codes (TICK-CONSERVE-01)
 
+> **⚠ RETIRED 2026-07-18 (tick-conservation retirement — dead-WS sweep
+> follow-up):** the daily 15:40 IST audit and this code are DELETED. Every
+> audit INPUT died with the dead tick chain (stage-2 sweep #1631, 2026-07-17):
+> the WAL frame counter had no live writer (both live feeds retired — Dhan
+> 2026-07-13, Groww 2026-07-15), the processor outcome counters died with the
+> deleted `tick_processor.rs` chain, and nothing writes the `ticks` table on
+> the REST-only runtime — so every run could only record `partial` (an
+> honest-but-permanent no-signal state, never a measurement). Deleted:
+> `crates/app/src/tick_conservation_boot.rs` (the audit + spawn sites),
+> `crates/storage/src/tick_conservation_audit_persistence.rs` (the Rust
+> WRITER only), the `ws_frame_spill.rs::count_frames_for_ist_day` scan block,
+> the `ErrorCode::TickConserve01DailyResidual` variant, the
+> `tick-conserve-01` CloudWatch filter+alarm (dated note in
+> `error-code-alarms.tf`), and the triage rule. The
+> **`tick_conservation_audit` QuestDB TABLE is RETAINED** (SEBI 5y, never
+> dropped — no DDL drop anywhere; historical rows stay queryable).
+> Relocated survivors: `ws_wal_dir()` → `crates/app/src/boot_helpers.rs`;
+> `parse_questdb_count()` → `crates/app/src/feed_scoreboard_boot.rs`.
+> Content below retained as historical audit per house convention.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C > this file.
 > **Operator directive (2026-06-10, verbatim):** *"Go ahead to achieve zero
 > tick loss"* — following *"I suspect maybe in some cases we are removing
