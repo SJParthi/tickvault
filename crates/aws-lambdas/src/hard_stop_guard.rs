@@ -460,8 +460,7 @@ Why: the native AWS Budget stop-actions fire only ONCE per\n\
 month-crossing. Without disabling the start rule, tomorrow's\n\
 8:30 AM auto-start would restart the box and it would run\n\
 every day for the rest of the month, unkilled.\n\
-After investigating the spend, re-enable with:\n\
-  aws events enable-rule --name {rule}\n",
+After investigating the spend, re-enable with:\n  aws events enable-rule --name {rule}\n",
         instance_id = env.instance_id,
         kill = env.budget_kill_usd,
         rule = env.start_rule_name,
@@ -1146,6 +1145,26 @@ mod tests {
         assert!(msg.contains("Budget breached"));
         assert!(msg.contains("auto-start DISABLED"));
         assert!(msg.contains("aws events enable-rule --name tv-prod-daily-start"));
+        // Byte-exact python-oracle parity (rendered by RUNNING
+        // `_execute_breach_stop` from handler.py @ 9b1c2e6a1^ with the same
+        // inputs: INSTANCE_ID=i-tvapp, START_RULE_NAME=tv-prod-daily-start,
+        // BUDGET_KILL_USD=55, mtd=57.31, was_state=running, disable ok).
+        // Fix round F1: the 2-space indent before the enable-rule command
+        // must survive — a `\n\` source continuation stripped it.
+        assert_eq!(
+            msg.as_str(),
+            "🛑 *Budget breached — box stopped + morning auto-start DISABLED \
+until operator re-enables*\n\
+_instance_: `i-tvapp`\n\
+_was_state_: running\n\
+_MTD spend_: ~$57.31 >= $55 stop-budget\n\
+Morning auto-start rule `tv-prod-daily-start` DISABLED.\n\
+Why: the native AWS Budget stop-actions fire only ONCE per\n\
+month-crossing. Without disabling the start rule, tomorrow's\n\
+8:30 AM auto-start would restart the box and it would run\n\
+every day for the rest of the month, unkilled.\n\
+After investigating the spend, re-enable with:\n  aws events enable-rule --name tv-prod-daily-start\n"
+        );
         assert!(published[0].subject.chars().count() <= 99);
     }
 
