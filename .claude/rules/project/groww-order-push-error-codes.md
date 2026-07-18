@@ -1,3 +1,13 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/common/src/config.rs"
+  - "config/base.toml"
+  - "crates/common/src/ws_event_types.rs"
+  - "crates/trading/src/oms/groww/push/**"
+  - "crates/app/src/groww_order_observability.rs"
+---
+
 # Groww Order/Position PUSH Channel — Error Codes (GROWW-PUSH-01..04)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

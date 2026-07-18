@@ -1,3 +1,12 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/core/src/option_chain/*.rs"
+  - "crates/core/src/cross_verify/*.rs"
+  - "docs/architecture/option-chain-z-plus-heart-piece.md"
+  - "docs/architecture/aws-indices-only-locked-architecture.md"
+---
+
 # Option Chain + Cross-Verify Error Codes (RETIRED)
 
 > **⚠ RETIRED 2026-06-28.** The 8 `OPTION-CHAIN-01..08` `ErrorCode` variants and the entire `option_chain` REST subsystem were DELETED per operator directive 2026-06-28 ("drop the option chain entire implementations and its table also"). The subsystem was disabled since 2026-06-02 (no Dhan Option Chain Data API entitlement) with no live consumer; its QuestDB table was dropped 2026-06-23. The §1 historical content below is retained for audit only — NONE of these codes exist as enum variants anymore. (The §2 CROSS-VERIFY codes were already retired 2026-05-26.)

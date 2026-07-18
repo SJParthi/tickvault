@@ -128,6 +128,14 @@ run_check "tickvault-logs MCP self-test passes" \
     python3 scripts/mcp-servers/tickvault-logs/server.py --self-test
 run_check "tickvault-logs MCP placeholder-env fallback" \
     python3 scripts/mcp-servers/tickvault-logs/test_placeholder_fallback.py
+# 2026-07-18 (rust-only phase 2c, PRE-CUTOVER): the Rust port
+# crates/tickvault-logs-mcp is dual-pinned alongside server.py during the
+# parallel-run window. The python checks above stay until the separate
+# cutover PR swaps .mcp.json after live parallel-run validation.
+run_check "tickvault-logs Rust MCP crate present" \
+    test -f crates/tickvault-logs-mcp/src/main.rs
+run_check "tickvault-logs Rust MCP unit tests pass" \
+    cargo test -p tickvault-logs-mcp --lib
 
 echo ""
 echo "--- source-code invariants ---"

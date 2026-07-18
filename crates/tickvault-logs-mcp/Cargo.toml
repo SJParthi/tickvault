@@ -1,0 +1,31 @@
+# tickvault-logs-mcp — Rust port of scripts/mcp-servers/tickvault-logs/server.py
+# (rust-only purge phase 2c, 2026-07-18). Full 14-tool parity with the Python
+# original; cutover (.mcp.json swap + server.py deletion) is a SEPARATE later
+# PR after live parallel-run validation. Cold-path, out-of-process — the three
+# principles' hot-path clauses do not bind here, but every version is pinned
+# via workspace deps and the crate carries the standard lint attributes.
+
+[package]
+name = "tickvault-logs-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+# sha2: SHA-256 for the hand-rolled AWS SigV4 chain (HMAC-SHA256 is
+# hand-rolled on top of sha2 — the workspace pins sha2 0.11 (digest 0.11)
+# while the only hmac in the lock is the digest-0.10-generation 0.12.1, so
+# a direct hmac dep would need a NEW pin; RFC 4231 vectors + Python-derived
+# goldens pin the hand-rolled implementation instead).
+sha2 = { workspace = true }
+# reqwest blocking: the MCP server is a synchronous stdio loop (mirrors the
+# Python original's urllib usage) — the `blocking` feature is additive on
+# the workspace-pinned 0.13.4.
+reqwest = { workspace = true, features = ["blocking"] }
+# regex: grep_codebase (the Python original uses stdlib `re`). Promoted
+# transitive pin — see the dated Section 11c note in the workspace manifest.
+regex = { workspace = true }

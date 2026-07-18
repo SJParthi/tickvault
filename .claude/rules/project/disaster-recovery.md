@@ -1,3 +1,11 @@
+---
+paths:
+  - "crates/core/src/instrument/boot_mode.rs"
+  - "crates/core/src/instrument/live_tick_atm_resolver.rs"
+  - "crates/core/src/instrument/subscription_planner.rs"
+  - "crates/app/src/main.rs"
+---
+
 # Disaster Recovery — F&O Subscription Boot Modes & Worst-Case Scenarios
 
 > **Authority:** CLAUDE.md > this file.

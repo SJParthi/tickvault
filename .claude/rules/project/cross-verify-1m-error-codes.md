@@ -1,3 +1,10 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/app/src/cross_verify_1m_boot.rs"
+  - "crates/storage/src/cross_verify_1m_audit_persistence.rs"
+---
+
 # Post-Market 1-Minute Cross-Verification — Error Codes
 
 > **Authority:** CLAUDE.md > operator-charter-forever.md > this file.

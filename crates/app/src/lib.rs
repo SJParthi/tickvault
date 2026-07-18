@@ -247,6 +247,12 @@ pub mod order_observability;
 /// profile, spawned ONLY from `dhan_rest_stack` Phase 5b (2026-07-17
 /// correction — Phase 5a is the RETIRED order-update WS spawn slot).
 pub mod order_runtime;
+/// Full-fidelity order/position PUSH-event capture consumer
+/// (ORDER-EVT-01, 2026-07-18 — `order_update_events` /
+/// `position_update_events`): config-gated (`[order_update_events]`)
+/// supervised drain of the two capture channels into the storage writers.
+/// ADDITIVE forensic lane beside the lossy `order_audit` lane.
+pub mod order_update_events_boot;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
 // Dead live-WS sweep stage 1 (2026-07-17, operator directive via

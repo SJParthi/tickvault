@@ -2863,3 +2863,27 @@ rules:
       re-fills at the next boot). Escalate so the operator reads the stage
       field and the tv_ram_store_* depth gauges per the runbook instead of
       any auto-action.
+
+  # ORDER-EVT-01 = the full-fidelity order/position push-event capture lane
+  # degraded (ensure-DDL / append / flush on the order_update_events or
+  # position_update_events tables, a bounded-channel sink_drop at a
+  # producer, or the supervised consumer's receiver_lost / task_respawn).
+  # Escalate (not auto_restart): the capture is a best-effort ADDITIVE
+  # forensic lane (AUDIT-WS-01 / GROWW-ORD-08 class) — the lossy
+  # BrokerOrderEvent fan-out, the hint lane, and the order_audit rows are
+  # untouched, and re-appends are DEDUP-idempotent once QuestDB recovers;
+  # the operator inspects the stage field per the runbook.
+  - name: order-evt-01-push-event-capture-degraded-escalate
+    match:
+      code: ORDER-EVT-01
+    action: escalate
+    runbook_path: .claude/rules/project/order-update-events-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      ORDER-EVT-01 = the additive full-fidelity push-event capture lane
+      degraded, never order-path impact (the lossy fan-out + hint lane +
+      order_audit rows are independent; DEDUP re-appends heal after
+      QuestDB recovers). Escalate so the operator reads the stage field
+      and the tv_order_update_events_* counters per the runbook instead
+      of any auto-action.
