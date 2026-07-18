@@ -249,7 +249,32 @@ book keys on — cross-feeding would double-key instruments invisibly to
 the §3 first-seen-segment tripwire (segments match across the split).
 Honest residual: contract-leg OPTION marks remain dead on the cadence
 path — the cadence lane fetches chains, not per-contract candles, so
-only index spot marks flow. The Fix-F closed-channel warn now
+only index spot marks flow. *(Closed at the PLUMBING level 2026-07-18
+same-day: the chain cadence seam now forwards one mark per RESOLVED
+option contract leg after the option_chain_1m flush ACK — identities
+are REAL exchange_token u64s resolved via the day-cached
+`resolve_groww_contract_books` machinery piggybacked on the
+expiry-list master download (zero extra REST); an unresolved
+strike/leg is counted (`tv_cadence_option_mark_unresolved_total`) +
+skipped, never a synthetic id; only finite >0 LTPs forward, bounded
+≤~1.1K try_sends/min vs the 8,192-default mark channel. PLUMBING ONLY
+today — no option position can exist in paper mode (IDX_I-only
+self-test, no strategy), so option marks match zero positions and
+restore nothing today; they pre-wire option-leg unrealized P&L for
+future option orders. Same day, order_observability.rs stopped
+hardcoding `feed:"dhan"` on order_audit/pnl_audit rows —
+`OrderSideWiring` carries the lane's feed discriminant. Honest
+envelope: option-contract marks resolve only while the book expiry —
+the flat nearest ≥ today from the Groww master — equals the cadence
+fire's day-locked policy expiry, true today for NIFTY/SENSEX by
+construction and for BANKNIFTY under the Assumed no-weeklies
+monthly-only regime; on any divergence day (weeklies returning, or a
+cross-broker `expiry_disagreement` Dhan-wins override re-keying the
+Groww fire) 100% of the affected underlying's option marks are
+counted-unresolved (`tv_cadence_option_mark_unresolved_total`,
+fail-closed, never misattributed) until the cadence §3e book
+delegation lands.)* The Fix-F
+closed-channel warn now
 distinguishes never-any-mark ("mark channel closed before any mark
 arrived — no live mark producer is configured") from the benign
 day-complete close; control flow unchanged. Ratchet:
