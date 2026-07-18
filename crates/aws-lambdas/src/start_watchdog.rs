@@ -146,6 +146,14 @@ fn expand_hour_only_time(raw: &str) -> Option<String> {
     }
 }
 
+/// True when chrono parsed a leap-second time (`:60`), which it represents
+/// as `nanosecond() >= 1_000_000_000`. Python `fromisoformat` REJECTS
+/// second=60 ("ValueError: second must be in 0..59" — oracle-verified), so
+/// any leap-second parse must map to None for oracle parity.
+fn is_chrono_leap_second(nanos: u32) -> bool {
+    nanos >= 1_000_000_000
+}
+
 /// Python `datetime.fromisoformat(raw)` + naive-as-IST interpretation.
 /// Accepts an offset-aware ISO timestamp (seconds, minute, or hour
 /// precision), a naive `YYYY-MM-DD[T ]HH[:MM[:SS[.f]]]` (interpreted as
@@ -157,6 +165,9 @@ pub fn parse_keep_alive_timestamp(raw: &str) -> Option<DateTime<Utc>> {
         return None;
     }
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        if is_chrono_leap_second(dt.nanosecond()) {
+            return None;
+        }
         return Some(dt.with_timezone(&Utc));
     }
     // Python 3.11+ fromisoformat (the lambda runtime is python3.12) accepts
@@ -184,6 +195,9 @@ pub fn parse_keep_alive_timestamp(raw: &str) -> Option<DateTime<Utc>> {
         "%Y-%m-%d %H:%M%z",
     ] {
         if let Ok(dt) = DateTime::parse_from_str(raw, fmt) {
+            if is_chrono_leap_second(dt.nanosecond()) {
+                return None;
+            }
             return Some(dt.with_timezone(&Utc));
         }
     }
@@ -194,7 +208,11 @@ pub fn parse_keep_alive_timestamp(raw: &str) -> Option<DateTime<Utc>> {
         "%Y-%m-%d %H:%M",
     ]
     .iter()
-    .find_map(|fmt| NaiveDateTime::parse_from_str(raw, fmt).ok())
+    .find_map(|fmt| {
+        NaiveDateTime::parse_from_str(raw, fmt)
+            .ok()
+            .filter(|dt| !is_chrono_leap_second(dt.nanosecond()))
+    })
     .or_else(|| {
         NaiveDate::parse_from_str(raw, "%Y-%m-%d")
             .ok()
@@ -1488,6 +1506,11 @@ mod tests {
             "2026-13-40T06:00",
             "T06:00",
             "",
+            // Leap-second `:60` — python fromisoformat raises
+            // "ValueError: second must be in 0..59" (oracle-verified);
+            // chrono would otherwise accept it as nanosecond >= 1e9.
+            "2026-07-03T23:59:60",
+            "2026-06-30 23:59:60.5",
         ] {
             assert_eq!(parse_keep_alive_timestamp(garbage), None, "{garbage:?}");
         }

@@ -18,8 +18,10 @@
 #      per month-crossing — without this, the next morning's start cron
 #      restarts the box and it runs daily, unkilled, for the rest of
 #      the month. Cost Explorer errors fail-safe (page, never disable).
-#    - Source lives in deploy/aws/lambda/hard-stop-guard/ (extracted
-#      from an inline heredoc 2026-07-03 so the logic is unit-tested)
+#    - Source lives in crates/aws-lambdas/src/hard_stop_guard.rs (the
+#      Rust port, rust-only phase 2b-2 wave 2 — the former
+#      deploy/aws/lambda/hard-stop-guard/ Python dir was deleted in the
+#      same PR; see the Hard Auto-Stop Guard section comment below)
 #
 # Cost: Both Lambdas under 1 invocation/day each — well within the
 # AWS Lambda free tier (1M invocations/mo). Zero additional cost.
