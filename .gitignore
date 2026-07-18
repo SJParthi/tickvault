@@ -120,3 +120,8 @@ mutants.out.old/
 target/llvm-cov-target/
 .claude/worktrees/
 target2/
+
+# ---- CI-built Rust Lambda zips (rust-only phase 2b-1) ----
+# Built by the terraform-apply.yml build-lambdas step (cargo-lambda);
+# never committed — terraform reads them at plan/apply time only.
+deploy/aws/terraform/.lambda-zips/

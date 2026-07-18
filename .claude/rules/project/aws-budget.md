@@ -54,6 +54,20 @@ died with the live-WS retirements):
 Net ≈ **−$0.70/mo pre-GST (~−₹70/mo incl. 18% GST at ₹85/$)** — the real
 gain is the freed dashboard slot + ~730 LoC of dead monitoring code.
 
+## COST NOTE 2026-07-18 — tick-conservation retirement (−~$0.10/mo)
+
+The tick-conservation retirement (dead-WS sweep follow-up, this PR) removed
+the `tv-<env>-errcode-tick-conserve-01` log-filter alarm (−1 alarm ≈
+−$0.10/mo, Verified against the terraform diff): its only emit site
+(`crates/app/src/tick_conservation_boot.rs`, the 15:40 IST reconciler's
+Leak arm) was deleted with the audit modules — every audit input died with
+the dead tick chain in the stage-2 sweep (#1631), so the filter could never
+match again (the ws-reinject-01 dead-filter precedent). No
+`tv_tick_conservation_*` metric was ever in the EMF allowlist (grep-verified
+— zero series delta). The `tick_conservation_audit` QuestDB TABLE is
+retained (SEBI 5y). Dated notes in `error-code-alarms.tf` +
+`observability-architecture.md`.
+
 ## COST NOTE 2026-07-18 — dead live-WS sweep stage 4 (−~$0.40/mo alarms; −4 EMF series)
 
 The stage-4 dead-producer sweep (this PR) retired the 4 dead-tick alarm
