@@ -70,7 +70,7 @@ operator inspects, never manually re-persists first).
 | `ensure_ddl` | the `CREATE TABLE` / `ALTER ADD COLUMN` / `DEDUP ENABLE` `/exec` leg returned non-2xx or was unreachable — NOTE the duplicate-row window: the first ILP write may auto-create the table WITHOUT DEDUP UPSERT KEYS until a later boot's ensure succeeds |
 | `append` | an ILP buffer append was rejected — the row is skipped, the loop continues |
 | `flush` | the ILP-over-HTTP flush was refused by the per-request server ACK (the 2026-07-05 fire-and-forget lesson) — pending rows DISCARDED (`discard_pending`, the poisoned-buffer defense; `tv_order_update_events_rows_discarded_total` counts) |
-| `sink_drop` | a producer's bounded-sink `try_send` was refused (full/closed) — the event's capture row is LOST, counted `tv_order_update_events_dropped_total{reason="full"\|"closed"}`; the push read loop is never blocked |
+| `sink_drop` | a producer's bounded-sink `try_send` was refused (full/closed) — the event's capture row is LOST, counted PER EVENT `tv_order_update_events_dropped_total{reason="full"\|"closed"}`; the coded `error!` is EDGE-LATCHED per channel on BOTH feeds (audit-findings Rule 4 — the episode's first drop is loud, subsequent drops are `debug!`+counter, a successful publish re-arms); the push read loop is never blocked |
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `ORDER-EVT-01`; the `stage`

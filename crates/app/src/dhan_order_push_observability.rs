@@ -17,8 +17,10 @@
 //! stage pattern mirrored from `order_observability.rs` — NO new
 //! ErrorCode. No live orders; `dry_run` is untouched.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_common::broker_order_events::{
     OrderUpdateEventRecord, build_dhan_order_event_record,
@@ -218,11 +220,21 @@ fn persist_push_row(writer: &mut OrderAuditWriter, row: &OrderAuditRow) {
 // Dhan producer half of the order_update_events capture lane, 2026-07-18)
 // ---------------------------------------------------------------------------
 
+/// Sink-drop episode latch (round-2 polish — the Groww
+/// `order_events.rs::ORDER_SINK_DROP_LATCHED` edge discipline,
+/// audit-findings Rule 4): the FIRST refused publish of an episode logs
+/// the coded `error!`; every subsequent drop in the same episode is
+/// counted-only (`debug!`). A successful publish re-arms the latch, so
+/// the NEXT episode's first drop is loud again. Counters stay per-event
+/// (the trend is never lost).
+static DHAN_ORDER_SINK_DROP_LATCHED: AtomicBool = AtomicBool::new(false);
+
 /// Best-effort `try_send` of one Dhan full-fidelity capture record into the
 /// `order_update_events` consumer channel. `None` sender (capture disabled)
 /// is a silent no-op; a FULL or CLOSED channel drops the ROW loudly
-/// (counted + coded `ORDER-EVT-01 stage="sink_drop"`) and NEVER blocks or
-/// fails the paper-audit path — the capture is additive forensics.
+/// (counted per-event + coded `ORDER-EVT-01 stage="sink_drop"` on the
+/// episode's FIRST drop, edge-latched) and NEVER blocks or fails the
+/// paper-audit path — the capture is additive forensics.
 fn publish_dhan_event_record(
     events_tx: Option<&mpsc::Sender<OrderUpdateEventRecord>>,
     record: OrderUpdateEventRecord,
@@ -230,23 +242,43 @@ fn publish_dhan_event_record(
     let Some(tx) = events_tx else {
         return;
     };
-    if let Err(e) = tx.try_send(record) {
-        let reason = match e {
-            mpsc::error::TrySendError::Full(_) => "full",
-            mpsc::error::TrySendError::Closed(_) => "closed",
-        };
-        metrics::counter!("tv_order_update_events_dropped_total", "reason" => reason).increment(1);
-        error!(
-            code = ErrorCode::OrderEvt01PersistFailed.code_str(),
-            stage = "sink_drop",
-            feed = "dhan",
-            channel = "order",
-            reason,
-            "ORDER-EVT-01: dhan order push-event capture record dropped — the \
-             capture consumer channel is {reason}; the forensic row for this \
-             event is lost (best-effort capture; the paper audit path and the \
-             feed are unaffected)"
-        );
+    match tx.try_send(record) {
+        Ok(()) => {
+            // Falling edge: a successful publish re-arms the episode latch.
+            if DHAN_ORDER_SINK_DROP_LATCHED.load(Ordering::Relaxed) {
+                DHAN_ORDER_SINK_DROP_LATCHED.store(false, Ordering::Relaxed);
+            }
+        }
+        Err(e) => {
+            let reason = match e {
+                mpsc::error::TrySendError::Full(_) => "full",
+                mpsc::error::TrySendError::Closed(_) => "closed",
+            };
+            metrics::counter!("tv_order_update_events_dropped_total", "reason" => reason)
+                .increment(1);
+            if DHAN_ORDER_SINK_DROP_LATCHED.swap(true, Ordering::Relaxed) {
+                debug!(
+                    stage = "sink_drop",
+                    feed = "dhan",
+                    channel = "order",
+                    reason,
+                    "dhan order push-event capture record dropped ({reason}) — \
+                     episode already reported; counted only"
+                );
+                return;
+            }
+            error!(
+                code = ErrorCode::OrderEvt01PersistFailed.code_str(),
+                stage = "sink_drop",
+                feed = "dhan",
+                channel = "order",
+                reason,
+                "ORDER-EVT-01: dhan order push-event capture record dropped — the \
+                 capture consumer channel is {reason}; the forensic row for this \
+                 event is lost (best-effort capture; the paper audit path and the \
+                 feed are unaffected)"
+            );
+        }
     }
 }
 
@@ -382,6 +414,19 @@ pub fn spawn_dhan_order_push_consumer(
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process-global
+    /// `DHAN_ORDER_SINK_DROP_LATCHED` episode latch (the
+    /// `tv_api_token_prod_guard` shared-Mutex precedent — parallel test
+    /// threads publishing through `publish_dhan_event_record` would
+    /// otherwise race the latch assertions). Poisoning-safe.
+    static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn latch_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Wire-shaped OrderUpdate via serde defaults (the order_runtime
     /// `wire_update` house helper — OrderUpdate has no `Default` impl).
     fn update_with(status: &str) -> OrderUpdate {
@@ -493,13 +538,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_dhan_event_record_delivers_into_the_capture_channel() {
+        let _latch_lock = latch_test_guard();
         let (tx, mut rx) = mpsc::channel(4);
         let update = update_with("TRADED");
         publish_dhan_event_record(Some(&tx), build_dhan_order_event_record(&update, 909));
+        // try_recv (not .recv().await): try_send delivers synchronously, and
+        // awaiting would hold the std latch guard across an await point
+        // (clippy::await_holding_lock).
         let rec = rx
-            .recv()
-            .await
-            .unwrap_or_else(|| panic!("capture record expected"));
+            .try_recv()
+            .unwrap_or_else(|_| panic!("capture record expected"));
         assert_eq!(rec.ts_ist_nanos, 909);
         assert_eq!(rec.order_id, "112111182045");
         assert_eq!(rec.raw_status, "TRADED");
@@ -515,6 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_dhan_event_record_full_channel_drops_without_blocking() {
+        let _latch_lock = latch_test_guard();
         let (tx, _rx) = mpsc::channel(1);
         let update = update_with("PENDING");
         // Fill the single slot, then publish again — must return (drop),
@@ -525,10 +574,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_dhan_event_record_closed_channel_drops_without_panic() {
+        let _latch_lock = latch_test_guard();
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let update = update_with("CANCELLED");
         publish_dhan_event_record(Some(&tx), build_dhan_order_event_record(&update, 3));
+    }
+
+    /// Round-2 polish: the sink-drop `error!` is EDGE-LATCHED — a drop
+    /// latches the episode, a successful publish re-arms it (the Groww
+    /// `ORDER_SINK_DROP_LATCHED` discipline mirrored on the Dhan producer).
+    #[tokio::test]
+    async fn test_publish_dhan_sink_drop_latch_sets_on_drop_and_rearms_on_success() {
+        let _latch_lock = latch_test_guard();
+        let update = update_with("PENDING");
+        // Drop path: full channel latches the episode.
+        let (full_tx, _full_rx) = mpsc::channel(1);
+        publish_dhan_event_record(Some(&full_tx), build_dhan_order_event_record(&update, 1));
+        publish_dhan_event_record(Some(&full_tx), build_dhan_order_event_record(&update, 2));
+        assert!(
+            DHAN_ORDER_SINK_DROP_LATCHED.load(Ordering::Relaxed),
+            "a refused publish must latch the sink-drop episode"
+        );
+        // Falling edge: a successful publish re-arms the latch.
+        let (ok_tx, mut ok_rx) = mpsc::channel(4);
+        publish_dhan_event_record(Some(&ok_tx), build_dhan_order_event_record(&update, 3));
+        assert!(ok_rx.try_recv().is_ok(), "successful publish must deliver");
+        assert!(
+            !DHAN_ORDER_SINK_DROP_LATCHED.load(Ordering::Relaxed),
+            "a successful publish must re-arm the sink-drop latch"
+        );
     }
 
     #[test]
