@@ -1340,24 +1340,44 @@ impl OrderManagementSystem {
                     continue;
                 }
                 order.status = update.status;
-                // ⚠ MANDATORY PRE-LIVE FOLLOW-UP (post-#1562 audit,
-                // 2026-07-17 — order-runtime-dryrun.md §3): this
-                // non-terminal arm copies traded_qty UNCONDITIONALLY in
-                // BOTH directions and then clears needs_reconciliation.
-                // The M2 comment above declares the broker GET snapshot
-                // can be STALER than local state, so a stale snapshot
-                // silently LOWERS the fill-delta baseline (the C8 error!
-                // covers only the UPWARD direction) — a later WS
-                // (re)delivery of the true cumulative then computes a
+                // Downward-copy guard (2026-07-18 — direction (a) of the
+                // order-runtime-dryrun.md §3 third landmine, closing the
+                // post-#1562 MANDATORY PRE-LIVE follow-up; mirrors the C2
+                // WS-side monotone guard in `apply_fill_fields`): the M2
+                // comment above declares the broker GET snapshot can be
+                // STALER than local state, so a snapshot reporting
+                // traded_qty BELOW the locally-recorded cumulative must
+                // NOT lower the fill-delta baseline — a later WS
+                // (re)delivery of the true cumulative would compute a
                 // positive qty_delta in extract_fill_delta → a SECOND
                 // FillEvent for fills already booked → RiskEngine
-                // double-count (contradicting the "double-count-safe"
-                // contract). Reachable in LIVE mode only (dry-run returns
-                // above before corrections). Fix directions (order-side
-                // owner): refuse the downward copy on non-terminal orders
-                // (symmetric with the C2 WS-side monotone guard), or emit
-                // the correction as a FillEvent. No dry_run=false flip
-                // without one of them.
+                // double-count. The downward copy is REFUSED on
+                // non-terminal orders: the local (traded_qty,
+                // avg_traded_price) pair stands (guarded together — the
+                // avg belongs to the qty it was recorded with), the
+                // divergence stays flagged (needs_reconciliation = true —
+                // a refused correction is NOT consumed, mirroring the
+                // terminal-arm status_suppressed semantics), and ONE
+                // coded divergence error fires. Upward and equal copies
+                // apply exactly as before. LIVE-mode-only arm by
+                // construction — the dry-run early return at the top of
+                // reconcile() precedes every correction.
+                if update.traded_qty < order.traded_qty {
+                    error!(
+                        code = ErrorCode::OmsGapReconciliation.code_str(),
+                        order_id = %update.order_id,
+                        local_qty = order.traded_qty,
+                        broker_qty = update.traded_qty,
+                        "OMS-GAP-02: stale broker snapshot reported traded_qty \
+                         below the locally-recorded cumulative — downward copy \
+                         refused on non-terminal order; fill-delta baseline \
+                         preserved (a lowered baseline would double-emit a \
+                         FillEvent on the next WS redelivery)"
+                    );
+                    order.needs_reconciliation = true;
+                    order.updated_at_us = now_epoch_us();
+                    continue;
+                }
                 order.traded_qty = update.traded_qty;
                 order.avg_traded_price = update.avg_traded_price;
                 order.needs_reconciliation = false;
@@ -6092,6 +6112,52 @@ mod tests {
         assert_eq!(oms.order("2").unwrap().status, OrderStatus::Rejected);
         // …but broker fill fields apply even on terminal orders (B1).
         assert_eq!(oms.order("2").unwrap().traded_qty, 50);
+        handle.abort();
+    }
+
+    /// PR-A (2026-07-18) — the `order-runtime-dryrun.md` s3 third landmine,
+    /// direction (a): a STALE broker snapshot reporting `traded_qty` BELOW
+    /// the locally-recorded cumulative must NOT lower the fill-delta
+    /// baseline on a NON-TERMINAL order. Pre-fix bite (verbatim failing run
+    /// recorded in the fix commit body): reconcile copied 50 -> 25
+    /// unconditionally, so the subsequent WS redelivery of the SAME
+    /// cumulative 50 computed delta 25 -> a SECOND `FillEvent` (1 lot @ lot
+    /// 25) -> RiskEngine double-count.
+    #[tokio::test]
+    async fn live_mode_reconcile_refuses_downward_copy_no_double_fill() {
+        let body = format!("[{}]", broker_order_json("1", "PART_TRADED", 25));
+        let (base_url, handle) = start_oms_mock(200, &body).await;
+
+        let mut oms = make_live_oms(&base_url);
+        let mut order = make_reconcile_order("1", OrderStatus::PartTraded);
+        order.traded_qty = 50; // fills already recorded via the WS path
+        order.avg_traded_price = 245.5;
+        oms.orders.insert("1".to_owned(), order);
+
+        oms.reconcile().await.unwrap();
+        let local = oms.order("1").unwrap();
+        // The downward copy is REFUSED — the fill-delta baseline holds…
+        assert_eq!(
+            local.traded_qty, 50,
+            "stale downward broker snapshot must not lower the fill baseline"
+        );
+        assert!(
+            local.needs_reconciliation,
+            "a refused downward correction is NOT consumed — the divergence stays flagged"
+        );
+        // …so a WS redelivery of the SAME cumulative 50 is delta 0 -> no
+        // second FillEvent (the double-count bite this test pins).
+        let mut u = make_order_update("1", "PART_TRADED");
+        u.traded_qty = 50;
+        u.avg_traded_price = 245.5;
+        u.exchange = "NSE".to_owned();
+        u.segment = "D".to_owned();
+        let fill = oms.handle_order_update(&u).unwrap();
+        assert!(
+            fill.is_none(),
+            "WS redelivery of an already-booked cumulative must not emit a \
+             second FillEvent (double-count), got {fill:?}"
+        );
         handle.abort();
     }
 
