@@ -64,6 +64,9 @@ use crate::cadence_escalation::{
     flush_off_worker, target_outcome_of,
 };
 use crate::dhan_cadence_executor::{date_to_yyyymmdd, deadline_remaining_ms, yyyymmdd_to_date};
+use crate::groww_contract_1m_boot::{
+    GrowwContractBook, contract_segment_code, resolve_groww_contract_books,
+};
 use crate::groww_option_chain_1m_boot::{
     GrowwChainFetchFailure, build_chain_audit_row, chain_audit_append_best_effort,
     chain_audit_flush_best_effort, chain_error_class_for_status, download_master_bounded,
@@ -136,6 +139,51 @@ pub fn groww_chain_identity(
         .map(|(slot, (underlying, exchange, groww_symbol))| {
             (slot, underlying, exchange, groww_symbol)
         })
+}
+
+/// Day-keyed contract-identity index for the chain mark tap:
+/// `(underlying, strike_paise, leg)` → `(exchange_token u64, segment_code)`.
+type ContractMarkIndex = std::collections::HashMap<(&'static str, i64, &'static str), (u64, u8)>;
+
+/// Integer-paise strike key — float-equality-free join between the chain
+/// response's vendor strike keys and the master-derived contract book's
+/// symbol-parsed strikes. `None` = non-finite / non-positive (skipped +
+/// counted by the caller, never a guessed identity). Pure.
+fn strike_paise_key(strike: f64) -> Option<i64> {
+    if !strike.is_finite() || strike <= 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    // APPROVED: guarded finite/positive above; real NSE/BSE strikes are
+    // orders of magnitude inside i64 paise range.
+    Some((strike * 100.0).round() as i64)
+}
+
+/// Build the day's contract-identity index from the resolved contract
+/// books (master-CSV-derived — the legacy contract-leg id space:
+/// exchange_token u64 + NSE_FNO/BSE_FNO segment codes). Rows with a
+/// non-representable token or strike are skipped (the books already
+/// dropped malformed/colliding master rows). Pure.
+fn build_contract_mark_index(books: &[GrowwContractBook]) -> ContractMarkIndex {
+    let mut index = ContractMarkIndex::new();
+    for book in books {
+        let seg_code = contract_segment_code(book.segment);
+        for slot in &book.strikes {
+            let Some(key) = strike_paise_key(slot.strike) else {
+                continue;
+            };
+            for (leg, contract) in [("CE", slot.ce.as_ref()), ("PE", slot.pe.as_ref())] {
+                if let Some(contract) = contract
+                    && let Ok(token) = u64::try_from(contract.token)
+                {
+                    index
+                        .entry((book.underlying, key, leg))
+                        .or_insert((token, seg_code));
+                }
+            }
+        }
+    }
+    index
 }
 
 /// Pure: the day's DISTINCT sorted FUTURE option expiries for one
@@ -217,6 +265,18 @@ pub struct GrowwCadenceExecutor {
     /// underlying) — the lock is held across the master download so
     /// concurrent fires serialize onto ONE download per day.
     expiry_cache: Mutex<Option<(NaiveDate, [Vec<u32>; 3])>>,
+    /// Day-keyed (IST) option-contract IDENTITY index for the chain mark
+    /// tap: `(underlying, strike_paise, leg)` → `(exchange_token u64,
+    /// segment_code)`. Resolved from the SAME once-per-day instruments
+    /// master download `fetch_expiry_list` already performs (the
+    /// day-cached `resolve_groww_contract_books` machinery — zero extra
+    /// REST); `fetch_chain` only READS it. The chain response itself
+    /// carries NO per-contract numeric id, and a SYNTHETIC id is BANNED
+    /// (id-space divergence from the exchange_token space the legacy
+    /// contract-leg tap + `option_contract_1m_rest` use — the exact
+    /// class the cadence_mark_source_guard id-space ban exists for): an
+    /// unresolvable leg is skipped + counted, never guessed.
+    contract_marks: Mutex<Option<(NaiveDate, ContractMarkIndex)>>,
     /// Escalation-edge tally (fix round 2026-07-17): the legacy
     /// SPOT1M-01/CHAIN-02 3-consecutive-fully-failed-minutes paging edge,
     /// minute-bucketed executor-side (persist failure = failed minute).
@@ -270,6 +330,7 @@ impl GrowwCadenceExecutor {
             token_cache: Mutex::new(GrowwTokenCache::new()),
             moneyness_latches: Mutex::new(MoneynessWarnLatches::default()),
             expiry_cache: Mutex::new(None),
+            contract_marks: Mutex::new(None),
             escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier,
             mark_forwarder,
@@ -294,6 +355,7 @@ impl GrowwCadenceExecutor {
             token_cache: Mutex::new(token_cache),
             moneyness_latches: Mutex::new(MoneynessWarnLatches::default()),
             expiry_cache: Mutex::new(None),
+            contract_marks: Mutex::new(None),
             escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier: None,
             mark_forwarder: None,
@@ -1035,6 +1097,63 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                 }
                 flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
             }
+            // Order-runtime OPTION mark tap (2026-07-18, Item 3): forward
+            // one mark per RESOLVED contract leg ONLY after the
+            // option_chain_1m flush ACK (the spot tap's persist-confirm
+            // discipline — a mark must never reference a price the audit
+            // record does not back). Identity = the day-cached
+            // master-derived contract index (real exchange_token u64 +
+            // NSE_FNO/BSE_FNO segment code — the legacy contract-leg id
+            // space); a leg with no index entry is skipped + counted
+            // (tv_cadence_option_mark_unresolved_total) — a SYNTHETIC id
+            // is banned (id-space divergence class). Volume bound:
+            // ~100-190 strikes × 2 legs × 3 underlyings ≈ ≤ ~1.1K
+            // try_sends per minute close vs the default 8,192-cap mark
+            // channel ([order_runtime].mark_channel_capacity, floor 256)
+            // — full-chain forwarding fits comfortably; drops are counted
+            // best-effort (tv_mark_forward_dropped_total) and
+            // consequence-free today (zero option positions can exist in
+            // paper mode — the self-test entry is IDX_I-only and no
+            // strategy exists), so this tap is PLUMBING for future
+            // option-leg unrealized P&L, restoring nothing today.
+            if !persist_failed && let Some(forwarder) = self.mark_forwarder.as_ref() {
+                let marks = self.contract_marks.lock().await;
+                match marks.as_ref().filter(|(day, _)| *day == trading_date) {
+                    Some((_, index)) => {
+                        for leg in &chain.legs {
+                            // Only real, finite, positive LTPs become
+                            // marks (0.0 = illiquid/omitted — skipped
+                            // silently, not an identity failure).
+                            if !leg.ltp.is_finite() || leg.ltp <= 0.0 {
+                                continue;
+                            }
+                            let resolved = strike_paise_key(leg.strike)
+                                .and_then(|key| index.get(&(underlying, key, leg.leg)));
+                            match resolved {
+                                Some(&(token, seg_code)) => {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    // APPROVED: MarkUpdate carries f32 by
+                                    // contract (the wire LTP precision);
+                                    // price-level narrowing only.
+                                    forwarder.mark_forward(token, seg_code, leg.ltp as f32);
+                                }
+                                None => {
+                                    metrics::counter!("tv_cadence_option_mark_unresolved_total")
+                                        .increment(1);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // No same-day index (master download not yet run /
+                        // failed) — every leg is identity-unresolved;
+                        // counted, never a synthetic id, never a download
+                        // on the chain fire's critical path.
+                        metrics::counter!("tv_cadence_option_mark_unresolved_total")
+                            .increment(u64::try_from(chain.legs.len()).unwrap_or(u64::MAX));
+                    }
+                }
+            }
             let underlying_spot = (!chain.underlying_ltp_missing
                 && chain.underlying_ltp.is_finite()
                 && chain.underlying_ltp > 0.0)
@@ -1146,6 +1265,25 @@ impl CadenceExecutor for GrowwCadenceExecutor {
         ];
         let out = lists[slot].clone();
         *cache = Some((today, lists));
+        // Piggyback the chain mark tap's contract-identity index on this
+        // SAME once-per-day master download (zero extra REST; never on
+        // the chain fire's deadline-bounded critical path). Gated on the
+        // forwarder: with [order_runtime] off the index is dead weight.
+        if self.mark_forwarder.is_some() {
+            let (books, degraded, skipped_rows, token_collisions) =
+                resolve_groww_contract_books(&rows, today);
+            let index = build_contract_mark_index(&books);
+            if !degraded.is_empty() || skipped_rows > 0 || token_collisions > 0 {
+                debug!(
+                    ?degraded,
+                    skipped_rows,
+                    token_collisions,
+                    "groww cadence: contract mark index resolved with gaps \
+                     (unresolved chain legs are counted, never guessed)"
+                );
+            }
+            *self.contract_marks.lock().await = Some((today, index));
+        }
         Ok(out)
     }
 }
@@ -1174,6 +1312,62 @@ mod tests {
             auth_rejected,
             msg: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn test_strike_paise_key_guards_and_rounds() {
+        assert_eq!(strike_paise_key(25500.0), Some(2_550_000));
+        assert_eq!(strike_paise_key(25500.05), Some(2_550_005));
+        assert_eq!(strike_paise_key(0.0), None);
+        assert_eq!(strike_paise_key(-5.0), None);
+        assert_eq!(strike_paise_key(f64::NAN), None);
+        assert_eq!(strike_paise_key(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn test_build_contract_mark_index_real_tokens_never_synthetic() {
+        use crate::groww_contract_1m_boot::{GrowwContractRef, GrowwStrikeSlot};
+        let book = GrowwContractBook {
+            underlying: "NIFTY",
+            exchange: "NSE",
+            segment: "NSE_FNO",
+            underlying_security_id: 1,
+            expiry: NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            strikes: vec![
+                GrowwStrikeSlot {
+                    strike: 25500.0,
+                    ce: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25500-CE".to_string(),
+                        token: 12345,
+                    }),
+                    pe: None,
+                },
+                GrowwStrikeSlot {
+                    strike: 25600.0,
+                    ce: None,
+                    pe: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25600-PE".to_string(),
+                        // Negative token cannot become a u64 mark id —
+                        // skipped, never a synthetic identity.
+                        token: -7,
+                    }),
+                },
+            ],
+        };
+        let index = build_contract_mark_index(std::slice::from_ref(&book));
+        assert_eq!(
+            index.get(&("NIFTY", 2_550_000, "CE")),
+            Some(&(
+                12345_u64,
+                tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO
+            ))
+        );
+        // One-sided strike: no PE entry fabricated.
+        assert_eq!(index.get(&("NIFTY", 2_550_000, "PE")), None);
+        // Non-representable token: no entry — the tap counts it
+        // unresolved instead of guessing an id.
+        assert_eq!(index.get(&("NIFTY", 2_560_000, "PE")), None);
+        assert_eq!(index.len(), 1);
     }
 
     fn master_row(
