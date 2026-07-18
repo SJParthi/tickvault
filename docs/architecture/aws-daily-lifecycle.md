@@ -470,6 +470,8 @@ These are inconsistent. The 30-min difference is operationally meaningful becaus
 - Telegram Bot rate limits: https://core.telegram.org/bots/faq
 - Existing repo anchors: `deploy/aws/terraform/main.tf:253-275`, `deploy/aws/terraform/alarms.tf`, `crates/core/src/notification/service.rs:50-89`, `deploy/aws/lambda/claude-triage/handler.py`
 
+> (2026-07-18: `deploy/aws/lambda/claude-triage/handler.py` was deleted in the Rust-only purge — retrieve it via git history at any pre-2026-07-18 commit.)
+
 ---
 
 ## §D. 9-box per-item checklist (mandatory per operator-charter §C)

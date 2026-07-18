@@ -54,7 +54,8 @@ pub mod network;
 pub mod notification;
 pub mod parser;
 pub mod pipeline;
-pub mod scheduler;
+// Dead-code batch 2 (2026-07-18): `scheduler` DELETED — zero refs; its module
+// doc still described the DELETED WS timeline (08:30 WS up … 15:30 disconnect).
 pub mod websocket;
 
 #[cfg(test)]
