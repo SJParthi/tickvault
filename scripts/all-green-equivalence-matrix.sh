@@ -33,6 +33,8 @@
 # Honest residual (the questdb-console-gate-matrix precedent): the harness
 # executes the step's SCRIPT, not its YAML attributes — a `continue-on-error:`
 # added to the ci.yml step would not be caught here.
+# (2026-07-18 review-round-1 fix: fixture-row DELETION is no longer a residual
+# — the count floor below is ratcheted at the full 88-row matrix.)
 # =============================================================================
 set -euo pipefail
 
@@ -116,8 +118,12 @@ while IFS=$'\t' read -r name event overrides expect_exit expect_out; do
 done < <(sed -n '/^# FIXTURES-BEGIN/,/^# FIXTURES-END/p' "${BASH_SOURCE[0]}" | grep -v '^#')
 
 echo "all-green-equivalence-matrix: ${pass}/${total} fixtures match the frozen expected outputs (${fail} mismatches)"
-if [ "$total" -lt 40 ]; then
-  echo "FATAL: fixture table shrank below the 40-case floor (found ${total})" >&2
+# 2026-07-18 ratchet (review round 1): the floor is pinned at the CURRENT
+# fixture count (88) and only moves UP as fixtures are added — deleting any
+# fixture row below 88 fails the guard (the 40-row floor left rows 41..88
+# mechanically deletable, a weakening vector on the merge choke point).
+if [ "$total" -lt 88 ]; then
+  echo "FATAL: fixture table shrank below the 88-case ratchet floor (found ${total})" >&2
   exit 2
 fi
 [ "$fail" -eq 0 ] || exit 1
