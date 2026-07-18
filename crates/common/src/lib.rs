@@ -23,7 +23,9 @@
 pub mod always_on;
 pub mod broker_order_events;
 pub mod build_info;
-pub mod candle_fold;
+// Dead-code batch 2 (2026-07-18): `candle_fold` DELETED — zero consumers
+// (the app's `rest_candle_fold` is a name-twin with its own types, not a
+// consumer of this module).
 pub mod config;
 pub mod constants;
 pub mod disconnect_cause;
@@ -32,8 +34,9 @@ pub mod error_code;
 pub mod feed;
 pub mod feed_blame;
 pub mod feed_health;
-pub mod feed_parity;
-pub mod formulas;
+// Dead-code batch 2 (2026-07-18): `feed_parity` DELETED — the CANCELLED
+// §33.2 Groww live-vs-backtest 1m comparer (zero refs; NOT the index_futures
+// FUTIDX-02 seam, which stands). `formulas` DELETED — only ref was this decl.
 pub mod instrument_registry;
 pub mod instrument_types;
 pub mod live_bar_freshness;
@@ -43,10 +46,12 @@ pub mod live_bar_freshness;
 pub mod market_hours;
 pub mod moneyness;
 pub mod muhurat;
-pub mod open_price_rest_fallback;
-pub mod open_price_source;
+// Dead-code batch 2 (2026-07-18): `open_price_rest_fallback` +
+// `open_price_source` DELETED as a pair — the retired `/marketfeed/quote`
+// open-price fallback (already a REMOVE class in
+// no-rest-except-live-feed-2026-06-27.md §3; zero refs outside the pair).
 pub mod order_types;
-pub mod phase;
+// Dead-code batch 2 (2026-07-18): `phase` DELETED — zero refs.
 pub mod portfolio_types;
 pub mod price_precision;
 pub mod sanitize;

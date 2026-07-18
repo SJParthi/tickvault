@@ -594,7 +594,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // Install the manager exactly as the lane does (main.rs ~7172/7183): the
     // global OnceLock for the force-renewal paths + the live slot so the
     // token health/headroom gauges read THIS manager. With the lane retired
-    // nothing ever calls `clear_live_token_manager`, so the slot stays ours.
+    // nothing ever clears the live-token slot, so the slot stays ours.
     if !tickvault_core::auth::token_manager::set_global_token_manager(token_manager.clone()) {
         warn!("global TokenManager already installed — skipping (Dhan REST-only stack)");
     }

@@ -246,23 +246,6 @@ pub enum NotificationEvent {
         next_retry_ms: u64,
     },
 
-    /// Pre-market profile check FAILED — dataPlan, activeSegment, or token
-    /// expiry is not acceptable for today's trading session. Fires CRITICAL
-    /// Telegram on every failure. If the check runs during market hours
-    /// AND fails, the boot sequence HALTS (Parthiban directive 2026-04-21).
-    ///
-    /// Common causes:
-    /// - `dataPlan != "Active"` — subscription expired over weekend
-    /// - `activeSegment` lacks `"Derivative"` — F&O access revoked
-    /// - Token has < 4h until expiry — rotate before market open
-    ///
-    /// `within_market_hours = true` means HALT fired; `false` means operator
-    /// has until market open to investigate.
-    PreMarketProfileCheckFailed {
-        reason: String,
-        within_market_hours: bool,
-    },
-
     // `MidSessionProfileInvalidated` DELETED 2026-07-14 (operator Dhan
     // noise lock — dhan-rest-only-noise-lock-2026-07-14.md): the 900s
     // profile probe runs SILENTLY (coded error! + counters); a terminal
@@ -291,55 +274,6 @@ pub enum NotificationEvent {
         subscribed_count: usize,
         capacity: usize,
         last_activity_secs_ago: Option<u32>,
-    },
-
-    /// Aggregate pool-online summary — fires on rising-edge when ALL
-    /// spawned connections have actually reached `Connected` state.
-    /// Carries the per-connection breakdown so the operator sees pool
-    /// capacity utilisation + heartbeat liveness at a glance.
-    ///
-    /// `boot_path` distinguishes pre-9am normal slow boot from the
-    /// mid-market crash-recovery fast boot (per operator intent
-    /// 2026-05-04: slow boot is the default, fast boot is reserved for
-    /// emergency restart between 09:00–15:30 IST when cache is valid).
-    ///
-    /// `per_connection[i] = (subscribed_count, capacity, last_activity_secs_ago)`
-    /// indexed by `connection_index`. Length == `total`.
-    WebSocketPoolOnline {
-        connected: usize,
-        total: usize,
-        per_connection: Vec<(usize, usize, Option<u32>)>,
-        boot_path: BootPathLabel,
-        boot_wall_clock_secs: f64,
-        /// Age (secs) of the most-recent REAL tick across all instruments,
-        /// or `None` if zero real ticks captured yet. Historically sourced
-        /// from the tick-gap detector's `freshest_tick_age_secs` (DELETED
-        /// in PR-C3, 2026-07-14, with the Dhan WS lane; real ticks only —
-        /// never pings). Closes the 2026-06-02 false-OK where the per-feed
-        /// "last update Xs ago" counted Dhan keep-alive pings and could
-        /// read healthy while no real ticks were captured.
-        last_real_tick_age_secs: Option<u32>,
-        /// One status line per ENABLED market-data feed (Dhan, Groww, any
-        /// future feed) — operator directive 2026-07-03: the "ready to
-        /// trade" readiness message must name EVERY feed, not just the
-        /// Dhan connection pool. Built at emit time from the same
-        /// per-feed health registry the feed-control page reads.
-        feeds: Vec<FeedStatusLine>,
-    },
-
-    /// Aggregate pool-degraded summary — fires when only a subset of
-    /// connections reached `Connected` after the per-conn deadline.
-    /// `stuck[i] = (connection_index, state_label)` describes each
-    /// non-Connected slot. Replaces the pre-existing
-    /// `WebSocketPoolDegraded { down_secs }` for the boot-time path
-    /// (the watchdog still emits the pre-existing variant for
-    /// mid-session pool-down events).
-    WebSocketPoolPartialAfterDeadline {
-        connected: usize,
-        total: usize,
-        per_connection: Vec<(usize, usize, Option<u32>)>,
-        stuck: Vec<(usize, String)>,
-        boot_path: BootPathLabel,
     },
 
     /// Off-hours boot-complete confirmation — fires when the per-conn
@@ -2146,144 +2080,6 @@ fn format_feed_status_block(feeds: &[FeedStatusLine]) -> String {
     out
 }
 
-/// Renders the WebSocket pool-online (HEALTHY) Telegram message in the
-/// Tier-2 human-readable format. Single message at boot — eye instantly
-/// catches the verdict, then per-feed breakdown for at-a-glance status.
-fn format_pool_online_message(
-    connected: usize,
-    total: usize,
-    per_connection: &[(usize, usize, Option<u32>)],
-    boot_path: BootPathLabel,
-    boot_wall_clock_secs: f64,
-    last_real_tick_age_secs: Option<u32>,
-    feeds: &[FeedStatusLine],
-) -> String {
-    let total_subscribed: usize = per_connection.iter().map(|(s, _, _)| *s).sum();
-    let total_capacity: usize = per_connection.iter().map(|(_, c, _)| *c).sum();
-    let pool_pct = if total_capacity == 0 {
-        0.0
-    } else {
-        (total_subscribed as f64 / total_capacity as f64) * 100.0
-    };
-    let mut out = String::new();
-    out.push_str("<b>✅ TickVault is live and ready to trade</b>\n\n");
-    // "Dhan:" prefix (2026-07-03 feed parity): this count is the Dhan
-    // connection pool ONLY — the per-feed block below covers every enabled
-    // market-data feed (Dhan, Groww, future), so the header must not claim
-    // to be the full feed count.
-    out.push_str(&format!(
-        "📡 Dhan: All {connected} of {total} connections up\n"
-    ));
-    out.push_str(&format!(
-        "📊 Tracking {sub} instruments out of {cap} max ({pct:.0}% full)\n\n",
-        sub = format_with_commas(total_subscribed),
-        cap = format_with_commas(total_capacity),
-        pct = pool_pct,
-    ));
-    // Real-tick freshness (NOT frame freshness). The per-feed "last update"
-    // line below counts ANY frame incl. Dhan keep-alive pings, so it can read
-    // "0s ago" while zero real ticks are captured. This line reports the
-    // most-recent GENUINE tick so "live" can never look green on a ping-only
-    // feed (2026-06-02 false-OK fix).
-    match last_real_tick_age_secs {
-        Some(age) => out.push_str(&format!("📈 Real market ticks: last one {age}s ago\n\n")),
-        None => out.push_str(
-            "⚠️ Real market ticks: NONE captured yet — feed may be sending only \
-             keep-alive pings. If this persists after market open, the feed is \
-             connected but not delivering data.\n\n",
-        ),
-    }
-    out.push_str("Dhan connections:\n");
-    for (idx, (sub, cap, last)) in per_connection.iter().enumerate() {
-        let display = idx.saturating_add(1);
-        let pct = if *cap == 0 {
-            0.0
-        } else {
-            (*sub as f64 / *cap as f64) * 100.0
-        };
-        let pct_label = if (pct - 100.0).abs() < f64::EPSILON {
-            "full".to_string()
-        } else {
-            format!("{pct:.0}% full")
-        };
-        let ping = format_ping_freshness(*last);
-        out.push_str(&format!(
-            "  Connection {display}: tracking {sub_fmt} instruments ({pct_label}) — last update {ping}\n",
-            sub_fmt = format_with_commas(*sub),
-        ));
-    }
-    // 2026-07-03 feed parity: one line per ENABLED market-data feed —
-    // Groww (and any future feed) appears alongside Dhan, or the operator
-    // cannot know the second feed came up.
-    out.push('\n');
-    out.push_str(&format_feed_status_block(feeds));
-    out.push_str("\n💚 Heartbeat healthy on all feeds (Dhan pings every 10s, auto-pong)\n");
-    out.push_str(&format!(
-        "⏱️ Boot took {boot_wall_clock_secs:.1} seconds — {path}\n",
-        path = boot_path.human(),
-    ));
-    out.push_str("\nYou're good to go.");
-    out
-}
-
-/// Renders the WebSocket pool-degraded Telegram message in the Tier-2
-/// human-readable format. Includes per-slot stuck reason + retry plan.
-fn format_pool_partial_message(
-    connected: usize,
-    total: usize,
-    per_connection: &[(usize, usize, Option<u32>)],
-    stuck: &[(usize, String)],
-    boot_path: BootPathLabel,
-) -> String {
-    let total_subscribed: usize = per_connection.iter().map(|(s, _, _)| *s).sum();
-    let total_capacity: usize = per_connection.iter().map(|(_, c, _)| *c).sum();
-    let pool_pct = if total_capacity == 0 {
-        0.0
-    } else {
-        (total_subscribed as f64 / total_capacity as f64) * 100.0
-    };
-    let stuck_count = stuck.len();
-    let mut out = String::new();
-    out.push_str("<b>⚠️ TickVault is partially online — needs your attention</b>\n\n");
-    out.push_str(&format!(
-        "📡 {connected} of {total} market-data feeds connected ({stuck_count} stuck)\n"
-    ));
-    out.push_str(&format!(
-        "📊 Tracking {sub} instruments out of {cap} max ({pct:.0}%)\n\n",
-        sub = format_with_commas(total_subscribed),
-        cap = format_with_commas(total_capacity),
-        pct = pool_pct,
-    ));
-    out.push_str("Working feeds:\n");
-    let stuck_idxs: std::collections::HashSet<usize> = stuck.iter().map(|(i, _)| *i).collect();
-    for (idx, (sub, cap, last)) in per_connection.iter().enumerate() {
-        if stuck_idxs.contains(&idx) {
-            continue;
-        }
-        let display = idx.saturating_add(1);
-        let pct = if *cap == 0 {
-            0.0
-        } else {
-            (*sub as f64 / *cap as f64) * 100.0
-        };
-        let ping = format_ping_freshness(*last);
-        out.push_str(&format!(
-            "  Feed {display}: tracking {sub_fmt} instruments ({pct:.0}% full) — last update {ping}\n",
-            sub_fmt = format_with_commas(*sub),
-        ));
-    }
-    out.push_str("\nBroken feeds:\n");
-    for (idx, reason) in stuck {
-        let display = idx.saturating_add(1);
-        out.push_str(&format!("  Feed {display}: {}\n", html_escape(reason)));
-    }
-    out.push_str(&format!(
-        "\n🔄 The system will keep retrying every 5 seconds.\n   Boot path: {path}",
-        path = boot_path.human(),
-    ));
-    out
-}
-
 impl NotificationEvent {
     /// Formats the event as a Telegram message.
     ///
@@ -2348,13 +2144,10 @@ impl NotificationEvent {
             Self::AuthenticationSuccess
             | Self::AuthenticationFailed { .. }
             | Self::AuthenticationTransientFailure { .. }
-            | Self::PreMarketProfileCheckFailed { .. }
             | Self::TokenRenewed
             | Self::TokenRenewalFailed { .. }
             // ── Dhan-scoped: main-feed WebSocket lifecycle ──
             | Self::WebSocketConnected { .. }
-            | Self::WebSocketPoolOnline { .. }
-            | Self::WebSocketPoolPartialAfterDeadline { .. }
             | Self::WebSocketPoolDeferredOffHours { .. }
             | Self::WebSocketPoolDegraded { .. }
             | Self::WebSocketPoolRecovered { .. }
@@ -2541,22 +2334,6 @@ impl NotificationEvent {
                     reason = html_escape(&redact_url_params(reason)),
                 )
             }
-            Self::PreMarketProfileCheckFailed {
-                reason,
-                within_market_hours,
-            } => {
-                let header = if *within_market_hours {
-                    "<b>CRITICAL: Pre-market profile check FAILED — BOOT HALTED</b>"
-                } else {
-                    "<b>CRITICAL: Pre-market profile check FAILED — investigate before 09:15 IST</b>"
-                };
-                let reason = html_escape(reason);
-                format!(
-                    "{header}\n{reason}\n\
-                     Run:\n  curl -H \"access-token: $TOKEN\" https://api.dhan.co/v2/profile\n\
-                     Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h."
-                )
-            }
             Self::TokenRenewed => "<b>Token renewed</b>".to_string(),
             Self::TokenRenewalFailed { attempts, reason } => {
                 // 2026-07-14 Dhan noise lock reword: broker + consequence.
@@ -2595,30 +2372,6 @@ impl NotificationEvent {
                     cap = format_with_commas(*capacity),
                 )
             }
-            Self::WebSocketPoolOnline {
-                connected,
-                total,
-                per_connection,
-                boot_path,
-                boot_wall_clock_secs,
-                last_real_tick_age_secs,
-                feeds,
-            } => format_pool_online_message(
-                *connected,
-                *total,
-                per_connection,
-                *boot_path,
-                *boot_wall_clock_secs,
-                *last_real_tick_age_secs,
-                feeds,
-            ),
-            Self::WebSocketPoolPartialAfterDeadline {
-                connected,
-                total,
-                per_connection,
-                stuck,
-                boot_path,
-            } => format_pool_partial_message(*connected, *total, per_connection, stuck, *boot_path),
             Self::WebSocketPoolDeferredOffHours {
                 deferred,
                 total,
@@ -4334,12 +4087,9 @@ impl NotificationEvent {
             Self::AuthenticationSuccess => "AuthenticationSuccess",
             Self::AuthenticationFailed { .. } => "AuthenticationFailed",
             Self::AuthenticationTransientFailure { .. } => "AuthenticationTransientFailure",
-            Self::PreMarketProfileCheckFailed { .. } => "PreMarketProfileCheckFailed",
             Self::TokenRenewed => "TokenRenewed",
             Self::TokenRenewalFailed { .. } => "TokenRenewalFailed",
             Self::WebSocketConnected { .. } => "WebSocketConnected",
-            Self::WebSocketPoolOnline { .. } => "WebSocketPoolOnline",
-            Self::WebSocketPoolPartialAfterDeadline { .. } => "WebSocketPoolPartialAfterDeadline",
             Self::WebSocketPoolDeferredOffHours { .. } => "WebSocketPoolDeferredOffHours",
             Self::WebSocketPoolDegraded { .. } => "WebSocketPoolDegraded",
             Self::WebSocketPoolRecovered { .. } => "WebSocketPoolRecovered",
@@ -4564,7 +4314,6 @@ impl NotificationEvent {
             // now); failure events keep their legacy instant paging.
             Self::AuthenticationSuccess
             | Self::InstrumentBuildSuccess { .. }
-            | Self::WebSocketPoolOnline { .. }
             | Self::WebSocketPoolDeferredOffHours { .. }
             | Self::OrderUpdateConnected
             | Self::OrderUpdateAuthenticated
@@ -4669,16 +4418,6 @@ impl NotificationEvent {
             } => Some(BootMilestone::Instruments {
                 count: clamp_u32(derivative_count.saturating_add(*underlying_count)),
             }),
-            Self::WebSocketPoolOnline {
-                connected,
-                total,
-                last_real_tick_age_secs,
-                ..
-            } => Some(BootMilestone::DhanFeedOnline {
-                connected: clamp_u32(*connected),
-                total: clamp_u32(*total),
-                last_real_tick_age_secs: *last_real_tick_age_secs,
-            }),
             Self::WebSocketPoolDeferredOffHours { .. } => {
                 Some(BootMilestone::DhanFeedDeferredOffHours)
             }
@@ -4732,7 +4471,6 @@ impl NotificationEvent {
             // exhaust, the terminal path fires `AuthenticationFailed` at
             // Critical instead.
             Self::AuthenticationTransientFailure { .. } => Severity::Low,
-            Self::PreMarketProfileCheckFailed { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
@@ -4775,8 +4513,6 @@ impl NotificationEvent {
             // 2026-05-09: demoted Medium → Low so the boot-success summary
             // renders as ✅ [LOW] (green). Immediate dispatch is now
             // controlled separately via `dispatch_policy()`.
-            Self::WebSocketPoolOnline { .. } => Severity::Low,
-            Self::WebSocketPoolPartialAfterDeadline { .. } => Severity::High,
             Self::WebSocketPoolDeferredOffHours { .. } => Severity::Low,
             Self::WebSocketPoolDegraded { .. } => Severity::High,
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
@@ -5008,7 +4744,6 @@ impl NotificationEvent {
             // batch 3); OrderUpdateConnected is the surviving WS ping.
             Self::AuthenticationSuccess
             | Self::InstrumentBuildSuccess { .. }
-            | Self::WebSocketPoolOnline { .. }
             | Self::WebSocketPoolDeferredOffHours { .. }
             // PR #5 (2026-05-19): Phase2Complete retired.
             | Self::OrderUpdateConnected => DispatchPolicy::Immediate,
@@ -5199,15 +4934,6 @@ mod tests {
                 derivative_count: 1000,
                 underlying_count: 46,
             },
-            NotificationEvent::WebSocketPoolOnline {
-                connected: 1,
-                total: 1,
-                per_connection: vec![(4, 5000, Some(2))],
-                boot_path: BootPathLabel::Slow,
-                boot_wall_clock_secs: 94.0,
-                last_real_tick_age_secs: Some(2),
-                feeds: vec![],
-            },
             NotificationEvent::WebSocketPoolDeferredOffHours {
                 deferred: 1,
                 total: 1,
@@ -5277,23 +5003,6 @@ mod tests {
             .boot_milestone(),
             Some(M::Instruments { count: 1046 }),
             "count = derivatives + underlyings"
-        );
-        assert_eq!(
-            NotificationEvent::WebSocketPoolOnline {
-                connected: 1,
-                total: 1,
-                per_connection: vec![],
-                boot_path: BootPathLabel::Slow,
-                boot_wall_clock_secs: 1.0,
-                last_real_tick_age_secs: None,
-                feeds: vec![],
-            }
-            .boot_milestone(),
-            Some(M::DhanFeedOnline {
-                connected: 1,
-                total: 1,
-                last_real_tick_age_secs: None
-            })
         );
         assert_eq!(
             NotificationEvent::WebSocketPoolDeferredOffHours {
@@ -6843,20 +6552,6 @@ mod tests {
             body.contains("DEFERRED") || body.contains("deferred") || body.contains("until 09:00"),
             "body must explain WHY the connections are not yet up: {body}"
         );
-        // Negative ratchet: the partial-after-deadline (in-market) variant
-        // MUST keep firing High so genuine in-market faults still page.
-        let in_market = NotificationEvent::WebSocketPoolPartialAfterDeadline {
-            connected: 4,
-            total: 5,
-            per_connection: vec![(0, 5000, None); 5],
-            stuck: vec![(4, "Disconnected".to_string())],
-            boot_path: BootPathLabel::Slow,
-        };
-        assert_eq!(
-            in_market.severity(),
-            Severity::High,
-            "in-market partial pool MUST stay High — regression block"
-        );
     }
 
     #[test]
@@ -7873,25 +7568,6 @@ mod tests {
         // Empty list must render an explicit "unknown", never vanish.
         let empty = format_feed_status_block(&[]);
         assert!(empty.contains("Market-data feeds: unknown"), "got: {empty}");
-    }
-
-    #[test]
-    fn test_pool_online_message_lists_every_enabled_feed() {
-        let ev = NotificationEvent::WebSocketPoolOnline {
-            connected: 1,
-            total: 1,
-            per_connection: vec![(776, 5_000, Some(0))],
-            boot_path: BootPathLabel::Slow,
-            boot_wall_clock_secs: 1.2,
-            last_real_tick_age_secs: Some(0),
-            feeds: feed_lines(),
-        };
-        let msg = ev.to_message();
-        assert!(msg.contains("Market-data feeds:"), "got: {msg}");
-        assert!(msg.contains("Dhan: 776 instruments"), "got: {msg}");
-        assert!(msg.contains("Groww: 768 instruments"), "got: {msg}");
-        // The header now honestly labels the connection count as Dhan's.
-        assert!(msg.contains("Dhan: All 1 of 1"), "got: {msg}");
     }
 
     #[test]
@@ -10095,44 +9771,6 @@ mod tests {
         assert!(
             !block.contains('❌'),
             "31-120s band must not claim broken: {block}"
-        );
-    }
-
-    #[test]
-    fn test_pool_online_message_zero_capacity_and_no_real_ticks_is_honest() {
-        // Zero-capacity per-connection rows must render 0% (no div-by-zero)
-        // and zero REAL ticks must render the loud NONE warning (2026-06-02
-        // false-OK fix), never a fabricated freshness.
-        let ev = NotificationEvent::WebSocketPoolOnline {
-            connected: 1,
-            total: 1,
-            per_connection: vec![(0, 0, None)],
-            boot_path: BootPathLabel::Slow,
-            boot_wall_clock_secs: 1.0,
-            last_real_tick_age_secs: None,
-            feeds: vec![],
-        };
-        let msg = ev.to_message();
-        assert!(msg.contains("NONE captured yet"), "got: {msg}");
-        assert!(msg.contains("0% full"), "zero capacity renders 0%: {msg}");
-    }
-
-    #[test]
-    fn test_pool_online_message_full_connection_and_fresh_tick() {
-        let ev = NotificationEvent::WebSocketPoolOnline {
-            connected: 1,
-            total: 1,
-            per_connection: vec![(100, 100, Some(2))],
-            boot_path: BootPathLabel::Slow,
-            boot_wall_clock_secs: 1.0,
-            last_real_tick_age_secs: Some(3),
-            feeds: vec![],
-        };
-        let msg = ev.to_message();
-        assert!(msg.contains("(full)"), "100% renders as 'full': {msg}");
-        assert!(
-            msg.contains("Real market ticks: last one 3s ago"),
-            "got: {msg}"
         );
     }
 

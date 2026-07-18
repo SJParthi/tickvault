@@ -70,8 +70,8 @@ pub fn classify_disappearance_state(instrument_type: &str) -> LifecycleState {
 }
 
 /// The per-instrument inputs the reconciler needs to classify a
-/// transition. All primitive so this module needs neither `core`'s
-/// private `CsvRow` nor a live DB.
+/// transition. All primitive so this module needs neither `core`'s CSV
+/// row types (deleted 2026-07-18, dead-code batch 2) nor a live DB.
 #[derive(Debug, Clone, Copy)]
 pub struct ReconcileInput<'a> {
     /// Yesterday's `lifecycle_state`, or `None` if this
