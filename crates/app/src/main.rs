@@ -2141,6 +2141,46 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
     }
 }
 
+/// Spawns the RELOCATED scoreboard IST-midnight reset task (stage-3 dead-WS
+/// sweep, 2026-07-17).
+///
+/// These two cold, day-boundary resets previously lived inside the deleted
+/// `spawn_engine_b_aggregator` Task 3 (the IST-midnight force-seal loop) —
+/// per the sweep contract the cluster-D resets are RELOCATED, never deleted:
+///
+/// 1. `feed_lag_monitor::reset_day_lag_histogram(Feed::Dhan)` — clears the
+///    scorecard DAY lag distribution at every IST midnight (Scoreboard PR-C;
+///    a Saturday midnight must still clear Friday's distribution before
+///    Monday's scorecard row). Cold, O(96).
+/// 2. `feed_presence::reset_daily(Feed::Dhan)` — clears the presence bitsets
+///    at the same boundary (Scoreboard PR-D; belt-and-braces — the day-keyed
+///    clear at registration is the backstop). Cold, O(slots × 6).
+///
+/// Honest note: both writers are dormant on the REST-only runtime (the live
+/// feeds are retired), so these resets are currently no-op hygiene — kept so
+/// the cluster-D day-boundary contract survives until its own stage decides
+/// the modules' fate. Deliberately NO trading-day gate: the resets must fire
+/// on EVERY midnight (the deleted Task 3 ran them before its gate too).
+fn spawn_scoreboard_midnight_reset_task() {
+    tokio::spawn(async move {
+        loop {
+            // Sleep until the next IST midnight (bounded helper, ≤ 24h).
+            let sleep_secs = tickvault_common::market_hours::secs_until_next_ist_midnight().max(1);
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+            tickvault_core::pipeline::feed_lag_monitor::reset_day_lag_histogram(
+                tickvault_common::feed::Feed::Dhan,
+            );
+            tickvault_core::pipeline::feed_presence::reset_daily(
+                tickvault_common::feed::Feed::Dhan,
+            );
+            tracing::info!(
+                "scoreboard IST-midnight resets fired (day lag histogram + presence bitsets)"
+            );
+        }
+    });
+    tracing::info!("scoreboard IST-midnight reset task spawned (relocated, stage-3 sweep)");
+}
+
 // ---------------------------------------------------------------------------
 // D2-pre: PROCESS-shared infra for the Dhan-OFF boot path
 // ---------------------------------------------------------------------------
@@ -2349,6 +2389,9 @@ async fn build_shared_infra(
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
+
+    // --- Scoreboard IST-midnight resets (RELOCATED, stage-3 sweep) ---
+    spawn_scoreboard_midnight_reset_task();
 
     // --- Tick broadcast channel (PROCESS-shared) ---
     // Held for the process lifetime so the subscriber tasks never wake on a
