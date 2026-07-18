@@ -66,7 +66,7 @@ falls under and what artifact proves the claim.
 | ErrorCode tag on every `error!` | P | 100% | `crates/common/tests/error_code_tag_guard.rs` |
 | Every ErrorCode has rule + runbook | P | 54/54 variants | `crates/common/tests/error_code_rule_file_crossref.rs` + `triage_rules_full_coverage_guard.rs` |
 | Prometheus metric catalog | P | No drift | `crates/common/tests/metrics_catalog.rs` |
-| Zero-tick-loss alert | R | Fires on any gap ≥1s | `deploy/docker/prometheus/rules/tickvault-alerts.yml` + `crates/storage/tests/zero_tick_loss_alert_guard.rs` |
+| Seal-drop paging (was: zero-tick-loss alert) | R | AGGREGATOR-DROP-01 pages on any dropped seal | `deploy/aws/terraform/seal-drop-alarm.tf` + `crates/app/tests/seal_drop_paging_wiring_guard.rs` _(2026-07-18: the tick-loss alert + its guard were deleted with the tick rescue ring, stage-4 sweep)_ |
 <!-- Retired with the CloudWatch-only migration:
   - "Recording rules" / `recording_rules_guard.rs`
   - "Alertmanager rules wiring" / `grafana_alerts_wiring.rs`           (#O1 Grafana removal)

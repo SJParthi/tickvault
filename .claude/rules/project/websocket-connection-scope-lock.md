@@ -288,7 +288,7 @@ row Verified with file:line evidence):
 `index_extractor` (`NSE_INDEX_ALLOWLIST` + `canonicalize_index_symbol`),
 `index_futures.rs` (the §36 selector — DE-GATED from the `daily_universe_fetcher` cargo
 feature, else the Groww §36.7 futures silently drop = a scope violation),
-`instrument_snapshot::is_valid_trading_date`, `presence_registration::ist_day_from_date`,
+`instrument_snapshot::is_valid_trading_date`, `presence_registration::ist_day_from_date` *(retired 2026-07-18, stage-4 — caller-less after the presence registry deleted; the scoreboard derives the IST day itself)*,
 `storage::lifecycle_reconciler::classify_transition`, the `instrument_lifecycle` /
 `index_constituency` / `instrument_fetch_audit` TABLES (SEBI never-delete), the ts-pin
 migration, the Groww `shared_master_writer`, the scoreboard, `feed_presence`, and the
@@ -299,7 +299,8 @@ constants `INDEX_CONSTITUENCY_BASE_URL` / `GROWW_INSTRUMENT_CSV_URL` /
 
 > "100% inside the tested envelope, with ratcheted regression coverage: Groww capture
 > keeps the full bounded zero-tick-loss chain (WAL-before-broadcast → ring → NDJSON spill
-> → DLQ, `TICK_BUFFER_CAPACITY` ratcheted); the Dhan REST stack keeps lock-before-mint +
+> → DLQ; ring constant retired 2026-07-18 with the dead tick chain — the live absorption
+> tier is the 200,000-seal ring, `SEAL_BUFFER_CAPACITY`/`seal_ring.rs`); the Dhan REST stack keeps lock-before-mint +
 > RESILIENCE-03 (`dual-instance-lock-2026-07-04.md` §3.5); the retirement is
 > config-reversible until Phase C deletes the code, and irreversible-without-a-fresh-quote
 > after. NOT claimed: (a) any Dhan live tick capture — by design, per Q1/Q2 there is NONE;

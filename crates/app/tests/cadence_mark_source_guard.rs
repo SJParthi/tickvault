@@ -14,10 +14,14 @@
 //! origin/main 0f5aa760 — this guard FAILS there by construction.
 //!
 //! Pins:
-//! 1. the GROWW cadence executor forwards marks at EXACTLY ONE site,
-//!    Option-gated, AFTER the persist → flush-ACK → heartbeat → fold
-//!    handoff chain (a mark must never reference a price the audit
-//!    record does not back);
+//! 1. the GROWW cadence executor forwards marks at EXACTLY TWO sites —
+//!    the SPOT persist-confirm seam and (2026-07-18 deliberate ratchet
+//!    widening, Item 3) the CHAIN persist-confirm seam — each
+//!    Option-gated and AFTER its own persist → flush-ACK chain (a mark
+//!    must never reference a price the audit record does not back); the
+//!    chain seam additionally resolves REAL exchange_token identities
+//!    from the day-cached master-derived contract index (a synthetic id
+//!    is the id-space-divergence class this guard bans);
 //! 2. the DHAN cadence executor carries NO mark tap (id-space ban);
 //! 3. main.rs threads the forwarder into the cadence boot call;
 //! 4. cadence_boot.rs passes it to the GROWW executor only;
@@ -90,17 +94,21 @@ fn scan_region(rel: &str) -> String {
 fn test_groww_cadence_executor_forwards_marks_after_persist_confirm() {
     let scan = scan_region("src/groww_cadence_executor.rs");
 
-    // EXACTLY ONE forward site (the 1-tap-per-leg discipline of
+    // EXACTLY TWO forward sites (the 1-tap-per-seam discipline of
     // order_runtime_spawn_site_guard::ratchet_groww_rest_leg_mark_taps_pinned
-    // applied to the cadence producer): a second site would mean a
-    // non-own-fire arm started producing marks (the stale-price class).
+    // applied to the cadence producer; widened 1 → 2 on 2026-07-18 for
+    // the chain seam): a THIRD site would mean a non-own-fire arm
+    // started producing marks (the stale-price class).
     let forwards = scan.matches(".mark_forward(").count();
     assert_eq!(
-        forwards, 1,
+        forwards, 2,
         "groww_cadence_executor.rs production region must forward marks at \
-         EXACTLY ONE site (the spot persist-confirm seam) — found \
-         {forwards}; zero re-opens the PR #1624 producer-less mark channel \
-         (paper fills + P&L marks silently dead)"
+         EXACTLY TWO sites (the spot persist-confirm seam + the chain \
+         persist-confirm seam — 2026-07-18 deliberate widening) — found \
+         {forwards}; fewer re-opens the PR #1624 producer-less mark \
+         channel class (paper fills + P&L marks silently dead), more \
+         means a non-own-fire arm started producing marks (the \
+         stale-price class)"
     );
 
     // Option-gate pin: the tap must be a no-op when [order_runtime] is off.
@@ -134,6 +142,53 @@ fn test_groww_cadence_executor_forwards_marks_after_persist_confirm() {
              heartbeat → fold → mark contract"
         );
         last = at;
+    }
+}
+
+#[test]
+fn test_groww_cadence_chain_seam_forwards_resolved_marks_after_flush_ack() {
+    // Item 3 (2026-07-18): the CHAIN mark tap. Ordering pin scoped to the
+    // fetch_chain region (sliced from the chain writer's own
+    // `append_row_ext(` anchor so the SPOT seam's needles can never
+    // vacuously satisfy it): persist append → flush → the
+    // persist-gated Option-gate → mark forward.
+    let scan = scan_region("src/groww_cadence_executor.rs");
+    let chain_at = scan
+        .find(".append_row_ext(")
+        .expect("groww_cadence_executor.rs lost the chain writer append_row_ext anchor");
+    let chain_region = &scan[chain_at..];
+    let needles = [
+        "flush_off_worker(|| writer.flush())",
+        "if !persist_failed && let Some(forwarder) = self.mark_forwarder.as_ref()",
+        ".mark_forward(",
+    ];
+    let mut last = 0usize;
+    for needle in needles {
+        let at = chain_region.find(needle).unwrap_or_else(|| {
+            panic!("groww_cadence_executor.rs chain-seam region lost `{needle}`")
+        });
+        assert!(
+            at > last,
+            "chain-seam ordering violated: `{needle}` at byte {at} must come \
+             after the previous needle (byte {last}) — the persist → \
+             flush-ACK → mark contract"
+        );
+        last = at;
+    }
+    // Identity discipline: REAL exchange_token ids via the day-cached
+    // master-derived index (never a synthetic id), unresolved legs
+    // COUNTED (never guessed), and the index built OFF the chain fire's
+    // critical path (piggybacked on the expiry-list master download).
+    for needle in [
+        "resolve_groww_contract_books(",
+        "build_contract_mark_index(",
+        "tv_cadence_option_mark_unresolved_total",
+    ] {
+        assert!(
+            scan.contains(needle),
+            "groww_cadence_executor.rs production region lost `{needle}` — \
+             the chain mark tap's real-identity/counted-unresolved contract"
+        );
     }
 }
 
