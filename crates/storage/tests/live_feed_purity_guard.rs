@@ -6,13 +6,15 @@
 //! catches violations even when the hook is bypassed (e.g. CI against
 //! a branch that landed before the hook).
 //!
-//! Ground rule: the `ticks` QuestDB table is populated EXCLUSIVELY by
-//! `ParsedTick` frames originating from the WebSocket connection pool
-//! (`crates/core/src/websocket/`) and processed through
-//! `crates/core/src/pipeline/tick_processor.rs`. Historical REST-API
-//! data NEVER crosses into `ticks` (the entire Dhan historical fetch
-//! chain was deleted in PRs #803-#807; `historical_candles` table is
-//! gone).
+//! Ground rule: the `ticks` QuestDB table holds LIVE-feed-sourced ticks
+//! ONLY. Historical REST-API data NEVER crosses into `ticks` (the entire
+//! Dhan historical fetch chain was deleted in PRs #803-#807;
+//! `historical_candles` table is gone). Stage-2 dead-WS sweep
+//! (2026-07-17): the live tick WRITE path itself (`tick_processor.rs` +
+//! `tick_persistence.rs`) was deleted with the dead Dhan tick chain — the
+//! table is now read-only (SEBI-retained), which makes this ban strictly
+//! stronger: NO writer may be re-introduced from any historical/synth
+//! path (the banned-symbol needles below stay as the tripwire).
 //!
 //! See `.claude/rules/project/live-feed-purity.md` for the full rule.
 

@@ -58,6 +58,18 @@ notify = { workspace = true }
 # Only the feature-gated daily-universe boot orchestrator hashes the CSV
 # (source_csv_sha256 provenance); optional so the default build stays lean.
 
+[dev-dependencies]
+# start_paused virtual-time tests for the exit-execution verify ladder
+# (same pattern as crates/core + crates/api dev-deps).
+tokio = { workspace = true, features = ["test-util"] }
+
+# Order-runtime dry-run PR (2026-07-14): DHAT zero-alloc ratchet + Criterion
+# budget evidence for the mark-forward hot-path tap (re-homed 2026-07-16 to
+# the Groww REST legs after the live bridge retired). Both are existing
+# workspace pins (no new dependency roots).
+criterion = { workspace = true }
+dhat = { workspace = true }
+
 [features]
 # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (and its sha2
 # optional dep) was DELETED with the Dhan instrument-download chain
@@ -65,6 +77,15 @@ notify = { workspace = true }
 # formerly-gated SEBI persistence modules in `tickvault-storage` are now
 # compiled unconditionally.
 default = []
+# Groww order-side (§39.2 Gate 2 — non-default): pulls the trading-side
+# order/position PUSH channel + the common-side gate/config surface so the
+# Stage D app consumer (`groww_order_observability`) can compile. NEVER in
+# `default` — a default build carries no Groww order code.
+groww_orders = ["tickvault-trading/groww_orders", "tickvault-common/groww_orders"]
+
+[[bench]]
+name = "order_gate"
+harness = false
 
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "clap", "signal-hook"]

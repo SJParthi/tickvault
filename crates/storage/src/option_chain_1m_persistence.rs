@@ -41,7 +41,9 @@
 //!     strike DOUBLE, leg SYMBOL, contract_security_id LONG,
 //!     last_price DOUBLE, iv DOUBLE, delta DOUBLE, theta DOUBLE,
 //!     gamma DOUBLE, vega DOUBLE, oi LONG, volume LONG, previous_oi LONG,
-//!     underlying_spot DOUBLE, fetched_at TIMESTAMP
+//!     underlying_spot DOUBLE, fetched_at TIMESTAMP,
+//!     rho DOUBLE, close_to_data_ms LONG, moneyness SYMBOL,
+//!     moneyness_depth DOUBLE
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, underlying_security_id, exchange_segment,
 //!                     expiry, strike, leg, feed);
@@ -151,6 +153,25 @@ pub struct OptionChain1mRow {
     pub underlying_spot: f64,
     /// Retrieval wall-clock instant, IST nanoseconds.
     pub fetched_at_ist_nanos: i64,
+    /// Write-time moneyness classification (`"ITM"`/`"ATM"`/`"OTM"`/
+    /// `"UNKNOWN"` — `tickvault_common::moneyness::Moneyness::as_str()`,
+    /// the ONLY producer of these labels). AUDIT MIRROR ONLY: the RAM
+    /// chain snapshot is the decision source of truth (operator directive
+    /// 2026-07-14); this column exists so `WHERE moneyness='ATM'` is a
+    /// precomputed filter, never a query-time recompute. NOT in the DEDUP
+    /// key (label column — the `contract_security_id` precedent).
+    pub moneyness: &'static str,
+    /// Signed moneyness DEPTH in rupees (2026-07-17, operator-confirmed
+    /// gap): negative = ITM-direction, positive = OTM-direction for BOTH
+    /// legs (CE: strike − spot; PE: spot − strike — the leg-normalized
+    /// sign convention of
+    /// `tickvault_common::moneyness::moneyness_depth_paise`, the ONLY
+    /// home of the arithmetic per the parse-only strike ratchet).
+    /// `None` = unclassifiable (unparsable leg / guarded-invalid
+    /// strike/spot — a moneyness=UNKNOWN row carries `None`) → the column
+    /// is left UNWRITTEN (NULL in QuestDB, ILP-sparse). NOT in the DEDUP
+    /// key (numeric companion column, same class as `close_to_data_ms`).
+    pub moneyness_depth: Option<f64>,
 }
 
 /// The idempotent `CREATE TABLE` DDL for `option_chain_1m`. Pure.
@@ -181,7 +202,9 @@ pub fn option_chain_1m_create_ddl() -> String {
             underlying_spot        DOUBLE, \
             fetched_at             TIMESTAMP, \
             rho                    DOUBLE, \
-            close_to_data_ms       LONG\
+            close_to_data_ms       LONG, \
+            moneyness              SYMBOL, \
+            moneyness_depth        DOUBLE\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_OPTION_CHAIN_1M});"
     )
@@ -195,7 +218,7 @@ pub fn option_chain_1m_create_ddl() -> String {
 /// EXISTS` at the next boot (nullable — the Dhan rows simply leave them
 /// NULL until the Dhan leg ever stamps them). Pure.
 #[must_use]
-pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 23] {
+pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 25] {
     [
         ("trading_date_ist", "TIMESTAMP"),
         ("underlying_security_id", "LONG"),
@@ -224,10 +247,37 @@ pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 23] {
         // production use of the same account) + the spot-leg
         // `close_to_data_ms` honesty-column precedent (the chain response
         // carries NO timestamp — Verified-absence, §3 — so the measured
-        // close→data delay is the ONLY freshness signal). Dhan rows leave
-        // both NULL (the Dhan emit path is untouched).
+        // close→data delay is the ONLY freshness signal).
+        // 2026-07-17 correction: the "Dhan rows leave both NULL" era ended
+        // — the Dhan leg now stamps `close_to_data_ms` (the already-
+        // measured fetch latency is persisted per row); `rho` remains NULL
+        // on Dhan FOREVER — the Dhan option-chain response carries NO rho
+        // (greeks are delta/theta/gamma/vega only —
+        // `docs/dhan-ref/06-option-chain.md` /
+        // `.claude/rules/dhan/option-chain.md` rule 10; grep-verified
+        // against the Dhan leg's response parser).
         ("rho", "DOUBLE"),
         ("close_to_data_ms", "LONG"),
+        // Moneyness classification (2026-07-14, operator directive relayed
+        // via the coordinator session — moneyness is CRITICAL and MANDATORY,
+        // computed at WRITE time; the RAM chain snapshot is the decision
+        // surface, this column is the write-only AUDIT MIRROR so
+        // `WHERE moneyness='ATM'` is a precomputed filter, never a
+        // query-time recompute). Values: ITM/ATM/OTM/UNKNOWN (4-value
+        // SYMBOL). Additive + nullable; rows written by earlier builds stay
+        // NULL FOREVER (never backfilled). NOT in the DEDUP key (label
+        // column — the contract_security_id precedent).
+        ("moneyness", "SYMBOL"),
+        // Signed moneyness depth (2026-07-17, operator-confirmed gap):
+        // the numeric companion to the moneyness label — signed rupees,
+        // negative = ITM-direction / positive = OTM-direction for BOTH
+        // legs (CE: strike−spot; PE: spot−strike), computed at WRITE time
+        // in `tickvault_common::moneyness::moneyness_depth_paise` (integer
+        // paise — the single arithmetic home per the parse-only strike
+        // ratchet). Additive + nullable (ILP-sparse: written only when
+        // classifiable); pre-existing rows stay NULL FOREVER (never
+        // backfilled). NOT in the DEDUP key.
+        ("moneyness_depth", "DOUBLE"),
     ]
 }
 
@@ -441,37 +491,54 @@ impl OptionChain1mWriter {
         String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
     }
 
-    /// Appends one option-chain leg row (cold path, ≤~3K rows/minute,
-    /// batched: the fetcher appends a whole minute then flushes once).
-    /// The Dhan emit path — `rho` / `close_to_data_ms` stay UNWRITTEN
-    /// (NULL in QuestDB) until the Dhan leg ever stamps them.
+    /// Appends one option-chain leg row with NO extension columns (cold
+    /// path, ≤~3K rows/minute, batched: the fetcher appends a whole
+    /// minute then flushes once) — `rho` / `close_to_data_ms` stay
+    /// UNWRITTEN (NULL in QuestDB). Since 2026-07-17 the production legs
+    /// both route through [`Self::append_row_ext`] (the Dhan leg now
+    /// stamps `close_to_data_ms`); this stays the plain convenience form.
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, r: &OptionChain1mRow) -> Result<()> {
-        self.append_row_inner(r, None)
+        self.append_row_inner(r, None, None)
     }
 
-    /// Appends one row WITH the 2026-07-13 extension columns — the Groww
-    /// chain leg stamps the per-leg `rho` greek
-    /// (`docs/groww-ref/14-option-chain.md` §2) and the measured
-    /// `close_to_data_ms` delay (the chain response carries NO timestamp —
-    /// the measured delay is the only freshness signal).
+    /// Appends one row WITH the independently-optional extension columns
+    /// (2026-07-17 refactor of the 2026-07-13 pair — `rho` and
+    /// `close_to_data_ms` are now separately `Option`al so each leg
+    /// stamps exactly what it has; ILP-sparse — a `None` lands NULL):
+    /// - Groww chain leg: `(Some(rho), Some(close_to_data_ms))` — the
+    ///   per-leg `rho` greek (`docs/groww-ref/14-option-chain.md` §2) +
+    ///   the measured delay (the chain response carries NO timestamp).
+    /// - Dhan chain leg: `(None, Some(close_to_data_ms))` — the Dhan
+    ///   option-chain response carries NO rho (greeks are
+    ///   delta/theta/gamma/vega only — `docs/dhan-ref/06-option-chain.md`
+    ///   / `.claude/rules/dhan/option-chain.md` rule 10), so `rho` stays
+    ///   NULL on Dhan rows forever; the already-measured fetch latency IS
+    ///   persisted per row since 2026-07-17.
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row_ext(
         &mut self,
         r: &OptionChain1mRow,
-        rho: f64,
-        close_to_data_ms: i64,
+        rho: Option<f64>,
+        close_to_data_ms: Option<i64>,
     ) -> Result<()> {
-        self.append_row_inner(r, Some((rho, close_to_data_ms)))
+        self.append_row_inner(r, rho, close_to_data_ms)
     }
 
-    /// Shared append body — `ext` = the optional `(rho, close_to_data_ms)`
-    /// extension pair (ILP rows are sparse: absent columns land NULL).
-    fn append_row_inner(&mut self, r: &OptionChain1mRow, ext: Option<(f64, i64)>) -> Result<()> {
+    /// Shared append body — `rho` / `close_to_data_ms` are the
+    /// independently-optional extension columns (ILP rows are sparse:
+    /// absent columns land NULL); `r.moneyness_depth` likewise lands only
+    /// when `Some`.
+    fn append_row_inner(
+        &mut self,
+        r: &OptionChain1mRow,
+        rho: Option<f64>,
+        close_to_data_ms: Option<i64>,
+    ) -> Result<()> {
         let b = self
             .buffer
             .table(OPTION_CHAIN_1M_TABLE)
@@ -487,6 +554,11 @@ impl OptionChain1mWriter {
             .context("underlying_symbol")?
             .symbol("leg", r.leg)
             .context("leg")?
+            // Moneyness audit-mirror stamp (2026-07-14) — a SYMBOL tag,
+            // written UNCONDITIONALLY on BOTH feeds (UNKNOWN covers every
+            // unclassifiable case, so it is never absent).
+            .symbol("moneyness", r.moneyness)
+            .context("moneyness")?
             .column_ts(
                 "trading_date_ist",
                 TimestampNanos::new(r.trading_date_ist_nanos),
@@ -522,10 +594,20 @@ impl OptionChain1mWriter {
             .context("underlying_spot")?
             .column_ts("fetched_at", TimestampNanos::new(r.fetched_at_ist_nanos))
             .context("fetched_at")?;
-        let b = if let Some((rho, close_to_data_ms)) = ext {
-            b.column_f64("rho", rho)
-                .context("rho")?
-                .column_i64("close_to_data_ms", close_to_data_ms)
+        // Independently-optional columns (ILP-sparse — a None lands NULL).
+        let b = if let Some(depth) = r.moneyness_depth {
+            b.column_f64("moneyness_depth", depth)
+                .context("moneyness_depth")?
+        } else {
+            b
+        };
+        let b = if let Some(rho) = rho {
+            b.column_f64("rho", rho).context("rho")?
+        } else {
+            b
+        };
+        let b = if let Some(ms) = close_to_data_ms {
+            b.column_i64("close_to_data_ms", ms)
                 .context("close_to_data_ms")?
         } else {
             b
@@ -633,6 +715,11 @@ mod tests {
             previous_oi: 402_220,
             underlying_spot: 25_642.8,
             fetched_at_ist_nanos: 1_770_000_961_042_000_000,
+            // 25650 CE @ spot 25642.8, Rs.50 grid → the grid-rounded ATM.
+            moneyness: "ATM",
+            // The ATM label still carries its signed distance: CE depth =
+            // 25650.00 − 25642.80 = +7.20 rupees (OTM-direction sign).
+            moneyness_depth: Some(7.2),
         }
     }
 
@@ -681,6 +768,10 @@ mod tests {
         // The per-contract SecurityId is a LABEL, never a key (derivative
         // ids are unstable across relists — instrument-master.md rule 3).
         assert!(!has_token("contract_security_id"));
+        // The signed depth (2026-07-17) is a numeric companion column,
+        // NEVER a key (float-valued + nullable — the close_to_data_ms
+        // class).
+        assert!(!has_token("moneyness_depth"));
     }
 
     #[test]
@@ -722,16 +813,19 @@ mod tests {
     }
 
     /// The Groww-parameterized writer stamps `feed=groww` + its own source
-    /// label, and `append_row_ext` writes the 2026-07-13 extension columns
-    /// (`rho` + `close_to_data_ms`); the plain Dhan `append_row` leaves
-    /// them UNWRITTEN (NULL in QuestDB — the Dhan emit path untouched).
+    /// label, and `append_row_ext` writes both extension columns
+    /// (`rho` + `close_to_data_ms`). Since 2026-07-17 the two are
+    /// independently optional: a Dhan-style `(None, Some(ms))` call DOES
+    /// stamp `close_to_data_ms` and does NOT stamp `rho` (the Dhan
+    /// option-chain response carries no rho — delta/theta/gamma/vega
+    /// only); the plain `append_row` leaves both UNWRITTEN.
     #[test]
     fn test_chain1m_append_row_ext_groww_stamps_feed_rho_and_latency() {
         let mut w = OptionChain1mWriter::for_test_with_feed(
             OPTION_CHAIN_1M_FEED_GROWW,
             OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
         );
-        w.append_row_ext(&sample_row(), 5.1802, 1_042)
+        w.append_row_ext(&sample_row(), Some(5.1802), Some(1_042))
             .expect("ext append must succeed");
         assert_eq!(w.pending(), 1);
         let line = w.buffer_utf8();
@@ -746,7 +840,24 @@ mod tests {
             "close_to_data_ms missing: {line}"
         );
 
-        // The Dhan path never writes the extension columns.
+        // The Dhan-style ext call (2026-07-17): close_to_data_ms IS
+        // stamped, rho is NOT (no rho exists in the Dhan response).
+        let mut dhan_ext = OptionChain1mWriter::for_test();
+        dhan_ext
+            .append_row_ext(&sample_row(), None, Some(2_314))
+            .expect("ext append must succeed");
+        let dhan_ext_line = dhan_ext.buffer_utf8();
+        assert!(dhan_ext_line.contains(",feed=dhan"), "got: {dhan_ext_line}");
+        assert!(
+            dhan_ext_line.contains("close_to_data_ms=2314i"),
+            "Dhan ext call must stamp close_to_data_ms: {dhan_ext_line}"
+        );
+        assert!(
+            !dhan_ext_line.contains("rho="),
+            "Dhan must never stamp rho (absent from the response): {dhan_ext_line}"
+        );
+
+        // The plain append_row writes NEITHER extension column.
         let mut dhan = OptionChain1mWriter::for_test();
         dhan.append_row(&sample_row()).expect("append must succeed");
         let dhan_line = dhan.buffer_utf8();
@@ -757,11 +868,113 @@ mod tests {
         );
         assert!(
             !dhan_line.contains("rho="),
-            "Dhan must not stamp rho: {dhan_line}"
+            "plain append_row must not stamp rho: {dhan_line}"
         );
         assert!(
             !dhan_line.contains("close_to_data_ms="),
-            "Dhan must not stamp close_to_data_ms: {dhan_line}"
+            "plain append_row must not stamp close_to_data_ms: {dhan_line}"
+        );
+    }
+
+    /// The 2026-07-17 signed-depth column: written when `Some` (both
+    /// feeds' append paths), OMITTED when `None` (ILP-sparse → NULL in
+    /// QuestDB — the unclassifiable/UNKNOWN-row case), and present in the
+    /// DDL manifest as DOUBLE so the self-heal covers live tables.
+    #[test]
+    fn test_chain1m_append_row_stamps_moneyness_depth_when_some_omits_when_none() {
+        // Some(depth) → the field lands (plain + ext paths).
+        let mut w = OptionChain1mWriter::for_test();
+        w.append_row(&sample_row()).expect("append must succeed");
+        let line = w.buffer_utf8();
+        assert!(
+            line.contains("moneyness_depth=7.2"),
+            "moneyness_depth missing when Some: {line}"
+        );
+        let mut ext = OptionChain1mWriter::for_test_with_feed(
+            OPTION_CHAIN_1M_FEED_GROWW,
+            OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+        );
+        ext.append_row_ext(&sample_row(), Some(5.1802), Some(1_042))
+            .expect("ext append must succeed");
+        assert!(
+            ext.buffer_utf8().contains("moneyness_depth=7.2"),
+            "moneyness_depth missing on the ext path: {}",
+            ext.buffer_utf8()
+        );
+
+        // None → the field is OMITTED entirely (NULL), while the
+        // moneyness SYMBOL tag still lands (UNKNOWN rows keep the label).
+        let mut none_row = sample_row();
+        none_row.moneyness = "UNKNOWN";
+        none_row.moneyness_depth = None;
+        let mut w2 = OptionChain1mWriter::for_test();
+        w2.append_row_ext(&none_row, None, Some(1_042))
+            .expect("append must succeed");
+        let line2 = w2.buffer_utf8();
+        assert!(
+            !line2.contains("moneyness_depth="),
+            "None depth must be omitted (NULL): {line2}"
+        );
+        assert!(
+            line2.contains(",moneyness=UNKNOWN"),
+            "the moneyness label still lands on a None-depth row: {line2}"
+        );
+
+        // Manifest carries the column as DOUBLE (ALTER self-heal).
+        assert!(
+            option_chain_1m_columns()
+                .iter()
+                .any(|&(col, ty)| col == "moneyness_depth" && ty == "DOUBLE"),
+            "moneyness_depth must be a DOUBLE column in the manifest"
+        );
+    }
+
+    /// The 2026-07-14 moneyness audit-mirror stamp: a SYMBOL tag (ILP
+    /// tags-before-fields — it must sit in the tag section, before the
+    /// first space), written on BOTH feeds' append paths.
+    #[test]
+    fn test_chain1m_append_row_stamps_moneyness_symbol() {
+        // Dhan path (plain append_row).
+        let mut dhan = OptionChain1mWriter::for_test();
+        dhan.append_row(&sample_row()).expect("append must succeed");
+        let dhan_line = dhan.buffer_utf8();
+        let dhan_tags = dhan_line.split(' ').next().unwrap_or_default();
+        assert!(
+            dhan_tags.contains(",moneyness=ATM"),
+            "moneyness must be an ILP TAG (before the first field) on the \
+             Dhan line: {dhan_line}"
+        );
+
+        // Groww path (append_row_ext) stamps the SAME tag.
+        let mut groww = OptionChain1mWriter::for_test_with_feed(
+            OPTION_CHAIN_1M_FEED_GROWW,
+            OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+        );
+        groww
+            .append_row_ext(&sample_row(), Some(5.1802), Some(1_042))
+            .expect("ext append must succeed");
+        let groww_line = groww.buffer_utf8();
+        let groww_tags = groww_line.split(' ').next().unwrap_or_default();
+        assert!(
+            groww_tags.contains(",moneyness=ATM"),
+            "moneyness must be an ILP TAG on the Groww line: {groww_line}"
+        );
+
+        // The DDL manifest carries the column as SYMBOL (self-heal covers
+        // live tables created by earlier builds).
+        assert!(
+            option_chain_1m_columns()
+                .iter()
+                .any(|&(col, ty)| col == "moneyness" && ty == "SYMBOL"),
+            "moneyness must be a SYMBOL column in the manifest"
+        );
+        // NEVER in the DEDUP key (label column).
+        assert!(
+            !DEDUP_KEY_OPTION_CHAIN_1M
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|tok| tok == "moneyness"),
+            "moneyness must never enter the DEDUP key"
         );
     }
 

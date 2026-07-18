@@ -3,8 +3,10 @@
 //! (Dhan + Groww share the ONE engine, threaded by `FeedStrategy` value).
 //!
 //! Why (WARNING from the 2026-07-01 adversarial O(1) hunt): the row builder
-//! (`dhat_tick_row_builder.rs`), the bar-cache lookup (`dhat_bar_cache_lookup.rs`)
-//! and the Dhan binary WS read (`dhat_ws_reader_zero_alloc.rs`) are DHAT-guarded,
+//! (`dhat_tick_row_builder.rs`), the bar-cache lookup (`dhat_bar_cache_lookup.rs`
+//! — deleted 2026-07-17 with the dead `in_mem::bar_cache` module, dead live-WS
+//! sweep stage 1) and the Dhan binary WS read (`dhat_ws_reader_zero_alloc.rs`)
+//! are DHAT-guarded,
 //! but the 21-TF fold itself — `consume_tick` folding a tick into all 21 cells —
 //! was alloc-free only BY INSPECTION, with no ratchet. A future edit that adds a
 //! per-tick allocation (a `format!` in a log, a `Vec`, a `.collect()`, a boxed

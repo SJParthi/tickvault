@@ -66,19 +66,34 @@
 //! `outcome="empty"` — counted, edge-tracked, forensics-rowed, never
 //! silent (Rule 11).
 //!
-//! ## Rate budget + pacing (the plan's capacity verdict)
-//! Per `docs/groww-ref/15-rate-limits-and-capacity.md` (official limits +
-//! capacity math + the §6 live-probe measurement plan): Groww's Live-Data
+//! ## Rate budget + pacing — the 2026-07-14 burst AUTO-LADDER
+//! (operator approval "approved and go ahead with the recommendation";
+//! contract `no-rest-except-live-feed-2026-06-27.md` §9.7 +
+//! `groww-second-feed-scope-2026-06-19.md` §38.9). Groww's Live-Data
 //! bucket is 10/s + 300/min, TYPE-pooled, shared with bruteX on the ONE
 //! minter token; which bucket `/historical/*` counts against is
-//! UNVERIFIED (Assumed Live Data — `docs/groww-ref/99-UNKNOWNS.md`). That
-//! binds the minute-boundary pacing rule: the 3 symbols are fetched
-//! SEQUENTIALLY, so at most ONE request is in flight at any instant
-//! (ladder re-polls are ≥700 ms apart) — far inside the ≤6 req/s
-//! boundary-burst ceiling. Worst case ~15 requests/minute (3 symbols × 5
-//! ladder rungs) ≈ 5% of the 300/min budget. Every 429 is counted + its
-//! shape captured (timestamp, endpoint, Retry-After presence, sanitized
-//! body) — the live-probe (e) requirement.
+//! UNVERIFIED (Assumed Live Data — `docs/groww-ref/99-UNKNOWNS.md`).
+//! The 4 targets fire CONCURRENTLY as ONE WAVE at a TIER-dependent
+//! post-boundary delay: `two_wave` (the shipped default) fires the spot
+//! wave at close+1,350 ms — more than one rolling second after the chain
+//! leg's close+300 ms wave, so the boundary burst never exceeds 4 req/s;
+//! the probe-gated `seven_concurrent` tier fires it at close+300 ms with
+//! the chain wave (7 req/s). Any Groww-leg HTTP 429 AUTO-DEMOTES the
+//! session (`crate::groww_rest_burst`; a demoted two_wave staggers wave
+//! slots by 350 ms — the ladder rung offsets are measured from each
+//! target's own first attempt, so the stagger propagates into every
+//! re-poll rung wave). Worst case ~20 requests/minute (4 targets × 5
+//! ladder rungs) ≈ 7% of the 300/min budget; the honest vendor-lag
+//! rolling-second worst (two adjacent rung waves) is 8 req/s solo —
+//! const-asserted ≤ the 10/s ceiling in `constants.rs`. Every 429 is
+//! counted + its shape captured (timestamp, endpoint, Retry-After
+//! presence, sanitized body) — the live-probe (e) requirement.
+//!
+//! ## Pre-boundary warm-up (config `[groww_rest_burst] warm_up`)
+//! At minute boundary − 4 s the leg sends ONE unauthenticated GET on its
+//! own client (3 s-bounded, response discarded) so an idle-closed TLS/H2
+//! connection is re-established before the critical window — see
+//! `crate::groww_rest_burst::send_warmup_get` for the no-token rationale.
 //!
 //! ## Token (the minter lock)
 //! The shared Groww access token is read READ-ONLY from SSM via the
@@ -113,20 +128,19 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CANDLE_INTERVAL_1MIN, GROWW_DATA_DIR,
-    GROWW_HISTORICAL_CANDLES_URL, GROWW_SPOT_1M_FIRE_DELAY_MS, GROWW_SPOT_1M_MAX_BODY_BYTES,
-    GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS, GROWW_SPOT_1M_RETRY_OFFSETS_MS,
+    GROWW_HISTORICAL_CANDLES_URL, GROWW_REST_RUNG_JITTER_STEP_MS, GROWW_REST_WARMUP_LEAD_SECS,
+    GROWW_SPOT_1M_MAX_BODY_BYTES, GROWW_SPOT_1M_REQUEST_TIMEOUT_MS, GROWW_SPOT_1M_RETRY_OFFSETS_MS,
     GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, GROWW_SPOT_1M_SYMBOLS, GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS,
     GROWW_SPOT_1M_VIX_SYMBOL, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
     SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::secret_manager::fetch_groww_access_token;
 use tickvault_core::feed::groww::instruments::stable_index_security_id;
-use tickvault_core::feed::groww::native::watch_reader::{
-    WatchFileDoc, WatchFileKind, parse_watch_file,
-};
+use tickvault_core::feed::groww::watch_reader::{WatchFileDoc, WatchFileKind, parse_watch_file};
 use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::disk_health_watcher::classify_join_exit;
@@ -140,6 +154,13 @@ use tickvault_storage::spot_1m_rest_persistence::{
 };
 
 use crate::dhan_intraday_parse::MinuteCandle;
+// The 2026-07-14 burst auto-ladder: shared tier/demotion state, the
+// tier-dependent wave delay + stagger schedule, and the pre-boundary
+// warm-up sender.
+use crate::groww_rest_burst::{
+    GrowwRestBurstState, intra_wave_stagger_ms, send_warmup_get, spot_wave_fire_delay_ms,
+    wave_sleep_from_now_ms,
+};
 // The session-boundary scheduling primitives + edge tracker + body-cap
 // helpers are REUSED from the Dhan spot leg (they are NSE-session facts and
 // pure state machines — the option_chain_1m_boot precedent).
@@ -186,14 +207,19 @@ pub struct GrowwSpot1mTaskParams {
     pub calendar: Arc<TradingCalendar>,
     /// QuestDB target for the `spot_1m_rest` + `rest_fetch_audit` tables.
     pub questdb: QuestDbConfig,
-    /// Chain-leg sequencing signal (PR-3): the boundary seconds-of-day this
-    /// leg just finished firing, published UNCONDITIONALLY at the END of
-    /// every fire — success OR failure — via `send_replace` (never errors;
-    /// the Dhan seam's exact semantics: the chain must never block on a
-    /// failing spot leg, and its own fallback timer covers a dead/disabled
-    /// one). `None` when the chain leg is disabled — zero publishes, the
-    /// loop stays byte-identical to PR-2.
-    pub minute_done_tx: Option<tokio::sync::watch::Sender<Option<u32>>>,
+    /// The shared 2026-07-14 burst auto-ladder state (tier + session
+    /// demotion flag + warm-up toggle) — one `Arc` across the spot, chain
+    /// and contract legs so a 429 on ANY leg demotes them all. (The PR-3
+    /// spot→chain minute-done signal was RETIRED by the auto-ladder — the
+    /// chain leg fires on its own minute-boundary timer.)
+    pub burst: Arc<GrowwRestBurstState>,
+    /// Order-runtime mark tap (dry-run PR, 2026-07-14; re-homed 2026-07-16
+    /// after the Groww live feed retired): `Some` ONLY when
+    /// `[order_runtime].enabled`. Marks are the OWN-FIRE just-closed-minute
+    /// candle CLOSES, forwarded AFTER the persist flush ACK — backfill,
+    /// sweep and warm-up NEVER produce marks (stale prices must not fill
+    /// paper orders). `None` ⇒ the tap is structurally absent (no-op).
+    pub mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 }
 
 // ---------------------------------------------------------------------------
@@ -215,22 +241,22 @@ pub struct GrowwSpot1mTaskParams {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GrowwSpotTarget {
     /// The Groww candles identity (`groww_symbol`, e.g. `NSE-NIFTY`).
-    groww_symbol: String,
+    pub(crate) groww_symbol: String,
     /// Human symbol persisted on rows (`NIFTY` / ... / `INDIA VIX`).
-    symbol: &'static str,
+    pub(crate) symbol: &'static str,
     /// Groww exchange (`NSE` / `BSE`).
-    exchange: String,
+    pub(crate) exchange: String,
     /// Groww segment (`CASH` for indices).
-    segment: String,
+    pub(crate) segment: String,
     /// The live-lane canonical Groww index id
     /// ([`stable_index_security_id`] of the groww_symbol).
-    security_id: i64,
+    pub(crate) security_id: i64,
     /// `true` for the 3 §38 core indices; `false` for INDIA VIX.
-    core: bool,
+    pub(crate) core: bool,
 }
 
 /// The 3 CORE targets from the const table. Pure.
-fn core_spot_targets() -> Vec<GrowwSpotTarget> {
+pub(crate) fn core_spot_targets() -> Vec<GrowwSpotTarget> {
     GROWW_SPOT_1M_SYMBOLS
         .iter()
         .map(
@@ -296,9 +322,9 @@ fn vix_target_from_watch_doc(doc: &WatchFileDoc, expected_date: &str) -> Option<
 /// (counted + warned once by the caller; the 3 core targets are never
 /// blocked). Cold path, at most one small file read per minute.
 // TEST-EXEMPT: thin fs-read shim — the parse + match + fail-closed arms are the pure vix_target_from_watch_doc, unit-tested below.
-fn try_resolve_vix_target(trading_date: NaiveDate) -> Option<GrowwSpotTarget> {
+pub(crate) fn try_resolve_vix_target(trading_date: NaiveDate) -> Option<GrowwSpotTarget> {
     let date = trading_date.format("%Y-%m-%d").to_string();
-    let path = crate::groww_native_shadow::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
+    let path = crate::groww_watch_paths::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
     let json = std::fs::read_to_string(&path).ok()?;
     let doc = parse_watch_file(&json).ok()?;
     vix_target_from_watch_doc(&doc, &date)
@@ -546,7 +572,7 @@ pub(crate) struct GrowwCandleRow {
 /// defensively (both forms). Malformed bodies/rows parse to empty/skipped
 /// + counted — never a panic (typed-degrade discipline). `volume` may be
 /// null (indices) → 0; non-finite prices skip the row. Pure.
-fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
+pub(crate) fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
     let (rows, stats) = parse_groww_1m_candle_rows(body);
     let candles = rows
         .into_iter()
@@ -828,6 +854,112 @@ fn pre_boot_gap_minutes(
     out
 }
 
+/// Bounded pre-boot dedup read cap per SID (Fix E, 2026-07-17) — a session
+/// holds at most 375 minutes, so 400 gives honest headroom; the query asks
+/// for `cap + 1` (the house LIMIT+1 probe) and `rows > cap` = a corrupt /
+/// untrustworthy set, treated as a read failure (fail-open naming).
+pub const GROWW_SPOT1M_PRE_BOOT_READ_CAP: usize = 400;
+
+/// The pre-boot dedup query (Fix E): which minutes of THIS (feed='groww',
+/// SID, day pre-boot window) did a PREDECESSOR process already persist to
+/// `spot_1m_rest`? Micros WHERE literals (the only representation legal in
+/// an embedded QuestDB TIMESTAMP comparison), nanos-projected key —
+/// mirrors the spot cross-verify reader's shape. Pure.
+#[must_use]
+pub fn select_pre_boot_persisted_sql(
+    security_id: i64,
+    window_start_nanos: i64,
+    window_end_nanos: i64,
+) -> String {
+    let start = window_start_nanos / 1_000;
+    let end = window_end_nanos / 1_000;
+    let probe_limit = GROWW_SPOT1M_PRE_BOOT_READ_CAP + 1;
+    format!(
+        "SELECT DISTINCT (ts / 1) * 1000 AS ts_nanos FROM spot_1m_rest \
+         WHERE feed = '{SPOT_1M_REST_FEED_GROWW}' AND security_id = {security_id} \
+         AND ts >= {start} AND ts < {end} LIMIT {probe_limit}"
+    )
+}
+
+/// Parse the [`select_pre_boot_persisted_sql`] response into the persisted
+/// minute set. LIMIT+1 hardened: MORE than `cap` rows = an untrustworthy
+/// set (`Err` — the caller fails OPEN and names every gap). Pure.
+///
+/// # Errors
+/// Malformed body / missing dataset / over-cap row count.
+pub fn parse_pre_boot_persisted_minutes(
+    body: &str,
+    cap: usize,
+) -> Result<std::collections::HashSet<i64>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("malformed JSON: {e}"))?;
+    let rows = v
+        .get("dataset")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| "missing dataset".to_string())?;
+    if rows.len() > cap {
+        return Err(format!(
+            "{} rows exceed the {cap}-row pre-boot dedup cap — set untrusted",
+            rows.len()
+        ));
+    }
+    let mut out = std::collections::HashSet::with_capacity(rows.len());
+    for r in rows {
+        if let Some(ts) = r.as_array().and_then(|c| c.first()).and_then(|c| {
+            c.as_i64().or_else(|| {
+                // APPROVED: cold-path float-to-i64 column fallback precedent
+                #[allow(clippy::cast_possible_truncation)]
+                c.as_f64().map(|f| f as i64)
+            })
+        }) {
+            out.insert(ts);
+        }
+    }
+    Ok(out)
+}
+
+/// Fix E: only TRULY-ABSENT pre-boot minutes get named — a minute a
+/// predecessor process already persisted (its `ok` row lands alongside in
+/// the DEDUP-keyed audit) is NOT a gap and must not be re-named. Pure.
+#[must_use]
+pub fn filter_unpersisted_minutes(
+    gap_minutes_nanos: &[i64],
+    persisted_nanos: &std::collections::HashSet<i64>,
+) -> Vec<i64> {
+    gap_minutes_nanos
+        .iter()
+        .copied()
+        .filter(|m| !persisted_nanos.contains(m))
+        .collect()
+}
+
+/// Read the predecessor-persisted minute set for one SID's pre-boot window
+/// (Fix E dedup). ONE bounded local-QuestDB `/exec` GET per SID per sweep
+/// (≤4/day); any failure (transport / non-2xx / parse / over-cap) is an
+/// `Err` the caller fails OPEN on — a failed dedup read must never hide a
+/// real gap.
+async fn read_pre_boot_persisted_minutes(
+    client: &reqwest::Client,
+    questdb: &QuestDbConfig,
+    security_id: i64,
+    window_start_nanos: i64,
+    window_end_nanos: i64,
+) -> Result<std::collections::HashSet<i64>, String> {
+    let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
+    let sql = select_pre_boot_persisted_sql(security_id, window_start_nanos, window_end_nanos);
+    let resp = client
+        .get(&url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("send: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("http {}", resp.status()));
+    }
+    let body = resp.text().await.map_err(|e| format!("read: {e}"))?;
+    parse_pre_boot_persisted_minutes(&body, GROWW_SPOT1M_PRE_BOOT_READ_CAP)
+}
+
 /// `true` when a vendor candle's OHLC is implausible — any non-positive
 /// O/H/L/C or `high < low` (hostile round 1 item 9). The row is STILL
 /// persisted verbatim (we mirror the vendor), but never silently: the
@@ -887,6 +1019,22 @@ fn groww_retry_sleep_deltas_ms() -> [u64; 4] {
         o[2].saturating_sub(o[1]),
         o[3].saturating_sub(o[2]),
     ]
+}
+
+/// The sleep before ladder attempt `attempt` (1-based rung index), with
+/// the HIGH-1 (2026-07-14) per-target rung jitter folded in: the jitter
+/// is added ONCE, before the FIRST rung, which shifts the target's
+/// ENTIRE rung schedule by `rung_jitter_ms` (rung k lands at
+/// `offset_k + jitter` — the Dhan-leg slot-jitter precedent), so the 4
+/// concurrent targets never re-poll in lockstep on a correlated
+/// vendor-lag minute. Applied in ALL tiers. Pure.
+fn rung_sleep_delta_ms(deltas: &[u64; 4], attempt: usize, rung_jitter_ms: u64) -> u64 {
+    let base = deltas[attempt - 1];
+    if attempt == 1 {
+        base.saturating_add(rung_jitter_ms)
+    } else {
+        base
+    }
 }
 
 /// `true` when an SSM re-read of the shared token is allowed — the
@@ -1156,12 +1304,12 @@ enum SymbolFetchOutcome {
 /// One attempt's typed failure — classification from the REAL
 /// `StatusCode`, never a substring scan.
 #[derive(Clone, Debug, PartialEq)]
-struct FetchFailure {
+pub(crate) struct FetchFailure {
     /// HTTP status (0 = the request never got a response).
-    status: u16,
-    rate_limited: bool,
-    auth_rejected: bool,
-    msg: String,
+    pub(crate) status: u16,
+    pub(crate) rate_limited: bool,
+    pub(crate) auth_rejected: bool,
+    pub(crate) msg: String,
 }
 
 /// Per-ladder forensics for the `rest_fetch_audit` row: attempts actually
@@ -1205,7 +1353,7 @@ async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String>
 /// `Authorization` header — never in the URL, never logged). A 429
 /// additionally records the live-probe (e) shape: endpoint + Retry-After
 /// presence + sanitized body, via one bounded `warn!` per occurrence.
-async fn groww_fetch_once(
+pub(crate) async fn groww_fetch_once(
     client: &reqwest::Client,
     url: &str,
     query: &[(&'static str, String); 6],
@@ -1283,6 +1431,7 @@ async fn fetch_minute_with_ladder(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    rung_jitter_ms: u64,
 ) -> (SymbolFetchOutcome, LadderForensics) {
     let deltas = groww_retry_sleep_deltas_ms();
     let mut last_error: Option<String> = None;
@@ -1297,7 +1446,12 @@ async fn fetch_minute_with_ladder(
     };
     for attempt in 0..=deltas.len() {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(deltas[attempt - 1])).await;
+            tokio::time::sleep(Duration::from_millis(rung_sleep_delta_ms(
+                &deltas,
+                attempt,
+                rung_jitter_ms,
+            )))
+            .await;
         }
         let started = std::time::Instant::now();
         let result = groww_fetch_once(client, url, query, token).await;
@@ -1421,6 +1575,7 @@ async fn fetch_minute_bounded(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    rung_jitter_ms: u64,
 ) -> (SymbolFetchOutcome, LadderForensics) {
     match tokio::time::timeout(
         Duration::from_secs(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS),
@@ -1432,6 +1587,7 @@ async fn fetch_minute_bounded(
             target_minute_ist_nanos,
             backfill_minute_ist_nanos,
             minute_close_ms_of_day,
+            rung_jitter_ms,
         ),
     )
     .await
@@ -1468,7 +1624,7 @@ async fn fetch_minute_bounded(
 /// `close_to_data_ms` stamp is the caller's HONEST retrieval delay
 /// (own-fire latency, or the > 60 s real delay for a backfilled/swept
 /// minute).
-fn build_groww_spot_1m_row(
+pub(crate) fn build_groww_spot_1m_row(
     candle: &MinuteCandle,
     security_id: i64,
     symbol: &'static str,
@@ -1541,44 +1697,13 @@ fn build_fetch_audit_row(
     }
 }
 
-/// Forensics rows for the targets SKIPPED after an auth-class reject
-/// short-circuited the fire (hostile round 1 item 12): no request is ever
-/// sent for them with the dead token — outcome `no_token`, class `auth`,
-/// 0/-1 sentinels (no HTTP happened). Pure — unit-tested below.
-fn build_auth_short_circuit_rows(
-    remaining: &[GrowwSpotTarget],
-    target_minute_ist_nanos: i64,
-    trading_date_nanos: i64,
-) -> Vec<RestFetchAuditRow> {
-    let forensics = LadderForensics {
-        attempts: 0,
-        rate_limited_count: 0,
-        final_http_status: 0,
-        final_latency_ms: -1,
-        error_class: "auth",
-        auth_rejected: true,
-    };
-    remaining
-        .iter()
-        .map(|target| {
-            build_fetch_audit_row(
-                target_minute_ist_nanos,
-                trading_date_nanos,
-                target.security_id,
-                target.symbol,
-                &forensics,
-                RestFetchOutcome::NoToken,
-                -1,
-                "auth",
-            )
-        })
-        .collect()
-}
-
 /// Best-effort forensics append: a failure logs (coded) + counts and
 /// RETURNS — the fetch loop, the verdict and the failure edge are never
 /// affected by the forensics leg.
-fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestFetchAuditRow) {
+pub(crate) fn audit_append_best_effort(
+    audit_writer: &mut RestFetchAuditWriter,
+    row: &RestFetchAuditRow,
+) {
     if let Err(err) = audit_writer.append_row(row) {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_append")
             .increment(1);
@@ -1594,7 +1719,7 @@ fn audit_append_best_effort(audit_writer: &mut RestFetchAuditWriter, row: &RestF
 }
 
 /// Best-effort forensics flush (same never-affects-the-loop contract).
-fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
+pub(crate) fn audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
     if let Err(err) = audit_writer.flush() {
         metrics::counter!("tv_rest_fetch_audit_persist_errors_total", "stage" => "audit_flush")
             .increment(1);
@@ -1631,7 +1756,7 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
     // the exact TLS/resolver churn HTTP-CLIENT-01 §0 condemns); NEVER a
     // `Client::new()` panic fallback.
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_millis(GROWW_SPOT_1M_REQUEST_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
@@ -1676,10 +1801,12 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
     let mut first_covered: Option<i64> = None;
     info!(
         core_symbols = GROWW_SPOT_1M_SYMBOLS.len(),
+        tier = params.burst.effective_tier().as_str(),
+        warm_up = params.burst.warm_up_enabled(),
         "groww_spot_1m: per-minute fetch loop armed (fires each minute close \
-         09:16:00-15:30:00 IST, ~0.3-1.3s after the boundary; sequential \
-         target pacing; INDIA VIX joins as the 4th target once \
-         runtime-resolved — 2026-07-13 operator scope)"
+         09:16:00-15:30:00 IST as ONE concurrent wave at the tier delay — \
+         2026-07-14 burst auto-ladder; INDIA VIX joins as the 4th target \
+         once runtime-resolved — 2026-07-13 operator scope)"
     );
 
     loop {
@@ -1716,9 +1843,52 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
             .await;
             return;
         };
-        let sleep_ms =
-            u64::from(fire.saturating_sub(now)).saturating_mul(1_000) + GROWW_SPOT_1M_FIRE_DELAY_MS;
-        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        // 2026-07-14 auto-ladder: the spot wave fires at the TIER delay
+        // (two_wave: close+1,350 ms — more than a rolling second after the
+        // chain wave; seven_concurrent: close+300 ms). The optional
+        // pre-boundary warm-up GET (boundary−4 s, 3 s-bounded,
+        // unauthenticated — see `send_warmup_get`) re-establishes an
+        // idle-closed TLS connection before the critical window.
+        // CRITICAL-1 (2026-07-14 fix round): EVERY wake instant — the
+        // warm-up lead AND the wave itself — is computed from the
+        // MILLISECOND clock (`wave_sleep_from_now_ms`), never by summing
+        // a whole-second boundary gap with the delay: the pre-fix else
+        // branch woke at `fire + frac(now) + delay`, and the two legs'
+        // independent fractional offsets could collapse the load-bearing
+        // 1,050 ms wave separation to ~51 ms.
+        let wave_delay_ms = spot_wave_fire_delay_ms(params.burst.effective_tier());
+        let warmup_lead_ms = GROWW_REST_WARMUP_LEAD_SECS.saturating_mul(1_000);
+        let warmup_sleep_ms = wave_sleep_from_now_ms(
+            fire,
+            -i64::try_from(warmup_lead_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if params.burst.warm_up_enabled() && warmup_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(warmup_sleep_ms)).await;
+            if let Some(first) = targets.first() {
+                let warmup_query = groww_candles_query(
+                    &first.groww_symbol,
+                    &first.exchange,
+                    &first.segment,
+                    iter_date,
+                );
+                send_warmup_get(
+                    &client,
+                    GROWW_HISTORICAL_CANDLES_URL,
+                    &warmup_query,
+                    "spot_1m",
+                )
+                .await;
+            }
+        }
+        let remaining_ms = wave_sleep_from_now_ms(
+            fire,
+            i64::try_from(wave_delay_ms).unwrap_or(0),
+            ist_millis_of_day_now(),
+        );
+        if remaining_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+        }
 
         // Staleness gate: a suspend / clock step can wake us far past the
         // boundary. Skip + recompute; every boundary that elapsed while
@@ -1769,13 +1939,6 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
         )
         .await;
         last_fired = Some(fire);
-        // Chain-leg sequencing (PR-3): publish this fire's boundary
-        // UNCONDITIONALLY — success OR failure (the chain must never block
-        // on a failing spot leg; the Dhan seam's semantics). `send_replace`
-        // never errors; no receiver = no cost.
-        if let Some(tx) = &params.minute_done_tx {
-            tx.send_replace(Some(fire));
-        }
         // H2 overrun accounting: boundaries that fully elapsed DURING the
         // fire can never be fetched — count them loudly + feed the edge.
         let after = ist_secs_of_day_now();
@@ -1913,6 +2076,20 @@ async fn fire_one_minute(
 ) {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
     let minute_label = format_minute_ist_12h(minute_open_secs);
+    // TRAP-A (2026-07-15, Groww live-feed retirement): per-fire liveness
+    // heartbeat for the re-pointed market-hours liveness alarm
+    // (market-hours-liveness-alarm.tf, treat_missing_data = "breaching").
+    // Set ONCE per per-minute fire, deliberately NOT pre-registered at
+    // boot — the first set at the 09:16:01 IST fire IS the session-start
+    // signal (a pre-registered 0 would satisfy the alarm while the legs
+    // never fire); metrics-exporter-prometheus re-renders the last value
+    // on every scrape thereafter, so a wedged/dead process — or a session
+    // where NO leg ever fired — goes MISSING in-window and pages. HONEST
+    // BOUND (2026-07-15, R1-2): the re-render means legs dying MID-SESSION
+    // after the first fire keep the gauge published — that class is owned
+    // by the legs' own escalation pages, not this alarm. The 1.0 is a
+    // constant marker — only sample PRESENCE matters.
+    metrics::gauge!("tv_rest_1m_fire_heartbeat").set(1.0);
     let trading_date = today_ist();
     let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
     let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
@@ -1943,10 +2120,30 @@ async fn fire_one_minute(
     // data flush ACK, then stamped with the real close_to_persist_ms (a
     // failed flush discards them — the flush_failed rows are the truth).
     let mut held_ok_rows: Vec<RestFetchAuditRow> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: bars staged for the fold-writer
+    // handoff — sent ONLY after the flush ACK confirms persistence.
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
+    // Order-runtime mark tap (re-homed 2026-07-16): OWN-FIRE just-closed-
+    // minute closes ONLY, staged here and forwarded AFTER the flush ACK
+    // (persist-confirm choke point — mirrors the fold hook placement). The
+    // BACKFILL branch below and the post-session sweep NEVER stage marks:
+    // a >60s-old repaired price must not fill a paper order (the C11
+    // replay-window lesson applied to the REST legs). Cold path (once per
+    // minute) — the Vec is fine; the forward itself is a lock-free
+    // best-effort try_send that no-ops when the runtime is disabled.
+    let mut staged_marks: Vec<crate::order_runtime::MarkUpdate> = Vec::new();
 
     if let Some(token) = token_cache.ensure_token().await {
+        // 2026-07-14 auto-ladder: the WAVE — all targets fetch
+        // CONCURRENTLY (JoinSet; each task owns cheap handle clones), a
+        // demoted two_wave session staggers slots by 350 ms. The 429
+        // demotion + tier counter are recorded from the collected
+        // forensics below.
+        let tier = params.burst.effective_tier();
+        metrics::counter!("tv_groww_rest_burst_tier_total", "tier" => tier.as_str()).increment(1);
+        let mut wave: tokio::task::JoinSet<(usize, SymbolFetchOutcome, LadderForensics)> =
+            tokio::task::JoinSet::new();
         for (idx, target) in targets.iter().enumerate() {
-            let security_id = target.security_id;
             let query = groww_candles_query(
                 &target.groww_symbol,
                 &target.exchange,
@@ -1954,20 +2151,91 @@ async fn fire_one_minute(
                 trading_date,
             );
             let backfill_nanos = backfill_minute_nanos(
-                tracker.last_persisted(security_id),
+                tracker.last_persisted(target.security_id),
                 target_nanos,
                 session_first_nanos,
             );
-            let (outcome, forensics) = fetch_minute_bounded(
-                client,
-                GROWW_HISTORICAL_CANDLES_URL,
-                &query,
-                &token,
-                target_nanos,
-                backfill_nanos,
-                minute_close_ms,
-            )
-            .await;
+            let wave_client = client.clone();
+            let wave_token = token.clone();
+            // The sequential floor spans a whole per-target budget per
+            // slot (review MEDIUM-1 2026-07-14).
+            let stagger_ms =
+                intra_wave_stagger_ms(tier, idx, GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000);
+            // HIGH-1 (2026-07-14): deterministic per-target rung jitter
+            // in ALL tiers — slot j shifts its rung schedule by j×150 ms
+            // so correlated vendor-lag re-polls never fire in lockstep.
+            let rung_jitter_ms = (idx as u64).saturating_mul(GROWW_REST_RUNG_JITTER_STEP_MS);
+            wave.spawn(async move {
+                if stagger_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+                }
+                let (outcome, forensics) = fetch_minute_bounded(
+                    &wave_client,
+                    GROWW_HISTORICAL_CANDLES_URL,
+                    &query,
+                    &wave_token,
+                    target_nanos,
+                    backfill_nanos,
+                    minute_close_ms,
+                    rung_jitter_ms,
+                )
+                .await;
+                (idx, outcome, forensics)
+            });
+        }
+        // Collect the wave back into TARGET ORDER so the persist / audit
+        // / verdict pipeline below stays deterministic.
+        let mut results: Vec<Option<(SymbolFetchOutcome, LadderForensics)>> =
+            (0..targets.len()).map(|_| None).collect();
+        while let Some(joined) = wave.join_next().await {
+            match joined {
+                Ok((idx, outcome, forensics)) => {
+                    if let Some(slot) = results.get_mut(idx) {
+                        *slot = Some((outcome, forensics));
+                    }
+                }
+                Err(join_err) => {
+                    // Unwind builds only (release aborts on panic): the
+                    // lost slot stays None and is synthesized as a Failed
+                    // outcome below — never a silent missing target.
+                    error!(
+                        code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                        stage = "wave_task_failed",
+                        feed = SPOT_1M_REST_FEED_GROWW,
+                        ?join_err,
+                        "SPOT1M-01: a wave fetch task failed to join — its \
+                         target counts as failed for this minute"
+                    );
+                }
+            }
+        }
+        let mut any_auth_rejected = false;
+        let mut any_rate_limited = false;
+        for (idx, target) in targets.iter().enumerate() {
+            let security_id = target.security_id;
+            let (outcome, forensics) =
+                results
+                    .get_mut(idx)
+                    .and_then(Option::take)
+                    .unwrap_or_else(|| {
+                        (
+                            SymbolFetchOutcome::Failed {
+                                reason: "wave fetch task failed to join".to_string(),
+                                ga_code: None,
+                                backfill_candle: None,
+                            },
+                            LadderForensics {
+                                attempts: 0,
+                                rate_limited_count: 0,
+                                final_http_status: 0,
+                                final_latency_ms: -1,
+                                error_class: "task_failed",
+                                auth_rejected: false,
+                            },
+                        )
+                    });
+            any_auth_rejected |= forensics.auth_rejected;
+            any_rate_limited |= forensics.rate_limited_count > 0;
 
             // Forensics row (success AND failure) — best-effort, the
             // verdict below is computed independently. GAP-11 persist
@@ -2106,6 +2374,31 @@ async fn fire_one_minute(
                         held_ok_rows.push(row);
                     }
                     staged.push((security_id, candle.minute_ts_ist_nanos));
+                    if let Ok(sid_u64) = u64::try_from(security_id) {
+                        confirmed_bars.push(
+                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                                Feed::Groww,
+                                sid_u64,
+                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                                &candle,
+                            ),
+                        );
+                        // Mark tap: OWN-FIRE close only (this is the just-
+                        // closed target minute; the backfill branch below
+                        // deliberately stages NO mark).
+                        #[allow(clippy::cast_possible_truncation)]
+                        // APPROVED: MarkUpdate carries f32 by contract (the
+                        // wire LTP precision); price-level narrowing only.
+                        staged_marks.push(crate::order_runtime::MarkUpdate {
+                            security_id: sid_u64,
+                            segment_code: tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                            price: candle.close as f32,
+                        });
+                    } else {
+                        // Round-2 LOW-6: never a silent skip — counted +
+                        // one coalesced warn (defensive; ids are positive).
+                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
+                    }
                 }
             }
             if let Some(backfill) = backfill_candle {
@@ -2165,34 +2458,47 @@ async fn fire_one_minute(
                         "none",
                     ));
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
-                }
-            }
-            if forensics.auth_rejected {
-                // Item 12: drop the dead token NOW and short-circuit the
-                // remaining symbols for THIS fire — every further request
-                // with the same rejected token is a doomed 401 (~15 wasted
-                // rejects worst case). The next fire's ensure_token
-                // re-reads SSM at the ≥60s floor (unchanged); NEVER a mint.
-                token_cache.note_auth_rejected();
-                let remaining = &targets[idx + 1..];
-                if !remaining.is_empty() {
-                    error_count = error_count.saturating_add(remaining.len());
-                    warn!(
-                        skipped_symbols = remaining.len(),
-                        "groww_spot_1m: auth-class reject — remaining symbols \
-                         short-circuited for this fire (no doomed requests); \
-                         forensics rows still emitted"
-                    );
-                    for row in
-                        build_auth_short_circuit_rows(remaining, target_nanos, trading_date_nanos)
-                    {
-                        metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "error")
-                            .increment(1);
-                        audit_append_best_effort(audit_writer, &row);
+                    if let Ok(sid_u64) = u64::try_from(security_id) {
+                        confirmed_bars.push(
+                            crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                                Feed::Groww,
+                                sid_u64,
+                                tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                                &backfill,
+                            ),
+                        );
+                    } else {
+                        // Round-2 LOW-6: never a silent skip — counted +
+                        // one coalesced warn (defensive; ids are positive).
+                        crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
                     }
                 }
-                break;
             }
+        }
+        if any_auth_rejected {
+            // Item 12 (auto-ladder form): the wave already fired
+            // concurrently, so there are no "remaining" targets to
+            // short-circuit — each target's OWN ladder aborted on its
+            // 401/403 (≤ 4 doomed requests, not 4 × 5). Drop the dead
+            // token so the NEXT fire's ensure_token re-reads SSM at the
+            // ≥60 s floor (unchanged); NEVER a mint.
+            token_cache.note_auth_rejected();
+        }
+        if any_rate_limited && params.burst.note_rate_limited() {
+            // The session's DEMOTION EDGE (exactly once): the burst tier
+            // steps down for every subsequent minute — seven_concurrent →
+            // two_wave, two_wave → staggered two_wave. Boot restores the
+            // configured tier.
+            warn!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "burst_demoted",
+                feed = SPOT_1M_REST_FEED_GROWW,
+                minute = %minute_label,
+                demoted_to = params.burst.effective_tier().as_str(),
+                "SPOT1M-01: HTTP 429 on the Groww spot wave — burst tier \
+                 auto-demoted for the rest of the session (restart restores \
+                 the configured tier)"
+            );
         }
         let flush_result = writer.flush();
         if let Err(err) = &flush_result {
@@ -2237,6 +2543,19 @@ async fn fire_one_minute(
             // Flush confirmed — advance the per-symbol persisted watermark.
             for (security_id, minute_nanos) in staged {
                 tracker.commit(security_id, minute_nanos);
+            }
+            // 2026-07-16 REST-era candle derivation: the bars are now
+            // persist-CONFIRMED — hand them to the fold writer.
+            crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
+            // Order-runtime mark tap: forward the OWN-FIRE closes now that
+            // the flush ACK confirmed persistence (a mark must never
+            // reference a price the audit record does not back). Best-effort
+            // try_send; a full channel drops the mark (counted — the next
+            // minute supersedes it); None ⇒ runtime disabled, zero work.
+            if let Some(forwarder) = params.mark_forwarder.as_ref() {
+                for mark in &staged_marks {
+                    forwarder.mark_forward(mark.security_id, mark.segment_code, mark.price);
+                }
             }
         }
         // GAP-11: the ok rows land ONLY after (and stamped with) the data
@@ -2445,6 +2764,9 @@ async fn run_post_session_sweep(
     let mut still_missing: u64 = 0;
     let mut pre_boot_named: u64 = 0;
     let mut staged: Vec<(i64, i64)> = Vec::new();
+    // 2026-07-16 REST-era candle derivation: swept bars staged for the
+    // fold-writer handoff — sent ONLY after the flush ACK confirms.
+    let mut confirmed_bars: Vec<crate::rest_candle_fold::ConfirmedBar> = Vec::new();
     let mut persist_failed = false;
     for target in targets {
         let security_id = target.security_id;
@@ -2453,7 +2775,40 @@ async fn run_post_session_sweep(
         // forensics row per minute, NO fetch (§38 forbids a bulk
         // backfill). A whole-session blind run (never fired) names every
         // session minute and skips the fetch-sweep entirely.
-        let pre_boot = pre_boot_gap_minutes(first_covered, session_first, session_last);
+        // Fix E (2026-07-17): a PREDECESSOR process's persisted minutes
+        // are NOT gaps — one bounded dedup read per SID excludes them, so
+        // only truly-absent minutes get named (kills the restart-day
+        // 1,088-artifact class). A failed/over-cap read fails OPEN to the
+        // old name-everything behavior + one coded warn — a broken dedup
+        // read must never hide a real gap.
+        let mut pre_boot = pre_boot_gap_minutes(first_covered, session_first, session_last);
+        if let Some(last) = pre_boot.last().copied() {
+            match read_pre_boot_persisted_minutes(
+                client,
+                &params.questdb,
+                security_id,
+                session_first,
+                last.saturating_add(NANOS_PER_MINUTE),
+            )
+            .await
+            {
+                Ok(persisted) => {
+                    pre_boot = filter_unpersisted_minutes(&pre_boot, &persisted);
+                }
+                Err(reason) => {
+                    warn!(
+                        code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                        stage = "pre_boot_dedup_read",
+                        feed = SPOT_1M_REST_FEED_GROWW,
+                        security_id,
+                        %reason,
+                        "SPOT1M-01: pre-boot dedup read failed — naming every \
+                         pre-boot minute as before (fail-open; a failed read \
+                         must never hide a real gap)"
+                    );
+                }
+            }
+        }
         if !pre_boot.is_empty() {
             pre_boot_named = pre_boot_named.saturating_add(pre_boot.len() as u64);
             metrics::counter!("tv_groww_spot1m_pre_boot_gap_total")
@@ -2615,6 +2970,18 @@ async fn run_post_session_sweep(
             } else {
                 found_for_sid = found_for_sid.saturating_add(1);
                 staged.push((security_id, *minute_nanos));
+                if let Ok(sid_u64) = u64::try_from(security_id) {
+                    confirmed_bars.push(crate::rest_candle_fold::ConfirmedBar::from_minute_candle(
+                        Feed::Groww,
+                        sid_u64,
+                        tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I,
+                        &candle,
+                    ));
+                } else {
+                    // Round-2 LOW-6: never a silent skip — counted + one
+                    // coalesced warn (defensive; ids are positive).
+                    crate::rest_candle_fold::note_unfoldable_identity(Feed::Groww, security_id);
+                }
             }
         }
         // NAMED GAPS: the finally-unrecovered minutes for this symbol —
@@ -2688,6 +3055,10 @@ async fn run_post_session_sweep(
         for (security_id, minute_nanos) in staged {
             tracker.commit(security_id, minute_nanos);
         }
+        // 2026-07-16 REST-era candle derivation: swept bars are now
+        // persist-CONFIRMED — hand them to the fold writer (out-of-order
+        // swept bars mark their day dirty for a refold).
+        crate::rest_candle_fold::send_confirmed_bars(&confirmed_bars);
     }
     audit_flush_best_effort(audit_writer);
     metrics::counter!("tv_groww_spot1m_sweep_backfilled_total").increment(swept);
@@ -3422,6 +3793,27 @@ mod tests {
         }
     }
 
+    /// HIGH-1 (2026-07-14): the per-target rung jitter is added ONCE,
+    /// before the first rung, shifting the target's whole rung schedule
+    /// by `slot × 150 ms` — rung k reconstructs to `offset_k + jitter`
+    /// for every slot, and slot 0 is byte-identical to the unjittered
+    /// schedule.
+    #[test]
+    fn test_rung_sleep_delta_applies_slot_jitter_to_whole_schedule() {
+        let deltas = groww_retry_sleep_deltas_ms();
+        for slot in 0..GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1 {
+            let jitter = slot * GROWW_REST_RUNG_JITTER_STEP_MS;
+            let mut cumulative = 0u64;
+            for (attempt, offset) in (1..=deltas.len()).zip(GROWW_SPOT_1M_RETRY_OFFSETS_MS.iter()) {
+                cumulative += rung_sleep_delta_ms(&deltas, attempt, jitter);
+                assert_eq!(cumulative, *offset + jitter);
+            }
+        }
+        // Slot 0 (jitter 0) reproduces the raw deltas exactly.
+        assert_eq!(rung_sleep_delta_ms(&deltas, 1, 0), deltas[0]);
+        assert_eq!(rung_sleep_delta_ms(&deltas, 2, 0), deltas[1]);
+    }
+
     #[test]
     fn test_should_reread_token_respects_60s_floor() {
         // Never read → always allowed.
@@ -3655,6 +4047,53 @@ mod tests {
         assert!(pre_boot_gap_minutes(Some(covered), session_first, session_last).is_empty());
     }
 
+    /// Fix E pre-boot dedup: predecessor-persisted minutes are EXCLUDED
+    /// from naming; only truly-absent minutes stay; an over-cap dataset is
+    /// an `Err` (fail-open — the caller names everything + one coded warn).
+    #[test]
+    fn test_pre_boot_dedup_excludes_predecessor_persisted_minutes() {
+        // The dedup query shape: feed-scoped, SID-scoped, micros window,
+        // LIMIT+1 probe.
+        let sql = select_pre_boot_persisted_sql(4_611, 2_000_000_000, 5_000_000_000);
+        assert!(sql.contains("feed = 'groww'"), "{sql}");
+        assert!(sql.contains("security_id = 4611"), "{sql}");
+        assert!(sql.contains("ts >= 2000000 AND ts < 5000000"), "{sql}");
+        assert!(
+            sql.contains(&format!("LIMIT {}", GROWW_SPOT1M_PRE_BOOT_READ_CAP + 1)),
+            "{sql}"
+        );
+
+        // Parse + filter: minutes 1 and 3 persisted by a predecessor →
+        // only minute 2 remains a nameable gap.
+        let body = r#"{"dataset":[[60000000000],[180000000000]]}"#;
+        let persisted =
+            parse_pre_boot_persisted_minutes(body, GROWW_SPOT1M_PRE_BOOT_READ_CAP).expect("parses");
+        let gaps = [60_000_000_000_i64, 120_000_000_000, 180_000_000_000];
+        assert_eq!(
+            filter_unpersisted_minutes(&gaps, &persisted),
+            vec![120_000_000_000],
+            "predecessor-persisted minutes are not gaps"
+        );
+
+        // Read-failure arms fail OPEN (caller keeps the old naming): a
+        // malformed body and an over-cap set are both `Err`.
+        assert!(parse_pre_boot_persisted_minutes("not json", 400).is_err());
+        assert!(parse_pre_boot_persisted_minutes(r#"{"no":"dataset"}"#, 400).is_err());
+        let over = format!(
+            r#"{{"dataset":[{}]}}"#,
+            (0..3)
+                .map(|i| format!("[{i}]"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(
+            parse_pre_boot_persisted_minutes(&over, 2).is_err(),
+            "over-cap set is untrusted (fail-open)"
+        );
+        // Exactly-cap is trusted (the LIMIT+1 probe).
+        assert!(parse_pre_boot_persisted_minutes(&over, 3).is_ok());
+    }
+
     /// Item 9: non-positive O/H/L/C or high<low flags; a normal candle
     /// (incl. zero-volume index) does not.
     #[test]
@@ -3730,31 +4169,6 @@ mod tests {
         }
     }
 
-    /// Item 12 (fire-level): the symbols skipped after an auth reject get
-    /// `no_token`/`auth` forensics rows with 0/-1 sentinels — never a
-    /// doomed request, never a silent skip.
-    #[test]
-    fn test_build_auth_short_circuit_rows_names_remaining_symbols() {
-        // 2026-07-13: the short-circuit slice is target-typed now, so a
-        // resolved INDIA VIX target is skipped + forensics-rowed exactly
-        // like the core symbols.
-        let targets = core_spot_targets();
-        let rows = build_auth_short_circuit_rows(&targets[1..], 900, 0);
-        assert_eq!(rows.len(), 2, "two targets remain after the first");
-        for (row, target) in rows.iter().zip(&targets[1..]) {
-            assert_eq!(row.outcome, RestFetchOutcome::NoToken);
-            assert_eq!(row.error_class, "auth");
-            assert_eq!(row.final_http_status, 0, "no HTTP happened");
-            assert_eq!(row.attempts, 0);
-            assert_eq!(row.fetch_latency_ms, -1);
-            assert_eq!(row.close_to_data_ms, -1);
-            assert_eq!(row.ts_ist_nanos, 900);
-            assert_eq!(row.security_id, target.security_id);
-            assert_eq!(row.symbol, target.symbol);
-        }
-        assert!(build_auth_short_circuit_rows(&[], 900, 0).is_empty());
-    }
-
     /// Spawn a one-response-per-connection mock HTTP server; returns the
     /// candles URL pointing at it.
     async fn spawn_mock_candles_server(response: &'static str) -> String {
@@ -3796,7 +4210,7 @@ mod tests {
         let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
         let token = SecretString::from("test-token");
         let (outcome, forensics) =
-            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0).await;
+            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0, 0).await;
         assert_eq!(
             forensics.attempts, 1,
             "auth reject must abort the ladder on the first rung"
@@ -3824,7 +4238,7 @@ mod tests {
         let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
         let token = SecretString::from("test-token");
         let (outcome, forensics) =
-            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0).await;
+            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0, 0).await;
         assert_eq!(
             forensics.attempts,
             GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() as u32 + 1,
@@ -3881,6 +4295,7 @@ mod tests {
             nse_mock_trading_dates: vec![],
         };
         GrowwSpot1mTaskParams {
+            mark_forwarder: None,
             notifier: NotificationService::disabled(),
             calendar: Arc::new(
                 tickvault_common::trading_calendar::TradingCalendar::from_config(&config)
@@ -3892,9 +4307,12 @@ mod tests {
                 pg_port: 1,
                 ilp_port: 1,
             },
-            // PR-3 rebase reconciliation: the chain leg's minute-done
-            // sequencing sender — None in these fixtures (chain off).
-            minute_done_tx: None,
+            // 2026-07-14 auto-ladder: the shared burst state — the
+            // rate-safe default shape, warm-up off in fixtures.
+            burst: GrowwRestBurstState::new(
+                tickvault_common::config::GrowwRestBurstTier::TwoWave,
+                false,
+            ),
         }
     }
 
@@ -4099,6 +4517,7 @@ mod tests {
             target_nanos,
             Some(backfill_nanos),
             0,
+            0,
         )
         .await;
         assert_eq!(forensics.attempts, 1, "found on the first rung");
@@ -4124,6 +4543,7 @@ mod tests {
             &token,
             target_nanos,
             Some(backfill_nanos),
+            0,
             0,
         )
         .await;

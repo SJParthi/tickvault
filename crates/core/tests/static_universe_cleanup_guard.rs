@@ -76,7 +76,9 @@ fn test_boot_mode_file_does_not_exist() {
         "boot_mode.rs MUST be deleted under indices-only scope (PR #509). \
          Found at {}. The 4-mode resolver (PreMarket/MidPreMarket/MidMarket/PostMarket) \
          is dead — see plan §R.1 row 4. Market-hours gating now lives in \
-         depth_rebalancer::is_within_market_hours_ist + tick_processor::is_within_persist_window.",
+         the g1_exchange_gate_accepts / market-hours constants in common \
+         (the tick_processor persist-window helpers died with the tick \
+         chain, stage-2 dead-WS sweep 2026-07-17).",
         path.display()
     );
 }

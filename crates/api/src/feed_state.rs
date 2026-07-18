@@ -55,45 +55,6 @@ pub struct FeedStatus {
     pub dhan_disable_allowed: bool,
 }
 
-/// §34 PR-3 (Item 12): one per-connection health row for the `/feeds` panel.
-/// All evidence is FILE-derived (per-conn status + tick capture files under
-/// `data/groww/shards/cNN/`) — honest, no invented liveness.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct GrowwScaleConnRow {
-    /// Zero-based connection id (matches the shard cutter / `GROWW_CONN_ID`).
-    pub conn_id: usize,
-    /// `true` when the ladder currently wants this connection running
-    /// (`conn_id < desired_conns`).
-    pub desired: bool,
-    /// `true` when the sidecar wrote its connect+subscribe PROOF status file.
-    pub subscribed_proof: bool,
-    /// Bytes captured into this conn's NDJSON tick file (0 = nothing yet).
-    pub tick_file_bytes: u64,
-    /// Seconds since this conn's tick file was last appended; `null` = never.
-    pub last_capture_age_secs: Option<u64>,
-}
-
-/// §34 PR-3 (Item 12): the Groww auto-scale panel snapshot the ladder
-/// publishes every evaluation tick (~30s). Served on `GET /api/feeds/health`
-/// as the `groww_scale` object when scale mode is enabled.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct GrowwScaleSnapshot {
-    /// Ladder FSM state label (`probing` / `holding` / `advancing` /
-    /// `rolling_back` / `halted_at_ceiling` / `halted_at_plateau`).
-    pub ladder_state: &'static str,
-    /// Connections the ladder currently wants running.
-    pub desired_conns: usize,
-    /// Configured ceiling (post probe-override when probe mode is on).
-    pub target_conns: usize,
-    /// Cap-probe mode active (2 x 600 verdict run).
-    pub probe_mode: bool,
-    /// This evaluation ran in weekend SMOKE mode (market closed; tick gates
-    /// honestly skipped — machinery validation only, NOT a live validation).
-    pub smoke: bool,
-    /// One row per potential connection (0..target_conns).
-    pub connections: Vec<GrowwScaleConnRow>,
-}
-
 /// Lock-free per-feed runtime enable/disable flags. Seeded from `config.feeds` at
 /// boot; flipped live by the feed-toggle API. One shared `Arc` instance binds the
 /// API and the feed lanes together. PR-E: the `dhan`/`groww` flags are
@@ -154,12 +115,9 @@ pub struct FeedRuntimeState {
     /// so the lock is uncontended and has zero hot-path impact. `Option<Arc<_>>` is
     /// cheap to clone out under the lock; the lock is never held across an `.await`.
     live_lane_token_manager: Mutex<Option<Arc<TokenManager>>>,
-    /// §34 PR-3 (Item 12): latest Groww auto-scale panel snapshot, published by
-    /// the ladder every ~30s eval tick and read by `GET /api/feeds/health`.
-    /// Cold path both sides (30s writer / operator-page reader) — a Mutex'd
-    /// `Option<Arc<_>>` mirrors the `live_lane_token_manager` pattern; the lock
-    /// is never held across an `.await` and never touched per-tick.
-    groww_scale_snapshot: Mutex<Option<Arc<GrowwScaleSnapshot>>>,
+    // (2026-07-15: the §34 Groww auto-scale panel snapshot slot was deleted
+    // with the scale ladder — the /feeds health payload no longer carries a
+    // `groww_scale` object.)
 }
 
 impl FeedRuntimeState {
@@ -210,7 +168,6 @@ impl FeedRuntimeState {
             // D2c (C4): no lane manager until `start_dhan_lane` installs one.
             live_lane_token_manager: Mutex::new(None),
             // §34 PR-3: no scale snapshot until the ladder publishes one.
-            groww_scale_snapshot: Mutex::new(None),
         }
     }
 
@@ -220,6 +177,15 @@ impl FeedRuntimeState {
     #[must_use]
     pub fn dhan_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.dhan)
+    }
+
+    /// Cadence 2026-07-14: a clone of the shared Groww enable atomic (the
+    /// `dhan_flag` mirror), for core consumers that cannot depend on this
+    /// crate (the cadence runner's level-triggered per-cycle lane gate).
+    /// The SAME atomic the API toggle flips.
+    #[must_use]
+    pub fn groww_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.groww)
     }
 
     /// PR-E: boot wiring marks the Dhan main-feed lane as spawned.
@@ -262,26 +228,6 @@ impl FeedRuntimeState {
     }
 
     /// PR-E: narrow the Dhan-disable safety gate (boot wires this to `dry_run`).
-    /// §34 PR-3 (Item 12): publish the latest Groww auto-scale panel snapshot.
-    /// Called by the ladder every evaluation tick (~30s, cold path). A poisoned
-    /// lock (a panicked writer) is survived by skipping the publish — the panel
-    /// simply shows the previous snapshot.
-    pub fn set_groww_scale_snapshot(&self, snapshot: Arc<GrowwScaleSnapshot>) {
-        if let Ok(mut slot) = self.groww_scale_snapshot.lock() {
-            *slot = Some(snapshot);
-        }
-    }
-
-    /// §34 PR-3 (Item 12): the latest Groww auto-scale panel snapshot, or
-    /// `None` when scale mode is off / the ladder has not published yet.
-    #[must_use]
-    pub fn groww_scale_snapshot(&self) -> Option<Arc<GrowwScaleSnapshot>> {
-        self.groww_scale_snapshot
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-    }
-
     pub fn set_dhan_disable_allowed(&self, allowed: bool) {
         self.dhan_disable_allowed.store(allowed, Ordering::Relaxed);
     }
@@ -449,7 +395,6 @@ impl std::fmt::Debug for FeedRuntimeState {
                 "live_lane_token_manager_present",
                 &live_token_manager_present,
             )
-            .field("groww_scale_snapshot", &self.groww_scale_snapshot)
             .finish()
     }
 }
@@ -678,6 +623,21 @@ mod tests {
             "toggling Dhan off is observed on the shared flag"
         );
         state.set_enabled(Feed::Dhan, true);
+        assert!(flag.load(Ordering::Relaxed), "re-enable observed too");
+    }
+
+    #[test]
+    fn test_groww_flag_shares_the_same_atomic_the_toggle_flips() {
+        // The cadence runner's Groww lane gate MUST be the very atomic the
+        // API toggle flips (the dhan_flag mirror).
+        let state = FeedRuntimeState::default();
+        let flag = state.groww_flag();
+        state.set_enabled(Feed::Groww, false);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "toggling Groww off is observed on the shared flag"
+        );
+        state.set_enabled(Feed::Groww, true);
         assert!(flag.load(Ordering::Relaxed), "re-enable observed too");
     }
 

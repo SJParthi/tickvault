@@ -117,6 +117,11 @@ mod capital_protection {
     }
 
     /// SAFETY-B2-06: Unrealized loss triggers halt (mark-to-market).
+    ///
+    /// 2026-07-14 lot_size fix: unrealized now multiplies by lot_size
+    /// (symmetric with realized), so this test FINALLY matches its name —
+    /// pre-fix the same scenario computed -800 (25x understated) and
+    /// asserted the order was APPROVED despite a 20,000-rupee real loss.
     #[test]
     fn test_unrealized_loss_triggers_halt() {
         let mut engine = make_engine();
@@ -124,10 +129,11 @@ mod capital_protection {
         engine.record_fill(1001, 80, 100.0, 25);
         engine.update_market_price(1001, 90.0);
 
-        // RISK-GAP-02: unrealized = 80 * (90 - 100) = -800.
-        // Max daily loss = 1M * 2% = 20,000. |-800| < 20,000 → approved.
+        // RISK-GAP-02: unrealized = 80 * (90 - 100) * 25 = -20,000.
+        // Max daily loss = 1M * 2% = 20,000 (inclusive boundary) → halt.
         let result = engine.check_order(2001, 1);
-        assert!(result.is_approved());
+        assert!(!result.is_approved(), "mark-to-market breach must reject");
+        assert!(engine.is_halted(), "mark-to-market breach must halt");
     }
 
     /// SAFETY-B2-07: Halt persists across multiple check_order calls.
@@ -646,12 +652,13 @@ mod dhan_validation {
         engine.update_market_price(1001, f64::NAN);
         engine.update_market_price(1001, 110.0); // valid
 
-        // RISK-GAP-02: 10 lots * (110.0 - 100.0) = 100.0 unrealized profit
+        // RISK-GAP-02: 10 lots * (110.0 - 100.0) * 25 = 2500.0 unrealized
+        // profit (2026-07-14 lot_size fix).
         let pnl = engine.total_unrealized_pnl();
         assert!(pnl.is_finite(), "unrealized P&L must be finite");
         assert!(
-            (pnl - 100.0).abs() < f64::EPSILON,
-            "expected 100.0, got {pnl}"
+            (pnl - 2500.0).abs() < f64::EPSILON,
+            "expected 2500.0, got {pnl}"
         );
     }
 

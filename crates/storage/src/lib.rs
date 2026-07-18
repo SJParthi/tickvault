@@ -20,8 +20,11 @@
 //!
 //! # Modules
 //! - `instrument_persistence` — daily instrument snapshot to QuestDB (Block 01.1)
-//! - `tick_persistence` — batched ILP writer for live ticks
 // PR-E (2026-05-26): candle_persistence retired.
+// Stage-2 dead-WS sweep (2026-07-17): `tick_persistence` (the live-tick ILP
+// writer) retired with the deleted Dhan tick chain — zero production callers
+// since PR-C2/C3 + the Groww live-feed retirement (2026-07-15). The `ticks`
+// TABLE is retained in QuestDB (SEBI); nothing writes it anymore.
 //!
 //! # Boot Sequence Position
 //! OMS -> **QuestDB** -> HTTP API
@@ -110,14 +113,9 @@ pub mod brutex_crossverify_persistence;
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
 pub mod feed_episode_audit_persistence;
-pub mod feed_gap_audit_persistence;
-pub mod feed_parity_1m_audit_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): the per-day per-feed
 /// scoreboard row + the per-instrument coverage detail table.
 pub mod feed_scoreboard_persistence;
-/// Groww auto-scale ladder forensic chain (§34, auto-scale PR-2 Item 8) —
-/// one row per ladder transition; feeds restart rehydration.
-pub mod groww_scale_audit_persistence;
 /// Daily timeframe-consistency verifier (operator 2026-07-13): one row per
 /// finding cell where a stored higher-TF candle disagrees with its
 /// recomputed-from-1m value (TF-VERIFY-01/02).
@@ -153,10 +151,11 @@ pub mod wal_suspension_watcher;
 // Isolated `groww_*` namespace; the Dhan path is untouched.
 pub mod groww_persistence;
 // Groww second-feed 1-minute candle persistence (operator lock §32).
-pub mod groww_candle_persistence;
-// (SP5) The Groww live-vs-backtest 1m parity audit module was MERGED into the
-// unified `feed_parity_1m_audit_persistence` above (one table, `feed` in the
-// DEDUP key). Its empty `groww_cross_verify_1m_audit` table is retained on disk.
+// (SP5) The Groww live-vs-backtest 1m parity audit writer was merged into a
+// unified `feed_parity_1m_audit_persistence` module, then DELETED 2026-07-15
+// with the Groww live feed (parity track cancelled §33.2; zero callers).
+// The `feed_parity_1m_audit` + `groww_cross_verify_1m_audit` TABLES are
+// retained on disk (SEBI history; partition_manager DAY rows keep them).
 // Instrument fetch-audit table (SEBI forensic — retained per the PR-C3
 // retirement banner in daily-universe-instr-fetch-error-codes.md).
 // PR-C3 (2026-07-14): compiles unconditionally — the `daily_universe_fetcher`
@@ -223,6 +222,7 @@ pub mod shadow_seal_columns;
 // Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
 // SPOT half; SPOT1M-02): the `spot_1m_rest` table DDL + ILP-over-HTTP writer.
 pub mod spot_1m_rest_persistence;
+pub mod spot_crossverify_persistence;
 // Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
 // the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
 // ILP-over-HTTP writer.
@@ -236,149 +236,18 @@ pub mod option_contract_1m_rest_persistence;
 // 2026-07-13, Groww REST plan PR-2): the `rest_fetch_audit` table DDL +
 // ILP-over-HTTP writer — one row per (target minute, symbol, feed, leg).
 pub mod rest_fetch_audit_persistence;
-// B6 (2026-07-03): off-thread tick ILP flush worker — keeps the blocking
-// questdb TCP flush off the tick-consumer thread (TICK-FLUSH-01).
-pub(crate) mod tick_flush_worker;
-pub mod tick_persistence;
-pub mod tick_row_builder;
-pub mod tick_spill_drain;
+// Stage-2 dead-WS sweep (2026-07-17): `tick_flush_worker` / `tick_persistence`
+// / `tick_row_builder` / `tick_spill_drain` DELETED with the dead Dhan tick
+// chain (`run_tick_processor` died in PR-C2/C3; the Groww live feed retired
+// 2026-07-15) — zero production callers re-verified before deletion. The
+// TICK-FLUSH-01 / HOT-PATH-01/02 ErrorCode variants are RETAINED (crossref);
+// the `tv_ticks_dropped_total` CloudWatch alarm becomes a dead monitor —
+// terraform/EMF retirement is dashboard-PR scope. `ws_frame_spill` (the WAL
+// durable floor) is KEPT — it is a separate, live surface.
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;
 
-/// Test support: re-exports internal functions for DHAT and benchmark tests.
-pub mod tick_persistence_testing {
-    /// Re-export of `f32_to_f64_clean` for DHAT and Criterion benchmarks.
-    pub fn f32_to_f64_clean_pub(v: f32) -> f64 {
-        crate::tick_persistence::f32_to_f64_clean(v)
-    }
-
-    /// Re-export of the private `build_tick_row_seq` (the 17-column ILP row
-    /// encoder on the tick hot path) for the `full_tick_processing` Criterion
-    /// bench in `crates/core/benches/`. Measurement-only surface — production
-    /// code keeps calling the writer methods, never this.
-    ///
-    /// # Errors
-    /// Propagates the underlying ILP buffer error (table/column append failure).
-    pub fn build_tick_row_seq_pub(
-        buffer: &mut questdb::ingress::Buffer,
-        tick: &tickvault_common::tick_types::ParsedTick,
-        capture_seq: i64,
-    ) -> anyhow::Result<()> {
-        crate::tick_persistence::build_tick_row_seq(buffer, tick, capture_seq)
-    }
-
-    /// Constructs an ILP V1 buffer of the same protocol version the live
-    /// `TickPersistenceWriter` uses — lets cross-crate benches build rows
-    /// without naming `questdb` types (questdb-rs is not a dep of core).
-    #[must_use]
-    pub fn new_ilp_buffer_pub() -> questdb::ingress::Buffer {
-        questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1)
-    }
-}
-
-/// Shared process-wide mutex for tests that touch the real global
-/// `data/spill/` directory (TICK_SPILL_DIR / CANDLE_SPILL_DIR).
-///
-/// The recovery test
-///   - `tick_persistence::tests::test_recover_skips_current_active_spill`
-///
-/// calls `recover_stale_spill_files()`, which drains EVERY matching
-/// `{ticks,candles}-*.bin` file under the global spill directory. When
-/// cargo runs these tests in parallel inside the same binary, they race
-/// on filesystem state: one test drains the other test's artefacts
-/// before the assertion runs, causing flaky CI failures under
-/// `cargo test --workspace`.
-///
-/// Any test that creates files under `data/spill/` MUST acquire this
-/// lock first. Holding it for the duration of the test serializes
-/// access without needing a new dev-dep.
-#[cfg(test)]
-pub(crate) fn spill_dir_test_lock() -> &'static std::sync::Mutex<()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::tick_persistence_testing::f32_to_f64_clean_pub;
-
-    #[test]
-    fn test_f32_to_f64_clean_pub_preserves_price() {
-        assert_eq!(f32_to_f64_clean_pub(24500.5), 24500.5);
-    }
-
-    #[test]
-    fn test_f32_to_f64_clean_pub_zero() {
-        assert_eq!(f32_to_f64_clean_pub(0.0), 0.0);
-    }
-
-    #[test]
-    fn test_f32_to_f64_clean_pub_nan() {
-        assert!(f32_to_f64_clean_pub(f32::NAN).is_nan());
-    }
-
-    #[test]
-    fn test_f32_to_f64_clean_pub_infinity() {
-        assert_eq!(f32_to_f64_clean_pub(f32::INFINITY), f64::INFINITY);
-        assert_eq!(f32_to_f64_clean_pub(f32::NEG_INFINITY), f64::NEG_INFINITY);
-    }
-
-    #[test]
-    fn test_f32_to_f64_clean_pub_dhan_index_price() {
-        // STORAGE-GAP-02: f32→f64 precision test via public wrapper.
-        // 21004.95_f32 must produce 21004.95_f64, not 21004.94921875.
-        let result = f32_to_f64_clean_pub(21004.95_f32);
-        assert_eq!(result, 21004.95_f64);
-    }
-
-    #[test]
-    fn test_f32_to_f64_clean_pub_negative() {
-        assert_eq!(f32_to_f64_clean_pub(-100.5), -100.5);
-    }
-
-    #[test]
-    fn test_new_ilp_buffer_pub_starts_empty() {
-        let buffer = super::tick_persistence_testing::new_ilp_buffer_pub();
-        assert_eq!(buffer.row_count(), 0);
-        assert_eq!(buffer.len(), 0);
-    }
-
-    #[test]
-    fn test_build_tick_row_seq_pub_appends_one_row() {
-        let mut buffer = super::tick_persistence_testing::new_ilp_buffer_pub();
-        let tick = tickvault_common::tick_types::ParsedTick {
-            security_id: 13,
-            exchange_segment_code: 0,
-            last_traded_price: 23_146.45,
-            last_trade_quantity: 0,
-            exchange_timestamp: 1_770_000_000,
-            received_at_nanos: 1_770_000_000_000_000_000,
-            average_traded_price: 0.0,
-            volume: 0,
-            total_sell_quantity: 0,
-            total_buy_quantity: 0,
-            day_open: 23_100.0,
-            day_close: 23_050.0,
-            day_high: 23_200.0,
-            day_low: 23_000.0,
-            open_interest: 0,
-            oi_day_high: 0,
-            oi_day_low: 0,
-            iv: f64::NAN,
-            delta: f64::NAN,
-            gamma: f64::NAN,
-            theta: f64::NAN,
-            vega: f64::NAN,
-        };
-        super::tick_persistence_testing::build_tick_row_seq_pub(&mut buffer, &tick, 42)
-            .expect("row build must succeed for a valid tick");
-        assert_eq!(buffer.row_count(), 1);
-        assert!(buffer.len() > 0, "encoded ILP row must be non-empty");
-    }
-}
+// Stage-2 dead-WS sweep (2026-07-17): the `tick_persistence_testing` shim and
+// `spill_dir_test_lock` (both consumed only by the deleted tick benches/DHAT
+// tests) retired with the tick chain.

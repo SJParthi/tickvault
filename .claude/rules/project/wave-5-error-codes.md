@@ -132,6 +132,13 @@ case where someone bypasses the unit tests).
 
 ## VOLUME-MONO-01 — cumulative volume monotonicity breach (Item 26 L1)
 
+> **⚠ EMIT SITE DELETED 2026-07-17 (stage-2 dead-WS sweep):**
+> `crates/core/src/pipeline/volume_monotonicity_guard.rs` was DELETED with
+> the dead Dhan tick chain (its only feeder, `tick_processor.rs`, had zero
+> production callers after the live-WS retirements). The
+> `Volume01MonotonicityBreach` variant is RETAINED (no ErrorCode deletions
+> in the sweep); the code can no longer fire. Historical audit below.
+
 **Trigger:** within a single IST trading day, a tick arrives for some
 `(security_id, exchange_segment)` pair where `volume[i] < volume[i-1]`.
 The Wave 5 in-memory L1 guard

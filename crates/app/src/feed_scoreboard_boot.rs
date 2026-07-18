@@ -61,9 +61,6 @@ use tickvault_common::feed_blame::{
 use tickvault_storage::feed_episode_audit_persistence::{
     FeedEpisodeAuditRow, FeedEpisodeAuditWriter, ensure_feed_episode_audit_table,
 };
-use tickvault_storage::feed_gap_audit_persistence::{
-    FeedGapAuditRow, FeedGapAuditWriter, ensure_feed_gap_audit_table,
-};
 use tickvault_storage::feed_scoreboard_persistence::{
     CoverageSource, FeedCoverageDailyRow, FeedScoreboardDailyRow, FeedScoreboardWriter,
     LAG_FLOOR_MS_DHAN, LAG_FLOOR_MS_GROWW, SCOREBOARD_SESSION_MINUTES,
@@ -2461,6 +2458,9 @@ pub struct RestFetchLiteRow {
     pub close_to_data_ms: i64,
     /// 429 attempts inside this fetch's ladder.
     pub rate_limited_count: i64,
+    /// The row's error-class slug (`pre_boot` splits restart-window rows
+    /// out of "never recovered" — Fix E, 2026-07-17); empty when absent.
+    pub error_class: String,
 }
 
 /// One (feed, leg) day aggregate for the scorecard digest. `-1` = that
@@ -2477,8 +2477,12 @@ pub struct RestLegDaySummary {
     /// non-named-gap outcome: empty / error / rate_limited / no_token /
     /// skipped).
     pub failed_fetches: i64,
-    /// Finally-unrecovered minutes (`outcome='named_gap'`).
+    /// Finally-unrecovered minutes (`outcome='named_gap'`, every class
+    /// EXCEPT `pre_boot` — Fix E, 2026-07-17).
     pub named_gaps: i64,
+    /// `named_gap` rows classed `pre_boot` — minutes from before this
+    /// process started (audit bookkeeping, never a pull failure).
+    pub pre_boot_gaps: i64,
     /// Sum of 429 attempts across the day's fetches.
     pub rate_limited_hits: i64,
     /// Ok rows retrieved ≥ [`REST_LEG_LATE_RECOVERY_MS`] after close —
@@ -2501,8 +2505,8 @@ pub struct RestLegDaySummary {
 pub fn build_rest_fetch_audit_day_sql(target_ist_day: u64) -> String {
     let (start, end) = day_bounds_micros(target_ist_day);
     format!(
-        "select feed, leg, outcome, close_to_data_ms, rate_limited_count \
-         from rest_fetch_audit where ts >= {start} and ts < {end}"
+        "select feed, leg, outcome, close_to_data_ms, rate_limited_count, \
+         error_class from rest_fetch_audit where ts >= {start} and ts < {end}"
     )
 }
 
@@ -2518,65 +2522,6 @@ pub fn build_spot1m_close_latency_day_sql(target_ist_day: u64) -> String {
         "select feed, close_to_data_ms from spot_1m_rest \
          where ts >= {start} and ts < {end} and close_to_data_ms >= 0"
     )
-}
-
-/// The day's `feed_gap_audit` edge rows — `(feed, start_ts micros, outcome)`
-/// — for the FEED-GAP-01 dangling-close sweep. `cast(start_ts as long)`
-/// yields micros so the parse stays numeric (no ISO-timestamp parsing).
-/// Fetch-all-and-pair-in-Rust deliberately: QuestDB 9.3.5 rejects
-/// `NOT IN (SELECT …)` on TIMESTAMP (the scoreboard round-6 lesson), and a
-/// day carries at most a handful of gap edges. Micros literals.
-#[must_use]
-pub fn build_feed_gap_day_sql(target_ist_day: u64) -> String {
-    let (start, end) = day_bounds_micros(target_ist_day);
-    format!(
-        "select feed, cast(start_ts as long) start_us, outcome \
-         from feed_gap_audit where ts >= {start} and ts < {end}"
-    )
-}
-
-/// Parse the [`build_feed_gap_day_sql`] response into
-/// `(feed, start_ts_micros, outcome)` rows. Pure; `None` = unparsable body;
-/// malformed rows are SKIPPED (best-effort), never a panic.
-#[must_use]
-pub fn parse_feed_gap_day_rows(body: &str) -> Option<Vec<(String, i64, String)>> {
-    let rows = parse_dataset(body)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(cols) = row.as_array()
-            && cols.len() >= 3
-            && let (Some(feed), Some(start_us), Some(outcome)) =
-                (cols[0].as_str(), cols[1].as_i64(), cols[2].as_str())
-        {
-            out.push((feed.to_string(), start_us, outcome.to_string()));
-        }
-    }
-    Some(out)
-}
-
-/// The day's DANGLING gap episodes: `(feed, start_ts_micros)` keys that
-/// carry an `open` row but NO `closed` / `dangling_closed` row (session-tail
-/// EOF / box-death dark-hole class). Pure + testable; order-independent.
-#[must_use]
-pub fn compute_dangling_gap_opens(rows: &[(String, i64, String)]) -> Vec<(String, i64)> {
-    use std::collections::HashSet;
-    // Per-feed-episode keys — no security_id involved, so I-P1-11 is N/A.
-    let closed: HashSet<(&str, i64)> = rows
-        .iter()
-        .filter(|(_, _, outcome)| outcome != "open")
-        .map(|(feed, start_us, _)| (feed.as_str(), *start_us))
-        .collect();
-    let mut seen: HashSet<(&str, i64)> = HashSet::new();
-    let mut out = Vec::new();
-    for (feed, start_us, outcome) in rows {
-        if outcome == "open"
-            && !closed.contains(&(feed.as_str(), *start_us))
-            && seen.insert((feed.as_str(), *start_us))
-        {
-            out.push((feed.clone(), *start_us));
-        }
-    }
-    out
 }
 
 /// Parse the [`build_rest_fetch_audit_day_sql`] response. Pure; `None` =
@@ -2602,6 +2547,11 @@ pub fn parse_rest_fetch_audit_lite(body: &str) -> Option<Vec<RestFetchLiteRow>> 
             outcome: outcome.to_string(),
             close_to_data_ms: cols[3].as_i64().unwrap_or(-1),
             rate_limited_count: cols[4].as_i64().unwrap_or(0),
+            error_class: cols
+                .get(5)
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string(),
         });
     }
     Some(out)
@@ -2683,6 +2633,7 @@ pub fn aggregate_rest_leg_day(
                     ok_fetches: 0,
                     failed_fetches: 0,
                     named_gaps: 0,
+                    pre_boot_gaps: 0,
                     rate_limited_hits: 0,
                     late_recovered: 0,
                     close_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
@@ -2707,6 +2658,11 @@ pub fn aggregate_rest_leg_day(
                         prompt.push(r.close_to_data_ms);
                     }
                 }
+            }
+            // Fix E: `pre_boot`-classed rows are restart-window
+            // bookkeeping, never "never recovered" pull failures.
+            "named_gap" if r.error_class == "pre_boot" => {
+                s.pre_boot_gaps = s.pre_boot_gaps.saturating_add(1);
             }
             "named_gap" => s.named_gaps = s.named_gaps.saturating_add(1),
             _ => s.failed_fetches = s.failed_fetches.saturating_add(1),
@@ -2733,6 +2689,7 @@ pub fn aggregate_rest_leg_day(
             ok_fetches: SCOREBOARD_UNAVAILABLE_SENTINEL,
             failed_fetches: SCOREBOARD_UNAVAILABLE_SENTINEL,
             named_gaps: SCOREBOARD_UNAVAILABLE_SENTINEL,
+            pre_boot_gaps: SCOREBOARD_UNAVAILABLE_SENTINEL,
             rate_limited_hits: SCOREBOARD_UNAVAILABLE_SENTINEL,
             late_recovered: 0,
             close_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
@@ -2815,6 +2772,7 @@ pub fn build_rest_leg_score_lines(
                 ok_fetches: s.ok_fetches,
                 failed_fetches: s.failed_fetches,
                 named_gaps: s.named_gaps,
+                pre_boot_gaps: s.pre_boot_gaps,
                 rate_limited_hits: s.rate_limited_hits,
                 late_recovered: s.late_recovered,
                 close_p50_ms: s.close_p50_ms,
@@ -2828,6 +2786,7 @@ pub fn build_rest_leg_score_lines(
                 ok_fetches: sent,
                 failed_fetches: sent,
                 named_gaps: sent,
+                pre_boot_gaps: sent,
                 rate_limited_hits: sent,
                 late_recovered: sent,
                 close_p50_ms: sent,
@@ -2853,7 +2812,100 @@ pub fn build_rest_leg_score_lines(
             out.push(to_line(&s.feed, &s.leg, Some(s)));
         }
     }
+    // G6 (fix round 2): the F3 not-measured `info!` moved OUT of this
+    // builder into the AGGREGATION path (`log_rest_leg_measurement_gaps`,
+    // called right after `aggregate_rest_leg_day`) — this builder was
+    // only invoked on the telegram-enabled branch of main.rs, so on a
+    // telegram-disabled boot the §2b always-render contract was satisfied
+    // neither on the card nor in logs.
     out
+}
+
+/// The CANONICAL card pairs whose lines carry MEASURED latency but NO
+/// pull counts (`ok_fetches == -1`, `close_samples > 0`) — the documented
+/// `spot_1m_rest` latency-only fallback source (a forensics-writer outage
+/// window or a pre-2026-07-14 backfill day). These pairs RENDER count-less
+/// on the card (G6, fix round 2) and are logged as latency-only — never
+/// as "not measured" (that log statement was false for exactly this arm).
+#[must_use]
+pub fn latency_only_canonical_rest_pairs(
+    lines: &[tickvault_core::notification::events::RestLegScoreLine],
+) -> Vec<(String, String)> {
+    CANONICAL_DISPLAY
+        .iter()
+        .filter(|(feed, leg)| {
+            let counts_measured = lines
+                .iter()
+                .any(|l| l.feed == *feed && l.leg == *leg && l.ok_fetches >= 0);
+            let latency_measured = lines
+                .iter()
+                .any(|l| l.feed == *feed && l.leg == *leg && l.close_samples > 0);
+            !counts_measured && latency_measured
+        })
+        .map(|(feed, leg)| ((*feed).to_string(), (*leg).to_string()))
+        .collect()
+}
+
+/// F3 log-side always-render contract, re-homed to the AGGREGATION path
+/// (G6, fix round 2) so it fires even when the scorecard Telegram is
+/// disabled — one truthful `info!` per canonical pair that is either
+/// wholly unmeasured (nothing on the card) or latency-only (renders a
+/// count-less delay segment). See the RULE-CONTRACT TENSION note on
+/// `unmeasured_canonical_rest_pairs`.
+pub fn log_rest_leg_measurement_gaps(summaries: &[RestLegDaySummary]) {
+    let lines = build_rest_leg_score_lines(summaries);
+    for (feed, leg) in unmeasured_canonical_rest_pairs(&lines) {
+        info!(
+            %feed,
+            %leg,
+            "rest-leg digest: {feed}/{leg} not measured — omitted from the \
+             scorecard card per the 2026-07-15 cleanliness directive; the \
+             always-render contract is satisfied in logs pending the \
+             rule-file supersession"
+        );
+    }
+    for (feed, leg) in latency_only_canonical_rest_pairs(&lines) {
+        info!(
+            %feed,
+            %leg,
+            "rest-leg digest: {feed}/{leg} latency measured, pull counts \
+             missing (the spot_1m_rest latency-only fallback source) — \
+             renders a count-less delay segment on the scorecard card"
+        );
+    }
+}
+
+/// The four canonical card pairs (display names) the §2b contract names.
+const CANONICAL_DISPLAY: [(&str, &str); 4] = [
+    ("Dhan", "spot candles"),
+    ("Dhan", "option chain"),
+    ("Groww", "spot candles"),
+    ("Groww", "option chain"),
+];
+
+/// The CANONICAL card pairs (Dhan/Groww × spot candles/option chain) with
+/// NOTHING measured today — no pull counts AND no latency samples. Pure so
+/// the F3 not-measured logging is unit-testable.
+///
+/// G6 (fix round 2): a pair on the documented `spot_1m_rest` latency-only
+/// fallback (`ok_fetches == -1`, `close_samples > 0`) is MEASURED — it was
+/// previously misclassified unmeasured here (a false log statement while
+/// its real latency sat in the same lines vec) and simultaneously dropped
+/// from the card. Latency-only pairs are named separately by
+/// [`latency_only_canonical_rest_pairs`].
+#[must_use]
+pub fn unmeasured_canonical_rest_pairs(
+    lines: &[tickvault_core::notification::events::RestLegScoreLine],
+) -> Vec<(String, String)> {
+    CANONICAL_DISPLAY
+        .iter()
+        .filter(|(feed, leg)| {
+            !lines.iter().any(|l| {
+                l.feed == *feed && l.leg == *leg && (l.ok_fetches >= 0 || l.close_samples > 0)
+            })
+        })
+        .map(|(feed, leg)| ((*feed).to_string(), (*leg).to_string()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3781,6 +3833,10 @@ pub async fn run_feed_scoreboard(
         }
     };
     let rest_legs = aggregate_rest_leg_day(&audit_lite, &spot_latency_fallback);
+    // F3 log-side always-render contract (re-homed here by G6, fix
+    // round 2): fires on EVERY aggregation run — including
+    // telegram-disabled boots, where the card never renders at all.
+    log_rest_leg_measurement_gaps(&rest_legs);
     // Dashboard gauge (plan PR-5 "+ dashboard gauge") — /metrics-local
     // (NOT CloudWatch-shipped; the tv_index_futures_selected precedent, so
     // zero alarm/cost impact), set on SAME-DAY runs only (a backfill's
@@ -3800,97 +3856,6 @@ pub async fn run_feed_scoreboard(
                 )
                 .set(s.close_p99_ms as f64);
             }
-        }
-    }
-
-    // 6f. FEED-GAP-01 dangling-close sweep (Groww hardening PR-3,
-    //     2026-07-14): every gap episode whose recovery edge never fired
-    //     (session-tail EOF / box death mid-gap) gets ONE `dangling_closed`
-    //     row with -1 sentinels — never fabricated measurements (Rule 11).
-    //     ADDITIVE + best-effort: a read/parse/write failure logs
-    //     FEED-GAP-01 (stage=dangling_close) and NEVER touches the
-    //     episode/coverage/lag sections, the daily rows, or the run
-    //     outcome. DEDUP-idempotent: the row's deterministic identity is
-    //     (ts, day, feed, start_ts, outcome), so a rerun UPSERTs in place.
-    {
-        ensure_feed_gap_audit_table(questdb).await;
-        let sql = build_feed_gap_day_sql(target_ist_day);
-        match exec_query(&client, questdb, &sql).await {
-            Some(body) => match parse_feed_gap_day_rows(&body) {
-                Some(rows) => {
-                    let dangling = compute_dangling_gap_opens(&rows);
-                    if !dangling.is_empty() {
-                        let now_ist_nanos = chrono::Utc::now()
-                            .timestamp_nanos_opt()
-                            .unwrap_or_default()
-                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-                        let nanos_per_day: i64 = 86_400 * 1_000_000_000;
-                        let trading_date_ist_nanos =
-                            now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day);
-                        // Inline append+flush is acceptable HERE (unlike the
-                        // bridge loop): this sweep runs ONCE per daily run on
-                        // the cold scoreboard task, and the writer's ILP conf
-                        // is pinned no-retry + 5s request timeout (review
-                        // HIGH 2026-07-14), so the worst case is a bounded
-                        // ~5s wait once a day — nothing latency-sensitive
-                        // shares this task.
-                        let mut writer = FeedGapAuditWriter::new(questdb);
-                        let mut append_err = false;
-                        for (feed, start_us) in &dangling {
-                            let row = FeedGapAuditRow::dangling_closed(
-                                now_ist_nanos,
-                                trading_date_ist_nanos,
-                                feed,
-                                start_us.saturating_mul(1_000),
-                            );
-                            if let Err(err) = writer.append_row(&row) {
-                                append_err = true;
-                                error!(
-                                    code = "FEED-GAP-01",
-                                    stage = "dangling_close",
-                                    ?err,
-                                    feed,
-                                    "FEED-GAP-01: dangling-close row append failed"
-                                );
-                            }
-                        }
-                        match writer.flush() {
-                            Ok(()) if !append_err => info!(
-                                closed = dangling.len(),
-                                "feed_scoreboard: dangling gap episodes closed with -1 sentinels \
-                                 (FEED-GAP-01 sweep)"
-                            ),
-                            Ok(()) => {}
-                            Err(err) => {
-                                metrics::counter!(
-                                    "tv_feed_gap_audit_write_errors_total",
-                                    "stage" => "dangling_close"
-                                )
-                                .increment(1);
-                                error!(
-                                    code = "FEED-GAP-01",
-                                    stage = "dangling_close",
-                                    ?err,
-                                    "FEED-GAP-01: dangling-close flush failed — the day's open episodes \
-                                     stay open (honest, visible via SQL); the next run re-sweeps"
-                                );
-                            }
-                        }
-                    }
-                }
-                None => error!(
-                    code = "FEED-GAP-01",
-                    stage = "dangling_close",
-                    "FEED-GAP-01: the day's feed_gap_audit body was unparsable — dangling \
-                     episodes stay open until the next sweep"
-                ),
-            },
-            None => error!(
-                code = "FEED-GAP-01",
-                stage = "dangling_close",
-                "FEED-GAP-01: the day's feed_gap_audit rows could not be read — \
-                 dangling episodes stay open until the next sweep"
-            ),
         }
     }
 
@@ -6939,6 +6904,7 @@ mod tests {
             outcome: outcome.to_string(),
             close_to_data_ms: close_ms,
             rate_limited_count: rl,
+            error_class: String::new(),
         }
     }
 
@@ -7155,6 +7121,7 @@ mod tests {
                 ok_fetches: 1_496,
                 failed_fetches: 4,
                 named_gaps: 0,
+                pre_boot_gaps: 0,
                 rate_limited_hits: 0,
                 late_recovered: 2,
                 close_p50_ms: 1_400,
@@ -7168,6 +7135,7 @@ mod tests {
                 ok_fetches: 10,
                 failed_fetches: 0,
                 named_gaps: 0,
+                pre_boot_gaps: 0,
                 rate_limited_hits: 0,
                 late_recovered: 0,
                 close_p50_ms: 900,
@@ -7203,58 +7171,121 @@ mod tests {
         assert_eq!(build_rest_leg_score_lines(&[]).len(), 4);
     }
 
-    // -----------------------------------------------------------------------
-    // FEED-GAP-01 dangling-close sweep (Groww hardening PR-3, 2026-07-14)
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn test_build_feed_gap_day_sql_uses_micros_bounds_and_long_cast() {
-        let sql = build_feed_gap_day_sql(20_650);
-        assert!(sql.contains("from feed_gap_audit"));
-        assert!(sql.contains("cast(start_ts as long)"));
-        let start = 20_650_i64 * 86_400 * 1_000_000;
-        assert!(sql.contains(&format!("ts >= {start}")));
-    }
-
-    #[test]
-    fn test_compute_dangling_gap_opens_pairs_open_with_any_close() {
-        let rows = vec![
-            // Episode A: open + closed → NOT dangling.
-            ("groww".to_string(), 100, "open".to_string()),
-            ("groww".to_string(), 100, "closed".to_string()),
-            // Episode B: open only → DANGLING.
-            ("groww".to_string(), 200, "open".to_string()),
-            // Episode C: open + dangling_closed (a prior sweep) → NOT dangling.
-            ("groww".to_string(), 300, "open".to_string()),
-            ("groww".to_string(), 300, "dangling_closed".to_string()),
-            // Duplicate open rows for B (DEDUP re-append) → ONE sweep row.
-            ("groww".to_string(), 200, "open".to_string()),
-        ];
+    fn test_unmeasured_canonical_rest_pairs_names_only_sentinel_pairs() {
+        // F3 (2026-07-15 fix round): the card suppresses unmeasured pairs,
+        // so the honest not-measured signal moves to the logs — this pure
+        // helper names exactly the canonical pairs with no measured pull
+        // source (the §2b always-render contract's log-side leg).
+        let summaries = vec![RestLegDaySummary {
+            feed: "groww".to_string(),
+            leg: "spot_1m".to_string(),
+            ok_fetches: 1_496,
+            failed_fetches: 4,
+            named_gaps: 0,
+            pre_boot_gaps: 0,
+            rate_limited_hits: 0,
+            late_recovered: 2,
+            close_p50_ms: 1_400,
+            close_p99_ms: 3_200,
+            close_max_ms: 6_200,
+            close_samples: 1_494,
+        }];
+        let lines = build_rest_leg_score_lines(&summaries);
         assert_eq!(
-            compute_dangling_gap_opens(&rows),
-            vec![("groww".to_string(), 200)]
+            unmeasured_canonical_rest_pairs(&lines),
+            vec![
+                ("Dhan".to_string(), "spot candles".to_string()),
+                ("Dhan".to_string(), "option chain".to_string()),
+                ("Groww".to_string(), "option chain".to_string()),
+            ]
+        );
+        // Every canonical pair measured → nothing to log.
+        let all = ["spot_1m", "chain_1m"];
+        let full: Vec<RestLegDaySummary> = ["dhan", "groww"]
+            .iter()
+            .flat_map(|f| {
+                all.iter().map(|l| RestLegDaySummary {
+                    feed: (*f).to_string(),
+                    leg: (*l).to_string(),
+                    ok_fetches: 5,
+                    failed_fetches: 0,
+                    named_gaps: 0,
+                    pre_boot_gaps: 0,
+                    rate_limited_hits: 0,
+                    late_recovered: 0,
+                    close_p50_ms: 900,
+                    close_p99_ms: 1_500,
+                    close_max_ms: 1_600,
+                    close_samples: 5,
+                })
+            })
+            .collect();
+        let lines = build_rest_leg_score_lines(&full);
+        assert!(unmeasured_canonical_rest_pairs(&lines).is_empty());
+        // Empty build → all four pairs named.
+        assert_eq!(
+            unmeasured_canonical_rest_pairs(&build_rest_leg_score_lines(&[])).len(),
+            4
         );
     }
 
     #[test]
-    fn test_compute_dangling_gap_opens_is_per_feed() {
-        // The same start_ts on ANOTHER feed never closes this feed's episode.
-        let rows = vec![
-            ("groww".to_string(), 500, "open".to_string()),
-            ("dhan".to_string(), 500, "closed".to_string()),
-        ];
-        assert_eq!(
-            compute_dangling_gap_opens(&rows),
-            vec![("groww".to_string(), 500)]
+    fn test_latency_only_pair_is_measured_not_unmeasured() {
+        // G6 (fix round 2): the documented spot_1m_rest latency-only
+        // fallback (counts -1, latency measured) must classify MEASURED —
+        // logging it "not measured" was a false statement during exactly
+        // the forensics-writer-outage window the fallback exists for. It
+        // is named separately as latency-only instead.
+        let summaries = vec![RestLegDaySummary {
+            feed: "dhan".to_string(),
+            leg: "spot_1m".to_string(),
+            ok_fetches: -1,
+            failed_fetches: -1,
+            named_gaps: -1,
+            pre_boot_gaps: -1,
+            rate_limited_hits: -1,
+            late_recovered: -1,
+            close_p50_ms: 1_100,
+            close_p99_ms: 1_800,
+            close_max_ms: 5_000,
+            close_samples: 372,
+        }];
+        let lines = build_rest_leg_score_lines(&summaries);
+        let unmeasured = unmeasured_canonical_rest_pairs(&lines);
+        assert!(
+            !unmeasured.contains(&("Dhan".to_string(), "spot candles".to_string())),
+            "a latency-only pair must never be logged 'not measured': {unmeasured:?}"
         );
+        // The other three canonical pairs stay honestly unmeasured.
+        assert_eq!(unmeasured.len(), 3);
+        // ...and the latency-only classifier names exactly this pair.
+        assert_eq!(
+            latency_only_canonical_rest_pairs(&lines),
+            vec![("Dhan".to_string(), "spot candles".to_string())]
+        );
+        // A counts-measured pair is never latency-only.
+        let counted = vec![RestLegDaySummary {
+            feed: "dhan".to_string(),
+            leg: "spot_1m".to_string(),
+            ok_fetches: 735,
+            failed_fetches: 0,
+            named_gaps: 0,
+            pre_boot_gaps: 0,
+            rate_limited_hits: 0,
+            late_recovered: 0,
+            close_p50_ms: 1_100,
+            close_p99_ms: 1_800,
+            close_max_ms: 5_000,
+            close_samples: 372,
+        }];
+        let lines = build_rest_leg_score_lines(&counted);
+        assert!(latency_only_canonical_rest_pairs(&lines).is_empty());
     }
 
-    #[test]
-    fn test_parse_feed_gap_day_rows_skips_malformed() {
-        let body = r#"{"columns":[{"name":"feed"},{"name":"start_us"},{"name":"outcome"}],
-            "dataset":[["groww",123,"open"],["groww","bad","open"],[null,1,"open"]]}"#;
-        let rows = parse_feed_gap_day_rows(body).expect("parsable");
-        assert_eq!(rows, vec![("groww".to_string(), 123, "open".to_string())]);
-        assert!(parse_feed_gap_day_rows("not json").is_none());
-    }
+    // MERGE RESOLVED 2026-07-15: the FEED-GAP-01 dangling-close sweep
+    // tests died here with their production fns (the gap-episode
+    // machinery retired with the Groww live feed, main #1581); the G6
+    // measurement-gap tests above are KEPT (their fns + the
+    // aggregation-path log call survive the REST-only runtime).
 }

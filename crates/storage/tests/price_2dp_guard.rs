@@ -44,37 +44,15 @@ fn code_only(content: &str) -> String {
         .join("\n")
 }
 
-/// The live tick-persist price columns. Each must have its VALUE constructed
-/// through `round_to_2dp(...)` at the `RawTickFields` build site in
-/// `tick_persistence.rs::build_tick_row_seq` (C1 convergence moved the literal
-/// `column_f64(...)` writes into the shared `tick_row_builder`, but the operator
-/// 2-decimal contract is applied here, at value-construction time, BEFORE the
-/// value enters the feed-agnostic `RawTickFields`).
-const TICK_PRICE_COLUMNS: &[&str] = &["ltp", "open", "high", "low", "close", "avg_price"];
-
-#[test]
-fn tick_persistence_price_columns_are_rounded_to_2dp() {
-    let code = code_only(&storage_src("tick_persistence.rs"));
-    // Post-C1 the Dhan `build_tick_row_seq` constructs a `RawTickFields` whose
-    // price values are pre-rounded, then delegates to the shared builder. The
-    // 2-decimal contract lives at this value-construction site. Accepted shapes
-    // (whitespace normalised) for each price column `<col>`:
-    //   <col>: round_to_2dp(                  — required-for-both field (ltp)
-    //   <col>: Some(round_to_2dp(             — per-feed Option field (open/…/avg_price)
-    let normalised: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
-    for col in TICK_PRICE_COLUMNS {
-        let required_field = format!("{col}: round_to_2dp(");
-        let optional_field = format!("{col}: Some(round_to_2dp(");
-        assert!(
-            normalised.contains(&required_field) || normalised.contains(&optional_field),
-            "tick_persistence.rs::build_tick_row_seq must construct the price field \
-             `{col}` through `round_to_2dp(...)` (operator 2-decimal contract \
-             2026-05-29) before it enters RawTickFields. Found a `{col}:` field set \
-             without rounding. Wrap it: round_to_2dp(f32_to_f64_clean(...)). Greeks/IV \
-             are exempt; this guard covers PRICE columns only."
-        );
-    }
-}
+// RETIRED (stage-2 dead-WS sweep, 2026-07-17):
+// `tick_persistence_price_columns_are_rounded_to_2dp` pinned the
+// `round_to_2dp(...)` wraps at the `RawTickFields` build site in
+// `tick_persistence.rs::build_tick_row_seq` — that file (and the shared
+// `tick_row_builder.rs` it delegated to) was DELETED with the dead Dhan
+// tick chain, so there is no tick-persist price write site left to pin.
+// The operator 2-decimal contract STANDS for every surviving price write
+// path: the candle seal row pin below (`candles_*`, the LIVE path) and the
+// REST-leg persistence modules' own rounding pins.
 
 #[test]
 fn candle_seal_row_rounds_ohlc_to_2dp() {
@@ -94,16 +72,11 @@ fn candle_seal_row_rounds_ohlc_to_2dp() {
     }
 }
 
-#[test]
-fn round_to_2dp_helper_is_available_in_storage() {
-    // Pin that the local re-export exists so the wraps above resolve.
-    let code = storage_src("tick_persistence.rs");
-    assert!(
-        code.contains("pub fn round_to_2dp"),
-        "tick_persistence.rs must expose a `round_to_2dp` re-export of the \
-         canonical common primitive."
-    );
-}
+// RETIRED (stage-2 dead-WS sweep, 2026-07-17):
+// `round_to_2dp_helper_is_available_in_storage` pinned the `round_to_2dp`
+// re-export inside the deleted `tick_persistence.rs`. The canonical
+// primitive lives in `tickvault_common::price_precision::round_to_2dp`
+// (unchanged); surviving storage write sites import it directly.
 
 // ---------------------------------------------------------------------------
 // Self-test for the helper
@@ -121,6 +94,5 @@ fn self_test_code_only_strips_comments() {
 fn _assert_paths_exist() {
     // compile-time-ish sanity that the files are where we scan.
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let _ = base.join("tick_persistence.rs");
     let _ = base.join("shadow_seal_columns.rs");
 }

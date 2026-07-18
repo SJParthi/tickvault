@@ -3990,6 +3990,8 @@ dependencies = [
  "chrono-tz",
  "clap",
  "core_affinity",
+ "criterion",
+ "dhat",
  "figment",
  "governor",
  "metrics",
@@ -4021,6 +4023,7 @@ name = "tickvault-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "arrayvec",
  "aws-lc-rs",
  "aws-lc-sys",
@@ -4036,6 +4039,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid",
@@ -4063,7 +4067,6 @@ dependencies = [
  "loom",
  "memmap2",
  "metrics",
- "metrics-exporter-prometheus",
  "papaya",
  "proptest",
  "reqwest",
@@ -4122,10 +4125,12 @@ name = "tickvault-trading"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "chrono",
  "chrono-tz",
  "criterion",
  "dhat",
+ "futures-util",
  "governor",
  "loom",
  "metrics",
@@ -4141,6 +4146,7 @@ dependencies = [
  "tickvault-common",
  "tickvault-core",
  "tokio",
+ "tokio-tungstenite",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid",

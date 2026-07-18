@@ -9,7 +9,9 @@
 
 ---
 
-> **⚠ RETIREMENT AUTHORIZED 2026-07-13 — deletion LANDED in PR-C3 (2026-07-14):**
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 — deletion LANDED in PR-C3 (2026-07-14);
+> the `CrossVerify1m01MismatchFound` / `CrossVerify1m02FetchDegraded` variants
+> DELETED in the C4 sweep (2026-07-15):**
 > `cross_verify_1m_boot.rs` is DELETED (the parser-relocation obligation below was
 > satisfied by C1's `dhan_intraday_parse.rs` move — Verified: `spot_1m_rest_boot` +
 > `groww_spot_1m_boot` import from the relocated module); the two paging entries the

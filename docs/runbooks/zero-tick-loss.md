@@ -163,7 +163,12 @@ is full. Causes:
 
 ## Related files
 
-- `crates/storage/src/tick_persistence.rs` — 3-tier buffer logic
+- `tick_persistence.rs` — the 3-tier (ring → spill → DLQ) tick buffer
+  logic. DELETED 2026-07-17 (stage-2 dead-WS sweep): the tick writer had
+  zero production callers after the live-WS retirements (Dhan 2026-07-13,
+  Groww 2026-07-15); nothing writes the `ticks` table anymore. The
+  candle-side absorption chain (seal ring → spill → DLQ) lives on in the
+  seal/shadow writers and is what this runbook's tiers map to today.
 - `crates/common/src/constants.rs` — `TICK_BUFFER_CAPACITY`
 - `crates/storage/tests/zero_tick_loss_alert_guard.rs` — pinned invariants
   (post #O3 it pins metric emission; the Prometheus alert-rule assertions +

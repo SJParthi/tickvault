@@ -55,6 +55,11 @@ pub struct PositionInfo {
     pub avg_entry_price: f64,
     /// Realized P&L from closed trades (in rupees).
     pub realized_pnl: f64,
+    /// Contract lot size (2026-07-14 unrealized-P&L fix): stored on every
+    /// `record_fill` so mark-to-market P&L multiplies by the SAME lot size
+    /// realized P&L uses. `0` (the `Default`) is treated as `1` in math —
+    /// a pre-fix position or an equity fill is never zeroed out.
+    pub lot_size: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +91,10 @@ mod tests {
         assert_eq!(pos.net_lots, 0);
         assert_eq!(pos.avg_entry_price, 0.0);
         assert_eq!(pos.realized_pnl, 0.0);
+        assert_eq!(
+            pos.lot_size, 0,
+            "default lot_size is 0 (treated as 1 in math)"
+        );
     }
 
     #[test]
@@ -235,6 +244,7 @@ mod tests {
             net_lots: 5,
             avg_entry_price: 245.50,
             realized_pnl: 0.0,
+            lot_size: 25,
         };
         assert_eq!(pos.net_lots, 5);
         assert!((pos.avg_entry_price - 245.50).abs() < f64::EPSILON);
@@ -246,6 +256,7 @@ mod tests {
             net_lots: -3,
             avg_entry_price: 300.0,
             realized_pnl: 1500.0,
+            lot_size: 25,
         };
         assert!(pos.net_lots < 0, "short position has negative lots");
         assert!((pos.realized_pnl - 1500.0).abs() < f64::EPSILON);
@@ -257,6 +268,7 @@ mod tests {
             net_lots: 2,
             avg_entry_price: 100.0,
             realized_pnl: 50.0,
+            lot_size: 1,
         };
         let debug = format!("{pos:?}");
         assert!(debug.contains("net_lots"));
@@ -272,6 +284,7 @@ mod tests {
             net_lots: 10,
             avg_entry_price: 200.0,
             realized_pnl: -500.0,
+            lot_size: 50,
         };
         let cloned = pos.clone();
         let copied = pos;

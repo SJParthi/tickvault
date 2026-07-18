@@ -4,9 +4,65 @@
 >
 > **⚠ FURTHER SUPERSEDED → r8g.large 2026-06-30 (operator Quote 7 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance upgraded m8g.large → **r8g.large** (Graviton4, 2 vCPU / 16 GiB), bill → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP kept). The current effective instance lock lives in that file's §7.
 >
+> **⚠ RE-SUPERSEDED → t4g.medium 2026-07-15 (operator Quote 8 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance DOWNSIZED r8g.large → **t4g.medium** (Graviton2, 2 vCPU / 4 GiB), QuestDB QDB_MEM_LIMIT 4g → 1g. INTERIM bill → ~₹1,471/mo incl GST at 270 hrs with the live 50 GB root (gp3 cannot shrink; the 20 GB fresh-volume recreate — an executor pre-stage, NOT operator-quoted — drops it to ~₹1,197/mo; ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the post-recreate 20 GB volume — on the live 50 GB root the ~176-hr figure is ~₹1,260, and ~₹986 is never the 270-hr one). EIP kept. The current effective instance lock lives in that file's §7. This file's original t4g.medium tables below remain 2026-05-18 historical audit (different universe/stack — do not reuse the ₹1,022 figure).
+>
 > **Authority:** Parthiban (architect). Non-negotiable.
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
+
+## COST NOTE 2026-07-17 — dead live-WS sweep stage 1 (−~$0.10/mo)
+
+The stage-1 zero-wiring dead-module sweep (operator directive 2026-07-17
+via coordinator) removed the `ws-reinject-01` errcode log-filter alarm
+(−1 alarm ≈ −$0.10/mo, Verified against the terraform diff in this PR):
+its ONLY emit site (`crates/app/src/wal_reinject.rs`, retained un-consumed
+since PR-C2 "pending the Phase C module cleanup") was deleted in that
+cleanup, so the filter could never match again (the ws-gap-07 /
+feed-stall-01 dead-filter precedent). Dated notes in
+`error-code-alarms.tf` + `observability-architecture.md`. No other
+alarm/metric/dashboard change in this sweep.
+
+## COST NOTE 2026-07-15 — Groww live-feed retirement (Trap-A lockstep; net reduction)
+
+The Groww live feed (sidecar + bridge + stall watchdog + lag publisher) is
+retired (operator 2026-07-15: "remove the whole Groww live feed; keep only
+spot 1m and option chain for both brokers; go"). Alarm/metric deltas
+(Verified against the terraform diff in this PR; billing magnitudes Assumed
+at CloudWatch list rates — active-series-hours decay to $0 once producers
+stop publishing):
+
+- **−3 alarms ≈ −$0.30/mo (Verified):** groww-ws-inactive +
+  groww-stall-restart-storm (app-alarms.tf) + groww-exchange-lag-p99-high
+  (silent-feed-alarms.tf S4).
+- **−1 alarm ≈ −$0.10/mo (Verified, same-PR fix round):**
+  aggregator-no-seals (app-alarms.tf section 9) — its metric lost its last
+  live producer with the bridge deletion (Dhan broadcast publisher-less
+  since PR-C2); a permanently-dead monitor the window gate kept arming
+  (window-gate ALARM_NAMES trimmed 5 → 4 in the same edit).
+- **−1 alarm + its fallback log metric filter ≈ −$0.10/mo + one sparse
+  derived series (Verified):** the tv-<env>-feed-stall-restarts counter
+  pager (feed-stall-restart-alarm.tf deleted whole).
+- **−1 errcode alarm ≈ −$0.10/mo (Verified):** the "feed-stall-01"
+  error_code_alerts entry (its ERROR-level emit site died with the stall
+  watchdog; observability-architecture.md paging list updated in lockstep).
+- **−4 EMF allowlist names ≈ −$1.20/mo at full in-session density (names
+  Verified; billing Assumed):** tv_groww_ws_active,
+  tv_feed_last_tick_age_seconds, tv_feed_sidecar_stall_restart_total,
+  tv_groww_exchange_lag_p99_seconds.
+- **+1 EMF name ≈ +$0.30/mo (Assumed):** tv_rest_1m_fire_heartbeat — the
+  per-fire liveness gauge replacing the lag gauge **1:1 under the EXISTING
+  tv-<env>-market-hours-liveness-missing alarm** (metric_name-only swap;
+  0 new alarms; treat_missing_data="breaching" + the 09:20–15:35 IST window
+  gate unchanged).
+
+Net ≈ **−$0.50/mo alarms/filters + ≈ −$0.90/mo series (Assumed)** — inside
+the $35/mo pre-GST budget alarm ceiling; the real saving is the ~30K-LoC
+delete, not dollars. Honest residual (design Assumed sound, not
+live-simulated): the heartbeat is deliberately NOT pre-registered at boot —
+the first set at the 09:16:01 IST fire is the session-start signal; a day
+where BOTH per-minute REST spot legs are disabled/dead pages the liveness
+alarm ~09:25 IST — the designed loud outcome (zero in-session capture), not
+a false page.
 
 ## COST NOTE 2026-07-14 — REST-audit alarm gaps (GAP-01/03/05, +~$0.60/mo)
 

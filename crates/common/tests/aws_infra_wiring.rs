@@ -100,30 +100,31 @@ fn test_terraform_instance_type_pinned() {
     let content =
         std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
             .expect("variables.tf must be readable"); // APPROVED: test
-    // Operator-lock 2026-06-30 (daily-universe-scope-expansion-2026-05-27.md §7
-    // Quote 7): r8g.large ONLY (Graviton4, 16 GiB) — DOUBLED RAM from m8g.large
-    // for the both-feeds + larger-universe workload. SUPERSEDES the 2026-05-29
-    // m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks. Any
-    // reintroduction of c7i.xlarge / c8g.xlarge / m8g.large / t4g.* as the
-    // PINNED type fails this test.
+    // Operator-lock 2026-07-15 (daily-universe-scope-expansion-2026-05-27.md §7
+    // Quote 8): t4g.medium ONLY (Graviton2 burstable, 4 GiB) — DOWNSIZED from
+    // r8g.large (cost cut; Groww-only runtime). SUPERSEDES the 2026-06-30
+    // r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large locks. Any
+    // reintroduction of r8g.large / m8g.large / c7i.xlarge / c8g.xlarge as the
+    // PINNED type fails this test. (Retired types may still appear in
+    // SUPERSEDES prose — only the validation condition is forbidden.)
     assert!(
-        content.contains("\"r8g.large\""),
-        "variables.tf must pin instance_type to r8g.large (operator lock 2026-06-30, see daily-universe-scope-expansion-2026-05-27.md §7)"
+        content.contains("\"t4g.medium\""),
+        "variables.tf must pin instance_type to t4g.medium (operator lock 2026-07-15, see daily-universe-scope-expansion-2026-05-27.md §7 Quote 8)"
     );
     assert!(
-        content.contains("var.instance_type == \"r8g.large\""),
+        content.contains("var.instance_type == \"t4g.medium\""),
         "variables.tf must VALIDATE instance_type pinning"
     );
     // Negative asserts — block the retired stacks from ever returning as the
-    // validated default (m8g.large/t4g.medium/t4g.large may still appear in
+    // validated default (r8g.large/m8g.large/t4g.large may still appear in
     // SUPERSEDES comments, so we only forbid them as the validation condition).
     assert!(
-        !content.contains("var.instance_type == \"m8g.large\""),
-        "m8g.large retired as the pinned type (operator lock 2026-06-30, doubled RAM to r8g.large)"
+        !content.contains("var.instance_type == \"r8g.large\""),
+        "r8g.large retired as the pinned type (operator downsize lock 2026-07-15)"
     );
     assert!(
-        !content.contains("var.instance_type == \"t4g.medium\""),
-        "t4g.medium retired as the pinned type (operator lock 2026-05-29)"
+        !content.contains("var.instance_type == \"m8g.large\""),
+        "m8g.large retired as the pinned type (operator lock 2026-06-30)"
     );
     assert!(
         !content.contains("c7i.xlarge"),
@@ -181,8 +182,10 @@ fn test_cloudwatch_operator_dashboard_exists() {
     // A few signal metrics that MUST be charted (and are in the scrape allowlist).
     // (PR-C2, 2026-07-13: tv_realtime_guarantee_score replaced by the Groww
     // lag gauge — the score widget retired with the PARKed SLO publisher.)
+    // (2026-07-15: the Groww lag gauge replaced by tv_rest_1m_fire_heartbeat
+    // — its sample producer died with the Groww live feed.)
     for metric in &[
-        "tv_groww_exchange_lag_p99_seconds",
+        "tv_rest_1m_fire_heartbeat",
         "tv_questdb_disconnected_seconds",
         "tv_token_remaining_seconds",
         "tv_aggregator_seals_emitted_total",
@@ -524,6 +527,36 @@ fn test_deploy_aws_workflow_has_market_hours_guard() {
     assert!(
         content.contains("330") && content.contains("1015"),
         "deploy-aws.yml must encode the 09:00-15:45 IST window in UTC (330-1015)"
+    );
+}
+
+#[test]
+fn test_deploy_aws_workflow_green_defer_gate() {
+    // Green-defer contract (2026-07-17, PR #1618): an in-window MAIN-BRANCH
+    // push run exits GREEN with deploy_allowed=false (deferred no-op — the
+    // 15:46 IST after-close cron delivers the SHA); the deploy job must be
+    // gated on that output, and the defer arm must stay scoped to
+    // push-to-main only (tags/dispatch keep the loud red block).
+    let content =
+        std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
+            .expect("deploy-aws.yml must be readable"); // APPROVED: test
+    assert!(
+        content.contains("needs.guard_market_hours.outputs.deploy_allowed == 'true'"),
+        "deploy-aws.yml deploy job must gate on guard_market_hours' deploy_allowed output"
+    );
+    assert!(
+        content.contains(
+            r#"elif [ "${{ github.event_name }}" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then"#
+        ),
+        "deploy-aws.yml green-defer arm must be scoped to push events on refs/heads/main only"
+    );
+    assert!(
+        content.contains(r#"echo "deploy_allowed=false" >> "$GITHUB_OUTPUT""#),
+        "deploy-aws.yml defer arm must write deploy_allowed=false (green deferred no-op)"
+    );
+    assert!(
+        content.contains(r#"echo "deploy_allowed=true" >> "$GITHUB_OUTPUT""#),
+        "deploy-aws.yml must write deploy_allowed=true on the allowed path"
     );
 }
 

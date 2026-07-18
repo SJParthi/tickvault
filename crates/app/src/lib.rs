@@ -18,7 +18,11 @@
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
 
-pub mod bar_cache_loader;
+// Dead live-WS sweep stage 1 (2026-07-17, operator directive via
+// coordinator): `bar_cache_loader` module DELETED — zero production
+// callers (its only reference was this declaration); it read the retired
+// tick-fed candle shadow tables with a feed-blind union (feed-separation
+// recon GAP-1), and its in-RAM `BarCache` consumer died with it.
 // W2 PR#5 (2026-07-10, audit follow-up row 15): holiday-calendar
 // coverage-horizon staleness watchdog - pages the operator BEFORE the
 // calendar runs off its year-end cliff into un-listed holidays.
@@ -35,6 +39,19 @@ pub mod brutex_crossverify_compare;
 // 15:50 IST I/O shell — S3 CSV fetch, QuestDB reads, compare orchestration,
 // persistence, Telegram summary + supervised spawn (Unit 7).
 pub mod brutex_crossverify_boot;
+// Judge-locked cadence scheduler boot wiring (2026-07-14): config-gated
+// dual-spawn of the supervised per-minute fire scheduler (dry-run
+// executors both lanes day 1 — no REST caller). Runbook:
+// `.claude/rules/project/cadence-error-codes.md`.
+pub mod cadence_boot;
+pub(crate) mod cadence_escalation;
+/// Real Dhan cadence executor — limiter-free, gate-pacing honored (the runner
+/// pre-acquires gates; this executor issues ONE bounded request per call).
+pub mod dhan_cadence_executor;
+/// Real Groww cadence executor — the Groww twin (gate-free lane by
+/// construction; ONE bounded request per call; token = shared-minter SSM
+/// READ-ONLY, never minted).
+pub mod groww_cadence_executor;
 // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
 // watchdog — daily open-position safety gate (alert-only in sandbox/dry-run).
 pub mod orphan_position_watchdog_boot;
@@ -53,6 +70,12 @@ pub mod spot_1m_rest_boot;
 // chain for the 3 underlyings via POST /v2/optionchain and persist to the
 // `option_chain_1m` table (CHAIN-01..04).
 pub mod option_chain_1m_boot;
+// Groww REST burst auto-ladder (operator approval 2026-07-14): the shared
+// tier/demotion state + wave schedule for the per-minute Groww REST legs,
+// plus the env-gated off-hours rate probe that gates the
+// seven_concurrent promotion.
+pub mod groww_rate_probe;
+pub mod groww_rest_burst;
 // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
 // the Groww per-minute REST plan): the just-closed minute's official Groww
 // 1m OHLCV for the 3 spot indices → `spot_1m_rest` feed='groww' + the
@@ -78,6 +101,7 @@ pub mod feed_scoreboard_boot;
 // recompute every higher-TF candle (2m..4h) from the stored 1m rows and
 // compare against the persisted TF tables — Dhan verifies TODAY, Groww
 // verifies the PREVIOUS trading day (TF-VERIFY-01/02).
+pub mod spot_crossverify_boot;
 pub mod tf_consistency_boot;
 pub mod tick_conservation_boot;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
@@ -88,6 +112,12 @@ pub mod day_ohlc_orchestrator;
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
 pub mod boot_helpers;
+/// Once-per-trading-day delivery markers for daily scheduled tasks
+/// (Telegram cleanliness overhaul, coordinator-relayed directive
+/// 2026-07-15). Fail-open advisory files under `data/state/daily/` —
+/// the 15:40 timeframe check's catch-up arm consults them so a
+/// post-15:40 restart never re-fires an already-delivered daily card.
+pub mod daily_task_marker;
 /// Dhan runtime activation watcher (PR-2) — dormant supervisor that keeps the
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
@@ -105,42 +135,49 @@ pub mod dhan_data_api_limiter;
 /// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
 /// module the Phase C deletion PRs remove). Pure move, zero behavior change.
 pub mod dhan_intraday_parse;
+/// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive
+/// 2026-07-16; governance on PR #1597): receive-only broadcast consumer
+/// mapping order updates to `order_audit` rows `feed='dhan'`/`mode='paper'`.
+/// Spawned by `dhan_rest_stack` Phase 5a under `[dhan_order_push] enabled`
+/// (default OFF).
+pub mod dhan_order_push_observability;
 /// Dhan REST-only auth bootstrap (Phase A of the Dhan-live-feed removal,
 /// operator directive 2026-07-13): with `feeds.dhan_enabled = false` this
 /// brings up the RETAINED Dhan REST surface — dual-instance lock →
 /// TokenManager → renewal + mid-session watchdog → REST canary +
 /// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
 pub mod dhan_rest_stack;
-/// Groww runtime activation watcher — feed toggle cold-starts/teardowns the
-/// whole Groww lane live (operator 2026-06-24). Default-OFF; dormant until enabled.
-pub mod groww_activation;
-/// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
-pub mod groww_bridge;
-/// Fleet-scoped Telegram alert coalescing for the Groww auto-scale fleet
-/// (§34, exam-fix 2026-07-06): reject/connected transitions across ALL fleet
-/// connections aggregate into at most ONE Telegram per 60s window per
-/// direction; single-connection semantics untouched.
-pub mod groww_fleet_alerts;
-/// Groww NATIVE-RUST shadow client runner (PR-R1 parity migration, operator
-/// "go" 2026-07-04 — `groww-second-feed-scope-2026-06-19.md` §35). Default-OFF
-/// behind `[feeds] groww_native_shadow`.
-pub mod groww_native_shadow;
-/// Groww auto-scale ladder FSM + gates + restart rehydration (§34, PR-2 of
-/// `.claude/plans/active-plan-groww-autoscale.md`). Default-OFF behind
-/// `[feeds.groww.scale] enabled`.
-pub mod groww_scale_ladder;
-/// Groww scale-FLEET dual-instance SSM lock gate (Session-B fix #1,
-/// operator go 2026-07-04): refuses the multi-connection fleet spawn when a
-/// peer instance already holds `/tickvault/<env>/instance-lock-groww-scale`
-/// (GROWW-SCALE-05, fail-closed; single-connection fallback).
-pub mod groww_scale_lock;
-/// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
-/// "no manual commands" 2026-06-19). Default-OFF.
-pub mod groww_sidecar_supervisor;
-pub mod scale_test_preflight;
+/// Groww order/position PUSH channel — Stage D app consumer (2026-07-17,
+/// operator-authorized paper-mode receive-only build): bridges trading-side
+/// `BrokerOrderEvent`s from the supervised push runner into `order_audit`
+/// forensic rows (`feed='groww'`). Gated on the non-default `groww_orders`
+/// cargo feature (§39.2 Gate 2) AND the runtime
+/// `[groww_orders] order_push_enabled` flag (Gate 1, default OFF).
+#[cfg(feature = "groww_orders")]
+pub mod groww_order_observability;
+/// `[groww_universe]` process-global daily Groww watch-set + shared-master
+/// rider (2026-07-15 live-feed retirement re-home of the activation daily
+/// build loop + the sole persist_groww_instruments caller).
+pub mod groww_universe;
+pub mod groww_watch_paths;
+/// RAM residency stores boot (operator directive 2026-07-16, PR-2):
+/// installs the month-deep spot bar rings + current-day chain minute ring,
+/// runs the bounded chain-day rehydrate, and publishes the depth gauges.
+/// RAMSTORE-01 runbook: `.claude/rules/project/ram-store-error-codes.md`.
+pub mod market_ram_store_boot;
+/// REST-era multi-TF candle derivation (operator directive 2026-07-16):
+/// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
+/// timeframes via the shared seal-writer channel + boot catch-up over the
+/// stored month. FOLD-01 runbook:
+/// `.claude/rules/project/rest-candle-fold-error-codes.md`.
+pub mod rest_candle_fold;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;
+/// Pure shutdown classifier (Telegram cleanliness overhaul, 2026-07-15):
+/// signal kind × runtime source × IST clock × trading calendar →
+/// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
+pub mod shutdown_class;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
 // + 1 order-update conn only).
@@ -179,19 +216,39 @@ pub mod metrics_catalog;
 /// rotate the API bearer token (/tickvault/<env>/api/bearer-token) without
 /// an app restart — closes audit row 13.
 pub mod api_token_rotation;
+/// 🔷 DHAN exit-order execution dispatcher (Cluster B, 2026-07-14) — the
+/// S6-G1 call-site hub for every engine exit method + LOCK #2's runtime
+/// `!cfg.enabled` gate. Future entry-side (Cluster A) work constructs
+/// `ExitCommand`s; only this module executes them (never the engine
+/// methods directly).
+pub mod exit_execution;
 pub mod index_constituency_boot;
 pub mod observability;
+/// Shared OMS wiring (TokenHandle→TokenProvider adapter + pinned-timeout
+/// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so
+/// the two OMS construction sites can never drift.
+pub mod oms_wiring;
 /// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
 /// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily
 /// OnEod heartbeat + counters-vs-rows reconcile (OMS-GAP-02 on mismatch).
 pub mod order_observability;
+/// Order runtime (dry-run) — cluster A, operator directive 2026-07-14
+/// (`.claude/plans/active-plan-order-runtime-dryrun.md`): the single-owner
+/// supervised task owning the paper OMS + RiskEngine on the dhan-off prod
+/// profile, spawned ONLY from `dhan_rest_stack` Phase 5b (2026-07-17
+/// correction — Phase 5a is the RETIRED order-update WS spawn slot).
+pub mod order_runtime;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
-/// C3 (2026-07-03): bounded, chunked, backpressured STAGE-C.2b WAL frame
-/// re-injection — replaces the raw try_send loop that dropped 1,127,801
-/// frames + kept the WAL unconfirmed (self-feeding re-replay storm).
-pub mod wal_reinject;
+// Dead live-WS sweep stage 1 (2026-07-17, operator directive via
+// coordinator): `wal_reinject` module DELETED — its own PR-C2 comments
+// recorded it "retained un-consumed pending the Phase C module cleanup";
+// both STAGE-C.2b re-injection call sites died with the Dhan live-WS lane
+// (2026-07-13), and main.rs drains residual LiveFeed WAL frames loudly at
+// boot instead. The WS-REINJECT-01 paging filter was retired in lockstep
+// (error-code-alarms.tf dated note); the `WsReinject01Aborted` variant is
+// retained pending the post-sibling-merge variant sweep.
 /// Shared `ws_event_audit` channel + consumer helper — relocated from the
 /// main.rs binary in Phase C1 (2026-07-13) so the lib-side `dhan_rest_stack`
 /// (which owns the functional-dormant order-update WS per operator ruling

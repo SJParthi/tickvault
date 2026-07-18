@@ -147,6 +147,22 @@ and replaced with the hard bans in this rule.
     - Why: a tick-built 1d candle is just a sample of the day; the historical
       daily candle is NSE's authoritative O/H/L/C/V — the same exact-match
       reason the operator cited for the intraday chart-vs-tick gap.
+    - **2026-07-16 dated edit — the REST-era BAR-FOLD writer MAY produce
+      `candles_1d` (operator directive 2026-07-16, verbatim: *"why the fuck
+      remaining candles 1m till 1day is not yet generated and populated —
+      resolve these"*).** With BOTH live feeds retired (Dhan 2026-07-13,
+      Groww 2026-07-15) the "tick-built 1d is just a sample" rationale above
+      no longer applies: there IS no tick path, and the fold writer
+      (`crates/app/src/rest_candle_fold.rs`) derives ALL 21 timeframes —
+      including 1d, sealed at the 15:30 close — from the OFFICIAL vendor
+      `spot_1m_rest` 1m candles (the same authoritative-candle source class
+      this rule always preferred), never from ticks. Scope of the edit:
+      ONLY the bar-fold writer's `BufferedSeal` emissions through the
+      shared seal-writer may write `candles_1d`; the live-aggregator D1
+      write-boundary drop (the paragraphs above) stays as-is for any future
+      re-authorized tick path, and NOTHING here relaxes rules 1-6 (no
+      synthesized ticks into `ticks`, ever). FOLD-01 runbook:
+      `.claude/rules/project/rest-candle-fold-error-codes.md`.
 
 11. **Post-market 1-minute cross-verification — RE-ALLOWED 2026-06-02 (operator
     directive, narrowed).** Operator quote: *"put back the historical cross

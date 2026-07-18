@@ -20,61 +20,59 @@ dispatch_frame           = 10           # <10ns  — matches dispatch_frame/tick
 pipeline                 = 100          # <100ns per tick — matches pipeline/batch_100_mixed, pipeline/burst_100_ticker
 registry_get             = 50           # <50ns  — matches registry/get_hit, registry/get_miss (papaya O(1) lookup)
 token_handle             = 50           # <50ns  — matches token_handle/load (arc-swap hot-path read)
-f32_to_f64_clean         = 50           # <50ns  — matches f32_to_f64_clean/* (storage precision conversion)
+# f32_to_f64_clean budget removed in the stage-2 dead-WS sweep (2026-07-17):
+# its Criterion bench lived in the deleted crates/storage/benches/
+# tick_persistence.rs (the dead tick chain). The primitive itself is
+# unchanged in tickvault_common::price_precision (unit + wiring tested).
 ws_reader_frame_handle   = 5000         # <5μs  — STAGE-D P7.6: counter bump + WAL append + dispatch per frame. Generous ceiling because WAL append includes one heap alloc + one crossbeam try_send; measured ~1-3μs in criterion, budget gives 2× headroom for noisy CI runners.
-phase2_compute_subscriptions = 1000000  # <1ms  — Plan item Q (2026-04-23): cold-path 09:13 dispatcher computes ATM±24 for 4 depth underlyings × 200-strike option chains. Measured ~4.3μs; 1ms budget gives ~230× headroom so accidental O(n²) regressions fail CI without being tight enough to flake on noisy runners.
 # tick_gap_record_tick_steady_state / tick_gap_scan_gaps_full_universe budgets
 # removed in PR-C3 (2026-07-14) with the deleted tick-gap detector
 # (operator Q4-ii 2026-07-13).
-slo_score_evaluate_all_green = 1000      # <1µs — Wave 3-D Item 13: composite SLO score evaluator hot path (six clamps + five multiplies + 6-way min-scan). 1µs ceiling gives ~20× headroom over the measured median; regression past this size means a heap allocation or a powf entered the path.
-slo_score_evaluate_degraded = 1000       # <1µs — Wave 3-D Item 13: degraded path (find-weakest scan + threshold branches). Same budget as all-green.
+# slo_score_evaluate_* budgets removed in the C4 sweep (2026-07-15) with the
+# deleted slo_score.rs contract stub + its bench (wave-3-d PARK banner).
 
 # Silent-feed hardening Item 4 (2026-07-06 incident) — Dhan exchange-lag monitor.
 feed_lag_record_dhan_tick = 100          # <100ns — HOT PATH ring write (dwell check + clock alignment + two relaxed atomic stores + head bump + two relaxed day-histogram RMWs since scoreboard PR-C; zero-alloc, DHAT-ratcheted by dhat_feed_lag_ring.rs). Regression past this means an allocation or a lock entered the per-tick observation.
-feed_lag_record_groww_tick = 100         # <100ns — HOT PATH Groww fold (scoreboard PR-C: capture/staleness classify + ring write + two relaxed day-histogram RMWs; zero-alloc, DHAT-ratcheted by dhat_feed_lag_groww.rs). Same budget class as the Dhan target.
 feed_presence_record = 100               # <100ns — HOT PATH presence fold (scoreboard PR-D: enabled check + minute math + one lock-free papaya read + one relaxed fetch_or; zero-alloc, DHAT-ratcheted by dhat_feed_presence.rs). Same budget class as the feed_lag hot targets — the papaya hash+read dominates.
 feed_lag_p99_window = 5000000            # <5ms — COLD path: publisher p99 over a full 32,768-sample window via select_nth_unstable. Honestly O(N-window), NOT O(1) — runs on the supervised 10s task off the tick thread (cold-budget class; the former tick_gap_scan_gaps_full_universe peer budget retired in PR-C3, 2026-07-14).
 
-# Phase 12-runtime (2026-04-28) — Movers 22-TF primitives
-compute_swap_delta_150_30_overlap   = 50000   # <50µs — depth-20 dynamic top-150 set diff with 30-entry crossover (typical per-minute case).
-compute_swap_delta_full_overlap     = 50000   # <50µs — full 150 overlap (no-op delta path).
-compute_swap_delta_zero_overlap     = 50000   # <50µs — full 150-vs-150 swap (worst case).
-compute_next_tick_secs              = 50      # <50ns — pure integer arithmetic.
-compute_lag_secs                    = 50      # <50ns — saturating sub.
-should_emit_snapshot                = 50      # <50ns — single integer compare.
-parse_questdb_dataset_json_150_rows = 1000000 # <1ms — JSON parsing for 150-row payload (option_movers worst case).
+# Moneyness classification (2026-07-14, operator directive) — one key, two benches.
+moneyness = 50                           # <50ns — matches moneyness/classify (2-arm label parse + three integer compares, zero-alloc) AND moneyness/snapshot_read (one lock-free arc-swap load — the token_handle/load class). DHAT-ratcheted by dhat_moneyness.rs. Key checked bidirectionally against every other budget key and bench name (incl. the since-removed should_emit_snapshot key, deleted 2026-07-17 as an orphaned budget — neither string contained the other); repo-wide grep for "moneyness" was zero hits before this feature.
 
-# B6 (2026-07-03) — operator-gated TRUE-COMPUTE per-tick budget.
-# Bench: composite/quote_tick_compute_only (crates/core/benches/
-# full_tick_processing.rs) — the full live-loop chain incl. the REAL
-# writer append under the off-thread flush offload (flush I/O on the
-# worker thread, NOT in the measured thread). Measured median ~1.94µs
-# on the 2026-07-03 dev box → ~5× headroom under the operator's 10µs
-# gate. Key checked bidirectionally against every other budget key and
-# bench name (incl. composite_quote_tick_full_chain) — no substring
-# collision.
-composite_quote_tick_compute_only = 10000  # <10µs — B6 true-compute budget (2026-07-03)
+# 2026-07-17: removed 9 orphaned budget keys (phase2_compute_subscriptions, compute_swap_delta_*, compute_next_tick_secs, compute_lag_secs, should_emit_snapshot, parse_questdb_dataset_json_150_rows, cascade_fanout_feed_sealed_1s_bar) — their benches were deleted with the movers/depth/live-feed retirements; bench-gate silently ignored budget keys with no matching bench (Rule-11 dead-gate class).
 
-# C1 (2026-07-03) — full per-tick chain budget, wired into CI by bench.yml.
-# Bench: composite/quote_tick_full_chain (crates/core/benches/
-# full_tick_processing.rs:256) — parse → heartbeat → gap detector → canary
-# scan → enricher → ILP row → persisted counter → broadcast → monotonicity
-# guard → histogram records. Key checked bidirectionally against every other
-# budget key and bench dir name (incl. composite_quote_tick_compute_only) —
-# no substring collision.
-composite_quote_tick_full_chain = 10000  # <10µs full per-tick chain p50 (measured p50 1526 ns on 2026-07-03, this container)
+# B6/C1 composite_quote_tick_compute_only + composite_quote_tick_full_chain
+# budgets removed in the stage-2 dead-WS sweep (2026-07-17): their Criterion
+# bench (crates/core/benches/full_tick_processing.rs) measured the deleted
+# tick chain (parse → enricher → tick writer → broadcast → monotonicity
+# guard) and was deleted with it. The operator's per-tick latency gates for
+# the SURVIVING hot paths stand: dispatch_frame/pipeline (parser),
+# feed_lag_record_dhan_tick, feed_presence_record, moneyness.
 
 # Trading crate — OMS
 oms_state_transition     = 100          # <100ns — matches oms/state_transition
 
-# Trading crate — 28-TF CascadeFanout (Phase 3 9-box closure)
-cascade_fanout_feed_sealed_1s_bar = 5000  # <5µs per call. 28 × papaya pin/get + uncontended mutex ≈ 1.7µs measured; 3× headroom for noisy CI runners. At ~24K seals/sec peak this caps fanout work at ~12% of one core.
 
-# Trading crate — Wave 7-A4 BarCache RAM-first hot-path READ side
-bar_cache_lookup         = 100          # <100ns per call. papaya pin + get + Copy of CompactBar (56 B). Source-site docstring claims ~30ns measured; 3× headroom for noisy CI runners. Companion to dhat_bar_cache_lookup.rs (zero-alloc) — together they pin the W7-A4 §6 "100% code performance" guarantee row. At ~4,200 lookups/sec sustained + ~99K reads/sec minute-boundary burst this budget caps lookup work at ~10% of one core.
+# Trading crate — Wave 7-A4 BarCache budget key RETIRED (dead live-WS sweep
+# stage 1, 2026-07-17): the `in_mem::bar_cache` module, its Criterion bench
+# and dhat_bar_cache_lookup.rs were deleted (zero production callers — its
+# only writer was the feed-blind bar_cache_loader boot union, recon GAP-1).
 
 # Trading crate — OBI (Order Book Imbalance)
 obi_compute              = 1000         # <1μs = 1000ns — matches obi_compute_20_levels, obi_compute_with_wall (measured: ~297ns)
+
+# App crate — order-runtime dry-run PR (2026-07-14): the mark-forward gate
+# into the dry-run order runtime. 2026-07-17 truth-sync: the mark SOURCE is
+# the Groww per-minute REST legs' persist-confirm points (re-homed
+# 2026-07-16 — the live-bridge per-tick source died with #1581); the gate
+# KEEPS its hot-path-grade budget so a future higher-rate source needs no
+# re-budget.
+# Substring-matches order_gate/mark_forward_{disarmed,armed_full,armed_accept}.
+# Disarmed (the dominant path) is a single Relaxed load (~1ns); the armed
+# arms are one bounded try_send of a 16-byte Copy struct (drop arm counts a
+# static-key counter). 100ns covers all three with CI-runner headroom.
+# Companion zero-alloc evidence: crates/app/tests/dhat_mark_forward.rs.
+order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day

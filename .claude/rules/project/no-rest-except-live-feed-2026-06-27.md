@@ -1,5 +1,17 @@
 # No REST Except Live Feed — Market-Data REST Lock (Operator Lock 2026-06-27)
 
+> **⚠ LOCK INVERTED 2026-07-15 — NO live market-data feed exists (operator Q1, received directly in this
+> session: *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*;
+> approval Q2, typos preserved: *"go aehad approv ed dude"*):** with the Groww live WS retired (after the
+> 2026-07-13 Dhan retirement), the §8 (Dhan) + §9 (Groww) scheduled-pull KEEP classes ARE the entire
+> market-data surface — §1's "only the live-feed WebSocket carries market data" no longer names a running
+> feed. The Groww master-CSV + token-read KEEP rows STAND (the watch set supplies the REST legs' identity;
+> the SEBI master continuity keeps writing). The live-feed-AUTH KEEP class now serves only the REST stacks +
+> the order-side channels (order/position live push is a separate, permanently-kept surface per the
+> operator's 2026-07-15 order-side directive — recorded by the order-side session; see the cluster-A rule
+> updates — market data = per-minute REST pull, order/position events = live push). GDF
+> (`gdf-third-feed-scope-2026-07-13.md`) remains the only path to a future live market-data feed.
+
 > **⚠ 2026-07-12 NOTE — BruteX cross-verify S3 read is a KEEP class:** per the operator's 2026-07-12 directive recorded verbatim in `groww-second-feed-scope-2026-06-19.md` §37, TickVault reads BruteX-produced backtest CSVs from OUR OWN S3 bucket (`s3://tv-prod-cold/crossverify/*`) via `aws-sdk-s3` GetObject/ListObjectsV2. That is an INTERNAL artifact transfer from our own infrastructure — the same class as the S3 cold-archive surface — NOT a market-data REST endpoint of Dhan or Groww. A new **KEEP** row is added to the §3 inventory below. This lock's ban on Dhan/Groww market-data REST pulls is UNCHANGED.
 >
 > **⚠ 2026-07-12 NOTE (SECOND same-day directive) — per-minute REST pipeline is a scheduled-pull KEEP class:** a SECOND 2026-07-12 operator directive (relayed verbatim via the coordinator session, quote preserved in §8.0 below) adds a narrow **scheduled-pull KEEP class**: the per-minute **spot-1m intraday fetch** (`POST /v2/charts/intraday`, interval `"1"`, exactly 3 IDX_I SIDs — NIFTY=13, BANKNIFTY=25, SENSEX=51) + the per-minute **option-chain fetch** (`POST /v2/optionchain` + `POST /v2/optionchain/expirylist`, the same 3 underlyings' current expiry, config-gated DEFAULT-OFF pending the first-live-boot entitlement probe) — **see the new §8**. Two new KEEP rows join the §3 inventory; the matching legacy REMOVE rows are annotated, never deleted. The ban on all OTHER market-data REST pulls is UNCHANGED.
@@ -7,6 +19,8 @@
 > **⚠ 2026-07-13 NOTE — GROWW per-minute REST pipeline is a scheduled-pull KEEP class:** a 2026-07-13 operator directive (relayed verbatim via the coordinator session, quotes preserved in §9.0 below + `groww-second-feed-scope-2026-06-19.md` §38) extends the §8 scheduled-pull KEEP class to GROWW: the per-minute **spot-1m fetch** (`GET api.groww.in/v1/historical/candles`, `candle_interval="1minute"`, 3 Groww spot indices) + the per-minute **option-chain fetch** (`GET api.groww.in/v1/option-chain/...`, the same 3 underlyings' current expiry) + a bounded **per-contract 1m fetch** (same candles endpoint, `segment=FNO`, selected option contracts) — **see the new §9**. Two new KEEP rows join the §3 inventory. The ban on all OTHER market-data REST pulls (incl. any BULK Groww historical sweep) is UNCHANGED.
 >
 > **⚠ 2026-07-13 NOTE (THIRD same-period directive) — Dhan live WS retired; KEEP-row repurposing:** per the operator's 2026-07-13 retirement directive (verbatim in `websocket-connection-scope-lock.md`'s "2026-07-13 Amendment"), the Dhan LIVE-FEED half of §1's one-liner no longer exists — for Dhan, market data is now EXCLUSIVELY the §8 scheduled-pull KEEP class (spot-1m + option-chain + historical); the live-feed WS in §1 now means the GROWW feed (and, when its trial goes live, GDF per `gdf-third-feed-scope-2026-07-13.md`). Three §3 row effects: **(1) the Dhan "live-feed AUTH" KEEP rows (generateAccessToken / RenewToken / getIP-setIP) are KEPT with a repurposed rationale** — they now produce the token/gate for the Dhan REST stack (spot-1m/chain/historical) + the functional-dormant order-update WS inside `dhan_rest_stack`, no longer for a market-data WS; **(2) the Dhan Detailed CSV instrument-master KEEP row is RETIRED** (operator Q3: *"hereafter no Dhan instrument download/parsing — just direct hardcoded security IDs passed to spot 1m and option chain"*; the Phase B dependency map proved ZERO surviving consumers — the Groww watch build reads its OWN master CSV, never the Dhan one); **(3) the niftyindices NTM row and the Groww master CSV row are UNCHANGED** (their surviving consumer is the Groww watch build via its own hardened client). Row annotations below are edited in place per house style (rows annotated, never deleted).
+>
+> **⚠ 2026-07-14 NOTE — Groww ORDER-SIDE is a gated KEEP class (build authorized, live fire LOCKED):** a 2026-07-14 operator directive (verbatim in §10.0 below + `groww-second-feed-scope-2026-06-19.md` §39) authorizes BUILDING + INTEGRATING the Groww order-side (orders / smart orders / portfolio / margin / user, per `docs/groww-ref/16-orders-margins-portfolio.md`) **entirely behind a 4-gate live-fire lattice** — see the new **§10**. Order MUTATIONS stay hard-locked until a separate future dated live-orders enable; order-side READ-ONLY GETs are per-area config-gated DEFAULT-OFF + market-hours-only. Quote/LTP REST and bulk historical fetch stay BANNED (§1/§2/§33). Two-plus new KEEP-GATED rows join the §3 inventory; the ban on all OTHER market-data REST pulls is UNCHANGED.
 >
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > `daily-universe-scope-expansion-2026-05-27.md` §3 > `groww-second-feed-scope-2026-06-19.md` > this file > defaults.
 > **Scope:** PERMANENT once confirmed. Every Phase. Every PR. Every future Claude/Cowork session. Applies to BOTH Dhan (feed #1) and Groww (feed #2).
@@ -53,7 +67,7 @@ A **literal** reading ("kill ALL REST") is self-contradictory: it would also kil
 | `GET niftyindices.com ind_niftytotalmarket_list.csv` | `instruments.rs:646`; `main.rs:1978,2667,6806` | constituents (static ref) — the MAP source | **KEEP** |
 | ~~`POST api.groww.in/v1/token/api/access`~~ | ~~`groww/auth.rs`~~ | Groww live-feed AUTH | **REMOVED 2026-07-02** — superseded by the shared token-minter SSM read (`groww-shared-token-minter-2026-07-02.md`); TickVault never mints |
 | `GET GROWW_INSTRUMENT_CSV_URL` | `constants.rs:612`; `instruments.rs:639` | Groww master (static ref) — the MAP source | **KEEP** |
-| `POST api.groww.in/v1/api/apex/v1/socket/token/create/` (per-session socket-token mint) | `constants.rs` (`GROWW_SOCKET_TOKEN_URL`); `feed/groww/native/socket_token.rs` | Groww live-feed AUTH — mints the per-session NATS user JWT from the SSM-read access token (NOT an access-token mint; the shared-minter lock 2026-07-02 is untouched). Recorded 2026-07-04 with the native-shadow-client authorization (`groww-second-feed-scope-2026-06-19.md` §35); the Python sidecar's SDK already makes this exact call | **KEEP** (added 2026-07-04) |
+| `POST api.groww.in/v1/api/apex/v1/socket/token/create/` (per-session socket-token mint) | `constants.rs` (`GROWW_SOCKET_TOKEN_URL`); `feed/groww/native/socket_token.rs` | Groww live-feed AUTH — mints the per-session NATS user JWT from the SSM-read access token (NOT an access-token mint; the shared-minter lock 2026-07-02 is untouched). Recorded 2026-07-04 with the native-shadow-client authorization (`groww-second-feed-scope-2026-06-19.md` §35); the Python sidecar's SDK already makes this exact call | **RETIRED 2026-07-15** (was KEEP, added 2026-07-04) — the sole caller (the native shadow client's socket-token mint) was deleted with the Groww live feed; `GROWW_SOCKET_TOKEN_URL` deleted from constants.rs the same day. Row kept as history |
 | `POST /v2/charts/intraday` (1m cross-verify) | `cross_verify_1m_boot.rs:283`; `constants.rs:1255` | MARKET-DATA pull | **REMOVE** (historical uses removed; the narrow §8 scheduled-pull use was re-authorized 2026-07-12) |
 | `POST /v2/charts/historical` (prev-day OHLCV) | `prev_day_ohlcv_boot.rs:120`; `constants.rs:1259` | MARKET-DATA pull | **REMOVE** |
 | `GET /v2/profile` (REST canary + mid-session watchdog) | `rest_canary_boot.rs:170`; `mid_session_watchdog.rs:30` | MARKET-DATA-adjacent poll | **REMOVE** (canary + watchdog) |
@@ -66,6 +80,9 @@ A **literal** reading ("kill ALL REST") is self-contradictory: it would also kil
 | `POST /v2/optionchain` + `POST /v2/optionchain/expirylist` (per-minute chain, config-gated — §8) | future `crates/app/src/option_chain_1m_boot.rs` + `crates/storage/src/option_chain_1m_persistence.rs` (code lands in the §8 follow-up PR) | scheduled-pull market-data KEEP class (§8) — 3 underlyings' CURRENT expiry, sequenced after the spot fetch, writes ONLY the new `option_chain_1m` table | **KEEP** (added 2026-07-12 — §8; DEFAULT-OFF pending the first-live-boot entitlement probe) |
 | `GET api.groww.in/v1/historical/candles` (per-minute scheduled pull — 3 Groww spot indices + bounded selected option contracts; §9) | future `crates/app/src/groww_spot_1m_boot.rs` + `crates/app/src/groww_contract_1m_boot.rs` + `crates/storage/src/option_contract_1m_rest_persistence.rs` (code lands in the §9 follow-up PRs) | scheduled-pull market-data KEEP class (§9) — `candle_interval="1minute"`, day-granular window + client-side target-minute filter, once per minute in-session; writes ONLY `spot_1m_rest` (feed='groww') / the new `option_contract_1m_rest` table (never `ticks`/`candles_*`) | **KEEP** (added 2026-07-13 — §9) |
 | `GET api.groww.in/v1/option-chain/exchange/{e}/underlying/{u}?expiry_date=...` (per-minute scheduled pull, 3 underlyings current expiry; §9) | future `crates/app/src/groww_option_chain_1m_boot.rs` (code lands in the §9 follow-up PRs) | scheduled-pull market-data KEEP class (§9) — CURRENT expiry from the already-ingested Groww instruments CSV, sequenced after the Groww spot fetch; writes ONLY `option_chain_1m` (feed='groww') (never `ticks`/`candles_*`) | **KEEP** (added 2026-07-13 — §9; DEFAULT-OFF pending first-live-session verification) |
+| `POST /v1/order/create` · `/modify` · `/cancel` · `/v1/order-advance/*` (Groww order mutations) | future `crates/trading/src/oms/groww/{api_client,smart_orders}.rs` (feature `groww_orders`) | order MUTATION (behind the 4-gate live-fire lattice) | **KEEP-GATED** (added 2026-07-14 — §10; operator-live-orders-enable-ONLY, `GROWW_ORDER_LIVE_FIRE` false) |
+| `GET /v1/order/{list,detail,status,status/reference,trades}` · `/v1/positions/*` · `/v1/holdings/user` · `/v1/margins/detail/*` · `/v1/user/detail` (Groww order-side reads) | future `crates/trading/src/oms/groww/{api_client,portfolio,margin,user}.rs` (feature `groww_orders`) | order-side READ (config-gated + market-hours-only) | **KEEP-GATED** (added 2026-07-14 — §10; per-area `[groww_orders]` flags DEFAULT-OFF) |
+| Groww order/position-update WS (`subscribe_*_order_updates` / `subscribe_fno_position_updates`) on the existing feed connection | future `crates/trading/src/oms/groww/*` (feature `groww_orders`) | order/position update stream (no new connection) | **KEEP-GATED** (added 2026-07-14 — §10; gated with the order-side) |
 
 **What removing the REMOVE rows costs (honest, fail-soft):** prev-day `*_pct_from_prev_day` columns read 0 (already boot-never-blocks); the 15:31 IST 1m cross-verify (the only OHLCV parity signal) goes away; REST canary + mid-session profile watchdog go away (lose early "REST died" detection); open-price fallback + option-chain cache go away. **The live feed, dedup, and mapping all keep working — nothing in the hot path or the master build breaks.**
 
@@ -98,7 +115,7 @@ Always loaded. Activates on any session that:
 - Edits `crates/app/src/spot_1m_rest_boot.rs`, `crates/app/src/option_chain_1m_boot.rs`, `crates/storage/src/spot_1m_rest_persistence.rs`, `crates/storage/src/option_chain_1m_persistence.rs` (the §8 scheduled-pull modules)
 - Edits `crates/app/src/groww_spot_1m_boot.rs`, `crates/app/src/groww_option_chain_1m_boot.rs`, `crates/app/src/groww_contract_1m_boot.rs`, `crates/storage/src/option_contract_1m_rest_persistence.rs` (the §9 scheduled-pull modules)
 - Adds any new REST call to `api.dhan.co`, `api.groww.in`, or any market-data host
-- Any file containing `charts/intraday`, `charts/historical`, `marketfeed/ltp`, `marketfeed/quote`, `optionchain`, `/v2/profile`, `generateAccessToken`, `RenewToken`, `api-scrip-master`, `niftyindices`, `GROWW_INSTRUMENT_CSV_URL`, `/v1/token`, `spot_1m_rest`, `option_chain_1m`, `v1/historical/candles`, `v1/option-chain`, `groww_spot_1m`, `groww_option_chain_1m`, `option_contract_1m_rest`
+- Any file containing `charts/intraday`, `charts/historical`, `marketfeed/ltp`, `marketfeed/quote`, `optionchain`, `/v2/profile`, `generateAccessToken`, `RenewToken`, `api-scrip-master`, `niftyindices`, `GROWW_INSTRUMENT_CSV_URL`, `/v1/token`, `spot_1m_rest`, `option_chain_1m`, `v1/historical/candles`, `v1/option-chain`, `groww_spot_1m`, `groww_option_chain_1m`, `option_contract_1m_rest`, `v1/order/`, `order-advance`, `margins/detail`, `holdings/user`, `positions/user`, `v1/user/detail`, `groww_orders`, `GROWW_ORDER_LIVE_FIRE`, `oms/groww`, `broker_order_events`
 
 ---
 
@@ -209,7 +226,7 @@ patterns (the Dhan PR #1499 pattern, pending merge).
 | Endpoint | Scope (LOCKED) | Cadence | Destination table | Gate |
 |---|---|---|---|---|
 | `GET api.groww.in/v1/historical/candles` (spot) | 4 Groww spot indices ONLY (was 3; INDIA VIX added 2026-07-13 per `groww-second-feed-scope-2026-06-19.md` §38.7 — runtime-resolved from the day's Groww master, SPOT ONLY): `NSE-NIFTY` / `NSE-BANKNIFTY` / `BSE-SENSEX` + the resolved INDIA VIX groww_symbol, segment CASH; `candle_interval="1minute"`; day-granular window + client-side minute filter; `Authorization: Bearer <shared-minter SSM read-only token>` + `x-api-version: 1.0` | once per minute close, [09:15, 15:30) IST trading days, + one bounded 15:31 sweep (the Dhan PR #1499 pattern, pending merge) | `spot_1m_rest` ONLY, `feed='groww'` (never `ticks`/`candles_*`/`historical_candles`) | `[groww_spot_1m]` config, serde default OFF, base.toml opts in |
-| `GET api.groww.in/v1/option-chain/exchange/{e}/underlying/{u}?expiry_date=...` | the SAME 3 underlyings, CURRENT (nearest ≥ today) expiry only, from the already-ingested Groww instruments CSV | once per minute, SEQUENCED after the Groww spot fetch; own min-gap pacing | `option_chain_1m` ONLY, `feed='groww'` | `[groww_option_chain_1m]` config — **DEFAULT-OFF** pending first-live-session verification + a dated note; **flipped ON in base.toml 2026-07-13 after the live probe PASSED (§38.6 of the groww-scope file; the serde DEFAULT stays OFF)** |
+| `GET api.groww.in/v1/option-chain/exchange/{e}/underlying/{u}?expiry_date=...` | the SAME 3 underlyings, CURRENT (nearest ≥ today) expiry only, from the already-ingested Groww instruments CSV | ~~once per minute, SEQUENCED after the Groww spot fetch; own min-gap pacing~~ **SUPERSEDED 2026-07-14 by the §9.7 auto-ladder:** once per minute on the chain leg's OWN minute-boundary timer (close + 300 ms), the 3 underlyings CONCURRENT within the wave (min-gap deleted) | `option_chain_1m` ONLY, `feed='groww'` | `[groww_option_chain_1m]` config — **DEFAULT-OFF** pending first-live-session verification + a dated note; **flipped ON in base.toml 2026-07-13 after the live probe PASSED (§38.6 of the groww-scope file; the serde DEFAULT stays OFF)** |
 | `GET api.groww.in/v1/historical/candles` (contracts) | a BOUNDED selected set of active option contracts (`segment=FNO`, `groww_symbol` like `NSE-NIFTY-04Jan24-19200-CE`; envelope cap per minute; selection fed by the chain snapshot / instruments master) | once per minute, after the chain leg | NEW `option_contract_1m_rest` ONLY (`feed` in DEDUP key; retention registered) | config-gated, serde default OFF |
 
 ## §9.3 Honest envelope (mandatory per operator-charter §F)
@@ -241,6 +258,27 @@ patterns (the Dhan PR #1499 pattern, pending merge).
 - Cold-path only; zero hot-path involvement; zero new WebSocket; token READ-ONLY from SSM
   (never minted — `groww-shared-token-minter-2026-07-02.md`); §28 indicators/strategies
   boundary untouched.
+- **Burst arithmetic (2026-07-14 auto-ladder — supersedes the "≤6 req/s" pacing line
+  above for the Groww legs; full contract in §9.7; numbers RECOMPUTED the same day for
+  the fix-round HIGH-1 rung jitter):** the shipped `two_wave` tier bursts ≤ 4 req/s at
+  the boundary (3 chain at close+300 ms, 4 spot at close+1,350 ms — the 1,050 ms wave
+  separation keeps every rolling second single-wave, and both legs compute the wake from
+  the MILLISECOND clock so the separation holds exactly — fix-round CRITICAL-1; the
+  original whole-second else-branch could collapse it to ~51 ms); the probe-gated
+  `seven_concurrent` tier bursts 7 req/s. Each spot target's re-poll rung schedule is
+  jittered by slot × 150 ms in ALL tiers (fix-round HIGH-1 — the Dhan-leg precedent), so
+  the honest vendor-lag worst case (jittered rung stragglers inside one rolling second)
+  is 6 req/s solo for the rungs, 8 with the contract leg's 2/s (pre-jitter: 8 and 10 —
+  AT the ceiling), and 9 for the seven tier's initial-wave-plus-rungs (pre-jitter 11,
+  above the ceiling) — all const-asserted; still zero margin over the assumed BruteX
+  ~3/s co-tenancy, which is why any live 429 AUTO-DEMOTES the tier down the §9.7(3)
+  ladder (one coded warn per level + `tv_groww_rest_burst_demoted_total{level}`), never
+  out-polled. LOW-2 honest note (same fix round): the contract leg now starts ~2–6 s
+  earlier than pre-Stage-1 (the chain leg completes faster), so its 2/s stream stacks
+  INSIDE the spot rung windows — counted inside the solo const-assert, zero co-tenant
+  margin beyond it, accepted by design. Per-minute totals stay ≤ 55 (30 contract + 20
+  spot + 3 chain + 2 warm-up) ≈ 18% of the 300/min budget — const-asserted in
+  `crates/common/src/constants.rs`.
 - **Decision-freshness gate (2026-07-13, recorded with PR-4 — the operator's verbatim
   intent: "we cannot rely on backfill — within the particular second or few seconds it
   should definitely be pulled for TRADING DECISIONS; we need precise filling"):**
@@ -292,11 +330,167 @@ Covered by the §6 trigger list (extended 2026-07-13 with the `groww_spot_1m` /
 `groww_option_chain_1m` / `option_contract_1m_rest` / `v1/historical/candles` /
 `v1/option-chain` strings and the §9 module paths).
 
+## §9.7 — 2026-07-14: rate-safe AUTO-LADDER replaces the sequenced-after-spot cadence (dated amendment)
+
+**Operator authorization (2026-07-14, relayed verbatim via the coordinator
+session):** *"approved and go ahead with the recommendation"* — the
+recommendation being the rate-safe auto-ladder rebuild of the per-minute Groww
+REST legs so worst-case DECISION data lands < 5 s after minute close, with the
+operator's stated preference for the 7-concurrent burst held PROBE-GATED
+behind the off-hours rate probe (the shipped default is the safer two-wave
+shape).
+
+**What changes (the §9.1/§9.2 "sequenced after the Groww spot fetch" +
+"own min-gap pacing" cadence contract is SUPERSEDED for the Groww legs):**
+
+1. **Self-imposed pacing DELETED.** The chain leg no longer waits for the
+   spot leg's minute-done signal nor the 2.5 s fallback timer — it fires on
+   its OWN minute-boundary timer; the 1,000 ms inter-underlying chain min-gap
+   is deleted; the spot targets fetch CONCURRENTLY instead of sequentially.
+   (~4.5 s of self-imposed latency removed; measured chain round-trip is
+   ~0.2 s per the 2026-07-13 live probe.)
+2. **Two burst tiers (`[groww_rest_burst] tier`):**
+   - `two_wave` (the SHIPPED default; serde default too): 3 chain requests
+     concurrently at close + 300 ms; 4 spot requests concurrently at
+     close + 1,350 ms. The 1,050 ms wave separation keeps every rolling
+     1-second window single-wave ⇒ boundary burst ≤ 4 req/s.
+   - `seven_concurrent` (the operator preference — PROBE-GATED, never the
+     default): all 7 requests concurrently at close + 300 ms (7/10 of the
+     documented ceiling solo; zero margin at the assumed BruteX ~3/s
+     co-tenancy anchor). Promotion = a config flip + a fresh dated note HERE
+     after the §9.7(5) probe passes.
+3. **AUTO-DEMOTE (a LADDER since the same-day fix round — review
+   MEDIUM-1):** any HTTP 429 on any Groww REST leg (spot / chain /
+   contract) steps the session ONE shape down
+   `seven_concurrent → two_wave → two_wave + 350 ms intra-wave stagger →
+   fully-sequential-within-wave` (the sequential floor spaces wave slots
+   a whole per-slot hard budget apart — the pre-Stage-1 one-at-a-time
+   pacing shape; a 429 at the floor is a no-op). One coded warn per
+   demotion LEVEL (SPOT1M-01 / CHAIN-02 `stage="burst_demoted"` — no new
+   ErrorCode variants) + `tv_groww_rest_burst_demoted_total{level}`; boot
+   resets to the configured tier.
+4. **WARM-UP (`[groww_rest_burst] warm_up`, base.toml ON):** at minute
+   boundary − 4 s each leg sends ONE lightweight UNAUTHENTICATED GET on its
+   own client (response discarded; the 401/400 still re-establishes an
+   idle-closed TLS/H2 connection before the critical window), bounded by its
+   own 3 s timeout so a fire can never start late. ≤ 2 requests in a second
+   that never overlaps the waves — counted in the budget arithmetic.
+5. **OFF-HOURS RATE PROBE (env-gated `TICKVAULT_GROWW_RATE_PROBE=1`, default
+   OFF — OPERATOR-TRIGGERED, never scheduled):** escalating bursts
+   4 → 6 → 8 → 11 req/s (one second each, ~10 s pause between steps, max 2
+   rounds, ~58 requests total) against the granted candles endpoint;
+   REFUSED inside the [08:30, 16:00) IST wall-clock blackout window on ANY
+   day — trading day or not (same-day fix round, SECURITY-MEDIUM: the
+   original `trading_day && [09:00, 15:35)` gate depended solely on the
+   trading calendar, so a stale holiday list could fire the burst
+   mid-session; the unconditional wall-clock window has no calendar lookup
+   to fail-open on). CO-TENANCY (review MEDIUM-2): BruteX's bulk pulls are
+   nightly/post-market (§9.3) and the blackout cannot see BruteX's
+   schedule — the operator MUST coordinate the probe run with BruteX's
+   nightly window before arming the env var. Per-step 429 count + latency
+   as structured log lines + counters; writes NO data tables. Its verdict
+   is the ONLY gate that can promote `seven_concurrent`. (The probe's
+   11 req/s top step over-tests: with the fix-round rung jitter the
+   seven-tier lag-worst shape is 9 req/s — the 11 step is kept as
+   deliberate margin.)
+6. **What does NOT change:** the KEEP endpoints, destination tables, DEDUP
+   keys, token discipline (SSM read-only, never minted), the bounded spot
+   re-poll ladder + backfill + 15:31 sweep (never-skip capture is a hard
+   constraint — rungs landing after the decision window are record-only),
+   the per-leg escalation edges, the Dhan legs (completely untouched), the
+   chain→contract sequencing, and the §38.8 decision-freshness gate.
+   Timeouts TIGHTEN: chain 10 s → 4.5 s, spot 5 s → 3.5 s (per-leg budgets
+   re-derived and const-asserted).
+
 ---
 
-# §10 — 2026-07-14 operator re-assertion: Dhan spot-1m + option-chain REST are ENABLED classes
+# §10. Groww ORDER-SIDE REST/WS — gated KEEP class (operator authorization 2026-07-14)
 
-## §10.0 The verbatim operator quotes (preserve exactly, do not paraphrase — expletives included)
+## §10.0 The verbatim operator authorization (2026-07-14 — preserve exactly)
+
+**Operative authorization — the operator's DIRECT dated in-thread confirmation (2026-07-14, typed by Parthiban into this session's thread, event `321350d4-cf70-4a1c-88fc-36584527c8fd`), verbatim:**
+
+> "confirm — apply the Groww order scope-unlock PR-0. Build only, behind the OFF switch, no live orders"
+
+**Originating build directive (same day, relayed verbatim via the coordinator session):**
+
+> "build design architect and even integrate everything entirely… only when I turn on/off or enable live orders then live orders should be placed."
+
+## §10.1 The grant — one paragraph
+
+The market-data-only ban of §1/§2 is NARROWLY extended to authorize the Groww
+ORDER-SIDE surface — but ONLY behind the 4-gate live-fire lattice of
+`groww-second-feed-scope-2026-06-19.md` §39. NO Groww quote/LTP REST pull is
+authorized (that stays BANNED — §3 REMOVE class); NO bulk historical/backtest
+fetch is authorized (§33 stands). Order MUTATIONS (create/modify/cancel, smart
+orders) are HARD-LOCKED until the operator's explicit future dated live-orders
+enable (§39.2 Gates 1–4 all aligned). Order-side READ-ONLY GETs (order/trade
+list+detail+status, positions, holdings, margins, user profile) are per-area
+config-gated DEFAULT-OFF + market-hours-only — the cold-path scheduled-read
+discipline, no order placed. The order-update / position-update WS subscriptions
+ride the EXISTING single Groww feed connection (no new connection). All calls
+carry the shared-minter SSM READ-ONLY token (never mint — token-minter lock
+2026-07-02). Cold-path only; the tick hot path + the live feed + the §8/§9 REST
+legs are untouched.
+
+## §10.2 KEEP-GATED endpoint table (all gated per §39.2 — nothing runs by default)
+
+| Endpoint / function | Transport | Class | Verdict |
+|---|---|---|---|
+| `POST /v1/order/create` · `/modify` · `/cancel` | REST | order MUTATION | **KEEP-GATED** — operator-live-orders-enable-ONLY (Gates 1–4; `GROWW_ORDER_LIVE_FIRE` false) |
+| `/v1/order-advance/create` · `/modify/{id}` · `/cancel/{...}` (smart orders) | REST | order MUTATION | **KEEP-GATED** — operator-live-orders-enable-ONLY |
+| `GET /v1/order/list` · `/detail/{id}` · `/status/{id}` · `/status/reference/{ref}` · `/trades/{id}` | REST | order-side READ | **KEEP-GATED** — `[groww_orders] orders_read`, default-OFF + market-hours-only |
+| `GET /v1/positions/user` · `/positions/trading-symbol` | REST | portfolio READ | **KEEP-GATED** — `[groww_orders] portfolio_read`, default-OFF + market-hours-only |
+| `GET /v1/holdings/user` | REST | portfolio READ | **KEEP-GATED** — `[groww_orders] portfolio_read`, default-OFF + market-hours-only |
+| `GET /v1/margins/detail/user` · `POST /v1/margins/detail/orders` (margin calculator) | REST | margin READ | **KEEP-GATED** — `[groww_orders] margin_read`, default-OFF + market-hours-only |
+| `GET /v1/user/detail` | REST | user READ | **KEEP-GATED** — `[groww_orders] user_read`, default-OFF + market-hours-only |
+| order-update WS (`subscribe_equity_order_updates` / `subscribe_fno_order_updates`) + `subscribe_fno_position_updates` (on the EXISTING feed connection) | WS | order/position update stream | **KEEP-GATED** — gated with the order-side (no new connection) |
+
+## §10.3 What a violating PR looks like (REJECT)
+
+- ANY Groww order-side call site OUTSIDE `crates/trading/src/oms/groww/` or not
+  behind the 4-gate lattice (§39.2 / Gate 5).
+- ANY Groww quote/LTP REST pull — stays BANNED (§3 REMOVE class; §1/§2).
+- ANY bulk Groww historical/backtest fetch — stays BANNED (§33).
+- A Groww MUTATING order request while any of Gates 1–3 is unaligned.
+- Minting a Groww token, caching one past an auth failure, or reading the
+  credential params (token-minter lock 2026-07-02).
+- Flipping a read-only gate ON without market-hours gating, or DEFAULT-ON, or a
+  live-fire gate without a fresh dated quote editing §39 + §10 first.
+
+Any such PR MUST be rejected in review even if the operator approves verbally —
+the operator must update THIS §10 first with a fresh dated quote.
+
+## §10.4 Honest envelope (mandatory per operator-charter §F)
+
+> "The order-side ships DARK behind §39's four build-failure-ratcheted gates —
+> a default build has no Groww order code and no request fires until a dated
+> operator enable. Read-only GETs are market-hours-gated and place no order.
+> NOT claimed: live Groww order behaviour (PAPER-MODE tested vs
+> `docs/groww-ref/16` only, UNVERIFIED-LIVE) or that our key carries order
+> ENTITLEMENT (UNPROBED). Quote/LTP REST + bulk history stay banned."
+
+## §10.5 Auto-driver / Insta-reel explanation
+
+> Sir, the "no price-phone-calls" rule still holds — no ringing Groww to ask a
+> price. NEW: we may build an ORDERING desk with a four-lock safe on the "place
+> order" button. Reading the order book / holdings / margin is allowed but ONLY
+> during shop hours and ONLY when that little switch is on. The real "place a
+> live order" button stays behind all four locks until you, on a dated day, open
+> them yourself.
+
+## §10.6 Trigger (auto-loaded)
+
+Covered by the §6 trigger list (extended 2026-07-14 with `v1/order/`,
+`order-advance`, `margins/detail`, `holdings/user`, `positions/user`,
+`v1/user/detail`, `groww_orders`, `GROWW_ORDER_LIVE_FIRE`, `oms/groww`, and the
+`broker_order_events` seam).
+
+---
+
+# §11 — 2026-07-14 operator re-assertion: Dhan spot-1m + option-chain REST are ENABLED classes
+
+## §11.0 The verbatim operator quotes (preserve exactly, do not paraphrase — expletives included)
 
 **Quote 1 (2026-07-14, verbatim):**
 > "dhan option chain should be enabled why the fuck this is disabled ... only live feed is disabled"
@@ -304,7 +498,7 @@ Covered by the §6 trigger list (extended 2026-07-13 with the `groww_spot_1m` /
 **Quote 2 (2026-07-14, verbatim):**
 > "market feed ... it should be clearly historical data api for spot 1m"
 
-## §10.1 The re-assertion — one paragraph
+## §11.1 The re-assertion — one paragraph
 
 `POST /v2/charts/intraday` (interval `"1"` — the spot-1m leg) and
 `POST /v2/optionchain` (+ `POST /v2/optionchain/expirylist`) are **KEEP /
@@ -316,7 +510,7 @@ misread as "these endpoints are disabled". The §3 rows already carry the
 re-authorization annotations; this section is the dated, quote-backed record
 that they are ENABLED classes, permanently.
 
-## §10.2 The factual config truth (Verified, 2026-07-14)
+## §11.2 The factual config truth (Verified, 2026-07-14)
 
 - **Both legs are `enabled = true` in `config/base.toml` and running in
   prod** — `[spot_1m_rest]` (the §8 spot half) and `[option_chain_1m]`
@@ -332,7 +526,16 @@ that they are ENABLED classes, permanently.
   2026-07-14 empty-class split + one-shot probes). A vendor not serving
   data is a measured degrade, never a reason to call the leg "disabled".
 
-## §10.3 What stays REMOVED (explicit, per Quote 2)
+**2026-07-17 truth-sync:** the statement above ('Both legs are enabled = true
+in config/base.toml and running in prod') describes the pre-cadence state. As
+of 2026-07-17 the four legacy per-minute leg sections are `enabled = false` in
+base.toml and the SAME pulls fire from the cadence scheduler lane
+(`[cadence] enabled = true`, real broker executors — see
+`cadence-error-codes.md` §0c). Endpoints, SIDs, tables, DEDUP keys and budgets
+are unchanged; only the fire-timing owner moved. The §8/§9 grants continue to
+govern the cadence executors' calls.
+
+## §11.3 What stays REMOVED (explicit, per Quote 2)
 
 **`POST /v2/marketfeed/quote` and `POST /v2/marketfeed/ltp` REMAIN REMOVED**
 (the §3 REMOVE row stands). Per Quote 2, the spot-1m data source is
@@ -341,17 +544,20 @@ that they are ENABLED classes, permanently.
 quote endpoints (Quote-API 1/sec bucket). Re-adding a marketfeed caller
 requires a fresh dated quote HERE first.
 
-## §10.4 Cross-references + honest envelope
+## §11.4 Cross-references + honest envelope
 
 Consistent with `dhan-rest-only-noise-lock-2026-07-14.md` §1 (same-day
 operator lock: "for Dhan except spot 1m and option chain nothing else should
 work") and with this PR's cross-source-chain-coverage rule. Honest envelope:
 this section changes ZERO code and ZERO config — it is the dated record that
 the two legs are authorized + enabled; whether Dhan actually SERVES same-day
-intraday candles remains the open vendor-side question the §10.2 probes
+intraday candles remains the open vendor-side question the §11.2 probes
 measure (the chain leg is serving normally — 735/735 on 2026-07-14).
 
-## §10.5 Trigger (auto-loaded)
+## §11.5 Trigger (auto-loaded)
 
 Covered by the §6 trigger list (the `charts/intraday`, `optionchain`,
 `spot_1m_rest`, `option_chain_1m` strings already activate this file).
+(2026-07-16, operator directive events 38df2073 + 157f7cd0) SUPERSEDED wording: "on the existing feed connection (no new connection)" predates the 2026-07-15 Groww live-feed retirement. There is no live Groww feed connection anymore, so the authorized order/position/trade PUSH channel opens ONE NEW dedicated NATS-over-WS connection (`wss://socket-api.groww.in`, order/position/trade events only). Config `order_push_enabled`, module `oms/groww/push/`, codes GROWW-PUSH-01..04.
+
+(2026-07-16) RE-KEPT as live-feed-AUTH class for the order-push channel — `POST api.groww.in/v1/api/apex/v1/socket/token/create/` mints the per-session NATS user JWT the order channel needs (operator: "use the socket-token the Groww channel needs"). The ACCESS-token minter lock (groww-shared-token-minter-2026-07-02.md) is UNTOUCHED: the access token stays SSM read-only, never minted by TickVault.

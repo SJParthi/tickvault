@@ -1529,38 +1529,9 @@ mod tests {
              main.rs site (the PROCESS-GLOBAL boot prefix — PR-D fix round \
              1, 2026-07-11); found {init_sites}."
         );
-        // Source-order pin (PR-D fix round 1, review HIGH — the
-        // ratchet_tick_processor_spawns_before_reinject_await pattern):
-        // init is a GLOBAL.get() gate, so it MUST precede the Groww
-        // activation watcher spawn — a registration ordered before init is
-        // silently skipped, and a half-registered registry drains a false
-        // one-sided daily verdict at 15:45.
-        // (PR-C2, 2026-07-13: the `load_instruments` ordering pin retired —
-        // the Dhan instrument loader was deleted with the live-WS lane, so
-        // the Groww activation watcher is the only surviving registration
-        // producer.)
-        // Positions are computed over COMMENT-STRIPPED source (PR-D review
-        // round 2, LOW — the vacuous-ratchet class): a raw str::find could
-        // resolve to a future comment citing a needle literal and satisfy
-        // the ordering assertions vacuously; use the same line filter the
-        // count check above uses.
-        let stripped: String = main_rs
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let init_pos = stripped
-            .find(init_needle)
-            .expect("init_feed_presence site present");
-        let watcher_pos = stripped
-            .find("run_groww_activation_watcher(")
-            .expect("Groww activation watcher spawn present");
-        assert!(
-            init_pos < watcher_pos,
-            "init_feed_presence must precede the run_groww_activation_watcher \
-             spawn (init at stripped byte {init_pos}, watcher at \
-             {watcher_pos})"
-        );
+        // (2026-07-15 Groww live-feed deletion: the run_groww_activation_watcher
+        // ordering pin retired with the watcher — init_feed_presence remains
+        // the single process-global-prefix site pinned by the count above.)
         assert!(
             main_rs.contains("feed_presence::reset_daily("),
             "the main.rs IST-midnight task must reset the Dhan presence \
@@ -1575,94 +1546,8 @@ mod tests {
     // "2026-07-13 Amendment" §B): test_feed_lag_publisher_supervisor_is_wired_into_main died with the machinery it pinned
     // — the Dhan exchange-lag publisher (tv_dhan_exchange_lag_p99_seconds)
     // retired with the Dhan live feed — no Dhan ticks exist to measure. The
-    // surviving GROWW lag publisher keeps its own guard
-    // (`test_groww_lag_publisher_supervisor_is_wired_into_main`).
-
-    /// Scoreboard PR-C (2026-07-11): the GROWW exchange-lag p99 publisher
-    /// (`tv_groww_exchange_lag_p99_seconds`) MUST be spawned via its
-    /// supervisor from the PROCESS-GLOBAL boot prefix — one call site that
-    /// runs on EVERY boot mode (unlike the Dhan publisher's fast/slow
-    /// dual-arm wiring, the Groww bridge block executes before the boot
-    /// fork). A bare `tokio::spawn` or a dropped spawn regresses the SLO-03
-    /// silent-task-death class: the gauge stream stops with no error!, no
-    /// counter, no respawn, and the groww lag alarm false-OKs on missing
-    /// data (`notBreaching`).
-    #[test]
-    fn test_groww_lag_publisher_supervisor_is_wired_into_main() {
-        let main_rs = std::fs::read_to_string("../app/src/main.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
-            .expect("main.rs must be readable");
-        let supervisor_call_sites = main_rs
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//")
-                    && !t.starts_with("///")
-                    && !t.contains("fn spawn_supervised_groww_lag_publisher")
-                    && t.contains("spawn_supervised_groww_lag_publisher(")
-            })
-            .count();
-        assert_eq!(
-            supervisor_call_sites, 1,
-            "spawn_supervised_groww_lag_publisher must have EXACTLY 1 call \
-             site in main.rs (the process-global boot prefix, next to the \
-             Groww bridge supervisor); found {supervisor_call_sites}. \
-             Removing it silently darkens the groww lag gauge for every \
-             session (notBreaching on missing data)."
-        );
-        // The supervisor must be the ONLY spawn path for the publisher loop.
-        let inner_call_sites = main_rs
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//")
-                    && !t.starts_with("///")
-                    && t.contains("run_groww_lag_publisher(")
-            })
-            .count();
-        assert_eq!(
-            inner_call_sites, 1,
-            "run_groww_lag_publisher must be called ONLY from the groww \
-             feed-lag supervisor loop (found {inner_call_sites} non-comment \
-             mentions; expected exactly 1: the supervisor call site)"
-        );
-    }
-
-    /// Session-B fix #1 (operator go 2026-07-04): the Groww scale-FLEET
-    /// spawn in `main.rs` MUST be gated by the fleet dual-instance SSM lock
-    /// (`acquire_groww_scale_fleet_lock`). A scale-test boot runs
-    /// `dhan_enabled=false` and never reaches the Dhan RESILIENCE-01 lock,
-    /// so removing this gate silently re-opens the class where two hosts
-    /// (Mac + AWS, or two Macs) scale the SAME Groww account simultaneously
-    /// and the failure masquerades as provider throttle (GROWW-SCALE-05).
-    #[test]
-    fn test_groww_scale_fleet_lock_is_wired_into_main() {
-        let main_rs = std::fs::read_to_string("../app/src/main.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
-            .expect("main.rs must be readable");
-        assert!(
-            main_rs.contains("acquire_groww_scale_fleet_lock("),
-            "main.rs MUST gate the Groww scale-fleet spawn behind \
-             `groww_scale_lock::acquire_groww_scale_fleet_lock` \
-             (GROWW-SCALE-05, Session-B fix 2026-07-04). Without it, two \
-             tickvault instances can scale the SAME Groww account and the \
-             failure masquerades as provider throttle."
-        );
-        // The lock decision must happen BEFORE the fleet spawn in source
-        // order — gating after the spawn would be a false gate.
-        let lock_idx = main_rs
-            .find("acquire_groww_scale_fleet_lock(")
-            .expect("lock call site present (asserted above)");
-        let fleet_idx = main_rs
-            .find("spawn_groww_scale_fleet(")
-            .expect("main.rs must still spawn the scale fleet somewhere");
-        assert!(
-            lock_idx < fleet_idx,
-            "the fleet dual-instance lock must be acquired BEFORE \
-             spawn_groww_scale_fleet in main.rs source order \
-             (lock at byte {lock_idx}, fleet spawn at byte {fleet_idx})"
-        );
-    }
+    // Groww lag publisher + its guard retired 2026-07-15 with the Groww
+    // live feed (no Groww live ticks exist to measure).
 
     /// AUTH-GAP-05 (2026-07-06): the mid-session watchdog MUST carry the
     /// forced re-mint trigger — the pure `decide_remint` decision core AND

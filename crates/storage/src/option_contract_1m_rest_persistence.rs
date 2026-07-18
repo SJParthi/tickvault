@@ -44,7 +44,8 @@
 //!     underlying_symbol SYMBOL, leg SYMBOL, groww_symbol STRING,
 //!     expiry TIMESTAMP, strike DOUBLE,
 //!     open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
-//!     volume LONG, oi LONG, close_to_data_ms LONG, fetched_at TIMESTAMP
+//!     volume LONG, oi LONG, close_to_data_ms LONG, fetched_at TIMESTAMP,
+//!     underlying_spot DOUBLE, moneyness SYMBOL
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, exchange_segment, feed);
 //! ```
@@ -128,6 +129,18 @@ pub struct OptionContract1mRestRow {
     pub close_to_data_ms: i64,
     /// Retrieval wall-clock instant, IST nanoseconds.
     pub fetched_at_ist_nanos: i64,
+    /// The CHAIN leg's anchor LTP this row's moneyness was classified
+    /// against (0.0 = no fresh anchor — moneyness is then UNKNOWN). The
+    /// audit-recompute column: the contract table has no other spot field,
+    /// so a moneyness label without the spot it used would be un-auditable.
+    /// Anchor-relative (≤5-min staleness gate), NOT candle-minute-exact —
+    /// stated honestly per the §38.8 decision-freshness discipline.
+    pub underlying_spot: f64,
+    /// Write-time moneyness classification (`"ITM"`/`"ATM"`/`"OTM"`/
+    /// `"UNKNOWN"` — `tickvault_common::moneyness::Moneyness::as_str()`).
+    /// AUDIT MIRROR ONLY (operator directive 2026-07-14); NOT in the
+    /// DEDUP key (label column).
+    pub moneyness: &'static str,
 }
 
 /// The idempotent `CREATE TABLE` DDL for `option_contract_1m_rest`. Pure.
@@ -153,7 +166,9 @@ pub fn option_contract_1m_rest_create_ddl() -> String {
             volume            LONG, \
             oi                LONG, \
             close_to_data_ms  LONG, \
-            fetched_at        TIMESTAMP\
+            fetched_at        TIMESTAMP, \
+            underlying_spot   DOUBLE, \
+            moneyness         SYMBOL\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_OPTION_CONTRACT_1M_REST});"
     )
@@ -221,6 +236,15 @@ pub async fn ensure_option_contract_1m_rest_table(questdb_config: &QuestDbConfig
         ("oi", "LONG"),
         ("close_to_data_ms", "LONG"),
         ("fetched_at", "TIMESTAMP"),
+        // Moneyness classification (2026-07-14, operator directive relayed
+        // via the coordinator session): `underlying_spot` = the chain-leg
+        // anchor LTP the classification used (≤5-min staleness gate —
+        // anchor-relative, not candle-minute-exact, stated honestly);
+        // `moneyness` ∈ ITM/ATM/OTM/UNKNOWN. Both additive + nullable;
+        // earlier builds' rows stay NULL forever. NEITHER is in the DEDUP
+        // key (label columns).
+        ("underlying_spot", "DOUBLE"),
+        ("moneyness", "SYMBOL"),
     ] {
         statements.push(format!(
             "ALTER TABLE {OPTION_CONTRACT_1M_REST_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
@@ -366,6 +390,10 @@ impl OptionContract1mRestWriter {
             .context("underlying_symbol")?
             .symbol("leg", r.leg)
             .context("leg")?
+            // Moneyness audit-mirror stamp (2026-07-14) — a SYMBOL tag,
+            // before every `.column_*` (ILP tags-before-fields rule).
+            .symbol("moneyness", r.moneyness)
+            .context("moneyness")?
             .column_str("groww_symbol", r.groww_symbol.as_str())
             .context("groww_symbol")?
             .column_ts(
@@ -395,6 +423,10 @@ impl OptionContract1mRestWriter {
             .context("close_to_data_ms")?
             .column_ts("fetched_at", TimestampNanos::new(r.fetched_at_ist_nanos))
             .context("fetched_at")?
+            // The anchor spot the moneyness was classified against (0.0 =
+            // no fresh anchor → moneyness UNKNOWN) — audit recompute.
+            .column_f64("underlying_spot", r.underlying_spot)
+            .context("underlying_spot")?
             .at(TimestampNanos::new(r.ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
@@ -508,6 +540,9 @@ mod tests {
             oi: 3_412_500,
             close_to_data_ms: 1_842,
             fetched_at_ist_nanos: 1_770_000_961_842_000_000,
+            underlying_spot: 25_642.8,
+            // 25500 CE with the anchor spot above (strike < spot) — ITM.
+            moneyness: "ITM",
         }
     }
 
@@ -534,6 +569,8 @@ mod tests {
             "oi",
             "close_to_data_ms",
             "fetched_at",
+            "underlying_spot",
+            "moneyness",
         ] {
             assert!(ddl.contains(col), "DDL missing column {col:?}: {ddl}");
         }
@@ -620,6 +657,35 @@ mod tests {
             "latency column missing: {line}"
         );
         assert!(line.contains("volume=125450i"), "volume missing: {line}");
+    }
+
+    /// The 2026-07-14 moneyness audit-mirror stamp: `moneyness` is a
+    /// SYMBOL TAG (before the first field) and `underlying_spot` (the
+    /// anchor LTP the classification used) is a DOUBLE field — the
+    /// audit-recompute pair.
+    #[test]
+    fn test_contract1m_append_row_stamps_moneyness_and_underlying_spot() {
+        let mut w = OptionContract1mRestWriter::for_test();
+        w.append_row(&sample_row()).expect("append must succeed");
+        let line = w.buffer_utf8();
+        let tags = line.split(' ').next().unwrap_or_default();
+        assert!(
+            tags.contains(",moneyness=ITM"),
+            "moneyness must be an ILP TAG (before the first field): {line}"
+        );
+        assert!(
+            line.contains("underlying_spot=25642.8"),
+            "the anchor spot must land as a DOUBLE field: {line}"
+        );
+        // NEVER in the DEDUP key (label columns).
+        let has_token = |t: &str| {
+            DEDUP_KEY_OPTION_CONTRACT_1M_REST
+                .split([',', ' '])
+                .map(str::trim)
+                .any(|tok| tok == t)
+        };
+        assert!(!has_token("moneyness"));
+        assert!(!has_token("underlying_spot"));
     }
 
     #[test]

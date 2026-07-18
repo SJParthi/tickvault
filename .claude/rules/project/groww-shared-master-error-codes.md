@@ -5,7 +5,8 @@
 > `data-integrity.md` "feed-in-key EVERYWHERE" (operator override 2026-06-28) > this file.
 > **Companion code:** `crates/core/src/feed/groww/shared_master_writer.rs`,
 > `crates/common/src/error_code.rs::ErrorCode::GrowwMaster01PersistFailed`,
-> wired at the `Ok(set)` arm of `crates/app/src/groww_activation.rs`.
+> wired at the `Ok(set)` arm of `crates/app/src/groww_universe.rs` (the `[groww_universe]`
+> daily rider — re-homed 2026-07-15 from the deleted `groww_activation.rs` live-lane watcher).
 > **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs` requires this file to
 > mention every `GrowwMaster01*` variant verbatim — `GROWW-MASTER-01` appears below.
 
@@ -104,7 +105,9 @@ delete-marker operator procedure) could re-TRUNCATE behind a permanently-green g
    spawned BEFORE the Groww activation watcher and regardless of `feeds.dhan_enabled` — a quiet
    12×5s QuestDB readiness probe (never BOOT-01/02 pages) then the gate-aware migration, marking
    the gate within ~75s worst case, inside the 120s wait, on EVERY boot mode. Ratchet:
-   `ratchet_ts_pin_migration_spawns_before_groww_watcher` (main.rs source-order scan) +
+   `ratchet_ts_pin_migration_spawns_before_groww_universe_rider` (renamed 2026-07-15 from
+   `…_before_groww_watcher` — the Groww activation watcher retired with the live feed;
+   source-order scan) +
    `test_ts_pin_readiness_constants_bound_inside_groww_gate_wait`.
 2. **In-process exactly-once wrapper (F15).** `MigrationGate` gained a `run_once`
    `tokio::sync::OnceCell` latch; `migrate_index_constituency_truncate_once_with_gate` executes
@@ -131,7 +134,9 @@ Groww activation, the live feed, or any order/tick path).
 (ILP/HTTP down, QuestDB unreachable, flush error, prior-snapshot read error). The `stage` label
 on `tv_groww_master_persist_errors_total` distinguishes `lifecycle` / `constituency` /
 `lifecycle_audit` (the 2026-06-29 audit-chain emit, which can fail on EITHER the prior-snapshot
-read OR the audit append) / `lifecycle_flip` (the 2026-07-05 disappearance state-flip below).
+read OR the audit append) / `lifecycle_flip` (the 2026-07-05 disappearance state-flip below) /
+`watch_build` (2026-07-15 — the daily rider's own `build_and_write_groww_watch` pull-until-success
+loop failing past 3 attempts; NO new ErrorCode variant).
 
 ### 2026-07-05 — lifecycle-integrity fixes (disappearance flip + first_seen preservation)
 
@@ -163,8 +168,12 @@ Three audit-confirmed gaps closed in one PR:
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — look for `GROWW-MASTER-01`; the payload carries the
-   `stage` (`lifecycle` / `constituency` / `lifecycle_audit` / `lifecycle_flip`) and the
-   error context.
+   `stage` (`lifecycle` / `constituency` / `lifecycle_audit` / `lifecycle_flip` /
+   `watch_build` / `task_respawn`) and the error context. `watch_build` = the daily watch-set
+   BUILD itself is failing (Groww master CSV / niftyindices fetch or parse — the rider keeps
+   retrying with capped backoff; spot-leg VIX resolution + master continuity degrade until it
+   succeeds); `task_respawn` = the supervised rider task died and was respawned
+   (`tv_groww_universe_respawn_total{reason}`).
 2. `tv_groww_master_persist_errors_total` rate non-zero → QuestDB ILP degraded; run
    `make doctor` (cross-check BOOT-01/BOOT-02 if it coincides with boot).
 3. The Groww live feed, the `ticks` table, and trading are UNAFFECTED — only the queryable
@@ -185,7 +194,8 @@ order placement, the Dhan master rows, or Groww feed activation.
 - Audit chain (2026-06-29): `shared_master_writer::emit_groww_lifecycle_audit` (audit-first §24) +
   the pure `build_groww_lifecycle_select_sql` / `parse_groww_lifecycle_dataset` / `groww_today_attrs`
   / `build_groww_audit_rows`, reusing `tickvault_storage::lifecycle_reconciler::classify_transition`.
-- Wiring: `crates/app/src/groww_activation.rs` (the watch-set `Ok(set)` arm).
+- Wiring: `crates/app/src/groww_universe.rs` (the watch-set `Ok(set)` arm of the daily rider —
+  re-homed 2026-07-15; the live-lane `groww_activation.rs` was deleted with the Groww live feed).
 
 ---
 

@@ -10,9 +10,10 @@
 //! If the two drift, a fresh instance selects a DIFFERENT metric set than a
 //! deployed one — an alarm can silently point at a metric that never reaches
 //! CloudWatch (false-OK class, audit-findings Rule 11). This guard fails the
-//! build on drift, on any of the three 2026-07-06 metric names disappearing,
-//! or on the two Groww feed-down alarms (or their output-list registrations)
-//! being removed from `app-alarms.tf`.
+//! build on drift, on the Trap-A liveness heartbeat
+//! (`tv_rest_1m_fire_heartbeat`, 2026-07-15 — the re-pointed market-hours
+//! liveness alarm's gauge) disappearing from the selector, or on any of the
+//! 4 retired Groww-live metric names sneaking back in.
 
 #![cfg(test)]
 
@@ -83,107 +84,42 @@ fn cw_agent_selector_copies_are_byte_identical() {
 }
 
 #[test]
-fn cw_agent_selector_ships_groww_feed_down_metrics() {
+fn cw_agent_selector_ships_heartbeat_and_drops_groww_live_metrics() {
+    // 2026-07-15 (Groww live-feed retirement, Trap-A lockstep): the selector
+    // must ship the re-pointed liveness alarm's heartbeat gauge and must NOT
+    // resurrect the 4 retired Groww-live names (a dead name in the EMF list
+    // implies coverage no producer can ever publish again).
     let root = repo_root();
     let live = extract_selector_regex(
         &read(&root.join("deploy/aws/cloudwatch-agent.json")),
         "deploy/aws/cloudwatch-agent.json",
     );
-    for name in [
+    assert!(
+        live.contains("tv_rest_1m_fire_heartbeat"),
+        "cw-agent metric_selectors must ship tv_rest_1m_fire_heartbeat — the \
+         market-hours liveness alarm (treat_missing_data=breaching) is blind \
+         without it (false-SOS ~09:25 IST daily)"
+    );
+    for retired in [
         "tv_groww_ws_active",
         "tv_feed_last_tick_age_seconds",
         "tv_feed_sidecar_stall_restart_total",
+        "tv_groww_exchange_lag_p99_seconds",
     ] {
         assert!(
-            live.contains(name),
-            "cw-agent metric_selectors must ship {name} (2026-07-06 groww feed-down \
-             alerting) — an alarm on a metric that never reaches CloudWatch is a \
-             false-OK"
+            !live.contains(retired),
+            "cw-agent metric_selectors resurrected retired Groww-live metric \
+             {retired} (producer deleted 2026-07-15 — a dead name implies \
+             coverage that can never be published again)"
         );
     }
 }
 
-#[test]
-fn groww_feed_down_alarms_exist_and_are_registered() {
-    let root = repo_root();
-    let tf = read(&root.join("deploy/aws/terraform/app-alarms.tf"));
-
-    // Alarm resources + their metric wiring.
-    for (resource, alarm_name, metric) in [
-        (
-            "resource \"aws_cloudwatch_metric_alarm\" \"groww_ws_inactive\"",
-            "tv-${var.environment}-groww-ws-inactive",
-            "tv_groww_ws_active",
-        ),
-        (
-            "resource \"aws_cloudwatch_metric_alarm\" \"groww_stall_restart_storm\"",
-            "tv-${var.environment}-groww-stall-restart-storm",
-            "tv_feed_sidecar_stall_restart_total",
-        ),
-    ] {
-        assert!(
-            tf.contains(resource),
-            "app-alarms.tf: missing {resource} (2026-07-06 groww feed-down alerting)"
-        );
-        assert!(
-            tf.contains(alarm_name),
-            "app-alarms.tf: missing alarm_name {alarm_name}"
-        );
-        assert!(
-            tf.contains(metric),
-            "app-alarms.tf: alarm must point at metric {metric}"
-        );
-    }
-
-    // Missing-data honesty: both alarms must never stick FIRING across the
-    // scheduled 16:30 IST box stop / weekends / deploy gaps.
-    // The scan is bounded at the resource block's OWN closing brace
-    // (2026-07-06 fix): a fixed byte window overran into the NEIGHBOR
-    // resource, whose identical `treat_missing_data` literal satisfied the
-    // assertion even after the alarm's own line was deleted (mutation-
-    // verified vacuous pass — terraform then defaults to "missing", the
-    // exact 2026-06-02 stuck-FIRING class this guard claims to prevent).
-    for block_name in ["groww_ws_inactive", "groww_stall_restart_storm"] {
-        let block = resource_block(&tf, block_name);
-        assert!(
-            block.contains("treat_missing_data  = \"notBreaching\""),
-            "app-alarms.tf: {block_name} must use treat_missing_data = notBreaching \
-             (the 2026-06-02 stuck-FIRING fix class)"
-        );
-    }
-
-    // Delta-semantics honesty (2026-07-06 fix): the CloudWatch agent's
-    // Prometheus/EMF pipeline DELTA-converts counter metrics (each datapoint
-    // is the per-scrape increase, never the cumulative count), so the storm
-    // alarm must aggregate with Sum over a window — a Maximum-vs-cumulative
-    // threshold >1 can NEVER fire on its documented condition and un-fires
-    // mid-storm once the in-process backoff throttles kills apart.
-    {
-        let block = resource_block(&tf, "groww_stall_restart_storm");
-        assert!(
-            block.contains("statistic           = \"Sum\""),
-            "app-alarms.tf: groww_stall_restart_storm must use statistic = Sum — \
-             the CW agent delta-converts Prometheus counters, so Maximum >= 3 \
-             never sees a cumulative count (behaviorally dead alarm)"
-        );
-        assert!(
-            !block.contains("\"Maximum\""),
-            "app-alarms.tf: groww_stall_restart_storm must NOT regress to Maximum \
-             on a delta-converted counter"
-        );
-    }
-
-    // Output-list registration (the operator-facing alarm inventory).
-    for entry in [
-        "aws_cloudwatch_metric_alarm.groww_ws_inactive.alarm_name",
-        "aws_cloudwatch_metric_alarm.groww_stall_restart_storm.alarm_name",
-    ] {
-        assert!(
-            tf.contains(entry),
-            "app-alarms.tf: {entry} must be registered in the app_cloudwatch_alarms output"
-        );
-    }
-}
+// RETIRED (2026-07-15 — Groww live-feed retirement):
+// groww_feed_down_alarms_exist_and_are_registered died with the two alarms
+// it pinned — groww_ws_inactive + groww_stall_restart_storm left
+// app-alarms.tf (their gauge/counter producers, the Groww bridge + sidecar
+// stall watchdog, were deleted; dated notes in app-alarms.tf).
 
 #[test]
 fn resource_block_extractor_is_bounded_at_own_closing_brace() {
@@ -194,7 +130,7 @@ fn resource_block_extractor_is_bounded_at_own_closing_brace() {
     // after the alarm's own lines were deleted.
     let root = repo_root();
     let tf = read(&root.join("deploy/aws/terraform/app-alarms.tf"));
-    for block_name in ["groww_ws_inactive", "groww_stall_restart_storm"] {
+    for block_name in ["questdb_disconnected", "disk_watcher_respawn"] {
         let block = resource_block(&tf, block_name);
         assert_eq!(
             block

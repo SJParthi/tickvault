@@ -1,5 +1,21 @@
 # Bounded WAL Frame Re-Injection — Error Codes (WS-REINJECT-01)
 
+> **⚠ RETIRED 2026-07-17 (dead live-WS sweep stage 1 — operator directive
+> 2026-07-17 via coordinator):** `crates/app/src/wal_reinject.rs` is DELETED.
+> Its own PR-C2 (2026-07-13) comments recorded it "retained un-consumed
+> pending the Phase C module cleanup" — both STAGE-C.2b re-injection call
+> sites died with the Dhan live-WS lane, and main.rs drains residual
+> LiveFeed WAL frames loudly at boot instead (counted +
+> `confirm_replayed`). The `ws-reinject-01` CloudWatch filter+alarm was
+> retired in the SAME PR (dated notes in `error-code-alarms.tf` +
+> `observability-architecture.md` "Retired paging entries") — a filter with
+> no possible emit site is a dead filter per the paging drift guard. The
+> `WsReinject01Aborted` ErrorCode variant and the `WAL_REINJECT_*`
+> constants are RETAINED pending the post-sibling-merge variant/constants
+> sweep (this file keeps satisfying the cross-ref test). The WAL floor
+> itself (`ws_frame_spill.rs`) is UNTOUCHED and load-bearing. Content
+> below retained as historical audit.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F > this file.
 > **Companion code:** `crates/app/src/wal_reinject.rs` (`reinject_wal_frames` /
 > `ReinjectOutcome`), the two STAGE-C.2b call sites in `crates/app/src/main.rs`
@@ -158,6 +174,24 @@ WAL floor (they would exist only in whatever the persistence chain absorbed
 before the crash). This window is identical before and after the C3 change;
 tracked as a follow-up (confirm-on-persist would need a
 consumer-side acknowledgement watermark).
+
+---
+
+## §1.5. 2026-07-14 Update — the planned `confirm_deferred_stale_livefeed` defer arm was CUT (socket-free re-scope)
+
+The dry-run order runtime PR originally added a THIRD confirm site — the
+dhan-OFF REST stack draining boot-staged ORDER-UPDATE WAL frames into its
+broadcast with a conditional confirm (defer reason
+`confirm_deferred_stale_livefeed`, warn-level). That whole drain/confirm leg
+was CUT at the merge with the same-day operator Dhan noise lock
+(`dhan-rest-only-noise-lock-2026-07-14.md` §3 — the stack opens no
+order-update socket and touches no order-update WAL). The boot-staged
+order-update segments therefore remain the documented Phase-A residual on
+dhan-off boots (undrained in `replaying/`, zero loss, re-globbed each boot)
+until the gated live re-arm restores the socket + WAL capture + drain in
+one quoted follow-up unit. The §1 abort semantics (`channel_closed` /
+`send_timeout`, error-level, paging) are UNCHANGED; no new reason string
+exists in code today.
 
 ---
 

@@ -59,19 +59,14 @@ criterion = { workspace = true }
 dhat = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
-# full_tick_processing bench only: install the SAME recorder family
-# production uses (workspace-pinned, already a crates/app dependency) so
-# per-tick counter/histogram costs are measured against real registry
-# atomics, not the no-op recorder.
-metrics-exporter-prometheus = { workspace = true }
 
 [[bench]]
 name = "tick_parser"
 harness = false
 
-[[bench]]
-name = "full_tick_processing"
-harness = false
+# [[bench]] full_tick_processing removed in the stage-2 dead-WS sweep
+# (2026-07-17) with the deleted tick chain (tick_processor/tick_enricher —
+# the composite quote-tick chain it measured no longer exists).
 
 [[bench]]
 name = "pipeline"
@@ -89,16 +84,15 @@ harness = false
 name = "ws_reader_frame_handle"
 harness = false
 
-[[bench]]
-name = "prev_close_writer"
-harness = false
+# [[bench]] prev_close_writer removed in the stage-2 dead-WS sweep
+# (2026-07-17) with the deleted pipeline/prev_close_writer.rs module.
 
 # [[bench]] tick_gap_detector removed in PR-C3 (2026-07-14) with the
 # deleted tick-gap detector module (operator Q4-ii 2026-07-13).
 
-[[bench]]
-name = "slo_score"
-harness = false
+# [[bench]] slo_score removed in the C4 sweep (2026-07-15) with the deleted
+# slo_score.rs contract stub + the SLO-01/02/03 variants (wave-3-d PARK
+# banner: "Phase C variant cleanup").
 
 [[bench]]
 name = "feed_lag_ring"
@@ -106,6 +100,10 @@ harness = false
 
 [[bench]]
 name = "feed_presence"
+harness = false
+
+[[bench]]
+name = "moneyness"
 harness = false
 
 # PR-C3 (2026-07-14): the `ntm_subscription_proof` example entry was deleted

@@ -175,6 +175,23 @@ rules:
       auto-reset — the operator must diagnose whether the underlying
       issue is authentication, rate limiting, or a bad order payload.
 
+  # -----------------------------------------------------------------------
+  # Cluster B — live order refused by the fail-closed order-readiness gate
+  # -----------------------------------------------------------------------
+
+  - name: order-ready-01-gate-refused-escalate
+    match:
+      code: ORDER-READY-01
+    action: escalate
+    runbook_path: .claude/rules/project/order-readiness-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      A live order was refused by the fail-closed readiness gate (no probe,
+      stale probe, invalid Dhan dataPlan/segment, or low token headroom).
+      Never auto-action — the operator must confirm the Dhan data plan,
+      Derivative segment and token before orders are re-enabled.
+
   # =======================================================================
   # MILESTONE 2 — full ErrorCode coverage (48 new rules, total 54 codes)
   #
@@ -738,79 +755,20 @@ rules:
       until the next market open. Replaces the legacy give-up path.
       Silence daily; only the Resumed event needs operator visibility.
 
-  - name: ws-gap-05-pool-respawn-escalate
-    match:
-      code: WS-GAP-05
-    action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 60
-    justification: >-
-      WS-GAP-05 means the pool supervisor respawned a dead task.
-      Single respawn is recoverable; sustained rate >1/min for 5min
-      = cascading failure. Escalate so operator can correlate.
+  # C4 sweep (2026-07-15): rule `ws-gap-05-pool-respawn-escalate` retired — the WS-GAP-05 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: ws-gap-06-tick-gap-summary-silence
-    match:
-      code: WS-GAP-06
-    action: silence
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 60
-    justification: >-
-      WS-GAP-06 is the 60s coalesced tick-gap summary. Telegram
-      already routes the summary event; the JSONL entry is for
-      audit only. Silence (cooldown matches the 60s coalesce window).
+  # C4 sweep (2026-07-15): rule `ws-gap-06-tick-gap-summary-silence` retired — the WS-GAP-06 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: ws-gap-07-live-channel-closed-escalate
-    match:
-      code: WS-GAP-07
-    action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 300
-    justification: >-
-      WS-GAP-07 = the live-feed frame channel's receiver was dropped — the
-      tick-processing consumer died, so no ticks reach the pipeline from this
-      connection until the app restarts. High severity; the pool supervisor
-      (WS-GAP-05) respawns the connection task but cannot resurrect a dead
-      consumer. Escalate (Telegram + draft Issue) so the operator restarts
-      the app per the runbook.
+  # C4 sweep (2026-07-15): rule `ws-gap-07-live-channel-closed-escalate` retired — the WS-GAP-07 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: ws-gap-08-rate-limit-cooldown-silence
-    match:
-      code: WS-GAP-08
-    action: silence
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 300
-    justification: >-
-      WS-GAP-08 is the persisted Dhan 429 rate-limit cooldown. The common
-      case is the boot-time wait (info!) — the system correctly waiting out
-      a real Dhan rate-limit before the first WS connect, which BREAKS the
-      instant-429 restart loop. It is Low severity, fail-open, and bounded
-      at 5 minutes, so no operator action is needed. The rarer persist-write
-      failure is best-effort (in-memory streak still applies). Silence;
-      sustained recurrence is visible via tv_ws_rate_limit_cooldown_waited_total.
+  # C4 sweep (2026-07-15): rule `ws-gap-08-rate-limit-cooldown-silence` retired — the WS-GAP-08 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: ws-gap-09-watchdog-reconnect-in-place-silence
-    match:
-      code: WS-GAP-09
-    action: silence
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 300
-    justification: >-
-      WS-GAP-09 is the pool watchdog reconnecting IN PLACE on a benign
-      bare-Dhan-transport-RST class (every conn streak 0, no non-reconnectable
-      code, token valid, QuestDB reachable) instead of process::exit + a
-      775-SID cold re-subscribe that trips Dhan's per-IP 429. The common
-      reason="bare_dhan_reset" case is the system self-healing — Low severity,
-      no operator action. The rarer reason="ceiling_exceeded" (15-min
-      reconnect-in-place with zero frame recovery) falls back to the legacy
-      restart, which is already operator-visible via tv_pool_self_halts_total.
-      Silence; sustained recurrence is visible via
-      tv_ws_watchdog_reconnect_in_place_total.
+  # C4 sweep (2026-07-15): rule `ws-gap-09-watchdog-reconnect-in-place-silence` retired — the WS-GAP-09 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
   - name: ws-gap-10-order-update-outage-escalate
     match:
@@ -1058,54 +1016,14 @@ rules:
   # Wave 3-D — composite real-time guarantee score (drive-by fix 2026-04-28)
   # -----------------------------------------------------------------------
 
-  - name: slo-01-healthy-recovery-silence
-    match:
-      code: SLO-01
-    action: silence
-    runbook_path: .claude/rules/project/wave-3-d-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      SLO-01 = composite real-time guarantee score recovered to healthy
-      (>= 0.95). Severity::Info positive ping; the Telegram message itself
-      is the operator-visible artifact. Silence locally.
+  # C4 sweep (2026-07-15): rule `slo-01-healthy-recovery-silence` retired — the SLO-01 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: slo-02-degraded-escalate
-    match:
-      code: SLO-02
-    action: escalate
-    runbook_path: .claude/rules/project/wave-3-d-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 600
-    justification: >-
-      SLO-02 = composite score below 0.95 (Degraded) or below 0.80
-      (Critical). The `weakest` field on the Telegram payload names the
-      contributing dimension. Triage by following the dimension-specific
-      runbook (PHASE2-01, BOOT-01, AUTH-GAP-03, etc.). Never auto-fix
-      the composite — root cause is upstream.
+  # C4 sweep (2026-07-15): rule `slo-02-degraded-escalate` retired — the SLO-02 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: slo-03-publisher-respawn-escalate
-    match:
-      code: SLO-03
-    action: escalate
-    runbook_path: .claude/rules/project/wave-3-d-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 300
-    justification: >-
-      SLO-03 means the supervisor respawned the SLO evaluator/publisher
-      (the 10s tv_realtime_guarantee_score scheduler) after it died
-      (panic/cancel/clean-exit). A single respawn self-heals — the metric
-      stream resumes within ~15s. But a sustained respawn rate
-      (tv_slo_publisher_respawn_total) means a real bug in the loop, and a
-      dying publisher blinds the guarantee-critical alarm on missing data
-      (the 2026-07-03 10:35 IST incident). Mirrors DISK-WATCHER-01 /
-      WS-SPILL-01. Escalate (Telegram + draft Issue) so the operator can
-      correlate the panic backtrace, with a 5-min cooldown to avoid
-      spamming on the benign one-off respawn at shutdown.
-
-  # -----------------------------------------------------------------------
-  # Phase 7 (2026-04-28) — Depth-20 dynamic top-150 selector
-  # -----------------------------------------------------------------------
+  # C4 sweep (2026-07-15): rule `slo-03-publisher-respawn-escalate` retired — the SLO-03 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
   - name: prevclose-03-boot-routing-assertion-escalate
     match:
@@ -1314,24 +1232,8 @@ rules:
       paired Telegram event — never manually re-mints first.
       Severity::High — pages with a 5-min cooldown, does not auto-fix.
 
-  - name: auth-gap-06-fast-boot-cached-token-validation-escalate
-    match:
-      code: AUTH-GAP-06
-    action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 300
-    justification: >-
-      AUTH-GAP-06 = the FAST crash-recovery boot arm validated the
-      CACHED Dhan JWT with one /v2/profile call BEFORE any WebSocket
-      spawn. Either a Dhan 401/403 reject forced a re-mint through the
-      existing TokenManager machinery, or the validation degraded
-      (transient network / REST-surface error) and boot proceeded
-      loudly with the cached token after one bounded retry. The
-      re-mint / degraded-proceed IS the self-remediation; the operator
-      inspects — a repeat on every boot means the cache/mint chain is
-      broken. Severity::High — pages with a 5-min cooldown, does not
-      auto-fix.
+  # C4 sweep (2026-07-15): rule `auth-gap-06-fast-boot-cached-token-validation-escalate` retired — the AUTH-GAP-06 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
   - name: resource-01-fd-count-high-escalate
     match:
@@ -1425,18 +1327,8 @@ rules:
       behavior — next wake is Monday market open (65h dormant).
       Operator-visible but not actionable; silenced from Telegram.
 
-  - name: tick-gap-summary-during-market-open-burst-escalate
-    match:
-      code: WS-GAP-06
-      message_substring: "09:15"
-    action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
-    confidence: 0.9
-    cooldown_secs: 30
-    justification: >-
-      WS-GAP-06 fan-out: tick-gap summary during 09:15 market-open
-      burst window. Distinguishes from mid-day silent socket — the
-      09:15 burst is high-volume so silence here is more alarming.
+  # C4 sweep (2026-07-15): rule `tick-gap-summary-during-market-open-burst-escalate` retired — the WS-GAP-06 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
   - name: storage-gap-03-audit-write-failed-during-cross-verify-escalate
     match:
@@ -1579,80 +1471,20 @@ rules:
   # Sub-PR #9 of 2026-05-27 daily-universe expansion — fetch chain
   # -----------------------------------------------------------------------
 
-  - name: instr-fetch-01-csv-hard-failed-escalate
-    match:
-      code: INSTR-FETCH-01
-    action: escalate
-    runbook_path: .claude/rules/project/daily-universe-instr-fetch-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      INSTR-FETCH-01 = Detailed CSV fetch hard-failed past §4 retry
-      ladder. Severity::Critical. Operator inspects Dhan CDN health
-      + considers --operator-acknowledge-stale-csv override.
+  # C4 sweep (2026-07-15): rule `instr-fetch-01-csv-hard-failed-escalate` retired — the INSTR-FETCH-01 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: instr-fetch-02-schema-validation-failed-escalate
-    match:
-      code: INSTR-FETCH-02
-    action: escalate
-    runbook_path: .claude/rules/project/daily-universe-instr-fetch-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      INSTR-FETCH-02 = CSV parser rejected the body. Severity::Critical.
-      Either missing header, non-UTF-8, or >0.1% row failures.
-      Operator inspects raw CSV via curl; possible Dhan schema break.
+  # C4 sweep (2026-07-15): rule `instr-fetch-02-schema-validation-failed-escalate` retired — the INSTR-FETCH-02 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: instr-fetch-03-dangling-references-escalate
-    match:
-      code: INSTR-FETCH-03
-    action: escalate
-    runbook_path: .claude/rules/project/daily-universe-instr-fetch-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      INSTR-FETCH-03 = >0.5% of FUTSTK/OPTSTK rows had dangling
-      UNDERLYING_SECURITY_ID. Severity::Critical. Possible Dhan-side
-      timing or our parser regression dropping NSE_EQ rows below the
-      0.1% threshold.
+  # C4 sweep (2026-07-15): rule `instr-fetch-03-dangling-references-escalate` retired — the INSTR-FETCH-03 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: instr-fetch-04-universe-size-out-of-bounds-escalate
-    match:
-      code: INSTR-FETCH-04
-    action: escalate
-    runbook_path: .claude/rules/project/daily-universe-instr-fetch-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      INSTR-FETCH-04 = computed universe size outside [100, 400].
-      Severity::Critical. Either upstream extractor returned partial
-      data (below) OR a regression let in extra rows (above).
-      Operator runs --dry-run-universe to inspect each extractor's
-      contribution.
+  # C4 sweep (2026-07-15): rule `instr-fetch-04-universe-size-out-of-bounds-escalate` retired — the INSTR-FETCH-04 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  # -----------------------------------------------------------------------
-  # NTM Sub-PR #10a (§31): niftyindices constituent source degraded
-  # -----------------------------------------------------------------------
-
-  - name: ntm-constituency-01-source-degraded-escalate
-    match:
-      code: NTM-CONSTITUENCY-01
-    action: escalate
-    runbook_path: .claude/rules/project/ntm-constituency-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      NTM-CONSTITUENCY-01 = the niftyindices constituent source failed
-      (fetch / parse / >0.5% dangling). Severity::Critical. By operator
-      policy this DEGRADES (trade the indices + F&O-underlyings core
-      universe) rather than halting, but the operator MUST be told that
-      today runs without the ~500 cash-only NTM constituents. No safe
-      auto-action — escalate.
-
-
-  # -----------------------------------------------------------------------
-  # Day OHLC tracker for IDX_I (post 2026-05-26 — pre-open buffer removed)
-  # -----------------------------------------------------------------------
+  # C4 sweep (2026-07-15): rule `ntm-constituency-01-source-degraded-escalate` retired — the NTM-CONSTITUENCY-01 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
   - name: index-ohlc-02-daily-reset-failed-escalate
     match:
@@ -1674,43 +1506,11 @@ rules:
   # Post-market 1-minute cross-verification (2026-06-02, narrowed re-allow)
   # -----------------------------------------------------------------------
 
-  - name: cross-verify-1m-01-mismatch-found-escalate
-    match:
-      code: CROSS-VERIFY-1M-01
-    action: escalate
-    runbook_path: .claude/rules/project/cross-verify-1m-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      CROSS-VERIFY-1M-01 = one or more 1-minute OHLCV cells disagreed
-      (exact compare) between our candles_1m and Dhan intraday for the
-      trading day. Severity::High, data-integrity signal — NOT
-      auto-triage-safe. Track the trend, not the absolute count: our
-      live feed is sampled while Dhan's intraday is built from the full
-      tape, so per-minute high/low drift is expected sampling noise. A
-      sudden spike or sustained open/close drift is a real problem.
-      Operator inspects data/cross-verify/cross-verify-1m-<date>.csv +
-      the cross_verify_1m_audit table.
+  # C4 sweep (2026-07-15): rule `cross-verify-1m-01-mismatch-found-escalate` retired — the CROSS-VERIFY-1M-01 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: cross-verify-1m-02-fetch-degraded-escalate
-    match:
-      code: CROSS-VERIFY-1M-02
-    action: escalate
-    runbook_path: .claude/rules/project/cross-verify-1m-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      CROSS-VERIFY-1M-02 = Dhan intraday REST errored / rate-limited /
-      returned empty for a material fraction of the spot SIDs, so the
-      15:31 IST verification could not vouch for the full universe that
-      day (false-OK avoidance, audit Rule 11). Severity::High. Best-effort
-      run never blocks; next trading day re-runs. Operator checks Dhan
-      Data-API health + the 5/sec, 100k/day rate budget.
-
-
-  # -----------------------------------------------------------------------
-  # WAL frame-spill writer hardening (2026-06-09, zero-tick-loss)
-  # -----------------------------------------------------------------------
+  # C4 sweep (2026-07-15): rule `cross-verify-1m-02-fetch-degraded-escalate` retired — the CROSS-VERIFY-1M-02 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
   - name: ws-spill-01-writer-respawn-escalate
     match:
@@ -1795,130 +1595,24 @@ rules:
   # REST-health canary (2026-06-10, task DHAN-REST-400)
   # -----------------------------------------------------------------------
 
-  - name: rest-canary-01-probe-failed-escalate
-    match:
-      code: REST-CANARY-01
-    action: escalate
-    runbook_path: .claude/rules/project/dhan-rest-canary-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      RETIRED EMIT 2026-07-14 (operator Dhan noise lock,
-      dhan-rest-only-noise-lock-2026-07-14.md): the REST canary module +
-      both spawn sites are DELETED, so REST-CANARY-01 has ZERO production
-      emit sites — this rule can only match a historical errors.jsonl
-      line. The ErrorCode variant + this rule are retained per the house
-      retirement-banner style (the triage full-coverage guard requires a
-      rule or an exemption per variant). Historical semantics: a scheduled
-      GET /v2/profile health probe (09:05 / 12:00 / 15:25 IST) returned
-      non-2xx or failed to send after one 30s retry; the spot/chain legs'
-      own escalation edges now self-detect a dead REST surface in ~3-4 min.
+  # C4 sweep (2026-07-15): rule `rest-canary-01-probe-failed-escalate` retired — the REST-CANARY-01 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: prevday-01-coverage-empty-escalate
-    match:
-      code: PREVDAY-01
-    action: escalate
-    runbook_path: .claude/rules/project/prev-day-ohlcv-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      PREVDAY-01 = the boot-time previous-day OHLCV fetch returned ZERO
-      yesterday candles for the subscribed universe (PrevDayCoverage::Empty).
-      Severity::High, NOT auto-fixable from the app: the cause is upstream
-      (Dhan 200-with-empty-body for every symbol — data-plan / market-closed /
-      far-OTM — or an empty universe build). Boot is fail-soft and never
-      blocks; the prev-day reference cache simply has no rows until the next
-      successful boot, so the *_pct_from_prev_day columns read 0. The operator
-      inspects tv_prev_day_ohlcv_empty_total + the REST canary + the
-      universe-build codes per the runbook, then acts upstream (Dhan portal /
-      scope). Fires at most once per boot.
+  # C4 sweep (2026-07-15): rule `prevday-01-coverage-empty-escalate` retired — the PREVDAY-01 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  # ── D2b: runtime Dhan-lane cold-start FSM (2026-06-26) ──────────────────
-  # DHAN-LANE-01/02/03 = a runtime Dhan-lane cold-start (a boot-OFF Dhan feed
-  # enabled at runtime) failed at the universe-build / ws-pool-spawn / auth-gate
-  # stage. The FSM returns to Off (no half-running lane) and a bounded backoff
-  # retry re-attempts automatically — but the operator MUST know the lane did
-  # not come up (the cause is usually upstream: Dhan CSV / niftyindices source,
-  # TLS/DNS, token/static-IP). Escalate; the retry self-heals if the upstream
-  # recovers. NOT auto-fixable from the app (no in-app fix for an upstream
-  # auth/universe/network failure). The PROCESS-shared infra stays up, so the
-  # Groww feed is unaffected throughout.
-  - name: dhan-lane-01-universe-build-failed-escalate
-    match:
-      code: DHAN-LANE-01
-    action: escalate
-    runbook_path: .claude/rules/project/dhan-lane-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      DHAN-LANE-01 = runtime Dhan-lane cold-start failed at the daily-universe
-      build stage (the inline spine's instrument-load failure surfaced at
-      runtime). The FSM is driven Starting->Off; a bounded min(10*2^n,300)s
-      backoff re-attempts. Cause is upstream (Dhan/niftyindices CSV source) —
-      cross-check the INSTR-FETCH-* / NTM-CONSTITUENCY-01 codes. Operator action
-      required if it persists; the retry self-heals if the source recovers.
+  # C4 sweep (2026-07-15): rule `dhan-lane-01-universe-build-failed-escalate` retired — the DHAN-LANE-01 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: dhan-lane-02-ws-pool-spawn-failed-escalate
-    match:
-      code: DHAN-LANE-02
-    action: escalate
-    runbook_path: .claude/rules/project/dhan-lane-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      DHAN-LANE-02 = runtime Dhan-lane cold-start failed at the main-feed
-      WS-pool create/spawn stage. start_dhan_lane's own cancel cleanup aborted
-      every lane-owned handle it spawned so far (no orphan sockets); the FSM is
-      driven Starting->Off; bounded retry. Cause is usually TLS/DNS or a
-      Dhan-side handshake failure — cross-check tv_websocket_connections_active.
-      The 2-Dhan-WS lock is untouched. Operator inspection per the runbook.
+  # C4 sweep (2026-07-15): rule `dhan-lane-02-ws-pool-spawn-failed-escalate` retired — the DHAN-LANE-02 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: dhan-lane-03-auth-failed-escalate
-    match:
-      code: DHAN-LANE-03
-    action: escalate
-    runbook_path: .claude/rules/project/dhan-lane-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      DHAN-LANE-03 = runtime Dhan-lane cold-start failed at the IP-verify /
-      TOTP->JWT auth / static-IP / dual-instance boot gate. At RUNTIME this
-      NEVER exits the process (unlike the boot path); the FSM returns to Off and
-      bounded retry re-attempts. Reuse AUTH-GAP-* semantics: check
-      tv_token_remaining_seconds, the SSM TOTP secret, and the static-IP
-      whitelist. The lane owns its own TokenManager (C4) so a cold-start cannot
-      renew a stale global token. Operator action per the runbook.
+  # C4 sweep (2026-07-15): rule `dhan-lane-03-auth-failed-escalate` retired — the DHAN-LANE-03 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  # DHAN-LANE-04 = the runtime Stop's teardown hit the bounded drain timeout and
-  # force-aborted the remaining WS handles. The lane STILL reaches Off
-  # (degraded-but-recovered, not data loss). Medium, auto-triage-safe — silence:
-  # the only loss is the in-flight graceful-close of an ALREADY-disabled feed;
-  # the operator notes it but no action is required unless it recurs every
-  # disable (then inspect the WS graceful-close path per the runbook).
-  - name: dhan-lane-04-teardown-timeout-silence
-    match:
-      code: DHAN-LANE-04
-    action: silence
-    runbook_path: .claude/rules/project/dhan-lane-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      DHAN-LANE-04 = the runtime Dhan-lane teardown drain timed out; the inner
-      teardown force-aborted the remaining WS handles and the lane STILL reached
-      Off. Degraded-but-recovered, not data loss — the only loss is the
-      graceful-close of an already-disabled feed. Silence (counter +
-      tv_dhan_lane_teardown_forced_total record the event); the operator
-      inspects only if it recurs on every disable per the runbook.
+  # C4 sweep (2026-07-15): rule `dhan-lane-04-teardown-timeout-silence` retired — the DHAN-LANE-04 ErrorCode
+  # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  # GROWW-MASTER-01 = the best-effort cold-path write of the Groww instrument
-  # set into the SHARED instrument_lifecycle + index_constituency master tables
-  # (tagged feed='groww') failed (QuestDB ILP unreachable / flush error). It is a
-  # forensic master/metadata write, NEVER on the data-correctness or recovery
-  # path — Groww feed activation, the live tick path, and the Dhan master rows
-  # are all UNAFFECTED. The append is idempotent (DEDUP UPSERT) so the next boot
-  # re-runs. Medium, auto-triage-safe — silence: the counter
-  # (tv_groww_master_persist_errors_total) records it; the operator inspects only
-  # if it persists (then it is the same QuestDB-ILP-degraded signal as BOOT-01/02).
   - name: groww-master-01-persist-failed-silence
     match:
       code: GROWW-MASTER-01
@@ -1994,29 +1688,9 @@ rules:
       (NATS reject, subscribe failure, SDK decode error, SSM/boto3 failure)
       instead of only the fixed Telegram wording.
 
-  # WS-REINJECT-01 = the boot-time STAGE-C.2b WAL re-injection aborted — the
-  # frame-channel consumer (tick processor) was dead (channel closed) or
-  # wedged (per-send timeout). The undelivered remainder stays durably staged
-  # in the WAL replaying/ directory and re-replays next boot, so the abort
-  # self-heals across a restart — but a dead/wedged consumer at boot needs
-  # operator eyes (cross-check WS-GAP-07 / BOOT-01 / PROC-01).
-  - name: ws-reinject-01-aborted-escalate
-    match:
-      code: WS-REINJECT-01
-    action: escalate
-    runbook_path: .claude/rules/project/ws-reinject-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 300
-    justification: >-
-      WS-REINJECT-01 = the bounded chunked-backpressure WAL re-injection
-      (C3 fix for the 2026-07-03 dropped=1,127,801 storm) aborted because the
-      tick-processor consumer was dead or made zero progress for the per-send
-      timeout. No frame is silently lost — the remainder stays staged in
-      replaying/ for re-replay next boot and confirm_replayed() is skipped —
-      but the underlying consumer death/wedge (WS-GAP-07 / QuestDB /
-      host-pressure class) needs operator root-cause. Escalate (Telegram +
-      draft Issue) with a 5-min cooldown; the next boot's replay self-heals
-      the data path.
+  # 2026-07-17 (evidence-audit Fix PR C): rule `ws-reinject-01-aborted-escalate` retired — the
+  # WS-REINJECT-01 ErrorCode variant was deleted with its orphaned emitter (wal_reinject.rs had
+  # zero production callers; main.rs count-residuals + confirm_replayed are the retained coverage).
 
   # HTTP-CLIENT-01 = reqwest ClientBuilder::build() failed at a storage
   # HTTP-client site (TLS backend / resolver init / fd exhaustion). The site
@@ -2378,6 +2052,50 @@ rules:
       re-run once the underlying condition (BruteX producer publish, S3
       reachability, QuestDB health per BOOT-01/02) is fixed.
 
+  # SPOT-XVERIFY-01 (spot cross-verify comparator) = the daily 15:47 IST
+  # Dhan-vs-Groww spot 1m cross-verify found >=1 divergent / missing cell.
+  # Escalate — NOT auto-triage safe (severity-independent is_auto_triage_safe
+  # override, the BRUTEX-XVERIFY-01 / FUTIDX-02 precedent): a data-
+  # comparability signal is never auto-actioned; the operator decides which
+  # capture chain drifted. Both feeds re-produce tomorrow; the audit rows are
+  # the durable record — never hand-patch either table.
+  - name: spot-xverify-01-divergence-found-escalate
+    match:
+      code: SPOT-XVERIFY-01
+    action: escalate
+    runbook_path: .claude/rules/project/spot-crossverify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SPOT-XVERIFY-01 = the daily Dhan-vs-Groww spot 1-minute cross-verify
+      found divergent / missing cells. Data-comparability signal — never
+      auto-actioned (severity-independent is_auto_triage_safe override): the
+      operator inspects spot_crossverify_cell_audit (field/kind breakdown)
+      and the day's per-feed spot 1m REST health to decide which capture
+      chain drifted. Track the trend, not the absolute count.
+
+  # SPOT-XVERIFY-02 (spot cross-verify comparator) = a leg of the daily run
+  # degraded (questdb read/write, join/parse, wall-clock cap, keep-better
+  # suppression). The degrade is honestly stamped (partial/no_data/blind/
+  # degraded — never a false clean); the run is DEDUP-idempotent and the
+  # keep-better guard protects a measured day, so escalate = the operator
+  # re-runs after fixing the underlying QuestDB condition.
+  - name: spot-xverify-02-run-degraded-escalate
+    match:
+      code: SPOT-XVERIFY-02
+    action: escalate
+    runbook_path: .claude/rules/project/spot-crossverify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SPOT-XVERIFY-02 = the daily spot cross-verify run degraded on one leg
+      (QuestDB read/write, join/parse, wall-clock cap, keep-better
+      suppression). Best-effort cold-path forensic compare — feeds/capture/
+      trading are unaffected; escalate so the operator knows the day is
+      partial/no_data/blind/degraded and can backfill via the DEDUP-
+      idempotent re-run once the underlying QuestDB condition (per
+      BOOT-01/02) is fixed.
+
   # -----------------------------------------------------------------------
   # Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2)
   # -----------------------------------------------------------------------
@@ -2548,3 +2266,611 @@ rules:
       (BOOT-01/02, WAL-SUSPEND-01) and backfills with the env override
       re-run per the runbook. Auto-restarting the app for a degraded
       forensic run would be worse than the miss.
+
+  # -----------------------------------------------------------------------
+  # 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14, WP1)
+  # -----------------------------------------------------------------------
+
+  # EXIT-ORDER-01 = an exit engine call degraded (validation refusal on a
+  # dispatched command / Dhan API error on a super, forever, or sliced
+  # order / ENTRY_LEG cancel refused post-fill — the naked-position race
+  # U4, never exercised / slicing response anomaly). The layer ships
+  # default-off behind four locks and dry-run paper mode; the coded line
+  # carries the order/correlation ids. Never auto-fixed: re-issuing an
+  # order-side mutation blind is exactly the double-exposure class the
+  # idempotency machinery exists to prevent.
+  - name: exit-order-01-execution-degraded-escalate
+    match:
+      code: EXIT-ORDER-01
+    action: escalate
+    runbook_path: .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      EXIT-ORDER-01 = exit engine call degraded. The refusal/degrade
+      already happened loudly with correlation ids in the coded line;
+      the operator inspects per the lockout runbook. Log-sink-only (the
+      2026-07-14 Dhan noise lock) — no pager entry; auto-triage must
+      never re-issue an order mutation.
+
+  # EXIT-VERIFY-01 = the MPP verify ladder exhausted with a degraded
+  # verdict: PendingAtLimit (MARKET auto-converted to LIMIT resting on the
+  # book past the deadline — orders.md rule 18, NEVER assumed filled),
+  # partial fill at budget (needs_reconciliation set — the remainder is
+  # never silently forgotten), or an Unknown unparsable status
+  # (fail-closed). The order stays tracked; reconcile owns the follow-up.
+  - name: exit-verify-01-degraded-escalate
+    match:
+      code: EXIT-VERIFY-01
+    action: escalate
+    runbook_path: .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      EXIT-VERIFY-01 = MPP verify ladder exhausted without a clean fill.
+      An unverified exit is open exposure — operator eyes required; any
+      live policy action (modify-to-aggressive / cancel-remainder) is a
+      live order action and is never auto-executed in the dry-run layer.
+
+  # -----------------------------------------------------------------------
+  # 🟢 GROWW order-side fan-out contract stubs (2026-07-15) — Portfolio,
+  # Smart Orders (GTT/OCO), Margin. ALL escalate: contract stubs with zero
+  # emit sites until the area code PRs land; no auto-fix script exists,
+  # and the order-side never auto-actions (the §39 live-fire lattice).
+  # -----------------------------------------------------------------------
+
+  # GROWW-PORT-01 = the broker portfolio snapshot fetch degraded (stage
+  # taxonomy: cycle_failed / escalation / token_read / client_build /
+  # task_respawn / resolve_failed / schema_drift / rate_limited /
+  # blind_tier). The next tier/cycle re-attempts; consumers fail closed
+  # on snapshot age — nothing is safe to auto-fix on a read surface.
+  - name: groww-port-01-snapshot-degraded-escalate
+    match:
+      code: GROWW-PORT-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PORT-01 = portfolio snapshot fetch degraded. The next
+      tier/cycle re-attempts automatically and consumers fail closed on
+      staleness; the operator inspects the stage + the shared token /
+      pooled rate bucket per the runbook rather than a blind auto-fix.
+
+  # GROWW-PORT-02 = a broker-portfolio QuestDB persist leg failed
+  # (best-effort; discard-pending defense; DEDUP-idempotent re-append).
+  - name: groww-port-02-persist-failed-escalate
+    match:
+      code: GROWW-PORT-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PORT-02 = portfolio persist failed. Re-appends are
+      DEDUP-idempotent; the underlying condition is QuestDB ILP/HTTP
+      health (make doctor, BOOT-01/BOOT-02 cross-check) — operator
+      inspection, never a blind auto-fix.
+
+  # GROWW-PORT-03 = the three-book reconciliation ledger CONFIRMED a
+  # residual. is_auto_triage_safe = false (severity-independent override,
+  # the FUTIDX-02 precedent): a data-comparability verdict between our
+  # book, the broker book, and co-tenant activity is an operator
+  # judgment — auto-"fixing" either side would forge position state.
+  - name: groww-port-03-recon-divergence-escalate
+    match:
+      code: GROWW-PORT-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PORT-03 = reconciliation residual confirmed. Never
+      auto-actioned (FUTIDX-02 precedent) — the operator judges which
+      book explains the residual via the position_recon_audit trend
+      per the runbook.
+
+  # GROWW-PORT-04 = a foreign (not-ours) position on the SHARED account
+  # (BruteX co-tenant). Evidence-only visibility; never auto-exited —
+  # the never-auto-exit invariant is source-scan-ratcheted.
+  - name: groww-port-04-foreign-position-escalate
+    match:
+      code: GROWW-PORT-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PORT-04 = foreign position detected on the pooled account.
+      The page IS the dry-run action; nothing is ever auto-actioned —
+      the operator eyeballs the broker app per the runbook.
+
+  # GROWW-OCO-01 = a smart-order (GTT/OCO) create/cancel leg failed after
+  # one bounded transport retry. Never auto-fixed: re-issuing an
+  # order-side mutation blind is the double-exposure class the
+  # idempotency machinery exists to prevent.
+  - name: groww-oco-01-placement-failed-escalate
+    match:
+      code: GROWW-OCO-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-01 = smart-order placement/cancel leg failed. The
+      failure is already loud with correlation forensics; the reconcile
+      poller owns the follow-up — auto-triage must never re-issue an
+      order mutation.
+
+  # GROWW-OCO-02 = an OCO sibling-leg cancel UNVERIFIED past the 30s
+  # deadline after the other leg filled — a DOUBLE-FILL exposure window.
+  # Severity::Critical: never auto-actioned (the Critical blanket); the
+  # operator verifies/cancels the sibling on the broker book NOW.
+  - name: groww-oco-02-sibling-cancel-unverified-escalate
+    match:
+      code: GROWW-OCO-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-02 = OCO sibling cancel unverified past the deadline.
+      Critical double-fill exposure — the operator must verify the
+      sibling on the broker book immediately; an automated cancel is a
+      live order action and is never auto-executed.
+
+  # GROWW-OCO-03 = OCO pair state reconcile mismatch vs the broker (incl.
+  # the partial-fill class; broker semantics doc-UNKNOWN, fail-closed).
+  # is_auto_triage_safe = false (severity-independent override, the
+  # FUTIDX-02 data-comparability precedent).
+  - name: groww-oco-03-reconcile-mismatch-escalate
+    match:
+      code: GROWW-OCO-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-03 = OCO pair reconcile mismatch. Never auto-actioned
+      (FUTIDX-02 precedent) — the operator judges partial-fill vs
+      broker lag vs a tracked-state bug; the next poll re-measures.
+
+  # GROWW-OCO-04 = a smart-order modify rejected by the broker OR
+  # targeting an API-immutable leg field (leg order_type/price) — the
+  # fallback is cancel+recreate, a mutation no auto-fix may issue.
+  - name: groww-oco-04-modify-rejected-escalate
+    match:
+      code: GROWW-OCO-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-04 = smart-order modify rejected. An immutable-field
+      rejection is a request-construction bug routed through
+      cancel+recreate — an order mutation the auto-triage daemon never
+      issues.
+
+  # GROWW-OCO-05 = the OCO get/list reconcile poller (15s cadence)
+  # degraded/respawned. Bounded re-poll at the next tick self-heals; a
+  # sustained degrade while a pair is live blinds the OCO-02 check.
+  - name: groww-oco-05-poller-degraded-escalate
+    match:
+      code: GROWW-OCO-05
+    action: escalate
+    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-OCO-05 = OCO reconcile poller degraded. The next tick
+      re-polls automatically; the operator checks whether an OCO pair
+      is live (the sibling-verification window) per the runbook —
+      nothing is safe to auto-fix.
+
+  # -----------------------------------------------------------------------
+  # Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15)
+  # -----------------------------------------------------------------------
+
+  # GROWW-MARG-01 = the per-poll 60s in-session Groww user-margin fetch
+  # degraded (stage names the leg: transport / timeout / status / auth /
+  # rate_limited / oversize / parse / failure_envelope / shape_incomplete /
+  # sanity / no_token, + the 3-consecutive escalation edge). Self-healing
+  # by construction — the next poll re-attempts; an invalid payload is
+  # never stored and the prior snapshot ages toward the GROWW-MARG-03
+  # fail-closed edge. Escalate for visibility: sustained auth = the shared
+  # token-minter Lambda; sustained rate_limited = the BruteX co-tenant is
+  # exhausting the pooled bucket — both are operator calls, never
+  # auto-fixed (no script can mint a token or out-poll a shared budget).
+  - name: groww-marg-01-fetch-degraded-escalate
+    match:
+      code: GROWW-MARG-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-01 = Groww margin fetch degraded. The poll loop already
+      self-heals (next 60s attempt; fail-closed staleness backstop); the
+      operator inspects the stage taxonomy for token/rate-limit/shape
+      causes per the runbook — nothing is safe to auto-fix.
+
+  # GROWW-MARG-02 = the margin audit persist leg failed (ensure-DDL / ILP
+  # append / ILP-over-HTTP flush). Best-effort forensic write: gate
+  # decisions are RAM-only and unaffected; re-appends are DEDUP-idempotent.
+  # Escalate so the operator runs the Day-1 DEDUP-verify checklist and
+  # cross-checks QuestDB health (BOOT-01/02, WAL-SUSPEND-01).
+  - name: groww-marg-02-persist-failed-escalate
+    match:
+      code: GROWW-MARG-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-02 = margin audit persist failed. Forensic rows for the
+      outage window are missing until QuestDB recovers; gate decisions
+      were never at risk. Operator checks QuestDB health + the DEDUP
+      window per the runbook.
+
+  # GROWW-MARG-03 = the Groww margin snapshot went stale (>stale_secs /
+  # absent / previous-IST-date) and the entry gate CLOSED fail-closed.
+  # Exits are unaffected; the next fresh poll self-heals. Escalate: a
+  # stale-gate episode during market hours means entries are refused and
+  # the operator must know WHY polls are failing (cross-check
+  # GROWW-MARG-01) — force-opening the gate is never an option.
+  - name: groww-marg-03-stale-gate-closed-escalate
+    match:
+      code: GROWW-MARG-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-03 = margin snapshot stale, entry gate closed. The
+      fail-closed refusal IS the protection; only a fresh successful poll
+      re-opens it. Operator triages the underlying fetch health — nothing
+      is safe to auto-fix.
+
+  # GROWW-MARG-04 = ENFORCE-mode entry rejected — insufficient usable
+  # funds after the safety buffer + carry-across-swap pending ledger +
+  # min-free floor on the SHARED (BruteX co-tenant) Groww account.
+  # Escalate — NOT auto-triage safe (is_auto_triage_safe() == false
+  # severity-independent override, the FUTIDX-02 / WAL-SUSPEND-01
+  # precedent): whether to top up funds, shrink sizing, re-tune the
+  # buffer, or accept the no-trade is an operator judgment over a shared
+  # account; auto-triage must never act on a funds verdict.
+  - name: groww-marg-04-entry-rejected-insufficient-escalate
+    match:
+      code: GROWW-MARG-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-04 = enforce-mode entry rejected on insufficient usable
+      funds. A funds verdict on the shared account is an operator
+      judgment (severity-independent is_auto_triage_safe override);
+      the payload carries the full paise arithmetic for the decision.
+
+  # GROWW-MARG-05 = the cold-path margin-calculator verifier found the
+  # broker's total requirement diverging from the local
+  # premium-with-buffers formula beyond tolerance. Visibility only — the
+  # conservative local buffer stands and the enforce-flip is BLOCKED
+  # until resolved; a dated operator note re-tunes, never an auto-fix.
+  - name: groww-marg-05-calc-divergence-escalate
+    match:
+      code: GROWW-MARG-05
+    action: escalate
+    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-MARG-05 = calculator divergence from the local margin
+      formula. One coalesced warn per day; the operator compares the
+      local vs broker numbers per the runbook and re-tunes with a dated
+      note — nothing is auto-adjusted.
+  # -----------------------------------------------------------------------
+  # Groww REGULAR orders — shared contracts PR-A0 (operator authorization
+  # 2026-07-14; DORMANT / dry-run only). All 10 are LOG-SINK-ONLY; the
+  # operator page is the typed Telegram event. GROWW-ORD-03 (Critical) +
+  # GROWW-ORD-04 (severity-independent override) MUST escalate; the
+  # self-healing rate-limit code is silenced (expected co-tenant noise).
+  # Emit sites land in later serial Orders PRs.
+  # -----------------------------------------------------------------------
+  - name: groww-ord-01-mutation-rejected-escalate
+    match:
+      code: GROWW-ORD-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-01 = a place/modify/cancel was definitively rejected
+      (400-class + well-shaped FAILURE envelope). Never auto-retried;
+      the operator reads the GA code + plain reason.
+
+  - name: groww-ord-02-ambiguous-outcome-escalate
+    match:
+      code: GROWW-ORD-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-02 = a mutation entered the ambiguity resolution ladder
+      (timeout/5xx/decode/429/GA-on-non-400). The ladder self-resolves or
+      escalates to GROWW-ORD-03; surface so the operator knows an outcome
+      is being confirmed.
+
+  - name: groww-ord-03-ambiguity-unresolved-escalate
+    match:
+      code: GROWW-ORD-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      GROWW-ORD-03 = the resolution ladder exhausted without confirming an
+      order's fate (Critical, never auto-triaged). The operator MUST open
+      the Groww app and check the order book — an order may be live and
+      unknown to us.
+
+  - name: groww-ord-04-reconcile-mismatch-escalate
+    match:
+      code: GROWW-ORD-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-04 = reconciliation found a status/fill drift, ghost, or
+      fill-monotonicity breach. A data-integrity verdict is never
+      auto-actioned (is_auto_triage_safe = false, the FUTIDX-02
+      precedent); the operator judges which side drifted.
+
+  - name: groww-ord-05-rate-limited-silence
+    match:
+      code: GROWW-ORD-05
+    action: silence
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-05 = broker 429 on an order-family call while our self-caps
+      were green (the shared-account co-tenant hypothesis). Counted +
+      backed off, never out-polled, never trips the circuit breaker —
+      expected recurring noise, so silence; a sustained rate is the
+      co-tenant signal the operator inspects.
+
+  - name: groww-ord-06-ledger-write-failed-escalate
+    match:
+      code: GROWW-ORD-06
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-06 = the write-ahead intent ledger failed an append/fsync
+      or replay found interior corruption. The mutation is already refused
+      fail-closed; escalate so the operator checks the ledger directory's
+      disk/permissions.
+
+  - name: groww-ord-07-unknown-status-escalate
+    match:
+      code: GROWW-ORD-07
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-07 = an undocumented (open-set) order-status string was
+      observed; the order is parked + reconciled. A NEW distinct string
+      means the wire vocabulary drifted — the operator adds it to the
+      parser's known set in a reviewed PR (never a guessed rank).
+
+  - name: groww-ord-08-audit-write-failed-escalate
+    match:
+      code: GROWW-ORD-08
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-08 = the shared order_audit ILP append/flush failed
+      (best-effort, AUDIT-WS-01 class). The intent ledger is the safety
+      record and a failed audit row never gates a mutation; escalate so the
+      operator knows a forensic row is missing until QuestDB recovers.
+
+  - name: groww-ord-09-quantity-refused-escalate
+    match:
+      code: GROWW-ORD-09
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-09 = a requested order quantity exceeded the
+      max_order_quantity config gate; refused loudly before any HTTP. The
+      operator decides whether raising the cap is intended (freeze limits
+      are exchange-published and changing — never hardcoded).
+
+  - name: groww-ord-10-auth-stale-escalate
+    match:
+      code: GROWW-ORD-10
+    action: escalate
+    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-ORD-10 = an order-family call classified 401/403; the
+      minter-lock re-read ladder engaged (SSM read-only, never mints). At
+      the ~06:00 IST daily reset this self-heals; a sustained rate means
+      the minter is stale (cross-check the shared-token minter runbook).
+
+  # -----------------------------------------------------------------------
+  # Groww order/position PUSH channel (Stage A, 2026-07-16)
+  # -----------------------------------------------------------------------
+
+  # GROWW-PUSH-01 = the push channel's NATS-over-WS connect / reconnect
+  # failed at the transport level. Bounded backoff reconnect self-heals;
+  # receive-only observability — no order path is affected.
+  - name: groww-push-01-connect-failed-escalate
+    match:
+      code: GROWW-PUSH-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PUSH-01 = push-channel connect/reconnect failed. The bounded
+      backoff ladder already self-heals; the operator inspects whether the
+      provider is rejecting the session — nothing is safe to auto-fix.
+
+  # GROWW-PUSH-02 = the per-session socket-token mint or the NATS CONNECT
+  # was auth-rejected. The access token is RE-READ from SSM at floor
+  # pacing, NEVER minted (token-minter lock 2026-07-02).
+  - name: groww-push-02-auth-failed-escalate
+    match:
+      code: GROWW-PUSH-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PUSH-02 = push-channel auth rejected. At the ~06:00 IST daily
+      token reset this self-heals via the SSM re-read; a sustained rate
+      means the shared minter Lambda is stale — never minted from here.
+
+  # GROWW-PUSH-03 = a push frame / protobuf payload failed decode or
+  # arrived on an unknown subject: counted + skipped, never a panic.
+  - name: groww-push-03-decode-failed-escalate
+    match:
+      code: GROWW-PUSH-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PUSH-03 = push frame decode failure. A low rate is schema
+      drift on optional fields (forward-skipped by design); a high rate
+      means the wire schema changed — a reviewed parser update, never an
+      auto-fix.
+
+  # GROWW-PUSH-04 = the supervised push-channel task died and was
+  # respawned (WS-GAP-05 / FEED-SUPERVISOR-01 house pattern).
+  - name: groww-push-04-supervisor-respawned-escalate
+    match:
+      code: GROWW-PUSH-04
+    action: escalate
+    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      GROWW-PUSH-04 = push-channel supervisor respawned the task. The
+      respawn already self-healed; a sustained respawn rate is a real bug
+      — the operator captures the backtrace per the runbook.
+
+  # CADENCE-01 = a cadence broker lane degraded inside a cycle (fetch
+  # failures / 429-despite-gates / empty spots / fallback provenance /
+  # unknown moneyness / ladder exhausted). The scheduler self-heals by
+  # construction: the next minute boundary re-fires, the failure ladder
+  # walks the anchor earlier, and RateLimited is never blind-retried.
+  # Escalate so the operator reads the coalesced per-cycle stage list —
+  # a sustained rate_limited stage is a gate-bug / shared-budget signal
+  # worth human eyes, never an auto-fix.
+  - name: cadence-01-lane-degraded-escalate
+    match:
+      code: CADENCE-01
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-01 = cadence lane degraded this cycle (coalesced). The
+      ladder + next-boundary re-fire already self-heal; the operator
+      inspects the stage taxonomy per the runbook (rate_limited despite
+      the structural gates = shared-budget co-tenant or broker
+      tightening — a spacing constant must never be auto-touched).
+
+  # CADENCE-02 = a (lane, cycle-minute) decision honest-skipped (cutoff /
+  # both sources dead / all-Unknown moneyness). The skip IS the
+  # fail-closed action — no decision on missing/stale data; nothing to
+  # undo, nothing to restart. Escalate for visibility (Rule 11: a skip is
+  # never rendered OK); a RUN of skips points at the broker surface and
+  # the capture legs' own codes for the same window.
+  - name: cadence-02-decision-skipped-escalate
+    match:
+      code: CADENCE-02
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-02 = cadence decision honest-skipped. The skip is the
+      fail-closed design outcome (exactly-once latch, never a late
+      decision); dry-run boots skip EVERY minute by design (the
+      DryRunLoggingExecutor returns Empty). Operator correlates a skip
+      run with CADENCE-01 stages + SPOT1M-01/CHAIN-02 per the runbook.
+
+  # CADENCE-03 = scheduler machinery degraded (ladder shift / late wake /
+  # boundary skipped / skew clamped / runner respawn / nominal gate
+  # deferral). Every arm already self-corrected or self-reported; the
+  # supervised runner respawns itself (release panics abort the process —
+  # the TICK-FLUSH-01 honesty note). Escalate so trends (host pressure,
+  # respawn storms, the should-never gate_deferred_nominal) reach the
+  # operator; nothing here is auto-fixable.
+  - name: cadence-03-scheduler-degraded-escalate
+    match:
+      code: CADENCE-03
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-03 = cadence scheduler machinery degraded. late_wake /
+      boundary_skipped trends correlate with host pressure (PROC-01,
+      RESOURCE-01..03); a respawn storm is a real bug needing the panic
+      backtrace; gate_deferred_nominal is a schedule/gate consistency
+      bug to file — never widen spacings as a reaction.
+
+  # FOLD-01 = the REST-era bar-fold candle derivation degraded (catch-up
+  # query/parse, seal/bar handoff drop, or a supervised-task respawn).
+  # Escalate (not auto_restart): every degrade is RE-DERIVABLE — the
+  # spot_1m_rest source rows stand and the dirty-day refold + next boot's
+  # catch-up re-emit DEDUP-idempotently; the operator inspects the stage
+  # (QuestDB /exec health vs seal-writer backpressure vs a fold bug) per
+  # the runbook. Log-sink-only delivery — the 15:40 IST tf-consistency
+  # verifier is the end-to-end "are the candles there?" signal.
+  - name: fold-01-rest-candle-derivation-degraded-escalate
+    match:
+      code: FOLD-01
+    action: escalate
+    runbook_path: .claude/rules/project/rest-candle-fold-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      FOLD-01 = a leg of the REST-era candle fold degraded. No market data
+      is lost (the spot_1m_rest rows stand; refold/catch-up repair
+      idempotently); escalate so the operator reads the stage field and
+      cross-checks QuestDB /exec (catchup_*) or the seal-writer chain
+      (seal_send) per the runbook instead of any auto-action.
+
+  # RAMSTORE-01 = a RAM residency store leg degraded (chain rehydrate
+  # query/parse/truncation, live row-cap truncation, stale-day drop, or a
+  # supervised stats/rehydrate task respawn). Escalate (not auto_restart):
+  # QuestDB remains the durable truth — a RAM degrade re-fills via PR-1's
+  # boot catch-up + the bounded chain rehydrate at the next boot; the
+  # operator inspects the stage + the depth gauges per the runbook.
+  - name: ramstore-01-ram-residency-degraded-escalate
+    match:
+      code: RAMSTORE-01
+    action: escalate
+    runbook_path: .claude/rules/project/ram-store-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      RAMSTORE-01 = the RAM residency machinery degraded, never market-data
+      loss (the candles_* / option_chain_1m DEDUP rows stand and RAM
+      re-fills at the next boot). Escalate so the operator reads the stage
+      field and the tv_ram_store_* depth gauges per the runbook instead of
+      any auto-action.

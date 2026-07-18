@@ -29,6 +29,11 @@
 // cosmetic markdown-rendering nicety with zero runtime/behavior impact.
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
+// Match the lib.rs restriction-lint blanket for the binary crate root:
+// no unwrap/expect/print/dbg in production code.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
@@ -55,7 +60,6 @@ use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 // Phase C1 (2026-07-13): relocated from this binary to the lib so
 // dhan_rest_stack can create its own ws_event_audit consumer (Q4-i rewire).
-use tickvault_app::ws_audit_consumer::spawn_ws_event_audit_consumer;
 
 // PR-E (2026-05-26): ensure_candle_table_dedup_keys retired alongside
 // the deleted candle_persistence module + historical_candles table.
@@ -252,7 +256,8 @@ async fn emit_boot_completed_when_feed_live(
         // with no live feed.
         info!(
             "boot-completed: no feed enabled (dhan_enabled=false, groww_enabled=false) — \
-             emitting the alive signal for a deliberately shared-infra-only run"
+             emitting the alive signal immediately for the REST-only boot (the per-minute \
+             Dhan/Groww REST legs are config-gated by their own sections, not these flags)"
         );
         emit_boot_completed();
         return;
@@ -290,8 +295,9 @@ async fn emit_boot_completed_when_feed_live(
                 wait_secs = BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS,
                 "boot-completed: NO enabled feed reached a live state within the wait window — \
                  WITHHOLDING the alive signal (tv_boot_completed) so the boot-heartbeat alarm \
-                 pages on the missing metric. Check the enabled feed(s): a Dhan lane that never \
-                 reached Running or a Groww activation that never built its watch-list."
+                 pages on the missing metric. Check the enabled feed(s) — with the live lanes \
+                 retired (Dhan 2026-07-13, Groww 2026-07-15) an enabled-but-dead feed flag \
+                 means the config re-enabled a lane this build no longer ships."
             );
             return;
         }
@@ -335,6 +341,8 @@ async fn main() -> Result<()> {
     // rustls 0.23+ requires an explicit CryptoProvider. Both tokio-tungstenite
     // (WSS to Dhan) and reqwest (HTTPS to Dhan REST) depend on rustls.
     // Using aws-lc-rs as the provider (already in the dependency tree).
+    // APPROVED: bootstrap — TLS mandatory, install cannot fail-soft
+    #[allow(clippy::expect_used)]
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
@@ -448,6 +456,24 @@ async fn main() -> Result<()> {
                  a config change + restart."
             );
         }
+        // 2026-07-15 operator directive ("remove the whole Groww live feed;
+        // keep only spot 1m and option chain for both brokers"): the Groww
+        // overlay is narrow-only too — a STALE data/feed-state.json written
+        // while Groww WAS the live feed (`groww_enabled: true`) can never
+        // resurrect the retired feed over the production.toml flip (the
+        // boot-heartbeat false-page class). One boot-time warn makes the
+        // suppression visible (never silent).
+        if tickvault_api::feed_state_persist::groww_overlay_suppressed(
+            &config.feeds,
+            persisted.as_ref(),
+        ) {
+            warn!(
+                "feed-state overlay requested groww_enabled=true but the config says false — \
+                 overlay SUPPRESSED: the Groww live feed is retired by operator directive \
+                 2026-07-15 (both brokers are REST-only for market data). Re-enabling requires \
+                 a config change + restart."
+            );
+        }
         config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
     }
     let feeds = &config.feeds;
@@ -492,242 +518,44 @@ async fn main() -> Result<()> {
              feed-gating PR lands"
         );
     }
-    // ── Groww second feed: dormant-until-enabled lanes (operator 2026-06-24) ──
-    // The feed toggle must start/stop the ENTIRE Groww lane LIVE — so the bridge,
-    // the Python-sidecar supervisor, AND the activation watcher are ALL spawned
-    // UNCONDITIONALLY at boot. Each self-idles on `is_enabled(Feed::Groww)` (a
-    // poll, zero Groww work) while OFF, so an OFF Groww feed still touches NOTHING
-    // (no auth, no instruments, no Python) — the OFF-feed-isolation guarantee
-    // holds as a *dormant poll* rather than *not-spawned*. On enable (config OR
-    // the /api/feeds webpage toggle, NO restart) the activation watcher — a
-    // level-triggered reconciler that owns one abortable task — runs the
-    // one-shots (ensure tables → auth smoke → build watch-list) and marks the
-    // lane running ONLY after the watch-list builds (no false-OK); on disable it
-    // aborts the in-flight task so no Groww work continues. The sidecar
-    // supervisor provisions the venv + launches the Python producer; the bridge
-    // tails the producer's tick file. Both self-idle on the same enable flag.
-    // Watch date is computed at ACTIVATION time inside the watcher (so a runtime
-    // re-enable past IST midnight uses today's date, never a stale boot date) —
-    // not pre-computed here.
-    let groww_max_subscribe = std::env::var("GROWW_MAX_SUBSCRIBE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .or(Some(
-            tickvault_core::feed::groww::instruments::GROWW_DEFAULT_MAX_SUBSCRIBE,
-        ));
-    info!(
-        groww_enabled = feeds.groww_enabled,
-        "[feeds] Groww lanes spawned dormant (bridge + sidecar + activation watcher); \
-         they activate on enable (config OR /api/feeds toggle) with no restart"
-    );
-    // Trading calendar for the Groww IST-midnight force-seal boundary task. The
-    // shared `Arc<TradingCalendar>` for the Dhan path is built later in boot
-    // (after the clock-drift check), but the Groww bridge spawns here; both are
-    // built from the SAME `config.trading` (immutable read-only calendar data),
-    // so the trading-day gate is identical. Config is already validated.
-    let groww_trading_calendar = std::sync::Arc::new(
-        TradingCalendar::from_config(&config.trading)
-            .context("failed to build Groww trading calendar")?,
-    );
-    // SUPERVISED (2026-07-02 adversarial-sweep fix): the bridge — the ONLY
-    // consumer of the sidecar NDJSON — used to be a bare tokio::spawn, so a
-    // panic silently stopped all Groww persistence while the stall watchdog
-    // killed the WRONG process (the healthy Python sidecar). The supervisor
-    // respawns it (FEED-SUPERVISOR-01 + tv_feed_supervisor_respawn_total,
-    // WS-GAP-05 pattern); the NDJSON re-tail is DEDUP-idempotent.
-    // §34 auto-scale (PR-2): default OFF → the single-conn spawns below are
-    // byte-identical to the pre-scale boot. When `[feeds.groww.scale]`
-    // enabled=true, the shard-bridge fleet + per-conn sidecar fleet + ladder
-    // replace the single bridge + single sidecar (same aggregator engine,
-    // same ring→spill→DLQ chain, ONE shared capture-seq across shards).
-    let groww_scale_cfg = config.feeds.groww.scale.clone();
-    let groww_shards_root =
-        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_SHARDS_DIR_DEFAULT);
-    // §34 PR-3 (addendum A): the Mac scale-test PREFLIGHT gates the fleet.
-    // On ANY failed check the boot falls back to the SINGLE-CONNECTION Groww
-    // path — capture continues; only the multi-conn experiment is refused.
-    let groww_scale_enabled = groww_scale_cfg.enabled
-        && {
-            let report = tickvault_app::scale_test_preflight::run_scale_preflight(
-                &groww_shards_root,
-                &config.questdb,
-            );
-            let ok = report.all_ok();
-            if !ok {
-                error!(
-                    "[feeds] groww scale PREFLIGHT FAILED — falling back to the                  single-connection Groww path (capture continues; fix the                  failed checks above and restart to run the scale test)"
-                );
-            }
-            ok
+    // ── Order-runtime mark bridge (dry-run PR, 2026-07-14; re-homed
+    // 2026-07-16 after the Groww live feed retired in #1581) ────────────────
+    // Built in the PROCESS-GLOBAL boot prefix so the mark source exists
+    // before any REST-leg spawn. `[order_runtime].enabled = false` → all
+    // three slots stay empty/None and every downstream path is
+    // byte-identical. The receiver is stashed in a take-once slot for the
+    // Dhan REST-only stack's Phase 5b (`spawn_dhan_rest_stack` — the
+    // runtime's single spawn site; 2026-07-17 correction: Phase 5a is the
+    // RETIRED order-update WS slot); the forwarder now rides into the Groww
+    // per-minute REST legs (spot + contract — the live-tick bridge tap died
+    // with the retired Groww live feed): marks are the OWN-FIRE just-closed
+    // 1m candle closes, forwarded at each leg's persist-confirm choke point.
+    let (order_runtime_mark_forwarder, order_runtime_mark_rx_slot, order_runtime_marks_wanted) =
+        if config.order_runtime.enabled {
+            let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
+                tickvault_app::order_runtime::MarkUpdate,
+            >(config.order_runtime.mark_channel_capacity);
+            let marks_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Some(tickvault_app::order_runtime::MarkForwarder {
+                    marks_wanted: std::sync::Arc::clone(&marks_wanted),
+                    tx: mark_tx,
+                }),
+                std::sync::Arc::new(std::sync::Mutex::new(Some(mark_rx))),
+                marks_wanted,
+            )
+        } else {
+            (
+                None,
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
         };
-    // ── Session-B fix #1 (operator go 2026-07-04): Groww FLEET dual-instance
-    // lock. A scale-test boot runs dhan_enabled=false and never reaches the
-    // Dhan RESILIENCE-01 lock, so without THIS gate two hosts (Mac + AWS, or
-    // two Macs) could scale the SAME Groww account simultaneously — a failure
-    // that masquerades as provider throttle. The lock is attempted ONLY after
-    // cfg.enabled + preflight pass (a default boot performs ZERO new SSM
-    // calls). AlreadyHeld / SSM-unavailable-after-retries → fail-closed:
-    // fleet SKIPPED with a GROWW-SCALE-05 Critical page (emitted inside the
-    // gate module via the error! log-sink chain — HONEST delivery boundary:
-    // no typed Telegram NotificationEvent exists for this code yet, so
-    // boot-stage delivery is log-sink + CloudWatch-log-derived alerting
-    // only; the deferred Telegram notifier slot is not filled at this boot
-    // stage), single-connection fallback, app keeps running. See
-    // groww-scale-error-codes.md §4b. The guard is handed to
-    // `run_process_runloop`, which calls `release_on_shutdown()` at
-    // graceful teardown so the SSM slot frees IMMEDIATELY for a same-host
-    // restart (2026-07-04 adversarial-review HIGH fix; hard crash still
-    // relies on the 90s TTL).
-    let mut groww_scale_fleet_lock: Option<
-        tickvault_app::groww_scale_lock::GrowwScaleFleetLockGuard,
-    > = None;
-    let groww_scale_enabled = if groww_scale_enabled {
-        match tickvault_app::groww_scale_lock::acquire_groww_scale_fleet_lock().await {
-            tickvault_app::groww_scale_lock::GrowwScaleFleetLockOutcome::Acquired(guard) => {
-                groww_scale_fleet_lock = Some(guard);
-                true
-            }
-            tickvault_app::groww_scale_lock::GrowwScaleFleetLockOutcome::SkipFleet => false,
-        }
-    } else {
-        false
-    };
-    // Deferred Telegram slot shared by the Groww bridge + sidecar supervisor +
-    // activation watcher: all three spawn here (before the notifier is built),
-    // so they get a shared slot that is filled with the live
-    // `NotificationService` once it exists (below). Declared BEFORE the bridge
-    // spawn (2026-07-04 boot-visibility parity) so the bridge can emit the
-    // boot-stage "feed connected — awaiting first tick" ping.
-    let groww_sidecar_notifier_slot: std::sync::Arc<
-        arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>,
-    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
-    // Watch-entries slot: the activation watcher publishes the daily
-    // subscribe set here so the ladder can cut shards (scale mode only).
-    let groww_scale_entries: std::sync::Arc<
-        arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>,
-    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
-    // ── Groww capture rotation-at-open — PROCESS-GLOBAL, BEFORE both spawns ──
-    // 2026-07-13 disk-retention hardening (review round 1 redesign, F1+F2):
-    // rotate a stale previous-IST-day capture file HERE, synchronously,
-    // strictly BEFORE the Groww bridge task AND the sidecar supervisor spawn
-    // below — ordering holds by construction on EVERY boot arm (this is the
-    // single shared spawn site; the ratchet in disk_retention_wiring_guard.rs
-    // pins the source order). Only Rust renames at open: the rename completes
-    // before the sidecar process exists (it can never re-open the old inode)
-    // and before the bridge's one-shot archive-drain decision runs (F1), and
-    // the archive is named by the bridge's snapshot day — the exact name
-    // drain_archive_tail_if_needed probes (F2). Scale-lab per-conn shard
-    // captures (main-locked-out, dev only) are not rotated at open.
-    let _rotated_capture = tickvault_app::groww_bridge::rotate_stale_groww_capture_at_open(
-        std::path::Path::new(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
-    );
-    if groww_scale_enabled {
-        let _groww_shard_bridges =
-            tickvault_app::groww_bridge::spawn_supervised_groww_shard_bridges(
-                config.questdb.clone(),
-                groww_shards_root.clone(),
-                groww_scale_cfg.target_connections,
-                std::sync::Arc::clone(&feed_runtime),
-                std::sync::Arc::clone(&feed_health),
-                Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
-                // 2026-07-04 boot-visibility parity: the boot-stage
-                // "connected — awaiting first tick" Telegram ping.
-                Some(std::sync::Arc::clone(&groww_sidecar_notifier_slot)),
-                groww_trading_calendar,
-            );
-    } else {
-        let _groww_bridge_supervisor = tickvault_app::groww_bridge::spawn_supervised_groww_bridge(
-            config.questdb.clone(),
-            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
-            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
-            std::sync::Arc::clone(&feed_runtime),
-            std::sync::Arc::clone(&feed_health),
-            // ws_event_audit forensic sender (2026-06-29): one `feed='groww'` row per
-            // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
-            // order-update use. Closes the audit gap (Groww connected but wrote no row).
-            Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
-            // 2026-07-04 boot-visibility parity: the boot-stage
-            // "connected — awaiting first tick" Telegram ping (same
-            // lazily-filled slot the sidecar supervisor uses).
-            Some(std::sync::Arc::clone(&groww_sidecar_notifier_slot)),
-            // Trading calendar (2026-06-29): drives the Groww IST-midnight force-seal
-            // boundary task's trading-day gate — built from the SAME `config.trading`
-            // the Dhan IST-midnight force-seal calendar uses.
-            groww_trading_calendar,
-        );
-    }
-    // On a sidecar auth/entitlement/error diagnostic the sidecar supervisor
-    // fires ONE `GrowwSidecarRejected` Telegram event (via the shared
-    // `groww_sidecar_notifier_slot` declared above) + marks Groww rejected in
-    // feed_health — so the operator sees WHY Groww has 0 ticks instead of a
-    // silent log line.
-    // FEED-SUPERVISOR-01: spawn the feed-agnostic sidecar supervisor under a
-    // respawning wrapper so the stall-watchdog (FEED-STALL-01) can never die
-    // silently — a panic/return respawns it (WS-GAP-05 / DISK-WATCHER-01 pattern).
-    // Disk-retention hardening (2026-07-13): thread the capture-archive S3
-    // destination from `[feeds.groww]` into the sidecar child env so rotated
-    // capture archives are verified-offloaded to S3 instead of accumulating
-    // unbounded on the 30 GB root EBS. Empty bucket = archival OFF.
-    let groww_sidecar_options = tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions {
-        archive_s3_bucket: config.feeds.groww.capture_archive_s3_bucket.clone(),
-        archive_s3_prefix: config.feeds.groww.capture_archive_s3_prefix.clone(),
-        // FIX-B (2026-07-14): boot-time episode_mode selects the reject-page
-        // cooldown (60s with the GrowwFeed episode fold ON, legacy 1800s when
-        // the episode kill switch is OFF). Runtime config flip = restart,
-        // consistent with how episode_mode itself is consumed.
-        episode_mode: config.notification.episode_mode,
-        ..tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default()
-    };
-    if groww_scale_enabled {
-        // §34: the ladder publishes desired_conns; the fleet reconciles the
-        // per-conn Python children to it (spawn missing / kill newest).
-        let scale_runtime = tickvault_app::groww_scale_ladder::GrowwScaleRuntime::default();
-        let _groww_fleet = tickvault_app::groww_sidecar_supervisor::spawn_groww_scale_fleet(
-            std::sync::Arc::clone(&feed_runtime),
-            groww_sidecar_options.clone(),
-            groww_shards_root.clone(),
-            std::sync::Arc::clone(&scale_runtime.desired_conns),
-            std::sync::Arc::clone(&scale_runtime.wake),
-            std::sync::Arc::clone(&feed_health),
-            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
-            // Scoreboard PR-B (2026-07-10): stall-watchdog kill+relaunch
-            // forensic rows (`stall_restarted`) — same consumer pattern as
-            // the bridge's lifecycle rows.
-            Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
-        );
-        tokio::spawn(tickvault_app::groww_scale_ladder::run_groww_scale_ladder(
-            groww_scale_cfg.clone(),
-            config.questdb.clone(),
-            std::sync::Arc::clone(&feed_runtime),
-            std::sync::Arc::clone(&feed_health),
-            scale_runtime,
-            std::sync::Arc::clone(&groww_scale_entries),
-            groww_shards_root.clone(),
-        ));
-    } else {
-        tickvault_app::groww_sidecar_supervisor::spawn_supervised_groww_sidecar_supervisor(
-            std::sync::Arc::clone(&feed_runtime),
-            groww_sidecar_options.clone(),
-            std::sync::Arc::clone(&feed_health),
-            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
-            // Scoreboard PR-B (2026-07-10): every stall-watchdog
-            // kill+relaunch stamps ONE `stall_restarted` ws_event_audit row
-            // (fixed cause slug in `source`) so the 15:45 IST scorecard
-            // counts stall episodes — same consumer the bridge uses.
-            Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
-        );
-    }
-    // ── Groww exchange-lag publisher — PROCESS-GLOBAL boot prefix ──
-    // Scoreboard PR-C: publishes `tv_groww_exchange_lag_p99_seconds` (the
-    // Groww gauge's OWN name — never the Dhan gauge). Spawned here, next to
-    // the Groww bridge supervisor, so it runs on EVERY boot mode (fast
-    // crash-recovery included) — the single-site mirror of the Dhan
-    // publisher's dual-arm wiring. Inert while Groww is disabled (empty
-    // ring → the ≥50-sample gate publishes nothing).
-    let _groww_lag_publisher_supervisor = spawn_supervised_groww_lag_publisher();
     // ── per-instrument presence registry init — PROCESS-GLOBAL boot prefix ──
-    // Scoreboard PR-D fix round 1 (review HIGH): init MUST precede BOTH the
-    // Groww activation watcher spawn below AND both boot arms'
+    // Scoreboard PR-D fix round 1 (review HIGH; 2026-07-15: the Groww
+    // activation watcher this originally ordered against retired with the
+    // Groww live feed — init stays the single process-global site): init
+    // MUST precede any registration producer AND both boot arms'
     // `load_instruments` — `feed_presence::register_instruments` is a
     // GLOBAL.get() free fn that silently no-ops pre-init, so the previous
     // fast-arm init site (~1,000 lines after its load_instruments)
@@ -743,52 +571,19 @@ async fn main() -> Result<()> {
     );
     // ── index_constituency ts-pin migration — PROCESS-GLOBAL boot prefix ──
     // F13/F14 hardening (2026-07-05): the one-shot, marker-gated TRUNCATE
-    // migration runs here — BEFORE the Groww activation watcher and regardless
+    // migration runs here — BEFORE the [groww_universe] daily rider and regardless
     // of `feeds.dhan_enabled` (it needs only the QuestDB config) — so the
     // `index_constituency_migration_gate` the Groww shared-master writer
     // awaits is marked within its bounded 120s wait on EVERY boot mode. The
-    // wrapper's exactly-once latch (F15) means the Dhan lane's later
-    // defense-in-depth call can never fire a LATE first truncate that wipes
-    // just-written `feed='groww'` rows. Ratchet:
-    // `index_constituency_boot::tests::ratchet_ts_pin_migration_spawns_before_groww_watcher`.
+    // wrapper's exactly-once latch (F15) means a later defense-in-depth call
+    // can never fire a LATE first truncate that wipes just-written
+    // `feed='groww'` rows. Ratchet:
+    // `index_constituency_boot::tests::ratchet_ts_pin_migration_spawns_before_groww_universe_rider`.
     tokio::spawn(
         tickvault_app::index_constituency_boot::run_index_constituency_ts_pin_migration_at_boot(
             config.questdb.clone(),
         ),
     );
-    tokio::spawn(
-        tickvault_app::groww_activation::run_groww_activation_watcher(
-            std::sync::Arc::clone(&feed_runtime),
-            std::sync::Arc::clone(&feed_health),
-            config.questdb.clone(),
-            groww_max_subscribe,
-            config.network.request_timeout_ms,
-            // 2026-07-03 Telegram feed parity: same lazily-filled notifier
-            // slot the sidecar supervisor uses — carries the Groww
-            // instruments-load Info ping once the watch-set resolves.
-            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
-            // §34: in scale mode the watcher publishes the daily subscribe
-            // set here so the ladder can cut shards. `None` (scale OFF) is
-            // byte-identical to the pre-scale watcher behavior.
-            groww_scale_enabled.then(|| std::sync::Arc::clone(&groww_scale_entries)),
-        ),
-    );
-    // ── Groww NATIVE-RUST shadow client (PR-R1, operator "go" 2026-07-04) ──
-    // Default-OFF behind `[feeds] groww_native_shadow`. When enabled it runs
-    // ALONGSIDE the Python sidecar (same watch file, own NDJSON capture at
-    // data/groww/rust-live-ticks.ndjson) for the exact per-tick parity
-    // comparer. Shadow-only: NO shared-table writes, NO strategy/order wiring,
-    // NO sidecar changes — the flag is the kill switch.
-    if config.feeds.groww_native_shadow {
-        let _groww_native_shadow_supervisor =
-            tickvault_app::groww_native_shadow::spawn_supervised_groww_native_shadow(
-                std::path::PathBuf::from(tickvault_common::constants::GROWW_DATA_DIR),
-            );
-        tracing::info!(
-            "groww native shadow client ENABLED (PR-R1) — capturing to {}",
-            tickvault_common::constants::GROWW_NATIVE_SHADOW_NDJSON_PATH
-        );
-    }
     // PR-C2 (2026-07-13): the Dhan dormant activation watcher
     // (`dhan_activation.rs`) and the D2b runtime cold-start supervisor
     // (`run_dhan_lane_runtime_supervisor` + `dhan_lane_ctx_cell`) that were
@@ -833,6 +628,14 @@ async fn main() -> Result<()> {
         tracing::warn!("session TradingCalendar already installed — skipping");
     }
 
+    // Deferred Telegram notifier slot — declared BEFORE the notifier is
+    // built; filled with the live `NotificationService` once shared infra
+    // constructs it below. Survivor of the 2026-07-15 Groww live-feed
+    // deletion (it used to be shared with the bridge/sidecar/activation
+    // lanes): the calendar-staleness watchdog still consumes it.
+    let deferred_notifier_slot: std::sync::Arc<
+        arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>,
+    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
     // W2 PR#5 (2026-07-10, audit follow-up row 15) — holiday-calendar
     // coverage-horizon staleness watchdog. Spawned in the COMMON boot prefix
     // (every path: fast/slow/Groww-only) so the boot-time check gives daily
@@ -845,7 +648,7 @@ async fn main() -> Result<()> {
     let _calendar_staleness_watchdog =
         tickvault_app::calendar_staleness::spawn_calendar_staleness_watchdog(
             trading_calendar.clone(),
-            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
+            std::sync::Arc::clone(&deferred_notifier_slot),
         );
 
     // Wave 2 — install global QuestDB config so any module can emit
@@ -993,43 +796,6 @@ async fn main() -> Result<()> {
     // because handles created pre-install resolve to a no-op counter.
     tickvault_core::parser::prewarm_dispatcher_counters();
 
-    // Pre-register the Groww sidecar stall-restart counter at 0 — HERE,
-    // immediately after the recorder installs (round-5 review fix,
-    // 2026-07-06). The round-4 attempt registered it at the TOP of
-    // `run_groww_sidecar_supervisor`, but that supervisor is spawned much
-    // earlier in this fn (before the STAGE-C WAL replay, well before this
-    // Step 2 install), so its `counter!` handle resolved to the no-op
-    // recorder and NO registration happened — the series was still lazily
-    // born at the first real restart, whose sample the CW agent's delta
-    // pipeline drops as its baseline (feed-stall-restart-alarm.tf
-    // FIRST-SAMPLE BASELINE): restart #1 of every app session was lost and
-    // the tv-<env>-feed-stall-restarts pager's effective first-episode
-    // threshold was 4, not 3. Registering post-install makes the series
-    // DENSE from boot (a 0-delta /metrics event per 60s scrape), so the
-    // dropped first sample is the harmless 0 baseline and the pager
-    // genuinely sees every restart, including the session's first.
-    // Honest residual: a stall-restart landing in the pre-install boot
-    // window (between the supervisor spawn and this line) would increment a
-    // no-op handle and go uncounted — physically implausible (it needs a
-    // sidecar launch + a recorded tick + >30s feed silence inside the boot
-    // prefix). Ratchet (source-order scan of this file):
-    // groww_sidecar_supervisor::tests::test_stall_restart_counter_is_preregistered_after_recorder_install.
-    metrics::counter!(
-        "tv_feed_sidecar_stall_restart_total",
-        "feed" => tickvault_common::feed::Feed::Groww.as_str(),
-    )
-    .increment(0);
-    // Never-streamed attribution counter (2026-07-09 reject-loop hardening):
-    // same delta-baseline rationale as the counter above — pre-register so
-    // the CW agent's dropped-first-sample can never eat the session's first
-    // never-streamed restart from the attribution split. The pager math is
-    // unaffected (never-streamed restarts ALSO increment the stall counter
-    // above, which the tv-<env>-feed-stall-restarts alarm reads).
-    metrics::counter!(
-        "tv_feed_sidecar_never_streamed_restart_total",
-        "feed" => tickvault_common::feed::Feed::Groww.as_str(),
-    )
-    .increment(0);
     // Seal-writer TRUE-DROP counter (2026-07-09 candle-drop paging PR):
     // same delta-baseline rationale as the two registrations above — the CW
     // agent's prometheus pipeline drops each counter series' FIRST sample
@@ -1698,12 +1464,12 @@ async fn main() -> Result<()> {
     // boot path too. Before this, only the FAST boot path stored the notifier
     // (the store next to `fast_notifier` above) — the slow-boot / GROWW-ONLY
     // shared-infra path never filled the slot, so every Groww boot-stage ping
-    // (FeedAuthOk / FeedInstrumentsLoaded / sidecar-reject / connected) waited
+    // (calendar-staleness etc.) waited
     // out its budget and was skipped ("notifier slot never filled within the
     // wait budget"). Provably safe here: the notifier is fully constructed
     // (strict init + coalescer wrap) inside `build_shared_infra` before this
     // line runs — the exact mirror of the fast-path store.
-    groww_sidecar_notifier_slot.store(Some(std::sync::Arc::clone(&notifier)));
+    deferred_notifier_slot.store(Some(std::sync::Arc::clone(&notifier)));
 
     // =======================================================================
     // PROCESS-GLOBAL supervised observability monitors (2026-07-01 per-lane-leak
@@ -1785,6 +1551,25 @@ async fn main() -> Result<()> {
             ),
         );
 
+    // [groww_universe] daily Groww watch-set + shared-master rider —
+    // PROCESS-GLOBAL (2026-07-15 Groww live-feed retirement re-home, next to
+    // the sibling process-global monitors above): once per IST day, build +
+    // write data/groww/groww-watch-<date>.json (the spot leg's VIX resolver
+    // reads it) and fire-and-forget persist_groww_instruments (SEBI
+    // feed='groww' master continuity). Config-gated ([groww_universe]
+    // enabled, serde default OFF; base.toml opts in); disabled = one info! +
+    // nothing spawned. Independent of feeds.groww_enabled / the retired live
+    // lane — the REST-legs pattern (main.rs Groww REST spawns).
+    if config.groww_universe.enabled {
+        let _groww_universe_rider =
+            tickvault_app::groww_universe::spawn_groww_universe_rider(config.questdb.clone());
+    } else {
+        info!(
+            "[groww_universe] disabled — daily Groww watch-set rider not spawned \
+             (spot-leg VIX resolution + feed='groww' master continuity degrade)"
+        );
+    }
+
     // Daily 15:40 IST per-feed tick-conservation audit — PROCESS-GLOBAL
     // (2026-07-02 adversarial-sweep fix). Previously nested inside the
     // Dhan-gated `spawn_post_market_tasks`, so a Groww-only session ran ZERO
@@ -1852,7 +1637,33 @@ async fn main() -> Result<()> {
     // Groww 1m OHLCV for the 3 spot indices and persists to `spot_1m_rest`
     // tagged feed='groww' (+ `rest_fetch_audit` forensics rows). See
     // `spawn_groww_spot_1m_leg`.
-    spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+    // Order-runtime mark tap (re-homed 2026-07-16): the forwarder rides
+    // into the Groww REST legs (spot + contract) — the only mark sources
+    // since the live bridge retired. `None` when `[order_runtime]` is off.
+    spawn_groww_spot_1m_leg(
+        &config,
+        &notifier,
+        &trading_calendar,
+        order_runtime_mark_forwarder,
+    );
+
+    // Groww order/position PUSH channel — Stage D (operator-authorized
+    // paper-mode receive-only build, 2026-07-17): the supervised
+    // NATS-over-WS push runner fanning full-fidelity order events into the
+    // bounded order_audit sink. Gated BOTH on the non-default
+    // `groww_orders` cargo feature (§39.2 Gate 2 — a default build carries
+    // no Groww order code) AND the runtime `[groww_orders]
+    // order_push_enabled` flag (Gate 1, default OFF).
+    #[cfg(feature = "groww_orders")]
+    {
+        if config.groww_orders.order_push_enabled {
+            tickvault_app::groww_order_observability::spawn_groww_order_push(&config.questdb);
+        } else {
+            info!(
+                "groww order push disabled (config) — receive-only order/position channel not spawned"
+            );
+        }
+    }
 
     // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
     // the conservation audit + scoreboard above (operator 2026-07-13):
@@ -1865,6 +1676,30 @@ async fn main() -> Result<()> {
     tickvault_app::tf_consistency_boot::spawn_tf_consistency_tasks(
         &config,
         &trading_calendar,
+        &notifier,
+    );
+
+    // Post-close Dhan↔Groww spot_1m_rest cross-broker OHLC comparator
+    // (SPOT-XVERIFY-01/02) — PROCESS-GLOBAL, config-gated (`[spot_crossverify]
+    // enabled`), 15:47 IST, DEDUP-idempotent. See
+    // `spot_crossverify_boot::spawn_spot_crossverify_tasks`.
+    tickvault_app::spot_crossverify_boot::spawn_spot_crossverify_tasks(
+        &config,
+        &trading_calendar,
+        &notifier,
+    );
+
+    // Judge-locked cadence scheduler — PROCESS-GLOBAL like the verifier
+    // above (2026-07-14): per-minute chain + spot fire timing with
+    // structural zero-429 gates, failure ladder, and event-driven dry-run
+    // decisions (CADENCE-01/02/03). Config-gated (`[cadence] enabled`,
+    // ships false); dry-run executors both lanes — NO REST caller in this
+    // PR; the once-per-process AtomicBool inside makes the fast-arm +
+    // prefix dual-spawn safe. See `cadence_boot::spawn_cadence_scheduler`.
+    let _cadence_shutdown = tickvault_app::cadence_boot::spawn_cadence_scheduler(
+        &config,
+        &trading_calendar,
+        &feed_runtime,
         &notifier,
     );
 
@@ -2041,6 +1876,16 @@ async fn main() -> Result<()> {
             notifier: std::sync::Arc::clone(&notifier),
             calendar: std::sync::Arc::clone(&trading_calendar),
             feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            // Order-runtime dry-run PR (2026-07-14, SOCKET-FREE per the
+            // same-day operator Dhan noise lock): only the mark bridge
+            // rides in — no order-update WS, no WAL capture / boot drain
+            // (both gated behind a fresh dated operator quote in
+            // dhan-rest-only-noise-lock-2026-07-14 §3). Post-C2 the stack
+            // spawns UNCONDITIONALLY, so `[order_runtime]` is never inert
+            // on any boot shape (the pre-C2 E6 dhan-ON warn is retired
+            // with the lane).
+            mark_rx_slot: std::sync::Arc::clone(&order_runtime_mark_rx_slot),
+            marks_wanted: std::sync::Arc::clone(&order_runtime_marks_wanted),
             // PR-C2: the stack owns the /health token-block writer.
             health: health_status.clone(),
         },
@@ -2096,7 +1941,6 @@ async fn main() -> Result<()> {
         &notifier,
         &config,
         trading_calendar.clone(),
-        groww_scale_fleet_lock,
     )
     .await
 }
@@ -2969,6 +2813,58 @@ async fn build_shared_infra(
     // --- Health registry (drives /health + /api/feeds/health) ---
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
+    // BOOT-03 (Wave-2-C Item 7.3): clock-skew boot gate. Wall-clock drift
+    // vs a trusted source (chronyc PRIMARY, QuestDB now() FALLBACK) that
+    // exceeds CLOCK_SKEW_HALT_THRESHOLD_SECS can silently split/merge trading
+    // days in QuestDB DEDUP keys — so HALT boot. Runs on every boot path
+    // before the seal-writer starts. QuestDB is up by here (ensure_infra_running
+    // above). A probe that CANNOT run (no chrony + QuestDB unreachable) degrades
+    // and PROCEEDS — a dev box without chrony must still boot (per
+    // test_enforce_clock_skew_at_boot_unavailable_does_not_halt).
+    match infra::enforce_clock_skew_at_boot(
+        &config.questdb,
+        tickvault_common::constants::CLOCK_SKEW_HALT_THRESHOLD_SECS,
+    )
+    .await
+    {
+        Ok(sample) => {
+            info!(
+                skew_secs = sample.skew_secs,
+                source = sample.source,
+                "BOOT-03: clock-skew gate passed"
+            );
+        }
+        Err(infra::ClockSkewError::ThresholdExceeded {
+            skew_secs,
+            threshold_secs,
+            source,
+        }) => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded.code_str(),
+                skew_secs,
+                threshold_secs,
+                source,
+                "BOOT-03: wall-clock skew exceeds threshold — REFUSING BOOT"
+            );
+            notifier.notify(NotificationEvent::BootClockSkewExceeded {
+                skew_secs,
+                threshold_secs,
+                source: source.to_string(),
+            });
+            return Err(anyhow::anyhow!(
+                "BOOT-03 clock skew {skew_secs:+.3}s exceeds threshold {threshold_secs:.2}s"
+            ));
+        }
+        Err(unavailable) => {
+            // Both probes failed (no chrony + QuestDB now() unreachable) —
+            // degrade, do NOT halt. Dev boxes without chrony still boot.
+            warn!(
+                error = %unavailable,
+                "BOOT-03: clock-skew probe unavailable — proceeding without the gate"
+            );
+        }
+    }
+
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
 
@@ -2991,9 +2887,12 @@ async fn build_shared_infra(
     // PUBLISHER-LESS (the lane's `run_tick_processor` is deleted; Groww runs
     // its own writer + aggregator instance), so these consumers idle. The
     // wiring stays: the `spawn_seal_writer_loop` above installed the
-    // process-wide `global_seal_sender` that Groww's OWN aggregator drains
-    // through (load-bearing), and this Dhan aggregator instance's force-seal
-    // tasks are idempotent no-ops on its empty state.
+    // process-wide `global_seal_sender` — since 2026-07-15 (Groww live-feed
+    // retirement) it has NO live-producing aggregator either (the Groww
+    // instance died with the bridge), so the whole seal chain is DORMANT on
+    // the REST-only runtime — and this Dhan aggregator instance's force-seal
+    // tasks are idempotent no-ops on its empty state. The committed C-phase
+    // follow-up retires the candle machinery wholesale.
     {
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
@@ -3023,7 +2922,85 @@ async fn build_shared_infra(
             "L10 tick_storage broadcast consumer spawned + IST 09:15 reset task running"
         );
     }
-    info!("SHARED-INFRA BOOT: seal-writer + 21-TF aggregator running (Groww candles can seal)");
+    // (2026-07-15 wording fix: with the Groww live feed retired the aggregator
+    // has NO live tick producer — candle aggregation is DORMANT machinery on a
+    // REST-only boot; the committed C-phase follow-up owns its retirement.)
+    info!(
+        "SHARED-INFRA BOOT: seal-writer + 21-TF aggregator running (DORMANT — no live \
+         tick producer on the REST-only runtime; candle machinery retires in the \
+         committed C-phase follow-up)"
+    );
+
+    // --- RAM residency stores (operator directive 2026-07-16, PR-2) ---
+    // Installed BEFORE the fold spawn below so PR-1's boot catch-up
+    // populates the month-deep spot rings (pre-market spot rehydration IS
+    // the catch-up — zero new spot reads); the chain-day rehydrate +
+    // stats/heartbeat tasks ride alongside. Config-gated (fail-safe serde
+    // default OFF; base.toml opts in); cold path only.
+    // RAMSTORE-01 runbook: .claude/rules/project/ram-store-error-codes.md
+    if config.market_ram_store.enabled {
+        tickvault_app::market_ram_store_boot::install_market_ram_stores(
+            &config.market_ram_store,
+            config.rest_candle_fold.catchup_days,
+        );
+        let _ram_store_rehydrate =
+            tickvault_app::market_ram_store_boot::spawn_chain_day_rehydrate(config.questdb.clone());
+        let _ram_store_stats = tickvault_app::market_ram_store_boot::spawn_ram_store_stats_task();
+        info!(
+            spot_days = config.market_ram_store.spot_days,
+            chain_row_cap = config.market_ram_store.chain_row_cap,
+            "market_ram_store: RAM residency ARMED — spots month-deep (filled by \
+             the fold catch-up + live seals), options current-day (chain publishes \
+             + boot rehydrate); depth gauges show the honest fill level"
+        );
+    } else {
+        info!(
+            "market_ram_store: disabled by config ([market_ram_store] enabled = false) \
+             — spot/chain RAM residency stores NOT installed this boot (QuestDB \
+             remains the only read surface)"
+        );
+    }
+
+    // --- REST-era candle derivation (operator directive 2026-07-16) ---
+    // Folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
+    // timeframes through the shared seal-writer channel installed just above
+    // (the seal chain is no longer dormant — this is its REST-era producer),
+    // plus a boot catch-up over the stored month. Config-gated (fail-safe
+    // serde default OFF; base.toml opts in); supervised; cold path only.
+    // FOLD-01 runbook: .claude/rules/project/rest-candle-fold-error-codes.md
+    if config.rest_candle_fold.enabled {
+        let (fold_bar_tx, fold_bar_rx) =
+            tokio::sync::mpsc::channel(tickvault_app::rest_candle_fold::FOLD_BAR_CHANNEL_CAPACITY);
+        if tickvault_app::rest_candle_fold::set_global_fold_bar_sender(fold_bar_tx) {
+            let _rest_candle_fold_supervisor =
+                tickvault_app::rest_candle_fold::spawn_supervised_rest_candle_fold(
+                    config.rest_candle_fold.clone(),
+                    config.questdb.clone(),
+                    fold_bar_rx,
+                );
+            info!(
+                catchup_days = config.rest_candle_fold.catchup_days,
+                "rest_candle_fold: REST-era candle derivation ARMED — spot legs hand \
+                 off persist-confirmed 1m bars; boot catch-up re-folds the stored \
+                 month into all 21 timeframes (candles_1m..candles_1d populate again)"
+            );
+        } else {
+            // LOW: first-wins refusal — a duplicate install means a second
+            // spawn attempt in one process (defensive; loud, never silent).
+            error!(
+                code = tickvault_common::error_code::ErrorCode::RestCandleFold01Degraded.code_str(),
+                stage = "sender_install",
+                "rest_candle_fold: global fold-bar sender was ALREADY installed — \
+                 duplicate fold spawn REFUSED (the first installation's task keeps \
+                 running; this receiver is dropped unused)"
+            );
+        }
+    } else {
+        info!(
+            "rest_candle_fold: disabled by config ([rest_candle_fold] enabled = false) \
+             — candles_* stay REST-underived this boot"
+        );
+    }
 
     // --- HTTP API server (incl. /api/feeds toggle routes) — C1 fix ---
     let api_state = SharedAppState::new_with_feed_runtime_and_health(
@@ -3096,11 +3073,6 @@ async fn run_process_runloop(
     // calendar (Saturday/Sunday/holiday suppression). See
     // `boot_helpers::should_emit_post_market_alert`.
     trading_calendar: std::sync::Arc<TradingCalendar>,
-    // Session-B HIGH fix (2026-07-04 adversarial review): the Groww
-    // scale-fleet dual-instance lock guard, released at graceful teardown
-    // below so a same-host restart never sees its own dead slot as a peer.
-    // `None` on every non-scale boot (the overwhelming default).
-    groww_scale_fleet_lock: Option<tickvault_app::groww_scale_lock::GrowwScaleFleetLockGuard>,
 ) -> Result<()> {
     let mode = "LIVE";
     info!(
@@ -3112,12 +3084,18 @@ async fn run_process_runloop(
     // 2026-07-13 operator visibility rider: the boot Telegram states what
     // the per-minute Dhan REST legs will ACTUALLY do today (config truth) —
     // a midnight boot is otherwise silent about them until 09:16 IST.
+    // 2026-07-17 truth-sync: the cadence scheduler's Dhan lane is the
+    // per-minute author now (the legacy legs ship enabled = false under
+    // the RS3 mutual exclusion), so the report ORs in the cadence lane —
+    // otherwise the boot Telegram claimed Dhan capture OFF on every boot.
     notifier.notify(NotificationEvent::StartupComplete {
         mode,
-        spot_1m_enabled: config.spot_1m_rest.enabled,
+        spot_1m_enabled: config.spot_1m_rest.enabled
+            || (config.cadence.enabled && config.cadence.dhan_lane),
         spot_1m_indices: u32::try_from(tickvault_common::constants::SPOT_1M_REST_INDICES.len())
             .unwrap_or(0),
-        chain_1m_enabled: config.option_chain_1m.enabled,
+        chain_1m_enabled: config.option_chain_1m.enabled
+            || (config.cadence.enabled && config.cadence.dhan_lane),
         chain_1m_underlyings: u32::try_from(
             tickvault_common::constants::CHAIN_1M_UNDERLYINGS.len(),
         )
@@ -3139,7 +3117,11 @@ async fn run_process_runloop(
         }
     };
 
-    if shutdown_reason == "market_close" {
+    // 2026-07-15 shutdown classification: the signal kind that actually
+    // ended the run (previously logged then DROPPED) is threaded into the
+    // ShutdownInitiated event so a scheduled 4:30 PM IST stop renders one
+    // quiet line instead of paging like an incident.
+    let final_signal: &'static str = if shutdown_reason == "market_close" {
         info!("market close reached — post-market housekeeping, API stays alive");
         // 2026-05-02: suppress the Post-Market Telegram on non-trading
         // days (Saturday / Sunday / NSE holidays) where no market open
@@ -3262,11 +3244,50 @@ async fn run_process_runloop(
             reason,
             "shutdown signal received — stopping remaining services"
         );
+        reason
     } else {
         info!("shutdown signal received — stopping gracefully");
-    }
+        shutdown_reason
+    };
 
-    notifier.notify(NotificationEvent::ShutdownInitiated);
+    // Classify the stop (pure fn; fails toward ExternalStop — loud — on any
+    // doubt). Inputs are all in-process: the signal kind, the runtime
+    // source badge, the IST clock, and the trading calendar.
+    let shutdown_class = {
+        use chrono::{Datelike, Timelike};
+        let now_ist =
+            chrono::Utc::now().with_timezone(&tickvault_common::trading_calendar::ist_offset());
+        let today_ist = now_ist.date_naive();
+        let is_weekday = !matches!(
+            today_ist.weekday(),
+            chrono::Weekday::Sat | chrono::Weekday::Sun
+        );
+        let is_aws = matches!(
+            tickvault_core::notification::source_badge::runtime_source(),
+            tickvault_core::notification::source_badge::RuntimeSource::Aws
+        );
+        tickvault_app::shutdown_class::classify_shutdown(
+            final_signal,
+            is_aws,
+            now_ist.time().num_seconds_from_midnight(),
+            is_weekday,
+            trading_calendar.is_trading_day(today_ist),
+        )
+    };
+    info!(
+        signal = final_signal,
+        class = ?shutdown_class,
+        "shutdown classified"
+    );
+    notifier.notify(NotificationEvent::ShutdownInitiated {
+        class: shutdown_class,
+    });
+
+    // Cadence runner graceful teardown (verifier F2, 2026-07-15): the
+    // spawn's Notify previously parked unnotified in a `_cadence_shutdown`
+    // binding — the runner never saw a graceful shutdown. No-op when the
+    // scheduler is disabled / never spawned.
+    tickvault_app::cadence_boot::notify_cadence_shutdown();
 
     // Second Ctrl+C → force exit.
     tokio::spawn(async {
@@ -3277,20 +3298,6 @@ async fn run_process_runloop(
 
     // (PR-C2, 2026-07-13: the Dhan-lane teardown steps 1–5 are deleted with
     // the lane — the PROCESS infra below is torn down regardless.)
-
-    // 5b. Release the Groww scale-fleet dual-instance lock (2026-07-04
-    // adversarial-review HIGH fix). Without this, every clean shutdown left
-    // the SSM slot fresh for up to 90s (TTL), so a same-host restart — the
-    // dominant Mac scale-test iteration workflow — saw its OWN dead slot as
-    // a fresh AlreadyHeld peer: fleet refused for the whole session + a
-    // false-positive GROWW-SCALE-05 page naming the operator's previous
-    // pid. `release_on_shutdown` is permit-based (Rule 16 lost-wake safe)
-    // and bounded (GROWW_SCALE_LOCK_RELEASE_TIMEOUT_SECS), so a black-holed
-    // SSM endpoint can never hang process exit; on timeout the 90s TTL
-    // remains the backstop.
-    if let Some(fleet_lock) = groww_scale_fleet_lock {
-        fleet_lock.release_on_shutdown().await;
-    }
 
     // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
     // summaries + write the final episode snapshot (bounded 10s inside
@@ -3346,59 +3353,6 @@ async fn wait_for_shutdown_signal() -> &'static str {
         let _ = tokio::signal::ctrl_c().await;
         "ctrl_c"
     }
-}
-
-/// Bounded backoff between Dhan exchange-lag publisher respawns (silent-feed
-/// hardening Item 4). Mirrors [`SLO_PUBLISHER_RESPAWN_BACKOFF_SECS`]: long
-/// enough to avoid a hot respawn loop, short enough that the
-/// `tv_dhan_exchange_lag_p99_seconds` stream resumes well inside one alarm
-/// evaluation period (the lag alarm needs 10 consecutive breaching minutes).
-const FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS: u64 = 5;
-
-/// Scoreboard PR-C — supervise the GROWW exchange-lag p99 publisher
-/// (`tickvault_core::pipeline::feed_lag_monitor::run_groww_lag_publisher`,
-/// gauge `tv_groww_exchange_lag_p99_seconds` — its OWN name, never the Dhan
-/// gauge; an EMF `feed` label would fold the series together).
-///
-/// Spawned ONCE from the process-global boot prefix (next to the Groww
-/// bridge supervisor — it runs on EVERY boot mode, so no fast/slow
-/// dual-site + once-guard is needed; the single call site is pinned by
-/// `test_groww_lag_publisher_supervisor_is_wired_into_main` in
-/// secret_manager.rs). With the Groww feed disabled the ring stays empty,
-/// the ≥50-sample gate publishes nothing, and the task is inert.
-///
-/// Same SLO-03 / WS-GAP-05 supervisor semantics as the Dhan one: on every
-/// publisher death it logs `error!`, increments its OWN respawn counter
-/// `tv_groww_lag_publisher_respawn_total{reason}`, backs off
-/// [`FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS`], and respawns — the gauge
-/// stream can never vanish silently. No dedicated `ErrorCode` (same
-/// least-new-surface decision as the Dhan supervisor above).
-// TEST-EXEMPT: cold-path supervisor spawn wrapper — exit classification is
-// the unit-tested `disk_health_watcher::classify_join_exit`; the boot wiring
-// is pinned by `test_groww_lag_publisher_supervisor_is_wired_into_main`.
-// O(1) EXEMPT: cold-path supervisor — one task per session, fires only on publisher death.
-#[must_use]
-fn spawn_supervised_groww_lag_publisher() -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let handle =
-                tokio::spawn(tickvault_core::pipeline::feed_lag_monitor::run_groww_lag_publisher());
-            let join_result = handle.await;
-            let reason = tickvault_storage::disk_health_watcher::classify_join_exit(&join_result);
-            error!(
-                reason,
-                backoff_secs = FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS,
-                "groww exchange-lag publisher task exited — respawning so the \
-                 tv_groww_exchange_lag_p99_seconds stream cannot vanish silently"
-            );
-            metrics::counter!("tv_groww_lag_publisher_respawn_total", "reason" => reason)
-                .increment(1);
-            tokio::time::sleep(std::time::Duration::from_secs(
-                FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS,
-            ))
-            .await;
-        }
-    })
 }
 
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).
@@ -3549,23 +3503,13 @@ mod tests {
     // MECHANICAL ENFORCEMENT: Timestamp consistency across all paths
     // ===================================================================
 
-    #[test]
-    fn test_tick_persistence_no_ist_offset_on_exchange_timestamp() {
-        // Ticks from Dhan WebSocket have IST epoch seconds.
-        // The tick persistence writer must NOT add IST offset to exchange_timestamp.
-        // Only received_at (from Utc::now()) gets the offset.
-        let source = include_str!("../../storage/src/tick_persistence.rs");
-        // The designated ts column uses exchange_timestamp directly
-        assert!(
-            source.contains("i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000)"),
-            "tick ts must use exchange_timestamp directly (IST epoch, no offset)"
-        );
-        // received_at adds IST offset
-        assert!(
-            source.contains("received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS)"),
-            "received_at must add IST_UTC_OFFSET_NANOS (UTC → IST)"
-        );
-    }
+    // Stage-2 dead-WS sweep (2026-07-17):
+    // `test_tick_persistence_no_ist_offset_on_exchange_timestamp` RETIRED —
+    // its subject (`crates/storage/src/tick_persistence.rs`, the live-tick
+    // ILP writer) was deleted with the dead Dhan tick chain, so there is no
+    // tick `ts` write site left to pin. The WebSocket-timestamp rule itself
+    // (`data-integrity.md` — NEVER add +5:30 to an exchange-timestamp `ts`)
+    // still binds any future tick writer, which must re-add this ratchet.
 
     // Candle-engine re-architecture #T1b: `test_live_candle_no_ist_offset`
     // removed — Engine A (`LiveCandleWriter` / `compute_live_candle_nanos`
@@ -3712,14 +3656,12 @@ fn spawn_daily_tick_conservation_task(
     let tc_calendar = std::sync::Arc::clone(trading_calendar);
     // Single source of truth for the WAL dir (shared with STAGE-C).
     let tc_wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
-    let tc_groww_ndjson =
-        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT);
     let tc_feed_runtime = std::sync::Arc::clone(feed_runtime);
     tokio::spawn(async move {
         use chrono::{FixedOffset, TimeZone, Timelike, Utc};
         use tickvault_app::tick_conservation_boot::{
             ConservationStart, boot_covers_full_session, decide_conservation_start,
-            run_groww_tick_conservation_audit, run_tick_conservation_audit,
+            run_tick_conservation_audit,
         };
         use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
         let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
@@ -3791,23 +3733,6 @@ fn spawn_daily_tick_conservation_task(
         } else {
             debug!("tick_conservation: Dhan run skipped (Dhan feed disabled this session)");
         }
-
-        // Groww lane — same IST day, same window, runtime-gated so a
-        // Dhan-only session writes no misleading zero Groww row.
-        if tc_feed_runtime.is_enabled(tickvault_common::feed::Feed::Groww) {
-            run_groww_tick_conservation_audit(
-                &tc_groww_ndjson,
-                &tc_qcfg,
-                target_ist_day,
-                trading_date_ist_nanos,
-                run_ts_ist_nanos,
-                boot_covers_full_session(boot_secs_of_day),
-            )
-            .await;
-            info!("PROOF: groww tick_conservation audit fired @ 15:40:00 IST");
-        } else {
-            debug!("groww_conservation: skipped (Groww feed disabled this session)");
-        }
     });
     info!("tick_conservation: daily per-feed WAL/NDJSON-vs-DB audit task spawned (process-global)");
 }
@@ -3843,18 +3768,23 @@ fn spawn_groww_spot_1m_leg(
     config: &ApplicationConfig,
     notifier: &std::sync::Arc<NotificationService>,
     trading_calendar: &std::sync::Arc<TradingCalendar>,
+    // Order-runtime mark tap (re-homed 2026-07-16 — the live-bridge tap
+    // died with the retired Groww live feed): rides into the spot +
+    // contract legs; `None` ⇒ `[order_runtime]` disabled, taps inert.
+    mark_forwarder: Option<tickvault_app::order_runtime::MarkForwarder>,
 ) {
-    // PR-3 sequencing: the spot→chain minute-done watch channel exists
-    // ONLY when BOTH Groww REST legs are enabled — chain-off keeps the
-    // spot leg byte-identical to PR-2 (no sender, no publishes; the Dhan
-    // seam's precedent).
+    // 2026-07-14 auto-ladder (operator approval — the two-wave / seven
+    // burst tiers): the spot→chain sequencing channel is RETIRED — each
+    // Groww REST leg fires on its OWN minute-boundary timer; the shared
+    // session-scoped burst state below carries the configured tier + the
+    // 429 auto-demote latch across ALL Groww REST legs (one pooled Groww
+    // rate bucket ⇒ one demotion signal). Boot resets to the configured
+    // tier by construction (fresh state per process).
     let chain_enabled = config.groww_option_chain_1m.enabled;
-    let (minute_done_tx, spot_minute_done) = if config.groww_spot_1m.enabled && chain_enabled {
-        let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    let burst = tickvault_app::groww_rest_burst::GrowwRestBurstState::new(
+        config.groww_rest_burst.tier,
+        config.groww_rest_burst.warm_up,
+    );
     // PR-4 sequencing + selection handoff: the chain→contract channel +
     // anchor store exist ONLY when BOTH legs are on (contract-off keeps
     // the chain leg byte-identical to PR-3). The contract leg DEPENDS on
@@ -3888,21 +3818,26 @@ fn spawn_groww_spot_1m_leg(
                     notifier: notifier.clone(),
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
-                    minute_done_tx,
+                    burst: std::sync::Arc::clone(&burst),
+                    // OWN-FIRE spot closes → the dry-run runtime's marks.
+                    mark_forwarder: mark_forwarder.clone(),
                 },
             );
         info!(
+            tier = config.groww_rest_burst.tier.as_str(),
             "groww_spot_1m: Groww per-minute spot 1m REST leg spawned \
-             (fires each minute close 09:16:00-15:30:00 IST; sequential \
-             symbol pacing)"
+             (fires each minute close 09:16:00-15:30:00 IST; concurrent \
+             spot wave per the configured burst tier)"
         );
     } else {
         info!("groww_spot_1m: disabled by config — Groww per-minute spot fetch not spawned");
     }
-    // Groww per-minute option-chain leg (PR-3): sequenced after the spot
-    // fire via the watch signal + fallback timer; DEFAULT-OFF pending the
-    // first live probe — the probe-and-report path runs instead while
-    // disabled (one bounded chain call per underlying, Info verdict).
+    // Groww per-minute option-chain leg: fires on its OWN minute-boundary
+    // timer (2026-07-14 auto-ladder — the spot→chain sequencing wait is
+    // retired); concurrent underlying wave per the shared burst tier.
+    // DEFAULT-OFF pending the first live probe — the probe-and-report
+    // path runs instead while disabled (one bounded chain call per
+    // underlying, Info verdict).
     if chain_enabled {
         let _groww_chain1m_supervisor =
             tickvault_app::groww_option_chain_1m_boot::spawn_supervised_groww_chain_1m(
@@ -3910,15 +3845,16 @@ fn spawn_groww_spot_1m_leg(
                     notifier: notifier.clone(),
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
-                    spot_minute_done,
+                    burst: std::sync::Arc::clone(&burst),
                     minute_done_tx: chain_minute_done_tx,
                     anchor_store: contract_anchor_store.clone(),
                 },
             );
         info!(
+            tier = config.groww_rest_burst.tier.as_str(),
             "groww_chain_1m: Groww per-minute option-chain leg spawned \
-             (fires each minute close right after the Groww spot fetch; \
-             sequential underlying pacing)"
+             (fires each minute close on its own timer; concurrent \
+             underlying wave per the configured burst tier)"
         );
         // Groww per-contract 1m leg (PR-4, the fill-model leg): sequenced
         // after the chain fire via the watch signal + fallback timer;
@@ -3934,6 +3870,9 @@ fn spawn_groww_spot_1m_leg(
                         chain_minute_done: chain_minute_done_rx,
                         anchor_store: contract_anchor_store,
                         strikes_each_side: config.groww_contract_1m.strikes_each_side,
+                        burst: std::sync::Arc::clone(&burst),
+                        // OWN-FIRE contract closes → the option-leg marks.
+                        mark_forwarder: mark_forwarder.clone(),
                     },
                 );
             info!(
@@ -3955,7 +3894,7 @@ fn spawn_groww_spot_1m_leg(
                     notifier: notifier.clone(),
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
-                    spot_minute_done: None,
+                    burst: std::sync::Arc::clone(&burst),
                     minute_done_tx: None,
                     anchor_store: None,
                 },
@@ -3967,6 +3906,23 @@ fn spawn_groww_spot_1m_leg(
         );
     } else {
         info!("groww_chain_1m: disabled by config (probe off) — nothing spawned");
+    }
+    // 2026-07-14 off-hours rate probe (env-gated, DEFAULT OFF): arm with
+    // TICKVAULT_GROWW_RATE_PROBE=1 on an off-hours run to measure
+    // Groww's real burst tolerance (4→6→8→11 req/s steps). Refused
+    // inside the [08:30, 16:00) IST wall-clock blackout on ANY day
+    // (SECURITY-MEDIUM 2026-07-14 — no calendar dependency, so a stale
+    // holiday list can never fire the burst mid-session); the operator
+    // must also coordinate the run with BruteX's nightly bulk window
+    // (§9.7). Results are structured logs + counters only — NO data
+    // tables.
+    if std::env::var(tickvault_app::groww_rate_probe::GROWW_RATE_PROBE_ENV).as_deref() == Ok("1") {
+        tokio::spawn(tickvault_app::groww_rate_probe::run_groww_rate_probe());
+        info!(
+            "groww_rate_probe: armed via TICKVAULT_GROWW_RATE_PROBE=1 — \
+             escalating off-hours burst probe spawned (refuses to run \
+             inside the [08:30, 16:00) IST wall-clock blackout window)"
+        );
     }
 }
 

@@ -151,6 +151,45 @@ const _: () = assert!(
 /// (= 60) — equality tripwire-pinned in the tests below.
 pub const GROWW_CATCHUP_MARGIN_SECS: u32 = 60;
 
+/// Task slug for the once-per-trading-day delivery marker
+/// (`data/state/daily/tf-consistency-YYYY-MM-DD.marker` — Telegram
+/// cleanliness overhaul, coordinator-relayed directive 2026-07-15). ONLY the
+/// `RunCatchUp` arm consults it; the real 15:40 fire (`SleepThenRun`) and
+/// forced runs (`RunNow`) never do, and it is written ONLY after a `pass`
+/// summary was dispatched — a FAILURE-class day re-runs AND re-pages on
+/// restart (Rule 11), and a `no_data` day no longer seals it either (G4a,
+/// fix round 2: a trading-day no_data can be a silently-empty discovery
+/// dataset — the PR #1474 blind-since-birth class — so a same-day restart
+/// must re-run, not read "nothing to check" forever).
+const TF_CONSISTENCY_MARKER_TASK: &str = "tf-consistency";
+
+/// Pure notify predicate for the daily summary: a `no_data` day ("nothing to
+/// check" — feeds were off) is LOG-ONLY, never a Telegram card; every other
+/// verdict (pass / mismatch / degraded / blind) notifies.
+///
+/// F4 (2026-07-15 fix round): a FORCED run (`TICKVAULT_TF_VERIFY_NOW=1`)
+/// ALWAYS notifies, `no_data` included — the catch-up skip message itself
+/// tells the operator to force a run, and a forced run answering with
+/// silence would be a Rule-11 hole. Scheduled/catch-up runs keep `no_data`
+/// log-only.
+///
+/// MERGE RESOLVED 2026-07-15 (G9a collision site 1 — roles swapped: main's
+/// #1581, the groww-live-off retirement, landed FIRST): main's 1-arg
+/// `pub(crate)` version of this predicate was superseded by this 2-arg
+/// forced-aware one per the recorded resolution rule — forced runs always
+/// notify (the F4 Rule-11 fix). Main's TRAP-B rationale is preserved: with
+/// the Groww live feed retired there are zero live candle producers, so a
+/// scheduled run legitimately reads `no_data` EVERY trading day — an
+/// unconditional daily Info card carries nothing actionable (commandment
+/// 8); NoData is therefore log-only on scheduled runs while `blind` still
+/// pages (Rule 11: BLIND ≠ no-data) and an unknown/drifted label fails
+/// LOUD (notifies). Adapted TRAP-B arm coverage:
+/// `test_should_notify_summary_nodata_is_log_only_all_other_arms_page`.
+#[must_use]
+pub fn should_notify_summary(status_label: &str, forced_run: bool) -> bool {
+    forced_run || status_label != "no_data"
+}
+
 // ---------------------------------------------------------------------------
 // Scheduling (pure)
 // ---------------------------------------------------------------------------
@@ -778,6 +817,22 @@ pub fn select_instruments_sql(feed: &str, day_start_ist_nanos: i64) -> String {
     )
 }
 
+/// HIGH-3 (dead-fold false-OK, 2026-07-16): bounded COUNT of the SOURCE
+/// `spot_1m_rest` rows for a (feed, day) window. Fired ONLY when candle
+/// discovery came back EMPTY — with the REST-era bar-fold as the SOLE
+/// `candles_*` author, "zero candles" is genuinely NoData only when the
+/// source table is ALSO empty; source-rows-without-candles means the fold
+/// died silently and the pass must classify Blind (High), never NoData
+/// (Info). Same micros WHERE window shape as the sibling builders. Pure.
+#[must_use]
+pub fn select_spot_1m_count_sql(feed: &str, day_start_ist_nanos: i64) -> String {
+    let (start, end) = day_bounds_micros(day_start_ist_nanos);
+    format!(
+        "SELECT count(*) FROM spot_1m_rest \
+         WHERE feed = '{feed}' AND ts >= {start} AND ts < {end}"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // /exec dataset parsing (pure — skip-malformed, never panics)
 // ---------------------------------------------------------------------------
@@ -892,6 +947,16 @@ pub fn parse_instruments_dataset(
     Ok((out, truncated))
 }
 
+/// Parse a single-cell COUNT dataset (`{"dataset": [[N]]}`). `None` on any
+/// malformed shape — the caller treats that as a failed read (degraded),
+/// never as zero. Pure.
+#[must_use]
+pub fn parse_count_dataset(body: &str) -> Option<i64> {
+    let rows = json_dataset(body).ok()?;
+    let cols = rows.first()?.as_array()?;
+    row_i64(cols, 0)
+}
+
 // ---------------------------------------------------------------------------
 // Run status + summary (pure)
 // ---------------------------------------------------------------------------
@@ -954,6 +1019,16 @@ pub fn classify_run_status(
         return RunStatus::Degraded;
     }
     RunStatus::Pass
+}
+
+/// HIGH-3 (2026-07-16): the empty-discovery source check — a positive
+/// `spot_1m_rest` row count while candle discovery is EMPTY means the
+/// bar-fold (the sole `candles_*` author) produced nothing; the pass must
+/// mark the source as seen so `classify_run_status` yields Blind, never
+/// NoData. Pure.
+#[must_use]
+pub fn empty_candles_with_spot_rows_is_blind(spot_1m_rows: i64) -> bool {
+    spot_1m_rows > 0
 }
 
 /// Combine the two per-pass statuses into the run verdict: both feeds off
@@ -1306,6 +1381,54 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
         }
     };
     if instruments.is_empty() {
+        // HIGH-3 (dead-fold false-OK, 2026-07-16): with the REST-era
+        // bar-fold as the SOLE candles_* author, zero candle rows is
+        // genuinely "nothing to check" ONLY when the SOURCE table is also
+        // empty. One bounded COUNT against spot_1m_rest decides: source
+        // rows without candles = the fold died silently → the pass marks
+        // the source seen so classification reads Blind (High Telegram),
+        // never NoData (Info). A failed count read degrades the pass
+        // (which ALSO classifies Blind at zero compared) — never a silent
+        // NoData on an unproven emptiness.
+        let count_sql = select_spot_1m_count_sql(p.feed, day_start_nanos);
+        match http_get_text(p.client, p.exec_url, &count_sql).await {
+            Ok(body) => match parse_count_dataset(&body) {
+                Some(spot_rows) if empty_candles_with_spot_rows_is_blind(spot_rows) => {
+                    stats.rows_seen = true;
+                    error!(
+                        code = ErrorCode::TfVerify02RunDegraded.code_str(),
+                        stage = "source_without_candles",
+                        feed = p.feed,
+                        date = %stats.date_label,
+                        spot_rows,
+                        "TF-VERIFY-02: spot_1m_rest carries rows for this \
+                         (feed, day) but candle discovery is EMPTY — the \
+                         bar-fold derived NOTHING (dead-fold class; pass \
+                         classifies Blind, never NoData)"
+                    );
+                }
+                Some(_) => {
+                    // Source genuinely empty too — honest NoData.
+                }
+                None => {
+                    count_query_failure(&mut stats, "query_failed");
+                    warn!(
+                        feed = p.feed,
+                        "tf_consistency: spot_1m_rest count parse failed \
+                         (empty-discovery source check degraded)"
+                    );
+                }
+            },
+            Err((reason, stage)) => {
+                count_query_failure(&mut stats, stage);
+                warn!(
+                    feed = p.feed,
+                    %reason,
+                    "tf_consistency: spot_1m_rest count query failed \
+                     (empty-discovery source check degraded)"
+                );
+            }
+        }
         info!(
             feed = p.feed,
             date = %stats.date_label,
@@ -1891,7 +2014,7 @@ pub fn spawn_tf_consistency_tasks(
     }
     let qcfg = config.questdb.clone();
     let calendar = std::sync::Arc::clone(trading_calendar);
-    let inner: tokio::task::JoinHandle<Result<Option<TfConsistencySummaryData>, String>> =
+    let inner: tokio::task::JoinHandle<Result<Option<(TfConsistencySummaryData, bool)>, String>> =
         tokio::spawn(async move {
             use chrono::{FixedOffset, TimeZone, Timelike, Utc};
             use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
@@ -1976,6 +2099,32 @@ pub fn spawn_tf_consistency_tasks(
                     );
                 }
                 TfVerifyStart::RunCatchUp => {
+                    // Once-per-trading-day gate (2026-07-15): a post-15:40
+                    // restart must not re-fire an already-delivered daily
+                    // card. ONLY this catch-up arm consults the marker —
+                    // the scheduled 15:40 fire and forced runs never do,
+                    // and a FAILURE-class day never writes one (Rule 11:
+                    // suppression never hides a failure).
+                    if crate::daily_task_marker::daily_marker_exists(
+                        TF_CONSISTENCY_MARKER_TASK,
+                        today_ist,
+                    ) {
+                        // G11 (fix round 2): name the EXACT honored marker
+                        // path so the operator hint is copy-pasteable.
+                        let marker_path = crate::daily_task_marker::daily_marker_path(
+                            TF_CONSISTENCY_MARKER_TASK,
+                            today_ist,
+                        );
+                        info!(
+                            marker_date = %today_ist,
+                            marker_path = %marker_path.display(),
+                            "tf_consistency: today's summary was already delivered — \
+                             honoring the {today_ist} delivery marker and skipping \
+                             the catch-up re-run (remove the marker file above or \
+                             set TICKVAULT_TF_VERIFY_NOW=1 to force)"
+                        );
+                        return Ok(None);
+                    }
                     info!(
                         now = %now_ist.time(),
                         "tf_consistency: late boot (past 15:40 IST) — running the day's \
@@ -1991,28 +2140,116 @@ pub fn spawn_tf_consistency_tasks(
             let groww_date = previous_trading_day(&calendar, target);
             let summary = run_tf_consistency(&qcfg, target, groww_date).await;
             info!("PROOF: tf_consistency verifier fired @ 15:40:00 IST");
-            Ok(Some(summary))
+            // F4: the forced flag rides along so the notify predicate can
+            // keep a forced run's answer LOUD (no_data included).
+            Ok(Some((summary, force_now)))
         });
     let tf_notifier = std::sync::Arc::clone(notifier);
     tokio::spawn(async move {
         match inner.await {
-            Ok(Ok(Some(s))) => {
-                tf_notifier.notify(NotificationEvent::TfConsistencySummary {
-                    dhan_date_ist: s.dhan_date_ist,
-                    groww_date_ist: s.groww_date_ist,
-                    instruments: s.instruments,
-                    buckets_compared: s.buckets_compared,
-                    mismatches: s.mismatches,
-                    missing_tf_rows: s.missing_tf_rows,
-                    no_coverage: s.no_coverage,
-                    off_grid: s.off_grid,
-                    duplicates: s.duplicates,
-                    tail_unsealed: s.tail_unsealed,
-                    degraded: s.degraded,
-                    truncated: s.truncated,
-                    status_label: s.status_label,
-                    top_detail: s.top_detail,
-                });
+            Ok(Ok(Some((s, forced_run)))) => {
+                // MERGE RESOLVED 2026-07-15 (G9a collision site 2, roles
+                // swapped — #1581 landed first): main's un-tupled arm +
+                // 1-arg predicate were superseded by this tupled
+                // (summary, forced_run) shape — forced runs always notify
+                // (the F4 Rule-11 fix). Main's TRAP-B semantics are
+                // preserved by the 2-arg predicate's scheduled-run arm.
+                let status_label = s.status_label.clone();
+                // Marker keyed on the VERIFIED (Dhan) date, never blindly
+                // "today" — a forced past-date backfill must not suppress
+                // today's catch-up (2026-07-15 once-per-day gate).
+                let marker_date =
+                    chrono::NaiveDate::parse_from_str(&s.dhan_date_ist, "%Y-%m-%d").ok();
+                if should_notify_summary(&status_label, forced_run) {
+                    tf_notifier.notify(NotificationEvent::TfConsistencySummary {
+                        dhan_date_ist: s.dhan_date_ist,
+                        groww_date_ist: s.groww_date_ist,
+                        instruments: s.instruments,
+                        buckets_compared: s.buckets_compared,
+                        mismatches: s.mismatches,
+                        missing_tf_rows: s.missing_tf_rows,
+                        no_coverage: s.no_coverage,
+                        off_grid: s.off_grid,
+                        duplicates: s.duplicates,
+                        tail_unsealed: s.tail_unsealed,
+                        degraded: s.degraded,
+                        truncated: s.truncated,
+                        status_label: s.status_label,
+                        top_detail: s.top_detail,
+                    });
+                } else {
+                    // no_data is log-only (2026-07-15): "nothing to check"
+                    // must never page — the suppressed send is replaced by
+                    // this one visible line (never a silent skip).
+                    //
+                    // TRAP-B (main #1581, preserved through the 2026-07-15
+                    // merge): with the Groww live feed retired there are
+                    // ZERO live candle producers, so a scheduled run
+                    // legitimately reads no_data EVERY trading day — an
+                    // unconditional daily Info page carries nothing
+                    // actionable. NoData → log-only; blind still pages
+                    // (Rule 11: BLIND ≠ no-data).
+                    //
+                    // G4b (fix round 2): warn!, not info! — this arm is
+                    // structurally TRADING-DAY-only (scheduled/catch-up
+                    // runs exist only on trading days per
+                    // decide_tf_verify_start; forced runs always notify).
+                    // Post-#1581 this is one EXPECTED warn line per
+                    // trading day (log-only, no spam); it stays warn!
+                    // rather than info! so the day any candle producer
+                    // returns, an unexpectedly-empty discovery query (the
+                    // PR #1474 blind-since-birth class) sits above the
+                    // info noise floor.
+                    //
+                    // G4c — RULE-CONTRACT TENSION, recorded deliberately
+                    // (see the plan file's Observability section):
+                    // `tf-consistency-error-codes.md` §3's delivery
+                    // contract reads "the typed TfConsistencySummary
+                    // Telegram (ONE per run — Info only when clean WITH
+                    // coverage or pure no-data)". This suppression
+                    // intentionally deviates for the scheduled/catch-up
+                    // no_data arm per the operator's direct 2026-07-15
+                    // cleanliness escalation — PENDING the rule-file
+                    // supersession the operator must land with a dated
+                    // quote. Rule files are not editable in this PR.
+                    warn!(
+                        status = %status_label,
+                        dhan_date = %s.dhan_date_ist,
+                        groww_date = %s.groww_date_ist,
+                        "tf_consistency: nothing to check today (trading day) — \
+                         Telegram summary suppressed (log-only; pass, failure \
+                         and FORCED days still notify). If the feeds DID run \
+                         today, suspect an empty discovery query."
+                    );
+                }
+                // G4a (fix round 2): ONLY a "pass" marks the day delivered.
+                // no_data no longer seals the marker — a trading-day
+                // no_data can be a silently-empty discovery dataset (the
+                // PR #1474 class), and marker-sealing it made every
+                // same-day restart's catch-up skip too ("nothing to check"
+                // forever, zero operator signal). mismatch/degraded/blind
+                // ALSO leave the marker unwritten so a restart re-runs +
+                // re-pages (Rule 11).
+                //
+                // F5 HONEST RESIDUAL (fix round 1, 2026-07-15 — timeboxed
+                // decision): `notify()` is spawn-and-return with NO public
+                // completion signal, so this marker records DISPATCH, not
+                // DELIVERY. A Telegram-transport failure on a PASS day
+                // still writes the marker, and every same-day restart then
+                // skips — the operator gets no card until the next trading
+                // day (self-heals). Bounded by: the TELEGRAM-01 drop
+                // counter + the tv-telegram-drops CloudWatch alarm cover
+                // transport-failure visibility, and the catch-up skip line
+                // above names the honored marker date so a suppressed day
+                // is diagnosable from logs. Gating the marker on delivery
+                // needs a service.rs completion signal — deliberately not
+                // smuggled into this fix round (see the plan file's
+                // Failure Modes entry).
+                if status_label == "pass"
+                    && let Some(d) = marker_date
+                {
+                    crate::daily_task_marker::write_daily_marker(TF_CONSISTENCY_MARKER_TASK, d);
+                }
             }
             Ok(Ok(None)) => {} // non-trading-day skip / refused force — no page.
             Ok(Err(reason)) => {
@@ -2076,6 +2313,54 @@ mod tests {
     #[test]
     fn test_decide_tf_verify_start_trigger_constant_is_1540_ist() {
         assert_eq!(TF_VERIFY_TRIGGER_SECS_OF_DAY_IST, 56_400);
+    }
+
+    // -------------------------------------------------------------------
+    // should_notify_summary (2026-07-15 no_data log-only gate)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_should_notify_summary_suppresses_only_no_data() {
+        assert!(
+            !should_notify_summary("no_data", false),
+            "a nothing-to-check day is log-only on scheduled/catch-up runs"
+        );
+    }
+
+    #[test]
+    fn test_should_notify_summary_forced_run_always_notifies() {
+        // F4 (2026-07-15 fix round): a FORCED run must never answer with
+        // silence — the catch-up skip message itself tells the operator to
+        // force one; no_data included.
+        assert!(
+            should_notify_summary("no_data", true),
+            "a forced run must notify even on no_data"
+        );
+        for label in ["pass", "mismatch", "degraded", "blind", ""] {
+            assert!(should_notify_summary(label, true), "{label} forced");
+        }
+    }
+
+    #[test]
+    fn test_should_notify_summary_pass_and_failure_classes_notify() {
+        // Rule 11: every verdict with information content still notifies —
+        // pass (positive daily signal) AND every failure class.
+        for label in ["pass", "mismatch", "degraded", "blind"] {
+            assert!(
+                should_notify_summary(label, false),
+                "{label} must keep notifying"
+            );
+        }
+        // Fail-open on an unknown / drifted label: notify, never silence.
+        assert!(should_notify_summary("some_future_label", false));
+        assert!(should_notify_summary("", false));
+    }
+
+    #[test]
+    fn test_tf_consistency_marker_task_slug_is_pinned() {
+        // The marker filename is derived from this slug — a drift would
+        // orphan existing markers and re-fire the day's card once.
+        assert_eq!(TF_CONSISTENCY_MARKER_TASK, "tf-consistency");
     }
 
     #[test]
@@ -2789,6 +3074,72 @@ mod tests {
         assert_eq!(classify_run_status(10, 1, true, true), MismatchFound);
         assert_eq!(classify_run_status(10, 0, true, true), Degraded);
         assert_eq!(classify_run_status(10, 0, false, true), Pass);
+    }
+
+    /// HIGH-3 (dead-fold false-OK, 2026-07-16): zero candles + nonzero
+    /// spot_1m_rest rows must classify Blind (the source check flips
+    /// rows_seen); zero + zero stays NoData.
+    #[test]
+    fn test_empty_candles_with_spot_rows_is_blind_vs_nodata() {
+        use RunStatus::{Blind, NoData};
+        // Nonzero source rows → the fold is the dead component → Blind.
+        assert!(empty_candles_with_spot_rows_is_blind(1));
+        assert!(empty_candles_with_spot_rows_is_blind(375));
+        assert_eq!(
+            classify_run_status(0, 0, false, empty_candles_with_spot_rows_is_blind(375)),
+            Blind,
+            "zero candles + nonzero spot rows must page Blind, never NoData"
+        );
+        // Zero (or nonsensical negative) source rows → genuinely nothing
+        // to check → NoData stands.
+        assert!(!empty_candles_with_spot_rows_is_blind(0));
+        assert!(!empty_candles_with_spot_rows_is_blind(-1));
+        assert_eq!(
+            classify_run_status(0, 0, false, empty_candles_with_spot_rows_is_blind(0)),
+            NoData
+        );
+    }
+
+    /// HIGH-3 companions: the COUNT SQL keeps the hardened read shape
+    /// (micros window, feed scope) and the parser is total on garbage.
+    #[test]
+    fn test_select_spot_1m_count_sql_and_parse_count_dataset() {
+        let day_start_nanos = 1_752_600_600_000_000_000_i64;
+        let sql = select_spot_1m_count_sql("dhan", day_start_nanos);
+        assert!(sql.starts_with("SELECT count(*) FROM spot_1m_rest"));
+        assert!(sql.contains("feed = 'dhan'"));
+        // Micros window, same day-bounds shape as the sibling builders.
+        let (start, end) = day_bounds_micros(day_start_nanos);
+        assert!(sql.contains(&format!("ts >= {start}")));
+        assert!(sql.contains(&format!("ts < {end}")));
+
+        assert_eq!(parse_count_dataset(r#"{"dataset": [[42]]}"#), Some(42));
+        assert_eq!(parse_count_dataset(r#"{"dataset": [[0]]}"#), Some(0));
+        // Float-serialized counts fold through the row_i64 fallback.
+        assert_eq!(parse_count_dataset(r#"{"dataset": [[7.0]]}"#), Some(7));
+        // Malformed shapes are None (degraded read), never zero.
+        assert_eq!(parse_count_dataset("not json"), None);
+        assert_eq!(parse_count_dataset(r#"{"dataset": []}"#), None);
+        assert_eq!(parse_count_dataset(r#"{"nope": true}"#), None);
+    }
+
+    #[test]
+    fn test_should_notify_summary_nodata_is_log_only_all_other_arms_page() {
+        // TRAP-B (2026-07-15, main #1581) adapted to the 2-arg forced-aware
+        // predicate (merge resolution): scheduled NoData → log-only;
+        // Pass / MismatchFound / Degraded / Blind ALL page (Rule 11:
+        // blind ≠ no-data); an unknown/drifted label fails LOUD; and a
+        // FORCED run notifies even on NoData (the F4 Rule-11 fix).
+        assert!(!should_notify_summary(RunStatus::NoData.as_str(), false));
+        assert!(should_notify_summary(RunStatus::Pass.as_str(), false));
+        assert!(should_notify_summary(
+            RunStatus::MismatchFound.as_str(),
+            false
+        ));
+        assert!(should_notify_summary(RunStatus::Degraded.as_str(), false));
+        assert!(should_notify_summary(RunStatus::Blind.as_str(), false));
+        assert!(should_notify_summary("some_future_label", false));
+        assert!(should_notify_summary(RunStatus::NoData.as_str(), true));
     }
 
     #[test]

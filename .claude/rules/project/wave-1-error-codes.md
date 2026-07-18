@@ -9,6 +9,14 @@
 
 ## HOT-PATH-01 — sync filesystem I/O failed inside an async writer task
 
+> **⚠ EMIT SITES DELETED 2026-07-17 (stage-2 dead-WS sweep):**
+> `crates/core/src/pipeline/prev_close_writer.rs` — the sole emit surface for
+> HOT-PATH-01 and HOT-PATH-02 — was DELETED with the dead Dhan tick chain
+> (zero production callers after the 2026-07-13 Dhan live-WS retirement).
+> The `HotPath01SyncFsFailed` / `HotPath02WriterQueueDrop` ErrorCode
+> variants are RETAINED (no ErrorCode deletions in the sweep); neither code
+> can fire again. Content below retained as historical audit.
+
 **Trigger:** the dedicated tokio task that drains the prev_close cache
 mpsc channel (Wave 1 Item 0.a) failed an underlying
 `tokio::fs::write` or `tokio::fs::rename` call. The hot path is NOT
@@ -73,6 +81,13 @@ Prometheus restart.
 
 ## PREVCLOSE-01 — previous_close ILP write or flush failed
 
+> **⚠ EMIT SITES DELETED 2026-07-17 (stage-2 dead-WS sweep):** the prev-close
+> persist drain lived inside the deleted dead tick chain (the cited source
+> path `crates/core/src/pipeline/prev_close_persist.rs` never existed as a
+> file on `main` — the drain task was wired through the deleted
+> `tick_processor.rs` chain). The `PrevClose01IlpFailed` variant is
+> RETAINED; the code can no longer fire. Historical audit below.
+
 **Trigger:** the `prev_close_persist` async drain task hit an error
 calling `PreviousCloseWriter::append_prev_close` or `force_flush`.
 
@@ -93,6 +108,13 @@ path; included so the enum variant exists for future use without
 needing another rule-file edit.
 
 **Source:** `crates/core/src/pipeline/first_seen_set.rs`
+
+> **2026-07-17 note (dead live-WS sweep stage 1):** the source module
+> `first_seen_set.rs` is DELETED — it had ZERO production callers (only
+> comments referenced it since the PR-C2 Dhan live-WS lane deletion,
+> 2026-07-13). The `PrevClose02` variant was already emitter-less
+> ("reserved") and is RETAINED pending the post-sibling-merge variant
+> sweep; this file keeps satisfying the cross-ref test.
 
 ## PREVOI-01 — prev_oi cache empty at boot
 

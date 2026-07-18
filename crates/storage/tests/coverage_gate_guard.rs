@@ -192,12 +192,15 @@ fn coverage_gate_source_has_no_anchored_match() {
 /// ALWAYS fails, at full precision.
 #[test]
 fn coverage_gate_exact_threshold_value_passes() {
-    // storage floor is 91.2 → 912 covered of 1000 lines is EXACTLY at it.
+    // storage floor is 90.1 (91.2 -> 90.1 on 2026-07-17, the stage-2
+    // dead-WS-sweep truthful re-baseline — see the dated record in
+    // quality/crate-coverage-thresholds.toml) → 901 covered of 1000 lines
+    // is EXACTLY at it.
     let mut entries = full_presence_entries(&["storage"]);
     entries.push(file_entry(
         "/home/runner/work/tickvault/tickvault/crates/storage/src/lib.rs",
         1000,
-        912,
+        901,
     ));
     let json = coverage_json(&entries);
     let (code, out) = run_gate("tv_gate_exact_at_floor.json", &json);
@@ -217,12 +220,14 @@ fn coverage_gate_exact_threshold_value_passes() {
 /// longer be DISPLAYED as visually equal to its threshold.
 #[test]
 fn coverage_gate_one_line_below_threshold_fails_with_honest_display() {
-    // 9119/10000 = 91.19% — strictly below the 91.2 storage floor.
+    // 9009/10000 = 90.09% — strictly below the 90.1 storage floor
+    // (91.2 -> 90.1 on 2026-07-17, the stage-2 dead-WS-sweep truthful
+    // re-baseline — dated record in quality/crate-coverage-thresholds.toml).
     let mut entries = full_presence_entries(&["storage"]);
     entries.push(file_entry(
         "/home/runner/work/tickvault/tickvault/crates/storage/src/lib.rs",
         10000,
-        9119,
+        9009,
     ));
     let json = coverage_json(&entries);
     let (code, out) = run_gate("tv_gate_just_below_floor.json", &json);
@@ -231,9 +236,9 @@ fn coverage_gate_one_line_below_threshold_fails_with_honest_display() {
         "coverage strictly below the threshold must FAIL:\n{out}"
     );
     assert!(
-        out.contains("91.19"),
-        "the FAIL row must display the true 2-decimal value (91.19), never a \
-         rounded 91.2 that looks equal to the threshold:\n{out}"
+        out.contains("90.09"),
+        "the FAIL row must display the true 2-decimal value (90.09), never a \
+         rounded 90.1 that looks equal to the threshold:\n{out}"
     );
 }
 

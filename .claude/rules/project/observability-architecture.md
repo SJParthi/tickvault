@@ -46,12 +46,13 @@ now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
 DH-901, DH-906 (term-match tripwire — no coded emit site
-exists yet), AUTH-GAP-04, FEED-STALL-01 (ERROR lines = the
-sidecar's own >5-restarts-per-5-min STORM escalation ONLY; per-restart lines
-are warn!-level and invisible here — the ≥3-restarts-per-15-min restart pager
-is the separate `tv_feed_sidecar_stall_restart_total` counter alarm,
-`feed-stall-restart-alarm.tf`; round-3 correction 2026-07-06),
-WS-REINJECT-01, PROC-01, **AGGREGATOR-DROP-01 (added 2026-07-09** — the
+exists yet), AUTH-GAP-04 (the Groww stall-storm entry left this list
+2026-07-15 — its only ERROR-level emit site, the deleted sidecar stall
+watchdog, died with the Groww live feed; see "Retired paging entries" below),
+(the WAL re-injection-abort entry left this list 2026-07-17 — its only
+emit site, the un-consumed `wal_reinject.rs` helper, was deleted in the
+dead live-WS sweep stage 1; see "Retired paging entries" below), PROC-01,
+**AGGREGATOR-DROP-01 (added 2026-07-09** — the
 audit found the Severity::Critical sealed-candle-drop code, the ONLY
 silent-data-loss path for sealed candles, paged nobody; it also gains a
 redundant counter-side pager on `tv_seal_writer_drain_total{kind="dropped"}`
@@ -118,7 +119,18 @@ emit module `cross_verify_1m_boot.rs` was deleted with the Dhan instrument
 chain (the 15:31 IST Dhan live-vs-historical cross-verify has no live side
 to compare — `cross-verify-1m-error-codes.md` retirement banner), so both
 filters could never match again; the tf map entries were removed in the
-same PR (dated note in `error-code-alarms.tf`).
+same PR (dated note in `error-code-alarms.tf`). The `feed-stall-01`
+filter+alarm AND the `tv-<env>-feed-stall-restarts` counter alarm
+(`feed-stall-restart-alarm.tf`) were RETIRED 2026-07-15 with the Groww live
+feed — their emit sites (the stall watchdog + sidecar supervisor) were
+deleted, so neither could ever fire again (dated notes in both tf files).
+The `ws-reinject-01` filter+alarm was RETIRED 2026-07-17 (dead live-WS
+sweep stage 1) — its only emit site, `crates/app/src/wal_reinject.rs`
+(retained un-consumed since PR-C2 "pending the Phase C module cleanup"),
+was deleted in that cleanup, so the filter could never match again; the tf
+map entry was removed in the same PR (dated note in
+`error-code-alarms.tf`; the `WsReinject01Aborted` variant retirement is
+the post-sibling-merge variant sweep).
 
 > Removed from the filtered+alarmed set: the Dhan REST canary code
 > (RETIRED 2026-07-14 with its module + both spawn sites + the
@@ -269,6 +281,7 @@ summary file and drives the above flow.
 | `.claude/triage/error-rules.yaml` | triage classifier | Phase 6 |
 | `.claude/triage/claude-loop-prompt.md` | Claude-watches-logs runbook | Phase 7 |
 | `.claude/state/triage-seen.jsonl` | edge-trigger dedup | Phase 6 |
+| `data/orders/` (+ `groww-intents-YYYYMMDD.ndjson`) | Groww order intent write-ahead ledger (fsync-per-append; IST-midnight rotation; retained, no sweeper) | Groww orders (2026-07-15) |
 
 ## What future sessions MUST NOT do
 
@@ -373,8 +386,13 @@ summary file and drives the above flow.
       Depth WebSockets are forbidden forever per
       `.claude/rules/project/websocket-connection-scope-lock.md`; the
       detector module and its DHAT + loom ratchets were deleted too.
-- [x] **Phase 10.3** — Tick-loss chaos test shipped:
-      `crates/storage/tests/chaos_zero_tick_loss.rs`.
+- [~] **Phase 10.3** — Tick-loss chaos test shipped 2026-05, then RETIRED
+      2026-07-17 (stage-2 dead-WS sweep): `chaos_zero_tick_loss.rs` was
+      deleted with its subject — the dead tick writer
+      (`tick_persistence.rs`) had zero production callers after the
+      live-WS retirements (Dhan 2026-07-13, Groww 2026-07-15). The
+      candle-side chaos coverage (seal ring → spill → DLQ) remains in the
+      surviving `chaos_*` suites.
 - [~] **Phase 11** — WS + QuestDB + Valkey resilience SLA ALERT GUARD
       partially retired: the Prometheus-side `resilience_sla_alert_guard.rs`
       was deleted with the Alertmanager + Prometheus removals (#O2 / #O3).

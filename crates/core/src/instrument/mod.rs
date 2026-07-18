@@ -31,8 +31,11 @@
 //! | `csv_row` | the shared instrument-row TYPE the two modules above consume (split out of the deleted parser) |
 //! | `instrument_snapshot` | trimmed to `is_valid_trading_date` (the fail-closed date/path-traversal guard — Groww activation consumes) |
 //! | `presence_registration` | trimmed to `ist_day_from_date` (the shared IST day-number convention — Groww presence + scoreboard consume) |
-//! | `market_open_self_test` | dormant contract stub (pure evaluator; its spawner died with the lane in C2 — the C4 sweep decides retain-vs-delete) |
-//! | `slo_score` | dormant contract stub per the wave-3-d 2026-07-13 PARK banner (C2 precedent) |
+//! | `market_open_self_test` | dormant contract stub (pure evaluator; its spawner died with the lane in C2 — RETAINED by the C4 sweep 2026-07-15: its SELFTEST-01/02 codes were not in the operator-authorized C4 deletion set; a future sweep needs its own ruling) |
+//!
+//! `slo_score` was DELETED in the C4 sweep (2026-07-15) with its bench +
+//! the SLO-01/02/03 ErrorCode variants (caller-less contract stub; the
+//! wave-3-d PARK banner authorized "Phase C variant cleanup").
 
 // Historical deletion trail (pre-C3): PR #4/#6a/#6b (2026-05-19) removed the
 // bhavcopy/binary-cache/depth/diagnostic/loader/universe-builder generation;
@@ -45,4 +48,3 @@ pub mod index_futures;
 pub mod instrument_snapshot;
 pub mod market_open_self_test;
 pub mod presence_registration;
-pub mod slo_score;

@@ -9,11 +9,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-fn main_src() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
 /// Phase C1 (2026-07-13): the consumer helper relocated from the main.rs
 /// binary to the lib module so `dhan_rest_stack` (the Q4-i order-update
 /// rewire home) can create its own consumer — the internals pins now scan
@@ -42,52 +37,47 @@ fn test_spawn_ws_event_audit_consumer_wired_and_moved_intact() {
             && module.contains("run_ws_event_audit_consumer(rx, questdb_cfg)"),
         "spawn_ws_event_audit_consumer helper must create the channel + spawn the consumer."
     );
-    let src = main_src();
-    assert!(
-        src.contains("use tickvault_app::ws_audit_consumer::spawn_ws_event_audit_consumer;"),
-        "main.rs must re-import the relocated consumer helper."
-    );
-    // PR-C2 (2026-07-13, operator retirement directive —
-    // websocket-connection-scope-lock.md "2026-07-13 Amendment"): the Dhan
-    // main-feed pool (and its named `Some(ws_audit_tx)` sender) DIED with
-    // the lane. The surviving main.rs producers are the Groww bridge /
-    // fleet / sidecar-supervisor sites, each creating its own consumer
-    // inline via the shared helper (counted in the next test).
-    assert!(
-        src.contains("Some(spawn_ws_event_audit_consumer(config.questdb.clone()))"),
-        "the Groww producer sites must pass an inline consumer sender."
-    );
+    // 2026-07-15 (Groww live-feed deletion): the Groww bridge / fleet /
+    // sidecar-supervisor producer sites — the last main.rs consumers of the
+    // helper — died with the lanes, so main.rs no longer imports it. The
+    // helper module is RETAINED (the scoreboard still reads ws_event_audit;
+    // a future producer re-wires through the same helper) and its internals
+    // stay pinned above + in the table/error-code test below.
 }
 
 #[test]
 fn test_order_update_connection_is_audit_wired() {
-    // The order-update connection must also stamp ws_event_audit rows — it
-    // creates its own consumer via the shared helper and passes the sender.
-    let src = main_src();
-    let helper_calls = src
-        .matches("spawn_ws_event_audit_consumer(config.questdb.clone())")
-        .count();
-    assert!(
-        helper_calls >= 2,
-        "the Groww producer sites must call spawn_ws_event_audit_consumer \
-         (found {helper_calls} call(s); expected the bridge + stall-watchdog \
-         sites). PR-C2 (2026-07-13): the legacy main.rs order-update spawn \
-         died with the lane — the stack pins below own that half now."
-    );
-    // 2026-07-14 operator Dhan noise lock: the PR-C1/Q4-i dhan_rest_stack
-    // order-update spawn is RETIRED — the stack must no longer open the
-    // socket at all (its negative ratchet lives in dhan_rest_stack.rs
-    // tests). The main.rs lane sites above are Dhan-gated dead code that
-    // the Phase C-2 PR deletes wholesale.
+    // 2026-07-16 (the order-update rewire — operator directive, governance
+    // on PR #1597; FLIPS the 2026-07-14 negative ratchet): the
+    // dhan_rest_stack Phase 5a MUST spawn the order-update WS again — as
+    // the PAPER-MODE push channel, gated on `[dhan_order_push] enabled`
+    // (default OFF) and Telegram-silent (the `None` notifier binding — the
+    // 2026-07-14 Dhan noise lock still owns the page surface). The ws
+    // lifecycle audit sender is honestly `None` at this site today (the
+    // shared consumer helper is not cheaply reachable in the stack —
+    // wiring it is a flagged follow-up); the in-file dhan_rest_stack
+    // ratchet (`test_rest_stack_order_update_push_gated_and_no_canary`)
+    // pins the exactly-once spawn count.
     let stack = rest_stack_src();
     let stack_prod = stack
         .split_once("#[cfg(test)]")
         .map(|(prod, _)| prod.to_string())
         .unwrap_or(stack);
     assert!(
-        !stack_prod.contains("run_order_update_connection("),
-        "dhan_rest_stack must NOT spawn the order-update WS (retired \
-         2026-07-14 — dhan-rest-only-noise-lock-2026-07-14.md)."
+        stack_prod.contains("run_order_update_connection("),
+        "dhan_rest_stack must spawn the order-update WS as the config-gated \
+         paper-mode push channel (2026-07-16 rewire — \
+         .claude/plans/active-plan-dhan-order-update-rewire.md)."
+    );
+    assert!(
+        stack_prod.contains("if config.dhan_order_push.enabled {"),
+        "the order-update WS spawn must be gated on [dhan_order_push] enabled \
+         (default OFF — a disabled boot must stay byte-identical)."
+    );
+    assert!(
+        stack_prod.contains("let order_push_notifier: Option<Arc<NotificationService>> = None;"),
+        "the order-update WS spawn must stay Telegram-silent — the notifier \
+         arg is a NAMED None binding (2026-07-14 Dhan noise lock)."
     );
 }
 

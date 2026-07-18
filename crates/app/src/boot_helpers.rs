@@ -289,7 +289,6 @@ pub fn create_log_file_writer() -> Option<std::fs::File> {
 ///
 /// | Target | Reason |
 /// |---|---|
-/// | `tickvault_storage::tick_persistence` | tick flush noise |
 /// | `tickvault_core::auth::secret_manager` | per-secret SSM fetch debug |
 /// | `aws_config::profile::credentials` | already suppressed at `warn` for credential leak |
 /// | `aws_smithy_http_client` / `aws_smithy_runtime` | HTTP request/response noise |
@@ -303,9 +302,11 @@ pub fn create_log_file_writer() -> Option<std::fs::File> {
 pub fn build_app_log_filter_directive(base_level: &str) -> String {
     // Order matters: later entries win when they overlap. We start with
     // the user's base level and then layer per-target downgrades on top.
+    // Stage-2 dead-WS sweep (2026-07-17): the
+    // `tickvault_storage::tick_persistence=info` downgrade retired — the
+    // module was deleted with the dead Dhan tick chain.
     format!(
         "{base},\
-         tickvault_storage::tick_persistence=info,\
          tickvault_core::auth::secret_manager=info,\
          aws_config::profile::credentials=warn,\
          aws_smithy_http_client=warn,\
@@ -373,6 +374,7 @@ const CLOCK_DRIFT_HTTP_TIMEOUT_SECS: u64 = 5;
 const CLOCK_DRIFT_REFERENCE_URL: &str = "https://www.google.com";
 
 /// Checks system clock against an HTTP server's Date header (cold path, boot only).
+// TEST-EXEMPT: live HTTP HEAD against an external public time reference (boot-only cold path, fail-soft Option) — no pure core to unit-test without egress; the BOOT-03 gate consuming it is wired in main.rs.
 pub async fn check_clock_drift() -> Option<i64> {
     let local_now = chrono::Utc::now();
     let client = reqwest::Client::builder()
@@ -530,8 +532,9 @@ mod tests {
         assert_eq!(secs_until_close_seal_ist(0), 55_805);
     }
 
-    /// Wiring ratchet (source-scan, repo style — mirrors
-    /// `wal_reinject::tests::ratchet_main_rs_uses_bounded_reinject_helper`):
+    /// Wiring ratchet (source-scan, repo style — the pattern the deleted
+    /// `wal_reinject` ratchets established; that module retired 2026-07-17,
+    /// dead live-WS sweep stage 1):
     /// the close-time force-seal task MUST stay spawned in
     /// `spawn_engine_b_aggregator` (main.rs Task 3b) with (a) the
     /// `compute_close_seal_sleep` trigger, (b) the trading-day calendar
@@ -674,8 +677,9 @@ mod tests {
         let d = build_app_log_filter_directive("debug");
         assert!(d.starts_with("debug,"));
         // The whole point: even with `debug` as the base, the chatty
-        // targets must be downgraded.
-        assert!(d.contains("tickvault_storage::tick_persistence=info"));
+        // targets must be downgraded. (tick_persistence removed from the
+        // directive in the stage-2 dead-WS sweep, 2026-07-17.)
+        assert!(d.contains("tickvault_core::auth::secret_manager=info"));
         assert!(d.contains("aws_config::profile::credentials=warn"));
     }
 

@@ -200,6 +200,21 @@ as historical audit; THIS table is the effective contract.
 > consumer; durable order-event capture returns with live trading (the OMS wiring), and
 > boot-staged order-update WAL segments remain undrained on dhan-off boots (pre-existing
 > Phase A residual, C2 target).
+>
+> **2026-07-14 Amendment (order-runtime dry-run PR — SOCKET-FREE under the same-day
+> §A.1 noise lock):** with `[order_runtime].enabled = true` (base.toml ON; the serde
+> default stays OFF) the dhan-OFF REST stack spawns the DRY-RUN ORDER RUNTIME
+> (`.claude/rules/project/order-runtime-dryrun.md`) — a paper OMS + RiskEngine fed by
+> paper fills and Groww marks, `dry_run` hard-true, ZERO live orders. It opens NO Dhan
+> WebSocket and performs NO order-update WAL capture/drain: the runtime's order-update
+> broadcast channel is created with ZERO producers, honoring the §A.1 spawn retirement.
+> The LIVE RE-ARM is one quoted follow-up unit — (1) the order-update socket spawn with
+> the runtime consumer wired, (2) durable WAL frame capture + the boot drain/conditional
+> confirm, (3) the two CloudWatch order-update alarms §A.1 deleted — re-armed together
+> only after a fresh dated operator quote lands in
+> `dhan-rest-only-noise-lock-2026-07-14.md` §3 + §A.1 here. Ratchets:
+> `test_rest_stack_spawns_no_order_update_ws_and_no_canary` (the socket ban) +
+> `test_rest_stack_wires_order_runtime` (the socket-free/WAL-free runtime shape).
 
 ### §A.1 — 2026-07-14 subsection: Dhan REST-only NOISE lock (order-update spawn retired; Dhan alert surface narrowed to 4)
 
@@ -361,6 +376,22 @@ number reproducible from this repository.
 > line), ready for the day we place orders again. A third supplier (GDF) is being
 > auditioned separately — the wall hooks stay ready for their board.
 
+## 2026-07-15 Amendment — Groww live WS retired; live market-data WS count 1 → 0 (REST-only runtime)
+
+> **Operator directive 2026-07-15 (received directly in this session):** Q1: *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*
+> Approval Q2 (typos preserved): *"go aehad approv ed dude"*.
+
+Effects: the Groww live NATS-over-WS feed — the SOLE live market-data feed per the 2026-07-13 amendment —
+is RETIRED. **Total live market-data WebSocket connections: 0.** Market data is REST-only for BOTH brokers:
+the Dhan §8 spot-1m + option-chain pulls and the Groww §9/§38 spot-1m + option-chain (+ bounded contract)
+pulls (`no-rest-except-live-feed-2026-06-27.md`). Order/position live-push channels remain a SEPARATE,
+authorized surface per the operator's 2026-07-15 order-side directive (recorded by the order-side session;
+see the cluster-A rule updates) — market data = per-minute REST pull, order/position events = live push;
+the dormant `order_update_connection.rs` module ruling in §A.1 is UNCHANGED. The GDF lock
+(`gdf-third-feed-scope-2026-07-13.md`) is UNTOUCHED — it is the ONLY path to any future live market-data
+WebSocket. Where the 2026-07-13 amendment's §A table names Groww "THE SOLE LIVE MARKET-DATA FEED", this
+amendment supersedes that row.
+
 ---
 
 ## Trigger (auto-loaded paths)
@@ -374,3 +405,12 @@ Always loaded. Activates on any session that:
 - Adds any new `wss://` URL constant
 - Calls any `spawn_*_connection` or `spawn_*_pipeline` function
 - Edits `crates/app/src/dhan_rest_stack.rs` or any file containing `SPOT_1M_REST_INDICES` (the post-retirement Dhan surface)
+### 2026-07-16 — Groww + Dhan order/position/trade-update PUSH channels authorized (operator directive)
+
+Operator Parthiban, 2026-07-16, verbatim (event 38df2073-eecb-43cf-876d-a4a809dde269):
+> "Build real-time order, position and trade-update WebSockets for both Dhan and Groww, paper mode / off by default, no live orders yet. Edit the scope-lock rule files to allow it and use the socket-token the Groww channel needs. Everything's staged on branch claude/groww-order-position-push and PR #1597 — continue from there."
+Confirmed after a permission prompt about this rule-file write (event 157f7cd0-dfdf-4c4e-b93a-9f9aff3317c2): OK to record the instruction here and open the two sockets, paper mode / off by default.
+
+GROWW order/position/trade PUSH channel: ONE NEW dedicated NATS-over-WS connection (`wss://socket-api.groww.in`) carrying ORDER / POSITION / TRADE events ONLY — never market data (market data stays REST-only per the 2026-07-15 amendment). Config key `order_push_enabled` under `[groww_orders]` (serde default OFF); module tree `crates/trading/src/oms/groww/push/`; error codes GROWW-PUSH-01..04; `WsType::GrowwOrderUpdate`. Receive-only, paper mode; `GROWW_ORDER_LIVE_FIRE` stays false; no live orders.
+
+2026-07-16 (operator directive above, events 38df2073 + 157f7cd0): the dormant `order_update_connection.rs` is authorized for re-spawn as a PAPER-MODE, receive-only, DEFAULT-OFF channel from `dhan_rest_stack` Phase 5a, gated on `[dhan_order_push] enabled = false`, with `notifier: None` (Telegram-silent — the Dhan 4-item noise-lock family unchanged, the 2 deleted CloudWatch alarms stay deleted). Events are consumed into `order_audit` rows feed='dhan'/mode='paper'. Module DELETION remains REJECT; live order fire remains locked (dry_run untouched).

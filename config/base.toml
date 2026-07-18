@@ -164,11 +164,16 @@ ilp_port = 9009
 [partition_retention]
 # STANDARD class (audit / daily-data tables) hot window.
 retention_days = 90
-# HIGH-VOLUME market-data class (ticks + 21 candles_* tables, ~1.2-2 GB/day).
-# 90d of ticks (~135+ GB) can never fit the 30 GB volume; 14d hot on EBS with
-# the verified S3 archive as the durable long-term store (SEBI retention is
-# satisfied by the S3 copy — aws-budget hot-window doctrine).
-market_data_hot_days = 14
+# HIGH-VOLUME market-data class (ticks + 21 candles_* tables + the per-minute
+# chain tables option_chain_1m/option_contract_1m_rest since 2026-07-16).
+# 35d hot on EBS (2026-07-16 operator directive — "our entire one month
+# should be stored and fetched from questdb even before premarket"; was 14),
+# with the verified S3 archive as the durable long-term store (SEBI retention
+# is satisfied by the S3 copy — aws-budget hot-window doctrine). The chain
+# tables moved here from the 90d Standard class the same day (the operator's
+# "option only for the current day" direction — 35d is the smallest clean
+# change; a tighter chain-only knob is a follow-up if disk pressure demands).
+market_data_hot_days = 35
 # Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
 # Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
 # and size-verified. ROLLBACK: set false (or delete the key) to restore the
@@ -315,47 +320,16 @@ auto_start_docker = true
 [feeds]
 dhan_enabled = false
 groww_enabled = false
-# Groww NATIVE-RUST SHADOW client (PR-R1 of the parity migration, operator
-# "go" 2026-07-04 — groww-second-feed-scope-2026-06-19.md §35). Default OFF.
-# When true, the native Rust client runs ALONGSIDE the Python sidecar (same
-# watch set) and writes its own NDJSON capture file
-# (data/groww/rust-live-ticks.ndjson) for the exact per-tick parity comparer.
-# No shared-table writes, no strategy/order wiring, no sidecar changes.
-groww_native_shadow = false
-
-# Groww capture-archive S3 offload (2026-07-13 disk-retention hardening).
-# Rotated sidecar capture archives (data/groww/live-ticks-YYYYMMDD.ndjson)
-# are uploaded to s3://<bucket>/<prefix>/<filename>, VERIFIED (head_object
-# size match), and only then deleted locally after a grace window. Empty
-# bucket = archival OFF (archives kept on disk — the dev-Mac behaviour);
-# the sidecar NEVER deletes a file without a verified S3 copy.
-[feeds.groww]
-capture_archive_s3_bucket = "tv-prod-cold"
-capture_archive_s3_prefix = "groww-capture"
-
-# Groww multi-connection AUTO-SCALE ladder (operator authorization 2026-07-03,
-# §34 of .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
-# enabled = false (the default) keeps the single-connection sidecar path
-# byte-identical. Tier A ceiling = 10 connections (Monday); raising
-# target_connections beyond the current tier requires the §34.2 gate evidence.
-[feeds.groww.scale]
-enabled = false
-target_connections = 10
-instruments_per_conn = 1000
-ladder = [1, 2, 5, 10]
-gate_hold_minutes = 15
-gate_max_cpu_pct = 70.0
-gate_min_disk_free_pct = 20.0
-gate_max_capture_lag_ms = 30000
-rollback_hold_base_minutes = 10
-advance_window_ist = ["09:20", "14:30"]
-# Cap-probe mode (PR-3): exactly 2 conns x 600 instruments + a
-# per-conn-vs-per-account verdict, then hold at 2. Scale-test harness only.
-probe_mode = false
-# Weekend SMOKE mode (PR-3): when the market is CLOSED, exercise the full
-# scale machinery with tick gates honestly SKIPPED (labelled SMOKE).
-# No effect while the market is open. Scale-test harness only.
-weekend_smoke = false
+# The Groww LIVE feed was RETIRED 2026-07-15 (operator directive: "remove
+# the whole Groww live feed; keep only spot 1m and option chain for both
+# brokers"). groww_enabled above does NOT gate the Groww REST legs (each is
+# section-gated by its own [groww_spot_1m] / [groww_option_chain_1m] /
+# contract-leg `enabled` key); it feeds the boot-completed feed gate, the
+# scoreboard feed_off day classification, and the /feeds page display only
+# (verified 2026-07-15 — the live feed itself is retired). The daily
+# watch-set build lives under [groww_universe]. The retired keys
+# (groww_native_shadow, [feeds.groww] capture archive, [feeds.groww.scale])
+# were removed with the live machinery.
 
 # [movers] section retired in PR #2 (2026-05-18) alongside the deleted
 # movers pipeline. Under the 4-IDX_I-only universe top-N gainers/losers/
@@ -495,7 +469,7 @@ compare_volume           = false    # groww live volume is always 0
 # (fail-safe); `enabled = false` is the rollback switch.
 # ===========================================================================
 [spot_1m_rest]
-enabled = true
+enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Dhan spot pulls (RS3 mutual exclusion)
 # 2026-07-14 serving-delay diagnostics rider: LOG-ONLY one-shot probes
 # (first session fire after boot + once at ~11:00 IST; ≤6 bounded extra
 # requests/day, ~300ms apart, inside the Data-API budget) that log the
@@ -548,7 +522,7 @@ target_rps = 3
 # canary if `enabled` is ever rolled back).
 # ===========================================================================
 [option_chain_1m]
-enabled = true  # entitlement proven live 2026-07-13 08:31:49 IST (§8.7)
+enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Dhan chain pulls (RS3; entitlement remains proven live 2026-07-13, §8.7)
 probe_and_report = true
 
 # ===========================================================================
@@ -564,6 +538,17 @@ probe_and_report = true
 # section = disabled (fail-safe); `enabled = false` is the rollback switch.
 # ===========================================================================
 [groww_spot_1m]
+enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Groww spot pulls (RS3)
+
+# ===========================================================================
+# [groww_universe] — process-global daily Groww watch-set + shared-master
+# rider (2026-07-15 Groww live-feed retirement re-home): once per IST day,
+# build + write data/groww/groww-watch-<date>.json (the spot leg's VIX
+# resolver reads it) and fire-and-forget persist_groww_instruments (SEBI
+# feed='groww' master continuity). Base opts IN; the serde default stays OFF
+# (the house fail-safe pattern — an absent section disables the rider).
+# ===========================================================================
+[groww_universe]
 enabled = true
 
 # ===========================================================================
@@ -582,7 +567,7 @@ enabled = true
 # nothing) — flip enabled = true only after the probe passes.
 # ===========================================================================
 [groww_option_chain_1m]
-enabled = true # flipped 2026-07-13 after the live probe PASSED (groww-second-feed-scope §38.6); serde default stays OFF
+enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Groww chain pulls (RS3; probe PASSED 2026-07-13, §38.6)
 probe_and_report = true # inert while enabled; the rollback canary (the Dhan §8.7 precedent)
 
 # ===========================================================================
@@ -608,6 +593,29 @@ enabled = false # stays OFF until the operator's dated flip note (the chain leg 
 strikes_each_side = 2
 
 # ===========================================================================
+# Groww REST burst auto-ladder (operator approval 2026-07-14 — "approved
+# and go ahead with the recommendation"; contract:
+# no-rest-except-live-feed-2026-06-27.md §9.7 +
+# groww-second-feed-scope-2026-06-19.md §38.9). tier selects how the
+# per-minute Groww spot + chain waves fire: "two_wave" (the rate-safe
+# DEFAULT — 3 chain requests at close+300ms, 4 spot at close+1350ms;
+# boundary burst <= 4/s) or "seven_concurrent" (the operator preference —
+# all 7 at close+300ms; flip ONLY after the off-hours rate probe passes,
+# with a fresh dated rule note). Any Groww-leg HTTP 429 steps the session
+# DOWN the demotion ladder (two_wave -> staggered -> fully sequential); a
+# restart restores this configured tier.
+# warm_up = true sends one unauthenticated pre-boundary GET per leg client
+# at boundary-4s (3s-bounded, response discarded) so an idle-closed TLS
+# connection is re-established before the critical window. An ABSENT
+# section = two_wave + warm-up off — still rate-safe: the wave instants
+# are millisecond-precise regardless of the warm-up toggle, so the > 1s
+# two_wave separation always holds (2026-07-14 fix-round wording).
+# ===========================================================================
+[groww_rest_burst]
+tier = "two_wave" # seven_concurrent is probe-gated — dated rule note required to flip
+warm_up = true
+
+# ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
 # "how will you guarantee that all our defined timeframes internally are
 # correct — how do you identify whether any miscalculation or data
@@ -622,6 +630,123 @@ strikes_each_side = 2
 # ===========================================================================
 [tf_consistency]
 enabled = true
+
+# Daily 15:47 IST Dhan↔Groww spot_1m_rest cross-broker OHLC comparator
+# (SPOT-XVERIFY-01/02, operator 2026-07-17). serde default is OFF; base.toml
+# opts in (the fail-safe shape).
+[spot_crossverify]
+enabled = true
+
+# ===========================================================================
+# Order runtime (dry-run) — cluster A, operator directive 2026-07-14
+# (.claude/plans/active-plan-order-runtime-dryrun.md). One supervised task
+# owning the paper OMS + RiskEngine, spawned from the Dhan REST-only stack:
+# order-update events reach the book, Groww marks drive mark-to-market P&L
+# + the next-mark paper filler, the daily-loss halt finally has real
+# inputs, and a once-daily gated self-test proves the chain end-to-end.
+# NO real orders ever (the OMS is hard dry-run). An ABSENT section =
+# disabled (fail-safe); `enabled = false` is the rollback switch — it
+# restores the exact pre-PR dormant shape (discard drain, no WAL capture).
+# ===========================================================================
+[order_runtime]
+enabled = true
+paper_fill = true
+self_test = true
+reconcile_interval_secs = 300
+mark_channel_capacity = 8192
+
+# ===========================================================================
+# 🔷 DHAN order-update WS paper-mode push channel (operator directive
+# 2026-07-16; governance on PR #1597 —
+# .claude/plans/active-plan-dhan-order-update-rewire.md). RECEIVE-ONLY:
+# when enabled, the Dhan REST stack opens the order-update WebSocket
+# (Telegram-silent per the 2026-07-14 Dhan noise lock) and records each
+# order event as an order_audit row feed='dhan' mode='paper'. NO live
+# orders; dry_run untouched. Ships OFF — flipping to true is the
+# operator's paper-mode observability opt-in; an ABSENT section =
+# disabled (fail-safe).
+# ===========================================================================
+[dhan_order_push]
+enabled = false
+
+# ===========================================================================
+# REST-era multi-TF candle derivation (operator directive 2026-07-16:
+# "why the fuck remaining candles 1m till 1day is not yet generated and
+# populated — resolve these"). Folds persist-confirmed spot_1m_rest 1m bars
+# into all 21 candles_* timeframes via the shared seal-writer channel, plus
+# a boot catch-up over the last `catchup_days` of stored bars (35 = the
+# operator's one-month spot window + weekend slack, 2026-07-16: "our entire
+# one month should be stored and fetched from questdb even before
+# premarket"). NEVER touches `ticks` (live-feed-purity; rule 10 carries the
+# dated candles_1d edit). Serde default is OFF (fail-safe) — this section
+# opts in; `enabled = false` is the rollback switch.
+# ===========================================================================
+[rest_candle_fold]
+enabled = true
+catchup_days = 35
+
+# ===========================================================================
+# RAM residency stores (operator directive 2026-07-16, PR-2 of the
+# data-completeness build): the month-deep SPOT bar rings (fed by the
+# rest_candle_fold emit path — zero new QuestDB reads) + the current-day
+# CHAIN minute ring (fed by the chain legs' publish path, boot-rehydrated
+# from today's option_chain_1m rows via bounded /exec windows). Cold path
+# only; reads are the FUTURE strategy read contract (§28 boundary — no
+# strategy consumer ships). An ABSENT section = disabled (fail-safe);
+# `enabled = false` is the rollback switch. RAMSTORE-01 runbook:
+# .claude/rules/project/ram-store-error-codes.md
+# ===========================================================================
+[market_ram_store]
+enabled = true
+spot_days = 35
+chain_row_cap = 1000
+
+# ===========================================================================
+# Scheduled OMS order-book reconciliation (2026-07-14). Every
+# `interval_secs` during the NSE session the trading pipeline reconciles
+# OMS state against the Dhan order book (the OMS-GAP-02 machinery gains a
+# scheduled caller). DEFAULT-OFF until live trading — the OMS dry-run
+# short-circuit makes an enabled run a zero-HTTP no-op anyway. An ABSENT
+# section = disabled (fail-safe); `enabled = false` is the rollback switch.
+# ===========================================================================
+[oms_reconcile]
+enabled = false
+interval_secs = 300
+# NOTE: `trading_hours_only = false` skips the SESSION-WINDOW gate AND the
+# trading-DAY (calendar/weekday) gate — runs then fire on weekends/holidays too.
+trading_hours_only = true
+
+# ===========================================================================
+# Groww ORDER-SIDE build gate (operator authorization 2026-07-14 —
+# groww-second-feed-scope-2026-06-19.md §39, no-rest-except-live-feed §10).
+# GATE 1 of the 4-gate live-fire lattice. EVERY key is false: the entire
+# Groww order-side ships DARK. Read-only order/portfolio/margin/user GETs run
+# ONLY when their per-area flag here is true AND during market hours. Live
+# order PLACEMENT is additionally hard-locked behind Gate 2 (the non-default
+# `groww_orders` cargo feature) + Gate 3 (the GROWW_ORDER_LIVE_FIRE = false
+# source const): flipping live_fire_requested alone fires NOTHING. Flipping
+# any of these to true for live orders is a SEPARATE future dated operator
+# action that edits §39 + Gate 3 first. Absent section = fully disabled.
+# ===========================================================================
+[groww_orders]
+orders_read = false
+portfolio_read = false
+margin_read = false
+user_read = false
+live_fire_requested = false
+smart_orders_read = false # read-only GTT/OCO get/list (the OCO reconcile poller's read surface)
+smart_orders_write = false # smart-order create/modify/cancel INTENT — inert without Gates 2+3
+oco_reconcile_poll_secs = 15 # OCO reconcile poller cadence (seconds; Smart Orders area design value)
+oco_sibling_cancel_deadline_secs = 30 # sibling-cancel verification deadline (seconds) — past it = GROWW-OCO-02
+# paper_enabled: the zero-HTTP paper executor + intent ledger lane. Default
+# OFF; makes ZERO HTTP calls (incl. GETs) when on — separate from orders_read.
+paper_enabled = false
+# max_order_quantity: fail-closed cap; 0 = refuse-all (pending the operator's
+# 0-vs-1 answer). A larger requested qty is refused before any HTTP (GROWW-ORD-09).
+max_order_quantity = 0
+# order_push_enabled: receive-only order/position PUSH channel (Stage A,
+# 2026-07-16) — paper-mode observability only; places no order.
+order_push_enabled = false
 
 # ===========================================================================
 # 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via
@@ -643,3 +768,99 @@ enabled = true
 enabled = false
 tenant_budget_percent = 50
 rest_self_cap_per_sec = 5
+
+# ===========================================================================
+# 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14 — LOCK #1 of
+# the 4-lock OFF switch; runbook + lockout contract in
+# .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md). While
+# enabled = false the app-crate dispatcher drops every exit command
+# (counted, never silent). Flipping to true activates DRY-RUN PAPER
+# behavior ONLY — the engine's hardcoded dry_run = true blocks every live
+# POST, and one boot log line names the mode honestly (a flip is never a
+# silent no-op). Going live needs a code change + ratchet edit + rule-file
+# edit with a dated operator quote — never a config flip alone. This
+# section deliberately EXISTS with enabled = false: it is the lockout
+# guard's non-vacuous scan surface (the groww-scale-lockout pattern).
+# When enabling: default_freeze_limit_qty (>= 1, the NSE freeze quantity)
+# and freeze_limits_reviewed_on ("YYYY-MM-DD", warns when > 90 days old)
+# become mandatory; mpp_verify_deadline_secs (default 30) and
+# mpp_verify_max_attempts (default 5) drive the verify-after-place ladder.
+# ===========================================================================
+[exit_orders]
+enabled = false
+
+# Cadence scheduler (judge-locked 2026-07-14; reshaped by the operator
+# directive 2026-07-16): per-minute POST-CLOSE burst fire timing with
+# structural zero-429 gates (pure CAS per-(underlying, expiry) spacing +
+# the combined rolling-second cap, monotonic domain), streak-driven shape
+# ladders, and event-driven per-(lane, minute) moneyness decisions.
+# SHIPS DISABLED: day 1 both lanes run the dry-run logging executor
+# (fires logged, Empty returned, NO REST call — decisions honest-skip).
+# Flipping `enabled = true` needs the real broker executors (a later PR)
+# + the dated rule-file note per
+# `.claude/rules/project/cadence-error-codes.md`.
+[cadence]
+enabled = true # flipped 2026-07-17 — REAL broker executors both lanes (the legacy per-minute legs stand down above per the RS3 mutual exclusion)
+# Broker lane gates (fix round 2026-07-17): the cadence REST lanes are
+# deliberately INDEPENDENT of the retired live-WS flags
+# feeds.dhan_enabled/groww_enabled (false in prod, runtime enable 409'd).
+# Config + restart to change — no runtime toggle.
+dhan_lane = true
+groww_lane = true
+# The Dhan post-close burst second (operator 2026-07-16 "all 7 parallel
+# at first second" — the same-day correction): at T + this, ALL 7
+# requests fire concurrently — 3 chains (the 3s rule is per-(underlying,
+# expiry) only, so different underlyings are concurrent in the
+# option-chain API's OWN budget) + all 4 spots (the Data-API bucket,
+# 4 <= 5). The shape ladder's rung 1 fallback splits instead: chains in
+# second 1, ALL 4 spots in second 2.
+dhan_burst_offset_ms = 1000
+# Rolling-1000ms-window spot gate: at most this many spot requests in ANY
+# sliding second (1..=5 — Dhan's Data-API hard cap is 5/sec; the combined
+# spot+expiry rolling-second ring is THE binding cadence-lane pacing per
+# the 2026-07-16 coordinator ruling — cadence fires do NOT route through
+# the shared 3 rps dhan_data_api_limiter, which stays for the legacy
+# paths, and chain fires are governed solely by the per-key 3s gate).
+spot_window_cap = 4
+# Streak thresholds shared by ALL cadence ladders (the 2026-07-16 Dhan
+# shape rung 0⇄1, the 2026-07-15 spot-concurrency tiers and the Groww
+# fallback-shape ladder; BOTH Assumed — operator confirm pending):
+# degrade one step after this many CONSECUTIVE dirty cycles; recover one
+# step after this many consecutive fully-clean cycles.
+concurrency_degrade_after_dirty_cycles = 2
+concurrency_recover_after_clean_cycles = 3
+# Spot clamp: spots never fire earlier than T + this (house 300ms —
+# structurally inert at the default 1000ms burst offset).
+spot_min_post_close_ms = 300
+# At most one in-cycle retry per failed request, through the gates. A
+# RateLimited leg KEEPS its one bounded in-cycle retry (after the per-key
+# spacing) — one of the operator's "multiple attempts" before any shape
+# demotion (2026-07-16 Correction 2; supersedes the earlier "RateLimited
+# never retried" wording, which was the exact inverse).
+in_cycle_retry_max = 1
+# Lane staleness cutoffs past T: older data is stale for a next-minute fill.
+dhan_lane_cutoff_ms = 15000
+groww_lane_cutoff_ms = 6000
+# Groww fallback-shape ladder (operator verbatim 2026-07-16 two-rung
+# prescription + the retained choice-3 last resort): rung 0 (default) =
+# all 7 requests in parallel at T+0; rung 1 = :01 all 3 chains / :02 ALL
+# 4 spots (VIX included); rung 2 (kept beyond the operator's two-rung
+# prescription as the last resort — dated note in
+# cadence-error-codes.md) = :01 chains / :02 core spots / :03 VIX alone.
+# Verdict = last wave + the burst timeout; 1500ms per request on the
+# sequential fallback.
+groww_anchor_offset_ms = 0
+groww_burst_timeout_ms = 800
+groww_request_timeout_ms = 1500
+# The structural zero-429 floor: the per-(underlying, expiry) chain gate
+# (the 2026-07-16 directive: the broker's 3s rule applies to the SAME
+# chain expiry only — different underlyings fire concurrently).
+chain_min_spacing_ms = 3000
+# Pre-market expiry resolution (operator spec 2026-07-15): bounded retry
+# interval per (broker, underlying) expiry-list fetch until the IST
+# deadline; past the deadline ONE edge-latched CADENCE-01
+# `expiry_unresolved` page per pair episode while background retry
+# continues to session end (the deadline gates the PAGE, never attempts).
+expiry_retry_interval_ms = 60000
+# 08:55:00 IST = 32100 seconds of day (validated within [0, 86400)).
+expiry_deadline_secs_of_day_ist = 32100

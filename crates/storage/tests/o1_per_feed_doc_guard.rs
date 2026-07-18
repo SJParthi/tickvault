@@ -94,8 +94,12 @@ fn doc_matches_code_every_feed_keyed_dedup_const_contains_feed() {
     // carry `feed` MUST actually carry `feed` in the storage source. (The dedup
     // meta-guard enforces this independently; this re-asserts it from the doc's
     // perspective so doc + code can never silently diverge.)
+    // Stage-2 dead-WS sweep (2026-07-17): the `("tick_persistence.rs",
+    // "DEDUP_KEY_TICKS")` row was removed — the file (the ticks writer) was
+    // DELETED with the dead Dhan tick chain; the `ticks` table stays
+    // read-only in QuestDB (SEBI) with its DB-side DEDUP config intact, but
+    // there is no writer-side constant left to bind the doc to.
     let checks = [
-        ("tick_persistence.rs", "DEDUP_KEY_TICKS"),
         ("shadow_persistence.rs", "DEDUP_KEY_CANDLES"),
         ("prev_day_ohlcv_persistence.rs", "DEDUP_KEY_PREV_DAY_OHLCV"),
         ("ws_event_audit_persistence.rs", "DEDUP_KEY_WS_EVENT_AUDIT"),

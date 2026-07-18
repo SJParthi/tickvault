@@ -25,16 +25,19 @@
 
 ## §1. The rule (one line)
 
-**The ONLY Dhan Telegram alerts that can ever fire are: (1) the DHAN spot-1m
-pull failing/recovered, (2) the DHAN option-chain pull failing/recovered,
-(3) the DHAN token-unobtainable Critical, and (4) the CloudWatch 4h
-token-remaining early-warning — every other Dhan-era page, probe, watchdog
+**The ONLY Dhan-scoped Telegram alerts that can ever fire are: (1) the DHAN
+spot-1m pull failing/recovered, (2) the DHAN option-chain pull
+failing/recovered, (3) the DHAN token-unobtainable Critical, (4) the
+CloudWatch 4h token-remaining early-warning, and (5 — added 2026-07-16 per
+the §2.2 dated row) the cadence expiry cross-broker DISAGREEMENT page (a
+cross-broker data-integrity page naming BOTH brokers, not a Dhan-failure
+family) — every other Dhan-era page, probe, watchdog
 Telegram, and dead alarm is deleted or silenced; the token machinery
 self-heals SILENTLY.**
 
 ---
 
-## §2. The contract table (the final 4-item Dhan alert set)
+## §2. The contract table (the final 4-item Dhan alert set + the §2.2 2026-07-16 cross-broker addition)
 
 | # | Allowed Dhan alert | Variant(s) / route | Fires when |
 |---|---|---|---|
@@ -56,7 +59,25 @@ falling edge). This is a variant EXTENSION of family (2), not a 5th family: it s
 "the Dhan option-chain pull is failing" — scoped to one index. Everything else in §2 stands;
 the deleted/silenced table is untouched.
 
-**Deleted or silenced 2026-07-14 (everything else Dhan):**
+**§2.2 — 2026-07-16: the cadence expiry cross-broker DISAGREEMENT page joins the allowed
+set.** Authority: the OPERATOR's 2026-07-16 cadence/expiry-disagreement directive, relayed
+via the coordinator session (verbatim intent, labeled as such per the house §38.0-Context-3
+convention — this dated row is the rule-file edit §3 demands before any new Dhan-scoped
+page): a cross-broker expiry split must page the operator as a real Telegram alert, never a
+log-only line. The coordinator's implementation ruling relaying it (verbatim): *"R6 —
+expiry cross-broker disagreement must be a REAL typed
+NotificationEvent Telegram page (not log-only) + a dated 2026-07-16 row in
+dhan-rest-only-noise-lock-2026-07-14.md §2."* The cadence scheduler's pre-market expiry
+resolution (`cadence-error-codes.md` §0) can find Dhan's and Groww's contract lists
+DISAGREEING on today's policy expiry for one underlying — Dhan's exchange-sourced date WINS
+and keys BOTH lanes. The new page is `NotificationEvent::CadenceExpiryDisagreement` (High):
+edge-latched ONCE per underlying per day (the day-locked store's `newly_disagreeing` latch),
+body names BOTH brokers + both dates + that the Dhan date now keys both lanes (plain English
+per the 10 commandments). This is a CROSS-BROKER data-integrity page, not a Dhan-failure
+family: it fires only when both brokers resolved and their answers split — never per wave,
+never on a single-broker outage (those stay the log-only `expiry_unresolved` stage + the
+pre-market deadline page). Emit site: the `newly_disagreeing` arm in
+`crates/core/src/cadence/runner.rs`; sink threaded from boot via `cadence_boot.rs`.
 
 | Component | Disposition |
 |---|---|
@@ -65,12 +86,37 @@ the deleted/silenced table is untouched.
 | REST-stack stale-token sweep (GAP-02, 2026-07-14 backstop) | **ADDED, silent:** `dhan_rest_stack` Phase 3 runs `force_renewal_if_stale(14400)` every 900s (`DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS`) — the renewal-loop-halt backstop the lane's 4h sweep used to be. Not market-hours-gated. Terminal failure pages via family-(3). SUPERVISED (fix round: the house respawn pattern — a silent sweep death would re-open the audited gap; unwind-build self-heal only, release panics abort). Honest wording note (fix round): the ~23h renewal loop is NOT an independent retry — it HALTS PERMANENTLY after its circuit-breaker cycles; this sweep + the AUTH-GAP-05 watchdog are the retries. |
 | Shared mint-cooldown gate (H3, 2026-07-14 fix round) | **ADDED, silent:** `TokenManager::renew_with_fallback` — the ONE shared re-mint entry (watchdog + GAP-02 sweep + renewal loop + `force_renewal*`) — SKIPS the `generateAccessToken` fallback with a coded warn + typed refusal (`mint-cooldown` prefix; never a page, never burns the episode latch) while a previous mint ATTEMPT is younger than the ~125s Dhan cooldown. Closes the AG5-R2-1 flagged residual the 900s sweep had tightened 16x. The boot-time `initialize` retry loop is deliberately UNGATED (calls `acquire_token` directly; owns its own >=130s floor — no boot deadlock; source-scan pinned). |
 | Token-health gauge poller supervision + pre-#1522 residual (GAP-06 + M6, fix round) | The re-homed poller is SUPERVISED like the sweep. **ACCEPTED residual (M6):** on a hypothetical `dhan_enabled=true` boot BEFORE #1522 merges, the LANE path no longer spawns the poller (its main.rs spawn sites are deleted) and the stack does not run — so `tv_token_valid` would go unpublished for that boot shape. Accepted because prod is dhan-OFF (config + the Phase-A 409 refusal) and #1522 (which deletes the lane's fast arm) merges FIRST; this PR rebases after. |
-| REST canary (`rest_canary_boot.rs`, REST-CANARY-01 probes 09:05/12:00/15:25 IST) | **Module + both spawn sites + the `rest-canary-01` CloudWatch filter/alarm DELETED.** The legs self-detect REST death in ~3-4 min via their own escalation edges — strictly better than 3 fixed slots. `ErrorCode::RestCanary01ProbeFailed` variant retained until C4. |
+| REST canary (`rest_canary_boot.rs`, REST-CANARY-01 probes 09:05/12:00/15:25 IST) | **Module + both spawn sites + the `rest-canary-01` CloudWatch filter/alarm DELETED.** The legs self-detect REST death in ~3-4 min via their own escalation edges — strictly better than 3 fixed slots. `ErrorCode::RestCanary01ProbeFailed` variant retained until C4 — **DELETED in the C4 sweep (2026-07-15)**. |
 | No-tick watchdog (`no_tick_watchdog.rs`, `NoLiveTicksDuringMarketHours` Critical) | **Module + variant + both spawn sites DELETED.** Its heartbeat was fed ONLY by the retired Dhan tick pipeline; Groww stall detection is FEED-STALL-01 + the market-hours-liveness alarm. |
-| Fast-boot cached-token validation (`fast_boot_validation.rs`, AUTH-GAP-06) | **Module + sole call site DELETED** (the Dhan-gated fast arm is dead with `dhan_enabled=false` and dies in #1522). `ErrorCode::AuthGap06…` variant retained until C4. |
+| Fast-boot cached-token validation (`fast_boot_validation.rs`, AUTH-GAP-06) | **Module + sole call site DELETED** (the Dhan-gated fast arm is dead with `dhan_enabled=false` and dies in #1522). `ErrorCode::AuthGap06…` variant retained until C4 — **DELETED in the C4 sweep (2026-07-15)**. |
 | Token-health gauge poller (`token_health_gauge.rs`, `tv_token_valid` + live `tv_token_remaining_seconds`) | **RE-HOMED (GAP-06, 2026-07-14 — supersedes the same-day delete ruling):** the module is KEPT; the lane/fast-arm spawn sites in main.rs are DELETED; `dhan_rest_stack` Phase 3 spawns it, so the gauges stay alive on dhan-off boots even after a renewal-loop circuit-breaker halt (which kills the 30s in-loop gauge writer) — keeping alarm #4 sighted. |
 | Order-update WS spawn (`dhan_rest_stack` Phase 5a) + its 2 alarms (`tv-<env>-order-update-ws-inactive`, `tv-<env>-order-update-reconnect-storm`) | **Spawn + alarms DELETED** per `websocket-connection-scope-lock.md` §A.1. The core module `order_update_connection.rs` is RETAINED DORMANT (unit tests stay) for the live-trading re-wire — re-spawn or module deletion needs a fresh dated quote in the scope-lock file first. |
 | `observability-architecture.md` paging list | REST-CANARY-01 removed from the Filtered+alarmed set (dated note; the paging drift guard pins tf↔doc↔emit). |
+
+### §2a. Order-execution family (cluster C, PR #1554 — a SEPARATE landed family, NOT a Dhan REST alert)
+
+The §2 4-item set is the **Dhan REST-only surface** (spot-1m / option-chain /
+token). Distinct from it, the **order-execution family** — the cluster-C
+order-side observability that landed on `main` in **PR #1554** — dispatches its
+OWN typed Telegram events from `crates/app/src/order_observability.rs`
+(the order-side consumer's `OmsAlertBridge` / `RiskAlertBridge` sinks):
+`NotificationEvent::OrderRejected`, `NotificationEvent::CircuitBreakerOpened`,
+and `NotificationEvent::RiskHalt`. These fire on the OMS order path (order
+rejects, circuit-breaker transitions, risk halts) in the paper/dry-run layer —
+NOT on the Dhan REST data-pull surface — so they are **outside** the §2 count
+and are NOT governed by the §3 "new Dhan-scoped REST Telegram page" REJECT.
+
+**This subsection is a rebase-reconciliation note (2026-07-14):** it DOCUMENTS
+the pre-existing, landed #1554 dispatch sites so the exit-order lockout guard
+(`dhan_exit_order_lockout_guard::exit_layer_emits_no_telegram_dispatch`) — which
+requires this file to carry an `order execution` family row once any order-path
+`NotificationEvent` dispatch site exists — reconciles cleanly with `main`. It
+introduces NO new emit. **The 🔷 DHAN exit-order layer itself stays
+Telegram-free** (engine exit region + `exit_rules.rs` + `exit_execution.rs` are
+sink-free; EXIT-ORDER-01 / EXIT-VERIFY-01 remain log-sink-only) — the guard's
+part (a) still enforces that verbatim. Any FUTURE change that routes the exit
+layer's own signals to Telegram remains a REJECT under §3 until an operator
+dated quote lands here.
 
 ---
 
@@ -158,3 +204,4 @@ Always loaded. Reinforced on any session editing:
   `TokenForcedRemintTriggered`, `NoLiveTicksDuringMarketHours`,
   `rest_canary`, `fast_boot_validation`, `run_order_update_connection`, or
   `DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS`
+(2026-07-16, operator directive events 38df2073 + 157f7cd0) The paper-mode, receive-only order-update re-spawn is AUTHORIZED (config `[dhan_order_push] enabled = false`, default OFF). The channel is Telegram-SILENT (`notifier: None`) — the 4-item Dhan Telegram family is UNCHANGED and the 2 deleted CloudWatch alarms STAY deleted. Observability is coded logs + counters (`tv_dhan_order_updates_total`, `tv_dhan_order_push_respawn_total`) + ws_event_audit + order_audit rows only. Live order fire remains locked.
