@@ -995,9 +995,11 @@ fn test_deploy_watchdog_lambda_is_wired() {
         "deploy/aws/terraform/deploy-watchdog-lambda.tf",
         "Deploy-watchdog Lambda terraform (EventBridge + IAM + function)",
     );
+    // Rust-only phase 2b-2 wave 1 (2026-07-18): the handler is the Rust
+    // module (the python handler.py was ported 1:1 and deleted).
     require_file_exists(
-        "deploy/aws/lambda/deploy-watchdog/handler.py",
-        "Deploy-watchdog Lambda handler",
+        "crates/aws-lambdas/src/deploy_watchdog.rs",
+        "Deploy-watchdog Lambda handler (Rust module)",
     );
     let tf = std::fs::read_to_string(
         workspace_root().join("deploy/aws/terraform/deploy-watchdog-lambda.tf"),
@@ -1049,19 +1051,21 @@ fn test_deploy_watchdog_lambda_is_wired() {
 #[test]
 fn test_deploy_watchdog_handler_only_dispatches_when_positively_stale() {
     // The handler's safety contract: NEVER dispatch on uncertainty. The pure
-    // `is_stale` must return False when either sha is unknown (the no-false-OK
-    // inverse — we never "fix" what we can't confirm is broken).
-    let h = std::fs::read_to_string(
-        workspace_root().join("deploy/aws/lambda/deploy-watchdog/handler.py"),
-    )
-    .expect("deploy-watchdog handler.py must be readable"); // APPROVED: test
+    // `is_stale` must return false when either sha is unknown (the no-false-OK
+    // inverse — we never "fix" what we can't confirm is broken). Repointed
+    // 2026-07-18 (rust-only phase 2b-2 wave 1) at the Rust module that
+    // replaced deploy/aws/lambda/deploy-watchdog/handler.py.
+    let h =
+        std::fs::read_to_string(workspace_root().join("crates/aws-lambdas/src/deploy_watchdog.rs"))
+            .expect("crates/aws-lambdas/src/deploy_watchdog.rs must be readable"); // APPROVED: test
     assert!(
-        h.contains("def is_stale("),
+        h.contains("pub fn is_stale("),
         "handler must expose the pure is_stale decision function"
     );
     assert!(
-        h.contains("if not desired_sha or not deployed_sha:") && h.contains("return False"),
-        "is_stale MUST return False when either sha is unknown — never dispatch on uncertainty"
+        h.contains("let (Some(desired), Some(deployed)) = (desired_sha, deployed_sha) else")
+            && h.contains("return false;"),
+        "is_stale MUST return false when either sha is unknown — never dispatch on uncertainty"
     );
     assert!(
         h.contains("deploy-aws-after-close.yml"),

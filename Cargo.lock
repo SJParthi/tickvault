@@ -4282,6 +4282,7 @@ dependencies = [
  "aws-sdk-ssm",
  "chrono",
  "lambda_runtime",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

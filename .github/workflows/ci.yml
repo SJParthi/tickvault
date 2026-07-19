@@ -590,14 +590,13 @@ jobs:
         shell: bash
         run: bash .claude/hooks/boot-symmetry-guard.sh
 
-      # 2026-07-07 Telegram UX overhaul (judge final contract, Module 5):
-      # the telegram-webhook Lambda's house-style formatters are unit-tested
-      # server-side so a Lambda regression cannot ship silently. Added to
-      # the EXISTING Repo Guards job on purpose — no new job, the All Green
-      # `needs:` list is unchanged.
-      - name: Telegram Lambda house-style unit tests
-        shell: bash
-        run: make lambda-test
+      # 2026-07-18 (rust-only phase 2b-2 wave 1): the python `make
+      # lambda-test` step is RETIRED — the telegram-webhook Lambda is now
+      # the Rust crate tickvault-aws-lambdas (its ported test suite runs in
+      # the Test matrix `aws-lambdas` lane, which All Green already needs),
+      # and the house-style judge contract stays ratcheted by
+      # crates/core/tests/telegram_lambda_house_style_guard.rs (repointed
+      # at the Rust module).
 
       # QuestDB console lambda suites + deploy-gate scenario harness
       # (2026-07-06 shell-hang fix; simplified in the 2026-07-08 closure
