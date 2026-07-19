@@ -230,19 +230,37 @@ fn config_file_is_consumed_by_the_rust_mcp_server_only() {
         "config/claude-mcp-endpoints.toml header must name the Rust MCP \
          server as its consumer (post-cutover truth)"
     );
-    let out = std::process::Command::new("git")
+    let git_out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root())
         .args(["ls-files", "--", "scripts/mcp-servers/tickvault-logs"])
-        .output()
-        .expect("run git ls-files");
-    assert!(out.status.success(), "git ls-files failed");
-    let tracked = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        tracked.trim().is_empty(),
-        "a git-tracked python MCP server reappeared — the committed-config \
-         contract is pinned on the Rust side only:\n{tracked}"
-    );
+        .output();
+    match git_out {
+        Ok(out) if out.status.success() => {
+            // Real checkout / normal CI: the tracked output must be empty
+            // (no git-tracked python MCP server).
+            let tracked = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                tracked.trim().is_empty(),
+                "a git-tracked python MCP server reappeared — the committed-config \
+                 contract is pinned on the Rust side only:\n{tracked}"
+            );
+        }
+        _ => {
+            // cargo-mutants runs tests from a non-git copied tree (no .git),
+            // where `git ls-files` exits non-zero (and git may be absent
+            // entirely); fall back to a filesystem-existence check so the
+            // guard keeps its teeth without panicking — the deleted python
+            // server directory must simply be absent on disk.
+            let py_dir = repo_root().join("scripts/mcp-servers/tickvault-logs");
+            assert!(
+                !py_dir.exists(),
+                "a python MCP server directory reappeared on disk — the \
+                 committed-config contract is pinned on the Rust side only: {}",
+                py_dir.display()
+            );
+        }
+    }
 }
 
 // The Rust MCP server consumes the SAME committed config file through

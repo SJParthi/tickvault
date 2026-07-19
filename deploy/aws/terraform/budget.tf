@@ -18,7 +18,10 @@
 #
 # 2026-07-15 note (Quote 8 downsize — daily-universe §7): the instance lock is
 # now t4g.medium — INTERIM ~$14.67 pre-GST (~₹1,471/mo incl GST at 270 hrs on
-# the live 50 GB root). limit_amount stays $55 DELIBERATELY (the budget measures
+# the live 50 GB root). [2026-07-19 correction: live root verified 30 GiB via
+# describe-volumes — the 2026-07-13 grow to 50 never physically applied, so the
+# interim is ~$12.85 pre-GST (~₹1,289/mo incl GST); see daily-universe §7.]
+# limit_amount stays $55 DELIBERATELY (the budget measures
 # TOTAL account spend and $55 is honest headroom either way); lowering it toward
 # ~$25 post-downsize is an optional follow-up with its own cost note in
 # aws-budget.md — remember the BUDGET_USD lockstep above if taken.

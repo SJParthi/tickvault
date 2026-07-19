@@ -147,23 +147,39 @@ fn instance_lock_supersession_markers_present_in_operator_charter() {
 }
 
 /// Section C — the bill in §7 must match the locked figure. Operator
-/// approved the t4g.medium downsize 2026-07-15 (Quote 8); the pinned
-/// number is the honest INTERIM ~₹1,471/mo (270 hrs, EIP kept, incl.
-/// 18% GST, LIVE 50 GB root — gp3 cannot shrink tonight). ~₹1,197/mo is
-/// pinned only as the labelled post-20-GB-recreate figure, and ~₹986/mo
-/// requires BOTH the ~176-hr auto-schedule basis AND the post-recreate
-/// 20 GB volume (on the live 50 GB root the ~176-hr figure is ~₹1,260) —
-/// the guard requires those labels so the live bill is never misstated.
-/// If someone re-tunes any of this in the rule file without operator
-/// approval, the build fails.
+/// approved the t4g.medium downsize 2026-07-15 (Quote 8); the stated
+/// INTERIM was ~₹1,471/mo on a "live 50 GB root" premise. 2026-07-19
+/// live `describe-volumes` verification (coordinator session) showed the
+/// root is 30 GiB gp3 — the 2026-07-13 approved 30→50 grow was recorded
+/// but never physically applied — so the CORRECTED interim is ~₹1,289/mo
+/// (EBS $0.0912 × 30 = $2.74; subtotal $12.85 → ₹1,092 → ×1.18 GST),
+/// with ~₹1,471/mo retained as the labelled pre-correction figure.
+/// ~₹1,197/mo is pinned only as the labelled post-20-GB-recreate figure,
+/// and ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the
+/// post-recreate 20 GB volume (the live-30-GB ~176-hr figure is ~₹1,077;
+/// the superseded 50 GB record's was ~₹1,260) — the guard requires those
+/// labels so the live bill is never misstated. If someone re-tunes any of
+/// this in the rule file without operator approval, the build fails.
 #[test]
 fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
     assert!(
+        body.contains("~₹1,289/mo") || body.contains("Rs 1,289/mo"),
+        "rule file §7 must pin the CORRECTED INTERIM ~₹1,289/mo bill (live 30 GB root verified 2026-07-19: t4g.medium, 270 hrs, +EIP, incl GST)"
+    );
+    assert!(
+        body.contains("30 GiB gp3") && body.contains("never physically applied"),
+        "rule file §7 must carry the 2026-07-19 live-volume correction (30 GiB gp3 verified; the 2026-07-13 grow to 50 never physically applied)"
+    );
+    assert!(
+        body.contains("~₹1,077"),
+        "rule file §7 must state the corrected live-30-GB ~176-hr figure (~₹1,077)"
+    );
+    assert!(
         body.contains("~₹1,471/mo") || body.contains("Rs 1,471/mo"),
-        "rule file §7 must pin the INTERIM ~₹1,471/mo bill (operator approved 2026-07-15 Quote 8: t4g.medium, 270 hrs, live 50 GB EBS, +EIP, incl GST)"
+        "rule file §7 must retain the pre-correction ~₹1,471/mo figure as labelled history (2026-07-15 Quote 8 record on the never-applied 50 GB assumption)"
     );
     assert!(
         body.contains("~₹1,197/mo applies ONLY after the 20 GB fresh-volume recreate"),

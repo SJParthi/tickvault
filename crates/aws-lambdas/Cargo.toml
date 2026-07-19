@@ -27,6 +27,13 @@ aws-sdk-ssm = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
 aws-sdk-cloudwatch = { workspace = true }
 aws-sdk-costexplorer = { workspace = true }
+# operator-control (phase 2b-3) extras — all pre-existing workspace pins:
+# aws-lc-rs (HMAC-SHA256 for the qdb console link token — the same crate the
+# workspace already pins for rustls/ed25519), regex (the python handler's
+# stdlib `re` gates: SQL LIMIT clamp + banned-keyword word boundaries),
+# reqwest (the GitHub main-HEAD provenance read — python used urllib).
+aws-lc-rs = { workspace = true }
+regex = { workspace = true }
 aws-sdk-eventbridge = { workspace = true }
 # qdb-console pair (phase 2b-3): the VPC relay speaks plain HTTP to the box
 # (Python urllib parity — blocking client on a spawn_blocking thread, NO AWS
@@ -40,7 +47,6 @@ form_urlencoded = { workspace = true }
 # and signs/verifies its HMAC session tokens with aws-lc-rs (the workspace's
 # existing crypto provider — no new crypto root).
 aws-sdk-lambda = { workspace = true }
-aws-lc-rs = { workspace = true }
 
 [[bin]]
 name = "start-watchdog"
@@ -61,6 +67,10 @@ path = "src/bin/boot_heartbeat_gate.rs"
 [[bin]]
 name = "market-hours-liveness-gate"
 path = "src/bin/market_hours_liveness_gate.rs"
+
+[[bin]]
+name = "operator-control"
+path = "src/bin/operator_control.rs"
 
 [[bin]]
 name = "hard-stop-guard"
