@@ -133,23 +133,26 @@ fn deploy_workflow_records_binary_sha_to_ssm() {
 }
 
 /// 6 — the operator portal renders the provenance footer.
+/// (2026-07-18 rust-only phase 2b-3: the python handler.py is DELETED — the
+/// pins now target the Rust port, same contract, never weakened.)
 #[test]
 fn portal_footer_renders_provenance_line() {
     let root = repo_root();
-    let handler = read(&root.join("deploy/aws/lambda/operator-control/handler.py"));
+    let handler = read(&root.join("crates/aws-lambdas/src/operator_control.rs"));
     assert!(
         handler.contains("· portal") && handler.contains("· main"),
         "portal handler must format 'binary <7> · portal <7> · main <7>'"
     );
     assert!(
-        handler.contains("_provenance_line"),
-        "portal handler must keep the pure _provenance_line formatter"
+        handler.contains("fn provenance_line"),
+        "portal handler must keep the pure provenance_line formatter"
     );
     assert!(
-        handler.contains("fullmatch"),
-        "portal handler must hex-validate provenance SHAs (re.fullmatch) \
-         before rendering — a poisoned SSM param / GitHub response must \
-         never smuggle markup into the footer"
+        handler.contains("^[0-9a-f]{7,40}$") && handler.contains("fn safe_provenance_sha"),
+        "portal handler must hex-validate provenance SHAs (anchored \
+         HEX_SHA_RE via safe_provenance_sha) before rendering — a poisoned \
+         SSM param / GitHub response must never smuggle markup into the \
+         footer"
     );
 
     let tf = read(&root.join("deploy/aws/terraform/operator-control-lambda.tf"));

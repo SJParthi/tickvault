@@ -4314,6 +4314,7 @@ dependencies = [
  "form_urlencoded",
  "lambda_runtime",
  "percent-encoding",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

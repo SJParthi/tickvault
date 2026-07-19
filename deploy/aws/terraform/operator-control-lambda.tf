@@ -1,6 +1,6 @@
 # Operator portal Lambda — action backend for the single-page operator portal
 # (Overview / Data / DB / GitHub / Logs / AWS / Latency tabs).
-# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-07-03 — B4 QuestDB one-click console: new `qdb_console_url` action mints a 90s HMAC link token over the same control secret + the Data-tab DB card gains a 🗄 Open QuestDB Console button; QDB_CONSOLE_URL env injected below from questdb-console.tf when var.enable_questdb_console. Previous: 2026-07-02b — portal DB console: new READ-ONLY "DB" tab (tables list via tables(), click → table_columns + first-100-rows, query grid + client-side CSV download) + hardened _is_safe_sql (single-statement — any ';' except one trailing rejects; '--'/'/*' comments reject; QuestDB mutators backup/checkpoint/snapshot/cancel/set/refresh/detach/attach/dedup/squash/resume/suspend banned anywhere — closes the "select 1; backup table ticks" chaining gap) + server-side 1000-row cap (_cap_sql_rows clamps/appends LIMIT; /exp limit= + head bound output). handler.py-only changes need this bump because terraform-apply only watches deploy/aws/terraform/**)
+# Re-trigger marker: bump to fire terraform-apply. (2026-07-18 — rust-only phase 2b-3: handler ported to Rust — crates/aws-lambdas/src/operator_control.rs (+ bin operator-control), python deploy/aws/lambda/operator-control/ DELETED; runtime provided.al2023/arm64/bootstrap; zip from the CI build-lambdas step; behavior parity pinned by the full 150-test 1:1 port + the byte-identical console HTML sha256 + the HMAC qdblink vector re-derived from the running python oracle. Previous: 2026-07-03 — B4 QuestDB one-click console: new `qdb_console_url` action mints a 90s HMAC link token over the same control secret + the Data-tab DB card gains a 🗄 Open QuestDB Console button; QDB_CONSOLE_URL env injected below from questdb-console.tf when var.enable_questdb_console. Previous: 2026-07-02b — portal DB console: new READ-ONLY "DB" tab (tables list via tables(), click → table_columns + first-100-rows, query grid + client-side CSV download) + hardened _is_safe_sql (single-statement — any ';' except one trailing rejects; '--'/'/*' comments reject; QuestDB mutators backup/checkpoint/snapshot/cancel/set/refresh/detach/attach/dedup/squash/resume/suspend banned anywhere — closes the "select 1; backup table ticks" chaining gap) + server-side 1000-row cap (_cap_sql_rows clamps/appends LIMIT; /exp limit= + head bound output). handler.py-only changes need this bump because terraform-apply only watches deploy/aws/terraform/**)
 #
 # WHY: the operator wants ONE place (console URL + Telegram) to view AND control
 # the box, without the AWS console or GitHub UI. Grafana = view; this = control.
@@ -145,22 +145,21 @@ resource "aws_iam_role_policy" "operator_control" {
   policy = data.aws_iam_policy_document.operator_control_permissions[0].json
 }
 
-data "archive_file" "operator_control" {
-  count       = var.enable_operator_control_lambda ? 1 : 0
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/operator-control"
-  output_path = "${path.module}/.build/operator-control.zip"
-  excludes    = ["test_handler.py", "README.md"] # ship handler.py only — not test/docs
-}
-
+# Rust-only phase 2b-3 (2026-07-18): the python handler.py zip is retired —
+# the zip is built in CI by the build-lambdas step (terraform-apply.yml
+# `operator-control` bin, cargo-lambda provided.al2023/arm64) and downloaded
+# into ${path.module}/.lambda-zips/ before plan/apply; source_code_hash is
+# the shared Rust SOURCE digest (same contract as the four 2b-1 lambdas —
+# see budget-guards.tf for the rationale + local-plan caveat).
 resource "aws_lambda_function" "operator_control" {
   count            = var.enable_operator_control_lambda ? 1 : 0
   function_name    = "tv-${var.environment}-operator-control"
   role             = aws_iam_role.operator_control[0].arn
-  runtime          = "python3.12"
-  handler          = "handler.lambda_handler"
-  filename         = data.archive_file.operator_control[0].output_path
-  source_code_hash = data.archive_file.operator_control[0].output_base64sha256
+  runtime          = "provided.al2023"
+  handler          = "bootstrap"
+  architectures    = ["arm64"]
+  filename         = "${path.module}/.lambda-zips/operator-control.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
   timeout          = 30
   memory_size      = 128
 

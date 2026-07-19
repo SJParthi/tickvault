@@ -4,7 +4,7 @@
 # =============================================================================
 # Idempotent, cold-path. Safe to call from:
 #   - deploy/systemd/tickvault.service  ExecStartPre (boot self-heal)
-#   - deploy/aws/lambda/operator-control/handler.py  (restart-questdb / docker-reset)
+#   - crates/aws-lambdas/src/operator_control.rs  (restart-questdb / docker-reset; the python handler.py was retired 2026-07-18, rust-only phase 2b-3)
 #   - an operator shell
 #
 # Why this exists (incident 2026-06-08): PR #1052's self-heal used

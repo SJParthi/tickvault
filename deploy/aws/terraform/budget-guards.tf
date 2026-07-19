@@ -46,7 +46,8 @@
 # `file(".lambda-zips/source.digest")` reads fail otherwise) — CI-only
 # planning is the intended contract; and a toolchain/cargo-lambda version
 # bump alone does NOT change the digest (binaries redeploy on the next
-# source / Cargo.lock change). Applies to all four .lambda-zips lambdas.
+# source / Cargo.lock change). Applies to all five .lambda-zips lambdas
+# (the four 2b-1 ports + operator-control, rust-only phase 2b-3 2026-07-18).
 
 resource "aws_iam_role" "tv_daily_budget_digest" {
   name = "tv-prod-daily-budget-digest-role"
