@@ -9,6 +9,9 @@ rust-version = "1.95.0"
 license = "MIT"
 
 [workspace.dependencies]
+# bruteX trading-core — READ-ONLY git dep pinned to an exact commit (never a branch/tag float).
+# Guard: crates/storage/tests/trading_core_rev_pin_guard.rs
+trading-core = { git = "https://github.com/SJParthi/bruteX", rev = "184a48a4abb0ec2fd61906499a6a799a752abd7e", default-features = false }
 # S6-Step8 / S7: Cargo.toml is the executable single source of truth.
 # (Tech Stack Bible deleted 2026-04-14.) Use exact pins (no ^/~/*).
 # Run `bash .claude/hooks/dep-freshness-scanner.sh` to check for drift.

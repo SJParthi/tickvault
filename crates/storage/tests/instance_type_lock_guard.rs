@@ -239,6 +239,55 @@ fn instance_lock_2026_07_19_sub_1k_ruling_pinned() {
     );
 }
 
+/// Section C.2 — the 2026-07-19 SECOND same-day ruling (Quote 10) must stay
+/// pinned: the operator approved the EIP release for the no-real-orders
+/// period ("until or unless we flip the real orders static ip is not needed
+/// due okay?"), the live verification proved a STANDALONE release unsafe
+/// (launch-time ENI attribute — the live ENI never mints an ephemeral IP),
+/// and execution is BUNDLED with the erase-window recreate per
+/// `docs/runbooks/eip-release.md`. Removing any of these would let a future
+/// session (a) release the EIP standalone and brick the box, or (b) flip
+/// `enable_eip` without the runbook's verify-first order, or (c) go live on
+/// Dhan orders without the ≥7-day setIP re-whitelist protocol.
+#[test]
+fn instance_lock_2026_07_19_eip_release_ruling_pinned() {
+    let root = repo_root();
+    let budget = read(&root.join(".claude/rules/project/aws-budget.md"));
+    assert!(
+        budget
+            .contains("until or unless we flip the real orders static ip is not needed due okay?"),
+        "aws-budget.md must carry the 2026-07-19 Quote 10 verbatim (typos included)"
+    );
+    assert!(
+        budget.contains("VERIFIED-UNSAFE-STANDALONE"),
+        "aws-budget.md must record the live standalone-release verdict (launch-time ENI attribute)"
+    );
+    assert!(
+        budget.contains("docs/runbooks/eip-release.md"),
+        "aws-budget.md must point at the bundled-recreate execution runbook"
+    );
+    let daily =
+        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    assert!(
+        daily.contains("Quote 10"),
+        "daily-universe §0 must carry the 2026-07-19 Quote 10 EIP-release ruling"
+    );
+    let scope = read(&root.join(".claude/rules/project/websocket-connection-scope-lock.md"));
+    assert!(
+        scope.contains("Static IP / EIP ruling"),
+        "websocket-connection-scope-lock.md must carry the 2026-07-19 static-IP ruling section"
+    );
+    let runbook = read(&root.join("docs/runbooks/eip-release.md"));
+    assert!(
+        runbook.contains("VERIFY outbound-without-EIP FIRST"),
+        "the runbook must encode the operator's verify-first safety order"
+    );
+    assert!(
+        runbook.contains("7-day modify cooldown") && runbook.contains("/v2/ip/setIP"),
+        "the runbook must carry the live-trading re-enable protocol (new EIP + Dhan setIP >=7 days pre-go-live)"
+    );
+}
+
 /// Section D — the schedule lock must mention `08:30 IST` (operator narrowed
 /// the window back to 08:30-16:30 on 2026-06-05: "make the aws instance start
 /// and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening).
