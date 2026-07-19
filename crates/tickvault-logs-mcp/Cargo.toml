@@ -2,10 +2,7 @@
 # (rust-only purge phase 2c, 2026-07-18). Full 14-tool parity with the Python
 # original; CUTOVER DONE (2026-07-18): .mcp.json launches this crate via
 # scripts/mcp-servers/tickvault-logs-launch.sh and server.py is deleted from
-# git. ⚠ RETIRED 2026-07-19 (BATCH-5): the python3+git parity harness
-# (tests/parity.rs) that re-materialized server.py from pinned history to prove
-# cutover parity is deleted — its target no longer exists in the tree and the
-# Rust port is the sole runtime (rust-only-forever lock 2026-07-19).
+# git (the parity harness re-materializes it from pinned git history).
 # Cold-path, out-of-process — the three
 # principles' hot-path clauses do not bind here, but every version is pinned
 # via workspace deps and the crate carries the standard lint attributes.

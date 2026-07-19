@@ -36,6 +36,7 @@ const MCP_JSON: &str = ".mcp.json";
 const RUST_CRATE_DIR: &str = "crates/tickvault-logs-mcp";
 const RUST_TOOLS_RS: &str = "crates/tickvault-logs-mcp/src/tools.rs";
 const RUST_RPC_RS: &str = "crates/tickvault-logs-mcp/src/rpc.rs";
+const PARITY_RS: &str = "crates/tickvault-logs-mcp/tests/parity.rs";
 const VALIDATE_SH: &str = "scripts/validate-automation.sh";
 
 /// The FULL 14-tool surface the server must expose (the byte-parity
@@ -191,6 +192,7 @@ fn rust_port_crate_exists_with_core_sources() {
         "crates/tickvault-logs-mcp/src/config.rs",
         "crates/tickvault-logs-mcp/src/signature.rs",
         "crates/tickvault-logs-mcp/src/sigv4.rs",
+        PARITY_RS,
     ] {
         let path = root.join(rel);
         assert!(
@@ -248,13 +250,52 @@ fn rust_port_binary_supports_self_test() {
     );
 }
 
-// The parity-harness pins (`parity_harness_pins_git_history_reference` +
-// `parity_harness_keeps_the_transcript_test`) were RETIRED 2026-07-19
-// (BATCH-5) with the harness itself: `crates/tickvault-logs-mcp/tests/parity.rs`
-// — the test-time python3 + git-network fixture that re-materialized the
-// deleted python server and byte-compared it — was deleted in the Rust-only
-// purge (rust-only-forever-lock-2026-07-19.md). The `python_server_retired_from_git`
-// pin above remains the standing guarantee that no python server is git-tracked.
+#[test]
+fn parity_harness_pins_git_history_reference() {
+    // The parity gate must keep running WITHOUT python in the tree: the
+    // harness materializes server.py from a PINNED full-sha commit, with
+    // the shallow-clone fetch fallback. De-pinning or deleting the
+    // materialization silently kills the byte-parity gate.
+    let src = load_text(PARITY_RS);
+    assert!(
+        src.contains("SERVER_PY_PINNED_COMMIT"),
+        "parity.rs lost the pinned git-history reference"
+    );
+    assert!(
+        src.contains("fn materialize_server_py"),
+        "parity.rs lost the server.py materialization fn"
+    );
+    // The pin must be a FULL 40-hex sha (a short sha can go ambiguous).
+    let pin_line = src
+        .lines()
+        .find(|l| l.contains("const SERVER_PY_PINNED_COMMIT"))
+        .expect("SERVER_PY_PINNED_COMMIT const line");
+    let sha: String = pin_line
+        .chars()
+        .skip_while(|c| *c != '"')
+        .skip(1)
+        .take_while(|c| *c != '"')
+        .collect();
+    assert!(
+        sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "SERVER_PY_PINNED_COMMIT must be a full 40-hex sha, got `{sha}`"
+    );
+    assert!(
+        src.contains("--depth=1"),
+        "parity.rs lost the shallow-clone fetch fallback (CI checkout is \
+         depth-1; without it the parity gate dies on shallow clones)"
+    );
+}
+
+#[test]
+fn parity_harness_keeps_the_transcript_test() {
+    let src = load_text(PARITY_RS);
+    assert!(
+        src.contains("fn parity_transcript"),
+        "parity.rs lost the parity_transcript test — the byte-parity gate \
+         is the cutover's regression floor"
+    );
+}
 
 #[test]
 fn gitignore_masks_materialized_python_dir() {
