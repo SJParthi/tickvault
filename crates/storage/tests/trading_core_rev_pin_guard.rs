@@ -91,45 +91,56 @@ fn test_trading_core_pyo3_feature_disabled() {
     );
 }
 
-/// A `trading-core` dep line is OK only under exactly `[dev-dependencies]`.
-/// Any OTHER dependency table — `[dependencies]`, `[build-dependencies]`,
-/// `[target.'cfg(...)'.dependencies]`, or any future `*dependencies` section —
+/// A `trading-core` dep line is OK only under exactly `[dev-dependencies]`
+/// of `crates/trading/Cargo.toml`. Any other crate manifest, and any OTHER
+/// section — `[dependencies]`, `[build-dependencies]`,
+/// `[target.'cfg(...)'.dependencies]`, or any future `*dependencies` table —
 /// naming trading-core FAILS this guard: each would pull bruteX code into a
-/// build/runtime graph.
+/// build/runtime graph. Walks EVERY `crates/*/Cargo.toml` so a new consumer
+/// crate can never slip past the guard.
 #[test]
 fn test_consumer_uses_workspace_pin_as_dev_dependency_only() {
-    let manifest = read("crates/trading/Cargo.toml");
-    let mut section = String::new();
+    let crates_dir = repo_root().join("crates");
     let mut dev_ok = false;
-    let mut offending_section: Option<String> = None;
-    for raw in manifest.lines() {
-        let l = raw.trim();
-        if l.starts_with('[') {
-            section = l.to_string();
+    for entry in fs::read_dir(&crates_dir)
+        .expect("read crates/ dir")
+        .flatten()
+    {
+        let manifest_path = entry.path().join("Cargo.toml");
+        if !manifest_path.is_file() {
             continue;
         }
-        if !l.starts_with("trading-core") {
-            continue;
-        }
-        if section == "[dev-dependencies]" {
-            assert!(
-                l.contains("workspace = true"),
-                "the dev-dependency must use the workspace pin: {l}"
-            );
-            dev_ok = true;
-        } else if section.contains("dependencies") {
-            offending_section = Some(section.clone());
+        let rel = format!("crates/{}/Cargo.toml", entry.file_name().to_string_lossy());
+        let manifest = read(&rel);
+        let mut section = String::new();
+        for raw in manifest.lines() {
+            let l = raw.trim();
+            if l.starts_with('[') {
+                section = l.to_string();
+                continue;
+            }
+            if !l.starts_with("trading-core") {
+                continue;
+            }
+            if rel == "crates/trading/Cargo.toml" && section == "[dev-dependencies]" {
+                assert!(
+                    l.contains("workspace = true"),
+                    "the dev-dependency must use the workspace pin: {l}"
+                );
+                dev_ok = true;
+            } else {
+                panic!(
+                    "trading-core may ONLY appear under [dev-dependencies] of \
+                     crates/trading/Cargo.toml; found it under {section} of {rel} \
+                     — that would pull bruteX code into a build/runtime graph"
+                );
+            }
         }
     }
     assert!(
         dev_ok,
-        "crates/trading must consume trading-core as a dev-dependency"
-    );
-    assert!(
-        offending_section.is_none(),
-        "trading-core may ONLY appear under [dev-dependencies]; found it under \
-         {} — that would pull bruteX code into a build/runtime graph",
-        offending_section.as_deref().unwrap_or("?")
+        "expected dev-dependency consumer missing: crates/trading/Cargo.toml \
+         must consume trading-core under [dev-dependencies]"
     );
 }
 
