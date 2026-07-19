@@ -49,6 +49,17 @@ Any such PR MUST be rejected in review even if the operator approves verbally �
 
 ---
 
+## §3.1. Progress note (2026-07-19, BATCH-5)
+
+The `tickvault-logs-mcp` cutover parity harness (`crates/tickvault-logs-mcp/tests/parity.rs`) — a
+test-time `python3` + git-network fixture that re-materialized the deleted
+`scripts/mcp-servers/tickvault-logs/server.py` from pinned git history to prove the Rust port
+reproduced the Python original response-for-response — is RETIRED. Its target no longer exists in
+the tree, the cutover is done, and the Rust crate is the sole runtime; removing it drops the last
+`python3` dependency of that crate's test surface. No allowlist entry changed (parity.rs was Rust).
+
+---
+
 ## §4. Trigger (auto-loaded)
 
 Always loaded (this file is under `.claude/rules/project/`). Reinforced on any session that adds a new executable component, edits `crates/common/tests/rust_only_guard.rs`, or proposes any non-Rust runtime addition.

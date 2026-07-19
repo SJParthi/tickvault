@@ -1,7 +1,9 @@
 //! Stats endpoint — proxies QuestDB queries server-side to avoid CORS.
 //!
-//! Returns dashboard statistics in a single JSON response:
-//! table count, underlyings, derivatives, subscribed indices, ticks.
+//! Returns dashboard statistics in a single JSON response: QuestDB
+//! reachability + live table count. The instrument-master counts
+//! (underlyings / derivatives / subscribed indices) and the ticks count were
+//! retired 2026-07-19 (BATCH-5) — their source tables are dropped at boot.
 
 use axum::Json;
 use axum::extract::State;
@@ -33,10 +35,20 @@ pub(crate) fn build_stats_client(timeout_secs: u64) -> reqwest::Client {
 pub struct StatsResponse {
     pub questdb_reachable: bool,
     pub tables: u64,
-    pub underlyings: u64,
-    pub derivatives: u64,
-    pub subscribed_indices: u64,
-    pub ticks: u64,
+    // `underlyings` / `derivatives` (contracts) / `subscribed_indices` counts
+    // RETIRED 2026-07-19 (BATCH-5): all three queried the instrument-master
+    // tables `fno_underlyings` / `derivative_contracts` / `subscribed_indices`,
+    // which are in the boot-time `RETIRED_QUESTDB_TABLES` DROP list
+    // (shadow_persistence.rs) — dropped since the #T3 instrument-table cleanup +
+    // the 2026-07-13 Dhan instrument-download retirement. The queries therefore
+    // returned a permanently-0 "contracts —" placeholder (false-OK). Retired
+    // rather than repointed. FOLLOW-UP (operator): if a live universe-size tile
+    // is wanted, repoint at `instrument_lifecycle WHERE lifecycle_state='active'`
+    // (the KEPT live master) with the right instrument_type filters.
+    // `ticks` count RETIRED 2026-07-19 (BATCH-5): the `ticks` writer was
+    // deleted 2026-07-17, so this lifetime count no longer grows and would
+    // report a permanently-stale "ticks captured" number (false-OK). Retired
+    // rather than repointed at another table.
 }
 
 /// `GET /api/stats` — fetch QuestDB counts in one call.
@@ -90,33 +102,9 @@ pub(crate) async fn compute_stats(state: &SharedAppState) -> StatsResponse {
     StatsResponse {
         questdb_reachable,
         tables: tables.unwrap_or(0),
-        // I-P1-08 (rewritten 2026-04-17): Lifecycle tables hold active + expired
-        // rows forever. Dashboard counts must filter `status = 'active'` or
-        // expired contracts from prior sessions inflate the number.
-        underlyings: query_count(
-            &client,
-            &base_url,
-            "SELECT count() FROM fno_underlyings WHERE status = 'active'",
-        )
-        .await
-        .unwrap_or(0),
-        derivatives: query_count(
-            &client,
-            &base_url,
-            "SELECT count() FROM derivative_contracts WHERE status = 'active'",
-        )
-        .await
-        .unwrap_or(0),
-        subscribed_indices: query_count(
-            &client,
-            &base_url,
-            "SELECT count() FROM subscribed_indices WHERE status = 'active'",
-        )
-        .await
-        .unwrap_or(0),
-        ticks: query_count(&client, &base_url, "SELECT count() FROM ticks")
-            .await
-            .unwrap_or(0),
+        // underlyings / derivatives (contracts) / subscribed_indices / ticks
+        // counts retired 2026-07-19 (BATCH-5) — their source tables are in the
+        // boot-time RETIRED_QUESTDB_TABLES DROP list, so no query is issued.
     }
 }
 
@@ -164,10 +152,6 @@ mod tests {
         let stats = StatsResponse {
             questdb_reachable: true,
             tables: 5,
-            underlyings: 214,
-            derivatives: 96948,
-            subscribed_indices: 31,
-            ticks: 0,
         };
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"tables\":5"));
@@ -223,10 +207,6 @@ mod tests {
         let result = compute_stats(&state).await;
         assert!(!result.questdb_reachable);
         assert_eq!(result.tables, 0);
-        assert_eq!(result.underlyings, 0);
-        assert_eq!(result.derivatives, 0);
-        assert_eq!(result.subscribed_indices, 0);
-        assert_eq!(result.ticks, 0);
     }
 
     #[test]
@@ -234,10 +214,6 @@ mod tests {
         let stats = StatsResponse {
             questdb_reachable: false,
             tables: 0,
-            underlyings: 0,
-            derivatives: 0,
-            subscribed_indices: 0,
-            ticks: 0,
         };
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"questdb_reachable\":false"));
@@ -501,11 +477,7 @@ mod tests {
     async fn test_stats_response_debug_impl() {
         let stats = StatsResponse {
             questdb_reachable: true,
-            tables: 3,
-            underlyings: 100,
-            derivatives: 5000,
-            subscribed_indices: 10,
-            ticks: 999999,
+            tables: 999999,
         };
         let debug = format!("{stats:?}");
         assert!(debug.contains("StatsResponse"));
@@ -687,10 +659,6 @@ mod tests {
         let err_response = StatsResponse {
             questdb_reachable: false,
             tables: 0,
-            underlyings: 0,
-            derivatives: 0,
-            subscribed_indices: 0,
-            ticks: 0,
         };
         assert!(!err_response.questdb_reachable);
         assert_eq!(err_response.tables, 0);
@@ -716,16 +684,8 @@ mod tests {
         let resp = StatsResponse {
             questdb_reachable: false,
             tables: 0,
-            underlyings: 0,
-            derivatives: 0,
-            subscribed_indices: 0,
-            ticks: 0,
         };
         assert!(!resp.questdb_reachable);
         assert_eq!(resp.tables, 0);
-        assert_eq!(resp.underlyings, 0);
-        assert_eq!(resp.derivatives, 0);
-        assert_eq!(resp.subscribed_indices, 0);
-        assert_eq!(resp.ticks, 0);
     }
 }

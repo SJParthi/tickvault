@@ -340,9 +340,10 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
     var strip = document.getElementById("dbStrip");
     strip.replaceChildren();
     var db = d.db || {};
-    var t = el("span"); t.id = "dbTicks";
-    if (typeof db.ticks_today === "number") countUp(t, db.ticks_today); else t.textContent = "—";
-    strip.appendChild(dbCell("Price updates saved today", t));
+    // "Price updates saved today" tile RETIRED 2026-07-19 (BATCH-5): the `ticks`
+    // writer was deleted 2026-07-17, so `db.ticks_today` no longer exists in the
+    // BoardDb payload and the tile rendered a permanent "—". Removed, not
+    // repointed — the "ticks captured" concept is dead in the REST-era runtime.
     var c = el("span"); c.id = "dbCandles";
     if (typeof db.candles_1m_today === "number") countUp(c, db.candles_1m_today); else c.textContent = "—";
     strip.appendChild(dbCell("Minute summaries (candles) sealed today", c));

@@ -1124,6 +1124,12 @@ impl CadenceExecutor for GrowwCadenceExecutor {
             // strategy exists), so this tap is PLUMBING for future
             // option-leg unrealized P&L, restoring nothing today.
             if !persist_failed && let Some(forwarder) = self.mark_forwarder.as_ref() {
+                // NOTE (cold-path follow-up): the contract_marks mutex is held
+                // across the per-leg forwarding loop below (one per-minute chain
+                // fire). This is COLD path (not the tick hot path) so it is not a
+                // latency concern today, but a future refactor could snapshot the
+                // needed index rows under the lock and drop the guard before the
+                // loop. Deliberately left as-is here — no behaviour change.
                 let marks = self.contract_marks.lock().await;
                 match marks.as_ref().filter(|(day, _)| *day == trading_date) {
                     Some((_, index)) => {

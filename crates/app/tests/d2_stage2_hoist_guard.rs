@@ -147,11 +147,11 @@ fn shared_infra_builder_spawns_the_shared_pipeline() {
     // builder, ahead of any future publisher.
     let src = read_main_rs();
     let body = build_shared_infra_body(&src);
-    for needle in [
-        "run_slow_boot_observability",
-        "run_tick_storage_consumer",
-        "spawn_seal_writer_loop",
-    ] {
+    // `run_tick_storage_consumer` assertion RETIRED 2026-07-19 (BATCH-5):
+    // the tick-storage consumer was deleted in the PrevDayCache/TickStorage
+    // cleanup, so the builder no longer spawns it. The surviving spawns below
+    // still pin the shared candle pipeline + seal-writer for every boot.
+    for needle in ["run_slow_boot_observability", "spawn_seal_writer_loop"] {
         assert!(
             body.contains(needle),
             "build_shared_infra MUST spawn `{needle}` so the shared candle \
