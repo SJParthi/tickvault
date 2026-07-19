@@ -308,6 +308,8 @@ pub struct OrderRuntimeParams {
     /// The stack's order-update auth signal (fires ONCE per process on the
     /// first successful WS auth) — triggers an immediate reconcile cycle.
     pub auth_notify: Arc<Notify>,
+    /// Order-leg P&L sink (None = feature OFF; byte-identical no-op path).
+    pub leg_pnl_tx: Option<mpsc::Sender<LegPnlEvent>>,
 }
 
 /// Spawn the supervised order runtime. Returns the SUPERVISOR handle.
@@ -325,6 +327,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
             token_handle,
             client_id,
             auth_notify,
+            leg_pnl_tx,
         } = params;
         // The mark receiver survives inner respawns behind a tokio Mutex —
         // the inner run holds the guard for its lifetime; an (unwind-build)
@@ -349,6 +352,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 token_handle: token_handle.clone(),
                 client_id: client_id.clone(),
                 auth_notify: Arc::clone(&auth_notify),
+                leg_pnl_tx: leg_pnl_tx.clone(),
             };
             let mark_rx_shared = Arc::clone(&mark_rx);
             let run_started = std::time::Instant::now();
@@ -411,6 +415,8 @@ struct RuntimeCtx {
     token_handle: TokenHandle,
     client_id: String,
     auth_notify: Arc<Notify>,
+    /// Order-leg P&L sink (None = feature OFF; byte-identical no-op path).
+    leg_pnl_tx: Option<mpsc::Sender<LegPnlEvent>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,7 +1141,7 @@ async fn run_order_runtime(
                     process_mark(
                         &mut oms, &mut risk, &mut book, &mut self_test, &ctx, m,
                         config.order_runtime.paper_fill,
-                    None, ).await;
+                    ctx.leg_pnl_tx.as_ref(), ).await;
                     processed += 1;
                     if processed >= MARK_BATCH_MAX {
                         break;
@@ -1245,7 +1251,7 @@ async fn handle_order_update_event(
     match oms.handle_order_update(update) {
         Ok(Some(fill)) => {
             let order_id = fill.order_id.clone();
-            if apply_fill(risk, book, &fill, None) {
+            if apply_fill(risk, book, &fill, ctx.leg_pnl_tx.as_ref()) {
                 advance_self_test_on_fill(oms, risk, self_test, ctx, &order_id, paper_fill).await;
             }
         }
@@ -1396,7 +1402,7 @@ async fn fill_paper_order(
         Ok(Some(fill)) => {
             metrics::counter!("tv_paper_fills_synthesized_total").increment(1);
             let filled_order_id = fill.order_id.clone();
-            if apply_fill(risk, book, &fill, None) {
+            if apply_fill(risk, book, &fill, ctx.leg_pnl_tx.as_ref()) {
                 advance_self_test_on_fill(oms, risk, self_test, ctx, &filled_order_id, true).await;
             }
         }
@@ -1799,6 +1805,7 @@ mod tests {
             token_handle: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             client_id: "100".to_string(),
             auth_notify: Arc::new(Notify::new()),
+            leg_pnl_tx: None,
         }
     }
 
