@@ -44,6 +44,8 @@ loom = ["dep:loom"]
 groww_orders = ["dep:aws-lc-rs", "dep:tokio-tungstenite", "dep:futures-util"]
 
 [dev-dependencies]
+# bruteX trading-core parity oracle — dev/test ONLY, never a runtime dependency.
+trading-core = { workspace = true }
 tickvault-core = { path = "../core" }
 criterion = { workspace = true }
 dhat = { workspace = true }
