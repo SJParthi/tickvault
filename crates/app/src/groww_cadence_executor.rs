@@ -200,24 +200,32 @@ fn build_contract_mark_index(books: &[GrowwContractBook]) -> ContractMarkIndex {
 /// REST; never on the chain fire's deadline-bounded critical path).
 /// `underlying` borrows the book's `&'static str` symbol — zero allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OptionLegIdentity {
-    pub(crate) underlying: &'static str,
-    pub(crate) expiry: NaiveDate,
-    pub(crate) strike_paise: i64,
-    pub(crate) option_type: tickvault_common::types::OptionType,
+pub struct OptionLegIdentity {
+    pub underlying: &'static str,
+    pub expiry: NaiveDate,
+    pub strike_paise: i64,
+    pub option_type: tickvault_common::types::OptionType,
 }
 
 /// Reverse index `(exchange_token, segment_code) -> identity` for the
 /// leg-P&L consumer. O(1) lookup per persisted row.
-pub(crate) type LegIdentityIndex = std::collections::HashMap<(u64, u8), OptionLegIdentity>;
+pub type LegIdentityIndex = std::collections::HashMap<(u64, u8), OptionLegIdentity>;
 
 /// Day-stamped shared handle for the leg identity index. The cadence
 /// executor STOREs a fresh `(day, index)` once per daily master download;
 /// the leg-P&L boot consumer LOADs lock-free per row. `None` (pre-publish)
 /// means the consumer persists identity sentinels (counted) — later rows
 /// self-heal once today's index lands.
-pub(crate) type SharedLegIdentityIndex =
+pub type SharedLegIdentityIndex =
     std::sync::Arc<arc_swap::ArcSwapOption<(NaiveDate, LegIdentityIndex)>>;
+
+/// Fresh, empty shared leg-identity handle. Created once at boot (main.rs),
+/// cloned into the cadence executor (the publisher) and the order-leg P&L
+/// boot consumer (the reader). Empty until the first daily master publish.
+#[must_use]
+pub fn new_shared_leg_identity_index() -> SharedLegIdentityIndex {
+    std::sync::Arc::new(arc_swap::ArcSwapOption::empty())
+}
 
 /// Build the reverse identity index from the SAME resolved books the
 /// forward mark index uses. First-wins on a `(token, segment)` collision —
@@ -375,6 +383,7 @@ impl GrowwCadenceExecutor {
         questdb: &QuestDbConfig,
         notifier: Option<Arc<NotificationService>>,
         mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
+        leg_identity_index: SharedLegIdentityIndex,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
@@ -403,7 +412,7 @@ impl GrowwCadenceExecutor {
             escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier,
             mark_forwarder,
-            leg_identity_index: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            leg_identity_index,
         })
     }
 
@@ -1388,6 +1397,11 @@ impl CadenceExecutor for GrowwCadenceExecutor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_new_shared_leg_identity_index_starts_empty() {
+        assert!(super::new_shared_leg_identity_index().load_full().is_none());
+    }
+
     use super::*;
 
     fn spot_failure(status: u16, rate_limited: bool, auth_rejected: bool) -> FetchFailure {
