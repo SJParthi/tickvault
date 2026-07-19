@@ -71,7 +71,7 @@ QuestDB writes to `tv-questdb-data` (`/var/lib/questdb`) on the 30 GB gp3 root v
 ## After recovery — confirm
 
 - `systemctl is-active tickvault` → `active`
-- portal app tile → `running`, **ticks captured today** climbing
+- portal app tile → `running`, and **minute candles are sealing** (`candles_1m` row-count climbing)
 - `journalctl -u tickvault -f` → no more `BOOT-02`
 
 ---
