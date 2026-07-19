@@ -131,7 +131,7 @@ But we CAN mechanically guarantee:
 | Operator alarms (CloudWatch) | AWS CloudWatch Alarms over the app metrics | _(the Prometheus recording/alert rules `tickvault-alerts.yml` + `recording_rules_guard` were retired #O2/#O3)_ |
 | ERROR logs → CloudWatch Logs | CloudWatch Logs metric filters / alarms | _(the opt-in Loki LogQL alerts + Loki/Alloy containers were retired in the CloudWatch-only migration)_ |
 | `make doctor` = 7-section health in one command | `scripts/doctor.sh` | run any time |
-| 12 MCP tools for Claude workspace access | `scripts/mcp-servers/tickvault-logs/server.py` | `tickvault_logs_mcp_guard` |
+| 12 MCP tools for Claude workspace access | `crates/tickvault-logs-mcp` _(2026-07-18 Rust cutover — the Python server was deleted; launched via `scripts/mcp-servers/tickvault-logs-launch.sh`)_ | `tickvault_logs_mcp_guard` |
 
 ## Tier 8 — Automation surface (100% searchable/findable)
 
@@ -207,8 +207,9 @@ cargo test --workspace --no-fail-fast
 # Doctor confirms live infra:
 make doctor
 
-# MCP tools are live:
-python3 scripts/mcp-servers/tickvault-logs/server.py --self-test
+# MCP tools are live (2026-07-18 Rust cutover — the Python server was
+# deleted; the launcher runs crates/tickvault-logs-mcp):
+bash scripts/mcp-servers/tickvault-logs-launch.sh --self-test
 ```
 
 If any of these 4 commands fails, the guarantee is broken — and the

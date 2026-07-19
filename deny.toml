@@ -67,6 +67,7 @@ allow = [
     "CC0-1.0",
     "MPL-2.0",
     "CDLA-Permissive-2.0",  # webpki-roots (Mozilla CA cert data)
+    "BlueOak-1.0.0",        # minicbor (aws-smithy-cbor <- aws-sdk-cloudwatch); OSI-approved permissive
 ]
 # GPL/AGPL/copyleft licenses are denied by default (not in allow list).
 

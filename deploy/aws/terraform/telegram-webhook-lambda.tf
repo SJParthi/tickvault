@@ -92,25 +92,35 @@ resource "aws_iam_role_policy" "telegram_webhook" {
 }
 
 # ---------------------------------------------------------------------------
-# Lambda source — packaged from deploy/aws/lambda/telegram-webhook/
+# Lambda source — Rust bin (rust-only phase 2b-2 wave 1, 2026-07-18).
+#
+# The Python handler (deploy/aws/lambda/telegram-webhook/handler.py) was
+# PORTED to Rust — crates/aws-lambdas/src/telegram_webhook.rs (lib logic;
+# every python test ported to Rust unit tests) + src/bin/telegram_webhook.rs
+# (thin bootstrap bin). Behavior parity: same SNS Records parse, same
+# house-style plain-English lines + IST 12-hour timestamps, same
+# ALARM/OK batch fold + lone-OK recovered line + warm-container OK
+# suppression, same plain-text (no parse_mode) sendMessage POST via the
+# SSM-read bot token + chat id. The house-style judge contract stays
+# ratcheted by crates/core/tests/telegram_lambda_house_style_guard.rs
+# (repointed at the Rust module in the same PR).
+# The zip is built in CI by the build-lambdas job (terraform-apply.yml)
+# into ${path.module}/.lambda-zips/ before plan/apply; source_code_hash is
+# a digest of the Rust SOURCE (Rust builds are not bit-reproducible, so
+# hashing the zip would churn every build with zero source change).
+# Post-apply canary is MANDATORY for this lambda (make test-telegram path).
 # ---------------------------------------------------------------------------
-
-data "archive_file" "telegram_webhook" {
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/telegram-webhook"
-  output_path = "${path.module}/.telegram-webhook.zip"
-  excludes    = ["README.md", "__pycache__", "*.pyc"]
-}
 
 resource "aws_lambda_function" "telegram_webhook" {
   function_name    = "tv-${var.environment}-telegram-webhook"
   role             = aws_iam_role.telegram_webhook.arn
-  handler          = "handler.lambda_handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 15
   memory_size      = 128
-  filename         = data.archive_file.telegram_webhook.output_path
-  source_code_hash = data.archive_file.telegram_webhook.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/telegram-webhook.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
 
   environment {
     variables = {

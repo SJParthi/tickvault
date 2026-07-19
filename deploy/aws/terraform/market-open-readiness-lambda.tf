@@ -78,25 +78,32 @@ resource "aws_iam_role_policy" "market_open_readiness" {
 }
 
 # ---------------------------------------------------------------------------
-# Lambda source — packaged from deploy/aws/lambda/market-open-readiness/
+# Lambda source — Rust bin (rust-only phase 2b-2 wave 1, 2026-07-18).
+#
+# The Python handler (deploy/aws/lambda/market-open-readiness/handler.py)
+# was PORTED to Rust — crates/aws-lambdas/src/market_open_readiness.rs
+# (lib logic; every python test ported to Rust unit tests) +
+# src/bin/market_open_readiness.rs (thin bootstrap bin). Behavior parity:
+# same classify_readiness verdicts (ready/holiday-silent, not-running /
+# not-booted / verify-failed pages, drill page), same 08:25 IST holiday
+# self-stop gate, same tv_boot_completed metric probe, same ASCII SNS
+# subjects + emoji bodies. The zip is built in CI by the build-lambdas job
+# (terraform-apply.yml) into ${path.module}/.lambda-zips/ before
+# plan/apply; source_code_hash is a digest of the Rust SOURCE (Rust builds
+# are not bit-reproducible, so hashing the zip would churn every build
+# with zero source change).
 # ---------------------------------------------------------------------------
-
-data "archive_file" "market_open_readiness" {
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/market-open-readiness"
-  output_path = "${path.module}/.market-open-readiness.zip"
-  excludes    = ["README.md", "test_handler.py", "__pycache__", "*.pyc"]
-}
 
 resource "aws_lambda_function" "market_open_readiness" {
   function_name    = "tv-${var.environment}-market-open-readiness"
   role             = aws_iam_role.market_open_readiness.arn
-  handler          = "handler.lambda_handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 30
   memory_size      = 128
-  filename         = data.archive_file.market_open_readiness.output_path
-  source_code_hash = data.archive_file.market_open_readiness.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/market-open-readiness.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
 
   environment {
     variables = {

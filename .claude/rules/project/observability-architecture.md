@@ -376,7 +376,9 @@ summary file and drives the above flow.
 - [x] **Phase 7.1** — `/loop` runbook prompt
       (`.claude/triage/claude-loop-prompt.md`).
 - [x] **Phase 7.2** — Triage MCP server shipped:
-      `scripts/mcp-servers/tickvault-logs/server.py` exposes the full
+      `crates/tickvault-logs-mcp/src/tools.rs` (2026-07-18 Rust cutover —
+      the Python server was deleted; launched via
+      `scripts/mcp-servers/tickvault-logs-launch.sh`) exposes the full
       triage flow over stdio MCP — `_signature_hash` (FNV-1a of
       code+target+first-160), `tool_triage_log_tail`,
       `tool_find_runbook_for_code`, `tool_list_novel_signatures`,

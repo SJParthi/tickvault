@@ -1,197 +1,46 @@
-//! Phase 7.2 guard — `scripts/mcp-servers/tickvault-logs/server.py` must
-//! keep its five pinned tools so Claude Code's triage flow doesn't break
-//! when the MCP server silently drops a capability.
+//! Phase 7.2 guard — the `tickvault-logs` MCP server must keep its
+//! pinned tool surface so Claude Code's triage flow doesn't break when
+//! the server silently drops a capability.
 //!
-//! This is a source-scan guard — dep-free, fast, runs in-process. It does
-//! NOT invoke the server (that would require a Python subprocess and
-//! parsing JSON-RPC). What it asserts:
+//! 2026-07-18 (rust-only phase 2c, CUTOVER DONE): the server is the Rust
+//! crate `crates/tickvault-logs-mcp`, launched from `.mcp.json` via
+//! `scripts/mcp-servers/tickvault-logs-launch.sh`. The python
+//! `scripts/mcp-servers/tickvault-logs/server.py` is DELETED from git
+//! after parallel-run parity evidence (PR #1644 harness + the cutover
+//! PR's live side-by-side matrix); the parity harness re-materializes it
+//! from pinned git history (`SERVER_PY_PINNED_COMMIT` in
+//! `crates/tickvault-logs-mcp/tests/parity.rs`), so the byte-parity gate
+//! keeps running WITHOUT python living in the tree.
 //!
-//! 1. The `server.py` + `README.md` files exist at the pinned paths.
-//! 2. `server.py` registers every required ToolSpec name.
-//! 3. `server.py` exposes the `main()` entry + `_run_stdio_loop()`.
-//! 4. `.mcp.json` registers the `tickvault-logs` server block.
+//! This is a source-scan guard — dep-free, fast, runs in-process. What
+//! it asserts (each a build-failing pin; none weaker than the
+//! pre-cutover python pins they replace):
 //!
-//! If any assertion fails, the build fails — future sessions can't
-//! accidentally remove a tool Claude depends on.
-//!
-//! 2026-07-18 (rust-only phase 2c, PRE-CUTOVER transition window): the
-//! Rust port `crates/tickvault-logs-mcp` now exists with full 14-tool
-//! parity. During the parallel-run window BOTH implementations are
-//! pinned: every python assertion below stays untouched, and the new
-//! `rust_port_*` tests pin the Rust crate. `.mcp.json` MUST keep
-//! pointing at server.py until the separate cutover PR swaps it after
-//! live parallel-run validation.
+//! 1. The python server stays RETIRED from git (a resurrection fails).
+//! 2. `.mcp.json` launches the Rust server via the launcher — never
+//!    python.
+//! 3. The launcher exists, is executable, and is rust-only.
+//! 4. The Rust crate keeps its core sources + the full 14-tool surface
+//!    + the JSON-RPC methods + the pinned protocol version.
+//! 5. The parity harness keeps the pinned git-history reference (the
+//!    parity gate cannot be silently deleted or de-pinned).
+//! 6. validate-automation keeps exercising the REAL rust launch path.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-const SERVER_PY: &str = "scripts/mcp-servers/tickvault-logs/server.py";
-const README_MD: &str = "scripts/mcp-servers/tickvault-logs/README.md";
+const PYTHON_SERVER_DIR: &str = "scripts/mcp-servers/tickvault-logs";
+const LAUNCHER_SH: &str = "scripts/mcp-servers/tickvault-logs-launch.sh";
 const MCP_JSON: &str = ".mcp.json";
-// 2026-07-18: the Rust port (phase 2c) — dual-pinned with server.py.
 const RUST_CRATE_DIR: &str = "crates/tickvault-logs-mcp";
 const RUST_TOOLS_RS: &str = "crates/tickvault-logs-mcp/src/tools.rs";
 const RUST_RPC_RS: &str = "crates/tickvault-logs-mcp/src/rpc.rs";
+const PARITY_RS: &str = "crates/tickvault-logs-mcp/tests/parity.rs";
+const VALIDATE_SH: &str = "scripts/validate-automation.sh";
 
-/// The five tools Claude Code's loop prompt and the error-triage hook
-/// rely on. Removing any one would silently break the zero-touch chain.
-const REQUIRED_TOOL_NAMES: &[&str] = &[
-    "tail_errors",
-    "list_novel_signatures",
-    "summary_snapshot",
-    "triage_log_tail",
-    "signature_history",
-    // Phase 7.2 expansion — live-query tools for Claude co-work.
-    // `prometheus_query` + `list_active_alerts` were RETIRED in #O5
-    // (2026-05-30) — they pointed at the now-removed Prometheus (#O3) +
-    // Alertmanager (#O2) containers. Use questdb_sql / CloudWatch instead.
-    "find_runbook_for_code",
-    // Phase 7.2 workspace-wide expansion — SQL / grep / doctor / git
-    "questdb_sql",
-    "grep_codebase",
-    "run_doctor",
-    "git_recent_log",
-];
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn load_text(rel: &str) -> String {
-    let path = workspace_root().join(rel);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-#[test]
-fn tickvault_logs_mcp_server_py_exists() {
-    let path = workspace_root().join(SERVER_PY);
-    assert!(
-        path.exists(),
-        "{} missing — the log-query MCP server is a Phase 7.2 dependency",
-        path.display()
-    );
-}
-
-#[test]
-fn tickvault_logs_mcp_readme_exists() {
-    let path = workspace_root().join(README_MD);
-    assert!(path.exists(), "{} missing", path.display());
-}
-
-#[test]
-fn tickvault_logs_mcp_server_registers_every_required_tool() {
-    let src = load_text(SERVER_PY);
-    let mut missing: Vec<&'static str> = Vec::new();
-    for tool in REQUIRED_TOOL_NAMES {
-        // Check the ToolSpec entry — must have `name="<tool>"`.
-        let needle = format!("name=\"{tool}\"");
-        if !src.contains(&needle) {
-            missing.push(tool);
-        }
-    }
-    assert!(
-        missing.is_empty(),
-        "tickvault-logs MCP server is missing required ToolSpec entries:\n  {}",
-        missing.join("\n  ")
-    );
-}
-
-#[test]
-fn tickvault_logs_mcp_server_has_stdio_loop_entry() {
-    let src = load_text(SERVER_PY);
-    assert!(
-        src.contains("def _run_stdio_loop"),
-        "server.py missing _run_stdio_loop — MCP transport would not work"
-    );
-    assert!(src.contains("def main("), "server.py missing main() entry");
-}
-
-#[test]
-fn tickvault_logs_mcp_server_handles_required_jsonrpc_methods() {
-    let src = load_text(SERVER_PY);
-    for method in ["initialize", "tools/list", "tools/call"] {
-        assert!(
-            src.contains(&format!("\"{method}\"")),
-            "server.py does not handle JSON-RPC method `{method}`"
-        );
-    }
-}
-
-#[test]
-fn mcp_json_registers_tickvault_logs_server() {
-    let src = load_text(MCP_JSON);
-    assert!(
-        src.contains("\"tickvault-logs\""),
-        ".mcp.json missing `tickvault-logs` server registration"
-    );
-    assert!(
-        src.contains("scripts/mcp-servers/tickvault-logs/server.py"),
-        ".mcp.json `tickvault-logs` entry does not point at the right path"
-    );
-}
-
-#[test]
-fn tickvault_logs_mcp_server_is_stdlib_only() {
-    // Dep-free requirement — no pip install. If an import line appears
-    // that isn't in the stdlib allow-list, fail.
-    let src = load_text(SERVER_PY);
-    // Allow-list: every top-level import used by the current server.py.
-    // Add to this list DELIBERATELY if you're approving a new stdlib
-    // module; never add a pip-installable module.
-    let stdlib_allowlist = [
-        "from __future__",
-        "import hashlib",
-        "import json",
-        "import os",
-        "import sys",
-        "from dataclasses",
-        "from datetime",
-        "from pathlib",
-        "from typing",
-        // urllib retained for tool_tickvault_api (the prometheus_query +
-        // list_active_alerts tools that originally needed it were retired
-        // in #O5, 2026-05-30).
-        "import urllib.parse",
-        "import urllib.request",
-        // Phase 7.2 workspace-wide (grep_codebase, run_doctor, git_recent_log)
-        "import re",
-        "import fnmatch",
-        "import subprocess",
-    ];
-    for line in src.lines() {
-        let trimmed = line.trim_start();
-        if !(trimmed.starts_with("import ") || trimmed.starts_with("from ")) {
-            continue;
-        }
-        // Skip indented imports inside functions (they're stdlib too).
-        if line != trimmed {
-            continue;
-        }
-        let matches_allowlist = stdlib_allowlist.iter().any(|a| trimmed.starts_with(a));
-        assert!(
-            matches_allowlist,
-            "server.py has a non-stdlib top-level import: `{trimmed}`. \
-             The tickvault-logs MCP server MUST be pip-dep-free. Add to \
-             the allow-list in this test ONLY if the new import is stdlib."
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 2026-07-18 — Rust-port pins (phase 2c, pre-cutover transition window).
-// The Rust crate `crates/tickvault-logs-mcp` must keep full tool parity
-// with server.py for as long as both live side by side. These tests do
-// NOT replace any python pin above — they are ADDITIVE. Deleting either
-// implementation before the cutover PR fails the build.
-// ---------------------------------------------------------------------------
-
-/// The FULL 14-tool surface both implementations must expose. (The
-/// python `REQUIRED_TOOL_NAMES` above is the historical 10-tool core;
-/// this is the complete current set the parity harness byte-compares.)
+/// The FULL 14-tool surface the server must expose (the byte-parity
+/// contract the cutover was validated against).
 const FULL_TOOL_SURFACE: &[&str] = &[
     "tail_errors",
     "list_novel_signatures",
@@ -209,6 +58,127 @@ const FULL_TOOL_SURFACE: &[&str] = &[
     "cloudwatch_logs",
 ];
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn load_text(rel: &str) -> String {
+    let path = workspace_root().join(rel);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+#[test]
+fn python_server_retired_from_git() {
+    // Post-cutover pin (replaces the pre-cutover `server.py exists` pin,
+    // inverted to the new truth): NOTHING under the old python server
+    // dir is git-tracked. The path may exist ON DISK (the parity harness
+    // re-materializes server.py there at runtime; the dir is gitignored)
+    // — disk presence is deliberately NOT asserted either way.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root())
+        .args(["ls-files", "--", PYTHON_SERVER_DIR])
+        .output()
+        .expect("run git ls-files");
+    assert!(out.status.success(), "git ls-files failed");
+    let tracked = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        tracked.trim().is_empty(),
+        "python MCP server files are git-tracked again — the rust-only \
+         phase 2c cutover deleted them; a resurrection needs a fresh \
+         dated operator decision:\n{tracked}"
+    );
+}
+
+#[test]
+fn mcp_json_registers_tickvault_logs_server() {
+    let src = load_text(MCP_JSON);
+    assert!(
+        src.contains("\"tickvault-logs\""),
+        ".mcp.json missing `tickvault-logs` server registration"
+    );
+    assert!(
+        src.contains(LAUNCHER_SH),
+        ".mcp.json `tickvault-logs` entry must launch the Rust server via \
+         {LAUNCHER_SH}"
+    );
+}
+
+#[test]
+fn mcp_json_no_longer_launches_python() {
+    // Post-cutover inverse of the old `.mcp.json points at server.py`
+    // pin: no python launch of the tickvault-logs server may return.
+    let src = load_text(MCP_JSON);
+    assert!(
+        !src.contains("server.py"),
+        ".mcp.json references server.py — the python MCP server was \
+         retired in the phase 2c cutover (rollback = a deliberate revert \
+         of the cutover PR, never a partial re-point)"
+    );
+    assert!(
+        !src.contains("mcp-servers/tickvault-logs/"),
+        ".mcp.json references the retired python server dir"
+    );
+}
+
+#[test]
+fn launcher_exists_executable_and_rust_only() {
+    let path = workspace_root().join(LAUNCHER_SH);
+    assert!(path.is_file(), "{} missing", path.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "launcher must be executable (mode={mode:o})"
+        );
+    }
+    let src = load_text(LAUNCHER_SH);
+    // 2026-07-18 review MED-1 hardening: comment-strip the launcher
+    // source before pinning the launch lines — the pre-hardening
+    // substring asserts were satisfiable by the launcher's HEADER
+    // COMMENT alone (a deleted exec line with the comment intact still
+    // passed). Whole-line `#` comments are stripped; the `#!` shebang
+    // is kept (it is code, not commentary).
+    let code: String = src
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') || t.starts_with("#!")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        code.contains("release/tickvault-logs-mcp"),
+        "launcher must prefer the prebuilt release binary (in CODE, not a comment)"
+    );
+    assert!(
+        code.contains("exec \"$BIN\""),
+        "launcher must exec the prebuilt binary via `exec \"$BIN\"` (in CODE, \
+         not a comment)"
+    );
+    assert!(
+        code.contains("exec cargo run --release -q -p tickvault-logs-mcp"),
+        "launcher must fall back to `exec cargo run --release` \
+         (build-on-first-use) in CODE, not a comment"
+    );
+    assert!(
+        code.contains("no launch path executed"),
+        "launcher must keep the fail-loud safety tail (`no launch path \
+         executed` + exit 1) after the final exec — it catches any future \
+         deletion/regression of the exec lines"
+    );
+    assert!(
+        !src.to_ascii_lowercase().contains("python"),
+        "launcher must be rust-only — no python fallback"
+    );
+}
+
 #[test]
 fn rust_port_crate_exists_with_core_sources() {
     let root = workspace_root();
@@ -222,12 +192,13 @@ fn rust_port_crate_exists_with_core_sources() {
         "crates/tickvault-logs-mcp/src/config.rs",
         "crates/tickvault-logs-mcp/src/signature.rs",
         "crates/tickvault-logs-mcp/src/sigv4.rs",
+        PARITY_RS,
     ] {
         let path = root.join(rel);
         assert!(
             path.exists(),
-            "{} missing — the Rust MCP port (phase 2c) is dual-pinned with \
-             server.py until the cutover PR",
+            "{} missing — the Rust MCP server is the ONLY tickvault-logs \
+             implementation post-cutover",
             path.display()
         );
     }
@@ -246,28 +217,7 @@ fn rust_port_tools_rs_registers_the_full_14_tool_surface() {
     assert!(
         missing.is_empty(),
         "crates/tickvault-logs-mcp/src/tools.rs is missing tool names \
-         (14-tool parity with server.py is the phase-2c contract):\n  {}",
-        missing.join("\n  ")
-    );
-}
-
-#[test]
-fn rust_port_python_server_covers_same_full_surface() {
-    // Bidirectional parity pin: every tool the Rust crate must expose is
-    // also registered in server.py (name="<tool>" ToolSpec needles). A
-    // tool added to one side only fails here.
-    let src = load_text(SERVER_PY);
-    let mut missing: Vec<&'static str> = Vec::new();
-    for tool in FULL_TOOL_SURFACE {
-        let needle = format!("name=\"{tool}\"");
-        if !src.contains(&needle) {
-            missing.push(tool);
-        }
-    }
-    assert!(
-        missing.is_empty(),
-        "server.py is missing tools the Rust port exposes — the 14-tool \
-         parity surface drifted:\n  {}",
+         (the 14-tool surface is the cutover parity contract):\n  {}",
         missing.join("\n  ")
     );
 }
@@ -283,24 +233,95 @@ fn rust_port_rpc_handles_required_jsonrpc_methods() {
     }
     assert!(
         src.contains("2024-11-05"),
-        "rpc.rs must pin MCP protocolVersion 2024-11-05 (server.py parity)"
+        "rpc.rs must pin MCP protocolVersion 2024-11-05 (the parity-frozen \
+         protocol version)"
     );
 }
 
 #[test]
-fn rust_port_cutover_not_yet_performed() {
-    // Pre-cutover invariant: .mcp.json still points at server.py and
-    // does NOT yet reference the Rust binary. The cutover swap is a
-    // SEPARATE later PR after live parallel-run validation (2026-07-18).
-    let src = load_text(MCP_JSON);
+fn rust_port_binary_supports_self_test() {
+    // validate-automation + the launcher's --self-test path depend on the
+    // flag surviving (server.py --self-test parity).
+    let src = load_text("crates/tickvault-logs-mcp/src/main.rs");
     assert!(
-        src.contains("scripts/mcp-servers/tickvault-logs/server.py"),
-        ".mcp.json no longer points at server.py — the cutover must be \
-         its own PR with a dated rule/guard update, not a side effect"
+        src.contains("--self-test"),
+        "main.rs must keep the --self-test flag (validate-automation runs \
+         the launcher with it)"
+    );
+}
+
+#[test]
+fn parity_harness_pins_git_history_reference() {
+    // The parity gate must keep running WITHOUT python in the tree: the
+    // harness materializes server.py from a PINNED full-sha commit, with
+    // the shallow-clone fetch fallback. De-pinning or deleting the
+    // materialization silently kills the byte-parity gate.
+    let src = load_text(PARITY_RS);
+    assert!(
+        src.contains("SERVER_PY_PINNED_COMMIT"),
+        "parity.rs lost the pinned git-history reference"
     );
     assert!(
-        !src.contains("tickvault-logs-mcp"),
-        ".mcp.json references the Rust binary — premature cutover; the \
-         swap is a separate PR after live parallel-run validation"
+        src.contains("fn materialize_server_py"),
+        "parity.rs lost the server.py materialization fn"
+    );
+    // The pin must be a FULL 40-hex sha (a short sha can go ambiguous).
+    let pin_line = src
+        .lines()
+        .find(|l| l.contains("const SERVER_PY_PINNED_COMMIT"))
+        .expect("SERVER_PY_PINNED_COMMIT const line");
+    let sha: String = pin_line
+        .chars()
+        .skip_while(|c| *c != '"')
+        .skip(1)
+        .take_while(|c| *c != '"')
+        .collect();
+    assert!(
+        sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "SERVER_PY_PINNED_COMMIT must be a full 40-hex sha, got `{sha}`"
+    );
+    assert!(
+        src.contains("--depth=1"),
+        "parity.rs lost the shallow-clone fetch fallback (CI checkout is \
+         depth-1; without it the parity gate dies on shallow clones)"
+    );
+}
+
+#[test]
+fn parity_harness_keeps_the_transcript_test() {
+    let src = load_text(PARITY_RS);
+    assert!(
+        src.contains("fn parity_transcript"),
+        "parity.rs lost the parity_transcript test — the byte-parity gate \
+         is the cutover's regression floor"
+    );
+}
+
+#[test]
+fn gitignore_masks_materialized_python_dir() {
+    let src = load_text(".gitignore");
+    assert!(
+        src.contains("scripts/mcp-servers/tickvault-logs/"),
+        ".gitignore must mask the runtime-materialized python dir — \
+         otherwise a parity run leaves an untracked server.py that can be \
+         accidentally re-committed"
+    );
+}
+
+#[test]
+fn validate_automation_exercises_rust_launch_path() {
+    let src = load_text(VALIDATE_SH);
+    assert!(
+        src.contains("tickvault-logs-launch.sh --self-test"),
+        "validate-automation.sh must self-test through the REAL .mcp.json \
+         launch path (the launcher)"
+    );
+    assert!(
+        src.contains("cargo test -p tickvault-logs-mcp --lib"),
+        "validate-automation.sh must keep the Rust MCP unit-test check"
+    );
+    assert!(
+        !src.contains("python3 scripts/mcp-servers"),
+        "validate-automation.sh still invokes the retired python MCP server"
     );
 }

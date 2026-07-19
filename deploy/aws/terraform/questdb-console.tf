@@ -1,5 +1,5 @@
 # B4 — QuestDB one-click console (2026-07-03).
-# Re-trigger marker: bump to fire terraform-apply (re-zips both handlers). (b4-qdb-console-2026-07-03-r1)
+# Re-trigger marker: bump to fire terraform-apply (redeploys both lambdas). (b4-qdb-console-2026-07-18-rust-r1)
 #
 # Browser → API-Gateway v2 HTTP API ($default, payload v2)
 #         → FRONT Lambda (NON-VPC: device-key auth + session cookies +
@@ -60,38 +60,19 @@ resource "aws_security_group" "qdb_console_lambda" {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Packaging (mirrors the operator-control archive_file pattern).
+# Packaging — 2026-07-18 (rust-only phase 2b-3): the two Python handlers were
+# PORTED to Rust (crates/aws-lambdas/src/qdb_console_proxy.rs +
+# qdb_console_front.rs; thin bootstrap bins qdb-console-proxy /
+# qdb-console-front). The archive_file blocks are gone: the zips are built in
+# CI by the build-lambdas job (terraform-apply.yml) and downloaded into
+# ${path.module}/.lambda-zips/ before plan/apply; source_code_hash is the
+# Rust-SOURCE digest (same rationale + local-plan caveat as the dated
+# .lambda-zips comment in budget-guards.tf). Behavior parity is the
+# contract: same env vars (QDB_BASE / BACK_FN_ARN / CONTROL_SECRET_PARAM),
+# same SQL gate, same HMAC link/session tokens, same relay envelope — every
+# deviation documented at the deviating line in the Rust sources; the 31+61
+# Python unit tests were ported 1:1.
 # ─────────────────────────────────────────────────────────────────────────────
-data "archive_file" "questdb_console_front" {
-  count       = var.enable_questdb_console ? 1 : 0
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/questdb-console-front"
-  output_path = "${path.module}/.build/questdb-console-front.zip"
-  # Ship handler.py only — not tests/docs. "**/__pycache__/**": the unit
-  # tests run inside this source_dir and generate gitignored interpreter
-  # bytecode there (archive_file packages the LIVE directory, not the git
-  # index); bytecode filenames are interpreter-version-dependent
-  # (handler.cpython-<NN>.pyc), so only a glob can pin them — legal, the
-  # hashicorp/archive provider documents doublestar glob excludes. HONEST
-  # ENVELOPE: a stale pre-glob archive provider cached for a local apply
-  # would not match the glob — no worse than the prior status quo; CI pulls
-  # the latest provider.
-  excludes = ["test_handler.py", "README.md", "**/__pycache__/**"]
-}
-
-data "archive_file" "questdb_console_proxy" {
-  count       = var.enable_questdb_console ? 1 : 0
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/questdb-console-proxy"
-  output_path = "${path.module}/.build/questdb-console-proxy.zip"
-  # Ship handler.py only — same excludes rationale as the front block above.
-  # Incident evidence + the deploy-gate harness deliberately live OUTSIDE
-  # this packaging dir (docs/incidents/2026-07-06-questdb-console-shell-hang/
-  # and scripts/questdb-console-gate-matrix.sh) precisely so this list needs
-  # no special-casing; every non-handler file committed into this source_dir
-  # MUST be added here.
-  excludes = ["test_handler.py", "README.md", "**/__pycache__/**"]
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BACK Lambda (VPC): dumb relay to QuestDB on the box private IP. Zero secrets,
@@ -127,11 +108,12 @@ resource "aws_lambda_function" "questdb_console_proxy" {
   count            = var.enable_questdb_console ? 1 : 0
   function_name    = "tv-${var.environment}-questdb-console-proxy"
   role             = aws_iam_role.questdb_console_proxy[0].arn
-  runtime          = "python3.12"
-  handler          = "handler.lambda_handler"
-  filename         = data.archive_file.questdb_console_proxy[0].output_path
-  source_code_hash = data.archive_file.questdb_console_proxy[0].output_base64sha256
-  timeout          = 26 # aggregate backstop: the handler's 12s _TIMEOUT_SECS is PER socket op (connect + EACH recv — _read_capped issues up to ~16 sequential capped read() calls, each of which may span MANY recvs, every recv resetting the 12s timer, so under a dribble the recv count is unbounded), so a dribbling upstream is bounded by THIS Lambda timeout, not by 12s; < the front's 29s
+  runtime          = "provided.al2023"
+  handler          = "bootstrap"
+  architectures    = ["arm64"]
+  filename         = "${path.module}/.lambda-zips/qdb-console-proxy.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
+  timeout          = 26 # aggregate backstop: the handler's 12s TIMEOUT_SECS is a PER-HTTP-OP budget (the Rust port sets reqwest connect + per-request timeouts; a dribbling upstream is additionally bounded by the read cap), so THIS Lambda timeout is the hard aggregate ceiling; < the front's 29s
   memory_size      = 256
 
   vpc_config {
@@ -196,10 +178,11 @@ resource "aws_lambda_function" "questdb_console_front" {
   count            = var.enable_questdb_console ? 1 : 0
   function_name    = "tv-${var.environment}-questdb-console-front"
   role             = aws_iam_role.questdb_console_front[0].arn
-  runtime          = "python3.12"
-  handler          = "handler.lambda_handler"
-  filename         = data.archive_file.questdb_console_front[0].output_path
-  source_code_hash = data.archive_file.questdb_console_front[0].output_base64sha256
+  runtime          = "provided.al2023"
+  handler          = "bootstrap"
+  architectures    = ["arm64"]
+  filename         = "${path.module}/.lambda-zips/qdb-console-front.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
   timeout          = 29 # API-GW caps integrations at 30s
   memory_size      = 256
 

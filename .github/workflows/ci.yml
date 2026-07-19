@@ -234,11 +234,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # aws-lambdas joined 2026-07-18 (rust-only phase 2b-1) — a matrix
+        # ENTRY, not a new job, so the all-green needs list is untouched.
         # 2026-07-18 (rust-only phase 2c): `logs-mcp` = the new
         # crates/tickvault-logs-mcp crate (matrix entry expands to
         # `tickvault-logs-mcp` via the `tickvault-${{ matrix.crate }}`
         # run line below).
-        crate: [common, storage, core, trading, api, app, logs-mcp]
+        crate: [common, storage, core, trading, api, app, aws-lambdas, logs-mcp]
         # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature was
         # DELETED with the Dhan instrument chain (operator Q3, 2026-07-13 —
         # websocket-connection-scope-lock.md "2026-07-13 Amendment" §B); the
@@ -588,37 +590,32 @@ jobs:
         shell: bash
         run: bash .claude/hooks/boot-symmetry-guard.sh
 
-      # 2026-07-07 Telegram UX overhaul (judge final contract, Module 5):
-      # the telegram-webhook Lambda's house-style formatters are unit-tested
-      # server-side so a Lambda regression cannot ship silently. Added to
-      # the EXISTING Repo Guards job on purpose — no new job, the All Green
-      # `needs:` list is unchanged.
-      - name: Telegram Lambda house-style unit tests
-        shell: bash
-        run: make lambda-test
+      # 2026-07-18 (rust-only phase 2b-2 wave 1): the python `make
+      # lambda-test` step is RETIRED — the telegram-webhook Lambda is now
+      # the Rust crate tickvault-aws-lambdas (its ported test suite runs in
+      # the Test matrix `aws-lambdas` lane, which All Green already needs),
+      # and the house-style judge contract stays ratcheted by
+      # crates/core/tests/telegram_lambda_house_style_guard.rs (repointed
+      # at the Rust module).
 
-      # QuestDB console lambda suites + deploy-gate scenario harness
-      # (2026-07-06 shell-hang fix; simplified in the 2026-07-08 closure
-      # pass). Before this step the console lambda Python suites ran in NO CI
-      # lane — a PR reverting the B4 r3 handler fix would merge with every
-      # check green. Both suites are stdlib-only (<1s) and run unconditionally
-      # inside this already-All-Green-gated job (a step in an existing needed
-      # job, NOT a new job — merge-gate-lock §5 forbids a PR-relevant job
-      # outside all-green's needs list). The harness self-extracts the
-      # console smoke-gate step from terraform-apply.yml and drives its
-      # decision tree end-to-end through stubbed terraform/aws/curl/sleep;
-      # it ABORTS loudly if the gate step is deleted or renamed. Honest
-      # residual: a `continue-on-error:` added to the gate step is NOT
-      # caught (the harness executes the step's script, not its YAML
-      # attributes), and nothing ratchets this ci.yml step's own existence.
-      - name: QuestDB console lambda unit tests (back + front)
+      # QuestDB console deploy-gate scenario harness (2026-07-06 shell-hang
+      # fix; simplified in the 2026-07-08 closure pass). 2026-07-18
+      # (rust-only phase 2b-3): the two console lambda Python unittest
+      # suites that used to run here were RETIRED with the handlers — the
+      # 31+61 tests are ported 1:1 into crates/aws-lambdas
+      # (qdb_console_proxy.rs / qdb_console_front.rs) and run in the
+      # Test (aws-lambdas-adjacent) cargo lanes. The two harnesses below
+      # remain: the smoke-gate harness self-extracts the console smoke-gate
+      # step from terraform-apply.yml and drives its decision tree
+      # end-to-end through stubbed terraform/aws/curl/sleep; it ABORTS
+      # loudly if the gate step is deleted or renamed. Honest residual: a
+      # `continue-on-error:` added to the gate step is NOT caught (the
+      # harness executes the step's script, not its YAML attributes), and
+      # nothing ratchets this ci.yml step's own existence.
+      - name: QuestDB console deploy-gate + all-green harnesses
         shell: bash
         run: |
           set -euo pipefail
-          for d in deploy/aws/lambda/questdb-console-proxy deploy/aws/lambda/questdb-console-front; do
-            echo "== ${d} =="
-            (cd "$d" && python3 -m unittest test_handler -v)
-          done
           echo "== questdb-console-gate-matrix.sh (terraform-apply.yml console smoke-gate scenarios) =="
           bash scripts/questdb-console-gate-matrix.sh
           echo "== all-green-equivalence-matrix.sh (all-green jq verdict vs frozen fixture table) =="

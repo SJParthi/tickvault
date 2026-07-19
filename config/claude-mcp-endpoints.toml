@@ -1,6 +1,8 @@
 # Claude MCP Endpoints Config — universal, branch-independent
 #
-# Read by scripts/mcp-servers/tickvault-logs/server.py at startup.
+# Read at startup by the tickvault-logs MCP server (crates/tickvault-logs-mcp,
+# launched via scripts/mcp-servers/tickvault-logs-launch.sh since the 2026-07-18
+# rust-only phase 2c cutover).
 # Env vars (TICKVAULT_QUESTDB_URL etc.) override any value here.
 #
 # Purpose: every Claude session, on every branch, on every host

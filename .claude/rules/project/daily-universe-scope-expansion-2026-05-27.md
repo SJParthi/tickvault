@@ -383,6 +383,8 @@ Per `.claude/rules/project/z-plus-defense-doctrine.md`:
 
 The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth) and the WebSocket pool spawn:
 
+> *(2026-07-19 note: the timeline below is HISTORICAL — the §10 orchestrator retired with the Dhan subscription contract per the 2026-07-13 top banner, and the "EC2 r8g.large boots" line predates the 2026-07-15 Quote 8 downsize; the host has been **t4g.medium** since then — §7 + PR #1582 / downsize-instance.yml are the current authority.)*
+
 ```
 08:30 IST  EventBridge cron fires (Mon–Fri only); EC2 r8g.large boots (~60s cold)
 08:31      Docker compose up (QuestDB + tickvault-app)

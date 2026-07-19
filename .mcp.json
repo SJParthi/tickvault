@@ -22,9 +22,9 @@
       }
     },
     "tickvault-logs": {
-      "command": "python3",
+      "command": "bash",
       "args": [
-        "scripts/mcp-servers/tickvault-logs/server.py"
+        "scripts/mcp-servers/tickvault-logs-launch.sh"
       ],
       "env": {
         "TICKVAULT_LOGS_DIR": "${TICKVAULT_LOGS_DIR}",

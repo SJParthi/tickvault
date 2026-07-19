@@ -119,25 +119,32 @@ resource "aws_iam_role_policy" "budget_killswitch" {
 }
 
 # ---------------------------------------------------------------------------
-# Lambda source — packaged from deploy/aws/lambda/budget-killswitch/
+# Lambda source — Rust bin (rust-only phase 2b-1, 2026-07-18).
+#
+# The Python handler (deploy/aws/lambda/budget-killswitch/handler.py) was
+# PORTED to Rust — crates/aws-lambdas/src/budget_killswitch.rs (lib logic;
+# every python test ported to Rust unit tests) + src/bin/budget_killswitch.rs
+# (thin bootstrap bin). Behavior parity: same SNS event parse (Records[0]
+# .Sns.{Subject,Message}), same StopInstances on EC2_INSTANCE_ID, same
+# Critical operator alert to ALERTS_TOPIC_ARN with the 99-char subject cap
+# and 1000-char message truncation, same fail-loud re-raise so the
+# budget_killswitch_errors self-error alarm below still fires on failure.
+# The zip is built in CI by the build-lambdas job (terraform-apply.yml)
+# into ${path.module}/.lambda-zips/ before plan/apply; source_code_hash is
+# a digest of the Rust SOURCE (Rust builds are not bit-reproducible, so
+# hashing the zip would churn every build with zero source change).
 # ---------------------------------------------------------------------------
-
-data "archive_file" "budget_killswitch" {
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/budget-killswitch"
-  output_path = "${path.module}/.budget-killswitch.zip"
-  excludes    = ["README.md", "__pycache__", "*.pyc"]
-}
 
 resource "aws_lambda_function" "budget_killswitch" {
   function_name    = "tv-${var.environment}-budget-killswitch"
   role             = aws_iam_role.budget_killswitch.arn
-  handler          = "handler.lambda_handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 30
   memory_size      = 128
-  filename         = data.archive_file.budget_killswitch.output_path
-  source_code_hash = data.archive_file.budget_killswitch.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/budget-killswitch.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
 
   environment {
     variables = {
