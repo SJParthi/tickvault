@@ -28,6 +28,41 @@ Both seams sit AFTER `book.tripwire_ok(sid, segment_code)` (:819 / :1175), so cr
 
 **Hot-path honesty (verbatim, binding):** DHAT deliberately NOT claimed — over-claiming on a minute-cadence cold path; the genuinely hot MarkForwarder tap is byte-untouched and keeps its existing `dhat_mark_forward.rs` proof. This item is NOT the tick hot path (no live WS exists; marks arrive at minute cadence after the option_chain_1m flush ACK, fills are rare paper events). Per event: O(1) TIME (one HashMap get + ~6 f64 ops + one bounded try_send) and O(1) SPACE (bounded channel; overflow drops counted, never grows). Zero producer-side allocation — all strings are resolved consumer-side from the day Arc.
 
+### Review fold — pre-impl 3-agent round 1 (2026-07-19)
+
+Security review (FIX-FIRST — plan-text gaps only) + hot-path review (SHIP) folded; the hostile
+round re-runs against this text. No design change — pins, verifications and one justification.
+
+1. **ILP sanitizer pin (SEC MED-1):** every vendor-derived SYMBOL/STRING column of
+   `order_leg_pnl` (`underlying`, `option_type`, `expiry` — plus the static
+   `event_kind`/`mode`/`segment`/`feed`/`trading_date_ist`) goes through the SAME
+   `sanitize_ilp_symbol()` choke point the exemplar (`order_update_events_persistence.rs`)
+   uses (crates/common/src/sanitize.rs:79), and the empty→`"n/a"` sentinel check runs AFTER sanitize
+   (exemplar order), never before. `sanitize_audit_string` is explicitly the WRONG tool for
+   ILP columns (double-quoting corrupts stored text) — it is used ONLY for log interpolation.
+2. **Log-injection pin (SEC MED-2):** identity-miss logging in `order_leg_pnl_boot.rs` (and
+   any other log line carrying vendor-derived `underlying`/`expiry`/`option_type`) routes
+   through the house log choke points (`log_safe_id`/`sanitize_audit_string` — crates/app/src/order_update_events_boot.rs:66),
+   never raw interpolation.
+3. **Fill-side finiteness (SEC LOW-1) — VERIFIED:** `RiskEngine::record_fill`
+   (crates/trading/src/risk/engine.rs:160-299) finiteness-guards the realized-P&L
+   accumulation (hot-path review read the full body); the fill-seam emit consumes
+   post-guard state only.
+4. **Mark-side finiteness (SEC LOW-2) — VERIFIED: `RiskEngine::update_market_price` rejects non-finite/non-positive marks internally (crates/trading/src/risk/engine.rs:286, code-read this round); the mark-seam emit additionally consumes only `f32_to_f64_clean` output (order_runtime.rs:1182).**
+5. **Identity-index structure justification (HOT LOW/MED):** the existing
+   `contract_marks: Mutex<Option<(NaiveDate, ContractMarkIndex)>>` is an EXECUTOR-LOCAL
+   field read on the cadence-executor task; the leg-identity map is consumed by the
+   persistence CONSUMER task at row-append time. A cross-task, lock-free read surface is
+   required, hence the separate `Arc<ArcSwapOption<HashMap<(u64, u8), OptionLegIdentity>>>`
+   publication. The BUILD still piggybacks the SAME once-per-day master-row loop beside
+   `build_contract_mark_index` (zero extra REST — unchanged).
+6. **feed-in-DEDUP-key (HOT LOW) — already satisfied:** `DEDUP_KEY_ORDER_LEG_PNL` carries
+   `feed` ("ts, trading_date_ist, feed, security_id, segment, event_seq");
+   `dedup_segment_meta_guard` + the feed-in-key guard ride it.
+7. **RiskEngine sid-only keying (HOT LOW) — already recorded:** the pre-existing I-P1-11
+   gap note in Design stands; `LegPnlEvent` carries `segment_code` so every persisted row
+   is composite-keyed; not worsened by this PR.
+
 ## Edge Cases
 
 1. **16:00 daily reset × cumulative realized:** `realized_pnl` is a cumulative-DAY snapshot of the engine's per-leg realized at emit time. The runtime's daily reset zeroes engine state; rows before/after are separated by `trading_date_ist`, and a post-reset row legitimately restarts at 0.0 — never back-adjusted. Documented in the rule file.
