@@ -193,6 +193,64 @@ fn build_contract_mark_index(books: &[GrowwContractBook]) -> ContractMarkIndex {
     index
 }
 
+/// Reverse identity for one FNO option leg — everything the leg-P&L
+/// persister needs to label a row, keyed by the SAME
+/// `(exchange_token, segment_code)` pair the mark tap emits. Built beside
+/// the forward mark index on the once-per-day master download (zero extra
+/// REST; never on the chain fire's deadline-bounded critical path).
+/// `underlying` borrows the book's `&'static str` symbol — zero allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OptionLegIdentity {
+    pub(crate) underlying: &'static str,
+    pub(crate) expiry: NaiveDate,
+    pub(crate) strike_paise: i64,
+    pub(crate) option_type: tickvault_common::types::OptionType,
+}
+
+/// Reverse index `(exchange_token, segment_code) -> identity` for the
+/// leg-P&L consumer. O(1) lookup per persisted row.
+pub(crate) type LegIdentityIndex = std::collections::HashMap<(u64, u8), OptionLegIdentity>;
+
+/// Day-stamped shared handle for the leg identity index. The cadence
+/// executor STOREs a fresh `(day, index)` once per daily master download;
+/// the leg-P&L boot consumer LOADs lock-free per row. `None` (pre-publish)
+/// means the consumer persists identity sentinels (counted) — later rows
+/// self-heal once today's index lands.
+pub(crate) type SharedLegIdentityIndex =
+    std::sync::Arc<arc_swap::ArcSwapOption<(NaiveDate, LegIdentityIndex)>>;
+
+/// Build the reverse identity index from the SAME resolved books the
+/// forward mark index uses. First-wins on a `(token, segment)` collision —
+/// mirrors the forward index's `or_insert` law; colliding master rows are
+/// already counted upstream by `resolve_groww_contract_books`.
+fn build_leg_identity_index(books: &[GrowwContractBook]) -> LegIdentityIndex {
+    let mut index = LegIdentityIndex::new();
+    for book in books {
+        let seg_code = contract_segment_code(book.segment);
+        for slot in &book.strikes {
+            let Some(strike_paise) = strike_paise_key(slot.strike) else {
+                continue;
+            };
+            for (option_type, contract) in [
+                (tickvault_common::types::OptionType::Call, slot.ce.as_ref()),
+                (tickvault_common::types::OptionType::Put, slot.pe.as_ref()),
+            ] {
+                if let Some(contract) = contract
+                    && let Ok(token) = u64::try_from(contract.token)
+                {
+                    index.entry((token, seg_code)).or_insert(OptionLegIdentity {
+                        underlying: book.underlying,
+                        expiry: book.expiry,
+                        strike_paise,
+                        option_type,
+                    });
+                }
+            }
+        }
+    }
+    index
+}
+
 /// Pure: the day's DISTINCT sorted FUTURE option expiries for one
 /// underlying, extracted from the Groww instruments master with the SAME
 /// filter as the legacy `select_current_option_expiry` (§3e — one
@@ -302,6 +360,10 @@ pub struct GrowwCadenceExecutor {
     /// the first-seen-SEGMENT tripwire (segments match across the
     /// split). `None` ⇒ `[order_runtime]` disabled — zero work.
     mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
+    /// Item 3 (order-leg-pnl): day-stamped reverse identity handle for the
+    /// leg-P&L consumer. Always constructed (two pointers when idle); the
+    /// daily loop publishes into it only when the mark forwarder is wired.
+    leg_identity_index: SharedLegIdentityIndex,
 }
 
 impl GrowwCadenceExecutor {
@@ -341,6 +403,7 @@ impl GrowwCadenceExecutor {
             escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier,
             mark_forwarder,
+            leg_identity_index: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         })
     }
 
@@ -366,6 +429,7 @@ impl GrowwCadenceExecutor {
             escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier: None,
             mark_forwarder: None,
+            leg_identity_index: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         }
     }
 
@@ -1311,6 +1375,12 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                 );
             }
             *self.contract_marks.lock().await = Some((today, index));
+            // Item 3 (order-leg-pnl): publish the day-stamped reverse
+            // identity index — lock-free swap; consumer rows that went
+            // out as identity sentinels self-heal once this lands.
+            let identity = build_leg_identity_index(&books);
+            self.leg_identity_index
+                .store(Some(std::sync::Arc::new((today, identity))));
         }
         Ok(out)
     }
@@ -1350,6 +1420,107 @@ mod tests {
         assert_eq!(strike_paise_key(-5.0), None);
         assert_eq!(strike_paise_key(f64::NAN), None);
         assert_eq!(strike_paise_key(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn test_leg_identity_index_build() {
+        use crate::groww_contract_1m_boot::{GrowwContractRef, GrowwStrikeSlot};
+        let book = GrowwContractBook {
+            underlying: "NIFTY",
+            exchange: "NSE",
+            segment: "NSE_FNO",
+            underlying_security_id: 1,
+            expiry: NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            strikes: vec![
+                GrowwStrikeSlot {
+                    strike: 25500.0,
+                    ce: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25500-CE".to_string(),
+                        token: 12345,
+                    }),
+                    pe: None,
+                },
+                GrowwStrikeSlot {
+                    strike: 25600.0,
+                    ce: None,
+                    pe: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25600-PE".to_string(),
+                        token: -7,
+                    }),
+                },
+            ],
+        };
+        let books = [book];
+        let forward = build_contract_mark_index(&books);
+        let identity = build_leg_identity_index(&books);
+        assert!(!forward.is_empty(), "fixture must resolve real tokens");
+        assert_eq!(
+            identity.len(),
+            forward.len(),
+            "reverse index must cover exactly the forward entries"
+        );
+        for ((underlying, expiry, strike_paise, leg), (token, seg)) in &forward {
+            let got = identity
+                .get(&(*token, *seg))
+                .expect("every forward entry has a reverse identity");
+            assert_eq!(got.underlying, *underlying);
+            assert_eq!(got.expiry, *expiry);
+            assert_eq!(got.strike_paise, *strike_paise);
+            assert_eq!(got.option_type.as_str(), *leg);
+        }
+    }
+
+    #[test]
+    fn test_leg_identity_sentinel_then_heal() {
+        let handle: SharedLegIdentityIndex = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+        // Pre-publish: the handle reads None — the consumer persists
+        // identity SENTINELS (counted), never a guessed identity.
+        assert!(handle.load_full().is_none());
+
+        use crate::groww_contract_1m_boot::{GrowwContractRef, GrowwStrikeSlot};
+        let book = GrowwContractBook {
+            underlying: "NIFTY",
+            exchange: "NSE",
+            segment: "NSE_FNO",
+            underlying_security_id: 1,
+            expiry: NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            strikes: vec![
+                GrowwStrikeSlot {
+                    strike: 25500.0,
+                    ce: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25500-CE".to_string(),
+                        token: 12345,
+                    }),
+                    pe: None,
+                },
+                GrowwStrikeSlot {
+                    strike: 25600.0,
+                    ce: None,
+                    pe: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25600-PE".to_string(),
+                        token: -7,
+                    }),
+                },
+            ],
+        };
+        let books = [book];
+        let today = books[0].expiry;
+        let built = build_leg_identity_index(&books);
+        assert!(!built.is_empty());
+        handle.store(Some(std::sync::Arc::new((today, built))));
+
+        // Post-publish: the SAME lookup heals — day stamp + identity fields.
+        let published = handle.load_full().expect("published day index");
+        let (day, idx) = &*published;
+        assert_eq!(*day, today);
+        let ((_, expiry, strike_paise, leg), (token, seg)) = build_contract_mark_index(&books)
+            .into_iter()
+            .next()
+            .expect("fixture entry");
+        let got = idx.get(&(token, seg)).expect("healed identity");
+        assert_eq!(got.expiry, expiry);
+        assert_eq!(got.strike_paise, strike_paise);
+        assert_eq!(got.option_type.as_str(), leg);
     }
 
     #[test]
