@@ -10,6 +10,15 @@
 # QuestDB 1g, automated") — recorded in
 # .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md §0/§7.
 #
+# ⚠ 2026-07-19 HISTORICAL CORRECTION: this header (and the run-log/Telegram
+# strings below) narrate the root as "50 GB" — that premise was WRONG. Live
+# `describe-volumes` on vol-073ccaa417a0f344b (2026-07-19) returned 30 GiB
+# gp3: the 2026-07-13 approved 30->50 grow was recorded but never physically
+# applied, so the volume this workflow snapshotted on 2026-07-15 was 30 GB.
+# The one-shot run is DONE — strings below are left as the historical run
+# narrative; authority for the corrected state: daily-universe §7 2026-07-19
+# correction note.
+#
 # ─────────────────────────────────────────────────────────────────────────────
 # ⚠ EBS 50 GB -> 20 GB CANNOT BE DONE IN THIS WORKFLOW (executor decision,
 #   NOT operator-quoted scope — see the rule file §7 Rule 3)
