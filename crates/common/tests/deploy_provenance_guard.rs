@@ -167,7 +167,9 @@ fn portal_footer_renders_provenance_line() {
 #[test]
 fn watchdog_publishes_binary_mismatch_metric() {
     let root = repo_root();
-    let handler = read(&root.join("deploy/aws/lambda/deploy-watchdog/handler.py"));
+    // Repointed 2026-07-18 (rust-only phase 2b-2 wave 1): the watchdog is
+    // now the Rust module (the python handler.py was ported 1:1 + deleted).
+    let handler = read(&root.join("crates/aws-lambdas/src/deploy_watchdog.rs"));
     assert!(
         handler.contains("tv_binary_main_sha_mismatch"),
         "deploy-watchdog must publish the tv_binary_main_sha_mismatch metric"

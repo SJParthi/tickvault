@@ -34,7 +34,12 @@ aws-sdk-costexplorer = { workspace = true }
 # reqwest (the GitHub main-HEAD provenance read — python used urllib).
 aws-lc-rs = { workspace = true }
 regex = { workspace = true }
+aws-sdk-eventbridge = { workspace = true }
 reqwest = { workspace = true }
+
+[[bin]]
+name = "start-watchdog"
+path = "src/bin/start_watchdog.rs"
 
 [[bin]]
 name = "budget-killswitch"
@@ -55,3 +60,19 @@ path = "src/bin/market_hours_liveness_gate.rs"
 [[bin]]
 name = "operator-control"
 path = "src/bin/operator_control.rs"
+
+[[bin]]
+name = "hard-stop-guard"
+path = "src/bin/hard_stop_guard.rs"
+
+[[bin]]
+name = "telegram-webhook"
+path = "src/bin/telegram_webhook.rs"
+
+[[bin]]
+name = "market-open-readiness"
+path = "src/bin/market_open_readiness.rs"
+
+[[bin]]
+name = "deploy-watchdog"
+path = "src/bin/deploy_watchdog.rs"

@@ -605,25 +605,26 @@ fn test_holiday_stop_marker_chain_is_wired() {
          gate sample sees an unexplained stop"
     );
 
-    // --- reader 1: start-watchdog handler.py -------------------------------
-    let watchdog = read("deploy/aws/lambda/start-watchdog/handler.py");
+    // --- reader 1: start-watchdog Rust port (rust-only phase 2b-2 wave 2;
+    //     the python handler.py was deleted with the tf swap) ---------------
+    let watchdog = read("crates/aws-lambdas/src/start_watchdog.rs");
     for pin in [
         "HOLIDAY_STOP_PARAM",
-        "def _holiday_stop_is_today(",
+        "pub async fn holiday_stop_is_today",
         "\"skipped\": \"holiday_stop\"",
     ] {
         assert!(
             watchdog.contains(pin),
-            "start-watchdog handler.py lost `{pin}` — the 08:45 IST check will \
+            "start_watchdog.rs lost `{pin}` — the 08:45 IST check will \
              again self-start the holiday-stopped box AND false-page a Critical \
              'auto-start FAILED' every weekday NSE holiday"
         );
     }
     let marker_call = watchdog
-        .find("if _holiday_stop_is_today(_now()):")
+        .find("if holiday_stop_is_today(ssm, &env.holiday_stop_param, now).await")
         .expect("check mode must consult the marker in its not-running branch"); // APPROVED: test
     let self_start_call = watchdog
-        .find("self_started = _try_self_start(ec2_client, EC2_INSTANCE_ID)")
+        .find("let self_started = try_self_start(ec2, &env.instance_id).await")
         .expect("check mode must keep its self-heal start for real trading days"); // APPROVED: test
     assert!(
         marker_call < self_start_call,

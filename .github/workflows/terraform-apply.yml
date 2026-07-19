@@ -225,7 +225,7 @@ jobs:
           set -euo pipefail
           ZIP_DIR="${{ env.TF_DIR }}/.lambda-zips"
           mkdir -p "${ZIP_DIR}"
-          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch operator-control"
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard operator-control"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
           # (--break-system-packages: ubuntu-24.04 system pip is PEP-668
           # externally-managed; harmless where the runner image already
@@ -400,7 +400,7 @@ jobs:
           set -euo pipefail
           ZIP_DIR="${{ env.TF_DIR }}/.lambda-zips"
           mkdir -p "${ZIP_DIR}"
-          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch operator-control"
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard operator-control"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
           # (--break-system-packages: ubuntu-24.04 system pip is PEP-668
           # externally-managed; harmless where the runner image already
