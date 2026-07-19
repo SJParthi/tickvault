@@ -975,6 +975,9 @@ pub enum ErrorCode {
     /// auto-triage-safe (the degrade already happened; DEDUP-idempotent
     /// re-appends and the next event self-heal — the operator inspects).
     OrderEvt01PersistFailed,
+    /// ORDER-PNL-01 — per-leg option P&L persistence degraded (the
+    /// `stage` field names the failing leg).
+    OrderPnl01PersistFailed,
 
     // -----------------------------------------------------------------------
     // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
@@ -1443,6 +1446,7 @@ impl ErrorCode {
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded => "RAMSTORE-01",
             Self::OrderEvt01PersistFailed => "ORDER-EVT-01",
+            Self::OrderPnl01PersistFailed => "ORDER-PNL-01",
             Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
             Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
             // Groww Portfolio area contract stubs (§39.3, 2026-07-14)
@@ -1664,6 +1668,7 @@ impl ErrorCode {
             // next boot re-fills). LOG-SINK-ONLY.
             Self::RamStore01Degraded => Severity::High,
             Self::OrderEvt01PersistFailed => Severity::High,
+            Self::OrderPnl01PersistFailed => Severity::High,
             // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
             // exit-order layer degraded / the MPP verify ladder exhausted
             // without a clean fill. High: operator eyes on every occurrence
@@ -2341,6 +2346,7 @@ impl ErrorCode {
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded,
             Self::OrderEvt01PersistFailed,
+            Self::OrderPnl01PersistFailed,
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded,
             Self::ExitVerify01Degraded,
@@ -2779,6 +2785,7 @@ mod tests {
         // production callers; deleted with its dead paging filter) => 164.
         // 2026-07-18 (full-fidelity order/position push-event capture):
         // +1 ORDER-EVT-01 (OrderEvt01PersistFailed — order_update_events /
+        // +1 ORDER-PNL-01 (OrderPnl01PersistFailed — order_update_events /
         // position_update_events forensic-writer degrade; log-sink-only,
         // High, auto-triage-safe) => 165.
         // 2026-07-18 (tick-conservation retirement, dead-WS sweep follow-up):
@@ -2790,7 +2797,8 @@ mod tests {
         // 2026-07-20 (cross-fill visibility, operator directive): +1
         // CADENCE-04 (Cadence04AuditWriteFailed — cross_fill_audit
         // best-effort forensics degrade; Medium, auto-triage-safe) => 165.
-        assert_eq!(ErrorCode::all().len(), 165);
+        // +1 ORDER-PNL-01 (2026-07-19) => 166
+        assert_eq!(ErrorCode::all().len(), 166);
     }
 
     #[test]
