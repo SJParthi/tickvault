@@ -2390,10 +2390,12 @@ async fn build_shared_infra(
     // PR-C3 (2026-07-14): the order-update broadcast channel was removed
     // (publisher + subscriber both retired — see the SharedInfraHandles note).
 
-    // --- Subscriber tasks: obs + tick-storage ---
-    // Both `.subscribe()` to `tick_broadcast_sender` HERE, in the hoisted
+    // --- Subscriber task: slow-boot observability ---
+    // It `.subscribe()`s to `tick_broadcast_sender` HERE, in the hoisted
     // prefix, before anything could publish — subscribe-before-publish is
-    // preserved by construction. Stage-3 dead-WS sweep (2026-07-17): the
+    // preserved by construction. (The tick-storage broadcast consumer was
+    // REMOVED in this PR's PrevDayCache/TickStorage cleanup — see the dated
+    // BATCH-5 note after the block below.) Stage-3 dead-WS sweep (2026-07-17): the
     // 21-TF TICK aggregator driver (`spawn_engine_b_aggregator`) is DELETED —
     // the seal-writer above stays, fed exclusively by the REST-era candle
     // fold (FOLD-01) further below.

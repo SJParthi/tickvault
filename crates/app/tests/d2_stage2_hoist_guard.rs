@@ -1,9 +1,12 @@
 //! D2 Stage 2 — genuine shared-infra hoist guard (source-scan ratchet).
 //!
-//! Stage 2 hoisted the PROCESS-shared blocks (notifier, health, seal-writer,
-//! the tick broadcast, the obs / tick-storage subscriber tasks, the API
-//! server) into a single `build_shared_infra(...)` prefix and deleted the
-//! D2-pre duplicate `run_shared_infra_only`.
+//! Stage 2 hoisted the PROCESS-shared blocks (notifier, health, the
+//! seal-writer `spawn_seal_writer_loop`, the tick broadcast, the surviving
+//! `run_slow_boot_observability` subscriber task, the API server) into a
+//! single `build_shared_infra(...)` prefix and deleted the D2-pre duplicate
+//! `run_shared_infra_only`. (The tick-storage subscriber task was removed in
+//! the BATCH-5 PrevDayCache/TickStorage cleanup — the guard asserts only the
+//! surviving `run_slow_boot_observability` + `spawn_seal_writer_loop`.)
 //!
 //! ## Stage-3 dead-WS sweep (2026-07-17)
 //! The 21-TF TICK aggregator driver (`spawn_engine_b_aggregator`) is
