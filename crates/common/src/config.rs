@@ -229,6 +229,9 @@ pub struct ApplicationConfig {
     /// off); `config/base.toml` opts in.
     #[serde(default)]
     pub order_update_events: OrderUpdateEventsConfig,
+    /// Per-leg option P&L capture (dry-run forensics; default OFF).
+    #[serde(default)]
+    pub order_leg_pnl: OrderLegPnlConfig,
     /// `[groww_rest_burst]` — the 2026-07-14 Groww REST burst auto-ladder
     /// (operator approval "approved and go ahead with the recommendation";
     /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
@@ -1799,6 +1802,35 @@ pub struct DhanOrderPushConfig {
     /// Default OFF (fail-safe).
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Per-leg option P&L capture config (`[order_leg_pnl]`).
+///
+/// Dry-run only forensics: gates the bounded leg-P&L channel + the
+/// `order_leg_pnl` QuestDB writer. An ABSENT section means OFF
+/// (fail-safe); `config/base.toml` opts in explicitly.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderLegPnlConfig {
+    /// Master switch — OFF by default; the effective gate is
+    /// `order_runtime.enabled && order_leg_pnl.enabled`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bounded channel capacity between the emit seams and the consumer.
+    #[serde(default = "default_order_leg_pnl_channel_capacity")]
+    pub channel_capacity: usize,
+}
+
+impl Default for OrderLegPnlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel_capacity: default_order_leg_pnl_channel_capacity(),
+        }
+    }
+}
+
+fn default_order_leg_pnl_channel_capacity() -> usize {
+    2048
 }
 
 /// `[order_update_events]` — full-fidelity order/position PUSH-event
@@ -4200,6 +4232,7 @@ mod tests {
             order_runtime: OrderRuntimeConfig::default(),
             dhan_order_push: DhanOrderPushConfig::default(),
             order_update_events: OrderUpdateEventsConfig::default(),
+            order_leg_pnl: OrderLegPnlConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
@@ -6200,6 +6233,19 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.order_update_events.enabled);
+    }
+
+    #[test]
+    fn test_order_leg_pnl_config_default_off() {
+        // Absent [order_leg_pnl] section must mean OFF (fail-safe) with the
+        // documented channel capacity.
+        let cfg = OrderLegPnlConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.channel_capacity, 2048);
+
+        let parsed: OrderLegPnlConfig = toml::from_str("").expect("empty section parses");
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.channel_capacity, 2048);
     }
 
     /// Order runtime validation: the 60s reconcile floor + the bounded
