@@ -2010,6 +2010,19 @@ mod tests {
     }
 
     #[test]
+    fn test_console_shared_corpus_pins() {
+        // Cross-language freeze with the console lambdas' Python suites
+        // (deploy/aws/lambda/questdb-console-{front,proxy}/test_handler.py):
+        // with the Python operator-control oracle retired, those suites pin
+        // FROZEN verdicts on a shared corpus — this test pins the same three
+        // entries the pre-port oracle comparison covered but the inline
+        // SafeSql tests did not.
+        assert!(is_safe_sql("select 1 ;")); // space before the ONE stripped ';'
+        assert!(is_safe_sql("select 1 union all select 2")); // no mutator word
+        assert!(!is_safe_sql("(select 1)")); // leading non-letter → empty first word
+    }
+
+    #[test]
     fn test_sql_comments_rejected() {
         assert!(!is_safe_sql("-- comment\nselect 1"));
         assert!(!is_safe_sql("select 1 -- tail comment"));

@@ -15,6 +15,7 @@ import base64
 import importlib.util
 import io
 import os
+import re
 import socket
 import sys
 import unittest
@@ -38,12 +39,29 @@ def _load_front():
     return mod
 
 
-def _load_opctl():
-    p = Path(__file__).resolve().parent.parent / "operator-control" / "handler.py"
-    spec = importlib.util.spec_from_file_location("opctl_for_parity_back", p)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# The Python operator-control lambda was retired in the rust-only phase 2b-3
+# port — crates/aws-lambdas/src/operator_control.rs is now the parity anchor.
+# Its SQL-gate constant arrays are parsed straight out of the Rust source
+# (fail-LOUD: a missing file or an empty parse aborts the test — never a
+# vacuous pass).
+_RUST_OPCTL = (
+    Path(__file__).resolve().parents[4] / "crates" / "aws-lambdas" / "src" / "operator_control.rs"
+)
+
+
+def _rust_gate_lists() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    src = _RUST_OPCTL.read_text(encoding="utf-8")
+
+    def arr(name: str) -> tuple[str, ...]:
+        m = re.search(rf"const {name}: \[&str; \d+\] = \[(.*?)\];", src, re.S)
+        if m is None:
+            raise AssertionError(f"{name} not found in {_RUST_OPCTL} — parity anchor lost")
+        vals = tuple(re.findall(r'"([^"]+)"', m.group(1)))
+        if not vals:
+            raise AssertionError(f"{name} parsed empty from {_RUST_OPCTL} — parser drifted")
+        return vals
+
+    return arr("SQL_ALLOWED_PREFIXES"), arr("SQL_BANNED")
 
 
 class FakeResp:
@@ -137,22 +155,25 @@ class ReGate(WithBase):
 
     def test_sql_gate_parity_with_operator_control_shared_subset(self) -> None:
         # The back gate is a read-only SUPERSET of operator-control (adds bare
-        # introspection funcs); on the NON-func corpus they must agree.
-        opctl = _load_opctl()
-        self.assertEqual(handler._SQL_ALLOWED_PREFIXES, opctl._SQL_ALLOWED_PREFIXES)
-        self.assertEqual(handler._SQL_BANNED, opctl._SQL_BANNED)
-        for q in (
-            "select 1; drop table ticks",
-            "select 1 -- x",
-            "select /* x */ 1",
-            "backup table ticks",
-            "select backup from t",
-            "WITH x AS (SELECT 1) SELECT * FROM x",
-            "show tables",
-            "select 1;",
-            "",
+        # introspection funcs); on the NON-func corpus they must agree. The
+        # constants parse straight out of the Rust operator-control port and
+        # the corpus verdicts are FROZEN (verified equal to the retired Python
+        # gate before freezing; the Rust port pins the same table inline).
+        prefixes, banned = _rust_gate_lists()
+        self.assertEqual(handler._SQL_ALLOWED_PREFIXES, prefixes)
+        self.assertEqual(handler._SQL_BANNED, banned)
+        for q, expected in (
+            ("select 1; drop table ticks", False),
+            ("select 1 -- x", False),
+            ("select /* x */ 1", False),
+            ("backup table ticks", False),
+            ("select backup from t", False),
+            ("WITH x AS (SELECT 1) SELECT * FROM x", True),
+            ("show tables", True),
+            ("select 1;", True),
+            ("", False),
         ):
-            self.assertEqual(handler._is_safe_sql(q), opctl._is_safe_sql(q), q)
+            self.assertEqual(handler._is_safe_sql(q), expected, q)
 
     def test_introspection_funcs_allowed_and_rechecked(self) -> None:
         # FIX 3: the console's bare introspection funcs pass; unknown funcs +

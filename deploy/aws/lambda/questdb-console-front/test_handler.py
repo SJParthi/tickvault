@@ -1,7 +1,7 @@
 """Unit tests for the questdb-console-front Lambda (B4) — pure functions only.
 
 Runs without AWS credentials or boto3 (all clients are lazy). Covers:
-  * SQL-gate PARITY with operator-control/_is_safe_sql (the contract) over an
+  * SQL-gate PARITY with the Rust operator-control port (the contract) over an
     adversarial corpus — smuggling, chaining, comments, banned mutators.
   * Auth: link token / session cookie / Bearer / login POST — expired, forged,
     garbage, missing; constant-time compare asserted via source inspection.
@@ -16,10 +16,10 @@ Run with:  python3 -m unittest test_handler
 from __future__ import annotations
 
 import base64
-import importlib.util
 import inspect
 import json
 import os
+import re
 import sys
 import time
 import unittest
@@ -35,52 +35,71 @@ import handler  # noqa: E402
 SECRET = "test-device-key-0123456789"
 
 
-def _load_opctl():
-    """Load the operator-control handler by path (module-name-clash safe) so
-    parity with ITS _is_safe_sql can be asserted explicitly."""
-    p = Path(__file__).resolve().parent.parent / "operator-control" / "handler.py"
-    spec = importlib.util.spec_from_file_location("opctl_handler_for_parity", p)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# The Python operator-control lambda was retired in the rust-only phase 2b-3
+# port — crates/aws-lambdas/src/operator_control.rs is now the parity anchor.
+# Its SQL-gate constant arrays are parsed straight out of the Rust source
+# (fail-LOUD: a missing file or an empty parse aborts the test — never a
+# vacuous pass). Gate BEHAVIOUR is pinned via the frozen truth table below,
+# which the Rust port's inline SafeSql tests pin identically (the table was
+# verified equal to the retired Python operator-control gate before freezing).
+_RUST_OPCTL = (
+    Path(__file__).resolve().parents[4] / "crates" / "aws-lambdas" / "src" / "operator_control.rs"
+)
 
 
-# The adversarial corpus. Every entry is run through BOTH gates; behaviour
-# must be IDENTICAL (parity is the contract — copying without a ratchet rots).
+def _rust_gate_lists() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    src = _RUST_OPCTL.read_text(encoding="utf-8")
+
+    def arr(name: str) -> tuple[str, ...]:
+        m = re.search(rf"const {name}: \[&str; \d+\] = \[(.*?)\];", src, re.S)
+        if m is None:
+            raise AssertionError(f"{name} not found in {_RUST_OPCTL} — parity anchor lost")
+        vals = tuple(re.findall(r'"([^"]+)"', m.group(1)))
+        if not vals:
+            raise AssertionError(f"{name} parsed empty from {_RUST_OPCTL} — parser drifted")
+        return vals
+
+    return arr("SQL_ALLOWED_PREFIXES"), arr("SQL_BANNED")
+
+
+# The adversarial corpus with its FROZEN verdicts (the shared-gate truth
+# table). Drift in the console gate fails HERE; drift in the Rust gate fails
+# its own inline SafeSql tests; list drift fails the parse-parity test below.
 _SQL_CORPUS = [
     # multi-statement / chaining
-    "select 1; drop table ticks",
-    "select 1;;",
-    "select 1 ; select 2",
-    "select 1;",  # single trailing ';' is OK
-    "select 1 ;",
+    ("select 1; drop table ticks", False),
+    ("select 1;;", False),
+    ("select 1 ; select 2", False),
+    ("select 1;", True),  # single trailing ';' is OK
+    ("select 1 ;", True),
     # comments
-    "select 1 -- drop table ticks",
-    "select /* drop */ 1",
-    "--select 1",
+    ("select 1 -- drop table ticks", False),
+    ("select /* drop */ 1", False),
+    ("--select 1", False),
     # first-word gate
-    "selector 1",
-    "explainx select 1",
-    "(select 1)",
-    "insert into t values(1)",
+    ("selector 1", False),
+    ("explainx select 1", False),
+    ("(select 1)", False),
+    ("insert into t values(1)", False),
     # banned words embedded, any case/position
-    "select * from t where x = 'UPDATE'",
-    "SELECT INSERT",
-    "with x as (delete from t) select 1",
-    "select 1 union all select 2",  # allowed — no mutator
-    "WITH x AS (SELECT 1) SELECT * FROM x",
+    ("select * from t where x = 'UPDATE'", False),
+    ("SELECT INSERT", False),
+    ("with x as (delete from t) select 1", False),
+    ("select 1 union all select 2", True),  # allowed — no mutator
+    ("WITH x AS (SELECT 1) SELECT * FROM x", True),
     # leading whitespace / newlines / tabs / uppercase
-    "  \n\t SELECT 1",
-    "\nshow tables",
-    "explain select * from ticks",
+    ("  \n\t SELECT 1", True),
+    ("\nshow tables", True),
+    ("explain select * from ticks", True),
     # empty / whitespace-only
-    "",
-    "   ",
-    ";",
+    ("", False),
+    ("   ", False),
+    (";", False),
 ]
-# banned keywords exercised individually (mirrored _SQL_BANNED tuple)
-_SQL_CORPUS += [f"select {kw} from t" for kw in handler._SQL_BANNED]
-_SQL_CORPUS += [f"select * from t where a = {kw.upper()}" for kw in handler._SQL_BANNED]
+# banned keywords exercised individually (mirrored _SQL_BANNED tuple) — a
+# banned word anywhere is a reject by construction, both gates.
+_SQL_CORPUS += [(f"select {kw} from t", False) for kw in handler._SQL_BANNED]
+_SQL_CORPUS += [(f"select * from t where a = {kw.upper()}", False) for kw in handler._SQL_BANNED]
 
 
 def _event(
@@ -134,30 +153,35 @@ class WithSecret(unittest.TestCase):
 
 class SqlGateParity(unittest.TestCase):
     def test_sql_gate_parity_with_operator_control(self) -> None:
-        opctl = _load_opctl()
-        # The mirrored constants must be IDENTICAL tuples.
-        self.assertEqual(handler._SQL_ALLOWED_PREFIXES, opctl._SQL_ALLOWED_PREFIXES)
-        self.assertEqual(handler._SQL_BANNED, opctl._SQL_BANNED)
-        for q in _SQL_CORPUS:
+        prefixes, banned = _rust_gate_lists()
+        # The mirrored constants must be IDENTICAL to the Rust port's arrays.
+        self.assertEqual(handler._SQL_ALLOWED_PREFIXES, prefixes)
+        self.assertEqual(handler._SQL_BANNED, banned)
+        for q, expected in _SQL_CORPUS:
             self.assertEqual(
                 handler._is_safe_sql(q),
-                opctl._is_safe_sql(q),
+                expected,
                 f"gate parity broken for query: {q!r}",
             )
 
     def test_cap_sql_rows_parity_with_operator_control(self) -> None:
-        opctl = _load_opctl()
-        for q in (
-            "select * from ticks",
-            "select * from ticks LIMIT 5000",
-            "select * from ticks limit 10",
-            "select * from ticks limit 0,5000",
-            "select * from ticks limit -5",
-            "show tables",
-            "explain select 1",
-            "with x as (select 1) select * from x;",
+        # FROZEN expected outputs (verified equal to the retired Python
+        # operator-control _cap_sql_rows before freezing; the Rust port's
+        # cap_sql_rows inline tests pin the same behaviour).
+        for q, expected in (
+            ("select * from ticks", "select * from ticks LIMIT 1000"),
+            ("select * from ticks LIMIT 5000", "select * from ticks LIMIT 1000"),
+            ("select * from ticks limit 10", "select * from ticks limit 10"),
+            ("select * from ticks limit 0,5000", "select * from ticks limit 0,5000"),
+            ("select * from ticks limit -5", "select * from ticks limit -5"),
+            ("show tables", "show tables"),
+            ("explain select 1", "explain select 1"),
+            (
+                "with x as (select 1) select * from x;",
+                "with x as (select 1) select * from x LIMIT 1000",
+            ),
         ):
-            self.assertEqual(handler._cap_sql_rows(q), opctl._cap_sql_rows(q), q)
+            self.assertEqual(handler._cap_sql_rows(q), expected, q)
 
     def test_multi_statement_rejected(self) -> None:
         self.assertFalse(handler._is_safe_sql("select 1; drop table ticks"))
@@ -184,10 +208,9 @@ class SqlGateParity(unittest.TestCase):
         self.assertTrue(handler._is_safe_sql("  \n\t SELECT 1"))
 
     def test_parenthesised_select_rejected_like_operator_control(self) -> None:
-        # The first-word split sees a leading non-letter → "" → reject. This
-        # matches operator-control exactly (fail-closed parity).
-        opctl = _load_opctl()
-        self.assertEqual(handler._is_safe_sql("(select 1)"), opctl._is_safe_sql("(select 1)"))
+        # The first-word split sees a leading non-letter → "" → reject. The
+        # Rust port's first_word does the same (pinned in its inline SafeSql
+        # tests) — fail-closed parity.
         self.assertFalse(handler._is_safe_sql("(select 1)"))
 
 
@@ -228,7 +251,9 @@ class SqlIntrospectionSuperset(unittest.TestCase):
         back = _u.module_from_spec(spec)
         spec.loader.exec_module(back)
         self.assertEqual(handler._SQL_ALLOWED_FUNCS, back._SQL_ALLOWED_FUNCS)
-        corpus = list(_SQL_CORPUS) + [f"{fn}()" for fn in handler._SQL_ALLOWED_FUNCS] + [
+        corpus = [q for q, _expected in _SQL_CORPUS] + [
+            f"{fn}()" for fn in handler._SQL_ALLOWED_FUNCS
+        ] + [
             "columns('ticks')", "tables(); drop table ticks", "evil_func()", "tables() delete",
         ]
         for q in corpus:
