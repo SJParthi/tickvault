@@ -215,7 +215,7 @@ jobs:
       # cargo-lambda install is absorbed by the adjacent actions/cache step
       # (tag-pinned @v4, this workflow's house action-pinning style).
       - name: Cache cargo-lambda
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-lambda
           key: cargo-lambda-1.9.1-${{ runner.os }}-${{ runner.arch }}
@@ -390,7 +390,7 @@ jobs:
       # (2026-07-18 hostile-review r1 F1 fix — full rationale on the plan
       # job's twin step; KEEP the two Cache/Build steps textually identical).
       - name: Cache cargo-lambda
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-lambda
           key: cargo-lambda-1.9.1-${{ runner.os }}-${{ runner.arch }}
