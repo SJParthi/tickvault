@@ -36,7 +36,10 @@ pub struct StatsResponse {
     pub underlyings: u64,
     pub derivatives: u64,
     pub subscribed_indices: u64,
-    pub ticks: u64,
+    // `ticks` count RETIRED 2026-07-19 (BATCH-5): the `ticks` writer was
+    // deleted 2026-07-17, so this lifetime count no longer grows and would
+    // report a permanently-stale "ticks captured" number (false-OK). Retired
+    // rather than repointed at another table.
 }
 
 /// `GET /api/stats` — fetch QuestDB counts in one call.
@@ -114,9 +117,7 @@ pub(crate) async fn compute_stats(state: &SharedAppState) -> StatsResponse {
         )
         .await
         .unwrap_or(0),
-        ticks: query_count(&client, &base_url, "SELECT count() FROM ticks")
-            .await
-            .unwrap_or(0),
+        // `ticks` count retired 2026-07-19 (BATCH-5) — no ticks query issued.
     }
 }
 
@@ -167,7 +168,6 @@ mod tests {
             underlyings: 214,
             derivatives: 96948,
             subscribed_indices: 31,
-            ticks: 0,
         };
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"tables\":5"));
@@ -226,7 +226,6 @@ mod tests {
         assert_eq!(result.underlyings, 0);
         assert_eq!(result.derivatives, 0);
         assert_eq!(result.subscribed_indices, 0);
-        assert_eq!(result.ticks, 0);
     }
 
     #[test]
@@ -237,7 +236,6 @@ mod tests {
             underlyings: 0,
             derivatives: 0,
             subscribed_indices: 0,
-            ticks: 0,
         };
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"questdb_reachable\":false"));
@@ -505,7 +503,6 @@ mod tests {
             underlyings: 100,
             derivatives: 5000,
             subscribed_indices: 10,
-            ticks: 999999,
         };
         let debug = format!("{stats:?}");
         assert!(debug.contains("StatsResponse"));
@@ -690,7 +687,6 @@ mod tests {
             underlyings: 0,
             derivatives: 0,
             subscribed_indices: 0,
-            ticks: 0,
         };
         assert!(!err_response.questdb_reachable);
         assert_eq!(err_response.tables, 0);
@@ -719,13 +715,11 @@ mod tests {
             underlyings: 0,
             derivatives: 0,
             subscribed_indices: 0,
-            ticks: 0,
         };
         assert!(!resp.questdb_reachable);
         assert_eq!(resp.tables, 0);
         assert_eq!(resp.underlyings, 0);
         assert_eq!(resp.derivatives, 0);
         assert_eq!(resp.subscribed_indices, 0);
-        assert_eq!(resp.ticks, 0);
     }
 }

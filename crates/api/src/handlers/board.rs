@@ -56,10 +56,13 @@ pub struct BoardStatus {
 pub struct BoardDb {
     /// True when QuestDB answered the probe this poll.
     pub reachable: bool,
-    /// Ticks persisted since IST midnight; `null` on query failure.
-    pub ticks_today: Option<u64>,
     /// 1m candles sealed since IST midnight; `null` on query failure.
     pub candles_1m_today: Option<u64>,
+    // `ticks_today` tile RETIRED 2026-07-19 (BATCH-5): the `ticks` writer was
+    // deleted 2026-07-17 (dead live-WS sweep), so `ticks` receives no new
+    // rows — the count would be a permanently-stale/zero "live ticks captured
+    // today" number, i.e. a false-OK. Retired rather than repointed at another
+    // table (repointing a "ticks" label at candles would be a different lie).
 }
 
 /// The full `GET /api/board/data` payload.
@@ -134,11 +137,11 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
     let client = super::stats::build_stats_client(QUESTDB_BOARD_TIMEOUT_SECS);
     let midnight = ist_today_midnight_literal();
-    let ticks_sql = format!("SELECT count() FROM ticks WHERE ts >= '{midnight}'");
+    // `ticks_today` tile retired 2026-07-19 (BATCH-5) — the ticks writer is
+    // gone, so no ticks query is issued anymore.
     let candles_sql = format!("SELECT count() FROM candles_1m WHERE ts >= '{midnight}'");
-    let (probe, ticks_today, candles_1m_today) = tokio::join!(
+    let (probe, candles_1m_today) = tokio::join!(
         super::stats::query_count(&client, &base_url, "SHOW TABLES"),
-        super::stats::query_count(&client, &base_url, &ticks_sql),
         super::stats::query_count(&client, &base_url, &candles_sql),
     );
 
@@ -152,7 +155,6 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
         feeds,
         db: BoardDb {
             reachable: probe.is_some(),
-            ticks_today,
             candles_1m_today,
         },
     }
@@ -356,7 +358,6 @@ mod tests {
         assert!(resp.status.uptime_secs.is_none(), "boot epoch 0 → null");
         assert!(!resp.status.build_sha_short.is_empty());
         assert!(!resp.db.reachable, "QuestDB down → reachable=false");
-        assert!(resp.db.ticks_today.is_none());
         assert!(resp.db.candles_1m_today.is_none());
         // Feeds section still present (one row per feed, from the registry).
         assert_eq!(
@@ -367,7 +368,10 @@ mod tests {
         // JSON shape: nulls serialize as null, not as a panic or a fake 0.
         // (connections/race fields removed 2026-07-17 — dashboard tidy.)
         let json = serde_json::to_value(&resp).expect("serializes");
-        assert!(json["db"]["ticks_today"].is_null());
+        assert!(
+            json["db"].get("ticks_today").is_none(),
+            "retired ticks_today tile absent (BATCH-5 2026-07-19)"
+        );
         assert!(json.get("race").is_none(), "retired race field absent");
         assert!(
             json.get("connections").is_none(),
