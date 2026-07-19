@@ -2031,6 +2031,7 @@ impl ErrorCode {
             }
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded => ".claude/rules/project/ram-store-error-codes.md",
+            Self::OrderPnl01PersistFailed => ".claude/rules/project/order-leg-pnl-error-codes.md",
             Self::OrderEvt01PersistFailed => {
                 ".claude/rules/project/order-update-events-error-codes.md"
             }
@@ -3263,6 +3264,7 @@ mod tests {
                 || s.starts_with("ORDER-READY-")
                 // Full-fidelity order/position push-event capture (2026-07-18).
                 || s.starts_with("ORDER-EVT-")
+                || s.starts_with("ORDER-PNL-")
                 // Wave 1 (PR #393): hot-path / phase2 / prev-close / movers prefixes
                 || s.starts_with("HOT-PATH-")
                 || s.starts_with("PHASE2-")
