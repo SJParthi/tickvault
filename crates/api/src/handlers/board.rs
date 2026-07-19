@@ -18,7 +18,7 @@
 //!   (`tickvault_common::build_info`), trading-session flag, `/proc` RSS.
 //! - feeds: the existing [`super::feeds::get_feeds_health`] response, reused
 //!   verbatim (no forked verdict logic).
-//! - db: today's ticks + sealed 1m candles via QuestDB HTTP `/exec` with a
+//! - db: sealed 1m candles via QuestDB HTTP `/exec` with a
 //!   bounded timeout (reuses `super::stats::query_count`).
 //!
 //! (The `connections` + `race` sections were removed 2026-07-17 — dashboard
