@@ -19,7 +19,7 @@
 //! ```text
 //! tv_subsystem_memory_estimated_bytes{component="rescue_ring"}   228000000
 //! tv_subsystem_memory_estimated_bytes{component="bar_storage"}  1287000000  # alert!
-//! tv_subsystem_memory_estimated_bytes{component="tick_storage"}  854000000
+//! tv_subsystem_memory_estimated_bytes{component="registry"}       12000000
 //! ```
 //!
 //! at a glance, with the alert pointing at the offending component.
@@ -124,8 +124,9 @@ impl SubsystemMemoryHandles {
             eviction_counters.insert(tf, handle);
         }
 
-        // L124 + L18 (revised): 7 component gauges, all NaN at boot.
-        // Sampler overwrites only when a source is registered.
+        // L124 + L18 (revised): 6 component gauges, all NaN at boot
+        // (the sourceless `tick_storage` label was retired 2026-07-19,
+        // BATCH-5). Sampler overwrites only when a source is registered.
         let mut component_gauges = HashMap::with_capacity(ALLOWED_SUBSYSTEM_COMPONENTS.len());
         for &component in ALLOWED_SUBSYSTEM_COMPONENTS {
             let handle: Gauge = gauge!(SUBSYSTEM_MEMORY_GAUGE_NAME, "component" => component);
@@ -206,8 +207,8 @@ impl SubsystemMemoryHandles {
 pub type SourceFn = Box<dyn Fn() -> Option<f64> + Send + Sync>;
 
 /// A registry of "compute the current memory footprint of component X"
-/// closures. Closures are registered by downstream PRs (e.g. #504d
-/// wires `tick_storage` from the `papaya` map's `len() × size_of`).
+/// closures. Closures are registered by downstream PRs (e.g. wiring
+/// `bar_storage` from a candle store's `len() × size_of`).
 ///
 /// The sampler task evaluates every registered source on each tick.
 /// Components that never get a source registered keep their gauge at
@@ -475,9 +476,9 @@ mod tests {
     }
 
     #[test]
-    fn handles_register_initializes_all_seven_components() {
+    fn handles_register_initializes_all_six_components() {
         let h = SubsystemMemoryHandles::register();
-        assert_eq!(h.component_gauges.len(), 7, "L18 pins 7 components");
+        assert_eq!(h.component_gauges.len(), 6, "L18 pins 6 components");
         for &c in ALLOWED_SUBSYSTEM_COMPONENTS {
             assert!(
                 h.component_gauges.contains_key(c),
