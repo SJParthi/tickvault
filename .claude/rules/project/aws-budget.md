@@ -17,6 +17,8 @@ paths:
 >
 > **⚠ RE-SUPERSEDED → t4g.medium 2026-07-15 (operator Quote 8 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance DOWNSIZED r8g.large → **t4g.medium** (Graviton2, 2 vCPU / 4 GiB), QuestDB QDB_MEM_LIMIT 4g → 1g. INTERIM bill → ~₹1,471/mo incl GST at 270 hrs with the live 50 GB root (gp3 cannot shrink; the 20 GB fresh-volume recreate — an executor pre-stage, NOT operator-quoted — drops it to ~₹1,197/mo; ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the post-recreate 20 GB volume — on the live 50 GB root the ~176-hr figure is ~₹1,260, and ~₹986 is never the 270-hr one). EIP kept. The current effective instance lock lives in that file's §7. This file's original t4g.medium tables below remain 2026-05-18 historical audit (different universe/stack — do not reuse the ₹1,022 figure).
 >
+> **⚠ LIVE-VOLUME CORRECTION 2026-07-19:** the banner above's "live 50 GB root" premise was factually WRONG — `aws ec2 describe-volumes vol-073ccaa417a0f344b` (run live 2026-07-19 via the coordinator session) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use**, attached to `i-0b956d0209231a48b` at `/dev/xvda` since 2026-05-24. The 2026-07-13 approved 30→50 GB grow (COST NOTE below) was RECORDED but **never physically applied**. Corrected interim bill: EBS $0.0912 × 30 = $2.74; subtotal $6.05 + $3.60 + $2.74 + $0.18 + $0.28 = $12.85 → ₹1,092 → ×1.18 GST = **~₹1,289/mo** at 270 hrs (was stated ~₹1,471/mo; the ~176-hr figure is ~₹1,077, was stated ~₹1,260). Post-recreate figures unchanged (~₹1,197 / ~₹986 — they assumed 20 GB). **FLAGGED FOLLOW-UP:** the disk-pressure remediation the grow was approved for is UNAPPLIED — the 82%-disk-pressure risk may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note. Full arithmetic + authority: `daily-universe-scope-expansion-2026-05-27.md` §7 (2026-07-19 correction note) + §0 (2026-07-19 approvals bullet).
+>
 > **Authority:** Parthiban (architect). Non-negotiable.
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
@@ -257,6 +259,19 @@ effective contract lives in `daily-universe-scope-expansion-2026-05-27.md` §7
 (Mechanical Rule 3); the live grow is `scripts/aws-upgrade-instance.sh
 --ebs-size 50` (online) — terraform's `ebs_gp3_size_gb=50` documents
 fresh-provision intent only (`volume_size` is in `lifecycle.ignore_changes`).
+
+**2026-07-19 correction — THIS GROW NEVER PHYSICALLY APPLIED:** live
+`describe-volumes` (2026-07-19, coordinator session) shows the root volume
+still **30 GiB gp3** — the approved `--ebs-size 50` command above was never
+actually run against the box, so the +~₹170/mo EBS delta never materialized
+and the pressure-relief backstop this note approved is **NOT in place**.
+LOUD FLAGGED FOLLOW-UP: the 2026-07-13 disk-pressure class (root fs 82%,
+~2.5–3.6 GB/trading-day growth) may recur on the 30 GB root — executing the
+approved grow (or formally accepting 30 GB now that the Dhan WS lane +
+Groww live feed retired and reduced the write load) is an operator/infra
+decision, deliberately NOT taken in the 2026-07-19 docs-only correction PR.
+See the header banner correction + `daily-universe-scope-expansion-2026-05-27.md`
+§7 for the corrected bill (~₹1,289/mo interim).
 
 ## COST NOTE 2026-07-14 — Order-side observability, cluster C (+~$0.60/mo now, ~$1.20/mo ceiling at Phase-1)
 
