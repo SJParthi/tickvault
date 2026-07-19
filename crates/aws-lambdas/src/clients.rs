@@ -36,3 +36,7 @@ pub fn ssm(config: &SdkConfig) -> aws_sdk_ssm::Client {
 pub fn cloudwatch(config: &SdkConfig) -> aws_sdk_cloudwatch::Client {
     aws_sdk_cloudwatch::Client::new(config)
 }
+
+pub fn eventbridge(config: &SdkConfig) -> aws_sdk_eventbridge::Client {
+    aws_sdk_eventbridge::Client::new(config)
+}

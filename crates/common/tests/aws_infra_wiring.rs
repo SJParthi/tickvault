@@ -934,9 +934,16 @@ fn test_start_watchdog_lambda_monitors_the_morning_start() {
     // pages if the box did not come up. Runs IN AWS (not on a GitHub runner),
     // so it alerts even if GitHub Actions is down — the gap that hid the
     // 2026-06-02 silent start failure.
+    // Rust-only phase 2b-2 wave 2 (2026-07-18): the python handler.py was
+    // ported to crates/aws-lambdas (lib start_watchdog.rs + thin bin) and
+    // deleted with the terraform runtime swap to provided.al2023/bootstrap.
     require_file_exists(
-        "deploy/aws/lambda/start-watchdog/handler.py",
-        "start-watchdog Lambda handler (ping + check)",
+        "crates/aws-lambdas/src/start_watchdog.rs",
+        "start-watchdog Lambda handler (Rust port — ping + check)",
+    );
+    require_file_exists(
+        "crates/aws-lambdas/src/bin/start_watchdog.rs",
+        "start-watchdog Lambda thin bootstrap bin",
     );
     require_file_exists(
         "deploy/aws/terraform/start-watchdog-lambda.tf",
@@ -960,12 +967,17 @@ fn test_start_watchdog_lambda_monitors_the_morning_start() {
         tf.contains("ec2:DescribeInstances") && tf.contains("aws_sns_topic.tv_alerts.arn"),
         "watchdog Lambda must describe EC2 + publish to tv_alerts"
     );
-    let py = std::fs::read_to_string(
-        workspace_root().join("deploy/aws/lambda/start-watchdog/handler.py"),
-    )
-    .expect("handler.py must be readable"); // APPROVED: test
+    // The Rust runtime swap must be complete (no python remnant).
     assert!(
-        py.contains("describe_instances") && py.contains("\"running\""),
+        tf.contains("runtime          = \"provided.al2023\"")
+            && tf.contains("handler          = \"bootstrap\""),
+        "start-watchdog-lambda.tf must run the Rust bootstrap bin (rust-only phase 2b-2)"
+    );
+    let rs =
+        std::fs::read_to_string(workspace_root().join("crates/aws-lambdas/src/start_watchdog.rs"))
+            .expect("start_watchdog.rs must be readable"); // APPROVED: test
+    assert!(
+        rs.contains("describe_instances") && rs.contains("\"running\""),
         "handler must check the instance is running"
     );
 }
