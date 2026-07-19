@@ -27,13 +27,13 @@
 | Gate | Where | What it enforces |
 |---|---|---|
 | Phase-3 rust-only ratchet | `crates/common/tests/rust_only_guard.rs` | A **shrinking allowlist** of the last non-Rust executable files — the allowlist may only SHRINK, never GROW. A new non-Rust executable fails the build. |
-| Banned-pattern scanner | `.claude/hooks/banned-pattern-scanner.sh` | Blocks hot-path allocation / non-Rust runtime intrusions at commit. |
+| Banned-pattern scanner | `.claude/hooks/banned-pattern-scanner.sh` | Blocks banned patterns (hot-path allocation, etc.) in Rust source at commit; a non-Rust executable added under a non-`.py` name is a residual caught in review (§3), not by this scanner. |
 | Hot-path discipline | `.claude/rules/project/hot-path.md` | Zero allocation, O(1) constraints, banned hot-path patterns. |
 | Exact-version pinning | root `Cargo.toml` workspace deps | `^`/`~`/`*`/`>=` BANNED; `cargo update` BANNED; ONLY exact pins. |
 
 This file is the governance lock; the mechanical teeth are the guard test + scanners that ride the SAME PR — they land together so the rule and its enforcement can never drift apart.
 
-**Honest envelope:** this file cannot, by itself, stop a non-Rust executable from landing — it is the recorded operator intent. The build-failing power lives entirely in the `rust_only_guard.rs` shrinking allowlist and the banned-pattern scanner. If a future PR both adds a non-Rust executable AND grows the allowlist to permit it, only a reviewer honoring §3 catches it — which is why the guard test's shrink-only property (a merged allowlist entry can never be re-added once removed) is the real ratchet, and this file names it so no session forgets where the teeth are.
+**Honest envelope:** this file cannot, by itself, stop a non-Rust executable from landing — it is the recorded operator intent. The build-failing power lives entirely in the `rust_only_guard.rs` shrinking allowlist and the banned-pattern scanner. If a future PR both adds a non-Rust executable AND grows the allowlist to permit it, only a reviewer honoring §3 catches it: the shrinking allowlist mechanically fails the build on any new tracked Python file that is not already listed, and drops entries as their files are removed — so the automated floor only ever ratchets DOWN; re-growing the allowlist (adding a Python file together with its own allowlist entry) is not mechanically blocked and is caught in review by the §3 reject list, and this file names where the teeth are so no session forgets.
 
 ---
 
