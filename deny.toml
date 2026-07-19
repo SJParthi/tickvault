@@ -169,4 +169,15 @@ allow-registry = [
     "https://github.com/rust-lang/crates.io-index",
     "sparse+https://index.crates.io/",
 ]
-allow-git = []
+allow-git = ["https://github.com/SJParthi/bruteX"]
+
+# bruteX trading-core (pinned git dev-dep): proprietary license scoped to this ONE
+# crate — the global [licenses] allow list stays untouched.
+[[licenses.clarify]]
+crate = "trading-core"
+expression = "LicenseRef-Proprietary"
+license-files = []
+
+[[licenses.exceptions]]
+crate = "trading-core"
+allow = ["LicenseRef-Proprietary"]
