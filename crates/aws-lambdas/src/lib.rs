@@ -34,6 +34,8 @@ pub mod hard_stop_guard;
 pub mod logging;
 pub mod market_hours_gate;
 pub mod market_open_readiness;
+pub mod qdb_console_front;
+pub mod qdb_console_proxy;
 pub mod start_watchdog;
 pub mod telegram_webhook;
 pub mod time;

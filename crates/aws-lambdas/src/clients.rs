@@ -37,6 +37,12 @@ pub fn cloudwatch(config: &SdkConfig) -> aws_sdk_cloudwatch::Client {
     aws_sdk_cloudwatch::Client::new(config)
 }
 
+/// Lambda invoke client — the console FRONT's only AWS call surface
+/// (Python parity: `boto3.client("lambda")` invoking the back relay).
+pub fn lambda(config: &SdkConfig) -> aws_sdk_lambda::Client {
+    aws_sdk_lambda::Client::new(config)
+}
+
 pub fn eventbridge(config: &SdkConfig) -> aws_sdk_eventbridge::Client {
     aws_sdk_eventbridge::Client::new(config)
 }

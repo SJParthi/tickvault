@@ -185,6 +185,17 @@ aws-sdk-s3 = { version = "=1.138.0", default-features = false, features = ["beha
 aws-sdk-ec2 = { version = "=1.238.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-cloudwatch = { version = "=1.119.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-costexplorer = { version = "=1.121.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# 2026-07-18 (rust-only phase 2b-3): the questdb-console FRONT Lambda invokes
+# the back relay via the Lambda Invoke API (Python parity:
+# boto3.client("lambda").invoke). Sparse-index-verified 2026-07-18: 1.135.0
+# is the NEWEST aws-sdk-lambda release AND its aws-smithy-* requirements
+# (types ^1.6.1 / runtime ^1.12.0 / runtime-api ^1.13.0 / json ^0.63.0 /
+# http ^0.64.0 / schema ^0.2.0 / observability ^0.3.0 + aws-runtime ^1.8.1 /
+# eventstream ^0.61.1) match the Cargo.lock aws family EXACTLY (1.132.0
+# through 1.135.0 all do — the "deliberately not the newest" caveat on the
+# ec2/cloudwatch pins above does not apply here). Same `=` deviation + same
+# feature shape as the sibling SDK pins.
+aws-sdk-lambda = { version = "=1.135.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # rust-only phase 2b-2 wave 2 (2026-07-18): hard-stop-guard needs
 # events:DisableRule. 1.110.0 is the eventbridge release whose aws-smithy-*
 # requirements (runtime ^1.12.0 / runtime-api ^1.13.0 / types ^1.6.1) match
@@ -212,6 +223,20 @@ flate2 = "1.1.9"
 # this promotes it to a direct pin — the aws-lc-rs / flate2 promotion
 # precedent above. Flagged in the PR body for operator visibility.
 regex = "1.12.3"
+
+# ---- Section 11d: QuestDB-console Lambda pair (rust-only phase 2b-3) ----
+# 2026-07-18: the qdb-console-proxy / qdb-console-front handler.py ports
+# need base64 body envelopes (Python `base64.b64encode`), percent-decoding
+# for the traversal gate (Python `urllib.parse.unquote`), and urlencoded
+# query parsing (Python `urllib.parse.parse_qs`). NONE is a new
+# supply-chain root — all three were ALREADY resolved in Cargo.lock
+# (base64 0.22.1 via the aws smithy family, percent-encoding 2.3.2 +
+# form_urlencoded 1.2.2 via url/reqwest); this promotes them to direct
+# pins — the aws-lc-rs / flate2 / regex promotion precedent above.
+# Flagged in the PR body for operator visibility.
+base64 = "0.22.1"
+percent-encoding = "2.3.2"
+form_urlencoded = "1.2.2"
 
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }
