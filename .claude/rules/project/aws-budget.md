@@ -62,11 +62,11 @@ Recorded bases (daily-universe §7, 2026-07-19-corrected — Verified arithmetic
 | # | Lever | Δ per month | Status |
 |---|---|---|---|
 | 1 | Delete rollback snapshot `snap-090ed9c4f3df0ca61` AFTER 2026-07-22 (its ~1-week rollback window ends Mon 2026-07-22) | −~₹125 (Assumed magnitude) | **SANCTIONED — schedule only, do NOT delete before 2026-07-22.** No auto-delete exists: the operator (or a dated follow-up session after Monday 2026-07-22) runs `aws ec2 delete-snapshot --snapshot-id snap-090ed9c4f3df0ca61` and records a dated note here. |
-| 2 | Release the Elastic IP | −$3.60 → −₹306 pre-GST → **−~₹361 incl GST** | **FLAGGED, OPERATOR-GATED — do NOT act.** The EIP is rule-locked (daily-universe §7: without it the box has NO public IP after any stop/start → unreachable by SSM, and the Dhan static-IP mandate breaks). Releasing it means re-architecting box access (e.g. SSM-over-VPC-endpoint costs MORE than the EIP; a fresh ephemeral IP per start breaks the Dhan static-IP whitelist). Operator decision line: release EIP yes/no — requires its own dated quote editing §7 first. |
+| 2 | Release the Elastic IP | −$3.60 → −₹306 pre-GST → **−~₹361 incl GST** | ~~**FLAGGED, OPERATOR-GATED — do NOT act.**~~ **2026-07-19 SECOND RULING (same day): release APPROVED for the no-real-orders period — but VERIFIED-UNSAFE-STANDALONE** (live describe evidence, coordinator session, 2026-07-19: the running instance's ENI eni-01fdeec2412f55587 has the ephemeral-public-IP attribute OFF — a launch-time ENI attribute AWS cannot enable post-launch — so releasing today = NO public IPv4 on the next stop/start = no SSM/feeds/deploys; the daily-universe §7 empirical claim CONFIRMED). Execution is therefore **BUNDLED with Lever 5** (the erase-window recreate — a FRESH launch in subnet subnet-00c8d06903d1482ea inherits `MapPublicIpOnLaunch=true` and gets an ephemeral public IP every start). Runbook: `docs/runbooks/eip-release.md` (verify-first order: recreate → prove ephemeral IP → release). Historical context of the old "do NOT act" status retained above via strikethrough — never deleted. |
 | 3 | Trim the dated COST-NOTE alarm spend (menu below) | up to −~₹271 (recorded ceiling; live residual likely lower) | **FLAGGED, RULE-FILE-GOVERNED — change nothing here.** Each group landed under its own dated note; each trim needs its own dated retirement note. |
 | 4a | SNS → SMS off (the bill table marks it optional) | −$0.28 → **−~₹28 incl GST** | Operator menu item — Telegram + Email fan-out remain (both free-tier). |
 | 4b | S3 cold trim | −≤$0.18 → −≤₹18 | Effectively NOT a lever: SEBI 5y retention rules the archive; the line only grows. No real finding beyond the recorded $0.18. |
-| 5 | 20 GB fresh-volume recreate (pre-staged 2026-07-15 executor decision; EBS $2.74 → $1.82) | −$0.92 → **−~₹92 incl GST** | **OPERATOR-GATED** (terminate-and-recreate in the erase window). NOTE: this ruling accepts **30 GB** as the live size; the 20 GB pre-stage remains a separate, un-quoted executor option — going below 30 needs its own operator go. |
+| 5 | 20 GB fresh-volume recreate (pre-staged 2026-07-15 executor decision; EBS $2.74 → $1.82) | −$0.92 → **−~₹92 incl GST** | **OPERATOR-GATED** (terminate-and-recreate in the erase window). NOTE: this ruling accepts **30 GB** as the live size; the 20 GB pre-stage remains a separate, un-quoted executor option — going below 30 needs its own operator go. **2026-07-19 SECOND RULING: the recreate is now the DELIVERY VEHICLE for Lever 2** — a fresh launch is the ONLY way this box gets ephemeral public IPs (the live ENI's launch-time attribute is off, verified 2026-07-19), so the EIP release and the 20 GB volume land together in ONE erase window (−₹361 − ₹92 in one action; runbook `docs/runbooks/eip-release.md`). |
 
 **Lever-3 menu — the dated alarm groups (from the COST NOTES in this file):**
 
@@ -98,6 +98,68 @@ groups to retire; (iii) SMS off yes/no; (iv) 20 GB recreate go/no-go.
 credentials (verified 2026-07-18: `UnrecognizedClientException`); the live
 per-service split is the operator's daily budget digest / Cost Explorer
 console. All ₹ figures above are the recorded list-rate arithmetic.
+
+### OPERATOR RULING 2026-07-19 (SECOND, same day) — EIP release APPROVED for the no-real-orders period (verify-first, bundled with the recreate)
+
+**The verbatim operator demand (2026-07-19 — preserve EXACTLY, typos included):**
+
+> "until or unless we flip the real orders static ip is not needed due okay?"
+
+**Meaning:** the Elastic IP is NOT needed until real orders flip on — its
+release is APPROVED for the no-real-orders period, with the operator's
+explicit safety order: **VERIFY outbound-without-EIP FIRST, release SECOND.**
+This is the dated quote the Lever-2 row's old status ("requires its own dated
+quote editing §7 first") demanded — daily-universe §7 carries the twin note
+(Quote 10) in the same PR.
+
+**Live verification verdict (live describe evidence, coordinator session,
+2026-07-19 — supersedes tree-side prediction):**
+
+| Fact | Evidence |
+|---|---|
+| Subnet IS auto-assign | `subnet-00c8d06903d1482ea` has `MapPublicIpOnLaunch=true` + explicit `0.0.0.0/0 → igw-00469f8a48d456a9c` route (genuinely public, no NAT) — matches `main.tf` lines 74–106 |
+| BUT the LIVE ENI cannot use it | ephemeral-public-IP assignment is a LAUNCH-TIME ENI attribute; `eni-01fdeec2412f55587` (eth0 of `i-0b956d0209231a48b`, launched 2026-05-24 BEFORE the subnet flag landed ~2026-05-29) will NOT get a fresh ephemeral IP after EIP release, on stop/start or otherwise — AWS cannot enable the attribute post-launch |
+| Current public IP | the EIP itself: `13.234.145.177` (`eipalloc-01d43d4debab9217b`, the account's ONLY EIP) |
+| Verdict | **EIP release is NOT safe standalone** — releasing today bricks the box (no public IPv4 → no SSM, no REST pulls, no deploys). The 2026-05-31 `variables.tf` observation + daily-universe §7's "no public IP after stop/modify/start" claim are CONFIRMED live. |
+
+**The sanctioned path (honors the verify-first order):** BUNDLE the release
+with the erase-window instance RECREATE (Lever 5) — a fresh launch inherits
+the subnet's auto-assign and gets an ephemeral public IP every start; only
+the Dhan ORDER whitelist needs IP stability, and that is not needed until
+live trading (the boot IP-verification code retired with the Dhan lane,
+PR-C2 2026-07-13 — `ip_verifier` has zero production callers, Verified by
+source scan 2026-07-19, so the app boots cleanly on an ephemeral IP with NO
+code change). Full step-by-step: **`docs/runbooks/eip-release.md`**
+(recreate → prove the fresh ENI mints an ephemeral IP → merge the
+`enable_eip=false` terraform PR, whose path-filtered auto-apply lane
+`.github/workflows/terraform-apply.yml` — plan on PR, apply on main push
+outside market hours with 3 post-close cron retries — IS the release
+mechanism; then `EC2_INSTANCE_ID` secret rotation + post-release checks +
+the live-trading re-enable protocol: new EIP + Dhan setIP ≥7 days before
+go-live).
+
+**Bill recompute with the bundle sanctioned (all at the honest ~176-hr
+all-in ~₹1,473 basis unless noted):**
+
+- **Interim (now → the erase window; no EIP change yet):** Lever 1
+  (−₹125) + Lever-3 trims (up to −₹271) + SMS off (−₹28) →
+  1,473 − 125 − 271 − 28 = **~₹1,049** (full-trim floor; conservative
+  trims that keep the REST-audit + order-side pagers land higher). Still
+  over ₹1,000 — the interim does NOT meet the target; the window does.
+- **Post-window (bundled L2 + L5 land):** 1,049 − 361 − 92 = **~₹596**
+  (full trims) / 1,473 − 125 − 150 − 28 − 361 − 92 = **~₹717**
+  (conservative trims, dead-group-only) — the **~₹600–720/mo class**,
+  comfortably under the ₹1,000 target either way.
+- **Even at the 270-hr ceiling basis (all-in ~₹1,685):** post-window
+  1,685 − 125 − 271 − 28 − 361 − 92 = **~₹808** (full trims) /
+  **~₹929** (conservative) — the target is met at BOTH bases once the
+  bundle lands. The bundle therefore RESOLVES the "UNREACHABLE without at
+  least one operator-gated lever" verdict above: the gated lever pair
+  (L2+L5) is now approved and scheduled, pending only the erase-window
+  execution + its in-window verification steps.
+- The earlier "L1+L2 = ~₹987" line above assumed a standalone EIP release —
+  superseded: L2 cannot land standalone (verified-unsafe); every
+  target-meeting combination now routes through the bundle.
 
 ### Budget-alarm ceiling stepped down $55 → $25 (this PR) with a ratchet ladder to $10
 
