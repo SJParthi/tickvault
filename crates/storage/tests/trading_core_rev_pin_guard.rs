@@ -91,12 +91,17 @@ fn test_trading_core_pyo3_feature_disabled() {
     );
 }
 
+/// A `trading-core` dep line is OK only under exactly `[dev-dependencies]`.
+/// Any OTHER dependency table — `[dependencies]`, `[build-dependencies]`,
+/// `[target.'cfg(...)'.dependencies]`, or any future `*dependencies` section —
+/// naming trading-core FAILS this guard: each would pull bruteX code into a
+/// build/runtime graph.
 #[test]
 fn test_consumer_uses_workspace_pin_as_dev_dependency_only() {
     let manifest = read("crates/trading/Cargo.toml");
     let mut section = String::new();
     let mut dev_ok = false;
-    let mut runtime_hit = false;
+    let mut offending_section: Option<String> = None;
     for raw in manifest.lines() {
         let l = raw.trim();
         if l.starts_with('[') {
@@ -106,16 +111,14 @@ fn test_consumer_uses_workspace_pin_as_dev_dependency_only() {
         if !l.starts_with("trading-core") {
             continue;
         }
-        match section.as_str() {
-            "[dev-dependencies]" => {
-                assert!(
-                    l.contains("workspace = true"),
-                    "the dev-dependency must use the workspace pin: {l}"
-                );
-                dev_ok = true;
-            }
-            "[dependencies]" => runtime_hit = true,
-            _ => {}
+        if section == "[dev-dependencies]" {
+            assert!(
+                l.contains("workspace = true"),
+                "the dev-dependency must use the workspace pin: {l}"
+            );
+            dev_ok = true;
+        } else if section.contains("dependencies") {
+            offending_section = Some(section.clone());
         }
     }
     assert!(
@@ -123,8 +126,10 @@ fn test_consumer_uses_workspace_pin_as_dev_dependency_only() {
         "crates/trading must consume trading-core as a dev-dependency"
     );
     assert!(
-        !runtime_hit,
-        "trading-core must NEVER be a runtime [dependencies] entry"
+        offending_section.is_none(),
+        "trading-core may ONLY appear under [dev-dependencies]; found it under \
+         {} — that would pull bruteX code into a build/runtime graph",
+        offending_section.as_deref().unwrap_or("?")
     );
 }
 
@@ -190,5 +195,13 @@ fn test_deny_toml_scopes_the_git_source() {
         !licenses_body.contains("LicenseRef-Proprietary"),
         "LicenseRef-Proprietary must stay scoped to the trading-core \
          clarify/exception blocks, never the global [licenses] allow list"
+    );
+    assert!(
+        deny.contains("[[licenses.exceptions]]"),
+        "deny.toml must carry a [[licenses.exceptions]] block for trading-core"
+    );
+    assert!(
+        deny.contains(r#"allow = ["LicenseRef-Proprietary"]"#),
+        "deny.toml licenses exception must allow exactly LicenseRef-Proprietary"
     );
 }
