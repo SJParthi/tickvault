@@ -76,6 +76,13 @@ Round 2 ran as two LIGHT bounded reviewers (the round-1 monolithic hostile agent
 1. `event_seq` is stamped ONCE, CONSUMER-side, per persisted row (the exemplar's pattern). `LegPnlEvent` carries NO seq field; producer-side stamping is FORBIDDEN — a consumer respawn re-stamping producer-carried seqs would duplicate rows.
 2. Both emit seams compute unrealized P&L via the single-leg `PositionInfo::unrealized_at(mark)` on the ONE touched position — NEVER via the O(N) `total_unrealized_pnl` (engine.rs:393). Both methods coexist after Item 1; the per-leg path is the only one on the event path.
 
+### Round-4 fold (2026-07-19, pre-impl hostile review — FIX-FIRST, plan-text only)
+
+1. Test scope corrected to `cargo test --workspace` (crates/common edits in Items 5+6 escalate scope per testing-scope.md).
+2. The ErrorCode::all() count-assert bump (164 -> 165, error_code.rs:2772, dated comment) is now a NAMED mandatory edit in Item 6.
+3. TEST-EXEMPT comments for ensure_order_leg_pnl_table + the lazy new() stated in the persistence item.
+No design change; both round-2 binding pins unchanged.
+
 ## Edge Cases
 
 1. **16:00 daily reset × cumulative realized:** `realized_pnl` is a cumulative-DAY snapshot of the engine's per-leg realized at emit time. The runtime's daily reset zeroes engine state; rows before/after are separated by `trading_date_ist`, and a post-reset row legitimately restarts at 0.0 — never back-adjusted. Documented in the rule file.
@@ -102,7 +109,8 @@ Round 2 ran as two LIGHT bounded reviewers (the round-1 monolithic hostile agent
 
 ## Test Plan
 
-Scoped per testing-scope.md: `cargo test -p tickvault-trading -p tickvault-app -p tickvault-storage`.
+`cargo test --workspace`
+  (workspace scope REQUIRED: Items 5+6 edit crates/common/src/{config.rs,error_code.rs}; per testing-scope.md any crates/common edit escalates to workspace scope — this executes error_code_tag_guard, error_code_rule_file_crossref, the ErrorCode::all() count-assert, and test_order_leg_pnl_config_default_off)
 
 - **trading:** financial boundary tests on `unrealized_at` (zero lots, short position, lot_size 0→1, non-finite mark refused/propagated per guard, large-magnitude values) + a delegation-equivalence pin (`total_unrealized_pnl` == Σ `unrealized_at` over positions) — satisfies the financial-test guard for new P&L math.
 - **app:** state-machine walk open→add→reduce→flip→close through the `apply_fill`/`process_mark` harness asserting the emitted `LegPnlEvent` sequence + values; cross-segment same-token distinct emissions; segment gate (IDX_I emits nothing); identity hit / sentinel / late-heal / day-reset; OFF emits nothing; gate resolved once with the honest pnl-on/runtime-off boot line.
@@ -137,12 +145,14 @@ Scoped per testing-scope.md: `cargo test -p tickvault-trading -p tickvault-app -
 - [ ] Item 4 — `order_leg_pnl` persistence (DDL + DEDUP + writer)
   - Files: crates/storage/src/order_leg_pnl_persistence.rs, crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs
   - Tests: test_order_leg_pnl_ddl_idempotent, test_order_leg_pnl_dedup_key_has_feed_and_segment, test_order_leg_pnl_flush_failure_discards, test_order_leg_pnl_nonfinite_clamp
+  - ensure_order_leg_pnl_table and the lazy writer new() carry // TEST-EXEMPT: comments per the exemplar order_update_events_persistence.rs (:102/:219/:318/:346/:357 pattern) so pub-fn-test-guard passes without vacuous tests.
 - [ ] Item 5 — config + boot consumer + gate wiring
   - Files: crates/common/src/config.rs, config/base.toml, crates/app/src/order_leg_pnl_boot.rs, crates/app/src/dhan_rest_stack.rs, crates/app/src/main.rs
   - Tests: test_order_leg_pnl_config_default_off, test_boot_gate_resolved_once
 - [ ] Item 6 — `ErrorCode::OrderPnl01PersistFailed` + rule file
   - Files: crates/common/src/error_code.rs, .claude/rules/project/order-leg-pnl-error-codes.md
   - Tests: rides error_code_tag_guard, error_code_rule_file_crossref, all-variants match tests
+  - MANDATORY companion edit: bump the build-failing count-assert at crates/common/src/error_code.rs:2772 from assert_eq!(ErrorCode::all().len(), 164) to 165, with the house dated-comment convention beside it: "+1 ORDER-PNL-01 (2026-07-19) => 165" (mirroring the :2761-2765 style).
 
 ## Scenarios
 
