@@ -28,19 +28,19 @@
 //! - `live_candle_state` — [`LiveCandleState`], the shared per-bucket
 //!   OHLCV state (extracted from the deleted `aggregator_cell`).
 //! - `seal_ring` — `SealRing` + `BufferedSeal` ring buffer.
-//! - `pct_stamping` — seal-time prev-day pct stamping primitives.
+//! - `pct_stamping` — DELETED (dead-code cleanup — BATCH-5): the
+//!   seal-time prev-day pct-stamping primitives lost their sole feeder
+//!   (the deleted `PrevDayCache` boot loader) with the live-WS feed
+//!   retirements; the REST-era candle fold (`rest_candle_fold.rs`) is
+//!   the sole `candles_*` writer and stamps no pct fields.
 //! - `boundary_calc` — DELETED (dead live-WS sweep stage 1, 2026-07-17,
 //!   operator directive via coordinator): the cold-path boundary-timer
 //!   pure-function primitives had zero callers anywhere.
 
 pub mod live_candle_state;
-pub mod pct_stamping;
 pub mod seal_ring;
 pub mod tf_index;
 
 pub use live_candle_state::LiveCandleState;
-pub use pct_stamping::{
-    PrevDayRefs, compute_close_pct, compute_oi_pct, compute_volume_pct, stamp_seal_pct_fields,
-};
 pub use seal_ring::{BufferOutcome, BufferedSeal, SEAL_BUFFER_CAPACITY, SealRing};
 pub use tf_index::{TF_COUNT, TfIndex};
