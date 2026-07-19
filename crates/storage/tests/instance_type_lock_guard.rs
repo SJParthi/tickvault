@@ -195,6 +195,50 @@ fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
     );
 }
 
+/// Section C.1 — the 2026-07-19 sub-1K ruling (Quote 9) must stay pinned:
+/// the operator formally ACCEPTED the 30 GB root (the 2026-07-13 30→50 grow
+/// CANCELLED), re-affirmed t4g.medium, and set a HARD TARGET of < ₹1,000/mo
+/// incl GST. The recorded ~₹1,289/~₹1,077 bills do NOT meet that target, so
+/// the rule files must (a) carry the verbatim quote, (b) label the bills
+/// with the target, and (c) keep the itemized lever path in aws-budget.md —
+/// removing any of these would let a future bill be presented as compliant
+/// (false-OK) or resurrect the cancelled grow without a fresh quote.
+#[test]
+fn instance_lock_2026_07_19_sub_1k_ruling_pinned() {
+    let root = repo_root();
+    let daily =
+        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    assert!(
+        daily.contains("just 30 gn enough and onl yt4g medium as of now"),
+        "daily-universe §0 must carry the 2026-07-19 Quote 9 verbatim (typos included)"
+    );
+    assert!(
+        daily.contains("< ₹1,000"),
+        "daily-universe §7 must carry the 2026-07-19 hard target (< ₹1,000/mo incl GST)"
+    );
+    assert!(
+        daily.contains("grow is **CANCELLED**") || daily.contains("grow CANCELLED"),
+        "daily-universe must record that the 2026-07-13 30→50 grow is CANCELLED (Quote 9)"
+    );
+    let budget = read(&root.join(".claude/rules/project/aws-budget.md"));
+    assert!(
+        budget.contains("OPERATOR RULING 2026-07-19"),
+        "aws-budget.md must carry the OPERATOR RULING 2026-07-19 section (the itemized sub-1K lever path)"
+    );
+    assert!(
+        budget.contains("just 30 gn enough and onl yt4g medium as of now"),
+        "aws-budget.md must carry the 2026-07-19 Quote 9 verbatim (typos included)"
+    );
+    assert!(
+        budget.contains("UNREACHABLE without at least one"),
+        "aws-budget.md must state plainly that <₹1,000 is unreachable without an operator-gated lever (no false-OK)"
+    );
+    assert!(
+        budget.contains("snap-090ed9c4f3df0ca61"),
+        "aws-budget.md must carry the rollback-snapshot deletion scheduling note (Lever 1, after 2026-07-22)"
+    );
+}
+
 /// Section D — the schedule lock must mention `08:30 IST` (operator narrowed
 /// the window back to 08:30-16:30 on 2026-06-05: "make the aws instance start
 /// and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening).
