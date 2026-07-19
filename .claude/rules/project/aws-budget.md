@@ -17,8 +17,114 @@ paths:
 >
 > **⚠ RE-SUPERSEDED → t4g.medium 2026-07-15 (operator Quote 8 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance DOWNSIZED r8g.large → **t4g.medium** (Graviton2, 2 vCPU / 4 GiB), QuestDB QDB_MEM_LIMIT 4g → 1g. INTERIM bill → ~₹1,471/mo incl GST at 270 hrs with the live 50 GB root (gp3 cannot shrink; the 20 GB fresh-volume recreate — an executor pre-stage, NOT operator-quoted — drops it to ~₹1,197/mo; ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the post-recreate 20 GB volume — on the live 50 GB root the ~176-hr figure is ~₹1,260, and ~₹986 is never the 270-hr one). EIP kept. The current effective instance lock lives in that file's §7. This file's original t4g.medium tables below remain 2026-05-18 historical audit (different universe/stack — do not reuse the ₹1,022 figure).
 >
-> **⚠ LIVE-VOLUME CORRECTION 2026-07-19:** the banner above's "live 50 GB root" premise was factually WRONG — `aws ec2 describe-volumes vol-073ccaa417a0f344b` (run live 2026-07-19 via the coordinator session) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use**, attached to `i-0b956d0209231a48b` at `/dev/xvda` since 2026-05-24. The 2026-07-13 approved 30→50 GB grow (COST NOTE below) was RECORDED but **never physically applied**. Corrected interim bill: EBS $0.0912 × 30 = $2.74; subtotal $6.05 + $3.60 + $2.74 + $0.18 + $0.28 = $12.85 → ₹1,092 → ×1.18 GST = **~₹1,289/mo** at 270 hrs (was stated ~₹1,471/mo; the ~176-hr figure is ~₹1,077, was stated ~₹1,260). Post-recreate figures unchanged (~₹1,197 / ~₹986 — they assumed 20 GB). **FLAGGED FOLLOW-UP:** the disk-pressure remediation the grow was approved for is UNAPPLIED — the 82%-disk-pressure risk may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note. Full arithmetic + authority: `daily-universe-scope-expansion-2026-05-27.md` §7 (2026-07-19 correction note) + §0 (2026-07-19 approvals bullet).
+> **⚠ LIVE-VOLUME CORRECTION 2026-07-19:** the banner above's "live 50 GB root" premise was factually WRONG — `aws ec2 describe-volumes vol-073ccaa417a0f344b` (run live 2026-07-19 via the coordinator session) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use**, attached to `i-0b956d0209231a48b` at `/dev/xvda` since 2026-05-24. The 2026-07-13 approved 30→50 GB grow (COST NOTE below) was RECORDED but **never physically applied**. Corrected interim bill: EBS $0.0912 × 30 = $2.74; subtotal $6.05 + $3.60 + $2.74 + $0.18 + $0.28 = $12.85 → ₹1,092 → ×1.18 GST = **~₹1,289/mo** at 270 hrs (was stated ~₹1,471/mo; the ~176-hr figure is ~₹1,077, was stated ~₹1,260). Post-recreate figures unchanged (~₹1,197 / ~₹986 — they assumed 20 GB). **FLAGGED FOLLOW-UP:** the disk-pressure remediation the grow was approved for is UNAPPLIED — the 82%-disk-pressure risk may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note. *(RESOLVED same day by the 2026-07-19 OPERATOR RULING below: 30 GB is formally ACCEPTED and the 30→50 grow is CANCELLED.)* Full arithmetic + authority: `daily-universe-scope-expansion-2026-05-27.md` §7 (2026-07-19 correction note) + §0 (2026-07-19 approvals bullet).
 >
+> **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
+
+## OPERATOR RULING 2026-07-19 — sub-₹1,000/month hard budget target (30 GB accepted; grow CANCELLED)
+
+**The verbatim operator demand (2026-07-19 — preserve EXACTLY, typos included):**
+
+> "just 30 gn enough and onl yt4g medium as of now espeicall yentirkey it hsodul be kless than 1k per month dude oikay?"
+
+**Meaning (recorded with the ruling):**
+(a) the **30 GB root volume is formally ACCEPTED** — the 2026-07-13
+approved-but-never-applied 30→50 GB grow is **CANCELLED** (the COST NOTE
+2026-07-13 below and its 2026-07-19 correction are resolved by this ruling;
+the 82%-disk-pressure class is now handled by code retention + S3 archival
+on the accepted 30 GB, and any future grow needs a fresh dated quote);
+(b) **t4g.medium stays locked as-of-now** (re-affirms the 2026-07-15
+Quote 8 lock — no instance change);
+(c) **NEW HARD BUDGET TARGET: total AWS bill < ₹1,000/month incl GST.**
+
+### The itemized path to < ₹1,000 (evidence-backed arithmetic)
+
+Recorded bases (daily-universe §7, 2026-07-19-corrected — Verified arithmetic):
+
+- 270-hr ceiling basis: $12.85 → ₹1,092 → ×1.18 GST ≈ **₹1,289/mo**
+- ~176-hr auto-schedule basis: EC2 $3.94 + EIP $3.60 + EBS-30GB $2.74 +
+  S3 $0.18 + SMS $0.28 = **$10.74** → ₹913 → ×1.18 ≈ **₹1,077/mo**
+- PLUS the un-itemised add-ons the §7 honest envelope already admits:
+  the dated COST-NOTE alarm spend, recorded **~$2.7/mo ≈ ₹271/mo incl GST**
+  (that recorded figure PREDATES the 2026-07-15→18 retirement notes below,
+  −$2.4-class in total, so the LIVE number is likely materially lower —
+  Unknown without Cost Explorer), and the 2026-07-15 rollback snapshot
+  `snap-090ed9c4f3df0ca61` at **~₹125/mo class** (Assumed magnitude —
+  EBS snapshots bill on USED blocks at ~$0.05/GB-mo, so the 30 GB root
+  bills its ~used-space ≈ $1.0–1.5 pre-GST ≈ ₹100–150 incl GST; a full
+  30 GB would be $1.50 ≈ ₹150) until deleted.
+- **Honest all-in today: ~₹1,473/mo at ~176 hrs (~₹1,685 at the 270-hr
+  ceiling).** The base bill ALONE (₹1,077) already exceeds ₹1,000 — the
+  target is NOT met by any amount of add-on trimming alone.
+
+| # | Lever | Δ per month | Status |
+|---|---|---|---|
+| 1 | Delete rollback snapshot `snap-090ed9c4f3df0ca61` AFTER 2026-07-22 (its ~1-week rollback window ends Mon 2026-07-22) | −~₹125 (Assumed magnitude) | **SANCTIONED — schedule only, do NOT delete before 2026-07-22.** No auto-delete exists: the operator (or a dated follow-up session after Monday 2026-07-22) runs `aws ec2 delete-snapshot --snapshot-id snap-090ed9c4f3df0ca61` and records a dated note here. |
+| 2 | Release the Elastic IP | −$3.60 → −₹306 pre-GST → **−~₹361 incl GST** | **FLAGGED, OPERATOR-GATED — do NOT act.** The EIP is rule-locked (daily-universe §7: without it the box has NO public IP after any stop/start → unreachable by SSM, and the Dhan static-IP mandate breaks). Releasing it means re-architecting box access (e.g. SSM-over-VPC-endpoint costs MORE than the EIP; a fresh ephemeral IP per start breaks the Dhan static-IP whitelist). Operator decision line: release EIP yes/no — requires its own dated quote editing §7 first. |
+| 3 | Trim the dated COST-NOTE alarm spend (menu below) | up to −~₹271 (recorded ceiling; live residual likely lower) | **FLAGGED, RULE-FILE-GOVERNED — change nothing here.** Each group landed under its own dated note; each trim needs its own dated retirement note. |
+| 4a | SNS → SMS off (the bill table marks it optional) | −$0.28 → **−~₹28 incl GST** | Operator menu item — Telegram + Email fan-out remain (both free-tier). |
+| 4b | S3 cold trim | −≤$0.18 → −≤₹18 | Effectively NOT a lever: SEBI 5y retention rules the archive; the line only grows. No real finding beyond the recorded $0.18. |
+| 5 | 20 GB fresh-volume recreate (pre-staged 2026-07-15 executor decision; EBS $2.74 → $1.82) | −$0.92 → **−~₹92 incl GST** | **OPERATOR-GATED** (terminate-and-recreate in the erase window). NOTE: this ruling accepts **30 GB** as the live size; the 20 GB pre-stage remains a separate, un-quoted executor option — going below 30 needs its own operator go. |
+
+**Lever-3 menu — the dated alarm groups (from the COST NOTES in this file):**
+
+| Dated group | Recorded add | Trim caveat |
+|---|---|---|
+| Silent-feed hardening 2026-07-06 | +$1.50 (~₹150) | Several members ALREADY retired by the 2026-07-15/17 sweeps (dhan-lag alarm + 2 series, boundary-catchup-storm-dhan + 2 series) — the live residual of this group is far below $1.50. |
+| Scoreboard PR-C 2026-07-11 | +$0.40 (~₹40) | Groww-lag alarm + series ALREADY retired (2026-07-15 Trap-A + 2026-07-17 dashboard tidy) — largely gone. |
+| REST-audit gaps 2026-07-14 | +$0.60 (~₹60) | These page the ONLY remaining market-data pulls (spot-1m/chain legs + Telegram-drop) — trimming them blinds the REST legs. Not recommended. |
+| Order-side cluster C 2026-07-14 | +$0.60 now (+$1.20 at Phase-1) (~₹60) | Order-path pagers (paper mode today). |
+| Already-recorded retirements 2026-07-14→18 | −$0.40 −$0.50 −$0.10 −$0.70 −$0.10 −$0.40 −$0.70 ≈ **−$2.9** | Landed; they are why the live alarm spend is likely well under the recorded ~$2.7. |
+
+**Which combinations reach < ₹1,000 (at the honest ~176-hr basis, all-in ~₹1,473):**
+
+- Lever 1 alone: ~₹1,348 — **does NOT meet the target.**
+- Lever 1 + full Lever 3 + 4a + 4b: 1,348 − 271 − 28 − 18 = **~₹1,031 — still misses** (and full Lever 3 is partly already spent by prior retirements).
+- **Lever 1 + Lever 2 (EIP release): 1,348 − 361 = ~₹987 ✓** — meets the target while KEEPING all alarms + SMS.
+- **Lever 1 + full Lever 3 + 4a + 4b + Lever 5 (20 GB recreate): 1,031 − 92 = ~₹939 ✓** — meets the target WITHOUT touching the EIP.
+- At the 270-hr ceiling basis even Lever 1+2 misses (~₹1,199); every lever combined lands ~₹790 — but 270 hrs is the operator-set ceiling, not the auto-schedule actual; re-basing the recorded bill to ~176 hrs would itself need a §7 dated note.
+
+**NO FALSE-OK — stated plainly:** the base bill (₹1,077 at ~176 hrs) exceeds
+₹1,000 on its own, so **< ₹1,000/month is UNREACHABLE without at least one
+operator-gated lever** (EIP release OR the 20-GB recreate combined with the
+full alarm trim + SMS off). The sanctioned Lever 1 (snapshot deletion after
+2026-07-22) is necessary in every combination but sufficient in none.
+Operator decision list: (i) EIP release yes/no; (ii) which Lever-3 alarm
+groups to retire; (iii) SMS off yes/no; (iv) 20 GB recreate go/no-go.
+
+**Live Cost Explorer:** NOT consulted — the sandbox has no valid AWS
+credentials (verified 2026-07-18: `UnrecognizedClientException`); the live
+per-service split is the operator's daily budget digest / Cost Explorer
+console. All ₹ figures above are the recorded list-rate arithmetic.
+
+### Budget-alarm ceiling stepped down $55 → $25 (this PR) with a ratchet ladder to $10
+
+The `budget.tf` `limit_amount` is a **KILL line**, not a mere alarm: 90%/100%
+ACTUAL auto-STOP the box (native Budget Actions + the killswitch Lambda, which
+also disables the morning start cron). Target arithmetic: ₹1,000 incl GST ÷
+1.18 = ₹847 pre-GST ÷ ₹85/$ ≈ **$10/mo** — the eventual ceiling. But July 2026
+is a MIXED month (r8g.large until the 2026-07-15 downsize): projected July
+EOM ≈ $19–20 pre-GST (Assumed: ~88 r8g auto-hrs ≈ $7.3 + t4g remainder ≈ $1.5
++ EIP $3.60 + EBS $2.74 + alarms ≤$2.7 + S3/SMS $0.46 + snapshot ≈ $1.1), so
+$10/$13/$18 NOW would cross the 90% kill line mid-July and stop the box.
+Stepped value set in this PR: **$25** (90% line $22.5 stays above the ~$19–20
+July projection; a 2.2× cut from $55). Dated ratchet ladder (each step = its
+own PR editing `budget.tf limit_amount` + `budget-guards.tf BUDGET_KILL_USD`
++ `crates/aws-lambdas/src/budget_digest.rs BUDGET_USD` in lockstep, with a
+dated cost note here):
+
+- **$25 (2026-07-19, this PR)** — safe through the July mixed month.
+- **→ $18** from the first full t4g.medium month (Aug 2026) — covers the
+  270-hr all-in worst case (~$15.6 post-snapshot-deletion) with headroom.
+- **→ $13** once Lever 1 + the chosen Lever-3 trims land (~₹1,300-class actual).
+- **→ $10** once an operator-gated lever (EIP release, or recreate + trims)
+  brings the actual bill under ₹1,000 (the ruling's line).
+
+Residual (honest): `hard_stop_guard.rs` keeps `DEFAULT_BUDGET_KILL_USD = 55.0`
+as its env-missing FALLBACK only — terraform always injects
+`BUDGET_KILL_USD = "25"`, so the runtime kill line is $25; aligning the
+fallback constant is a flagged follow-up (fail direction: a missing env var
+kills later, never earlier).
 > **Authority:** Parthiban (architect). Non-negotiable.
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
@@ -270,6 +376,9 @@ LOUD FLAGGED FOLLOW-UP: the 2026-07-13 disk-pressure class (root fs 82%,
 approved grow (or formally accepting 30 GB now that the Dhan WS lane +
 Groww live feed retired and reduced the write load) is an operator/infra
 decision, deliberately NOT taken in the 2026-07-19 docs-only correction PR.
+**RESOLVED 2026-07-19 (same day, OPERATOR RULING above): 30 GB formally
+ACCEPTED — this grow is CANCELLED** ("just 30 gn enough…"); any future grow
+needs a fresh dated quote.
 See the header banner correction + `daily-universe-scope-expansion-2026-05-27.md`
 §7 for the corrected bill (~₹1,289/mo interim).
 

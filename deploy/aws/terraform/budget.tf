@@ -26,6 +26,25 @@
 # ~$25 post-downsize is an optional follow-up with its own cost note in
 # aws-budget.md — remember the BUDGET_USD lockstep above if taken.
 #
+# 2026-07-19 RULING STEP (daily-universe §0 Quote 9 — hard target < ₹1,000/mo
+# incl GST): limit_amount stepped $55 -> $25. Arithmetic: the target ceiling is
+# ₹1,000 / 1.18 GST = ₹847 pre-GST / ₹85 per $ ≈ $10/mo — but limit_amount is a
+# KILL line (the 90%/100% ACTUAL actions below auto-STOP the box and the
+# killswitch Lambda disables the morning start cron), and July 2026 is a MIXED
+# month (r8g.large until the 2026-07-15 downsize): projected July EOM ≈ $19-20
+# pre-GST (~88 r8g auto-hrs ≈ $7.3 + t4g remainder ≈ $1.5 + EIP $3.60 + EBS
+# $2.74 + alarms <=$2.7 + S3/SMS $0.46 + rollback snapshot ≈ $1.1), so $10/$13/
+# $18 NOW would cross the 90% kill line mid-July and stop the box. $25 keeps
+# the 90% line ($22.5) above the July projection while cutting the ceiling
+# 2.2x. Dated ratchet ladder (each step = its own PR + cost note in
+# aws-budget.md, keeping the 3-way lockstep: this limit_amount +
+# budget-guards.tf BUDGET_KILL_USD + budget_digest.rs BUDGET_USD):
+#   $25 (2026-07-19) -> $18 (first full t4g.medium month, Aug 2026; covers the
+#   270-hr all-in worst case ~$15.6 post-snapshot-deletion) -> $13 (once the
+#   snapshot deletion + chosen alarm trims land) -> $10 (once an
+#   operator-gated lever brings the actual bill under ₹1,000).
+# Full lever table: aws-budget.md "OPERATOR RULING 2026-07-19".
+#
 # NO cost_filter (un-blinded 2026-06-30): the budget previously filtered on the
 # `Project=tickvault` cost-allocation tag, but that tag was NEVER applied to the
 # actual billed resources (EC2/EBS/EIP), so the budget measured ~$0 against the
@@ -50,7 +69,7 @@ resource "aws_budgets_budget" "tv_monthly" {
   # are preserved exactly — the actions re-bind automatically to the new name.
   name              = "tv-${var.environment}-monthly-budget-v2"
   budget_type       = "COST"
-  limit_amount      = "55"
+  limit_amount      = "25"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

@@ -7,6 +7,11 @@
 # 2026-06-30 r8g.large [~₹2,919/mo] + 2026-05-29 m8g.large + 2026-05-27
 # t4g.large + 2026-05-18 t4g.medium locks). Header corrected 2026-07-15 —
 # it previously described the superseded r8g.large envelope.
+# 2026-07-19 RULING (daily-universe §0 Quote 9): 30 GB root ACCEPTED (the
+# 30→50 grow CANCELLED), t4g.medium re-affirmed, and a NEW HARD TARGET of
+# < ₹1,000/mo incl GST — the ~₹1,289/~₹1,077 recorded bills do NOT meet it;
+# the itemized lever path lives in .claude/rules/project/aws-budget.md
+# "OPERATOR RULING 2026-07-19" (budget kill ceiling stepped $55 → $25 there).
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
@@ -347,7 +352,8 @@ resource "aws_instance" "tv_app" {
   # daily auto-stop → instance runs 24/7 → ~720 hrs/mo → a many-times-over bill
   # instead of the locked monthly figure (~₹2,919 under the 2026-06-30 r8g.large
   # lock; ~₹1,289 under the 2026-07-15 t4g.medium lock — corrected 2026-07-19
-  # from the stated ~₹1,471 after the live 30 GB root verification), and would block the
+  # from the stated ~₹1,471 after the live 30 GB root verification; hard
+  # TARGET < ₹1,000/mo per the 2026-07-19 ruling — see aws-budget.md), and would block the
   # in-place instance-type flips (up OR down).
   # Stop is reversible (EBS + data survive a stop) so it needs no guard.
   disable_api_termination = true

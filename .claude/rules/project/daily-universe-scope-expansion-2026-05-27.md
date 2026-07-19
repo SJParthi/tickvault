@@ -99,6 +99,22 @@
 > logic is otherwise unchanged: gp3 still cannot shrink, and 30→20 still requires
 > the fresh-volume recreate.)*
 
+**Quote 9 (2026-07-19, 30 GB accepted + t4g.medium as-of-now + hard sub-1K target — preserve EXACTLY, typos included):**
+> "just 30 gn enough and onl yt4g medium as of now espeicall yentirkey it hsodul be kless than 1k per month dude oikay?"
+>
+> Operator ruled: (a) the **30 GB root is formally ACCEPTED** — the 2026-07-13
+> approved-but-never-applied 30→50 GB grow is **CANCELLED** (closes the
+> 2026-07-19 live-volume-correction flagged follow-up; any future grow needs a
+> fresh dated quote); (b) **t4g.medium locked as-of-now** (re-affirms Quote 8 —
+> no instance change); (c) **NEW HARD BUDGET TARGET: total AWS bill
+> < ₹1,000/month incl GST**. The recorded bills below (~₹1,289/mo at 270 hrs /
+> ~₹1,077/mo at ~176 hrs) do NOT meet the target on their own — the itemized,
+> evidence-backed lever path (snapshot deletion after 2026-07-22, EIP decision,
+> alarm-trim menu, 20 GB recreate; which combinations reach <₹1,000) lives in
+> `aws-budget.md` "OPERATOR RULING 2026-07-19". The 20 GB fresh-volume TARGET
+> stays a separate, un-quoted executor pre-stage — this ruling accepts 30 GB as
+> the live size; going below 30 still needs its own operator go.
+
 **Approvals:**
 - 2026-05-27: Approved Sub-PR plan items A–D (infinite retry policy, single `instrument_lifecycle` table, separate `instrument_lifecycle_audit` table, plan growing to 14 sub-PRs)
 - 2026-05-27: Approved options X–Z (EventBridge cron at 08:30 IST, `lifecycle_state_locked` column for operator overrides, `--dry-run-universe` CLI flag for first prod validation)
@@ -110,6 +126,7 @@
 - 2026-07-13: Approved EBS grow 30 GB -> 50 GB gp3 (+~₹170/mo incl GST) + instance-role S3 write on tv-prod-cold/groww-capture/* (Groww capture archival), per operator quote: "go ahead and merge everything once it is green - yes do whatever is the recommendation" (prod disk-pressure remediation - disk hit 82% on 2026-07-13 with zero reclamation). Note: the instance role's existing cold-bucket statement (main.tf, s3:GetObject/PutObject/ListBucket on the whole `tv-<env>-cold` bucket) ALREADY covers the groww-capture/* prefix — no IAM change was needed. Bill ~₹2,919/mo → ~₹3,101/mo incl GST (recomputed below).
 - 2026-07-15: Approved instance DOWNSIZE r8g.large → **t4g.medium** (2 vCPU / 4 GiB) + QDB_MEM_LIMIT 4g → 1g, executed via the guarded `downsize-instance.yml` workflow (old root snapshotted first, kept ~1 week), per Quote 8 ("Flip tonight: t4g.medium, QuestDB 1g, automated"). INTERIM bill (the live root stays 50 GB — gp3 cannot shrink) ~₹3,101/mo → **~₹1,471/mo** incl GST at 270 hrs; drops to ~₹1,197/mo only AFTER the 20 GB fresh-volume recreate (executor pre-stage, not operator-quoted); ~₹986/mo requires BOTH the ~176-hr pure auto-schedule basis AND the post-recreate 20 GB volume (on the live 50 GB root the ~176-hr figure is ~₹1,260), NEVER the 270-hr figure. EIP kept.
 - 2026-07-19: **LIVE-STATE CORRECTION (verified evidence, not a new approval):** `aws ec2 describe-volumes` on `vol-073ccaa417a0f344b` (the root of `i-0b956d0209231a48b`, attached at `/dev/xvda` since 2026-05-24) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use** — run live 2026-07-19 via the coordinator session's credentialed AWS access. The 2026-07-13 approved 30→50 GB grow (bullet above) was RECORDED but **never physically applied** — every "live 50 GB root" statement dated 2026-07-15 (the Quote 8 executor note + the bullet above + §7) is corrected by the dated 2026-07-19 notes in §7. **FLAGGED FOLLOW-UP:** the disk-pressure remediation that grow was approved for is therefore UNAPPLIED — the 82%-disk-pressure risk class may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note.
+- 2026-07-19: **RULING (Quote 9): 30 GB ACCEPTED + t4g.medium as-of-now + hard target < ₹1,000/mo incl GST.** Resolves the flagged follow-up in the bullet above — the 2026-07-13 30→50 grow is **CANCELLED**; the accepted mitigation for the disk-pressure class is code retention + S3 archival on the 30 GB root (any future grow needs a fresh dated quote). The recorded interim bills (~₹1,289/mo at 270 hrs; ~₹1,077/mo at ~176 hrs) EXCEED the new target — the itemized lever path + which combinations reach <₹1,000 (none without an operator-gated lever) is recorded in `aws-budget.md` "OPERATOR RULING 2026-07-19"; the budget-alarm kill ceiling stepped $55 → $25 the same day with a dated ratchet ladder toward $10 (₹1,000 ÷ 1.18 ÷ ₹85 ≈ $10 pre-GST).
 
 ---
 
@@ -254,7 +271,7 @@ per-minute-REST workload is NOT yet live-validated on credits — watch
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.0224/hr** (ap-south-1, console-verified 2026-05-18 — re-verify at execution) — no Reserved / Savings Plan / Spot |
 | Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
-| EBS | gp3 **30 GB LIVE** (VERIFIED 2026-07-19 via live `describe-volumes` — the 2026-07-13 approved 30→50 grow was recorded but never physically applied; this row read "50 GB LIVE" 2026-07-15→2026-07-19. gp3 cannot shrink — the 20 GB target lands only via the fresh-volume terminate-and-recreate in the operator's erase window; terraform default pre-staged to 20, executor decision 2026-07-15) |
+| EBS | gp3 **30 GB LIVE — ACCEPTED by the 2026-07-19 ruling (Quote 9: "just 30 gn enough"; the 2026-07-13 30→50 grow is CANCELLED)** (VERIFIED 2026-07-19 via live `describe-volumes` — the grow was recorded but never physically applied; this row read "50 GB LIVE" 2026-07-15→2026-07-19. gp3 cannot shrink — the 20 GB target lands only via the fresh-volume terminate-and-recreate in the operator's erase window; terraform default pre-staged to 20, executor decision 2026-07-15) |
 | EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan) |
 | Network | ENA enabled by default |
 
@@ -277,6 +294,13 @@ per-minute-REST workload is NOT yet live-validated on credits — watch
 > place to the verified 30 GB; the pre-correction 50 GB numbers are preserved
 > in this note. **FLAGGED FOLLOW-UP:** the 2026-07-13 disk-pressure grow is
 > UNAPPLIED — see the 2026-07-19 approvals bullet in §0.
+>
+> **Same-day 2026-07-19 ruling annotation (Quote 9):** 30 GB is now ACCEPTED and
+> the grow CANCELLED; and BOTH corrected figures carry the new HARD TARGET
+> **< ₹1,000/mo incl GST** — neither ~₹1,289 (270 hrs) nor ~₹1,077 (~176 hrs)
+> meets it. The itemized lever path (and the plain statement that no
+> non-operator-gated combination reaches <₹1,000) lives in `aws-budget.md`
+> "OPERATOR RULING 2026-07-19".
 
 Operator-set ceiling **270 running hours/month** (auto weekday schedule
 ~176 hrs + manual runs — the hours BASIS is unchanged; every prior §7 bill
@@ -300,7 +324,7 @@ Telegram are all included and free-tier.**
 | Data transfer out | ~14 GB < 100 GB free egress | $0.00 |
 | **Subtotal (pre-GST)** | | **$12.85** |
 | **× ₹85/$** | | **₹1,092** |
-| **+ 18% GST (AWS India)** | | **~₹1,289/mo** |
+| **+ 18% GST (AWS India)** | | **~₹1,289/mo** *(target < ₹1,000 per the 2026-07-19 ruling — NOT met by this bill; lever path in `aws-budget.md`)* |
 
 **Honest envelope:** the CURRENT bill is ~**₹1,289/month all-in incl. GST**
 (270 hrs, live 30 GB root verified 2026-07-19, EIP kept) — a ~₹1,810/mo cut
@@ -312,7 +336,9 @@ $1.82). The operator's earlier ~₹986/mo figure **requires BOTH the ~176-hr
 pure Mon–Fri auto-schedule basis AND the post-recreate 20 GB volume**
 ($9.82 → ₹835 → ×1.18 ≈ ₹986); on the LIVE 30 GB root the ~176-hr figure
 is **~₹1,077** ($10.74 → ₹913 → ×1.18 ≈ ₹1,077; the superseded 50 GB record
-put it at ~₹1,260 — $12.56 → ₹1,068 → ×1.18 ≈ ₹1,260) — ~₹986 is NEVER to be
+put it at ~₹1,260 — $12.56 → ₹1,068 → ×1.18 ≈ ₹1,260; *2026-07-19 ruling
+annotation: target < ₹1,000 per Quote 9 — even this ~176-hr figure does NOT
+meet it; lever path in `aws-budget.md`*) — ~₹986 is NEVER to be
 presented as the 270-hr figure or as achievable before the recreate, and
 the hours basis is NOT re-based by this change. **The observability stack
 is NOT ₹0** (corrected 2026-07-15 — an earlier draft of this section said
@@ -332,6 +358,11 @@ $0.0224/hr (ap-south-1 console 2026-05-18 — re-verify at execution);
 EIP/EBS/S3/SNS are AWS list rates. Budget alarm ceiling stays $35/mo
 pre-GST (lowering toward ~$15 is an optional follow-up with its own cost
 note in aws-budget.md). Operator approved 2026-07-15 (Quote 8).
+*(2026-07-19 correction + ruling: the LIVE terraform kill ceiling was
+actually $55 since 2026-06-30 — `budget.tf limit_amount`, not the $35
+this sentence recorded; per the Quote 9 sub-1K ruling it stepped
+$55 → $25 on 2026-07-19, with a dated ratchet ladder toward $10
+(₹1,000 ÷ 1.18 ÷ ₹85 ≈ $10 pre-GST) recorded in `aws-budget.md`.)*
 
 > **Note on instance schedule (2026-05-29):** trading WEEKDAYS only
 > (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays
@@ -364,7 +395,7 @@ note in aws-budget.md). Operator approved 2026-07-15 (Quote 8).
    - **Total used: ~2.3 GB (app at the ~700 MB 4-SID actual) – ~3.1 GB (app at the 1.5 GB cap)** — the rows above sum to ~2.27 GB / ~3.07 GB (arithmetic corrected 2026-07-15; an earlier draft said "~2.6–3.1") *(2026-07-18: the seal-ring row replaced the 10 MB tick-ring row, +~19 MB — inside the ~ rounding, totals unchanged)*
    - **Headroom: ~0.9–1.7 GB** — above the 1 GB Linux kswapd floor only while the app stays at/under its cap. **FLAG (honest, unresolved — Assumed until measured; Rule 11, no false-OK):** the pre-downsize Rule 2 sizing formula this file has always carried (≈3.2 MB × SID for the 21-TF today+yesterday RAM-resident set) predicts an app working set of **~2.5 GB at ~770 SIDs** — with QuestDB at 1g that totals ~4.1 GB (2.5 app + 1.0 QDB + ~0.17 buffers + ~0.4 OS) and does **NOT fit in 4 GiB**. The ~700 MB "actual" and the formula cannot both hold at ~770 SIDs; **the first live session on t4g.medium is the measured gate** — read `tv_process_rss_bytes` / RESOURCE-02 and `mem_used_percent` before AND after cutover; if live RSS is materially above ~1.5 GB, 4 GiB does not fit and t4g.large (8 GiB) is the rip-cord. QuestDB at 1g serving today's ~770-SID Groww write load is likewise re-validated live (the old 1g-class budget served the 4-SID universe). BURSTABLE CPU: watch `CPUCreditBalance` after cutover.
 
-3. **EBS = 30 GB gp3 LIVE (verified 2026-07-19 — the 2026-07-13 approved 30→50 grow was recorded but never physically applied); 20 GB is the pre-staged fresh-volume TARGET** (executor decision 2026-07-15, recorded in §0 under Quote 8 — NOT operator-quoted scope). gp3 grows online but can NEVER shrink: `modify-volume` refuses a smaller size and a larger snapshot cannot restore into a smaller volume (the 30 GB snapshot cannot restore into 20 GB), so 30 → 20 requires a volume/instance REPLACEMENT (terraform terminate-and-recreate in the operator's post-market erase window; the box is fully cattle-provisioned by `user-data.sh.tftpl`; the 2026-07-15 pre-downsize snapshot is the rollback, kept ~1 week; the GitHub secret `EC2_INSTANCE_ID` must be rotated to the new id at recreate time). Terraform `ebs_gp3_size_gb` default = 20 documents FRESH-PROVISION intent only — `root_block_device[0].volume_size` is in the instance `lifecycle.ignore_changes`, so `terraform apply` never touches the live volume. History: 10 GB → 30 GB (2026-05-29 Quote 6) → [50 GB approved 2026-07-13 (disk-pressure grow) — RECORDED but never physically applied; live verified 30 GB by `describe-volumes` 2026-07-19] → 20 GB target (2026-07-15). **FLAGGED FOLLOW-UP (2026-07-19):** the unapplied grow means the 2026-07-13 82%-disk-pressure remediation never landed — applying it (or accepting 30 GB) is an operator/infra decision. The partition manager keeps auto-archiving partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window.
+3. **EBS = 30 GB gp3 LIVE (verified 2026-07-19 — the 2026-07-13 approved 30→50 grow was recorded but never physically applied); 20 GB is the pre-staged fresh-volume TARGET** (executor decision 2026-07-15, recorded in §0 under Quote 8 — NOT operator-quoted scope). gp3 grows online but can NEVER shrink: `modify-volume` refuses a smaller size and a larger snapshot cannot restore into a smaller volume (the 30 GB snapshot cannot restore into 20 GB), so 30 → 20 requires a volume/instance REPLACEMENT (terraform terminate-and-recreate in the operator's post-market erase window; the box is fully cattle-provisioned by `user-data.sh.tftpl`; the 2026-07-15 pre-downsize snapshot is the rollback, kept ~1 week; the GitHub secret `EC2_INSTANCE_ID` must be rotated to the new id at recreate time). Terraform `ebs_gp3_size_gb` default = 20 documents FRESH-PROVISION intent only — `root_block_device[0].volume_size` is in the instance `lifecycle.ignore_changes`, so `terraform apply` never touches the live volume. History: 10 GB → 30 GB (2026-05-29 Quote 6) → [50 GB approved 2026-07-13 (disk-pressure grow) — RECORDED but never physically applied; live verified 30 GB by `describe-volumes` 2026-07-19] → 20 GB target (2026-07-15) → **30 GB ACCEPTED (2026-07-19 Quote 9 — the 50 GB grow CANCELLED)**. **FLAGGED FOLLOW-UP (2026-07-19):** the unapplied grow means the 2026-07-13 82%-disk-pressure remediation never landed — applying it (or accepting 30 GB) is an operator/infra decision. *(RESOLVED same day by Quote 9: 30 GB is formally ACCEPTED, the grow is CANCELLED — the disk-pressure class is handled by code retention + S3 archival on the 30 GB root; any future grow needs a fresh dated quote. The 20 GB fresh-volume TARGET stays a separate un-quoted executor pre-stage — going below the accepted 30 needs its own operator go.)* The partition manager keeps auto-archiving partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window.
 
 4. **No paid AWS services** (RDS, ElastiCache, NAT Gateway, ALB) without budget review.
 
