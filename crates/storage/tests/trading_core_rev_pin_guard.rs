@@ -25,8 +25,6 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The single root-manifest dependency line pinning trading-core (comment
-/// lines and unrelated lines are ignored).
 fn trading_core_dep_line() -> String {
     let root = read("Cargo.toml");
     root.lines()
@@ -91,56 +89,138 @@ fn test_trading_core_pyo3_feature_disabled() {
     );
 }
 
-/// A `trading-core` dep line is OK only under exactly `[dev-dependencies]`
-/// of `crates/trading/Cargo.toml`. Any other crate manifest, and any OTHER
-/// section — `[dependencies]`, `[build-dependencies]`,
-/// `[target.'cfg(...)'.dependencies]`, or any future `*dependencies` table —
-/// naming trading-core FAILS this guard: each would pull bruteX code into a
-/// build/runtime graph. Walks EVERY `crates/*/Cargo.toml` so a new consumer
-/// crate can never slip past the guard.
-#[test]
-fn test_consumer_uses_workspace_pin_as_dev_dependency_only() {
-    let crates_dir = repo_root().join("crates");
-    let mut dev_ok = false;
-    for entry in fs::read_dir(&crates_dir)
-        .expect("read crates/ dir")
-        .flatten()
-    {
-        let manifest_path = entry.path().join("Cargo.toml");
-        if !manifest_path.is_file() {
+/// Recursively collect every `Cargo.toml` in the repo, skipping build/VCS
+/// caches and symlinks so the scan is deterministic and cannot loop.
+fn collect_manifests(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
             continue;
         }
-        let rel = format!("crates/{}/Cargo.toml", entry.file_name().to_string_lossy());
-        let manifest = read(&rel);
-        let mut section = String::new();
-        for raw in manifest.lines() {
-            let l = raw.trim();
-            if l.starts_with('[') {
-                section = l.to_string();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if file_type.is_dir() {
+            if matches!(
+                name.as_ref(),
+                "target" | ".git" | ".cargo" | "node_modules" | "data"
+            ) {
                 continue;
             }
-            if !l.starts_with("trading-core") {
-                continue;
+            collect_manifests(&entry.path(), out);
+        } else if name == "Cargo.toml" {
+            out.push(entry.path());
+        }
+    }
+}
+
+/// Depth-first walk over a parsed manifest, recording the dotted key-path of
+/// every reference to the `trading-core` crate: a literal `trading-core` key
+/// (plain, dotted-table, target-specific, or `[patch]` form), a rename entry
+/// carrying `package = "trading-core"`, or a bare `package = "trading-core"`
+/// string anywhere (arrays of tables included).
+fn find_trading_core_refs(value: &toml::Value, path: &mut Vec<String>, hits: &mut Vec<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table {
+                path.push(key.clone());
+                let is_tc_key = key == "trading-core";
+                let is_tc_rename = child
+                    .as_table()
+                    .and_then(|t| t.get("package"))
+                    .and_then(toml::Value::as_str)
+                    == Some("trading-core");
+                let is_tc_package_str = key == "package" && child.as_str() == Some("trading-core");
+                if is_tc_key || is_tc_rename || is_tc_package_str {
+                    hits.push(path.join("."));
+                }
+                find_trading_core_refs(child, path, hits);
+                path.pop();
             }
-            if rel == "crates/trading/Cargo.toml" && section == "[dev-dependencies]" {
-                assert!(
-                    l.contains("workspace = true"),
-                    "the dev-dependency must use the workspace pin: {l}"
-                );
-                dev_ok = true;
-            } else {
-                panic!(
-                    "trading-core may ONLY appear under [dev-dependencies] of \
-                     crates/trading/Cargo.toml; found it under {section} of {rel} \
-                     — that would pull bruteX code into a build/runtime graph"
-                );
+        }
+        toml::Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                path.push(idx.to_string());
+                find_trading_core_refs(item, path, hits);
+                path.pop();
             }
+        }
+        _ => {}
+    }
+}
+
+/// `trading-core` may appear in exactly two sanctioned places: the root
+/// `[workspace.dependencies]` pin and the `crates/trading` `[dev-dependencies]`
+/// inherit. Every other reference — dotted tables, `package = "trading-core"`
+/// renames, target-specific tables, `[patch]` sections, any other manifest
+/// (fuzz included) — fails the build. Manifests are PARSED (never
+/// string-matched) and an unparsable manifest fails closed.
+#[test]
+fn test_consumer_uses_workspace_pin_as_dev_dependency_only() {
+    let root = repo_root();
+    let mut manifests = Vec::new();
+    collect_manifests(&root, &mut manifests);
+    manifests.sort();
+    assert!(
+        manifests.len() >= 10,
+        "manifest scan looks broken: expected the >= 10 known Cargo.toml files, found {}",
+        manifests.len()
+    );
+
+    let root_manifest = root.join("Cargo.toml");
+    let trading_manifest = root.join("crates").join("trading").join("Cargo.toml");
+    let mut root_pin_seen = false;
+    let mut dev_dep_seen = false;
+
+    for manifest in &manifests {
+        let text = fs::read_to_string(manifest)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest.display()));
+        let parsed: toml::Table = text
+            .parse()
+            .unwrap_or_else(|e| panic!("failed to parse {}: {e}", manifest.display()));
+        let mut hits = Vec::new();
+        find_trading_core_refs(&toml::Value::Table(parsed), &mut Vec::new(), &mut hits);
+        for hit in hits {
+            let sanctioned_root =
+                *manifest == root_manifest && hit == "workspace.dependencies.trading-core";
+            let sanctioned_dev =
+                *manifest == trading_manifest && hit == "dev-dependencies.trading-core";
+            assert!(
+                sanctioned_root || sanctioned_dev,
+                "unsanctioned trading-core reference at `{hit}` in {} — bruteX trading-core is allowed ONLY as the root [workspace.dependencies] pin and the crates/trading [dev-dependencies] entry",
+                manifest.display()
+            );
+            root_pin_seen |= sanctioned_root;
+            dev_dep_seen |= sanctioned_dev;
         }
     }
     assert!(
-        dev_ok,
-        "expected dev-dependency consumer missing: crates/trading/Cargo.toml \
-         must consume trading-core under [dev-dependencies]"
+        root_pin_seen,
+        "root Cargo.toml must carry the [workspace.dependencies] trading-core pin"
+    );
+    assert!(
+        dev_dep_seen,
+        "crates/trading/Cargo.toml must declare trading-core under [dev-dependencies]"
+    );
+
+    let trading: toml::Table = read("crates/trading/Cargo.toml")
+        .parse()
+        .expect("failed to parse crates/trading/Cargo.toml");
+    let inherits_workspace = trading
+        .get("dev-dependencies")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("trading-core"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("workspace"))
+        .and_then(toml::Value::as_bool);
+    assert_eq!(
+        inherits_workspace,
+        Some(true),
+        "crates/trading trading-core dev-dependency must be `{{ workspace = true }}`"
     );
 }
 
@@ -176,8 +256,7 @@ fn test_no_runtime_fetch_of_brutex_in_sources() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "runtime sources must never reference the bruteX repo — consumption is \
-         compile-time-only via the pinned dev-dependency: {offenders:?}"
+        "runtime sources must never reference the bruteX repo — consumption is compile-time-only via the pinned dev-dependency: {offenders:?}"
     );
 }
 
@@ -204,8 +283,7 @@ fn test_deny_toml_scopes_the_git_source() {
     let licenses_body = &body[..lic_end];
     assert!(
         !licenses_body.contains("LicenseRef-Proprietary"),
-        "LicenseRef-Proprietary must stay scoped to the trading-core \
-         clarify/exception blocks, never the global [licenses] allow list"
+        "LicenseRef-Proprietary must stay scoped to the trading-core clarify/exception blocks, never the global [licenses] allow list"
     );
     assert!(
         deny.contains("[[licenses.exceptions]]"),
