@@ -189,7 +189,7 @@ jobs:
         uses: actions/checkout@v7.0.0
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
           components: rustfmt, clippy
@@ -252,7 +252,7 @@ jobs:
         uses: actions/checkout@v7.0.0
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
@@ -309,7 +309,7 @@ jobs:
         uses: actions/checkout@v7.0.0
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
@@ -344,7 +344,7 @@ jobs:
         uses: actions/checkout@v7.0.0
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
@@ -447,7 +447,7 @@ jobs:
         uses: actions/checkout@v7.0.0
 
       - name: Install Rust toolchain 1.95.0 + llvm-tools
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
           components: llvm-tools-preview
@@ -702,7 +702,7 @@ jobs:
           echo "DHAT target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
