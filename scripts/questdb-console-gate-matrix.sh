@@ -25,8 +25,11 @@
 # through the REAL gate script.
 #
 # Run from anywhere:  bash scripts/questdb-console-gate-matrix.sh
-# CI wiring: the ci.yml Repo Guards step "QuestDB console lambda unit tests
-# (back + front)" runs this harness on every PR (the job feeds All Green).
+# CI wiring: the ci.yml Repo Guards step "QuestDB console deploy-gate +
+# all-green harnesses" runs this harness on every PR (the job feeds All
+# Green). (2026-07-18 rust-only phase 2b-3: the console lambda Python
+# unittest halves of that step retired with the handlers — the suites are
+# ported 1:1 into crates/aws-lambdas.)
 set -u
 
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)

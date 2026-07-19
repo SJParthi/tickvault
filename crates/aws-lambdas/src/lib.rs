@@ -37,6 +37,8 @@ pub mod market_open_readiness;
 pub mod operator_control;
 pub mod operator_control_action_commands;
 pub mod operator_control_commands;
+pub mod qdb_console_front;
+pub mod qdb_console_proxy;
 pub mod start_watchdog;
 pub mod telegram_webhook;
 pub mod time;
