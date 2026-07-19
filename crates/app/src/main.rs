@@ -2562,7 +2562,10 @@ async fn run_process_runloop(
     // `boot_helpers::should_emit_post_market_alert`.
     trading_calendar: std::sync::Arc<TradingCalendar>,
 ) -> Result<()> {
-    let mode = "LIVE";
+    // Truthfulness rider: the runtime is dry-run/paper only — no real-money
+    // orders are placed. Render "RUNNING (paper)" so the boot Telegram cannot
+    // be mistaken for a live-money mode ("LIVE" read as real trading).
+    let mode = "RUNNING (paper)";
     info!(
         mode,
         api_port = config.api.port,

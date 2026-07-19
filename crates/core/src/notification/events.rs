@@ -207,7 +207,7 @@ impl BootPathLabel {
 pub enum NotificationEvent {
     /// Application boot completed successfully.
     StartupComplete {
-        /// "LIVE" or "OFFLINE".
+        /// "RUNNING (paper)" or "OFFLINE".
         mode: &'static str,
         /// Per-minute spot 1m REST leg armed at boot (config truth —
         /// 2026-07-13 operator visibility rider: the boot Telegram must say
