@@ -6,6 +6,10 @@
 //! - the `boot-heartbeat-alarm.tf` boot-window gate inline Python heredoc
 //! - the `market-hours-liveness-alarm.tf` market-hours gate inline heredoc
 //!
+//! Rust-only purge phase 2b-2 wave 2 (2026-07-18): ports of
+//! - `deploy/aws/lambda/start-watchdog/handler.py` (EC2 lifecycle watchdog)
+//! - `deploy/aws/lambda/hard-stop-guard/handler.py` (hourly budget/schedule guard)
+//!
 //! Behavior parity is the contract: same env vars, same SNS message shapes,
 //! same alarm-name/window logic, same IST time math as the Python sources.
 //! Every deviation is deliberate and documented at the deviating line.
@@ -24,9 +28,14 @@ pub mod alarm_gate;
 pub mod budget_digest;
 pub mod budget_killswitch;
 pub mod clients;
+pub mod deploy_watchdog;
 pub mod events;
+pub mod hard_stop_guard;
 pub mod logging;
 pub mod market_hours_gate;
+pub mod market_open_readiness;
 pub mod qdb_console_front;
 pub mod qdb_console_proxy;
+pub mod start_watchdog;
+pub mod telegram_webhook;
 pub mod time;

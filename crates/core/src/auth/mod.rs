@@ -41,6 +41,7 @@ pub mod token_manager;
 pub mod totp_generator;
 pub mod types;
 
-pub use token_cache::FastCacheResult;
+// Dead-code batch 2 (2026-07-18): `FastCacheResult` re-export DELETED with
+// the fast-boot cache arm (zero production callers since PR-C2).
 pub use token_manager::{TokenHandle, TokenManager};
 pub use types::{DhanCredentials, QuestDbCredentials, TelegramCredentials, TokenState};

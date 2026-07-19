@@ -48,17 +48,6 @@ pub struct SystemHealthStatus {
     /// Read by `/health`, `overall_status`, and observability. A single
     /// momentary blip flips this — that is correct for observability.
     questdb_reachable: AtomicBool,
-    /// DAMPED QuestDB-reachability signal that feeds the pool-watchdog's 429
-    /// ride-out EXIT decision ONLY. Unlike the raw `questdb_reachable` above,
-    /// this flips `false` only after N *consecutive* failed probes (see
-    /// `damp_questdb_exit_signal` in `crates/app/src/main.rs`), so a single
-    /// blip (GC pause / transient HTTP hiccup / a 2s probe-timeout under load)
-    /// during a live in-market 429 storm no longer forces a `process::exit(2)`
-    /// → 775-SID cold re-subscribe → next 429 restart/429 loop. A genuine
-    /// SUSTAINED outage still flips it after N ticks, so the exit gate is never
-    /// worse than today for a real dead DB. Inits `true` — a watchdog that has
-    /// never probed must not pre-force an exit.
-    questdb_reachable_for_exit_decision: AtomicBool,
     /// Whether the auth token is currently valid.
     token_valid: AtomicBool,
     /// Seconds remaining until token expiry (0 = expired or unknown).
@@ -85,7 +74,6 @@ impl SystemHealthStatus {
             // "down" (that would pre-force a genuine-fatal exit). The gate has
             // other predicates (token valid, no non-reconnectable code) so this
             // default never rides out an absent pool on its own.
-            questdb_reachable_for_exit_decision: AtomicBool::new(true),
             token_valid: AtomicBool::new(false),
             token_remaining_secs: AtomicU64::new(0),
             tick_persistence_connected: AtomicBool::new(false),
@@ -144,23 +132,6 @@ impl SystemHealthStatus {
     /// Returns whether QuestDB is reachable (RAW single-probe signal).
     pub fn questdb_reachable(&self) -> bool {
         self.questdb_reachable.load(Ordering::Relaxed)
-    }
-
-    /// Sets the DAMPED QuestDB-reachability signal used ONLY by the pool
-    /// watchdog's 429 ride-out exit decision. The watchdog computes this from
-    /// N consecutive failed probes via `damp_questdb_exit_signal`; a single
-    /// success resets. Never read by `/health` — keep that on the raw signal.
-    pub fn set_questdb_reachable_for_exit_decision(&self, reachable: bool) {
-        self.questdb_reachable_for_exit_decision
-            .store(reachable, Ordering::Relaxed);
-    }
-
-    /// Returns the DAMPED QuestDB-reachability signal for the ride-out exit
-    /// gate. `false` only after N consecutive failed probes — so a single blip
-    /// does not force `process::exit`, but a sustained outage still does.
-    pub fn questdb_reachable_for_exit_decision(&self) -> bool {
-        self.questdb_reachable_for_exit_decision
-            .load(Ordering::Relaxed)
     }
 
     /// Marks the auth token as valid/invalid.
@@ -223,11 +194,6 @@ impl SystemHealthStatus {
     // TEST-EXEMPT: trivial AtomicU64 load, tested indirectly by health endpoint tests
     pub fn ticks_spilled(&self) -> u64 {
         self.ticks_spilled.load(Ordering::Relaxed)
-    }
-
-    /// Sets the boot timestamp.
-    pub fn set_boot_epoch_secs(&self, epoch_secs: u64) {
-        self.boot_epoch_secs.store(epoch_secs, Ordering::Relaxed);
     }
 
     /// Returns the boot timestamp (0 if not yet booted).
@@ -604,42 +570,6 @@ mod tests {
     }
 
     #[test]
-    fn test_questdb_reachable_for_exit_decision_independent_of_raw() {
-        let health = SystemHealthStatus::new();
-        // Damped exit signal inits `true` (never pre-force an exit before any
-        // probe); the raw signal inits `false`.
-        assert!(
-            health.questdb_reachable_for_exit_decision(),
-            "damped exit signal must init true"
-        );
-        assert!(
-            !health.questdb_reachable(),
-            "raw signal inits false (unknown until first probe)"
-        );
-
-        // A single RAW blip (set raw false) must NOT touch the damped exit
-        // signal — `/health` reflects the blip, the exit gate does not.
-        health.set_questdb_reachable(false);
-        assert!(
-            !health.questdb_reachable(),
-            "raw signal reflects the blip (observability intact)"
-        );
-        assert!(
-            health.questdb_reachable_for_exit_decision(),
-            "damped exit signal is independent of a single raw blip"
-        );
-
-        // The two signals move independently in both directions.
-        health.set_questdb_reachable(true);
-        health.set_questdb_reachable_for_exit_decision(false);
-        assert!(health.questdb_reachable(), "raw is now true");
-        assert!(
-            !health.questdb_reachable_for_exit_decision(),
-            "damped exit signal is independently settable to false"
-        );
-    }
-
-    #[test]
     fn test_order_update_connected_set_and_get() {
         let health = SystemHealthStatus::new();
         assert!(!health.order_update_connected());
@@ -656,14 +586,12 @@ mod tests {
         health.set_pipeline_active(true);
         health.set_questdb_reachable(true);
         health.set_token_valid(true);
-        health.set_boot_epoch_secs(1_772_073_900);
 
         assert_eq!(health.overall_status(), "healthy");
         assert_eq!(health.websocket_connections(), 3);
         assert!(health.pipeline_active());
         assert!(health.questdb_reachable());
         assert!(health.token_valid());
-        assert_eq!(health.boot_epoch_secs(), 1_772_073_900);
     }
 
     #[test]
@@ -821,14 +749,6 @@ mod tests {
         assert!(health.pipeline_active());
         health.set_pipeline_active(false);
         assert!(!health.pipeline_active());
-    }
-
-    #[test]
-    fn test_system_health_status_boot_epoch_secs_set_and_get() {
-        let health = SystemHealthStatus::default();
-        assert_eq!(health.boot_epoch_secs(), 0);
-        health.set_boot_epoch_secs(1_700_000_000);
-        assert_eq!(health.boot_epoch_secs(), 1_700_000_000);
     }
 
     // -------------------------------------------------------------------
@@ -993,14 +913,5 @@ mod tests {
         assert!(health.tick_persistence_connected());
         health.set_tick_persistence_connected(false);
         assert!(!health.tick_persistence_connected());
-    }
-
-    #[test]
-    fn test_system_health_status_boot_epoch_secs_overwrite() {
-        let health = SystemHealthStatus::default();
-        health.set_boot_epoch_secs(1_000_000);
-        assert_eq!(health.boot_epoch_secs(), 1_000_000);
-        health.set_boot_epoch_secs(2_000_000);
-        assert_eq!(health.boot_epoch_secs(), 2_000_000);
     }
 }

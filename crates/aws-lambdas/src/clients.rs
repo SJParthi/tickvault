@@ -42,3 +42,7 @@ pub fn cloudwatch(config: &SdkConfig) -> aws_sdk_cloudwatch::Client {
 pub fn lambda(config: &SdkConfig) -> aws_sdk_lambda::Client {
     aws_sdk_lambda::Client::new(config)
 }
+
+pub fn eventbridge(config: &SdkConfig) -> aws_sdk_eventbridge::Client {
+    aws_sdk_eventbridge::Client::new(config)
+}

@@ -27,6 +27,7 @@ aws-sdk-ssm = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
 aws-sdk-cloudwatch = { workspace = true }
 aws-sdk-costexplorer = { workspace = true }
+aws-sdk-eventbridge = { workspace = true }
 # qdb-console pair (phase 2b-3): the VPC relay speaks plain HTTP to the box
 # (Python urllib parity — blocking client on a spawn_blocking thread, NO AWS
 # SDK in the proxy), and the envelope carries base64 bodies + urlencoded
@@ -40,6 +41,10 @@ form_urlencoded = { workspace = true }
 # existing crypto provider — no new crypto root).
 aws-sdk-lambda = { workspace = true }
 aws-lc-rs = { workspace = true }
+
+[[bin]]
+name = "start-watchdog"
+path = "src/bin/start_watchdog.rs"
 
 [[bin]]
 name = "budget-killswitch"
@@ -56,6 +61,22 @@ path = "src/bin/boot_heartbeat_gate.rs"
 [[bin]]
 name = "market-hours-liveness-gate"
 path = "src/bin/market_hours_liveness_gate.rs"
+
+[[bin]]
+name = "hard-stop-guard"
+path = "src/bin/hard_stop_guard.rs"
+
+[[bin]]
+name = "telegram-webhook"
+path = "src/bin/telegram_webhook.rs"
+
+[[bin]]
+name = "market-open-readiness"
+path = "src/bin/market_open_readiness.rs"
+
+[[bin]]
+name = "deploy-watchdog"
+path = "src/bin/deploy_watchdog.rs"
 
 [[bin]]
 name = "qdb-console-proxy"

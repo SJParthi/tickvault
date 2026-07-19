@@ -176,9 +176,17 @@ pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
     let files = iter_errors_jsonl_files(&dir_path);
     let mut events: Vec<Value> = Vec::new();
     for (_, f) in &files {
-        let Ok(raw) = std::fs::read_to_string(f) else {
+        // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
+        // behavior) instead of silently dropping a WHOLE errors file on
+        // invalid UTF-8 while still listing it in files_scanned — every
+        // valid JSON line keeps parsing; a binary line fails the
+        // per-line JSON parse and is skipped by the existing per-line
+        // semantics. A genuinely unreadable file (io error) keeps the
+        // skip-continue.
+        let Ok(bytes) = std::fs::read(f) else {
             continue;
         };
+        let raw = decode_utf8_replace(&bytes);
         let text = py_textmode(&raw);
         let lines = py_splitlines(&text);
         for line in lines.iter().rev() {
@@ -309,9 +317,17 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
     let mut order: Vec<String> = Vec::new();
     let mut first_seen: HashMap<String, NovelInfo> = HashMap::new();
     for (_, f) in &files {
-        let Ok(raw) = std::fs::read_to_string(f) else {
+        // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
+        // behavior) instead of silently dropping a WHOLE errors file on
+        // invalid UTF-8 while still listing it in files_scanned — every
+        // valid JSON line keeps parsing; a binary line fails the
+        // per-line JSON parse and is skipped by the existing per-line
+        // semantics. A genuinely unreadable file (io error) keeps the
+        // skip-continue.
+        let Ok(bytes) = std::fs::read(f) else {
             continue;
         };
+        let raw = decode_utf8_replace(&bytes);
         let text = py_textmode(&raw);
         for line in py_splitlines(&text) {
             let Some(ev) = parse_event(line) else {
@@ -459,9 +475,17 @@ pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value
     let files = iter_errors_jsonl_files(&dir_path);
     let mut matches: Vec<Value> = Vec::new();
     for (_, f) in &files {
-        let Ok(raw) = std::fs::read_to_string(f) else {
+        // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
+        // behavior) instead of silently dropping a WHOLE errors file on
+        // invalid UTF-8 while still listing it in files_scanned — every
+        // valid JSON line keeps parsing; a binary line fails the
+        // per-line JSON parse and is skipped by the existing per-line
+        // semantics. A genuinely unreadable file (io error) keeps the
+        // skip-continue.
+        let Ok(bytes) = std::fs::read(f) else {
             continue;
         };
+        let raw = decode_utf8_replace(&bytes);
         let text = py_textmode(&raw);
         for line in py_splitlines(&text) {
             let Some(ev) = parse_event(line) else {
@@ -2258,5 +2282,44 @@ mod tests {
             "python drops the `.` component: {err}"
         );
         assert!(!err.contains("/./"), "{err}");
+    }
+
+    /// 2026-07-18 review LOW-1: an errors.jsonl file containing an
+    /// invalid-UTF-8 line must be LOSSY-decoded, never silently dropped
+    /// whole — the valid JSON lines on either side of the binary line
+    /// must both survive (the binary line itself fails the per-line
+    /// JSON parse and is skipped by the existing per-line semantics).
+    #[test]
+    fn tail_errors_lossy_decodes_invalid_utf8_errors_file() {
+        let base = std::env::temp_dir().join(format!("tv-mcp-lossy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let machine = base.join("data").join("logs").join("machine");
+        std::fs::create_dir_all(&machine).unwrap();
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"{\"code\":\"AAA-01\",\"message\":\"first\"}\n");
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x80]); // invalid UTF-8 line
+        bytes.extend_from_slice(b"\n{\"code\":\"BBB-02\",\"message\":\"second\"}\n");
+        std::fs::write(machine.join("errors.jsonl.2026-07-18-05"), &bytes).unwrap();
+        let ctx = Ctx {
+            repo_root: base.clone(),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let out = tool_tail_errors(&ctx, 10, None);
+        let events = out["events"].as_array().unwrap();
+        let codes: Vec<&str> = events.iter().filter_map(|e| e["code"].as_str()).collect();
+        assert!(
+            codes.contains(&"AAA-01"),
+            "valid line BEFORE the binary line must survive lossy decode: {out}"
+        );
+        assert!(
+            codes.contains(&"BBB-02"),
+            "valid line AFTER the binary line must survive lossy decode: {out}"
+        );
+        assert_eq!(
+            events.len(),
+            2,
+            "exactly the two valid events (binary line skipped per-line): {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

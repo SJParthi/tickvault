@@ -51,7 +51,14 @@ app     = 63.3
 # structurally unexercisable without a live AWS account; every pure
 # decision/formatting fn is covered). Floor per the standing formula:
 # measured 64.92 rounded down to one decimal (64.9) minus 0.1 = 64.8.
-aws-lambdas = 64.8
+# RE-MEASURED 2026-07-18 (rust-only phase 2b-2 wave 1 — telegram-webhook +
+# market-open-readiness + deploy-watchdog modules added, each with its
+# python test suite ported 1:1): `cargo llvm-cov -p tickvault-aws-lambdas`
+# measured 66.06% lines (2681 lines, 910 missed — the misses remain the
+# thin [[bin]] glue files + the async AWS/HTTP-call glue, structurally
+# unexercisable without a live AWS account; every pure decision/formatting
+# fn is covered). Ratchet up-only: 66.06 → 66.0 − 0.1 = 65.9.
+aws-lambdas = 65.9
 # tickvault-logs-mcp: INITIAL floor (2026-07-18, rust-only phase 2c — the
 # new Rust MCP crate). Locally measured 85.83% line coverage (cargo
 # llvm-cov -p tickvault-logs-mcp, all targets — the parity integration

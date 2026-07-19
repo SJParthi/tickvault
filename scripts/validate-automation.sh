@@ -98,8 +98,11 @@ run_check "observability_chain_e2e" \
 # migration. Their checks are removed here so the sweep reflects reality.
 run_check "tickvault_logs_mcp_guard" \
     cargo test -p tickvault-common --test tickvault_logs_mcp_guard
-run_check "claude_triage_lambda_guard" \
-    cargo test -p tickvault-common --test claude_triage_lambda_guard
+# NOTE (2026-07-18 de-stale): claude_triage_lambda_guard was DELETED in the
+# Rust-only purge Phase 1 — the claude-triage Lambda scaffold it pinned
+# (deploy/aws/lambda/claude-triage/ + claude-triage-lambda.tf, wired-disabled,
+# never opted in) was removed; its check is removed here so the sweep
+# reflects reality. The LOCAL triage loop (.claude/triage/) is unaffected.
 run_check "loki_alloy_profile_guard" \
     cargo test -p tickvault-common --test loki_alloy_profile_guard
 run_check "runbook_cross_link_guard" \
@@ -122,16 +125,21 @@ run_check "auto-fix clear-spill executable" \
     test -x scripts/auto-fix-clear-spill.sh
 run_check "error-triage hook executable" \
     test -x .claude/hooks/error-triage.sh
-run_check "tickvault-logs MCP server present + executable" \
-    test -x scripts/mcp-servers/tickvault-logs/server.py
-run_check "tickvault-logs MCP self-test passes" \
-    python3 scripts/mcp-servers/tickvault-logs/server.py --self-test
-run_check "tickvault-logs MCP placeholder-env fallback" \
-    python3 scripts/mcp-servers/tickvault-logs/test_placeholder_fallback.py
-# 2026-07-18 (rust-only phase 2c, PRE-CUTOVER): the Rust port
-# crates/tickvault-logs-mcp is dual-pinned alongside server.py during the
-# parallel-run window. The python checks above stay until the separate
-# cutover PR swaps .mcp.json after live parallel-run validation.
+# 2026-07-18 (rust-only phase 2c, CUTOVER): .mcp.json launches the Rust
+# server via the launcher; the python server + its placeholder-fallback
+# test are DELETED from git (the parity harness re-materializes server.py
+# from pinned git history). The self-test check exercises the REAL
+# .mcp.json launch path (launcher -> prebuilt release binary, else cargo
+# run); the placeholder-env fallback twins live in the crate's config.rs
+# tests.
+run_check "tickvault-logs MCP launcher present + executable" \
+    test -x scripts/mcp-servers/tickvault-logs-launch.sh
+run_check "tickvault-logs MCP self-test passes (rust, via launcher)" \
+    bash scripts/mcp-servers/tickvault-logs-launch.sh --self-test
+run_check "tickvault-logs MCP placeholder-env fallback (rust config twins)" \
+    cargo test -p tickvault-logs-mcp --lib config::
+run_check "tickvault-logs python server retired from git" \
+    bash -c '[ -z "$(git ls-files scripts/mcp-servers/tickvault-logs/)" ]'
 run_check "tickvault-logs Rust MCP crate present" \
     test -f crates/tickvault-logs-mcp/src/main.rs
 run_check "tickvault-logs Rust MCP unit tests pass" \
