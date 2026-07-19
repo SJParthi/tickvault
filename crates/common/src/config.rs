@@ -67,12 +67,10 @@ pub struct ApplicationConfig {
     /// engines per L7).
     #[serde(default)]
     pub engine: EngineConfig,
-    /// Wave-5 in-memory store §K-L10 (PR #504d) — runtime-tunable
-    /// per-instrument tick capacity for `TickStorage`. Default 5_000
-    /// covers the busiest contract's daily tick count without
-    /// triggering Vec realloc.
-    #[serde(default)]
-    pub in_mem: InMemConfig,
+    // `[in_mem]` section REMOVED 2026-07-19 (dead-code cleanup — BATCH-5):
+    // its sole content was `[in_mem.tick_storage].per_instrument_capacity`,
+    // which fed the `TickStorage` store that was retired with the PrevDayCache/
+    // TickStorage removal. No production reader remained.
     /// Pluggable market-data feed selection (Groww second-feed scope,
     /// operator lock 2026-06-19 — see
     /// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`).
@@ -2178,45 +2176,9 @@ impl FeedsConfig {
     }
 }
 
-/// Container for the `[in_mem]` TOML section (Wave-5 §K-L10, PR #504d).
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct InMemConfig {
-    #[serde(default)]
-    pub tick_storage: TickStorageConfig,
-}
-
-/// `[in_mem.tick_storage]` — runtime-tunable TickStorage settings.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TickStorageConfig {
-    /// Pre-allocated `Vec<ParsedTick>` capacity per `(security_id,
-    /// exchange_segment)` key on first push. Sized to cover the
-    /// busiest contract's daily tick count without forcing a Vec
-    /// realloc (`tv_in_mem_tick_storage_realloc_total` increments on
-    /// overflow). Setting this to 0 falls back to the compile-time
-    /// default (`DEFAULT_PER_INSTRUMENT_CAPACITY = 5_000`) inside
-    /// `TickStorage::new` so a misconfigured TOML cannot trigger
-    /// 1-byte-realloc-per-tick.
-    #[serde(default = "TickStorageConfig::default_per_instrument_capacity")]
-    pub per_instrument_capacity: usize,
-}
-
-impl TickStorageConfig {
-    /// Default capacity = 5_000 per L10 sizing analysis (mirrors the
-    /// trading crate constant `DEFAULT_PER_INSTRUMENT_CAPACITY`).
-    /// Pinned by `test_tick_storage_default_per_instrument_capacity`.
-    #[must_use]
-    pub const fn default_per_instrument_capacity() -> usize {
-        5_000
-    }
-}
-
-impl Default for TickStorageConfig {
-    fn default() -> Self {
-        Self {
-            per_instrument_capacity: Self::default_per_instrument_capacity(),
-        }
-    }
-}
+// `InMemConfig` / `TickStorageConfig` REMOVED 2026-07-19 (dead-code cleanup —
+// BATCH-5): they configured the retired in-memory `TickStorage` store (removed
+// with the PrevDayCache/TickStorage sweep). No production reader remained.
 
 /// Container for the `[engine.timeframes]` TOML section. L8 pins the
 /// "TF list source" to `config/base.toml`, so this struct exists to
@@ -4219,7 +4181,7 @@ mod tests {
             // movers: MoversConfig retired in PR #2 (2026-05-18).
             features: FeaturesConfig::default(),
             engine: EngineConfig::default(),
-            in_mem: InMemConfig::default(),
+            // in_mem: InMemConfig retired 2026-07-19 (BATCH-5 dead-code cleanup).
             feeds: FeedsConfig::default(),
             scoreboard: ScoreboardConfig::default(),
             brutex_crossverify: BrutexCrossverifyConfig::default(),
@@ -4965,22 +4927,9 @@ mod tests {
         assert!(!engine.timeframes.contains_seconds_tf());
     }
 
-    // --- Wave-5 §K-L10 (PR #504d) ratchets ---------------------------
-
-    #[test]
-    fn test_tick_storage_default_per_instrument_capacity_is_5k() {
-        // L10 + sizing analysis pin: 5_000 covers the busiest contract.
-        // Drift requires plan amend.
-        let cfg = TickStorageConfig::default();
-        assert_eq!(cfg.per_instrument_capacity, 5_000);
-        assert_eq!(TickStorageConfig::default_per_instrument_capacity(), 5_000);
-    }
-
-    #[test]
-    fn test_in_mem_config_default_inherits_l10_tick_storage() {
-        let cfg = InMemConfig::default();
-        assert_eq!(cfg.tick_storage.per_instrument_capacity, 5_000);
-    }
+    // Wave-5 §K-L10 (PR #504d) TickStorageConfig/InMemConfig ratchets REMOVED
+    // 2026-07-19 (BATCH-5): the config surface they pinned was retired with the
+    // dead TickStorage store.
 
     #[test]
     fn test_observability_config_default() {
