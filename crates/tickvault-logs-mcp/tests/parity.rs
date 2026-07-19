@@ -1,6 +1,8 @@
-//! PARITY HARNESS (PR 2c evidence): drives BOTH the live Python
-//! `scripts/mcp-servers/tickvault-logs/server.py` and the Rust binary
-//! over an IDENTICAL scripted JSON-RPC transcript and diffs every
+//! PARITY HARNESS (PR 2c evidence): drives BOTH the Python reference
+//! `scripts/mcp-servers/tickvault-logs/server.py` — post-cutover
+//! materialized from git history at `SERVER_PY_PINNED_COMMIT` (the file
+//! is deleted from the tree; see `materialize_server_py`) — and the Rust
+//! binary over an IDENTICAL scripted JSON-RPC transcript and diffs every
 //! response after a small, explicitly-documented normalization.
 //!
 //! NORMALIZATION (the complete list — nothing else is touched):
@@ -144,6 +146,119 @@ fn repo_root() -> PathBuf {
         .and_then(Path::parent)
         .expect("repo root")
         .to_path_buf()
+}
+
+// ---------------------------------------------------------------------------
+// Python reference materialization (post-cutover, phase 2c)
+// ---------------------------------------------------------------------------
+
+/// The last pre-cutover `main` commit that carries
+/// `scripts/mcp-servers/tickvault-logs/server.py`. After the cutover PR
+/// deletes server.py from the working tree, the parity harness
+/// materializes the python reference FROM GIT HISTORY at this pinned
+/// commit — the frozen behavior contract the Rust port was byte-compared
+/// against. Bumping this pin is a deliberate reviewed change (it moves
+/// the parity baseline), never a side effect.
+const SERVER_PY_PINNED_COMMIT: &str = "c1e5991fb4c743dac38ea8c54d1e87ddcbca99ae";
+const SERVER_PY_REL: &str = "scripts/mcp-servers/tickvault-logs/server.py";
+
+/// Resolve the python reference server: the working-tree copy when one
+/// exists AND is byte-identical to the pinned blob (a previous
+/// materialization — the path is gitignored post-cutover; verified via
+/// blob-OID compare per the 2026-07-18 R1 LOW-1 finding, so a future pin
+/// bump can never silently parity against a stale copy), else
+/// `git show <pin>:<path>` written as a runtime
+/// artifact at the SAME path so the python child's
+/// `Path(__file__)`-derived repo root stays the REAL repo root (sessions
+/// A–D grep/doctor/git against the live tree). On a shallow CI clone the
+/// pinned commit is fetched on demand; total failure panics LOUDLY —
+/// a silently-skipped parity gate would be a false-OK (audit Rule 11).
+fn materialize_server_py() -> PathBuf {
+    let root = repo_root();
+    let path = root.join(SERVER_PY_REL);
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("run git {args:?}: {e}"))
+    };
+    let spec = format!("{SERVER_PY_PINNED_COMMIT}:{SERVER_PY_REL}");
+    // The needle check runs on BOTH paths (reused-verified and fresh) —
+    // 2026-07-18 hostile-review R1 LOW-1.
+    let assert_needle = |bytes: &[u8], ctx: &str| {
+        let needle: &[u8] = b"_run_stdio_loop";
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle),
+            "{ctx} server.py lacks _run_stdio_loop — wrong object at {spec}?"
+        );
+    };
+    if path.is_file() {
+        // 2026-07-18 hostile-review R1 LOW-1: a pre-existing working-tree
+        // copy (gitignored runtime artifact) is reused ONLY when
+        // byte-identical to the pinned blob — after a future pin bump, a
+        // stale copy must never silently parity against the OLD baseline.
+        // Compare the pinned blob OID against `git hash-object <file>`;
+        // on mismatch, delete and re-materialize from the pin.
+        let mut oid_out = git(&["rev-parse", &spec]);
+        if !oid_out.status.success() {
+            // Shallow clone: same fetch-retry as the `git show` path below.
+            let _ = git(&["fetch", "--depth=1", "origin", SERVER_PY_PINNED_COMMIT]);
+            oid_out = git(&["rev-parse", &spec]);
+        }
+        assert!(
+            oid_out.status.success(),
+            "cannot resolve pinned blob {spec} to verify the working-tree \
+             server.py (the parity gate must not silently reuse an \
+             unverified copy): {}",
+            String::from_utf8_lossy(&oid_out.stderr)
+        );
+        let pinned_oid = String::from_utf8_lossy(&oid_out.stdout).trim().to_string();
+        let hash_out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .arg("hash-object")
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|e| panic!("run git hash-object {}: {e}", path.display()));
+        assert!(
+            hash_out.status.success(),
+            "git hash-object {} failed (the parity gate must not silently \
+             reuse an unverified copy): {}",
+            path.display(),
+            String::from_utf8_lossy(&hash_out.stderr)
+        );
+        let actual_oid = String::from_utf8_lossy(&hash_out.stdout).trim().to_string();
+        if actual_oid == pinned_oid {
+            let bytes = std::fs::read(&path).expect("read verified working-tree server.py");
+            assert_needle(&bytes, "reused working-tree");
+            return path;
+        }
+        // Stale copy from an OLD pin (or a hand-edit): never reuse it.
+        std::fs::remove_file(&path).expect("remove stale materialized server.py");
+    }
+    let mut out = git(&["show", &spec]);
+    if !out.status.success() {
+        // Shallow clone (CI checkout fetch-depth=1): fetch the pinned
+        // commit by sha (reachable from main), then retry.
+        let _ = git(&["fetch", "--depth=1", "origin", SERVER_PY_PINNED_COMMIT]);
+        out = git(&["show", &spec]);
+    }
+    assert!(
+        out.status.success(),
+        "cannot materialize {spec} from git history (the parity gate must \
+         not silently skip): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = out.stdout;
+    assert_needle(&bytes, "materialized");
+    std::fs::create_dir_all(path.parent().expect("server.py parent")).expect("mkdir server.py dir");
+    // Temp-then-rename: a concurrent invocation must never see a torn file.
+    let tmp = root.join(format!("{SERVER_PY_REL}.tmp{}", std::process::id()));
+    std::fs::write(&tmp, &bytes).expect("write materialized server.py");
+    std::fs::rename(&tmp, &path).expect("rename materialized server.py");
+    path
 }
 
 fn write(path: &Path, content: &str) {
@@ -530,16 +645,9 @@ fn spawn_session(
     extra: &[(&str, &str)],
 ) -> Session {
     let root = repo_root();
-    let server_py = root
-        .join("scripts")
-        .join("mcp-servers")
-        .join("tickvault-logs")
-        .join("server.py");
-    assert!(
-        server_py.is_file(),
-        "server.py missing: {}",
-        server_py.display()
-    );
+    // Post-cutover: server.py is deleted from git — materialize the
+    // pinned-history reference at the real path (root derivation intact).
+    let server_py = materialize_server_py();
 
     let mut envs: Vec<(String, String)> = envs_common.to_vec();
     for (k, v) in extra {
@@ -904,11 +1012,7 @@ fn parity_transcript() {
     // TICKVAULT_MCP_REPO_ROOT.
     // ------------------------------------------------------------------
     {
-        let real_server = repo_root()
-            .join("scripts")
-            .join("mcp-servers")
-            .join("tickvault-logs")
-            .join("server.py");
+        let real_server = materialize_server_py();
         let server_copy = fixture_root
             .join("scripts")
             .join("mcp-servers")

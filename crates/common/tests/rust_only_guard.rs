@@ -74,26 +74,8 @@ const TRACKED_PY_ALLOWLIST: &[&str] = &[
     ".claude/skills/dhanhq/scripts/resolve_security.py",
     ".claude/skills/dhanhq/scripts/trade_logger.py",
     ".claude/skills/dhanhq/scripts/validate_order.py",
-    "deploy/aws/lambda/deploy-watchdog/handler.py",
-    "deploy/aws/lambda/deploy-watchdog/test_handler.py",
-    "deploy/aws/lambda/hard-stop-guard/handler.py",
-    "deploy/aws/lambda/hard-stop-guard/test_handler.py",
-    "deploy/aws/lambda/market-open-readiness/handler.py",
-    "deploy/aws/lambda/market-open-readiness/test_handler.py",
-    "deploy/aws/lambda/operator-control/handler.py",
-    "deploy/aws/lambda/operator-control/test_handler.py",
-    "deploy/aws/lambda/questdb-console-front/handler.py",
-    "deploy/aws/lambda/questdb-console-front/test_handler.py",
-    "deploy/aws/lambda/questdb-console-proxy/handler.py",
-    "deploy/aws/lambda/questdb-console-proxy/test_handler.py",
-    "deploy/aws/lambda/start-watchdog/handler.py",
-    "deploy/aws/lambda/start-watchdog/test_handler.py",
-    "deploy/aws/lambda/telegram-webhook/handler.py",
-    "deploy/aws/lambda/telegram-webhook/test_handler.py",
     "docs/incidents/2026-07-06-questdb-console-shell-hang/raw_socket_probe.py",
     "docs/incidents/2026-07-06-questdb-console-shell-hang/repro_backlambda.py",
-    "scripts/mcp-servers/tickvault-logs/server.py",
-    "scripts/mcp-servers/tickvault-logs/test_placeholder_fallback.py",
 ];
 
 /// Files (non-`.py`, non-docs) that carry a python invocation on a
@@ -101,8 +83,6 @@ const TRACKED_PY_ALLOWLIST: &[&str] = &[
 /// no additions ever; a file that goes python-clean (or is deleted) MUST
 /// have its entry removed in the same PR.
 const INVOCATION_SITE_ALLOWLIST: &[&str] = &[
-    ".github/workflows/ci.yml",
-    ".mcp.json",
     "Makefile",
     "scripts/bench-gate.sh",
     "scripts/validate-automation.sh",
