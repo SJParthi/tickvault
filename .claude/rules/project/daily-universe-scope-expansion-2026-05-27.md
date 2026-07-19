@@ -115,6 +115,27 @@
 > stays a separate, un-quoted executor pre-stage — this ruling accepts 30 GB as
 > the live size; going below 30 still needs its own operator go.
 
+**Quote 10 (2026-07-19, same day — EIP release for the no-real-orders period; preserve EXACTLY, typos included):**
+> "until or unless we flip the real orders static ip is not needed due okay?"
+>
+> Operator ruled: the Elastic IP release is **APPROVED for the no-real-orders
+> period**, with a strict safety order — **VERIFY outbound-without-EIP FIRST,
+> release SECOND**. Live verification (coordinator session, 2026-07-19, live
+> describe evidence) returned VERIFIED-UNSAFE-STANDALONE: the subnet
+> (`subnet-00c8d06903d1482ea`) does carry `MapPublicIpOnLaunch=true` with a
+> real IGW route, but ephemeral-public-IP assignment is a LAUNCH-TIME ENI
+> attribute — the live ENI `eni-01fdeec2412f55587` (launched 2026-05-24,
+> before the subnet flag) can NEVER mint an ephemeral IP, so a standalone
+> release bricks the box (this file's §7 "no public IP after a
+> stop/modify/start" claim CONFIRMED live). Execution is therefore BUNDLED
+> with the erase-window instance RECREATE (the 20 GB fresh-volume pre-stage —
+> a fresh launch inherits the subnet auto-assign and gets an ephemeral IP
+> every start). Runbook: `docs/runbooks/eip-release.md`; bill path + second
+> ruling record: `aws-budget.md` "OPERATOR RULING 2026-07-19 (SECOND, same
+> day)". Re-enable for live trading: new EIP + Dhan setIP re-whitelist
+> planned ≥7 days before go-live (Dhan's modify cooldown), with fresh dated
+> edits HERE + in `websocket-connection-scope-lock.md` first.
+
 **Approvals:**
 - 2026-05-27: Approved Sub-PR plan items A–D (infinite retry policy, single `instrument_lifecycle` table, separate `instrument_lifecycle_audit` table, plan growing to 14 sub-PRs)
 - 2026-05-27: Approved options X–Z (EventBridge cron at 08:30 IST, `lifecycle_state_locked` column for operator overrides, `--dry-run-universe` CLI flag for first prod validation)
@@ -127,6 +148,7 @@
 - 2026-07-15: Approved instance DOWNSIZE r8g.large → **t4g.medium** (2 vCPU / 4 GiB) + QDB_MEM_LIMIT 4g → 1g, executed via the guarded `downsize-instance.yml` workflow (old root snapshotted first, kept ~1 week), per Quote 8 ("Flip tonight: t4g.medium, QuestDB 1g, automated"). INTERIM bill (the live root stays 50 GB — gp3 cannot shrink) ~₹3,101/mo → **~₹1,471/mo** incl GST at 270 hrs; drops to ~₹1,197/mo only AFTER the 20 GB fresh-volume recreate (executor pre-stage, not operator-quoted); ~₹986/mo requires BOTH the ~176-hr pure auto-schedule basis AND the post-recreate 20 GB volume (on the live 50 GB root the ~176-hr figure is ~₹1,260), NEVER the 270-hr figure. EIP kept.
 - 2026-07-19: **LIVE-STATE CORRECTION (verified evidence, not a new approval):** `aws ec2 describe-volumes` on `vol-073ccaa417a0f344b` (the root of `i-0b956d0209231a48b`, attached at `/dev/xvda` since 2026-05-24) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use** — run live 2026-07-19 via the coordinator session's credentialed AWS access. The 2026-07-13 approved 30→50 GB grow (bullet above) was RECORDED but **never physically applied** — every "live 50 GB root" statement dated 2026-07-15 (the Quote 8 executor note + the bullet above + §7) is corrected by the dated 2026-07-19 notes in §7. **FLAGGED FOLLOW-UP:** the disk-pressure remediation that grow was approved for is therefore UNAPPLIED — the 82%-disk-pressure risk class may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note.
 - 2026-07-19: **RULING (Quote 9): 30 GB ACCEPTED + t4g.medium as-of-now + hard target < ₹1,000/mo incl GST.** Resolves the flagged follow-up in the bullet above — the 2026-07-13 30→50 grow is **CANCELLED**; the accepted mitigation for the disk-pressure class is code retention + S3 archival on the 30 GB root (any future grow needs a fresh dated quote). The recorded interim bills (~₹1,289/mo at 270 hrs; ~₹1,077/mo at ~176 hrs) EXCEED the new target — the itemized lever path + which combinations reach <₹1,000 (none without an operator-gated lever) is recorded in `aws-budget.md` "OPERATOR RULING 2026-07-19"; the budget-alarm kill ceiling stepped $55 → $25 the same day with a dated ratchet ladder toward $10 (₹1,000 ÷ 1.18 ÷ ₹85 ≈ $10 pre-GST).
+- 2026-07-19: **RULING (Quote 10, later same day): EIP release APPROVED for the no-real-orders period — verify-first, bundled execution.** Live verification (coordinator session, 2026-07-19) proved a standalone release UNSAFE (launch-time ENI attribute — the live ENI never mints an ephemeral IP), so the release lands ONLY inside the erase-window recreate bundle per `docs/runbooks/eip-release.md`; the Lever-2/Lever-5 rows in `aws-budget.md` are updated in lockstep. Post-bundle bill lands in the ~₹600–720/mo class at ~176 hrs (~₹808–929 at the 270-hr ceiling) — under the Quote 9 target at BOTH hour bases.
 
 ---
 
@@ -272,7 +294,7 @@ per-minute-REST workload is NOT yet live-validated on credits — watch
 | Pricing | On-demand **$0.0224/hr** (ap-south-1, console-verified 2026-05-18 — re-verify at execution) — no Reserved / Savings Plan / Spot |
 | Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
 | EBS | gp3 **30 GB LIVE — ACCEPTED by the 2026-07-19 ruling (Quote 9: "just 30 gn enough"; the 2026-07-13 30→50 grow is CANCELLED)** (VERIFIED 2026-07-19 via live `describe-volumes` — the grow was recorded but never physically applied; this row read "50 GB LIVE" 2026-07-15→2026-07-19. gp3 cannot shrink — the 20 GB target lands only via the fresh-volume terminate-and-recreate in the operator's erase window; terraform default pre-staged to 20, executor decision 2026-07-15) |
-| EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan) |
+| EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan). **2026-07-19 Quote 10 supersession note: release APPROVED for the no-real-orders period — execution ONLY via the bundled erase-window recreate** (a standalone release is VERIFIED-UNSAFE on the live ENI — launch-time attribute, live describe evidence, coordinator session, 2026-07-19; this row's "no public IP after stop/modify/start" claim CONFIRMED). Runbook: `docs/runbooks/eip-release.md`. Re-enable + Dhan setIP ≥7 days before live orders. |
 | Network | ENA enabled by default |
 
 ### Cost bill (LOCKED INTERIM ~₹1,289/mo incl. 18% GST — 270 hrs, live 30 GB EBS verified 2026-07-19; drops to ~₹1,197/mo after the 20 GB recreate; was ~₹3,101 on r8g.large pre-2026-07-15)
@@ -352,7 +374,10 @@ on top. The EIP is kept because an
 `aws ec2 modify-instance-attribute` instance-type flip (stop→modify→start)
 leaves the ENI with NO ephemeral public IP (auto-assign-public-IP is a
 fresh-launch-only attribute), so only the EIP gives the box an internet
-path to SSM + Dhan. **Tax:** 18% GST total (IGST inter-state, or CGST 9% +
+path to SSM + Dhan *(mechanism CONFIRMED live 2026-07-19; per Quote 10 the
+EIP is release-APPROVED for the no-real-orders period via the bundled
+erase-window recreate ONLY — see the §7 EIP row note +
+`docs/runbooks/eip-release.md`)*. **Tax:** 18% GST total (IGST inter-state, or CGST 9% +
 SGST 9% intra-state — identical 18%, no extra cess). Verified: t4g.medium
 $0.0224/hr (ap-south-1 console 2026-05-18 — re-verify at execution);
 EIP/EBS/S3/SNS are AWS list rates. Budget alarm ceiling stays $35/mo

@@ -415,3 +415,30 @@ Confirmed after a permission prompt about this rule-file write (event 157f7cd0-d
 GROWW order/position/trade PUSH channel: ONE NEW dedicated NATS-over-WS connection (`wss://socket-api.groww.in`) carrying ORDER / POSITION / TRADE events ONLY — never market data (market data stays REST-only per the 2026-07-15 amendment). Config key `order_push_enabled` under `[groww_orders]` (serde default OFF); module tree `crates/trading/src/oms/groww/push/`; error codes GROWW-PUSH-01..04; `WsType::GrowwOrderUpdate`. Receive-only, paper mode; `GROWW_ORDER_LIVE_FIRE` stays false; no live orders.
 
 2026-07-16 (operator directive above, events 38df2073 + 157f7cd0): the dormant `order_update_connection.rs` is authorized for re-spawn as a PAPER-MODE, receive-only, DEFAULT-OFF channel from `dhan_rest_stack` Phase 5a, gated on `[dhan_order_push] enabled = false`, with `notifier: None` (Telegram-silent — the Dhan 4-item noise-lock family unchanged, the 2 deleted CloudWatch alarms stay deleted). Events are consumed into `order_audit` rows feed='dhan'/mode='paper'. Module DELETION remains REJECT; live order fire remains locked (dry_run untouched).
+
+### 2026-07-19 — Static IP / EIP ruling: release APPROVED for the no-real-orders period (Dhan static-IP whitelist dormant until live re-enable)
+
+Operator Parthiban, 2026-07-19, verbatim (preserve EXACTLY, typos included):
+> "until or unless we flip the real orders static ip is not needed due okay?"
+
+Effects (docs-only record; NO terraform flip ships with this note): the Elastic IP
+(`13.234.145.177` — the Dhan static-IP whitelist address) is release-APPROVED for the
+no-real-orders period. The operator's safety order — VERIFY outbound-without-EIP FIRST,
+release SECOND — was executed as a live verification (coordinator session, 2026-07-19,
+live describe evidence): a STANDALONE release is UNSAFE (ephemeral-public-IP assignment is
+a launch-time ENI attribute; the live ENI `eni-01fdeec2412f55587` can never mint one, so
+release-today = no public IPv4 = no SSM/feeds/deploys). Execution is therefore BUNDLED
+with the erase-window instance RECREATE per `docs/runbooks/eip-release.md` (recreate →
+prove the fresh ENI mints an ephemeral IP → merge the `enable_eip=false` terraform PR —
+the path-filtered terraform-apply auto lane is the sanctioned release mechanism).
+The Dhan static-IP surface stays consistent with the existing retirements: the Step 6a
+boot IP gate + Step 5.5 IP verification already retired with the Dhan live-WS lane (PR-C2,
+2026-07-13 — `ip_verifier` has zero production callers, Verified 2026-07-19), and the Dhan
+DATA REST pulls (§8 spot-1m/chain) carry no static-IP requirement — only the ORDER APIs do.
+**RE-ENABLE PROTOCOL (live trading):** ≥7 days BEFORE the first live order (Dhan's static-IP
+modify cooldown): fresh dated operator quote HERE + daily-universe §7 → `enable_eip=true`
+terraform PR (allocates a NEW address — the old one is gone forever) → Dhan
+`POST /v2/ip/setIP` (PRIMARY) registration → update the EIP literal consumers
+(`downsize-instance.yml` `EXPECTED_EIP`, SSM `/tickvault/<env>/network/static-ip`) → re-wire
+the boot IP gate before live fire. A PR that flips `enable_eip` in EITHER direction without
+the matching dated note here + §7 = REJECT.
