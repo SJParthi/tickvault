@@ -47,8 +47,10 @@ Recorded bases (daily-universe §7, 2026-07-19-corrected — Verified arithmetic
 - PLUS the un-itemised add-ons the §7 honest envelope already admits:
   the dated COST-NOTE alarm spend, recorded **~$2.7/mo ≈ ₹271/mo incl GST**
   (that recorded figure PREDATES the 2026-07-15→18 retirement notes below,
-  −$2.4-class in total, so the LIVE number is likely materially lower —
-  Unknown without Cost Explorer), and the 2026-07-15 rollback snapshot
+  ≈ −$2.5 in total — 0.50+0.10+0.70+0.10+0.40+0.70; with the 2026-07-14
+  PR-C3 −$0.40 already netted inside the ~$2.7 record — so the LIVE number
+  is likely materially lower — Unknown without Cost Explorer), and the
+  2026-07-15 rollback snapshot
   `snap-090ed9c4f3df0ca61` at **~₹125/mo class** (Assumed magnitude —
   EBS snapshots bill on USED blocks at ~$0.05/GB-mo, so the 30 GB root
   bills its ~used-space ≈ $1.0–1.5 pre-GST ≈ ₹100–150 incl GST; a full
