@@ -159,7 +159,6 @@ fn in_session(secs: i64) -> bool {
     (SESSION_OPEN_SECS_OF_DAY_IST..SESSION_CLOSE_SECS_OF_DAY_IST).contains(&secs)
 }
 
-// APPROVED: boot wiring injects each handle explicitly; a params struct refactor is tracked separately
 #[allow(clippy::too_many_arguments)] // APPROVED: 10 narrow scalar comparison inputs; a params struct adds nothing
 fn cmp_field(
     field: &'static str,
