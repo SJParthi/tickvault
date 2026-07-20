@@ -1132,6 +1132,14 @@ banned-pattern scanner keeps its RAM-first category, all 3 boot legs keep
 the classify/publish wiring, and the contract leg (DB-audit-only) never
 publishes a snapshot.
 
+> **⚠ SIGN CONVENTION SUPERSEDED 2026-07-20 (operator ruling — see the
+> dated section immediately below).** The 2026-07-17 paragraph is retained
+> verbatim for audit; its "NEGATIVE = ITM-direction, POSITIVE =
+> OTM-direction" convention (CE depth = strike − spot, PE depth =
+> spot − strike) is NO LONGER the law. The 2026-07-20 law INVERTS the
+> sign: **ITM ⇒ depth > 0, OTM ⇒ depth < 0** (CE depth = spot − strike;
+> PE depth = strike − spot).
+
 **2026-07-17 — `moneyness_depth` DOUBLE companion column (`option_chain_1m`,
 BOTH feeds):** the SYMBOL classification gains a signed numeric distance
 column, `moneyness_depth` DOUBLE (rupees), stamped at WRITE time by both
@@ -1160,6 +1168,34 @@ DOUBLE is the raw parsed f64 — a sub-paise strike would make
 `moneyness_depth` differ from (stored strike − stored spot) by < 1
 paise; real NSE strikes are whole-paise, so the divergence is nil in
 practice.
+
+**2026-07-20 — moneyness_depth SIGN FLIP (operator ruling — supersedes the
+2026-07-17 convention above):** the operator observed a live row at spot
+57800.9 / strike 81000 showing ITM depth = −23199.1 and OTM depth =
++23199.1 and ruled the convention inverted — verbatim intent: *"ITM depth
+must be POSITIVE, OTM must be NEGATIVE — flip it."* The NEW law
+(test-pinned in `crates/common/src/moneyness.rs`):
+
+- **`classify == Itm ⇒ depth > 0`, `classify == Otm ⇒ depth < 0`,
+  0 = strike paise-exactly at spot** (leg-normalized, both legs identical
+  sign semantics);
+- **CE depth = spot − strike** (CE ITM when strike < spot → positive ✓);
+- **PE depth = strike − spot** (PE ITM when strike > spot → positive ✓).
+
+Screenshot verification: spot 57800.9 / strike 81000 → PE (ITM) depth =
+81000 − 57800.9 = **+23199.1** ✓; CE (OTM) depth = 57800.9 − 81000 =
+**−23199.1** ✓. Everything else is UNCHANGED: NULL semantics, the
+not-in-DEDUP-key label-column class, the integer-paise home
+(`moneyness_depth_paise`) + `depth_paise_to_rupees` write-boundary split,
+the parse-only-strike ratchet, and the RAM snapshot path (no depth
+field). Rows written under the 2026-07-17 convention (2026-07-17 →
+2026-07-20 merge minute) carry the OLD sign and are NOT backfilled
+(label column, latest-run-wins on any DEDUP re-append); rows self-correct
+from the merge minute onward. The code from 2026-07-17 faithfully
+followed the ruling of its day — the RULING is what flipped, not a code
+bug. Ratchets: `test_moneyness_depth_paise_ce_pe_sign_convention`,
+`test_moneyness_depth_sign_is_consistent_with_classification`,
+`test_moneyness_depth_one_paise_boundary`.
 
 ## §3. Delivery boundary (honest — no false-OK)
 

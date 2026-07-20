@@ -162,8 +162,9 @@ pub struct OptionChain1mRow {
     /// key (label column — the `contract_security_id` precedent).
     pub moneyness: &'static str,
     /// Signed moneyness DEPTH in rupees (2026-07-17, operator-confirmed
-    /// gap): negative = ITM-direction, positive = OTM-direction for BOTH
-    /// legs (CE: strike − spot; PE: spot − strike — the leg-normalized
+    /// gap; sign flipped per operator ruling 2026-07-20): positive =
+    /// ITM-direction, negative = OTM-direction for BOTH legs
+    /// (CE: spot − strike; PE: strike − spot — the leg-normalized
     /// sign convention of
     /// `tickvault_common::moneyness::moneyness_depth_paise`, the ONLY
     /// home of the arithmetic per the parse-only strike ratchet).
@@ -268,10 +269,11 @@ pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 25] {
         // NULL FOREVER (never backfilled). NOT in the DEDUP key (label
         // column — the contract_security_id precedent).
         ("moneyness", "SYMBOL"),
-        // Signed moneyness depth (2026-07-17, operator-confirmed gap):
+        // Signed moneyness depth (2026-07-17, operator-confirmed gap;
+        // sign flipped per operator ruling 2026-07-20):
         // the numeric companion to the moneyness label — signed rupees,
-        // negative = ITM-direction / positive = OTM-direction for BOTH
-        // legs (CE: strike−spot; PE: spot−strike), computed at WRITE time
+        // positive = ITM-direction / negative = OTM-direction for BOTH
+        // legs (CE: spot−strike; PE: strike−spot), computed at WRITE time
         // in `tickvault_common::moneyness::moneyness_depth_paise` (integer
         // paise — the single arithmetic home per the parse-only strike
         // ratchet). Additive + nullable (ILP-sparse: written only when
@@ -718,8 +720,9 @@ mod tests {
             // 25650 CE @ spot 25642.8, Rs.50 grid → the grid-rounded ATM.
             moneyness: "ATM",
             // The ATM label still carries its signed distance: CE depth =
-            // 25650.00 − 25642.80 = +7.20 rupees (OTM-direction sign).
-            moneyness_depth: Some(7.2),
+            // 25642.80 − 25650.00 = −7.20 rupees (OTM-direction sign,
+            // negative per the 2026-07-20 flip).
+            moneyness_depth: Some(-7.2),
         }
     }
 
@@ -887,7 +890,7 @@ mod tests {
         w.append_row(&sample_row()).expect("append must succeed");
         let line = w.buffer_utf8();
         assert!(
-            line.contains("moneyness_depth=7.2"),
+            line.contains("moneyness_depth=-7.2"),
             "moneyness_depth missing when Some: {line}"
         );
         let mut ext = OptionChain1mWriter::for_test_with_feed(
@@ -897,7 +900,7 @@ mod tests {
         ext.append_row_ext(&sample_row(), Some(5.1802), Some(1_042))
             .expect("ext append must succeed");
         assert!(
-            ext.buffer_utf8().contains("moneyness_depth=7.2"),
+            ext.buffer_utf8().contains("moneyness_depth=-7.2"),
             "moneyness_depth missing on the ext path: {}",
             ext.buffer_utf8()
         );

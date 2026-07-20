@@ -509,9 +509,10 @@ pub struct ChainClassification {
     /// Per-leg classes, index-aligned with the input leg order (the
     /// persist loop zips over this).
     pub row_moneyness: Vec<Moneyness>,
-    /// Per-leg signed moneyness DEPTH in rupees (2026-07-17), index-
-    /// aligned with `row_moneyness`: negative = ITM-direction, positive =
-    /// OTM-direction for BOTH legs (CE: strike−spot; PE: spot−strike).
+    /// Per-leg signed moneyness DEPTH in rupees (2026-07-17; sign flipped
+    /// per operator ruling 2026-07-20), index-aligned with
+    /// `row_moneyness`: positive = ITM-direction, negative =
+    /// OTM-direction for BOTH legs (CE: spot−strike; PE: strike−spot).
     /// `None` = unclassifiable (unparsable leg / guarded-invalid values —
     /// the persisted column lands NULL). ALL arithmetic lives in
     /// `tickvault_common::moneyness::moneyness_depth_paise` (integer

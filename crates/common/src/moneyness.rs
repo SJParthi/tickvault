@@ -371,19 +371,22 @@ pub fn classify_moneyness_for(
 }
 
 /// Signed moneyness DEPTH in paise — the numeric companion to the
-/// ITM/ATM/OTM label (operator-confirmed gap, 2026-07-17): how far the
-/// strike sits from the spot, LEG-NORMALIZED so the sign reads the same
-/// for both legs:
+/// ITM/ATM/OTM label (operator-confirmed gap, 2026-07-17; sign convention
+/// FLIPPED per operator ruling 2026-07-20 — ITM must read POSITIVE): how
+/// far the strike sits from the spot, LEG-NORMALIZED so the sign reads
+/// the same for both legs:
 ///
-/// - **negative = ITM-direction**, **positive = OTM-direction**,
+/// - **positive = ITM-direction**, **negative = OTM-direction**,
 ///   **0 = strike paise-exactly at the spot**;
-/// - CE: `depth = strike − spot` (CE is ITM when strike < spot → negative ✓);
-/// - PE: `depth = spot − strike` (PE is ITM when strike > spot → negative ✓).
+/// - CE: `depth = spot − strike` (CE is ITM when strike < spot → positive ✓);
+/// - PE: `depth = strike − spot` (PE is ITM when strike > spot → positive ✓).
 ///
 /// This matches [`classify_moneyness_paise`]'s direction convention
 /// (decision-table rows 7–10: CE strike<spot = ITM, PE strike>spot = ITM),
-/// so for any valid inputs `classify == Itm ⇒ depth < 0` and
-/// `classify == Otm ⇒ depth > 0` (consistency-pinned in the tests below).
+/// so for any valid inputs `classify == Itm ⇒ depth > 0` and
+/// `classify == Otm ⇒ depth < 0` (consistency-pinned in the tests below).
+/// The pre-2026-07-20 convention was the inverse (ITM negative) — rows
+/// persisted under it carry the old sign and are never backfilled.
 /// ATM-labeled rows STILL carry their signed distance — the grid-rounded
 /// ATM strike can sit a nonzero distance from the spot (the label
 /// semantics are untouched; depth is the companion number, never a
@@ -396,8 +399,8 @@ pub fn classify_moneyness_for(
 /// | 1 | leg not "CE"/"PE" | — | `None` |
 /// | 2 | `strike_paise < 1` or `spot_paise < 1` | any | `None` |
 /// | 3 | i64 overflow on the subtraction | any | `None` (checked, never a panic — structurally unreachable once row 2 holds: both operands ≥ 1 bound the result by ±(`i64::MAX` − 1)) |
-/// | 4 | ok | CE | `Some(strike_paise − spot_paise)` |
-/// | 5 | ok | PE | `Some(spot_paise − strike_paise)` |
+/// | 4 | ok | CE | `Some(spot_paise − strike_paise)` |
+/// | 5 | ok | PE | `Some(strike_paise − spot_paise)` |
 ///
 /// The `< 1` guards mirror [`classify_moneyness_paise`]'s operand guards:
 /// callers feed [`price_to_paise_guarded`] outputs (0 = invalid/missing),
@@ -409,7 +412,7 @@ pub fn classify_moneyness_for(
 /// The depth derives from [`price_to_paise_guarded`] (ROUNDED paise)
 /// while the persisted `strike` DOUBLE column is the raw parsed f64 — a
 /// sub-paise strike would make the stored `moneyness_depth` differ from
-/// (stored strike − stored spot) by < 1 paise. Real NSE strikes are
+/// the stored spot/strike difference by < 1 paise. Real NSE strikes are
 /// whole-paise, so the divergence is nil in practice.
 ///
 /// # Performance
@@ -422,8 +425,8 @@ pub fn moneyness_depth_paise(leg: &str, strike_paise: i64, spot_paise: i64) -> O
         return None;
     }
     match leg {
-        OptionLeg::Ce => strike_paise.checked_sub(spot_paise),
-        OptionLeg::Pe => spot_paise.checked_sub(strike_paise),
+        OptionLeg::Ce => spot_paise.checked_sub(strike_paise),
+        OptionLeg::Pe => strike_paise.checked_sub(spot_paise),
     }
 }
 
@@ -889,40 +892,69 @@ mod tests {
         );
     }
 
-    // -- Signed moneyness depth (2026-07-17) ---------------------------------
+    // -- Signed moneyness depth (2026-07-17; sign flipped 2026-07-20) --------
 
     #[test]
     fn test_moneyness_depth_paise_ce_pe_sign_convention() {
-        // CE ITM (strike < spot) → negative.
+        // 2026-07-20 operator ruling: ITM ⇒ depth > 0, OTM ⇒ depth < 0.
+        // 4-quadrant pin:
+        // CE ITM (strike < spot) → POSITIVE.
         assert_eq!(
             moneyness_depth_paise("CE", 2_450_000, 2_453_640),
-            Some(-3_640)
+            Some(3_640)
         );
-        // CE OTM (strike > spot) → positive.
+        // CE OTM (strike > spot) → NEGATIVE.
         assert_eq!(
             moneyness_depth_paise("CE", 2_460_000, 2_453_640),
-            Some(6_360)
-        );
-        // PE ITM (strike > spot) → negative.
-        assert_eq!(
-            moneyness_depth_paise("PE", 2_460_000, 2_453_640),
             Some(-6_360)
         );
-        // PE OTM (strike < spot) → positive.
+        // PE ITM (strike > spot) → POSITIVE.
+        assert_eq!(
+            moneyness_depth_paise("PE", 2_460_000, 2_453_640),
+            Some(6_360)
+        );
+        // PE OTM (strike < spot) → NEGATIVE.
         assert_eq!(
             moneyness_depth_paise("PE", 2_450_000, 2_453_640),
-            Some(3_640)
+            Some(-3_640)
         );
         // Strike paise-exactly at the spot → Some(0), both legs.
         assert_eq!(moneyness_depth_paise("CE", 2_453_640, 2_453_640), Some(0));
         assert_eq!(moneyness_depth_paise("PE", 2_453_640, 2_453_640), Some(0));
         // The ATM-labeled grid strike still carries its signed distance:
         // the 2026-04-21 capture (spot 24536.40, grid ATM 24550.00) → CE
-        // depth +13.60 rupees = +1360 paise (label ATM, depth nonzero).
+        // depth −13.60 rupees = −1360 paise (label ATM, OTM-direction now
+        // negative; depth nonzero).
         assert_eq!(
             moneyness_depth_paise("CE", 2_455_000, 2_453_640),
-            Some(1_360)
+            Some(-1_360)
         );
+        // The 2026-07-20 operator screenshot: spot 57800.90, strike
+        // 81000.00 → PE (ITM) = +23199.10, CE (OTM) = −23199.10.
+        assert_eq!(
+            moneyness_depth_paise("PE", 8_100_000, 5_780_090),
+            Some(2_319_910)
+        );
+        assert_eq!(
+            moneyness_depth_paise("CE", 8_100_000, 5_780_090),
+            Some(-2_319_910)
+        );
+    }
+
+    /// One-tick (1 paise) boundary around the spot: the smallest possible
+    /// nonzero distance carries the correct 2026-07-20 sign in all four
+    /// quadrants.
+    #[test]
+    fn test_moneyness_depth_one_paise_boundary() {
+        let spot = 2_453_640_i64;
+        // CE one paise ITM-side (strike = spot − 1) → +1.
+        assert_eq!(moneyness_depth_paise("CE", spot - 1, spot), Some(1));
+        // CE one paise OTM-side (strike = spot + 1) → −1.
+        assert_eq!(moneyness_depth_paise("CE", spot + 1, spot), Some(-1));
+        // PE one paise ITM-side (strike = spot + 1) → +1.
+        assert_eq!(moneyness_depth_paise("PE", spot + 1, spot), Some(1));
+        // PE one paise OTM-side (strike = spot − 1) → −1.
+        assert_eq!(moneyness_depth_paise("PE", spot - 1, spot), Some(-1));
     }
 
     #[test]
@@ -946,10 +978,10 @@ mod tests {
         // checked_sub can never overflow — the widest possible legal pairs
         // still compute Some (the checked form is pure defense-in-depth,
         // never a panic path).
-        assert_eq!(moneyness_depth_paise("PE", i64::MAX, 1), Some(1 - i64::MAX));
-        assert_eq!(moneyness_depth_paise("CE", 1, i64::MAX), Some(1 - i64::MAX));
-        assert_eq!(moneyness_depth_paise("CE", i64::MAX, 1), Some(i64::MAX - 1));
-        assert_eq!(moneyness_depth_paise("PE", 1, i64::MAX), Some(i64::MAX - 1));
+        assert_eq!(moneyness_depth_paise("CE", i64::MAX, 1), Some(1 - i64::MAX));
+        assert_eq!(moneyness_depth_paise("PE", 1, i64::MAX), Some(1 - i64::MAX));
+        assert_eq!(moneyness_depth_paise("PE", i64::MAX, 1), Some(i64::MAX - 1));
+        assert_eq!(moneyness_depth_paise("CE", 1, i64::MAX), Some(i64::MAX - 1));
     }
 
     #[test]
@@ -961,9 +993,10 @@ mod tests {
 
     #[test]
     fn test_moneyness_depth_sign_is_consistent_with_classification() {
-        // For a spread of valid (leg, strike, spot, atm) inputs:
-        // classify==Itm ⇒ depth<0 and classify==Otm ⇒ depth>0; ATM rows
-        // are excluded from the sign assertion but MUST still be Some.
+        // For a spread of valid (leg, strike, spot, atm) inputs
+        // (2026-07-20 operator ruling): classify==Itm ⇒ depth>0 and
+        // classify==Otm ⇒ depth<0; ATM rows are excluded from the sign
+        // assertion but MUST still be Some.
         let spots = [2_453_640_i64, 4_814_325, 8_105_000, 5_000, 2_455_000];
         let step = 5_000_i64;
         for &spot_paise in &spots {
@@ -980,12 +1013,12 @@ mod tests {
                     let depth = moneyness_depth_paise(leg, strike_paise, spot_paise);
                     match class {
                         Moneyness::Itm => assert!(
-                            depth.is_some_and(|d| d < 0),
-                            "{leg} ITM strike={strike_paise} spot={spot_paise} must have depth<0, got {depth:?}"
+                            depth.is_some_and(|d| d > 0),
+                            "{leg} ITM strike={strike_paise} spot={spot_paise} must have depth>0, got {depth:?}"
                         ),
                         Moneyness::Otm => assert!(
-                            depth.is_some_and(|d| d > 0),
-                            "{leg} OTM strike={strike_paise} spot={spot_paise} must have depth>0, got {depth:?}"
+                            depth.is_some_and(|d| d < 0),
+                            "{leg} OTM strike={strike_paise} spot={spot_paise} must have depth<0, got {depth:?}"
                         ),
                         Moneyness::Atm => assert!(
                             depth.is_some(),
