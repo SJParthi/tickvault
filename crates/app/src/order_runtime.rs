@@ -1141,7 +1141,9 @@ async fn run_order_runtime(
                     process_mark(
                         &mut oms, &mut risk, &mut book, &mut self_test, &ctx, m,
                         config.order_runtime.paper_fill,
-                    ctx.leg_pnl_tx.as_ref(), ).await;
+                        ctx.leg_pnl_tx.as_ref(),
+                    )
+                    .await;
                     processed += 1;
                     if processed >= MARK_BATCH_MAX {
                         break;

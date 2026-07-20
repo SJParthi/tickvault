@@ -239,17 +239,18 @@ pub mod observability;
 /// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so
 /// the two OMS construction sites can never drift.
 pub mod oms_wiring;
-/// Order runtime (dry-run) — cluster A, operator directive 2026-07-14
-/// (`.claude/plans/active-plan-order-runtime-dryrun.md`): the single-owner
-/// supervised task owning the paper OMS + RiskEngine on the dhan-off prod
-/// profile, spawned ONLY from `dhan_rest_stack` Phase 5b (2026-07-17
-/// correction — Phase 5a is the RETIRED order-update WS spawn slot).
+/// Order-leg option P&L capture boot (ORDER-PNL-01, default-OFF).
 pub mod order_leg_pnl_boot;
 /// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
 /// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily
 /// OnEod heartbeat + counters-vs-rows reconcile (OMS-GAP-02 on mismatch).
 pub mod order_observability;
+/// Order runtime (dry-run) — cluster A, operator directive 2026-07-14
+/// (`.claude/plans/active-plan-order-runtime-dryrun.md`): the single-owner
+/// supervised task owning the paper OMS + RiskEngine on the dhan-off prod
+/// profile, spawned ONLY from `dhan_rest_stack` Phase 5b (2026-07-17
+/// correction — Phase 5a is the RETIRED order-update WS spawn slot).
 pub mod order_runtime;
 /// Full-fidelity order/position PUSH-event capture consumer
 /// (ORDER-EVT-01, 2026-07-18 — `order_update_events` /

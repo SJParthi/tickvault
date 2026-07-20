@@ -2786,7 +2786,6 @@ mod tests {
         // production callers; deleted with its dead paging filter) => 164.
         // 2026-07-18 (full-fidelity order/position push-event capture):
         // +1 ORDER-EVT-01 (OrderEvt01PersistFailed — order_update_events /
-        // +1 ORDER-PNL-01 (OrderPnl01PersistFailed — order_update_events /
         // position_update_events forensic-writer degrade; log-sink-only,
         // High, auto-triage-safe) => 165.
         // 2026-07-18 (tick-conservation retirement, dead-WS sweep follow-up):
