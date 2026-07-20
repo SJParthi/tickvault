@@ -125,6 +125,30 @@ pub(crate) fn map_groww_chain_failure(f: &GrowwChainFetchFailure) -> CadenceFetc
     CadenceFetchError::Transport
 }
 
+/// Pure (H1, audit 2026-07-20): classify a Groww 2xx spot body whose
+/// target minute is MISSING — `(audit class, audit outcome, cadence
+/// error)`. A ZERO-candle parse that counted malformed rows (garbage
+/// envelope, wrong-shape tuples, unparseable timestamps) is a
+/// `malformed_body` ERROR ([`CadenceFetchError::Malformed`] — terminal,
+/// non-arming, folded into the `fetch_failed` stage), never dressed as
+/// vendor absence. Candles-without-the-target and a CLEAN zero-candle
+/// body stay the honest `empty` class.
+#[must_use]
+pub(crate) fn groww_spot_zero_candle_class(
+    zero_candles: bool,
+    stats: &crate::groww_spot_1m_boot::GrowwParseStats,
+) -> (&'static str, RestFetchOutcome, CadenceFetchError) {
+    if zero_candles && stats.malformed_rows > 0 {
+        (
+            "malformed_body",
+            RestFetchOutcome::Error,
+            CadenceFetchError::Malformed,
+        )
+    } else {
+        ("empty", RestFetchOutcome::Empty, CadenceFetchError::Empty)
+    }
+}
+
 /// Groww identity + moneyness-latch slot for a chain underlying — looked
 /// up from the pinned [`GROWW_CHAIN_1M_UNDERLYINGS`] set by the plain
 /// symbol. Returns `(slot, underlying, exchange, groww_symbol)`.
@@ -648,12 +672,19 @@ impl CadenceExecutor for GrowwCadenceExecutor {
             flush_off_worker(|| audit_flush_best_effort(&mut audit));
             return Err(CadenceFetchError::Transport);
         }
-        let (candles, _stats) = parse_groww_1m_candles(&body);
+        let (candles, stats) = parse_groww_1m_candles(&body);
         let Some(candle) = candles
             .iter()
             .find(|c| c.minute_ts_ist_nanos == target_nanos)
             .copied()
         else {
+            // H1 (audit 2026-07-20): a ZERO-candle parse that COUNTED
+            // malformed rows/envelope is a wrong-shape body — an ERROR
+            // class (`Malformed`, terminal, non-arming), never dressed as
+            // vendor absence. A body with candles but no target minute,
+            // or a clean zero-candle body, stays the honest Empty.
+            let (class, audit_outcome, mapped) =
+                groww_spot_zero_candle_class(candles.is_empty(), &stats);
             let mut audit = self.audit_writer.lock().await;
             audit_append_best_effort(
                 &mut audit,
@@ -665,13 +696,13 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                     1,
                     200,
                     0,
-                    RestFetchOutcome::Empty,
+                    audit_outcome,
                     -1,
-                    "empty",
+                    class,
                 ),
             );
             flush_off_worker(|| audit_flush_best_effort(&mut audit));
-            return Err(CadenceFetchError::Empty);
+            return Err(mapped);
         };
         let close_to_data_ms =
             (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
@@ -1804,5 +1835,34 @@ mod tests {
             "the heartbeat gauge must be persist-gated: inside fetch_spot's \
              flush_ok guard after the flush ACK, before the fold handoff"
         );
+    }
+
+    /// H1 (audit 2026-07-20): the Groww spot zero-candle malformed-vs-
+    /// empty split — a zero-candle parse with counted malformed rows is
+    /// a terminal Error class, never dressed as vendor absence.
+    #[test]
+    fn groww_spot_zero_candle_malformed_vs_empty() {
+        use crate::groww_spot_1m_boot::GrowwParseStats;
+        let dirty = GrowwParseStats {
+            malformed_rows: 1,
+            ..GrowwParseStats::default()
+        };
+        // Zero candles + malformed markers ⇒ Error/Malformed.
+        let (class, outcome, err) = groww_spot_zero_candle_class(true, &dirty);
+        assert_eq!(class, "malformed_body");
+        assert_eq!(outcome, RestFetchOutcome::Error);
+        assert_eq!(err, CadenceFetchError::Malformed);
+        // Clean zero-candle body ⇒ honest empty.
+        let clean = GrowwParseStats::default();
+        let (class, outcome, err) = groww_spot_zero_candle_class(true, &clean);
+        assert_eq!(class, "empty");
+        assert_eq!(outcome, RestFetchOutcome::Empty);
+        assert_eq!(err, CadenceFetchError::Empty);
+        // Candles present (target missing) — even with skipped rows the
+        // body served data: stays the honest empty class.
+        let (class, outcome, err) = groww_spot_zero_candle_class(false, &dirty);
+        assert_eq!(class, "empty");
+        assert_eq!(outcome, RestFetchOutcome::Empty);
+        assert_eq!(err, CadenceFetchError::Empty);
     }
 }

@@ -3,7 +3,7 @@
 > **What this answers:** "Where, as a human, do I SEE the historical
 > cross-verification?" — and "is it even running?"
 > **Authority:** `.claude/rules/project/live-feed-purity.md` rule 11,
-> `.claude/rules/project/cross-verify-1m-error-codes.md`.
+> `docs/error-runbooks/cross-verify-1m-error-codes.md`.
 > **⚠ RETIRED (PR-C3, 2026-07-14):** the 15:31 IST Dhan live-vs-historical
 > cross-verify was retired with the Dhan live WS (operator 2026-07-13) and
 > its module `cross_verify_1m_boot.rs` was DELETED — the forensic artifacts
@@ -69,6 +69,6 @@ flips its `force_now` input.
 
 ## Cross-references
 
-- `.claude/rules/project/cross-verify-1m-error-codes.md` — CROSS-VERIFY-1M-01/02 triage
+- `docs/error-runbooks/cross-verify-1m-error-codes.md` — CROSS-VERIFY-1M-01/02 triage
 - `.claude/rules/project/live-feed-purity.md` rule 11 — the narrowed re-allow
 - `docs/runbooks/phase-1-monitoring-rubric.md` — cross-verify match-rate target
