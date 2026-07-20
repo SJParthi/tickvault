@@ -174,7 +174,7 @@ aws-sdk-ssm = { version = "1.112.0", default-features = false, features = ["beha
 # (#1504) also uses this SDK (PutObject/HeadObject to tv-<env>-cold) with a
 # caret "1.136.0" requirement — the exact =1.138.0 pin satisfies it; ONE
 # workspace entry serves both consumers.
-aws-sdk-s3 = { version = "=1.138.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "=1.138.1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-07-18 (rust-only phase 2b-1): the 4 AWS Lambdas move from inline
 # Python heredocs / handler.py to Rust bins in crates/aws-lambdas. Three new
 # SDK crates + the Lambda runtime. All three SDK pins are the 2026-07-08
@@ -185,8 +185,8 @@ aws-sdk-s3 = { version = "=1.138.0", default-features = false, features = ["beha
 # the house bare-version style) as the aws-sdk-s3 pin above. Deliberately
 # NOT the newest releases (ec2 1.240.0 / cloudwatch 1.120.0, 2026-07-10)
 # because those start a NEWER smithy generation → cargo-deny duplicate bans.
-aws-sdk-ec2 = { version = "=1.238.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-sdk-cloudwatch = { version = "=1.119.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ec2 = { version = "=1.240.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-cloudwatch = { version = "=1.120.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-costexplorer = { version = "=1.121.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-07-18 (rust-only phase 2b-3): the questdb-console FRONT Lambda invokes
 # the back relay via the Lambda Invoke API (Python parity:

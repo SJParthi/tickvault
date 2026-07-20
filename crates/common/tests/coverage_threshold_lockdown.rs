@@ -42,9 +42,12 @@ use std::path::Path;
 /// aws-lambdas pin added 2026-07-18 (rust-only phase 2b-1): the NEW
 /// crates/aws-lambdas (4 Lambda bins + shared lib). MEASURED-then-ratcheted:
 /// local `cargo llvm-cov -p tickvault-aws-lambdas` measured 64.92% lines;
-/// floor per the standing formula = 64.9 - 0.1 = 64.8 (the misses are the
+/// initial floor per the standing formula = 64.9 - 0.1 = 64.8 (the misses are the
 /// thin [[bin]] glue + SDK client construction + live-AWS async glue —
 /// structurally unexercisable without a live AWS account).
+/// 2026-07-20: 64.8 -> 81.1 - the pin ratcheted to the raised TOML floor
+/// (first CI Coverage & Perf measurement 81.40 on runs 29739772946 +
+/// 29745302463; PR #1694).
 ///
 /// tickvault-logs-mcp pin added 2026-07-18 (rust-only phase 2c): initial
 /// CONSERVATIVE floor 80.0 from a dev-sandbox measurement of 85.83%
@@ -54,13 +57,14 @@ use std::path::Path;
 const PINNED_DEFAULT_FLOOR: f64 = 63.0;
 const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     ("common", 99.5),
-    ("core", 90.2),
+    ("core", 91.6),
     ("trading", 96.9),
     ("storage", 90.1),
     ("api", 98.6),
-    ("app", 63.3),
-    ("aws-lambdas", 64.8),
-    ("tickvault-logs-mcp", 80.0),
+    ("app", 68.3),
+    ("aws-lambdas", 81.1),
+    // 2026-07-20: 80.0 -> 87.3 - the ratchet promised above (first CI Coverage & Perf measurement 87.64 on runs 29739772946 + 29745302463; PR #1694).
+    ("tickvault-logs-mcp", 87.3),
 ];
 
 fn read_thresholds_toml() -> String {

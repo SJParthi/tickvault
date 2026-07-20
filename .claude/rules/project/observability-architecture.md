@@ -419,7 +419,7 @@ summary file and drives the above flow.
       `chaos_ws_frame_spill_saturation.rs` (Phase 11.2 backpressure sim),
       `chaos_valkey_kill.rs` (Phase 11.3 Valkey kill-test). The CloudWatch
       alarm equivalents land alongside the prod CloudWatch migration.
-- [x] **Phase 12.1** — ratcheted per-crate line-coverage floors (63.3–99.5, target 100%; floors only move up) set in
+- [x] **Phase 12.1** — ratcheted per-crate line-coverage floors (68.3–99.5, target 100%; floors only move up) set in
       `quality/crate-coverage-thresholds.toml`, enforced by
       `scripts/coverage-gate.sh` in CI
 - [x] **Phase 12.5** — O(1) hot-path ratchet: DHAT zero-alloc tests +
