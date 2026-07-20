@@ -4079,6 +4079,14 @@ pub const CADENCE_DECISION_DEADLINE_MS: i64 = 4_000;
 // collide with the next cycle's volley burst (#1690 audit H5). Strictly < 60_000.
 pub const CADENCE_HISTORY_REPULL_OFFSETS_MS: [i64; 2] = [30_000, 50_000];
 
+/// HTTP keep-alive knobs for the cadence Dhan REST client (hedge plan item 4).
+/// The pool idle timeout MUST exceed the 60 s cadence period, or every minute's
+/// volley pays a fresh TCP+TLS handshake (measured 2026-07-20: Dhan cycles
+/// 1.05-4.02 s vs Groww 0.29-0.87 s). 120 s idle > 60 s period; OS TCP
+/// keepalive probes every 30 s keep NAT/LB paths warm between volleys.
+pub const CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
+pub const CADENCE_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
+
 #[cfg(test)]
 mod market_hours_tests {
     use super::*;
@@ -5487,6 +5495,12 @@ mod cadence_native_retry_hedge_tests {
             CADENCE_HISTORY_REPULL_OFFSETS_MS
                 .iter()
                 .all(|&o| o < 60_000)
+        );
+        assert_eq!(CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS, 120);
+        assert_eq!(CADENCE_HTTP_TCP_KEEPALIVE_SECS, 30);
+        assert!(
+            CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS > 60,
+            "pool idle must outlive the 60s cadence period"
         );
     }
 }

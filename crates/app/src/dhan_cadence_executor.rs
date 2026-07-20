@@ -44,8 +44,9 @@ use chrono::NaiveDate;
 use secrecy::ExposeSecret;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    CHAIN_1M_UNDERLYINGS, DHAN_CHARTS_INTRADAY_PATH, DHAN_OPTION_CHAIN_EXPIRYLIST_PATH,
-    DHAN_OPTION_CHAIN_PATH, EXCHANGE_SEGMENT_IDX_I, SPOT_1M_REST_INDICES,
+    CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS, CADENCE_HTTP_TCP_KEEPALIVE_SECS, CHAIN_1M_UNDERLYINGS,
+    DHAN_CHARTS_INTRADAY_PATH, DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, DHAN_OPTION_CHAIN_PATH,
+    EXCHANGE_SEGMENT_IDX_I, SPOT_1M_REST_INDICES,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
@@ -276,6 +277,12 @@ impl DhanCadenceExecutor {
                 DHAN_CADENCE_HTTP_TIMEOUT_SECS,
             ))
             .redirect(reqwest::redirect::Policy::none())
+            .pool_idle_timeout(std::time::Duration::from_secs(
+                CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS,
+            ))
+            .tcp_keepalive(std::time::Duration::from_secs(
+                CADENCE_HTTP_TCP_KEEPALIVE_SECS,
+            ))
             .build()
             .map_err(|e| format!("dhan cadence HTTP client build failed: {e}"))?;
         Ok(Self {
@@ -401,6 +408,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                 }
             };
             let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
+            let fetch_started = std::time::Instant::now();
             let fetched = tokio::time::timeout(
                 std::time::Duration::from_millis(remaining_ms),
                 spot_1m_fetch_once_unpaced(
@@ -411,6 +419,9 @@ impl CadenceExecutor for DhanCadenceExecutor {
                 ),
             )
             .await;
+            let spot_fetch_ms =
+                i64::try_from(fetch_started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            metrics::histogram!("tv_dhan_cadence_spot_fetch_ms").record(spot_fetch_ms as f64);
             let fetch_verdict = match fetched {
                 Err(_elapsed) => Err((
                     CadenceFetchError::Timeout,

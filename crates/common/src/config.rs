@@ -1210,7 +1210,7 @@ pub struct CadenceConfig {
     /// Native micro-retry hedge for 2xx-empty cadence legs (2026-07-20 directive).
     #[serde(default = "cadence_default_true")]
     pub native_retry_enabled: bool,
-    /// Post-cross-fill background history re-pull (T+30s/T+60s, repair only).
+    /// Post-cross-fill background history re-pull (T+30s/T+50s, repair only).
     #[serde(default = "cadence_default_true")]
     pub history_repull_enabled: bool,
 }
