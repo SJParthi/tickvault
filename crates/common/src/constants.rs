@@ -1840,6 +1840,24 @@ pub const CADENCE_GROWW_WAVE_STEP_MS: i64 = 1_000;
 /// the cadence gates apply this floor per key).
 pub const CADENCE_CHAIN_MIN_SPACING_FLOOR_MS: i64 = 3_000;
 
+/// Cadence degraded-leg recovery (operator 2026-07-20): bounded micro-retry
+/// offsets for a 2xx-empty broker leg, measured from the minute-close instant.
+/// The retries hedge SMALL vendor lag only; the T+4s deadline below decides.
+pub const CADENCE_LATE_RETRY_OFFSETS_MS: [u64; 3] = [2_000, 3_000, 3_800];
+
+/// The pinned native-vs-cross-fill decision deadline (ms after minute close).
+/// Native rows arriving by this instant win; otherwise the already-prepared
+/// cross-fill is used with zero extra wait (tie resolves to cross-fill).
+pub const CADENCE_NATIVE_DECISION_DEADLINE_MS: u64 = 4_000;
+
+/// Background history re-pull offsets (ms after minute close) for a leg that
+/// resolved via cross-fill — record-completeness only, NEVER a decision input.
+pub const CADENCE_HISTORY_REPULL_OFFSETS_MS: [u64; 2] = [30_000, 60_000];
+
+/// Dhan cadence pre-warm lead (ms before minute close): one best-effort GET on
+/// the pooled client so the TLS/H2 connection is warm for the volley.
+pub const CADENCE_DHAN_PREWARM_LEAD_MS: u64 = 5_000;
+
 // ---------------------------------------------------------------------------
 // Option-chain 1m REST pipeline (operator grant 2026-07-12 — PR-3, the
 // OPTION-CHAIN half). The 3 underlyings are the [`CHAIN_1M_UNDERLYINGS`]
@@ -5445,5 +5463,36 @@ mod tests {
         assert_eq!(GROWW_NATIVE_AUTH_RETRY_FLOOR_SECS, 60);
         assert_eq!(GROWW_NATIVE_WATCH_POLL_SECS, 30);
         assert_eq!(GROWW_NATIVE_WRITER_CHANNEL_CAPACITY, 65_536);
+    }
+
+    #[test]
+    fn test_late_retry_offsets_and_deadline_pinned() {
+        assert_eq!(CADENCE_LATE_RETRY_OFFSETS_MS, [2_000, 3_000, 3_800]);
+        assert_eq!(CADENCE_NATIVE_DECISION_DEADLINE_MS, 4_000);
+        let mut prev = 0u64;
+        for off in CADENCE_LATE_RETRY_OFFSETS_MS {
+            assert!(off > prev, "offsets strictly increasing");
+            assert!(
+                off < CADENCE_NATIVE_DECISION_DEADLINE_MS,
+                "every retry sits inside the deadline"
+            );
+            prev = off;
+        }
+    }
+
+    #[test]
+    fn test_repull_offsets_pinned() {
+        assert_eq!(CADENCE_HISTORY_REPULL_OFFSETS_MS, [30_000, 60_000]);
+        for off in CADENCE_HISTORY_REPULL_OFFSETS_MS {
+            assert!(
+                off > CADENCE_NATIVE_DECISION_DEADLINE_MS,
+                "re-pull is strictly post-deadline (record-only)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prewarm_lead_pinned() {
+        assert_eq!(CADENCE_DHAN_PREWARM_LEAD_MS, 5_000);
     }
 }
