@@ -477,6 +477,7 @@ fn sim_dhan_cycle(
                         slots.dhan_chain_retry_slots_ms[next_retry_slot].max(clock.wall_ms);
                     if may_retry_in_cycle(
                         &err,
+                        true,
                         retries_used_chain[i],
                         cfg.in_cycle_retry_max,
                         retry_fire,
@@ -533,8 +534,10 @@ fn sim_dhan_cycle(
     let mut next_spot_retry_target = slots.dhan_spot_slots_ms[3] + CADENCE_SPOT_WINDOW_MS;
     for (k, err) in spot_failures {
         let retry_target = next_spot_retry_target.max(clock.wall_ms);
+        // PHASE-B(native-retry): flips with the runner spot call site when the native ladder lands.
         if may_retry_in_cycle(
             &err,
+            true,
             retries_used_spot[k],
             cfg.in_cycle_retry_max,
             retry_target,
@@ -1035,6 +1038,7 @@ fn test_retry_through_gate_never_compresses_chain_spacing() {
     let err = CadenceFetchError::Transport;
     assert!(may_retry_in_cycle(
         &err,
+        true,
         0,
         cfg.in_cycle_retry_max,
         slots.dhan_chain_retry_slots_ms[0],
