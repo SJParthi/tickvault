@@ -104,3 +104,77 @@ Two independent kill switches restore the pre-PR shape without a revert: `[caden
 Cross-reference per `.claude/rules/project/per-wave-guarantee-matrix.md`: every item above carries the 15-row "100% everything" matrix + the 7-row resilience matrix from that file, instantiated as follows — coverage: new units + ratchets listed per item (coverage delta >= 0); audit: cross_fill_audit rows are the sibling's table (this PR emits tokens; no new table here — no new DEDUP surface); monitoring/logging/alerting: the Observability section's counters + coded CADENCE-04 (log-sink-only by design — alert row N/A per the noise-lock, documented); performance: cold path only, no hot-path allocation (DHAT N/A — not a hot path; documented); security: no new input surface, no secrets, reqwest builder flags only; bugs/review: adversarial hostile review, 2 consecutive clean rounds before push; scenarios: the Edge Cases section enumerated + tested; functionality: every new pub fn has call site + test; extreme check: the isolation ratchet + constants ratchet + limiter-ban guard fail the build on regression. Resilience 7-row: zero ticks lost — N/A (REST cadence lane, no tick path); WS — N/A; never slow/locked — bounded retries, gate-paced, deadline-capped; QuestDB — unchanged persistence paths, DEDUP-idempotent; O(1) — per-slot constant-bounded work (<= 3 retries + 2 re-pulls, pinned); uniqueness/dedup — existing composite DEDUP keys reused verbatim; real-time proof — per-leg instrumentation + counters + resolution tokens.
 
 **Honest 100% claim:** 100% inside the tested envelope, with ratcheted regression coverage: <= 3 gate-paced native retries per leg per minute with immediate 429-abort (constants ratchet-pinned); deadline arbitration at T+4.0 s with the pre-existing cross-fill as the unchanged correctness floor; the background re-pull bounded to 2 DEDUP-idempotent attempts, HARD-isolated from decisions by a build-failing ratchet. NOT claimed: that retries recover today's observed vendor lag (2026-07-20 evidence: zero native recoveries, both open empties cross-filled ~+19.4 s — the hedge is an opportunity window, not a guarantee); NOT claimed: any latency improvement from client hygiene (unmeasured until the per-leg instrumentation lands — that is why it lands).
+
+
+## 2026-07-20 Amendment — #1690-supersession corrections (MANDATORY; adopted before items 6/2+3)
+
+> Source: coordinator + the PR #1690 owner (PR #1690 CLOSED as superseded by #1693, comment
+> 5023436400; branch `claude/cadence-t4s-retry` @ e8c48cc2 retained as a read-only reference).
+> Adversarially re-verified; the external verifier holds the same list. Where this amendment
+> conflicts with the plan body above, THIS AMENDMENT WINS.
+
+### A. Error code: CADENCE-05, not CADENCE-04 (collision)
+Main already carries `Cadence04AuditWriteFailed => "CADENCE-04"` (landed with #1688;
+`crates/common/src/error_code.rs:1263` / `:1490`). The plan body's
+`Cadence04NativeRetryExhausted` is RENAMED **`Cadence05RecoveryDegraded` => "CADENCE-05"**.
+Item 6 registers CADENCE-05 through the full D3 checklist (enum, code_str, severity,
+runbook_path, auto-triage, catalog, unit tests) + a triage-yaml entry. The error-code count on
+main is **166** (do not copy #1690's stale 165) — item 6 bumps the count assert to 167.
+
+### B. History re-pull offsets: [30_000, 50_000] (NOT 60_000)
+T+60s lands exactly ON the next minute boundary and collides with the next cycle's volley burst
+(#1690 audit §0d H5). `CADENCE_HISTORY_REPULL_OFFSETS_MS = [30_000, 50_000]` + a pinned
+`assert!(offsets.iter().all(|&o| o < 60_000))` boundary assert + an in-code rationale comment.
+(Item 1 was in flight with 60_000; corrected by the follow-up commit before the merge-forward.
+The config gates `[cadence] native_retry_enabled` / `history_repull_enabled` landed with item 1,
+default ON, serde-defaulted.)
+
+### C. Retry eligibility (Malformed NEVER retried)
+| Leg outcome at volley | In-window native retry? | Cross-fill eligible? |
+|---|---|---|
+| 2xx EMPTY (zero candles) | YES (spot ladder; chain see D) | YES |
+| 2xx MALFORMED (schema break) | **NEVER** (excluded from retry AND from L3 fallback) | per existing rules |
+| HTTP 429 | NO — immediate ladder abort; the existing shape ladder owns it | YES |
+| Transport error / timeout | NO — the existing per-leg escalation owns it | YES |
+
+(#1690 pinned this class via `test_late_retry_eligibility_set_pinned`; main now carries #1689's
+Malformed-vs-Empty split — the eligibility gate keys on the split enum, never on "no rows".)
+
+### D. Spot-only retry grid; chain = single slot at arbitration
+The [T+2.0, T+3.0, T+3.8]s rung grid is **SPOT-ONLY**. Chain legs: the volley consumes the
+per-(underlying, expiry) >=3s CAS gate slot at ~T+1.0-1.3s, so the earliest legal chain re-fire
+is ~T+4.0-4.3s — at/after the decision deadline. Chain legs therefore get ZERO sub-4s rungs; at
+T+4.0s arbitration an empty chain leg resolves via the prepared cross-fill, and AT MOST ONE
+gate-paced native chain attempt may fire at/after arbitration whose result is HISTORY REPAIR
+ONLY (never the decision). Quote-1's "measure precisely when Dhan serves it" intent is served
+for chains by the T+30/50s re-pull + the `resolved_at_ms_after_close` audit column.
+
+### E. Operator quotes (verbatim, typos included — the authority for this plan)
+Quote 1 (2026-07-20): "not 4 seconds later dude see if it can't be pulled at the very first second means then second third fourth sequentially without hitting the rate limit right dude see in this case we will easily get to know whether because of our today issues maybe it could have taken one or two or three or fourth second right because if the data is not yet formed till 4th second then our only idea is to find the precisely when til l4 th seockd if the eat is kto deliverable means then we can use the cross reference right dude"
+
+Quote 2 (2026-07-20): "See do you udnerstand my point as what I'm asking bro as such see if spot alone doesn't return the data then only that shoudl be retried toll 4 seconds right dude am I right bro do you understand what I'm askign dude see this shoudl be the same even with option chain right dude If everything can be paralleled by spinning everything in its own parallelism spinning sessions do it as the parallel process dude"
+
+Second clause (2026-07-20, relayed): "retry native until the 4th second, then cross-fill; backfill never feeds live decisions"
+
+### F. Pre-warm: DEFERRED (dated note)
+A real HTTP pre-warm against api.dhan.co is a new REST call class — it needs a fresh dated KEEP
+row in `no-rest-except-live-feed-2026-06-27.md` §3 FIRST (verifier M13). NOT in this PR. Only
+connection-level warmth ships now: `.pool_idle_timeout(120s)` + `.tcp_keepalive(30s)` (item 4).
+
+### G. Non-blocking re-pull gate law (H4/H5)
+EVERY attempt (rung, arbitration slot, T+30/50 re-pull) passes `DhanGates::try_acquire_spot` /
+`try_acquire_chain` with a fresh monotonic timestamp BEFORE dispatch; budget proofs cite the
+DhanGates ring, NOT the retired 3rps limiter. The T+30/50 re-pull runs OUTSIDE the next cycle's
+burst window; when the gate refuses, the attempt is SKIPPED + counted (`gate_skipped`) — nominal
+traffic ALWAYS wins; a re-pull 429 never arms the shape ladder or rate_limited streaks.
+
+### H. Test-signature budget
+The hedge disturbs exact-fire-count expectations in `cadence_fallback_proof`, `runner_dry_run`,
+and `zero_429_replay` suites. Update them deliberately (reference shapes: the closed branch
+`claude/cadence-t4s-retry` @ e8c48cc2 — reference only, no unadjudicated code copying).
+
+### I. Decision isolation (unchanged, re-affirmed)
+Cross-filled + re-pulled rows are record-completeness only — never trading-decision inputs; the
+build-failing `cadence_history_repull_isolation_guard` (item 5) + the ratcheted
+`may_decide_at_completion` cutoff (TRH-R2-1) stay. `cross_fill_audit` ROWS are owned by
+`claude/cross-fill-audit`; this PR lands the seam only.
