@@ -4062,6 +4062,21 @@ const _: () = {
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
 
+/// Cadence native-retry hedge: re-poll offsets for a 2xx-empty leg, in ms
+/// after the minute close (volley fires ~T+1s; decision deadline T+4s).
+pub const CADENCE_NATIVE_RETRY_OFFSETS_MS: [i64; 3] = [2_000, 3_000, 3_800];
+
+/// Max native micro-retry attempts per lane per minute (== offsets len).
+pub const CADENCE_NATIVE_RETRY_MAX_ATTEMPTS: usize = 3;
+
+/// Decision deadline after minute close: native data arriving before this
+/// wins; at the deadline the pre-prepared cross-fill fires with no extra wait.
+pub const CADENCE_DECISION_DEADLINE_MS: i64 = 4_000;
+
+/// Background history re-pull offsets (post-cross-fill repair of the degraded
+/// broker's OWN rows; history-repair only, never a decision input).
+pub const CADENCE_HISTORY_REPULL_OFFSETS_MS: [i64; 2] = [30_000, 60_000];
+
 #[cfg(test)]
 mod market_hours_tests {
     use super::*;
@@ -5445,5 +5460,26 @@ mod tests {
         assert_eq!(GROWW_NATIVE_AUTH_RETRY_FLOOR_SECS, 60);
         assert_eq!(GROWW_NATIVE_WATCH_POLL_SECS, 30);
         assert_eq!(GROWW_NATIVE_WRITER_CHANNEL_CAPACITY, 65_536);
+    }
+}
+
+#[cfg(test)]
+mod cadence_native_retry_hedge_tests {
+    use super::*;
+
+    #[test]
+    fn test_cadence_native_retry_constants_pinned() {
+        assert_eq!(CADENCE_NATIVE_RETRY_OFFSETS_MS, [2_000, 3_000, 3_800]);
+        assert_eq!(
+            CADENCE_NATIVE_RETRY_MAX_ATTEMPTS,
+            CADENCE_NATIVE_RETRY_OFFSETS_MS.len()
+        );
+        assert_eq!(CADENCE_DECISION_DEADLINE_MS, 4_000);
+        assert!(
+            CADENCE_NATIVE_RETRY_OFFSETS_MS
+                .iter()
+                .all(|&o| o < CADENCE_DECISION_DEADLINE_MS)
+        );
+        assert_eq!(CADENCE_HISTORY_REPULL_OFFSETS_MS, [30_000, 60_000]);
     }
 }

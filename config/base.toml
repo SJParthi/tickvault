@@ -816,6 +816,9 @@ enabled = false
 # + the dated rule-file note per
 # `.claude/rules/project/cadence-error-codes.md`.
 [cadence]
+# Native micro-retry hedge + background history re-pull (2026-07-20 operator directive).
+native_retry_enabled = true
+history_repull_enabled = true
 enabled = true # flipped 2026-07-17 — REAL broker executors both lanes (the legacy per-minute legs stand down above per the RS3 mutual exclusion)
 # Broker lane gates (fix round 2026-07-17): the cadence REST lanes are
 # deliberately INDEPENDENT of the retired live-WS flags
