@@ -597,7 +597,7 @@ pub enum ErrorCode {
     //
     // See:
     // - crates/trading/src/in_mem/day_ohlc_tracker.rs
-    // - .claude/rules/project/index-day-ohlc-tracker-error-codes.md
+    // - docs/error-runbooks/index-day-ohlc-tracker-error-codes.md
     // -----------------------------------------------------------------------
     /// INDEX-OHLC-02: daily reset at IST midnight failed for one or more
     /// SIDs (e.g., parking_lot mutex panic, tracker handle dropped).
@@ -1842,17 +1842,17 @@ impl ErrorCode {
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
-            | Self::PrevClose04CacheEmptyAtBoot => ".claude/rules/project/wave-1-error-codes.md",
+            | Self::PrevClose04CacheEmptyAtBoot => "docs/error-runbooks/wave-1-error-codes.md",
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
-                ".claude/rules/project/ws-frame-spill-error-codes.md"
+                "docs/error-runbooks/ws-frame-spill-error-codes.md"
             }
             // B6 (2026-07-03): off-thread tick ILP flush worker
             Self::TickFlush01WorkerRespawn => {
-                ".claude/rules/project/tick-flush-worker-error-codes.md"
+                "docs/error-runbooks/tick-flush-worker-error-codes.md"
             }
             // W2 PR#6 (2026-07-10): per-table WAL-suspension probe
             Self::WalSuspend01TableSuspended => {
-                ".claude/rules/project/wal-suspension-error-codes.md"
+                "docs/error-runbooks/wal-suspension-error-codes.md"
             }
             Self::WsGap04PostCloseSleep
             | Self::WsGap10OrderUpdateOutage
@@ -1866,16 +1866,16 @@ impl ErrorCode {
             | Self::Audit05SelftestWriteFailed
             | Self::Audit06OrderWriteFailed
             | Self::StorageGap03AuditWriteFailed
-            | Self::StorageGap04S3ArchiveFailed => ".claude/rules/project/wave-2-error-codes.md",
+            | Self::StorageGap04S3ArchiveFailed => "docs/error-runbooks/wave-2-error-codes.md",
             Self::AuditWs01EventWriteFailed => {
-                ".claude/rules/project/ws-event-audit-error-codes.md"
+                "docs/error-runbooks/ws-event-audit-error-codes.md"
             }
-            Self::Boot03ClockSkewExceeded => ".claude/rules/project/wave-2-c-error-codes.md",
+            Self::Boot03ClockSkewExceeded => "docs/error-runbooks/wave-2-c-error-codes.md",
             Self::Telegram01Dropped
             | Self::Telegram02CoalescerStateInconsistency
-            | Self::Telegram03EpisodeDegraded => ".claude/rules/project/wave-3-error-codes.md",
+            | Self::Telegram03EpisodeDegraded => "docs/error-runbooks/wave-3-error-codes.md",
             Self::Selftest01Passed | Self::Selftest02Failed => {
-                ".claude/rules/project/wave-3-c-error-codes.md"
+                "docs/error-runbooks/wave-3-c-error-codes.md"
             }
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
@@ -1900,16 +1900,16 @@ impl ErrorCode {
             | Self::Data813InvalidSecurityId
             | Self::Data814InvalidRequest => ".claude/rules/dhan/annexure-enums.md",
             Self::OrderReady01GateRefused => {
-                ".claude/rules/project/order-readiness-error-codes.md"
+                "docs/error-runbooks/order-readiness-error-codes.md"
             }
             Self::PrevClose03BootRoutingAssertion
-            | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
+            | Self::Volume01MonotonicityBreach => "docs/error-runbooks/wave-5-error-codes.md",
             Self::AggregatorDrop01
             | Self::AggregatorLate01
             | Self::AggregatorLag01TickLagDropped
             | Self::AggregatorSeal01IlpFailed
             | Self::AggregatorHb01Heartbeat
-            | Self::Boundary01CatchupSeal => ".claude/rules/project/wave-6-error-codes.md",
+            | Self::Boundary01CatchupSeal => "docs/error-runbooks/wave-6-error-codes.md",
             Self::Resilience01DualInstanceDetected
             | Self::Proc01OomKillDetected
             // AUTH-P11 (2026-07-01) — TOTP secret rotated externally (promotes
@@ -1922,36 +1922,36 @@ impl ErrorCode {
             // (promotes the RESERVED RESOURCE-01/02/03 stubs).
             | Self::Resource01FdCountHigh
             | Self::Resource02ResidentMemoryHigh
-            | Self::Resource03SpillFreeLow => ".claude/rules/project/wave-4-error-codes.md",
+            | Self::Resource03SpillFreeLow => "docs/error-runbooks/wave-4-error-codes.md",
             // 2026-07-04 dual-instance lock hardening (lock-before-mint)
             Self::Resilience03MintRefusedLockNotHeld => {
-                ".claude/rules/project/dual-instance-lock-2026-07-04.md"
+                "docs/error-runbooks/dual-instance-lock-2026-07-04.md"
             }
             Self::OrphanPosition01Detected => {
-                ".claude/rules/project/phase-0-item-20-error-codes.md"
+                "docs/error-runbooks/phase-0-item-20-error-codes.md"
             }
             Self::BarMismatch01CorrectedFromHistorical
             | Self::BarMismatch02CrossCheckInconclusive
             | Self::BarMismatch03CrossCheckFailed => {
-                ".claude/rules/project/phase-0-items-15-28-29-error-codes.md"
+                "docs/error-runbooks/phase-0-items-15-28-29-error-codes.md"
             }
             // Day OHLC tracker for IDX_I
             Self::IndexOhlc02DailyResetFailed => {
-                ".claude/rules/project/index-day-ohlc-tracker-error-codes.md"
+                "docs/error-runbooks/index-day-ohlc-tracker-error-codes.md"
             }
             // PR-A (2026-06-28): Groww shared-master persist
             Self::GrowwMaster01PersistFailed => {
-                ".claude/rules/project/groww-shared-master-error-codes.md"
+                "docs/error-runbooks/groww-shared-master-error-codes.md"
             }
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
             Self::FeedStall01SidecarRestarted
             | Self::FeedSupervisor01Respawned
             | Self::FeedReject01SidecarErrorDetail => {
-                ".claude/rules/project/feed-stall-watchdog-error-codes.md"
+                "docs/error-runbooks/feed-stall-watchdog-error-codes.md"
             }
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed => {
-                ".claude/rules/project/http-client-error-codes.md"
+                "docs/error-runbooks/http-client-error-codes.md"
             }
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
             Self::GrowwScale01RollbackFired
@@ -1959,33 +1959,33 @@ impl ErrorCode {
             | Self::GrowwScale03ShardOverlap
             | Self::GrowwScale04AuditWriteFailed
             | Self::GrowwScale05DualFleetDetected => {
-                ".claude/rules/project/groww-scale-error-codes.md"
+                "docs/error-runbooks/groww-scale-error-codes.md"
             }
             // PR-R1 (2026-07-04): Groww native-Rust shadow client
             Self::GrowwNative01ConnectFailed
             | Self::GrowwNative02AuthFailed
             | Self::GrowwNative03DecodeFailed
             | Self::GrowwNative04WriterFailed => {
-                ".claude/rules/project/groww-native-rust-error-codes.md"
+                "docs/error-runbooks/groww-native-rust-error-codes.md"
             }
             Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
-                ".claude/rules/project/futidx-4-error-codes.md"
+                "docs/error-runbooks/futidx-4-error-codes.md"
             }
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded => {
-                ".claude/rules/project/dual-feed-scoreboard-error-codes.md"
+                "docs/error-runbooks/dual-feed-scoreboard-error-codes.md"
             }
             // BruteX↔TickVault daily cross-verify (2026-07-12)
             Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
-                ".claude/rules/project/brutex-crossverify-error-codes.md"
+                "docs/error-runbooks/brutex-crossverify-error-codes.md"
             }
             // Dhan↔Groww spot cross-broker comparator
             Self::SpotXverify01MismatchFound | Self::SpotXverify02RunDegraded => {
-                ".claude/rules/project/spot-crossverify-error-codes.md"
+                "docs/error-runbooks/spot-crossverify-error-codes.md"
             }
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded | Self::Spot1m02PersistFailed => {
-                ".claude/rules/project/rest-1m-pipeline-error-codes.md"
+                "docs/error-runbooks/rest-1m-pipeline-error-codes.md"
             }
             // Per-minute option-chain REST pipeline (PR-3, 2026-07-12) —
             // one runbook for the whole per-minute REST pipeline family.
@@ -1993,24 +1993,24 @@ impl ErrorCode {
             | Self::Chain02FetchDegraded
             | Self::Chain03PersistFailed
             | Self::Chain04ExpirylistFailed => {
-                ".claude/rules/project/rest-1m-pipeline-error-codes.md"
+                "docs/error-runbooks/rest-1m-pipeline-error-codes.md"
             }
             // Daily timeframe-consistency verifier (operator 2026-07-13)
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => {
-                ".claude/rules/project/tf-consistency-error-codes.md"
+                "docs/error-runbooks/tf-consistency-error-codes.md"
             }
             // Feed gap-episode forensics (Groww hardening PR-3, 2026-07-14)
             Self::FeedGap01EpisodeDegraded => {
-                ".claude/rules/project/feed-gap-error-codes.md"
+                "docs/error-runbooks/feed-gap-error-codes.md"
             }
             // REST-era multi-TF candle derivation (operator 2026-07-16)
             Self::RestCandleFold01Degraded => {
-                ".claude/rules/project/rest-candle-fold-error-codes.md"
+                "docs/error-runbooks/rest-candle-fold-error-codes.md"
             }
             // RAM residency stores (operator 2026-07-16, PR-2)
-            Self::RamStore01Degraded => ".claude/rules/project/ram-store-error-codes.md",
+            Self::RamStore01Degraded => "docs/error-runbooks/ram-store-error-codes.md",
             Self::OrderEvt01PersistFailed => {
-                ".claude/rules/project/order-update-events-error-codes.md"
+                "docs/error-runbooks/order-update-events-error-codes.md"
             }
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
@@ -2021,7 +2021,7 @@ impl ErrorCode {
             | Self::GrowwPort02PersistFailed
             | Self::GrowwPort03ReconDivergence
             | Self::GrowwPort04ForeignPosition => {
-                ".claude/rules/project/groww-portfolio-error-codes.md"
+                "docs/error-runbooks/groww-portfolio-error-codes.md"
             }
             // Groww Smart Orders (GTT/OCO) fan-out contract stubs
             // (2026-07-15): one runbook per §39.3 area.
@@ -2030,7 +2030,7 @@ impl ErrorCode {
             | Self::GrowwOco03ReconcileMismatch
             | Self::GrowwOco04ModifyRejected
             | Self::GrowwOco05PollerDegraded => {
-                ".claude/rules/project/groww-oco-error-codes.md"
+                "docs/error-runbooks/groww-oco-error-codes.md"
             }
             // Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15)
             Self::GrowwMarg01FetchDegraded
@@ -2038,7 +2038,7 @@ impl ErrorCode {
             | Self::GrowwMarg03SnapshotStaleGateClosed
             | Self::GrowwMarg04EntryRejectedInsufficient
             | Self::GrowwMarg05CalcDivergence => {
-                ".claude/rules/project/groww-margin-error-codes.md"
+                "docs/error-runbooks/groww-margin-error-codes.md"
             }
             // Groww orders shared contracts (PR-A0, 2026-07-15) — one runbook
             // for the whole GROWW-ORD-* family.
@@ -2052,7 +2052,7 @@ impl ErrorCode {
             | Self::GrowwOrd08AuditWriteFailed
             | Self::GrowwOrd09QuantityRefused
             | Self::GrowwOrd10AuthStale => {
-                ".claude/rules/project/groww-orders-error-codes.md"
+                "docs/error-runbooks/groww-orders-error-codes.md"
             }
             // Groww order/position push channel (Stage A, 2026-07-16) — one
             // runbook for the whole GROWW-PUSH-* family.
@@ -2060,7 +2060,7 @@ impl ErrorCode {
             | Self::GrowwPush02AuthFailed
             | Self::GrowwPush03DecodeFailed
             | Self::GrowwPush04SupervisorRespawned => {
-                ".claude/rules/project/groww-order-push-error-codes.md"
+                "docs/error-runbooks/groww-order-push-error-codes.md"
             }
             // Cadence scheduler (operator directive 2026-07-14)
             Self::Cadence01LaneDegraded
@@ -2439,8 +2439,8 @@ mod tests {
             let path = code.runbook_path();
             assert!(!path.is_empty(), "runbook_path empty for {cs}");
             assert!(
-                path.starts_with(".claude/"),
-                "{cs} must point at .claude/: {path}"
+                path.starts_with(".claude/") || path.starts_with("docs/error-runbooks/"),
+                "{cs} must point at .claude/ or docs/error-runbooks/: {path}"
             );
         }
     }
@@ -2783,7 +2783,7 @@ mod tests {
         assert!(code.is_auto_triage_safe());
         assert_eq!(
             code.runbook_path(),
-            ".claude/rules/project/wave-3-error-codes.md"
+            "docs/error-runbooks/wave-3-error-codes.md"
         );
     }
 
@@ -2799,7 +2799,7 @@ mod tests {
         assert!(!code.is_auto_triage_safe());
         assert_eq!(
             code.runbook_path(),
-            ".claude/rules/project/groww-scale-error-codes.md"
+            "docs/error-runbooks/groww-scale-error-codes.md"
         );
         let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -2873,7 +2873,7 @@ mod tests {
         assert!(!f2.is_auto_triage_safe());
         assert_eq!(
             f2.runbook_path(),
-            ".claude/rules/project/futidx-4-error-codes.md"
+            "docs/error-runbooks/futidx-4-error-codes.md"
         );
     }
 
@@ -2905,7 +2905,7 @@ mod tests {
         // The whole family shares the per-minute REST pipeline runbook.
         assert_eq!(
             c1.runbook_path(),
-            ".claude/rules/project/rest-1m-pipeline-error-codes.md"
+            "docs/error-runbooks/rest-1m-pipeline-error-codes.md"
         );
     }
 
@@ -2933,7 +2933,7 @@ mod tests {
             assert!(ErrorCode::all().contains(&code));
             assert_eq!(
                 code.runbook_path(),
-                ".claude/rules/project/tf-consistency-error-codes.md"
+                "docs/error-runbooks/tf-consistency-error-codes.md"
             );
         }
     }
@@ -3006,7 +3006,7 @@ mod tests {
             assert_eq!(code.is_auto_triage_safe(), auto_safe);
             assert_eq!(
                 code.runbook_path(),
-                ".claude/rules/project/groww-portfolio-error-codes.md"
+                "docs/error-runbooks/groww-portfolio-error-codes.md"
             );
             assert!(ErrorCode::all().contains(&code));
             // The runbook must exist on disk (cross-ref test parity).
@@ -3070,7 +3070,7 @@ mod tests {
             assert_eq!(code.is_auto_triage_safe(), auto_safe);
             assert_eq!(
                 code.runbook_path(),
-                ".claude/rules/project/groww-oco-error-codes.md"
+                "docs/error-runbooks/groww-oco-error-codes.md"
             );
             assert!(ErrorCode::all().contains(&code));
             let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3120,7 +3120,7 @@ mod tests {
             assert!(ErrorCode::all().contains(&code));
             assert_eq!(
                 code.runbook_path(),
-                ".claude/rules/project/groww-margin-error-codes.md"
+                "docs/error-runbooks/groww-margin-error-codes.md"
             );
             // The runbook must exist on disk (cross-ref test parity).
             let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3176,7 +3176,7 @@ mod tests {
             assert!(ErrorCode::all().contains(&code));
             assert_eq!(
                 code.runbook_path(),
-                ".claude/rules/project/groww-order-push-error-codes.md"
+                "docs/error-runbooks/groww-order-push-error-codes.md"
             );
             // The runbook must exist on disk (cross-ref test parity).
             let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3203,7 +3203,7 @@ mod tests {
         );
         assert_eq!(
             c.runbook_path(),
-            ".claude/rules/project/order-readiness-error-codes.md"
+            "docs/error-runbooks/order-readiness-error-codes.md"
         );
         assert!(ErrorCode::all().contains(&c));
     }

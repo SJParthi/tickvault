@@ -183,7 +183,7 @@ rules:
     match:
       code: ORDER-READY-01
     action: escalate
-    runbook_path: .claude/rules/project/order-readiness-error-codes.md
+    runbook_path: docs/error-runbooks/order-readiness-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -687,7 +687,7 @@ rules:
     match:
       code: HOT-PATH-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    runbook_path: docs/error-runbooks/wave-1-error-codes.md
     confidence: 1.0
     cooldown_secs: 3600
     justification: >-
@@ -699,7 +699,7 @@ rules:
     match:
       code: HOT-PATH-02
     action: silence
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    runbook_path: docs/error-runbooks/wave-1-error-codes.md
     confidence: 1.0
     cooldown_secs: 86400
     justification: >-
@@ -713,7 +713,7 @@ rules:
     match:
       code: PREVCLOSE-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    runbook_path: docs/error-runbooks/wave-1-error-codes.md
     confidence: 1.0
     cooldown_secs: 3600
     justification: >-
@@ -725,7 +725,7 @@ rules:
     match:
       code: PREVCLOSE-02
     action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    runbook_path: docs/error-runbooks/wave-1-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -747,7 +747,7 @@ rules:
     match:
       code: WS-GAP-04
     action: silence
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 86400
     justification: >-
@@ -774,7 +774,7 @@ rules:
     match:
       code: WS-GAP-10
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -791,7 +791,7 @@ rules:
     match:
       code: DISK-WATCHER-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -808,7 +808,7 @@ rules:
     match:
       code: AUTH-GAP-03
     action: silence
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 86400
     justification: >-
@@ -820,7 +820,7 @@ rules:
     match:
       code: BOOT-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -832,7 +832,7 @@ rules:
     match:
       code: BOOT-02
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -844,7 +844,7 @@ rules:
     match:
       code: BOOT-03
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-c-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-c-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -860,7 +860,7 @@ rules:
     match:
       code: AUDIT-02
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -871,7 +871,7 @@ rules:
     match:
       code: AUDIT-03
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -881,7 +881,7 @@ rules:
     match:
       code: AUDIT-04
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -891,7 +891,7 @@ rules:
     match:
       code: AUDIT-05
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -901,7 +901,7 @@ rules:
     match:
       code: AUDIT-06
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -912,7 +912,7 @@ rules:
     match:
       code: AUDIT-WS-01
     action: escalate
-    runbook_path: .claude/rules/project/ws-event-audit-error-codes.md
+    runbook_path: docs/error-runbooks/ws-event-audit-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -927,7 +927,7 @@ rules:
     match:
       code: STORAGE-GAP-03
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -938,7 +938,7 @@ rules:
     match:
       code: STORAGE-GAP-04
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 3600
     justification: >-
@@ -950,7 +950,7 @@ rules:
     match:
       code: TELEGRAM-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-3-error-codes.md
+    runbook_path: docs/error-runbooks/wave-3-error-codes.md
     confidence: 1.0
     cooldown_secs: 1800
     justification: >-
@@ -963,7 +963,7 @@ rules:
     match:
       code: TELEGRAM-02
     action: silence
-    runbook_path: .claude/rules/project/wave-3-error-codes.md
+    runbook_path: docs/error-runbooks/wave-3-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -974,7 +974,7 @@ rules:
     match:
       code: TELEGRAM-03
     action: silence
-    runbook_path: .claude/rules/project/wave-3-error-codes.md
+    runbook_path: docs/error-runbooks/wave-3-error-codes.md
     confidence: 1.0
     cooldown_secs: 3600
     justification: >-
@@ -990,7 +990,7 @@ rules:
     match:
       code: SELFTEST-01
     action: silence
-    runbook_path: .claude/rules/project/wave-3-c-error-codes.md
+    runbook_path: docs/error-runbooks/wave-3-c-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1002,7 +1002,7 @@ rules:
     match:
       code: SELFTEST-02
     action: escalate
-    runbook_path: .claude/rules/project/wave-3-c-error-codes.md
+    runbook_path: docs/error-runbooks/wave-3-c-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -1029,7 +1029,7 @@ rules:
     match:
       code: PREVCLOSE-03
     action: escalate
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    runbook_path: docs/error-runbooks/wave-5-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1047,7 +1047,7 @@ rules:
     match:
       code: VOLUME-MONO-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    runbook_path: docs/error-runbooks/wave-5-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -1072,7 +1072,7 @@ rules:
     match:
       message_substring: "candle cascade lag"
     action: escalate
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    runbook_path: docs/error-runbooks/wave-5-error-codes.md
     confidence: 0.9
     cooldown_secs: 60
     justification: >-
@@ -1089,7 +1089,7 @@ rules:
     match:
       message_substring: "cascade supervisor respawn"
     action: escalate
-    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    runbook_path: docs/error-runbooks/wave-5-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1118,7 +1118,7 @@ rules:
     match:
       code: PREVOI-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    runbook_path: docs/error-runbooks/wave-1-error-codes.md
     confidence: 0.9
     cooldown_secs: 0
     justification: >-
@@ -1132,7 +1132,7 @@ rules:
     match:
       code: PREVCLOSE-04
     action: escalate
-    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    runbook_path: docs/error-runbooks/wave-1-error-codes.md
     confidence: 0.9
     cooldown_secs: 0
     justification: >-
@@ -1146,7 +1146,7 @@ rules:
     match:
       code: BOUNDARY-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    runbook_path: docs/error-runbooks/wave-6-error-codes.md
     confidence: 0.9
     cooldown_secs: 60
     justification: >-
@@ -1160,7 +1160,7 @@ rules:
     match:
       code: RESILIENCE-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    runbook_path: docs/error-runbooks/wave-4-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1174,7 +1174,7 @@ rules:
     match:
       code: RESILIENCE-03
     action: escalate
-    runbook_path: .claude/rules/project/dual-instance-lock-2026-07-04.md
+    runbook_path: docs/error-runbooks/dual-instance-lock-2026-07-04.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1191,7 +1191,7 @@ rules:
     match:
       code: PROC-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    runbook_path: docs/error-runbooks/wave-4-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1205,7 +1205,7 @@ rules:
     match:
       code: AUTH-GAP-04
     action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    runbook_path: docs/error-runbooks/wave-4-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1220,7 +1220,7 @@ rules:
     match:
       code: AUTH-GAP-05
     action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    runbook_path: docs/error-runbooks/wave-4-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1239,7 +1239,7 @@ rules:
     match:
       code: RESOURCE-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    runbook_path: docs/error-runbooks/wave-4-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1253,7 +1253,7 @@ rules:
     match:
       code: RESOURCE-02
     action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    runbook_path: docs/error-runbooks/wave-4-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1267,7 +1267,7 @@ rules:
     match:
       code: RESOURCE-03
     action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    runbook_path: docs/error-runbooks/wave-4-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1319,7 +1319,7 @@ rules:
       code: WS-GAP-04
       message_substring: "Friday"
     action: silence
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1335,7 +1335,7 @@ rules:
       code: STORAGE-GAP-03
       message_substring: "cross_verify"
     action: escalate
-    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
     confidence: 0.95
     cooldown_secs: 60
     justification: >-
@@ -1347,7 +1347,7 @@ rules:
     match:
       code: AGGREGATOR-DROP-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    runbook_path: docs/error-runbooks/wave-6-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1361,7 +1361,7 @@ rules:
     match:
       code: AGGREGATOR-LATE-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    runbook_path: docs/error-runbooks/wave-6-error-codes.md
     confidence: 0.9
     cooldown_secs: 60
     justification: >-
@@ -1374,7 +1374,7 @@ rules:
     match:
       code: AGGREGATOR-LAG-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    runbook_path: docs/error-runbooks/wave-6-error-codes.md
     confidence: 1.0
     cooldown_secs: 60
     justification: >-
@@ -1391,7 +1391,7 @@ rules:
     match:
       code: AGGREGATOR-SEAL-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    runbook_path: docs/error-runbooks/wave-6-error-codes.md
     confidence: 0.95
     cooldown_secs: 60
     justification: >-
@@ -1403,7 +1403,7 @@ rules:
     match:
       code: AGGREGATOR-HB-01
     action: silence
-    runbook_path: .claude/rules/project/wave-6-error-codes.md
+    runbook_path: docs/error-runbooks/wave-6-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1415,7 +1415,7 @@ rules:
     match:
       code: ORPHAN-POSITION-01
     action: escalate
-    runbook_path: .claude/rules/project/phase-0-item-20-error-codes.md
+    runbook_path: docs/error-runbooks/phase-0-item-20-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1429,7 +1429,7 @@ rules:
     match:
       code: BAR-MISMATCH-01
     action: escalate
-    runbook_path: .claude/rules/project/phase-0-items-15-28-29-error-codes.md
+    runbook_path: docs/error-runbooks/phase-0-items-15-28-29-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1444,7 +1444,7 @@ rules:
     match:
       code: BAR-MISMATCH-02
     action: escalate
-    runbook_path: .claude/rules/project/phase-0-items-15-28-29-error-codes.md
+    runbook_path: docs/error-runbooks/phase-0-items-15-28-29-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1457,7 +1457,7 @@ rules:
     match:
       code: BAR-MISMATCH-03
     action: escalate
-    runbook_path: .claude/rules/project/phase-0-items-15-28-29-error-codes.md
+    runbook_path: docs/error-runbooks/phase-0-items-15-28-29-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1490,7 +1490,7 @@ rules:
     match:
       code: INDEX-OHLC-02
     action: escalate
-    runbook_path: .claude/rules/project/index-day-ohlc-tracker-error-codes.md
+    runbook_path: docs/error-runbooks/index-day-ohlc-tracker-error-codes.md
     confidence: 0.9
     cooldown_secs: 60
     justification: >-
@@ -1516,7 +1516,7 @@ rules:
     match:
       code: WS-SPILL-01
     action: escalate
-    runbook_path: .claude/rules/project/ws-frame-spill-error-codes.md
+    runbook_path: docs/error-runbooks/ws-frame-spill-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1534,7 +1534,7 @@ rules:
     match:
       code: TICK-FLUSH-01
     action: escalate
-    runbook_path: .claude/rules/project/tick-flush-worker-error-codes.md
+    runbook_path: docs/error-runbooks/tick-flush-worker-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1555,7 +1555,7 @@ rules:
     match:
       code: WS-SPILL-02
     action: escalate
-    runbook_path: .claude/rules/project/ws-frame-spill-error-codes.md
+    runbook_path: docs/error-runbooks/ws-frame-spill-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1606,7 +1606,7 @@ rules:
     match:
       code: GROWW-MASTER-01
     action: silence
-    runbook_path: .claude/rules/project/groww-shared-master-error-codes.md
+    runbook_path: docs/error-runbooks/groww-shared-master-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1629,7 +1629,7 @@ rules:
     match:
       code: FEED-STALL-01
     action: escalate
-    runbook_path: .claude/rules/project/feed-stall-watchdog-error-codes.md
+    runbook_path: docs/error-runbooks/feed-stall-watchdog-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1648,7 +1648,7 @@ rules:
     match:
       code: FEED-SUPERVISOR-01
     action: escalate
-    runbook_path: .claude/rules/project/feed-stall-watchdog-error-codes.md
+    runbook_path: docs/error-runbooks/feed-stall-watchdog-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1667,7 +1667,7 @@ rules:
     match:
       code: FEED-REJECT-01
     action: escalate
-    runbook_path: .claude/rules/project/feed-stall-watchdog-error-codes.md
+    runbook_path: docs/error-runbooks/feed-stall-watchdog-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1692,7 +1692,7 @@ rules:
     match:
       code: HTTP-CLIENT-01
     action: escalate
-    runbook_path: .claude/rules/project/http-client-error-codes.md
+    runbook_path: docs/error-runbooks/http-client-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1716,7 +1716,7 @@ rules:
     match:
       code: GROWW-SCALE-01
     action: escalate
-    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1736,7 +1736,7 @@ rules:
     match:
       code: GROWW-SCALE-02
     action: escalate
-    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1756,7 +1756,7 @@ rules:
     match:
       code: GROWW-SCALE-03
     action: escalate
-    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1775,7 +1775,7 @@ rules:
     match:
       code: GROWW-SCALE-04
     action: silence
-    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1796,7 +1796,7 @@ rules:
     match:
       code: GROWW-SCALE-05
     action: escalate
-    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1817,7 +1817,7 @@ rules:
     match:
       code: GROWW-NATIVE-01
     action: silence
-    runbook_path: .claude/rules/project/groww-native-rust-error-codes.md
+    runbook_path: docs/error-runbooks/groww-native-rust-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1836,7 +1836,7 @@ rules:
     match:
       code: GROWW-NATIVE-02
     action: silence
-    runbook_path: .claude/rules/project/groww-native-rust-error-codes.md
+    runbook_path: docs/error-runbooks/groww-native-rust-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1852,7 +1852,7 @@ rules:
     match:
       code: GROWW-NATIVE-03
     action: silence
-    runbook_path: .claude/rules/project/groww-native-rust-error-codes.md
+    runbook_path: docs/error-runbooks/groww-native-rust-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1869,7 +1869,7 @@ rules:
     match:
       code: GROWW-NATIVE-04
     action: silence
-    runbook_path: .claude/rules/project/groww-native-rust-error-codes.md
+    runbook_path: docs/error-runbooks/groww-native-rust-error-codes.md
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
@@ -1890,7 +1890,7 @@ rules:
     match:
       code: FUTIDX-01
     action: escalate
-    runbook_path: .claude/rules/project/futidx-4-error-codes.md
+    runbook_path: docs/error-runbooks/futidx-4-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1910,7 +1910,7 @@ rules:
     match:
       code: FUTIDX-02
     action: escalate
-    runbook_path: .claude/rules/project/futidx-4-error-codes.md
+    runbook_path: docs/error-runbooks/futidx-4-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -1938,7 +1938,7 @@ rules:
     match:
       code: SCOREBOARD-01
     action: escalate
-    runbook_path: .claude/rules/project/dual-feed-scoreboard-error-codes.md
+    runbook_path: docs/error-runbooks/dual-feed-scoreboard-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -1962,7 +1962,7 @@ rules:
     match:
       code: FEED-GAP-01
     action: escalate
-    runbook_path: .claude/rules/project/feed-gap-error-codes.md
+    runbook_path: docs/error-runbooks/feed-gap-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -1981,7 +1981,7 @@ rules:
     match:
       code: WAL-SUSPEND-01
     action: escalate
-    runbook_path: .claude/rules/project/wal-suspension-error-codes.md
+    runbook_path: docs/error-runbooks/wal-suspension-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -2005,7 +2005,7 @@ rules:
     match:
       code: BRUTEX-XVERIFY-01
     action: escalate
-    runbook_path: .claude/rules/project/brutex-crossverify-error-codes.md
+    runbook_path: docs/error-runbooks/brutex-crossverify-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2028,7 +2028,7 @@ rules:
     match:
       code: BRUTEX-XVERIFY-02
     action: escalate
-    runbook_path: .claude/rules/project/brutex-crossverify-error-codes.md
+    runbook_path: docs/error-runbooks/brutex-crossverify-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2052,7 +2052,7 @@ rules:
     match:
       code: SPOT-XVERIFY-01
     action: escalate
-    runbook_path: .claude/rules/project/spot-crossverify-error-codes.md
+    runbook_path: docs/error-runbooks/spot-crossverify-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2073,7 +2073,7 @@ rules:
     match:
       code: SPOT-XVERIFY-02
     action: escalate
-    runbook_path: .claude/rules/project/spot-crossverify-error-codes.md
+    runbook_path: docs/error-runbooks/spot-crossverify-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2100,7 +2100,7 @@ rules:
     match:
       code: SPOT1M-01
     action: escalate
-    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    runbook_path: docs/error-runbooks/rest-1m-pipeline-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2121,7 +2121,7 @@ rules:
     match:
       code: SPOT1M-02
     action: escalate
-    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    runbook_path: docs/error-runbooks/rest-1m-pipeline-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2143,7 +2143,7 @@ rules:
     match:
       code: CHAIN-01
     action: escalate
-    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    runbook_path: docs/error-runbooks/rest-1m-pipeline-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2161,7 +2161,7 @@ rules:
     match:
       code: CHAIN-02
     action: escalate
-    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    runbook_path: docs/error-runbooks/rest-1m-pipeline-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2182,7 +2182,7 @@ rules:
     match:
       code: CHAIN-03
     action: escalate
-    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    runbook_path: docs/error-runbooks/rest-1m-pipeline-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2201,7 +2201,7 @@ rules:
     match:
       code: CHAIN-04
     action: escalate
-    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    runbook_path: docs/error-runbooks/rest-1m-pipeline-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2226,7 +2226,7 @@ rules:
     match:
       code: TF-VERIFY-01
     action: escalate
-    runbook_path: .claude/rules/project/tf-consistency-error-codes.md
+    runbook_path: docs/error-runbooks/tf-consistency-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2246,7 +2246,7 @@ rules:
     match:
       code: TF-VERIFY-02
     action: escalate
-    runbook_path: .claude/rules/project/tf-consistency-error-codes.md
+    runbook_path: docs/error-runbooks/tf-consistency-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2317,7 +2317,7 @@ rules:
     match:
       code: GROWW-PORT-01
     action: escalate
-    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    runbook_path: docs/error-runbooks/groww-portfolio-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2332,7 +2332,7 @@ rules:
     match:
       code: GROWW-PORT-02
     action: escalate
-    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    runbook_path: docs/error-runbooks/groww-portfolio-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2350,7 +2350,7 @@ rules:
     match:
       code: GROWW-PORT-03
     action: escalate
-    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    runbook_path: docs/error-runbooks/groww-portfolio-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2366,7 +2366,7 @@ rules:
     match:
       code: GROWW-PORT-04
     action: escalate
-    runbook_path: .claude/rules/project/groww-portfolio-error-codes.md
+    runbook_path: docs/error-runbooks/groww-portfolio-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2382,7 +2382,7 @@ rules:
     match:
       code: GROWW-OCO-01
     action: escalate
-    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    runbook_path: docs/error-runbooks/groww-oco-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2399,7 +2399,7 @@ rules:
     match:
       code: GROWW-OCO-02
     action: escalate
-    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    runbook_path: docs/error-runbooks/groww-oco-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2416,7 +2416,7 @@ rules:
     match:
       code: GROWW-OCO-03
     action: escalate
-    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    runbook_path: docs/error-runbooks/groww-oco-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2431,7 +2431,7 @@ rules:
     match:
       code: GROWW-OCO-04
     action: escalate
-    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    runbook_path: docs/error-runbooks/groww-oco-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2447,7 +2447,7 @@ rules:
     match:
       code: GROWW-OCO-05
     action: escalate
-    runbook_path: .claude/rules/project/groww-oco-error-codes.md
+    runbook_path: docs/error-runbooks/groww-oco-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2474,7 +2474,7 @@ rules:
     match:
       code: GROWW-MARG-01
     action: escalate
-    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    runbook_path: docs/error-runbooks/groww-margin-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2492,7 +2492,7 @@ rules:
     match:
       code: GROWW-MARG-02
     action: escalate
-    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    runbook_path: docs/error-runbooks/groww-margin-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2511,7 +2511,7 @@ rules:
     match:
       code: GROWW-MARG-03
     action: escalate
-    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    runbook_path: docs/error-runbooks/groww-margin-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2532,7 +2532,7 @@ rules:
     match:
       code: GROWW-MARG-04
     action: escalate
-    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    runbook_path: docs/error-runbooks/groww-margin-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2550,7 +2550,7 @@ rules:
     match:
       code: GROWW-MARG-05
     action: escalate
-    runbook_path: .claude/rules/project/groww-margin-error-codes.md
+    runbook_path: docs/error-runbooks/groww-margin-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2570,7 +2570,7 @@ rules:
     match:
       code: GROWW-ORD-01
     action: escalate
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2582,7 +2582,7 @@ rules:
     match:
       code: GROWW-ORD-02
     action: escalate
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2595,7 +2595,7 @@ rules:
     match:
       code: GROWW-ORD-03
     action: escalate
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
@@ -2608,7 +2608,7 @@ rules:
     match:
       code: GROWW-ORD-04
     action: escalate
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2621,7 +2621,7 @@ rules:
     match:
       code: GROWW-ORD-05
     action: silence
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2635,7 +2635,7 @@ rules:
     match:
       code: GROWW-ORD-06
     action: escalate
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2648,7 +2648,7 @@ rules:
     match:
       code: GROWW-ORD-07
     action: escalate
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2661,7 +2661,7 @@ rules:
     match:
       code: GROWW-ORD-08
     action: escalate
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2674,7 +2674,7 @@ rules:
     match:
       code: GROWW-ORD-09
     action: escalate
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2687,7 +2687,7 @@ rules:
     match:
       code: GROWW-ORD-10
     action: escalate
-    runbook_path: .claude/rules/project/groww-orders-error-codes.md
+    runbook_path: docs/error-runbooks/groww-orders-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2707,7 +2707,7 @@ rules:
     match:
       code: GROWW-PUSH-01
     action: escalate
-    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    runbook_path: docs/error-runbooks/groww-order-push-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2722,7 +2722,7 @@ rules:
     match:
       code: GROWW-PUSH-02
     action: escalate
-    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    runbook_path: docs/error-runbooks/groww-order-push-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2736,7 +2736,7 @@ rules:
     match:
       code: GROWW-PUSH-03
     action: escalate
-    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    runbook_path: docs/error-runbooks/groww-order-push-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2751,7 +2751,7 @@ rules:
     match:
       code: GROWW-PUSH-04
     action: escalate
-    runbook_path: .claude/rules/project/groww-order-push-error-codes.md
+    runbook_path: docs/error-runbooks/groww-order-push-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2834,7 +2834,7 @@ rules:
     match:
       code: FOLD-01
     action: escalate
-    runbook_path: .claude/rules/project/rest-candle-fold-error-codes.md
+    runbook_path: docs/error-runbooks/rest-candle-fold-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2854,7 +2854,7 @@ rules:
     match:
       code: RAMSTORE-01
     action: escalate
-    runbook_path: .claude/rules/project/ram-store-error-codes.md
+    runbook_path: docs/error-runbooks/ram-store-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
@@ -2877,7 +2877,7 @@ rules:
     match:
       code: ORDER-EVT-01
     action: escalate
-    runbook_path: .claude/rules/project/order-update-events-error-codes.md
+    runbook_path: docs/error-runbooks/order-update-events-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
