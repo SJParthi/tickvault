@@ -90,7 +90,11 @@ touched: `tickvault-core` (`crates/core/src/cadence/{assembly,runner}.rs`),
   `cross_fill_refuses_nonpositive_donor_spot`
 - `runner.rs::unaccounted_session_tail_cases`,
   `executor_tail_grace_is_bounded_and_additive`,
-  `stages_include_divergence_flags`
+  `divergence_flags_alone_never_degrade` +
+  `real_degrade_excludes_divergence_stages` (divergence is advisory
+  info-level only — decoupled from `any()`/`stages()` per the 2026-07-20
+  adversarial review; supersedes the drafted
+  `stages_include_divergence_flags`)
 - Scoped: `cargo test -p tickvault-core -p tickvault-app`; full battery via CI
   (All Green on the exact final head per merge-gate-lock §3.2).
 
@@ -104,8 +108,10 @@ M11 grace is one constant).
 
 New counters `tv_cadence_chain_spot_divergence_total{lane,underlying}` +
 `tv_cadence_cross_source_spot_divergence_total{underlying}`; existing
-`tv_cadence_boundary_skipped_total` reused for the tail; new stages
-`chain_spot_divergence` / `cross_source_spot_divergence` (CADENCE-01) +
+`tv_cadence_boundary_skipped_total` reused for the tail; new flags
+`chain_spot_divergence` / `cross_source_spot_divergence` (advisory
+info-level only — decoupled from the CADENCE-01 degrade stages/`any()`
+per the 2026-07-20 adversarial review; coalesced `info!` + counters) +
 `final_boundary_missed` (CADENCE-03); new audit class `malformed_body`
 (outcome `Error`). All documented in `cadence-error-codes.md` §0d + the two
 stage tables in the same PR.

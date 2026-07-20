@@ -1280,11 +1280,15 @@ struct DegradeFlags {
     /// underlying spot diverged from the lane's resolved spot cell beyond
     /// the 0.5% coherence band — vendor-stale chain / wrong-instrument
     /// proxy (chain bodies carry no vendor timestamp or echo to check
-    /// directly). Never decision-blocking, never arming.
+    /// directly). Never decision-blocking, never arming. 2026-07-20
+    /// (adversarial review): EXCLUDED from `any()`/`stages()` — advisory
+    /// info-level + counter only, never a CADENCE-01 degrade stage.
     chain_spot_divergence: bool,
     /// ADVISORY (H2-partial/M14, audit 2026-07-20): both lanes' OWN-fetch
     /// spots for one underlying + minute diverged beyond the band —
-    /// cross-broker divergence / wrong-instrument proxy.
+    /// cross-broker divergence / wrong-instrument proxy. 2026-07-20
+    /// (adversarial review): EXCLUDED from `any()`/`stages()` — advisory
+    /// info-level + counter only, never a CADENCE-01 degrade stage.
     cross_source_spot_divergence: bool,
     /// ≥1 chain request was stamped `expiry_yyyymmdd = None` (the
     /// resolver seam is unresolved — the scheduler never guesses; the
@@ -1304,8 +1308,6 @@ impl DegradeFlags {
             || self.cross_fill
             || self.chain_embedded_spot
             || self.moneyness_unknown
-            || self.chain_spot_divergence
-            || self.cross_source_spot_divergence
             || self.expiry_unresolved
     }
 
@@ -1323,11 +1325,6 @@ impl DegradeFlags {
             (self.cross_fill, "cross_fill"),
             (self.chain_embedded_spot, "chain_embedded_spot"),
             (self.moneyness_unknown, "moneyness_unknown"),
-            (self.chain_spot_divergence, "chain_spot_divergence"),
-            (
-                self.cross_source_spot_divergence,
-                "cross_source_spot_divergence",
-            ),
             (self.expiry_unresolved, "expiry_unresolved"),
         ] {
             if flag {
@@ -2944,6 +2941,21 @@ fn finalize_if_complete<C: CadenceClock>(
             && own.minute_ist == foreign.minute_ist
             && spots_diverge_paise(own.spot_paise, foreign.spot_paise)
         {
+            // Coalesced ADVISORY emission (2026-07-20, adversarial review):
+            // decoupled from CADENCE-01 — one plain info! per lane per
+            // cycle (first offender named), NO ErrorCode, counter kept.
+            if !lane.flags.cross_source_spot_divergence {
+                info!(
+                    kind = "cross_source_spot_divergence",
+                    lane = lane.asm.feed.as_str(),
+                    underlying = u.as_str(),
+                    own_spot_paise = own.spot_paise,
+                    foreign_spot_paise = foreign.spot_paise,
+                    delta_paise = (own.spot_paise - foreign.spot_paise).abs(),
+                    "cadence advisory: cross-broker spot divergence beyond the \
+                     0.5% band (info-only, coalesced — not a CADENCE-01 stage)"
+                );
+            }
             lane.flags.cross_source_spot_divergence = true;
             metrics::counter!(
                 "tv_cadence_cross_source_spot_divergence_total",
@@ -3014,6 +3026,22 @@ fn decide_lane<C: CadenceClock>(
             lane.asm.spot(*u),
         ) && spots_diverge_paise(embedded_paise, cell.spot_paise)
         {
+            // Coalesced ADVISORY emission (2026-07-20, adversarial review):
+            // decoupled from CADENCE-01 — one plain info! per lane per
+            // cycle (first offender named), NO ErrorCode, counter kept.
+            if !lane.flags.chain_spot_divergence {
+                info!(
+                    kind = "chain_spot_divergence",
+                    lane = feed.as_str(),
+                    underlying = u.as_str(),
+                    embedded_spot_paise = embedded_paise,
+                    cell_spot_paise = cell.spot_paise,
+                    delta_paise = (embedded_paise - cell.spot_paise).abs(),
+                    "cadence advisory: chain-embedded spot diverged from the \
+                     resolved spot cell beyond the 0.5% band (info-only, \
+                     coalesced — not a CADENCE-01 stage)"
+                );
+            }
             lane.flags.chain_spot_divergence = true;
             metrics::counter!(
                 "tv_cadence_chain_spot_divergence_total",
@@ -3203,20 +3231,39 @@ mod tests {
         );
     }
 
-    /// H3/H2-partial (audit 2026-07-20): the coalesced stage string
-    /// carries the two new advisory divergence stages.
+    /// 2026-07-20 (adversarial review): the two ADVISORY divergence flags
+    /// are DECOUPLED from CADENCE-01 — alone they never read as a degrade
+    /// (`any()` false, `stages()` empty), so a routine 0.5% cross-broker
+    /// divergence can never false-fire the High degrade line.
     #[test]
-    fn stages_include_divergence_flags() {
+    fn divergence_flags_alone_never_degrade() {
         let flags = DegradeFlags {
+            chain_spot_divergence: true,
+            cross_source_spot_divergence: true,
+            ..DegradeFlags::default()
+        };
+        assert!(!flags.any());
+        assert!(flags.stages().is_empty());
+        // And a clean cycle stays clean.
+        assert!(!DegradeFlags::default().any());
+        assert!(DegradeFlags::default().stages().is_empty());
+    }
+
+    /// 2026-07-20 (adversarial review): a REAL degrade flag still arms
+    /// CADENCE-01, and the advisory divergence flags never leak into the
+    /// coalesced stage string beside it.
+    #[test]
+    fn real_degrade_excludes_divergence_stages() {
+        let flags = DegradeFlags {
+            fetch_failed: true,
             chain_spot_divergence: true,
             cross_source_spot_divergence: true,
             ..DegradeFlags::default()
         };
         assert!(flags.any());
         let s = flags.stages();
-        assert_eq!(s, "chain_spot_divergence,cross_source_spot_divergence");
-        // And they never leak into a clean cycle.
-        assert!(!DegradeFlags::default().any());
-        assert!(DegradeFlags::default().stages().is_empty());
+        assert_eq!(s, "fetch_failed");
+        assert!(!s.contains("chain_spot_divergence"));
+        assert!(!s.contains("cross_source_spot_divergence"));
     }
 }
