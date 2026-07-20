@@ -52,6 +52,11 @@ pub const CROSS_FILL_DIGEST_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3_600 + 47 * 60;
 /// degrades to "+N more" — the table holds the full record).
 const DIGEST_MAX_LINES: usize = 20;
 
+/// HTTP timeout for the once-per-day digest QuestDB `/exec` read (cold
+/// path). Generous vs the 2s probe timeout because the day-query scans
+/// the day's `cross_fill_audit` rows (bounded — a handful/day).
+const DIGEST_HTTP_TIMEOUT_SECS: u64 = 10;
+
 /// Map a core [`CrossFillAuditEvent`] onto its `cross_fill_audit` row.
 /// Pure — the resolution SYMBOL derives from the stage (`cross_fill` →
 /// `cross_fill`; `groww_fallback` → `native_late_retry`, the lane's OWN
@@ -287,12 +292,32 @@ async fn run_cross_fill_digest_once(
 ) {
     let date_ymd = date.format("%Y-%m-%d").to_string();
     let base_url = format!("http://{}:{}/exec", questdb_cfg.host, questdb_cfg.http_port);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
+    // Panic-free client build (HTTP-CLIENT-01 discipline — NEVER fall back
+    // to `Client::new()`, which panics on the same conditions that make the
+    // builder fail). A build failure degrades this one digest run to the
+    // honest "count unknown" body via the read-failure arm below.
+    let client = match tickvault_storage::http_client::build_probe_client(DIGEST_HTTP_TIMEOUT_SECS)
     {
         Ok(c) => c,
-        Err(_) => reqwest::Client::new(),
+        Err(e) => {
+            metrics::counter!("tv_cross_fill_audit_write_errors_total", "stage" => "digest_read")
+                .increment(1);
+            error!(
+                code = ErrorCode::Cadence04AuditWriteFailed.code_str(),
+                stage = "digest_read",
+                error = %e.message(),
+                date = %date_ymd,
+                "CADENCE-04: digest HTTP client build failed — \
+                 sending the honest count-unknown digest (never a false 0)"
+            );
+            notifier.notify(NotificationEvent::CrossFillDailyDigest {
+                trading_date_ist: date_ymd,
+                count: -1,
+                lines: String::new(),
+                fallback_count: -1,
+            });
+            return;
+        }
     };
     let events = match fetch_body(&client, &base_url, &build_cross_fill_day_sql(&date_ymd)).await {
         Some(body) => parse_cross_fill_day_dataset(&body),
