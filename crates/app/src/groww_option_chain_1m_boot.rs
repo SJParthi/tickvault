@@ -112,7 +112,7 @@ use tickvault_storage::disk_health_watcher::classify_join_exit;
 use tickvault_storage::option_chain_1m_persistence::{
     OPTION_CHAIN_1M_FEED_GROWW, OPTION_CHAIN_1M_LEG_CE, OPTION_CHAIN_1M_LEG_PE,
     OPTION_CHAIN_1M_SEGMENT_IDX_I, OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN, OptionChain1mRow,
-    OptionChain1mWriter, ensure_option_chain_1m_table,
+    OptionChain1mWriter, ensure_option_chain_1m_table, migrate_drop_moneyness_depth_column,
 };
 use tickvault_storage::rest_fetch_audit_persistence::{
     REST_FETCH_LEG_CHAIN_1M, RestFetchAuditRow, RestFetchAuditWriter, RestFetchOutcome,
@@ -1252,12 +1252,7 @@ async fn fire_one_groww_chain_minute(
                         moneyness_spot,
                         chain.legs.iter().map(|l| (l.strike, l.leg, l.ltp)),
                     );
-                    for ((leg, leg_moneyness), leg_depth) in chain
-                        .legs
-                        .iter()
-                        .zip(cls.row_moneyness.iter())
-                        .zip(cls.row_depth.iter())
-                    {
+                    for (leg, leg_label) in chain.legs.iter().zip(cls.row_labels.iter()) {
                         let row = OptionChain1mRow {
                             ts_ist_nanos: target_minute_nanos,
                             trading_date_ist_nanos: trading_date_nanos,
@@ -1287,12 +1282,7 @@ async fn fire_one_groww_chain_minute(
                             // vendor omitted the ltp → every row UNKNOWN).
                             underlying_spot: chain.underlying_ltp,
                             fetched_at_ist_nanos: fetched_at,
-                            moneyness: leg_moneyness.as_str(),
-                            // Signed depth (2026-07-17) — classified from
-                            // the GUARDED moneyness_spot above; None (→
-                            // NULL) whenever that spot / the strike were
-                            // invalid (the UNKNOWN-row case).
-                            moneyness_depth: *leg_depth,
+                            moneyness: *leg_label,
                         };
                         if let Err(err) =
                             writer.append_row_ext(&row, Some(leg.rho), Some(close_to_data_ms))
@@ -1823,6 +1813,7 @@ pub async fn run_groww_chain_1m(
     // 2026-07-13 rho/close_to_data_ms additions — → DEDUP ENABLE) for BOTH
     // tables; failures degrade loudly inside and never block.
     ensure_option_chain_1m_table(&params.questdb).await;
+    migrate_drop_moneyness_depth_column(&params.questdb).await;
     ensure_rest_fetch_audit_table(&params.questdb).await;
 
     if !params.calendar.is_trading_day_today() {

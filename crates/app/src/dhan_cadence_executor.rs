@@ -814,12 +814,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
             let mut persist_failed = false;
             {
                 let mut writer = self.chain_writer.lock().await;
-                for ((leg, leg_moneyness), leg_depth) in chain
-                    .legs
-                    .iter()
-                    .zip(cls.row_moneyness.iter())
-                    .zip(cls.row_depth.iter())
-                {
+                for (leg, leg_label) in chain.legs.iter().zip(cls.row_labels.iter()) {
                     let row = OptionChain1mRow {
                         ts_ist_nanos: target_nanos,
                         trading_date_ist_nanos: trading_date_nanos,
@@ -840,11 +835,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         previous_oi: leg.previous_oi,
                         underlying_spot: chain.underlying_spot,
                         fetched_at_ist_nanos: fetched_at,
-                        moneyness: leg_moneyness.as_str(),
-                        // Signed depth (2026-07-17 merge) — classified in
-                        // classify_chain_legs; None (→ NULL) whenever the
-                        // leg/strike/spot fail the classifier's guards.
-                        moneyness_depth: *leg_depth,
+                        moneyness: *leg_label,
                     };
                     // Dhan rows carry NO rho (delta/theta/gamma/vega only —
                     // option-chain.md rule 10); the measured close→data
