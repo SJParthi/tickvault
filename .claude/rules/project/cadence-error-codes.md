@@ -862,56 +862,99 @@ This rule activates when editing:
   `DayLockedExpiryStore`, `global_dhan_gates`, `global_expiry_store`,
   `resolve_policy_expiry`, or `QueueDelay`
 
-## §CADENCE-04 — degraded-leg recovery (hedged late retry + background history re-pull)
+## §CADENCE-05 — degraded-leg recovery (hedged late retry + background history re-pull)
 
 > **Operator directive (2026-07-20, verbatim):** "retry native until the 4th
 > second, then cross-fill; backfill never feeds live decisions."
 
-`ErrorCode::Cadence04RecoveryDegraded` (`code_str() == "CADENCE-04"`).
+`ErrorCode::Cadence05RecoveryDegraded` (`code_str() == "CADENCE-05"` — CADENCE-04
+was consumed by #1688's `Cadence04AuditWriteFailed` on main; this class minted
+the next free number).
 **Severity:** High. **Auto-triage safe:** YES (the degrade already happened —
 the volley resolved via cross-fill or the bounded re-pull gave up; nothing is
 auto-re-fired). **Delivery:** log-sink-only — NO Telegram, NO CloudWatch
 alarm (the Dhan noise-lock 4-item family is UNCHANGED).
 
-**The pinned contract (`crates/common/src/constants.rs`):**
+**The pinned contract (`crates/common/src/constants.rs` — offsets DERIVED
+from the DhanGates constants per §0d H4, not guessed):**
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `CADENCE_LATE_RETRY_OFFSETS_MS` | `[2_000, 3_000, 3_800]` | bounded in-window micro-retries of ONLY the missing legs, ms after minute close (first fire ~T+1.3s) |
-| `CADENCE_NATIVE_DECISION_DEADLINE_MS` | `4_000` | the T+4s decision pin: native data if a retry landed it, else the already-prepared cross-fill with zero extra wait |
-| `CADENCE_HISTORY_REPULL_OFFSETS_MS` | `[30_000, 60_000]` | detached background re-pull of the degraded broker's OWN rows (DEDUP-idempotent upsert) — fired only when the deadline resolved via cross-fill |
-| `CADENCE_DHAN_PREWARM_LEAD_MS` | `5_000` | one best-effort pre-warm GET on the pooled Dhan client at T−5s |
+| `CADENCE_LATE_RETRY_SPOT_OFFSETS_MS` | `[2_000, 3_000]` | the Dhan SPOT hedged micro-retry grid, ms after minute close — the appended rolling-window grid (default T+1s burst + k·1000ms windows); answers ~+300ms land inside the deadline. Per-leg Empty budget = `CADENCE_LATE_RETRY_SPOT_EMPTY_BUDGET` (2); with ALL 4 spots empty the shared append grid fits ~2 retry fires before the deadline (the rest are pre-empted by the resolved deadline) |
+| `CADENCE_LATE_RETRY_CHAIN_OFFSET_MS` | `4_000` | the Dhan CHAIN single legal retry slot: the ≥3s per-(underlying, expiry) CAS gate makes sub-3s chain re-fires infeasible — burst (T+1s) + spacing (3s) = T+4.0s, the EXISTING `dhan_chain_retry_slots_ms` grid. Its answer can never beat the deadline; when the deadline cross-fills first the slot is skipped and the background re-pull owns the chain's own-row recovery |
+| `CADENCE_NATIVE_DECISION_DEADLINE_MS` | `4_000` | the T+4s decision pin: native data if it completed the lane by then, else the already-prepared fallback rungs (cross-fill, chain-embedded) with zero extra wait; a tie at the instant resolves to the fallback (test-pinned). When the donor has nothing either, the lane continues on the existing retry/cutoff machinery unchanged |
+| `CADENCE_HISTORY_REPULL_OFFSETS_MS` | `[30_000, 50_000]` | detached background re-pull of the degraded broker's OWN rows (DEDUP-idempotent upsert) — fired only when the decision resolved via cross-fill. T+50s (NOT T+60s — that IS the next boundary; §0d H5) keeps both waves clear of the next cycle's burst window |
+| `CADENCE_DHAN_PREWARM_LEAD_MS` | `5_000` | **RESERVED — pre-warm DEFERRED 2026-07-20:** reqwest exposes no TLS-handshake-only warm-up through its pool, so a real pre-warm is a recurring HTTP GET requiring a `no-rest-except-live-feed-2026-06-27.md` §3 KEEP row (operator surface, §0d M13). No code consumes the constant today |
 
-**Trigger:** a per-lane recovery leg degraded — a late retry answered a
-NON-requested minute (stale-answer guard refusal), every late retry exhausted
-without native data (decision fell to cross-fill), or a background history
-re-pull attempt failed/exhausted. The payload names lane, stage, attempt and
-offset.
+**Groww symmetry:** the Groww lane's bounded in-window retry IS its existing
+wave-verdict fallback + L3 deferred fallback (~T+0.8s, its own 300/min
+budget — no DhanGates by design §4); the deadline, the Malformed exclusion
+and the background re-pull apply to BOTH lanes identically.
+
+**Retry-eligibility set (`ladder::late_retry_budget`, build-pinned):**
+Empty = YES (spot budget 2 / chain budget 1); Timeout / Transport / Auth /
+QueueDelay = the pre-existing single bounded retry (single-flight per leg by
+construction — retries are scheduled only AT completion, the §3c
+first-write-wins precedent); RateLimited = its one bounded retry, and a 429
+answered ON a retry finds the class budget spent (remaining micro-retries
+abort — never a storm); **Malformed = NEVER** (2xx schema break — a
+same-second retry re-fetches the same broken shape; on Groww the per-leg
+malformed latch excludes the leg from the verdict/L3 fallback too).
+
+**Gate law (§0d — binding):** every Dhan retry rides the normal dispatch path
+(`try_acquire_chain` / `try_acquire_spot` before EVERY fire — retries are
+re-queued cycle events, structurally gate-passed); every Dhan re-pull request
+does a NON-BLOCKING gate acquire and SKIPS the wave when contended (nominal
+traffic always wins, counted `gate_skipped`).
+
+**Trigger:** a per-lane recovery leg degraded — every hedged retry stayed
+empty and the decision fell to the prepared cross-fill
+(`stage="retry_still_empty"`, coalesced per lane per cycle), a retry attempt
+was 429-aborted (`stage="retry_rate_limited"`, coalesced), or the background
+history re-pull exhausted both waves without rows
+(`stage="repull_exhausted"`). The stale-answer guard is the EXECUTOR's own
+wrong-minute filter (rows for any minute other than the requested one class
+as `empty_stale` → Empty) — a lagging vendor can never smuggle a wrong
+minute into assembly.
 
 **Counters:** `tv_cadence_late_retry_total{lane, outcome}` with outcome ∈
-{`native_landed`, `stale_answer`, `empty_again`, `error`, `exhausted`} and
+{`native_landed`, `empty_again`, `rate_limited`, `error`, `exhausted`} and
 `tv_cadence_history_repull_total{lane, outcome}` with outcome ∈
-{`recovered`, `empty`, `error`, `exhausted`}.
+{`recovered`, `empty`, `gate_skipped`, `error`, `exhausted`}. The CADENCE-01
+wrap-up line additionally carries `attempts` + `resolution`
+(`native_first_try` / `native_late_retry` / `cross_fill` — the #1688
+`cross_fill_audit` vocabulary; the audit-row wiring itself is the sibling
+session's seam, marked `SEAM(#1688)` at the runner's decide site).
 
-**Isolation law (build-failing ratchet):** the background re-pull is
-HARD-ISOLATED from decisions — it upserts the broker's OWN rows through the
-existing DEDUP keys and is NEVER a resolution value in any audit
-(resolution stays ∈ {`native_first_try`, `native_late_retry`, `cross_fill`}).
+**Isolation law (build-failing ratchet
+`history_repull::tests::test_history_repull_isolation_ratchet`):** the
+background re-pull is HARD-ISOLATED from decisions — it upserts the broker's
+OWN rows through the existing DEDUP keys and is NEVER a resolution value in
+any audit (resolution stays ∈ {`native_first_try`, `native_late_retry`,
+`cross_fill`}); the module cannot even name the runner's cycle-state /
+ladder types, so a re-pull 429 can NEVER arm the shape ladder or feed a
+`rate_limited` streak.
 
 **Triage:**
-1. `mcp__tickvault-logs__tail_errors` — find `CADENCE-04`; the payload names
-   lane + stage + attempt.
-2. A `stale_answer` outcome = the vendor served a lagging minute — expected
-   during open-minute lag; the decision already used cross-fill.
+1. `mcp__tickvault-logs__tail_errors` — find `CADENCE-05`; the payload names
+   lane + stage + attempts.
+2. `empty_again` trends = the vendor is lagging past the retry grid — the
+   decision already used cross-fill at T+4s with zero added wait; expected
+   during the open-minute lag class.
 3. Sustained `exhausted` on ONE lane = that broker's intraday endpoint is
-   lagging past T+3.8s — check the lane's own degraded pages (SPOT1M/CHAIN
-   families) and the daily digest; the other lane's cross-fill is covering.
+   lagging past ~T+3.3s every minute — check the lane's own degraded pages
+   (SPOT1M/CHAIN families) and the daily digest; the other lane's cross-fill
+   is covering.
 4. `tv_cadence_history_repull_total{outcome="exhausted"}` rising = the
-   degraded broker still had no data at T+60s — the minute stays cross-filled
+   degraded broker still had no data at T+50s — the minute stays cross-filled
    in the shared tables; record-completeness recovers on later sweeps only.
+   A rising `gate_skipped` means the re-pull kept losing the non-blocking
+   gate to nominal traffic — correct priority, never widen it.
 
-**Honest envelope:** the hedged retries recover SMALL publication lag
-(≤ ~3.8s); the ~2-minute open lag observed live on 2026-07-20 (09:15/09:16
-IST empty at pull, clean from 09:18) is NOT retryable in-window — only the
-cross-fill covers it, and the background re-pull repairs the broker's own
-history rows after the fact. The healthy lane is byte-untouched.
+**Honest envelope:** the hedged retries recover the SMALL-lag class
+(publication lag of a few seconds — answers landing by ~T+3.3s); the
+~2-minute market-open lag observed live on 2026-07-20 (09:15/09:16 IST empty
+at the T+1s pull, clean from 09:18) is NOT retryable in-window — ONLY the
+cross-fill covers those decisions, and the background re-pull repairs the
+broker's own history rows after the fact. The healthy lane is byte-untouched
+(zero retry tasks, `native_first_try`, attempts=0).

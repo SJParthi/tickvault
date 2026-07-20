@@ -1246,15 +1246,19 @@ pub enum ErrorCode {
     /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
     /// signal). Severity::Medium, auto-triage-safe.
     Cadence03SchedulerDegraded,
-    /// CADENCE-04: the degraded-leg RECOVERY machinery itself degraded —
-    /// a late micro-retry errored (`stage="retry_error"`), every bounded
-    /// retry stayed empty (`stage="retry_still_empty"`), the background
-    /// history re-pull exhausted its attempts without rows
-    /// (`stage="repull_exhausted"`), or the retry lane hit a 429 and
-    /// aborted the remaining attempts (`stage="retry_rate_limited"`).
-    /// Observability only — nothing is auto-re-fired; log-sink-only
-    /// (operator 2026-07-20). Severity::High, auto-triage-safe.
-    Cadence04RecoveryDegraded,
+    /// CADENCE-05: the degraded-leg RECOVERY machinery itself degraded —
+    /// every bounded late retry stayed empty and the decision fell to
+    /// cross-fill (`stage="retry_still_empty"`, coalesced per lane per
+    /// cycle), a retry attempt hit a 429 and the remaining micro-retries
+    /// aborted (`stage="retry_rate_limited"`, coalesced), or the
+    /// background history re-pull exhausted its bounded attempts without
+    /// rows (`stage="repull_exhausted"`). Per-attempt retry errors are
+    /// counter-only (`tv_cadence_late_retry_total{outcome="error"}`) —
+    /// the underlying failure already logs via the CADENCE-01 fetch
+    /// paths. Observability only — nothing is auto-re-fired;
+    /// log-sink-only (operator 2026-07-20). Severity::High,
+    /// auto-triage-safe.
+    Cadence05RecoveryDegraded,
 }
 
 impl ErrorCode {
@@ -1480,7 +1484,7 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded => "CADENCE-01",
             Self::Cadence02DecisionSkipped => "CADENCE-02",
             Self::Cadence03SchedulerDegraded => "CADENCE-03",
-            Self::Cadence04RecoveryDegraded => "CADENCE-04",
+            Self::Cadence05RecoveryDegraded => "CADENCE-05",
         }
     }
 
@@ -1798,11 +1802,11 @@ impl ErrorCode {
             // — self-correcting scheduling telemetry, never data loss;
             // the lane-level consequences page via CADENCE-01/02. Medium.
             Self::Cadence03SchedulerDegraded => Severity::Medium,
-            // CADENCE-04 (operator 2026-07-20): the degraded-leg recovery
+            // CADENCE-05 (operator 2026-07-20): the degraded-leg recovery
             // machinery degraded (retry error / still-empty / re-pull
             // exhausted / retry 429-aborted) — observability only, the
             // cross-fill already decided the minute. High, log-sink-only.
-            Self::Cadence04RecoveryDegraded => Severity::High,
+            Self::Cadence05RecoveryDegraded => Severity::High,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -2081,7 +2085,7 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded
             | Self::Cadence02DecisionSkipped
             | Self::Cadence03SchedulerDegraded
-            | Self::Cadence04RecoveryDegraded => {
+            | Self::Cadence05RecoveryDegraded => {
                 ".claude/rules/project/cadence-error-codes.md"
             }
         }
@@ -2380,7 +2384,7 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded,
             Self::Cadence02DecisionSkipped,
             Self::Cadence03SchedulerDegraded,
-            Self::Cadence04RecoveryDegraded,
+            Self::Cadence05RecoveryDegraded,
         ]
     }
 }
@@ -2786,7 +2790,7 @@ mod tests {
         // TABLE is retained per SEBI 5y) => 164, mechanically recounted
         // against the merged all() vec at this merge of origin/main.
         // 2026-07-20 (cadence T+4s recovery, operator directive):
-        // +1 CADENCE-04 (Cadence04RecoveryDegraded — hedged late-retry /
+        // +1 CADENCE-05 (Cadence05RecoveryDegraded — hedged late-retry /
         // background history re-pull degrade; log-sink-only, High,
         // auto-triage-safe) => 165.
         assert_eq!(ErrorCode::all().len(), 165);
@@ -2861,14 +2865,14 @@ mod tests {
         assert_eq!(c3.severity(), Severity::Medium);
         assert!(c3.is_auto_triage_safe());
 
-        let c4 = ErrorCode::Cadence04RecoveryDegraded;
-        assert_eq!(c4.code_str(), "CADENCE-04");
-        assert_eq!("CADENCE-04".parse::<ErrorCode>(), Ok(c4));
-        assert_eq!(c4.severity(), Severity::High);
+        let c5 = ErrorCode::Cadence05RecoveryDegraded;
+        assert_eq!(c5.code_str(), "CADENCE-05");
+        assert_eq!("CADENCE-05".parse::<ErrorCode>(), Ok(c5));
+        assert_eq!(c5.severity(), Severity::High);
         // Observability only — nothing is auto-re-fired (operator
-        // 2026-07-20); log-sink-only per cadence-error-codes.md §CADENCE-04.
-        assert!(c4.is_auto_triage_safe());
-        for code in [c1, c2, c3, c4] {
+        // 2026-07-20); log-sink-only per cadence-error-codes.md §CADENCE-05.
+        assert!(c5.is_auto_triage_safe());
+        for code in [c1, c2, c3, c5] {
             assert_eq!(
                 code.runbook_path(),
                 ".claude/rules/project/cadence-error-codes.md"

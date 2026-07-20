@@ -1840,22 +1840,54 @@ pub const CADENCE_GROWW_WAVE_STEP_MS: i64 = 1_000;
 /// the cadence gates apply this floor per key).
 pub const CADENCE_CHAIN_MIN_SPACING_FLOOR_MS: i64 = 3_000;
 
-/// Cadence degraded-leg recovery (operator 2026-07-20): bounded micro-retry
-/// offsets for a 2xx-empty broker leg, measured from the minute-close instant.
-/// The retries hedge SMALL vendor lag only; the T+4s deadline below decides.
-pub const CADENCE_LATE_RETRY_OFFSETS_MS: [u64; 3] = [2_000, 3_000, 3_800];
+/// Cadence degraded-leg recovery (operator 2026-07-20): the DHAN SPOT
+/// micro-retry offsets, ms after minute close, DERIVED from the gate
+/// constants — the appended-window retry grid starts one full
+/// [`CADENCE_SPOT_WINDOW_MS`] past the last shape-0 spot group (the
+/// default T+1s burst) and steps one window per retry, so a 2xx-empty
+/// spot leg re-fires at T+2.0s and T+3.0s (answers ~+300ms — both
+/// inside the T+4s deadline). Documentation pin of the STRUCTURAL grid
+/// (`CycleState::next_spot_retry_target_ms`), ratcheted by
+/// `test_late_retry_offsets_and_deadline_pinned`.
+pub const CADENCE_LATE_RETRY_SPOT_OFFSETS_MS: [i64; 2] = [2_000, 3_000];
+
+/// The DHAN CHAIN late-retry offset, ms after minute close: the per-key
+/// ≥3s CAS gate ([`CADENCE_CHAIN_MIN_SPACING_FLOOR_MS`]) makes any
+/// sub-3s chain re-fire infeasible — the existing
+/// `dhan_chain_retry_slots_ms` grid slot (default burst T+1s + 3s
+/// spacing = T+4.0s) is the EARLIEST legal chain retry, i.e. chains get
+/// effectively ONE in-window retry whose answer can never beat the T+4s
+/// deadline. When the deadline resolves the lane via cross-fill first,
+/// that same-instant retry slot is skipped and the background history
+/// re-pull owns the broker's own-row recovery instead.
+pub const CADENCE_LATE_RETRY_CHAIN_OFFSET_MS: i64 = 4_000;
+
+/// Per-leg late-retry budget for the 2xx-EMPTY class on a Dhan SPOT leg
+/// (2 in-window retries — see [`CADENCE_LATE_RETRY_SPOT_OFFSETS_MS`]).
+/// Chains keep the config budget (1 — the single legal T+4.0s slot);
+/// Malformed is NEVER retried (schema break — a same-second retry
+/// cannot fix it); every other class keeps `[cadence] in_cycle_retry_max`.
+pub const CADENCE_LATE_RETRY_SPOT_EMPTY_BUDGET: u32 = 2;
 
 /// The pinned native-vs-cross-fill decision deadline (ms after minute close).
 /// Native rows arriving by this instant win; otherwise the already-prepared
 /// cross-fill is used with zero extra wait (tie resolves to cross-fill).
-pub const CADENCE_NATIVE_DECISION_DEADLINE_MS: u64 = 4_000;
+pub const CADENCE_NATIVE_DECISION_DEADLINE_MS: i64 = 4_000;
 
 /// Background history re-pull offsets (ms after minute close) for a leg that
-/// resolved via cross-fill — record-completeness only, NEVER a decision input.
-pub const CADENCE_HISTORY_REPULL_OFFSETS_MS: [u64; 2] = [30_000, 60_000];
+/// resolved via cross-fill — record-completeness only, NEVER a decision
+/// input. T+30s and T+50s deliberately AVOID the next cycle's burst
+/// window (T+60s lands ON the next boundary — cadence-error-codes.md
+/// §0d H5): the second attempt completes ~T+51s, a full ~10s before the
+/// next volley fires.
+pub const CADENCE_HISTORY_REPULL_OFFSETS_MS: [i64; 2] = [30_000, 50_000];
 
-/// Dhan cadence pre-warm lead (ms before minute close): one best-effort GET on
-/// the pooled client so the TLS/H2 connection is warm for the volley.
+/// Dhan cadence pre-warm lead (ms before minute close). RESERVED —
+/// DEFERRED 2026-07-20: reqwest exposes no TLS-handshake-only warm-up
+/// through its pool, so a real pre-warm would be a recurring HTTP GET
+/// requiring a KEEP row in `no-rest-except-live-feed-2026-06-27.md` §3
+/// (an operator surface — §0d M13). The constant stays pinned so the
+/// future PR cannot drift the lead silently; NO code consumes it today.
 pub const CADENCE_DHAN_PREWARM_LEAD_MS: u64 = 5_000;
 
 // ---------------------------------------------------------------------------
@@ -5467,26 +5499,47 @@ mod tests {
 
     #[test]
     fn test_late_retry_offsets_and_deadline_pinned() {
-        assert_eq!(CADENCE_LATE_RETRY_OFFSETS_MS, [2_000, 3_000, 3_800]);
-        assert_eq!(CADENCE_NATIVE_DECISION_DEADLINE_MS, 4_000);
-        let mut prev = 0u64;
-        for off in CADENCE_LATE_RETRY_OFFSETS_MS {
-            assert!(off > prev, "offsets strictly increasing");
+        // DERIVED, not guessed (operator 2026-07-20): spot offsets = the
+        // default T+1s burst + (k+1) rolling windows — the appended
+        // retry grid the runner actually schedules.
+        let default_burst_ms = 1_000_i64;
+        assert_eq!(CADENCE_LATE_RETRY_SPOT_OFFSETS_MS, [2_000, 3_000]);
+        for (k, off) in CADENCE_LATE_RETRY_SPOT_OFFSETS_MS.iter().enumerate() {
+            let derived = default_burst_ms + (k as i64 + 1) * CADENCE_SPOT_WINDOW_MS;
+            assert_eq!(*off, derived, "spot offset {k} derives from the gate grid");
             assert!(
-                off < CADENCE_NATIVE_DECISION_DEADLINE_MS,
-                "every retry sits inside the deadline"
+                *off < CADENCE_NATIVE_DECISION_DEADLINE_MS,
+                "every spot retry fires inside the deadline"
             );
-            prev = off;
         }
+        // Chain: the per-key >=3s CAS gate makes T+4.0s the EARLIEST
+        // legal chain retry — exactly one in-window slot.
+        assert_eq!(
+            CADENCE_LATE_RETRY_CHAIN_OFFSET_MS,
+            default_burst_ms + CADENCE_CHAIN_MIN_SPACING_FLOOR_MS,
+            "chain offset derives from burst + per-key spacing floor"
+        );
+        assert_eq!(CADENCE_NATIVE_DECISION_DEADLINE_MS, 4_000);
+        assert_eq!(CADENCE_LATE_RETRY_SPOT_EMPTY_BUDGET, 2);
+        assert_eq!(
+            CADENCE_LATE_RETRY_SPOT_EMPTY_BUDGET as usize,
+            CADENCE_LATE_RETRY_SPOT_OFFSETS_MS.len(),
+            "the spot Empty budget matches the derived offset grid"
+        );
     }
 
     #[test]
     fn test_repull_offsets_pinned() {
-        assert_eq!(CADENCE_HISTORY_REPULL_OFFSETS_MS, [30_000, 60_000]);
+        assert_eq!(CADENCE_HISTORY_REPULL_OFFSETS_MS, [30_000, 50_000]);
         for off in CADENCE_HISTORY_REPULL_OFFSETS_MS {
             assert!(
                 off > CADENCE_NATIVE_DECISION_DEADLINE_MS,
                 "re-pull is strictly post-deadline (record-only)"
+            );
+            assert!(
+                off < 60_000,
+                "re-pull NEVER lands on/after the next minute boundary \
+                 (T+60s IS the next boundary — §0d H5)"
             );
         }
     }
