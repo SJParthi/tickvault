@@ -184,11 +184,13 @@ fn test_cloudwatch_operator_dashboard_exists() {
     // lag gauge — the score widget retired with the PARKed SLO publisher.)
     // (2026-07-15: the Groww lag gauge replaced by tv_rest_1m_fire_heartbeat
     // — its sample producer died with the Groww live feed.)
+    // (2026-07-17, stage-3 dead-WS sweep: tv_aggregator_seals_emitted_total
+    // left this list — its widget retired with the tick aggregator; the
+    // series can never publish again.)
     for metric in &[
         "tv_rest_1m_fire_heartbeat",
         "tv_questdb_disconnected_seconds",
         "tv_token_remaining_seconds",
-        "tv_aggregator_seals_emitted_total",
     ] {
         assert!(
             dash.contains(metric),
@@ -932,9 +934,16 @@ fn test_start_watchdog_lambda_monitors_the_morning_start() {
     // pages if the box did not come up. Runs IN AWS (not on a GitHub runner),
     // so it alerts even if GitHub Actions is down — the gap that hid the
     // 2026-06-02 silent start failure.
+    // Rust-only phase 2b-2 wave 2 (2026-07-18): the python handler.py was
+    // ported to crates/aws-lambdas (lib start_watchdog.rs + thin bin) and
+    // deleted with the terraform runtime swap to provided.al2023/bootstrap.
     require_file_exists(
-        "deploy/aws/lambda/start-watchdog/handler.py",
-        "start-watchdog Lambda handler (ping + check)",
+        "crates/aws-lambdas/src/start_watchdog.rs",
+        "start-watchdog Lambda handler (Rust port — ping + check)",
+    );
+    require_file_exists(
+        "crates/aws-lambdas/src/bin/start_watchdog.rs",
+        "start-watchdog Lambda thin bootstrap bin",
     );
     require_file_exists(
         "deploy/aws/terraform/start-watchdog-lambda.tf",
@@ -958,12 +967,17 @@ fn test_start_watchdog_lambda_monitors_the_morning_start() {
         tf.contains("ec2:DescribeInstances") && tf.contains("aws_sns_topic.tv_alerts.arn"),
         "watchdog Lambda must describe EC2 + publish to tv_alerts"
     );
-    let py = std::fs::read_to_string(
-        workspace_root().join("deploy/aws/lambda/start-watchdog/handler.py"),
-    )
-    .expect("handler.py must be readable"); // APPROVED: test
+    // The Rust runtime swap must be complete (no python remnant).
     assert!(
-        py.contains("describe_instances") && py.contains("\"running\""),
+        tf.contains("runtime          = \"provided.al2023\"")
+            && tf.contains("handler          = \"bootstrap\""),
+        "start-watchdog-lambda.tf must run the Rust bootstrap bin (rust-only phase 2b-2)"
+    );
+    let rs =
+        std::fs::read_to_string(workspace_root().join("crates/aws-lambdas/src/start_watchdog.rs"))
+            .expect("start_watchdog.rs must be readable"); // APPROVED: test
+    assert!(
+        rs.contains("describe_instances") && rs.contains("\"running\""),
         "handler must check the instance is running"
     );
 }
@@ -981,9 +995,11 @@ fn test_deploy_watchdog_lambda_is_wired() {
         "deploy/aws/terraform/deploy-watchdog-lambda.tf",
         "Deploy-watchdog Lambda terraform (EventBridge + IAM + function)",
     );
+    // Rust-only phase 2b-2 wave 1 (2026-07-18): the handler is the Rust
+    // module (the python handler.py was ported 1:1 and deleted).
     require_file_exists(
-        "deploy/aws/lambda/deploy-watchdog/handler.py",
-        "Deploy-watchdog Lambda handler",
+        "crates/aws-lambdas/src/deploy_watchdog.rs",
+        "Deploy-watchdog Lambda handler (Rust module)",
     );
     let tf = std::fs::read_to_string(
         workspace_root().join("deploy/aws/terraform/deploy-watchdog-lambda.tf"),
@@ -1035,19 +1051,21 @@ fn test_deploy_watchdog_lambda_is_wired() {
 #[test]
 fn test_deploy_watchdog_handler_only_dispatches_when_positively_stale() {
     // The handler's safety contract: NEVER dispatch on uncertainty. The pure
-    // `is_stale` must return False when either sha is unknown (the no-false-OK
-    // inverse — we never "fix" what we can't confirm is broken).
-    let h = std::fs::read_to_string(
-        workspace_root().join("deploy/aws/lambda/deploy-watchdog/handler.py"),
-    )
-    .expect("deploy-watchdog handler.py must be readable"); // APPROVED: test
+    // `is_stale` must return false when either sha is unknown (the no-false-OK
+    // inverse — we never "fix" what we can't confirm is broken). Repointed
+    // 2026-07-18 (rust-only phase 2b-2 wave 1) at the Rust module that
+    // replaced deploy/aws/lambda/deploy-watchdog/handler.py.
+    let h =
+        std::fs::read_to_string(workspace_root().join("crates/aws-lambdas/src/deploy_watchdog.rs"))
+            .expect("crates/aws-lambdas/src/deploy_watchdog.rs must be readable"); // APPROVED: test
     assert!(
-        h.contains("def is_stale("),
+        h.contains("pub fn is_stale("),
         "handler must expose the pure is_stale decision function"
     );
     assert!(
-        h.contains("if not desired_sha or not deployed_sha:") && h.contains("return False"),
-        "is_stale MUST return False when either sha is unknown — never dispatch on uncertainty"
+        h.contains("let (Some(desired), Some(deployed)) = (desired_sha, deployed_sha) else")
+            && h.contains("return false;"),
+        "is_stale MUST return false when either sha is unknown — never dispatch on uncertainty"
     );
     assert!(
         h.contains("deploy-aws-after-close.yml"),

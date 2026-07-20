@@ -17,14 +17,19 @@
 #   I  gate step missing from the workflow  -> extraction ABORT, non-zero
 #
 # The gate step is EXTRACTED from .github/workflows/terraform-apply.yml at
-# run time (yaml.safe_load; the `${{ env.* }}` expressions substituted; the
-# extraction ABORTS with one clear error if the step is missing/renamed or
-# the extracted script is empty). Stubs terraform/aws/curl/sleep on PATH and
-# drives each scenario end-to-end through the REAL gate script.
+# run time (constrained awk parse of the step's `run: |` block scalar; the
+# `${{ env.* }}` expressions substituted; the extraction ABORTS with one
+# clear error if the step is missing/renamed, the run block is not a plain
+# `run: |` literal, or the extracted script is empty). Stubs
+# terraform/aws/curl/sleep on PATH and drives each scenario end-to-end
+# through the REAL gate script.
 #
 # Run from anywhere:  bash scripts/questdb-console-gate-matrix.sh
-# CI wiring: the ci.yml Repo Guards step "QuestDB console lambda unit tests
-# (back + front)" runs this harness on every PR (the job feeds All Green).
+# CI wiring: the ci.yml Repo Guards step "QuestDB console deploy-gate +
+# all-green harnesses" runs this harness on every PR (the job feeds All
+# Green). (2026-07-18 rust-only phase 2b-3: the console lambda Python
+# unittest halves of that step retired with the handlers — the suites are
+# ported 1:1 into crates/aws-lambdas.)
 set -u
 
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -38,26 +43,91 @@ GATE_SRC="$WORK/gate-step.sh"
 # script (env expressions substituted) to <out-file>; non-zero on any
 # failure. The main flow ABORTS on failure instead of running scenarios
 # against an empty script.
+#
+# Rust-only purge Phase 2a-2 (2026-07-18): the PyYAML extraction was
+# replaced by a CONSTRAINED awk parse, total for the actual shape the
+# workflow uses (verified against terraform-apply.yml):
+#     - name: "Deploy gate: console shell ..."   <- step key, quoted string
+#       # comment lines                           <- optional, deeper indent
+#       run: |                                    <- literal block scalar
+#         <script body>                           <- one deeper indent level
+# The parse fail-closes loudly on ANY drift from that shape (step renamed/
+# missing -> "gate step not found in the workflow"; run key absent or not a
+# `run: |` literal block -> its own abort; unsubstituted `${{` -> abort) —
+# the same abort-not-run-empty contract the PyYAML version had. Block-scalar
+# semantics reproduced: body dedented to the first body line's indent,
+# interior blank lines kept, trailing blank lines clipped (`|` chomping).
 extract_gate() {
   local wf="$1" out="$2"
-  if ! python3 - "$wf" > "$out" <<'PY'
-import sys
-import yaml
-
-doc = yaml.safe_load(open(sys.argv[1]))
-for job in (doc.get("jobs") or {}).values():
-    for step in job.get("steps", []) or []:
-        name = step.get("name") or ""
-        if name.startswith("Deploy gate: console shell"):
-            run = step["run"]
-            run = run.replace("${{ env.TF_DIR }}", "deploy/aws/terraform")
-            run = run.replace("${{ env.AWS_REGION }}", "ap-south-1")
-            if "${{" in run:
-                raise SystemExit("unsubstituted GitHub expression remains in the gate script")
-            sys.stdout.write(run)
-            raise SystemExit(0)
-raise SystemExit("gate step not found in the workflow")
-PY
+  if ! awk '
+    function indent_of(s,   n) { n = match(s, /[^ ]/); return (n == 0) ? length(s) : n - 1 }
+    function is_blank(s) { return s ~ /^[ \t]*$/ }
+    function emit_err(msg) { print msg > "/dev/stderr"; bad = 1; exit 1 }
+    function finish(   i) {
+      # substitute the two env expressions the step uses (literal matches)
+      gsub(/\$\{\{ env\.TF_DIR \}\}/, "deploy/aws/terraform", body)
+      gsub(/\$\{\{ env\.AWS_REGION \}\}/, "ap-south-1", body)
+      if (index(body, "${{") > 0)
+        emit_err("unsubstituted GitHub expression remains in the gate script")
+      printf "%s", body
+      done_ok = 1
+      exit 0
+    }
+    # state 0: searching for the gate step
+    state == 0 {
+      if ($0 ~ /^ *- name: *"?Deploy gate: console shell/) {
+        step_indent = indent_of($0)
+        state = 1
+      }
+      next
+    }
+    # state 1: inside the step, searching for its run: | key
+    state == 1 {
+      if (!is_blank($0) && indent_of($0) <= step_indent)
+        emit_err("gate step found but it has no run: | block before the step ends")
+      if ($0 ~ /^ *run:/) {
+        if ($0 !~ /^ *run: *\| *$/)
+          emit_err("gate step run block is not a plain literal block scalar (run: |) — extractor cannot parse it")
+        state = 2
+        body = ""
+        body_indent = -1
+        pending_blanks = 0
+      }
+      next
+    }
+    # state 2: inside the run block scalar body
+    state == 2 {
+      if (is_blank($0)) { pending_blanks++; next }
+      ind = indent_of($0)
+      if (body_indent < 0) {
+        if (ind <= step_indent + 2)
+          emit_err("gate step run block is empty or mis-indented")
+        body_indent = ind
+      }
+      # Block end vs mid-body dedent (review round 1 fix, 2026-07-18): only a
+      # dedent to AT-OR-ABOVE the step level (the next step / next job key)
+      # legitimately ends the block. A non-blank line whose indent falls
+      # STRICTLY BETWEEN the step indent and the body indent is a malformed /
+      # drifted run block — the old code silently finish()ed there with a
+      # TRUNCATED extraction (rc=0), so scenarios ran against a prefix of the
+      # real gate script. Fail-closed loudly instead (same abort-not-run-
+      # truncated contract as every other drift arm).
+      if (ind <= step_indent && ind < body_indent) finish()   # block ended (trailing blanks clipped)
+      if (ind < body_indent)
+        emit_err("mid-body dedent inside the gate run block (indent " ind " is between the step indent " step_indent " and the body indent " body_indent ") — refusing a TRUNCATED extraction")
+      for (i = 0; i < pending_blanks; i++) body = body "\n"
+      pending_blanks = 0
+      body = body substr($0, body_indent + 1) "\n"
+      next
+    }
+    END {
+      if (bad) exit 1
+      if (done_ok) exit 0
+      if (state == 2 && body != "") { finish(); exit 0 }
+      print "gate step not found in the workflow" > "/dev/stderr"
+      exit 1
+    }
+  ' "$wf" > "$out"
   then
     return 1
   fi
@@ -158,16 +228,24 @@ run_case H_exhausted_stopping_skip true ok ok "504" stopping 0 "box state 'stopp
 #    clear error; never scenarios against an empty script)
 TOTAL=$((TOTAL + 1))
 STRIPPED="$WORK/stripped.yml"
-python3 - "$WORKFLOW" "$STRIPPED" <<'PY'
-import sys
-import yaml
-
-doc = yaml.safe_load(open(sys.argv[1]))
-for job in (doc.get("jobs") or {}).values():
-    steps = job.get("steps") or []
-    job["steps"] = [s for s in steps if not (s.get("name") or "").startswith("Deploy gate: console shell")]
-yaml.safe_dump(doc, open(sys.argv[2], "w"))
-PY
+# Strip the gate step from the RAW yaml (rust-only Phase 2a-2 — replaces the
+# PyYAML load/dump round-trip): drop lines from the step's `- name:` line
+# until the next non-blank line at the same-or-shallower indent (the next
+# step / next job key). Only the extractor above consumes the stripped file,
+# so a raw-text strip is sufficient — no YAML re-serialization needed.
+awk '
+  function indent_of(s,   n) { n = match(s, /[^ ]/); return (n == 0) ? length(s) : n - 1 }
+  skip {
+    if ($0 !~ /^[ \t]*$/ && indent_of($0) <= step_indent) skip = 0
+    else next
+  }
+  /^ *- name: *"?Deploy gate: console shell/ {
+    step_indent = indent_of($0)
+    skip = 1
+    next
+  }
+  { print }
+' "$WORKFLOW" > "$STRIPPED"
 if extract_gate "$STRIPPED" "$WORK/should-not-exist.sh" 2> "$WORK/extract-err"; then
   FAILS=$((FAILS + 1))
   printf '%-32s %s\n' "I_missing_step_abort" "FAIL(extraction unexpectedly succeeded)"

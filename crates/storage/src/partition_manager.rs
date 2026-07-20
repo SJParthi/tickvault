@@ -66,6 +66,9 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // `instrument_lifecycle` (also a pinned-ts current-state master).
     // TICK-CONSERVE-01 (2026-06-10): one row per daily conservation-audit
     // run — same SEBI-audit class + DAY partitioning as cross_verify_1m_audit.
+    // (Audit RETIRED 2026-07-18 with its modules + ErrorCode — dead-WS sweep
+    // follow-up; the TABLE stays retained/swept here per SEBI 5y, exactly
+    // like cross_verify_1m_audit above whose writer also retired.)
     "tick_conservation_audit",
     // AUDIT-WS-01 (2026-06-12): one row per WebSocket lifecycle event —
     // same SEBI-audit class + DAY partitioning as the audit tables above.
@@ -153,6 +156,13 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // pnl heartbeat row); `feed` is in both DEDUP keys.
     "order_audit",
     "pnl_audit",
+    // ORDER-EVT-01 (2026-07-18, full-fidelity push-event capture): one row
+    // per received broker order/position push event, BOTH feeds — the same
+    // Standard 90d order-audit class as order_audit/pnl_audit above (90d hot
+    // in QuestDB, then the DAY sweep's detach→S3-archive cold path). Tiny in
+    // paper mode (a handful of rows/day); `feed` is in both DEDUP keys.
+    "order_update_events",
+    "position_update_events",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.

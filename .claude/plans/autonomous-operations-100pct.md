@@ -33,7 +33,7 @@
 - `scripts/tv-tunnel/com.tickvault.tunnel.plist` — launchd template
 - `scripts/tv-tunnel/tickvault-tunnel.service` — systemd template
 - `scripts/tv-tunnel/doctor.sh` — verify tunnel is up from the host it runs on
-- `scripts/mcp-servers/tickvault-logs/server.py` — read `claude-mcp-endpoints.toml`, env vars as override
+- The `tickvault-logs` MCP server — read `claude-mcp-endpoints.toml`, env vars as override _(2026-07-18 Rust cutover — now `crates/tickvault-logs-mcp`, launched via `scripts/mcp-servers/tickvault-logs-launch.sh`; the Python server was deleted)_
 - `.mcp.json` — reference the new config path
 - `crates/api/src/handlers/debug.rs` — two read-only log-access handlers
 - `crates/api/src/lib.rs` — wire debug routes

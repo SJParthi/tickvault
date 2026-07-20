@@ -37,15 +37,6 @@ pub const LOG_DIRECTORY: &str = "data/logs/machine";
 /// Error-only log file name (WARN + ERROR only, for fast debugging).
 pub const ERROR_LOG_FILE_PATH: &str = "data/logs/machine/errors.log";
 
-/// Fast boot window start (IST).
-pub const FAST_BOOT_WINDOW_START: &str = "09:00:00";
-
-/// Fast boot window end (IST). NSE regular session closes at 15:30.
-pub const FAST_BOOT_WINDOW_END: &str = "15:30:00";
-
-/// Reduced WebSocket connection stagger for off-market-hours boot (milliseconds).
-pub const OFF_HOURS_CONNECTION_STAGGER_MS: u64 = 1000;
-
 /// Local override config file path (git-ignored, optional).
 pub const CONFIG_LOCAL_PATH: &str = "config/local.toml";
 
@@ -127,43 +118,12 @@ impl tracing_subscriber::fmt::time::FormatTime for IstTimer {
 // Pure helper functions
 // ---------------------------------------------------------------------------
 
-/// Determines the effective WebSocket connection stagger in milliseconds.
-///
-/// Always uses `OFF_HOURS_CONNECTION_STAGGER_MS` (1s) for fast boot.
-/// This ensures crash recovery during market hours gets all 5 connections
-/// up in ~5 seconds instead of ~50 seconds with 10s stagger.
-/// Dhan's WebSocket servers handle 5 concurrent connects without issue.
-pub fn effective_ws_stagger(_configured_stagger_ms: u64, _is_market_hours: bool) -> u64 {
-    OFF_HOURS_CONNECTION_STAGGER_MS
-}
-
 /// Formats a host:port pair into a `SocketAddr` string.
 ///
 /// Returns the formatted string — caller is responsible for parsing.
 /// This is a pure function extracted for testability.
 pub fn format_bind_addr(host: &str, port: u16) -> String {
     format!("{host}:{port}")
-}
-
-/// Determines the boot mode description for logging.
-///
-/// Returns `"fast"` if a valid token cache exists AND we're within market
-/// hours on a trading day. Otherwise returns `"standard"`.
-pub fn determine_boot_mode(has_cache: bool, is_market_hours: bool) -> &'static str {
-    if has_cache && is_market_hours {
-        "fast"
-    } else {
-        "standard"
-    }
-}
-
-/// Determines whether to use the fast boot path.
-///
-/// Fast boot requires BOTH a valid token cache AND being within market hours
-/// on a trading day. If the cache exists but we're outside market hours,
-/// the slow boot path is used (downloads fresh instruments, starts Docker first).
-pub fn should_fast_boot(has_cache: bool, is_market_hours: bool) -> bool {
-    has_cache && is_market_hours
 }
 
 /// Returns `true` if the post-market 15:30 IST shutdown sequence should
@@ -208,59 +168,6 @@ pub fn compute_market_close_sleep(market_close_time_str: &str) -> std::time::Dur
     let now_secs = u64::from(now_time.num_seconds_from_midnight());
     let close_secs = u64::from(close_time.num_seconds_from_midnight());
     std::time::Duration::from_secs(close_secs.saturating_sub(now_secs))
-}
-
-/// Close-time force-seal trigger instant: 15:30:05 IST as seconds-of-day
-/// (15 × 3600 + 30 × 60 + 5 = 55_805).
-///
-/// Why 15:30:05 (close-time force-seal, 2026-07-03): the aggregator's
-/// session gate closes the [09:15, 15:30) IST window at exactly 15:30:00,
-/// and the market-close sequence aborts the WS read loops at
-/// ~15:30:02.8 (close + `MARKET_CLOSE_DRAIN_BUFFER_SECS`). Sealing at
-/// 15:30:05 is therefore strictly AFTER the last in-session tick can fold,
-/// so the final session buckets (the 15:29 M1 bar and every TF's last
-/// bucket) flush the same day instead of waiting for the IST-midnight
-/// backstop (which the daily 16:30 IST instance auto-stop destroys).
-pub const CLOSE_SEAL_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60 + 5;
-
-/// Seconds per day (IST wall clock; NSE has no DST).
-const CLOSE_SEAL_SECS_PER_DAY: u64 = 86_400;
-
-/// Pure trigger-time math for the close-time force-seal task: seconds to
-/// sleep from `now_secs_of_day` (IST seconds since midnight) until the NEXT
-/// 15:30:05 IST instant.
-///
-/// - Before the trigger (e.g. 15:29:59 = 55_799) returns the short gap (6s).
-/// - AT or after the trigger it wraps to TOMORROW's 15:30:05 (never 0, so
-///   the task loop can never busy-spin on the trigger instant).
-#[must_use]
-pub fn secs_until_close_seal_ist(now_secs_of_day: u32) -> u64 {
-    let now = u64::from(now_secs_of_day);
-    let trigger = u64::from(CLOSE_SEAL_SECS_OF_DAY_IST);
-    if now < trigger {
-        trigger - now
-    } else {
-        trigger + CLOSE_SEAL_SECS_PER_DAY - now
-    }
-}
-
-/// Wall-clock wrapper for [`secs_until_close_seal_ist`]: reads the current
-/// IST time and returns the sleep until the next 15:30:05 IST trigger.
-/// Used by the close-time force-seal task (Task 3b) in `main.rs`.
-#[must_use]
-// TEST-EXEMPT: thin wall-clock read — trigger math unit-tested via secs_until_close_seal_ist; spawn pinned by ratchet_main_rs_spawns_close_time_force_seal.
-pub fn compute_close_seal_sleep() -> std::time::Duration {
-    let now_ist = chrono::Utc::now().with_timezone(&ist_offset());
-    let now_secs = now_ist.time().num_seconds_from_midnight();
-    std::time::Duration::from_secs(secs_until_close_seal_ist(now_secs))
-}
-
-/// Opens (or creates) the app log file for Alloy consumption.
-///
-/// Creates `data/logs/` directory if needed. Returns `None` if the file
-/// cannot be created (best-effort — logging to stdout always works).
-pub fn create_log_file_writer() -> Option<std::fs::File> {
-    create_log_file_writer_at(APP_LOG_FILE_PATH)
 }
 
 /// Builds the EnvFilter directive string for the rolling app-log file.
@@ -361,6 +268,23 @@ pub fn create_error_log_writer() -> Option<std::fs::File> {
 }
 
 // ---------------------------------------------------------------------------
+// WS-frame WAL directory (single source of truth)
+// ---------------------------------------------------------------------------
+
+/// The single source of truth for the WS-frame WAL directory — the SAME
+/// derivation as main.rs STAGE-C boot wiring. Hostile-review H1: the env
+/// derivation was previously copy-pasted at two main.rs sites and could
+/// drift; both now call this. Relocated 2026-07-18 from the retired
+/// `tick_conservation_boot` module (dead-WS sweep follow-up) — the STAGE-C
+/// replay + archive-prune + confirm sites survive the audit's retirement.
+#[must_use]
+pub fn ws_wal_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()), // O(1) EXEMPT: boot-time
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Clock drift check
 // ---------------------------------------------------------------------------
 
@@ -405,56 +329,6 @@ pub async fn check_clock_drift() -> Option<i64> {
 /// Heartbeat watchdog interval in seconds.
 pub const WATCHDOG_INTERVAL_SECS: u64 = 30;
 
-/// Spawns a background watchdog that periodically checks system liveness.
-///
-/// Checks every 30 seconds:
-/// - Token handle has a valid (non-None) token
-/// - Tick broadcast sender has active receivers
-///
-/// Logs ERROR on failure (triggers Telegram via Loki -> Grafana).
-pub fn spawn_heartbeat_watchdog(
-    token_handle: tickvault_core::auth::token_manager::TokenHandle,
-    tick_sender: tokio::sync::broadcast::Sender<tickvault_common::tick_types::ParsedTick>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(WATCHDOG_INTERVAL_SECS));
-        interval.tick().await; // Skip immediate first tick.
-
-        loop {
-            interval.tick().await;
-
-            let token_ok = {
-                let guard = token_handle.load();
-                guard.as_ref().is_some()
-            };
-            if !token_ok {
-                // AUTH-GAP-01: token watchdog observed a None handle mid-session.
-                tracing::error!(
-                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
-                    severity = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
-                        .severity()
-                        .as_str(),
-                    "AUTH-GAP-01: WATCHDOG — token handle is None, authentication may have failed"
-                );
-            }
-
-            let receiver_count = tick_sender.receiver_count();
-            if receiver_count == 0 {
-                tracing::error!(
-                    "WATCHDOG: tick broadcast has 0 receivers — tick processor may have crashed"
-                );
-            }
-
-            // L4: Export system metrics (open FDs, thread count) every watchdog cycle.
-            crate::infra::export_system_metrics();
-
-            // C1: Emit systemd watchdog heartbeat (no-op if not under systemd).
-            crate::infra::notify_systemd_watchdog();
-        }
-    })
-}
-
 // ---------------------------------------------------------------------------
 // STAGE-D: Boot-time WAL replay drain helpers
 // ---------------------------------------------------------------------------
@@ -497,75 +371,14 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
 
-    // -----------------------------------------------------------------------
-    // Close-time force-seal trigger math (15:30:05 IST) + wiring ratchet
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn test_close_seal_constant_is_153005_ist() {
-        assert_eq!(
-            CLOSE_SEAL_SECS_OF_DAY_IST, 55_805,
-            "close-time force-seal trigger must be 15:30:05 IST (55,805s of day)"
-        );
-    }
-
-    #[test]
-    fn test_secs_until_close_seal_ist_at_152959_is_6s() {
-        // 15:29:59 IST = 55,799s → 6 seconds before the 15:30:05 trigger.
-        assert_eq!(secs_until_close_seal_ist(55_799), 6);
-    }
-
-    #[test]
-    fn test_secs_until_close_seal_ist_at_exact_trigger_wraps_to_next_day() {
-        // AT 15:30:05 the trigger already fired — wrap to tomorrow (never 0,
-        // so the task loop cannot busy-spin on the trigger instant).
-        assert_eq!(secs_until_close_seal_ist(55_805), 86_400);
-    }
-
-    #[test]
-    fn test_secs_until_close_seal_ist_just_after_trigger() {
-        assert_eq!(secs_until_close_seal_ist(55_806), 86_399);
-    }
-
-    #[test]
-    fn test_secs_until_close_seal_ist_at_midnight() {
-        assert_eq!(secs_until_close_seal_ist(0), 55_805);
-    }
-
-    /// Wiring ratchet (source-scan, repo style — the pattern the deleted
-    /// `wal_reinject` ratchets established; that module retired 2026-07-17,
-    /// dead live-WS sweep stage 1):
-    /// the close-time force-seal task MUST stay spawned in
-    /// `spawn_engine_b_aggregator` (main.rs Task 3b) with (a) the
-    /// `compute_close_seal_sleep` trigger, (b) the trading-day calendar
-    /// gate, and (c) the session-scoped seal that skips always-on
-    /// instruments. Removing any of these silently restores the daily
-    /// lost-15:29-candle bug (2026-07-03).
-    #[test]
-    fn ratchet_main_rs_spawns_close_time_force_seal() {
-        let main_src = include_str!("main.rs");
-        assert!(
-            main_src.contains("compute_close_seal_sleep("),
-            "main.rs must sleep on compute_close_seal_sleep() for the \
-             close-time force-seal task (Task 3b)"
-        );
-        assert!(
-            main_src.contains("force_seal_all_session_scoped("),
-            "main.rs must call force_seal_all_session_scoped() at the \
-             15:30:05 IST close-time seal — force_seal_all would truncate \
-             always-on (GIFT Nifty) open buckets mid-session"
-        );
-        // The trading-day gate must live inside the close-seal task block:
-        // find the task marker and require the calendar gate within it.
-        let block_start = main_src
-            .find("close-time force-seal")
-            .expect("main.rs must carry the close-time force-seal task block");
-        let block = &main_src[block_start..block_start.saturating_add(4_000).min(main_src.len())];
-        assert!(
-            block.contains("is_trading_day_today()"),
-            "the close-time force-seal task must gate on \
-             TradingCalendar::is_trading_day_today() (weekends/holidays skip)"
-        );
+    fn test_ws_wal_dir_default() {
+        // Single source of truth for the WAL dir (hostile-review H1) —
+        // default matches the STAGE-C boot wiring. Relocated 2026-07-18
+        // from the retired tick_conservation_boot module.
+        if std::env::var("TV_WS_WAL_DIR").is_err() {
+            assert_eq!(ws_wal_dir(), std::path::PathBuf::from("./data/ws_wal"));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -928,71 +741,9 @@ mod tests {
     // Fast boot window tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_post_market_monitor_constants() {
-        assert_eq!(FAST_BOOT_WINDOW_END, "15:30:00");
-    }
-
-    #[test]
-    fn test_fast_boot_window_start_is_valid_time() {
-        let parsed = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S");
-        assert!(parsed.is_ok());
-    }
-
-    #[test]
-    fn test_fast_boot_window_end_is_valid_time() {
-        let parsed = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S");
-        assert!(parsed.is_ok());
-    }
-
-    #[test]
-    fn test_fast_boot_window_start_before_end() {
-        let start = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S").unwrap();
-        let end = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S").unwrap();
-        assert!(start < end);
-    }
-
-    #[test]
-    fn test_fast_boot_window_covers_market_hours() {
-        let start = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S").unwrap();
-        let end = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S").unwrap();
-        let market_open = chrono::NaiveTime::parse_from_str("09:15:00", "%H:%M:%S").unwrap();
-        let market_close = chrono::NaiveTime::parse_from_str("15:30:00", "%H:%M:%S").unwrap();
-        assert!(start <= market_open);
-        assert!(end >= market_close);
-    }
-
-    #[test]
-    fn test_fast_boot_window_duration_is_reasonable() {
-        let start = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S").unwrap();
-        let end = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S").unwrap();
-        let duration_secs = end.num_seconds_from_midnight() - start.num_seconds_from_midnight();
-        assert!(duration_secs >= 3600);
-        assert!(duration_secs <= 43200);
-    }
-
     // -----------------------------------------------------------------------
     // Off-hours stagger tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn off_hours_stagger_is_less_than_market_hours() {
-        const {
-            assert!(OFF_HOURS_CONNECTION_STAGGER_MS > 0);
-            assert!(OFF_HOURS_CONNECTION_STAGGER_MS <= 2000);
-        }
-    }
-
-    #[test]
-    fn test_off_hours_stagger_constant_value() {
-        assert_eq!(OFF_HOURS_CONNECTION_STAGGER_MS, 1000);
-    }
-
-    #[test]
-    fn test_off_hours_stagger_fits_in_u64() {
-        let d = std::time::Duration::from_millis(OFF_HOURS_CONNECTION_STAGGER_MS);
-        assert_eq!(d.as_secs(), 1);
-    }
 
     // -----------------------------------------------------------------------
     // App log file path tests
@@ -1034,16 +785,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // create_log_file_writer tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_create_log_file_writer_returns_some_in_default_path() {
-        let _ = create_log_file_writer();
-    }
-
-    #[test]
-    fn test_create_log_file_writer_returns_file_handle() {
-        let _ = create_log_file_writer();
-    }
 
     #[test]
     fn test_create_log_file_writer_with_temp_dir() {
@@ -1089,54 +830,6 @@ mod tests {
     // create_log_file_writer — deeper tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_create_log_file_writer_returns_some() {
-        // In a normal environment, the log file should be creatable.
-        // This exercises both the create_dir_all and OpenOptions paths.
-        let result = create_log_file_writer();
-        assert!(
-            result.is_some(),
-            "create_log_file_writer should succeed in writable directory"
-        );
-    }
-
-    #[test]
-    fn test_create_log_file_writer_file_is_writable() {
-        use std::io::Write;
-        if let Some(mut file) = create_log_file_writer() {
-            let write_result = file.write_all(b"test log line\n");
-            assert!(
-                write_result.is_ok(),
-                "log file must be writable after creation"
-            );
-        }
-    }
-
-    #[test]
-    fn test_create_log_file_writer_idempotent() {
-        // Multiple calls should all succeed (file opened in append mode).
-        let f1 = create_log_file_writer();
-        let f2 = create_log_file_writer();
-        assert!(f1.is_some());
-        assert!(f2.is_some());
-    }
-
-    #[test]
-    fn test_app_log_file_path_parent_is_valid_dir() {
-        let path = std::path::Path::new(APP_LOG_FILE_PATH);
-        let parent = path.parent();
-        assert!(
-            parent.is_some(),
-            "log file path must have a parent directory"
-        );
-        let parent = parent.unwrap();
-        // After create_log_file_writer(), the parent dir should exist.
-        let _ = create_log_file_writer();
-        assert!(
-            parent.exists(),
-            "log directory must exist after writer creation"
-        );
-    }
     // -----------------------------------------------------------------------
     // compute_market_close_sleep — deterministic future time test
     // -----------------------------------------------------------------------
@@ -1181,26 +874,6 @@ mod tests {
     // Const assertions — compile-time guarantees
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_fast_boot_window_start_is_before_nine_fifteen() {
-        let start = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_START, "%H:%M:%S").unwrap();
-        let nine_fifteen = chrono::NaiveTime::parse_from_str("09:15:00", "%H:%M:%S").unwrap();
-        assert!(
-            start <= nine_fifteen,
-            "fast boot window must start at or before market open (09:15)"
-        );
-    }
-
-    #[test]
-    fn test_fast_boot_window_end_is_market_close() {
-        let end = chrono::NaiveTime::parse_from_str(FAST_BOOT_WINDOW_END, "%H:%M:%S").unwrap();
-        let market_close = chrono::NaiveTime::parse_from_str("15:30:00", "%H:%M:%S").unwrap();
-        assert_eq!(
-            end, market_close,
-            "fast boot window end must equal market close"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // compute_market_close_sleep — exercise now >= close_time branch
     // -----------------------------------------------------------------------
@@ -1236,45 +909,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // create_log_file_writer — deeper error path coverage
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_create_log_file_writer_creates_directory_if_missing() {
-        // Verify that after calling create_log_file_writer, the parent
-        // directory exists (it creates it if missing).
-        let result = create_log_file_writer();
-        if result.is_some() {
-            let log_dir = std::path::Path::new(APP_LOG_FILE_PATH)
-                .parent()
-                .unwrap_or(std::path::Path::new("data/logs"));
-            assert!(log_dir.exists(), "log directory must be created");
-            assert!(log_dir.is_dir(), "log parent must be a directory");
-        }
-    }
-
-    #[test]
-    fn test_create_log_file_writer_file_exists_after_creation() {
-        let result = create_log_file_writer();
-        if result.is_some() {
-            let log_path = std::path::Path::new(APP_LOG_FILE_PATH);
-            assert!(log_path.exists(), "log file must exist after creation");
-            assert!(log_path.is_file(), "log path must be a regular file");
-        }
-    }
-
-    #[test]
-    fn test_create_log_file_writer_append_mode() {
-        use std::io::Write;
-        // Write to the log file twice — second write should append, not overwrite.
-        let f1 = create_log_file_writer();
-        if let Some(mut file) = f1 {
-            file.write_all(b"first line\n").unwrap();
-        }
-        let f2 = create_log_file_writer();
-        if let Some(mut file) = f2 {
-            file.write_all(b"second line\n").unwrap();
-        }
-        // If we got here without panic, append mode works correctly.
-    }
 
     // -----------------------------------------------------------------------
     // create_log_file_writer_at — error path coverage
@@ -1330,19 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_log_file_writer_at_default_path_matches_original() {
-        // Verify that create_log_file_writer delegates to create_log_file_writer_at
-        let result_default = create_log_file_writer();
-        let result_at = create_log_file_writer_at(APP_LOG_FILE_PATH);
-        // Both should succeed in the same environment
-        assert_eq!(
-            result_default.is_some(),
-            result_at.is_some(),
-            "both functions should agree on success/failure"
-        );
-    }
-
-    #[test]
     fn test_create_log_file_writer_at_dev_null_returns_some() {
         // /dev/null is always writable on Linux
         let result = create_log_file_writer_at("/dev/null");
@@ -1359,27 +980,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // effective_ws_stagger tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_effective_ws_stagger_always_uses_fast_stagger() {
-        // Always uses 1s stagger for fast crash recovery during market hours.
-        assert_eq!(
-            effective_ws_stagger(3000, true),
-            OFF_HOURS_CONNECTION_STAGGER_MS
-        );
-        assert_eq!(
-            effective_ws_stagger(3000, false),
-            OFF_HOURS_CONNECTION_STAGGER_MS
-        );
-        assert_eq!(
-            effective_ws_stagger(0, true),
-            OFF_HOURS_CONNECTION_STAGGER_MS
-        );
-        assert_eq!(
-            effective_ws_stagger(0, false),
-            OFF_HOURS_CONNECTION_STAGGER_MS
-        );
-    }
 
     // -----------------------------------------------------------------------
     // format_bind_addr tests
@@ -1422,65 +1022,9 @@ mod tests {
     // determine_boot_mode tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_determine_boot_mode_fast_with_cache_and_market() {
-        assert_eq!(determine_boot_mode(true, true), "fast");
-    }
-
-    #[test]
-    fn test_determine_boot_mode_standard_no_cache() {
-        assert_eq!(determine_boot_mode(false, true), "standard");
-    }
-
-    #[test]
-    fn test_determine_boot_mode_standard_no_market() {
-        assert_eq!(determine_boot_mode(true, false), "standard");
-    }
-
-    #[test]
-    fn test_determine_boot_mode_standard_neither() {
-        assert_eq!(determine_boot_mode(false, false), "standard");
-    }
-
     // -----------------------------------------------------------------------
     // should_fast_boot tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_should_fast_boot_true() {
-        assert!(should_fast_boot(true, true));
-    }
-
-    #[test]
-    fn test_should_fast_boot_false_no_cache() {
-        assert!(!should_fast_boot(false, true));
-    }
-
-    #[test]
-    fn test_should_fast_boot_false_no_market() {
-        assert!(!should_fast_boot(true, false));
-    }
-
-    #[test]
-    fn test_should_fast_boot_false_neither() {
-        assert!(!should_fast_boot(false, false));
-    }
-
-    #[test]
-    fn test_should_fast_boot_matches_determine_boot_mode() {
-        // should_fast_boot(true, true) <=> determine_boot_mode returns "fast"
-        for &cache in &[true, false] {
-            for &market in &[true, false] {
-                let is_fast = should_fast_boot(cache, market);
-                let mode = determine_boot_mode(cache, market);
-                assert_eq!(
-                    is_fast,
-                    mode == "fast",
-                    "should_fast_boot and determine_boot_mode must agree for cache={cache}, market={market}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn test_heartbeat_watchdog_spawned() {
@@ -1599,19 +1143,6 @@ mod tests {
     // effective_ws_stagger: edge cases
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_effective_ws_stagger_u64_max_always_fast() {
-        // Even with u64::MAX configured, always uses fast stagger.
-        assert_eq!(
-            effective_ws_stagger(u64::MAX, true),
-            OFF_HOURS_CONNECTION_STAGGER_MS
-        );
-        assert_eq!(
-            effective_ws_stagger(u64::MAX, false),
-            OFF_HOURS_CONNECTION_STAGGER_MS
-        );
-    }
-
     // -----------------------------------------------------------------------
     // format_bind_addr: empty host
     // -----------------------------------------------------------------------
@@ -1625,19 +1156,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // determine_boot_mode and should_fast_boot: consistency exhaustive
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_determine_boot_mode_returns_only_fast_or_standard() {
-        for &cache in &[true, false] {
-            for &market in &[true, false] {
-                let mode = determine_boot_mode(cache, market);
-                assert!(
-                    mode == "fast" || mode == "standard",
-                    "unexpected boot mode: {mode}"
-                );
-            }
-        }
-    }
 
     // -----------------------------------------------------------------------
     // STAGE-C.2b: WAL replay drain helpers — the two

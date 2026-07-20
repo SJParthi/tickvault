@@ -1,10 +1,18 @@
 //! D2 Stage 2 — genuine shared-infra hoist guard (source-scan ratchet).
 //!
-//! Stage 2 hoisted the PROCESS-shared blocks (notifier, health, seal-writer,
-//! the tick + order-update broadcasts, the obs / 21-TF aggregator /
-//! tick-storage subscriber tasks, the API server) into a single
-//! `build_shared_infra(...)` prefix and deleted the D2-pre duplicate
-//! `run_shared_infra_only`.
+//! Stage 2 hoisted the PROCESS-shared blocks (notifier, health, the
+//! seal-writer `spawn_seal_writer_loop`, the tick broadcast, the surviving
+//! `run_slow_boot_observability` subscriber task, the API server) into a
+//! single `build_shared_infra(...)` prefix and deleted the D2-pre duplicate
+//! `run_shared_infra_only`. (The tick-storage subscriber task was removed in
+//! the BATCH-5 PrevDayCache/TickStorage cleanup — the guard asserts only the
+//! surviving `run_slow_boot_observability` + `spawn_seal_writer_loop`.)
+//!
+//! ## Stage-3 dead-WS sweep (2026-07-17)
+//! The 21-TF TICK aggregator driver (`spawn_engine_b_aggregator`) is
+//! DELETED (no tick input on the REST-only runtime); its spawned-once pins
+//! below are re-pointed at the surviving seal-writer + subscriber shape,
+//! with a negative pin that the aggregator driver stays deleted.
 //!
 //! ## PR-C2 re-shape (2026-07-13 — Dhan live-WS lane deletion, operator
 //! retirement directive per websocket-connection-scope-lock.md "2026-07-13
@@ -22,8 +30,8 @@
 //!   its own wiring guards. The builder-spawns-the-shared-pipeline half
 //!   SURVIVES below.
 //! The single-construction contract (ONE `build_shared_infra` call, the API
-//! bound once, the 21-TF aggregator spawned once) survives re-anchored on
-//! the whole file instead of the deleted slow-path slice.
+//! bound once, the seal-writer spawned once) survives re-anchored on the
+//! whole file instead of the deleted slow-path slice.
 
 /// Read `crates/app/src/main.rs` regardless of the test's working directory.
 fn read_main_rs() -> String {
@@ -72,7 +80,7 @@ fn run_shared_infra_only_is_deleted() {
 fn single_shared_infra_construction() {
     // Exactly ONE shared-infra construction: one `build_shared_infra(` call
     // beyond the definition, the API bound once (inside the builder), the
-    // 21-TF aggregator spawned once (inside the builder). PR-C2: re-anchored
+    // seal-writer spawned once (inside the builder). PR-C2: re-anchored
     // on the whole file — the fast/slow split no longer exists.
     let src = read_main_rs();
 
@@ -102,20 +110,33 @@ fn single_shared_infra_construction() {
         "the single `axum::serve` bind must live inside build_shared_infra."
     );
 
-    // The 21-TF aggregator is spawned exactly once, inside the builder.
-    let agg_defs = src.matches("fn spawn_engine_b_aggregator(").count();
-    let agg_total = src.matches("spawn_engine_b_aggregator(").count();
+    // The seal-writer is spawned exactly once, inside the builder (stage-3
+    // dead-WS sweep, 2026-07-17: the tick-aggregator spawn pin retired with
+    // `spawn_engine_b_aggregator`; the seal chain's single install point is
+    // the surviving invariant).
+    let sw_defs = src.matches("fn spawn_seal_writer_loop(").count();
+    let sw_total = src.matches("spawn_seal_writer_loop(").count();
     assert_eq!(
-        agg_total - agg_defs,
+        sw_total - sw_defs,
         1,
-        "exactly one `spawn_engine_b_aggregator` call may exist (found {}) — \
-         a second would double-spawn the 21-TF aggregator.",
-        agg_total - agg_defs
+        "exactly one `spawn_seal_writer_loop` call may exist (found {}) — \
+         a second would double-install the global seal sender.",
+        sw_total - sw_defs
     );
     assert_eq!(
-        builder_body.matches("spawn_engine_b_aggregator(").count(),
+        builder_body.matches("spawn_seal_writer_loop(").count(),
         1,
-        "the single aggregator spawn must live inside build_shared_infra."
+        "the single seal-writer spawn must live inside build_shared_infra."
+    );
+
+    // Stage-3 negative pin: the deleted 21-TF tick-aggregator driver must
+    // stay deleted — re-adding it would resurrect a publisher-less consumer.
+    // (Paren-suffixed needle so the dated retirement COMMENTS naming the fn
+    // do not trip the pin — only a real definition/call site does.)
+    assert!(
+        !src.contains("spawn_engine_b_aggregator("),
+        "stage-3 dead-WS sweep: `spawn_engine_b_aggregator` (the 21-TF tick \
+         aggregator driver) must stay deleted from main.rs."
     );
 }
 
@@ -129,12 +150,11 @@ fn shared_infra_builder_spawns_the_shared_pipeline() {
     // builder, ahead of any future publisher.
     let src = read_main_rs();
     let body = build_shared_infra_body(&src);
-    for needle in [
-        "run_slow_boot_observability",
-        "spawn_engine_b_aggregator",
-        "run_tick_storage_consumer",
-        "spawn_seal_writer_loop",
-    ] {
+    // `run_tick_storage_consumer` assertion RETIRED 2026-07-19 (BATCH-5):
+    // the tick-storage consumer was deleted in the PrevDayCache/TickStorage
+    // cleanup, so the builder no longer spawns it. The surviving spawns below
+    // still pin the shared candle pipeline + seal-writer for every boot.
+    for needle in ["run_slow_boot_observability", "spawn_seal_writer_loop"] {
         assert!(
             body.contains(needle),
             "build_shared_infra MUST spawn `{needle}` so the shared candle \

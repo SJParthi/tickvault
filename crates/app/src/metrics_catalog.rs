@@ -35,36 +35,19 @@
 //!   * `ALLOWED_*` slices → ratcheted by a runtime test in this same
 //!     module so any addition has to land here AND in the test.
 //!
-//! # Registered elsewhere — Dhan exchange-lag metrics (silent-feed Item 4)
+//! # Retired — Dhan exchange-lag metrics (deleted 2026-07-17, dashboard tidy)
 //!
-//! The 2026-07-06 silent-feed hardening added three metrics whose emit
-//! sites live in `tickvault_core::pipeline::feed_lag_monitor` (this app
-//! crate cannot host their names as consts without dead code — core cannot
-//! depend on app). Catalogued here for discoverability:
-//!   * `tv_dhan_exchange_lag_p99_seconds` — UNLABELED gauge, trailing-60s
-//!     exchange→receive lag p99, published every 10 s ONLY in-session
-//!     (regular [09:00,15:30) IST + Muhurat [18:00,19:30) when active)
-//!     with ≥50 samples. **Quantization floor: Dhan LTT is a u32 of whole IST
-//!     seconds, so the lag has a ≥1 s floor — a healthy p99 reads ~1–2 s
-//!     and can NEVER read 0; sub-second wire lag is UNMEASURABLE for
-//!     feed=dhan.** The dhan-only NAME (no `feed` label) sidesteps the
-//!     CloudWatch EMF host-only dimension label-folding trap.
-//!   * `tv_dhan_lag_samples_excluded_total` — counter of WAL-replay
-//!     samples excluded by the two-condition discriminator (receipt−capture
-//!     dwell ≥60 s AND pre-live-boundary capture — live rows delayed >60 s
-//!     in-pipeline by a consumer stall are KEPT; round-2 fix 2026-07-07)
-//!     (visible, never silent censoring — Rule 11). **CloudWatch-exported**:
-//!     it is in the 27-name host-only EMF allowlist of
-//!     `deploy/aws/cloudwatch-agent.json` + `user-data.sh.tftpl`
-//!     (~$0.30/mo, billed in silent-feed-alarms.tf / aws-budget.md) and is
-//!     pinned there by the EMF name-count ratchet.
-//!   * `tv_dhan_lag_negative_clamped_total` — /metrics-only counter of
-//!     negative-lag clamps (host-clock skew vs Dhan whole-second stamps);
-//!     NOT CloudWatch-exported (the only /metrics-only member of the trio).
-//! Plus the supervisor counter `tv_feed_lag_publisher_respawn_total{reason}`
-//! emitted by `spawn_supervised_feed_lag_publisher` in `main.rs`
-//! (WS-GAP-05/SLO-03 respawn pattern; `reason` labels are the static
-//! `classify_join_exit` set — no cardinality risk).
+//! The 2026-07-06 silent-feed hardening's Dhan lag trio
+//! (`tv_dhan_exchange_lag_p99_seconds` gauge,
+//! `tv_dhan_lag_samples_excluded_total`, `tv_dhan_lag_negative_clamped_total`)
+//! and the supervisor counter `tv_feed_lag_publisher_respawn_total` were
+//! DELETED 2026-07-17 with the dead Dhan-lag ring/publisher chain in
+//! `feed_lag_monitor.rs` — the chain lost its tick source + spawn sites
+//! with the Dhan live-WS lane deletion (PR-C2, 2026-07-13) and the stage-2
+//! dead-WS sweep (2026-07-17), so none of the four could ever emit again.
+//! The 2 CloudWatch-exported names left the EMF allowlist (19 → 17) and the
+//! `dhan_exchange_lag_p99_high` alarm was retired in the same PR
+//! (silent-feed-alarms.tf; cost note in aws-budget.md, 2026-07-17).
 //!
 //! # Retired — Groww exchange-lag metrics (deleted 2026-07-15)
 //!
@@ -80,14 +63,9 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-// Scoreboard PR-D (2026-07-11) — per-instrument presence registry
-// (`tickvault_core::pipeline::feed_presence`): deliberately ZERO metrics.
-// The hot fold is metrics-free by design (one papaya read + one relaxed
-// fetch_or; unregistered-fold / overflow counters are internal atomics
-// surfaced by the 15:45 drain's log line + the SCOREBOARD-01 error arms),
-// and per-instrument coverage is QuestDB-side data (`feed_coverage_daily`)
-// — never re-published as CloudWatch series (the design-§6 cost stance:
-// the scoreboard's ONE new EMF series remains the PR-C Groww lag gauge).
+// Scoreboard PR-D presence registry: DELETED 2026-07-18 (stage-4
+// dead-producer sweep) — it carried deliberately ZERO metrics, so no
+// catalog change accompanies the deletion.
 
 /// Metric name for the per-component memory estimate gauge.
 ///
@@ -125,17 +103,21 @@ pub const IN_MEM_EVICTIONS_COUNTER_NAME: &str = "tv_in_mem_evictions_total";
 /// SEC-M3 (§AA): names are deliberately coarse so that an attacker
 /// who scrapes `/metrics` cannot derive the precise architecture
 /// (e.g. "papaya tick map at security_id 13" → "rescue_ring",
-/// "tick_storage", "bar_storage", "registry", "runtime",
-/// "binary_static", "papaya_overhead"). Exactly 7 entries.
+/// "bar_storage", "registry", "runtime", "binary_static",
+/// "papaya_overhead"). Exactly 6 entries.
 ///
 /// `f64::NAN` is the boot-time value for every component (L124);
 /// the sampler overwrites only those components whose source
 /// closure has been registered. Components that remain unset stay
 /// NaN and are filtered out by the `unless absent_over_time(...)`
 /// alert clause.
+///
+/// `tick_storage` RETIRED 2026-07-19 (dead-code cleanup — BATCH-5): the
+/// in-RAM `TickStorage` store was removed with the PrevDayCache/TickStorage
+/// sweep, so no source closure ever registered this component — its gauge
+/// stayed permanently NaN (sourceless). Dropped from the allowlist.
 pub const ALLOWED_SUBSYSTEM_COMPONENTS: &[&str] = &[
     "rescue_ring",
-    "tick_storage",
     "bar_storage",
     "registry",
     "runtime",
@@ -255,12 +237,14 @@ mod tests {
     }
 
     #[test]
-    fn allowed_components_has_exactly_seven_coarse_labels() {
-        // L18 + SEC-M3: exactly 7 components, coarse names only.
+    fn allowed_components_has_exactly_six_coarse_labels() {
+        // L18 + SEC-M3: coarse names only. Pinned at 6 since the sourceless
+        // `tick_storage` label was retired 2026-07-19 (BATCH-5) with the
+        // in-RAM TickStorage store.
         assert_eq!(
             ALLOWED_SUBSYSTEM_COMPONENTS.len(),
-            7,
-            "L18 design pins 7 components — adding an 8th requires a \
+            6,
+            "L18 design pins 6 components — adding a 7th requires a \
              plan update plus dashboard / alert / ratchet review."
         );
         let set: HashSet<&&str> = ALLOWED_SUBSYSTEM_COMPONENTS.iter().collect();
@@ -281,7 +265,7 @@ mod tests {
     fn allowed_components_do_not_leak_precise_subsystems() {
         // SEC-M3: even though the value is internal, the names must
         // not name precise modules. `tick_processor`, `papaya_pool`,
-        // etc. would leak architecture; `tick_storage` / `runtime`
+        // etc. would leak architecture; `bar_storage` / `runtime`
         // are coarse enough.
         let banned_substrings = [
             "tick_processor",

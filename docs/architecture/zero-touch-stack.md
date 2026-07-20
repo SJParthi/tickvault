@@ -43,7 +43,7 @@ of the file layer. On AWS, CloudWatch alarms flow into an opt-in
 Lambda that runs `tmux send-keys` to trigger a Claude Code session
 on the EC2 instance. Every layer has a pinned Rust meta-guard
 blocking regression. Validation: `make validate-automation` runs
-28 checks in 30 seconds.
+25 checks in 30 seconds.
 
 ## Visual flow (ASCII)
 
@@ -109,11 +109,11 @@ AWS path (opt-in):
 | 5.1, 5.2 | `7b87ab2` | `summary_writer` tokio task, FNV-1a signature grouping, 18 unit tests; `make status` integration. |
 | 6.1, 6.2 | `a3145e9` | `error-rules.yaml` (7 seed rules), `error-triage.sh` shell hook, 3 auto-fix scripts, 7-test `triage_rules_guard`. |
 | 7.1 | `a3145e9` | `claude-loop-prompt.md` runbook. |
-| 7.2 | `8c53928` | `scripts/mcp-servers/tickvault-logs/server.py` — 5-tool MCP (`tail_errors`, `list_novel_signatures`, `summary_snapshot`, `triage_log_tail`, `signature_history`); 7-test `tickvault_logs_mcp_guard`. |
+| 7.2 | `8c53928` | The Python `tickvault-logs` MCP server (`server.py`, historical) — 5-tool MCP (`tail_errors`, `list_novel_signatures`, `summary_snapshot`, `triage_log_tail`, `signature_history`); 7-test `tickvault_logs_mcp_guard`. _(2026-07-18 Rust cutover — the Python server was deleted; replaced by `crates/tickvault-logs-mcp`, launched via `scripts/mcp-servers/tickvault-logs-launch.sh`.)_ |
 | 8.1 | `a3145e9`, `a81206f` | `scripts/auto-fix-{restart-depth,refresh-instruments,clear-spill}.sh`. |
-| 8.2 | `c68346d` | `deploy/aws/lambda/claude-triage/` Lambda + `claude-triage-lambda.tf` (opt-in); 7-test `claude_triage_lambda_guard`. |
+| 8.2 | `c68346d` | `deploy/aws/lambda/claude-triage/` Lambda + `claude-triage-lambda.tf` (opt-in); 7-test `claude_triage_lambda_guard`. _(RETIRED 2026-07-18 — claude-triage lambda deleted in the Rust-only purge, never provisioned (0 of 13 AWS functions); the guard was deleted with it. See git history.)_ |
 | 9.1 | `1cdd78a` | `operator-health.json` single-page Grafana dashboard (14 panels); 7-test `operator_health_dashboard_guard`. _(RETIRED in the CloudWatch-only migration #O1; the dashboard tree + its guard were deleted. CloudWatch Dashboards replace operator visualization in prod.)_ |
-| 9.2 | `a81206f`, extended each phase | `scripts/validate-automation.sh` + `make validate-automation` — 28 end-to-end checks. |
+| 9.2 | `a81206f`, extended each phase | `scripts/validate-automation.sh` + `make validate-automation` — 25 end-to-end checks. |
 | 10.1 | `275157a` | `zero_tick_loss_alert_guard` — pins tick-loss metric emissions + buffer capacity constant + doc coherence. _(Post #O3 the 4 Prometheus alert-rule assertions were removed when the Prometheus container retired; the early-warning signal moved to CloudWatch Alarms over the same metrics, which the guard still pins as EMITTED.)_ |
 | 11 | `897f7b6` | `resilience_sla_alert_guard` — 6 tests pin WS/QuestDB/Valkey SLA alerts. |
 | 12.1 | existing `quality/crate-coverage-thresholds.toml` | 100% line-coverage floor per crate, enforced by `scripts/coverage-gate.sh`. |
@@ -132,15 +132,15 @@ AWS path (opt-in):
 | Claude loop prompt | `.claude/triage/claude-loop-prompt.md` |
 | Shell triage hook | `.claude/hooks/error-triage.sh` |
 | Auto-fix scripts | `scripts/auto-fix-*.sh` |
-| MCP log server | `scripts/mcp-servers/tickvault-logs/server.py` |
-| AWS triage Lambda | `deploy/aws/lambda/claude-triage/handler.py` |
-| Lambda Terraform | `deploy/aws/terraform/claude-triage-lambda.tf` |
+| MCP log server | `crates/tickvault-logs-mcp` _(2026-07-18 Rust cutover — the Python server was deleted; launched via `scripts/mcp-servers/tickvault-logs-launch.sh`)_ |
+| AWS triage Lambda | RETIRED 2026-07-18 — `deploy/aws/lambda/claude-triage/handler.py` deleted in the Rust-only purge, never provisioned (0 of 13 AWS functions); see git history |
+| Lambda Terraform | RETIRED 2026-07-18 — `deploy/aws/terraform/claude-triage-lambda.tf` deleted with the lambda; see git history |
 | Logs shipping (current) | CloudWatch Logs agent → CloudWatch Logs _(Loki/Alloy retired in the CloudWatch-only migration #O1–#O3)_ |
 | Operator alarms (current) | AWS CloudWatch Alarms _(the Prometheus `tickvault-alerts.yml` rules + Alertmanager were retired #O2/#O3)_ |
 | Operator dashboard (current) | CloudWatch Dashboards _(the local Grafana `operator-health.json` + its tree were retired #O1)_ |
 | Validate automation | `scripts/validate-automation.sh` |
 
-## All 28 validate-automation.sh checks
+## All 25 validate-automation.sh checks
 
 Run `make validate-automation` to exercise all of these in ~30 seconds.
 
@@ -152,14 +152,14 @@ Run `make validate-automation` to exercise all of these in ~30 seconds.
 3. `error_code_tag_guard` (2 tests)
 4. `triage_rules_guard` (7 tests)
 5. `error_level_meta_guard` (2 tests)
-6. `zero_tick_loss_alert_guard` (7 tests)
+6. seal-ring ratchet suite (`candles::seal_ring` lib tests) _(2026-07-18: `zero_tick_loss_alert_guard` was DELETED with the tick rescue ring in the stage-4 dead-producer sweep)_
 7. `summary_writer` unit tests (18 tests)
 8. `observability` library tests (37 tests)
 9. `observability_chain_e2e` (4 tests)
 10. `operator_health_dashboard_guard` _(RETIRED with Grafana removal #O1)_
 11. `resilience_sla_alert_guard` _(Prometheus-side assertions retired #O2/#O3; chaos tests remain)_
 12. `tickvault_logs_mcp_guard` (7 tests)
-13. `claude_triage_lambda_guard` (7 tests)
+13. `claude_triage_lambda_guard` _(RETIRED 2026-07-18 — deleted with the claude-triage lambda in the Rust-only purge; see git history)_
 14. `loki_alloy_profile_guard` _(RETIRED with Loki/Alloy removal)_
 
 **File-level invariants (10):**
@@ -177,11 +177,11 @@ Run `make validate-automation` to exercise all of these in ~30 seconds.
 | Every `error!` reaches Telegram within ~15s | CloudWatch Alarms (over the metrics formerly scraped by Prometheus) + `error-level` tracing layer |
 | No flush/persist/drain failure is silenced | `error_level_meta_guard` — 28 phrases pinned |
 | Every ErrorCode has rule docs | `error_code_rule_file_crossref` forward+reverse |
-| Zero-tick-loss metrics are emitted (alarms in CloudWatch) | `zero_tick_loss_alert_guard` — metric + buffer capacity + doc pinned (the 4 Prometheus alert-rule assertions retired #O3; alarms moved to CloudWatch) |
+| Seal-chain capacity + drop paging stay ratcheted | `seal_ring.rs` lib suite pins `SEAL_BUFFER_CAPACITY`; AGGREGATOR-DROP-01 pagers pinned by `seal_drop_paging_wiring_guard.rs` _(2026-07-18: `zero_tick_loss_alert_guard` + its tick metrics were DELETED with the tick rescue ring, stage-4 sweep)_ |
 | WS/QuestDB SLA chaos coverage exists | `resilience_sla_alert_guard` Prometheus-side assertions retired #O2/#O3; chaos tests (`chaos_questdb_*`, `chaos_ws_*`, `chaos_valkey_kill`) remain |
 | Operator dashboard has every required widget | CloudWatch Dashboards _(the Grafana `operator_health_dashboard_guard` was retired with Grafana #O1)_ |
 | Loki/Alloy not in the default stack | RETIRED — Loki/Alloy removed entirely in the CloudWatch-only migration |
-| Claude-triage Lambda never provisions until `enable_claude_triage_lambda = true` | `claude_triage_lambda_guard` — every resource `count`-gated |
+| Claude-triage Lambda never provisions until `enable_claude_triage_lambda = true` | RETIRED 2026-07-18 — the claude-triage lambda + `claude_triage_lambda_guard` were deleted in the Rust-only purge (never provisioned, 0 of 13 AWS functions); see git history |
 | MCP log server exposes 5 tools, no pip deps | `tickvault_logs_mcp_guard` — imports allow-list enforced |
 | Instrument lifecycle tables self-heal on boot | `ALTER TABLE ADD COLUMN IF NOT EXISTS` pattern — source-scan asserted |
 

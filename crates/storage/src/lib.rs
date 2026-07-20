@@ -120,7 +120,12 @@ pub mod feed_scoreboard_persistence;
 /// finding cell where a stored higher-TF candle disagrees with its
 /// recomputed-from-1m value (TF-VERIFY-01/02).
 pub mod tf_consistency_audit_persistence;
-pub mod tick_conservation_audit_persistence;
+// Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
+// `tick_conservation_audit_persistence` module DELETED — the Rust WRITER
+// only; the `tick_conservation_audit` QuestDB TABLE is RETAINED on disk
+// per SEBI 5y retention (no DDL drop anywhere). The 15:40 IST audit's
+// inputs all died with the live-WS retirements + the stage-2 tick-chain
+// deletion (#1631).
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
 // `historical_candles` QuestDB table. The module had no live consumers
@@ -156,11 +161,11 @@ pub mod groww_persistence;
 // with the Groww live feed (parity track cancelled §33.2; zero callers).
 // The `feed_parity_1m_audit` + `groww_cross_verify_1m_audit` TABLES are
 // retained on disk (SEBI history; partition_manager DAY rows keep them).
-// Instrument fetch-audit table (SEBI forensic — retained per the PR-C3
-// retirement banner in daily-universe-instr-fetch-error-codes.md).
-// PR-C3 (2026-07-14): compiles unconditionally — the `daily_universe_fetcher`
-// feature gate was deleted with the Dhan instrument chain.
-pub mod instrument_fetch_audit_persistence;
+// Dead-code sweep batch 1 (2026-07-18): `instrument_fetch_audit_persistence`
+// DELETED — zero callers since its Phase-C feeders died (PR-C3, 2026-07-14).
+// The `instrument_fetch_audit` TABLE stays (SEBI forensic — retained via the
+// partition_manager sweep-list string, per the retirement banner in
+// daily-universe-instr-fetch-error-codes.md).
 // Lifecycle table contracts (§5/§6 SEBI never-delete) — schema constants
 // + DEDUP keys + LifecycleState/TransitionKind enums + DDL/Row/append
 // helpers. PR-C3 (2026-07-14): compiles unconditionally (feature gate
@@ -200,11 +205,19 @@ pub mod partition_archive;
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
 pub mod order_audit_persistence;
+// Full-fidelity order/position push-event capture (design 2026-07-18;
+// ORDER-EVT-01): one row per received broker push event, BOTH feeds —
+// the capture companions of the lossy 11-field BrokerOrderEvent seam.
+pub mod order_update_events_persistence;
+pub mod position_update_events_persistence;
 // Cluster-C order-side observability (2026-07-14): daily P&L snapshot
 // audit — rebuild of the Phase-0 Item-25 table deleted in #T4 (2026-05-20);
 // the OnEod row is the daily heartbeat/denominator (STORAGE-GAP-03).
 pub mod pnl_audit_persistence;
-pub mod prev_day_ohlcv_persistence;
+// Dead-code sweep batch 1 (2026-07-18): `prev_day_ohlcv_persistence` DELETED
+// — zero callers since its sole feeder `prev_day_ohlcv_boot.rs` died in
+// PR-C3 (2026-07-14). The `prev_day_ohlcv` TABLE stays read-only (forensic;
+// partition_manager sweep string retains it).
 pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;
@@ -212,10 +225,10 @@ pub mod seal_spill;
 pub mod seal_writer_loop;
 pub mod seal_writer_runner;
 pub mod seal_writer_task;
-// SP4 (groww-live-backtest-parity): the ONE feed-parameterized candle writer,
-// named as an explicit `GenericCandle1mWriter(feed)` facade over the per-seal
-// `ShadowCandleWriter` (the already-converged shared seal-writer chain).
-pub mod generic_candle_writer;
+// Dead-code sweep batch 1 (2026-07-18): the SP4 feed-parameterized candle
+// writer facade (`generic_candle_writer`) DELETED — the parity plan SP5–SP7
+// was cancelled (groww-second-feed-scope §33.2) and the facade never gained
+// a caller.
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;

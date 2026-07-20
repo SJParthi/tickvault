@@ -372,8 +372,8 @@ list = [
   "1d",
 ]
 
-[in_mem.tick_storage]
-per_instrument_capacity = 5000
+# [in_mem.tick_storage] REMOVED 2026-07-19 (dead-code cleanup — BATCH-5):
+# the TickStorage store it tuned was retired; no reader remained.
 
 # --------------------------------------------------------------------
 # Option-chain config sections REMOVED 2026-06-28.
@@ -668,6 +668,22 @@ mark_channel_capacity = 8192
 # ===========================================================================
 [dhan_order_push]
 enabled = false
+
+# ===========================================================================
+# Full-fidelity order/position PUSH-event capture (ORDER-EVT-01 —
+# .claude/rules/project/order-update-events-error-codes.md). When enabled,
+# one supervised consumer drains the two capture channels (Dhan order
+# updates + Groww order/position push records) into the NEW
+# order_update_events / position_update_events QuestDB tables — an
+# ADDITIVE forensic lane beside the lossy 11-field order_audit lane
+# (which is untouched). Zero Telegram, zero order-path involvement, cold
+# path only. Serde default is OFF (fail-safe) — this section opts in;
+# `enabled = false` is the rollback switch. Producers feed the channels
+# only when their own gates run ([dhan_order_push] / [groww_orders]
+# order_push_enabled) — with both producer gates off the consumer idles.
+# ===========================================================================
+[order_update_events]
+enabled = true
 
 # ===========================================================================
 # REST-era multi-TF candle derivation (operator directive 2026-07-16:

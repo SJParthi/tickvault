@@ -590,10 +590,10 @@ pub const BACKLOG_TICK_AGE_MAX_SECS: u32 = 86_400;
 /// Base path for all secrets in SSM Parameter Store.
 ///
 /// Matches the repo name `tickvault`. The prior namespace was `/dlt` (from
-/// the dhan-live-trader legacy name). Run `scripts/migrate-ssm-dlt-to-
-/// tickvault.sh` once per environment to copy `/dlt/*` → `/tickvault/*`
-/// before this code is deployed; the script is idempotent and a `--delete`
-/// flag removes the old namespace after you verify the app boots cleanly.
+/// the dhan-live-trader legacy name). The one-shot `/dlt/*` → `/tickvault/*`
+/// migration has already been executed per environment; the migration
+/// script (`scripts/migrate-ssm-dlt-to-tickvault.sh`) was deleted in the
+/// rust-only phase 2a-2 purge and remains recoverable from git history.
 pub const SSM_SECRET_BASE_PATH: &str = "/tickvault";
 
 /// SSM service path segment for Dhan credentials.
@@ -1205,9 +1205,10 @@ pub const INDEX_SYMBOL_ALIASES: &[(&str, &str)] = &[
     // Groww→Dhan spelling bridges (2026-06-28): the Groww index DISPLAY `name`
     // for these three differs from the Dhan-allowlist trading-symbol spelling,
     // so the Groww index-coverage audit would falsely flag them absent. Additive
-    // (alias→canonical) — they only ADD a fallback match, never remove one, so
-    // the Dhan-side `extract_indices` path is unaffected for already-matching
-    // rows. Stored already-normalized (uppercase, single-spaced).
+    // (alias→canonical) — they only ADD a fallback match, never remove one
+    // for already-matching rows (the Dhan-side index-extraction consumer was
+    // DELETED 2026-07-18, dead-code batch 2; the canonicalizer remains the
+    // consumer). Stored already-normalized (uppercase, single-spaced).
     ("NIFTY MIDCAP SELECT", "MIDCPNIFTY"),
     ("NIFTY MIDCAP 50", "NIFTYMCAP50"),
     ("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"),
@@ -2900,40 +2901,13 @@ pub const TICK_FLUSH_BATCH_SIZE: usize = 1000;
 /// Default tick flush interval in milliseconds.
 pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 
-/// Tick ring buffer capacity for QuestDB outage resilience.
-/// Holds ticks in memory when QuestDB is down, drains on recovery.
-///
-/// **Rightsized 2026-05-20 for the 4-SID indices-only universe.**
-/// The live universe is 4 IDX_I SIDs (NIFTY, BANKNIFTY, SENSEX,
-/// INDIA VIX) in Quote mode — a tick rate of ~10-20/sec, not the
-/// ~5,000/sec of the old 25K-instrument universe the 5M ring was
-/// sized for.
-///
-/// - 100,000 ticks × ~200 bytes = ~20 MB RAM (pre-allocated at boot
-///   via `VecDeque::with_capacity` in `tick_persistence.rs`).
-/// - At a sustained ~20 ticks/sec = ~83 minutes before disk spill.
-/// - At an extreme ~400 ticks/sec burst = ~4 minutes before spill.
-/// - Both far exceed the ≤60-second QuestDB-outage SLA; the disk
-///   spill + DLQ still backstop any overflow beyond that.
-///
-/// **Trim history:**
-/// - 600K → 2M (PR #452, 2026-05-03): extreme-memory-pressure spec
-///   for the old large universe.
-/// - 2M → 5M (Wave 7-A4, 2026-05-11): RAM-first hardening, ~1.0 GB
-///   pre-allocated, sized for the old ~5,000-tick/sec workload.
-/// - 5M → 100K (2026-05-20): the universe narrowed to 4 IDX_I SIDs;
-///   a 5M ring (~1 GB) buffered ~130 hours for a feed that needs
-///   minutes. Trimmed to 100K — frees ~980 MB RAM on the 8 GB host.
-///   Conservative resize: spill + DLQ retained. The deeper
-///   simplification (10K + drop spill/DLQ) is tracked in
-///   `docs/architecture/resilience-simplification-4-sids.md`.
-pub const TICK_BUFFER_CAPACITY: usize = 100_000;
-
-/// High watermark threshold for tick ring buffer (80% of capacity).
-/// When buffer occupancy exceeds this, a WARN-level alert fires once
-/// to signal imminent disk spill. Triggers Telegram via Loki ERROR rule.
-/// 80% of 100,000 = 80,000 ticks.
-pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 80,000
+// `TICK_BUFFER_CAPACITY` / `TICK_BUFFER_HIGH_WATERMARK` DELETED 2026-07-18
+// (stage-4 dead-producer sweep): their sole consumer, the tick rescue ring in
+// `tick_persistence.rs`, was deleted in the stage-2 dead-WS sweep (2026-07-17)
+// — the runtime is REST-only and nothing writes the `ticks` table anymore.
+// The live absorption tier is the candle-side seal ring:
+// `SEAL_BUFFER_CAPACITY = 200_000` in `crates/trading/src/candles/seal_ring.rs`
+// (ratcheted by `seal_ring.rs::test_seal_buffer_capacity_constant_is_locked_value`).
 
 /// Minimum free disk space (bytes) to log a warning before spill write.
 /// 100 MB — below this, a WARN fires on each spill open to alert operator
@@ -3171,10 +3145,10 @@ pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 ///
 /// Archived segments are POST-confirmed-replay copies: their frames were
 /// re-injected into the live pipeline AND durably persisted before
-/// `confirm_replayed` moved them out of `replaying/`. The only reader of
-/// `archive/` after that point is the same-day 15:40 IST tick-conservation
-/// audit (`count_frames_for_ist_day`), which counts frames for the CURRENT
-/// day only (with a 3-day segment-creation pre-filter) — so even 2 days
+/// `confirm_replayed` moved them out of `replaying/`. No reader depends on
+/// aged archive segments (the last — the same-day 15:40 IST
+/// tick-conservation audit's current-day-only scan — retired 2026-07-18
+/// with the audit, the dead-WS sweep follow-up) — so even 2 days
 /// was audit-safe. 7 days is chosen instead (F3) because the archive is
 /// ALSO the only remaining copy for the documented confirm-on-channel
 /// residual (`confirm_replayed` archives on frames-IN-CHANNEL, not
@@ -3899,14 +3873,11 @@ const _: () = assert!(
 /// late-arriving tick within the 60s grace lands in its true bar.
 pub const BAR_FINAL_SEAL_OFFSET_SECS: u64 = 60;
 
-/// Soft anomaly threshold — if a tick arrives with `exchange_ts` more
-/// than `LATE_TICK_ANOMALY_THRESHOLD_MS` BEHIND the local wall-clock
-/// receive time, it is counted by `tv_late_tick_after_boundary_total`
-/// (the `LastTickAfterBoundary` Telegram variant was retired 2026-06-12 —
-/// redundant with that counter; the per-tick hot path must not carry a
-/// notifier). Helps operators spot Dhan-side ingestion lag or clock skew
-/// without halting tick acceptance.
-pub const LATE_TICK_ANOMALY_THRESHOLD_MS: u64 = 30_000;
+// `LATE_TICK_ANOMALY_THRESHOLD_MS` DELETED 2026-07-18 (stage-4 dead-producer
+// sweep, review LOW-3): its doc claimed present-tense counting by
+// `tv_late_tick_after_boundary_total`, whose emit site died with the dead
+// tick chain (stage-2 sweep 2026-07-17); the constant had zero production
+// consumers (doc + pin test only).
 
 // Compile-time consistency: BAR_FINAL_SEAL_OFFSET_SECS must equal
 // WS_GRACE_AFTER_CLOSE_SECS — they're two views of the same 60s
@@ -5251,12 +5222,6 @@ mod tests {
         assert_eq!(BAR_FINAL_SEAL_OFFSET_SECS, WS_GRACE_AFTER_CLOSE_SECS);
     }
 
-    /// Constant pin — late-tick anomaly threshold.
-    #[test]
-    fn test_late_tick_anomaly_threshold_ms_pinned_at_30000() {
-        assert_eq!(LATE_TICK_ANOMALY_THRESHOLD_MS, 30_000);
-    }
-
     /// Plan §8 row 1: a tick stamped `exchange_ts = 15:29:59.586` must
     /// be ACCEPTED by G1 even if the local clock has advanced past
     /// 15:30:00.x. The G1 gate looks ONLY at exchange_ts; the wall
@@ -5426,13 +5391,6 @@ mod tests {
     fn test_max_csv_body_bytes_is_exactly_50_mib() {
         // 50 * 1024 * 1024 — kills the 4 arithmetic mutants at the initializer.
         assert_eq!(MAX_CSV_BODY_BYTES, 52_428_800);
-    }
-
-    #[test]
-    fn test_tick_buffer_high_watermark_is_exactly_80_percent() {
-        // TICK_BUFFER_CAPACITY * 4 / 5 — kills `*`/`/` swaps at the initializer.
-        assert_eq!(TICK_BUFFER_CAPACITY, 100_000);
-        assert_eq!(TICK_BUFFER_HIGH_WATERMARK, 80_000);
     }
 
     #[test]

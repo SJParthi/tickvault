@@ -18,14 +18,14 @@
 //!   (`tickvault_common::build_info`), trading-session flag, `/proc` RSS.
 //! - feeds: the existing [`super::feeds::get_feeds_health`] response, reused
 //!   verbatim (no forked verdict logic).
-//! - connections: `data/groww/shards/c*/groww-status.json` (scale runs) or
-//!   the single `data/groww/groww-status.json` (normal runs).
-//! - race: the newest `data/groww/parity-<date>.tsv` (PR-R2 comparer output).
-//! - db: today's ticks + sealed 1m candles via QuestDB HTTP `/exec` with a
+//! - db: sealed 1m candles via QuestDB HTTP `/exec` with a
 //!   bounded timeout (reuses `super::stats::query_count`).
-
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+//!
+//! (The `connections` + `race` sections were removed 2026-07-17 — dashboard
+//! tidy: their producers, the Groww sidecar `groww-status.json` files and
+//! the shadow-parity `parity-<date>.tsv`, were deleted with the live feeds
+//! (Groww 2026-07-15; the §35 shadow client with it), so both fields could
+//! only ever serve permanent empty/null values.)
 
 use axum::Json;
 use axum::extract::State;
@@ -33,27 +33,6 @@ use serde::Serialize;
 
 use crate::state::SharedAppState;
 
-/// Default directory holding the Groww sidecar/shadow artifacts. Overridable
-/// via [`GROWW_DIR_ENV`] (tests / non-standard layouts).
-const GROWW_DIR_DEFAULT: &str = "data/groww";
-/// Env override for [`GROWW_DIR_DEFAULT`].
-const GROWW_DIR_ENV: &str = "TV_GROWW_DIR";
-/// Per-connection shard directories live under `data/groww/shards/c<NN>/`.
-const SHARDS_SUBDIR: &str = "shards";
-/// The sidecar connect+subscribe PROOF status file name (both layouts).
-const STATUS_FILENAME: &str = "groww-status.json";
-/// PR-R2 parity comparer summary: `parity-<YYYY-MM-DD>.tsv`.
-const PARITY_PREFIX: &str = "parity-";
-const PARITY_SUFFIX: &str = ".tsv";
-
-/// A status JSON larger than this is malformed — skip it.
-const MAX_STATUS_FILE_BYTES: u64 = 64 * 1024;
-/// A parity TSV larger than this is not the expected summary — skip it.
-const MAX_PARITY_FILE_BYTES: u64 = 256 * 1024;
-/// Bound the parity metric map (defensive cap on a public payload).
-const MAX_PARITY_ROWS: usize = 128;
-/// Bound the connections array (defensive cap on a public payload).
-const MAX_CONNECTIONS_REPORTED: usize = 128;
 /// QuestDB count queries are cold-path; keep each request bounded.
 const QUESTDB_BOARD_TIMEOUT_SECS: u64 = 3;
 
@@ -72,37 +51,18 @@ pub struct BoardStatus {
     pub mem_rss_bytes: Option<u64>,
 }
 
-/// One Groww connection row (from a sidecar `groww-status.json`).
-#[derive(Debug, Serialize)]
-pub struct BoardConnRow {
-    pub conn_id: u32,
-    /// Sanitized short event tag (`subscribed` / `streaming` / ...).
-    pub event: String,
-    pub subscribed_total: u64,
-    pub emitted: u64,
-    pub dropped: u64,
-    /// Seconds since the status file's own timestamp; `null` if absent.
-    pub age_secs: Option<u64>,
-}
-
-/// Newest parity-comparer summary (PR-R2 `parity-<date>.tsv`), parsed as a
-/// generic metric→integer map so future comparer columns flow through.
-#[derive(Debug, Serialize)]
-pub struct ParityRace {
-    /// The IST date embedded in the filename (validated `YYYY-MM-DD`).
-    pub date: String,
-    pub metrics: BTreeMap<String, i64>,
-}
-
 /// QuestDB persistence counters for the "vault" panel.
 #[derive(Debug, Serialize)]
 pub struct BoardDb {
     /// True when QuestDB answered the probe this poll.
     pub reachable: bool,
-    /// Ticks persisted since IST midnight; `null` on query failure.
-    pub ticks_today: Option<u64>,
     /// 1m candles sealed since IST midnight; `null` on query failure.
     pub candles_1m_today: Option<u64>,
+    // `ticks_today` tile RETIRED 2026-07-19 (BATCH-5): the `ticks` writer was
+    // deleted 2026-07-17 (dead live-WS sweep), so `ticks` receives no new
+    // rows — the count would be a permanently-stale/zero "live ticks captured
+    // today" number, i.e. a false-OK. Retired rather than repointed at another
+    // table (repointing a "ticks" label at candles would be a different lie).
 }
 
 /// The full `GET /api/board/data` payload.
@@ -111,14 +71,6 @@ pub struct BoardDataResponse {
     pub status: BoardStatus,
     /// The existing `/api/feeds/health` payload, embedded verbatim.
     pub feeds: super::feeds::FeedsHealthResponse,
-    /// Empty when no groww status file exists (feed off / not started).
-    pub connections: Vec<BoardConnRow>,
-    /// `null` until a parity TSV exists → the page shows "race pending".
-    pub race: Option<ParityRace>,
-    /// Static caveat flag: Dhan tick timestamps carry whole-second precision
-    /// only (`live-market-feed.md` — LTT is epoch SECONDS), so a per-tick
-    /// capture-lag number for Dhan would be dishonest sub-second.
-    pub dhan_clock_whole_seconds: bool,
     pub db: BoardDb,
 }
 
@@ -180,25 +132,16 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
     let now_secs = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
     let uptime_secs = (boot > 0 && now_secs >= boot).then(|| now_secs - boot);
 
-    // File-derived sections (groww status files, shadow NDJSON, parity TSV)
-    // bundled into one spawn_blocking so file I/O never parks the runtime.
-    // A join failure degrades to the all-empty view — never a panic.
-    let dir = groww_dir();
-    let now_ist = super::feeds::now_ist_nanos();
-    let file_view = tokio::task::spawn_blocking(move || collect_file_view(&dir, now_ist))
-        .await
-        .unwrap_or_default();
-
     // QuestDB counts — three bounded queries, concurrently (max one timeout).
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
     let client = super::stats::build_stats_client(QUESTDB_BOARD_TIMEOUT_SECS);
     let midnight = ist_today_midnight_literal();
-    let ticks_sql = format!("SELECT count() FROM ticks WHERE ts >= '{midnight}'");
+    // `ticks_today` tile retired 2026-07-19 (BATCH-5) — the ticks writer is
+    // gone, so no ticks query is issued anymore.
     let candles_sql = format!("SELECT count() FROM candles_1m WHERE ts >= '{midnight}'");
-    let (probe, ticks_today, candles_1m_today) = tokio::join!(
+    let (probe, candles_1m_today) = tokio::join!(
         super::stats::query_count(&client, &base_url, "SHOW TABLES"),
-        super::stats::query_count(&client, &base_url, &ticks_sql),
         super::stats::query_count(&client, &base_url, &candles_sql),
     );
 
@@ -210,191 +153,11 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
             mem_rss_bytes: read_proc_rss_bytes(),
         },
         feeds,
-        connections: file_view.connections,
-        race: file_view.race,
-        dhan_clock_whole_seconds: true,
         db: BoardDb {
             reachable: probe.is_some(),
-            ticks_today,
             candles_1m_today,
         },
     }
-}
-
-/// The groww artifacts directory (env-overridable for tests).
-fn groww_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var(GROWW_DIR_ENV)
-        && !custom.trim().is_empty()
-    {
-        return PathBuf::from(custom);
-    }
-    PathBuf::from(GROWW_DIR_DEFAULT)
-}
-
-/// Everything read from disk for one poll (all best-effort).
-#[derive(Debug, Default)]
-struct FileView {
-    connections: Vec<BoardConnRow>,
-    race: Option<ParityRace>,
-}
-
-fn collect_file_view(dir: &Path, now_ist_nanos: i64) -> FileView {
-    FileView {
-        connections: scan_connections(dir, now_ist_nanos),
-        race: newest_parity_race(dir),
-    }
-}
-
-/// One row per Groww connection: shard layout (`shards/c<NN>/groww-status.json`)
-/// when present, otherwise the single-sidecar `groww-status.json` as conn 0.
-fn scan_connections(dir: &Path, now_ist_nanos: i64) -> Vec<BoardConnRow> {
-    let mut rows: Vec<BoardConnRow> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir.join(SHARDS_SUBDIR)) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(id) = name.strip_prefix('c').and_then(|s| s.parse::<u32>().ok()) else {
-                continue;
-            };
-            if let Some(row) =
-                read_status_file(&entry.path().join(STATUS_FILENAME), id, now_ist_nanos)
-            {
-                rows.push(row);
-            }
-        }
-    }
-    if rows.is_empty()
-        && let Some(row) = read_status_file(&dir.join(STATUS_FILENAME), 0, now_ist_nanos)
-    {
-        rows.push(row);
-    }
-    rows.sort_by_key(|r| r.conn_id);
-    rows.truncate(MAX_CONNECTIONS_REPORTED);
-    rows
-}
-
-/// Reads + parses one sidecar status file; `None` on any problem (a torn or
-/// oversized file is skipped, never an error).
-fn read_status_file(path: &Path, conn_id: u32, now_ist_nanos: i64) -> Option<BoardConnRow> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_STATUS_FILE_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(path).ok()?;
-    parse_status_json(&text, conn_id, now_ist_nanos)
-}
-
-/// Parses the sidecar `write_status` record. Unknown fields are ignored;
-/// missing counters default to 0 (the tag itself is what proves liveness).
-fn parse_status_json(text: &str, conn_id: u32, now_ist_nanos: i64) -> Option<BoardConnRow> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let event = sanitize_tag(value.get("event").and_then(|v| v.as_str()).unwrap_or(""));
-    if event.is_empty() {
-        return None;
-    }
-    let age_secs = value
-        .get("ts_ist_nanos")
-        .and_then(serde_json::Value::as_i64)
-        .map(|ts| {
-            let diff = now_ist_nanos.saturating_sub(ts).max(0);
-            u64::try_from(diff / 1_000_000_000).unwrap_or(u64::MAX)
-        });
-    Some(BoardConnRow {
-        conn_id,
-        event,
-        subscribed_total: value
-            .get("total")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        emitted: value
-            .get("emitted")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        dropped: value
-            .get("dropped")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        age_secs,
-    })
-}
-
-/// Public-payload hygiene: keep only ascii alnum/underscore, max 32 chars.
-fn sanitize_tag(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .take(32)
-        .collect()
-}
-
-/// Finds + parses the newest `parity-<YYYY-MM-DD>.tsv`; `None` when no valid
-/// summary exists yet ("race pending").
-fn newest_parity_race(dir: &Path) -> Option<ParityRace> {
-    let mut best: Option<(String, PathBuf)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(date) = name
-            .strip_prefix(PARITY_PREFIX)
-            .and_then(|s| s.strip_suffix(PARITY_SUFFIX))
-        else {
-            continue;
-        };
-        if !is_valid_iso_date(date) {
-            continue;
-        }
-        if best.as_ref().is_none_or(|(d, _)| date > d.as_str()) {
-            best = Some((date.to_string(), entry.path()));
-        }
-    }
-    let (date, path) = best?;
-    let meta = std::fs::metadata(&path).ok()?;
-    if meta.len() > MAX_PARITY_FILE_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    let metrics = parse_parity_tsv(&text);
-    if metrics.is_empty() {
-        return None;
-    }
-    Some(ParityRace { date, metrics })
-}
-
-/// Strict `YYYY-MM-DD` shape check (filename → payload, so validate).
-fn is_valid_iso_date(date: &str) -> bool {
-    let bytes = date.as_bytes();
-    bytes.len() == 10
-        && bytes.iter().enumerate().all(|(i, b)| match i {
-            4 | 7 => *b == b'-',
-            _ => b.is_ascii_digit(),
-        })
-}
-
-/// Parses the comparer's `metric\tvalue` TSV into a bounded metric map.
-/// Non-numeric rows (incl. the header) are skipped.
-fn parse_parity_tsv(text: &str) -> BTreeMap<String, i64> {
-    let mut out = BTreeMap::new();
-    for line in text.lines() {
-        if out.len() >= MAX_PARITY_ROWS {
-            break;
-        }
-        let mut parts = line.splitn(2, '\t');
-        let (Some(key), Some(val)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let Ok(num) = val.trim().parse::<i64>() else {
-            continue;
-        };
-        let key: String = key
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .take(64)
-            .collect();
-        if key.is_empty() {
-            continue;
-        }
-        out.insert(key, num);
-    }
-    out
 }
 
 /// Resident memory of this process in bytes; `None` on hosts without procfs.
@@ -585,17 +348,6 @@ mod tests {
         );
     }
 
-    /// Unique per-test scratch dir (no tempfile dep; cleaned best-effort).
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tv-board-test-{tag}-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
-    }
-
     #[tokio::test]
     async fn test_compute_board_data_all_sources_down_returns_nulls_not_panics() {
         // Everything down/absent: QuestDB unreachable, no groww files (test
@@ -606,133 +358,29 @@ mod tests {
         assert!(resp.status.uptime_secs.is_none(), "boot epoch 0 → null");
         assert!(!resp.status.build_sha_short.is_empty());
         assert!(!resp.db.reachable, "QuestDB down → reachable=false");
-        assert!(resp.db.ticks_today.is_none());
         assert!(resp.db.candles_1m_today.is_none());
-        assert!(resp.race.is_none(), "no parity file → race pending");
         // Feeds section still present (one row per feed, from the registry).
         assert_eq!(
             resp.feeds.feeds.len(),
             crate::feed_state::Feed::ALL.len(),
             "feeds section embedded even when everything else is down"
         );
-        assert!(resp.dhan_clock_whole_seconds);
         // JSON shape: nulls serialize as null, not as a panic or a fake 0.
+        // (connections/race fields removed 2026-07-17 — dashboard tidy.)
         let json = serde_json::to_value(&resp).expect("serializes");
-        assert!(json["db"]["ticks_today"].is_null());
-        assert!(json["race"].is_null());
-    }
-
-    #[test]
-    fn test_parse_parity_tsv_extracts_numeric_metrics() {
-        let text = "metric\tvalue\nmatched\t981\nmissing_in_rust\t10\n\
-                    latency_all_p50_ns\t2275532\nnot a row\ngarbage\tNaN\n";
-        let map = parse_parity_tsv(text);
-        assert_eq!(map.get("matched"), Some(&981));
-        assert_eq!(map.get("missing_in_rust"), Some(&10));
-        assert_eq!(map.get("latency_all_p50_ns"), Some(&2_275_532));
-        assert!(!map.contains_key("metric"), "header row skipped");
-        assert!(!map.contains_key("garbage"), "non-numeric skipped");
-        assert_eq!(map.len(), 3);
-    }
-
-    #[test]
-    fn test_parse_parity_tsv_caps_rows() {
-        let mut text = String::new();
-        for i in 0..(MAX_PARITY_ROWS + 50) {
-            text.push_str(&format!("k{i}\t{i}\n"));
-        }
-        assert_eq!(parse_parity_tsv(&text).len(), MAX_PARITY_ROWS);
-    }
-
-    #[test]
-    fn test_newest_parity_race_picks_latest_valid_date() {
-        let dir = scratch_dir("parity");
-        std::fs::write(dir.join("parity-2026-07-04.tsv"), "matched\t5\n").expect("write");
-        std::fs::write(dir.join("parity-2026-07-05.tsv"), "matched\t9\n").expect("write");
-        std::fs::write(dir.join("parity-notadate.tsv"), "matched\t1\n").expect("write");
-        let race = newest_parity_race(&dir).expect("race present");
-        assert_eq!(race.date, "2026-07-05");
-        assert_eq!(race.metrics.get("matched"), Some(&9));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_newest_parity_race_none_when_dir_missing() {
-        let dir = std::env::temp_dir().join("tv-board-test-definitely-absent");
-        assert!(newest_parity_race(&dir.join("nope")).is_none());
-    }
-
-    #[test]
-    fn test_scan_connections_prefers_shards_dir() {
-        let dir = scratch_dir("shards");
-        // Shard layout: c00 + c02 present, c01 missing its status file.
-        for (shard, total) in [("c00", 1000u64), ("c02", 998u64)] {
-            let sd = dir.join(SHARDS_SUBDIR).join(shard);
-            std::fs::create_dir_all(&sd).expect("mkdir");
-            std::fs::write(
-                sd.join(STATUS_FILENAME),
-                format!(
-                    "{{\"event\":\"streaming\",\"total\":{total},\"emitted\":7,\
-                     \"dropped\":1,\"ts_ist_nanos\":100}}"
-                ),
-            )
-            .expect("write");
-        }
-        std::fs::create_dir_all(dir.join(SHARDS_SUBDIR).join("c01")).expect("mkdir");
-        // A single-file status also present — must be IGNORED when shards exist.
-        std::fs::write(
-            dir.join(STATUS_FILENAME),
-            "{\"event\":\"subscribed\",\"total\":5}",
-        )
-        .expect("write");
-        let rows = scan_connections(&dir, 5_000_000_100);
-        assert_eq!(rows.len(), 2, "one row per shard with a status file");
-        assert_eq!(rows[0].conn_id, 0);
-        assert_eq!(rows[1].conn_id, 2);
-        assert_eq!(rows[0].event, "streaming");
-        assert_eq!(rows[0].subscribed_total, 1000);
-        assert_eq!(rows[0].age_secs, Some(5), "age from ts_ist_nanos delta");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_scan_connections_falls_back_to_single_status_file() {
-        let dir = scratch_dir("single");
-        std::fs::write(
-            dir.join(STATUS_FILENAME),
-            "{\"event\":\"subscribed\",\"total\":767,\"emitted\":0,\"dropped\":0}",
-        )
-        .expect("write");
-        let rows = scan_connections(&dir, 0);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].conn_id, 0);
-        assert_eq!(rows[0].subscribed_total, 767);
-        assert!(rows[0].age_secs.is_none(), "no ts field → null age");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_scan_connections_empty_when_nothing_exists() {
-        let dir = scratch_dir("empty");
-        assert!(scan_connections(&dir, 0).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_parse_status_json_sanitizes_event_and_rejects_garbage() {
-        let row = parse_status_json(
-            "{\"event\":\"str<script>eaming!\",\"total\":3}",
-            7,
-            1_000_000_000,
-        )
-        .expect("parses");
-        assert_eq!(row.event, "strscripteaming", "tag sanitized to alnum/_");
-        assert!(parse_status_json("not json at all", 0, 0).is_none());
         assert!(
-            parse_status_json("{\"total\":3}", 0, 0).is_none(),
-            "no event tag → skipped"
+            json["db"].get("ticks_today").is_none(),
+            "retired ticks_today tile absent (BATCH-5 2026-07-19)"
+        );
+        assert!(json.get("race").is_none(), "retired race field absent");
+        assert!(
+            json.get("connections").is_none(),
+            "retired connections field absent"
         );
     }
+
+    // (parity/scan_connections/parse_status_json test suites deleted
+    // 2026-07-17 with their subject fns — dashboard tidy.)
 
     #[test]
     fn test_parse_vmrss_kib_extracts_value() {
@@ -746,15 +394,13 @@ mod tests {
         let lit = ist_today_midnight_literal();
         assert_eq!(lit.len(), "2026-07-05T00:00:00.000000Z".len());
         assert!(lit.ends_with("T00:00:00.000000Z"));
-        assert!(is_valid_iso_date(&lit[..10]));
-    }
-
-    #[test]
-    fn test_is_valid_iso_date() {
-        assert!(is_valid_iso_date("2026-07-05"));
-        assert!(!is_valid_iso_date("2026-7-5"));
-        assert!(!is_valid_iso_date("20260705xx"));
-        assert!(!is_valid_iso_date("2026-07-05T"));
+        // Date prefix stays strict YYYY-MM-DD (is_valid_iso_date deleted
+        // 2026-07-17 with the parity reader — inline shape check kept).
+        let bytes = &lit.as_bytes()[..10];
+        assert!(bytes.iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        }));
     }
 
     #[test]
@@ -769,12 +415,5 @@ mod tests {
             (delta - offset).abs() < 2_000_000_000,
             "IST nanos ~offset ahead of UTC (delta={delta})"
         );
-    }
-
-    #[test]
-    fn test_sanitize_tag_truncates() {
-        let long = "a".repeat(100);
-        assert_eq!(sanitize_tag(&long).len(), 32);
-        assert_eq!(sanitize_tag("stream-ing 42"), "streaming42");
     }
 }

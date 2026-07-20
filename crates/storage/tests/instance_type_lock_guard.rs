@@ -147,23 +147,39 @@ fn instance_lock_supersession_markers_present_in_operator_charter() {
 }
 
 /// Section C — the bill in §7 must match the locked figure. Operator
-/// approved the t4g.medium downsize 2026-07-15 (Quote 8); the pinned
-/// number is the honest INTERIM ~₹1,471/mo (270 hrs, EIP kept, incl.
-/// 18% GST, LIVE 50 GB root — gp3 cannot shrink tonight). ~₹1,197/mo is
-/// pinned only as the labelled post-20-GB-recreate figure, and ~₹986/mo
-/// requires BOTH the ~176-hr auto-schedule basis AND the post-recreate
-/// 20 GB volume (on the live 50 GB root the ~176-hr figure is ~₹1,260) —
-/// the guard requires those labels so the live bill is never misstated.
-/// If someone re-tunes any of this in the rule file without operator
-/// approval, the build fails.
+/// approved the t4g.medium downsize 2026-07-15 (Quote 8); the stated
+/// INTERIM was ~₹1,471/mo on a "live 50 GB root" premise. 2026-07-19
+/// live `describe-volumes` verification (coordinator session) showed the
+/// root is 30 GiB gp3 — the 2026-07-13 approved 30→50 grow was recorded
+/// but never physically applied — so the CORRECTED interim is ~₹1,289/mo
+/// (EBS $0.0912 × 30 = $2.74; subtotal $12.85 → ₹1,092 → ×1.18 GST),
+/// with ~₹1,471/mo retained as the labelled pre-correction figure.
+/// ~₹1,197/mo is pinned only as the labelled post-20-GB-recreate figure,
+/// and ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the
+/// post-recreate 20 GB volume (the live-30-GB ~176-hr figure is ~₹1,077;
+/// the superseded 50 GB record's was ~₹1,260) — the guard requires those
+/// labels so the live bill is never misstated. If someone re-tunes any of
+/// this in the rule file without operator approval, the build fails.
 #[test]
 fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
     assert!(
+        body.contains("~₹1,289/mo") || body.contains("Rs 1,289/mo"),
+        "rule file §7 must pin the CORRECTED INTERIM ~₹1,289/mo bill (live 30 GB root verified 2026-07-19: t4g.medium, 270 hrs, +EIP, incl GST)"
+    );
+    assert!(
+        body.contains("30 GiB gp3") && body.contains("never physically applied"),
+        "rule file §7 must carry the 2026-07-19 live-volume correction (30 GiB gp3 verified; the 2026-07-13 grow to 50 never physically applied)"
+    );
+    assert!(
+        body.contains("~₹1,077"),
+        "rule file §7 must state the corrected live-30-GB ~176-hr figure (~₹1,077)"
+    );
+    assert!(
         body.contains("~₹1,471/mo") || body.contains("Rs 1,471/mo"),
-        "rule file §7 must pin the INTERIM ~₹1,471/mo bill (operator approved 2026-07-15 Quote 8: t4g.medium, 270 hrs, live 50 GB EBS, +EIP, incl GST)"
+        "rule file §7 must retain the pre-correction ~₹1,471/mo figure as labelled history (2026-07-15 Quote 8 record on the never-applied 50 GB assumption)"
     );
     assert!(
         body.contains("~₹1,197/mo applies ONLY after the 20 GB fresh-volume recreate"),
@@ -176,6 +192,99 @@ fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
     assert!(
         body.contains("~₹1,260"),
         "rule file §7 must state the live-50-GB ~176-hr figure (~₹1,260) so ~₹986 is never presented as reachable before the 20 GB recreate"
+    );
+}
+
+/// Section C.1 — the 2026-07-19 sub-1K ruling (Quote 9) must stay pinned:
+/// the operator formally ACCEPTED the 30 GB root (the 2026-07-13 30→50 grow
+/// CANCELLED), re-affirmed t4g.medium, and set a HARD TARGET of < ₹1,000/mo
+/// incl GST. The recorded ~₹1,289/~₹1,077 bills do NOT meet that target, so
+/// the rule files must (a) carry the verbatim quote, (b) label the bills
+/// with the target, and (c) keep the itemized lever path in aws-budget.md —
+/// removing any of these would let a future bill be presented as compliant
+/// (false-OK) or resurrect the cancelled grow without a fresh quote.
+#[test]
+fn instance_lock_2026_07_19_sub_1k_ruling_pinned() {
+    let root = repo_root();
+    let daily =
+        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    assert!(
+        daily.contains("just 30 gn enough and onl yt4g medium as of now"),
+        "daily-universe §0 must carry the 2026-07-19 Quote 9 verbatim (typos included)"
+    );
+    assert!(
+        daily.contains("< ₹1,000"),
+        "daily-universe §7 must carry the 2026-07-19 hard target (< ₹1,000/mo incl GST)"
+    );
+    assert!(
+        daily.contains("grow is **CANCELLED**") || daily.contains("grow CANCELLED"),
+        "daily-universe must record that the 2026-07-13 30→50 grow is CANCELLED (Quote 9)"
+    );
+    let budget = read(&root.join(".claude/rules/project/aws-budget.md"));
+    assert!(
+        budget.contains("OPERATOR RULING 2026-07-19"),
+        "aws-budget.md must carry the OPERATOR RULING 2026-07-19 section (the itemized sub-1K lever path)"
+    );
+    assert!(
+        budget.contains("just 30 gn enough and onl yt4g medium as of now"),
+        "aws-budget.md must carry the 2026-07-19 Quote 9 verbatim (typos included)"
+    );
+    assert!(
+        budget.contains("UNREACHABLE without at least one"),
+        "aws-budget.md must state plainly that <₹1,000 is unreachable without an operator-gated lever (no false-OK)"
+    );
+    assert!(
+        budget.contains("snap-090ed9c4f3df0ca61"),
+        "aws-budget.md must carry the rollback-snapshot deletion scheduling note (Lever 1, after 2026-07-22)"
+    );
+}
+
+/// Section C.2 — the 2026-07-19 SECOND same-day ruling (Quote 10) must stay
+/// pinned: the operator approved the EIP release for the no-real-orders
+/// period ("until or unless we flip the real orders static ip is not needed
+/// due okay?"), the live verification proved a STANDALONE release unsafe
+/// (launch-time ENI attribute — the live ENI never mints an ephemeral IP),
+/// and execution is BUNDLED with the erase-window recreate per
+/// `docs/runbooks/eip-release.md`. Removing any of these would let a future
+/// session (a) release the EIP standalone and brick the box, or (b) flip
+/// `enable_eip` without the runbook's verify-first order, or (c) go live on
+/// Dhan orders without the ≥7-day setIP re-whitelist protocol.
+#[test]
+fn instance_lock_2026_07_19_eip_release_ruling_pinned() {
+    let root = repo_root();
+    let budget = read(&root.join(".claude/rules/project/aws-budget.md"));
+    assert!(
+        budget
+            .contains("until or unless we flip the real orders static ip is not needed due okay?"),
+        "aws-budget.md must carry the 2026-07-19 Quote 10 verbatim (typos included)"
+    );
+    assert!(
+        budget.contains("VERIFIED-UNSAFE-STANDALONE"),
+        "aws-budget.md must record the live standalone-release verdict (launch-time ENI attribute)"
+    );
+    assert!(
+        budget.contains("docs/runbooks/eip-release.md"),
+        "aws-budget.md must point at the bundled-recreate execution runbook"
+    );
+    let daily =
+        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    assert!(
+        daily.contains("Quote 10"),
+        "daily-universe §0 must carry the 2026-07-19 Quote 10 EIP-release ruling"
+    );
+    let scope = read(&root.join(".claude/rules/project/websocket-connection-scope-lock.md"));
+    assert!(
+        scope.contains("Static IP / EIP ruling"),
+        "websocket-connection-scope-lock.md must carry the 2026-07-19 static-IP ruling section"
+    );
+    let runbook = read(&root.join("docs/runbooks/eip-release.md"));
+    assert!(
+        runbook.contains("VERIFY outbound-without-EIP FIRST"),
+        "the runbook must encode the operator's verify-first safety order"
+    );
+    assert!(
+        runbook.contains("7-day modify cooldown") && runbook.contains("/v2/ip/setIP"),
+        "the runbook must carry the live-trading re-enable protocol (new EIP + Dhan setIP >=7 days pre-go-live)"
     );
 }
 

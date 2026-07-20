@@ -1,3 +1,9 @@
+---
+paths:
+  - "crates/core/src/historical/*.rs"
+  - "crates/storage/src/candle_persistence.rs"
+---
+
 # Historical Candles & Cross-Verification Rules
 
 > **Authority:** CLAUDE.md > this file.

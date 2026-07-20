@@ -61,8 +61,12 @@ fn scan(path: &str) {
 #[test]
 fn seal_paths_contain_no_io() {
     // Integration tests run with CWD = the crate directory (crates/trading).
-    scan("src/candles/aggregator_cell.rs");
-    scan("src/candles/multi_tf_aggregator.rs");
+    // 2026-07-17 (stage-3 dead-WS sweep): re-pinned from the DELETED tick
+    // aggregator files (aggregator_cell.rs / multi_tf_aggregator.rs) to the
+    // SURVIVING pure seal-path modules — the ring, the shared candle state,
+    // and the seal-time pct stamping stay in-RAM I/O-free.
+    scan("src/candles/seal_ring.rs");
+    scan("src/candles/live_candle_state.rs");
 }
 
 #[test]

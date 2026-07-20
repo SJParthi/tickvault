@@ -67,12 +67,10 @@ pub struct ApplicationConfig {
     /// engines per L7).
     #[serde(default)]
     pub engine: EngineConfig,
-    /// Wave-5 in-memory store §K-L10 (PR #504d) — runtime-tunable
-    /// per-instrument tick capacity for `TickStorage`. Default 5_000
-    /// covers the busiest contract's daily tick count without
-    /// triggering Vec realloc.
-    #[serde(default)]
-    pub in_mem: InMemConfig,
+    // `[in_mem]` section REMOVED 2026-07-19 (dead-code cleanup — BATCH-5):
+    // its sole content was `[in_mem.tick_storage].per_instrument_capacity`,
+    // which fed the `TickStorage` store that was retired with the PrevDayCache/
+    // TickStorage removal. No production reader remained.
     /// Pluggable market-data feed selection (Groww second-feed scope,
     /// operator lock 2026-06-19 — see
     /// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`).
@@ -224,6 +222,13 @@ pub struct ApplicationConfig {
     /// Absent section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub dhan_order_push: DhanOrderPushConfig,
+    /// `[order_update_events]` — full-fidelity order/position push-event
+    /// capture into `order_update_events` / `position_update_events`
+    /// (ORDER-EVT-01; additive forensic lane beside the lossy
+    /// `order_audit` lane). Absent section ⇒ DISABLED (fail-safe default
+    /// off); `config/base.toml` opts in.
+    #[serde(default)]
+    pub order_update_events: OrderUpdateEventsConfig,
     /// `[groww_rest_burst]` — the 2026-07-14 Groww REST burst auto-ladder
     /// (operator approval "approved and go ahead with the recommendation";
     /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
@@ -409,12 +414,17 @@ pub struct ScoreboardConfig {
     #[serde(default = "default_scoreboard_enabled")]
     pub telegram_enabled: bool,
     /// Populate the per-instrument `feed_coverage_daily` detail rows
-    /// (~1.5K/day). Consumed by PR-4 (presence registry); the table +
-    /// flag ship in PR-A so the config surface is stable.
+    /// (~1.5K/day). INERT since 2026-07-18 (stage-4 dead-producer sweep):
+    /// the presence registry — the rows' only source — was deleted, so no
+    /// detail row can be built; the field is retained so existing config
+    /// files keep parsing (the table + historical rows stay).
     #[serde(default = "default_scoreboard_enabled")]
     pub coverage_detail_rows: bool,
-    /// Hot-path per-tick presence fold (PR-4). `false` ⇒ coverage via SQL
-    /// totals only; per-instrument unique-wins "unavailable".
+    /// Hot-path per-tick presence fold. INERT since 2026-07-18 (stage-4
+    /// dead-producer sweep): the presence registry was deleted (its
+    /// record/register producers died with the live feeds), so nothing
+    /// reads this flag anymore; retained so existing config files keep
+    /// parsing. Coverage is the SQL approximation (`sql_backfill`).
     #[serde(default = "default_scoreboard_enabled")]
     pub presence_fold_enabled: bool,
     /// Groww exchange→receipt lag histogram fold (PR-3). Until it ships,
@@ -1791,6 +1801,27 @@ pub struct DhanOrderPushConfig {
     pub enabled: bool,
 }
 
+/// `[order_update_events]` — full-fidelity order/position PUSH-event
+/// capture (ORDER-EVT-01; `.claude/rules/project/order-update-events-error-codes.md`):
+/// when enabled, the app spawns one supervised consumer draining the two
+/// capture channels (Dhan order updates + Groww order/position push
+/// records) into the NEW `order_update_events` / `position_update_events`
+/// QuestDB tables. ADDITIVE forensic lane — the lossy 11-field
+/// `order_audit` lane and the hint lane are untouched; zero Telegram,
+/// zero order-path involvement, cold path only.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[order_update_events]` section (or a TOML written before this
+/// PR) disables the capture entirely. `config/base.toml` opts in with
+/// `enabled = true`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OrderUpdateEventsConfig {
+    /// Master switch for the full-fidelity push-event capture consumer.
+    /// Default OFF (fail-safe).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// serde default for [`GrowwContract1mConfig::strikes_each_side`] — the
 /// pinned [`crate::constants::GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE`].
 fn default_groww_contract_1m_strikes_each_side() -> u32 {
@@ -2145,45 +2176,9 @@ impl FeedsConfig {
     }
 }
 
-/// Container for the `[in_mem]` TOML section (Wave-5 §K-L10, PR #504d).
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct InMemConfig {
-    #[serde(default)]
-    pub tick_storage: TickStorageConfig,
-}
-
-/// `[in_mem.tick_storage]` — runtime-tunable TickStorage settings.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TickStorageConfig {
-    /// Pre-allocated `Vec<ParsedTick>` capacity per `(security_id,
-    /// exchange_segment)` key on first push. Sized to cover the
-    /// busiest contract's daily tick count without forcing a Vec
-    /// realloc (`tv_in_mem_tick_storage_realloc_total` increments on
-    /// overflow). Setting this to 0 falls back to the compile-time
-    /// default (`DEFAULT_PER_INSTRUMENT_CAPACITY = 5_000`) inside
-    /// `TickStorage::new` so a misconfigured TOML cannot trigger
-    /// 1-byte-realloc-per-tick.
-    #[serde(default = "TickStorageConfig::default_per_instrument_capacity")]
-    pub per_instrument_capacity: usize,
-}
-
-impl TickStorageConfig {
-    /// Default capacity = 5_000 per L10 sizing analysis (mirrors the
-    /// trading crate constant `DEFAULT_PER_INSTRUMENT_CAPACITY`).
-    /// Pinned by `test_tick_storage_default_per_instrument_capacity`.
-    #[must_use]
-    pub const fn default_per_instrument_capacity() -> usize {
-        5_000
-    }
-}
-
-impl Default for TickStorageConfig {
-    fn default() -> Self {
-        Self {
-            per_instrument_capacity: Self::default_per_instrument_capacity(),
-        }
-    }
-}
+// `InMemConfig` / `TickStorageConfig` REMOVED 2026-07-19 (dead-code cleanup —
+// BATCH-5): they configured the retired in-memory `TickStorage` store (removed
+// with the PrevDayCache/TickStorage sweep). No production reader remained.
 
 /// Container for the `[engine.timeframes]` TOML section. L8 pins the
 /// "TF list source" to `config/base.toml`, so this struct exists to
@@ -4186,7 +4181,7 @@ mod tests {
             // movers: MoversConfig retired in PR #2 (2026-05-18).
             features: FeaturesConfig::default(),
             engine: EngineConfig::default(),
-            in_mem: InMemConfig::default(),
+            // in_mem: InMemConfig retired 2026-07-19 (BATCH-5 dead-code cleanup).
             feeds: FeedsConfig::default(),
             scoreboard: ScoreboardConfig::default(),
             brutex_crossverify: BrutexCrossverifyConfig::default(),
@@ -4204,6 +4199,7 @@ mod tests {
             groww_contract_1m: GrowwContract1mConfig::default(),
             order_runtime: OrderRuntimeConfig::default(),
             dhan_order_push: DhanOrderPushConfig::default(),
+            order_update_events: OrderUpdateEventsConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
@@ -4931,22 +4927,9 @@ mod tests {
         assert!(!engine.timeframes.contains_seconds_tf());
     }
 
-    // --- Wave-5 §K-L10 (PR #504d) ratchets ---------------------------
-
-    #[test]
-    fn test_tick_storage_default_per_instrument_capacity_is_5k() {
-        // L10 + sizing analysis pin: 5_000 covers the busiest contract.
-        // Drift requires plan amend.
-        let cfg = TickStorageConfig::default();
-        assert_eq!(cfg.per_instrument_capacity, 5_000);
-        assert_eq!(TickStorageConfig::default_per_instrument_capacity(), 5_000);
-    }
-
-    #[test]
-    fn test_in_mem_config_default_inherits_l10_tick_storage() {
-        let cfg = InMemConfig::default();
-        assert_eq!(cfg.tick_storage.per_instrument_capacity, 5_000);
-    }
+    // Wave-5 §K-L10 (PR #504d) TickStorageConfig/InMemConfig ratchets REMOVED
+    // 2026-07-19 (BATCH-5): the config surface they pinned was retired with the
+    // dead TickStorage store.
 
     #[test]
     fn test_observability_config_default() {
@@ -6177,6 +6160,46 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.dhan_order_push.enabled);
+    }
+
+    /// Full-fidelity push-event capture (ORDER-EVT-01): the
+    /// `[order_update_events]` section defaults OFF (fail-safe) whether the
+    /// section is absent, empty, or pre-dates the feature; explicit ON
+    /// round-trips.
+    #[test]
+    fn test_order_update_events_config_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = OrderUpdateEventsConfig::default();
+        assert!(
+            !d.enabled,
+            "order_update_events must default OFF (fail-safe)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            order_update_events: OrderUpdateEventsConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [order_update_events] must default, not error");
+        assert!(!missing.order_update_events.enabled);
+        // Empty section (no keys) → disabled.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[order_update_events]\n"))
+            .extract()
+            .expect("empty [order_update_events] must default, not error");
+        assert!(!empty.order_update_events.enabled);
+        // Explicit ON round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[order_update_events]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.order_update_events.enabled);
     }
 
     /// Order runtime validation: the 60s reconcile floor + the bounded

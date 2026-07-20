@@ -1,3 +1,13 @@
+---
+paths:
+  - "crates/common/src/error_code.rs"
+  - "crates/trading/src/oms/groww/smart_orders.rs"
+  - "crates/trading/src/oms/groww/executor.rs"
+  - "crates/trading/src/oms/groww/api_client.rs"
+  - "crates/trading/tests/groww_smart_orders_off_guard.rs"
+  - "crates/common/src/config.rs"
+---
+
 # Groww Smart Orders (GTT/OCO) Area — Error Codes (GROWW-OCO-01..05)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >

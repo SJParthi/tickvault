@@ -215,103 +215,30 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
 #     alarm RETIRED 2026-07-15 with the Groww live-feed retirement — the
 #     seals metric lost its last live producer; historical)
 # ---------------------------------------------------------------------------
-data "archive_file" "tv_market_hours_liveness_gate_zip" {
-  type        = "zip"
-  output_path = "${path.module}/.tv-market-hours-liveness-gate.zip"
-  source {
-    content  = <<-PYEOF
-import os, boto3
-from datetime import datetime, timedelta, timezone
-
-cw = boto3.client('cloudwatch')
-ec2 = boto3.client('ec2')
-ssm = boto3.client('ssm')
-
-ALARM_NAMES = [n.strip() for n in os.environ['ALARM_NAMES'].split(',') if n.strip()]
-INSTANCE_ID = os.environ['EC2_INSTANCE_ID']
-HOLIDAY_STOP_PARAM = os.environ['HOLIDAY_STOP_PARAM']
-IST = timedelta(hours=5, minutes=30)
-
-# mode="open"  (09:20 IST) -> enable alarm actions for the market-hours window,
-#                             but ONLY if the tv-app box is actually up.
-# mode="close" (15:35 IST) -> disable them again so the intentional off-hours
-#                             state (metric missing on the nightly/weekend
-#                             stop, or legitimately-zero score/seals while the
-#                             box idles outside market hours) never pages.
-#
-# WEEKDAY-NSE-HOLIDAY SAFETY (2026-07-07 review fix): the open cron is a plain
-# MON-FRI schedule with no NSE-holiday awareness, and on weekday NSE holidays
-# the box SELF-STOPS at boot (deploy/aws/holiday-gate.sh, ~08:32 IST). Enabling
-# the breaching-on-missing members of ALARM_NAMES (market-hours-liveness,
-# app-log-ingestion-silent) against an intentionally-stopped box would
-# false-page every weekday holiday (~09:25 / ~09:35 IST). So "open" first asks
-# EC2 whether the instance is up; a not-up box (holiday self-stop or operator
-# manual stop) keeps its actions DISABLED and skips the OK reset.
-# FAIL-OPEN: any DescribeInstances error enables as before — a real trading
-# day must never lose the liveness page (mirror of holiday-gate.sh's
-# fail-open philosophy, pointed the other way).
-def holiday_stop_is_today():
-    # ROUND-3 hardening (2026-07-07): deploy/aws/holiday-gate.sh stamps
-    # today's IST date into HOLIDAY_STOP_PARAM right BEFORE it self-stops the
-    # box on a weekday NSE holiday. Marker == today is AUTHORITATIVE for
-    # "intentionally stopped today" — unlike the single instance-state sample
-    # below, it cannot be raced by a holiday-blind restarter briefly bringing
-    # the box up around 09:20 IST (the restart-war window). Stale markers
-    # (a previous holiday's date) never match today. FAIL-OPEN: any SSM error
-    # / missing param = not a holiday — a real trading day must never lose
-    # the liveness page.
-    try:
-        raw = (ssm.get_parameter(Name=HOLIDAY_STOP_PARAM)['Parameter']['Value'] or '').strip()
-        today_ist = (datetime.now(timezone.utc) + IST).strftime('%Y-%m-%d')
-        return raw == today_ist
-    except Exception as e:
-        print(f"holiday-stop marker unavailable ({e}) -- fail-open, not a holiday")
-        return False
-
-def instance_is_up():
-    try:
-        r = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
-        state = r['Reservations'][0]['Instances'][0]['State']['Name']
-        # 'pending' counts as up: a late trading-day start must still arm the
-        # window (the OK reset + 5-15 min evaluation absorb the boot).
-        return state in ('running', 'pending'), state
-    except Exception as e:
-        print(f"describe_instances failed ({e}) -- fail-open, treating as up")
-        return True, 'unknown'
-
-def handler(event, context):
-    mode = (event or {}).get('mode', 'close')
-    if mode == 'open':
-        # Marker check FIRST — race-proof (round 3); instance state second —
-        # covers the marker-less manual-stop case (round 1).
-        if holiday_stop_is_today():
-            print(f"holiday-stop marker == today (NSE holiday self-stop); "
-                  f"leaving actions disabled for {ALARM_NAMES}")
-            return {'mode': mode, 'enabled': False, 'holiday_stop': True}
-        up, state = instance_is_up()
-        if not up:
-            print(f"instance {INSTANCE_ID} state={state} -- intentional stop "
-                  f"(NSE holiday self-stop / manual); leaving actions disabled "
-                  f"for {ALARM_NAMES}")
-            return {'mode': mode, 'enabled': False, 'instance_state': state}
-        cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)
-        # Reset to OK on open so a stale ALARM from a prior window does not
-        # immediately re-fire on the first enabled evaluation.
-        for name in ALARM_NAMES:
-            cw.set_alarm_state(
-                AlarmName=name,
-                StateValue='OK',
-                StateReason='market-hours window opened (09:20 IST)',
-            )
-        print(f"enabled actions for {ALARM_NAMES}")
-        return {'mode': mode, 'enabled': True}
-    cw.disable_alarm_actions(AlarmNames=ALARM_NAMES)
-    print(f"disabled actions for {ALARM_NAMES}")
-    return {'mode': mode, 'enabled': False}
-PYEOF
-    filename = "index.py"
-  }
-}
+# 2026-07-18 (rust-only phase 2b-1): the inline Python heredoc was PORTED to
+# Rust — crates/aws-lambdas/src/market_hours_gate.rs (lib logic + unit
+# tests) + src/bin/market_hours_liveness_gate.rs (thin bootstrap bin).
+# Behavior parity, unchanged env contract (ALARM_NAMES comma-list,
+# EC2_INSTANCE_ID, HOLIDAY_STOP_PARAM):
+#   mode="open"  (09:20 IST) → enable the gated alarms' actions, but ONLY if
+#     (a) the holiday-stop marker != today (checked FIRST — round-3
+#         race-proof; FAIL-OPEN on any SSM error: not a holiday) and
+#     (b) the tv-app box is up ('running'/'pending'; FAIL-OPEN on any
+#         DescribeInstances error — a real trading day must never lose the
+#         liveness page), then reset each alarm to OK with the exact
+#         'market-hours window opened (09:20 IST)' reason.
+#   mode="close" (15:35 IST) → disable them again so the intentional
+#     off-hours state never pages.
+# The weekday-NSE-holiday safety chain (2026-07-07 rounds 1+3) lives on in
+# the Rust port and is ratcheted by
+# crates/app/tests/cloudwatch_agent_glob_guard.rs
+# (test_gate_lambda_open_is_holiday_safe +
+#  test_gate_lambda_open_checks_holiday_marker_first — repointed at the
+# Rust source in the same PR as this heredoc removal).
+# The zip is built in CI by the build-lambdas job (terraform-apply.yml) and
+# downloaded into ${path.module}/.lambda-zips/ before plan/apply;
+# source_code_hash is a digest of the Rust SOURCE (Rust builds are not
+# bit-reproducible, so hashing the zip would churn every build).
 
 resource "aws_iam_role" "tv_market_hours_liveness_gate" {
   name = "tv-${var.environment}-market-hours-liveness-gate-role"
@@ -372,11 +299,12 @@ resource "aws_iam_role_policy" "tv_market_hours_liveness_gate" {
 
 resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
   function_name    = "tv-${var.environment}-market-hours-liveness-gate"
-  filename         = data.archive_file.tv_market_hours_liveness_gate_zip.output_path
-  source_code_hash = data.archive_file.tv_market_hours_liveness_gate_zip.output_base64sha256
+  filename         = "${path.module}/.lambda-zips/market-hours-liveness-gate.zip"
+  source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))
   role             = aws_iam_role.tv_market_hours_liveness_gate.arn
-  handler          = "index.handler"
-  runtime          = "python3.12"
+  handler          = "bootstrap"
+  runtime          = "provided.al2023"
+  architectures    = ["arm64"]
   timeout          = 30
   memory_size      = 128
   environment {
@@ -415,7 +343,14 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
       # retired — its gauge's only sample producer (the Groww bridge) was
       # deleted — AND aggregator-no-seals retired the same day (its seals
       # metric lost its last live producer; see app-alarms.tf section 9
-      # note). The gate now arms 4 alarms.
+      # note).
+      # 2026-07-17 (stage-3 dead-WS sweep): boundary-catchup-storm-dhan
+      # retired with the tick-aggregator deletion — see silent-feed-alarms.tf
+      # S2 note.
+      # 2026-07-17 (dashboard tidy): dhan-exchange-lag-p99-high retired —
+      # its gauge's only publisher (run_dhan_lag_publisher, dormant since
+      # the PR-C2 lane deletion) is deleted with the dead Dhan-lag chain.
+      # The gate now arms 2 alarms.
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         # aggregator_no_seals retired 2026-07-15 (dead monitor — see
@@ -425,8 +360,9 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # list 2026-07-13).
         aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
-        aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
-        aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
+        # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS
+        # sweep — its metric's writer, the tick aggregator, is deleted).
+        # dhan_exchange_lag_p99_high retired 2026-07-17 (dead Dhan-lag chain).
         # groww_exchange_lag_p99_high retired 2026-07-15 (Groww live feed removal).
       ])
       # Weekday-NSE-holiday safety: the open path skips enabling when this
@@ -450,14 +386,16 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 
 # ---------------------------------------------------------------------------
 # Watch the watchman (round-13, 2026-07-06): the gate Lambda's 09:20 IST open
-# invocation is the ONLY path that arms the 4 gated alarms (the ALARM_NAMES
+# invocation is the ONLY path that arms the 2 gated alarms (the ALARM_NAMES
 # env list above — the surviving 2026-07-06 silent-feed set; count 12 → 8 in
 # PR-C2 2026-07-14: realtime-guarantee-critical/-degraded + ws-pool-all-dead
 # + ws-failed-connections retired with the Dhan lane; → 7 same day via the
 # merged Dhan noise lock (→ 6 in PR-C3 2026-07-14: tick-gap-instruments-
 # silent retired with its deleted gauge producer; → 4 on 2026-07-15:
 # groww-exchange-lag-p99-high + aggregator-no-seals retired with the Groww
-# live-feed retirement): the leg-3
+# live-feed retirement; → 2 on 2026-07-17: boundary-catchup-storm-dhan
+# retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-
+# high retired with the dead Dhan-lag publisher chain): the leg-3
 # order-update reconnect-storm pager
 # retired with the order-update WS spawn). A gate failure
 # previously re-opened
@@ -475,9 +413,12 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # (12 -> 8 PR-C2, -> 7 Dhan noise lock, -> 6 PR-C3 2026-07-14 with
   # tick-gap-instruments-silent retired alongside its deleted gauge
   # producer, -> 4 on 2026-07-15: groww-exchange-lag-p99-high +
-  # aggregator-no-seals retired with the Groww live feed) lives HERE in
+  # aggregator-no-seals retired with the Groww live feed, -> 2 on
+  # 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3
+  # tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the
+  # dead Dhan-lag publisher chain) lives HERE in
   # the comment; the description keeps only the operator-actionable core.
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 4 gated alarms (market-hours-liveness-missing, app-log-ingestion-silent, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high - the Lambda's ALARM_NAMES env is the authoritative list; trimmed to 4 on 2026-07-15 with the Groww live-feed retirement). A failed open leaves all 4 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 4 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 2 gated alarms (market-hours-liveness-missing, app-log-ingestion-silent - the Lambda's ALARM_NAMES env is the authoritative list; trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain). A failed open leaves both disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 2 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
@@ -494,9 +435,12 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # close), so the post-ALARM auto-OK is always AGED-OUT, never a fix — a
   # recurring Rule-11 false-recovery green per failure episode. Worse, for
   # THIS watchman the green also invited skipping the manual re-arm of the
-  # 4 gated alarms (the leg-3 reconnect-storm pager + PR-C3's tick-gap alarm
+  # 2 gated alarms (the leg-3 reconnect-storm pager + PR-C3's tick-gap alarm
   # retired 2026-07-14; groww-exchange-lag-p99-high + aggregator-no-seals
-  # retired 2026-07-15 with the Groww live feed) — the description above
+  # retired 2026-07-15 with the Groww live feed; boundary-catchup-storm-dhan
+  # retired 2026-07-17 with the stage-3 tick-aggregator deletion;
+  # dhan-exchange-lag-p99-high
+  # retired 2026-07-17 with the dead Dhan-lag chain) — the description above
   # says: re-arm manually
   # REGARDLESS.
   ok_actions = []
@@ -557,6 +501,6 @@ resource "aws_lambda_permission" "tv_market_hours_liveness_close" {
 }
 
 output "market_hours_liveness_alarm_name" {
-  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a session where NO REST 1m leg ever fired, in the 09:20-15:35 IST window). Signal: the tv_rest_1m_fire_heartbeat gauge MISSING (treat_missing_data=breaching) — set once per per-minute fire by the retained REST 1m spot legs (spot_1m_rest_boot.rs + groww_spot_1m_boot.rs), in the CW-agent filter (user-data.sh.tftpl). Signal moved off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other 3 ALARM_NAMES entries (app-log-ingestion-silent, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high — list trimmed to 4 on 2026-07-15: groww-exchange-lag + aggregator-no-seals retired with the Groww live feed)."
+  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a session where NO REST 1m leg ever fired, in the 09:20-15:35 IST window). Signal: the tv_rest_1m_fire_heartbeat gauge MISSING (treat_missing_data=breaching) — set once per per-minute fire by the retained REST 1m spot legs (spot_1m_rest_boot.rs + groww_spot_1m_boot.rs), in the CW-agent filter (user-data.sh.tftpl). Signal moved off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entry (app-log-ingestion-silent — list trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain; previously trimmed to 4 on 2026-07-15 with the Groww live-feed retirement)."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }

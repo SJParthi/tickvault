@@ -45,6 +45,11 @@ pub mod brutex_crossverify_boot;
 // `.claude/rules/project/cadence-error-codes.md`.
 pub mod cadence_boot;
 pub(crate) mod cadence_escalation;
+// Boot-time candle-table DDL + retired-object sweep (Track A, 2026-07-18):
+// re-homes the pre-#1522 drop-legacy → ensure-candles → named-views chain
+// behind a bounded quiet probe; awaited from `build_shared_infra` BEFORE
+// the seal-writer spawn (the fresh-volume no-DEDUP fix).
+pub mod candle_ddl_boot;
 /// Real Dhan cadence executor — limiter-free, gate-pacing honored (the runner
 /// pre-acquires gates; this executor issues ONE bounded request per call).
 pub mod dhan_cadence_executor;
@@ -103,7 +108,13 @@ pub mod feed_scoreboard_boot;
 // verifies the PREVIOUS trading day (TF-VERIFY-01/02).
 pub mod spot_crossverify_boot;
 pub mod tf_consistency_boot;
-pub mod tick_conservation_boot;
+// Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
+// `tick_conservation_boot` module DELETED — the 15:40 IST WAL-vs-DB daily
+// audit's every input died with the live-WS retirements (Dhan 2026-07-13,
+// Groww 2026-07-15) + the stage-2 tick-chain deletion (#1631); the shared
+// `ws_wal_dir()` helper relocated to `boot_helpers`, `parse_questdb_count`
+// to `feed_scoreboard_boot`. The `tick_conservation_audit` QuestDB table
+// is RETAINED (SEBI, forensic).
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the
 // operator-locked pre-open equilibrium open-price gap.
@@ -171,9 +182,6 @@ pub mod market_ram_store_boot;
 /// stored month. FOLD-01 runbook:
 /// `.claude/rules/project/rest-candle-fold-error-codes.md`.
 pub mod rest_candle_fold;
-/// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
-/// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
-pub mod seal_routing;
 /// Pure shutdown classifier (Telegram cleanliness overhaul, 2026-07-15):
 /// signal kind × runtime source × IST clock × trading calendar →
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
@@ -194,10 +202,10 @@ pub mod infra;
 // previous-day OHLCV REST fetch retired with the Dhan live-WS lane (operator
 // 2026-07-13; prev-day-ohlcv-error-codes.md retirement banner). The
 // `prev_day_ohlcv` QuestDB table is retained (forensic).
-// F2 (Wave-5 #504e follow-up) — boot-time loader for `PrevDayCache`
-// so the cascade seal-time pct-stamping path (PR #520 / F1) sees
-// non-zero `prev_day_close` values from QuestDB's `previous_close`
-// table on cold boot.
+// Dead-code cleanup — BATCH-5 (2026-07-19): the F2 boot-time `PrevDayCache`
+// loader stub is gone — `PrevDayCache` + the seal-time pct-stamping path were
+// removed (their sole feeder retired with the live-WS feeds). The PREVCLOSE-04
+// ErrorCode variant is retained (documented in wave-1-error-codes.md).
 pub mod metrics_catalog;
 // PR-C3 (2026-07-14, operator retirement directive 2026-07-13 — scope-lock
 // amendment §B): the Dhan lifecycle-reconcile + fetch-audit chain is
@@ -239,6 +247,12 @@ pub mod order_observability;
 /// profile, spawned ONLY from `dhan_rest_stack` Phase 5b (2026-07-17
 /// correction — Phase 5a is the RETIRED order-update WS spawn slot).
 pub mod order_runtime;
+/// Full-fidelity order/position PUSH-event capture consumer
+/// (ORDER-EVT-01, 2026-07-18 — `order_update_events` /
+/// `position_update_events`): config-gated (`[order_update_events]`)
+/// supervised drain of the two capture channels into the storage writers.
+/// ADDITIVE forensic lane beside the lossy `order_audit` lane.
+pub mod order_update_events_boot;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
 // Dead live-WS sweep stage 1 (2026-07-17, operator directive via

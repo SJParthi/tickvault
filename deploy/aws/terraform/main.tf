@@ -1,9 +1,17 @@
-# DLT AWS stack — t4g.medium budget envelope (INTERIM ~₹1,471/mo incl GST:
-# 270 hrs, live 50 GB EBS, +EIP kept; operator-lock 2026-07-15 Quote 8 in
+# DLT AWS stack — t4g.medium budget envelope (INTERIM ~₹1,289/mo incl GST:
+# 270 hrs, live 30 GB EBS [verified 2026-07-19 via describe-volumes — the
+# 2026-07-13 approved grow to 50 never physically applied; the ~₹1,471 figure
+# stated 2026-07-15→2026-07-19 assumed 50 GB], +EIP kept; operator-lock
+# 2026-07-15 Quote 8 in
 # daily-universe-scope-expansion-2026-05-27.md §7, which supersedes the
 # 2026-06-30 r8g.large [~₹2,919/mo] + 2026-05-29 m8g.large + 2026-05-27
 # t4g.large + 2026-05-18 t4g.medium locks). Header corrected 2026-07-15 —
 # it previously described the superseded r8g.large envelope.
+# 2026-07-19 RULING (daily-universe §0 Quote 9): 30 GB root ACCEPTED (the
+# 30→50 grow CANCELLED), t4g.medium re-affirmed, and a NEW HARD TARGET of
+# < ₹1,000/mo incl GST — the ~₹1,289/~₹1,077 recorded bills do NOT meet it;
+# the itemized lever path lives in .claude/rules/project/aws-budget.md
+# "OPERATOR RULING 2026-07-19" (budget kill ceiling stepped $55 → $25 there).
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
@@ -12,7 +20,8 @@
 #     SNS publish + S3 cold-tier read/write
 #   - EC2 t4g.medium (ARM Graviton2, 2 vCPU / 4 GiB — 2026-07-15 downsize lock;
 #     was r8g.large) with a gp3 root volume (var default 20 GB = fresh-provision
-#     intent only; the LIVE box keeps its 50 GB root — gp3 cannot shrink)
+#     intent only; the LIVE box keeps its 30 GB root [verified 2026-07-19;
+#     the 2026-07-13 grow to 50 never applied] — gp3 cannot shrink)
 #   - Elastic IP — count-gated on var.enable_eip (DEFAULT false for the 3-month
 #     data-pull: no orders → no Dhan static-IP whitelist need → ~₹430/mo saved.
 #     Flip enable_eip=true before going LIVE with orders; 7-day modify cooldown)
@@ -342,7 +351,9 @@ resource "aws_instance" "tv_app" {
   # ec2:StopInstances. `disable_api_stop = true` would silently block the
   # daily auto-stop → instance runs 24/7 → ~720 hrs/mo → a many-times-over bill
   # instead of the locked monthly figure (~₹2,919 under the 2026-06-30 r8g.large
-  # lock; ~₹1,471 under the 2026-07-15 t4g.medium lock), and would block the
+  # lock; ~₹1,289 under the 2026-07-15 t4g.medium lock — corrected 2026-07-19
+  # from the stated ~₹1,471 after the live 30 GB root verification; hard
+  # TARGET < ₹1,000/mo per the 2026-07-19 ruling — see aws-budget.md), and would block the
   # in-place instance-type flips (up OR down).
   # Stop is reversible (EBS + data survive a stop) so it needs no guard.
   disable_api_termination = true

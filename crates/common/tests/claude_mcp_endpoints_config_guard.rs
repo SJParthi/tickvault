@@ -215,33 +215,89 @@ fn tunnel_install_scripts_exist_and_are_executable() {
     }
 }
 
+// 2026-07-18 (rust-only phase 2c, CUTOVER DONE): server.py is DELETED
+// from git — the committed-config contract now binds the Rust server
+// that .mcp.json actually launches. The python `_endpoint_url` pin is
+// replaced by its post-cutover truth (no live python consumer remains;
+// the Rust twin below carries the resolver pins) WITHOUT weakening.
 #[test]
-fn mcp_server_reads_config_file_before_env_vars() {
-    // Source-scan guard: the MCP server source MUST call _endpoint_url
-    // (the config-aware resolver), not bare os.environ.get for the
-    // endpoint URLs. Prevents regression where someone reverts to plain
-    // env-var lookups and breaks the committed-config contract.
-    let path = repo_root().join("scripts/mcp-servers/tickvault-logs/server.py");
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("MCP server source missing at {}", path.display()));
+fn config_file_is_consumed_by_the_rust_mcp_server_only() {
+    // The config header must name its real (rust) consumer, and no
+    // git-tracked python MCP server may exist to bypass the contract.
+    let (raw, _) = load_config();
+    assert!(
+        raw.contains("crates/tickvault-logs-mcp"),
+        "config/claude-mcp-endpoints.toml header must name the Rust MCP \
+         server as its consumer (post-cutover truth)"
+    );
+    let git_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root())
+        .args(["ls-files", "--", "scripts/mcp-servers/tickvault-logs"])
+        .output();
+    match git_out {
+        Ok(out) if out.status.success() => {
+            // Real checkout / normal CI: the tracked output must be empty
+            // (no git-tracked python MCP server).
+            let tracked = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                tracked.trim().is_empty(),
+                "a git-tracked python MCP server reappeared — the committed-config \
+                 contract is pinned on the Rust side only:\n{tracked}"
+            );
+        }
+        _ => {
+            // cargo-mutants runs tests from a non-git copied tree (no .git),
+            // where `git ls-files` exits non-zero (and git may be absent
+            // entirely); fall back to a filesystem-existence check so the
+            // guard keeps its teeth without panicking — the deleted python
+            // server directory must simply be absent on disk.
+            let py_dir = repo_root().join("scripts/mcp-servers/tickvault-logs");
+            assert!(
+                !py_dir.exists(),
+                "a python MCP server directory reappeared on disk — the \
+                 committed-config contract is pinned on the Rust side only: {}",
+                py_dir.display()
+            );
+        }
+    }
+}
 
-    // Every endpoint URL lookup must use _endpoint_url(...).
-    for kind in ["questdb_url", "tickvault_api_url"] {
+// The Rust MCP server consumes the SAME committed config file through
+// the SAME profile keys server.py did (resolver parity, frozen by the
+// parity harness against the pinned git-history reference).
+#[test]
+fn rust_mcp_port_reads_config_file_before_env_vars() {
+    // The URL profile keys are consulted at the tool call sites
+    // (tools.rs passes them into config::endpoint_url); the logs keys
+    // are consulted inside the resolver (config.rs). Scan both.
+    let root = repo_root();
+    let mut src = String::new();
+    for rel in [
+        "crates/tickvault-logs-mcp/src/config.rs",
+        "crates/tickvault-logs-mcp/src/tools.rs",
+    ] {
+        let path = root.join(rel);
+        src.push_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("Rust MCP port source missing at {}", path.display())),
+        );
+    }
+    for kind in [
+        "questdb_url",
+        "tickvault_api_url",
+        "logs_source",
+        "logs_dir_local",
+    ] {
         assert!(
             src.contains(&format!("\"{kind}\"")),
-            "MCP server source must reference profile key '{kind}' via _endpoint_url"
+            "Rust MCP port must reference profile key '{kind}' \
+             (endpoint_url/logs resolver parity with server.py)"
         );
     }
-    // No bare os.environ.get of the legacy env vars for URL resolution.
-    for env in ["TICKVAULT_QUESTDB_URL", "TICKVAULT_API_URL"] {
-        // The env var CAN appear (it's passed to _endpoint_url), but
-        // NOT in the `base_url or os.environ.get(...)` pattern that the
-        // config loader replaced. Detect the banned pattern.
-        let banned = format!("or os.environ.get(\n        \"{env}\"");
-        assert!(
-            !src.contains(&banned),
-            "MCP server has legacy `base_url or os.environ.get(\"{env}\"...)` \
-             pattern — use _endpoint_url() instead"
-        );
-    }
+    // And the canonical committed-config filename itself.
+    assert!(
+        src.contains("claude-mcp-endpoints.toml"),
+        "Rust MCP port must load config/claude-mcp-endpoints.toml"
+    );
 }

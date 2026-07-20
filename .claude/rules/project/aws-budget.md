@@ -1,3 +1,14 @@
+---
+paths:
+  - "deploy/docker/docker-compose.yml"
+  - "deploy/aws/**"
+  - "scripts/aws-*"
+  - "crates/app/src/infra.rs"
+  - "crates/trading/src/candles/seal_ring.rs"
+  - "crates/trading/src/indicator/**"
+  - "crates/trading/src/strategy/**"
+---
+
 # AWS Budget Enforcement — t4g.medium LOCKED ~₹1,022/mo
 
 > **⚠ SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** instance upgraded t4g.medium → t4g.large (8 GiB), bill ~₹1,022/mo → ~₹1,514/mo, cron 08:00 → 08:30 IST. Contents below retained as 2026-05-18 historical audit; current effective contract lives in the superseding file.
@@ -6,9 +17,280 @@
 >
 > **⚠ RE-SUPERSEDED → t4g.medium 2026-07-15 (operator Quote 8 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance DOWNSIZED r8g.large → **t4g.medium** (Graviton2, 2 vCPU / 4 GiB), QuestDB QDB_MEM_LIMIT 4g → 1g. INTERIM bill → ~₹1,471/mo incl GST at 270 hrs with the live 50 GB root (gp3 cannot shrink; the 20 GB fresh-volume recreate — an executor pre-stage, NOT operator-quoted — drops it to ~₹1,197/mo; ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the post-recreate 20 GB volume — on the live 50 GB root the ~176-hr figure is ~₹1,260, and ~₹986 is never the 270-hr one). EIP kept. The current effective instance lock lives in that file's §7. This file's original t4g.medium tables below remain 2026-05-18 historical audit (different universe/stack — do not reuse the ₹1,022 figure).
 >
+> **⚠ LIVE-VOLUME CORRECTION 2026-07-19:** the banner above's "live 50 GB root" premise was factually WRONG — `aws ec2 describe-volumes vol-073ccaa417a0f344b` (run live 2026-07-19 via the coordinator session) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use**, attached to `i-0b956d0209231a48b` at `/dev/xvda` since 2026-05-24. The 2026-07-13 approved 30→50 GB grow (COST NOTE below) was RECORDED but **never physically applied**. Corrected interim bill: EBS $0.0912 × 30 = $2.74; subtotal $6.05 + $3.60 + $2.74 + $0.18 + $0.28 = $12.85 → ₹1,092 → ×1.18 GST = **~₹1,289/mo** at 270 hrs (was stated ~₹1,471/mo; the ~176-hr figure is ~₹1,077, was stated ~₹1,260). Post-recreate figures unchanged (~₹1,197 / ~₹986 — they assumed 20 GB). **FLAGGED FOLLOW-UP:** the disk-pressure remediation the grow was approved for is UNAPPLIED — the 82%-disk-pressure risk may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note. *(RESOLVED same day by the 2026-07-19 OPERATOR RULING below: 30 GB is formally ACCEPTED and the 30→50 grow is CANCELLED.)* Full arithmetic + authority: `daily-universe-scope-expansion-2026-05-27.md` §7 (2026-07-19 correction note) + §0 (2026-07-19 approvals bullet).
+>
+> **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
+
+## OPERATOR RULING 2026-07-19 — sub-₹1,000/month hard budget target (30 GB accepted; grow CANCELLED)
+
+**The verbatim operator demand (2026-07-19 — preserve EXACTLY, typos included):**
+
+> "just 30 gn enough and onl yt4g medium as of now espeicall yentirkey it hsodul be kless than 1k per month dude oikay?"
+
+**Meaning (recorded with the ruling):**
+(a) the **30 GB root volume is formally ACCEPTED** — the 2026-07-13
+approved-but-never-applied 30→50 GB grow is **CANCELLED** (the COST NOTE
+2026-07-13 below and its 2026-07-19 correction are resolved by this ruling;
+the 82%-disk-pressure class is now handled by code retention + S3 archival
+on the accepted 30 GB, and any future grow needs a fresh dated quote);
+(b) **t4g.medium stays locked as-of-now** (re-affirms the 2026-07-15
+Quote 8 lock — no instance change);
+(c) **NEW HARD BUDGET TARGET: total AWS bill < ₹1,000/month incl GST.**
+
+### The itemized path to < ₹1,000 (evidence-backed arithmetic)
+
+Recorded bases (daily-universe §7, 2026-07-19-corrected — Verified arithmetic):
+
+- 270-hr ceiling basis: $12.85 → ₹1,092 → ×1.18 GST ≈ **₹1,289/mo**
+- ~176-hr auto-schedule basis: EC2 $3.94 + EIP $3.60 + EBS-30GB $2.74 +
+  S3 $0.18 + SMS $0.28 = **$10.74** → ₹913 → ×1.18 ≈ **₹1,077/mo**
+- PLUS the un-itemised add-ons the §7 honest envelope already admits:
+  the dated COST-NOTE alarm spend, recorded **~$2.7/mo ≈ ₹271/mo incl GST**
+  (that recorded figure PREDATES the 2026-07-15→18 retirement notes below,
+  ≈ −$2.5 in total — 0.50+0.10+0.70+0.10+0.40+0.70; with the 2026-07-14
+  PR-C3 −$0.40 already netted inside the ~$2.7 record — so the LIVE number
+  is likely materially lower — Unknown without Cost Explorer), and the
+  2026-07-15 rollback snapshot
+  `snap-090ed9c4f3df0ca61` at **~₹125/mo class** (Assumed magnitude —
+  EBS snapshots bill on USED blocks at ~$0.05/GB-mo, so the 30 GB root
+  bills its ~used-space ≈ $1.0–1.5 pre-GST ≈ ₹100–150 incl GST; a full
+  30 GB would be $1.50 ≈ ₹150) until deleted.
+- **Honest all-in today: ~₹1,473/mo at ~176 hrs (~₹1,685 at the 270-hr
+  ceiling).** The base bill ALONE (₹1,077) already exceeds ₹1,000 — the
+  target is NOT met by any amount of add-on trimming alone.
+
+| # | Lever | Δ per month | Status |
+|---|---|---|---|
+| 1 | Delete rollback snapshot `snap-090ed9c4f3df0ca61` AFTER 2026-07-22 (its ~1-week rollback window ends Mon 2026-07-22) | −~₹125 (Assumed magnitude) | **SANCTIONED — schedule only, do NOT delete before 2026-07-22.** No auto-delete exists: the operator (or a dated follow-up session after Monday 2026-07-22) runs `aws ec2 delete-snapshot --snapshot-id snap-090ed9c4f3df0ca61` and records a dated note here. |
+| 2 | Release the Elastic IP | −$3.60 → −₹306 pre-GST → **−~₹361 incl GST** | ~~**FLAGGED, OPERATOR-GATED — do NOT act.**~~ **2026-07-19 SECOND RULING (same day): release APPROVED for the no-real-orders period — but VERIFIED-UNSAFE-STANDALONE** (live describe evidence, coordinator session, 2026-07-19: the running instance's ENI eni-01fdeec2412f55587 has the ephemeral-public-IP attribute OFF — a launch-time ENI attribute AWS cannot enable post-launch — so releasing today = NO public IPv4 on the next stop/start = no SSM/feeds/deploys; the daily-universe §7 empirical claim CONFIRMED). Execution is therefore **BUNDLED with Lever 5** (the erase-window recreate — a FRESH launch in subnet subnet-00c8d06903d1482ea inherits `MapPublicIpOnLaunch=true` and gets an ephemeral public IP every start). Runbook: `docs/runbooks/eip-release.md` (verify-first order: recreate → prove ephemeral IP → release). Historical context of the old "do NOT act" status retained above via strikethrough — never deleted. |
+| 3 | Trim the dated COST-NOTE alarm spend (menu below) | up to −~₹271 (recorded ceiling; live residual likely lower) | **FLAGGED, RULE-FILE-GOVERNED — change nothing here.** Each group landed under its own dated note; each trim needs its own dated retirement note. |
+| 4a | SNS → SMS off (the bill table marks it optional) | −$0.28 → **−~₹28 incl GST** | Operator menu item — Telegram + Email fan-out remain (both free-tier). |
+| 4b | S3 cold trim | −≤$0.18 → −≤₹18 | Effectively NOT a lever: SEBI 5y retention rules the archive; the line only grows. No real finding beyond the recorded $0.18. |
+| 5 | 20 GB fresh-volume recreate (pre-staged 2026-07-15 executor decision; EBS $2.74 → $1.82) | −$0.92 → **−~₹92 incl GST** | **OPERATOR-GATED** (terminate-and-recreate in the erase window). NOTE: this ruling accepts **30 GB** as the live size; the 20 GB pre-stage remains a separate, un-quoted executor option — going below 30 needs its own operator go. **2026-07-19 SECOND RULING: the recreate is now the DELIVERY VEHICLE for Lever 2** — a fresh launch is the ONLY way this box gets ephemeral public IPs (the live ENI's launch-time attribute is off, verified 2026-07-19), so the EIP release and the 20 GB volume land together in ONE erase window (−₹361 − ₹92 in one action; runbook `docs/runbooks/eip-release.md`). |
+
+**Lever-3 menu — the dated alarm groups (from the COST NOTES in this file):**
+
+| Dated group | Recorded add | Trim caveat |
+|---|---|---|
+| Silent-feed hardening 2026-07-06 | +$1.50 (~₹150) | Several members ALREADY retired by the 2026-07-15/17 sweeps (dhan-lag alarm + 2 series, boundary-catchup-storm-dhan + 2 series) — the live residual of this group is far below $1.50. |
+| Scoreboard PR-C 2026-07-11 | +$0.40 (~₹40) | Groww-lag alarm + series ALREADY retired (2026-07-15 Trap-A + 2026-07-17 dashboard tidy) — largely gone. |
+| REST-audit gaps 2026-07-14 | +$0.60 (~₹60) | These page the ONLY remaining market-data pulls (spot-1m/chain legs + Telegram-drop) — trimming them blinds the REST legs. Not recommended. |
+| Order-side cluster C 2026-07-14 | +$0.60 now (+$1.20 at Phase-1) (~₹60) | Order-path pagers (paper mode today). |
+| Already-recorded retirements 2026-07-14→18 | −$0.40 −$0.50 −$0.10 −$0.70 −$0.10 −$0.40 −$0.70 ≈ **−$2.9** | Landed; they are why the live alarm spend is likely well under the recorded ~$2.7. |
+
+**Which combinations reach < ₹1,000 (at the honest ~176-hr basis, all-in ~₹1,473):**
+
+- Lever 1 alone: ~₹1,348 — **does NOT meet the target.**
+- Lever 1 + full Lever 3 + 4a + 4b: 1,348 − 271 − 28 − 18 = **~₹1,031 — still misses** (and full Lever 3 is partly already spent by prior retirements).
+- **Lever 1 + Lever 2 (EIP release): 1,348 − 361 = ~₹987 ✓** — meets the target while KEEPING all alarms + SMS.
+- **Lever 1 + full Lever 3 + 4a + 4b + Lever 5 (20 GB recreate): 1,031 − 92 = ~₹939 ✓** — meets the target WITHOUT touching the EIP.
+- At the 270-hr ceiling basis even Lever 1+2 misses (~₹1,199); every lever combined lands ~₹790 — but 270 hrs is the operator-set ceiling, not the auto-schedule actual; re-basing the recorded bill to ~176 hrs would itself need a §7 dated note.
+
+**NO FALSE-OK — stated plainly:** the base bill (₹1,077 at ~176 hrs) exceeds
+₹1,000 on its own, so **< ₹1,000/month is UNREACHABLE without at least one
+operator-gated lever** (EIP release OR the 20-GB recreate combined with the
+full alarm trim + SMS off). The sanctioned Lever 1 (snapshot deletion after
+2026-07-22) is necessary in every combination but sufficient in none.
+Operator decision list: (i) EIP release yes/no; (ii) which Lever-3 alarm
+groups to retire; (iii) SMS off yes/no; (iv) 20 GB recreate go/no-go.
+
+**Live Cost Explorer:** NOT consulted — the sandbox has no valid AWS
+credentials (verified 2026-07-18: `UnrecognizedClientException`); the live
+per-service split is the operator's daily budget digest / Cost Explorer
+console. All ₹ figures above are the recorded list-rate arithmetic.
+
+### OPERATOR RULING 2026-07-19 (SECOND, same day) — EIP release APPROVED for the no-real-orders period (verify-first, bundled with the recreate)
+
+**The verbatim operator demand (2026-07-19 — preserve EXACTLY, typos included):**
+
+> "until or unless we flip the real orders static ip is not needed due okay?"
+
+**Meaning:** the Elastic IP is NOT needed until real orders flip on — its
+release is APPROVED for the no-real-orders period, with the operator's
+explicit safety order: **VERIFY outbound-without-EIP FIRST, release SECOND.**
+This is the dated quote the Lever-2 row's old status ("requires its own dated
+quote editing §7 first") demanded — daily-universe §7 carries the twin note
+(Quote 10) in the same PR.
+
+**Live verification verdict (live describe evidence, coordinator session,
+2026-07-19 — supersedes tree-side prediction):**
+
+| Fact | Evidence |
+|---|---|
+| Subnet IS auto-assign | `subnet-00c8d06903d1482ea` has `MapPublicIpOnLaunch=true` + explicit `0.0.0.0/0 → igw-00469f8a48d456a9c` route (genuinely public, no NAT) — matches `main.tf` lines 74–106 |
+| BUT the LIVE ENI cannot use it | ephemeral-public-IP assignment is a LAUNCH-TIME ENI attribute; `eni-01fdeec2412f55587` (eth0 of `i-0b956d0209231a48b`, launched 2026-05-24 BEFORE the subnet flag landed ~2026-05-29) will NOT get a fresh ephemeral IP after EIP release, on stop/start or otherwise — AWS cannot enable the attribute post-launch |
+| Current public IP | the EIP itself: `13.234.145.177` (`eipalloc-01d43d4debab9217b`, the account's ONLY EIP) |
+| Verdict | **EIP release is NOT safe standalone** — releasing today bricks the box (no public IPv4 → no SSM, no REST pulls, no deploys). The 2026-05-31 `variables.tf` observation + daily-universe §7's "no public IP after stop/modify/start" claim are CONFIRMED live. |
+
+**The sanctioned path (honors the verify-first order):** BUNDLE the release
+with the erase-window instance RECREATE (Lever 5) — a fresh launch inherits
+the subnet's auto-assign and gets an ephemeral public IP every start; only
+the Dhan ORDER whitelist needs IP stability, and that is not needed until
+live trading (the boot IP-verification code retired with the Dhan lane,
+PR-C2 2026-07-13 — `ip_verifier` has zero production callers, Verified by
+source scan 2026-07-19, so the app boots cleanly on an ephemeral IP with NO
+code change). Full step-by-step: **`docs/runbooks/eip-release.md`**
+(recreate → prove the fresh ENI mints an ephemeral IP → merge the
+`enable_eip=false` terraform PR, whose path-filtered auto-apply lane
+`.github/workflows/terraform-apply.yml` — plan on PR, apply on main push
+outside market hours with 3 post-close cron retries — IS the release
+mechanism; then `EC2_INSTANCE_ID` secret rotation + post-release checks +
+the live-trading re-enable protocol: new EIP + Dhan setIP ≥7 days before
+go-live).
+
+**Bill recompute with the bundle sanctioned (all at the honest ~176-hr
+all-in ~₹1,473 basis unless noted):**
+
+- **Interim (now → the erase window; no EIP change yet):** Lever 1
+  (−₹125) + Lever-3 trims (up to −₹271) + SMS off (−₹28) →
+  1,473 − 125 − 271 − 28 = **~₹1,049** (full-trim floor; conservative
+  trims that keep the REST-audit + order-side pagers land higher). Still
+  over ₹1,000 — the interim does NOT meet the target; the window does.
+- **Post-window (bundled L2 + L5 land):** 1,049 − 361 − 92 = **~₹596**
+  (full trims) / 1,473 − 125 − 150 − 28 − 361 − 92 = **~₹717**
+  (conservative trims, dead-group-only) — the **~₹600–720/mo class**,
+  comfortably under the ₹1,000 target either way.
+- **Even at the 270-hr ceiling basis (all-in ~₹1,685):** post-window
+  1,685 − 125 − 271 − 28 − 361 − 92 = **~₹808** (full trims) /
+  **~₹929** (conservative) — the target is met at BOTH bases once the
+  bundle lands. The bundle therefore RESOLVES the "UNREACHABLE without at
+  least one operator-gated lever" verdict above: the gated lever pair
+  (L2+L5) is now approved and scheduled, pending only the erase-window
+  execution + its in-window verification steps.
+- The earlier "L1+L2 = ~₹987" line above assumed a standalone EIP release —
+  superseded: L2 cannot land standalone (verified-unsafe); every
+  target-meeting combination now routes through the bundle.
+
+### Budget-alarm ceiling stepped down $55 → $25 (this PR) with a ratchet ladder to $10
+
+The `budget.tf` `limit_amount` is a **KILL line**, not a mere alarm: 90%/100%
+ACTUAL auto-STOP the box (native Budget Actions + the killswitch Lambda, which
+also disables the morning start cron). Target arithmetic: ₹1,000 incl GST ÷
+1.18 = ₹847 pre-GST ÷ ₹85/$ ≈ **$10/mo** — the eventual ceiling. But July 2026
+is a MIXED month (r8g.large until the 2026-07-15 downsize): projected July
+EOM ≈ $19–20 pre-GST (Assumed: ~88 r8g auto-hrs ≈ $7.3 + t4g remainder ≈ $1.5
++ EIP $3.60 + EBS $2.74 + alarms ≤$2.7 + S3/SMS $0.46 + snapshot ≈ $1.1), so
+$10/$13/$18 NOW would cross the 90% kill line mid-July and stop the box.
+Stepped value set in this PR: **$25** (90% line $22.5 stays above the ~$19–20
+July projection; a 2.2× cut from $55). Dated ratchet ladder (each step = its
+own PR editing `budget.tf limit_amount` + `budget-guards.tf BUDGET_KILL_USD`
++ `crates/aws-lambdas/src/budget_digest.rs BUDGET_USD` in lockstep, with a
+dated cost note here):
+
+- **$25 (2026-07-19, this PR)** — safe through the July mixed month.
+- **→ $18** from the first full t4g.medium month (Aug 2026) — covers the
+  270-hr all-in worst case (~$15.6 post-snapshot-deletion) with headroom.
+- **→ $13** once Lever 1 + the chosen Lever-3 trims land (~₹1,300-class actual).
+- **→ $10** once an operator-gated lever (EIP release, or recreate + trims)
+  brings the actual bill under ₹1,000 (the ruling's line).
+
+Residual (honest): `hard_stop_guard.rs` keeps `DEFAULT_BUDGET_KILL_USD = 55.0`
+as its env-missing FALLBACK only — terraform always injects
+`BUDGET_KILL_USD = "25"`, so the runtime kill line is $25; aligning the
+fallback constant is a flagged follow-up (fail direction: a missing env var
+kills later, never earlier).
 > **Authority:** Parthiban (architect). Non-negotiable.
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
+
+## COST NOTE 2026-07-17 — dashboard tidy (−~$0.70/mo + 1 free-tier dashboard slot)
+
+The dashboard-tidy PR (cleanup wave, Track B) retired the dead Dhan-lag
+observability chain and the scoreboard dashboard (Verified against the
+terraform diff in this PR; billing magnitudes Assumed at CloudWatch list
+rates — active-series-hours were already $0-decaying since the producers
+died with the live-WS retirements):
+
+- **−1 alarm ≈ −$0.10/mo (Verified):** dhan-exchange-lag-p99-high
+  (silent-feed-alarms.tf S3) — its only publisher
+  (`run_dhan_lag_publisher`, feed_lag_monitor.rs) lost its spawn site +
+  tick source with the Dhan live-WS lane deletion (PR-C2, 2026-07-13) and
+  is deleted in this PR; a permanently-missing-data dead monitor (the
+  groww-exchange-lag S4 precedent, 2026-07-15). Window-gate ALARM_NAMES
+  trimmed 3 → 2 in lockstep (the same-day stage-3 sweep had already
+  retired boundary-catchup-storm-dhan, 4 → 3).
+- **−2 EMF allowlist series ≈ −$0.60/mo (names Verified; billing
+  Assumed):** tv_dhan_exchange_lag_p99_seconds +
+  tv_dhan_lag_samples_excluded_total (cloudwatch-agent.json +
+  user-data.sh.tftpl, 17 → 15 names — the same-day stage-3 sweep had
+  already removed the 2 dead aggregator names, 19 → 17).
+- **−1 CloudWatch dashboard: ₹0 (Verified):** `tv-<env>-scoreboard`
+  (dashboard.tf) — its Dhan-vs-Groww lag-trend widgets charted only the
+  dead lag gauges; frees dashboard slot #2 of the 3-slot free tier.
+- Dead-widget trim on the KEPT `tv-<env>-operator` dashboard (₹0):
+  WebSocket-health / spill-dropped / DLQ-ticks widgets removed — their
+  metrics have ZERO producers post live-WS retirements; their app-alarms.tf
+  alarms are deliberately NOT touched here (flagged follow-up, dated notes
+  in dashboard.tf).
+
+Net ≈ **−$0.70/mo pre-GST (~−₹70/mo incl. 18% GST at ₹85/$)** — the real
+gain is the freed dashboard slot + ~730 LoC of dead monitoring code.
+
+## COST NOTE 2026-07-18 — tick-conservation retirement (−~$0.10/mo)
+
+The tick-conservation retirement (dead-WS sweep follow-up, this PR) removed
+the `tv-<env>-errcode-tick-conserve-01` log-filter alarm (−1 alarm ≈
+−$0.10/mo, Verified against the terraform diff): its only emit site
+(`crates/app/src/tick_conservation_boot.rs`, the 15:40 IST reconciler's
+Leak arm) was deleted with the audit modules — every audit input died with
+the dead tick chain in the stage-2 sweep (#1631), so the filter could never
+match again (the ws-reinject-01 dead-filter precedent). No
+`tv_tick_conservation_*` metric was ever in the EMF allowlist (grep-verified
+— zero series delta). The `tick_conservation_audit` QuestDB TABLE is
+retained (SEBI 5y). Dated notes in `error-code-alarms.tf` +
+`observability-architecture.md`.
+
+## COST NOTE 2026-07-18 — dead live-WS sweep stage 4 (−~$0.40/mo alarms; −4 EMF series)
+
+The stage-4 dead-producer sweep (this PR) retired the 4 dead-tick alarm
+chains whose emit sites died with the stage-2 tick-chain deletion
+(2026-07-17 — `tick_persistence.rs` ring/spill/DLQ counters + the
+`tick_processor.rs` post-close check); billing magnitudes Assumed at
+CloudWatch list rates (active-series-hours decay to $0 once producers
+stop publishing):
+
+- **−4 alarms ≈ −$0.40/mo (Verified against the terraform diff):**
+  `tv-<env>-spill-dropped`, `tv-<env>-dlq-ticks`, `tv-<env>-ticks-dropped`,
+  `tv-<env>-late-tick-after-boundary` (app-alarms.tf; all ungated —
+  no window-gate edit).
+- **−4 EMF selector names ≈ −$1.20/mo at full density (Assumed; already
+  $0 in practice — the producers stopped 2026-07-17):**
+  `tv_spill_dropped_total`, `tv_dlq_ticks_total`, `tv_ticks_dropped_total`,
+  `tv_late_tick_after_boundary_total` removed from both selector copies
+  (cloudwatch-agent.json + user-data.sh.tftpl).
+
+The seal-side loss pagers (seal-drop-alarm.tf + the AGGREGATOR-DROP-01
+errcode alarm) are UNTOUCHED.
+
+## COST NOTE 2026-07-17 — dead live-WS sweep stage 3 (−~$0.70/mo)
+
+The stage-3 sweep (this PR) deleted the publisher-less 21-TF TICK aggregator
+and its main.rs driver tasks — both live feeds are retired, so no tick
+publisher exists and the aggregator's metrics lost their last possible
+writers. Retired in lockstep (dated notes in `silent-feed-alarms.tf` S2 +
+`app-alarms.tf` header + `market-hours-liveness-alarm.tf` +
+`dashboard.tf`; billing magnitudes Assumed at CloudWatch list rates —
+active-series-hours decay to $0 once producers stop publishing):
+
+- **−1 alarm ≈ −$0.10/mo (Verified against the terraform diff):**
+  `boundary_catchup_storm_dhan` (silent-feed-alarms.tf) — its metric
+  `tv_boundary_catchup_total` was written only by the deleted aggregator's
+  watermark catch-up sealer. Its window-gate ALARM_NAMES entry (gate now
+  arms 3 alarms) and its dashboard widget + alarm-strip ARN left in the
+  same PR.
+- **−2 [host,feed] series ≈ −$0.60/mo (Assumed):** the second EMF
+  `metric_declaration` (`^tv_boundary_catchup_total$` under [host,feed])
+  deleted from `cloudwatch-agent.json` + `user-data.sh.tftpl`.
+- **−2 main-list EMF names ≈ $0 marginal (dormant since PR-C2/stage-2):**
+  `tv_aggregator_seals_emitted_total` + `tv_aggregator_close_pct_nonzero_total`
+  removed from the host-only selector (17 names remain) — their emit sites
+  (seal_routing.rs + the main.rs close-pct proof counter) died with the
+  aggregator drivers.
+
+Net ≈ **−$0.70/mo** — the seal-drop pagers (AGGREGATOR-DROP-01 errcode
+alarm + `tv-<env>-seal-writer-dropped`, seal-drop-alarm.tf) are UNTOUCHED:
+their subject, the storage seal-writer chain, survives with
+`rest_candle_fold` as its sole producer.
 
 ## COST NOTE 2026-07-17 — dead live-WS sweep stage 1 (−~$0.10/mo)
 
@@ -148,6 +430,22 @@ effective contract lives in `daily-universe-scope-expansion-2026-05-27.md` §7
 --ebs-size 50` (online) — terraform's `ebs_gp3_size_gb=50` documents
 fresh-provision intent only (`volume_size` is in `lifecycle.ignore_changes`).
 
+**2026-07-19 correction — THIS GROW NEVER PHYSICALLY APPLIED:** live
+`describe-volumes` (2026-07-19, coordinator session) shows the root volume
+still **30 GiB gp3** — the approved `--ebs-size 50` command above was never
+actually run against the box, so the +~₹170/mo EBS delta never materialized
+and the pressure-relief backstop this note approved is **NOT in place**.
+LOUD FLAGGED FOLLOW-UP: the 2026-07-13 disk-pressure class (root fs 82%,
+~2.5–3.6 GB/trading-day growth) may recur on the 30 GB root — executing the
+approved grow (or formally accepting 30 GB now that the Dhan WS lane +
+Groww live feed retired and reduced the write load) is an operator/infra
+decision, deliberately NOT taken in the 2026-07-19 docs-only correction PR.
+**RESOLVED 2026-07-19 (same day, OPERATOR RULING above): 30 GB formally
+ACCEPTED — this grow is CANCELLED** ("just 30 gn enough…"); any future grow
+needs a fresh dated quote.
+See the header banner correction + `daily-universe-scope-expansion-2026-05-27.md`
+§7 for the corrected bill (~₹1,289/mo interim).
+
 ## COST NOTE 2026-07-14 — Order-side observability, cluster C (+~$0.60/mo now, ~$1.20/mo ceiling at Phase-1)
 
 Order-side audit tables + alert-sink wiring + alarms (order_audit/pnl_audit rebuild, OMS→Telegram
@@ -172,186 +470,4 @@ bridge, orders-placed storm pager, arm-on-arrival fill-lag/daily-loss alarms), p
 Total **≈ $0.60/mo pre-GST now (~₹51/mo incl. 18% GST at ₹85/$), ≈ $1.20/mo at Phase-1** —
 inside the $35/mo pre-GST budget alarm ceiling and the ~₹3,101/mo envelope.
 
-## OPERATOR DECISION 2026-05-20 — Observability stack → CloudWatch-only
-
-> **Operator (Parthiban), 2026-05-20:** "except questdb app and cloud
-> watch we planned to remove everything."
-
-The runtime is being narrowed to **THREE components only**:
-
-| Keep | Role |
-|---|---|
-| **QuestDB** | the single data plane — 24-table KEEP set |
-| **tickvault app** | the host process |
-| **AWS CloudWatch** | the entire observability layer — metrics, logs, alarms |
-
-**REMOVED:** Grafana, Prometheus, Alertmanager, **Valkey**. The frontend / portal /
-TradingView terminal and Jaeger / Loki / Alloy / Traefik were already removed in earlier PRs.
-
-**Execution is staged, NOT done here.** This is a multi-PR program —
-see `.claude/plans/active-plan-observability-cloudwatch-only.md`.
-**Valkey is load-bearing** (dual-instance lock + token cache); its
-removal is the highest-risk PR and must not be half-shipped.
-
-## OPERATOR DECISION 2026-05-18 — Instance LOCKED to t4g.medium
-
-> See `docs/architecture/aws-indices-only-locked-architecture.md` §5
-> "The instance — t4g.medium LOCKED 2026-05-18 (FINAL, NO COMPARISONS)".
-
-**Why it shrank from c7i.xlarge → t4g.medium:**
-
-- Universe narrowed to 4 IDX_I SIDs (`LOCKED_UNIVERSE` — NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21)
-- Rescue ring trimmed 5M → 100K ticks (~980 MB freed)
-- Depth-20 / depth-200 / Phase 2 / movers / greeks pipelines all deleted (PRs #2-#6b)
-- App working set dropped to ~280-700 MB; total host need ~2 GB
-
-## Authoritative Bill — t4g.medium, every day 08:00–17:00 IST
-
-| Line | Spec | Unit Price | Monthly ₹ |
-|---|---|---|---|
-| EC2 t4g.medium | ARM Graviton 2 vCPU, 4 GiB, on-demand, 9hr × 30 days | $0.0224/hr | ₹514 |
-| EIP (24/7) | 1 static IP — Dhan static-IP mandate | $0.005/hr × 720h | ₹306 |
-| EBS gp3 | 10 GB (tight — 4-SID dataset is small) | $0.0912/GB-mo | ₹78 |
-| S3 cold | Tiny dataset (4 SIDs) — Intelligent-Tier → Glacier auto | $0.025→$0.002/GB-mo | ₹15 |
-| CloudWatch | 10 custom metrics + 5GB logs (free tier) + 18 alarms (13 app + 5 infra; first 10 free, 8 over @ $0.10) | ~$0.80 | ₹68 |
-| SNS SMS | ~100 India SMS/mo | $0.00278/msg | ₹24 |
-| SNS Email / HTTPS / Lambda | free tier | $0 | ₹0 |
-| Data transfer | ~10 GB outbound | ~$0.01/GB | ₹85 |
-| **TOTAL** | | | **~₹1,022/mo** |
-
-**Honest envelope:** ₹1,022 is ~₹22 over the <₹1,000 target. Operator locked Option A — accept ₹22 overage for 7-day weekend availability (BRUTEX work).
-
-**Pricing correction (kept for record):** Mumbai t4g.medium = $0.0224/hr per the operator's AWS console screenshot. An earlier research agent quoted $0.0392/hr (43% high) — that error would have pushed the bill to ~₹1,400/mo.
-
-## Instance Schedule (LOCKED)
-
-- **Start:** 08:00 IST every day Mon–Sun (EventBridge cron `cron(30 2 * * ? *)`)
-- **Stop:** 17:00 IST every day Mon–Sun (EventBridge cron `cron(30 11 * * ? *)`)
-- **Manual:** start/stop anytime via `aws ec2 start-instances` / Console
-- **EIP:** stays associated 24/7 — Dhan static IP has 7-day cooldown on modify; never release
-- **Cost per running hour:** **₹1.90** ($0.0224 × ₹85)
-- **Cost per stopped hour (EBS + EIP only):** **₹0.51**
-
-## Mechanical Rules
-
-1. **Instance type is t4g.medium. PERIOD.** Going larger requires:
-   - Operator explicit approval with dated quote
-   - Update to `docs/architecture/aws-indices-only-locked-architecture.md` §5
-   - Update to this file
-   - Ratchet test pinning the new spec
-2. **EBS stays at 10 GB.** 4-SID dataset is tiny. If it grows, partition manager → S3 cold tier; do NOT enlarge the volume.
-3. **NEVER add paid AWS services** (RDS, ElastiCache, NAT Gateway, ALB, etc.) without budget review.
-4. **CloudWatch is MANDATORY and always enabled** — within free tier (10 metrics + 10 alarms + 5GB logs).
-5. **S3 lifecycle: auto-tier** Standard → Intelligent-Tiering @ 90d → Glacier Deep Archive @ 365d. SEBI 5y retention at ₹0.17/GB/mo.
-6. **Host memory budget for t4g.medium (4 GiB total) — POST CloudWatch-only migration:**
-   - QuestDB: ~1.5 GB (write-mostly, 4 SIDs, 80% lower write pressure post Wave-6)
-   - Tickvault app: ~700 MB actual / 1.5 GB cap (today + yesterday sealed bars + indicator state + 100K rescue ring)
-   - OS + FS cache: ~400 MB (tracing log writes, audit flush bursts, kernel TCP buffers)
-   - **Total used: ~2.6 GB**
-   - **Headroom: ~1.4 GB** — above the 1 GB Linux kswapd floor
-7. **Pre-migration (Valkey/Prom/Alertmanager still running) is OVER-BUDGET on t4g.medium 4 GiB.** The CloudWatch-only migration plan must complete BEFORE the prod instance flips to t4g.medium. Until then, dev runs locally on Mac and prod stays unprovisioned.
-8. **NO manual configuration on AWS deployment** — every setting (memory, schedule, alarms, audits) lives in version-controlled config files. `git clone` + `docker compose up -d` reproduces the runtime identically on Mac dev and AWS prod.
-9. **RAM-first hot path (mandatory):** tick → strategy decision must read indicator state, today's sealed bars, yesterday's sealed bars, and prev_day_OI cache from RAM only. QuestDB is for: persistence, audit, cross-verify (cold path), boot rehydration. Banned-pattern guard blocks any indicator/strategy code path that issues SELECT against QuestDB during market hours.
-10. **Alerting:** CloudWatch alarm → SNS → 4-channel fan-out (SMS + Telegram via Lambda webhook + Email + Connect outbound call). Standard pattern documented in `aws-indices-only-locked-architecture.md` §6.
-
-## What This Prevents
-
-- Accidentally provisioning anything other than t4g.medium (next step up t4g.large = ~₹1,262/mo, +₹240)
-- EBS growing unbounded (10 GB → 100 GB = ₹702/mo extra; 4-SID workload doesn't need it)
-- Adding CloudWatch beyond free tier (₹0.67/GB log ingestion adds up fast)
-- Forgetting Elastic IP charges when instance is stopped (₹306/mo regardless of running state)
-- Adding managed services that balloon the bill
-- OOM killer striking under burst load (1+ GB headroom prevents this on 4 GiB)
-- DB-dependent hot-path latency (RAM-first rule prevents this)
-
-## Risks Accepted (t4g.medium lock)
-
-| Risk | Mitigation |
-|---|---|
-| 4 GiB RAM has ~1.4 GB headroom after slimmed stack | CloudWatch `MemoryUtilization` alarm at 75%; ample for ~2.6 GB working set |
-| Burstable CPU could exhaust under 09:15:30 IST bursts | Audit: 4 SIDs at ~20 ticks/sec = trivial. Baseline 40% × 2 vCPU = 0.8 vCPU effective; cumulative CPU credits handle any spike. |
-| Single-AZ — InsufficientInstanceCapacity | Manual fallback to alternate AZ per `aws-capacity-error.md`. 99.99% region SLA ≈ 4.3 min/mo expected downtime. |
-| ap-south-1 region outage | Accept envelope. Documented as honest-envelope limit. |
-| Future BRUTEX strategy load growth >10× | t4g.medium still fits; t4g.large is the rip-cord (~₹1,262/mo) |
-
-## RAM-First Architecture (mandatory)
-
-### Hot Path (RAM ONLY — no DB hits)
-
-| Operation | Source |
-|---|---|
-| Tick → indicator update | RAM (live aggregator + today/yesterday sealed bars + running state) |
-| Indicator → strategy decision | RAM (everything resident) |
-| Strategy decision → order construction | RAM (token, instrument cache) |
-| Risk check (margin, exposure) | RAM (OMS state, prev_day_OI cache) |
-| Order out → wire | RAM → TLS → Dhan |
-
-### Cold Path (DB allowed)
-
-| Operation | DB allowed |
-|---|---|
-| Tick persistence | ✅ async ILP write |
-| Candle seal flush | ✅ async ILP write |
-| Audit trail INSERT | ✅ async ILP write |
-| Boot rehydration (one-time) | ✅ SELECT today's bars |
-| Post-market cross-verify | ✅ SELECT all 1m bars |
-| Operator query (manual debugging) | ✅ QuestDB Web Console |
-
-### Banned Pattern (CI-enforced)
-
-```
-banned-pattern-scanner.sh blocks:
-- SELECT inside crates/trading/src/strategy/*
-- SELECT inside crates/trading/src/indicator/*
-- SELECT inside crates/core/src/pipeline/tick_processor.rs
-- SELECT inside crates/trading/src/oms/risk_check.rs
-- Any code path between WS read and order out that hits QuestDB
-```
-
-## 100% Coverage Verification (POST CloudWatch-only migration)
-
-| Need | Tool | Status |
-|---|---|---|
-| Tracking | QuestDB audit tables (15+) | ✅ KEEP |
-| Logging | tracing → CloudWatch Logs (`/tickvault/prod/app`, 14d retention) | ✅ migrate from local errors.jsonl |
-| Monitoring | CloudWatch custom metrics (10 free tier) | ✅ replaces Prometheus |
-| Alerting | CloudWatch alarms → SNS → 4-channel fan-out | ✅ replaces Alertmanager |
-| Auditing | QuestDB audit tables + S3 cold archive | ✅ KEEP |
-| Capturing | QuestDB ticks + candles | ✅ KEEP |
-| Visualizing | QuestDB Web Console (Grafana retired) | ⚠ scoped — operator-only, not 24/7 |
-| Dashboards | CloudWatch Dashboards (3 free tier) | ✅ replaces Grafana operator-health page |
-| Distributed tracing | CloudWatch X-Ray (optional, free tier 100K traces/mo) | ⚠ optional |
-| Zero tick loss envelope | 100K rescue ring + spill + DLQ | ✅ 60s+ absorbed at 4-SID rates |
-| RAM-first hot path | today + yesterday sealed bars in RAM | ✅ enforced by banned-pattern |
-
-## Common Runtime / Dynamic / Scalable / Automated Charter
-
-Operator demand 2026-05-10: "extremely common runtime dynamic scalable approach,
-fully comprehensively automated, logged, tracked, captured, visualized, alerted,
-notified on Telegram, no manual inputs."
-
-| Demand | Mechanical enforcement |
-|---|---|
-| Common runtime | Same `docker-compose.yml` Mac dev = AWS prod (rule 8) |
-| Dynamic | EventBridge auto-start/stop, dynamic SLO score 10s |
-| Scalable | Bounded mpsc + spill ring + DLQ; QuestDB partition manager prunes old data automatically; t4g.large is the rip-cord for >10× growth |
-| Automated logging | tracing macros mandatory; ERROR routes to CloudWatch Logs; hourly local errors.jsonl + 48h retention sweep (transitional) |
-| Automated tracking | 15+ audit tables auto-INSERT on every typed event with DEDUP UPSERT KEYS |
-| Automated capturing | every tick auto-persists to QuestDB; spill NDJSON catches overflow; auto-replays on rehydration |
-| Automated visualizing | CloudWatch Dashboards auto-provisioned via Terraform / aws CLI |
-| Automated alerting | CloudWatch alarms evaluate every 30s; SNS auto-routes by severity to 4 channels |
-| Automated notifications | SNS → Lambda → Telegram webhook; `Severity::High`/`Critical` auto-page operator |
-| No manual inputs | Boot sequence fully automatic: bootstrap.sh pulls SSM → docker compose up → app self-tests via `make doctor` → 3-tier fallback (cache → SSM → TOTP) |
-| RAM-first hot path | banned-pattern guard blocks DB queries from indicator/strategy/risk paths |
-
-## Trigger
-
-This rule activates when editing files matching:
-- `deploy/docker/docker-compose.yml`
-- `deploy/aws/*`
-- `scripts/aws-*`
-- `crates/app/src/infra.rs`
-- `crates/common/src/constants.rs` (`TICK_BUFFER_CAPACITY`)
-- `crates/trading/src/indicator/*` (RAM-first guard)
-- `crates/trading/src/strategy/*` (RAM-first guard)
-- Any file containing `t4g.medium`, `t4g`, `c7i`, `c8g`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`, `TICK_BUFFER_CAPACITY`
+> **[ARCHIVED 2026-07-20]** 2026-05-18/2026-05-20 historical body (CloudWatch-only decision, t4g.medium lock narrative, ₹1,022 bill, schedule, mechanical rules, risks, RAM-first architecture, coverage table, automation charter — retained as 2026-05-18 historical audit per the top banner; current contract = daily-universe-scope-expansion §7 + the 2026-07-19 rulings above) — moved verbatim to `docs/rules-archive/aws-budget-archive.md` (context-size incident; content unchanged).

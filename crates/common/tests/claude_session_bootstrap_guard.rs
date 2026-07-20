@@ -161,68 +161,107 @@ fn session_env_is_gitignored() {
     );
 }
 
+// 2026-07-18 (rust-only phase 2c, CUTOVER DONE): server.py +
+// test_placeholder_fallback.py are DELETED from git. The PR #288
+// `${TICKVAULT_LOGS_DIR}` literal-passthrough class now binds the RUST
+// binary that .mcp.json actually launches; the pins below replace the
+// python pins with their post-cutover truth WITHOUT weakening:
+//  - the .mcp.json tickvault-logs entry launches the placeholder-aware
+//    Rust server (never python),
+//  - the placeholder-fallback behavior twins (test_placeholder_fallback.py
+//    ports) live in crates/tickvault-logs-mcp/src/config.rs tests,
+//  - validate-automation runs those twins on every audit.
 #[test]
-fn mcp_server_has_placeholder_aware_env_resolution() {
-    // PR #288 review finding: Claude Code's MCP launcher passes literal
-    // `${TICKVAULT_LOGS_DIR}` strings when the shell env var is missing.
-    // The server must treat those as unset and fall through to the TOML.
-    let src = read("scripts/mcp-servers/tickvault-logs/server.py");
+fn mcp_json_launches_placeholder_aware_rust_server() {
+    let src = read(".mcp.json");
     assert!(
-        src.contains("_is_resolved"),
-        "server.py must define _is_resolved() helper that rejects ${{...}} \
-         placeholder strings — otherwise MCP log tools return ${{...}}/file \
-         not found on every fresh Claude session"
+        src.contains("scripts/mcp-servers/tickvault-logs-launch.sh"),
+        ".mcp.json tickvault-logs entry must launch the Rust server via the \
+         launcher (phase 2c cutover)"
     );
     assert!(
-        src.contains("startswith(\"${\")"),
-        "_is_resolved() must explicitly check for the `${{` placeholder prefix"
+        !src.contains("server.py"),
+        ".mcp.json launches the retired python server — the PR #288 \
+         placeholder-resolution guarantees are pinned on the Rust side only"
     );
-    // Every TICKVAULT_ env accessor must go through _is_resolved, not a
-    // bare truthy check.
-    for accessor in [
-        "_active_profile",
-        "_endpoint_url",
-        "_logs_dir",
-        "_logs_source",
-    ] {
-        let pos = src
-            .find(&format!("def {accessor}"))
-            .unwrap_or_else(|| panic!("server.py missing {accessor}"));
-        let body_end = src[pos..]
-            .find("\n\n\n")
-            .map(|n| pos + n)
-            .unwrap_or(src.len());
-        let body = &src[pos..body_end];
-        assert!(
-            body.contains("_is_resolved"),
-            "{accessor} must use _is_resolved() gatekeeper — raw env truthy \
-             check lets ${{...}} placeholders through"
-        );
-    }
 }
 
 #[test]
-fn mcp_server_placeholder_fallback_test_exists() {
-    let p = repo_root().join("scripts/mcp-servers/tickvault-logs/test_placeholder_fallback.py");
-    assert!(p.exists(), "placeholder fallback test missing");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&p).unwrap().permissions().mode();
-        assert!(
-            mode & 0o111 != 0,
-            "placeholder fallback test must be executable (mode={mode:o})"
-        );
-    }
+fn rust_config_carries_placeholder_fallback_twin_tests() {
+    // Post-cutover replacement of the `test_placeholder_fallback.py
+    // exists + executable` pin: the behavior twins are Rust unit tests in
+    // config.rs (every Python assert has a twin there).
+    let src = read("crates/tickvault-logs-mcp/src/config.rs");
+    assert!(
+        src.contains("test_placeholder_fallback.py"),
+        "config.rs must keep the test_placeholder_fallback.py twin marker \
+         (the ported placeholder-fallback test suite)"
+    );
+    assert!(
+        src.contains("is_resolved_rejects_placeholder"),
+        "config.rs lost the is_resolved placeholder-rejection twin test"
+    );
 }
 
 #[test]
-fn validate_automation_runs_placeholder_fallback_test() {
+fn validate_automation_runs_placeholder_fallback_twins() {
     let s = read("scripts/validate-automation.sh");
     assert!(
-        s.contains("test_placeholder_fallback.py"),
-        "validate-automation.sh must run the placeholder fallback test so \
-         every audit catches regressions"
+        s.contains("cargo test -p tickvault-logs-mcp --lib config::"),
+        "validate-automation.sh must run the Rust placeholder-fallback \
+         twins (config.rs tests) so every audit catches regressions"
+    );
+    assert!(
+        !s.contains("test_placeholder_fallback.py"),
+        "validate-automation.sh still invokes the deleted python \
+         placeholder-fallback test"
+    );
+}
+
+// The Rust MCP server carries the SAME placeholder-aware env resolution
+// server.py had — the `${TICKVAULT_LOGS_DIR}` literal-passthrough class
+// (PR #288) applies identically to the Rust binary .mcp.json launches.
+#[test]
+fn rust_mcp_port_has_placeholder_aware_env_resolution() {
+    let src = read("crates/tickvault-logs-mcp/src/config.rs");
+    assert!(
+        src.contains("fn is_resolved"),
+        "config.rs must define is_resolved() rejecting ${{...}} placeholders \
+         (server.py _is_resolved parity)"
+    );
+    assert!(
+        src.contains("starts_with(\"${\")"),
+        "is_resolved() must explicitly check the `${{` placeholder prefix"
+    );
+    // Every env-backed accessor must gate through is_resolved.
+    for accessor in [
+        "fn active_profile",
+        "fn endpoint_url",
+        "fn logs_dir",
+        "fn logs_source",
+    ] {
+        let pos = src
+            .find(accessor)
+            .unwrap_or_else(|| panic!("config.rs missing `{accessor}`"));
+        // Bound the scan to the accessor's local region (next `pub fn` or
+        // 2KB, whichever first) — same spirit as the python body scan.
+        let tail = &src[pos..];
+        let body_end = tail[accessor.len()..]
+            .find("\npub fn ")
+            .map(|n| n + accessor.len())
+            .unwrap_or_else(|| tail.len().min(2048));
+        let body = &tail[..body_end];
+        assert!(
+            body.contains("is_resolved"),
+            "{accessor} must use the is_resolved() gatekeeper — raw env \
+             truthy check lets ${{...}} placeholders through"
+        );
+    }
+    // The placeholder-fallback behaviour twins (test_placeholder_fallback.py
+    // asserts) live as unit tests inside the crate itself.
+    assert!(
+        src.contains("placeholder"),
+        "config.rs should carry the placeholder-fallback unit-test twins"
     );
 }
 

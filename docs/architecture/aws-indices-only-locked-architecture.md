@@ -6,6 +6,10 @@
 >
 > **⚠ §5 RE-SUPERSEDED → t4g.medium 2026-07-15 (operator Quote 8 in [`.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`](../../.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md) §7):** instance DOWNSIZED r8g.large → **t4g.medium** (Graviton2, 2 vCPU / 4 GiB), QuestDB QDB_MEM_LIMIT 4g → 1g. INTERIM bill → ~₹1,471/mo incl GST at 270 hrs with the live 50 GB root (gp3 cannot shrink; drops to ~₹1,197/mo only after the 20 GB fresh-volume recreate — an executor pre-stage, not operator-quoted; ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the post-recreate 20 GB volume, the live-50-GB ~176-hr figure being ~₹1,260). EIP kept. The current effective instance lock lives in that file's §7; the t4g.medium spec table below remains 2026-05-18 historical audit (different universe — its ₹514/₹1,022 figures do not apply to the 2026-07-15 lock).
 >
+> **⚠ §5 LIVE-VOLUME CORRECTION 2026-07-19:** the banner above's "live 50 GB root" premise was WRONG — live `describe-volumes` on `vol-073ccaa417a0f344b` (2026-07-19, coordinator session) returned **30 GiB gp3** (3000 IOPS / 125 MiB/s, in-use, attached to `i-0b956d0209231a48b` since 2026-05-24): the 2026-07-13 approved 30→50 grow was recorded but never physically applied. Corrected interim bill: subtotal $12.85 ($6.05 EC2 + $3.60 EIP + $2.74 EBS@30 + $0.18 S3 + $0.28 SMS) → ₹1,092 → ×1.18 GST = **~₹1,289/mo** at 270 hrs (was stated ~₹1,471; ~176-hr figure ~₹1,077, was ~₹1,260; post-recreate ~₹1,197/~₹986 unchanged). FLAGGED FOLLOW-UP: the disk-pressure grow is UNAPPLIED — operator/infra decision pending. Authority: `daily-universe-scope-expansion-2026-05-27.md` §7 2026-07-19 correction note.
+>
+> **⚠ §5 OPERATOR RULING 2026-07-19 (Quote 9 — same day as the correction above):** verbatim: *"just 30 gn enough and onl yt4g medium as of now espeicall yentirkey it hsodul be kless than 1k per month dude oikay?"* — (a) the **30 GB root is formally ACCEPTED**, the 2026-07-13 30→50 grow **CANCELLED** (resolves the pending decision above); (b) t4g.medium re-affirmed as-of-now; (c) **NEW HARD BUDGET TARGET < ₹1,000/mo incl GST** — the corrected ~₹1,289 (270 hrs) / ~₹1,077 (~176 hrs) bills do NOT meet it; the itemized lever path (no non-operator-gated combination reaches <₹1,000) + the budget kill-ceiling step $55 → $25 (ratchet ladder toward $10) live in `.claude/rules/project/aws-budget.md` "OPERATOR RULING 2026-07-19" + `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 9.
+>
 > **Status:** LOCKED design (no code shipped). Supersedes `aws-cost-floor-analysis.md` §6 choice — operator picked a path none of the canned options offered. This doc captures it.
 > **Authority:** CLAUDE.md > operator-charter-forever.md > this file > `aws-budget.md` (which now needs major revision per these locks).
 > **Created:** 2026-05-18.
@@ -388,7 +392,7 @@ The operator demanded these are NEVER compromised. Checking at 4-SID scope:
 ## §B. Honest 100% claim (mandatory per operator-charter §F)
 
 > "100% inside the tested envelope of the 4-SID indices-only scope on AWS t4g.small ap-south-1:
-> - Zero tick loss bounded by 100,000-tick rescue ring (≥83 minutes of buffer at 20 ticks/sec peak) → NDJSON spill → DLQ NDJSON.
+> - Zero data loss bounded by the 200,000-seal ring (`SEAL_BUFFER_CAPACITY`) → NDJSON spill → DLQ _(2026-07-18: the 100K tick rescue ring was deleted with the dead tick writer, stage-4 sweep — the seal chain is the live absorption tier)_.
 > - WebSocket detect-and-reconnect ≤5s; sleep-until-open post-close; SubscribeRxGuard preserves subscriptions across reconnects.
 > - QuestDB outage absorbed up to ring capacity; CloudWatch alarm fires within 30s of disconnect; operator paged via SMS+Telegram+Email simultaneously.
 > - Hot path O(1) per yata indicator update; bench-gated ≤100ns p99.
@@ -455,7 +459,7 @@ Reading: every dimension of AWS-side operational support must be wired, not aspi
 | Lambda invocation (SNS→Telegram bridge) | Lambda async invocation has **2 automatic retries + on-failure DLQ** |
 | EC2 stop/start API call | CloudTrail records the API call regardless of success/failure |
 | CloudWatch metric publish | Tickvault keeps a local circular buffer; on CW outage, retries on next interval. If sustained, falls back to disk log → CW Logs |
-| Tick from Dhan WS | Operator-charter §F: **bounded zero loss** via rescue ring (100K) → NDJSON spill → DLQ NDJSON |
+| Tick from Dhan WS | Operator-charter §F: **bounded zero loss** via the seal chain — 200K seal ring → NDJSON spill → DLQ _(2026-07-18: the 100K tick rescue ring retired with the dead tick writer; the Dhan live WS itself retired 2026-07-13)_ |
 
 ### §11.3 The "Retrigger" lock — failed alarms re-fire
 
@@ -945,7 +949,7 @@ Each is operator-readable on phone in 5 seconds:
 |---|---|---|
 | "Never disconnect" | SEBI 24h JWT forces reconnect | Invisible reconnect ≤5s |
 | "Never outage" | AWS region 99.99% SLA = 4.3min/mo possible | Telegram + SMS + Call within 60s of detection |
-| "Never miss a tick" | Network packets can drop | 100K-tick rescue ring → NDJSON spill → DLQ catches all |
+| "Never miss a tick" | Network packets can drop | 200K seal ring → NDJSON spill → DLQ _(2026-07-18: tick rescue ring deleted with the dead tick writer; the seal chain is the live tier)_ |
 | "Never fail" | QuestDB is third-party | Absorbs via 3-tier; alarm within 30s |
 | "100% guarantee no hallucination" | Words are not proof | Every claim has a ratchet test that fails build on regression |
 

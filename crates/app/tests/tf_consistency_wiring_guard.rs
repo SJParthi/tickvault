@@ -10,7 +10,7 @@
 //! AtomicBool inside `spawn_tf_consistency_tasks` makes the dual spawn safe).
 //!
 //! Mirrors the codebase's `*_wiring_guard` pattern
-//! (`tick_conservation_wiring_guard.rs`, `spot_1m_rest_wiring_guard.rs`).
+//! (`spot_1m_rest_wiring_guard.rs`).
 //! Reads SOURCE text, so it runs on the default build independent of any
 //! feature flag.
 

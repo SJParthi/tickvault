@@ -182,9 +182,9 @@ test: ## Run all tests
 scoped-check: ## Run tests ONLY for crates touched by current diff (see .claude/rules/project/testing-scope.md)
 	@bash .claude/hooks/scoped-test-runner.sh
 
-lambda-test: ## Run telegram-webhook Lambda unit tests (pure formatters, no AWS creds)
-	@echo "🧪 Running telegram-webhook Lambda unit tests..."
-	python3 -m unittest discover -s deploy/aws/lambda/telegram-webhook -p 'test_*.py' -v
+lambda-test: ## Run the AWS Lambda Rust crate tests (ported python suites; no AWS creds)
+	@echo "🧪 Running tickvault-aws-lambdas tests..."
+	cargo test -p tickvault-aws-lambdas
 	@echo ""
 	@echo "  ✅ Lambda tests passed"
 
@@ -262,7 +262,7 @@ questdb-init: ## Create all QuestDB tables + materialized views (idempotent)
 
 health: ## Check app health endpoint
 	@echo "❤️  Health check:"
-	@curl -s http://localhost:$(APP_PORT)/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "  ⚠️  App not running (http://localhost:$(APP_PORT)/health)"
+	@curl -s http://localhost:$(APP_PORT)/health 2>/dev/null | jq -e . 2>/dev/null || echo "  ⚠️  App not running (http://localhost:$(APP_PORT)/health)"
 
 status: ## Full system status (Docker + App + QuestDB)
 	@echo ""

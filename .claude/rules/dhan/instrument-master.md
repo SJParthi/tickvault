@@ -1,3 +1,16 @@
+---
+paths:
+  - "crates/core/src/instrument/csv_downloader.rs"
+  - "crates/core/src/instrument/csv_parser.rs"
+  - "crates/core/src/instrument/daily_universe.rs"
+  - "crates/core/src/instrument/fno_underlying_extractor.rs"
+  - "crates/core/src/instrument/index_extractor.rs"
+  - "crates/app/src/today_instrument.rs"
+  - "crates/app/src/lifecycle_reconcile_orchestrator.rs"
+  - "crates/app/src/daily_universe_boot.rs"
+  - "crates/storage/src/instrument_lifecycle_persistence.rs"
+---
+
 # Dhan Instrument Master Enforcement
 
 > **Ground truth:** `docs/dhan-ref/09-instrument-master.md`
