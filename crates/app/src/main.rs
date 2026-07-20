@@ -1659,6 +1659,14 @@ async fn main() -> Result<()> {
     // ships false); dry-run executors both lanes — NO REST caller in this
     // PR; the once-per-process AtomicBool inside makes the fast-arm +
     // prefix dual-spawn safe. See `cadence_boot::spawn_cadence_scheduler`.
+    // Order-leg P&L (2026-07-19): shared leg-identity handle + boot consumer.
+    let leg_identity_index = tickvault_app::groww_cadence_executor::new_shared_leg_identity_index();
+    let order_leg_pnl_tx = tickvault_app::order_leg_pnl_boot::spawn_order_leg_pnl_capture(
+        config.order_runtime.enabled,
+        &config.order_leg_pnl,
+        &config.questdb,
+        std::sync::Arc::clone(&leg_identity_index),
+    );
     let _cadence_shutdown = tickvault_app::cadence_boot::spawn_cadence_scheduler(
         &config,
         &trading_calendar,
@@ -1672,6 +1680,7 @@ async fn main() -> Result<()> {
         // u64s the paper book keys on; cross-feeding would double-key
         // instruments invisibly to the first-seen-segment tripwire.
         order_runtime_mark_forwarder,
+        leg_identity_index,
     );
 
     // -----------------------------------------------------------------------
@@ -1863,6 +1872,9 @@ async fn main() -> Result<()> {
             order_update_events_tx: order_update_events_tx.clone(),
             // PR-C2: the stack owns the /health token-block writer.
             health: health_status.clone(),
+            // Order-leg P&L (2026-07-19): sink for the runtime's paper-leg
+            // realized/unrealized events. None = feature OFF.
+            leg_pnl_tx: order_leg_pnl_tx,
         },
     );
 

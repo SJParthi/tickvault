@@ -85,6 +85,10 @@ pub fn spawn_cadence_scheduler(
     // invisibly to the first-seen-segment tripwire). `None` when
     // `[order_runtime]` is disabled.
     groww_mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
+    // Shared leg-identity handle (2026-07-19): the cadence executor publishes
+    // the daily option-leg identity index into this ArcSwap; the order-leg
+    // P&L boot consumer reads it lock-free.
+    leg_identity_index: crate::groww_cadence_executor::SharedLegIdentityIndex,
 ) -> Option<Arc<Notify>> {
     if !config.cadence.enabled {
         info!("cadence: disabled by [cadence] config — nothing spawned");
@@ -119,6 +123,7 @@ pub fn spawn_cadence_scheduler(
         &config.questdb,
         Some(Arc::clone(notifier)),
         groww_mark_forwarder,
+        leg_identity_index,
     ) {
         Ok(exec) => Arc::new(exec),
         Err(err) => {

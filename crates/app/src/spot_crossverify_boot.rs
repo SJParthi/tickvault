@@ -159,6 +159,7 @@ fn in_session(secs: i64) -> bool {
     (SESSION_OPEN_SECS_OF_DAY_IST..SESSION_CLOSE_SECS_OF_DAY_IST).contains(&secs)
 }
 
+#[allow(clippy::too_many_arguments)] // APPROVED: 10 narrow scalar comparison inputs; a params struct adds nothing
 fn cmp_field(
     field: &'static str,
     d_paise: i64,
@@ -422,7 +423,7 @@ pub fn worst_example_lines(findings: &[CellFinding], day_start_nanos: i64) -> Ve
         .iter()
         .filter(|f| f.kind == SpotXverifyCellKind::Diverged)
         .collect();
-    diverged.sort_by(|a, b| b.diff_paise.cmp(&a.diff_paise));
+    diverged.sort_by_key(|b| std::cmp::Reverse(b.diff_paise));
     let mut out: Vec<String> = Vec::new();
     for f in diverged {
         if out.len() >= SPOT_XVERIFY_TOP_DETAIL_MAX {
