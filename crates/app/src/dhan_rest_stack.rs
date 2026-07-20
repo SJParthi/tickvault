@@ -213,6 +213,8 @@ pub struct DhanRestStackParams {
     pub order_update_events_tx: Option<
         tokio::sync::mpsc::Sender<tickvault_common::broker_order_events::OrderUpdateEventRecord>,
     >,
+    /// Order-leg P&L sink threaded from main.rs boot (None = feature OFF).
+    pub leg_pnl_tx: Option<tokio::sync::mpsc::Sender<crate::order_runtime::LegPnlEvent>>,
 }
 
 /// Cadence (seconds) of the /health token-block writer (PR-C2 re-home of
@@ -891,6 +893,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 token_handle: Arc::clone(&token_handle),
                 client_id: client_id.clone(),
                 auth_notify: auth_signal,
+                leg_pnl_tx: params.leg_pnl_tx.clone(),
             });
         info!(
             "Dhan REST-only stack: DRY-RUN order runtime spawned (socket-free — \

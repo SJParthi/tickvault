@@ -2887,6 +2887,25 @@ rules:
       field and the tv_ram_store_* depth gauges per the runbook instead of
       any auto-action.
 
+  # ORDER-PNL-01 = the per-leg option P&L persistence lane degraded
+  # (the stage field names the failing leg; log-sink-only,
+  # DEDUP-idempotent re-appends self-heal once QuestDB recovers). Same
+  # ADDITIVE-forensic class as ORDER-EVT-01 — order-path untouched — so
+  # escalate (not auto_restart): the operator inspects the stage field
+  # per the runbook. Added 2026-07-19.
+  - name: order-pnl-01-leg-pnl-persist-degraded-escalate
+    match:
+      code: ORDER-PNL-01
+    action: escalate
+    runbook_path: docs/error-runbooks/order-leg-pnl-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      ORDER-PNL-01 = per-leg option P&L persistence degraded (stage names
+      the failing leg); log-sink-only, DEDUP-idempotent re-appends
+      self-heal once QuestDB recovers. Escalate so the operator reads the
+      stage field per the runbook instead of any auto-action.
+
   # ORDER-EVT-01 = the full-fidelity order/position push-event capture lane
   # degraded (ensure-DDL / append / flush on the order_update_events or
   # position_update_events tables, a bounded-channel sink_drop at a
