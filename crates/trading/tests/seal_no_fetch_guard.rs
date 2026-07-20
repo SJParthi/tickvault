@@ -67,7 +67,6 @@ fn seal_paths_contain_no_io() {
     // and the seal-time pct stamping stay in-RAM I/O-free.
     scan("src/candles/seal_ring.rs");
     scan("src/candles/live_candle_state.rs");
-    scan("src/candles/pct_stamping.rs");
 }
 
 #[test]

@@ -19,8 +19,8 @@
 /// Per-bucket live candle state (one open bucket of one timeframe).
 ///
 /// The 3 Wave-5 pct fields plus `open_pct` / `open_gap_pct` stay `0.0`
-/// until the seal-time writer stamps them via
-/// [`crate::candles::stamp_seal_pct_fields`].
+/// in the REST-era runtime — the seal-time pct-stamping primitives were
+/// removed with the `PrevDayCache` feeder (dead-code cleanup — BATCH-5).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LiveCandleState {
     /// Bucket-open IST epoch second (aligned to TF boundary).

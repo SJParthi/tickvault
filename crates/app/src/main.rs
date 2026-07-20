@@ -832,74 +832,13 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&subsystem_memory_handles),
         ));
 
-    // L10 (Wave-5 #504d): construct the in-RAM tick ring. Per
-    // `[in_mem.tick_storage].per_instrument_capacity` config (default
-    // 5_000), each new (security_id, segment) key reserves that many
-    // tick slots on first push so steady-state pushes hit the
-    // no-realloc path.
-    let tick_storage = std::sync::Arc::new(tickvault_trading::in_mem::TickStorage::new(
-        config.in_mem.tick_storage.per_instrument_capacity,
-    ));
-
-    // L13 (Wave-5 #504e): construct the prev-day reference cache.
-    // Empty at boot — the bhavcopy + option-chain loaders populate it
-    // before the cascade starts emitting sealed bars (boot-time
-    // loader lands in a follow-up small wiring PR; the data structure
-    // ships here so the seal-stamping path
-    // `CandleEngineMap::on_tick_with_pct` has its lookup target).
-    let prev_day_cache = std::sync::Arc::new(tickvault_trading::in_mem::PrevDayCache::new());
-
-    // L18 / #504a: register the `registry` source closure for the
-    // prev-day cache. The same component label captures both the
-    // instrument registry (legacy) AND prev-day refs since both are
-    // per-instrument metadata frozen for the trading session.
-    {
-        let cache_for_sampler = std::sync::Arc::clone(&prev_day_cache);
-        if let Err(err) = subsystem_memory_sampler.register_source("registry", move || {
-            #[allow(clippy::cast_precision_loss)] // APPROVED: byte count fits f64 mantissa
-            Some(cache_for_sampler.estimated_bytes() as f64)
-        }) {
-            tracing::error!(
-                err,
-                "L18 / #504a: failed to register prev_day_cache memory source — \
-                 component gauge will stay NaN; investigate the subsystem_memory \
-                 sampler state"
-            );
-        }
-    }
-
-    // L18 / #504a contract: register the `tick_storage` source closure
-    // with the subsystem_memory sampler. The sampler runs every 10s and
-    // calls `estimated_bytes()` to update
-    // `tv_subsystem_memory_estimated_bytes{component="tick_storage"}`.
-    {
-        let storage_for_sampler = std::sync::Arc::clone(&tick_storage);
-        if let Err(err) = subsystem_memory_sampler.register_source("tick_storage", move || {
-            // L18: lazy `len() x size_of` — NOT raw RSS. Reports actual
-            // resident bytes (Linux lazy-page allocation excludes
-            // reserved-but-unused Vec capacity).
-            #[allow(clippy::cast_precision_loss)]
-            // APPROVED: byte count fits f64 mantissa for any realistic universe
-            Some(storage_for_sampler.estimated_bytes() as f64)
-        }) {
-            tracing::error!(
-                err,
-                "L18 / #504a: failed to register tick_storage memory source — \
-                 component gauge will stay NaN; investigate the subsystem_memory \
-                 sampler state"
-            );
-        }
-    }
-
-    // L10 reset task: drain the tick ring at IST 09:15 daily so day-N
-    // ticks never bleed into day-(N+1)'s session. Sleep-based, not
-    // poll-based — audit-findings Rule 3 (market-hours-aware tokio task).
-    let _tick_storage_reset_join = {
-        let storage_for_reset = std::sync::Arc::clone(&tick_storage);
-        tokio::spawn(async move {
-            tickvault_trading::in_mem::run_tick_storage_daily_reset(storage_for_reset).await;
-        })
-    };
+    // Dead-code cleanup — BATCH-5 (2026-07-19): the in-RAM `TickStorage`
+    // ring, its `PrevDayCache` (prev-day pct-stamp feeder), their
+    // subsystem_memory source registrations, and the IST 09:15 reset task
+    // were REMOVED. The tick broadcast lost its sole producer with the
+    // live-WS feed retirements (Dhan 2026-07-13, Groww 2026-07-15) — the
+    // ring/consumer/reset never ran, and the REST-era candle fold
+    // (`rest_candle_fold.rs`) is the sole `candles_*` writer.
 
     let _subsystem_memory_sampler_join = std::sync::Arc::clone(&subsystem_memory_sampler).spawn();
 
@@ -1430,7 +1369,7 @@ async fn main() -> Result<()> {
     // Build the PROCESS-shared infra ONCE here: notifier (+ Docker auto-start),
     // health registry, seal-writer (installs the process-wide global_seal_sender),
     // the tick broadcast (the order-update broadcast retired in PR-C3,
-    // 2026-07-14), the obs / tick-storage subscriber tasks (the 21-TF tick
+    // 2026-07-14), the slow-boot observability subscriber task (the 21-TF tick
     // aggregator retired in the stage-3 dead-WS sweep, 2026-07-17), and the
     // axum API server (incl. /api/feeds, so the toggle endpoint exists
     // regardless of feed state). The single `run_process_runloop` below keeps
@@ -1445,7 +1384,6 @@ async fn main() -> Result<()> {
         &config,
         std::sync::Arc::clone(&feed_runtime),
         std::sync::Arc::clone(&feed_health),
-        std::sync::Arc::clone(&tick_storage),
     )
     .await?;
     // 2026-07-05 feed-Telegram parity (operator: "why dhan messages and groww
@@ -2261,8 +2199,8 @@ struct SharedInfraHandles {
     /// Drives `/health` + `/api/feeds/health`. The lane updates it; the API
     /// server reads it.
     health_status: SharedHealthStatus,
-    /// The PROCESS-shared tick broadcast. The 3 subscriber tasks (obs,
-    /// aggregator, tick-storage) are spawned in `build_shared_infra` and have
+    /// The PROCESS-shared tick broadcast. The sole subscriber task
+    /// (slow-boot observability) is spawned in `build_shared_infra` and has
     /// already `.subscribe()`d to this before anything could publish.
     /// PUBLISHER-LESS since PR-C2 (2026-07-14): the lane's
     /// `run_tick_processor` — the only publisher — was deleted with the Dhan
@@ -2287,7 +2225,7 @@ struct SharedInfraHandles {
 /// REST-era candle fold since the stage-3 dead-WS sweep deleted the 21-TF
 /// tick aggregator, 2026-07-17), the tick broadcast channel (the
 /// order-update broadcast retired in PR-C3, 2026-07-14), the
-/// observability + tick-storage subscriber tasks (which `.subscribe()` to the
+/// slow-boot observability subscriber task (which `.subscribe()` to the
 /// tick broadcast BEFORE anything could publish — the
 /// subscribe-before-publish / zero-tick-loss invariant, preserved by
 /// construction), and the axum API server (incl. /api/feeds — so the toggle
@@ -2300,7 +2238,6 @@ async fn build_shared_infra(
     config: &ApplicationConfig,
     feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
-    tick_storage: std::sync::Arc<tickvault_trading::in_mem::TickStorage>,
 ) -> Result<SharedInfraHandles> {
     // --- Notifier (strict) + Docker infra (parallel — independent) ---
     // C1: strict notifier init — the app must refuse to boot in no-op mode.
@@ -2453,10 +2390,12 @@ async fn build_shared_infra(
     // PR-C3 (2026-07-14): the order-update broadcast channel was removed
     // (publisher + subscriber both retired — see the SharedInfraHandles note).
 
-    // --- Subscriber tasks: obs + tick-storage ---
-    // Both `.subscribe()` to `tick_broadcast_sender` HERE, in the hoisted
+    // --- Subscriber task: slow-boot observability ---
+    // It `.subscribe()`s to `tick_broadcast_sender` HERE, in the hoisted
     // prefix, before anything could publish — subscribe-before-publish is
-    // preserved by construction. Stage-3 dead-WS sweep (2026-07-17): the
+    // preserved by construction. (The tick-storage broadcast consumer was
+    // REMOVED in this PR's PrevDayCache/TickStorage cleanup — see the dated
+    // BATCH-5 note after the block below.) Stage-3 dead-WS sweep (2026-07-17): the
     // 21-TF TICK aggregator driver (`spawn_engine_b_aggregator`) is DELETED —
     // the seal-writer above stays, fed exclusively by the REST-era candle
     // fold (FOLD-01) further below.
@@ -2469,21 +2408,10 @@ async fn build_shared_infra(
         });
         info!("slow-boot observability consumer started");
     }
-    {
-        let tick_storage_rx = tick_broadcast_sender.subscribe();
-        let storage_for_consumer = std::sync::Arc::clone(&tick_storage);
-        tokio::spawn(async move {
-            tickvault_trading::in_mem::run_tick_storage_consumer(
-                tick_storage_rx,
-                storage_for_consumer,
-            )
-            .await;
-        });
-        info!(
-            per_instrument_capacity = config.in_mem.tick_storage.per_instrument_capacity,
-            "L10 tick_storage broadcast consumer spawned + IST 09:15 reset task running"
-        );
-    }
+    // Dead-code cleanup — BATCH-5 (2026-07-19): the tick-storage broadcast
+    // consumer was REMOVED (in the PrevDayCache/TickStorage cleanup). The tick
+    // broadcast has zero producers in the REST-era runtime (live-WS feeds
+    // retired), so the consumer never received a tick.
     // (Stage-3 dead-WS sweep 2026-07-17: the 21-TF tick aggregator is
     // DELETED — the seal-writer is fed exclusively by the REST-era candle
     // fold, FOLD-01.)
@@ -2636,7 +2564,10 @@ async fn run_process_runloop(
     // `boot_helpers::should_emit_post_market_alert`.
     trading_calendar: std::sync::Arc<TradingCalendar>,
 ) -> Result<()> {
-    let mode = "LIVE";
+    // Truthfulness rider: the runtime is dry-run/paper only — no real-money
+    // orders are placed. Render "RUNNING (paper)" so the boot Telegram cannot
+    // be mistaken for a live-money mode ("LIVE" read as real trading).
+    let mode = "RUNNING (paper)";
     info!(
         mode,
         api_port = config.api.port,

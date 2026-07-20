@@ -146,10 +146,6 @@ async fn no_panic_stats_unreachable_questdb() {
     let result = stats_body_json(get_stats(State(state)).await).await;
     assert_eq!(result["questdb_reachable"], serde_json::json!(false));
     assert_eq!(result["tables"], serde_json::json!(0));
-    assert_eq!(result["underlyings"], serde_json::json!(0));
-    assert_eq!(result["derivatives"], serde_json::json!(0));
-    assert_eq!(result["subscribed_indices"], serde_json::json!(0));
-    assert_eq!(result["ticks"], serde_json::json!(0));
 }
 
 #[tokio::test]
@@ -177,10 +173,6 @@ fn no_panic_stats_response_serialization_extreme_values() {
     let stats = StatsResponse {
         questdb_reachable: true,
         tables: u64::MAX,
-        underlyings: u64::MAX,
-        derivatives: u64::MAX,
-        subscribed_indices: u64::MAX,
-        ticks: u64::MAX,
     };
     let json = serde_json::to_string(&stats).unwrap();
     assert!(!json.is_empty());

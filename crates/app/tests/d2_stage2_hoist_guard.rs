@@ -1,9 +1,12 @@
 //! D2 Stage 2 — genuine shared-infra hoist guard (source-scan ratchet).
 //!
-//! Stage 2 hoisted the PROCESS-shared blocks (notifier, health, seal-writer,
-//! the tick broadcast, the obs / tick-storage subscriber tasks, the API
-//! server) into a single `build_shared_infra(...)` prefix and deleted the
-//! D2-pre duplicate `run_shared_infra_only`.
+//! Stage 2 hoisted the PROCESS-shared blocks (notifier, health, the
+//! seal-writer `spawn_seal_writer_loop`, the tick broadcast, the surviving
+//! `run_slow_boot_observability` subscriber task, the API server) into a
+//! single `build_shared_infra(...)` prefix and deleted the D2-pre duplicate
+//! `run_shared_infra_only`. (The tick-storage subscriber task was removed in
+//! the BATCH-5 PrevDayCache/TickStorage cleanup — the guard asserts only the
+//! surviving `run_slow_boot_observability` + `spawn_seal_writer_loop`.)
 //!
 //! ## Stage-3 dead-WS sweep (2026-07-17)
 //! The 21-TF TICK aggregator driver (`spawn_engine_b_aggregator`) is
@@ -147,11 +150,11 @@ fn shared_infra_builder_spawns_the_shared_pipeline() {
     // builder, ahead of any future publisher.
     let src = read_main_rs();
     let body = build_shared_infra_body(&src);
-    for needle in [
-        "run_slow_boot_observability",
-        "run_tick_storage_consumer",
-        "spawn_seal_writer_loop",
-    ] {
+    // `run_tick_storage_consumer` assertion RETIRED 2026-07-19 (BATCH-5):
+    // the tick-storage consumer was deleted in the PrevDayCache/TickStorage
+    // cleanup, so the builder no longer spawns it. The surviving spawns below
+    // still pin the shared candle pipeline + seal-writer for every boot.
+    for needle in ["run_slow_boot_observability", "spawn_seal_writer_loop"] {
         assert!(
             body.contains(needle),
             "build_shared_infra MUST spawn `{needle}` so the shared candle \

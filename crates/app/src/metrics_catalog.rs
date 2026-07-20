@@ -103,17 +103,21 @@ pub const IN_MEM_EVICTIONS_COUNTER_NAME: &str = "tv_in_mem_evictions_total";
 /// SEC-M3 (§AA): names are deliberately coarse so that an attacker
 /// who scrapes `/metrics` cannot derive the precise architecture
 /// (e.g. "papaya tick map at security_id 13" → "rescue_ring",
-/// "tick_storage", "bar_storage", "registry", "runtime",
-/// "binary_static", "papaya_overhead"). Exactly 7 entries.
+/// "bar_storage", "registry", "runtime", "binary_static",
+/// "papaya_overhead"). Exactly 6 entries.
 ///
 /// `f64::NAN` is the boot-time value for every component (L124);
 /// the sampler overwrites only those components whose source
 /// closure has been registered. Components that remain unset stay
 /// NaN and are filtered out by the `unless absent_over_time(...)`
 /// alert clause.
+///
+/// `tick_storage` RETIRED 2026-07-19 (dead-code cleanup — BATCH-5): the
+/// in-RAM `TickStorage` store was removed with the PrevDayCache/TickStorage
+/// sweep, so no source closure ever registered this component — its gauge
+/// stayed permanently NaN (sourceless). Dropped from the allowlist.
 pub const ALLOWED_SUBSYSTEM_COMPONENTS: &[&str] = &[
     "rescue_ring",
-    "tick_storage",
     "bar_storage",
     "registry",
     "runtime",
@@ -233,12 +237,14 @@ mod tests {
     }
 
     #[test]
-    fn allowed_components_has_exactly_seven_coarse_labels() {
-        // L18 + SEC-M3: exactly 7 components, coarse names only.
+    fn allowed_components_has_exactly_six_coarse_labels() {
+        // L18 + SEC-M3: coarse names only. Pinned at 6 since the sourceless
+        // `tick_storage` label was retired 2026-07-19 (BATCH-5) with the
+        // in-RAM TickStorage store.
         assert_eq!(
             ALLOWED_SUBSYSTEM_COMPONENTS.len(),
-            7,
-            "L18 design pins 7 components — adding an 8th requires a \
+            6,
+            "L18 design pins 6 components — adding a 7th requires a \
              plan update plus dashboard / alert / ratchet review."
         );
         let set: HashSet<&&str> = ALLOWED_SUBSYSTEM_COMPONENTS.iter().collect();
@@ -259,7 +265,7 @@ mod tests {
     fn allowed_components_do_not_leak_precise_subsystems() {
         // SEC-M3: even though the value is internal, the names must
         // not name precise modules. `tick_processor`, `papaya_pool`,
-        // etc. would leak architecture; `tick_storage` / `runtime`
+        // etc. would leak architecture; `bar_storage` / `runtime`
         // are coarse enough.
         let banned_substrings = [
             "tick_processor",

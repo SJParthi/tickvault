@@ -314,12 +314,15 @@ function renderStats(stats) {
   const grid = document.createElement("div");
   grid.className = "grid";
   grid.style.marginTop = "10px";
+  // ticks / underlyings / derivatives (contracts) / indices tiles RETIRED
+  // 2026-07-19 (BATCH-5): the `ticks` writer was deleted 2026-07-17 and the
+  // instrument-master tables (fno_underlyings / derivative_contracts /
+  // subscribed_indices) are in the boot-time RETIRED_QUESTDB_TABLES DROP list,
+  // so all four rendered a permanently-0 placeholder (false-OK). Only the live
+  // `tables` (SHOW TABLES) count remains. Live per-feed tick/candle counts are
+  // still shown in the per-feed section above (hv.ticks_total / hv.candles_total).
   const cells = [
     ["tables", stats.tables],
-    ["ticks", stats.ticks],
-    ["underlyings", stats.underlyings],
-    ["derivatives", stats.derivatives],
-    ["indices", stats.subscribed_indices],
   ];
   for (const [lbl, val] of cells) {
     const cell = document.createElement("div");
@@ -440,6 +443,10 @@ mod tests {
         // the page iterates whatever feed rows `/api/feeds/health` returns (no
         // static feed list, so a future 3rd feed appears with zero page edits).
         // We assert the structural section/metric markers instead.
+        // "underlyings" / "derivatives" retired 2026-07-19 (BATCH-5) with the
+        // dead instrument-master stats tiles (their source tables are dropped
+        // at boot). "ticks" / "candles" / "last tick" survive via the live
+        // per-feed section (hv.ticks_total / hv.candles_total).
         for marker in [
             "Feeds",
             "Overall health",
@@ -447,8 +454,6 @@ mod tests {
             "ticks",
             "candles",
             "last tick",
-            "underlyings",
-            "derivatives",
         ] {
             assert!(
                 DASHBOARD_HTML.contains(marker),

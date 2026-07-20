@@ -202,10 +202,10 @@ pub mod infra;
 // previous-day OHLCV REST fetch retired with the Dhan live-WS lane (operator
 // 2026-07-13; prev-day-ohlcv-error-codes.md retirement banner). The
 // `prev_day_ohlcv` QuestDB table is retained (forensic).
-// F2 (Wave-5 #504e follow-up) — boot-time loader for `PrevDayCache`
-// so the cascade seal-time pct-stamping path (PR #520 / F1) sees
-// non-zero `prev_day_close` values from QuestDB's `previous_close`
-// table on cold boot.
+// Dead-code cleanup — BATCH-5 (2026-07-19): the F2 boot-time `PrevDayCache`
+// loader stub is gone — `PrevDayCache` + the seal-time pct-stamping path were
+// removed (their sole feeder retired with the live-WS feeds). The PREVCLOSE-04
+// ErrorCode variant is retained (documented in wave-1-error-codes.md).
 pub mod metrics_catalog;
 // PR-C3 (2026-07-14, operator retirement directive 2026-07-13 — scope-lock
 // amendment §B): the Dhan lifecycle-reconcile + fetch-audit chain is
