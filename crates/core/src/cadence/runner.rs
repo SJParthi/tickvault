@@ -2496,6 +2496,7 @@ fn handle_completion<C, D, G>(
                                 let retry_fire = retry_at.max(now_wall);
                                 if may_retry_in_cycle(
                                     &err,
+                                    true,
                                     cycle.chain_retries_used[underlying_idx],
                                     cfg.in_cycle_retry_max,
                                     retry_fire,
@@ -2650,8 +2651,10 @@ fn handle_completion<C, D, G>(
                         let mut retry_scheduled = false;
                         if lane_feed == Feed::Dhan {
                             let retry_target = cycle.next_spot_retry_target_ms.max(now_wall);
+                            // PHASE-B(native-retry): this literal flips to a cfg-gated value when the native spot ladder lands.
                             if may_retry_in_cycle(
                                 &err,
+                                true,
                                 cycle.spot_retries_used[target_idx],
                                 cfg.in_cycle_retry_max,
                                 retry_target,
