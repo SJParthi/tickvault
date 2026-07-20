@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use chrono::{NaiveDate, TimeZone, Timelike, Utc};
 use tickvault_common::config::CadenceConfig;
-use tickvault_common::constants::{CADENCE_SPOT_WINDOW_MS, IST_UTC_OFFSET_SECONDS};
+use tickvault_common::constants::{
+    CADENCE_NATIVE_DECISION_DEADLINE_MS, CADENCE_SPOT_WINDOW_MS, IST_UTC_OFFSET_SECONDS,
+};
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
@@ -45,6 +47,7 @@ use super::expiry::{
     policy_for, resolve_policy_expiry,
 };
 use super::gate::{DhanGates, GateVerdict};
+use super::history_repull::{HistoryRepullPlan, spawn_history_repull};
 use super::ladder::{
     CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY, DHAN_SHAPE_MAX_STEP, DhanRung0ReentryCap,
     GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder, StreakShift,
@@ -1233,6 +1236,16 @@ pub enum CycleAction {
     GrowwCutoff,
     /// The Dhan lane staleness cutoff.
     DhanCutoff,
+    /// The pinned T+4s native-vs-cross-fill decision deadline (operator
+    /// 2026-07-20 — "retry native until the 4th second, then
+    /// cross-fill"): ONE event covering BOTH lanes. A lane whose OWN
+    /// data completed before this instant already decided natively at
+    /// its completion; a still-incomplete lane gets the fallback rungs
+    /// (cross-fill + chain-embedded) admitted NOW — regardless of
+    /// in-flight retries — with zero added wait. When the donor has
+    /// nothing fresh either, the lane is left untouched and the
+    /// existing retry/cutoff machinery owns it unchanged.
+    NativeDeadline,
 }
 
 /// A completed fetch, delivered over the bounded completion channel.
@@ -1356,6 +1369,34 @@ struct LaneRun {
     /// §3(e) cross-source is the fallback steady state, never an
     /// every-cycle preemption of the lane's own scheduled fires).
     inflight: u32,
+    /// Count of LATE-RETRY dispatches this cycle (operator 2026-07-20):
+    /// Dhan in-cycle retry schedulings + Groww verdict-fallback / L3
+    /// deferred-fallback dispatches. Feeds the resolution token + the
+    /// coalesced wrap-up fields (the #1688 `cross_fill_audit`
+    /// `retry_attempts` vocabulary — the sibling wires the row itself).
+    late_retry_attempts: u32,
+    /// A RETRY attempt on this lane answered 429 — the remaining
+    /// micro-retries were aborted by the spent class budget (coalesced
+    /// CADENCE-05 `retry_rate_limited` at wrap-up).
+    retry_rate_limited: bool,
+    /// The lane's resolution token, set at decide time — the LOCKED
+    /// #1688 `cross_fill_audit` vocabulary: `native_first_try` /
+    /// `native_late_retry` / `cross_fill`. `None` until decided (skips
+    /// carry no resolution).
+    resolution: Option<&'static str>,
+}
+
+/// The #1688 `cross_fill_audit` resolution vocabulary (stable SYMBOL
+/// wire strings), computed at decide time. Pure.
+#[must_use]
+fn resolution_token(cross_filled: bool, late_retry_attempts: u32) -> &'static str {
+    if cross_filled {
+        "cross_fill"
+    } else if late_retry_attempts > 0 {
+        "native_late_retry"
+    } else {
+        "native_first_try"
+    }
 }
 
 impl LaneRun {
@@ -1367,6 +1408,9 @@ impl LaneRun {
             resolved: false,
             flags: DegradeFlags::default(),
             arming_failure: false,
+            late_retry_attempts: 0,
+            retry_rate_limited: false,
+            resolution: None,
             inflight: 0,
         }
     }
@@ -1456,6 +1500,23 @@ pub fn build_cycle_events(
         events.push((slots.groww_verdict_ms, CycleAction::GrowwVerdict));
         events.push((slots.groww_cutoff_ms, CycleAction::GrowwCutoff));
     }
+    if dhan_enabled || groww_enabled {
+        // The T+4s hedged-decision deadline (operator 2026-07-20), one
+        // event for both lanes. Same-instant ordering is deterministic:
+        // the stable sort keeps this event BEFORE any same-ms event
+        // inserted later via `insert_event` (whose partition point is
+        // `<=`), so the T+4.0s chain-retry slot is evaluated AFTER the
+        // deadline — a lane the deadline resolved via cross-fill skips
+        // that retry (the background history re-pull owns its own-row
+        // recovery); a lane the deadline could NOT resolve still fires
+        // it natively.
+        events.push((
+            slots
+                .boundary_ms
+                .saturating_add(CADENCE_NATIVE_DECISION_DEADLINE_MS),
+            CycleAction::NativeDeadline,
+        ));
+    }
     events.sort_by_key(|(ms, _)| *ms);
     events
 }
@@ -1503,6 +1564,7 @@ where
         groww_leg_ok: [false; 7],
         groww_leg_attempts: [0; 7],
         groww_leg_inflight: [false; 7],
+        groww_leg_malformed: [false; 7],
         groww_verdict_passed: false,
         groww_fallback_launched: false,
         late_wake_flagged: false,
@@ -1672,6 +1734,8 @@ where
                     stage = %lane.flags.stages(),
                     lane = lane.asm.feed.as_str(),
                     cycle_minute_ist = lane.asm.cycle_minute_ist,
+                    attempts = lane.late_retry_attempts,
+                    resolution = lane.resolution.unwrap_or("skipped"),
                     "cadence lane degraded under DRY-RUN executors \
                      (expected shape — F10 demotion)"
                 );
@@ -1681,10 +1745,38 @@ where
                     stage = %lane.flags.stages(),
                     lane = lane.asm.feed.as_str(),
                     cycle_minute_ist = lane.asm.cycle_minute_ist,
+                    attempts = lane.late_retry_attempts,
+                    resolution = lane.resolution.unwrap_or("skipped"),
                     "CADENCE-01: cadence lane degraded this cycle (coalesced)"
                 );
             }
         }
+    }
+    // Degraded-leg recovery wrap-up (operator 2026-07-20): coalesced
+    // CADENCE-05 emissions + the detached background history re-pull.
+    // Never under DRY-RUN executors (structurally Empty every cycle —
+    // the F10 noise posture) — real recovery needs real brokers.
+    if !deps.dry_run {
+        emit_recovery_wrapup(&cycle.dhan);
+        emit_recovery_wrapup(&cycle.groww);
+        spawn_repull_for_lane(
+            clock,
+            deps,
+            Some(Arc::clone(gates)),
+            &cycle.dhan,
+            Arc::clone(&deps.dhan_executor),
+            CADENCE_DHAN_REQUEST_TIMEOUT_MS,
+            slots,
+        );
+        spawn_repull_for_lane(
+            clock,
+            deps,
+            None,
+            &cycle.groww,
+            Arc::clone(&deps.groww_executor),
+            deps.config.groww_request_timeout_ms,
+            slots,
+        );
     }
     // Rollover only from a lane that ran (a disabled lane parked Idle via
     // OffSessionOrDisabled — Idle + Rollover is deliberately illegal).
@@ -1725,6 +1817,13 @@ struct CycleState {
     /// still-in-flight leg is SKIPPED by the fallback (await-or-skip;
     /// first-write-wins on completion stays).
     groww_leg_inflight: [bool; 7],
+    /// Per-leg Malformed latch (operator 2026-07-20 retry-eligibility
+    /// set): a Groww leg that answered `Malformed` (2xx schema break) is
+    /// NOT retry-eligible — the verdict fallback and the L3 deferred
+    /// fallback both skip it (a same-second retry re-fetches the same
+    /// broken shape; the Dhan side enforces the same exclusion via
+    /// `late_retry_budget`).
+    groww_leg_malformed: [bool; 7],
     /// The GrowwVerdict instant passed (F4/L3): a leg completing Err on
     /// its 1st attempt after it was skipped in flight has no later
     /// verdict — the L3 DEFERRED fallback (2026-07-15) dispatches its one
@@ -2079,13 +2178,23 @@ fn handle_action<C, D, G>(
             // is terminal on its 1st attempt — see `groww_leg_attempts`).
             // Failures re-fetch sequentially: chains first, then spots;
             // successes never re-fetched.
+            // A Malformed-latched leg is additionally SKIPPED (operator
+            // 2026-07-20 eligibility set — a same-second refetch of a
+            // schema-broken shape cannot succeed; the shape-drift page
+            // owns the diagnosis, cross-fill owns the minute).
             let failed_chains: Vec<usize> = (0..ChainUnderlying::COUNT)
-                .filter(|i| !cycle.groww_leg_ok[*i] && !cycle.groww_leg_inflight[*i])
+                .filter(|i| {
+                    !cycle.groww_leg_ok[*i]
+                        && !cycle.groww_leg_inflight[*i]
+                        && !cycle.groww_leg_malformed[*i]
+                })
                 .collect();
             let failed_spots: Vec<usize> = (0..SpotTarget::ALL.len())
                 .filter(|k| {
                     let leg = k + ChainUnderlying::COUNT;
-                    !cycle.groww_leg_ok[leg] && !cycle.groww_leg_inflight[leg]
+                    !cycle.groww_leg_ok[leg]
+                        && !cycle.groww_leg_inflight[leg]
+                        && !cycle.groww_leg_malformed[leg]
                 })
                 .collect();
             if failed_chains.is_empty() && failed_spots.is_empty() {
@@ -2115,12 +2224,14 @@ fn handle_action<C, D, G>(
                 metrics::counter!("tv_cadence_groww_fallback_total", "leg" => "chain").increment(1);
                 debug!(underlying_idx = i, "cadence: groww chain fallback queued");
                 cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
+                cycle.groww.late_retry_attempts = cycle.groww.late_retry_attempts.saturating_add(1);
                 cycle.groww_leg_inflight[*i] = true;
             }
             for k in &failed_spots {
                 metrics::counter!("tv_cadence_groww_fallback_total", "leg" => "spot").increment(1);
                 debug!(target_idx = k, "cadence: groww spot fallback queued");
                 cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
+                cycle.groww.late_retry_attempts = cycle.groww.late_retry_attempts.saturating_add(1);
                 cycle.groww_leg_inflight[*k + ChainUnderlying::COUNT] = true;
             }
             let exec = Arc::clone(&deps.groww_executor);
@@ -2192,7 +2303,181 @@ fn handle_action<C, D, G>(
             let CycleState { dhan, groww, .. } = cycle;
             finalize_lane_at_cutoff(clock.as_ref(), slots, dhan, groww, latch, deps.dry_run);
         }
+        CycleAction::NativeDeadline => {
+            // The pinned T+4s hedged decision (operator 2026-07-20 —
+            // "retry native until the 4th second, then cross-fill"):
+            // native data that completed a lane before this instant
+            // already decided at its completion (`finalize_if_complete`
+            // on the completion arm — the deadline is then a no-op via
+            // the `resolved` guard inside). A still-incomplete lane gets
+            // the fallback rungs admitted NOW (`own_path_exhausted`
+            // forced true), regardless of in-flight retries — zero added
+            // wait. The determinism pin: the check runs at THIS one
+            // event; a native answer is used iff its completion was
+            // processed before this instant (the biased select drains
+            // queued completions first), otherwise the prepared
+            // cross-fill wins — a tie at the instant resolves to
+            // cross-fill. When the donor lane has nothing fresh the
+            // finalize returns untouched and the existing retry/cutoff
+            // machinery owns the lane unchanged (never a premature
+            // skip).
+            let CycleState { dhan, groww, .. } = cycle;
+            finalize_if_complete(
+                clock.as_ref(),
+                slots,
+                dhan,
+                groww,
+                latch,
+                true,
+                deps.dry_run,
+            );
+            finalize_if_complete(
+                clock.as_ref(),
+                slots,
+                groww,
+                dhan,
+                latch,
+                true,
+                deps.dry_run,
+            );
+        }
     }
+}
+
+/// Count one LATE-RETRY answer's outcome on its lane (operator
+/// 2026-07-20 observability): `native_landed` (the hedge worked) /
+/// `empty_again` (the vendor is still lagging — includes the executor's
+/// wrong-minute `empty_stale` class, which IS the stale-answer guard:
+/// rows for any minute other than the requested one are never accepted)
+/// / `rate_limited` (aborts the remaining micro-retries via the spent
+/// class budget) / `error` (transport-class on the retry).
+fn record_late_retry_outcome(lane: &mut LaneRun, err: Option<&CadenceFetchError>) {
+    let outcome = match err {
+        None => "native_landed",
+        Some(CadenceFetchError::Empty) => "empty_again",
+        Some(CadenceFetchError::RateLimited { .. }) => {
+            lane.retry_rate_limited = true;
+            "rate_limited"
+        }
+        Some(_) => "error",
+    };
+    metrics::counter!(
+        "tv_cadence_late_retry_total",
+        "lane" => lane.asm.feed.as_str(),
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+/// Coalesced per-(lane, cycle) CADENCE-05 recovery wrap-up (operator
+/// 2026-07-20; log-sink-only — the Dhan noise-lock posture): the hedged
+/// retries exhausted without native data (`retry_still_empty` — the
+/// decision already used the prepared cross-fill with zero added wait),
+/// and/or a retry attempt was 429-aborted (`retry_rate_limited`).
+fn emit_recovery_wrapup(lane: &LaneRun) {
+    if !lane.enabled {
+        return;
+    }
+    if lane.resolution == Some("cross_fill") && lane.late_retry_attempts > 0 {
+        metrics::counter!(
+            "tv_cadence_late_retry_total",
+            "lane" => lane.asm.feed.as_str(),
+            "outcome" => "exhausted"
+        )
+        .increment(1);
+        error!(
+            code = ErrorCode::Cadence05RecoveryDegraded.code_str(),
+            stage = "retry_still_empty",
+            lane = lane.asm.feed.as_str(),
+            cycle_minute_ist = lane.asm.cycle_minute_ist,
+            attempts = lane.late_retry_attempts,
+            "CADENCE-05: every bounded late retry stayed empty — the \
+             decision used the prepared cross-fill at the T+4s deadline \
+             (zero added wait; the background re-pull owns the broker's \
+             own-row recovery)"
+        );
+    }
+    if lane.retry_rate_limited {
+        error!(
+            code = ErrorCode::Cadence05RecoveryDegraded.code_str(),
+            stage = "retry_rate_limited",
+            lane = lane.asm.feed.as_str(),
+            cycle_minute_ist = lane.asm.cycle_minute_ist,
+            "CADENCE-05: a late-retry attempt answered 429 — the \
+             remaining micro-retries were aborted (spent class budget; \
+             never a storm)"
+        );
+    }
+}
+
+/// Spawn the background history re-pull for a lane whose minute RESOLVED
+/// via cross-fill (operator 2026-07-20 — "backfill never feeds live
+/// decisions"): the plan is PLAIN DATA (which legs are CrossSource +
+/// spawn-time-resolved expiries); the detached task holds only the
+/// executor + the gates — the `history_repull` isolation ratchet
+/// guarantees it can never touch assembly/decision/ladder state.
+fn spawn_repull_for_lane<C, D, G, E>(
+    clock: &Arc<C>,
+    deps: &CadenceRunnerDeps<D, G>,
+    gates: Option<Arc<DhanGates>>,
+    lane: &LaneRun,
+    executor: Arc<E>,
+    request_timeout_ms: i64,
+    slots: &CycleSlots,
+) where
+    C: CadenceClock,
+    D: CadenceExecutor + 'static,
+    G: CadenceExecutor + 'static,
+    E: CadenceExecutor + 'static,
+{
+    if !lane.enabled || lane.resolution != Some("cross_fill") {
+        return;
+    }
+    let feed = lane.asm.feed;
+    let mut chains: [Option<Option<u32>>; ChainUnderlying::COUNT] = [None; ChainUnderlying::COUNT];
+    let mut spots = [false; ChainUnderlying::COUNT];
+    for u in ChainUnderlying::ALL {
+        let i = u.index();
+        if lane
+            .asm
+            .chain(*u)
+            .is_some_and(|c| c.provenance == ChainProvenance::CrossSource)
+        {
+            // Expiry resolved AT SPAWN TIME by the runner — the re-pull
+            // module never touches the resolver (isolation law).
+            chains[i] = Some(
+                deps.expiry_resolver
+                    .resolved_expiry(feed, *u, clock.ist_date()),
+            );
+        }
+        if lane
+            .asm
+            .spot(*u)
+            .is_some_and(|sp| sp.provenance == SpotProvenance::CrossSource)
+        {
+            spots[i] = true;
+        }
+    }
+    let plan = HistoryRepullPlan {
+        lane: feed,
+        cycle_minute_ist: slots.cycle_minute_ist,
+        boundary_ms: slots.boundary_ms,
+        chains,
+        spots,
+        request_timeout_ms,
+    };
+    if !plan.any_pending() {
+        return;
+    }
+    info!(
+        lane = feed.as_str(),
+        cycle_minute_ist = plan.cycle_minute_ist,
+        pending_legs = plan.pending_count(),
+        "cadence: background history re-pull scheduled for the \
+         cross-filled legs (T+30s/T+50s waves — record-completeness \
+         only, never a decision input)"
+    );
+    spawn_history_repull(Arc::clone(clock), executor, gates, plan);
 }
 
 /// Spawn one bounded chain fetch (fire-and-forget by design: bounded by
@@ -2424,6 +2709,18 @@ fn handle_completion<C, D, G>(
                         cycle.groww_leg_attempts[underlying_idx].saturating_add(1);
                     cycle.groww_leg_inflight[underlying_idx] = false;
                 }
+                // Is this completion a LATE-RETRY answer? (operator
+                // 2026-07-20 observability): Dhan — a retry was already
+                // scheduled for this leg; Groww — this is the leg's 2nd+
+                // attempt (verdict fallback / L3). Single-flight per leg
+                // by construction, so the attribution is exact.
+                let is_retry_answer = match lane_feed {
+                    Feed::Dhan => cycle.chain_retries_used[underlying_idx] > 0,
+                    Feed::Groww => cycle.groww_leg_attempts[underlying_idx] >= 2,
+                };
+                if is_retry_answer {
+                    record_late_retry_outcome(lane, result.as_ref().err());
+                }
                 match result {
                     Ok(ok) => {
                         if lane_feed == Feed::Groww {
@@ -2477,6 +2774,7 @@ fn handle_completion<C, D, G>(
                                 let retry_fire = retry_at.max(now_wall);
                                 if may_retry_in_cycle(
                                     &err,
+                                    true,
                                     cycle.chain_retries_used[underlying_idx],
                                     cfg.in_cycle_retry_max,
                                     retry_fire,
@@ -2486,6 +2784,8 @@ fn handle_completion<C, D, G>(
                                     cycle.chain_retries_used[underlying_idx] += 1;
                                     cycle.next_chain_retry_slot += 1;
                                     retry_scheduled = true;
+                                    lane.late_retry_attempts =
+                                        lane.late_retry_attempts.saturating_add(1);
                                     insert_event(
                                         &mut cycle.events,
                                         retry_fire,
@@ -2496,6 +2796,12 @@ fn handle_completion<C, D, G>(
                                     );
                                 }
                             }
+                        }
+                        if lane_feed == Feed::Groww && matches!(err, CadenceFetchError::Malformed) {
+                            // Malformed is NOT retry-eligible (operator
+                            // 2026-07-20): latch the leg so the verdict
+                            // fallback skips it.
+                            cycle.groww_leg_malformed[underlying_idx] = true;
                         }
                         // L3 (2026-07-15): the DEFERRED per-leg fallback
                         // — a leg SKIPPED in flight at the verdict (F4)
@@ -2513,11 +2819,15 @@ fn handle_completion<C, D, G>(
                             && cycle.groww_verdict_passed
                             && cycle.groww_leg_attempts[underlying_idx] == 1
                             && !lane.resolved
+                            // Malformed is NOT retry-eligible (operator
+                            // 2026-07-20 eligibility set).
+                            && !matches!(err, CadenceFetchError::Malformed)
                             && now_wall.saturating_add(CADENCE_RETRY_LATENCY_ALLOWANCE_MS)
                                 <= slots.groww_cutoff_ms
                         {
                             deferred_fallback = true;
                             lane.flags.groww_fallback = true;
+                            lane.late_retry_attempts = lane.late_retry_attempts.saturating_add(1);
                             metrics::counter!(
                                 "tv_cadence_groww_fallback_total",
                                 "leg" => "chain"
@@ -2591,6 +2901,16 @@ fn handle_completion<C, D, G>(
                     cycle.groww_leg_attempts[leg] = cycle.groww_leg_attempts[leg].saturating_add(1);
                     cycle.groww_leg_inflight[leg] = false;
                 }
+                // Late-retry answer attribution (see the chain arm).
+                let is_retry_answer = match lane_feed {
+                    Feed::Dhan => cycle.spot_retries_used[target_idx] > 0,
+                    Feed::Groww => {
+                        cycle.groww_leg_attempts[target_idx + ChainUnderlying::COUNT] >= 2
+                    }
+                };
+                if is_retry_answer {
+                    record_late_retry_outcome(lane, result.as_ref().err());
+                }
                 match result {
                     Ok(snap) => {
                         if lane_feed == Feed::Groww {
@@ -2633,6 +2953,7 @@ fn handle_completion<C, D, G>(
                             let retry_target = cycle.next_spot_retry_target_ms.max(now_wall);
                             if may_retry_in_cycle(
                                 &err,
+                                false,
                                 cycle.spot_retries_used[target_idx],
                                 cfg.in_cycle_retry_max,
                                 retry_target,
@@ -2643,6 +2964,8 @@ fn handle_completion<C, D, G>(
                                 cycle.next_spot_retry_target_ms =
                                     retry_target.saturating_add(CADENCE_SPOT_WINDOW_MS);
                                 retry_scheduled = true;
+                                lane.late_retry_attempts =
+                                    lane.late_retry_attempts.saturating_add(1);
                                 insert_event(
                                     &mut cycle.events,
                                     retry_target,
@@ -2653,6 +2976,11 @@ fn handle_completion<C, D, G>(
                                 );
                             }
                         }
+                        if lane_feed == Feed::Groww && matches!(err, CadenceFetchError::Malformed) {
+                            // Malformed is NOT retry-eligible (operator
+                            // 2026-07-20): latch so the verdict skips it.
+                            cycle.groww_leg_malformed[target_idx + ChainUnderlying::COUNT] = true;
+                        }
                         // L3 (2026-07-15): the DEFERRED per-leg fallback
                         // for an in-flight-skipped SPOT leg — see the
                         // chain arm above.
@@ -2661,11 +2989,15 @@ fn handle_completion<C, D, G>(
                             && cycle.groww_verdict_passed
                             && cycle.groww_leg_attempts[target_idx + ChainUnderlying::COUNT] == 1
                             && !lane.resolved
+                            // Malformed is NOT retry-eligible (operator
+                            // 2026-07-20 eligibility set).
+                            && !matches!(err, CadenceFetchError::Malformed)
                             && now_wall.saturating_add(CADENCE_RETRY_LATENCY_ALLOWANCE_MS)
                                 <= slots.groww_cutoff_ms
                         {
                             deferred_fallback = true;
                             lane.flags.groww_fallback = true;
+                            lane.late_retry_attempts = lane.late_retry_attempts.saturating_add(1);
                             metrics::counter!(
                                 "tv_cadence_groww_fallback_total",
                                 "leg" => "spot"
@@ -3043,6 +3375,17 @@ fn decide_lane<C: CadenceClock>(
         },
         dry_run,
     );
+    // Resolution token (operator 2026-07-20 — the #1688 cross_fill_audit
+    // vocabulary): cross_fill / native_late_retry / native_first_try.
+    // SEAM(#1688): the sibling cross-fill-audit session threads this +
+    // `late_retry_attempts` into the audit row's `resolution` /
+    // `retry_attempts` columns once the branches share an ancestry
+    // (cross_fill_audit_persistence is on main, outside this stacked
+    // base) — whoever lands second rebases (plan design item 2).
+    lane.resolution = Some(resolution_token(
+        lane.flags.cross_fill,
+        lane.late_retry_attempts,
+    ));
     lane.resolved = true;
 }
 
@@ -3158,5 +3501,52 @@ mod tests {
         // And they never leak into a clean cycle.
         assert!(!DegradeFlags::default().any());
         assert!(DegradeFlags::default().stages().is_empty());
+    }
+
+    /// Operator 2026-07-20 — the #1688 resolution vocabulary is locked.
+    #[test]
+    fn resolution_token_vocabulary_locked() {
+        assert_eq!(resolution_token(true, 0), "cross_fill");
+        assert_eq!(resolution_token(true, 3), "cross_fill");
+        assert_eq!(resolution_token(false, 2), "native_late_retry");
+        assert_eq!(resolution_token(false, 0), "native_first_try");
+    }
+
+    /// Source-scan ratchet (operator 2026-07-20): the cycle wrap-up
+    /// spawns the background history re-pull for BOTH lanes, gated on
+    /// the cross_fill resolution + !dry_run, and the deadline event is
+    /// built into every cycle's event list. Deleting any of these
+    /// silently would fail the build here.
+    #[test]
+    fn ratchet_runner_spawns_history_repull_for_both_lanes() {
+        let src = include_str!("runner.rs");
+        let production: &str = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a head");
+        assert_eq!(
+            production.matches("spawn_repull_for_lane(").count(),
+            // Exactly the 2 call sites (dhan + groww); the generic fn
+            // definition spells `spawn_repull_for_lane<`.
+            2,
+            "the wrap-up must spawn the re-pull for BOTH lanes"
+        );
+        assert!(
+            production.contains("if !deps.dry_run {"),
+            "recovery wrap-up + re-pull must stay dry-run-gated (F10)"
+        );
+        assert!(
+            production.contains(r#"lane.resolution != Some("cross_fill")"#),
+            "the re-pull fires ONLY on a cross_fill resolution \
+             (backfill never feeds live decisions)"
+        );
+        assert!(
+            production.contains("CycleAction::NativeDeadline,"),
+            "build_cycle_events must schedule the T+4s deadline"
+        );
+        assert!(
+            production.contains("CADENCE_NATIVE_DECISION_DEADLINE_MS"),
+            "the deadline event must ride the pinned constant"
+        );
     }
 }

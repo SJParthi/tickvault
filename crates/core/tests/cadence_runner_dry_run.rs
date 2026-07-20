@@ -408,18 +408,22 @@ async fn test_cadence_runner_dry_run_full_cycle_emits_decisions_or_skips() {
         })
         .count();
     // EXACT counts (deterministic all-Empty script): Empty IS retryable
-    // in-cycle (may_retry_in_cycle) and every retry slot lands inside the
-    // :15 cutoff — 3 chain primaries + 3 grid retries, 4 spot singles +
-    // 4 appended retries. Exact equality pins that the RUNNER's retry
-    // insertion (handle_completion → insert_event) actually fires:
-    // deleting it would read 3/4 here.
+    // in-cycle (may_retry_in_cycle) — chains keep budget 1 (the single
+    // legal T+4.0s per-key slot), spots carry the 2026-07-20 hedged
+    // Empty budget of 2 (`CADENCE_LATE_RETRY_SPOT_EMPTY_BUDGET`) — and
+    // with BOTH lanes all-Empty the T+4s deadline finds no donor (no
+    // cross-fill, no chain-embedded), so every retry slot still lands
+    // inside the :15 cutoff: 3 chain primaries + 3 grid retries, 4 spot
+    // singles + 8 appended retries (2 per leg). Exact equality pins that
+    // the RUNNER's retry insertion (handle_completion → insert_event)
+    // actually fires: deleting it would read 3/4 here.
     assert_eq!(
         dhan_chains, 6,
         "Dhan chains: 3 primaries + 3 grid retries (all Empty)"
     );
     assert_eq!(
-        dhan_spots, 8,
-        "Dhan spots: 4 singles + 4 appended retries (all Empty)"
+        dhan_spots, 12,
+        "Dhan spots: 4 singles + 8 appended retries (all Empty, budget 2)"
     );
     assert_eq!(
         groww_chains, 6,
@@ -920,11 +924,18 @@ async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
         v
     };
     // Cycle 1 (shape 0 = ALL-7, step 0, dirty): 4 nominal spots
-    // CONCURRENT in the burst second, plus 4 appended in-cycle retries
-    // (Correction 2: a 429'd leg keeps its ONE bounded retry) stepping
-    // one 1000ms window each past the last nominal slot.
+    // CONCURRENT in the burst second, plus the 2 PRE-DEADLINE appended
+    // in-cycle retries (Correction 2: a 429'd leg keeps its bounded
+    // retry) stepping one 1000ms window each past the last nominal
+    // slot — the T+4s hedged decision (operator 2026-07-20) resolves
+    // this chains-OK lane via the chain-embedded rung AT the deadline,
+    // skipping the appended retries at/after T+4.0.
     let c1 = spot_instants(FIRST_CYCLE_MINUTE);
-    assert_eq!(c1.len(), 8, "cycle 1: 4 nominal spots + 4 bounded retries");
+    assert_eq!(
+        c1.len(),
+        6,
+        "cycle 1: 4 nominal spots + 2 pre-deadline retries"
+    );
     assert!(
         c1[3] - c1[0] <= SLOT_TOLERANCE_MS,
         "shape 0 = all-7: ALL 4 spots in the burst second (spread {})",
@@ -936,16 +947,24 @@ async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
         c1[4] - c1[0]
     );
     assert!(
-        (c1[7] - c1[4] - 3_000).abs() <= SLOT_TOLERANCE_MS,
+        (c1[5] - c1[4] - 1_000).abs() <= SLOT_TOLERANCE_MS,
         "retries step one window each (retry spread {})",
-        c1[7] - c1[4]
+        c1[5] - c1[4]
     );
     // Cycle 3 (shape 1 + step 1 after 2 consecutive dirty cycles;
-    // itself dirty so the lane never resolves early): buckets
-    // [1,1,1,2] — three together in the rung-1 spot second, the 4th
-    // one full window later, plus the 4 appended retries.
+    // itself dirty so the lane never resolves early ON OWN DATA):
+    // buckets [1,1,1,2] — three together in the rung-1 spot second, the
+    // 4th one full window later. The append grid starts at T+4.0s here
+    // (one window past the T+3.0 overflow bucket) — ON the hedged
+    // deadline, so the chains-OK lane resolves chain-embedded first and
+    // NO appended retry fires this cycle (the dirty verdict still comes
+    // from the 4 nominal 429s).
     let c3 = spot_instants(FIRST_CYCLE_MINUTE + 120);
-    assert_eq!(c3.len(), 8, "cycle 3: 4 nominal spots + 4 bounded retries");
+    assert_eq!(
+        c3.len(),
+        4,
+        "cycle 3: 4 nominal spots; appended retries all post-deadline"
+    );
     assert!(
         c3[2] - c3[0] <= SLOT_TOLERANCE_MS,
         "shape 1 + step 1: first group of 3"
@@ -954,11 +973,6 @@ async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
         (c3[3] - c3[0] - 1_000).abs() <= SLOT_TOLERANCE_MS,
         "step-1 overflow bucket exactly one 1000ms window later (got +{})",
         c3[3] - c3[0]
-    );
-    assert!(
-        (c3[4] - c3[3] - 1_000).abs() <= SLOT_TOLERANCE_MS,
-        "first appended retry one window past the overflow bucket (got +{})",
-        c3[4] - c3[3]
     );
     // Cycle 7 (shape 0 + step 0 again after 3 consecutive clean cycles
     // 4-6): recovered to the all-7 primary — 4 spots, all burst, no
@@ -970,6 +984,168 @@ async fn test_dhan_spot_ladder_rate_limit_mid_ladder_degrades_then_recovers() {
         "recovered to shape 0 = all-7 burst (spread {})",
         c7[3] - c7[0]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_deadline_race_deterministic() {
+    // Operator 2026-07-20 ("retry native until the 4th second, then
+    // cross-fill"): Dhan ALL-EMPTY + Groww fully healthy. The T+4s
+    // NativeDeadline cross-fills the Dhan lane from the Groww donor
+    // with ZERO added wait — the same-instant T+4.0 chain-retry slots
+    // (and the T+4.0/T+5.0 appended spot retries) are deterministically
+    // SKIPPED on the resolved lane (the tie resolves to the prepared
+    // cross-fill), and the background history re-pull then re-asks
+    // Dhan's OWN legs at T+30/T+50 through the gates.
+    fn groww_ok_chain(
+        req: &ChainFetchRequest,
+        _prior: usize,
+    ) -> Result<ChainFetchOk, CadenceFetchError> {
+        if req.feed == Feed::Dhan {
+            return Err(CadenceFetchError::Empty);
+        }
+        Ok(ChainFetchOk {
+            underlying_spot: Some(24_500.0),
+            published_to_registry: false,
+        })
+    }
+    fn groww_ok_spot(
+        req: &SpotFetchRequest,
+        _prior: usize,
+    ) -> Result<SpotSnapshot, CadenceFetchError> {
+        if req.feed == Feed::Dhan {
+            return Err(CadenceFetchError::Empty);
+        }
+        Ok(SpotSnapshot {
+            price: 24_500.0,
+            source_minute_ist: req.cycle_minute_ist,
+            received_at_epoch_ms: 0,
+        })
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exec = Arc::new(RecordingExecutor {
+        log: Arc::clone(&log),
+        start: tokio::time::Instant::now(),
+        chain_verdict: groww_ok_chain,
+        spot_verdict: groww_ok_spot,
+        expiry_verdict: empty_expiry_list,
+    });
+    let (deps, shutdown) = deps_with(Arc::clone(&exec), true, true);
+    let clock = Arc::new(TestClock {
+        anchor: tokio::time::Instant::now(),
+        base_wall_ms: BASE_WALL_MS,
+        date: NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"),
+    });
+    let task = tokio::spawn(run_cadence_loop(clock, deps));
+    // Boundary 1 at +10s; deadline at +14s; re-pull waves at +40s/+60s
+    // (T+30/T+50 past the boundary). Run well past the second wave.
+    for _ in 0..75 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    shutdown.notify_waiters();
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
+        .await
+        .expect("runner must exit after shutdown")
+        .expect("runner task must not panic");
+    assert_eq!(exit, LoopExit::Shutdown);
+    // APPROVED (test-only): poisoned mutex propagates the panic.
+    #[allow(clippy::unwrap_used)]
+    let calls = log.lock().unwrap().clone();
+    // In-cycle window = anything before the Dhan cutoff (+25s elapsed);
+    // the re-pull waves land at +40s/+60s.
+    let m1 = FIRST_CYCLE_MINUTE;
+    let dhan_cycle_spots = calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                RecordedCall::Spot {
+                    feed: Feed::Dhan,
+                    ..
+                }
+            ) && c.minute() == m1
+                && c.at_ms() < 25_000
+        })
+        .count();
+    let dhan_cycle_chains = calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                RecordedCall::Chain {
+                    feed: Feed::Dhan,
+                    ..
+                }
+            ) && c.minute() == m1
+                && c.at_ms() < 25_000
+        })
+        .count();
+    // 4 nominal spots + ONLY the 2 pre-deadline appended retries (T+2.0
+    // and T+3.0) — the T+4.0/T+5.0 retries were pre-empted by the
+    // deadline cross-fill (zero added wait).
+    assert_eq!(
+        dhan_cycle_spots, 6,
+        "deadline must pre-empt the post-deadline spot retries"
+    );
+    // 3 nominal chains only — the single legal T+4.0 chain-retry slot
+    // sorts AFTER the deadline event at the same instant and is skipped
+    // on the resolved lane (the determinism pin: tie → cross-fill).
+    assert_eq!(
+        dhan_cycle_chains, 3,
+        "the same-instant chain retry must lose the tie to the deadline"
+    );
+    // The background history re-pull (resolution == cross_fill, dry_run
+    // off) re-asks Dhan's OWN CrossSource legs at T+30/T+50 with the
+    // ORIGINAL minute: 3 chains + 3 underlying spots per wave, both
+    // waves Empty again here (still counted, then exhausted).
+    let dhan_repull_spots = calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                RecordedCall::Spot {
+                    feed: Feed::Dhan,
+                    ..
+                }
+            ) && c.minute() == m1
+                && c.at_ms() >= 35_000
+        })
+        .count();
+    let dhan_repull_chains = calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                RecordedCall::Chain {
+                    feed: Feed::Dhan,
+                    ..
+                }
+            ) && c.minute() == m1
+                && c.at_ms() >= 35_000
+        })
+        .count();
+    assert_eq!(dhan_repull_spots, 6, "re-pull: 3 spots x 2 waves");
+    assert_eq!(dhan_repull_chains, 6, "re-pull: 3 chains x 2 waves");
+    // The HEALTHY lane is byte-untouched: 3 chains + 4 spots, no
+    // retries, no re-pull (it resolved native_first_try).
+    let groww_calls = calls
+        .iter()
+        .filter(|c| {
+            (matches!(
+                c,
+                RecordedCall::Spot {
+                    feed: Feed::Groww,
+                    ..
+                }
+            ) || matches!(
+                c,
+                RecordedCall::Chain {
+                    feed: Feed::Groww,
+                    ..
+                }
+            )) && c.minute() == m1
+        })
+        .count();
+    assert_eq!(groww_calls, 7, "healthy Groww lane: 7 legs, untouched");
 }
 
 #[tokio::test(start_paused = true)]

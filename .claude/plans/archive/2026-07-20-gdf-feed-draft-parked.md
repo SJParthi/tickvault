@@ -1,3 +1,9 @@
+> **PARKED 2026-07-20 (never started — resurrectable):** this DRAFT was moved
+> out of the active set to honor the 5-active-plan cap (plan-gate) when the
+> cadence-late-repull plan entered. No implementation exists for it; the
+> future GDF session should move it back to
+> `.claude/plans/active-plan-gdf-feed.md` before starting.
+
 # Implementation Plan: GDF (Global Data Feeds) as feed #3 — trial-ready before the key arrives
 
 **Status:** DRAFT

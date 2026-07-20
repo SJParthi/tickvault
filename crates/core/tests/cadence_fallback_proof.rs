@@ -270,18 +270,22 @@ fn all_instants(calls: &[RecordedCall], minute: u32) -> Vec<i64> {
 /// the 4 NOMINAL spot fires stay CONCURRENT in the burst second (the
 /// shape-0 / step-0 signature) — a demotion would split them (the
 /// [1,1,1,2] rung-1 grouping the RateLimited test observes at cycle 3).
-/// Each failed leg keeps its ONE bounded in-cycle retry (all classes
-/// share the retry budget — `may_retry_in_cycle`), so a dirty cycle
-/// records 8 spot fires: nominal 4 burst-concurrent + 4 appended.
+/// Each failed leg keeps its bounded in-cycle retry budget
+/// (`may_retry_in_cycle`), appended on the T+2.0/T+3.0/T+4.0/T+5.0
+/// window grid — but since the T+4s hedged decision deadline (operator
+/// 2026-07-20), a lane these chains-OK harnesses resolve AT the
+/// deadline (chain-embedded rung, zero added wait) skips the appended
+/// retries at/after T+4.0: a dirty cycle records 6 spot fires — the 4
+/// nominal burst-concurrent + the 2 pre-deadline appended retries.
 fn assert_dhan_shape0_every_cycle(calls: &[RecordedCall], cycles: u32, class: &str) {
     for n in 0..cycles {
         let minute = FIRST_CYCLE_MINUTE + 60 * n;
         let inst = spot_instants(calls, minute);
         assert_eq!(
             inst.len(),
-            8,
-            "{class}: cycle {} must record 4 nominal spots + 4 bounded \
-             in-cycle retries (got {})",
+            6,
+            "{class}: cycle {} must record 4 nominal spots + the 2 \
+             pre-deadline appended retries (got {})",
             n + 1,
             inst.len()
         );
