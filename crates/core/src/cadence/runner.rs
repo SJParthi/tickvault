@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use chrono::{NaiveDate, TimeZone, Timelike, Utc};
 use tickvault_common::config::CadenceConfig;
-use tickvault_common::constants::{CADENCE_SPOT_WINDOW_MS, IST_UTC_OFFSET_SECONDS};
+use tickvault_common::constants::{
+    CADENCE_NATIVE_RETRY_OFFSETS_MS, CADENCE_SPOT_WINDOW_MS, IST_UTC_OFFSET_SECONDS,
+};
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
@@ -1354,6 +1356,11 @@ struct LaneRun {
     /// §3(e) cross-source is the fallback steady state, never an
     /// every-cycle preemption of the lane's own scheduled fires).
     inflight: u32,
+    /// Native spot retry rungs consumed this cycle (item 2 phase B1).
+    late_retry_attempts: u32,
+    /// Latched on a 429 seen while the native retry ladder is active -
+    /// aborts the remaining native rungs for this cycle (budget-spent).
+    retry_rate_limited: bool,
 }
 
 impl LaneRun {
@@ -1366,6 +1373,8 @@ impl LaneRun {
             flags: DegradeFlags::default(),
             arming_failure: false,
             inflight: 0,
+            late_retry_attempts: 0,
+            retry_rate_limited: false,
         }
     }
 
@@ -1974,6 +1983,24 @@ fn handle_action<C, D, G>(
                     );
                 }
                 GateVerdict::RetryAtMs(at_mono) => {
+                    // H4 (native retry): a gate-denied NATIVE rung is skipped
+                    // silently - counted, never re-queued, never escalated.
+                    // Native rungs are scheduled nominal=false with
+                    // late_retry_attempts > 0 (incremented at schedule time),
+                    // so nominal dispatches and pure-legacy retries keep the
+                    // byte-equivalent defer_action path below.
+                    if !nominal
+                        && deps.config.native_retry_enabled
+                        && cycle.dhan.late_retry_attempts > 0
+                    {
+                        metrics::counter!(
+                            "tv_cadence_native_retry_total",
+                            "lane" => Feed::Dhan.as_str(),
+                            "outcome" => "gate_busy_skip"
+                        )
+                        .increment(1);
+                        return;
+                    }
                     defer_action(
                         "spot",
                         nominal && !cycle.dispatch_ran_late,
@@ -2616,6 +2643,15 @@ fn handle_completion<C, D, G>(
                         if lane_feed == Feed::Groww {
                             cycle.groww_leg_ok[target_idx + ChainUnderlying::COUNT] = true;
                         }
+                        if lane.late_retry_attempts > 0 {
+                            // Native spot retry ladder: success after >= 1 native rung.
+                            metrics::counter!(
+                                "tv_cadence_native_retry_total",
+                                "lane" => lane_feed.as_str(),
+                                "outcome" => "recovered"
+                            )
+                            .increment(1);
+                        }
                         lane.asm.record_spot(
                             target,
                             snap.price,
@@ -2650,20 +2686,60 @@ fn handle_completion<C, D, G>(
                         // never contend a nominal group's window budget.
                         let mut retry_scheduled = false;
                         if lane_feed == Feed::Dhan {
-                            let retry_target = cycle.next_spot_retry_target_ms.max(now_wall);
-                            // PHASE-B(native-retry): this literal flips to a cfg-gated value when the native spot ladder lands.
-                            if may_retry_in_cycle(
-                                &err,
-                                true,
-                                cycle.spot_retries_used[target_idx],
-                                cfg.in_cycle_retry_max,
-                                retry_target,
-                                CADENCE_RETRY_LATENCY_ALLOWANCE_MS,
-                                slots.dhan_cutoff_ms,
-                            ) {
+                            // Native spot retry ladder (item 2 phase B1): an Empty spot
+                            // result re-fires at fixed offsets from the minute boundary
+                            // instead of advancing the shared retry window.
+                            let native_empty =
+                                cfg.native_retry_enabled && matches!(err, CadenceFetchError::Empty);
+                            // A 429 while the native ladder is active latches the lane and
+                            // aborts the remaining rungs this cycle (budget-spent).
+                            // CADENCE-01: RateLimited is never `native_empty`, so its one
+                            // bounded in-cycle 429 retry keeps the legacy path unchanged.
+                            if cfg.native_retry_enabled
+                                && lane.late_retry_attempts > 0
+                                && matches!(err, CadenceFetchError::RateLimited { .. })
+                                && !lane.retry_rate_limited
+                            {
+                                lane.retry_rate_limited = true;
+                                metrics::counter!(
+                                    "tv_cadence_native_retry_total",
+                                    "lane" => lane_feed.as_str(),
+                                    "outcome" => "aborted_429"
+                                )
+                                .increment(1);
+                            }
+                            let rung = (lane.late_retry_attempts as usize).min(2);
+                            let retry_target = if native_empty {
+                                slots
+                                    .boundary_ms
+                                    .saturating_add(CADENCE_NATIVE_RETRY_OFFSETS_MS[rung])
+                                    .max(now_wall)
+                            } else {
+                                cycle.next_spot_retry_target_ms.max(now_wall)
+                            };
+                            if !(native_empty && lane.retry_rate_limited)
+                                && may_retry_in_cycle(
+                                    &err,
+                                    // Kill switch OFF => literal `true` (class-blind legacy budget,
+                                    // byte-equivalent to the pre-ladder shape). Flag ON => `false`:
+                                    // the ladder grants Empty spot legs retry_max.max(3) rungs.
+                                    !cfg.native_retry_enabled,
+                                    cycle.spot_retries_used[target_idx],
+                                    cfg.in_cycle_retry_max,
+                                    retry_target,
+                                    CADENCE_RETRY_LATENCY_ALLOWANCE_MS,
+                                    slots.dhan_cutoff_ms,
+                                )
+                            {
                                 cycle.spot_retries_used[target_idx] += 1;
-                                cycle.next_spot_retry_target_ms =
-                                    retry_target.saturating_add(CADENCE_SPOT_WINDOW_MS);
+                                if native_empty {
+                                    // Native rung: offset-anchored off the minute boundary -
+                                    // the shared retry window cursor is NOT advanced.
+                                    lane.late_retry_attempts += 1;
+                                } else {
+                                    cycle.next_spot_retry_target_ms =
+                                        retry_target.saturating_add(CADENCE_SPOT_WINDOW_MS);
+                                }
                                 retry_scheduled = true;
                                 insert_event(
                                     &mut cycle.events,
@@ -2673,6 +2749,19 @@ fn handle_completion<C, D, G>(
                                         nominal: false,
                                     },
                                 );
+                            } else if cfg.native_retry_enabled
+                                && lane.late_retry_attempts > 0
+                                && !matches!(err, CadenceFetchError::RateLimited { .. })
+                            {
+                                // Budget/cutoff ended the ladder with the leg still failed
+                                // after >= 1 native rung. A 429 abort is already counted as
+                                // aborted_429 - never double-counted here.
+                                metrics::counter!(
+                                    "tv_cadence_native_retry_total",
+                                    "lane" => lane_feed.as_str(),
+                                    "outcome" => "exhausted"
+                                )
+                                .increment(1);
                             }
                         }
                         // L3 (2026-07-15): the DEFERRED per-leg fallback
