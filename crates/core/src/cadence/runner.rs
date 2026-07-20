@@ -1510,6 +1510,7 @@ where
         groww_leg_ok: [false; 7],
         groww_leg_attempts: [0; 7],
         groww_leg_inflight: [false; 7],
+        groww_leg_malformed: [false; 7],
         groww_verdict_passed: false,
         groww_fallback_launched: false,
         late_wake_flagged: false,
@@ -1732,6 +1733,12 @@ struct CycleState {
     /// still-in-flight leg is SKIPPED by the fallback (await-or-skip;
     /// first-write-wins on completion stays).
     groww_leg_inflight: [bool; 7],
+    /// PHASE-B2 (item 2): per-leg Malformed latch for the Groww lane —
+    /// chains `0..3` by underlying index, spots `3..7` by
+    /// `target_idx + ChainUnderlying::COUNT`. A malformed answer is NEVER
+    /// retried (ladder budget 0) and the leg is NEVER selected as an L3
+    /// cross-fill candidate (the ONE combined filter below).
+    groww_leg_malformed: [bool; 7],
     /// The GrowwVerdict instant passed (F4/L3): a leg completing Err on
     /// its 1st attempt after it was skipped in flight has no later
     /// verdict — the L3 DEFERRED fallback (2026-07-15) dispatches its one
@@ -2110,7 +2117,9 @@ fn handle_action<C, D, G>(
             let failed_spots: Vec<usize> = (0..SpotTarget::ALL.len())
                 .filter(|k| {
                     let leg = k + ChainUnderlying::COUNT;
-                    !cycle.groww_leg_ok[leg] && !cycle.groww_leg_inflight[leg]
+                    !cycle.groww_leg_ok[leg]
+                        && !cycle.groww_leg_inflight[leg]
+                        && !cycle.groww_leg_malformed[leg]
                 })
                 .collect();
             if failed_chains.is_empty() && failed_spots.is_empty() {
@@ -2232,10 +2241,16 @@ fn handle_action<C, D, G>(
         }
         CycleAction::GrowwCutoff => {
             let CycleState { dhan, groww, .. } = cycle;
+            // PHASE-B2 (item 2): CADENCE-05 recovery wrap-up reads the
+            // PRE-finalize resolved state — the lane's own-path outcome.
+            emit_recovery_wrapup(groww);
             finalize_lane_at_cutoff(clock.as_ref(), slots, groww, dhan, latch, deps.dry_run);
         }
         CycleAction::DhanCutoff => {
             let CycleState { dhan, groww, .. } = cycle;
+            // PHASE-B2 (item 2): CADENCE-05 recovery wrap-up reads the
+            // PRE-finalize resolved state — the lane's own-path outcome.
+            emit_recovery_wrapup(dhan);
             finalize_lane_at_cutoff(clock.as_ref(), slots, dhan, groww, latch, deps.dry_run);
         }
     }
@@ -2488,6 +2503,12 @@ fn handle_completion<C, D, G>(
                         );
                     }
                     Err(err) => {
+                        if lane_feed == Feed::Groww && matches!(err, CadenceFetchError::Malformed) {
+                            // PHASE-B2 (item 2): latch the malformed leg —
+                            // never retried (budget 0), never an L3
+                            // cross-fill candidate.
+                            cycle.groww_leg_malformed[underlying_idx] = true;
+                        }
                         if matches!(err, CadenceFetchError::Empty) {
                             // Chain 200-empty: its own coalesced stage
                             // (never conflated with a transport-class
@@ -2661,6 +2682,12 @@ fn handle_completion<C, D, G>(
                         );
                     }
                     Err(err) => {
+                        if lane_feed == Feed::Groww && matches!(err, CadenceFetchError::Malformed) {
+                            // PHASE-B2 (item 2): latch the malformed leg —
+                            // never retried (budget 0), never an L3
+                            // cross-fill candidate.
+                            cycle.groww_leg_malformed[target_idx + ChainUnderlying::COUNT] = true;
+                        }
                         if matches!(err, CadenceFetchError::Empty) {
                             // 200-empty: coalesced spot_empty stage
                             // (either lane); does NOT arm the ladder
@@ -3284,6 +3311,32 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
     lane.resolved = true;
 }
 
+/// PHASE-B2 (item 2): CADENCE-05 recovery wrap-up — LOG-SINK-ONLY, once per
+/// lane per minute (each cutoff action fires exactly once per cycle). Called
+/// at cycle teardown (the cutoff handlers) BEFORE `finalize_lane_at_cutoff`,
+/// so the guard reads the lane's own-path outcome: the native retry ladder
+/// ran (`late_retry_attempts > 0`) and the lane still enters cutoff
+/// unresolved — recovery degraded to the cross-fill/cutoff decision floor.
+/// No Telegram, no NotificationEvent, no alarm wiring.
+fn emit_recovery_wrapup(lane: &LaneRun) {
+    if !lane.enabled || lane.resolved || lane.late_retry_attempts == 0 {
+        return;
+    }
+    let stage = if lane.retry_rate_limited {
+        "retry_rate_limited"
+    } else {
+        "retry_still_empty"
+    };
+    error!(
+        code = ErrorCode::Cadence05RecoveryDegraded.code_str(),
+        stage,
+        lane = lane.asm.feed.as_str(),
+        cycle_minute_ist = lane.asm.cycle_minute_ist,
+        late_retry_attempts = lane.late_retry_attempts,
+        "CADENCE-05: native retries exhausted without recovery — cutoff/cross-fill is the floor"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3357,5 +3410,48 @@ mod tests {
         assert_eq!(s, "fetch_failed");
         assert!(!s.contains("chain_spot_divergence"));
         assert!(!s.contains("cross_source_spot_divergence"));
+    }
+
+    /// PHASE-B2 (item 2): kill-switch-OFF byte-equivalence pin — with
+    /// `native_retry_enabled = false` the runner passes `leg_is_chain = true`
+    /// for spots, so every class keeps the legacy class-blind budget and the
+    /// legacy target expression survives in the source. Malformed is the ONE
+    /// spec-sanctioned exception on BOTH arms: never retried (budget 0).
+    #[test]
+    fn test_native_retry_kill_switch_off_is_legacy_class_blind() {
+        use crate::cadence::ladder::late_retry_budget;
+
+        // OFF (leg_is_chain=true for spots): legacy class-blind budget.
+        assert_eq!(late_retry_budget(&CadenceFetchError::Empty, true, 1), 1);
+        assert_eq!(late_retry_budget(&CadenceFetchError::Timeout, true, 1), 1);
+        assert_eq!(late_retry_budget(&CadenceFetchError::Transport, true, 1), 1);
+        assert_eq!(
+            late_retry_budget(
+                &CadenceFetchError::RateLimited {
+                    retry_after_ms: None
+                },
+                true,
+                1
+            ),
+            1
+        );
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::QueueDelay, true, 1),
+            1
+        );
+        // ON (spot leg): Empty gets the 3-attempt native ladder.
+        assert_eq!(late_retry_budget(&CadenceFetchError::Empty, false, 1), 3);
+        // Malformed is NEVER retried — kill switch ON or OFF.
+        assert_eq!(late_retry_budget(&CadenceFetchError::Malformed, true, 1), 0);
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::Malformed, false, 1),
+            0
+        );
+        // Source pins: the legacy target expression + the cfg gate + the ONE
+        // combined L3 malformed filter.
+        let src = include_str!("runner.rs");
+        assert!(src.contains("cycle.next_spot_retry_target_ms.max(now_wall)"));
+        assert!(src.contains("!cfg.native_retry_enabled"));
+        assert!(src.contains("!cycle.groww_leg_malformed[leg]"));
     }
 }

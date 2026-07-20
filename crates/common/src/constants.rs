@@ -5487,6 +5487,12 @@ mod cadence_native_retry_hedge_tests {
         assert_eq!(CADENCE_DECISION_DEADLINE_MS, 4_000);
         assert!(
             CADENCE_NATIVE_RETRY_OFFSETS_MS
+                .windows(2)
+                .all(|w| w[0] < w[1]),
+            "native retry offsets must be strictly ascending"
+        );
+        assert!(
+            CADENCE_NATIVE_RETRY_OFFSETS_MS
                 .iter()
                 .all(|&o| o < CADENCE_DECISION_DEADLINE_MS)
         );
