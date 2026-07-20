@@ -165,6 +165,45 @@ pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
     out
 }
 
+/// H1 (audit 2026-07-20, Dim A): discriminate a ZERO-candle parse of a
+/// Dhan intraday body into "well-formed empty day" vs "malformed/wrong
+/// shape". Only the strict well-formed-empty shape — valid JSON carrying
+/// ALL six columnar arrays at equal length ZERO — is a benign vendor
+/// empty. Everything else that parses to zero candles is MALFORMED:
+/// non-JSON, missing arrays, length mismatch, AND a rows>0 body whose
+/// EVERY row fails value parsing (the exact 2026-07-15 float-timestamp
+/// wire-drift class that produced 14 silent 0-row days as
+/// `empty_no_rows`). Callers use this ONLY when
+/// [`parse_intraday_1m_candles`] returned zero candles. Pure — never
+/// panics.
+#[must_use]
+pub fn zero_candle_body_is_malformed(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return true;
+    };
+    let arr = |k: &str| v.get(k).and_then(|x| x.as_array());
+    let (Some(open), Some(high), Some(low), Some(close), Some(vol), Some(ts)) = (
+        arr("open"),
+        arr("high"),
+        arr("low"),
+        arr("close"),
+        arr("volume"),
+        arr("timestamp"),
+    ) else {
+        return true;
+    };
+    let n = ts.len();
+    // Well-formed empty: every parallel array present at equal length 0.
+    // Any non-zero length here means the caller's zero-candle parse
+    // skipped EVERY row (value drift) — malformed, never a benign empty.
+    !(n == 0
+        && open.is_empty()
+        && high.is_empty()
+        && low.is_empty()
+        && close.is_empty()
+        && vol.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +257,39 @@ mod tests {
         assert!(parse_intraday_1m_candles("{}").is_empty());
         let mismatch = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1,2]}"#;
         assert!(parse_intraday_1m_candles(mismatch).is_empty());
+    }
+
+    /// H1 (audit 2026-07-20): the zero-candle discriminator — only the
+    /// strict well-formed six-empty-arrays shape is a benign vendor
+    /// empty; every other zero-candle body is malformed, INCLUDING a
+    /// rows>0 body whose every row fails value parsing (the 2026-07-15
+    /// float-timestamp incident class).
+    #[test]
+    fn zero_candle_body_discriminates_malformed_vs_empty() {
+        // Well-formed empty day: NOT malformed.
+        let empty = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[]}"#;
+        assert!(parse_intraday_1m_candles(empty).is_empty());
+        assert!(!zero_candle_body_is_malformed(empty));
+        // Garbage / wrong shape / missing arrays / length mismatch: malformed.
+        assert!(zero_candle_body_is_malformed("not json"));
+        assert!(zero_candle_body_is_malformed("{}"));
+        assert!(zero_candle_body_is_malformed(
+            r#"{"open":[],"high":[],"low":[],"close":[],"volume":[]}"#
+        ));
+        assert!(zero_candle_body_is_malformed(
+            r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1,2]}"#
+        ));
+        // Rows present but EVERY row value-unparseable (all-null OHLC):
+        // parses to zero candles AND classifies malformed — value drift,
+        // never a benign empty.
+        let value_drift = r#"{"open":[null],"high":[null],"low":[null],"close":[null],"volume":[null],"timestamp":[null]}"#;
+        assert!(parse_intraday_1m_candles(value_drift).is_empty());
+        assert!(zero_candle_body_is_malformed(value_drift));
+        // A HEALTHY body is out of the discriminator's domain (callers
+        // consult it only on a zero-candle parse) — but it still answers
+        // honestly: rows>0 ⇒ "not the well-formed-empty shape".
+        let healthy = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1780380120]}"#;
+        assert_eq!(parse_intraday_1m_candles(healthy).len(), 1);
     }
 
     #[test]
