@@ -425,10 +425,14 @@ pub enum StepIndexOutcome {
 /// |---|---|---|---|
 /// | 1 | leg not "CE"/"PE" | — | `Invalid` |
 /// | 2 | `strike_paise < 1` or `atm_paise < 1` or `step_paise ≤ 0` | any | `Invalid` |
-/// | 3 | i64 overflow on the subtraction | any | `Invalid` (checked, never a panic — structurally unreachable once row 2 holds: both operands ≥ 1 bound the result by ±(`i64::MAX` − 1)) |
-/// | 4 | `(strike − atm)` not a multiple of `step` | any | `NotAligned` (loud at the call site — NEVER silent rounding) |
-/// | 5 | ok | CE | `Aligned((strike_paise − atm_paise) / step_paise)` |
-/// | 6 | ok | PE | `Aligned((atm_paise − strike_paise) / step_paise)` |
+/// | 3 | `(strike − atm)` not a multiple of `step` | any | `NotAligned` (loud at the call site — NEVER silent rounding) |
+/// | 4 | ok | CE | `Aligned((strike_paise − atm_paise) / step_paise)` |
+/// | 5 | ok | PE | `Aligned((atm_paise − strike_paise) / step_paise)` |
+///
+/// Overflow is IMPOSSIBLE past row 2 (no checked/panicking arithmetic
+/// needed): both operands are ≥ 1, so the difference lies in
+/// `[1 − i64::MAX, i64::MAX − 1]` — pinned by the i64-extreme tests
+/// below (the same totality argument as [`atm_strike_paise`]'s bound).
 ///
 /// The `< 1` guards mirror [`classify_moneyness_paise`]'s operand
 /// guards: callers feed [`price_to_paise_guarded`] +
@@ -439,8 +443,8 @@ pub enum StepIndexOutcome {
 /// signal, the same family as the observed-step drift cross-check.
 ///
 /// # Performance
-/// O(1): one 2-arm label parse + one checked subtraction + one integer
-/// rem/div pair. Zero allocation.
+/// O(1): one 2-arm label parse + one subtraction + one integer rem/div
+/// pair. Zero allocation.
 #[inline]
 #[must_use]
 pub fn moneyness_step_index(
@@ -455,15 +459,15 @@ pub fn moneyness_step_index(
     if strike_paise < 1 || atm_paise < 1 || step_paise <= 0 {
         return StepIndexOutcome::Invalid;
     }
-    // Leg-normalized signed distance from the grid anchor (checked —
-    // structurally total once the ≥1 guards hold; defense-in-depth for
-    // raw i64 callers, overflow fail-closes to Invalid like every guard).
+    // Leg-normalized signed distance from the grid anchor. Total by the
+    // ≥1 guards above: both operands sit in [1, i64::MAX], so the
+    // difference is bounded by ±(i64::MAX − 1) — overflow is
+    // mathematically impossible (extreme-pinned in the tests below), so
+    // plain subtraction is provably panic-free even with
+    // overflow-checks on.
     let diff = match leg {
-        OptionLeg::Ce => strike_paise.checked_sub(atm_paise),
-        OptionLeg::Pe => atm_paise.checked_sub(strike_paise),
-    };
-    let Some(diff) = diff else {
-        return StepIndexOutcome::Invalid;
+        OptionLeg::Ce => strike_paise - atm_paise,
+        OptionLeg::Pe => atm_paise - strike_paise,
     };
     if diff % step_paise != 0 {
         return StepIndexOutcome::NotAligned;
@@ -1253,6 +1257,25 @@ mod tests {
         assert_eq!(
             moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(i64::MIN)).as_str(),
             format!("ITM-{}", i64::MIN.unsigned_abs()).as_str()
+        );
+    }
+
+    /// The label type's trait surface: `Display` renders the bare label,
+    /// `Debug` wraps it, equality/copy compare by content (the buffers
+    /// are zero-padded past `len`, so derived `PartialEq` is exact).
+    #[test]
+    fn test_moneyness_step_label_display_debug_and_eq() {
+        let l = moneyness_step_label(Moneyness::Otm, StepIndexOutcome::Aligned(7));
+        assert_eq!(format!("{l}"), "OTM+7");
+        assert_eq!(format!("{l:?}"), "MoneynessStepLabel(\"OTM+7\")");
+        let same = moneyness_step_label(Moneyness::Otm, StepIndexOutcome::Aligned(7));
+        assert_eq!(l, same, "content-equal labels compare equal");
+        let copied = l;
+        assert_eq!(copied.as_str(), "OTM+7", "Copy semantics preserved");
+        assert_ne!(
+            l,
+            moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(-7)),
+            "different labels compare unequal"
         );
     }
 
