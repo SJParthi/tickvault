@@ -26,7 +26,7 @@ default = 63.0
 
 [crates]
 common  = 99.5
-core    = 90.2
+core    = 91.6
 trading = 96.9
 # storage: 91.2 -> 90.1 (2026-07-17, stage-2 dead-WS sweep, PR #1631).
 # TRUTHFUL RE-BASELINE, not a ratchet bypass: the sweep deleted ~12K LoC of
@@ -42,7 +42,7 @@ trading = 96.9
 # from this honest floor. Flagged in the PR #1631 body for coordinator review.
 storage = 90.1
 api     = 98.6
-app     = 63.3
+app     = 68.3
 # aws-lambdas: NEW crate (2026-07-18, rust-only phase 2b-1 — the 4 AWS
 # Lambdas as Rust bins). MEASURED-then-ratcheted per the phase-2 design:
 # local `cargo llvm-cov -p tickvault-aws-lambdas` measured 64.92% lines
@@ -58,7 +58,7 @@ app     = 63.3
 # thin [[bin]] glue files + the async AWS/HTTP-call glue, structurally
 # unexercisable without a live AWS account; every pure decision/formatting
 # fn is covered). Ratchet up-only: 66.06 → 66.0 − 0.1 = 65.9.
-aws-lambdas = 65.9
+aws-lambdas = 81.1
 # tickvault-logs-mcp: INITIAL floor (2026-07-18, rust-only phase 2c — the
 # new Rust MCP crate). Locally measured 85.83% line coverage (cargo
 # llvm-cov -p tickvault-logs-mcp, all targets — the parity integration
@@ -69,4 +69,4 @@ aws-lambdas = 65.9
 # collection); RATCHET to the standing formula (measured rounded down to
 # one decimal minus 0.1) in a follow-up once the first post-merge CI
 # measurement lands.
-tickvault-logs-mcp = 80.0
+tickvault-logs-mcp = 87.3
