@@ -219,7 +219,7 @@ commits MUST cite the verdict file's commit hash.
   * Operator daily startup: `docs/runbooks/operator-daily-startup.md`
   * Daily discipline: `docs/runbooks/daily-operations.md`
   * Troubleshooting (per ErrorCode): `docs/runbooks/troubleshooting.md`
-  * SLO score: `.claude/rules/project/wave-3-d-error-codes.md::SLO-02`
+  * SLO score: `docs/error-runbooks/wave-3-d-error-codes.md::SLO-02`
   * Operator charter: `.claude/rules/project/operator-charter-forever.md`
 
 ## The honest 100% claim (for Phase 1 promotion only)
