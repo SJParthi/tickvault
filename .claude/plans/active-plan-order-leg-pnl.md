@@ -1,6 +1,6 @@
 # Implementation Plan: Option-Contract-Leg P&L (dry-run order runtime)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-19
 **Approved by:** Parthiban (operator) — standing GO 2026-07-19 ("just goa head with everythgin dude okay?", relayed via the coordinator session). Recorded per the operator's ZERO-TOUCH governance pre-authorization: plan Status is APPROVED the moment it exists for operator-ordered work.
 
@@ -142,23 +142,23 @@ Round-5 reviewer pair (fold verifier + fresh refuter) returned FIX-FIRST; folded
 
 ## Plan Items
 
-- [ ] Item 1 — pure `PositionInfo::unrealized_at` + engine delegation
+- [x] Item 1 — pure `PositionInfo::unrealized_at` + engine delegation
   - Files: crates/trading/src/risk/types.rs, crates/trading/src/risk/engine.rs
   - Tests: test_unrealized_at_boundaries, test_total_unrealized_delegation_equivalence
-- [ ] Item 2 — `LegPnlEvent` emission at the fill + mark seams (FNO-only gate)
+- [x] Item 2 — `LegPnlEvent` emission at the fill + mark seams (FNO-only gate)
   - Files: crates/app/src/order_runtime.rs
   - Tests: test_leg_pnl_fill_state_walk, test_leg_pnl_mark_emission_fno_only, test_leg_pnl_cross_segment_distinct, test_leg_pnl_off_emits_nothing
-- [ ] Item 3 — day identity reverse index + ArcSwap publish
+- [x] Item 3 — day identity reverse index + ArcSwap publish
   - Files: crates/app/src/groww_cadence_executor.rs
   - Tests: test_leg_identity_index_build, test_leg_identity_sentinel_then_heal
-- [ ] Item 4 — `order_leg_pnl` persistence (DDL + DEDUP + writer)
+- [x] Item 4 — `order_leg_pnl` persistence (DDL + DEDUP + writer)
   - Files: crates/storage/src/order_leg_pnl_persistence.rs, crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs
   - Tests: test_order_leg_pnl_ddl_idempotent, test_order_leg_pnl_dedup_key_has_feed_and_segment, test_order_leg_pnl_flush_failure_discards, test_order_leg_pnl_nonfinite_clamp
   - ensure_order_leg_pnl_table and the lazy writer new() carry // TEST-EXEMPT: comments per the exemplar order_update_events_persistence.rs (:102/:219/:318/:346/:357 pattern) so pub-fn-test-guard passes without vacuous tests.
-- [ ] Item 5 — config + boot consumer + gate wiring
+- [x] Item 5 — config + boot consumer + gate wiring
   - Files: crates/common/src/config.rs, config/base.toml, crates/app/src/order_leg_pnl_boot.rs, crates/app/src/dhan_rest_stack.rs, crates/app/src/main.rs
   - Tests: test_order_leg_pnl_config_default_off, test_boot_gate_resolved_once
-- [ ] Item 6 — `ErrorCode::OrderPnl01PersistFailed` + rule file
+- [x] Item 6 — `ErrorCode::OrderPnl01PersistFailed` + rule file
   - Files: crates/common/src/error_code.rs, .claude/rules/project/order-leg-pnl-error-codes.md
   - Tests: rides error_code_tag_guard, error_code_rule_file_crossref, all-variants match tests
   - MANDATORY companion edit: bump the build-failing count-assert at crates/common/src/error_code.rs:2771 from assert_eq!(ErrorCode::all().len(), 164) to 165, with the house dated-comment convention beside it: "+1 ORDER-PNL-01 (2026-07-19) => 165" (mirroring the :2761-2765 style).
