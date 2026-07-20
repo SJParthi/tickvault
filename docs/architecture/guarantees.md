@@ -165,7 +165,7 @@ no shell, no curl, no grep:
 | `cargo audit` | YES | every push |
 | `cargo deny` | YES | every push |
 | 30-check validate-automation | YES | every push |
-| Ratcheted per-crate LINE-coverage floors (63.3–99.5, target 100%; no branch gate) | YES | post-merge only (not a PR blocker) |
+| Ratcheted per-crate LINE-coverage floors (68.3–99.5, target 100%; no branch gate) | YES | post-merge only (not a PR blocker) |
 | Mutation zero-survivors | YES | weekly |
 | Fuzz 0 crashes | YES | weekly |
 

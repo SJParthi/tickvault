@@ -54,13 +54,14 @@ use std::path::Path;
 const PINNED_DEFAULT_FLOOR: f64 = 63.0;
 const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     ("common", 99.5),
-    ("core", 90.2),
+    ("core", 91.6),
     ("trading", 96.9),
     ("storage", 90.1),
     ("api", 98.6),
-    ("app", 63.3),
-    ("aws-lambdas", 64.8),
-    ("tickvault-logs-mcp", 80.0),
+    ("app", 68.3),
+    ("aws-lambdas", 81.1),
+    // 2026-07-20: 80.0 -> 87.3 - the ratchet promised above (first CI Coverage & Perf measurement 87.64 on runs 29739772946 + 29745302463; PR #1694).
+    ("tickvault-logs-mcp", 87.3),
 ];
 
 fn read_thresholds_toml() -> String {
