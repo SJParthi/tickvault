@@ -94,6 +94,10 @@ change is introduced (relocation + path literals only).
 - [x] Move 47 runbook files verbatim to `docs/error-runbooks/`
   - Files: 46 × `*-error-codes.md` (not cadence) + `dual-instance-lock-2026-07-04.md`
   - Tests: every_runbook_path_exists_on_disk
+  - Merge-forward note (2026-07-20): main's PR #1691 added
+    `order-leg-pnl-error-codes.md` under `.claude/rules/project/`; folded
+    into `docs/error-runbooks/` at the merge (48 runbooks + README now live
+    there; `runbook_path()` + `error-rules.yaml` repointed in the same fold).
 - [x] Update `runbook_path()` literals + prefix unit test
   - Files: crates/common/src/error_code.rs
   - Tests: test_every_variant_has_non_empty_runbook_path
