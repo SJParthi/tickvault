@@ -125,6 +125,30 @@ pub(crate) fn map_groww_chain_failure(f: &GrowwChainFetchFailure) -> CadenceFetc
     CadenceFetchError::Transport
 }
 
+/// Pure (H1, audit 2026-07-20): classify a Groww 2xx spot body whose
+/// target minute is MISSING — `(audit class, audit outcome, cadence
+/// error)`. A ZERO-candle parse that counted malformed rows (garbage
+/// envelope, wrong-shape tuples, unparseable timestamps) is a
+/// `malformed_body` ERROR ([`CadenceFetchError::Malformed`] — terminal,
+/// non-arming, folded into the `fetch_failed` stage), never dressed as
+/// vendor absence. Candles-without-the-target and a CLEAN zero-candle
+/// body stay the honest `empty` class.
+#[must_use]
+pub(crate) fn groww_spot_zero_candle_class(
+    zero_candles: bool,
+    stats: &crate::groww_spot_1m_boot::GrowwParseStats,
+) -> (&'static str, RestFetchOutcome, CadenceFetchError) {
+    if zero_candles && stats.malformed_rows > 0 {
+        (
+            "malformed_body",
+            RestFetchOutcome::Error,
+            CadenceFetchError::Malformed,
+        )
+    } else {
+        ("empty", RestFetchOutcome::Empty, CadenceFetchError::Empty)
+    }
+}
+
 /// Groww identity + moneyness-latch slot for a chain underlying — looked
 /// up from the pinned [`GROWW_CHAIN_1M_UNDERLYINGS`] set by the plain
 /// symbol. Returns `(slot, underlying, exchange, groww_symbol)`.
@@ -186,6 +210,72 @@ fn build_contract_mark_index(books: &[GrowwContractBook]) -> ContractMarkIndex {
                     index
                         .entry((book.underlying, book.expiry, key, leg))
                         .or_insert((token, seg_code));
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Reverse identity for one FNO option leg — everything the leg-P&L
+/// persister needs to label a row, keyed by the SAME
+/// `(exchange_token, segment_code)` pair the mark tap emits. Built beside
+/// the forward mark index on the once-per-day master download (zero extra
+/// REST; never on the chain fire's deadline-bounded critical path).
+/// `underlying` borrows the book's `&'static str` symbol — zero allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionLegIdentity {
+    pub underlying: &'static str,
+    pub expiry: NaiveDate,
+    pub strike_paise: i64,
+    pub option_type: tickvault_common::types::OptionType,
+}
+
+/// Reverse index `(exchange_token, segment_code) -> identity` for the
+/// leg-P&L consumer. O(1) lookup per persisted row.
+pub type LegIdentityIndex = std::collections::HashMap<(u64, u8), OptionLegIdentity>;
+
+/// Day-stamped shared handle for the leg identity index. The cadence
+/// executor STOREs a fresh `(day, index)` once per daily master download;
+/// the leg-P&L boot consumer LOADs lock-free per row. `None` (pre-publish)
+/// means the consumer persists identity sentinels (counted) — later rows
+/// self-heal once today's index lands.
+pub type SharedLegIdentityIndex =
+    std::sync::Arc<arc_swap::ArcSwapOption<(NaiveDate, LegIdentityIndex)>>;
+
+/// Fresh, empty shared leg-identity handle. Created once at boot (main.rs),
+/// cloned into the cadence executor (the publisher) and the order-leg P&L
+/// boot consumer (the reader). Empty until the first daily master publish.
+#[must_use]
+pub fn new_shared_leg_identity_index() -> SharedLegIdentityIndex {
+    std::sync::Arc::new(arc_swap::ArcSwapOption::empty())
+}
+
+/// Build the reverse identity index from the SAME resolved books the
+/// forward mark index uses. First-wins on a `(token, segment)` collision —
+/// mirrors the forward index's `or_insert` law; colliding master rows are
+/// already counted upstream by `resolve_groww_contract_books`.
+fn build_leg_identity_index(books: &[GrowwContractBook]) -> LegIdentityIndex {
+    let mut index = LegIdentityIndex::new();
+    for book in books {
+        let seg_code = contract_segment_code(book.segment);
+        for slot in &book.strikes {
+            let Some(strike_paise) = strike_paise_key(slot.strike) else {
+                continue;
+            };
+            for (option_type, contract) in [
+                (tickvault_common::types::OptionType::Call, slot.ce.as_ref()),
+                (tickvault_common::types::OptionType::Put, slot.pe.as_ref()),
+            ] {
+                if let Some(contract) = contract
+                    && let Ok(token) = u64::try_from(contract.token)
+                {
+                    index.entry((token, seg_code)).or_insert(OptionLegIdentity {
+                        underlying: book.underlying,
+                        expiry: book.expiry,
+                        strike_paise,
+                        option_type,
+                    });
                 }
             }
         }
@@ -302,6 +392,10 @@ pub struct GrowwCadenceExecutor {
     /// the first-seen-SEGMENT tripwire (segments match across the
     /// split). `None` ⇒ `[order_runtime]` disabled — zero work.
     mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
+    /// Item 3 (order-leg-pnl): day-stamped reverse identity handle for the
+    /// leg-P&L consumer. Always constructed (two pointers when idle); the
+    /// daily loop publishes into it only when the mark forwarder is wired.
+    leg_identity_index: SharedLegIdentityIndex,
 }
 
 impl GrowwCadenceExecutor {
@@ -313,6 +407,7 @@ impl GrowwCadenceExecutor {
         questdb: &QuestDbConfig,
         notifier: Option<Arc<NotificationService>>,
         mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
+        leg_identity_index: SharedLegIdentityIndex,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
@@ -341,6 +436,7 @@ impl GrowwCadenceExecutor {
             escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier,
             mark_forwarder,
+            leg_identity_index,
         })
     }
 
@@ -366,6 +462,7 @@ impl GrowwCadenceExecutor {
             escalation: Mutex::new(LaneEscalation::new(Feed::Groww)),
             notifier: None,
             mark_forwarder: None,
+            leg_identity_index: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         }
     }
 
@@ -575,12 +672,19 @@ impl CadenceExecutor for GrowwCadenceExecutor {
             flush_off_worker(|| audit_flush_best_effort(&mut audit));
             return Err(CadenceFetchError::Transport);
         }
-        let (candles, _stats) = parse_groww_1m_candles(&body);
+        let (candles, stats) = parse_groww_1m_candles(&body);
         let Some(candle) = candles
             .iter()
             .find(|c| c.minute_ts_ist_nanos == target_nanos)
             .copied()
         else {
+            // H1 (audit 2026-07-20): a ZERO-candle parse that COUNTED
+            // malformed rows/envelope is a wrong-shape body — an ERROR
+            // class (`Malformed`, terminal, non-arming), never dressed as
+            // vendor absence. A body with candles but no target minute,
+            // or a clean zero-candle body, stays the honest Empty.
+            let (class, audit_outcome, mapped) =
+                groww_spot_zero_candle_class(candles.is_empty(), &stats);
             let mut audit = self.audit_writer.lock().await;
             audit_append_best_effort(
                 &mut audit,
@@ -592,13 +696,13 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                     1,
                     200,
                     0,
-                    RestFetchOutcome::Empty,
+                    audit_outcome,
                     -1,
-                    "empty",
+                    class,
                 ),
             );
             flush_off_worker(|| audit_flush_best_effort(&mut audit));
-            return Err(CadenceFetchError::Empty);
+            return Err(mapped);
         };
         let close_to_data_ms =
             (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
@@ -994,12 +1098,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
             let mut persist_failed = false;
             {
                 let mut writer = self.chain_writer.lock().await;
-                for ((leg, leg_moneyness), leg_depth) in chain
-                    .legs
-                    .iter()
-                    .zip(cls.row_moneyness.iter())
-                    .zip(cls.row_depth.iter())
-                {
+                for (leg, leg_label) in chain.legs.iter().zip(cls.row_labels.iter()) {
                     let row = OptionChain1mRow {
                         ts_ist_nanos: target_nanos,
                         trading_date_ist_nanos: trading_date_nanos,
@@ -1022,11 +1121,7 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                         // underlying_ltp_missing forensics convention).
                         underlying_spot: chain.underlying_ltp,
                         fetched_at_ist_nanos: fetched_at,
-                        moneyness: leg_moneyness.as_str(),
-                        // Signed depth (2026-07-17 merge) — classified from
-                        // the GUARDED moneyness_spot above; None (→ NULL)
-                        // whenever that spot / the strike were invalid.
-                        moneyness_depth: *leg_depth,
+                        moneyness: *leg_label,
                     };
                     if let Err(err) =
                         writer.append_row_ext(&row, Some(leg.rho), Some(close_to_data_ms))
@@ -1124,6 +1219,12 @@ impl CadenceExecutor for GrowwCadenceExecutor {
             // strategy exists), so this tap is PLUMBING for future
             // option-leg unrealized P&L, restoring nothing today.
             if !persist_failed && let Some(forwarder) = self.mark_forwarder.as_ref() {
+                // NOTE (cold-path follow-up): the contract_marks mutex is held
+                // across the per-leg forwarding loop below (one per-minute chain
+                // fire). This is COLD path (not the tick hot path) so it is not a
+                // latency concern today, but a future refactor could snapshot the
+                // needed index rows under the lock and drop the guard before the
+                // loop. Deliberately left as-is here — no behaviour change.
                 let marks = self.contract_marks.lock().await;
                 match marks.as_ref().filter(|(day, _)| *day == trading_date) {
                     Some((_, index)) => {
@@ -1305,6 +1406,12 @@ impl CadenceExecutor for GrowwCadenceExecutor {
                 );
             }
             *self.contract_marks.lock().await = Some((today, index));
+            // Item 3 (order-leg-pnl): publish the day-stamped reverse
+            // identity index — lock-free swap; consumer rows that went
+            // out as identity sentinels self-heal once this lands.
+            let identity = build_leg_identity_index(&books);
+            self.leg_identity_index
+                .store(Some(std::sync::Arc::new((today, identity))));
         }
         Ok(out)
     }
@@ -1312,6 +1419,11 @@ impl CadenceExecutor for GrowwCadenceExecutor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_new_shared_leg_identity_index_starts_empty() {
+        assert!(super::new_shared_leg_identity_index().load_full().is_none());
+    }
+
     use super::*;
 
     fn spot_failure(status: u16, rate_limited: bool, auth_rejected: bool) -> FetchFailure {
@@ -1344,6 +1456,107 @@ mod tests {
         assert_eq!(strike_paise_key(-5.0), None);
         assert_eq!(strike_paise_key(f64::NAN), None);
         assert_eq!(strike_paise_key(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn test_leg_identity_index_build() {
+        use crate::groww_contract_1m_boot::{GrowwContractRef, GrowwStrikeSlot};
+        let book = GrowwContractBook {
+            underlying: "NIFTY",
+            exchange: "NSE",
+            segment: "NSE_FNO",
+            underlying_security_id: 1,
+            expiry: NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            strikes: vec![
+                GrowwStrikeSlot {
+                    strike: 25500.0,
+                    ce: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25500-CE".to_string(),
+                        token: 12345,
+                    }),
+                    pe: None,
+                },
+                GrowwStrikeSlot {
+                    strike: 25600.0,
+                    ce: None,
+                    pe: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25600-PE".to_string(),
+                        token: -7,
+                    }),
+                },
+            ],
+        };
+        let books = [book];
+        let forward = build_contract_mark_index(&books);
+        let identity = build_leg_identity_index(&books);
+        assert!(!forward.is_empty(), "fixture must resolve real tokens");
+        assert_eq!(
+            identity.len(),
+            forward.len(),
+            "reverse index must cover exactly the forward entries"
+        );
+        for ((underlying, expiry, strike_paise, leg), (token, seg)) in &forward {
+            let got = identity
+                .get(&(*token, *seg))
+                .expect("every forward entry has a reverse identity");
+            assert_eq!(got.underlying, *underlying);
+            assert_eq!(got.expiry, *expiry);
+            assert_eq!(got.strike_paise, *strike_paise);
+            assert_eq!(got.option_type.as_str(), *leg);
+        }
+    }
+
+    #[test]
+    fn test_leg_identity_sentinel_then_heal() {
+        let handle: SharedLegIdentityIndex = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+        // Pre-publish: the handle reads None — the consumer persists
+        // identity SENTINELS (counted), never a guessed identity.
+        assert!(handle.load_full().is_none());
+
+        use crate::groww_contract_1m_boot::{GrowwContractRef, GrowwStrikeSlot};
+        let book = GrowwContractBook {
+            underlying: "NIFTY",
+            exchange: "NSE",
+            segment: "NSE_FNO",
+            underlying_security_id: 1,
+            expiry: NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            strikes: vec![
+                GrowwStrikeSlot {
+                    strike: 25500.0,
+                    ce: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25500-CE".to_string(),
+                        token: 12345,
+                    }),
+                    pe: None,
+                },
+                GrowwStrikeSlot {
+                    strike: 25600.0,
+                    ce: None,
+                    pe: Some(GrowwContractRef {
+                        groww_symbol: "NSE-NIFTY-30Jul26-25600-PE".to_string(),
+                        token: -7,
+                    }),
+                },
+            ],
+        };
+        let books = [book];
+        let today = books[0].expiry;
+        let built = build_leg_identity_index(&books);
+        assert!(!built.is_empty());
+        handle.store(Some(std::sync::Arc::new((today, built))));
+
+        // Post-publish: the SAME lookup heals — day stamp + identity fields.
+        let published = handle.load_full().expect("published day index");
+        let (day, idx) = &*published;
+        assert_eq!(*day, today);
+        let ((_, expiry, strike_paise, leg), (token, seg)) = build_contract_mark_index(&books)
+            .into_iter()
+            .next()
+            .expect("fixture entry");
+        let got = idx.get(&(token, seg)).expect("healed identity");
+        assert_eq!(got.expiry, expiry);
+        assert_eq!(got.strike_paise, strike_paise);
+        assert_eq!(got.option_type.as_str(), leg);
     }
 
     #[test]
@@ -1622,5 +1835,34 @@ mod tests {
             "the heartbeat gauge must be persist-gated: inside fetch_spot's \
              flush_ok guard after the flush ACK, before the fold handoff"
         );
+    }
+
+    /// H1 (audit 2026-07-20): the Groww spot zero-candle malformed-vs-
+    /// empty split — a zero-candle parse with counted malformed rows is
+    /// a terminal Error class, never dressed as vendor absence.
+    #[test]
+    fn groww_spot_zero_candle_malformed_vs_empty() {
+        use crate::groww_spot_1m_boot::GrowwParseStats;
+        let dirty = GrowwParseStats {
+            malformed_rows: 1,
+            ..GrowwParseStats::default()
+        };
+        // Zero candles + malformed markers ⇒ Error/Malformed.
+        let (class, outcome, err) = groww_spot_zero_candle_class(true, &dirty);
+        assert_eq!(class, "malformed_body");
+        assert_eq!(outcome, RestFetchOutcome::Error);
+        assert_eq!(err, CadenceFetchError::Malformed);
+        // Clean zero-candle body ⇒ honest empty.
+        let clean = GrowwParseStats::default();
+        let (class, outcome, err) = groww_spot_zero_candle_class(true, &clean);
+        assert_eq!(class, "empty");
+        assert_eq!(outcome, RestFetchOutcome::Empty);
+        assert_eq!(err, CadenceFetchError::Empty);
+        // Candles present (target missing) — even with skipped rows the
+        // body served data: stays the honest empty class.
+        let (class, outcome, err) = groww_spot_zero_candle_class(false, &dirty);
+        assert_eq!(class, "empty");
+        assert_eq!(outcome, RestFetchOutcome::Empty);
+        assert_eq!(err, CadenceFetchError::Empty);
     }
 }

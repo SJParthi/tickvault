@@ -13,8 +13,8 @@
 //! Scope: PRICE columns only. Greeks (delta/theta/gamma/vega) and IV are
 //! DELIBERATELY EXCLUDED (operator decision 2026-05-29 — delta is 0-1,
 //! IV is a fraction; 2dp would destroy them). The `*_pct_from_prev_day`
-//! columns are rounded upstream at compute time
-//! (`pct_stamping::compute_*`), so they need no write-site wrap.
+//! percentage columns are likewise outside this guard's PRICE-column
+//! scope, so they carry no write-site `round_to_2dp` wrap here.
 //!
 //! See: `.claude/rules/project/data-integrity.md` (Price Precision),
 //! `crates/common/src/price_precision.rs::round_to_2dp`.

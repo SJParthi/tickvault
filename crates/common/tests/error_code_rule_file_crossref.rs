@@ -226,6 +226,12 @@ fn load_all_rule_text() -> String {
     let rules_dir = root.join(".claude").join("rules");
     let mut combined = String::new();
     collect_markdown_contents(&rules_dir, &mut combined);
+    // Phase-2 rules-tree diet (2026-07-20): per-error-code runbook files moved
+    // verbatim out of the auto-loaded `.claude/rules/` tree into
+    // `docs/error-runbooks/` (context-size incident). Both crossref directions
+    // scan the runbook directory alongside the rules tree.
+    let runbooks_dir = root.join("docs").join("error-runbooks");
+    collect_markdown_contents(&runbooks_dir, &mut combined);
     combined
 }
 

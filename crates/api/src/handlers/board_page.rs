@@ -340,14 +340,30 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
     var strip = document.getElementById("dbStrip");
     strip.replaceChildren();
     var db = d.db || {};
-    var t = el("span"); t.id = "dbTicks";
-    if (typeof db.ticks_today === "number") countUp(t, db.ticks_today); else t.textContent = "—";
-    strip.appendChild(dbCell("Price updates saved today", t));
+    // "Price updates saved today" tile RETIRED 2026-07-19 (BATCH-5): the `ticks`
+    // writer was deleted 2026-07-17, so `db.ticks_today` no longer exists in the
+    // BoardDb payload and the tile rendered a permanent "—". Removed, not
+    // repointed — the "ticks captured" concept is dead in the REST-era runtime.
     var c = el("span"); c.id = "dbCandles";
     if (typeof db.candles_1m_today === "number") countUp(c, db.candles_1m_today); else c.textContent = "—";
     strip.appendChild(dbCell("Minute summaries (candles) sealed today", c));
     var r = el("span", db.reachable ? "lastTick" : null, db.reachable ? "✅ answering" : "🆘 not answering");
     strip.appendChild(dbCell("Vault (database) right now", r));
+    // Cross-fill today (operator 2026-07-20): how many times one broker's
+    // minute was filled from the other broker, with the precise times.
+    var xf = el("span");
+    var xfEvents = db.cross_fill_events;
+    if (Array.isArray(xfEvents)) {
+      var n = (typeof db.cross_fill_today === "number") ? db.cross_fill_today : xfEvents.length;
+      xf.textContent = (n === 0) ? "0 ✅" : String(n);
+    } else {
+      xf.textContent = "—"; // table unreadable — honest unknown, never 0
+    }
+    var xfCell = dbCell("Cross-fill today (one broker filled from the other)", xf);
+    if (Array.isArray(xfEvents) && xfEvents.length) {
+      xfCell.appendChild(el("div", "lab", xfEvents.slice(0, 6).join(" · ")));
+    }
+    strip.appendChild(xfCell);
   }
 
   // ---------- 6. problems (bearer-gated error log) ----------
@@ -465,6 +481,10 @@ mod tests {
         // test coverage (pub-fn-test-guard): board_page
         assert!(BOARD_HTML.starts_with("<!DOCTYPE html>"));
         assert!(BOARD_HTML.contains("TickVault — Live Board"), "title");
+        assert!(
+            BOARD_HTML.contains("Cross-fill today"),
+            "cross-fill tile present (operator 2026-07-20)"
+        );
         assert!(
             BOARD_HTML.contains("LOCAL — live data"),
             "LOCAL badge present"

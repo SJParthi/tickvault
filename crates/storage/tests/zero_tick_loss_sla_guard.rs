@@ -101,7 +101,7 @@ fn test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames() {
                 let outcome = spill.append(ws_type, frame);
                 assert!(
                     matches!(outcome, AppendOutcome::Spilled),
-                    "append #{i} on {ws_type:?} must be Spilled (not Dropped) — channel has 65K capacity"
+                    "append #{i} on {ws_type:?} must be Spilled (not Dropped) — channel has 131K capacity"
                 );
             }
         }
@@ -120,7 +120,7 @@ fn test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames() {
             spill.drop_critical_count(),
             0,
             "ZERO-TICK-LOSS VIOLATION: {} frame(s) dropped by spill hot path. \
-             Channel is 65K deep and we only wrote {expected_total} — this \
+             Channel is 131K deep and we only wrote {expected_total} — this \
              means the writer thread is genuinely stuck, not just slow.",
             spill.drop_critical_count()
         );

@@ -45,6 +45,9 @@ pub mod brutex_crossverify_boot;
 // `.claude/rules/project/cadence-error-codes.md`.
 pub mod cadence_boot;
 pub(crate) mod cadence_escalation;
+/// Cross-fill visibility (operator 2026-07-20): audit-channel consumer +
+/// the 15:47 IST daily Telegram digest over `cross_fill_audit`.
+pub mod cross_fill_visibility;
 // Boot-time candle-table DDL + retired-object sweep (Track A, 2026-07-18):
 // re-homes the pre-#1522 drop-legacy → ensure-candles → named-views chain
 // behind a bounded quiet probe; awaited from `build_shared_infra` BEFORE
@@ -202,10 +205,10 @@ pub mod infra;
 // previous-day OHLCV REST fetch retired with the Dhan live-WS lane (operator
 // 2026-07-13; prev-day-ohlcv-error-codes.md retirement banner). The
 // `prev_day_ohlcv` QuestDB table is retained (forensic).
-// F2 (Wave-5 #504e follow-up) — boot-time loader for `PrevDayCache`
-// so the cascade seal-time pct-stamping path (PR #520 / F1) sees
-// non-zero `prev_day_close` values from QuestDB's `previous_close`
-// table on cold boot.
+// Dead-code cleanup — BATCH-5 (2026-07-19): the F2 boot-time `PrevDayCache`
+// loader stub is gone — `PrevDayCache` + the seal-time pct-stamping path were
+// removed (their sole feeder retired with the live-WS feeds). The PREVCLOSE-04
+// ErrorCode variant is retained (documented in wave-1-error-codes.md).
 pub mod metrics_catalog;
 // PR-C3 (2026-07-14, operator retirement directive 2026-07-13 — scope-lock
 // amendment §B): the Dhan lifecycle-reconcile + fetch-audit chain is
@@ -236,6 +239,8 @@ pub mod observability;
 /// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so
 /// the two OMS construction sites can never drift.
 pub mod oms_wiring;
+/// Order-leg option P&L capture boot (ORDER-PNL-01, default-OFF).
+pub mod order_leg_pnl_boot;
 /// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
 /// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily

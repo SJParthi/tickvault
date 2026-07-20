@@ -109,6 +109,11 @@ pub mod http_client;
 /// with a keep-better outcome guard — written via ILP-over-HTTP (per-flush
 /// server ACK). See `.claude/rules/project/brutex-crossverify-error-codes.md`.
 pub mod brutex_crossverify_persistence;
+/// Cadence cross-fill visibility (operator 2026-07-20): one forensic row per
+/// cross-fill / Groww-fallback event with the precise minute + latency —
+/// the "every day, week, month, precisely at what time" system-of-record.
+/// See `.claude/rules/project/cadence-error-codes.md` §4 (CADENCE-04).
+pub mod cross_fill_audit_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): one classified row per feed
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
@@ -208,6 +213,7 @@ pub mod order_audit_persistence;
 // Full-fidelity order/position push-event capture (design 2026-07-18;
 // ORDER-EVT-01): one row per received broker push event, BOTH feeds —
 // the capture companions of the lossy 11-field BrokerOrderEvent seam.
+pub mod order_leg_pnl_persistence;
 pub mod order_update_events_persistence;
 pub mod position_update_events_persistence;
 // Cluster-C order-side observability (2026-07-14): daily P&L snapshot
