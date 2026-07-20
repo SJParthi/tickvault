@@ -31,6 +31,7 @@ use super::assembly::{
     ChainCell, ChainProvenance, LaneAssembly, MoneynessFold, SpotProvenance,
     chain_moneyness_anchor, cross_fill_freshness_floor_ms, fold_chain_cell_moneyness,
 };
+use super::audit::{CrossFillAuditEvent, emit_cross_fill_audit};
 use super::decision::{
     CadenceEvent, CadenceState, DecisionLatch, DecisionOutcome, DecisionSnapshot, SkipReason,
     emit_decision, may_decide_at_completion, next_cadence_state,
@@ -2077,6 +2078,27 @@ fn handle_action<C, D, G>(
                 cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
                 cycle.groww_leg_inflight[*k + ChainUnderlying::COUNT] = true;
             }
+            // Cross-fill visibility (operator 2026-07-20): one forensic
+            // audit event per fallback LAUNCH (the lane's own late retry —
+            // `resolution = native_late_retry`); the resolution instant is
+            // unknown at launch, so `resolved_at_ms_after_close = -1`.
+            {
+                let (ts_ist_nanos, trading_date_ist_nanos) =
+                    cross_fill_audit_stamp(clock.as_ref(), slots.cycle_minute_ist);
+                emit_cross_fill_audit(CrossFillAuditEvent {
+                    ts_ist_nanos,
+                    trading_date_ist_nanos,
+                    lane: Feed::Groww.as_str(),
+                    source_lane: Feed::Groww.as_str(),
+                    stage: "groww_fallback",
+                    cycle_minute_ist: slots.cycle_minute_ist,
+                    spots: failed_spots.len() as u32,
+                    chains: failed_chains.len() as u32,
+                    cycle_latency_ms: clock.ist_ms_of_day().saturating_sub(slots.boundary_ms),
+                    ladder_rung: slots.groww_shape,
+                    resolved_at_ms_after_close: -1,
+                });
+            }
             let exec = Arc::clone(&deps.groww_executor);
             let fallback_tx = tx.clone();
             let timeout_ms = deps.config.groww_request_timeout_ms;
@@ -2788,6 +2810,31 @@ fn finalize_if_complete<C: CadenceClock>(
                 metrics::counter!("tv_cadence_spot_fallback_total", "source" => "cross_source")
                     .increment(u64::from(spots));
             }
+            // Cross-fill visibility (operator 2026-07-20): one forensic
+            // audit event per cross-fill firing, fire-and-forget off the
+            // decision path — the precise minute + latency land in the
+            // `cross_fill_audit` table via the app-side consumer.
+            let ladder_rung = if lane.asm.feed == Feed::Dhan {
+                slots.dhan_shape
+            } else {
+                slots.groww_shape
+            };
+            let latency_ms = now_wall.saturating_sub(slots.boundary_ms);
+            let (ts_ist_nanos, trading_date_ist_nanos) =
+                cross_fill_audit_stamp(clock, lane.asm.cycle_minute_ist);
+            emit_cross_fill_audit(CrossFillAuditEvent {
+                ts_ist_nanos,
+                trading_date_ist_nanos,
+                lane: lane.asm.feed.as_str(),
+                source_lane: other.asm.feed.as_str(),
+                stage: "cross_fill",
+                cycle_minute_ist: lane.asm.cycle_minute_ist,
+                spots,
+                chains,
+                cycle_latency_ms: latency_ms,
+                ladder_rung,
+                resolved_at_ms_after_close: latency_ms,
+            });
         }
         // Rung 3: the lane's own chain-embedded spot.
         let embedded = lane.asm.fill_spots_from_chain_embedded(now_wall);
@@ -2801,6 +2848,19 @@ fn finalize_if_complete<C: CadenceClock>(
         return;
     }
     decide_lane(clock, slots, lane, latch, dry_run);
+}
+
+/// The (minute-open `ts`, IST-midnight `trading_date_ist`) nanosecond
+/// stamps for a cross-fill audit event, derived from the injected clock
+/// (cold path, once per cross-fill/fallback event). Pure arithmetic over
+/// the clock reads.
+fn cross_fill_audit_stamp<C: CadenceClock>(clock: &C, cycle_minute_ist: u32) -> (i64, i64) {
+    let now_ist_nanos = ist_epoch_nanos(clock);
+    let midnight_ist_nanos =
+        now_ist_nanos.saturating_sub(clock.ist_ms_of_day().saturating_mul(1_000_000));
+    let ts_ist_nanos = midnight_ist_nanos
+        .saturating_add(i64::from(cycle_minute_ist).saturating_mul(1_000_000_000));
+    (ts_ist_nanos, midnight_ist_nanos)
 }
 
 /// IST-epoch nanoseconds "now" (the `chain_snapshot` registry's time

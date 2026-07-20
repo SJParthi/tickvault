@@ -84,6 +84,19 @@ impl Feed {
         matches!(self, Self::Groww | Self::Dhan)
     }
 
+    /// True for lanes whose LIVE-WS transport was RETIRED by operator
+    /// directive (Dhan 2026-07-13, Groww 2026-07-15) — market data now
+    /// arrives via the per-minute REST cadence pulls. Drives the honest
+    /// "off by design" wording on the /feeds panel instead of the scary
+    /// "switched off by operator" (operator-scare fix, 2026-07-20). A
+    /// future NON-retired feed adds a `false` arm here.
+    #[must_use]
+    pub const fn live_ws_retired(self) -> bool {
+        match self {
+            Self::Dhan | Self::Groww => true,
+        }
+    }
+
     /// Human-readable display name for operator-facing UI (the feed-control page
     /// renders its switch label from this — single source, so a future feed's row
     /// appears with zero page edits).
@@ -132,6 +145,15 @@ mod tests {
                 feed.is_runtime_toggleable(),
                 "{name} must be toggleable (PR-E)"
             );
+        }
+    }
+
+    #[test]
+    fn test_live_ws_retired_true_for_both_retired_lanes() {
+        // Operator-scare fix (2026-07-20): both live-WS lanes are retired
+        // (Dhan 2026-07-13, Groww 2026-07-15) — OFF is the designed state.
+        for &feed in Feed::ALL {
+            assert!(feed.live_ws_retired(), "{feed:?} live-WS lane is retired");
         }
     }
 
