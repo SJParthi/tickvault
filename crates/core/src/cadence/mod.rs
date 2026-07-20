@@ -75,6 +75,7 @@
 //! (`tickvault_common::moneyness` + `pipeline::chain_snapshot`).
 
 pub mod assembly;
+pub mod audit;
 pub mod decision;
 pub mod executor;
 pub mod expiry;
@@ -83,6 +84,7 @@ pub mod ladder;
 pub mod runner;
 pub mod schedule;
 
+pub use audit::{CrossFillAuditEvent, init_cross_fill_audit_sink};
 pub use executor::{
     CadenceExecutor, CadenceFetchError, ChainFetchOk, ChainFetchRequest, DryRunLoggingExecutor,
     ExpiryListRequest, ExpiryResolver, SpotFetchRequest, SpotSnapshot, SpotTarget,

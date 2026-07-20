@@ -133,7 +133,15 @@ pub struct FeedHealthReport {
 /// Evaluate one feed's truthful health from its live signals. Pure, O(1).
 #[must_use]
 pub fn evaluate_feed_health(feed: Feed, input: FeedHealthInput) -> FeedHealthReport {
-    let (verdict, reason) = classify(input);
+    let (verdict, mut reason) = classify(input);
+    // Operator-scare fix (2026-07-20): a RETIRED live-WS lane's OFF state is
+    // the DESIGNED runtime (market data arrives via the per-minute REST
+    // cadence pulls) — "switched off by operator" read as a fault. The
+    // classify() core stays feed-agnostic; the honest relabel applies here
+    // where the feed identity is known.
+    if verdict == FeedHealthVerdict::Disabled && feed.live_ws_retired() {
+        reason = "live-WS lane (retired) — off by design";
+    }
     FeedHealthReport {
         feed,
         verdict,
@@ -568,6 +576,9 @@ mod tests {
         );
         assert_eq!(r.verdict, FeedHealthVerdict::Disabled);
         assert_eq!(r.verdict.as_str(), "disabled");
+        // Operator-scare fix (2026-07-20): the retired live-WS lanes read
+        // "off by design", never the scary "switched off by operator".
+        assert_eq!(r.reason, "live-WS lane (retired) — off by design");
     }
 
     #[test]

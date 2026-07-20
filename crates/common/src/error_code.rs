@@ -1246,6 +1246,18 @@ pub enum ErrorCode {
     /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
     /// signal). Severity::Medium, auto-triage-safe.
     Cadence03SchedulerDegraded,
+    /// CADENCE-04: a `cross_fill_audit` forensics write DEGRADED — the
+    /// emit channel dropped an event (`stage="channel"`), the ILP
+    /// append/flush failed (`stage="append"` / `stage="flush"`), the
+    /// ensure-DDL failed (`stage="audit_ensure_*"` — duplicate-row window
+    /// per the HTTP-CLIENT-01 envelope), or the daily digest could not
+    /// read the table (`stage="digest_read"` — the digest then says
+    /// "count unknown", never a false "0 times ✅"). Best-effort ONLY:
+    /// the cadence decision path and the coalesced CADENCE-01 signal are
+    /// untouched; only the queryable forensic row / digest precision is
+    /// lost until QuestDB recovers. Severity::Medium, auto-triage-safe
+    /// (operator directive 2026-07-20 — cross-fill visibility).
+    Cadence04AuditWriteFailed,
 }
 
 impl ErrorCode {
@@ -1471,6 +1483,7 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded => "CADENCE-01",
             Self::Cadence02DecisionSkipped => "CADENCE-02",
             Self::Cadence03SchedulerDegraded => "CADENCE-03",
+            Self::Cadence04AuditWriteFailed => "CADENCE-04",
         }
     }
 
@@ -1788,6 +1801,10 @@ impl ErrorCode {
             // — self-correcting scheduling telemetry, never data loss;
             // the lane-level consequences page via CADENCE-01/02. Medium.
             Self::Cadence03SchedulerDegraded => Severity::Medium,
+            // CADENCE-04 (operator 2026-07-20): a cross_fill_audit
+            // forensics write/read failure — best-effort record only; the
+            // CADENCE-01 signal + counters still carry the event. Medium.
+            Self::Cadence04AuditWriteFailed => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -2065,7 +2082,8 @@ impl ErrorCode {
             // Cadence scheduler (operator directive 2026-07-14)
             Self::Cadence01LaneDegraded
             | Self::Cadence02DecisionSkipped
-            | Self::Cadence03SchedulerDegraded => {
+            | Self::Cadence03SchedulerDegraded
+            | Self::Cadence04AuditWriteFailed => {
                 ".claude/rules/project/cadence-error-codes.md"
             }
         }
@@ -2364,6 +2382,7 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded,
             Self::Cadence02DecisionSkipped,
             Self::Cadence03SchedulerDegraded,
+            Self::Cadence04AuditWriteFailed,
         ]
     }
 }
@@ -2839,7 +2858,15 @@ mod tests {
         assert_eq!("CADENCE-03".parse::<ErrorCode>(), Ok(c3));
         assert_eq!(c3.severity(), Severity::Medium);
         assert!(c3.is_auto_triage_safe());
-        for code in [c1, c2, c3] {
+
+        // CADENCE-04 (operator 2026-07-20): best-effort cross_fill_audit
+        // forensics write/read failure — Medium, auto-triage-safe.
+        let c4 = ErrorCode::Cadence04AuditWriteFailed;
+        assert_eq!(c4.code_str(), "CADENCE-04");
+        assert_eq!("CADENCE-04".parse::<ErrorCode>(), Ok(c4));
+        assert_eq!(c4.severity(), Severity::Medium);
+        assert!(c4.is_auto_triage_safe());
+        for code in [c1, c2, c3, c4] {
             assert_eq!(
                 code.runbook_path(),
                 ".claude/rules/project/cadence-error-codes.md"
