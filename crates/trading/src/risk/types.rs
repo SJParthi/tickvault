@@ -62,6 +62,25 @@ pub struct PositionInfo {
     pub lot_size: u32,
 }
 
+impl PositionInfo {
+    /// Unrealized P&L in rupees for this leg at the given mark price.
+    ///
+    /// The ONE unrealized formula — the risk-engine total and the
+    /// per-leg P&L emission path both delegate here (order-leg-pnl
+    /// Item 1). A non-finite mark or entry yields 0.0 (defense in
+    /// depth — `update_market_price` rejects non-finite marks
+    /// upstream) and a zero `lot_size` is treated as 1, mirroring
+    /// the `record_fill` guard.
+    #[must_use]
+    pub fn unrealized_at(&self, mark: f64) -> f64 {
+        if !mark.is_finite() || !self.avg_entry_price.is_finite() {
+            return 0.0;
+        }
+        let lot = if self.lot_size == 0 { 1 } else { self.lot_size };
+        (mark - self.avg_entry_price) * f64::from(self.net_lots) * f64::from(lot)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -69,6 +88,60 @@ pub struct PositionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unrealized_at_boundaries() {
+        // Long profit: (110 - 100) * 2 * 75 = 1500.
+        let long = PositionInfo {
+            net_lots: 2,
+            avg_entry_price: 100.0,
+            realized_pnl: 0.0,
+            lot_size: 75,
+        };
+        assert!((long.unrealized_at(110.0) - 1500.0).abs() < 1e-9);
+
+        // Short profit: (190 - 200) * (-3) * 50 = 1500.
+        let short = PositionInfo {
+            net_lots: -3,
+            avg_entry_price: 200.0,
+            realized_pnl: 0.0,
+            lot_size: 50,
+        };
+        assert!((short.unrealized_at(190.0) - 1500.0).abs() < 1e-9);
+
+        // Flat leg: net_lots 0 => 0.0 at any mark.
+        let flat = PositionInfo {
+            net_lots: 0,
+            avg_entry_price: 100.0,
+            realized_pnl: 0.0,
+            lot_size: 75,
+        };
+        assert!(flat.unrealized_at(1.0).abs() < 1e-9);
+        assert!(flat.unrealized_at(99999.0).abs() < 1e-9);
+
+        // lot_size 0 treated as 1 (record_fill guard mirror):
+        // (12.5 - 10.0) * 1 * 1 = 2.5.
+        let zero_lot = PositionInfo {
+            net_lots: 1,
+            avg_entry_price: 10.0,
+            realized_pnl: 0.0,
+            lot_size: 0,
+        };
+        assert!((zero_lot.unrealized_at(12.5) - 2.5).abs() < 1e-9);
+
+        // Non-finite marks yield 0.0 (defense in depth).
+        assert!(long.unrealized_at(f64::NAN).abs() < 1e-9);
+        assert!(long.unrealized_at(f64::INFINITY).abs() < 1e-9);
+
+        // Large-magnitude stays finite.
+        let large = PositionInfo {
+            net_lots: 1000,
+            avg_entry_price: 1.0,
+            realized_pnl: 0.0,
+            lot_size: 75,
+        };
+        assert!(large.unrealized_at(1.0e6).is_finite());
+    }
 
     #[test]
     fn risk_check_approved() {

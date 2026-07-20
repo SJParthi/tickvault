@@ -29,11 +29,13 @@ paths:
 > (config-gated dual-spawn), `crates/common/src/config.rs::CadenceConfig`
 > (`[cadence]`, serde default OFF; base.toml ships `enabled = false`),
 > `crates/common/src/error_code.rs::ErrorCode::{Cadence01LaneDegraded,
-> Cadence02DecisionSkipped, Cadence03SchedulerDegraded}`.
+> Cadence02DecisionSkipped, Cadence03SchedulerDegraded,
+> Cadence04AuditWriteFailed}`.
 > **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs` requires
 > this file to mention every `Cadence0*` variant verbatim — `CADENCE-01`,
-> `CADENCE-02`, `CADENCE-03`, `Cadence01LaneDegraded`, `Cadence02DecisionSkipped`
-> and `Cadence03SchedulerDegraded` appear here.
+> `CADENCE-02`, `CADENCE-03`, `CADENCE-04`, `Cadence01LaneDegraded`,
+> `Cadence02DecisionSkipped`, `Cadence03SchedulerDegraded` and
+> `Cadence04AuditWriteFailed` appear here.
 
 ---
 
@@ -396,6 +398,84 @@ Dated factual notes on what the code/config does as of 2026-07-17:
   daily); a multi-day dev process gets day-2 sweep coverage only after a
   restart.
 
+## §0d. 2026-07-20 — adversarial-verification hardening (audit fix PR) + BINDING T+4s constraints
+
+The 6-dimension adversarial verification (2026-07-20; VERDICT: 0 CRITICAL / 5
+HIGH / 14 MEDIUM) landed these classification/visibility fixes in one PR:
+
+1. **Spot malformed-vs-empty split (H1).** A 2xx spot body that parses to ZERO
+   candles is now discriminated: a WELL-FORMED empty day stays the benign
+   Empty class, but a malformed/wrong-shape body — including a rows>0 body
+   whose EVERY row fails value parsing, the exact 2026-07-15 float-timestamp
+   wire-drift class that hid 14 silent 0-row days behind `empty_no_rows` —
+   classifies audit `Error` class `malformed_body` + `CadenceFetchError::
+   Malformed` (terminal, non-arming, folds into the `fetch_failed` stage).
+   Dhan: `zero_candle_body_is_malformed` (`dhan_intraday_parse.rs`) +
+   `dhan_spot_zero_candle_class`; Groww: `groww_spot_zero_candle_class`
+   (counted `malformed_rows` on a zero-candle parse). The Dhan CHAIN empty
+   arm gains the Groww-parity `leg_shape_drift` split (M2:
+   `dhan_chain_empty_class` — strikes seen with zero extracted legs = drift).
+2. **Advisory spot-coherence bands (H3 / M14) + the divergence stages above.**
+3. **Cross-fill paise-0 donor guard (M4)** — `cross_fill_from` refuses a
+   donor spot whose paise guard failed; the borrower keeps the honest skip.
+4. **Session-tail accounting (M9)** — the `final_boundary_missed` CADENCE-03
+   stage above.
+5. **Executor persist-tail grace (M11)** — the runner's outer cancel bound is
+   the executor budget + `CADENCE_EXECUTOR_TAIL_GRACE_MS` (1.5s), so a
+   completed persist can no longer be severed from its audit append/fold
+   handoff and mislabeled `Timeout` (the executor's own deadline still types
+   the network-phase Timeout; the outer cancel is only the wedge backstop).
+
+**Limitation (H2 — documented, structural):** NO cadence leg's response
+carries an instrument/expiry echo to validate against the request — Dhan
+intraday is bare columnar arrays, Groww candles are bare tuples, Dhan
+`data.oc` and Groww `payload.strikes` echo neither underlying nor expiry.
+Response-vs-request identity validation is therefore IMPOSSIBLE on this API
+surface; the divergence bands above are the compensating plausibility check,
+and any future endpoint change that ADDS an echo field MUST wire the direct
+check and retire this Limitation row.
+
+### BINDING constraints on the T+4s retry build (H4 / H5 / M13 — plan `active-plan-cadence-late-repull.md`, branch `claude/cadence-t4s-retry`)
+
+The T+4s implementation PR MUST satisfy ALL of the following (a PR that does
+not is REJECTED in review; the plan text as of 2026-07-20 does NOT yet — Dim
+F cells A1/A4/A5):
+
+- **(H4a) Gate routing is the law for every retry.** Every hedged micro-retry
+  and every re-pull request passes `DhanGates::try_acquire_spot` /
+  `try_acquire_chain` (the cap-5 rolling-1000ms COMBINED ring + per-key
+  spacing) BEFORE dispatch. Budget safety proofs MUST cite the DhanGates ring
+  — a const-assert against the retired-for-cadence 3 rps
+  `dhan_data_api_limiter` proves nothing (coordinator ruling A, §0b).
+- **(H4b) Chain retry offsets respect the ≥3s per-key CAS gate.** A same-key
+  chain retry earlier than burst+3s either breaches the broker's 3s rule
+  (ungated) or defers to ≥T+4000 — EXACTLY the native decision deadline, so
+  it can never produce `native_late_retry`. The EXISTING
+  `dhan_chain_retry_slots_ms` slot at T+4000 is the earliest gate-legal chain
+  retry; the plan's [2000, 3000, 3800]ms offsets are SPOT-only at best and
+  MUST be re-derived per-leg-class.
+- **(H4c, M12 folded) Race classes pinned.** State whether a Timeout-class
+  first answer triggers retries (an original may still land — first-write-
+  wins / exactly-once at the assembly record MUST be pinned, the §3c
+  in-flight-skip precedent), and either await-or-skip between the pinned
+  offsets so two same-leg retries can never be concurrently in flight.
+- **(H5) Background re-pull collision analysis is mandatory.** The
+  `[30_000, 60_000]`ms re-pull offsets place T+60s ON the next boundary T′ —
+  a re-pull chain near T′ either stamps the per-key gate (deferring the next
+  NOMINAL fire → the should-never `gate_deferred_nominal` broken by our own
+  detached task) or bypasses it (two same-key wire requests ~1s apart → 429
+  self-infliction). The re-pull MUST (a) route through the gates, (b) fire
+  OUTSIDE the next cycle's burst window (the `:30` mid-minute anchor
+  precedent), and (c) state its ladder interaction: a re-pull 429 must NOT
+  arm the shape ladder or feed `rate_limited` streaks (history repair is not
+  the critical window).
+- **(M13) Pre-warm names its class or does not ship.** The 09:15:55 pre-warm
+  MUST name its exact endpoint + gate/budget authority, and EITHER be a
+  TLS-handshake-only warm-up (the Groww §9.7 precedent — no HTTP request, no
+  REST-lock impact) OR land a KEEP row in
+  `no-rest-except-live-feed-2026-06-27.md` §3 in the SAME PR (a recurring
+  HTTP GET class without its lock row violates that lock's §4).
+
 ## §1. CADENCE-01 — a broker lane degraded inside a cycle
 
 **Severity:** High. **Auto-triage safe:** Yes (the cycle already ended; the
@@ -416,6 +496,8 @@ EXCEPT `rate_limited`, which fires per-request by design (see below):
 | `cross_fill` | the lane's OWN fetch path exhausted (every own fire completed/failed, retries spent) without the cell; the OTHER lane's fresh same-minute data filled it (provenance stamped `CrossSource`). Freshness floor: the plain base T−5000 window for BOTH lenders (`CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS`). *(Superseded 2026-07-16: the LENDER-aware widening — CADENCE-XFILL-RUNG-1, 2026-07-15, which widened the window to the Dhan lender's rung-shifted earliest chain PRE-fire — was RETIRED with the pre-close anchor ladder in the §0b reshape; every fire is post-close now, so the pre-fire instant it widened for no longer exists and the base floor suffices — §0b RETIRED-machinery list.)* The fallback rungs run only on own-path exhaustion or at the cutoff — never preempting a still-scheduled own fire (design §5 resolution order) |
 | `chain_embedded_spot` | third-rung provenance: the chain response's own embedded underlying spot filled the cell (own path exhausted first, as above) |
 | `moneyness_unknown` | ≥1 underlying's fold classified Unknown (spot unusable / rows unclassifiable / registry snapshot refused by the decide-time guard: unconfirmed publish, wrong minute, stale, or the boot sentinel) |
+| `chain_spot_divergence` | ADVISORY (H3/H2-partial, audit 2026-07-20): a chain body's embedded underlying spot disagreed with the lane's resolved spot cell beyond the 0.5% coherence band (`CADENCE_SPOT_DIVERGENCE_MAX_BPS` = 50 — the OPTION-CHAIN-04 tolerance precedent). Chain bodies carry NO vendor timestamp and NO instrument/expiry echo, so this band is the honest proxy for a vendor-stale chain body (the cell's minute stamp is the REQUEST's own stamp) or a wrong-instrument response. Counter `tv_cadence_chain_spot_divergence_total{lane,underlying}`. NEVER decision-blocking, NEVER arming — the decision proceeds. (2026-07-20: decoupled from CADENCE-01 — advisory info-level only, per adversarial review: EXCLUDED from `DegradeFlags::any()`/`stages()`, so it can never arm the High degrade line; surfaced as the counter + ONE coalesced plain `info!` per lane per cycle naming the paise delta, no ErrorCode) |
+| `cross_source_spot_divergence` | ADVISORY (H2-partial/M14, audit 2026-07-20): both lanes' OWN-fetch spots for one underlying + minute disagreed beyond the same band — cross-broker divergence / corporate-action-adjustment / wrong-instrument proxy. Checked opportunistically at the deciding lane's completion when the other lane's same-cycle cell already exists. Counter `tv_cadence_cross_source_spot_divergence_total{underlying}`. Never blocking, never arming. (2026-07-20: decoupled from CADENCE-01 — advisory info-level only, per adversarial review: EXCLUDED from `DegradeFlags::any()`/`stages()`, so a routine 0.5%-band cross-broker disagreement can never false-fire the High degrade line; surfaced as the counter + ONE coalesced plain `info!` per lane per cycle naming the paise delta, no ErrorCode) |
 | `queue_delay` | a fetch was refused by a SELF-INFLICTED pacing-queue deadline — our own machinery (e.g. an executor-internal queue), never the broker (F1(iii) 2026-07-15). *(Superseded 2026-07-16, coordinator ruling A: cadence fires no longer route through the shared `dhan_data_api_limiter` at all — §0b/§3b item 1 — so the originally-named shared-limiter source can no longer produce this stage on the cadence lane; the typing is KEPT for any future executor-side self-inflicted pacing source.)* Stage-tagged distinctly, NEVER folded into `fetch_failed`, NEVER arms any ladder |
 | `expiry_unresolved` | TWO emission points share this stage: (a) the per-cycle coalesced flag — ≥1 chain request was stamped `expiry_yyyymmdd = None` (the day-locked store has no policy date yet; the scheduler NEVER guesses — the executor impl may fall back to its warmup expiry; ALWAYS present in dry-run, where every expiry-list fetch returns Empty); (b) the resolution loop's EDGE-LATCHED deadline page — ONE `error!` per (broker, underlying) per IST day the instant `expiry_deadline_secs_of_day_ist` (default 08:55) passes unresolved; the lanes run degraded meanwhile and the background retry continues at `expiry_retry_interval_ms` until session end (the deadline gates the PAGE, never the attempts, and a post-deadline BOOT requires ≥2 consecutive failed waves before the page — E4, 2026-07-15; R3, 2026-07-15: waves count REAL dispatched attempts per pair only — a disabled-lane or gate-deferred iteration never advances the threshold). FALLING EDGE (E3, 2026-07-15): a LATER successful resolution for a pair whose page HAD fired emits one coded recovery `info!` (`stage = "expiry_resolved_late"` on the same CADENCE-01 code — no new variant) + `tv_cadence_expiry_resolved_late_total{broker, underlying}`, at most once per pair per day (first write wins) |
 | `expiry_disagreement` | both brokers resolved the day's policy expiry for one underlying and the dates DIFFER — **Dhan WINS for keying BOTH lanes** (exchange-sourced expirylist authority); edge-latched ONCE per (underlying, day); both raw dates ride the payload + the store's provenance view (`tv_cadence_expiry_disagreement_total{underlying}`). SINCE 2026-07-16 (R6) the same edge ALSO dispatches the REAL typed `CadenceExpiryDisagreement` HIGH Telegram page (authority: `dhan-rest-only-noise-lock-2026-07-14.md` §2.2) — the ONE cadence signal that pages directly today |
@@ -508,6 +590,7 @@ self-corrected or self-reported; the operator inspects trends).
 | `groww_shape_shift` | the 2026-07-15 Groww three-choice fallback-shape ladder moved a choice (`tv_cadence_groww_shape_shifts_total{direction}`; same direction convention — the NEXT cycle uses the new wave shape) |
 | `late_wake` | a cycle wake fired ≥1000 ms after its target instant (scheduler starvation / suspend) — the cycle proceeds with the remaining slots |
 | `boundary_skipped` | ≥1 minute boundary elapsed entirely un-fired (overrun / suspend / clock step); counted, coalesced, next boundary joins cleanly (no-mid-cycle-join) |
+| `final_boundary_missed` | M9 (audit 2026-07-20, Dim D F1): the day loop reached the no-joinable-boundary arm on a trading day with the SESSION TAIL un-fired — a stall/overrun PAST 15:30 IST consumed the boundaries in `(last_boundary, 15:30]` (incl. the 15:29 decision minute), which the in-session `boundary_skipped` arm structurally never sees. Counted into `tv_cadence_boundary_skipped_total` + one coded `error!` per IST day (latched; day-flip re-arms). A post-close boot that completed NO boundary this session claims no tail (that class belongs to the boot-liveness alarm) |
 | `skew_clamped` | the wall-clock target computation clamped an implausible skew — targets re-picked, the monotonic gates were never at risk |
 | `respawn` | the supervised runner task died and was respawned (`tv_cadence_runner_respawn_total{reason}`) |
 | `gate_deferred_nominal` | a NOMINAL slot fire was deferred by a gate — a should-never signal (the schedule serializes nominal slots wider than every spacing); any occurrence is a schedule/gate consistency bug worth a report |
@@ -569,6 +652,13 @@ the next minute boundary (unchanged). Ratchets:
 `test_midcycle_disable_stops_not_yet_dispatched_fires` in
 `cadence_runner_dry_run.rs`. Never a bug report: this is the documented
 lifecycle envelope (the same wording lives on `CadenceConfig`'s doc).
+
+**Known limit (2026-07-20, adversarial review M9):** the session-tail
+boundary uses the fixed `CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST`
+(15:30 IST) constant, so a Muhurat or NSE early-close session logs a
+phantom `unaccounted_session_tail` CADENCE-03 once that day (latched
+once/day, log-only — no page). Operators should ignore the code on such
+days; a session-aware boundary is a possible follow-up.
 
 ## §3b. COMPOSITION CONTRACT (2026-07-15) — binding on every future executor impl
 
@@ -715,6 +805,50 @@ the first column-0 `#[cfg(test)]` line, the house production-region
 pattern, so a test-module mention of the notify call can never satisfy or
 double-count the production pin.)
 
+## §3g. CADENCE-04 — cross_fill_audit forensics write/read degraded (2026-07-20)
+
+**Severity:** Medium. **Auto-triage safe:** Yes (best-effort forensic record;
+the cadence decision path + the coalesced CADENCE-01 signal are untouched).
+
+**Why this code exists (operator directive 2026-07-20):** every cross-fill
+must be "highlighted, logged, monitored, audited, visualised — every day,
+week, month — precisely at what time it is happening". The
+`cross_fill_audit` QuestDB table (writer:
+`crates/storage/src/cross_fill_audit_persistence.rs`; emit sink:
+`crates/core/src/cadence/audit.rs`; consumer + 15:47 IST daily Telegram
+digest: `crates/app/src/cross_fill_visibility.rs`; runbook with the
+weekly/monthly rollup SQL: `docs/runbooks/cross-fill-visibility.md`) records
+ONE row per cross-fill firing (`stage='cross_fill'`,
+`resolution='cross_fill'`) and per Groww fallback launch
+(`stage='groww_fallback'`, `resolution='native_late_retry'`), DEDUP-keyed
+`(ts, trading_date_ist, lane, cycle_minute_ist, stage)`. `CADENCE-04`
+(`ErrorCode::Cadence04AuditWriteFailed`) fires when that best-effort chain
+degrades — `stage` field on the emission:
+
+| stage | Meaning |
+|---|---|
+| `channel` | the runner's fire-and-forget `try_send` dropped an event (consumer dead / channel full — `tv_cross_fill_audit_dropped_total{reason}`) |
+| `append` / `flush` | the ILP append/flush failed (`tv_cross_fill_audit_write_errors_total{stage}`; a failed flush DISCARDS pending rows — `tv_cross_fill_audit_rows_discarded_total`, the poisoned-buffer defense) |
+| `audit_ensure_client_build` / `audit_ensure_ddl` | the boot ensure-DDL failed — the HTTP-CLIENT-01-class duplicate-row window applies until a later ensure succeeds |
+| `digest_read` | the 15:47 IST daily digest could not read the table — the Telegram says "count UNKNOWN", never a false "0 times" green (audit Rule 11) |
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `CADENCE-04`; the payload names
+   the `stage` + lane + minute.
+2. Run `make doctor` — a sustained rate means QuestDB ILP/HTTP is degraded
+   (cross-check BOOT-01/BOOT-02 if it coincides with boot).
+3. Nothing to repair on the cadence side: the decision path never consults
+   this table; the next event re-appends normally and the DEDUP keys make
+   replays idempotent. Only the queryable forensic rows / digest precision
+   for the outage window are lost.
+
+**Honest envelope:** the audit is best-effort forensics. A sustained outage
+loses `cross_fill_audit` rows for the window — the coalesced CADENCE-01
+`stage="cross_fill"` / `stage="groww_fallback"` logs and the
+`tv_cadence_cross_fill_total{direction}` /
+`tv_cadence_groww_fallback_total{leg}` counters still carry every event; it
+never affects the fetch cadence, the decisions, or any order path.
+
 ## §4. Honest envelope (mandatory per operator-charter §F)
 
 > "100% inside the tested envelope, with ratcheted regression coverage: the
@@ -774,9 +908,12 @@ This rule activates when editing:
 - `crates/app/src/cadence_boot.rs`
 - `crates/common/src/config.rs` (`CadenceConfig`)
 - `config/base.toml` `[cadence]`
-- Any file containing `CADENCE-01`, `CADENCE-02`, `CADENCE-03`,
+- `crates/storage/src/cross_fill_audit_persistence.rs`
+- `crates/app/src/cross_fill_visibility.rs`
+- Any file containing `CADENCE-01`, `CADENCE-02`, `CADENCE-03`, `CADENCE-04`,
   `Cadence01LaneDegraded`, `Cadence02DecisionSkipped`,
-  `Cadence03SchedulerDegraded`, `MinSpacingGate`, `DhanGates`,
+  `Cadence03SchedulerDegraded`, `Cadence04AuditWriteFailed`,
+  `cross_fill_audit`, `MinSpacingGate`, `DhanGates`,
   `CadenceExecutor`, `spawn_supervised_cadence_runner`, `tv_cadence_`,
   `DayLockedExpiryStore`, `global_dhan_gates`, `global_expiry_store`,
   `resolve_policy_expiry`, or `QueueDelay`

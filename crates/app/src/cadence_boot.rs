@@ -85,6 +85,10 @@ pub fn spawn_cadence_scheduler(
     // invisibly to the first-seen-segment tripwire). `None` when
     // `[order_runtime]` is disabled.
     groww_mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
+    // Shared leg-identity handle (2026-07-19): the cadence executor publishes
+    // the daily option-leg identity index into this ArcSwap; the order-leg
+    // P&L boot consumer reads it lock-free.
+    leg_identity_index: crate::groww_cadence_executor::SharedLegIdentityIndex,
 ) -> Option<Arc<Notify>> {
     if !config.cadence.enabled {
         info!("cadence: disabled by [cadence] config — nothing spawned");
@@ -119,6 +123,7 @@ pub fn spawn_cadence_scheduler(
         &config.questdb,
         Some(Arc::clone(notifier)),
         groww_mark_forwarder,
+        leg_identity_index,
     ) {
         Ok(exec) => Arc::new(exec),
         Err(err) => {
@@ -146,9 +151,17 @@ pub fn spawn_cadence_scheduler(
         let questdb = config.questdb.clone();
         drop(tokio::spawn(async move {
             tickvault_storage::spot_1m_rest_persistence::ensure_spot_1m_rest_table(&questdb).await;
+            tickvault_storage::option_chain_1m_persistence::migrate_drop_moneyness_depth_column(
+                &questdb,
+            )
+            .await;
             tickvault_storage::option_chain_1m_persistence::ensure_option_chain_1m_table(&questdb)
                 .await;
             tickvault_storage::rest_fetch_audit_persistence::ensure_rest_fetch_audit_table(
+                &questdb,
+            )
+            .await;
+            tickvault_storage::cross_fill_audit_persistence::ensure_cross_fill_audit_table(
                 &questdb,
             )
             .await;
@@ -169,6 +182,16 @@ pub fn spawn_cadence_scheduler(
             ),
         ));
     }
+    // Cross-fill visibility (operator 2026-07-20): install the audit sink +
+    // consumer BEFORE the runner spawns (no emit can race the install), and
+    // arm the 15:47 IST daily digest. Both best-effort, never on the
+    // decision path — see crates/app/src/cross_fill_visibility.rs.
+    crate::cross_fill_visibility::spawn_cross_fill_audit_consumer(config.questdb.clone());
+    crate::cross_fill_visibility::spawn_cross_fill_digest(
+        Arc::clone(trading_calendar),
+        config.questdb.clone(),
+        Arc::clone(notifier),
+    );
     let shutdown = Arc::new(Notify::new());
     // Park the handle for the teardown path (F2, 2026-07-15).
     drop(CADENCE_SHUTDOWN.set(Arc::clone(&shutdown)));

@@ -139,6 +139,67 @@ pub(crate) fn map_chain_failure(f: &ChainFetchUnpacedFailure) -> CadenceFetchErr
     }
 }
 
+/// Pure (H1, audit 2026-07-20): classify a 2xx spot body whose target
+/// minute is MISSING into the honest three-way split — `(audit class,
+/// audit outcome, cadence error)`:
+/// - candles present but none at the target ⇒ vendor serving LAG
+///   (`empty_stale` / Empty),
+/// - a WELL-FORMED zero-candle body ⇒ benign vendor empty
+///   (`empty_no_rows` / Empty),
+/// - a malformed/wrong-shape zero-candle body ⇒ `malformed_body` /
+///   `Error` / [`CadenceFetchError::Malformed`] (non-arming terminal —
+///   the runner folds it into the `fetch_failed` stage; never dressed as
+///   vendor absence).
+#[must_use]
+pub(crate) fn dhan_spot_zero_candle_class(
+    stats: Option<(usize, i64)>,
+    body: &str,
+) -> (&'static str, RestFetchOutcome, CadenceFetchError) {
+    match stats {
+        Some((rows, _)) if rows > 0 => (
+            "empty_stale",
+            RestFetchOutcome::Empty,
+            CadenceFetchError::Empty,
+        ),
+        _ if crate::dhan_intraday_parse::zero_candle_body_is_malformed(body) => (
+            "malformed_body",
+            RestFetchOutcome::Error,
+            CadenceFetchError::Malformed,
+        ),
+        _ => (
+            "empty_no_rows",
+            RestFetchOutcome::Empty,
+            CadenceFetchError::Empty,
+        ),
+    }
+}
+
+/// Pure (M2, audit 2026-07-20): the Dhan chain zero-LEGS split — the
+/// Groww-parity `empty_chain` vs `leg_shape_drift` discrimination.
+/// Strikes present in the `oc` map (kept OR rejected) with ZERO
+/// extracted legs = the response carried data our extraction dropped
+/// (schema/shape drift — an ERROR class), while a literally-empty map is
+/// the honest vendor Empty.
+#[must_use]
+pub(crate) fn dhan_chain_empty_class(
+    strike_count: u32,
+    invalid_strikes: u32,
+) -> (&'static str, RestFetchOutcome, CadenceFetchError) {
+    if strike_count > 0 || invalid_strikes > 0 {
+        (
+            "leg_shape_drift",
+            RestFetchOutcome::Error,
+            CadenceFetchError::Malformed,
+        )
+    } else {
+        (
+            "empty_chain",
+            RestFetchOutcome::Empty,
+            CadenceFetchError::Empty,
+        )
+    }
+}
+
 /// Pure: `yyyymmdd` int → date (`None` on garbage — the executor returns
 /// [`CadenceFetchError::Empty`] rather than fabricating an expiry).
 #[must_use]
@@ -399,12 +460,15 @@ impl CadenceExecutor for DhanCadenceExecutor {
             let (candle, _backfill, stats) =
                 parse_intraday_columnar_for_minutes(&fetched_body.text, target_nanos, None);
             let Some(candle) = candle else {
-                // 2xx without the target minute — the honest empty split:
-                // zero-candle body vs a body serving the day with a LAG.
-                let class = match stats {
-                    Some((rows, _)) if rows > 0 => "empty_stale",
-                    _ => "empty_no_rows",
-                };
+                // 2xx without the target minute — the honest THREE-way
+                // split (H1, audit 2026-07-20): a body serving the day
+                // with a LAG (stale), a WELL-FORMED zero-candle day
+                // (benign vendor empty), or a malformed/wrong-shape body
+                // whose zero-candle parse must NEVER be dressed as vendor
+                // absence (the 2026-07-15 float-timestamp incident class
+                // hid 14 days behind `empty_no_rows`).
+                let (class, outcome, mapped) =
+                    dhan_spot_zero_candle_class(stats, &fetched_body.text);
                 let mut audit = self.audit_writer.lock().await;
                 audit_append_best_effort(
                     &mut audit,
@@ -415,13 +479,13 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         symbol,
                         1,
                         0,
-                        RestFetchOutcome::Empty,
+                        outcome,
                         -1,
                         class,
                     ),
                 );
                 flush_off_worker(|| audit_flush_best_effort(&mut audit));
-                return Err(CadenceFetchError::Empty);
+                return Err(mapped);
             };
             let close_to_data_ms =
                 (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
@@ -693,6 +757,12 @@ impl CadenceExecutor for DhanCadenceExecutor {
                 return Err(CadenceFetchError::Malformed);
             };
             if chain.legs.is_empty() {
+                // M2 (audit 2026-07-20): the Groww-parity empty-vs-drift
+                // split — strikes present with zero extracted legs is an
+                // ERROR (leg_shape_drift), a literally-empty map the
+                // honest vendor Empty.
+                let (class, audit_outcome, mapped) =
+                    dhan_chain_empty_class(chain.strike_count, chain.invalid_strikes);
                 let mut audit = self.audit_writer.lock().await;
                 chain_audit_append_best_effort(
                     &mut audit,
@@ -704,12 +774,12 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         1,
                         200,
                         -1,
-                        RestFetchOutcome::Empty,
-                        "empty_chain",
+                        audit_outcome,
+                        class,
                     ),
                 );
                 flush_off_worker(|| chain_audit_flush_best_effort(&mut audit));
-                return Err(CadenceFetchError::Empty);
+                return Err(mapped);
             }
             let close_to_data_ms =
                 (ist_millis_of_day_now() - (i64::from(req.cycle_minute_ist) + 60) * 1000).max(0);
@@ -744,12 +814,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
             let mut persist_failed = false;
             {
                 let mut writer = self.chain_writer.lock().await;
-                for ((leg, leg_moneyness), leg_depth) in chain
-                    .legs
-                    .iter()
-                    .zip(cls.row_moneyness.iter())
-                    .zip(cls.row_depth.iter())
-                {
+                for (leg, leg_label) in chain.legs.iter().zip(cls.row_labels.iter()) {
                     let row = OptionChain1mRow {
                         ts_ist_nanos: target_nanos,
                         trading_date_ist_nanos: trading_date_nanos,
@@ -770,11 +835,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         previous_oi: leg.previous_oi,
                         underlying_spot: chain.underlying_spot,
                         fetched_at_ist_nanos: fetched_at,
-                        moneyness: leg_moneyness.as_str(),
-                        // Signed depth (2026-07-17 merge) — classified in
-                        // classify_chain_legs; None (→ NULL) whenever the
-                        // leg/strike/spot fail the classifier's guards.
-                        moneyness_depth: *leg_depth,
+                        moneyness: *leg_label,
                     };
                     // Dhan rows carry NO rho (delta/theta/gamma/vega only —
                     // option-chain.md rule 10); the measured close→data
@@ -1195,5 +1256,52 @@ mod tests {
              after the flush ACK, before the fold handoff (never \
              fetch-time, never fire-time)"
         );
+    }
+
+    /// H1 (audit 2026-07-20): the spot zero-candle three-way split —
+    /// stale vs benign empty vs malformed; malformed is a terminal Error
+    /// class, never dressed as vendor absence.
+    #[test]
+    fn dhan_spot_zero_candle_class_splits_malformed() {
+        // Candles present, target missing ⇒ vendor lag (stale).
+        let (class, outcome, err) =
+            dhan_spot_zero_candle_class(Some((374, 55_740_000_000_000)), "{}");
+        assert_eq!(class, "empty_stale");
+        assert_eq!(outcome, RestFetchOutcome::Empty);
+        assert_eq!(err, CadenceFetchError::Empty);
+        // Well-formed zero-candle day ⇒ benign empty.
+        let empty = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[]}"#;
+        let (class, outcome, err) = dhan_spot_zero_candle_class(None, empty);
+        assert_eq!(class, "empty_no_rows");
+        assert_eq!(outcome, RestFetchOutcome::Empty);
+        assert_eq!(err, CadenceFetchError::Empty);
+        // Malformed / wrong-shape zero-candle bodies ⇒ Error/Malformed.
+        for body in ["not json", "{}", r#"{"open":[]}"#] {
+            let (class, outcome, err) = dhan_spot_zero_candle_class(None, body);
+            assert_eq!(class, "malformed_body");
+            assert_eq!(outcome, RestFetchOutcome::Error);
+            assert_eq!(err, CadenceFetchError::Malformed);
+        }
+    }
+
+    /// M2 (audit 2026-07-20): the Dhan chain empty-vs-drift split
+    /// (Groww parity) — strikes seen with zero extracted legs is drift.
+    #[test]
+    fn dhan_chain_empty_vs_leg_shape_drift_split() {
+        // Literally-empty oc map ⇒ honest vendor Empty.
+        let (class, outcome, err) = dhan_chain_empty_class(0, 0);
+        assert_eq!(class, "empty_chain");
+        assert_eq!(outcome, RestFetchOutcome::Empty);
+        assert_eq!(err, CadenceFetchError::Empty);
+        // Kept strikes with zero legs ⇒ extraction drift (Error).
+        let (class, outcome, err) = dhan_chain_empty_class(12, 0);
+        assert_eq!(class, "leg_shape_drift");
+        assert_eq!(outcome, RestFetchOutcome::Error);
+        assert_eq!(err, CadenceFetchError::Malformed);
+        // Only-rejected strikes (all invalid keys) ⇒ ALSO drift.
+        let (class, outcome, err) = dhan_chain_empty_class(0, 3);
+        assert_eq!(class, "leg_shape_drift");
+        assert_eq!(outcome, RestFetchOutcome::Error);
+        assert_eq!(err, CadenceFetchError::Malformed);
     }
 }

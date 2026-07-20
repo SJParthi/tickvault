@@ -923,6 +923,26 @@ pub enum NotificationEvent {
         reason: String,
     },
 
+    /// Once-per-trading-day cross-fill visibility digest at 3:47 PM IST
+    /// (operator directive 2026-07-20 — every cross-fill "highlighted,
+    /// logged, monitored, audited, visualised ... precisely at what time").
+    /// Severity::Info + `DispatchPolicy::Immediate` (the
+    /// DualFeedDailyScorecard precedent — post-close Info would otherwise
+    /// coalesce). `count = -1` means the `cross_fill_audit` table could
+    /// not be read — the body says "count unknown", never a false
+    /// "0 times" green (audit Rule 11).
+    CrossFillDailyDigest {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// Cross-fill events today (`-1` = table unreadable).
+        count: i64,
+        /// Pre-formatted plain-English event lines (one per line, e.g.
+        /// "9:16 AM — Dhan spot filled from Groww"); empty when none.
+        lines: String,
+        /// Groww own-retry fallback launches today (`-1` = unknown).
+        fallback_count: i64,
+    },
+
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
     // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
     // PR #5 (2026-05-19): 7 Phase2* variants retired alongside the
@@ -3356,6 +3376,59 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's scorecard."
                 )
             }
+            Self::CrossFillDailyDigest {
+                trading_date_ist,
+                count,
+                lines,
+                fallback_count,
+            } => {
+                let date = html_escape(trading_date_ist);
+                if *count < 0 {
+                    // Honest degraded body — the table could not be read;
+                    // never a false "0 times" green (audit Rule 11).
+                    format!(
+                        "\u{26a0}\u{fe0f} <b>Cross-fill check could not run today</b> ({date})\n\
+                         The record book of broker-to-broker fills could not \
+                         be read \u{2014} today's count is UNKNOWN.\n\
+                         What to do: check the database is up, then re-check \
+                         tomorrow's digest."
+                    )
+                } else if *count == 0 {
+                    let fallback = if *fallback_count > 0 {
+                        format!(
+                            "\nGroww retried its own fetch {fallback_count} \
+                             time(s) \u{2014} no broker borrowing was needed."
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "\u{2705} <b>Cross-fill used 0 times today</b> ({date})\n\
+                         Every minute's prices came from each broker's own \
+                         feed \u{2014} nothing was borrowed.{fallback}"
+                    )
+                } else {
+                    let detail = if lines.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{}", html_escape(lines))
+                    };
+                    let fallback = if *fallback_count > 0 {
+                        format!(
+                            "\nGroww also retried its own fetch \
+                             {fallback_count} time(s)."
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "\u{1f504} <b>Cross-fill used {count} time(s) today</b> ({date})\n\
+                         One broker's minute was filled from the other \
+                         broker's data at these times:{detail}{fallback}\n\
+                         Full detail is in the cross-fill record book."
+                    )
+                }
+            }
             Self::BrutexCrossverifySummary {
                 trading_date_ist,
                 outcome,
@@ -4131,6 +4204,7 @@ impl NotificationEvent {
             Self::ChainExpirylistFailed { .. } => "ChainExpirylistFailed",
             Self::DualFeedDailyScorecard { .. } => "DualFeedDailyScorecard",
             Self::DualFeedScorecardAborted { .. } => "DualFeedScorecardAborted",
+            Self::CrossFillDailyDigest { .. } => "CrossFillDailyDigest",
             Self::BrutexCrossverifySummary { .. } => "BrutexCrossverifySummary",
             Self::BrutexCrossverifyAborted { .. } => "BrutexCrossverifyAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
@@ -4627,6 +4701,8 @@ impl NotificationEvent {
             // LOUDLY in the body (partial/degraded footnotes) and a task
             // death fires the High Aborted variant below instead.
             Self::DualFeedDailyScorecard { .. } => Severity::Info,
+            // Cross-fill visibility daily digest (2026-07-20): Info.
+            Self::CrossFillDailyDigest { .. } => Severity::Info,
             Self::DualFeedScorecardAborted { .. } => Severity::High,
             // BruteX cross-verify (2026-07-12): Info per the contract — the
             // daily digest is a positive signal; the LOUD body lines carry
@@ -4772,6 +4848,11 @@ impl NotificationEvent {
             // default Info routing would coalesce it) — same rationale as
             // CrossVerify1mSummary / DualFeedDailyScorecard above.
             Self::BrutexCrossverifySummary { .. } => DispatchPolicy::Immediate,
+            // Cross-fill visibility digest (2026-07-20): the once-per-day
+            // 15:47 IST digest must arrive AT 15:47 (post-close = off-hours,
+            // so the default Info routing would coalesce it) — the
+            // DualFeedDailyScorecard rationale above.
+            Self::CrossFillDailyDigest { .. } => DispatchPolicy::Immediate,
             // 2026-07-08 (verified incident, operator complaint "why every
             // telegram notification is very late"): PR #1439's in-market
             // digest (900s window) swept the three once-per-trading-day
@@ -9571,6 +9652,51 @@ mod tests {
             top_offenders: top_offenders.to_string(),
             hint: hint.to_string(),
         }
+    }
+
+    #[test]
+    fn test_cross_fill_daily_digest_message_format() {
+        // Zero day (measured): green + plain English, no jargon/paths.
+        let zero = NotificationEvent::CrossFillDailyDigest {
+            trading_date_ist: "2026-07-20".to_string(),
+            count: 0,
+            lines: String::new(),
+            fallback_count: 0,
+        };
+        assert_eq!(zero.topic(), "CrossFillDailyDigest");
+        assert_eq!(zero.severity(), Severity::Info);
+        assert_eq!(zero.dispatch_policy(), DispatchPolicy::Immediate);
+        let body = zero.to_message();
+        assert!(body.contains("Cross-fill used 0 times today"), "{body}");
+        assert!(
+            body.contains("\u{2705}"),
+            "green emoji on the measured zero"
+        );
+        assert!(!body.contains(".rs"), "no file paths (commandment 3)");
+
+        // Non-zero day: count + the precise per-event times.
+        let some = NotificationEvent::CrossFillDailyDigest {
+            trading_date_ist: "2026-07-20".to_string(),
+            count: 2,
+            lines: "9:16 AM — Dhan spot price filled from Groww".to_string(),
+            fallback_count: 1,
+        };
+        let body = some.to_message();
+        assert!(body.contains("Cross-fill used 2 time(s) today"), "{body}");
+        assert!(body.contains("9:16 AM"), "precise time carried");
+        assert!(body.contains("retried its own fetch 1 time(s)"), "{body}");
+
+        // Unreadable table: honest UNKNOWN, never a false zero (Rule 11).
+        let unknown = NotificationEvent::CrossFillDailyDigest {
+            trading_date_ist: "2026-07-20".to_string(),
+            count: -1,
+            lines: String::new(),
+            fallback_count: -1,
+        };
+        let body = unknown.to_message();
+        assert!(body.contains("could not run today"), "{body}");
+        assert!(body.contains("UNKNOWN"), "{body}");
+        assert!(!body.contains("0 times"), "never a false zero");
     }
 
     #[test]
