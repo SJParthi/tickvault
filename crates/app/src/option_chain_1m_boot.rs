@@ -89,8 +89,9 @@ use tickvault_common::constants::{
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::moneyness::{
-    Moneyness, OptionLeg, atm_strike_paise, classify_moneyness_paise, depth_paise_to_rupees,
-    moneyness_depth_paise, observed_finest_step_paise, price_to_paise_guarded, strike_step_paise,
+    Moneyness, MoneynessStepLabel, OptionLeg, StepIndexOutcome, atm_strike_paise,
+    classify_moneyness_paise, moneyness_step_index, moneyness_step_label,
+    observed_finest_step_paise, price_to_paise_guarded, strike_step_paise,
 };
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
 use tickvault_common::trading_calendar::TradingCalendar;
@@ -104,7 +105,7 @@ use tickvault_storage::disk_health_watcher::classify_join_exit;
 use tickvault_storage::option_chain_1m_persistence::{
     OPTION_CHAIN_1M_FEED_DHAN, OPTION_CHAIN_1M_LEG_CE, OPTION_CHAIN_1M_LEG_PE,
     OPTION_CHAIN_1M_SEGMENT_IDX_I, OptionChain1mRow, OptionChain1mWriter,
-    ensure_option_chain_1m_table,
+    ensure_option_chain_1m_table, migrate_drop_moneyness_depth_column,
 };
 use tickvault_storage::rest_fetch_audit_persistence::{
     REST_FETCH_LEG_CHAIN_1M, RestFetchAuditRow, RestFetchAuditWriter, RestFetchOutcome,
@@ -509,16 +510,22 @@ pub struct ChainClassification {
     /// Per-leg classes, index-aligned with the input leg order (the
     /// persist loop zips over this).
     pub row_moneyness: Vec<Moneyness>,
-    /// Per-leg signed moneyness DEPTH in rupees (2026-07-17; sign flipped
-    /// per operator ruling 2026-07-20), index-aligned with
-    /// `row_moneyness`: positive = ITM-direction, negative =
-    /// OTM-direction for BOTH legs (CE: spot−strike; PE: strike−spot).
-    /// `None` = unclassifiable (unparsable leg / guarded-invalid values —
-    /// the persisted column lands NULL). ALL arithmetic lives in
-    /// `tickvault_common::moneyness::moneyness_depth_paise` (integer
-    /// paise) — this file only calls it, per the parse-only strike
-    /// ratchet.
-    pub row_depth: Vec<Option<f64>>,
+    /// Per-leg COMBINED moneyness label (operator ruling 2026-07-20 —
+    /// the step count lives IN the `moneyness` SYMBOL itself:
+    /// `"ITM-1"`, `"ITM-2"`, …, `"ATM"`, `"OTM+1"`, …; bare
+    /// `"ITM"`/`"OTM"` when the strike is off-grid (loud via
+    /// `misaligned_rows`); `"UNKNOWN"` for unclassifiable rows).
+    /// Index-aligned with `row_moneyness`. ALL step arithmetic lives in
+    /// `tickvault_common::moneyness::moneyness_step_index` +
+    /// `moneyness_step_label` (integer paise, ATM-anchored grid steps) —
+    /// this file only calls them, per the parse-only strike ratchet.
+    pub row_labels: Vec<MoneynessStepLabel>,
+    /// Rows whose strike was NOT a whole number of grid steps from the
+    /// ATM anchor (`StepIndexOutcome::NotAligned`) — the loud error
+    /// path (→ `tv_moneyness_step_misaligned_total` + an edge-latched
+    /// CHAIN-02 `moneyness_step_misaligned` warn at the call site);
+    /// those rows carry the bare class label, never a rounded step.
+    pub misaligned_rows: u64,
     /// RAM snapshot rows (built BEFORE the persist loop so a persist
     /// failure can never degrade the RAM decision surface).
     pub snap_rows: Vec<SnapshotRow>,
@@ -543,16 +550,20 @@ pub fn classify_chain_legs<'a>(
     legs: impl Iterator<Item = (f64, &'a str, f64)>,
 ) -> ChainClassification {
     let spot_paise = price_to_paise_guarded(spot_rupees).unwrap_or(0);
-    let atm_paise = strike_step_paise(underlying_symbol)
-        .and_then(|step| atm_strike_paise(spot_paise, step))
-        .unwrap_or(0);
+    let step_paise = strike_step_paise(underlying_symbol).unwrap_or(0);
+    let atm_paise = if step_paise > 0 {
+        atm_strike_paise(spot_paise, step_paise).unwrap_or(0)
+    } else {
+        0
+    };
     let (lo, hi) = legs.size_hint();
     let cap = hi.unwrap_or(lo);
     let mut cls = ChainClassification {
         spot_paise,
         atm_paise,
         row_moneyness: Vec::with_capacity(cap),
-        row_depth: Vec::with_capacity(cap),
+        row_labels: Vec::with_capacity(cap),
+        misaligned_rows: 0,
         snap_rows: Vec::with_capacity(cap),
         strike_paise_sorted: Vec::with_capacity(cap),
         unknown_rows: 0,
@@ -561,11 +572,15 @@ pub fn classify_chain_legs<'a>(
     for (strike_rupees, leg_label, ltp_rupees) in legs {
         let strike_paise = price_to_paise_guarded(strike_rupees).unwrap_or(0);
         let m = classify_moneyness_paise(leg_label, strike_paise, spot_paise, atm_paise);
-        // Signed depth (2026-07-17) — computed in common's integer-paise
-        // home from the SAME guarded operands; None (→ NULL) whenever the
-        // leg/strike/spot fail the classifier's own guards.
-        let depth_rupees =
-            moneyness_depth_paise(leg_label, strike_paise, spot_paise).map(depth_paise_to_rupees);
+        // Combined step label (2026-07-20) — computed in common's
+        // integer-paise home from the SAME guarded operands + the SAME
+        // grid anchor the classifier used; a misaligned strike is
+        // COUNTED (loud at the call site) and carries the bare class.
+        let step = moneyness_step_index(leg_label, strike_paise, atm_paise, step_paise);
+        if step == StepIndexOutcome::NotAligned {
+            cls.misaligned_rows = cls.misaligned_rows.saturating_add(1);
+        }
+        let label = moneyness_step_label(m, step);
         if m == Moneyness::Unknown {
             cls.unknown_rows = cls.unknown_rows.saturating_add(1);
         }
@@ -584,7 +599,7 @@ pub fn classify_chain_legs<'a>(
             });
         }
         cls.row_moneyness.push(m);
-        cls.row_depth.push(depth_rupees);
+        cls.row_labels.push(label);
     }
     cls.strike_paise_sorted.sort_unstable();
     cls.strike_paise_sorted.dedup();
@@ -602,6 +617,7 @@ pub fn classify_chain_legs<'a>(
 pub struct MoneynessWarnLatches {
     step_drift: [Option<NaiveDate>; CHAIN_1M_UNDERLYINGS.len()],
     atm_absent: [Option<NaiveDate>; CHAIN_1M_UNDERLYINGS.len()],
+    step_misaligned: [Option<NaiveDate>; CHAIN_1M_UNDERLYINGS.len()],
 }
 
 impl MoneynessWarnLatches {
@@ -613,6 +629,12 @@ impl MoneynessWarnLatches {
     /// True at most once per (slot, trading day) for the atm-absent warn.
     pub fn should_fire_atm_absent(&mut self, slot: usize, day: NaiveDate) -> bool {
         Self::fire(&mut self.atm_absent, slot, day)
+    }
+
+    /// True at most once per (slot, trading day) for the misaligned-strike
+    /// warn (2026-07-20 — the step-label NotAligned loud path).
+    pub fn should_fire_step_misaligned(&mut self, slot: usize, day: NaiveDate) -> bool {
+        Self::fire(&mut self.step_misaligned, slot, day)
     }
 
     fn fire(slots: &mut [Option<NaiveDate>], slot: usize, day: NaiveDate) -> bool {
@@ -648,6 +670,29 @@ pub fn record_chain_moneyness_observability(
     if cls.unknown_rows > 0 {
         metrics::counter!("tv_moneyness_unknown_total", "feed" => feed_label)
             .increment(cls.unknown_rows);
+    }
+    // Misaligned strikes (2026-07-20 combined-label law): a strike that is
+    // not a whole number of grid steps from the ATM anchor carries the
+    // BARE class label (never a rounded step) — counted per row + ONE
+    // edge-latched warn per (feed, underlying, day). Loud, never silent.
+    if cls.misaligned_rows > 0 {
+        metrics::counter!("tv_moneyness_step_misaligned_total", "feed" => feed_label)
+            .increment(cls.misaligned_rows);
+        if latches.should_fire_step_misaligned(slot, trading_date) {
+            warn!(
+                code = ErrorCode::Chain02FetchDegraded.code_str(),
+                stage = "moneyness_step_misaligned",
+                feed = feed_label,
+                symbol = underlying_symbol,
+                misaligned_rows = cls.misaligned_rows,
+                atm_paise = cls.atm_paise,
+                minute = %minute_label,
+                "CHAIN-02: vendor strike(s) not a whole number of grid \
+                 steps from the ATM anchor — those rows carry the bare \
+                 ITM/OTM label with NO step count (never silent rounding); \
+                 cross-check the observed-step drift signal"
+            );
+        }
     }
     // ATM-absent: strikes parsed + ATM resolvable, but NO listed strike
     // sits on the computed grid ATM (vendor hole / spot outside the
@@ -1915,12 +1960,7 @@ async fn fire_one_chain_minute(
                         chain.underlying_spot,
                         chain.legs.iter().map(|l| (l.strike, l.leg, l.last_price)),
                     );
-                    for ((leg, leg_moneyness), leg_depth) in chain
-                        .legs
-                        .iter()
-                        .zip(cls.row_moneyness.iter())
-                        .zip(cls.row_depth.iter())
-                    {
+                    for (leg, leg_label) in chain.legs.iter().zip(cls.row_labels.iter()) {
                         let row = OptionChain1mRow {
                             ts_ist_nanos: target_minute_nanos,
                             trading_date_ist_nanos: trading_date_nanos,
@@ -1941,8 +1981,7 @@ async fn fire_one_chain_minute(
                             previous_oi: leg.previous_oi,
                             underlying_spot: chain.underlying_spot,
                             fetched_at_ist_nanos: fetched_at,
-                            moneyness: leg_moneyness.as_str(),
-                            moneyness_depth: *leg_depth,
+                            moneyness: *leg_label,
                         };
                         // 2026-07-17: the Dhan leg persists the already-
                         // measured close→data latency per row (rho stays
@@ -2501,6 +2540,7 @@ pub async fn run_option_chain_1m(
     // Idempotent DDL first (CREATE → ADD COLUMN self-heal → DEDUP ENABLE);
     // failures degrade loudly inside (CHAIN-03) and never block the run.
     ensure_option_chain_1m_table(&params.questdb).await;
+    migrate_drop_moneyness_depth_column(&params.questdb).await;
     // GAP-11 forensics: the shared rest_fetch_audit table (idempotent —
     // the spot + Groww legs also ensure it; a second call is harmless).
     ensure_rest_fetch_audit_table(&params.questdb).await;
@@ -2946,6 +2986,33 @@ mod tests {
         assert!(latches.should_fire_step_drift(0, d2), "new day re-arms");
         // Out-of-range slot never fires (defensive — pinned 3 underlyings).
         assert!(!latches.should_fire_step_drift(99, d1));
+    }
+
+    /// The 2026-07-20 misaligned-strike latch: same once-per-(slot, day)
+    /// semantics as its siblings, independent of the other two kinds.
+    #[test]
+    fn test_should_fire_step_misaligned_latch_once_per_slot_day() {
+        let mut latches = MoneynessWarnLatches::default();
+        let d1 = NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        let d2 = NaiveDate::from_ymd_opt(2026, 7, 21).expect("valid date");
+        assert!(latches.should_fire_step_misaligned(0, d1));
+        assert!(
+            !latches.should_fire_step_misaligned(0, d1),
+            "latched for the day"
+        );
+        assert!(
+            latches.should_fire_step_misaligned(2, d1),
+            "slots independent"
+        );
+        assert!(
+            latches.should_fire_step_drift(0, d1),
+            "independent of the step-drift kind"
+        );
+        assert!(
+            latches.should_fire_step_misaligned(0, d2),
+            "new day re-arms"
+        );
+        assert!(!latches.should_fire_step_misaligned(99, d1));
     }
 
     /// The observability sink never panics on any classification shape

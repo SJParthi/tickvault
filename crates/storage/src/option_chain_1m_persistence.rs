@@ -43,7 +43,7 @@
 //!     gamma DOUBLE, vega DOUBLE, oi LONG, volume LONG, previous_oi LONG,
 //!     underlying_spot DOUBLE, fetched_at TIMESTAMP,
 //!     rho DOUBLE, close_to_data_ms LONG, moneyness SYMBOL,
-//!     moneyness_depth DOUBLE
+//!     contract SYMBOL
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, underlying_security_id, exchange_segment,
 //!                     expiry, strike, leg, feed);
@@ -54,6 +54,7 @@ use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::moneyness::MoneynessStepLabel;
 
 /// QuestDB table name — one row per fetched `(minute, underlying, expiry,
 /// strike, leg)`.
@@ -153,26 +154,20 @@ pub struct OptionChain1mRow {
     pub underlying_spot: f64,
     /// Retrieval wall-clock instant, IST nanoseconds.
     pub fetched_at_ist_nanos: i64,
-    /// Write-time moneyness classification (`"ITM"`/`"ATM"`/`"OTM"`/
-    /// `"UNKNOWN"` — `tickvault_common::moneyness::Moneyness::as_str()`,
-    /// the ONLY producer of these labels). AUDIT MIRROR ONLY: the RAM
-    /// chain snapshot is the decision source of truth (operator directive
-    /// 2026-07-14); this column exists so `WHERE moneyness='ATM'` is a
-    /// precomputed filter, never a query-time recompute. NOT in the DEDUP
-    /// key (label column — the `contract_security_id` precedent).
-    pub moneyness: &'static str,
-    /// Signed moneyness DEPTH in rupees (2026-07-17, operator-confirmed
-    /// gap; sign flipped per operator ruling 2026-07-20): positive =
-    /// ITM-direction, negative = OTM-direction for BOTH legs
-    /// (CE: spot − strike; PE: strike − spot — the leg-normalized
-    /// sign convention of
-    /// `tickvault_common::moneyness::moneyness_depth_paise`, the ONLY
-    /// home of the arithmetic per the parse-only strike ratchet).
-    /// `None` = unclassifiable (unparsable leg / guarded-invalid
-    /// strike/spot — a moneyness=UNKNOWN row carries `None`) → the column
-    /// is left UNWRITTEN (NULL in QuestDB, ILP-sparse). NOT in the DEDUP
-    /// key (numeric companion column, same class as `close_to_data_ms`).
-    pub moneyness_depth: Option<f64>,
+    /// Write-time COMBINED moneyness label (operator ruling 2026-07-20 —
+    /// the strike-step count lives IN the label itself: `"ITM-1"`,
+    /// `"ITM-2"`, …, `"ATM"`, `"OTM+1"`, …; bare `"ITM"`/`"OTM"` when the
+    /// step is unresolvable; `"UNKNOWN"` for unclassifiable rows —
+    /// `tickvault_common::moneyness::moneyness_step_label` is the ONLY
+    /// producer). AUDIT MIRROR ONLY: the RAM chain snapshot is the
+    /// decision source of truth (operator directive 2026-07-14); this
+    /// column exists so `WHERE moneyness='ATM'` /
+    /// `WHERE moneyness='ITM-1'` are precomputed filters, never a
+    /// query-time recompute. NOT in the DEDUP key (label column — the
+    /// `contract_security_id` precedent). The retired 2026-07-17
+    /// `moneyness_depth` DOUBLE column is DROPPED (operator ruling
+    /// 2026-07-20 — see the marker-gated migration in the ensure fn).
+    pub moneyness: MoneynessStepLabel,
 }
 
 /// The idempotent `CREATE TABLE` DDL for `option_chain_1m`. Pure.
@@ -205,7 +200,7 @@ pub fn option_chain_1m_create_ddl() -> String {
             rho                    DOUBLE, \
             close_to_data_ms       LONG, \
             moneyness              SYMBOL, \
-            moneyness_depth        DOUBLE\
+            contract               SYMBOL\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_OPTION_CHAIN_1M});"
     )
@@ -264,23 +259,221 @@ pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 25] {
         // computed at WRITE time; the RAM chain snapshot is the decision
         // surface, this column is the write-only AUDIT MIRROR so
         // `WHERE moneyness='ATM'` is a precomputed filter, never a
-        // query-time recompute). Values: ITM/ATM/OTM/UNKNOWN (4-value
-        // SYMBOL). Additive + nullable; rows written by earlier builds stay
+        // query-time recompute). Values since the 2026-07-20 combined-
+        // label law: "ITM-1"…, "ATM", "OTM+1"…, bare "ITM"/"OTM"
+        // (off-grid fallback), "UNKNOWN" (~21 nominal distinct values
+        // under the ATM±10 plan — SYMBOL-friendly cardinality; rows
+        // written before 2026-07-20 keep the bare 4-value labels).
+        // Additive + nullable; rows written by earlier builds stay
         // NULL FOREVER (never backfilled). NOT in the DEDUP key (label
         // column — the contract_security_id precedent).
         ("moneyness", "SYMBOL"),
-        // Signed moneyness depth (2026-07-17, operator-confirmed gap;
-        // sign flipped per operator ruling 2026-07-20):
-        // the numeric companion to the moneyness label — signed rupees,
-        // positive = ITM-direction / negative = OTM-direction for BOTH
-        // legs (CE: spot−strike; PE: strike−spot), computed at WRITE time
-        // in `tickvault_common::moneyness::moneyness_depth_paise` (integer
-        // paise — the single arithmetic home per the parse-only strike
-        // ratchet). Additive + nullable (ILP-sparse: written only when
-        // classifiable); pre-existing rows stay NULL FOREVER (never
-        // backfilled). NOT in the DEDUP key.
-        ("moneyness_depth", "DOUBLE"),
+        // Human-readable contract label (operator addition 2026-07-20 —
+        // "NIFTY 28 JUL 25000 CALL", the Dhan-web style), derived at
+        // WRITE time from fields already on the row
+        // (`contract_label`) — zero extra fetch, cold write path.
+        // Additive + nullable; rows written by earlier builds stay NULL
+        // FOREVER (self-heal ADD, never backfilled). NOT in the DEDUP
+        // key (display label). The retired `moneyness_depth` DOUBLE
+        // (2026-07-17 → 2026-07-20) is deliberately ABSENT here — it is
+        // DROPPED from live tables by the marker-gated migration below.
+        ("contract", "SYMBOL"),
     ]
+}
+
+/// Uppercase 3-letter month names for [`contract_label`] (1-indexed via
+/// `month0`).
+const CONTRACT_LABEL_MONTHS: [&str; 12] = [
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+];
+
+/// Human-readable contract label, Dhan-web style (operator addition
+/// 2026-07-20, verbatim: *"one extra column to mention everything like
+/// this — for example NIFTY 28 JUL 25000 CALL"*):
+/// `<UNDERLYING> <D> <MMM> <STRIKE> <CALL|PUT>` — day WITHOUT a leading
+/// zero, month uppercase 3-letter, strike as an integer when whole
+/// (`25000`, never `25000.0`; a genuinely fractional strike renders its
+/// shortest decimal form), `CALL`/`PUT` words (never CE/PE — an unknown
+/// leg falls back to the raw label, honest). Derived at WRITE time from
+/// fields already on the row — zero extra fetch, cold ILP write path
+/// (allocation is fine here; this is not the tick hot path).
+///
+/// `expiry_ist_nanos` follows the house IST-as-epoch convention (the
+/// row's own `expiry` column value); an out-of-range timestamp renders
+/// the honest `?` day/month sentinel instead of a fabricated date.
+#[must_use]
+pub fn contract_label(
+    underlying_symbol: &str,
+    expiry_ist_nanos: i64,
+    strike: f64,
+    leg: &str,
+) -> String {
+    use chrono::Datelike;
+    let side = match leg {
+        OPTION_CHAIN_1M_LEG_CE => "CALL",
+        OPTION_CHAIN_1M_LEG_PE => "PUT",
+        other => other,
+    };
+    let date = chrono::DateTime::from_timestamp(expiry_ist_nanos.div_euclid(1_000_000_000), 0)
+        .map(|dt| dt.date_naive());
+    let (day, month) = match date {
+        Some(d) => (
+            d.day(),
+            CONTRACT_LABEL_MONTHS
+                .get(d.month0() as usize)
+                .copied()
+                .unwrap_or("?"),
+        ),
+        None => (0, "?"),
+    };
+    // Whole strikes render as integers (his example: 25000, not 25000.0);
+    // NOTE: display-only formatting — the strike VALUE is never computed
+    // or rounded (parse-only invariant; `{:.0}` is applied only when
+    // `fract() == 0`, i.e. losslessly).
+    if strike.is_finite() && strike.fract() == 0.0 {
+        format!("{underlying_symbol} {day} {month} {strike:.0} {side}")
+    } else {
+        format!("{underlying_symbol} {day} {month} {strike} {side}")
+    }
+}
+
+/// One-shot marker file for the 2026-07-20 `moneyness_depth` column DROP
+/// (operator ruling: *"what is this moneyness_depth column, just remove
+/// it"*). Mirrors the `index_constituency` ts-pin marker convention
+/// (`data/state/…`).
+pub const OPTION_CHAIN_1M_DEPTH_DROP_MARKER_PATH: &str =
+    "data/state/option-chain-1m-moneyness-depth-dropped.marker";
+
+/// PURE marker-gate predicate: should the one-shot depth-column DROP run?
+/// `true` when the marker file is ABSENT.
+#[must_use]
+pub fn option_chain_1m_depth_drop_should_run(marker_path: &std::path::Path) -> bool {
+    !marker_path.exists()
+}
+
+/// One-shot, marker-gated `ALTER TABLE option_chain_1m DROP COLUMN
+/// moneyness_depth` (operator ruling 2026-07-20 — the 2026-07-17 depth
+/// column is REMOVED; its historic rupee/step values are the garbage the
+/// ruling ordered gone). Idempotent + fail-safe:
+/// * marker PRESENT → skip (one-shot).
+/// * DROP succeeds → `info!` + marker written.
+/// * DROP rejected because the column does not exist (a fresh table
+///   created by the post-2026-07-20 DDL) → ALREADY the migrated state →
+///   marker written.
+/// * QuestDB down / other non-2xx → `error!` (CHAIN-03,
+///   `stage="depth_column_drop"`), marker NOT written — retried next boot.
+///   Never touches any other column; never blocks any boot leg.
+///
+/// A SEPARATE boot fn (the `index_constituency` ts-pin migration
+/// convention) — deliberately NOT wired inside
+/// [`ensure_option_chain_1m_table`], so the ensure's mock-HTTP unit
+/// tests can never trigger a marker write (the boot legs call BOTH,
+/// side by side).
+// TEST-EXEMPT: live-QuestDB ALTER runner (marker predicate + DDL string unit-tested; transport arms are the ensure-fn error-arm class)
+pub async fn migrate_drop_moneyness_depth_column(questdb_config: &QuestDbConfig) {
+    let marker_path = std::path::Path::new(OPTION_CHAIN_1M_DEPTH_DROP_MARKER_PATH);
+    if !option_chain_1m_depth_drop_should_run(marker_path) {
+        return;
+    }
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "depth_column_drop")
+                .increment(1);
+            error!(
+                code = "CHAIN-03",
+                stage = "depth_column_drop",
+                ?err,
+                "CHAIN-03: HTTP client build failed — moneyness_depth DROP \
+                 skipped, will retry next boot"
+            );
+            return;
+        }
+    };
+    let ddl = format!("ALTER TABLE {OPTION_CHAIN_1M_TABLE} DROP COLUMN moneyness_depth;");
+    let done = match client
+        .get(base_url)
+        .query(&[("query", ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!(
+                table = OPTION_CHAIN_1M_TABLE,
+                "one-time 2026-07-20 migration: dropped the retired moneyness_depth column"
+            );
+            true
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let lower = body.to_ascii_lowercase();
+            // A fresh table created by the post-2026-07-20 DDL has no such
+            // column — QuestDB rejects the DROP with an invalid/unknown
+            // column error; that IS the migrated state.
+            if lower.contains("invalid column")
+                || lower.contains("column") && lower.contains("does not exist")
+            {
+                true
+            } else {
+                metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "depth_column_drop")
+                    .increment(1);
+                error!(
+                    code = "CHAIN-03",
+                    stage = "depth_column_drop",
+                    %status,
+                    body = %body.chars().take(200).collect::<String>(),
+                    "CHAIN-03: moneyness_depth DROP COLUMN returned non-2xx — \
+                     marker NOT written, will retry next boot"
+                );
+                false
+            }
+        }
+        Err(err) => {
+            metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "depth_column_drop")
+                .increment(1);
+            error!(
+                code = "CHAIN-03",
+                stage = "depth_column_drop",
+                ?err,
+                "CHAIN-03: moneyness_depth DROP COLUMN request failed — \
+                 marker NOT written, will retry next boot"
+            );
+            false
+        }
+    };
+    if !done {
+        return;
+    }
+    // Best-effort marker write; a failed write just repeats the (now
+    // no-op) DROP next boot.
+    if let Some(parent) = marker_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        warn!(
+            ?err,
+            path = %parent.display(),
+            "moneyness_depth drop migration: failed to create data/state/ dir for marker"
+        );
+        return;
+    }
+    if let Err(err) = std::fs::write(
+        marker_path,
+        "option_chain_1m moneyness_depth column dropped on this deployment (operator ruling 2026-07-20).\n",
+    ) {
+        warn!(
+            ?err,
+            path = OPTION_CHAIN_1M_DEPTH_DROP_MARKER_PATH,
+            "moneyness_depth drop migration: failed to write marker (will repeat next boot)"
+        );
+    }
 }
 
 /// Create the `option_chain_1m` table if absent (idempotent schema-self-heal
@@ -533,8 +726,8 @@ impl OptionChain1mWriter {
 
     /// Shared append body — `rho` / `close_to_data_ms` are the
     /// independently-optional extension columns (ILP rows are sparse:
-    /// absent columns land NULL); `r.moneyness_depth` likewise lands only
-    /// when `Some`.
+    /// absent columns land NULL). The `contract` display label is derived
+    /// here from fields already on the row ([`contract_label`]).
     fn append_row_inner(
         &mut self,
         r: &OptionChain1mRow,
@@ -556,11 +749,19 @@ impl OptionChain1mWriter {
             .context("underlying_symbol")?
             .symbol("leg", r.leg)
             .context("leg")?
-            // Moneyness audit-mirror stamp (2026-07-14) — a SYMBOL tag,
-            // written UNCONDITIONALLY on BOTH feeds (UNKNOWN covers every
+            // Moneyness audit-mirror stamp (2026-07-14; combined step
+            // label since 2026-07-20) — a SYMBOL tag, written
+            // UNCONDITIONALLY on BOTH feeds (UNKNOWN covers every
             // unclassifiable case, so it is never absent).
-            .symbol("moneyness", r.moneyness)
+            .symbol("moneyness", r.moneyness.as_str())
             .context("moneyness")?
+            // Human-readable contract label (2026-07-20 operator
+            // addition) — derived from row fields, Dhan-web style.
+            .symbol(
+                "contract",
+                contract_label(r.underlying_symbol, r.expiry_ist_nanos, r.strike, r.leg).as_str(),
+            )
+            .context("contract")?
             .column_ts(
                 "trading_date_ist",
                 TimestampNanos::new(r.trading_date_ist_nanos),
@@ -597,12 +798,6 @@ impl OptionChain1mWriter {
             .column_ts("fetched_at", TimestampNanos::new(r.fetched_at_ist_nanos))
             .context("fetched_at")?;
         // Independently-optional columns (ILP-sparse — a None lands NULL).
-        let b = if let Some(depth) = r.moneyness_depth {
-            b.column_f64("moneyness_depth", depth)
-                .context("moneyness_depth")?
-        } else {
-            b
-        };
         let b = if let Some(rho) = rho {
             b.column_f64("rho", rho).context("rho")?
         } else {
@@ -693,6 +888,7 @@ impl OptionChain1mWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tickvault_common::moneyness::{Moneyness, StepIndexOutcome, moneyness_step_label};
 
     fn sample_row() -> OptionChain1mRow {
         OptionChain1mRow {
@@ -717,12 +913,10 @@ mod tests {
             previous_oi: 402_220,
             underlying_spot: 25_642.8,
             fetched_at_ist_nanos: 1_770_000_961_042_000_000,
-            // 25650 CE @ spot 25642.8, Rs.50 grid → the grid-rounded ATM.
-            moneyness: "ATM",
-            // The ATM label still carries its signed distance: CE depth =
-            // 25642.80 − 25650.00 = −7.20 rupees (OTM-direction sign,
-            // negative per the 2026-07-20 flip).
-            moneyness_depth: Some(-7.2),
+            // 25650 CE @ spot 25642.8, Rs.50 grid → the grid-rounded ATM
+            // (the anchor strike indexes 0 → the bare "ATM" label under
+            // the 2026-07-20 combined-label law).
+            moneyness: moneyness_step_label(Moneyness::Atm, StepIndexOutcome::Aligned(0)),
         }
     }
 
@@ -771,10 +965,11 @@ mod tests {
         // The per-contract SecurityId is a LABEL, never a key (derivative
         // ids are unstable across relists — instrument-master.md rule 3).
         assert!(!has_token("contract_security_id"));
-        // The signed depth (2026-07-17) is a numeric companion column,
-        // NEVER a key (float-valued + nullable — the close_to_data_ms
-        // class).
+        // The retired moneyness_depth (2026-07-17 → dropped 2026-07-20)
+        // must never re-enter the key; the human-readable contract label
+        // (2026-07-20) is a display column, never a key.
         assert!(!has_token("moneyness_depth"));
+        assert!(!has_token("contract"));
     }
 
     #[test]
@@ -879,56 +1074,156 @@ mod tests {
         );
     }
 
-    /// The 2026-07-17 signed-depth column: written when `Some` (both
-    /// feeds' append paths), OMITTED when `None` (ILP-sparse → NULL in
-    /// QuestDB — the unclassifiable/UNKNOWN-row case), and present in the
-    /// DDL manifest as DOUBLE so the self-heal covers live tables.
+    /// The 2026-07-20 combined-label law + column removal: the step
+    /// count lives IN the `moneyness` SYMBOL (`ITM-1`/`OTM+1`…), the
+    /// retired `moneyness_depth` column is NEVER written, absent from the
+    /// manifest (so the self-heal can never re-add it), and the DROP
+    /// migration machinery exists (marker predicate + path). The NEW
+    /// `contract` display label lands as a SYMBOL tag.
     #[test]
-    fn test_chain1m_append_row_stamps_moneyness_depth_when_some_omits_when_none() {
-        // Some(depth) → the field lands (plain + ext paths).
+    fn test_chain1m_combined_label_no_depth_column_and_contract_tag() {
+        // A one-step-ITM CE row carries the combined label.
+        let mut itm_row = sample_row();
+        itm_row.strike = 25_600.0;
+        itm_row.moneyness = moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(-1));
         let mut w = OptionChain1mWriter::for_test();
-        w.append_row(&sample_row()).expect("append must succeed");
+        w.append_row(&itm_row).expect("append must succeed");
         let line = w.buffer_utf8();
+        let tags = line.split(' ').next().unwrap_or_default();
         assert!(
-            line.contains("moneyness_depth=-7.2"),
-            "moneyness_depth missing when Some: {line}"
+            tags.contains(",moneyness=ITM-1"),
+            "combined ITM-1 label must land as an ILP TAG: {line}"
+        );
+        // The retired depth column is NEVER written — any path.
+        assert!(
+            !line.contains("moneyness_depth"),
+            "moneyness_depth must never be written (dropped 2026-07-20): {line}"
         );
         let mut ext = OptionChain1mWriter::for_test_with_feed(
             OPTION_CHAIN_1M_FEED_GROWW,
             OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
         );
-        ext.append_row_ext(&sample_row(), Some(5.1802), Some(1_042))
+        ext.append_row_ext(&itm_row, Some(5.1802), Some(1_042))
             .expect("ext append must succeed");
         assert!(
-            ext.buffer_utf8().contains("moneyness_depth=-7.2"),
-            "moneyness_depth missing on the ext path: {}",
+            !ext.buffer_utf8().contains("moneyness_depth"),
+            "moneyness_depth must never be written on the ext path: {}",
             ext.buffer_utf8()
         );
-
-        // None → the field is OMITTED entirely (NULL), while the
-        // moneyness SYMBOL tag still lands (UNKNOWN rows keep the label).
-        let mut none_row = sample_row();
-        none_row.moneyness = "UNKNOWN";
-        none_row.moneyness_depth = None;
+        // UNKNOWN rows keep the bare label.
+        let mut unknown_row = sample_row();
+        unknown_row.moneyness = moneyness_step_label(Moneyness::Unknown, StepIndexOutcome::Invalid);
         let mut w2 = OptionChain1mWriter::for_test();
-        w2.append_row_ext(&none_row, None, Some(1_042))
+        w2.append_row_ext(&unknown_row, None, Some(1_042))
             .expect("append must succeed");
-        let line2 = w2.buffer_utf8();
         assert!(
-            !line2.contains("moneyness_depth="),
-            "None depth must be omitted (NULL): {line2}"
+            w2.buffer_utf8().contains(",moneyness=UNKNOWN"),
+            "UNKNOWN rows keep the bare label: {}",
+            w2.buffer_utf8()
         );
+        // Manifest: no depth column (the self-heal must never re-add it);
+        // the contract display column IS present as SYMBOL.
         assert!(
-            line2.contains(",moneyness=UNKNOWN"),
-            "the moneyness label still lands on a None-depth row: {line2}"
+            !option_chain_1m_columns()
+                .iter()
+                .any(|&(col, _)| col == "moneyness_depth"),
+            "moneyness_depth must be ABSENT from the manifest (dropped 2026-07-20)"
         );
-
-        // Manifest carries the column as DOUBLE (ALTER self-heal).
         assert!(
             option_chain_1m_columns()
                 .iter()
-                .any(|&(col, ty)| col == "moneyness_depth" && ty == "DOUBLE"),
-            "moneyness_depth must be a DOUBLE column in the manifest"
+                .any(|&(col, ty)| col == "contract" && ty == "SYMBOL"),
+            "contract must be a SYMBOL column in the manifest"
+        );
+        assert!(
+            !option_chain_1m_create_ddl().contains("moneyness_depth"),
+            "the CREATE DDL must not carry the dropped column"
+        );
+        // The contract tag lands (spaces ILP-escaped inside the tag block).
+        assert!(
+            line.contains(",contract=NIFTY\\ "),
+            "contract label tag missing: {line}"
+        );
+        // Migration machinery: pure marker predicate + stable paths.
+        let missing = std::path::Path::new("data/state/definitely-absent-marker-for-test");
+        assert!(option_chain_1m_depth_drop_should_run(missing));
+        assert!(OPTION_CHAIN_1M_DEPTH_DROP_MARKER_PATH.starts_with("data/state/"));
+    }
+
+    /// The 2026-07-20 depth-drop migration marker gate: runs when the
+    /// marker is absent, skips when present (one-shot per deployment).
+    #[test]
+    fn test_option_chain_1m_depth_drop_should_run_marker_gate() {
+        let dir =
+            std::env::temp_dir().join(format!("tv-depth-drop-marker-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let marker = dir.join("marker");
+        assert!(
+            option_chain_1m_depth_drop_should_run(&marker),
+            "absent marker => migration runs"
+        );
+        std::fs::write(&marker, "done").expect("write marker");
+        assert!(
+            !option_chain_1m_depth_drop_should_run(&marker),
+            "present marker => one-shot skip"
+        );
+        std::fs::remove_file(&marker).ok();
+        std::fs::remove_dir(&dir).ok();
+        // The production marker path lives under data/state/ (the house
+        // migration-marker convention).
+        assert!(OPTION_CHAIN_1M_DEPTH_DROP_MARKER_PATH.starts_with("data/state/"));
+    }
+
+    /// The 2026-07-20 contract-label format law, pinned with exact
+    /// literals (the operator's own example first): day WITHOUT a leading
+    /// zero, month uppercase 3-letter, whole strikes as integers,
+    /// CALL/PUT words.
+    #[test]
+    fn test_contract_label_format_law() {
+        // 2026-07-28 IST midnight (IST-as-epoch) = 1_785_196_800 s.
+        let jul28 = 1_785_196_800_000_000_000_i64;
+        assert_eq!(
+            contract_label("NIFTY", jul28, 25_000.0, OPTION_CHAIN_1M_LEG_CE),
+            "NIFTY 28 JUL 25000 CALL"
+        );
+        assert_eq!(
+            contract_label("BANKNIFTY", jul28, 59_000.0, OPTION_CHAIN_1M_LEG_CE),
+            "BANKNIFTY 28 JUL 59000 CALL"
+        );
+        // PUT side + a single-digit day (2026-08-04 = jul28 + 7d) —
+        // no leading zero ("4 AUG", never "04 AUG").
+        let aug4 = jul28 + 7 * 86_400 * 1_000_000_000;
+        assert_eq!(
+            contract_label("SENSEX", aug4, 81_000.0, OPTION_CHAIN_1M_LEG_PE),
+            "SENSEX 4 AUG 81000 PUT"
+        );
+        // A genuinely fractional strike renders its decimal form (no NSE
+        // index grid has one today — defensive, never rounded).
+        assert_eq!(
+            contract_label("NIFTY", jul28, 25_050.5, OPTION_CHAIN_1M_LEG_PE),
+            "NIFTY 28 JUL 25050.5 PUT"
+        );
+        // Unknown leg falls back to the raw label (honest, never guessed).
+        assert_eq!(
+            contract_label("NIFTY", jul28, 25_000.0, "XX"),
+            "NIFTY 28 JUL 25000 XX"
+        );
+        // Extreme timestamps stay total (chrono covers the whole
+        // i64-nanos range once divided to seconds, so the `?` sentinel
+        // arm is pure defense): i64::MAX nanos = 2262-04-11.
+        assert_eq!(
+            contract_label("NIFTY", i64::MAX, 25_000.0, OPTION_CHAIN_1M_LEG_CE),
+            "NIFTY 11 APR 25000 CALL"
+        );
+        // Negative nanos (pre-epoch) floor-divide correctly.
+        assert_eq!(
+            contract_label(
+                "NIFTY",
+                -86_400_000_000_000,
+                25_000.0,
+                OPTION_CHAIN_1M_LEG_CE
+            ),
+            "NIFTY 31 DEC 25000 CALL"
         );
     }
 

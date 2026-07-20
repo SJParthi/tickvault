@@ -1132,13 +1132,12 @@ banned-pattern scanner keeps its RAM-first category, all 3 boot legs keep
 the classify/publish wiring, and the contract leg (DB-audit-only) never
 publishes a snapshot.
 
-> **⚠ SIGN CONVENTION SUPERSEDED 2026-07-20 (operator ruling — see the
-> dated section immediately below).** The 2026-07-17 paragraph is retained
-> verbatim for audit; its "NEGATIVE = ITM-direction, POSITIVE =
-> OTM-direction" convention (CE depth = strike − spot, PE depth =
-> spot − strike) is NO LONGER the law. The 2026-07-20 law INVERTS the
-> sign: **ITM ⇒ depth > 0, OTM ⇒ depth < 0** (CE depth = spot − strike;
-> PE depth = strike − spot).
+> **⚠ COLUMN REMOVED 2026-07-20 (operator ruling — see the dated section
+> immediately below).** The 2026-07-17 paragraph is retained verbatim
+> for audit; the `moneyness_depth` DOUBLE column it describes is
+> DROPPED (marker-gated migration), its arithmetic fns are deleted, and
+> the step information moved INTO the `moneyness` SYMBOL itself
+> (`ITM-1`/`OTM+1` combined labels — the 2026-07-20 law below).
 
 **2026-07-17 — `moneyness_depth` DOUBLE companion column (`option_chain_1m`,
 BOTH feeds):** the SYMBOL classification gains a signed numeric distance
@@ -1169,33 +1168,70 @@ DOUBLE is the raw parsed f64 — a sub-paise strike would make
 paise; real NSE strikes are whole-paise, so the divergence is nil in
 practice.
 
-**2026-07-20 — moneyness_depth SIGN FLIP (operator ruling — supersedes the
-2026-07-17 convention above):** the operator observed a live row at spot
-57800.9 / strike 81000 showing ITM depth = −23199.1 and OTM depth =
-+23199.1 and ruled the convention inverted — verbatim intent: *"ITM depth
-must be POSITIVE, OTM must be NEGATIVE — flip it."* The NEW law
-(test-pinned in `crates/common/src/moneyness.rs`):
+**2026-07-20 — COMBINED STEP LABEL in the `moneyness` column;
+`moneyness_depth` REMOVED; NEW `contract` display column (operator
+rulings, final — supersedes the 2026-07-17 depth column above):** the
+operator saw a live row at spot 57800.9 / strike 81000 carrying raw
+rupee depths (−23199.1/+23199.1) and, across three same-day refinements
+(honestly recorded: first read as a SIGN flip, then as a signed
+STRIKE-STEP INDEX — *"it should be ITM -1 or ITM -2 or something like
+that"* — then final), ruled verbatim: *"under moneyness column itself
+make it as itm-1 or otm+1, don't create new column — what is this
+moneyness_depth column, just remove it"*, plus the addition *"how about
+one extra column to mention everything like this — for example NIFTY 28
+JUL 25000 CALL"*. The FINAL law (test-pinned):
 
-- **`classify == Itm ⇒ depth > 0`, `classify == Otm ⇒ depth < 0`,
-  0 = strike paise-exactly at spot** (leg-normalized, both legs identical
-  sign semantics);
-- **CE depth = spot − strike** (CE ITM when strike < spot → positive ✓);
-- **PE depth = strike − spot** (PE ITM when strike > spot → positive ✓).
+- **The `moneyness` SYMBOL itself carries the step:** `ITM-1`, `ITM-2`,
+  …, `ATM`, `OTM+1`, `OTM+2`, … (~21 nominal distinct values under the
+  ATM±10 plan; `UNKNOWN` unchanged; bare `ITM`/`OTM` is the honest
+  fallback for an off-grid strike — direction known, step honestly
+  absent). The Jul-17 SIGN convention (ITM minus / OTM plus) matches
+  this notation and STAYS.
+- **Step computation is integer-exact from the chain's real grid:**
+  `moneyness_step_index(leg, strike_paise, atm_paise, step_paise)` in
+  `crates/common/src/moneyness.rs` — leg-normalized
+  (CE: (strike−atm)/step; PE: (atm−strike)/step) against the SAME
+  round-half-up grid ATM anchor + directive step table the classifier
+  uses; consistency-pinned `Itm ⇒ index < 0`, `Otm ⇒ index > 0`,
+  grid-ATM ⇒ 0. A NON-grid-aligned strike is a LOUD error path —
+  `StepIndexOutcome::NotAligned` → bare label +
+  `tv_moneyness_step_misaligned_total{feed}` + one edge-latched
+  CHAIN-02 `stage="moneyness_step_misaligned"` warn per
+  (feed, underlying, day) — NEVER silent rounding. Labels beyond ±10
+  (e.g. the screenshot's BANKNIFTY 81000 @ spot 57800.9 → `ITM-232`
+  PE / `OTM+232` CE on the Rs.100 grid) render honestly, never
+  clamped. The label is built by the zero-alloc
+  `moneyness_step_label` (`MoneynessStepLabel`, 24-byte stack buffer).
+- **`moneyness_depth` is REMOVED end-to-end:** row-struct field +
+  writer emit + CREATE DDL + ALTER-manifest entries deleted
+  (`moneyness_depth_paise`/`depth_paise_to_rupees` deleted with it),
+  and a ONE-SHOT marker-gated `ALTER TABLE option_chain_1m DROP COLUMN
+  moneyness_depth` runs at ensure time
+  (`data/state/option-chain-1m-moneyness-depth-dropped.marker`; a
+  fresh post-2026-07-20 table's invalid-column reject counts as
+  migrated; failure = CHAIN-03 `stage="depth_column_drop"`, marker not
+  written, retried next boot). The historic depth values are DELETED —
+  explicitly ordered, not an accident.
+- **NEW `contract` SYMBOL display column** — Dhan-web style
+  `"NIFTY 28 JUL 25000 CALL"` (day without leading zero, month
+  uppercase 3-letter, whole strikes as integers, CALL/PUT words),
+  derived at WRITE time from fields already on the row
+  (`contract_label` in the persistence module — display formatting
+  only, never strike arithmetic; the parse-only ratchet holds). Rows
+  written by earlier builds read NULL (self-heal ADD, never
+  backfilled). NOT in the DEDUP key.
 
-Screenshot verification: spot 57800.9 / strike 81000 → PE (ITM) depth =
-81000 − 57800.9 = **+23199.1** ✓; CE (OTM) depth = 57800.9 − 81000 =
-**−23199.1** ✓. Everything else is UNCHANGED: NULL semantics, the
-not-in-DEDUP-key label-column class, the integer-paise home
-(`moneyness_depth_paise`) + `depth_paise_to_rupees` write-boundary split,
-the parse-only-strike ratchet, and the RAM snapshot path (no depth
-field). Rows written under the 2026-07-17 convention (2026-07-17 →
-2026-07-20 merge minute) carry the OLD sign and are NOT backfilled
-(label column, latest-run-wins on any DEDUP re-append); rows self-correct
-from the merge minute onward. The code from 2026-07-17 faithfully
-followed the ruling of its day — the RULING is what flipped, not a code
-bug. Ratchets: `test_moneyness_depth_paise_ce_pe_sign_convention`,
-`test_moneyness_depth_sign_is_consistent_with_classification`,
-`test_moneyness_depth_one_paise_boundary`.
+Rows written before 2026-07-20 keep the bare 4-value labels (a label
+column, never backfilled); the `option_contract_1m_rest` table's
+`moneyness` column is NOT touched by this change (bare labels remain —
+its own step-labeling would need a fresh dated scope). The RAM
+`ChainMoneynessSnapshot` stays enum-based (decision surface unchanged).
+Ratchets: `test_moneyness_step_index_ce_pe_sign_convention`,
+`test_moneyness_step_index_guards_misalignment_and_extremes`,
+`test_moneyness_step_label_law`,
+`test_moneyness_step_sign_is_consistent_with_classification`,
+`test_chain1m_combined_label_no_depth_column_and_contract_tag`,
+`test_contract_label_format_law`.
 
 ## §3. Delivery boundary (honest — no false-OK)
 
