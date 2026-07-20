@@ -2822,6 +2822,29 @@ rules:
       backtrace; gate_deferred_nominal is a schedule/gate consistency
       bug to file — never widen spacings as a reaction.
 
+  # CADENCE-04 = the cross_fill_audit best-effort forensics chain degraded
+  # (emit channel drop / ILP append+flush / ensure-DDL / 15:47 IST daily
+  # digest read). Escalate (not auto_fix): the cadence decision path is
+  # untouched by construction and every event is still carried by the
+  # coalesced CADENCE-01 log + the cross-fill/fallback counters — only the
+  # queryable forensic rows / digest precision for the outage window are
+  # lost; the operator checks QuestDB health (make doctor, BOOT-01/02
+  # correlation) and lets the next event / next digest re-attempt.
+  - name: cadence-04-cross-fill-audit-degraded-escalate
+    match:
+      code: CADENCE-04
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-04 = cross_fill_audit forensics write/read degraded
+      (best-effort; Medium). Sustained rate = QuestDB ILP/HTTP degraded —
+      inspect via make doctor; a digest_read stage means the daily
+      Telegram honestly reported count-UNKNOWN instead of a false zero.
+      Nothing on the fetch/decision path needs repair; rows re-append
+      DEDUP-idempotently once QuestDB recovers.
+
   # FOLD-01 = the REST-era bar-fold candle derivation degraded (catch-up
   # query/parse, seal/bar handoff drop, or a supervised-task respawn).
   # Escalate (not auto_restart): every degrade is RE-DERIVABLE — the

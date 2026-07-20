@@ -91,8 +91,11 @@ const FEEDS_PAGE_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
   <h1>TickVault — Feed Control</h1>
-  <p class="sub">Turn each market-data feed on or off — one, or several at once.
-     Changes apply live (no restart).</p>
+  <p class="sub"><b>📊 Market data is captured by the per-minute REST cadence
+     pulls (Dhan + Groww) — that capture runs regardless of the switches
+     below.</b> Today's numbers are on the <a href="/board">Live Board</a>.</p>
+  <p class="sub">The switches below control only the RETIRED live-WS lanes —
+     they are OFF by design and safe to leave alone.</p>
 
   <div class="token-row">
     <input id="token" type="password" placeholder="API token (required to toggle feeds)"
@@ -352,6 +355,16 @@ struct FeedRowDescriptor {
 /// Build the per-feed UI note generically (no per-feed hardcoded copy) so any
 /// future feed gets an accurate description automatically.
 fn feed_note(feed: Feed) -> String {
+    // Operator-scare fix (2026-07-20): the retired live-WS lanes must never
+    // read as a fault — OFF is the designed runtime; the per-minute REST
+    // cadence pulls are the market-data capture now.
+    if feed.live_ws_retired() {
+        return format!(
+            "{} live-WS lane (retired) — off by design. Market data arrives \
+             via the per-minute REST cadence pulls instead.",
+            feed.display_name()
+        );
+    }
     if feed.is_runtime_toggleable() {
         format!(
             "{} live market-data feed — turn on/off. Off disconnects the live feed + stops \
@@ -414,6 +427,16 @@ mod tests {
         assert!(
             FEEDS_PAGE_HTML.contains("TickVault — Feed Control"),
             "has the title"
+        );
+        // Operator-scare fix (2026-07-20): the REST cadence capture status is
+        // the prominent line; the retired live-WS switches are secondary.
+        assert!(
+            FEEDS_PAGE_HTML.contains("per-minute REST cadence"),
+            "prominent REST-cadence capture line present"
+        );
+        assert!(
+            FEEDS_PAGE_HTML.contains("RETIRED live-WS lanes"),
+            "retired live-WS framing present"
         );
     }
 

@@ -332,7 +332,13 @@ fn per_feed_market_data_dedup_keys_must_include_feed() {
 // Scans EVERY `DEDUP_KEY_*` constant in storage src and fails if any omits the
 // bare `feed` token. The allowlist is EMPTY — there is no persisted table
 // exempt from the rule. Removing `feed` from ANY persisted key fails the build.
-const FEED_NOT_APPLICABLE_KEYS: &[&str] = &[];
+// 2026-07-20 (operator cross-fill visibility directive): `cross_fill_audit`
+// is exempt from the bare-`feed` token because its `lane` column IS the
+// per-feed identity for this table — the row describes the BORROWING broker
+// lane (`dhan`/`groww`), so a Dhan and a Groww event for the same minute are
+// already DISTINCT rows via `lane` (which is in the key). Adding a redundant
+// `feed` column would duplicate `lane` under a second name.
+const FEED_NOT_APPLICABLE_KEYS: &[&str] = &["DEDUP_KEY_CROSS_FILL_AUDIT"];
 
 #[test]
 fn every_persisted_table_dedup_key_must_include_feed() {

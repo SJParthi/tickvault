@@ -29,11 +29,13 @@ paths:
 > (config-gated dual-spawn), `crates/common/src/config.rs::CadenceConfig`
 > (`[cadence]`, serde default OFF; base.toml ships `enabled = false`),
 > `crates/common/src/error_code.rs::ErrorCode::{Cadence01LaneDegraded,
-> Cadence02DecisionSkipped, Cadence03SchedulerDegraded}`.
+> Cadence02DecisionSkipped, Cadence03SchedulerDegraded,
+> Cadence04AuditWriteFailed}`.
 > **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs` requires
 > this file to mention every `Cadence0*` variant verbatim — `CADENCE-01`,
-> `CADENCE-02`, `CADENCE-03`, `Cadence01LaneDegraded`, `Cadence02DecisionSkipped`
-> and `Cadence03SchedulerDegraded` appear here.
+> `CADENCE-02`, `CADENCE-03`, `CADENCE-04`, `Cadence01LaneDegraded`,
+> `Cadence02DecisionSkipped`, `Cadence03SchedulerDegraded` and
+> `Cadence04AuditWriteFailed` appear here.
 
 ---
 
@@ -796,6 +798,50 @@ the first column-0 `#[cfg(test)]` line, the house production-region
 pattern, so a test-module mention of the notify call can never satisfy or
 double-count the production pin.)
 
+## §3g. CADENCE-04 — cross_fill_audit forensics write/read degraded (2026-07-20)
+
+**Severity:** Medium. **Auto-triage safe:** Yes (best-effort forensic record;
+the cadence decision path + the coalesced CADENCE-01 signal are untouched).
+
+**Why this code exists (operator directive 2026-07-20):** every cross-fill
+must be "highlighted, logged, monitored, audited, visualised — every day,
+week, month — precisely at what time it is happening". The
+`cross_fill_audit` QuestDB table (writer:
+`crates/storage/src/cross_fill_audit_persistence.rs`; emit sink:
+`crates/core/src/cadence/audit.rs`; consumer + 15:47 IST daily Telegram
+digest: `crates/app/src/cross_fill_visibility.rs`; runbook with the
+weekly/monthly rollup SQL: `docs/runbooks/cross-fill-visibility.md`) records
+ONE row per cross-fill firing (`stage='cross_fill'`,
+`resolution='cross_fill'`) and per Groww fallback launch
+(`stage='groww_fallback'`, `resolution='native_late_retry'`), DEDUP-keyed
+`(ts, trading_date_ist, lane, cycle_minute_ist, stage)`. `CADENCE-04`
+(`ErrorCode::Cadence04AuditWriteFailed`) fires when that best-effort chain
+degrades — `stage` field on the emission:
+
+| stage | Meaning |
+|---|---|
+| `channel` | the runner's fire-and-forget `try_send` dropped an event (consumer dead / channel full — `tv_cross_fill_audit_dropped_total{reason}`) |
+| `append` / `flush` | the ILP append/flush failed (`tv_cross_fill_audit_write_errors_total{stage}`; a failed flush DISCARDS pending rows — `tv_cross_fill_audit_rows_discarded_total`, the poisoned-buffer defense) |
+| `audit_ensure_client_build` / `audit_ensure_ddl` | the boot ensure-DDL failed — the HTTP-CLIENT-01-class duplicate-row window applies until a later ensure succeeds |
+| `digest_read` | the 15:47 IST daily digest could not read the table — the Telegram says "count UNKNOWN", never a false "0 times" green (audit Rule 11) |
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `CADENCE-04`; the payload names
+   the `stage` + lane + minute.
+2. Run `make doctor` — a sustained rate means QuestDB ILP/HTTP is degraded
+   (cross-check BOOT-01/BOOT-02 if it coincides with boot).
+3. Nothing to repair on the cadence side: the decision path never consults
+   this table; the next event re-appends normally and the DEDUP keys make
+   replays idempotent. Only the queryable forensic rows / digest precision
+   for the outage window are lost.
+
+**Honest envelope:** the audit is best-effort forensics. A sustained outage
+loses `cross_fill_audit` rows for the window — the coalesced CADENCE-01
+`stage="cross_fill"` / `stage="groww_fallback"` logs and the
+`tv_cadence_cross_fill_total{direction}` /
+`tv_cadence_groww_fallback_total{leg}` counters still carry every event; it
+never affects the fetch cadence, the decisions, or any order path.
+
 ## §4. Honest envelope (mandatory per operator-charter §F)
 
 > "100% inside the tested envelope, with ratcheted regression coverage: the
@@ -855,9 +901,12 @@ This rule activates when editing:
 - `crates/app/src/cadence_boot.rs`
 - `crates/common/src/config.rs` (`CadenceConfig`)
 - `config/base.toml` `[cadence]`
-- Any file containing `CADENCE-01`, `CADENCE-02`, `CADENCE-03`,
+- `crates/storage/src/cross_fill_audit_persistence.rs`
+- `crates/app/src/cross_fill_visibility.rs`
+- Any file containing `CADENCE-01`, `CADENCE-02`, `CADENCE-03`, `CADENCE-04`,
   `Cadence01LaneDegraded`, `Cadence02DecisionSkipped`,
-  `Cadence03SchedulerDegraded`, `MinSpacingGate`, `DhanGates`,
+  `Cadence03SchedulerDegraded`, `Cadence04AuditWriteFailed`,
+  `cross_fill_audit`, `MinSpacingGate`, `DhanGates`,
   `CadenceExecutor`, `spawn_supervised_cadence_runner`, `tv_cadence_`,
   `DayLockedExpiryStore`, `global_dhan_gates`, `global_expiry_store`,
   `resolve_policy_expiry`, or `QueueDelay`
