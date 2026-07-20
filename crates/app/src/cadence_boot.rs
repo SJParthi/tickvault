@@ -151,6 +151,10 @@ pub fn spawn_cadence_scheduler(
         let questdb = config.questdb.clone();
         drop(tokio::spawn(async move {
             tickvault_storage::spot_1m_rest_persistence::ensure_spot_1m_rest_table(&questdb).await;
+            tickvault_storage::option_chain_1m_persistence::migrate_drop_moneyness_depth_column(
+                &questdb,
+            )
+            .await;
             tickvault_storage::option_chain_1m_persistence::ensure_option_chain_1m_table(&questdb)
                 .await;
             tickvault_storage::rest_fetch_audit_persistence::ensure_rest_fetch_audit_table(
