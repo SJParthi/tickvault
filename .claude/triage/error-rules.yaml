@@ -2822,6 +2822,26 @@ rules:
       backtrace; gate_deferred_nominal is a schedule/gate consistency
       bug to file — never widen spacings as a reaction.
 
+  # CADENCE-04 = degraded-leg RECOVERY machinery degraded (late retry
+  # error/still-empty/429-aborted, or the background history re-pull
+  # exhausted). The degrade already happened — the volley resolved via
+  # cross-fill or the bounded re-pull gave up; nothing is auto-re-fired.
+  # Log-sink-only delivery (operator 2026-07-20).
+  - name: cadence-04-recovery-degraded-escalate
+    match:
+      code: CADENCE-04
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-04 = degraded-leg recovery degraded. stale_answer /
+      retry_still_empty trends = vendor publication lag past T+3.8s
+      (the cross-fill covered the decision); repull_exhausted rising =
+      the broker still had no history rows at T+60s — inspect the lane's
+      own SPOT1M/CHAIN degraded pages per the runbook; never widen the
+      retry offsets as a reaction.
+
   # FOLD-01 = the REST-era bar-fold candle derivation degraded (catch-up
   # query/parse, seal/bar handoff drop, or a supervised-task respawn).
   # Escalate (not auto_restart): every degrade is RE-DERIVABLE — the

@@ -861,3 +861,57 @@ This rule activates when editing:
   `CadenceExecutor`, `spawn_supervised_cadence_runner`, `tv_cadence_`,
   `DayLockedExpiryStore`, `global_dhan_gates`, `global_expiry_store`,
   `resolve_policy_expiry`, or `QueueDelay`
+
+## §CADENCE-04 — degraded-leg recovery (hedged late retry + background history re-pull)
+
+> **Operator directive (2026-07-20, verbatim):** "retry native until the 4th
+> second, then cross-fill; backfill never feeds live decisions."
+
+`ErrorCode::Cadence04RecoveryDegraded` (`code_str() == "CADENCE-04"`).
+**Severity:** High. **Auto-triage safe:** YES (the degrade already happened —
+the volley resolved via cross-fill or the bounded re-pull gave up; nothing is
+auto-re-fired). **Delivery:** log-sink-only — NO Telegram, NO CloudWatch
+alarm (the Dhan noise-lock 4-item family is UNCHANGED).
+
+**The pinned contract (`crates/common/src/constants.rs`):**
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `CADENCE_LATE_RETRY_OFFSETS_MS` | `[2_000, 3_000, 3_800]` | bounded in-window micro-retries of ONLY the missing legs, ms after minute close (first fire ~T+1.3s) |
+| `CADENCE_NATIVE_DECISION_DEADLINE_MS` | `4_000` | the T+4s decision pin: native data if a retry landed it, else the already-prepared cross-fill with zero extra wait |
+| `CADENCE_HISTORY_REPULL_OFFSETS_MS` | `[30_000, 60_000]` | detached background re-pull of the degraded broker's OWN rows (DEDUP-idempotent upsert) — fired only when the deadline resolved via cross-fill |
+| `CADENCE_DHAN_PREWARM_LEAD_MS` | `5_000` | one best-effort pre-warm GET on the pooled Dhan client at T−5s |
+
+**Trigger:** a per-lane recovery leg degraded — a late retry answered a
+NON-requested minute (stale-answer guard refusal), every late retry exhausted
+without native data (decision fell to cross-fill), or a background history
+re-pull attempt failed/exhausted. The payload names lane, stage, attempt and
+offset.
+
+**Counters:** `tv_cadence_late_retry_total{lane, outcome}` with outcome ∈
+{`native_landed`, `stale_answer`, `empty_again`, `error`, `exhausted`} and
+`tv_cadence_history_repull_total{lane, outcome}` with outcome ∈
+{`recovered`, `empty`, `error`, `exhausted`}.
+
+**Isolation law (build-failing ratchet):** the background re-pull is
+HARD-ISOLATED from decisions — it upserts the broker's OWN rows through the
+existing DEDUP keys and is NEVER a resolution value in any audit
+(resolution stays ∈ {`native_first_try`, `native_late_retry`, `cross_fill`}).
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `CADENCE-04`; the payload names
+   lane + stage + attempt.
+2. A `stale_answer` outcome = the vendor served a lagging minute — expected
+   during open-minute lag; the decision already used cross-fill.
+3. Sustained `exhausted` on ONE lane = that broker's intraday endpoint is
+   lagging past T+3.8s — check the lane's own degraded pages (SPOT1M/CHAIN
+   families) and the daily digest; the other lane's cross-fill is covering.
+4. `tv_cadence_history_repull_total{outcome="exhausted"}` rising = the
+   degraded broker still had no data at T+60s — the minute stays cross-filled
+   in the shared tables; record-completeness recovers on later sweeps only.
+
+**Honest envelope:** the hedged retries recover SMALL publication lag
+(≤ ~3.8s); the ~2-minute open lag observed live on 2026-07-20 (09:15/09:16
+IST empty at pull, clean from 09:18) is NOT retryable in-window — only the
+cross-fill covers it, and the background re-pull repairs the broker's own
+history rows after the fact. The healthy lane is byte-untouched.
