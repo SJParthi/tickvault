@@ -349,6 +349,21 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
     strip.appendChild(dbCell("Minute summaries (candles) sealed today", c));
     var r = el("span", db.reachable ? "lastTick" : null, db.reachable ? "✅ answering" : "🆘 not answering");
     strip.appendChild(dbCell("Vault (database) right now", r));
+    // Cross-fill today (operator 2026-07-20): how many times one broker's
+    // minute was filled from the other broker, with the precise times.
+    var xf = el("span");
+    var xfEvents = db.cross_fill_events;
+    if (Array.isArray(xfEvents)) {
+      var n = (typeof db.cross_fill_today === "number") ? db.cross_fill_today : xfEvents.length;
+      xf.textContent = (n === 0) ? "0 ✅" : String(n);
+    } else {
+      xf.textContent = "—"; // table unreadable — honest unknown, never 0
+    }
+    var xfCell = dbCell("Cross-fill today (one broker filled from the other)", xf);
+    if (Array.isArray(xfEvents) && xfEvents.length) {
+      xfCell.appendChild(el("div", "lab", xfEvents.slice(0, 6).join(" · ")));
+    }
+    strip.appendChild(xfCell);
   }
 
   // ---------- 6. problems (bearer-gated error log) ----------
@@ -466,6 +481,10 @@ mod tests {
         // test coverage (pub-fn-test-guard): board_page
         assert!(BOARD_HTML.starts_with("<!DOCTYPE html>"));
         assert!(BOARD_HTML.contains("TickVault — Live Board"), "title");
+        assert!(
+            BOARD_HTML.contains("Cross-fill today"),
+            "cross-fill tile present (operator 2026-07-20)"
+        );
         assert!(
             BOARD_HTML.contains("LOCAL — live data"),
             "LOCAL badge present"

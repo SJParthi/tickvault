@@ -45,6 +45,9 @@ pub mod brutex_crossverify_boot;
 // `.claude/rules/project/cadence-error-codes.md`.
 pub mod cadence_boot;
 pub(crate) mod cadence_escalation;
+/// Cross-fill visibility (operator 2026-07-20): audit-channel consumer +
+/// the 15:47 IST daily Telegram digest over `cross_fill_audit`.
+pub mod cross_fill_visibility;
 // Boot-time candle-table DDL + retired-object sweep (Track A, 2026-07-18):
 // re-homes the pre-#1522 drop-legacy → ensure-candles → named-views chain
 // behind a bounded quiet probe; awaited from `build_shared_infra` BEFORE
