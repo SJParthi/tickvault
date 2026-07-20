@@ -4075,7 +4075,9 @@ pub const CADENCE_DECISION_DEADLINE_MS: i64 = 4_000;
 
 /// Background history re-pull offsets (post-cross-fill repair of the degraded
 /// broker's OWN rows; history-repair only, never a decision input).
-pub const CADENCE_HISTORY_REPULL_OFFSETS_MS: [i64; 2] = [30_000, 60_000];
+// T+50s (NOT T+60s): T+60s lands exactly ON the next minute boundary and would
+// collide with the next cycle's volley burst (#1690 audit H5). Strictly < 60_000.
+pub const CADENCE_HISTORY_REPULL_OFFSETS_MS: [i64; 2] = [30_000, 50_000];
 
 #[cfg(test)]
 mod market_hours_tests {
@@ -5480,6 +5482,11 @@ mod cadence_native_retry_hedge_tests {
                 .iter()
                 .all(|&o| o < CADENCE_DECISION_DEADLINE_MS)
         );
-        assert_eq!(CADENCE_HISTORY_REPULL_OFFSETS_MS, [30_000, 60_000]);
+        assert_eq!(CADENCE_HISTORY_REPULL_OFFSETS_MS, [30_000, 50_000]);
+        assert!(
+            CADENCE_HISTORY_REPULL_OFFSETS_MS
+                .iter()
+                .all(|&o| o < 60_000)
+        );
     }
 }
