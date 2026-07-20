@@ -300,7 +300,13 @@ impl LaneAssembly {
         let mut chains_filled = 0;
         for u in ChainUnderlying::ALL {
             let i = u.index();
+            // M4 (audit 2026-07-20, Dim B): a donor spot whose paise guard
+            // FAILED (`spot_paise == 0` — invalid/absurd price) is refused;
+            // borrowing it would mint a CrossSource cell that anchors every
+            // strike Unknown-at-best (or wrong via the raw f64). The cell
+            // stays empty — the honest skip/degrade path.
             if let (None, Some(foreign)) = (self.spots[i], other.spots[i])
+                && foreign.spot_paise > 0
                 && cross_fill_fresh(
                     foreign.minute_ist,
                     self.cycle_minute_ist,
@@ -358,6 +364,31 @@ pub fn cross_fill_fresh(
     foreign_minute_ist == cycle_minute_ist
         && foreign_fetched_at_ms >= freshness_floor_abs_ms
         && now_ms <= borrowing_cutoff_abs_ms
+}
+
+/// The advisory spot price-coherence band, basis points (H3/H2-partial/M14,
+/// audit 2026-07-20): 50 bps = 0.5% — the OPTION-CHAIN-04 LTP-disagreement
+/// tolerance precedent (`option-chain-cross-verify-error-codes.md` §1).
+/// Two same-minute prices for one underlying differing beyond this band
+/// signal vendor staleness, a wrong-instrument body, or cross-broker
+/// divergence — ADVISORY (stage + counter), never decision-blocking.
+pub const CADENCE_SPOT_DIVERGENCE_MAX_BPS: i64 = 50;
+
+/// TRUE when two paise prices for the SAME (underlying, minute) diverge
+/// beyond [`CADENCE_SPOT_DIVERGENCE_MAX_BPS`] relative to the SMALLER
+/// operand (the conservative denominator — symmetric in its arguments).
+/// Any non-positive operand returns `false`: an unresolved/guard-failed
+/// price carries no verdict (its own Unknown/skip paths already surface
+/// it). Integer-only saturating math — O(1), no float compare. Pure.
+#[must_use]
+pub fn spots_diverge_paise(a_paise: i64, b_paise: i64) -> bool {
+    if a_paise <= 0 || b_paise <= 0 {
+        return false;
+    }
+    let diff = (a_paise - b_paise).abs();
+    let denom = a_paise.min(b_paise);
+    // diff/denom > BPS/10_000  ⇔  diff * 10_000 > denom * BPS (denom > 0).
+    diff.saturating_mul(10_000) > denom.saturating_mul(CADENCE_SPOT_DIVERGENCE_MAX_BPS)
 }
 
 /// The cross-fill freshness floor (absolute IST ms-of-day) for the
@@ -919,6 +950,70 @@ mod tests {
         );
         assert!(borrower.spot(ChainUnderlying::Nifty).is_none());
         assert!(borrower.chain(ChainUnderlying::Nifty).is_none());
+    }
+
+    #[test]
+    fn cross_fill_refuses_nonpositive_donor_spot() {
+        // M4 (audit 2026-07-20, Dim B): a donor spot whose paise guard
+        // failed (spot_paise == 0) must NOT cross-fill — the borrower's
+        // cell stays empty (honest skip), while a VALID donor still fills.
+        let mut borrower = asm(Feed::Dhan);
+        let mut lender = asm(Feed::Groww);
+        // Guard-failed donor: non-finite/absurd price → spot_paise == 0.
+        lender.record_spot(
+            SpotTarget::Nifty,
+            -1.0,
+            SpotProvenance::OwnFetch,
+            T_MS + 300,
+            MINUTE,
+        );
+        assert!(
+            lender
+                .spot(ChainUnderlying::Nifty)
+                .is_some_and(|s| s.spot_paise == 0),
+            "precondition: the guard must have failed the donor price"
+        );
+        // Valid donor on a second underlying.
+        lender.record_spot(
+            SpotTarget::BankNifty,
+            51_000.0,
+            SpotProvenance::OwnFetch,
+            T_MS + 300,
+            MINUTE,
+        );
+        let (spots, chains) =
+            borrower.cross_fill_from(&lender, BASE_FLOOR_MS, T_MS + 1_000, T_MS + 15_000);
+        assert_eq!((spots, chains), (1, 0), "only the valid donor fills");
+        assert!(
+            borrower.spot(ChainUnderlying::Nifty).is_none(),
+            "the paise-0 donor was refused"
+        );
+        assert!(
+            borrower
+                .spot(ChainUnderlying::Banknifty)
+                .is_some_and(|s| s.provenance == SpotProvenance::CrossSource)
+        );
+    }
+
+    #[test]
+    fn spots_diverge_paise_band_boundaries() {
+        // H3/H2-partial/M14 (audit 2026-07-20): 50 bps band, strictly-
+        // greater fires, relative to the SMALLER operand, symmetric.
+        let base = 2_450_000_i64; // NIFTY 24,500.00 in paise
+        // Exactly at the band (0.5% of base = 12_250 paise): NOT diverged.
+        assert!(!spots_diverge_paise(base, base + 12_250));
+        assert!(!spots_diverge_paise(base + 12_250, base));
+        // One paise beyond the band: diverged (both argument orders).
+        assert!(spots_diverge_paise(base, base + 12_251));
+        assert!(spots_diverge_paise(base + 12_251, base));
+        // Equal prices: never diverged.
+        assert!(!spots_diverge_paise(base, base));
+        // A 2:1 split-class divergence: loudly diverged.
+        assert!(spots_diverge_paise(base, base / 2));
+        // Non-positive operands carry NO verdict.
+        assert!(!spots_diverge_paise(0, base));
+        assert!(!spots_diverge_paise(base, 0));
+        assert!(!spots_diverge_paise(-1, base));
     }
 
     #[test]

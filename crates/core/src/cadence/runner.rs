@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 use super::assembly::{
     ChainCell, ChainProvenance, LaneAssembly, MoneynessFold, SpotProvenance,
     chain_moneyness_anchor, cross_fill_freshness_floor_ms, fold_chain_cell_moneyness,
+    spots_diverge_paise,
 };
 use super::audit::{CrossFillAuditEvent, emit_cross_fill_audit};
 use super::decision::{
@@ -379,6 +380,9 @@ where
     let mut groww_ladder = StreakLadder::starting_at(0);
     let mut latch = DecisionLatch::new();
     let mut last_boundary: Option<u32> = None;
+    // M9 (audit 2026-07-20): once-per-day latch for the session-tail
+    // accounting in the no-joinable-boundary arm.
+    let mut final_tail_accounted = false;
     let mut current_date = clock.ist_date();
     let mut exhausted_episode = false;
     let mut lanes_parked = false;
@@ -404,6 +408,7 @@ where
             groww_ladder = StreakLadder::starting_at(0);
             exhausted_episode = false;
             last_boundary = None;
+            final_tail_accounted = false;
             // The decision latch stores bare minute-of-day slots, which
             // recur EVERY day — a lane whose slot froze across the day
             // flip (parked lanes, a midnight suspend) would otherwise
@@ -456,6 +461,30 @@ where
             None
         };
         let Some(boundary) = boundary else {
+            // M9 (audit 2026-07-20, Dim D F1): a stall/skew that overruns
+            // PAST session end lands here with the day's TAIL boundaries
+            // (incl. the 15:29 decision minute) consumed by NOTHING — the
+            // in-session boundary_skipped arm below never sees them
+            // because no further joinable boundary exists. Account them
+            // LOUDLY, once per IST day (latched; a fresh post-close boot
+            // with `last_boundary = None` never claims a tail it did not
+            // own — that class is the boot-liveness alarm's).
+            if is_trading
+                && !final_tail_accounted
+                && let Some(missed) = unaccounted_session_tail(last_boundary)
+            {
+                final_tail_accounted = true;
+                metrics::counter!("tv_cadence_boundary_skipped_total").increment(u64::from(missed));
+                error!(
+                    code = ErrorCode::Cadence03SchedulerDegraded.code_str(),
+                    stage = "final_boundary_missed",
+                    missed,
+                    from_boundary = ?last_boundary,
+                    "CADENCE-03: session-tail cycle boundaries dropped past \
+                     15:30 IST un-fired (stall/overrun past session end) — \
+                     the final decisions of the day were lost"
+                );
+            }
             // Off-session / day over: bounded-chunk sleep re-checking the
             // calendar (shutdown stays responsive).
             tokio::select! {
@@ -1247,6 +1276,20 @@ struct DegradeFlags {
     cross_fill: bool,
     chain_embedded_spot: bool,
     moneyness_unknown: bool,
+    /// ADVISORY (H3/H2-partial, audit 2026-07-20): a chain body's embedded
+    /// underlying spot diverged from the lane's resolved spot cell beyond
+    /// the 0.5% coherence band — vendor-stale chain / wrong-instrument
+    /// proxy (chain bodies carry no vendor timestamp or echo to check
+    /// directly). Never decision-blocking, never arming. 2026-07-20
+    /// (adversarial review): EXCLUDED from `any()`/`stages()` — advisory
+    /// info-level + counter only, never a CADENCE-01 degrade stage.
+    chain_spot_divergence: bool,
+    /// ADVISORY (H2-partial/M14, audit 2026-07-20): both lanes' OWN-fetch
+    /// spots for one underlying + minute diverged beyond the band —
+    /// cross-broker divergence / wrong-instrument proxy. 2026-07-20
+    /// (adversarial review): EXCLUDED from `any()`/`stages()` — advisory
+    /// info-level + counter only, never a CADENCE-01 degrade stage.
+    cross_source_spot_divergence: bool,
     /// ≥1 chain request was stamped `expiry_yyyymmdd = None` (the
     /// resolver seam is unresolved — the scheduler never guesses; the
     /// executor impl may fall back to its warmup expiry). Always set in
@@ -2261,7 +2304,34 @@ fn insert_event(events: &mut Vec<(i64, CycleAction)>, at_ms: i64, action: CycleA
     events.insert(pos, (at_ms, action));
 }
 
-/// Bound a chain fetch by the per-request timeout (Elapsed → `Timeout`).
+/// M11 (audit 2026-07-20, Dim E-2): the runner's OUTER cancel bound sits
+/// this far BEYOND the executor's own `deadline_epoch_ms` budget. The
+/// executor types its own `Timeout` for the NETWORK phase (its deadline
+/// math is unchanged); the outer `tokio::time::timeout` is only the
+/// wedge backstop — before this grace it fired at exactly the executor's
+/// budget and could cancel the future BETWEEN a succeeded persist/flush
+/// and its audit append + fold handoff (persisted rows then mislabeled
+/// `Timeout`, forensic row skipped). 1.5s covers the bounded persist
+/// tail (ILP flush + audit append via the off-worker flush helpers).
+const CADENCE_EXECUTOR_TAIL_GRACE_MS: i64 = 1_500;
+
+/// M9 (audit 2026-07-20, Dim D F1): the count of session-TAIL cycle
+/// boundaries that elapsed entirely un-fired when the day loop finds NO
+/// further joinable boundary — i.e. the boundaries in
+/// `(last_boundary, 15:30:00]` a stall/overrun past session end silently
+/// consumed (the in-session `boundary_skipped` arm never sees them). A
+/// process that never completed a boundary this session (`None` — e.g. a
+/// post-close boot) owns no tail: claiming the whole day would be false.
+/// Pure.
+#[must_use]
+fn unaccounted_session_tail(last_boundary: Option<u32>) -> Option<u32> {
+    let lb = last_boundary?;
+    let last = super::schedule::CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST;
+    (lb < last).then(|| (last - lb) / 60)
+}
+
+/// Bound a chain fetch by the per-request timeout plus the persist-tail
+/// grace (Elapsed → `Timeout`; see [`CADENCE_EXECUTOR_TAIL_GRACE_MS`]).
 async fn bound_chain_fetch<E: CadenceExecutor>(
     exec: &E,
     req: ChainFetchRequest,
@@ -2269,14 +2339,19 @@ async fn bound_chain_fetch<E: CadenceExecutor>(
 ) -> Result<ChainFetchOk, CadenceFetchError> {
     // APPROVED: validated > 0 at boot — the cast is safe.
     #[allow(clippy::cast_sign_loss)]
-    let dur = Duration::from_millis(timeout_ms.max(1) as u64);
+    let dur = Duration::from_millis(
+        timeout_ms
+            .max(1)
+            .saturating_add(CADENCE_EXECUTOR_TAIL_GRACE_MS) as u64,
+    );
     match tokio::time::timeout(dur, exec.fetch_chain(req)).await {
         Ok(r) => r,
         Err(_elapsed) => Err(CadenceFetchError::Timeout),
     }
 }
 
-/// Bound a spot fetch by the per-request timeout (Elapsed → `Timeout`).
+/// Bound a spot fetch by the per-request timeout plus the persist-tail
+/// grace (Elapsed → `Timeout`; see [`CADENCE_EXECUTOR_TAIL_GRACE_MS`]).
 async fn bound_spot_fetch<E: CadenceExecutor>(
     exec: &E,
     req: SpotFetchRequest,
@@ -2284,7 +2359,11 @@ async fn bound_spot_fetch<E: CadenceExecutor>(
 ) -> Result<SpotSnapshot, CadenceFetchError> {
     // APPROVED: validated > 0 at boot — the cast is safe.
     #[allow(clippy::cast_sign_loss)]
-    let dur = Duration::from_millis(timeout_ms.max(1) as u64);
+    let dur = Duration::from_millis(
+        timeout_ms
+            .max(1)
+            .saturating_add(CADENCE_EXECUTOR_TAIL_GRACE_MS) as u64,
+    );
     match tokio::time::timeout(dur, exec.fetch_spot(req)).await {
         Ok(r) => r,
         Err(_elapsed) => Err(CadenceFetchError::Timeout),
@@ -2847,6 +2926,44 @@ fn finalize_if_complete<C: CadenceClock>(
     if !lane.asm.is_data_complete() {
         return;
     }
+    // ADVISORY cross-broker coherence band (H2-partial/M14, audit
+    // 2026-07-20): when BOTH lanes hold OWN-fetch spots for the same
+    // underlying + minute, a >0.5% disagreement flags cross-source
+    // divergence (wrong-instrument / corporate-action-adjustment /
+    // vendor-staleness proxy — no leg's response carries an instrument
+    // echo to validate directly). Opportunistic by completion order:
+    // checked on the lane that decides while the other lane's same-cycle
+    // cell already exists. Flag + counter only — never blocking.
+    for u in ChainUnderlying::ALL {
+        if let (Some(own), Some(foreign)) = (lane.asm.spot(*u), other.asm.spot(*u))
+            && own.provenance == SpotProvenance::OwnFetch
+            && foreign.provenance == SpotProvenance::OwnFetch
+            && own.minute_ist == foreign.minute_ist
+            && spots_diverge_paise(own.spot_paise, foreign.spot_paise)
+        {
+            // Coalesced ADVISORY emission (2026-07-20, adversarial review):
+            // decoupled from CADENCE-01 — one plain info! per lane per
+            // cycle (first offender named), NO ErrorCode, counter kept.
+            if !lane.flags.cross_source_spot_divergence {
+                info!(
+                    kind = "cross_source_spot_divergence",
+                    lane = lane.asm.feed.as_str(),
+                    underlying = u.as_str(),
+                    own_spot_paise = own.spot_paise,
+                    foreign_spot_paise = foreign.spot_paise,
+                    delta_paise = (own.spot_paise - foreign.spot_paise).abs(),
+                    "cadence advisory: cross-broker spot divergence beyond the \
+                     0.5% band (info-only, coalesced — not a CADENCE-01 stage)"
+                );
+            }
+            lane.flags.cross_source_spot_divergence = true;
+            metrics::counter!(
+                "tv_cadence_cross_source_spot_divergence_total",
+                "underlying" => u.as_str()
+            )
+            .increment(1);
+        }
+    }
     decide_lane(clock, slots, lane, latch, dry_run);
 }
 
@@ -2895,6 +3012,44 @@ fn decide_lane<C: CadenceClock>(
         // OwnFetch spot serves the SPOT SERIES, not chain moneyness.
         let (spot_paise, atm_paise) =
             chain_moneyness_anchor(*u, lane.asm.chain(*u), lane.asm.spot(*u));
+        // ADVISORY coherence band (H3/H2-partial, audit 2026-07-20): the
+        // chain's embedded underlying spot vs the lane's resolved spot
+        // cell. Chain bodies carry no vendor timestamp or instrument
+        // echo, so a >0.5% disagreement is the honest proxy for a
+        // vendor-stale chain body or a wrong-instrument response. Flag +
+        // counter only — never decision-blocking, never arming.
+        if let (Some(embedded_paise), Some(cell)) = (
+            lane.asm
+                .chain(*u)
+                .and_then(|c| c.embedded_spot)
+                .and_then(tickvault_common::moneyness::price_to_paise_guarded),
+            lane.asm.spot(*u),
+        ) && spots_diverge_paise(embedded_paise, cell.spot_paise)
+        {
+            // Coalesced ADVISORY emission (2026-07-20, adversarial review):
+            // decoupled from CADENCE-01 — one plain info! per lane per
+            // cycle (first offender named), NO ErrorCode, counter kept.
+            if !lane.flags.chain_spot_divergence {
+                info!(
+                    kind = "chain_spot_divergence",
+                    lane = feed.as_str(),
+                    underlying = u.as_str(),
+                    embedded_spot_paise = embedded_paise,
+                    cell_spot_paise = cell.spot_paise,
+                    delta_paise = (embedded_paise - cell.spot_paise).abs(),
+                    "cadence advisory: chain-embedded spot diverged from the \
+                     resolved spot cell beyond the 0.5% band (info-only, \
+                     coalesced — not a CADENCE-01 stage)"
+                );
+            }
+            lane.flags.chain_spot_divergence = true;
+            metrics::counter!(
+                "tv_cadence_chain_spot_divergence_total",
+                "lane" => feed.as_str(),
+                "underlying" => u.as_str()
+            )
+            .increment(1);
+        }
         // GUARDED fold over the resolved cell: reads the cell's SOURCE
         // feed's registry slot (the lender's for a cross-filled chain),
         // refuses an unconfirmed publish and a stale / wrong-minute /
@@ -3035,4 +3190,80 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
         dry_run,
     );
     lane.resolved = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M9 (audit 2026-07-20): the session-tail accounting owns exactly
+    /// the boundaries in `(last_boundary, 15:30:00]` — and refuses to
+    /// claim a day it never served.
+    #[test]
+    fn unaccounted_session_tail_cases() {
+        let last = super::super::schedule::CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST;
+        // A post-close boot that never completed a boundary owns no tail.
+        assert_eq!(unaccounted_session_tail(None), None);
+        // A healthy day (final boundary completed) has no tail.
+        assert_eq!(unaccounted_session_tail(Some(last)), None);
+        // Stalled after 15:28 → the 15:29 and 15:30 boundaries dropped.
+        assert_eq!(unaccounted_session_tail(Some(last - 120)), Some(2));
+        // Stalled right after the penultimate boundary → exactly one.
+        assert_eq!(unaccounted_session_tail(Some(last - 60)), Some(1));
+    }
+
+    /// M11 (audit 2026-07-20): the outer cancel bound is STRICTLY beyond
+    /// the executor's own budget (additive grace, saturating), so it can
+    /// no longer sever a completed persist from its audit row.
+    #[test]
+    fn executor_tail_grace_is_bounded_and_additive() {
+        assert_eq!(CADENCE_EXECUTOR_TAIL_GRACE_MS, 1_500);
+        let timeout_ms: i64 = 5_000;
+        let outer = timeout_ms
+            .max(1)
+            .saturating_add(CADENCE_EXECUTOR_TAIL_GRACE_MS);
+        assert!(outer > timeout_ms);
+        assert_eq!(outer, 6_500);
+        // Saturating: a pathological i64::MAX budget never overflows.
+        assert_eq!(
+            i64::MAX.saturating_add(CADENCE_EXECUTOR_TAIL_GRACE_MS),
+            i64::MAX
+        );
+    }
+
+    /// 2026-07-20 (adversarial review): the two ADVISORY divergence flags
+    /// are DECOUPLED from CADENCE-01 — alone they never read as a degrade
+    /// (`any()` false, `stages()` empty), so a routine 0.5% cross-broker
+    /// divergence can never false-fire the High degrade line.
+    #[test]
+    fn divergence_flags_alone_never_degrade() {
+        let flags = DegradeFlags {
+            chain_spot_divergence: true,
+            cross_source_spot_divergence: true,
+            ..DegradeFlags::default()
+        };
+        assert!(!flags.any());
+        assert!(flags.stages().is_empty());
+        // And a clean cycle stays clean.
+        assert!(!DegradeFlags::default().any());
+        assert!(DegradeFlags::default().stages().is_empty());
+    }
+
+    /// 2026-07-20 (adversarial review): a REAL degrade flag still arms
+    /// CADENCE-01, and the advisory divergence flags never leak into the
+    /// coalesced stage string beside it.
+    #[test]
+    fn real_degrade_excludes_divergence_stages() {
+        let flags = DegradeFlags {
+            fetch_failed: true,
+            chain_spot_divergence: true,
+            cross_source_spot_divergence: true,
+            ..DegradeFlags::default()
+        };
+        assert!(flags.any());
+        let s = flags.stages();
+        assert_eq!(s, "fetch_failed");
+        assert!(!s.contains("chain_spot_divergence"));
+        assert!(!s.contains("cross_source_spot_divergence"));
+    }
 }
