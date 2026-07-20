@@ -189,6 +189,35 @@ as its env-missing FALLBACK only — terraform always injects
 `BUDGET_KILL_USD = "25"`, so the runtime kill line is $25; aligning the
 fallback constant is a flagged follow-up (fail direction: a missing env var
 kills later, never earlier).
+
+## 2026-07-20 — capacity-incident emergency upsize + same-day revert (dated record)
+
+On Mon 2026-07-20, 08:30–08:55 IST, the scheduled t4g.medium start of
+`i-0b956d0209231a48b` failed with ap-south-1a `InsufficientInstanceCapacity`
+across **9 attempts** (the 08:30 auto-start cron, the start-watchdog retries,
+and manual starts). Emergency action: `ModifyInstanceAttribute` →
+**t4g.large** at 03:26:43Z (08:56:43 IST) restored the start at
+**08:59:27 IST** — ~15 minutes before market open. The session ran clean on
+t4g.large; the box auto-stopped at 16:30:23 IST per the weekday schedule; the
+instance was then **reverted to t4g.medium while stopped** (this record —
+same evening, per the playbook below). EIP association
+(`eipalloc-01d43d4debab9217b` → `13.234.145.177`) verified intact through
+both type flips.
+
+**Cost impact:** ≈ one session-day of the t4g.large-vs-t4g.medium delta
+(~$0.20 pre-GST). The 2026-07-19 sub-₹1K posture above STANDS — this was a
+bounded one-day emergency, not an instance-lock change; t4g.medium remains
+the locked type (2026-07-15 Quote 8, re-affirmed by the 2026-07-19 ruling).
+
+**Playbook (sanctioned rip-cord):** on an `InsufficientInstanceCapacity`
+start failure of the locked type, a STOP-STATE type-flip to **t4g.large**
+(same Graviton2 family, no AMI/volume/EIP change) is the sanctioned
+emergency path to make the market open — then **revert to t4g.medium the
+same evening** while the box is stopped, and land a dated record here. This
+is a capacity-incident escape hatch only; any PERMANENT type change still
+requires the full §7 dated-quote protocol in
+`daily-universe-scope-expansion-2026-05-27.md`.
+
 > **Authority:** Parthiban (architect). Non-negotiable.
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
