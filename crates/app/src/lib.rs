@@ -239,6 +239,8 @@ pub mod observability;
 /// HTTP client builder) — extracted from `trading_pipeline` 2026-07-14 so
 /// the two OMS construction sites can never drift.
 pub mod oms_wiring;
+/// Order-leg option P&L capture boot (ORDER-PNL-01, default-OFF).
+pub mod order_leg_pnl_boot;
 /// Cluster-C order-side observability (2026-07-14): OmsAlertSink /
 /// RiskAlertSink bridges → Telegram + the rebuilt SEBI order_audit /
 /// pnl_audit tables via one bounded mpsc(1024) consumer task; daily

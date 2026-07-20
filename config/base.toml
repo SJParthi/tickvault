@@ -685,6 +685,10 @@ enabled = false
 [order_update_events]
 enabled = true
 
+[order_leg_pnl]
+# Per-leg option P&L capture (dry-run paper mode; log-sink-only ORDER-PNL-01).
+enabled = true
+
 # ===========================================================================
 # REST-era multi-TF candle derivation (operator directive 2026-07-16:
 # "why the fuck remaining candles 1m till 1day is not yet generated and

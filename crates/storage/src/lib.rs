@@ -213,6 +213,7 @@ pub mod order_audit_persistence;
 // Full-fidelity order/position push-event capture (design 2026-07-18;
 // ORDER-EVT-01): one row per received broker push event, BOTH feeds —
 // the capture companions of the lossy 11-field BrokerOrderEvent seam.
+pub mod order_leg_pnl_persistence;
 pub mod order_update_events_persistence;
 pub mod position_update_events_persistence;
 // Cluster-C order-side observability (2026-07-14): daily P&L snapshot
