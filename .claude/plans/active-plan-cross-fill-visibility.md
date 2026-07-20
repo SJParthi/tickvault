@@ -151,6 +151,13 @@ task and tile degrade to absence; the feeds relabel is a pure string change.
   - Files: docs/runbooks/cross-fill-visibility.md
   - Tests: n/a (docs)
 
+## Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md` — the 15-row 100% Guarantee Matrix and
+the 7-row Resilience Demand Matrix apply to every item of this plan; the
+per-item proofs are the Test Plan + Observability sections above and the
+filled matrices in the PR body (the template carries both matrices).
+
 ## Zero-Loss Guarantee Charter check
 
 - Coverage: unit tests per module above; audit table carries DEDUP keys; no

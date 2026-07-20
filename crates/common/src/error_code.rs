@@ -2787,7 +2787,10 @@ mod tests {
         // #1631; the audit modules were deleted, the tick_conservation_audit
         // TABLE is retained per SEBI 5y) => 164, mechanically recounted
         // against the merged all() vec at this merge of origin/main.
-        assert_eq!(ErrorCode::all().len(), 164);
+        // 2026-07-20 (cross-fill visibility, operator directive): +1
+        // CADENCE-04 (Cadence04AuditWriteFailed — cross_fill_audit
+        // best-effort forensics degrade; Medium, auto-triage-safe) => 165.
+        assert_eq!(ErrorCode::all().len(), 165);
     }
 
     #[test]
