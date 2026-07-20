@@ -1369,7 +1369,7 @@ async fn main() -> Result<()> {
     // Build the PROCESS-shared infra ONCE here: notifier (+ Docker auto-start),
     // health registry, seal-writer (installs the process-wide global_seal_sender),
     // the tick broadcast (the order-update broadcast retired in PR-C3,
-    // 2026-07-14), the obs / tick-storage subscriber tasks (the 21-TF tick
+    // 2026-07-14), the slow-boot observability subscriber task (the 21-TF tick
     // aggregator retired in the stage-3 dead-WS sweep, 2026-07-17), and the
     // axum API server (incl. /api/feeds, so the toggle endpoint exists
     // regardless of feed state). The single `run_process_runloop` below keeps
@@ -2199,8 +2199,8 @@ struct SharedInfraHandles {
     /// Drives `/health` + `/api/feeds/health`. The lane updates it; the API
     /// server reads it.
     health_status: SharedHealthStatus,
-    /// The PROCESS-shared tick broadcast. The 3 subscriber tasks (obs,
-    /// aggregator, tick-storage) are spawned in `build_shared_infra` and have
+    /// The PROCESS-shared tick broadcast. The sole subscriber task
+    /// (slow-boot observability) is spawned in `build_shared_infra` and has
     /// already `.subscribe()`d to this before anything could publish.
     /// PUBLISHER-LESS since PR-C2 (2026-07-14): the lane's
     /// `run_tick_processor` — the only publisher — was deleted with the Dhan
@@ -2225,7 +2225,7 @@ struct SharedInfraHandles {
 /// REST-era candle fold since the stage-3 dead-WS sweep deleted the 21-TF
 /// tick aggregator, 2026-07-17), the tick broadcast channel (the
 /// order-update broadcast retired in PR-C3, 2026-07-14), the
-/// observability + tick-storage subscriber tasks (which `.subscribe()` to the
+/// slow-boot observability subscriber task (which `.subscribe()` to the
 /// tick broadcast BEFORE anything could publish — the
 /// subscribe-before-publish / zero-tick-loss invariant, preserved by
 /// construction), and the axum API server (incl. /api/feeds — so the toggle
@@ -2390,10 +2390,12 @@ async fn build_shared_infra(
     // PR-C3 (2026-07-14): the order-update broadcast channel was removed
     // (publisher + subscriber both retired — see the SharedInfraHandles note).
 
-    // --- Subscriber tasks: obs + tick-storage ---
-    // Both `.subscribe()` to `tick_broadcast_sender` HERE, in the hoisted
+    // --- Subscriber task: slow-boot observability ---
+    // It `.subscribe()`s to `tick_broadcast_sender` HERE, in the hoisted
     // prefix, before anything could publish — subscribe-before-publish is
-    // preserved by construction. Stage-3 dead-WS sweep (2026-07-17): the
+    // preserved by construction. (The tick-storage broadcast consumer was
+    // REMOVED in this PR's PrevDayCache/TickStorage cleanup — see the dated
+    // BATCH-5 note after the block below.) Stage-3 dead-WS sweep (2026-07-17): the
     // 21-TF TICK aggregator driver (`spawn_engine_b_aggregator`) is DELETED —
     // the seal-writer above stays, fed exclusively by the REST-era candle
     // fold (FOLD-01) further below.
@@ -2406,10 +2408,10 @@ async fn build_shared_infra(
         });
         info!("slow-boot observability consumer started");
     }
-    // Dead-code cleanup — BATCH-5 (2026-07-19): the `run_tick_storage_consumer`
-    // broadcast consumer was REMOVED. The tick broadcast has zero producers
-    // in the REST-era runtime (live-WS feeds retired), so the consumer never
-    // received a tick.
+    // Dead-code cleanup — BATCH-5 (2026-07-19): the tick-storage broadcast
+    // consumer was REMOVED (in the PrevDayCache/TickStorage cleanup). The tick
+    // broadcast has zero producers in the REST-era runtime (live-WS feeds
+    // retired), so the consumer never received a tick.
     // (Stage-3 dead-WS sweep 2026-07-17: the 21-TF tick aggregator is
     // DELETED — the seal-writer is fed exclusively by the REST-era candle
     // fold, FOLD-01.)

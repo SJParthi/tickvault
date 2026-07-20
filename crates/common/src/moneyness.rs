@@ -370,80 +370,226 @@ pub fn classify_moneyness_for(
     }
 }
 
-/// Signed moneyness DEPTH in paise — the numeric companion to the
-/// ITM/ATM/OTM label (operator-confirmed gap, 2026-07-17): how far the
-/// strike sits from the spot, LEG-NORMALIZED so the sign reads the same
-/// for both legs:
+/// Outcome of the signed moneyness STEP-INDEX computation
+/// ([`moneyness_step_index`]) — a 3-way verdict so the caller can route
+/// the misaligned case LOUDLY (counter + edge-latched warn) instead of a
+/// silent NULL that would be indistinguishable from ordinary
+/// invalid-input UNKNOWNs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepIndexOutcome {
+    /// The strike sits exactly on the ATM-anchored grid — the signed
+    /// step count (ITM negative / OTM positive / ATM 0; the classic
+    /// chain notation "ITM-1/ITM-2 … OTM+1/OTM+2").
+    Aligned(i64),
+    /// The strike is NOT a whole number of grid steps from the ATM
+    /// anchor — the call site must count + warn (never silent rounding,
+    /// never a fabricated index) and fall back to the bare class label.
+    NotAligned,
+    /// Guard-invalid inputs (unparsable leg / strike or ATM < 1 paise /
+    /// step ≤ 0 / overflow) — the ordinary UNKNOWN-class quiet path.
+    Invalid,
+}
+
+/// Signed moneyness depth as a STRIKE-STEP INDEX — the numeric companion
+/// to the ITM/ATM/OTM class in the classic option-chain notation the
+/// operator specified 2026-07-20 (verbatim: *"it should be ITM -1 or
+/// ITM -2 or something like that"*): **ITM rows step −1, −2, …; OTM rows
+/// step +1, +2, …; the grid-ATM anchor strike steps 0.** The 2026-07-17
+/// SIGN convention (ITM negative / OTM positive) is KEPT — it matches
+/// the "ITM-minus / OTM-plus" notation; what the 2026-07-20 ruling
+/// changed is the UNITS (grid steps, not rupees) and the DELIVERY (the
+/// step is folded into the `moneyness` label itself via
+/// [`moneyness_step_label`]; the `moneyness_depth` column is REMOVED).
 ///
-/// - **negative = ITM-direction**, **positive = OTM-direction**,
-///   **0 = strike paise-exactly at the spot**;
-/// - CE: `depth = strike − spot` (CE is ITM when strike < spot → negative ✓);
-/// - PE: `depth = spot − strike` (PE is ITM when strike > spot → negative ✓).
+/// Leg-normalized, so the sign reads the same for both legs:
+/// - CE: `index = (strike − atm) / step` (CE strikes BELOW the ATM
+///   anchor are ITM → negative ✓);
+/// - PE: `index = (atm − strike) / step` (PE strikes ABOVE the ATM
+///   anchor are ITM → negative ✓).
 ///
-/// This matches [`classify_moneyness_paise`]'s direction convention
-/// (decision-table rows 7–10: CE strike<spot = ITM, PE strike>spot = ITM),
-/// so for any valid inputs `classify == Itm ⇒ depth < 0` and
-/// `classify == Otm ⇒ depth > 0` (consistency-pinned in the tests below).
-/// ATM-labeled rows STILL carry their signed distance — the grid-rounded
-/// ATM strike can sit a nonzero distance from the spot (the label
-/// semantics are untouched; depth is the companion number, never a
-/// re-classification).
+/// The anchor is the SAME grid-rounded ATM the classifier uses
+/// ([`atm_strike_paise`] — round-half-up of the spot to the directive
+/// grid [`strike_step_paise`]), so for every ON-GRID strike the index is
+/// consistent with [`classify_moneyness_paise`]: the grid-ATM strike is
+/// labeled ATM and indexes 0, and any on-grid strike above the anchor
+/// is strictly above the spot (proof: `strike ≥ atm + step` and
+/// `atm ≥ spot − step/2` ⇒ `strike ≥ spot + step/2 > spot`; mirror
+/// below), so `Itm ⇒ index < 0` and `Otm ⇒ index > 0`
+/// (consistency-pinned in the tests below). The ATM±10 chain plan puts
+/// nominal rows in `[−10, +10]`; deeper vendor rows index honestly
+/// beyond ±10 — never clamped, never relabeled.
 ///
 /// ## Decision table
 ///
 /// | # | Guard state | leg | Result |
 /// |---|---|---|---|
-/// | 1 | leg not "CE"/"PE" | — | `None` |
-/// | 2 | `strike_paise < 1` or `spot_paise < 1` | any | `None` |
-/// | 3 | i64 overflow on the subtraction | any | `None` (checked, never a panic — structurally unreachable once row 2 holds: both operands ≥ 1 bound the result by ±(`i64::MAX` − 1)) |
-/// | 4 | ok | CE | `Some(strike_paise − spot_paise)` |
-/// | 5 | ok | PE | `Some(spot_paise − strike_paise)` |
+/// | 1 | leg not "CE"/"PE" | — | `Invalid` |
+/// | 2 | `strike_paise < 1` or `atm_paise < 1` or `step_paise ≤ 0` | any | `Invalid` |
+/// | 3 | i64 overflow on the subtraction | any | `Invalid` (checked, never a panic — structurally unreachable once row 2 holds: both operands ≥ 1 bound the result by ±(`i64::MAX` − 1)) |
+/// | 4 | `(strike − atm)` not a multiple of `step` | any | `NotAligned` (loud at the call site — NEVER silent rounding) |
+/// | 5 | ok | CE | `Aligned((strike_paise − atm_paise) / step_paise)` |
+/// | 6 | ok | PE | `Aligned((atm_paise − strike_paise) / step_paise)` |
 ///
-/// The `< 1` guards mirror [`classify_moneyness_paise`]'s operand guards:
-/// callers feed [`price_to_paise_guarded`] outputs (0 = invalid/missing),
-/// so a moneyness=UNKNOWN row carries `None` depth by construction (the
-/// missing-vendor-spot 0.0 case etc.). Overflow is unreachable via the
-/// guarded conversion (paise ≤ 1e9) but fail-closes for raw i64 callers.
-///
-/// ## Half-paise divergence note (audit-column consistency)
-/// The depth derives from [`price_to_paise_guarded`] (ROUNDED paise)
-/// while the persisted `strike` DOUBLE column is the raw parsed f64 — a
-/// sub-paise strike would make the stored `moneyness_depth` differ from
-/// (stored strike − stored spot) by < 1 paise. Real NSE strikes are
-/// whole-paise, so the divergence is nil in practice.
+/// The `< 1` guards mirror [`classify_moneyness_paise`]'s operand
+/// guards: callers feed [`price_to_paise_guarded`] +
+/// [`atm_strike_paise`] outputs (0 = invalid/missing/unresolvable), so a
+/// moneyness=UNKNOWN row gets `Invalid` by construction (missing vendor
+/// spot, unknown-underlying step, unresolvable ATM). Real NSE strikes
+/// are whole grid multiples — `NotAligned` is a vendor-data-anomaly
+/// signal, the same family as the observed-step drift cross-check.
 ///
 /// # Performance
-/// O(1): one 2-arm label parse + one checked subtraction. Zero allocation.
+/// O(1): one 2-arm label parse + one checked subtraction + one integer
+/// rem/div pair. Zero allocation.
 #[inline]
 #[must_use]
-pub fn moneyness_depth_paise(leg: &str, strike_paise: i64, spot_paise: i64) -> Option<i64> {
-    let leg = OptionLeg::parse(leg)?;
-    if strike_paise < 1 || spot_paise < 1 {
-        return None;
+pub fn moneyness_step_index(
+    leg: &str,
+    strike_paise: i64,
+    atm_paise: i64,
+    step_paise: i64,
+) -> StepIndexOutcome {
+    let Some(leg) = OptionLeg::parse(leg) else {
+        return StepIndexOutcome::Invalid;
+    };
+    if strike_paise < 1 || atm_paise < 1 || step_paise <= 0 {
+        return StepIndexOutcome::Invalid;
     }
-    match leg {
-        OptionLeg::Ce => strike_paise.checked_sub(spot_paise),
-        OptionLeg::Pe => spot_paise.checked_sub(strike_paise),
+    // Leg-normalized signed distance from the grid anchor (checked —
+    // structurally total once the ≥1 guards hold; defense-in-depth for
+    // raw i64 callers, overflow fail-closes to Invalid like every guard).
+    let diff = match leg {
+        OptionLeg::Ce => strike_paise.checked_sub(atm_paise),
+        OptionLeg::Pe => atm_paise.checked_sub(strike_paise),
+    };
+    let Some(diff) = diff else {
+        return StepIndexOutcome::Invalid;
+    };
+    if diff % step_paise != 0 {
+        return StepIndexOutcome::NotAligned;
+    }
+    StepIndexOutcome::Aligned(diff / step_paise)
+}
+
+/// Byte capacity of [`MoneynessStepLabel`] — "OTM+" (4) + the 20 digits
+/// of `u64::MAX` = 24; every producible label fits with zero truncation.
+pub const MONEYNESS_STEP_LABEL_CAP: usize = 24;
+
+/// A stack-allocated combined moneyness label — the `moneyness` SYMBOL
+/// column value in the 2026-07-20 combined-label law: `"ITM-1"`,
+/// `"ITM-2"`, …, `"ATM"`, `"OTM+1"`, `"OTM+2"`, …, with the bare class
+/// (`"ITM"`/`"OTM"`) as the honest fallback when the step is
+/// unresolvable (misaligned strike / invalid grid inputs) and
+/// `"UNKNOWN"` for unclassifiable rows. Zero heap allocation (fixed
+/// 24-byte buffer, `Copy`); build via [`moneyness_step_label`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MoneynessStepLabel {
+    buf: [u8; MONEYNESS_STEP_LABEL_CAP],
+    len: u8,
+}
+
+impl MoneynessStepLabel {
+    /// Internal constructor from a known-short ASCII literal.
+    fn from_ascii(s: &str) -> Self {
+        let mut buf = [0u8; MONEYNESS_STEP_LABEL_CAP];
+        let bytes = s.as_bytes();
+        let n = bytes.len().min(MONEYNESS_STEP_LABEL_CAP);
+        buf[..n].copy_from_slice(&bytes[..n]);
+        // APPROVED: n ≤ 24 by the min() above — the cast is lossless.
+        #[allow(clippy::cast_possible_truncation)]
+        Self { buf, len: n as u8 }
+    }
+
+    /// The label as a `&str` (the ILP SYMBOL write value).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // The buffer is only ever filled from ASCII literals + ASCII
+        // digits, so the slice is always valid UTF-8; the fallback is
+        // pure defense (never reachable).
+        core::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or("UNKNOWN")
     }
 }
 
-/// Paise → rupees conversion for the signed-depth DOUBLE audit column
-/// (`option_chain_1m.moneyness_depth`). The integer-paise core
-/// ([`moneyness_depth_paise`]) stays the testable arithmetic; this is the
-/// display/storage conversion only.
+impl core::fmt::Debug for MoneynessStepLabel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "MoneynessStepLabel({:?})", self.as_str())
+    }
+}
+
+impl core::fmt::Display for MoneynessStepLabel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Build the combined `moneyness` SYMBOL label from the class + the step
+/// verdict (operator ruling 2026-07-20 — the step count lives IN the
+/// label; verbatim: *"under moneyness column itself make it as itm-1 or
+/// otm+1"*, upper-cased to match the table's existing SCREAMING SYMBOL
+/// convention):
+///
+/// | class | step | label |
+/// |---|---|---|
+/// | UNKNOWN | any | `"UNKNOWN"` |
+/// | ATM | any | `"ATM"` (the anchor strike indexes 0; the off-grid strike==spot degenerate stays bare) |
+/// | ITM | `Aligned(n)`, `n ≠ 0` | `"ITM-{|n|}"` |
+/// | OTM | `Aligned(n)`, `n ≠ 0` | `"OTM+{|n|}"` |
+/// | ITM / OTM | `NotAligned` / `Invalid` / `Aligned(0)` | bare `"ITM"` / `"OTM"` (direction known from the spot comparison; step honestly absent — the NotAligned case is made loud by the call site) |
+///
+/// The sign GLYPH comes from the CLASS (ITM always renders `-`, OTM
+/// always `+` — the operator's notation) and the magnitude from the
+/// index; for on-grid strikes the two always agree (the consistency law
+/// pinned in the tests: `Itm ⇒ index < 0`, `Otm ⇒ index > 0`).
+/// `Aligned(0)` under an ITM/OTM class is structurally impossible
+/// (index 0 ⇔ strike == atm ⇔ class ATM by row-5 precedence) — the
+/// defensive arm falls back to the bare class, never a lying "ITM-0".
 ///
 /// # Performance
-/// O(1), zero allocation.
-#[inline]
+/// O(1), zero heap allocation (stack buffer + manual digit write).
 #[must_use]
-pub fn depth_paise_to_rupees(depth_paise: i64) -> f64 {
-    // Guarded-conversion callers are bounded ±1e9 paise, far inside f64's
-    // exact-integer range; a raw extreme i64 loses only sub-paise precision
-    // on a DOUBLE display column — never a panic.
-    // APPROVED: bounded paise→rupees display conversion (see the note above)
-    #[allow(clippy::cast_precision_loss)]
-    {
-        depth_paise as f64 / 100.0
+pub fn moneyness_step_label(class: Moneyness, step: StepIndexOutcome) -> MoneynessStepLabel {
+    match class {
+        Moneyness::Unknown => MoneynessStepLabel::from_ascii("UNKNOWN"),
+        Moneyness::Atm => MoneynessStepLabel::from_ascii("ATM"),
+        Moneyness::Itm | Moneyness::Otm => {
+            let (bare, glyph) = match class {
+                Moneyness::Itm => ("ITM", b'-'),
+                _ => ("OTM", b'+'),
+            };
+            let StepIndexOutcome::Aligned(idx) = step else {
+                return MoneynessStepLabel::from_ascii(bare);
+            };
+            let magnitude = idx.unsigned_abs();
+            if magnitude == 0 {
+                return MoneynessStepLabel::from_ascii(bare);
+            }
+            let mut buf = [0u8; MONEYNESS_STEP_LABEL_CAP];
+            buf[..3].copy_from_slice(bare.as_bytes());
+            buf[3] = glyph;
+            // Manual base-10 digit write (backwards into a scratch, then
+            // copied) — u64::MAX is 20 digits, 4 + 20 = 24 = CAP.
+            let mut scratch = [0u8; 20];
+            let mut m = magnitude;
+            let mut digits = 0usize;
+            while m > 0 {
+                // APPROVED: m % 10 < 10 — the cast is lossless.
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    scratch[digits] = b'0' + (m % 10) as u8;
+                }
+                m /= 10;
+                digits += 1;
+            }
+            for (i, d) in (0..digits).rev().enumerate() {
+                buf[4 + i] = scratch[d];
+            }
+            // APPROVED: 4 + digits ≤ 24 — the cast is lossless.
+            #[allow(clippy::cast_possible_truncation)]
+            MoneynessStepLabel {
+                buf,
+                len: (4 + digits) as u8,
+            }
+        }
     }
 }
 
@@ -889,81 +1035,233 @@ mod tests {
         );
     }
 
-    // -- Signed moneyness depth (2026-07-17) ---------------------------------
+    // -- Step-index + combined label (operator ruling 2026-07-20) ------------
 
     #[test]
-    fn test_moneyness_depth_paise_ce_pe_sign_convention() {
-        // CE ITM (strike < spot) → negative.
+    fn test_moneyness_step_index_ce_pe_sign_convention() {
+        // NIFTY Rs.50 grid (5_000 paise), ATM anchor 25_000.00.
+        let atm = 2_500_000_i64;
+        let step = 5_000_i64;
+        // 4-quadrant pin (the coordinator-relayed law examples):
+        // CE 24,950 = one step BELOW the anchor → ITM-1 territory → −1.
         assert_eq!(
-            moneyness_depth_paise("CE", 2_450_000, 2_453_640),
-            Some(-3_640)
+            moneyness_step_index("CE", 2_495_000, atm, step),
+            StepIndexOutcome::Aligned(-1)
         );
-        // CE OTM (strike > spot) → positive.
+        // CE 25,050 → OTM+1 → +1.
         assert_eq!(
-            moneyness_depth_paise("CE", 2_460_000, 2_453_640),
-            Some(6_360)
+            moneyness_step_index("CE", 2_505_000, atm, step),
+            StepIndexOutcome::Aligned(1)
         );
-        // PE ITM (strike > spot) → negative.
+        // PE 25,050 → ITM-1 → −1.
         assert_eq!(
-            moneyness_depth_paise("PE", 2_460_000, 2_453_640),
-            Some(-6_360)
+            moneyness_step_index("PE", 2_505_000, atm, step),
+            StepIndexOutcome::Aligned(-1)
         );
-        // PE OTM (strike < spot) → positive.
+        // PE 24,950 → OTM+1 → +1.
         assert_eq!(
-            moneyness_depth_paise("PE", 2_450_000, 2_453_640),
-            Some(3_640)
+            moneyness_step_index("PE", 2_495_000, atm, step),
+            StepIndexOutcome::Aligned(1)
         );
-        // Strike paise-exactly at the spot → Some(0), both legs.
-        assert_eq!(moneyness_depth_paise("CE", 2_453_640, 2_453_640), Some(0));
-        assert_eq!(moneyness_depth_paise("PE", 2_453_640, 2_453_640), Some(0));
-        // The ATM-labeled grid strike still carries its signed distance:
-        // the 2026-04-21 capture (spot 24536.40, grid ATM 24550.00) → CE
-        // depth +13.60 rupees = +1360 paise (label ATM, depth nonzero).
+        // The anchor strike itself → 0, both legs.
         assert_eq!(
-            moneyness_depth_paise("CE", 2_455_000, 2_453_640),
-            Some(1_360)
+            moneyness_step_index("CE", atm, atm, step),
+            StepIndexOutcome::Aligned(0)
+        );
+        assert_eq!(
+            moneyness_step_index("PE", atm, atm, step),
+            StepIndexOutcome::Aligned(0)
+        );
+        // Two steps out, both directions.
+        assert_eq!(
+            moneyness_step_index("CE", 2_490_000, atm, step),
+            StepIndexOutcome::Aligned(-2)
+        );
+        assert_eq!(
+            moneyness_step_index("PE", 2_510_000, atm, step),
+            StepIndexOutcome::Aligned(-2)
+        );
+        // The ATM±10 plan edges index exactly ±10.
+        assert_eq!(
+            moneyness_step_index("CE", atm - 10 * step, atm, step),
+            StepIndexOutcome::Aligned(-10)
+        );
+        assert_eq!(
+            moneyness_step_index("CE", atm + 10 * step, atm, step),
+            StepIndexOutcome::Aligned(10)
+        );
+        // The 2026-07-20 operator screenshot re-derived on its real grid:
+        // BANKNIFTY spot 57,800.90, Rs.100 step (10_000 paise) → grid ATM
+        // 57,800.00; strike 81,000.00 sits 232 steps above — PE = ITM-232,
+        // CE = OTM+232 (honestly OUTSIDE the ATM±10 plan window, never
+        // clamped).
+        let bn_atm = atm_strike_paise(5_780_090, 10_000).expect("grid ATM");
+        assert_eq!(bn_atm, 5_780_000);
+        assert_eq!(
+            moneyness_step_index("PE", 8_100_000, bn_atm, 10_000),
+            StepIndexOutcome::Aligned(-232)
+        );
+        assert_eq!(
+            moneyness_step_index("CE", 8_100_000, bn_atm, 10_000),
+            StepIndexOutcome::Aligned(232)
         );
     }
 
     #[test]
-    fn test_moneyness_depth_paise_guards_and_overflow_boundary() {
-        // Unknown / miscased legs → None (mirrors the classifier).
+    fn test_moneyness_step_index_guards_misalignment_and_extremes() {
+        let atm = 2_500_000_i64;
+        let step = 5_000_i64;
+        // Unknown / miscased legs → Invalid (mirrors the classifier).
         for bad_leg in ["", "XX", "ce", "Ce", "CALL", "PUT"] {
             assert_eq!(
-                moneyness_depth_paise(bad_leg, 2_455_000, 2_453_640),
-                None,
-                "leg {bad_leg:?} must yield None"
+                moneyness_step_index(bad_leg, 2_495_000, atm, step),
+                StepIndexOutcome::Invalid,
+                "leg {bad_leg:?} must be Invalid"
             );
         }
-        // Zero / negative operands → None (the price_to_paise_guarded
-        // invalid sentinel — a moneyness=UNKNOWN row carries NULL depth).
-        assert_eq!(moneyness_depth_paise("CE", 0, 2_453_640), None);
-        assert_eq!(moneyness_depth_paise("CE", 2_455_000, 0), None);
-        assert_eq!(moneyness_depth_paise("PE", -1, 2_453_640), None);
-        assert_eq!(moneyness_depth_paise("PE", 2_455_000, -1), None);
-        // Structural totality at the i64 extremes: with BOTH operands ≥ 1
-        // the subtraction result is bounded by ±(i64::MAX − 1), so
-        // checked_sub can never overflow — the widest possible legal pairs
-        // still compute Some (the checked form is pure defense-in-depth,
-        // never a panic path).
-        assert_eq!(moneyness_depth_paise("PE", i64::MAX, 1), Some(1 - i64::MAX));
-        assert_eq!(moneyness_depth_paise("CE", 1, i64::MAX), Some(1 - i64::MAX));
-        assert_eq!(moneyness_depth_paise("CE", i64::MAX, 1), Some(i64::MAX - 1));
-        assert_eq!(moneyness_depth_paise("PE", 1, i64::MAX), Some(i64::MAX - 1));
+        // Zero/negative operands + step → Invalid (the guarded-conversion
+        // sentinel — a moneyness=UNKNOWN row carries the quiet path).
+        assert_eq!(
+            moneyness_step_index("CE", 0, atm, step),
+            StepIndexOutcome::Invalid
+        );
+        assert_eq!(
+            moneyness_step_index("CE", 2_495_000, 0, step),
+            StepIndexOutcome::Invalid
+        );
+        assert_eq!(
+            moneyness_step_index("CE", 2_495_000, atm, 0),
+            StepIndexOutcome::Invalid
+        );
+        assert_eq!(
+            moneyness_step_index("PE", -1, atm, step),
+            StepIndexOutcome::Invalid
+        );
+        assert_eq!(
+            moneyness_step_index("PE", 2_495_000, atm, -5_000),
+            StepIndexOutcome::Invalid
+        );
+        // An off-grid strike is NotAligned — NEVER silently rounded (the
+        // loud error path at the call sites): half a step off…
+        assert_eq!(
+            moneyness_step_index("CE", 2_502_500, atm, step),
+            StepIndexOutcome::NotAligned
+        );
+        // …and one paise off.
+        assert_eq!(
+            moneyness_step_index("PE", 2_495_001, atm, step),
+            StepIndexOutcome::NotAligned
+        );
+        // Structural totality at the i64 extremes: with both operands ≥ 1
+        // the subtraction is bounded by ±(i64::MAX − 1); step 1 keeps the
+        // extremes grid-aligned, so the widest legal pairs still compute.
+        assert_eq!(
+            moneyness_step_index("CE", i64::MAX, 1, 1),
+            StepIndexOutcome::Aligned(i64::MAX - 1)
+        );
+        assert_eq!(
+            moneyness_step_index("PE", i64::MAX, 1, 1),
+            StepIndexOutcome::Aligned(1 - i64::MAX)
+        );
+        assert_eq!(
+            moneyness_step_index("CE", 1, i64::MAX, 1),
+            StepIndexOutcome::Aligned(1 - i64::MAX)
+        );
+        assert_eq!(
+            moneyness_step_index("PE", 1, i64::MAX, 1),
+            StepIndexOutcome::Aligned(i64::MAX - 1)
+        );
     }
 
     #[test]
-    fn test_depth_paise_to_rupees_conversion() {
-        assert!((depth_paise_to_rupees(1_360) - 13.60).abs() < 1e-9);
-        assert!((depth_paise_to_rupees(-3_640) - (-36.40)).abs() < 1e-9);
-        assert!((depth_paise_to_rupees(0) - 0.0).abs() < f64::EPSILON);
+    fn test_moneyness_step_label_law() {
+        // The operator's literal notation: ITM-1 / ITM-2 / OTM+1 / OTM+2,
+        // ATM, UNKNOWN — upper-case, glyph from the class.
+        assert_eq!(
+            moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(-1)).as_str(),
+            "ITM-1"
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(-2)).as_str(),
+            "ITM-2"
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Otm, StepIndexOutcome::Aligned(1)).as_str(),
+            "OTM+1"
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Otm, StepIndexOutcome::Aligned(2)).as_str(),
+            "OTM+2"
+        );
+        // Plan edges.
+        assert_eq!(
+            moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(-10)).as_str(),
+            "ITM-10"
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Otm, StepIndexOutcome::Aligned(10)).as_str(),
+            "OTM+10"
+        );
+        // Beyond the plan (the screenshot's 232-step strike) — honest,
+        // never clamped.
+        assert_eq!(
+            moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(-232)).as_str(),
+            "ITM-232"
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Otm, StepIndexOutcome::Aligned(232)).as_str(),
+            "OTM+232"
+        );
+        // ATM + UNKNOWN stay bare regardless of the step verdict.
+        assert_eq!(
+            moneyness_step_label(Moneyness::Atm, StepIndexOutcome::Aligned(0)).as_str(),
+            "ATM"
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Atm, StepIndexOutcome::NotAligned).as_str(),
+            "ATM"
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Unknown, StepIndexOutcome::Invalid).as_str(),
+            "UNKNOWN"
+        );
+        // Misaligned / invalid ITM/OTM fall back to the bare class —
+        // direction honest, step honestly absent, never "ITM-0".
+        assert_eq!(
+            moneyness_step_label(Moneyness::Itm, StepIndexOutcome::NotAligned).as_str(),
+            "ITM"
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Otm, StepIndexOutcome::Invalid).as_str(),
+            "OTM"
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(0)).as_str(),
+            "ITM"
+        );
+        // The glyph comes from the CLASS (defensive — magnitude only from
+        // the index).
+        assert_eq!(
+            moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(3)).as_str(),
+            "ITM-3"
+        );
+        // Extreme magnitude fits the 24-byte buffer (20 digits + "OTM+").
+        assert_eq!(
+            moneyness_step_label(Moneyness::Otm, StepIndexOutcome::Aligned(i64::MAX)).as_str(),
+            format!("OTM+{}", i64::MAX).as_str()
+        );
+        assert_eq!(
+            moneyness_step_label(Moneyness::Itm, StepIndexOutcome::Aligned(i64::MIN)).as_str(),
+            format!("ITM-{}", i64::MIN.unsigned_abs()).as_str()
+        );
     }
 
     #[test]
-    fn test_moneyness_depth_sign_is_consistent_with_classification() {
-        // For a spread of valid (leg, strike, spot, atm) inputs:
-        // classify==Itm ⇒ depth<0 and classify==Otm ⇒ depth>0; ATM rows
-        // are excluded from the sign assertion but MUST still be Some.
+    fn test_moneyness_step_sign_is_consistent_with_classification() {
+        // For a spread of valid on-grid (leg, strike, spot, atm) inputs:
+        // classify==Itm ⇒ step index < 0, classify==Otm ⇒ index > 0, and
+        // the grid-ATM strike (class Atm) ⇒ index 0 — the label glyphs
+        // (ITM-, OTM+) can therefore never lie for aligned strikes.
         let spots = [2_453_640_i64, 4_814_325, 8_105_000, 5_000, 2_455_000];
         let step = 5_000_i64;
         for &spot_paise in &spots {
@@ -977,23 +1275,40 @@ mod tests {
                 }
                 for leg in ["CE", "PE"] {
                     let class = classify_moneyness_paise(leg, strike_paise, spot_paise, atm_paise);
-                    let depth = moneyness_depth_paise(leg, strike_paise, spot_paise);
+                    let index = moneyness_step_index(leg, strike_paise, atm_paise, step);
+                    let StepIndexOutcome::Aligned(idx) = index else {
+                        panic!("on-grid strike must align: {leg} {strike_paise} vs {atm_paise}");
+                    };
                     match class {
                         Moneyness::Itm => assert!(
-                            depth.is_some_and(|d| d < 0),
-                            "{leg} ITM strike={strike_paise} spot={spot_paise} must have depth<0, got {depth:?}"
+                            idx < 0,
+                            "{leg} ITM strike={strike_paise} atm={atm_paise} must index<0, got {idx}"
                         ),
                         Moneyness::Otm => assert!(
-                            depth.is_some_and(|d| d > 0),
-                            "{leg} OTM strike={strike_paise} spot={spot_paise} must have depth>0, got {depth:?}"
+                            idx > 0,
+                            "{leg} OTM strike={strike_paise} atm={atm_paise} must index>0, got {idx}"
                         ),
-                        Moneyness::Atm => assert!(
-                            depth.is_some(),
-                            "{leg} ATM strike={strike_paise} spot={spot_paise} must still carry Some depth"
+                        Moneyness::Atm => assert_eq!(
+                            idx, 0,
+                            "the grid-ATM strike must index 0 ({leg} {strike_paise})"
                         ),
                         Moneyness::Unknown => {
                             unreachable!("valid guarded inputs can never classify UNKNOWN")
                         }
+                    }
+                    // The combined label round-trips the law.
+                    let label = moneyness_step_label(class, index);
+                    match class {
+                        Moneyness::Itm => assert!(
+                            label.as_str().starts_with("ITM-"),
+                            "ITM label must carry the minus glyph: {label}"
+                        ),
+                        Moneyness::Otm => assert!(
+                            label.as_str().starts_with("OTM+"),
+                            "OTM label must carry the plus glyph: {label}"
+                        ),
+                        Moneyness::Atm => assert_eq!(label.as_str(), "ATM"),
+                        Moneyness::Unknown => unreachable!(),
                     }
                 }
             }
