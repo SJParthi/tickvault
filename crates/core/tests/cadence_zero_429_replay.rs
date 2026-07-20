@@ -534,7 +534,7 @@ fn sim_dhan_cycle(
     let mut next_spot_retry_target = slots.dhan_spot_slots_ms[3] + CADENCE_SPOT_WINDOW_MS;
     for (k, err) in spot_failures {
         let retry_target = next_spot_retry_target.max(clock.wall_ms);
-        // PHASE-B(native-retry): flips with the runner spot call site when the native ladder lands.
+        // Runner spot site is cfg-gated (!native_retry_enabled); this call pins the kill-switch-OFF (legacy class-blind) budget.
         if may_retry_in_cycle(
             &err,
             true,
