@@ -2845,6 +2845,29 @@ rules:
       Nothing on the fetch/decision path needs repair; rows re-append
       DEDUP-idempotently once QuestDB recovers.
 
+  # CADENCE-05 = the cadence native-retry/cross-fill recovery machinery
+  # degraded (the T+4s native-retry hedge arbitrated with the native leg
+  # still empty => cross_fill resolution, or the bounded T+30s/T+50s
+  # background history re-pull exhausted both attempts without repairing
+  # the minute). Escalate (not auto_fix): the decision minute is carried
+  # by the cross-fill leg or honestly gapped — nothing fabricated; the
+  # operator inspects the cross_fill_audit rows (vendor-side serving
+  # delay) and lets the next cycle re-attempt.
+  - name: cadence-05-recovery-degraded-escalate
+    match:
+      code: CADENCE-05
+    action: escalate
+    runbook_path: .claude/rules/project/cadence-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CADENCE-05 = cadence native-retry/cross-fill recovery degraded
+      (mirrors CADENCE-04's grouping; Medium). The T+4s hedge arbitrated
+      to cross_fill or the bounded re-pull exhausted — the minute is
+      carried by the cross-fill leg / honestly gapped, never fabricated;
+      inspect cross_fill_audit resolved_at_ms_after_close for the
+      vendor-side delay and let the next cycle re-attempt.
+
   # FOLD-01 = the REST-era bar-fold candle derivation degraded (catch-up
   # query/parse, seal/bar handoff drop, or a supervised-task respawn).
   # Escalate (not auto_restart): every degrade is RE-DERIVABLE — the

@@ -917,3 +917,32 @@ This rule activates when editing:
   `CadenceExecutor`, `spawn_supervised_cadence_runner`, `tv_cadence_`,
   `DayLockedExpiryStore`, `global_dhan_gates`, `global_expiry_store`,
   `resolve_policy_expiry`, or `QueueDelay`
+
+---
+
+### CADENCE-05 — native-retry / cross-fill recovery degraded (2026-07-20)
+
+`ErrorCode::Cadence05RecoveryDegraded` (`code_str() == "CADENCE-05"`).
+**Severity + auto-triage:** mirrors CADENCE-04's grouping exactly.
+**Delivery:** log-sink-only — the Dhan noise-lock 4-item Telegram family is
+UNCHANGED (`dhan-rest-only-noise-lock-2026-07-14.md` §2); no new page.
+
+**Trigger:** the T+4s native-retry hedge (plan
+`active-plan-cadence-native-retry-hedge.md`) reached arbitration with the
+native leg still EMPTY (resolution token `cross_fill`), or the bounded
+T+30s/T+50s background history re-pull exhausted both attempts without
+repairing the minute — i.e. the recovery machinery itself degraded. Design
+contract: at most one emit per (lane, leg, cycle minute).
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `CADENCE-05`; the payload names
+   lane, leg, cycle minute, retry attempts and the resolution token
+   (`native_first_try` / `native_late_retry` / `cross_fill`).
+2. Check the `cross_fill_audit` rows for that minute —
+   `resolved_at_ms_after_close` quantifies the vendor-side serving delay
+   (the 2026-07-20 open-minute class resolved ~+19.4s; sub-4s retries cannot
+   save that class — cross-fill is the floor, by design).
+3. A 429 on any retry rung aborts the ladder by design (gate law H4) — check
+   the `gate_skipped` counter before suspecting the ladder itself.
+4. Both-brokers-empty degrades loudly and fabricates nothing — verify the
+   other broker's leg health before suspecting the hedge.

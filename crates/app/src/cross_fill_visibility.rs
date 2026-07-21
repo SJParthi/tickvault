@@ -505,6 +505,8 @@ mod tests {
             cycle_latency_ms: 9_000,
             ladder_rung: 1,
             resolved_at_ms_after_close: 9_000,
+            resolution: "cross_fill",
+            retry_attempts: 0,
         };
         let row = row_from_event(&base);
         assert_eq!(row.resolution, "cross_fill");
@@ -519,6 +521,8 @@ mod tests {
             spots: 0,
             chains: 2,
             resolved_at_ms_after_close: -1,
+            resolution: "cross_fill",
+            retry_attempts: 0,
             ..base
         };
         let row = row_from_event(&fb);

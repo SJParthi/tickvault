@@ -213,7 +213,7 @@ Honest implementation (mechanical, not aspirational):
 
 | 100% claim | Mechanical proof |
 |---|---|
-| Code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (63.3–99.5, target 100%), floors only move up; enforced post-merge by `scripts/coverage-gate.sh` |
+| Code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (68.3–99.5, target 100%), floors only move up; enforced post-merge by `scripts/coverage-gate.sh` |
 | Audit coverage | Every typed event writes to a `<event>_audit` table (Wave-2-D + Wave-4-E) |
 | Testing coverage | 22 test categories per `testing.md`; scoped per changed crate |
 | Code checks | banned-pattern-scanner + pub-fn-test-guard + pub-fn-wiring-guard + plan-verify + secret-scan + 8 pre-commit gates |

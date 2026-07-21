@@ -1261,6 +1261,15 @@ pub enum ErrorCode {
     /// lost until QuestDB recovers. Severity::Medium, auto-triage-safe
     /// (operator directive 2026-07-20 — cross-fill visibility).
     Cadence04AuditWriteFailed,
+    /// CADENCE-05: the cadence native-retry / cross-fill RECOVERY
+    /// machinery degraded — the T+4s native-retry hedge reached
+    /// arbitration with the native leg still EMPTY (resolution token
+    /// `cross_fill`), or the bounded T+30s/T+50s background history
+    /// re-pull exhausted both attempts without repairing the minute.
+    /// At most one emit per (lane, leg, cycle minute).
+    /// Severity::Medium, auto-triage-safe (operator directive
+    /// 2026-07-20 — native-retry / cross-fill hedge).
+    Cadence05RecoveryDegraded,
 }
 
 impl ErrorCode {
@@ -1488,6 +1497,7 @@ impl ErrorCode {
             Self::Cadence02DecisionSkipped => "CADENCE-02",
             Self::Cadence03SchedulerDegraded => "CADENCE-03",
             Self::Cadence04AuditWriteFailed => "CADENCE-04",
+            Self::Cadence05RecoveryDegraded => "CADENCE-05",
         }
     }
 
@@ -1810,6 +1820,10 @@ impl ErrorCode {
             // forensics write/read failure — best-effort record only; the
             // CADENCE-01 signal + counters still carry the event. Medium.
             Self::Cadence04AuditWriteFailed => Severity::Medium,
+            // CADENCE-05 (operator 2026-07-20): the native-retry /
+            // cross-fill recovery machinery degraded — cross-fill / the
+            // honest gap is the floor; nothing fabricated. Medium.
+            Self::Cadence05RecoveryDegraded => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -2091,7 +2105,8 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded
             | Self::Cadence02DecisionSkipped
             | Self::Cadence03SchedulerDegraded
-            | Self::Cadence04AuditWriteFailed => {
+            | Self::Cadence04AuditWriteFailed
+            | Self::Cadence05RecoveryDegraded => {
                 ".claude/rules/project/cadence-error-codes.md"
             }
         }
@@ -2392,6 +2407,7 @@ impl ErrorCode {
             Self::Cadence02DecisionSkipped,
             Self::Cadence03SchedulerDegraded,
             Self::Cadence04AuditWriteFailed,
+            Self::Cadence05RecoveryDegraded,
         ]
     }
 }
@@ -2800,7 +2816,8 @@ mod tests {
         // CADENCE-04 (Cadence04AuditWriteFailed — cross_fill_audit
         // best-effort forensics degrade; Medium, auto-triage-safe) => 165.
         // +1 ORDER-PNL-01 (2026-07-19) => 166
-        assert_eq!(ErrorCode::all().len(), 166);
+        // +1 CADENCE-05 (2026-07-20, native-retry/cross-fill hedge) => 167
+        assert_eq!(ErrorCode::all().len(), 167);
     }
 
     #[test]
@@ -2879,7 +2896,15 @@ mod tests {
         assert_eq!("CADENCE-04".parse::<ErrorCode>(), Ok(c4));
         assert_eq!(c4.severity(), Severity::Medium);
         assert!(c4.is_auto_triage_safe());
-        for code in [c1, c2, c3, c4] {
+
+        // CADENCE-05 (operator 2026-07-20): native-retry / cross-fill
+        // recovery degraded — Medium, auto-triage-safe.
+        let c5 = ErrorCode::Cadence05RecoveryDegraded;
+        assert_eq!(c5.code_str(), "CADENCE-05");
+        assert_eq!("CADENCE-05".parse::<ErrorCode>(), Ok(c5));
+        assert_eq!(c5.severity(), Severity::Medium);
+        assert!(c5.is_auto_triage_safe());
+        for code in [c1, c2, c3, c4, c5] {
             assert_eq!(
                 code.runbook_path(),
                 ".claude/rules/project/cadence-error-codes.md"
