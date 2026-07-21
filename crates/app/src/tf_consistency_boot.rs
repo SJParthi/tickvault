@@ -6,7 +6,7 @@
 //! At **15:40 IST** every trading day (after the Dhan 15:30:05 close-time
 //! force-seal + writer drain and the 15:31 cross-verify burst, before the
 //! 15:45 scoreboard), recompute every stored higher-timeframe candle — the
-//! 19 TFs `2m..4h` (`TfIndex::ALL` minus `M1` the baseline minus `D1`,
+//! 10 TFs `2m..4h` (`TfIndex::ALL` minus `M1` the baseline minus `D1`,
 //! which is excluded by design: Dhan drops D1 at the write boundary per
 //! `live-feed-purity.md` rule 10, and Groww D1 is a partial-day
 //! midnight-sealed bucket) — from its constituent `candles_1m` rows and
@@ -94,7 +94,7 @@ pub const TF_VERIFY_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// legitimately complete.
 pub const TF_VERIFY_1M_ROW_LIMIT: usize = 500;
 
-/// Row CAP on the per-SID 19-way higher-TF UNION query. Sized above the
+/// Row CAP on the per-SID 10-way higher-TF UNION query. Sized above the
 /// arithmetic worst case (Σ per-TF daily bucket counts = 903); fetched as
 /// `cap + 1` (LIMIT+1 probe), truncation = `> cap`.
 pub const TF_VERIFY_TF_UNION_ROW_LIMIT: usize = 2_000;
@@ -770,7 +770,7 @@ pub fn select_1m_sql(
     )
 }
 
-/// Per-SID 19-way UNION ALL across `candles_2m..candles_4h`, each arm
+/// Per-SID 10-way UNION ALL across `candles_2m..candles_4h`, each arm
 /// tagged with its display label. Pure; excludes `candles_1m` (the
 /// baseline) and `candles_1d` (excluded by design).
 #[must_use]
@@ -807,7 +807,7 @@ pub fn select_tf_union_sql(
 }
 
 /// Per-feed instrument discovery: DISTINCT (security_id, segment) over a
-/// UNION of `candles_1m` + the 19 higher-TF tables for the day window —
+/// UNION of `candles_1m` + the 10 higher-TF tables for the day window —
 /// higher-TF tables INCLUDED so a phantom TF row with no 1m data is still
 /// discovered. Pure.
 #[must_use]
@@ -1586,7 +1586,7 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
             continue;
         }
 
-        // Query B — the 19-way higher-TF union.
+        // Query B — the 10-way higher-TF union.
         let sql_tf = select_tf_union_sql(p.feed, *sid, segment, day_start_nanos);
         let tf_rows = match http_get_text(p.client, p.exec_url, &sql_tf).await {
             Ok(body) => match parse_tf_union_dataset(&body, TF_VERIFY_TF_UNION_ROW_LIMIT) {
@@ -2507,7 +2507,7 @@ mod tests {
     #[test]
     fn test_tf_verify_targets_exclude_m1_and_d1() {
         let targets = tf_verify_targets();
-        assert_eq!(targets.len(), 19, "21 TFs minus M1 minus D1");
+        assert_eq!(targets.len(), 10, "12 TFs minus M1 minus D1");
         assert!(!targets.contains(&TfIndex::M1));
         assert!(!targets.contains(&TfIndex::D1));
         assert_eq!(targets.first(), Some(&TfIndex::M2));
@@ -2517,21 +2517,12 @@ mod tests {
     /// Per-TF daily bucket counts pinned as literals — each equals
     /// ceil(375 / minutes-per-bucket) for the 375-minute session.
     #[test]
-    fn test_bucket_grid_daily_counts_all_19_tfs() {
-        let expected: [(TfIndex, usize); 19] = [
+    fn test_bucket_grid_daily_counts_all_10_tfs() {
+        let expected: [(TfIndex, usize); 10] = [
             (TfIndex::M2, 188),
             (TfIndex::M3, 125),
             (TfIndex::M4, 94),
             (TfIndex::M5, 75),
-            (TfIndex::M6, 63),
-            (TfIndex::M7, 54),
-            (TfIndex::M8, 47),
-            (TfIndex::M9, 42),
-            (TfIndex::M10, 38),
-            (TfIndex::M11, 35),
-            (TfIndex::M12, 32),
-            (TfIndex::M13, 29),
-            (TfIndex::M14, 27),
             (TfIndex::M15, 25),
             (TfIndex::M30, 13),
             (TfIndex::H1, 7),
@@ -2971,9 +2962,9 @@ mod tests {
     }
 
     #[test]
-    fn test_select_tf_union_sql_has_19_arms_excludes_1m_and_1d() {
+    fn test_select_tf_union_sql_has_10_arms_excludes_1m_and_1d() {
         let sql = select_tf_union_sql("groww", 1333, "NSE_EQ", 1_784_005_200_000_000_000);
-        assert_eq!(sql.matches(" UNION ALL ").count(), 18, "19 arms");
+        assert_eq!(sql.matches(" UNION ALL ").count(), 9, "10 arms");
         for tf in tf_verify_targets() {
             assert!(
                 sql.contains(&format!("FROM {}", tf.table_name())),
@@ -3006,10 +2997,10 @@ mod tests {
     }
 
     #[test]
-    fn test_select_instruments_sql_unions_all_20_tables_with_limit() {
+    fn test_select_instruments_sql_unions_all_11_tables_with_limit() {
         let sql = select_instruments_sql("dhan", 1_784_005_200_000_000_000);
         assert!(sql.starts_with("SELECT DISTINCT security_id, segment FROM ("));
-        assert_eq!(sql.matches(" UNION ALL ").count(), 19, "1m + 19 targets");
+        assert_eq!(sql.matches(" UNION ALL ").count(), 10, "1m + 10 targets");
         assert!(sql.contains("FROM candles_1m"), "{sql}");
         assert!(sql.contains("FROM candles_4h"), "{sql}");
         assert!(!sql.contains("candles_1d"), "{sql}");

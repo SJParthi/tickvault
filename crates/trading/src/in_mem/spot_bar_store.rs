@@ -12,7 +12,7 @@
 //! Per `(feed, security_id, exchange_segment)` slot (I-P1-11 composite —
 //! `security_id` alone is never a key) × per [`TfIndex`] ring of SEALED
 //! bars. Ring capacity = `spot_days` (config, default 35) ×
-//! [`bars_per_day`] for that TF (Σ over the 21 TFs = 1,279 bars/day/slot;
+//! [`bars_per_day`] for that TF (Σ over the 12 TFs = 912 bars/day/slot;
 //! ~17 MB at 8 slots × 35 days — test-asserted under a 40 MB ceiling).
 //! [`RamBar`] is a 48-byte `Copy` struct; rings are `VecDeque<RamBar>`
 //! pre-allocated at slot creation — the steady-state live write is an O(1)
@@ -86,8 +86,8 @@ pub const fn bars_per_day(tf: TfIndex) -> u32 {
     if bars == 0 { 1 } else { bars }
 }
 
-/// Σ [`bars_per_day`] over all 21 TFs — the per-slot per-day bar count
-/// (1,279; pinned by `test_bars_per_day_session_math`).
+/// Σ [`bars_per_day`] over all 12 TFs — the per-slot per-day bar count
+/// (912; pinned by `test_bars_per_day_session_math`).
 #[must_use]
 // TEST-EXEMPT: pure Σ over bars_per_day — pinned by test_bars_per_day_session_math + the capacity-envelope tests.
 pub fn total_bars_per_day_all_tfs() -> u32 {
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(bars_per_day(TfIndex::H1), 7);
         assert_eq!(bars_per_day(TfIndex::H4), 2);
         assert_eq!(bars_per_day(TfIndex::D1), 1);
-        assert_eq!(total_bars_per_day_all_tfs(), 1_279);
+        assert_eq!(total_bars_per_day_all_tfs(), 912);
         assert_eq!(SESSION_SECS, 22_500);
     }
 
@@ -544,8 +544,8 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 1_279 × 35 × 8 × 48 = 17_189_760 B ≈ 16.4 MiB.
-        assert_eq!(bytes, 17_189_760);
+        // 912 × 35 × 8 × 48 = 12_257_280 B ≈ 11.7 MiB.
+        assert_eq!(bytes, 12_257_280);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -728,8 +728,8 @@ mod tests {
         assert_eq!(stats.bars_resident_per_feed[Feed::Groww.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Groww.index()], 1);
-        // Two slots × 1 day × 1,279 bars × 48 B of pre-allocated capacity.
-        assert_eq!(stats.estimated_bytes, 2 * 1_279 * 48);
+        // Two slots × 1 day × 912 bars × 48 B of pre-allocated capacity.
+        assert_eq!(stats.estimated_bytes, 2 * 912 * 48);
     }
 
     #[test]

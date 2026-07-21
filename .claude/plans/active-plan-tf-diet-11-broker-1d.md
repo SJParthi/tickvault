@@ -1,6 +1,6 @@
 # Implementation Plan: Timeframe Diet — 11 Frames + Broker-Pulled 1d
 
-**Status:** APPROVED
+**Status:** IN_PROGRESS
 **Date:** 2026-07-20
 **Approved by:** Parthiban (operator) — two dated verbatim quotes below, recorded under the operator's standing pre-authorization ("every plan file any session writes for work I have ordered — treat its Status as APPROVED by me the moment it exists").
 
@@ -26,6 +26,7 @@
 - [ ] Item 1 — Canonical enum shrink: TfIndex 21 → 11 + INTRADAY_TFS + seal-spill format-version bump
   - Files: crates/trading/src/candles/tf_index.rs, crates/trading/src/candles/seal_ring.rs, crates/storage/src/seal_spill.rs
   - Tests: test_tf_count_is_eleven, test_tf_ordinal_table_pins_the_eleven, test_intraday_tfs_is_all_minus_d1, test_seal_spill_format_bump_refuses_old_version_records
+  - Progress 2026-07-21 (M2-alpha, commit A): the 6m-14m band is retired — TF_COUNT 21 → 12, ordinals repacked, all pins/tests updated (tf_index.rs, shadow_persistence.rs, spot_bar_store.rs, shadow_seal_columns.rs, partition_manager.rs, tf_consistency_boot.rs). 30m retirement (commit B) next; INTRADAY_TFS + the seal-spill format-version bump remain open (second worker).
 - [ ] Item 2 — Live fold iterates INTRADAY_TFS only (D1 never live-folded)
   - Files: crates/app/src/rest_candle_fold.rs
   - Tests: test_fold_bar_iterates_intraday_only, test_d1_never_produced_by_live_fold, test_ragged_final_buckets_seal_at_session_close

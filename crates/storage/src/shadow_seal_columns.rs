@@ -11,7 +11,7 @@
 //! testing. Putting the column-typing logic in a pure function lets us
 //! exhaustively test:
 //!
-//! - timeframe → table name dispatch (all 21 TFs)
+//! - timeframe → table name dispatch (all 12 TFs)
 //! - segment-code → ILP `symbol` string (all 8 segments + UNKNOWN)
 //! - the `bucket_start_ist_secs * 1_000_000_000` IST-nanos conversion
 //!   (CRITICAL data-integrity rule — the WS LTT carries IST already,
@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_name_dispatches_correctly_for_all_21_tfs() {
+    fn test_table_name_dispatches_correctly_for_all_12_tfs() {
         for tf in TfIndex::ALL {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(
@@ -283,15 +283,6 @@ mod tests {
             (TfIndex::M3, "candles_3m"),
             (TfIndex::M4, "candles_4m"),
             (TfIndex::M5, "candles_5m"),
-            (TfIndex::M6, "candles_6m"),
-            (TfIndex::M7, "candles_7m"),
-            (TfIndex::M8, "candles_8m"),
-            (TfIndex::M9, "candles_9m"),
-            (TfIndex::M10, "candles_10m"),
-            (TfIndex::M11, "candles_11m"),
-            (TfIndex::M12, "candles_12m"),
-            (TfIndex::M13, "candles_13m"),
-            (TfIndex::M14, "candles_14m"),
             (TfIndex::M15, "candles_15m"),
             (TfIndex::M30, "candles_30m"),
             (TfIndex::H1, "candles_1h"),
