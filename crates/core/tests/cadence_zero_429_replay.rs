@@ -1321,7 +1321,7 @@ proptest! {
         let cfg = CadenceConfig::default();
         let boundary = 9 * 3600 + 16 * 60 + boundary_min * 60;
         let slots = build_cycle_slots(boundary, dhan_shape, spot_step, groww_step, &cfg);
-        let events = build_cycle_events(&slots, dhan_enabled, groww_enabled);
+        let events = build_cycle_events(&slots, dhan_enabled, groww_enabled, false);
 
         // Time-sorted, always.
         for w in events.windows(2) {

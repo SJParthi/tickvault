@@ -20,7 +20,8 @@ use std::time::Duration;
 use chrono::{NaiveDate, TimeZone, Timelike, Utc};
 use tickvault_common::config::CadenceConfig;
 use tickvault_common::constants::{
-    CADENCE_NATIVE_RETRY_OFFSETS_MS, CADENCE_SPOT_WINDOW_MS, IST_UTC_OFFSET_SECONDS,
+    CADENCE_DECISION_DEADLINE_MS, CADENCE_NATIVE_RETRY_OFFSETS_MS, CADENCE_SPOT_WINDOW_MS,
+    IST_UTC_OFFSET_SECONDS,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
@@ -1236,6 +1237,8 @@ pub enum CycleAction {
     GrowwCutoff,
     /// The Dhan lane staleness cutoff.
     DhanCutoff,
+    /// The boundary+deadline native-retry chain deadline slot (item 3).
+    NativeDeadline,
 }
 
 /// A completed fetch, delivered over the bounded completion channel.
@@ -1346,6 +1349,9 @@ struct LaneRun {
     state: CadenceState,
     asm: LaneAssembly,
     resolved: bool,
+    /// Resolution provenance token for the cross-fill audit seam
+    /// (item 3): set IMMEDIATELY before `resolved = true`.
+    resolution: Option<&'static str>,
     flags: DegradeFlags,
     arming_failure: bool,
     /// Dispatched-but-not-yet-completed OWN fetches (burst + fallback +
@@ -1370,6 +1376,7 @@ impl LaneRun {
             state: CadenceState::Idle,
             asm: LaneAssembly::new(feed, slots.cycle_minute_ist, slots.boundary_ms),
             resolved: false,
+            resolution: None,
             flags: DegradeFlags::default(),
             arming_failure: false,
             inflight: 0,
@@ -1416,6 +1423,7 @@ pub fn build_cycle_events(
     slots: &CycleSlots,
     dhan_enabled: bool,
     groww_enabled: bool,
+    native_retry_enabled: bool,
 ) -> Vec<(i64, CycleAction)> {
     let mut events: Vec<(i64, CycleAction)> = Vec::with_capacity(16);
     if dhan_enabled {
@@ -1462,6 +1470,12 @@ pub fn build_cycle_events(
         ));
         events.push((slots.groww_verdict_ms, CycleAction::GrowwVerdict));
         events.push((slots.groww_cutoff_ms, CycleAction::GrowwCutoff));
+    }
+    if native_retry_enabled {
+        events.push((
+            slots.boundary_ms + CADENCE_DECISION_DEADLINE_MS,
+            CycleAction::NativeDeadline,
+        ));
     }
     events.sort_by_key(|(ms, _)| *ms);
     events
@@ -1541,7 +1555,12 @@ where
         };
     }
 
-    cycle.events = build_cycle_events(slots, cycle.dhan.enabled, cycle.groww.enabled);
+    cycle.events = build_cycle_events(
+        slots,
+        cycle.dhan.enabled,
+        cycle.groww.enabled,
+        deps.config.native_retry_enabled,
+    );
 
     let (tx, mut rx) = mpsc::channel::<Completion>(CADENCE_COMPLETION_CHANNEL_CAPACITY);
 
@@ -1645,7 +1664,12 @@ where
                         cycle.groww = LaneRun::new(Feed::Groww, groww_now, slots);
                         arm_lane(&mut cycle.dhan);
                         arm_lane(&mut cycle.groww);
-                        cycle.events = build_cycle_events(slots, dhan_now, groww_now);
+                        cycle.events = build_cycle_events(
+                            slots,
+                            dhan_now,
+                            groww_now,
+                            deps.config.native_retry_enabled,
+                        );
                         continue;
                     }
                 }
@@ -1680,6 +1704,8 @@ where
                     stage = %lane.flags.stages(),
                     lane = lane.asm.feed.as_str(),
                     cycle_minute_ist = lane.asm.cycle_minute_ist,
+                    attempts = lane.late_retry_attempts,
+                    resolution = lane.resolution.unwrap_or("none"),
                     "cadence lane degraded under DRY-RUN executors \
                      (expected shape — F10 demotion)"
                 );
@@ -1689,11 +1715,29 @@ where
                     stage = %lane.flags.stages(),
                     lane = lane.asm.feed.as_str(),
                     cycle_minute_ist = lane.asm.cycle_minute_ist,
+                    attempts = lane.late_retry_attempts,
+                    resolution = lane.resolution.unwrap_or("none"),
                     "CADENCE-01: cadence lane degraded this cycle (coalesced)"
                 );
             }
         }
     }
+    // ITEM 3 (E6): history_repull_enabled consumer - record-only
+    // history-repair intent for cross-filled lanes (the item-5 repull
+    // executor pends; this is the wiring seam).
+    if !deps.dry_run {
+        let dhan_cross = cycle.dhan.resolution == Some("cross_fill");
+        let groww_cross = cycle.groww.resolution == Some("cross_fill");
+        if deps.config.history_repull_enabled {
+            if cycle.dhan.enabled && dhan_cross {
+                spawn_history_repull(Feed::Dhan, cycle.dhan.asm.cycle_minute_ist);
+            }
+            if cycle.groww.enabled && groww_cross {
+                spawn_history_repull(Feed::Groww, cycle.groww.asm.cycle_minute_ist);
+            }
+        }
+    }
+
     // Rollover only from a lane that ran (a disabled lane parked Idle via
     // OffSessionOrDisabled — Idle + Rollover is deliberately illegal).
     if cycle.dhan.enabled {
@@ -1789,7 +1833,13 @@ fn arm_lane(lane: &mut LaneRun) {
         lane.fsm(CadenceEvent::AnchorReached);
     } else {
         lane.fsm(CadenceEvent::OffSessionOrDisabled);
+        // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
+        lane.resolution = Some(resolution_token(
+            lane.flags.cross_fill || lane.flags.groww_fallback,
+            lane.late_retry_attempts,
+        ));
         lane.resolved = true;
+        debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
     }
 }
 
@@ -1848,7 +1898,13 @@ fn drop_lane_runtime_disabled(lane: &mut LaneRun) {
          dropped (no partial emit; in-flight requests complete audit-only)"
     );
     lane.fsm(CadenceEvent::Shutdown);
+    // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
+    lane.resolution = Some(resolution_token(
+        lane.flags.cross_fill || lane.flags.groww_fallback,
+        lane.late_retry_attempts,
+    ));
     lane.resolved = true;
+    debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
     lane.enabled = false;
 }
 
@@ -2238,6 +2294,62 @@ fn handle_action<C, D, G>(
                     }
                 }
             }));
+        }
+        CycleAction::NativeDeadline => {
+            // ITEM 3: ONE gate-paced chain deadline slot per underlying at
+            // boundary + CADENCE_DECISION_DEADLINE_MS - history-repair only
+            // (results ride the normal completion flow; never deferred).
+            if cycle.dhan.enabled && !cycle.dhan.resolved {
+                cycle.dhan.late_retry_attempts = cycle.dhan.late_retry_attempts.saturating_add(1);
+                for (underlying_idx, underlying) in
+                    ChainUnderlying::ALL.iter().copied().enumerate()
+                {
+                    let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
+                        Feed::Dhan,
+                        underlying,
+                        clock.ist_date(),
+                    );
+                    match gates.try_acquire_chain(underlying, expiry_yyyymmdd, now_mono) {
+                        GateVerdict::Acquired => {
+                            if cycle.dhan.state == CadenceState::Armed {
+                                cycle.dhan.fsm(CadenceEvent::FirstFetchDispatched);
+                            }
+                            if expiry_yyyymmdd.is_none() {
+                                cycle.dhan.flags.expiry_unresolved = true;
+                            }
+                            let req = ChainFetchRequest {
+                                feed: Feed::Dhan,
+                                underlying,
+                                expiry_yyyymmdd,
+                                cycle_minute_ist: slots.cycle_minute_ist,
+                                deadline_epoch_ms: clock
+                                    .epoch_ms()
+                                    .saturating_add(CADENCE_DHAN_REQUEST_TIMEOUT_MS),
+                            };
+                            cycle.dhan.inflight = cycle.dhan.inflight.saturating_add(1);
+                            spawn_chain_fetch(
+                                Arc::clone(&deps.dhan_executor),
+                                tx.clone(),
+                                req,
+                                underlying_idx,
+                                CADENCE_DHAN_REQUEST_TIMEOUT_MS,
+                            );
+                        }
+                        GateVerdict::RetryAtMs(_) => {
+                            metrics::counter!(
+                                "tv_cadence_native_retry_total",
+                                "lane" => Feed::Dhan.as_str(),
+                                "outcome" => "gate_busy_skip"
+                            )
+                            .increment(1);
+                        }
+                    }
+                }
+            }
+            // SPEC: force BOTH finalize calls with own_path_exhausted: true.
+            let CycleState { dhan, groww, .. } = cycle;
+            finalize_if_complete(clock.as_ref(), slots, dhan, groww, latch, true, deps.dry_run);
+            finalize_if_complete(clock.as_ref(), slots, groww, dhan, latch, true, deps.dry_run);
         }
         CycleAction::GrowwCutoff => {
             let CycleState { dhan, groww, .. } = cycle;
@@ -3220,7 +3332,13 @@ fn decide_lane<C: CadenceClock>(
             "CADENCE-03: decision double-latch attempt refused (exactly-\
              once guard held; should-never scheduler-logic signal)"
         );
+        // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
+        lane.resolution = Some(resolution_token(
+            lane.flags.cross_fill || lane.flags.groww_fallback,
+            lane.late_retry_attempts,
+        ));
         lane.resolved = true;
+        debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
         return;
     }
     // FSM: an all-unknown completion is honest-skipped — nothing USABLE
@@ -3250,7 +3368,38 @@ fn decide_lane<C: CadenceClock>(
         },
         dry_run,
     );
+    // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
+    lane.resolution = Some(resolution_token(
+        lane.flags.cross_fill || lane.flags.groww_fallback,
+        lane.late_retry_attempts,
+    ));
     lane.resolved = true;
+    debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
+}
+
+/// Resolution provenance vocabulary - LOCKED: "cross_fill" |
+/// "native_late_retry" | "native_first_try" (item 3).
+fn resolution_token(cross_filled: bool, late_retry_attempts: u32) -> &'static str {
+    if cross_filled {
+        "cross_fill"
+    } else if late_retry_attempts > 0 {
+        "native_late_retry"
+    } else {
+        "native_first_try"
+    }
+}
+
+/// ITEM 3 (E6): record-only history-repair intent for a cross-filled lane -
+/// the item-5 repull executor consumes this seam later; today it logs the
+/// intent on a detached task (never blocks the scheduler).
+fn spawn_history_repull(feed: Feed, cycle_minute_ist: u32) {
+    tokio::spawn(async move {
+        info!(
+            lane = feed.as_str(),
+            cycle_minute_ist,
+            "cadence: history repull intent recorded (cross-filled lane)"
+        );
+    });
 }
 
 /// Cutoff handling: one final finalize attempt, else HONEST-SKIP with
@@ -3288,7 +3437,13 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
         SkipReason::Cutoff
     };
     if !latch.try_latch(lane.asm.feed, lane.asm.cycle_minute_ist) {
+        // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
+        lane.resolution = Some(resolution_token(
+            lane.flags.cross_fill || lane.flags.groww_fallback,
+            lane.late_retry_attempts,
+        ));
         lane.resolved = true;
+        debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
         return;
     }
     match reason {
@@ -3308,7 +3463,13 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
         },
         dry_run,
     );
+    // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
+    lane.resolution = Some(resolution_token(
+        lane.flags.cross_fill || lane.flags.groww_fallback,
+        lane.late_retry_attempts,
+    ));
     lane.resolved = true;
+    debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
 }
 
 /// PHASE-B2 (item 2): CADENCE-05 recovery wrap-up — LOG-SINK-ONLY, once per
