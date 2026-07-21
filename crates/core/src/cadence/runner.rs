@@ -2267,6 +2267,8 @@ fn handle_action<C, D, G>(
                     cycle_latency_ms: clock.ist_ms_of_day().saturating_sub(slots.boundary_ms),
                     ladder_rung: slots.groww_shape,
                     resolved_at_ms_after_close: -1,
+                    resolution: "native_late_retry",
+                    retry_attempts: cycle.groww.late_retry_attempts,
                 });
             }
             let exec = Arc::clone(&deps.groww_executor);
@@ -3194,6 +3196,8 @@ fn finalize_if_complete<C: CadenceClock>(
                 cycle_latency_ms: latency_ms,
                 ladder_rung,
                 resolved_at_ms_after_close: latency_ms,
+                resolution: "cross_fill",
+                retry_attempts: lane.late_retry_attempts,
             });
         }
         // Rung 3: the lane's own chain-embedded spot.
