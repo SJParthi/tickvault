@@ -4,23 +4,24 @@
 //! mapping from `(timeframe → QuestDB table name + DEDUP key +
 //! bucket-seconds + display name)`. [`TfIndex`] is that handle: a
 //! `#[repr(u8)]` enum whose ordinal indexes the per-instrument
-//! `[Mutex<LiveCandleState>; 5]` slot array AND the storage-side
-//! `[Sender; 5]` ILP writer array.
+//! `[Mutex<LiveCandleState>; TF_COUNT]` slot array AND the
+//! storage-side `[Sender; TF_COUNT]` ILP writer array.
 //!
-//! ## The 5 timeframes
+//! ## The 21 timeframes (1s–15s, 30s, 1m, 3m, 5m, 15m, 1d)
 //!
 //! The candle re-architecture (#T1) ships ONE aggregator that derives
-//! all 5 timeframes directly from the live tick stream and flushes
+//! all 21 timeframes directly from the live tick stream and flushes
 //! each sealed bar straight to its own plain QuestDB table
-//! (`candles_1m` … `candles_1d`). There are no `_shadow` tables, no
-//! `candles_1s` base table, and no materialized-view cascade — every
+//! (`candles_1s` … `candles_1d`; legacy frames write-stopped). There
+//! are no `_shadow` tables and no materialized-view cascade — every
 //! timeframe is a first-class table written at seal time.
 //!
-//! Variants are ordered short-to-long (1m → 1d) so the ordinal
+//! Variant ordinals are FROZEN (1m…1d at 0..=4; 1s–15s + 30s
+//! appended at 5..=20) so the ordinal
 //! returned by [`Self::as_ordinal`] is stable. Reordering variants is
 //! a SEMVER break — every consumer indexing by ordinal (the
-//! per-instrument `[Mutex<LiveCandleState>; 5]`, the ILP
-//! `[Sender; 5]` writer, the audit-table `timeframe` SYMBOL column)
+//! per-instrument `[Mutex<LiveCandleState>; TF_COUNT]`, the ILP
+//! `[Sender; TF_COUNT]` writer, the audit-table `timeframe` SYMBOL column)
 //! breaks silently.
 
 /// Number of timeframes the live candle engine derives. Pinned here so
@@ -143,8 +144,8 @@ impl TfIndex {
     ];
 
     /// Returns the ordinal (`0..TF_COUNT`) used to index the
-    /// per-instrument `[Mutex<LiveCandleState>; 5]` array AND the
-    /// storage-side `[Sender; 5]` ILP writer array.
+    /// per-instrument `[Mutex<LiveCandleState>; TF_COUNT]` array AND the
+    /// storage-side `[Sender; TF_COUNT]` ILP writer array.
     #[inline]
     #[must_use]
     pub const fn as_ordinal(self) -> usize {

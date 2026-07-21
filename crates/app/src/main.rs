@@ -1630,7 +1630,7 @@ async fn main() -> Result<()> {
 
     // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
     // the conservation audit + scoreboard above (operator 2026-07-13):
-    // recompute every higher-TF candle (2m..4h) from the stored 1m rows and
+    // recompute every higher-TF candle (3m..15m) from the stored 1m rows and
     // compare against the persisted TF tables — Dhan verifies TODAY, Groww
     // verifies the PREVIOUS trading day (TF-VERIFY-01/02). Gated on
     // `[tf_consistency] enabled` + trading-day inside the task; the

@@ -365,6 +365,9 @@ realtime_guarantee_score = true
 # only after Groww-API drill-down backtests prove signal value, AND only
 # together with: cascade RAM engine entry + matview DDL entry + Tf enum
 # variant + symmetry ratchet update (see plan §K-L6/L7/L8 + PR #517).
+# NOTE (TF-diet C-lane): this is the INDICATOR-ENGINE TF list only — the
+# candle-TABLE set is the separate 21-frame second-scale contract
+# (1s–15s, 30s, 1m, 3m, 5m, 15m, 1d; legacy frames write-stopped).
 [engine.timeframes]
 list = [
   "1m", "5m", "15m", "30m",
@@ -620,7 +623,7 @@ warm_up = true
 # "how will you guarantee that all our defined timeframes internally are
 # correct — how do you identify whether any miscalculation or data
 # issues"). At 15:40 IST every trading day, recompute every sealed
-# higher-timeframe candle (2m..4h) from its stored 1-minute constituents
+# higher-timeframe candle (3m..15m) from its stored 1-minute constituents
 # and compare exactly — Dhan verifies TODAY (stable after the 15:30:05
 # close seal); Groww verifies the PREVIOUS trading day (its tails seal at
 # IST midnight). Findings land in the tf_consistency_audit table + one
@@ -693,7 +696,8 @@ enabled = true
 # REST-era multi-TF candle derivation (operator directive 2026-07-16:
 # "why the fuck remaining candles 1m till 1day is not yet generated and
 # populated — resolve these"). Folds persist-confirmed spot_1m_rest 1m bars
-# into all 21 candles_* timeframes via the shared seal-writer channel, plus
+# into the 1m-derivable candles_* timeframes (1m/3m/5m/15m/1d of the
+# 21-frame second-scale set) via the shared seal-writer channel, plus
 # a boot catch-up over the last `catchup_days` of stored bars (35 = the
 # operator's one-month spot window + weekend slack, 2026-07-16: "our entire
 # one month should be stored and fetched from questdb even before

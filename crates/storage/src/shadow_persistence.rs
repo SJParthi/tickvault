@@ -151,7 +151,7 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// Create all 5 plain candle tables + the per-seal audit table if they
+/// Create all 21 plain candle tables + the per-seal audit table if they
 /// do not already exist, with DEDUP UPSERT enabled on each.
 ///
 /// Idempotent: safe to call on every boot. Failures are logged at
