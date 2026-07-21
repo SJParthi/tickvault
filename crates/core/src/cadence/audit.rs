@@ -49,6 +49,11 @@ pub struct CrossFillAuditEvent {
     /// Minute-close T → resolution instant, ms; `-1` = unknown at emit
     /// time (fallback launch rows) — never a fabricated latency.
     pub resolved_at_ms_after_close: i64,
+    /// Closed-contract resolution token at emit time (`native_first_try` |
+    /// `native_late_retry` | `cross_fill`).
+    pub resolution: &'static str,
+    /// Late-retry attempts recorded on the lane when this event was emitted.
+    pub retry_attempts: u32,
 }
 
 impl CrossFillAuditEvent {
@@ -119,6 +124,8 @@ mod tests {
             cycle_latency_ms: 12_500,
             ladder_rung: 0,
             resolved_at_ms_after_close: 12_500,
+            resolution: "cross_fill",
+            retry_attempts: 1,
         }
     }
 

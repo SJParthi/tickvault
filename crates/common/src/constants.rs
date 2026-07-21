@@ -4062,6 +4062,48 @@ const _: () = {
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
 
+/// Cadence native-retry hedge: re-poll offsets for a 2xx-empty leg, in ms
+/// after the minute close (volley fires ~T+1s; decision deadline T+4s).
+pub const CADENCE_NATIVE_RETRY_OFFSETS_MS: [i64; 3] = [2_000, 3_000, 3_800];
+
+/// Max native micro-retry attempts per lane per minute (== offsets len).
+pub const CADENCE_NATIVE_RETRY_MAX_ATTEMPTS: usize = 3;
+
+/// Decision deadline after minute close: native data arriving before this
+/// wins; at the deadline the pre-prepared cross-fill fires with no extra wait.
+pub const CADENCE_DECISION_DEADLINE_MS: i64 = 4_000;
+
+/// Background history re-pull offsets (post-cross-fill repair of the degraded
+/// broker's OWN rows; history-repair only, never a decision input).
+// T+50s (NOT T+60s): T+60s lands exactly ON the next minute boundary and would
+// collide with the next cycle's volley burst (#1690 audit H5). Strictly < 60_000.
+pub const CADENCE_HISTORY_REPULL_OFFSETS_MS: [i64; 2] = [30_000, 50_000];
+
+/// Per-attempt hard bound for one history re-pull attempt (all legs of that
+/// attempt share it). Chosen so the LAST attempt (T+50s) ends before the next
+/// cycle's volley: 50_000 + 8_000 = 58_000 < 60_000 (H5 headroom 2s).
+pub const CADENCE_HISTORY_REPULL_TIMEOUT_MS: u64 = 8_000;
+
+// Compile-time H5 law: the last re-pull attempt, bounded by its timeout, must
+// finish strictly before the next minute's cycle volley.
+const _: () = assert!(
+    CADENCE_HISTORY_REPULL_OFFSETS_MS[1] + (CADENCE_HISTORY_REPULL_TIMEOUT_MS as i64) < 60_000,
+    "history re-pull last attempt + timeout must end before the next cycle volley"
+);
+// Compile-time ordering law: attempt offsets must be strictly increasing.
+const _: () = assert!(
+    CADENCE_HISTORY_REPULL_OFFSETS_MS[0] < CADENCE_HISTORY_REPULL_OFFSETS_MS[1],
+    "history re-pull offsets must be strictly increasing"
+);
+
+/// HTTP keep-alive knobs for the cadence Dhan REST client (hedge plan item 4).
+/// The pool idle timeout MUST exceed the 60 s cadence period, or every minute's
+/// volley pays a fresh TCP+TLS handshake (measured 2026-07-20: Dhan cycles
+/// 1.05-4.02 s vs Groww 0.29-0.87 s). 120 s idle > 60 s period; OS TCP
+/// keepalive probes every 30 s keep NAT/LB paths warm between volleys.
+pub const CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
+pub const CADENCE_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
+
 #[cfg(test)]
 mod market_hours_tests {
     use super::*;
@@ -5445,5 +5487,44 @@ mod tests {
         assert_eq!(GROWW_NATIVE_AUTH_RETRY_FLOOR_SECS, 60);
         assert_eq!(GROWW_NATIVE_WATCH_POLL_SECS, 30);
         assert_eq!(GROWW_NATIVE_WRITER_CHANNEL_CAPACITY, 65_536);
+    }
+}
+
+#[cfg(test)]
+mod cadence_native_retry_hedge_tests {
+    use super::*;
+
+    #[test]
+    fn test_cadence_native_retry_constants_pinned() {
+        assert_eq!(CADENCE_NATIVE_RETRY_OFFSETS_MS, [2_000, 3_000, 3_800]);
+        assert_eq!(
+            CADENCE_NATIVE_RETRY_MAX_ATTEMPTS,
+            CADENCE_NATIVE_RETRY_OFFSETS_MS.len()
+        );
+        assert_eq!(CADENCE_DECISION_DEADLINE_MS, 4_000);
+        assert_eq!(CADENCE_HISTORY_REPULL_TIMEOUT_MS, 8_000);
+        assert!(
+            CADENCE_NATIVE_RETRY_OFFSETS_MS
+                .windows(2)
+                .all(|w| w[0] < w[1]),
+            "native retry offsets must be strictly ascending"
+        );
+        assert!(
+            CADENCE_NATIVE_RETRY_OFFSETS_MS
+                .iter()
+                .all(|&o| o < CADENCE_DECISION_DEADLINE_MS)
+        );
+        assert_eq!(CADENCE_HISTORY_REPULL_OFFSETS_MS, [30_000, 50_000]);
+        assert!(
+            CADENCE_HISTORY_REPULL_OFFSETS_MS
+                .iter()
+                .all(|&o| o < 60_000)
+        );
+        assert_eq!(CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS, 120);
+        assert_eq!(CADENCE_HTTP_TCP_KEEPALIVE_SECS, 30);
+        assert!(
+            CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS > 60,
+            "pool idle must outlive the 60s cadence period"
+        );
     }
 }

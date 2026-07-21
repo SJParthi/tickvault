@@ -1207,6 +1207,15 @@ pub struct CadenceConfig {
     /// Validated < 86_400.
     #[serde(default = "default_cadence_expiry_deadline_secs_of_day_ist")]
     pub expiry_deadline_secs_of_day_ist: u32,
+    /// Native micro-retry hedge for 2xx-empty cadence legs (2026-07-20 directive).
+    #[serde(default = "cadence_default_true")]
+    pub native_retry_enabled: bool,
+    /// Post-cross-fill background history re-pull (T+30s/T+50s, repair only).
+    #[serde(default = "cadence_default_true")]
+    pub history_repull_enabled: bool,
+}
+fn cadence_default_true() -> bool {
+    true
 }
 
 /// Serde default for [`CadenceConfig::dhan_lane`] /
@@ -1319,6 +1328,8 @@ impl Default for CadenceConfig {
             chain_min_spacing_ms: default_cadence_chain_min_spacing_ms(),
             expiry_retry_interval_ms: default_cadence_expiry_retry_interval_ms(),
             expiry_deadline_secs_of_day_ist: default_cadence_expiry_deadline_secs_of_day_ist(),
+            native_retry_enabled: true,
+            history_repull_enabled: true,
         }
     }
 }
@@ -7040,6 +7051,24 @@ mod tests {
                 ..Default::default()
             }
             .any_enabled()
+        );
+    }
+}
+
+#[cfg(test)]
+mod cadence_retry_flag_tests {
+    use super::*;
+
+    #[test]
+    fn test_cadence_config_retry_flags_default_on() {
+        let cfg = CadenceConfig::default();
+        assert!(
+            cfg.native_retry_enabled,
+            "native_retry_enabled must default ON"
+        );
+        assert!(
+            cfg.history_repull_enabled,
+            "history_repull_enabled must default ON"
         );
     }
 }

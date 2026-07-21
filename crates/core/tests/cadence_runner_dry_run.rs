@@ -260,7 +260,13 @@ fn deps_with(
     Arc<Notify>,
 ) {
     let shutdown = Arc::new(Notify::new());
-    let config = CadenceConfig::default();
+    // This suite pins the kill-switch-OFF legacy shape (B1 defines OFF as
+    // byte-equivalent pre-ladder behavior).
+    let config = CadenceConfig {
+        native_retry_enabled: false,
+        history_repull_enabled: false, // legacy count pins assume no repull spawn
+        ..CadenceConfig::default()
+    };
     let gates = test_gates(&config);
     let deps = CadenceRunnerDeps {
         config,
