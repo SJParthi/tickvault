@@ -335,6 +335,13 @@ groww_enabled = false
 # movers pipeline. Under the 4-IDX_I-only universe top-N gainers/losers/
 # most-active queries are meaningless.
 
+# GDF third feed - default OFF (gdf-third-feed-scope-2026-07-13.md)
+gdf_enabled = false
+
+[feeds.gdf]
+# "subscribe" = SubscribeRealtime (the 2026-07-21 trial); "firehose" deferred.
+mode = "subscribe"
+
 [features]
 hotpath_async_writers = true
 phase2_emit_guard = true

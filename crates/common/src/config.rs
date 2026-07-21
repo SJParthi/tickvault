@@ -387,6 +387,34 @@ pub struct FeedsConfig {
     /// rides alongside the `[groww_universe]` daily watch-set rider (which
     /// has its OWN gate). Default OFF.
     pub groww_enabled: bool,
+    /// GDF (Global Data Feeds) third feed - default OFF per
+    /// `.claude/rules/project/gdf-third-feed-scope-2026-07-13.md`.
+    #[serde(default)]
+    pub gdf_enabled: bool,
+    /// GDF feed tuning; see `GdfConfig`.
+    #[serde(default)]
+    pub gdf: GdfConfig,
+}
+
+/// GDF (Global Data Feeds) capture tuning - default OFF, see
+/// `.claude/rules/project/gdf-third-feed-scope-2026-07-13.md` section 2.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GdfConfig {
+    /// Capture mode: "subscribe" (SubscribeRealtime, default) or "firehose" (deferred).
+    #[serde(default = "default_gdf_mode")]
+    pub mode: String,
+}
+
+fn default_gdf_mode() -> String {
+    "subscribe".to_string()
+}
+
+impl Default for GdfConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_gdf_mode(),
+        }
+    }
 }
 
 impl Default for FeedsConfig {
@@ -394,6 +422,8 @@ impl Default for FeedsConfig {
         Self {
             dhan_enabled: true,
             groww_enabled: false,
+            gdf_enabled: false,
+            gdf: GdfConfig::default(),
         }
     }
 }
