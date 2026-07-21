@@ -2301,8 +2301,7 @@ fn handle_action<C, D, G>(
             // (results ride the normal completion flow; never deferred).
             if cycle.dhan.enabled && !cycle.dhan.resolved {
                 cycle.dhan.late_retry_attempts = cycle.dhan.late_retry_attempts.saturating_add(1);
-                for (underlying_idx, underlying) in
-                    ChainUnderlying::ALL.iter().copied().enumerate()
+                for (underlying_idx, underlying) in ChainUnderlying::ALL.iter().copied().enumerate()
                 {
                     let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
                         Feed::Dhan,
@@ -2348,8 +2347,24 @@ fn handle_action<C, D, G>(
             }
             // SPEC: force BOTH finalize calls with own_path_exhausted: true.
             let CycleState { dhan, groww, .. } = cycle;
-            finalize_if_complete(clock.as_ref(), slots, dhan, groww, latch, true, deps.dry_run);
-            finalize_if_complete(clock.as_ref(), slots, groww, dhan, latch, true, deps.dry_run);
+            finalize_if_complete(
+                clock.as_ref(),
+                slots,
+                dhan,
+                groww,
+                latch,
+                true,
+                deps.dry_run,
+            );
+            finalize_if_complete(
+                clock.as_ref(),
+                slots,
+                groww,
+                dhan,
+                latch,
+                true,
+                deps.dry_run,
+            );
         }
         CycleAction::GrowwCutoff => {
             let CycleState { dhan, groww, .. } = cycle;
@@ -3396,8 +3411,7 @@ fn spawn_history_repull(feed: Feed, cycle_minute_ist: u32) {
     tokio::spawn(async move {
         info!(
             lane = feed.as_str(),
-            cycle_minute_ist,
-            "cadence: history repull intent recorded (cross-filled lane)"
+            cycle_minute_ist, "cadence: history repull intent recorded (cross-filled lane)"
         );
     });
 }
@@ -3614,5 +3628,83 @@ mod tests {
         assert!(src.contains("cycle.next_spot_retry_target_ms.max(now_wall)"));
         assert!(src.contains("!cfg.native_retry_enabled"));
         assert!(src.contains("!cycle.groww_leg_malformed[leg]"));
+    }
+
+    /// ITEM 3: the resolution provenance vocabulary is LOCKED -
+    /// "cross_fill" | "native_late_retry" | "native_first_try".
+    #[test]
+    fn resolution_token_vocabulary_locked() {
+        assert_eq!(super::resolution_token(true, 0), "cross_fill");
+        assert_eq!(super::resolution_token(true, 3), "cross_fill");
+        assert_eq!(super::resolution_token(false, 2), "native_late_retry");
+        assert_eq!(super::resolution_token(false, 0), "native_first_try");
+    }
+
+    /// ITEM 3 ratchet: LaneRun's ctor initializes the resolution token to None.
+    #[test]
+    fn ratchet_lane_run_ctor_initializes_resolution_none() {
+        let src = include_str!("runner.rs");
+        let needle = ["resolution", ": None,"].concat();
+        assert!(
+            src.contains(needle.as_str()),
+            "LaneRun ctor must initialize resolution: None"
+        );
+    }
+
+    /// ITEM 3 ratchet: the E6 history-repull consumer spawns for BOTH lanes,
+    /// gated on cross_fill resolution + history_repull_enabled + !dry_run,
+    /// and the NativeDeadline slot rides CADENCE_DECISION_DEADLINE_MS.
+    #[test]
+    fn ratchet_runner_spawns_history_repull_for_both_lanes() {
+        let src = include_str!("runner.rs");
+        let spawn = ["spawn_history_repull", "(Feed::"].concat();
+        assert_eq!(
+            src.matches(spawn.as_str()).count(),
+            2,
+            "exactly one history-repull spawn per lane (dhan + groww)"
+        );
+        let dry_gate = ["if !deps.", "dry_run {"].concat();
+        assert!(
+            src.contains(dry_gate.as_str()),
+            "repull intent must be dry-run gated"
+        );
+        let cross = [".resolution == Some(", "\"cross_fill\")"].concat();
+        assert_eq!(
+            src.matches(cross.as_str()).count(),
+            2,
+            "repull gated on cross_fill resolution for both lanes"
+        );
+        let deadline_variant = ["CycleAction::Native", "Deadline,"].concat();
+        assert!(
+            src.contains(deadline_variant.as_str()),
+            "NativeDeadline slot must be pushed in build_cycle_events"
+        );
+        let deadline_const = ["CADENCE_DECISION_", "DEADLINE_MS"].concat();
+        assert!(
+            src.contains(deadline_const.as_str()),
+            "the chain deadline slot must ride CADENCE_DECISION_DEADLINE_MS"
+        );
+    }
+
+    /// ITEM 3 ratchet: exactly one resolution assignment IMMEDIATELY before
+    /// each resolved-site (exactly-one-resolution per slot per minute).
+    #[test]
+    fn ratchet_resolution_set_exactly_before_each_resolved_site() {
+        let src = include_str!("runner.rs");
+        let resolved = ["lane.resolved", " = true;"].concat();
+        let seam = ["// SEAM(", "#1688):"].concat();
+        let set = ["lane.resolution", ".is_some()"].concat();
+        let n = src.matches(resolved.as_str()).count();
+        assert_eq!(n, 6, "six genuine lane-resolution sites");
+        assert_eq!(
+            src.matches(seam.as_str()).count(),
+            n,
+            "one SEAM comment per site"
+        );
+        assert_eq!(
+            src.matches(set.as_str()).count(),
+            n,
+            "one debug_assert per site"
+        );
     }
 }
