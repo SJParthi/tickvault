@@ -171,3 +171,47 @@ Always loaded. Activates on any session that:
 - Edits any file under `docs/gdf-ref/`
 - Adds any new `ws://` or `wss://` URL constant
 - Edits `.claude/plans/active-plan-gdf-feed.md`
+
+---
+
+## §9. 2026-07-21 Amendment — SubscribeRealtime 99-symbol trial scope (operator directives)
+
+### §9.0 The verbatim operator demands (preserve exactly, do not paraphrase — typos included)
+
+**Quote 1 (2026-07-21, the 100-symbol SubscribeRealtime directive):**
+> "Dude as of now i planned to just implement the gdfl subscrieb real time 100 symbols dude what do you say and think bro so that we can have evry secodn lvie feed data right firts chekc this newer requrimeent and tell me dud ehow doe shtiw ork bro okay?"
+
+**Quote 2 (2026-07-21, the exact instrument set + greeks ownership):**
+> "Dude as of now i planned to use only nifty 50 spot and the current expiry 98 options coevered entire call and put right alone dude okay? see we have greekks entirley in our brutex where we cna siue that dude okay?"
+
+**Quote 3 (2026-07-21, option-buying slippage focus + the frame family):**
+> "see especially wheneve we focus on otpion buyign to redcuce the amssive slippage how shdou lw e use this dude see and even our tiemframe will be liek thsi ddue whcu is 1 seocnd till 15 seocnd sequantially one by oen and 30 second and 1m, 3m, 5m, 15m alone dude okay?"
+
+**Quote 4 (2026-07-21, daily instrument re-resolution):**
+> "Eeven everyday it hsodu leven cosndier the isntruremnts and base don it onl yit shdou lsubscirbe etc etec do everythgin rigth dud ema i irgith bro tel lem dude okay?"
+
+**Quote 5 (2026-07-21, architecture ownership delegated to Claude):**
+> "i eman i simply said wal or ring butffer but id otn have an idea abotu this fuckig archtiecture bro okay? So it is your fuckign repsosnsibility to check thsi fuckign ultimate new design new arhcietcutre everthyghin rbno oklay?"
+
+### §9.1 The recorded effects (dated contract changes)
+
+| # | Effect | Detail |
+|---|---|---|
+| (a) | **Capture mode PRIMARY flips: Mode A firehose → Mode B SubscribeRealtime** | Exactly **99 symbols** = the NIFTY 50 spot index + the current-expiry strike window of **49 CE + 49 PE** NIFTY option contracts ("100 symbols" in Quote 1 = the operator's round number; Quote 2 fixes the exact set at 1 + 98 = 99). The §2 "Capture modes" row's Mode A/Mode B roles INVERT for this trial: SubscribeRealtime per-symbol is the primary lane; the firehose remains a documented, config-selectable fallback (`feeds.gdf.mode`), NOT the trial default. The D4 firehose sizing + the firehose-ingest ban stay valid as-is for any future firehose use. |
+| (b) | **Daily pre-market instrument re-resolution** | Per Quote 4: every trading morning the 99-symbol set is RE-DERIVED from the in-band `GetInstruments` master (the §3 KEEP row) — current expiry re-selected (nearest ≥ today, never-roll), the 49+49 strike ladder re-centered — NEVER a stale hardcoded list. Fail-closed on <99 resolved with named gaps (design doc §2). |
+| (c) | **Greeks are computed ENTIRELY in BruteX** | Per Quote 2: tickvault stores NO greeks columns/tables for GDF. The BruteX consumption seam is the §37 read-only S3 artifact class (`groww-second-feed-scope-2026-06-19.md` §37 + `brutex-readonly-lock-2026-07-18.md` — bruteX repo read-only, operator-side relay). Any tickvault-side greeks computation/storage = REJECT without a fresh dated quote. |
+| (d) | **The GDF-derived OHLCV frame family** | Per Quote 3: **1s, 2s, 3s, … 15s (sequential one-by-one) + 30s + 1m, 3m, 5m, 15m** — built from the SubscribeRealtime stream for the 99 symbols. **+1d broker-pulled next pre-market** — FLAGGED: this 1d row is a COORDINATOR ASSUMPTION pending operator veto, NOT quoted; the operator's quote names only 1s–15s + 30s + 1m/3m/5m/15m. Purpose per Quote 3: option-buying slippage reduction analysis (sub-minute fill modeling). No strategy wiring — the §28 indicators/strategies boundary stands. |
+| (e) | **Architecture ownership delegated to Claude** | Per Quote 5: the WAL/ring-buffer/capture architecture decisions are Claude's responsibility to design and verify (within the locked reuse-AS-IS contract below). The design record is `docs/architecture/gdf-1s-subscribe-design.md`. |
+
+### §9.2 What is UNCHANGED by this amendment (the 2026-07-13 lock stands)
+
+- **Default OFF** — `feeds.gdf_enabled = false`, serde default OFF; flipping the default still needs a fresh dated quote.
+- **WAL/ring/spill/DLQ/aggregator reuse AS-IS** — capture-at-receipt, WAL-before-broadcast, DEDUP-idempotent replay (§2 durable floor).
+- **Shared tables, `feed='gdf'`, feed-in-key DEDUP** — NO `gdf_*` parallel data tables.
+- **No GDF REST** (§3 FORBIDDEN row), **no SDK vendoring** (native Rust only), **1-session-per-key `instance-lock-gdf`** fail-closed gate.
+- **No strategy / no orders** — capture + candles + cross-verification only; §28 boundary untouched.
+- The §5 REJECT list, §6 honest envelope (1-second conflated L1, whole-second stamps, plain `ws://` cleartext-key trial flag) all stand; where §2's "Mode A (primary, trial)" wording conflicts with §9.1(a), this amendment wins (house convention: dated amendment > earlier table row).
+
+### §9.3 Trigger
+
+Covered by the §8 trigger list (this file always loads; `SubscribeRealtime` / `docs/gdf-ref/` / the plan file paths already activate it). The design doc `docs/architecture/gdf-1s-subscribe-design.md` joins the reinforcement set.
