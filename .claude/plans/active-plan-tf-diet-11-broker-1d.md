@@ -1,96 +1,89 @@
-# Implementation Plan: Timeframe Diet — 11 Frames + Broker-Pulled 1d
+# Implementation Plan: TF Reshape — Second-Scale Frame Set + Broker-Pulled 1d
 
 **Status:** IN_PROGRESS
-**Date:** 2026-07-20
-**Approved by:** Parthiban (operator) — two dated verbatim quotes below, recorded under the operator's standing pre-authorization ("every plan file any session writes for work I have ordered — treat its Status as APPROVED by me the moment it exists").
+**Date:** 2026-07-21
+**Approved by:** Parthiban (operator) — standing zero-touch pre-authorization (operator-charter governance: a plan for operator-ordered work is APPROVED on existence); frame set per the operator's 2026-07-21 directive quoted below.
 
-## Operator authority (verbatim, typos included — 2026-07-20)
+## Operator frame-set directive (2026-07-21 — verbatim, typos preserved)
 
-> **Quote 1:** "Dude one more newer requirement which is have only one to give minutes sequential dude which is 1, 2, 3, 4, 5 and 15 min and 1 hr 2hr 3h 4h and 1 d alone dude so now fell me dude how does this work can you update this dude okay across our entire codebase and workspace dude okay?  See only next day after the pre market gets started pull the 1d data dud eokay? First fell me what do you udnerstand here dude okay?"
+> "even our tiemframe will be liek thsi ddue whcu is 1 seocnd till 15 seocnd sequantially one by oen and 30 second and 1m, 3m, 5m, 15m alone dude okay?"
 
-> **Quote 2:** "See its simple bro one day shoudl be pulled from its own broker data dude okay? But for these timeframes very simple dude just remove starting 6 till 14 mins dude and just have our current 15m and 1h, 2h, 3h, 4h dude do you understand what Ima kdogn sude"
+## Frame contract (locked for PR #1696)
 
-## The contract
+- **IN — 21 frames:** 1s, 2s, 3s, 4s, 5s, 6s, 7s, 8s, 9s, 10s, 11s, 12s, 13s, 14s, 15s (15 second-frames) + 30s + 1m, 3m, 5m, 15m + 1d (broker-pulled per the 2026-07-20 1d-direct spec).
+- **OUT — write-stop only:** 2m, 4m, 6m–14m, 30m, 1h, 2h, 3h, 4h. Their QuestDB tables and stored history are KEPT: they are NEVER added to `RETIRED_QUESTDB_TABLES` or any boot-DROP union (the standing write-stop invariant).
+- **COORDINATOR ASSUMPTION 1 (pending operator veto — isolated in commit C2):** the replace-reading of "alone": 2m/4m/30m/1h/2h/3h/4h live aggregation retires. A veto costs one revert of C2.
+- **COORDINATOR ASSUMPTION 2 (pending operator veto — isolated in commit C4 + the single 1d membership entry):** 1d is retained as broker-pulled (the operator's quote does not name 1d). A veto costs one revert of C4 plus dropping the 1d membership entry.
+- The 6m–14m retirement (both specs agree) already landed in commit 320be7c4 (the preserved snapshot).
 
-1. **The candle timeframe set becomes EXACTLY 11:** `1m, 2m, 3m, 4m, 5m, 15m, 1h, 2h, 3h, 4h, 1d`.
-   **Removed (10 of today's 21):** `6m, 7m, 8m, 9m, 10m, 11m, 12m, 13m, 14m` (Quote 2: "remove starting 6 till 14 mins") **plus `30m`**.
-   **30m flag (contract-resolved — surfaced for the operator):** Quote 1's exhaustive "alone" list omits 30m and Quote 2 does not name it; the contract's "EXACTLY 11 ... and any other frame not in the 11" resolves 30m as REMOVED. Arithmetic: 21 − 9 (6m..14m) − 1 (30m) = 11.
-2. **1d is NEVER aggregated live.** Each broker's 1d row is pulled from that broker's OWN daily data ("one day shoudl be pulled from its own broker data") — Dhan daily via the granted historical surface, Groww daily via its granted candles surface — each row feed-tagged, on the NEXT trading day after pre-market starts (cadence-scheduled ~09:00–09:15 IST, before open), DEDUP-idempotent, bounded retries, fail-soft + loud on a missing broker day.
-3. **Executor defaults (flagged for the operator in the PR):**
-   - (a) Stored rows for retired timeframes are KEPT as history: writing stops; the retired tables (candles_6m..candles_14m, candles_30m) leave the DDL/retention name lists; they are NEVER added to RETIRED_QUESTDB_TABLES (that list is DROPPED at boot — keep-as-history forbids it).
-   - (b) Intraday frames anchor at the 09:15 IST session open; ragged final buckets are allowed and documented honestly (session 09:15–15:30 IST means the 2h final bucket is 15:15–15:30, 3h final 15:15–15:30, 4h final 13:15–15:30 — the existing session-truncated-end behavior).
-   - (c) Adversarial-verifier matrix built in from the start: last-TRADING-day (never calendar-yesterday) via the trading calendar across weekends/holidays; broker-vs-broker daily disagreement kept as TWO feed-tagged rows (DEDUP key `(ts, security_id, segment, feed)`), never merged or reconciled into one; no fabrication of a 1d row from live intraday sums when a broker day is missing (D1 is structurally absent from the live fold loop — the broker-pull lane is the ONLY candles_1d writer); removal completeness enforced by a build-failing source-scan ratchet.
+## Execution reality (honest envelope)
 
-## Plan Items
+- Second-frames source from the **GDF 1s feed**, which is being designed/built in a parallel session (that session specs the interface). They land STRUCTURALLY in this PR but are FEED-GATED: **zero rows flow until the GDF 1s feed goes live.** The PR body states this plainly.
+- Minute-frames 1m/3m/5m/15m keep working TODAY from the REST cadence (the 1m source is unchanged by this PR).
+- 1d fills from the broker daily pull, not from live aggregation.
 
-- [ ] Item 1 — Canonical enum shrink: TfIndex 21 → 11 + INTRADAY_TFS + seal-spill format-version bump
-  - Files: crates/trading/src/candles/tf_index.rs, crates/trading/src/candles/seal_ring.rs, crates/storage/src/seal_spill.rs
-  - Tests: test_tf_count_is_eleven, test_tf_ordinal_table_pins_the_eleven, test_intraday_tfs_is_all_minus_d1, test_seal_spill_format_bump_refuses_old_version_records
-  - Progress 2026-07-21 (M2-alpha, commit A): the 6m-14m band is retired — TF_COUNT 21 → 12, ordinals repacked, all pins/tests updated (tf_index.rs, shadow_persistence.rs, spot_bar_store.rs, shadow_seal_columns.rs, partition_manager.rs, tf_consistency_boot.rs). 30m retirement (commit B) next; INTRADAY_TFS + the seal-spill format-version bump remain open (second worker).
-- [ ] Item 2 — Live fold iterates INTRADAY_TFS only (D1 never live-folded)
-  - Files: crates/app/src/rest_candle_fold.rs
-  - Tests: test_fold_bar_iterates_intraday_only, test_d1_never_produced_by_live_fold, test_ragged_final_buckets_seal_at_session_close
-- [ ] Item 3 — Storage DDL / retention / config / metrics on the 11-set
-  - Files: crates/storage/src/shadow_persistence.rs, crates/storage/src/shadow_candle_writer.rs, crates/storage/src/partition_manager.rs, crates/common/src/config.rs, config/base.toml, crates/app/src/metrics_catalog.rs, crates/common/tests/tf_symmetry_guard.rs
-  - Tests: test_candle_table_names_are_the_eleven, test_retired_candle_tables_not_in_drop_list, test_timeframes_config_default_is_the_eleven, tf_symmetry_guard eleven-pin
-- [ ] Item 4 — 1d broker-pull cadence lane (per-feed, pre-market, last-trading-day)
-  - Files: crates/core/src/cadence/executor.rs, crates/core/src/cadence/runner.rs, crates/app/src/dhan_cadence_executor.rs, crates/app/src/groww_cadence_executor.rs, crates/app/src/cadence_boot.rs, crates/storage/src/daily_1d_persistence.rs, crates/common/src/config.rs, crates/common/src/constants.rs, crates/common/src/error_code.rs
-  - Tests: test_last_trading_day_over_weekend_and_holiday, test_daily_rows_feed_tagged_both_brokers_coexist, test_missing_broker_day_writes_nothing, test_daily_pull_dedup_idempotent_on_rerun, test_daily_pull_bounded_retry_and_cutoff
-- [ ] Item 5 — Removal-completeness source-scan ratchet
-  - Files: crates/common/tests/tf_diet_guard.rs
-  - Tests: no_retired_tf_labels_in_production_source, no_retired_candle_table_names_in_production_source, rule_and_plan_pin_the_eleven
-- [ ] Item 6 — Rule-file dated grants + runbook + orphan-flip + docs sweep
-  - Files: .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, docs/error-runbooks/daily-1d-error-codes.md, crates/common/tests/dhan_api_coverage.rs, CLAUDE.md
-  - Tests: error_code_rule_file_crossref covers DAILY1D-01 and DAILY1D-02, charts-historical constant test flipped orphan-to-live
+## Plan Items (commit ladder C1–C5; push per commit; drive PR #1696 to READY, never merge — the operator merges post-freeze)
+
+- [x] C1 — re-scope this plan to the new frame contract (docs-only)
+  - Files: .claude/plans/active-plan-tf-diet-11-broker-1d.md
+  - Tests: n/a (docs-only)
+
+- [ ] C2 — retirement widening: write-stop 2m, 4m, 30m, 1h, 2h, 3h, 4h; minute-side membership becomes 1m, 3m, 5m, 15m, 1d (TF_COUNT 12 → 5 at this commit)
+  - Files: crates/trading/src/candles/tf_index.rs, crates/trading/src/in_mem/spot_bar_store.rs, crates/app/src/tf_consistency_boot.rs, crates/storage/src/partition_manager.rs, crates/storage/src/shadow_persistence.rs, crates/storage/src/shadow_seal_columns.rs, crates/storage/tests/partition_retention_coverage_guard.rs
+  - Tests: partition_retention_coverage_guard bare-literal count re-pin (12 → 5), tf_index membership unit tests, scoped trading/storage/app suites green
+
+- [ ] C3 — second-scale structural: TfIndex gains 1s–15s + 30s variants; bucket math generalized to second-scale; candle DDL + seal/spill format extended; every second-frame FEED-GATED (zero rows until the GDF 1s feed is live) (TF_COUNT 5 → 21)
+  - Files: crates/trading/src/candles/tf_index.rs, the candle aggregator/seal path under crates/trading/src/candles/, crates/storage persistence + DDL modules, crates/app/src/candle_ddl_boot.rs
+  - Tests: second-scale bucket-boundary unit tests + proptest, TF_COUNT/membership ratchets, DDL guard updates, a feed-gate zero-row test
+
+- [ ] C4 — broker-pulled 1d per the 2026-07-20 spec (assumption-isolated)
+  - Files: the 1d pull modules in crates/app (cadence lane) + crates/storage persistence
+  - Tests: 1d pull unit/integration tests + dedup-key guard coverage
+
+- [ ] C5 — ratchet/guard/string sweep + PR body: residual "21 TF" prose (rest_candle_fold.rs, metrics_catalog.rs, subsystem_memory.rs, lib.rs, main.rs "all 21 timeframes" string, candle_ddl_boot.rs, d2_stage2_hoist_guard.rs, ensure_ddl_boot_wiring_guard.rs); PR body rewritten with the full gate evidence + the feed-gated zero-rows statement; flip #1696 to READY
+  - Files: the prose/guard files above; the PR body
+  - Tests: full scoped suites re-run with pasted evidence; guard self-tests
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Monday pre-market pull | 1d rows for Friday (last trading day), one per feed |
-| 2 | Holiday midweek, pull next morning | 1d rows for the last trading day; no holiday row fabricated |
-| 3 | Dhan serves daily, Groww errors/empty | Dhan row written; Groww failure counted + logged loud (DAILY1D-01); nothing fabricated |
-| 4 | Brokers disagree on daily OHLC | TWO rows, feed='dhan' and feed='groww', both kept — never merged |
-| 5 | Pull re-run same morning | DEDUP upsert — idempotent, zero duplicate rows |
-| 6 | Seal-spill file from the 21-TF era | Refused by the format-version bump, quarantined loudly; catchup refold from spot_1m_rest recovers |
-| 7 | Live tick at 15:20 IST | Folds into the 10 intraday frames only; a live candles_1d write is impossible |
+| 1 | GDF 1s feed not yet live (today) | Second-frame tables exist with ZERO rows; minute-frames 1m/3m/5m/15m fill from REST; no errors, no pages |
+| 2 | Operator vetoes the replace-reading | Revert C2 alone; retired minute frames resume aggregation |
+| 3 | Operator vetoes 1d retention | Revert C4 + drop the 1d membership entry |
+| 4 | Boot on the existing prod DB | Retired tables untouched (write-stop); new second-frame DDL created via the CREATE/ALTER IF NOT EXISTS self-heal |
 
 ## Design
 
-The canonical enum `TfIndex` (crates/trading/src/candles/tf_index.rs) shrinks from 21 variants to 11 with re-packed ordinals: M1=0, M2=1, M3=2, M4=3, M5=4, M15=5, H1=6, H2=7, H3=8, H4=9, D1=10; TF_COUNT=11. The ordinal==index invariant stays (it backs the fold-state arrays and channel arrays); the reshuffle is the documented SEMVER-break the enum header already names, absorbed in-repo in the same PR. A NEW const `INTRADAY_TFS: [TfIndex; 10]` (ALL minus D1) becomes the ONLY set the live aggregator iterates: `rest_candle_fold.rs` fold/seal/force-seal/refold/catchup paths switch from `TfIndex::ALL` to `INTRADAY_TFS`, making a live-summed 1d structurally impossible. `TfIndex::ALL` (11) remains the storage/DDL/retention/metrics iteration set. Because the seal-spill disk format encodes tf as a raw u8 ordinal and old ordinals 0–20 overlap the new 0–10 with different meanings (old 5 = 6m would decode as new 15m), the spill format version is BUMPED: old-version records are refused and quarantined loudly, never silently re-mapped — the durable truth is spot_1m_rest and the existing catchup refold (catchup_days=35) rebuilds intraday candles from it. The 1d lane extends the cadence machinery: `CadenceExecutor` (crates/core/src/cadence/executor.rs) gains `fetch_daily`, implemented by both `dhan_cadence_executor.rs` (POST /v2/charts/historical, the existing constant re-entering live use; SIDs 13/25/51) and `groww_cadence_executor.rs` (GET v1/historical/candles with a new GROWW_CANDLE_INTERVAL_1DAY="1day" token; the 4 Groww spot indices incl. the runtime-resolved VIX); a new `run_daily_pull_loop` in runner.rs (mirroring run_expiry_resolution_loop: pre-market window, AbortOnDrop, bounded retries until success or the 15:30 cutoff) computes the last N=5 TRADING days via the trading calendar, pulls each broker's own daily bars for that window (self-heals missed days and supplies prev-day closes for the pct columns), stamps ts = 09:15 IST session open of each trading day, and upserts into candles_1d via a new daily-1d writer in crates/storage with the existing DEDUP key (ts, security_id, segment, feed). New config `[daily_1d_pull]` is serde-default-OFF with base.toml enabled=true (config flip pre-authorized), gated on the existing [cadence] lanes.
+TfIndex is the single frame-membership authority (TF_COUNT + the frame enum + bucket math). C2 shrinks live minute membership to the surviving four + 1d using the exact retirement machinery proven in commit 320be7c4 (write-stop only: aggregation and writes cease; tables, history, and reads are untouched). C3 generalizes the bucket index from minute-scale to second-scale (bucket width expressed in seconds; 1m stays a 60-second bucket), adds the 16 second-frames to the enum, extends the candle DDL and seal/spill column sets, and wraps every second-frame write behind a feed-gate keyed on the GDF 1s feed's presence so the structure ships dark. C4 wires the broker daily pull as the sole 1d source. C5 sweeps the numeric ratchets and prose so no guard still pins the old 21/12 counts.
 
 ## Edge Cases
 
-Weekend/holiday: the pull targets the last TRADING day (calendar-driven), so Monday pulls Friday and post-holiday mornings pull the pre-holiday session; a 5-trading-day window makes a missed morning self-heal on the next run. Ragged buckets: the 6h15m session leaves final buckets of 15m (2h/3h) and 2h15m (4h) — kept, sealed at session close by the existing session-truncated-end logic, documented. Groww "1day" interval token is UNVERIFIED-LIVE: first live pull is the probe; empty/reject is counted + logged loud, never fabricated. VIX groww_symbol may be unresolved on a Groww-disabled boot: skipped + counted, core indices never blocked. Old spill records after the format bump: refused + quarantined (scenario 6). Retired-table history stays readable in QuestDB (tables freeze on disk; no DDL touches them). Catchup refold spans up to 35 days and must iterate INTRADAY_TFS only, or it would re-fabricate 1d — pinned by test. Boot after 09:15: the daily loop still runs immediately (late but same-day); boot before 09:00 waits for the window.
+- Second-scale bucket boundaries: bucket(ts) for 1s..15s/30s must floor on second boundaries; the 09:15:00 IST open lands in the first bucket of each frame; partial buckets at open/close seal per the existing seal law.
+- 30s vs 30m: 30m retires while 30s arrives — membership tables and prose must never conflate them.
+- The bare-literal count pin in partition_retention_coverage_guard.rs (~lines 102/119) is invisible to the `; N]` sweep — every count re-cut includes it (12 → 5 at C2, 5 → 21 at C3).
+- Retired-table reads (dashboards, backfills) keep working — write-stop only.
+- Feed-gate OFF is a NORMAL state (zero rows, no error, no page), not a degrade.
 
 ## Failure Modes
 
-Broker daily endpoint down: bounded retries inside the pre-market loop, then hourly until the 15:30 cutoff; every failure is a coded structured log DAILY1D-01 (log-sink-only per the Dhan noise-lock 4-item set — NO new Telegram family) with feed + day named; the day self-heals via the 5-day window tomorrow. Partial broker response (some SIDs missing): present rows written, missing SIDs counted + logged; never inferred. QuestDB write failure: the existing writer error path (coded error, bounded retry, never a crash). Row-level anomaly (zero/negative OHLC from a broker): row skipped + DAILY1D-02 logged, never written. Seal-spill version mismatch: refuse + quarantine loudly (never silent decode); durable truth refolds. Config junk in [daily_1d_pull]: serde default OFF = fail-safe; an absent section disables the lane.
+- The GDF 1s feed slips or never launches → second-frames stay structurally present with zero rows; harmless by design; no alarm (stated in the PR body).
+- The operator vetoes assumption 1 or 2 → single-commit reverts (C2 / C4) by construction.
+- DDL drift on an existing DB → the boot DDL self-heal (CREATE/ALTER IF NOT EXISTS) creates the new second-frame tables; retired tables are never dropped.
+- A missed count pin (a guard still expecting the old TF_COUNT) → the build-failing ratchet catches it at the C2/C3 gates — that is the ratchet working; the pin is fixed in the same commit.
 
 ## Test Plan
 
-Scoped per the testing-scope rule: cargo test -p tickvault-trading, -p tickvault-app, -p tickvault-storage, -p tickvault-core; crates/common edits escalate to workspace. Every Plan Item lists its named tests above; ratchets added: the tf_index 11-pin, the tf_symmetry_guard 11-set cross-surface pin, tf_diet_guard (source-scan banning retired labels/table names in crates/**/src), the partition_retention_coverage_guard update, the seal-spill format-bump refusal test, and the dhan_api_coverage orphan-to-live flip. The 1d lane is tested against the adversarial-verifier matrix: last-trading-day weekend/holiday fixtures, two-feed coexistence, missing-day non-fabrication, DEDUP idempotence, bounded retry/cutoff. Hostile-reviewer + refuter rounds run to 2 consecutive clean rounds before ready-flip; every push is routed to the external adversarial verifier session; merge additionally gates on its 2-consecutive-clean verdict on the exact final head plus All Green.
+Per-crate scoped suites (trading, storage, app) at each commit; second-scale bucket-boundary unit tests plus a proptest over arbitrary in-session timestamps at C3; ratchet re-pins (TF_COUNT, membership, the bare-literal guard) in the same commit as each count change; a feed-gate test asserting zero second-frame writes while the gate is off; full evidence (test counts, fmt, clippy) pasted into the PR body at C5.
 
 ## Rollback
 
-One revert of the PR restores the 21-TF world: the enum, const lists, DDL name lists, and fold loop are all in-repo constants with no data migration. Stored data is unaffected in both directions — retired tables were never dropped (keep-as-history), and candles_1d rows written by the lane are plain DEDUP-keyed rows old code ignores. Seal-spill: after a revert, old code refuses NEW-version spill files the same loud way — spills are a transient absorption tier, and the catchup refold from spot_1m_rest recovers intraday state, so the refusal costs nothing durable. Config rollback alone ([daily_1d_pull] removed or enabled=false) disables the 1d lane without a code revert.
+Each commit is independently revertable (the assumption isolation is designed for exactly that). Write-stop-only retirement means no data is lost in either direction — re-enabling a frame is a membership re-add, and retired history was never dropped. PR #1696 stays draft until READY; nothing merges before the operator's own post-freeze merge.
 
 ## Observability
 
-Counters: tv_daily1d_pull_total{feed,outcome} and tv_daily1d_rows_written_total{feed} land in metrics_catalog. Every failure path is a coded structured log carrying code = DAILY1D-01 (pull/day-level degrade) or DAILY1D-02 (row-level anomaly), both LOG-SINK-ONLY — the Dhan noise-lock 4-item Telegram set is untouched and no new NotificationEvent family is added. Runbook: docs/error-runbooks/daily-1d-error-codes.md (crossref-test mentions both codes; runbook_path() points at it). Boot logs one line naming the 11-frame set and the daily-lane gate state. The RAM/table savings (21 → 11 live tables + fold arrays) are quantified in the PR body.
+Existing tv_* candle metrics keep reporting for surviving frames; the feed-gate state (GDF 1s live or not) is logged once at boot; no new Telegram surface (the noise-lock is unchanged); retired frames simply stop appearing in write-path logs while their tables remain queryable.
 
-## Per-Item Guarantee Matrix
+## Per-item guarantee matrix
 
-Every plan item above carries the 15-row + 7-row guarantee matrix BY CROSS-REFERENCE to `.claude/rules/project/per-wave-guarantee-matrix.md` (the canonical matrix file), per that rule's cross-reference clause. Plan-Wide Proof Matrix — the load-bearing rows made concrete for this change:
-
-| Demand | Mechanical proof for this plan |
-|---|---|
-| 100% code coverage | ratcheted per-crate floors (quality/crate-coverage-thresholds.toml) stay green; every new pub fn lands with a matching test (pub-fn test guard) |
-| 100% testing coverage | per-item Tests lines above; scoped suites for the five touched crates |
-| 100% code checks | the pre-commit + pre-push gate batteries; tf_diet_guard + tf_symmetry_guard + tf_index ratchets added |
-| 100% monitoring/logging/alerting | DAILY1D codes carry code= fields; counters in metrics_catalog; LOG-SINK-ONLY per the noise-lock (no new Telegram family) |
-| Zero ticks lost | the tick hot path is untouched; the seal chain keeps ring, spill, DLQ; the spill format bump refuses stale records LOUDLY and the durable truth (spot_1m_rest + catchup refold) recovers — zero durable loss inside the envelope |
-| O(1) latency | the fold loop iterates a const [TfIndex; 10] — the same O(1)-per-bar shape, strictly less work than the 21-array |
-| Uniqueness + dedup | candles_1d DEDUP UPSERT KEYS (ts, security_id, segment, feed) — composite key + feed-in-key preserved |
-
-**Honest 100% claim:** 100% inside the tested envelope, with ratcheted regression coverage: the 11-TF set pinned by build-failing tests (tf_index pin + tf_symmetry_guard + tf_diet_guard); the 1d lane DEDUP-idempotent with last-trading-day tests across weekend/holiday fixtures; the seal-spill format bump refuses stale-era records loudly (quarantine, never silent decode); the 200,000-seal ring to NDJSON spill to DLQ chain unchanged. NOT claimed: live Groww "1day" interval serving (UNVERIFIED-LIVE — the first live pull is the probe, fail-soft + loud); Dhan daily serving behavior after its orphan period (the first live pull measures it).
+Cross-reference: every C-item above carries the 15-row + 7-row guarantee matrices of `.claude/rules/project/per-wave-guarantee-matrix.md` by reference, enforced mechanically by `per-item-guarantee-check.sh`.
