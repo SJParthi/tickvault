@@ -21,6 +21,8 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+> **UPGRADE 2026-07-21 (Quote 11): instance lock → m8g.large** (latest-gen Graviton4, 2 vCPU / 8 GiB fixed-performance, $0.06416/hr on-demand ap-south-1 — pricing-API-verified 2026-07-21, re-verify at execution). Honest all-in: **≈ ₹2,420/mo @ 270 hrs / ≈ ₹1,815/mo @ ~176 hrs** incl 18% GST (EIP + 30 GB EBS + S3 + SNS adders unchanged); r8g.large alternative (16 GiB, $0.08258/hr) ≈ ₹2,918 / ₹2,140; rejected 1-vCPU mediums m8g.medium ≈ ₹1,551/₹1,248 · r8g.medium ≈ ₹1,800/₹1,411. Quote 9's sub-₹1,000 hard target is SUPERSEDED for the instance line by Quote 11 (GDF RAM-first sizing + the 2-day t4g `InsufficientInstanceCapacity` drought outrank it; the 30 GB EBS acceptance stands). The $25 kill ceiling leaves ~$0.9/mo headroom at m8g.large 270 hrs (r8g.large exceeds it) — the lockstep triple raise (`budget.tf limit_amount` + `budget-guards.tf` BUDGET_KILL_USD + `budget_digest.rs` BUDGET_USD, e.g. → $30) is a FLAGGED operator follow-up, deliberately NOT flipped in the prep PR. Full record: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 11 + §7.
+
 ## OPERATOR RULING 2026-07-19 — sub-₹1,000/month hard budget target (30 GB accepted; grow CANCELLED)
 
 **The verbatim operator demand (2026-07-19 — preserve EXACTLY, typos included):**
