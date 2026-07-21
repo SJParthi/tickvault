@@ -49,6 +49,7 @@ use super::expiry::{
     policy_for, resolve_policy_expiry,
 };
 use super::gate::{DhanGates, GateVerdict};
+use super::history_repull;
 use super::ladder::{
     CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY, DHAN_SHAPE_MAX_STEP, DhanRung0ReentryCap,
     GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder, StreakShift,
@@ -1722,18 +1723,52 @@ where
             }
         }
     }
-    // ITEM 3 (E6): history_repull_enabled consumer - record-only
-    // history-repair intent for cross-filled lanes (the item-5 repull
-    // executor pends; this is the wiring seam).
+    // ITEM 5 (E6): history_repull_enabled consumer - fire-and-forget history
+    // re-pull for cross-filled lanes (the T+30s/T+50s ladder lives in
+    // history_repull::run_history_repull; detached, never blocks the
+    // scheduler, ratcheted by cadence_history_repull_isolation_guard.rs).
     if !deps.dry_run {
         let dhan_cross = cycle.dhan.resolution == Some("cross_fill");
         let groww_cross = cycle.groww.resolution == Some("cross_fill");
         if deps.config.history_repull_enabled {
+            let repull_elapsed_ms = clock.ist_ms_of_day().saturating_sub(slots.boundary_ms);
             if cycle.dhan.enabled && dhan_cross {
-                spawn_history_repull(Feed::Dhan, cycle.dhan.asm.cycle_minute_ist);
+                spawn_history_repull(history_repull::HistoryRepullCtx {
+                    feed: Feed::Dhan,
+                    cycle_minute_ist: cycle.dhan.asm.cycle_minute_ist,
+                    executor: Arc::clone(&deps.dhan_executor),
+                    gates: Some(Arc::clone(gates)),
+                    chain_expiries: repull_chain_expiries(
+                        deps.expiry_resolver.as_ref(),
+                        Feed::Dhan,
+                        clock.ist_date(),
+                    ),
+                    anchor: history_repull::RepullAnchor {
+                        spawn_mono_ms: clock.monotonic_ms(),
+                        spawn_epoch_ms: clock.epoch_ms(),
+                        spawn_instant: tokio::time::Instant::now(),
+                    },
+                    elapsed_in_cycle_ms: repull_elapsed_ms,
+                });
             }
             if cycle.groww.enabled && groww_cross {
-                spawn_history_repull(Feed::Groww, cycle.groww.asm.cycle_minute_ist);
+                spawn_history_repull(history_repull::HistoryRepullCtx {
+                    feed: Feed::Groww,
+                    cycle_minute_ist: cycle.groww.asm.cycle_minute_ist,
+                    executor: Arc::clone(&deps.groww_executor),
+                    gates: None,
+                    chain_expiries: repull_chain_expiries(
+                        deps.expiry_resolver.as_ref(),
+                        Feed::Groww,
+                        clock.ist_date(),
+                    ),
+                    anchor: history_repull::RepullAnchor {
+                        spawn_mono_ms: clock.monotonic_ms(),
+                        spawn_epoch_ms: clock.epoch_ms(),
+                        spawn_instant: tokio::time::Instant::now(),
+                    },
+                    elapsed_in_cycle_ms: repull_elapsed_ms,
+                });
             }
         }
     }
@@ -3404,16 +3439,28 @@ fn resolution_token(cross_filled: bool, late_retry_attempts: u32) -> &'static st
     }
 }
 
-/// ITEM 3 (E6): record-only history-repair intent for a cross-filled lane -
-/// the item-5 repull executor consumes this seam later; today it logs the
-/// intent on a detached task (never blocks the scheduler).
-fn spawn_history_repull(feed: Feed, cycle_minute_ist: u32) {
-    tokio::spawn(async move {
-        info!(
-            lane = feed.as_str(),
-            cycle_minute_ist, "cadence: history repull intent recorded (cross-filled lane)"
-        );
-    });
+/// ITEM 5: the real fire-and-forget history re-pull detachment point for a
+/// cross-filled lane - spawns `history_repull::run_history_repull` on a
+/// detached task (never blocks the scheduler; the module's isolation from
+/// assembly/decision/audit is ratcheted by
+/// `cadence_history_repull_isolation_guard.rs`).
+fn spawn_history_repull<E: CadenceExecutor + 'static>(ctx: history_repull::HistoryRepullCtx<E>) {
+    tokio::spawn(history_repull::run_history_repull(ctx));
+}
+
+/// ITEM 5: resolve today's day-locked expiry per chain underlying for a
+/// history re-pull - FRESH from the injected resolver at spawn time (the
+/// scheduler NEVER guesses; `None` = unresolved, the re-pull skips that
+/// chain leg).
+fn repull_chain_expiries(
+    resolver: &dyn ExpiryResolver,
+    feed: Feed,
+    ist_date: NaiveDate,
+) -> Vec<(ChainUnderlying, Option<u32>)> {
+    ChainUnderlying::ALL
+        .iter()
+        .map(|u| (*u, resolver.resolved_expiry(feed, *u, ist_date)))
+        .collect()
 }
 
 /// Cutoff handling: one final finalize attempt, else HONEST-SKIP with
@@ -3657,7 +3704,7 @@ mod tests {
     #[test]
     fn ratchet_runner_spawns_history_repull_for_both_lanes() {
         let src = include_str!("runner.rs");
-        let spawn = ["spawn_history_repull", "(Feed::"].concat();
+        let spawn = ["spawn_history_repull", "("].concat();
         assert_eq!(
             src.matches(spawn.as_str()).count(),
             2,
