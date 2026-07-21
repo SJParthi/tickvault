@@ -946,3 +946,30 @@ contract: at most one emit per (lane, leg, cycle minute).
    the `gate_skipped` counter before suspecting the ladder itself.
 4. Both-brokers-empty degrades loudly and fabricates nothing — verify the
    other broker's leg health before suspecting the hedge.
+
+## 2026-07-21 — digest/consumer observability lines (incident note)
+
+Tue 2026-07-21 (binary c52f25ab): 40 cross-fill producer events fired 14:51–15:30 IST,
+yet the digest chain produced ZERO log lines all day, so the 15:47 IST digest read as
+never-fired. A full code-forensics pass proved the chain CORRECT (IST timer math, spawn
+ordering, always-notify contract), and a credentialed CloudWatch run then CONFIRMED the
+digest actually fired AND dispatched: tv_telegram_dispatched_total{severity="info",
+coalesced="false"} moved +1 in the 10:16:31→10:17:31Z scrape window (= the 15:47 IST
+slot), the notifier initialized ACTIVE at boot, zero TELEGRAM-01 lines, zero drops.
+The entire hunt existed because the SUCCESS path logged nothing.
+
+This PR adds three INFO lines (no logic change):
+- consumer start — once per boot, when the cross-fill audit consumer begins draining;
+- digest armed — once per day-cycle, with wait_secs to the 15:47 IST target;
+- digest fired — on trading days, with the day's count, logged BEFORE notify.
+
+Healthy-trading-day law: 1 consumer-start + 1 digest-armed (per cycle) + 1 digest-fired
+line. ZERO such lines now means a REAL no-fire (spawn/panic/timer). A fired line with no
+Telegram received means the drop is DOWNSTREAM of the app dispatch — check
+tv_telegram_dispatched_total / tv_telegram_dropped_total{reason="noop_mode"}, the four
+boot WARNs ending "— using no-op mode", TELEGRAM-01 lines, and finally chat-side
+(chat-id value, Telegram client) — the 2026-07-21 incident landed in that last class.
+
+Named follow-up (optional, low priority — the drop path was NOT the culprit here): a
+first-drop WARN in crates/core/src/notification/service.rs when NoOp mode swallows its
+first event; deliberately NOT in this PR (second crate).

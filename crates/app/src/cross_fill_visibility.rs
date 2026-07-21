@@ -100,6 +100,7 @@ pub fn spawn_cross_fill_audit_consumer(questdb_cfg: QuestDbConfig) {
     }
     tokio::spawn(async move {
         let mut writer = CrossFillAuditWriter::new(&questdb_cfg);
+        info!("cross-fill audit consumer started — draining cross-fill audit events to QuestDB");
         while let Some(ev) = rx.recv().await {
             let row = row_from_event(&ev);
             if let Err(err) = writer.append_row(&row) {
@@ -146,6 +147,10 @@ pub fn spawn_cross_fill_digest(
         loop {
             let secs = ist_now().num_seconds_from_midnight();
             let wait = secs_until_next_trigger(secs, CROSS_FILL_DIGEST_TRIGGER_SECS_OF_DAY_IST);
+            info!(
+                wait_secs = wait,
+                "cross-fill daily digest armed — fires at 15:47 IST"
+            );
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             let date = ist_now().date_naive();
             if !calendar.is_trading_day(date) {
@@ -335,6 +340,10 @@ async fn run_cross_fill_digest_once(
     };
     match events {
         Some(events) => {
+            info!(
+                count = events.len(),
+                "cross-fill daily digest fired — sending the daily digest notification"
+            );
             notifier.notify(NotificationEvent::CrossFillDailyDigest {
                 trading_date_ist: date_ymd,
                 count: events.len() as i64,
