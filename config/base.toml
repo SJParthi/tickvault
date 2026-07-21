@@ -667,7 +667,7 @@ mark_channel_capacity = 8192
 # disabled (fail-safe).
 # ===========================================================================
 [dhan_order_push]
-enabled = false
+enabled = true
 
 # ===========================================================================
 # Full-fidelity order/position PUSH-event capture (ORDER-EVT-01 —
@@ -766,7 +766,7 @@ paper_enabled = false
 max_order_quantity = 0
 # order_push_enabled: receive-only order/position PUSH channel (Stage A,
 # 2026-07-16) — paper-mode observability only; places no order.
-order_push_enabled = false
+order_push_enabled = true
 
 # ===========================================================================
 # 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via

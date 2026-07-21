@@ -205,3 +205,15 @@ Always loaded. Reinforced on any session editing:
   `rest_canary`, `fast_boot_validation`, `run_order_update_connection`, or
   `DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS`
 (2026-07-16, operator directive events 38df2073 + 157f7cd0) The paper-mode, receive-only order-update re-spawn is AUTHORIZED (config `[dhan_order_push] enabled = false`, default OFF). The channel is Telegram-SILENT (`notifier: None`) — the 4-item Dhan Telegram family is UNCHANGED and the 2 deleted CloudWatch alarms STAY deleted. Observability is coded logs + counters (`tv_dhan_order_updates_total`, `tv_dhan_order_push_respawn_total`) + ws_event_audit + order_audit rows only. Live order fire remains locked.
+
+### 2026-07-21 — [dhan_order_push] PAPER ACTIVATION prep (DRAFT PR; operator-go pending)
+
+Prep lane (coordinator-routed, 2026-07-21): `config/base.toml [dhan_order_push]
+enabled` flips to `true` so the authorized (2026-07-16, events 38df2073 + 157f7cd0)
+receive-only paper order-update re-spawn from `dhan_rest_stack` begins capturing.
+The channel stays Telegram-SILENT (`notifier: None`) — the 4-item Dhan alert family is
+UNCHANGED and the 2 deleted CloudWatch alarms STAY deleted; observability remains coded
+logs + `tv_dhan_order_updates_total` / `tv_dhan_order_push_respawn_total` +
+ws_event_audit + order_audit mode='paper' rows. Serde default stays OFF; live order
+fire remains locked. The operator's go for the merge lands here verbatim:
+<OPERATOR-GO-HERE>

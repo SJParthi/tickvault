@@ -117,8 +117,9 @@ fn test_gate1_base_toml_groww_orders_keys_all_false() {
         "smart_orders_read",
         "smart_orders_write",
         "paper_enabled",
-        // Order-push Stage A (2026-07-16): the push channel ships dark.
-        "order_push_enabled",
+            // order_push_enabled REMOVED from this dark-ship loop 2026-07-21: the paper
+            // activation PR (operator authorization 2026-07-16, events 38df2073 + 157f7cd0)
+            // flips it true in base.toml; the serde-default-off pin above still stands.
     ] {
         let false_line = format!("{key} = false");
         let true_line = format!("{key} = true");

@@ -561,3 +561,15 @@ Covered by the §6 trigger list (the `charts/intraday`, `optionchain`,
 (2026-07-16, operator directive events 38df2073 + 157f7cd0) SUPERSEDED wording: "on the existing feed connection (no new connection)" predates the 2026-07-15 Groww live-feed retirement. There is no live Groww feed connection anymore, so the authorized order/position/trade PUSH channel opens ONE NEW dedicated NATS-over-WS connection (`wss://socket-api.groww.in`, order/position/trade events only). Config `order_push_enabled`, module `oms/groww/push/`, codes GROWW-PUSH-01..04.
 
 (2026-07-16) RE-KEPT as live-feed-AUTH class for the order-push channel — `POST api.groww.in/v1/api/apex/v1/socket/token/create/` mints the per-session NATS user JWT the order channel needs (operator: "use the socket-token the Groww channel needs"). The ACCESS-token minter lock (groww-shared-token-minter-2026-07-02.md) is UNTOUCHED: the access token stays SSM read-only, never minted by TickVault.
+
+### §10 addendum — 2026-07-21: order-push PAPER ACTIVATION prep (DRAFT PR; operator-go pending)
+
+Prep lane (coordinator-routed, 2026-07-21): the two order-push gates flip to `true` in
+`config/base.toml` (`[groww_orders] order_push_enabled` + `[dhan_order_push] enabled`),
+activating the §10 KEEP-GATED order/position/trade PUSH channels in receive-only PAPER
+mode (operator 2026-07-16, events 38df2073 + 157f7cd0). The Groww per-session
+socket-token mint stays the sanctioned live-feed-AUTH class; the ACCESS-token minter
+lock is untouched (SSM read-only, never minted). Order MUTATIONS stay hard-locked
+(Gates 1–4; `GROWW_ORDER_LIVE_FIRE` false); the read-only GET areas stay OFF — this PR
+flips nothing else. The operator's go for the merge lands here verbatim:
+<OPERATOR-GO-HERE>
