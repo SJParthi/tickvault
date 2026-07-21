@@ -1,8 +1,8 @@
 # Implementation Plan: GDF (Global Data Feeds) as feed #3 — trial-ready before the key arrives
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-07-13
-**Approved by:** pending (Parthiban — operator quote 2026-07-13 recorded in
+**Approved by:** Parthiban (operator) — 2026-07-21 verbatim quotes in the amendment above
 `gdf-third-feed-scope-2026-07-13.md` §0 authorizes the DESIGN; the operator has NOT yet
 approved this plan — implementation PRs B–G may only start once this file's Status flips
 to APPROVED per plan-enforcement.md / the design-first wall)
@@ -17,6 +17,33 @@ reconciled master claims table in `docs/gdf-ref/README.md`) / **[U-n]**
 built as if Verified.
 
 ---
+
+## 2026-07-21 Operator Amendment — SubscribeRealtime 99-symbol 1-second scope (Status → APPROVED)
+
+> **Operator-locked 2026-07-21 (verbatim quotes below, typos included). This amendment
+> APPROVES the plan (Status DRAFT → APPROVED) under the NARROWED scope stated here; where
+> the sections below conflict with this amendment, this amendment wins.**
+
+**Quote 1 (scope):**
+> "nifty 50 spot and its current expiry oprions call and put 49 + 49 = 98 dude and even each and every day the current expirty and its strikes could change dude okay? and greeks we will fetch it from brutex right dude?"
+
+**Quote 2 (build order + instance question):**
+> "first build it entirley for this we might need bigger instance ram right dude okay?"
+
+**Quote 3 (daily instrument rebuild):**
+> "yes每 day morning it should rebuild the instrument and its subscription dude okay?"
+
+**Quote 4 (RAM-first sizing):**
+> "yes ram first dude okay?"
+
+### Binding scope effects (supersede the matching rows below)
+
+1. **Capture mode:** **Mode B (SubscribeRealtime, per-symbol) is the IMPLEMENTATION TARGET** — `feeds.gdf.mode = "subscribe"` becomes the config default for the trial. The Mode A firehose (StreamAllSymbols) is DEFERRED — kept as documented protocol reference only; no firehose NDJSON segment store is built in this scope.
+2. **Subscription set: exactly 99 symbols** — NIFTY 50 spot (1) + the CURRENT-expiry NIFTY option chain 49 CE + 49 PE (98). The 49+49 strike window is selected around ATM from the daily instrument rebuild.
+3. **Daily morning instrument rebuild (in scope):** every trading morning the GDF instrument list is re-fetched (GetInstruments in-band WS) and the 99-symbol subscription set is rebuilt — current expiry + refreshed strikes. Expiry rollover = the next morning's rebuild; NEVER an intraday resubscribe.
+4. **Greeks are NOT sourced from GDF** — BruteX computes/serves greeks; the GDF leg captures L1 ticks only.
+5. **RAM-first sizing:** the full trading day of ~99 instruments' 1-second L1 ticks stays RAM-resident (QuestDB persistence unchanged); the bigger-instance decision is DEFERRED to the operator per `daily-universe-scope-expansion-2026-05-27.md` §7 (any instance change needs its own dated quote there).
+
 
 ## Design
 
