@@ -308,7 +308,9 @@ pub fn deterministic_run_ts_nanos(day_start_ist_nanos: i64) -> i64 {
 pub fn tf_verify_targets() -> Vec<TfIndex> {
     TfIndex::ALL
         .into_iter()
-        .filter(|tf| !matches!(tf, TfIndex::M1 | TfIndex::D1))
+        // Second-scale frames are GDF-feed-gated: never folded from REST 1m; their only future writer is the GDF 1s pipeline.
+        // They hold ZERO rows today, so the REST-derived consistency verifier must never target them.
+        .filter(|tf| !tf.is_second_scale() && !matches!(tf, TfIndex::M1 | TfIndex::D1))
         .collect()
 }
 
@@ -2515,6 +2517,20 @@ mod tests {
         assert!(!targets.contains(&TfIndex::D1));
         assert_eq!(targets.first(), Some(&TfIndex::M3));
         assert_eq!(targets.last(), Some(&TfIndex::M15));
+    }
+
+    /// C3: second-scale frames are GDF-feed-gated (zero rows arrive from
+    /// the REST 1m fold), and a 30s target's penultimate window
+    /// E=55_770 would sit inside the catchup margin — so the 15:40
+    /// verify pass must stay the minute-scale trio exactly.
+    #[test]
+    fn test_verify_targets_exclude_second_scale_frames() {
+        let targets = tf_verify_targets();
+        assert!(
+            targets.iter().all(|tf| !tf.is_second_scale()),
+            "second-scale frame leaked into verify targets: {targets:?}"
+        );
+        assert_eq!(targets, vec![TfIndex::M3, TfIndex::M5, TfIndex::M15]);
     }
 
     /// Per-TF daily bucket counts pinned as literals — each equals

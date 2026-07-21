@@ -25,8 +25,11 @@
 
 /// Number of timeframes the live candle engine derives. Pinned here so
 /// the per-instrument slot array and the storage-side sender array
-/// share one source of truth.
-pub const TF_COUNT: usize = 5;
+/// share one source of truth. 21 since C3 (operator frame directive
+/// 2026-07-21): 1s..15s + 30s + 1m/3m/5m/15m + broker 1d — the 16
+/// second-scale frames are STRUCTURAL ONLY (GDF-feed-gated, zero rows
+/// until the GDF 1s live feed lands in its own lane).
+pub const TF_COUNT: usize = 21;
 
 /// 09:15:00 IST expressed as seconds-of-day (`9*3600 + 15*60`).
 /// The NSE regular trading session opens at 09:15:00 — every candle
@@ -44,7 +47,7 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 #[cfg(test)]
 pub(crate) const MARKET_CLOSE_SECS_OF_DAY_IST: u32 = 55_800;
 
-/// Runtime-indexable handle for the 5 candle timeframes.
+/// Runtime-indexable handle for the 21 candle timeframes.
 ///
 /// Use [`Self::ALL`] to iterate. Use [`Self::from_ordinal`] for
 /// runtime decoding (e.g. parsing audit-table rows). Use
@@ -67,18 +70,76 @@ pub enum TfIndex {
     /// every trading day so the UTC boundary does not produce stale
     /// candles in practice).
     D1 = 4,
+    // -- Second-scale frames (C3, operator directive 2026-07-21) ------
+    // APPENDED after D1 so every pre-existing seal-spill ordinal
+    // (0..=4) stays byte-stable (SEAL_SPILL_FORMAT_VERSION stays 1).
+    // STRUCTURAL ONLY: all 16 frames are GDF-feed-gated — ZERO rows
+    // until the GDF 1s live feed lands (separate lane); the REST 1m
+    // cadence fold never writes them.
+    /// 1-second candles (1 s). GDF-feed-gated (structural).
+    S1 = 5,
+    /// 2-second candles (2 s). GDF-feed-gated (structural).
+    S2 = 6,
+    /// 3-second candles (3 s). GDF-feed-gated (structural).
+    S3 = 7,
+    /// 4-second candles (4 s). GDF-feed-gated (structural).
+    S4 = 8,
+    /// 5-second candles (5 s). GDF-feed-gated (structural).
+    S5 = 9,
+    /// 6-second candles (6 s). GDF-feed-gated (structural).
+    S6 = 10,
+    /// 7-second candles (7 s). GDF-feed-gated (structural).
+    S7 = 11,
+    /// 8-second candles (8 s). GDF-feed-gated (structural).
+    S8 = 12,
+    /// 9-second candles (9 s). GDF-feed-gated (structural).
+    S9 = 13,
+    /// 10-second candles (10 s). GDF-feed-gated (structural).
+    S10 = 14,
+    /// 11-second candles (11 s). GDF-feed-gated (structural).
+    S11 = 15,
+    /// 12-second candles (12 s). GDF-feed-gated (structural).
+    S12 = 16,
+    /// 13-second candles (13 s). GDF-feed-gated (structural).
+    S13 = 17,
+    /// 14-second candles (14 s). GDF-feed-gated (structural).
+    S14 = 18,
+    /// 15-second candles (15 s). GDF-feed-gated (structural).
+    S15 = 19,
+    /// 30-second candles (30 s). GDF-feed-gated (structural).
+    S30 = 20,
 }
 
 impl TfIndex {
-    /// All 5 timeframes in canonical short-to-long order. The index
+    /// All 21 timeframes in ORDINAL (seal-spill append) order: the 5
+    /// legacy frames (1m/3m/5m/15m/1d) first, then the 16 GDF-gated
+    /// second-scale frames (1s..15s, 30s) appended by C3 — so the
+    /// array is deliberately NOT globally seconds-ascending. The index
     /// of each entry equals its [`Self::as_ordinal`] value, which the
-    /// hot-path `[Mutex<LiveCandleState>; 5]` array indexing relies on.
+    /// hot-path `[Mutex<LiveCandleState>; TF_COUNT]` array indexing
+    /// relies on.
     pub const ALL: [TfIndex; TF_COUNT] = [
         TfIndex::M1,
         TfIndex::M3,
         TfIndex::M5,
         TfIndex::M15,
         TfIndex::D1,
+        TfIndex::S1,
+        TfIndex::S2,
+        TfIndex::S3,
+        TfIndex::S4,
+        TfIndex::S5,
+        TfIndex::S6,
+        TfIndex::S7,
+        TfIndex::S8,
+        TfIndex::S9,
+        TfIndex::S10,
+        TfIndex::S11,
+        TfIndex::S12,
+        TfIndex::S13,
+        TfIndex::S14,
+        TfIndex::S15,
+        TfIndex::S30,
     ];
 
     /// Returns the ordinal (`0..TF_COUNT`) used to index the
@@ -103,6 +164,22 @@ impl TfIndex {
             2 => Some(Self::M5),
             3 => Some(Self::M15),
             4 => Some(Self::D1),
+            5 => Some(Self::S1),
+            6 => Some(Self::S2),
+            7 => Some(Self::S3),
+            8 => Some(Self::S4),
+            9 => Some(Self::S5),
+            10 => Some(Self::S6),
+            11 => Some(Self::S7),
+            12 => Some(Self::S8),
+            13 => Some(Self::S9),
+            14 => Some(Self::S10),
+            15 => Some(Self::S11),
+            16 => Some(Self::S12),
+            17 => Some(Self::S13),
+            18 => Some(Self::S14),
+            19 => Some(Self::S15),
+            20 => Some(Self::S30),
             _ => None,
         }
     }
@@ -119,6 +196,22 @@ impl TfIndex {
             Self::M5 => "candles_5m",
             Self::M15 => "candles_15m",
             Self::D1 => "candles_1d",
+            Self::S1 => "candles_1s",
+            Self::S2 => "candles_2s",
+            Self::S3 => "candles_3s",
+            Self::S4 => "candles_4s",
+            Self::S5 => "candles_5s",
+            Self::S6 => "candles_6s",
+            Self::S7 => "candles_7s",
+            Self::S8 => "candles_8s",
+            Self::S9 => "candles_9s",
+            Self::S10 => "candles_10s",
+            Self::S11 => "candles_11s",
+            Self::S12 => "candles_12s",
+            Self::S13 => "candles_13s",
+            Self::S14 => "candles_14s",
+            Self::S15 => "candles_15s",
+            Self::S30 => "candles_30s",
         }
     }
 
@@ -153,7 +246,34 @@ impl TfIndex {
             Self::M5 => 300,
             Self::M15 => 900,
             Self::D1 => 86_400,
+            Self::S1 => 1,
+            Self::S2 => 2,
+            Self::S3 => 3,
+            Self::S4 => 4,
+            Self::S5 => 5,
+            Self::S6 => 6,
+            Self::S7 => 7,
+            Self::S8 => 8,
+            Self::S9 => 9,
+            Self::S10 => 10,
+            Self::S11 => 11,
+            Self::S12 => 12,
+            Self::S13 => 13,
+            Self::S14 => 14,
+            Self::S15 => 15,
+            Self::S30 => 30,
         }
+    }
+
+    /// True for the 16 GDF-gated second-scale frames (bucket < 60 s:
+    /// 1s..=15s + 30s). These frames are STRUCTURAL until the GDF 1s live
+    /// feed lands (separate lane) — ZERO rows are written today, the REST
+    /// 1m cadence folds only the 5-frame minute/day set, and the RAM store
+    /// allocates them as capacity-1 placeholders (never full session rings).
+    #[inline]
+    #[must_use]
+    pub const fn is_second_scale(self) -> bool {
+        self.seconds_per_bucket() < 60
     }
 
     /// Short display name (`"1m"`, `"3m"`, ..., `"1d"`). Stable across
@@ -167,6 +287,22 @@ impl TfIndex {
             Self::M5 => "5m",
             Self::M15 => "15m",
             Self::D1 => "1d",
+            Self::S1 => "1s",
+            Self::S2 => "2s",
+            Self::S3 => "3s",
+            Self::S4 => "4s",
+            Self::S5 => "5s",
+            Self::S6 => "6s",
+            Self::S7 => "7s",
+            Self::S8 => "8s",
+            Self::S9 => "9s",
+            Self::S10 => "10s",
+            Self::S11 => "11s",
+            Self::S12 => "12s",
+            Self::S13 => "13s",
+            Self::S14 => "14s",
+            Self::S15 => "15s",
+            Self::S30 => "30s",
         }
     }
 
@@ -241,29 +377,43 @@ mod tests {
     }
 
     #[test]
-    fn test_tf_index_all_has_five_distinct_variants() {
+    fn test_tf_index_all_has_twenty_one_distinct_variants() {
         let mut seen = std::collections::HashSet::new();
         for tf in TfIndex::ALL {
             assert!(seen.insert(tf), "duplicate variant in TfIndex::ALL: {tf:?}");
         }
         assert_eq!(TfIndex::ALL.len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 5);
+        assert_eq!(TF_COUNT, 21);
     }
 
+    /// C3 (2026-07-21): the 16 second-scale frames are APPENDED after
+    /// D1 so every pre-existing seal-spill ordinal (0..=4) stays
+    /// stable — `ALL` is therefore ordinal-ordered, NOT globally
+    /// seconds-ascending. This pin is strictly stronger than the old
+    /// ascending check: it pins the EXACT seconds sequence, and each
+    /// ordinal block stays strictly ascending within itself.
     #[test]
-    fn test_tf_index_canonical_ordering_short_to_long() {
+    fn test_tf_index_ordinal_order_pins_exact_seconds_sequence() {
         let secs: Vec<u32> = TfIndex::ALL
             .iter()
             .map(|tf| tf.seconds_per_bucket())
             .collect();
-        for window in secs.windows(2) {
-            assert!(
-                window[0] < window[1],
-                "TfIndex::ALL must be strictly ascending by seconds_per_bucket; \
-                 got {} >= {}",
-                window[0],
-                window[1]
-            );
+        let expected: Vec<u32> = [60_u32, 180, 300, 900, 86_400]
+            .into_iter()
+            .chain(1..=15)
+            .chain([30])
+            .collect();
+        assert_eq!(secs, expected, "ordinal seconds sequence drifted");
+        for block in [&secs[..5], &secs[5..]] {
+            for window in block.windows(2) {
+                assert!(
+                    window[0] < window[1],
+                    "each ordinal block must be strictly ascending by \
+                     seconds_per_bucket; got {} >= {}",
+                    window[0],
+                    window[1]
+                );
+            }
         }
     }
 
@@ -298,6 +448,22 @@ mod tests {
             "candles_5m",
             "candles_15m",
             "candles_1d",
+            "candles_1s",
+            "candles_2s",
+            "candles_3s",
+            "candles_4s",
+            "candles_5s",
+            "candles_6s",
+            "candles_7s",
+            "candles_8s",
+            "candles_9s",
+            "candles_10s",
+            "candles_11s",
+            "candles_12s",
+            "candles_13s",
+            "candles_14s",
+            "candles_15s",
+            "candles_30s",
         ];
         assert_eq!(names, expected);
         // No `_shadow` suffix anywhere — these are first-class tables.
@@ -352,7 +518,10 @@ mod tests {
     #[test]
     fn test_tf_index_display_names_unique_and_stable() {
         let mut seen = std::collections::HashSet::new();
-        let expected = ["1m", "3m", "5m", "15m", "1d"];
+        let expected = [
+            "1m", "3m", "5m", "15m", "1d", "1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "9s",
+            "10s", "11s", "12s", "13s", "14s", "15s", "30s",
+        ];
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
             let name = tf.display_name();
             assert_eq!(
@@ -370,9 +539,49 @@ mod tests {
         assert_eq!(TfIndex::M5.seconds_per_bucket(), 300);
         assert_eq!(TfIndex::M15.seconds_per_bucket(), 900);
         assert_eq!(TfIndex::D1.seconds_per_bucket(), 86_400);
+        // Second-scale frames (C3): S1..S15 are 1..=15 s, S30 is 30 s.
+        for ord in 5..=19_usize {
+            let tf = TfIndex::from_ordinal(ord).expect("second-scale ordinal");
+            assert_eq!(
+                tf.seconds_per_bucket(),
+                u32::try_from(ord - 4).expect("fits"),
+                "S-frame seconds drifted at ordinal {ord}"
+            );
+        }
+        assert_eq!(TfIndex::S30.seconds_per_bucket(), 30);
         // Every minute-class TF is a whole number of minutes.
         for tf in [TfIndex::M1, TfIndex::M3, TfIndex::M5, TfIndex::M15] {
             assert_eq!(tf.seconds_per_bucket() % 60, 0);
+        }
+    }
+
+    #[test]
+    fn test_tf_index_second_scale_gate_is_exactly_the_16_gdf_frames() {
+        // GDF-gate predicate: exactly the 16 sub-minute frames (S1..S15 +
+        // S30) are second-scale; the legacy 5-frame live set is NOT.
+        let second_scale: Vec<TfIndex> = TfIndex::ALL
+            .into_iter()
+            .filter(|tf| tf.is_second_scale())
+            .collect();
+        assert_eq!(second_scale.len(), 16, "second-scale frame count drifted");
+        for tf in [
+            TfIndex::M1,
+            TfIndex::M3,
+            TfIndex::M5,
+            TfIndex::M15,
+            TfIndex::D1,
+        ] {
+            assert!(!tf.is_second_scale(), "{tf:?} wrongly GDF-gated");
+        }
+        for tf in second_scale {
+            assert!(
+                tf.seconds_per_bucket() < 60,
+                "{tf:?} gated but not sub-minute"
+            );
+            assert!(
+                tf.as_ordinal() >= 5,
+                "{tf:?} gated frame in legacy ordinals"
+            );
         }
     }
 
@@ -434,8 +643,11 @@ mod tests {
         }
     }
 
+    /// `Ord` sorts by the `repr(u8)` discriminant = the seal-spill
+    /// APPEND order (C3) — which is exactly `ALL`'s order. Deliberately
+    /// NOT seconds order: D1 (ordinal 4) precedes S1 (ordinal 5).
     #[test]
-    fn test_tf_index_canonical_total_ordering_matches_secs_ordering() {
+    fn test_tf_index_total_ordering_matches_ordinal_append_order() {
         let mut sorted = TfIndex::ALL.to_vec();
         sorted.sort();
         assert_eq!(sorted, TfIndex::ALL);

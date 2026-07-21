@@ -99,7 +99,7 @@ fn guard_helpers_are_sane() {
     assert!(!table_name_constants(sample).iter().any(|t| t.contains(' ')));
 }
 
-/// The 5 live candle tables are swept by iterating `candle_table_names()` (the
+/// The 21 live candle tables are swept by iterating `candle_table_names()` (the
 /// single source of truth) in `detach_old_partitions`. This cross-references
 /// that source — closing the gap where #1022's meta-guard was blind to candle
 /// tables (it only saw literals inside `partition_manager.rs`). Catches both
@@ -116,7 +116,7 @@ fn candle_tables_are_swept_via_single_source() {
     );
 
     let names = tickvault_storage::shadow_persistence::candle_table_names();
-    assert_eq!(names.len(), 5, "expected 5 live candle tables");
+    assert_eq!(names.len(), 21, "expected 21 live candle tables");
     for n in names {
         assert!(
             n.starts_with("candles_") && !n.contains("_shadow"),

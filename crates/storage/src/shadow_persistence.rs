@@ -78,7 +78,7 @@ use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 // ---------------------------------------------------------------------------
 // QuestDB table names — one per timeframe.
 //
-// The 5 candle table names are derived from `TfIndex::table_name()`
+// The TF_COUNT (21) candle table names are derived from `TfIndex::table_name()`
 // (the single source of truth in `crates/trading/src/candles/tf_index.rs`).
 // Use `candle_table_names()` below to enumerate them.
 // ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 // ---------------------------------------------------------------------------
 // DEDUP UPSERT keys — composite per I-P1-11.
 //
-// All 5 candle tables share the same key shape because they are
+// All 21 candle tables share the same key shape because they are
 // uniformly partitioned `(ts, security_id, segment)`. The
 // `dedup_segment_meta_guard.rs` workspace meta-guard scans every
 // `DEDUP_KEY_*` constant in `crates/storage/src/` and FAILS the build
@@ -117,12 +117,12 @@ pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
 // Public helpers — aggregate the table names for downstream consumers.
 // ---------------------------------------------------------------------------
 
-/// All 5 candle table names in canonical order (1m → 1d), derived from
+/// All TF_COUNT (21) candle table names in ordinal (seal-spill) order, derived from
 /// `TfIndex::table_name()`.
 ///
 /// Used by:
 /// - the DDL setup loop below.
-/// - the hot-path seal-writer chain to index into the `[Sender; 5]`
+/// - the hot-path seal-writer chain to index into the `[Sender; TF_COUNT]`
 ///   ILP sender array.
 #[must_use]
 // TEST-EXEMPT: pure const-array accessor; tested via test_candle_table_names_are_plain_and_canonical + test_all_candle_table_names_distinct.
@@ -347,13 +347,13 @@ const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
 /// is exactly the `candles_2m` / `candles_3m` / `candles_10m` 400 bug).
 /// This list covers the names that have NO Engine-B counterpart and so
 /// would otherwise leak forever.
-const LEGACY_EXTRA_CANDLE_MATVIEW_NAMES: [&str; 5] = [
-    "candles_5s",
-    "candles_10s",
-    "candles_15s",
-    "candles_30s",
-    "candles_7d",
-];
+///
+/// C3 (second-scale frames): `candles_5s` / `candles_10s` /
+/// `candles_15s` / `candles_30s` are now Engine-B table names
+/// (S5/S10/S15/S30 appended to `TfIndex::ALL`), so they moved OUT of
+/// this extras list into the Engine-B stale-matview sweep above —
+/// only the 7-day aggregation keeps no Engine-B counterpart.
+const LEGACY_EXTRA_CANDLE_MATVIEW_NAMES: [&str; 1] = ["candles_7d"];
 
 /// QuestDB tables retired by the table-cleanup plan (#T3 instrument, #T4
 /// misc) and the PR #3 greeks teardown. The persistence modules + boot
@@ -821,9 +821,9 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_table_names_has_five_entries() {
+    fn test_candle_table_names_has_tf_count_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 5);
+        assert_eq!(TF_COUNT, 21);
     }
 
     #[test]
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn test_candle_table_names_match_tf_index_table_name() {
         // The DDL loop derives names from `TfIndex::table_name()`; this
-        // pins that alignment so the writer's `[Sender; 5]` indexing
+        // pins that alignment so the writer's `[Sender; TF_COUNT]` indexing
         // stays consistent with the DDL it created.
         let names = candle_table_names();
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
@@ -1036,12 +1036,30 @@ mod tests {
     #[test]
     fn test_candle_table_names_canonical_ordering_1m_to_1d() {
         let names = candle_table_names();
+        // C3: legacy 5-frame prefix (ordinals 0..=4) byte-stable, the 16
+        // second-scale frames APPENDED after candles_1d (ordinals 5..=20).
         let expected = [
             "candles_1m",
             "candles_3m",
             "candles_5m",
             "candles_15m",
             "candles_1d",
+            "candles_1s",
+            "candles_2s",
+            "candles_3s",
+            "candles_4s",
+            "candles_5s",
+            "candles_6s",
+            "candles_7s",
+            "candles_8s",
+            "candles_9s",
+            "candles_10s",
+            "candles_11s",
+            "candles_12s",
+            "candles_13s",
+            "candles_14s",
+            "candles_15s",
+            "candles_30s",
         ];
         assert_eq!(names, expected);
     }

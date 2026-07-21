@@ -449,6 +449,10 @@ impl SidFoldState {
 
         let mut sealed: Vec<SealedBucket> = Vec::new();
         for tf in TfIndex::ALL {
+            if tf.is_second_scale() {
+                // Second-scale frames are GDF-feed-gated: never folded from REST 1m; their only future writer is the GDF 1s pipeline.
+                continue;
+            }
             let idx = tf as usize;
             let start = tf.bucket_start(minute_secs);
             match self.buckets[idx] {
@@ -2327,7 +2331,7 @@ mod tests {
         day_seals.extend(catchup_engine.force_seal_open());
         ram_store_record_day_into(&catchup_store, Feed::Dhan, 13, 0, &day_seals);
         // Ring parity per TF (the 15:29 close bar seals everything live too,
-        // so both paths cover all 5 TFs).
+        // so both paths cover all 5 minute-scale TFs; second frames are GDF-gated).
         let key = SlotKey {
             feed: Feed::Dhan,
             security_id: 13,
@@ -2336,6 +2340,12 @@ mod tests {
         for tf in TfIndex::ALL {
             let live = live_store.latest_n(key, tf, 10_000);
             let catchup = catchup_store.latest_n(key, tf, 10_000);
+            if tf.is_second_scale() {
+                // Second-scale frames are GDF-feed-gated: REST 1m folds never populate them.
+                assert!(live.is_empty(), "no REST live fold for {tf:?}");
+                assert!(catchup.is_empty(), "no REST catch-up fold for {tf:?}");
+                continue;
+            }
             assert!(!live.is_empty(), "live ring populated for {tf:?}");
             assert_eq!(live, catchup, "RAM ring parity live vs catch-up for {tf:?}");
         }
@@ -2611,6 +2621,11 @@ mod tests {
 
         let mut buckets_checked = 0usize;
         for tf in TfIndex::ALL {
+            // Second-scale frames are GDF-feed-gated: REST 1m bars can never
+            // populate a sub-minute bucket, so the fold side has nothing to seal.
+            if tf.is_second_scale() {
+                continue;
+            }
             for window in bucket_grid(tf.seconds_per_bucket()) {
                 // Independent membership: 1m bars whose minute-open
                 // seconds-of-day lie in [start, end_effective).

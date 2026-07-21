@@ -32,7 +32,7 @@
   - Files: crates/trading/src/candles/tf_index.rs, crates/trading/src/in_mem/spot_bar_store.rs, crates/app/src/tf_consistency_boot.rs, crates/storage/src/partition_manager.rs, crates/storage/src/shadow_persistence.rs, crates/storage/src/shadow_seal_columns.rs, crates/storage/tests/partition_retention_coverage_guard.rs
   - Tests: partition_retention_coverage_guard bare-literal count re-pin (12 → 5), tf_index membership unit tests, scoped trading/storage/app suites green
 
-- [ ] C3 — second-scale structural: TfIndex gains 1s–15s + 30s variants; bucket math generalized to second-scale; candle DDL + seal/spill format extended; every second-frame FEED-GATED (zero rows until the GDF 1s feed is live) (TF_COUNT 5 → 21)
+- [x] C3 — second-scale structural: TfIndex gains 1s–15s + 30s variants; bucket math generalized to second-scale; candle DDL + seal/spill format extended; every second-frame FEED-GATED (zero rows until the GDF 1s feed is live) (TF_COUNT 5 → 21)
   - Files: crates/trading/src/candles/tf_index.rs, the candle aggregator/seal path under crates/trading/src/candles/, crates/storage persistence + DDL modules, crates/app/src/candle_ddl_boot.rs
   - Tests: second-scale bucket-boundary unit tests + proptest, TF_COUNT/membership ratchets, DDL guard updates, a feed-gate zero-row test
 

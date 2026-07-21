@@ -40,7 +40,7 @@
 //! |---|---|---|
 //! | 0    | 4 | `security_id` low-32 (legacy/Dhan; full u64 at 120-128) |
 //! | 4    | 1 | `exchange_segment_code: u8`     |
-//! | 5    | 1 | `tf_ordinal: u8` (0..=4 per `TfIndex`) |
+//! | 5    | 1 | `tf_ordinal: u8` (0..=20 per `TfIndex`; 0..=4 = the legacy 5-frame set, 5..=20 = the C3 GDF-gated second-scale frames) |
 //! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
 //! | 7    | 1 | `format_version: u8` (=1; 2026-07-21 C2 — 0 = pre-renumber legacy, REFUSED on load) |
 //! | 8    | 4 | `bucket_start_ist_secs: u32`    |
@@ -98,7 +98,7 @@ pub const SEAL_SPILL_FORMAT_VERSION: u8 = 1;
 /// Self-contained binary record for spilled sealed bars.
 ///
 /// Field layout matches the wire-format table above. The
-/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=4)
+/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=20)
 /// from the trading crate; the glue slice translates
 /// `BufferedSeal::tf` ↔ `tf_ordinal` via a checked
 /// `TfIndex::from_ordinal` round-trip.
@@ -1061,11 +1061,12 @@ mod tests {
     }
 
     #[test]
-    fn test_from_buffered_seal_maps_all_five_tfs_to_correct_ordinal() {
+    fn test_from_buffered_seal_maps_all_twenty_one_tfs_to_correct_ordinal() {
         // Verify every TfIndex variant maps to its canonical ordinal
-        // (0..=4). This pins the trading↔storage contract: a future
-        // re-ordering of TfIndex::ALL would silently flip every
-        // spilled record's TF assignment.
+        // (0..=20: legacy 0..=4 byte-stable, C3 second-scale 5..=20
+        // appended — SEAL_SPILL_FORMAT_VERSION stays 1). This pins the
+        // trading↔storage contract: a future re-ordering of TfIndex::ALL
+        // would silently flip every spilled record's TF assignment.
         let buffered = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
         let mut tested: Vec<u8> = Vec::with_capacity(TfIndex::ALL.len());
         for tf in TfIndex::ALL {
@@ -1082,6 +1083,36 @@ mod tests {
         }
         let expected: Vec<u8> = (0..TfIndex::ALL.len() as u8).collect();
         assert_eq!(tested, expected);
+
+        // Append-only proof: the 5 LEGACY frames (M1, M3, M5, M15, D1)
+        // keep their exact pre-C3 ordinals 0..=4 — the C3 second-scale
+        // frames are APPENDED after D1, never interleaved, so a pre-C3
+        // spilled record decodes to the SAME frame under the C3 binary
+        // (SEAL_SPILL_FORMAT_VERSION stays 1).
+        let legacy: [(TfIndex, u8); 5] = [
+            (TfIndex::M1, 0),
+            (TfIndex::M3, 1),
+            (TfIndex::M5, 2),
+            (TfIndex::M15, 3),
+            (TfIndex::D1, 4),
+        ];
+        for (tf, ord) in legacy {
+            let mut b = buffered;
+            b.tf = tf;
+            let s = SerializedSeal::from(&b);
+            assert_eq!(
+                s.tf_ordinal,
+                ord,
+                "legacy ordinal drift for {} (append-only violated)",
+                tf.display_name()
+            );
+            assert_eq!(
+                s.tf(),
+                Some(tf),
+                "legacy roundtrip for {}",
+                tf.display_name()
+            );
+        }
     }
 
     #[test]
@@ -1098,9 +1129,13 @@ mod tests {
     fn test_serialized_seal_tf_returns_none_for_out_of_range_ordinal() {
         let mut s =
             SerializedSeal::from(&mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
-        // 5 timeframes → valid ordinals are 0..=4; the first
-        // out-of-range ordinal is `TfIndex::ALL.len()` (= 5).
-        s.tf_ordinal = TfIndex::ALL.len() as u8; // out of range
+        // 21 timeframes → valid ordinals are 0..=20; the first
+        // out-of-range ordinal is `TfIndex::ALL.len()` (= 21). ROLLBACK
+        // SAFETY: this clean-refusal arm is the same code shape the older
+        // 5-frame binary takes for a C3-written record carrying ordinal
+        // >= 5 — refused (skip + warn at the read site), NEVER a panic —
+        // which is what lets SEAL_SPILL_FORMAT_VERSION stay 1.
+        s.tf_ordinal = TfIndex::ALL.len() as u8; // out of range (21)
         assert_eq!(s.tf(), None);
         s.tf_ordinal = 255;
         assert_eq!(s.tf(), None);
@@ -1184,5 +1219,39 @@ mod tests {
         assert_ne!(r0, r1);
         assert_eq!(r0.exchange_segment_code, 0);
         assert_eq!(r1.exchange_segment_code, 1);
+    }
+}
+
+/// C3 phase-B pins: the spill `tf_ordinal` byte round-trips every one of the
+/// 21 `TfIndex` frames, the legacy 5 keep ordinals 0..=4, and out-of-range
+/// ordinals refuse cleanly (`None`) — never panic.
+#[cfg(test)]
+mod c3_tf_ordinal_pins {
+    use tickvault_trading::candles::TfIndex;
+    use tickvault_trading::candles::tf_index::TF_COUNT;
+
+    #[test]
+    fn test_tf_ordinal_roundtrip_covers_all_21_frames() {
+        assert_eq!(TF_COUNT, 21);
+        for ord in 0..=20usize {
+            let tf =
+                TfIndex::from_ordinal(ord).unwrap_or_else(|| panic!("ordinal {ord} must decode"));
+            assert_eq!(tf.as_ordinal(), ord, "round-trip broke at {ord}");
+        }
+        // The legacy 5-frame set keeps its pre-C3 ordinals 0..=4.
+        assert_eq!(TfIndex::M1.as_ordinal(), 0);
+        assert_eq!(TfIndex::M3.as_ordinal(), 1);
+        assert_eq!(TfIndex::M5.as_ordinal(), 2);
+        assert_eq!(TfIndex::M15.as_ordinal(), 3);
+        assert_eq!(TfIndex::D1.as_ordinal(), 4);
+    }
+
+    #[test]
+    fn test_from_ordinal_refuses_21_and_255_without_panic() {
+        assert!(TfIndex::from_ordinal(21).is_none());
+        assert!(TfIndex::from_ordinal(255).is_none());
+        for ord in TF_COUNT..=255usize {
+            assert!(TfIndex::from_ordinal(ord).is_none(), "{ord} must refuse");
+        }
     }
 }
