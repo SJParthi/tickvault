@@ -1,11 +1,41 @@
-# Implementation Plan: GDF (Global Data Feeds) as feed #3 — trial-ready before the key arrives
+# Implementation Plan: GDF (Global Data Feeds) as feed #3 — 1s SubscribeRealtime 99-symbol trial
 
-**Status:** DRAFT
-**Date:** 2026-07-13
-**Approved by:** pending (Parthiban — operator quote 2026-07-13 recorded in
-`gdf-third-feed-scope-2026-07-13.md` §0 authorizes the DESIGN; the operator has NOT yet
-approved this plan — implementation PRs B–G may only start once this file's Status flips
-to APPROVED per plan-enforcement.md / the design-first wall)
+**Status:** APPROVED
+**Date:** 2026-07-21 (original DRAFT 2026-07-13; re-scoped + approved 2026-07-21)
+**Approved by:** Parthiban (operator) — 2026-07-21 directives, verbatim quotes recorded in
+gdf-third-feed-scope-2026-07-13.md §9
+
+> **⚠ 2026-07-21 RE-SCOPE (operator directives — verbatim quotes in
+> `gdf-third-feed-scope-2026-07-13.md` §9; this banner WINS wherever the body below
+> conflicts, per house convention):**
+>
+> 1. **Primary capture mode = Mode B `SubscribeRealtime`, exactly 99 symbols** —
+>    NIFTY 50 spot + the current-expiry 49 CE + 49 PE NIFTY option strikes (Quote 1 said
+>    "100 symbols" as the round number; Quote 2 fixes 1 + 98 = 99). Mode A firehose
+>    DEMOTES to a config-selectable fallback (`feeds.gdf.mode`) — the D4 firehose sizing
+>    below stays valid as documentation for that fallback, but the D4 disk verdict / EBS
+>    bump is NOT required for the 99-symbol trial (~99 rows/s ≈ 30 KB/s wire — trivial).
+> 2. **Daily pre-market re-resolution** (Quote 4): the 99-symbol set is re-derived every
+>    morning from the in-band `GetInstruments` master — current expiry re-selected,
+>    strike ladder re-centered around spot; fail-closed on <99 resolved with named gaps;
+>    never a stale hardcoded list.
+> 3. **Greeks: BruteX-owned entirely** (Quote 2) — tickvault stores NO greeks for GDF;
+>    consumption is the §37 read-only S3 seam.
+> 4. **Frame family** (Quote 3): 1s..15s sequential + 30s + 1m/3m/5m/15m OHLCV frames
+>    from the 99-symbol stream (+1d broker-pulled next pre-market — flagged coordinator
+>    assumption pending operator veto). Purpose: option-buying slippage reduction
+>    analysis. §28 strategy boundary untouched.
+> 5. **Full architecture record:** `docs/architecture/gdf-1s-subscribe-design.md`
+>    (per Quote 5 — architecture ownership delegated to Claude; WAL→ring→spill→DLQ
+>    reused AS-IS, RAM sizing honesty incl. the minimum-8GiB-host finding, backtest/live
+>    parity via replay of OUR OWN captured stream).
+> 6. **Merge protocol:** the operator merges ALL PRs himself post-beta — every PR in this
+>    plan opens DRAFT and stays un-merged until the operator's own merge action
+>    (consistent with `operator-session-defaults-2026-07-10.md` §1 rule 2).
+>
+> The PR-series items below (PR-B..PR-G) are re-read through this banner: wherever an
+> item says "firehose primary / mode A", the 99-symbol SubscribeRealtime lane is the
+> primary deliverable and the firehose parts are fallback-class scope.
 **Authority/rule file:** `.claude/rules/project/gdf-third-feed-scope-2026-07-13.md` (PR-A)
 **Ground truth:** `docs/gdf-ref/` (15-file reference pack, merged PR #1493, 2026-07-13)
 **Guarantee matrices:** every PR below carries the 15-row + 7-row matrices per
@@ -138,9 +168,10 @@ as expected (no page storm); NOTE the 08:00–08:45 overlap with our boot window
 
 ## Plan Items (the PR series — serial, one at a time, All Green each)
 
-- [ ] **PR-A (S) — scope rule + this plan (docs only; THIS PR).** Land the scope
-  authorization rule file + this plan (Status stays DRAFT until the operator approves;
-  the operator flips Status→APPROVED before PR-B may start).
+- [x] **PR-A (S) — scope rule + this plan (docs only).** Landed 2026-07-13 (the scope
+  rule + this plan, DRAFT). **2026-07-21:** Status flipped to APPROVED on the operator's
+  §9 directives (quotes in `gdf-third-feed-scope-2026-07-13.md` §9); the 2026-07-21
+  amendment PR carries the §9 rule edit + this re-scope + the architecture design doc.
   - Files: `.claude/rules/project/gdf-third-feed-scope-2026-07-13.md`,
     `.claude/plans/active-plan-gdf-feed.md`
   - Tests: n/a (docs) — plan-gate/plan-verify/per-item-guarantee-check pass; PLAN cap ≤5
