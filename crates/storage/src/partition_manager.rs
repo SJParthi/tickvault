@@ -663,9 +663,10 @@ mod tests {
     fn test_candle_tables_are_real_plain_names_not_shadow() {
         // The candle tables swept by detach_old_partitions come from the single
         // source of truth. They MUST be plain `candles_<TF>` (no `_shadow`) and
-        // number 5 — this is the exact bug #1022 had (phantom `_shadow` names).
+        // number 21 (M1/M3/M5/M15/D1 + S1..S15 + S30, TF-diet second-scale) —
+        // the exact bug #1022 had (phantom `_shadow` names).
         let names = crate::shadow_persistence::candle_table_names();
-        assert_eq!(names.len(), 5, "expected 5 live candle tables");
+        assert_eq!(names.len(), 21, "expected 21 live candle tables");
         for name in names {
             assert!(
                 name.starts_with("candles_"),
