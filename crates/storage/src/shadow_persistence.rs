@@ -5,7 +5,7 @@
 //! cascading through the legacy `candles_1s` materialized-view chain and
 //! WITHOUT the interim `_shadow` tables of the Wave 6 design.
 //!
-//! - 12 timeframes (1m / 2m / … / 15m / 30m / 1h / 2h / 3h / 4h / 1d)
+//! - 5 timeframes (1m / 3m / 5m / 15m / 1d)
 //!   each get their OWN plain QuestDB table — `candles_<tf>`. Names are
 //!   derived from `TfIndex::table_name()` (the single source of truth).
 //! - Every candle table carries DEDUP UPSERT KEYS
@@ -78,7 +78,7 @@ use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 // ---------------------------------------------------------------------------
 // QuestDB table names — one per timeframe.
 //
-// The 12 candle table names are derived from `TfIndex::table_name()`
+// The 5 candle table names are derived from `TfIndex::table_name()`
 // (the single source of truth in `crates/trading/src/candles/tf_index.rs`).
 // Use `candle_table_names()` below to enumerate them.
 // ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 // ---------------------------------------------------------------------------
 // DEDUP UPSERT keys — composite per I-P1-11.
 //
-// All 12 candle tables share the same key shape because they are
+// All 5 candle tables share the same key shape because they are
 // uniformly partitioned `(ts, security_id, segment)`. The
 // `dedup_segment_meta_guard.rs` workspace meta-guard scans every
 // `DEDUP_KEY_*` constant in `crates/storage/src/` and FAILS the build
@@ -117,12 +117,12 @@ pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
 // Public helpers — aggregate the table names for downstream consumers.
 // ---------------------------------------------------------------------------
 
-/// All 12 candle table names in canonical order (1m → 1d), derived from
+/// All 5 candle table names in canonical order (1m → 1d), derived from
 /// `TfIndex::table_name()`.
 ///
 /// Used by:
 /// - the DDL setup loop below.
-/// - the hot-path seal-writer chain to index into the `[Sender; 12]`
+/// - the hot-path seal-writer chain to index into the `[Sender; 5]`
 ///   ILP sender array.
 #[must_use]
 // TEST-EXEMPT: pure const-array accessor; tested via test_candle_table_names_are_plain_and_canonical + test_all_candle_table_names_distinct.
@@ -151,7 +151,7 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// Create all 12 plain candle tables + the per-seal audit table if they
+/// Create all 5 plain candle tables + the per-seal audit table if they
 /// do not already exist, with DEDUP UPSERT enabled on each.
 ///
 /// Idempotent: safe to call on every boot. Failures are logged at
@@ -821,9 +821,9 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_table_names_has_twelve_entries() {
+    fn test_candle_table_names_has_five_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 12);
+        assert_eq!(TF_COUNT, 5);
     }
 
     #[test]
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn test_candle_table_names_match_tf_index_table_name() {
         // The DDL loop derives names from `TfIndex::table_name()`; this
-        // pins that alignment so the writer's `[Sender; 12]` indexing
+        // pins that alignment so the writer's `[Sender; 5]` indexing
         // stays consistent with the DDL it created.
         let names = candle_table_names();
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
@@ -890,7 +890,7 @@ mod tests {
     #[test]
     fn test_legacy_candle_tf_suffixes_has_nine_entries() {
         // The 9 legacy Engine-C timeframes (1m..1d) — distinct from the
-        // 12 live TFs of Engine B.
+        // 5 live TFs of Engine B.
         assert_eq!(LEGACY_CANDLE_TF_SUFFIXES.len(), 9);
         let mut seen = std::collections::HashSet::new();
         for sfx in LEGACY_CANDLE_TF_SUFFIXES {
@@ -1038,16 +1038,9 @@ mod tests {
         let names = candle_table_names();
         let expected = [
             "candles_1m",
-            "candles_2m",
             "candles_3m",
-            "candles_4m",
             "candles_5m",
             "candles_15m",
-            "candles_30m",
-            "candles_1h",
-            "candles_2h",
-            "candles_3h",
-            "candles_4h",
             "candles_1d",
         ];
         assert_eq!(names, expected);

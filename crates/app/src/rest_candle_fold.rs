@@ -13,7 +13,7 @@
 //! tick aggregator is publisher-less, so the `candles_*` tables stopped
 //! populating. This module derives them from the ONLY live market-data source
 //! left — the per-minute `spot_1m_rest` official 1m bars — by FOLDING each
-//! persist-CONFIRMED 1m bar into all 21 timeframe buckets and emitting sealed
+//! persist-CONFIRMED 1m bar into all 5 timeframe buckets and emitting sealed
 //! buckets as [`BufferedSeal`]s into the EXISTING global seal-writer channel
 //! (`tickvault_storage::seal_writer_runner::global_seal_sender`), which lands
 //! them in the same `candles_*` tables with the same DEDUP key
@@ -44,7 +44,7 @@
 //!   of an already-folded minute) updates the map; the consumer loop
 //!   drains each arriving burst as ONE batch and refolds every dirty slot
 //!   ONCE per batch from its map through a fresh engine (≤375 bars ×
-//!   21 TFs — microseconds, cold path; a mid-day-outage sweep of N repairs
+//!   5 TFs — microseconds, cold path; a mid-day-outage sweep of N repairs
 //!   costs one refold per slot, never N full-day refolds), swaps the live
 //!   engine in place, and re-emits every bucket the refold closed (DEDUP
 //!   UPSERT heals in place). Lossless for bars received IN-PROCESS THIS
@@ -385,7 +385,7 @@ pub fn in_session(ist_secs: u32) -> bool {
     (FOLD_SESSION_OPEN_SECS_OF_DAY_IST..FOLD_SESSION_CLOSE_SECS_OF_DAY_IST).contains(&sod)
 }
 
-/// Per-(feed, SID, segment) fold engine: 21 open buckets + ordering watermark.
+/// Per-(feed, SID, segment) fold engine: 5 open buckets + ordering watermark.
 #[derive(Debug)]
 pub struct SidFoldState {
     pub feed: Feed,
@@ -431,7 +431,7 @@ impl SidFoldState {
         }
     }
 
-    /// Folds one 1m bar into all 21 TF buckets, sealing any bucket the bar
+    /// Folds one 1m bar into all 5 TF buckets, sealing any bucket the bar
     /// has moved past. O(TF_COUNT) per bar — constant work, cold path.
     pub fn fold_bar(&mut self, bar: &ConfirmedBar) -> FoldOutcome {
         let minute_secs_i64 = bar.minute_ts_ist_nanos / 1_000_000_000;
@@ -582,7 +582,7 @@ pub fn sealed_bucket_to_seal(
 
 /// Rebuilds a fresh engine from the day-map (minute-ordered — `BTreeMap`
 /// iteration), returning it plus every bucket the refold closed. Pure —
-/// no I/O; ≤375 bars × 21 TFs of constant work (microseconds, cold path).
+/// no I/O; ≤375 bars × 5 TFs of constant work (microseconds, cold path).
 /// The caller emits the sealed buckets (DEDUP UPSERT heals in place) and
 /// swaps the returned engine over the live one.
 pub fn refold_from_day_map(
@@ -1664,7 +1664,7 @@ async fn refold_day(
     let mut folded_bars: Vec<ConfirmedBar> = Vec::new();
     // PR-2 RAM residency: the whole day's seals, recorded as per-TF blocks
     // AFTER the fold (newest→oldest day order needs the block-prepend path).
-    // ~4 seals/bar across the 21 TFs — cold-path, bounded by the row LIMIT.
+    // ~1.5 seals/bar across the 5 TFs — cold-path, bounded by the row LIMIT.
     let mut day_seals: Vec<SealedBucket> = Vec::with_capacity(rows.len().saturating_mul(4));
     for row in &rows {
         let bar = ConfirmedBar {
@@ -2260,7 +2260,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_bar_folds_into_all_21_tfs_and_m1_seals() {
+    fn test_single_bar_folds_into_all_5_tfs_and_m1_seals() {
         let mut e = SidFoldState::new(Feed::Dhan, 13, 0);
         let outcome = e.fold_bar(&bar_at(0, 100.0, 101.0, 99.0, 100.5, 10));
         let FoldOutcome::Folded(sealed) = outcome else {
@@ -2271,8 +2271,8 @@ mod tests {
         assert_eq!(sealed[0].tf, TfIndex::M1);
         assert_eq!(sealed[0].bucket.open, 100.0);
         assert_eq!(sealed[0].bucket.close, 100.5);
-        // The other 20 TFs are open.
-        assert_eq!(e.open_bucket_count(), 20);
+        // The other 4 TFs (3m/5m/15m/1d) are open.
+        assert_eq!(e.open_bucket_count(), 4);
     }
 
     #[test]
@@ -2327,7 +2327,7 @@ mod tests {
         day_seals.extend(catchup_engine.force_seal_open());
         ram_store_record_day_into(&catchup_store, Feed::Dhan, 13, 0, &day_seals);
         // Ring parity per TF (the 15:29 close bar seals everything live too,
-        // so both paths cover all 21 TFs).
+        // so both paths cover all 5 TFs).
         let key = SlotKey {
             feed: Feed::Dhan,
             security_id: 13,
@@ -2352,7 +2352,7 @@ mod tests {
         let FoldOutcome::Folded(sealed) = outcome else {
             panic!("expected folded");
         };
-        // Every remaining open bucket seals at close (all 21 TFs' final
+        // Every remaining open bucket seals at close (all 5 TFs' final
         // buckets end at 15:30 by session truncation).
         assert_eq!(e.open_bucket_count(), 0);
         let d1 = sealed
@@ -2367,11 +2367,16 @@ mod tests {
 
     #[test]
     fn test_session_truncated_end_final_partial_bucket() {
-        // H1 bucket opening 15:15 truncates to 15:30 (900s partial).
+        // C2 (2026-07-21): every live intraday TF (1/3/5/15m) divides the
+        // 375-minute session evenly, so D1 is the ONLY live frame whose
+        // natural end truncates (the historical carrier was the retired
+        // H1 bucket opening 15:15). The M15 final bucket [15:15, 15:30)
+        // fits EXACTLY — min(natural, close) is the identity there.
         let start = (DAY0 as u32) + 54_900; // 15:15
         assert_eq!(
-            session_truncated_end(TfIndex::H1, start),
-            (DAY0 as u32) + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST
+            session_truncated_end(TfIndex::M15, start),
+            (DAY0 as u32) + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST,
+            "M15 final bucket's natural end IS the close (exact fit)"
         );
         // D1's natural next-day end truncates to the same-day close.
         assert_eq!(

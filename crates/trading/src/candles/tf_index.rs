@@ -4,13 +4,13 @@
 //! mapping from `(timeframe → QuestDB table name + DEDUP key +
 //! bucket-seconds + display name)`. [`TfIndex`] is that handle: a
 //! `#[repr(u8)]` enum whose ordinal indexes the per-instrument
-//! `[Mutex<LiveCandleState>; 12]` slot array AND the storage-side
-//! `[Sender; 12]` ILP writer array.
+//! `[Mutex<LiveCandleState>; 5]` slot array AND the storage-side
+//! `[Sender; 5]` ILP writer array.
 //!
-//! ## The 12 timeframes
+//! ## The 5 timeframes
 //!
 //! The candle re-architecture (#T1) ships ONE aggregator that derives
-//! all 12 timeframes directly from the live tick stream and flushes
+//! all 5 timeframes directly from the live tick stream and flushes
 //! each sealed bar straight to its own plain QuestDB table
 //! (`candles_1m` … `candles_1d`). There are no `_shadow` tables, no
 //! `candles_1s` base table, and no materialized-view cascade — every
@@ -19,14 +19,14 @@
 //! Variants are ordered short-to-long (1m → 1d) so the ordinal
 //! returned by [`Self::as_ordinal`] is stable. Reordering variants is
 //! a SEMVER break — every consumer indexing by ordinal (the
-//! per-instrument `[Mutex<LiveCandleState>; 12]`, the ILP
-//! `[Sender; 12]` writer, the audit-table `timeframe` SYMBOL column)
+//! per-instrument `[Mutex<LiveCandleState>; 5]`, the ILP
+//! `[Sender; 5]` writer, the audit-table `timeframe` SYMBOL column)
 //! breaks silently.
 
 /// Number of timeframes the live candle engine derives. Pinned here so
 /// the per-instrument slot array and the storage-side sender array
 /// share one source of truth.
-pub const TF_COUNT: usize = 12;
+pub const TF_COUNT: usize = 5;
 
 /// 09:15:00 IST expressed as seconds-of-day (`9*3600 + 15*60`).
 /// The NSE regular trading session opens at 09:15:00 — every candle
@@ -44,7 +44,7 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 #[cfg(test)]
 pub(crate) const MARKET_CLOSE_SECS_OF_DAY_IST: u32 = 55_800;
 
-/// Runtime-indexable handle for the 12 candle timeframes.
+/// Runtime-indexable handle for the 5 candle timeframes.
 ///
 /// Use [`Self::ALL`] to iterate. Use [`Self::from_ordinal`] for
 /// runtime decoding (e.g. parsing audit-table rows). Use
@@ -56,55 +56,34 @@ pub(crate) const MARKET_CLOSE_SECS_OF_DAY_IST: u32 = 55_800;
 pub enum TfIndex {
     /// 1-minute candles (60 s).
     M1 = 0,
-    /// 2-minute candles (120 s).
-    M2 = 1,
     /// 3-minute candles (180 s).
-    M3 = 2,
-    /// 4-minute candles (240 s).
-    M4 = 3,
+    M3 = 1,
     /// 5-minute candles (300 s).
-    M5 = 4,
+    M5 = 2,
     /// 15-minute candles (900 s).
-    M15 = 5,
-    /// 30-minute candles (1_800 s).
-    M30 = 6,
-    /// 1-hour candles (3_600 s).
-    H1 = 7,
-    /// 2-hour candles (7_200 s).
-    H2 = 8,
-    /// 3-hour candles (10_800 s).
-    H3 = 9,
-    /// 4-hour candles (14_400 s).
-    H4 = 10,
+    M15 = 3,
     /// 1-day candles (86_400 s — UTC-aligned arithmetic; the
     /// IST-midnight rollover task force-seals open bars at IST 00:00
     /// every trading day so the UTC boundary does not produce stale
     /// candles in practice).
-    D1 = 11,
+    D1 = 4,
 }
 
 impl TfIndex {
-    /// All 12 timeframes in canonical short-to-long order. The index
+    /// All 5 timeframes in canonical short-to-long order. The index
     /// of each entry equals its [`Self::as_ordinal`] value, which the
-    /// hot-path `[Mutex<LiveCandleState>; 12]` array indexing relies on.
+    /// hot-path `[Mutex<LiveCandleState>; 5]` array indexing relies on.
     pub const ALL: [TfIndex; TF_COUNT] = [
         TfIndex::M1,
-        TfIndex::M2,
         TfIndex::M3,
-        TfIndex::M4,
         TfIndex::M5,
         TfIndex::M15,
-        TfIndex::M30,
-        TfIndex::H1,
-        TfIndex::H2,
-        TfIndex::H3,
-        TfIndex::H4,
         TfIndex::D1,
     ];
 
     /// Returns the ordinal (`0..TF_COUNT`) used to index the
-    /// per-instrument `[Mutex<LiveCandleState>; 12]` array AND the
-    /// storage-side `[Sender; 12]` ILP writer array.
+    /// per-instrument `[Mutex<LiveCandleState>; 5]` array AND the
+    /// storage-side `[Sender; 5]` ILP writer array.
     #[inline]
     #[must_use]
     pub const fn as_ordinal(self) -> usize {
@@ -120,17 +99,10 @@ impl TfIndex {
     pub const fn from_ordinal(ord: usize) -> Option<Self> {
         match ord {
             0 => Some(Self::M1),
-            1 => Some(Self::M2),
-            2 => Some(Self::M3),
-            3 => Some(Self::M4),
-            4 => Some(Self::M5),
-            5 => Some(Self::M15),
-            6 => Some(Self::M30),
-            7 => Some(Self::H1),
-            8 => Some(Self::H2),
-            9 => Some(Self::H3),
-            10 => Some(Self::H4),
-            11 => Some(Self::D1),
+            1 => Some(Self::M3),
+            2 => Some(Self::M5),
+            3 => Some(Self::M15),
+            4 => Some(Self::D1),
             _ => None,
         }
     }
@@ -143,16 +115,9 @@ impl TfIndex {
     pub const fn table_name(self) -> &'static str {
         match self {
             Self::M1 => "candles_1m",
-            Self::M2 => "candles_2m",
             Self::M3 => "candles_3m",
-            Self::M4 => "candles_4m",
             Self::M5 => "candles_5m",
             Self::M15 => "candles_15m",
-            Self::M30 => "candles_30m",
-            Self::H1 => "candles_1h",
-            Self::H2 => "candles_2h",
-            Self::H3 => "candles_3h",
-            Self::H4 => "candles_4h",
             Self::D1 => "candles_1d",
         }
     }
@@ -184,37 +149,23 @@ impl TfIndex {
     pub const fn seconds_per_bucket(self) -> u32 {
         match self {
             Self::M1 => 60,
-            Self::M2 => 120,
             Self::M3 => 180,
-            Self::M4 => 240,
             Self::M5 => 300,
             Self::M15 => 900,
-            Self::M30 => 1_800,
-            Self::H1 => 3_600,
-            Self::H2 => 7_200,
-            Self::H3 => 10_800,
-            Self::H4 => 14_400,
             Self::D1 => 86_400,
         }
     }
 
-    /// Short display name (`"1m"`, `"2m"`, ..., `"1d"`). Stable across
+    /// Short display name (`"1m"`, `"3m"`, ..., `"1d"`). Stable across
     /// the codebase and the audit-table `timeframe` SYMBOL column.
     #[inline]
     #[must_use]
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::M1 => "1m",
-            Self::M2 => "2m",
             Self::M3 => "3m",
-            Self::M4 => "4m",
             Self::M5 => "5m",
             Self::M15 => "15m",
-            Self::M30 => "30m",
-            Self::H1 => "1h",
-            Self::H2 => "2h",
-            Self::H3 => "3h",
-            Self::H4 => "4h",
             Self::D1 => "1d",
         }
     }
@@ -224,8 +175,8 @@ impl TfIndex {
     ///
     /// Buckets are anchored to the **09:15:00 IST market open**, NOT to
     /// the epoch — so every timeframe's first candle of the day starts
-    /// exactly at 09:15 (a 30m bucket is `[09:15,09:45)`, not
-    /// `[09:00,09:30)`; a 1h bucket is `[09:15,10:15)`). A tick at or
+    /// exactly at 09:15 (a 15m bucket is `[09:15,09:30)`; the first
+    /// bucket of every frame starts at the open). A tick at or
     /// before the open anchors to the first bucket; the aggregator's
     /// market-hours gate keeps genuine pre-open ticks out anyway.
     ///
@@ -290,13 +241,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tf_index_all_has_twelve_distinct_variants() {
+    fn test_tf_index_all_has_five_distinct_variants() {
         let mut seen = std::collections::HashSet::new();
         for tf in TfIndex::ALL {
             assert!(seen.insert(tf), "duplicate variant in TfIndex::ALL: {tf:?}");
         }
         assert_eq!(TfIndex::ALL.len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 12);
+        assert_eq!(TF_COUNT, 5);
     }
 
     #[test]
@@ -343,16 +294,9 @@ mod tests {
         });
         let expected = [
             "candles_1m",
-            "candles_2m",
             "candles_3m",
-            "candles_4m",
             "candles_5m",
             "candles_15m",
-            "candles_30m",
-            "candles_1h",
-            "candles_2h",
-            "candles_3h",
-            "candles_4h",
             "candles_1d",
         ];
         assert_eq!(names, expected);
@@ -408,9 +352,7 @@ mod tests {
     #[test]
     fn test_tf_index_display_names_unique_and_stable() {
         let mut seen = std::collections::HashSet::new();
-        let expected = [
-            "1m", "2m", "3m", "4m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
-        ];
+        let expected = ["1m", "3m", "5m", "15m", "1d"];
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
             let name = tf.display_name();
             assert_eq!(
@@ -424,20 +366,12 @@ mod tests {
     #[test]
     fn test_tf_index_seconds_per_bucket_values() {
         assert_eq!(TfIndex::M1.seconds_per_bucket(), 60);
+        assert_eq!(TfIndex::M3.seconds_per_bucket(), 180);
+        assert_eq!(TfIndex::M5.seconds_per_bucket(), 300);
         assert_eq!(TfIndex::M15.seconds_per_bucket(), 900);
-        assert_eq!(TfIndex::M30.seconds_per_bucket(), 1_800);
-        assert_eq!(TfIndex::H1.seconds_per_bucket(), 3_600);
-        assert_eq!(TfIndex::H4.seconds_per_bucket(), 14_400);
         assert_eq!(TfIndex::D1.seconds_per_bucket(), 86_400);
         // Every minute-class TF is a whole number of minutes.
-        for tf in [
-            TfIndex::M1,
-            TfIndex::M2,
-            TfIndex::M3,
-            TfIndex::M4,
-            TfIndex::M5,
-            TfIndex::M15,
-        ] {
+        for tf in [TfIndex::M1, TfIndex::M3, TfIndex::M5, TfIndex::M15] {
             assert_eq!(tf.seconds_per_bucket() % 60, 0);
         }
     }

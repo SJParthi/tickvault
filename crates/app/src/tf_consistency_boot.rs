@@ -6,7 +6,7 @@
 //! At **15:40 IST** every trading day (after the Dhan 15:30:05 close-time
 //! force-seal + writer drain and the 15:31 cross-verify burst, before the
 //! 15:45 scoreboard), recompute every stored higher-timeframe candle — the
-//! 10 TFs `2m..4h` (`TfIndex::ALL` minus `M1` the baseline minus `D1`,
+//! 3 TFs `3m..15m` (`TfIndex::ALL` minus `M1` the baseline minus `D1`,
 //! which is excluded by design: Dhan drops D1 at the write boundary per
 //! `live-feed-purity.md` rule 10, and Groww D1 is a partial-day
 //! midnight-sealed bucket) — from its constituent `candles_1m` rows and
@@ -94,8 +94,8 @@ pub const TF_VERIFY_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// legitimately complete.
 pub const TF_VERIFY_1M_ROW_LIMIT: usize = 500;
 
-/// Row CAP on the per-SID 10-way higher-TF UNION query. Sized above the
-/// arithmetic worst case (Σ per-TF daily bucket counts = 903); fetched as
+/// Row CAP on the per-SID 3-way higher-TF UNION query. Sized above the
+/// arithmetic worst case (Σ per-TF daily bucket counts = 225); fetched as
 /// `cap + 1` (LIMIT+1 probe), truncation = `> cap`.
 pub const TF_VERIFY_TF_UNION_ROW_LIMIT: usize = 2_000;
 
@@ -301,7 +301,7 @@ pub fn deterministic_run_ts_nanos(day_start_ist_nanos: i64) -> i64 {
 // The verified timeframe set + the independent bucket grid (pure)
 // ---------------------------------------------------------------------------
 
-/// The 19 comparison targets: `TfIndex::ALL` minus `M1` (the recompute
+/// The 3 comparison targets: `TfIndex::ALL` minus `M1` (the recompute
 /// baseline) minus `D1` (excluded by design — Dhan drops D1 at the write
 /// boundary; Groww D1 is a partial-day midnight bucket).
 #[must_use]
@@ -370,8 +370,11 @@ pub fn is_on_grid(secs_of_day: i64, tf_secs: u32) -> bool {
 /// within [`GROWW_CATCHUP_MARGIN_SECS`] of the 15:30:00 close, so the
 /// `end ≤ watermark − margin` seal condition is unsatisfiable before the
 /// midnight force-seal (which never runs on the prod schedule). Catches
-/// every final window AND e.g. the 2m penultimate `[15:27, 15:29)` window
-/// (E = 55_740). Pure.
+/// every final window (E = 55_800); with the C2 5-frame live set no verify
+/// target has a NON-final window inside the margin (the historical carrier
+/// was the retired 2m penultimate `[15:27, 15:29)`, E = 55_740 — the exact
+/// boundary stays pinned in `test_groww_uncatchupable_tail_boundaries`).
+/// Pure.
 #[must_use]
 pub fn groww_uncatchupable_tail(end_effective_secs_of_day: u32) -> bool {
     end_effective_secs_of_day.saturating_add(GROWW_CATCHUP_MARGIN_SECS)
@@ -770,7 +773,7 @@ pub fn select_1m_sql(
     )
 }
 
-/// Per-SID 10-way UNION ALL across `candles_2m..candles_4h`, each arm
+/// Per-SID 3-way UNION ALL across `candles_3m..candles_15m`, each arm
 /// tagged with its display label. Pure; excludes `candles_1m` (the
 /// baseline) and `candles_1d` (excluded by design).
 #[must_use]
@@ -1586,7 +1589,7 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
             continue;
         }
 
-        // Query B — the 10-way higher-TF union.
+        // Query B — the 3-way higher-TF union.
         let sql_tf = select_tf_union_sql(p.feed, *sid, segment, day_start_nanos);
         let tf_rows = match http_get_text(p.client, p.exec_url, &sql_tf).await {
             Ok(body) => match parse_tf_union_dataset(&body, TF_VERIFY_TF_UNION_ROW_LIMIT) {
@@ -2507,29 +2510,19 @@ mod tests {
     #[test]
     fn test_tf_verify_targets_exclude_m1_and_d1() {
         let targets = tf_verify_targets();
-        assert_eq!(targets.len(), 10, "12 TFs minus M1 minus D1");
+        assert_eq!(targets.len(), 3, "5 TFs minus M1 minus D1");
         assert!(!targets.contains(&TfIndex::M1));
         assert!(!targets.contains(&TfIndex::D1));
-        assert_eq!(targets.first(), Some(&TfIndex::M2));
-        assert_eq!(targets.last(), Some(&TfIndex::H4));
+        assert_eq!(targets.first(), Some(&TfIndex::M3));
+        assert_eq!(targets.last(), Some(&TfIndex::M15));
     }
 
     /// Per-TF daily bucket counts pinned as literals — each equals
     /// ceil(375 / minutes-per-bucket) for the 375-minute session.
     #[test]
-    fn test_bucket_grid_daily_counts_all_10_tfs() {
-        let expected: [(TfIndex, usize); 10] = [
-            (TfIndex::M2, 188),
-            (TfIndex::M3, 125),
-            (TfIndex::M4, 94),
-            (TfIndex::M5, 75),
-            (TfIndex::M15, 25),
-            (TfIndex::M30, 13),
-            (TfIndex::H1, 7),
-            (TfIndex::H2, 4),
-            (TfIndex::H3, 3),
-            (TfIndex::H4, 2),
-        ];
+    fn test_bucket_grid_daily_counts_all_3_tfs() {
+        let expected: [(TfIndex, usize); 3] =
+            [(TfIndex::M3, 125), (TfIndex::M5, 75), (TfIndex::M15, 25)];
         for (tf, count) in expected {
             let grid = bucket_grid(tf.seconds_per_bucket());
             assert_eq!(grid.len(), count, "window count for {}", tf.display_name());
@@ -2618,14 +2611,14 @@ mod tests {
             TfIndex::M5.bucket_start(day_start_secs + 33_450) - day_start_secs,
             33_300
         );
-        // H1 @ 15:20:00 → 15:15:00.
+        // 15m @ 15:20:00 → 15:15:00.
         assert_eq!(
-            TfIndex::H1.bucket_start(day_start_secs + 55_200) - day_start_secs,
+            TfIndex::M15.bucket_start(day_start_secs + 55_200) - day_start_secs,
             54_900
         );
-        // 30m @ 09:45:00 → 09:45:00 (exact boundary opens the next bucket).
+        // 3m @ 09:45:00 → 09:45:00 (exact boundary opens the next bucket).
         assert_eq!(
-            TfIndex::M30.bucket_start(day_start_secs + 35_100) - day_start_secs,
+            TfIndex::M3.bucket_start(day_start_secs + 35_100) - day_start_secs,
             35_100
         );
         // And the verifier's own grid agrees with those literals.
@@ -2895,15 +2888,15 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_tf_partial_final_window_h1_members_stop_at_1529() {
-        // H1 final window [15:15, 16:15) effective [15:15, 15:30): the
+    fn test_compare_tf_final_window_m15_members_stop_at_1529() {
+        // M15 final window [15:15, 15:30) (exact — 375 divides by 15): the
         // 15:29 minute is a member; nothing ≥ 15:30 can exist.
         let ones = vec![
             row(54_900, 10.0, 11.0, 9.0, 10.5, 5, 2),  // 15:15
             row(55_740, 10.5, 12.0, 10.0, 11.0, 5, 2), // 15:29
         ];
         let stored = vec![row(54_900, 10.0, 12.0, 9.0, 11.0, 10, 4)];
-        let (findings, counts) = compare_tf(TfIndex::H1, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M15, &ones, &stored, DAY_START, false);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
     }
@@ -2962,9 +2955,9 @@ mod tests {
     }
 
     #[test]
-    fn test_select_tf_union_sql_has_10_arms_excludes_1m_and_1d() {
+    fn test_select_tf_union_sql_has_3_arms_excludes_1m_and_1d() {
         let sql = select_tf_union_sql("groww", 1333, "NSE_EQ", 1_784_005_200_000_000_000);
-        assert_eq!(sql.matches(" UNION ALL ").count(), 9, "10 arms");
+        assert_eq!(sql.matches(" UNION ALL ").count(), 2, "3 arms");
         for tf in tf_verify_targets() {
             assert!(
                 sql.contains(&format!("FROM {}", tf.table_name())),
@@ -2997,12 +2990,12 @@ mod tests {
     }
 
     #[test]
-    fn test_select_instruments_sql_unions_all_11_tables_with_limit() {
+    fn test_select_instruments_sql_unions_all_4_tables_with_limit() {
         let sql = select_instruments_sql("dhan", 1_784_005_200_000_000_000);
         assert!(sql.starts_with("SELECT DISTINCT security_id, segment FROM ("));
-        assert_eq!(sql.matches(" UNION ALL ").count(), 10, "1m + 10 targets");
+        assert_eq!(sql.matches(" UNION ALL ").count(), 3, "1m + 3 targets");
         assert!(sql.contains("FROM candles_1m"), "{sql}");
-        assert!(sql.contains("FROM candles_4h"), "{sql}");
+        assert!(sql.contains("FROM candles_15m"), "{sql}");
         assert!(!sql.contains("candles_1d"), "{sql}");
         assert!(sql.contains("feed = 'dhan'"), "{sql}");
         // 2026-07-18 LIMIT+1 probe: cap 3,000 → fetch 3,001.
@@ -3043,14 +3036,14 @@ mod tests {
     fn test_parse_tf_union_dataset_groups_by_label_and_flags_cap() {
         let body = r#"{"dataset":[
             ["5m",1780380120000000000,100.0,101.0,99.0,100.5,10,3],
-            ["30m",1780380120000000000,100.0,102.0,98.0,101.0,60,12],
+            ["15m",1780380120000000000,100.0,102.0,98.0,101.0,60,12],
             ["bogus",1,1.0,1.0,1.0,1.0,1,1]
         ]}"#;
         let (rows, truncated) = parse_tf_union_dataset(body, 2_000).expect("parse");
         assert!(!truncated);
         assert_eq!(rows.len(), 2, "unknown tf label skipped");
         assert_eq!(rows[0].0, TfIndex::M5);
-        assert_eq!(rows[1].0, TfIndex::M30);
+        assert_eq!(rows[1].0, TfIndex::M15);
         assert!(parse_tf_union_dataset("nope", 10).is_err());
         // 2026-07-18 LIMIT+1 semantics: at-cap complete, over-cap trips.
         let (_, at_cap) = parse_tf_union_dataset(body, 3).expect("parse");
@@ -3362,33 +3355,42 @@ mod tests {
         assert_eq!(counts.tail_unsealed, 0);
     }
 
-    /// H1 widened (refuter round 2): the 2m PENULTIMATE window
-    /// `[15:27, 15:29)` has E = 55_740 and 55_740 + 60 ≥ 55_800, so it can
-    /// never catch-up-seal intraday — an ABSENT Groww stored row there is
-    /// `tail_unsealed`, NOT a paging `missing_tf_row`.
+    /// H1 widened (refuter round 2): the margin exemption for a NON-final
+    /// window. The historical compare_tf carrier was the retired 2m
+    /// PENULTIMATE window `[15:27, 15:29)` (E = 55_740; 55_740 + 60 ≥
+    /// 55_800 → `tail_unsealed`, never paging). With the C2 5-frame live
+    /// set NO verify target has a non-final window inside the 60 s margin
+    /// (penultimate E: 3m → 55_620, 5m → 55_500, 15m → 54_900), so only
+    /// FINAL windows (E = 55_800) are exempt — covered by
+    /// `test_compare_tf_groww_final_missing_is_tail_unsealed_not_paging`;
+    /// the exact 60 s boundary stays pinned at the predicate level in
+    /// `test_groww_uncatchupable_tail_boundaries`. This pin asserts the
+    /// structural fact itself and FIRES if a future frame (e.g. a C3
+    /// second-scale TF) re-introduces an in-margin non-final window as a
+    /// compare target — forcing a conscious compare_tf-level re-pin.
     #[test]
-    fn test_compare_tf_groww_2m_penultimate_missing_is_tail_unsealed() {
-        // 1m member inside the M2 penultimate window [55_620, 55_740).
-        let ones = vec![row(55_620, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M2, &ones, &[], DAY_START, true);
-        assert!(
-            findings.is_empty(),
-            "groww 2m penultimate absence must not page: {findings:?}"
-        );
-        assert_eq!(counts.tail_unsealed, 1, "counted, never silent");
-        assert_eq!(counts.buckets_compared, 0);
+    fn test_no_verify_target_has_nonfinal_window_inside_catchup_margin() {
+        for tf in tf_verify_targets() {
+            let penult_end = SESSION_CLOSE_SECS_OF_DAY_IST - tf.seconds_per_bucket();
+            assert!(
+                !groww_uncatchupable_tail(penult_end),
+                "{tf:?} penultimate window (E = {penult_end}) sits inside \
+                 the 60 s catch-up margin — the non-final exemption case is \
+                 reachable again; re-pin a compare_tf-level test for it"
+            );
+        }
     }
 
-    /// H1 widened: an EARLIER 2m window (`[15:25, 15:27)`, E = 55_620;
-    /// 55_620 + 60 < 55_800) is catch-up-able — an absent Groww row there
-    /// still pages `missing_tf_row`.
+    /// H1 widened: the 3m PENULTIMATE window (`[15:24, 15:27)`,
+    /// E = 55_620; 55_620 + 60 < 55_800) is catch-up-able — an absent
+    /// Groww row there still pages `missing_tf_row`.
     #[test]
-    fn test_compare_tf_groww_2m_earlier_window_missing_still_pages() {
-        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M2, &ones, &[], DAY_START, true);
+    fn test_compare_tf_groww_3m_penultimate_missing_still_pages() {
+        let ones = vec![row(55_440, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        let (findings, counts) = compare_tf(TfIndex::M3, &ones, &[], DAY_START, true);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
-        assert_eq!(findings[0].bucket_secs_of_day, 55_500);
+        assert_eq!(findings[0].bucket_secs_of_day, 55_440);
         assert_eq!(counts.tail_unsealed, 0);
     }
 

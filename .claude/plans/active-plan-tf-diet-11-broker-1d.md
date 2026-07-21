@@ -28,7 +28,7 @@
   - Files: .claude/plans/active-plan-tf-diet-11-broker-1d.md
   - Tests: n/a (docs-only)
 
-- [ ] C2 — retirement widening: write-stop 2m, 4m, 30m, 1h, 2h, 3h, 4h; minute-side membership becomes 1m, 3m, 5m, 15m, 1d (TF_COUNT 12 → 5 at this commit)
+- [x] C2 — retirement widening: write-stop 2m, 4m, 30m, 1h, 2h, 3h, 4h; minute-side membership becomes 1m, 3m, 5m, 15m, 1d (TF_COUNT 12 → 5 at this commit)
   - Files: crates/trading/src/candles/tf_index.rs, crates/trading/src/in_mem/spot_bar_store.rs, crates/app/src/tf_consistency_boot.rs, crates/storage/src/partition_manager.rs, crates/storage/src/shadow_persistence.rs, crates/storage/src/shadow_seal_columns.rs, crates/storage/tests/partition_retention_coverage_guard.rs
   - Tests: partition_retention_coverage_guard bare-literal count re-pin (12 → 5), tf_index membership unit tests, scoped trading/storage/app suites green
 

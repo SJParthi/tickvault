@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_name_dispatches_correctly_for_all_12_tfs() {
+    fn test_table_name_dispatches_correctly_for_all_five_tfs() {
         for tf in TfIndex::ALL {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(
@@ -279,16 +279,9 @@ mod tests {
         // candles across two tables — silent data loss class bug).
         let pairs = [
             (TfIndex::M1, "candles_1m"),
-            (TfIndex::M2, "candles_2m"),
             (TfIndex::M3, "candles_3m"),
-            (TfIndex::M4, "candles_4m"),
             (TfIndex::M5, "candles_5m"),
             (TfIndex::M15, "candles_15m"),
-            (TfIndex::M30, "candles_30m"),
-            (TfIndex::H1, "candles_1h"),
-            (TfIndex::H2, "candles_2h"),
-            (TfIndex::H3, "candles_3h"),
-            (TfIndex::H4, "candles_4h"),
             (TfIndex::D1, "candles_1d"),
         ];
         for (tf, expected) in pairs {
@@ -461,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_extraction_is_deterministic_for_identical_inputs() {
-        let s = mk_seal(13, 0, TfIndex::H4, 1_716_001_500, 200.75);
+        let s = mk_seal(13, 0, TfIndex::M15, 1_716_001_500, 200.75);
         let a = ShadowSealRow::from_buffered_seal(&s);
         let b = ShadowSealRow::from_buffered_seal(&s);
         assert_eq!(a, b);
@@ -479,9 +472,15 @@ mod tests {
         state.bucket_start_cumulative = 999;
         state.oi = 7_777_777;
         state.tick_count = 42;
-        let seal = BufferedSeal::new(99, EXCHANGE_SEGMENT_NSE_FNO, TfIndex::H4, state, Feed::Dhan);
+        let seal = BufferedSeal::new(
+            99,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            TfIndex::M15,
+            state,
+            Feed::Dhan,
+        );
         let row = ShadowSealRow::from_buffered_seal(&seal);
-        assert_eq!(row.table_name, "candles_4h");
+        assert_eq!(row.table_name, "candles_15m");
         assert_eq!(row.timestamp_ist_nanos, 1_716_001_500_i64 * 1_000_000_000);
         assert_eq!(row.security_id, 99);
         assert_eq!(row.segment, "NSE_FNO");

@@ -40,9 +40,9 @@
 //! |---|---|---|
 //! | 0    | 4 | `security_id` low-32 (legacy/Dhan; full u64 at 120-128) |
 //! | 4    | 1 | `exchange_segment_code: u8`     |
-//! | 5    | 1 | `tf_ordinal: u8` (0..=20 per `TfIndex`) |
+//! | 5    | 1 | `tf_ordinal: u8` (0..=4 per `TfIndex`) |
 //! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
-//! | 7    | 1 | padding                         |
+//! | 7    | 1 | `format_version: u8` (=1; 2026-07-21 C2 — 0 = pre-renumber legacy, REFUSED on load) |
 //! | 8    | 4 | `bucket_start_ist_secs: u32`    |
 //! | 12   | 4 | `tick_count: u32`               |
 //! | 16   | 8 | `volume: u64`                   |
@@ -88,10 +88,17 @@ const SEAL_SPILL_DIR: &str = "data/spill";
 /// migration must be coordinated.
 pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
 
+/// On-disk spill-record format version, written at byte 7 (the former
+/// padding byte, zero in every pre-C2 record). The 2026-07-21 C2 frame
+/// retirement RENUMBERED `TfIndex` ordinals (old M2=1 would decode as
+/// new M3=1 — silent TF mis-assignment), so `read_all` REFUSES records
+/// whose byte 7 is 0 (legacy ordinal space) instead of misdecoding them.
+pub const SEAL_SPILL_FORMAT_VERSION: u8 = 1;
+
 /// Self-contained binary record for spilled sealed bars.
 ///
 /// Field layout matches the wire-format table above. The
-/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=20)
+/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=4)
 /// from the trading crate; the glue slice translates
 /// `BufferedSeal::tf` ↔ `tf_ordinal` via a checked
 /// `TfIndex::from_ordinal` round-trip.
@@ -154,7 +161,9 @@ impl SerializedSeal {
         // Feed provenance round-trips through disk spill (byte 6; pre-feed
         // records have 0 here → Feed::Dhan on read).
         buf[6] = self.feed.index() as u8;
-        // buf[7] = padding (zero)
+        // Byte 7 = spill format version (0 = pre-C2 legacy ordinal space,
+        // refused on load — see `SEAL_SPILL_FORMAT_VERSION`).
+        buf[7] = SEAL_SPILL_FORMAT_VERSION;
         buf[8..12].copy_from_slice(&self.bucket_start_ist_secs.to_le_bytes());
         buf[12..16].copy_from_slice(&self.tick_count.to_le_bytes());
         buf[16..24].copy_from_slice(&self.volume.to_le_bytes());
@@ -464,10 +473,20 @@ impl SealSpillWriter {
             .with_context(|| format!("failed to open spill file {path:?}"))?;
         let mut reader = BufReader::new(file);
         let mut all = Vec::new();
+        let mut legacy_refused: usize = 0;
         let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
         loop {
             match read_full_record(&mut reader, &mut buf) {
                 Ok(true) => {
+                    // Format-version gate (2026-07-21 C2): a byte-7 of 0 marks a
+                    // pre-renumber record whose tf_ordinal lives in the OLD 12-frame
+                    // ordinal space (old M2=1 would misdecode as new M3=1). Refuse
+                    // the record, keep draining — a daily file can legitimately mix
+                    // legacy + v1 records via append across a deploy boundary.
+                    if buf[7] == 0 {
+                        legacy_refused += 1;
+                        continue;
+                    }
                     if let Some(seal) = SerializedSeal::from_bytes(&buf) {
                         all.push(seal);
                     } else {
@@ -484,6 +503,14 @@ impl SealSpillWriter {
                     break;
                 }
             }
+        }
+        if legacy_refused > 0 {
+            warn!(
+                ?path,
+                legacy_refused,
+                "refused pre-renumber legacy spill records (format_version byte 0 — \
+                 old TfIndex ordinal space; deleted with the file after drain)"
+            );
         }
         info!(?path, count = all.len(), "drained spill file");
         Ok(all)
@@ -685,6 +712,54 @@ mod tests {
     }
 
     #[test]
+    fn test_to_bytes_stamps_format_version_and_roundtrips() {
+        // Every freshly-written record carries SEAL_SPILL_FORMAT_VERSION at
+        // byte 7 and still decodes through from_bytes (the version byte is
+        // a read_all-level gate, not a from_bytes-level one).
+        let seal = mk_seal(42, 1, 3, 1_716_000_900, 111.5);
+        let bytes = seal.to_bytes();
+        assert_eq!(bytes[7], SEAL_SPILL_FORMAT_VERSION);
+        let decoded = SerializedSeal::from_bytes(&bytes).expect("decodes");
+        assert_eq!(decoded, seal);
+    }
+
+    #[test]
+    fn test_read_all_refuses_legacy_records_but_drains_v1_siblings() {
+        // A daily spill file mixing a pre-renumber legacy record (byte 7
+        // == 0 — OLD TfIndex ordinal space) with a current v1 record must
+        // drain ONLY the v1 record; the legacy one is refused (never
+        // misdecoded into the renumbered ordinal space) and lost with the
+        // file when clear_spill_for_date deletes it after drain.
+        let dir = temp_spill_dir("legacy-refusal");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_716_000_000_i64;
+
+        // Legacy record: forge byte 7 back to 0 (the pre-C2 padding value).
+        let legacy = mk_seal(13, 0, 1, 1_716_000_900, 100.0);
+        let mut legacy_bytes = legacy.to_bytes();
+        legacy_bytes[7] = 0;
+
+        // Current v1 record (to_bytes stamps the version).
+        let v1 = mk_seal(25, 1, 2, 1_716_001_500, 200.75);
+        let v1_bytes = v1.to_bytes();
+
+        let path = writer.spill_path(now);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let mut raw = Vec::with_capacity(2 * SEAL_SPILL_RECORD_SIZE);
+        raw.extend_from_slice(&legacy_bytes);
+        raw.extend_from_slice(&v1_bytes);
+        std::fs::write(&path, &raw).expect("write mixed spill file");
+
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(drained.len(), 1, "only the v1 record must drain");
+        assert_eq!(drained[0], v1);
+
+        writer.clear_spill_for_date(now).expect("clear");
+        assert!(!path.exists(), "spill file deleted after drain");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_serialized_seal_from_bytes_rejects_truncated_buffer() {
         let short = vec![0u8; SEAL_SPILL_RECORD_SIZE - 1];
         assert_eq!(SerializedSeal::from_bytes(&short), None);
@@ -692,16 +767,18 @@ mod tests {
 
     #[test]
     fn test_serialized_seal_to_bytes_padding_zero_filled() {
-        // Bytes 6..8 (between tf_ordinal and bucket_start_ist_secs)
-        // and bytes 104..128 (reserved tail) MUST be zero so the file
-        // format is deterministic and grep-friendly. §31 Option 2 now
+        // Byte 6 is the feed index (0 = Dhan here); byte 7 carries the
+        // spill format version (C2, 2026-07-21) so legacy pre-renumber
+        // records (byte 7 == 0) are refusable on load. §31 Option 2 now
         // uses bytes 96..104 for `open_pct`, so the zero-padding tail
         // starts at 104.
         let seal = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
         let bytes = seal.to_bytes();
-        for i in [6, 7] {
-            assert_eq!(bytes[i], 0, "padding byte at {i} not zero");
-        }
+        assert_eq!(bytes[6], 0, "feed byte must be 0 (Dhan) for mk_seal");
+        assert_eq!(
+            bytes[7], SEAL_SPILL_FORMAT_VERSION,
+            "byte 7 must carry the spill format version"
+        );
         // §31: bytes 96..104 carry open_pct (mk_seal sets 7.7 → non-zero).
         assert_ne!(
             &bytes[96..104],
@@ -984,9 +1061,9 @@ mod tests {
     }
 
     #[test]
-    fn test_from_buffered_seal_maps_all_21_tfs_to_correct_ordinal() {
+    fn test_from_buffered_seal_maps_all_five_tfs_to_correct_ordinal() {
         // Verify every TfIndex variant maps to its canonical ordinal
-        // (0..=20). This pins the trading↔storage contract: a future
+        // (0..=4). This pins the trading↔storage contract: a future
         // re-ordering of TfIndex::ALL would silently flip every
         // spilled record's TF assignment.
         let buffered = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
@@ -1021,8 +1098,8 @@ mod tests {
     fn test_serialized_seal_tf_returns_none_for_out_of_range_ordinal() {
         let mut s =
             SerializedSeal::from(&mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
-        // 21 timeframes → valid ordinals are 0..=20; the first
-        // out-of-range ordinal is `TfIndex::ALL.len()` (= 21).
+        // 5 timeframes → valid ordinals are 0..=4; the first
+        // out-of-range ordinal is `TfIndex::ALL.len()` (= 5).
         s.tf_ordinal = TfIndex::ALL.len() as u8; // out of range
         assert_eq!(s.tf(), None);
         s.tf_ordinal = 255;
@@ -1031,7 +1108,7 @@ mod tests {
 
     #[test]
     fn test_try_into_buffered_seal_roundtrip_preserves_every_field() {
-        let original = mk_buffered_seal(25, 1, TfIndex::H4, 1_716_001_500, 200.75);
+        let original = mk_buffered_seal(25, 1, TfIndex::M15, 1_716_001_500, 200.75);
         let serialised = SerializedSeal::from(&original);
         let recovered = serialised
             .try_into_buffered_seal()

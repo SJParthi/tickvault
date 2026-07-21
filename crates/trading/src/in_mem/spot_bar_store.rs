@@ -12,7 +12,7 @@
 //! Per `(feed, security_id, exchange_segment)` slot (I-P1-11 composite —
 //! `security_id` alone is never a key) × per [`TfIndex`] ring of SEALED
 //! bars. Ring capacity = `spot_days` (config, default 35) ×
-//! [`bars_per_day`] for that TF (Σ over the 12 TFs = 912 bars/day/slot;
+//! [`bars_per_day`] for that TF (Σ over the 5 TFs = 601 bars/day/slot;
 //! ~17 MB at 8 slots × 35 days — test-asserted under a 40 MB ceiling).
 //! [`RamBar`] is a 48-byte `Copy` struct; rings are `VecDeque<RamBar>`
 //! pre-allocated at slot creation — the steady-state live write is an O(1)
@@ -86,8 +86,8 @@ pub const fn bars_per_day(tf: TfIndex) -> u32 {
     if bars == 0 { 1 } else { bars }
 }
 
-/// Σ [`bars_per_day`] over all 12 TFs — the per-slot per-day bar count
-/// (912; pinned by `test_bars_per_day_session_math`).
+/// Σ [`bars_per_day`] over all 5 TFs — the per-slot per-day bar count
+/// (601; pinned by `test_bars_per_day_session_math`).
 #[must_use]
 // TEST-EXEMPT: pure Σ over bars_per_day — pinned by test_bars_per_day_session_math + the capacity-envelope tests.
 pub fn total_bars_per_day_all_tfs() -> u32 {
@@ -529,13 +529,11 @@ mod tests {
     fn test_bars_per_day_session_math() {
         // ceil(22_500 / tf_secs), floored at 1 — spot-checked + summed.
         assert_eq!(bars_per_day(TfIndex::M1), 375);
-        assert_eq!(bars_per_day(TfIndex::M2), 188);
+        assert_eq!(bars_per_day(TfIndex::M3), 125);
+        assert_eq!(bars_per_day(TfIndex::M5), 75);
         assert_eq!(bars_per_day(TfIndex::M15), 25);
-        assert_eq!(bars_per_day(TfIndex::M30), 13);
-        assert_eq!(bars_per_day(TfIndex::H1), 7);
-        assert_eq!(bars_per_day(TfIndex::H4), 2);
         assert_eq!(bars_per_day(TfIndex::D1), 1);
-        assert_eq!(total_bars_per_day_all_tfs(), 912);
+        assert_eq!(total_bars_per_day_all_tfs(), 601);
         assert_eq!(SESSION_SECS, 22_500);
     }
 
@@ -544,8 +542,8 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 912 × 35 × 8 × 48 = 12_257_280 B ≈ 11.7 MiB.
-        assert_eq!(bytes, 12_257_280);
+        // 601 × 35 × 8 × 48 = 8_077_440 B ≈ 7.7 MiB.
+        assert_eq!(bytes, 8_077_440);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -591,24 +589,24 @@ mod tests {
 
     #[test]
     fn test_spot_bar_store_wraparound_evicts_oldest() {
-        // spot_days=1 → M30 capacity = 13 bars; the 14th append evicts the
+        // spot_days=1 → M15 capacity = 25 bars; the 26th append evicts the
         // oldest, and an over-window old bar is dropped (never displaces).
         let store = SpotBarStore::new(1);
-        let cap = bars_per_day(TfIndex::M30) as usize;
-        assert_eq!(cap, 13);
+        let cap = bars_per_day(TfIndex::M15) as usize;
+        assert_eq!(cap, 25);
         for i in 0..(cap as u32 + 1) {
-            store.append_sealed(key(), TfIndex::M30, bar(OPEN0 + i * 1_800, f64::from(i)));
+            store.append_sealed(key(), TfIndex::M15, bar(OPEN0 + i * 900, f64::from(i)));
         }
-        let bars = store.latest_n(key(), TfIndex::M30, 100);
+        let bars = store.latest_n(key(), TfIndex::M15, 100);
         assert_eq!(bars.len(), cap, "capacity must hold after wraparound");
         assert_eq!(
-            store.bar_at(key(), TfIndex::M30, OPEN0),
+            store.bar_at(key(), TfIndex::M15, OPEN0),
             None,
             "the oldest bar must be evicted"
         );
         // An over-window (older-than-front) bar at capacity is dropped.
         assert_eq!(
-            store.append_sealed(key(), TfIndex::M30, bar(OPEN0 - 1_800, 999.0)),
+            store.append_sealed(key(), TfIndex::M15, bar(OPEN0 - 900, 999.0)),
             UpsertOutcome::DroppedOverWindow
         );
         assert_eq!(store.stats().dropped_over_window, 1);
@@ -661,20 +659,20 @@ mod tests {
         // ring must keep the NEWEST `capacity` bars and drop the OLDEST
         // prefix — never the old keep-oldest/drop-newest direction.
         let store = SpotBarStore::new(1);
-        let cap = bars_per_day(TfIndex::M30) as usize; // 13
+        let cap = bars_per_day(TfIndex::M15) as usize; // 25
         let mut bars = Vec::with_capacity(cap + 2);
         for i in 0..(cap as u32 + 2) {
-            bars.push(bar(OPEN0 + i * 1_800, f64::from(i)));
+            bars.push(bar(OPEN0 + i * 900, f64::from(i)));
         }
-        let out = store.record_day_block(key(), TfIndex::M30, &bars);
+        let out = store.record_day_block(key(), TfIndex::M15, &bars);
         assert_eq!(out.recorded, cap, "exactly capacity bars recorded");
         assert_eq!(out.dropped_over_window, 2, "the 2 OLDEST bars dropped");
         // The oldest two are absent; the newest survives.
-        assert!(store.bar_at(key(), TfIndex::M30, OPEN0).is_none());
-        assert!(store.bar_at(key(), TfIndex::M30, OPEN0 + 1_800).is_none());
+        assert!(store.bar_at(key(), TfIndex::M15, OPEN0).is_none());
+        assert!(store.bar_at(key(), TfIndex::M15, OPEN0 + 900).is_none());
         assert_eq!(
             store
-                .bar_at(key(), TfIndex::M30, OPEN0 + (cap as u32 + 1) * 1_800)
+                .bar_at(key(), TfIndex::M15, OPEN0 + (cap as u32 + 1) * 900)
                 .map(|b| b.close),
             Some(f64::from(cap as u32 + 1)),
             "the NEWEST bar must be resident"
@@ -728,8 +726,8 @@ mod tests {
         assert_eq!(stats.bars_resident_per_feed[Feed::Groww.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Groww.index()], 1);
-        // Two slots × 1 day × 912 bars × 48 B of pre-allocated capacity.
-        assert_eq!(stats.estimated_bytes, 2 * 912 * 48);
+        // Two slots × 1 day × 601 bars × 48 B of pre-allocated capacity.
+        assert_eq!(stats.estimated_bytes, 2 * 601 * 48);
     }
 
     #[test]

@@ -41,7 +41,7 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks"];
 
 /// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
-/// past the hot window. The 12 live **candle** tables (`candles_1m` …
+/// past the hot window. The 5 live **candle** tables (`candles_1m` …
 /// `candles_1d`) are NOT listed here — they are swept by iterating
 /// [`crate::shadow_persistence::candle_table_names`] (the single source of
 /// truth, `TfIndex::table_name()`) so the candle names can never drift.
@@ -80,7 +80,7 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // (2026-06-19 Step 3b-ii) Groww 1-minute candles ALSO no longer have a
     // separate `groww_candles_1m` table — Groww writes the SHARED `candles_1m`
     // tagged feed='groww', which is already swept via `candle_table_names()` in
-    // `detach_old_partitions` (the 12 plain candle tables). So no
+    // `detach_old_partitions` (the 5 plain candle tables). So no
     // `groww_candles_1m` entry here.
     // Groww second-feed live-vs-backtest 1m parity mismatches (operator lock §32):
     // one row per mismatched (instrument, minute, field) — same SEBI-audit class +
@@ -285,7 +285,7 @@ impl PartitionManager {
             }
         }
 
-        // The 12 live candle tables (`candles_1m` … `candles_1d`), DAY-partitioned.
+        // The 5 live candle tables (`candles_1m` … `candles_1d`), DAY-partitioned.
         // Derived from `candle_table_names()` (the single source of truth,
         // `TfIndex::table_name()`) so the swept names can NEVER drift from what is
         // actually created/written. This is the dominant disk-growth source —
@@ -663,9 +663,9 @@ mod tests {
     fn test_candle_tables_are_real_plain_names_not_shadow() {
         // The candle tables swept by detach_old_partitions come from the single
         // source of truth. They MUST be plain `candles_<TF>` (no `_shadow`) and
-        // number 12 — this is the exact bug #1022 had (phantom `_shadow` names).
+        // number 5 — this is the exact bug #1022 had (phantom `_shadow` names).
         let names = crate::shadow_persistence::candle_table_names();
-        assert_eq!(names.len(), 12, "expected 12 live candle tables");
+        assert_eq!(names.len(), 5, "expected 5 live candle tables");
         for name in names {
             assert!(
                 name.starts_with("candles_"),
