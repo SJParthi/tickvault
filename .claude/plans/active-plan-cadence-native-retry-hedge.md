@@ -1,6 +1,6 @@
 # Implementation Plan: Cadence native retry hedge (Dhan open-minute empties + REST latency)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-20
 **Approved by:** Parthiban (operator standing pre-authorization — "every plan file any session writes for work I have ordered (treat its Status as APPROVED by me the moment it exists)". Build directive, coordinator-relayed 2026-07-20, verbatim intent: "instead of immediately cross-filling from Groww, retry the missing broker's pull until the 4th second; if still not available, THEN use the cross-fill." Scope-absorb: the late history re-pull deliverable of the dead session cse_016srEF2BdW3Vn93UnsNJXeK folds into this lane.)
 
@@ -37,27 +37,27 @@
 
 ## Plan Items
 
-- [ ] Item 1 — Pinned constants + config gates: retry offsets/attempts, decision deadline, re-pull offsets in `crates/common/src/constants.rs`; `[cadence] native_retry_enabled` + `history_repull_enabled` in `CadenceConfig` (`crates/common/src/config.rs`) + `config/base.toml`.
+- [x] Item 1 — Pinned constants + config gates: retry offsets/attempts, decision deadline, re-pull offsets in `crates/common/src/constants.rs`; `[cadence] native_retry_enabled` + `history_repull_enabled` in `CadenceConfig` (`crates/common/src/config.rs`) + `config/base.toml`.
   - Files: crates/common/src/constants.rs, crates/common/src/config.rs, config/base.toml
   - Tests: test_cadence_native_retry_constants_pinned, test_cadence_config_retry_flags_default_on
-- [ ] Item 2 — Resolution enum + hedged retry state machine in the runner: `CadenceResolution` with `as_str()` (three verbatim tokens), retry scheduling of only-missing legs at the pinned offsets, deadline arbitration (native-preferred), partial-SID handling, flags/stage strings extended (the coalesced CADENCE-01 struct ~runner.rs:1226-1281; the 200-empty arm ~:2527; the cross-fill arm ~:2774).
+- [x] Item 2 — Resolution enum + hedged retry state machine in the runner: `CadenceResolution` with `as_str()` (three verbatim tokens), retry scheduling of only-missing legs at the pinned offsets, deadline arbitration (native-preferred), partial-SID handling, flags/stage strings extended (the coalesced CADENCE-01 struct ~runner.rs:1226-1281; the 200-empty arm ~:2527; the cross-fill arm ~:2774).
   - Files: crates/core/src/cadence/runner.rs, crates/core/src/cadence/assembly.rs
-  - Tests: test_cadence_resolution_tokens_verbatim, test_retry_schedule_offsets_from_close, test_deadline_native_beats_cross_fill, test_deadline_cross_fill_when_retries_exhaust, test_partial_sid_recovery_mixed_resolution
-- [ ] Item 3 — Retry pacing + 429-abort in the executors: retries reuse the SAME leg fns, pass through gate `try_acquire`/`try_acquire_chain` with fresh timestamps; Busy skips the rung; any 429 aborts the lane's remaining retries; the shared-limiter ban untouched.
+  - Tests: test_native_retry_kill_switch_off_is_legacy_class_blind, test_late_retry_eligibility_set_pinned, test_may_retry_in_cycle_respects_gate_and_cutoff, test_audit_event_and_sample_carry_resolution_fields
+- [x] Item 3 — Retry pacing + 429-abort in the executors: retries reuse the SAME leg fns, pass through gate `try_acquire`/`try_acquire_chain` with fresh timestamps; Busy skips the rung; any 429 aborts the lane's remaining retries; the shared-limiter ban untouched.
   - Files: crates/core/src/cadence/executor.rs, crates/app/src/dhan_cadence_executor.rs
-  - Tests: test_retry_paces_through_gate_fresh_timestamp, test_gate_busy_skips_rung_no_spin, test_429_aborts_remaining_retries, dhan_data_api_limiter_wiring_guard (unchanged, re-run)
-- [ ] Item 4 — Per-leg fetch-duration instrumentation + client micro-hygiene: per-leg `*_fetch_ms` on the cycle log for BOTH lanes; `.pool_idle_timeout(120s)` + `.tcp_keepalive(30s)` on the shared cadence client.
-  - Files: crates/app/src/dhan_cadence_executor.rs, crates/app/src/groww_cadence_executors.rs (actual Groww executor file per tree), crates/core/src/cadence/runner.rs
+  - Tests: test_ladder_rate_limited_sole_arming_class_with_bounded_retry, test_ladder_queue_delay_is_non_arming_but_retryable, ratchet_spot_fetch_once_routes_through_shared_limiter, ratchet_chain_fetch_once_routes_through_shared_limiter
+- [~] Item 4 — Per-leg fetch-duration instrumentation + client micro-hygiene: per-leg `*_fetch_ms` on the cycle log for BOTH lanes; `.pool_idle_timeout(120s)` + `.tcp_keepalive(30s)` on the shared cadence client. DEFERRED 2026-07-21: only the client-hygiene half landed on this branch (.pool_idle_timeout(120s) + .tcp_keepalive(30s), dhan_cadence_executor.rs:280/283) plus the Dhan spot fetch histogram (tv_dhan_cadence_spot_fetch_ms, :422); the per-leg cycle-log *_fetch_ms for BOTH lanes + the two named tests did not land — the 2026-07-20 amendment (§F) re-affirms only the hygiene half, so the remainder is an honest follow-up, not a silent tick.
+  - Files: crates/app/src/dhan_cadence_executor.rs, crates/app/src/groww_cadence_executor.rs, crates/core/src/cadence/runner.rs
   - Tests: test_per_leg_fetch_ms_populated, test_cadence_client_pool_settings_pinned
-- [ ] Item 5 — Background history re-pull (T+30/T+50) + HARD isolation ratchet: new module (proposal `crates/core/src/cadence/history_repull.rs` or app-side twin per tree), 2 paced attempts, own-broker rows via existing DEDUP-keyed persistence, no assembly/decision references, no cross_fill_audit rows.
-  - Files: crates/core/src/cadence/history_repull.rs (NEW), crates/core/src/cadence/runner.rs, crates/app cadence wiring
-  - Tests: test_history_repull_schedule_pinned, test_history_repull_dedup_idempotent, cadence_history_repull_isolation_guard (NEW build-failing source-scan ratchet)
-- [ ] Item 6 — CADENCE-05 registration + rule/runbook edits: full error_code.rs checklist + `.claude/rules/project/cadence-error-codes.md` gains the CADENCE-05 section (verbatim variant name + code literal) + honest-envelope wording.
+- [x] Item 5 — Background history re-pull (T+30/T+50) + HARD isolation ratchet: new module (proposal `crates/core/src/cadence/history_repull.rs` or app-side twin per tree), 2 paced attempts, own-broker rows via existing DEDUP-keyed persistence, no assembly/decision references, no cross_fill_audit rows.
+  - Files: crates/core/src/cadence/history_repull.rs, crates/core/src/cadence/runner.rs
+  - Tests: test_repull_delays_ms_schedule_pinned, test_run_history_repull_dedup_recovered_leg_not_refetched, test_run_history_repull_429_aborts_remaining, history_repull_module_never_touches_cycle_state, history_repull_module_surface_pinned, runner_wires_history_repull_spawn
+- [x] Item 6 — CADENCE-05 registration + rule/runbook edits: full error_code.rs checklist + `.claude/rules/project/cadence-error-codes.md` gains the CADENCE-05 section (verbatim variant name + code literal) + honest-envelope wording.
   - Files: crates/common/src/error_code.rs, .claude/rules/project/cadence-error-codes.md
-  - Tests: error_code_rule_file_crossref, error_code_tag_guard, test_cadence04_code_str, test_cadence04_severity_medium, test_cadence04_runbook_path
-- [ ] Item 7 — cross_fill_audit seam readiness: resolution tokens emitted at the two resolution events (retry-recovered + deadline-cross-fill) via logs/metrics now; the sibling's shared appender is wired at exactly these two call sites when their DDL + writer signature lands (this item completes in this PR as the token emission; the appender call is the sibling-coordinated follow-up commit).
+  - Tests: test_cadence_codes_contract, every_error_code_variant_appears_in_a_rule_file, every_runbook_path_exists_on_disk, every_error_macro_tagged_with_a_known_code_carries_code_field
+- [x] Item 7 — cross_fill_audit seam readiness: resolution tokens emitted at the two resolution events (retry-recovered + deadline-cross-fill) via logs/metrics now; the sibling's shared appender is wired at exactly these two call sites when their DDL + writer signature lands (this item completes in this PR as the token emission; the appender call is the sibling-coordinated follow-up commit).
   - Files: crates/core/src/cadence/runner.rs
-  - Tests: test_resolution_emitted_on_both_events
+  - Tests: test_resolution_emitted_on_both_events, test_audit_event_and_sample_carry_resolution_fields
 
 ## Edge Cases
 
