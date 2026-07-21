@@ -71,8 +71,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 ENV="${TV_ENV:-prod}"
 REGION="${AWS_REGION:-ap-south-1}"          # ap-south-1 Mumbai per aws-budget.md
-FROM_TYPE="${FROM_TYPE:-r8g.large}"         # the prior locked type to flip FROM (overridable)
-TO_TYPE="${TO_TYPE:-t4g.medium}"            # operator lock 2026-07-15 §7 Quote 8 (downsize)
+FROM_TYPE="${FROM_TYPE:-t4g.medium}"         # the prior locked type to flip FROM (overridable)
+TO_TYPE="${TO_TYPE:-m8g.large}"            # operator lock 2026-07-15 §7 Quote 8 (downsize)
 NAME_TAG="tv-${ENV}-app"
 
 # Allowlist of flip targets. Adding a new type here is NOT the same as

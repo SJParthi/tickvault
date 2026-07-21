@@ -47,7 +47,7 @@ fn read(path: &Path) -> String {
 /// retained per house convention), so no `!contains("r8g.large")` assert —
 /// the §7 HEADING pin below is what forbids r8g.large as the CURRENT lock.
 #[test]
-fn instance_lock_authoritative_rule_file_pins_t4g_medium() {
+fn instance_lock_authoritative_rule_file_pins_m8g_large() {
     let root = repo_root();
     let path = root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
     assert!(
@@ -69,8 +69,8 @@ fn instance_lock_authoritative_rule_file_pins_t4g_medium() {
         "daily-universe rule file must pin 4 GiB RAM for t4g.medium"
     );
     assert!(
-        body.contains("Instance lock — t4g.medium"),
-        "the §7 heading must lock t4g.medium (not r8g.large) as the CURRENT instance type"
+        body.contains("Instance lock — m8g.large"),
+        "the §7 heading must lock m8g.large (not t4g.medium) as the CURRENT instance type"
     );
 }
 
