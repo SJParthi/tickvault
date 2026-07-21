@@ -11,7 +11,7 @@
 //! testing. Putting the column-typing logic in a pure function lets us
 //! exhaustively test:
 //!
-//! - timeframe → table name dispatch (all 21 TFs)
+//! - timeframe → table name dispatch (all 12 TFs)
 //! - segment-code → ILP `symbol` string (all 8 segments + UNKNOWN)
 //! - the `bucket_start_ist_secs * 1_000_000_000` IST-nanos conversion
 //!   (CRITICAL data-integrity rule — the WS LTT carries IST already,
@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_name_dispatches_correctly_for_all_21_tfs() {
+    fn test_table_name_dispatches_correctly_for_all_twenty_one_tfs() {
         for tf in TfIndex::ALL {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(
@@ -279,26 +279,26 @@ mod tests {
         // candles across two tables — silent data loss class bug).
         let pairs = [
             (TfIndex::M1, "candles_1m"),
-            (TfIndex::M2, "candles_2m"),
             (TfIndex::M3, "candles_3m"),
-            (TfIndex::M4, "candles_4m"),
             (TfIndex::M5, "candles_5m"),
-            (TfIndex::M6, "candles_6m"),
-            (TfIndex::M7, "candles_7m"),
-            (TfIndex::M8, "candles_8m"),
-            (TfIndex::M9, "candles_9m"),
-            (TfIndex::M10, "candles_10m"),
-            (TfIndex::M11, "candles_11m"),
-            (TfIndex::M12, "candles_12m"),
-            (TfIndex::M13, "candles_13m"),
-            (TfIndex::M14, "candles_14m"),
             (TfIndex::M15, "candles_15m"),
-            (TfIndex::M30, "candles_30m"),
-            (TfIndex::H1, "candles_1h"),
-            (TfIndex::H2, "candles_2h"),
-            (TfIndex::H3, "candles_3h"),
-            (TfIndex::H4, "candles_4h"),
             (TfIndex::D1, "candles_1d"),
+            (TfIndex::S1, "candles_1s"),
+            (TfIndex::S2, "candles_2s"),
+            (TfIndex::S3, "candles_3s"),
+            (TfIndex::S4, "candles_4s"),
+            (TfIndex::S5, "candles_5s"),
+            (TfIndex::S6, "candles_6s"),
+            (TfIndex::S7, "candles_7s"),
+            (TfIndex::S8, "candles_8s"),
+            (TfIndex::S9, "candles_9s"),
+            (TfIndex::S10, "candles_10s"),
+            (TfIndex::S11, "candles_11s"),
+            (TfIndex::S12, "candles_12s"),
+            (TfIndex::S13, "candles_13s"),
+            (TfIndex::S14, "candles_14s"),
+            (TfIndex::S15, "candles_15s"),
+            (TfIndex::S30, "candles_30s"),
         ];
         for (tf, expected) in pairs {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_extraction_is_deterministic_for_identical_inputs() {
-        let s = mk_seal(13, 0, TfIndex::H4, 1_716_001_500, 200.75);
+        let s = mk_seal(13, 0, TfIndex::M15, 1_716_001_500, 200.75);
         let a = ShadowSealRow::from_buffered_seal(&s);
         let b = ShadowSealRow::from_buffered_seal(&s);
         assert_eq!(a, b);
@@ -488,9 +488,15 @@ mod tests {
         state.bucket_start_cumulative = 999;
         state.oi = 7_777_777;
         state.tick_count = 42;
-        let seal = BufferedSeal::new(99, EXCHANGE_SEGMENT_NSE_FNO, TfIndex::H4, state, Feed::Dhan);
+        let seal = BufferedSeal::new(
+            99,
+            EXCHANGE_SEGMENT_NSE_FNO,
+            TfIndex::M15,
+            state,
+            Feed::Dhan,
+        );
         let row = ShadowSealRow::from_buffered_seal(&seal);
-        assert_eq!(row.table_name, "candles_4h");
+        assert_eq!(row.table_name, "candles_15m");
         assert_eq!(row.timestamp_ist_nanos, 1_716_001_500_i64 * 1_000_000_000);
         assert_eq!(row.security_id, 99);
         assert_eq!(row.segment, "NSE_FNO");
