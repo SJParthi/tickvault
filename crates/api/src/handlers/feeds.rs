@@ -475,6 +475,8 @@ mod tests {
         reg.set_decode_counts(Feed::Groww, 1500, 12);
         let state = test_state_with_health(
             FeedsConfig {
+                gdf_enabled: false,
+                gdf: Default::default(),
                 dhan_enabled: true,
                 groww_enabled: true,
                 ..Default::default()
@@ -512,6 +514,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_feeds_reports_seeded_state() {
         let state = test_state(FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: true,
             groww_enabled: false,
             ..Default::default()
@@ -527,6 +531,8 @@ mod tests {
     #[tokio::test]
     async fn test_set_feed_groww_enable_refused_409_after_retirement() {
         let state = test_state(FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: true,
             groww_enabled: false,
             ..Default::default()
@@ -556,6 +562,8 @@ mod tests {
     #[tokio::test]
     async fn test_set_feed_groww_disable_flips_state() {
         let state = test_state(FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: true,
             groww_enabled: true,
             ..Default::default()
@@ -641,6 +649,8 @@ mod tests {
     #[tokio::test]
     async fn test_set_feed_dhan_enable_refused_when_config_off_dry_run_mode() {
         let state = test_state(FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: false,
             groww_enabled: true,
             ..Default::default()
@@ -673,6 +683,8 @@ mod tests {
     #[tokio::test]
     async fn test_set_feed_dhan_enable_refused_when_config_off_live_trading_mode() {
         let state = test_state(FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: false,
             groww_enabled: true,
             ..Default::default()
@@ -696,6 +708,8 @@ mod tests {
     #[tokio::test]
     async fn test_set_feed_dhan_disable_still_allowed_when_config_off() {
         let state = test_state(FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: false,
             groww_enabled: true,
             ..Default::default()
@@ -728,6 +742,8 @@ mod tests {
                 health,
                 Arc::new(FeedRuntimeState::from_config_with_dhan_config(
                     &FeedsConfig {
+                        gdf_enabled: false,
+                        gdf: Default::default(),
                         dhan_enabled: false,
                         groww_enabled: true,
                         ..Default::default()
@@ -757,6 +773,8 @@ mod tests {
     #[tokio::test]
     async fn test_set_feed_groww_disable_unaffected_when_dhan_config_off() {
         let state = test_state(FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: false,
             groww_enabled: true,
             ..Default::default()

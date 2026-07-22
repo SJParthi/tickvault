@@ -263,6 +263,8 @@ pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>)
         None => config,
         // The persisted overlay carries ONLY the runtime toggles.
         Some(p) => FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             // 2026-07-13: narrow-only for Dhan — config-off wins over any
             // persisted-on (the retired live WS lane can never be
             // overlay-resurrected); config-on + persisted-off still honors
@@ -461,6 +463,8 @@ mod tests {
         // opposite — the narrow (dhan-off) sticks, the widen (groww-on) is
         // suppressed by the 2026-07-15 Groww AND-gate.
         let config = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: true,
             groww_enabled: false,
             ..Default::default()
@@ -483,6 +487,8 @@ mod tests {
     #[test]
     fn test_overlay_none_keeps_config_default() {
         let config = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: true,
             groww_enabled: false,
             ..Default::default()
@@ -506,6 +512,8 @@ mod tests {
         );
         // The boot then uses the config default unchanged.
         let config = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: true,
             groww_enabled: false,
             ..Default::default()
@@ -546,6 +554,8 @@ mod tests {
     #[test]
     fn test_overlay_feeds_narrows_only_and_none_is_identity() {
         let cfg = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: true,
             groww_enabled: false,
             ..Default::default()
@@ -611,6 +621,8 @@ mod tests {
     #[test]
     fn test_overlay_feeds_dhan_and_gate_suppresses_stale_widen() {
         let config = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: false,
             groww_enabled: true,
             ..Default::default()
@@ -635,6 +647,8 @@ mod tests {
     #[test]
     fn test_overlay_feeds_dhan_narrow_still_wins() {
         let config = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: true,
             groww_enabled: false,
             ..Default::default()
@@ -661,6 +675,8 @@ mod tests {
         // Widen: config groww-off + persisted groww-on → stays OFF.
         let widened = overlay_feeds(
             FeedsConfig {
+                gdf_enabled: config.gdf_enabled,
+                gdf: config.gdf,
                 dhan_enabled: false,
                 groww_enabled: false,
                 ..Default::default()
@@ -679,6 +695,8 @@ mod tests {
         // Narrow: config groww-on + persisted groww-off → OFF.
         let narrowed = overlay_feeds(
             FeedsConfig {
+                gdf_enabled: config.gdf_enabled,
+                gdf: config.gdf,
                 dhan_enabled: false,
                 groww_enabled: true,
                 ..Default::default()
@@ -701,11 +719,15 @@ mod tests {
     #[test]
     fn test_dhan_overlay_suppressed_predicate() {
         let cfg_off = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: false,
             groww_enabled: true,
             ..Default::default()
         };
         let cfg_on = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: true,
             groww_enabled: true,
             ..Default::default()
@@ -734,11 +756,15 @@ mod tests {
     #[test]
     fn test_groww_overlay_suppressed_predicate() {
         let cfg_off = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: false,
             groww_enabled: false,
             ..Default::default()
         };
         let cfg_on = FeedsConfig {
+            gdf_enabled: config.gdf_enabled,
+            gdf: config.gdf,
             dhan_enabled: false,
             groww_enabled: true,
             ..Default::default()

@@ -364,6 +364,8 @@ mod tests {
     #[test]
     fn test_from_config_seeds_atomics() {
         let feeds = FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: true,
             groww_enabled: true,
             ..Default::default()
@@ -380,6 +382,8 @@ mod tests {
         // runtime toggles flip the atomic, never the config snapshot the
         // API refusal gate reads.
         let feeds = FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: false,
             groww_enabled: true,
             ..Default::default()
@@ -404,6 +408,8 @@ mod tests {
         // RAW TOML said true — the lane is dormant, NOT retired, so the
         // refusal gate must stay open (pre-Phase-A round trip restored).
         let effective_off = FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: false,
             groww_enabled: true,
             ..Default::default()
@@ -424,6 +430,8 @@ mod tests {
         // keyed off the raw value ALONE, so no overlay shape can un-retire a
         // config-OFF lane either.
         let effective_on = FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: true,
             ..Default::default()
         };

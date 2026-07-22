@@ -484,6 +484,8 @@ mod tests {
         use crate::feed_state::{Feed, FeedRuntimeState};
         use tickvault_common::config::FeedsConfig;
         let fr = Arc::new(FeedRuntimeState::from_config(&FeedsConfig {
+            gdf_enabled: false,
+            gdf: Default::default(),
             dhan_enabled: true,
             groww_enabled: true,
             ..Default::default()
