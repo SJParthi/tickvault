@@ -32,13 +32,16 @@ pub enum Feed {
     Dhan,
     /// Groww (feed #2) — sidecar NDJSON producer. Default OFF.
     Groww,
+    /// GDF (feed #3) - Global Data Feeds SubscribeRealtime JSON push
+    /// (gdf-third-feed-scope-2026-07-13.md). Default OFF, trial-first.
+    Gdf,
 }
 
 impl Feed {
     /// The single-source list of every feed. Build every iteration / allowed-list
     /// from this — never a hand-written `[Feed::Dhan, Feed::Groww]` literal — so a
     /// future feed cannot be silently dropped from a list (NTM 2→3 lesson).
-    pub const ALL: &'static [Feed] = &[Feed::Dhan, Feed::Groww];
+    pub const ALL: &'static [Feed] = &[Feed::Dhan, Feed::Groww, Feed::Gdf];
 
     /// The number of feeds — derived from [`Feed::ALL`] so fixed-size per-feed
     /// arrays (e.g. the live-feed health registry) grow automatically with a new
@@ -53,6 +56,7 @@ impl Feed {
         match self {
             Self::Dhan => 0,
             Self::Groww => 1,
+            Self::Gdf => 2,
         }
     }
 
@@ -63,6 +67,7 @@ impl Feed {
         match self {
             Self::Dhan => "dhan",
             Self::Groww => "groww",
+            Self::Gdf => "gdf",
         }
     }
 
@@ -81,7 +86,10 @@ impl Feed {
     /// the handler via `FeedRuntimeState::can_disable_dhan`.
     #[must_use]
     pub const fn is_runtime_toggleable(self) -> bool {
-        matches!(self, Self::Groww | Self::Dhan)
+        match self {
+            Self::Groww | Self::Dhan => true,
+            Self::Gdf => false,
+        }
     }
 
     /// True for lanes whose LIVE-WS transport was RETIRED by operator
@@ -94,6 +102,7 @@ impl Feed {
     pub const fn live_ws_retired(self) -> bool {
         match self {
             Self::Dhan | Self::Groww => true,
+            Self::Gdf => false,
         }
     }
 
@@ -105,6 +114,7 @@ impl Feed {
         match self {
             Self::Dhan => "Dhan",
             Self::Groww => "Groww",
+            Self::Gdf => "GDF",
         }
     }
 }
@@ -135,26 +145,29 @@ mod tests {
         assert_eq!(sorted.len(), labels.len(), "feed labels must be unique");
         assert!(Feed::ALL.contains(&Feed::Dhan));
         assert!(Feed::ALL.contains(&Feed::Groww));
+        assert!(Feed::ALL.contains(&Feed::Gdf));
     }
 
     #[test]
-    fn test_both_feeds_runtime_toggleable() {
-        for &feed in Feed::ALL {
-            let name = feed.as_str();
-            assert!(
-                feed.is_runtime_toggleable(),
-                "{name} must be toggleable (PR-E)"
-            );
-        }
+    fn test_runtime_toggleable_split_dhan_groww_yes_gdf_refused() {
+        // PR-E keeps Dhan + Groww runtime-toggleable. GDF is config+restart
+        // only per gdf-third-feed-scope-2026-07-13.md - the runtime toggle is
+        // refused (default OFF, trial-first).
+        assert!(Feed::Dhan.is_runtime_toggleable());
+        assert!(Feed::Groww.is_runtime_toggleable());
+        assert!(!Feed::Gdf.is_runtime_toggleable());
     }
 
     #[test]
     fn test_live_ws_retired_true_for_both_retired_lanes() {
         // Operator-scare fix (2026-07-20): both live-WS lanes are retired
         // (Dhan 2026-07-13, Groww 2026-07-15) — OFF is the designed state.
-        for &feed in Feed::ALL {
-            assert!(feed.live_ws_retired(), "{feed:?} live-WS lane is retired");
-        }
+        assert!(Feed::Dhan.live_ws_retired());
+        assert!(Feed::Groww.live_ws_retired());
+        assert!(
+            !Feed::Gdf.live_ws_retired(),
+            "GDF future live-WS lane - not retired"
+        );
     }
 
     #[test]
@@ -162,6 +175,7 @@ mod tests {
         // Pin the exact wire labels — storage DEDUP keys + the API depend on them.
         assert_eq!(Feed::Dhan.as_str(), "dhan");
         assert_eq!(Feed::Groww.as_str(), "groww");
+        assert_eq!(Feed::Gdf.as_str(), "gdf");
     }
 
     #[test]
@@ -174,6 +188,7 @@ mod tests {
         }
         assert_eq!(Feed::Dhan.display_name(), "Dhan");
         assert_eq!(Feed::Groww.display_name(), "Groww");
+        assert_eq!(Feed::Gdf.display_name(), "GDF");
     }
 
     #[test]

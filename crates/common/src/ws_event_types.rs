@@ -47,6 +47,10 @@ pub enum WsType {
     /// with the Dhan `order_update` label or the retired market-data
     /// `groww_bridge` rows. Pairs with `feed='groww'`.
     GrowwOrderUpdate,
+    /// The GDF third-feed SubscribeRealtime session
+    /// (gdf-third-feed-scope-2026-07-13.md sec 2) - plain ws:// JSON push.
+    /// Pairs with feed='gdf'.
+    GdfFeed,
 }
 
 impl WsType {
@@ -60,13 +64,14 @@ impl WsType {
             Self::OrderUpdate => "order_update",
             Self::GrowwBridge => "groww_bridge",
             Self::GrowwOrderUpdate => "groww_order_update",
+            Self::GdfFeed => "gdf_feed",
         }
     }
 
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness
     /// without drifting from the enum.
     #[must_use]
-    pub const fn all() -> [WsType; 6] {
+    pub const fn all() -> [WsType; 7] {
         [
             Self::MainFeed,
             Self::Depth20,
@@ -74,6 +79,7 @@ impl WsType {
             Self::OrderUpdate,
             Self::GrowwBridge,
             Self::GrowwOrderUpdate,
+            Self::GdfFeed,
         ]
     }
 }
@@ -202,7 +208,8 @@ mod tests {
                 "depth_200",
                 "order_update",
                 "groww_bridge",
-                "groww_order_update"
+                "groww_order_update",
+                "gdf_feed"
             ]
         );
         // No two variants share a wire label.
@@ -237,7 +244,7 @@ mod tests {
     fn test_all_arrays_match_variant_counts() {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
-        assert_eq!(WsType::all().len(), 6);
+        assert_eq!(WsType::all().len(), 7);
         assert_eq!(WsEventKind::all().len(), 7);
     }
 
