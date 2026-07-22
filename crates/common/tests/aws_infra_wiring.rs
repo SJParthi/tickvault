@@ -100,31 +100,32 @@ fn test_terraform_instance_type_pinned() {
     let content =
         std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
             .expect("variables.tf must be readable"); // APPROVED: test
-    // Operator-lock 2026-07-15 (daily-universe-scope-expansion-2026-05-27.md §7
-    // Quote 8): t4g.medium ONLY (Graviton2 burstable, 4 GiB) — DOWNSIZED from
-    // r8g.large (cost cut; Groww-only runtime). SUPERSEDES the 2026-06-30
-    // r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large locks. Any
-    // reintroduction of r8g.large / m8g.large / c7i.xlarge / c8g.xlarge as the
-    // PINNED type fails this test. (Retired types may still appear in
-    // SUPERSEDES prose — only the validation condition is forbidden.)
+    // Operator-lock 2026-07-21 (daily-universe-scope-expansion-2026-05-27.md §7
+    // Quote 11): m8g.large ONLY (Graviton4, 2 vCPU / 8 GiB) — UPGRADED from
+    // t4g.medium (GDF RAM-first sizing + the t4g capacity droughts).
+    // SUPERSEDES the 2026-07-15 t4g.medium + 2026-06-30 r8g.large +
+    // 2026-05-27 t4g.large locks. Any reintroduction of t4g.medium /
+    // r8g.large / c7i.xlarge / c8g.xlarge as the PINNED type fails this
+    // test. (Retired types may still appear in SUPERSEDES prose — only the
+    // validation condition is forbidden.)
     assert!(
-        content.contains("\"t4g.medium\""),
-        "variables.tf must pin instance_type to t4g.medium (operator lock 2026-07-15, see daily-universe-scope-expansion-2026-05-27.md §7 Quote 8)"
+        content.contains("\"m8g.large\""),
+        "variables.tf must pin instance_type to m8g.large (operator lock 2026-07-21, see daily-universe-scope-expansion-2026-05-27.md §7 Quote 11)"
     );
     assert!(
-        content.contains("var.instance_type == \"t4g.medium\""),
+        content.contains("var.instance_type == \"m8g.large\""),
         "variables.tf must VALIDATE instance_type pinning"
     );
     // Negative asserts — block the retired stacks from ever returning as the
-    // validated default (r8g.large/m8g.large/t4g.large may still appear in
+    // validated default (t4g.medium/r8g.large/t4g.large may still appear in
     // SUPERSEDES comments, so we only forbid them as the validation condition).
     assert!(
         !content.contains("var.instance_type == \"r8g.large\""),
         "r8g.large retired as the pinned type (operator downsize lock 2026-07-15)"
     );
     assert!(
-        !content.contains("var.instance_type == \"m8g.large\""),
-        "m8g.large retired as the pinned type (operator lock 2026-06-30)"
+        !content.contains("var.instance_type == \"t4g.medium\""),
+        "t4g.medium retired as the pinned type (operator upgrade lock 2026-07-21)"
     );
     assert!(
         !content.contains("c7i.xlarge"),

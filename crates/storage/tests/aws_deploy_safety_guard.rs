@@ -232,31 +232,40 @@ const UPGRADE_SCRIPT: &str = "scripts/aws-upgrade-instance.sh";
 const APP_ALARMS_TF: &str = "deploy/aws/terraform/app-alarms.tf";
 const DOCKER_COMPOSE: &str = "deploy/docker/docker-compose.yml";
 
-/// The QuestDB-1g HALF of operator Quote 8 (2026-07-15, "Flip tonight:
-/// t4g.medium, QuestDB 1g, automated") — review round 6 ratchet. Two pins:
+/// The QuestDB-2g HALF of operator Quote 11 (2026-07-21, m8g.large upgrade —
+/// daily-universe-scope-expansion-2026-05-27.md, the same-flip re-cap). Pins:
 ///
 ///   1. `deploy/docker/docker-compose.yml` must default the QuestDB container
-///      memory to `${QDB_MEM_LIMIT:-1g}` — a silent revert to `:-4g` would
-///      over-commit the 4 GiB t4g.medium host on any boot path that never
-///      wrote the on-box `.env` override.
-///   2. `scripts/aws-upgrade-instance.sh` must keep the per-target auto-default
-///      arm `t4g.medium) QDB_MEM="1g"` — the manual-fallback flip must couple
-///      the QuestDB ceiling to the instance size exactly like the workflow.
+///      memory to `${QDB_MEM_LIMIT:-2g}` — a silent revert to `:-1g` (or the
+///      old `:-4g`) mis-sizes the 8 GiB m8g.large host on any boot path that
+///      never wrote the on-box `.env` override.
+///   2. `scripts/aws-upgrade-instance.sh` must keep the per-target
+///      auto-default arms — `m8g.large) QDB_MEM="2g"` (the upgrade target)
+///      AND `t4g.medium) QDB_MEM="1g"` (the emergency rip-cord) — so the
+///      manual-fallback flip couples the QuestDB ceiling to the instance
+///      size in BOTH directions exactly like the workflow.
 #[test]
-fn deploy_questdb_mem_limit_pins_1g_for_t4g_medium() {
+fn deploy_questdb_mem_limit_pins_2g_for_m8g_large() {
     let compose = read(DOCKER_COMPOSE);
     assert!(
-        compose.contains("${QDB_MEM_LIMIT:-1g}"),
+        compose.contains("${QDB_MEM_LIMIT:-2g}"),
         "docker-compose.yml must default the QuestDB mem_limit to \
-         `${{QDB_MEM_LIMIT:-1g}}` (operator Quote 8, 2026-07-15 — the QuestDB-1g \
-         half of the t4g.medium downsize; a 4g default over-commits the 4 GiB host)."
+         `${{QDB_MEM_LIMIT:-2g}}` (operator Quote 11, 2026-07-21 — the QuestDB-2g \
+         half of the m8g.large upgrade; a 1g/4g default mis-sizes the 8 GiB host)."
     );
     let script = squish(&code_only(&read(UPGRADE_SCRIPT)));
     assert!(
+        script.contains("m8g.large) QDB_MEM=\"2g\""),
+        "aws-upgrade-instance.sh must keep the `m8g.large) QDB_MEM=\"2g\"` \
+         auto-default arm (operator Quote 11, 2026-07-21) so the manual \
+         fallback couples QuestDB to 2g whenever the target is m8g.large."
+    );
+    assert!(
         script.contains("t4g.medium) QDB_MEM=\"1g\""),
         "aws-upgrade-instance.sh must keep the `t4g.medium) QDB_MEM=\"1g\"` \
-         auto-default arm (operator Quote 8, 2026-07-15) so the manual fallback \
-         couples QuestDB to 1g whenever the target is t4g.medium."
+         rip-cord arm (operator Quote 11 keeps t4g.medium as the emergency \
+         roll-back target) so the manual fallback couples QuestDB to 1g \
+         whenever the target is t4g.medium."
     );
 }
 

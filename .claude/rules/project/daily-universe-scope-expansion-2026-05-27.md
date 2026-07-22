@@ -90,11 +90,30 @@
 > planned ≥7 days before go-live (Dhan's modify cooldown), with fresh dated
 > edits HERE + in `websocket-connection-scope-lock.md` first.
 
+**Quote 11 (2026-07-21, instance UPGRADE to latest-gen Graviton — preserve EXACTLY, typos included):**
+> "noep is it better to upgrade it to m8 or r8 that too only very very latest aws mumabi isntance mtoehfrufcker okay?"
+>
+> Operator ruled (relayed via the coordinator session — this dated quote satisfies §7 Mechanical
+> Rule 1): upgrade the host instance to the LATEST-GENERATION Graviton in ap-south-1 (Mumbai) —
+> m8g or r8g. Context: the GDF 1s-feed RAM-first sizing (~7.6M bars/day resident) + the two-day
+> t4g.medium 08:30 IST `InsufficientInstanceCapacity` drought (2026-07-20 + 2026-07-21; the ~08:45
+> watchdog retry recovered both days). Live pricing-API-verified ap-south-1 on-demand rates
+> (2026-07-21, Linux/Shared — re-verify at execution): m8g.medium $0.03208/hr (1 vCPU/4 GiB) ·
+> m8g.large $0.06416/hr (2 vCPU/8 GiB) · r8g.medium $0.04129/hr (1 vCPU/8 GiB) · r8g.large
+> $0.08258/hr (2 vCPU/16 GiB). The 1-vCPU mediums FAIL the standing 2-vCPU precedent, so the
+> carried recommendation is **m8g.large (2 vCPU / 8 GiB) as the balanced default**, r8g.large
+> (2 vCPU / 16 GiB) the zero-anxiety alternative if BruteX greeks co-locate (coordinator floor:
+> minimum 8 GiB). This quote SUPERSEDES Quote 8's t4g.medium lock, Quote 9's "onl yt4g medium as
+> of now" clause, AND — for the instance line — Quote 9's sub-₹1,000/mo hard target (honest all-in
+> bills at BOTH hour bases live in §7 + `aws-budget.md`). The physical flip executes ONLY after the
+> operator merges the prepared DRAFT PR (post-EAP) and runs the §7 Rule 7 guarded tooling.
+
 > **[ARCHIVED 2026-07-20]** §0 Approvals 2026-05-27..2026-06-30 (superseded history) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).
 - 2026-07-15: Approved instance DOWNSIZE r8g.large → **t4g.medium** (2 vCPU / 4 GiB) + QDB_MEM_LIMIT 4g → 1g, executed via the guarded `downsize-instance.yml` workflow (old root snapshotted first, kept ~1 week), per Quote 8 ("Flip tonight: t4g.medium, QuestDB 1g, automated"). INTERIM bill (the live root stays 50 GB — gp3 cannot shrink) ~₹3,101/mo → **~₹1,471/mo** incl GST at 270 hrs; drops to ~₹1,197/mo only AFTER the 20 GB fresh-volume recreate (executor pre-stage, not operator-quoted); ~₹986/mo requires BOTH the ~176-hr pure auto-schedule basis AND the post-recreate 20 GB volume (on the live 50 GB root the ~176-hr figure is ~₹1,260), NEVER the 270-hr figure. EIP kept.
 - 2026-07-19: **LIVE-STATE CORRECTION (verified evidence, not a new approval):** `aws ec2 describe-volumes` on `vol-073ccaa417a0f344b` (the root of `i-0b956d0209231a48b`, attached at `/dev/xvda` since 2026-05-24) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use** — run live 2026-07-19 via the coordinator session's credentialed AWS access. The 2026-07-13 approved 30→50 GB grow (bullet above) was RECORDED but **never physically applied** — every "live 50 GB root" statement dated 2026-07-15 (the Quote 8 executor note + the bullet above + §7) is corrected by the dated 2026-07-19 notes in §7. **FLAGGED FOLLOW-UP:** the disk-pressure remediation that grow was approved for is therefore UNAPPLIED — the 82%-disk-pressure risk class may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note.
 - 2026-07-19: **RULING (Quote 9): 30 GB ACCEPTED + t4g.medium as-of-now + hard target < ₹1,000/mo incl GST.** Resolves the flagged follow-up in the bullet above — the 2026-07-13 30→50 grow is **CANCELLED**; the accepted mitigation for the disk-pressure class is code retention + S3 archival on the 30 GB root (any future grow needs a fresh dated quote). The recorded interim bills (~₹1,289/mo at 270 hrs; ~₹1,077/mo at ~176 hrs) EXCEED the new target — the itemized lever path + which combinations reach <₹1,000 (none without an operator-gated lever) is recorded in `aws-budget.md` "OPERATOR RULING 2026-07-19"; the budget-alarm kill ceiling stepped $55 → $25 the same day with a dated ratchet ladder toward $10 (₹1,000 ÷ 1.18 ÷ ₹85 ≈ $10 pre-GST).
 - 2026-07-19: **RULING (Quote 10, later same day): EIP release APPROVED for the no-real-orders period — verify-first, bundled execution.** Live verification (coordinator session, 2026-07-19) proved a standalone release UNSAFE (launch-time ENI attribute — the live ENI never mints an ephemeral IP), so the release lands ONLY inside the erase-window recreate bundle per `docs/runbooks/eip-release.md`; the Lever-2/Lever-5 rows in `aws-budget.md` are updated in lockstep. Post-bundle bill lands in the ~₹600–720/mo class at ~176 hrs (~₹808–929 at the 270-hr ceiling) — under the Quote 9 target at BOTH hour bases.
+- 2026-07-21: **RULING (Quote 11): instance UPGRADE to latest-gen Graviton APPROVED — m8g.large the carried default.** Supersedes the Quote 8 t4g.medium lock + Quote 9's "onl yt4g medium as of now" + (instance line only) the sub-₹1K target. Honest all-in bills (pricing-API-verified 2026-07-21 rates; EIP + 30 GB EBS + S3 + SNS adders; 18% GST): **m8g.large ≈ ₹2,420/mo @ 270 hrs / ≈ ₹1,815/mo @ ~176 hrs**; r8g.large ≈ ₹2,918 / ₹2,140; rejected 1-vCPU shapes m8g.medium ≈ ₹1,551/₹1,248, r8g.medium ≈ ₹1,800/₹1,411; pre-upgrade t4g.medium baseline ≈ ₹1,289/₹1,077. Execution = the operator-merged DRAFT PR + §7 Rule 7 tooling; the $25 budget-kill ceiling leaves ~$0.9/mo headroom at m8g.large 270 hrs — the lockstep triple raise is a FLAGGED operator follow-up.
 
 ---
 
@@ -176,7 +195,45 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
 
 ---
 
-## §7. Instance lock — t4g.medium (LOCKED 2026-07-15, supersedes the 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
+## §7. Instance lock — m8g.large (LOCKED 2026-07-21 per Quote 11, supersedes the 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
+
+**2026-07-21 change (operator Quote 11):** instance lock → **m8g.large** (ARM Graviton4
+latest-generation general-purpose, 2 vCPU / **8 GiB**, FIXED performance — no CPU-credit
+cliff), with QuestDB re-capped at `QDB_MEM_LIMIT=2g` in the same flip (compose default +
+the on-box `deploy/docker/.env`, retuned via SSM by the upgrade tooling). Rationale:
+(a) the GDF 1s feed's RAM-first sizing (~7.6M bars/day resident, ~0.4–1.5 GB by layout)
+does not fit the 4 GiB t4g.medium envelope with headroom — the Rule 2 FLAG below already
+predicted ~4.1 GiB total demand vs 4 GiB physical; (b) t4g.medium 08:30 IST starts hit
+`InsufficientInstanceCapacity` on 2026-07-20 AND 2026-07-21 (the ~08:45 watchdog retry
+recovered both days) — the burstable t4g pool in ap-south-1 is drought-prone at market
+open, while m8g/r8g are the latest-generation Graviton4 pools (capacity reasoning, not a
+measured guarantee); (c) the 1-vCPU mediums (m8g.medium $0.03208/hr / r8g.medium
+$0.04129/hr) FAIL the standing 2-vCPU floor and are REJECTED; r8g.large (2 vCPU / 16 GiB,
+$0.08258/hr, ≈ ₹2,918/mo @ 270 hrs / ≈ ₹2,140/mo @ ~176 hrs) is the recorded
+zero-anxiety alternative if BruteX greeks co-locate. Live rate: **$0.06416/hr on-demand
+ap-south-1** (pricing-API-verified 2026-07-21 — re-verify at execution). Quote 9's
+sub-₹1,000 hard target is SUPERSEDED for the instance line by Quote 11 (RAM + capacity
+outrank it; Quote 9's 30 GB EBS acceptance stands). Execution: the operator merges the
+prepared DRAFT PR post-EAP, then runs `scripts/aws-upgrade-instance.sh` (defaults now
+`--from t4g.medium --to m8g.large`; snapshot-first, EIP identity check, market-hours
+guard — §7 Rule 7). The t4g.medium spec table + bill below are RETAINED as the
+pre-upgrade historical audit. The m8g.large bill:
+
+| Line | Calc | USD |
+|---|---|---|
+| EC2 m8g.large (270 running hrs/mo ceiling) | $0.06416/hr × 270 | $17.32 |
+| Elastic IP (24/7, KEPT) | $0.005/hr × 720 | $3.60 |
+| EBS gp3 30 GB (live, accepted by Quote 9) | $0.0912 × 30 | $2.74 |
+| S3 cold + SNS SMS | | $0.46 |
+| **Subtotal (pre-GST)** | | **$24.12** |
+| **× ₹85/$ → + 18% GST** | | **≈ ₹2,420/mo** |
+
+At the ~176-hr pure Mon–Fri auto-schedule basis: $0.06416 × 176 = $11.29 + $6.80 adders
+= $18.09 → **≈ ₹1,815/mo** incl GST. BUDGET-KILL FLAG: the live $25 `budget.tf` ceiling
+leaves ~$0.9/mo headroom at m8g.large 270 hrs (r8g.large EXCEEDS it) — the lockstep
+triple raise (`budget.tf limit_amount` + `budget-guards.tf` BUDGET_KILL_USD +
+`budget_digest.rs` BUDGET_USD, e.g. → $30) is a FLAGGED operator follow-up, deliberately
+NOT flipped in the prep PR.
 
 **2026-07-15 change (operator Quote 8):** instance lock → **t4g.medium**
 (ARM Graviton2, burstable general-purpose) — **4 GiB RAM** (DOWN from the
@@ -303,7 +360,7 @@ $55 → $25 on 2026-07-19, with a dated ratchet ladder toward $10
 
 ### Mechanical Rules (replaces aws-budget.md mechanical rules 1+6)
 
-1. **Instance type is t4g.medium. PERIOD.** Changing it (back to r8g.large, to
+1. **Instance type is m8g.large. PERIOD.** (Quote 11, 2026-07-21 — was t4g.medium per Quote 8.) Changing it (back to t4g.medium, to r8g.large, to
    t4g.large, etc.) requires:
    - Operator explicit approval with dated quote (see §0 Quote 8)
    - Update to this file
@@ -324,6 +381,16 @@ $55 → $25 on 2026-07-19, with a dated ratchet ladder toward $10
    - **Total used: ~2.3 GB (app at the ~700 MB 4-SID actual) – ~3.1 GB (app at the 1.5 GB cap)** — the rows above sum to ~2.27 GB / ~3.07 GB (arithmetic corrected 2026-07-15; an earlier draft said "~2.6–3.1") *(2026-07-18: the seal-ring row replaced the 10 MB tick-ring row, +~19 MB — inside the ~ rounding, totals unchanged)*
    - **Headroom: ~0.9–1.7 GB** — above the 1 GB Linux kswapd floor only while the app stays at/under its cap. **FLAG (honest, unresolved — Assumed until measured; Rule 11, no false-OK):** the pre-downsize Rule 2 sizing formula this file has always carried (≈3.2 MB × SID for the 21-TF today+yesterday RAM-resident set) predicts an app working set of **~2.5 GB at ~770 SIDs** — with QuestDB at 1g that totals ~4.1 GB (2.5 app + 1.0 QDB + ~0.17 buffers + ~0.4 OS) and does **NOT fit in 4 GiB**. The ~700 MB "actual" and the formula cannot both hold at ~770 SIDs; **the first live session on t4g.medium is the measured gate** — read `tv_process_rss_bytes` / RESOURCE-02 and `mem_used_percent` before AND after cutover; if live RSS is materially above ~1.5 GB, 4 GiB does not fit and t4g.large (8 GiB) is the rip-cord. QuestDB at 1g serving today's ~770-SID Groww write load is likewise re-validated live (the old 1g-class budget served the 4-SID universe). BURSTABLE CPU: watch `CPUCreditBalance` after cutover.
 
+   **2026-07-21 (Quote 11) note:** the Rule-2 map above is the t4g.medium (4 GiB)
+   historical audit. On m8g.large (8 GiB): QuestDB `QDB_MEM_LIMIT=2g` · app ~0.7 GB
+   actual / 1.5 GB cap / ~2.5 GB formula-predicted at ~770 SIDs · buffers ~0.17 GB ·
+   OS ~0.4 GB → total ~4.1 GiB (app at cap) to ~5.1 GiB (app at formula) → **headroom
+   ~2.9–3.9 GiB** (vs ~0.9–1.7 GiB with the does-not-fit FLAG on t4g.medium) — the
+   Rule-2 FLAG's 4-GiB risk class CLOSES, and the GDF 1s-feed resident day (~7.6M bars
+   ≈ ~0.4–1.5 GB by layout) fits inside the remaining headroom. Fixed-performance CPU:
+   the burstable `CPUCreditBalance` watch-item retires. Assumed-until-measured: read
+   `tv_process_rss_bytes` + `mem_used_percent` on the first live m8g.large session.
+
 3. **EBS = 30 GB gp3 LIVE (verified 2026-07-19 — the 2026-07-13 approved 30→50 grow was recorded but never physically applied); 20 GB is the pre-staged fresh-volume TARGET** (executor decision 2026-07-15, recorded in §0 under Quote 8 — NOT operator-quoted scope). gp3 grows online but can NEVER shrink: `modify-volume` refuses a smaller size and a larger snapshot cannot restore into a smaller volume (the 30 GB snapshot cannot restore into 20 GB), so 30 → 20 requires a volume/instance REPLACEMENT (terraform terminate-and-recreate in the operator's post-market erase window; the box is fully cattle-provisioned by `user-data.sh.tftpl`; the 2026-07-15 pre-downsize snapshot is the rollback, kept ~1 week; the GitHub secret `EC2_INSTANCE_ID` must be rotated to the new id at recreate time). Terraform `ebs_gp3_size_gb` default = 20 documents FRESH-PROVISION intent only — `root_block_device[0].volume_size` is in the instance `lifecycle.ignore_changes`, so `terraform apply` never touches the live volume. History: 10 GB → 30 GB (2026-05-29 Quote 6) → [50 GB approved 2026-07-13 (disk-pressure grow) — RECORDED but never physically applied; live verified 30 GB by `describe-volumes` 2026-07-19] → 20 GB target (2026-07-15) → **30 GB ACCEPTED (2026-07-19 Quote 9 — the 50 GB grow CANCELLED)**. **FLAGGED FOLLOW-UP (2026-07-19):** the unapplied grow means the 2026-07-13 82%-disk-pressure remediation never landed — applying it (or accepting 30 GB) is an operator/infra decision. *(RESOLVED same day by Quote 9: 30 GB is formally ACCEPTED, the grow is CANCELLED — the disk-pressure class is handled by code retention + S3 archival on the 30 GB root; any future grow needs a fresh dated quote. The 20 GB fresh-volume TARGET stays a separate un-quoted executor pre-stage — going below the accepted 30 needs its own operator go.)* The partition manager keeps auto-archiving partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window.
 
 4. **No paid AWS services** (RDS, ElastiCache, NAT Gateway, ALB) without budget review.
@@ -332,7 +399,7 @@ $55 → $25 on 2026-07-19, with a dated ratchet ladder toward $10
 
 6. **RAM-first hot path (mandatory, unchanged):** every indicator + strategy + risk decision reads from RAM. QuestDB is persistence + audit + cold-path boot rehydration only. Banned-pattern scanner enforces.
 
-7. **Instance flip tooling:** the 2026-07-15 downsize executes via the guarded one-shot GitHub Actions workflow `.github/workflows/downsize-instance.yml` (snapshot-first → stop → `aws ec2 modify-instance-attribute` → start → EIP identity check → SSM `QDB_MEM_LIMIT=1g` retune → verify; a capacity start-failure rolls back to r8g.large with a VERIFIED post-rollback type/state check; a run that finds the box ALREADY t4g.medium continues in retune-only mode instead of refusing). `scripts/aws-upgrade-instance.sh` remains the manual fallback (`--from r8g.large --to t4g.medium` defaults; a t4g.medium target auto-defaults `QDB_MEM_LIMIT=1g`, an r8g.large target keeps the 4g arm for the emergency roll-UP direction). EIP + EBS preserved on either path (both verify the EIP survives and abort loudly if it changed) — the EIP is mandatory because the stop/modify/start leaves the ENI with no ephemeral public IP. Downtime ~3 minutes; the market-hours guards refuse the in-session window without an explicit force.
+7. **Instance flip tooling:** the 2026-07-15 downsize executes via the guarded one-shot GitHub Actions workflow `.github/workflows/downsize-instance.yml` (snapshot-first → stop → `aws ec2 modify-instance-attribute` → start → EIP identity check → SSM `QDB_MEM_LIMIT=1g` retune → verify; a capacity start-failure rolls back to r8g.large with a VERIFIED post-rollback type/state check; a run that finds the box ALREADY t4g.medium continues in retune-only mode instead of refusing). `scripts/aws-upgrade-instance.sh` remains the manual fallback (`--from r8g.large --to t4g.medium` defaults; a t4g.medium target auto-defaults `QDB_MEM_LIMIT=1g`, an r8g.large target keeps the 4g arm for the emergency roll-UP direction). EIP + EBS preserved on either path (both verify the EIP survives and abort loudly if it changed) — the EIP is mandatory because the stop/modify/start leaves the ENI with no ephemeral public IP. Downtime ~3 minutes; the market-hours guards refuse the in-session window without an explicit force. **2026-07-21 (Quote 11):** the UPGRADE direction reuses the same manual tooling with the new defaults `--from t4g.medium --to m8g.large` (an m8g.large target auto-defaults `QDB_MEM_LIMIT=2g`); `downsize-instance.yml` re-points FROM_TYPE m8g.large → t4g.medium as the emergency rip-cord.
 
 ---
 

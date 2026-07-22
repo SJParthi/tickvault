@@ -98,7 +98,7 @@ services:
     # Env-driven so scripts/aws-upgrade-instance.sh --qdb-mem can raise it
     # (e.g. the emergency roll-UP to r8g.large auto-defaults 4g). Override
     # QDB_MEM_LIMIT to set a different value on a Mac dev box.
-    mem_limit: ${QDB_MEM_LIMIT:-1g}
+    mem_limit: ${QDB_MEM_LIMIT:-2g}
     mem_reservation: 1g
     cpus: 2.0
     # OOM protection: prefer killing other containers over QuestDB.

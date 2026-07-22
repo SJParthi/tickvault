@@ -27,10 +27,10 @@ variable "environment" {
 variable "instance_type" {
   description = "EC2 instance type. MUST be t4g.medium per operator lock 2026-07-15 (Graviton2 burstable, 2 vCPU / 4 GiB, $0.0224/hr ap-south-1; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 8, which supersedes the 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large locks)."
   type        = string
-  default     = "t4g.medium"
+  default     = "m8g.large"
 
   validation {
-    condition     = var.instance_type == "t4g.medium"
+    condition     = var.instance_type == "m8g.large"
     error_message = "Instance type is pinned to t4g.medium (Graviton2, 4 GiB) per operator lock 2026-07-15 (Quote 8 downsize — the Groww-only runtime no longer needs the 16 GiB memory-optimized host; QuestDB is re-capped at 1g in lockstep). This SUPERSEDES the 2026-06-30 lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
   }
 }
