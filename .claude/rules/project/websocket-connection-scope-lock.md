@@ -331,3 +331,23 @@ terraform PR (allocates a NEW address — the old one is gone forever) → Dhan
 (`downsize-instance.yml` `EXPECTED_EIP`, SSM `/tickvault/<env>/network/static-ip`) → re-wire
 the boot IP gate before live fire. A PR that flips `enable_eip` in EITHER direction without
 the matching dated note here + §7 = REJECT.
+
+### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
+
+Operator Parthiban, 2026-07-24 (verbatim quotes preserved in
+`.claude/rules/project/truedata-feed-scope-2026-07-24.md` §0): authorized preparing
+**TrueData** as a fourth, **default-OFF** live-tick market-data feed for a trial
+("our plan is to do the trial version with true data … the truedata websocket live feed
+entirely … not even miss even a single tick … entirely RUST O(1)").
+
+Effect on this lock: the 2026-07-15 amendment's "total live market-data WebSocket
+connections: 0; GDF is the ONLY path to any future live market-data WebSocket" is AMENDED
+— TrueData (`wss://push.truedata.in:<port>`, feed='truedata') is a SECOND sanctioned
+live-market-data-WS path, **default-OFF** (`feeds.truedata_enabled = false`, serde
+default). When `truedata_enabled = true` the live-market-data-WS count is 1 (TrueData);
+default remains 0. Groww/Dhan live WS stay retired; the Dhan/Groww order-push channels are
+unaffected. Native Rust only (TrueData SDK reference-only). Full contract + the 90-byte
+tick layout + the zero-tick-loss / O(1) / instance / reversibility envelope:
+`truedata-feed-scope-2026-07-24.md`. Companion plan:
+`.claude/plans/active-plan-truedata-feed.md` (DRAFT — operator flips to APPROVED before any
+implementation PR).
