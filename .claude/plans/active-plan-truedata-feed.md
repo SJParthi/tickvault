@@ -114,18 +114,27 @@ the documented exit (scope §3).
 - [ ] **PR-B** — `Feed::Truedata` + `FeedsConfig.truedata_enabled` (default OFF) + `WsType::TruedataFeed` + `TruedataConfig` + `[feeds.truedata]` in base.toml
   - Files: `crates/common/src/feed.rs`, `crates/common/src/config.rs`, `crates/common/src/ws_event_types.rs`, `config/base.toml`
   - Tests: `feed.rs` round-trip/index/exhaustive; config serde-default-off; workspace escalation (common change)
-- [ ] **PR-C** — Native Rust WSS client + 90-byte Trade Binary parser (O(1) fixed-offset) + 128-byte auth-reply parser + SSM 1-session lock + SSM cred read (`Secret<String>`)
-  - Files: `crates/core/src/feed/truedata/{mod,connection,parser,auth,lock}.rs`
-  - Tests: parser fixed-offset + sample vector; auth-reply parse; no-panic unknown; DHAT; Criterion
-- [ ] **PR-D** — Wire the TrueData lane into WAL→ring→spill→DLQ + revive the tick→TF aggregator (`FeedStrategy::Truedata`) deriving 1s/1m/3m + per-symbol Sequence-No gap detector
-  - Files: `crates/core/src/feed/truedata/pipeline.rs`, aggregator wiring, `crates/app/src/truedata_lane.rs`
-  - Tests: WAL replay DEDUP-idempotent; aggregator derives timeframes; seq-gap TD-GAP-01
-- [ ] **PR-E** — Async cold-path QuestDB writer (`feed='truedata'`, feed-in-key DEDUP) for ticks + derived candles; RAM-first guard (no DB read in decision paths)
-  - Files: `crates/storage/src/*` (feed-parameterized), banned-pattern guard extension
-  - Tests: DEDUP feed-in-key; DB-down does not block; storage meta-guard
-- [ ] **PR-F** — Observability (counters/histograms/audit/error-codes) + tests + instance upgrade workflow (m8g.large) + sandbox trial (8086) → prod (8084) runbook
-  - Files: `crates/app/src/observability.rs` (metrics), `deploy/aws/terraform/variables.tf`, instance workflow/script, `docs/error-runbooks/truedata-feed-error-codes.md`
-  - Tests: metric registration; instance_type lock ratchet; alarm wiring
+- [ ] **PR-C** — Native Rust WSS client + 90-byte Trade Binary parser (O(1) fixed-offset) + 128-byte auth-reply parser + SSM 1-session lock (+ force-logout `logoutRequest`+60s on ghost session) + SSM cred read (`Secret<String>`) + **session-0 probe gate** (binary-vs-JSON default, endianness, Bid/Ask mode, LTP-vs-touchline sanity — fail-closed) + **TCP port-7070 binary fallback** if the probe finds WSS is JSON (guarantees O(1) either way)
+  - Files: `crates/core/src/feed/truedata/{mod,connection,parser,auth,lock,probe}.rs`
+  - Tests: parser fixed-offset + doc sample vector; auth-reply parse; no-panic unknown; len-dispatch (90/128/10/62); DHAT; Criterion
+- [ ] **PR-D** — Wire the TrueData lane into WAL→ring→spill→DLQ (**add per-feed WAL path `data/spill/truedata/` + feed tag — the WAL is transport-typed today, no feed byte**) + **REBUILD** the tick→TF aggregator (`MultiTfAggregator`/`FeedStrategy::Truedata` — HARD-DELETED 2026-07-17, recover from git pre-sweep; NOT a revive) deriving 1m/3m via the surviving `TfIndex` + a **SEPARATE 1s lane** (1s is NOT in TfIndex) + per-symbol Sequence-No gap detector (with reset-on-reconnect/new-day heuristic so it never false-pages)
+  - Files: `crates/core/src/feed/truedata/pipeline.rs`, `crates/storage/src/ws_frame_spill.rs` (per-feed path), aggregator rebuild, `crates/app/src/truedata_lane.rs`
+  - Tests: WAL replay DEDUP-idempotent per-feed; aggregator derives 1m/3m; 1s-lane; seq-gap TD-GAP-01; seq-reset suppression
+- [ ] **PR-E** — Async cold-path QuestDB writer (`feed='truedata'`, feed-in-key DEDUP) for ticks + derived candles + **new `candles_1s` table** (1s lane; the 21 `candles_*` need no schema change, feed already in-key); RAM-first guard (no DB read in decision paths)
+  - Files: `crates/storage/src/*` (feed-parameterized + `candles_1s`), banned-pattern guard extension
+  - Tests: DEDUP feed-in-key; `candles_1s` DDL; DB-down does not block; storage meta-guard
+- [ ] **PR-F** — Observability (counters/histograms/audit/error-codes) + tests + **reuse the existing PR #1701 m8g.large upgrade (do NOT duplicate the terraform/instance-lock edits — depend on #1701 landing)** + sandbox trial (8086) → prod (8084) runbook
+  - Files: `crates/app/src/observability.rs` (metrics), `docs/error-runbooks/truedata-feed-error-codes.md`, trial runbook
+  - Tests: metric registration; alarm wiring
+
+## Sequencing dependencies (from the open-PR review — Verified)
+
+| Depends on | Why | Action |
+|---|---|---|
+| **#1696 (timeframe diet)** land FIRST | reshapes the aggregator + `TF_COUNT` + `candles_Ns` surface PR-D writes into | build PR-D after #1696 merges (else rebase onto a changed TF contract) |
+| **#1701 (m8g.large prep)** land FIRST | our instance upgrade is already prepped there — reuse, don't duplicate | PR-F depends on #1701; no new terraform |
+| **#1700 (GDF #3 design)** | the pluggable-feed pattern TrueData #4 mirrors | design reference, no code conflict |
+| All 4 open PRs are **DO-NOT-MERGE by design** | operator/coordinator merges them, not this session | do NOT auto-merge; sequence around them |
 
 ## Scenarios
 
