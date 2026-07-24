@@ -26,6 +26,7 @@ pub mod quote;
 mod read_helpers;
 pub mod ticker;
 pub mod truedata;
+pub mod truedata_requests;
 pub mod types;
 
 // PR #4 (2026-05-19): depth re-exports retired.

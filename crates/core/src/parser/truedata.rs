@@ -94,7 +94,10 @@ pub const TD_TRADE_BINARY_LEN_QUOTE_ONLY: usize = 74;
 // Trade Binary field offsets (v2.6 p.16 — verbatim "Location" column)
 // ---------------------------------------------------------------------------
 
-const OFF_MSG_CODE: usize = 0; // char, 1B
+/// Offset of the `Msg Code` byte — identical across EVERY binary frame
+/// (auth/trade/heartbeat/marketstatus), which is what makes the O(1)
+/// first-byte dispatch in [`classify_frame`] valid.
+pub const OFF_MSG_CODE: usize = 0; // char, 1B
 const OFF_SYMBOL_ID: usize = 1; // int, 4B
 const OFF_TIMESTAMP: usize = 5; // int, 4B  — epoch SECONDS (whole-second!)
 const OFF_LTP: usize = 9; // float, 4B
@@ -925,5 +928,431 @@ mod tests {
         assert_eq!(TD_MARKET_STATUS_BINARY_LEN, 62);
         assert_eq!(TD_TRADE_BINARY_LEN_FULL, 90);
         assert_eq!(TD_TRADE_BINARY_LEN_QUOTE_ONLY, 74);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth response (binary, 128 B — v2.6 p.10)
+// ---------------------------------------------------------------------------
+
+const OFF_AUTH_STATUS: usize = 1; // bool, 1B
+const OFF_AUTH_MESSAGE: usize = 2; // str, 31B
+const OFF_AUTH_SEGMENT: usize = 33; // str, 60B
+const OFF_AUTH_MAX_SYMBOLS: usize = 93; // int, 4B
+const OFF_AUTH_SUBSCRIPTION: usize = 97; // str, 20B
+const OFF_AUTH_VALIDITY: usize = 117; // str, 10B
+
+const LEN_AUTH_MESSAGE: usize = 31;
+const LEN_AUTH_SEGMENT: usize = 60;
+const LEN_AUTH_SUBSCRIPTION: usize = 20;
+const LEN_AUTH_VALIDITY: usize = 10;
+
+// The documented fields tile bytes 0..127; byte 127 is trailing padding.
+const _: () = assert!(OFF_AUTH_VALIDITY + LEN_AUTH_VALIDITY <= TD_AUTH_BINARY_LEN);
+
+/// Decoded TrueData authentication response (v2.6 p.10).
+///
+/// String fields BORROW from the input frame (zero-allocation); the caller
+/// copies only what it keeps. `max_symbols` is the authoritative per-account
+/// symbol cap and MUST bound the subscribe set (fail-closed, never silently
+/// truncated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruedataAuth<'a> {
+    /// `true` when login succeeded.
+    pub success: bool,
+    /// Server message, e.g. `TrueData Real Time Data Service`. On a
+    /// duplicate login this carries `User Already Connected` — the
+    /// 1-session-per-key refusal that the SSM lock exists to avoid.
+    pub message: &'a str,
+    /// Comma/quote-separated enabled segments, e.g. `"NSEEQ","NSEFO"`.
+    pub segments: &'a str,
+    /// Per-account maximum concurrent symbols.
+    pub max_symbols: i32,
+    /// Subscription composition, e.g. `tick` / `tick+1min`.
+    pub subscription: &'a str,
+    /// Subscription validity date (`yyyy-MM-dd`).
+    pub validity: &'a str,
+}
+
+/// Trims a fixed-width TrueData string field: cuts at the first NUL and
+/// strips surrounding whitespace. Lossy on non-UTF-8 bytes is NOT used —
+/// invalid UTF-8 yields an empty field rather than a panic or an alloc.
+#[inline]
+fn fixed_str(raw: &[u8], offset: usize, len: usize) -> &str {
+    let end = offset.saturating_add(len).min(raw.len());
+    if offset >= end {
+        return "";
+    }
+    let field = &raw[offset..end];
+    let cut = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    core::str::from_utf8(&field[..cut]).unwrap_or("").trim()
+}
+
+/// Decodes the 128-byte binary authentication response (v2.6 p.10).
+///
+/// O(1) — fixed offsets, zero heap allocation (string fields borrow).
+///
+/// # Errors
+/// [`TruedataDecodeError::UnexpectedLength`] unless the frame is exactly
+/// 128 bytes; [`TruedataDecodeError::UnknownMsgCode`] unless byte 0 is `A`.
+pub fn decode_auth_binary(raw: &[u8]) -> Result<TruedataAuth<'_>, TruedataDecodeError> {
+    let Some(&first) = raw.first() else {
+        return Err(TruedataDecodeError::Empty);
+    };
+    if first == TD_JSON_SNIFF_BYTE {
+        return Err(TruedataDecodeError::IsJson);
+    }
+    if first != TD_MSG_CODE_AUTH {
+        return Err(TruedataDecodeError::UnknownMsgCode(first));
+    }
+    if raw.len() != TD_AUTH_BINARY_LEN {
+        return Err(TruedataDecodeError::UnexpectedLength {
+            msg_code: TD_MSG_CODE_AUTH,
+            len: raw.len(),
+        });
+    }
+    Ok(TruedataAuth {
+        success: raw[OFF_AUTH_STATUS] != 0,
+        message: fixed_str(raw, OFF_AUTH_MESSAGE, LEN_AUTH_MESSAGE),
+        segments: fixed_str(raw, OFF_AUTH_SEGMENT, LEN_AUTH_SEGMENT),
+        max_symbols: read_i32_le(raw, OFF_AUTH_MAX_SYMBOLS),
+        subscription: fixed_str(raw, OFF_AUTH_SUBSCRIPTION, LEN_AUTH_SUBSCRIPTION),
+        validity: fixed_str(raw, OFF_AUTH_VALIDITY, LEN_AUTH_VALIDITY),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat (binary, 10 B — v2.6 p.11)
+// ---------------------------------------------------------------------------
+
+const OFF_HB_STATUS: usize = 1; // bool, 1B
+const OFF_HB_TIMESTAMP_MS: usize = 2; // long, 8B — epoch MILLISECONDS
+
+const _: () = assert!(OFF_HB_TIMESTAMP_MS + 8 == TD_HEARTBEAT_BINARY_LEN);
+
+/// Decoded heartbeat (v2.6 p.11). Arrives every 5–6 seconds; silence is the
+/// feed-stall signal.
+///
+/// NOTE the asymmetry: the heartbeat timestamp is epoch **MILLISECONDS**,
+/// while the trade timestamp is epoch **SECONDS**. Do not share a parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruedataHeartbeat {
+    /// Status flag.
+    pub success: bool,
+    /// Server time, epoch **milliseconds**.
+    pub timestamp_ms: i64,
+}
+
+/// Decodes the 10-byte binary heartbeat (v2.6 p.11). O(1), zero-alloc.
+///
+/// # Errors
+/// Length/msg-code mismatches as per [`TruedataDecodeError`].
+pub fn decode_heartbeat_binary(raw: &[u8]) -> Result<TruedataHeartbeat, TruedataDecodeError> {
+    let Some(&first) = raw.first() else {
+        return Err(TruedataDecodeError::Empty);
+    };
+    if first == TD_JSON_SNIFF_BYTE {
+        return Err(TruedataDecodeError::IsJson);
+    }
+    if first != TD_MSG_CODE_HEARTBEAT {
+        return Err(TruedataDecodeError::UnknownMsgCode(first));
+    }
+    if raw.len() != TD_HEARTBEAT_BINARY_LEN {
+        return Err(TruedataDecodeError::UnexpectedLength {
+            msg_code: TD_MSG_CODE_HEARTBEAT,
+            len: raw.len(),
+        });
+    }
+    Ok(TruedataHeartbeat {
+        success: raw[OFF_HB_STATUS] != 0,
+        timestamp_ms: read_i64_le(raw, OFF_HB_TIMESTAMP_MS),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Market status (binary, 62 B — v2.6 p.11-12)
+// ---------------------------------------------------------------------------
+
+const OFF_MS_STATUS: usize = 1; // bool, 1B
+const OFF_MS_DATA: usize = 2; // str, 60B
+const LEN_MS_DATA: usize = 60;
+
+const _: () = assert!(OFF_MS_DATA + LEN_MS_DATA == TD_MARKET_STATUS_BINARY_LEN);
+
+/// Decoded market-status push (v2.6 p.11-12), e.g.
+/// `NSE EQ Normal Market Start`, `NSE FO Normal Market End`,
+/// `MCX Market Status: 1 Session No: 2`.
+///
+/// This is the vendor's own session-boundary signal — useful as a
+/// cross-check against our IST trading calendar, never as a replacement
+/// for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruedataMarketStatus<'a> {
+    /// Status flag.
+    pub success: bool,
+    /// Free-text session message (borrowed, zero-alloc).
+    pub data: &'a str,
+}
+
+/// Decodes the 62-byte binary market-status push. O(1), zero-alloc.
+///
+/// # Errors
+/// Length/msg-code mismatches as per [`TruedataDecodeError`].
+pub fn decode_market_status_binary(
+    raw: &[u8],
+) -> Result<TruedataMarketStatus<'_>, TruedataDecodeError> {
+    let Some(&first) = raw.first() else {
+        return Err(TruedataDecodeError::Empty);
+    };
+    if first == TD_JSON_SNIFF_BYTE {
+        return Err(TruedataDecodeError::IsJson);
+    }
+    if first != TD_MSG_CODE_MARKET_STATUS {
+        return Err(TruedataDecodeError::UnknownMsgCode(first));
+    }
+    if raw.len() != TD_MARKET_STATUS_BINARY_LEN {
+        return Err(TruedataDecodeError::UnexpectedLength {
+            msg_code: TD_MSG_CODE_MARKET_STATUS,
+            len: raw.len(),
+        });
+    }
+    Ok(TruedataMarketStatus {
+        success: raw[OFF_MS_STATUS] != 0,
+        data: fixed_str(raw, OFF_MS_DATA, LEN_MS_DATA),
+    })
+}
+
+#[cfg(test)]
+mod control_frame_tests {
+    use super::*;
+
+    fn build_auth_frame(
+        success: bool,
+        message: &str,
+        segments: &str,
+        max_symbols: i32,
+        subscription: &str,
+        validity: &str,
+    ) -> Vec<u8> {
+        let mut f = vec![0_u8; TD_AUTH_BINARY_LEN];
+        f[0] = TD_MSG_CODE_AUTH;
+        f[OFF_AUTH_STATUS] = u8::from(success);
+        let put = |f: &mut Vec<u8>, off: usize, cap: usize, s: &str| {
+            let bytes = s.as_bytes();
+            let n = bytes.len().min(cap);
+            f[off..off + n].copy_from_slice(&bytes[..n]);
+        };
+        put(&mut f, OFF_AUTH_MESSAGE, LEN_AUTH_MESSAGE, message);
+        put(&mut f, OFF_AUTH_SEGMENT, LEN_AUTH_SEGMENT, segments);
+        f[OFF_AUTH_MAX_SYMBOLS..OFF_AUTH_MAX_SYMBOLS + 4]
+            .copy_from_slice(&max_symbols.to_le_bytes());
+        put(
+            &mut f,
+            OFF_AUTH_SUBSCRIPTION,
+            LEN_AUTH_SUBSCRIPTION,
+            subscription,
+        );
+        put(&mut f, OFF_AUTH_VALIDITY, LEN_AUTH_VALIDITY, validity);
+        f
+    }
+
+    // --- auth ---
+
+    #[test]
+    fn test_auth_binary_decodes_documented_sample() {
+        // v2.6 p.10 binary sample: maxsymbols 900, subscription Tick+1min.
+        let f = build_auth_frame(
+            true,
+            "TrueData Real Time Data Service",
+            "NSEEQ,NSEFO",
+            900,
+            "Tick+1min",
+            "2026-12-31",
+        );
+        let a = decode_auth_binary(&f).expect("auth must decode");
+        assert!(a.success);
+        assert_eq!(a.message, "TrueData Real Time Data Service");
+        assert_eq!(a.segments, "NSEEQ,NSEFO");
+        assert_eq!(a.max_symbols, 900);
+        assert_eq!(a.subscription, "Tick+1min");
+        assert_eq!(a.validity, "2026-12-31");
+    }
+
+    #[test]
+    fn test_auth_binary_carries_the_duplicate_login_refusal() {
+        // The 1-session-per-key refusal our SSM lock exists to prevent.
+        let f = build_auth_frame(false, "User Already Connected", "", 0, "", "");
+        let a = decode_auth_binary(&f).expect("decode");
+        assert!(!a.success);
+        assert_eq!(a.message, "User Already Connected");
+    }
+
+    #[test]
+    fn test_auth_max_symbols_is_the_subscribe_cap() {
+        // maxsymbols must be readable — it bounds the subscribe set
+        // fail-closed rather than being silently truncated.
+        let f = build_auth_frame(true, "ok", "NSEEQ", 250, "tick", "2026-01-01");
+        assert_eq!(decode_auth_binary(&f).expect("decode").max_symbols, 250);
+    }
+
+    #[test]
+    fn test_auth_rejects_wrong_length_and_wrong_code() {
+        let mut short = vec![0_u8; 64];
+        short[0] = TD_MSG_CODE_AUTH;
+        assert_eq!(
+            decode_auth_binary(&short),
+            Err(TruedataDecodeError::UnexpectedLength {
+                msg_code: TD_MSG_CODE_AUTH,
+                len: 64
+            })
+        );
+        let mut wrong = vec![0_u8; TD_AUTH_BINARY_LEN];
+        wrong[0] = TD_MSG_CODE_TRADE;
+        assert_eq!(
+            decode_auth_binary(&wrong),
+            Err(TruedataDecodeError::UnknownMsgCode(TD_MSG_CODE_TRADE))
+        );
+        assert_eq!(decode_auth_binary(&[]), Err(TruedataDecodeError::Empty));
+    }
+
+    #[test]
+    fn test_auth_declines_json_frame() {
+        let json = br#"{"success":true,"message":"TrueData Real Time Data Service"}"#;
+        assert_eq!(decode_auth_binary(json), Err(TruedataDecodeError::IsJson));
+    }
+
+    #[test]
+    fn test_fixed_str_stops_at_nul_and_trims() {
+        let f = build_auth_frame(true, "short", "", 1, "", "");
+        let a = decode_auth_binary(&f).expect("decode");
+        assert_eq!(
+            a.message, "short",
+            "must stop at the NUL, not include padding"
+        );
+        assert_eq!(a.segments, "", "an all-NUL field is an empty string");
+    }
+
+    #[test]
+    fn test_auth_survives_non_utf8_field_without_panicking() {
+        let mut f = build_auth_frame(true, "ok", "", 1, "", "");
+        // Invalid UTF-8 in the message field.
+        f[OFF_AUTH_MESSAGE] = 0xFF;
+        f[OFF_AUTH_MESSAGE + 1] = 0xFE;
+        let a = decode_auth_binary(&f).expect("must not panic");
+        assert_eq!(
+            a.message, "",
+            "invalid UTF-8 degrades to empty, never panics"
+        );
+    }
+
+    // --- heartbeat ---
+
+    #[test]
+    fn test_heartbeat_binary_decodes_millisecond_timestamp() {
+        // v2.6 p.11 sample value.
+        let mut f = vec![0_u8; TD_HEARTBEAT_BINARY_LEN];
+        f[0] = TD_MSG_CODE_HEARTBEAT;
+        f[OFF_HB_STATUS] = 1;
+        f[OFF_HB_TIMESTAMP_MS..OFF_HB_TIMESTAMP_MS + 8]
+            .copy_from_slice(&1_730_828_522_088_i64.to_le_bytes());
+        let hb = decode_heartbeat_binary(&f).expect("heartbeat must decode");
+        assert!(hb.success);
+        assert_eq!(hb.timestamp_ms, 1_730_828_522_088);
+    }
+
+    #[test]
+    fn test_heartbeat_timestamp_is_ms_while_trade_is_seconds() {
+        // The asymmetry that must never be collapsed into one parser:
+        // a heartbeat ms value read as seconds would be ~55000 years out.
+        let mut f = vec![0_u8; TD_HEARTBEAT_BINARY_LEN];
+        f[0] = TD_MSG_CODE_HEARTBEAT;
+        f[OFF_HB_TIMESTAMP_MS..OFF_HB_TIMESTAMP_MS + 8]
+            .copy_from_slice(&1_730_828_522_088_i64.to_le_bytes());
+        let hb = decode_heartbeat_binary(&f).expect("decode");
+        assert!(
+            hb.timestamp_ms > 1_000_000_000_000,
+            "heartbeat is epoch MILLISECONDS (13 digits), not seconds"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_rejects_wrong_length() {
+        let mut f = vec![0_u8; 9];
+        f[0] = TD_MSG_CODE_HEARTBEAT;
+        assert_eq!(
+            decode_heartbeat_binary(&f),
+            Err(TruedataDecodeError::UnexpectedLength {
+                msg_code: TD_MSG_CODE_HEARTBEAT,
+                len: 9
+            })
+        );
+    }
+
+    // --- market status ---
+
+    #[test]
+    fn test_market_status_binary_decodes_session_message() {
+        let mut f = vec![0_u8; TD_MARKET_STATUS_BINARY_LEN];
+        f[0] = TD_MSG_CODE_MARKET_STATUS;
+        f[OFF_MS_STATUS] = 1;
+        let msg = b"NSE EQ Normal Market Start";
+        f[OFF_MS_DATA..OFF_MS_DATA + msg.len()].copy_from_slice(msg);
+        let ms = decode_market_status_binary(&f).expect("market status must decode");
+        assert!(ms.success);
+        assert_eq!(ms.data, "NSE EQ Normal Market Start");
+    }
+
+    #[test]
+    fn test_market_status_handles_every_documented_session_message() {
+        // v2.6 p.11 lists these verbatim; all must decode cleanly.
+        for msg in [
+            "NSE EQ Pre Open Start",
+            "NSE EQ Pre Open End",
+            "NSE EQ Normal Market Start",
+            "NSE FO Normal Market End",
+            "NSE EQ Post Close Start",
+            "NSE EQ Post Close End",
+            "NSE FO Normal Market Start",
+            "MCX Market Status: 5 Session No: 1",
+            "MCX Market Status: 1 Session No: 2",
+        ] {
+            let mut f = vec![0_u8; TD_MARKET_STATUS_BINARY_LEN];
+            f[0] = TD_MSG_CODE_MARKET_STATUS;
+            f[OFF_MS_STATUS] = 1;
+            let b = msg.as_bytes();
+            f[OFF_MS_DATA..OFF_MS_DATA + b.len()].copy_from_slice(b);
+            let ms = decode_market_status_binary(&f).expect("decode");
+            assert_eq!(ms.data, msg);
+        }
+    }
+
+    #[test]
+    fn test_market_status_rejects_wrong_length() {
+        let mut f = vec![0_u8; 61];
+        f[0] = TD_MSG_CODE_MARKET_STATUS;
+        assert_eq!(
+            decode_market_status_binary(&f),
+            Err(TruedataDecodeError::UnexpectedLength {
+                msg_code: TD_MSG_CODE_MARKET_STATUS,
+                len: 61
+            })
+        );
+    }
+
+    // --- cross-decoder no-panic sweep ---
+
+    #[test]
+    fn test_all_control_decoders_never_panic_on_arbitrary_input() {
+        for code in 0_u16..=255 {
+            for len in [0_usize, 1, 10, 62, 74, 90, 128, 200] {
+                let mut f = vec![0x5A_u8; len];
+                if len > 0 {
+                    f[0] = code as u8;
+                }
+                let _ = decode_auth_binary(&f);
+                let _ = decode_heartbeat_binary(&f);
+                let _ = decode_market_status_binary(&f);
+            }
+        }
     }
 }
