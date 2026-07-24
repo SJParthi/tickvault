@@ -26,7 +26,7 @@ checklist or in a dedicated "Per-Item Guarantee Matrix" subsection:
 
 | Demand | Mechanical proof artefact | Real-time check | Per-item gate |
 |---|---|---|---|
-| 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (63.3–99.5, target 100%), floors only move up; `scripts/coverage-gate.sh` | post-merge llvm-cov report | item PR includes coverage delta |
+| 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (68.3–99.5, target 100%), floors only move up; `scripts/coverage-gate.sh` | post-merge llvm-cov report | item PR includes coverage delta |
 | 100% audit coverage | `<event>_audit` table per typed event with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` | item adds/extends audit table |
 | 100% testing coverage | 22 test categories per `testing.md` (unit/integration/property/loom/dhat/fuzz/mutation/sanitizer/coverage/etc.) | `cargo test --workspace` green | item declares which 22 it covers |
 | 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory | all gates green |

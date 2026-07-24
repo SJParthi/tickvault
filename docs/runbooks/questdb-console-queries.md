@@ -4,7 +4,7 @@
 > BY NAME (NIFTY, RELIANCE, …) in the QuestDB console — without
 > hand-writing the composite instrument join every time?"
 > **Authority:** `.claude/plans/archive/2026-07-08-questdb-named-views.md`,
-> `.claude/rules/project/http-client-error-codes.md` (§1
+> `docs/error-runbooks/http-client-error-codes.md` (§1
 > `named_views_ensure` degrade row),
 > `.claude/rules/project/security-id-uniqueness.md` (I-P1-11),
 > `.claude/rules/project/data-integrity.md` (feed-in-key).
@@ -137,6 +137,6 @@ c.open_pct, c.open_gap_pct`.
 | Symptom | Meaning | Action |
 |---|---|---|
 | `named view DDL non-2xx` warn at boot | QuestDB rejected the statement (e.g. base table missing on a degraded boot) | None — retries next boot; use the fallback SQL meanwhile |
-| HTTP-CLIENT-01 with site `named_views_ensure` | reqwest client build failed (fd/TLS/resolver pressure) | Follow `.claude/rules/project/http-client-error-codes.md` triage; views self-heal next boot |
+| HTTP-CLIENT-01 with site `named_views_ensure` | reqwest client build failed (fd/TLS/resolver pressure) | Follow `docs/error-runbooks/http-client-error-codes.md` triage; views self-heal next boot |
 | NULL `symbol_name` on live instruments | Lifecycle master empty/partial (fresh DB, pre-reconcile) | Expected pre-reconcile; sustained NULLs = check the daily-universe orchestrator (INSTR-FETCH-*) |
 | View counts exactly N× inflated per instrument (e.g. every NIFTY minute appears twice) | Duplicate `instrument_lifecycle` rows for one `(security_id, exchange_segment, feed)` key — the HTTP-CLIENT-01 auto-create window or a partial feed self-heal left pre-DEDUP duplicates that `DEDUP ENABLE` never retro-collapses | Run the detector query above to confirm + name the keys. Base tables (`ticks`, `candles_1m`) are UNAFFECTED — the multiplication is join-side only. Remediation = the manual dedup sweep already named by `http-client-error-codes.md` §1 — an explicit operator decision (lifecycle rows are never auto-deleted, daily-universe lock §5) |

@@ -30,7 +30,7 @@
 > a QuestDB row, never a feeling.
 >
 > **Companion rule file (triage):**
-> `.claude/rules/project/dual-feed-scoreboard-error-codes.md` (SCOREBOARD-01
+> `docs/error-runbooks/dual-feed-scoreboard-error-codes.md` (SCOREBOARD-01
 > + the full blame taxonomy table).
 > **Tables:** `feed_scoreboard_daily` (one row per day per feed),
 > `feed_episode_audit` (one row per disconnect/stall/process-death episode,

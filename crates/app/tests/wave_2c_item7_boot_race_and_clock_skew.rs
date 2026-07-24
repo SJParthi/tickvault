@@ -162,8 +162,8 @@ fn test_boot_03_error_code_round_trips() {
     );
     assert_eq!(
         code.runbook_path(),
-        ".claude/rules/project/wave-2-c-error-codes.md",
-        "BOOT-03 runbook target must be the new Wave 2-C rule file"
+        "docs/error-runbooks/wave-2-c-error-codes.md",
+        "BOOT-03 runbook target must be the Wave 2-C runbook file (moved out of the auto-load path 2026-07-20)"
     );
 }
 
