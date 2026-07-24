@@ -833,3 +833,422 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Nested arrays (touchline `symbollist` is an array OF arrays)
+// ---------------------------------------------------------------------------
+
+/// Iterator over the INNER arrays of a nested JSON array, yielding each
+/// inner array as a byte slice (including its brackets) so it can be fed
+/// to [`JsonArrayIter`].
+///
+/// Needed because `touchline` wraps one row per subscribed symbol in
+/// `symbollist: [[...],[...]]` (v2.6 p.15).
+pub struct JsonNestedArrayIter<'a> {
+    raw: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonNestedArrayIter<'a> {
+    /// Creates an iterator over the inner arrays following `key`.
+    ///
+    /// Returns `None` when the key is absent.
+    #[must_use]
+    pub fn new(raw: &'a [u8], key: &[u8]) -> Option<Self> {
+        // O(1) EXEMPT: begin
+        // Locating the key requires scanning — inherent to a JSON wire and
+        // explicitly the non-O(1) fallback path (module complexity table).
+        let key_at = raw
+            .windows(key.len())
+            .position(|w| w == key)
+            .map(|p| p.saturating_add(key.len()))?;
+        // O(1) EXEMPT: end
+        Some(Self { raw, pos: key_at })
+    }
+}
+
+impl<'a> Iterator for JsonNestedArrayIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Find the next inner '['.
+        while self.pos < self.raw.len() && self.raw[self.pos] != b'[' {
+            // A ']' closing the OUTER array ends iteration.
+            if self.raw[self.pos] == b']' {
+                return None;
+            }
+            self.pos = self.pos.saturating_add(1);
+        }
+        // Skip the outer opening bracket on the first call.
+        if self.pos < self.raw.len() && self.raw[self.pos] == b'[' {
+            let after = self.pos.saturating_add(1);
+            let is_outer = self
+                .raw
+                .get(after..)
+                .is_some_and(|r| r.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'['));
+            if is_outer {
+                self.pos = after;
+                while self.pos < self.raw.len() && self.raw[self.pos] != b'[' {
+                    self.pos = self.pos.saturating_add(1);
+                }
+            }
+        }
+        if self.pos >= self.raw.len() {
+            return None;
+        }
+        let start = self.pos;
+        let mut end = start;
+        while end < self.raw.len() && self.raw[end] != b']' {
+            end = end.saturating_add(1);
+        }
+        if end >= self.raw.len() {
+            return None;
+        }
+        self.pos = end.saturating_add(1);
+        self.raw.get(start..=end)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Touchline
+// ---------------------------------------------------------------------------
+
+/// Field count of a touchline row as shown in EVERY v2.6 p.15 SAMPLE.
+pub const TD_TOUCHLINE_FIELDS_SAMPLE: usize = 17;
+/// Field count of a touchline row as listed in the v2.6 p.15 PROSE.
+///
+/// **The document contradicts itself**: the prose enumerates 18 fields
+/// (…, Today's OI, Previous Open Interest Close, Turnover, Bid, …) while
+/// all three worked examples carry 17. We therefore accept BOTH and
+/// anchor parsing from both ends — see [`decode_touchline_row`].
+pub const TD_TOUCHLINE_FIELDS_PROSE: usize = 18;
+
+/// One decoded touchline row (v2.6 p.15).
+///
+/// Pushed at pre-open and on every subscribe — this is where a symbol's
+/// opening snapshot (and its SymbolID) arrives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TruedataTouchline<'a> {
+    /// Symbol NAME (e.g. `NIFTY BANK`) — borrowed, zero-alloc.
+    pub symbol: &'a str,
+    /// Session-scoped numeric routing key.
+    pub symbol_id: i32,
+    /// Last update time, epoch seconds (ISO on the wire).
+    pub last_update_secs: i64,
+    /// Last traded price.
+    pub ltp: f32,
+    /// Tick volume.
+    pub tick_volume: i64,
+    /// Average traded price.
+    pub atp: f32,
+    /// Total volume for the day.
+    pub total_volume: i64,
+    /// Day open.
+    pub open: f32,
+    /// Day high.
+    pub high: f32,
+    /// Day low.
+    pub low: f32,
+    /// Previous close.
+    pub prev_close: f32,
+    /// Best bid.
+    pub bid: f32,
+    /// Best bid quantity.
+    pub bid_qty: i32,
+    /// Best ask.
+    pub ask: f32,
+    /// Best ask quantity.
+    pub ask_qty: i32,
+    /// The 2-or-3 ambiguous middle fields (OI / prev-OI-close / turnover),
+    /// kept RAW and unlabelled because the vendor doc contradicts itself
+    /// about how many there are and therefore which is which.
+    ///
+    /// `middle_count` says how many were present: 2 (sample shape) or 3
+    /// (prose shape). A consumer that needs OI must resolve this against
+    /// live data — we refuse to guess and mislabel a field.
+    pub middle_count: usize,
+    /// First ambiguous middle value (present when `middle_count >= 1`).
+    pub middle_0: i64,
+    /// Second ambiguous middle value (present when `middle_count >= 2`).
+    pub middle_1: i64,
+    /// Third ambiguous middle value (present only when `middle_count == 3`).
+    pub middle_2: i64,
+}
+
+/// Decodes ONE touchline row (an inner array of `symbollist`).
+///
+/// Parsing is anchored from BOTH ends because the vendor doc disagrees
+/// with itself on the field count (17 in every sample, 18 in the prose):
+/// the leading 11 fields and the trailing 4 (bid/bidqty/ask/askqty) are
+/// unambiguous in both shapes, so only the 2-or-3 middle OI/turnover
+/// fields vary — and those are surfaced raw rather than mislabelled.
+///
+/// # Errors
+/// [`TruedataDecodeError::UnexpectedLength`] when the row carries neither
+/// 17 nor 18 fields, or a field fails to parse.
+pub fn decode_touchline_row(row: &[u8]) -> Result<TruedataTouchline<'_>, TruedataDecodeError> {
+    let bad = |n: usize| TruedataDecodeError::UnexpectedLength {
+        msg_code: b'L',
+        len: n,
+    };
+    let iter = JsonArrayIter::new(row).ok_or_else(|| bad(0))?;
+    // Collect into a fixed-capacity stack array — no heap allocation.
+    const MAX: usize = TD_TOUCHLINE_FIELDS_PROSE;
+    let mut fields: [&str; MAX] = [""; MAX];
+    let mut n = 0usize;
+    for item in iter {
+        if n >= MAX {
+            return Err(bad(n.saturating_add(1)));
+        }
+        fields[n] = item;
+        n = n.saturating_add(1);
+    }
+    if n != TD_TOUCHLINE_FIELDS_SAMPLE && n != TD_TOUCHLINE_FIELDS_PROSE {
+        return Err(bad(n));
+    }
+    // Trailing 4 are always bid, bidqty, ask, askqty.
+    let tail = n.saturating_sub(4);
+    let middle_count = tail.saturating_sub(11);
+    let mid = |i: usize| -> i64 {
+        if i < middle_count {
+            parse_i64(fields[11usize.saturating_add(i)]).unwrap_or(0)
+        } else {
+            0
+        }
+    };
+    Ok(TruedataTouchline {
+        symbol: fields[0],
+        symbol_id: parse_i32(fields[1]).ok_or_else(|| bad(1))?,
+        last_update_secs: parse_iso_timestamp(fields[2]).ok_or_else(|| bad(2))?,
+        ltp: parse_f32(fields[3]).ok_or_else(|| bad(3))?,
+        tick_volume: parse_i64(fields[4]).ok_or_else(|| bad(4))?,
+        atp: parse_f32(fields[5]).ok_or_else(|| bad(5))?,
+        total_volume: parse_i64(fields[6]).ok_or_else(|| bad(6))?,
+        open: parse_f32(fields[7]).ok_or_else(|| bad(7))?,
+        high: parse_f32(fields[8]).ok_or_else(|| bad(8))?,
+        low: parse_f32(fields[9]).ok_or_else(|| bad(9))?,
+        prev_close: parse_f32(fields[10]).ok_or_else(|| bad(10))?,
+        bid: parse_f32(fields[tail]).ok_or_else(|| bad(tail))?,
+        bid_qty: parse_i32(fields[tail.saturating_add(1)]).ok_or_else(|| bad(tail))?,
+        ask: parse_f32(fields[tail.saturating_add(2)]).ok_or_else(|| bad(tail))?,
+        ask_qty: parse_i32(fields[tail.saturating_add(3)]).ok_or_else(|| bad(tail))?,
+        middle_count,
+        middle_0: mid(0),
+        middle_1: mid(1),
+        middle_2: mid(2),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// BidAsk L2 (BSE 5-level)
+// ---------------------------------------------------------------------------
+
+/// Number of depth levels in a BSE `bidaskL2` message (v2.6 p.17).
+pub const TD_BIDASK_L2_LEVELS: usize = 5;
+
+/// One depth level of a BSE L2 message.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TruedataL2Level {
+    /// Number of bid orders at this level.
+    pub bid_orders: i32,
+    /// Bid price.
+    pub bid_price: f32,
+    /// Bid quantity.
+    pub bid_qty: i32,
+    /// Number of ask orders at this level.
+    pub ask_orders: i32,
+    /// Ask price.
+    pub ask_price: f32,
+    /// Ask quantity.
+    pub ask_qty: i32,
+}
+
+/// A decoded BSE 5-level depth message (v2.6 p.17).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TruedataBidAskL2 {
+    /// Session-scoped routing key.
+    pub symbol_id: i32,
+    /// Epoch seconds (ISO on the wire, like `trade`).
+    pub timestamp_secs: i64,
+    /// The five depth levels, best first.
+    pub levels: [TruedataL2Level; TD_BIDASK_L2_LEVELS],
+    /// Total bid quantity across the book.
+    pub total_bid_qty: i64,
+    /// Total ask quantity across the book.
+    pub total_ask_qty: i64,
+}
+
+/// Decodes a `{"bidaskL2":[...]}` frame (BSE only, v2.6 p.17).
+///
+/// Layout: symbol id, timestamp, then five groups of
+/// (bid orders, bid price, bid qty, ask orders, ask price, ask qty),
+/// then total bid qty and total ask qty.
+///
+/// The totals are read from the END of the array rather than a fixed
+/// index, so a vendor field-count drift in the level block degrades to a
+/// typed error instead of silently shifting every price.
+///
+/// # Errors
+/// [`TruedataDecodeError::UnexpectedLength`] when the array is too short
+/// to carry the documented structure.
+pub fn decode_bidask_l2_json(raw: &[u8]) -> Result<TruedataBidAskL2, TruedataDecodeError> {
+    let bad = |n: usize| TruedataDecodeError::UnexpectedLength {
+        msg_code: b'2',
+        len: n,
+    };
+    // 2 header + 5*6 levels + 2 totals
+    const EXPECTED: usize = 2 + TD_BIDASK_L2_LEVELS * 6 + 2;
+    let iter = JsonArrayIter::new(raw).ok_or_else(|| bad(0))?;
+    let mut fields: [&str; EXPECTED] = [""; EXPECTED];
+    let mut n = 0usize;
+    for item in iter {
+        if n >= EXPECTED {
+            // Extra fields: vendor drift. Fail typed rather than mis-index.
+            return Err(bad(n.saturating_add(1)));
+        }
+        fields[n] = item;
+        n = n.saturating_add(1);
+    }
+    if n != EXPECTED {
+        return Err(bad(n));
+    }
+    let mut levels = [TruedataL2Level::default(); TD_BIDASK_L2_LEVELS];
+    for (lvl, slot) in levels.iter_mut().enumerate() {
+        let base = 2usize.saturating_add(lvl.saturating_mul(6));
+        *slot = TruedataL2Level {
+            bid_orders: parse_i32(fields[base]).unwrap_or(0),
+            bid_price: parse_f32(fields[base.saturating_add(1)]).unwrap_or(0.0),
+            bid_qty: parse_i32(fields[base.saturating_add(2)]).unwrap_or(0),
+            ask_orders: parse_i32(fields[base.saturating_add(3)]).unwrap_or(0),
+            ask_price: parse_f32(fields[base.saturating_add(4)]).unwrap_or(0.0),
+            ask_qty: parse_i32(fields[base.saturating_add(5)]).unwrap_or(0),
+        };
+    }
+    Ok(TruedataBidAskL2 {
+        symbol_id: parse_i32(fields[0]).ok_or_else(|| bad(0))?,
+        timestamp_secs: parse_iso_timestamp(fields[1]).ok_or_else(|| bad(1))?,
+        levels,
+        total_bid_qty: parse_i64(fields[EXPECTED.saturating_sub(2)]).unwrap_or(0),
+        total_ask_qty: parse_i64(fields[EXPECTED.saturating_sub(1)]).unwrap_or(0),
+    })
+}
+
+#[cfg(test)]
+mod nested_tests {
+    use super::*;
+
+    /// The v2.6 p.15 touchline sample (first two rows), verbatim shape.
+    const TOUCHLINE: &[u8] = br#"{"success":true,"message":"touchline","symbolsadded":2,"symbollist":[["NIFTY BANK","200000004","2020-12-17T08:40:29","30698.4","0","0","0","30920.35","30932.25","30587.1","30698.4","0","0","0","0","0","0"],["NIFTY-I","900000596","2020-12-17T09:17:52","13701.8","300","13695.74","206850","13710.15","13715.2","13686.9","13699.45","12538050","2832963189","13701.25","450","13701.9","375"]],"totalsymbolsubscribed":2}"#;
+
+    #[test]
+    fn test_json_nested_array_iter_new_yields_each_row() {
+        let rows: Vec<&[u8]> = JsonNestedArrayIter::new(TOUCHLINE, b"\"symbollist\":")
+            .expect("key")
+            .collect();
+        assert_eq!(rows.len(), 2, "two symbols in the sample");
+    }
+
+    #[test]
+    fn test_decode_touchline_row_parses_documented_sample() {
+        let rows: Vec<&[u8]> = JsonNestedArrayIter::new(TOUCHLINE, b"\"symbollist\":")
+            .expect("key")
+            .collect();
+        let t = decode_touchline_row(rows[0]).expect("row 0 decodes");
+        assert_eq!(t.symbol, "NIFTY BANK");
+        assert_eq!(t.symbol_id, 200_000_004);
+        assert!((t.ltp - 30698.4).abs() < 0.01);
+        assert!((t.open - 30920.35).abs() < 0.01);
+        assert!((t.high - 30932.25).abs() < 0.01);
+        assert!((t.low - 30587.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_decode_touchline_row_reports_ambiguous_middle_count() {
+        // The doc contradiction: samples carry 17 fields (2 middle values),
+        // the prose lists 18 (3 middle values). We surface the count rather
+        // than guessing which OI/turnover field is which.
+        let rows: Vec<&[u8]> = JsonNestedArrayIter::new(TOUCHLINE, b"\"symbollist\":")
+            .expect("key")
+            .collect();
+        let t = decode_touchline_row(rows[1]).expect("row 1 decodes");
+        assert_eq!(t.symbol, "NIFTY-I");
+        assert_eq!(
+            t.middle_count, 2,
+            "the documented SAMPLES carry 2 middle fields, not the prose's 3"
+        );
+        // Bid/ask are anchored from the END, so they are correct in both shapes.
+        assert_eq!(t.bid_qty, 450);
+        assert_eq!(t.ask_qty, 375);
+        assert!((t.bid - 13701.25).abs() < 0.01);
+        assert!((t.ask - 13701.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_decode_touchline_row_accepts_the_prose_18_field_shape() {
+        // Same row plus one extra middle field — the prose shape. Bid/ask
+        // must STILL land correctly because they are back-anchored.
+        let row = br#"["X","1","2020-12-17T09:17:52","100","1","100","10","100","101","99","100","11","22","33","1.5","7","2.5","9"]"#;
+        let t = decode_touchline_row(row).expect("18-field row decodes");
+        assert_eq!(t.middle_count, 3);
+        assert_eq!(t.bid_qty, 7);
+        assert_eq!(t.ask_qty, 9);
+        assert!((t.bid - 1.5).abs() < 0.01);
+        assert!((t.ask - 2.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_decode_touchline_row_rejects_other_field_counts() {
+        let short = br#"["X","1","2020-12-17T09:17:52","100"]"#;
+        assert!(decode_touchline_row(short).is_err());
+    }
+
+    #[test]
+    fn test_decode_bidask_l2_json_parses_five_levels_and_totals() {
+        // 2 header + 30 level fields + 2 totals = 34.
+        let mut s = String::from(r#"{"bidaskL2":["490000010","2023-07-05T09:15:44""#);
+        for lvl in 0..5 {
+            let base = 100 + lvl * 10;
+            s.push_str(&format!(
+                r#","1","{}","{}","2","{}","{}""#,
+                base,
+                base + 1,
+                base + 2,
+                base + 3
+            ));
+        }
+        s.push_str(r#","120","110"]}"#);
+        let l2 = decode_bidask_l2_json(s.as_bytes()).expect("L2 decodes");
+        assert_eq!(l2.symbol_id, 490_000_010);
+        assert_eq!(l2.total_bid_qty, 120);
+        assert_eq!(l2.total_ask_qty, 110);
+        assert_eq!(l2.levels.len(), TD_BIDASK_L2_LEVELS);
+        assert_eq!(l2.levels[0].bid_orders, 1);
+        assert!((l2.levels[0].bid_price - 100.0).abs() < 0.01);
+        assert_eq!(l2.levels[4].ask_qty, 143);
+    }
+
+    #[test]
+    fn test_decode_bidask_l2_json_rejects_wrong_field_count() {
+        let short = br#"{"bidaskL2":["490000010","2023-07-05T09:15:44","1","2"]}"#;
+        assert!(decode_bidask_l2_json(short).is_err());
+    }
+
+    #[test]
+    fn test_nested_decoders_never_panic_on_malformed_input() {
+        let fuzz: [&[u8]; 6] = [
+            b"",
+            b"{",
+            br#"{"symbollist":[["#,
+            br#"{"symbollist":[[]]}"#,
+            br#"{"bidaskL2":[}"#,
+            br#"[[["#,
+        ];
+        for f in fuzz {
+            let _ = decode_bidask_l2_json(f);
+            let _ = decode_touchline_row(f);
+            if let Some(it) = JsonNestedArrayIter::new(f, b"\"symbollist\":") {
+                let _ = it.count();
+            }
+        }
+    }
+}
