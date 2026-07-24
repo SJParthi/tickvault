@@ -274,6 +274,12 @@ pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>)
             // config-off. Persisted-off still honors the operator's last
             // disable on a config-on boot.
             groww_enabled: config.groww_enabled && p.groww_enabled,
+            // TrueData (feed #4): the persisted overlay carries only the
+            // Dhan/Groww runtime toggles today, so the TrueData config
+            // passes through unchanged (no overlay resurrection concern —
+            // TrueData ships default-OFF and its lane is not yet wired).
+            truedata_enabled: config.truedata_enabled,
+            truedata: config.truedata,
         },
     }
 }

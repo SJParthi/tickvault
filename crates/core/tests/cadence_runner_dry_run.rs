@@ -1236,6 +1236,7 @@ async fn test_cadence_runner_expiry_disagreement_dhan_wins_both_lanes() {
         match req.broker {
             Feed::Dhan => Ok(vec![20_260_716]),
             Feed::Groww => Ok(vec![20_260_717]),
+            Feed::Truedata => unreachable!("cadence has no TrueData lane"),
         }
     }
     let log = Arc::new(Mutex::new(Vec::new()));

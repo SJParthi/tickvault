@@ -47,6 +47,12 @@ pub enum WsType {
     /// with the Dhan `order_update` label or the retired market-data
     /// `groww_bridge` rows. Pairs with `feed='groww'`.
     GrowwOrderUpdate,
+    /// The TrueData live-tick feed (feed #4, operator lock 2026-07-24) —
+    /// the `wss://push.truedata.in` binary-tick market-data WebSocket. A
+    /// distinct `ws_type` keeps the broker meaning of the SYMBOL honest:
+    /// `where ws_type='truedata_feed'` reads cleanly and never mixes with
+    /// a Dhan/Groww label. Pairs with `feed='truedata'`.
+    TruedataFeed,
 }
 
 impl WsType {
@@ -60,13 +66,14 @@ impl WsType {
             Self::OrderUpdate => "order_update",
             Self::GrowwBridge => "groww_bridge",
             Self::GrowwOrderUpdate => "groww_order_update",
+            Self::TruedataFeed => "truedata_feed",
         }
     }
 
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness
     /// without drifting from the enum.
     #[must_use]
-    pub const fn all() -> [WsType; 6] {
+    pub const fn all() -> [WsType; 7] {
         [
             Self::MainFeed,
             Self::Depth20,
@@ -74,6 +81,7 @@ impl WsType {
             Self::OrderUpdate,
             Self::GrowwBridge,
             Self::GrowwOrderUpdate,
+            Self::TruedataFeed,
         ]
     }
 }
@@ -202,7 +210,8 @@ mod tests {
                 "depth_200",
                 "order_update",
                 "groww_bridge",
-                "groww_order_update"
+                "groww_order_update",
+                "truedata_feed"
             ]
         );
         // No two variants share a wire label.
@@ -237,7 +246,7 @@ mod tests {
     fn test_all_arrays_match_variant_counts() {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
-        assert_eq!(WsType::all().len(), 6);
+        assert_eq!(WsType::all().len(), 7);
         assert_eq!(WsEventKind::all().len(), 7);
     }
 
