@@ -1,8 +1,8 @@
 # Implementation Plan: TrueData Fourth Live-Tick Feed (feed='truedata')
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-07-24
-**Approved by:** pending (operator flips DRAFT → APPROVED per design-first wall)
+**Approved by:** Parthiban (operator) — approved 2026-07-24 in-session (AskUserQuestion: "Approve the plan, don't merge yet")
 **Scope authority:** `.claude/rules/project/truedata-feed-scope-2026-07-24.md` (operator quotes 2026-07-24)
 **Guarantee matrices:** the 15-row + 7-row matrices of `.claude/rules/project/per-wave-guarantee-matrix.md` apply to every PR below (cross-referenced, not re-pasted).
 
@@ -133,8 +133,8 @@ the documented exit (scope §3).
 |---|---|---|
 | **#1696 (timeframe diet)** land FIRST | reshapes the aggregator + `TF_COUNT` + `candles_Ns` surface PR-D writes into | build PR-D after #1696 merges (else rebase onto a changed TF contract) |
 | **#1701 (m8g.large prep)** land FIRST | our instance upgrade is already prepped there — reuse, don't duplicate | PR-F depends on #1701; no new terraform |
-| **#1700 (GDF #3 design)** | the pluggable-feed pattern TrueData #4 mirrors | design reference, no code conflict |
-| All 4 open PRs are **DO-NOT-MERGE by design** | operator/coordinator merges them, not this session | do NOT auto-merge; sequence around them |
+| ~~#1700 (GDF #3 design)~~ | **NOT needed (operator 2026-07-24: "gdf design is not yet needed … one and only truedata is needed")** — TrueData is a standalone independent feed; the pluggable pattern already shipped for Groww, no GDF dependency | dropped |
+| All open PRs are **DO-NOT-MERGE by design** | operator/coordinator merges them, not this session | do NOT auto-merge; sequence around them |
 
 ## Scenarios
 
