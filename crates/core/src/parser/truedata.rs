@@ -942,6 +942,13 @@ const OFF_AUTH_MAX_SYMBOLS: usize = 93; // int, 4B
 const OFF_AUTH_SUBSCRIPTION: usize = 97; // str, 20B
 const OFF_AUTH_VALIDITY: usize = 117; // str, 10B
 
+/// Widest fixed-width string field in the whole TrueData binary surface —
+/// the auth `Segment` field (60 bytes, v2.6 p.10).
+///
+/// This is the constant that makes the NUL scan in `fixed_str` a bounded
+/// operation rather than growth in n, and it is asserted there.
+pub const TD_MAX_FIXED_STR_LEN: usize = 60;
+
 const LEN_AUTH_MESSAGE: usize = 31;
 const LEN_AUTH_SEGMENT: usize = 60;
 const LEN_AUTH_SUBSCRIPTION: usize = 20;
@@ -984,6 +991,20 @@ fn fixed_str(raw: &[u8], offset: usize, len: usize) -> &str {
         return "";
     }
     let field = &raw[offset..end];
+    // O(1) EXEMPT: bounded NUL scan over a FIXED-WIDTH field — `len` is
+    // always one of the compile-time constants below (max 60 bytes, the
+    // auth `Segment` field), never input-dependent, so this is a constant
+    // upper bound rather than growth in n. It is also COLD PATH: the only
+    // callers are the auth decode (once per connect) and market-status
+    // (a handful per session) — never the tick hot path, which is
+    // `decode_trade_binary` and touches no strings at all. Finding a NUL
+    // terminator inherently requires inspecting bytes; there is no
+    // sub-linear alternative.
+    debug_assert!(
+        len <= TD_MAX_FIXED_STR_LEN,
+        "fixed_str called with an unbounded length — the O(1) EXEMPT above \
+         only holds for the documented fixed-width fields"
+    );
     let cut = field.iter().position(|&b| b == 0).unwrap_or(field.len());
     core::str::from_utf8(&field[..cut]).unwrap_or("").trim()
 }
