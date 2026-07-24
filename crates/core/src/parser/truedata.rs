@@ -991,22 +991,25 @@ fn fixed_str(raw: &[u8], offset: usize, len: usize) -> &str {
         return "";
     }
     let field = &raw[offset..end];
-    // O(1) EXEMPT: bounded NUL scan over a FIXED-WIDTH field — `len` is
-    // always one of the compile-time constants below (max 60 bytes, the
-    // auth `Segment` field), never input-dependent, so this is a constant
-    // upper bound rather than growth in n. It is also COLD PATH: the only
-    // callers are the auth decode (once per connect) and market-status
-    // (a handful per session) — never the tick hot path, which is
-    // `decode_trade_binary` and touches no strings at all. Finding a NUL
-    // terminator inherently requires inspecting bytes; there is no
-    // sub-linear alternative.
+    // O(1) EXEMPT: begin
+    // Bounded NUL scan over a FIXED-WIDTH field. `len` is always one of the
+    // compile-time constants (31 Message / 60 Segment / 20 Subscription /
+    // 10 Validity, v2.6 p.10), never input-dependent, so the worst case is
+    // 60 byte comparisons forever — a constant upper bound, not growth in
+    // n. It is also COLD PATH: the only callers are the auth decode (once
+    // per connect) and market-status (a handful per session). The tick hot
+    // path is `decode_trade_binary`, which touches no strings at all.
+    // Finding a NUL terminator inherently requires inspecting bytes; there
+    // is no sub-linear alternative. The debug_assert makes the bound that
+    // justifies this exemption fail loudly if a caller ever violates it.
     debug_assert!(
         len <= TD_MAX_FIXED_STR_LEN,
-        "fixed_str called with an unbounded length — the O(1) EXEMPT above \
+        "fixed_str called with an unbounded length — the O(1) EXEMPT here \
          only holds for the documented fixed-width fields"
     );
     let cut = field.iter().position(|&b| b == 0).unwrap_or(field.len());
     core::str::from_utf8(&field[..cut]).unwrap_or("").trim()
+    // O(1) EXEMPT: end
 }
 
 /// Decodes the 128-byte binary authentication response (v2.6 p.10).
