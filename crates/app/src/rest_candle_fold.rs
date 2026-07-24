@@ -1128,6 +1128,7 @@ fn feed_ordinal(feed: Feed) -> u8 {
     match feed {
         Feed::Dhan => 0,
         Feed::Groww => 1,
+        Feed::Truedata => 2,
     }
 }
 

@@ -185,11 +185,15 @@ impl DailyLagHistogram {
 /// the arrays are fixed-size atomics).
 static DHAN_DAY_LAG_HIST: DailyLagHistogram = DailyLagHistogram::new();
 static GROWW_DAY_LAG_HIST: DailyLagHistogram = DailyLagHistogram::new();
+// TrueData (feed #4) is a live-tick feed, so it gets its own day-lag
+// histogram exactly like Dhan/Groww (const-initialized, zero cost).
+static TRUEDATA_DAY_LAG_HIST: DailyLagHistogram = DailyLagHistogram::new();
 
 fn day_hist(feed: Feed) -> &'static DailyLagHistogram {
     match feed {
         Feed::Dhan => &DHAN_DAY_LAG_HIST,
         Feed::Groww => &GROWW_DAY_LAG_HIST,
+        Feed::Truedata => &TRUEDATA_DAY_LAG_HIST,
     }
 }
 

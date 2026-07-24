@@ -2628,6 +2628,11 @@ fn handle_completion<C, D, G>(
         let lane: &mut LaneRun = match lane_feed {
             Feed::Dhan => &mut cycle.dhan,
             Feed::Groww => &mut cycle.groww,
+            // TrueData (feed #4) is a live-tick feed, never a REST cadence
+            // lane — the cadence scheduler only ever drives Dhan/Groww
+            // lanes (CycleState has no TrueData LaneRun), so this arm is
+            // structurally unreachable regardless of truedata_enabled.
+            Feed::Truedata => unreachable!("cadence has no TrueData lane"),
         };
         lane.inflight = lane.inflight.saturating_sub(1);
         if lane.resolved {
@@ -2803,6 +2808,8 @@ fn handle_completion<C, D, G>(
                                     && (cycle.groww_leg_attempts[underlying_idx] >= 2
                                         || cycle.groww_verdict_passed)
                             }
+                            // TrueData is a live-tick feed, never a cadence lane.
+                            Feed::Truedata => unreachable!("cadence has no TrueData lane"),
                         };
                         if terminal
                             && !matches!(
@@ -2868,6 +2875,10 @@ fn handle_completion<C, D, G>(
                             match lane_feed {
                                 Feed::Dhan => cycle.dhan_spot_dirty = true,
                                 Feed::Groww => cycle.groww_dirty = true,
+                                // TrueData is a live-tick feed, never a cadence lane.
+                                Feed::Truedata => {
+                                    unreachable!("cadence has no TrueData lane")
+                                }
                             }
                         }
                         // The retry is APPENDED at the next free
@@ -3004,6 +3015,8 @@ fn handle_completion<C, D, G>(
                                         >= 2
                                         || cycle.groww_verdict_passed)
                             }
+                            // TrueData is a live-tick feed, never a cadence lane.
+                            Feed::Truedata => unreachable!("cadence has no TrueData lane"),
                         };
                         let cell_missing = match target.chain_underlying() {
                             Some(u) => lane.asm.spot(u).is_none(),
@@ -3059,6 +3072,8 @@ fn lane_own_path_exhausted(feed: Feed, cycle: &CycleState) -> bool {
     let lane = match feed {
         Feed::Dhan => &cycle.dhan,
         Feed::Groww => &cycle.groww,
+        // TrueData is a live-tick feed, never a cadence lane.
+        Feed::Truedata => unreachable!("cadence has no TrueData lane"),
     };
     if lane.inflight > 0 {
         return false;
@@ -3072,6 +3087,8 @@ fn lane_own_path_exhausted(feed: Feed, cycle: &CycleState) -> bool {
             action,
             CycleAction::GrowwWave { .. } | CycleAction::GrowwVerdict
         ),
+        // TrueData is a live-tick feed, never a cadence lane.
+        Feed::Truedata => false,
     })
 }
 
