@@ -28,6 +28,7 @@ pub mod ticker;
 pub mod truedata;
 pub mod truedata_json;
 pub mod truedata_requests;
+pub mod truedata_session;
 pub mod types;
 
 // PR #4 (2026-05-19): depth re-exports retired.
