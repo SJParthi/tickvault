@@ -739,6 +739,10 @@ pub(crate) fn emit_edge_action(
                 });
             }
         }
+        // TrueData (feed #4) is a live-tick feed, not a REST cadence leg, so it
+        // produces no per-minute fetch escalation emits (the sibling
+        // classify path treats future feeds the same way). No-op.
+        (Feed::Truedata, _, _) => {}
     }
 }
 

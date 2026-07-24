@@ -32,13 +32,18 @@ pub enum Feed {
     Dhan,
     /// Groww (feed #2) — sidecar NDJSON producer. Default OFF.
     Groww,
+    /// TrueData (feed #4) — the intended LIVE-TICK source (operator lock
+    /// 2026-07-24, `truedata-feed-scope-2026-07-24.md`). Native Rust
+    /// `wss://push.truedata.in` binary-tick producer, default OFF; its
+    /// live WS is NOT retired.
+    Truedata,
 }
 
 impl Feed {
     /// The single-source list of every feed. Build every iteration / allowed-list
     /// from this — never a hand-written `[Feed::Dhan, Feed::Groww]` literal — so a
     /// future feed cannot be silently dropped from a list (NTM 2→3 lesson).
-    pub const ALL: &'static [Feed] = &[Feed::Dhan, Feed::Groww];
+    pub const ALL: &'static [Feed] = &[Feed::Dhan, Feed::Groww, Feed::Truedata];
 
     /// The number of feeds — derived from [`Feed::ALL`] so fixed-size per-feed
     /// arrays (e.g. the live-feed health registry) grow automatically with a new
@@ -53,6 +58,7 @@ impl Feed {
         match self {
             Self::Dhan => 0,
             Self::Groww => 1,
+            Self::Truedata => 2,
         }
     }
 
@@ -63,6 +69,7 @@ impl Feed {
         match self {
             Self::Dhan => "dhan",
             Self::Groww => "groww",
+            Self::Truedata => "truedata",
         }
     }
 
@@ -81,7 +88,7 @@ impl Feed {
     /// the handler via `FeedRuntimeState::can_disable_dhan`.
     #[must_use]
     pub const fn is_runtime_toggleable(self) -> bool {
-        matches!(self, Self::Groww | Self::Dhan)
+        matches!(self, Self::Groww | Self::Dhan | Self::Truedata)
     }
 
     /// True for lanes whose LIVE-WS transport was RETIRED by operator
@@ -89,11 +96,13 @@ impl Feed {
     /// arrives via the per-minute REST cadence pulls. Drives the honest
     /// "off by design" wording on the /feeds panel instead of the scary
     /// "switched off by operator" (operator-scare fix, 2026-07-20). A
-    /// future NON-retired feed adds a `false` arm here.
+    /// NON-retired feed (TrueData — its live WS is the intended tick
+    /// source, operator lock 2026-07-24) has a `false` arm here.
     #[must_use]
     pub const fn live_ws_retired(self) -> bool {
         match self {
             Self::Dhan | Self::Groww => true,
+            Self::Truedata => false,
         }
     }
 
@@ -105,6 +114,7 @@ impl Feed {
         match self {
             Self::Dhan => "Dhan",
             Self::Groww => "Groww",
+            Self::Truedata => "TrueData",
         }
     }
 }
@@ -135,6 +145,7 @@ mod tests {
         assert_eq!(sorted.len(), labels.len(), "feed labels must be unique");
         assert!(Feed::ALL.contains(&Feed::Dhan));
         assert!(Feed::ALL.contains(&Feed::Groww));
+        assert!(Feed::ALL.contains(&Feed::Truedata));
     }
 
     #[test]
@@ -150,11 +161,16 @@ mod tests {
 
     #[test]
     fn test_live_ws_retired_true_for_both_retired_lanes() {
-        // Operator-scare fix (2026-07-20): both live-WS lanes are retired
-        // (Dhan 2026-07-13, Groww 2026-07-15) — OFF is the designed state.
-        for &feed in Feed::ALL {
-            assert!(feed.live_ws_retired(), "{feed:?} live-WS lane is retired");
-        }
+        // Operator-scare fix (2026-07-20): the Dhan + Groww live-WS lanes are
+        // retired (Dhan 2026-07-13, Groww 2026-07-15) — OFF is the designed
+        // state. TrueData (feed #4, operator lock 2026-07-24) is the intended
+        // live-tick source, so its lane is NOT retired.
+        assert!(Feed::Dhan.live_ws_retired());
+        assert!(Feed::Groww.live_ws_retired());
+        assert!(
+            !Feed::Truedata.live_ws_retired(),
+            "TrueData live-WS lane is the intended tick source, not retired"
+        );
     }
 
     #[test]
@@ -162,6 +178,7 @@ mod tests {
         // Pin the exact wire labels — storage DEDUP keys + the API depend on them.
         assert_eq!(Feed::Dhan.as_str(), "dhan");
         assert_eq!(Feed::Groww.as_str(), "groww");
+        assert_eq!(Feed::Truedata.as_str(), "truedata");
     }
 
     #[test]
@@ -174,6 +191,7 @@ mod tests {
         }
         assert_eq!(Feed::Dhan.display_name(), "Dhan");
         assert_eq!(Feed::Groww.display_name(), "Groww");
+        assert_eq!(Feed::Truedata.display_name(), "TrueData");
     }
 
     #[test]

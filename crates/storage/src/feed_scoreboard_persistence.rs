@@ -81,6 +81,12 @@ pub const LAG_FLOOR_MS_DHAN: i64 = 1000;
 /// receipt clock is the sidecar callback capture — one hop downstream).
 pub const LAG_FLOOR_MS_GROWW: i64 = 1;
 
+/// TrueData lag measurement floor: the v2.6 binary tick carries a whole-second
+/// `Timestamp(i32)` (precision UNVERIFIED-LIVE per the scope lock), so sub-second
+/// lag is unmeasurable and the floor is 1000ms (Dhan-class). Feed #4, operator
+/// lock 2026-07-24.
+pub const LAG_FLOOR_MS_TRUEDATA: i64 = 1000;
+
 /// NSE regular session minutes ([09:15, 15:30) IST).
 pub const SCOREBOARD_SESSION_MINUTES: i64 = 375;
 
