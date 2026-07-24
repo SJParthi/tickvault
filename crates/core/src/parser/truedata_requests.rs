@@ -106,39 +106,58 @@ pub fn build_remove_symbol(symbols: &[&str]) -> String {
     build_symbol_request(TD_METHOD_REMOVE_SYMBOL, symbols)
 }
 
-/// Builds a `getmarketstatus` request (v2.6 p.14).
+/// The complete `getmarketstatus` request frame (v2.6 p.14).
+///
+/// A compile-time constant: the frame takes no arguments, so there is
+/// nothing to format and nothing to allocate.
+pub const TD_REQUEST_GET_MARKET_STATUS: &str = r#"{"method":"getmarketstatus"}"#;
+
+/// The complete `logout` request frame (v2.6 p.18).
+///
+/// A compile-time constant, for the same reason as
+/// [`TD_REQUEST_GET_MARKET_STATUS`].
+pub const TD_REQUEST_LOGOUT: &str = r#"{"method":"logout"}"#;
+
+/// Returns the `getmarketstatus` request (v2.6 p.14).
 ///
 /// The reply is a JSON object of per-segment states, e.g.
 /// `{"success":true,"NSE_EQ":"CLOSED","NSE_FO":"CLOSED","MCX":"OPEN"}`.
+///
+/// Returns a `&'static str` — this frame is fixed, so it costs no
+/// allocation at all.
 #[must_use]
-pub fn build_get_market_status() -> String {
-    format!("{{\"method\":\"{TD_METHOD_GET_MARKET_STATUS}\"}}")
+pub const fn build_get_market_status() -> &'static str {
+    TD_REQUEST_GET_MARKET_STATUS
 }
 
-/// Builds a `logout` request (v2.6 p.18).
+/// Returns the `logout` request (v2.6 p.18).
 ///
 /// Sending this on graceful shutdown is what avoids the ghost-session
 /// class: TrueData permits ONE login per key, and a dirty disconnect leaves
 /// the server-side session held, forcing the force-logout HTTP call plus a
 /// **1-minute** wait (v2.6 p.19) before the next login can succeed.
+///
+/// Returns a `&'static str` — fixed frame, zero allocation.
 #[must_use]
-pub fn build_logout() -> String {
-    format!("{{\"method\":\"{TD_METHOD_LOGOUT}\"}}")
+pub const fn build_logout() -> &'static str {
+    TD_REQUEST_LOGOUT
 }
 
 /// Splits a symbol universe into request-sized chunks.
 ///
 /// Returns one JSON `addsymbol` frame per chunk. An empty universe yields
 /// an empty Vec (we never send a pointless empty subscribe).
+///
+/// The result Vec is pre-sized to the exact chunk count — no growth
+/// reallocation, no iterator `collect`.
 #[must_use]
 pub fn build_add_symbol_batches(symbols: &[&str]) -> Vec<String> {
-    if symbols.is_empty() {
-        return Vec::new();
+    let chunk_count = symbols.len().div_ceil(TD_MAX_SYMBOLS_PER_REQUEST);
+    let mut batches = Vec::with_capacity(chunk_count);
+    for chunk in symbols.chunks(TD_MAX_SYMBOLS_PER_REQUEST) {
+        batches.push(build_add_symbol(chunk));
     }
-    symbols
-        .chunks(TD_MAX_SYMBOLS_PER_REQUEST)
-        .map(build_add_symbol)
-        .collect()
+    batches
 }
 
 // ---------------------------------------------------------------------------
