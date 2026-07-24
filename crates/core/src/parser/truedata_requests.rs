@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_symbol_matches_documented_shape() {
+    fn test_build_remove_symbol_matches_documented_shape() {
         let got = build_remove_symbol(&["MINDTREE"]);
         assert_eq!(got, r#"{"method":"removesymbol","symbols":["MINDTREE"]}"#);
     }
@@ -223,12 +223,12 @@ mod tests {
     }
 
     #[test]
-    fn test_batches_are_empty_for_empty_universe() {
+    fn test_build_add_symbol_batches_empty_universe() {
         assert!(build_add_symbol_batches(&[]).is_empty());
     }
 
     #[test]
-    fn test_batches_split_at_the_cap() {
+    fn test_build_add_symbol_batches_split_at_cap() {
         let names: Vec<String> = (0..250).map(|i| format!("SYM{i}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let batches = build_add_symbol_batches(&refs);
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_of_exactly_the_cap_is_one_frame() {
+    fn test_build_add_symbol_batches_exact_cap_one_frame() {
         let names: Vec<String> = (0..TD_MAX_SYMBOLS_PER_REQUEST)
             .map(|i| format!("S{i}"))
             .collect();

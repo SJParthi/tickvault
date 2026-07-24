@@ -608,18 +608,18 @@ mod tests {
     // --- frame classification ---
 
     #[test]
-    fn test_classify_empty_frame_is_error() {
+    fn test_classify_frame_empty_is_error() {
         assert_eq!(classify_frame(&[]), Err(TruedataDecodeError::Empty));
     }
 
     #[test]
-    fn test_classify_json_frame_by_first_byte() {
+    fn test_classify_frame_json_by_first_byte() {
         let json = br#"{"trade":["100000995"]}"#;
         assert_eq!(classify_frame(json), Ok(TruedataFrameKind::Json));
     }
 
     #[test]
-    fn test_classify_all_documented_binary_codes() {
+    fn test_classify_frame_all_documented_binary_codes() {
         assert_eq!(
             classify_frame(&[TD_MSG_CODE_AUTH]),
             Ok(TruedataFrameKind::AuthBinary)
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_unknown_code_is_reported_not_panicked() {
+    fn test_classify_frame_unknown_code_reported() {
         assert_eq!(
             classify_frame(&[b'Z']),
             Err(TruedataDecodeError::UnknownMsgCode(b'Z'))
@@ -649,7 +649,7 @@ mod tests {
     // --- trade decode ---
 
     #[test]
-    fn test_decode_documented_sample_roundtrips_every_field() {
+    fn test_decode_trade_binary_sample_roundtrips_fields() {
         let frame = sample_frame();
         let t = decode_trade_binary(&frame).expect("sample frame must decode");
         assert_eq!(t.symbol_id, 100_000_995);
@@ -673,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_74_byte_frame_has_no_bid_ask() {
+    fn test_decode_trade_binary_74_byte_no_bid_ask() {
         let frame = build_trade_frame(
             42,
             1_700_000_000,
@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_rejects_wrong_length_without_panicking() {
+    fn test_decode_trade_binary_rejects_wrong_length() {
         for len in [1_usize, 10, 62, 73, 75, 89, 91, 128, 200] {
             let mut f = vec![0_u8; len];
             f[0] = TD_MSG_CODE_TRADE;
@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_declines_json_frame_cleanly() {
+    fn test_decode_trade_binary_declines_json_frame() {
         let json = br#"{"trade":["100000995","2020-12-16T14:02:32"]}"#;
         assert_eq!(
             decode_trade_binary(json),
@@ -730,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_declines_non_trade_binary_frame() {
+    fn test_decode_trade_binary_declines_non_trade() {
         let mut auth = vec![0_u8; TD_AUTH_BINARY_LEN];
         auth[0] = TD_MSG_CODE_AUTH;
         assert_eq!(
@@ -740,14 +740,14 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_empty_frame_is_error_not_panic() {
+    fn test_decode_trade_binary_empty_is_error() {
         assert_eq!(decode_trade_binary(&[]), Err(TruedataDecodeError::Empty));
     }
 
     /// Every possible byte value as msg code, and every length 0..=200:
     /// the decoder must return, never panic.
     #[test]
-    fn test_decode_never_panics_on_arbitrary_input() {
+    fn test_decode_trade_binary_never_panics_arbitrary() {
         for code in 0_u16..=255 {
             for len in [0_usize, 1, 9, 74, 90, 128] {
                 let mut f = vec![0xAB_u8; len];
@@ -853,28 +853,28 @@ mod tests {
     // --- sequence gap detection ---
 
     #[test]
-    fn test_seq_first_frame_establishes_baseline() {
+    fn test_check_seq_first_frame_establishes_baseline() {
         assert_eq!(check_seq(None, 4775), SeqCheck::FirstSeen);
     }
 
     #[test]
-    fn test_seq_contiguous_when_exactly_next() {
+    fn test_check_seq_contiguous_when_exactly_next() {
         assert_eq!(check_seq(Some(10), 11), SeqCheck::Contiguous);
     }
 
     #[test]
-    fn test_seq_forward_jump_is_always_a_gap() {
+    fn test_check_seq_forward_jump_is_always_gap() {
         assert_eq!(check_seq(Some(10), 12), SeqCheck::Gap { missing: 1 });
         assert_eq!(check_seq(Some(10), 20), SeqCheck::Gap { missing: 9 });
     }
 
     #[test]
-    fn test_seq_duplicate_is_reported() {
+    fn test_check_seq_duplicate_is_reported() {
         assert_eq!(check_seq(Some(10), 10), SeqCheck::Duplicate);
     }
 
     #[test]
-    fn test_seq_reset_to_near_zero_is_reseed_not_gap() {
+    fn test_check_seq_reset_near_zero_is_reseed() {
         assert_eq!(check_seq(Some(999_999), 1), SeqCheck::Reseed);
         assert_eq!(
             check_seq(Some(999_999), TD_SEQ_RESEED_CEILING),
@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn test_seq_backwards_but_not_near_zero_is_not_silently_swallowed() {
+    fn test_check_seq_backwards_not_silently_swallowed() {
         // A large backwards jump is a reorder, not a reseed — it must be
         // reported (as Duplicate/out-of-order), never treated as normal.
         assert_ne!(check_seq(Some(999_999), 500_000), SeqCheck::Reseed);
@@ -891,14 +891,14 @@ mod tests {
     }
 
     #[test]
-    fn test_seq_forward_gap_after_a_reseed_still_fires() {
+    fn test_check_seq_forward_gap_after_reseed_fires() {
         // The reseed-suppression must never mask a REAL gap that happens
         // right after a reset (the hostile-review finding).
         assert_eq!(check_seq(Some(1), 5), SeqCheck::Gap { missing: 3 });
     }
 
     #[test]
-    fn test_seq_handles_i32_extremes_without_overflow() {
+    fn test_check_seq_handles_i32_extremes() {
         // Near the 32-bit ceiling: must not panic or wrap.
         let _ = check_seq(Some(i32::MAX), i32::MIN);
         let _ = check_seq(Some(i32::MIN), i32::MAX);
@@ -1183,7 +1183,7 @@ mod control_frame_tests {
     // --- auth ---
 
     #[test]
-    fn test_auth_binary_decodes_documented_sample() {
+    fn test_decode_auth_binary_documented_sample() {
         // v2.6 p.10 binary sample: maxsymbols 900, subscription Tick+1min.
         let f = build_auth_frame(
             true,
@@ -1203,7 +1203,7 @@ mod control_frame_tests {
     }
 
     #[test]
-    fn test_auth_binary_carries_the_duplicate_login_refusal() {
+    fn test_decode_auth_binary_duplicate_login_refusal() {
         // The 1-session-per-key refusal our SSM lock exists to prevent.
         let f = build_auth_frame(false, "User Already Connected", "", 0, "", "");
         let a = decode_auth_binary(&f).expect("decode");
@@ -1212,7 +1212,7 @@ mod control_frame_tests {
     }
 
     #[test]
-    fn test_auth_max_symbols_is_the_subscribe_cap() {
+    fn test_decode_auth_binary_max_symbols_is_cap() {
         // maxsymbols must be readable — it bounds the subscribe set
         // fail-closed rather than being silently truncated.
         let f = build_auth_frame(true, "ok", "NSEEQ", 250, "tick", "2026-01-01");
@@ -1220,7 +1220,7 @@ mod control_frame_tests {
     }
 
     #[test]
-    fn test_auth_rejects_wrong_length_and_wrong_code() {
+    fn test_decode_auth_binary_rejects_wrong_length_code() {
         let mut short = vec![0_u8; 64];
         short[0] = TD_MSG_CODE_AUTH;
         assert_eq!(
@@ -1240,7 +1240,7 @@ mod control_frame_tests {
     }
 
     #[test]
-    fn test_auth_declines_json_frame() {
+    fn test_decode_auth_binary_declines_json() {
         let json = br#"{"success":true,"message":"TrueData Real Time Data Service"}"#;
         assert_eq!(decode_auth_binary(json), Err(TruedataDecodeError::IsJson));
     }
@@ -1257,7 +1257,7 @@ mod control_frame_tests {
     }
 
     #[test]
-    fn test_auth_survives_non_utf8_field_without_panicking() {
+    fn test_decode_auth_binary_survives_non_utf8() {
         let mut f = build_auth_frame(true, "ok", "", 1, "", "");
         // Invalid UTF-8 in the message field.
         f[OFF_AUTH_MESSAGE] = 0xFF;
@@ -1272,7 +1272,7 @@ mod control_frame_tests {
     // --- heartbeat ---
 
     #[test]
-    fn test_heartbeat_binary_decodes_millisecond_timestamp() {
+    fn test_decode_heartbeat_binary_ms_timestamp() {
         // v2.6 p.11 sample value.
         let mut f = vec![0_u8; TD_HEARTBEAT_BINARY_LEN];
         f[0] = TD_MSG_CODE_HEARTBEAT;
@@ -1285,7 +1285,7 @@ mod control_frame_tests {
     }
 
     #[test]
-    fn test_heartbeat_timestamp_is_ms_while_trade_is_seconds() {
+    fn test_decode_heartbeat_binary_ms_not_seconds() {
         // The asymmetry that must never be collapsed into one parser:
         // a heartbeat ms value read as seconds would be ~55000 years out.
         let mut f = vec![0_u8; TD_HEARTBEAT_BINARY_LEN];
@@ -1300,7 +1300,7 @@ mod control_frame_tests {
     }
 
     #[test]
-    fn test_heartbeat_rejects_wrong_length() {
+    fn test_decode_heartbeat_binary_rejects_wrong_length() {
         let mut f = vec![0_u8; 9];
         f[0] = TD_MSG_CODE_HEARTBEAT;
         assert_eq!(
@@ -1315,7 +1315,7 @@ mod control_frame_tests {
     // --- market status ---
 
     #[test]
-    fn test_market_status_binary_decodes_session_message() {
+    fn test_decode_market_status_binary_session_message() {
         let mut f = vec![0_u8; TD_MARKET_STATUS_BINARY_LEN];
         f[0] = TD_MSG_CODE_MARKET_STATUS;
         f[OFF_MS_STATUS] = 1;
@@ -1327,7 +1327,7 @@ mod control_frame_tests {
     }
 
     #[test]
-    fn test_market_status_handles_every_documented_session_message() {
+    fn test_decode_market_status_binary_all_documented() {
         // v2.6 p.11 lists these verbatim; all must decode cleanly.
         for msg in [
             "NSE EQ Pre Open Start",
@@ -1351,7 +1351,7 @@ mod control_frame_tests {
     }
 
     #[test]
-    fn test_market_status_rejects_wrong_length() {
+    fn test_decode_market_status_binary_rejects_length() {
         let mut f = vec![0_u8; 61];
         f[0] = TD_MSG_CODE_MARKET_STATUS;
         assert_eq!(
