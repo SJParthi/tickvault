@@ -6,6 +6,54 @@
 **Scope authority:** `.claude/rules/project/truedata-feed-scope-2026-07-24.md` (operator quotes 2026-07-24)
 **Guarantee matrices:** the 15-row + 7-row matrices of `.claude/rules/project/per-wave-guarantee-matrix.md` apply to every PR below (cross-referenced, not re-pasted).
 
+> **⚠⚠ SUPERSEDED AGAIN — READ `truedata-feed-scope-2026-07-24.md` §10 FIRST.**
+> The operator supplied the official gated PDFs (Market Data API v2.6 + TCP API
+> v2.3) later the same day. They **restore** the original binary spec: the
+> **90-byte WS Trade binary (v2.6 p.16)** and the **128-byte auth binary (p.10)**
+> are REAL, **TCP port 7070 is REAL** (87-byte packet, TCP v2.3 p.8/13-14), the
+> force-logout wait is **1 min** (p.19), and **no LZ4** appears in either PDF.
+> **Binary decode is therefore genuinely fixed-offset O(1) + zero-alloc** —
+> PR-C builds the 90-byte WS binary parser, NOT a JSON scanner, and the "never
+> say O(1)" rule applies ONLY to the JSON fallback path. Chosen transport:
+> **WebSocket binary on port 8084** (TCP 7070 rejected: cleartext credentials,
+> undocumented subscribe syntax, no heartbeat — §10.3). The §9 banner below is
+> retained as audit trail; **§10 wins wherever they disagree.** What SURVIVES
+> from §9: trade timestamps are **whole seconds** (PDF-confirmed), so the
+> `ticks` DEDUP key MUST carry `capture_seq` or ~75% of same-second ticks are
+> silently destroyed (§10.5).
+>
+> **⚠ EVIDENCE CORRECTION 2026-07-24 (same day) — this plan's transport/parser
+> items are SUPERSEDED by `truedata-feed-scope-2026-07-24.md` §9.** An audit
+> against the IN-REPO reference pack (`docs/broker-ref-upload-2026-07-15/truedata/`)
+> found the PDF-sourced wire spec unsupported: the wire is **LZ4-compressed
+> JSON**, NOT a 90-byte binary struct; **TCP port 7070 does not exist**; the
+> auth reply is a **welcome JSON containing `TrueData`**, not a 128-byte
+> struct; the ghost-session wait is **~5 minutes**, not 60 s; prod default port
+> is **8082**; maintenance also covers **Sat/Sun 07:30–10:30**; and the stream
+> is a **conflated ~1-second L1 snapshot, NOT true tick-by-tick**.
+>
+> **Binding effects on the PR items below:**
+> - **PR-C** builds a **zero-allocation positional JSON scanner** (reusable
+>   per-connection scratch buffers, no `serde_json::Value`, no `String`), NOT a
+>   `from_le_bytes` fixed-offset decoder. Any unit test pinning the 90-byte
+>   offsets (`Seq No @70`, `OHL @69`, the "v2.6 sample tick") is VOID — do not
+>   write it.
+> - The parse is described as **"zero-allocation, amortized-constant per tick
+>   (O(frame bytes), fixed bound)"** — calling it O(1) is a §5 REJECT (§9.3).
+> - Decode must tolerate `touchline`/`bidask`/`bidaskL2`/`bar`/`greeks`/
+>   `marketstatus`/`heartbeat`, not just trade+heartbeat (§9.2).
+> - Identity uses the §9.5 canonical-key scheme in band **`[2^59, 2^60)`** with
+>   a **range** (never single-bit) disjointness assert; TrueData has **no ISIN**.
+> - The 17 symbol-master `.txt` HTTPS downloads are an **UNGRANTED REST
+>   surface** — a KEEP row must land in `no-rest-except-live-feed-2026-06-27.md`
+>   before any fetch code (§9.5).
+> - **PR-C..PR-F remain BLOCKED on the §9.8 day-0 sandbox capture** (one real
+>   frame settles JSON array-vs-object + timestamp precision + the raw
+>   subscribe keys). Building the scanner before that is guesswork.
+>
+> Operator scope is UNCHANGED — §0 quotes stand verbatim. This corrects OUR
+> evidence, not the authorization.
+
 ---
 
 ## Design
