@@ -723,3 +723,210 @@ mod tests {
         assert!(s.lock_held(), "lock state is independent of session state");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Heartbeat watchdog
+// ---------------------------------------------------------------------------
+
+/// Documented heartbeat cadence (v2.6 p.11, verbatim: "every 5-6 seconds
+/// interval"). We pin the SLOWER end so the watchdog never fires on the
+/// vendor's own documented jitter.
+pub const TD_HEARTBEAT_INTERVAL_SECS: u64 = 6;
+
+/// Missed heartbeats before the link is called LATE (degraded, logged).
+pub const TD_HEARTBEAT_LATE_MISSES: u64 = 3;
+/// Missed heartbeats before the link is called STALLED (reconnect).
+pub const TD_HEARTBEAT_STALL_MISSES: u64 = 6;
+
+/// Silence, in seconds, at which the link is LATE.
+pub const TD_HEARTBEAT_LATE_SECS: u64 = TD_HEARTBEAT_INTERVAL_SECS * TD_HEARTBEAT_LATE_MISSES;
+/// Silence, in seconds, at which the link is STALLED.
+pub const TD_HEARTBEAT_STALL_SECS: u64 = TD_HEARTBEAT_INTERVAL_SECS * TD_HEARTBEAT_STALL_MISSES;
+
+const _: () = assert!(TD_HEARTBEAT_LATE_SECS < TD_HEARTBEAT_STALL_SECS);
+
+/// Health of the link as judged by heartbeat silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkHealth {
+    /// A heartbeat arrived within the expected window.
+    Healthy,
+    /// Heartbeats are late but not yet conclusive — log, do not reconnect.
+    Late {
+        /// Seconds since the last heartbeat.
+        silent_secs: u64,
+    },
+    /// Heartbeats have stopped: the link is dead even if the socket has
+    /// not reported an error. Reconnect.
+    Stalled {
+        /// Seconds since the last heartbeat.
+        silent_secs: u64,
+    },
+}
+
+impl LinkHealth {
+    /// `true` only when a reconnect is warranted.
+    #[must_use]
+    pub const fn should_reconnect(self) -> bool {
+        matches!(self, Self::Stalled { .. })
+    }
+}
+
+/// Detects a dead link from heartbeat silence.
+///
+/// This is the feed-death signal that a socket error does NOT give you: a
+/// TCP connection can stay open while the vendor has stopped sending, and
+/// without this the lane would sit "connected" and silent all session.
+///
+/// Heartbeats are the right signal rather than ticks because v2.6 p.11
+/// states they begin "as soon as the client is connected" and continue
+/// independently of trading activity — so silence is unambiguous, whereas
+/// tick silence is legitimate outside market hours.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TruedataHeartbeatWatchdog {
+    silent_secs: u64,
+}
+
+impl TruedataHeartbeatWatchdog {
+    /// A fresh watchdog with no silence recorded.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { silent_secs: 0 }
+    }
+
+    /// Records a heartbeat, clearing the silence counter.
+    pub const fn on_heartbeat(&mut self) {
+        self.silent_secs = 0;
+    }
+
+    /// Advances the silence clock.
+    pub const fn tick(&mut self, secs: u64) {
+        self.silent_secs = self.silent_secs.saturating_add(secs);
+    }
+
+    /// Seconds since the last heartbeat.
+    #[must_use]
+    pub const fn silent_secs(&self) -> u64 {
+        self.silent_secs
+    }
+
+    /// Current verdict.
+    #[must_use]
+    pub const fn health(&self) -> LinkHealth {
+        if self.silent_secs >= TD_HEARTBEAT_STALL_SECS {
+            LinkHealth::Stalled {
+                silent_secs: self.silent_secs,
+            }
+        } else if self.silent_secs >= TD_HEARTBEAT_LATE_SECS {
+            LinkHealth::Late {
+                silent_secs: self.silent_secs,
+            }
+        } else {
+            LinkHealth::Healthy
+        }
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn test_truedata_heartbeat_watchdog_new_starts_healthy() {
+        let w = TruedataHeartbeatWatchdog::new();
+        assert_eq!(w.health(), LinkHealth::Healthy);
+        assert_eq!(w.silent_secs(), 0);
+        assert!(!w.health().should_reconnect());
+    }
+
+    #[test]
+    fn test_on_heartbeat_clears_accumulated_silence() {
+        let mut w = TruedataHeartbeatWatchdog::new();
+        w.tick(20);
+        assert_ne!(w.health(), LinkHealth::Healthy);
+        w.on_heartbeat();
+        assert_eq!(w.health(), LinkHealth::Healthy);
+        assert_eq!(w.silent_secs(), 0);
+    }
+
+    #[test]
+    fn test_health_stays_healthy_across_the_documented_cadence() {
+        // v2.6 p.11 says every 5-6 seconds; a normal beat at 6s must NOT
+        // register as late, or the watchdog would cry wolf every cycle.
+        let mut w = TruedataHeartbeatWatchdog::new();
+        for _ in 0..10 {
+            w.tick(TD_HEARTBEAT_INTERVAL_SECS);
+            assert_eq!(
+                w.health(),
+                LinkHealth::Healthy,
+                "a beat arriving at the documented interval is healthy"
+            );
+            w.on_heartbeat();
+        }
+    }
+
+    #[test]
+    fn test_health_reports_late_before_stalled() {
+        let mut w = TruedataHeartbeatWatchdog::new();
+        w.tick(TD_HEARTBEAT_LATE_SECS);
+        match w.health() {
+            LinkHealth::Late { silent_secs } => assert_eq!(silent_secs, TD_HEARTBEAT_LATE_SECS),
+            other => panic!("expected Late, got {other:?}"),
+        }
+        assert!(!w.health().should_reconnect(), "Late must NOT reconnect");
+    }
+
+    #[test]
+    fn test_health_reports_stalled_and_requests_reconnect() {
+        let mut w = TruedataHeartbeatWatchdog::new();
+        w.tick(TD_HEARTBEAT_STALL_SECS);
+        match w.health() {
+            LinkHealth::Stalled { silent_secs } => {
+                assert_eq!(silent_secs, TD_HEARTBEAT_STALL_SECS);
+            }
+            other => panic!("expected Stalled, got {other:?}"),
+        }
+        assert!(w.health().should_reconnect());
+    }
+
+    #[test]
+    fn test_health_boundary_is_exact_at_each_threshold() {
+        let mut w = TruedataHeartbeatWatchdog::new();
+        w.tick(TD_HEARTBEAT_LATE_SECS.saturating_sub(1));
+        assert_eq!(w.health(), LinkHealth::Healthy, "one second before Late");
+        w.tick(1);
+        assert!(matches!(w.health(), LinkHealth::Late { .. }));
+
+        let mut w2 = TruedataHeartbeatWatchdog::new();
+        w2.tick(TD_HEARTBEAT_STALL_SECS.saturating_sub(1));
+        assert!(
+            matches!(w2.health(), LinkHealth::Late { .. }),
+            "one second before Stalled is still only Late"
+        );
+        w2.tick(1);
+        assert!(matches!(w2.health(), LinkHealth::Stalled { .. }));
+    }
+
+    #[test]
+    fn test_tick_saturates_without_overflow() {
+        let mut w = TruedataHeartbeatWatchdog::new();
+        w.tick(u64::MAX);
+        w.tick(u64::MAX);
+        assert!(w.health().should_reconnect());
+        assert_eq!(w.silent_secs(), u64::MAX, "saturating, never wrapping");
+    }
+
+    #[test]
+    fn test_heartbeat_thresholds_are_ordered_and_documented() {
+        assert_eq!(TD_HEARTBEAT_INTERVAL_SECS, 6, "v2.6 p.11 slow end of 5-6s");
+        assert_eq!(TD_HEARTBEAT_LATE_SECS, 18);
+        assert_eq!(TD_HEARTBEAT_STALL_SECS, 36);
+        assert!(TD_HEARTBEAT_LATE_SECS < TD_HEARTBEAT_STALL_SECS);
+    }
+
+    #[test]
+    fn test_link_health_should_reconnect_only_for_stalled() {
+        assert!(!LinkHealth::Healthy.should_reconnect());
+        assert!(!LinkHealth::Late { silent_secs: 20 }.should_reconnect());
+        assert!(LinkHealth::Stalled { silent_secs: 40 }.should_reconnect());
+    }
+}
