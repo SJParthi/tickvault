@@ -1008,6 +1008,52 @@ mod tests {
     // --- cross-cutting ---
 
     #[test]
+    fn test_record_count_trusts_the_body_not_the_declared_header_count() {
+        // The header's count field is the SERVER's claim; the body is the
+        // fact. If they disagree we must iterate what actually arrived —
+        // trusting the claim would read past the body or skip records.
+        let mut f = build_add_symbol_frame(TD_MSG_CODE_SYMBOLS_ADDED, &[("A", 1), ("B", 2)]);
+        put_i32(&mut f, OFF_RL_COUNT, 99); // server claims 99, body has 2
+        let list = decode_record_list(&f).expect("must decode");
+        assert_eq!(list.changed_count, 99, "the claim is reported verbatim");
+        assert_eq!(list.record_count(), 2, "the body is what is counted");
+        assert_eq!(list.add_symbol_records().count(), 2);
+    }
+
+    #[test]
+    fn test_add_symbol_records_yields_exactly_record_count_items() {
+        for n in [0_usize, 1, 2, 5] {
+            let names: Vec<(String, i32)> = (0..n)
+                .map(|i| (format!("SYM{i}"), i32::try_from(i).unwrap_or(0)))
+                .collect();
+            let refs: Vec<(&str, i32)> = names.iter().map(|(s, i)| (s.as_str(), *i)).collect();
+            let f = build_add_symbol_frame(TD_MSG_CODE_SYMBOLS_ADDED, &refs);
+            let list = decode_record_list(&f).expect("must decode");
+            assert_eq!(list.record_count(), n);
+            assert_eq!(list.add_symbol_records().count(), n, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn test_remove_symbol_records_yields_exactly_record_count_items() {
+        for n in [0_usize, 1, 3] {
+            let mut f = vec![0_u8; TD_RECORD_LIST_HEADER_LEN + n * TD_REMOVE_SYMBOL_RECORD_LEN];
+            f[0] = TD_MSG_CODE_SYMBOLS_REMOVED;
+            for i in 0..n {
+                let base = TD_RECORD_LIST_HEADER_LEN + i * TD_REMOVE_SYMBOL_RECORD_LEN;
+                put_i32(
+                    &mut f,
+                    base + OFF_RS_SYMBOL_ID,
+                    i32::try_from(i).unwrap_or(0),
+                );
+            }
+            let list = decode_record_list(&f).expect("must decode");
+            assert_eq!(list.record_count(), n);
+            assert_eq!(list.remove_symbol_records().count(), n, "n = {n}");
+        }
+    }
+
+    #[test]
     fn test_record_len_matches_the_frame_kind() {
         assert_eq!(
             TruedataRecordListKind::SymbolsAdded.record_len(),
