@@ -158,14 +158,21 @@ fn chaos_mixed_type_burst_preserves_every_frame_across_types() {
     // Per-type counts must each be exactly N/2 (here 20000 / 2 = 10000).
     let mut live = 0usize;
     let mut ord = 0usize;
+    let mut truedata = 0usize;
     for rec in &recovered {
         match rec.ws_type {
             WsType::LiveFeed => live += 1,
             WsType::OrderUpdate => ord += 1,
+            WsType::TruedataFeed => truedata += 1,
         }
     }
     assert_eq!(live, 10_000, "LiveFeed count");
     assert_eq!(ord, 10_000, "OrderUpdate count");
+    assert_eq!(
+        truedata, 0,
+        "this fixture appends no TrueData frames — a non-zero count means \
+         replay mis-routed a transport tag"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
