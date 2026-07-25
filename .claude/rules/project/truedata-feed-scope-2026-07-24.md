@@ -87,7 +87,7 @@ Market-data feeds remain **pluggable**. A FOURTH feed provider is authorized:
 **TrueData** (TrueData Markets / NSE-authorized realtime vendor), **feed
 `'truedata'`, default OFF** (`feeds.truedata_enabled = false`,
 `#[serde(default)]`). TrueData is implemented **natively in tickvault Rust** —
-NOTHING is vendored from the TrueData Python/Node/.Net SDKs; they are protocol
+NOTHING is vendored from the TrueData reference clients (any language); they are protocol
 REFERENCE ONLY (the Groww §32/§35 + GDF precedent). Transport is a
 **`wss://push.truedata.in:<port>` WebSocket** carrying the TrueData realtime
 protocol (JSON auth/subscribe control frames + binary tick frames; the
@@ -187,7 +187,7 @@ legal; TrueData OFF ⇒ byte-identical behavior to today.
   quote.
 - Creates any `truedata_*` parallel DATA table, writes a shared-table row
   without `feed='truedata'`, or omits `feed` from a DEDUP key.
-- Vendors/imports ANY TrueData SDK code (Python/Node/.Net) or adds a sidecar for
+- Vendors/imports ANY TrueData reference-client code (any language) or adds a sidecar for
   TrueData (native Rust only).
 - Subscribes the TrueData 1min/5min BAR streams instead of deriving timeframes
   from ticks (Quote 2), or persists a bar the aggregator did not derive.
@@ -609,7 +609,7 @@ identity design (canonical keys, band `[2^59, 2^60)`, RANGE disjointness).
 
 ---
 
-## §11. SDK GROUND TRUTH — 2026-07-25 (official Python SDK read end to end)
+## §11. SDK GROUND TRUTH — 2026-07-25 (vendor reference client read end to end)
 
 > **AUTHORITY: this section SUPERSEDES §9 and §10 wherever they conflict.** The
 > operator directed reading the vendor's own client rather than waiting on a
@@ -630,7 +630,7 @@ identity design (canonical keys, band `[2^59, 2^60)`, RANGE disjointness).
 | Aspect | Settled value | Evidence |
 |---|---|---|
 | **Binary vs JSON is a CLIENT-SIDE CHOICE** | `TD_live(..., compression=False)` — the SDK's own default is **JSON**. `compression=True` selects the binary path. Nothing is negotiated with the server at connect. This closes §10.6 #1, which assumed the server decided. | `TD_live.py:15,23`; `TD_ws.py:327` |
-| **The binary path is LZ4-BLOCK COMPRESSED on the wire** | `decompress_data()` calls `lz4.block.decompress(data, uncomp_length)` and only THEN reads the msg code from `decompressed[:1]`. **Raw LZ4 block, no size prefix** (python-lz4 treats a supplied `uncompressed_size` as "source carries no header"); the SDK tries 1024 bytes, then `len(data)*5` on `LZ4BlockError`. | `utils.py:427-437` |
+| **The binary path is LZ4-BLOCK COMPRESSED on the wire** | `decompress_data()` calls `lz4.block.decompress(data, uncomp_length)` and only THEN reads the msg code from `decompressed[:1]`. **Raw LZ4 block, no size prefix** (that binding treats a supplied `uncompressed_size` as "source carries no header"); the client tries 1024 bytes, then `len(data)*5` on `LZ4BlockError`. | `utils.py:427-437` |
 | **Endianness: LITTLE-ENDIAN, CONFIRMED** | Every unpack is `'<'`: `<?` bool, `<i` int, `<Q` long, `<f` float, `<d` double. §10.6 #2 — the single highest-risk unknown, a wrong guess silently garbling every price — is **CLOSED**. | `utils.py:393-405` |
 | **`long_var` is UNSIGNED (`<Q`)** | `tot_volume`, `oi`, `prev_oi` are u64 on the wire, not i64. See §11.4 for why our decoder deliberately reads them as `i64` anyway. | `utils.py:399` |
 | **`epoch_var` is dual-width** | 4-byte fields are `<i` epoch **seconds**; 8-byte fields are `<Q` epoch **milliseconds**, which the SDK converts by string-truncating the last 3 digits. Matches our trade-seconds / heartbeat-milliseconds split. | `utils.py:405` |
