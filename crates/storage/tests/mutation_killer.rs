@@ -56,13 +56,29 @@ fn mutation_ws_type_from_u8_four_returns_order_update_not_live_feed() {
 
 #[test]
 fn mutation_ws_type_from_u8_unknown_values_return_none() {
-    // PR #4: codes 2 + 3 (former Depth20/Depth200 tags) are now unknown,
-    // along with the original out-of-range 0 / 5 / 255 inputs.
+    // PR #4: codes 2 + 3 (former Depth20/Depth200 tags) are now unknown.
+    //
+    // 2026-07-25: tag 5 is NO LONGER unknown — it is `TruedataFeed`. It was
+    // the next free byte after 1 (LiveFeed), 2 and 3 (retired depth tags,
+    // deliberately never reused so an old WAL segment can never be
+    // mis-decoded), and 4 (OrderUpdate). Tag 6 takes over as the
+    // next-unknown probe.
     assert_eq!(WsType::from_u8(0), None);
-    assert_eq!(WsType::from_u8(2), None);
-    assert_eq!(WsType::from_u8(3), None);
-    assert_eq!(WsType::from_u8(5), None);
+    assert_eq!(
+        WsType::from_u8(2),
+        None,
+        "retired Depth20 tag stays unknown"
+    );
+    assert_eq!(
+        WsType::from_u8(3),
+        None,
+        "retired Depth200 tag stays unknown"
+    );
+    assert_eq!(WsType::from_u8(6), None);
     assert_eq!(WsType::from_u8(255), None);
+    // The claimed tag must decode — a regression here means TrueData frames
+    // replay as an unknown transport and are dropped on boot.
+    assert_eq!(WsType::from_u8(5), Some(WsType::TruedataFeed));
 }
 
 #[test]
