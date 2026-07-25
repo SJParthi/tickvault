@@ -606,3 +606,164 @@ capture-at-receipt WAL→ring→spill→DLQ; shared tables + `feed='truedata'` +
 feed-in-key DEDUP; ticks-only timeframe derivation; RAM-first absolute; the
 instance/reversibility contract (§3); every §5 REJECT row; and the §9.5
 identity design (canonical keys, band `[2^59, 2^60)`, RANGE disjointness).
+
+---
+
+## §11. SDK GROUND TRUTH — 2026-07-25 (official Python SDK read end to end)
+
+> **AUTHORITY: this section SUPERSEDES §9 and §10 wherever they conflict.** The
+> operator directed reading the vendor's own client rather than waiting on a
+> support reply ("why can't you check that binary vs json from their python sdk
+> code ddue?"). The source read is `truedata` **7.0.1** —
+> `truedata/websocket/{compression_map.py, utils.py, TD_ws.py, TD_live.py}` —
+> the decoder TrueData themselves ship. Its `A`/`T`/`H`/`M` offset entries match
+> the v2.6 PDF **byte for byte**, which is what makes it authoritative for
+> everything the PDF omits.
+>
+> Both §9 and §10 were honest against the evidence each had. §9 read only the
+> in-repo web pack and over-retracted the binary spec; §10 read the PDFs and
+> over-corrected by dismissing LZ4. **The SDK shows both were partly right**,
+> and the resulting wire model is different from either. That model is below.
+
+### §11.1 The wire, settled
+
+| Aspect | Settled value | Evidence |
+|---|---|---|
+| **Binary vs JSON is a CLIENT-SIDE CHOICE** | `TD_live(..., compression=False)` — the SDK's own default is **JSON**. `compression=True` selects the binary path. Nothing is negotiated with the server at connect. This closes §10.6 #1, which assumed the server decided. | `TD_live.py:15,23`; `TD_ws.py:327` |
+| **The binary path is LZ4-BLOCK COMPRESSED on the wire** | `decompress_data()` calls `lz4.block.decompress(data, uncomp_length)` and only THEN reads the msg code from `decompressed[:1]`. **Raw LZ4 block, no size prefix** (python-lz4 treats a supplied `uncompressed_size` as "source carries no header"); the SDK tries 1024 bytes, then `len(data)*5` on `LZ4BlockError`. | `utils.py:427-437` |
+| **Endianness: LITTLE-ENDIAN, CONFIRMED** | Every unpack is `'<'`: `<?` bool, `<i` int, `<Q` long, `<f` float, `<d` double. §10.6 #2 — the single highest-risk unknown, a wrong guess silently garbling every price — is **CLOSED**. | `utils.py:393-405` |
+| **`long_var` is UNSIGNED (`<Q`)** | `tot_volume`, `oi`, `prev_oi` are u64 on the wire, not i64. See §11.4 for why our decoder deliberately reads them as `i64` anyway. | `utils.py:399` |
+| **`epoch_var` is dual-width** | 4-byte fields are `<i` epoch **seconds**; 8-byte fields are `<Q` epoch **milliseconds**, which the SDK converts by string-truncating the last 3 digits. Matches our trade-seconds / heartbeat-milliseconds split. | `utils.py:405` |
+| **The SDK rounds floats to 2 dp** | `round(struct.unpack('<f',…)[0], 2)`. This is an SDK **display** choice, not a wire property — we keep full `f32` precision and widen via `f32_to_f64_clean` (STORAGE-GAP-02). | `utils.py:401` |
+| **Heartbeat timestamp format differs by mode** | binary/compressed: `%Y-%m-%dT%H:%M:%S` (whole seconds); JSON: `%Y-%m-%dT%H:%M:%S.%f` (sub-second). A parser written for one mode fails on the other. | `TD_ws.py:113-116` |
+| **Thirteen message codes exist, not four** | `A T W B D G O F S L R H M`. The PDF tabulates four. | `compression_map.py` |
+
+### §11.2 The `W` discovery — the bug this reading prevented
+
+`msg_map` keys the trade layout by CODE, not by length:
+
+- `"T"` — 20 fields, ends at `ask_qty`@86 → **90 bytes, WITH bid/ask**
+- `"W"` — 16 fields, ends at `seq_no`@70 → **74 bytes, WITHOUT bid/ask**, every
+  shared offset byte-identical to `T`
+
+A bid/ask-disabled account therefore receives `W`, **not a truncated `T`**. Our
+decoder had inferred the 74-byte case as a short `T` (the only reading the PDF
+alone supports), so `classify_frame` would have returned
+`UnknownMsgCode(b'W')` and **every tick on such an account would have been
+silently dropped** — the exact "not even miss even a single tick" failure the
+§0 Quote 1 mandate forbids, and one no test against our own assumptions could
+have caught. Fixed 2026-07-25: `decode_trade_binary` derives `has_bid_ask`
+from the CODE and validates the length against what that code must carry, so a
+74-byte `T` or a 90-byte `W` is rejected as malformed rather than silently
+reinterpreted. This also **retires the §10.1 row 6 length-dispatch design** —
+dispatch is by code; length is only a validity check.
+
+### §11.3 O(1) — the honest per-frame complexity, corrected again
+
+§10.4 restored the "O(1) binary parse" claim. With LZ4 on the wire that claim
+is **true of field extraction only**. The corrected, binding statement:
+
+| Stage | Complexity | Note |
+|---|---|---|
+| LZ4 block decompress (binary mode only) | **O(frame bytes)** | into a PRE-ALLOCATED per-connection scratch buffer — zero heap per frame, but NOT O(1) |
+| JSON positional scan (JSON mode only) | **O(frame bytes)** | zero-alloc hand-rolled scanner; never `serde_json::Value` |
+| Msg-code dispatch | **O(1)** | one byte |
+| Field extraction, binary | **O(1)** | ~20 fixed-offset `from_le_bytes`, no loop, no heap |
+| SymbolID → stable `security_id` | **O(1)** avg | `papaya` lock-free map |
+| Seq-gap check | **O(1)** | per-symbol last-seq compare |
+| Persisted dedup / uniqueness | **O(1)** | QuestDB DEDUP UPSERT KEYS incl. `feed` |
+| RAM decision read | **O(log ring)** | `RwLock` + binary search (`spot_bar_store.rs`) — unchanged, still flagged |
+
+**Binding wording rule (supersedes §9.3 and §10.4):** the sanctioned phrase for
+either transport mode is **"zero-allocation, amortized-constant per tick
+(O(frame bytes) decode, fixed bound)"**. The **field extraction** step may be
+called O(1); the **frame** may not, in either mode. Claiming end-to-end O(1)
+per frame is a §5 REJECT. The frame size is bounded by the fixed 90-byte
+shape, so per-tick cost remains amortized constant — the guarantee the
+mandate actually needs.
+
+### §11.4 Signedness — a deliberate, documented deviation
+
+The SDK reads `long_var` as `<Q` (u64); our decoder reads `i64`. This is
+intentional and strictly safer, not an oversight: any real volume/OI/turnover
+value is far below 2^63, so the two decodings are **bit-identical in every
+reachable case**. They differ only when the top bit is set — which for a
+traded quantity is impossible and therefore evidence of a corrupt or
+mis-framed read. `u64` would silently accept such a value as a legitimate
+9-quintillion volume; `i64` surfaces it as negative, where
+`saturate_tot_volume` and the `TradeSanity` tripwire catch it. We keep `i64`
+and treat negative as corrupt.
+
+### §11.5 The two OPERATOR DECISIONS this opens
+
+Both are recorded, neither is taken unilaterally.
+
+**Decision 1 — transport mode.** `compression` is ours to choose:
+
+| | JSON mode | Binary mode |
+|---|---|---|
+| New dependency | **none** — the zero-alloc scanner in `truedata_json.rs` is already written and tested | **`lz4_flex` (or equivalent) — a genuinely new supply-chain root**, which CLAUDE.md requires Parthiban to approve |
+| Per-frame decode | O(frame bytes) scan, zero-alloc | O(frame bytes) decompress + O(1) extraction, zero-alloc |
+| Bandwidth | larger frames | smaller frames (that is what the compression buys) |
+| Readiness today | **ready now** | blocked on the dep approval |
+
+Recommendation: **start the trial in JSON mode** (zero new dependencies, ships
+today, protocol fully covered) and treat binary+LZ4 as a measured bandwidth
+optimisation once day-0 numbers exist. Both decoders are being built either
+way, so the switch is a config flip, not a rebuild.
+
+**Decision 2 — `lz4_flex` as a workspace dependency**, required only if
+Decision 1 picks binary mode. Exact-pinned per the CARGO rules; needs the
+operator's explicit approval before it is added.
+
+### §11.6 What the SDK did NOT settle (still day-0 probe items)
+
+- **Granularity** (§9.4 stands unchanged): the vendor PDF asserts tick-by-tick;
+  NSE states TBT is not redistributed to any vendor. Neither the SDK nor the
+  PDF measures the real cadence. The day-0 msgs/sec/symbol count is still the
+  only honest answer, and "never miss a tick" still means "never lose a
+  RECEIVED message", never "observe every exchange trade".
+- **Seq-No scope, reset and wrap** (§10.6 #3) — the SDK reads the field and
+  does nothing with it.
+- **SymbolID stability across sessions/days** (§10.6 #5) — the SDK re-learns
+  it from every `addsymbol` reply, which is consistent with our design but
+  proves nothing about stability.
+- **Bar timestamp: open-stamped or close-stamped** (§9.8 #2) — not derivable.
+- **`D` (bidaskL2) layout — UNRESOLVABLE from either source.** The SDK orders
+  each depth level `price, qty, count`; the PDF prose (p.17 iii) orders it
+  `count, price, qty`. Worse, the SDK's own level-2 block is self-inconsistent:
+  `bid_qty_2`@45 collides with `ask_2`@45, `no_bid_2`@41 sits out of list
+  order, and level 2 spans 20 bytes where levels 1/3/4/5 each span 24 — making
+  the frame either 137 bytes (SDK literal) or 141 (uniform). Either reading has
+  a coin-flip chance of reporting wrong depth from level 2 onward, and
+  silently-wrong depth is strictly worse than absent depth. `D` is therefore
+  **classified, counted and REFUSED** (`decode_bidask_l2_binary` returns
+  `UnresolvedLayout`), never guessed. BSE 5-level depth is outside the
+  subscription scope, so nothing is lost; resolving it is a day-0 probe item
+  and a support question.
+- **Assigned production port** (8082 vs 8084) and the account's entitlements
+  (§9.9) — account-specific, operator to confirm in writing.
+
+### §11.7 Ratchet reconciliation (supersedes the §10.7 table)
+
+| # | Ratchet | Change |
+|---|---|---|
+| 1 | `truedata_wire_format_guard` | REQUIRES the 90-byte const offset table + code-keyed dispatch; must additionally pin that `W` is decoded and that dispatch is by CODE, never by length |
+| 2 | `truedata_no_o1_parse_claim_guard` | RE-SCOPED per §11.3: no source or doc may call the per-FRAME decode O(1) in **either** mode; the field-extraction O(1) claim stays legal |
+| 3–4 | namespace bands / id golden vectors | UNCHANGED (§9.5 identity design stands) |
+| 5 | `truedata_cooldown_is_one_minute` | UNCHANGED (v2.6 p.19) |
+| 6 | `truedata_tolerates_all_message_types` | WIDENED to all thirteen codes `A T W B D G O F S L R H M` |
+| 7 | `truedata_symbol_master_fetch_is_ungranted` | UNCHANGED |
+| 8 | `dhat_truedata_decode_zero_alloc` | UNCHANGED, and now covers the LZ4 scratch buffer if binary mode is chosen |
+| 9–11 | same-second survival / endianness gate / TCP-7070-unused | #10 `truedata_endianness_probe_gate` is **SATISFIED** by §11.1 (LE confirmed from the vendor's own unpack format strings); it stays as a regression pin rather than a blocking gate |
+| 12 | **NEW** `truedata_bidask_l2_is_refused_not_guessed` | `D` must return `UnresolvedLayout`; a field-level `D` decoder may not exist without a fresh dated quote resolving the layout |
+
+### §11.8 What did NOT change
+
+The §0 operator quotes; default-OFF; native-Rust-only (the SDK is READ as
+reference, nothing vendored); the SSM 1-session lock; capture-at-receipt
+WAL→ring→spill→DLQ with the RAW frame WAL'd **before** any decompress or parse;
+shared tables + `feed='truedata'` + feed-in-key DEDUP incl. `capture_seq` for
+same-second survival; ticks-only timeframe derivation; RAM-first absolute; the
+instance/reversibility contract (§3); every §5 REJECT row; and the §9.5
+identity design.
