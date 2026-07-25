@@ -1,43 +1,66 @@
 //! TrueData (feed #4) wire decoder — binary-first, JSON-fallback.
 //!
 //! **Ground truth:** `TrueData Market Data API Documentation v 2.6`
-//! (20 Feb 2025), pages 10–18, as reconciled in
-//! `.claude/rules/project/truedata-feed-scope-2026-07-24.md` §10.
+//! (20 Feb 2025) pages 10–18, plus the OFFICIAL Python SDK (`truedata`
+//! 7.0.1, `truedata/websocket/`), as reconciled in
+//! `.claude/rules/project/truedata-feed-scope-2026-07-24.md` §11.
 //!
 //! # Why two paths
 //!
 //! v2.6 documents EVERY message type in BOTH a JSON and a binary form
-//! (p.10 auth, p.11 heartbeat/marketstatus, p.16 trade), and p.6 advertises
-//! "Flexible data formats (JSON, CSV, Binary)" — but **no page documents how
-//! a client REQUESTS binary** (format selection is documented for the REST
-//! API only, p.19), and **the word "endian" appears nowhere in all 27
-//! pages**. Both are outbound questions to TrueData support (§10.6 #1/#2).
+//! (p.10 auth, p.11 heartbeat/marketstatus, p.16 trade) but never says how a
+//! client picks. **The SDK settles it: the choice is CLIENT-SIDE, not
+//! negotiated** — `TD_live(..., compression=False)`, and the vendor's own
+//! default is JSON (`TD_live.py:15`; `TD_ws.py:327`). So we support both and
+//! dispatch on the first byte:
 //!
-//! So this decoder dispatches on the FIRST BYTE and handles whichever wire
-//! the vendor actually gives us:
+//! - `b'{'` → JSON frame (zero-alloc positional scan in
+//!   [`super::truedata_json`]).
+//! - anything else → binary frame, dispatched on the msg-code byte @0 and
+//!   validated by length. Fixed-offset `from_le_bytes`, zero-allocation.
 //!
-//! - `b'{'` → JSON frame (zero-alloc positional scan; **NOT O(1)** — see the
-//!   complexity note below).
-//! - anything else → binary frame, dispatched on the msg-code byte @0
-//!   (`A` auth / `T` trade / `H` heartbeat / `M` marketstatus) and validated
-//!   by length. Fixed-offset `from_le_bytes` — genuinely **O(1)**,
-//!   zero-allocation.
+//! # ⚠ The binary wire is LZ4-COMPRESSED — decompress BEFORE calling this
 //!
-//! # Complexity (honest labels — §10.4)
+//! [`classify_frame`] and every `decode_*_binary` below expect the
+//! **DECOMPRESSED** buffer. The SDK's `decompress_data` runs
+//! `lz4.block.decompress(data, uncomp_length)` and only THEN reads the msg
+//! code from `decompressed[:1]` (`utils.py:427-437`) — raw LZ4 block, no
+//! size prefix. Handing raw socket bytes to `classify_frame` in binary mode
+//! dispatches on an LZ4 header byte, not a message code.
+//!
+//! The capture chain is unaffected and deliberately ordered: the **RAW**
+//! (still-compressed) frame is WAL'd at receipt, before any decompress or
+//! parse, so a decoder bug can never cost us the bytes.
+//!
+//! # Complexity (honest labels — §11.3)
 //!
 //! | Operation | Complexity |
 //! |---|---|
-//! | binary trade decode | **O(1)**, zero-alloc (20 fixed offsets, no loop) |
+//! | LZ4 block decompress (binary mode) | **O(frame bytes)**, into a reusable scratch buffer |
+//! | JSON positional scan (JSON mode) | **O(frame bytes)**, zero-alloc |
 //! | frame-type + length dispatch | **O(1)** |
-//! | JSON fallback scan | **O(frame bytes)**, zero-alloc — NEVER call it O(1) |
+//! | binary trade FIELD EXTRACTION | **O(1)**, zero-alloc (20 fixed offsets, no loop) |
 //!
-//! # Endianness (fail-closed)
+//! The **field extraction** is O(1); the **frame** is not, in either mode.
+//! The sanctioned phrase is "zero-allocation, amortized-constant per tick
+//! (O(frame bytes) decode, fixed bound)" — frame size is bounded by the
+//! fixed 90-byte shape. Calling the per-frame decode O(1) is a §5 REJECT.
 //!
-//! Little-endian is ASSUMED and **not yet confirmed by the vendor**. A
-//! big-endian wire would silently produce plausible-but-wrong prices rather
-//! than failing loudly (the worst failure class), so `decode_trade_binary`
-//! is paired with [`TradeSanity::check`] — the caller MUST run the day-0
-//! probe and pin a verdict before trusting decoded prices in prod.
+//! # Endianness — LITTLE, CONFIRMED
+//!
+//! Every `struct.unpack` in the vendor's own decoder uses the `'<'` prefix:
+//! `<?` bool, `<i` int, `<Q` long, `<f` float, `<d` double
+//! (`utils.py:393-405`). This was the highest-risk unknown in the whole
+//! integration — a big-endian wire would have produced plausible-but-wrong
+//! prices rather than failing loudly — and it is now closed from the
+//! vendor's own format strings. [`TradeSanity::check`] is retained as a
+//! runtime regression tripwire, no longer as a blocking probe gate.
+//!
+//! Note the SDK reads `long_var` as `<Q` (unsigned) where we read `i64`.
+//! That is a deliberate, documented deviation (§11.4): the two decodings are
+//! bit-identical for every reachable value and differ only when the top bit
+//! is set, which for a traded quantity is impossible and therefore evidence
+//! of corruption — `u64` would accept it silently, `i64` surfaces it.
 //!
 //! # No-panic contract
 //!
@@ -399,14 +422,21 @@ pub fn decode_trade_binary(raw: &[u8]) -> Result<TruedataTrade, TruedataDecodeEr
 }
 
 // ---------------------------------------------------------------------------
-// Endianness / sanity tripwire (day-0 probe gate)
+// Structural sanity tripwire (byte-order / framing regression guard)
 // ---------------------------------------------------------------------------
 
 /// Verdict of the cheap structural sanity check on a decoded trade.
 ///
-/// A big-endian wire read as little-endian produces values that are wildly
-/// out of range (or NaN), rather than failing loudly — this is the tripwire
-/// that turns that silent corruption into a detectable, coded refusal.
+/// A byte-order or framing mistake produces values that are wildly out of
+/// range (or NaN) rather than failing loudly — the worst failure class,
+/// because it looks like data. This is the tripwire that turns that silent
+/// corruption into a detectable, coded refusal.
+///
+/// Endianness itself is no longer in question — the vendor's own decoder
+/// unpacks every field little-endian (§11.1). This check therefore runs as
+/// a permanent REGRESSION guard (a mis-set offset, a truncated frame, a
+/// future wire change) rather than as the day-0 byte-order probe gate it
+/// was originally written to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradeSanity {
     /// Every structural invariant held.
