@@ -767,3 +767,24 @@ shared tables + `feed='truedata'` + feed-in-key DEDUP incl. `capture_seq` for
 same-second survival; ticks-only timeframe derivation; RAM-first absolute; the
 instance/reversibility contract (§3); every §5 REJECT row; and the §9.5
 identity design.
+
+### §11.9 The same-second DEDUP requirement is ALREADY SATISFIED (verified 2026-07-25)
+
+§10.5 states that because TrueData trade timestamps are whole seconds, the
+`ticks` DEDUP key **must** carry a per-tick disambiguator or every tick but the
+last in each second is silently upserted away. That was written as a
+requirement to implement. It is in fact **already in place** and has been:
+
+- Live key: `ALTER TABLE ticks DEDUP ENABLE UPSERT KEYS(ts, security_id,
+  segment, capture_seq, feed)` — five keys, including both `capture_seq` (the
+  intra-second disambiguator) and `feed` (the I-P1-11 feed-in-key extension).
+- Ratcheted by `crates/storage/tests/questdb_init_script_guard.rs::
+  test_init_script_ticks_ddl_is_final_schema_with_5_key_dedup`, which fails the
+  build if the key is weakened. Verified green 2026-07-25.
+
+So no schema change is needed for TrueData on this point, and the PR-E
+persistence work does **not** carry a DEDUP migration. What remains genuinely
+open is that `capture_seq` must be populated per RECEIVED frame by the
+TrueData ingest path (as it is for the existing feeds) — a wiring obligation,
+not a schema one. Recorded here so a future session does not re-plan a
+migration that already shipped.
