@@ -63,6 +63,10 @@ pub enum TruedataJsonType {
     Greeks,
     /// `{"bar1min":[...]}` — 1-minute bar (backend-enabled, GZIP).
     Bar1Min,
+    /// `{"bar5min":[...]}` — 5-minute bar (backend-enabled). The binary
+    /// twin is code `F`; both are decoded but never subscribed, since we
+    /// derive every timeframe from ticks (scope-lock §0 Quote 2).
+    Bar5Min,
     /// A heartbeat frame (`"message":"HeartBeat"`).
     Heartbeat,
     /// A market-status frame (`"message":"marketstatus"`).
@@ -73,35 +77,105 @@ pub enum TruedataJsonType {
     Auth,
     /// A reply to `addsymbol` (`"message":"symbols added"`).
     SymbolsAdded,
+    /// A reply to `removesymbol` (`"message":"symbols removed"`).
+    SymbolsRemoved,
 }
 
-/// Finds the first `"key":` token and maps it to a message type.
+impl TruedataJsonType {
+    /// `true` for the per-tick data frames that arrive continuously.
+    ///
+    /// These always lead with their type key in the documented samples, so
+    /// they are found inside the narrow first-pass window. Control frames
+    /// (auth, acks, touchline, market status) can carry a long payload
+    /// BEFORE their `"message"` key, which is why they get a second,
+    /// wider pass — see [`json_msg_type`].
+    #[inline]
+    #[must_use]
+    pub const fn is_data_frame(self) -> bool {
+        matches!(
+            self,
+            Self::Trade | Self::BidAsk | Self::BidAskL2 | Self::Greeks
+        )
+    }
+}
+
+/// Narrow first-pass sniff window — every documented data frame leads with
+/// its type key, so the per-tick path never scans further than this.
+pub const TD_JSON_SNIFF_WINDOW: usize = 128;
+
+/// Wider second-pass window, used ONLY when the narrow pass found nothing.
 ///
-/// Order matters: `bidaskL2` must be tested BEFORE `bidask`, since the
-/// latter is a prefix of the former.
+/// Control frames are shaped `{"success":true,"symbollist":[…],"message":
+/// "symbols added"}` — with a few hundred symbols in the list, the
+/// `"message"` token sits far past the narrow window. Without this second
+/// pass an `addsymbol` acknowledgement carrying the SymbolID bindings would
+/// classify as unrecognised and be dropped, and the session would then
+/// never learn a single SymbolID. The pass is bounded and only runs on the
+/// rare control frames, so the tick path is unchanged.
+pub const TD_JSON_CONTROL_SNIFF_WINDOW: usize = 8192;
+
+/// Finds the message-type token of a JSON frame.
+///
+/// Two bounded passes. The first scans [`TD_JSON_SNIFF_WINDOW`] bytes for
+/// every token — this is where all continuous data frames are found. Only
+/// if that misses does the second scan [`TD_JSON_CONTROL_SNIFF_WINDOW`]
+/// bytes for the CONTROL tokens alone, whose payload may precede the
+/// `"message"` key.
+///
+/// Order matters inside each pass: `bidaskL2` is tested BEFORE `bidask`
+/// (prefix collision), and `"bar1min"`/`"bar5min"` are distinct tokens.
 ///
 /// Returns `None` for an unrecognised frame — a doc-drift signal to count
 /// and drop, never a panic.
 #[must_use]
 pub fn json_msg_type(raw: &[u8]) -> Option<TruedataJsonType> {
-    // Bounded scan: the type token always appears in the first ~64 bytes.
-    const SNIFF_WINDOW: usize = 128;
-    let window = &raw[..raw.len().min(SNIFF_WINDOW)];
     // bidaskL2 BEFORE bidask (prefix collision).
-    for (needle, kind) in [
-        (&b"\"bidaskL2\""[..], TruedataJsonType::BidAskL2),
-        (&b"\"trade\""[..], TruedataJsonType::Trade),
-        (&b"\"bidask\""[..], TruedataJsonType::BidAsk),
-        (&b"\"greeks\""[..], TruedataJsonType::Greeks),
-        (&b"\"bar1min\""[..], TruedataJsonType::Bar1Min),
-        (&b"HeartBeat"[..], TruedataJsonType::Heartbeat),
-        (&b"marketstatus"[..], TruedataJsonType::MarketStatus),
-        (&b"touchline"[..], TruedataJsonType::Touchline),
-        (&b"symbols added"[..], TruedataJsonType::SymbolsAdded),
-        (&b"TrueData"[..], TruedataJsonType::Auth),
-    ] {
-        if contains_sub(window, needle) {
+    const DATA_TOKENS: [(&[u8], TruedataJsonType); 6] = [
+        (b"\"bidaskL2\"", TruedataJsonType::BidAskL2),
+        (b"\"trade\"", TruedataJsonType::Trade),
+        (b"\"bidask\"", TruedataJsonType::BidAsk),
+        (b"\"greeks\"", TruedataJsonType::Greeks),
+        (b"\"bar1min\"", TruedataJsonType::Bar1Min),
+        (b"\"bar5min\"", TruedataJsonType::Bar5Min),
+    ];
+    // "symbols removed" BEFORE "symbols added"? No prefix collision — the
+    // two differ at the first word boundary — but both are tested before
+    // the bare "TrueData" welcome token, which can appear in a longer
+    // control payload.
+    const CONTROL_TOKENS: [(&[u8], TruedataJsonType); 5] = [
+        (b"HeartBeat", TruedataJsonType::Heartbeat),
+        (b"marketstatus", TruedataJsonType::MarketStatus),
+        (b"touchline", TruedataJsonType::Touchline),
+        (b"symbols added", TruedataJsonType::SymbolsAdded),
+        (b"symbols removed", TruedataJsonType::SymbolsRemoved),
+    ];
+
+    let narrow = &raw[..raw.len().min(TD_JSON_SNIFF_WINDOW)];
+    for (needle, kind) in DATA_TOKENS {
+        if contains_sub(narrow, needle) {
             return Some(kind);
+        }
+    }
+    for (needle, kind) in CONTROL_TOKENS {
+        if contains_sub(narrow, needle) {
+            return Some(kind);
+        }
+    }
+    if contains_sub(narrow, b"TrueData") {
+        return Some(TruedataJsonType::Auth);
+    }
+
+    // Second pass: control frames only, wider window. Skipped entirely when
+    // the frame is short enough that the narrow pass already saw all of it.
+    if raw.len() > TD_JSON_SNIFF_WINDOW {
+        let wide = &raw[..raw.len().min(TD_JSON_CONTROL_SNIFF_WINDOW)];
+        for (needle, kind) in CONTROL_TOKENS {
+            if contains_sub(wide, needle) {
+                return Some(kind);
+            }
+        }
+        if contains_sub(wide, b"TrueData") {
+            return Some(TruedataJsonType::Auth);
         }
     }
     None
@@ -580,9 +654,90 @@ mod tests {
             Some(TruedataJsonType::MarketStatus)
         );
         assert_eq!(
+            json_msg_type(br#"{"bar5min":["950000114"]}"#),
+            Some(TruedataJsonType::Bar5Min)
+        );
+        assert_eq!(
+            json_msg_type(br#"{"success":true,"message":"symbols added","symbollist":[]}"#),
+            Some(TruedataJsonType::SymbolsAdded)
+        );
+        assert_eq!(
+            json_msg_type(br#"{"success":true,"message":"symbols removed","symbollist":[]}"#),
+            Some(TruedataJsonType::SymbolsRemoved)
+        );
+        assert_eq!(
             json_msg_type(br#"{"success":true,"message":"TrueData Real Time Data Service"}"#),
             Some(TruedataJsonType::Auth)
         );
+    }
+
+    #[test]
+    fn test_json_msg_type_finds_control_token_behind_a_long_payload() {
+        // The real shape of an addsymbol acknowledgement: the symbollist
+        // comes FIRST and the "message" token sits far past the narrow
+        // window. Classifying this as unrecognised would drop the frame
+        // that carries every SymbolID binding — the session would then
+        // never learn a single id, and every subsequent tick would be
+        // unroutable.
+        let mut frame = Vec::from(&br#"{"success":true,"symbollist":["#[..]);
+        for i in 0..400 {
+            if i > 0 {
+                frame.push(b',');
+            }
+            frame.extend_from_slice(format!("\"SYMBOL{i}:{i}\"").as_bytes());
+        }
+        frame.extend_from_slice(br#"],"message":"symbols added"}"#);
+        assert!(
+            frame.len() > TD_JSON_SNIFF_WINDOW,
+            "fixture must exceed the narrow window to be meaningful"
+        );
+        assert_eq!(
+            json_msg_type(&frame),
+            Some(TruedataJsonType::SymbolsAdded),
+            "control token behind a long payload must still be found"
+        );
+    }
+
+    #[test]
+    fn test_json_msg_type_data_frames_never_need_the_wide_pass() {
+        // A tick frame must be classified from the narrow window alone, so
+        // the hot path never pays for the control-frame second pass.
+        let narrow_only = &TRADE_19[..TRADE_19.len().min(TD_JSON_SNIFF_WINDOW)];
+        assert_eq!(json_msg_type(narrow_only), Some(TruedataJsonType::Trade));
+    }
+
+    #[test]
+    fn test_json_msg_type_beyond_the_control_window_is_none_not_misread() {
+        // Bounded means bounded: a token past the wide window is reported
+        // as unrecognised (counted, dropped) — never guessed at.
+        let mut frame = Vec::from(&b"{\"pad\":\""[..]);
+        frame.resize(TD_JSON_CONTROL_SNIFF_WINDOW + 64, b'x');
+        frame.extend_from_slice(br#"","message":"symbols added"}"#);
+        assert_eq!(json_msg_type(&frame), None);
+    }
+
+    #[test]
+    fn test_is_data_frame_partitions_the_message_types() {
+        for t in [
+            TruedataJsonType::Trade,
+            TruedataJsonType::BidAsk,
+            TruedataJsonType::BidAskL2,
+            TruedataJsonType::Greeks,
+        ] {
+            assert!(t.is_data_frame(), "{t:?} is a continuous data frame");
+        }
+        for t in [
+            TruedataJsonType::Bar1Min,
+            TruedataJsonType::Bar5Min,
+            TruedataJsonType::Heartbeat,
+            TruedataJsonType::MarketStatus,
+            TruedataJsonType::Touchline,
+            TruedataJsonType::Auth,
+            TruedataJsonType::SymbolsAdded,
+            TruedataJsonType::SymbolsRemoved,
+        ] {
+            assert!(!t.is_data_frame(), "{t:?} is not a continuous data frame");
+        }
     }
 
     #[test]
