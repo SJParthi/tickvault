@@ -229,6 +229,9 @@ pub struct ApplicationConfig {
     /// off); `config/base.toml` opts in.
     #[serde(default)]
     pub order_update_events: OrderUpdateEventsConfig,
+    /// Per-leg option P&L capture (dry-run forensics; default OFF).
+    #[serde(default)]
+    pub order_leg_pnl: OrderLegPnlConfig,
     /// `[groww_rest_burst]` — the 2026-07-14 Groww REST burst auto-ladder
     /// (operator approval "approved and go ahead with the recommendation";
     /// `no-rest-except-live-feed-2026-06-27.md` §9.7): which burst tier the
@@ -384,6 +387,19 @@ pub struct FeedsConfig {
     /// rides alongside the `[groww_universe]` daily watch-set rider (which
     /// has its OWN gate). Default OFF.
     pub groww_enabled: bool,
+    /// TrueData live feed (feed #4, operator lock 2026-07-24 —
+    /// `truedata-feed-scope-2026-07-24.md`). The intended live-tick source,
+    /// but ships DEFAULT-OFF (trial-first): everything is code-ready so day
+    /// 0 of the trial is a config flip, not a build. `#[serde(default)]` so
+    /// an absent `truedata_enabled` key (a TOML written before this PR)
+    /// keeps the current boot byte-identical. Flipping the DEFAULT needs a
+    /// fresh dated operator quote.
+    #[serde(default)]
+    pub truedata_enabled: bool,
+    /// TrueData connection parameters (`[feeds.truedata]`). Fully
+    /// serde-defaulted so an absent section is the disabled/day-0 shape.
+    #[serde(default)]
+    pub truedata: TruedataConfig,
 }
 
 impl Default for FeedsConfig {
@@ -391,6 +407,87 @@ impl Default for FeedsConfig {
         Self {
             dhan_enabled: true,
             groww_enabled: false,
+            truedata_enabled: false,
+            truedata: TruedataConfig::default(),
+        }
+    }
+}
+
+/// `[feeds.truedata]` — TrueData (feed #4) connection parameters (operator
+/// lock 2026-07-24, `truedata-feed-scope-2026-07-24.md`). Every field is
+/// `#[serde(default)]`-driven so an ABSENT `[feeds.truedata]` section and an
+/// empty one deserialize identically to the disabled day-0 shape (the
+/// `OrderRuntimeConfig` / `Spot1mRestConfig` precedent). The `host`/`port`
+/// live per-account and come from SSM in production; the config carries the
+/// non-secret shape only (NEVER the user/password — those are SSM-only
+/// `Secret<String>` per the scope lock §2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TruedataConfig {
+    /// `push.truedata.in` host (per-account; issued by TrueData). Empty
+    /// default — the connect path resolves the real endpoint from SSM
+    /// (`/tickvault/<env>/truedata/endpoint`) when the feed is enabled.
+    #[serde(default = "default_truedata_host")]
+    pub host: String,
+    /// WebSocket port. Default 8086 (the v2.6-doc SANDBOX port; PROD is
+    /// 8084) — never hardcoded in the client, sourced from SSM in prod.
+    #[serde(default = "default_truedata_port")]
+    pub port: u16,
+    /// Exchange segments to request (TrueData segment labels). Default =
+    /// NSE equity + NSE F&O + indices.
+    #[serde(default = "default_truedata_segments")]
+    pub segments: Vec<String>,
+    /// Feed mode. Default `"tick"` — we DERIVE all timeframes from ticks
+    /// (Quote 2); the 1min/5min bar subscription is FORBIDDEN by the lock.
+    #[serde(default = "default_truedata_mode")]
+    pub mode: String,
+    /// Bound on the live subscription symbol set (0 = the auth reply's
+    /// `MaxSymbols` governs; a positive value caps below it). Default 0.
+    #[serde(default)]
+    pub max_symbols: u32,
+    /// Subscribe the combined tick+quote frame carrying L1 bid/ask (doc
+    /// point (g)) for worst-case-fill lot sizing. Default true.
+    #[serde(default = "default_truedata_bidask")]
+    pub bidask: bool,
+    /// Use the raw-TCP binary port (7070) fallback instead of WSS when the
+    /// session-0 probe finds the WSS trade frame is JSON (which breaks
+    /// O(1)). Default false — WSS binary is preferred.
+    #[serde(default)]
+    pub use_tcp_fallback: bool,
+}
+
+fn default_truedata_host() -> String {
+    String::new()
+}
+
+fn default_truedata_port() -> u16 {
+    8086
+}
+
+fn default_truedata_segments() -> Vec<String> {
+    vec!["nse-eq".to_string(), "nse-fo".to_string(), "in".to_string()]
+}
+
+fn default_truedata_mode() -> String {
+    "tick".to_string()
+}
+
+fn default_truedata_bidask() -> bool {
+    true
+}
+
+impl Default for TruedataConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly (an
+    /// empty `[feeds.truedata]` section and an ABSENT section must
+    /// deserialize identically).
+    fn default() -> Self {
+        Self {
+            host: default_truedata_host(),
+            port: default_truedata_port(),
+            segments: default_truedata_segments(),
+            mode: default_truedata_mode(),
+            max_symbols: 0,
+            bidask: default_truedata_bidask(),
+            use_tcp_fallback: false,
         }
     }
 }
@@ -1204,6 +1301,15 @@ pub struct CadenceConfig {
     /// Validated < 86_400.
     #[serde(default = "default_cadence_expiry_deadline_secs_of_day_ist")]
     pub expiry_deadline_secs_of_day_ist: u32,
+    /// Native micro-retry hedge for 2xx-empty cadence legs (2026-07-20 directive).
+    #[serde(default = "cadence_default_true")]
+    pub native_retry_enabled: bool,
+    /// Post-cross-fill background history re-pull (T+30s/T+50s, repair only).
+    #[serde(default = "cadence_default_true")]
+    pub history_repull_enabled: bool,
+}
+fn cadence_default_true() -> bool {
+    true
 }
 
 /// Serde default for [`CadenceConfig::dhan_lane`] /
@@ -1316,6 +1422,8 @@ impl Default for CadenceConfig {
             chain_min_spacing_ms: default_cadence_chain_min_spacing_ms(),
             expiry_retry_interval_ms: default_cadence_expiry_retry_interval_ms(),
             expiry_deadline_secs_of_day_ist: default_cadence_expiry_deadline_secs_of_day_ist(),
+            native_retry_enabled: true,
+            history_repull_enabled: true,
         }
     }
 }
@@ -1801,6 +1909,35 @@ pub struct DhanOrderPushConfig {
     pub enabled: bool,
 }
 
+/// Per-leg option P&L capture config (`[order_leg_pnl]`).
+///
+/// Dry-run only forensics: gates the bounded leg-P&L channel + the
+/// `order_leg_pnl` QuestDB writer. An ABSENT section means OFF
+/// (fail-safe); `config/base.toml` opts in explicitly.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderLegPnlConfig {
+    /// Master switch — OFF by default; the effective gate is
+    /// `order_runtime.enabled && order_leg_pnl.enabled`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bounded channel capacity between the emit seams and the consumer.
+    #[serde(default = "default_order_leg_pnl_channel_capacity")]
+    pub channel_capacity: usize,
+}
+
+impl Default for OrderLegPnlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel_capacity: default_order_leg_pnl_channel_capacity(),
+        }
+    }
+}
+
+fn default_order_leg_pnl_channel_capacity() -> usize {
+    2048
+}
+
 /// `[order_update_events]` — full-fidelity order/position PUSH-event
 /// capture (ORDER-EVT-01; `.claude/rules/project/order-update-events-error-codes.md`):
 /// when enabled, the app spawns one supervised consumer draining the two
@@ -2165,7 +2302,7 @@ impl FeedsConfig {
     /// with every feed disabled has nothing to do). Pure, O(1).
     #[must_use]
     pub const fn any_enabled(&self) -> bool {
-        self.dhan_enabled || self.groww_enabled
+        self.dhan_enabled || self.groww_enabled || self.truedata_enabled
     }
 
     /// `true` when BOTH feeds run in parallel (the cross-check target:
@@ -4200,6 +4337,7 @@ mod tests {
             order_runtime: OrderRuntimeConfig::default(),
             dhan_order_push: DhanOrderPushConfig::default(),
             order_update_events: OrderUpdateEventsConfig::default(),
+            order_leg_pnl: OrderLegPnlConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
@@ -6202,6 +6340,19 @@ mod tests {
         assert!(on.order_update_events.enabled);
     }
 
+    #[test]
+    fn test_order_leg_pnl_config_default_off() {
+        // Absent [order_leg_pnl] section must mean OFF (fail-safe) with the
+        // documented channel capacity.
+        let cfg = OrderLegPnlConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.channel_capacity, 2048);
+
+        let parsed: OrderLegPnlConfig = toml::from_str("").expect("empty section parses");
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.channel_capacity, 2048);
+    }
+
     /// Order runtime validation: the 60s reconcile floor + the bounded
     /// [256, 65536] mark-channel envelope apply ONLY when enabled (a
     /// disabled section is never rejected — rollback safety).
@@ -6918,6 +7069,11 @@ mod tests {
             .expect("missing [feeds] must use defaults, not error");
         assert!(wrapper.feeds.dhan_enabled);
         assert!(!wrapper.feeds.groww_enabled);
+        // TrueData (feed #4) ships DEFAULT-OFF; an absent key/section keeps
+        // the day-0 disabled shape (serde default) — port 8086 sandbox default.
+        assert!(!wrapper.feeds.truedata_enabled);
+        assert_eq!(wrapper.feeds.truedata.port, 8086);
+        assert_eq!(wrapper.feeds.truedata.mode, "tick");
     }
 
     /// All four toggle permutations round-trip via figment and the
@@ -6994,6 +7150,24 @@ mod tests {
                 ..Default::default()
             }
             .any_enabled()
+        );
+    }
+}
+
+#[cfg(test)]
+mod cadence_retry_flag_tests {
+    use super::*;
+
+    #[test]
+    fn test_cadence_config_retry_flags_default_on() {
+        let cfg = CadenceConfig::default();
+        assert!(
+            cfg.native_retry_enabled,
+            "native_retry_enabled must default ON"
+        );
+        assert!(
+            cfg.history_repull_enabled,
+            "history_repull_enabled must default ON"
         );
     }
 }

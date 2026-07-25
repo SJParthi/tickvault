@@ -25,6 +25,12 @@ pub mod previous_close;
 pub mod quote;
 mod read_helpers;
 pub mod ticker;
+pub mod truedata;
+pub mod truedata_aux;
+pub mod truedata_json;
+pub mod truedata_requests;
+pub mod truedata_router;
+pub mod truedata_session;
 pub mod types;
 
 // PR #4 (2026-05-19): depth re-exports retired.

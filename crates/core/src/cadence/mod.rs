@@ -80,6 +80,7 @@ pub mod decision;
 pub mod executor;
 pub mod expiry;
 pub mod gate;
+pub mod history_repull;
 pub mod ladder;
 pub mod runner;
 pub mod schedule;

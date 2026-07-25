@@ -101,6 +101,7 @@ async fn order_runtime_e2e_orphan_updates_and_mark_drain() {
         Arc::new(arc_swap::ArcSwap::from_pointee(None));
 
     let supervisor = spawn_order_runtime(OrderRuntimeParams {
+        leg_pnl_tx: None,
         config,
         notifier,
         calendar,
@@ -198,6 +199,7 @@ async fn order_runtime_e2e_mark_channel_close_does_not_exit_the_loop() {
         Arc::new(arc_swap::ArcSwap::from_pointee(None));
 
     let supervisor = spawn_order_runtime(OrderRuntimeParams {
+        leg_pnl_tx: None,
         config,
         notifier,
         calendar,

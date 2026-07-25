@@ -43,10 +43,10 @@ present in the same Telegram thread.
   2. Cross-reference with `mcp__tickvault-logs__run_doctor`.
   3. The 4 boot gates each have a runbook target:
      * Static IP gate → `.claude/rules/dhan/authentication.md` rule 7
-     * Dual-instance lock → `.claude/rules/project/wave-2-error-codes.md`
+     * Dual-instance lock → `docs/error-runbooks/wave-2-error-codes.md`
        (RESILIENCE-01)
-     * Clock skew → `.claude/rules/project/wave-2-c-error-codes.md` (BOOT-03)
-     * QuestDB readiness → `.claude/rules/project/wave-2-error-codes.md`
+     * Clock skew → `docs/error-runbooks/wave-2-c-error-codes.md` (BOOT-03)
+     * QuestDB readiness → `docs/error-runbooks/wave-2-error-codes.md`
        (BOOT-01 / BOOT-02)
   4. **No-go below 08:55:** if any gate is still red at 08:55 IST,
      decide whether to skip the trading day. Do NOT force-bypass the
@@ -113,7 +113,7 @@ The bhavcopy loader runs at boot (cold path). Empty for today means:
      `make refresh-instruments` to retry.
   2. **The loader failed entirely:** `PREVCLOSE-04` error code in
      `errors.jsonl.*`. See
-     `.claude/rules/project/wave-1-error-codes.md::PREVCLOSE-04`.
+     `docs/error-runbooks/wave-1-error-codes.md::PREVCLOSE-04`.
      Cascade seal-time pct-stamping falls back to 0.0 for the 3 %
      fields — operator sees zero-valued % columns until next boot.
 

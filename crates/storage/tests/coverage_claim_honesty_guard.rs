@@ -1,7 +1,7 @@
 //! Ratchet guard for the B7 coverage-honesty sweep (2026-07-03).
 //!
 //! The executable truth is `quality/crate-coverage-thresholds.toml` — ratcheted
-//! per-crate LINE-coverage floors (app 63.3 … common 99.5; floors only move up,
+//! per-crate LINE-coverage floors (app 68.3 … common 99.5; floors only move up,
 //! 100% is the target), enforced post-merge by `scripts/coverage-gate.sh`. The
 //! B7 directive replaced every FALSE "100% coverage enforced" documentation
 //! claim with that honest wording, aligned `make coverage` to the SAME per-crate
@@ -45,7 +45,7 @@ fn coverage_claims_in_ci_yml_are_honest() {
 }
 
 /// CLAUDE.md must not claim a 100% minimum for all crates — the enforced
-/// floors are 63.3–99.5 (target 100%).
+/// floors are 68.3–99.5 (target 100%).
 #[test]
 fn claude_md_does_not_claim_100pct_minimum_for_all_crates() {
     let claude_md = read("CLAUDE.md");

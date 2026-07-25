@@ -320,6 +320,12 @@ auto_start_docker = true
 [feeds]
 dhan_enabled = false
 groww_enabled = false
+# TrueData (feed #4, operator lock 2026-07-24 —
+# .claude/rules/project/truedata-feed-scope-2026-07-24.md). The intended
+# LIVE-TICK source, but ships DEFAULT-OFF (trial-first): everything is
+# code-ready so day 0 of the trial is a config flip, not a build. Flipping
+# this default requires a fresh dated operator quote.
+truedata_enabled = false
 # The Groww LIVE feed was RETIRED 2026-07-15 (operator directive: "remove
 # the whole Groww live feed; keep only spot 1m and option chain for both
 # brokers"). groww_enabled above does NOT gate the Groww REST legs (each is
@@ -330,6 +336,22 @@ groww_enabled = false
 # watch-set build lives under [groww_universe]. The retired keys
 # (groww_native_shadow, [feeds.groww] capture archive, [feeds.groww.scale])
 # were removed with the live machinery.
+
+# TrueData (feed #4) connection parameters. All keys are serde-defaulted, so
+# an absent [feeds.truedata] section is the disabled day-0 shape. host/port
+# come from SSM in production (/tickvault/<env>/truedata/endpoint); the
+# user/password are SSM-only Secret<String> and NEVER appear in config.
+# port 8086 = the v2.6-doc SANDBOX port (PROD is 8084). Timeframes are
+# DERIVED from ticks (mode = "tick") — the 1min/5min bar streams are never
+# subscribed. Inert while truedata_enabled = false.
+[feeds.truedata]
+host = ""
+port = 8086
+segments = ["nse-eq", "nse-fo", "in"]
+mode = "tick"
+max_symbols = 0
+bidask = true
+use_tcp_fallback = false
 
 # [movers] section retired in PR #2 (2026-05-18) alongside the deleted
 # movers pipeline. Under the 4-IDX_I-only universe top-N gainers/losers/
@@ -685,6 +707,10 @@ enabled = false
 [order_update_events]
 enabled = true
 
+[order_leg_pnl]
+# Per-leg option P&L capture (dry-run paper mode; log-sink-only ORDER-PNL-01).
+enabled = true
+
 # ===========================================================================
 # REST-era multi-TF candle derivation (operator directive 2026-07-16:
 # "why the fuck remaining candles 1m till 1day is not yet generated and
@@ -816,6 +842,9 @@ enabled = false
 # + the dated rule-file note per
 # `.claude/rules/project/cadence-error-codes.md`.
 [cadence]
+# Native micro-retry hedge + background history re-pull (2026-07-20 operator directive).
+native_retry_enabled = true
+history_repull_enabled = true
 enabled = true # flipped 2026-07-17 — REAL broker executors both lanes (the legacy per-minute legs stand down above per the RS3 mutual exclusion)
 # Broker lane gates (fix round 2026-07-17): the cadence REST lanes are
 # deliberately INDEPENDENT of the retired live-WS flags

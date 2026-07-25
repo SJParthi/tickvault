@@ -68,6 +68,16 @@ pub struct FeedStatus {
 pub struct FeedRuntimeState {
     dhan: Arc<AtomicBool>,
     groww: Arc<AtomicBool>,
+    /// TrueData (feed #4) runtime enable flag, seeded from
+    /// `feeds.truedata_enabled` (default OFF). `Arc<AtomicBool>` so the SAME
+    /// atomic can be handed to the future `core` TrueData WS loop (which
+    /// cannot depend on this crate). Today the TrueData lane is not yet
+    /// wired, so a runtime enable is RECORDED but no lane acts on it
+    /// (`truedata_lane_running` stays false — no false-OK).
+    truedata: Arc<AtomicBool>,
+    /// Set once by the boot wiring when the TrueData lane is actually
+    /// spawned. Stays false until the lane is wired (a later PR).
+    truedata_lane_running: AtomicBool,
     /// The IMMUTABLE RAW TOML value of `feeds.dhan_enabled` (Phase A,
     /// operator directive 2026-07-13) — captured BEFORE the feed-state
     /// overlay is applied (round-2 review MEDIUM, 2026-07-13). Distinct
@@ -144,6 +154,10 @@ impl FeedRuntimeState {
         Self {
             dhan: Arc::new(AtomicBool::new(feeds.dhan_enabled)),
             groww: Arc::new(AtomicBool::new(feeds.groww_enabled)),
+            // TrueData (feed #4): seed the runtime flag from config (default
+            // OFF); the lane is not wired yet so it never runs this process.
+            truedata: Arc::new(AtomicBool::new(feeds.truedata_enabled)),
+            truedata_lane_running: AtomicBool::new(false),
             // Phase A (2026-07-13): the RAW TOML Dhan value is retained
             // immutably so the API can refuse a runtime enable of the
             // retired lane (raw config-off is authoritative; round-2 FIX A).
@@ -270,6 +284,8 @@ impl FeedRuntimeState {
         match feed {
             Feed::Dhan => self.is_dhan_lane_running(),
             Feed::Groww => self.is_groww_lane_running(),
+            // TrueData lane not yet wired — never running this process.
+            Feed::Truedata => self.truedata_lane_running.load(Ordering::Relaxed),
         }
     }
 
@@ -280,6 +296,7 @@ impl FeedRuntimeState {
         match feed {
             Feed::Dhan => self.dhan.load(Ordering::Relaxed),
             Feed::Groww => self.groww.load(Ordering::Relaxed),
+            Feed::Truedata => self.truedata.load(Ordering::Relaxed),
         }
     }
 
@@ -289,6 +306,7 @@ impl FeedRuntimeState {
         match feed {
             Feed::Dhan => self.dhan.store(enabled, Ordering::Relaxed),
             Feed::Groww => self.groww.store(enabled, Ordering::Relaxed),
+            Feed::Truedata => self.truedata.store(enabled, Ordering::Relaxed),
         }
         enabled
     }

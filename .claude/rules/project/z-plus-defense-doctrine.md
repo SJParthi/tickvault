@@ -224,7 +224,7 @@ The operator's charter is non-negotiable. If a PR seems "too much work for a sma
 | `resilience_sla_alert_guard.rs` | `cargo test` | counter must have alert rule |
 | `error_level_meta_guard.rs` | `cargo test` | flush/persist uses `error!` |
 | `scripts/bench-gate.sh` | post-merge | 5% regression budget |
-| `scripts/coverage-gate.sh` | post-merge | ratcheted per-crate floors (63.3–99.5, target 100%) per crate |
+| `scripts/coverage-gate.sh` | post-merge | ratcheted per-crate floors (68.3–99.5, target 100%) per crate |
 | **NEW:** `z-plus-checklist-guard.sh` | pre-PR | Z+ checklist filled in for every plan item |
 | **NEW:** `auto-driver-test-guard.sh` | pre-PR | operator-facing text passes auto-driver test |
 

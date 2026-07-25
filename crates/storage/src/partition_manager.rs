@@ -161,6 +161,7 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // Standard 90d order-audit class as order_audit/pnl_audit above (90d hot
     // in QuestDB, then the DAY sweep's detach→S3-archive cold path). Tiny in
     // paper mode (a handful of rows/day); `feed` is in both DEDUP keys.
+    "order_leg_pnl",
     "order_update_events",
     "position_update_events",
     // CADENCE-04 (2026-07-20, cross-fill visibility, operator directive):

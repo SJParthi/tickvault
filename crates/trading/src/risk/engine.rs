@@ -397,14 +397,12 @@ impl RiskEngine {
                 continue;
             }
             if let Some(&market_price) = self.market_prices.get(security_id) {
-                // 2026-07-14 fix (order-runtime dry-run PR): multiply by the
-                // contract lot size — previously omitted, so the daily-loss
-                // halt would have been 25-75x understated on options
-                // (a Rule-11 false-guarantee class). `max(1)` covers pre-fix
-                // Default rows and equities (lot_size 0 → 1).
-                let unrealized = (pos.net_lots as f64)
-                    * (market_price - pos.avg_entry_price)
-                    * f64::from(pos.lot_size.max(1));
+                // Delegates to the ONE per-leg formula
+                // (`PositionInfo::unrealized_at`, order-leg-pnl Item 1) —
+                // preserves the 2026-07-14 lot-size fix (multiply by the
+                // contract lot size; lot_size 0 treated as 1 for pre-fix
+                // Default rows and equities).
+                let unrealized = pos.unrealized_at(market_price);
                 // Defensive finiteness guard: with the lot_size multiplier an
                 // ABSURD (finite-but-huge, ~1e307) price could overflow the
                 // product to ±inf and poison the total. Conservative-skip,
@@ -1362,6 +1360,29 @@ mod tests {
         engine.update_market_price(1001, 190.0);
         // unrealized = -10 * (190 - 200) * 25 = 2500 (lot_size fix 2026-07-14)
         assert!((engine.total_unrealized_pnl() - 2500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_total_unrealized_delegation_equivalence() {
+        // ONE formula: the engine total must equal Σ per-leg unrealized_at (order-leg-pnl Item 1 pin).
+        let mut engine = make_engine();
+        engine.record_fill(1001, 2, 100.0, 75);
+        engine.record_fill(2002, -3, 200.0, 50);
+        engine.update_market_price(1001, 110.0);
+        engine.update_market_price(2002, 190.0);
+
+        let manual_sum: f64 = [(1001_u64, 110.0_f64), (2002, 190.0)]
+            .iter()
+            .map(|&(sid, mark)| {
+                engine
+                    .position(sid)
+                    .map(|p| p.unrealized_at(mark))
+                    .unwrap_or(0.0)
+            })
+            .sum();
+        // (110-100)*2*75 = 1500 long + (190-200)*(-3)*50 = 1500 short.
+        assert!((manual_sum - 3000.0).abs() < 1e-9);
+        assert!((engine.total_unrealized_pnl() - manual_sum).abs() < 1e-9);
     }
 
     // -----------------------------------------------------------------------

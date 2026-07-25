@@ -308,6 +308,8 @@ pub struct OrderRuntimeParams {
     /// The stack's order-update auth signal (fires ONCE per process on the
     /// first successful WS auth) — triggers an immediate reconcile cycle.
     pub auth_notify: Arc<Notify>,
+    /// Order-leg P&L sink (None = feature OFF; byte-identical no-op path).
+    pub leg_pnl_tx: Option<mpsc::Sender<LegPnlEvent>>,
 }
 
 /// Spawn the supervised order runtime. Returns the SUPERVISOR handle.
@@ -325,6 +327,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
             token_handle,
             client_id,
             auth_notify,
+            leg_pnl_tx,
         } = params;
         // The mark receiver survives inner respawns behind a tokio Mutex —
         // the inner run holds the guard for its lifetime; an (unwind-build)
@@ -349,6 +352,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 token_handle: token_handle.clone(),
                 client_id: client_id.clone(),
                 auth_notify: Arc::clone(&auth_notify),
+                leg_pnl_tx: leg_pnl_tx.clone(),
             };
             let mark_rx_shared = Arc::clone(&mark_rx);
             let run_started = std::time::Instant::now();
@@ -411,6 +415,8 @@ struct RuntimeCtx {
     token_handle: TokenHandle,
     client_id: String,
     auth_notify: Arc<Notify>,
+    /// Order-leg P&L sink (None = feature OFF; byte-identical no-op path).
+    leg_pnl_tx: Option<mpsc::Sender<LegPnlEvent>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -797,9 +803,116 @@ fn log_safe_id(raw: &str) -> String {
         .collect()
 }
 
+// ==== OPTION-CONTRACT LEG P&L (order-leg-pnl Item 2) ====
+
+/// FNO binary segment codes (NSE_FNO / BSE_FNO) — the only segments the
+/// leg-P&L capture emits for (option-contract legs live here).
+const LEG_PNL_FNO_SEGMENT_CODES: [u8; 2] = [2, 8];
+
+/// Producer-side sink-drop episode latch: the first drop of an episode is
+/// a loud coded error, later drops are debug-only; a successful send
+/// re-arms the latch.
+static LEG_PNL_SINK_DROP_LATCHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Which seam produced a leg-P&L observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegPnlKind {
+    /// A per-minute option-contract mark reached the risk engine.
+    Mark,
+    /// A (paper) fill reached the risk engine.
+    Fill,
+}
+
+/// One per-leg P&L observation for an OPTION CONTRACT leg (dry-run order
+/// runtime). `Copy`, fixed-size, string-free — nothing allocates at the
+/// emit seams; identity strings are resolved consumer-side.
+/// `event_seq` is deliberately ABSENT here: it is stamped exactly once,
+/// CONSUMER-side, per persisted row.
+#[derive(Debug, Clone, Copy)]
+pub struct LegPnlEvent {
+    pub ts_utc_ns: i64,
+    pub sid: u64,
+    pub segment_code: u8,
+    pub event_kind: LegPnlKind,
+    pub net_lots: i32,
+    pub lot_size: u32,
+    pub avg_entry_price: f64,
+    pub mark_price: f64,
+    pub realized_pnl: f64,
+    pub unrealized_pnl: f64,
+}
+
+/// Emit one leg-P&L observation from a fill/mark seam.
+///
+/// O(1) time AND space per call: one `position()` hash lookup + the
+/// single-leg `unrealized_at` formula + a bounded `try_send` of a `Copy`
+/// value. FNO-only (codes 2/8). A `None` sender (feature OFF or not yet
+/// wired) is a no-op — the OFF path is byte-identical. A sid with no
+/// position entry (e.g. a pending-paper-only mark) emits NOTHING.
+fn emit_leg_pnl(
+    leg_pnl_tx: Option<&mpsc::Sender<LegPnlEvent>>,
+    risk: &RiskEngine,
+    security_id: u64,
+    segment_code: u8,
+    event_kind: LegPnlKind,
+    mark_price: f64,
+) {
+    let Some(tx) = leg_pnl_tx else { return };
+    if !LEG_PNL_FNO_SEGMENT_CODES.contains(&segment_code) {
+        return;
+    }
+    let Some(pos) = risk.position(security_id) else {
+        return;
+    };
+    let event = LegPnlEvent {
+        ts_utc_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        sid: security_id,
+        segment_code,
+        event_kind,
+        net_lots: pos.net_lots,
+        lot_size: pos.lot_size,
+        avg_entry_price: pos.avg_entry_price,
+        mark_price,
+        realized_pnl: pos.realized_pnl,
+        unrealized_pnl: pos.unrealized_at(mark_price),
+    };
+    match tx.try_send(event) {
+        Ok(()) => {
+            LEG_PNL_SINK_DROP_LATCHED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(err) => {
+            let reason = match err {
+                mpsc::error::TrySendError::Full(_) => "full",
+                mpsc::error::TrySendError::Closed(_) => "closed",
+            };
+            metrics::counter!("tv_order_leg_pnl_dropped_total", "reason" => reason).increment(1);
+            if !LEG_PNL_SINK_DROP_LATCHED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                error!(
+                    code = ErrorCode::OrderPnl01PersistFailed.code_str(),
+                    stage = "sink_drop",
+                    reason,
+                    security_id,
+                    "order leg P&L event dropped at the producer sink — this event's capture row is lost (bounded channel; capture is best-effort)"
+                );
+            } else {
+                debug!(
+                    reason,
+                    security_id, "order leg P&L event dropped (episode already latched)"
+                );
+            }
+        }
+    }
+}
+
 /// Applies one FillEvent to the risk engine + mirror. Returns whether the
 /// fill was applied (tripwire / unknown-segment guard may refuse).
-fn apply_fill(risk: &mut RiskEngine, book: &mut BookState, fill: &FillEvent) -> bool {
+fn apply_fill(
+    risk: &mut RiskEngine,
+    book: &mut BookState,
+    fill: &FillEvent,
+    leg_pnl_tx: Option<&mpsc::Sender<LegPnlEvent>>,
+) -> bool {
     // S2 (fix-round 2026-07-14): a fill whose segment chars were UNMAPPABLE
     // cannot be partition-checked — treating UNKNOWN as compatible-with-
     // everything was the exact tripwire bypass. Refuse the fill (loud);
@@ -832,6 +945,14 @@ fn apply_fill(risk: &mut RiskEngine, book: &mut BookState, fill: &FillEvent) -> 
         "live"
     };
     metrics::counter!("tv_risk_fills_recorded_total", "kind" => kind).increment(1);
+    emit_leg_pnl(
+        leg_pnl_tx,
+        risk,
+        fill.security_id,
+        fill.segment_code,
+        LegPnlKind::Fill,
+        fill.avg_price,
+    );
     true
 }
 
@@ -1020,7 +1141,9 @@ async fn run_order_runtime(
                     process_mark(
                         &mut oms, &mut risk, &mut book, &mut self_test, &ctx, m,
                         config.order_runtime.paper_fill,
-                    ).await;
+                        ctx.leg_pnl_tx.as_ref(),
+                    )
+                    .await;
                     processed += 1;
                     if processed >= MARK_BATCH_MAX {
                         break;
@@ -1130,7 +1253,7 @@ async fn handle_order_update_event(
     match oms.handle_order_update(update) {
         Ok(Some(fill)) => {
             let order_id = fill.order_id.clone();
-            if apply_fill(risk, book, &fill) {
+            if apply_fill(risk, book, &fill, ctx.leg_pnl_tx.as_ref()) {
                 advance_self_test_on_fill(oms, risk, self_test, ctx, &order_id, paper_fill).await;
             }
         }
@@ -1171,6 +1294,7 @@ async fn process_mark(
     ctx: &RuntimeCtx,
     mark: MarkUpdate,
     paper_fill: bool,
+    leg_pnl_tx: Option<&mpsc::Sender<LegPnlEvent>>,
 ) {
     if !book.tripwire_ok(mark.security_id, mark.segment_code) {
         return;
@@ -1206,6 +1330,14 @@ async fn process_mark(
         return;
     }
     risk.update_market_price(mark.security_id, price);
+    emit_leg_pnl(
+        leg_pnl_tx,
+        risk,
+        mark.security_id,
+        mark.segment_code,
+        LegPnlKind::Mark,
+        price,
+    );
 
     // Next-mark paper filler (F12 fill-once: the pending index holds
     // non-terminal PAPER orders only, and a filled order goes terminal
@@ -1272,7 +1404,7 @@ async fn fill_paper_order(
         Ok(Some(fill)) => {
             metrics::counter!("tv_paper_fills_synthesized_total").increment(1);
             let filled_order_id = fill.order_id.clone();
-            if apply_fill(risk, book, &fill) {
+            if apply_fill(risk, book, &fill, ctx.leg_pnl_tx.as_ref()) {
                 advance_self_test_on_fill(oms, risk, self_test, ctx, &filled_order_id, true).await;
             }
         }
@@ -1675,6 +1807,7 @@ mod tests {
             token_handle: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             client_id: "100".to_string(),
             auth_notify: Arc::new(Notify::new()),
+            leg_pnl_tx: None,
         }
     }
 
@@ -1785,7 +1918,7 @@ mod tests {
             lot_size: 25,
             order_id: "PAPER-1".to_string(),
         };
-        assert!(apply_fill(&mut risk, &mut book, &fill));
+        assert!(apply_fill(&mut risk, &mut book, &fill, None));
         assert_eq!(risk.net_lots_for(13), 2, "fill must reach the risk engine");
         assert_eq!(book.mirror.get(&13), Some(&2));
     }
@@ -1810,9 +1943,9 @@ mod tests {
             lot_size: 1,
             order_id: "PAPER-2".to_string(),
         };
-        assert!(apply_fill(&mut risk, &mut book, &fill_a));
+        assert!(apply_fill(&mut risk, &mut book, &fill_a, None));
         assert!(
-            !apply_fill(&mut risk, &mut book, &fill_b),
+            !apply_fill(&mut risk, &mut book, &fill_b, None),
             "a divergent segment for a known sid must be SKIPPED (loud), \
              never silently merged into the same position"
         );
@@ -1908,7 +2041,7 @@ mod tests {
             .ok()
             .flatten()
             .expect("fill event"); // APPROVED: test
-        assert!(apply_fill(&mut risk, &mut book, &fill));
+        assert!(apply_fill(&mut risk, &mut book, &fill, None));
         let ok = local_reconcile(&oms, &risk, &book.mirror);
         assert_eq!(ok.sids_checked, 1);
         assert_eq!(ok.divergences, 0, "mirror==net_lots after a clean fill");
@@ -1973,7 +2106,7 @@ mod tests {
                 lot_size: 25,
                 order_id: "PAPER-x".to_string(),
             };
-            assert!(apply_fill(&mut risk, &mut book, &fill));
+            assert!(apply_fill(&mut risk, &mut book, &fill, None));
         }
         // Leg 1 only: this synthetic walk applies fills WITHOUT tracked
         // orders, so the order-fold leg legitimately diverges (empty book
@@ -1999,7 +2132,7 @@ mod tests {
         let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
         let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
         if let Ok(Some(fill)) = oms.handle_order_update(&synthetic) {
-            apply_fill(&mut risk, &mut book, &fill);
+            apply_fill(&mut risk, &mut book, &fill, None);
         }
         assert_eq!(risk.net_lots_for(13), 1);
         assert!(!book.mirror.is_empty());
@@ -2122,6 +2255,7 @@ mod tests {
                 price: 100.0,
             },
             true,
+            None,
         )
         .await;
         assert!(
@@ -2143,6 +2277,7 @@ mod tests {
                 price: 101.0,
             },
             true,
+            None,
         )
         .await;
         let today = ist_day_number(chrono::Utc::now().timestamp());
@@ -2197,6 +2332,7 @@ mod tests {
                 price: 400.0,
             },
             true,
+            None,
         )
         .await;
         assert_eq!(
@@ -2437,6 +2573,7 @@ mod tests {
                 price: 400.0,
             },
             true,
+            None,
         )
         .await;
         assert_eq!(risk.net_lots_for(13), 1, "paper fill must open 1 lot");
@@ -2460,6 +2597,7 @@ mod tests {
                 price: 100.0,
             },
             true,
+            None,
         )
         .await;
 
@@ -2508,7 +2646,7 @@ mod tests {
             order_id: "PAPER-1".to_string(),
         };
         assert!(
-            !apply_fill(&mut risk, &mut book, &fill),
+            !apply_fill(&mut risk, &mut book, &fill, None),
             "an unknown-segment fill must be REFUSED (tripwire bypass — S2)"
         );
         assert_eq!(risk.net_lots_for(27), 0);
@@ -2619,5 +2757,193 @@ mod tests {
         }
         // Unknown → empty chars (tolerated by the engine's sentinel arm).
         assert_eq!(segment_code_to_chars(SEGMENT_CODE_UNKNOWN), ("", ""));
+    }
+
+    // -------------------------------------------------------------------
+    // Option-contract leg P&L emission (order-leg-pnl Item 2)
+    // -------------------------------------------------------------------
+
+    fn make_leg_pnl_channel() -> (mpsc::Sender<LegPnlEvent>, mpsc::Receiver<LegPnlEvent>) {
+        mpsc::channel(8)
+    }
+
+    #[test]
+    fn test_leg_pnl_fill_state_walk() {
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let (tx, mut rx) = make_leg_pnl_channel();
+        let fill_open = FillEvent {
+            security_id: 777,
+            segment_code: 2,
+            fill_lots: 2,
+            avg_price: 100.0,
+            lot_size: 25,
+            order_id: "PAPER-LP1".to_string(),
+        };
+        assert!(apply_fill(&mut risk, &mut book, &fill_open, Some(&tx)));
+        let e1 = rx.try_recv().expect("open fill must emit a leg P&L event");
+        assert_eq!(e1.event_kind, LegPnlKind::Fill);
+        assert_eq!(e1.sid, 777);
+        assert_eq!(e1.segment_code, 2);
+        assert_eq!(e1.net_lots, 2);
+        assert_eq!(e1.lot_size, 25);
+        assert!((e1.avg_entry_price - 100.0).abs() < 1e-9);
+        assert!((e1.mark_price - 100.0).abs() < 1e-9);
+        assert!(e1.unrealized_pnl.abs() < 1e-9);
+        assert!(e1.ts_utc_ns > 0);
+        let fill_close = FillEvent {
+            security_id: 777,
+            segment_code: 2,
+            fill_lots: -1,
+            avg_price: 110.0,
+            lot_size: 25,
+            order_id: "PAPER-LP2".to_string(),
+        };
+        assert!(apply_fill(&mut risk, &mut book, &fill_close, Some(&tx)));
+        let e2 = rx
+            .try_recv()
+            .expect("closing fill must emit a leg P&L event");
+        assert_eq!(e2.net_lots, 1);
+        assert!((e2.realized_pnl - 250.0).abs() < 1e-9);
+        assert!((e2.unrealized_pnl - 250.0).abs() < 1e-9);
+        assert!((e2.mark_price - 110.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_leg_pnl_cross_segment_distinct() {
+        // Cross-segment fills for ONE sid: the I-P1-11 first-seen-segment
+        // tripwire makes a same-book collision LOUD by design, so each leg
+        // gets its own risk/book here — the point under test is that the
+        // EVENT carries (sid, segment) so persisted rows stay distinct.
+        let mut risk_nse = make_risk();
+        let mut book_nse = BookState::new();
+        let mut risk_bse = make_risk();
+        let mut book_bse = BookState::new();
+        let (tx, mut rx) = make_leg_pnl_channel();
+        let f_nse = FillEvent {
+            security_id: 640,
+            segment_code: 2,
+            fill_lots: 1,
+            avg_price: 10.0,
+            lot_size: 75,
+            order_id: "PAPER-N".to_string(),
+        };
+        let f_bse = FillEvent {
+            security_id: 640,
+            segment_code: 8,
+            fill_lots: 1,
+            avg_price: 12.0,
+            lot_size: 75,
+            order_id: "PAPER-B".to_string(),
+        };
+        assert!(apply_fill(&mut risk_nse, &mut book_nse, &f_nse, Some(&tx)));
+        assert!(apply_fill(&mut risk_bse, &mut book_bse, &f_bse, Some(&tx)));
+        let e1 = rx.try_recv().expect("NSE_FNO fill emits");
+        let e2 = rx.try_recv().expect("BSE_FNO fill emits");
+        // Rows stay distinguishable by (security_id, segment) — the persisted
+        // DEDUP key carries BOTH per I-P1-11.
+        assert_eq!((e1.segment_code, e2.segment_code), (2, 8));
+        assert_eq!((e1.sid, e2.sid), (640, 640));
+    }
+
+    #[test]
+    fn test_leg_pnl_off_emits_nothing() {
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let fill = FillEvent {
+            security_id: 888,
+            segment_code: 2,
+            fill_lots: 3,
+            avg_price: 55.0,
+            lot_size: 15,
+            order_id: "PAPER-OFF".to_string(),
+        };
+        assert!(apply_fill(&mut risk, &mut book, &fill, None));
+        assert_eq!(risk.net_lots_for(888), 3);
+    }
+
+    #[tokio::test]
+    async fn test_leg_pnl_mark_emission_fno_only() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        let (tx, mut rx) = make_leg_pnl_channel();
+        risk.record_fill(901, 2, 100.0, 25);
+        risk.record_fill(13, 1, 22_000.0, 1);
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 901,
+                segment_code: 2,
+                price: 105.0,
+            },
+            false,
+            Some(&tx),
+        )
+        .await;
+        let e = rx.try_recv().expect("FNO mark must emit a leg P&L event");
+        assert_eq!(e.event_kind, LegPnlKind::Mark);
+        assert_eq!(e.segment_code, 2);
+        assert!((e.mark_price - 105.0).abs() < 1e-6);
+        assert!((e.unrealized_pnl - 250.0).abs() < 1e-3);
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 13,
+                segment_code: 0,
+                price: 22_100.0,
+            },
+            false,
+            Some(&tx),
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "non-FNO mark must not emit a leg P&L row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_leg_pnl_mark_pending_no_position_no_row() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        let (tx, mut rx) = make_leg_pnl_channel();
+        // A pending paper order for sid 555 WITHOUT any position — the mark
+        // passes the has_pending_paper gate, but emit_leg_pnl finds no
+        // position entry and must emit nothing.
+        book.pending_paper
+            .insert(555, vec!["PAPER-PEND".to_string()]);
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 555,
+                segment_code: 2,
+                price: 50.0,
+            },
+            false,
+            Some(&tx),
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "pending-paper-only mark (no position) must NOT emit a row"
+        );
     }
 }

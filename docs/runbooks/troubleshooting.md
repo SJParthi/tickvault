@@ -50,7 +50,7 @@
   1. `docker ps` — confirm `tv-questdb` is in state `Up`.
   2. `make doctor` section 4 — green = wait; red = check Docker daemon.
   3. Boot will auto-succeed within 60s if QuestDB recovers; otherwise BOOT-02 fires + app HALTs.
-**Cross-reference:** `.claude/rules/project/wave-2-error-codes.md::BOOT-01`.
+**Cross-reference:** `docs/error-runbooks/wave-2-error-codes.md::BOOT-01`.
 
 ### BOOT-02 — QuestDB boot deadline exceeded (HALTING)
 
@@ -60,7 +60,7 @@
   1. `nc -z 127.0.0.1 9009` — must succeed.
   2. `tail -50 data/logs/auto-up.*.log` — inspect docker compose attempt.
   3. After QuestDB recovers, restart the app — boot will succeed in ~10s.
-**Cross-reference:** `.claude/rules/project/wave-2-error-codes.md::BOOT-02`.
+**Cross-reference:** `docs/error-runbooks/wave-2-error-codes.md::BOOT-02`.
 
 ### BOOT-03 — Clock skew (HALTING)
 
@@ -71,7 +71,7 @@
   2. `chronyc -a 'burst 4/4' && chronyc -a makestep` — force step adjustment.
   3. Restart app — BOOT-03 should clear.
 **Do NOT:** silently raise the 2.0s threshold. IST midnight + 09:00 open + 15:30 close gates depend on accurate wall-clock.
-**Cross-reference:** `.claude/rules/project/wave-2-c-error-codes.md::BOOT-03`.
+**Cross-reference:** `docs/error-runbooks/wave-2-c-error-codes.md::BOOT-03`.
 
 ### RESILIENCE-01 — Dual-instance lock collision
 
@@ -82,7 +82,7 @@
   2. Stop it cleanly: `systemctl stop tickvault` OR `kill -SIGTERM <pid>`.
   3. Wait 90s for the Valkey instance-lock TTL to expire.
   4. Restart this process.
-**Cross-reference:** `.claude/rules/project/wave-4-error-codes.md::RESILIENCE-01`.
+**Cross-reference:** `docs/error-runbooks/wave-4-error-codes.md::RESILIENCE-01`.
 
 ## WebSocket codes
 
@@ -91,14 +91,14 @@
 **Symptom:** Telegram Info "WebSocketSleepEntered" after 15:30 IST.
 **Cause:** Normal post-close transition; connection dormant until next market open.
 **Fix:** None — informational. Pool supervisor keeps slot alive.
-**Cross-reference:** `.claude/rules/project/wave-2-error-codes.md::WS-GAP-04`.
+**Cross-reference:** `docs/error-runbooks/wave-2-error-codes.md::WS-GAP-04`.
 
 ### WS-GAP-05 — Pool supervisor respawned task
 
 **Symptom:** `tv_ws_pool_respawn_total{reason="unexpected_clean_exit"}` increments.
 **Cause:** A main-feed connection session ended with a server Close frame / TCP stream-end without a shutdown request (W2#8, 2026-07-10).
 **Fix:** The slot's supervised loop auto-respawns within ~5s (storm-bounded 5s→300s backoff). If the rate sustains, Dhan keeps closing the session server-side — cross-check the token + Dhan status in `data/logs/errors.jsonl.*` (the WS-GAP-05 lines carry `backoff_secs` + `consecutive_quick_exits`). Release-build panics abort the process (`panic = "abort"`); recovery there is restart + WAL replay, not respawn.
-**Cross-reference:** `.claude/rules/project/wave-2-error-codes.md::WS-GAP-05`.
+**Cross-reference:** `docs/error-runbooks/wave-2-error-codes.md::WS-GAP-05`.
 
 ### WS-GAP-06 — Tick-gap detector fired
 
@@ -108,7 +108,7 @@
   1. Inspect the `top_10_samples` field on the event.
   2. If symbols cluster on one segment → Dhan-side outage; wait or escalate to Dhan support.
   3. If scattered → check `tv_websocket_connections_active` (1 expected under Phase 0 lock).
-**Cross-reference:** `.claude/rules/project/wave-2-error-codes.md::WS-GAP-06`.
+**Cross-reference:** `docs/error-runbooks/wave-2-error-codes.md::WS-GAP-06`.
 
 ## Auth / Dhan API codes
 
@@ -117,14 +117,14 @@
 **Symptom:** Disconnect code 807 in Dhan packet → automatic token refresh.
 **Cause:** JWT crossed 24h validity window mid-session.
 **Fix:** Token manager auto-refreshes via Valkey cache → SSM → TOTP regen.
-**Cross-reference:** `.claude/rules/project/wave-2-error-codes.md::AUTH-GAP-02`.
+**Cross-reference:** `docs/error-runbooks/wave-2-error-codes.md::AUTH-GAP-02`.
 
 ### AUTH-GAP-03 — Force-renew on WS wake
 
 **Symptom:** Telegram Info "Token force-renewed on WS wake".
 **Cause:** Token had < 4h validity when WS woke from post-close sleep.
 **Fix:** None — preventive auto-action.
-**Cross-reference:** `.claude/rules/project/wave-2-error-codes.md::AUTH-GAP-03`.
+**Cross-reference:** `docs/error-runbooks/wave-2-error-codes.md::AUTH-GAP-03`.
 
 ### DH-901 — Dhan auth error
 
@@ -149,20 +149,20 @@
   1. Inspect Telegram payload for `buffer_entries`, `skipped_no_price`, `skipped_no_expiry`.
   2. If `buffer_entries == 0` → pre-open buffer empty; check IDX_I + NSE_EQ subscriptions for 09:00-09:12.
   3. Decide go/no-go by 09:15 IST.
-**Cross-reference:** `.claude/rules/project/wave-1-error-codes.md::PHASE2-01`.
+**Cross-reference:** `docs/error-runbooks/wave-1-error-codes.md::PHASE2-01`.
 
 ### PHASE2-02 — Phase2EmitGuard dropped
 
 **Symptom:** `tv_phase2_emit_guard_dropped_total` increments; alert fires for 24h.
 **Cause:** Code regression — Phase 2 scheduler returned without calling `emit_complete`/`emit_failed`/`emit_skipped`.
 **Fix:** Find the recent edit to `phase2_scheduler.rs` that added a return path; ensure it calls `guard.emit_*(...)` before returning.
-**Cross-reference:** `.claude/rules/project/wave-1-error-codes.md::PHASE2-02`.
+**Cross-reference:** `docs/error-runbooks/wave-1-error-codes.md::PHASE2-02`.
 
 ### PHASE2-READY-01 — Pre-flight failed at 09:13:01 IST
 
 **Symptom:** Telegram CRITICAL "Phase2ReadinessFailed" naming which of 11 checks failed.
 **Fix:** Each failing check name has a specific runbook (token_expiry_headroom → AUTH-GAP-03; questdb_ilp → BOOT-01/02; etc.). Operator has ~120s before 09:15 open.
-**Cross-reference:** `.claude/rules/project/wave-5-error-codes.md::PHASE2-READY-01`.
+**Cross-reference:** `docs/error-runbooks/wave-5-error-codes.md::PHASE2-READY-01`.
 
 ## previous_close codes
 
@@ -170,21 +170,21 @@
 
 **Symptom:** `tv_prev_close_persist_errors_total` increments.
 **Fix:** `make doctor` confirms QuestDB. If healthy, ILP TCP transient — auto-recovers on next snapshot.
-**Cross-reference:** `.claude/rules/project/wave-1-error-codes.md::PREVCLOSE-01`.
+**Cross-reference:** `docs/error-runbooks/wave-1-error-codes.md::PREVCLOSE-01`.
 
 ### PREVCLOSE-04 — Boot loader degraded
 
 **Symptom:** Telegram WARN/ERROR "PREVCLOSE-04" at boot; OI Change / OI Change % columns show 0.
 **Cause:** QuestDB unreachable OR `previous_close` table empty for the last 7 trading days.
 **Fix:** Run `make refresh-instruments` to re-fetch bhavcopy; restart app. Cascade falls back to 0.0 for the 3 % fields until next boot succeeds.
-**Cross-reference:** `.claude/rules/project/wave-1-error-codes.md::PREVCLOSE-04`.
+**Cross-reference:** `docs/error-runbooks/wave-1-error-codes.md::PREVCLOSE-04`.
 
 ### PREVOI-01 — prev_oi cache empty at boot
 
 **Symptom:** Single WARN at boot only.
 **Cause:** Boot-time bhavcopy + Option Chain prev_oi loader not yet wired (deferred to PR #452).
 **Fix:** None — operator MUST NOT trust OI Change columns on `/api/movers` until #452 ships.
-**Cross-reference:** `.claude/rules/project/wave-1-error-codes.md::PREVOI-01`.
+**Cross-reference:** `docs/error-runbooks/wave-1-error-codes.md::PREVOI-01`.
 
 ## Self-test / SLO codes
 
@@ -192,13 +192,13 @@
 
 **Symptom:** Telegram CRITICAL at 09:16:30 IST naming `failed: [check1, check2, ...]`.
 **Fix:** Each sub-check has a specific runbook (main_feed_active → disaster-recovery.md scenario 6; questdb_connected → BOOT-01/02; token_expiry_headroom → AUTH-GAP-03).
-**Cross-reference:** `.claude/rules/project/wave-3-c-error-codes.md::SELFTEST-02`.
+**Cross-reference:** `docs/error-runbooks/wave-3-c-error-codes.md::SELFTEST-02`.
 
 ### SLO-02 — Composite SLO score degraded
 
 **Symptom:** Telegram HIGH/CRITICAL "RealtimeGuaranteeDegraded/Critical" with `weakest` dimension named.
 **Fix:** Follow the runbook for the named weakest dimension (WS_health, QDB_health, Tick_freshness, Token_freshness, Spill_health, Phase2_health). Do NOT try to "fix the composite" — fix the underlying typed code.
-**Cross-reference:** `.claude/rules/project/wave-3-d-error-codes.md::SLO-02`.
+**Cross-reference:** `docs/error-runbooks/wave-3-d-error-codes.md::SLO-02`.
 
 ## Storage / audit codes
 
@@ -206,13 +206,13 @@
 
 **Symptom:** `STORAGE-GAP-03` umbrella + specific AUDIT-NN.
 **Fix:** Check QuestDB ILP TCP + disk-full state. Ring buffer absorbs transient failures.
-**Cross-reference:** `.claude/rules/project/wave-2-error-codes.md::STORAGE-GAP-03`.
+**Cross-reference:** `docs/error-runbooks/wave-2-error-codes.md::STORAGE-GAP-03`.
 
 ### STORAGE-GAP-05 — Disk-full pre-flight failed (HALTING)
 
 **Symptom:** Telegram CRITICAL; app exited or refuses spill writes.
 **Fix:** `df -h /data` — free space. Move old spill files to S3 cold archive OR enlarge EBS.
-**Cross-reference:** `.claude/rules/project/wave-4-error-codes.md::STORAGE-GAP-05`.
+**Cross-reference:** `docs/error-runbooks/wave-4-error-codes.md::STORAGE-GAP-05`.
 
 ## Performance / hot-path codes
 
@@ -221,7 +221,7 @@
 **Symptom:** Telegram HIGH at boot; `tv_core_pinning_workers_pinned_total < 4`.
 **Cause:** Host has < 4 logical cores OR cgroup cpuset rejects pin OR not running on t4g.medium / equivalent.
 **Fix:** `nproc` ≥ 4 required; container needs `--cpuset-cpus=0-3` equivalent.
-**Cross-reference:** `.claude/rules/project/wave-5-error-codes.md::CORE-PIN-01`.
+**Cross-reference:** `docs/error-runbooks/wave-5-error-codes.md::CORE-PIN-01`.
 
 ### CORE-PIN-02 — Worker drifted off core
 
@@ -232,7 +232,7 @@
 
 **Symptom:** Telegram HIGH; prev_close cache writer task errored.
 **Fix:** `df -h data/instrument-cache/`; check mount + permissions. Writer self-recovers on next cache update.
-**Cross-reference:** `.claude/rules/project/wave-1-error-codes.md::HOT-PATH-01`.
+**Cross-reference:** `docs/error-runbooks/wave-1-error-codes.md::HOT-PATH-01`.
 
 ### HOT-PATH-02 — Prev-close writer queue full
 
@@ -248,7 +248,7 @@
   1. Confirm parser byte offsets (Quote bytes 22-25, Full bytes 22-25) are correct.
   2. Run the monotonicity SELECT from `docs/operator/track-2-monotonicity-select.md`.
   3. If reproducible → escalate Dhan via the draft email from PR #414.
-**Cross-reference:** `.claude/rules/project/wave-5-error-codes.md::VOLUME-MONO-01`.
+**Cross-reference:** `docs/error-runbooks/wave-5-error-codes.md::VOLUME-MONO-01`.
 
 ### I-P1-11 — Cross-segment SecurityId collision
 
@@ -266,7 +266,7 @@
   * `send_failed` → check Telegram bot API health, SSM bot-token validity.
   * `coalesced_sample_capped` → a single topic firing > 10×/60s; investigate the noisy subsystem.
   * `noop_mode` → SSM unavailable at boot; `make doctor` is RED.
-**Cross-reference:** `.claude/rules/project/wave-3-error-codes.md::TELEGRAM-01`.
+**Cross-reference:** `docs/error-runbooks/wave-3-error-codes.md::TELEGRAM-01`.
 
 ## When you don't know the ErrorCode
 

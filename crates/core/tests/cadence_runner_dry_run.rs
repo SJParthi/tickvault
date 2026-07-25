@@ -260,7 +260,13 @@ fn deps_with(
     Arc<Notify>,
 ) {
     let shutdown = Arc::new(Notify::new());
-    let config = CadenceConfig::default();
+    // This suite pins the kill-switch-OFF legacy shape (B1 defines OFF as
+    // byte-equivalent pre-ladder behavior).
+    let config = CadenceConfig {
+        native_retry_enabled: false,
+        history_repull_enabled: false, // legacy count pins assume no repull spawn
+        ..CadenceConfig::default()
+    };
     let gates = test_gates(&config);
     let deps = CadenceRunnerDeps {
         config,
@@ -1230,6 +1236,7 @@ async fn test_cadence_runner_expiry_disagreement_dhan_wins_both_lanes() {
         match req.broker {
             Feed::Dhan => Ok(vec![20_260_716]),
             Feed::Groww => Ok(vec![20_260_717]),
+            Feed::Truedata => unreachable!("cadence has no TrueData lane"),
         }
     }
     let log = Arc::new(Mutex::new(Vec::new()));

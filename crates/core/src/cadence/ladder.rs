@@ -295,6 +295,22 @@ pub fn failure_arms_ladder(err: &CadenceFetchError) -> bool {
     matches!(err, CadenceFetchError::RateLimited { .. })
 }
 
+/// Per-class in-cycle retry budget (the 2026-07-20 amendment eligibility
+/// matrix): Malformed => 0 (never retried); Empty on a SPOT leg => the
+/// native ladder cap (CADENCE_NATIVE_RETRY_MAX_ATTEMPTS, never below
+/// retry_max); everything else — including Empty on the CHAIN leg and
+/// RateLimited — => the legacy retry_max.
+#[must_use]
+pub fn late_retry_budget(err: &CadenceFetchError, leg_is_chain: bool, retry_max: u32) -> u32 {
+    match err {
+        CadenceFetchError::Malformed => 0,
+        CadenceFetchError::Empty if !leg_is_chain => {
+            retry_max.max(tickvault_common::constants::CADENCE_NATIVE_RETRY_MAX_ATTEMPTS as u32)
+        }
+        _ => retry_max,
+    }
+}
+
 /// May a failed request be retried IN-CYCLE? (design §3(b); RateLimited
 /// arm reversed by the operator's 2026-07-16 correction.)
 ///
@@ -311,18 +327,15 @@ pub fn failure_arms_ladder(err: &CadenceFetchError) -> bool {
 ///   otherwise the retry could only produce a late (discarded) response.
 #[must_use]
 pub fn may_retry_in_cycle(
-    // Every failure class shares ONE bounded retry budget — including
-    // RateLimited (2026-07-16 correction) and QueueDelay (non-arming
-    // but retryable, F1(iii)); the class parameter stays as the policy
-    // seam (a future class-specific budget changes ONLY this fn).
-    _err: &CadenceFetchError,
+    err: &CadenceFetchError,
+    leg_is_chain: bool,
     retries_used: u32,
     retry_max: u32,
     earliest_fire_ms: i64,
     latency_allowance_ms: i64,
     lane_cutoff_abs_ms: i64,
 ) -> bool {
-    if retries_used >= retry_max {
+    if retries_used >= late_retry_budget(err, leg_is_chain, retry_max) {
         return false;
     }
     earliest_fire_ms.saturating_add(latency_allowance_ms) <= lane_cutoff_abs_ms
@@ -388,6 +401,7 @@ mod tests {
         // "429 kills the leg for the cycle" behavior is REVERSED.
         assert!(may_retry_in_cycle(
             &rate_limited,
+            true,
             0,
             1,
             5_000,
@@ -397,6 +411,7 @@ mod tests {
         // One retry per leg per cycle, never more.
         assert!(!may_retry_in_cycle(
             &rate_limited,
+            true,
             1,
             1,
             5_000,
@@ -421,6 +436,7 @@ mod tests {
         // An Empty IS still retryable in-cycle (one gated attempt).
         assert!(may_retry_in_cycle(
             &CadenceFetchError::Empty,
+            true,
             0,
             1,
             5_000,
@@ -433,14 +449,14 @@ mod tests {
     fn test_may_retry_in_cycle_respects_gate_and_cutoff() {
         let e = CadenceFetchError::Transport;
         // Budget exhausted → no retry.
-        assert!(!may_retry_in_cycle(&e, 1, 1, 5_000, 1_500, 60_000));
+        assert!(!may_retry_in_cycle(&e, true, 1, 1, 5_000, 1_500, 60_000));
         // Gate's earliest instant + latency allowance past the cutoff →
         // the retry could only be a late response → refused.
-        assert!(!may_retry_in_cycle(&e, 0, 1, 14_000, 1_500, 15_000));
+        assert!(!may_retry_in_cycle(&e, true, 0, 1, 14_000, 1_500, 15_000));
         // Landing exactly AT the cutoff is admitted (inclusive).
-        assert!(may_retry_in_cycle(&e, 0, 1, 13_500, 1_500, 15_000));
+        assert!(may_retry_in_cycle(&e, true, 0, 1, 13_500, 1_500, 15_000));
         // Room + budget → retry through the gates.
-        assert!(may_retry_in_cycle(&e, 0, 1, 5_000, 1_500, 15_000));
+        assert!(may_retry_in_cycle(&e, true, 0, 1, 5_000, 1_500, 15_000));
     }
 
     #[test]
@@ -473,6 +489,7 @@ mod tests {
         // the window; one more gated attempt is legitimate).
         assert!(may_retry_in_cycle(
             &CadenceFetchError::QueueDelay,
+            true,
             0,
             1,
             5_000,
@@ -805,5 +822,45 @@ mod tests {
         assert_eq!(groww_wave_indices(2), (1, 2, 3));
         // Clamp past the max = choice 3.
         assert_eq!(groww_wave_indices(7), (1, 2, 3));
+    }
+
+    #[test]
+    fn test_late_retry_eligibility_set_pinned() {
+        use tickvault_common::constants::CADENCE_NATIVE_RETRY_MAX_ATTEMPTS;
+        let retry_max = 1u32;
+        // Malformed: never retried, either leg.
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::Malformed, false, retry_max),
+            0
+        );
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::Malformed, true, retry_max),
+            0
+        );
+        // Empty on a SPOT leg: the native ladder cap.
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::Empty, false, retry_max),
+            CADENCE_NATIVE_RETRY_MAX_ATTEMPTS as u32
+        );
+        // Empty on the CHAIN leg: legacy budget.
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::Empty, true, retry_max),
+            1
+        );
+        // RateLimited: legacy budget both legs (429 is budget-spend, never budget-grow).
+        let rl = CadenceFetchError::RateLimited {
+            retry_after_ms: None,
+        };
+        assert_eq!(late_retry_budget(&rl, false, retry_max), retry_max);
+        assert_eq!(late_retry_budget(&rl, true, retry_max), retry_max);
+        // Remaining classes: legacy budget.
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::Timeout, false, retry_max),
+            retry_max
+        );
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::QueueDelay, false, retry_max),
+            retry_max
+        );
     }
 }

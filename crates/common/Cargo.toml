@@ -50,7 +50,7 @@ tokio = { workspace = true }
 # rustls-webpki 0.101.7 also remains, pulled in by tokio-rustls 0.24.1
 # which is a deep AWS SDK transitive (aws-smithy-http-client 1.1.12).
 # Bumping the AWS SDK suite is a major change deferred to its own PR.
-aws-lc-sys = "0.42.0"
+aws-lc-sys = "0.43.0"
 aws-lc-rs = "1.17.0"
 rustls-webpki = "0.103.13"
 rand = "0.10.1"
