@@ -29,6 +29,7 @@ pub mod truedata;
 pub mod truedata_aux;
 pub mod truedata_json;
 pub mod truedata_requests;
+pub mod truedata_router;
 pub mod truedata_session;
 pub mod types;
 
