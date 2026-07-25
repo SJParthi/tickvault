@@ -60,6 +60,39 @@ pub const TD_MSG_CODE_HEARTBEAT: u8 = b'H';
 /// Binary message-code byte for a market-status push (v2.6 p.11-12).
 pub const TD_MSG_CODE_MARKET_STATUS: u8 = b'M';
 
+// The codes below are NOT in the v2.6 PDF's binary tables — they were
+// recovered from the OFFICIAL Python SDK's `msg_map`
+// (truedata 7.0.1, `truedata/websocket/compression_map.py`), which is the
+// authoritative decoder TrueData ships. Every offset in that map for `T`,
+// `A`, `H` and `M` matches this module byte-for-byte, so the map is
+// trustworthy for the codes the PDF omits.
+
+/// Trade WITHOUT the bid/ask block — a DISTINCT message code, not a short
+/// `T` frame.
+///
+/// This is the single most important discovery from the SDK map: when an
+/// account has bid/ask disabled, TrueData does NOT send a truncated `T` —
+/// it sends `W`. Treating the no-bid/ask case as a length variant of `T`
+/// (which the PDF's tables alone would lead you to do) means every tick on
+/// such an account is dropped as an unknown code.
+pub const TD_MSG_CODE_TRADE_NO_BIDASK: u8 = b'W';
+/// Standalone bid/ask (L1) message.
+pub const TD_MSG_CODE_BIDASK: u8 = b'B';
+/// BSE 5-level depth message.
+pub const TD_MSG_CODE_BIDASK_L2: u8 = b'D';
+/// Option greeks (requires backend enablement).
+pub const TD_MSG_CODE_GREEKS: u8 = b'G';
+/// 1-minute bar (requires backend enablement; we derive our own).
+pub const TD_MSG_CODE_BAR_1MIN: u8 = b'O';
+/// 5-minute bar (requires backend enablement; we derive our own).
+pub const TD_MSG_CODE_BAR_5MIN: u8 = b'F';
+/// `addsymbol` acknowledgement — carries the learned SymbolIDs.
+pub const TD_MSG_CODE_SYMBOLS_ADDED: u8 = b'S';
+/// Touchline snapshot.
+pub const TD_MSG_CODE_TOUCHLINE: u8 = b'L';
+/// `removesymbol` acknowledgement.
+pub const TD_MSG_CODE_SYMBOLS_REMOVED: u8 = b'R';
+
 /// First byte of a JSON frame — the JSON-vs-binary sniff (§10.6 #1).
 pub const TD_JSON_SNIFF_BYTE: u8 = b'{';
 
@@ -77,17 +110,15 @@ pub const TD_MARKET_STATUS_BINARY_LEN: usize = 62;
 /// Trade frame WITH bid/ask — 90 bytes (v2.6 p.16, "Total Bytes 90").
 pub const TD_TRADE_BINARY_LEN_FULL: usize = 90;
 
-/// Trade frame WITHOUT bid/ask — 74 bytes.
+/// Trade frame WITHOUT bid/ask — 74 bytes, message code `W`.
 ///
-/// **INFERRED, not vendor-documented.** v2.6 p.16 tabulates only the
-/// 90-byte (bid/ask-active) binary trade. The JSON trade message, however,
-/// is documented in BOTH a 19-field (with bid/ask) and a 15-field (without)
-/// form (p.16-17), and bid/ask is opt-out per account (p.15) — so a
-/// bid/ask-disabled binary frame would end immediately after
-/// `Sequence No` (offset 70 + 4 = 74). We accept that length defensively
-/// and report `bid`/`ask` as `None`; we never index past 74 on such a
-/// frame. If the vendor confirms bid/ask-off binary frames are still
-/// 90 bytes (zero-filled), this arm simply never fires.
+/// **CONFIRMED by the official Python SDK** (`truedata` 7.0.1,
+/// `truedata/websocket/compression_map.py`): `msg_map["W"]` lists exactly
+/// 16 fields ending at `seq_no` (offset 70, 4 bytes) — 74 total — with
+/// byte-identical offsets to `T` for every shared field. v2.6 p.16
+/// tabulates only the 90-byte `T` form, so this length was originally
+/// INFERRED here; the SDK map upgrades it to Verified and, critically,
+/// showed it arrives under its OWN code rather than as a short `T`.
 pub const TD_TRADE_BINARY_LEN_QUOTE_ONLY: usize = 74;
 
 // ---------------------------------------------------------------------------
@@ -230,8 +261,23 @@ pub enum TruedataFrameKind {
     Json,
     /// Binary authentication response (128 B).
     AuthBinary,
-    /// Binary trade/tick (90 B, or 74 B without bid/ask).
+    /// Binary trade/tick WITH bid/ask (90 B, code `T`).
     TradeBinary,
+    /// Binary trade/tick WITHOUT bid/ask (74 B, code `W`) — a distinct
+    /// code, not a truncated `T`.
+    TradeNoBidAskBinary,
+    /// Standalone L1 bid/ask (code `B`).
+    BidAskBinary,
+    /// BSE 5-level depth (code `D`).
+    BidAskL2Binary,
+    /// Option greeks (code `G`).
+    GreeksBinary,
+    /// 1-minute or 5-minute bar (codes `O` / `F`).
+    BarBinary,
+    /// `addsymbol` / `removesymbol` acknowledgement (codes `S` / `R`).
+    SymbolAck,
+    /// Touchline snapshot (code `L`).
+    TouchlineBinary,
     /// Binary heartbeat (10 B).
     HeartbeatBinary,
     /// Binary market-status push (62 B).
@@ -257,6 +303,13 @@ pub fn classify_frame(raw: &[u8]) -> Result<TruedataFrameKind, TruedataDecodeErr
         TD_MSG_CODE_TRADE => Ok(TruedataFrameKind::TradeBinary),
         TD_MSG_CODE_HEARTBEAT => Ok(TruedataFrameKind::HeartbeatBinary),
         TD_MSG_CODE_MARKET_STATUS => Ok(TruedataFrameKind::MarketStatusBinary),
+        TD_MSG_CODE_TRADE_NO_BIDASK => Ok(TruedataFrameKind::TradeNoBidAskBinary),
+        TD_MSG_CODE_BIDASK => Ok(TruedataFrameKind::BidAskBinary),
+        TD_MSG_CODE_BIDASK_L2 => Ok(TruedataFrameKind::BidAskL2Binary),
+        TD_MSG_CODE_GREEKS => Ok(TruedataFrameKind::GreeksBinary),
+        TD_MSG_CODE_BAR_1MIN | TD_MSG_CODE_BAR_5MIN => Ok(TruedataFrameKind::BarBinary),
+        TD_MSG_CODE_SYMBOLS_ADDED | TD_MSG_CODE_SYMBOLS_REMOVED => Ok(TruedataFrameKind::SymbolAck),
+        TD_MSG_CODE_TOUCHLINE => Ok(TruedataFrameKind::TouchlineBinary),
         other => Err(TruedataDecodeError::UnknownMsgCode(other)),
     }
 }
@@ -281,27 +334,34 @@ pub fn classify_frame(raw: &[u8]) -> Result<TruedataFrameKind, TruedataDecodeErr
 pub fn decode_trade_binary(raw: &[u8]) -> Result<TruedataTrade, TruedataDecodeError> {
     // Classify first so a JSON frame is declined cleanly rather than being
     // read as garbage bytes.
-    match classify_frame(raw)? {
+    // BOTH trade codes are accepted: `T` carries bid/ask, `W` does not.
+    // They are DISTINCT message codes (official SDK msg_map), not a length
+    // variant of one code — rejecting `W` would silently drop every tick on
+    // a bid/ask-disabled account.
+    let msg_code = match classify_frame(raw)? {
         TruedataFrameKind::Json => return Err(TruedataDecodeError::IsJson),
-        TruedataFrameKind::TradeBinary => {}
+        TruedataFrameKind::TradeBinary => TD_MSG_CODE_TRADE,
+        TruedataFrameKind::TradeNoBidAskBinary => TD_MSG_CODE_TRADE_NO_BIDASK,
         _ => {
             // Non-trade binary frame handed to the trade decoder.
             let code = raw.first().copied().unwrap_or(0);
             return Err(TruedataDecodeError::UnknownMsgCode(code));
         }
-    }
+    };
 
     let len = raw.len();
-    let has_bid_ask = match len {
-        TD_TRADE_BINARY_LEN_FULL => true,
-        TD_TRADE_BINARY_LEN_QUOTE_ONLY => false,
-        _ => {
-            return Err(TruedataDecodeError::UnexpectedLength {
-                msg_code: TD_MSG_CODE_TRADE,
-                len,
-            });
-        }
+    // The code decides whether a bid/ask block EXISTS; the length is then
+    // validated against what that code must carry. A `T` of 74 bytes or a
+    // `W` of 90 is malformed, not a silent reinterpretation.
+    let has_bid_ask = msg_code == TD_MSG_CODE_TRADE;
+    let expected_len = if has_bid_ask {
+        TD_TRADE_BINARY_LEN_FULL
+    } else {
+        TD_TRADE_BINARY_LEN_QUOTE_ONLY
     };
+    if len != expected_len {
+        return Err(TruedataDecodeError::UnexpectedLength { msg_code, len });
+    }
 
     // Length is now proven >= 74, so every offset below is in bounds.
     let (bid, bid_qty, ask, ask_qty) = if has_bid_ask {
@@ -552,13 +612,15 @@ mod tests {
         seq_no: i32,
         bid_ask: Option<(f32, i32, f32, i32)>,
     ) -> Vec<u8> {
-        let len = if bid_ask.is_some() {
-            TD_TRADE_BINARY_LEN_FULL
+        // The SDK's `msg_map` uses two DISTINCT codes, not one code with two
+        // lengths: 'T' carries bid/ask (90 B), 'W' does not (74 B).
+        let (len, code) = if bid_ask.is_some() {
+            (TD_TRADE_BINARY_LEN_FULL, TD_MSG_CODE_TRADE)
         } else {
-            TD_TRADE_BINARY_LEN_QUOTE_ONLY
+            (TD_TRADE_BINARY_LEN_QUOTE_ONLY, TD_MSG_CODE_TRADE_NO_BIDASK)
         };
         let mut f = vec![0_u8; len];
-        f[OFF_MSG_CODE] = TD_MSG_CODE_TRADE;
+        f[OFF_MSG_CODE] = code;
         f[OFF_SYMBOL_ID..OFF_SYMBOL_ID + 4].copy_from_slice(&symbol_id.to_le_bytes());
         f[OFF_TIMESTAMP..OFF_TIMESTAMP + 4].copy_from_slice(&timestamp.to_le_bytes());
         f[OFF_LTP..OFF_LTP + 4].copy_from_slice(&ltp.to_le_bytes());
@@ -700,6 +762,33 @@ mod tests {
         assert_eq!(t.bid_qty, None);
         assert_eq!(t.ask, None);
         assert_eq!(t.ask_qty, None);
+    }
+
+    #[test]
+    fn test_decode_trade_binary_length_is_dispatched_by_msg_code_not_by_length() {
+        // The SDK's msg_map is keyed by CODE: 'T' is ALWAYS 90 bytes, 'W' is
+        // ALWAYS 74. A 74-byte 'T' or a 90-byte 'W' is a malformed frame, and
+        // must be rejected rather than silently reinterpreted — otherwise a
+        // truncated 'T' would decode with garbage bid/ask absent.
+        let mut short_t = vec![0_u8; TD_TRADE_BINARY_LEN_QUOTE_ONLY];
+        short_t[OFF_MSG_CODE] = TD_MSG_CODE_TRADE;
+        assert_eq!(
+            decode_trade_binary(&short_t),
+            Err(TruedataDecodeError::UnexpectedLength {
+                msg_code: TD_MSG_CODE_TRADE,
+                len: TD_TRADE_BINARY_LEN_QUOTE_ONLY
+            })
+        );
+
+        let mut long_w = vec![0_u8; TD_TRADE_BINARY_LEN_FULL];
+        long_w[OFF_MSG_CODE] = TD_MSG_CODE_TRADE_NO_BIDASK;
+        assert_eq!(
+            decode_trade_binary(&long_w),
+            Err(TruedataDecodeError::UnexpectedLength {
+                msg_code: TD_MSG_CODE_TRADE_NO_BIDASK,
+                len: TD_TRADE_BINARY_LEN_FULL
+            })
+        );
     }
 
     #[test]
@@ -985,7 +1074,7 @@ pub struct TruedataAuth<'a> {
 /// strips surrounding whitespace. Lossy on non-UTF-8 bytes is NOT used —
 /// invalid UTF-8 yields an empty field rather than a panic or an alloc.
 #[inline]
-fn fixed_str(raw: &[u8], offset: usize, len: usize) -> &str {
+pub(super) fn fixed_str(raw: &[u8], offset: usize, len: usize) -> &str {
     let end = offset.saturating_add(len).min(raw.len());
     if offset >= end {
         return "";
