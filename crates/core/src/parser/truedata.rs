@@ -594,6 +594,65 @@ pub const fn saturate_tot_volume(tot_volume: i64) -> (u32, bool) {
     }
 }
 
+/// Saturating conversion of TrueData's 4-byte `Volume` (the LTQ — this
+/// trade's own quantity) to the shared `ParsedTick.last_trade_quantity`
+/// width (`u16`).
+///
+/// **This is the narrowest conversion in the whole feed and the easiest to
+/// get silently wrong.** `u16` tops out at 65,535. A single 100,000-share
+/// equity print — an ordinary block trade — would wrap under a bare
+/// `as u16` to **34,464**, and a negative (corrupt) value would wrap to
+/// something arbitrary. Either way the number looks perfectly reasonable,
+/// lands in a candle, and nothing anywhere says it was altered.
+///
+/// Returns `(value, saturated)` so the caller increments
+/// `tv_truedata_ltq_saturated_total` and emits a coded warning naming the
+/// symbol. A capped quantity is then a visible, counted degradation rather
+/// than an invisible wrong number.
+///
+/// Widening the SHARED `ParsedTick.last_trade_quantity` to `u32` is the
+/// real fix and is a separately-scoped cross-feed change (Dhan and Groww
+/// both write this field, plus the ILP schema and a DHAT re-measure), so it
+/// is deliberately NOT bundled here.
+#[inline]
+#[must_use]
+pub const fn saturate_last_trade_qty(ltq: i32) -> (u16, bool) {
+    if ltq < 0 {
+        // The vendor sends this field as a traded quantity; negative means
+        // a corrupt or mis-framed read. Clamped AND flagged, for the same
+        // reason as `saturate_tot_volume`.
+        (0, true)
+    } else if ltq > u16::MAX as i32 {
+        (u16::MAX, true)
+    } else {
+        (ltq as u16, false)
+    }
+}
+
+/// Converts TrueData's signed 4-byte exchange timestamp to the shared
+/// `ParsedTick.exchange_timestamp` width (`u32`).
+///
+/// A bare `as u32` turns a negative (corrupt) timestamp into roughly
+/// 4.29 billion — **the year 2106**. The tick then lands in a far-future
+/// partition where nobody will ever look at it, and no error is raised:
+/// the row is simply gone from every practical query while appearing to
+/// have been written successfully.
+///
+/// Returns `(value, rejected)`. `rejected` means the timestamp was not
+/// representable and the caller must DROP the tick rather than persist it
+/// — unlike the quantity saturations above, there is no meaningful clamped
+/// value for a broken timestamp, and a tick with a fabricated time is worse
+/// than no tick.
+#[inline]
+#[must_use]
+pub const fn narrow_exchange_timestamp(timestamp_secs: i32) -> (u32, bool) {
+    if timestamp_secs < 0 {
+        (0, true)
+    } else {
+        (timestamp_secs as u32, false)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sequence-gap detection (the vendor loss proof)
 // ---------------------------------------------------------------------------
@@ -1103,6 +1162,73 @@ mod tests {
         // zero-volume print — invisible corruption, the worst class.
         assert_eq!(saturate_tot_volume(-1), (0, true));
         assert_eq!(saturate_tot_volume(i64::MIN), (0, true));
+    }
+
+    #[test]
+    fn test_saturate_last_trade_qty_caps_an_ordinary_block_trade_visibly() {
+        // 100,000 shares is an ordinary equity block print, and it does NOT
+        // fit in u16. A bare `as u16` gives 34,464 — a plausible-looking
+        // number that would land in a candle with nothing flagging it.
+        assert_eq!(saturate_last_trade_qty(100_000), (u16::MAX, true));
+        assert_eq!(
+            100_000_i32 as u16, 34_464,
+            "documents the wrap this function exists to prevent"
+        );
+    }
+
+    #[test]
+    fn test_saturate_last_trade_qty_boundaries_and_corruption() {
+        assert_eq!(saturate_last_trade_qty(0), (0, false));
+        assert_eq!(saturate_last_trade_qty(1), (1, false));
+        assert_eq!(
+            saturate_last_trade_qty(i32::from(u16::MAX)),
+            (u16::MAX, false),
+            "exactly at the cap is NOT a saturation"
+        );
+        assert_eq!(
+            saturate_last_trade_qty(i32::from(u16::MAX) + 1),
+            (u16::MAX, true),
+            "one past the cap IS"
+        );
+        assert_eq!(saturate_last_trade_qty(-1), (0, true));
+        assert_eq!(saturate_last_trade_qty(i32::MIN), (0, true));
+        assert_eq!(saturate_last_trade_qty(i32::MAX), (u16::MAX, true));
+    }
+
+    #[test]
+    fn test_narrow_exchange_timestamp_rejects_rather_than_inventing_2106() {
+        // `as u32` on a negative timestamp yields ~4.29e9 — the year 2106.
+        // The tick then lands in a partition nobody queries, with no error:
+        // effectively deleted while appearing written.
+        assert_eq!(narrow_exchange_timestamp(-1), (0, true));
+        assert_eq!(narrow_exchange_timestamp(i32::MIN), (0, true));
+        assert_eq!(
+            -1_i32 as u32, 4_294_967_295,
+            "documents the far-future value this function exists to prevent"
+        );
+        // Real timestamps pass through untouched.
+        assert_eq!(narrow_exchange_timestamp(0), (0, false));
+        assert_eq!(
+            narrow_exchange_timestamp(1_608_115_952),
+            (1_608_115_952, false)
+        );
+        assert_eq!(
+            narrow_exchange_timestamp(i32::MAX),
+            (2_147_483_647, false),
+            "the largest representable stamp is still valid, not rejected"
+        );
+    }
+
+    #[test]
+    fn test_narrow_exchange_timestamp_rejection_is_distinct_from_a_real_zero() {
+        // Epoch zero is a legitimate (if odd) value and must not be
+        // confused with the rejection sentinel — the flag carries the
+        // verdict, never the value.
+        let (value_ok, rejected_ok) = narrow_exchange_timestamp(0);
+        let (value_bad, rejected_bad) = narrow_exchange_timestamp(-5);
+        assert_eq!(value_ok, value_bad, "both clamp to the same value");
+        assert!(!rejected_ok, "a real zero is accepted");
+        assert!(rejected_bad, "a corrupt one is rejected");
     }
 
     #[test]
