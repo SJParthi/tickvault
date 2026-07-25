@@ -56,6 +56,41 @@ pub const TD_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(TD_RECONNECT_
 /// The vendor's duplicate-login refusal message (v2.6 p.10, verbatim).
 pub const TD_MSG_ALREADY_CONNECTED: &str = "User Already Connected";
 
+/// The distinctive core of the refusal, matched case-insensitively.
+///
+/// Matching the FULL literal exactly is brittle: the wire text is
+/// UNVERIFIED-LIVE, and any casing or surrounding-wording drift would send
+/// a ghost-session refusal down the ordinary backoff ladder — we would
+/// never force-logout, and the ghost would hold the single login silently
+/// for the whole session.
+pub const TD_MSG_ALREADY_CONNECTED_CORE: &str = "already connected";
+
+/// How many force-logouts one session may fire before parking.
+///
+/// The ghost-clearing cycle (refused → force-logout → 1-minute wait →
+/// retry) must terminate. If a real peer holds the key, evicting them every
+/// minute just means we evict each other forever and neither side keeps a
+/// session. After this many attempts the machine parks and pages instead.
+pub const TD_MAX_FORCE_LOGOUTS_PER_SESSION: u32 = 3;
+
+/// Case-insensitive ASCII substring test, allocation-free.
+///
+/// `to_lowercase()` would allocate; this is used on an auth-refusal path
+/// that a hostile or flapping server can drive repeatedly.
+#[must_use]
+pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() || n.len() > h.len() {
+        return false;
+    }
+    // O(1) EXEMPT: begin
+    // Substring search inherently compares bytes. Both operands are bounded
+    // by a vendor auth message (tens of bytes) and a compile-time literal;
+    // this is the cold connect path, never the per-tick hot path.
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+    // O(1) EXEMPT: end
+}
+
 // ---------------------------------------------------------------------------
 // Connect URL (secret-bearing)
 // ---------------------------------------------------------------------------
@@ -216,6 +251,11 @@ fn push_query_escaped(out: &mut String, raw: &str) {
 /// Why a connect attempt was refused by the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectRefusal {
+    /// The force-logout budget is spent and a ghost still holds the login.
+    ///
+    /// Terminal for this session — something outside this process owns the
+    /// key, and more attempts cannot fix it. The operator is paged.
+    GhostBudgetExhausted,
     /// A force-logout is in its mandatory cooldown; connecting now would
     /// be refused by the vendor and would restart the whole cycle.
     CoolingDown {
@@ -240,6 +280,15 @@ pub enum ConnectRefusal {
 pub enum SessionState {
     /// Not connected, no timer pending — connect immediately.
     Idle,
+    /// A connect attempt is IN FLIGHT (socket opening / authenticating).
+    ///
+    /// Without this state the machine sits in `Idle` for the whole
+    /// handshake, so a second caller — a retry timer firing under a slow
+    /// TLS negotiation, or a second in-process task — gets `Ok` again and
+    /// opens a SECOND socket. The vendor allows one login per key and
+    /// kills the first, so we would be knocking ourselves offline. The SSM
+    /// lock only guards against other PROCESSES; this guards against us.
+    Connecting,
     /// Connected and authenticated.
     Connected,
     /// Waiting out a reconnect backoff step.
@@ -259,6 +308,15 @@ pub enum SessionState {
         /// Elapsed seconds of the cooldown.
         waited_secs: u64,
     },
+    /// The force-logout budget is spent and a ghost still holds the login.
+    ///
+    /// A terminal state on purpose. Something outside this process owns the
+    /// key; hammering the vendor cannot fix it, so the machine parks and
+    /// the operator is paged.
+    ParkedGhost {
+        /// How many force-logouts were fired before parking.
+        force_logouts: u32,
+    },
 }
 
 /// The session driver: one clock, one state, no racing timers.
@@ -266,6 +324,13 @@ pub enum SessionState {
 pub struct TruedataSession {
     state: SessionState,
     lock_held: bool,
+    /// Force-logouts fired so far in this session.
+    ///
+    /// Deliberately a SESSION field rather than a `CoolingDown` payload:
+    /// the cooldown expiring transitions to `Idle`, which would DISCARD a
+    /// state-carried count and reset the budget to zero on every cycle —
+    /// the ghost loop would still be unbounded, just less obviously.
+    force_logouts: u32,
 }
 
 impl Default for TruedataSession {
@@ -281,6 +346,7 @@ impl TruedataSession {
         Self {
             state: SessionState::Idle,
             lock_held: false,
+            force_logouts: 0,
         }
     }
 
@@ -313,6 +379,7 @@ impl TruedataSession {
     /// A [`ConnectRefusal`] describing why the attempt is not allowed yet.
     pub const fn may_connect(&self) -> Result<(), ConnectRefusal> {
         match self.state {
+            SessionState::ParkedGhost { .. } => Err(ConnectRefusal::GhostBudgetExhausted),
             SessionState::CoolingDown { waited_secs } => Err(ConnectRefusal::CoolingDown {
                 remaining_secs: TD_FORCE_LOGOUT_COOLDOWN
                     .as_secs()
@@ -325,7 +392,9 @@ impl TruedataSession {
             } if waited_secs < step_secs => Err(ConnectRefusal::Backoff {
                 remaining_secs: step_secs.saturating_sub(waited_secs),
             }),
-            SessionState::Connected => Err(ConnectRefusal::AlreadyConnected),
+            SessionState::Connected | SessionState::Connecting => {
+                Err(ConnectRefusal::AlreadyConnected)
+            }
             _ if !self.lock_held => Err(ConnectRefusal::LockNotHeld),
             _ => Ok(()),
         }
@@ -360,17 +429,56 @@ impl TruedataSession {
         };
     }
 
-    /// Marks the session authenticated. Resets the failure ladder.
+    /// Marks a connect attempt as STARTED.
+    ///
+    /// Call this the moment the socket open is initiated, so a concurrent
+    /// caller sees `Connecting` and is refused instead of opening a second
+    /// socket on the same one-login key.
+    pub const fn on_connect_started(&mut self) {
+        match self.state {
+            // The cooldown and the parked state outrank everything.
+            SessionState::CoolingDown { .. } | SessionState::ParkedGhost { .. } => {}
+            _ => self.state = SessionState::Connecting,
+        }
+    }
+
+    /// Marks the session authenticated.
+    ///
+    /// A no-op during the cooldown or once parked: a stale success
+    /// callback from a socket that was already being torn down must not
+    /// cancel the vendor's mandatory wait.
     pub const fn on_connected(&mut self) {
-        self.state = SessionState::Connected;
+        match self.state {
+            SessionState::CoolingDown { .. } | SessionState::ParkedGhost { .. } => {}
+            _ => self.state = SessionState::Connected,
+        }
     }
 
     /// Records a connection/auth failure and schedules the next backoff.
     ///
     /// The ladder doubles from [`TD_RECONNECT_BACKOFF_MIN`] and saturates
     /// at [`TD_RECONNECT_BACKOFF_MAX`] — bounded, never a tight loop.
+    /// Records a connection/auth failure and schedules the next backoff.
+    ///
+    /// The ladder doubles from [`TD_RECONNECT_BACKOFF_MIN`] and saturates
+    /// at [`TD_RECONNECT_BACKOFF_MAX`] — bounded, never a tight loop.
+    ///
+    /// # The cooldown outranks this
+    ///
+    /// While [`SessionState::CoolingDown`] (or parked) this is a NO-OP, and
+    /// that is the whole point. The natural ordering after a
+    /// `User Already Connected` refusal is: refusal → force-logout →
+    /// cooldown → **and then the socket closes**, because we were just
+    /// refused. That close calls this method. If it overwrote the cooldown
+    /// with a 5-second backoff, we would log in again 5 seconds into the
+    /// vendor's mandatory 1-minute wait, be refused, force-logout again —
+    /// a ~5s reconnect storm for the entire session, hammering the vendor's
+    /// force-logout endpoint hundreds of times an hour and never obtaining
+    /// the one login. Exactly the bug this module exists to prevent.
     pub const fn on_disconnected(&mut self) {
         let attempt = match self.state {
+            // The cooldown and the parked state are not overwritable.
+            SessionState::CoolingDown { .. } | SessionState::ParkedGhost { .. } => return,
             SessionState::Backoff { attempt, .. } => attempt.saturating_add(1),
             _ => 0,
         };
@@ -388,8 +496,47 @@ impl TruedataSession {
     /// thing that matters is the vendor's 1-minute wait, and allowing a
     /// shorter backoff to fire first is exactly the bug this module
     /// exists to prevent.
+    /// Records that a force-logout was fired, entering the mandatory
+    /// cooldown — or parking when the budget is spent.
+    ///
+    /// SUPERSEDES any pending backoff: after a force-logout the only thing
+    /// that matters is the vendor's 1-minute wait.
+    ///
+    /// The count is carried so the ghost-clearing loop terminates. After
+    /// [`TD_MAX_FORCE_LOGOUTS_PER_SESSION`] attempts the machine parks
+    /// instead of cycling forever — if something outside this process owns
+    /// the key, evicting it every minute only means neither side ever
+    /// keeps a session.
     pub const fn on_force_logout_fired(&mut self) {
-        self.state = SessionState::CoolingDown { waited_secs: 0 };
+        self.force_logouts = self.force_logouts.saturating_add(1);
+        self.state = if self.force_logouts >= TD_MAX_FORCE_LOGOUTS_PER_SESSION {
+            SessionState::ParkedGhost {
+                force_logouts: self.force_logouts,
+            }
+        } else {
+            SessionState::CoolingDown { waited_secs: 0 }
+        };
+    }
+
+    /// How many force-logouts this session has fired.
+    #[must_use]
+    pub const fn force_logouts(&self) -> u32 {
+        self.force_logouts
+    }
+
+    /// Drops the connection when the single-session lock is lost.
+    ///
+    /// `set_lock_held(false)` alone only flips the flag — the state stays
+    /// `Connected`, so `may_connect` reports `AlreadyConnected` and a
+    /// caller polling for a drop signal never gets one. We would keep
+    /// streaming WITHOUT the lock while a peer takes it: two processes on
+    /// a one-login key. This forces the disconnect that the flag implies.
+    pub const fn on_lock_lost(&mut self) {
+        self.lock_held = false;
+        match self.state {
+            SessionState::CoolingDown { .. } | SessionState::ParkedGhost { .. } => {}
+            _ => self.state = SessionState::Idle,
+        }
     }
 
     /// Handles a vendor auth refusal.
@@ -401,7 +548,12 @@ impl TruedataSession {
     ///
     /// Returns `true` when the caller should fire the force-logout URL.
     pub fn on_auth_refused(&mut self, message: &str) -> bool {
-        if message.contains(TD_MSG_ALREADY_CONNECTED) {
+        // Case-INSENSITIVE, and matched on the distinctive middle of the
+        // phrase. The exact wire text is UNVERIFIED-LIVE; if casing or
+        // surrounding wording drifts, an exact match would route the ghost
+        // to the ordinary backoff ladder, never force-logout, and the
+        // ghost would hold the login silently for the whole session.
+        if contains_ignore_ascii_case(message, TD_MSG_ALREADY_CONNECTED_CORE) {
             self.on_force_logout_fired();
             true
         } else {
@@ -434,6 +586,10 @@ impl fmt::Display for ConnectRefusal {
             }
             Self::LockNotHeld => write!(f, "single-session lock not held"),
             Self::AlreadyConnected => write!(f, "already connected"),
+            Self::GhostBudgetExhausted => write!(
+                f,
+                "force-logout budget spent ({TD_MAX_FORCE_LOGOUTS_PER_SESSION}) — another process holds this API key"
+            ),
         }
     }
 }
@@ -574,6 +730,219 @@ mod tests {
     #[test]
     fn test_already_connected_message_matches_the_pdf_literal() {
         assert_eq!(TD_MSG_ALREADY_CONNECTED, "User Already Connected");
+    }
+
+    // --- the reconnect-storm class: the cooldown outranks everything ---
+
+    #[test]
+    fn test_on_disconnected_does_not_clobber_the_cooldown() {
+        // THE natural ordering, and the one that used to break: the vendor
+        // refuses, we force-logout and start the mandatory wait, and THEN
+        // the socket closes (it must — we were just refused). That close
+        // used to overwrite the 60s cooldown with a 5s backoff, so we would
+        // log in again 5 seconds into the vendor's wait, be refused, and
+        // repeat for the whole session.
+        let mut s = TruedataSession::new();
+        s.set_lock_held(true);
+        assert!(s.on_auth_refused(TD_MSG_ALREADY_CONNECTED));
+        s.on_disconnected();
+        assert!(
+            matches!(s.state(), SessionState::CoolingDown { .. }),
+            "socket close must not cancel the vendor's mandatory wait, got {:?}",
+            s.state()
+        );
+        // And it must still be refusing well past the old 5s backoff step.
+        s.tick(10);
+        assert!(
+            matches!(s.may_connect(), Err(ConnectRefusal::CoolingDown { .. })),
+            "must still be cooling down 10s in, got {:?}",
+            s.may_connect()
+        );
+    }
+
+    #[test]
+    fn test_on_connected_does_not_clobber_the_cooldown() {
+        // A stale success callback from a socket already being torn down
+        // must not cancel the wait either.
+        let mut s = TruedataSession::new();
+        s.set_lock_held(true);
+        s.on_force_logout_fired();
+        s.on_connected();
+        assert!(matches!(s.state(), SessionState::CoolingDown { .. }));
+    }
+
+    #[test]
+    fn test_cooldown_survives_a_full_disconnect_reconnect_cycle() {
+        // Belt and braces: hammer every event at it for the whole minute
+        // and the machine must refuse every single connect.
+        let mut s = TruedataSession::new();
+        s.set_lock_held(true);
+        s.on_force_logout_fired();
+        for elapsed in 0..59 {
+            s.on_disconnected();
+            s.on_connect_started();
+            s.on_connected();
+            assert!(
+                s.may_connect().is_err(),
+                "connect allowed {elapsed}s into the mandatory wait"
+            );
+            s.tick(1);
+        }
+    }
+
+    // --- the ghost loop must terminate ---
+
+    #[test]
+    fn test_on_force_logout_fired_parks_after_the_budget() {
+        let mut s = TruedataSession::new();
+        s.set_lock_held(true);
+        for n in 1..TD_MAX_FORCE_LOGOUTS_PER_SESSION {
+            s.on_force_logout_fired();
+            assert!(
+                matches!(s.state(), SessionState::CoolingDown { .. }),
+                "attempt {n} should still be cooling down, got {:?}",
+                s.state()
+            );
+            assert_eq!(
+                s.force_logouts(),
+                n,
+                "the budget must ACCUMULATE across cycles"
+            );
+            s.tick(TD_FORCE_LOGOUT_COOLDOWN.as_secs());
+        }
+        s.on_force_logout_fired();
+        assert!(
+            matches!(s.state(), SessionState::ParkedGhost { .. }),
+            "budget spent — must park rather than cycle forever, got {:?}",
+            s.state()
+        );
+        assert_eq!(s.may_connect(), Err(ConnectRefusal::GhostBudgetExhausted));
+    }
+
+    #[test]
+    fn test_force_logouts_counter_survives_the_cooldown_expiring() {
+        // The count lives on the SESSION, not on the CoolingDown variant.
+        // Held in the state it would be discarded when the cooldown expires
+        // to Idle, resetting the budget to zero on every cycle — the ghost
+        // loop would still be unbounded, just less obviously so.
+        let mut s = TruedataSession::new();
+        s.set_lock_held(true);
+        assert_eq!(s.force_logouts(), 0);
+        s.on_force_logout_fired();
+        assert_eq!(s.force_logouts(), 1);
+        s.tick(TD_FORCE_LOGOUT_COOLDOWN.as_secs());
+        assert_eq!(s.state(), SessionState::Idle, "cooldown expired");
+        assert_eq!(
+            s.force_logouts(),
+            1,
+            "the budget must survive the cooldown expiring, or it never accumulates"
+        );
+        s.on_force_logout_fired();
+        assert_eq!(s.force_logouts(), 2);
+    }
+
+    #[test]
+    fn test_parked_ghost_is_terminal_against_every_event() {
+        let mut s = TruedataSession::new();
+        s.set_lock_held(true);
+        for _ in 0..TD_MAX_FORCE_LOGOUTS_PER_SESSION {
+            s.on_force_logout_fired();
+            s.tick(TD_FORCE_LOGOUT_COOLDOWN.as_secs());
+        }
+        assert!(matches!(s.state(), SessionState::ParkedGhost { .. }));
+        s.on_disconnected();
+        s.on_connect_started();
+        s.on_connected();
+        s.tick(10_000);
+        assert!(
+            matches!(s.state(), SessionState::ParkedGhost { .. }),
+            "parked is terminal — the operator decides, not a retry timer"
+        );
+    }
+
+    // --- lock loss must actually drop the connection ---
+
+    #[test]
+    fn test_on_lock_lost_forces_disconnect_not_just_a_flag_flip() {
+        let mut s = TruedataSession::new();
+        s.set_lock_held(true);
+        s.on_connect_started();
+        s.on_connected();
+        assert_eq!(s.state(), SessionState::Connected);
+        s.on_lock_lost();
+        assert_eq!(
+            s.state(),
+            SessionState::Idle,
+            "losing the lock while connected means two processes on one key"
+        );
+        assert!(!s.lock_held());
+        assert_eq!(s.may_connect(), Err(ConnectRefusal::LockNotHeld));
+    }
+
+    // --- we must not knock ourselves offline ---
+
+    #[test]
+    fn test_on_connect_started_blocks_a_second_concurrent_connect() {
+        // Between "go" and "connected" the machine used to sit in Idle, so
+        // a retry timer firing under a slow handshake got Ok again and
+        // opened a second socket on a one-login key — the vendor kills the
+        // first, and we have knocked ourselves offline.
+        let mut s = TruedataSession::new();
+        s.set_lock_held(true);
+        assert_eq!(s.may_connect(), Ok(()));
+        s.on_connect_started();
+        assert_eq!(
+            s.may_connect(),
+            Err(ConnectRefusal::AlreadyConnected),
+            "a second attempt while one is in flight must be refused"
+        );
+    }
+
+    // --- the refusal literal is UNVERIFIED-LIVE, so match it loosely ---
+
+    #[test]
+    fn test_on_auth_refused_matches_case_and_wording_drift() {
+        for msg in [
+            "User Already Connected",
+            "user already connected",
+            "USER ALREADY CONNECTED",
+            "Access Denied. Key already in use by other session. Already Connected.",
+        ] {
+            let mut s = TruedataSession::new();
+            s.set_lock_held(true);
+            assert!(
+                s.on_auth_refused(msg),
+                "must force-logout on {msg:?} — an exact-literal match would \
+                 send this down the backoff ladder and the ghost would hold \
+                 the login all session"
+            );
+            assert!(matches!(s.state(), SessionState::CoolingDown { .. }));
+        }
+    }
+
+    #[test]
+    fn test_on_auth_refused_unrelated_message_still_takes_the_ladder() {
+        let mut s = TruedataSession::new();
+        s.set_lock_held(true);
+        assert!(!s.on_auth_refused("Invalid credentials"));
+        assert!(matches!(s.state(), SessionState::Backoff { .. }));
+    }
+
+    #[test]
+    fn test_contains_ignore_ascii_case_boundaries() {
+        assert!(contains_ignore_ascii_case(
+            "Already Connected",
+            "already connected"
+        ));
+        assert!(contains_ignore_ascii_case(
+            "xxALREADY CONNECTEDxx",
+            "already connected"
+        ));
+        assert!(!contains_ignore_ascii_case("already", "already connected"));
+        assert!(!contains_ignore_ascii_case("", "a"));
+        assert!(!contains_ignore_ascii_case("anything", ""));
+        // Exactly-equal lengths must still match.
+        assert!(contains_ignore_ascii_case("AbC", "aBc"));
     }
 
     // --- lock discipline (fail-closed) ---

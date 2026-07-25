@@ -130,7 +130,7 @@ impl RouteRefusal {
 
 /// Translates a core-decoder error into a routing refusal.
 #[inline]
-const fn refuse_core(err: TruedataDecodeError, fallback_code: u8) -> RouteRefusal {
+const fn refuse_core(err: TruedataDecodeError, fallback_code: u8, len: usize) -> RouteRefusal {
     match err {
         TruedataDecodeError::Empty => RouteRefusal::Empty,
         TruedataDecodeError::UnknownMsgCode(code) => RouteRefusal::UnknownMsgCode(code),
@@ -142,23 +142,28 @@ const fn refuse_core(err: TruedataDecodeError, fallback_code: u8) -> RouteRefusa
         // than swallowed.
         TruedataDecodeError::IsJson => RouteRefusal::Malformed {
             msg_code: fallback_code,
-            len: 0,
+            len,
         },
     }
 }
 
 /// Translates an auxiliary-decoder error into a routing refusal.
 #[inline]
-const fn refuse_aux(err: TruedataAuxDecodeError, len: usize) -> RouteRefusal {
+const fn refuse_aux(err: TruedataAuxDecodeError, code: u8, len: usize) -> RouteRefusal {
     match err {
         TruedataAuxDecodeError::Empty => RouteRefusal::Empty,
         TruedataAuxDecodeError::WrongMsgCode { found, .. } => RouteRefusal::UnknownMsgCode(found),
         TruedataAuxDecodeError::UnexpectedLength { msg_code, len } => {
             RouteRefusal::Malformed { msg_code, len }
         }
-        TruedataAuxDecodeError::RaggedRecordList { .. } => {
-            RouteRefusal::Malformed { msg_code: 0, len }
-        }
+        // Carry the REAL code. Reporting 0 here rendered as a NUL byte and
+        // was indistinguishable from a genuine code-0 frame, discarding the
+        // one datum a doc-drift investigation needs: WHICH record-list
+        // frame changed shape.
+        TruedataAuxDecodeError::RaggedRecordList { .. } => RouteRefusal::Malformed {
+            msg_code: code,
+            len,
+        },
         TruedataAuxDecodeError::UnresolvedLayout { msg_code, len } => {
             RouteRefusal::UnresolvedLayout { msg_code, len }
         }
@@ -176,43 +181,55 @@ const fn refuse_aux(err: TruedataAuxDecodeError, len: usize) -> RouteRefusal {
 /// A [`RouteRefusal`] describing why the frame could not be decoded.
 pub fn route_frame(raw: &[u8]) -> Result<TruedataFrame<'_>, RouteRefusal> {
     let len = raw.len();
-    let kind = classify_frame(raw).map_err(|e| refuse_core(e, 0))?;
-    // The code byte, for error reporting. Safe: classify_frame already
-    // proved the frame is non-empty.
+    // The code byte, for error reporting. 0 only when the frame is empty,
+    // which `classify_frame` rejects on the next line.
     let code = raw.first().copied().unwrap_or(0);
+    let kind = classify_frame(raw).map_err(|e| refuse_core(e, code, len))?;
     match kind {
         TruedataFrameKind::Json => Ok(TruedataFrame::Json),
         TruedataFrameKind::AuthBinary => decode_auth_binary(raw)
             .map(TruedataFrame::Auth)
-            .map_err(|e| refuse_core(e, code)),
+            .map_err(|e| refuse_core(e, code, len)),
         TruedataFrameKind::TradeBinary | TruedataFrameKind::TradeNoBidAskBinary => {
             decode_trade_binary(raw)
                 .map(TruedataFrame::Trade)
-                .map_err(|e| refuse_core(e, code))
+                .map_err(|e| refuse_core(e, code, len))
         }
         TruedataFrameKind::BidAskBinary => decode_bidask_binary(raw)
             .map(TruedataFrame::BidAsk)
-            .map_err(|e| refuse_aux(e, len)),
+            .map_err(|e| refuse_aux(e, code, len)),
         TruedataFrameKind::GreeksBinary => decode_greeks_binary(raw)
             .map(TruedataFrame::Greeks)
-            .map_err(|e| refuse_aux(e, len)),
+            .map_err(|e| refuse_aux(e, code, len)),
         TruedataFrameKind::BarBinary => decode_bar_binary(raw)
             .map(TruedataFrame::Bar)
-            .map_err(|e| refuse_aux(e, len)),
+            .map_err(|e| refuse_aux(e, code, len)),
         TruedataFrameKind::SymbolAck | TruedataFrameKind::TouchlineBinary => {
             decode_record_list(raw)
                 .map(TruedataFrame::RecordList)
-                .map_err(|e| refuse_aux(e, len))
+                .map_err(|e| refuse_aux(e, code, len))
         }
         TruedataFrameKind::HeartbeatBinary => decode_heartbeat_binary(raw)
             .map(TruedataFrame::Heartbeat)
-            .map_err(|e| refuse_core(e, code)),
+            .map_err(|e| refuse_core(e, code, len)),
         TruedataFrameKind::MarketStatusBinary => decode_market_status_binary(raw)
             .map(TruedataFrame::MarketStatus)
-            .map_err(|e| refuse_core(e, code)),
+            .map_err(|e| refuse_core(e, code, len)),
         // Deliberately refused, not decoded — see the module docs.
-        TruedataFrameKind::BidAskL2Binary => Err(decode_bidask_l2_binary(raw)
-            .map_or_else(|e| refuse_aux(e, len), |()| RouteRefusal::Empty)),
+        // Deliberately refused, not decoded — see the module docs. The
+        // success arm maps to UnresolvedLayout rather than to `Empty`: it
+        // is unreachable today, but the moment `D` IS resolved the natural
+        // edit is to make the decoder return `Ok`, and an `Empty` mapping
+        // would then file every depth frame under "zero-length frame"
+        // while still discarding it. Conservation would hold and nothing
+        // would alarm.
+        TruedataFrameKind::BidAskL2Binary => Err(decode_bidask_l2_binary(raw).map_or_else(
+            |e| refuse_aux(e, code, len),
+            |()| RouteRefusal::UnresolvedLayout {
+                msg_code: code,
+                len,
+            },
+        )),
     }
 }
 

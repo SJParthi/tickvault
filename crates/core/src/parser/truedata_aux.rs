@@ -8,7 +8,7 @@
 //!
 //! # Ground truth for this module
 //!
-//! The layouts here come from the OFFICIAL TrueData Python SDK
+//! The layouts here come from TrueData's OFFICIAL reference client
 //! (`truedata` 7.0.1, `truedata/websocket/compression_map.py`, the `msg_map`
 //! table) — the decoder TrueData themselves ship. Its entries for `A`, `T`,
 //! `H` and `M` match the PDF **byte for byte**, which is what makes it
@@ -94,6 +94,13 @@ const OFF_BA_BID: usize = 9;
 const OFF_BA_BID_QTY: usize = 13;
 const OFF_BA_ASK: usize = 17;
 const OFF_BA_ASK_QTY: usize = 21;
+// Full adjacency chain — a middle-offset typo must fail the build, not
+// silently read the wrong bytes (see the same note in `truedata.rs`).
+const _: () = assert!(OFF_BA_TIMESTAMP == OFF_BA_SYMBOL_ID + 4);
+const _: () = assert!(OFF_BA_BID == OFF_BA_TIMESTAMP + 4);
+const _: () = assert!(OFF_BA_BID_QTY == OFF_BA_BID + 4);
+const _: () = assert!(OFF_BA_ASK == OFF_BA_BID_QTY + 4);
+const _: () = assert!(OFF_BA_ASK_QTY == OFF_BA_ASK + 4);
 const _: () = assert!(OFF_BA_ASK_QTY + 4 == TD_BIDASK_BINARY_LEN);
 
 // "G": symbol_id 1, timestamp 5, iv 9, delta 17, gamma 25, theta 33, vega 41, rho 49
@@ -105,6 +112,13 @@ const OFF_GR_GAMMA: usize = 25;
 const OFF_GR_THETA: usize = 33;
 const OFF_GR_VEGA: usize = 41;
 const OFF_GR_RHO: usize = 49;
+const _: () = assert!(OFF_GR_TIMESTAMP == OFF_GR_SYMBOL_ID + 4);
+const _: () = assert!(OFF_GR_IV == OFF_GR_TIMESTAMP + 4);
+const _: () = assert!(OFF_GR_DELTA == OFF_GR_IV + 8);
+const _: () = assert!(OFF_GR_GAMMA == OFF_GR_DELTA + 8);
+const _: () = assert!(OFF_GR_THETA == OFF_GR_GAMMA + 8);
+const _: () = assert!(OFF_GR_VEGA == OFF_GR_THETA + 8);
+const _: () = assert!(OFF_GR_RHO == OFF_GR_VEGA + 8);
 const _: () = assert!(OFF_GR_RHO + 8 == TD_GREEKS_BINARY_LEN);
 
 // "O"/"F": symbol_id 1, timestamp 5, open 9, high 13, low 17, close 21,
@@ -117,6 +131,13 @@ const OFF_BAR_LOW: usize = 17;
 const OFF_BAR_CLOSE: usize = 21;
 const OFF_BAR_VOLUME: usize = 25;
 const OFF_BAR_OI: usize = 29;
+const _: () = assert!(OFF_BAR_TIMESTAMP == OFF_BAR_SYMBOL_ID + 4);
+const _: () = assert!(OFF_BAR_OPEN == OFF_BAR_TIMESTAMP + 4);
+const _: () = assert!(OFF_BAR_HIGH == OFF_BAR_OPEN + 4);
+const _: () = assert!(OFF_BAR_LOW == OFF_BAR_HIGH + 4);
+const _: () = assert!(OFF_BAR_CLOSE == OFF_BAR_LOW + 4);
+const _: () = assert!(OFF_BAR_VOLUME == OFF_BAR_CLOSE + 4);
+const _: () = assert!(OFF_BAR_OI == OFF_BAR_VOLUME + 4);
 const _: () = assert!(OFF_BAR_OI + 8 == TD_BAR_BINARY_LEN);
 
 // "S"/"L"/"R" header: msg_code 0, success 1, count 2, total 6, records from 10
@@ -143,6 +164,22 @@ const OFF_AS_BID: usize = 98;
 const OFF_AS_BID_QTY: usize = 102;
 const OFF_AS_ASK: usize = 106;
 const OFF_AS_ASK_QTY: usize = 110;
+const _: () = assert!(OFF_AS_TIMESTAMP == OFF_AS_SYMBOL_ID + 4);
+const _: () = assert!(OFF_AS_LTP == OFF_AS_TIMESTAMP + 4);
+const _: () = assert!(OFF_AS_VOLUME == OFF_AS_LTP + 4);
+const _: () = assert!(OFF_AS_ATP == OFF_AS_VOLUME + 4);
+const _: () = assert!(OFF_AS_TOT_VOLUME == OFF_AS_ATP + 4);
+const _: () = assert!(OFF_AS_OPEN == OFF_AS_TOT_VOLUME + 8);
+const _: () = assert!(OFF_AS_HIGH == OFF_AS_OPEN + 4);
+const _: () = assert!(OFF_AS_LOW == OFF_AS_HIGH + 4);
+const _: () = assert!(OFF_AS_PREV_CLOSE == OFF_AS_LOW + 4);
+const _: () = assert!(OFF_AS_OI == OFF_AS_PREV_CLOSE + 4);
+const _: () = assert!(OFF_AS_PREV_OI == OFF_AS_OI + 8);
+const _: () = assert!(OFF_AS_TURNOVER == OFF_AS_PREV_OI + 8);
+const _: () = assert!(OFF_AS_BID == OFF_AS_TURNOVER + 8);
+const _: () = assert!(OFF_AS_BID_QTY == OFF_AS_BID + 4);
+const _: () = assert!(OFF_AS_ASK == OFF_AS_BID_QTY + 4);
+const _: () = assert!(OFF_AS_ASK_QTY == OFF_AS_ASK + 4);
 const _: () = assert!(OFF_AS_ASK_QTY + 4 == TD_ADD_SYMBOL_RECORD_LEN);
 const _: () = assert!(OFF_AS_SYMBOL_ID == TD_SYMBOL_NAME_LEN);
 

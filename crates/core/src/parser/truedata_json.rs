@@ -184,8 +184,11 @@ pub fn json_msg_type(raw: &[u8]) -> Option<TruedataJsonType> {
 /// Bounded substring search over a small window.
 ///
 /// O(1) EXEMPT: begin
-/// Bounded by SNIFF_WINDOW (128 bytes) and by the needle set, both
-/// compile-time constants — a constant upper bound, not growth in n.
+/// Bounded by TD_JSON_SNIFF_WINDOW (128 B) on the per-tick pass and by
+/// TD_JSON_CONTROL_SNIFF_WINDOW (8192 B) on the rare control pass, plus a
+/// fixed needle set — all compile-time constants, so a constant upper
+/// bound, not growth in n. Data frames exit in the narrow pass, so the
+/// wide bound is never paid per tick.
 /// Substring search inherently requires comparing bytes. This is also the
 /// JSON FALLBACK path, which is explicitly NOT claimed to be O(1)
 /// (scope-lock §10.4); the O(1) hot path is the binary decoder.
@@ -206,28 +209,90 @@ fn contains_sub(haystack: &[u8], needle: &[u8]) -> bool {
 pub struct JsonArrayIter<'a> {
     raw: &'a [u8],
     pos: usize,
+    malformed: bool,
+    finished: bool,
 }
 
 impl<'a> JsonArrayIter<'a> {
-    /// Creates an iterator positioned at the first `[` in the frame.
+    /// Creates an iterator positioned at the array that is the VALUE of a
+    /// top-level key.
     ///
-    /// Returns `None` when the frame contains no array.
+    /// Anchoring is string-aware: a `[` that appears INSIDE a quoted string
+    /// is skipped. Without that, a frame like
+    /// `{"message":"bad [req]","trade":[…]}` would anchor on the bracket
+    /// inside the message text and iterate garbage that happens to parse.
+    ///
+    /// Returns `None` when the frame contains no array outside a string.
     #[must_use]
     pub fn new(raw: &'a [u8]) -> Option<Self> {
         // O(1) EXEMPT: begin
         // Locating the array opener requires scanning bytes — inherent to
         // ANY JSON wire, and this module is explicitly the NON-O(1)
         // fallback path (see the module complexity table and scope-lock
-        // §10.4). The O(1) hot path is the binary decoder in
+        // §11.3). The O(1) field extraction is the binary decoder in
         // `super::truedata`, which uses fixed offsets and never scans.
         // The scan is bounded by the frame length, which the transport
-        // caps well below the WebSocket max frame size.
-        let start = raw.iter().position(|&b| b == b'[')?;
+        // caps below the WebSocket max frame size.
+        let mut i = 0_usize;
+        let mut in_string = false;
+        let mut start = None;
+        while i < raw.len() {
+            let b = raw[i];
+            if in_string {
+                if b == b'\\' {
+                    // Skip the escaped byte so an escaped quote cannot end
+                    // the string early.
+                    i = i.saturating_add(2);
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = false;
+                }
+            } else if b == b'"' {
+                in_string = true;
+            } else if b == b'[' {
+                start = Some(i);
+                break;
+            }
+            i = i.saturating_add(1);
+        }
         // O(1) EXEMPT: end
+        let start = start?;
         Some(Self {
             raw,
             pos: start.saturating_add(1),
+            malformed: false,
+            finished: false,
         })
+    }
+
+    /// `true` when iteration stopped because the array was BROKEN rather
+    /// than because it ended cleanly at `]`.
+    ///
+    /// This distinction is load-bearing. `decode_trade_json` detects the
+    /// optional bid/ask tail by `next()` returning `None` — so without it,
+    /// an unterminated or non-UTF-8 field 16 makes a 19-field trade decode
+    /// silently as the 15-field quote-only shape, with `bid`/`ask` reported
+    /// as absent rather than as an error. Silent degradation of a tick is
+    /// worse than a typed refusal: the ledger would count it as decoded and
+    /// nothing anywhere would say the frame was damaged.
+    #[inline]
+    #[must_use]
+    pub const fn is_malformed(&self) -> bool {
+        self.malformed
+    }
+
+    /// `true` once the closing `]` has been consumed.
+    ///
+    /// Lets a decoder assert that a frame carried EXACTLY the documented
+    /// field count: after reading its last expected field, a well-formed
+    /// array must be finished. Extra trailing fields mean the vendor
+    /// changed the shape, and continuing to trust the earlier positions
+    /// would be a guess.
+    #[inline]
+    #[must_use]
+    pub const fn is_finished(&self) -> bool {
+        self.finished
     }
 }
 
@@ -235,27 +300,103 @@ impl<'a> Iterator for JsonArrayIter<'a> {
     type Item = &'a str;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Find the opening quote of the next element, stopping at `]`.
+        // Skip separators and whitespace to the start of the next element.
         while self.pos < self.raw.len() {
             match self.raw[self.pos] {
-                b'"' => break,
-                b']' => return None,
-                _ => self.pos = self.pos.saturating_add(1),
+                b',' | b' ' | b'\t' | b'\n' | b'\r' => {
+                    self.pos = self.pos.saturating_add(1);
+                }
+                b']' => {
+                    // The ONLY clean end of the array.
+                    self.pos = self.pos.saturating_add(1);
+                    self.finished = true;
+                    return None;
+                }
+                _ => break,
             }
         }
         if self.pos >= self.raw.len() {
+            // Ran off the end without ever seeing `]` — unterminated, not
+            // finished.
+            self.malformed = true;
             return None;
         }
+
+        if self.raw[self.pos] == b'"' {
+            return self.next_quoted();
+        }
+        // An UNQUOTED token: a bare number, `null`, `true`, `false`. The
+        // documented samples quote every value, but a vendor change to bare
+        // numbers must not make elements INVISIBLE — skipping them would
+        // shift every later field left and silently mis-assign prices to
+        // quantities. So they are yielded verbatim and the caller's own
+        // parse decides whether the content is acceptable.
+        self.next_unquoted()
+    }
+}
+
+impl<'a> JsonArrayIter<'a> {
+    /// Reads a `"…"` element, honouring backslash escapes.
+    ///
+    /// The yielded slice is the RAW inner text, escapes NOT expanded —
+    /// unescaping would require an allocation, and no numeric or symbol
+    /// field TrueData sends contains one. What matters here is that an
+    /// escaped quote does not terminate the element early: that would make
+    /// the real closing quote read as an opening quote and desynchronise
+    /// every remaining field in the array.
+    fn next_quoted(&mut self) -> Option<&'a str> {
         let start = self.pos.saturating_add(1);
         let mut end = start;
-        while end < self.raw.len() && self.raw[end] != b'"' {
-            end = end.saturating_add(1);
+        while end < self.raw.len() {
+            match self.raw[end] {
+                b'\\' => end = end.saturating_add(2),
+                b'"' => break,
+                _ => end = end.saturating_add(1),
+            }
         }
         if end >= self.raw.len() {
+            // Opening quote with no closing quote (or a trailing lone
+            // backslash that ran the cursor past the end).
+            self.malformed = true;
             return None;
         }
         self.pos = end.saturating_add(1);
-        core::str::from_utf8(self.raw.get(start..end)?).ok()
+        match self
+            .raw
+            .get(start..end)
+            .and_then(|b| core::str::from_utf8(b).ok())
+        {
+            Some(field) => Some(field),
+            None => {
+                self.malformed = true;
+                None
+            }
+        }
+    }
+
+    /// Reads a bare token up to the next `,` or `]`.
+    fn next_unquoted(&mut self) -> Option<&'a str> {
+        let start = self.pos;
+        let mut end = start;
+        while end < self.raw.len() && !matches!(self.raw[end], b',' | b']') {
+            end = end.saturating_add(1);
+        }
+        if end >= self.raw.len() {
+            self.malformed = true;
+            return None;
+        }
+        self.pos = end;
+        match self
+            .raw
+            .get(start..end)
+            .and_then(|b| core::str::from_utf8(b).ok())
+        {
+            Some(field) => Some(field.trim()),
+            None => {
+                self.malformed = true;
+                None
+            }
+        }
     }
 }
 
@@ -263,53 +404,120 @@ impl<'a> Iterator for JsonArrayIter<'a> {
 // Number parsing (zero-alloc, total)
 // ---------------------------------------------------------------------------
 
-/// Parses an `i32`, treating an empty field as 0.
+/// Parses an `i32`. An empty field is an ERROR.
 ///
-/// TrueData sends `""` for absent numeric values (e.g. the Special Tag),
-/// so empty must degrade to a default rather than erroring the whole tick.
+/// Empty-tolerance used to apply to every numeric field, which meant a
+/// blank LTP silently became `0.0` and a blank symbol id routed to symbol
+/// zero. Only the two fields TrueData is actually known to blank get the
+/// tolerant variant below; everything else must fail loudly.
 #[inline]
 fn parse_i32(s: &str) -> Option<i32> {
-    if s.is_empty() {
-        return Some(0);
-    }
     s.trim().parse::<i32>().ok()
 }
 
-/// Parses an `i64`, treating an empty field as 0.
+/// Parses an `i64`. An empty field is an ERROR — see [`parse_i32`].
 #[inline]
 fn parse_i64(s: &str) -> Option<i64> {
-    if s.is_empty() {
+    s.trim().parse::<i64>().ok()
+}
+
+/// Parses an `i64` for the OI slots, where an empty field means "absent".
+///
+/// Open interest is genuinely absent for cash-segment instruments, and the
+/// vendor blanks it rather than sending `0`. Rejecting the whole tick would
+/// mean rejecting every equity print, so these two slots — and ONLY these
+/// two — treat empty as zero.
+#[inline]
+fn parse_i64_or_absent(s: &str) -> Option<i64> {
+    if s.trim().is_empty() {
         return Some(0);
     }
     s.trim().parse::<i64>().ok()
 }
 
-/// Parses an `f32`, treating an empty field as 0.0.
+/// Parses a FINITE `f32`. Empty, `NaN`, `inf` and out-of-range are errors.
+///
+/// `"NaN"` and `"inf"` parse successfully in Rust, and `1e40` overflows to
+/// `inf` — all three would enter price fields and poison every downstream
+/// min/max comparison silently. A price that is not a finite number is not
+/// a price.
 #[inline]
 fn parse_f32(s: &str) -> Option<f32> {
-    if s.is_empty() {
-        return Some(0.0);
-    }
-    s.trim().parse::<f32>().ok()
+    let v = s.trim().parse::<f32>().ok()?;
+    v.is_finite().then_some(v)
 }
 
-/// Parses an `f64`, treating an empty field as 0.0.
+/// Parses a FINITE `f64` — see [`parse_f32`].
 #[inline]
 fn parse_f64(s: &str) -> Option<f64> {
-    if s.is_empty() {
-        return Some(0.0);
-    }
-    s.trim().parse::<f64>().ok()
+    let v = s.trim().parse::<f64>().ok()?;
+    v.is_finite().then_some(v)
 }
 
 // ---------------------------------------------------------------------------
 // Timestamps — TWO formats on the same socket
 // ---------------------------------------------------------------------------
 
+/// Lowest year either timestamp parser will accept.
+///
+/// The epoch itself — anything earlier is a corrupt or hostile field, not
+/// a market timestamp.
+pub const TD_MIN_YEAR: i64 = 1970;
+
+/// Highest year either timestamp parser will accept.
+///
+/// Deliberately generous but FINITE. The bound exists for overflow safety,
+/// not plausibility: `days_from_civil` computes `y - 1` and `era * 146_097`,
+/// and the release profile sets `overflow-checks = true`, so an unbounded
+/// year from the wire is a PANIC — `i64::MIN` underflows the first
+/// expression and any year past ~2.5e16 overflows the second. The ISO
+/// parser reads a fixed 4-byte field and could not exceed 9999, but the US
+/// parser splits on `/` and parses an arbitrary-length token, so the bound
+/// is enforced in both rather than relying on one parser's field width.
+pub const TD_MAX_YEAR: i64 = 2200;
+
+/// Days in a given month, leap-year aware.
+///
+/// `days_from_civil` NORMALISES an out-of-range day — Feb 30 silently
+/// becomes Mar 2 — so a plain `1..=31` check lets a corrupt date through as
+/// a plausible-looking timestamp. This is the check that makes an invalid
+/// date an error instead of a different valid date.
+#[inline]
+#[must_use]
+pub const fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            // Gregorian leap rule. `y` is caller-validated in range, so the
+            // remainders cannot overflow.
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// `true` when a year is inside the range both parsers accept.
+#[inline]
+#[must_use]
+pub const fn is_supported_year(y: i64) -> bool {
+    // Range pattern rather than a containment call — see the note in
+    // `parse_iso_timestamp`.
+    matches!(y, TD_MIN_YEAR..=TD_MAX_YEAR)
+}
+
 /// Days from civil epoch (1970-01-01) — Howard Hinnant's algorithm.
 ///
 /// Pure integer arithmetic, no allocation, no `chrono` round-trip.
-#[allow(clippy::arithmetic_side_effects)] // APPROVED: bounded by validated y/m/d ranges below
+///
+/// # Panics in release without the caller's range check
+/// Callers MUST reject years outside [`TD_MIN_YEAR`]..=[`TD_MAX_YEAR`]
+/// first. See [`TD_MAX_YEAR`] for exactly which expressions overflow.
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: callers enforce is_supported_year + m/d ranges
 const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -327,6 +535,9 @@ const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// IST convention the rest of the pipeline uses — this function never
 /// invents a zone offset.
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: all inputs range-validated by the callers
+///
+/// # Panics in release without the caller's range check
+/// See [`days_from_civil`].
 const fn civil_to_epoch_secs(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
     days_from_civil(y, mo, d) * 86_400 + h * 3_600 + mi * 60 + s
 }
@@ -357,7 +568,10 @@ pub fn parse_iso_timestamp(s: &str) -> Option<i64> {
     // back into the call it rejects. The match-pattern form is O(1),
     // satisfies both tools, and needs no exemption for an exception that
     // does not actually exist.
-    if !matches!(mo, 1..=12) || !matches!(d, 1..=31) {
+    if !is_supported_year(y) || !matches!(mo, 1..=12) {
+        return None;
+    }
+    if d < 1 || d > days_in_month(y, mo) {
         return None;
     }
     if h > 23 || mi > 59 || sec > 60 {
@@ -394,7 +608,15 @@ pub fn parse_us_timestamp(s: &str) -> Option<i64> {
     }
 
     // Range patterns — see the note in `parse_iso_timestamp`.
-    if !matches!(mo, 1..=12) || !matches!(d, 1..=31) {
+    //
+    // The YEAR check is not cosmetic here: unlike the ISO parser this one
+    // splits on `/` and parses an arbitrary-length token, so without the
+    // bound a crafted field reaches `days_from_civil` and PANICS in release
+    // (overflow-checks = true) — a wire-reachable crash of the feed task.
+    if !is_supported_year(y) || !matches!(mo, 1..=12) {
+        return None;
+    }
+    if d < 1 || d > days_in_month(y, mo) {
         return None;
     }
     if !matches!(h12, 1..=12) || mi > 59 || sec > 60 {
@@ -402,22 +624,21 @@ pub fn parse_us_timestamp(s: &str) -> Option<i64> {
     }
 
     // 12-hour → 24-hour: 12 AM is 00, 12 PM is 12.
-    let h24 = match meridiem.trim().to_ascii_uppercase().as_str() {
-        "AM" => {
-            if h12 == 12 {
-                0
-            } else {
-                h12
-            }
+    //
+    // `eq_ignore_ascii_case` rather than `to_ascii_uppercase()`: the latter
+    // ALLOCATES A STRING, and `bidask` is a continuous per-tick data frame,
+    // so that would be heap traffic on the hot path (principle 1).
+    let meridiem = meridiem.trim();
+    let h24 = if meridiem.eq_ignore_ascii_case("AM") {
+        if h12 == 12 { 0 } else { h12 }
+    } else if meridiem.eq_ignore_ascii_case("PM") {
+        if h12 == 12 {
+            12
+        } else {
+            h12.saturating_add(12)
         }
-        "PM" => {
-            if h12 == 12 {
-                12
-            } else {
-                h12.saturating_add(12)
-            }
-        }
-        _ => return None,
+    } else {
+        return None;
     };
     Some(civil_to_epoch_secs(y, mo, d, h24, mi, sec))
 }
@@ -456,8 +677,10 @@ pub fn decode_trade_json(raw: &[u8]) -> Result<TruedataTrade, TruedataDecodeErro
     let high = parse_f32(next().ok_or_else(|| bad(7))?).ok_or_else(|| bad(8))?;
     let low = parse_f32(next().ok_or_else(|| bad(8))?).ok_or_else(|| bad(9))?;
     let prev_close = parse_f32(next().ok_or_else(|| bad(9))?).ok_or_else(|| bad(10))?;
-    let oi = parse_i64(next().ok_or_else(|| bad(10))?).ok_or_else(|| bad(11))?;
-    let prev_oi = parse_i64(next().ok_or_else(|| bad(11))?).ok_or_else(|| bad(12))?;
+    // OI is legitimately blank on cash-segment instruments — the only two
+    // slots that tolerate an empty field.
+    let oi = parse_i64_or_absent(next().ok_or_else(|| bad(10))?).ok_or_else(|| bad(11))?;
+    let prev_oi = parse_i64_or_absent(next().ok_or_else(|| bad(11))?).ok_or_else(|| bad(12))?;
     let turnover = parse_f64(next().ok_or_else(|| bad(12))?).ok_or_else(|| bad(13))?;
     let special_tag_str = next().ok_or_else(|| bad(13))?;
     let seq_no = parse_i32(next().ok_or_else(|| bad(14))?).ok_or_else(|| bad(15))?;
@@ -466,6 +689,12 @@ pub fn decode_trade_json(raw: &[u8]) -> Result<TruedataTrade, TruedataDecodeErro
     let special_tag = special_tag_str.as_bytes().first().copied().unwrap_or(0);
 
     // Optional bid/ask tail (the 19-field shape).
+    //
+    // `None` here is ambiguous on its face — it means either "the array
+    // ended after 15 fields" (legitimate quote-only shape) or "field 16 is
+    // broken". Only the first is acceptable; the iterator's `is_malformed`
+    // flag separates them, so a damaged frame errors instead of silently
+    // decoding as quote-only.
     let (bid, bid_qty, ask, ask_qty) = match next() {
         Some(bid_s) => {
             let bid = parse_f32(bid_s).ok_or_else(|| bad(16))?;
@@ -474,14 +703,39 @@ pub fn decode_trade_json(raw: &[u8]) -> Result<TruedataTrade, TruedataDecodeErro
             let ask_qty = parse_i32(next().ok_or_else(|| bad(18))?).ok_or_else(|| bad(19))?;
             (Some(bid), Some(bid_qty), Some(ask), Some(ask_qty))
         }
-        None => (None, None, None, None),
+        None => {
+            if it.is_malformed() {
+                return Err(bad(16));
+            }
+            (None, None, None, None)
+        }
     };
+
+    // The array must be EXHAUSTED here. A vendor-added 20th field would
+    // otherwise be dropped in silence while we keep trusting positions 1-19
+    // that may have shifted — the field-count constants existed but nothing
+    // read them.
+    if !it.is_finished() {
+        if it.next().is_some() {
+            return Err(bad(TD_JSON_TRADE_FIELDS_FULL.saturating_add(1)));
+        }
+        if it.is_malformed() {
+            return Err(bad(TD_JSON_TRADE_FIELDS_FULL));
+        }
+    }
 
     Ok(TruedataTrade {
         symbol_id,
         // The struct mirrors the binary wire, where the timestamp is a
-        // 4-byte int. Saturate rather than wrap on an absurd date.
-        timestamp_secs: i32::try_from(timestamp_secs).unwrap_or(i32::MAX),
+        // 4-byte int. `unwrap_or(i32::MAX)` was wrong in one direction: a
+        // PRE-1970 date underflows and would have saturated UPWARDS to
+        // 2038 — a sign flip presented as a valid recent timestamp. Clamp
+        // to the nearest representable instant instead, so an out-of-range
+        // date stays out of range.
+        timestamp_secs: i32::try_from(
+            timestamp_secs.clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+        )
+        .unwrap_or(i32::MAX),
         ltp,
         last_trade_qty,
         atp,
@@ -597,15 +851,30 @@ pub fn decode_greeks_json(raw: &[u8]) -> Result<TruedataGreeks, TruedataDecodeEr
     let mut num = |idx: usize| -> Result<f64, TruedataDecodeError> {
         parse_f64(it.next().ok_or_else(|| bad(idx))?).ok_or_else(|| bad(idx))
     };
+    // FIELD ORDER: the SDK's JSON dataclass, NOT the v2.6 p.17 prose.
+    //
+    // The prose lists "delta, gamma, theta, vega, rho, IV" — IV last. The
+    // vendor's own client reads iv, delta, theta, gamma, vega, rho, and the
+    // PDF's OWN sample settles it: [0.2015, 0.0331, -6.0417, 0.0005,
+    // 0.8335, 0.0198] under the prose order gives IV = 1.98% with
+    // vega = 0.0005, which is not a real option; under the SDK order it
+    // gives IV = 20.15%, gamma = 0.0005, vega = 0.83 — coherent. The prose
+    // contradicts its own example, so the SDK wins.
+    //
+    // UNRESOLVED (day-0 probe): the SDK is internally inconsistent about
+    // gamma vs theta — its BINARY map puts gamma@25 before theta@33, its
+    // JSON order puts theta before gamma. The two are read from different
+    // positions here for exactly that reason. Greeks are backend-enabled
+    // and never subscribed, so nothing depends on it today.
     Ok(TruedataGreeks {
         symbol_id,
         timestamp_secs,
-        delta: num(2)?,
-        gamma: num(3)?,
+        iv: num(2)?,
+        delta: num(3)?,
         theta: num(4)?,
-        vega: num(5)?,
-        rho: num(6)?,
-        iv: num(7)?,
+        gamma: num(5)?,
+        vega: num(6)?,
+        rho: num(7)?,
     })
 }
 
@@ -885,14 +1154,226 @@ mod tests {
 
     #[test]
     fn test_decode_greeks_json_roundtrips_sample() {
+        // Field order is the SDK's, NOT the v2.6 p.17 prose. The sample
+        // values are what prove it: read in prose order they describe an
+        // option with 1.98% implied vol and a vega of 0.0005, which does
+        // not exist; read in SDK order they describe a normal one.
         let g = decode_greeks_json(GREEKS).expect("decode");
         assert_eq!(g.symbol_id, 301_680_343);
-        assert!((g.delta - 0.2015).abs() < 1e-9);
+        assert!((g.iv - 0.2015).abs() < 1e-9, "IV is FIRST, not last");
+        assert!((g.delta - 0.0331).abs() < 1e-9);
         assert!((g.theta + 6.0417).abs() < 1e-9, "theta is negative");
-        assert!((g.iv - 0.0198).abs() < 1e-9);
+        assert!((g.gamma - 0.0005).abs() < 1e-9);
+        assert!((g.vega - 0.8335).abs() < 1e-9);
+        assert!((g.rho - 0.0198).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_decode_greeks_json_prose_order_would_be_implausible() {
+        // Guards the decision above rather than just its output: if someone
+        // "fixes" the order back to the PDF prose, these two implausible
+        // values are what they would be asserting.
+        let g = decode_greeks_json(GREEKS).expect("decode");
+        assert!(
+            g.iv > 0.05,
+            "an implied vol under 5% means the prose order crept back in"
+        );
+        assert!(
+            g.vega > g.gamma,
+            "vega above gamma is the coherence check that settles the order"
+        );
     }
 
     // --- timestamps: the two-format trap ---
+
+    #[test]
+    fn test_is_supported_year_bounds_the_overflow_window() {
+        // The bound is not about plausibility — it is what stops
+        // `days_from_civil` from overflowing and PANICKING in release.
+        assert!(is_supported_year(TD_MIN_YEAR));
+        assert!(is_supported_year(TD_MAX_YEAR));
+        assert!(is_supported_year(2026));
+        assert!(!is_supported_year(TD_MIN_YEAR - 1));
+        assert!(!is_supported_year(TD_MAX_YEAR + 1));
+        assert!(!is_supported_year(i64::MIN));
+        assert!(!is_supported_year(i64::MAX));
+    }
+
+    #[test]
+    fn test_days_in_month_handles_the_leap_rule() {
+        assert_eq!(days_in_month(2024, 2), 29, "divisible by 4");
+        assert_eq!(days_in_month(2023, 2), 28);
+        assert_eq!(days_in_month(1900, 2), 28, "century, not divisible by 400");
+        assert_eq!(days_in_month(2000, 2), 29, "divisible by 400");
+        assert_eq!(days_in_month(2026, 1), 31);
+        assert_eq!(days_in_month(2026, 4), 30);
+        assert_eq!(days_in_month(2026, 12), 31);
+        assert_eq!(days_in_month(2026, 0), 0, "out of range yields no days");
+        assert_eq!(days_in_month(2026, 13), 0);
+    }
+
+    #[test]
+    fn test_timestamp_parsers_survive_extreme_years_without_panicking() {
+        // These are the exact inputs that used to reach `days_from_civil`
+        // and panic under overflow-checks. They must return None.
+        assert_eq!(
+            parse_us_timestamp("1/1/-9223372036854775808 1:00:00 AM"),
+            None
+        );
+        assert_eq!(parse_us_timestamp("1/1/99999999999999999 1:00:00 AM"), None);
+        assert_eq!(parse_us_timestamp("1/1/1969 1:00:00 AM"), None);
+        assert_eq!(parse_iso_timestamp("0001-01-01T00:00:00"), None);
+        assert_eq!(parse_iso_timestamp("9999-01-01T00:00:00"), None);
+    }
+
+    #[test]
+    fn test_timestamp_parsers_reject_impossible_calendar_days() {
+        // `days_from_civil` NORMALISES an out-of-range day, so Feb 30 would
+        // silently become Mar 2 — a different valid timestamp, not an error.
+        assert_eq!(parse_iso_timestamp("2021-02-30T10:00:00"), None);
+        assert_eq!(
+            parse_iso_timestamp("2023-02-29T10:00:00"),
+            None,
+            "not a leap year"
+        );
+        assert!(
+            parse_iso_timestamp("2024-02-29T10:00:00").is_some(),
+            "leap year"
+        );
+        assert_eq!(parse_iso_timestamp("2021-04-31T10:00:00"), None);
+        assert_eq!(parse_us_timestamp("2/30/2021 1:00:00 AM"), None);
+    }
+
+    #[test]
+    fn test_parse_i64_or_absent_tolerates_blank_oi_only() {
+        // OI is genuinely blank on cash-segment instruments; every other
+        // numeric field must fail loudly rather than become zero.
+        assert_eq!(parse_i64_or_absent(""), Some(0));
+        assert_eq!(parse_i64_or_absent("  "), Some(0));
+        assert_eq!(parse_i64_or_absent("123"), Some(123));
+        assert_eq!(parse_i64_or_absent("abc"), None);
+    }
+
+    #[test]
+    fn test_blank_price_is_an_error_not_a_zero() {
+        // A blank LTP used to decode as 0.0 — a real price of zero, fed to
+        // every downstream consumer with no complaint.
+        assert!(parse_f32("").is_none());
+        assert!(parse_i32("").is_none());
+        assert!(parse_i64("").is_none());
+    }
+
+    #[test]
+    fn test_non_finite_numbers_are_rejected() {
+        // "NaN" and "inf" parse successfully in Rust, and 1e40 overflows an
+        // f32 to inf. None of the three is a price.
+        assert!(parse_f32("NaN").is_none());
+        assert!(parse_f32("inf").is_none());
+        assert!(parse_f32("-inf").is_none());
+        assert!(parse_f32("1e40").is_none(), "overflows f32 to infinity");
+        assert!(parse_f64("NaN").is_none());
+        assert!(parse_f64("inf").is_none());
+    }
+
+    #[test]
+    fn test_json_array_iter_is_malformed_separates_broken_from_ended() {
+        // Clean end.
+        let mut it = JsonArrayIter::new(br#"["a","b"]"#).expect("iter");
+        assert_eq!(it.next(), Some("a"));
+        assert_eq!(it.next(), Some("b"));
+        assert_eq!(it.next(), None);
+        assert!(!it.is_malformed(), "a clean `]` is not malformed");
+        assert!(it.is_finished());
+
+        // Unterminated array.
+        let mut it = JsonArrayIter::new(br#"["a","b""#).expect("iter");
+        assert_eq!(it.next(), Some("a"));
+        assert_eq!(it.next(), Some("b"));
+        assert_eq!(it.next(), None);
+        assert!(it.is_malformed(), "no closing `]` is malformed");
+        assert!(!it.is_finished());
+
+        // Unterminated element.
+        let mut it = JsonArrayIter::new(br#"["a","bbb"#).expect("iter");
+        assert_eq!(it.next(), Some("a"));
+        assert_eq!(it.next(), None);
+        assert!(it.is_malformed());
+    }
+
+    #[test]
+    fn test_json_array_iter_is_finished_only_after_the_closing_bracket() {
+        let mut it = JsonArrayIter::new(br#"["a"]"#).expect("iter");
+        assert!(!it.is_finished(), "not finished before iterating");
+        assert_eq!(it.next(), Some("a"));
+        assert!(
+            !it.is_finished(),
+            "not finished while an element was just read"
+        );
+        assert_eq!(it.next(), None);
+        assert!(it.is_finished());
+    }
+
+    #[test]
+    fn test_json_array_iter_handles_escaped_quotes_without_desyncing() {
+        // Zero escape handling used to end the element at the escaped
+        // quote; the real closing quote then read as an OPENING quote and
+        // every later field shifted by one.
+        let mut it = JsonArrayIter::new(br#"["A\"B","1234"]"#).expect("iter");
+        assert_eq!(it.next(), Some(r#"A\"B"#));
+        assert_eq!(
+            it.next(),
+            Some("1234"),
+            "the field after an escaped quote must survive"
+        );
+        assert_eq!(it.next(), None);
+        assert!(!it.is_malformed());
+    }
+
+    #[test]
+    fn test_json_array_iter_yields_unquoted_tokens_rather_than_skipping_them() {
+        // Bare numbers used to be INVISIBLE: skipped silently, shifting
+        // every later field left and mis-assigning prices to quantities.
+        let mut it = JsonArrayIter::new(br#"["100",1472.8,"635",null,true]"#).expect("iter");
+        assert_eq!(it.next(), Some("100"));
+        assert_eq!(it.next(), Some("1472.8"), "a bare number is an ELEMENT");
+        assert_eq!(it.next(), Some("635"));
+        assert_eq!(it.next(), Some("null"));
+        assert_eq!(it.next(), Some("true"));
+        assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn test_json_array_iter_skips_a_bracket_inside_a_string() {
+        // Anchoring on the first `[` anywhere would start iterating inside
+        // the message text.
+        let it =
+            JsonArrayIter::new(br#"{"message":"bad [req]","trade":["42","7"]}"#).expect("iter");
+        let got: [Option<&str>; 3] = {
+            let mut it = it;
+            [it.next(), it.next(), it.next()]
+        };
+        assert_eq!(got[0], Some("42"), "must anchor on the real array");
+        assert_eq!(got[1], Some("7"));
+        assert_eq!(got[2], None);
+    }
+
+    #[test]
+    fn test_decode_trade_json_rejects_extra_trailing_fields() {
+        // A vendor-added 20th field used to be dropped in silence while we
+        // kept trusting positions 1-19 that may have shifted.
+        let mut frame = Vec::from(&TRADE_19[..TRADE_19.len() - 2]);
+        frame.extend_from_slice(br#","999"]}"#);
+        assert!(
+            decode_trade_json(&frame).is_err(),
+            "a 20-field trade must error, not decode as 19"
+        );
+    }
+
+    #[test]
+    fn test_json_nested_array_iter_rejects_an_empty_key() {
+        // `windows(0)` panics, and the release profile aborts on panic.
+        assert!(JsonNestedArrayIter::new(b"[[\"a\"]]", b"").is_none());
+    }
 
     #[test]
     fn test_parse_iso_timestamp_matches_known_epoch() {
@@ -1010,6 +1491,12 @@ impl<'a> JsonNestedArrayIter<'a> {
     /// Returns `None` when the key is absent.
     #[must_use]
     pub fn new(raw: &'a [u8], key: &[u8]) -> Option<Self> {
+        // `slice::windows(0)` PANICS, and the release profile aborts on
+        // panic. A public constructor accepting an arbitrary key must not
+        // carry that edge.
+        if key.is_empty() {
+            return None;
+        }
         // O(1) EXEMPT: begin
         // Locating the key requires scanning — inherent to a JSON wire and
         // explicitly the non-O(1) fallback path (module complexity table).
@@ -1233,58 +1720,49 @@ pub struct TruedataBidAskL2 {
     pub total_ask_qty: i64,
 }
 
-/// Decodes a `{"bidaskL2":[...]}` frame (BSE only, v2.6 p.17).
+/// Refuses a `{"bidaskL2":[...]}` frame (BSE 5-level depth).
 ///
-/// Layout: symbol id, timestamp, then five groups of
-/// (bid orders, bid price, bid qty, ask orders, ask price, ask qty),
-/// then total bid qty and total ask qty.
+/// This is a decoder-shaped REFUSAL, matching
+/// [`super::truedata_aux::decode_bidask_l2_binary`]. Both paths refuse the
+/// same wire for the same reason, so no route can ever emit depth we are
+/// not sure of.
 ///
-/// The totals are read from the END of the array rather than a fixed
-/// index, so a vendor field-count drift in the level block degrades to a
-/// typed error instead of silently shifting every price.
+/// # Why it is refused
+///
+/// The layout is contested three ways, and this decoder previously guessed
+/// one of the three:
+///
+/// 1. **Field count.** It expected 34 elements (2 header + 5×6 + 2). The
+///    v2.6 p.17 sample carries **35** — there is a `seq_no` after the
+///    timestamp that the prose never mentions. So the decoder would have
+///    rejected the vendor's own documented frame, while the unit test
+///    passed because its fixture was built to the wrong shape.
+/// 2. **Field order within a level.** The prose says
+///    `count, price, qty`; the SDK's binary map says `price, qty, count`.
+/// 3. **Grouping.** The prose reads as five bid/ask groups; decoding the
+///    PDF's actual sample only yields a coherent book (bids descending
+///    65280 → 65120.75 → 65050 → 65010, asks ascending
+///    65540.75 → 65980 → 65989) under an INTERLEAVED reading.
+///
+/// # The resolved candidate, for the day-0 probe
+///
+/// `[symbol_id, timestamp, seq_no]` then five levels of
+/// `(bid_price, bid_qty, bid_orders, ask_price, ask_qty, ask_orders)`,
+/// then `total_bid_qty, total_ask_qty` — 35 elements; the binary twin is a
+/// uniform 24 bytes per level starting at offset 13, totals at 133/137,
+/// **141 bytes**. One captured frame confirms or refutes this. Until one
+/// does, wrong depth is strictly worse than absent depth, and BSE 5-level
+/// depth is outside the subscription scope anyway.
 ///
 /// # Errors
-/// [`TruedataDecodeError::UnexpectedLength`] when the array is too short
-/// to carry the documented structure.
+/// Always [`TruedataDecodeError::UnexpectedLength`] with `msg_code = b'2'`,
+/// carrying the observed element count so a captured frame can be compared
+/// against the candidate above.
 pub fn decode_bidask_l2_json(raw: &[u8]) -> Result<TruedataBidAskL2, TruedataDecodeError> {
-    let bad = |n: usize| TruedataDecodeError::UnexpectedLength {
+    let n = JsonArrayIter::new(raw).map_or(0, Iterator::count);
+    Err(TruedataDecodeError::UnexpectedLength {
         msg_code: b'2',
         len: n,
-    };
-    // 2 header + 5*6 levels + 2 totals
-    const EXPECTED: usize = 2 + TD_BIDASK_L2_LEVELS * 6 + 2;
-    let iter = JsonArrayIter::new(raw).ok_or_else(|| bad(0))?;
-    let mut fields: [&str; EXPECTED] = [""; EXPECTED];
-    let mut n = 0usize;
-    for item in iter {
-        if n >= EXPECTED {
-            // Extra fields: vendor drift. Fail typed rather than mis-index.
-            return Err(bad(n.saturating_add(1)));
-        }
-        fields[n] = item;
-        n = n.saturating_add(1);
-    }
-    if n != EXPECTED {
-        return Err(bad(n));
-    }
-    let mut levels = [TruedataL2Level::default(); TD_BIDASK_L2_LEVELS];
-    for (lvl, slot) in levels.iter_mut().enumerate() {
-        let base = 2usize.saturating_add(lvl.saturating_mul(6));
-        *slot = TruedataL2Level {
-            bid_orders: parse_i32(fields[base]).unwrap_or(0),
-            bid_price: parse_f32(fields[base.saturating_add(1)]).unwrap_or(0.0),
-            bid_qty: parse_i32(fields[base.saturating_add(2)]).unwrap_or(0),
-            ask_orders: parse_i32(fields[base.saturating_add(3)]).unwrap_or(0),
-            ask_price: parse_f32(fields[base.saturating_add(4)]).unwrap_or(0.0),
-            ask_qty: parse_i32(fields[base.saturating_add(5)]).unwrap_or(0),
-        };
-    }
-    Ok(TruedataBidAskL2 {
-        symbol_id: parse_i32(fields[0]).ok_or_else(|| bad(0))?,
-        timestamp_secs: parse_iso_timestamp(fields[1]).ok_or_else(|| bad(1))?,
-        levels,
-        total_bid_qty: parse_i64(fields[EXPECTED.saturating_sub(2)]).unwrap_or(0),
-        total_ask_qty: parse_i64(fields[EXPECTED.saturating_sub(1)]).unwrap_or(0),
     })
 }
 
@@ -1358,28 +1836,34 @@ mod nested_tests {
     }
 
     #[test]
-    fn test_decode_bidask_l2_json_parses_five_levels_and_totals() {
-        // 2 header + 30 level fields + 2 totals = 34.
-        let mut s = String::from(r#"{"bidaskL2":["490000010","2023-07-05T09:15:44""#);
-        for lvl in 0..5 {
-            let base = 100 + lvl * 10;
-            s.push_str(&format!(
-                r#","1","{}","{}","2","{}","{}""#,
-                base,
-                base + 1,
-                base + 2,
-                base + 3
-            ));
-        }
-        s.push_str(r#","120","110"]}"#);
-        let l2 = decode_bidask_l2_json(s.as_bytes()).expect("L2 decodes");
-        assert_eq!(l2.symbol_id, 490_000_010);
-        assert_eq!(l2.total_bid_qty, 120);
-        assert_eq!(l2.total_ask_qty, 110);
-        assert_eq!(l2.levels.len(), TD_BIDASK_L2_LEVELS);
-        assert_eq!(l2.levels[0].bid_orders, 1);
-        assert!((l2.levels[0].bid_price - 100.0).abs() < 0.01);
-        assert_eq!(l2.levels[4].ask_qty, 143);
+    fn test_decode_bidask_l2_json_refuses_rather_than_guessing() {
+        // The v2.6 p.17 sample, VERBATIM — 35 elements, including the
+        // seq_no the prose never mentions. The previous decoder expected
+        // 34 and would have rejected this real frame while its own
+        // hand-built 34-field fixture passed.
+        let sample = br#"{"bidaskL2":["490000010","2023-07-05T09:15:44","0","65280","10","1","65540.75","10","1","65120.75","10","1","65980","50","1","65050","50","1","65989","50","1","65010","50","1","0","0","0","0","0","0","0","0","0","120","110"]}"#;
+        let got = decode_bidask_l2_json(sample);
+        assert!(
+            matches!(
+                got,
+                Err(TruedataDecodeError::UnexpectedLength { msg_code: b'2', .. })
+            ),
+            "L2 must refuse until the layout is probed, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_bidask_l2_json_refusal_reports_the_element_count() {
+        // The count is the whole point of the refusal: it is what a
+        // captured frame gets compared against on day 0.
+        let short = br#"{"bidaskL2":["490000010","2023-07-05T09:15:44","1","2"]}"#;
+        assert_eq!(
+            decode_bidask_l2_json(short),
+            Err(TruedataDecodeError::UnexpectedLength {
+                msg_code: b'2',
+                len: 4
+            })
+        );
     }
 
     #[test]

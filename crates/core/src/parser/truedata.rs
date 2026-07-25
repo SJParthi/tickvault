@@ -1,8 +1,8 @@
 //! TrueData (feed #4) wire decoder — binary-first, JSON-fallback.
 //!
 //! **Ground truth:** `TrueData Market Data API Documentation v 2.6`
-//! (20 Feb 2025) pages 10–18, plus the OFFICIAL Python SDK (`truedata`
-//! 7.0.1, `truedata/websocket/`), as reconciled in
+//! (20 Feb 2025) pages 10–18, plus the vendor's OFFICIAL reference client
+//! (`truedata` 7.0.1, `truedata/websocket/`), as reconciled in
 //! `.claude/rules/project/truedata-feed-scope-2026-07-24.md` §11.
 //!
 //! # Why two paths
@@ -84,7 +84,7 @@ pub const TD_MSG_CODE_HEARTBEAT: u8 = b'H';
 pub const TD_MSG_CODE_MARKET_STATUS: u8 = b'M';
 
 // The codes below are NOT in the v2.6 PDF's binary tables — they were
-// recovered from the OFFICIAL Python SDK's `msg_map`
+// recovered from the vendor's OFFICIAL reference client `msg_map`
 // (truedata 7.0.1, `truedata/websocket/compression_map.py`), which is the
 // authoritative decoder TrueData ships. Every offset in that map for `T`,
 // `A`, `H` and `M` matches this module byte-for-byte, so the map is
@@ -135,7 +135,7 @@ pub const TD_TRADE_BINARY_LEN_FULL: usize = 90;
 
 /// Trade frame WITHOUT bid/ask — 74 bytes, message code `W`.
 ///
-/// **CONFIRMED by the official Python SDK** (`truedata` 7.0.1,
+/// **CONFIRMED by the vendor's official reference client** (`truedata` 7.0.1,
 /// `truedata/websocket/compression_map.py`): `msg_map["W"]` lists exactly
 /// 16 fields ending at `seq_no` (offset 70, 4 bytes) — 74 total — with
 /// byte-identical offsets to `T` for every shared field. v2.6 p.16
@@ -172,7 +172,33 @@ const OFF_BID_QTY: usize = 78; // int, 4B
 const OFF_ASK: usize = 82; // float, 4B
 const OFF_ASK_QTY: usize = 86; // int, 4B
 
-// Compile-time proof that the offset map exactly tiles the documented frame.
+// Compile-time proof that the offset map exactly tiles the documented
+// frame — the FULL chain, field by field.
+//
+// Asserting only the frame ends was not the proof the comment claimed: a
+// typo in a middle offset (`OFF_HIGH = 34` instead of 33) still ends the
+// frame at 90 and still passes, while silently reading High from the wrong
+// bytes. That is precisely the silent-corruption class this module exists
+// to prevent, so every adjacency is pinned.
+const _: () = assert!(OFF_SYMBOL_ID == OFF_MSG_CODE + 1);
+const _: () = assert!(OFF_TIMESTAMP == OFF_SYMBOL_ID + 4);
+const _: () = assert!(OFF_LTP == OFF_TIMESTAMP + 4);
+const _: () = assert!(OFF_VOLUME == OFF_LTP + 4);
+const _: () = assert!(OFF_ATP == OFF_VOLUME + 4);
+const _: () = assert!(OFF_TOT_VOLUME == OFF_ATP + 4);
+const _: () = assert!(OFF_OPEN == OFF_TOT_VOLUME + 8);
+const _: () = assert!(OFF_HIGH == OFF_OPEN + 4);
+const _: () = assert!(OFF_LOW == OFF_HIGH + 4);
+const _: () = assert!(OFF_PREV_CLOSE == OFF_LOW + 4);
+const _: () = assert!(OFF_OI == OFF_PREV_CLOSE + 4);
+const _: () = assert!(OFF_PREV_OI == OFF_OI + 8);
+const _: () = assert!(OFF_TURNOVER == OFF_PREV_OI + 8);
+const _: () = assert!(OFF_OHL == OFF_TURNOVER + 8);
+const _: () = assert!(OFF_SEQ_NO == OFF_OHL + 1);
+const _: () = assert!(OFF_BID == OFF_SEQ_NO + 4);
+const _: () = assert!(OFF_BID_QTY == OFF_BID + 4);
+const _: () = assert!(OFF_ASK == OFF_BID_QTY + 4);
+const _: () = assert!(OFF_ASK_QTY == OFF_ASK + 4);
 const _: () = assert!(OFF_ASK_QTY + 4 == TD_TRADE_BINARY_LEN_FULL);
 const _: () = assert!(OFF_SEQ_NO + 4 == TD_TRADE_BINARY_LEN_QUOTE_ONLY);
 const _: () = assert!(OFF_BID == TD_TRADE_BINARY_LEN_QUOTE_ONLY);
@@ -451,6 +477,17 @@ pub enum TradeSanity {
     LtpOutsideDayRange,
     /// Cumulative day volume was negative.
     NegativeTotVolume,
+    /// Turnover was NaN or infinite.
+    ///
+    /// Turnover is the one `f64` on the frame and was previously exempt
+    /// from the finiteness sweep, so a NaN there passed as `Plausible`.
+    NonFiniteTurnover,
+    /// Open interest (current or previous) was negative.
+    ///
+    /// Same reasoning as [`Self::NegativeTotVolume`]: the vendor sends OI
+    /// unsigned, so a negative is a corrupt read. These two fields had no
+    /// tripwire at all.
+    NegativeOpenInterest,
 }
 
 impl TradeSanity {
@@ -487,8 +524,15 @@ impl TradeSanity {
                 return Self::NegativePrice;
             }
         }
+        if !trade.turnover.is_finite() {
+            return Self::NonFiniteTurnover;
+        }
         if trade.tot_volume < 0 {
             return Self::NegativeTotVolume;
+        }
+        // The vendor sends OI unsigned; a negative here is a corrupt read.
+        if trade.oi < 0 || trade.prev_oi < 0 {
+            return Self::NegativeOpenInterest;
         }
         // Pre-open frames legitimately carry 0 high/low — only compare once
         // the session has actually traded.
@@ -534,10 +578,15 @@ impl TradeSanity {
 #[inline]
 #[must_use]
 pub const fn saturate_tot_volume(tot_volume: i64) -> (u32, bool) {
-    if tot_volume <= 0 {
-        // Negative is nonsensical for cumulative volume (and is caught by
-        // TradeSanity); clamp to 0 without flagging saturation.
-        (0, false)
+    if tot_volume < 0 {
+        // NEGATIVE is nonsensical for cumulative volume. The vendor sends
+        // this field unsigned, so a negative here means the top bit is set:
+        // a corrupt or mis-framed read, not a real quantity. It is clamped
+        // to 0 AND flagged, because a silent zero-volume tick with no
+        // counter firing is exactly the invisible-corruption case the flag
+        // exists to surface. (A genuine zero is handled below and is NOT
+        // flagged — a symbol with no trades yet legitimately has zero.)
+        (0, true)
     } else if tot_volume > u32::MAX as i64 {
         (u32::MAX, true)
     } else {
@@ -739,6 +788,87 @@ mod tests {
     }
 
     // --- trade decode ---
+
+    /// The v2.6 p.16 sample as RAW BYTES, generated outside this codebase.
+    ///
+    /// Every other fixture writes fields through the same `OFF_*` constants
+    /// the decoder reads back, so swapping two offsets in source keeps all
+    /// of them green — the test proves the constants are self-consistent,
+    /// not that they are RIGHT. This vector was produced independently
+    /// (little-endian `struct.pack` against the documented offsets) and
+    /// references no constant, so a swapped offset fails here and only
+    /// here. Field values are deliberately all-distinct for the same
+    /// reason: identical neighbours make a swap invisible.
+    const GOLDEN_TRADE_90: [u8; 90] = [
+        0x54, 0xe3, 0xe4, 0xf5, 0x05, 0xf0, 0xe6, 0xd9, 0x5f, 0x9a, //
+        0x19, 0xb8, 0x44, 0x7b, 0x02, 0x00, 0x00, 0x8f, 0x7a, 0xb8, //
+        0x44, 0xf5, 0x63, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9a, //
+        0x61, 0xb8, 0x44, 0x00, 0x80, 0xb9, 0x44, 0x00, 0xe0, 0xb6, //
+        0x44, 0x33, 0x8b, 0xb7, 0x44, 0x6f, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0x00, 0xde, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x8f, 0xc2, 0x55, 0x31, 0x46, 0xf3, 0xcd, 0x41, 0x4f, //
+        0xa7, 0x12, 0x00, 0x00, 0x9a, 0x19, 0xb8, 0x44, 0xad, 0x01, //
+        0x00, 0x00, 0x9a, 0x29, 0xb8, 0x44, 0x22, 0x00, 0x00, 0x00, //
+    ];
+
+    #[test]
+    fn test_decode_trade_binary_golden_bytes_pin_every_offset() {
+        let t = decode_trade_binary(&GOLDEN_TRADE_90).expect("golden frame must decode");
+        assert_eq!(t.symbol_id, 100_000_995);
+        assert_eq!(t.timestamp_secs, 1_608_115_952);
+        assert!((t.ltp - 1472.8).abs() < 0.001, "ltp {}", t.ltp);
+        assert_eq!(t.last_trade_qty, 635);
+        assert!((t.atp - 1475.83).abs() < 0.001, "atp {}", t.atp);
+        assert_eq!(t.tot_volume, 680_949);
+        assert!((t.open - 1475.05).abs() < 0.001, "open {}", t.open);
+        assert!((t.high - 1484.0).abs() < 0.001, "high {}", t.high);
+        assert!((t.low - 1463.0).abs() < 0.001, "low {}", t.low);
+        assert!(
+            (t.prev_close - 1468.35).abs() < 0.001,
+            "prev_close {}",
+            t.prev_close
+        );
+        // Distinct values: an oi/prev_oi swap is visible.
+        assert_eq!(t.oi, 111);
+        assert_eq!(t.prev_oi, 222);
+        assert!((t.turnover - 1_004_964_962.67).abs() < 0.01);
+        assert_eq!(t.special_tag, b'O');
+        assert_eq!(t.seq_no, 4775);
+        assert_eq!(t.bid_qty, Some(429));
+        assert_eq!(t.ask_qty, Some(34));
+        assert!((t.bid.expect("bid") - 1472.8).abs() < 0.001);
+        assert!((t.ask.expect("ask") - 1473.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_golden_trade_agrees_with_the_offset_built_fixture() {
+        // Ties the two fixture styles together: if the builder and the
+        // golden vector ever disagree, one of them is wrong and the build
+        // says so instead of quietly trusting the builder.
+        let built = build_trade_frame(
+            100_000_995,
+            1_608_115_952,
+            1472.8,
+            635,
+            1475.83,
+            680_949,
+            1475.05,
+            1484.0,
+            1463.0,
+            1468.35,
+            111,
+            222,
+            1_004_964_962.67,
+            b'O',
+            4775,
+            Some((1472.8, 429, 1473.3, 34)),
+        );
+        assert_eq!(
+            built.as_slice(),
+            GOLDEN_TRADE_90.as_slice(),
+            "the offset-built frame must match the independently-generated bytes"
+        );
+    }
 
     #[test]
     fn test_decode_trade_binary_sample_roundtrips_fields() {
@@ -965,8 +1095,21 @@ mod tests {
     }
 
     #[test]
-    fn test_tot_volume_negative_clamps_to_zero_unflagged() {
-        assert_eq!(saturate_tot_volume(-5), (0, false));
+    fn test_saturate_tot_volume_negative_clamps_to_zero_and_is_flagged() {
+        // The vendor sends this field UNSIGNED, so a negative means the top
+        // bit is set: a corrupt or mis-framed read, not a quantity. It used
+        // to clamp to zero with `saturated = false`, which meant the
+        // counter never fired and the tick persisted as a silent
+        // zero-volume print — invisible corruption, the worst class.
+        assert_eq!(saturate_tot_volume(-1), (0, true));
+        assert_eq!(saturate_tot_volume(i64::MIN), (0, true));
+    }
+
+    #[test]
+    fn test_saturate_tot_volume_genuine_zero_is_not_flagged() {
+        // A symbol with no trades yet legitimately has zero volume; that
+        // must NOT trip the corruption counter or the signal is noise.
+        assert_eq!(saturate_tot_volume(0), (0, false));
     }
 
     // --- sequence gap detection ---
