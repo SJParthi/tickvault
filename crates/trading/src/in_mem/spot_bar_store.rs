@@ -12,8 +12,13 @@
 //! Per `(feed, security_id, exchange_segment)` slot (I-P1-11 composite —
 //! `security_id` alone is never a key) × per [`TfIndex`] ring of SEALED
 //! bars. Ring capacity = `spot_days` (config, default 35) ×
-//! [`bars_per_day`] for that TF (Σ over the 21 TFs = 1,279 bars/day/slot;
-//! ~17 MB at 8 slots × 35 days — test-asserted under a 40 MB ceiling).
+//! [`bars_per_day`] for that TF (Σ over the 5 RAM-resident TFs = 601
+//! bars/day/slot; ~17 MB at 8 slots × 35 days — test-asserted under a
+//! 40 MB ceiling). The 16 GDF-gated second-scale frames (C3) are
+//! allocated as capacity-1 placeholders (16 × 48 B = 768 B/slot) — ZERO
+//! rows until the GDF 1s live feed lands; full-formula rings for them
+//! (Σ 75_413 bars/day/slot) would be ~966 MB at 8 × 35, blowing the
+//! t4g.medium envelope for frames no feed writes yet.
 //! [`RamBar`] is a 48-byte `Copy` struct; rings are `VecDeque<RamBar>`
 //! pre-allocated at slot creation — the steady-state live write is an O(1)
 //! `push_back` with front eviction, no per-append allocation.
@@ -86,13 +91,19 @@ pub const fn bars_per_day(tf: TfIndex) -> u32 {
     if bars == 0 { 1 } else { bars }
 }
 
-/// Σ [`bars_per_day`] over all 21 TFs — the per-slot per-day bar count
-/// (1,279; pinned by `test_bars_per_day_session_math`).
+/// Σ [`bars_per_day`] over the RAM-RESIDENT frames (the 5-frame live
+/// minute/day set) — the per-slot per-day bar count (601; pinned by
+/// `test_bars_per_day_session_math`). The 16 GDF-gated second-scale
+/// frames are EXCLUDED: they are capacity-1 placeholders with ZERO rows
+/// until the GDF 1s feed lands, never part of the resident-bar total.
 #[must_use]
 // TEST-EXEMPT: pure Σ over bars_per_day — pinned by test_bars_per_day_session_math + the capacity-envelope tests.
 pub fn total_bars_per_day_all_tfs() -> u32 {
     let mut total = 0u32;
     for tf in TfIndex::ALL {
+        if tf.is_second_scale() {
+            continue; // GDF-gated placeholder — zero rows until the GDF feed.
+        }
         total += bars_per_day(tf);
     }
     total
@@ -328,7 +339,15 @@ impl SpotBarStore {
         }
         let mut rings = Vec::with_capacity(TF_COUNT);
         for tf in TfIndex::ALL {
-            let capacity = (bars_per_day(tf) as usize) * (self.spot_days as usize);
+            // GDF-gated second-scale frames (C3): capacity-1 placeholder —
+            // ZERO rows until the GDF 1s live feed lands (separate lane).
+            // The full session formula (e.g. S1 = 22_500 bars/day) would
+            // pre-allocate ~966 MB of empty rings across 8 slots × 35 days.
+            let capacity = if tf.is_second_scale() {
+                1
+            } else {
+                (bars_per_day(tf) as usize) * (self.spot_days as usize)
+            };
             rings.push(TfRing::new(capacity.max(1)));
         }
         let slot = std::sync::Arc::new(Slot {
@@ -452,9 +471,20 @@ impl SpotBarStore {
             let feed_idx = slot.key.feed.index();
             seen_feed[feed_idx] = true;
             let rings = slot.rings.read();
-            for ring in rings.iter() {
+            for (ordinal, ring) in rings.iter().enumerate() {
+                // Resident bars count over EVERY ring (a GDF-gated ring that
+                // ever gains a row must show up here); the byte ESTIMATE
+                // covers the RAM-resident live-frame rings only — the 16
+                // second-scale placeholders are a pinned 768 B/slot
+                // (test_second_scale_rings_are_capacity_one_placeholders).
                 bars_resident_per_feed[feed_idx] += ring.bars.len() as u64;
-                estimated_bytes += (ring.capacity as u64) * (core::mem::size_of::<RamBar>() as u64);
+                let second_scale = TfIndex::from_ordinal(ordinal)
+                    .map(TfIndex::is_second_scale)
+                    .unwrap_or(false);
+                if !second_scale {
+                    estimated_bytes +=
+                        (ring.capacity as u64) * (core::mem::size_of::<RamBar>() as u64);
+                }
             }
             drop(rings);
             let depth = self.depth_days(slot.key);
@@ -529,13 +559,11 @@ mod tests {
     fn test_bars_per_day_session_math() {
         // ceil(22_500 / tf_secs), floored at 1 — spot-checked + summed.
         assert_eq!(bars_per_day(TfIndex::M1), 375);
-        assert_eq!(bars_per_day(TfIndex::M2), 188);
+        assert_eq!(bars_per_day(TfIndex::M3), 125);
+        assert_eq!(bars_per_day(TfIndex::M5), 75);
         assert_eq!(bars_per_day(TfIndex::M15), 25);
-        assert_eq!(bars_per_day(TfIndex::M30), 13);
-        assert_eq!(bars_per_day(TfIndex::H1), 7);
-        assert_eq!(bars_per_day(TfIndex::H4), 2);
         assert_eq!(bars_per_day(TfIndex::D1), 1);
-        assert_eq!(total_bars_per_day_all_tfs(), 1_279);
+        assert_eq!(total_bars_per_day_all_tfs(), 601);
         assert_eq!(SESSION_SECS, 22_500);
     }
 
@@ -544,8 +572,8 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 1_279 × 35 × 8 × 48 = 17_189_760 B ≈ 16.4 MiB.
-        assert_eq!(bytes, 17_189_760);
+        // 601 × 35 × 8 × 48 = 8_077_440 B ≈ 7.7 MiB.
+        assert_eq!(bytes, 8_077_440);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -591,24 +619,24 @@ mod tests {
 
     #[test]
     fn test_spot_bar_store_wraparound_evicts_oldest() {
-        // spot_days=1 → M30 capacity = 13 bars; the 14th append evicts the
+        // spot_days=1 → M15 capacity = 25 bars; the 26th append evicts the
         // oldest, and an over-window old bar is dropped (never displaces).
         let store = SpotBarStore::new(1);
-        let cap = bars_per_day(TfIndex::M30) as usize;
-        assert_eq!(cap, 13);
+        let cap = bars_per_day(TfIndex::M15) as usize;
+        assert_eq!(cap, 25);
         for i in 0..(cap as u32 + 1) {
-            store.append_sealed(key(), TfIndex::M30, bar(OPEN0 + i * 1_800, f64::from(i)));
+            store.append_sealed(key(), TfIndex::M15, bar(OPEN0 + i * 900, f64::from(i)));
         }
-        let bars = store.latest_n(key(), TfIndex::M30, 100);
+        let bars = store.latest_n(key(), TfIndex::M15, 100);
         assert_eq!(bars.len(), cap, "capacity must hold after wraparound");
         assert_eq!(
-            store.bar_at(key(), TfIndex::M30, OPEN0),
+            store.bar_at(key(), TfIndex::M15, OPEN0),
             None,
             "the oldest bar must be evicted"
         );
         // An over-window (older-than-front) bar at capacity is dropped.
         assert_eq!(
-            store.append_sealed(key(), TfIndex::M30, bar(OPEN0 - 1_800, 999.0)),
+            store.append_sealed(key(), TfIndex::M15, bar(OPEN0 - 900, 999.0)),
             UpsertOutcome::DroppedOverWindow
         );
         assert_eq!(store.stats().dropped_over_window, 1);
@@ -661,20 +689,20 @@ mod tests {
         // ring must keep the NEWEST `capacity` bars and drop the OLDEST
         // prefix — never the old keep-oldest/drop-newest direction.
         let store = SpotBarStore::new(1);
-        let cap = bars_per_day(TfIndex::M30) as usize; // 13
+        let cap = bars_per_day(TfIndex::M15) as usize; // 25
         let mut bars = Vec::with_capacity(cap + 2);
         for i in 0..(cap as u32 + 2) {
-            bars.push(bar(OPEN0 + i * 1_800, f64::from(i)));
+            bars.push(bar(OPEN0 + i * 900, f64::from(i)));
         }
-        let out = store.record_day_block(key(), TfIndex::M30, &bars);
+        let out = store.record_day_block(key(), TfIndex::M15, &bars);
         assert_eq!(out.recorded, cap, "exactly capacity bars recorded");
         assert_eq!(out.dropped_over_window, 2, "the 2 OLDEST bars dropped");
         // The oldest two are absent; the newest survives.
-        assert!(store.bar_at(key(), TfIndex::M30, OPEN0).is_none());
-        assert!(store.bar_at(key(), TfIndex::M30, OPEN0 + 1_800).is_none());
+        assert!(store.bar_at(key(), TfIndex::M15, OPEN0).is_none());
+        assert!(store.bar_at(key(), TfIndex::M15, OPEN0 + 900).is_none());
         assert_eq!(
             store
-                .bar_at(key(), TfIndex::M30, OPEN0 + (cap as u32 + 1) * 1_800)
+                .bar_at(key(), TfIndex::M15, OPEN0 + (cap as u32 + 1) * 900)
                 .map(|b| b.close),
             Some(f64::from(cap as u32 + 1)),
             "the NEWEST bar must be resident"
@@ -728,8 +756,50 @@ mod tests {
         assert_eq!(stats.bars_resident_per_feed[Feed::Groww.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Groww.index()], 1);
-        // Two slots × 1 day × 1,279 bars × 48 B of pre-allocated capacity.
-        assert_eq!(stats.estimated_bytes, 2 * 1_279 * 48);
+        // Two slots × 1 day × 601 bars × 48 B of pre-allocated capacity.
+        assert_eq!(stats.estimated_bytes, 2 * 601 * 48);
+    }
+
+    #[test]
+    fn test_second_scale_rings_are_capacity_one_placeholders() {
+        // C3: the 16 GDF-gated second-scale frames allocate capacity-1
+        // placeholder rings (ZERO rows until the GDF 1s feed lands — a
+        // pinned 16 × 48 B = 768 B/slot of actual heap) and are excluded
+        // from the RAM-resident bar total + byte estimate; the session
+        // formula stays honest for the future GDF capacity flip.
+        assert_eq!(bars_per_day(TfIndex::S1), 22_500);
+        assert_eq!(bars_per_day(TfIndex::S2), 11_250);
+        assert_eq!(bars_per_day(TfIndex::S15), 1_500);
+        assert_eq!(bars_per_day(TfIndex::S30), 750);
+        let mut gated_formula_total = 0u32;
+        for tf in TfIndex::ALL {
+            if tf.is_second_scale() {
+                gated_formula_total += bars_per_day(tf);
+            }
+        }
+        assert_eq!(gated_formula_total, 75_413, "gated formula sum drifted");
+        // The resident total + byte estimate exclude the gated frames.
+        assert_eq!(total_bars_per_day_all_tfs(), 601);
+        let store = SpotBarStore::new(35);
+        store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
+        let stats = store.stats();
+        assert_eq!(stats.estimated_bytes, 601 * 35 * 48);
+        let slot = store.find_slot(key()).expect("slot exists");
+        let rings = slot.rings.read();
+        assert_eq!(rings.len(), TF_COUNT, "one ring per TfIndex ordinal");
+        for (ordinal, ring) in rings.iter().enumerate() {
+            let tf = TfIndex::from_ordinal(ordinal).expect("ring ordinal");
+            if tf.is_second_scale() {
+                assert_eq!(ring.capacity, 1, "{tf:?} placeholder capacity drifted");
+                assert!(ring.bars.is_empty(), "{tf:?} must hold ZERO rows pre-GDF");
+            } else {
+                assert_eq!(
+                    ring.capacity,
+                    (bars_per_day(tf) as usize) * 35,
+                    "{tf:?} live-frame ring capacity drifted"
+                );
+            }
+        }
     }
 
     #[test]
