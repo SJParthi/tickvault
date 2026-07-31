@@ -4976,8 +4976,32 @@ mod tests {
         // Both boundaries are exact minute marks.
         assert_eq!(SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST % 60, 0);
         assert_eq!(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST % 60, 0);
-        assert_eq!(SPOT_1M_REST_FIRE_DELAY_MS, 300);
-        assert_eq!(SPOT_1M_REST_RETRY_OFFSETS_MS, [700, 1_500, 3_000, 6_000]);
+        // 2026-07-31 early-fire re-spacing (operator directive): the first
+        // attempt moved 300 ms -> 5 ms and the ladder gained two rungs. The
+        // OLD 300 ms instant survives as rung 4 (asserted below) — that is
+        // what makes the change never-worse than the previous schedule.
+        assert_eq!(SPOT_1M_REST_FIRE_DELAY_MS, 5);
+        assert_eq!(
+            SPOT_1M_REST_RETRY_OFFSETS_MS,
+            [45, 145, 295, 695, 1_495, 2_995]
+        );
+        // Absolute attempt instants, measured from the minute close.
+        let attempts: Vec<u64> = std::iter::once(SPOT_1M_REST_FIRE_DELAY_MS)
+            .chain(
+                SPOT_1M_REST_RETRY_OFFSETS_MS
+                    .iter()
+                    .map(|o| SPOT_1M_REST_FIRE_DELAY_MS + o),
+            )
+            .collect();
+        assert_eq!(attempts, vec![5, 50, 150, 300, 700, 1_500, 3_000]);
+        assert!(
+            attempts.contains(&300),
+            "the pre-2026-07-31 300 ms fire instant must remain a rung"
+        );
+        assert!(
+            attempts.iter().filter(|a| **a <= 800).count() >= 5,
+            "at least five attempts must land inside the operator's <800 ms window"
+        );
         assert!(
             SPOT_1M_REST_RETRY_OFFSETS_MS
                 .windows(2)
@@ -4989,7 +5013,11 @@ mod tests {
         // 2026-07-12 H2 fix: the REAL minute budget — short per-request
         // timeout + a hard per-SID ladder budget that fits the minute.
         assert_eq!(SPOT_1M_REST_REQUEST_TIMEOUT_SECS, 5);
-        assert_eq!(SPOT_1M_REST_SID_BUDGET_SECS, 20);
+        // 20 -> 22 with the early-fire re-spacing: the worst-case schedule
+        // assert charges a full 429 extra-backoff PER RUNG, so 4 -> 6 rungs
+        // adds 2 x 2 s to the hostile bound even though the LAST offset
+        // shrank (6_000 -> 2_995 ms). Net worst case 20_445 ms.
+        assert_eq!(SPOT_1M_REST_SID_BUDGET_SECS, 22);
         assert!(
             SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_SID_BUDGET_SECS * 1_000 < 60_000,
             "budget must finish inside the minute"
