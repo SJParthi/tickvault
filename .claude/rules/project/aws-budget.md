@@ -21,6 +21,53 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## OPERATOR RULING 2026-07-31 — kill-ceiling RAISED $25 → $35 (breach incident; ladder paused, TARGET unchanged)
+
+**The verbatim operator demands (2026-07-31 — typed directly in-session, preserve EXACTLY, typos included):**
+> "Raise the limit bro olay?"
+>
+> "Go ahead with recomemdnaetion bro okay?"
+>
+> "nommanaul inptu full yauotmated mtoehrfucekr okay?"
+
+**The incident (live AWS evidence, read 2026-07-31 ~08:00 IST, acct `208384284948`):**
+
+| Fact | Value |
+|---|---|
+| Budget | `tv-prod-monthly-budget-v2` |
+| LIMIT | $25.00 |
+| ACTUAL | **$27.47 = 109.9% — BREACHED** |
+| FORECAST | $28.72 |
+| Actions armed | **2** — `RUN_SSM_DOCUMENTS` / `STOP_EC2_INSTANCES` on `i-0b956d0209231a48b`, `ApprovalModel=AUTOMATIC`, thresholds **90%** and **100%** |
+| Action status | **both `EXECUTION_FAILURE`** — repeatedly attempting to auto-stop the prod box mid-session while failing to complete |
+
+Effect: continuous budget alerts + an unreliable prod box during trading hours. EventBridge rules were verified **all 17 ENABLED** (incl. `tv-prod-daily-start` `cron(0 3 ? * MON-FRI *)` = 08:30 IST and `tv-prod-daily-stop` `cron(0 11 ? * MON-FRI *)` = 16:30 IST) — the killswitch had **not** disabled the start cron, so the ceiling was the sole blocker.
+
+**Why $35 (arithmetic — the actions fire at 90%/100% of the NEW limit):**
+
+| New limit | 90% line | vs ACTUAL $27.47 | vs FORECAST $28.72 | Verdict |
+|---|---|---|---|---|
+| $30 | $27.00 | ❌ already below actual | ❌ | re-trips immediately |
+| $32 | $28.80 | ✅ | ⚠️ 90% | tight |
+| **$35** | **$31.50** | ✅ | ✅ (82%) | **chosen** |
+
+**Status of the 2026-07-19 ruling:** the **< ₹1,000/mo TARGET stands unchanged** and the lever table below remains the plan of record. Only the **kill CEILING** is raised; the downward ratchet ladder ($25 → $18 → $13 → $10) is **PAUSED, not cancelled** — it resumes once the standing waste below is cut.
+
+**Standing waste NOT addressed by this raise (~$8.31/mo, Cost Explorer, 2026-07-31):**
+
+| Line | $/mo | Action |
+|---|---|---|
+| AWS Cost Explorer API | **2.38** | 238 calls @ $0.01 — something polls the bill; find + stop the caller |
+| VPC / Elastic IP | **3.55** | release already approved (2026-07-19 SECOND ruling, bundled with the recreate) |
+| CloudWatch alarms | **3.27** | trim menu below |
+| Secrets Manager | **0.38** | repo standard is free-tier SSM Parameter Store — delete stale secrets |
+
+Cutting those lands **~$19.43/mo — back under even the OLD $25 ceiling**, which is the precondition for resuming the ladder.
+
+**3-way lockstep applied in this PR:** `budget.tf limit_amount "35"` + `budget-guards.tf BUDGET_KILL_USD "35"` + `budget_digest.rs BUDGET_USD = 35.0` (+ its two pinned render tests). `hard_stop_guard.rs DEFAULT_BUDGET_KILL_USD = 55.0` remains the env-missing FALLBACK only (the env var is always injected; fail direction = kills later, never earlier) — aligning it stays a flagged follow-up.
+
+---
+
 ## OPERATOR RULING 2026-07-19 — sub-₹1,000/month hard budget target (30 GB accepted; grow CANCELLED)
 
 **The verbatim operator demand (2026-07-19 — preserve EXACTLY, typos included):**
