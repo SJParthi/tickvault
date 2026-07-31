@@ -462,15 +462,18 @@ Override per environment via `config/{env}.toml` or env vars.
 | Pre-push gates | `.claude/hooks/pre-push-gate.sh` |
 | Active plan | `.claude/plans/active-plan.md` |
 | Codebase map | `docs/architecture/codebase-map.md` |
-| DhanHQ agent skill (READ-ONLY ref) | `.claude/skills/dhanhq/` (from `github.com/dhan-oss/dhanhq-skills`) |
+| Dhan API reference (sole) | `docs/dhan-ref/*.md` (21 files) |
 
-> **DhanHQ agent skill — READ-ONLY API reference.** The `dhanhq` skill in
-> `.claude/skills/dhanhq/` (upstream `github.com/dhan-oss/dhanhq-skills`) is
-> installed ONLY as up-to-date DhanHQ API documentation. **Rule 1:** it is NEVER
-> used to place/modify/cancel live orders before July 2026, and its order/execution
-> scripts + examples are NEVER run. **Rule 2:** its Python reference code must NOT
-> enter the production Rust order path or schema. Use it for fact-checking the Dhan
-> REST/WS surface only — alongside `docs/dhan-ref/*.md`.
+> **DhanHQ agent skill — REMOVED 2026-07-31 (zero-interpreted-language purge).**
+> The `.claude/skills/dhanhq/` tree (upstream `github.com/dhan-oss/dhanhq-skills`)
+> was a vendor SDK reference written entirely in an interpreted language — 15
+> example/helper scripts plus 95 fenced code blocks — and was deleted under the
+> operator's 2026-07-31 directive (§0 of
+> `.claude/rules/project/rust-only-forever-lock-2026-07-19.md`). It was always
+> reference-only: never executed, never permitted into the production Rust order
+> path. **`docs/dhan-ref/*.md` (21 files) is now the SOLE Dhan API reference** and
+> was already the authority the old note pointed at ("alongside
+> `docs/dhan-ref/*.md`"); no API fact is lost with the skill.
 
 ## DHAN SUPPORT COMMUNICATIONS
 

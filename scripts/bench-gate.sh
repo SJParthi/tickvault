@@ -220,7 +220,7 @@ FILENAME == budgets_file {
 # ---- absolute-budget arm: N <rel-root> <median_ns> ----
 $1 == "N" {
   bench = $2
-  gsub(/\/new/, "", bench)        # python .replace("/new", "") — all occurrences
+  gsub(/\/new/, "", bench)        # legacy .replace("/new", "") — all occurrences
   gsub(/\//, "_", bench)
   bench = tolower(bench)
   median_ns = $3 + 0
