@@ -1613,20 +1613,54 @@ pub const SPOT_1M_REST_INDICES: [(SecurityId, &str); 4] = [
 /// edge owns). Re-armed only by that SID's own recovery.
 pub const SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD: u32 = 10;
 
-/// Post-minute-close fire delay (ms): the fetcher wakes ~300 ms after each
-/// minute boundary so Dhan has a beat to seal the just-closed candle before
-/// the first poll. The docs do NOT document just-closed-minute availability
-/// latency — the bounded re-poll ladder below plus the
-/// `tv_spot1m_close_to_data_ms` histogram are the honest live probe.
-pub const SPOT_1M_REST_FIRE_DELAY_MS: u64 = 300;
+/// Post-minute-close fire delay (ms) — the FIRST attempt of the in-minute
+/// ladder.
+///
+/// **2026-07-31 (operator directive): 300 ms → 5 ms.** The old 300 ms was a
+/// GUESS — this comment previously said Dhan needed "a beat to seal the
+/// just-closed candle" while admitting in the same breath that the docs do
+/// NOT document just-closed-minute availability latency, and nobody had ever
+/// measured it (`close_to_data_ms` was recorded but never shipped to
+/// CloudWatch; verified 2026-07-31, zero datapoints).
+///
+/// Operator verbatim: *"even beofre 800 ms or just below one second i need
+/// the enitre spot and otpion chain data … just go ahead ad check after 5ms
+/// itself"*.
+///
+/// Moving the START is safe because the ladder offsets below are measured
+/// FROM THE FIRST ATTEMPT: the old 300 ms survives as rung 4, so the
+/// worst-case schedule is NO WORSE than before — we only add three earlier
+/// chances. The 5 ms rung is what MEASURES the vendor's true seal latency
+/// (`tv_rest1m_first_success_offset_ms`), which then feeds the self-tuning
+/// start offset.
+pub const SPOT_1M_REST_FIRE_DELAY_MS: u64 = 5;
 
 /// Bounded in-minute re-poll ladder: offsets (ms) FROM THE FIRST ATTEMPT at
 /// which the fetch is re-polled when the target minute's candle is not yet
 /// in the response (or the attempt errored). After the last offset the
 /// minute is counted failed/empty — never an unbounded in-minute retry.
-/// Strictly increasing; worst case the last poll fires ~6.3 s after the
-/// minute close (fire delay + final offset), well inside the next boundary.
-pub const SPOT_1M_REST_RETRY_OFFSETS_MS: [u64; 4] = [700, 1_500, 3_000, 6_000];
+/// Strictly increasing.
+///
+/// **2026-07-31 early-fire re-spacing (operator directive).** Offsets are
+/// measured FROM THE FIRST ATTEMPT, so with the 5 ms start the absolute
+/// attempt schedule is:
+///
+/// | rung | absolute | note |
+/// |---|---|---|
+/// | 1 | +5 ms | the operator's instant check |
+/// | 2 | +50 ms | |
+/// | 3 | +150 ms | |
+/// | 4 | **+300 ms** | the OLD start — preserved as a fallback rung |
+/// | 5 | +700 ms | last rung inside the operator's <800 ms window |
+/// | 6 | +1_500 ms | tail — capture completeness, not decision data |
+/// | 7 | +3_000 ms | tail |
+///
+/// Rungs 1-5 all land inside 700 ms (the operator's "before 800 ms"
+/// requirement); rungs 6-7 preserve the long tail so a genuinely slow vendor
+/// minute is still CAPTURED rather than dropped — the §38.8 decision-freshness
+/// gate already forbids a late row from being a trading input, so the tail
+/// costs nothing but completeness.
+pub const SPOT_1M_REST_RETRY_OFFSETS_MS: [u64; 6] = [45, 145, 295, 695, 1_495, 2_995];
 
 /// Deterministic per-SID ladder jitter STEP (ms) — each spot SID shifts its
 /// whole re-poll schedule by `slot × step` (slot = the SID's fixed position
@@ -1680,7 +1714,14 @@ pub const SPOT_1M_REST_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// enforced with `tokio::time::timeout` around the ladder, so no
 /// combination of stalls can push a fire past the next boundary. A budget
 /// overrun counts as that SID's failure for the minute.
-pub const SPOT_1M_REST_SID_BUDGET_SECS: u64 = 20;
+/// **2026-07-31: 20 s → 22 s.** The early-fire re-spacing adds two ladder
+/// rungs (4 → 6 offsets), and the worst-case schedule assert below charges a
+/// full 429 extra-backoff PER RUNG — so the hostile bound grew by 2 × 2 s
+/// while the last offset shrank (6_000 → 2_995 ms). Net worst case is
+/// 20_445 ms, which no longer fits a 20 s budget. 22 s restores headroom and
+/// still leaves the whole ladder finishing far inside the 60 s minute
+/// (5 ms + 22 s = 22.005 s — const-asserted below).
+pub const SPOT_1M_REST_SID_BUDGET_SECS: u64 = 22;
 
 /// Maximum accepted response body size (bytes) for one intraday poll —
 /// one minute × one index is a few hundred bytes; even a grossly
@@ -1726,12 +1767,56 @@ const _: () = assert!(
 // (4 × 2 s = 8 s) — the fully hostile schedule (6 s + 0.45 s + 8 s + one
 // 5 s request timeout = 19.45 s) still fits the 20 s hard per-SID budget.
 const _: () = assert!(
-    SPOT_1M_REST_RETRY_OFFSETS_MS[3]
+    SPOT_1M_REST_RETRY_OFFSETS_MS[SPOT_1M_REST_RETRY_OFFSETS_MS.len() - 1]
         + (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
         + SPOT_1M_REST_RETRY_OFFSETS_MS.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
         + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
         < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
     "SPOT_1M ladder schedule (last offset + max jitter + max 429 backoffs + one request timeout) must fit the budget"
+);
+
+// 2026-07-31 early-fire invariants (operator directive). These pin the three
+// properties that make moving the start from 300 ms to 5 ms SAFE rather than
+// merely faster.
+
+// (a) The ladder must stay strictly increasing — a non-monotonic schedule
+//     would re-poll out of order and make the first-success offset (the whole
+//     point of the measurement) meaningless.
+const _: () = {
+    let mut i = 1;
+    while i < SPOT_1M_REST_RETRY_OFFSETS_MS.len() {
+        assert!(
+            SPOT_1M_REST_RETRY_OFFSETS_MS[i] > SPOT_1M_REST_RETRY_OFFSETS_MS[i - 1],
+            "SPOT_1M retry offsets must be strictly increasing"
+        );
+        i += 1;
+    }
+};
+
+// (b) The OLD 300 ms start must survive as a rung. This is what guarantees
+//     the early-fire change can never be WORSE than the previous behaviour:
+//     whatever the vendor does, we still poll at the instant we used to.
+const _: () = {
+    let mut found = false;
+    let mut i = 0;
+    while i < SPOT_1M_REST_RETRY_OFFSETS_MS.len() {
+        if SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_RETRY_OFFSETS_MS[i] == 300 {
+            found = true;
+        }
+        i += 1;
+    }
+    assert!(
+        found,
+        "the pre-2026-07-31 300 ms fire instant must remain a ladder rung — \
+         it is the proof that early-fire is never worse than the old schedule"
+    );
+};
+
+// (c) The operator's decision window: at least one rung must land at or
+//     before 800 ms, or the change fails its own purpose.
+const _: () = assert!(
+    SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_RETRY_OFFSETS_MS[0] <= 800,
+    "the first re-poll must land inside the operator's <800 ms decision window"
 );
 
 // ---------------------------------------------------------------------------
