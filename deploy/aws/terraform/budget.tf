@@ -45,6 +45,33 @@
 #   operator-gated lever brings the actual bill under ₹1,000).
 # Full lever table: aws-budget.md "OPERATOR RULING 2026-07-19".
 #
+# 2026-07-31 OPERATOR RULING — LIMIT RAISED $25 -> $35 (SUPERSEDES the
+# 2026-07-19 downward ratchet ladder above for the CEILING; the sub-₹1,000
+# TARGET and the lever table are UNCHANGED and still tracked).
+# Operator verbatim (2026-07-31, typed directly in-session, typos preserved):
+#   "Raise the limit bro olay?"
+#   "Go ahead with recomemdnaetion bro okay?"
+#   "nommanaul inptu full yauotmated mtoehrfucekr okay?"
+# Incident this answers (live AWS evidence, read 2026-07-31 ~08:00 IST via
+# DescribeBudgets + DescribeBudgetActionsForAccount on acct 208384284948):
+#   ACTUAL $27.47 vs LIMIT $25.00 = 109.9% — BOTH budget actions (90% and
+#   100%, ActionType RUN_SSM_DOCUMENTS / STOP_EC2_INSTANCES on
+#   i-0b956d0209231a48b, ApprovalModel AUTOMATIC) were tripped and sitting in
+#   status=EXECUTION_FAILURE — i.e. repeatedly trying to auto-stop the prod
+#   box mid-session while failing to complete, so the operator got continuous
+#   budget alerts and an unreliable box. FORECAST $28.72.
+# Why $35 and not $30: the actions fire at 90% and 100% of the NEW limit. At
+#   $30 the 90% line is $27.00 — ALREADY below the live $27.47 actual, so the
+#   kill would re-trip immediately. At $35 the 90% line is $31.50 and the
+#   $28.72 forecast lands at 82% — clear for the remainder of July 2026.
+# Standing waste NOT addressed by this raise (~$8.31/mo, measured via Cost
+#   Explorer 2026-07-31): Cost-Explorer API polling $2.38 (238 calls @ $0.01),
+#   VPC/Elastic-IP $3.55 (release already operator-approved 2026-07-19 Quote
+#   10), CloudWatch alarm spend $3.27, Secrets Manager $0.38 (repo standard is
+#   free-tier SSM Parameter Store). Cutting those lands ~$19.43/mo, back under
+#   even the OLD $25 ceiling — tracked as the follow-up that lets the downward
+#   ladder resume.
+#
 # NO cost_filter (un-blinded 2026-06-30): the budget previously filtered on the
 # `Project=tickvault` cost-allocation tag, but that tag was NEVER applied to the
 # actual billed resources (EC2/EBS/EIP), so the budget measured ~$0 against the
@@ -69,7 +96,7 @@ resource "aws_budgets_budget" "tv_monthly" {
   # are preserved exactly — the actions re-bind automatically to the new name.
   name              = "tv-${var.environment}-monthly-budget-v2"
   budget_type       = "COST"
-  limit_amount      = "25"
+  limit_amount      = "35"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"
