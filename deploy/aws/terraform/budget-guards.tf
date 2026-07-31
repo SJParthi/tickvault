@@ -223,14 +223,17 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       ALERTS_TOPIC_ARN = aws_sns_topic.tv_alerts.arn
       # GAP 1: the morning start cron the Lambda disables on a breach.
       START_RULE_NAME = aws_cloudwatch_event_rule.daily_start.name
-      # KEEP IN SYNC with budget.tf limit_amount ("25") + the digest's
+      # KEEP IN SYNC with budget.tf limit_amount ("35") + the digest's
       # BUDGET_USD above — all three MUST agree on the kill line.
       # ($55 -> $25 on 2026-07-19 per the sub-1K ruling step in budget.tf;
+      # $25 -> $35 on 2026-07-31 per the operator ruling recorded verbatim in
+      # budget.tf — the live budget had breached at 109.9% and both AUTOMATIC
+      # STOP_EC2 actions were stuck in EXECUTION_FAILURE against the prod box;
       # hard_stop_guard.rs DEFAULT_BUDGET_KILL_USD=55.0 remains the
       # env-missing FALLBACK only — this env var is always injected, so the
-      # runtime kill line is $25; aligning the fallback const is a flagged
+      # runtime kill line is $35; aligning the fallback const is a flagged
       # follow-up, fail direction = kills later, never earlier.)
-      BUDGET_KILL_USD = "25"
+      BUDGET_KILL_USD = "35"
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).
       PING_STATE_PARAM = "/tickvault/${var.environment}/budget-guard/ping-state"
