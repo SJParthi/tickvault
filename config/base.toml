@@ -886,19 +886,22 @@ groww_lane = true
 # The serde DEFAULT stays 1000 (fail-safe): an absent [cadence] section
 # keeps the old timing.
 #
-# 2026-07-31 SAME-DAY CORRECTION (operator: "if groww you are trigegrign
-# entire 7 requets paralley isntantly at 0 ms emans then … dhan also shdou
-# lfollwo the sam eapproach rigth dude which shodul be same and check if an
-# donly if the isntant 0 ms fails aloen emans then 5 ms and icnremental
-# check approach"): an intermediate 300 was NOT symmetry — Groww fires its
-# 7-request volley at T+0 (`groww_anchor_offset_ms = 0` below) and Dhan
-# must do the SAME. Lowered 300 -> 5. Literal 0 is REJECTED by
-# `CadenceConfig::validate` (`dhan_burst_offset_ms` must be > 0), so 5 is
-# the smallest legal value — and is the operator's own stated number.
-# The escalation the directive asks for is the native retry ladder:
-# CADENCE_NATIVE_RETRY_OFFSETS_MS = [300, 1000, 2000, 3000, 3800], whose
-# two early rungs were prepended in the same change.
-dhan_burst_offset_ms = 5
+# 2026-07-31 SAME-DAY CORRECTION (operator: "dhan also shdou lfollwo the
+# sam eapproach rigth dude which shodul be same and check if an donly if
+# the isntant 0 ms fails aloen emans then 5 ms and icnremental check
+# approach"): -> 0. BOTH lanes now fire their 7-request volley at the SAME
+# instant: Groww at `groww_anchor_offset_ms = 0` (below) and Dhan here at
+# 0. An intermediate 5 was NOT symmetry — 5ms is the operator's first
+# RETRY step, not the first fire, and it lives in
+# CADENCE_NATIVE_RETRY_OFFSETS_MS = [5, 300, 1000, 2000, 3000, 3800].
+# `CadenceConfig::validate` was relaxed in the same change from `> 0` to
+# `>= 0`: its 2026-07-16 rationale (a T+0 Dhan burst colliding with
+# `next_joinable_boundary`'s strictly-in-future rule) does NOT hold, because
+# that function anchors on
+# `groww_anchor_offset_ms.min(dhan_burst_offset_ms)` and the Groww term is
+# ALREADY 0 — so a Dhan 0 changes the computation by nothing. NEGATIVE is
+# still refused (that would fire before the minute closes).
+dhan_burst_offset_ms = 0
 # Rolling-1000ms-window spot gate: at most this many spot requests in ANY
 # sliding second (1..=5 — Dhan's Data-API hard cap is 5/sec; the combined
 # spot+expiry rolling-second ring is THE binding cadence-lane pacing per
@@ -916,13 +919,13 @@ concurrency_recover_after_clean_cycles = 3
 # Spot clamp: spots never fire earlier than T + this.
 #
 # 2026-07-31 (same operator directive as `dhan_burst_offset_ms` above):
-# LOWERED 300 -> 5. The Dhan spot fire instant is
-# `max(dhan_burst_offset_ms, spot_min_post_close_ms)`, so leaving this at
-# 300 would have SILENTLY pinned every spot at T+300 no matter how low the
-# burst offset went — the chains would fire at T+5 and the spots would not,
-# which is exactly the asymmetry the directive removes. The serde DEFAULT
-# stays 300 (fail-safe).
-spot_min_post_close_ms = 5
+# LOWERED 300 -> 0. The Dhan spot fire instant is
+# `max(dhan_burst_offset_ms, spot_min_post_close_ms)`, so ANY value here
+# above the burst offset SILENTLY pins every spot later than the chains —
+# at 300 the chains would fire at T+0 and the spots at T+300, which is
+# exactly the asymmetry the directive removes. 0 keeps all 7 requests in
+# ONE simultaneous volley. The serde DEFAULT stays 300 (fail-safe).
+spot_min_post_close_ms = 0
 # At most one in-cycle retry per failed request, through the gates. A
 # RateLimited leg KEEPS its one bounded in-cycle retry (after the per-key
 # spacing) — one of the operator's "multiple attempts" before any shape
