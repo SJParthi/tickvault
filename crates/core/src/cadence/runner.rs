@@ -3682,8 +3682,15 @@ mod tests {
             late_retry_budget(&CadenceFetchError::QueueDelay, true, 1),
             1
         );
-        // ON (spot leg): Empty gets the 3-attempt native ladder.
-        assert_eq!(late_retry_budget(&CadenceFetchError::Empty, false, 1), 3);
+        // ON (spot leg): Empty gets the FULL native ladder. Bound to the
+        // constant, not a literal — 2026-07-31 grew the ladder 3 -> 5
+        // rungs (two EARLY rungs prepended for the T+5 burst move) and a
+        // literal here would have silently disagreed with the array that
+        // `constants.rs` already pins verbatim.
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::Empty, false, 1),
+            tickvault_common::constants::CADENCE_NATIVE_RETRY_MAX_ATTEMPTS as u32
+        );
         // Malformed is NEVER retried — kill switch ON or OFF.
         assert_eq!(late_retry_budget(&CadenceFetchError::Malformed, true, 1), 0);
         assert_eq!(
