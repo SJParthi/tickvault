@@ -107,7 +107,7 @@ test: ## Run all tests
 scoped-check: ## Run tests ONLY for crates touched by current diff (see .claude/rules/project/testing-scope.md)
 	@bash .claude/hooks/scoped-test-runner.sh
 
-lambda-test: ## Run the AWS Lambda Rust crate tests (ported python suites; no AWS creds)
+lambda-test: ## Run the AWS Lambda Rust crate tests (ported legacy suites; no AWS creds)
 	@echo "🧪 Running tickvault-aws-lambdas tests..."
 	cargo test -p tickvault-aws-lambdas
 	@echo ""

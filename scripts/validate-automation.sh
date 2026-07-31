@@ -138,7 +138,7 @@ run_check "tickvault-logs MCP self-test passes (rust, via launcher)" \
     bash scripts/mcp-servers/tickvault-logs-launch.sh --self-test
 run_check "tickvault-logs MCP placeholder-env fallback (rust config twins)" \
     cargo test -p tickvault-logs-mcp --lib config::
-run_check "tickvault-logs python server retired from git" \
+run_check "tickvault-logs legacy interpreted server retired from git" \
     bash -c '[ -z "$(git ls-files scripts/mcp-servers/tickvault-logs/)" ]'
 run_check "tickvault-logs Rust MCP crate present" \
     test -f crates/tickvault-logs-mcp/src/main.rs
