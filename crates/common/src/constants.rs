@@ -4063,11 +4063,31 @@ const _: () = {
 // ---------------------------------------------------------------------------
 
 /// Cadence native-retry hedge: re-poll offsets for a 2xx-empty leg, in ms
-/// after the minute close (volley fires ~T+1s; decision deadline T+4s).
-pub const CADENCE_NATIVE_RETRY_OFFSETS_MS: [i64; 3] = [2_000, 3_000, 3_800];
+/// after the minute close (decision deadline T+4s).
+///
+/// 2026-07-31 (operator directive — "if groww you are trigegrign entire 7
+/// requets paralley isntantly at 0 ms emans then … dhan also shdou lfollwo
+/// the sam eapproach … and check if an donly if the isntant 0 ms fails
+/// aloen emans then 5 ms and icnremental check approach"): the two EARLY
+/// rungs 300 and 1000 were PREPENDED when the Dhan burst moved from
+/// T+1000 to T+5 (`cadence.dhan_burst_offset_ms`, `config/base.toml`).
+/// Before that move the first fire WAS ~T+1000, so a 2000ms first rung was
+/// only ~1s later; firing at T+5 with an unchanged ladder would have left a
+/// 2-SECOND hole before the first retry. The 1000 rung deliberately
+/// reproduces the OLD fire instant, so the worst case of the early fire is
+/// exactly the timing we ran all of 2026-07-31 (measured p50 1029ms) — the
+/// early fire can only add chances, never remove one.
+///
+/// Rate-budget honesty: the 4 spots consume 4 of Dhan's 5/sec Data-API
+/// budget at the T+5 burst, so the 300 rung has room for at most ONE
+/// re-fire inside that first rolling second; the cadence gate APPENDS any
+/// remaining retries at the next free rolling-window instant (~T+1005),
+/// which is what the 1000 rung anchors. Rungs are advisory earliest
+/// instants, never a guarantee of 4 concurrent re-fires.
+pub const CADENCE_NATIVE_RETRY_OFFSETS_MS: [i64; 5] = [300, 1_000, 2_000, 3_000, 3_800];
 
 /// Max native micro-retry attempts per lane per minute (== offsets len).
-pub const CADENCE_NATIVE_RETRY_MAX_ATTEMPTS: usize = 3;
+pub const CADENCE_NATIVE_RETRY_MAX_ATTEMPTS: usize = 5;
 
 /// Decision deadline after minute close: native data arriving before this
 /// wins; at the deadline the pre-prepared cross-fill fires with no extra wait.
@@ -5496,7 +5516,22 @@ mod cadence_native_retry_hedge_tests {
 
     #[test]
     fn test_cadence_native_retry_constants_pinned() {
-        assert_eq!(CADENCE_NATIVE_RETRY_OFFSETS_MS, [2_000, 3_000, 3_800]);
+        // 2026-07-31: two EARLY rungs prepended with the T+5 burst move —
+        // 300 (first re-fire inside the burst's own rolling second, one
+        // slot of the 5/sec Dhan budget) and 1000 (the OLD fire instant,
+        // so the early fire's worst case == the timing measured all of
+        // 2026-07-31).
+        assert_eq!(
+            CADENCE_NATIVE_RETRY_OFFSETS_MS,
+            [300, 1_000, 2_000, 3_000, 3_800]
+        );
+        // The 1000 rung MUST stay: it is the floor guaranteeing the early
+        // burst can never be worse than the pre-2026-07-31 T+1000 fire.
+        assert!(
+            CADENCE_NATIVE_RETRY_OFFSETS_MS.contains(&1_000),
+            "the old T+1000 fire instant must remain a rung — it is the \
+             no-regression floor for the T+5 burst"
+        );
         assert_eq!(
             CADENCE_NATIVE_RETRY_MAX_ATTEMPTS,
             CADENCE_NATIVE_RETRY_OFFSETS_MS.len()

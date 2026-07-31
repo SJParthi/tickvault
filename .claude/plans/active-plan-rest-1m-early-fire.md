@@ -4,6 +4,96 @@
 **Date:** 2026-07-31
 **Approved by:** Parthiban (operator) — "yes go ahead and ensure to use only RUST O(1) entirely everywhere"
 
+---
+
+> ## ⚠ 2026-07-31 SAME-DAY CORRECTION — read this BEFORE the body below
+>
+> Two load-bearing premises in the original body are **WRONG**. Both are the
+> same error class that got PR #1713 closed. The body is RETAINED as audit
+> (house supersession convention); where it conflicts with this banner, the
+> banner wins.
+>
+> **Error 1 — WRONG LANE.** The body targets
+> `SPOT_1M_REST_FIRE_DELAY_MS` / `GROWW_CHAIN_1M_FIRE_DELAY_MS` /
+> `GROWW_SPOT_1M_TWO_WAVE_FIRE_DELAY_MS` in
+> `spot_1m_rest_boot.rs` / `groww_spot_1m_boot.rs`. Those are the **LEGACY
+> per-minute legs, which are `enabled = false`** and have been stood down
+> since 2026-07-17 (`cadence-error-codes.md` §0c; pinned by
+> `cadence_boot_wiring_guard::test_cadence_base_toml_enabled_and_legacy_legs_stood_down`).
+> Editing them changes NOTHING in production. The live lane is the **cadence
+> scheduler**, whose timing knobs are `config/base.toml [cadence]`:
+> `dhan_burst_offset_ms` and `spot_min_post_close_ms`.
+>
+> **Error 2 — "nobody has measured that latency" is FALSE.**
+> `close_to_data_ms` is a **column on every persisted row**, and `latency_ms`
+> is in every cadence decision log line. Measured live from the box on
+> 2026-07-31 (QuestDB `spot_1m_rest`, 250 minutes, both feeds):
+>
+> | feed | rows | minutes | p50 | p99 | min | max |
+> |---|---|---|---|---|---|---|
+> | dhan | 1000 | 250 | 1029 ms | 1106 ms | 1017 ms | 1137 ms |
+> | groww | 999 | 250 | 49 ms | 30703 ms | 30 ms | 31359 ms |
+>
+> Dhan's spread across its 4 spots **within** a minute is 13 ms (p50),
+> proving the 7-request burst is genuinely concurrent. Dhan's own answer
+> time is therefore **~17–137 ms**; the rest was `dhan_burst_offset_ms`.
+> Coverage is a **dead heat — 250 minutes each**, so Dhan was never
+> "behind"; and it was **Groww** (the fast lane) that lost a candle today
+> (SENSEX 11:20 AM IST), not Dhan.
+>
+> **Error 3 (the one that unblocked this) — a 2xx-empty spot DOES arm a
+> retry.** The "empty is never retried" belief conflated two DIFFERENT
+> ladders: the **shape** ladder (armed by 429 only) and the **native retry**
+> ladder (armed by `Empty`, `native_retry_enabled = true` since the
+> 2026-07-20 directive). The safety net already existed.
+>
+> ### What actually SHIPPED under this plan (2026-07-31)
+>
+> Operator directive (verbatim, typos preserved): *"if groww you are
+> trigegrign entire 7 requets paralley isntantly at 0 ms emans then … dhan
+> also shdou lfollwo the sam eapproach rigth dude which shodul be same and
+> check if an donly if the isntant 0 ms fails aloen emans then 5 ms and
+> icnremental check approach rigth dude am i irght dude?"*
+>
+> - [x] **Item 0 — Dhan/Groww fire symmetry + early retry rungs**
+>   - `config/base.toml`: `dhan_burst_offset_ms` 1000 → **5**
+>     (literal 0 is rejected by `CadenceConfig::validate`; 5 is the smallest
+>     legal value and the operator's own number), `spot_min_post_close_ms`
+>     300 → **5** (the spot fire instant is
+>     `max(burst, clamp)`, so leaving 300 would have silently pinned spots at
+>     T+300 while chains fired at T+5 — the exact asymmetry being removed).
+>   - `crates/common/src/constants.rs`:
+>     `CADENCE_NATIVE_RETRY_OFFSETS_MS` `[2000,3000,3800]` →
+>     **`[300,1000,2000,3000,3800]`** (+ `MAX_ATTEMPTS` 3 → 5). The two
+>     EARLY rungs are the "5 ms then incremental" escalation; the **1000
+>     rung is the no-regression floor** — it reproduces the OLD fire
+>     instant, so the early burst's worst case is exactly the timing
+>     measured all day.
+>   - `crates/core/src/cadence/runner.rs`: the
+>     `test_native_retry_kill_switch_off_is_legacy_class_blind` budget
+>     assertion bound to `CADENCE_NATIVE_RETRY_MAX_ATTEMPTS` instead of a
+>     literal `3`, so it cannot drift from the array `constants.rs` pins.
+>   - Serde DEFAULTS deliberately UNCHANGED (1000 / 300): an absent
+>     `[cadence]` section still boots the old timing — fail-safe.
+>
+> **Rate-budget honesty (the real constraint on "incremental"):** the 4
+> spots consume 4 of Dhan's **5/sec** Data-API budget at the burst, so the
+> 300 rung has room for at most **ONE** re-fire inside that first rolling
+> second; the gate APPENDS the rest at the next free instant (~T+1005),
+> which is what the 1000 rung anchors. The rungs are advisory earliest
+> instants, never a promise of 4 concurrent re-fires.
+>
+> **NOT claimed (UNVERIFIED-LIVE):** that Dhan serves a just-closed minute
+> at T+5. **Zero** empty Dhan responses have ever been observed (zero
+> `spot_empty` and zero `native_retry` events in the 5 hours checked), so
+> the sub-300 ms region has no evidence either way — the native ladder is
+> the safety net that makes finding out safe, and the first session on this
+> config is the probe. Items 1–6 below (histogram + `OffsetTuner`) remain
+> the follow-on that turns the measurement into an automatic start offset;
+> they must be re-scoped to the **cadence** lane before implementation.
+
+---
+
 ## Operator directive (verbatim, typos preserved)
 
 > "See even beofre 800 ms or just below one second i need the enitre spot and
