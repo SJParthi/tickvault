@@ -332,6 +332,28 @@ terraform PR (allocates a NEW address — the old one is gone forever) → Dhan
 the boot IP gate before live fire. A PR that flips `enable_eip` in EITHER direction without
 the matching dated note here + §7 = REJECT.
 
+### 2026-07-21 — PAPER order-push ACTIVATION prep (DRAFT PR; do not merge without the operator's go)
+
+Prep lane (coordinator-routed, 2026-07-21): `config/base.toml` flips
+`[groww_orders] order_push_enabled` and `[dhan_order_push] enabled` to `true` so the
+already-BUILT receive-only PAPER order-push channels (authorized 2026-07-16 — events
+38df2073-eecb-43cf-876d-a4a809dde269 + 157f7cd0-dfdf-4c4e-b93a-9f9aff3317c2: the Groww
+order/position/trade NATS-over-WS channel and the Dhan order-update re-spawn from
+`dhan_rest_stack`) begin capturing broker events. Serde defaults stay OFF; `dry_run`
+stays true; `GROWW_ORDER_LIVE_FIRE` stays false — zero live orders; market data stays
+REST-only (this activates the ORDER-side push surface the 2026-07-15 amendment
+explicitly kept separate). The operator's go for the merge lands here verbatim:
+**Operator go (2026-07-31, typed directly in-session — verbatim, typos preserved):**
+> "Okay then merge all these PRs dude okay? see dont mereg speartely make it a s a
+> clubbed PR and mereg dud eokay?"
+>
+> "just as a single clubbed PR dud eokay?"
+
+Merged 2026-07-31 as part of the single clubbed integration PR (this PR), together
+with the two dependabot bumps and the second-scale frame diet. `dry_run` stays true;
+`GROWW_ORDER_LIVE_FIRE` stays false; serde defaults stay OFF — capture only, zero
+live orders.
+
 ### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
 
 Operator Parthiban, 2026-07-24 (verbatim quotes preserved in

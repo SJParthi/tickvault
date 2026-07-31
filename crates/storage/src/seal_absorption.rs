@@ -633,7 +633,7 @@ mod tests {
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(1, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        let s1 = mk_buffered_seal(13, 0, TfIndex::H4, 1_716_000_900, 102.5);
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M15, 1_716_000_900, 102.5);
         let filler = mk_buffered_seal(99, 0, TfIndex::M1, 1_716_001_500, 200.0);
         p.submit(s1, now);
         p.submit(filler, now);
