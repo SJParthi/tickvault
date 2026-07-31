@@ -182,3 +182,40 @@ claimed:** that `propose()` is O(1) — it is a const-bounded O(k) scan on the
 daily cold path, stated plainly rather than relabelled. **NOT claimed:** any
 change to decision-making — the §38.8 decision-freshness gate is untouched
 and no strategy consumes these tables.
+
+## Per-Item Guarantee Matrix
+
+Canonical definition: `.claude/rules/project/per-wave-guarantee-matrix.md`.
+Filled in for THIS plan (every row names a real artefact, or `N/A — <reason>`).
+
+### 15-row "100% everything" matrix
+
+| Demand | Proof artefact for this plan |
+|---|---|
+| 100% code coverage | `OffsetTuner` is a pure module — unit + proptest cover every branch (p95, both clamps, empty ring, wrap, once-per-day gate); coverage delta ≥ 0 against the ratcheted core/common floors |
+| 100% audit coverage | N/A — no new persisted event. The legs' existing `rest_fetch_audit` row already names each minute's outcome; this plan changes WHEN we ask, never WHAT we record |
+| 100% testing coverage | Categories exercised: 1 smoke · 2 happy-path · 3 error · 4 edge · 5 boundary · 6 property · 7 DHAT · 13 panic-safety · 22 integration |
+| 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan, all pre-push |
+| 100% code performance | DHAT proves `record_sample` allocates zero; `propose()` is const-bounded O(k=256) on the DAILY cold path — labelled O(k), never relabelled O(1) |
+| 100% monitoring | 3 new signals: `tv_rest1m_first_success_offset_ms{feed,leg}` histogram · `tv_rest1m_offset_tuned_total{feed,leg,direction}` · `tv_rest1m_ladder_rung_used{feed,leg,rung}` |
+| 100% logging | one coded `info!` per daily adjust, naming old → new offset + the p95 it came from |
+| 100% alerting | N/A — deliberate. This is a tuning signal, not a failure class; it rides the existing SPOT1M-01 / CHAIN-02 runbooks. No new page, no new alarm |
+| 100% security | No new network surface, no new credential path, no new endpoint — only the timing of existing authorized calls changes |
+| 100% security hardening | N/A — no attack-surface delta |
+| 100% bugs fixing | Adversarial 3-agent pass (hot-path + security + hostile) before and after implementation |
+| 100% scenarios covering | 8 edge cases enumerated in Edge Cases above, each with its handling |
+| 100% functionalities covering | Every new pub fn gets a test AND a call site (pre-push gates 6 + 11) |
+| 100% code review | 3-agent pass on the diff, both directions |
+| 100% extreme check | 4 const-asserts fail the BUILD on regression: ladder strictly increasing · worst case < 60 s · floor ≤ start ≤ ceiling · old 300 ms rung still present |
+
+### 7-row Resilience matrix
+
+| Demand | Honest envelope for this plan |
+|---|---|
+| Zero ticks lost | No new drop path. Rung COUNT is bounded and the ladder still gives up cleanly; a missed minute is counted, never silently skipped |
+| WS never disconnects | N/A — REST legs only; no WebSocket touched |
+| Never slow/locked/hanged | `record_sample` is O(1) zero-alloc (DHAT-proven); the daily `propose()` runs on the cold path, never inside a fire |
+| QuestDB never fails | N/A — no persistence path touched; no table, no DEDUP key, no schema |
+| O(1) latency | record / rung-lookup / jitter are O(1); `propose()` is const-bounded O(k) and is FLAGGED as such, not claimed O(1) |
+| Uniqueness + dedup | N/A — no new persisted row; existing `(ts, security_id, exchange_segment, feed)` keys untouched |
+| Real-time proof | The `first_success_offset_ms` histogram IS the proof — it is the measurement that has never existed in this system |
