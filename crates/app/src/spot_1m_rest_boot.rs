@@ -598,14 +598,20 @@ impl PersistTracker {
 /// offsets-from-first-attempt so the schedule stays a single source of
 /// truth. Pure.
 #[must_use]
-pub fn retry_sleep_deltas_ms() -> [u64; 4] {
+pub fn retry_sleep_deltas_ms() -> [u64; SPOT_1M_REST_RETRY_OFFSETS_MS.len()] {
+    // Arity-generic since the 2026-07-31 early-fire re-spacing (4 -> 6 rungs):
+    // derived from the constant's own length so a future ladder change can
+    // never leave this reconstruction silently out of step. O(rungs) over a
+    // compile-time-fixed array, no allocation.
     let o = SPOT_1M_REST_RETRY_OFFSETS_MS;
-    [
-        o[0],
-        o[1].saturating_sub(o[0]),
-        o[2].saturating_sub(o[1]),
-        o[3].saturating_sub(o[2]),
-    ]
+    let mut deltas = [0u64; SPOT_1M_REST_RETRY_OFFSETS_MS.len()];
+    deltas[0] = o[0];
+    let mut i = 1;
+    while i < o.len() {
+        deltas[i] = o[i].saturating_sub(o[i - 1]);
+        i += 1;
+    }
+    deltas
 }
 
 /// Deterministic per-SID ladder jitter (ms) for the SID at `slot` in the
@@ -4436,8 +4442,10 @@ mod tests {
     }
 
     /// Worst-case all-429 jittered schedule stays inside the hard per-SID
-    /// budget: every rung rate-limited (extra backoff before each of the 4
-    /// re-polls) + max jitter + one full request timeout < 20 s.
+    /// budget: every rung rate-limited (extra backoff before EACH re-poll) +
+    /// max jitter + one full request timeout < the budget. Arity-generic
+    /// since the 2026-07-31 early-fire re-spacing (4 -> 6 rungs, budget
+    /// 20 s -> 22 s).
     #[test]
     fn test_ladder_worst_case_429_schedule_stays_inside_sid_budget() {
         let deltas = retry_sleep_deltas_ms();
@@ -4450,7 +4458,7 @@ mod tests {
         // Scheduled sleeps sum to the (jittered) last offset + 4 backoffs.
         assert_eq!(
             total_sleep_ms,
-            SPOT_1M_REST_RETRY_OFFSETS_MS[3]
+            SPOT_1M_REST_RETRY_OFFSETS_MS[SPOT_1M_REST_RETRY_OFFSETS_MS.len() - 1]
                 + max_jitter
                 + deltas.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
         );
@@ -4501,7 +4509,9 @@ mod tests {
     #[test]
     fn test_retry_sleep_deltas_ms_reconstruct_the_offset_schedule() {
         let deltas = retry_sleep_deltas_ms();
-        assert_eq!(deltas, [700, 800, 1_500, 3_000]);
+        // 2026-07-31 early-fire re-spacing: offsets [45,145,295,695,1495,2995]
+        // (absolute attempts at +5/50/150/300/700/1500/3000 ms from the close).
+        assert_eq!(deltas, [45, 100, 150, 400, 800, 1_500]);
         // Cumulative deltas reproduce the constant offsets exactly.
         let mut cumulative = 0u64;
         for (delta, offset) in deltas.iter().zip(SPOT_1M_REST_RETRY_OFFSETS_MS.iter()) {
