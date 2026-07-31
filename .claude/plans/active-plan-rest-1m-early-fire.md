@@ -56,19 +56,33 @@
 > icnremental check approach rigth dude am i irght dude?"*
 >
 > - [x] **Item 0 — Dhan/Groww fire symmetry + early retry rungs**
->   - `config/base.toml`: `dhan_burst_offset_ms` 1000 → **5**
->     (literal 0 is rejected by `CadenceConfig::validate`; 5 is the smallest
->     legal value and the operator's own number), `spot_min_post_close_ms`
->     300 → **5** (the spot fire instant is
->     `max(burst, clamp)`, so leaving 300 would have silently pinned spots at
->     T+300 while chains fired at T+5 — the exact asymmetry being removed).
+>   - `config/base.toml`: `dhan_burst_offset_ms` 1000 → **0**,
+>     `spot_min_post_close_ms` 300 → **0**. BOTH lanes now fire their
+>     7-request volley at the SAME instant (Groww's `groww_anchor_offset_ms`
+>     has always been 0). The spot fire instant is `max(burst, clamp)`, so
+>     any clamp above the burst silently pins spots later than chains —
+>     at 300 the chains would fire at T+0 and the spots at T+300, the exact
+>     asymmetry being removed.
+>   - `crates/common/src/config.rs`: `CadenceConfig::validate` relaxed
+>     `dhan_burst_offset_ms > 0` → **`>= 0`** (negative still refused — that
+>     would fire pre-close). The 2026-07-16 rule ALSO refused T+0, citing a
+>     collision with `next_joinable_boundary`'s strictly-in-future rule.
+>     **That rationale does not hold:** the function anchors on
+>     `groww_anchor_offset_ms.min(dhan_burst_offset_ms)` and the Groww term
+>     is ALREADY 0, so a Dhan 0 changes the computation by nothing. Its one
+>     real consequence (a boot landing exactly ON the boundary skips to the
+>     next minute) is pre-existing and pinned by
+>     `test_cadence_schedule_next_joinable_boundary_no_mid_cycle_join`.
+>     Refusing 0 for Dhan while allowing it for Groww was an unjustified
+>     asymmetry between the lanes.
 >   - `crates/common/src/constants.rs`:
 >     `CADENCE_NATIVE_RETRY_OFFSETS_MS` `[2000,3000,3800]` →
->     **`[300,1000,2000,3000,3800]`** (+ `MAX_ATTEMPTS` 3 → 5). The two
->     EARLY rungs are the "5 ms then incremental" escalation; the **1000
->     rung is the no-regression floor** — it reproduces the OLD fire
->     instant, so the early burst's worst case is exactly the timing
->     measured all day.
+>     **`[5,300,1000,2000,3000,3800]`** (+ `MAX_ATTEMPTS` 3 → 6). **5 ms is
+>     the operator's first RETRY step, not the first fire** — an earlier
+>     revision of this item wrongly put 5 ms in the burst offset. The
+>     **1000 rung is the no-regression floor** — it reproduces the OLD fire
+>     instant, so the T+0 burst's worst case is exactly the timing measured
+>     all day.
 >   - `crates/core/src/cadence/runner.rs`: the
 >     `test_native_retry_kill_switch_off_is_legacy_class_blind` budget
 >     assertion bound to `CADENCE_NATIVE_RETRY_MAX_ATTEMPTS` instead of a
