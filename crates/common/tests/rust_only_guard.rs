@@ -58,35 +58,13 @@ use std::process::Command;
 /// Every tracked `.py` file on `main` as of 2026-07-18 (`git ls-files '*.py' | sort`).
 /// ADDITIONS ARE FORBIDDEN FOREVER (rust-only operator directive 2026-07-18).
 /// Deletions MUST remove the entry in the same PR (shrinking ratchet).
-const TRACKED_PY_ALLOWLIST: &[&str] = &[
-    ".claude/skills/dhanhq/examples/fetch_option_chain.py",
-    ".claude/skills/dhanhq/examples/gtt_forever_order.py",
-    ".claude/skills/dhanhq/examples/historical_data_analysis.py",
-    ".claude/skills/dhanhq/examples/iron_condor.py",
-    ".claude/skills/dhanhq/examples/live_feed_setup.py",
-    ".claude/skills/dhanhq/examples/margin_check.py",
-    ".claude/skills/dhanhq/examples/order_management.py",
-    ".claude/skills/dhanhq/examples/place_equity_order.py",
-    ".claude/skills/dhanhq/examples/place_fno_order.py",
-    ".claude/skills/dhanhq/examples/portfolio_summary.py",
-    ".claude/skills/dhanhq/examples/super_order_with_sl.py",
-    ".claude/skills/dhanhq/scripts/dhan_helpers.py",
-    ".claude/skills/dhanhq/scripts/resolve_security.py",
-    ".claude/skills/dhanhq/scripts/trade_logger.py",
-    ".claude/skills/dhanhq/scripts/validate_order.py",
-    "docs/incidents/2026-07-06-questdb-console-shell-hang/raw_socket_probe.py",
-    "docs/incidents/2026-07-06-questdb-console-shell-hang/repro_backlambda.py",
-];
+const TRACKED_PY_ALLOWLIST: &[&str] = &[];
 
 /// Files (non-`.py`, non-docs) that carry a python invocation on a
 /// NON-COMMENT line as of 2026-07-18. File-level allowlist. Same ratchet:
 /// no additions ever; a file that goes python-clean (or is deleted) MUST
 /// have its entry removed in the same PR.
-const INVOCATION_SITE_ALLOWLIST: &[&str] = &[
-    "Makefile",
-    "scripts/bench-gate.sh",
-    "scripts/validate-automation.sh",
-];
+const INVOCATION_SITE_ALLOWLIST: &[&str] = &[];
 
 // ============================ PURE CORE ============================
 
