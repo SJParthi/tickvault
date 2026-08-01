@@ -127,12 +127,40 @@ fn banned_token() -> String {
     String::from_utf8(vec![0x70, 0x79, 0x74, 0x68, 0x6f, 0x6e]).unwrap()
 }
 
+/// Every interpreter/package-manager token that re-introduces the banned
+/// runtime. 2026-08-01 (operator directive — "only Rust"): the guard used to
+/// ban the interpreter's OWN name and nothing else, so ELEVEN live install
+/// sites passed green for weeks — `pip3 install ziglang` in
+/// `terraform-apply.yml` (which made the arm64 LINKER of every production
+/// lambda an interpreter invocation) plus `pip3 install awscli` in four
+/// setup scripts. Banning the runtime while permitting its package manager
+/// is not a ban; these tokens close that hole.
+///
+/// Deliberately NOT included (each would fail the guard TODAY and needs its
+/// own decision, never a silent allowlist entry):
+///   - `venv` — `deploy-aws.yml` has a `rm -rf …/venv` CLEANUP line
+///   - `perl` — `terraform-apply.yml` non-ASCII SG-description guard
+///   - `node`/`npx` — `.mcp.json` dev-only MCP servers
+/// All three are recorded in `rust-only-forever-lock-2026-07-19.md`.
+fn banned_tokens() -> Vec<String> {
+    let mut tokens = vec![banned_token()];
+    for extra in ["pip", "pipx", "uv", "uvx", "poetry", "conda", "virtualenv"] {
+        tokens.push(extra.to_string());
+    }
+    tokens
+}
+
 fn line_has_banned_token(line: &str) -> bool {
+    banned_tokens()
+        .iter()
+        .any(|tok| line_has_token(line, tok.as_str()))
+}
+
+fn line_has_token(line: &str, tok: &str) -> bool {
     let bytes = line.as_bytes();
-    let tok = banned_token();
     let needle = tok.as_bytes();
     let mut start = 0usize;
-    while let Some(rel) = line[start..].find(tok.as_str()) {
+    while let Some(rel) = line[start..].find(tok) {
         let i = start + rel;
         let before_ok = i == 0 || {
             let c = bytes[i - 1] as char;

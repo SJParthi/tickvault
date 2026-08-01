@@ -168,7 +168,7 @@ check_cmd() {
 MISSING=0
 check_cmd "docker"         "Install Docker Desktop: https://docker.com/products/docker-desktop" || MISSING=$((MISSING + 1))
 check_cmd "curl"           "apt install curl / brew install curl" || MISSING=$((MISSING + 1))
-check_cmd "aws"            "pip3 install awscli" || MISSING=$((MISSING + 1))
+check_cmd "aws"            "bash scripts/ensure-aws-cli.sh" || MISSING=$((MISSING + 1))
 
 # docker compose is a subcommand, not a binary
 printf "  %-12s " "compose"
