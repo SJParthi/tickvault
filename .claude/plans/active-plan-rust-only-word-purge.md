@@ -110,6 +110,51 @@ constants. Enforcement is build-time only (the extended `rust_only_guard.rs`). T
 retirement of the parity harness REMOVES a test signal and that loss is recorded in
 the rule file rather than hidden.
 
+## Per-Item Guarantee Matrix
+
+Canonical definition: `.claude/rules/project/per-wave-guarantee-matrix.md`. Filled in for
+this work rather than cross-referenced blindly — several rows are honestly N/A because
+this change is prose, identifiers, and two byte-identical wire constants.
+
+| Demand | How this plan satisfies it |
+|---|---|
+| 100% code coverage | No new production branches; the 3 new byte-pin tests + the new ratchet all execute. Coverage floors unchanged (`quality/crate-coverage-thresholds.toml`). |
+| 100% audit coverage | N/A — no new event, no new table. The provenance audit trail is what this plan PRESERVES (the `handler.py:NNN` pointer count is compared before/after). |
+| 100% testing coverage | Touched-crate suites in full: trading (+`groww_orders`), aws-lambdas, logs-mcp, common, core, storage, app, api. |
+| 100% code checks | `cargo fmt --all --check`, clippy, banned-pattern scan, secret scan, plan-verify, the pre-commit 9-gate battery. |
+| 100% code performance | N/A for the hot path — nothing on it is touched. The one allocation introduced (`grep_pattern_description()`) is on the cold MCP `tools/list` handshake, once per client. |
+| 100% monitoring | N/A — no new runtime signal (see Observability). |
+| 100% logging | Unchanged; no `error!`/`warn!` site added or removed. |
+| 100% alerting | N/A — no new failure mode. |
+| 100% security | The wipe rewrite is the security-relevant edit: dry-run-verified to leave every SEBI never-delete table untouched. No secret, credential, or token path touched. |
+| 100% security hardening | Attack-surface delta: ZERO net. Two interpreter execution paths REMOVED (one in CI, one on the prod box) — strictly a reduction. |
+| 100% bugs fixing | The sweep itself surfaced two real defects: the guard's word-only token set (PR #1716) and the harness that resurrected + executed a deleted file. |
+| 100% scenarios covering | Scenarios table below — incl. the SEBI-tables-survive case and the reintroduction case. |
+| 100% functionalities covering | Every renamed identifier was `git grep`-verified to have zero external references before renaming. |
+| 100% code review | Three parallel agents partitioned by directory; each reported refusals rather than guessing, and two escalated the execution sites instead of editing them. |
+| 100% extreme check | The new ratchet fails the build on reintroduction, bite-proven in both directions. |
+
+## Resilience Demand Matrix
+
+| Demand | This plan's position |
+|---|---|
+| Zero ticks lost | N/A — no capture, ring, spill, or DLQ path is touched. No new tick-drop path introduced. |
+| WS never disconnects | The two Groww wire constants are the ONLY connection-adjacent edits; both are byte-pinned so the CONNECT frame and mint header are provably unchanged. |
+| Never slow/locked/hanged | No hot-path code touched; no new allocation on any per-tick path. |
+| QuestDB never fails | The wipe rewrite talks to QuestDB; it is bounded (`--max-time 15`/`30`) and its independent WIPE-RESULT tail still proves the counts reached zero. |
+| O(1) latency | Unchanged. This plan makes NO O(1) claim — see the honest non-claim below. |
+| Uniqueness + dedup | N/A — no DEDUP key, schema, or identity path touched. |
+| Real-time proof | N/A — build-time enforcement only. |
+
+**Honest non-claim (mandatory wording).** This plan does NOT claim the workspace is
+O(1); that is false and cannot be made true (reading N rows is O(N) by counting, and
+comparison sorting is provably ≥ O(n log n)). What is claimed is bounded and ratcheted:
+100% inside the tested envelope, with ratcheted regression coverage — our own source is
+at literal zero occurrences, enforced by a bite-proven build-failing guard; the six wire
+values are byte-identical, each pinned by a test whose expected value is spelled as
+bytes. Beyond that envelope, the vendor reference docs and dated plan history keep the
+word deliberately, and that is stated rather than counted as done.
+
 ## Plan Items
 
 - [x] Prose purge — `crates/aws-lambdas/` (601 → 1)
