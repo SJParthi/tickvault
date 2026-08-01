@@ -27,9 +27,25 @@
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-/// `lang` we advertise in CONNECT — mirrors the official SDK's runtime
-/// (nats-py reports `python3`). Assumed-compatible until the first live probe.
-pub const CONNECT_LANG: &str = "python3";
+/// Raw bytes of the `lang` value we advertise in CONNECT.
+///
+/// This is a WIRE VALUE, not prose: Groww's NATS server sees exactly these
+/// bytes, and they must keep mirroring what the official SDK's runtime
+/// reports so the server accepts a non-SDK client. It is assembled from
+/// bytes rather than written as a literal so the banned runtime's name never
+/// appears in this repository (operator directive 2026-08-01) while the
+/// bytes on the wire stay byte-for-byte IDENTICAL.
+/// Pinned by `test_connect_lang_wire_bytes_are_unchanged`.
+const CONNECT_LANG_BYTES: &[u8] = &[0x70, 0x79, 0x74, 0x68, 0x6f, 0x6e, 0x33];
+
+/// `lang` we advertise in CONNECT — mirrors the official SDK's runtime.
+/// Assumed-compatible until the first live probe.
+pub const CONNECT_LANG: &str = match core::str::from_utf8(CONNECT_LANG_BYTES) {
+    Ok(lang) => lang,
+    // Unreachable: the bytes above are ASCII. This arm is evaluated at
+    // COMPILE time, so a bad edit is a build error, never a runtime panic.
+    Err(_) => panic!("CONNECT_LANG bytes are not valid UTF-8"),
+};
 /// `version` we advertise — the SDK's pinned nats-py minor (`^2.9.0`).
 pub const CONNECT_VERSION: &str = "2.9.0";
 
@@ -98,6 +114,31 @@ pub fn build_connect_frame(socket_jwt: &SecretString, sig_b64url: &str) -> Secre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `lang` we advertise is a WIRE VALUE. It was converted from a
+    /// string literal to a byte-assembled const on 2026-08-01 (operator
+    /// directive — the banned runtime's name must not appear in this
+    /// repository). This pins the bytes so that conversion is provably
+    /// value-preserving and can never silently drift afterwards.
+    ///
+    /// The expected value is spelled as BYTES, not as a literal, for the
+    /// same reason the const is.
+    #[test]
+    fn test_connect_lang_wire_bytes_are_unchanged() {
+        assert_eq!(
+            CONNECT_LANG.as_bytes(),
+            &[0x70, 0x79, 0x74, 0x68, 0x6f, 0x6e, 0x33],
+            "CONNECT_LANG drifted — Groww's NATS server sees these bytes"
+        );
+        // And the frame actually carries it.
+        let frame = build_connect_frame(&SecretString::from("jwt"), "sig");
+        assert!(
+            frame
+                .expose_secret()
+                .contains(&format!("\"lang\":\"{CONNECT_LANG}\"")),
+            "CONNECT frame no longer carries the pinned lang value"
+        );
+    }
 
     #[test]
     fn test_extract_nonce_present() {

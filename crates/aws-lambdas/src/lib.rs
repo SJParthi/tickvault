@@ -2,8 +2,8 @@
 //!
 //! Rust-only purge phase 2b-1 (2026-07-18): ports of
 //! - `deploy/aws/lambda/budget-killswitch/handler.py` (the pilot rewrite)
-//! - the `budget-guards.tf` daily-budget-digest inline Python heredoc
-//! - the `boot-heartbeat-alarm.tf` boot-window gate inline Python heredoc
+//! - the `budget-guards.tf` daily-budget-digest inline legacy heredoc
+//! - the `boot-heartbeat-alarm.tf` boot-window gate inline legacy heredoc
 //! - the `market-hours-liveness-alarm.tf` market-hours gate inline heredoc
 //!
 //! Rust-only purge phase 2b-2 wave 2 (2026-07-18): ports of
@@ -11,7 +11,7 @@
 //! - `deploy/aws/lambda/hard-stop-guard/handler.py` (hourly budget/schedule guard)
 //!
 //! Behavior parity is the contract: same env vars, same SNS message shapes,
-//! same alarm-name/window logic, same IST time math as the Python sources.
+//! same alarm-name/window logic, same IST time math as the legacy sources.
 //! Every deviation is deliberate and documented at the deviating line.
 //!
 //! Cold path only — these run 1-4 times per day on EventBridge crons / SNS

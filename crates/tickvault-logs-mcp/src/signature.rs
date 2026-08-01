@@ -8,7 +8,7 @@ use crate::pycompat::py_slice_chars;
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
 
-/// 16 lowercase hex chars, identical to the Python + summary_writer hash.
+/// 16 lowercase hex chars, identical to the legacy + summary_writer hash.
 pub fn signature_hash(code: Option<&str>, target: &str, message: &str) -> String {
     let truncated = py_slice_chars(message, 160);
     let mut h = FNV_OFFSET;
@@ -33,11 +33,11 @@ mod tests {
     use super::*;
 
     /// Golden vectors generated from the LIVE server.py on 2026-07-18:
-    /// `python3 -c "import server; server._signature_hash(...)"` — see the
+    /// the legacy interpreter one-liner: `import server; server._signature_hash(...)` — see the
     /// PR 2c parity evidence. Bit-exactness is the load-bearing contract
     /// (list_novel_signatures / signature_history join on this hash).
     #[test]
-    fn matches_python_golden_vectors() {
+    fn matches_legacy_golden_vectors() {
         let e200 = "é".repeat(200);
         let x300 = "x".repeat(300);
         let cases: &[(Option<&str>, &str, &str, &str)] = &[

@@ -722,7 +722,7 @@ pub enum ErrorCode {
     /// GROWW-NATIVE-01 (PR-R1 shadow client, 2026-07-04) — the native-Rust
     /// Groww NATS-over-WebSocket shadow client failed to connect / lost the
     /// connection / had its supervised task respawned. Bounded expo backoff
-    /// reconnect (`GROWW_NATIVE_RECONNECT_*_SECS`); shadow-only — the Python
+    /// reconnect (`GROWW_NATIVE_RECONNECT_*_SECS`); shadow-only — the legacy
     /// sidecar capture chain is UNAFFECTED. Severity::Medium,
     /// auto-triage-safe (self-healing reconnect; a sustained rate is the
     /// live-probe answer the shadow run exists to collect).

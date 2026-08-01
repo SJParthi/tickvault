@@ -4,9 +4,9 @@
 # 2026-08-01 (operator directive — Rust-O(1)-only workspace): replaces the
 # `pip3 install awscli` fallback that lived in bootstrap.sh /
 # provision-infra-secrets.sh / setup-secrets.sh. That path pulled the AWS CLI
-# **v1** wheel from PyPI and required a Python interpreter + pip on the host —
+# **v1** wheel from PyPI and required an interpreter + its package manager on the host —
 # a live interpreted-language dependency in the setup chain, and one the
-# rust_only_guard did not catch (its token set covers `python`, never `pip`).
+# rust_only_guard did not catch (its token set covers the runtime name, never `pip`).
 #
 # The official installer ships a SELF-CONTAINED binary (its own embedded
 # runtime, nothing to install alongside it) and gives v2 instead of the

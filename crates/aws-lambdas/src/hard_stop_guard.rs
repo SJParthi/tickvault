@@ -24,7 +24,7 @@
 //! errors fail OPEN to a ping — one ping beats a silent guard).
 //!
 //! The AWS calls are abstracted behind tiny async traits so the unit tests
-//! drive the FULL flow with fakes exactly like the Python monkeypatched
+//! drive the FULL flow with fakes exactly like the legacy monkeypatched
 //! `boto3.client` fakes did (including the ExplodingSsm "SSM was never
 //! touched" ratchets). The real SDK impls are thin, uncovered-by-design
 //! shells (UNPROVEN until deploy — a live Lambda invoke is the only probe).
@@ -34,11 +34,11 @@ use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
-/// Python parity: `BUDGET_KILL_USD = float(os.environ.get(..., "55"))`.
+/// Legacy parity: `BUDGET_KILL_USD = float(os.environ.get(..., "55"))`.
 /// KEEP IN SYNC with budget.tf `limit_amount` AND `BUDGET_USD` in the daily
 /// digest — the three MUST agree on "breached".
 pub const DEFAULT_BUDGET_KILL_USD: f64 = 55.0;
-/// Python parity default for the change-only ping-state SSM param
+/// Legacy parity default for the change-only ping-state SSM param
 /// (NOT under the banned groww/* namespace).
 pub const DEFAULT_PING_STATE_PARAM: &str = "/tickvault/prod/budget-guard/ping-state";
 /// Spend buckets are 10%-of-stop-budget steps.
@@ -53,9 +53,9 @@ fn ist() -> FixedOffset {
     FixedOffset::east_opt(crate::time::IST_OFFSET_SECS).unwrap_or_else(|| Utc.fix())
 }
 
-/// Environment wiring — Python parity: module-level `os.environ.get` reads.
+/// Environment wiring — legacy parity: module-level `os.environ.get` reads.
 /// NOTE: this lambda's instance env var is `INSTANCE_ID`, NOT
-/// `EC2_INSTANCE_ID` (python parity — the two guard lambdas differ).
+/// `EC2_INSTANCE_ID` (legacy parity — the two guard lambdas differ).
 #[derive(Debug, Clone)]
 pub struct GuardEnv {
     pub instance_id: String,
@@ -71,7 +71,7 @@ impl GuardEnv {
             instance_id: std::env::var("INSTANCE_ID").unwrap_or_default(),
             alerts_topic_arn: std::env::var("ALERTS_TOPIC_ARN").unwrap_or_default(),
             start_rule_name: std::env::var("START_RULE_NAME").unwrap_or_default(),
-            // Deliberate deviation: python `float(...)` raises at import on a
+            // Deliberate deviation: legacy `float(...)` raises at import on a
             // garbage value (Lambda init error). We fail-soft to the default
             // with a loud warn — a mis-typed env var must not kill the
             // never-cross guard entirely.
@@ -95,16 +95,16 @@ pub struct GuardInstance {
     pub launch_time: Option<DateTime<Utc>>,
 }
 
-/// EC2 surface. `Err` mirrors a raised boto3 exception (uncaught in python —
+/// EC2 surface. `Err` mirrors a raised boto3 exception (uncaught in the legacy runtime —
 /// it propagates out of the handler); `Ok(None)` mirrors an empty
-/// Reservations/Instances response (python would IndexError — also fatal).
+/// Reservations/Instances response (the legacy runtime would IndexError — also fatal).
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait Ec2Api {
     async fn describe(&self, instance_id: &str) -> Result<Option<GuardInstance>, String>;
     async fn stop_instances(&self, instance_id: &str) -> Result<(), String>;
 }
 
-/// SNS surface. Python does NOT catch publish exceptions — an `Err` here
+/// SNS surface. The legacy runtime does NOT catch publish exceptions — an `Err` here
 /// propagates out of the handler exactly like the raised boto3 error would.
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait SnsApi {
@@ -119,7 +119,7 @@ pub trait EventsApi {
 }
 
 /// Cost Explorer surface — the raw `Amount` strings per result period
-/// (python sums `float(d["Total"]["UnblendedCost"]["Amount"])`).
+/// (the legacy runtime sums `float(d["Total"]["UnblendedCost"]["Amount"])`).
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait CeApi {
     async fn unblended_amounts(&self, start: &str, end: &str) -> Result<Vec<String>, String>;
@@ -132,7 +132,7 @@ pub trait SsmApi {
     async fn put_parameter(&self, name: &str, value: &str) -> Result<(), String>;
 }
 
-/// Python `in_up_window`: Mon-Fri 08:30-16:30 IST (inclusive both ends).
+/// Legacy `in_up_window`: Mon-Fri 08:30-16:30 IST (inclusive both ends).
 /// The guard NEVER stops the box during the window on schedule grounds —
 /// only a budget breach may stop it in-window.
 pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
@@ -144,10 +144,10 @@ pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
     (830..=1630).contains(&hhmm)
 }
 
-/// Python `mtd_usd` — best-effort Cost Explorer month-to-date total.
+/// Legacy `mtd_usd` — best-effort Cost Explorer month-to-date total.
 /// Returns `None` on ANY error — the caller treats None as fail-safe
 /// ("cost_unknown": page, never stop or disable on missing data).
-/// Deliberate deviation: python read `datetime.now(timezone.utc)` inside;
+/// Deliberate deviation: the legacy runtime read `datetime.now(timezone.utc)` inside;
 /// we take the injected clock so the date window is testable/consistent.
 pub async fn mtd_usd<C: CeApi>(ce: &C, now_utc: DateTime<Utc>) -> Option<f64> {
     let today = now_utc.date_naive();
@@ -166,7 +166,7 @@ pub async fn mtd_usd<C: CeApi>(ce: &C, now_utc: DateTime<Utc>) -> Option<f64> {
                 match a.parse::<f64>() {
                     Ok(v) => total += v,
                     Err(e) => {
-                        // Python float() raise -> caught by the blanket arm.
+                        // Legacy float() raise -> caught by the blanket arm.
                         warn!(error = %e, "MTD lookup failed (non-fatal): bad Amount");
                         return None;
                     }
@@ -181,7 +181,7 @@ pub async fn mtd_usd<C: CeApi>(ce: &C, now_utc: DateTime<Utc>) -> Option<f64> {
     }
 }
 
-/// Python `classify_in_window_action` — pure decision for the in-window arm
+/// Legacy `classify_in_window_action` — pure decision for the in-window arm
 /// (GAP 1 fix): breach_stop / cost_unknown (fail-safe) / below_budget.
 pub fn classify_in_window_action(mtd: Option<f64>, budget_kill_usd: f64) -> &'static str {
     match mtd {
@@ -191,13 +191,13 @@ pub fn classify_in_window_action(mtd: Option<f64>, budget_kill_usd: f64) -> &'st
     }
 }
 
-/// Python `spend_bucket` — which 10%-of-stop-budget bucket the MTD spend
+/// Legacy `spend_bucket` — which 10%-of-stop-budget bucket the MTD spend
 /// sits in. Total, never panics: unknown/negative spend or a non-positive
 /// kill line clamps to bucket 0; the percentage is capped at 999 so a
-/// runaway spend cannot overflow anything. NaN parity with the python
-/// oracle: python's `int(min(nan, 999.0) // 10)` raised ValueError and the
+/// runaway spend cannot overflow anything. NaN parity with the legacy
+/// oracle: the legacy runtime's `int(min(nan, 999.0) // 10)` raised ValueError and the
 /// `except` arm returned 0 (Rust `f64::min` ignores NaN, so this is mapped
-/// explicitly below); `+inf` takes python's `min(inf, 999.0) == 999.0`
+/// explicitly below); `+inf` takes the legacy runtime's `min(inf, 999.0) == 999.0`
 /// path -> bucket 99, which Rust's `min` already matches.
 pub fn spend_bucket(mtd: Option<f64>, budget_kill_usd: f64) -> i64 {
     let Some(mtd) = mtd else { return 0 };
@@ -206,7 +206,7 @@ pub fn spend_bucket(mtd: Option<f64>, budget_kill_usd: f64) -> i64 {
     }
     let pct = (mtd / budget_kill_usd) * 100.0;
     if pct.is_nan() {
-        // Python oracle: int(nan) raises -> except -> 0.
+        // Legacy oracle: int(nan) raises -> except -> 0.
         return 0;
     }
     // APPROVED: floor of a value capped at 999 / BUCKET_PCT_STEP — always fits i64; NaN returned 0 above.
@@ -215,7 +215,7 @@ pub fn spend_bucket(mtd: Option<f64>, budget_kill_usd: f64) -> i64 {
     bucket
 }
 
-/// Python `classify_ping_decision` — pure change-only ping decision
+/// Legacy `classify_ping_decision` — pure change-only ping decision
 /// (2026-07-09, Telegram noise N2). Returns `(reason, new_state)`;
 /// reason ∈ ping_state_missing / ping_new_month / ping_cost_unknown_edge /
 /// ping_cost_recovered / ping_bucket_changed / silent. Fail-open by design:
@@ -239,7 +239,7 @@ pub fn classify_ping_decision(
         }
         return ("ping_cost_unknown_edge", new_state);
     }
-    // Python isinstance validation: dict with month:str, bucket:int,
+    // Legacy isinstance validation: dict with month:str, bucket:int,
     // outcome:str — anything else is a missing/corrupt state (fail-open).
     let valid = prev.filter(|p| p.is_object()).and_then(|p| {
         Some((
@@ -277,8 +277,8 @@ pub fn classify_ping_decision(
     ("silent", new_state)
 }
 
-/// Python `render_running_ping` — pure `(subject, message)` for a
-/// change-only running ping. Strings are byte-identical to python.
+/// Legacy `render_running_ping` — pure `(subject, message)` for a
+/// change-only running ping. Strings are byte-identical to legacy.
 pub fn render_running_ping(
     reason: &str,
     mtd: Option<f64>,
@@ -361,9 +361,9 @@ _instance_: `{instance_id}` — up {hrs_up:.1}h this boot.\n\
     )
 }
 
-/// Python `load_ping_state` — best-effort SSM state read; ANY error returns
+/// Legacy `load_ping_state` — best-effort SSM state read; ANY error returns
 /// `None` (fail-open: the classifier then pings; one ping beats a silent
-/// guard). Non-object JSON also reads as None (python `isinstance(dict)`).
+/// guard). Non-object JSON also reads as None (legacy `isinstance(dict)`).
 pub async fn load_ping_state<P: SsmApi>(ssm: &P, param: &str) -> Option<Value> {
     match ssm.get_parameter(param).await {
         Ok(raw) => match serde_json::from_str::<Value>(&raw) {
@@ -381,7 +381,7 @@ pub async fn load_ping_state<P: SsmApi>(ssm: &P, param: &str) -> Option<Value> {
     }
 }
 
-/// Python `save_ping_state` — best-effort SSM state write; a failed write is
+/// Legacy `save_ping_state` — best-effort SSM state write; a failed write is
 /// logged and the handler still returns ok (worst case: one duplicate
 /// ping/hour until the write lands — duplicate-over-silent).
 pub async fn save_ping_state<P: SsmApi>(ssm: &P, param: &str, state: &Value) -> bool {
@@ -394,7 +394,7 @@ pub async fn save_ping_state<P: SsmApi>(ssm: &P, param: &str, state: &Value) -> 
     }
 }
 
-/// Python `_execute_breach_stop` — stop the box + disable the morning start
+/// Legacy `_execute_breach_stop` — stop the box + disable the morning start
 /// rule + page (GAP 1). Ordering is deliberate: stop FIRST (caps spend even
 /// if the disable fails), then disable the start rule, then page — the page
 /// honestly reports whether the disable landed so the operator can finish
@@ -420,7 +420,7 @@ pub async fn execute_breach_stop<E: Ec2Api, N: SnsApi, V: EventsApi>(
                 disable_err = String::new();
             }
             Err(e) => {
-                // Python: page-don't-crash (logger.exception + continue).
+                // legacy: page-don't-crash (logger.exception + continue).
                 error!(error = %e, rule = %env.start_rule_name, "events:DisableRule failed");
                 disable_err = e;
             }
@@ -447,7 +447,7 @@ restarts at 8:30 AM tomorrow.",
         )
     };
 
-    // Python `subject[:99]` — char-boundary-safe truncation.
+    // Legacy `subject[:99]` — char-boundary-safe truncation.
     let subject_capped: String = subject.chars().take(99).collect();
     let message = format!(
         "🛑 *Budget breached — box stopped + morning auto-start DISABLED \
@@ -476,7 +476,7 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
     }))
 }
 
-/// Python `lambda_handler` — hourly EventBridge cron entry (event unused).
+/// Legacy `lambda_handler` — hourly EventBridge cron entry (event unused).
 pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
     env: &GuardEnv,
     ec2: &E,
@@ -495,7 +495,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
         return Ok(json!({"ok": false, "reason": "missing ALERTS_TOPIC_ARN"}));
     }
 
-    // Python indexes Reservations[0].Instances[0] — an absent instance
+    // The legacy runtime indexes Reservations[0].Instances[0] — an absent instance
     // raises (IndexError) and fails the invoke; `Err` here mirrors that.
     let inst = ec2
         .describe(&env.instance_id)
@@ -686,7 +686,7 @@ impl CeApi for SdkCe {
             .map_err(|e| e.to_string())?;
         let mut out = Vec::with_capacity(r.results_by_time().len());
         for period in r.results_by_time() {
-            // Python `d["Total"]["UnblendedCost"]["Amount"]` — a missing key
+            // Legacy `d["Total"]["UnblendedCost"]["Amount"]` — a missing key
             // raises inside mtd_usd's blanket catch -> None; Err mirrors it.
             let amount = period
                 .total()
@@ -806,7 +806,7 @@ mod tests {
         async fn describe(&self, _instance_id: &str) -> Result<Option<GuardInstance>, String> {
             Ok(Some(GuardInstance {
                 state: self.state.clone(),
-                // Python fake: LaunchTime = 2026-07-07 03:00 UTC.
+                // Legacy fake: LaunchTime = 2026-07-07 03:00 UTC.
                 launch_time: Some(utc(2026, 7, 7, 3, 0)),
             }))
         }
@@ -1145,7 +1145,7 @@ mod tests {
         assert!(msg.contains("Budget breached"));
         assert!(msg.contains("auto-start DISABLED"));
         assert!(msg.contains("aws events enable-rule --name tv-prod-daily-start"));
-        // Byte-exact python-oracle parity (rendered by RUNNING
+        // Byte-exact legacy-oracle parity (rendered by RUNNING
         // `_execute_breach_stop` from handler.py @ 9b1c2e6a1^ with the same
         // inputs: INSTANCE_ID=i-tvapp, START_RULE_NAME=tv-prod-daily-start,
         // BUDGET_KILL_USD=55, mtd=57.31, was_state=running, disable ok).
@@ -1340,7 +1340,7 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         assert_eq!(spend_bucket(Some(-1.0), 55.0), 0);
         assert_eq!(spend_bucket(Some(10.0), 0.0), 0);
         assert_eq!(spend_bucket(Some(1e12), 55.0), 99); // capped
-        // Python-oracle parity (verified: python3 try/except spend_bucket):
+        // Legacy-oracle parity (verified: the legacy runtime try/except spend_bucket):
         // nan -> 0 (int(nan) raised -> except -> 0), +inf -> 99
         // (min(inf, 999.0) == 999.0), -inf -> 0 (mtd < 0), inf/inf -> 0
         // (nan pct -> raised -> 0).

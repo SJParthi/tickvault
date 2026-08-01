@@ -215,7 +215,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
 #     alarm RETIRED 2026-07-15 with the Groww live-feed retirement — the
 #     seals metric lost its last live producer; historical)
 # ---------------------------------------------------------------------------
-# 2026-07-18 (rust-only phase 2b-1): the inline Python heredoc was PORTED to
+# 2026-07-18 (rust-only phase 2b-1): the inline legacy heredoc was PORTED to
 # Rust — crates/aws-lambdas/src/market_hours_gate.rs (lib logic + unit
 # tests) + src/bin/market_hours_liveness_gate.rs (thin bootstrap bin).
 # Behavior parity, unchanged env contract (ALARM_NAMES comma-list,

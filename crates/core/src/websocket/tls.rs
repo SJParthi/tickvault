@@ -6,7 +6,7 @@
 //!   reverse proxies that would otherwise negotiate HTTP/2 and reject the
 //!   WebSocket upgrade.
 //! - [`build_websocket_tls_connector_no_alpn`]: advertises NO ALPN protocol.
-//!   Used by 200-level depth ONLY, matching Dhan's Python SDK
+//!   Used by 200-level depth ONLY, matching Dhan's vendor SDK
 //!   `dhanhq==2.2.0rc1` exactly (Parthiban verified 2026-04-23 on
 //!   SecurityId 72271). Any other combination (tungstenite default UA +
 //!   http/1.1 ALPN) produced `Protocol(ResetWithoutClosingHandshake)`
@@ -33,10 +33,10 @@ pub fn build_websocket_tls_connector() -> Result<Connector, WebSocketError> {
 /// Builds a TLS connector WITHOUT any ALPN protocol for the 200-level depth
 /// socket.
 ///
-/// Matches the wire behavior of Dhan's Python SDK `dhanhq==2.2.0rc1` which
+/// Matches the wire behavior of Dhan's vendor SDK `dhanhq==2.2.0rc1` which
 /// uses the stock `websockets/16.0` library — that library does not set
 /// `alpn_protocols` on its `ssl.SSLContext`, so the TLS ClientHello advertises
-/// no ALPN. Parthiban ran the Python SDK against our account at SecurityId
+/// no ALPN. Parthiban ran the vendor SDK against our account at SecurityId
 /// 72271 on 2026-04-23 and the connection streamed for 30+ minutes with zero
 /// disconnects, while our Rust client with `http/1.1` ALPN kept getting
 /// `Protocol(ResetWithoutClosingHandshake)`.
@@ -336,7 +336,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // No-ALPN connector (200-level depth only — matches Python SDK wire behavior)
+    // No-ALPN connector (200-level depth only — matches vendor SDK wire behavior)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_build_websocket_tls_connector_no_alpn_has_empty_alpn_list() {
-        // Matches Python SDK `dhanhq==2.2.0rc1` which uses `websockets/16.0`
+        // Matches vendor SDK `dhanhq==2.2.0rc1` which uses `websockets/16.0`
         // with default SSLContext — no ALPN advertised. Verified 2026-04-23.
         install_crypto_provider();
         let connector = build_websocket_tls_connector_no_alpn().unwrap();

@@ -249,7 +249,7 @@ Per `docs/dhan-support/README.md`, share the GitHub link in a short Gmail reply:
 
 > Hi team,
 > Full reproduction details + Python output attached:
-> https://github.com/SJParthi/tickvault/blob/main/docs/dhan-support/2026-04-21-ticket-5519522-python-also-fails.md
+> https://github.com/SJParthi/tickvault/blob/main/docs/dhan-support/2026-04-21-ticket-5519522-vendor-sdk-also-fails.md
 >
 > Parthiban
 

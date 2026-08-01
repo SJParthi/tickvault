@@ -133,7 +133,7 @@ fn deploy_workflow_records_binary_sha_to_ssm() {
 }
 
 /// 6 — the operator portal renders the provenance footer.
-/// (2026-07-18 rust-only phase 2b-3: the python handler.py is DELETED — the
+/// (2026-07-18 rust-only phase 2b-3: the legacy handler.py is DELETED — the
 /// pins now target the Rust port, same contract, never weakened.)
 #[test]
 fn portal_footer_renders_provenance_line() {
@@ -168,7 +168,7 @@ fn portal_footer_renders_provenance_line() {
 fn watchdog_publishes_binary_mismatch_metric() {
     let root = repo_root();
     // Repointed 2026-07-18 (rust-only phase 2b-2 wave 1): the watchdog is
-    // now the Rust module (the python handler.py was ported 1:1 + deleted).
+    // now the Rust module (the legacy handler.py was ported 1:1 + deleted).
     let handler = read(&root.join("crates/aws-lambdas/src/deploy_watchdog.rs"));
     assert!(
         handler.contains("tv_binary_main_sha_mismatch"),

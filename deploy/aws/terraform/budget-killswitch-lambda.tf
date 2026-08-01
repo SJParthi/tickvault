@@ -121,9 +121,9 @@ resource "aws_iam_role_policy" "budget_killswitch" {
 # ---------------------------------------------------------------------------
 # Lambda source — Rust bin (rust-only phase 2b-1, 2026-07-18).
 #
-# The Python handler (deploy/aws/lambda/budget-killswitch/handler.py) was
+# The legacy handler (deploy/aws/lambda/budget-killswitch/handler.py) was
 # PORTED to Rust — crates/aws-lambdas/src/budget_killswitch.rs (lib logic;
-# every python test ported to Rust unit tests) + src/bin/budget_killswitch.rs
+# every legacy test ported to Rust unit tests) + src/bin/budget_killswitch.rs
 # (thin bootstrap bin). Behavior parity: same SNS event parse (Records[0]
 # .Sns.{Subject,Message}), same StopInstances on EC2_INSTANCE_ID, same
 # Critical operator alert to ALERTS_TOPIC_ARN with the 99-char subject cap

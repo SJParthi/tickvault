@@ -1,4 +1,4 @@
-//! Daily budget digest — Rust port of the `budget-guards.tf` inline Python
+//! Daily budget digest — Rust port of the `budget-guards.tf` inline legacy
 //! heredoc (`tv-prod-daily-budget-digest`, phase 2b-1).
 //!
 //! Runs 17:30 IST (12:00 UTC) Mon-Fri via EventBridge cron. Queries Cost
@@ -33,7 +33,7 @@ pub const GST_MULT: f64 = 1.18;
 /// limit_amount.
 pub const BUDGET_USD: f64 = 35.0;
 
-/// SNS subject — Python parity: `'[BUDGET] daily AWS cost'`.
+/// SNS subject — legacy parity: `'[BUDGET] daily AWS cost'`.
 pub const DIGEST_SUBJECT: &str = "[BUDGET] daily AWS cost";
 
 /// Friendly labels for the Cost Explorer SERVICE dimension (substring match).
@@ -63,7 +63,7 @@ pub fn inr(usd: f64) -> f64 {
     usd * INR_PER_USD * GST_MULT
 }
 
-/// Traffic-light emoji — Python parity: 🟢 <50, 🟡 <80, 🟠 <100, 🔴 ≥100.
+/// Traffic-light emoji — legacy parity: 🟢 <50, 🟡 <80, 🟠 <100, 🔴 ≥100.
 pub fn emoji_for_pct(pct: f64) -> &'static str {
     if pct < 50.0 {
         "🟢"
@@ -76,7 +76,7 @@ pub fn emoji_for_pct(pct: f64) -> &'static str {
     }
 }
 
-/// Calendar math for the digest — Python parity including the December
+/// Calendar math for the digest — legacy parity including the December
 /// special case (`... if today_utc.month < 12 else 31`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MonthMath {
@@ -94,7 +94,7 @@ pub fn month_math(today_utc: NaiveDate, mtd_usd: f64) -> MonthMath {
         31
     };
     let days_remaining = days_in_month.saturating_sub(today_utc.day());
-    // Python: `(mtd_usd / today_utc.day) * days_in_month if today_utc.day
+    // legacy: `(mtd_usd / today_utc.day) * days_in_month if today_utc.day
     // else mtd_usd` — day is never 0, the guard is kept for parity.
     let forecast_usd = if today_utc.day() > 0 {
         (mtd_usd / f64::from(today_utc.day())) * f64::from(days_in_month)
@@ -108,7 +108,7 @@ pub fn month_math(today_utc: NaiveDate, mtd_usd: f64) -> MonthMath {
     }
 }
 
-/// Fold raw `(SERVICE, usd)` groups into labeled aggregates — Python
+/// Fold raw `(SERVICE, usd)` groups into labeled aggregates — legacy
 /// parity: skip `usd <= 0`, aggregate on the friendly label, first-seen
 /// insertion order (a Vec fold, not a hash map, so tie ordering is stable).
 pub fn aggregate_by_service(groups: &[(String, f64)]) -> Vec<(String, f64)> {
@@ -129,8 +129,8 @@ pub fn aggregate_by_service(groups: &[(String, f64)]) -> Vec<(String, f64)> {
 
 /// Render the Telegram digest body + the `% of budget`.
 ///
-/// Line-for-line parity with the Python heredoc (note the heredoc's `$$`
-/// is terraform escaping — the deployed Python rendered a single `$`).
+/// Line-for-line parity with the legacy heredoc (note the heredoc's `$$`
+/// is terraform escaping — the deployed legacy runtime rendered a single `$`).
 pub fn render_digest(
     today_utc: NaiveDate,
     yday_usd: f64,
@@ -163,7 +163,7 @@ pub fn render_digest(
     ];
 
     let mut sorted: Vec<&(String, f64)> = by_svc.iter().collect();
-    // Python: `sorted(..., key=lambda kv: -kv[1])` — descending by USD,
+    // legacy: `sorted(..., key=lambda kv: -kv[1])` — descending by USD,
     // stable for ties (insertion order preserved).
     sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     for (nice, usd) in &sorted {
@@ -175,7 +175,7 @@ pub fn render_digest(
     (lines.join("\n"), pct)
 }
 
-/// Parse a Cost Explorer `Amount` string list into a summed f64 — Python
+/// Parse a Cost Explorer `Amount` string list into a summed f64 — legacy
 /// parity: `float(...)` raises on garbage, so a bad amount is an Err
 /// (the Lambda errors, its Errors metric fires).
 pub fn sum_amounts<'a, I: IntoIterator<Item = &'a str>>(amounts: I) -> Result<f64, Error> {
@@ -188,7 +188,7 @@ pub fn sum_amounts<'a, I: IntoIterator<Item = &'a str>>(amounts: I) -> Result<f6
     Ok(total)
 }
 
-/// Require a Cost Explorer response key — Python parity (hostile-review r1
+/// Require a Cost Explorer response key — legacy parity (hostile-review r1
 /// F4): the heredoc's `d['Total']['UnblendedCost']['Amount']` /
 /// `g['Keys'][0]` / `g['Metrics'][...]` chains RAISE KeyError/IndexError on
 /// any missing key, so the Lambda errors and its Errors metric fires. A
@@ -197,13 +197,13 @@ pub fn sum_amounts<'a, I: IntoIterator<Item = &'a str>>(amounts: I) -> Result<f6
 pub fn require_key<T>(value: Option<T>, key: &str) -> Result<T, Error> {
     value.ok_or_else(|| {
         Error::from(format!(
-            "Cost Explorer response missing {key:?} (python KeyError parity — never a silent $0 digest)"
+            "Cost Explorer response missing {key:?} (legacy KeyError parity — never a silent $0 digest)"
         ))
     })
 }
 
 /// Pull a day's `Total.UnblendedCost.Amount` string — errors loudly on any
-/// missing key (python KeyError parity, hostile-review r1 F4).
+/// missing key (legacy KeyError parity, hostile-review r1 F4).
 pub fn day_unblended_amount(
     day: &aws_sdk_costexplorer::types::ResultByTime,
 ) -> Result<&str, Error> {
@@ -213,7 +213,7 @@ pub fn day_unblended_amount(
 }
 
 /// Pull a group's `(Keys[0], Metrics.UnblendedCost.Amount)` pair — errors
-/// loudly on any missing key (python KeyError/IndexError parity,
+/// loudly on any missing key (legacy KeyError/IndexError parity,
 /// hostile-review r1 F4).
 pub fn group_service_amount(g: &aws_sdk_costexplorer::types::Group) -> Result<(&str, &str), Error> {
     let svc = require_key(g.keys().first(), "Groups[].Keys[0]")?;
@@ -226,12 +226,12 @@ pub fn group_service_amount(g: &aws_sdk_costexplorer::types::Group) -> Result<(&
     Ok((svc.as_str(), amount))
 }
 
-/// The success return — Python parity: `{'ok': True, 'mtd_usd': .., 'pct': ..}`.
+/// The success return — legacy parity: `{'ok': True, 'mtd_usd': .., 'pct': ..}`.
 pub fn success_result(mtd_usd: f64, pct: f64) -> Value {
     json!({"ok": true, "mtd_usd": mtd_usd, "pct": pct})
 }
 
-/// Entry point — EventBridge cron invoke (payload unused, like the Python).
+/// Entry point — EventBridge cron invoke (payload unused, like the legacy runtime).
 ///
 /// UNPROVEN until deploy: the live Cost Explorer + SNS legs run only in a
 /// real Lambda invoke.
@@ -276,7 +276,7 @@ fn date_interval(
         .map_err(Error::from)
 }
 
-/// Python `get_total` — DAILY UnblendedCost summed over the window.
+/// Legacy `get_total` — DAILY UnblendedCost summed over the window.
 async fn get_total(
     ce: &aws_sdk_costexplorer::Client,
     start: &str,
@@ -289,7 +289,7 @@ async fn get_total(
         .metrics("UnblendedCost")
         .send()
         .await?;
-    // Hostile-review r1 F4: missing keys ERROR loudly (python KeyError
+    // Hostile-review r1 F4: missing keys ERROR loudly (legacy KeyError
     // parity), never a silent skip into a false-OK ₹0 digest.
     let mut amounts: Vec<&str> = Vec::with_capacity(r.results_by_time().len());
     for day in r.results_by_time() {
@@ -298,7 +298,7 @@ async fn get_total(
     sum_amounts(amounts)
 }
 
-/// Python `get_by_service` — raw `(SERVICE, usd)` pairs per day-group
+/// Legacy `get_by_service` — raw `(SERVICE, usd)` pairs per day-group
 /// (aggregation/labeling happens in `aggregate_by_service`).
 async fn get_by_service(
     ce: &aws_sdk_costexplorer::Client,
@@ -322,7 +322,7 @@ async fn get_by_service(
     for day in r.results_by_time() {
         for g in day.groups() {
             // Hostile-review r1 F4: missing Keys/Metrics keys ERROR loudly
-            // (python KeyError/IndexError parity), never a silent skip.
+            // (legacy KeyError/IndexError parity), never a silent skip.
             let (svc, amount) = group_service_amount(g)?;
             let usd = amount
                 .parse::<f64>()
@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emoji_thresholds_match_python() {
+    fn test_emoji_thresholds_match_legacy() {
         assert_eq!(emoji_for_pct(0.0), "🟢");
         assert_eq!(emoji_for_pct(49.999), "🟢");
         assert_eq!(emoji_for_pct(50.0), "🟡");
@@ -394,8 +394,8 @@ mod tests {
     }
 
     #[test]
-    fn test_month_math_december_python_special_case() {
-        // Python: `... if today_utc.month < 12 else 31`.
+    fn test_month_math_december_legacy_special_case() {
+        // legacy: `... if today_utc.month < 12 else 31`.
         let dec = NaiveDate::from_ymd_opt(2026, 12, 5).unwrap();
         let m = month_math(dec, 5.0);
         assert_eq!(m.days_in_month, 31);
@@ -436,7 +436,7 @@ mod tests {
         assert!(msg.contains("_Days left_:   13"), "{msg}");
         assert!(msg.contains("*Where it goes (this month):*"));
         // Sorted descending by USD: CloudWatch (6.0) before EC2 (4.0),
-        // with the Python {:<16} left-justified label column.
+        // with the legacy {:<16} left-justified label column.
         let cw_idx = msg.find("  CloudWatch       ₹").unwrap();
         let ec2_idx = msg.find("  EC2 compute      ₹").unwrap();
         assert!(cw_idx < ec2_idx, "{msg}");
@@ -461,8 +461,8 @@ mod tests {
     }
 
     #[test]
-    fn test_service_line_format_matches_python_width() {
-        // Python: f"  {nice:<16} ₹{inr(usd):.0f}  ($${usd:.2f})" — with the
+    fn test_service_line_format_matches_legacy_width() {
+        // legacy: f"  {nice:<16} ₹{inr(usd):.0f}  ($${usd:.2f})" — with the
         // terraform `$$` unescaping to a single `$`.
         let today = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
         let by_svc = vec![("KMS".to_string(), 0.51)];
@@ -477,14 +477,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sum_amounts_rejects_garbage_like_python_float() {
+    fn test_sum_amounts_rejects_garbage_like_legacy_float() {
         assert!(sum_amounts(["1.5", "not-a-number"]).is_err());
     }
 
     #[test]
     fn test_day_unblended_amount_missing_keys_error_loudly() {
         use aws_sdk_costexplorer::types::{MetricValue, ResultByTime};
-        // Hostile-review r1 F4: a day with NO Total must ERROR (python
+        // Hostile-review r1 F4: a day with NO Total must ERROR (legacy
         // KeyError parity), never silently skip into a false-OK ₹0.
         let no_total = ResultByTime::builder().build();
         assert!(day_unblended_amount(&no_total).is_err());
@@ -515,12 +515,12 @@ mod tests {
     #[test]
     fn test_group_service_amount_missing_keys_error_loudly() {
         use aws_sdk_costexplorer::types::{Group, MetricValue};
-        // No Keys → error (python g['Keys'][0] IndexError parity).
+        // No Keys → error (legacy g['Keys'][0] IndexError parity).
         let no_keys = Group::builder()
             .metrics("UnblendedCost", MetricValue::builder().amount("1").build())
             .build();
         assert!(group_service_amount(&no_keys).is_err());
-        // No Metrics → error (python g['Metrics'] KeyError parity).
+        // No Metrics → error (legacy g['Metrics'] KeyError parity).
         let no_metrics = Group::builder().keys("AWS Lambda").build();
         assert!(group_service_amount(&no_metrics).is_err());
         // Metrics present but UnblendedCost missing → error.
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn test_digest_subject_is_python_literal() {
+    fn test_digest_subject_is_legacy_literal() {
         assert_eq!(DIGEST_SUBJECT, "[BUDGET] daily AWS cost");
     }
 }

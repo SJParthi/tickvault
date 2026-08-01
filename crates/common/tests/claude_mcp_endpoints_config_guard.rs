@@ -217,13 +217,13 @@ fn tunnel_install_scripts_exist_and_are_executable() {
 
 // 2026-07-18 (rust-only phase 2c, CUTOVER DONE): server.py is DELETED
 // from git — the committed-config contract now binds the Rust server
-// that .mcp.json actually launches. The python `_endpoint_url` pin is
-// replaced by its post-cutover truth (no live python consumer remains;
+// that .mcp.json actually launches. The legacy `_endpoint_url` pin is
+// replaced by its post-cutover truth (no live legacy consumer remains;
 // the Rust twin below carries the resolver pins) WITHOUT weakening.
 #[test]
 fn config_file_is_consumed_by_the_rust_mcp_server_only() {
     // The config header must name its real (rust) consumer, and no
-    // git-tracked python MCP server may exist to bypass the contract.
+    // git-tracked legacy MCP server may exist to bypass the contract.
     let (raw, _) = load_config();
     assert!(
         raw.contains("crates/tickvault-logs-mcp"),
@@ -238,11 +238,11 @@ fn config_file_is_consumed_by_the_rust_mcp_server_only() {
     match git_out {
         Ok(out) if out.status.success() => {
             // Real checkout / normal CI: the tracked output must be empty
-            // (no git-tracked python MCP server).
+            // (no git-tracked legacy MCP server).
             let tracked = String::from_utf8_lossy(&out.stdout);
             assert!(
                 tracked.trim().is_empty(),
-                "a git-tracked python MCP server reappeared — the committed-config \
+                "a git-tracked legacy MCP server reappeared — the committed-config \
                  contract is pinned on the Rust side only:\n{tracked}"
             );
         }
@@ -250,12 +250,12 @@ fn config_file_is_consumed_by_the_rust_mcp_server_only() {
             // cargo-mutants runs tests from a non-git copied tree (no .git),
             // where `git ls-files` exits non-zero (and git may be absent
             // entirely); fall back to a filesystem-existence check so the
-            // guard keeps its teeth without panicking — the deleted python
+            // guard keeps its teeth without panicking — the deleted legacy
             // server directory must simply be absent on disk.
             let py_dir = repo_root().join("scripts/mcp-servers/tickvault-logs");
             assert!(
                 !py_dir.exists(),
-                "a python MCP server directory reappeared on disk — the \
+                "a legacy MCP server directory reappeared on disk — the \
                  committed-config contract is pinned on the Rust side only: {}",
                 py_dir.display()
             );
