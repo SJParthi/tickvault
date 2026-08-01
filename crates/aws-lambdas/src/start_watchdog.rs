@@ -20,7 +20,7 @@
 //! (fixed UTC+5:30), same never-crash catch semantics on every AWS read.
 //!
 //! The AWS calls are abstracted behind tiny async traits so the unit tests
-//! drive the FULL flow with fakes exactly like the Python monkeypatched
+//! drive the FULL flow with fakes exactly like the legacy monkeypatched
 //! `boto3.client` fakes did (including "EC2/SSM/SNS were never touched"
 //! assertions). The real SDK impls are thin, uncovered-by-design shells
 //! (UNPROVEN until deploy — a live Lambda invoke is the only real probe).
@@ -48,7 +48,7 @@ pub const OPERATING_CLOSE_IST_MINUTES: u32 = 17 * 60;
 /// Grace: never curfew-stop a box within this many minutes of its launch.
 pub const CURFEW_START_GRACE_MINUTES: i64 = 45;
 
-/// Python parity defaults for the SSM parameter names.
+/// Legacy parity defaults for the SSM parameter names.
 pub const DEFAULT_KEEP_ALIVE_PARAM: &str = "/tickvault/prod/keep-alive-until";
 pub const DEFAULT_HOLIDAY_STOP_PARAM: &str = "/tickvault/prod/holiday-stop-date";
 
@@ -58,7 +58,7 @@ fn ist() -> FixedOffset {
     FixedOffset::east_opt(crate::time::IST_OFFSET_SECS).unwrap_or_else(|| Utc.fix())
 }
 
-/// Environment wiring — Python parity: module-level `os.environ.get` reads
+/// Environment wiring — legacy parity: module-level `os.environ.get` reads
 /// with the same defaults ("" / "" / "3001" / the two SSM param paths).
 #[derive(Debug, Clone)]
 pub struct WatchdogEnv {
@@ -102,20 +102,20 @@ pub trait Ec2Api {
 
 /// SSM surface. `Err` mirrors a raised boto3 exception (ParameterNotFound,
 /// AccessDenied, ...); `Ok` returns the raw parameter Value (may be empty —
-/// Python's `.get("Value") or ""`).
+/// the legacy runtime's `.get("Value") or ""`).
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait SsmApi {
     async fn get_parameter(&self, name: &str) -> Result<String, String>;
 }
 
-/// SNS surface. Python does NOT catch publish exceptions — an `Err` here
+/// SNS surface. The legacy runtime does NOT catch publish exceptions — an `Err` here
 /// propagates out of the handler exactly like the raised boto3 error would.
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait SnsApi {
     async fn publish(&self, topic_arn: &str, subject: &str, message: &str) -> Result<(), String>;
 }
 
-/// Python `_is_within_operating_hours`: 08:00-17:00 IST on a Monday-Friday.
+/// Legacy `_is_within_operating_hours`: 08:00-17:00 IST on a Monday-Friday.
 pub fn is_within_operating_hours(now_utc: DateTime<Utc>) -> bool {
     let ist_now = now_utc.with_timezone(&ist());
     // Sat=5, Sun=6 — weekends are always curfew.
@@ -127,7 +127,7 @@ pub fn is_within_operating_hours(now_utc: DateTime<Utc>) -> bool {
 }
 
 /// True when chrono parsed a leap-second time (`:60`), which it represents
-/// as `nanosecond() >= 1_000_000_000`. Python `fromisoformat` REJECTS
+/// as `nanosecond() >= 1_000_000_000`. Legacy `fromisoformat` REJECTS
 /// second=60 ("ValueError: second must be in 0..59" — oracle-verified), so
 /// any leap-second parse must map to None for oracle parity.
 fn is_chrono_leap_second(nanos: u32) -> bool {
@@ -149,21 +149,21 @@ enum KeepAliveShape {
 /// Strict shape gate + canonicalizer for the keep-alive timestamp.
 ///
 /// This runs BEFORE any chrono call so that chrono's lenient parsing can
-/// never accept a shape python `fromisoformat` rejects: chrono numeric
-/// fields match 1..=2 digits (python requires exactly 2 — "…T6:00" must
-/// reject), `parse_from_rfc3339` tolerates lowercase `z` (python rejects
+/// never accept a shape legacy `fromisoformat` rejects: chrono numeric
+/// fields match 1..=2 digits (the legacy runtime requires exactly 2 — "…T6:00" must
+/// reject), `parse_from_rfc3339` tolerates lowercase `z` (the legacy runtime rejects
 /// it — review finding G1-1), and `%z` has its own leniencies. The gate
 /// enforces exact digit counts and an UPPERCASE-`Z`-only designator, then
 /// emits a fully-canonical string (`T` separator, minute/second expanded
 /// to `:00`, fraction truncated to 6 digits, offset as `+HH:MM`) that the
 /// caller parses with a single strict chrono format per shape.
 ///
-/// Accepted grammar (python-accept subset, oracle-verified 2026-07-18):
+/// Accepted grammar (legacy-accept subset, oracle-verified 2026-07-18):
 /// - date: extended `YYYY-MM-DD` only
-/// - separator: ANY single character (python 3.11+ accepts any single
+/// - separator: ANY single character (legacy 3.11+ accepts any single
 ///   unicode char — `t`, `x`, even a digit; all oracle-verified)
 /// - time: `HH`, `HH:MM`, `HH:MM:SS`, `HH:MM:SS.f{1,}` (dot only; the
-///   fraction keeps its first 6 digits — python truncates to microseconds)
+///   fraction keeps its first 6 digits — the legacy runtime truncates to microseconds)
 /// - offset: none, `Z` (uppercase only), `[+-]HH`, `[+-]HH:MM`, `[+-]HHMM`
 ///   (offset minutes must be <= 59; hour range is value-checked by chrono)
 fn normalize_keep_alive_shape(raw: &str) -> Option<KeepAliveShape> {
@@ -182,7 +182,7 @@ fn normalize_keep_alive_shape(raw: &str) -> Option<KeepAliveShape> {
     {
         return None;
     }
-    // Python's MINYEAR is 1 — fromisoformat rejects year 0000
+    // the legacy runtime's MINYEAR is 1 — fromisoformat rejects year 0000
     // (oracle-verified); chrono would happily parse it. Fail closed.
     if b[..4] == *b"0000" {
         return None;
@@ -190,7 +190,7 @@ fn normalize_keep_alive_shape(raw: &str) -> Option<KeepAliveShape> {
     if b.len() == 10 {
         return Some(KeepAliveShape::DateOnly);
     }
-    // Consume ONE separator character (any single char — python parity;
+    // Consume ONE separator character (any single char — legacy parity;
     // multi-byte safe) and normalize it to 'T' in the canonical output.
     let time = {
         let mut chars = raw[10..].chars();
@@ -224,17 +224,17 @@ fn normalize_keep_alive_shape(raw: &str) -> Option<KeepAliveShape> {
                     j += 1;
                 }
                 if j == start {
-                    // Bare trailing dot ("06:00:00.") — python rejects too.
+                    // Bare trailing dot ("06:00:00.") — the legacy runtime rejects too.
                     return None;
                 }
-                // Python truncates fractional seconds to microseconds;
+                // The legacy runtime truncates fractional seconds to microseconds;
                 // keep exactly the first 6 digits for value parity (G1-3).
                 fraction = &time[start..(start + 6).min(j)];
                 i = j;
             }
         }
     }
-    // Offset: '' (naive), 'Z' (UPPERCASE only — python rejects a lowercase
+    // Offset: '' (naive), 'Z' (UPPERCASE only — the legacy runtime rejects a lowercase
     // 'z' designator in every shape, oracle-verified; G1-1), or a sign
     // followed by HH / HH:MM / HHMM. Anything else rejects the whole input.
     let offset = &time[i..];
@@ -254,7 +254,7 @@ fn normalize_keep_alive_shape(raw: &str) -> Option<KeepAliveShape> {
             } else {
                 return None;
             };
-            // Fail-closed divergence: python OVERFLOWS offset minutes >= 60
+            // Fail-closed divergence: the legacy runtime OVERFLOWS offset minutes >= 60
             // into hours ("+05:99" -> +06:39, oracle-verified); we refuse.
             if om.parse::<u32>().ok()? >= 60 {
                 return None;
@@ -278,7 +278,7 @@ fn normalize_keep_alive_shape(raw: &str) -> Option<KeepAliveShape> {
     })
 }
 
-/// Python `datetime.fromisoformat(raw)` + naive-as-IST interpretation.
+/// Legacy `datetime.fromisoformat(raw)` + naive-as-IST interpretation.
 /// Accepts an offset-aware ISO timestamp (fraction, second, minute, or
 /// hour precision), a naive `YYYY-MM-DD[<sep>]HH[:MM[:SS[.f]]]`
 /// (interpreted as IST — the operator's plain local paste), or a bare
@@ -287,32 +287,32 @@ fn normalize_keep_alive_shape(raw: &str) -> Option<KeepAliveShape> {
 /// The strict shape gate ([`normalize_keep_alive_shape`]) canonicalizes
 /// the input BEFORE any chrono call, so chrono leniencies (1-digit numeric
 /// fields, lowercase `z` in RFC3339, `%z` quirks) can never accept a shape
-/// python rejects. Chrono then does VALUE validation only (month 13,
+/// the legacy runtime rejects. Chrono then does VALUE validation only (month 13,
 /// Feb 30, hour 24, second 61, offset magnitude >= 24h all reject —
 /// oracle-parity), plus the explicit leap-second (`:60`) rejection.
 ///
-/// # Deliberate divergences from python fromisoformat (fail-closed)
+/// # Deliberate divergences from legacy fromisoformat (fail-closed)
 ///
-/// Python 3.12 (the lambda runtime) ACCEPTS all of the following shapes;
+/// Legacy 3.12 (the lambda runtime) ACCEPTS all of the following shapes;
 /// this parser REJECTS them (None -> the curfew guard stays armed, i.e.
 /// every divergence is in the budget-safe direction). Each was
-/// oracle-verified against python3.12 on 2026-07-18 via an exhaustive
+/// oracle-verified against legacy 3.12 on 2026-07-18 via an exhaustive
 /// differential sweep (separators x precisions x suffixes grid):
 /// - comma fractional-second separator ("…06:00:00,5")
 /// - ISO basic-format dates/times ("20260703", "20260703T060708",
 ///   "2026-07-03T060708", "20260703T06:07:08" and other mixed forms)
 /// - ISO week dates ("2026-W27-5", "2026-W27-5T06:07:08")
-/// - fractional hours and minutes ("…06.5", "…06:07.5" — python reads
+/// - fractional hours and minutes ("…06.5", "…06:07.5" — the legacy runtime reads
 ///   06:30:00 / 06:07:30)
 /// - offsets with a seconds component ("+05:30:00", "+053015",
 ///   "+05:30:00.123456")
-/// - offset minutes >= 60 ("+05:99" — python overflows to +06:39)
+/// - offset minutes >= 60 ("+05:99" — the legacy runtime overflows to +06:39)
 /// - a space between the time and the offset ("…06:00:00 +05:30") — and in
-///   fact ANY single character there ("…06:07:08xZ"): CPython reuses its
+///   fact ANY single character there ("…06:07:08xZ"): the legacy runtime reuses its
 ///   any-separator rule between the time and the tzinfo part
 /// - an empty fraction directly before an offset ("…06:07:08.Z")
 /// - fractional-second precision beyond what chrono's grammar shares with
-///   python is NOT a divergence: both truncate — python to 6 digits
+///   the legacy runtime is NOT a divergence: both truncate — the legacy runtime to 6 digits
 ///   natively, this parser by keeping the first 6 fraction digits (G1-3:
 ///   the previous nanosecond-preserving behavior is replaced with exact
 ///   microsecond parity).
@@ -351,7 +351,7 @@ pub fn parse_keep_alive_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     }
 }
 
-/// Python `(dt + IST_OFFSET).strftime("%I:%M %p").lstrip("0")` — 12-hour IST
+/// Legacy `(dt + IST_OFFSET).strftime("%I:%M %p").lstrip("0")` — 12-hour IST
 /// clock with the leading zero stripped ("8:43 AM", "11:51 PM").
 pub fn format_ist_12h(t: DateTime<Utc>) -> String {
     let s = t.with_timezone(&ist()).format("%I:%M %p").to_string();
@@ -361,7 +361,7 @@ pub fn format_ist_12h(t: DateTime<Utc>) -> String {
     }
 }
 
-/// Python `now.replace(hour=h, minute=m, second=0, microsecond=0)`.
+/// Legacy `now.replace(hour=h, minute=m, second=0, microsecond=0)`.
 fn at_utc_time(now: DateTime<Utc>, hour: u32, minute: u32) -> DateTime<Utc> {
     now.with_hour(hour)
         .and_then(|d| d.with_minute(minute))
@@ -370,7 +370,7 @@ fn at_utc_time(now: DateTime<Utc>, hour: u32, minute: u32) -> DateTime<Utc> {
         .unwrap_or(now) // unreachable: 0<=hour<24, 0<=minute<60
 }
 
-/// Python `_instance_info` — ('unknown', None) on any error; never raises.
+/// Legacy `_instance_info` — ('unknown', None) on any error; never raises.
 pub async fn instance_info<E: Ec2Api>(
     ec2: &E,
     instance_id: &str,
@@ -385,7 +385,7 @@ pub async fn instance_info<E: Ec2Api>(
     }
 }
 
-/// Python `_instance_public_ip` — None on any error / missing IP.
+/// Legacy `_instance_public_ip` — None on any error / missing IP.
 pub async fn instance_public_ip<E: Ec2Api>(ec2: &E, instance_id: &str) -> Option<String> {
     match ec2.describe(instance_id).await {
         Err(exc) => {
@@ -396,7 +396,7 @@ pub async fn instance_public_ip<E: Ec2Api>(ec2: &E, instance_id: &str) -> Option
     }
 }
 
-/// Python `_try_self_start` — true iff the call was accepted; never raises.
+/// Legacy `_try_self_start` — true iff the call was accepted; never raises.
 pub async fn try_self_start<E: Ec2Api>(ec2: &E, instance_id: &str) -> bool {
     match ec2.start_instances(instance_id).await {
         Ok(()) => {
@@ -410,7 +410,7 @@ pub async fn try_self_start<E: Ec2Api>(ec2: &E, instance_id: &str) -> bool {
     }
 }
 
-/// Python `_try_self_stop` — true iff the call was accepted; never raises.
+/// Legacy `_try_self_stop` — true iff the call was accepted; never raises.
 pub async fn try_self_stop<E: Ec2Api>(ec2: &E, instance_id: &str) -> bool {
     match ec2.stop_instances(instance_id).await {
         Ok(()) => {
@@ -424,7 +424,7 @@ pub async fn try_self_stop<E: Ec2Api>(ec2: &E, instance_id: &str) -> bool {
     }
 }
 
-/// Python `_read_keep_alive_until` — None = no (usable) override. Never
+/// Legacy `_read_keep_alive_until` — None = no (usable) override. Never
 /// raises; fail-open here would silently disable budget protection, so any
 /// failure is treated as "no override" (the guard stays armed).
 pub async fn read_keep_alive_until<S: SsmApi>(ssm: &S, param: &str) -> Option<DateTime<Utc>> {
@@ -443,7 +443,7 @@ pub async fn read_keep_alive_until<S: SsmApi>(ssm: &S, param: &str) -> Option<Da
     }
 }
 
-/// Python `_holiday_stop_is_today` — true iff holiday-gate.sh stamped
+/// Legacy `_holiday_stop_is_today` — true iff holiday-gate.sh stamped
 /// TODAY's IST date into the marker. FAIL-OPEN False on any error so a real
 /// trading day can never lose the 08:45 rescue.
 pub async fn holiday_stop_is_today<S: SsmApi>(
@@ -460,7 +460,7 @@ pub async fn holiday_stop_is_today<S: SsmApi>(
     }
 }
 
-/// Python `_publish` — skips (with a warning) when the topic ARN is unset.
+/// Legacy `_publish` — skips (with a warning) when the topic ARN is unset.
 async fn publish<N: SnsApi>(
     sns: &N,
     env: &WatchdogEnv,
@@ -474,7 +474,7 @@ async fn publish<N: SnsApi>(
     sns.publish(&env.alerts_topic_arn, subject, message).await
 }
 
-/// Python `lambda_handler` — the full mode dispatch, driven through the
+/// Legacy `lambda_handler` — the full mode dispatch, driven through the
 /// injectable AWS surfaces so tests exercise the exact flow.
 pub async fn run_watchdog<E: Ec2Api, S: SsmApi, N: SnsApi>(
     event: &Value,
@@ -484,7 +484,7 @@ pub async fn run_watchdog<E: Ec2Api, S: SsmApi, N: SnsApi>(
     sns: &N,
     now: DateTime<Utc>,
 ) -> Result<Value, String> {
-    // Python: `(event or {}).get("mode", "check")` — a missing/non-string
+    // legacy: `(event or {}).get("mode", "check")` — a missing/non-string
     // mode falls through to the default "check" branch.
     let mode = event.get("mode").and_then(Value::as_str).unwrap_or("check");
     info!(mode, instance = %env.instance_id, "start-watchdog invoked");
@@ -855,7 +855,7 @@ impl SsmApi for SdkSsm {
             .send()
             .await
             .map_err(|e| e.to_string())?;
-        // Python: `resp.get("Parameter", {}).get("Value") or ""`.
+        // legacy: `resp.get("Parameter", {}).get("Value") or ""`.
         Ok(resp
             .parameter()
             .and_then(|p| p.value())
@@ -1064,7 +1064,7 @@ mod tests {
         }
     }
 
-    /// The Python `_wire` fake wired boto3.client("ssm") to the SNS fake, so
+    /// The legacy `_wire` fake wired boto3.client("ssm") to the SNS fake, so
     /// SSM reads in those tests raised AttributeError -> the fail-open catch
     /// arm. A raising FakeSsm reproduces that exactly.
     async fn run(
@@ -1561,8 +1561,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_keep_alive_minute_precision_matches_python_oracle() {
-        // Oracle: python3 datetime.fromisoformat (lambda runtime python3.12)
+    fn test_parse_keep_alive_minute_precision_matches_legacy_oracle() {
+        // Oracle: the legacy runtime datetime.fromisoformat (lambda runtime legacy 3.12)
         // ACCEPTS minute-precision forms — verified 2026-07-18:
         //   '2026-07-03T06:00'        -> datetime(2026, 7, 3, 6, 0)
         //   '2026-07-03 06:00'        -> datetime(2026, 7, 3, 6, 0)
@@ -1595,9 +1595,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_keep_alive_hour_only_matches_python312_oracle() {
-        // Oracle: python3.11+/3.12 fromisoformat ALSO accepts hour-only
-        // times (rejected in <=3.10; the lambda runtime is python3.12) —
+    fn test_parse_keep_alive_hour_only_matches_legacy_312_oracle() {
+        // Oracle: legacy 3.11+/3.12 fromisoformat ALSO accepts hour-only
+        // times (rejected in <=3.10; the lambda runtime is legacy 3.12) —
         // verified 2026-07-18:
         //   '2026-07-03T06'        -> datetime(2026, 7, 3, 6, 0)
         //   '2026-07-03 06'        -> datetime(2026, 7, 3, 6, 0)
@@ -1632,7 +1632,7 @@ mod tests {
             "2026-13-40T06:00",
             "T06:00",
             "",
-            // Leap-second `:60` — python fromisoformat raises
+            // Leap-second `:60` — legacy fromisoformat raises
             // "ValueError: second must be in 0..59" (oracle-verified);
             // chrono would otherwise accept it as nanosecond >= 1e9.
             "2026-07-03T23:59:60",
@@ -1643,13 +1643,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_keep_alive_accepted_parity_vectors_match_python_oracle() {
-        // Differential-sweep ACCEPTED-PARITY set (python3.12 oracle,
-        // 2026-07-18): every shape below is accepted by BOTH python
+    fn test_parse_keep_alive_accepted_parity_vectors_match_legacy_oracle() {
+        // Differential-sweep ACCEPTED-PARITY set (legacy 3.12 oracle,
+        // 2026-07-18): every shape below is accepted by BOTH legacy
         // fromisoformat and this parser, with identical values.
         let ist_0030_utc = utc(2026, 7, 3, 0, 30);
         for accepted in [
-            // Any single separator char (python 3.11+ rule) — lowercase
+            // Any single separator char (legacy 3.11+ rule) — lowercase
             // 't', 'x', even a digit — all normalize to the same instant.
             "2026-07-03t06:00",
             "2026-07-03x06:00",
@@ -1661,7 +1661,7 @@ mod tests {
                 "{accepted:?}"
             );
         }
-        // Hour-only offset "+05" (python reads +05:00).
+        // Hour-only offset "+05" (the legacy runtime reads +05:00).
         assert_eq!(
             parse_keep_alive_timestamp("2026-07-03T06:00:00+05"),
             Some(utc(2026, 7, 3, 1, 0))
@@ -1671,7 +1671,7 @@ mod tests {
             parse_keep_alive_timestamp("2026-07-03T06:00:00-0530"),
             Some(utc(2026, 7, 3, 11, 30))
         );
-        // "-0000" == UTC (python-accepted; RFC3339 would reject it).
+        // "-0000" == UTC (legacy-accepted; RFC3339 would reject it).
         assert_eq!(
             parse_keep_alive_timestamp("2026-07-03T06:00:00-0000"),
             Some(utc(2026, 7, 3, 6, 0))
@@ -1684,11 +1684,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_keep_alive_fraction_truncates_to_microseconds_like_python() {
-        // G1-3: python truncates fractional seconds to microseconds
+    fn test_parse_keep_alive_fraction_truncates_to_microseconds_like_legacy() {
+        // G1-3: the legacy runtime truncates fractional seconds to microseconds
         // (".9999999" -> .999999, ".123456789012" -> .123456 —
         // oracle-verified 2026-07-18). This parser keeps exactly the first
-        // 6 fraction digits so the values match python EXACTLY (the
+        // 6 fraction digits so the values match legacy EXACTLY (the
         // previous nanosecond-preserving behavior diverged sub-micro).
         let expect = ist()
             .with_ymd_and_hms(2026, 7, 3, 6, 0, 0)
@@ -1708,8 +1708,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_keep_alive_lowercase_z_rejected_like_python() {
-        // G1-1: python fromisoformat REJECTS a lowercase 'z' designator in
+    fn test_parse_keep_alive_lowercase_z_rejected_like_legacy() {
+        // G1-1: legacy fromisoformat REJECTS a lowercase 'z' designator in
         // EVERY shape (oracle-verified 2026-07-18) — chrono's RFC3339 arm
         // and the old ['Z', 'z'] normalization used to accept these four,
         // silently suppressing the curfew. The shape gate now refuses them
@@ -1723,7 +1723,7 @@ mod tests {
         ] {
             assert_eq!(parse_keep_alive_timestamp(lower_z), None, "{lower_z:?}");
         }
-        // The SEPARATOR position still accepts 'z' (python accepts any
+        // The SEPARATOR position still accepts 'z' (the legacy runtime accepts any
         // single separator char there — parity, not a designator).
         assert_eq!(
             parse_keep_alive_timestamp("2026-07-03z06:00"),
@@ -1732,10 +1732,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_keep_alive_python_rejected_shapes_stay_rejected() {
-        // Differential-sweep UNSAFE-DIRECTION set: python REJECTS all of
+    fn test_parse_keep_alive_legacy_rejected_shapes_stay_rejected() {
+        // Differential-sweep UNSAFE-DIRECTION set: the legacy runtime REJECTS all of
         // these (oracle-verified 2026-07-18); accepting any of them would
-        // suppress the curfew on a shape the python lambda never honored.
+        // suppress the curfew on a shape the legacy lambda never honored.
         // chrono's lenient 1..=2-digit numeric parsing (and year-0 support)
         // would accept several without the strict shape gate.
         for rejected in [
@@ -1745,7 +1745,7 @@ mod tests {
             "2026-07-3T06:00",           // 1-digit day
             "126-07-03T06:00",           // 3-digit year
             "02026-07-03T06:00",         // 5-digit year
-            "0000-01-01T00:00",          // python MINYEAR is 1
+            "0000-01-01T00:00",          // legacy MINYEAR is 1
             "2026-07-03T 06:00",         // space after the separator
             "2026-07-03T06:00:00+5:30",  // 1-digit offset hour
             "2026-07-03T06:00:00+24:00", // offset magnitude >= 24h
@@ -1757,7 +1757,7 @@ mod tests {
 
     #[test]
     fn test_parse_keep_alive_documented_failsafe_divergences_reject() {
-        // Deliberate fail-closed divergences: python3.12 ACCEPTS every
+        // Deliberate fail-closed divergences: legacy 3.12 ACCEPTS every
         // shape below (oracle-verified 2026-07-18); this parser REJECTS
         // them (None -> the curfew guard stays armed — the budget-safe
         // direction). Full list on `parse_keep_alive_timestamp`'s doc.

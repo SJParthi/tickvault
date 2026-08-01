@@ -94,9 +94,9 @@ resource "aws_iam_role_policy" "telegram_webhook" {
 # ---------------------------------------------------------------------------
 # Lambda source — Rust bin (rust-only phase 2b-2 wave 1, 2026-07-18).
 #
-# The Python handler (deploy/aws/lambda/telegram-webhook/handler.py) was
+# The legacy handler (deploy/aws/lambda/telegram-webhook/handler.py) was
 # PORTED to Rust — crates/aws-lambdas/src/telegram_webhook.rs (lib logic;
-# every python test ported to Rust unit tests) + src/bin/telegram_webhook.rs
+# every legacy test ported to Rust unit tests) + src/bin/telegram_webhook.rs
 # (thin bootstrap bin). Behavior parity: same SNS Records parse, same
 # house-style plain-English lines + IST 12-hour timestamps, same
 # ALARM/OK batch fold + lone-OK recovered line + warm-container OK

@@ -165,9 +165,9 @@ fn session_env_is_gitignored() {
 // test_placeholder_fallback.py are DELETED from git. The PR #288
 // `${TICKVAULT_LOGS_DIR}` literal-passthrough class now binds the RUST
 // binary that .mcp.json actually launches; the pins below replace the
-// python pins with their post-cutover truth WITHOUT weakening:
+// legacy pins with their post-cutover truth WITHOUT weakening:
 //  - the .mcp.json tickvault-logs entry launches the placeholder-aware
-//    Rust server (never python),
+//    Rust server (never the legacy runtime),
 //  - the placeholder-fallback behavior twins (test_placeholder_fallback.py
 //    ports) live in crates/tickvault-logs-mcp/src/config.rs tests,
 //  - validate-automation runs those twins on every audit.
@@ -181,7 +181,7 @@ fn mcp_json_launches_placeholder_aware_rust_server() {
     );
     assert!(
         !src.contains("server.py"),
-        ".mcp.json launches the retired python server — the PR #288 \
+        ".mcp.json launches the retired legacy server — the PR #288 \
          placeholder-resolution guarantees are pinned on the Rust side only"
     );
 }
@@ -190,7 +190,7 @@ fn mcp_json_launches_placeholder_aware_rust_server() {
 fn rust_config_carries_placeholder_fallback_twin_tests() {
     // Post-cutover replacement of the `test_placeholder_fallback.py
     // exists + executable` pin: the behavior twins are Rust unit tests in
-    // config.rs (every Python assert has a twin there).
+    // config.rs (every legacy assert has a twin there).
     let src = read("crates/tickvault-logs-mcp/src/config.rs");
     assert!(
         src.contains("test_placeholder_fallback.py"),
@@ -213,7 +213,7 @@ fn validate_automation_runs_placeholder_fallback_twins() {
     );
     assert!(
         !s.contains("test_placeholder_fallback.py"),
-        "validate-automation.sh still invokes the deleted python \
+        "validate-automation.sh still invokes the deleted legacy \
          placeholder-fallback test"
     );
 }
@@ -244,7 +244,7 @@ fn rust_mcp_port_has_placeholder_aware_env_resolution() {
             .find(accessor)
             .unwrap_or_else(|| panic!("config.rs missing `{accessor}`"));
         // Bound the scan to the accessor's local region (next `pub fn` or
-        // 2KB, whichever first) — same spirit as the python body scan.
+        // 2KB, whichever first) — same spirit as the legacy body scan.
         let tail = &src[pos..];
         let body_end = tail[accessor.len()..]
             .find("\npub fn ")

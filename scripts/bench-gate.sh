@@ -38,7 +38,7 @@ BUDGETS_FILE="quality/benchmark-budgets.toml"
 BENCH_BUDGET_MULTIPLIER="${BENCH_BUDGET_MULTIPLIER:-1.0}"
 
 # Validate the multiplier early and loudly: digits and at most one dot only
-# (rejects empty, negative, and non-numeric garbage before it reaches Python).
+# (rejects empty, negative, and non-numeric garbage before it reaches the evaluator).
 case "$BENCH_BUDGET_MULTIPLIER" in
   ''|*[!0-9.]*|.|*.*.*)
     echo "ERROR: BENCH_BUDGET_MULTIPLIER must be a positive number, got '$BENCH_BUDGET_MULTIPLIER'" >&2
@@ -72,15 +72,15 @@ fi
 
 
 # =============================================================================
-# Rust-only purge Phase 2a-2 (2026-07-18): the inline python3 walker below
+# Rust-only purge Phase 2a-2 (2026-07-18): the inline interpreter walker below
 # was replaced by jq (per-file JSON extraction) + awk (TOML parse, budget
 # matching, float comparisons, verdicts). Numeric semantics preserved:
 # every comparison and every printed number is computed on IEEE-754 doubles
-# exactly as the python was (json floats, per-element division, budget x
+# exactly as the evaluator was (json floats, per-element division, budget x
 # multiplier, pct x 100, printf %.0f / %+.1f / %g are the same C-double
 # operations in both). Per-line output content and exit codes are
 # unchanged; LINE ORDER is now deterministic (sorted paths, all absolute-
-# budget lines before regression lines) where python's os.walk order was
+# budget lines before regression lines) where the legacy walker's order was
 # filesystem-dependent.
 # =============================================================================
 
@@ -96,7 +96,7 @@ while IFS= read -r f; do
   # FAIL CLOSED on a null/missing/non-numeric median (review round 1 fix,
   # 2026-07-18): the previous `.median.point_estimate // 0` turned an
   # explicit JSON null into 0ns — a corrupt estimates.json silently PASSED
-  # every budget. The old python raised TypeError there (exit 1); restore
+  # every budget. The old evaluator raised TypeError there (exit 1); restore
   # that fail-closed contract with a named error instead of a stack trace.
   median=$(jq -r '(try .median.point_estimate catch null)
                   | if type == "number" then . else "CORRUPT" end' "$f")
@@ -113,14 +113,14 @@ while IFS= read -r f; do
   rel="${rel%/estimates.json}"
   # mean.point_estimate defaults to 0 when absent; the CI lower bound is NA
   # when confidence_interval is absent, not an object, or lower_bound is
-  # null (the python isinstance(ci, dict) + .get() semantics).
+  # null (the evaluator's isinstance(ci, dict) + .get() semantics).
   # FAIL CLOSED on a PRESENT null/non-numeric mean.point_estimate or a
   # present NON-NULL non-numeric lower_bound (review round 2 fix,
   # 2026-07-18): the previous `// 0` / awk `+0` coerced them to 0, so a
   # real +30% regression with a corrupt lower_bound silently PASSED. The
-  # old python crashed there (TypeError, exit 1). Parity kept byte-
+  # old evaluator crashed there (TypeError, exit 1). Parity kept byte-
   # identical everywhere else: an ABSENT mean/point_estimate is still 0
-  # (documented python-parity), and a null/absent lower_bound (or a
+  # (documented legacy-parity), and a null/absent lower_bound (or a
   # non-object confidence_interval) still takes the NA fallback.
   vals=$(jq -r '[ ((.mean // {}) as $m
                    | if ($m | type) == "object" and ($m | has("point_estimate"))
@@ -148,7 +148,7 @@ LC_ALL=C awk -F'\t' \
   -v multiplier_raw="$BENCH_BUDGET_MULTIPLIER" \
 '
 function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
-# frepr: render a decimal string the way python str(float(...)) did for the
+# frepr: render a decimal string the way the legacy float repr did for the
 # TOML-magnitude values in use ("5.0" -> "5.0", "5" -> "5.0") — display only.
 function frepr(v,   s) {
   s = v

@@ -1,7 +1,7 @@
-//! Small CPython-semantics helpers so tool outputs match server.py
+//! Small legacy-runtime-semantics helpers so tool outputs match server.py
 //! byte-for-byte (after the harness's documented normalization).
 
-/// Python `s[:n]` — slice by UNICODE CHARACTERS, not bytes.
+/// legacy `s[:n]` — slice by UNICODE CHARACTERS, not bytes.
 pub fn py_slice_chars(s: &str, n: usize) -> &str {
     match s.char_indices().nth(n) {
         Some((idx, _)) => &s[..idx],
@@ -9,7 +9,7 @@ pub fn py_slice_chars(s: &str, n: usize) -> &str {
     }
 }
 
-/// Python `s[-n:]` — last `n` characters.
+/// legacy `s[-n:]` — last `n` characters.
 pub fn py_tail_chars(s: &str, n: usize) -> &str {
     let count = s.chars().count();
     if count <= n {
@@ -22,8 +22,8 @@ pub fn py_tail_chars(s: &str, n: usize) -> &str {
     }
 }
 
-/// Python `str.splitlines()` for the terminators that appear in real log
-/// files: `\n`, `\r\n`, `\r`. (CPython also splits on `\v`, `\f`, `\x1c`,
+/// legacy `str.splitlines()` for the terminators that appear in real log
+/// files: `\n`, `\r\n`, `\r`. (the legacy runtime also splits on `\v`, `\f`, `\x1c`,
 /// `\x1d`, `\x1e`, `\x85`, ` `, ` ` — those never appear in the
 /// tickvault log sinks; documented bounded-parity deviation.)
 pub fn py_splitlines(s: &str) -> Vec<&str> {
@@ -55,13 +55,13 @@ pub fn py_splitlines(s: &str) -> Vec<&str> {
     out
 }
 
-/// Python `line.rstrip("\n")` — strip trailing `\n` chars only.
+/// legacy `line.rstrip("\n")` — strip trailing `\n` chars only.
 // WIRING-EXEMPT: parity-shim helper landed dormant on main via #1644 (phase 2c, pre-cutover — call sites arrive with the MCP cutover PR); annotated 2026-07-18 because the local wiring guard diffs the whole merge range and flags main's own fn.
 pub fn py_rstrip_newline(s: &str) -> &str {
     s.trim_end_matches('\n')
 }
 
-/// Python `int(x)` over a JSON value: numbers truncate toward zero,
+/// legacy `int(x)` over a JSON value: numbers truncate toward zero,
 /// strings parse as base-10 integers. Returns Err(msg) with a
 /// `ValueError`-shaped message when it cannot coerce (the transcript
 /// avoids these; the message shape is a documented deviation).
@@ -87,7 +87,7 @@ pub fn py_int(v: &serde_json::Value) -> Result<i64, String> {
 
 /// `urllib.parse.quote(s)` with the default `safe="/"`: percent-encode the
 /// UTF-8 bytes of `s`, leaving unreserved chars (ALPHA / DIGIT / `_.-~`)
-/// and `/` literal. Uppercase hex, matching CPython.
+/// and `/` literal. Uppercase hex, matching the legacy runtime.
 pub fn py_urllib_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
@@ -169,7 +169,7 @@ pub fn py_fnmatch(name: &str, pattern: &str) -> bool {
     matches(&n, &p)
 }
 
-/// Decode bytes as UTF-8 with Python's `errors="ignore"` — invalid byte
+/// Decode bytes as UTF-8 with legacy's `errors="ignore"` — invalid byte
 /// sequences are DROPPED (not replaced).
 pub fn decode_utf8_ignore(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
@@ -197,23 +197,23 @@ pub fn decode_utf8_ignore(bytes: &[u8]) -> String {
     out
 }
 
-/// Decode bytes as UTF-8 with Python's `errors="replace"` (U+FFFD).
+/// Decode bytes as UTF-8 with legacy's `errors="replace"` (U+FFFD).
 pub fn decode_utf8_replace(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Python `json.dumps(..., ensure_ascii=True)` (the DEFAULT) emulation —
+/// legacy `json.dumps(..., ensure_ascii=True)` (the DEFAULT) emulation —
 /// review r8, 2026-07-18: post-process a serde_json dump so every char at
-/// or above U+007F becomes CPython's `\uXXXX` escape (lowercase 4-digit
+/// or above U+007F becomes the legacy runtime's `\uXXXX` escape (lowercase 4-digit
 /// hex; astral chars as a UTF-16 surrogate PAIR: U+1D54A becomes
 /// backslash-u d835 then backslash-u dd4a — both verified against
-/// CPython 3.x `json.dumps`). CPython also escapes DEL (U+007F) as
+/// the legacy runtime 3.x `json.dumps`). The legacy runtime also escapes DEL (U+007F) as
 /// backslash-u 007f, which serde leaves raw, so the boundary is
 /// `>= 0x7f`, not strictly-greater.
 ///
 /// Safe as a post-pass, never double-escaping: serde_json escapes only
 /// `"`/`\`/controls < 0x20 (short forms `\"` `\\` `\b` `\f` `\n` `\r`
-/// `\t`, else lowercase `\u00XX` — the SAME forms CPython emits), so
+/// `\t`, else lowercase `\u00XX` — the SAME forms the legacy runtime emits), so
 /// every escape sequence in serde output is pure ASCII < 0x7F, and any
 /// char >= U+007F is always literal string content.
 pub fn ensure_ascii(s: &str) -> String {
@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn tail_chars_matches_python_negative_slice() {
+    fn tail_chars_matches_legacy_negative_slice() {
         assert_eq!(py_tail_chars("abcdef", 3), "def");
         assert_eq!(py_tail_chars("ab", 5), "ab");
         assert_eq!(py_tail_chars("héllo", 4), "éllo");
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn int_coercion_matches_python() {
+    fn int_coercion_matches_legacy() {
         use serde_json::json;
         assert_eq!(py_int(&json!(5)).unwrap(), 5);
         assert_eq!(py_int(&json!(5.9)).unwrap(), 5);
@@ -301,12 +301,12 @@ mod tests {
         assert_eq!(decode_utf8_replace(b"ab\xffcd"), "ab\u{fffd}cd");
     }
 
-    // Review r8 (2026-07-18): goldens below are CPython outputs, derived
-    // by running `python3 -c "import json; print(json.dumps(...))"`
-    // (CPython 3.x, 2026-07-18) and pasting the results verbatim.
+    // Review r8 (2026-07-18): goldens below are the legacy runtime outputs, derived
+    // by running the legacy interpreter one-liner `import json; print(json.dumps(...))`
+    // (the legacy runtime 3.x, 2026-07-18) and pasting the results verbatim.
     #[test]
-    fn ensure_ascii_matches_python_json_dumps_golden() {
-        // python3: json.dumps({"text": "ASCII é — 日本語 𝕊 \x01 end"},
+    fn ensure_ascii_matches_legacy_json_dumps_golden() {
+        // legacy: json.dumps({"text": "ASCII é — 日本語 𝕊 \x01 end"},
         // indent=2) ==
         // '{\n  "text": "ASCII \\u00e9 \\u2014 \\u65e5\\u672c\\u8a9e
         //  \\ud835\\udd4a \\u0001 end"\n}'
@@ -320,14 +320,14 @@ mod tests {
 
     #[test]
     fn ensure_ascii_del_and_boundary_chars() {
-        // python3: json.dumps('~\x7f\x80\xa0') == '"~\\u007f\\u0080\\u00a0"'
-        // — DEL (0x7f) IS escaped by CPython; serde leaves it raw.
+        // legacy: json.dumps('~\x7f\x80\xa0') == '"~\\u007f\\u0080\\u00a0"'
+        // — DEL (0x7f) IS escaped by the legacy runtime; serde leaves it raw.
         let v = serde_json::Value::String("~\u{7f}\u{80}\u{a0}".to_string());
         assert_eq!(
             ensure_ascii(&serde_json::to_string(&v).unwrap()),
             "\"~\\u007f\\u0080\\u00a0\""
         );
-        // python3: json.dumps('𝕊') == '"\\ud835\\udd4a"' — lowercase
+        // legacy: json.dumps('𝕊') == '"\\ud835\\udd4a"' — lowercase
         // surrogate PAIR for an astral char.
         let astral = serde_json::Value::String("\u{1d54a}".to_string());
         assert_eq!(
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn ensure_ascii_pure_ascii_passthrough_never_double_escapes() {
         // serde's own escapes (controls, quote, backslash) are all-ASCII
-        // and identical to CPython's — python3: json.dumps('\x01\x1f"\\\t')
+        // and identical to the legacy runtime's — legacy: json.dumps('\x01\x1f"\\\t')
         // == '"\\u0001\\u001f\\"\\\\\\t"'. The post-pass must leave them
         // untouched, including an already-escaped backslash-u2014
         // 6-char literal sequence.

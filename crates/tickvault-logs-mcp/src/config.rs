@@ -4,7 +4,7 @@
 //!
 //! Every accessor is parameterized over an [`Env`] source so unit tests
 //! exercise the full precedence chain without mutating process-global env
-//! vars (the Rust twin of `test_placeholder_fallback.py` — every Python
+//! vars (the Rust twin of `test_placeholder_fallback.py` — every legacy
 //! assert has a twin in this module's tests).
 
 use std::collections::BTreeMap;
@@ -34,7 +34,7 @@ impl Env for MapEnv {
     }
 }
 
-/// Parsed `config/claude-mcp-endpoints.toml` — mirrors the Python
+/// Parsed `config/claude-mcp-endpoints.toml` — mirrors the legacy
 /// `_load_endpoints_config` result shape:
 /// `{"active": <profile>, "profiles": {<name>: {<kind>: <value>}}}`.
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ impl Default for EndpointsConfig {
     }
 }
 
-/// Python `_is_resolved`: set AND not a literal `${...}` placeholder.
+/// legacy `_is_resolved`: set AND not a literal `${...}` placeholder.
 pub fn is_resolved(value: Option<&str>) -> bool {
     let Some(value) = value else { return false };
     if value.is_empty() {
@@ -62,7 +62,7 @@ pub fn is_resolved(value: Option<&str>) -> bool {
     !(stripped.starts_with("${") && stripped.ends_with('}'))
 }
 
-/// Python `_endpoints_config_path`: env override wins iff set and not a
+/// legacy `_endpoints_config_path`: env override wins iff set and not a
 /// placeholder; else `<repo_root>/config/claude-mcp-endpoints.toml`.
 pub fn endpoints_config_path(env: &dyn Env, repo_root: &Path) -> PathBuf {
     if let Some(override_path) = env.get("TICKVAULT_MCP_ENDPOINTS_CONFIG") {
@@ -75,7 +75,7 @@ pub fn endpoints_config_path(env: &dyn Env, repo_root: &Path) -> PathBuf {
     repo_root.join("config").join("claude-mcp-endpoints.toml")
 }
 
-/// Python `_load_endpoints_config`: best-effort parse; missing or
+/// legacy `_load_endpoints_config`: best-effort parse; missing or
 /// malformed file falls back to `{"active": "local", "profiles": {}}` —
 /// the MCP server must never crash because the config is absent.
 pub fn load_endpoints_config(path: &Path) -> EndpointsConfig {
@@ -103,7 +103,7 @@ pub fn load_endpoints_config(path: &Path) -> EndpointsConfig {
     result
 }
 
-/// Python `_active_profile`.
+/// legacy `_active_profile`.
 pub fn active_profile(env: &dyn Env, cfg: &EndpointsConfig) -> String {
     let override_val = env.get("TICKVAULT_MCP_PROFILE");
     if is_resolved(override_val.as_deref()) {
@@ -112,7 +112,7 @@ pub fn active_profile(env: &dyn Env, cfg: &EndpointsConfig) -> String {
     cfg.active.clone()
 }
 
-/// Python `_endpoint_url` — the 4-tier precedence order:
+/// legacy `_endpoint_url` — the 4-tier precedence order:
 /// explicit > resolved env var > active-profile config > hardcoded default.
 pub fn endpoint_url(
     env: &dyn Env,
@@ -123,7 +123,7 @@ pub fn endpoint_url(
     explicit: Option<&str>,
 ) -> String {
     if let Some(explicit) = explicit {
-        // Python truthiness: an empty explicit string falls through.
+        // legacy truthiness: an empty explicit string falls through.
         if !explicit.is_empty() {
             return explicit.to_string();
         }
@@ -142,7 +142,7 @@ pub fn endpoint_url(
     default.to_string()
 }
 
-/// Lexical dot-normalization matching Python `pathlib`'s parse-time
+/// Lexical dot-normalization matching legacy `pathlib`'s parse-time
 /// behavior: `.` components are dropped (`Path("a/./b")` == `Path("a/b")`,
 /// `Path("")` == `Path(".")`), while `..` is KEPT verbatim — pathlib
 /// pure-path construction/joins never resolve parent components. Purely
@@ -151,7 +151,7 @@ pub fn endpoint_url(
 /// POSIX `//`-root (review r4 LOW-1): pathlib preserves EXACTLY two
 /// leading slashes (POSIX grants `//` implementation-defined meaning);
 /// one or three-plus collapse to a single `/`, and interior runs always
-/// collapse. Verified live on the box python:
+/// collapse. Verified live on the box legacy:
 /// `PurePosixPath('//a/b')` -> `//a/b`, `'///a/b'` -> `/a/b`,
 /// `'/a//b'` -> `/a/b`, `'//'` -> `//`, `'///'` -> `/`. Rust's
 /// `components()` collapses ALL leading slashes to one RootDir, so the
@@ -184,7 +184,7 @@ pub(crate) fn pathlib_lexical(path: &Path) -> PathBuf {
     }
 }
 
-/// Python `_logs_dir`. Every branch mirrors CPython's `Path(...)`
+/// legacy `_logs_dir`. Every branch mirrors the legacy runtime's `Path(...)`
 /// construction, which drops `.` components at parse time — the shipped
 /// default `logs_dir_local = "./data/logs"` must join to
 /// `<root>/data/logs`, never `<root>/./data/logs` (the joined string
@@ -208,7 +208,7 @@ pub fn logs_dir(env: &dyn Env, cfg: &EndpointsConfig, repo_root: &Path) -> PathB
     pathlib_lexical(&repo_root.join("data").join("logs"))
 }
 
-/// Python `_logs_source`: "http" or "local".
+/// legacy `_logs_source`: "http" or "local".
 pub fn logs_source(env: &dyn Env, cfg: &EndpointsConfig) -> String {
     let override_val = env.get("TICKVAULT_LOGS_SOURCE");
     if is_resolved(override_val.as_deref()) {
@@ -227,7 +227,7 @@ pub fn logs_source(env: &dyn Env, cfg: &EndpointsConfig) -> String {
     "local".to_string()
 }
 
-/// Python `_machine_logs_dir` — `data/logs/machine/` with the 2026-07-05
+/// legacy `_machine_logs_dir` — `data/logs/machine/` with the 2026-07-05
 /// grace-window fallback to the legacy top-level dir.
 pub fn machine_logs_dir(logs_dir: &Path) -> PathBuf {
     let machine = logs_dir.join("machine");
@@ -237,7 +237,7 @@ pub fn machine_logs_dir(logs_dir: &Path) -> PathBuf {
     logs_dir.to_path_buf()
 }
 
-/// Python `_state_dir`.
+/// legacy `_state_dir`.
 pub fn state_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(".claude").join("state")
 }
@@ -247,7 +247,7 @@ pub fn state_dir(repo_root: &Path) -> PathBuf {
 /// walk up from the current dir looking for `.mcp.json` or
 /// `config/claude-mcp-endpoints.toml`, else the current dir. The
 /// `.mcp.json` launcher runs from the repo root, so this resolves to the
-/// same root `__file__` gives the Python server.
+/// same root `__file__` gives the legacy server.
 pub fn resolve_repo_root(env: &dyn Env) -> PathBuf {
     let override_val = env.get("TICKVAULT_MCP_REPO_ROOT");
     if is_resolved(override_val.as_deref()) {
@@ -271,7 +271,7 @@ pub fn resolve_repo_root(env: &dyn Env) -> PathBuf {
     }
 }
 
-/// Everything the tools need, resolved once at startup (the Python server
+/// Everything the tools need, resolved once at startup (the legacy server
 /// caches the parsed config per process the same way).
 pub struct Ctx {
     pub repo_root: PathBuf,
@@ -302,7 +302,7 @@ impl Ctx {
 
 // ---------------------------------------------------------------------------
 // Tests — Rust twins of scripts/mcp-servers/tickvault-logs/
-// test_placeholder_fallback.py (every Python assert has a twin here) plus
+// test_placeholder_fallback.py (every legacy assert has a twin here) plus
 // precedence-chain coverage.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn invalid_logs_source_env_value_falls_through() {
-        // Python: `_is_resolved(override) and override in {"http", "local"}`
+        // legacy: `_is_resolved(override) and override in {"http", "local"}`
         let env = env(&[("TICKVAULT_LOGS_SOURCE", "carrier-pigeon")]);
         let cfg = EndpointsConfig::default();
         assert_eq!(logs_source(&env, &cfg), "local");
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn logs_dir_shipped_dotted_relative_value_joins_like_pathlib() {
         // The LITERAL shipped default in config/claude-mcp-endpoints.toml is
-        // "./data/logs". Python: Path("/repo") / "./data/logs" drops the
+        // "./data/logs". legacy: Path("/repo") / "./data/logs" drops the
         // leading `.` at construction => "/repo/data/logs". The Rust join
         // must produce the identical string (it echoes into tool outputs).
         let env = MapEnv::default();
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn logs_dir_absolute_dotted_config_value_is_dot_normalized() {
-        // Python Path("/abs/./data/logs") == Path("/abs/data/logs").
+        // legacy Path("/abs/./data/logs") == Path("/abs/data/logs").
         let env = MapEnv::default();
         let cfg = cfg_with_profile("local", "local", &[("logs_dir_local", "/abs/./data/logs")]);
         assert_eq!(
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn logs_dir_env_override_is_dot_normalized() {
-        // Python Path(override) also drops `.` at construction.
+        // legacy Path(override) also drops `.` at construction.
         let env = env(&[("TICKVAULT_LOGS_DIR", "/x/./y")]);
         let cfg = EndpointsConfig {
             active: "local".to_string(),
@@ -543,8 +543,8 @@ mod tests {
     }
 
     #[test]
-    fn pathlib_lexical_empty_and_lone_dot_match_python() {
-        // Python Path("") == Path(".") == PosixPath("."): both normalize
+    fn pathlib_lexical_empty_and_lone_dot_match_legacy() {
+        // legacy Path("") == Path(".") == PosixPath("."): both normalize
         // to "." here so the echoed string can never be empty.
         assert_eq!(pathlib_lexical(Path::new("")), PathBuf::from("."));
         assert_eq!(pathlib_lexical(Path::new(".")), PathBuf::from("."));
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn pathlib_lexical_preserves_double_slash_root_like_pathlib() {
-        // Review r4 LOW-1. Verified live on the box python:
+        // Review r4 LOW-1. Verified live on the box legacy:
         //   PurePosixPath('//a/b')   -> //a/b   (exactly-2 root preserved)
         //   PurePosixPath('///a/b')  -> /a/b    (>=3 collapse)
         //   PurePosixPath('/a//b')   -> /a/b    (interior runs collapse)

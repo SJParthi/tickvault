@@ -87,9 +87,9 @@ resource "aws_iam_role_policy" "deploy_watchdog" {
 # ---------------------------------------------------------------------------
 # Lambda source — Rust bin (rust-only phase 2b-2 wave 1, 2026-07-18).
 #
-# The Python handler (deploy/aws/lambda/deploy-watchdog/handler.py) was
+# The legacy handler (deploy/aws/lambda/deploy-watchdog/handler.py) was
 # PORTED to Rust — crates/aws-lambdas/src/deploy_watchdog.rs (lib logic;
-# every python test ported to Rust unit tests) + src/bin/deploy_watchdog.rs
+# every legacy test ported to Rust unit tests) + src/bin/deploy_watchdog.rs
 # (thin bootstrap bin). Behavior parity: same is_stale / binary_is_stale
 # never-dispatch-on-uncertainty contract, same GitHub desired/deployed sha
 # reads + workflow_dispatch, same B9 tv_binary_main_sha_mismatch metric

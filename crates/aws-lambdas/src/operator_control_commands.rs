@@ -1,5 +1,5 @@
 //! AUTO-GENERATED command/SQL goldens for the operator-control port —
-//! produced by RUNNING the python oracle
+//! produced by RUNNING the legacy oracle
 //! (`deploy/aws/lambda/operator-control/handler.py`) via the wave-4 build
 //! script, NEVER hand-transcribed. Byte-exact with `_VIEW_COMMANDS`,
 //! `_LATENCY_COMMANDS`, `_STORAGE_COMMANDS`, `_FEEDS_VIEW_COMMANDS` and
@@ -20,7 +20,7 @@
 //! `ticks` are all retired — those hosts appear in THIS comment only, never in
 //! any command below (the retired-hosts absence scan pins that).
 
-/// python: `_VIEW_COMMANDS` (handler.py:332-355).
+/// legacy: `_VIEW_COMMANDS` (handler.py:332-355).
 pub const VIEW_COMMANDS: [&str; 13] = [
     r"set +e",
     r#"echo "APP=$(systemctl is-active tickvault 2>/dev/null || echo inactive)""#,
@@ -37,7 +37,7 @@ pub const VIEW_COMMANDS: [&str; 13] = [
     r#"echo "ERRORS_END""#,
 ];
 
-/// python: `_LATENCY_COMMANDS = _latency_commands()` (handler.py:461-483).
+/// legacy: `_LATENCY_COMMANDS = _latency_commands()` (handler.py:461-483).
 pub const LATENCY_COMMANDS: [&str; 7] = [
     r"set +e",
     r#"echo "METRICS_BEGIN""#,
@@ -48,14 +48,14 @@ pub const LATENCY_COMMANDS: [&str; 7] = [
     r#"curl -fsS --max-time 4 -G 'http://127.0.0.1:9000/exp' --data-urlencode "query=select feed, leg, count() ok_rows, approx_percentile(close_to_data_ms, 0.5, 3) p50, approx_percentile(close_to_data_ms, 0.99, 3) p99 from rest_fetch_audit where ts in today() and outcome = 'ok' and close_to_data_ms >= 0 group by feed, leg order by feed, leg" 2>/dev/null | tail -n +2 | sed 's/^/RESTLAT_ROW=/'"#,
 ];
 
-/// python: `_STORAGE_COMMANDS` (handler.py:591-595).
+/// legacy: `_STORAGE_COMMANDS` (handler.py:591-595).
 pub const STORAGE_COMMANDS: [&str; 3] = [
     r"set +e",
     r#"df -BG / | tail -1 | awk '{print "DISK_USED="$3"\nDISK_FREE="$4"\nDISK_PCT="$5}'"#,
     r#"echo "DB_SIZE=$(du -sBG /var/lib/docker/volumes/tv-questdb-data/_data 2>/dev/null | cut -f1)""#,
 ];
 
-/// python: `_FEEDS_VIEW_COMMANDS` (handler.py:641-683).
+/// legacy: `_FEEDS_VIEW_COMMANDS` (handler.py:641-683).
 pub const FEEDS_VIEW_COMMANDS: [&str; 9] = [
     r"set +e",
     r#"echo "FEEDS_BEGIN""#,
@@ -68,5 +68,5 @@ pub const FEEDS_VIEW_COMMANDS: [&str; 9] = [
     r#"echo "REST_LAT_HOUR=$(curl -fsS --max-time 4 -G 'http://127.0.0.1:9000/exp' --data-urlencode "query=select feed, approx_percentile(close_to_data_ms, 0.5, 3), approx_percentile(close_to_data_ms, 0.99, 3) from rest_fetch_audit where ts > dateadd('h', -1, dateadd('m', 330, now())) and outcome = 'ok' and close_to_data_ms >= 0 group by feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
 ];
 
-/// python: `_rest_latency_sql()` (handler.py:444-458) — static return value.
+/// legacy: `_rest_latency_sql()` (handler.py:444-458) — static return value.
 pub const REST_LATENCY_SQL: &str = r"select feed, leg, count() ok_rows, approx_percentile(close_to_data_ms, 0.5, 3) p50, approx_percentile(close_to_data_ms, 0.99, 3) p99 from rest_fetch_audit where ts in today() and outcome = 'ok' and close_to_data_ms >= 0 group by feed, leg order by feed, leg";

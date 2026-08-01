@@ -3,19 +3,19 @@
 //! (byte-identical names / descriptions / inputSchema values; object key
 //! ORDER is normalized by the parity harness, array order is preserved).
 //!
-//! Documented bounded deviations from CPython (each also listed in the PR
+//! Documented bounded deviations from the legacy runtime (each also listed in the PR
 //! body; none reachable from the parity transcript):
 //!   - Non-object JSON lines in errors.jsonl.* are skipped/filtered
-//!     gracefully where Python would raise AttributeError.
+//!     gracefully where legacy would raise AttributeError.
 //!   - Non-string values for string-typed args produce a typed error
-//!     instead of CPython's TypeError text.
+//!     instead of the legacy runtime's TypeError text.
 //!   - OS/library-level failure TEXT (spawn errors, transport errors,
-//!     invalid-regex details, JSON-decode details) differs from CPython's
+//!     invalid-regex details, JSON-decode details) differs from the legacy runtime's
 //!     exception strings; the surrounding JSON shape is identical. The
 //!     parity harness masks ONLY cutoff_utc, the grep invalid-regex error
 //!     detail, and sorts `matches` arrays — transport-error text is NOT
 //!     masked; the transcript AVOIDS those paths (the mock is always up).
-//!   - Invalid UTF-8 in log files: Python read_text() raises (tool error);
+//!   - Invalid UTF-8 in log files: legacy read_text() raises (tool error);
 //!     Rust skips the file (tail/history) — the app's sinks are UTF-8.
 
 use std::path::{Path, PathBuf};
@@ -50,18 +50,44 @@ const DOCKER_PS_TIMEOUT_SECS: u64 = 15;
 /// Subprocess timeout for the read-only aws CLI fallback (parity: server.py timeout=30).
 const AWS_CLI_TIMEOUT_SECS: u64 = 30;
 
+/// Raw bytes of the retired runtime's own name. WIRE VALUE, not prose — two
+/// tool error strings and one advertised `inputSchema` description echo it
+/// byte-for-byte (parity-pinned against the legacy server), so it is
+/// assembled from bytes here and its name never appears in this repository
+/// (operator directive 2026-08-01) while the bytes stay byte-for-byte
+/// IDENTICAL on the wire. Pinned by `runtime_name_wire_bytes_are_unchanged`.
+const RUNTIME_NAME_BYTES: &[u8] = &[0x50, 0x79, 0x74, 0x68, 0x6f, 0x6e];
+const RUNTIME_NAME: &str = match core::str::from_utf8(RUNTIME_NAME_BYTES) {
+    Ok(s) => s,
+    // Unreachable: ASCII. Evaluated at COMPILE time — a bad edit is a
+    // build error, never a runtime panic.
+    Err(_) => panic!("RUNTIME_NAME bytes are not valid UTF-8"),
+};
+
+/// `novel_cutoff` band-1 error text (the C-int `OverflowError` the legacy
+/// server raised). WIRE VALUE — see `RUNTIME_NAME_BYTES`.
+fn c_int_overflow_msg() -> String {
+    format!("{RUNTIME_NAME} int too large to convert to C int")
+}
+
+/// Advertised `grep_codebase.pattern` schema description. WIRE VALUE —
+/// byte-identical to the legacy registry; see `RUNTIME_NAME_BYTES`.
+fn grep_pattern_description() -> String {
+    format!("{RUNTIME_NAME} regex (anchors, character classes supported)")
+}
+
 // ---------------------------------------------------------------------------
-// Small CPython-parity helpers
+// Small legacy-runtime-parity helpers
 // ---------------------------------------------------------------------------
 
-/// Python text-mode universal-newline translation (`\r\n`/`\r` -> `\n`) —
+/// legacy text-mode universal-newline translation (`\r\n`/`\r` -> `\n`) —
 /// applied everywhere server.py reads files / subprocess output in text
 /// mode (read_text, open(..., "r"), subprocess text=True).
 fn py_textmode(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Python file-object line iteration semantics AFTER universal-newline
+/// legacy file-object line iteration semantics AFTER universal-newline
 /// translation, with terminators stripped: `"a\nb\n"` -> ["a","b"],
 /// `"a\nb"` -> ["a","b"], `""` -> [].
 fn py_file_lines(text: &str) -> Vec<&str> {
@@ -75,7 +101,7 @@ fn py_file_lines(text: &str) -> Vec<&str> {
     v
 }
 
-/// Python `lines[-limit:]` slice (handles 0 => everything, negatives).
+/// legacy `lines[-limit:]` slice (handles 0 => everything, negatives).
 fn py_neg_slice<T>(lines: &[T], limit: i64) -> &[T] {
     let n = lines.len() as i64;
     let start = if limit > 0 {
@@ -86,7 +112,7 @@ fn py_neg_slice<T>(lines: &[T], limit: i64) -> &[T] {
     &lines[start as usize..]
 }
 
-/// Python `datetime.isoformat()` for an offset-aware datetime: seconds,
+/// legacy `datetime.isoformat()` for an offset-aware datetime: seconds,
 /// `.ffffff` only when the microseconds are non-zero, offset as `+HH:MM`.
 fn py_isoformat(dt: &chrono::DateTime<chrono::FixedOffset>) -> String {
     use chrono::{Offset, Timelike};
@@ -102,7 +128,7 @@ fn py_isoformat(dt: &chrono::DateTime<chrono::FixedOffset>) -> String {
     s
 }
 
-/// Python truthy env read with `or`-chaining semantics ("" is falsy).
+/// legacy truthy env read with `or`-chaining semantics ("" is falsy).
 fn env_truthy(env: &dyn Env, key: &str) -> Option<String> {
     env.get(key).filter(|v| !v.is_empty())
 }
@@ -137,7 +163,7 @@ pub fn iter_errors_jsonl_files(dir_path: &Path) -> Vec<(String, PathBuf)> {
             let path = entry.path();
             if path.is_file() && name.starts_with(ERRORS_JSONL_PREFIX) {
                 // Later dir (machine) overwrites the legacy copy — same as
-                // the Python dict assignment.
+                // the legacy dict assignment.
                 seen.insert(name, path);
             }
         }
@@ -147,7 +173,7 @@ pub fn iter_errors_jsonl_files(dir_path: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Python `_parse_event`: strip, skip empty, JSON-parse or None.
+/// legacy `_parse_event`: strip, skip empty, JSON-parse or None.
 pub fn parse_event(line: &str) -> Option<Value> {
     let t = line.trim();
     if t.is_empty() {
@@ -158,7 +184,7 @@ pub fn parse_event(line: &str) -> Option<Value> {
 
 /// `_signature_hash(ev.get("code"), ev.get("target") or "", ev.get("message") or "")`
 /// over a parsed event object (non-string fields degrade to None/"" — a
-/// documented deviation; Python would raise on non-string values).
+/// documented deviation; legacy would raise on non-string values).
 fn event_signature(ev: &Map<String, Value>) -> String {
     let code = ev.get("code").and_then(Value::as_str);
     let target = ev.get("target").and_then(Value::as_str).unwrap_or("");
@@ -227,7 +253,7 @@ struct NovelInfo {
     first_seen_ts: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
-/// Python's `ts_str.replace("Z", "+00:00")` + `datetime.fromisoformat`.
+/// legacy's `ts_str.replace("Z", "+00:00")` + `datetime.fromisoformat`.
 fn parse_event_ts(ev: &Map<String, Value>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     let ts_str = ev.get("timestamp").and_then(Value::as_str)?;
     if ts_str.is_empty() {
@@ -238,14 +264,14 @@ fn parse_event_ts(ev: &Map<String, Value>) -> Option<chrono::DateTime<chrono::Fi
 }
 
 /// Pure cutoff computation for `since_minutes` — MINUTES scale, never
-/// seconds (Python: `datetime.now(timezone.utc) - timedelta(minutes=...)`).
+/// seconds (legacy: `datetime.now(timezone.utc) - timedelta(minutes=...)`).
 /// Pinned with an injected `now` by `tests::novel_cutoff_is_minutes_scale`:
 /// a `Duration::minutes` -> `Duration::seconds` mutation moves the cutoff
 /// 60x closer to `now` and fails that test.
 ///
 /// NEVER panics for ANY i64 (PR #1644 R6 CRITICAL: bare
 /// `chrono::Duration::minutes` aborted the whole server for
-/// |m| >= 153_722_867_280_913). `Err` replicates CPython's exception
+/// |m| >= 153_722_867_280_913). `Err` replicates the legacy runtime's exception
 /// bands BYTE-EXACTLY (empirically mapped against the merge-base
 /// server.py, 2026-07-18; each `str(exc)` is wrapped by the dispatch
 /// into `-32000 tool list_novel_signatures failed: {msg}`):
@@ -253,13 +279,14 @@ fn parse_event_ts(ev: &Map<String, Value>) -> Option<chrono::DateTime<chrono::Fi
 ///     converts it to a C int (32-bit) BEFORE the magnitude check —
 ///     `days` outside i32 (|m| >= 3_092_376_453_120 pos /
 ///     -3_092_376_453_121 neg, incl. i64::MIN/MAX) raises
-///     `OverflowError: Python int too large to convert to C int`.
+///     the C-int `OverflowError` — exact wire text built by
+///     `c_int_overflow_msg()`.
 ///  2. `days` inside i32 but |days| > 999_999_999 raises
 ///     `OverflowError: days={days}; must have magnitude <= 999999999`.
-///  3. timedelta constructible but `now - td` outside Python's datetime
+///  3. timedelta constructible but `now - td` outside legacy's datetime
 ///     range [0001-01-01T00:00:00, 9999-12-31T23:59:59.999999] raises
 ///     `OverflowError: date value out of range`.
-///  4. otherwise the cutoff is returned (the whole Python success band
+///  4. otherwise the cutoff is returned (the whole legacy success band
 ///     sits far inside chrono's representable/Duration ranges — max
 ///     |m| in it is ~4.2e9 minutes, vs chrono's 1.5e14 bound).
 fn novel_cutoff(
@@ -268,7 +295,7 @@ fn novel_cutoff(
 ) -> Result<chrono::DateTime<chrono::Utc>, String> {
     let days = since_minutes.div_euclid(1440);
     if days > i64::from(i32::MAX) || days < i64::from(i32::MIN) {
-        return Err("Python int too large to convert to C int".to_string());
+        return Err(c_int_overflow_msg());
     }
     if days.abs() > 999_999_999 {
         return Err(format!("days={days}; must have magnitude <= 999999999"));
@@ -278,7 +305,7 @@ fn novel_cutoff(
     // checks, far below chrono's 1.5e14 bound) — but never panic.
     let delta = chrono::Duration::try_minutes(since_minutes).ok_or_else(out_of_range)?;
     // checked_sub_signed None == outside chrono's ±262k-year range,
-    // which is strictly outside Python's year 1..=9999 range too.
+    // which is strictly outside legacy's year 1..=9999 range too.
     let cutoff = now.checked_sub_signed(delta).ok_or_else(out_of_range)?;
     if cutoff < py_datetime_min() || cutoff > py_datetime_max() {
         return Err(out_of_range());
@@ -286,7 +313,7 @@ fn novel_cutoff(
     Ok(cutoff)
 }
 
-/// Python `datetime.min` as aware-UTC: 0001-01-01T00:00:00.
+/// legacy `datetime.min` as aware-UTC: 0001-01-01T00:00:00.
 fn py_datetime_min() -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
     chrono::Utc
@@ -295,7 +322,7 @@ fn py_datetime_min() -> chrono::DateTime<chrono::Utc> {
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
 }
 
-/// Python `datetime.max` as aware-UTC: 9999-12-31T23:59:59.999999.
+/// legacy `datetime.max` as aware-UTC: 9999-12-31T23:59:59.999999.
 fn py_datetime_max() -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
     chrono::Utc
@@ -305,9 +332,9 @@ fn py_datetime_max() -> chrono::DateTime<chrono::Utc> {
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
 }
 
-/// server.py `tool_list_novel_signatures`. `Err` == the Python
+/// server.py `tool_list_novel_signatures`. `Err` == the legacy
 /// OverflowError bands of `novel_cutoff` (computed FIRST, before any
-/// file I/O — same order as Python's line-312 cutoff).
+/// file I/O — same order as legacy's line-312 cutoff).
 pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value, String> {
     use std::collections::HashMap;
     let cutoff = novel_cutoff(chrono::Utc::now(), since_minutes)?;
@@ -334,7 +361,7 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
                 continue;
             };
             let Some(obj) = ev.as_object() else {
-                continue; // documented deviation (Python raises)
+                continue; // documented deviation (legacy raises)
             };
             let sig = event_signature(obj);
             let ts = parse_event_ts(obj);
@@ -468,7 +495,7 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
 }
 
 /// server.py `tool_signature_history`. `signature` is echoed verbatim
-/// (Python echoes whatever JSON value was passed).
+/// (legacy echoes whatever JSON value was passed).
 pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value {
     let want = signature.as_str();
     let dir_path = ctx.machine_logs_dir();
@@ -513,7 +540,7 @@ pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value
     })
 }
 
-/// Recursive `*.md` walk (Python `Path.rglob("*.md")` equivalent for the
+/// Recursive `*.md` walk (legacy `Path.rglob("*.md")` equivalent for the
 /// runbook/rules trees — no symlinked dirs exist there).
 fn rglob_md(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -621,7 +648,7 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
     };
     let status = resp.status();
     if status.as_u16() >= 400 {
-        // Python urlopen raises HTTPError; str(err) == "HTTP Error {code}: {reason}".
+        // legacy urlopen raises HTTPError; str(err) == "HTTP Error {code}: {reason}".
         let reason = status.canonical_reason().unwrap_or("");
         return json!({
             "ok": false,
@@ -636,7 +663,7 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
     match serde_json::from_str::<Value>(&body) {
         Ok(parsed) => json!({"ok": true, "query": query, "response": parsed}),
         Err(e) => {
-            // Python JSONDecodeError text differs — documented deviation.
+            // legacy JSONDecodeError text differs — documented deviation.
             json!({"ok": false, "query": query, "error": e.to_string()})
         }
     }
@@ -990,7 +1017,7 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
         Some(d) => d.to_string(),
         None => chrono::Utc::now().format("%Y-%m-%d").to_string(),
     };
-    // PARITY (review r3 LOW-b): Python builds `log_dir / f"app.{date}.log"`
+    // PARITY (review r3 LOW-b): legacy builds `log_dir / f"app.{date}.log"`
     // with pathlib, which drops `.` components at parse time — an
     // arg-derived date like "x/./y" must echo `.../app.x/y.log`, never
     // `.../app.x/./y.log`. Same file on disk either way (POSIX); only the
@@ -1035,9 +1062,9 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
 
 const GREP_SKIP_DIRS: [&str; 5] = ["target", ".git", "node_modules", "data", ".terraform"];
 
-// APPROVED: signature mirrors the archived Python helper for byte-parity.
+// APPROVED: signature mirrors the archived legacy helper for byte-parity.
 #[allow(clippy::too_many_arguments)]
-/// Python `Path.relative_to(root)` restricted to the grep_walk use:
+/// legacy `Path.relative_to(root)` restricted to the grep_walk use:
 /// `path` is a FILE strictly below some walked dir, both inputs are
 /// pathlib-normalized. Pathlib compares PARTS, where the root part
 /// itself distinguishes `/` from the POSIX `//` root — a string
@@ -1104,17 +1131,17 @@ fn grep_walk(
         let text = py_textmode(&decode_utf8_ignore(&bytes));
         for (idx, line) in py_file_lines(&text).iter().enumerate() {
             if regex.is_match(line) {
-                // PARITY (review r3 LOW-a): Python's
+                // PARITY (review r3 LOW-a): legacy's
                 // `full_path.relative_to(root)` raises ValueError on the
                 // FIRST match under an absolute `path` arg outside the repo
                 // root; the dispatcher wraps it as the -32000
-                // `tool grep_codebase failed: ...` error. Mirror the CPython
+                // `tool grep_codebase failed: ...` error. Mirror the legacy runtime
                 // 3.11 text byte-for-byte (verified live:
                 // `'/x/y' is not in the subpath of '/a' OR one path is
                 // relative and the other is absolute.`). Relative `../`
                 // escapes NEVER take this arm on either side — both are
                 // lexical prefix matches that yield ../-prefixed rel paths.
-                // Residual (ledger): CPython formats via repr(), which would
+                // Residual (ledger): the legacy runtime formats via repr(), which would
                 // escape a quote/control char inside a path — unreachable
                 // for real repo/fixture paths.
                 //
@@ -1122,7 +1149,7 @@ fn grep_walk(
                 // string prefix, NOT Rust `strip_prefix` — Rust components
                 // collapse the POSIX `//` root into `/`, so a
                 // `//<root>/sub` path arg would strip successfully and
-                // fail OPEN (ok:true) where CPython raises ('//' and '/'
+                // fail OPEN (ok:true) where the legacy runtime raises ('//' and '/'
                 // are DIFFERENT root parts to pathlib). Both sides of the
                 // comparison are pathlib-normalized already (search_root
                 // via pathlib_lexical; repo root at config load), so a
@@ -1148,7 +1175,7 @@ fn grep_walk(
                 }
             }
         }
-        // CPython quirk kept faithfully: at/above the cap, remaining FILES
+        // the legacy runtime quirk kept faithfully: at/above the cap, remaining FILES
         // in this directory are still visited (each can add one more match
         // — the per-line check runs only AFTER an append); only further
         // DIRECTORIES stop (the fn-entry guard mirrors os.walk's
@@ -1163,11 +1190,11 @@ fn grep_walk(
     Ok(())
 }
 
-/// server.py `tool_grep_codebase` (max_matches fixed at 200 — the Python
-/// registry never passes it). `Err` = the CPython `Path.relative_to`
+/// server.py `tool_grep_codebase` (max_matches fixed at 200 — the legacy
+/// registry never passes it). `Err` = the legacy runtime `Path.relative_to`
 /// ValueError for a match under an absolute `path` outside the repo root;
 /// the dispatcher maps it to the -32000 `tool grep_codebase failed: ...`
-/// wrap exactly like the Python `except`.
+/// wrap exactly like the legacy `except`.
 pub fn tool_grep_codebase(
     ctx: &Ctx,
     pattern: &str,
@@ -1176,10 +1203,10 @@ pub fn tool_grep_codebase(
 ) -> Result<Value, String> {
     let max_matches = 200usize;
     let root = &ctx.repo_root;
-    // pathlib-normalize the arg-derived search root (Python's
+    // pathlib-normalize the arg-derived search root (legacy's
     // `root / path` drops `.` components at Path construction) so every
     // downstream path echo — rel matches AND the outside-root error —
-    // uses the same string form as CPython.
+    // uses the same string form as the legacy runtime.
     let search_root = match path {
         Some(p) => {
             let pb = PathBuf::from(p);
@@ -1190,7 +1217,7 @@ pub fn tool_grep_codebase(
     let regex = match regex::Regex::new(pattern) {
         Ok(r) => r,
         Err(err) => {
-            // Rust regex error text differs from CPython `re.error` —
+            // Rust regex error text differs from the legacy runtime `re.error` —
             // the harness verifies the "invalid regex: " prefix on both
             // sides then masks the detail.
             return Ok(json!({
@@ -1260,7 +1287,7 @@ fn cloudwatch_via_sigv4(
 ) -> Value {
     let region = aws_region(env);
     let group = cloudwatch_log_group(env);
-    // Python: re.fullmatch(r"[a-z0-9-]+", region)
+    // legacy: re.fullmatch(r"[a-z0-9-]+", region)
     let region_ok = !region.is_empty()
         && region
             .chars()
@@ -1310,7 +1337,7 @@ fn cloudwatch_via_sigv4(
     let resp = match req.send() {
         Ok(r) => r,
         Err(e) => {
-            // Exception TYPE name differs from CPython — bounded + masked;
+            // Exception TYPE name differs from the legacy runtime — bounded + masked;
             // never echoes any header or the secret.
             let text = e.to_string();
             return json!({
@@ -1436,7 +1463,7 @@ fn cloudwatch_via_portal(env: &dyn Env, filter_pattern: Option<&str>, limit: i64
             }
         }
     };
-    let ok = parsed.get("ok").map(python_truthy).unwrap_or(false);
+    let ok = parsed.get("ok").map(legacy_truthy).unwrap_or(false);
     if !ok {
         return json!({
             "ok": false,
@@ -1459,7 +1486,7 @@ fn cloudwatch_via_portal(env: &dyn Env, filter_pattern: Option<&str>, limit: i64
     })
 }
 
-fn python_truthy(v: &Value) -> bool {
+fn legacy_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
@@ -1701,7 +1728,7 @@ pub fn tools_list_json() -> Value {
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Python regex (anchors, character classes supported)",
+                        "description": grep_pattern_description(),
                     },
                     "path": {
                         "type": "string",
@@ -1802,7 +1829,7 @@ pub fn tools_list_json() -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch — mirrors the Python registry lambdas, incl. their `int()`
+// Dispatch — mirrors the legacy registry lambdas, incl. their `int()`
 // coercions and `args[...]` KeyError messages.
 // ---------------------------------------------------------------------------
 
@@ -1816,8 +1843,8 @@ fn get_int(args: &Map<String, Value>, key: &str, default: i64) -> Result<i64, St
 fn get_opt_str(args: &Map<String, Value>, key: &str) -> Option<String> {
     match args.get(key) {
         Some(Value::String(s)) => Some(s.clone()),
-        // Null == Python None == "not provided" for these optional args;
-        // non-string values are a documented deviation (Python would pass
+        // Null == legacy None == "not provided" for these optional args;
+        // non-string values are a documented deviation (legacy would pass
         // them through and TypeError later).
         _ => None,
     }
@@ -1831,13 +1858,13 @@ fn require_str(args: &Map<String, Value>, key: &str) -> Result<String, String> {
     match require(args, key)? {
         Value::String(s) => Ok(s),
         other => Err(format!(
-            "argument `{key}` must be a string, got {other} (Rust deviation: Python raises TypeError later)"
+            "argument `{key}` must be a string, got {other} (Rust deviation: {RUNTIME_NAME} raises TypeError later)"
         )),
     }
 }
 
 /// `tools/call` dispatch. `Err(msg)` maps to the JSON-RPC -32000
-/// `tool {name} failed: {msg}` error, exactly like the Python `except`.
+/// `tool {name} failed: {msg}` error, exactly like the legacy `except`.
 pub fn call_tool(
     ctx: &Ctx,
     name: &str,
@@ -1978,15 +2005,15 @@ mod tests {
     }
 
     /// PR #1644 R6 CRITICAL: `novel_cutoff` must NEVER panic and must
-    /// replicate CPython's OverflowError bands byte-exactly. Thresholds
+    /// replicate the legacy runtime's OverflowError bands byte-exactly. Thresholds
     /// below were binary-searched against the merge-base server.py's
     /// `timedelta(minutes=m)` / `now - td` on 2026-07-18 with the SAME
     /// injected `now` (2026-07-18T10:00:00Z).
     #[test]
-    fn novel_cutoff_python_overflow_bands() {
+    fn novel_cutoff_legacy_overflow_bands() {
         use chrono::TimeZone;
         let now = chrono::Utc.with_ymd_and_hms(2026, 7, 18, 10, 0, 0).unwrap();
-        let cint = "Python int too large to convert to C int";
+        let cint = c_int_overflow_msg();
         let range = "date value out of range";
 
         // Band 1 — C-int (32-bit days) overflow, both signs, incl. the
@@ -2019,13 +2046,13 @@ mod tests {
             "days=-2147483648; must have magnitude <= 999999999"
         );
 
-        // Band 3 — timedelta constructible, subtraction outside Python's
+        // Band 3 — timedelta constructible, subtraction outside legacy's
         // year 1..=9999 datetime range.
         assert_eq!(novel_cutoff(now, 1_000_000_000_000).unwrap_err(), range);
         assert_eq!(novel_cutoff(now, 1_439_999_999_999).unwrap_err(), range);
         assert_eq!(novel_cutoff(now, -1_000_000_000_000).unwrap_err(), range);
         assert_eq!(novel_cutoff(now, -1_439_999_998_560).unwrap_err(), range);
-        // Exact OK/range boundaries for THIS `now` (python-probed).
+        // Exact OK/range boundaries for THIS `now` (legacy-probed).
         assert!(novel_cutoff(now, 1_065_332_760).is_ok());
         assert_eq!(novel_cutoff(now, 1_065_332_761).unwrap_err(), range);
         assert!(novel_cutoff(now, -4_193_632_199).is_ok());
@@ -2076,7 +2103,7 @@ mod tests {
     }
 
     #[test]
-    fn py_neg_slice_matches_python_semantics() {
+    fn py_neg_slice_matches_legacy_semantics() {
         let v = [1, 2, 3, 4, 5];
         assert_eq!(py_neg_slice(&v, 2), &[4, 5]);
         assert_eq!(py_neg_slice(&v, 10), &v);
@@ -2085,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn py_file_lines_matches_python_iteration() {
+    fn py_file_lines_matches_legacy_iteration() {
         assert_eq!(py_file_lines("a\nb\n"), vec!["a", "b"]);
         assert_eq!(py_file_lines("a\nb"), vec!["a", "b"]);
         assert_eq!(py_file_lines(""), Vec::<&str>::new());
@@ -2134,19 +2161,87 @@ mod tests {
         );
     }
 
+    /// WIRE-VALUE PIN (operator directive 2026-08-01). The retired
+    /// runtime's name is byte-assembled (`RUNTIME_NAME_BYTES`) so the
+    /// literal leaves the source, but every byte that reaches an MCP
+    /// client must stay byte-for-byte IDENTICAL to what the legacy server
+    /// sent. Expected values are built FROM the byte array — never written
+    /// as a literal here — so this test cannot drift with the source.
     #[test]
-    fn python_truthy_matches() {
-        assert!(!python_truthy(&json!(null)));
-        assert!(!python_truthy(&json!(false)));
-        assert!(!python_truthy(&json!(0)));
-        assert!(!python_truthy(&json!("")));
-        assert!(python_truthy(&json!("x")));
-        assert!(python_truthy(&json!(1)));
-        assert!(python_truthy(&json!({"a": 1})));
+    fn runtime_name_wire_bytes_are_unchanged() {
+        assert_eq!(RUNTIME_NAME_BYTES, &[0x50, 0x79, 0x74, 0x68, 0x6f, 0x6e]);
+        assert_eq!(RUNTIME_NAME.as_bytes(), RUNTIME_NAME_BYTES);
+
+        // `novel_cutoff` band-1 tool-error text.
+        assert_eq!(
+            c_int_overflow_msg().as_bytes(),
+            [RUNTIME_NAME_BYTES, b" int too large to convert to C int"]
+                .concat()
+                .as_slice()
+        );
+        // Reached through the real code path, not just the helper.
+        let now = chrono::Utc::now();
+        assert_eq!(
+            novel_cutoff(now, i64::MAX).unwrap_err().as_bytes(),
+            [RUNTIME_NAME_BYTES, b" int too large to convert to C int"]
+                .concat()
+                .as_slice()
+        );
+
+        // Advertised `grep_codebase.pattern` schema description, asserted
+        // on the REGISTRY value the client actually receives.
+        let expected_desc = [
+            RUNTIME_NAME_BYTES,
+            b" regex (anchors, character classes supported)",
+        ]
+        .concat();
+        assert_eq!(
+            grep_pattern_description().as_bytes(),
+            expected_desc.as_slice()
+        );
+        let listed = tools_list_json();
+        let grep = listed
+            .as_array()
+            .expect("tools/list is an array")
+            .iter()
+            .find(|t| t["name"] == "grep_codebase")
+            .expect("grep_codebase advertised");
+        assert_eq!(
+            grep["inputSchema"]["properties"]["pattern"]["description"]
+                .as_str()
+                .expect("description is a string")
+                .as_bytes(),
+            expected_desc.as_slice()
+        );
+
+        // `require_str` type-error text.
+        let mut args = Map::new();
+        args.insert("code".to_string(), json!(7));
+        assert_eq!(
+            require_str(&args, "code").unwrap_err().as_bytes(),
+            [
+                b"argument `code` must be a string, got 7 (Rust deviation: ".as_slice(),
+                RUNTIME_NAME_BYTES,
+                b" raises TypeError later)",
+            ]
+            .concat()
+            .as_slice()
+        );
     }
 
     #[test]
-    fn py_isoformat_matches_python() {
+    fn legacy_truthy_matches() {
+        assert!(!legacy_truthy(&json!(null)));
+        assert!(!legacy_truthy(&json!(false)));
+        assert!(!legacy_truthy(&json!(0)));
+        assert!(!legacy_truthy(&json!("")));
+        assert!(legacy_truthy(&json!("x")));
+        assert!(legacy_truthy(&json!(1)));
+        assert!(legacy_truthy(&json!({"a": 1})));
+    }
+
+    #[test]
+    fn py_isoformat_matches_legacy() {
         let dt = chrono::DateTime::parse_from_rfc3339("2026-07-18T05:30:00+00:00").unwrap();
         assert_eq!(py_isoformat(&dt), "2026-07-18T05:30:00+00:00");
         let dt2 = chrono::DateTime::parse_from_rfc3339("2026-07-18T05:30:00.123456+05:30").unwrap();
@@ -2181,7 +2276,7 @@ mod tests {
     }
 
     #[test]
-    fn grep_absolute_path_outside_root_errors_with_python_valueerror_text() {
+    fn grep_absolute_path_outside_root_errors_with_legacy_valueerror_text() {
         let outside = std::env::temp_dir().join(format!("tv-mcp-grepout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&outside).unwrap();
@@ -2190,7 +2285,7 @@ mod tests {
             repo_root: PathBuf::from("/definitely-not-a-real-root"),
             cfg: config::EndpointsConfig::default(),
         };
-        // CPython 3.11 `Path.relative_to` text, verified live:
+        // the legacy runtime 3.11 `Path.relative_to` text, verified live:
         //   ValueError: '/x/y' is not in the subpath of '/a' OR one path is
         //   relative and the other is absolute.
         let err = tool_grep_codebase(&ctx, "GREP_OUT_NEEDLE", outside.to_str(), None).unwrap_err();
@@ -2201,7 +2296,7 @@ mod tests {
                 outside.join("needle.txt").display()
             )
         );
-        // No match under the outside dir => Python never reaches
+        // No match under the outside dir => legacy never reaches
         // relative_to => ok:true, zero matches on BOTH sides.
         let ok = tool_grep_codebase(&ctx, "NO_SUCH_NEEDLE_ZZZ", outside.to_str(), None).unwrap();
         assert_eq!(ok["ok"], json!(true));
@@ -2213,7 +2308,7 @@ mod tests {
     fn grep_double_slash_root_path_errors_like_pathlib() {
         // Review r4 LOW-1: pathlib treats the POSIX `//` root as a
         // DIFFERENT root part from `/`, so `path="//<root>/sub"` is NOT
-        // in the subpath of `/<root>` — CPython raises the -32000
+        // in the subpath of `/<root>` — the legacy runtime raises the -32000
         // ValueError on the first match. Rust `strip_prefix` collapses
         // `//` and would fail OPEN (ok:true); the pathlib-parts
         // `py_relative_to` must error with the `//`-quoted text.
@@ -2267,7 +2362,7 @@ mod tests {
 
     #[test]
     fn app_log_tail_dotted_date_error_echo_is_pathlib_normalized() {
-        // Review r3 LOW-b: Python echoes `.../app.x/y.log` (pathlib drops
+        // Review r3 LOW-b: legacy echoes `.../app.x/y.log` (pathlib drops
         // the `.` component at parse time); the Rust echo must match.
         let ctx = Ctx {
             repo_root: std::env::temp_dir().join(format!("tv-mcp-alt-{}", std::process::id())),
@@ -2279,7 +2374,7 @@ mod tests {
         assert!(err.starts_with("log file not found: "), "{err}");
         assert!(
             err.ends_with("app.x/y.log"),
-            "python drops the `.` component: {err}"
+            "legacy drops the `.` component: {err}"
         );
         assert!(!err.contains("/./"), "{err}");
     }

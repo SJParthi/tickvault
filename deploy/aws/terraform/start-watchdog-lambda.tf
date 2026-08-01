@@ -101,9 +101,9 @@ resource "aws_iam_role_policy" "start_watchdog" {
 # ---------------------------------------------------------------------------
 # Lambda source — Rust bin (rust-only phase 2b-2 wave 2, 2026-07-18).
 #
-# The Python handler (deploy/aws/lambda/start-watchdog/handler.py) was
+# The legacy handler (deploy/aws/lambda/start-watchdog/handler.py) was
 # PORTED to Rust — crates/aws-lambdas/src/start_watchdog.rs (lib logic;
-# all 31 python tests ported 1:1 to Rust unit tests) +
+# all 31 legacy tests ported 1:1 to Rust unit tests) +
 # src/bin/start_watchdog.rs (thin bootstrap bin). Behavior parity: same
 # mode dispatch (ping/check/stop_check/curfew_check), same SNS
 # Subject/Message strings, same IST curfew math (08:00-17:00 Mon-Fri),

@@ -55,7 +55,7 @@ app     = 68.3
 # measured 64.92 rounded down to one decimal (64.9) minus 0.1 = 64.8.
 # RE-MEASURED 2026-07-18 (rust-only phase 2b-2 wave 1 — telegram-webhook +
 # market-open-readiness + deploy-watchdog modules added, each with its
-# python test suite ported 1:1): `cargo llvm-cov -p tickvault-aws-lambdas`
+# legacy test suite ported 1:1): `cargo llvm-cov -p tickvault-aws-lambdas`
 # measured 66.06% lines (2681 lines, 910 missed — the misses remain the
 # thin [[bin]] glue files + the async AWS/HTTP-call glue, structurally
 # unexercisable without a live AWS account; every pure decision/formatting

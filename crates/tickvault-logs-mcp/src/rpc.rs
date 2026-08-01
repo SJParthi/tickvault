@@ -3,11 +3,11 @@
 //! `tools/list`, `tools/call`, `notifications/initialized` (silent),
 //! unknown method → -32601, parse error → -32700 with `id: null`.
 //!
-//! Documented bounded deviations from CPython (transcript never hits
+//! Documented bounded deviations from the legacy runtime (transcript never hits
 //! them): a syntactically-valid NON-OBJECT request line (e.g. `5`) gets a
-//! "method not found" error here where Python would crash with an
+//! "method not found" error here where legacy would crash with an
 //! AttributeError; a truthy non-object `params` / `arguments` is treated
-//! as empty here where Python would raise mid-handler.
+//! as empty here where legacy would raise mid-handler.
 
 use std::io::{BufRead, Write};
 
@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 use crate::config::Ctx;
 use crate::tools;
 
-/// Python `f"{value}"` rendering of a JSON value pulled from the request
+/// legacy `f"{value}"` rendering of a JSON value pulled from the request
 /// (`unknown tool: {name}` / `method not found: {method}`): `None`,
 /// `True`/`False`, bare strings, number repr.
 fn py_display(v: &Value) -> String {
@@ -43,16 +43,16 @@ fn envelope_error(id: &Value, code: i64, message: &str) -> Value {
 
 /// Handle one parsed request. `None` = notification (no response line).
 pub fn handle_request(ctx: &Ctx, req: &Value) -> Option<Value> {
-    // Python: req_id = req.get("id") — missing id serializes as null.
+    // legacy: req_id = req.get("id") — missing id serializes as null.
     let id = req.get("id").cloned().unwrap_or(Value::Null);
-    // Python: method = req.get("method", "") — string compare below, so a
+    // legacy: method = req.get("method", "") — string compare below, so a
     // non-string method never matches and falls through to -32601.
     let method_val = req
         .get("method")
         .cloned()
         .unwrap_or_else(|| Value::String(String::new()));
     let method = method_val.as_str().unwrap_or("");
-    // Python: params = req.get("params") or {} (falsy → {}).
+    // legacy: params = req.get("params") or {} (falsy → {}).
     let params: Map<String, Value> = match req.get("params") {
         Some(Value::Object(m)) => m.clone(),
         _ => Map::new(),
@@ -77,14 +77,14 @@ pub fn handle_request(ctx: &Ctx, req: &Value) -> Option<Value> {
         "tools/call" => {
             let name_val = params.get("name").cloned().unwrap_or(Value::Null);
             let name = name_val.as_str().unwrap_or("");
-            // Python: arguments = params.get("arguments") or {}.
+            // legacy: arguments = params.get("arguments") or {}.
             let arguments: Map<String, Value> = match params.get("arguments") {
                 Some(Value::Object(m)) => m.clone(),
                 _ => Map::new(),
             };
             match tools::call_tool(ctx, name, &arguments) {
                 Some(Ok(result)) => {
-                    // Python: json.dumps(result, indent=2) — 2-space
+                    // legacy: json.dumps(result, indent=2) — 2-space
                     // indent, ": " separators, ensure_ascii=True (the
                     // default). serde_json pretty matches the shape and
                     // escape forms; the ensure_ascii post-pass (review
@@ -142,11 +142,11 @@ pub fn process_line(ctx: &Ctx, raw: &str) -> Option<Value> {
 /// `from_utf8_lossy` — review round-2 fix: the previous `lines()` iterator
 /// yielded `Err(InvalidData)` on an invalid-UTF-8 line and silently broke
 /// the loop, dropping every SUBSEQUENT valid request (false-OK exit 0),
-/// where Python (surrogateescape locale) answers -32700 for the bad line
+/// where legacy (surrogateescape locale) answers -32700 for the bad line
 /// and keeps serving. Valid UTF-8 input converts byte-identically, so
 /// existing byte-parity is untouched; an invalid-UTF-8 line becomes a
 /// `U+FFFD`-carrying string that fails JSON parse and rides the existing
-/// -32700 `id: null` path — Python's behavior class. Genuine I/O errors
+/// -32700 `id: null` path — legacy's behavior class. Genuine I/O errors
 /// still end the loop.
 pub fn run_stdio_loop(ctx: &Ctx) {
     let stdin = std::io::stdin();
@@ -170,7 +170,7 @@ fn run_loop<R: BufRead, W: Write>(ctx: &Ctx, mut input: R, mut out: W) {
             continue;
         };
         if let Ok(s) = serde_json::to_string(&resp) {
-            // Python's envelope writes (_respond/_respond_error) use
+            // legacy's envelope writes (_respond/_respond_error) use
             // json.dumps with the ensure_ascii=True default too, so the
             // same post-pass applies to the whole wire line (review r8,
             // 2026-07-18). Tool-result inner text is already ASCII by
@@ -180,7 +180,7 @@ fn run_loop<R: BufRead, W: Write>(ctx: &Ctx, mut input: R, mut out: W) {
             let s = crate::pycompat::ensure_ascii(&s);
             // Deliberate deviation (ledger in lib.rs): a stdout write
             // failure (broken pipe) is swallowed and the loop runs to
-            // stdin EOF + exit 0; CPython dies exit 1 with a
+            // stdin EOF + exit 0; the legacy runtime dies exit 1 with a
             // BrokenPipeError traceback. Unreachable in the real MCP
             // lifecycle; the Rust direction is safer.
             let _ignored = writeln!(out, "{s}");
@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_message_matches_python_fstring() {
+    fn unknown_tool_message_matches_legacy_fstring() {
         let ctx = test_ctx();
         let resp = handle_request(
             &ctx,
@@ -245,15 +245,15 @@ mod tests {
         assert_eq!(resp["error"]["code"], -32601);
         assert_eq!(resp["error"]["message"], "unknown tool: nope");
 
-        // Missing name → Python `None`.
+        // Missing name → legacy `None`.
         let resp = handle_request(&ctx, &json!({"id": 4, "method": "tools/call"})).unwrap();
         assert_eq!(resp["error"]["message"], "unknown tool: None");
     }
 
     #[test]
-    fn tool_error_maps_to_32000_with_python_keyerror_shape() {
+    fn tool_error_maps_to_32000_with_legacy_keyerror_shape() {
         let ctx = test_ctx();
-        // signature_history without `signature` → Python KeyError repr `'signature'`.
+        // signature_history without `signature` → legacy KeyError repr `'signature'`.
         let resp = handle_request(
             &ctx,
             &json!({
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(resp["error"]["code"], -32601);
         assert_eq!(resp["error"]["message"], "method not found: bogus/x");
 
-        // Missing method → "" per Python req.get("method", "").
+        // Missing method → "" per legacy req.get("method", "").
         let resp = handle_request(&ctx, &json!({"id": 7})).unwrap();
         assert_eq!(resp["error"]["message"], "method not found: ");
 
@@ -327,7 +327,7 @@ mod tests {
     fn invalid_utf8_line_answers_32700_and_loop_continues() {
         // Review round-2 fix: an invalid-UTF-8 line must NOT silently end
         // the loop — it answers -32700 (id null) and the NEXT valid
-        // request is still served (Python surrogateescape behavior class).
+        // request is still served (legacy surrogateescape behavior class).
         let ctx = test_ctx();
         let mut input: Vec<u8> = Vec::new();
         input.extend_from_slice(b"\xff\xfe{bad\n");
@@ -348,11 +348,11 @@ mod tests {
     }
 
     #[test]
-    fn inner_text_is_ensure_ascii_escaped_like_python_json_dumps() {
+    fn inner_text_is_ensure_ascii_escaped_like_legacy_json_dumps() {
         // Review r8 (2026-07-18): a runbook carrying an em-dash + an
-        // astral char must reach the inner tool-result text as CPython
+        // astral char must reach the inner tool-result text as the legacy runtime
         // json.dumps (ensure_ascii=True) escapes — never raw UTF-8.
-        // Golden fragment derived from python3 json.dumps (2026-07-18):
+        // Golden fragment derived from the legacy runtime json.dumps (2026-07-18):
         // '—' -> the 6-char literal backslash-u2014, '𝕊' -> the
         // surrogate pair backslash-ud835 backslash-udd4a.
         let ctx = test_ctx();
@@ -375,7 +375,7 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("em\\u2014dash and astral \\ud835\\udd4a"),
-            "inner text not python-escaped: {text}"
+            "inner text not legacy-escaped: {text}"
         );
         assert!(
             text.bytes().all(|b| b < 0x7f),
@@ -389,11 +389,11 @@ mod tests {
     }
 
     #[test]
-    fn envelope_line_is_ensure_ascii_escaped_like_python_json_dumps() {
-        // Review r8 (2026-07-18): python's _respond/_respond_error dumps
+    fn envelope_line_is_ensure_ascii_escaped_like_legacy_json_dumps() {
+        // Review r8 (2026-07-18): legacy's _respond/_respond_error dumps
         // use ensure_ascii=True too — a non-ASCII tool name echoed into
         // the -32601 message must ride the wire escaped
-        // (python3 json.dumps('na\u{ef}ve') escapes to backslash-u00ef).
+        // (legacy json.dumps('na\u{ef}ve') escapes to backslash-u00ef).
         let ctx = test_ctx();
         let mut input: Vec<u8> = Vec::new();
         input.extend_from_slice(
@@ -408,7 +408,7 @@ mod tests {
         let line = String::from_utf8(out).unwrap();
         assert!(
             line.contains("unknown tool: na\\u00efve"),
-            "envelope not python-escaped: {line}"
+            "envelope not legacy-escaped: {line}"
         );
         assert!(
             line.bytes().all(|b| b < 0x7f),

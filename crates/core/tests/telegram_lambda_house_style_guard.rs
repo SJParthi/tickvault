@@ -2,7 +2,7 @@
 //!
 //! REPOINTED 2026-07-18 (rust-only phase 2b-2 wave 1): the Lambda is now
 //! the Rust module `crates/aws-lambdas/src/telegram_webhook.rs` (the
-//! Python `deploy/aws/lambda/telegram-webhook/handler.py` was ported 1:1
+//! legacy `deploy/aws/lambda/telegram-webhook/handler.py` was ported 1:1
 //! and DELETED in the same PR). This guard is the INDEPENDENT second
 //! layer on top of the crate's own unit tests (the Test matrix
 //! `aws-lambdas` lane): those tests live next to the module and can be
@@ -241,7 +241,7 @@ fn guard_never_drop_delivery_boundary_and_fail_open_render() {
     let src = module_src();
     let prod = production_region(&src);
     // ist_12h degrades on malformed/edge-dated StateChangeTime instead of
-    // crashing (the python OverflowError regression class — the Rust arm
+    // crashing (the legacy OverflowError regression class — the Rust arm
     // falls back to the invocation time).
     let ist = region(prod, "pub fn ist_12h(", "pub fn ");
     assert!(
@@ -269,7 +269,7 @@ fn guard_never_drop_delivery_boundary_and_fail_open_render() {
 }
 
 // Bonus pin 1: the crate's own test lane carries the judge-contract test
-// names (ported 1:1 from the python suite — the Test matrix aws-lambdas
+// names (ported 1:1 from the legacy suite — the Test matrix aws-lambdas
 // lane runs them on every PR).
 #[test]
 fn guard_rust_test_lane_carries_contract_tests() {
@@ -292,19 +292,19 @@ fn guard_rust_test_lane_carries_contract_tests() {
     }
 }
 
-// Bonus pin 2: the ported python handler stays DELETED — a zombie
+// Bonus pin 2: the ported legacy handler stays DELETED — a zombie
 // handler.py reappearing next to the Rust module would mean two divergent
 // Telegram formatters (the rollback path is a full PR revert, never a
-// parallel python copy).
+// parallel legacy copy).
 #[test]
-fn guard_python_handler_stays_deleted() {
+fn guard_legacy_handler_stays_deleted() {
     let py = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../deploy/aws/lambda/telegram-webhook/handler.py");
     assert!(
         !py.exists(),
         "deploy/aws/lambda/telegram-webhook/handler.py must stay deleted \
          (ported to crates/aws-lambdas/src/telegram_webhook.rs in phase \
-         2b-2 wave 1) — a parallel python formatter would drift from the \
+         2b-2 wave 1) — a parallel legacy formatter would drift from the \
          Rust house-style contract"
     );
 }

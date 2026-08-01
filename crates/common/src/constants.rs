@@ -5,7 +5,7 @@
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 Binary Protocol — Packet Sizes
-// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in vendor SDK v2 (src/dhanhq/marketfeed.py)
 // All sizes verified against struct.calcsize() in the SDK.
 // ---------------------------------------------------------------------------
 
@@ -93,7 +93,7 @@ pub const WEBSOCKET_PROTOCOL_VERSION: &str = "2";
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Exchange Segment Codes (Binary Protocol)
-// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in vendor SDK v2 (src/dhanhq/marketfeed.py)
 // CRITICAL: These are binary wire codes, NOT subscription JSON strings.
 // ---------------------------------------------------------------------------
 
@@ -192,7 +192,7 @@ pub const DISCONNECT_CLIENT_ID_INVALID: u16 = 810;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Response Codes (Binary Protocol)
-// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in vendor SDK v2 (src/dhanhq/marketfeed.py)
 // ---------------------------------------------------------------------------
 
 /// Response code for index ticker packet (16 bytes).
@@ -203,10 +203,10 @@ pub const RESPONSE_CODE_TICKER: u8 = 2;
 
 /// Response code for market depth standalone packet (112 bytes).
 /// Format: `<BHBIf100s>` — Header(8) + LTP(f32) + Depth(5×20 bytes).
-/// Dhan API (Python SDK ref): `process_market_depth(data)`.
+/// Dhan API (vendor SDK ref): `process_market_depth(data)`.
 ///
 /// NOTE: Not in annexure Section 3 (gap between Ticker(2) and Quote(4)).
-/// Documented and handled in Dhan API (Python SDK ref) v2 `process_market_depth()`.
+/// Documented and handled in Dhan API (vendor SDK ref) v2 `process_market_depth()`.
 pub const RESPONSE_CODE_MARKET_DEPTH: u8 = 3;
 
 /// Response code for quote packet (50 bytes).
@@ -245,7 +245,7 @@ pub const MARKET_STATUS_POST_CLOSE: u16 = 3;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Subscription Request Codes
-// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in vendor SDK v2 (src/dhanhq/marketfeed.py)
 // Subscribe codes: 15 (Ticker), 17 (Quote), 21 (Full).
 // Unsubscribe = subscribe_code + 1: 16 (Ticker), 18 (Quote), 22 (Full).
 // Disconnect = 12 (closes the WebSocket connection).
@@ -305,7 +305,7 @@ pub const MARKET_DEPTH_LEVELS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Market Depth — Per-Level Field Offsets (within a single 20-byte level)
-// Source: Dhan API (Python SDK ref) `<IIHHff>` format string.
+// Source: Dhan API (vendor SDK ref) `<IIHHff>` format string.
 // Used in Full (code 8) and Market Depth standalone (code 3) packets.
 // ---------------------------------------------------------------------------
 
@@ -329,7 +329,7 @@ pub const DEPTH_LEVEL_OFFSET_ASK_PRICE: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Deep Depth Protocol — 20-Level & 200-Level WebSocket Feeds
-// Source: Dhan official API spec; verified in Python SDK (src/dhanhq/marketfeed.py), Dhan API docs.
+// Source: Dhan official API spec; verified in vendor SDK (src/dhanhq/marketfeed.py), Dhan API docs.
 // Separate WebSocket endpoints from the standard feed.
 // Bid and ask sides arrive as SEPARATE binary packets.
 // ---------------------------------------------------------------------------
@@ -351,7 +351,7 @@ pub const DEEP_DEPTH_LEVEL_SIZE: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Deep Depth — Per-Level Field Offsets (within a single 16-byte level)
-// Source: Dhan API (Python SDK ref) `<dII>` format string in fulldepth.py.
+// Source: Dhan API (vendor SDK ref) `<dII>` format string in fulldepth.py.
 // ---------------------------------------------------------------------------
 
 /// Price (f64 LE) offset within a deep depth level.
@@ -393,7 +393,7 @@ pub const FEED_REQUEST_TWENTY_DEPTH: u8 = 23;
 
 /// Unsubscription request code for full market depth feed (both 20 and 200 level).
 /// Dhan Annexure: UnsubscribeFullDepth = 25. There is NO code 24.
-/// Python SDK (fulldepth.py) also uses 25 for unsubscribe.
+/// vendor SDK (fulldepth.py) also uses 25 for unsubscribe.
 pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 25;
 
 // ---------------------------------------------------------------------------
@@ -417,7 +417,7 @@ pub const DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Live Order Update WebSocket
-// Source: DhanHQ API docs, Python SDK.
+// Source: DhanHQ API docs, vendor SDK.
 // Separate JSON-based WebSocket (NOT binary).
 // ---------------------------------------------------------------------------
 
@@ -1515,16 +1515,16 @@ pub const DHAN_TWENTY_DEPTH_WS_BASE_URL: &str = "wss://depth-api-feed.dhan.co/tw
 /// 200-level depth WebSocket base URL.
 /// Full URL: `wss://full-depth-api.dhan.co/?token=TOKEN&clientId=CLIENT_ID&authType=2`
 ///
-/// NOTE: On 2026-04-23 Parthiban verified with Dhan's official Python SDK
+/// NOTE: On 2026-04-23 Parthiban verified with Dhan's official vendor SDK
 /// `dhanhq==2.2.0rc1` that the **root path `/`** (not `/twohundreddepth`) is
 /// the working URL for our account at SecurityId 72271 at depth 200. The SDK
 /// streamed 30+ minutes on root path, while our Rust client at
 /// `/twohundreddepth` kept getting `Protocol(ResetWithoutClosingHandshake)`
 /// for 2+ weeks. This reverses the advice in Dhan ticket #5519522 which
 /// had told us to use `/twohundreddepth`. If this regresses, re-open that
-/// ticket and cite the 2026-04-23 Python SDK verification in the reply.
+/// ticket and cite the 2026-04-23 vendor SDK verification in the reply.
 /// Dhan also confirmed: use a Security ID close to current market price (ATM).
-pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co"; // APPROVED: infrastructure constant — Python SDK verified root path 2026-04-23
+pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co"; // APPROVED: infrastructure constant — vendor SDK verified root path 2026-04-23
 
 // ---------------------------------------------------------------------------
 // Historical Data — Candle Fetch Constants
@@ -2832,7 +2832,7 @@ pub const AUTH_RETRY_MAX_BACKOFF_SECS: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Binary Packet Byte Offsets
-// Source: SDK struct.unpack format strings, verified against Python SDK.
+// Source: SDK struct.unpack format strings, verified against vendor SDK.
 // CRITICAL: Quote and Full packets DIVERGE at offset 34.
 // ---------------------------------------------------------------------------
 
@@ -3582,7 +3582,7 @@ const _: () = assert!(
 
 // ---------------------------------------------------------------------------
 // Compile-Time Assertions — Binary Protocol Offset Chain Verification
-// Source: Dhan API (Python SDK ref) struct.unpack format strings.
+// Source: Dhan API (vendor SDK ref) struct.unpack format strings.
 // Ensures every offset = previous_offset + previous_field_size.
 // ---------------------------------------------------------------------------
 

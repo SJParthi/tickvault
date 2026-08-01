@@ -4,7 +4,7 @@
 
 fn main() {
     let ctx = tickvault_logs_mcp::config::Ctx::from_process_env();
-    // Python: if "--self-test" in sys.argv (any position).
+    // legacy: if "--self-test" in sys.argv (any position).
     if std::env::args().any(|a| a == "--self-test") {
         std::process::exit(tickvault_logs_mcp::selftest::run(&ctx));
     }

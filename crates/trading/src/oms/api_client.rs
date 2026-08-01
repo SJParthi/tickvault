@@ -1390,7 +1390,7 @@ impl OrderApiClient {
     /// The response shape is ambiguous upstream: the portal capture says
     /// "Sliced orders placed" — PLURAL —
     /// (`docs/dhan-ref/dhanhq-v2-upstream-2026-07-03/03-orders.md:242`)
-    /// while its schema shows a single object, and the official Python SDK
+    /// while its schema shows a single object, and the official vendor SDK
     /// returns a LIST. Both shapes parse via the untagged
     /// [`SlicingResponse`] (`Many` wins the untagged race) — a `JsonError`
     /// AFTER orders were placed would mean ghost orders.

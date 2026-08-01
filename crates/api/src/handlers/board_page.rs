@@ -172,7 +172,7 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
 
   <!-- (Sections 3 "Connections" + 4 "Speed check" removed 2026-07-17 —
        dashboard tidy: their data producers, the Groww sidecar status files
-       and the Python-vs-Rust shadow-parity TSV, were deleted with the live
+       and the legacy-vs-Rust shadow-parity TSV, were deleted with the live
        feeds (Groww 2026-07-15; shadow client with it), so both panels could
        only ever render permanent empty/pending states.) -->
 

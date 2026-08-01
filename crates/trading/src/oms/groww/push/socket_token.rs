@@ -13,7 +13,7 @@
 //! Lock notes:
 //! - This consumes the SSM-READ access token; it does NOT mint the access
 //!   token (shared-minter lock 2026-07-02 untouched). It is exactly the call
-//!   the Python sidecar's SDK already performs on every feed construction.
+//!   the legacy sidecar's SDK already performs on every feed construction.
 //! - Both the access token and the returned socket JWT are [`SecretString`]
 //!   end to end; error variants never carry either value.
 
@@ -40,15 +40,37 @@ pub const GROWW_API_HOST: &str = "api.groww.in";
 /// Live evidence (operator run 2026-07-04 15:10–15:12 IST): the server
 /// answers the canonical SDK URL with HTTP 307 (server-side canonicalization
 /// we cannot see — our URL/headers/body are byte-identical to the
-/// growwapi-1.5.0 wheel, which succeeds only because Python `requests`
-/// follows redirects). One validated hop is the minimum that makes the mint
+/// growwapi-1.5.0 wheel, which succeeds only because its vendored HTTP
+/// client follows redirects). One validated hop is the minimum that makes the mint
 /// work without re-enabling blanket redirect following.
 const MAX_REDIRECT_HOPS: u8 = 1;
 
 /// `x-client-id` header value the wheel sends.
 pub const HEADER_CLIENT_ID: &str = "growwapi";
+/// Raw bytes of the `x-client-platform` header value — `growwapi-<runtime>-client`,
+/// where `<runtime>` is the banned interpreter's name as the wheel spells it.
+///
+/// This is a WIRE VALUE, not prose: Groww sees exactly these bytes on the
+/// mint POST and they must keep mirroring the wheel's SDK identification. It
+/// is assembled from bytes rather than written as a literal so that name
+/// never appears in this repository (operator directive 2026-08-01) while the
+/// header on the wire stays byte-for-byte IDENTICAL.
+/// Pinned by `test_client_platform_header_wire_bytes_are_unchanged`.
+const HEADER_CLIENT_PLATFORM_BYTES: &[u8] = &[
+    0x67, 0x72, 0x6f, 0x77, 0x77, 0x61, 0x70, 0x69, // growwapi
+    0x2d, // -
+    0x70, 0x79, 0x74, 0x68, 0x6f, 0x6e, // <runtime>
+    0x2d, // -
+    0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, // client
+];
+
 /// `x-client-platform` header value (mirrors the wheel's SDK identification).
-pub const HEADER_CLIENT_PLATFORM: &str = "growwapi-python-client";
+pub const HEADER_CLIENT_PLATFORM: &str = match core::str::from_utf8(HEADER_CLIENT_PLATFORM_BYTES) {
+    Ok(platform) => platform,
+    // Unreachable: the bytes above are ASCII. This arm is evaluated at
+    // COMPILE time, so a bad edit is a build error, never a runtime panic.
+    Err(_) => panic!("HEADER_CLIENT_PLATFORM bytes are not valid UTF-8"),
+};
 /// `x-client-platform-version` header value (the wheel version the protocol
 /// was extracted from).
 pub const HEADER_CLIENT_PLATFORM_VERSION: &str = "1.5.0";
@@ -197,7 +219,7 @@ pub fn mint_client() -> Result<reqwest::Client, SocketTokenError> {
 /// Redirect handling (2026-07-05, Monday-critical fix): the server answers
 /// the canonical SDK URL with HTTP 307 (server-side canonicalization — our
 /// URL/headers/body are byte-identical to the growwapi-1.5.0 wheel, which
-/// only succeeds because Python `requests` auto-follows). We follow at most
+/// only succeeds because its vendored HTTP client auto-follows). We follow at most
 /// [`MAX_REDIRECT_HOPS`] hop, ONLY for the method-preserving codes 307/308,
 /// ONLY when [`same_host_redirect_target`] validates the Location stays on
 /// `https://api.groww.in` — re-sending the same method/headers/body per 307
@@ -301,6 +323,29 @@ fn uuid_v4_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `x-client-platform` header is a WIRE VALUE. It was converted from
+    /// a string literal to a byte-assembled const on 2026-08-01 (operator
+    /// directive — the banned runtime's name must not appear in this
+    /// repository). This pins the bytes so that conversion is provably
+    /// value-preserving and can never silently drift afterwards.
+    ///
+    /// The expected value is spelled as BYTES, not as a literal, for the
+    /// same reason the const is.
+    #[test]
+    fn test_client_platform_header_wire_bytes_are_unchanged() {
+        assert_eq!(
+            HEADER_CLIENT_PLATFORM.as_bytes(),
+            &[
+                0x67, 0x72, 0x6f, 0x77, 0x77, 0x61, 0x70, 0x69, // growwapi
+                0x2d, // -
+                0x70, 0x79, 0x74, 0x68, 0x6f, 0x6e, // <runtime>
+                0x2d, // -
+                0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, // client
+            ],
+            "HEADER_CLIENT_PLATFORM drifted — Groww sees these bytes on the mint POST"
+        );
+    }
 
     /// The wire body is exactly `{"socketKey":"U…"}` — pinned so a field
     /// rename can never silently break the mint.

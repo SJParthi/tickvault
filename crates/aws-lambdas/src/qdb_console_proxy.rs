@@ -1,7 +1,7 @@
 //! QuestDB console BACK Lambda (B4) — VPC-attached dumb HTTP relay, ZERO
 //! secrets. Rust port of `deploy/aws/lambda/questdb-console-proxy/handler.py`
 //! (rust-only phase 2b-3, 2026-07-18). Behavior parity is the contract; the
-//! Python source is the oracle and every deviation is documented inline.
+//! Legacy source is the oracle and every deviation is documented inline.
 //!
 //! Invoked ONLY by the front Lambda (qdb-console-front) via
 //! lambda:InvokeFunction with a JSON envelope:
@@ -31,13 +31,13 @@
 //! docs/incidents/2026-07-06-questdb-console-shell-hang/repro-evidence.md):
 //! QuestDB 9.3.5 answers GET / with an UNFRAMED keep-alive 301 (no
 //! Content-Length, no Transfer-Encoding) and NEVER closes the socket — even
-//! under request `Connection: close`. The Python fix pair is preserved
+//! under request `Connection: close`. The legacy fix pair is preserved
 //! byte-for-byte in behavior:
 //!   (1) GET / is rewritten to /index.html so the unframed 301 is never
 //!       elicited (the framed shell answers in ~4ms), and
 //!   (2) redirects are NEVER followed and a 3xx is relayed BODY-LESS
 //!       (status + Location only; reading an unframed 3xx body would block
-//!       until the socket timeout). In Python this was the
+//!       until the socket timeout). In the legacy runtime this was the
 //!       `_NoFollowRedirect` opener; here the live client is built with
 //!       `reqwest::redirect::Policy::none()` and [`handle_core`]'s 3xx arm
 //!       structurally never touches the body reader (bomb-reader ratchet in
@@ -47,15 +47,15 @@ use base64::Engine as _;
 use serde_json::{Map, Value, json};
 
 /// Deployed-bytes proof marker (proof-3 ratchet: `build_marker_present`).
-/// Byte-identical to the Python `QDB_CONSOLE_BUILD` and to the front's copy.
+/// Byte-identical to the legacy `QDB_CONSOLE_BUILD` and to the front's copy.
 pub const QDB_CONSOLE_BUILD: &str = "b4-qdb-console-2026-07-06-r3";
 
-/// Single-timeout tradeoff (Python FIX 8): urllib's `timeout` was the
+/// Single-timeout tradeoff (legacy FIX 8): urllib's `timeout` was the
 /// SOCKET-op timeout (it bounded BOTH the connect attempt AND each blocking
 /// recv). The Rust live client maps this as `connect_timeout` + the blocking
 /// client's op-level `timeout` (reqwest 0.13's blocking builder exposes no
-/// per-recv `read_timeout`) — a strictly TIGHTER envelope than Python's:
-/// a DRIBBLING body that Python would let run to the back Lambda's 26s
+/// per-recv `read_timeout`) — a strictly TIGHTER envelope than the legacy runtime's:
+/// a DRIBBLING body that the legacy runtime would let run to the back Lambda's 26s
 /// timeout (questdb-console.tf) is bounded at 12s here. Documented
 /// deviation; never looser than the oracle.
 pub const TIMEOUT_SECS: u64 = 12;
@@ -63,7 +63,7 @@ pub const TIMEOUT_SECS: u64 = 12;
 /// Keep base64+JSON under Lambda's 6 MiB invoke envelope.
 pub const MAX_BODY_BYTES: usize = 4_100_000;
 
-/// Incremental read chunk size (Python `_READ_CHUNK`).
+/// Incremental read chunk size (legacy `_READ_CHUNK`).
 pub const READ_CHUNK: usize = 262_144;
 
 // ------------------------------------------------------- read-only SQL gate
@@ -127,7 +127,7 @@ pub const SQL_ALLOWED_FUNCS: [&str; 12] = [
     "flush_query_cache",
 ];
 
-/// Python `\w` word-character test (`re` str patterns are unicode-aware):
+/// Legacy `\w` word-character test (`re` str patterns are unicode-aware):
 /// letters, digits, underscore.
 pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -159,7 +159,7 @@ fn contains_word(haystack: &str, word: &str) -> bool {
     false
 }
 
-/// First token per Python `re.split(r"[^a-z]+", q, maxsplit=1)[0]` — the
+/// First token per legacy `re.split(r"[^a-z]+", q, maxsplit=1)[0]` — the
 /// leading run of ascii `a-z` chars (empty when `q` starts with anything
 /// else).
 fn first_token(q: &str) -> &str {
@@ -170,7 +170,7 @@ fn first_token(q: &str) -> &str {
     &q[..end]
 }
 
-/// Bare-call match per Python `re.match(r"\s*([a-z_]+)\s*\(", q)` — returns
+/// Bare-call match per legacy `re.match(r"\s*([a-z_]+)\s*\(", q)` — returns
 /// the function name when `q` opens with optional whitespace, a non-empty
 /// `[a-z_]+` run, optional whitespace, then `(`.
 fn leading_func_name(q: &str) -> Option<&str> {
@@ -191,7 +191,7 @@ fn leading_func_name(q: &str) -> Option<&str> {
 }
 
 /// Read-only gate (hardened 2026-07-02; introspection superset 2026-07-03).
-/// Rules, all fail-closed — Python `_is_safe_sql` parity:
+/// Rules, all fail-closed — legacy `_is_safe_sql` parity:
 /// 1. SINGLE STATEMENT: one trailing ';' is stripped; ANY remaining ';'
 ///    rejects (closes the "select 1; <unlisted mutator>" chaining gap).
 /// 2. NO SQL COMMENTS ('--' or '/*'): keeps the banned-word scan honest —
@@ -247,7 +247,7 @@ pub const STATIC_EXTS: [&str; 10] = [
     ".html", ".js", ".css", ".svg", ".png", ".woff2", ".ico", ".map", ".json", ".txt",
 ];
 
-/// The Python `_STATIC_EXTS` tuple carries an 11th entry `.webmanifest`;
+/// The legacy `_STATIC_EXTS` tuple carries an 11th entry `.webmanifest`;
 /// keeping the array + tail split makes the const arity explicit.
 pub const STATIC_EXT_WEBMANIFEST: &str = ".webmanifest";
 
@@ -256,7 +256,7 @@ fn has_static_ext(path_lower: &str) -> bool {
         || path_lower.ends_with(STATIC_EXT_WEBMANIFEST)
 }
 
-/// Python `urllib.parse.unquote` parity for the traversal check: decode
+/// Legacy `urllib.parse.unquote` parity for the traversal check: decode
 /// every valid `%XX` hex pair to its byte; leave invalid sequences literal;
 /// decode the byte string as UTF-8 with replacement (errors='replace').
 fn percent_unquote(raw: &str) -> String {
@@ -285,7 +285,7 @@ pub fn bad_path(raw_path: &str) -> bool {
     false
 }
 
-/// `_classify_path` verdicts, with the exact Python string labels for the
+/// `_classify_path` verdicts, with the exact legacy string labels for the
 /// parity ratchets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
@@ -306,7 +306,7 @@ impl PathKind {
     }
 }
 
-/// Python `_classify_path` parity (`path or "/"` then `.rstrip()`).
+/// Legacy `_classify_path` parity (`path or "/"` then `.rstrip()`).
 pub fn classify_path(method: &str, path: &str) -> PathKind {
     let base = if path.is_empty() { "/" } else { path };
     let p = base.trim_end();
@@ -327,7 +327,7 @@ pub fn classify_path(method: &str, path: &str) -> PathKind {
     }
 }
 
-/// Python `parse_qs(raw_query).get("query", [""])[0]` parity: '&'-separated
+/// Legacy `parse_qs(raw_query).get("query", [""])[0]` parity: '&'-separated
 /// pairs, '+' as space, percent-decoded UTF-8 with replacement, BLANK values
 /// dropped (parse_qs default `keep_blank_values=False`), first survivor
 /// wins.
@@ -341,13 +341,13 @@ pub(crate) fn query_param(raw_query: &str, name: &str) -> String {
 }
 
 /// Returns `None` when the request may be relayed, else the typed err code
-/// (Python `_gate` returned `""` / the code).
+/// (legacy `_gate` returned `""` / the code).
 pub fn gate(method: &str, path: &str, raw_query: &str) -> Option<&'static str> {
     match classify_path(method, path) {
         PathKind::Deny | PathKind::Method => Some("denied"),
         PathKind::Sql => {
             let q = query_param(raw_query, "query");
-            // Python `len(q)` counts CHARS, not bytes.
+            // Legacy `len(q)` counts CHARS, not bytes.
             if q.is_empty() || q.chars().count() > MAX_SQL_LEN || !is_safe_sql(&q) {
                 Some("denied_sql")
             } else {
@@ -359,12 +359,12 @@ pub fn gate(method: &str, path: &str, raw_query: &str) -> Option<&'static str> {
 }
 
 // ------------------------------------------------------------- upstream seam
-// The Python handler called `urllib.request.urlopen` directly and the tests
+// The legacy handler called `urllib.request.urlopen` directly and the tests
 // mock-patched it. The Rust port injects the upstream through this seam so
 // the pure core stays fully unit-testable; [`ReqwestUpstream`] is the live
 // implementation the bin wires in.
 
-/// One relayed request. `timeout_secs` mirrors the Python
+/// One relayed request. `timeout_secs` mirrors the legacy
 /// `urlopen(req, timeout=_TIMEOUT_SECS)` argument so the fakes can pin it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayRequest {
@@ -388,7 +388,7 @@ impl RelayRequest {
     }
 }
 
-/// Connect/transport failure classification — the Python
+/// Connect/transport failure classification — the legacy
 /// `except (TimeoutError, socket.timeout)` vs `except URLError/Exception`
 /// split (a URLError WRAPPING a socket timeout is still a timeout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,8 +398,8 @@ pub enum FetchError {
 }
 
 /// Body-read failure classification. `Timeout` is the unframed-body
-/// per-recv timeout (Python fixer round 2 → `upstream_timeout`); `Other`
-/// collapses the Python fixer-round-3 class (ConnectionResetError /
+/// per-recv timeout (legacy fixer round 2 → `upstream_timeout`); `Other`
+/// collapses the legacy fixer-round-3 class (ConnectionResetError /
 /// IncompleteRead / ConnectionAbortedError — peer RST mid body) →
 /// `box_unreachable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,7 +408,7 @@ pub enum BodyReadError {
     Other,
 }
 
-/// Chunked body reader — Python's `fp.read(_READ_CHUNK)` semantics: an
+/// Chunked body reader — the legacy runtime's `fp.read(_READ_CHUNK)` semantics: an
 /// empty chunk means EOF.
 pub trait BodyRead {
     fn read_chunk(&mut self, max_len: usize) -> Result<Vec<u8>, BodyReadError>;
@@ -431,7 +431,7 @@ impl UpstreamResponse {
     }
 }
 
-/// The urlopen seam. In Python every 3xx ALSO surfaced through this call
+/// The urlopen seam. In the legacy runtime every 3xx ALSO surfaced through this call
 /// (as an HTTPError with an unread body, courtesy of `_NoFollowRedirect`);
 /// here the live impl disables redirects so a 3xx arrives as a plain
 /// response and [`handle_core`] relays it body-less.
@@ -442,7 +442,7 @@ pub trait Upstream {
 /// Incremental read bounded at [`MAX_BODY_BYTES`]. Returns `(body, over)`
 /// where `over=true` means the cap was exceeded (body is truncated to the
 /// cap). Used on BOTH the success and the error-status path so neither
-/// reads-then-slices (Python `_read_capped`).
+/// reads-then-slices (legacy `_read_capped`).
 pub fn read_capped(fp: &mut dyn BodyRead) -> Result<(Vec<u8>, bool), BodyReadError> {
     let mut out: Vec<u8> = Vec::new();
     let mut total = 0usize;
@@ -467,10 +467,10 @@ fn err_json(code: &str) -> Value {
     json!({ "err": code })
 }
 
-/// Python `str(event.get(key, default))` parity for the envelope fields.
+/// Legacy `str(event.get(key, default))` parity for the envelope fields.
 /// Deliberate documented deviation: a JSON `null` renders as the default
-/// (Python rendered `str(None) == "None"`); non-string scalars render via
-/// their JSON text (Python `str(5) == "5"` — same for numbers/bools).
+/// (the legacy runtime rendered `str(None) == "None"`); non-string scalars render via
+/// their JSON text (legacy `str(5) == "5"` — same for numbers/bools).
 fn event_str(event: &Value, key: &str, default: &str) -> String {
     match event.get(key) {
         None | Some(Value::Null) => default.to_string(),
@@ -479,7 +479,7 @@ fn event_str(event: &Value, key: &str, default: &str) -> String {
     }
 }
 
-/// Python `str(event.get("rawQuery", "") or "")` — any falsy value (null,
+/// Legacy `str(event.get("rawQuery", "") or "")` — any falsy value (null,
 /// "", 0, false) collapses to "".
 fn event_raw_query(event: &Value) -> String {
     match event.get("rawQuery") {
@@ -507,10 +507,10 @@ fn relay_out_headers(resp: &UpstreamResponse) -> Map<String, Value> {
     out
 }
 
-/// The full handler core — Python `lambda_handler` parity, with the
+/// The full handler core — legacy `lambda_handler` parity, with the
 /// upstream injected. `qdb_base` is the `QDB_BASE` env value (read by the
 /// bin per invoke; Lambda env is static per sandbox, so this matches the
-/// Python module-import read).
+/// Legacy module-import read).
 pub fn handle_core(event: &Value, qdb_base: &str, upstream: &mut dyn Upstream) -> Value {
     let method = event_str(event, "method", "GET").to_uppercase();
     let mut path = event_str(event, "path", "/");
@@ -608,7 +608,7 @@ pub fn handle_core(event: &Value, qdb_base: &str, upstream: &mut dyn Upstream) -
     }
 
     // Body-read error mapping is IDENTICAL on the success (<300) and the
-    // error-status (>=400) arm in the Python oracle: a per-recv timeout on
+    // error-status (>=400) arm in the legacy oracle: a per-recv timeout on
     // an unframed body -> upstream_timeout (fixer round 2); any other read
     // failure (peer RST mid body / IncompleteRead / aborted) ->
     // box_unreachable (fixer round 3 + the success path's blanket arm).
@@ -620,7 +620,7 @@ pub fn handle_core(event: &Value, qdb_base: &str, upstream: &mut dyn Upstream) -
 
     // QuestDB error responses (e.g. /exec 400 with JSON body) are VALID
     // console traffic — relay them. Only the success arm enforces the
-    // too_large verdict (Python parity: the HTTPError arm ignored `over`
+    // too_large verdict (legacy parity: the HTTPError arm ignored `over`
     // and relayed the capped body).
     if status < 300 && over {
         return err_json("too_large"); // → front 502, never 503
@@ -637,11 +637,11 @@ pub fn handle_core(event: &Value, qdb_base: &str, upstream: &mut dyn Upstream) -
 
 /// The live relay client. Redirect policy is NONE (the `_NoFollowRedirect`
 /// port — a 3xx must surface to [`handle_core`] un-followed and un-read),
-/// with the Python single-timeout semantics mapped to
+/// with the legacy single-timeout semantics mapped to
 /// `connect_timeout` + the blocking client's op-level `timeout` (reqwest
 /// 0.13's blocking builder exposes no per-recv `read_timeout`; its
 /// `timeout` covers connect/read/write ops — a deliberate, documented
-/// deviation that is strictly TIGHTER than Python's per-socket-op
+/// deviation that is strictly TIGHTER than the legacy runtime's per-socket-op
 /// timeout, never looser).
 pub struct ReqwestUpstream {
     client: reqwest::blocking::Client,
@@ -669,7 +669,7 @@ impl ReqwestUpstream {
             .connect_timeout(connect)
             // Op-level timeout (see the struct doc): reqwest 0.13's blocking
             // builder has no `read_timeout`; `timeout` bounds connect/read/
-            // write operations — a tighter-than-Python envelope.
+            // write operations — a tighter-than-legacy envelope.
             .timeout(read)
             .build()?;
         Ok(Self { client })
@@ -677,7 +677,7 @@ impl ReqwestUpstream {
 }
 
 /// A reqwest transport error is a timeout when any layer of its source
-/// chain says so (the Python `URLError(reason=socket.timeout)` unwrap).
+/// chain says so (the legacy `URLError(reason=socket.timeout)` unwrap).
 fn classify_transport_error(e: &reqwest::Error) -> FetchError {
     if e.is_timeout() {
         return FetchError::Timeout;
@@ -708,7 +708,7 @@ impl BodyRead for BlockingBody {
         let mut buf = vec![0u8; max_len];
         let mut filled = 0usize;
         // io::Read may return short reads; loop until EOF or the chunk is
-        // full so the capped reader sees Python-`fp.read(n)`-like chunks.
+        // full so the capped reader sees legacy-`fp.read(n)`-like chunks.
         while filled < buf.len() {
             match self.resp.read(&mut buf[filled..]) {
                 Ok(0) => break,
@@ -760,13 +760,13 @@ impl Upstream for ReqwestUpstream {
 /// Live entrypoint for the bin: read `QDB_BASE`, run the core on a blocking
 /// thread (the blocking reqwest client must not run on the async runtime
 /// worker). A join failure (panic) propagates as a Lambda FunctionError —
-/// the same escape semantics an unhandled Python exception had.
+/// the same escape semantics an unhandled legacy exception had.
 pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     let qdb_base = std::env::var("QDB_BASE").unwrap_or_default();
     let out = tokio::task::spawn_blocking(move || {
         let mut upstream = match ReqwestUpstream::new() {
             Ok(u) => u,
-            // No Python analog (urllib had no client-construction step);
+            // No legacy analog (urllib had no client-construction step);
             // fail-closed to the unreachable-class typed err.
             Err(_) => return err_json("box_unreachable"),
         };
@@ -786,7 +786,7 @@ mod tests {
 
     const FAKE_BASE: &str = "http://10.42.1.99:9000";
 
-    // ---- fakes (the Python FakeResp / mock.patch("urlopen") equivalents)
+    // ---- fakes (the legacy FakeResp / mock.patch("urlopen") equivalents)
 
     struct ChunkBody {
         chunks: Vec<Vec<u8>>,
@@ -948,9 +948,9 @@ mod tests {
 
     #[test]
     fn path_whitelist_parity() {
-        // Python compared against the front's `_classify_path` (loaded from
+        // The legacy runtime compared against the front's `_classify_path` (loaded from
         // the sibling handler file). The expected verdicts below are the
-        // EXECUTED Python front verdicts for the same 16 cases; the front
+        // EXECUTED legacy front verdicts for the same 16 cases; the front
         // Rust module lands in the sibling commit and this table pins the
         // shared contract byte-for-byte.
         let cases: [(&str, &str, &str); 16] = [
@@ -1006,7 +1006,7 @@ mod tests {
     fn sql_gate_parity_with_operator_control_shared_subset() {
         // The back gate is a read-only SUPERSET of operator-control (adds
         // bare introspection funcs); on the NON-func corpus they must agree.
-        // The Python test loaded operator-control/handler.py live; the
+        // The legacy test loaded operator-control/handler.py live; the
         // expected verdicts below are the EXECUTED operator-control
         // `_is_safe_sql` verdicts for the shared corpus, and the tuple pins
         // mirror `opctl._SQL_ALLOWED_PREFIXES` / `opctl._SQL_BANNED`
@@ -1111,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    // The python test pins the CONSTANT itself — a constant assertion is
+    // The legacy test pins the CONSTANT itself — a constant assertion is
     // the point (ratchet on the cap value), so the lint is waived here.
     #[allow(clippy::assertions_on_constants)]
     fn body_cap_constant_within_6mib_envelope() {
@@ -1139,7 +1139,7 @@ mod tests {
         let calls = up.calls.borrow();
         let req = &calls[0];
         assert!(req.url.starts_with("http://10.42.1.99:9000/exp?"));
-        // Python asserted `urlopen(..., timeout=_TIMEOUT_SECS)`.
+        // The legacy runtime asserted `urlopen(..., timeout=_TIMEOUT_SECS)`.
         assert_eq!(req.timeout_secs, TIMEOUT_SECS);
     }
 
@@ -1293,7 +1293,7 @@ mod tests {
 
     #[test]
     fn no_follow_redirect_client_used_live() {
-        // The belt layer, ported behaviorally (Python asserted the LIVE
+        // The belt layer, ported behaviorally (the legacy runtime asserted the LIVE
         // installed urllib opener object, not source text — a source grep
         // stays green with the install call moved into dead code). Here a
         // REAL loopback server answers a framed 301; the LIVE
@@ -1390,7 +1390,7 @@ mod tests {
 
     #[test]
     fn urlerror_wrapping_timeout_maps_to_upstream_timeout() {
-        // Python: urllib wrapped a socket timeout inside URLError — still
+        // legacy: urllib wrapped a socket timeout inside URLError — still
         // an upstream timeout. Rust equivalent: reqwest wraps the per-recv
         // io timeout inside its transport error; the LIVE classifier must
         // yield FetchError::Timeout (which handle_core maps to
@@ -1432,7 +1432,7 @@ mod tests {
     fn unframed_non_3xx_body_timeout_maps_to_upstream_timeout() {
         // Fixer round 2 (2026-07-06): a per-recv timeout raised while
         // READING an unframed NON-3xx error body must map to the honest
-        // upstream_timeout -> front 504 (in Python it originally ESCAPED
+        // upstream_timeout -> front 504 (in the legacy runtime it originally ESCAPED
         // lambda_handler as a FunctionError -> dishonest offline-503).
         // /settings is NOT rewritten, so this exercises the non-3xx body
         // read (the 3xx arm never reads — see the bomb-body test above).
@@ -1454,12 +1454,12 @@ mod tests {
     #[test]
     fn non_timeout_error_body_read_failure_maps_to_box_unreachable() {
         // Fixer round 3 (2026-07-06): a NON-timeout failure of the same
-        // non-3xx error-body read — the Python escape class was
+        // non-3xx error-body read — the legacy escape class was
         // ConnectionResetError (peer RST mid error body, e.g. the QuestDB
         // container restart on every box deploy), http.client
         // IncompleteRead, ConnectionAbortedError — must map to the typed
         // box_unreachable (a reset/aborted peer IS unreachable-class). The
-        // three Python exception types collapse into BodyReadError::Other
+        // three legacy exception types collapse into BodyReadError::Other
         // at the seam by design.
         let mut up = FakeUpstream::new(vec![FakeReply::Response {
             status: 500,
@@ -1504,7 +1504,7 @@ mod tests {
     // ------------------------------------------------------------ Hygiene
 
     /// Everything above the first column-0 `#[cfg(test)]` line — the house
-    /// production-region split (the Python hygiene tests scanned handler.py
+    /// production-region split (the legacy hygiene tests scanned handler.py
     /// while the fixtures lived in test_handler.py; in Rust both share this
     /// file, so the scan excises the test module).
     fn production_region() -> &'static str {
@@ -1516,7 +1516,7 @@ mod tests {
     #[test]
     fn no_aws_sdk_import() {
         // The VPC hop is secret-free and SDK-free by contract (it has no
-        // AWS-API network path anyway — no NAT, no VPC endpoints). Python
+        // AWS-API network path anyway — no NAT, no VPC endpoints). Legacy
         // asserted no `boto3`; the Rust equivalent is no aws_sdk_* /
         // aws_config use in the production region. Needles are assembled at
         // runtime so these literals never self-match.
@@ -1538,7 +1538,7 @@ mod tests {
     #[test]
     fn build_marker_present() {
         assert!(QDB_CONSOLE_BUILD.starts_with("b4-qdb-console-"));
-        // Python also asserted the front handler carries the same marker;
+        // The legacy runtime also asserted the front handler carries the same marker;
         // the front-side cross-pin lands with the qdb_console_front module
         // (its `build_marker_present` asserts equality against this const).
     }

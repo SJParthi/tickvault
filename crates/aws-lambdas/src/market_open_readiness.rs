@@ -17,7 +17,7 @@
 //! tv_alerts. A TOTAL SNS outage silences both legs — outside the
 //! envelope, stated here.
 //!
-//! Environment variables (set by Terraform — unchanged from the Python):
+//! Environment variables (set by Terraform — unchanged from the legacy runtime):
 //!   EC2_INSTANCE_ID       — the tv-app instance to check
 //!   ALERTS_TOPIC_ARN      — operator's tv_alerts SNS topic for Telegram
 //!   METRIC_NAMESPACE      — Tickvault/Prod
@@ -26,14 +26,14 @@
 //!   BOOT_LOOKBACK_MINUTES — boot-metric freshness window (default 10)
 //!   LOG_LEVEL             — INFO (default) / DEBUG / WARNING
 //!
-//! Parity ledger (every deliberate deviation from the Python original):
-//! - python `logger.*` → `tracing::*` (same CloudWatch Logs destination).
+//! Parity ledger (every deliberate deviation from the legacy original):
+//! - legacy `logger.*` → `tracing::*` (same CloudWatch Logs destination).
 //! - env vars are read per invocation instead of at module import — same
 //!   effective behavior inside a Lambda container.
-//! - the python handler tests monkeypatched `boto3.client`; the Rust seam
+//! - the legacy handler tests monkeypatched `boto3.client`; the Rust seam
 //!   injects the two probes + the publish transport into `run` instead
 //!   (same observable outcomes, no process-global mutation).
-//! - a non-integer BOOT_LOOKBACK_MINUTES raised ValueError at python
+//! - a non-integer BOOT_LOOKBACK_MINUTES raised ValueError at legacy
 //!   import (module load failure); Rust falls back to the default 10 —
 //!   fail-toward-working, documented here.
 
@@ -63,7 +63,7 @@ use crate::time::IST_OFFSET_SECS;
 ///
 /// EC2 never self-stops on app FAILURE, and the boot-heartbeat gate
 /// window (08:50-09:10) is the backstop pager for anything this
-/// heuristic misreads. Python parity: `HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES`.
+/// heuristic misreads. Legacy parity: `HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES`.
 pub const HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES: u32 = 8 * 60 + 25;
 
 pub const DEFAULT_BOOT_LOOKBACK_MINUTES: i64 = 10;
@@ -83,7 +83,7 @@ fn ist() -> FixedOffset {
         .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap_or(Utc.fix()))
 }
 
-/// Minutes since IST midnight for a UTC datetime. Python parity:
+/// Minutes since IST midnight for a UTC datetime. Legacy parity:
 /// `_ist_minutes_of_day`.
 pub fn ist_minutes_of_day(dt_utc: DateTime<Utc>) -> u32 {
     let ist_dt = dt_utc.with_timezone(&ist());
@@ -91,7 +91,7 @@ pub fn ist_minutes_of_day(dt_utc: DateTime<Utc>) -> u32 {
 }
 
 /// True iff `dt_utc` falls on the same IST calendar date as `now_utc`.
-/// Python parity: `_is_today_ist`.
+/// Legacy parity: `_is_today_ist`.
 pub fn is_today_ist(dt_utc: DateTime<Utc>, now_utc: DateTime<Utc>) -> bool {
     let tz = ist();
     let a = dt_utc.with_timezone(&tz);
@@ -99,7 +99,7 @@ pub fn is_today_ist(dt_utc: DateTime<Utc>, now_utc: DateTime<Utc>) -> bool {
     (a.year(), a.month(), a.day()) == (b.year(), b.month(), b.day())
 }
 
-/// Pure decision core — unit-tested with zero AWS. Python parity:
+/// Pure decision core — unit-tested with zero AWS. Legacy parity:
 /// `classify_readiness`.
 ///
 /// Fail TOWARD paging: cannot-verify != OK. A stopped/stopping box whose
@@ -140,7 +140,7 @@ pub fn classify_readiness(
 /// Subject is rejected with InvalidParameter, which would degrade every
 /// readiness page (incl. the drill) to the generic Lambda-Errors watchman
 /// page. House precedent: hard-stop-guard / budget-digest / killswitch
-/// all use ASCII subjects with emoji only in the body. Python parity:
+/// all use ASCII subjects with emoji only in the body. Legacy parity:
 /// `SUBJECTS_AND_MESSAGES` (dict → const array + lookup fn).
 pub const SUBJECTS_AND_MESSAGES: [(&str, &str, &str); 4] = [
     (
@@ -183,15 +183,15 @@ pub fn subject_and_message(verdict: &str) -> Option<(&'static str, &'static str)
         .map(|(_, s, m)| (*s, *m))
 }
 
-/// Injectable readiness core — fold of the python `lambda_handler` with
+/// Injectable readiness core — fold of the legacy `lambda_handler` with
 /// the two probes + the publish transport injected (the Rust analog of
-/// the python tests' `monkeypatch.setattr(boto3, "client", ...)`).
+/// the legacy tests' `monkeypatch.setattr(boto3, "client", ...)`).
 ///
 /// `instance_state` returns (state name, LaunchTime, probe_error);
 /// `boot_metric_seen` returns (boot metric >= 1 in lookback, probe_error)
 /// and is consulted ONLY for a running box with a clean EC2 probe;
 /// `publish` sends one page and its error PROPAGATES (the pager must
-/// never die silently — python re-raise semantics).
+/// never die silently — legacy re-raise semantics).
 pub async fn run<SF, SFut, BF, BFut, PF, PFut>(
     event: &Value,
     now_utc: DateTime<Utc>,
@@ -243,7 +243,7 @@ where
 ///
 /// Any error (incl. not-found) → ("unknown", None, true) — the caller's
 /// `classify_readiness` turns a probe error into the verify-failed page.
-/// Python parity: `_instance_state`. UNPROVEN until deploy — the live
+/// Legacy parity: `_instance_state`. UNPROVEN until deploy — the live
 /// ec2:DescribeInstances leg runs only in a real Lambda.
 async fn instance_state(
     ec2: &aws_sdk_ec2::Client,
@@ -280,7 +280,7 @@ async fn instance_state(
 }
 
 /// Return (boot metric >= 1 in the lookback window, probe_error).
-/// Python parity: `_boot_metric_seen`. UNPROVEN until deploy.
+/// Legacy parity: `_boot_metric_seen`. UNPROVEN until deploy.
 async fn boot_metric_seen(
     cw: &aws_sdk_cloudwatch::Client,
     now_utc: DateTime<Utc>,
@@ -338,12 +338,12 @@ async fn boot_metric_seen(
 
 /// Entry point — 08:45 IST EventBridge (mode=readiness), manual invoke,
 /// or `{"mode": "drill"}` — the SNS end-to-end verification drill.
-/// Python parity: `lambda_handler`.
+/// Legacy parity: `lambda_handler`.
 ///
 /// UNPROVEN until deploy: the live EC2/CloudWatch/SNS legs run only in a
 /// real Lambda. A failed publish PROPAGATES (`?`) so the invocation error
 /// feeds AWS/Lambda Errors → the readiness-errors alarm → tv_alerts —
-/// the python re-raise semantics (the pager must never die silently).
+/// the legacy re-raise semantics (the pager must never die silently).
 pub async fn handle(event: Value) -> Result<Value, Error> {
     let instance_id = std::env::var("EC2_INSTANCE_ID").unwrap_or_default();
     let topic_arn = std::env::var("ALERTS_TOPIC_ARN").unwrap_or_default();
@@ -374,7 +374,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
             let sns = sns.clone();
             let topic_arn = topic_arn.clone();
             async move {
-                // Python parity: `_publish` — subject truncated at 99
+                // Legacy parity: `_publish` — subject truncated at 99
                 // chars; on failure log + RAISE so the Errors alarm pages.
                 let subject_capped: String = subject.chars().take(99).collect();
                 sns.publish()
@@ -418,7 +418,7 @@ mod tests {
     use chrono::TimeZone;
 
     // 08:45 IST on Mon 2026-07-06 = 03:15 UTC — the scheduled invocation
-    // instant (python fixture NOW).
+    // instant (legacy fixture NOW).
     fn now() -> DateTime<Utc> {
         at_ist(2026, 7, 6, 8, 45)
     }
@@ -562,7 +562,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Handler wiring — injected probes + publish, no AWS (the python
+    // Handler wiring — injected probes + publish, no AWS (the legacy
     // fake-boto3 suite ported onto the `run` seam)
     // ------------------------------------------------------------------
 
@@ -725,7 +725,7 @@ mod tests {
         assert!(err.contains("sns down"));
     }
 
-    // ---- Rust-side additions beyond the Python suite ----
+    // ---- Rust-side additions beyond the legacy suite ----
 
     #[test]
     fn test_is_today_ist_splits_on_ist_midnight_not_utc() {

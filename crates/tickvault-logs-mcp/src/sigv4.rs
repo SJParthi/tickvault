@@ -5,7 +5,7 @@
 //! HMAC-SHA256 is hand-rolled on top of the workspace-pinned `sha2`
 //! (the only `hmac` crate in the lock is the digest-0.10-generation
 //! 0.12.1, incompatible with sha2 0.11; a 15-line RFC 2104 implementation
-//! avoids a new pin). Pinned by RFC 4231 vectors + Python-derived goldens.
+//! avoids a new pin). Pinned by RFC 4231 vectors + legacy-derived goldens.
 
 use sha2::{Digest, Sha256};
 
@@ -43,7 +43,7 @@ fn sha256_hex(data: &[u8]) -> String {
     hex(&Sha256::digest(data))
 }
 
-/// Python `_sigv4_signing_key` — the AWS SigV4 HMAC derivation chain.
+/// legacy `_sigv4_signing_key` — the AWS SigV4 HMAC derivation chain.
 pub fn sigv4_signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> [u8; 32] {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_stamp.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
@@ -52,7 +52,7 @@ pub fn sigv4_signing_key(secret: &str, date_stamp: &str, region: &str, service: 
 }
 
 /// Signing timestamp — passed in so the builder stays pure/testable
-/// (mirror of the Python `amz_now: datetime` parameter).
+/// (mirror of the legacy `amz_now: datetime` parameter).
 #[derive(Debug, Clone)]
 pub struct AmzNow {
     /// `%Y%m%dT%H%M%SZ`
@@ -71,11 +71,11 @@ impl AmzNow {
 }
 
 /// Pure builder for a SigV4-signed CloudWatch Logs `FilterLogEvents` POST.
-/// Returns `(url, body_bytes, headers)` — byte-identical to the Python
+/// Returns `(url, body_bytes, headers)` — byte-identical to the legacy
 /// builder for identical inputs (the request BODY is constructed manually
-/// in Python dict-insertion order with compact separators, because the
+/// in legacy dict-insertion order with compact separators, because the
 /// body bytes feed the payload hash and therefore the signature).
-// APPROVED: argument list mirrors the Python builder positionally (golden-vector parity contract).
+// APPROVED: argument list mirrors the legacy builder positionally (golden-vector parity contract).
 #[allow(clippy::too_many_arguments)]
 pub fn build_cloudwatch_sigv4_request(
     region: &str,
@@ -96,7 +96,7 @@ pub fn build_cloudwatch_sigv4_request(
     let target = "Logs_20140328.FilterLogEvents";
     let content_type = "application/x-amz-json-1.1";
 
-    // Python: json.dumps({logGroupName, startTime, limit[, filterPattern]},
+    // legacy: json.dumps({logGroupName, startTime, limit[, filterPattern]},
     // separators=(",", ":")) — insertion order, compact.
     let clamped_limit = limit.clamp(1, 10_000);
     let group_json = serde_json::Value::String(log_group.to_string()).to_string();
@@ -160,7 +160,7 @@ pub fn build_cloudwatch_sigv4_request(
     (url, body, headers)
 }
 
-/// Python `build_cloudwatch_filter_args` — the aws CLI argv builder.
+/// legacy `build_cloudwatch_filter_args` — the aws CLI argv builder.
 pub fn build_cloudwatch_filter_args(
     log_group: &str,
     region: &str,
@@ -192,7 +192,7 @@ pub fn build_cloudwatch_filter_args(
     args
 }
 
-/// Python `parse_cloudwatch_events` — `aws logs filter-log-events` JSON →
+/// legacy `parse_cloudwatch_events` — `aws logs filter-log-events` JSON →
 /// compact `{ts_ms, stream, message}` list (stable-sorted by ts_ms,
 /// trimmed to the newest `limit`).
 pub fn parse_cloudwatch_events(stdout: &str, limit: i64) -> Vec<serde_json::Value> {
@@ -239,7 +239,7 @@ pub fn parse_cloudwatch_events(stdout: &str, limit: i64) -> Vec<serde_json::Valu
     tail_limit(out, limit)
 }
 
-/// Python `out[-int(limit):] if limit > 0 else out`.
+/// legacy `out[-int(limit):] if limit > 0 else out`.
 pub fn tail_limit(v: Vec<serde_json::Value>, limit: i64) -> Vec<serde_json::Value> {
     if limit > 0 {
         let len = v.len();
@@ -250,7 +250,7 @@ pub fn tail_limit(v: Vec<serde_json::Value>, limit: i64) -> Vec<serde_json::Valu
     }
 }
 
-/// Python `parse_portal_logs_raw` — ERR_BEGIN/ERR_END + APP_BEGIN/APP_END
+/// legacy `parse_portal_logs_raw` — ERR_BEGIN/ERR_END + APP_BEGIN/APP_END
 /// marker-delimited journalctl tail → `[{section, message}]`.
 pub fn parse_portal_logs_raw(raw: &str) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
@@ -281,7 +281,7 @@ pub fn parse_portal_logs_raw(raw: &str) -> Vec<serde_json::Value> {
     out
 }
 
-/// Python `filter_and_trim_portal_events` — client-side substring filter +
+/// legacy `filter_and_trim_portal_events` — client-side substring filter +
 /// newest-`limit` trim.
 pub fn filter_and_trim_portal_events(
     events: Vec<serde_json::Value>,
@@ -337,7 +337,7 @@ mod tests {
     /// Golden derived from the LIVE server.py `_sigv4_signing_key`
     /// (2026-07-18).
     #[test]
-    fn signing_key_matches_python_golden() {
+    fn signing_key_matches_legacy_golden() {
         let key = sigv4_signing_key(
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             "20150830",
@@ -354,7 +354,7 @@ mod tests {
     /// `build_cloudwatch_sigv4_request` (2026-07-18) — url, body bytes and
     /// every header must be byte-identical, signature included.
     #[test]
-    fn sigv4_request_matches_python_golden_no_token() {
+    fn sigv4_request_matches_legacy_golden_no_token() {
         let amz = AmzNow {
             amz_date: "20260718T053000Z".into(),
             date_stamp: "20260718".into(),
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn sigv4_request_matches_python_golden_with_session_token() {
+    fn sigv4_request_matches_legacy_golden_with_session_token() {
         let amz = AmzNow {
             amz_date: "20300102T030405Z".into(),
             date_stamp: "20300102".into(),

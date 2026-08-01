@@ -126,7 +126,7 @@ run_check "auto-fix clear-spill executable" \
 run_check "error-triage hook executable" \
     test -x .claude/hooks/error-triage.sh
 # 2026-07-18 (rust-only phase 2c, CUTOVER): .mcp.json launches the Rust
-# server via the launcher; the python server + its placeholder-fallback
+# server via the launcher; the legacy server + its placeholder-fallback
 # test are DELETED from git (the parity harness re-materializes server.py
 # from pinned git history). The self-test check exercises the REAL
 # .mcp.json launch path (launcher -> prebuilt release binary, else cargo

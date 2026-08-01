@@ -1,9 +1,9 @@
 //! `--self-test` mode — the same print sequence as server.py's
 //! `_self_test()` (server.py:1769-1804). JSON demo blocks are truncated
-//! to the first 400 CHARACTERS like the Python `[:400]` slices.
+//! to the first 400 CHARACTERS like the legacy `[:400]` slices.
 //!
 //! Documented deviation: JSON key ORDER inside the demo blocks differs
-//! (serde_json sorts keys; Python preserves insertion order). The
+//! (serde_json sorts keys; legacy preserves insertion order). The
 //! self-test is a human smoke surface, not part of the byte-compared
 //! parity transcript.
 
@@ -16,14 +16,14 @@ use crate::pycompat::py_slice_chars;
 use crate::tools;
 
 fn dumps_indent2(v: &Value) -> String {
-    // Python's demo blocks are json.dumps(..., indent=2) with the
+    // legacy's demo blocks are json.dumps(..., indent=2) with the
     // ensure_ascii=True default; the [:400] slice runs over the ESCAPED
     // string, so escape BEFORE the caller's py_slice_chars (review r8,
     // 2026-07-18).
     crate::pycompat::ensure_ascii(&serde_json::to_string_pretty(v).unwrap_or_default())
 }
 
-/// Python's novel-demo compaction: keep every top-level key, but replace
+/// legacy's novel-demo compaction: keep every top-level key, but replace
 /// `novel` with its first 3 entries, each stripped of `message`.
 fn compact_novel_demo(out: &Value) -> Value {
     let Some(map) = out.as_object() else {
@@ -54,7 +54,7 @@ fn compact_novel_demo(out: &Value) -> Value {
 }
 
 /// Run the self-test; returns the process exit code (always 0, like the
-/// Python `_self_test`).
+/// legacy `_self_test`).
 pub fn run(ctx: &Ctx) -> i32 {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -94,8 +94,8 @@ pub fn run(ctx: &Ctx) -> i32 {
     ));
     emit("");
     emit("--- tool_list_novel_signatures(since_minutes=60) demo ---");
-    // since_minutes=60 is deep inside the Python success band, so the
-    // Err arm is unreachable here (Python's demo would crash if it ever
+    // since_minutes=60 is deep inside the legacy success band, so the
+    // Err arm is unreachable here (legacy's demo would crash if it ever
     // raised); degrade to a visible error object rather than panic.
     let novel_out = tools::tool_list_novel_signatures(ctx, 60)
         .unwrap_or_else(|e| serde_json::json!({"error": e}));
