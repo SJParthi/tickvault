@@ -34,12 +34,14 @@ echo -n "  Checking AWS CLI... "
 if command -v aws > /dev/null 2>&1; then
     echo -e "${GREEN}installed${NC}"
 else
-    echo -e "${YELLOW}not found — installing via pip...${NC}"
-    pip3 install awscli --quiet 2>/dev/null || pip install awscli --quiet 2>/dev/null
+    echo -e "${YELLOW}not found — installing (official installer)...${NC}"
+    # 2026-08-01: official self-contained installer, no interpreter —
+    # see scripts/ensure-aws-cli.sh.
+    bash "$(dirname "${BASH_SOURCE[0]}")/ensure-aws-cli.sh" || true
     if command -v aws > /dev/null 2>&1; then
         echo -e "  ${GREEN}AWS CLI installed${NC}"
     else
-        echo -e "  ${RED}Failed to install AWS CLI. Install manually: pip3 install awscli${NC}"
+        echo -e "  ${RED}Failed to install AWS CLI. See: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html${NC}"
         exit 1
     fi
 fi

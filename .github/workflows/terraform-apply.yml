@@ -227,10 +227,38 @@ jobs:
           mkdir -p "${ZIP_DIR}"
           BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
-          # (--break-system-packages: ubuntu-24.04 system pip is PEP-668
-          # externally-managed; harmless where the runner image already
-          # sets PIP_BREAK_SYSTEM_PACKAGES.) Fails loudly under set -e.
-          pip3 install --break-system-packages ziglang==0.14.1
+          #
+          # 2026-08-01 (operator directive — Rust-O(1)-only workspace): this
+          # was `pip3 install --break-system-packages ziglang==0.14.1`, which
+          # pulled a PyPI wheel and made cargo-zigbuild invoke
+          # `python3 -m ziglang` as the arm64 LINKER — i.e. an interpreter sat
+          # in the build path of every production Rust lambda. Replaced by the
+          # OFFICIAL upstream zig tarball: same pinned 0.14.1, same linker,
+          # zero interpreters. (rust_only_guard never caught this: its token
+          # set covers `python`, never `pip`/`pip3`.)
+          ZIG_VERSION="0.14.1"
+          ZIG_DIR="${RUNNER_TEMP}/zig"
+          mkdir -p "${ZIG_DIR}"
+          # Upstream renamed the archive between releases
+          # (zig-linux-x86_64-X vs zig-x86_64-linux-X). Try both and fail
+          # loudly if neither resolves — never silently fall back to pip.
+          ZIG_OK=""
+          for ZIG_NAME in "zig-linux-x86_64-${ZIG_VERSION}" "zig-x86_64-linux-${ZIG_VERSION}"; do
+            if curl -fsSL --retry 3 --retry-delay 2 \
+                 "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_NAME}.tar.xz" \
+                 -o "${ZIG_DIR}/zig.tar.xz"; then
+              tar -xJf "${ZIG_DIR}/zig.tar.xz" -C "${ZIG_DIR}"
+              echo "${ZIG_DIR}/${ZIG_NAME}" >> "${GITHUB_PATH}"
+              export PATH="${ZIG_DIR}/${ZIG_NAME}:${PATH}"
+              ZIG_OK="${ZIG_NAME}"
+              break
+            fi
+          done
+          if [ -z "${ZIG_OK}" ]; then
+            echo "::error::zig ${ZIG_VERSION} download failed for both archive names — refusing to fall back to a PyPI interpreter build" >&2
+            exit 1
+          fi
+          zig version
           # cargo-lambda: cache-restored or version-pinned install; a failed
           # install fails the step (no silent fallback — 2026-07-18 F1 fix).
           command -v cargo-lambda >/dev/null 2>&1 || cargo install cargo-lambda@1.9.1 --locked
@@ -402,10 +430,38 @@ jobs:
           mkdir -p "${ZIP_DIR}"
           BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
-          # (--break-system-packages: ubuntu-24.04 system pip is PEP-668
-          # externally-managed; harmless where the runner image already
-          # sets PIP_BREAK_SYSTEM_PACKAGES.) Fails loudly under set -e.
-          pip3 install --break-system-packages ziglang==0.14.1
+          #
+          # 2026-08-01 (operator directive — Rust-O(1)-only workspace): this
+          # was `pip3 install --break-system-packages ziglang==0.14.1`, which
+          # pulled a PyPI wheel and made cargo-zigbuild invoke
+          # `python3 -m ziglang` as the arm64 LINKER — i.e. an interpreter sat
+          # in the build path of every production Rust lambda. Replaced by the
+          # OFFICIAL upstream zig tarball: same pinned 0.14.1, same linker,
+          # zero interpreters. (rust_only_guard never caught this: its token
+          # set covers `python`, never `pip`/`pip3`.)
+          ZIG_VERSION="0.14.1"
+          ZIG_DIR="${RUNNER_TEMP}/zig"
+          mkdir -p "${ZIG_DIR}"
+          # Upstream renamed the archive between releases
+          # (zig-linux-x86_64-X vs zig-x86_64-linux-X). Try both and fail
+          # loudly if neither resolves — never silently fall back to pip.
+          ZIG_OK=""
+          for ZIG_NAME in "zig-linux-x86_64-${ZIG_VERSION}" "zig-x86_64-linux-${ZIG_VERSION}"; do
+            if curl -fsSL --retry 3 --retry-delay 2 \
+                 "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_NAME}.tar.xz" \
+                 -o "${ZIG_DIR}/zig.tar.xz"; then
+              tar -xJf "${ZIG_DIR}/zig.tar.xz" -C "${ZIG_DIR}"
+              echo "${ZIG_DIR}/${ZIG_NAME}" >> "${GITHUB_PATH}"
+              export PATH="${ZIG_DIR}/${ZIG_NAME}:${PATH}"
+              ZIG_OK="${ZIG_NAME}"
+              break
+            fi
+          done
+          if [ -z "${ZIG_OK}" ]; then
+            echo "::error::zig ${ZIG_VERSION} download failed for both archive names — refusing to fall back to a PyPI interpreter build" >&2
+            exit 1
+          fi
+          zig version
           # cargo-lambda: cache-restored or version-pinned install; a failed
           # install fails the step (no silent fallback — 2026-07-18 F1 fix).
           command -v cargo-lambda >/dev/null 2>&1 || cargo install cargo-lambda@1.9.1 --locked

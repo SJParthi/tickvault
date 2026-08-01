@@ -28,8 +28,44 @@ interpreted-language invocation token in a shell script / workflow yml /
 Makefile / `.mcp.json` / terraform template, fails the build. The 3 former
 invocation-allowlisted files carried only the WORD in comments (no live
 execution existed) — the 3 flagged mentions were reworded so the allowlist
-could go empty. `docs/dhan-ref/*.md` (21 files) is now the SOLE Dhan API
+could go empty. **[⚠ THAT PARENTHETICAL WAS FALSE — see the 2026-08-01
+correction block immediately below §0.]** `docs/dhan-ref/*.md` (21 files) is now the SOLE Dhan API
 reference; CLAUDE.md's "KEY FILES" row + skill note are updated in lockstep.
+
+> ## ⚠ 2026-08-01 CORRECTION — "no live execution existed" was FALSE
+>
+> A four-agent audit (operator directive, 2026-08-01: *"nowhere i shdpou le
+> even see the pyhton word itsefl"*) found **ELEVEN live interpreted-language
+> invocation sites** that had been passing this guard GREEN the whole time —
+> because the token set banned the interpreter's OWN name and never its
+> package manager:
+>
+> | Site | What actually ran |
+> |---|---|
+> | `.github/workflows/terraform-apply.yml:233,408` | `pip3 install --break-system-packages ziglang==0.14.1` — `cargo-zigbuild` then invoked the interpreter as the **arm64 LINKER of every production Rust lambda** |
+> | `scripts/bootstrap.sh:114-117,123` | `pip3 install awscli` (the deprecated **v1** wheel) |
+> | `scripts/provision-infra-secrets.sh:36-42` | same |
+> | `scripts/setup-secrets.sh:38,42` | same |
+> | `scripts/setup-observability.sh:171` | same (help text) |
+>
+> **Fixed in the same PR:** the ziglang wheel → the OFFICIAL upstream zig
+> tarball (same pinned 0.14.1, zero interpreters, fails loudly rather than
+> falling back); all four AWS-CLI paths → `scripts/ensure-aws-cli.sh` (official
+> self-contained installer, v2 not v1); and `banned_tokens()` in
+> `rust_only_guard.rs` widened to `pip` / `pipx` / `uv` / `uvx` / `poetry` /
+> `conda` / `virtualenv`. **Bite-proven:** re-adding the exact `pip3 install
+> ziglang` line fails `no_new_banned_invocations` (verified 2026-08-01).
+>
+> **Still present, each needing its own decision — NOT silently allowlisted:**
+> `perl -ne` (`terraform-apply.yml:282`, the non-ASCII security-group
+> description guard), `rm -rf …/venv` (`deploy-aws.yml:729` — a cleanup line
+> that only DELETES), and `npx @modelcontextprotocol/*` (`.mcp.json`, dev-only,
+> never deployed). None is the banned runtime; all three are recorded here
+> rather than hidden, and adding their tokens would fail the guard today.
+>
+> **Lesson binding on every future ratchet:** a ban on a runtime that permits
+> its package manager is not a ban. Any future interpreter ban MUST enumerate
+> the ecosystem's INSTALL verbs, not just the binary name.
 
 **Honest boundary of Quote 2 (recorded, not hidden — §2's no-false-OK rule):**
 "nowhere the word python" is satisfied for **executable files and invocation
