@@ -8,12 +8,12 @@
 //!   2. Publishes a Critical message to the operator's `tv_alerts` topic so
 //!      the existing Telegram webhook pages the operator immediately
 //!
-//! Environment variables (set by Terraform — unchanged from the Python):
+//! Environment variables (set by Terraform — unchanged from the legacy runtime):
 //!   EC2_INSTANCE_ID  — instance to stop on budget breach
 //!   ALERTS_TOPIC_ARN — operator's tv_alerts SNS topic for Telegram
 //!   LOG_LEVEL        — INFO (default) / DEBUG / WARNING
 //!
-//! Parity notes: every pure helper mirrors its `_snake_case` Python
+//! Parity notes: every pure helper mirrors its `_snake_case` legacy
 //! original (`_extract_budget_message`, `_format_alert_payload`, the env
 //! guards, the SNS 99-char subject truncation, the re-raise-on-error
 //! semantics so the Lambda Errors metric + SNS retry policy still fire).
@@ -22,10 +22,10 @@ use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::{error, info};
 
-/// SNS hard subject limit is 100 chars; the Python truncated at 99.
+/// SNS hard subject limit is 100 chars; the legacy runtime truncated at 99.
 pub const SNS_SUBJECT_MAX: usize = 99;
 
-/// Message-body truncation cap — Python: `message[:1000] + " …(truncated)"`.
+/// Message-body truncation cap — legacy: `message[:1000] + " …(truncated)"`.
 pub const MESSAGE_TRUNCATE_CHARS: usize = 1000;
 
 /// One instance state transition from an `ec2:StopInstances` response,
@@ -46,7 +46,7 @@ pub struct AlertPayload {
 
 /// Pull a human-readable summary out of the SNS budget envelope.
 ///
-/// Python parity (`_extract_budget_message`): tolerant `dict.get` chain —
+/// Legacy parity (`_extract_budget_message`): tolerant `dict.get` chain —
 /// no Records → `<no SNS Records>`; missing Subject/Message →
 /// `<no subject>` / `<no message>`; bodies over 1000 chars truncate with
 /// ` …(truncated)`. Operates on `Value` to mirror the dict semantics
@@ -81,7 +81,7 @@ pub fn extract_budget_message(event: &Value) -> String {
 
 /// Build the operator-alert SNS payload.
 ///
-/// Python parity (`_format_alert_payload`): transitions render
+/// Legacy parity (`_format_alert_payload`): transitions render
 /// `"<id>: <prev> -> <curr>"` joined by `", "`, with `?` for any missing
 /// key and `<no state change reported>` when the list is empty; the body
 /// carries the Trigger context, the numbered Next steps, and the
@@ -128,12 +128,12 @@ pub fn format_alert_payload(
     }
 }
 
-/// Char-boundary-safe SNS subject truncation (Python `[:99]`).
+/// Char-boundary-safe SNS subject truncation (legacy `[:99]`).
 pub fn truncate_subject(subject: &str) -> String {
     subject.chars().take(SNS_SUBJECT_MAX).collect()
 }
 
-/// Env-var guards — Python parity: empty `EC2_INSTANCE_ID` /
+/// Env-var guards — legacy parity: empty `EC2_INSTANCE_ID` /
 /// `ALERTS_TOPIC_ARN` short-circuit with `{"ok": false, "reason": ...}`
 /// (checked in this order) BEFORE any AWS client is built.
 pub fn guard_config(instance_id: &str, topic_arn: &str) -> Result<(), Value> {
@@ -148,7 +148,7 @@ pub fn guard_config(instance_id: &str, topic_arn: &str) -> Result<(), Value> {
     Ok(())
 }
 
-/// Render the success return value — Python parity:
+/// Render the success return value — legacy parity:
 /// `{"ok": True, "instance_id": ..., "stop_state_changes": [...]}`.
 pub fn success_result(instance_id: &str, state_changes: &[StateTransition]) -> Value {
     let changes: Vec<Value> = state_changes
@@ -172,7 +172,7 @@ pub fn success_result(instance_id: &str, state_changes: &[StateTransition]) -> V
 ///
 /// UNPROVEN until deploy: the live `ec2:StopInstances` + `sns:Publish`
 /// legs run only in a real Lambda. Errors are propagated (`?`) so the
-/// Lambda Errors metric increments and SNS retries — the Python re-raise
+/// Lambda Errors metric increments and SNS retries — the legacy re-raise
 /// semantics.
 pub async fn handle(event: Value) -> Result<Value, Error> {
     let instance_id = std::env::var("EC2_INSTANCE_ID").unwrap_or_default();
@@ -243,7 +243,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
 mod tests {
     use super::*;
 
-    // ---- ExtractBudgetMessage (Python: 3 tests) ----
+    // ---- ExtractBudgetMessage (legacy: 3 tests) ----
 
     #[test]
     fn test_empty_event_returns_placeholder() {
@@ -277,7 +277,7 @@ mod tests {
         assert!(out.chars().count() < 1500);
     }
 
-    // ---- FormatAlertPayload (Python: 6 tests) ----
+    // ---- FormatAlertPayload (legacy: 6 tests) ----
 
     fn one_transition(id: &str) -> Vec<StateTransition> {
         vec![StateTransition {
@@ -334,8 +334,8 @@ mod tests {
         assert!(!out.message.contains("Traceback"));
     }
 
-    // ---- LambdaHandlerGuards (Python: 2 tests) ----
-    // The Python tests mutated module globals then called lambda_handler;
+    // ---- LambdaHandlerGuards (legacy: 2 tests) ----
+    // The legacy tests mutated module globals then called lambda_handler;
     // here the guard is a pure fn over the same two values — no process-env
     // mutation (test-parallelism-safe), same observable outcomes.
 
@@ -353,7 +353,7 @@ mod tests {
         assert!(out["reason"].as_str().unwrap().contains("ALERTS_TOPIC_ARN"));
     }
 
-    // ---- Rust-side additions beyond the Python suite ----
+    // ---- Rust-side additions beyond the legacy suite ----
 
     #[test]
     fn test_guard_passes_with_both_set() {

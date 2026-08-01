@@ -1167,7 +1167,7 @@ fn test_depth_ws_url_constants_are_orphaned() {
     assert_eq!(
         DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co",
         "200-level depth WS URL constant (ORPHANED — zero consumers; root \
-         path per the 2026-04-23 Python SDK verification)"
+         path per the 2026-04-23 vendor SDK verification)"
     );
 
     let mut files = Vec::new();

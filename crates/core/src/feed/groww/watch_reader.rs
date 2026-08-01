@@ -1,6 +1,6 @@
 //! Reader for the Rust-built Groww watch file
 //! (`data/groww/groww-watch-<date>.json`) — the SAME single-source file the
-//! Python sidecar subscribes from, so the shadow client's universe can never
+//! legacy sidecar subscribes from, so the shadow client's universe can never
 //! drift from the sidecar's.
 //!
 //! Writer counterpart: `crate::feed::groww::instruments::serialize_watch_file`

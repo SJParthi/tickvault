@@ -142,7 +142,7 @@ fi
 
 # Extract per-crate coverage from llvm-cov JSON using jq, then enforce the
 # thresholds in awk with EXACT scaled-integer arithmetic (rust-only purge
-# Phase 2a-2, 2026-07-18: replaces the inline python3/Fraction block — same
+# Phase 2a-2, 2026-07-18: replaces the inline interpreter/Fraction block — same
 # semantics, same output, same exit codes).
 # llvm-cov JSON format: { "data": [ { "files": [ { "filename": "...", "summary": { "lines": { "count": N, "covered": M } } } ] } ] }
 #
@@ -169,10 +169,10 @@ trap 'rm -f "$TSV_FILE"' EXIT
 # FAIL CLOSED on a PRESENT null/non-numeric lines.count / lines.covered
 # (review round 2 fix, 2026-07-18): the previous `// 0` turned an explicit
 # JSON null into 0 and let a string ride into awk (where `+0` coerces to 0),
-# so a corrupt report read 100.00% PASS. The old python crashed with a
+# so a corrupt report read 100.00% PASS. The old evaluator crashed with a
 # TypeError there (exit 1); restore that fail-closed contract with a named
 # jq error (set -e aborts the gate on jq's non-zero exit). A MISSING key
-# stays 0 — the old python `.get(..., 0)` was equally open there, and the
+# stays 0 — the old evaluator `.get(..., 0)` was equally open there, and the
 # parity contract deliberately keeps missing-key behavior unchanged.
 jq -r '
   def req_num($k):
@@ -216,7 +216,7 @@ function parse_dec(v,   ip, fp, i) {
   for (i = 0; i < length(fp); i++) G_pow *= 10
   G_scaled = ip * G_pow + (fp == "" ? 0 : fp + 0)
 }
-# frepr: render a decimal threshold string the way python float repr did
+# frepr: render a decimal threshold string the way the legacy float repr did
 # ("50" -> "50.0", "99.50" -> "99.5", "63.3" -> "63.3") — display only.
 function frepr(v,   s) {
   s = v

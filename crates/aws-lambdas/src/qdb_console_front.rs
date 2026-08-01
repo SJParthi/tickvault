@@ -1,8 +1,8 @@
 //! QuestDB console FRONT Lambda (B4) — auth + read-only gate, NON-VPC.
 //!
 //! 1:1 port of `deploy/aws/lambda/questdb-console-front/handler.py`
-//! (rust-only phase 2b-3, 2026-07-18). Python is the ORACLE — every test
-//! vector below is derived by running python3 on the original handler
+//! (rust-only phase 2b-3, 2026-07-18). The legacy runtime is the ORACLE — every test
+//! vector below is derived by running the legacy runtime on the original handler
 //! (`scratchpad/w3-oracle.json`, derived 2026-07-18), never invented.
 //!
 //! Browser → API-Gateway v2 ($default, payload v2) → THIS Lambda →
@@ -31,13 +31,13 @@
 //!
 //! The read-only SQL gate, the traversal reject, and the path classifier are
 //! the SAME functions the back uses (`crate::qdb_console_proxy`) — the
-//! Python sources carried two VERBATIM copies with a byte-parity test; the
+//! Legacy sources carried two VERBATIM copies with a byte-parity test; the
 //! Rust port makes that parity STRUCTURAL (one shared implementation), and
 //! the ported parity tests pin the shared behavior against the
 //! operator-control oracle verdicts.
 //!
 //! Never logs secrets, tokens, or cookie values. Structured JSON log per
-//! request (tracing → CloudWatch, replacing the Python `print`).
+//! request (tracing → CloudWatch, replacing the legacy `print`).
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -50,20 +50,20 @@ use crate::qdb_console_proxy::{self as back_gate, PathKind, bad_path, classify_p
 
 // ------------------------------------------------------------------ consts
 
-/// Deployed-bytes proof marker — MUST equal the back's marker (the Python
+/// Deployed-bytes proof marker — MUST equal the back's marker (the legacy
 /// BuildMarker test asserted the same value in both handler sources; the
 /// Rust test pins equality against `qdb_console_proxy::QDB_CONSOLE_BUILD`).
 pub const QDB_CONSOLE_BUILD: &str = "b4-qdb-console-2026-07-06-r3";
 
-/// Session cookie lifetime — Python `12 * 3600`.
+/// Session cookie lifetime — legacy `12 * 3600`.
 pub const SESSION_TTL_SECS: i128 = 12 * 3600;
 
 /// One-click link token lifetime. The front only VERIFIES link tokens (the
 /// portal mints them); the const is kept for wire-contract documentation
-/// parity with the Python source.
+/// parity with the legacy source.
 pub const LINK_TOKEN_TTL_SECS: i128 = 90;
 
-/// Shared row cap (Python `_SQL_MAX_ROWS`).
+/// Shared row cap (legacy `_SQL_MAX_ROWS`).
 pub const SQL_MAX_ROWS: u64 = 1000;
 
 pub use crate::qdb_console_proxy::{MAX_BODY_BYTES, MAX_SQL_LEN};
@@ -79,13 +79,13 @@ pub const PASSTHROUGH_PARAMS: [&str; 7] = [
 /// static path must not reach QuestDB) — only this whitelist passes.
 pub const STATIC_ALLOWED_PARAMS: [&str; 6] = ["f", "j", "v", "version", "nm", "src"];
 
-/// Python `_OFFLINE_MSG` — byte-exact (en dash + em dash included).
+/// Legacy `_OFFLINE_MSG` — byte-exact (en dash + em dash included).
 pub const OFFLINE_MSG: &str = "tickvault box is offline (auto-stopped outside 08:30–16:30 IST) — \
                                try during market hours";
 
-// -------------------------------------------------------- python semantics
+// -------------------------------------------------------- legacy semantics
 
-/// Python truthiness for JSON-decoded values (`or` chains, `if v:`).
+/// Legacy truthiness for JSON-decoded values (`or` chains, `if v:`).
 fn truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
@@ -97,8 +97,8 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
-/// Python `str(v)` for JSON-decoded scalars. Deliberate documented
-/// deviation for composites: Python rendered dict/list via repr (single
+/// Legacy `str(v)` for JSON-decoded scalars. Deliberate documented
+/// deviation for composites: the legacy runtime rendered dict/list via repr (single
 /// quotes); here they render as their JSON text — no test or wire consumer
 /// touches that arm (API-GW v2 query/header values are strings).
 fn py_str(v: &Value) -> String {
@@ -112,11 +112,11 @@ fn py_str(v: &Value) -> String {
     }
 }
 
-/// Python `int(str)` — strips (unicode) whitespace, one optional sign,
+/// Legacy `int(str)` — strips (unicode) whitespace, one optional sign,
 /// ascii digits with single underscores BETWEEN digits. Deviations, both
-/// fail-closed and documented: unicode digits are rejected (Python accepted
-/// them), and integers beyond i128 fail (Python was arbitrary-precision) —
-/// every caller maps `None` onto the Python `ValueError` path.
+/// fail-closed and documented: unicode digits are rejected (the legacy runtime accepted
+/// them), and integers beyond i128 fail (the legacy runtime was arbitrary-precision) —
+/// every caller maps `None` onto the legacy `ValueError` path.
 fn py_int(s: &str) -> Option<i128> {
     let t = s.trim();
     let (neg, digits) = match t.strip_prefix('-') {
@@ -147,11 +147,11 @@ fn py_int(s: &str) -> Option<i128> {
     Some(if neg { -n } else { n })
 }
 
-/// Python `urllib.parse.quote_plus` — percent-encode everything outside
+/// Legacy `urllib.parse.quote_plus` — percent-encode everything outside
 /// `[A-Za-z0-9_.\-~]`, space → `+`, non-ASCII via UTF-8 %XX (uppercase hex).
 fn py_quote_plus(s: &str) -> String {
     use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-    // NON_ALPHANUMERIC minus the Python-safe chars, minus space (handled
+    // NON_ALPHANUMERIC minus the legacy-safe chars, minus space (handled
     // by the literal `+` substitution below).
     const QUOTE_PLUS: &AsciiSet = &NON_ALPHANUMERIC
         .remove(b'_')
@@ -164,9 +164,9 @@ fn py_quote_plus(s: &str) -> String {
         .replace(' ', "+")
 }
 
-/// Python `urllib.parse.urlencode(dict)` — `k=v` pairs joined with `&`,
+/// Legacy `urllib.parse.urlencode(dict)` — `k=v` pairs joined with `&`,
 /// quote_plus on both sides, INSERTION order preserved (the callers build
-/// their pair lists in the exact Python dict-insertion order).
+/// their pair lists in the exact legacy dict-insertion order).
 fn py_urlencode(pairs: &[(String, String)]) -> String {
     pairs
         .iter()
@@ -178,9 +178,9 @@ fn py_urlencode(pairs: &[(String, String)]) -> String {
 // ------------------------------------------------------- read-only SQL gate
 // The gate itself (`is_safe_sql`, the banned/prefix/func constants) is the
 // SHARED back implementation — see the module doc. Only the row-cap helpers
-// live here (the back never caps; the front does, Python parity).
+// live here (the back never caps; the front does, legacy parity).
 
-/// Trailing-`LIMIT` clause match — Python
+/// Trailing-`LIMIT` clause match — legacy
 /// `re.search(r"(?i)\blimit\s+(-?\d+)(\s*,\s*-?\d+)?\s*$", q)`.
 /// Returns `(byte_start_of_limit, lo_digits, hi_present)`.
 fn parse_trailing_limit(q: &str) -> Option<(usize, String, bool)> {
@@ -195,7 +195,7 @@ fn parse_trailing_limit(q: &str) -> Option<(usize, String, bool)> {
             continue;
         }
         // \b before: start-of-string or a non-word char (see
-        // `qdb_console_proxy::is_word_char` for the Python `\w` mapping).
+        // `qdb_console_proxy::is_word_char` for the legacy `\w` mapping).
         if pos > 0 && back_gate::is_word_char(chars[pos - 1].1) {
             continue;
         }
@@ -260,7 +260,7 @@ fn parse_trailing_limit(q: &str) -> Option<(usize, String, bool)> {
     None
 }
 
-/// `lo > cap` for a non-negative digit string, with Python's
+/// `lo > cap` for a non-negative digit string, with the legacy runtime's
 /// arbitrary-precision semantics preserved fail-closed: an over-u128 value
 /// is certainly above the cap.
 fn limit_exceeds_cap(lo_digits: &str, cap: u64) -> bool {
@@ -270,7 +270,7 @@ fn limit_exceeds_cap(lo_digits: &str, cap: u64) -> bool {
         .unwrap_or(true)
 }
 
-/// Python `re.split(r"[^a-z]+", q, maxsplit=1)[0]` on an already-stripped
+/// Legacy `re.split(r"[^a-z]+", q, maxsplit=1)[0]` on an already-stripped
 /// lowered string — the leading ascii `a-z` run.
 fn first_token_lower(q: &str) -> String {
     q.to_lowercase()
@@ -280,7 +280,7 @@ fn first_token_lower(q: &str) -> String {
 }
 
 /// Enforce a server-side row cap on an already-validated read-only query —
-/// Python `_cap_sql_rows` parity. A trailing `LIMIT n` above the cap is
+/// Legacy `_cap_sql_rows` parity. A trailing `LIMIT n` above the cap is
 /// clamped; a SELECT/WITH query with no trailing LIMIT gets `LIMIT <cap>`
 /// appended; SHOW/EXPLAIN are left untouched; QuestDB range/negative forms
 /// (`LIMIT lo,hi` / `LIMIT -n`) are left as-is.
@@ -308,7 +308,7 @@ pub fn cap_sql_rows(query: &str) -> String {
 
 /// Clamp the console's `limit` pagination param (`n` or `lo,hi`) so a
 /// single page can never exceed the row cap. Malformed → the cap.
-/// Python `_clamp_limit_param` parity (`int()` semantics via [`py_int`]).
+/// Legacy `_clamp_limit_param` parity (`int()` semantics via [`py_int`]).
 pub fn clamp_limit_param(raw: &str) -> String {
     let cap = i128::from(SQL_MAX_ROWS);
     if let Some((lo_s, hi_s)) = raw.split_once(',') {
@@ -331,7 +331,7 @@ pub fn clamp_limit_param(raw: &str) -> String {
 
 // ------------------------------------------------------------------- signing
 
-/// Lowercase hex of a byte slice (Python `hexdigest()`).
+/// Lowercase hex of a byte slice (legacy `hexdigest()`).
 fn hex_lower(bytes: &[u8]) -> String {
     const TABLE: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -342,15 +342,15 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// Python `hmac.new(secret, msg, sha256).hexdigest()`.
+/// Legacy `hmac.new(secret, msg, sha256).hexdigest()`.
 fn hmac_hex(secret: &str, msg: &str) -> String {
     let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, secret.as_bytes());
     let tag = aws_lc_rs::hmac::sign(&key, msg.as_bytes());
     hex_lower(tag.as_ref())
 }
 
-/// Constant-time equality (Python `hmac.compare_digest`). Deliberate
-/// documented deviation: Python's str form RAISED TypeError on non-ascii
+/// Constant-time equality (legacy `hmac.compare_digest`). Deliberate
+/// documented deviation: the legacy runtime's str form RAISED TypeError on non-ascii
 /// inputs (a 500); this byte compare fails closed to `false` instead.
 fn ct_eq(a: &str, b: &str) -> bool {
     aws_lc_rs::constant_time::verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
@@ -389,7 +389,7 @@ pub fn verify_signed(secret: &str, prefix: &str, value: &str, now_epoch: i128) -
 
 // ------------------------------------------------------------- event helpers
 
-/// Python `_http_method` — `requestContext.http.method` upper-cased, else
+/// Legacy `_http_method` — `requestContext.http.method` upper-cased, else
 /// `event.get("httpMethod", "POST")`.
 fn http_method(event: &Value) -> String {
     let nested = event
@@ -405,7 +405,7 @@ fn http_method(event: &Value) -> String {
     }
 }
 
-/// Python `_path` — `event.get("rawPath") or event.get("path") or "/"`
+/// Legacy `_path` — `event.get("rawPath") or event.get("path") or "/"`
 /// (falsy chain), then `str()`.
 fn path_of(event: &Value) -> String {
     for key in ["rawPath", "path"] {
@@ -418,7 +418,7 @@ fn path_of(event: &Value) -> String {
     "/".to_string()
 }
 
-/// Python `_cookies(event).get(name, "")` — API-GW v2 delivers cookies as a
+/// Legacy `_cookies(event).get(name, "")` — API-GW v2 delivers cookies as a
 /// list of `k=v` strings; keys are `.strip()`ed; later duplicates overwrite
 /// (last occurrence wins).
 fn cookie_get(event: &Value, name: &str) -> String {
@@ -435,7 +435,7 @@ fn cookie_get(event: &Value, name: &str) -> String {
     out
 }
 
-/// The event's `headers` object (Python `event.get("headers") or {}`).
+/// The event's `headers` object (legacy `event.get("headers") or {}`).
 fn headers_of(event: &Value) -> Map<String, Value> {
     match event.get("headers") {
         Some(Value::Object(o)) => o.clone(),
@@ -443,8 +443,8 @@ fn headers_of(event: &Value) -> Map<String, Value> {
     }
 }
 
-/// Python `_authenticated` — Bearer header (constant-time) OR a valid
-/// `qdb_sess` cookie. Structural deviation, documented: the Python version
+/// Legacy `_authenticated` — Bearer header (constant-time) OR a valid
+/// `qdb_sess` cookie. Structural deviation, documented: the legacy version
 /// re-read `_control_secret()` itself; here the caller passes the secret it
 /// already fetched (same cached value — the cache TTL is 60s and both reads
 /// happen inside one invoke).
@@ -464,10 +464,10 @@ fn authenticated(event: &Value, now_epoch: i128, secret: &str) -> bool {
 
 // ------------------------------------------------------------------ responses
 
-/// Python `_json_resp` — API-GW v2 response with a dumped-JSON string body.
+/// Legacy `_json_resp` — API-GW v2 response with a dumped-JSON string body.
 /// Documented deviations (no assertion or consumer reads either): serde
-/// serializes object keys alphabetically (Python kept insertion order) and
-/// compactly (Python `json.dumps` used `", "` / `": "` separators).
+/// serializes object keys alphabetically (the legacy runtime kept insertion order) and
+/// compactly (legacy `json.dumps` used `", "` / `": "` separators).
 fn json_resp(status: i64, body: &Value) -> Value {
     json!({
         "statusCode": status,
@@ -482,7 +482,7 @@ fn sql_reject_resp(query: &str, msg: &str) -> Value {
     json_resp(400, &json!({"query": query, "error": msg, "position": 0}))
 }
 
-/// The Python `_LOGIN_HTML` template, byte-identical (oracle sha256
+/// The legacy `_LOGIN_HTML` template, byte-identical (oracle sha256
 /// `0277780b…` pinned in the tests).
 const LOGIN_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -507,9 +507,9 @@ padding:10px;font-size:14px;cursor:pointer}
 __ERR__
 </div></body></html>"#;
 
-/// Python `_login_page` — the login shell with an optional error line. The
+/// Legacy `_login_page` — the login shell with an optional error line. The
 /// `err` values are FIXED internal literals (never user input), exactly as
-/// in Python — no HTML escaping, parity-preserved.
+/// in the legacy runtime — no HTML escaping, parity-preserved.
 fn login_page(status: i64, err: &str) -> Value {
     let err_html = if err.is_empty() {
         String::new()
@@ -528,7 +528,7 @@ fn login_page(status: i64, err: &str) -> Value {
     })
 }
 
-/// Python `_session_redirect` — 302 / with the fresh `qdb_sess` cookie.
+/// Legacy `_session_redirect` — 302 / with the fresh `qdb_sess` cookie.
 fn session_redirect(secret: &str, now_epoch: i128) -> Value {
     let exp = now_epoch + SESSION_TTL_SECS;
     let cookie = format!(
@@ -545,9 +545,9 @@ fn session_redirect(secret: &str, now_epoch: i128) -> Value {
 
 // --------------------------------------------------------------- path gating
 // `bad_path` + `classify_path` (Deny/Method/Sql/Static) are the SHARED back
-// implementations — Python carried verbatim copies in both handlers.
+// implementations — the legacy runtime carried verbatim copies in both handlers.
 
-/// Validate + rebuild the query string for /exec | /exp — Python
+/// Validate + rebuild the query string for /exec | /exp — legacy
 /// `_build_sql_raw_query`. `Ok((capped_query, raw_query_string))` on
 /// success, `Err(api-gw response)` on rejection.
 pub fn build_sql_raw_query(
@@ -562,7 +562,7 @@ pub fn build_sql_raw_query(
     if q.trim().is_empty() {
         return Err(sql_reject_resp("", "missing query parameter"));
     }
-    // Python `len(q)` counts CHARACTERS (and `q[:200]` slices them).
+    // Legacy `len(q)` counts CHARACTERS (and `q[:200]` slices them).
     if q.chars().count() > MAX_SQL_LEN {
         return Err(sql_reject_resp(
             &q.chars().take(200).collect::<String>(),
@@ -578,7 +578,7 @@ pub fn build_sql_raw_query(
     let capped = cap_sql_rows(&q);
     let mut fwd: Vec<(String, String)> = vec![("query".to_string(), capped.clone())];
     for k in PASSTHROUGH_PARAMS {
-        // Python `if k in params and params[k] is not None` — ONLY null is
+        // Legacy `if k in params and params[k] is not None` — ONLY null is
         // excluded (empty strings forward as `k=`).
         if let Some(v) = params.get(k)
             && !v.is_null()
@@ -600,7 +600,7 @@ pub fn build_sql_raw_query(
 }
 
 /// Forward ONLY a whitelisted param set on static / /chk / console paths —
-/// NEVER the raw rawQueryString (Python `_build_static_query`).
+/// NEVER the raw rawQueryString (legacy `_build_static_query`).
 pub fn build_static_query(params: &Map<String, Value>) -> String {
     let fwd: Vec<(String, String)> = STATIC_ALLOWED_PARAMS
         .iter()
@@ -616,21 +616,21 @@ pub fn build_static_query(params: &Map<String, Value>) -> String {
 
 // ------------------------------------------------------------------ back relay
 
-/// Injected dependencies — the Python monkeypatch seams (`_control_secret`
+/// Injected dependencies — the legacy monkeypatch seams (`_control_secret`
 /// and `_invoke_back`) made explicit. The live impl is [`LiveDeps`];
 /// tests inject fakes.
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline, so Send-ness resolves at the concrete call sites.
 pub trait FrontDeps {
-    /// Python `_control_secret()` — SSM runtime read, 60s cache,
+    /// Legacy `_control_secret()` — SSM runtime read, 60s cache,
     /// fail-closed to `""` on any error.
     async fn control_secret(&mut self) -> String;
-    /// Python `_invoke_back(payload)` — lambda:InvokeFunction
+    /// Legacy `_invoke_back(payload)` — lambda:InvokeFunction
     /// (RequestResponse) to the VPC back Lambda; `{"err": "..."}` on any
     /// invoke failure.
     async fn invoke_back(&mut self, payload: Value) -> Value;
 }
 
-/// Python `_relay` — forward to the back, translate its typed errors,
+/// Legacy `_relay` — forward to the back, translate its typed errors,
 /// pass the base64 body through.
 async fn relay<D: FrontDeps>(
     deps: &mut D,
@@ -704,9 +704,9 @@ async fn relay<D: FrontDeps>(
             &json!({"error": "response too large (>4.1MB) — narrow the query"}),
         );
     }
-    // Python `int(back.get("status", 200))` — numbers truncate toward zero,
+    // Legacy `int(back.get("status", 200))` — numbers truncate toward zero,
     // numeric strings parse; a non-numeric value would have RAISED in
-    // Python (a 500) — documented deviation: default 200 (the back's typed
+    // Legacy (a 500) — documented deviation: default 200 (the back's typed
     // envelope always carries an int).
     let status = match back.get("status") {
         None => 200,
@@ -727,7 +727,7 @@ async fn relay<D: FrontDeps>(
 
 // ---------------------------------------------------------------------- log
 
-/// Python `_log` — one structured JSON line per request. NEVER logs
+/// Legacy `_log` — one structured JSON line per request. NEVER logs
 /// secrets, tokens, or cookies. (`print` → `tracing::info!`; the bin's JSON
 /// subscriber renders the same CloudWatch-ingestable shape.)
 fn log_req(path: &str, method: &str, outcome: &str, status: i64, sql_head: &str) {
@@ -745,8 +745,8 @@ fn log_req(path: &str, method: &str, outcome: &str, status: i64, sql_head: &str)
 
 // ------------------------------------------------------------------- handler
 
-/// Python `_body_text` — raw body, base64-decoded (UTF-8 with replacement)
-/// when flagged. Documented deviation: Python's `b64decode` silently
+/// Legacy `_body_text` — raw body, base64-decoded (UTF-8 with replacement)
+/// when flagged. Documented deviation: the legacy runtime's `b64decode` silently
 /// DISCARDED non-alphabet characters before the padding check; the strict
 /// Rust decoder rejects them — both land on the same fail-closed `""`.
 fn body_text(event: &Value) -> String {
@@ -765,27 +765,27 @@ fn body_text(event: &Value) -> String {
     }
 }
 
-/// Extract the login key from a POST /login body — Python inline logic.
+/// Extract the login key from a POST /login body — legacy inline logic.
 fn login_key(body: &str, ctype: &str) -> String {
     if ctype.contains("json") {
         let text = if body.is_empty() { "{}" } else { body };
         match serde_json::from_str::<Value>(text) {
-            // Python `.get("key", "")` then `str(...)`: a missing key is
+            // Legacy `.get("key", "")` then `str(...)`: a missing key is
             // `""`; a present non-string renders via `str` (null → "None").
             Ok(Value::Object(o)) => o.get("key").map(py_str).unwrap_or_default(),
-            // Non-object JSON RAISED in Python (a 500) — documented
+            // Non-object JSON RAISED in the legacy runtime (a 500) — documented
             // deviation: fail closed to "" (a 401, never a crash).
             Ok(_) => String::new(),
             Err(_) => String::new(),
         }
     } else {
-        // The login <form> posts x-www-form-urlencoded — Python
+        // The login <form> posts x-www-form-urlencoded — legacy
         // `parse_qs(body).get("key", [""])[0]` (first NON-BLANK value).
         back_gate::query_param(body, "key")
     }
 }
 
-/// The full handler core — Python `lambda_handler` parity, with the SSM
+/// The full handler core — legacy `lambda_handler` parity, with the SSM
 /// secret + back-invoke seams injected.
 pub async fn handle_core<D: FrontDeps>(event: &Value, now_epoch: i128, deps: &mut D) -> Value {
     let method = http_method(event);
@@ -865,7 +865,7 @@ pub async fn handle_core<D: FrontDeps>(event: &Value, now_epoch: i128, deps: &mu
                     .get("statusCode")
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
-                // Python `str(params.get("query", ""))[:200]` — a present
+                // Legacy `str(params.get("query", ""))[:200]` — a present
                 // null renders "None" (py_str), a missing key "".
                 let head = params.get("query").map(py_str).unwrap_or_default();
                 log_req(&path, &method, "denied_sql", status, &head);
@@ -892,12 +892,12 @@ pub async fn handle_core<D: FrontDeps>(event: &Value, now_epoch: i128, deps: &mu
 
 // ----------------------------------------------------------------- live deps
 
-/// SSM secret cache — Python module-global `_cache` parity (persists across
+/// SSM secret cache — legacy module-global `_cache` parity (persists across
 /// warm invokes; `time.monotonic` → `Instant`). Failures (empty values)
 /// are never cached: the next read retries.
 static SECRET_CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
-/// Python `_SECRET_TTL_SECS = 60.0`.
+/// Legacy `_SECRET_TTL_SECS = 60.0`.
 const SECRET_TTL_SECS: u64 = 60;
 const SECRET_TTL: Duration = Duration::from_secs(SECRET_TTL_SECS);
 
@@ -923,7 +923,7 @@ impl LiveDeps {
         }
     }
 
-    /// Python `_load_param` — missing/any-error => `""` (fail closed).
+    /// Legacy `_load_param` — missing/any-error => `""` (fail closed).
     async fn load_param(&self) -> String {
         if self.control_secret_param.is_empty() {
             return String::new();
@@ -1001,7 +1001,7 @@ impl FrontDeps for LiveDeps {
     }
 }
 
-/// Live entrypoint for the bin. Python `lambda_handler` used
+/// Live entrypoint for the bin. Legacy `lambda_handler` used
 /// `int(time.time())` for `now`.
 pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     let now_epoch = std::time::SystemTime::now()
@@ -1026,7 +1026,7 @@ mod tests {
             .map_or(0, |d| i128::from(d.as_secs()))
     }
 
-    // ---- fakes (the Python WithSecret monkeypatch seam)
+    // ---- fakes (the legacy WithSecret monkeypatch seam)
 
     struct FakeDeps {
         secret: String,
@@ -1067,7 +1067,7 @@ mod tests {
         }
     }
 
-    // ---- the Python `_event` builder
+    // ---- the legacy `_event` builder
 
     #[allow(clippy::too_many_arguments)]
     fn event_full(
@@ -1134,8 +1134,8 @@ mod tests {
         handle_core(event, now_epoch(), deps).await
     }
 
-    // The adversarial corpus — the Python `_SQL_CORPUS` base entries, with
-    // the operator-control gate's verdict per entry DERIVED FROM THE PYTHON
+    // The adversarial corpus — the legacy `_SQL_CORPUS` base entries, with
+    // the operator-control gate's verdict per entry DERIVED FROM THE LEGACY
     // ORACLE (scratchpad/w3-oracle.json run of
     // deploy/aws/lambda/operator-control/handler.py, 2026-07-18). On the
     // base corpus front == opctl on every entry (the introspection-func
@@ -1173,7 +1173,7 @@ mod tests {
     ];
 
     /// The full corpus: base entries + every banned keyword exercised
-    /// individually (the Python `_SQL_CORPUS +=` loops; oracle verdict for
+    /// individually (the legacy `_SQL_CORPUS +=` loops; oracle verdict for
     /// every generated entry is `false`).
     fn sql_corpus() -> Vec<(String, bool)> {
         let mut corpus: Vec<(String, bool)> = SQL_CORPUS_BASE
@@ -1190,7 +1190,7 @@ mod tests {
         corpus
     }
 
-    // ---- SqlGateParity (Python: 8 tests) ----
+    // ---- SqlGateParity (legacy: 8 tests) ----
 
     #[test]
     fn test_sql_gate_parity_with_operator_control() {
@@ -1291,7 +1291,7 @@ mod tests {
         assert!(!is_safe_sql("(select 1)"));
     }
 
-    // ---- SqlIntrospectionSuperset (Python: 6 tests) ----
+    // ---- SqlIntrospectionSuperset (legacy: 6 tests) ----
 
     #[test]
     fn test_each_allowed_func_passes_bare_and_with_args() {
@@ -1331,7 +1331,7 @@ mod tests {
 
     #[test]
     fn test_front_back_gate_byte_identical() {
-        // The Rust port makes the Python front/back byte-parity STRUCTURAL:
+        // The Rust port makes the legacy front/back byte-parity STRUCTURAL:
         // the front calls the back's `is_safe_sql` directly. This ported
         // test keeps the corpus exercised through both call paths and pins
         // the shared verdicts against the oracle (front == back on ALL 89
@@ -1351,15 +1351,15 @@ mod tests {
         }
     }
 
-    // ---- Signing (Python: 7 tests) ----
+    // ---- Signing (legacy: 7 tests) ----
 
     #[test]
     fn test_mint_verify_roundtrip() {
         let now = now_epoch();
         let tok = mint_signed(SECRET, "qdblink", now + 90);
         assert!(verify_signed(SECRET, "qdblink", &tok, now));
-        // Wire-contract vectors DERIVED FROM THE PYTHON ORACLE
-        // (w3-oracle.json `hmac`, python3 run of the original handler —
+        // Wire-contract vectors DERIVED FROM THE LEGACY ORACLE
+        // (w3-oracle.json `hmac`, the legacy runtime run of the original handler —
         // the operator-control MINT side must byte-match these).
         assert_eq!(
             mint_signed(SECRET, "qdblink", 1_780_000_090),
@@ -1425,7 +1425,7 @@ mod tests {
     fn test_constant_time_compare_used() {
         // The ratchet the brief demands: every secret compare goes through
         // the constant-time helper — token/cookie verify AND the two direct
-        // key compares (Bearer + login POST). Python asserted
+        // key compares (Bearer + login POST). The legacy runtime asserted
         // `hmac.compare_digest` in the source of _verify_signed /
         // _authenticated / lambda_handler; here the source-scan pins
         // `ct_eq(` at all three sites (production region only) and the
@@ -1441,7 +1441,7 @@ mod tests {
         );
     }
 
-    // ---- AuthFlow (Python: 14 tests) ----
+    // ---- AuthFlow (legacy: 14 tests) ----
 
     #[tokio::test]
     async fn test_unauthenticated_get_returns_login_page() {
@@ -1639,7 +1639,7 @@ mod tests {
         assert_eq!(status_of(&r), 401);
     }
 
-    // ---- PathMethodGate (Python: 16 tests) ----
+    // ---- PathMethodGate (legacy: 16 tests) ----
 
     #[tokio::test]
     async fn test_imp_path_403() {
@@ -1924,7 +1924,7 @@ mod tests {
         assert!(fwd.contains(&("count".to_string(), "true".to_string())));
         assert!(!fwd.iter().any(|(k, _)| k == "evil"));
         // Oracle byte-vector (w3-oracle.json `build_sql.exec_count` — the
-        // Python quote_plus wire form, '*' percent-encoded).
+        // Legacy quote_plus wire form, '*' percent-encoded).
         assert_eq!(raw, "query=select+%2A+from+ticks+LIMIT+1000&count=true");
     }
 
@@ -1978,7 +1978,7 @@ mod tests {
         assert_eq!(raw, "query=show+tables&limit=1000");
     }
 
-    // ---- RelayPlumbing (Python: 9 tests) ----
+    // ---- RelayPlumbing (legacy: 9 tests) ----
 
     #[tokio::test]
     async fn test_binary_base64_passthrough_preserves_headers() {
@@ -2033,7 +2033,7 @@ mod tests {
         let msg = body["error"].as_str().unwrap_or("");
         assert!(msg.contains("offline"));
         assert!(msg.contains("08:30"));
-        // Stronger than the Python substring asserts: the full oracle
+        // Stronger than the legacy substring asserts: the full oracle
         // message (w3-oracle.json `offline_msg`, en/em dashes included).
         assert_eq!(msg, OFFLINE_MSG);
     }
@@ -2065,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    // The python test pins the CONSTANT itself — a constant assertion is
+    // The legacy test pins the CONSTANT itself — a constant assertion is
     // the point (ratchet on the cap value), so the lint is waived here.
     #[allow(clippy::assertions_on_constants)]
     fn test_body_cap_constant_within_6mib_envelope() {
@@ -2095,7 +2095,7 @@ mod tests {
     async fn test_relay_forwards_location_on_3xx() {
         // B4 r3 defense-in-depth: the back relays a 3xx BODY-LESS (status +
         // Location) — the front must forward `location` so the browser can
-        // follow to /index.html. FAILED on the Python r2 bytes (the _relay
+        // follow to /index.html. FAILED on the legacy r2 bytes (the _relay
         // header tuple dropped `location`).
         let mut deps = FakeDeps::with_back(|_p| {
             json!({
@@ -2133,23 +2133,23 @@ mod tests {
         assert_eq!(status_of(&r), 400);
     }
 
-    // ---- BuildMarker (Python: 1 test) ----
+    // ---- BuildMarker (legacy: 1 test) ----
 
     #[test]
     fn test_build_marker_present() {
         // Proof-3 ratchet: the deployed-bytes marker exists in BOTH halves
-        // of the console pair with the SAME value (Python asserted the
+        // of the console pair with the SAME value (the legacy runtime asserted the
         // front marker appears in the back source).
         assert!(QDB_CONSOLE_BUILD.starts_with("b4-qdb-console-"));
         assert_eq!(QDB_CONSOLE_BUILD, back::QDB_CONSOLE_BUILD);
     }
 
-    // ---- Extra (beyond the 61 Python tests): oracle byte-vectors ----
+    // ---- Extra (beyond the 61 legacy tests): oracle byte-vectors ----
 
     #[test]
-    fn test_python_oracle_vectors() {
+    fn test_legacy_oracle_vectors() {
         // Byte-equivalence law: every value below was produced by running
-        // python3 on the original handler.py (w3-oracle.json, 2026-07-18).
+        // the legacy runtime on the original handler.py (w3-oracle.json, 2026-07-18).
         fn sha256_hex(s: &str) -> String {
             hex_lower(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, s.as_bytes()).as_ref())
         }

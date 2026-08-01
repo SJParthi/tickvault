@@ -1,10 +1,10 @@
 //! AUTO-GENERATED action command goldens for the operator-control port —
-//! captured by RUNNING the python oracle's `lambda_handler`
+//! captured by RUNNING the legacy oracle's `lambda_handler`
 //! (`deploy/aws/lambda/operator-control/handler.py`) with a stubbed
 //! `_ssm_shell` (`scratchpad/w4-dump-actions.py`), NEVER hand-transcribed.
 //! Byte-exact with the SSM command lists each action dispatches.
 
-/// python: `lambda_handler wipe-questdb cmds` (handler.py:1126-1197) — captured from the RUNNING oracle.
+/// legacy: `lambda_handler wipe-questdb cmds` (handler.py:1126-1197) — captured from the RUNNING oracle.
 pub const WIPE_QUESTDB_COMMANDS: [&str; 10] = [
     r#"set +e"#,
     r#"systemctl stop tickvault || true"#,
@@ -34,7 +34,7 @@ PYWIPE"#,
     r#"sleep 3; qc() { curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20$1" 2>/dev/null | grep -o '\[\[[0-9]*' | grep -o '[0-9]*'; }; T=$(qc ticks); C=$(qc candles_1m); S=$(qc spot_1m_rest); O=$(qc option_chain_1m); K=$(qc option_contract_1m_rest); A=$(qc rest_fetch_audit); echo "WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?} spot_1m_rest=${S:-?} option_chain_1m=${O:-?} option_contract_1m_rest=${K:-?} rest_fetch_audit=${A:-?}"; if [ "${T:-0}" = 0 ] && [ "${C:-0}" = 0 ] && [ "${S:-0}" = 0 ] && [ "${O:-0}" = 0 ] && [ "${K:-0}" = 0 ] && [ "${A:-0}" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain — inspect the counts + TRUNCATE-FAILED lines above'; fi"#,
 ];
 
-/// python: `lambda_handler docker-reset cmds` (handler.py:1258-1306) — captured from the RUNNING oracle.
+/// legacy: `lambda_handler docker-reset cmds` (handler.py:1258-1306) — captured from the RUNNING oracle.
 pub const DOCKER_RESET_COMMANDS: [&str; 17] = [
     r#"set +e"#,
     r#"systemctl stop tickvault || true"#,
@@ -55,7 +55,7 @@ pub const DOCKER_RESET_COMMANDS: [&str; 17] = [
     r#"echo docker-reset-dispatched"#,
 ];
 
-/// python: `lambda_handler docker-nuke-bare cmds` (handler.py:1338-1368) — captured from the RUNNING oracle.
+/// legacy: `lambda_handler docker-nuke-bare cmds` (handler.py:1338-1368) — captured from the RUNNING oracle.
 pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 10] = [
     r#"set +e"#,
     r#"systemctl stop tickvault || true"#,
@@ -69,7 +69,7 @@ pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 10] = [
     r#"C=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' '); I=$(docker images -aq 2>/dev/null | wc -l | tr -d ' '); V=$(docker volume ls -q 2>/dev/null | wc -l | tr -d ' '); echo "BARE-NUKE-RESULT containers=$C images=$I volumes=$V"; if [ "$C" = 0 ] && [ "$I" = 0 ] && [ "$V" = 0 ]; then echo bare-nuke-complete; else echo 'bare-nuke-PARTIAL: something is still present (likely in-use)'; fi"#,
 ];
 
-/// python: `lambda_handler logs cmds` (handler.py:1414-1424) — captured from the RUNNING oracle.
+/// legacy: `lambda_handler logs cmds` (handler.py:1414-1424) — captured from the RUNNING oracle.
 pub const LOGS_COMMANDS: [&str; 7] = [
     r#"set +e"#,
     r#"echo ERR_BEGIN"#,

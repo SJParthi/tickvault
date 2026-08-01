@@ -162,7 +162,7 @@ fn coverage_gate_fails_below_threshold_crate() {
 /// never return to the gate script.
 ///
 /// 2026-07-18 amendment (PR #1642 review round 1 / rust-only Phase 2a-2):
-/// the gate's inline python was replaced by awk, so the python-era literal
+/// the gate's inline legacy script was replaced by awk, so the legacy-era literal
 /// `re.search(r'crates/` no longer exists and this pin went stale (the exact
 /// CI failure on head e5586994). The INTENT is unchanged and re-pinned on
 /// the awk shape: aggregation must use awk's `match()` (LEFTMOST match —
@@ -190,7 +190,7 @@ fn coverage_gate_source_has_no_anchored_match() {
         src.contains(r"match(fn, /crates\/[^\/]+\//)"),
         "scripts/coverage-gate.sh must aggregate crates via awk's leftmost \
          match() on the unanchored crates/<name>/ regex (the re.search \
-         semantics of the pre-2026-07-18 python implementation)"
+         semantics of the pre-2026-07-18 legacy implementation)"
     );
     assert!(
         src.contains("refusing vacuous pass"),

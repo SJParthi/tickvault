@@ -20,7 +20,7 @@
 #      the month. Cost Explorer errors fail-safe (page, never disable).
 #    - Source lives in crates/aws-lambdas/src/hard_stop_guard.rs (the
 #      Rust port, rust-only phase 2b-2 wave 2 — the former
-#      deploy/aws/lambda/hard-stop-guard/ Python dir was deleted in the
+#      deploy/aws/lambda/hard-stop-guard/ handler dir was deleted in the
 #      same PR; see the Hard Auto-Stop Guard section comment below)
 #
 # Cost: Both Lambdas under 1 invocation/day each — well within the
@@ -29,7 +29,7 @@
 
 # --------- Daily Budget Digest Lambda ---------
 #
-# 2026-07-18 (rust-only phase 2b-1): the inline Python heredoc was PORTED to
+# 2026-07-18 (rust-only phase 2b-1): the inline legacy heredoc was PORTED to
 # Rust — crates/aws-lambdas/src/budget_digest.rs (lib logic + unit tests) +
 # src/bin/daily_budget_digest.rs (thin bootstrap bin). Behavior parity:
 # same Cost Explorer queries (us-east-1, DAILY UnblendedCost, exclusive
@@ -131,7 +131,7 @@ resource "aws_lambda_permission" "tv_daily_budget_digest_eventbridge" {
 
 # --------- Hard Auto-Stop Guard Lambda ---------
 
-# 2026-07-18 (rust-only phase 2b-2 wave 2): ported from python
+# 2026-07-18 (rust-only phase 2b-2 wave 2): ported from the legacy handler
 # (deploy/aws/lambda/hard-stop-guard/handler.py, deleted in the same PR) to
 # the Rust binary `hard-stop-guard` in crates/aws-lambdas
 # (src/hard_stop_guard.rs — GAP 1 breach->stop+disable logic, 34 tests

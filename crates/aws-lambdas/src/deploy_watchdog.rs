@@ -36,18 +36,18 @@
 //! skip run can fool the GitHub signal but never the SSM param — the
 //! 2026-07-09 outage class).
 //!
-//! Behavior-parity ledger (deliberate deviations from the python):
-//! * env vars are read PER INVOCATION (python read them at module import;
+//! Behavior-parity ledger (deliberate deviations from the legacy runtime):
+//! * env vars are read PER INVOCATION (the legacy runtime read them at module import;
 //!   Lambda cold-starts per config change so both see current values).
-//! * `tracing` structured logs replace the python `logging` calls 1:1
+//! * `tracing` structured logs replace the legacy `logging` calls 1:1
 //!   (same levels, same decision points).
 //! * GitHub REST uses `reqwest` (10s timeout, fixed api.github.com host)
 //!   instead of urllib — same status/body tuple semantics: transport
 //!   failure -> (0, {"error": "github request failed"}), unparsable body
 //!   on an HTTP response -> {"error": "github http error"}.
-//! * the SSM token cache is a process-`static` Mutex map (the python
+//! * the SSM token cache is a process-`static` Mutex map (the legacy
 //!   module-global `_param_cache`) — warm containers skip the re-read;
-//!   the BINARY sha param is deliberately NOT cached (python parity: it
+//!   the BINARY sha param is deliberately NOT cached (legacy parity: it
 //!   changes on every deploy).
 
 use std::collections::HashMap;
@@ -57,14 +57,14 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
-/// Env defaults — python parity (`os.environ.get(...)` fallbacks).
+/// Env defaults — legacy parity (`os.environ.get(...)` fallbacks).
 const DEFAULT_GH_REPO: &str = "SJParthi/tickvault";
 const DEFAULT_GH_DESIRED_REF: &str = "main";
 const DEFAULT_GH_DEPLOY_WORKFLOW: &str = "deploy-aws.yml";
 const DEFAULT_GH_DISPATCH_WORKFLOW: &str = "deploy-aws-after-close.yml";
 const DEFAULT_BINARY_SHA_PARAM: &str = "/tickvault/prod/deploy/binary-git-sha";
 
-/// B9 deploy provenance metric identity — python parity
+/// B9 deploy provenance metric identity — legacy parity
 /// (`_MISMATCH_METRIC_*`). PutMetricData is called DIRECTLY (bypasses the
 /// Prometheus→EMF allowlist in user-data.sh.tftpl by design — this metric
 /// originates in the Lambda, not the app).
@@ -72,11 +72,11 @@ const MISMATCH_METRIC_NAMESPACE: &str = "Tickvault/Prod";
 const MISMATCH_METRIC_NAME: &str = "tv_binary_main_sha_mismatch";
 const MISMATCH_METRIC_HOST: &str = "tickvault-prod";
 
-const GITHUB_API_BASE: &str = "https://api.github.com"; // APPROVED: infrastructure constant — the GitHub REST API base (Lambda-side, python watchdog parity)
+const GITHUB_API_BASE: &str = "https://api.github.com"; // APPROVED: infrastructure constant — the GitHub REST API base (Lambda-side, legacy watchdog parity)
 const GITHUB_TIMEOUT_SECONDS: u64 = 10;
 
 // ------------------------------------------------------------------------
-// Pure decision logic (no IO — unit-tested below, python tests ported 1:1)
+// Pure decision logic (no IO — unit-tested below, legacy tests ported 1:1)
 // ------------------------------------------------------------------------
 
 /// Return true iff a redeploy is needed.
@@ -87,7 +87,7 @@ const GITHUB_TIMEOUT_SECONDS: u64 = 10;
 /// (a spurious deploy is worse than waiting for the next 5-minutes-later
 /// run). This is the no-false-OK contract inverted — we never claim
 /// "deployed" by absence, and we never "fix" what we cannot positively
-/// confirm is broken. Python parity: `if not desired_sha or not
+/// confirm is broken. Legacy parity: `if not desired_sha or not
 /// deployed_sha: return False`.
 pub fn is_stale(desired_sha: Option<&str>, deployed_sha: Option<&str>) -> bool {
     let (Some(desired), Some(deployed)) = (desired_sha, deployed_sha) else {
@@ -146,16 +146,16 @@ pub fn binary_is_stale(binary_sha: Option<&str>, desired_sha: Option<&str>) -> b
 }
 
 // ------------------------------------------------------------------------
-// IO helpers (thin wrappers — exercised in the live deploy, python parity)
+// IO helpers (thin wrappers — exercised in the live deploy, legacy parity)
 // ------------------------------------------------------------------------
 
-/// Warm-container SSM param cache — python parity (`_param_cache`
+/// Warm-container SSM param cache — legacy parity (`_param_cache`
 /// module-global). Only the GitHub TOKEN goes through this; the binary
 /// sha param is read fresh every fire.
 static PARAM_CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// SSM SecureString read with warm-container caching. Any failure returns
-/// "" (the watchdog must never crash on the token read — python parity:
+/// "" (the watchdog must never crash on the token read — legacy parity:
 /// the blanket `except` in `_cached_param`).
 async fn cached_param(ssm: &aws_sdk_ssm::Client, name: &str) -> String {
     if name.is_empty() {
@@ -194,7 +194,7 @@ async fn cached_param(ssm: &aws_sdk_ssm::Client, name: &str) -> String {
     }
 }
 
-/// Minimal GitHub REST call. Returns (status, json) — python `_gh` parity:
+/// Minimal GitHub REST call. Returns (status, json) — legacy `_gh` parity:
 /// no token -> (0, {"error": "github token not configured"}); transport
 /// failure -> (0, {"error": "github request failed"}); unparsable body on
 /// an HTTP response -> {"error": "github http error"}.
@@ -239,7 +239,7 @@ async fn gh(
     }
 }
 
-/// Current HEAD sha of the desired ref (main). Python `_desired_sha`.
+/// Current HEAD sha of the desired ref (main). Legacy `_desired_sha`.
 async fn desired_sha(
     client: &reqwest::Client,
     token: &str,
@@ -262,7 +262,7 @@ async fn desired_sha(
 }
 
 /// head_sha of the most recent SUCCESSFUL deploy workflow run on the ref.
-/// Python `_deployed_sha`.
+/// Legacy `_deployed_sha`.
 async fn deployed_sha(
     client: &reqwest::Client,
     token: &str,
@@ -297,7 +297,7 @@ async fn deployed_sha(
 }
 
 /// Trigger the (idempotent, market-hours-guarded) auto-deploy workflow.
-/// Python `_dispatch_deploy` — ok iff GitHub answers 201/204.
+/// Legacy `_dispatch_deploy` — ok iff GitHub answers 201/204.
 async fn dispatch_deploy(
     client: &reqwest::Client,
     token: &str,
@@ -325,7 +325,7 @@ async fn dispatch_deploy(
 
 /// Deployed-binary git SHA from SSM (B9 deploy provenance). Read fresh on
 /// every invocation (NOT via the token cache — the value changes on every
-/// deploy and Lambda containers persist across invocations). Python
+/// deploy and Lambda containers persist across invocations). Legacy
 /// `_binary_sha`.
 async fn binary_sha(ssm: &aws_sdk_ssm::Client, param: &str) -> Option<String> {
     if param.is_empty() {
@@ -352,7 +352,7 @@ async fn binary_sha(ssm: &aws_sdk_ssm::Client, param: &str) -> Option<String> {
 /// tv-<env>-binary-sha-stale alarm (Minimum >= 1 over 24h) can detect a
 /// running binary that lags main HEAD for a full day. Wrapped so the
 /// watchdog's core stale-deploy dispatch job NEVER breaks on metric IO
-/// (python parity: the blanket `except` + error log).
+/// (legacy parity: the blanket `except` + error log).
 async fn publish_binary_mismatch_metric(
     cw: &aws_sdk_cloudwatch::Client,
     binary: Option<&str>,
@@ -385,7 +385,7 @@ async fn publish_binary_mismatch_metric(
     }
 }
 
-/// SNS publish — never fatal (python `_publish` parity: unset topic warns,
+/// SNS publish — never fatal (legacy `_publish` parity: unset topic warns,
 /// a publish failure is error-logged and swallowed).
 async fn publish(sns: &aws_sdk_sns::Client, topic_arn: &str, subject: &str, message: &str) {
     if topic_arn.is_empty() {
@@ -408,13 +408,13 @@ async fn publish(sns: &aws_sdk_sns::Client, topic_arn: &str, subject: &str, mess
 // Entry point
 // ------------------------------------------------------------------------
 
-/// First 8 chars of an optional sha — python parity `(sha or "")[:8]`.
+/// First 8 chars of an optional sha — legacy parity `(sha or "")[:8]`.
 fn short8(sha: Option<&str>) -> String {
     sha.unwrap_or("").chars().take(8).collect()
 }
 
 /// Entry point. Idempotent — safe to run on every 5-minutes-after
-/// schedule. Python `lambda_handler` parity, same result JSON shape.
+/// schedule. Legacy `lambda_handler` parity, same result JSON shape.
 pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     let window = event
         .get("window")
@@ -552,7 +552,7 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
 }
 
 // ------------------------------------------------------------------------
-// Tests — the python test_handler.py suite ported 1:1 (same names). The
+// Tests — the legacy test_handler.py suite ported 1:1 (same names). The
 // decision contract that must never regress: dispatch ONLY when both shas
 // are known AND differ; NEVER dispatch on uncertainty; whitespace-
 // insensitive equality.

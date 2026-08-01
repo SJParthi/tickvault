@@ -1,10 +1,10 @@
 //! Operator portal Lambda — ONE URL to run the whole product (VIEW + CONTROL).
 //!
 //! Rust port (rust-only phase 2b-3, 2026-07-18) of
-//! `deploy/aws/lambda/operator-control/handler.py` — the Python file is the
+//! `deploy/aws/lambda/operator-control/handler.py` — the legacy file is the
 //! ORACLE: every constant, string, parser, gate, and response shape below is
 //! byte-parity with it, and every deliberate deviation is ledger-commented at
-//! the deviating line. The 150 Python unit tests are ported 1:1 in the test
+//! the deviating line. The 150 legacy unit tests are ported 1:1 in the test
 //! module(s) of this file.
 //!
 //! Served via BOTH the Lambda Function URL and the API-GW v2 (payload 2.0)
@@ -34,7 +34,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 // ------------------------------------------------------------------ constants
-// python: handler.py:112 — destructive box actions blocked during market
+// legacy: handler.py:112 — destructive box actions blocked during market
 // hours unless force=true. (wipe-groww removed 2026-07-16 — the groww-only
 // wipe control retired with the live feeds.)
 pub const DESTRUCTIVE: [&str; 7] = [
@@ -47,7 +47,7 @@ pub const DESTRUCTIVE: [&str; 7] = [
     "docker-nuke-bare",
 ];
 
-// python: handler.py:123 — HARD LOCK: the DATA-DESTRUCTIVE subset of
+// legacy: handler.py:123 — HARD LOCK: the DATA-DESTRUCTIVE subset of
 // DESTRUCTIVE — actions that DELETE market data which can NEVER be
 // re-fetched from upstream. During market hours these are REFUSED with 409
 // EVEN WHEN force=true. Lifecycle actions (stop / reboot / restart-app /
@@ -55,35 +55,35 @@ pub const DESTRUCTIVE: [&str; 7] = [
 // possible.
 pub const DATA_DESTRUCTIVE: [&str; 3] = ["wipe-questdb", "docker-reset", "docker-nuke-bare"];
 
-/// python: handler.py:125-129 (`_DATA_DESTRUCTIVE_LOCK_MSG`) — verbatim.
+/// legacy: handler.py:125-129 (`_DATA_DESTRUCTIVE_LOCK_MSG`) — verbatim.
 pub const DATA_DESTRUCTIVE_LOCK_MSG: &str = "Data-destructive actions are locked during market hours \
 (09:15-15:30 IST) — a mid-market wipe destroys data that can never \
 be re-fetched. Run after 15:30.";
 
-/// python: `_MKT_OPEN_SECS = 9 * 3600 + 15 * 60` (09:15 IST, seconds-of-day).
+/// legacy: `_MKT_OPEN_SECS = 9 * 3600 + 15 * 60` (09:15 IST, seconds-of-day).
 pub const MKT_OPEN_SECS: u32 = 9 * 3600 + 15 * 60;
-/// python: `_MKT_CLOSE_SECS = 15 * 3600 + 30 * 60` (15:30 IST, seconds-of-day).
+/// legacy: `_MKT_CLOSE_SECS = 15 * 3600 + 30 * 60` (15:30 IST, seconds-of-day).
 pub const MKT_CLOSE_SECS: u32 = 15 * 3600 + 30 * 60;
-/// python: `_IST_OFFSET_SECS = 19800  # +05:30`.
+/// legacy: `_IST_OFFSET_SECS = 19800  # +05:30`.
 pub const IST_OFFSET_SECS: i64 = 19_800;
 
-/// python: `_SECRET_TTL_SECS = 60.0` — control-secret SSM cache TTL.
+/// legacy: `_SECRET_TTL_SECS = 60.0` — control-secret SSM cache TTL.
 pub const SECRET_TTL_SECS: f64 = 60.0;
-/// python: `_VIEW_TIMEOUT_SECS = 6.0` — SSM RunCommand poll budget (view).
+/// legacy: `_VIEW_TIMEOUT_SECS = 6.0` — SSM RunCommand poll budget (view).
 pub const VIEW_TIMEOUT_SECS: f64 = 6.0;
-/// python: `_VIEW_POLL_SECS = 0.4` — SSM get_command_invocation poll cadence.
+/// legacy: `_VIEW_POLL_SECS = 0.4` — SSM get_command_invocation poll cadence.
 pub const VIEW_POLL_SECS: f64 = 0.4;
-/// python: `_LATENCY_TIMEOUT_SECS = 15.0` — the REST-era latency snapshot is
+/// legacy: `_LATENCY_TIMEOUT_SECS = 15.0` — the REST-era latency snapshot is
 /// one metrics scrape (3s) + one QuestDB round-trip probe (3s) + chronyc +
 /// one bounded rest_fetch_audit aggregate (4s); worst case ≈ 10-11s incl.
 /// SSM registration — per-curl `--max-time` bounds every leg.
 pub const LATENCY_TIMEOUT_SECS: f64 = 15.0;
 
-/// python: `_SQL_ALLOWED_PREFIXES` — read-only SQL gate: the first keyword
+/// legacy: `_SQL_ALLOWED_PREFIXES` — read-only SQL gate: the first keyword
 /// must be one of these.
 pub const SQL_ALLOWED_PREFIXES: [&str; 4] = ["select", "show", "explain", "with"];
 
-/// python: `_SQL_BANNED` — none of these mutating keywords may appear
+/// legacy: `_SQL_BANNED` — none of these mutating keywords may appear
 /// anywhere (whole-word). The tail 12 are QuestDB-specific mutators
 /// (DB-console hardening 2026-07-02) kept banned anywhere as belt-and-braces
 /// on top of the single-statement rule.
@@ -115,11 +115,11 @@ pub const SQL_BANNED: [&str; 25] = [
     "suspend",
 ];
 
-/// python: `_SQL_MAX_ROWS = 1000` — server-side row cap for the read-only
+/// legacy: `_SQL_MAX_ROWS = 1000` — server-side row cap for the read-only
 /// SQL console (both the Data-tab query box and the DB tab share `sql`).
 pub const SQL_MAX_ROWS: i64 = 1000;
 
-/// python: `_QDB_LINK_TTL_SECS = 90` — TTL of the one-click console link
+/// legacy: `_QDB_LINK_TTL_SECS = 90` — TTL of the one-click console link
 /// token minted by the `qdb_console_url` action. The console front Lambda
 /// verifies it (same control secret, HMAC over `"qdblink|<exp>"`) and swaps
 /// it for a 12h session cookie — so the link in a browser history / Telegram
@@ -128,12 +128,12 @@ pub const QDB_LINK_TTL_SECS: i64 = 90;
 
 // ------------------------------------------------------------- pure functions
 
-/// python: `_is_market_hours` (handler.py:193-199) — true during NSE market
+/// legacy: `_is_market_hours` (handler.py:193-199) — true during NSE market
 /// hours (Mon-Fri 09:15-15:30 IST). Fixed UTC+5:30 offset exactly like the
 /// oracle (India has no DST).
 pub fn is_market_hours(now_utc: DateTime<Utc>) -> bool {
     let ist = now_utc + TimeDelta::seconds(IST_OFFSET_SECS);
-    // python weekday(): Monday == 0 .. Sunday == 6; chrono mirror below.
+    // legacy weekday(): Monday == 0 .. Sunday == 6; chrono mirror below.
     if ist.weekday().num_days_from_monday() >= 5 {
         return false;
     }
@@ -141,7 +141,7 @@ pub fn is_market_hours(now_utc: DateTime<Utc>) -> bool {
     (MKT_OPEN_SECS..MKT_CLOSE_SECS).contains(&sod)
 }
 
-/// python: `_http_method` (handler.py:202-206). Fail closed: a malformed
+/// legacy: `_http_method` (handler.py:202-206). Fail closed: a malformed
 /// event is treated as an action ("POST" — hits auth), never a free page
 /// serve.
 pub fn http_method(event: &Value) -> String {
@@ -151,7 +151,7 @@ pub fn http_method(event: &Value) -> String {
     {
         return m.to_uppercase();
     }
-    // Ledger deviation: python `str()`-ifies a NON-STRING value found at
+    // Ledger deviation: legacy `str()`-ifies a NON-STRING value found at
     // requestContext.http.method / httpMethod (e.g. str({}) → "{}"); real
     // fn-URL / API-GW v2 events always carry strings, so we fall through to
     // the same "POST" default instead of JSON-stringifying garbage.
@@ -161,8 +161,8 @@ pub fn http_method(event: &Value) -> String {
     }
 }
 
-/// python: `_authorized` (handler.py:209-216) — constant-time bearer check.
-/// Header keys are lowercased by the Function URL. The Python oracle read
+/// legacy: `_authorized` (handler.py:209-216) — constant-time bearer check.
+/// Header keys are lowercased by the Function URL. The legacy oracle read
 /// the secret via `_control_secret()` inside the fn (monkeypatched in
 /// tests); the Rust core takes it as a parameter and the shell passes the
 /// SSM-cached value.
@@ -177,7 +177,7 @@ pub fn authorized(headers: &Value, secret: &str) -> bool {
     let Some(presented) = auth.strip_prefix("Bearer ") else {
         return false;
     };
-    // python `hmac.compare_digest` — constant-time for equal lengths, early
+    // legacy `hmac.compare_digest` — constant-time for equal lengths, early
     // length check otherwise; aws-lc-rs mirrors that contract.
     verify_slices_are_equal(presented.as_bytes(), secret.as_bytes()).is_ok()
 }
@@ -191,7 +191,7 @@ static SQL_BANNED_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
 static SQL_LIMIT_RE: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"(?i)\blimit\s+(-?\d+)(\s*,\s*-?\d+)?\s*$").ok());
 
-/// First WORD of an already-lowercased query — python
+/// First WORD of an already-lowercased query — legacy
 /// `re.split(r"[^a-z]+", q, maxsplit=1)[0]` (the leading `[a-z]*` run).
 fn first_word(q: &str) -> &str {
     let end = q
@@ -201,7 +201,7 @@ fn first_word(q: &str) -> &str {
     &q[..end]
 }
 
-/// python: `_is_safe_sql` (handler.py:220-253) — read-only gate (hardened
+/// legacy: `_is_safe_sql` (handler.py:220-253) — read-only gate (hardened
 /// 2026-07-02). Rules, all fail-closed:
 /// 1. SINGLE STATEMENT: one trailing ';' is stripped; ANY remaining ';'
 ///    rejects (closes the "select 1; <unlisted mutator>" chaining gap).
@@ -238,7 +238,7 @@ pub fn is_safe_sql(query: &str) -> bool {
     }
 }
 
-/// python: `_cap_sql_rows` (handler.py:256-278) — enforce a server-side row
+/// legacy: `_cap_sql_rows` (handler.py:256-278) — enforce a server-side row
 /// cap on an already-validated read-only query. A trailing `LIMIT n` above
 /// the cap is clamped to the cap; a SELECT/WITH query with no trailing LIMIT
 /// gets `LIMIT <cap>` appended. SHOW/EXPLAIN are left untouched. QuestDB's
@@ -255,7 +255,7 @@ pub fn cap_sql_rows_with(query: &str, cap: i64) -> String {
     {
         let lo = m.get(1).map_or("", |g| g.as_str());
         let hi = m.get(2);
-        // python: `int(lo) > cap` — arbitrary-precision int; a digits-only
+        // legacy: `int(lo) > cap` — arbitrary-precision int; a digits-only
         // string that overflows i64 is necessarily > cap, so a failed parse
         // clamps too (same verdict as the oracle).
         let over = lo.parse::<i64>().map_or(true, |n| n > cap);
@@ -272,21 +272,21 @@ pub fn cap_sql_rows_with(query: &str, cap: i64) -> String {
     q.to_string()
 }
 
-/// python default-arg form: `_cap_sql_rows(query)` with `cap=_SQL_MAX_ROWS`.
+/// legacy default-arg form: `_cap_sql_rows(query)` with `cap=_SQL_MAX_ROWS`.
 pub fn cap_sql_rows(query: &str) -> String {
     cap_sql_rows_with(query, SQL_MAX_ROWS)
 }
 
-/// python: `_mint_qdb_link_token` (handler.py:281-291).
+/// legacy: `_mint_qdb_link_token` (handler.py:281-291).
 ///
-/// hmac token wire contract (byte-exact with the python oracle,
+/// hmac token wire contract (byte-exact with the legacy oracle,
 /// handler.py:281-291, and with the sibling `questdb-console-front` Lambda
 /// which VERIFIES this token constant-time against the SAME SSM control
 /// secret):
 ///   * `exp = now_epoch + ttl` — integer unix seconds, base-10, no padding;
 ///   * message = `"qdblink|<exp>"` (ASCII, pipe separator, decimal exp);
 ///   * sig = HMAC-SHA256(key = UTF-8 secret bytes, message) hex-encoded in
-///     LOWERCASE (python `.hexdigest()`);
+///     LOWERCASE (legacy `.hexdigest()`);
 ///   * token = `"<exp>.<sig>"`.
 ///
 /// One-click console link: dies in `QDB_LINK_TTL_SECS` (90s); the console
@@ -303,7 +303,7 @@ pub fn mint_qdb_link_token(secret: &str, now_epoch: i64, ttl: i64) -> String {
     format!("{exp}.{sig}")
 }
 
-/// python default-arg form: `_mint_qdb_link_token(secret, now_epoch)` with
+/// legacy default-arg form: `_mint_qdb_link_token(secret, now_epoch)` with
 /// `ttl=_QDB_LINK_TTL_SECS`.
 pub fn mint_qdb_link_token_default_ttl(secret: &str, now_epoch: i64) -> String {
     mint_qdb_link_token(secret, now_epoch, QDB_LINK_TTL_SECS)
@@ -311,17 +311,17 @@ pub fn mint_qdb_link_token_default_ttl(secret: &str, now_epoch: i64) -> String {
 
 // -------------------------------------------------------------- more constants
 
-/// python: `_REST_LAT_QUERY_MAX_SECS = 4` (handler.py:441).
+/// legacy: `_REST_LAT_QUERY_MAX_SECS = 4` (handler.py:441).
 pub const REST_LAT_QUERY_MAX_SECS: u64 = 4;
 
-/// python: `_FEED_API_UNREACHABLE` (handler.py:636-638) — verbatim.
+/// legacy: `_FEED_API_UNREACHABLE` (handler.py:636-638) — verbatim.
 pub const FEED_API_UNREACHABLE: &str =
     "app API unreachable on the box (curl to 127.0.0.1:3001 failed — is the app running?)";
 
-/// python: `_BOX_UNREACHABLE` (handler.py:639) — verbatim.
+/// legacy: `_BOX_UNREACHABLE` (handler.py:639) — verbatim.
 pub const BOX_UNREACHABLE: &str = "box unreachable (SSM offline or instance stopped)";
 
-/// python: `_FEEDS_TIMEOUT_SECS = 28.0` (handler.py:685). Budget arithmetic
+/// legacy: `_FEEDS_TIMEOUT_SECS = 28.0` (handler.py:685). Budget arithmetic
 /// (review fix M1, 2026-07-16): the snapshot's curls are `--max-time` bounded
 /// at 8s + 8s (app /api/feeds + /api/feeds/health) + 4s + 4s (the two
 /// rest_fetch_audit reads) = 24s worst case, PLUS SSM registration/poll
@@ -329,24 +329,24 @@ pub const BOX_UNREACHABLE: &str = "box unreachable (SSM offline or instance stop
 /// `FEEDS_VIEW_COMMANDS` (drift-proof test parses them).
 pub const FEEDS_TIMEOUT_SECS: f64 = 28.0;
 
-/// python: `_MAIN_SHA_TTL_SECS = 60.0` (handler.py:875).
+/// legacy: `_MAIN_SHA_TTL_SECS = 60.0` (handler.py:875).
 pub const MAIN_SHA_TTL_SECS: f64 = 60.0;
-/// python: `_MAIN_SHA_MAX_AGE_SECS = 600.0` (handler.py:879) — on sustained
+/// legacy: `_MAIN_SHA_MAX_AGE_SECS = 600.0` (handler.py:879) — on sustained
 /// GitHub failure the cached main-HEAD value must not be served forever; past
 /// this hard max-age a failed refresh degrades to "unknown".
 pub const MAIN_SHA_MAX_AGE_SECS: f64 = 600.0;
 
 /// The single-page operator portal — BYTE-IDENTICAL to the RAW pre-footer
-/// python `_console_html()` template (handler.py:1510+; extracted verbatim
-/// from the running oracle before the python source is deleted in this PR —
+/// legacy `_console_html()` template (handler.py:1510+; extracted verbatim
+/// from the running oracle before the legacy source is deleted in this PR —
 /// sha256 identity is ratcheted in the test module). The provenance footer is
-/// spliced in at serve time by [`html_resp`], mirroring python
+/// spliced in at serve time by [`html_resp`], mirroring legacy
 /// `_html_resp()`'s `html.replace("</body>", footer + "\n</body>", 1)`.
 pub const CONSOLE_HTML: &str = include_str!("operator_control_console.html");
 
-// --------------------------------------------------------- python-parity glue
+// --------------------------------------------------------- legacy-parity glue
 
-/// python `bool(x)` truthiness for JSON values (`bool(payload.get("force",
+/// legacy `bool(x)` truthiness for JSON values (`bool(payload.get("force",
 /// False))`): null/absent → false, numbers → != 0, strings/arrays/objects →
 /// non-empty.
 fn truthy(v: &Value) -> bool {
@@ -360,9 +360,9 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
-/// python `str(payload.get(key, "")).strip()` for the string fields the
+/// legacy `str(payload.get(key, "")).strip()` for the string fields the
 /// router reads (action / confirm / command_id / query). Ledger deviation: a
-/// NON-STRING value (e.g. a JSON number) falls to "" instead of python's
+/// NON-STRING value (e.g. a JSON number) falls to "" instead of the legacy runtime's
 /// `str()`-ification ("5" / "True") — untested edge, every real caller sends
 /// strings.
 fn payload_str<'a>(payload: &'a Value, key: &str) -> &'a str {
@@ -373,7 +373,7 @@ fn payload_str<'a>(payload: &'a Value, key: &str) -> &'a str {
         .trim()
 }
 
-/// python `urllib.parse.quote(s)` with the default `safe='/'`: unreserved
+/// legacy `urllib.parse.quote(s)` with the default `safe='/'`: unreserved
 /// ALPHA / DIGIT / `_.-~` plus `/` pass through; every other byte of the
 /// UTF-8 encoding is `%XX` (uppercase hex) — pinned by the captured
 /// `sql_commands_example` oracle golden.
@@ -393,14 +393,14 @@ fn url_quote(s: &str) -> String {
     out
 }
 
-/// python `round(x, 1)` byte-parity: both operate on the same IEEE double
+/// legacy `round(x, 1)` byte-parity: both operate on the same IEEE double
 /// with round-half-to-even of the true decimal expansion (verified vectors:
 /// 5200.55 → 5200.6, 1450.04 → 1450.0).
 fn round1(x: f64) -> f64 {
     format!("{x:.1}").parse().unwrap_or(x)
 }
 
-/// python `html.escape(s)` (quote=True): `&` first, then `< > " '`.
+/// legacy `html.escape(s)` (quote=True): `&` first, then `< > " '`.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -409,14 +409,14 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-/// Last `n` CHARS of a string — python `s[-1500:]` slicing semantics
+/// Last `n` CHARS of a string — legacy `s[-1500:]` slicing semantics
 /// (char-boundary safe on UTF-8).
 fn last_chars(s: &str, n: usize) -> String {
     let count = s.chars().count();
     s.chars().skip(count.saturating_sub(n)).collect()
 }
 
-/// First `n` CHARS — python `s[:500]` slicing semantics.
+/// First `n` CHARS — legacy `s[:500]` slicing semantics.
 fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
@@ -428,13 +428,13 @@ static FEED_NAME_RE: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9_-]{0,31}$").ok());
 static HEX_SHA_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{7,40}$").ok());
 
-/// python `re.fullmatch(r"[a-z0-9_-]{1,32}", s)` — the feed/leg/outcome
+/// legacy `re.fullmatch(r"[a-z0-9_-]{1,32}", s)` — the feed/leg/outcome
 /// charset gate (defense in depth on our own symbols).
 fn is_token(s: &str) -> bool {
     TOKEN_RE.as_ref().is_some_and(|re| re.is_match(s))
 }
 
-/// python `_num` (handler.py:514-520 / 732-738): ""/null/nan → None, else
+/// legacy `_num` (handler.py:514-520 / 732-738): ""/null/nan → None, else
 /// float-or-None.
 fn parse_num(s: &str) -> Option<f64> {
     if s.is_empty() {
@@ -449,7 +449,7 @@ fn parse_num(s: &str) -> Option<f64> {
 
 // ------------------------------------------------------------------ view snap
 
-/// python: `_parse_feed_counts` (handler.py:357-372) — parse a *_BY_FEED
+/// legacy: `_parse_feed_counts` (handler.py:357-372) — parse a *_BY_FEED
 /// value (';'-joined QuestDB CSV rows like `"dhan",123;"groww",45;`) into
 /// {feed: count_str}. Malformed fragments are skipped; an empty/absent value
 /// yields {} (the UI then shows nothing rather than fabricated zeros).
@@ -469,7 +469,7 @@ pub fn parse_feed_counts(raw: &str) -> Value {
     Value::Object(out)
 }
 
-/// python: `_sum_counts` (handler.py:375-380) — sum the parseable
+/// legacy: `_sum_counts` (handler.py:375-380) — sum the parseable
 /// non-negative integer count strings; "" when NONE parsed (box stopped /
 /// QuestDB down) — the hero then shows nothing rather than a fabricated 0.
 pub fn sum_counts(vals: &[&str]) -> String {
@@ -477,7 +477,7 @@ pub fn sum_counts(vals: &[&str]) -> String {
     let mut any = false;
     for v in vals {
         let t = v.trim();
-        // python `.isdigit()` then arbitrary-precision int(); u128 covers any
+        // legacy `.isdigit()` then arbitrary-precision int(); u128 covers any
         // real count (ledger deviation: a >u128 digit string is skipped).
         if !t.is_empty()
             && t.chars().all(|c| c.is_ascii_digit())
@@ -490,7 +490,7 @@ pub fn sum_counts(vals: &[&str]) -> String {
     if any { sum.to_string() } else { String::new() }
 }
 
-/// python: `_parse_view` (handler.py:383-418) — parse the labeled snapshot
+/// legacy: `_parse_view` (handler.py:383-418) — parse the labeled snapshot
 /// stdout into the structured view dict.
 pub fn parse_view(stdout: &str) -> Value {
     let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -535,7 +535,7 @@ pub fn parse_view(stdout: &str) -> Value {
 
 // --------------------------------------------------------------- latency snap
 
-/// python: `_avg_ns` (handler.py:486-493) — sum/count → average nanoseconds,
+/// legacy: `_avg_ns` (handler.py:486-493) — sum/count → average nanoseconds,
 /// or None if no samples.
 pub fn avg_ns(sum_v: &str, count_v: &str) -> Option<f64> {
     let s: f64 = sum_v.trim().parse().ok()?;
@@ -543,7 +543,7 @@ pub fn avg_ns(sum_v: &str, count_v: &str) -> Option<f64> {
     if c > 0.0 { Some(s / c) } else { None }
 }
 
-/// python: `_parse_rest_lat_row` (handler.py:496-532) — parse one
+/// legacy: `_parse_rest_lat_row` (handler.py:496-532) — parse one
 /// `<feed>,<leg>,<ok_rows>,<p50>,<p99>` CSV line (latency in MILLISECONDS —
 /// close_to_data_ms is stored in ms), or None for anything malformed — a
 /// failed on-box query yields nothing, never a fabricated row.
@@ -564,7 +564,7 @@ pub fn parse_rest_lat_row(raw: &str) -> Option<Value> {
     Some(json!({
         "feed": feed,
         "leg": leg,
-        // python `int(rows)` truncation; `as i64` saturates on the untested
+        // legacy `int(rows)` truncation; `as i64` saturates on the untested
         // inf edge instead of raising.
         "ok_rows": rows as i64,
         "p50_ms": p50.map(round1),
@@ -572,7 +572,7 @@ pub fn parse_rest_lat_row(raw: &str) -> Option<Value> {
     }))
 }
 
-/// python: `sec_to_ms` inside `_parse_latency` (handler.py:567-571) —
+/// legacy: `sec_to_ms` inside `_parse_latency` (handler.py:567-571) —
 /// `f"{float(s) * 1000:.1f}"`, "" on unparseable.
 fn sec_to_ms(s: &str) -> String {
     s.trim()
@@ -581,7 +581,7 @@ fn sec_to_ms(s: &str) -> String {
         .unwrap_or_default()
 }
 
-/// python: `_parse_latency` (handler.py:535-585) — parse the labeled latency
+/// legacy: `_parse_latency` (handler.py:535-585) — parse the labeled latency
 /// snapshot. RESTLAT_ROW lines carry the per-(feed, leg) rest_fetch_audit
 /// aggregate; the METRICS block carries the dormant order-placement
 /// histogram. Empty stdout (box stopped) degrades to an empty table + blank
@@ -638,7 +638,7 @@ pub fn parse_latency(stdout: &str) -> Value {
 
 // --------------------------------------------------------------- storage snap
 
-/// python: `_parse_storage` (handler.py:598-614) — parse df/du output into
+/// legacy: `_parse_storage` (handler.py:598-614) — parse df/du output into
 /// disk_used/free/pct + db_size.
 pub fn parse_storage(stdout: &str) -> Value {
     let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -662,7 +662,7 @@ pub fn parse_storage(stdout: &str) -> Value {
 
 // ----------------------------------------------------------------- feeds card
 
-/// python: `_extract_marked_json` (handler.py:688-699) — extract + parse the
+/// legacy: `_extract_marked_json` (handler.py:688-699) — extract + parse the
 /// JSON between two marker lines. Returns (parsed_or_Null, error_str); never
 /// fabricates a payload.
 pub fn extract_marked_json(stdout: &str, begin: &str, end: &str) -> (Value, String) {
@@ -671,7 +671,7 @@ pub fn extract_marked_json(stdout: &str, begin: &str, end: &str) -> (Value, Stri
         && stdout.contains(end)
         && let Some((_, after)) = stdout.split_once(begin)
     {
-        // python `.split(end, 1)[0]` of a string WITHOUT `end` (marker before
+        // legacy `.split(end, 1)[0]` of a string WITHOUT `end` (marker before
         // begin) returns the whole remainder — mirrored by map_or below.
         raw = after.split_once(end).map_or(after, |(mid, _)| mid).trim();
     }
@@ -684,7 +684,7 @@ pub fn extract_marked_json(stdout: &str, begin: &str, end: &str) -> (Value, Stri
     }
 }
 
-/// python: `_parse_rest_audit` (handler.py:702-723) — parse the REST_AUDIT
+/// legacy: `_parse_rest_audit` (handler.py:702-723) — parse the REST_AUDIT
 /// value (';'-joined `feed,outcome,count` CSV rows) into
 /// {feed: {outcome: count_int}}. Charset-validated; malformed fragments are
 /// skipped so an empty/absent value yields {} — the card then says "no pulls
@@ -721,7 +721,7 @@ pub fn parse_rest_audit(raw: &str) -> Value {
     Value::Object(out)
 }
 
-/// python: `_parse_rest_lat_hour` (handler.py:726-755) — parse the
+/// legacy: `_parse_rest_lat_hour` (handler.py:726-755) — parse the
 /// REST_LAT_HOUR value (';'-joined `feed,p50,p99` CSV rows, milliseconds)
 /// into {feed: {p50_ms, p99_ms}}. Malformed fragments skipped, never
 /// fabricated.
@@ -752,7 +752,7 @@ pub fn parse_rest_lat_hour(raw: &str) -> Value {
     Value::Object(out)
 }
 
-/// python: `_parse_feeds_view` (handler.py:758-798) — parse the marked
+/// legacy: `_parse_feeds_view` (handler.py:758-798) — parse the marked
 /// feeds-view snapshot. On any failure the matching *_error field carries a
 /// structured reason and the payload is Null — the UI renders the error
 /// verbatim instead of defaulting to zeros. The REST-lane pulse rides the
@@ -801,7 +801,7 @@ pub fn parse_feeds_view(stdout: &str) -> Value {
     })
 }
 
-/// python: `_validate_feed_toggle` (handler.py:801-815) — strict validation
+/// legacy: `_validate_feed_toggle` (handler.py:801-815) — strict validation
 /// for the feed-toggle action. Returns "" when valid, else the rejection
 /// reason. The feed name is charset-locked (lowercase token — injection-safe
 /// for the shell/URL interpolation) but NOT allowlisted, so a future feed #3
@@ -821,11 +821,11 @@ pub fn validate_feed_toggle(feed: &Value, enabled: &Value) -> String {
     String::new()
 }
 
-/// python: `_feed_toggle_commands` (handler.py:818-835) — build the SSM curl
+/// legacy: `_feed_toggle_commands` (handler.py:818-835) — build the SSM curl
 /// for POST /api/feeds/{feed}. Only called AFTER [`validate_feed_toggle`]
 /// passed, so `feed` is a charset-locked lowercase token and `enabled` is a
 /// real bool — the interpolations cannot carry shell metacharacters. The
-/// body literal mirrors python `json.dumps({"enabled": enabled})` byte-exact
+/// body literal mirrors legacy `json.dumps({"enabled": enabled})` byte-exact
 /// (`{"enabled": true}` — WITH the space; oracle golden).
 pub fn feed_toggle_commands(feed: &str, enabled: bool) -> Vec<String> {
     let body = format!("{{\"enabled\": {enabled}}}");
@@ -845,7 +845,7 @@ http://127.0.0.1:3001/api/feeds/{feed} 2>/dev/null)\""
     ]
 }
 
-/// python: `_parse_feed_toggle` (handler.py:838-861) — parse the toggle
+/// legacy: `_parse_feed_toggle` (handler.py:838-861) — parse the toggle
 /// result: the app's HTTP status + its JSON body passed through VERBATIM
 /// (incl. the 409 Dhan-guard message). curl prints 000 when it could not
 /// connect — reported as unreachable, never success.
@@ -889,7 +889,7 @@ pub fn parse_feed_toggle(stdout: &str) -> Value {
 
 // --------------------------------------------------------- deploy provenance
 
-/// python: `_safe_provenance_sha` (handler.py:935-945) — hex-validate one
+/// legacy: `_safe_provenance_sha` (handler.py:935-945) — hex-validate one
 /// provenance sha (7-40 lowercase hex, else "unknown"), so a poisoned SSM
 /// param / GitHub response can never smuggle markup into the footer.
 pub fn safe_provenance_sha(sha: &Value) -> String {
@@ -899,7 +899,7 @@ pub fn safe_provenance_sha(sha: &Value) -> String {
     }
 }
 
-/// python: `_provenance_line` (handler.py:948-954) — pure formatter: short-7
+/// legacy: `_provenance_line` (handler.py:948-954) — pure formatter: short-7
 /// provenance triple; every input hex-validated first.
 pub fn provenance_line(binary_sha: &str, portal_sha: &str, main_sha: &str) -> String {
     let b = safe_provenance_sha(&Value::String(binary_sha.to_string()));
@@ -914,7 +914,7 @@ pub fn provenance_line(binary_sha: &str, portal_sha: &str, main_sha: &str) -> St
     )
 }
 
-/// python: `_provenance_footer_html` (handler.py:957-966) — defense in
+/// legacy: `_provenance_footer_html` (handler.py:957-966) — defense in
 /// depth: the line is already hex-validated per sha, and the assembled
 /// string is ALSO html-escaped before splicing into the page.
 pub fn provenance_footer_html(binary_sha: &str, portal_sha: &str, main_sha: &str) -> String {
@@ -925,13 +925,13 @@ color:var(--mut);opacity:.75\">{line}</footer>"
     )
 }
 
-/// Pure half of the python `_main_sha` cache policy (handler.py:898-932):
+/// Pure half of the legacy `_main_sha` cache policy (handler.py:898-932):
 /// is the cached value fresh enough to skip the GitHub fetch entirely?
 pub fn main_sha_cache_fresh(cached: &str, age_secs: f64) -> bool {
     !cached.is_empty() && age_secs <= MAIN_SHA_TTL_SECS
 }
 
-/// Pure half of the python `_main_sha` failure arm (handler.py:927-932): on
+/// Pure half of the legacy `_main_sha` failure arm (handler.py:927-932): on
 /// a FAILED refresh, serve the cached value only while it is younger than
 /// the 600s hard max-age; a sustained GitHub outage degrades to "unknown"
 /// instead of an unboundedly stale sha.
@@ -945,11 +945,11 @@ pub fn resolve_main_sha_after_failed_fetch(cached: &str, age_secs: f64) -> Strin
 
 // --------------------------------------------------------------------- responses
 
-/// python: `_resp` (handler.py:970-971). Ledger deviation: python
+/// legacy: `_resp` (handler.py:970-971). Ledger deviation: legacy
 /// `json.dumps` emits `", "` / `": "` separators in insertion order; serde
 /// emits compact separators in sorted key order — semantically identical
 /// JSON (every consumer `JSON.parse`s / `json.loads`es the body; the ported
-/// tests compare PARSED values, exactly like the python tests).
+/// tests compare PARSED values, exactly like the legacy tests).
 pub fn resp(status: u16, body: &Value) -> Value {
     json!({
         "statusCode": status,
@@ -958,9 +958,9 @@ pub fn resp(status: u16, body: &Value) -> Value {
     })
 }
 
-/// python: `_html_resp` (handler.py:974-991) — B9 deploy provenance: inject
+/// legacy: `_html_resp` (handler.py:974-991) — B9 deploy provenance: inject
 /// the footer just before `</body>` so the giant static console template
-/// stays untouched. (The python try/except fail-soft around the replace is
+/// stays untouched. (The legacy try/except fail-soft around the replace is
 /// structurally unnecessary here — the Rust footer render is pure and
 /// infallible.)
 pub fn html_resp(footer_html: &str) -> Value {
@@ -978,63 +978,63 @@ pub fn html_resp(footer_html: &str) -> Value {
 
 // ------------------------------------------------------------------ the shell
 
-/// Side-effect surface of the router — the python oracle's monkeypatch seams
+/// Side-effect surface of the router — the legacy oracle's monkeypatch seams
 /// (`_control_secret` / `_is_market_hours` / `_ssm_shell` / `_ssm_shell_sync`
 /// / `_client(...)` / env reads) as ONE trait, so [`route`] is a pure
 /// function of (event, shell). Tests implement a MockShell mirroring the
-/// python monkeypatching; production uses [`AwsShell`].
+/// legacy monkeypatching; production uses [`AwsShell`].
 // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 #[allow(async_fn_in_trait)]
 pub trait OpsShell {
-    /// python `_control_secret()` — SSM SecureString, 60s-cached.
+    /// legacy `_control_secret()` — SSM SecureString, 60s-cached.
     async fn control_secret(&self) -> String;
-    /// python `_is_market_hours(datetime.datetime.utcnow())`.
+    /// legacy `_is_market_hours(datetime.datetime.utcnow())`.
     fn market_hours_now(&self) -> bool;
-    /// python `int(time.time())`.
+    /// legacy `int(time.time())`.
     fn now_epoch(&self) -> i64;
-    /// python `os.environ.get(key, "")`.
+    /// legacy `os.environ.get(key, "")`.
     fn env(&self, key: &str) -> String;
-    /// python `_client("ec2").start_instances(...)`.
+    /// legacy `_client("ec2").start_instances(...)`.
     async fn ec2_start(&self) -> Result<(), String>;
-    /// python `_client("ec2").stop_instances(...)`.
+    /// legacy `_client("ec2").stop_instances(...)`.
     async fn ec2_stop(&self) -> Result<(), String>;
-    /// python `_client("ec2").reboot_instances(...)`.
+    /// legacy `_client("ec2").reboot_instances(...)`.
     async fn ec2_reboot(&self) -> Result<(), String>;
-    /// python `describe_instances(...)["Reservations"][0]["Instances"][0]["State"]["Name"]`.
+    /// legacy `describe_instances(...)["Reservations"][0]["Instances"][0]["State"]["Name"]`.
     async fn instance_state(&self) -> Result<String, String>;
-    /// python `_ssm_shell(commands)` → CommandId (Err → the 500 arm).
+    /// legacy `_ssm_shell(commands)` → CommandId (Err → the 500 arm).
     async fn ssm_shell(&self, commands: &[String]) -> Result<String, String>;
-    /// python `_ssm_shell_sync(commands, timeout)` → stdout+stderr, "" on
+    /// legacy `_ssm_shell_sync(commands, timeout)` → stdout+stderr, "" on
     /// any failure (box stopped / SSM offline) — callers degrade to an empty
     /// snapshot, never a 500.
     async fn ssm_shell_sync(&self, commands: &[String], timeout_secs: f64) -> String;
-    /// python `get_command_invocation(...)` → (Status, StdOut, StdErr);
+    /// legacy `get_command_invocation(...)` → (Status, StdOut, StdErr);
     /// Err → the Pending 200 arm (not registered yet / box offline).
     async fn command_invocation(
         &self,
         command_id: &str,
     ) -> Result<(String, String, String), String>;
-    /// python `describe_alarms(StateValue="ALARM", MaxRecords=20)` → alarm
+    /// legacy `describe_alarms(StateValue="ALARM", MaxRecords=20)` → alarm
     /// names; None on failure (fail-soft — the UI shows null).
     async fn firing_alarms(&self) -> Option<Vec<String>>;
-    /// python `_month_to_date_cost()` — "" on any failure.
+    /// legacy `_month_to_date_cost()` — "" on any failure.
     async fn month_to_date_cost(&self) -> String;
-    /// python `_binary_sha()` — fail-soft to "unknown".
+    /// legacy `_binary_sha()` — fail-soft to "unknown".
     async fn binary_sha(&self) -> String;
-    /// python `_portal_sha()` — env PORTAL_GIT_SHA or "unknown".
+    /// legacy `_portal_sha()` — env PORTAL_GIT_SHA or "unknown".
     fn portal_sha(&self) -> String;
-    /// python `_main_sha()` — GitHub main HEAD, 60s cache / 600s max-age,
+    /// legacy `_main_sha()` — GitHub main HEAD, 60s cache / 600s max-age,
     /// fail-soft to "unknown".
     async fn main_sha(&self) -> String;
 }
 
-/// python 500 arm: `except Exception: _resp(500, {"error": "action failed",
+/// legacy 500 arm: `except Exception: _resp(500, {"error": "action failed",
 /// "action": action})`.
 fn action_failed(action: &str) -> Value {
     resp(500, &json!({"error": "action failed", "action": action}))
 }
 
-/// Merge `extra`'s object fields into `base` (python `{**a, **b}` splat).
+/// Merge `extra`'s object fields into `base` (legacy `{**a, **b}` splat).
 fn merged(base: Value, extra: &Value) -> Value {
     let mut m = base.as_object().cloned().unwrap_or_default();
     if let Some(e) = extra.as_object() {
@@ -1045,10 +1045,10 @@ fn merged(base: Value, extra: &Value) -> Value {
     Value::Object(m)
 }
 
-/// python: `lambda_handler` (handler.py:994-1489) — the full router, ported
+/// legacy: `lambda_handler` (handler.py:994-1489) — the full router, ported
 /// branch-for-branch (same gate order, same response bodies, same status
 /// codes). Generic over the shell so the ported routing tests drive it with
-/// a mock exactly like the python tests monkeypatched the module globals.
+/// a mock exactly like the legacy tests monkeypatched the module globals.
 pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
     if http_method(event) == "GET" {
         let footer = provenance_footer_html(
@@ -1065,9 +1065,9 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         return resp(401, &json!({"error": "unauthorized"}));
     }
 
-    // python: `raw = event.get("body") or "{}"`; dict passthrough, else
+    // legacy: `raw = event.get("body") or "{}"`; dict passthrough, else
     // json.loads (fail → 400). Ledger deviation: a parsed NON-OBJECT payload
-    // (e.g. `[1]`) is treated as {} — python would AttributeError → 502
+    // (e.g. `[1]`) is treated as {} — the legacy runtime would AttributeError → 502
     // (untested edge, no real caller sends one).
     let payload: Value = match event.get("body") {
         Some(Value::Object(o)) => Value::Object(o.clone()),
@@ -1272,7 +1272,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                 .collect();
             match shell.ssm_shell(&cmds).await {
                 Ok(cid) => {
-                    // Audit line → CloudWatch (python `print` → tracing; the
+                    // Audit line → CloudWatch (legacy `print` → tracing; the
                     // charter bans print macros; same log-group destination).
                     tracing::info!(
                         command_id = cid,
@@ -1512,7 +1512,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
 
 /// Production [`OpsShell`] backed by the real AWS SDKs — UNPROVEN until
 /// deploy (exercised only in a live Lambda invoke; the pure router/parsers
-/// it feeds are what the unit tests cover, exactly like the python oracle's
+/// it feeds are what the unit tests cover, exactly like the legacy oracle's
 /// boto3 glue).
 pub struct AwsShell {
     ec2: aws_sdk_ec2::Client,
@@ -1528,9 +1528,9 @@ pub struct AwsShell {
     binary_sha_param: String,
     gh_repo: String,
     gh_token_param: String,
-    /// python `_cache` — 60s-TTL SSM param cache.
+    /// legacy `_cache` — 60s-TTL SSM param cache.
     param_cache: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
-    /// python `_main_sha_cache` — (value, fetched_at).
+    /// legacy `_main_sha_cache` — (value, fetched_at).
     main_sha_cache: std::sync::Mutex<(String, Option<std::time::Instant>)>,
 }
 
@@ -1540,12 +1540,12 @@ fn lock_unpoisoned<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl AwsShell {
     /// Build the live shell from the Lambda execution-role environment —
-    /// python module-init parity (`INSTANCE_ID` / `_SECRET_PARAM` /
+    /// legacy module-init parity (`INSTANCE_ID` / `_SECRET_PARAM` /
     /// provenance env vars).
     pub async fn new() -> Self {
         let config = crate::clients::sdk_config().await;
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3)) // APPROVED: python parity — urllib timeout=3 on the provenance GitHub read.
+            .timeout(std::time::Duration::from_secs(3)) // APPROVED: legacy parity — urllib timeout=3 on the provenance GitHub read.
             .build()
             .map_err(|err| {
                 // HTTP-CLIENT-01 class: never a panic-class Client::new()
@@ -1570,7 +1570,7 @@ impl AwsShell {
         }
     }
 
-    /// python `_load_param` — "" on any failure (missing ⇒ deny / disable,
+    /// legacy `_load_param` — "" on any failure (missing ⇒ deny / disable,
     /// fail closed).
     async fn load_param(&self, param: &str) -> String {
         if param.is_empty() {
@@ -1589,7 +1589,7 @@ impl AwsShell {
         }
     }
 
-    /// python `_cached_param` — refetch when absent, empty, or older than
+    /// legacy `_cached_param` — refetch when absent, empty, or older than
     /// `SECRET_TTL_SECS`.
     async fn cached_param(&self, param: &str) -> String {
         {
@@ -1609,11 +1609,11 @@ impl AwsShell {
         value
     }
 
-    /// One bounded GitHub main-HEAD read (python `_main_sha` fetch leg).
+    /// One bounded GitHub main-HEAD read (legacy `_main_sha` fetch leg).
     async fn fetch_main_sha(&self) -> Option<String> {
         let http = self.http.as_ref()?;
         let url = format!(
-            "https://api.github.com/repos/{}/commits/main", // APPROVED: fixed infrastructure host — python parity (handler.py:911), token-free URL.
+            "https://api.github.com/repos/{}/commits/main", // APPROVED: fixed infrastructure host — legacy parity (handler.py:911), token-free URL.
             self.gh_repo
         );
         let mut req = http
@@ -1689,7 +1689,7 @@ impl OpsShell for AwsShell {
             .send()
             .await
             .map_err(|e| format!("{e:?}"))?;
-        // python `["Reservations"][0]["Instances"][0]["State"]["Name"]` —
+        // legacy `["Reservations"][0]["Instances"][0]["State"]["Name"]` —
         // a missing element raised (→ 500); Err mirrors that.
         out.reservations()
             .first()
@@ -1717,7 +1717,7 @@ impl OpsShell for AwsShell {
     }
 
     async fn ssm_shell_sync(&self, commands: &[String], timeout_secs: f64) -> String {
-        // python `_ssm_shell_sync` (handler.py:301-321): "" on any failure —
+        // legacy `_ssm_shell_sync` (handler.py:301-321): "" on any failure —
         // callers degrade to an empty snapshot, never a 500.
         let cid = match self.ssm_shell(commands).await {
             Ok(cid) => cid,
@@ -1792,8 +1792,8 @@ impl OpsShell for AwsShell {
     }
 
     async fn month_to_date_cost(&self) -> String {
-        // python `_month_to_date_cost` (handler.py:1492-1507) — "" on any
-        // failure. Lambda env clock is UTC (python date.today() parity).
+        // legacy `_month_to_date_cost` (handler.py:1492-1507) — "" on any
+        // failure. Lambda env clock is UTC (legacy date.today() parity).
         let today = Utc::now().date_naive();
         let Some(first) = today.with_day(1) else {
             return String::new();
@@ -1924,7 +1924,7 @@ mod tests {
     }
 
     // ---------------------------------------------------- class Authorization
-    // python monkeypatched `handler._control_secret`; the Rust core takes the
+    // legacy monkeypatched `handler._control_secret`; the Rust core takes the
     // secret as a parameter, so the fixture secret is passed directly.
     const AUTH_SECRET: &str = "s3cret-token"; // test fixture, not a credential
 
@@ -2011,9 +2011,9 @@ mod tests {
 
     #[test]
     fn test_console_shared_corpus_pins() {
-        // Cross-language freeze with the console lambdas' Python suites
+        // Cross-language freeze with the console lambdas' legacy suites
         // (deploy/aws/lambda/questdb-console-{front,proxy}/test_handler.py):
-        // with the Python operator-control oracle retired, those suites pin
+        // with the legacy operator-control oracle retired, those suites pin
         // FROZEN verdicts on a shared corpus — this test pins the same three
         // entries the pre-port oracle comparison covered but the inline
         // SafeSql tests did not.
@@ -2111,7 +2111,7 @@ mod tests {
     }
 
     // Rust-side parity extras for the row cap's QuestDB range/negative forms
-    // (pinned by the python docstring; exercised here so the port cannot
+    // (pinned by the legacy docstring; exercised here so the port cannot
     // silently diverge on them).
     #[test]
     fn parity_range_and_negative_limits_left_as_is() {
@@ -2123,7 +2123,7 @@ mod tests {
             cap_sql_rows("select * from t limit -5"),
             "select * from t limit -5"
         );
-        // i64-overflowing positive limit still clamps (python bigint parity).
+        // i64-overflowing positive limit still clamps (legacy bigint parity).
         assert_eq!(
             cap_sql_rows("select * from t limit 99999999999999999999999"),
             "select * from t LIMIT 1000"
@@ -2139,8 +2139,8 @@ mod tests {
     }
 
     #[test]
-    fn mint_qdb_link_token_matches_python_hexdigest_vector() {
-        // Byte-exact oracle vector: python
+    fn mint_qdb_link_token_matches_legacy_hexdigest_vector() {
+        // Byte-exact oracle vector: legacy
         //   hmac.new(b"s3cret-token", b"qdblink|1780000090", sha256).hexdigest()
         // == "643a1010a7594e457633d6a2ba7f0e31dd84efbb8b0bf4191a1b5bed07caa163".
         let tok = mint_qdb_link_token(AUTH_SECRET, 1_780_000_000, QDB_LINK_TTL_SECS);
@@ -2155,9 +2155,9 @@ mod tests {
     }
 
     // =====================================================================
-    // Full 1:1 port of the remaining python test classes
+    // Full 1:1 port of the remaining legacy test classes
     // (deploy/aws/lambda/operator-control/test_handler.py). Test NAMES match
-    // the python names byte-for-byte so the parity check is mechanical.
+    // the legacy names byte-for-byte so the parity check is mechanical.
     // =====================================================================
 
     use crate::operator_control_action_commands::{
@@ -2168,10 +2168,10 @@ mod tests {
     };
 
     // ------------------------------------------------------------ MockShell
-    // The python tests monkeypatched module globals (`_control_secret`,
+    // The legacy tests monkeypatched module globals (`_control_secret`,
     // `_is_market_hours`, `_ssm_shell`, `_ssm_shell_sync`, `_client`); the
     // Rust router is generic over [`OpsShell`], so ONE mock mirrors every
-    // seam. Defaults mirror the python fixtures: secret "s3cret-token",
+    // seam. Defaults mirror the legacy fixtures: secret "s3cret-token",
     // market CLOSED (WipeGate pins the clock off-hours), instance running.
     struct MockShell {
         secret: String,
@@ -2179,7 +2179,7 @@ mod tests {
         now: i64,
         env: std::collections::HashMap<String, String>,
         ssm_result: Result<String, String>,
-        /// `Some(msg)` = the python `self.fail("SSM must not be called…")`
+        /// `Some(msg)` = the legacy `self.fail("SSM must not be called…")`
         /// stub — any ssm_shell call panics the test.
         forbid_ssm: Option<&'static str>,
         sync_output: String,
@@ -2290,7 +2290,7 @@ mod tests {
         }
         fn portal_sha(&self) -> String {
             // Same 3-line resolution as AwsShell::portal_sha, fed from the
-            // mock env map (python manipulated process env; edition-2024
+            // mock env map (the legacy runtime manipulated process env; edition-2024
             // `std::env::set_var` is unsafe + racy under parallel tests).
             let v = self.env("PORTAL_GIT_SHA");
             let t = v.trim();
@@ -2346,9 +2346,9 @@ mod tests {
 
     // ----------------------------------------- CONSOLE_HTML identity ratchet
     #[test]
-    fn console_html_is_byte_identical_to_python_pre_footer_template() {
-        // Golden sha256 of the RAW pre-footer python `_console_html()`
-        // template, captured by RUNNING the oracle before the python source
+    fn console_html_is_byte_identical_to_legacy_pre_footer_template() {
+        // Golden sha256 of the RAW pre-footer legacy `_console_html()`
+        // template, captured by RUNNING the oracle before the legacy source
         // was deleted in this PR (`sha256(handler._console_html())`). The
         // footer is injected at request time via `replacen("</body>", …)` in
         // BOTH implementations, so the stored template must be byte-equal.
@@ -2807,7 +2807,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------- class WipeGate
-    // python setUp pinned the clock OFF-hours (MockShell default) — since the
+    // legacy setUp pinned the clock OFF-hours (MockShell default) — since the
     // audit-fix-#2 hard lock, a forced data-destructive action is 409'd
     // in-window regardless of force, so these dispatch tests must be
     // deterministic at any wall-clock time.
@@ -2891,11 +2891,11 @@ mod tests {
         // PR-5 H-2 (hostile F5): the resurrection race — an external
         // `systemctl start` between TRUNCATE and the replay-source rm let the
         // booting bridge re-tail the capture file. Two pinned layers:
-        //  (a) replay sources are removed BEFORE the TRUNCATE python block;
+        //  (a) replay sources are removed BEFORE the TRUNCATE legacy block;
         //  (b) the unit is DISABLED for the wipe window and re-enabled before
         //      the final start;
         //  (c) prev_day_ohlcv is in the dynamic truncate targets.
-        // (python scanned handler source; the Rust command list is the
+        // (the legacy runtime scanned handler source; the Rust command list is the
         // oracle-captured WIPE_QUESTDB_COMMANDS golden — same ordering.)
         let joined = WIPE_QUESTDB_COMMANDS.join("\n");
         let rm_pos = joined.find("feed capture/replay sources removed").unwrap();
@@ -3563,7 +3563,7 @@ data-pull phase, so the system is never blinded mid-trade";
     // from the retired ticks 5-column key.
     #[test]
     fn test_view_comment_names_the_four_real_key_columns() {
-        // python scanned handler.py; the Rust twin lives in the commands
+        // the legacy runtime scanned handler.py; the Rust twin lives in the commands
         // module's doc comment (the %3D rationale block).
         let src = include_str!("operator_control_commands.rs");
         assert!(src.contains("(ts, security_id, exchange_segment, feed)"));
@@ -3843,7 +3843,7 @@ data-pull phase, so the system is never blinded mid-trade";
     const ACTIONS_SRC: &str = include_str!("operator_control_action_commands.rs");
 
     /// Everything above the test module — the scan surface for banned
-    /// identifiers, mirroring python's `hasattr(handler, …)` + source scan
+    /// identifiers, mirroring the legacy runtime's `hasattr(handler, …)` + source scan
     /// (this test module itself legitimately carries the needles).
     fn production_region(src: &str) -> &str {
         src.split("#[cfg(test)]").next().unwrap_or(src)
@@ -3872,7 +3872,7 @@ data-pull phase, so the system is never blinded mid-trade";
 
     #[test]
     fn test_backend_helpers_gone() {
-        // python asserted the module lacks the retired attributes; the Rust
+        // the legacy runtime asserted the module lacks the retired attributes; the Rust
         // twin scans the production regions of all three port modules.
         let prod = format!(
             "{}\n{}\n{}",
@@ -4178,7 +4178,7 @@ data-pull phase, so the system is never blinded mid-trade";
         let tok = url.split_once("tok=").unwrap().1.to_string();
         let (exp_s, sig) = tok.split_once('.').unwrap();
         // The mock pins now = 1_780_000_000 → exp is exactly now + the 90s
-        // TTL, and the signature equals the python-oracle HMAC vector
+        // TTL, and the signature equals the legacy-oracle HMAC vector
         // (`hmac.new(b"s3cret-token", b"qdblink|1780000090", sha256)`).
         assert_eq!(
             exp_s.parse::<i64>().unwrap(),
@@ -4264,7 +4264,7 @@ data-pull phase, so the system is never blinded mid-trade";
     fn test_provenance_footer_html_escapes_line() {
         // Defense in depth: even if the formatter ever regressed, the footer
         // html-escapes the assembled line. Every sha in this fixture is
-        // "unknown" (the python test env had no AWS/GitHub) — no angle
+        // "unknown" (the legacy test env had no AWS/GitHub) — no angle
         // brackets may appear inside the rendered line.
         let footer = provenance_footer_html("unknown", "unknown", "unknown");
         assert!(footer.contains("<footer"));
@@ -4276,7 +4276,7 @@ data-pull phase, so the system is never blinded mid-trade";
 
     #[test]
     fn test_portal_sha_defaults_to_unknown() {
-        // python manipulated process env around handler._portal_sha(); the
+        // the legacy runtime manipulated process env around handler._portal_sha(); the
         // Rust shell seam reads env through OpsShell, so the mock env map
         // drives the SAME trim/empty→unknown resolution hermetically
         // (edition-2024 `std::env::set_var` is unsafe + racy in parallel
@@ -4301,7 +4301,7 @@ data-pull phase, so the system is never blinded mid-trade";
         // 2026-07-03 hardening: on sustained GitHub failure the cached main
         // sha is served only up to the 600s hard max-age; beyond that a
         // failed refresh returns "unknown" instead of the stale value.
-        // (python patched urlopen + the cache dict; the Rust cache policy is
+        // (the legacy runtime patched urlopen + the cache dict; the Rust cache policy is
         // the pure pair main_sha_cache_fresh/resolve_main_sha_after_failed_fetch
         // that AwsShell::main_sha drives.)
         let sha = "abc1234def567890abc1234def567890abc12345";

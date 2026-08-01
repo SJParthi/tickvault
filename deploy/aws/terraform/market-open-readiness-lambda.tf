@@ -80,9 +80,9 @@ resource "aws_iam_role_policy" "market_open_readiness" {
 # ---------------------------------------------------------------------------
 # Lambda source — Rust bin (rust-only phase 2b-2 wave 1, 2026-07-18).
 #
-# The Python handler (deploy/aws/lambda/market-open-readiness/handler.py)
+# The legacy handler (deploy/aws/lambda/market-open-readiness/handler.py)
 # was PORTED to Rust — crates/aws-lambdas/src/market_open_readiness.rs
-# (lib logic; every python test ported to Rust unit tests) +
+# (lib logic; every legacy test ported to Rust unit tests) +
 # src/bin/market_open_readiness.rs (thin bootstrap bin). Behavior parity:
 # same classify_readiness verdicts (ready/holiday-silent, not-running /
 # not-booted / verify-failed pages, drill page), same 08:25 IST holiday

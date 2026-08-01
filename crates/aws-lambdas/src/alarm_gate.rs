@@ -1,5 +1,5 @@
 //! Boot-heartbeat window gate — Rust port of the `boot-heartbeat-alarm.tf`
-//! inline Python heredoc (`tv-${env}-boot-heartbeat-gate`, phase 2b-1).
+//! inline legacy heredoc (`tv-${env}-boot-heartbeat-gate`, phase 2b-1).
 //!
 //! mode="open"  (08:50 IST) → enable the alarm's actions for the boot window
 //!                            and reset it to OK so a stale ALARM from a
@@ -16,7 +16,7 @@ use tracing::info;
 /// The exact SetAlarmState reason the heredoc used.
 pub const BOOT_OPEN_STATE_REASON: &str = "boot-heartbeat window opened (08:50 IST)";
 
-/// The gate mode — Python parity: `(event or {}).get('mode', 'close')`,
+/// The gate mode — legacy parity: `(event or {}).get('mode', 'close')`,
 /// then `if mode == 'open'` — ANY other value (missing, null, garbage)
 /// behaves as close (the fail-safe direction: actions disabled).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,7 @@ impl GateMode {
     }
 
     /// The literal echoed back in the result JSON. Parity nuance: the
-    /// Python echoed the RAW mode string (so `{"mode":"garbage"}` came
+    /// The legacy runtime echoed the RAW mode string (so `{"mode":"garbage"}` came
     /// back verbatim while acting as close). We echo the EFFECTIVE mode —
     /// a deliberate, documented deviation (the result value is only read
     /// by humans in CloudWatch logs; the acted-on behavior is identical).
@@ -46,7 +46,7 @@ impl GateMode {
     }
 }
 
-/// Result JSON — Python parity: `{'mode': mode, 'enabled': bool}`.
+/// Result JSON — legacy parity: `{'mode': mode, 'enabled': bool}`.
 pub fn gate_result(mode: GateMode, enabled: bool) -> Value {
     json!({"mode": mode.as_str(), "enabled": enabled})
 }
@@ -111,13 +111,13 @@ mod tests {
 
     #[test]
     fn test_missing_or_garbage_mode_defaults_to_close() {
-        // Python: `(event or {}).get('mode', 'close')` + `== 'open'` gate.
+        // legacy: `(event or {}).get('mode', 'close')` + `== 'open'` gate.
         assert_eq!(GateMode::from_event(&json!({})), GateMode::Close);
         assert_eq!(GateMode::from_event(&json!(null)), GateMode::Close);
         assert_eq!(
             GateMode::from_event(&json!({"mode": "OPEN"})),
             GateMode::Close,
-            "mode compare is case-sensitive, like the Python == 'open'"
+            "mode compare is case-sensitive, like the legacy == 'open'"
         );
         assert_eq!(
             GateMode::from_event(&json!({"mode": 42})),
@@ -127,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gate_result_shapes_match_python() {
+    fn test_gate_result_shapes_match_legacy() {
         assert_eq!(
             gate_result(GateMode::Open, true),
             json!({"mode": "open", "enabled": true})
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_state_reason_is_python_literal() {
+    fn test_open_state_reason_is_legacy_literal() {
         assert_eq!(
             BOOT_OPEN_STATE_REASON,
             "boot-heartbeat window opened (08:50 IST)"

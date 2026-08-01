@@ -934,7 +934,7 @@ fn test_start_watchdog_lambda_monitors_the_morning_start() {
     // pages if the box did not come up. Runs IN AWS (not on a GitHub runner),
     // so it alerts even if GitHub Actions is down — the gap that hid the
     // 2026-06-02 silent start failure.
-    // Rust-only phase 2b-2 wave 2 (2026-07-18): the python handler.py was
+    // Rust-only phase 2b-2 wave 2 (2026-07-18): the legacy handler.py was
     // ported to crates/aws-lambdas (lib start_watchdog.rs + thin bin) and
     // deleted with the terraform runtime swap to provided.al2023/bootstrap.
     require_file_exists(
@@ -967,7 +967,7 @@ fn test_start_watchdog_lambda_monitors_the_morning_start() {
         tf.contains("ec2:DescribeInstances") && tf.contains("aws_sns_topic.tv_alerts.arn"),
         "watchdog Lambda must describe EC2 + publish to tv_alerts"
     );
-    // The Rust runtime swap must be complete (no python remnant).
+    // The Rust runtime swap must be complete (no legacy remnant).
     assert!(
         tf.contains("runtime          = \"provided.al2023\"")
             && tf.contains("handler          = \"bootstrap\""),
@@ -996,7 +996,7 @@ fn test_deploy_watchdog_lambda_is_wired() {
         "Deploy-watchdog Lambda terraform (EventBridge + IAM + function)",
     );
     // Rust-only phase 2b-2 wave 1 (2026-07-18): the handler is the Rust
-    // module (the python handler.py was ported 1:1 and deleted).
+    // module (the legacy handler.py was ported 1:1 and deleted).
     require_file_exists(
         "crates/aws-lambdas/src/deploy_watchdog.rs",
         "Deploy-watchdog Lambda handler (Rust module)",

@@ -9,7 +9,7 @@
 # ---- DHAT profiler output (per-test artifact) ----
 **/dhat-heap.json
 
-# ---- Python (MCP server bytecode cache) ----
+# ---- Legacy runtime (MCP server bytecode cache) ----
 __pycache__/
 *.pyc
 
@@ -121,7 +121,7 @@ target/llvm-cov-target/
 .claude/worktrees/
 target2/
 
-# rust-only phase 2c cutover: the python MCP server is DELETED from git;
+# rust-only phase 2c cutover: the legacy MCP server is DELETED from git;
 # the parity harness (crates/tickvault-logs-mcp/tests/parity.rs)
 # re-materializes it here at runtime from the pinned git-history commit.
 # Runtime artifact only — must never be re-committed.

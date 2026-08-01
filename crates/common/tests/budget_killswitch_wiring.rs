@@ -29,10 +29,10 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())) // APPROVED: test
 }
 
-// 2026-07-18 (rust-only phase 2b-1): the Python handler.py/test_handler.py
+// 2026-07-18 (rust-only phase 2b-1): the legacy handler.py/test_handler.py
 // were PORTED to crates/aws-lambdas (lib module budget_killswitch + the
 // budget-killswitch [[bin]], built via cargo-lambda as a provided.al2023
-// bootstrap zip). The three source-shape pins below repoint from the Python
+// bootstrap zip). The three source-shape pins below repoint from the legacy
 // files to the Rust port — same Z+ L7 invariant: the kill-switch source must
 // exist, must expose the Lambda entry point, and must carry runnable tests.
 
@@ -70,8 +70,8 @@ fn test_killswitch_handler_entry_point_is_wired() {
 }
 
 #[test]
-fn test_killswitch_port_keeps_the_python_test_parity_suite() {
-    // The 11 Python unit tests were ported 1:1 (plus Rust-side additions).
+fn test_killswitch_port_keeps_the_legacy_test_parity_suite() {
+    // The 11 legacy unit tests were ported 1:1 (plus Rust-side additions).
     // Spot-pin the three safety-critical ones so a future refactor cannot
     // silently drop the parity suite (`cargo test -p tickvault-aws-lambdas`
     // runs them in the Test (aws-lambdas) CI matrix lane).
@@ -85,7 +85,7 @@ fn test_killswitch_port_keeps_the_python_test_parity_suite() {
         assert!(
             lib.contains(pin),
             "Z+ L7 COOLDOWN ratchet: budget_killswitch.rs lost `{pin}` — \
-             the ported Python parity suite is no longer intact."
+             the ported legacy parity suite is no longer intact."
         );
     }
 }

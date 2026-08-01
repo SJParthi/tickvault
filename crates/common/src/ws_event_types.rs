@@ -35,7 +35,7 @@ pub enum WsType {
     /// `wss://api-order-update.dhan.co` order-update feed (always 1 conn).
     OrderUpdate,
     /// The Groww second feed (operator §32) — NOT a Dhan binary WS but a
-    /// Python-sidecar NDJSON tail bridge. A distinct `ws_type` keeps the broker
+    /// legacy-sidecar NDJSON tail bridge. A distinct `ws_type` keeps the broker
     /// meaning of the SYMBOL honest: a `where ws_type='groww_bridge'` query reads
     /// cleanly, and re-using a Dhan label (`main_feed`/`order_update`) would
     /// silently mix two brokers in operator filters. Pairs with `feed='groww'`.

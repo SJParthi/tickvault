@@ -3,7 +3,7 @@
 //! Builds the ~779-instrument Groww subscription set (NIFTY-Total-Market stocks +
 //! NSE indices) by joining the NTM constituent **ISINs** to Groww's own
 //! `exchange_token`s from Groww's master `instrument.csv`. The resolved set is
-//! written to a watch file the Python sidecar reads (subscribe_ltp for stocks +
+//! written to a watch file the legacy sidecar reads (subscribe_ltp for stocks +
 //! subscribe_index_value for indices).
 //!
 //! This module is the **pure, fully-unit-tested core**: CSV parse (header-name
@@ -64,7 +64,7 @@ pub enum WatchKind {
 }
 
 /// One instrument the sidecar should subscribe. Serializes to the watch-file
-/// contract the Python sidecar reads:
+/// contract the legacy sidecar reads:
 /// `{exchange, segment, exchange_token, kind, security_id}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WatchEntry {
@@ -102,7 +102,7 @@ pub struct WatchEntry {
     pub index_name: Option<String>,
     /// COLD-PATH provenance (§36 2026-07-08) — ISO `YYYY-MM-DD` expiry for the
     /// 4 index-future entries; `None` (and skipped on write) for everything
-    /// else, so existing entries stay byte-stable. The Python sidecar reads
+    /// else, so existing entries stay byte-stable. The legacy sidecar reads
     /// only `{exchange, segment, exchange_token, kind, security_id}` and the
     /// native watch reader ignores unknown fields — additive JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1207,7 +1207,7 @@ fn distinct_future_key_count(entries: &[WatchEntry]) -> usize {
     distinct.len()
 }
 
-/// On-disk watch-file shape the Python sidecar reads.
+/// On-disk watch-file shape the legacy sidecar reads.
 #[derive(Serialize)]
 struct WatchFile<'a> {
     /// IST trading date this watch set was built for (staleness guard).
