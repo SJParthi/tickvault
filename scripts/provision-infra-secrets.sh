@@ -33,13 +33,11 @@ echo "" >&2
 # ---- Prerequisite: AWS CLI + credentials ----
 if ! command -v aws > /dev/null 2>&1; then
     echo -e "  ${YELLOW}AWS CLI not found — auto-installing...${NC}" >&2
-    if command -v pip3 > /dev/null 2>&1; then
-        pip3 install awscli --quiet 2>/dev/null
-    elif command -v pip > /dev/null 2>&1; then
-        pip install awscli --quiet 2>/dev/null
-    fi
+    # 2026-08-01: official self-contained installer, no interpreter —
+    # see scripts/ensure-aws-cli.sh.
+    bash "$(dirname "${BASH_SOURCE[0]}")/ensure-aws-cli.sh" || true
     if ! command -v aws > /dev/null 2>&1; then
-        echo -e "  ${RED}Could not auto-install AWS CLI. Install: pip3 install awscli${NC}" >&2
+        echo -e "  ${RED}Could not auto-install AWS CLI. See: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html${NC}" >&2
         exit 1
     fi
     echo -e "  ${GREEN}AWS CLI installed${NC}" >&2
