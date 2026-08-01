@@ -2899,7 +2899,7 @@ mod tests {
         // oracle-captured WIPE_QUESTDB_COMMANDS golden — same ordering.)
         let joined = WIPE_QUESTDB_COMMANDS.join("\n");
         let rm_pos = joined.find("feed capture/replay sources removed").unwrap();
-        let truncate_pos = joined.find("PYWIPE").unwrap();
+        let truncate_pos = joined.find("WIPE-TARGETS").unwrap();
         assert!(
             rm_pos < truncate_pos,
             "replay-source rm must precede TRUNCATE"
@@ -2909,7 +2909,7 @@ mod tests {
             disable_pos < rm_pos,
             "unit must be disabled before the wipe body"
         );
-        assert!(joined.contains("t == 'prev_day_ohlcv'"));
+        assert!(joined.contains("$0==\"prev_day_ohlcv\""));
         assert!(joined.contains("systemctl enable tickvault || true"));
     }
 
@@ -2922,7 +2922,7 @@ mod tests {
         let joined = WIPE_QUESTDB_COMMANDS.join("\n");
         // (a) dynamic table discovery — no hardcoded 6-table list.
         assert!(joined.contains("SELECT table_name FROM tables()"));
-        assert!(joined.contains("t == 'ticks' or t.startswith('candles_')"));
+        assert!(joined.contains("$0==\"ticks\" || index($0,\"candles_\")==1"));
         // (b) every feed's capture/replay source removed (feed-agnostic).
         for needle in ["/ws_wal", "/groww", "/spill", "/dlq", "live-ticks.ndjson"] {
             assert!(
@@ -2946,10 +2946,20 @@ mod tests {
         // forensics, NOT a SEBI never-delete table; the SEBI *_audit family
         // stays preserved by the dynamic filter.
         let joined = WIPE_QUESTDB_COMMANDS.join("\n");
-        assert!(joined.contains(
-            "{'spot_1m_rest', 'option_chain_1m', 'option_contract_1m_rest', 'rest_fetch_audit'}"
-        ));
-        assert!(joined.contains("t in live_rest"));
+        // 2026-08-01: the target predicate is now an awk expression (the
+        // embedded interpreter program was retired). Each of the four LIVE
+        // REST tables must still appear as its own equality arm.
+        for live in [
+            "spot_1m_rest",
+            "option_chain_1m",
+            "option_contract_1m_rest",
+            "rest_fetch_audit",
+        ] {
+            assert!(
+                joined.contains(&format!("$0==\"{live}\"")),
+                "wipe target predicate lost the {live} arm"
+            );
+        }
         // Review fix M2 (2026-07-16): honest completion verifies EVERY
         // truncate-target family — the legacy pair AND all FOUR live REST
         // tables.

@@ -139,16 +139,16 @@ the rule file rather than hidden.
   - Files: `docs/dhan-support/2026-04-21-ticket-5519522-vendor-sdk-also-fails.md`,
     `crates/common/src/moneyness.rs`
   - Tests: `git grep` for the old name returns zero
-- [ ] Retire the interpreter-spawning parity harness + its lockstep guard
+- [x] Retire the interpreter-spawning parity harness + its lockstep guard
   - Files: `crates/tickvault-logs-mcp/tests/parity.rs` (delete),
     `crates/common/tests/tickvault_logs_mcp_guard.rs`,
     `.claude/rules/project/rust-only-forever-lock-2026-07-19.md`
   - Tests: `cargo test -p tickvault-logs-mcp`, `-p tickvault-common`
-- [ ] Replace the embedded QuestDB-wipe program with curl + shell
+- [x] Replace the embedded QuestDB-wipe program with curl + shell
   - Files: `crates/aws-lambdas/src/operator_control_action_commands.rs`,
     `crates/aws-lambdas/src/operator_control.rs`
   - Tests: `cargo test -p tickvault-aws-lambdas`
-- [ ] Extend the ratchet so the word cannot return to our own source
+- [x] Extend the ratchet so the word cannot return to our own source
   - Files: `crates/common/tests/rust_only_guard.rs`
   - Tests: bite-test (add the word → guard fails; remove → passes)
 

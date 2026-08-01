@@ -7,10 +7,13 @@
 //! `scripts/mcp-servers/tickvault-logs-launch.sh`. The legacy
 //! `scripts/mcp-servers/tickvault-logs/server.py` is DELETED from git
 //! after parallel-run parity evidence (PR #1644 harness + the cutover
-//! PR's live side-by-side matrix); the parity harness re-materializes it
-//! from pinned git history (`SERVER_PY_PINNED_COMMIT` in
-//! `crates/tickvault-logs-mcp/tests/parity.rs`), so the byte-parity gate
-//! keeps running WITHOUT the legacy runtime living in the tree.
+//! PR's live side-by-side matrix).
+//!
+//! 2026-08-01 (operator directive — pure Rust): the parity harness that
+//! re-materialized the deleted implementation from pinned git history and
+//! EXECUTED it is RETIRED. It ran the banned runtime in CI on every PR, and
+//! it is why the "zero tracked files" claim held only at rest. Pin 5 below
+//! is INVERTED accordingly.
 //!
 //! This is a source-scan guard — dep-free, fast, runs in-process. What
 //! it asserts (each a build-failing pin; none weaker than the
@@ -22,8 +25,8 @@
 //! 3. The launcher exists, is executable, and is rust-only.
 //! 4. The Rust crate keeps its core sources + the full 14-tool surface
 //!    + the JSON-RPC methods + the pinned protocol version.
-//! 5. The parity harness keeps the pinned git-history reference (the
-//!    parity gate cannot be silently deleted or de-pinned).
+//! 5. The parity harness stays RETIRED, and NO Rust source anywhere names
+//!    (or spawns) the banned runtime.
 //! 6. validate-automation keeps exercising the REAL rust launch path.
 
 use std::fs;
@@ -86,9 +89,10 @@ fn load_text(rel: &str) -> String {
 fn legacy_server_retired_from_git() {
     // Post-cutover pin (replaces the pre-cutover `server.py exists` pin,
     // inverted to the new truth): NOTHING under the old legacy server
-    // dir is git-tracked. The path may exist ON DISK (the parity harness
-    // re-materializes server.py there at runtime; the dir is gitignored)
-    // — disk presence is deliberately NOT asserted either way.
+    // dir is git-tracked. Disk presence is deliberately NOT asserted either
+    // way. (Until 2026-08-01 the parity harness re-materialized the file
+    // there at runtime; that harness is retired — see
+    // `parity_harness_is_retired_and_nothing_spawns_the_legacy_runtime`.)
     let out = Command::new("git")
         .arg("-C")
         .arg(workspace_root())
@@ -203,7 +207,6 @@ fn rust_port_crate_exists_with_core_sources() {
         "crates/tickvault-logs-mcp/src/config.rs",
         "crates/tickvault-logs-mcp/src/signature.rs",
         "crates/tickvault-logs-mcp/src/sigv4.rs",
-        PARITY_RS,
     ] {
         let path = root.join(rel);
         assert!(
@@ -261,50 +264,70 @@ fn rust_port_binary_supports_self_test() {
     );
 }
 
+/// INVERTED 2026-08-01 (operator directive — pure Rust, nowhere the banned
+/// runtime's name). This test used to REQUIRE the parity harness to keep its
+/// pinned-commit materialization. That harness
+/// (`crates/tickvault-logs-mcp/tests/parity.rs`) resurrected the DELETED
+/// implementation from pinned git history onto disk and EXECUTED it, and
+/// hard-failed rather than skipping when the interpreter was absent — so it
+/// ran the banned runtime in CI on every PR, and the "tree is at zero tracked
+/// files" claim held only because this test wrote one back at runtime.
+///
+/// The harness is retired. Its load-bearing pins survive as self-contained
+/// golden literals in `src/` (hash vectors, the SigV4 signing-key and
+/// request goldens, the ensure_ascii goldens, the novel-cutoff overflow
+/// bands) — those need no child process. What was genuinely LOST and is not
+/// replaced: the end-to-end JSON-RPC envelope diff and the `tools/list`
+/// registry diff against the legacy oracle. That is a real coverage
+/// reduction, recorded here rather than hidden.
 #[test]
-fn parity_harness_pins_git_history_reference() {
-    // The parity gate must keep running WITHOUT the legacy runtime in the tree: the
-    // harness materializes server.py from a PINNED full-sha commit, with
-    // the shallow-clone fetch fallback. De-pinning or deleting the
-    // materialization silently kills the byte-parity gate.
-    let src = load_text(PARITY_RS);
+fn parity_harness_is_retired_and_nothing_spawns_the_legacy_runtime() {
+    let root = workspace_root();
     assert!(
-        src.contains("SERVER_PY_PINNED_COMMIT"),
-        "parity.rs lost the pinned git-history reference"
+        !root.join(PARITY_RS).exists(),
+        "{PARITY_RS} is back — it resurrects the deleted implementation from \
+         pinned git history and EXECUTES it. Re-introducing it needs a fresh \
+         dated operator quote in rust-only-forever-lock-2026-07-19.md first."
     );
-    assert!(
-        src.contains("fn materialize_server_py"),
-        "parity.rs lost the server.py materialization fn"
-    );
-    // The pin must be a FULL 40-hex sha (a short sha can go ambiguous).
-    let pin_line = src
+
+    // And the banned runtime's name may not appear ANYWHERE in our own
+    // source — Rust, shell, workflows, terraform, manifests. (Vendor API
+    // reference docs under `docs/` are third-party documentation describing
+    // THEIR SDKs, and `.claude/plans/` is dated history the house convention
+    // never rewrites; both are deliberately out of scope.)
+    let token = banned_runtime();
+    let out = Command::new("git")
+        .args([
+            "grep",
+            "-ln",
+            "-i",
+            "--",
+            &token,
+            "crates/",
+            "scripts/",
+            ".github/",
+            "deploy/",
+            "Cargo.toml",
+            "quality/",
+            ".gitignore",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("git grep");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hits: Vec<&str> = stdout
         .lines()
-        .find(|l| l.contains("const SERVER_PY_PINNED_COMMIT"))
-        .expect("SERVER_PY_PINNED_COMMIT const line");
-    let sha: String = pin_line
-        .chars()
-        .skip_while(|c| *c != '"')
-        .skip(1)
-        .take_while(|c| *c != '"')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        // The enforcement files must NAME the token in order to ban it; both
+        // assemble it from bytes, so the literal is never spelled.
+        .filter(|l| {
+            !l.ends_with("tests/rust_only_guard.rs") && !l.ends_with("tickvault_logs_mcp_guard.rs")
+        })
         .collect();
     assert!(
-        sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
-        "SERVER_PY_PINNED_COMMIT must be a full 40-hex sha, got `{sha}`"
-    );
-    assert!(
-        src.contains("--depth=1"),
-        "parity.rs lost the shallow-clone fetch fallback (CI checkout is \
-         depth-1; without it the parity gate dies on shallow clones)"
-    );
-}
-
-#[test]
-fn parity_harness_keeps_the_transcript_test() {
-    let src = load_text(PARITY_RS);
-    assert!(
-        src.contains("fn parity_transcript"),
-        "parity.rs lost the parity_transcript test — the byte-parity gate \
-         is the cutover's regression floor"
+        hits.is_empty(),
+        "the banned runtime's name is back in Rust source: {hits:?}"
     );
 }
 
@@ -313,9 +336,10 @@ fn gitignore_masks_materialized_legacy_dir() {
     let src = load_text(".gitignore");
     assert!(
         src.contains("scripts/mcp-servers/tickvault-logs/"),
-        ".gitignore must mask the runtime-materialized legacy dir — \
-         otherwise a parity run leaves an untracked server.py that can be \
-         accidentally re-committed"
+        ".gitignore must keep masking the legacy server dir — defence in \
+         depth so a manually-materialized server.py can never be \
+         accidentally re-committed (the harness that materialized it at \
+         runtime was retired 2026-08-01)"
     );
 }
 
