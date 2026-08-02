@@ -55,7 +55,7 @@ jobs:
           prefix-key: fuzz-${{ env.NIGHTLY_VERSION }}
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-fuzz
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # cargo-fuzz
         with:
           tool: cargo-fuzz
 
