@@ -13,8 +13,13 @@
 #     (EventBridge stop schedule) — not an error. We do NOT fight that schedule.
 #   - Never silent: every run posts a one-line Telegram summary.
 #
-# Exit code is always 0 (a failed check is reported, not a workflow failure) —
-# EXCEPT --strict mode (manual dispatch) where unhealed issues exit 1.
+# Exit code: 0 when everything is healthy or was auto-healed; 1 when any issue
+# is left UNHEALED — on every trigger, scheduled runs included.
+#
+# (Until 2026-08-07 the non-zero exit applied only to --strict manual runs, so
+# the scheduled lane always exited 0 and a green tick meant nothing more than
+# "the script ran". `strict` is now retained only for backward compatibility
+# with existing dispatch inputs; it no longer changes behaviour.)
 # =============================================================================
 set -uo pipefail
 
@@ -310,8 +315,20 @@ if [ "${#HEALED[@]}" -gt 0 ] || [ "${#ISSUES[@]}" -gt 0 ]; then
   fi
 fi
 
-# Strict mode (manual dispatch): non-zero exit if unhealed issues remain.
-if [ "$STRICT" = "yes" ] && [ "${#ISSUES[@]}" -gt 0 ]; then
+# Unhealed issues ALWAYS exit non-zero — scheduled runs included.
+#
+# This used to be gated on $STRICT (manual dispatch only), so the scheduled
+# lane always exited 0 and every run showed a green checkmark in the Actions
+# tab regardless of what it found. 30 of 30 recent runs reported success —
+# including 2026-08-05, when the box never booted at all, and 2026-08-07,
+# when it failed to start on InsufficientInstanceCapacity. The operator was
+# reading green ticks over a dead box for a week.
+#
+# A green run must mean "the box is healthy", not "the script finished".
+# This is audit Rule 11: no false-OK signals. The SNS page above still fires
+# either way; this makes the RUN STATUS agree with it.
+if [ "${#ISSUES[@]}" -gt 0 ]; then
+  echo "aws-autopilot: ${#ISSUES[@]} unhealed issue(s) — failing the run so it is visible: ${ISSUES[*]}" >&2
   exit 1
 fi
 exit 0

@@ -261,13 +261,40 @@ jobs:
           # Also echo to the run log for quick glance.
           echo "$OUT"
 
+      # InsufficientInstanceCapacity is TRANSIENT: AWS momentarily has no
+      # capacity for this instance type in our pinned AZ. The old one-shot
+      # start surrendered to it instantly, which is how 2026-08-05 and
+      # 2026-08-07 lost whole trading sessions.
+      #
+      # Retry on capacity ONLY. Any other error (auth, bad id, quota) fails
+      # fast — retrying those just burns the runner and delays the page.
       - name: start
         if: github.event.inputs.action == 'start'
         run: |
           IID=${{ steps.iid.outputs.id }}
-          aws ec2 start-instances --region "$AWS_REGION" --instance-ids "$IID" >/dev/null
-          aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$IID"
-          echo "Started $IID — running."
+          ATTEMPTS=20          # 20 x 30s ~= 10 min of capacity hunting
+          SLEEP=30
+          for i in $(seq 1 "$ATTEMPTS"); do
+            if ERR=$(aws ec2 start-instances --region "$AWS_REGION" --instance-ids "$IID" 2>&1 >/dev/null); then
+              echo "start-instances accepted on attempt $i/$ATTEMPTS."
+              aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$IID"
+              echo "Started $IID — running."
+              exit 0
+            fi
+            case "$ERR" in
+              *InsufficientInstanceCapacity*|*Unavailable*)
+                echo "attempt $i/$ATTEMPTS: AWS has no capacity for this type in our AZ yet; retrying in ${SLEEP}s"
+                sleep "$SLEEP"
+                ;;
+              *)
+                echo "::error::start failed with a NON-capacity error — not retrying:"
+                echo "$ERR"
+                exit 1
+                ;;
+            esac
+          done
+          echo "::error::Could not start $IID after $ATTEMPTS attempts (~$((ATTEMPTS*SLEEP/60)) min) — AWS capacity for this instance type in our AZ is exhausted. This is an AWS-side shortage, not a config error. Options: retry later, or change instance type (operator-locked, see daily-universe-scope-expansion-2026-05-27.md §7)."
+          exit 1
 
       - name: stop
         if: github.event.inputs.action == 'stop'
@@ -421,8 +448,22 @@ jobs:
           gh workflow run deploy-aws.yml --repo "${{ github.repository }}" --ref main
           echo "Dispatched deploy-aws.yml (build -> ship -> smoke -> restart). Watch it in the Actions tab."
 
+      # The verdict MUST reflect what actually happened. This step used to stamp
+      # a hardcoded ✅ under `if: always()`, so a failed action (e.g. `start`
+      # dying on InsufficientInstanceCapacity, exit 254) still rendered a green
+      # summary. That is the false-OK class banned by audit Rule 11 — and it
+      # masked a real week-long outage: the box failed to boot on 2026-08-05
+      # and 2026-08-07 while every run reported success.
+      #
+      # `job.status` is 'success' only when no prior step failed, so the badge
+      # now derives from the run instead of asserting it.
       - name: Summary
         if: always()
         run: |
-          echo "## AWS Control: \`${{ github.event.inputs.action }}\` ✅" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ job.status }}" = "success" ]; then
+            VERDICT="✅ succeeded"
+          else
+            VERDICT="🆘 FAILED (job.status=${{ job.status }}) — the action did NOT complete; scroll up for the AWS error"
+          fi
+          echo "## AWS Control: \`${{ github.event.inputs.action }}\` — $VERDICT" >> "$GITHUB_STEP_SUMMARY"
           echo "Instance: ${{ steps.iid.outputs.id }} | region: ${AWS_REGION} | force: ${{ github.event.inputs.force }}" >> "$GITHUB_STEP_SUMMARY"
