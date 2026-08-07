@@ -46,6 +46,26 @@
 #   This is strictly MORE discriminating than widening max_regression_pct
 #   (which would blind the gate to real 30% regressions) and than resetting the
 #   baseline (which re-breaks on the next rotation).
+#
+# Spread re-calibration (2026-08-07, SAME DAY — the drift fix did not fire):
+#   The suppressor above shipped with spread = max - min, and then FAILED to
+#   suppress the very next rotation. Live on main @026c7b63 (bench run
+#   31182757999 attempt 2): 31 of 31 benches regressed, share 100%, every
+#   absolute budget passed — yet drift was NOT declared, because ONE outlier
+#   (ws_reader_dispatch_ticker, a 13ns bench, +111.6%) dragged max-min to
+#   88.0 pts against the 15 pt bar. The other 30 sat between +23.6% and
+#   +42.9%. max-min is a WORST-CASE statistic: a single noisy sub-30ns
+#   benchmark destroys it, which is exactly the population this gate measures.
+#   Same commit, minutes earlier (attempt 1), only 1 of 31 "regressed" — the
+#   two attempts differed by RUNNER, not by code (the merge touched zero files
+#   under crates/core, where the attempt-1 bench lives).
+#   Fix: spread is now the INTERQUARTILE RANGE (Q3-Q1) of the regressions —
+#   a robust statistic that ignores the tails by construction. On the live
+#   failing data IQR = 2.6 pts (vs max-min 88.0). The threshold, the count and
+#   share rules, and the absolute arm are all UNCHANGED; only the estimator
+#   changed. Case C of the self-test (8 benches genuinely fanned +6%..+80%,
+#   IQR 24 pts) still FAILS, so the discriminating power is preserved, and the
+#   full min..max range is still PRINTED for the operator.
 # =============================================================================
 
 set -euo pipefail
@@ -60,7 +80,11 @@ BENCH_BUDGET_MULTIPLIER="${BENCH_BUDGET_MULTIPLIER:-1.0}"
 # knob would be a one-line way to silence a real regression in CI.
 HARDWARE_DRIFT_MIN_COUNT=5      # never classify drift from a handful of benches
 HARDWARE_DRIFT_MIN_SHARE=0.70   # >= 70% of compared benches must have regressed
-HARDWARE_DRIFT_SPREAD_PCT=15    # max-min of the regressions, in percentage points
+HARDWARE_DRIFT_SPREAD_PCT=15    # INTERQUARTILE RANGE (Q3-Q1) of the regressions,
+                                # in percentage points. Was max-min until
+                                # 2026-08-07: one outlier sub-30ns bench could
+                                # single-handedly veto a textbook drift shape
+                                # (live: IQR 2.6 pts vs max-min 88.0 pts).
 
 # Validate the multiplier early and loudly: digits and at most one dot only
 # (rejects empty, negative, and non-numeric garbage before it reaches the evaluator).
@@ -330,15 +354,25 @@ END {
   # three hold: enough samples to be meaningful, nearly every compared bench
   # regressed, and the regressions cluster tightly. Fail-safe in every other
   # case -> the pre-2026-08-07 behaviour is preserved exactly.
-  drift = 0; share = 0; spread = 0
+  drift = 0; share = 0; spread = 0; full_range = 0; lo = 0; hi = 0
   if (reg_n > 0) {
     if (cmp_total > 0) share = reg_n / cmp_total
-    lo = reg_point[1]; hi = reg_point[1]
+    # Robust spread = interquartile range. max-min was vetoed by a single
+    # noisy sub-30ns bench on 2026-08-07 (see the header note); the IQR
+    # ignores both tails by construction. Insertion sort — reg_n is small
+    # (tens), and asort() is a gawk extension the CI runner awk may lack.
+    # NOTE: no apostrophes inside this awk program — it is single-quoted in
+    # the surrounding shell, so one would terminate the program early.
+    for (i = 1; i <= reg_n; i++) sorted[i] = reg_point[i]
     for (i = 2; i <= reg_n; i++) {
-      if (reg_point[i] < lo) lo = reg_point[i]
-      if (reg_point[i] > hi) hi = reg_point[i]
+      v = sorted[i]; j = i - 1
+      while (j >= 1 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j-- }
+      sorted[j + 1] = v
     }
-    spread = hi - lo
+    lo = sorted[1]; hi = sorted[reg_n]
+    full_range = hi - lo
+    q = int(reg_n / 4)
+    spread = sorted[reg_n - q] - sorted[q + 1]
     if (reg_n >= drift_min_count && share >= drift_min_share && spread <= drift_spread_pct)
       drift = 1
   }
@@ -354,8 +388,8 @@ END {
     }
   }
   if (drift) {
-    printf "\n  HARDWARE DRIFT DETECTED: %d of %d compared benchmarks regressed (%.0f%% >= %.0f%%), spread %.1f pts <= %.1f.\n", \
-      reg_n, cmp_total, share * 100, drift_min_share * 100, spread, drift_spread_pct
+    printf "\n  HARDWARE DRIFT DETECTED: %d of %d compared benchmarks regressed (%.0f%% >= %.0f%%), IQR %.1f pts <= %.1f (full range %+.1f%%..%+.1f%% = %.1f pts).\n", \
+      reg_n, cmp_total, share * 100, drift_min_share * 100, spread, drift_spread_pct, lo, hi, full_range
     print "  A code regression hits a few RELATED benchmarks; a uniform shift across nearly ALL of them is the runner, not the code."
     print "  The RELATIVE regression arm is SUPPRESSED for this run."
     print "  NOT suppressed: the absolute ns budgets above, which still gate and still fail this run if breached."
