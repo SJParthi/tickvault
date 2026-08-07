@@ -153,5 +153,42 @@ for name in registry/get_hit registry/get_miss oms/state_transition ; do
 done
 expect "no regressions, budgets OK -> PASS" 0 "$F"
 
+# --- Case G: drift shape WITH one outlier (the 2026-08-07 second incident) ---
+# The REAL shape of bench run 31182757999 attempt 2 on main @026c7b63:
+# 31/31 regressed, 30 of them clustered, and ONE sub-30ns bench
+# (ws_reader_dispatch_ticker) at +111.6%. Under the original max-min spread
+# that single outlier produced 88.0 pts vs the 15 pt bar, so drift was NOT
+# declared and the run went RED with every absolute budget passing. Under the
+# IQR the tails are ignored and the shape is correctly suppressed.
+# This case FAILS (exit 2) against the pre-IQR gate and PASSES against it.
+G="$TMP/g"
+i=0
+for spec in \
+  "ws_reader_dispatch_ticker:27" \
+  "registry/get_hit:14" "registry/get_miss:14" "oms/state_transition:38" \
+  "calendar/is_trading_day:9" "config/toml_load:40324" "obi_compute_20_levels:371" \
+  "obi_compute_empty_book:14" "obi_compute_with_wall:369" "dispatch_frame/ticker:16" \
+  "dispatch_frame/quote:16" "token_handle_load:6" "token_handle_load_none:6" \
+  "token_handle_clone_arc:5" "moneyness_classify:2" "moneyness_snapshot_read:7" \
+  "pipeline/burst_100_ticker:641" "pipeline/batch_100_mixed:771" \
+  "ws_reader_frame_handle_ns:153" "order_gate_mark_forward_disarmed:4" \
+  "order_gate_mark_forward_armed_full:4" "order_gate_mark_forward_armed_accept:31" \
+  "calendar/is_trading_day_holiday:10" "calendar/is_trading_day_weekend:1" \
+  "extra_a:10" "extra_b:10" "extra_c:10" "extra_d:10" "extra_e:10" \
+  "extra_f:10" "extra_g:10" ; do
+  name="${spec%%:*}"; median="${spec##*:}"
+  if [ "$i" -eq 0 ]; then
+    # the lone outlier: +111.6%, exactly as observed live
+    frac="1.116"; lower="1.000"
+  else
+    # the clustered majority: +23.6% .. +43.9%
+    frac="0.$((236 + (i - 1) * 7))"
+    lower="0.$((230 + (i - 1) * 7))"
+  fi
+  mk_bench "$G" "$name" "$median" "$frac" "$lower"
+  i=$((i + 1))
+done
+expect "31/31 drift + one +111.6% outlier -> PASS (IQR ignores tails; was false RED)" 0 "$G"
+
 printf '  bench-gate self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -113,6 +113,12 @@ fn bench_gate_carries_hardware_drift_detection() {
         "HARDWARE_DRIFT_MIN_SHARE=0.70",
         "HARDWARE_DRIFT_SPREAD_PCT=15",
         "HARDWARE DRIFT DETECTED",
+        // 2026-08-07 (second calibration): the spread estimator MUST stay
+        // robust. It shipped as max-min and then failed to suppress the very
+        // next rotation — one outlier sub-30ns bench (+111.6%) dragged max-min
+        // to 88.0 pts vs the 15 pt bar while the other 30 sat in +23.6..+42.9%
+        // (IQR 2.6 pts). Live: main @026c7b63, bench run 31182757999 attempt 2.
+        "INTERQUARTILE RANGE",
     ] {
         assert!(
             body.contains(needle),
@@ -122,6 +128,14 @@ fn bench_gate_carries_hardware_drift_detection() {
              budget passed)"
         );
     }
+    // The estimator must never revert to the worst-case statistic: a single
+    // noisy tail bench must not be able to veto a textbook drift shape.
+    assert!(
+        !body.contains("spread = hi - lo"),
+        "bench-gate reverted to max-min spread — one outlier benchmark can then \
+         single-handedly veto drift suppression, which is exactly the false RED \
+         observed live on main @026c7b63 (IQR 2.6 pts vs max-min 88.0 pts)"
+    );
     // The absolute arm must NEVER be suppressed by drift classification.
     assert!(
         body.contains("NOT suppressed: the absolute ns budgets"),
@@ -138,6 +152,9 @@ fn bench_gate_selftest_exists_and_covers_both_directions() {
         "still FAILS (not uniform)",
         "still FAILS (fail-safe)",
         "FAILS on absolute (not suppressed)",
+        // The 2026-08-07 second incident: a real drift shape carrying ONE
+        // outlier. Proven to FAIL against the pre-IQR gate and PASS after.
+        "IQR ignores tails",
     ] {
         assert!(
             body.contains(needle),
