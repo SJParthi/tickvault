@@ -611,6 +611,64 @@ line count) to the post-widening tree on branch `claude/groww-security-id-u64`.
 The guard remains active — any FURTHER edit to the frozen area beyond this
 recorded lift fails the build again, requiring its own fresh dated quote.
 
+### §28.2 — NARROW LIFT for the u64 slot-mapping repair (operator-approved 2026-08-07)
+
+**The verbatim operator authorization (2026-08-07, typed directly in-session):**
+
+> "go ahead and fix and implement eveuthign dude okay>"
+
+Given in DIRECT response to a message that named this lift as one of exactly two
+explicit asks — quote: *"**'§28 approved'** → I fix #1, the single most
+consequential defect in this entire session"* — alongside the summary of the
+defect itself. That message is the scope this quote authorizes.
+
+**The defect this lift repairs (Verified, red-team audit 2026-08-07).**
+`IndicatorEngine::update` / `warmup_from_candles` / `warmup_count` index a flat
+`states: Vec<IndicatorState>` of `MAX_INDICATOR_INSTRUMENTS` (25,000) with
+`let sid = security_id as usize`, then bail on `sid >= self.states.len()`.
+The §28.1 lift widened `security_id` to `u64` **and the id space subsequently
+became NAMESPACE-BANDED** — Groww indices occupy `[2^62, 2^63)`
+(`feed/groww/instruments.rs`), GDF `[2^60, 2^62)`, TrueData `[2^59, 2^60)`
+(`truedata-feed-scope-2026-07-24.md` §9.5). Every banded id is therefore
+astronomically `>= 25_000`, so **every** call returns `Default::default()`
+(`is_warm = false`) and the strategy evaluator returns `Hold` — permanently,
+for the entire live universe, **with no error, no counter, and no log line**.
+
+§28.1 explicitly left the C2 `states` flat-Vec finding "TRACKED and
+UN-remediated" as an I-P1-11 *collision* risk. After the banding it is no
+longer a collision risk — it is a **guaranteed total silent no-op**, which is
+strictly worse and was undocumented. Runtime-dead today only because the
+trading pipeline spawns solely under `dhan_enabled || groww_enabled` and both
+live feeds are retired; it would become a silent catastrophe the moment
+strategies go live.
+
+**Scope of THIS lift (narrow, mechanical):** ONLY the id→slot MAPPING may
+change. An O(1)-average slot allocator (`HashMap<u64, u32>` + a dense
+monotonic counter) translates a banded `security_id` into a dense index into
+the SAME pre-allocated `states` Vec. Capacity exhaustion is FAIL-CLOSED and
+LOUD (typed refusal + counter + coded error), never a silent miss.
+**NO indicator math changes. NO strategy FSM logic changes. No
+`IndicatorState` field changes.** The flat-Vec layout, its single startup
+allocation, and every computation stay byte-for-byte identical; only the index
+used to reach a slot is corrected.
+
+**Still NOT remediated by this lift (recorded honestly, not silently carried):**
+- **C1 warmup gate** — unchanged, still TRACKED.
+- **I-P1-11 composite key** — the engine's public signature takes `security_id`
+  alone, with no `ExchangeSegment`. Cross-FEED collision is now structurally
+  impossible (disjoint namespace bands), but two instruments sharing a numeric
+  id across SEGMENTS *within* one feed would still share a slot. Fixing that
+  needs a signature cascade through the pipeline and is a SEPARATE lift needing
+  its own dated quote.
+- **NaN in `high`/`low`/`open` during REST warmup** poisons indicator state
+  permanently (only `close` is guarded) — red-team finding #5, in the frozen
+  area, deliberately NOT taken in this lift.
+
+**Re-bless:** the `BOUNDARY_FILES` manifest in
+`operator_boundary_indicator_strategy_guard.rs` is regenerated for the
+post-repair tree. The guard stays ACTIVE — any further frozen-area edit beyond
+this recorded lift fails the build again and needs its own fresh dated quote.
+
 ---
 
 > **[ARCHIVED 2026-07-20]** §29 warm-resubscribe snapshot + §31 NTM subscription authorization (retired subscription chain; §31.1 mapping contract kept live) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).

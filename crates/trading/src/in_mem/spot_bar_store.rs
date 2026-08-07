@@ -139,6 +139,11 @@ pub enum UpsertOutcome {
     /// Older than the ring's retained window at capacity — dropped
     /// (correct eviction semantics; counted).
     DroppedOverWindow,
+    /// No slot could be created: the store is at `MAX_SPOT_BAR_SLOTS`
+    /// distinct instruments (2026-08-07). Distinct from `DroppedOverWindow`,
+    /// which is correct age-based eviction — this is a capacity REFUSAL and
+    /// means the instrument has no RAM retention at all.
+    SlotCapacityExhausted,
 }
 
 /// Outcome of one day-block record (test/forensics surface).
@@ -149,6 +154,16 @@ pub struct BlockOutcome {
     /// Bars older than the retained window at capacity — dropped.
     pub dropped_over_window: usize,
 }
+
+/// Hard cap on distinct `(feed, security_id, exchange_segment)` slots.
+///
+/// 2026-08-07: before this, the slot table grew unbounded — one entry per
+/// distinct instrument ever seen, never evicted. It was safe only by the
+/// external convention that callers feed the small hardcoded index list; the
+/// type enforced nothing. 256 is ~32x today's ~8 live slots, so it cannot bite
+/// current operation, while making the growth bounded BY CONSTRUCTION.
+/// Raising it is a deliberate, reviewable edit — which is the point.
+pub const MAX_SPOT_BAR_SLOTS: usize = 256;
 
 /// One per-TF sorted ring of sealed bars.
 #[derive(Debug)]
@@ -333,16 +348,36 @@ impl SpotBarStore {
         None
     }
 
-    fn find_or_create_slot(&self, key: SlotKey) -> std::sync::Arc<Slot> {
+    fn find_or_create_slot(&self, key: SlotKey) -> Option<std::sync::Arc<Slot>> {
         if let Some(slot) = self.find_slot(key) {
-            return slot;
+            return Some(slot);
         }
         let mut slots = self.slots.write();
         // Re-check under the write lock (another writer may have raced).
         for slot in slots.iter() {
             if slot.key == key {
-                return std::sync::Arc::clone(slot);
+                return Some(std::sync::Arc::clone(slot));
             }
+        }
+        // 2026-08-07: HARD CAP. Before this, `slots` grew by one entry for
+        // every distinct (feed, security_id, exchange_segment) ever seen and
+        // NEVER evicted — unbounded in code. It was safe only because callers
+        // happened to feed the hardcoded index list (~8 slots); the doc comment
+        // said "8 slots" as a DESIGN ASSUMPTION, with nothing enforcing it.
+        // Every feed-expansion plan in the repo widens that SID set, at which
+        // point the growth becomes real and silent. Bounded by construction now,
+        // and loud at the boundary rather than discovered as memory pressure.
+        if slots.len() >= MAX_SPOT_BAR_SLOTS {
+            metrics::counter!("tv_spot_bar_slots_exhausted_total").increment(1);
+            tracing::error!(
+                feed = key.feed.as_str(),
+                security_id = key.security_id,
+                cap = MAX_SPOT_BAR_SLOTS,
+                live = slots.len(),
+                "spot bar store slot capacity exhausted — this instrument's bars \
+                 are NOT being retained in RAM; raise MAX_SPOT_BAR_SLOTS"
+            );
+            return None;
         }
         let mut rings = Vec::with_capacity(TF_COUNT);
         for tf in TfIndex::ALL {
@@ -362,7 +397,7 @@ impl SpotBarStore {
             rings: RwLock::new(rings),
         });
         slots.push(std::sync::Arc::clone(&slot));
-        slot
+        Some(slot)
     }
 
     fn note_outcome(&self, outcome: UpsertOutcome) {
@@ -373,6 +408,9 @@ impl SpotBarStore {
             UpsertOutcome::DroppedOverWindow => {
                 self.dropped_over_window.fetch_add(1, Ordering::Relaxed);
             }
+            // Counted at the refusal site (find_or_create_slot) with the
+            // instrument named; nothing further to tally here.
+            UpsertOutcome::SlotCapacityExhausted => {}
             UpsertOutcome::Appended | UpsertOutcome::Replaced => {}
         }
     }
@@ -381,7 +419,9 @@ impl SpotBarStore {
     /// re-emits REPLACE in place — idempotent by construction, mirroring
     /// the `candles_*` DEDUP UPSERT semantics).
     pub fn append_sealed(&self, key: SlotKey, tf: TfIndex, bar: RamBar) -> UpsertOutcome {
-        let slot = self.find_or_create_slot(key);
+        let Some(slot) = self.find_or_create_slot(key) else {
+            return UpsertOutcome::SlotCapacityExhausted;
+        };
         let mut rings = slot.rings.write();
         let outcome = rings[tf.as_ordinal()].upsert(bar);
         drop(rings);
@@ -393,7 +433,14 @@ impl SpotBarStore {
     /// (ascending within the day). Newest→oldest catch-up days PREPEND in
     /// one O(day) pass; a resident day upserts in place.
     pub fn record_day_block(&self, key: SlotKey, tf: TfIndex, bars: &[RamBar]) -> BlockOutcome {
-        let slot = self.find_or_create_slot(key);
+        let Some(slot) = self.find_or_create_slot(key) else {
+            // Slot capacity refusal — already counted + logged loudly inside
+            // find_or_create_slot. Report zero recorded rather than pretending.
+            return BlockOutcome {
+                recorded: 0,
+                dropped_over_window: bars.len(),
+            };
+        };
         let mut rings = slot.rings.write();
         let outcome = rings[tf.as_ordinal()].record_block(bars);
         drop(rings);

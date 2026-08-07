@@ -261,7 +261,12 @@ scan_tick_price_precision() {
   local files="$2"
   local price_path_files
 
-  price_path_files=$(echo "$files" | grep -E '^crates/(storage|trading|core)/' || true)
+  # 2026-08-07: crates/app ADDED. It was outside this regex, so the
+  # f64::from(f32)-on-prices ban did not apply there — and a real violation
+  # was living in crates/app/src/day_ohlc_orchestrator.rs the whole time,
+  # silently widening 23925.65 -> 23925.650390625 into the day OHLC. A guard
+  # whose scope does not cover where the pattern occurs is not a guard.
+  price_path_files=$(echo "$files" | grep -E '^crates/(storage|trading|core|app)/' || true)
   if [ -z "$price_path_files" ]; then
     return
   fi
