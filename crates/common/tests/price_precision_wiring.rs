@@ -148,10 +148,20 @@ fn test_common_price_precision_module_exists() {
 // ban above still ratchets the whole workspace).
 
 #[test]
-fn test_banned_pattern_hook_covers_trading_and_core_paths() {
-    // The pre-commit hook must scan trading + core, not just storage.
-    // Before 2026-05-25 it only scanned storage, which is how the
-    // candle precision bug slipped past 1000s of tests.
+fn test_banned_pattern_hook_covers_trading_core_and_app_paths() {
+    // The pre-commit hook must scan trading + core + app, not just storage.
+    // Before 2026-05-25 it only scanned storage, which is how the candle
+    // precision bug slipped past 1000s of tests.
+    //
+    // 2026-08-07: `app` ADDED to the required set. The scanner (and THIS
+    // ratchet) pinned only storage|trading|core, so `crates/app` was outside
+    // the ban's reach — and a real violation was living in
+    // `crates/app/src/day_ohlc_orchestrator.rs` the whole time, widening
+    // 23925.65 -> 23925.650390625 into the day OHLC. The 2026-05-25 lesson
+    // repeated itself one crate over: a ratchet that pins a scope narrower
+    // than where the pattern can occur cannot catch it, and reports GREEN
+    // while doing so. This assertion now pins the WIDER scope, so narrowing
+    // it back fails the build.
     let body = fs::read_to_string(workspace_root().join(".claude/hooks/banned-pattern-scanner.sh"))
         .unwrap_or_default(); // APPROVED: test
     assert!(
@@ -160,9 +170,11 @@ fn test_banned_pattern_hook_covers_trading_and_core_paths() {
          scan_tick_price_precision (cross-crate price-field scanner)."
     );
     assert!(
-        body.contains("crates/(storage|trading|core)"),
+        body.contains("crates/(storage|trading|core|app)"),
         "Z+ ratchet: the cross-crate scanner regex must cover storage, \
-         trading, and core — the 3 crates that touch ParsedTick prices."
+         trading, core AND app — the 4 crates that touch ParsedTick prices. \
+         `app` was missing until 2026-08-07 and a live violation sat there \
+         undetected; narrowing this scope again re-opens that blind spot."
     );
     for field in [
         "f64::from(tick\\.last_traded_price)",

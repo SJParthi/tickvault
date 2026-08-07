@@ -49,8 +49,8 @@ const ENGINE_STATES_FIELD: &str = "states: Vec<IndicatorState>,";
 const BOUNDARY_FILES: &[(&str, u64, usize, usize)] = &[
     (
         "crates/trading/src/indicator/engine.rs",
-        0x515f98a52b788fb6,
-        61711,
+        0xf2a12824c086a9b7,
+        61730,
         1656,
     ),
     (
