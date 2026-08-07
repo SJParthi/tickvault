@@ -1,6 +1,22 @@
 # Implementation Plan: NSE CAS + F&O 15:40 session close (effective 2026-08-03)
 
-**Status:** APPROVED
+> **ARCHIVED 2026-08-07** — shipped in PR #1724 (squash `993a144c`, merged
+> 06:50:12Z by `github-actions[bot]` after `All Green` succeeded on head
+> `3ba410c7`). Archived per `plan-enforcement.md` rule 7 (mandatory once the
+> PR merges; the stale-plan pile is what made the design-first wall vacuous
+> in the 2026-07-10 incident).
+>
+> **ONE CARRY-FORWARD RESIDUAL — do not lose it.** Item 3 shipped **PARTIAL**
+> and is ticked only because its ACTIVE half (the constants + the boundary
+> predicate) landed. Still NOT built: the CAS row **tagging** and the
+> `tv_cas_window_rows_total` counter promised in this plan's Design and
+> Observability sections. `is_in_cas_window()` is therefore a **dormant
+> pub fn** carrying a `WIRING-EXEMPT` that names the gap rather than an
+> invented call site. The next session owning CAS work must either wire the
+> tag + counter or delete the predicate — archiving this plan does **not**
+> discharge that obligation.
+
+**Status:** VERIFIED (merged)
 **Date:** 2026-08-07
 **Approved by:** Parthiban (operator) — "yes bro", in direct response to
 "Want me to fix the 15:40 close?", this session. Operator originally spotted

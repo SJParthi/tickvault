@@ -741,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_expected_ip_fails_without_real_ssm() {
         let result = fetch_expected_ip_from_ssm().await;
-        if crate::test_support::has_aws_credentials() {
+        if crate::test_support::real_ssm_tests_enabled() {
             // Dev machine with real AWS credentials — SSM is reachable.
             assert!(
                 result.is_ok(),
@@ -759,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_public_ip_fails_without_real_ssm() {
         let result = verify_public_ip().await;
-        if crate::test_support::has_aws_credentials() {
+        if crate::test_support::real_ssm_tests_enabled() {
             // Dev machine with real AWS credentials — SSM + public IP check both succeed.
             assert!(
                 result.is_ok(),
