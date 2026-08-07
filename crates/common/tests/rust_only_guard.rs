@@ -99,6 +99,25 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path.ends_with(".yml")
         || path.ends_with(".yaml")
         || path.ends_with(".tftpl")
+        // 2026-08-07: `.tf` and Dockerfiles ADDED. They were structurally
+        // unscanned — only the `.tftpl` TEMPLATE form was covered — so a
+        // terraform `local-exec` provisioner shelling into a banned installer,
+        // or a `RUN <installer> install ...` line in a Dockerfile, would have
+        // passed this guard GREEN. Both file classes had zero tracked matches
+        // when the hole was found, so this closes a LATENT blind spot rather
+        // than an active violation. That distinction matters: this guard's
+        // whole job is to be true for files that do not exist yet.
+        //
+        // This is the same failure shape as the 2026-08-01 correction recorded
+        // in `rust-only-forever-lock-2026-07-19.md` — there the token set
+        // covered a runtime's own name but not its package manager; here the
+        // file-type set covered a template but not the rendered form. A guard
+        // is only as good as its SCOPE, and scope errors are invisible by
+        // construction: they produce green, not red.
+        || path.ends_with(".tf")
+        || path == "Dockerfile"
+        || path.ends_with("/Dockerfile")
+        || path.rsplit('/').next().is_some_and(|f| f.starts_with("Dockerfile."))
         || path == ".mcp.json"
         || path == "Makefile"
         || path.ends_with("/Makefile")

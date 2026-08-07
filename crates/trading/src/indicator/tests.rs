@@ -434,14 +434,17 @@ fn warmup_false_until_threshold() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn out_of_bounds_security_id_returns_default() {
+fn large_security_id_is_processed_not_defaulted() {
+    // REGRESSION 2026-08-07 (§28.2): asserted the silent no-op as the contract.
     let mut engine = IndicatorEngine::new(IndicatorParams::default());
     let tick = make_tick(u64::from(u32::MAX), 100.0, 101.0, 99.0, 1000);
     let snap = engine.update(&tick);
 
     assert_eq!(snap.security_id, u64::from(u32::MAX));
-    assert!(!snap.is_warm);
-    assert!((snap.ema_fast).abs() < f64::EPSILON);
+    assert!(
+        (snap.ema_fast - 100.0).abs() < f64::EPSILON,
+        "a large id must be processed; defaults here were the pre-§28.2 bug"
+    );
 }
 
 // -----------------------------------------------------------------------

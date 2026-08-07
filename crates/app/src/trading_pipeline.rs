@@ -36,7 +36,24 @@ use tracing::{debug, error, info, warn};
 const TRADING_PIPELINE_LAG_ERROR_THRESHOLD: u64 = 1_000;
 
 use tickvault_common::config::{ApplicationConfig, OmsReconcileConfig};
-use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, MAX_INDICATOR_INSTRUMENTS};
+use tickvault_common::constants::{
+    IST_UTC_OFFSET_SECONDS, MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS,
+    MAX_INDICATOR_INSTRUMENTS,
+};
+
+/// Order-gate window open, seconds-of-day IST — DERIVED from the canonical
+/// nanos constant so this file can never desync from the rest of the tree.
+const ORDER_GATE_OPEN_SECS_OF_DAY_IST: u32 = (MARKET_OPEN_IST_NANOS / 1_000_000_000) as u32;
+/// Order-gate window close, seconds-of-day IST (EXCLUSIVE) — likewise derived.
+///
+/// 2026-08-07: previously the literal `55_800` (15:30). The NSE Closing Auction
+/// Session moved the F&O close to 15:40 on 2026-08-03; every other site moved,
+/// this one did not, so entries were silently suppressed 15:30-15:40 daily.
+const ORDER_GATE_CLOSE_SECS_OF_DAY_IST: u32 = (MARKET_CLOSE_IST_NANOS / 1_000_000_000) as u32;
+
+// Fail the BUILD if these ever drift from the session the rest of the tree uses.
+const _: () = assert!(ORDER_GATE_OPEN_SECS_OF_DAY_IST == 33_300);
+const _: () = assert!(ORDER_GATE_CLOSE_SECS_OF_DAY_IST == 56_400);
 use tickvault_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
@@ -405,16 +422,29 @@ async fn run_trading_pipeline(
                         let snapshot = indicator_engine.update(&tick);
 
                         // Step 2: Evaluate all strategies
-                        // Guard: skip order placement outside trading hours [09:15, 15:30) IST.
-                        // Stale ticks in WebSocket buffer after 15:30 could trigger signals.
-                        // SEBI: no orders at or after 15:30 IST.
+                        // Guard: skip order placement outside trading hours
+                        // [09:15, MARKET_CLOSE) IST. Stale ticks in the buffer
+                        // after the close could otherwise trigger signals.
+                        //
+                        // 2026-08-07: this window was HARDCODED `33_300..55_800`
+                        // (09:15–15:30) and was MISSED by the NSE Closing Auction
+                        // Session sweep that moved the F&O close 15:30 -> 15:40
+                        // everywhere else. The result: for 10 minutes a day the
+                        // indicator/FSM state kept advancing while entries were
+                        // silently suppressed. Exits (below) were never gated, so
+                        // no position could be trapped — but no entry could fire
+                        // either. Now derived from the SAME constants as the rest
+                        // of the tree, so a future session change cannot desync
+                        // this file again. `market-hours.md` explicitly forbids
+                        // hardcoded bounds here.
                         let ist_secs_of_day = {
                             let now_utc = chrono::Utc::now().timestamp();
                             let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS)); // +5:30
                             (now_ist % 86_400) as u32
                         };
-                        // 09:15:00 = 33300s, 15:29:59 = 55799s
-                        let within_trading_hours = (33_300..55_800).contains(&ist_secs_of_day);
+                        let within_trading_hours = (ORDER_GATE_OPEN_SECS_OF_DAY_IST
+                            ..ORDER_GATE_CLOSE_SECS_OF_DAY_IST)
+                            .contains(&ist_secs_of_day);
 
                         for strategy in &mut strategies {
                             let signal = strategy.evaluate(&snapshot);

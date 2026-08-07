@@ -3408,6 +3408,27 @@ impl ApplicationConfig {
             );
         }
 
+        // Risk: capital must be finite and strictly positive.
+        //
+        // 2026-08-07 (red-team finding #2): this was NOT validated, while its
+        // sibling above WAS — an asymmetric guard. The daily-loss threshold is
+        // `capital * fraction`, so:
+        //   * capital = NaN  -> max_loss = NaN -> `pnl.abs() >= NaN` is FALSE
+        //                       -> the halt NEVER fires, at ANY drawdown;
+        //   * capital = 0.0  -> max_loss = 0.0 -> halt on the first rupee.
+        // A single typo in one config field could therefore silently disable
+        // the account's primary financial circuit breaker. Fail closed at boot
+        // instead — a refusal to start is infinitely cheaper than an unbounded
+        // live loss.
+        if !self.strategy.capital.is_finite() || self.strategy.capital <= 0.0 {
+            bail!(
+                "strategy.capital must be a finite value > 0 (it is the base for \
+                 the daily-loss halt threshold; NaN would disable the halt \
+                 entirely and 0 would halt on the first rupee), got {}",
+                self.strategy.capital
+            );
+        }
+
         // Instrument: download timeout must be positive.
         if self.instrument.csv_download_timeout_secs == 0 {
             bail!("instrument.csv_download_timeout_secs must be > 0");
