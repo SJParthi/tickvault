@@ -525,18 +525,24 @@ mod stress_indicator_engine {
         }
     }
 
+    // REGRESSION 2026-08-07 (daily-universe §28.2): this asserted that a large
+    // `security_id` yields a DEFAULT snapshot — encoding the bug as the contract.
+    // Ids are namespace-banded now (Groww index [2^62,2^63), GDF [2^60,2^62),
+    // TrueData [2^59,2^60)), so "large" describes EVERY live instrument: the old
+    // expectation meant indicators + strategy were a permanent silent no-op across
+    // the entire universe. Only genuine SLOT-CAPACITY exhaustion may default now.
     #[test]
-    fn test_stress_indicator_engine_out_of_bounds_security_id() {
+    fn test_stress_indicator_engine_large_security_id_is_processed() {
         let params = IndicatorParams::default();
         let mut engine = IndicatorEngine::new(params);
 
-        // Security ID beyond MAX_INDICATOR_INSTRUMENTS must return default snapshot.
+        // A numerically large security_id is NOT out of bounds any more — only
+        // the COUNT of distinct instruments is capped.
         let tick = make_tick(u64::from(u32::MAX), 100.0, 1);
         let snapshot = engine.update(&tick);
 
         assert_eq!(snapshot.security_id, u64::from(u32::MAX));
-        assert_eq!(snapshot.ema_fast, 0.0);
-        assert!(!snapshot.is_warm);
+        assert_eq!(snapshot.ema_fast, 100.0);
     }
 
     #[test]
