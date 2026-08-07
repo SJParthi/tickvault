@@ -47,7 +47,7 @@ fn read(path: &Path) -> String {
 /// retained per house convention), so no `!contains("r8g.large")` assert —
 /// the §7 HEADING pin below is what forbids r8g.large as the CURRENT lock.
 #[test]
-fn instance_lock_authoritative_rule_file_pins_t4g_medium() {
+fn instance_lock_authoritative_rule_file_pins_t4g_large() {
     let root = repo_root();
     let path = root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
     assert!(
@@ -57,20 +57,27 @@ fn instance_lock_authoritative_rule_file_pins_t4g_medium() {
     );
     let body = read(&path);
     assert!(
-        body.contains("t4g.medium"),
-        "daily-universe rule file must pin `t4g.medium` as the instance lock (Quote 8, 2026-07-15)"
+        body.contains("t4g.large"),
+        "daily-universe rule file must pin `t4g.large` as the instance lock (Quote 12, 2026-08-07)"
     );
     assert!(
-        body.contains("**t4g.medium**"),
-        "daily-universe rule file must bold-pin `t4g.medium` in the §7 instance-spec table"
+        body.contains("**t4g.large**"),
+        "daily-universe rule file must bold-pin `t4g.large` in the §7 instance-spec table"
     );
     assert!(
-        body.contains("4 GiB RAM"),
-        "daily-universe rule file must pin 4 GiB RAM for t4g.medium"
+        body.contains("8 GiB RAM"),
+        "daily-universe rule file must pin 8 GiB RAM for t4g.large"
     );
     assert!(
-        body.contains("Instance lock — t4g.medium"),
-        "the §7 heading must lock t4g.medium (not r8g.large) as the CURRENT instance type"
+        body.contains("Instance lock — t4g.large"),
+        "the §7 heading must lock t4g.large as the CURRENT instance type"
+    );
+    // The capacity outage is the WHY. If a future edit drops it, the next
+    // reader loses the reason this cost roughly +400-600 rupees/month and may
+    // "helpfully" revert to t4g.medium straight back into the dead AZ pool.
+    assert!(
+        body.contains("InsufficientInstanceCapacity"),
+        "§0 Quote 12 must retain the capacity-outage rationale for the t4g.large lock"
     );
 }
 
