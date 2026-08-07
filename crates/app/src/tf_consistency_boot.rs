@@ -135,7 +135,9 @@ const SECS_PER_DAY: i64 = 86_400;
 /// alone fails the build (the `tf_index.rs` session-constant discipline).
 const SESSION_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 /// 15:30:00 IST as seconds-of-day (exclusive session close).
-const SESSION_CLOSE_SECS_OF_DAY_IST: u32 = 55_800;
+// 2026-08-07: 55_800 (15:30) -> 56_400 (15:40) with the NSE CAS change of
+// 2026-08-03 (see `MARKET_CLOSE_IST_NANOS`); the assert below pins the drift.
+const SESSION_CLOSE_SECS_OF_DAY_IST: u32 = 56_400;
 const _: () = assert!(
     SESSION_OPEN_SECS_OF_DAY_IST as i64 * NANOS_PER_SEC == MARKET_OPEN_IST_NANOS,
     "session open drifted from the canonical common-crate constant"
@@ -2534,17 +2536,24 @@ mod tests {
     }
 
     /// Per-TF daily bucket counts pinned as literals — each equals
-    /// ceil(375 / minutes-per-bucket) for the 375-minute session.
+    /// ceil(385 / minutes-per-bucket) for the 385-minute session.
+    ///
+    /// 2026-08-07 (NSE CAS change of 2026-08-03, session 375 -> 385 min):
+    /// M3 125 -> 129, M5 75 -> 77, M15 25 -> 26. Note M15 no longer divides
+    /// evenly (385 / 15 = 25.67), so its FINAL window is now a partial
+    /// [15:30, 15:40) bucket where it used to land exactly on the close —
+    /// the `is_final` truncation path, previously exercised only by M3/M5,
+    /// now covers M15 too.
     #[test]
     fn test_bucket_grid_daily_counts_all_3_tfs() {
         let expected: [(TfIndex, usize); 3] =
-            [(TfIndex::M3, 125), (TfIndex::M5, 75), (TfIndex::M15, 25)];
+            [(TfIndex::M3, 129), (TfIndex::M5, 77), (TfIndex::M15, 26)];
         for (tf, count) in expected {
             let grid = bucket_grid(tf.seconds_per_bucket());
             assert_eq!(grid.len(), count, "window count for {}", tf.display_name());
-            // ceil(375 / S_minutes) cross-check computed independently.
+            // ceil(385 / S_minutes) cross-check computed independently.
             let s_min = (tf.seconds_per_bucket() / 60) as usize;
-            assert_eq!(count, 375usize.div_ceil(s_min), "{}", tf.display_name());
+            assert_eq!(count, 385usize.div_ceil(s_min), "{}", tf.display_name());
             // Exactly the last window is final; every end ≤ 15:30.
             assert!(grid.last().is_some_and(|w| w.is_final));
             assert_eq!(grid.iter().filter(|w| w.is_final).count(), 1);
@@ -2557,10 +2566,12 @@ mod tests {
 
     #[test]
     fn test_bucket_grid_partial_final_windows_truncate_at_close() {
-        // M2's last window is one minute: [15:29, 15:30).
+        // M2 last window is one minute: [15:39, 15:40) since the 2026-08-03
+        // NSE CAS change moved the close (385 min is still odd, so M2 still
+        // ends on a single-minute partial).
         let m2 = bucket_grid(120);
         let last = m2.last().expect("windows");
-        assert_eq!(last.start_secs_of_day, 15 * 3600 + 29 * 60);
+        assert_eq!(last.start_secs_of_day, 15 * 3600 + 39 * 60);
         assert_eq!(
             last.end_effective_secs_of_day,
             SESSION_CLOSE_SECS_OF_DAY_IST
@@ -3303,7 +3314,8 @@ mod tests {
     #[test]
     fn test_session_bounds_agree_with_common_constants() {
         assert_eq!(SESSION_OPEN_SECS_OF_DAY_IST, 33_300);
-        assert_eq!(SESSION_CLOSE_SECS_OF_DAY_IST, 55_800);
+        // 2026-08-07: 15:30 -> 15:40 (NSE CAS change 2026-08-03).
+        assert_eq!(SESSION_CLOSE_SECS_OF_DAY_IST, 56_400);
         assert_eq!(
             i64::from(SESSION_OPEN_SECS_OF_DAY_IST) * NANOS_PER_SEC,
             MARKET_OPEN_IST_NANOS
@@ -3336,8 +3348,9 @@ mod tests {
     /// buckets never seal on the prod schedule.
     #[test]
     fn test_compare_tf_groww_final_missing_is_tail_unsealed_not_paging() {
-        // M5 final window is [15:25, 15:30) — start 55_500.
-        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        // M5 final window is [15:35, 15:40) — start 56_100 (2026-08-03 NSE
+        // CAS change moved the close; 385 min still divides evenly by 5).
+        let ones = vec![row(56_100, 100.0, 101.0, 99.0, 100.5, 10, 3)];
         let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
         assert!(
             findings.is_empty(),
@@ -3486,8 +3499,8 @@ mod tests {
         // 03:00 IST — the GIFT-Nifty overnight signature.
         let overnight = vec![row(3 * 3600, 1.0, 1.0, 1.0, 1.0, 0, 1)];
         assert!(has_out_of_session_1m_row(&overnight, DAY_START));
-        // Boundary: exactly 15:30:00 is OUT of session.
-        let at_close = vec![row(55_800, 1.0, 1.0, 1.0, 1.0, 0, 1)];
+        // Boundary: exactly 15:40:00 is OUT of session (close is exclusive).
+        let at_close = vec![row(56_400, 1.0, 1.0, 1.0, 1.0, 0, 1)];
         assert!(has_out_of_session_1m_row(&at_close, DAY_START));
         // Boundary: 09:14:59 is OUT; 09:15:00 and 15:29:00 are IN.
         let pre_open = vec![row(33_299, 1.0, 1.0, 1.0, 1.0, 0, 1)];

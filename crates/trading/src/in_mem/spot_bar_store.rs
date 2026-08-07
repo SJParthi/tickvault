@@ -57,15 +57,22 @@ use tickvault_common::types::SecurityId;
 
 use crate::candles::{TF_COUNT, TfIndex};
 
-/// Trading-session length in seconds (09:15 → 15:30 IST), const-derived
+/// Trading-session length in seconds (09:15 → 15:40 IST), const-derived
 /// from the canonical nanos constants so a session change cannot silently
 /// diverge the ring capacity math.
+///
+/// 2026-08-07: 22_500 (375 min) -> 23_100 (385 min). NSE extended equity
+/// derivatives to 15:40 on 2026-08-03 for the new Closing Auction Session —
+/// see `MARKET_CLOSE_IST_NANOS`. This const-assert is the reason that change
+/// could not land half-applied: the ring capacity math derives from the same
+/// two constants, so a session move that missed this file would fail the
+/// BUILD rather than silently under-size every per-timeframe ring.
 pub const SESSION_SECS: u32 =
     ((MARKET_CLOSE_IST_NANOS - MARKET_OPEN_IST_NANOS) / 1_000_000_000) as u32;
 
 const _: () = assert!(
-    SESSION_SECS == 22_500,
-    "session length must be 375 minutes (09:15-15:30 IST)"
+    SESSION_SECS == 23_100,
+    "session length must be 385 minutes (09:15-15:40 IST)"
 );
 
 /// One sealed bar resident in RAM — 48 bytes, `Copy`, no heap.
@@ -557,14 +564,15 @@ mod tests {
 
     #[test]
     fn test_bars_per_day_session_math() {
-        // ceil(22_500 / tf_secs), floored at 1 — spot-checked + summed.
-        assert_eq!(bars_per_day(TfIndex::M1), 375);
-        assert_eq!(bars_per_day(TfIndex::M3), 125);
-        assert_eq!(bars_per_day(TfIndex::M5), 75);
-        assert_eq!(bars_per_day(TfIndex::M15), 25);
+        // ceil(23_100 / tf_secs), floored at 1 — spot-checked + summed.
+        // 2026-08-07: session 375 -> 385 min (NSE CAS change 2026-08-03).
+        assert_eq!(bars_per_day(TfIndex::M1), 385);
+        assert_eq!(bars_per_day(TfIndex::M3), 129);
+        assert_eq!(bars_per_day(TfIndex::M5), 77);
+        assert_eq!(bars_per_day(TfIndex::M15), 26);
         assert_eq!(bars_per_day(TfIndex::D1), 1);
-        assert_eq!(total_bars_per_day_all_tfs(), 601);
-        assert_eq!(SESSION_SECS, 22_500);
+        assert_eq!(total_bars_per_day_all_tfs(), 618);
+        assert_eq!(SESSION_SECS, 23_100);
     }
 
     #[test]
@@ -572,8 +580,9 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 601 × 35 × 8 × 48 = 8_077_440 B ≈ 7.7 MiB.
-        assert_eq!(bytes, 8_077_440);
+        // 618 × 35 × 8 × 48 = 8_305_920 B ≈ 7.9 MiB
+        // (2026-08-07: 601 -> 618 bars/day with the 385-minute session).
+        assert_eq!(bytes, 8_305_920);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -619,11 +628,12 @@ mod tests {
 
     #[test]
     fn test_spot_bar_store_wraparound_evicts_oldest() {
-        // spot_days=1 → M15 capacity = 25 bars; the 26th append evicts the
-        // oldest, and an over-window old bar is dropped (never displaces).
+        // spot_days=1 → M15 capacity = 26 bars (385-min session, 2026-08-07);
+        // the 27th append evicts the oldest, and an over-window old bar is
+        // dropped (never displaces).
         let store = SpotBarStore::new(1);
         let cap = bars_per_day(TfIndex::M15) as usize;
-        assert_eq!(cap, 25);
+        assert_eq!(cap, 26);
         for i in 0..(cap as u32 + 1) {
             store.append_sealed(key(), TfIndex::M15, bar(OPEN0 + i * 900, f64::from(i)));
         }
@@ -756,8 +766,8 @@ mod tests {
         assert_eq!(stats.bars_resident_per_feed[Feed::Groww.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Groww.index()], 1);
-        // Two slots × 1 day × 601 bars × 48 B of pre-allocated capacity.
-        assert_eq!(stats.estimated_bytes, 2 * 601 * 48);
+        // Two slots × 1 day × 618 bars × 48 B of pre-allocated capacity (385-min session).
+        assert_eq!(stats.estimated_bytes, 2 * 618 * 48);
     }
 
     #[test]
@@ -767,23 +777,26 @@ mod tests {
         // pinned 16 × 48 B = 768 B/slot of actual heap) and are excluded
         // from the RAM-resident bar total + byte estimate; the session
         // formula stays honest for the future GDF capacity flip.
-        assert_eq!(bars_per_day(TfIndex::S1), 22_500);
-        assert_eq!(bars_per_day(TfIndex::S2), 11_250);
-        assert_eq!(bars_per_day(TfIndex::S15), 1_500);
-        assert_eq!(bars_per_day(TfIndex::S30), 750);
+        assert_eq!(bars_per_day(TfIndex::S1), 23_100);
+        assert_eq!(bars_per_day(TfIndex::S2), 11_550);
+        assert_eq!(bars_per_day(TfIndex::S15), 1_540);
+        assert_eq!(bars_per_day(TfIndex::S30), 770);
         let mut gated_formula_total = 0u32;
         for tf in TfIndex::ALL {
             if tf.is_second_scale() {
                 gated_formula_total += bars_per_day(tf);
             }
         }
-        assert_eq!(gated_formula_total, 75_413, "gated formula sum drifted");
+        // 2026-08-07: 75_413 -> 77_422 with the 385-minute session. These are
+        // the GDF-gated second-scale frames — capacity-1 placeholders today,
+        // so the number is the would-be formula cost, not allocated memory.
+        assert_eq!(gated_formula_total, 77_422, "gated formula sum drifted");
         // The resident total + byte estimate exclude the gated frames.
-        assert_eq!(total_bars_per_day_all_tfs(), 601);
+        assert_eq!(total_bars_per_day_all_tfs(), 618);
         let store = SpotBarStore::new(35);
         store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
         let stats = store.stats();
-        assert_eq!(stats.estimated_bytes, 601 * 35 * 48);
+        assert_eq!(stats.estimated_bytes, 618 * 35 * 48);
         let slot = store.find_slot(key()).expect("slot exists");
         let rings = slot.rings.read();
         assert_eq!(rings.len(), TF_COUNT, "one ring per TfIndex ordinal");

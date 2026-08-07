@@ -14,8 +14,9 @@
 # Triggers:
 #   - schedule: every 15 min between 03:00-11:00 UTC (08:30-16:30 IST) Mon-Fri,
 #     i.e. while the box is supposed to be up. (Cheap: a few aws CLI calls.)
-#   - workflow_dispatch: on-demand, with a `strict` input that exits non-zero
-#     if anything is unhealed (so you can wire it as a gate).
+#   - workflow_dispatch: on-demand. (The `strict` input is retained for
+#     backward compatibility but no longer changes anything: since 2026-08-07
+#     an unhealed issue fails the run on EVERY trigger, scheduled included.)
 #
 # Auth: same OIDC-or-access-key fallback as seed/deploy. Skips cleanly if the
 # bootstrap secrets aren't set.
@@ -30,7 +31,7 @@ on:
   workflow_dispatch:
     inputs:
       strict:
-        description: 'Exit non-zero if any issue is left unhealed? (yes/no)'
+        description: 'DEPRECATED no-op — unhealed issues now fail the run on every trigger'
         required: false
         default: 'no'
 
