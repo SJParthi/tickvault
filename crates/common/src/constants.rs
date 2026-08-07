@@ -3902,6 +3902,15 @@ pub const CAS_WINDOW_CLOSE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 35 * 60;
 /// TRUE when an IST seconds-of-day instant falls inside the Closing Auction
 /// Session (open-inclusive, close-exclusive). Pure, O(1), no allocation.
 #[must_use]
+// WIRING-EXEMPT: deliberately dormant. This PR moves the session CLOSE to
+// 15:40 (the data loss that was actively bleeding every day); the CAS row
+// TAGGING that consumes this predicate is NOT built yet, so there is no
+// production call site and I will not invent one to satisfy the guard.
+// Shipping the predicate now — pure, const, unit-tested at all four
+// boundaries below — keeps the auction window defined in ONE place so the
+// tagging consumer cannot re-derive it slightly differently later. If that
+// consumer never lands, DELETE this function rather than leaving it dormant
+// forever.
 pub const fn is_in_cas_window(secs_of_day_ist: u32) -> bool {
     secs_of_day_ist >= CAS_WINDOW_OPEN_SECS_OF_DAY_IST
         && secs_of_day_ist < CAS_WINDOW_CLOSE_SECS_OF_DAY_IST
@@ -4948,6 +4957,29 @@ mod tests {
     fn test_market_close_ist_nanos_pinned_at_1540_exclusive() {
         // 15h * 3600 + 40m * 60 = 56_400 secs.
         assert_eq!(MARKET_CLOSE_IST_NANOS, 56_400_000_000_000);
+    }
+
+    /// Closing Auction Session window (NSE, from 2026-08-03): 15:15 open
+    /// INCLUSIVE, 15:35 close EXCLUSIVE. Both edges pinned so a future edit
+    /// cannot quietly widen or narrow the auction band.
+    #[test]
+    fn test_cas_window_boundaries() {
+        assert_eq!(CAS_WINDOW_OPEN_SECS_OF_DAY_IST, 54_900); // 15:15:00
+        assert_eq!(CAS_WINDOW_CLOSE_SECS_OF_DAY_IST, 56_100); // 15:35:00
+        // One second before the auction opens — OUT.
+        assert!(!is_in_cas_window(54_899));
+        // The open instant itself — IN (inclusive).
+        assert!(is_in_cas_window(54_900));
+        // Last second inside — IN.
+        assert!(is_in_cas_window(56_099));
+        // The close instant — OUT (exclusive).
+        assert!(!is_in_cas_window(56_100));
+        // The auction must sit strictly inside the trading session, or we
+        // would be tagging rows we no longer capture.
+        assert!(CAS_WINDOW_OPEN_SECS_OF_DAY_IST > 33_300);
+        assert!(
+            i64::from(CAS_WINDOW_CLOSE_SECS_OF_DAY_IST) * 1_000_000_000 <= MARKET_CLOSE_IST_NANOS
+        );
     }
 
     /// Spot 1m REST pipeline (operator grant 2026-07-12) — the index set

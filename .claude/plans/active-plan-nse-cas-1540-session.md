@@ -124,9 +124,16 @@ Rows already captured in the extra 10 minutes remain valid and DEDUP-keyed.
         `crates/app/src/day_ohlc_orchestrator.rs`,
         `crates/core/src/cadence/{decision,runner}.rs`
       - Tests: session-window boundary tests per crate
-- [x] Item 3 — CAS window constants + row tagging + counter
+- [x] Item 3 — CAS window constants + `is_in_cas_window()` predicate
       - Files: `crates/common/src/constants.rs`
-      - Tests: `test_cas_window_boundaries`
+      - Tests: `test_cas_window_boundaries` (all four edges)
+      - **PARTIAL, stated honestly:** the row TAGGING and the
+        `tv_cas_window_rows_total` counter promised in Design/Observability are
+        NOT built. The pub-fn wiring guard correctly flagged the predicate as
+        dormant; it carries a `WIRING-EXEMPT` naming that gap rather than an
+        invented call site. Scope call: this PR fixes the ACTIVE daily data
+        loss (the 15:30 close); tagging is additive and can land with its
+        consumer. Follow-up: wire the tag + counter, or delete the predicate.
 - [x] Item 4 — update ratchets/docs that pin the old close
       - Files: affected `crates/*/tests/*.rs`, rule/docs references
       - Tests: full per-crate suites green
