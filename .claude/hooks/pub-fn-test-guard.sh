@@ -127,7 +127,16 @@ if [ "$MODE" = "all" ]; then
   CURRENT_COUNT=$(count_untested "$FILES" "all")
 
   if [ ! -f "$BASELINE_FILE" ]; then
-    # First run: establish baseline
+    # FAIL CLOSED in CI (2026-08-07) — see test-count-guard.sh for the full
+    # rationale. A ratchet with no baseline compares nothing and passes
+    # vacuously; the baseline is tracked in git now.
+    if [ -n "${CI:-}" ]; then
+      echo "  FAIL: untested-pubfn baseline missing in CI: $BASELINE_FILE" >&2
+      echo "  This guard is a RATCHET; with no baseline it cannot compare and would pass vacuously." >&2
+      echo "  The baseline is tracked in git — restore it rather than regenerating." >&2
+      exit 1
+    fi
+    # First run (local dev only): establish baseline
     echo "$CURRENT_COUNT" > "$BASELINE_FILE"
     echo "  PASS: Untested pub fn baseline established: $CURRENT_COUNT (ratchet — can only go DOWN)" >&2
     exit 0
@@ -145,8 +154,14 @@ if [ "$MODE" = "all" ]; then
   fi
 
   if [ "$CURRENT_COUNT" -lt "$BASELINE" ]; then
-    echo "$CURRENT_COUNT" > "$BASELINE_FILE"
-    echo "  PASS: Untested pub fn count decreased ($BASELINE -> $CURRENT_COUNT) — baseline updated" >&2
+    # Baseline is TRACKED IN GIT since 2026-08-07 so the ratchet is real in CI.
+    # Auto-writing it here would dirty every working tree on every machine whose
+    # count differs -- exactly the breakage that forced the 2026-07-13 untracking
+    # (see .claude/rules/project/enforcement.md). Ratchet movement is now a
+    # deliberate, PR-visible edit, same discipline as
+    # quality/crate-coverage-thresholds.toml. Improvement still PASSES.
+    echo "  PASS: Untested pub fn count decreased ($BASELINE -> $CURRENT_COUNT)." >&2
+    echo "  Ratchet it in THIS PR:  echo $CURRENT_COUNT > $BASELINE_FILE" >&2
   else
     echo "  PASS: Untested pub fn count stable ($CURRENT_COUNT)" >&2
   fi

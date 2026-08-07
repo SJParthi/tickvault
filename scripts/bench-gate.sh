@@ -29,6 +29,23 @@
 # exceeds max_regression_pct — i.e. even the optimistic bound of the measured
 # change is a >5% slowdown. Point-estimate-only deltas (cross-runner noise,
 # statistically insignificant jitter) do NOT fail the gate.
+#
+# Hardware-drift suppression (added 2026-08-07 — the false-RED fix):
+#   The CI-lower-bound rule above filters NOISE but not a systematic hardware
+#   SHIFT: when GitHub rotates the shared runner pool, every benchmark gets
+#   confidently slower against a baseline recorded on the previous hardware.
+#   Observed live on main @993a144c: 31 of 31 benches "regressed" +24..30%
+#   while EVERY absolute ns budget passed with 5-10x margin, and the identical
+#   tree (da796888) had passed two days earlier.
+#   The discriminator is SHAPE, not size: a code regression hits a few RELATED
+#   benchmarks; a hardware shift hits nearly ALL of them by nearly the SAME
+#   amount. When count >= HARDWARE_DRIFT_MIN_COUNT AND the regressing share
+#   >= HARDWARE_DRIFT_MIN_SHARE AND the spread <= HARDWARE_DRIFT_SPREAD_PCT,
+#   the relative arm is suppressed and every line is reported as DRIFT with an
+#   explicit verdict. Absolute budgets are NEVER suppressed.
+#   This is strictly MORE discriminating than widening max_regression_pct
+#   (which would blind the gate to real 30% regressions) and than resetting the
+#   baseline (which re-breaks on the next rotation).
 # =============================================================================
 
 set -euo pipefail
@@ -36,6 +53,14 @@ set -euo pipefail
 CRITERION_DIR="${1:-target/criterion}"
 BUDGETS_FILE="quality/benchmark-budgets.toml"
 BENCH_BUDGET_MULTIPLIER="${BENCH_BUDGET_MULTIPLIER:-1.0}"
+
+# ---- hardware-drift thresholds (2026-08-07) ---------------------------------
+# All three must hold before the relative regression arm may be suppressed.
+# Deliberately NOT env-overridable: they are the gate's semantics, and an env
+# knob would be a one-line way to silence a real regression in CI.
+HARDWARE_DRIFT_MIN_COUNT=5      # never classify drift from a handful of benches
+HARDWARE_DRIFT_MIN_SHARE=0.70   # >= 70% of compared benches must have regressed
+HARDWARE_DRIFT_SPREAD_PCT=15    # max-min of the regressions, in percentage points
 
 # Validate the multiplier early and loudly: digits and at most one dot only
 # (rejects empty, negative, and non-numeric garbage before it reaches the evaluator).
@@ -146,6 +171,9 @@ done < <(find "$CRITERION_DIR" -name "estimates.json" -path "*/change/*" 2>/dev/
 LC_ALL=C awk -F'\t' \
   -v budgets_file="$BUDGETS_FILE" \
   -v multiplier_raw="$BENCH_BUDGET_MULTIPLIER" \
+  -v drift_min_count="$HARDWARE_DRIFT_MIN_COUNT" \
+  -v drift_min_share="$HARDWARE_DRIFT_MIN_SHARE" \
+  -v drift_spread_pct="$HARDWARE_DRIFT_SPREAD_PCT" \
 '
 function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
 # frepr: render a decimal string the way the legacy float repr did for the
@@ -273,17 +301,20 @@ $1 == "C" {
   bench = tolower(bench)
   point_pct = ($3 + 0) * 100
   lb = $4
+  cmp_total++
   if (lb != "NA") {
     lower_pct = (lb + 0) * 100
     if (lower_pct > max_regression) {
-      printf "  FAIL: %s: %+.1f%% regression (CI lower bound %+.1f%% > %s%%)\n", bench, point_pct, lower_pct, frepr(max_regression_raw)
-      reg_failed = 1
+      reg_n++
+      reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
+      reg_lower[reg_n] = lower_pct; reg_kind[reg_n] = "ci"
     }
   } else {
     printf "  NOTE: %s: change/estimates.json has no confidence_interval — falling back to point estimate\n", bench
     if (point_pct > max_regression) {
-      printf "  FAIL: %s: %+.1f%% regression (point estimate, no CI available; max: %s%%)\n", bench, point_pct, frepr(max_regression_raw)
-      reg_failed = 1
+      reg_n++
+      reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
+      reg_lower[reg_n] = point_pct; reg_kind[reg_n] = "point"
     }
   }
   next
@@ -292,6 +323,44 @@ END {
   if (died) exit 1
   if (checked == 0)
     print "  INFO: No benchmarks matched budget entries — gate passed (no violations)."
+
+  # ---- hardware-drift classification (2026-08-07) --------------------------
+  # A CODE regression hits a FEW RELATED benchmarks. A runner/toolchain change
+  # hits ALL of them by roughly the SAME amount. Declare drift only when all
+  # three hold: enough samples to be meaningful, nearly every compared bench
+  # regressed, and the regressions cluster tightly. Fail-safe in every other
+  # case -> the pre-2026-08-07 behaviour is preserved exactly.
+  drift = 0; share = 0; spread = 0
+  if (reg_n > 0) {
+    if (cmp_total > 0) share = reg_n / cmp_total
+    lo = reg_point[1]; hi = reg_point[1]
+    for (i = 2; i <= reg_n; i++) {
+      if (reg_point[i] < lo) lo = reg_point[i]
+      if (reg_point[i] > hi) hi = reg_point[i]
+    }
+    spread = hi - lo
+    if (reg_n >= drift_min_count && share >= drift_min_share && spread <= drift_spread_pct)
+      drift = 1
+  }
+  for (i = 1; i <= reg_n; i++) {
+    if (drift) {
+      printf "  DRIFT: %s: %+.1f%% (uniform shift — suppressed, see verdict)\n", reg_bench[i], reg_point[i]
+    } else if (reg_kind[i] == "ci") {
+      printf "  FAIL: %s: %+.1f%% regression (CI lower bound %+.1f%% > %s%%)\n", reg_bench[i], reg_point[i], reg_lower[i], frepr(max_regression_raw)
+      reg_failed = 1
+    } else {
+      printf "  FAIL: %s: %+.1f%% regression (point estimate, no CI available; max: %s%%)\n", reg_bench[i], reg_point[i], frepr(max_regression_raw)
+      reg_failed = 1
+    }
+  }
+  if (drift) {
+    printf "\n  HARDWARE DRIFT DETECTED: %d of %d compared benchmarks regressed (%.0f%% >= %.0f%%), spread %.1f pts <= %.1f.\n", \
+      reg_n, cmp_total, share * 100, drift_min_share * 100, spread, drift_spread_pct
+    print "  A code regression hits a few RELATED benchmarks; a uniform shift across nearly ALL of them is the runner, not the code."
+    print "  The RELATIVE regression arm is SUPPRESSED for this run."
+    print "  NOT suppressed: the absolute ns budgets above, which still gate and still fail this run if breached."
+    print "  Honest limit: a genuine broad regression coinciding with a runner rotation is indistinguishable from relative data alone."
+  }
   print ""
   if (reg_failed) {
     print "  Benchmark budget gate FAILED (confident regression)."
