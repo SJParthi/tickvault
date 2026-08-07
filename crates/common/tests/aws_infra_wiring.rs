@@ -100,20 +100,27 @@ fn test_terraform_instance_type_pinned() {
     let content =
         std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
             .expect("variables.tf must be readable"); // APPROVED: test
-    // Operator-lock 2026-07-15 (daily-universe-scope-expansion-2026-05-27.md §7
-    // Quote 8): t4g.medium ONLY (Graviton2 burstable, 4 GiB) — DOWNSIZED from
-    // r8g.large (cost cut; Groww-only runtime). SUPERSEDES the 2026-06-30
-    // r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large locks. Any
-    // reintroduction of r8g.large / m8g.large / c7i.xlarge / c8g.xlarge as the
+    // Operator-lock 2026-08-07 (daily-universe-scope-expansion-2026-05-27.md §7
+    // Quote 12): t4g.large ONLY (Graviton2 burstable, 8 GiB). NOT a performance
+    // upgrade — AWS ran out of t4g.medium capacity in ap-south-1a and the box,
+    // pinned to that single AZ by main.tf, could not start for whole trading
+    // sessions (Aug 5 = 0h, Aug 7 = 0h). A different instance type draws from a
+    // different capacity pool. SUPERSEDES the 2026-07-15 t4g.medium +
+    // 2026-06-30 r8g.large + 2026-05-29 m8g.large locks. Any reintroduction of
+    // t4g.medium / r8g.large / m8g.large / c7i.xlarge / c8g.xlarge as the
     // PINNED type fails this test. (Retired types may still appear in
     // SUPERSEDES prose — only the validation condition is forbidden.)
     assert!(
-        content.contains("\"t4g.medium\""),
-        "variables.tf must pin instance_type to t4g.medium (operator lock 2026-07-15, see daily-universe-scope-expansion-2026-05-27.md §7 Quote 8)"
+        content.contains("\"t4g.large\""),
+        "variables.tf must pin instance_type to t4g.large (operator lock 2026-08-07, see daily-universe-scope-expansion-2026-05-27.md §7 Quote 12)"
     );
     assert!(
-        content.contains("var.instance_type == \"t4g.medium\""),
+        content.contains("var.instance_type == \"t4g.large\""),
         "variables.tf must VALIDATE instance_type pinning"
+    );
+    assert!(
+        !content.contains("var.instance_type == \"t4g.medium\""),
+        "t4g.medium retired as the pinned type (operator capacity-escape lock 2026-08-07)"
     );
     // Negative asserts — block the retired stacks from ever returning as the
     // validated default (r8g.large/m8g.large/t4g.large may still appear in

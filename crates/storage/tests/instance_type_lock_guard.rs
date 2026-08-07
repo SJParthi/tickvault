@@ -172,9 +172,26 @@ fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    // 2026-08-07 (Quote 12): the CURRENT bill is the t4g.large one. The old
+    // t4g.medium figures below stay asserted because the file retains them as
+    // dated history — but the guard would otherwise have kept passing while
+    // pinning a SUPERSEDED bill as if it were live, which is precisely the
+    // false-OK class this repo bans. The new figures are asserted first.
+    assert!(
+        body.contains("~₹1,896/mo"),
+        "rule file must pin the CURRENT t4g.large 270-hr bill (~₹1,896/mo incl GST, live 30 GB root, EIP kept) — Quote 12, 2026-08-07"
+    );
+    assert!(
+        body.contains("~₹1,473/mo"),
+        "rule file must pin the CURRENT t4g.large ~176-hr figure (~₹1,473/mo incl GST)"
+    );
+    assert!(
+        body.contains("< ₹1,000/mo") || body.contains("sub-₹1,000"),
+        "rule file must keep the Quote 9 target visible so the breach stays legible"
+    );
     assert!(
         body.contains("~₹1,289/mo") || body.contains("Rs 1,289/mo"),
-        "rule file §7 must pin the CORRECTED INTERIM ~₹1,289/mo bill (live 30 GB root verified 2026-07-19: t4g.medium, 270 hrs, +EIP, incl GST)"
+        "rule file §7 must RETAIN the superseded t4g.medium ~₹1,289/mo bill as dated history"
     );
     assert!(
         body.contains("30 GiB gp3") && body.contains("never physically applied"),
