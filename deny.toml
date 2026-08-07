@@ -169,15 +169,13 @@ allow-registry = [
     "https://github.com/rust-lang/crates.io-index",
     "sparse+https://index.crates.io/",
 ]
-allow-git = ["https://github.com/SJParthi/bruteX"]
+# No git dependencies. The sole entry was SJParthi/bruteX for the `trading-core`
+# dev-dep, removed 2026-08-07 (its pinned rev was force-pushed away upstream and
+# the package exists on no bruteX branch — see root Cargo.toml). The empty list
+# with unknown-git = "deny" above now means: NO git dependency may be added
+# without a deliberate edit here, which is the stronger posture.
+allow-git = []
 
-# bruteX trading-core (pinned git dev-dep): proprietary license scoped to this ONE
-# crate — the global [licenses] allow list stays untouched.
-[[licenses.clarify]]
-crate = "trading-core"
-expression = "LicenseRef-Proprietary"
-license-files = []
-
-[[licenses.exceptions]]
-crate = "trading-core"
-allow = ["LicenseRef-Proprietary"]
+# (The two trading-core licence clarify/exception entries were removed with the
+#  dependency. cargo-deny errors on a clarify/exception for a crate absent from
+#  the graph, so they could not be left behind as dead config.)

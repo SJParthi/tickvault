@@ -9,9 +9,16 @@ rust-version = "1.95.0"
 license = "MIT"
 
 [workspace.dependencies]
-# bruteX trading-core — READ-ONLY git dep pinned to an exact commit (never a branch/tag float).
-# Guard: crates/storage/tests/trading_core_rev_pin_guard.rs
-trading-core = { git = "https://github.com/SJParthi/bruteX", rev = "184a48a4abb0ec2fd61906499a6a799a752abd7e", default-features = false }
+# NOTE (2026-08-07): the `trading-core` git dev-dependency on SJParthi/bruteX was
+# REMOVED here. Its pinned rev 184a48a4abb0ec2fd61906499a6a799a752abd7e was
+# force-pushed out of bruteX and no longer exists ("upload-pack: not our ref"),
+# so `cargo metadata` could not resolve the workspace and EVERY CI job died in
+# ~20s before compiling a line. Re-pinning was not possible: an exhaustive scan
+# of all 11 bruteX branches found NO package named `trading-core` on any of
+# them (bruteX now ships `api` / `core` / `store` / `greeks`, and none exports
+# round_half_even, compute_fib_levels, compute_pivot_levels or greeks).
+# Restoring the parity oracle needs a package that actually exists upstream —
+# see the removed crates/trading/tests/trading_core_parity.rs in git history.
 # S6-Step8 / S7: Cargo.toml is the executable single source of truth.
 # (Tech Stack Bible deleted 2026-04-14.) Use exact pins (no ^/~/*).
 # Run `bash .claude/hooks/dep-freshness-scanner.sh` to check for drift.
