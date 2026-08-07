@@ -39,22 +39,68 @@ use std::path::PathBuf;
 // ws_frame_spill drop-dimension record-site, which is live (the WAL is
 // KEEP).
 
-/// SP5.1: the drops dimension is now WIRED at the storage terminal-loss site.
-/// A dropped Dhan live-feed frame records `record_drops(Feed::Dhan)` in the
-/// `ws_frame_spill` drop arms → `drops>0 → Degraded` → the feed light flips 🟡,
-/// closing the SP5 connected+fresh-but-dropping false-OK.
+/// SP5.1: the drops dimension is WIRED at the storage terminal-loss site.
+/// A dropped live-feed frame records `record_drops` in the `ws_frame_spill`
+/// drop arms → `drops>0 → Degraded` → the feed light flips 🟡, closing the
+/// SP5 connected+fresh-but-dropping false-OK.
+///
+/// 2026-07-25: the attribution moved from a hardcoded `Feed::Dhan` to
+/// `WsType::owning_feed()`, so that a TrueData frame drop is reported
+/// against TrueData rather than Dhan (the WAL record carries no feed field —
+/// the transport tag is the only feed evidence that reaches disk). The
+/// SP5.1 invariant is UNCHANGED and is now asserted BEHAVIOURALLY below
+/// rather than by matching source literals: `owning_feed` is a pure
+/// function, so the guard can call it instead of grepping for the shape of
+/// its call site.
 #[test]
 fn test_sp5_1_drops_dimension_wired_in_spill() {
+    use tickvault_common::feed::Feed;
+    use tickvault_storage::ws_frame_spill::WsType;
+
+    // The SP5.1 invariant itself: a dropped LIVE-FEED frame must attribute
+    // to Dhan. Asserted directly, not inferred from source text.
+    assert_eq!(
+        WsType::LiveFeed.owning_feed(),
+        Some(Feed::Dhan),
+        "SP5.1 regression: a dropped LIVE-FEED frame no longer attributes to \
+         Dhan — the connected+fresh-but-dropping false-OK has re-opened (a \
+         dropping Dhan feed would read `ok`, not `degraded`)."
+    );
+    // ...and must not attribute to the WRONG broker, which is the failure
+    // this generalisation exists to prevent.
+    assert_eq!(
+        WsType::TruedataFeed.owning_feed(),
+        Some(Feed::Truedata),
+        "a TrueData frame drop must be reported against TrueData — naming the \
+         wrong broker sends the operator to investigate a healthy feed while \
+         the dropping one goes untouched."
+    );
+    assert_eq!(
+        WsType::OrderUpdate.owning_feed(),
+        None,
+        "an order-update drop must never flip a MARKET-DATA feed to degraded."
+    );
+
+    // The remaining source-scan half: the drop arms must still CALL the
+    // recorder. This cannot be asserted behaviourally without a live spill
+    // + registry, so the call-site wiring stays a scan.
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop(); // crates/app -> crates
     path.push("storage/src/ws_frame_spill.rs");
     let src =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert!(
-        src.contains("fh.record_drops(tickvault_common::feed::Feed::Dhan")
-            && src.contains("matches!(ws_type, WsType::LiveFeed)"),
-        "SP5.1 regression: the WAL frame spill no longer records a Dhan drop on a \
-         dropped LIVE-FEED frame — the connected+fresh-but-dropping false-OK has \
-         re-opened (a dropping Dhan feed would read `ok`, not `degraded`)."
+        src.contains("fh.record_drops(feed, 1)") && src.contains("ws_type.owning_feed()"),
+        "SP5.1 regression: the WAL frame spill no longer records a feed drop on \
+         a dropped frame — the connected+fresh-but-dropping false-OK has \
+         re-opened."
+    );
+    assert_eq!(
+        src.matches("self.record_feed_drop_for_health(ws_type);")
+            .count(),
+        2,
+        "both terminal-loss drop arms (channel Full, writer Disconnected) must \
+         record the drop — losing one arm silently re-opens the false-OK for \
+         that cause only, which is harder to notice than losing both."
     );
 }

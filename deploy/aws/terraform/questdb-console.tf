@@ -60,7 +60,7 @@ resource "aws_security_group" "qdb_console_lambda" {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Packaging — 2026-07-18 (rust-only phase 2b-3): the two Python handlers were
+# Packaging — 2026-07-18 (rust-only phase 2b-3): the two legacy handlers were
 # PORTED to Rust (crates/aws-lambdas/src/qdb_console_proxy.rs +
 # qdb_console_front.rs; thin bootstrap bins qdb-console-proxy /
 # qdb-console-front). The archive_file blocks are gone: the zips are built in
@@ -71,7 +71,7 @@ resource "aws_security_group" "qdb_console_lambda" {
 # contract: same env vars (QDB_BASE / BACK_FN_ARN / CONTROL_SECRET_PARAM),
 # same SQL gate, same HMAC link/session tokens, same relay envelope — every
 # deviation documented at the deviating line in the Rust sources; the 31+61
-# Python unit tests were ported 1:1.
+# legacy unit tests were ported 1:1.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────

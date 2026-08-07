@@ -47,7 +47,7 @@ fn read(path: &Path) -> String {
 /// retained per house convention), so no `!contains("r8g.large")` assert —
 /// the §7 HEADING pin below is what forbids r8g.large as the CURRENT lock.
 #[test]
-fn instance_lock_authoritative_rule_file_pins_t4g_medium() {
+fn instance_lock_authoritative_rule_file_pins_t4g_large() {
     let root = repo_root();
     let path = root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
     assert!(
@@ -57,20 +57,27 @@ fn instance_lock_authoritative_rule_file_pins_t4g_medium() {
     );
     let body = read(&path);
     assert!(
-        body.contains("t4g.medium"),
-        "daily-universe rule file must pin `t4g.medium` as the instance lock (Quote 8, 2026-07-15)"
+        body.contains("t4g.large"),
+        "daily-universe rule file must pin `t4g.large` as the instance lock (Quote 12, 2026-08-07)"
     );
     assert!(
-        body.contains("**t4g.medium**"),
-        "daily-universe rule file must bold-pin `t4g.medium` in the §7 instance-spec table"
+        body.contains("**t4g.large**"),
+        "daily-universe rule file must bold-pin `t4g.large` in the §7 instance-spec table"
     );
     assert!(
-        body.contains("4 GiB RAM"),
-        "daily-universe rule file must pin 4 GiB RAM for t4g.medium"
+        body.contains("8 GiB RAM"),
+        "daily-universe rule file must pin 8 GiB RAM for t4g.large"
     );
     assert!(
-        body.contains("Instance lock — t4g.medium"),
-        "the §7 heading must lock t4g.medium (not r8g.large) as the CURRENT instance type"
+        body.contains("Instance lock — t4g.large"),
+        "the §7 heading must lock t4g.large as the CURRENT instance type"
+    );
+    // The capacity outage is the WHY. If a future edit drops it, the next
+    // reader loses the reason this cost roughly +400-600 rupees/month and may
+    // "helpfully" revert to t4g.medium straight back into the dead AZ pool.
+    assert!(
+        body.contains("InsufficientInstanceCapacity"),
+        "§0 Quote 12 must retain the capacity-outage rationale for the t4g.large lock"
     );
 }
 
@@ -165,9 +172,26 @@ fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    // 2026-08-07 (Quote 12): the CURRENT bill is the t4g.large one. The old
+    // t4g.medium figures below stay asserted because the file retains them as
+    // dated history — but the guard would otherwise have kept passing while
+    // pinning a SUPERSEDED bill as if it were live, which is precisely the
+    // false-OK class this repo bans. The new figures are asserted first.
+    assert!(
+        body.contains("~₹1,896/mo"),
+        "rule file must pin the CURRENT t4g.large 270-hr bill (~₹1,896/mo incl GST, live 30 GB root, EIP kept) — Quote 12, 2026-08-07"
+    );
+    assert!(
+        body.contains("~₹1,473/mo"),
+        "rule file must pin the CURRENT t4g.large ~176-hr figure (~₹1,473/mo incl GST)"
+    );
+    assert!(
+        body.contains("< ₹1,000/mo") || body.contains("sub-₹1,000"),
+        "rule file must keep the Quote 9 target visible so the breach stays legible"
+    );
     assert!(
         body.contains("~₹1,289/mo") || body.contains("Rs 1,289/mo"),
-        "rule file §7 must pin the CORRECTED INTERIM ~₹1,289/mo bill (live 30 GB root verified 2026-07-19: t4g.medium, 270 hrs, +EIP, incl GST)"
+        "rule file §7 must RETAIN the superseded t4g.medium ~₹1,289/mo bill as dated history"
     );
     assert!(
         body.contains("30 GiB gp3") && body.contains("never physically applied"),

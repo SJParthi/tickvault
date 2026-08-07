@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -187,7 +187,7 @@ jobs:
             TOTAL=${TOTAL:-0}; MISSED=${MISSED:-0}; CAUGHT=${CAUGHT:-0}; TIMEOUT=${TIMEOUT:-0}
             if [ "$TOTAL" -gt 0 ]; then
               # Language port 2026-07-18 (rust-only purge Phase 2a-1): the
-              # former python3 f'{c / t * 100:.1f}' one-liner, re-expressed as
+              # former interpreter f'{c / t * 100:.1f}' one-liner, re-expressed as
               # awk printf "%.1f" — both format the same IEEE-754 double with
               # correctly-rounded decimal output (byte-identical values;
               # spot-checked across the caught/total range in the porting PR).

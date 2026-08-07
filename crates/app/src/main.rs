@@ -699,6 +699,7 @@ async fn main() -> Result<()> {
             } else {
                 let mut live = 0u64;
                 let mut ord = 0u64;
+                let mut truedata = 0u64;
                 for rec in recovered {
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
@@ -710,13 +711,25 @@ async fn main() -> Result<()> {
                             ord += 1;
                             ws_wal_replay_order_update.push(rec.frame);
                         }
+                        // TrueData frames are counted SEPARATELY and are NOT
+                        // pushed into `ws_wal_replay_live_feed`. That vector
+                        // feeds the Dhan re-injection path, whose consumer
+                        // expects Dhan's 8-byte-header binary protocol —
+                        // handing it a TrueData frame would parse one wire
+                        // format as another. Counting-only until the
+                        // TrueData ingest lane exists to consume them; the
+                        // raw frames stay on disk either way.
+                        tickvault_storage::ws_frame_spill::WsType::TruedataFeed => {
+                            truedata += 1;
+                        }
                     }
                 }
                 info!(
                     dir = %ws_wal_dir,
-                    total = live + ord,
+                    total = live + ord + truedata,
                     live_feed = live,
                     order_update = ord,
+                    truedata_feed = truedata,
                     "STAGE-C: WAL replay recovered residual frames — both types are \
                      pre-retirement residue with no live consumer (PR-C3, 2026-07-14): \
                      counted loudly at STAGE-C.2b, then archived (raw frames stay on disk)"
@@ -1630,7 +1643,7 @@ async fn main() -> Result<()> {
 
     // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
     // the conservation audit + scoreboard above (operator 2026-07-13):
-    // recompute every higher-TF candle (2m..4h) from the stored 1m rows and
+    // recompute every higher-TF candle (3m..15m) from the stored 1m rows and
     // compare against the persisted TF tables — Dhan verifies TODAY, Groww
     // verifies the PREVIOUS trading day (TF-VERIFY-01/02). Gated on
     // `[tf_consistency] enabled` + trading-day inside the task; the

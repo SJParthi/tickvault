@@ -9,7 +9,7 @@
 # ---- DHAT profiler output (per-test artifact) ----
 **/dhat-heap.json
 
-# ---- Python (MCP server bytecode cache) ----
+# ---- Legacy runtime (MCP server bytecode cache) ----
 __pycache__/
 *.pyc
 
@@ -66,11 +66,19 @@ fuzz/corpus/
 fuzz/target/
 
 # ---- Quality gate state files (local machine state) ----
+#
+# 2026-08-07 — THE THREE RATCHET BASELINES ARE NOW TRACKED, DELIBERATELY.
+# .test-count-baseline / .untested-pubfn-baseline / .financial-test-baseline
+# used to be ignored. Each guard, finding no baseline, WROTE one and exited 0 —
+# so on a fresh CI runner all three passed vacuously, every time, forever.
+# merge-gate-lock-2026-07-04.md §3 row 6 recorded this in writing as a
+# known false-OK (audit Rule 11) and kept them local-only because of it.
+# A ratchet whose memory is erased before every run is not a ratchet.
+# They are committed now so the comparison has something to compare against;
+# the guards additionally fail CLOSED when CI is set and a baseline is absent.
+# Do NOT re-add them here.
 .claude/hooks/.last-quality-pass
-.claude/hooks/.test-count-baseline
 .claude/hooks/.coverage-baseline
-.claude/hooks/.untested-pubfn-baseline
-.claude/hooks/.financial-test-baseline
 .claude/hooks/.last-session-check
 .claude/.session-env
 quality/.binary-size-baseline
@@ -121,7 +129,7 @@ target/llvm-cov-target/
 .claude/worktrees/
 target2/
 
-# rust-only phase 2c cutover: the python MCP server is DELETED from git;
+# rust-only phase 2c cutover: the legacy MCP server is DELETED from git;
 # the parity harness (crates/tickvault-logs-mcp/tests/parity.rs)
 # re-materializes it here at runtime from the pinned git-history commit.
 # Runtime artifact only — must never be re-committed.

@@ -92,6 +92,16 @@ done
 
 # ── RATCHETING ──
 if [ ! -f "$BASELINE_FILE" ]; then
+  # FAIL CLOSED in CI (2026-08-07) — see test-count-guard.sh for the full
+  # rationale. A ratchet with no baseline compares nothing and passes
+  # vacuously; the baseline is tracked in git now.
+  if [ -n "${CI:-}" ]; then
+    echo "  FAIL: financial-test baseline missing in CI: $BASELINE_FILE" >&2
+    echo "  This guard is a RATCHET; with no baseline it cannot compare and would pass vacuously." >&2
+    echo "  The baseline is tracked in git — restore it rather than regenerating." >&2
+    exit 1
+  fi
+  # First run (local dev only): establish baseline
   echo "$VIOLATIONS" > "$BASELINE_FILE"
   echo "  PASS: Financial test baseline established: $VIOLATIONS gaps (ratchet — can only go DOWN)" >&2
   exit 0
@@ -109,8 +119,14 @@ if [ "$VIOLATIONS" -gt "$BASELINE" ]; then
 fi
 
 if [ "$VIOLATIONS" -lt "$BASELINE" ]; then
-  echo "$VIOLATIONS" > "$BASELINE_FILE"
-  echo "  PASS: Financial test gaps decreased ($BASELINE -> $VIOLATIONS) — baseline updated" >&2
+  # Baseline is TRACKED IN GIT since 2026-08-07 so the ratchet is real in CI.
+  # Auto-writing it here would dirty every working tree on every machine whose
+  # count differs -- exactly the breakage that forced the 2026-07-13 untracking
+  # (see .claude/rules/project/enforcement.md). Ratchet movement is now a
+  # deliberate, PR-visible edit, same discipline as
+  # quality/crate-coverage-thresholds.toml. Improvement still PASSES.
+  echo "  PASS: Financial test gaps decreased ($BASELINE -> $VIOLATIONS)." >&2
+  echo "  Ratchet it in THIS PR:  echo $VIOLATIONS > $BASELINE_FILE" >&2
 else
   echo "  PASS: Financial test gaps stable ($VIOLATIONS)" >&2
 fi

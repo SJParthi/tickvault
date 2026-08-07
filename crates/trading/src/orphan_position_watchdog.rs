@@ -310,36 +310,37 @@ mod tests {
 
     #[test]
     fn test_seconds_until_orphan_watchdog_ist_at_midnight() {
-        // 00:00:00 IST → 15:25:00 IST = 15*3600 + 25*60 = 55_500.
-        assert_eq!(seconds_until_orphan_watchdog_ist(0), 55_500);
+        // 00:00:00 IST → 15:35:00 IST = 15*3600 + 35*60 = 56_100.
+        // 2026-08-07: watchdog moved 15:25 -> 15:35 with the 15:40 close.
+        assert_eq!(seconds_until_orphan_watchdog_ist(0), 56_100);
     }
 
     #[test]
     fn test_seconds_until_watchdog_at_market_open() {
-        // 09:00:00 IST → 15:25:00 IST = 6h25m = 23_100.
+        // 09:00:00 IST → 15:35:00 IST = 6h35m = 23_700.
         let now = 9 * 3600;
-        assert_eq!(seconds_until_orphan_watchdog_ist(now), 55_500 - now);
+        assert_eq!(seconds_until_orphan_watchdog_ist(now), 56_100 - now);
     }
 
     #[test]
     fn test_seconds_until_watchdog_exactly_at_boundary() {
-        // At exactly 15:25:00 IST the watchdog should fire immediately.
-        assert_eq!(seconds_until_orphan_watchdog_ist(55_500), 0);
+        // At exactly 15:35:00 IST the watchdog should fire immediately.
+        assert_eq!(seconds_until_orphan_watchdog_ist(56_100), 0);
     }
 
     #[test]
     fn test_seconds_until_watchdog_after_boundary_rolls_to_tomorrow() {
-        // 15:30:00 IST (close) → next 15:25:00 IST tomorrow.
-        // = SECONDS_PER_DAY - 55_800 + 55_500 = 86_400 - 300 = 86_100.
-        let now = 15 * 3600 + 30 * 60;
+        // 15:40:00 IST (close) → next 15:35:00 IST tomorrow.
+        // = SECONDS_PER_DAY - 56_400 + 56_100 = 86_400 - 300 = 86_100.
+        let now = 15 * 3600 + 40 * 60;
         assert_eq!(seconds_until_orphan_watchdog_ist(now), 86_100);
     }
 
     #[test]
     fn test_seconds_until_watchdog_late_night() {
-        // 23:59:59 IST → tomorrow 15:25 = 1s + 55_500 = 55_501.
+        // 23:59:59 IST → tomorrow 15:35 = 1s + 56_100 = 56_101.
         let now = 24 * 3600 - 1;
-        assert_eq!(seconds_until_orphan_watchdog_ist(now), 55_501);
+        assert_eq!(seconds_until_orphan_watchdog_ist(now), 56_101);
     }
 
     #[test]
@@ -357,10 +358,11 @@ mod tests {
 
     #[test]
     fn test_sleep_duration_until_orphan_watchdog_at_known_clock() {
-        // UTC 04:25 → IST 09:55. Next IST 15:25 = 5h30m = 19_800s.
+        // UTC 04:25 → IST 09:55. Next IST 15:35 = 5h40m = 20_400s
+        // (2026-08-07: watchdog 15:25 -> 15:35 with the 15:40 close).
         let utc = 4 * 3600 + 25 * 60;
         let dur = sleep_duration_until_orphan_watchdog(utc);
-        assert_eq!(dur.as_secs(), 19_800);
+        assert_eq!(dur.as_secs(), 20_400);
     }
 
     /// I-P1-11 ratchet: the OrphanPositionInfo struct MUST carry

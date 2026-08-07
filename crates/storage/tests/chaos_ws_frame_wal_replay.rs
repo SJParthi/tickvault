@@ -146,6 +146,11 @@ fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
                 assert!(text.contains("order_alert"));
                 ord += 1;
             }
+            WsType::TruedataFeed => panic!(
+                "this fixture appends no TrueData frames — replay produced a \
+                 transport tag that was never written, meaning the tag byte \
+                 was mis-decoded"
+            ),
         }
     }
     assert_eq!(live, 50, "LiveFeed count");

@@ -95,6 +95,71 @@
 - 2026-07-19: **LIVE-STATE CORRECTION (verified evidence, not a new approval):** `aws ec2 describe-volumes` on `vol-073ccaa417a0f344b` (the root of `i-0b956d0209231a48b`, attached at `/dev/xvda` since 2026-05-24) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use** — run live 2026-07-19 via the coordinator session's credentialed AWS access. The 2026-07-13 approved 30→50 GB grow (bullet above) was RECORDED but **never physically applied** — every "live 50 GB root" statement dated 2026-07-15 (the Quote 8 executor note + the bullet above + §7) is corrected by the dated 2026-07-19 notes in §7. **FLAGGED FOLLOW-UP:** the disk-pressure remediation that grow was approved for is therefore UNAPPLIED — the 82%-disk-pressure risk class may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note.
 - 2026-07-19: **RULING (Quote 9): 30 GB ACCEPTED + t4g.medium as-of-now + hard target < ₹1,000/mo incl GST.** Resolves the flagged follow-up in the bullet above — the 2026-07-13 30→50 grow is **CANCELLED**; the accepted mitigation for the disk-pressure class is code retention + S3 archival on the 30 GB root (any future grow needs a fresh dated quote). The recorded interim bills (~₹1,289/mo at 270 hrs; ~₹1,077/mo at ~176 hrs) EXCEED the new target — the itemized lever path + which combinations reach <₹1,000 (none without an operator-gated lever) is recorded in `aws-budget.md` "OPERATOR RULING 2026-07-19"; the budget-alarm kill ceiling stepped $55 → $25 the same day with a dated ratchet ladder toward $10 (₹1,000 ÷ 1.18 ÷ ₹85 ≈ $10 pre-GST).
 - 2026-07-19: **RULING (Quote 10, later same day): EIP release APPROVED for the no-real-orders period — verify-first, bundled execution.** Live verification (coordinator session, 2026-07-19) proved a standalone release UNSAFE (launch-time ENI attribute — the live ENI never mints an ephemeral IP), so the release lands ONLY inside the erase-window recreate bundle per `docs/runbooks/eip-release.md`; the Lever-2/Lever-5 rows in `aws-budget.md` are updated in lockstep. Post-bundle bill lands in the ~₹600–720/mo class at ~176 hrs (~₹808–929 at the 270-hr ceiling) — under the Quote 9 target at BOTH hour bases.
+- 2026-07-31: **RULING (Quote 11): budget KILL-CEILING raised $25 → $35 — the sub-₹1,000 TARGET is UNCHANGED, the downward ratchet ladder is PAUSED (not cancelled).** Operator verbatim (typed directly in-session, typos preserved): *"Raise the limit bro olay?"* / *"Go ahead with recomemdnaetion bro okay?"* / *"nommanaul inptu full yauotmated mtoehrfucekr okay?"*. Incident (live AWS evidence, 2026-07-31 ~08:00 IST, acct 208384284948): `tv-prod-monthly-budget-v2` ACTUAL **$27.47 vs LIMIT $25.00 = 109.9% BREACHED**, FORECAST $28.72, and **BOTH** AUTOMATIC budget actions (90% + 100%, `STOP_EC2_INSTANCES` on `i-0b956d0209231a48b`) sitting in **`EXECUTION_FAILURE`** — repeatedly trying to auto-stop the prod box mid-session while failing to complete. $30 was REJECTED because its 90% line ($27.00) already sits below the live actual; $35 puts the 90% line at $31.50 and the forecast at 82%. EventBridge verified all 17 rules ENABLED (start `cron(0 3 ? * MON-FRI *)` = 08:30 IST, stop `cron(0 11 ? * MON-FRI *)` = 16:30 IST — the operator's requested window, already live), so the ceiling was the sole blocker. 3-way lockstep applied (`budget.tf` + `budget-guards.tf` + `budget_digest.rs`). Standing waste of ~$8.31/mo (Cost-Explorer polling $2.38, EIP $3.55, CloudWatch $3.27, Secrets Manager $0.38) is UNADDRESSED by the raise and is the precondition for resuming the ladder — full record in `aws-budget.md` "OPERATOR RULING 2026-07-31".
+
+**Quote 12 (2026-08-07, instance type change to escape an AWS capacity outage — preserve EXACTLY):**
+> "go ahead with this Different instance type"
+
+Given in direct response to a presented choice between (a) a multi-AZ rebuild at
+₹0/month extra and (b) a different instance type at roughly +₹400/month. The
+operator picked (b).
+
+**The incident (Verified, live AWS evidence, 2026-08-07):** the prod box failed
+to start at the 08:30 IST schedule with `InsufficientInstanceCapacity` — AWS had
+no **t4g.medium** capacity in **ap-south-1a**, and `main.tf:77` pins the instance
+to that single AZ (`availability_zone = "${var.aws_region}a"`), so a stopped
+instance can only restart there. Six start attempts between 08:58 and 10:03 IST
+all failed. CloudWatch CPU shows the same failure across the week: Aug 3 = 8h,
+Aug 4 = 5h, **Aug 5 = 0h (never ran)**, Aug 6 = 7h, **Aug 7 = 0h**. Budget was
+NOT involved ($2.87 actual vs the $35 ceiling).
+
+**The change:** instance type **t4g.medium → t4g.large** (ARM Graviton2
+burstable, 2 vCPU / **8 GiB**, ap-south-1 on-demand **$0.0448/hr** — 2× the
+t4g.medium rate; re-verify at execution). Same family, same AZ, same EBS, EIP
+preserved — a different instance type draws from a DIFFERENT capacity pool,
+which is the entire point of the change.
+
+**Honest cost (this quote's real consequence — recorded, not buried):** the
+Quote 9 hard target of **< ₹1,000/mo incl GST is NOT met and moves further
+away**. Recomputed on this section's own discipline, on the live 30 GB root
+with the EIP kept: at the 270-hr ceiling $0.0448 × 270 = $12.10; $12.10 + $3.60
++ $2.74 + $0.18 + $0.28 = **$18.90** → ₹1,607 → ×1.18 ≈ **~₹1,896/mo** (was
+~₹1,289). At the ~176-hr pure auto-schedule basis: $7.88 + $3.60 + $2.74 + $0.18
++ $0.28 = **$14.68** → ₹1,248 → ×1.18 ≈ **~₹1,473/mo** (was ~₹1,077). So this
+is roughly **+₹400–600/mo**. The Quote 9 target stands as a target; this change
+knowingly breaches it to buy availability. The zero-cost alternative — moving to
+multi-AZ so the box can start in 1b/1c on the SAME t4g.medium — was presented
+and NOT chosen; it remains available and would allow reverting to t4g.medium
+later under its own dated quote.
+
+> **⚠ EXECUTION OUTCOME 2026-08-07 — THE FLIP FAILED; THE BOX IS STILL t4g.medium.**
+> The authorized change was executed via `downsize-instance.yml` (run 31148235540)
+> at ~10:12 IST and **AWS refused t4g.large for the SAME reason**:
+> `InsufficientInstanceCapacity ... when calling the StartInstances operation`.
+> The workflow rolled back to t4g.medium, VERIFIED the rollback, and re-stopped
+> the box for schedule parity; rollback snapshot `snap-0573ab07252f67bf3` was
+> taken first and nothing irreversible happened. **Live state: t4g.medium,
+> stopped.**
+>
+> **What this PROVES (and it supersedes the reasoning above):** the constraint is
+> the **AVAILABILITY ZONE, not the instance type**. `ap-south-1a` is out of
+> capacity for t4g.medium AND t4g.large simultaneously, so no instance-type
+> change can fix this — the ₹400–600/mo would have bought nothing. The remaining
+> real fix is the ZERO-extra-cost one: **un-pin the single AZ** (`main.tf:77`
+> hardcodes `availability_zone = "${var.aws_region}a"`) so the box can launch in
+> `1b`/`1c`, which requires an instance REPLACEMENT (AZ is fixed at launch) and
+> therefore a new EIP — see the §7 EIP row and `docs/runbooks/eip-release.md`.
+>
+> This lock's TYPE remains **t4g.large as the authorized target** (Quote 12
+> stands, and 8 GiB still retires the Rule 2 FLAG), but it is **NOT APPLIED**.
+> Any future re-attempt should expect the same capacity refusal until the AZ pin
+> is addressed. Re-attempting the type flip alone, without the AZ fix, is
+> predicted to fail again — do not burn a session on it.
+
+**Bonus (not the reason, but real):** 8 GiB retires the §7 Rule 2 FLAG, which
+honestly recorded that the retained sizing formula predicts a ~2.5 GB app
+working set at ~770 SIDs — a figure that does NOT fit 4 GiB. That risk was
+outstanding and unmeasured; t4g.large removes it.
 
 ---
 
@@ -176,7 +241,7 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
 
 ---
 
-## §7. Instance lock — t4g.medium (LOCKED 2026-07-15, supersedes the 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
+## §7. Instance lock — t4g.large (LOCKED 2026-08-07 per §0 Quote 12 — capacity escape; supersedes the 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
 
 **2026-07-15 change (operator Quote 8):** instance lock → **t4g.medium**
 (ARM Graviton2, burstable general-purpose) — **4 GiB RAM** (DOWN from the
@@ -192,7 +257,7 @@ per-minute-REST workload is NOT yet live-validated on credits — watch
 
 | Spec | Value |
 |---|---|
-| Instance | **t4g.medium** — ARM Graviton2, **2 vCPU, 4 GiB RAM** (burstable general-purpose) |
+| Instance | **t4g.large** — ARM Graviton2, **2 vCPU, 8 GiB RAM** (burstable general-purpose). *(Changed from t4g.medium 2026-08-07 per §0 Quote 12 — an AWS `InsufficientInstanceCapacity` outage in ap-south-1a left the box unstartable for whole trading sessions; a different type draws from a different capacity pool. Cost ~+₹400–600/mo — the Quote 9 sub-₹1,000 target is NOT met; see Quote 12 for the arithmetic.)* |
 | Region | ap-south-1 (Mumbai) |
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.0224/hr** (ap-south-1, console-verified 2026-05-18 — re-verify at execution) — no Reserved / Savings Plan / Spot |
@@ -292,6 +357,13 @@ actually $55 since 2026-06-30 — `budget.tf limit_amount`, not the $35
 this sentence recorded; per the Quote 9 sub-1K ruling it stepped
 $55 → $25 on 2026-07-19, with a dated ratchet ladder toward $10
 (₹1,000 ÷ 1.18 ÷ ₹85 ≈ $10 pre-GST) recorded in `aws-budget.md`.)*
+*(2026-07-31 ruling — Quote 11, §0 bullet: the kill ceiling is RAISED
+$25 → **$35** after the live budget breached at 109.9% ($27.47 actual vs
+$25) with BOTH AUTOMATIC `STOP_EC2_INSTANCES` actions stuck in
+`EXECUTION_FAILURE` against the prod box. The < ₹1,000/mo TARGET is
+UNCHANGED; the downward ladder is PAUSED, not cancelled, and resumes once
+the ~$8.31/mo standing waste is cut. Full record: `aws-budget.md`
+"OPERATOR RULING 2026-07-31".)*
 
 > **Note on instance schedule (2026-05-29):** trading WEEKDAYS only
 > (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays
@@ -303,8 +375,9 @@ $55 → $25 on 2026-07-19, with a dated ratchet ladder toward $10
 
 ### Mechanical Rules (replaces aws-budget.md mechanical rules 1+6)
 
-1. **Instance type is t4g.medium. PERIOD.** Changing it (back to r8g.large, to
-   t4g.large, etc.) requires:
+1. **Instance type is t4g.large. PERIOD.** *(2026-08-07, §0 Quote 12 — was
+   t4g.medium from 2026-07-15.)* Changing it (back to t4g.medium, to r8g.large,
+   etc.) requires:
    - Operator explicit approval with dated quote (see §0 Quote 8)
    - Update to this file
    - Update to `aws-indices-only-locked-architecture.md` §5
@@ -537,6 +610,64 @@ remain TRACKED and UN-remediated.
 line count) to the post-widening tree on branch `claude/groww-security-id-u64`.
 The guard remains active — any FURTHER edit to the frozen area beyond this
 recorded lift fails the build again, requiring its own fresh dated quote.
+
+### §28.2 — NARROW LIFT for the u64 slot-mapping repair (operator-approved 2026-08-07)
+
+**The verbatim operator authorization (2026-08-07, typed directly in-session):**
+
+> "go ahead and fix and implement eveuthign dude okay>"
+
+Given in DIRECT response to a message that named this lift as one of exactly two
+explicit asks — quote: *"**'§28 approved'** → I fix #1, the single most
+consequential defect in this entire session"* — alongside the summary of the
+defect itself. That message is the scope this quote authorizes.
+
+**The defect this lift repairs (Verified, red-team audit 2026-08-07).**
+`IndicatorEngine::update` / `warmup_from_candles` / `warmup_count` index a flat
+`states: Vec<IndicatorState>` of `MAX_INDICATOR_INSTRUMENTS` (25,000) with
+`let sid = security_id as usize`, then bail on `sid >= self.states.len()`.
+The §28.1 lift widened `security_id` to `u64` **and the id space subsequently
+became NAMESPACE-BANDED** — Groww indices occupy `[2^62, 2^63)`
+(`feed/groww/instruments.rs`), GDF `[2^60, 2^62)`, TrueData `[2^59, 2^60)`
+(`truedata-feed-scope-2026-07-24.md` §9.5). Every banded id is therefore
+astronomically `>= 25_000`, so **every** call returns `Default::default()`
+(`is_warm = false`) and the strategy evaluator returns `Hold` — permanently,
+for the entire live universe, **with no error, no counter, and no log line**.
+
+§28.1 explicitly left the C2 `states` flat-Vec finding "TRACKED and
+UN-remediated" as an I-P1-11 *collision* risk. After the banding it is no
+longer a collision risk — it is a **guaranteed total silent no-op**, which is
+strictly worse and was undocumented. Runtime-dead today only because the
+trading pipeline spawns solely under `dhan_enabled || groww_enabled` and both
+live feeds are retired; it would become a silent catastrophe the moment
+strategies go live.
+
+**Scope of THIS lift (narrow, mechanical):** ONLY the id→slot MAPPING may
+change. An O(1)-average slot allocator (`HashMap<u64, u32>` + a dense
+monotonic counter) translates a banded `security_id` into a dense index into
+the SAME pre-allocated `states` Vec. Capacity exhaustion is FAIL-CLOSED and
+LOUD (typed refusal + counter + coded error), never a silent miss.
+**NO indicator math changes. NO strategy FSM logic changes. No
+`IndicatorState` field changes.** The flat-Vec layout, its single startup
+allocation, and every computation stay byte-for-byte identical; only the index
+used to reach a slot is corrected.
+
+**Still NOT remediated by this lift (recorded honestly, not silently carried):**
+- **C1 warmup gate** — unchanged, still TRACKED.
+- **I-P1-11 composite key** — the engine's public signature takes `security_id`
+  alone, with no `ExchangeSegment`. Cross-FEED collision is now structurally
+  impossible (disjoint namespace bands), but two instruments sharing a numeric
+  id across SEGMENTS *within* one feed would still share a slot. Fixing that
+  needs a signature cascade through the pipeline and is a SEPARATE lift needing
+  its own dated quote.
+- **NaN in `high`/`low`/`open` during REST warmup** poisons indicator state
+  permanently (only `close` is guarded) — red-team finding #5, in the frozen
+  area, deliberately NOT taken in this lift.
+
+**Re-bless:** the `BOUNDARY_FILES` manifest in
+`operator_boundary_indicator_strategy_guard.rs` is regenerated for the
+post-repair tree. The guard stays ACTIVE — any further frozen-area edit beyond
+this recorded lift fails the build again and needs its own fresh dated quote.
 
 ---
 

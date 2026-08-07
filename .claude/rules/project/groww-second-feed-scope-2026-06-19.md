@@ -746,3 +746,15 @@ the operator must update THIS §39 first with a fresh dated quote.
 Operator Parthiban, 2026-07-16 (events 38df2073-eecb-43cf-876d-a4a809dde269 + 157f7cd0-dfdf-4c4e-b93a-9f9aff3317c2): the Groww order/position/trade-update PUSH channel is authorized under the same 4-gate live-fire lattice discipline (§39.2) — ONE NEW dedicated NATS-over-WS connection (`wss://socket-api.groww.in`), order/position/trade events ONLY, receive-only PAPER mode, `GROWW_ORDER_LIVE_FIRE` stays false. Names: config `order_push_enabled` under `[groww_orders]` (serde default OFF), module tree `crates/trading/src/oms/groww/push/`, error codes GROWW-PUSH-01..04, `WsType::GrowwOrderUpdate`. Access token stays SSM read-only (minter lock untouched); the per-session socket-token mint is the KEEP-class live-feed-AUTH call. No live orders.
 
 (2026-07-16) The transport building blocks (nats/nkey/proto/socket_token/connect) are restored from `dd7eaa5e^` into `crates/trading/src/oms/groww/push/` for the ORDER/POSITION channel — this is NOT a §35 shadow-client (market-data) revival.
+
+### §39 addendum — 2026-07-21: order_push_enabled PAPER ACTIVATION prep (DRAFT PR; operator-go pending)
+
+Prep lane (coordinator-routed, 2026-07-21): `config/base.toml [groww_orders]
+order_push_enabled` flips to `true` so the §39.x-authorized receive-only PAPER
+order/position/trade PUSH channel (operator 2026-07-16, events
+38df2073-eecb-43cf-876d-a4a809dde269 + 157f7cd0-dfdf-4c4e-b93a-9f9aff3317c2) begins
+capturing events into the shared paper tables. The serde DEFAULT stays OFF; Gates 2–4
+of the §39.2 lattice are untouched — `GROWW_ORDER_LIVE_FIRE` stays false, zero live
+orders. The gate-1 lattice guard's base.toml dark-ship loop drops this ONE key with a
+dated in-test note; the serde-default-off pin stands. The operator's go for the merge
+lands here verbatim: <OPERATOR-GO-HERE>

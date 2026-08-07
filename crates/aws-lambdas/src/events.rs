@@ -3,7 +3,7 @@
 //! Two invoke shapes exist in this fleet:
 //! - SNS pushes (budget-killswitch): the standard SNS envelope
 //!   `{"Records":[{"Sns":{"Subject":..,"Message":..}}]}`. The killswitch
-//!   parses it tolerantly via `serde_json::Value` (mirroring the Python
+//!   parses it tolerantly via `serde_json::Value` (mirroring the legacy
 //!   `dict.get` chain exactly) — the typed structs here document the shape
 //!   and serve tests/other consumers.
 //! - EventBridge scheduled rules with a constant JSON `input`
@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 /// The constant EventBridge `input` the gate crons send.
 ///
-/// Python parity: `(event or {}).get('mode', 'close')` — a missing/odd
+/// Legacy parity: `(event or {}).get('mode', 'close')` — a missing/odd
 /// field means `close` (the fail-safe direction: actions disabled).
 #[derive(Debug, Clone, Deserialize)]
 pub struct GateEvent {

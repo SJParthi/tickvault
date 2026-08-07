@@ -11,7 +11,7 @@ pub async fn sdk_config() -> SdkConfig {
     aws_config::defaults(BehaviorVersion::latest()).load().await
 }
 
-/// Cost Explorer is a us-east-1-only API — Python parity:
+/// Cost Explorer is a us-east-1-only API — legacy parity:
 /// `boto3.client('ce', region_name='us-east-1')`.
 pub async fn cost_explorer_us_east_1() -> aws_sdk_costexplorer::Client {
     let base = aws_config::defaults(BehaviorVersion::latest())
@@ -38,7 +38,7 @@ pub fn cloudwatch(config: &SdkConfig) -> aws_sdk_cloudwatch::Client {
 }
 
 /// Lambda invoke client — the console FRONT's only AWS call surface
-/// (Python parity: `boto3.client("lambda")` invoking the back relay).
+/// (legacy parity: `boto3.client("lambda")` invoking the back relay).
 pub fn lambda(config: &SdkConfig) -> aws_sdk_lambda::Client {
     aws_sdk_lambda::Client::new(config)
 }

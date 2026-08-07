@@ -131,7 +131,7 @@ resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_missing" {
 # Boot-window gate Lambda — enables the alarm's actions during the morning boot
 # window and disables them otherwise. Pattern mirrors budget-guards.tf.
 #
-# 2026-07-18 (rust-only phase 2b-1): the inline Python heredoc was PORTED to
+# 2026-07-18 (rust-only phase 2b-1): the inline legacy heredoc was PORTED to
 # Rust — crates/aws-lambdas/src/alarm_gate.rs (lib logic + unit tests) +
 # src/bin/boot_heartbeat_gate.rs (thin bootstrap bin). Behavior parity:
 # mode="open" (08:50 IST) → enable actions + reset the alarm to OK with the

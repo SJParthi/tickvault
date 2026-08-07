@@ -495,7 +495,11 @@ mod tests {
     #[test]
     fn window_bounds_come_from_tick_persist_constants() {
         assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 9 * 3600);
-        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
+        // 2026-08-07: NSE moved the F&O close to 15:40 on 2026-08-03 for the
+        // new Closing Auction Session — the "only one line changes" promise
+        // in this guard's doc comment held: the canonical constant moved and
+        // every dependent followed via const-assert.
+        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 40 * 60);
     }
 
     // ----- secs_until_next_market_open_ist ----------------------------------

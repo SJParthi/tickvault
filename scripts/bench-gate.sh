@@ -29,6 +29,43 @@
 # exceeds max_regression_pct — i.e. even the optimistic bound of the measured
 # change is a >5% slowdown. Point-estimate-only deltas (cross-runner noise,
 # statistically insignificant jitter) do NOT fail the gate.
+#
+# Hardware-drift suppression (added 2026-08-07 — the false-RED fix):
+#   The CI-lower-bound rule above filters NOISE but not a systematic hardware
+#   SHIFT: when GitHub rotates the shared runner pool, every benchmark gets
+#   confidently slower against a baseline recorded on the previous hardware.
+#   Observed live on main @993a144c: 31 of 31 benches "regressed" +24..30%
+#   while EVERY absolute ns budget passed with 5-10x margin, and the identical
+#   tree (da796888) had passed two days earlier.
+#   The discriminator is SHAPE, not size: a code regression hits a few RELATED
+#   benchmarks; a hardware shift hits nearly ALL of them by nearly the SAME
+#   amount. When count >= HARDWARE_DRIFT_MIN_COUNT AND the regressing share
+#   >= HARDWARE_DRIFT_MIN_SHARE AND the spread <= HARDWARE_DRIFT_SPREAD_PCT,
+#   the relative arm is suppressed and every line is reported as DRIFT with an
+#   explicit verdict. Absolute budgets are NEVER suppressed.
+#   This is strictly MORE discriminating than widening max_regression_pct
+#   (which would blind the gate to real 30% regressions) and than resetting the
+#   baseline (which re-breaks on the next rotation).
+#
+# Spread re-calibration (2026-08-07, SAME DAY — the drift fix did not fire):
+#   The suppressor above shipped with spread = max - min, and then FAILED to
+#   suppress the very next rotation. Live on main @026c7b63 (bench run
+#   31182757999 attempt 2): 31 of 31 benches regressed, share 100%, every
+#   absolute budget passed — yet drift was NOT declared, because ONE outlier
+#   (ws_reader_dispatch_ticker, a 13ns bench, +111.6%) dragged max-min to
+#   88.0 pts against the 15 pt bar. The other 30 sat between +23.6% and
+#   +42.9%. max-min is a WORST-CASE statistic: a single noisy sub-30ns
+#   benchmark destroys it, which is exactly the population this gate measures.
+#   Same commit, minutes earlier (attempt 1), only 1 of 31 "regressed" — the
+#   two attempts differed by RUNNER, not by code (the merge touched zero files
+#   under crates/core, where the attempt-1 bench lives).
+#   Fix: spread is now the INTERQUARTILE RANGE (Q3-Q1) of the regressions —
+#   a robust statistic that ignores the tails by construction. On the live
+#   failing data IQR = 2.6 pts (vs max-min 88.0). The threshold, the count and
+#   share rules, and the absolute arm are all UNCHANGED; only the estimator
+#   changed. Case C of the self-test (8 benches genuinely fanned +6%..+80%,
+#   IQR 24 pts) still FAILS, so the discriminating power is preserved, and the
+#   full min..max range is still PRINTED for the operator.
 # =============================================================================
 
 set -euo pipefail
@@ -37,8 +74,20 @@ CRITERION_DIR="${1:-target/criterion}"
 BUDGETS_FILE="quality/benchmark-budgets.toml"
 BENCH_BUDGET_MULTIPLIER="${BENCH_BUDGET_MULTIPLIER:-1.0}"
 
+# ---- hardware-drift thresholds (2026-08-07) ---------------------------------
+# All three must hold before the relative regression arm may be suppressed.
+# Deliberately NOT env-overridable: they are the gate's semantics, and an env
+# knob would be a one-line way to silence a real regression in CI.
+HARDWARE_DRIFT_MIN_COUNT=5      # never classify drift from a handful of benches
+HARDWARE_DRIFT_MIN_SHARE=0.70   # >= 70% of compared benches must have regressed
+HARDWARE_DRIFT_SPREAD_PCT=15    # INTERQUARTILE RANGE (Q3-Q1) of the regressions,
+                                # in percentage points. Was max-min until
+                                # 2026-08-07: one outlier sub-30ns bench could
+                                # single-handedly veto a textbook drift shape
+                                # (live: IQR 2.6 pts vs max-min 88.0 pts).
+
 # Validate the multiplier early and loudly: digits and at most one dot only
-# (rejects empty, negative, and non-numeric garbage before it reaches Python).
+# (rejects empty, negative, and non-numeric garbage before it reaches the evaluator).
 case "$BENCH_BUDGET_MULTIPLIER" in
   ''|*[!0-9.]*|.|*.*.*)
     echo "ERROR: BENCH_BUDGET_MULTIPLIER must be a positive number, got '$BENCH_BUDGET_MULTIPLIER'" >&2
@@ -72,15 +121,15 @@ fi
 
 
 # =============================================================================
-# Rust-only purge Phase 2a-2 (2026-07-18): the inline python3 walker below
+# Rust-only purge Phase 2a-2 (2026-07-18): the inline interpreter walker below
 # was replaced by jq (per-file JSON extraction) + awk (TOML parse, budget
 # matching, float comparisons, verdicts). Numeric semantics preserved:
 # every comparison and every printed number is computed on IEEE-754 doubles
-# exactly as the python was (json floats, per-element division, budget x
+# exactly as the evaluator was (json floats, per-element division, budget x
 # multiplier, pct x 100, printf %.0f / %+.1f / %g are the same C-double
 # operations in both). Per-line output content and exit codes are
 # unchanged; LINE ORDER is now deterministic (sorted paths, all absolute-
-# budget lines before regression lines) where python's os.walk order was
+# budget lines before regression lines) where the legacy walker's order was
 # filesystem-dependent.
 # =============================================================================
 
@@ -96,7 +145,7 @@ while IFS= read -r f; do
   # FAIL CLOSED on a null/missing/non-numeric median (review round 1 fix,
   # 2026-07-18): the previous `.median.point_estimate // 0` turned an
   # explicit JSON null into 0ns — a corrupt estimates.json silently PASSED
-  # every budget. The old python raised TypeError there (exit 1); restore
+  # every budget. The old evaluator raised TypeError there (exit 1); restore
   # that fail-closed contract with a named error instead of a stack trace.
   median=$(jq -r '(try .median.point_estimate catch null)
                   | if type == "number" then . else "CORRUPT" end' "$f")
@@ -113,14 +162,14 @@ while IFS= read -r f; do
   rel="${rel%/estimates.json}"
   # mean.point_estimate defaults to 0 when absent; the CI lower bound is NA
   # when confidence_interval is absent, not an object, or lower_bound is
-  # null (the python isinstance(ci, dict) + .get() semantics).
+  # null (the evaluator's isinstance(ci, dict) + .get() semantics).
   # FAIL CLOSED on a PRESENT null/non-numeric mean.point_estimate or a
   # present NON-NULL non-numeric lower_bound (review round 2 fix,
   # 2026-07-18): the previous `// 0` / awk `+0` coerced them to 0, so a
   # real +30% regression with a corrupt lower_bound silently PASSED. The
-  # old python crashed there (TypeError, exit 1). Parity kept byte-
+  # old evaluator crashed there (TypeError, exit 1). Parity kept byte-
   # identical everywhere else: an ABSENT mean/point_estimate is still 0
-  # (documented python-parity), and a null/absent lower_bound (or a
+  # (documented legacy-parity), and a null/absent lower_bound (or a
   # non-object confidence_interval) still takes the NA fallback.
   vals=$(jq -r '[ ((.mean // {}) as $m
                    | if ($m | type) == "object" and ($m | has("point_estimate"))
@@ -146,9 +195,12 @@ done < <(find "$CRITERION_DIR" -name "estimates.json" -path "*/change/*" 2>/dev/
 LC_ALL=C awk -F'\t' \
   -v budgets_file="$BUDGETS_FILE" \
   -v multiplier_raw="$BENCH_BUDGET_MULTIPLIER" \
+  -v drift_min_count="$HARDWARE_DRIFT_MIN_COUNT" \
+  -v drift_min_share="$HARDWARE_DRIFT_MIN_SHARE" \
+  -v drift_spread_pct="$HARDWARE_DRIFT_SPREAD_PCT" \
 '
 function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
-# frepr: render a decimal string the way python str(float(...)) did for the
+# frepr: render a decimal string the way the legacy float repr did for the
 # TOML-magnitude values in use ("5.0" -> "5.0", "5" -> "5.0") — display only.
 function frepr(v,   s) {
   s = v
@@ -220,7 +272,7 @@ FILENAME == budgets_file {
 # ---- absolute-budget arm: N <rel-root> <median_ns> ----
 $1 == "N" {
   bench = $2
-  gsub(/\/new/, "", bench)        # python .replace("/new", "") — all occurrences
+  gsub(/\/new/, "", bench)        # legacy .replace("/new", "") — all occurrences
   gsub(/\//, "_", bench)
   bench = tolower(bench)
   median_ns = $3 + 0
@@ -273,17 +325,20 @@ $1 == "C" {
   bench = tolower(bench)
   point_pct = ($3 + 0) * 100
   lb = $4
+  cmp_total++
   if (lb != "NA") {
     lower_pct = (lb + 0) * 100
     if (lower_pct > max_regression) {
-      printf "  FAIL: %s: %+.1f%% regression (CI lower bound %+.1f%% > %s%%)\n", bench, point_pct, lower_pct, frepr(max_regression_raw)
-      reg_failed = 1
+      reg_n++
+      reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
+      reg_lower[reg_n] = lower_pct; reg_kind[reg_n] = "ci"
     }
   } else {
     printf "  NOTE: %s: change/estimates.json has no confidence_interval — falling back to point estimate\n", bench
     if (point_pct > max_regression) {
-      printf "  FAIL: %s: %+.1f%% regression (point estimate, no CI available; max: %s%%)\n", bench, point_pct, frepr(max_regression_raw)
-      reg_failed = 1
+      reg_n++
+      reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
+      reg_lower[reg_n] = point_pct; reg_kind[reg_n] = "point"
     }
   }
   next
@@ -292,6 +347,54 @@ END {
   if (died) exit 1
   if (checked == 0)
     print "  INFO: No benchmarks matched budget entries — gate passed (no violations)."
+
+  # ---- hardware-drift classification (2026-08-07) --------------------------
+  # A CODE regression hits a FEW RELATED benchmarks. A runner/toolchain change
+  # hits ALL of them by roughly the SAME amount. Declare drift only when all
+  # three hold: enough samples to be meaningful, nearly every compared bench
+  # regressed, and the regressions cluster tightly. Fail-safe in every other
+  # case -> the pre-2026-08-07 behaviour is preserved exactly.
+  drift = 0; share = 0; spread = 0; full_range = 0; lo = 0; hi = 0
+  if (reg_n > 0) {
+    if (cmp_total > 0) share = reg_n / cmp_total
+    # Robust spread = interquartile range. max-min was vetoed by a single
+    # noisy sub-30ns bench on 2026-08-07 (see the header note); the IQR
+    # ignores both tails by construction. Insertion sort — reg_n is small
+    # (tens), and asort() is a gawk extension the CI runner awk may lack.
+    # NOTE: no apostrophes inside this awk program — it is single-quoted in
+    # the surrounding shell, so one would terminate the program early.
+    for (i = 1; i <= reg_n; i++) sorted[i] = reg_point[i]
+    for (i = 2; i <= reg_n; i++) {
+      v = sorted[i]; j = i - 1
+      while (j >= 1 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j-- }
+      sorted[j + 1] = v
+    }
+    lo = sorted[1]; hi = sorted[reg_n]
+    full_range = hi - lo
+    q = int(reg_n / 4)
+    spread = sorted[reg_n - q] - sorted[q + 1]
+    if (reg_n >= drift_min_count && share >= drift_min_share && spread <= drift_spread_pct)
+      drift = 1
+  }
+  for (i = 1; i <= reg_n; i++) {
+    if (drift) {
+      printf "  DRIFT: %s: %+.1f%% (uniform shift — suppressed, see verdict)\n", reg_bench[i], reg_point[i]
+    } else if (reg_kind[i] == "ci") {
+      printf "  FAIL: %s: %+.1f%% regression (CI lower bound %+.1f%% > %s%%)\n", reg_bench[i], reg_point[i], reg_lower[i], frepr(max_regression_raw)
+      reg_failed = 1
+    } else {
+      printf "  FAIL: %s: %+.1f%% regression (point estimate, no CI available; max: %s%%)\n", reg_bench[i], reg_point[i], frepr(max_regression_raw)
+      reg_failed = 1
+    }
+  }
+  if (drift) {
+    printf "\n  HARDWARE DRIFT DETECTED: %d of %d compared benchmarks regressed (%.0f%% >= %.0f%%), IQR %.1f pts <= %.1f (full range %+.1f%%..%+.1f%% = %.1f pts).\n", \
+      reg_n, cmp_total, share * 100, drift_min_share * 100, spread, drift_spread_pct, lo, hi, full_range
+    print "  A code regression hits a few RELATED benchmarks; a uniform shift across nearly ALL of them is the runner, not the code."
+    print "  The RELATIVE regression arm is SUPPRESSED for this run."
+    print "  NOT suppressed: the absolute ns budgets above, which still gate and still fail this run if breached."
+    print "  Honest limit: a genuine broad regression coinciding with a runner rotation is indistinguishable from relative data alone."
+  }
   print ""
   if (reg_failed) {
     print "  Benchmark budget gate FAILED (confident regression)."

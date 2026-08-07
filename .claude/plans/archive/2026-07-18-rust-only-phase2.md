@@ -1,6 +1,6 @@
 # Implementation Plan: Rust-Only Purge — Phase 2 (rewrite the LIVE Python in Rust)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-18
 **Approved by:** Parthiban (operator) — standing full-authority instruction (session preamble) + coordinator rust-only directive 2026-07-18 (verbatim: "our entire tickvault repository should be entirely RUST O(1) even now and in the future always — nowhere should even the word python be used")
 
@@ -227,3 +227,18 @@ surfaces). NOT claimed: bit-reproducible lambda zips (the source-digest hash
 is the honest drift key), lambda cold-start numbers before the first live
 invoke, or the `.mcp.json` launch-mode latency (Unknown — decided with the
 coordinator in 2c).
+
+
+---
+
+## Archived 2026-07-31 (plan-enforcement rule 7)
+
+Completed by PR #1712 (`claude/zero-python-purge`): every tracked `.py`
+deleted (17 -> 0), the vendor SDK reference tree removed, BOTH ratchet
+allowlists emptied to `&[]` (hard zero floor), and the guard itself made
+literal-free by assembling its detection token from bytes at runtime.
+
+Finding recorded during that work: this plan's title assumed LIVE
+interpreted-language code existed. It did not. All three formerly
+allowlisted invocation sites carried only the WORD in comments -- zero
+live execution anywhere in the tree. Verified 2026-07-31.

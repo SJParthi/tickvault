@@ -27,6 +27,32 @@ pub struct ReconciliationUpdate {
     pub avg_traded_price: f64,
 }
 
+/// Half a paise, in rupees — the price-equality tolerance for reconciliation.
+///
+/// NSE's smallest tick is 0.05 (five paise), so two prices closer than half a
+/// paise are the same price by any market definition, while float
+/// representation noise on realistic prices is orders of magnitude smaller.
+const PRICE_EQ_TOLERANCE_RUPEES: f64 = 0.005;
+
+/// True when two prices are equal within [`PRICE_EQ_TOLERANCE_RUPEES`].
+///
+/// # Why not `f64::EPSILON`
+///
+/// `f64::EPSILON` (2.2e-16) is the gap between 1.0 and the next f64 — NOT a
+/// general tolerance. At a price of ~100.0 the actual ULP is ~1.4e-14, roughly
+/// 64x larger, so an absolute `f64::EPSILON` comparison is indistinguishable
+/// from `!=` and flags every decimal-parse difference as a fill mismatch.
+///
+/// Non-finite inputs are never "equal" — a NaN price is a data fault and must
+/// surface as a mismatch, not be silently accepted.
+#[must_use]
+pub fn prices_equal_within_paise(a: f64, b: f64) -> bool {
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    (a - b).abs() <= PRICE_EQ_TOLERANCE_RUPEES
+}
+
 /// Reconciles OMS order state against orders fetched from the Dhan REST API.
 ///
 /// # Arguments
@@ -64,9 +90,23 @@ pub fn reconcile_orders(
         match oms_orders.get(&dhan_order.order_id) {
             Some(oms_order) => {
                 let status_mismatch = oms_order.status != dhan_status;
+                // 2026-08-07 (red-team finding #6): this compared prices with
+                // ABSOLUTE `f64::EPSILON` (2.2e-16). For a ~100.0 price the ULP
+                // is ~1.4e-14 — 64x larger — so `> f64::EPSILON` was BITWISE
+                // INEQUALITY wearing a tolerance's clothes: any decimal-parse
+                // difference between our f64 and the broker's emitted a
+                // spurious fill update. A price tolerance must be RELATIVE to
+                // the magnitude being compared (or, here, expressed in the
+                // currency's own smallest unit).
+                //
+                // Paise are the natural unit: NSE ticks are 0.05, so half a
+                // paise is far below any real price difference and far above
+                // float-representation noise on any price we will ever see.
                 let fill_mismatch = oms_order.traded_qty != dhan_order.traded_quantity
-                    || (oms_order.avg_traded_price - dhan_order.average_traded_price).abs()
-                        > f64::EPSILON;
+                    || !prices_equal_within_paise(
+                        oms_order.avg_traded_price,
+                        dhan_order.average_traded_price,
+                    );
 
                 if status_mismatch {
                     // OMS-GAP-02: order book divergence between local + Dhan.
@@ -345,21 +385,57 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn epsilon_boundary_fill_mismatch() {
-        // If the price difference is exactly at f64::EPSILON, it should NOT
-        // trigger a mismatch (comparison uses strict >).
+    fn test_prices_equal_within_paise_is_a_real_tolerance_not_bitwise_equality() {
+        // REGRESSION 2026-08-07 (red-team finding #6): the previous test was
+        // VACUOUS. It asserted that `100.0 + f64::EPSILON` does not trip the
+        // comparison — but `100.0 + f64::EPSILON == 100.0` is EXACTLY TRUE in
+        // f64 (EPSILON is the ULP at 1.0, ~64x smaller than the ULP at 100.0),
+        // so the "boundary" value it constructed was just 100.0. The test
+        // passed no matter what the comparison did.
+        //
+        // These assertions are non-vacuous: each pair is a genuinely DIFFERENT
+        // f64 from the other.
+        assert_ne!(
+            100.0_f64.to_bits(),
+            100.000_1_f64.to_bits(),
+            "precondition: the sub-paise probe must be a distinct f64"
+        );
+
+        // Sub-paise differences (real decimal-parse noise) are EQUAL.
+        assert!(prices_equal_within_paise(100.0, 100.000_1));
+        assert!(prices_equal_within_paise(100.0, 99.999_9));
+        assert!(prices_equal_within_paise(23_925.65, 23_925.650_390_625));
+
+        // A real one-paise difference is a MISMATCH.
+        assert!(!prices_equal_within_paise(100.0, 100.01));
+        // Exactly at the tolerance is equal; just past it is not.
+        assert!(prices_equal_within_paise(100.0, 100.005));
+        assert!(!prices_equal_within_paise(100.0, 100.006));
+
+        // Non-finite is never equal — a NaN price must surface, not be absorbed.
+        assert!(!prices_equal_within_paise(f64::NAN, 100.0));
+        assert!(!prices_equal_within_paise(100.0, f64::NAN));
+        assert!(!prices_equal_within_paise(f64::INFINITY, f64::INFINITY));
+    }
+
+    #[test]
+    fn sub_paise_price_difference_does_not_emit_a_fill_update() {
+        // End-to-end: the old absolute-EPSILON comparison emitted a spurious
+        // update here; the paise tolerance does not.
         let mut oms = HashMap::new();
         let mut order = make_managed_order("1", OrderStatus::Traded);
         order.avg_traded_price = 100.0;
         oms.insert("1".to_owned(), order);
 
         let mut dhan = make_dhan_order("1", "TRADED");
-        dhan.average_traded_price = 100.0 + f64::EPSILON;
+        dhan.average_traded_price = 100.000_1; // a distinct f64, sub-paise apart
         let dhan = vec![dhan];
 
         let (_report, updates) = reconcile_orders(&oms, &dhan);
-        // Exactly EPSILON → not > EPSILON → no mismatch
-        assert!(updates.is_empty());
+        assert!(
+            updates.is_empty(),
+            "a sub-paise decimal-parse difference must not be a fill mismatch"
+        );
     }
 
     #[test]

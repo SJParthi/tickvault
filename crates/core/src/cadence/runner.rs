@@ -2844,6 +2844,18 @@ fn handle_completion<C, D, G>(
                             )
                             .increment(1);
                         }
+                        // WHICH attempt actually delivered (2026-07-31 operator
+                        // ask): `burst` = the T+0 volley answered outright;
+                        // anything else names the retry rung that won. This is
+                        // the ONLY signal that answers "does the broker serve a
+                        // just-closed minute at T+0?" — `close_to_data_ms` shows
+                        // THAT it got faster, never WHICH attempt got it.
+                        metrics::counter!(
+                            "tv_cadence_spot_first_success_rung_total",
+                            "lane" => lane_feed.as_str(),
+                            "rung" => native_rung_label(lane.late_retry_attempts)
+                        )
+                        .increment(1);
                         lane.asm.record_spot(
                             target,
                             snap.price,
@@ -2910,7 +2922,19 @@ fn handle_completion<C, D, G>(
                                 )
                                 .increment(1);
                             }
-                            let rung = (lane.late_retry_attempts as usize).min(2);
+                            // Clamp to the LAST rung index, derived from the array
+                            // itself — never a literal. 2026-07-31: this read
+                            // `.min(2)`, the last index of the then-3-rung array;
+                            // when the ladder grew to 6 rungs (#1714) that stale
+                            // literal pinned every attempt past the 3rd to
+                            // CADENCE_NATIVE_RETRY_OFFSETS_MS[2], making the tail
+                            // rungs unreachable AND — because that offset is
+                            // already in the past by then — collapsing them into
+                            // back-to-back immediate re-fires against the broker
+                            // (a retry burst that burns the rolling-second budget
+                            // and invites the 429s the gates exist to prevent).
+                            let rung = (lane.late_retry_attempts as usize)
+                                .min(CADENCE_NATIVE_RETRY_OFFSETS_MS.len() - 1);
                             let retry_target = if native_empty {
                                 slots
                                     .boundary_ms
@@ -3448,6 +3472,39 @@ fn decide_lane<C: CadenceClock>(
     debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
 }
 
+/// Label for WHICH attempt first delivered a spot — the `rung` dimension of
+/// `tv_cadence_spot_first_success_rung_total` (2026-07-31 operator ask:
+/// "which attempt won?").
+///
+/// `attempts` is the lane's native-retry count AT THE MOMENT OF SUCCESS, so 0
+/// means the T+0 burst itself answered — the single most important reading,
+/// because whether a broker serves a just-closed minute at T+0 has never been
+/// observed (zero empty responses on record as of 2026-07-31).
+///
+/// Labels are `&'static str` and derived by INDEX, so a future edit to
+/// [`CADENCE_NATIVE_RETRY_OFFSETS_MS`] can never silently mislabel a rung —
+/// an index past the table degrades to `beyond_table` rather than pretending
+/// to name an offset. O(1), zero-allocation.
+fn native_rung_label(attempts: u32) -> &'static str {
+    // Kept in lockstep with CADENCE_NATIVE_RETRY_OFFSETS_MS by
+    // `test_native_rung_label_covers_every_rung_in_the_offsets_table`.
+    const LABELS: [&str; 6] = [
+        "retry_1_5ms",
+        "retry_2_300ms",
+        "retry_3_1000ms",
+        "retry_4_2000ms",
+        "retry_5_3000ms",
+        "retry_6_3800ms",
+    ];
+    if attempts == 0 {
+        return "burst";
+    }
+    LABELS
+        .get((attempts as usize) - 1)
+        .copied()
+        .unwrap_or("beyond_table")
+}
+
 /// Resolution provenance vocabulary - LOCKED: "cross_fill" |
 /// "native_late_retry" | "native_first_try" (item 3).
 fn resolution_token(cross_filled: bool, late_retry_attempts: u32) -> &'static str {
@@ -3661,6 +3718,62 @@ mod tests {
     /// legacy target expression survives in the source. Malformed is the ONE
     /// spec-sanctioned exception on BOTH arms: never retried (budget 0).
     #[test]
+    /// 2026-07-31 REGRESSION PIN. The rung index was clamped with a literal
+    /// `.min(2)` — the last index of the then-3-rung table. When #1714 grew
+    /// the ladder to 6 rungs that literal shipped unchanged, so every attempt
+    /// past the 3rd resolved to `CADENCE_NATIVE_RETRY_OFFSETS_MS[2]`: the
+    /// 2000/3000/3800 rungs became UNREACHABLE, and because index 2's offset
+    /// is already in the past by then, `.max(now_wall)` collapsed those three
+    /// attempts into back-to-back immediate re-fires — a retry burst against
+    /// the broker that burns the rolling-second budget and invites the very
+    /// 429s the gates exist to prevent.
+    ///
+    /// The clamp MUST derive from the table's own length so growing the
+    /// ladder can never again strand its tail.
+    #[test]
+    fn test_native_rung_clamp_tracks_the_offsets_table_length() {
+        let src = include_str!("runner.rs");
+        assert!(
+            src.contains("min(CADENCE_NATIVE_RETRY_OFFSETS_MS.len() - 1)"),
+            "the native rung clamp must derive from the offsets table length"
+        );
+        // Every rung index must be reachable, and each must map to a DISTINCT
+        // offset — the property the literal clamp silently destroyed.
+        let last = CADENCE_NATIVE_RETRY_OFFSETS_MS.len() - 1;
+        let reached: Vec<i64> = (0..=last)
+            .map(|attempts| CADENCE_NATIVE_RETRY_OFFSETS_MS[attempts.min(last)])
+            .collect();
+        assert_eq!(
+            reached,
+            CADENCE_NATIVE_RETRY_OFFSETS_MS.to_vec(),
+            "every rung must be reachable — a stranded tail means silent immediate re-fires"
+        );
+    }
+
+    /// The `rung` label vocabulary must cover EVERY entry of the offsets
+    /// table (plus the T+0 burst), so a grown ladder can never emit an
+    /// unnamed rung into the metric.
+    #[test]
+    fn test_native_rung_label_covers_every_rung_in_the_offsets_table() {
+        assert_eq!(native_rung_label(0), "burst");
+        for attempts in 1..=CADENCE_NATIVE_RETRY_OFFSETS_MS.len() {
+            let label = native_rung_label(u32::try_from(attempts).expect("rung count fits u32"));
+            assert_ne!(
+                label, "beyond_table",
+                "rung {attempts} has no label — the label table drifted from \
+                 CADENCE_NATIVE_RETRY_OFFSETS_MS"
+            );
+            assert!(
+                label.starts_with("retry_"),
+                "unexpected label {label} for rung {attempts}"
+            );
+        }
+        // One past the table degrades honestly instead of mislabelling.
+        let past = u32::try_from(CADENCE_NATIVE_RETRY_OFFSETS_MS.len() + 1).expect("fits u32");
+        assert_eq!(native_rung_label(past), "beyond_table");
+    }
+
+    #[test]
     fn test_native_retry_kill_switch_off_is_legacy_class_blind() {
         use crate::cadence::ladder::late_retry_budget;
 
@@ -3682,8 +3795,15 @@ mod tests {
             late_retry_budget(&CadenceFetchError::QueueDelay, true, 1),
             1
         );
-        // ON (spot leg): Empty gets the 3-attempt native ladder.
-        assert_eq!(late_retry_budget(&CadenceFetchError::Empty, false, 1), 3);
+        // ON (spot leg): Empty gets the FULL native ladder. Bound to the
+        // constant, not a literal — 2026-07-31 grew the ladder 3 -> 5
+        // rungs (two EARLY rungs prepended for the T+5 burst move) and a
+        // literal here would have silently disagreed with the array that
+        // `constants.rs` already pins verbatim.
+        assert_eq!(
+            late_retry_budget(&CadenceFetchError::Empty, false, 1),
+            tickvault_common::constants::CADENCE_NATIVE_RETRY_MAX_ATTEMPTS as u32
+        );
         // Malformed is NEVER retried — kill switch ON or OFF.
         assert_eq!(late_retry_budget(&CadenceFetchError::Malformed, true, 1), 0);
         assert_eq!(

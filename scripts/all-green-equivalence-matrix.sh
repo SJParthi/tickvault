@@ -5,12 +5,12 @@
 # succeeded" step).
 #
 # WHY (rust-only purge Phase 2a-1, 2026-07-18 — merge-gate-lock-2026-07-04.md
-# §5.1): the verdict step's inline `python3 - <<'PYEOF'` heredoc was ported to
+# §5.1): the verdict step's inline interpreter heredoc was ported to
 # a jq+shell program with BYTE-EQUIVALENT semantics. The porting PR proved
-# equivalence by running an 88-case fixture matrix through BOTH the old python
+# equivalence by running an 88-case fixture matrix through BOTH the old evaluator
 # heredoc and the new jq program (byte-identical stdout + stderr + exit codes;
 # evidence pasted in the PR body). This harness FREEZES that matrix: the
-# expected exit code + stdout of every fixture (generated from the OLD python
+# expected exit code + stdout of every fixture (generated from the OLD evaluator
 # evaluator, byte-verified against the jq program before merge) are pinned in
 # the table below, and the harness re-runs the LIVE jq block — self-extracted
 # from ci.yml between the ALL-GREEN-VERDICT-BEGIN/END markers — against every
@@ -19,7 +19,7 @@
 # existing Repo Guards console-gate step — a step in an existing needed job,
 # NOT a new job, per merge-gate-lock §5).
 #
-# NO PYTHON survives here by design: the reference side is the frozen table.
+# NO INTERPRETER survives here by design: the reference side is the frozen table.
 #
 # Fixture matrix shape (88 cases):
 #   A) 4 target jobs {commit-lint, design-first-wall, local-runtime-block,
@@ -132,7 +132,7 @@ exit 0
 # =============================================================================
 # Frozen fixture table (TAB-separated):
 #   name <TAB> event <TAB> overrides <TAB> expected_exit <TAB> expected_stdout
-# Generated 2026-07-18 from the OLD python evaluator; every row byte-verified
+# Generated 2026-07-18 from the OLD evaluator; every row byte-verified
 # identical (stdout + stderr + exit) against the new jq program before merge.
 # Do NOT hand-edit expected outputs — a semantics change needs its own dated
 # merge-gate-lock quote first (§5.1).

@@ -15,11 +15,60 @@ paths:
 >
 > **⚠ FURTHER SUPERSEDED → r8g.large 2026-06-30 (operator Quote 7 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance upgraded m8g.large → **r8g.large** (Graviton4, 2 vCPU / 16 GiB), bill → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP kept). The current effective instance lock lives in that file's §7.
 >
+> **⚠ RE-SUPERSEDED AGAIN → t4g.large 2026-08-07 (operator Quote 12 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §0/§7):** instance UPGRADED t4g.medium → **t4g.large** (Graviton2, 2 vCPU / **8 GiB**, $0.0448/hr) — NOT for performance: AWS ran out of **t4g.medium capacity in ap-south-1a** and the box, pinned to that single AZ by `main.tf:77`, could not start at all (Aug 5 = 0h, Aug 7 = 0h; six manual start attempts refused with `InsufficientInstanceCapacity`). A different instance type draws from a different capacity pool. Bill → **~₹1,896/mo** incl GST at 270 hrs / **~₹1,473/mo** at ~176 hrs (live 30 GB root, EIP kept) — i.e. **+₹400–600/mo, and the Quote 9 sub-₹1,000 target is NOT met and moves further away**. The ₹0-extra alternative (multi-AZ so the SAME t4g.medium can start in 1b/1c) was presented and not chosen; it stays available and would permit reverting under its own dated quote. The current effective instance lock lives in that file's §7.
+>
 > **⚠ RE-SUPERSEDED → t4g.medium 2026-07-15 (operator Quote 8 in [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §7):** instance DOWNSIZED r8g.large → **t4g.medium** (Graviton2, 2 vCPU / 4 GiB), QuestDB QDB_MEM_LIMIT 4g → 1g. INTERIM bill → ~₹1,471/mo incl GST at 270 hrs with the live 50 GB root (gp3 cannot shrink; the 20 GB fresh-volume recreate — an executor pre-stage, NOT operator-quoted — drops it to ~₹1,197/mo; ~₹986/mo requires BOTH the ~176-hr auto-schedule basis AND the post-recreate 20 GB volume — on the live 50 GB root the ~176-hr figure is ~₹1,260, and ~₹986 is never the 270-hr one). EIP kept. The current effective instance lock lives in that file's §7. This file's original t4g.medium tables below remain 2026-05-18 historical audit (different universe/stack — do not reuse the ₹1,022 figure).
 >
 > **⚠ LIVE-VOLUME CORRECTION 2026-07-19:** the banner above's "live 50 GB root" premise was factually WRONG — `aws ec2 describe-volumes vol-073ccaa417a0f344b` (run live 2026-07-19 via the coordinator session) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use**, attached to `i-0b956d0209231a48b` at `/dev/xvda` since 2026-05-24. The 2026-07-13 approved 30→50 GB grow (COST NOTE below) was RECORDED but **never physically applied**. Corrected interim bill: EBS $0.0912 × 30 = $2.74; subtotal $6.05 + $3.60 + $2.74 + $0.18 + $0.28 = $12.85 → ₹1,092 → ×1.18 GST = **~₹1,289/mo** at 270 hrs (was stated ~₹1,471/mo; the ~176-hr figure is ~₹1,077, was stated ~₹1,260). Post-recreate figures unchanged (~₹1,197 / ~₹986 — they assumed 20 GB). **FLAGGED FOLLOW-UP:** the disk-pressure remediation the grow was approved for is UNAPPLIED — the 82%-disk-pressure risk may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note. *(RESOLVED same day by the 2026-07-19 OPERATOR RULING below: 30 GB is formally ACCEPTED and the 30→50 grow is CANCELLED.)* Full arithmetic + authority: `daily-universe-scope-expansion-2026-05-27.md` §7 (2026-07-19 correction note) + §0 (2026-07-19 approvals bullet).
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
+
+## OPERATOR RULING 2026-07-31 — kill-ceiling RAISED $25 → $35 (breach incident; ladder paused, TARGET unchanged)
+
+**The verbatim operator demands (2026-07-31 — typed directly in-session, preserve EXACTLY, typos included):**
+> "Raise the limit bro olay?"
+>
+> "Go ahead with recomemdnaetion bro okay?"
+>
+> "nommanaul inptu full yauotmated mtoehrfucekr okay?"
+
+**The incident (live AWS evidence, read 2026-07-31 ~08:00 IST, acct `208384284948`):**
+
+| Fact | Value |
+|---|---|
+| Budget | `tv-prod-monthly-budget-v2` |
+| LIMIT | $25.00 |
+| ACTUAL | **$27.47 = 109.9% — BREACHED** |
+| FORECAST | $28.72 |
+| Actions armed | **2** — `RUN_SSM_DOCUMENTS` / `STOP_EC2_INSTANCES` on `i-0b956d0209231a48b`, `ApprovalModel=AUTOMATIC`, thresholds **90%** and **100%** |
+| Action status | **both `EXECUTION_FAILURE`** — repeatedly attempting to auto-stop the prod box mid-session while failing to complete |
+
+Effect: continuous budget alerts + an unreliable prod box during trading hours. EventBridge rules were verified **all 17 ENABLED** (incl. `tv-prod-daily-start` `cron(0 3 ? * MON-FRI *)` = 08:30 IST and `tv-prod-daily-stop` `cron(0 11 ? * MON-FRI *)` = 16:30 IST) — the killswitch had **not** disabled the start cron, so the ceiling was the sole blocker.
+
+**Why $35 (arithmetic — the actions fire at 90%/100% of the NEW limit):**
+
+| New limit | 90% line | vs ACTUAL $27.47 | vs FORECAST $28.72 | Verdict |
+|---|---|---|---|---|
+| $30 | $27.00 | ❌ already below actual | ❌ | re-trips immediately |
+| $32 | $28.80 | ✅ | ⚠️ 90% | tight |
+| **$35** | **$31.50** | ✅ | ✅ (82%) | **chosen** |
+
+**Status of the 2026-07-19 ruling:** the **< ₹1,000/mo TARGET stands unchanged** and the lever table below remains the plan of record. Only the **kill CEILING** is raised; the downward ratchet ladder ($25 → $18 → $13 → $10) is **PAUSED, not cancelled** — it resumes once the standing waste below is cut.
+
+**Standing waste NOT addressed by this raise (~$8.31/mo, Cost Explorer, 2026-07-31):**
+
+| Line | $/mo | Action |
+|---|---|---|
+| AWS Cost Explorer API | **2.38** | 238 calls @ $0.01 — something polls the bill; find + stop the caller |
+| VPC / Elastic IP | **3.55** | release already approved (2026-07-19 SECOND ruling, bundled with the recreate) |
+| CloudWatch alarms | **3.27** | trim menu below |
+| Secrets Manager | **0.38** | repo standard is free-tier SSM Parameter Store — delete stale secrets |
+
+Cutting those lands **~$19.43/mo — back under even the OLD $25 ceiling**, which is the precondition for resuming the ladder.
+
+**3-way lockstep applied in this PR:** `budget.tf limit_amount "35"` + `budget-guards.tf BUDGET_KILL_USD "35"` + `budget_digest.rs BUDGET_USD = 35.0` (+ its two pinned render tests). `hard_stop_guard.rs DEFAULT_BUDGET_KILL_USD = 55.0` remains the env-missing FALLBACK only (the env var is always injected; fail direction = kills later, never earlier) — aligning it stays a flagged follow-up.
+
+---
 
 ## OPERATOR RULING 2026-07-19 — sub-₹1,000/month hard budget target (30 GB accepted; grow CANCELLED)
 

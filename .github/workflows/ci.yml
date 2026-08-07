@@ -88,7 +88,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -139,7 +139,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -166,7 +166,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Validate SSM commands[] quoting in deploy workflows
         shell: bash
@@ -186,7 +186,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain 1.95.0
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
@@ -249,7 +249,7 @@ jobs:
         # gone and every crate tests with default features.
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain 1.95.0
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
@@ -306,7 +306,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain 1.95.0
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
@@ -341,7 +341,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain 1.95.0
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
@@ -430,7 +430,7 @@ jobs:
           df -h /
           # Well-known GH-hosted-runner cleanup recipe: drop preinstalled
           # toolchains this job never uses (~25-30 GB reclaimed).
-          # NOT deleted: /opt/hostedtoolcache python/node (system tools other
+          # NOT deleted: /opt/hostedtoolcache runtimes (system tools other
           # steps could resolve to) — CodeQL is the only safe-to-drop entry.
           sudo rm -rf /usr/share/dotnet \
                       /usr/local/lib/android \
@@ -444,7 +444,7 @@ jobs:
           df -h /
 
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain 1.95.0 + llvm-tools
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
@@ -538,7 +538,7 @@ jobs:
     timeout-minutes: 15 # 2026-07-16: real full-tree scans measured ~3.5 min; headroom for the lambda/console suites
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       # 2026-07-05: guards that the hot-path filter paths inside the two
       # scanners below always match REAL files — a rename can never blind
@@ -590,7 +590,7 @@ jobs:
         shell: bash
         run: bash .claude/hooks/boot-symmetry-guard.sh
 
-      # 2026-07-18 (rust-only phase 2b-2 wave 1): the python `make
+      # 2026-07-18 (rust-only phase 2b-2 wave 1): the legacy `make
       # lambda-test` step is RETIRED — the telegram-webhook Lambda is now
       # the Rust crate tickvault-aws-lambdas (its ported test suite runs in
       # the Test matrix `aws-lambdas` lane, which All Green already needs),
@@ -600,7 +600,7 @@ jobs:
 
       # QuestDB console deploy-gate scenario harness (2026-07-06 shell-hang
       # fix; simplified in the 2026-07-08 closure pass). 2026-07-18
-      # (rust-only phase 2b-3): the two console lambda Python unittest
+      # (rust-only phase 2b-3): the two console lambda legacy unittest
       # suites that used to run here were RETIRED with the handlers — the
       # 31+61 tests are ported 1:1 into crates/aws-lambdas
       # (qdb_console_proxy.rs / qdb_console_front.rs) and run in the
@@ -672,7 +672,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: DHAT target drift check (no silent drops)
         shell: bash
@@ -878,7 +878,7 @@ jobs:
           #
           # Language port 2026-07-18 (rust-only purge Phase 2a-1 —
           # merge-gate-lock-2026-07-04.md §5.1 dated amendment): the former
-          # inline `python3 - <<'PYEOF'` evaluator, re-expressed in jq+shell
+          # inline interpreter heredoc evaluator, re-expressed in jq+shell
           # with BYTE-EQUIVALENT semantics (jq ships preinstalled on the
           # GitHub ubuntu runner images). Semantics UNCHANGED:
           # - iterate needed jobs sorted by name;

@@ -58,7 +58,43 @@ paths:
 - CI never runs this guard — a CI run would establish a fresh baseline and
   pass vacuously (merge-gate-lock-2026-07-04.md §3 row 6)
 
+### 2026-08-07 baseline RE-TRACKING — the false-OK fix (supersedes the untracking notes above and below)
+
+The three ratchet baselines (`.test-count-baseline`, `.untested-pubfn-baseline`,
+`.financial-test-baseline`) are **tracked in git again**, deliberately. This
+reverses the 2026-07-13 untracking, and it fixes the reason that untracking was
+survivable in the first place.
+
+**The false-OK it closes.** Each guard, finding no baseline, WROTE one and
+exited 0. Gitignored + CI checkout ⇒ no baseline ⇒ every CI run auto-established
+a fresh one and passed. Three "gates" that could never fail. `merge-gate-lock-2026-07-04.md`
+§3 row 6 and the two bullets above record this in writing. A ratchet whose
+memory is erased before every run is not a ratchet.
+
+**Why re-tracking is safe now — the 2026-07-13 breakage is fixed at its cause.**
+That untracking happened because the guards **auto-wrote** the baseline on every
+improvement, so a tracked file went dirty on any machine whose count differed,
+and `git pull` refused. As of 2026-08-07 the guards **no longer write on
+improvement**: they PASS, print the new value, and tell you to ratchet it in the
+PR. The only remaining write is the local first-run bootstrap. Same discipline
+as `quality/crate-coverage-thresholds.toml`, which has always been committed and
+hand-ratcheted with a dated note. Ratchet movement is now PR-visible instead of
+silently absorbed into a developer's working tree.
+
+**Fail-closed in CI.** With `CI` set, a missing baseline is now `exit 1` with a
+named error, not an auto-establish. Local first-run behaviour is unchanged.
+
+**Honest envelope.** Committing the baselines makes the comparison real and the
+guards CI-viable; it does **not** by itself wire them into the CI `Repo Guards`
+job. They remain local-only today. Wiring them server-side is a deliberate
+follow-up (it would start blocking PRs, which needs its own review) — this note
+exists so nobody reads the re-tracking as having already delivered that.
+Ratchet: `crates/common/tests/audit_fix_guard.rs`.
+
 ### 2026-07-13 baseline untracking — one-time migration + fail-closed notes
+*(SUPERSEDED 2026-08-07 by the section above — retained as historical audit per
+house convention. The migration steps below are obsolete: the baselines are
+tracked again and the guards no longer auto-write them.)*
 - **One-time migration:** after pulling the 2026-07-13 untracking commit, a
   machine whose local baseline was auto-bumped by the guard may see
   `git pull` refuse over these two files (`git stash` is banned): run

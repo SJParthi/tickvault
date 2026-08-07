@@ -1,16 +1,16 @@
 //! Structured logging for the Lambda bins.
 //!
-//! Python parity: the killswitch handler read `LOG_LEVEL` (default `INFO`)
+//! Legacy parity: the killswitch handler read `LOG_LEVEL` (default `INFO`)
 //! into the stdlib logger; the heredoc lambdas used bare `print`. Here every
 //! bin initializes ONE JSON tracing subscriber whose level comes from
 //! `LOG_LEVEL` (same env var, same default) — CloudWatch Logs ingests the
-//! JSON lines exactly as it ingested the Python logger/print output.
+//! JSON lines exactly as it ingested the legacy logger/print output.
 
 use tracing_subscriber::EnvFilter;
 
-/// Map the Python-style `LOG_LEVEL` value (`INFO` / `DEBUG` / `WARNING`)
+/// Map the legacy-style `LOG_LEVEL` value (`INFO` / `DEBUG` / `WARNING`)
 /// onto a tracing filter directive. Unknown values fall back to `info`
-/// (the Python logger would have raised on setLevel of garbage only for
+/// (the legacy logger would have raised on setLevel of garbage only for
 /// non-string types; string garbage fell back to WARNING-ish behavior —
 /// deliberate deviation: we fail-soft to `info`, documented in the PR).
 pub fn level_directive(raw: Option<&str>) -> &'static str {
@@ -43,7 +43,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn level_directive_maps_python_levels() {
+    fn level_directive_maps_legacy_levels() {
         assert_eq!(level_directive(Some("INFO")), "info");
         assert_eq!(level_directive(Some("DEBUG")), "debug");
         assert_eq!(level_directive(Some("WARNING")), "warn");

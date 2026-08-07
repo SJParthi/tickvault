@@ -16,24 +16,24 @@
 //! markup-parsing payload field) so an alarm name containing '*' or '_'
 //! can never trigger a silent Markdown-parse 400 drop.
 //!
-//! Environment variables (set by Terraform — unchanged from the Python):
+//! Environment variables (set by Terraform — unchanged from the legacy runtime):
 //!   TELEGRAM_BOT_TOKEN_SSM_PARAM  — SSM path holding the bot token
 //!   TELEGRAM_CHAT_ID_SSM_PARAM    — SSM path holding the chat ID
 //!   LOG_LEVEL                     — INFO (default) / DEBUG / WARNING
 //!
-//! Parity ledger (every deliberate deviation from the Python original):
-//! - python `print()` forensics → `tracing::info!` (same CloudWatch Logs
+//! Parity ledger (every deliberate deviation from the legacy original):
+//! - legacy `print()` forensics → `tracing::info!` (same CloudWatch Logs
 //!   destination; the crate denies print_stdout).
-//! - python edge-dated timestamps (year 0001/9999) raised OverflowError on
+//! - legacy edge-dated timestamps (year 0001/9999) raised OverflowError on
 //!   the tz conversion and fell back to the invocation time; chrono
 //!   converts those dates without overflow, so the rendered clock is the
 //!   real converted time — both satisfy the `H:MM AM|PM` format contract.
-//! - python `str(dict)` renders `{'k': 'v'}`; Rust renders the serde_json
+//! - legacy `str(dict)` renders `{'k': 'v'}`; Rust renders the serde_json
 //!   representation `{"k":"v"}` for non-string SNS Message bodies (only
 //!   reachable on crafted/malformed publishes).
-//! - serde_json enforces a 128-level recursion limit that python's
+//! - serde_json enforces a 128-level recursion limit that the legacy runtime's
 //!   `json.loads` did not share at moderate depth: a VALID alarm JSON
-//!   carrying a >128-deep irrelevant nested field parsed in python
+//!   carrying a >128-deep irrelevant nested field parsed in legacy
 //!   (depth ~200 → house line; extreme ~1000+ depth raised
 //!   RecursionError → the fail-open generic safe line — oracle-verified
 //!   2026-07-18 against the recovered handler.py) but fails
@@ -44,19 +44,19 @@
 //!   NEVER reaches the Telegram body — a fail-safe divergence,
 //!   unreachable from real CloudWatch publishes (real alarm JSON is
 //!   shallow; reaching this arm requires a crafted `sns:Publish`).
-//! - python `_fold_records(cache=None)` optionality collapsed: every call
+//! - legacy `_fold_records(cache=None)` optionality collapsed: every call
 //!   site (lambda handler + all tests) passes a cache, so the Rust fn
 //!   takes `&mut HashMap` unconditionally.
-//! - python truthy-non-dict records / Sns values raised AttributeError →
+//! - legacy truthy-non-dict records / Sns values raised AttributeError →
 //!   generic safe line; Rust maps every non-object, non-null shape to the
 //!   same generic safe line (exotic FALSY non-dicts like `""`/`[]`/`0`
-//!   would have rendered "🔔 " in python — no test pins that; documented).
-//! - python wrapped the render loop + the whole fold in `except Exception`
+//!   would have rendered "🔔 " in the legacy runtime — no test pins that; documented).
+//! - the legacy runtime wrapped the render loop + the whole fold in `except Exception`
 //!   fail-open arms; the Rust render chain has no panicking path, so those
 //!   arms are structurally unreachable and not reproduced.
 //! - reqwest errors are stripped of their URL (`Error::without_url`)
 //!   before entering the failures list — the URL embeds the bot token
-//!   (hardening beyond python; urllib error strings never carried it).
+//!   (hardening beyond legacy; urllib error strings never carried it).
 //! - env vars are read per invocation instead of at module import — same
 //!   effective behavior inside a Lambda container.
 
@@ -69,7 +69,7 @@ use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
-pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org"; // APPROVED: infrastructure constant — the Telegram Bot API base (Lambda-side, python webhook parity)
+pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org"; // APPROVED: infrastructure constant — the Telegram Bot API base (Lambda-side, legacy webhook parity)
 pub const TELEGRAM_TIMEOUT_SECONDS: u64 = 8;
 
 /// Warm-container duplicate-OK guard (judge contract, robustness graft):
@@ -83,7 +83,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 /// Known alarm → auto-driver plain English (charter §D: no library names,
 /// no file paths, no jargon). Keys are alarm names AFTER the tv-<env>-
 /// prefix strip. Unknown names fall back to a humanized form — never a
-/// lookup panic, never raw JSON. Python parity: `ALARM_PHRASES` dict,
+/// lookup panic, never raw JSON. Legacy parity: `ALARM_PHRASES` dict,
 /// byte-identical phrases (incl. the 🔷 DHAN / 🖥️ HOST broker tags per the
 /// operator directive 2026-07-14).
 ///
@@ -198,12 +198,12 @@ pub const ALARM_PHRASES: [(&str, &str); 29] = [
 ];
 
 /// Cached SSM reads — Lambda containers stay warm for ~15 min. Re-fetch
-/// only when the container is cold. Python parity: `_CACHED_TOKEN` /
+/// only when the container is cold. Legacy parity: `_CACHED_TOKEN` /
 /// `_CACHED_CHAT_ID` module globals.
 static CACHED_TOKEN: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 static CACHED_CHAT_ID: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
-/// Warm-container OK-suppression cache — Python parity: `_LAST_SENT`.
+/// Warm-container OK-suppression cache — legacy parity: `_LAST_SENT`.
 static LAST_SENT: Mutex<Option<HashMap<String, (String, f64)>>> = Mutex::new(None);
 
 /// The fixed IST offset (+05:30). `east_opt` is statically in range; the
@@ -212,9 +212,9 @@ fn ist() -> FixedOffset {
     FixedOffset::east_opt(crate::time::IST_OFFSET_SECS).unwrap_or_else(|| Utc.fix())
 }
 
-/// Python `str(value or default)` over a JSON field: falsy (missing /
+/// Legacy `str(value or default)` over a JSON field: falsy (missing /
 /// null / "" / false) → default; other non-strings stringify (ledger:
-/// serde_json repr, not python repr — unreachable on real alarm JSON).
+/// serde_json repr, not legacy repr — unreachable on real alarm JSON).
 fn value_str_or(value: Option<&Value>, default: &str) -> String {
     match value {
         None | Some(Value::Null) => default.to_string(),
@@ -226,7 +226,7 @@ fn value_str_or(value: Option<&Value>, default: &str) -> String {
 }
 
 /// Map alarm severity / subject to a leading emoji per charter §D rule
-/// 5+10. Python parity: `_severity_emoji` (the python `"deploy ok" in`
+/// 5+10. Legacy parity: `_severity_emoji` (the legacy `"deploy ok" in`
 /// clause is a subset of the `"ok" in` clause — one contains-check here).
 pub fn severity_emoji(subject: &str, alarm_state: Option<&str>) -> &'static str {
     let subject_lower = subject.to_lowercase();
@@ -248,8 +248,8 @@ pub fn severity_emoji(subject: &str, alarm_state: Option<&str>) -> &'static str 
 
 /// Parse the CloudWatch StateChangeTime shapes
 /// ("2026-07-07T04:31:12.345+0000", "...Z", with/without fractional
-/// seconds, tz-naive treated as UTC). Python parity: `fromisoformat`
-/// with the `Z`→`+00:00` replace + the strptime fallbacks (python also
+/// seconds, tz-naive treated as UTC). Legacy parity: `fromisoformat`
+/// with the `Z`→`+00:00` replace + the strptime fallbacks (the legacy runtime also
 /// accepted date-only / space-separated ISO shapes CloudWatch never
 /// emits; not reproduced — malformed input degrades identically).
 fn parse_state_change_time(raw: &str) -> Option<DateTime<FixedOffset>> {
@@ -262,7 +262,7 @@ fn parse_state_change_time(raw: &str) -> Option<DateTime<FixedOffset>> {
     if let Ok(dt) = DateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f%z") {
         return Some(dt);
     }
-    // tz-naive input — python `parsed.replace(tzinfo=timezone.utc)`.
+    // tz-naive input — legacy `parsed.replace(tzinfo=timezone.utc)`.
     if let Ok(naive) = NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
         return Some(naive.and_utc().fixed_offset());
     }
@@ -271,7 +271,7 @@ fn parse_state_change_time(raw: &str) -> Option<DateTime<FixedOffset>> {
 
 /// Render a CloudWatch StateChangeTime as an IST 12-hour clock string.
 ///
-/// Python parity: `_ist_12h`. Malformed / missing input falls back to
+/// Legacy parity: `_ist_12h`. Malformed / missing input falls back to
 /// the invocation time — the timestamp line degrades, never crashes
 /// (fail-open: malformed / edge-dated inputs degrade to the invocation
 /// time; chrono has no OverflowError class — see the module ledger).
@@ -289,7 +289,7 @@ pub fn ist_12h(state_change_time: &str) -> String {
 }
 
 /// Strip the `tv-<env>-` prefix off an alarm name so the phrase table is
-/// environment-agnostic. Python parity: `_ENV_PREFIX_RE = ^tv-[a-z0-9]+-`
+/// environment-agnostic. Legacy parity: `_ENV_PREFIX_RE = ^tv-[a-z0-9]+-`
 /// (leftmost-anchored substitution, implemented without a regex dep).
 fn strip_env_prefix(name: &str) -> &str {
     if let Some(rest) = name.strip_prefix("tv-") {
@@ -307,7 +307,7 @@ fn strip_env_prefix(name: &str) -> &str {
 }
 
 /// Map an alarm name to plain English; humanize unknown names (fail-open).
-/// Python parity: `_alarm_phrase`.
+/// Legacy parity: `_alarm_phrase`.
 pub fn alarm_phrase(alarm_name: &str) -> String {
     let key = strip_env_prefix(alarm_name.trim());
     if let Some((_, phrase)) = ALARM_PHRASES.iter().find(|(k, _)| *k == key) {
@@ -328,7 +328,7 @@ pub fn alarm_phrase(alarm_name: &str) -> String {
 /// Format one CloudWatch alarm object into the house-style Telegram text.
 ///
 /// `{emoji} {plain-English line}` + newline + `{IST 12-hour} IST`.
-/// The raw NewStateReason NEVER enters this string. Python parity:
+/// The raw NewStateReason NEVER enters this string. Legacy parity:
 /// `_house_line`.
 pub fn house_line(alarm: &Value) -> String {
     let name = value_str_or(alarm.get("AlarmName"), "unknown-alarm");
@@ -348,13 +348,13 @@ pub fn house_line(alarm: &Value) -> String {
 }
 
 /// ONE green line covering one or more recovered alarms.
-/// Python parity: `_recovered_line`.
+/// Legacy parity: `_recovered_line`.
 pub fn recovered_line(phrases: &[String], ist_time: &str) -> String {
     format!("✅ Recovered: {} — {ist_time} IST", phrases.join("; "))
 }
 
 /// Return the CloudWatch alarm object if `message` is an alarm JSON
-/// string, else None. Python parity: `_parse_alarm`.
+/// string, else None. Legacy parity: `_parse_alarm`.
 pub fn parse_alarm(message: &Value) -> Option<Value> {
     let Value::String(s) = message else {
         return None;
@@ -367,7 +367,7 @@ pub fn parse_alarm(message: &Value) -> Option<Value> {
 }
 
 /// Character cap on the plain-SNS fallback body (Telegram's hard message
-/// limit is 4096 chars; cap + marker stays well under it). Python had no
+/// limit is 4096 chars; cap + marker stays well under it). The legacy runtime had no
 /// cap — the fallback arm is already a divergence-documented fail-safe
 /// (module ledger), and ordinary deploy/operator publishes are far
 /// shorter, so byte-parity for them is unaffected.
@@ -385,7 +385,7 @@ pub const PLAIN_FALLBACK_BODY_MAX_CHARS: usize = 3500;
 /// emitted by real CloudWatch — crafted input only) is redacted to the
 /// end of the text, fail-safe. Ordinary non-JSON messages contain no
 /// `"NewStateReason"` key, so this is a byte-exact no-op for them
-/// (python plain-fallback parity preserved; oracle-verified).
+/// (legacy plain-fallback parity preserved; oracle-verified).
 pub fn redact_new_state_reason(text: &str) -> String {
     const KEY: &str = "\"NewStateReason\"";
     if !text.contains(KEY) {
@@ -455,7 +455,7 @@ fn cap_fallback_body(body: String) -> String {
 }
 
 /// Format a non-CloudWatch SNS publish (e.g., from the deploy-aws
-/// workflow). Python parity: `_format_plain_sns` — byte-identical for
+/// workflow). Legacy parity: `_format_plain_sns` — byte-identical for
 /// ordinary messages; diverges ONLY when the text carries a
 /// `"NewStateReason"` field (redacted) or exceeds the fallback cap
 /// (truncated) — both fail-safe, module-ledger documented.
@@ -484,7 +484,7 @@ pub fn format_plain_sns(subject: Option<&Value>, message: &Value) -> String {
 /// True when an OK for `name` repeats a recent OK (warm-container dedupe).
 ///
 /// ONLY ever called for OK-state records — ALARM records are never
-/// routed through this cache (never-drop law). Python parity:
+/// routed through this cache (never-drop law). Legacy parity:
 /// `_should_suppress_ok`.
 pub fn should_suppress_ok(
     name: &str,
@@ -499,7 +499,7 @@ pub fn should_suppress_ok(
 
 /// Fold one SNS batch into the final list of Telegram texts.
 ///
-/// Rules (judge final contract, Module 5) — Python parity: `_fold_records`:
+/// Rules (judge final contract, Module 5) — legacy parity: `_fold_records`:
 /// - ALARM records stay INDIVIDUAL house lines — never digested,
 ///   never suppressed (a later ALARM for the same alarm supersedes an
 ///   earlier one in the same batch: still exactly one 🆘 delivered).
@@ -527,7 +527,7 @@ pub fn fold_records(
 
     let empty_message = Value::String(String::new());
     for record in records {
-        // Python parity: a truthy non-dict record / Sns value raised
+        // Legacy parity: a truthy non-dict record / Sns value raised
         // AttributeError → caught → generic safe line (fail-open).
         let sns_obj = match record {
             Value::Null => None,
@@ -576,7 +576,7 @@ pub fn fold_records(
     let mut lone_ok_phrases: Vec<String> = Vec::new();
     let mut lone_ok_ist: Option<String> = None;
 
-    // (python wrapped this loop in a per-record fail-open `except` —
+    // (the legacy runtime wrapped this loop in a per-record fail-open `except` —
     //  the Rust render chain has no panicking path; ledger.)
     for name in &name_order {
         let Some(alarm) = last_by_name.get(name) else {
@@ -623,7 +623,7 @@ pub fn fold_records(
 /// load-bearing: there is NO markup-parsing field in this payload, so an
 /// alarm name containing '*', '`' or '[' can never cause a silent
 /// Markdown-parse 400 drop (the `test_post_payload_has_no_parse_mode`
-/// ratchet asserts over these keys — the Rust analog of python's
+/// ratchet asserts over these keys — the Rust analog of the legacy runtime's
 /// `inspect.getsource` scan).
 pub fn telegram_form_pairs(chat_id: &str, text: &str) -> [(&'static str, String); 3] {
     [
@@ -633,7 +633,7 @@ pub fn telegram_form_pairs(chat_id: &str, text: &str) -> [(&'static str, String)
     ]
 }
 
-/// application/x-www-form-urlencoded encoding — Python parity:
+/// application/x-www-form-urlencoded encoding — legacy parity:
 /// `urllib.parse.urlencode` (quote_plus: space → '+', unreserved
 /// `A-Za-z0-9_.-~` pass through, everything else %XX per UTF-8 byte).
 pub fn form_urlencode(pairs: &[(&str, String)]) -> String {
@@ -664,7 +664,7 @@ pub fn form_urlencode(pairs: &[(&str, String)]) -> String {
 }
 
 /// POST to the Telegram bot API. Returns (status_code, body_text).
-/// Python parity: `_post_to_telegram`. UNPROVEN until deploy — the live
+/// Legacy parity: `_post_to_telegram`. UNPROVEN until deploy — the live
 /// HTTP leg runs only in a real Lambda; the payload construction it
 /// sends is what the unit tests cover. The token/chat-id are NEVER
 /// logged.
@@ -688,18 +688,18 @@ pub async fn post_to_telegram(
         .send()
         .await?;
     let status = resp.status().as_u16();
-    // python: resp.read().decode("utf-8", errors="replace") — reqwest
+    // legacy: resp.read().decode("utf-8", errors="replace") — reqwest
     // text() is already lossy on invalid UTF-8; a transport error while
-    // reading propagates like the python exception path.
+    // reading propagates like the legacy exception path.
     let body_text = resp.text().await?;
     Ok((status, body_text))
 }
 
 /// Send every folded text into the Telegram POST — the single delivery
-/// choke point (no filtering between the fold and the POST). Python
+/// choke point (no filtering between the fold and the POST). Legacy
 /// parity: the `for text in texts:` loop of `lambda_handler`. `post` is
 /// the injected transport so tests exercise the full never-drop boundary
-/// without HTTP (the Rust analog of python's `mock.patch`).
+/// without HTTP (the Rust analog of the legacy runtime's `mock.patch`).
 pub async fn send_texts<F, Fut>(texts: &[String], records_len: usize, mut post: F) -> Value
 where
     F: FnMut(String) -> Fut,
@@ -725,14 +725,14 @@ where
         }
         // Cheap rate-limit cushion. Telegram allows ~30 msg/sec per bot;
         // if 5+ alarms fire in the same SNS batch we don't want to flirt
-        // with their throttle. Python parity: `time.sleep(0.05)`.
-        tokio::time::sleep(Duration::from_millis(50)).await; // APPROVED: python-parity throttle cushion (time.sleep(0.05)) — cold Lambda path, not the tick hot path
+        // with their throttle. Legacy parity: `time.sleep(0.05)`.
+        tokio::time::sleep(Duration::from_millis(50)).await; // APPROVED: legacy-parity throttle cushion (time.sleep(0.05)) — cold Lambda path, not the tick hot path
     }
     json!({"sent": sent, "failures": failures, "records": records_len})
 }
 
 /// Fold + send composed — the testable end-to-end delivery seam the
-/// LambdaHandlerDelivery tests drive (python patched `lambda_handler`'s
+/// LambdaHandlerDelivery tests drive (the legacy runtime patched `lambda_handler`'s
 /// collaborators; the Rust seam injects the cache + transport instead).
 pub async fn deliver<F, Fut>(
     records: &[Value],
@@ -764,7 +764,7 @@ async fn fetch_ssm_secret(parameter_name: &str) -> Result<String, Error> {
 }
 
 /// Return (bot_token, chat_id), caching across warm invocations.
-/// Python parity: `_get_credentials`. Secret VALUES are never logged.
+/// Legacy parity: `_get_credentials`. Secret VALUES are never logged.
 async fn get_credentials() -> Result<(String, String), Error> {
     let token_param = std::env::var("TELEGRAM_BOT_TOKEN_SSM_PARAM")
         .unwrap_or_else(|_| "/tickvault/prod/telegram/bot-token".to_string());
@@ -781,11 +781,11 @@ async fn get_credentials() -> Result<(String, String), Error> {
     Ok((token, chat_id))
 }
 
-/// SNS-triggered entry point — Python parity: `lambda_handler`.
+/// SNS-triggered entry point — legacy parity: `lambda_handler`.
 ///
 /// UNPROVEN until deploy: the live SSM + Telegram HTTP legs run only in
 /// a real Lambda. Credential errors are propagated (`?`) so SNS marks
-/// the delivery failed and retries per its default policy — the python
+/// the delivery failed and retries per its default policy — the legacy
 /// re-raise semantics (without retry the alert is lost forever).
 pub async fn handle(event: Value) -> Result<Value, Error> {
     let records: Vec<Value> = event
@@ -822,7 +822,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
         let cache = guard.get_or_insert_with(HashMap::new);
         fold_records(&records, now, cache)
     };
-    // (python backstopped a fold crash with one generic line per record;
+    // (legacy backstopped a fold crash with one generic line per record;
     //  the Rust fold has no panicking path — ledger.)
 
     let result = send_texts(&texts, records.len(), |text| {
@@ -926,7 +926,7 @@ mod tests {
         alarm_record(name, state, "2026-07-07T04:31:12.345+0000")
     }
 
-    // ---- HouseLine (Python: 6 tests) ----
+    // ---- HouseLine (legacy: 6 tests) ----
 
     #[test]
     fn test_house_line_no_raw_threshold_json() {
@@ -1003,7 +1003,7 @@ mod tests {
         assert!(out.starts_with("⚠️ "));
     }
 
-    // ---- Ist12Hour (Python: 5 tests) ----
+    // ---- Ist12Hour (legacy: 5 tests) ----
 
     #[test]
     fn test_ist_12_hour_timestamp() {
@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn test_edge_dated_timestamps_fall_back_without_crash() {
-        // Python regression (2026-07-07 refute round 1): year-0001/9999
+        // Legacy regression (2026-07-07 refute round 1): year-0001/9999
         // inputs OverflowError'd on the IST conversion. chrono converts
         // them without overflow (module ledger) — the contract is the
         // clock FORMAT, which must hold either way.
@@ -1047,7 +1047,7 @@ mod tests {
         }
     }
 
-    // ---- AlarmPhrase (Python: 3 tests) ----
+    // ---- AlarmPhrase (legacy: 3 tests) ----
 
     #[test]
     fn test_known_alarm_maps_to_plain_english() {
@@ -1070,7 +1070,7 @@ mod tests {
         assert_eq!(alarm_phrase(""), "A cloud alarm changed state");
     }
 
-    // ---- FoldRecords (Python: 9 tests) ----
+    // ---- FoldRecords (legacy: 9 tests) ----
 
     #[test]
     fn test_ok_flip_single_line_recovered() {
@@ -1241,7 +1241,7 @@ mod tests {
         }
     }
 
-    // ---- FormatPlainSns (Python: 3 tests) ----
+    // ---- FormatPlainSns (legacy: 3 tests) ----
 
     #[test]
     fn test_deploy_ok_subject_uses_check_emoji() {
@@ -1285,8 +1285,8 @@ mod tests {
 
     #[test]
     fn test_deep_nest_200_valid_alarm_never_leaks_new_state_reason() {
-        // python oracle (recovered handler.py, 2026-07-18): depth-200
-        // PARSES in python → house line '🆘 Feed stall\n3:30 PM IST'.
+        // legacy oracle (recovered handler.py, 2026-07-18): depth-200
+        // PARSES in the legacy runtime → house line '🆘 Feed stall\n3:30 PM IST'.
         // Rust diverges (ledger): redacted, capped plain fallback.
         let msg = deep_alarm_json(200);
         let mut cache = HashMap::new();
@@ -1299,7 +1299,7 @@ mod tests {
 
     #[test]
     fn test_deep_nest_2000_valid_alarm_never_leaks_and_never_panics() {
-        // python oracle: depth-2000 raised RecursionError in json.loads →
+        // legacy oracle: depth-2000 raised RecursionError in json.loads →
         // fail-open generic safe line. Rust: fast serde_json refusal at
         // depth 128 → redacted + capped plain fallback. No panic, no
         // stack overflow, no forensic content either way.
@@ -1316,9 +1316,9 @@ mod tests {
     }
 
     #[test]
-    fn test_plain_fallback_ordinary_messages_byte_parity_with_python_oracle() {
+    fn test_plain_fallback_ordinary_messages_byte_parity_with_legacy_oracle() {
         // Redaction + cap MUST be byte-exact no-ops on ordinary non-JSON
-        // publishes. Oracle: python3 on the recovered handler.py
+        // publishes. Oracle: the legacy runtime on the recovered handler.py
         // (git show 3a44ffd^:deploy/aws/lambda/telegram-webhook/handler.py),
         // run 2026-07-18:
         //   _format_plain_sns("DLT deploy OK", "commit=abc ref=main")
@@ -1394,9 +1394,9 @@ mod tests {
         assert_eq!(out2, format!("🔔 {short}"));
     }
 
-    // ---- LambdaHandlerDelivery (Python: 3 tests) ----
+    // ---- LambdaHandlerDelivery (legacy: 3 tests) ----
     //
-    // Python patched lambda_handler's collaborators (`_get_credentials`,
+    // The legacy runtime patched lambda_handler's collaborators (`_get_credentials`,
     // `_post_to_telegram`, time.sleep); the Rust seam is `deliver` — the
     // same fold→send composition `handle` runs, with the cache + transport
     // injected. The empty-event test drives the real `handle` (it returns
@@ -1437,7 +1437,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poisoned_timestamp_record_never_drops_genuine_alarm_in_batch() {
-        // Python regression (2026-07-07 refute round 1): a batch containing
+        // Legacy regression (2026-07-07 refute round 1): a batch containing
         // one edge-dated StateChangeTime crashed the ENTIRE invocation
         // before any send — the genuine 🆘 in the same batch was dropped.
         let (result, posted) = invoke(vec![
@@ -1472,7 +1472,7 @@ mod tests {
         assert_eq!(result, json!({"sent": 0, "skipped": 1}));
     }
 
-    // ---- SeverityEmojiHeuristic (Python: 3 tests) ----
+    // ---- SeverityEmojiHeuristic (legacy: 3 tests) ----
 
     #[test]
     fn test_alarm_state_beats_subject() {
@@ -1490,12 +1490,12 @@ mod tests {
         assert_eq!(severity_emoji("hello", None), "🔔");
     }
 
-    // ---- PlainTextTransport (Python: 5 tests) ----
+    // ---- PlainTextTransport (legacy: 5 tests) ----
 
     #[test]
     fn test_post_payload_has_no_parse_mode() {
         // Plain-text mode is load-bearing: an alarm name containing '*'
-        // must never cause a silent Markdown-parse 400 drop. (Python used
+        // must never cause a silent Markdown-parse 400 drop. (the legacy runtime used
         // inspect.getsource; the Rust payload is a pure fn — assert over
         // its exact keys.)
         let pairs = telegram_form_pairs("chat", "text *with* markup");
@@ -1566,11 +1566,11 @@ mod tests {
         assert!(out.contains("🔷 DHAN:"));
     }
 
-    // ---- Rust-side additions beyond the Python suite ----
+    // ---- Rust-side additions beyond the legacy suite ----
 
     #[test]
-    fn test_form_urlencode_matches_python_quote_plus() {
-        // python: urlencode({"chat_id": "-100", "text": "a b&c=✅"}) —
+    fn test_form_urlencode_matches_legacy_quote_plus() {
+        // legacy: urlencode({"chat_id": "-100", "text": "a b&c=✅"}) —
         // space → '+', '&'/'=' → %26/%3D, UTF-8 bytes %XX uppercase.
         let pairs = [
             ("chat_id", "-100".to_string()),

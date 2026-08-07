@@ -331,7 +331,7 @@ fn test_alarm_is_gated_by_market_hours_lambda() {
 /// fail OPEN on an EC2 API error so a real trading day never loses the page.
 #[test]
 fn test_gate_lambda_open_is_holiday_safe() {
-    // 2026-07-18 (rust-only phase 2b-1): the gate Lambda's Python heredoc was
+    // 2026-07-18 (rust-only phase 2b-1): the gate Lambda's legacy heredoc was
     // PORTED to Rust (crates/aws-lambdas/src/market_hours_gate.rs) — the
     // env-var + IAM pins stay in the tf; the LOGIC pins repoint to the Rust
     // source (the budget_killswitch_wiring.rs repoint precedent).
@@ -606,7 +606,7 @@ fn test_holiday_stop_marker_chain_is_wired() {
     );
 
     // --- reader 1: start-watchdog Rust port (rust-only phase 2b-2 wave 2;
-    //     the python handler.py was deleted with the tf swap) ---------------
+    //     the legacy handler.py was deleted with the tf swap) ---------------
     let watchdog = read("crates/aws-lambdas/src/start_watchdog.rs");
     for pin in [
         "HOLIDAY_STOP_PARAM",

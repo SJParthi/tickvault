@@ -3,7 +3,7 @@
 //!
 //! Serves BOTH the Lambda Function URL and the API-GW v2 (payload 2.0)
 //! routes — the raw `serde_json::Value` event covers both shapes exactly
-//! like the Python oracle's dict handling did.
+//! like the legacy oracle's dict handling did.
 
 // House restriction-lint blanket (match the lib.rs / binary-root shape):
 // no unwrap/expect/print/dbg, no dropped Results, in production code.

@@ -351,7 +351,7 @@ fn capture_rest_body_bounded(body: &str, max_chars: usize) -> String {
     // still be caught. Redact the VALUE of known credential field names.
     // `auth_token` added 2026-07-09 (Groww reject-loop hardening security
     // review, LOW): the NATS CONNECT frame carries the credential under
-    // exactly this JSON key — belt-and-suspenders parity with the Python
+    // exactly this JSON key — belt-and-suspenders parity with the legacy
     // sidecar's own exact-value redaction.
     for key in [
         "accessToken",

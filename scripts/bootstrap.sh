@@ -108,19 +108,16 @@ echo -e "${CYAN}[4/10]${NC} Provisioning infrastructure credentials in AWS SSM..
 REGION="ap-south-1"
 SSM_ENV="${ENVIRONMENT:-dev}"
 
-# Auto-install AWS CLI if missing (true auto-setup — no manual steps)
+# Auto-install AWS CLI if missing (true auto-setup — no manual steps).
+# 2026-08-01: the interpreter-based install path was replaced by the official
+# self-contained installer — see scripts/ensure-aws-cli.sh for why.
 if ! command -v aws > /dev/null 2>&1; then
     echo -e "  ${YELLOW}AWS CLI not found — auto-installing...${NC}"
-    if command -v pip3 > /dev/null 2>&1; then
-        pip3 install awscli --quiet 2>/dev/null
-    elif command -v pip > /dev/null 2>&1; then
-        pip install awscli --quiet 2>/dev/null
-    fi
-    if command -v aws > /dev/null 2>&1; then
+    if bash "$(dirname "${BASH_SOURCE[0]}")/ensure-aws-cli.sh"; then
         echo -e "  ${GREEN}AWS CLI installed${NC}"
     else
         echo -e "  ${RED}Could not auto-install AWS CLI.${NC}"
-        echo -e "  ${RED}Install manually: pip3 install awscli${NC}"
+        echo -e "  ${RED}Install manually: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html${NC}"
         exit 1
     fi
 fi

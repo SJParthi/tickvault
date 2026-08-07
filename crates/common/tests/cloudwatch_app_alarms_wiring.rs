@@ -793,7 +793,7 @@ fn strip_hcl_comments(body: &str) -> String {
 /// group padding `ALARM_NAMES        = join(` must not panic the locator),
 /// and — because the input is comment-stripped — immune to a stale
 /// commented-out copy of the join hijacking the FIRST-occurrence search
-/// (the 2026-07-10 review's join-locator finding). The Lambda Python's
+/// (the 2026-07-10 review's join-locator finding). The legacy Lambda's
 /// `ALARM_NAMES = [n.strip()...]` line is skipped (not followed by
 /// `join(`).
 fn alarm_names_join_body(stripped_gate: &str) -> &str {

@@ -9,9 +9,16 @@ rust-version = "1.95.0"
 license = "MIT"
 
 [workspace.dependencies]
-# bruteX trading-core — READ-ONLY git dep pinned to an exact commit (never a branch/tag float).
-# Guard: crates/storage/tests/trading_core_rev_pin_guard.rs
-trading-core = { git = "https://github.com/SJParthi/bruteX", rev = "184a48a4abb0ec2fd61906499a6a799a752abd7e", default-features = false }
+# NOTE (2026-08-07): the `trading-core` git dev-dependency on SJParthi/bruteX was
+# REMOVED here. Its pinned rev 184a48a4abb0ec2fd61906499a6a799a752abd7e was
+# force-pushed out of bruteX and no longer exists ("upload-pack: not our ref"),
+# so `cargo metadata` could not resolve the workspace and EVERY CI job died in
+# ~20s before compiling a line. Re-pinning was not possible: an exhaustive scan
+# of all 11 bruteX branches found NO package named `trading-core` on any of
+# them (bruteX now ships `api` / `core` / `store` / `greeks`, and none exports
+# round_half_even, compute_fib_levels, compute_pivot_levels or greeks).
+# Restoring the parity oracle needs a package that actually exists upstream —
+# see the removed crates/trading/tests/trading_core_parity.rs in git history.
 # S6-Step8 / S7: Cargo.toml is the executable single source of truth.
 # (Tech Stack Bible deleted 2026-04-14.) Use exact pins (no ^/~/*).
 # Run `bash .claude/hooks/dep-freshness-scanner.sh` to check for drift.
@@ -176,7 +183,7 @@ aws-sdk-ssm = { version = "1.112.0", default-features = false, features = ["beha
 # workspace entry serves both consumers.
 aws-sdk-s3 = { version = "=1.138.1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-07-18 (rust-only phase 2b-1): the 4 AWS Lambdas move from inline
-# Python heredocs / handler.py to Rust bins in crates/aws-lambdas. Three new
+# legacy heredocs / handler.py to Rust bins in crates/aws-lambdas. Three new
 # SDK crates + the Lambda runtime. All three SDK pins are the 2026-07-08
 # generation whose aws-smithy-* requirements (types ^1.6.1 / runtime ^1.12.0 /
 # json ^0.63.0 / http ^0.64.0 / schema ^0.2.0 / observability ^0.3.0 +
@@ -189,7 +196,7 @@ aws-sdk-ec2 = { version = "=1.240.0", default-features = false, features = ["beh
 aws-sdk-cloudwatch = { version = "=1.120.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-costexplorer = { version = "=1.121.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-07-18 (rust-only phase 2b-3): the questdb-console FRONT Lambda invokes
-# the back relay via the Lambda Invoke API (Python parity:
+# the back relay via the Lambda Invoke API (legacy parity:
 # boto3.client("lambda").invoke). Sparse-index-verified 2026-07-18: 1.135.0
 # is the NEWEST aws-sdk-lambda release AND its aws-smithy-* requirements
 # (types ^1.6.1 / runtime ^1.12.0 / runtime-api ^1.13.0 / json ^0.63.0 /
@@ -220,7 +227,7 @@ flate2 = "1.1.9"
 
 # ---- Section 11c: Regex (tickvault-logs-mcp grep_codebase) ----
 # 2026-07-18 (rust-only phase 2c): the Rust port of the tickvault-logs MCP
-# server's `grep_codebase` tool needs a regex engine (the Python original
+# server's `grep_codebase` tool needs a regex engine (the legacy original
 # uses stdlib `re`). NOT a new supply-chain root — regex 1.12.3 was ALREADY
 # resolved in Cargo.lock (transitive via criterion/proptest and others);
 # this promotes it to a direct pin — the aws-lc-rs / flate2 promotion
@@ -229,9 +236,9 @@ regex = "1.12.3"
 
 # ---- Section 11d: QuestDB-console Lambda pair (rust-only phase 2b-3) ----
 # 2026-07-18: the qdb-console-proxy / qdb-console-front handler.py ports
-# need base64 body envelopes (Python `base64.b64encode`), percent-decoding
-# for the traversal gate (Python `urllib.parse.unquote`), and urlencoded
-# query parsing (Python `urllib.parse.parse_qs`). NONE is a new
+# need base64 body envelopes (legacy `base64.b64encode`), percent-decoding
+# for the traversal gate (legacy `urllib.parse.unquote`), and urlencoded
+# query parsing (legacy `urllib.parse.parse_qs`). NONE is a new
 # supply-chain root — all three were ALREADY resolved in Cargo.lock
 # (base64 0.22.1 via the aws smithy family, percent-encoding 2.3.2 +
 # form_urlencoded 1.2.2 via url/reqwest); this promotes them to direct

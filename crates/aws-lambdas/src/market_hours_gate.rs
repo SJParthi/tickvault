@@ -1,5 +1,5 @@
 //! Market-hours liveness window gate — Rust port of the
-//! `market-hours-liveness-alarm.tf` inline Python heredoc
+//! `market-hours-liveness-alarm.tf` inline legacy heredoc
 //! (`tv-${env}-market-hours-liveness-gate`, phase 2b-1).
 //!
 //! mode="open"  (09:20 IST) → enable the gated alarms' actions, but ONLY if
@@ -25,7 +25,7 @@ pub use crate::alarm_gate::GateMode;
 /// The exact SetAlarmState reason the heredoc used.
 pub const MARKET_OPEN_STATE_REASON: &str = "market-hours window opened (09:20 IST)";
 
-/// Instance states that count as "up". Python parity: `'pending'` counts —
+/// Instance states that count as "up". Legacy parity: `'pending'` counts —
 /// a late trading-day start must still arm the window (the OK reset +
 /// 5-15 min evaluation absorb the boot).
 pub fn state_counts_as_up(state: &str) -> bool {
@@ -35,8 +35,8 @@ pub fn state_counts_as_up(state: &str) -> bool {
 /// Classify the DescribeInstances result SHAPE. `None` = the call
 /// SUCCEEDED but the reservations/instances/state chain was missing —
 /// FAIL-OPEN (up), exactly like the Err arm (hostile-review r1 F3):
-/// the Python heredoc's doctrine is "a real trading day must never lose
-/// the liveness page", and the python failed OPEN on a missing shape;
+/// the legacy heredoc's doctrine is "a real trading day must never lose
+/// the liveness page", and the legacy runtime failed OPEN on a missing shape;
 /// only a POSITIVE non-up state may leave the alarms disabled.
 pub fn classify_instance_state(state: Option<String>) -> (bool, String) {
     match state {
@@ -45,7 +45,7 @@ pub fn classify_instance_state(state: Option<String>) -> (bool, String) {
     }
 }
 
-/// Python parity: `[n.strip() for n in raw.split(',') if n.strip()]`.
+/// Legacy parity: `[n.strip() for n in raw.split(',') if n.strip()]`.
 pub fn parse_alarm_names(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -86,7 +86,7 @@ pub fn open_decision(holiday_stop_today: bool, instance_up: bool, state: &str) -
     OpenDecision::Enable
 }
 
-/// Result JSON shapes — Python parity:
+/// Result JSON shapes — legacy parity:
 /// holiday skip  → `{'mode','enabled':false,'holiday_stop':true}`
 /// instance skip → `{'mode','enabled':false,'instance_state':state}`
 /// enabled open  → `{'mode','enabled':true}`
@@ -150,7 +150,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
         .await
     {
         // Missing shape on a SUCCESSFUL call routes through
-        // classify_instance_state's None arm → fail-open (python parity).
+        // classify_instance_state's None arm → fail-open (legacy parity).
         Ok(r) => classify_instance_state(
             r.reservations()
                 .first()
@@ -261,7 +261,7 @@ mod tests {
     fn test_classify_instance_state_missing_shape_fails_open_as_up() {
         // Hostile-review r1 F3: a SUCCESSFUL DescribeInstances whose
         // reservations/instances/state shape is missing must fail OPEN
-        // (up=true) exactly like the Err arm — python parity: a real
+        // (up=true) exactly like the Err arm — legacy parity: a real
         // trading day must never lose the liveness page.
         assert_eq!(classify_instance_state(None), (true, "unknown".to_string()));
         // A POSITIVE state still classifies normally.
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_result_shapes_match_python() {
+    fn test_open_result_shapes_match_legacy() {
         assert_eq!(
             open_result(GateMode::Open, &OpenDecision::SkipHolidayStop),
             json!({"mode": "open", "enabled": false, "holiday_stop": true})
@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_market_open_state_reason_is_python_literal() {
+    fn test_market_open_state_reason_is_legacy_literal() {
         assert_eq!(
             MARKET_OPEN_STATE_REASON,
             "market-hours window opened (09:20 IST)"

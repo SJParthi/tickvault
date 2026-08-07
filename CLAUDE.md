@@ -14,6 +14,21 @@
 
 Every file, function, config decision must pass all three. No exceptions.
 
+**Honest scope of principle 2 (recorded 2026-08-07 after an 8-agent audit).**
+O(1) is VERIFIED on the tick hot path — packet decode is fixed-offset
+`from_le_bytes` with no loop and no allocation, proven by DHAT tests that gate
+every PR, and instrument lookup is an O(1) composite-key hash. It is **not**
+universally true, and this file must not be read as claiming it is. The known
+exception is the RAM decision store `crates/trading/src/in_mem/spot_bar_store.rs`:
+reads are **O(log n)** (`RwLock` + binary search) with an O(slots) scan, writes
+are O(log n) typical and **O(n)** on a worst-case memmove, and `latest_n()` /
+`stats()` / `depth_days()` are **O(n)** full scans (`latest_n` also allocates).
+That file's own header already says so — it never claimed otherwise. Per the
+operator's standing rule, an inherently non-O(1) step is FLAGGED as such with
+its constraint and its chosen alternative; it is never relabelled O(1).
+Non-hot-path cold code (boot, daily builds, REST pulls) is not held to
+principle 2 at all.
+
 ## PROJECT
 
 - **Purpose:** O(1) latency live F&O trading system for Indian markets (NSE)
@@ -82,7 +97,7 @@ crates/
 | `types.rs` | `ExchangeSegment`, `FeedRequestCode`, `FeedResponseCode` |
 | `order_types.rs` | `OrderStatus`, `ProductType`, `OrderType`, `TransactionType` |
 | `instrument_types.rs` | `InstrumentType`, `ExpiryCode`, `InstrumentRecord` |
-| `instrument_registry.rs` | `InstrumentRegistry` (papaya concurrent map) |
+| `instrument_registry.rs` | `InstrumentRegistry` — plain `HashMap` keyed on the composite `(SecurityId, ExchangeSegment)` per I-P1-11 (**corrected 2026-08-07**: this row claimed "papaya concurrent map"; `papaya` appears nowhere in `crates/common/src/instrument_registry.rs` — see `by_composite: HashMap<…>`. `papaya` IS a real workspace dep, used in `core` + `trading`, just not here. Lookup is still O(1); the claim was wrong about the type, not the complexity) |
 | `tick_types.rs` | `TickerData`, `QuoteData`, `FullPacketData`, `DepthLevel` |
 | `trading_calendar.rs` | Market hours, holiday checks, IST handling |
 | `sanitize.rs` | Input sanitization utilities |
@@ -220,7 +235,7 @@ Branch protection ON: **All Green** (the ci.yml fan-in over the ENTIRE PR suite)
 | Secrets | secrecy + zeroize | 0.10.3 / 1.8.2 |
 | AWS | aws-config + aws-sdk-ssm + aws-sdk-sns | 1.8.15 / 1.108.0 / 1.98.0 |
 | Config | figment + toml | 0.10.19 / 1.1.0 |
-| Concurrent map | papaya | 0.2.3 |
+| Concurrent map | papaya | 0.2.4 |
 | Rate limiting | governor | 0.10.2 |
 | CLI | clap | 4.6.0 |
 
@@ -462,15 +477,18 @@ Override per environment via `config/{env}.toml` or env vars.
 | Pre-push gates | `.claude/hooks/pre-push-gate.sh` |
 | Active plan | `.claude/plans/active-plan.md` |
 | Codebase map | `docs/architecture/codebase-map.md` |
-| DhanHQ agent skill (READ-ONLY ref) | `.claude/skills/dhanhq/` (from `github.com/dhan-oss/dhanhq-skills`) |
+| Dhan API reference (sole) | `docs/dhan-ref/*.md` (21 files) |
 
-> **DhanHQ agent skill — READ-ONLY API reference.** The `dhanhq` skill in
-> `.claude/skills/dhanhq/` (upstream `github.com/dhan-oss/dhanhq-skills`) is
-> installed ONLY as up-to-date DhanHQ API documentation. **Rule 1:** it is NEVER
-> used to place/modify/cancel live orders before July 2026, and its order/execution
-> scripts + examples are NEVER run. **Rule 2:** its Python reference code must NOT
-> enter the production Rust order path or schema. Use it for fact-checking the Dhan
-> REST/WS surface only — alongside `docs/dhan-ref/*.md`.
+> **DhanHQ agent skill — REMOVED 2026-07-31 (zero-interpreted-language purge).**
+> The `.claude/skills/dhanhq/` tree (upstream `github.com/dhan-oss/dhanhq-skills`)
+> was a vendor SDK reference written entirely in an interpreted language — 15
+> example/helper scripts plus 95 fenced code blocks — and was deleted under the
+> operator's 2026-07-31 directive (§0 of
+> `.claude/rules/project/rust-only-forever-lock-2026-07-19.md`). It was always
+> reference-only: never executed, never permitted into the production Rust order
+> path. **`docs/dhan-ref/*.md` (21 files) is now the SOLE Dhan API reference** and
+> was already the authority the old note pointed at ("alongside
+> `docs/dhan-ref/*.md`"); no API fact is lost with the skill.
 
 ## DHAN SUPPORT COMMUNICATIONS
 

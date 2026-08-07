@@ -520,7 +520,14 @@ pub fn backfill_minute_nanos(
 /// cross-verify's observed 429 burst window (live session 2026-07-13:
 /// 91/776 cross-verify fetches failed HTTP 429 between 15:31 and 15:33).
 /// The const-assert below pins the sweep strictly clear of that window.
-const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 33 * 60 + 30;
+/// 2026-08-07 (NSE CAS change of 2026-08-03): moved 15:33:30 -> 15:43:30.
+/// The close moved to 15:40, so the old instant would have fired the
+/// "post-session" sweep 6.5 minutes BEFORE the session ended — sweeping a
+/// still-running day and reporting its unwritten final minutes as gaps. The
+/// +3.5-minute offset past the close (and the ≥150s clearance from the
+/// cross-verify 429 burst) is the invariant that was preserved, not the
+/// literal clock time. Still comfortably before the 16:30 IST box stop.
+const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 43 * 60 + 30;
 
 /// Historical anchor: the 15:31:00 IST trigger of the RETIRED bulk 1m
 /// cross-verify (`cross_verify_1m_boot.rs`, DELETED in PR-C3 2026-07-14 per
@@ -3728,7 +3735,7 @@ mod tests {
         let now = 10 * 3600 + 42 * 60 + 17;
         assert_eq!(next_minute_close_fire(now), Some(10 * 3600 + 43 * 60));
         // 15:29:01 → the final 15:30:00 boundary (the 15:29 candle).
-        assert_eq!(next_minute_close_fire(15 * 3600 + 29 * 60 + 1), Some(LAST));
+        assert_eq!(next_minute_close_fire(15 * 3600 + 39 * 60 + 1), Some(LAST));
     }
 
     #[test]
@@ -3748,7 +3755,10 @@ mod tests {
             fires += 1;
             now = fire + 1;
         }
-        assert_eq!(fires, 375, "one fire per session minute");
+        assert_eq!(
+            fires, 385,
+            "one fire per session minute (09:15-15:40 since 2026-08-03)"
+        );
     }
 
     // ---- next_fire_after (H1 — same-second duplicate re-fire) ---------------
@@ -4347,7 +4357,11 @@ mod tests {
         let session_first = minute_open_ist_nanos(date, FIRST - 60);
         let session_last = minute_open_ist_nanos(date, LAST - 60);
         let all = sweep_missing_minutes(None, session_first, session_last);
-        assert_eq!(all.len(), 375, "one per session minute");
+        assert_eq!(
+            all.len(),
+            385,
+            "one per session minute (09:15-15:40 since 2026-08-03)"
+        );
         assert_eq!(all[0], session_first);
         assert_eq!(*all.last().expect("non-empty"), session_last);
         // Tail gap: watermark at 15:27 → 15:28 + 15:29 both selected.
@@ -4368,7 +4382,7 @@ mod tests {
     fn test_sweep_fire_instant_clears_cross_verify_burst_window() {
         assert_eq!(
             SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST,
-            15 * 3600 + 33 * 60 + 30, // 15:33:30 = 56_010
+            15 * 3600 + 43 * 60 + 30, // 15:43:30 = 56_610 (post-15:40 close)
         );
         // ≥ 150 s after the 15:31:00 cross-verify trigger (burst observed
         // through 15:33) and before the 16:30 IST box stop.

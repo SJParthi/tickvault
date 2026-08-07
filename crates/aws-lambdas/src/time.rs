@@ -1,4 +1,4 @@
-//! IST time math — exact parity with the Python heredocs.
+//! IST time math — exact parity with the legacy heredocs.
 //!
 //! The market-hours gate heredoc computed IST as a fixed UTC+5:30 offset
 //! (`IST = timedelta(hours=5, minutes=30)`), NOT via a tz database. India
@@ -17,7 +17,7 @@ fn ist() -> FixedOffset {
     FixedOffset::east_opt(IST_OFFSET_SECS).unwrap_or_else(|| Utc.fix())
 }
 
-/// Today's IST date as `YYYY-MM-DD` — Python parity:
+/// Today's IST date as `YYYY-MM-DD` — legacy parity:
 /// `(datetime.now(timezone.utc) + IST).strftime('%Y-%m-%d')`.
 pub fn today_ist_string(now_utc: DateTime<Utc>) -> String {
     now_utc.with_timezone(&ist()).format("%Y-%m-%d").to_string()
@@ -34,7 +34,7 @@ mod tests {
     }
 
     #[test]
-    fn today_ist_matches_python_utc_plus_offset() {
+    fn today_ist_matches_legacy_utc_plus_offset() {
         // 2026-07-17 20:00 UTC = 2026-07-18 01:30 IST — date rolls over.
         let t = Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap();
         assert_eq!(today_ist_string(t), "2026-07-18");

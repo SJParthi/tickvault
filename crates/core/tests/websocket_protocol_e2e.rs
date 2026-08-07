@@ -146,7 +146,7 @@ use tickvault_core::websocket::types::DisconnectCode;
 // =========================================================================
 // SECTION 1: BINARY PROTOCOL — PACKET SIZE VERIFICATION
 // Cross-reference: dhanhq.co/docs/v2/live-market-feed/#binary-response
-// These sizes MUST match the Dhan Python SDK struct.calcsize() exactly.
+// These sizes MUST match the Dhan vendor SDK struct.calcsize() exactly.
 // =========================================================================
 
 #[test]

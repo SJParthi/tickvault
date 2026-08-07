@@ -1487,13 +1487,27 @@ impl CadenceConfig {
                 CADENCE_CHAIN_MIN_SPACING_FLOOR_MS
             );
         }
-        // 2026-07-16: the burst is a POST-close fire (second 1 of the
-        // minute) — a non-positive offset would race the close (and a
-        // T+0 burst would collide with the Groww anchor semantics of
-        // next_joinable_boundary's strictly-in-future rule).
-        if self.dhan_burst_offset_ms <= 0 {
+        // The burst is a POST-close fire: a NEGATIVE offset would race the
+        // close and is refused. T+0 is legal.
+        //
+        // 2026-07-31 (operator directive — Dhan must fire at the SAME
+        // instant as Groww): relaxed `<= 0` to `< 0`. The original
+        // 2026-07-16 rule also refused T+0, citing a collision with "the
+        // Groww anchor semantics of next_joinable_boundary's
+        // strictly-in-future rule". That rationale does NOT hold:
+        // `next_joinable_boundary` anchors on
+        // `groww_anchor_offset_ms.min(dhan_burst_offset_ms)`, and
+        // `groww_anchor_offset_ms` is ALREADY 0 — so the earliest-offset
+        // term is already 0 today and a Dhan 0 changes that computation by
+        // nothing. The one real consequence (a boot landing exactly ON the
+        // boundary skips to the next minute, because the rule is strictly
+        // `anchor_ms > now`) is pre-existing, deliberate, and pinned by
+        // `test_cadence_schedule_next_joinable_boundary_no_mid_cycle_join`.
+        // Refusing 0 for Dhan while allowing it for Groww was an
+        // unjustified asymmetry between the two lanes.
+        if self.dhan_burst_offset_ms < 0 {
             bail!(
-                "cadence.dhan_burst_offset_ms ({}) must be > 0 (the 2026-07-16 shape is fully POST-close — the burst is second 1 of the minute)",
+                "cadence.dhan_burst_offset_ms ({}) must be >= 0 (the burst is fully POST-close — a negative offset would fire before the minute closes)",
                 self.dhan_burst_offset_ms
             );
         }
@@ -3391,6 +3405,27 @@ impl ApplicationConfig {
             bail!(
                 "risk.max_daily_loss_percent must be a finite value in (0, 100], got {}",
                 self.risk.max_daily_loss_percent
+            );
+        }
+
+        // Risk: capital must be finite and strictly positive.
+        //
+        // 2026-08-07 (red-team finding #2): this was NOT validated, while its
+        // sibling above WAS — an asymmetric guard. The daily-loss threshold is
+        // `capital * fraction`, so:
+        //   * capital = NaN  -> max_loss = NaN -> `pnl.abs() >= NaN` is FALSE
+        //                       -> the halt NEVER fires, at ANY drawdown;
+        //   * capital = 0.0  -> max_loss = 0.0 -> halt on the first rupee.
+        // A single typo in one config field could therefore silently disable
+        // the account's primary financial circuit breaker. Fail closed at boot
+        // instead — a refusal to start is infinitely cheaper than an unbounded
+        // live loss.
+        if !self.strategy.capital.is_finite() || self.strategy.capital <= 0.0 {
+            bail!(
+                "strategy.capital must be a finite value > 0 (it is the base for \
+                 the daily-loss halt threshold; NaN would disable the halt \
+                 entirely and 0 would halt on the first rupee), got {}",
+                self.strategy.capital
             );
         }
 
@@ -6560,16 +6595,22 @@ mod tests {
         cfg.chain_min_spacing_ms = 3_000;
         cfg.groww_lane_cutoff_ms = 800;
         assert!(cfg.validate().is_err());
-        // The burst is a POST-close fire: 0 and negative are refused.
+        // The burst is a POST-close fire: NEGATIVE is refused, T+0 is
+        // LEGAL (2026-07-31 — Dhan fires at the same instant as Groww,
+        // whose anchor has always been 0; refusing 0 for one lane and
+        // allowing it for the other was an unjustified asymmetry).
         cfg.groww_lane_cutoff_ms = 6_000;
         cfg.dhan_burst_offset_ms = 0;
+        assert!(
+            cfg.validate().is_ok(),
+            "T+0 must be accepted — it is exactly what groww_anchor_offset_ms already uses"
+        );
+        cfg.dhan_burst_offset_ms = -1_000;
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("dhan_burst_offset_ms"),
             "unexpected error: {err}"
         );
-        cfg.dhan_burst_offset_ms = -1_000;
-        assert!(cfg.validate().is_err());
         cfg.dhan_burst_offset_ms = 1_000;
         assert!(cfg.validate().is_ok());
     }

@@ -147,10 +147,21 @@ pub fn spawn_day_ohlc_tick_consumer(
                         continue;
                     }
                     // Pure-function hot path: O(1) per tick, ≤50ns budget.
+                    // 2026-08-07: this used the raw widening conversion, which
+                    // inflates IEEE-754 (23925.65_f32 -> 23925.650390625_f64)
+                    // into the day OHLC. data-integrity.md "Price Precision
+                    // Preservation" mandates f32_to_f64_clean on EVERY f32->f64
+                    // price conversion; this was the last surviving prod site.
+                    // The banned-pattern scanner already forbade it, but only
+                    // scanned crates/{storage,trading,core} — crates/app sat
+                    // outside its regex, so the ban never applied here. Scanner
+                    // scope widened in the same change (and it immediately
+                    // caught an earlier draft of THIS comment for quoting the
+                    // pattern literally — the widened scope works).
                     let _ = tracker.update_tick(
                         tick.security_id,
                         ExchangeSegment::IdxI,
-                        f64::from(tick.last_traded_price),
+                        tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price),
                     );
                 }
                 Err(RecvError::Lagged(n)) => {
@@ -334,10 +345,14 @@ mod tests {
     }
 
     #[test]
-    fn test_day_ohlc_session_gate_rejects_15_30_00_exclusive_close() {
-        // 15:30:00 IST = 55_800 — the close is EXCLUSIVE, matching the
+    fn test_day_ohlc_session_gate_rejects_15_40_00_exclusive_close() {
+        // 15:40:00 IST = 56_400 — the close is EXCLUSIVE, matching the
         // candle aggregator gate and g1_exchange_gate_accepts.
-        assert!(!day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 55_800));
+        // 2026-08-07: was 15:30/55_800 before the NSE CAS change of 2026-08-03.
+        assert!(!day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 56_400));
+        // …and the ten newly-in-session minutes are ACCEPTED.
+        assert!(day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 55_800));
+        assert!(day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 56_399));
     }
 
     #[test]

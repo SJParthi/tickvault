@@ -34,7 +34,7 @@
 //! Row 5 note: ATM precedence over the inequality is the operator's
 //! definition — the 24550 CE at spot 24536.40 has strike > spot but IS the
 //! ATM strike (the 2026-04-21 live capture,
-//! `docs/dhan-support/2026-04-21-ticket-5519522-python-also-fails.md`), so
+//! `docs/dhan-support/2026-04-21-ticket-5519522-vendor-sdk-also-fails.md`), so
 //! it labels ATM, not OTM. Row 6: a strike paise-exactly AT the money is
 //! financially neither in nor out of the money — ITM/OTM would be a
 //! direction lie and UNKNOWN would hide a numerically certain fact; the
@@ -177,7 +177,7 @@ pub const MAX_PLAUSIBLE_PRICE_RUPEES: f64 = 10_000_000.0;
 ///
 /// Evidence classes (2026-07-14):
 /// - NIFTY Rs.50 — Verified-in-repo:
-///   `docs/dhan-support/2026-04-21-ticket-5519522-python-also-fails.md:69,138`
+///   `docs/dhan-support/2026-04-21-ticket-5519522-vendor-sdk-also-fails.md:69,138`
 ///   ("strike gap 50", live ATM 24550 @ spot 24536.40) +
 ///   `docs/groww-ref/14-option-chain.md:54,84` (consecutive keys
 ///   "23400", "23450").

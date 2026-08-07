@@ -1025,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_dhan_credentials_returns_error_without_real_ssm() {
         let result = fetch_dhan_credentials().await;
-        if crate::test_support::has_aws_credentials() {
+        if crate::test_support::real_ssm_tests_enabled() {
             // Dev machine with real AWS credentials — SSM is reachable,
             // so fetch_dhan_credentials succeeds. Validate the happy path.
             assert!(
@@ -1195,7 +1195,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_questdb_credentials_returns_error_without_real_ssm() {
         let result = fetch_questdb_credentials().await;
-        if crate::test_support::has_aws_credentials() {
+        if crate::test_support::real_ssm_tests_enabled() {
             assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
         } else {
             assert!(result.is_err(), "must fail without real SSM");
@@ -1205,7 +1205,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_telegram_credentials_returns_error_without_real_ssm() {
         let result = fetch_telegram_credentials().await;
-        if crate::test_support::has_aws_credentials() {
+        if crate::test_support::real_ssm_tests_enabled() {
             assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
         } else {
             assert!(result.is_err(), "must fail without real SSM");

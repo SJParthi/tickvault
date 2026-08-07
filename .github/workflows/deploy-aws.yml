@@ -125,7 +125,7 @@ jobs:
       binary_artifact_name: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain (host = aarch64-unknown-linux-musl, static binary)
         # MUSL static target eliminates GLIBC version dependency entirely.
@@ -403,7 +403,7 @@ jobs:
     environment: prod
     steps:
       - name: Checkout (for deploy scripts)
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Download built binary
         uses: actions/download-artifact@v4
@@ -722,7 +722,7 @@ jobs:
               "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
               "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
               "# Groww live feed RETIRED 2026-07-15 (operator directive: REST legs",
-              "# only) — the Python sidecar ship + venv-reset steps were removed with",
+              "# only) — the legacy sidecar ship + venv-reset steps were removed with",
               "# scripts/groww-sidecar/. Clean any leftover on-box sidecar artifacts so",
               "# nothing stale can be launched (idempotent no-ops once clean).",
               "rm -rf scripts/groww-sidecar && echo GROWW-SIDECAR-RETIRED: on-box sidecar source removed",

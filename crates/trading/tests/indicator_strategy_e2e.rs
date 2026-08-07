@@ -790,16 +790,24 @@ fn test_engine_warmup_persists_after_threshold() {
 // SECTION 14: INDICATOR ENGINE — OUT OF BOUNDS SECURITY_ID
 // =========================================================================
 
+// REGRESSION 2026-08-07 (daily-universe §28.2): this asserted that a large
+// `security_id` yields a DEFAULT snapshot — encoding the bug as the contract.
+// Ids are namespace-banded now (Groww index [2^62,2^63), GDF [2^60,2^62),
+// TrueData [2^59,2^60)), so "large" describes EVERY live instrument: the old
+// expectation meant indicators + strategy were a permanent silent no-op across
+// the entire universe. Only genuine SLOT-CAPACITY exhaustion may default now.
 #[test]
-fn test_engine_out_of_bounds_security_id_returns_default() {
+fn test_engine_large_security_id_is_processed_not_defaulted() {
     let mut engine = IndicatorEngine::new(IndicatorParams::default());
 
     let tick = make_simple_tick(u64::from(u32::MAX), 100.0);
     let snap = engine.update(&tick);
 
     assert_eq!(snap.security_id, u64::from(u32::MAX));
-    assert!(!snap.is_warm);
-    assert_eq!(snap.ema_fast, 0.0, "OOB returns default snapshot");
+    assert_eq!(
+        snap.ema_fast, 100.0,
+        "a large security_id must get a dense slot and be PROCESSED"
+    );
 }
 
 // =========================================================================

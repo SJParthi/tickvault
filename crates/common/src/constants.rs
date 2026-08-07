@@ -5,7 +5,7 @@
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 Binary Protocol — Packet Sizes
-// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in vendor SDK v2 (src/dhanhq/marketfeed.py)
 // All sizes verified against struct.calcsize() in the SDK.
 // ---------------------------------------------------------------------------
 
@@ -93,7 +93,7 @@ pub const WEBSOCKET_PROTOCOL_VERSION: &str = "2";
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Exchange Segment Codes (Binary Protocol)
-// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in vendor SDK v2 (src/dhanhq/marketfeed.py)
 // CRITICAL: These are binary wire codes, NOT subscription JSON strings.
 // ---------------------------------------------------------------------------
 
@@ -192,7 +192,7 @@ pub const DISCONNECT_CLIENT_ID_INVALID: u16 = 810;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Response Codes (Binary Protocol)
-// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in vendor SDK v2 (src/dhanhq/marketfeed.py)
 // ---------------------------------------------------------------------------
 
 /// Response code for index ticker packet (16 bytes).
@@ -203,10 +203,10 @@ pub const RESPONSE_CODE_TICKER: u8 = 2;
 
 /// Response code for market depth standalone packet (112 bytes).
 /// Format: `<BHBIf100s>` — Header(8) + LTP(f32) + Depth(5×20 bytes).
-/// Dhan API (Python SDK ref): `process_market_depth(data)`.
+/// Dhan API (vendor SDK ref): `process_market_depth(data)`.
 ///
 /// NOTE: Not in annexure Section 3 (gap between Ticker(2) and Quote(4)).
-/// Documented and handled in Dhan API (Python SDK ref) v2 `process_market_depth()`.
+/// Documented and handled in Dhan API (vendor SDK ref) v2 `process_market_depth()`.
 pub const RESPONSE_CODE_MARKET_DEPTH: u8 = 3;
 
 /// Response code for quote packet (50 bytes).
@@ -245,7 +245,7 @@ pub const MARKET_STATUS_POST_CLOSE: u16 = 3;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Subscription Request Codes
-// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in vendor SDK v2 (src/dhanhq/marketfeed.py)
 // Subscribe codes: 15 (Ticker), 17 (Quote), 21 (Full).
 // Unsubscribe = subscribe_code + 1: 16 (Ticker), 18 (Quote), 22 (Full).
 // Disconnect = 12 (closes the WebSocket connection).
@@ -305,7 +305,7 @@ pub const MARKET_DEPTH_LEVELS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Market Depth — Per-Level Field Offsets (within a single 20-byte level)
-// Source: Dhan API (Python SDK ref) `<IIHHff>` format string.
+// Source: Dhan API (vendor SDK ref) `<IIHHff>` format string.
 // Used in Full (code 8) and Market Depth standalone (code 3) packets.
 // ---------------------------------------------------------------------------
 
@@ -329,7 +329,7 @@ pub const DEPTH_LEVEL_OFFSET_ASK_PRICE: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Deep Depth Protocol — 20-Level & 200-Level WebSocket Feeds
-// Source: Dhan official API spec; verified in Python SDK (src/dhanhq/marketfeed.py), Dhan API docs.
+// Source: Dhan official API spec; verified in vendor SDK (src/dhanhq/marketfeed.py), Dhan API docs.
 // Separate WebSocket endpoints from the standard feed.
 // Bid and ask sides arrive as SEPARATE binary packets.
 // ---------------------------------------------------------------------------
@@ -351,7 +351,7 @@ pub const DEEP_DEPTH_LEVEL_SIZE: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Deep Depth — Per-Level Field Offsets (within a single 16-byte level)
-// Source: Dhan API (Python SDK ref) `<dII>` format string in fulldepth.py.
+// Source: Dhan API (vendor SDK ref) `<dII>` format string in fulldepth.py.
 // ---------------------------------------------------------------------------
 
 /// Price (f64 LE) offset within a deep depth level.
@@ -393,7 +393,7 @@ pub const FEED_REQUEST_TWENTY_DEPTH: u8 = 23;
 
 /// Unsubscription request code for full market depth feed (both 20 and 200 level).
 /// Dhan Annexure: UnsubscribeFullDepth = 25. There is NO code 24.
-/// Python SDK (fulldepth.py) also uses 25 for unsubscribe.
+/// vendor SDK (fulldepth.py) also uses 25 for unsubscribe.
 pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 25;
 
 // ---------------------------------------------------------------------------
@@ -417,7 +417,7 @@ pub const DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Live Order Update WebSocket
-// Source: DhanHQ API docs, Python SDK.
+// Source: DhanHQ API docs, vendor SDK.
 // Separate JSON-based WebSocket (NOT binary).
 // ---------------------------------------------------------------------------
 
@@ -1314,9 +1314,14 @@ pub const IST_UTC_OFFSET_SECONDS: i32 = 19_800;
 /// Seconds-of-day (IST) at which tick persistence starts: 09:00:00 = 9 × 3600.
 pub const TICK_PERSIST_START_SECS_OF_DAY_IST: u32 = 32_400;
 
-/// Seconds-of-day (IST) at which tick persistence ends: 15:30:00 = 15 × 3600 + 30 × 60.
-/// The end is **exclusive** — a tick at exactly 15:30:00 is NOT persisted.
-pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 55_800;
+/// Seconds-of-day (IST) at which tick persistence ends: 15:40:00 = 15 × 3600 + 40 × 60.
+/// The end is **exclusive** — a tick at exactly 15:40:00 is NOT persisted.
+///
+/// 2026-08-07: 55_800 (15:30) -> 56_400 (15:40) with the NSE CAS session change
+/// of 2026-08-03. Kept in lockstep with `MARKET_CLOSE_IST_NANOS` by the
+/// const-assert further down this file — that assertion is what caught this
+/// constant when the close moved, and it must stay.
+pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 56_400;
 
 /// CCL-06 (permutation-coverage audit §140): seconds-of-day (IST) at which the
 /// Muhurat (Diwali evening) trading-session persist window OPENS: 18:00:00 =
@@ -1336,10 +1341,15 @@ pub const MUHURAT_PERSIST_START_SECS_OF_DAY_IST: u32 = 64_800;
 pub const MUHURAT_PERSIST_END_SECS_OF_DAY_IST: u32 = 70_200;
 
 /// Operator-locked 2026-05-25: post-market historical fetch + cross-verify
-/// window START. Begins at 15:30:00 IST (= `TICK_PERSIST_END_SECS_OF_DAY_IST`).
+/// window START. Begins at 15:40:00 IST (= `TICK_PERSIST_END_SECS_OF_DAY_IST`).
 /// Operations gated by this constant: 90-day historical fetch, current-day
 /// intraday fetch (1m/5m/15m/60m), cross-verification.
-pub const POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST: u32 = 55_800;
+///
+/// 2026-08-07: 15:30 -> 15:40 with the NSE CAS change of 2026-08-03. This MUST
+/// track the close: starting the post-market fetch at 15:30 while the market
+/// still traded to 15:40 would cross-verify against a day that had not
+/// finished, reporting phantom divergence for the final ten minutes.
+pub const POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST: u32 = 56_400;
 
 /// Operator-locked 2026-05-25: post-market historical fetch + cross-verify
 /// window END. Stops at 23:00:00 IST = 23 × 3600 = 82_800. After this
@@ -1353,11 +1363,16 @@ pub const POST_MARKET_FETCH_WINDOW_END_SECS_OF_DAY_IST: u32 = 82_800;
 pub const SECONDS_PER_DAY: u32 = 86_400;
 
 /// Phase 0 Item 20 — seconds-of-day (IST) at which the orphan-position
-/// watchdog fires: 15:25:00 = 15 × 3600 + 25 × 60 = 55_500. The 5-minute
-/// headroom before the 15:30 close lets the DETECT → AUDIT → Telegram
+/// watchdog fires: 15:35:00 = 15 × 3600 + 35 × 60 = 56_100. The 5-minute
+/// headroom before the 15:40 close lets the DETECT → AUDIT → Telegram
 /// chain complete (Phase 0 dry-run) AND lets a Phase 1+ live exit
 /// attempt complete before the exchange rejects late orders.
-pub const ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST: u32 = 55_500;
+///
+/// 2026-08-07: 15:25 -> 15:35 with the NSE CAS change of 2026-08-03, holding
+/// the 5-minute headroom INVARIANT (const-asserted below) rather than the
+/// literal clock time. Keeping it at 15:25 would have left a 15-minute gap in
+/// which a position could be opened and never swept before the real close.
+pub const ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST: u32 = 56_100;
 
 /// Drain buffer (seconds) after market close before aborting WebSocket handles.
 /// Allows in-flight ticks (last 15:29 candle) to reach the tick processor channel
@@ -1515,16 +1530,16 @@ pub const DHAN_TWENTY_DEPTH_WS_BASE_URL: &str = "wss://depth-api-feed.dhan.co/tw
 /// 200-level depth WebSocket base URL.
 /// Full URL: `wss://full-depth-api.dhan.co/?token=TOKEN&clientId=CLIENT_ID&authType=2`
 ///
-/// NOTE: On 2026-04-23 Parthiban verified with Dhan's official Python SDK
+/// NOTE: On 2026-04-23 Parthiban verified with Dhan's official vendor SDK
 /// `dhanhq==2.2.0rc1` that the **root path `/`** (not `/twohundreddepth`) is
 /// the working URL for our account at SecurityId 72271 at depth 200. The SDK
 /// streamed 30+ minutes on root path, while our Rust client at
 /// `/twohundreddepth` kept getting `Protocol(ResetWithoutClosingHandshake)`
 /// for 2+ weeks. This reverses the advice in Dhan ticket #5519522 which
 /// had told us to use `/twohundreddepth`. If this regresses, re-open that
-/// ticket and cite the 2026-04-23 Python SDK verification in the reply.
+/// ticket and cite the 2026-04-23 vendor SDK verification in the reply.
 /// Dhan also confirmed: use a Security ID close to current market price (ATM).
-pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co"; // APPROVED: infrastructure constant — Python SDK verified root path 2026-04-23
+pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co"; // APPROVED: infrastructure constant — vendor SDK verified root path 2026-04-23
 
 // ---------------------------------------------------------------------------
 // Historical Data — Candle Fetch Constants
@@ -1654,10 +1669,13 @@ pub const SPOT_1M_REST_429_EXTRA_BACKOFF_MS: u64 = 2_000;
 /// close of the session's first (09:15) 1-minute candle.
 pub const SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 16 * 60;
 
-/// Last per-minute fire boundary, IST seconds-of-day: 15:30:00 — the close
-/// of the session's last (15:29) 1-minute candle. INCLUSIVE (the 15:30:00
-/// boundary itself fires, targeting the 15:29 candle).
-pub const SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60;
+/// Last per-minute fire boundary, IST seconds-of-day: 15:40:00 — the close
+/// of the session's last (15:39) 1-minute candle. INCLUSIVE (the 15:40:00
+/// boundary itself fires, targeting the 15:39 candle).
+///
+/// 2026-08-07: 15:30 -> 15:40 with the NSE CAS session change of 2026-08-03
+/// (see `MARKET_CLOSE_IST_NANOS`). Ten additional per-minute fires per day.
+pub const SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60;
 
 /// Consecutive fully-failed minutes (no SID succeeded) before the ONE
 /// edge-triggered SPOT1M-01 escalation page fires. Re-armed only after a
@@ -2747,7 +2765,7 @@ pub const AUTH_RETRY_MAX_BACKOFF_SECS: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Binary Packet Byte Offsets
-// Source: SDK struct.unpack format strings, verified against Python SDK.
+// Source: SDK struct.unpack format strings, verified against vendor SDK.
 // CRITICAL: Quote and Full packets DIVERGE at offset 34.
 // ---------------------------------------------------------------------------
 
@@ -3415,8 +3433,8 @@ const _: () = assert!(
     "TICK_PERSIST_START must equal 09:00 IST (32400)"
 );
 const _: () = assert!(
-    TICK_PERSIST_END_SECS_OF_DAY_IST == 15 * 3600 + 30 * 60,
-    "TICK_PERSIST_END must equal 15:30 IST (55800)"
+    TICK_PERSIST_END_SECS_OF_DAY_IST == 15 * 3600 + 40 * 60,
+    "TICK_PERSIST_END must equal 15:40 IST (56400) — NSE CAS change 2026-08-03"
 );
 const _: () = assert!(
     TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST,
@@ -3448,13 +3466,13 @@ const _: () = assert!(
 );
 const _: () = assert!(
     TICK_PERSIST_END_SECS_OF_DAY_IST <= MUHURAT_PERSIST_START_SECS_OF_DAY_IST,
-    "MUHURAT window must be disjoint from + after the regular [09:00, 15:30) window"
+    "MUHURAT window must be disjoint from + after the regular [09:00, 15:40) window"
 );
 
 // Post-market fetch window invariants (PR #796, operator-locked 2026-05-25).
 const _: () = assert!(
-    POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST == 15 * 3600 + 30 * 60,
-    "POST_MARKET_FETCH_WINDOW_START must equal 15:30 IST (55800)"
+    POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST == 15 * 3600 + 40 * 60,
+    "POST_MARKET_FETCH_WINDOW_START must equal 15:40 IST (56400) — NSE CAS change 2026-08-03"
 );
 const _: () = assert!(
     POST_MARKET_FETCH_WINDOW_END_SECS_OF_DAY_IST == 23 * 3600,
@@ -3470,13 +3488,16 @@ const _: () = assert!(
 );
 const _: () = assert!(
     POST_MARKET_FETCH_WINDOW_START_SECS_OF_DAY_IST == TICK_PERSIST_END_SECS_OF_DAY_IST,
-    "Fetch window must start exactly when market closes (15:30 IST)"
+    "Fetch window must start exactly when market closes (15:40 IST since the \
+     NSE CAS change of 2026-08-03)"
 );
 
 // Phase 0 Item 20 — orphan-position watchdog timing invariants.
 const _: () = assert!(
-    ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST == 15 * 3600 + 25 * 60,
-    "ORPHAN_POSITION_WATCHDOG_TIME must equal 15:25 IST (55500)"
+    ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST == 15 * 3600 + 35 * 60,
+    "ORPHAN_POSITION_WATCHDOG_TIME must equal 15:35 IST (56100) — NSE CAS \
+     change 2026-08-03 moved the close to 15:40; the 5-minute headroom is the \
+     invariant, not the clock time"
 );
 const _: () = assert!(
     ORPHAN_POSITION_WATCHDOG_TIME_SECS_IST < TICK_PERSIST_END_SECS_OF_DAY_IST,
@@ -3497,7 +3518,7 @@ const _: () = assert!(
 
 // ---------------------------------------------------------------------------
 // Compile-Time Assertions — Binary Protocol Offset Chain Verification
-// Source: Dhan API (Python SDK ref) struct.unpack format strings.
+// Source: Dhan API (vendor SDK ref) struct.unpack format strings.
 // Ensures every offset = previous_offset + previous_field_size.
 // ---------------------------------------------------------------------------
 
@@ -3845,10 +3866,67 @@ pub const CLOCK_SKEW_HALT_THRESHOLD_SECS: f64 = 2.0;
 pub const MARKET_OPEN_IST_NANOS: i64 = 33_300_000_000_000;
 
 /// G1 Exchange Gate — session close in IST nanoseconds-of-day.
-/// 15:30:00.000 IST = 55_800 * 1e9. **EXCLUSIVE** — a tick at exactly
-/// 15:30:00.000 is REJECTED (matches the existing
-/// `TICK_PERSIST_END_SECS_OF_DAY_IST = 55_800` exclusive contract).
-pub const MARKET_CLOSE_IST_NANOS: i64 = 55_800_000_000_000;
+/// 15:40:00.000 IST = 56_400 * 1e9. **EXCLUSIVE** — a tick at exactly
+/// 15:40:00.000 is REJECTED (preserves the long-standing exclusive contract;
+/// only the boundary VALUE moved).
+///
+/// 2026-08-07 (operator-approved, plan `active-plan-nse-cas-1540-session.md`):
+/// moved 55_800 (15:30) -> 56_400 (15:40). NSE extended equity-derivatives
+/// continuous trading by 10 minutes effective **2026-08-03**, to align with the
+/// new Closing Auction Session (CAS, 15:15-15:35) introduced in the cash market
+/// — derivatives stay open so positions can be hedged against the auction-
+/// discovered closing prices. Until this change tickvault stopped capturing at
+/// 15:30 every day from 2026-08-03, silently losing exactly the ten minutes
+/// that carry the closing-auction outcome.
+///
+/// Our captured universe (index spot + their option chains + index futures) is
+/// entirely F&O or F&O-constituent-derived, so this single boundary covers it.
+/// A non-F&O CASH equity would still close at 15:30 and would need a
+/// per-segment model — see the plan's Edge Cases. NOT covered: the separate
+/// post-close session (15:50-16:00), deliberately out of scope.
+pub const MARKET_CLOSE_IST_NANOS: i64 = 56_400_000_000_000;
+
+/// Closing Auction Session (CAS) window, IST seconds-of-day, introduced by NSE
+/// on 2026-08-03: continuous trading in F&O-constituent cash stocks ends at
+/// 15:15, the auction runs to 15:35, and closing-price discovery happens in its
+/// final 15:30-15:35 leg.
+///
+/// These bounds are for TAGGING AND TELEMETRY ONLY — they must never gate
+/// capture. A price printed during the auction is not a continuous-trading
+/// price, so consumers need to be able to tell them apart; dropping them would
+/// discard the very prints that determine the official close.
+pub const CAS_WINDOW_OPEN_SECS_OF_DAY_IST: u32 = 15 * 3600 + 15 * 60;
+/// End of the CAS window (EXCLUSIVE) — see [`CAS_WINDOW_OPEN_SECS_OF_DAY_IST`].
+pub const CAS_WINDOW_CLOSE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 35 * 60;
+
+/// TRUE when an IST seconds-of-day instant falls inside the Closing Auction
+/// Session (open-inclusive, close-exclusive). Pure, O(1), no allocation.
+#[must_use]
+// WIRING-EXEMPT: deliberately dormant. This PR moves the session CLOSE to
+// 15:40 (the data loss that was actively bleeding every day); the CAS row
+// TAGGING that consumes this predicate is NOT built yet, so there is no
+// production call site and I will not invent one to satisfy the guard.
+// Shipping the predicate now — pure, const, unit-tested at all four
+// boundaries below — keeps the auction window defined in ONE place so the
+// tagging consumer cannot re-derive it slightly differently later. If that
+// consumer never lands, DELETE this function rather than leaving it dormant
+// forever.
+pub const fn is_in_cas_window(secs_of_day_ist: u32) -> bool {
+    secs_of_day_ist >= CAS_WINDOW_OPEN_SECS_OF_DAY_IST
+        && secs_of_day_ist < CAS_WINDOW_CLOSE_SECS_OF_DAY_IST
+}
+
+// The CAS window must sit INSIDE the trading session — if a future session
+// edit ever moved the close before the auction ends, tagging would silently
+// mark rows we no longer capture.
+const _: () = assert!(
+    (CAS_WINDOW_CLOSE_SECS_OF_DAY_IST as i64) * 1_000_000_000 <= MARKET_CLOSE_IST_NANOS,
+    "CAS window must end at or before the session close"
+);
+const _: () = assert!(
+    (CAS_WINDOW_OPEN_SECS_OF_DAY_IST as i64) * 1_000_000_000 > MARKET_OPEN_IST_NANOS,
+    "CAS window must open after the session open"
+);
 
 /// G2 Wall-Clock Gate — grace period in seconds AFTER `MARKET_CLOSE_IST`
 /// during which the WebSocket socket stays open to absorb late-arriving
@@ -4063,11 +4141,33 @@ const _: () = {
 // ---------------------------------------------------------------------------
 
 /// Cadence native-retry hedge: re-poll offsets for a 2xx-empty leg, in ms
-/// after the minute close (volley fires ~T+1s; decision deadline T+4s).
-pub const CADENCE_NATIVE_RETRY_OFFSETS_MS: [i64; 3] = [2_000, 3_000, 3_800];
+/// after the minute close (decision deadline T+4s).
+///
+/// 2026-07-31 (operator directive — "dhan also shdou lfollwo the sam
+/// eapproach rigth dude which shodul be same and check if an donly if the
+/// isntant 0 ms fails aloen emans then 5 ms and icnremental check
+/// approach"): the FIRST FIRE moved to T+0 — the same instant as Groww
+/// (`cadence.dhan_burst_offset_ms = 0`, `config/base.toml`) — and the
+/// three EARLY rungs 5 / 300 / 1000 were PREPENDED here so a T+0 miss
+/// escalates immediately instead of waiting 2 full seconds. `5` is the
+/// operator's stated first-retry step; it is a RETRY offset, never the
+/// first fire.
+///
+/// The 1000 rung deliberately reproduces the PRE-2026-07-31 fire instant
+/// (`dhan_burst_offset_ms` was 1000), so the worst case of the T+0 fire is
+/// exactly the timing we ran all of 2026-07-31 (measured p50 1029ms) — the
+/// early fire can only add chances, never remove one.
+///
+/// Rate-budget honesty: the 4 spots consume 4 of Dhan's 5/sec Data-API
+/// budget at the T+5 burst, so the 300 rung has room for at most ONE
+/// re-fire inside that first rolling second; the cadence gate APPENDS any
+/// remaining retries at the next free rolling-window instant (~T+1005),
+/// which is what the 1000 rung anchors. Rungs are advisory earliest
+/// instants, never a guarantee of 4 concurrent re-fires.
+pub const CADENCE_NATIVE_RETRY_OFFSETS_MS: [i64; 6] = [5, 300, 1_000, 2_000, 3_000, 3_800];
 
 /// Max native micro-retry attempts per lane per minute (== offsets len).
-pub const CADENCE_NATIVE_RETRY_MAX_ATTEMPTS: usize = 3;
+pub const CADENCE_NATIVE_RETRY_MAX_ATTEMPTS: usize = 6;
 
 /// Decision deadline after minute close: native data arriving before this
 /// wins; at the deadline the pre-prepared cross-fill fires with no extra wait.
@@ -4116,8 +4216,9 @@ mod market_hours_tests {
 
     #[test]
     fn test_tick_persist_end_matches_three_thirty() {
-        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
-        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 55_800);
+        // 2026-08-07: 15:30 -> 15:40 (NSE CAS change 2026-08-03).
+        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 40 * 60);
+        assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 56_400);
     }
 
     #[test]
@@ -4849,11 +4950,36 @@ mod tests {
         assert_eq!(MARKET_OPEN_IST_NANOS, 33_300_000_000_000);
     }
 
-    /// Constant pin — MARKET_CLOSE_IST_NANOS = 15:30:00.000 IST (exclusive).
+    /// Constant pin — MARKET_CLOSE_IST_NANOS = 15:40:00.000 IST (exclusive).
+    /// 2026-08-07: NSE extended F&O to 15:40 on 2026-08-03 for the new
+    /// Closing Auction Session; the old 15:30 pin is dated history.
     #[test]
-    fn test_market_close_ist_nanos_pinned_at_1530_exclusive() {
-        // 15h * 3600 + 30m * 60 = 55_800 secs.
-        assert_eq!(MARKET_CLOSE_IST_NANOS, 55_800_000_000_000);
+    fn test_market_close_ist_nanos_pinned_at_1540_exclusive() {
+        // 15h * 3600 + 40m * 60 = 56_400 secs.
+        assert_eq!(MARKET_CLOSE_IST_NANOS, 56_400_000_000_000);
+    }
+
+    /// Closing Auction Session window (NSE, from 2026-08-03): 15:15 open
+    /// INCLUSIVE, 15:35 close EXCLUSIVE. Both edges pinned so a future edit
+    /// cannot quietly widen or narrow the auction band.
+    #[test]
+    fn test_cas_window_boundaries() {
+        assert_eq!(CAS_WINDOW_OPEN_SECS_OF_DAY_IST, 54_900); // 15:15:00
+        assert_eq!(CAS_WINDOW_CLOSE_SECS_OF_DAY_IST, 56_100); // 15:35:00
+        // One second before the auction opens — OUT.
+        assert!(!is_in_cas_window(54_899));
+        // The open instant itself — IN (inclusive).
+        assert!(is_in_cas_window(54_900));
+        // Last second inside — IN.
+        assert!(is_in_cas_window(56_099));
+        // The close instant — OUT (exclusive).
+        assert!(!is_in_cas_window(56_100));
+        // The auction must sit strictly inside the trading session, or we
+        // would be tagging rows we no longer capture.
+        assert!(CAS_WINDOW_OPEN_SECS_OF_DAY_IST > 33_300);
+        assert!(
+            i64::from(CAS_WINDOW_CLOSE_SECS_OF_DAY_IST) * 1_000_000_000 <= MARKET_CLOSE_IST_NANOS
+        );
     }
 
     /// Spot 1m REST pipeline (operator grant 2026-07-12) — the index set
@@ -4887,7 +5013,7 @@ mod tests {
         // Per-SID not-served detector threshold (~10 minutes).
         assert_eq!(SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD, 10);
         assert_eq!(SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, 33_360); // 09:16:00
-        assert_eq!(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, 55_800); // 15:30:00
+        assert_eq!(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, 56_400); // 15:40:00
         // Both boundaries are exact minute marks.
         assert_eq!(SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST % 60, 0);
         assert_eq!(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST % 60, 0);
@@ -5342,8 +5468,9 @@ mod tests {
     fn test_final_bar_seals_at_15_31_00_not_15_30_00() {
         let seal_offset_nanos = (BAR_FINAL_SEAL_OFFSET_SECS as i64) * 1_000_000_000;
         let forced_seal_at = MARKET_CLOSE_IST_NANOS + seal_offset_nanos;
-        let expected_15_31_00 = 55_860_000_000_000_i64;
-        assert_eq!(forced_seal_at, expected_15_31_00);
+        // 2026-08-07: close moved to 15:40, so the forced seal is 15:41:00.
+        let expected_15_41_00 = 56_460_000_000_000_i64;
+        assert_eq!(forced_seal_at, expected_15_41_00);
     }
 
     /// Plan §8: G1 gate function MUST NOT call local-clock helpers.
@@ -5496,7 +5623,23 @@ mod cadence_native_retry_hedge_tests {
 
     #[test]
     fn test_cadence_native_retry_constants_pinned() {
-        assert_eq!(CADENCE_NATIVE_RETRY_OFFSETS_MS, [2_000, 3_000, 3_800]);
+        // 2026-07-31: three EARLY rungs prepended with the T+0 burst move
+        // — 5 (the operator's stated first-retry step) and 300 (both
+        // opportunistic: the burst's 4 spots already hold 4 of Dhan's
+        // 5/sec Data-API budget, so at most ONE re-fire fits inside that
+        // first rolling second), and 1000 (the OLD fire instant, where
+        // the window frees and a full re-fire wave can land).
+        assert_eq!(
+            CADENCE_NATIVE_RETRY_OFFSETS_MS,
+            [5, 300, 1_000, 2_000, 3_000, 3_800]
+        );
+        // The 1000 rung MUST stay: it is the floor guaranteeing the early
+        // burst can never be worse than the pre-2026-07-31 T+1000 fire.
+        assert!(
+            CADENCE_NATIVE_RETRY_OFFSETS_MS.contains(&1_000),
+            "the old T+1000 fire instant must remain a rung — it is the \
+             no-regression floor for the T+5 burst"
+        );
         assert_eq!(
             CADENCE_NATIVE_RETRY_MAX_ATTEMPTS,
             CADENCE_NATIVE_RETRY_OFFSETS_MS.len()

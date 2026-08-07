@@ -27,7 +27,7 @@
 # Run from anywhere:  bash scripts/questdb-console-gate-matrix.sh
 # CI wiring: the ci.yml Repo Guards step "QuestDB console deploy-gate +
 # all-green harnesses" runs this harness on every PR (the job feeds All
-# Green). (2026-07-18 rust-only phase 2b-3: the console lambda Python
+# Green). (2026-07-18 rust-only phase 2b-3: the console lambda legacy
 # unittest halves of that step retired with the handlers — the suites are
 # ported 1:1 into crates/aws-lambdas.)
 set -u

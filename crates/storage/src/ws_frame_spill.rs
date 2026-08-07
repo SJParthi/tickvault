@@ -33,6 +33,17 @@ use tracing::{error, info, warn};
 pub enum WsType {
     LiveFeed = 1,
     OrderUpdate = 4,
+    /// TrueData's live market-data socket (feed #4).
+    ///
+    /// A DISTINCT tag rather than a reuse of [`WsType::LiveFeed`], because
+    /// this byte is the only thing that survives into the WAL — the record
+    /// carries no feed field. Tagging TrueData frames as `LiveFeed` would
+    /// mean a TrueData drop is attributed to **Dhan** in
+    /// `/api/feeds/health` and in the Telegram alert (see
+    /// [`WsType::owning_feed`]), naming the wrong broker in an operator
+    /// page. The Dhan noise lock requires every alert to say precisely
+    /// which broker; a wrong broker is worse than none.
+    TruedataFeed = 5,
 }
 
 impl WsType {
@@ -41,6 +52,7 @@ impl WsType {
         match b {
             1 => Some(Self::LiveFeed),
             4 => Some(Self::OrderUpdate),
+            5 => Some(Self::TruedataFeed),
             _ => None,
         }
     }
@@ -55,6 +67,30 @@ impl WsType {
         match self {
             Self::LiveFeed => "live_feed",
             Self::OrderUpdate => "order_update",
+            Self::TruedataFeed => "truedata_feed",
+        }
+    }
+
+    /// Which broker's market data this transport carries, if any.
+    ///
+    /// The WAL record has no feed byte — the transport tag IS the feed
+    /// evidence — so this is the single place that mapping is made, rather
+    /// than each call site hardcoding a broker.
+    ///
+    /// `LiveFeed` maps to Dhan for historical reasons: tag 1 was minted
+    /// when Dhan's main feed was the only live market-data socket. Groww
+    /// and Dhan live feeds are both retired, so tag 1 exists today for WAL
+    /// records written before those retirements — replaying one must still
+    /// attribute correctly.
+    ///
+    /// `OrderUpdate` returns `None`: it is not market data, and a dropped
+    /// order-update frame must not flip a market-data feed to `Degraded`.
+    // TEST-EXEMPT: covered by test_owning_feed_maps_each_transport_to_its_broker
+    pub fn owning_feed(self) -> Option<tickvault_common::feed::Feed> {
+        match self {
+            Self::LiveFeed => Some(tickvault_common::feed::Feed::Dhan),
+            Self::TruedataFeed => Some(tickvault_common::feed::Feed::Truedata),
+            Self::OrderUpdate => None,
         }
     }
 }
@@ -318,7 +354,7 @@ impl WsFrameSpill {
                     "ws_type" => ws_type.as_str(),
                 )
                 .increment(1);
-                self.record_dhan_drop_for_health(ws_type);
+                self.record_feed_drop_for_health(ws_type);
                 AppendOutcome::Dropped
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -349,26 +385,35 @@ impl WsFrameSpill {
                     "ws_type" => ws_type.as_str(),
                 )
                 .increment(1);
-                self.record_dhan_drop_for_health(ws_type);
+                self.record_feed_drop_for_health(ws_type);
                 AppendOutcome::Dropped
             }
         }
     }
 
-    /// SP5.1: on a terminal drop of a LIVE-FEED (Dhan) frame, record a Dhan drop
-    /// in the per-feed health registry so `/api/feeds/health` flips `Degraded`
-    /// (closing the SP5 connected+fresh-but-dropping false-OK). Called ONLY from
-    /// the two cold drop arms — never the hot `Spilled` path. A LiveFeed-frame
-    /// drop ⊇ tick drop (the frame may be OI/PrevClose/MarketStatus too) — all
-    /// are real Dhan data losses, so `Degraded` is the correct, honest signal.
-    /// `OrderUpdate` drops are NOT recorded (not the market-data feed). O(1),
-    /// zero-alloc, lock-free (one relaxed atomic). `None` registry = no-op.
+    /// SP5.1: on a terminal drop of a market-data frame, record the drop
+    /// against **the broker that transport actually belongs to** in the
+    /// per-feed health registry, so `/api/feeds/health` flips `Degraded`
+    /// (closing the SP5 connected+fresh-but-dropping false-OK).
+    ///
+    /// The feed comes from [`WsType::owning_feed`], not a hardcoded
+    /// `Feed::Dhan`. Hardcoding was correct while Dhan's was the only live
+    /// market-data socket, but with TrueData appending to the same WAL it
+    /// would report a TrueData loss as a **Dhan** loss — the wrong broker
+    /// in an operator page, which the Dhan noise lock explicitly forbids.
+    ///
+    /// Called ONLY from the two cold drop arms — never the hot `Spilled`
+    /// path. A market-data frame drop ⊇ tick drop (the frame may be
+    /// OI/PrevClose/MarketStatus too) — all are real data losses, so
+    /// `Degraded` is the correct, honest signal. `OrderUpdate` drops are
+    /// NOT recorded (not market data). O(1), zero-alloc, lock-free (one
+    /// relaxed atomic). `None` registry = no-op.
     #[inline]
-    fn record_dhan_drop_for_health(&self, ws_type: WsType) {
-        if matches!(ws_type, WsType::LiveFeed)
+    fn record_feed_drop_for_health(&self, ws_type: WsType) {
+        if let Some(feed) = ws_type.owning_feed()
             && let Some(ref fh) = self.feed_health
         {
-            fh.record_drops(tickvault_common::feed::Feed::Dhan, 1);
+            fh.record_drops(feed, 1);
         }
     }
 
@@ -1042,13 +1087,67 @@ mod tests {
 
     #[test]
     fn test_ws_type_roundtrip() {
-        for t in [WsType::LiveFeed, WsType::OrderUpdate] {
+        for t in [WsType::LiveFeed, WsType::OrderUpdate, WsType::TruedataFeed] {
             assert_eq!(WsType::from_u8(t.as_u8()), Some(t));
         }
         assert_eq!(WsType::from_u8(0), None);
         assert_eq!(WsType::from_u8(2), None);
         assert_eq!(WsType::from_u8(3), None);
+        assert_eq!(WsType::from_u8(6), None);
         assert_eq!(WsType::from_u8(99), None);
+    }
+
+    #[test]
+    fn test_ws_type_tag_bytes_are_frozen() {
+        // These bytes are PERSISTED in every WAL record. Changing one
+        // silently re-routes every already-written frame on the next boot
+        // replay, so they are pinned as literals rather than derived.
+        assert_eq!(WsType::LiveFeed.as_u8(), 1);
+        assert_eq!(WsType::OrderUpdate.as_u8(), 4);
+        assert_eq!(
+            WsType::TruedataFeed.as_u8(),
+            5,
+            "5 was chosen because 1-4 are spent or reserved by retired transports"
+        );
+    }
+
+    #[test]
+    fn test_owning_feed_maps_each_transport_to_its_broker() {
+        use tickvault_common::feed::Feed;
+        // The whole point: a TrueData drop must NOT be reported as Dhan.
+        assert_eq!(WsType::TruedataFeed.owning_feed(), Some(Feed::Truedata));
+        assert_eq!(
+            WsType::LiveFeed.owning_feed(),
+            Some(Feed::Dhan),
+            "tag 1 predates the multi-feed WAL; replayed old records stay Dhan"
+        );
+        assert_eq!(
+            WsType::OrderUpdate.owning_feed(),
+            None,
+            "an order-update drop must never flip a MARKET-DATA feed to Degraded"
+        );
+        // No two market-data transports may claim the same broker, or the
+        // health page cannot tell two feeds apart.
+        assert_ne!(
+            WsType::LiveFeed.owning_feed(),
+            WsType::TruedataFeed.owning_feed()
+        );
+    }
+
+    #[test]
+    fn test_every_ws_type_has_a_distinct_label() {
+        // The label is a metric dimension; a collision would silently merge
+        // two feeds' drop counters into one series.
+        let labels = [
+            WsType::LiveFeed.as_str(),
+            WsType::OrderUpdate.as_str(),
+            WsType::TruedataFeed.as_str(),
+        ];
+        for (i, a) in labels.iter().enumerate() {
+            for b in labels.iter().skip(i.saturating_add(1)) {
+                assert_ne!(a, b, "metric labels must be distinct");
+            }
+        }
     }
 
     #[test]

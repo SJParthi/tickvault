@@ -2539,14 +2539,17 @@ mod tests {
 
     #[test]
     fn test_in_ist_session_bounds() {
-        // [09:15, 15:30) IST, inclusive-exclusive; lockstep with the
+        // [09:15, 15:40) IST, inclusive-exclusive; lockstep with the
         // canonical MARKET_OPEN/CLOSE nanos constants.
+        // 2026-08-07: end 15:30 -> 15:40 (NSE CAS change of 2026-08-03).
         assert_eq!(SESSION_START_SECS_OF_DAY_IST, 9 * 3600 + 15 * 60);
-        assert_eq!(SESSION_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
+        assert_eq!(SESSION_END_SECS_OF_DAY_IST, 15 * 3600 + 40 * 60);
         assert!(in_ist_session(ist_ms(9, 15)));
         assert!(in_ist_session(ist_ms(12, 0)));
         assert!(in_ist_session(ist_ms(15, 29)));
-        assert!(!in_ist_session(ist_ms(15, 30)));
+        assert!(in_ist_session(ist_ms(15, 30))); // now IN session
+        assert!(in_ist_session(ist_ms(15, 39))); // the new last minute
+        assert!(!in_ist_session(ist_ms(15, 40)));
         assert!(!in_ist_session(ist_ms(9, 14)));
         assert!(!in_ist_session(ist_ms(21, 43)));
         assert!(!in_ist_session(0));
