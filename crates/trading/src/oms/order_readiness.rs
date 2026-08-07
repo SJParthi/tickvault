@@ -715,10 +715,11 @@ mod tests {
     fn test_next_readiness_probe_wait_secs_after_close_sleeps_to_next_0845() {
         // 16:00 IST = 57600; wait = (86400 - 57600) + 31500 = 60300.
         assert_eq!(next_readiness_probe_wait_secs(57_600), 60_300);
-        // Exactly at close (15:30 = 55800) is NOT in-session -> sleep to next.
+        // Exactly at close (15:40 = 56400 since 2026-08-03) is NOT in-session
+        // -> sleep to next.
         assert_eq!(
-            next_readiness_probe_wait_secs(55_800),
-            u64::from(SECONDS_PER_DAY - 55_800) + 31_500
+            next_readiness_probe_wait_secs(56_400),
+            u64::from(SECONDS_PER_DAY - 56_400) + 31_500
         );
     }
 

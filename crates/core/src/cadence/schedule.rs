@@ -430,8 +430,9 @@ mod tests {
         assert!(!expiry_wave_anchor_active(ms(8, 0, 0, 0), 60_000, true));
         // Non-trading days never anchor.
         assert!(!expiry_wave_anchor_active(now, interval, false));
-        // Session-over wakes keep the plain cadence.
-        assert!(!expiry_wave_anchor_active(ms(15, 30, 0, 0), 60_000, true));
+        // Session-over wakes keep the plain cadence (post-15:40 since the
+        // NSE CAS change of 2026-08-03; 15:30 is now mid-session).
+        assert!(!expiry_wave_anchor_active(ms(15, 40, 0, 0), 60_000, true));
         // Boundary edge: the era look-ahead opens exactly one minute
         // before the first cycle boundary (plain target at 09:15:00).
         assert!(expiry_wave_anchor_active(ms(9, 14, 0, 0), 60_000, true));
@@ -672,9 +673,10 @@ mod tests {
         // Mirrored hand-typed vectors pinning equality with the app
         // module's literals (crates/app/src/spot_1m_rest_boot.rs
         // `next_minute_close_fire` semantics + the shared window
-        // constants 33_360 / 55_800 — also const-asserted above).
+        // constants 33_360 / 56_400 — also const-asserted above).
+        // 2026-08-07: last mark 55_800 -> 56_400 (NSE CAS change 2026-08-03).
         assert_eq!(CADENCE_FIRST_CYCLE_BOUNDARY_SECS_OF_DAY_IST, 33_360); // 09:16:00
-        assert_eq!(CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST, 55_800); // 15:30:00
+        assert_eq!(CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST, 56_400); // 15:40:00
         // Pre-window (midnight, 09:00, exactly 09:16) → the first fire.
         assert_eq!(next_cycle_boundary(0), Some(33_360));
         assert_eq!(next_cycle_boundary(9 * 3600), Some(33_360));
@@ -685,21 +687,23 @@ mod tests {
         assert_eq!(next_cycle_boundary(10 * 3600 + 29 * 60 + 30), Some(37_800));
         assert_eq!(next_cycle_boundary(37_800), Some(37_800));
         // The last mark is INCLUSIVE; one second past it → None.
-        assert_eq!(next_cycle_boundary(55_800), Some(55_800));
-        assert_eq!(next_cycle_boundary(55_801), None);
+        assert_eq!(next_cycle_boundary(55_800), Some(55_800)); // 15:30 now mid-window
+        assert_eq!(next_cycle_boundary(56_400), Some(56_400)); // 15:40 — the last mark
+        assert_eq!(next_cycle_boundary(56_401), None);
         assert_eq!(next_cycle_boundary(86_399), None);
     }
 
     #[test]
-    fn test_cadence_schedule_window_09_16_to_15_30_inclusive() {
+    fn test_cadence_schedule_window_09_16_to_15_40_inclusive() {
         assert!(!boundary_in_window(33_300)); // 09:15:00 — before the window
         assert!(boundary_in_window(33_360)); // 09:16:00 — first
         assert!(boundary_in_window(45_000)); // mid-session
-        assert!(boundary_in_window(55_800)); // 15:30:00 — last, inclusive
-        assert!(!boundary_in_window(55_860)); // 15:31:00 — past
+        assert!(boundary_in_window(55_800)); // 15:30:00 — now mid-session
+        assert!(boundary_in_window(56_400)); // 15:40:00 — last, inclusive
+        assert!(!boundary_in_window(56_460)); // 15:41:00 — past
         // The last cycle carries the post_close stamp.
-        assert!(build_cycle_slots(55_800, 0, 0, 0, &cfg()).post_close);
-        assert!(!build_cycle_slots(55_740, 0, 0, 0, &cfg()).post_close);
+        assert!(build_cycle_slots(56_400, 0, 0, 0, &cfg()).post_close);
+        assert!(!build_cycle_slots(56_340, 0, 0, 0, &cfg()).post_close);
     }
 
     #[test]
@@ -722,9 +726,9 @@ mod tests {
         // re-selects its own boundary.
         let now = ms_of(10, 0, 20, 0);
         assert_eq!(next_joinable_boundary(now, Some(36_000), &c), Some(36_060));
-        // Past the session window → None.
-        let now = ms_of(15, 30, 1, 0);
-        assert_eq!(next_joinable_boundary(now, Some(55_800), &c), None);
+        // Past the session window → None (2026-08-07: window now ends 15:40).
+        let now = ms_of(15, 40, 1, 0);
+        assert_eq!(next_joinable_boundary(now, Some(56_400), &c), None);
     }
 
     /// Helper alias for the joinable-boundary vectors.
@@ -753,7 +757,8 @@ mod tests {
             seen += 1;
             boundary = next_cycle_boundary(b + 1);
         }
-        // [09:16:00, 15:30:00] inclusive = 375 minute closes.
-        assert_eq!(seen, 375);
+        // [09:16:00, 15:40:00] inclusive = 385 minute closes
+        // (2026-08-07: was 375 before the NSE CAS change of 2026-08-03).
+        assert_eq!(seen, 385);
     }
 }

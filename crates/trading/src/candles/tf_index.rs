@@ -46,7 +46,7 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 /// production consumer was the DELETED tick aggregator's session-window
 /// truncation; the pin tests below keep the canonical value asserted.
 #[cfg(test)]
-pub(crate) const MARKET_CLOSE_SECS_OF_DAY_IST: u32 = 55_800;
+pub(crate) const MARKET_CLOSE_SECS_OF_DAY_IST: u32 = 56_400;
 
 /// Runtime-indexable handle for the 21 candle timeframes.
 ///
@@ -362,8 +362,8 @@ mod tests {
 
         assert_eq!(MARKET_OPEN_SECS_OF_DAY_IST, 33_300, "09:15:00 IST");
         assert_eq!(
-            MARKET_CLOSE_SECS_OF_DAY_IST, 55_800,
-            "15:30:00 IST (exclusive)"
+            MARKET_CLOSE_SECS_OF_DAY_IST, 56_400,
+            "15:40:00 IST (exclusive) — NSE CAS change 2026-08-03"
         );
         assert_eq!(
             i64::from(MARKET_OPEN_SECS_OF_DAY_IST) * 1_000_000_000,
