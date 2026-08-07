@@ -375,10 +375,14 @@ mod tests {
     }
 
     #[test]
-    fn test_day_ohlc_session_gate_rejects_15_30_00_exclusive_close() {
-        // 15:30:00 IST = 55_800 — the close is EXCLUSIVE, matching the
+    fn test_day_ohlc_session_gate_rejects_15_40_00_exclusive_close() {
+        // 15:40:00 IST = 56_400 — the close is EXCLUSIVE, matching the
         // candle aggregator gate and g1_exchange_gate_accepts.
-        assert!(!day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 55_800));
+        // 2026-08-07: was 15:30/55_800 before the NSE CAS change of 2026-08-03.
+        assert!(!day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 56_400));
+        // …and the ten newly-in-session minutes are ACCEPTED.
+        assert!(day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 55_800));
+        assert!(day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 56_399));
     }
 
     #[test]

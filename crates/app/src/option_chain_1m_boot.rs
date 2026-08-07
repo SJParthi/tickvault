@@ -3752,8 +3752,9 @@ mod tests {
         let close_ms =
             i64::from(tickvault_common::constants::SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST)
                 * MILLIS_PER_SEC;
-        // 15:30:00 IST — the boundary that targets the 15:29 candle.
-        assert_eq!(close_ms, 55_800_000);
+        // 15:40:00 IST — the boundary that targets the 15:39 candle
+        // (2026-08-07: NSE CAS change of 2026-08-03 moved the close).
+        assert_eq!(close_ms, 56_400_000);
         // A retry launching at 15:30:05.5 (the fast path) is ALLOWED…
         assert!(chain_retry_allowed((close_ms + 5_500) - close_ms));
         // …and one at 15:30:12.5 (worst timed-out first attempt) too.
