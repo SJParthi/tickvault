@@ -259,14 +259,20 @@ mod indicator_mutations {
         }
     }
 
+    // REGRESSION 2026-08-07 (daily-universe §28.2): this asserted that a large
+    // `security_id` yields a DEFAULT snapshot — encoding the bug as the contract.
+    // Ids are namespace-banded now (Groww index [2^62,2^63), GDF [2^60,2^62),
+    // TrueData [2^59,2^60)), so "large" describes EVERY live instrument: the old
+    // expectation meant indicators + strategy were a permanent silent no-op across
+    // the entire universe. Only genuine SLOT-CAPACITY exhaustion may default now.
     #[test]
-    fn mutation_indicator_out_of_bounds_sid_returns_default() {
+    fn mutation_indicator_large_sid_is_processed() {
         let mut engine = IndicatorEngine::new(default_params());
         let tick = make_tick(u64::from(u32::MAX), 100.0, 110.0, 90.0, 1000);
         let snap = engine.update(&tick);
         assert_eq!(
-            snap.ema_fast, 0.0,
-            "Out-of-bounds security_id should return defaults"
+            snap.ema_fast, 100.0,
+            "a large security_id must be processed, not silently defaulted"
         );
     }
 

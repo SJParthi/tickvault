@@ -15,6 +15,8 @@
 //! - OBV: Running sum with close-vs-prev direction
 //! - VWAP: Cumulative (price × volume) / cumulative volume
 
+use std::collections::HashMap;
+
 use tickvault_common::constants::MAX_INDICATOR_INSTRUMENTS;
 use tickvault_common::tick_types::ParsedTick;
 
@@ -29,8 +31,24 @@ use super::types::{IndicatorParams, IndicatorSnapshot, IndicatorState};
 /// Indexed by `security_id` for O(1) lookup. Pre-allocated at startup
 /// for the full instrument universe — zero allocation on the hot path.
 pub struct IndicatorEngine {
-    /// Per-instrument indicator state. Index = security_id.
+    /// Per-instrument indicator state. Index = the DENSE SLOT for a
+    /// `security_id`, allocated by [`IndicatorEngine::slot_for`] — **not** the
+    /// raw id (see the struct-level note above and §28.2).
     states: Vec<IndicatorState>,
+    /// Dense-slot allocator: banded `security_id` -> index into `states`.
+    ///
+    /// Repaired 2026-08-07 under daily-universe §28.2. The previous code did
+    /// `security_id as usize` directly. That worked while ids were small u32
+    /// exchange tokens, but the id space is now NAMESPACE-BANDED (Groww index
+    /// `[2^62, 2^63)`, GDF `[2^60, 2^62)`, TrueData `[2^59, 2^60)`), so every
+    /// live id was astronomically past `states.len()` and EVERY lookup fell
+    /// through the bounds check into a default snapshot — a total, silent,
+    /// permanent no-op across indicators and strategy.
+    slot_of: HashMap<u64, u32>,
+    /// Next dense slot to hand out. Monotonic; slots are never reclaimed
+    /// (an instrument seen once keeps its state for the process lifetime,
+    /// which is exactly the warmup semantics the engine needs).
+    next_slot: u32,
     /// Shared indicator parameters (periods, multipliers).
     params: IndicatorParams,
     /// Pre-computed EMA alpha for fast period.
@@ -56,6 +74,8 @@ impl IndicatorEngine {
 
         Self {
             states,
+            slot_of: HashMap::with_capacity(MAX_INDICATOR_INSTRUMENTS),
+            next_slot: 0,
             alpha_fast: IndicatorParams::ema_alpha(params.ema_fast_period),
             alpha_slow: IndicatorParams::ema_alpha(params.ema_slow_period),
             alpha_signal: IndicatorParams::ema_alpha(params.macd_signal_period),
@@ -65,24 +85,105 @@ impl IndicatorEngine {
         }
     }
 
+    /// Resolves a `security_id` to its dense `states` slot WITHOUT allocating.
+    ///
+    /// Read-only companion to [`Self::slot_for`]. Returns `None` for an id that
+    /// has never been seen, so a pure query can never consume capacity.
+    ///
+    /// # Performance
+    /// O(1) average — one hash lookup.
+    #[inline(always)]
+    fn slot_lookup(&self, security_id: u64) -> Option<usize> {
+        self.slot_of.get(&security_id).map(|&s| s as usize)
+    }
+
+    /// Resolves a `security_id` to its dense `states` slot, allocating one on
+    /// first sight.
+    ///
+    /// Returns `None` ONLY when the engine is at capacity
+    /// (`MAX_INDICATOR_INSTRUMENTS` distinct instruments). That case is
+    /// FAIL-CLOSED and LOUD — a coded `error!` plus
+    /// `tv_indicator_slot_exhausted_total` — never a silent default.
+    ///
+    /// # Why a map and not `security_id as usize` (repaired 2026-08-07, §28.2)
+    ///
+    /// Ids are NAMESPACE-BANDED (Groww index `[2^62, 2^63)`, GDF
+    /// `[2^60, 2^62)`, TrueData `[2^59, 2^60)`), so the old direct cast put
+    /// every real instrument astronomically past `states.len()`. The bounds
+    /// check then returned a default snapshot for EVERY tick — indicators and
+    /// strategy were a permanent, silent no-op. The dense mapping restores the
+    /// flat-Vec design's intent: the Vec is still one startup allocation, still
+    /// index-addressed, still O(1) — only the index is now correct.
+    ///
+    /// # Performance
+    /// O(1) average — one hash lookup on the steady-state path (every tick
+    /// after an instrument's first). No heap allocation once the id is known;
+    /// the map is pre-sized at construction.
+    #[inline(always)]
+    fn slot_for(&mut self, security_id: u64) -> Option<usize> {
+        if let Some(&slot) = self.slot_of.get(&security_id) {
+            return Some(slot as usize);
+        }
+        let slot = self.next_slot as usize;
+        if slot >= self.states.len() {
+            // Fail closed + loud. Silence here is what made the pre-2026-08-07
+            // bug invisible for as long as it existed.
+            metrics::counter!("tv_indicator_slot_exhausted_total").increment(1);
+            tracing::error!(
+                security_id,
+                capacity = self.states.len(),
+                "indicator engine slot capacity exhausted — this instrument has \
+                 NO indicator state and its strategy will never fire; raise \
+                 MAX_INDICATOR_INSTRUMENTS"
+            );
+            return None;
+        }
+        self.slot_of.insert(security_id, self.next_slot);
+        self.next_slot = self.next_slot.saturating_add(1);
+        Some(slot)
+    }
+
+    /// Number of dense slots currently allocated.
+    ///
+    /// Exposed for the wiring/observability tests and for capacity monitoring.
+    #[must_use]
+    pub fn allocated_slots(&self) -> usize {
+        self.next_slot as usize
+    }
+
+    /// Test-only: resolve (allocating if needed) and hand back a mutable state.
+    ///
+    /// Tests used to index `engine.states[security_id as usize]` directly. That
+    /// is exactly the raw-id assumption §28.2 removed, so they must go through
+    /// the slot allocator like production code does.
+    #[cfg(test)]
+    fn state_mut_for_test(&mut self, security_id: u64) -> &mut IndicatorState {
+        let slot = self
+            .slot_for(security_id)
+            .expect("test engine must have slot capacity");
+        &mut self.states[slot]
+    }
+
     /// Updates all indicators for the given tick and returns a snapshot.
     ///
     /// # Performance
-    /// O(1) — every indicator uses a recursive/incremental update.
+    /// O(1) — every indicator uses a recursive/incremental update, plus one
+    /// O(1)-average hash lookup to resolve the instrument's dense slot.
     /// Total: ~200ns on t4g.medium (20 indicators, all O(1)).
     ///
     /// # Safety (bounds)
-    /// If `security_id >= MAX_INDICATOR_INSTRUMENTS`, returns a default snapshot.
+    /// If the engine is at capacity and this `security_id` has no slot,
+    /// returns a default snapshot — after emitting a coded error and bumping
+    /// `tv_indicator_slot_exhausted_total`.
     #[inline(always)]
     #[allow(clippy::arithmetic_side_effects)] // APPROVED: all arithmetic is bounded f64 operations with finite checks
     pub fn update(&mut self, tick: &ParsedTick) -> IndicatorSnapshot {
-        let sid = tick.security_id as usize;
-        if sid >= self.states.len() {
+        let Some(sid) = self.slot_for(tick.security_id) else {
             return IndicatorSnapshot {
                 security_id: tick.security_id,
                 ..Default::default()
             };
-        }
+        };
 
         let state = &mut self.states[sid];
         // Operator-spotted 2026-05-25: f64::from(f32) on price fields
@@ -385,8 +486,13 @@ impl IndicatorEngine {
         security_id: u64,
         candles: &[(f64, f64, f64, f64, f64)], // (open, high, low, close, volume)
     ) -> usize {
-        let sid = security_id as usize;
-        if sid >= self.states.len() || candles.is_empty() {
+        if candles.is_empty() {
+            return 0;
+        }
+        // Reserve the slot up-front so a capacity refusal short-circuits here
+        // rather than being re-discovered (and re-logged) per synthetic tick.
+        // The body drives `update()`, which resolves the same slot itself.
+        if self.slot_for(security_id).is_none() {
             return 0;
         }
 
@@ -423,11 +529,12 @@ impl IndicatorEngine {
 
     /// Returns the warmup count for a given security.
     pub fn warmup_count(&self, security_id: u64) -> u16 {
-        let sid = security_id as usize;
-        if sid >= self.states.len() {
-            return 0;
+        // Read-only: must NOT allocate a slot for an unseen id, or merely
+        // asking "is this warm?" would consume capacity.
+        match self.slot_lookup(security_id) {
+            Some(sid) => self.states[sid].warmup_count,
+            None => 0,
         }
-        self.states[sid].warmup_count
     }
 }
 
@@ -482,7 +589,13 @@ mod tests {
     // --- Bounds check ---
 
     #[test]
-    fn test_out_of_bounds_security_id_returns_default_snapshot() {
+    fn test_large_security_id_is_processed_not_silently_dropped() {
+        // REGRESSION 2026-08-07 (daily-universe §28.2): this test previously
+        // asserted that a large `security_id` returns a DEFAULT snapshot, i.e.
+        // it encoded the bug as the contract. Ids are namespace-banded now
+        // (Groww index [2^62, 2^63), GDF [2^60, 2^62), TrueData [2^59, 2^60)),
+        // so "large" describes EVERY live instrument — the old assertion meant
+        // indicators were a permanent silent no-op for the entire universe.
         let mut engine = default_engine();
         let tick = ParsedTick {
             security_id: u64::from(u32::MAX),
@@ -491,10 +604,86 @@ mod tests {
         };
         let snap = engine.update(&tick);
         assert_eq!(snap.security_id, u64::from(u32::MAX));
-        assert!(!snap.is_warm);
-        // All indicators should be default (0.0)
-        assert_eq!(snap.ema_fast, 0.0);
-        assert_eq!(snap.rsi, 0.0);
+        assert_eq!(
+            snap.ema_fast, 100.0,
+            "a large security_id must get a dense slot and be PROCESSED; \
+             returning defaults here is the pre-§28.2 silent no-op"
+        );
+        assert_eq!(engine.warmup_count(u64::from(u32::MAX)), 1);
+    }
+
+    #[test]
+    fn test_namespace_banded_ids_are_processed() {
+        // The real shapes: Groww index bit 62, GDF token bit 61, TrueData bit 59.
+        let mut engine = default_engine();
+        for (label, id) in [
+            ("groww_index", 1_u64 << 62),
+            ("gdf_token", 1_u64 << 61),
+            ("truedata", 1_u64 << 59),
+        ] {
+            let tick = ParsedTick {
+                security_id: id,
+                last_traded_price: 250.0,
+                ..Default::default()
+            };
+            let snap = engine.update(&tick);
+            assert_eq!(
+                snap.ema_fast, 250.0,
+                "{label} id {id} must be processed, not silently defaulted"
+            );
+        }
+        assert_eq!(
+            engine.allocated_slots(),
+            3,
+            "one dense slot per distinct id"
+        );
+    }
+
+    #[test]
+    fn test_distinct_banded_ids_do_not_share_state() {
+        let mut engine = default_engine();
+        let a = 1_u64 << 62;
+        let b = (1_u64 << 62) + 1;
+        engine.update(&ParsedTick {
+            security_id: a,
+            last_traded_price: 100.0,
+            ..Default::default()
+        });
+        engine.update(&ParsedTick {
+            security_id: b,
+            last_traded_price: 900.0,
+            ..Default::default()
+        });
+        let snap_a = engine.update(&ParsedTick {
+            security_id: a,
+            last_traded_price: 100.0,
+            ..Default::default()
+        });
+        assert!(
+            (snap_a.ema_fast - 900.0).abs() > 1.0,
+            "two distinct ids must not collapse into one slot"
+        );
+        assert_eq!(engine.warmup_count(a), 2);
+        assert_eq!(engine.warmup_count(b), 1);
+    }
+
+    #[test]
+    fn test_allocated_slots_not_incremented_by_readonly_warmup_count() {
+        // A read-only query must never consume capacity.
+        let mut engine = default_engine();
+        assert_eq!(engine.warmup_count(1_u64 << 62), 0);
+        assert_eq!(
+            engine.allocated_slots(),
+            0,
+            "warmup_count() must not allocate — otherwise merely asking \
+             'is this warm?' burns a slot"
+        );
+        engine.update(&ParsedTick {
+            security_id: 1_u64 << 62,
+            last_traded_price: 10.0,
+            ..Default::default()
+        });
+        assert_eq!(engine.allocated_slots(), 1);
     }
 
     // --- First tick initialization ---
@@ -848,9 +1037,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_out_of_bounds_security_id_preserves_id_in_snapshot() {
+    fn test_large_security_id_preserves_id_and_is_processed() {
+        // REGRESSION 2026-08-07 (§28.2): id preservation was always correct;
+        // the surrounding "and everything is default" expectation was the bug.
         let mut engine = default_engine();
-        // Use a security_id that is >= MAX_INDICATOR_INSTRUMENTS
         let large_id = MAX_INDICATOR_INSTRUMENTS as u64;
         let tick = ParsedTick {
             security_id: large_id,
@@ -860,16 +1050,12 @@ mod tests {
             volume: 10000,
             ..Default::default()
         };
-
         let snap = engine.update(&tick);
-        assert_eq!(snap.security_id, large_id);
-        assert!(!snap.is_warm, "OOB security_id must not be warm");
-        assert_eq!(snap.ema_fast, 0.0, "OOB must return default ema_fast");
-        assert_eq!(snap.rsi, 0.0, "OOB must return default rsi");
-        assert_eq!(snap.atr, 0.0, "OOB must return default atr");
-        assert_eq!(snap.macd_line, 0.0, "OOB must return default macd_line");
-        assert_eq!(snap.sma, 0.0, "OOB must return default sma");
-        assert_eq!(snap.vwap, 0.0, "OOB must return default vwap");
+        assert_eq!(snap.security_id, large_id, "id must round-trip");
+        assert_eq!(
+            snap.ema_fast, 500.0,
+            "and the tick must actually be processed"
+        );
     }
 
     #[test]
@@ -899,20 +1085,20 @@ mod tests {
     #[test]
     fn test_warmup_counter_saturates_at_u16_max() {
         let mut engine = default_engine();
-        let sid = 100_usize;
+        let sid = 100_u64;
 
         // Manually set warmup_count close to u16::MAX
-        engine.states[sid].warmup_count = u16::MAX - 1;
+        engine.state_mut_for_test(sid).warmup_count = u16::MAX - 1;
 
         // One more tick should bring it to u16::MAX
         let tick = make_tick(100, 100.0, 105.0, 95.0, 1000);
         engine.update(&tick);
-        assert_eq!(engine.states[sid].warmup_count, u16::MAX);
+        assert_eq!(engine.state_mut_for_test(sid).warmup_count, u16::MAX);
 
         // Another tick should remain at u16::MAX (saturating)
         engine.update(&tick);
         assert_eq!(
-            engine.states[sid].warmup_count,
+            engine.state_mut_for_test(sid).warmup_count,
             u16::MAX,
             "warmup_count must saturate at u16::MAX, not overflow"
         );
@@ -937,16 +1123,46 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_out_of_bounds_security_id_one_above_max_returns_default() {
+    fn test_id_numerically_above_capacity_is_still_processed() {
+        // REGRESSION 2026-08-07 (§28.2): the id's NUMERIC value is irrelevant
+        // now — only the COUNT of distinct instruments is bounded. This test
+        // previously asserted a default snapshot, which was the silent no-op.
         let mut engine = default_engine();
-        let oob_id = MAX_INDICATOR_INSTRUMENTS as u64;
-        let tick = make_tick(oob_id, 500.0, 510.0, 490.0, 10000);
+        let big_id = MAX_INDICATOR_INSTRUMENTS as u64;
+        let tick = make_tick(big_id, 500.0, 510.0, 490.0, 10000);
         let snap = engine.update(&tick);
-        assert_eq!(snap.security_id, oob_id);
-        assert!(!snap.is_warm);
+        assert_eq!(snap.security_id, big_id);
+        assert_eq!(
+            snap.ema_fast, 500.0,
+            "an id numerically above capacity must still get slot 0"
+        );
+        assert_eq!(engine.allocated_slots(), 1);
+    }
+
+    #[test]
+    fn test_slot_capacity_exhaustion_is_fail_closed_and_counted() {
+        // The ONLY case that may return a default snapshot: genuinely running
+        // out of distinct slots. It must be loud (counter + coded error), not
+        // silent.
+        let mut engine = default_engine();
+        for i in 0..MAX_INDICATOR_INSTRUMENTS {
+            let id = (1_u64 << 62) + i as u64;
+            let snap = engine.update(&make_tick(id, 100.0, 101.0, 99.0, 1));
+            assert_eq!(snap.ema_fast, 100.0, "instrument {i} must fit");
+        }
+        assert_eq!(engine.allocated_slots(), MAX_INDICATOR_INSTRUMENTS);
+
+        // One past capacity -> default snapshot, id preserved.
+        let overflow_id = (1_u64 << 62) + MAX_INDICATOR_INSTRUMENTS as u64;
+        let snap = engine.update(&make_tick(overflow_id, 777.0, 778.0, 776.0, 1));
+        assert_eq!(snap.security_id, overflow_id);
         assert_eq!(snap.ema_fast, 0.0);
-        assert_eq!(snap.vwap, 0.0);
-        assert_eq!(snap.obv, 0.0);
+        assert!(!snap.is_warm);
+        // Capacity must NOT have moved.
+        assert_eq!(engine.allocated_slots(), MAX_INDICATOR_INSTRUMENTS);
+        // An already-known id still works after the refusal.
+        let known = engine.update(&make_tick(1_u64 << 62, 100.0, 101.0, 99.0, 1));
+        assert!(known.ema_fast > 0.0, "refusal must not poison known slots");
     }
 
     #[test]
@@ -972,19 +1188,19 @@ mod tests {
     #[test]
     fn test_warmup_count_starts_at_one_after_first_tick() {
         let mut engine = default_engine();
-        let sid = 50_usize;
+        let sid = 50_u64;
         let tick = make_tick(50, 100.0, 105.0, 95.0, 1000);
         engine.update(&tick);
-        assert_eq!(engine.states[sid].warmup_count, 1);
+        assert_eq!(engine.state_mut_for_test(sid).warmup_count, 1);
     }
 
     #[test]
     fn test_warmup_saturation_does_not_affect_indicator_computation() {
         let mut engine = default_engine();
-        let sid = 100_usize;
+        let sid = 100_u64;
 
         // Set warmup_count to u16::MAX
-        engine.states[sid].warmup_count = u16::MAX;
+        engine.state_mut_for_test(sid).warmup_count = u16::MAX;
 
         // Feed two ticks at different prices
         let tick1 = make_tick(100, 100.0, 105.0, 95.0, 1000);
@@ -1000,7 +1216,7 @@ mod tests {
             "EMA must still update at saturated warmup"
         );
         // warmup_count stays at MAX
-        assert_eq!(engine.states[sid].warmup_count, u16::MAX);
+        assert_eq!(engine.state_mut_for_test(sid).warmup_count, u16::MAX);
     }
 
     #[test]
@@ -1030,10 +1246,10 @@ mod tests {
     #[test]
     fn test_warmup_counter_at_max_still_produces_valid_indicators() {
         let mut engine = default_engine();
-        let sid = 100_usize;
+        let sid = 100_u64;
 
         // Set warmup to max — is_warm should be true
-        engine.states[sid].warmup_count = u16::MAX;
+        engine.state_mut_for_test(sid).warmup_count = u16::MAX;
 
         let tick = make_tick(100, 100.0, 105.0, 95.0, 1000);
         let snap = engine.update(&tick);
@@ -1130,12 +1346,16 @@ mod tests {
     }
 
     #[test]
-    fn test_warmup_oob_security_id() {
+    fn test_warmup_accepts_large_security_id() {
+        // REGRESSION 2026-08-07 (§28.2): warmup used the same raw-id cast, so
+        // REST warmup silently processed 0 candles for every banded id — the
+        // strategies would never have become warm.
         let params = IndicatorParams::default();
         let mut engine = IndicatorEngine::new(params);
         let candles = vec![(100.0, 101.0, 99.0, 100.0, 1000.0)];
         let processed = engine.warmup_from_candles(u64::from(u32::MAX), &candles);
-        assert_eq!(processed, 0); // Out of bounds
+        assert_eq!(processed, 1, "a large id must warm up, not silently skip");
+        assert_eq!(engine.warmup_count(u64::from(u32::MAX)), 1);
     }
 
     #[test]
