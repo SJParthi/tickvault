@@ -82,15 +82,47 @@ pub fn parse_questdb_count(body: &str) -> Option<i64> {
 /// re-runs UPSERT the same row (DEDUP idempotency by construction).
 pub const SCOREBOARD_ROW_TS_SECS_OF_DAY_IST: i64 = 15 * 3600 + 45 * 60; // 56_700
 
-/// NSE regular session bounds in IST seconds-of-day ([09:15, 15:30)).
+/// NSE regular session bounds in IST seconds-of-day ([09:15, 15:40)).
+///
+/// 2026-08-07: the close was 55_800 (15:30) until the NSE Closing Auction
+/// change of 2026-08-03 moved it to 56_400 (15:40). This module hardcoded the
+/// literal with NO drift-pin, so it silently kept 15:30 while the canonical
+/// constant moved — leaving the scoreboard's minute-coverage denominator, the
+/// in-session gate and the process-death classifier all blind over the
+/// closing-auction window. The asserts below pin both bounds to the
+/// common-crate constants so this can never drift silently again (the pattern
+/// is `tf_consistency_boot.rs`, which is precisely why THAT module could not
+/// drift).
 pub const SESSION_START_SECS_OF_DAY_IST: i64 = 9 * 3600 + 15 * 60; // 33_300
-pub const SESSION_END_SECS_OF_DAY_IST: i64 = 15 * 3600 + 30 * 60; // 55_800
+pub const SESSION_END_SECS_OF_DAY_IST: i64 = 15 * 3600 + 40 * 60; // 56_400
+
+const _: () = assert!(
+    SESSION_START_SECS_OF_DAY_IST * NANOS_PER_SEC
+        == tickvault_common::constants::MARKET_OPEN_IST_NANOS,
+    "session start drifted from the canonical common-crate constant"
+);
+const _: () = assert!(
+    SESSION_END_SECS_OF_DAY_IST * NANOS_PER_SEC
+        == tickvault_common::constants::MARKET_CLOSE_IST_NANOS,
+    "session end drifted from the canonical common-crate constant"
+);
 
 /// Market-hours window used for the "boot occurred in-session" gate of the
-/// process-death reconciler ([09:00, 15:30) IST — the ws_event_audit
+/// process-death reconciler ([09:00, 15:40) IST — the ws_event_audit
 /// `market_hours` convention).
+///
+/// 2026-08-07: end moved 15:30 -> 15:40 with the same NSE CAS change. While it
+/// read 15:30, a genuine process death during the closing auction was
+/// classified `post_close_restart` — the CLEAN scheduled-stop carve-out — so a
+/// real mid-session crash produced no page and no blame row.
 pub const MARKET_HOURS_START_SECS_OF_DAY_IST: u32 = 9 * 3600;
-pub const MARKET_HOURS_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60;
+pub const MARKET_HOURS_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60;
+
+const _: () = assert!(
+    MARKET_HOURS_END_SECS_OF_DAY_IST as i64 * NANOS_PER_SEC
+        == tickvault_common::constants::MARKET_CLOSE_IST_NANOS,
+    "market-hours end drifted from the canonical common-crate constant"
+);
 
 /// WS-GAP-09 corroboration window around a disconnect episode (±120s).
 pub const WS_GAP9_OVERLAP_WINDOW_SECS: i64 = 120;
@@ -248,7 +280,7 @@ pub fn validate_scoreboard_backfill_date(
 /// logs SCOREBOARD-01 loudly. Pure.
 #[must_use]
 pub fn sanitize_scoreboard_trigger(configured_secs_of_day_ist: u32) -> (u32, bool) {
-    // APPROVED: SESSION_END_SECS_OF_DAY_IST = 55_800 fits u32 trivially.
+    // APPROVED: SESSION_END_SECS_OF_DAY_IST = 56_400 fits u32 trivially.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let lo = SESSION_END_SECS_OF_DAY_IST as u32;
     if (lo..86_400).contains(&configured_secs_of_day_ist) {
@@ -3980,7 +4012,10 @@ mod tests {
     fn test_scoreboard_trigger_constant_is_1545_ist() {
         assert_eq!(SCOREBOARD_ROW_TS_SECS_OF_DAY_IST, 56_700);
         assert_eq!(SESSION_START_SECS_OF_DAY_IST, 33_300);
-        assert_eq!(SESSION_END_SECS_OF_DAY_IST, 55_800);
+        // 2026-08-07: 55_800 (15:30) -> 56_400 (15:40), NSE CAS 2026-08-03.
+        // This assertion previously PINNED THE STALE VALUE as the contract,
+        // so correcting the constant read as a regression.
+        assert_eq!(SESSION_END_SECS_OF_DAY_IST, 56_400);
         assert_eq!(WS_GAP9_OVERLAP_WINDOW_SECS, 120);
         assert_eq!(RESOURCE_OVERLAP_WINDOW_SECS, 300);
     }
@@ -4028,7 +4063,11 @@ mod tests {
         assert!(!is_in_market_hours_secs(9 * 3600 - 1));
         assert!(is_in_market_hours_secs(9 * 3600));
         assert!(is_in_market_hours_secs(12 * 3600));
-        assert!(!is_in_market_hours_secs(15 * 3600 + 30 * 60));
+        // 2026-08-07: 15:30 is now INSIDE market hours (NSE CAS closing
+        // auction runs to 15:40); the exclusive bound moved to 15:40.
+        assert!(is_in_market_hours_secs(15 * 3600 + 30 * 60));
+        assert!(is_in_market_hours_secs(15 * 3600 + 39 * 60 + 59));
+        assert!(!is_in_market_hours_secs(15 * 3600 + 40 * 60));
     }
 
     #[test]
@@ -4867,17 +4906,21 @@ mod tests {
         fold_episode_into_tally(&mut t2, EPISODE_KIND_PROCESS_DEATH, "ours", true);
         assert_eq!(t2.restarts, 1);
         assert_eq!(t2.blame_ours, 1);
-        // is_post_close_connect boundary: 15:29:59 pre-close, 15:30:00 post.
-        assert!(!is_post_close_connect(day_ts(36_000), day_ts(55_799)));
-        assert!(is_post_close_connect(day_ts(36_000), day_ts(55_800)));
+        // is_post_close_connect boundary: 15:39:59 pre-close, 15:40:00 post.
+        // 2026-08-07: was 15:29:59/15:30:00 — while stale, a genuine crash in
+        // the closing auction was excused as a clean scheduled stop.
+        assert!(!is_post_close_connect(day_ts(36_000), day_ts(56_399)));
+        assert!(is_post_close_connect(day_ts(36_000), day_ts(56_400)));
+        // The window that used to be misclassified is now correctly in-session.
+        assert!(!is_post_close_connect(day_ts(36_000), day_ts(55_800)));
     }
 
     #[test]
     fn test_is_post_close_connect_boundary() {
-        // 15:29:59 reconnect = pre-close; 15:30:00 = post-close; and the
+        // 15:39:59 reconnect = pre-close; 15:40:00 = post-close; and the
         // day-scoping uses the PRIOR row's day.
-        assert!(!is_post_close_connect(day_ts(36_000), day_ts(55_799)));
-        assert!(is_post_close_connect(day_ts(36_000), day_ts(55_800)));
+        assert!(!is_post_close_connect(day_ts(36_000), day_ts(56_399)));
+        assert!(is_post_close_connect(day_ts(36_000), day_ts(56_400)));
         assert!(is_post_close_connect(day_ts(30_840), day_ts(63_000)));
     }
 
@@ -5153,7 +5196,10 @@ mod tests {
     fn test_sanitize_scoreboard_trigger_bounds() {
         // In-range values pass through untouched.
         assert_eq!(sanitize_scoreboard_trigger(56_700), (56_700, false));
-        assert_eq!(sanitize_scoreboard_trigger(55_800), (55_800, false));
+        assert_eq!(sanitize_scoreboard_trigger(56_400), (56_400, false));
+        // 2026-08-07: 55_800 (15:30) is now BELOW session close (56_400), so
+        // it is correctly rejected as a pre-close trigger and falls back.
+        assert_eq!(sanitize_scoreboard_trigger(55_800), (56_700, true));
         assert_eq!(sanitize_scoreboard_trigger(86_399), (86_399, false));
         // ≥ 86_400 (the silent never-fires typo) and pre-session-close
         // values fall back to the 15:45 default, flagged invalid.
@@ -5818,12 +5864,17 @@ mod tests {
         );
         assert!(is_session_up_row(&up_at(9 * 3600)), "09:00:00 inclusive");
         assert!(
-            is_session_up_row(&up_at(15 * 3600 + 29 * 60 + 59)),
-            "15:29:59"
+            is_session_up_row(&up_at(15 * 3600 + 39 * 60 + 59)),
+            "15:39:59"
         );
         assert!(
-            !is_session_up_row(&up_at(15 * 3600 + 30 * 60)),
-            "15:30 exclusive"
+            !is_session_up_row(&up_at(15 * 3600 + 40 * 60)),
+            "15:40 exclusive"
+        );
+        // 2026-08-07: 15:30 used to be the exclusive bound; it is now inside.
+        assert!(
+            is_session_up_row(&up_at(15 * 3600 + 30 * 60)),
+            "15:30 now in"
         );
         // Down kinds never count regardless of window.
         let down = ev(
