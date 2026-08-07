@@ -44,8 +44,8 @@ loom = ["dep:loom"]
 groww_orders = ["dep:aws-lc-rs", "dep:tokio-tungstenite", "dep:futures-util"]
 
 [dev-dependencies]
-# bruteX trading-core parity oracle — dev/test ONLY, never a runtime dependency.
-trading-core = { workspace = true }
+# (bruteX trading-core parity oracle removed 2026-08-07 — its upstream rev was
+#  force-pushed away and the package exists on no bruteX branch. See root Cargo.toml.)
 tickvault-core = { path = "../core" }
 criterion = { workspace = true }
 dhat = { workspace = true }
