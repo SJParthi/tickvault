@@ -2,15 +2,41 @@
 //!
 //! Gated behind `#[cfg(test)]` — never compiled into production binaries.
 
-/// Detects whether real AWS credentials are available on this machine.
+/// Detects whether tests that assert against a REAL, REACHABLE SSM should run.
 ///
-/// Checks two credential sources used by the AWS SDK default chain:
-/// 1. `AWS_ACCESS_KEY_ID` environment variable (explicit env-based creds)
-/// 2. `~/.aws/credentials` file (profile-based creds from `aws configure`)
+/// Requires BOTH:
+/// 1. an explicit `TICKVAULT_TEST_REAL_SSM=1` opt-in, and
+/// 2. credentials on the machine ([`has_aws_credentials`]).
 ///
-/// Returns `true` if either source exists. Tests that assert "must fail without
-/// real SSM" should adapt their expectations when this returns `true`, since
-/// SSM calls will succeed on machines with valid AWS credentials (e.g., dev Mac).
+/// # Why this exists (2026-08-07)
+///
+/// Six tests previously branched on [`has_aws_credentials`] alone and, when it
+/// returned `true`, asserted `"with real AWS credentials, fetch should
+/// succeed"`. That conflates two different questions:
+///
+/// * *"are credentials present?"* — what `has_aws_credentials` answers, and
+/// * *"is SSM actually reachable, with our parameters in it?"* — what those
+///   assertions actually require.
+///
+/// Any environment holding the first without the second fails them: a CI
+/// sandbox where the tooling exports a stray `AWS_ACCESS_KEY_ID` with no route
+/// to SSM, a developer laptop carrying `~/.aws/credentials` for an unrelated
+/// account, an offline machine, a locked-down VPC. Observed live: all six
+/// panicked in a sandbox purely because the proxy had exported a key.
+///
+/// Requiring an explicit opt-in makes running against live infrastructure a
+/// deliberate act rather than an accident of the ambient environment. Without
+/// the opt-in the tests assert the genuine unit contract — returns `Err`,
+/// never panics — which holds everywhere.
+///
+/// [`has_aws_credentials`]: fn.has_aws_credentials.html
+pub fn real_ssm_tests_enabled() -> bool {
+    matches!(
+        std::env::var("TICKVAULT_TEST_REAL_SSM").as_deref(),
+        Ok("1") | Ok("true")
+    ) && has_aws_credentials()
+}
+
 pub fn has_aws_credentials() -> bool {
     // Source 1: environment variable credentials
     if std::env::var("AWS_ACCESS_KEY_ID").is_ok() {
@@ -62,15 +88,24 @@ mod tests {
 
     static CREDS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const GUARDED_VARS: [&str; 3] = ["AWS_ACCESS_KEY_ID", "HOME", "USERPROFILE"];
+    // 2026-08-07: TICKVAULT_TEST_REAL_SSM joins the guarded set. The
+    // real_ssm_tests_enabled() tests mutate it, and it is process-global
+    // exactly like the other three — leaving it unguarded would re-open the
+    // same cross-thread race the CredsEnvGuard exists to close.
+    const GUARDED_VARS: [&str; 4] = [
+        "AWS_ACCESS_KEY_ID",
+        "HOME",
+        "USERPROFILE",
+        "TICKVAULT_TEST_REAL_SSM",
+    ];
 
     /// Scoped guard: holds the serialization lock for the test's duration
-    /// and restores the pre-test values of all three credential-related env
+    /// and restores the pre-test values of all four credential-related env
     /// vars on Drop (even on panic), so no test leaks env state into the
     /// next lock holder.
     struct CredsEnvGuard {
         _lock: MutexGuard<'static, ()>,
-        saved: [(&'static str, Option<std::ffi::OsString>); 3],
+        saved: [(&'static str, Option<std::ffi::OsString>); 4],
     }
 
     impl CredsEnvGuard {
@@ -444,5 +479,117 @@ mod tests {
                 None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // real_ssm_tests_enabled() — all four env permutations
+    //
+    // Regression: 2026-08-07 — six tests in secret_manager.rs / ip_verifier.rs
+    // / notification/service.rs branched on has_aws_credentials() alone and
+    // then asserted "with real AWS credentials, fetch should succeed". A
+    // sandbox whose tooling exported a bare AWS_ACCESS_KEY_ID (with no route
+    // to SSM) satisfied the credential check and failed all six. The gate now
+    // demands an explicit opt-in as well, so running against live AWS is a
+    // deliberate act rather than an accident of the ambient environment.
+    // -----------------------------------------------------------------------
+
+    /// Sets the opt-in var and a fake credential, so only the opt-in is under
+    /// test. Caller must already hold `CredsEnvGuard`.
+    ///
+    /// # Safety
+    /// Serialized by the held `CREDS_ENV_LOCK`; the guard restores all four
+    /// vars on Drop.
+    unsafe fn set_opt_in(value: Option<&str>) {
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("TICKVAULT_TEST_REAL_SSM", v),
+                None => std::env::remove_var("TICKVAULT_TEST_REAL_SSM"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_real_ssm_disabled_when_opt_in_absent_even_with_credentials() {
+        let _guard = CredsEnvGuard::acquire();
+        // SAFETY: serialized by CredsEnvGuard; restored on Drop.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+            set_opt_in(None);
+        }
+        assert!(
+            has_aws_credentials(),
+            "precondition: the fake credential must satisfy has_aws_credentials"
+        );
+        assert!(
+            !real_ssm_tests_enabled(),
+            "credentials alone must NOT enable real-SSM tests — this is the exact \
+             2026-08-07 sandbox failure (a stray AWS_ACCESS_KEY_ID with no SSM route)"
+        );
+    }
+
+    #[test]
+    fn test_real_ssm_disabled_when_opt_in_set_but_no_credentials() {
+        let _guard = CredsEnvGuard::acquire();
+        // SAFETY: serialized by CredsEnvGuard; restored on Drop.
+        unsafe {
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+            set_opt_in(Some("1"));
+        }
+        assert!(
+            !real_ssm_tests_enabled(),
+            "opt-in without credentials must NOT enable real-SSM tests"
+        );
+    }
+
+    #[test]
+    fn test_real_ssm_enabled_when_opt_in_and_credentials_both_present() {
+        let _guard = CredsEnvGuard::acquire();
+        // SAFETY: serialized by CredsEnvGuard; restored on Drop.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+            set_opt_in(Some("1"));
+        }
+        assert!(
+            real_ssm_tests_enabled(),
+            "both opt-in and credentials present must enable real-SSM tests"
+        );
+    }
+
+    #[test]
+    fn test_real_ssm_accepts_true_and_rejects_other_values() {
+        let _guard = CredsEnvGuard::acquire();
+        // SAFETY: serialized by CredsEnvGuard; restored on Drop.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+            set_opt_in(Some("true"));
+        }
+        assert!(real_ssm_tests_enabled(), "\"true\" must be accepted");
+
+        for rejected in ["0", "false", "yes", "", "TRUE", "1 "] {
+            // SAFETY: serialized by CredsEnvGuard; restored on Drop.
+            unsafe { set_opt_in(Some(rejected)) };
+            assert!(
+                !real_ssm_tests_enabled(),
+                "{rejected:?} must NOT enable real-SSM tests — only \"1\" and \"true\" do"
+            );
+        }
+    }
+
+    #[test]
+    fn test_real_ssm_disabled_when_neither_present() {
+        let _guard = CredsEnvGuard::acquire();
+        // SAFETY: serialized by CredsEnvGuard; restored on Drop.
+        unsafe {
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+            set_opt_in(None);
+        }
+        assert!(
+            !real_ssm_tests_enabled(),
+            "neither opt-in nor credentials must NOT enable real-SSM tests"
+        );
     }
 }

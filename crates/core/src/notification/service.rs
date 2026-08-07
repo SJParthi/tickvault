@@ -2986,7 +2986,7 @@ mod tests {
             ..NotificationConfig::default()
         };
         let service = NotificationService::initialize(&config).await;
-        if crate::test_support::has_aws_credentials() {
+        if crate::test_support::real_ssm_tests_enabled() {
             // Dev machine with real AWS credentials — Telegram creds fetched from SSM.
             assert!(
                 service.is_active(),
