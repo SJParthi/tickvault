@@ -144,8 +144,17 @@ env:
   REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
   IID: i-0b956d0209231a48b # pinned; must equal secrets.EC2_INSTANCE_ID
   EXPECTED_EIP: 13.234.145.177 # Dhan static-IP — abort loudly if it changes
-  FROM_TYPE: r8g.large
-  TO_TYPE: t4g.medium
+  # 2026-08-07 (operator Quote 12, daily-universe-scope-expansion-2026-05-27.md
+  # §0/§7): retargeted t4g.medium -> t4g.large. This is an UPSIZE, not a
+  # downsize — the workflow name is now a misnomer, kept because renaming it
+  # would break the dispatch URL and every doc reference mid-incident.
+  # Reason: AWS had no t4g.medium capacity in ap-south-1a and the box (pinned
+  # to that one AZ by main.tf:77) could not start for entire trading sessions.
+  # A different instance type draws from a different capacity pool.
+  # QDB_MEM stays 1g — with 8 GiB there is now headroom to raise it, but that
+  # is a separate tuning decision and is deliberately NOT coupled to this flip.
+  FROM_TYPE: t4g.medium
+  TO_TYPE: t4g.large
   QDB_MEM: 1g
 
 jobs:
