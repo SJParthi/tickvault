@@ -57,15 +57,22 @@ use tickvault_common::types::SecurityId;
 
 use crate::candles::{TF_COUNT, TfIndex};
 
-/// Trading-session length in seconds (09:15 → 15:30 IST), const-derived
+/// Trading-session length in seconds (09:15 → 15:40 IST), const-derived
 /// from the canonical nanos constants so a session change cannot silently
 /// diverge the ring capacity math.
+///
+/// 2026-08-07: 22_500 (375 min) -> 23_100 (385 min). NSE extended equity
+/// derivatives to 15:40 on 2026-08-03 for the new Closing Auction Session —
+/// see `MARKET_CLOSE_IST_NANOS`. This const-assert is the reason that change
+/// could not land half-applied: the ring capacity math derives from the same
+/// two constants, so a session move that missed this file would fail the
+/// BUILD rather than silently under-size every per-timeframe ring.
 pub const SESSION_SECS: u32 =
     ((MARKET_CLOSE_IST_NANOS - MARKET_OPEN_IST_NANOS) / 1_000_000_000) as u32;
 
 const _: () = assert!(
-    SESSION_SECS == 22_500,
-    "session length must be 375 minutes (09:15-15:30 IST)"
+    SESSION_SECS == 23_100,
+    "session length must be 385 minutes (09:15-15:40 IST)"
 );
 
 /// One sealed bar resident in RAM — 48 bytes, `Copy`, no heap.

@@ -129,8 +129,12 @@ pub const FOLD_BAR_CHANNEL_CAPACITY: usize = 4096;
 /// canonical nanos constants so a session change cannot silently diverge.
 pub const FOLD_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 
-/// Session close, IST seconds-of-day (15:30:00), exclusive.
-pub const FOLD_SESSION_CLOSE_SECS_OF_DAY_IST: u32 = 55_800;
+/// Session close, IST seconds-of-day (15:40:00), exclusive.
+///
+/// 2026-08-07: 55_800 (15:30) -> 56_400 (15:40) with the NSE CAS change of
+/// 2026-08-03 — see `MARKET_CLOSE_IST_NANOS`. The const-assert below is what
+/// forced this file to move with the canonical constant.
+pub const FOLD_SESSION_CLOSE_SECS_OF_DAY_IST: u32 = 56_400;
 
 const _: () = assert!(
     FOLD_SESSION_OPEN_SECS_OF_DAY_IST as i64 * 1_000_000_000 == MARKET_OPEN_IST_NANOS,
@@ -2311,8 +2315,12 @@ mod tests {
         // PR-2 equality contract: the SAME full-session bar set through the
         // LIVE per-seal upsert hook and the CATCH-UP day-block hook must
         // leave IDENTICAL rings (rehydration-equals-live-fold).
+        // 2026-08-07: 375 -> 385 minutes (NSE CAS change of 2026-08-03). The
+        // FULL session matters here: the live path only populates D1 when the
+        // final in-session bar seals every open bucket, so a short day leaves
+        // the live ring empty for D1 and the parity assert below fires.
         let mut bars = Vec::new();
-        for m in 0..375u32 {
+        for m in 0..385u32 {
             let px = 100.0 + f64::from(m) * 0.05;
             bars.push(bar_at(m, px, px + 0.5, px - 0.5, px + 0.1, i64::from(m)));
         }
@@ -2356,7 +2364,8 @@ mod tests {
     fn test_final_session_minute_seals_everything_including_d1() {
         let mut e = SidFoldState::new(Feed::Dhan, 13, 0);
         // 15:29 is minute offset 374 from 09:15.
-        let last = 374;
+        // 2026-08-07: 374 -> 384 (session 375 -> 385 min, NSE CAS 2026-08-03).
+        let last = 384;
         let sealed_early = fold_all(&mut e, &[bar_at(0, 100.0, 100.0, 100.0, 100.0, 1)]);
         assert_eq!(sealed_early.len(), 1); // M1 only
         let outcome = e.fold_bar(&bar_at(last, 200.0, 201.0, 199.0, 200.5, 2));
@@ -2378,16 +2387,19 @@ mod tests {
 
     #[test]
     fn test_session_truncated_end_final_partial_bucket() {
-        // C2 (2026-07-21): every live intraday TF (1/3/5/15m) divides the
-        // 375-minute session evenly, so D1 is the ONLY live frame whose
-        // natural end truncates (the historical carrier was the retired
-        // H1 bucket opening 15:15). The M15 final bucket [15:15, 15:30)
-        // fits EXACTLY — min(natural, close) is the identity there.
-        let start = (DAY0 as u32) + 54_900; // 15:15
+        // 2026-08-07 (NSE CAS change of 2026-08-03): the session is now 385
+        // minutes, which M15 does NOT divide evenly (385 / 15 = 25.67). The
+        // C2-era comment claimed M15 "fits EXACTLY" at [15:15, 15:30) — that
+        // was true only of the 375-minute session. The final M15 bucket now
+        // opens 15:30 and its natural end (15:45) TRUNCATES to the 15:40
+        // close, so M15 joins D1 as a truncating frame. Same assertion,
+        // materially different reason — worth stating so a future reader
+        // does not "restore" the exact-fit claim.
+        let start = (DAY0 as u32) + 55_800; // 15:30 — the final M15 bucket
         assert_eq!(
             session_truncated_end(TfIndex::M15, start),
             (DAY0 as u32) + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST,
-            "M15 final bucket's natural end IS the close (exact fit)"
+            "M15 final bucket truncates at the close (natural end 15:45)"
         );
         // D1's natural next-day end truncates to the same-day close.
         assert_eq!(
@@ -2599,9 +2611,10 @@ mod tests {
     fn test_golden_fold_agrees_with_tf_consistency_recompute() {
         use crate::tf_consistency_boot::{CandleRow, bucket_grid, recompute_window};
 
-        // Synthetic 375-minute day with varied OHLCV per minute.
+        // Synthetic 385-minute day with varied OHLCV per minute
+        // (2026-08-07: 375 -> 385 with the NSE CAS change of 2026-08-03).
         let mut bars = Vec::new();
-        for i in 0u32..375 {
+        for i in 0u32..385 {
             let base = 100.0 + f64::from(i) * 0.5;
             bars.push(bar_at(
                 i,
@@ -2617,7 +2630,7 @@ mod tests {
         assert_eq!(
             engine.open_bucket_count(),
             0,
-            "the 15:29 bar must seal every bucket"
+            "the 15:39 bar must seal every bucket"
         );
 
         let mut buckets_checked = 0usize;
@@ -2849,8 +2862,10 @@ mod tests {
     #[test]
     fn test_in_session_boundaries() {
         assert!(in_session(OPEN));
-        assert!(in_session((DAY0 as u32) + 55_740)); // 15:29
-        assert!(!in_session((DAY0 as u32) + 55_800)); // 15:30 exclusive
+        assert!(in_session((DAY0 as u32) + 55_740)); // 15:29 (was the last)
+        assert!(in_session((DAY0 as u32) + 55_800)); // 15:30 — now IN session
+        assert!(in_session((DAY0 as u32) + 56_340)); // 15:39 — the new last
+        assert!(!in_session((DAY0 as u32) + 56_400)); // 15:40 exclusive
         assert!(!in_session(OPEN - 60)); // 09:14
     }
 

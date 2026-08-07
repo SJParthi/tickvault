@@ -25,13 +25,17 @@ use crate::pipeline::chain_snapshot::ChainUnderlying;
 /// minute 09:15 closes there). Mirrors the record-capture legs' window.
 pub const CADENCE_FIRST_CYCLE_BOUNDARY_SECS_OF_DAY_IST: u32 = 9 * 3600 + 16 * 60;
 
-/// Last cadence cycle boundary of the session: T = 15:30:00 IST (the
-/// minute 15:29 closes there; its event decisions are stamped
+/// Last cadence cycle boundary of the session: T = 15:40:00 IST (the
+/// minute 15:39 closes there; its event decisions are stamped
 /// `post_close=true` — kept in dry-run, design §1 "Day edges").
-pub const CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60;
+///
+/// 2026-08-07: 15:30 -> 15:40 with the NSE CAS change of 2026-08-03. Ten more
+/// cadence cycles per day; the drift pin below is what forces this file to
+/// move whenever the capture legs' window moves.
+pub const CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60;
 
 // Drift pins: the cadence window IS the record-capture legs' window (the
-// same [09:16:00, 15:30:00] inclusive boundary marks) — a change to either
+// same [09:16:00, 15:40:00] inclusive boundary marks) — a change to either
 // side fails the build here.
 const _: () = assert!(
     CADENCE_FIRST_CYCLE_BOUNDARY_SECS_OF_DAY_IST == SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
@@ -39,7 +43,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST == SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
-    "cadence last boundary must mirror the spot_1m_rest last fire (15:30:00 IST)"
+    "cadence last boundary must mirror the spot_1m_rest last fire (15:40:00 IST)"
 );
 
 /// p95 REST latency allowance used by the in-cycle retry admission test
