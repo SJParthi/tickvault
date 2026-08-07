@@ -132,6 +132,30 @@ multi-AZ so the box can start in 1b/1c on the SAME t4g.medium — was presented
 and NOT chosen; it remains available and would allow reverting to t4g.medium
 later under its own dated quote.
 
+> **⚠ EXECUTION OUTCOME 2026-08-07 — THE FLIP FAILED; THE BOX IS STILL t4g.medium.**
+> The authorized change was executed via `downsize-instance.yml` (run 31148235540)
+> at ~10:12 IST and **AWS refused t4g.large for the SAME reason**:
+> `InsufficientInstanceCapacity ... when calling the StartInstances operation`.
+> The workflow rolled back to t4g.medium, VERIFIED the rollback, and re-stopped
+> the box for schedule parity; rollback snapshot `snap-0573ab07252f67bf3` was
+> taken first and nothing irreversible happened. **Live state: t4g.medium,
+> stopped.**
+>
+> **What this PROVES (and it supersedes the reasoning above):** the constraint is
+> the **AVAILABILITY ZONE, not the instance type**. `ap-south-1a` is out of
+> capacity for t4g.medium AND t4g.large simultaneously, so no instance-type
+> change can fix this — the ₹400–600/mo would have bought nothing. The remaining
+> real fix is the ZERO-extra-cost one: **un-pin the single AZ** (`main.tf:77`
+> hardcodes `availability_zone = "${var.aws_region}a"`) so the box can launch in
+> `1b`/`1c`, which requires an instance REPLACEMENT (AZ is fixed at launch) and
+> therefore a new EIP — see the §7 EIP row and `docs/runbooks/eip-release.md`.
+>
+> This lock's TYPE remains **t4g.large as the authorized target** (Quote 12
+> stands, and 8 GiB still retires the Rule 2 FLAG), but it is **NOT APPLIED**.
+> Any future re-attempt should expect the same capacity refusal until the AZ pin
+> is addressed. Re-attempting the type flip alone, without the AZ fix, is
+> predicted to fail again — do not burn a session on it.
+
 **Bonus (not the reason, but real):** 8 GiB retires the §7 Rule 2 FLAG, which
 honestly recorded that the retained sizing formula predicts a ~2.5 GB app
 working set at ~770 SIDs — a figure that does NOT fit 4 GiB. That risk was
