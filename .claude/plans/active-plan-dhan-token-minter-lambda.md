@@ -9,6 +9,12 @@
 
 ## Design
 
+Move the Dhan token mint OFF the EC2 box and into a daily Lambda, mirroring the
+Groww minter, so token freshness stops depending on whether the box can start.
+The Lambda reads the three Dhan credentials from SSM, generates a TOTP code,
+calls `generateAccessToken`, and writes the JWT back to the shared parameter
+every consumer already reads.
+
 ### The problem in one line
 
 Dhan permits **one active access token per account**, and the only thing that minted one was the tickvault app **on the prod EC2 box**. The box has been unstartable since ~2026-08-06 (`InsufficientInstanceCapacity`, ap-south-1a), so nothing minted, `/tickvault/prod/dhan/access-token` froze at its 25 July value, and consumers got `HTTP 401 / DH-901` on **785 of 785** attempts.
