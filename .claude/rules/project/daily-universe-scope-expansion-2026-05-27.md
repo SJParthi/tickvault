@@ -669,6 +669,72 @@ used to reach a slot is corrected.
 post-repair tree. The guard stays ACTIVE — any further frozen-area edit beyond
 this recorded lift fails the build again and needs its own fresh dated quote.
 
+### §28.3 — NARROW LIFT for the STRATEGY-EVALUATOR slot repair (operator-approved 2026-08-07)
+
+**The verbatim operator authorization (2026-08-07, typed directly in-session):**
+
+> "fi everyhtugn dude oaky?"
+
+Given in DIRECT response to a message that named exactly three fixes and asked the
+operator to pick — quote: *"Say **\"fix the clock\"**, or **\"do 1 and 2\"**"* — with
+the third row of that table reading **"fix the strategy" — brain offline**. The
+operator answered "fix everything", which selects all three including this one. Same
+authorization shape as the §28.2 quote ("go ahead and fix and implement eveuthign dude
+okay>"), and recorded here BEFORE any code change, per this file's own protocol.
+
+**The defect this lift repairs (Verified, 6-agent audit 2026-08-07, re-verified in
+source by the executor before writing this).** §28.2 repaired `IndicatorEngine` — but
+it explicitly scoped itself to the engine and stated "NO strategy FSM logic changes".
+The strategy evaluator one stage downstream carries the **identical unrepaired cast**:
+
+```rust
+// crates/trading/src/strategy/evaluator.rs:52
+let sid = snapshot.security_id as usize;
+if sid >= self.states.len() || !snapshot.is_warm {   // states.len() == 25_000
+    return Signal::Hold;
+}
+```
+
+`engine.rs:406` populates the snapshot with `security_id: tick.security_id` — the RAW
+banded id, NOT the dense slot the engine just resolved for its own use. Live ids are
+namespace-banded (Groww `[2^62,2^63)`, GDF `[2^60,2^62)`, TrueData `[2^59,2^60)`), all
+astronomically `>= 25_000`. So `evaluate()` returns `Signal::Hold` for **every live
+instrument, permanently, with no error, no counter and no log line** — the exact silent
+no-op signature §28.2 was written to eliminate, surviving one stage downstream.
+
+Net effect after §28.2 alone: indicators compute **correctly** and the strategy
+**discards every one of them**. Runtime-dead today (the trading pipeline spawns only
+under `dhan_enabled || groww_enabled`, both retired), exactly as the engine defect was
+— and, like it, a silent catastrophe the moment strategies go live. Unlike the engine
+defect it is **not** covered by the §28.2 fail-closed counter
+(`tv_indicator_slot_exhausted_total`), because the evaluator never reaches the engine's
+allocator at all.
+
+**Scope of THIS lift (narrow, mechanical):** ONLY the id→slot mapping used by the
+evaluator may change. The engine's already-resolved dense slot is carried on
+`IndicatorSnapshot` as a NEW field and the evaluator indexes by that. `security_id`
+keeps carrying the real banded id for every downstream consumer that legitimately needs
+it (audit rows, logs, persistence, cross-feed joins) — it is NOT repurposed.
+**NO indicator math changes. NO strategy FSM transition logic changes. No
+`IndicatorState` or FSM state-machine field changes.** Every condition evaluation and
+every transition stays byte-for-byte identical; only the index used to reach a slot is
+corrected.
+
+**Still NOT remediated by this lift (recorded honestly, not silently carried):**
+- **C1 warmup gate** — unchanged, still TRACKED.
+- **I-P1-11 composite key** — the evaluator, like the engine, keys on `security_id`
+  alone with no `ExchangeSegment`. Cross-FEED collision is structurally impossible
+  (disjoint bands), but two instruments sharing a numeric id across SEGMENTS within one
+  feed would still share a slot. Fixing that needs a signature cascade and its own
+  dated quote.
+- **NaN in `high`/`low`/`open` during REST warmup** poisons indicator state permanently
+  (only `close` is guarded) — deliberately NOT taken in this lift.
+
+**Re-bless:** the `BOUNDARY_FILES` manifest in
+`operator_boundary_indicator_strategy_guard.rs` is regenerated for the post-repair
+tree. The guard stays ACTIVE — any further frozen-area edit beyond this recorded lift
+fails the build again and needs its own fresh dated quote.
+
 ---
 
 > **[ARCHIVED 2026-07-20]** §29 warm-resubscribe snapshot + §31 NTM subscription authorization (retired subscription chain; §31.1 mapping contract kept live) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).

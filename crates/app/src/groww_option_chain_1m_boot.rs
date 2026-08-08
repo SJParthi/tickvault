@@ -2201,8 +2201,20 @@ pub struct GrowwChainProbeResult {
 /// serves stale-or-nothing off-hours (LOW-3 probe honesty). Pure.
 #[must_use]
 pub fn probe_in_session(secs_of_day: u32) -> bool {
-    (9 * 3600 + 16 * 60..15 * 3600 + 30 * 60).contains(&secs_of_day)
+    // 2026-08-07: upper bound was 15:30 and silently kept the pre-NSE-CAS
+    // boundary after the 2026-08-03 change, so the probe reported
+    // out-of-session while the market was still open 15:30–15:40.
+    (9 * 3600 + 16 * 60..PROBE_SESSION_END_SECS_OF_DAY_IST).contains(&secs_of_day)
 }
+
+/// Probe session end, seconds-of-day IST (15:40), pinned to the canonical
+/// close so it cannot silently drift again.
+const PROBE_SESSION_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60;
+const _: () = assert!(
+    PROBE_SESSION_END_SECS_OF_DAY_IST as i64 * 1_000_000_000
+        == tickvault_common::constants::MARKET_CLOSE_IST_NANOS,
+    "chain probe session end drifted from the canonical constant"
+);
 
 /// The out-of-hours caveat prefixed to a NON-passing probe verdict when
 /// the probe ran outside [`probe_in_session`] — an off-hours miss must
@@ -2943,8 +2955,11 @@ mod tests {
         assert!(!probe_in_session(9 * 3600 + 15 * 60 + 59));
         assert!(probe_in_session(9 * 3600 + 16 * 60));
         assert!(probe_in_session(12 * 3600));
-        assert!(probe_in_session(15 * 3600 + 29 * 60 + 59));
-        assert!(!probe_in_session(15 * 3600 + 30 * 60));
+        // 2026-08-07: upper bound moved 15:30 -> 15:40 (NSE CAS 2026-08-03);
+        // 15:30 is now INSIDE the probe session.
+        assert!(probe_in_session(15 * 3600 + 30 * 60));
+        assert!(probe_in_session(15 * 3600 + 39 * 60 + 59));
+        assert!(!probe_in_session(15 * 3600 + 40 * 60));
         assert!(!probe_in_session(0));
         assert!(!probe_in_session(23 * 3600));
     }
