@@ -206,3 +206,105 @@ The §7 trigger list covers this section. Additionally reinforced on any session
 editing `crates/common/tests/groww_no_mint_guard.rs`, `crates/core/src/auth/totp_generator.rs`,
 `deploy/aws/terraform/*groww*`, or any file containing `key_type`, `token/api/access`,
 `obtain_groww_access_token`, or `GrowwCredentials`.
+
+---
+
+## §9. 2026-08-08 — THE DHAN SHARED-TOKEN CONTRACT (tickvault mints AND publishes)
+
+> **This is the SHIPPED resolution of the §8.0 operator directive.** §8 recorded
+> the goal ("both brokers' TOTP working"); §9 records what actually closes it.
+> **The §8.2 path — teaching tickvault to mint Groww natively — is NOT needed and
+> is DEFERRED**: tickvault's Groww token already works (it reads the Lambda's), and
+> its Dhan token already works (it mints its own). The single real breakage was that
+> tickvault's Dhan token was never SHARED. §8 stays as the recorded authorization
+> and the §8.4 probe remains the gate on any future native Groww mint.
+
+### §9.0 The diagnosis (Verified 2026-08-08)
+
+**"One active token at a time — generating new token invalidates the old one"**
+(`docs/dhan-ref/02-authentication.md:216`). Dhan is single-token PER ACCOUNT.
+
+tickvault mints a Dhan token via TOTP and kept it entirely private — process
+memory (`arc-swap`) plus `/tmp/tv-token-cache` (0600, container-local, wiped on
+container restart). `grep put_parameter` across `crates/core/src/auth/` +
+`dhan_rest_stack.rs` returned **empty**: it never wrote the token back.
+
+So any peer consumer of the same Dhan account had to mint its own — which
+invalidated tickvault's token; tickvault's mid-session watchdog then re-minted,
+invalidating the peer's; repeat. **A flapping re-mint war where last-to-mint wins.**
+Neither side's TOTP was faulty — the ACCOUNT is single-token and had two minters.
+
+**Therefore rotating the TOTP secret fixes nothing** (same account, same limit) and
+would break both sides equally. Recorded because it is the intuitive wrong fix.
+
+### §9.1 The contract (LOCKED) — one minter per broker, the other side reads
+
+| Broker | Minter (exactly one) | Publishes to SSM | tickvault's role |
+|---|---|---|---|
+| Groww | bruteX Lambda (~06:05 IST) | `/tickvault/<env>/groww/access-token` | **reader** (`secret_manager::fetch_groww_access_token`) — never mints (§1–§3 unchanged) |
+| **Dhan** | **tickvault** (TOTP → JWT) | **`/tickvault/prod/dhan/access-token`** | **minter + publisher** (`crates/core/src/auth/dhan_token_publisher.rs`) |
+
+Perfectly symmetric with the roles reversed. Each broker has exactly ONE minter, so
+there is nothing left to invalidate.
+
+**The parameter name was already reserved and unwired** — `deploy/aws/terraform/variables.tf`
+`dhan_access_token_ssm_param` defaulted to `/tickvault/prod/dhan/access-token` with
+ZERO consumers repo-wide. This section wires the intent that was already recorded.
+
+### §9.2 Mechanical contract
+
+| Aspect | Locked value |
+|---|---|
+| Write site | `crates/core/src/auth/dhan_token_publisher.rs` — the ONLY SSM write in the auth tree |
+| Read-only pin PRESERVED | `secret_manager.rs` stays `put_parameter`-free (`groww_no_mint_guard.rs:129` + the new `dhan_token_publish_guard.rs::secret_manager_stays_read_only`) |
+| Trigger | after EVERY successful mint AND renewal, paired 1:1 with the existing crash-cache save |
+| Execution | **spawned, never awaited** — a slow/hanging SSM call can never delay a mint or stall the Step-6 boot deadline |
+| Failure policy | **fail-soft**: no panic, no retry loop, coded `error!` + `tv_dhan_token_publish_total{outcome}`; tickvault's own auth is unaffected (token is in memory) |
+| Secrecy | `Secret<String>`; written as `SecureString`; the VALUE never reaches a log line (ratcheted) |
+| IAM | **NO grant change needed (Verified 2026-08-08).** The instance role ALREADY holds `ssm:PutParameter` on `arn:aws:ssm:<region>:*:parameter/tickvault/<env>/*` (`main.tf`, granted for the dual-instance lock), which covers this parameter. No KMS grant either — it is a SecureString under the DEFAULT `aws/ssm` key; the existing `kms:Decrypt` statement is Groww-specific (that param uses the customer-managed `alias/tickvault-groww` CMK owned by bruteX). Only a comment was added recording that `PutParameter` is now load-bearing for TWO callers, so a future least-privilege narrowing checks both |
+| Ratchet | `crates/core/tests/dhan_token_publish_guard.rs` (8 build-failing tests) |
+
+### §9.3 What a PR that violates §9 looks like (REJECT)
+
+- Removes the publish from either mint site, or lets the publish/cache-save pair drift.
+- Awaits the publish on the mint path (re-introduces a boot-stall surface).
+- Moves the SSM write into `secret_manager.rs` (breaks the read-only pin).
+- Logs the token value, or adds a second `expose_secret()` in the publisher.
+- Points the publish at the Groww service segment (the secret NAME is identical —
+  `access-token` — so only the service segment prevents overwriting the Groww token
+  and 401-ing the Groww REST legs).
+- Broadens the IAM grant beyond that single parameter ARN.
+- Adds a SECOND Dhan minter anywhere (that is the exact defect this section closes).
+
+### §9.4 Honest envelope (mandatory per operator-charter §F)
+
+> "100% inside the tested envelope, with ratcheted regression coverage: the publish is
+> fail-soft BY CONSTRUCTION (spawned, never awaited, no panic path — all pinned), the
+> token value never reaches a log (pinned), `secret_manager.rs` stays read-only (pinned
+> twice), and both mint sites publish (pinned). **NOT claimed:** that any peer actually
+> reads it — that is an IAM grant plus a code change on the PEER side, outside this
+> repo; this removes the peer's REASON to mint, it cannot force the peer to stop. **NOT
+> claimed:** live SSM write behaviour — CI has no AWS credentials, so the first prod
+> boot plus an operator `aws ssm get-parameter --name /tickvault/prod/dhan/access-token`
+> is the real proof. **NOT claimed:** that Groww native TOTP now exists in tickvault —
+> it does not (§8 defers it; tickvault reads the Lambda's Groww token as before)."
+
+### §9.5 Auto-driver / Insta-reel explanation
+
+> Sir, the Dhan fridge accepts only ONE key at a time — cut a second key and the first
+> one stops working. Our shop cuts a Dhan key every morning and kept it in its own
+> pocket. So when the neighbour cut his own Dhan key, ours died; our boy noticed and
+> re-cut, which killed the neighbour's; round and round all day. Nobody's key-cutting
+> was faulty — the fridge simply allows one key. Fix: our shop keeps cutting the Dhan
+> key (it is good at it) and now **drops a copy in the shared locker** — exactly what
+> head office already does for the Groww fridge. The neighbour takes the copy instead
+> of cutting, so nothing ever kills anything again. And note: getting a NEW key blank
+> would not have helped — same fridge, same one-key rule.
+
+### §9.6 Trigger / auto-load
+
+The §7 trigger list applies. Additionally reinforced on any session editing
+`crates/core/src/auth/dhan_token_publisher.rs`, `crates/core/src/auth/token_manager.rs`,
+`crates/core/tests/dhan_token_publish_guard.rs`, or any file containing
+`DHAN_ACCESS_TOKEN_SECRET`, `tv_dhan_token_publish_total`, or
+`dhan_access_token_ssm_param`.
