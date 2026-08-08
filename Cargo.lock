@@ -4383,7 +4383,6 @@ dependencies = [
  "loom",
  "memmap2",
  "metrics",
- "papaya",
  "proptest",
  "reqwest",
  "rkyv",

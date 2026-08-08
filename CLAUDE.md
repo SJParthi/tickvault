@@ -127,15 +127,46 @@ crates/
 
 ### crates/storage — Persistence Layer
 
+> **Corrected 2026-08-08:** all 7 rows this table previously carried
+> (`tick_persistence.rs`, `candle_persistence.rs`, `instrument_persistence.rs`,
+> `calendar_persistence.rs`, `materialized_views.rs`, `deep_depth_persistence.rs`,
+> `indicator_snapshot_persistence.rs`) named files that **do not exist** — the tick-chain
+> modules were deleted in the 2026-07-17 stage-2 dead-WS sweep (PR #1631, recorded in
+> `quality/crate-coverage-thresholds.toml`), and the depth/indicator/materialized-view
+> writers went with the earlier live-feed retirements. The old table also advertised a
+> "zero-alloc hot path" tick ILP writer, which no longer exists in any form (live
+> market-data feeds retired 2026-07-13/15) — so it misdescribed the architecture, not just
+> the paths. Rows below are the real modules; descriptions are taken from each module's own
+> `//!` header. Ratcheted by
+> `crates/common/tests/claude_md_codebase_map_guard.rs`.
+
 | File | Contains |
 |------|----------|
-| `tick_persistence.rs` | QuestDB ILP writer (zero-alloc hot path) |
-| `candle_persistence.rs` | Candle storage with O(1) dedup |
-| `instrument_persistence.rs` | Instrument master persistence |
-| `calendar_persistence.rs` | Trading calendar storage |
-| `materialized_views.rs` | QuestDB materialized view DDL |
-| `deep_depth_persistence.rs` | 20/200-level depth ILP writer to `deep_market_depth` table |
-| `indicator_snapshot_persistence.rs` | Indicator snapshot ILP writer |
+| `seal_absorption.rs` | Sealed-candle 3-tier absorption pipeline (ring → spill → DLQ) |
+| `seal_spill.rs` | Sealed-candle disk-spill primitive (NDJSON) |
+| `seal_dlq.rs` | Sealed-candle NDJSON dead-letter queue |
+| `seal_writer_loop.rs` / `seal_writer_task.rs` / `seal_writer_runner.rs` | Sealed-candle writer tokio loop + task wiring |
+| `ws_frame_spill.rs` | Capture-at-receipt WAL — raw frame appended BEFORE parse/broadcast (feed-parameterized) |
+| `spot_1m_rest_persistence.rs` | `spot_1m_rest` table — per-minute spot 1m REST pipeline |
+| `option_chain_1m_persistence.rs` | `option_chain_1m` table — per-minute option-chain REST pipeline |
+| `option_contract_1m_rest_persistence.rs` | `option_contract_1m_rest` table — per-contract 1m candle leg |
+| `rest_fetch_audit_persistence.rs` | `rest_fetch_audit` table — per-fetch forensics for the REST legs |
+| `instrument_lifecycle_persistence.rs` | `instrument_lifecycle` + `instrument_lifecycle_audit` (SEBI never-delete) |
+| `order_audit_persistence.rs` | `order_audit` table — SEBI 5-year order-lifecycle forensics |
+| `order_update_events_persistence.rs` / `position_update_events_persistence.rs` | Broker order/position push events (paper mode) |
+| `order_leg_pnl_persistence.rs` / `pnl_audit_persistence.rs` / `cross_fill_audit_persistence.rs` | Order-leg P&L + P&L audit + cross-fill forensics |
+| `ws_event_audit_persistence.rs` | `ws_event_audit` table — WebSocket lifecycle audit (AUDIT-WS-01) |
+| `partition_manager.rs` / `partition_archive.rs` | QuestDB partition lifecycle + archive→verify→drop retention (S3 cold) |
+| `questdb_health.rs` | QuestDB health poller |
+| `console_views.rs` | Analyst console views — `ticks_named` + `candles_named` |
+| `feed_scoreboard_persistence.rs` / `feed_episode_audit_persistence.rs` | Daily feed scoreboard + feed-episode audit tables |
+| `shadow_candle_writer.rs` / `shadow_persistence.rs` / `shadow_seal_columns.rs` | Shadow candle-engine ILP append path |
+| `brutex_crossverify_persistence.rs` / `spot_crossverify_persistence.rs` | Cross-verification audit tables |
+| `tf_consistency_audit_persistence.rs` | Timeframe-consistency audit table |
+| `index_constituency_persistence.rs` | `index_constituency` table (SEBI point-in-time) |
+| `lifecycle_reconciler.rs` | Pure `classify_transition` — lifecycle state-transition classification |
+| `disk_health_watcher.rs` / `oom_monitor.rs` / `resource_monitor.rs` / `wal_suspension_watcher.rs` | Host + QuestDB resource watchdogs |
+| `boot_probe.rs` / `http_client.rs` | Boot-time QuestDB probe + shared HTTP client |
 
 ### crates/api — HTTP Server (12 routes)
 

@@ -204,7 +204,12 @@ fn test_stress_concurrent_registry_access() {
                 let mut found = 0_u64;
                 for i in 0..100_000_u32 {
                     let security_id = 50000 + u64::from((i + thread_idx * 12345) % 5000);
-                    if reg.get(security_id).is_some() {
+                    // 2026-08-08: id-only `get()` deleted (I-P1-11 lossy accessor);
+                    // these fixtures are all NseFno (see the builder above).
+                    if reg
+                        .get_with_segment(security_id, ExchangeSegment::NseFno)
+                        .is_some()
+                    {
                         found += 1;
                     }
                 }
