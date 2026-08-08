@@ -67,3 +67,142 @@ Any such PR MUST be rejected in review even if the operator approves verbally �
 ## §7. Trigger / auto-load
 
 Always loaded. Reinforced on any session editing `crates/core/src/feed/groww/auth.rs`, `crates/core/src/auth/secret_manager.rs`, `crates/app/src/groww_sidecar_supervisor.rs`, `scripts/groww-sidecar/*`, `scripts/aws-seed-ssm-parameters.sh`, or any file containing `groww-token-minter`, `GROWW_SSM_TOKEN_PARAM`, `GROWW_ACCESS_TOKEN_SECRET`, or `fetch_groww_access_token`.
+
+---
+
+## §8. 2026-08-08 — OPERATOR SCOPE CHANGE: tickvault to mint Groww via TOTP (native, both brokers self-sufficient)
+
+> **This section SUPERSEDES the §1/§2/§3 consumer-only contract** for the mint
+> capability, per the dated operator directive below. Sections §1-§7 are retained
+> as the 2026-07-02 historical record (house convention: annotate, never rewrite).
+> **Execution is GATED on the §8.4 probe** — the authorization is recorded here
+> FIRST (rule-file-first law), the code lands only after §8.4 returns a verdict
+> and the companion plan is operator-APPROVED (design-first wall).
+
+### §8.0 The verbatim operator demands (preserve EXACTLY, typos + expletives included)
+
+**Quote 1 (2026-08-08):**
+> "reoslve the dhan issue bro so both groww and dhan totp shdou lw ork rihg t bro am i irght dude?"
+
+**Quote 2 (2026-08-08, same session — the scope correction):**
+> "forget abotu brutex mtoherfucekr i asked you to make it dhan and gorww broekr totp bro okay?"
+
+**Quote 3 (2026-08-08, same session):**
+> "what si the fuckign issue ddue how shdou lw e reoslve both vendors totp issue bro okay?"
+
+Quote 2 explicitly withdraws the brutex-sharing framing an earlier turn of that
+session had (wrongly) assumed. The operator's scope is: **tickvault performs TOTP
+for BOTH brokers itself** — Dhan (already does) and Groww (does not).
+
+### §8.1 The measured starting state (Verified 2026-08-08, in source)
+
+| Broker | TOTP in tickvault | Evidence |
+|---|---|---|
+| **Dhan** | ✅ **PRESENT AND WORKING** | `crates/core/src/auth/totp_generator.rs`; `token_manager.rs:34` `use super::totp_generator::generate_totp_code`, with a TOTP retry ladder (`:323` `totp_retries`, `:362` `is_totp_error`, `TOTP_MAX_RETRIES`). Mint = `TokenManager::initialize` (SSM creds -> TOTP -> JWT), spawned UNCONDITIONALLY by `dhan_rest_stack` and consumed at fire time by `DhanCadenceExecutor`. |
+| **Groww** | ❌ **ABSENT** | Zero TOTP tokens anywhere under `crates/core/src/feed/groww/` or `crates/trading/src/oms/groww/`. tickvault only READS a pre-minted token: `secret_manager.rs:241 fetch_groww_access_token`. The mint path was DELETED 2026-07-02 by §2 of this file. |
+
+**So "the Dhan issue" is not a Dhan defect — Dhan is the half that already works.
+The gap is Groww.** (An earlier turn of the 2026-08-08 session mis-scoped this as a
+brutex token-sharing problem; that reading is withdrawn by Quote 2 and recorded here
+only so the correction is auditable.)
+
+### §8.2 Groww HAS a TOTP mint flow (Verified — this is achievable)
+
+`docs/groww-ref/17-token-lifecycle.md` §1 documents **three** Groww auth approaches;
+the 3rd is the **TOTP Flow**: `POST /v1/token/api/access` with `key_type: "totp"`,
+using API Key + TOTP code. This is exactly what the bruteX Lambda already does
+("mints via TOTP", §1 of this file), so the flow is proven in production — just not
+from tickvault.
+
+Note the documented contradiction (`17-token-lifecycle.md` §5): the REST page marks
+the TOTP flow *"Requires daily approval on Groww Cloud Api keys page"* while the
+python-sdk page marks it *"(Uses TOTP token and TOTP QR code — **No Expiry**)"*.
+Unresolved; §8.4 probes it.
+
+### §8.3 The four real blockers (one is an IAM hard-stop, not a code gap)
+
+| # | Blocker | Nature | Resolution |
+|---|---|---|---|
+| 1 | **IAM hard-stop** — tickvault's reader role (`groww-token-minter-reader-tickvault`) is scoped to `ssm:GetParameter` on the **access-token param ONLY** + `kms:Decrypt`. The `groww/api-key` + `groww/totp-secret` params are **Lambda-only read** (§1). | **Runtime AccessDenied**, not a code gap — perfect TOTP code would still fail. | terraform/IAM grant: add the 2 credential params to tickvault's reader policy. |
+| 2 | **This file's own §1/§3** — verbatim: *"NEVER mint a Groww access token from TickVault code, in any environment, ever."* | Governance | THIS §8 is that override, with the §8.0 dated quotes. |
+| 3 | **6 build-failing tests** — `crates/common/tests/groww_no_mint_guard.rs` bans *"any Groww TOTP computation"*, the `obtain_groww_access_token` / `fetch_groww_credentials` / `GrowwCredentials` surface, credential param paths, and `put_parameter` in `secret_manager.rs` (`:129`). | Ratchet | Re-bless in the SAME PR as the code, with this §8 cited as authority. The `secret_manager.rs` read-only pin should be KEPT (put the mint in its own module). |
+| 4 | **Deleted code** — the Groww mint path existed pre-2026-07-02. | Recovery | Restore from git history (pre-`dd7eaa5e^` lineage), then re-harden. |
+
+### §8.4 THE GATING PROBE — Groww one-active-token semantics (UNKNOWN, must run FIRST)
+
+**Why this gates everything:** if Groww invalidates the previous token on each mint
+(as **Dhan explicitly does** — `docs/dhan-ref/02-authentication.md:216`), then tickvault
+minting its own Groww token would kill the bruteX Lambda's token and vice-versa — a
+flapping token war that breaks the Groww REST legs.
+
+**The evidence LEANS SAFE but is explicitly UNVERIFIED.**
+`docs/groww-ref/17-token-lifecycle.md:122` (Unknown #2) records verbatim:
+
+> "**One-active-token semantics** | Nothing in the captured docs or SDK states whether
+> minting a new access token invalidates the previous one (contrast: Dhan documents
+> one-active-token explicitly). The web UI supports multiple named tokens ("create,
+> revoke and manage all your tokens"); `sessionName`/`isActive` in §4 hint at
+> multi-session support. Empirically BruteX + TickVault concurrently USE one shared
+> minted token without conflict. | **Unknown** — probe: mint twice in succession;
+> test whether token #1 still authenticates."
+
+**The probe (exactly as the doc names it), OFF-HOURS, operator-triggered:**
+
+1. Mint Groww token **A** via the TOTP flow. Record it.
+2. Mint Groww token **B** via the same flow. Record it.
+3. Authenticate a cheap read with **A**.
+4. **A still works => Groww is multi-token => tickvault may mint safely alongside the
+   Lambda.** **A is dead => one-active-token => tickvault must NOT mint concurrently**;
+   fall back to mint-only-when-SSM-token-is-stale/absent, or retire the Lambda.
+
+Run OUTSIDE market hours, never against the in-session token. Until the verdict is
+recorded HERE, **no Groww mint code may ship** (the §8.5 REJECT rows bind).
+
+### §8.5 What a PR that violates THIS §8 looks like (REJECT)
+
+- Ships ANY Groww mint code before the §8.4 probe verdict is recorded in this file.
+- Grants tickvault read on the Groww credential params without the §8.4 verdict
+  (the IAM grant is the point of no return — it makes an accidental mint possible).
+- Puts the mint's SSM write (if any) into `secret_manager.rs` — that module's
+  read-only pin (`groww_no_mint_guard.rs:129`) STAYS; use a separate module.
+- Weakens the Groww mint's TOTP/credential hygiene below the Dhan bar: credentials
+  read FRESH from SSM per mint, held only as `Secret<String>`, NEVER logged, never in
+  a URL, never written to a local `.env`/keychain.
+- Removes the SSM-read fallback path (`fetch_groww_access_token`) — after §8 tickvault
+  should PREFER the shared minted token and mint only as the documented fallback,
+  so a healthy Lambda day costs zero extra mints.
+- Leaves the bruteX Lambda and a tickvault mint racing without the §8.4 verdict
+  proving that is safe.
+
+Any such PR MUST be rejected in review even if the operator approves verbally — the
+§8.4 verdict must be recorded HERE first.
+
+### §8.6 Honest envelope (mandatory per operator-charter §F)
+
+> "Recorded, not claimed: Dhan TOTP is Verified working in tickvault today (source
+> evidence, §8.1). Groww TOTP is Verified ABSENT and Verified ACHIEVABLE (the flow
+> exists and the Lambda proves it in prod, §8.2). NOT claimed: that tickvault can mint
+> Groww today — it CANNOT, by IAM (§8.3 #1), and that is a runtime denial no code fixes.
+> NOT claimed: that two concurrent Groww minters are safe — that is **Unknown**, leaning
+> safe on multi-named-token evidence, and §8.4 is the probe that settles it. NOT claimed:
+> the TOTP flow's true expiry — the REST page ('daily approval') and the python-sdk page
+> ('No Expiry') contradict each other and §8.4 probes it. No code ships on an Unknown."
+
+### §8.7 Auto-driver / Insta-reel explanation
+
+> Sir, our shop cuts its OWN key for fridge Dhan every morning — that half already
+> works perfectly. For fridge Groww we never learned to cut a key; we just borrow head
+> office's. You want our boy able to cut BOTH keys himself. Two problems: (1) the Groww
+> key-cutting machine is LOCKED to him — he isn't allowed to open the drawer with the
+> Groww key-blank, so teaching him is useless until you unlock that drawer; and (2) for
+> the Dhan fridge we KNOW a second key kills the first, but for Groww nobody has ever
+> checked — and the signs look good (that fridge seems to accept several named keys at
+> once). So: cut two Groww keys back to back, then test the FIRST one. Still opens? Our
+> boy can cut his own key safely. Dead? Then only one of us cuts Groww keys, ever.
+
+### §8.8 Trigger / auto-load
+
+The §7 trigger list covers this section. Additionally reinforced on any session
+editing `crates/common/tests/groww_no_mint_guard.rs`, `crates/core/src/auth/totp_generator.rs`,
+`deploy/aws/terraform/*groww*`, or any file containing `key_type`, `token/api/access`,
+`obtain_groww_access_token`, or `GrowwCredentials`.
