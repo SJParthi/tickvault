@@ -1,6 +1,6 @@
 # Implementation Plan: Publish the minted Dhan access token to SSM (shared-token parity with Groww)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-08-08
 **Approved by:** Parthiban (operator) — 2026-08-08, verbatim: *"yes go ahead mtoherfucker okay? i jsut ened the fuckign workign solution"* + *"whichever is recommended go ahead dude okay?"*
 **Authority:** `.claude/rules/project/groww-shared-token-minter-2026-07-02.md` §9 (this PR adds it)
