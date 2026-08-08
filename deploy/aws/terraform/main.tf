@@ -196,6 +196,20 @@ resource "aws_iam_role_policy" "tv_instance" {
         Action = [
           "ssm:GetParameter",
           "ssm:GetParameters",
+          # PutParameter is load-bearing for TWO things — do not narrow it
+          # without checking both:
+          #   1. the dual-instance lock (`crates/core/src/instance_lock.rs`);
+          #   2. the Dhan access-token publish (operator 2026-08-08,
+          #      `crates/core/src/auth/dhan_token_publisher.rs`) — tickvault is
+          #      the sole Dhan minter and publishes the token to
+          #      /tickvault/<env>/dhan/access-token so peer consumers READ it
+          #      instead of minting. Dhan allows ONE active token per account,
+          #      so a second minter would invalidate ours and start a re-mint
+          #      war. Contract: groww-shared-token-minter-2026-07-02.md §9.
+          # No extra KMS grant is needed for that param: it is written as a
+          # SecureString under the DEFAULT aws/ssm key. (The kms:Decrypt
+          # statement below is specific to the Groww param, which uses the
+          # customer-managed alias/tickvault-groww CMK owned by bruteX.)
           "ssm:PutParameter",
           # DeleteParameter needed for graceful release of the
           # dual-instance lock at shutdown — see PR #764
