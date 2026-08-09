@@ -61,6 +61,66 @@ pub struct IndicatorEngine {
     wilder_factor: f64,
     /// Pre-computed Wilder factor for ADX smoothing.
     adx_wilder_factor: f64,
+    /// Count of ticks REFUSED at ingest by [`tick_prices_are_sane`].
+    ///
+    /// Drives the throttled `warn!` in [`IndicatorEngine::refuse_tick`] — a
+    /// line is emitted only on powers of two (1, 2, 4, 8 …), so even a
+    /// permanently-poisoned upstream is bounded to ≤64 log lines for the
+    /// process lifetime while `tv_indicator_tick_rejected_total` still counts
+    /// every single one.
+    rejected_ticks: u64,
+}
+
+/// Validates the widened price triple BEFORE any indicator state is touched.
+///
+/// # Why this exists (the bug it closes, 2026-08-09)
+///
+/// [`tickvault_common::price_precision::f32_to_f64_clean`] deliberately passes
+/// `NaN` / `±Inf` straight through, and the Dhan quote parser is PROVEN to emit
+/// `NaN` OHLC (`crates/core/src/parser/quote.rs`
+/// `test_parse_quote_nan_ohlc_parses_without_panic`) and negative LTP
+/// (`test_parse_quote_negative_ltp_parses_without_panic`). `NaN` is ABSORBING
+/// under arithmetic, so ONE such packet permanently poisoned the
+/// Wilder-smoothed accumulators — `atr`, `adx_tr_smooth`, `adx_plus_dm_smooth`,
+/// `adx_minus_dm_smooth`, `adx_value`, `vwap_cumulative_pv`,
+/// `vwap_cumulative_vol`, `bb_mean`, `bb_m2`, `sma_running_sum`, `ema_*` — for
+/// the process lifetime. `IndicatorSnapshot::sanitize_nan_inf` then masked the
+/// SNAPSHOT to `0.0`, so the strategy read plausible zeros instead of an error,
+/// and neither `reset_vwap_daily` nor `reset_bollinger_daily` clears
+/// `atr` / `adx_*` / `supertrend_*` / `prev_*` — so the daily reset never healed
+/// it. Fail closed at ingest is the only place that cannot be poisoned.
+///
+/// # The rule
+///
+/// | field | accepted |
+/// |---|---|
+/// | `price` (LTP) | finite AND `> 0.0` |
+/// | `high` / `low` | finite AND `>= 0.0` |
+///
+/// # Why `high`/`low` allow exactly `0.0` (deliberate, not an oversight)
+///
+/// A **Ticker** packet carries only LTP + LTT: `parse_ticker_packet` builds its
+/// `ParsedTick` with `..Default::default()`, so `day_high`/`day_low` are `0.0`
+/// by construction, and `ParsedTick`'s own field docs say "0.0 for Ticker".
+/// `0.0` is therefore the documented ABSENT sentinel, not a corrupt price.
+/// Rejecting it would silently drop every Ticker-mode instrument — precisely
+/// the total-silent-no-op class that §28.2 was written to eliminate. A NEGATIVE
+/// high/low has no legitimate producer and IS rejected.
+///
+/// `is_finite()` is load-bearing and NOT redundant with the comparisons:
+/// `NaN > 0.0` is already `false`, but `f64::INFINITY > 0.0` is `true`.
+///
+/// # Performance
+/// O(1), zero allocation — six register compares, no branch on heap data.
+#[inline(always)]
+#[must_use]
+fn tick_prices_are_sane(price: f64, high: f64, low: f64) -> bool {
+    price.is_finite()
+        && price > 0.0
+        && high.is_finite()
+        && high >= 0.0
+        && low.is_finite()
+        && low >= 0.0
 }
 
 impl IndicatorEngine {
@@ -81,7 +141,61 @@ impl IndicatorEngine {
             alpha_signal: IndicatorParams::ema_alpha(params.macd_signal_period),
             wilder_factor: IndicatorParams::wilder_factor(params.rsi_period),
             adx_wilder_factor: IndicatorParams::wilder_factor(params.adx_period),
+            rejected_ticks: 0,
             params,
+        }
+    }
+
+    /// Cold path: record + report a tick refused by [`tick_prices_are_sane`].
+    ///
+    /// Kept `#[cold]` + `#[inline(never)]` so the refusal branch contributes
+    /// nothing but a not-taken jump to the hot path's instruction footprint.
+    ///
+    /// Emits NO `ErrorCode` — there is no variant covering indicator-ingest
+    /// validation, and inventing one would require the `error_code_*` cross-ref
+    /// rule-file edits that are out of this change's scope. The counter is the
+    /// machine signal; the throttled `warn!` is the human one.
+    ///
+    /// The returned snapshot is `is_warm: false`, which the strategy evaluator
+    /// treats as an unconditional `Hold` — fail closed, never a trade on
+    /// garbage. `slot` carries the instrument's REAL dense slot when one is
+    /// already allocated, so nothing downstream mis-indexes slot 0.
+    #[cold]
+    #[inline(never)]
+    fn refuse_tick(
+        &mut self,
+        tick: &ParsedTick,
+        price: f64,
+        high: f64,
+        low: f64,
+    ) -> IndicatorSnapshot {
+        metrics::counter!("tv_indicator_tick_rejected_total").increment(1);
+        self.rejected_ticks = self.rejected_ticks.saturating_add(1);
+        // Powers of two only (1, 2, 4, 8 …): a permanently-broken upstream can
+        // never amplify into a log flood, yet the first occurrence is always
+        // reported. `is_power_of_two()` is already true for 1.
+        if self.rejected_ticks.is_power_of_two() {
+            tracing::warn!(
+                security_id = tick.security_id,
+                last_traded_price = price,
+                day_high = high,
+                day_low = low,
+                rejected_total = self.rejected_ticks,
+                "indicator engine REFUSED a tick carrying a non-finite or \
+                 non-positive price — indicator state was left UNTOUCHED (a NaN \
+                 here would permanently poison the Wilder-smoothed ATR/ADX/VWAP \
+                 accumulators, and the daily reset does not clear them). This \
+                 instrument produces no signal until clean ticks resume; watch \
+                 tv_indicator_tick_rejected_total"
+            );
+        }
+        // APPROVED: a dense slot is always < MAX_INDICATOR_INSTRUMENTS (25_000).
+        #[allow(clippy::cast_possible_truncation)]
+        let slot = self.slot_lookup(tick.security_id).unwrap_or(0) as u32;
+        IndicatorSnapshot {
+            security_id: tick.security_id,
+            slot,
+            ..Default::default()
         }
     }
 
@@ -178,14 +292,6 @@ impl IndicatorEngine {
     #[inline(always)]
     #[allow(clippy::arithmetic_side_effects)] // APPROVED: all arithmetic is bounded f64 operations with finite checks
     pub fn update(&mut self, tick: &ParsedTick) -> IndicatorSnapshot {
-        let Some(sid) = self.slot_for(tick.security_id) else {
-            return IndicatorSnapshot {
-                security_id: tick.security_id,
-                ..Default::default()
-            };
-        };
-
-        let state = &mut self.states[sid];
         // Operator-spotted 2026-05-25: f64::from(f32) on price fields
         // widens IEEE-754 (e.g. 23925.65_f32 → 23925.650390625_f64).
         // Every SMA/EMA/RSI/MACD/BB derived from these inputs inherits
@@ -196,8 +302,37 @@ impl IndicatorEngine {
         let price = tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price);
         let high = tickvault_common::price_precision::f32_to_f64_clean(tick.day_high);
         let low = tickvault_common::price_precision::f32_to_f64_clean(tick.day_low);
-        // u32→f64 is exact (no IEEE-754 widening); kept as f64::from.
+
+        // ---- INGEST GATE (fail closed, BEFORE any state mutation) ----
+        // `f32_to_f64_clean` passes NaN/±Inf straight through by design, and the
+        // Dhan quote parser provably emits both NaN OHLC and negative LTP. NaN
+        // is ABSORBING, so a single bad packet permanently poisons every
+        // Wilder-smoothed accumulator below and the daily resets do not clear
+        // them. Refuse the tick outright — see `tick_prices_are_sane`.
+        //
+        // This runs BEFORE `slot_for` on purpose: an instrument that only ever
+        // emits garbage must not burn one of the MAX_INDICATOR_INSTRUMENTS
+        // dense slots.
+        if !tick_prices_are_sane(price, high, low) {
+            return self.refuse_tick(tick, price, high, low);
+        }
+
+        let Some(sid) = self.slot_for(tick.security_id) else {
+            return IndicatorSnapshot {
+                security_id: tick.security_id,
+                ..Default::default()
+            };
+        };
+
+        let state = &mut self.states[sid];
+        // u32→f64 is exact (no IEEE-754 widening); kept as f64::from — and it
+        // can never be non-finite or negative, so it needs no ingest check.
         let volume = f64::from(tick.volume);
+        // `close` is snapshot-only (`previous_close`) and never mutates state,
+        // so it is deliberately NOT part of the gate: `ParsedTick` documents
+        // `day_close = 0.0` for Ticker packets, and `warmup_from_candles`
+        // hard-codes `day_close: 0.0`. A non-finite close is still clamped by
+        // `sanitize_nan_inf` at the snapshot boundary below.
         let close = tickvault_common::price_precision::f32_to_f64_clean(tick.day_close);
 
         // Track warmup
@@ -503,10 +638,38 @@ impl IndicatorEngine {
         }
 
         let mut processed = 0_usize;
+        let mut rejected = 0_u64;
 
         for &(open, high, low, close, volume) in candles {
-            // Skip invalid candles
-            if !close.is_finite() || close <= 0.0 {
+            // ---- CANDLE GATE (fail closed) ----
+            // The pre-2026-08-09 check validated `close` ONLY, in f64, so:
+            //   * a NaN `high`/`low`/`open` sailed through and poisoned the
+            //     Wilder accumulators exactly like a NaN live tick, and
+            //   * a large-but-finite f64 (e.g. 1e300) passed `close.is_finite()`
+            //     and then OVERFLOWED to `+inf` in the `close as f32` cast
+            //     below — non-finite state from an input that "looked" valid.
+            // Validating the CONVERTED f32 closes both holes at once: `f64 as
+            // f32` maps NaN→NaN and any out-of-range magnitude→±inf, so a
+            // single `is_finite()` on the result covers non-finite inputs AND
+            // cast overflow.
+            let close_f32 = close as f32;
+            let high_f32 = high as f32;
+            let low_f32 = low as f32;
+            let open_f32 = open as f32;
+            let candle_ok = close_f32.is_finite()
+                && close_f32 > 0.0
+                && high_f32.is_finite()
+                && high_f32 >= 0.0
+                && low_f32.is_finite()
+                && low_f32 >= 0.0
+                && open_f32.is_finite()
+                && open_f32 >= 0.0
+                // `volume as u32` saturates: NaN→0 and a negative→0 would both
+                // be silently WRONG rather than loud, so gate them here.
+                && volume.is_finite()
+                && volume >= 0.0;
+            if !candle_ok {
+                rejected = rejected.saturating_add(1);
                 continue;
             }
 
@@ -514,13 +677,13 @@ impl IndicatorEngine {
             let tick = ParsedTick {
                 security_id,
                 exchange_segment_code: 0,
-                last_traded_price: close as f32,
-                day_high: high as f32,
-                day_low: low as f32,
-                day_open: open as f32,
+                last_traded_price: close_f32,
+                day_high: high_f32,
+                day_low: low_f32,
+                day_open: open_f32,
                 day_close: 0.0, // Not used for indicator calculation
                 volume: volume as u32,
-                average_traded_price: close as f32,
+                average_traded_price: close_f32,
                 ..ParsedTick::default()
             };
 
@@ -529,6 +692,24 @@ impl IndicatorEngine {
             processed = processed.saturating_add(1);
         }
         // O(1) EXEMPT: end
+
+        if rejected > 0 {
+            // Cold path (startup), fired at most once per warmup call — one
+            // aggregate line, never per-candle, so a wholly-corrupt REST
+            // response cannot flood the boot log.
+            metrics::counter!("tv_indicator_warmup_candle_rejected_total").increment(rejected);
+            tracing::warn!(
+                security_id,
+                rejected,
+                processed,
+                total = candles.len(),
+                "indicator warmup REFUSED candles carrying a non-finite or \
+                 non-positive value (or one that overflows the f32 tick wire \
+                 format) — they were skipped, not fed into indicator state; if \
+                 `processed` is far below `total` this instrument may never \
+                 reach warmup and its strategy will never fire"
+            );
+        }
 
         processed
     }
@@ -1658,5 +1839,454 @@ mod tests {
             last_snap.supertrend > 0.0,
             "Supertrend value must be positive"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // NaN / Inf / non-positive INGEST GATE  (bug fixed 2026-08-09)
+    //
+    // `f32_to_f64_clean` passes NaN/Inf through by design and the Dhan quote
+    // parser provably emits NaN OHLC + negative LTP. NaN is ABSORBING, so one
+    // bad packet used to poison atr / adx_* / vwap_* / bb_* forever, while
+    // `sanitize_nan_inf` masked the SNAPSHOT to plausible 0.0 and the daily
+    // resets never cleared the poisoned fields.
+    // -----------------------------------------------------------------------
+
+    /// Every state field the Wilder/cumulative math can permanently absorb a
+    /// NaN into. `sanitize_nan_inf` masks the SNAPSHOT, so the only honest
+    /// assertion is against the STATE itself.
+    fn assert_state_finite(engine: &mut IndicatorEngine, sid: u64, ctx: &str) {
+        let s = engine.state_mut_for_test(sid);
+        for (name, v) in [
+            ("ema_fast", s.ema_fast),
+            ("ema_slow", s.ema_slow),
+            ("macd_signal_ema", s.macd_signal_ema),
+            ("rsi_avg_gain", s.rsi_avg_gain),
+            ("rsi_avg_loss", s.rsi_avg_loss),
+            ("atr", s.atr),
+            ("adx_plus_dm_smooth", s.adx_plus_dm_smooth),
+            ("adx_minus_dm_smooth", s.adx_minus_dm_smooth),
+            ("adx_tr_smooth", s.adx_tr_smooth),
+            ("adx_value", s.adx_value),
+            ("vwap_cumulative_pv", s.vwap_cumulative_pv),
+            ("vwap_cumulative_vol", s.vwap_cumulative_vol),
+            ("bb_mean", s.bb_mean),
+            ("bb_m2", s.bb_m2),
+            ("sma_running_sum", s.sma_running_sum),
+            ("supertrend_upper", s.supertrend_upper),
+            ("supertrend_lower", s.supertrend_lower),
+            ("prev_close", s.prev_close),
+            ("prev_high", s.prev_high),
+            ("prev_low", s.prev_low),
+        ] {
+            assert!(v.is_finite(), "{ctx}: state.{name} became non-finite ({v})");
+        }
+    }
+
+    // --- the pure gate ---
+
+    #[test]
+    fn test_tick_prices_are_sane_accepts_ordinary_prices() {
+        assert!(tick_prices_are_sane(100.0, 105.0, 95.0));
+        // Ticker packets carry high/low = 0.0 (the documented ABSENT sentinel).
+        assert!(tick_prices_are_sane(100.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_tick_prices_are_sane_rejects_every_poison_shape() {
+        // NaN in any of the three.
+        assert!(!tick_prices_are_sane(f64::NAN, 105.0, 95.0));
+        assert!(!tick_prices_are_sane(100.0, f64::NAN, 95.0));
+        assert!(!tick_prices_are_sane(100.0, 105.0, f64::NAN));
+        // ±Inf in any of the three — `is_finite()` is load-bearing here
+        // because `f64::INFINITY > 0.0` is TRUE.
+        assert!(!tick_prices_are_sane(f64::INFINITY, 105.0, 95.0));
+        assert!(!tick_prices_are_sane(f64::NEG_INFINITY, 105.0, 95.0));
+        assert!(!tick_prices_are_sane(100.0, f64::INFINITY, 95.0));
+        assert!(!tick_prices_are_sane(100.0, 105.0, f64::NEG_INFINITY));
+        // Non-positive LTP (the parser proves -500.0 and 0.0 reach us).
+        assert!(!tick_prices_are_sane(0.0, 105.0, 95.0));
+        assert!(!tick_prices_are_sane(-0.0, 105.0, 95.0));
+        assert!(!tick_prices_are_sane(-500.0, 105.0, 95.0));
+        // Negative high/low has no legitimate producer.
+        assert!(!tick_prices_are_sane(100.0, -1.0, 95.0));
+        assert!(!tick_prices_are_sane(100.0, 105.0, -1.0));
+    }
+
+    // --- update(): rejection is silent-safe, state-preserving, slot-preserving ---
+
+    #[test]
+    fn test_nan_day_high_is_rejected_and_state_untouched() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        engine.update(&make_tick(100, 102.0, 108.0, 96.0, 1000));
+        let good_atr = engine.state_mut_for_test(100).atr;
+        assert!(good_atr > 0.0, "precondition: ATR warmed up");
+
+        let snap = engine.update(&make_tick(100, 103.0, f32::NAN, 97.0, 1000));
+
+        assert!(!snap.is_warm, "a refused tick must be fail-closed (Hold)");
+        assert_eq!(snap.security_id, 100, "id must still round-trip");
+        assert_eq!(
+            engine.state_mut_for_test(100).atr,
+            good_atr,
+            "NaN day_high must leave ATR byte-identical — this is the poison \
+             the pre-2026-08-09 engine absorbed permanently"
+        );
+        assert_state_finite(&mut engine, 100, "after NaN day_high");
+    }
+
+    #[test]
+    fn test_nan_day_low_is_rejected_and_state_untouched() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        engine.update(&make_tick(100, 102.0, 108.0, 96.0, 1000));
+        let before = engine.state_mut_for_test(100).adx_tr_smooth;
+
+        let snap = engine.update(&make_tick(100, 103.0, 109.0, f32::NAN, 1000));
+
+        assert!(!snap.is_warm);
+        assert_eq!(engine.state_mut_for_test(100).adx_tr_smooth, before);
+        assert_state_finite(&mut engine, 100, "after NaN day_low");
+    }
+
+    #[test]
+    fn test_nan_ltp_is_rejected_and_state_untouched() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        let before = engine.state_mut_for_test(100).ema_fast;
+
+        let snap = engine.update(&make_tick(100, f32::NAN, 105.0, 95.0, 1000));
+
+        assert!(!snap.is_warm);
+        assert_eq!(engine.state_mut_for_test(100).ema_fast, before);
+        assert_state_finite(&mut engine, 100, "after NaN ltp");
+    }
+
+    #[test]
+    fn test_infinite_prices_are_rejected() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        engine.update(&make_tick(100, 101.0, 106.0, 96.0, 1000));
+        let before_vwap_pv = engine.state_mut_for_test(100).vwap_cumulative_pv;
+
+        for bad in [
+            make_tick(100, f32::INFINITY, 105.0, 95.0, 1000),
+            make_tick(100, f32::NEG_INFINITY, 105.0, 95.0, 1000),
+            make_tick(100, 102.0, f32::INFINITY, 95.0, 1000),
+            make_tick(100, 102.0, 105.0, f32::NEG_INFINITY, 1000),
+        ] {
+            let snap = engine.update(&bad);
+            assert!(!snap.is_warm, "infinite price must be refused");
+        }
+        assert_eq!(
+            engine.state_mut_for_test(100).vwap_cumulative_pv,
+            before_vwap_pv,
+            "VWAP accumulator is cumulative — an Inf would never wash out"
+        );
+        assert_state_finite(&mut engine, 100, "after Inf burst");
+    }
+
+    #[test]
+    fn test_negative_ltp_is_rejected() {
+        // `parse_quote_packet` accepts -500.0 (proven by its own parser test),
+        // so the engine is the layer that must refuse it.
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        let before = engine.state_mut_for_test(100).ema_fast;
+
+        let snap = engine.update(&make_tick(100, -500.0, 105.0, 95.0, 1000));
+
+        assert!(!snap.is_warm);
+        assert_eq!(engine.state_mut_for_test(100).ema_fast, before);
+        assert!(before > 0.0, "EMA must not have been dragged negative");
+    }
+
+    #[test]
+    fn test_zero_and_negative_zero_ltp_are_rejected() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        let before = engine.state_mut_for_test(100).ema_fast;
+
+        assert!(
+            !engine
+                .update(&make_tick(100, 0.0, 105.0, 95.0, 1000))
+                .is_warm
+        );
+        assert!(
+            !engine
+                .update(&make_tick(100, -0.0, 105.0, 95.0, 1000))
+                .is_warm
+        );
+
+        assert_eq!(engine.state_mut_for_test(100).ema_fast, before);
+        assert_eq!(
+            engine.warmup_count(100),
+            1,
+            "a refused tick must not advance warmup"
+        );
+    }
+
+    #[test]
+    fn test_negative_high_or_low_is_rejected() {
+        let mut engine = default_engine();
+        engine.update(&make_tick(100, 100.0, 105.0, 95.0, 1000));
+        let (high_before, low_before) = {
+            let s = engine.state_mut_for_test(100);
+            (s.prev_high, s.prev_low)
+        };
+        assert_eq!((high_before, low_before), (105.0, 95.0), "precondition");
+
+        // Asserted after EACH bad tick, and on BOTH fields: checking only
+        // `prev_high` after both ticks would pass VACUOUSLY, because a later
+        // tick with a valid high restores it to the original value.
+        engine.update(&make_tick(100, 100.0, -105.0, 95.0, 1000));
+        {
+            let s = engine.state_mut_for_test(100);
+            assert_eq!(s.prev_high, high_before, "negative high must be refused");
+            assert_eq!(s.prev_low, low_before);
+        }
+
+        engine.update(&make_tick(100, 100.0, 105.0, -95.0, 1000));
+        {
+            let s = engine.state_mut_for_test(100);
+            assert_eq!(s.prev_high, high_before);
+            assert_eq!(s.prev_low, low_before, "negative low must be refused");
+        }
+
+        assert_eq!(
+            engine.warmup_count(100),
+            1,
+            "neither refused tick may advance warmup"
+        );
+    }
+
+    #[test]
+    fn test_ticker_mode_zero_high_low_is_still_accepted() {
+        // REGRESSION GUARD for the gate's deliberate carve-out. A Ticker packet
+        // is built with `..Default::default()`, so day_high/day_low are 0.0 —
+        // the documented ABSENT sentinel, not a corrupt price. Rejecting it
+        // would silently drop every Ticker-mode instrument, which is exactly
+        // the total-silent-no-op class §28.2 was written to eliminate.
+        let mut engine = default_engine();
+        let ticker_like = ParsedTick {
+            security_id: 1_u64 << 62,
+            last_traded_price: 250.0,
+            ..Default::default()
+        };
+        let snap = engine.update(&ticker_like);
+        assert_eq!(
+            snap.ema_fast, 250.0,
+            "Ticker-mode tick (high=low=0.0) MUST be processed, not refused"
+        );
+        assert_eq!(engine.allocated_slots(), 1);
+    }
+
+    #[test]
+    fn test_rejected_tick_for_unknown_id_does_not_burn_a_slot() {
+        // The gate runs BEFORE slot_for on purpose: an instrument that only
+        // ever emits garbage must not consume finite slot capacity.
+        let mut engine = default_engine();
+        let snap = engine.update(&make_tick(1_u64 << 62, f32::NAN, 105.0, 95.0, 1000));
+        assert_eq!(snap.security_id, 1_u64 << 62, "id still round-trips");
+        assert_eq!(
+            engine.allocated_slots(),
+            0,
+            "a poison-only instrument must not consume a dense slot"
+        );
+    }
+
+    #[test]
+    fn test_rejected_tick_preserves_the_real_slot_for_a_known_instrument() {
+        // §28.3: the evaluator indexes `states` by snapshot.slot. A refusal
+        // must not hand back slot 0 for an instrument that owns slot 1.
+        let mut engine = default_engine();
+        engine.update(&make_tick(11, 100.0, 105.0, 95.0, 1000));
+        let second = engine.update(&make_tick(22, 100.0, 105.0, 95.0, 1000));
+        assert_eq!(second.slot, 1, "precondition: id 22 owns dense slot 1");
+
+        let snap = engine.update(&make_tick(22, f32::NAN, 105.0, 95.0, 1000));
+        assert_eq!(
+            snap.slot, 1,
+            "refusal must carry the instrument's real slot"
+        );
+        assert!(!snap.is_warm, "and still be fail-closed");
+    }
+
+    // --- the headline regression: survive poison, keep computing ---
+
+    #[test]
+    fn test_prior_good_state_survives_poison_and_next_good_tick_computes() {
+        // The exact scenario the bug produced: a warmed-up instrument takes one
+        // NaN packet mid-session. Before the fix, atr/adx/vwap were absorbed to
+        // NaN forever and every later snapshot was masked to plausible 0.0.
+        let mut engine = default_engine();
+        for i in 0..40_u32 {
+            let p = 100.0 + i as f32;
+            engine.update(&make_tick(7, p, p + 5.0, p - 5.0, 1000));
+        }
+        let clean = engine.update(&make_tick(7, 141.0, 146.0, 136.0, 1000));
+        assert!(clean.is_warm, "precondition: warm");
+        assert!(clean.atr > 0.0 && clean.adx > 0.0 && clean.vwap > 0.0);
+
+        let (atr_before, adx_before, vwap_before) = (clean.atr, clean.adx, clean.vwap);
+
+        // The poison burst: every shape at once.
+        for bad in [
+            make_tick(7, 142.0, f32::NAN, 137.0, 1000),
+            make_tick(7, 142.0, 147.0, f32::NAN, 1000),
+            make_tick(7, f32::NAN, 147.0, 137.0, 1000),
+            make_tick(7, f32::INFINITY, 147.0, 137.0, 1000),
+            make_tick(7, -1.0, 147.0, 137.0, 1000),
+            make_tick(7, 0.0, 147.0, 137.0, 1000),
+        ] {
+            let snap = engine.update(&bad);
+            assert!(!snap.is_warm, "every poison shape must be refused");
+        }
+
+        // State must be byte-identical to the last good tick.
+        assert_state_finite(&mut engine, 7, "after poison burst");
+        assert_eq!(engine.state_mut_for_test(7).atr, atr_before);
+        assert_eq!(engine.state_mut_for_test(7).adx_value, adx_before);
+        assert_eq!(
+            engine.warmup_count(7),
+            41,
+            "refused ticks must not advance warmup"
+        );
+
+        // And the very next GOOD tick must keep computing normally.
+        let resumed = engine.update(&make_tick(7, 143.0, 148.0, 138.0, 1000));
+        assert!(resumed.is_warm, "instrument must still be warm");
+        assert!(
+            resumed.atr.is_finite() && resumed.atr > 0.0,
+            "ATR must resume finite+positive, got {}",
+            resumed.atr
+        );
+        assert!(resumed.adx.is_finite() && resumed.adx > 0.0);
+        assert!(resumed.vwap.is_finite() && resumed.vwap > 0.0);
+        assert!(resumed.ema_fast.is_finite() && resumed.ema_fast > 0.0);
+        assert!(resumed.rsi.is_finite() && (0.0..=100.0).contains(&resumed.rsi));
+        assert!(
+            (resumed.atr - atr_before).abs() < atr_before,
+            "ATR must evolve continuously from the pre-poison value, not restart"
+        );
+        assert!(
+            resumed.vwap > vwap_before * 0.5 && resumed.vwap < vwap_before * 2.0,
+            "VWAP accumulator must be continuous across the refusal"
+        );
+    }
+
+    #[test]
+    fn test_poison_on_the_very_first_tick_leaves_instrument_pristine() {
+        // A refusal must not half-initialise an instrument (e.g. bump
+        // warmup_count and then bail), which would make the NEXT tick look like
+        // a second tick and skip first-tick EMA seeding.
+        let mut engine = default_engine();
+        assert!(
+            !engine
+                .update(&make_tick(9, 100.0, f32::NAN, 95.0, 1000))
+                .is_warm
+        );
+        assert_eq!(engine.warmup_count(9), 0);
+
+        let first_good = engine.update(&make_tick(9, 250.0, 255.0, 245.0, 1000));
+        assert_eq!(
+            first_good.ema_fast, 250.0,
+            "the first GOOD tick must still seed EMA to price"
+        );
+        assert_eq!(engine.warmup_count(9), 1);
+    }
+
+    // --- warmup_from_candles gate ---
+
+    #[test]
+    fn test_warmup_rejects_nan_high_low_and_open() {
+        // Pre-fix, only `close` was validated — a NaN high/low/open flowed
+        // straight into the same Wilder accumulators.
+        let mut engine = default_engine();
+        let candles = vec![
+            (100.0, 101.0, 99.0, 100.0, 1000.0),         // valid
+            (100.0, f64::NAN, 99.0, 100.0, 1000.0),      // NaN high
+            (100.0, 101.0, f64::NAN, 100.0, 1000.0),     // NaN low
+            (f64::NAN, 101.0, 99.0, 100.0, 1000.0),      // NaN open
+            (100.0, f64::INFINITY, 99.0, 100.0, 1000.0), // Inf high
+            (102.0, 103.0, 101.0, 102.0, 2000.0),        // valid
+        ];
+        let processed = engine.warmup_from_candles(300, &candles);
+        assert_eq!(processed, 2, "only the 2 clean candles may be processed");
+        assert_state_finite(&mut engine, 300, "after warmup with NaN OHLC");
+    }
+
+    #[test]
+    fn test_warmup_rejects_f64_to_f32_overflow_candle() {
+        // 1e300 is a perfectly finite f64 — it passed the old
+        // `close.is_finite()` check and then became +inf in `close as f32`.
+        let mut engine = default_engine();
+        assert!(1e300_f64.is_finite(), "premise: the f64 IS finite");
+        assert!(
+            !(1e300_f64 as f32).is_finite(),
+            "premise: but it overflows f32"
+        );
+
+        let candles = vec![
+            (100.0, 101.0, 99.0, 100.0, 1000.0),  // valid
+            (1e300, 1e300, 1e300, 1e300, 1000.0), // finite f64, +inf as f32
+            (100.0, 1e300, 99.0, 100.0, 1000.0),  // overflow in high only
+            (102.0, 103.0, 101.0, 102.0, 2000.0), // valid
+        ];
+        let processed = engine.warmup_from_candles(301, &candles);
+        assert_eq!(processed, 2, "f32-overflow candles must be refused");
+        assert_state_finite(&mut engine, 301, "after f32-overflow warmup");
+    }
+
+    #[test]
+    fn test_warmup_rejects_non_finite_and_negative_volume() {
+        // `volume as u32` saturates NaN→0 and negative→0: silently wrong
+        // rather than loud, so the gate refuses them instead.
+        let mut engine = default_engine();
+        let candles = vec![
+            (100.0, 101.0, 99.0, 100.0, f64::NAN),
+            (100.0, 101.0, 99.0, 100.0, -5.0),
+            (100.0, 101.0, 99.0, 100.0, f64::INFINITY),
+            (102.0, 103.0, 101.0, 102.0, 2000.0), // valid
+        ];
+        assert_eq!(engine.warmup_from_candles(302, &candles), 1);
+    }
+
+    #[test]
+    fn test_warmup_rejects_negative_ohlc_and_keeps_legacy_close_rule() {
+        let mut engine = default_engine();
+        let candles = vec![
+            (100.0, 101.0, 99.0, 0.0, 1000.0),    // close = 0 (legacy rule)
+            (100.0, 101.0, 99.0, -100.0, 1000.0), // negative close
+            (100.0, -101.0, 99.0, 100.0, 1000.0), // negative high
+            (100.0, 101.0, -99.0, 100.0, 1000.0), // negative low
+            (-100.0, 101.0, 99.0, 100.0, 1000.0), // negative open
+            (102.0, 103.0, 101.0, 102.0, 2000.0), // valid
+        ];
+        assert_eq!(engine.warmup_from_candles(303, &candles), 1);
+    }
+
+    #[test]
+    fn test_warmup_zero_high_low_candle_is_still_accepted() {
+        // Same Ticker-sentinel carve-out as the live path.
+        let mut engine = default_engine();
+        let candles = vec![(0.0, 0.0, 0.0, 100.0, 0.0)];
+        assert_eq!(
+            engine.warmup_from_candles(304, &candles),
+            1,
+            "close>0 with absent high/low must still warm up"
+        );
+    }
+
+    #[test]
+    fn test_warmup_all_poison_processes_nothing_and_stays_cold() {
+        let mut engine = default_engine();
+        let candles = vec![
+            (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+            (1e300, 1e300, 1e300, 1e300, 1e300),
+            (0.0, 0.0, 0.0, 0.0, 0.0),
+        ];
+        assert_eq!(engine.warmup_from_candles(305, &candles), 0);
+        assert_eq!(engine.warmup_count(305), 0);
     }
 }

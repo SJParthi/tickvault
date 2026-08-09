@@ -1,11 +1,99 @@
 # Proposal: r8g.xlarge migration — AZ un-pin, 13 timeframes, tick retention
 
-**Status:** DRAFT — needs operator approval + a dated quote before ANY change lands
+**Status:** APPROVED (2026-08-09, operator quote in "Authorization" below) — Phase 2 CORRECTED for live reality; see the 2026-08-09 block
 **Date:** 2026-08-08
-**Approved by:** pending
+**Approved by:** Parthiban (operator) — 2026-08-09, verbatim quote recorded below
 **Absorbs:** `2026-08-08-az-unpin.md` (the AZ un-pin is Phase 1 here — same instance
 replacement does both; that proposal stays as the standalone fallback if only the
 outage fix is wanted)
+
+---
+
+## Authorization + reality correction (2026-08-09)
+
+### The verbatim operator approval (preserve exactly, typos included)
+
+> "whichevr is reocmemnded go ahea ddud eokay?"
+
+Given in direct response to a presented three-option choice for the stranded-data
+question, in which the **recommended** option read: *"launch in `1b`, restore data
+via snapshot — keeps your data AND escapes the failing zone"*, against option B
+(launch in `1a` where the volume already sits, back in the zone that failed) and
+option C (fresh empty box, abandon the data — explicitly not recommended).
+
+**What this quote authorizes, precisely:** the AZ/data decision only — the
+instance launches in `ap-south-1b` (`var.availability_zone = "b"`, already the
+default) and the QuestDB data is migrated by **snapshot-and-restore**, never
+abandoned. The r8g.xlarge type, the 100 GB fresh root, and the $35 -> $100 budget
+ceiling in this plan carry their own separate authorization — operator Quote 13
+(2026-08-08) in `daily-universe-scope-expansion-2026-05-27.md` §0/§7 — and are NOT
+re-authorized or widened by this quote. Phase 3 (timeframes) remains unstarted.
+
+### Phase 2's premise is STALE — the old box is already gone
+
+Phase 2 below was written on 2026-08-08 assuming the old instance was still alive
+and would be "left INTACT" during the migration. That is no longer true. Verified
+live on 2026-08-09 via `describe-instances` / `describe-volumes` /
+`describe-route-tables`:
+
+| Phase 2 assumption | Live reality on 2026-08-09 |
+|---|---|
+| Old instance running, to be left intact | **DESTROYED** — `Reservations: []`, zero instances in ap-south-1 |
+| Volume attached to it | **DETACHED**, state `available`, still in ap-south-1a |
+| EIP attached | **UNASSOCIATED** (`13.234.145.177`) |
+| `terraform apply` will create the new box | **BLOCKED** until the CIDR conflict is fixed |
+
+The destruction was NOT capacity-related and NOT deliberate. The 2026-08-08
+multi-AZ refactor rewrote `aws_subnet.public` into a `for_each` without `moved`
+blocks, so terraform planned to CREATE a subnet that already existed; AWS refused
+the duplicate CIDR `10.42.1.0/24` and the apply died after destroying the instance
+(workflow run 31295255920, 2026-08-09 06:05 UTC). Fixed by
+`deploy/aws/terraform/moved.tf` (commit 72f2ace).
+
+### Corrected Phase 2 steps
+
+Supersedes the identically-numbered steps below where they conflict:
+
+- **2.1 — UNCHANGED and now easier.** Snapshot `vol-073ccaa417a0f344b`. It is
+  already detached, so there is no stop/quiesce step and no in-flight-write risk.
+  This is the FIRST action of the window: nothing else may run until it reports
+  `completed`.
+- **2.2 — NOT POSSIBLE AS WRITTEN, and this is the one real loss.** It asked for
+  pre-migration QuestDB row counts "from the last known good state". The box that
+  could answer that query no longer exists, so there is no independent baseline to
+  compare against. Corrected: take the baseline from the RESTORED volume once
+  mounted (2.4), and treat 2.6 as an internal-consistency check (restored volume
+  vs copied destination), NOT as proof against the pre-outage state. **Stated
+  plainly rather than papered over: we can prove the copy is faithful; we cannot
+  prove nothing was lost when the instance was destroyed.** Any partition that was
+  mid-write at 06:05 UTC on 2026-08-09 is unverifiable by this procedure.
+- **2.3 — REQUIRES `moved.tf` FIRST.** The apply cannot succeed without it. It
+  will also create the three missing route-table associations; without them the
+  new box has no internet path (the IGW route currently has ZERO subnets attached),
+  so it would boot unreachable by SSM and unable to reach any broker.
+- **2.4 / 2.5 — UNCHANGED.** Secondary-volume copy, not a root restore. The 30 GB
+  filesystem never becomes the root of the 100 GB box.
+- **2.6 — narrowed** per 2.2 above.
+- **2.7 — UNCHANGED and now mandatory rather than optional:** the
+  `EC2_INSTANCE_ID` GitHub secret currently points at a destroyed instance, so
+  every workflow that targets it by id is broken until this is rotated.
+- **2.8 — UNCHANGED.** Deletion of the old volume/snapshots stays gated on explicit
+  operator sign-off. The old volume is the ONLY remaining copy of that data; it is
+  not managed by any terraform resource (verified: zero `aws_ebs_volume` /
+  `aws_volume_attachment` resources), and `delete_on_termination = false` is what
+  preserved it. Nothing in this plan may delete it automatically.
+
+### Execution constraint (why this is not done yet)
+
+The session credentials (`arn:aws:iam::208384284948:user/claude-code-agent`) are
+**read-only for EC2** — `ec2:CreateSnapshot` returns `UnauthorizedOperation`. Every
+step 2.1/2.4/2.5/2.7 is therefore a privileged action that must run through a
+GitHub Actions lane holding the deploy credentials, or by the operator directly.
+That is a deliberate safety property, not a defect: no agent session can mutate
+prod EBS. It does mean the migration is **not** fully hands-off today, and this
+plan should not claim otherwise.
+
+---
 
 ---
 

@@ -92,13 +92,35 @@ use crate::spot_1m_rest_boot::{
 /// neither leg's in-deadline request is cut short by the belt.
 const DHAN_CADENCE_HTTP_TIMEOUT_SECS: u64 = 10;
 
+/// Per-slot maximum awaited budget, milliseconds — the ceiling every
+/// computed `remaining_ms` is CLAMPED to before it reaches
+/// `tokio::time::timeout`.
+///
+/// 2026-08-09 (clock-bug sweep): `deadline_remaining_ms` was unbounded
+/// ABOVE. `deadline_epoch_ms` and `now_epoch_ms` are both WALL-CLOCK
+/// (`chrono::Utc::now().timestamp_millis()`), so a BACKWARD NTP step
+/// between the runner stamping the deadline and the executor reading
+/// `now` inflates the difference by the size of the step — an hour-long
+/// step yields an hour-long `tokio::time::timeout`, and a half-open TLS
+/// socket then holds the cadence slot for the rest of the session. The
+/// forward direction already fails closed (`None` → `Timeout`).
+/// Clamping to the same value as the HTTP client's own belt keeps the
+/// awaited future bounded by the belt it was sized against, so a skew
+/// can never buy a request more time than one slot is worth.
+const DHAN_CADENCE_MAX_REQUEST_BUDGET_MS: u64 = DHAN_CADENCE_HTTP_TIMEOUT_SECS * 1_000;
+
 /// Pure: milliseconds remaining until `deadline_epoch_ms` at
-/// `now_epoch_ms` — `None` when the deadline already elapsed (the caller
-/// returns [`CadenceFetchError::Timeout`] WITHOUT sending).
+/// `now_epoch_ms`, CLAMPED to [`DHAN_CADENCE_MAX_REQUEST_BUDGET_MS`] —
+/// `None` when the deadline already elapsed (the caller returns
+/// [`CadenceFetchError::Timeout`] WITHOUT sending).
 #[must_use]
 pub fn deadline_remaining_ms(deadline_epoch_ms: i64, now_epoch_ms: i64) -> Option<u64> {
     let rem = deadline_epoch_ms.saturating_sub(now_epoch_ms);
-    u64::try_from(rem).ok().filter(|r| *r > 0)
+    u64::try_from(rem)
+        .ok()
+        .filter(|r| *r > 0)
+        // Backward-clock-step defense — see DHAN_CADENCE_MAX_REQUEST_BUDGET_MS.
+        .map(|r| r.min(DHAN_CADENCE_MAX_REQUEST_BUDGET_MS))
 }
 
 /// Pure: map one unpaced SPOT failure into the cadence taxonomy.
@@ -1161,6 +1183,82 @@ mod tests {
         assert_eq!(deadline_remaining_ms(1_000, 1_000), None);
         assert_eq!(deadline_remaining_ms(1_000, 1_001), None);
         assert_eq!(deadline_remaining_ms(i64::MIN, 0), None);
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-08-09 clock-bug sweep — the backward-NTP-step clamp.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_cadence_max_request_budget_matches_http_belt() {
+        // The clamp must stay tied to the client's own timeout belt: a
+        // request may never be awaited longer than the belt it was sized
+        // against.
+        assert_eq!(
+            DHAN_CADENCE_MAX_REQUEST_BUDGET_MS,
+            DHAN_CADENCE_HTTP_TIMEOUT_SECS * 1_000
+        );
+        assert_eq!(DHAN_CADENCE_MAX_REQUEST_BUDGET_MS, 10_000);
+    }
+
+    #[test]
+    fn test_cadence_deadline_remaining_ms_under_budget_is_unclamped() {
+        // Nominal slots are well under the belt — the clamp must be a
+        // no-op there, or every normal fire would be silently shortened.
+        assert_eq!(deadline_remaining_ms(1_000, 0), Some(1_000));
+        assert_eq!(
+            deadline_remaining_ms(
+                i64::try_from(DHAN_CADENCE_MAX_REQUEST_BUDGET_MS).expect("fits"),
+                0
+            ),
+            Some(DHAN_CADENCE_MAX_REQUEST_BUDGET_MS)
+        );
+    }
+
+    #[test]
+    fn test_cadence_deadline_remaining_ms_clamps_backward_clock_step() {
+        // THE BUG: a backward NTP step inflates (deadline - now). An hour
+        // of "remaining" became an hour-long tokio timeout, so one
+        // half-open socket held the cadence slot for the rest of the day.
+        let one_hour_ms = 3_600_000_i64;
+        assert_eq!(
+            deadline_remaining_ms(one_hour_ms, 0),
+            Some(DHAN_CADENCE_MAX_REQUEST_BUDGET_MS)
+        );
+        // One millisecond past the belt already clamps.
+        let just_over = i64::try_from(DHAN_CADENCE_MAX_REQUEST_BUDGET_MS).expect("fits") + 1;
+        assert_eq!(
+            deadline_remaining_ms(just_over, 0),
+            Some(DHAN_CADENCE_MAX_REQUEST_BUDGET_MS)
+        );
+    }
+
+    #[test]
+    fn test_cadence_deadline_remaining_ms_is_never_above_budget() {
+        // Exhaustive-ish: no (deadline, now) pair can ever buy more than
+        // one slot's budget, including the saturating extremes.
+        for (deadline, now) in [
+            (i64::MAX, i64::MIN),
+            (i64::MAX, 0),
+            (0, i64::MIN),
+            (1_000_000_000_000, 0),
+            (1, 0),
+        ] {
+            if let Some(remaining) = deadline_remaining_ms(deadline, now) {
+                assert!(
+                    remaining <= DHAN_CADENCE_MAX_REQUEST_BUDGET_MS,
+                    "deadline_remaining_ms({deadline}, {now}) = {remaining} exceeded the slot budget"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cadence_deadline_remaining_ms_forward_step_still_fails_closed() {
+        // The forward direction must KEEP failing closed — a clock jumped
+        // ahead of the deadline returns None (Timeout, no request sent).
+        assert_eq!(deadline_remaining_ms(0, 3_600_000), None);
+        assert_eq!(deadline_remaining_ms(i64::MIN, i64::MAX), None);
     }
 
     #[test]

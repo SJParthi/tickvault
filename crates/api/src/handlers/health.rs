@@ -37,27 +37,85 @@ pub struct SubsystemInfo {
     pub detail: Option<String>,
 }
 
+/// Status rendered for a subsystem that no longer exists in the running
+/// binary (2026-08-09). Distinct from a failure status on purpose: a retired
+/// subsystem cannot be "down", and reporting it red trains operators to
+/// ignore `/health` entirely.
+const STATUS_RETIRED: &str = "retired";
+
+/// Status rendered for a subsystem that DOES exist but has no producer
+/// pushing its state into `/health` yet (2026-08-09). An honest "we don't
+/// know" — never a fabricated "disconnected".
+const STATUS_UNREPORTED: &str = "unreported";
+
 /// GET /health — returns 200 OK with subsystem status.
+///
+/// # Honest reporting contract (2026-08-09, observability-blind-spot audit)
+///
+/// Four subsystem fields here had NO production writer, so they rendered
+/// their `new()` defaults as hard failures — `/health` claimed the websocket
+/// was "disconnected" and tick persistence "unavailable" on a perfectly
+/// healthy box, and `overall_status()` returned "degraded" on every request
+/// forever. Each field is now rendered from "has a producer ever reported
+/// this?" rather than from an unwritten default:
+///
+/// | field              | today            | why                                          |
+/// |--------------------|------------------|----------------------------------------------|
+/// | `websocket`        | `retired`        | live feeds retired 2026-07-13 / 2026-07-15   |
+/// | `pipeline`         | `retired`        | `spawn_trading_pipeline` has no call site    |
+/// | `tick_persistence` | `retired`        | `tick_persistence.rs` deleted 2026-07-17     |
+/// | `order_update`     | `unreported`     | subsystem IS live; the setter is unwired     |
+///
+/// The `order_update` row is the one genuine wiring gap: `dhan_rest_stack`
+/// spawns the paper-mode receive-only order-update connection when
+/// `[dhan_order_push] enabled = true`, but never calls
+/// `set_order_update_connected`. It is reported as `unreported` rather than
+/// silently green, and wiring it is a tracked follow-up in that file.
+///
+/// All four are ARM-ON-ARRIVAL: the first setter call from any producer
+/// flips the field back to live reporting with no change needed here.
 pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthResponse> {
     let health = state.health_status();
 
     let ws_count = health.websocket_connections();
-    let websocket = SubsystemInfo {
-        status: if ws_count > 0 {
-            "connected"
-        } else {
-            "disconnected"
-        },
-        detail: Some(format!("{ws_count} connections")),
+    let websocket = if health.websocket_reported() {
+        SubsystemInfo {
+            status: if ws_count > 0 {
+                "connected"
+            } else {
+                "disconnected"
+            },
+            detail: Some(format!("{ws_count} connections")),
+        }
+    } else {
+        SubsystemInfo {
+            status: STATUS_RETIRED,
+            detail: Some(
+                "live market-data WebSocket feeds retired (Dhan 2026-07-13, Groww 2026-07-15); \
+                 runtime is REST-only, so there is no connection count to report"
+                    .to_string(),
+            ),
+        }
     };
 
-    let order_update = SubsystemInfo {
-        status: if health.order_update_connected() {
-            "connected"
-        } else {
-            "disconnected"
-        },
-        detail: None,
+    let order_update = if health.order_update_reported() {
+        SubsystemInfo {
+            status: if health.order_update_connected() {
+                "connected"
+            } else {
+                "disconnected"
+            },
+            detail: None,
+        }
+    } else {
+        SubsystemInfo {
+            status: STATUS_UNREPORTED,
+            detail: Some(
+                "order-update channel runs in paper mode when [dhan_order_push] is enabled, \
+                 but nothing reports its connection state to /health yet"
+                    .to_string(),
+            ),
+        }
     };
 
     let questdb = SubsystemInfo {
@@ -83,30 +141,54 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
         },
     };
 
-    let pipeline = SubsystemInfo {
-        status: if health.pipeline_active() {
-            "active"
-        } else {
-            "inactive"
-        },
-        detail: None,
+    let pipeline = if health.pipeline_reported() {
+        SubsystemInfo {
+            status: if health.pipeline_active() {
+                "active"
+            } else {
+                "inactive"
+            },
+            detail: None,
+        }
+    } else {
+        SubsystemInfo {
+            status: STATUS_RETIRED,
+            detail: Some(
+                "the tick pipeline spawned only under the live feeds; with both retired it \
+                 has no production call site"
+                    .to_string(),
+            ),
+        }
     };
 
     let tick_buf = health.tick_buffer_size();
     let tick_spill = health.ticks_spilled();
-    let tick_persistence = SubsystemInfo {
-        status: if health.tick_persistence_connected() {
-            "connected"
-        } else if tick_buf > 0 || tick_spill > 0 {
-            "buffering"
-        } else {
-            "unavailable"
-        },
-        detail: if tick_buf > 0 || tick_spill > 0 {
-            Some(format!("buffer: {tick_buf}, spilled: {tick_spill}"))
-        } else {
-            None
-        },
+    // A buffering/spilling signal still counts as a real report even if the
+    // connected flag was never set — keep the original precedence in that case.
+    let tick_persistence = if health.tick_persistence_reported() || tick_buf > 0 || tick_spill > 0 {
+        SubsystemInfo {
+            status: if health.tick_persistence_connected() {
+                "connected"
+            } else if tick_buf > 0 || tick_spill > 0 {
+                "buffering"
+            } else {
+                "unavailable"
+            },
+            detail: if tick_buf > 0 || tick_spill > 0 {
+                Some(format!("buffer: {tick_buf}, spilled: {tick_spill}"))
+            } else {
+                None
+            },
+        }
+    } else {
+        SubsystemInfo {
+            status: STATUS_RETIRED,
+            detail: Some(
+                "tick persistence was deleted in the 2026-07-17 dead-WS sweep; no tick writer \
+                 exists on the REST-only runtime"
+                    .to_string(),
+            ),
+        }
     };
 
     let overall = health.overall_status();
@@ -191,7 +273,11 @@ mod tests {
         let health = Arc::new(SystemHealthStatus::new());
         health.set_questdb_reachable(true);
         health.set_token_valid(true);
-        // websocket stays at 0
+        // 2026-08-09: a producer REPORTING zero connections is the real
+        // "websocket is down" case, and must still degrade. (Before this
+        // change the test relied on the unwritten default, which is now
+        // rendered `retired` instead — see the handler doc comment.)
+        health.set_websocket_connections(0);
 
         let state = make_test_state(health);
         let Json(response) = health_check(State(state)).await;
@@ -217,17 +303,24 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_degraded() {
         let health = Arc::new(SystemHealthStatus::new());
-        // All subsystems down (default)
+        // Nothing reported at all (the `new()` defaults).
 
         let state = make_test_state(health);
         let Json(response) = health_check(State(state)).await;
 
+        // token_valid has a REAL production writer (dhan_rest_stack.rs), so
+        // an unset token is a genuine degrade — unchanged.
         assert_eq!(response.status, "degraded");
-        assert_eq!(response.subsystems.websocket.status, "disconnected");
         assert_eq!(response.subsystems.questdb.status, "unreachable");
         assert_eq!(response.subsystems.token.status, "invalid");
-        assert_eq!(response.subsystems.pipeline.status, "inactive");
-        assert_eq!(response.subsystems.tick_persistence.status, "unavailable");
+        // 2026-08-09: the three writer-less subsystems no longer masquerade
+        // as failures. `disconnected` / `inactive` / `unavailable` would each
+        // assert a fact nobody measured.
+        assert_eq!(response.subsystems.websocket.status, STATUS_RETIRED);
+        assert_eq!(response.subsystems.pipeline.status, STATUS_RETIRED);
+        assert_eq!(response.subsystems.tick_persistence.status, STATUS_RETIRED);
+        // The order-update channel DOES exist (paper mode) — honest "unknown".
+        assert_eq!(response.subsystems.order_update.status, STATUS_UNREPORTED);
     }
 
     #[test]
@@ -352,16 +445,143 @@ mod tests {
         let state = make_test_state(health);
         let Json(response) = health_check(State(state)).await;
 
-        // websocket detail should show "0 connections"
-        assert_eq!(
-            response.subsystems.websocket.detail,
-            Some("0 connections".to_string())
+        // 2026-08-09: an unreported websocket explains WHY there is no count
+        // instead of printing a made-up "0 connections".
+        let ws_detail = response
+            .subsystems
+            .websocket
+            .detail
+            .expect("retired websocket must explain itself");
+        assert!(
+            ws_detail.contains("retired"),
+            "websocket detail must name the retirement, got: {ws_detail}"
         );
-        // Other subsystems should have detail: None
+        // Subsystems with real writers still carry no detail when idle.
         assert!(response.subsystems.questdb.detail.is_none());
         assert!(response.subsystems.token.detail.is_none());
-        assert!(response.subsystems.pipeline.detail.is_none());
-        assert!(response.subsystems.tick_persistence.detail.is_none());
+        // The writer-less ones now carry an explanation rather than silence.
+        assert!(response.subsystems.pipeline.detail.is_some());
+        assert!(response.subsystems.tick_persistence.detail.is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // 2026-08-09 — observability-blind-spot audit: /health must not invent
+    // failure states for subsystems nobody reports, and must not pin the
+    // overall verdict to a permanent "degraded".
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_overall_is_healthy_on_rest_only_runtime() {
+        // THE HEADLINE REGRESSION. Before the fix this returned "degraded"
+        // forever, because `overall_status()` degraded on a websocket count
+        // that no production code has written since 2026-07-13.
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_token_valid(true);
+        health.set_questdb_reachable(true);
+        // No websocket producer — exactly the live REST-only runtime.
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(
+            response.status, "healthy",
+            "a REST-only runtime with a valid token and a reachable QuestDB is \
+             HEALTHY; reporting it degraded forever destroys the endpoint's signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_retired_subsystems_are_not_reported_as_failures() {
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_token_valid(true);
+        health.set_questdb_reachable(true);
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        for (name, status) in [
+            ("websocket", response.subsystems.websocket.status),
+            ("pipeline", response.subsystems.pipeline.status),
+            (
+                "tick_persistence",
+                response.subsystems.tick_persistence.status,
+            ),
+        ] {
+            assert_eq!(
+                status, STATUS_RETIRED,
+                "{name} has no production writer and must render `retired`"
+            );
+            for failure_word in ["disconnected", "inactive", "unavailable", "unreachable"] {
+                assert_ne!(
+                    status, failure_word,
+                    "{name} must never claim `{failure_word}` — nothing measured it"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_order_update_is_unreported_not_disconnected() {
+        // The order-update channel is LIVE (paper mode) but unwired, so the
+        // honest answer is "we don't know", NOT "disconnected".
+        let health = Arc::new(SystemHealthStatus::new());
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.order_update.status, STATUS_UNREPORTED);
+        assert_ne!(response.subsystems.order_update.status, "disconnected");
+        assert!(
+            response.subsystems.order_update.detail.is_some(),
+            "an unreported live subsystem must say why it is unreported"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_websocket_arms_on_arrival_when_a_producer_reports() {
+        // ARM-ON-ARRIVAL: when the authorized Dhan live main-feed WS revival
+        // lands and its watchdog pushes a count, both the rendering and the
+        // overall verdict must re-arm with no further edit to this handler.
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_token_valid(true);
+        health.set_questdb_reachable(true);
+        health.set_websocket_connections(1);
+
+        let state = make_test_state(health.clone());
+        let Json(response) = health_check(State(state)).await;
+        assert_eq!(response.subsystems.websocket.status, "connected");
+        assert_eq!(
+            response.subsystems.websocket.detail,
+            Some("1 connections".to_string())
+        );
+        assert_eq!(response.status, "healthy");
+
+        // ...and a subsequent drop to zero degrades exactly as before.
+        health.set_websocket_connections(0);
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+        assert_eq!(response.subsystems.websocket.status, "disconnected");
+        assert_eq!(
+            response.status, "degraded",
+            "once a producer reports the websocket, a drop to 0 must degrade"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_tick_persistence_buffering_still_wins_over_retired() {
+        // A non-empty ring/spill is itself evidence of a live writer, so the
+        // `buffering` state must survive the retired-rendering change.
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_tick_buffer_size(3);
+        health.set_ticks_spilled(4);
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.tick_persistence.status, "buffering");
+        assert_eq!(
+            response.subsystems.tick_persistence.detail,
+            Some("buffer: 3, spilled: 4".to_string())
+        );
     }
 
     // -------------------------------------------------------------------
@@ -411,9 +631,30 @@ mod tests {
         assert_eq!(response.subsystems.order_update.status, "connected");
     }
 
+    // 2026-08-09 (observability-blind-spot audit): these two previously
+    // asserted that an UNWRITTEN default renders as a failure state
+    // ("disconnected" / "unavailable"). That is precisely the lie the audit
+    // removed — nothing had measured either subsystem. They now assert the
+    // honest rendering, and the "real producer reported a failure" cases are
+    // covered by `test_health_check_order_update_connected` /
+    // `debug_spill_and_health_detail::health_reports_token_expiry_detail_and_buffering_state`
+    // plus the explicit reported-false test below.
     #[tokio::test]
-    async fn test_health_check_order_update_disconnected_by_default() {
+    async fn test_health_check_order_update_unreported_by_default() {
         let health = Arc::new(SystemHealthStatus::new());
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.order_update.status, STATUS_UNREPORTED);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_order_update_disconnected_when_producer_reports_false() {
+        // A REAL producer reporting "not connected" must still render
+        // "disconnected" — the retired/unreported rendering must never mask
+        // a genuine down signal.
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_order_update_connected(false);
         let state = make_test_state(health);
         let Json(response) = health_check(State(state)).await;
 
@@ -421,8 +662,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_check_tick_persistence_unavailable_by_default() {
+    async fn test_health_check_tick_persistence_retired_by_default() {
         let health = Arc::new(SystemHealthStatus::new());
+
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(response.subsystems.tick_persistence.status, STATUS_RETIRED);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_tick_persistence_unavailable_when_producer_reports_false() {
+        // Producer present, connection down, ring/spill empty → "unavailable"
+        // remains the correct answer.
+        let health = Arc::new(SystemHealthStatus::new());
+        health.set_tick_persistence_connected(false);
 
         let state = make_test_state(health);
         let Json(response) = health_check(State(state)).await;
