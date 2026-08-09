@@ -71,19 +71,40 @@ resource "aws_internet_gateway" "dlt" {
   }
 }
 
+# MULTI-AZ (2026-08-08, operator Quote 13 — daily-universe-scope-expansion §7).
+#
+# This used to be ONE subnet hardcoded to `${var.aws_region}a`, and that single
+# line is what kept the box dark 2026-08-06 -> 2026-08-08: ap-south-1a ran out of
+# capacity, and because a stopped instance can only restart in its own AZ, every
+# start attempt returned InsufficientInstanceCapacity. The 2026-08-07 attempt to
+# escape by changing the INSTANCE TYPE (t4g.medium -> t4g.large, workflow run
+# 31148235540) was refused for the SAME reason and rolled back — which is the
+# proof that the constraint was the ZONE, not the size.
+#
+# `describe-instance-type-offerings` (run live 2026-08-08) confirms all 7 candidate
+# types are offered in all three ap-south-1 AZs, so a subnet per AZ + a variable
+# turns a multi-day outage into a one-variable re-apply.
+#
+# A subnet is free; there is no cost to holding all three.
+#
+# DO NOT collapse this back to a single AZ — that is a REJECT per §7 Mechanical
+# Rule 1, independent of any instance-type change.
 resource "aws_subnet" "public" {
+  for_each = toset(["a", "b", "c"])
+
   vpc_id            = aws_vpc.dlt.id
-  cidr_block        = "10.42.1.0/24"
-  availability_zone = "${var.aws_region}a"
-  # Auto-assign a public IP on launch so the instance is reachable for
-  # the data-pull window WITHOUT a static EIP (var.enable_eip = false,
-  # operator lock 2026-05-29 §7 Quote 5 — no orders, no Dhan static-IP
-  # need). When enable_eip flips true for live trading, the EIP overrides
-  # this with a stable address.
+  cidr_block        = "10.42.${index(["a", "b", "c"], each.key) + 1}.0/24"
+  availability_zone = "${var.aws_region}${each.key}"
+
+  # Auto-assign a public IP on launch so a FRESH instance is reachable without a
+  # static EIP. Note this is a LAUNCH-TIME ENI attribute: it applies to newly
+  # launched instances only, which is why the 2026-07-19 finding (the live ENI can
+  # never mint an ephemeral IP after a stop/modify/start) does not contradict it —
+  # and why an EIP release is only safe bundled with a recreate.
   map_public_ip_on_launch = true
 
   tags = {
-    Name = "tv-${var.environment}-public-a"
+    Name = "tv-${var.environment}-public-${each.key}"
   }
 }
 
@@ -100,8 +121,12 @@ resource "aws_route_table" "public" {
   }
 }
 
+# One association per AZ subnet (2026-08-08 multi-AZ, Quote 13). All three
+# share the single public route table — the IGW route is identical per AZ.
 resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
+  for_each = aws_subnet.public
+
+  subnet_id      = each.value.id
   route_table_id = aws_route_table.public.id
 }
 
@@ -348,7 +373,12 @@ resource "aws_iam_role_policy_attachment" "tv_instance_ssm_core" {
 resource "aws_instance" "tv_app" {
   ami                    = var.ami_id
   instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public.id
+  # 2026-08-08 (Quote 13): the zone is now a VARIABLE, not a hardcoded "a".
+  # Changing var.availability_zone re-places the instance in a zone that HAS
+  # capacity — the whole point of the multi-AZ change. Note this forces a
+  # REPLACEMENT (an instance cannot move zones), which is expected and is why
+  # the migration is snapshot-based; see the plan's Phase 2.
+  subnet_id              = aws_subnet.public[var.availability_zone].id
   vpc_security_group_ids = [aws_security_group.tv_app.id]
   key_name               = var.key_name
   iam_instance_profile   = aws_iam_instance_profile.tv_instance.name

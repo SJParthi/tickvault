@@ -23,15 +23,19 @@ pub const INR_PER_USD: f64 = 85.0;
 /// India GST 18%.
 pub const GST_MULT: f64 = 1.18;
 /// The REAL ceiling is the AWS Budget that auto-stops the box (budget.tf
-/// limit_amount): **$35/month** on UnblendedCost since the 2026-07-31
-/// operator ruling (was $25 from the 2026-07-19 sub-1K step, itself down
-/// from $55). The 2026-07-19 downward ratchet ladder ($25 → $18 → $13 → $10)
-/// is SUPERSEDED for the ceiling but the sub-₹1,000 TARGET still stands —
-/// see the dated block in budget.tf + aws-budget.md. KEEP IN SYNC with
-/// budget.tf limit_amount + budget-guards.tf BUDGET_KILL_USD — the digest
-/// reads BUDGET_USD, the native Budget Action + killswitch fire at
-/// limit_amount.
-pub const BUDGET_USD: f64 = 35.0;
+/// limit_amount): **$100/month** on UnblendedCost since the 2026-08-08
+/// operator ruling (Quote 13 — was $35 from 2026-07-31, $25 from the
+/// 2026-07-19 sub-1K step, itself down from $55). The instance moved to
+/// r8g.xlarge to serve the 13-timeframe + current-day tick-retention
+/// requirement; the bill's high estimate is $73.60/mo and the AUTOMATIC
+/// budget actions fire at 90%/100%, so a ceiling under ~$82 would stop the
+/// box mid-session. The 2026-07-19 downward ratchet ladder ($25 → $18 → $13
+/// → $10) is SUPERSEDED for the ceiling; the sub-₹1,000 TARGET still stands
+/// and is now BREACHED ~6× — recorded, not silently dropped. See the dated
+/// block in budget.tf + aws-budget.md. KEEP IN SYNC with budget.tf
+/// limit_amount + budget-guards.tf BUDGET_KILL_USD — the digest reads
+/// BUDGET_USD, the native Budget Action + killswitch fire at limit_amount.
+pub const BUDGET_USD: f64 = 100.0;
 
 /// SNS subject — legacy parity: `'[BUDGET] daily AWS cost'`.
 pub const DIGEST_SUBJECT: &str = "[BUDGET] daily AWS cost";
@@ -425,14 +429,14 @@ mod tests {
             ("CloudWatch".to_string(), 6.0),
         ];
         let (msg, pct) = render_digest(today, 0.53, 10.0, &by_svc);
-        // pct = 10/35*100 = 28.57… → 🟢 (BUDGET_USD = 35 since 2026-07-31;
-        // derived from the const so a future ladder step updates in lockstep).
+        // pct = 10/100*100 = 10% → 🟢 (BUDGET_USD = 100 since 2026-08-08;
+        // derived from the const so a future ceiling change updates in lockstep).
         assert!((pct - (10.0 / BUDGET_USD) * 100.0).abs() < 1e-9);
         assert!(msg.starts_with("🟢 *AWS Cost — tickvault*"));
         // inr(0.53) = 53.159 → "₹53"; USD keeps 2dp with a SINGLE dollar sign.
         assert!(msg.contains("_Yesterday_:   ₹53   ($0.53)"), "{msg}");
         assert!(msg.contains("_This month_:  ₹1003   ($10.00)"), "{msg}");
-        assert!(msg.contains("_Of $35 stop-budget_: 29%"), "{msg}");
+        assert!(msg.contains("_Of $100 stop-budget_: 10%"), "{msg}");
         assert!(msg.contains("_Days left_:   13"), "{msg}");
         assert!(msg.contains("*Where it goes (this month):*"));
         // Sorted descending by USD: CloudWatch (6.0) before EC2 (4.0),
@@ -449,13 +453,16 @@ mod tests {
         let (msg, pct) = render_digest(today, 0.0, 0.0, &[]);
         assert_eq!(pct, 0.0);
         assert!(msg.contains("  (no spend yet this month)"));
-        assert!(msg.contains("_Of $35 stop-budget_: 0%"));
+        assert!(msg.contains("_Of $100 stop-budget_: 0%"));
     }
 
     #[test]
     fn test_render_digest_over_budget_is_red() {
         let today = NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
-        let (msg, pct) = render_digest(today, 1.0, 60.0, &[]);
+        // Derived from the const so a future ceiling change can never
+        // silently turn this into an under-budget case (it did exactly
+        // that at the $35 -> $100 raise on 2026-08-08).
+        let (msg, pct) = render_digest(today, 1.0, BUDGET_USD * 1.2, &[]);
         assert!(pct > 100.0);
         assert!(msg.starts_with("🔴"));
     }
