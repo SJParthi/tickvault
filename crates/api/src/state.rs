@@ -864,7 +864,7 @@ mod tests {
     // NOTE (2026-08-09): each of the four getters below gets its OWN test
     // whose name embeds the fn name, so `.claude/hooks/pub-fn-test-guard.sh`
     // (which matches `fn test_.*<fn_name>`) sees explicit coverage for every
-    // new pub fn rather than relying on incidental substring matches.
+    // new public getter rather than relying on incidental substring matches.
 
     #[test]
     fn test_websocket_reported_starts_false_and_latches_on_first_report() {
