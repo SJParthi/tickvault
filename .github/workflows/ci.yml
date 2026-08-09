@@ -930,7 +930,12 @@ jobs:
             echo "::error::A loom target in tickvault-core ran 0 tests — the crate's 'loom' feature is not reaching the cfg gate, so these binaries are EMPTY and this lane would pass vacuously."
             exit 1
           fi
-          executed=$(grep -c "^     Running tests/loom_" /tmp/loom-core.log || true)
+          # NOTE: unanchored + `.*` on purpose. CI sets CARGO_TERM_COLOR=always,
+          # so cargo emits "\e[1m\e[92m     Running\e[0m tests/..." and a `^     Running`
+          # anchor matches NOTHING through the ANSI prefix — it counted 0 while all
+          # targets had actually run (first live run, 2026-08-09). Mirrors the DHAT
+          # lane above, which has always used this form.
+          executed=$(grep -c 'Running.*tests/loom_' /tmp/loom-core.log || true)
           if [ "$executed" -ne 3 ]; then
             echo "::error::Expected 3 executed loom targets in tickvault-core, saw $executed — a --test flag was dropped from this step while the file and drift-list entry survived, silently un-gating that target."
             exit 1
@@ -946,7 +951,12 @@ jobs:
             echo "::error::The loom target in tickvault-trading ran 0 tests — the crate's 'loom' feature is not reaching the cfg gate, so the binary is EMPTY and this lane would pass vacuously."
             exit 1
           fi
-          executed=$(grep -c "^     Running tests/loom_" /tmp/loom-trading.log || true)
+          # NOTE: unanchored + `.*` on purpose. CI sets CARGO_TERM_COLOR=always,
+          # so cargo emits "\e[1m\e[92m     Running\e[0m tests/..." and a `^     Running`
+          # anchor matches NOTHING through the ANSI prefix — it counted 0 while all
+          # targets had actually run (first live run, 2026-08-09). Mirrors the DHAT
+          # lane above, which has always used this form.
+          executed=$(grep -c 'Running.*tests/loom_' /tmp/loom-trading.log || true)
           if [ "$executed" -ne 1 ]; then
             echo "::error::Expected 1 executed loom target in tickvault-trading, saw $executed — the --test flag was dropped from this step while the file and drift-list entry survived."
             exit 1
