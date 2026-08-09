@@ -269,36 +269,124 @@ pub struct DhanCredentials {
     pub totp_secret: SecretString,
 }
 
-/// Reads one SSM parameter, decrypted.
-async fn read_secret(ssm: &SsmClient, path: &str) -> Result<SecretString, MintError> {
-    let response = ssm
-        .get_parameter()
-        .name(path)
-        .with_decryption(true)
-        .send()
-        .await
-        .map_err(|err| MintError::CredentialRead(format!("{path}: {err}")))?;
+// ---------------------------------------------------------------------------
+// Seams — the whole orchestration is drivable from a unit test with fakes
+// ---------------------------------------------------------------------------
 
-    let value = response
-        .parameter()
-        .and_then(aws_sdk_ssm::types::Parameter::value)
-        .ok_or_else(|| MintError::CredentialRead(format!("{path}: parameter has no value")))?;
+/// The two SSM operations the mint job needs.
+///
+/// Extracted as a seam for the same reason `start_watchdog.rs` abstracts its
+/// AWS calls: the ORCHESTRATION is where the safety properties live (a bad
+/// mint must never overwrite a good token; a credential failure must never
+/// reach the write), and those properties are only provable if a test can
+/// drive the flow. The real SDK impl below is a thin, uncovered-by-design
+/// shell; every decision sits above it.
+pub trait SecretStore {
+    /// Reads one parameter, decrypted. Empty or missing is an ERROR, not an
+    /// `Option` — a blank credential must fail loudly, never mint with an
+    /// empty PIN.
+    fn read(
+        &self,
+        path: String,
+    ) -> impl std::future::Future<Output = Result<SecretString, MintError>> + Send;
 
-    if value.trim().is_empty() {
-        return Err(MintError::CredentialRead(format!("{path}: value is empty")));
-    }
-
-    Ok(SecretString::from(value.to_string()))
+    /// Writes one parameter as a `SecureString`, overwriting.
+    fn write_secure(
+        &self,
+        path: String,
+        value: SecretString,
+    ) -> impl std::future::Future<Output = Result<(), MintError>> + Send;
 }
 
-/// Reads all three Dhan credentials concurrently.
+/// The mint step, as a seam.
+pub trait TokenMinter {
+    fn mint(
+        &self,
+        credentials: &DhanCredentials,
+    ) -> impl std::future::Future<Output = Result<SecretString, MintError>> + Send;
+}
+
+/// Live SSM implementation of [`SecretStore`].
+pub struct SsmSecretStore<'a> {
+    client: &'a SsmClient,
+}
+
+impl<'a> SsmSecretStore<'a> {
+    #[must_use]
+    pub fn new(client: &'a SsmClient) -> Self {
+        Self { client }
+    }
+}
+
+impl SecretStore for SsmSecretStore<'_> {
+    // TEST-EXEMPT: thin live-AWS shell — every decision it feeds is covered by the fake-driven orchestration tests.
+    async fn read(&self, path: String) -> Result<SecretString, MintError> {
+        let response = self
+            .client
+            .get_parameter()
+            .name(&path)
+            .with_decryption(true)
+            .send()
+            .await
+            .map_err(|err| MintError::CredentialRead(format!("{path}: {err}")))?;
+
+        let value = response
+            .parameter()
+            .and_then(aws_sdk_ssm::types::Parameter::value)
+            .ok_or_else(|| MintError::CredentialRead(format!("{path}: parameter has no value")))?;
+
+        if value.trim().is_empty() {
+            return Err(MintError::CredentialRead(format!("{path}: value is empty")));
+        }
+
+        Ok(SecretString::from(value.to_string()))
+    }
+
+    // TEST-EXEMPT: thin live-AWS shell — the refusal that protects it is covered by the fake-driven orchestration tests.
+    async fn write_secure(&self, path: String, value: SecretString) -> Result<(), MintError> {
+        self.client
+            .put_parameter()
+            .name(&path)
+            .value(value.expose_secret())
+            .r#type(ParameterType::SecureString)
+            .overwrite(true)
+            .send()
+            .await
+            .map_err(|err| MintError::Publish(format!("{path}: {err}")))?;
+        Ok(())
+    }
+}
+
+/// Live Dhan HTTP implementation of [`TokenMinter`].
+pub struct DhanHttpMinter<'a> {
+    http: &'a reqwest::Client,
+    auth_base_url: &'a str,
+}
+
+impl<'a> DhanHttpMinter<'a> {
+    #[must_use]
+    pub fn new(http: &'a reqwest::Client, auth_base_url: &'a str) -> Self {
+        Self {
+            http,
+            auth_base_url,
+        }
+    }
+}
+
+impl TokenMinter for DhanHttpMinter<'_> {
+    // TEST-EXEMPT: thin live-HTTP shell — delegates to mint_token, whose decision points (URL building, response classification) are covered by build_mint_url + parse_mint_response tests.
+    async fn mint(&self, credentials: &DhanCredentials) -> Result<SecretString, MintError> {
+        mint_token(self.http, self.auth_base_url, credentials).await
+    }
+}
+
+/// Reads all three Dhan credentials concurrently, through the store seam.
 ///
 /// # Errors
 ///
 /// Returns [`MintError::CredentialRead`] if any parameter is missing or empty.
-// TEST-EXEMPT: live AWS SSM fetch — mirrors secret_manager.rs::fetch_dhan_credentials; the path construction it depends on is covered by build_ssm_path tests.
-pub async fn fetch_credentials(
-    ssm: &SsmClient,
+pub async fn fetch_credentials_from<S: SecretStore>(
+    store: &S,
     environment: &str,
 ) -> Result<DhanCredentials, MintError> {
     let client_id_path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
@@ -313,9 +401,9 @@ pub async fn fetch_credentials(
     );
 
     let (client_id, pin, totp_secret) = tokio::try_join!(
-        read_secret(ssm, &client_id_path),
-        read_secret(ssm, &pin_path),
-        read_secret(ssm, &totp_path),
+        store.read(client_id_path),
+        store.read(pin_path),
+        store.read(totp_path),
     )?;
 
     Ok(DhanCredentials {
@@ -323,6 +411,18 @@ pub async fn fetch_credentials(
         pin,
         totp_secret,
     })
+}
+
+/// Reads all three Dhan credentials concurrently from live SSM.
+///
+/// # Errors
+///
+/// Returns [`MintError::CredentialRead`] if any parameter is missing or empty.
+pub async fn fetch_credentials(
+    ssm: &SsmClient,
+    environment: &str,
+) -> Result<DhanCredentials, MintError> {
+    fetch_credentials_from(&SsmSecretStore::new(ssm), environment).await
 }
 
 /// Mints a fresh Dhan access token via the TOTP flow.
@@ -399,24 +499,27 @@ pub fn describe_transport_error(err: &reqwest::Error) -> String {
 /// Returns [`MintError::Publish`] if the write fails — a loud condition: the
 /// mint already invalidated the previous token, so a failed write leaves every
 /// consumer holding a dead one.
-// TEST-EXEMPT: live AWS SSM write — the path it targets is covered by build_ssm_path tests and pinned against terraform by the wiring guard.
+pub async fn publish_token_to<S: SecretStore>(
+    store: &S,
+    environment: &str,
+    token: &SecretString,
+) -> Result<String, MintError> {
+    let path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_ACCESS_TOKEN_SECRET);
+    store.write_secure(path.clone(), token.clone()).await?;
+    Ok(path)
+}
+
+/// Publishes the token to the live SSM parameter consumers read.
+///
+/// # Errors
+///
+/// Returns [`MintError::Publish`] if the write fails.
 pub async fn publish_token(
     ssm: &SsmClient,
     environment: &str,
     token: &SecretString,
 ) -> Result<String, MintError> {
-    let path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_ACCESS_TOKEN_SECRET);
-
-    ssm.put_parameter()
-        .name(&path)
-        .value(token.expose_secret())
-        .r#type(ParameterType::SecureString)
-        .overwrite(true)
-        .send()
-        .await
-        .map_err(|err| MintError::Publish(format!("{path}: {err}")))?;
-
-    Ok(path)
+    publish_token_to(&SsmSecretStore::new(ssm), environment, token).await
 }
 
 /// The full daily job: read credentials → mint → publish.
@@ -427,15 +530,29 @@ pub async fn publish_token(
 ///
 /// Returns the [`MintError`] describing which stage failed. Every failure is
 /// loud: the Lambda invocation fails, which is what the operator alarm keys on.
-// TEST-EXEMPT: pure composition of three live-AWS/HTTP steps, each individually exempted above; end-to-end proof is the first live invocation.
-pub async fn run_mint_and_publish(
-    ssm: &SsmClient,
-    http: &reqwest::Client,
+pub async fn run_mint_and_publish_with<S: SecretStore, M: TokenMinter>(
+    store: &S,
+    minter: &M,
     environment: &str,
-    auth_base_url: &str,
 ) -> Result<String, MintError> {
-    let credentials = fetch_credentials(ssm, environment).await?;
-    let token = mint_token(http, auth_base_url, &credentials).await?;
+    let credentials = fetch_credentials_from(store, environment).await?;
+    let token = minter.mint(&credentials).await?;
+
+    // THE GATE. A non-JWT value never reaches the write, so an error body or a
+    // truncated response can never replace a working token. It sits here rather
+    // than only inside the minter so the module's headline safety property is
+    // true for ANY `TokenMinter`, not just the one that validates internally.
+    if !looks_like_jwt(token.expose_secret()) {
+        warn!(
+            token_len = token.expose_secret().len(),
+            "refusing to publish — the minted value is not JWT-shaped; the \
+             previous token is left in place"
+        );
+        return Err(MintError::MalformedToken(format!(
+            "minted value is not JWT-shaped (len {})",
+            token.expose_secret().len()
+        )));
+    }
 
     // Length only — never the value.
     info!(
@@ -443,7 +560,7 @@ pub async fn run_mint_and_publish(
         "mint succeeded; publishing to SSM"
     );
 
-    let path = publish_token(ssm, environment, &token).await?;
+    let path = publish_token_to(store, environment, &token).await?;
 
     info!(
         parameter = %path,
@@ -451,6 +568,25 @@ pub async fn run_mint_and_publish(
     );
 
     Ok(path)
+}
+
+/// The full daily job against live AWS + Dhan.
+///
+/// # Errors
+///
+/// Returns the [`MintError`] describing which stage failed.
+pub async fn run_mint_and_publish(
+    ssm: &SsmClient,
+    http: &reqwest::Client,
+    environment: &str,
+    auth_base_url: &str,
+) -> Result<String, MintError> {
+    run_mint_and_publish_with(
+        &SsmSecretStore::new(ssm),
+        &DhanHttpMinter::new(http, auth_base_url),
+        environment,
+    )
+    .await
 }
 
 /// Builds the HTTP client used for the mint.
@@ -939,5 +1075,494 @@ mod tests {
         let before = seen.len();
         seen.dedup();
         assert_eq!(before, seen.len(), "stage labels must be distinct");
+    }
+
+    // -----------------------------------------------------------------------
+    // Orchestration tests — fake seams, real flow.
+    //
+    // These exist because the module's safety properties live in the ORDER of
+    // the steps, not in any single step: a bad mint must never reach the write,
+    // a credential failure must never reach the mint, and a write failure must
+    // be loud and name its path. Reading the code is not proof; these are.
+    // -----------------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    struct FakeStore {
+        /// path -> Some(value) to succeed, None to fail that read.
+        reads: HashMap<String, Option<String>>,
+        /// Every write that actually happened, in order.
+        writes: Mutex<Vec<(String, String)>>,
+        /// When true, every write fails.
+        write_fails: bool,
+    }
+
+    impl FakeStore {
+        fn healthy(env: &str) -> Self {
+            let mut reads = HashMap::new();
+            reads.insert(
+                build_ssm_path(env, SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET),
+                Some("1106656882".to_string()),
+            );
+            reads.insert(
+                build_ssm_path(env, SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
+                Some("123456".to_string()),
+            );
+            reads.insert(
+                build_ssm_path(env, SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
+                Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
+            );
+            Self {
+                reads,
+                writes: Mutex::new(Vec::new()),
+                write_fails: false,
+            }
+        }
+
+        fn writes(&self) -> Vec<(String, String)> {
+            self.writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl SecretStore for FakeStore {
+        async fn read(&self, path: String) -> Result<SecretString, MintError> {
+            match self.reads.get(&path) {
+                Some(Some(value)) => Ok(SecretString::from(value.clone())),
+                Some(None) => Err(MintError::CredentialRead(format!("{path}: value is empty"))),
+                None => Err(MintError::CredentialRead(format!(
+                    "{path}: parameter has no value"
+                ))),
+            }
+        }
+
+        async fn write_secure(&self, path: String, value: SecretString) -> Result<(), MintError> {
+            if self.write_fails {
+                return Err(MintError::Publish(format!("{path}: AccessDenied")));
+            }
+            self.writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((path, value.expose_secret().to_string()));
+            Ok(())
+        }
+    }
+
+    struct FakeMinter(Result<String, MintError>);
+
+    impl TokenMinter for FakeMinter {
+        async fn mint(&self, _credentials: &DhanCredentials) -> Result<SecretString, MintError> {
+            match &self.0 {
+                Ok(token) => Ok(SecretString::from(token.clone())),
+                Err(err) => Err(err.clone()),
+            }
+        }
+    }
+
+    /// A minter that PANICS if reached — proves an earlier stage gated it.
+    struct NeverMinter;
+
+    impl TokenMinter for NeverMinter {
+        async fn mint(&self, _credentials: &DhanCredentials) -> Result<SecretString, MintError> {
+            panic!("the mint must never run when a credential read failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_happy_path_writes_the_token_to_the_expected_path() {
+        let store = FakeStore::healthy("prod");
+        let jwt = sample_jwt();
+        let minter = FakeMinter(Ok(jwt.clone()));
+
+        let path = run_mint_and_publish_with(&store, &minter, "prod")
+            .await
+            .expect("the healthy flow must publish");
+
+        assert_eq!(path, "/tickvault/prod/dhan/access-token");
+        assert_eq!(
+            store.writes(),
+            vec![("/tickvault/prod/dhan/access-token".to_string(), jwt)],
+            "exactly one write, of the minted token, to the access-token path"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_writes_to_the_env_it_was_given_never_a_hardcoded_prod() {
+        let store = FakeStore::healthy("staging");
+        let minter = FakeMinter(Ok(sample_jwt()));
+
+        let path = run_mint_and_publish_with(&store, &minter, "staging")
+            .await
+            .expect("the staging flow must publish");
+
+        assert_eq!(path, "/tickvault/staging/dhan/access-token");
+    }
+
+    #[tokio::test]
+    async fn orchestration_never_writes_a_groww_parameter() {
+        // The secret NAME is identical for both brokers (`access-token`); only
+        // the service segment keeps this Lambda off Groww's parameter, and a
+        // write there would 401 every Groww REST leg.
+        let store = FakeStore::healthy("prod");
+        let minter = FakeMinter(Ok(sample_jwt()));
+
+        run_mint_and_publish_with(&store, &minter, "prod")
+            .await
+            .expect("the healthy flow must publish");
+
+        for (path, _) in store.writes() {
+            assert!(
+                !path.contains("/groww/"),
+                "the minter must never write a Groww parameter; it wrote {path}"
+            );
+            assert!(path.contains("/dhan/"), "expected a Dhan path, got {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_a_non_jwt_mint_is_refused_before_the_write() {
+        // The module's headline safety property: an error body reaching the
+        // publish step must NOT replace a working token.
+        let store = FakeStore::healthy("prod");
+        let minter = FakeMinter(Ok("{\"status\":\"error\"}".to_string()));
+
+        let err = run_mint_and_publish_with(&store, &minter, "prod")
+            .await
+            .expect_err("a non-JWT value must be refused");
+
+        assert_eq!(err.stage(), "malformed_token");
+        assert!(
+            store.writes().is_empty(),
+            "NOTHING may be written when the minted value is malformed"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_an_empty_mint_is_refused_before_the_write() {
+        let store = FakeStore::healthy("prod");
+        let minter = FakeMinter(Ok(String::new()));
+
+        let err = run_mint_and_publish_with(&store, &minter, "prod")
+            .await
+            .expect_err("an empty value must be refused");
+
+        assert_eq!(err.stage(), "malformed_token");
+        assert!(
+            store.writes().is_empty(),
+            "an empty token must never be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_a_mint_failure_never_reaches_the_write() {
+        let store = FakeStore::healthy("prod");
+        let minter = FakeMinter(Err(MintError::DhanError("wrong TOTP".to_string())));
+
+        let err = run_mint_and_publish_with(&store, &minter, "prod")
+            .await
+            .expect_err("a rejected mint must fail the job");
+
+        assert_eq!(err.stage(), "dhan_rejected");
+        assert!(
+            store.writes().is_empty(),
+            "a failed mint must leave the parameter untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_a_missing_credential_never_reaches_the_mint_or_the_write() {
+        let mut store = FakeStore::healthy("prod");
+        store.reads.insert(
+            build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
+            None,
+        );
+
+        let err = run_mint_and_publish_with(&store, &NeverMinter, "prod")
+            .await
+            .expect_err("a missing credential must fail the job");
+
+        assert_eq!(err.stage(), "credential_read");
+        assert!(store.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn orchestration_a_publish_failure_is_loud_and_names_the_path() {
+        let mut store = FakeStore::healthy("prod");
+        store.write_fails = true;
+        let minter = FakeMinter(Ok(sample_jwt()));
+
+        let err = run_mint_and_publish_with(&store, &minter, "prod")
+            .await
+            .expect_err("a failed write must fail the job");
+
+        assert_eq!(err.stage(), "publish");
+        assert!(
+            err.to_string()
+                .contains("/tickvault/prod/dhan/access-token"),
+            "the operator needs the path in the message; got: {err}"
+        );
+        // The message must also say the parameter is now stale — the mint
+        // already invalidated the old token, so a failed write is not benign.
+        assert!(err.to_string().contains("stale"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn orchestration_never_leaks_the_token_value_into_an_error() {
+        let mut store = FakeStore::healthy("prod");
+        store.write_fails = true;
+        let jwt = sample_jwt();
+        let minter = FakeMinter(Ok(jwt.clone()));
+
+        let err = run_mint_and_publish_with(&store, &minter, "prod")
+            .await
+            .expect_err("a failed write must fail the job");
+
+        assert!(
+            !err.to_string().contains(&jwt),
+            "the token value must never appear in an error message"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_credentials_from_reads_exactly_the_three_dhan_paths() {
+        let store = FakeStore::healthy("prod");
+        let creds = fetch_credentials_from(&store, "prod")
+            .await
+            .expect("the healthy reads must succeed");
+
+        assert_eq!(creds.client_id.expose_secret(), "1106656882");
+        assert_eq!(creds.pin.expose_secret(), "123456");
+        assert_eq!(
+            creds.totp_secret.expose_secret(),
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_credentials_from_fails_on_an_empty_value_rather_than_minting_blank() {
+        let mut store = FakeStore::healthy("prod");
+        store.reads.insert(
+            build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
+            None,
+        );
+
+        // Deliberately NOT `expect_err` — that needs `Debug` on the Ok side, and
+        // DhanCredentials must never gain a Debug impl it does not need.
+        let stage = match fetch_credentials_from(&store, "prod").await {
+            Ok(_) => panic!("an empty PIN must fail rather than mint blank"),
+            Err(err) => err.stage(),
+        };
+        assert_eq!(stage, "credential_read");
+    }
+
+    #[tokio::test]
+    async fn publish_token_to_targets_the_access_token_path() {
+        let store = FakeStore::healthy("prod");
+        let token = SecretString::from(sample_jwt());
+        let path = publish_token_to(&store, "prod", &token)
+            .await
+            .expect("the write must succeed");
+        assert_eq!(path, "/tickvault/prod/dhan/access-token");
+        assert_eq!(store.writes().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // mint_token against a real local HTTP server.
+    //
+    // Follows the house idiom already used by crates/api/src/handlers/stats.rs:
+    // a one-shot TcpListener on a random loopback port. No new dependency, and
+    // it exercises the REAL reqwest path — query construction, status
+    // classification, body reading — rather than a mock of it.
+    // -----------------------------------------------------------------------
+
+    /// Starts a one-shot HTTP server that captures the request line and
+    /// answers with `status` and `body`. Returns (base_url, captured_request).
+    async fn start_mint_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<Mutex<String>>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind must succeed");
+        let port = listener
+            .local_addr()
+            .expect("local_addr must be readable")
+            .port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let captured = std::sync::Arc::new(Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&captured);
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap_or(0);
+            if let Ok(mut guard) = sink.lock() {
+                *guard = String::from_utf8_lossy(&buf[..read]).to_string();
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        (base_url, captured)
+    }
+
+    fn test_credentials() -> DhanCredentials {
+        DhanCredentials {
+            client_id: SecretString::from("1106656882".to_string()),
+            pin: SecretString::from("123456".to_string()),
+            totp_secret: SecretString::from("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_token_sends_all_three_credentials_as_query_params_to_the_right_path() {
+        let jwt = sample_jwt();
+        let body: &'static str = Box::leak(
+            format!("{{\"accessToken\":\"{jwt}\",\"dhanClientId\":\"1106656882\"}}")
+                .into_boxed_str(),
+        );
+        let (base, captured) = start_mint_server("200 OK", body).await;
+        let http = build_http_client().expect("client must build");
+
+        let token = mint_token(&http, &base, &test_credentials())
+            .await
+            .expect("a 200 with a JWT must mint");
+
+        assert_eq!(token.expose_secret(), jwt);
+
+        let request = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            request.starts_with("POST /app/generateAccessToken?"),
+            "must POST the documented path; got: {}",
+            request.lines().next().unwrap_or_default()
+        );
+        assert!(
+            request.contains("dhanClientId=1106656882"),
+            "got: {request}"
+        );
+        assert!(request.contains("pin=123456"), "got: {request}");
+        assert!(request.contains("totp="), "the TOTP code must be sent");
+    }
+
+    #[tokio::test]
+    async fn mint_token_maps_a_non_2xx_to_http_status_with_a_captured_body() {
+        let (base, _) = start_mint_server("503 Service Unavailable", "upstream down").await;
+        let http = build_http_client().expect("client must build");
+
+        let err = mint_token(&http, &base, &test_credentials())
+            .await
+            .expect_err("a 503 must fail");
+
+        assert_eq!(err.stage(), "http_status");
+        match err {
+            MintError::HttpStatus { status, body } => {
+                assert_eq!(status, 503);
+                assert_eq!(body, "upstream down");
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_token_maps_dhans_200_with_error_envelope_to_dhan_rejected() {
+        // Dhan answers 200 with an error envelope for a wrong PIN or TOTP.
+        let (base, _) = start_mint_server(
+            "200 OK",
+            "{\"status\":\"error\",\"message\":\"Invalid TOTP\"}",
+        )
+        .await;
+        let http = build_http_client().expect("client must build");
+
+        let err = mint_token(&http, &base, &test_credentials())
+            .await
+            .expect_err("an error envelope must fail even at HTTP 200");
+
+        assert_eq!(err.stage(), "dhan_rejected");
+        assert!(err.to_string().contains("Invalid TOTP"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn mint_token_refuses_a_200_carrying_a_non_jwt_token() {
+        let (base, _) = start_mint_server("200 OK", "{\"accessToken\":\"not-a-jwt\"}").await;
+        let http = build_http_client().expect("client must build");
+
+        let err = mint_token(&http, &base, &test_credentials())
+            .await
+            .expect_err("a non-JWT token must be refused");
+
+        assert_eq!(err.stage(), "malformed_token");
+    }
+
+    #[tokio::test]
+    async fn mint_token_error_for_a_bad_status_never_echoes_the_pin() {
+        // The URL carries the PIN in its query string. No error rendering may
+        // include it — that is why describe_transport_error exists and why the
+        // HttpStatus arm captures only the BODY.
+        let (base, _) = start_mint_server("500 Internal Server Error", "boom").await;
+        let http = build_http_client().expect("client must build");
+
+        let err = mint_token(&http, &base, &test_credentials())
+            .await
+            .expect_err("a 500 must fail");
+
+        let rendered = err.to_string();
+        assert!(!rendered.contains("123456"), "PIN leaked: {rendered}");
+        assert!(!rendered.contains("pin="), "PIN param leaked: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn mint_token_surfaces_a_transport_failure_without_the_url() {
+        // Nothing is listening on this port, so reqwest fails at connect. The
+        // error must be classified by KIND, never rendered with its URL.
+        let http = build_http_client().expect("client must build");
+
+        let err = mint_token(&http, "http://127.0.0.1:1", &test_credentials())
+            .await
+            .expect_err("a closed port must fail");
+
+        assert_eq!(err.stage(), "transport");
+        let rendered = err.to_string();
+        assert!(!rendered.contains("127.0.0.1"), "URL leaked: {rendered}");
+        assert!(!rendered.contains("123456"), "PIN leaked: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn run_mint_and_publish_end_to_end_over_real_http_and_a_fake_store() {
+        // The FULL flow with only the SSM boundary faked: real HTTP mint, real
+        // gate, real path construction.
+        let jwt = sample_jwt();
+        let body: &'static str =
+            Box::leak(format!("{{\"accessToken\":\"{jwt}\"}}").into_boxed_str());
+        let (base, _) = start_mint_server("200 OK", body).await;
+        let http = build_http_client().expect("client must build");
+        let store = FakeStore::healthy("prod");
+        let minter = DhanHttpMinter::new(&http, &base);
+
+        let path = run_mint_and_publish_with(&store, &minter, "prod")
+            .await
+            .expect("the end-to-end flow must publish");
+
+        assert_eq!(path, "/tickvault/prod/dhan/access-token");
+        assert_eq!(
+            store.writes(),
+            vec![("/tickvault/prod/dhan/access-token".to_string(), jwt)]
+        );
     }
 }
