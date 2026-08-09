@@ -32,11 +32,25 @@
 //! Acquire semantics:
 //!   * `PutParameter` with `overwrite=false` is the atomic "claim" —
 //!     SSM rejects the request if the parameter already exists.
-//!   * On rejection we `GetParameter`, parse the JSON, and check the
-//!     holder's `last_heartbeat_unix`. If older than
-//!     `INSTANCE_LOCK_TTL_SECS` the slot is considered stale and we
-//!     take over via `PutParameter(overwrite=true)`. Otherwise we
-//!     return `AlreadyHeld { holder }`.
+//!   * On rejection we `GetParameter`, parse the JSON, and classify the
+//!     holder's `last_heartbeat_unix` via [`LockValue::freshness`]. If
+//!     older than `INSTANCE_LOCK_TTL_SECS` — and the two clocks
+//!     plausibly agree — the slot is considered stale and we take over
+//!     via `PutParameter(overwrite=true)`. Otherwise we return
+//!     `AlreadyHeld { holder }`.
+//!   * **Clock skew (2026-08-09).** The takeover decision compares two
+//!     WALL clocks on two different boxes and there is no fencing token,
+//!     so it is only as good as time sync. A heartbeat dated in the
+//!     acquirer's FUTURE beyond `INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS` is
+//!     therefore refused as `ClockSkewFuture` — loudly, with a
+//!     `RESILIENCE-01` line and `tv_instance_lock_clock_skew_refused_total`
+//!     — instead of being floored to age 0 by `saturating_sub` and
+//!     silently deadlocking boot until wall clock caught up. The opposite
+//!     direction (an acquirer whose clock jumped FORWARD past the TTL,
+//!     stealing the lock from a HEALTHY holder — the Dhan
+//!     one-active-token mint war) is NOT distinguishable from a real
+//!     crash using these two numbers, so every takeover is counted
+//!     (`tv_instance_lock_stale_takeover_total`) and warned instead.
 //!   * Heartbeat: every 30s the owner re-issues `PutParameter` with a
 //!     refreshed `last_heartbeat_unix`. Two missed renewals still leave
 //!     30s of headroom before another instance considers the slot stale.
@@ -64,6 +78,18 @@ pub const INSTANCE_LOCK_TTL_SECS: u64 = 90;
 /// Heartbeat interval — 1/3 of the TTL. Two missed renewals still leave
 /// 30 seconds of headroom before the lock is considered stale.
 pub const INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// Tolerated skew, in seconds, between the ACQUIRER's wall clock and the
+/// holder's recorded `last_heartbeat_unix`.
+///
+/// The lock has no fencing token: staleness is judged purely by comparing
+/// two wall clocks on two different boxes. A heartbeat that sits in the
+/// acquirer's FUTURE by more than this tolerance cannot be explained by a
+/// healthy holder writing a slightly-ahead timestamp — it means the two
+/// clocks genuinely disagree, so NO staleness verdict from those numbers
+/// is trustworthy. 5 s is generous for NTP-disciplined hosts (typical
+/// offsets are sub-100 ms) while still catching a real step.
+pub const INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS: u64 = 5;
 
 /// SSM Parameter path prefix. Full path is `{prefix}/{env}/instance-lock`
 /// so dev / sandbox / prod cannot stomp on each other.
@@ -182,10 +208,39 @@ impl LockValue {
     }
 
     /// Pure function: is this lock value stale relative to `now_unix`
-    /// using the given TTL? Used by acquire-takeover decisions.
+    /// using the given TTL?
+    ///
+    /// **Clock-skew blind.** `saturating_sub` floors a future-dated
+    /// heartbeat at age 0, so this returns `false` forever against a
+    /// holder whose recorded heartbeat is ahead of `now_unix` — a boot
+    /// that can never take over even after that holder is long dead.
+    /// Acquire decisions therefore go through [`LockValue::freshness`],
+    /// which separates that case out. Kept for callers that only need
+    /// the plain TTL question.
     #[must_use]
     pub fn is_stale(&self, now_unix: u64, ttl_secs: u64) -> bool {
         now_unix.saturating_sub(self.last_heartbeat_unix) > ttl_secs
+    }
+
+    /// Pure function: classify this holder's heartbeat against the
+    /// acquirer's own wall clock — the skew-aware replacement for
+    /// [`LockValue::is_stale`] on the acquire path.
+    ///
+    /// Evaluation order matters: the skew check runs FIRST, because when
+    /// the two clocks disagree the age arithmetic is meaningless and must
+    /// not be allowed to produce a takeover verdict.
+    #[must_use]
+    pub fn freshness(&self, now_unix: u64, ttl_secs: u64, max_skew_secs: u64) -> LockFreshness {
+        let skew_secs = self.last_heartbeat_unix.saturating_sub(now_unix);
+        if skew_secs > max_skew_secs {
+            return LockFreshness::ClockSkewFuture { skew_secs };
+        }
+        let age_secs = now_unix.saturating_sub(self.last_heartbeat_unix);
+        if age_secs > ttl_secs {
+            LockFreshness::Stale { age_secs }
+        } else {
+            LockFreshness::Fresh { age_secs }
+        }
     }
 
     pub fn to_json(&self) -> Result<String> {
@@ -194,6 +249,52 @@ impl LockValue {
 
     pub fn from_json(raw: &str) -> Result<Self> {
         serde_json::from_str(raw).context("parse LockValue JSON")
+    }
+}
+
+/// Verdict of [`LockValue::freshness`] — the acquire path's three-way
+/// split over "is the current holder alive?".
+///
+/// The two-clock comparison this is derived from has NO fencing token, so
+/// the honest envelope is: a BACKWARD-dated heartbeat is detectable and
+/// refused (`ClockSkewFuture`); an acquirer clock that jumped FORWARD past
+/// the TTL is NOT distinguishable from a genuinely dead holder using these
+/// two numbers alone, so it is counted and logged on takeover
+/// (`tv_instance_lock_stale_takeover_total`) rather than prevented. A fleet
+/// with no crashes should see that counter stay at 0; any increment is
+/// either a real crash recovery or a forward clock step, and both deserve
+/// the operator's eye.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockFreshness {
+    /// Heartbeat within TTL — the holder is alive. Do NOT take over.
+    Fresh { age_secs: u64 },
+    /// Heartbeat older than TTL, with the clocks in plausible agreement —
+    /// takeover is allowed.
+    Stale { age_secs: u64 },
+    /// The heartbeat is dated in the acquirer's FUTURE beyond
+    /// [`INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS`]. The clocks disagree, so no
+    /// staleness verdict is trustworthy: fail closed (refuse the lock) and
+    /// say so loudly instead of silently deadlocking on
+    /// `saturating_sub`-floored age 0.
+    ClockSkewFuture { skew_secs: u64 },
+}
+
+impl LockFreshness {
+    /// `true` only for [`LockFreshness::Stale`] — the ONE verdict that
+    /// authorises overwriting another instance's lock.
+    #[must_use]
+    pub fn allows_takeover(&self) -> bool {
+        matches!(self, Self::Stale { .. })
+    }
+
+    /// Short stable label for logs / metric labels.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fresh { .. } => "fresh",
+            Self::Stale { .. } => "stale",
+            Self::ClockSkewFuture { .. } => "clock_skew_future",
+        }
     }
 }
 
@@ -301,16 +402,74 @@ async fn try_acquire_lock_at_path(
         }
     };
 
-    // Step 3 — evaluate freshness. If stale, take over via overwrite=true.
-    match LockValue::from_json(&raw) {
-        Ok(existing) if existing.is_stale(now, INSTANCE_LOCK_TTL_SECS) => {
+    // Step 3 — evaluate freshness (SKEW-AWARE since 2026-08-09). If stale
+    // AND the two clocks plausibly agree, take over via overwrite=true.
+    let parsed = LockValue::from_json(&raw).map(|existing| {
+        let verdict = existing.freshness(
+            now,
+            INSTANCE_LOCK_TTL_SECS,
+            INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS,
+        );
+        (existing, verdict)
+    });
+    match parsed {
+        Ok((existing, LockFreshness::ClockSkewFuture { skew_secs })) => {
+            // The holder's heartbeat is dated in OUR future by more than
+            // the tolerance: the clocks disagree, so the age arithmetic
+            // that decides staleness is meaningless. Fail closed (the
+            // existing house intent: when in doubt, do NOT take the lock)
+            // — but LOUDLY, because the pre-2026-08-09 code silently
+            // floored this to age 0 via `saturating_sub` and therefore
+            // refused boot FOREVER, self-healing only once wall clock
+            // caught up.
+            metrics::counter!(
+                "tv_instance_lock_clock_skew_refused_total",
+                "direction" => "holder_ahead"
+            )
+            .increment(1);
+            error!(
+                target: "tickvault::instance_lock",
+                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                severity = ErrorCode::Resilience01DualInstanceDetected
+                    .severity()
+                    .as_str(),
+                path = %path,
+                prior_holder = %existing.host_id,
+                prior_heartbeat_unix = existing.last_heartbeat_unix,
+                our_now_unix = now,
+                skew_secs,
+                max_skew_secs = INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS,
+                verdict = LockFreshness::ClockSkewFuture { skew_secs }.as_str(),
+                "RESILIENCE-01: instance-lock CLOCK SKEW — the holder's heartbeat is \
+                 dated in our future; staleness cannot be judged, refusing boot \
+                 (fail-closed). Fix time sync on this host or the holder before \
+                 retrying; this will NOT clear on its own"
+            );
+            Ok(AcquireOutcome::AlreadyHeld {
+                holder: existing.host_id,
+            })
+        }
+        Ok((existing, LockFreshness::Stale { age_secs })) => {
+            // Forward direction: an acquirer clock that jumped ahead past
+            // the TTL is indistinguishable from a genuinely dead holder
+            // using only these two wall clocks (no fencing token exists).
+            // It is therefore COUNTED and logged on every takeover, never
+            // silently performed — on a healthy fleet this counter stays
+            // at 0.
+            metrics::counter!("tv_instance_lock_stale_takeover_total").increment(1);
             warn!(
                 target: "tickvault::instance_lock",
                 path = %path,
                 prior_holder = %existing.host_id,
                 prior_heartbeat_unix = existing.last_heartbeat_unix,
-                age_secs = now.saturating_sub(existing.last_heartbeat_unix),
-                "prior lock holder is stale — taking over via overwrite"
+                our_now_unix = now,
+                age_secs,
+                ttl_secs = INSTANCE_LOCK_TTL_SECS,
+                verdict = LockFreshness::Stale { age_secs }.as_str(),
+                "prior lock holder is stale — taking over via overwrite. If the prior \
+                 holder is in fact ALIVE, this host's clock has jumped forward: \
+                 verify time sync (the lock has no fencing token, so a forward step \
+                 is observable here but not preventable)"
             );
             put_parameter(ssm, path, &payload, true)
                 .await
@@ -325,7 +484,7 @@ async fn try_acquire_lock_at_path(
             );
             Ok(AcquireOutcome::Acquired)
         }
-        Ok(existing) => Ok(AcquireOutcome::AlreadyHeld {
+        Ok((existing, LockFreshness::Fresh { .. })) => Ok(AcquireOutcome::AlreadyHeld {
             holder: existing.host_id,
         }),
         Err(parse_err) => {
@@ -1061,6 +1220,227 @@ mod tests {
         // saturating_sub handles backwards clock skew without panic.
         let v = LockValue::new("x", 1000);
         assert!(!v.is_stale(500, INSTANCE_LOCK_TTL_SECS));
+    }
+
+    // -----------------------------------------------------------------------
+    // LockValue::freshness — the 2026-08-09 skew-aware acquire classifier.
+    //
+    // The two clocks being compared live on two different boxes and there is
+    // no fencing token, so these tests pin BOTH skew directions plus the
+    // ordinary fresh/stale split.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_freshness_constants_pinned() {
+        assert_eq!(INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS, 5);
+        // The tolerance must stay far below the TTL, or a skew allowance
+        // could swallow the entire staleness window.
+        assert!(INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS < INSTANCE_LOCK_TTL_SECS);
+    }
+
+    #[test]
+    fn test_lock_freshness_as_str_labels_are_stable() {
+        // These strings ride log fields an operator greps — pin them.
+        assert_eq!(LockFreshness::Fresh { age_secs: 0 }.as_str(), "fresh");
+        assert_eq!(LockFreshness::Stale { age_secs: 91 }.as_str(), "stale");
+        assert_eq!(
+            LockFreshness::ClockSkewFuture { skew_secs: 6 }.as_str(),
+            "clock_skew_future"
+        );
+    }
+
+    #[test]
+    fn test_lock_freshness_allows_takeover_only_for_stale() {
+        assert!(!LockFreshness::Fresh { age_secs: 0 }.allows_takeover());
+        assert!(LockFreshness::Stale { age_secs: 91 }.allows_takeover());
+        assert!(!LockFreshness::ClockSkewFuture { skew_secs: 6 }.allows_takeover());
+    }
+
+    #[test]
+    fn test_freshness_normal_case_is_fresh() {
+        // The everyday path: a healthy holder heartbeating every 30s.
+        let v = LockValue::new("holder", 1_000);
+        let verdict = v.freshness(
+            1_000 + INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS,
+            INSTANCE_LOCK_TTL_SECS,
+            INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS,
+        );
+        assert_eq!(
+            verdict,
+            LockFreshness::Fresh {
+                age_secs: INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS
+            }
+        );
+        assert!(!verdict.allows_takeover());
+        assert_eq!(verdict.as_str(), "fresh");
+    }
+
+    #[test]
+    fn test_freshness_at_exact_ttl_is_fresh_not_stale() {
+        // Strict greater-than, matching is_stale — the boundary belongs to
+        // the holder (fail-closed direction).
+        let v = LockValue::new("holder", 1_000);
+        assert_eq!(
+            v.freshness(
+                1_000 + INSTANCE_LOCK_TTL_SECS,
+                INSTANCE_LOCK_TTL_SECS,
+                INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS
+            ),
+            LockFreshness::Fresh {
+                age_secs: INSTANCE_LOCK_TTL_SECS
+            }
+        );
+    }
+
+    #[test]
+    fn test_freshness_one_second_past_ttl_is_stale_and_allows_takeover() {
+        let v = LockValue::new("crashed", 1_000);
+        let verdict = v.freshness(
+            1_000 + INSTANCE_LOCK_TTL_SECS + 1,
+            INSTANCE_LOCK_TTL_SECS,
+            INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS,
+        );
+        assert_eq!(
+            verdict,
+            LockFreshness::Stale {
+                age_secs: INSTANCE_LOCK_TTL_SECS + 1
+            }
+        );
+        assert!(verdict.allows_takeover());
+        assert_eq!(verdict.as_str(), "stale");
+    }
+
+    #[test]
+    fn test_freshness_backward_skew_holder_ahead_is_refused_not_deadlocked() {
+        // BUG (backward direction): the holder's heartbeat sits in OUR
+        // future. `is_stale` floors the age at 0 via saturating_sub, so it
+        // returns false FOREVER — boot refuses against a long-dead holder
+        // and only self-heals once wall clock catches up. `freshness`
+        // classifies it as a distinct, loud, counted condition instead.
+        let v = LockValue::new("holder", 10_000);
+        let now = 10_000 - (INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS + 1);
+
+        // The old predicate: silently "not stale", indistinguishable from
+        // a healthy holder.
+        assert!(!v.is_stale(now, INSTANCE_LOCK_TTL_SECS));
+
+        let verdict = v.freshness(
+            now,
+            INSTANCE_LOCK_TTL_SECS,
+            INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS,
+        );
+        assert_eq!(
+            verdict,
+            LockFreshness::ClockSkewFuture {
+                skew_secs: INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS + 1
+            }
+        );
+        // Fail-closed intent preserved: skew NEVER authorises a takeover.
+        assert!(!verdict.allows_takeover());
+        assert_eq!(verdict.as_str(), "clock_skew_future");
+    }
+
+    #[test]
+    fn test_freshness_small_backward_skew_within_tolerance_stays_fresh() {
+        // NTP-disciplined hosts routinely differ by a fraction of a second;
+        // that must not be reported as a skew incident.
+        let v = LockValue::new("holder", 10_000);
+        for skew in 0..=INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS {
+            let verdict = v.freshness(
+                10_000 - skew,
+                INSTANCE_LOCK_TTL_SECS,
+                INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS,
+            );
+            assert_eq!(
+                verdict,
+                LockFreshness::Fresh { age_secs: 0 },
+                "skew of {skew}s is inside tolerance and must stay Fresh"
+            );
+        }
+    }
+
+    #[test]
+    fn test_freshness_skew_check_wins_over_staleness_arithmetic() {
+        // Ordering matters: when the clocks disagree, the age arithmetic is
+        // meaningless and must never be allowed to produce Stale. Here the
+        // heartbeat is far in our future — an is_stale-style read would say
+        // "age 0, fresh"; either way a takeover verdict would be a lie.
+        let v = LockValue::new("holder", 1_000_000);
+        let verdict = v.freshness(1, INSTANCE_LOCK_TTL_SECS, INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS);
+        assert!(matches!(verdict, LockFreshness::ClockSkewFuture { .. }));
+        assert!(!verdict.allows_takeover());
+    }
+
+    #[test]
+    fn test_freshness_forward_skew_steals_from_healthy_holder_is_stale_and_counted() {
+        // BUG (forward direction, CRITICAL): our clock jumped forward past
+        // the TTL, so a holder that heartbeated one second ago in real time
+        // looks dead. With no fencing token this is NOT distinguishable
+        // from a real crash — the honest contract is that it classifies as
+        // Stale (takeover proceeds, so an overnight crash still recovers)
+        // and the call site COUNTS + WARNS on every takeover.
+        let v = LockValue::new("healthy-holder", 1_000);
+        let jumped_forward = 1_000 + INSTANCE_LOCK_TTL_SECS + 1;
+        let verdict = v.freshness(
+            jumped_forward,
+            INSTANCE_LOCK_TTL_SECS,
+            INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS,
+        );
+        assert!(verdict.allows_takeover());
+        assert_eq!(verdict.as_str(), "stale");
+    }
+
+    #[test]
+    fn test_freshness_extremes_do_not_panic() {
+        // u64 saturation on both ends — no overflow, no panic, always a
+        // verdict.
+        let far_future = LockValue::new("h", u64::MAX);
+        assert!(matches!(
+            far_future.freshness(0, INSTANCE_LOCK_TTL_SECS, INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS),
+            LockFreshness::ClockSkewFuture { .. }
+        ));
+        let epoch = LockValue::new("h", 0);
+        assert!(matches!(
+            epoch.freshness(
+                u64::MAX,
+                INSTANCE_LOCK_TTL_SECS,
+                INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS
+            ),
+            LockFreshness::Stale { .. }
+        ));
+        // Zero tolerance degenerates safely: any future-dating is skew.
+        let v = LockValue::new("h", 10);
+        assert_eq!(
+            v.freshness(9, INSTANCE_LOCK_TTL_SECS, 0),
+            LockFreshness::ClockSkewFuture { skew_secs: 1 }
+        );
+        assert_eq!(
+            v.freshness(10, INSTANCE_LOCK_TTL_SECS, 0),
+            LockFreshness::Fresh { age_secs: 0 }
+        );
+    }
+
+    #[test]
+    fn test_freshness_agrees_with_is_stale_whenever_clocks_agree() {
+        // The classifier must be a strict refinement: for every non-skewed
+        // (now, heartbeat) pair its Stale verdict matches the old
+        // predicate exactly, so no existing behaviour silently changed.
+        let base = 100_000_u64;
+        for age in [0_u64, 1, 30, 89, 90, 91, 200, 86_400] {
+            let v = LockValue::new("h", base);
+            let now = base + age;
+            let stale_by_predicate = v.is_stale(now, INSTANCE_LOCK_TTL_SECS);
+            let verdict = v.freshness(
+                now,
+                INSTANCE_LOCK_TTL_SECS,
+                INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS,
+            );
+            assert_eq!(
+                verdict.allows_takeover(),
+                stale_by_predicate,
+                "age {age}s: freshness and is_stale must agree when clocks agree"
+            );
+        }
     }
 
     #[test]
