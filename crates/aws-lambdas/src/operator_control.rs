@@ -2403,15 +2403,21 @@ mod tests {
         // the class this repo's guards exist to eliminate. Correcting it is
         // worth more than byte-identity with a retired template.
         //
+        // 2026-08-08: SECOND intentional divergence (operator Quote 14). The
+        // stopped-box banner read "auto-stops 16:30 IST" — factually wrong once
+        // the 9-hour window moved the stop to 17:30. Same class as the 2026-08-07
+        // correction above: an operator-facing time that lies by an hour. Note
+        // the ratchet caught this edit, which is exactly its job — the banner is
+        // the operator's only in-console statement of when the box goes down.
+        //
         // The pin REMAINS a content ratchet — any further unreviewed edit to
         // the console HTML still fails the build; it simply no longer claims
-        // legacy-byte-identity. Length is coincidentally unchanged (the label
-        // swapped 3 -> 4 in one character position).
+        // legacy-byte-identity.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "b1f335118e3c1252d2a28df59f7bd8803035fa48b5fb1713416a35156192ee6d"
+            "a0310d91329bd0c926261f79e907b9f35169a9234d791b09265d14f117636825"
         );
         assert_eq!(CONSOLE_HTML.len(), 45_612);
     }
@@ -4158,7 +4164,7 @@ data-pull phase, so the system is never blinded mid-trade";
         // One calm banner replaces the per-shield "unreachable" scatter…
         assert!(CONSOLE_HTML.contains(r#"id="stoppedbanner""#));
         assert!(CONSOLE_HTML.contains(
-        "Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start"
+        "Box stopped (auto-stops 17:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start"
     ));
         assert!(CONSOLE_HTML.contains("$('stoppedbanner').hidden=running"));
         // …and the shield greys out as "—" ONLY when the box is not running.

@@ -25,13 +25,24 @@ variable "environment" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type. MUST be t4g.large per operator lock 2026-08-07 (Graviton2 burstable, 2 vCPU / 8 GiB, $0.0448/hr ap-south-1; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 12, which supersedes the 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large locks). Changed because AWS ran out of t4g.medium capacity in ap-south-1a and the box — pinned to that single AZ by main.tf — could not start for whole trading sessions; a different type draws from a different capacity pool."
+  description = "EC2 instance type. MUST be r8g.xlarge per operator lock 2026-08-08 (Graviton4 memory-optimised, 4 vCPU / 32 GiB; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 13, which supersedes the 2026-08-07 t4g.large + 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large locks). Sized for the 13-timeframe (1s/5s/10s/15s/30s + 1m/2m/3m/5m/15m/30m/60m + 1d) current-day workload WITH raw-tick retention at ~25,000 instruments: 13 TF x 128 B LiveCandleState x 25k = 42 MB, seal ring 29 MB, a day of ticks 2.3-7.2 GB, QuestDB 8-16 GB, app+OS 6-12 GB => 14-31 GB in 32 GiB. `r` (8 GiB/vCPU) because the workload is memory-bound: m8g would force buying unused CPU to reach the same RAM, r8gd's local NVMe is WIPED on every stop (the box stops daily), and r8i would force an x86 rebuild of the whole ARM pipeline. NOTE the AZ pin was removed in the same change — see var.availability_zone; the 2026-08-07 type-only flip failed with InsufficientInstanceCapacity precisely because it left the pin in place."
   type        = string
-  default     = "t4g.large"
+  default     = "r8g.xlarge"
 
   validation {
-    condition     = var.instance_type == "t4g.large"
-    error_message = "Instance type is pinned to t4g.large (Graviton2, 8 GiB) per operator lock 2026-08-07 (Quote 12 — escaping an InsufficientInstanceCapacity outage on t4g.medium in ap-south-1a). This SUPERSEDES the 2026-07-15 t4g.medium lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
+    condition     = var.instance_type == "r8g.xlarge"
+    error_message = "Instance type is pinned to r8g.xlarge (Graviton4, 4 vCPU / 32 GiB) per operator lock 2026-08-08 (Quote 13 — the 13-timeframe + current-day tick-retention requirement). This SUPERSEDES the 2026-08-07 t4g.large lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
+  }
+}
+
+variable "availability_zone" {
+  description = "Which ap-south-1 AZ suffix the instance launches into (a|b|c). Added 2026-08-08 (operator Quote 13) to END the single-AZ pin that kept the box unstartable 2026-08-06 -> 2026-08-08: ap-south-1a ran out of capacity, and a stopped instance can only restart in its own AZ, so every start returned InsufficientInstanceCapacity — and the 2026-08-07 escape attempt via a bigger instance type was refused for the SAME reason, proving the zone was the constraint. Subnets now exist in all three AZs (main.tf), so a capacity refusal is a one-variable change + re-apply instead of days of downtime. Default 'b' because 'a' is the zone that failed. NOTE: changing this REPLACES the instance (an instance cannot move zones) and the root EBS volume does NOT follow (EBS is zone-locked) — migrate via snapshot; see .claude/plans/proposals/2026-08-08-r8g-xlarge-migration.md Phase 2."
+  type        = string
+  default     = "b"
+
+  validation {
+    condition     = contains(["a", "b", "c"], var.availability_zone)
+    error_message = "availability_zone must be one of a, b, c (the ap-south-1 AZ suffixes). All candidate instance types are offered in all three — verified 2026-08-08 via describe-instance-type-offerings."
   }
 }
 
@@ -66,13 +77,32 @@ variable "enable_eip" {
 variable "ebs_gp3_size_gb" {
   description = "Root EBS volume size in GB. 20 per the 2026-07-15 downsize pre-stage (executor decision recorded in daily-universe-scope-expansion-2026-05-27.md §0 under Quote 8 + §7 Rule 3 — NOT operator-quoted scope): gp3 can NEVER shrink (`modify-volume` grows only, and a larger snapshot cannot restore into a smaller volume), so the LIVE root stays at its current size until a deliberate terminate-and-recreate in the operator's post-market data-erase window replaces it (the box is fully cattle-provisioned by user-data.sh.tftpl; the pre-downsize snapshot is the rollback). LIVE SIZE CORRECTED 2026-07-19: describe-volumes on vol-073ccaa417a0f344b returned 30 GiB gp3 — the 2026-07-13 approved 30->50 grow was recorded but never physically applied (see daily-universe §7 2026-07-19 correction note). SAME-DAY RULING (daily-universe §0 Quote 9): 30 GB formally ACCEPTED, the grow CANCELLED — any future grow needs a fresh dated quote; the 20 GB fresh-provision target below stays a separate un-quoted executor pre-stage. History: 10 -> 30 (2026-05-29 Quote 6) -> [50 approved 2026-07-13, never applied; live verified 30 on 2026-07-19] -> 20 target (2026-07-15). The partition manager archives partitions >90d to the cheaper S3 cold bucket, so 20 GB holds the hot window on the erased fresh volume. root_block_device[0].volume_size is in the instance lifecycle.ignore_changes so a `terraform apply` does NOT touch the LIVE volume. This var documents the intended size for a FRESH provision only; any LIVE grow stays out-of-band via scripts/aws-upgrade-instance.sh --ebs-size (online aws ec2 modify-volume, no stop)."
   type        = number
-  default     = 20
+  default     = 100
 
   validation {
     condition     = var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 200
-    error_message = "EBS is sized 10-200 GB. 20 GB default per the 2026-07-15 downsize pre-stage (fresh-volume replacement target; the live root is 30 GB — verified 2026-07-19 via describe-volumes; the 2026-07-13 approved grow to 50 was never physically applied; gp3 cannot shrink). gp3 grows online beyond this if needed."
+    error_message = "EBS is sized 10-200 GB. 100 GB default per operator lock 2026-08-08 (Quote 13 — the 13-timeframe + current-day tick-retention workload; the live root is 30 GB and gp3 cannot shrink, so 100 lands only on the fresh volume at the multi-AZ recreate). gp3 grows online beyond this if needed."
   }
 }
+
+# 2026-08-08 (operator Quote 13) — DEFAULT RAISED 20 -> 100 GB.
+#
+# Sized for the 13-timeframe (1s/5s/10s/15s/30s + 1m/2m/3m/5m/15m/30m/60m + 1d)
+# current-day workload WITH raw-tick retention at ~25,000 instruments:
+#   ticks     ~25-80 M rows/day (ASSUMED - swings the estimate 3x) => 44-141 GB/mo
+#   13 TFs    ~46 M rows/day sparse                               => ~61 GB/mo
+# with ~30 days held on disk and the rest archived to S3 by the partition manager.
+#
+# The sparse figure is VERIFIED, not assumed: live_candle_state.rs:105 makes an
+# unopened bucket a sentinel that emits nothing, which is the difference between
+# ~46 M rows/day (~2,050/sec, inside the ~5,000/sec ingest envelope) and a dense
+# 808 M rows/day (~35,900/sec, 7x over).
+#
+# WHY 100 AND NOT 250, deliberately: gp3 grows ONLINE in one command but can
+# NEVER shrink (§7 Mechanical Rule 3). Starting small is therefore the only
+# reversible direction - if the real tick volume lands at the top of the assumed
+# range, grow it live; if it lands low, nothing was wasted. Oversizing "to be
+# safe" is the one mistake here that cannot be undone without another recreate.
 
 variable "ebs_gp3_iops" {
   description = "Root gp3 EBS provisioned IOPS. 3000 is the gp3 baseline (free, included). Range 3000-16000 — raise alongside throughput when the QuestDB write/read load grows (e.g. both feeds at ~2K SIDs). scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume; root_block_device[0].iops is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-bumped value. This var documents the intended IOPS for a FRESH provision."

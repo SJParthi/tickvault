@@ -233,7 +233,11 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # env-missing FALLBACK only — this env var is always injected, so the
       # runtime kill line is $35; aligning the fallback const is a flagged
       # follow-up, fail direction = kills later, never earlier.)
-      BUDGET_KILL_USD = "35"
+      # $35 -> $100 on 2026-08-08 per the operator ruling recorded verbatim in
+      # budget.tf (Quote 13 — r8g.xlarge for the 13-timeframe + tick-retention
+      # requirement; the bill's high estimate is $73.60 and the actions fire at
+      # 90%/100%, so a ceiling under ~$82 would stop the box mid-session).
+      BUDGET_KILL_USD = "100"
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).
       PING_STATE_PARAM = "/tickvault/${var.environment}/budget-guard/ping-state"

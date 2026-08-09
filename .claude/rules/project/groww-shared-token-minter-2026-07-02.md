@@ -308,3 +308,116 @@ The §7 trigger list applies. Additionally reinforced on any session editing
 `crates/core/tests/dhan_token_publish_guard.rs`, or any file containing
 `DHAN_ACCESS_TOKEN_SECRET`, `tv_dhan_token_publish_total`, or
 `dhan_access_token_ssm_param`.
+
+---
+
+## §10. 2026-08-08 — THE DHAN TOKEN MINTER LAMBDA (box-independent; supersedes §9's minter placement)
+
+> **This section SUPERSEDES §9's "tickvault is the Dhan minter" placement.**
+> §9 correctly identified the defect (the Dhan token was never published) and
+> shipped the publish. §10 fixes a SECOND defect §9 did not address: §9 left
+> the MINTER on the prod EC2 box, so token freshness stayed coupled to the box
+> being up. §9's publisher code is RETAINED and is not deleted — see
+> "Coexistence" below. Sections §1–§9 remain the historical record.
+
+### §10.0 The verbatim operator authorization (2026-08-08)
+
+> "build the lambda"
+
+Given in direct response to a message proposing exactly this: a Dhan token
+minter Lambda mirroring the Groww one, so token freshness stops depending on
+the EC2 box. Reconfirmed the same session: "yes yes yes".
+
+### §10.1 The incident this closes (Verified, live evidence)
+
+| Fact | Evidence |
+|---|---|
+| Dhan permits ONE active token per account | `docs/dhan-ref/02-authentication.md:216` |
+| The Dhan token parameter had not been written since **25 July** | brutex-side `describe`/console read, 2026-08-08 |
+| The Groww parameter refreshed normally the same morning (00:35 GMT) | same read — the asymmetry IS the finding |
+| Prod box unstartable since ~2026-08-06 (`InsufficientInstanceCapacity`, ap-south-1a) | Aug 5 = 0h, Aug 7 = 0h CPU; `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 12 |
+| Consumers reading the stale parameter got `HTTP 401 / DH-901` on **785 of 785** attempts | brutex session, 2026-08-08 |
+
+**Root cause:** the only Dhan minter ran on the box. Box down ⇒ no mint ⇒ the
+parameter froze ⇒ every consumer served a dead token. Groww was immune because
+its minter is a Lambda. **Rotating the TOTP secret would have fixed nothing**
+(same account, same one-token limit) and would have broken both brokers —
+recorded because it is the intuitive wrong fix.
+
+### §10.2 The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Minter | `tv-<env>-dhan-token-minter` Lambda (`crates/aws-lambdas/src/dhan_token_minter.rs`) — **the sole Dhan minter** |
+| Schedule | `cron(35 0 * * ? *)` = **06:05 IST daily, EVERY day** (not MON-FRI — consumers read this parameter on weekends too) |
+| Reads | `/tickvault/<env>/dhan/{client-id,client-secret,totp-secret}` — enumerated ARNs, never a `/dhan/*` wildcard |
+| Writes | `/tickvault/<env>/dhan/access-token` ONLY, `SecureString`, `Overwrite=true` — scoped to that single ARN so it can never clobber the Groww token (same secret name, different service segment) |
+| Language | native Rust (`rust-only-forever-lock-2026-07-19.md`); TOTP via the EXISTING `totp-rs` workspace pin, same SHA-1/6-digit/30s parameters as `crates/core/src/auth/totp_generator.rs` — no new dependency root |
+| EC2 permissions | **NONE.** It mints and publishes; it never starts, stops or describes the box |
+| Secret hygiene | token/PIN/TOTP never logged (length + shape verdict only); the mint URL is logged without its query string, which carries the PIN; `reqwest` transport errors are reported by KIND because their `Display` embeds the full URL |
+| Fail-loud | every failure path returns `Err` ⇒ Lambda invocation error ⇒ `tv-<env>-dhan-token-minter-errors` pages. A malformed/error-body token is REFUSED **before** the SSM write, so a bad mint can never overwrite a good token |
+| Schedule-drop detection | `tv-<env>-dhan-token-minter-not-invoked` (`Invocations < 1` per 24h, `treat_missing_data=breaching`) — the Errors alarm is blind to a dropped schedule (no invocation = no error), the 2026-07-02 repo-wide scheduler-drop class |
+
+### §10.3 Coexistence with §9 (IMPORTANT — read before changing either)
+
+§9's publisher (`crates/core/src/auth/dhan_token_publisher.rs`) is **retained
+and still wired**. Today that is safe because the box is down, so only one
+minter can actually run. **It is NOT safe once the box starts:** two minters
+against a one-active-token account is precisely the re-mint war §9 set out to
+end, re-created from the other direction.
+
+**REQUIRED before the box next runs** (flagged, NOT done in this PR): tickvault
+must READ this parameter instead of minting — the same posture it already has
+for Groww (`fetch_groww_access_token`). Until that lands, a running box plus
+this Lambda will fight. Stated plainly rather than left implicit; no false-OK.
+
+### §10.4 What a violating PR looks like (REJECT)
+
+- Adds a SECOND Dhan minter anywhere (that is the defect, from either side).
+- Widens the write scope beyond the single `dhan/access-token` ARN, or the read
+  scope to a `/dhan/*` wildcard.
+- Logs the token, PIN or TOTP; or renders a `reqwest::Error` verbatim (its
+  `Display` carries the PIN-bearing query string).
+- Publishes a token without the JWT shape check — that check is what stops an
+  error body from replacing a working token.
+- Makes any failure path silent (returns `Ok` on a failed mint or write).
+- Removes the not-invoked alarm, or the `treat_missing_data = "breaching"` on
+  it — a dropped schedule is invisible to the Errors alarm.
+- Points the schedule at MON-FRI (weekend consumers would read a stale token).
+- Deletes §9's publisher without first switching tickvault to READ (that would
+  leave the box mintless AND readless).
+
+### §10.5 Honest envelope
+
+> "100% inside the tested envelope, with ratcheted regression coverage: the
+> pure logic — SSM path construction, mint-URL building, TOTP generation, JWT
+> shape gating, Dhan's 200-with-error envelope, body truncation, and the
+> refusal to publish a malformed token — is unit-tested (24 tests) including
+> the Dhan/Groww path-collision case and the no-secret-in-error-message case.
+> **NOT claimed:** live behaviour. No AWS credentials exist in CI, so the SSM
+> reads, the SSM write, the real `generateAccessToken` call, and the
+> EventBridge trigger are UNVERIFIED-LIVE until the first scheduled 06:05 IST
+> invocation. The real proof is `aws ssm get-parameter --name
+> /tickvault/prod/dhan/access-token --query Parameter.LastModifiedDate`
+> reading today's date. **NOT claimed:** that this fixes trading — the box
+> still cannot start (ap-south-1a capacity; AZ pin at `main.tf:77`), which is
+> an independent problem this Lambda deliberately does not touch. **NOT
+> claimed:** safe coexistence with a RUNNING box — see §10.3."
+
+### §10.6 Auto-driver explanation
+
+> Sir, our shop cut the Dhan fridge key itself — but only while the shop was
+> open. The shop has been shut since Tuesday (no space in the market yard), so
+> nobody cut a key, and the key in the shared locker went dead. The neighbour
+> kept trying that dead key: 785 tries, 785 failures. Meanwhile the Groww key
+> was fresh every morning — because head office cuts THAT one from their own
+> office, not from our shop. So now we do the same for Dhan: a small clerk who
+> comes at 6:05 every morning, cuts the key, drops it in the locker, and goes
+> home. Shop open or shut, the key is always fresh.
+
+### §10.7 Trigger / auto-load
+
+The §7 trigger list applies. Additionally reinforced on any session editing
+`crates/aws-lambdas/src/dhan_token_minter.rs`,
+`deploy/aws/terraform/dhan-token-minter-lambda.tf`, or any file containing
+`dhan-token-minter`, `DHAN_ACCESS_TOKEN_SECRET`, or `generateAccessToken`.

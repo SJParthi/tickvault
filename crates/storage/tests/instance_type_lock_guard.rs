@@ -1,21 +1,33 @@
-//! Sub-PR #1 of 2026-05-27 daily-universe expansion — source-scan ratchet
-//! pinning the **t4g.medium instance type lock** documented in
+//! Source-scan ratchet pinning the **r8g.xlarge instance type lock** AND the
+//! **multi-AZ shape** documented in
 //! `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §7.
 //!
 //! Lock history: 2026-05-18 t4g.medium → 2026-05-27 t4g.large → 2026-05-29
 //! m8g.large (8 GiB) → 2026-06-30 r8g.large (Graviton4, 16 GiB — operator
-//! Quote 7) → 2026-07-15 **t4g.medium** (Graviton2, 4 GiB RAM — operator
-//! Quote 8 downsize: QDB_MEM_LIMIT 4g → 1g, EBS 20 GB fresh-volume TARGET
-//! pre-staged as an executor decision while the live root stays 50 GB;
-//! INTERIM bill ~₹1,471/mo incl GST at 270 hrs). This guard fails the
-//! build if:
+//! Quote 7) → 2026-07-15 t4g.medium (Graviton2, 4 GiB — Quote 8 downsize) →
+//! 2026-08-07 t4g.large (Quote 12 — an attempted capacity escape that AWS
+//! REFUSED and that was rolled back) → 2026-08-08 **r8g.xlarge** (Graviton4,
+//! 4 vCPU / 32 GiB — operator Quote 13, sized for the 13-timeframe
+//! current-day workload with raw-tick retention at ~25,000 instruments;
+//! bill ~₹5,824–₹7,382/mo at ~210 hrs, which BREACHES the Quote 9
+//! sub-₹1,000 target ~6× and says so).
 //!
-//!  1. The new authoritative rule file disappears or stops pinning
-//!     `t4g.medium`.
-//!  2. The four superseded rule files lose their SUPERSEDED-BY
-//!     markers (= future readers wouldn't find the new contract).
-//!  3. The instance-type lock value in any of the docs disagrees
-//!     with `t4g.medium`.
+//! This guard pins TWO things, because the 2026-08-07 incident proved they
+//! are inseparable: the type flip alone failed with the SAME
+//! `InsufficientInstanceCapacity` as the type it replaced, since the subnet
+//! was still pinned to one AZ. A future session that "reverts to a cheaper
+//! type" without keeping the multi-AZ shape walks straight back into a
+//! multi-day outage.
+//!
+//! Fails the build if:
+//!
+//!  1. The authoritative rule file disappears or stops pinning `r8g.xlarge`.
+//!  2. The AZ un-pin is reverted (the rule file must keep recording that the
+//!     zone is NOT pinned, and terraform must keep the per-AZ subnets).
+//!  3. The superseded rule files lose their SUPERSEDED-BY markers (= future
+//!     readers wouldn't find the current contract).
+//!  4. The instance-type lock value in any of the docs disagrees with
+//!     `r8g.xlarge`.
 //!
 //! See:
 //! - `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
@@ -41,13 +53,13 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
-/// Section A — the new authoritative rule file MUST exist and pin
-/// `t4g.medium` as the locked instance type (operator Quote 8, 2026-07-15).
-/// r8g.large itself must REMAIN greppable in the file (Quote 7 history is
-/// retained per house convention), so no `!contains("r8g.large")` assert —
-/// the §7 HEADING pin below is what forbids r8g.large as the CURRENT lock.
+/// Section A — the authoritative rule file MUST exist and pin `r8g.xlarge`
+/// as the locked instance type (operator Quote 13, 2026-08-08). Superseded
+/// types REMAIN greppable in the file (history is retained per house
+/// convention), so there is no `!contains(...)` assert — the §7 HEADING pin
+/// below is what forbids any of them as the CURRENT lock.
 #[test]
-fn instance_lock_authoritative_rule_file_pins_t4g_large() {
+fn instance_lock_authoritative_rule_file_pins_r8g_xlarge() {
     let root = repo_root();
     let path = root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
     assert!(
@@ -57,27 +69,73 @@ fn instance_lock_authoritative_rule_file_pins_t4g_large() {
     );
     let body = read(&path);
     assert!(
-        body.contains("t4g.large"),
-        "daily-universe rule file must pin `t4g.large` as the instance lock (Quote 12, 2026-08-07)"
+        body.contains("r8g.xlarge"),
+        "daily-universe rule file must pin `r8g.xlarge` as the instance lock (Quote 13, 2026-08-08)"
     );
     assert!(
-        body.contains("**t4g.large**"),
-        "daily-universe rule file must bold-pin `t4g.large` in the §7 instance-spec table"
+        body.contains("**r8g.xlarge**"),
+        "daily-universe rule file must bold-pin `r8g.xlarge` in the §7 instance-spec table"
     );
     assert!(
-        body.contains("8 GiB RAM"),
-        "daily-universe rule file must pin 8 GiB RAM for t4g.large"
+        body.contains("32 GiB RAM"),
+        "daily-universe rule file must pin 32 GiB RAM for r8g.xlarge"
     );
     assert!(
-        body.contains("Instance lock — t4g.large"),
-        "the §7 heading must lock t4g.large as the CURRENT instance type"
+        body.contains("Instance lock — r8g.xlarge"),
+        "the §7 heading must lock r8g.xlarge as the CURRENT instance type"
     );
     // The capacity outage is the WHY. If a future edit drops it, the next
-    // reader loses the reason this cost roughly +400-600 rupees/month and may
-    // "helpfully" revert to t4g.medium straight back into the dead AZ pool.
+    // reader loses the reason the box was dark for three days and may
+    // "helpfully" revert to a cheaper type straight back into the dead AZ.
     assert!(
         body.contains("InsufficientInstanceCapacity"),
-        "§0 Quote 12 must retain the capacity-outage rationale for the t4g.large lock"
+        "§0 must retain the capacity-outage rationale for the instance lock"
+    );
+}
+
+/// Section A2 — the AZ UN-PIN is pinned as hard as the instance type.
+///
+/// This exists because the 2026-08-07 attempt fixed the type and left the
+/// zone pinned, and AWS refused the new type for the SAME reason. Anyone
+/// re-pinning the subnet to a single AZ re-creates a multi-day outage, so it
+/// fails the build in both the rule file and the terraform.
+#[test]
+fn instance_lock_az_stays_unpinned() {
+    let root = repo_root();
+    let body =
+        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    assert!(
+        body.contains("NOT PINNED"),
+        "§7 must record that the availability zone is NOT pinned (Quote 13, 2026-08-08)"
+    );
+    assert!(
+        body.contains("var.availability_zone"),
+        "§7 must name `var.availability_zone` as the zone selector"
+    );
+
+    let tf = read(&root.join("deploy/aws/terraform/main.tf"));
+    assert!(
+        tf.contains(r#"for_each = toset(["a", "b", "c"])"#),
+        "main.tf must provision a public subnet in EVERY ap-south-1 AZ — \
+         re-pinning to one zone is what caused the 2026-08-06..08 outage"
+    );
+    assert!(
+        !tf.contains(r#"availability_zone = "${var.aws_region}a""#),
+        "main.tf must NOT re-introduce the hardcoded single-AZ subnet pin"
+    );
+    assert!(
+        tf.contains("aws_subnet.public[var.availability_zone].id"),
+        "the instance must select its subnet via var.availability_zone"
+    );
+
+    let vars = read(&root.join("deploy/aws/terraform/variables.tf"));
+    assert!(
+        vars.contains(r#"variable "availability_zone""#),
+        "variables.tf must define the availability_zone variable"
+    );
+    assert!(
+        vars.contains(r#"contains(["a", "b", "c"], var.availability_zone)"#),
+        "availability_zone must be validated against the three real AZ suffixes"
     );
 }
 
@@ -168,7 +226,7 @@ fn instance_lock_supersession_markers_present_in_operator_charter() {
 /// labels so the live bill is never misstated. If someone re-tunes any of
 /// this in the rule file without operator approval, the build fails.
 #[test]
-fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
+fn instance_lock_monthly_bill_pinned_to_current_r8g_xlarge_range() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
@@ -177,13 +235,30 @@ fn instance_lock_monthly_bill_pinned_to_rupees_1471_interim() {
     // dated history — but the guard would otherwise have kept passing while
     // pinning a SUPERSEDED bill as if it were live, which is precisely the
     // false-OK class this repo bans. The new figures are asserted first.
+    // 2026-08-08 (Quote 13): the CURRENT bill is the r8g.xlarge one. The
+    // t4g.large figures this test used to assert FIRST are now history, and
+    // the file still contains them -- so the old assertions kept passing while
+    // pinning a SUPERSEDED bill as if it were live. That is exactly the
+    // false-OK class this repo bans, and it is why the current figures are
+    // asserted first and the superseded ones are explicitly labelled below.
     assert!(
-        body.contains("~₹1,896/mo"),
-        "rule file must pin the CURRENT t4g.large 270-hr bill (~₹1,896/mo incl GST, live 30 GB root, EIP kept) — Quote 12, 2026-08-07"
+        body.contains("~₹5,824/mo"),
+        "rule file must pin the CURRENT r8g.xlarge low-end bill (~₹5,824/mo incl GST at ~210 hrs, 100 GB, EIP kept) — Quote 13, 2026-08-08"
     );
     assert!(
-        body.contains("~₹1,473/mo"),
-        "rule file must pin the CURRENT t4g.large ~176-hr figure (~₹1,473/mo incl GST)"
+        body.contains("~₹7,382/mo"),
+        "rule file must pin the CURRENT r8g.xlarge high-end bill (~₹7,382/mo incl GST — the AWS-list-rate end of the derived range)"
+    );
+    // The breach must stay stated out loud. If a future edit quietly drops it,
+    // the next reader could believe this bill meets the sub-1,000 target.
+    assert!(
+        body.contains("BREACHED"),
+        "§0 Quote 13 must keep recording that the sub-₹1,000 target is BREACHED by the r8g.xlarge bill"
+    );
+    // Superseded, retained as dated history (NOT the live bill).
+    assert!(
+        body.contains("~₹1,896/mo"),
+        "rule file must retain the superseded t4g.large 270-hr bill as history — Quote 12, 2026-08-07"
     );
     assert!(
         body.contains("< ₹1,000/mo") || body.contains("sub-₹1,000"),
@@ -316,12 +391,18 @@ fn instance_lock_2026_07_19_eip_release_ruling_pinned() {
 /// the window back to 08:30-16:30 on 2026-06-05: "make the aws instance start
 /// and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening).
 #[test]
-fn instance_lock_schedule_pinned_to_0830_ist_start() {
+fn instance_lock_schedule_pinned_to_0830_1730_ist_window() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
     assert!(
-        body.contains("08:30–16:30 IST") || body.contains("08:30 IST"),
-        "rule file §7 must pin the 08:30 IST EventBridge cron start"
+        body.contains("CURRENT LIVE SCHEDULE: 08:30–17:30 IST"),
+        "rule file §7 must pin 08:30 IST as the CURRENT LIVE schedule. The bare \
+         `08:30` substring is NOT enough on its own: the file retains superseded \
+         schedule notes that also contain it, so an unqualified assert would pass \
+         even after the live window changed (false-OK). The 08:00–17:00 window is \
+         APPROVED (Quote 13) but deliberately unapplied until the 5 coupled \
+         Lambda/alarm crons are re-timed together — when that lands, this assert \
+         moves to the new window in the same PR as the terraform."
     );
 }

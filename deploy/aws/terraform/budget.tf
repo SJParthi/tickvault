@@ -94,9 +94,31 @@ resource "aws_budgets_budget" "tv_monthly" {
   # STOP_EC2 action targets, and every internal reference (which use the
   # `aws_budgets_budget.tv_monthly.name` attribute, not a hardcoded string)
   # are preserved exactly — the actions re-bind automatically to the new name.
-  name              = "tv-${var.environment}-monthly-budget-v2"
-  budget_type       = "COST"
-  limit_amount      = "35"
+  name        = "tv-${var.environment}-monthly-budget-v2"
+  budget_type = "COST"
+  # 2026-08-08 OPERATOR RULING (Quote 13) — LIMIT RAISED $35 -> $100.
+  # Operator verbatim (typed directly in-session, typos preserved):
+  #   "then can we go ahead with r8g x large dude"
+  #   "yes dude go ahead but before that provide em tje rpecise detaield lsited plan dude okay?"
+  #   "yes raise the ceilign ddue and make it as entirely acceptabel to oru newer requeirmeent dude okau?"
+  # Why: the instance moves t4g.large -> r8g.xlarge (4 vCPU / 32 GiB) to serve the
+  #   13-timeframe + current-day tick-retention requirement at ~25,000 instruments.
+  #   The bill's HIGH estimate is $73.60/mo (see daily-universe-scope-expansion §7
+  #   "Bill 2026-08-08"). The budget actions fire at 90% and 100% of the limit, so any
+  #   ceiling below ~$82 would trip STOP_EC2_INSTANCES mid-session — exactly the
+  #   2026-07-31 failure mode. $100 puts the 90% line at $90, clear of $73.60, while
+  #   staying a real guard rather than a rubber stamp.
+  # The sub-₹1,000/mo TARGET is formally BREACHED by this ruling (~6x) and the
+  #   downward ratchet ladder stays PAUSED — recorded honestly, not silently dropped.
+  # FLAGGED, UNRESOLVED: the 2026-07-31 incident above left BOTH actions in
+  #   EXECUTION_FAILURE. The 2026-08-08 executing session could NOT verify their
+  #   current state (describe-budget-actions-for-budget -> AccessDenied), so whether
+  #   the kill switch works AT ALL is Unknown. Raising a ceiling does not repair a
+  #   broken action. This needs a live check with budget-action read access before the
+  #   safety net can be claimed to function.
+  # KEEP IN 3-WAY LOCKSTEP: budget-guards.tf BUDGET_KILL_USD + budget_digest.rs
+  #   BUDGET_USD (and its tests' "$100" assertions).
+  limit_amount      = "100"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

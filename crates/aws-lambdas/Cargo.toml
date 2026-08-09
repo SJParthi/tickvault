@@ -47,6 +47,12 @@ form_urlencoded = { workspace = true }
 # and signs/verifies its HMAC session tokens with aws-lc-rs (the workspace's
 # existing crypto provider — no new crypto root).
 aws-sdk-lambda = { workspace = true }
+# dhan-token-minter (2026-08-08): the box-independent daily Dhan mint.
+# Both are EXISTING workspace pins reused verbatim — no new dependency root:
+# totp-rs is the same crate crates/core uses for the Dhan TOTP, and secrecy
+# keeps the PIN/TOTP-secret/token in redacting wrappers.
+totp-rs = { workspace = true }
+secrecy = { workspace = true }
 
 [[bin]]
 name = "start-watchdog"
@@ -95,3 +101,7 @@ path = "src/bin/qdb_console_proxy.rs"
 [[bin]]
 name = "qdb-console-front"
 path = "src/bin/qdb_console_front.rs"
+
+[[bin]]
+name = "dhan-token-minter"
+path = "src/bin/dhan_token_minter.rs"
