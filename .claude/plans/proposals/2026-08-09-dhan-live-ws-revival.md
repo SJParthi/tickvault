@@ -1,11 +1,18 @@
 # Proposal: revive the Dhan live main-feed WebSocket (the only tick source this account can reach)
 
-**Status:** DRAFT — implementation may NOT start until the operator flips this to APPROVED
+**Status:** APPROVED — 2026-08-09, operator quote recorded in the scope lock (see below)
 **Date:** 2026-08-09
-**Approved by:** pending
+**Approved by:** Parthiban (operator) — 2026-08-09, verbatim: *"what the fuck bro our idea
+is toa dd live feed so oevrall 16 websocket conbections rigth…"*, reaffirmed *"whta the
+fuck we have deisgne dveeyhtign in PR 1731 right?"*. Given in direct response to a plan
+that had wrongly presented the feed choice as still open, when the revival had already
+been authorized earlier the same day.
 **Scope authority:** `.claude/rules/project/websocket-connection-scope-lock.md`
 → "2026-08-09 — DHAN LIVE MAIN-FEED WS REVIVAL AUTHORIZED" (operator quote recorded there
 verbatim, reversing the 2026-07-13 retirement)
+→ "2026-08-09 (SAME DAY, SECOND QUOTE) — 16 CONNECTIONS + depth-20/depth-200 AUTHORIZED"
+(lifts the 1-connection cap to ≤16 and un-forbids depth-20 / depth-200; the companion
+16-connection architecture is `2026-08-09-dhan-16-connection-architecture.md`, PR #1731)
 **Guarantee matrices:** the 15-row + 7-row matrices of
 `.claude/rules/project/per-wave-guarantee-matrix.md` apply to every PR below
 (cross-referenced, not re-pasted).
