@@ -67,10 +67,22 @@ services:
     # the 9.3.5 version pin while letting docker pick the correct arch.
     # Project rule "No :latest — exact version with SHA256" is satisfied
     # by the explicit :9.3.5 version; SHA256 omitted ONLY because Docker
-    # Hub publishes per-arch SHA256s (we'd need both arm64 + amd64 SHAs
-    # and conditional logic, which is fragile). Multi-arch tag is the
-    # canonical Docker-recommended approach for cross-arch deployments.
-    image: questdb/questdb:9.3.5
+    # 2026-08-08: DIGEST PINNED. The previous comment here claimed a digest pin
+    # would need "both arm64 + amd64 SHAs and conditional logic, which is
+    # fragile" — that premise was FACTUALLY WRONG, and it left this image as the
+    # only un-pinned one in the file while CLAUDE.md asserted "All images pinned
+    # with SHA256 digest".
+    #
+    # Docker Hub publishes a MULTI-ARCH OCI IMAGE INDEX whose digest resolves
+    # per-platform with zero conditional logic. Verified live against
+    # registry-1.docker.io on 2026-08-08:
+    #   Docker-Content-Digest: sha256:22ad0305...7b968
+    #   mediaType: application/vnd.oci.image.index.v1+json
+    #   platforms:  linux/amd64  AND  linux/arm64
+    #   round-tripped by digest -> HTTP 200
+    # So ONE index digest covers Mac/amd64+arm64 dev and the ARM Graviton t4g
+    # prod box, and composes correctly with the `platform:` pin below.
+    image: questdb/questdb:9.3.5@sha256:22ad030544f45a396c743124c928ce33de11666c104f63f69ce4e66e07e7b968
     # Force arm64 on the deployed Graviton box (default). The earlier claim
     # that this is "harmless on amd64 dev hosts" was WRONG — `platform:`
     # is a hard requirement, not a preference: on an amd64 host it pulls

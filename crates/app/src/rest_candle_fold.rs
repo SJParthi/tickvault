@@ -100,7 +100,7 @@
 //!   [`FOLD_HEARTBEAT_INTERVAL_SECS`] loop tick — alarm-ready, but
 //!   metrics-local today per the same delivery boundary).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -182,6 +182,17 @@ pub const FOLD_RESPAWN_BACKOFF_SECS: u64 = 30;
 /// `tv_rest_candle_fold_heartbeat_total` increments once per tick even
 /// when zero bars/seals moved, so a dead fold task is a visible flatline).
 pub const FOLD_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+
+/// Hard cap on distinct live fold slots — one per composite
+/// `(feed, security_id, exchange_segment_code)` identity.
+///
+/// Sized to the operator's stated 25,000-instrument target (the same figure
+/// `MAX_INDICATOR_INSTRUMENTS` carries), because the slot table — like the
+/// indicator engine's — is PUSH-ONLY: a slot handed out is never reclaimed
+/// for the process lifetime. Without a cap the backing Vec grows monotonically
+/// forever; exhaustion is FAIL-CLOSED and LOUD (counted +
+/// [`ErrorCode::RestCandleFold01Degraded`]), never a silent drop.
+pub const FOLD_MAX_SLOTS: usize = 25_000;
 
 /// Paced catch-up emission: sleep this long when the seal channel is full
 /// (cold boot path — waiting beats dropping).
@@ -876,23 +887,188 @@ impl SidDayFold {
     }
 }
 
-/// Finds or creates the (feed, sid, segment) live slot.
-fn slot_mut(
-    engines: &mut Vec<SidDayFold>,
-    feed: Feed,
-    security_id: SecurityId,
-    segment_code: u8,
-) -> &mut SidDayFold {
-    if let Some(pos) = engines.iter().position(|s| {
-        s.engine.feed == feed
-            && s.engine.security_id == security_id
-            && s.engine.exchange_segment_code == segment_code
-    }) {
-        return &mut engines[pos];
+/// Composite fold-slot identity.
+///
+/// This is the FULL I-P1-11 key `(security_id, exchange_segment)` EXTENDED
+/// with `feed` per the 2026-06-28 feed-in-key operator override — NEVER
+/// `security_id` alone. Dhan reuses the same numeric id across segments
+/// (the live FINNIFTY `id = 27` IDX_I vs NSE_EQ collision,
+/// `.claude/rules/project/security-id-uniqueness.md`), and the same numeric
+/// id can legitimately arrive from two feeds; keying on the id alone would
+/// silently FOLD TWO DIFFERENT INSTRUMENTS INTO ONE candle series.
+type FoldSlotKey = (Feed, SecurityId, u8);
+
+/// Per-(feed, sid, segment) live fold slots with an O(1)-average identity
+/// index.
+///
+/// # Why this type exists (2026-08-09 — the O(n) hot-path repair)
+///
+/// The predecessor was a bare `Vec<SidDayFold>` scanned with
+/// `iter().position(..)` on EVERY bar, against a Vec that is PUSH-ONLY (no
+/// `retain`/`clear`/reset exists anywhere on this path, by design — a slot
+/// carries the instrument's open buckets and day-map for the process
+/// lifetime). Per drained batch that is O(bars x slots); at the operator's
+/// 25,000-instrument target it degrades to effectively O(n^2) per minute
+/// against a table that never shrinks. Principle 2 of CLAUDE.md is "O(1) or
+/// fail at compile time", so the scan is replaced by a hash index while the
+/// `Vec` stays the backing storage (stable indices, cache-friendly
+/// iteration, unchanged fold semantics) — the same shape
+/// `IndicatorEngine::slot_for` uses (`crates/trading/src/indicator/engine.rs`).
+///
+/// # Why `std::collections::HashMap` and not `papaya`
+///
+/// `papaya` is the house choice for LOCK-FREE CONCURRENT maps read from
+/// multiple threads (it hands out guards and pays for epoch reclamation).
+/// This table is owned outright by ONE tokio task and is only ever reached
+/// through `&mut FoldSlots`, so there is no sharing to make lock-free — a
+/// plain `HashMap` is strictly cheaper for the same O(1) average lookup.
+/// `DashMap` is banned on hot paths regardless.
+///
+/// # Allocation
+///
+/// The per-bar lookup path ([`Self::slot_index`]) is a pure `HashMap::get`
+/// on a `Copy` key — no allocation. Only first sight of a NEW instrument
+/// allocates (one map insert + one Vec push), which is exactly the cold
+/// first-bar-of-the-day path.
+#[derive(Debug, Default)]
+pub struct FoldSlots {
+    /// Backing storage. Index-stable: slots are appended, never removed or
+    /// reordered, so an index handed out stays valid for the process life.
+    slots: Vec<SidDayFold>,
+    /// Composite identity -> index into [`Self::slots`]. O(1) average.
+    index: HashMap<FoldSlotKey, u32>,
+    /// Coalescing latch for the capacity-exhausted error (every occurrence
+    /// is counted; ONE coded error per process — the house
+    /// `note_unfoldable_identity` discipline, so a saturated table cannot
+    /// spam the log once per bar forever).
+    exhausted_warned: bool,
+}
+
+impl FoldSlots {
+    /// Empty table. The index is pre-sized lazily — sizing it to
+    /// [`FOLD_MAX_SLOTS`] up front would reserve for 25,000 instruments on
+    /// every boot when today's live universe is a handful of spot indices.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            index: HashMap::new(),
+            exhausted_warned: false,
+        }
     }
-    engines.push(SidDayFold::new(feed, security_id, segment_code));
-    let last = engines.len() - 1;
-    &mut engines[last]
+
+    /// Number of allocated slots.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// True when no slot has been allocated yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Resolves a composite identity to its slot index WITHOUT allocating a
+    /// slot. Read-only companion to [`Self::slot_index`] — a pure query can
+    /// never consume capacity. O(1) average, zero heap traffic.
+    #[must_use]
+    pub fn lookup(&self, feed: Feed, security_id: SecurityId, segment_code: u8) -> Option<usize> {
+        self.index
+            .get(&(feed, security_id, segment_code))
+            .map(|&i| i as usize)
+    }
+
+    /// Resolves a composite identity to its slot index, allocating a slot on
+    /// first sight.
+    ///
+    /// Returns `None` ONLY at [`FOLD_MAX_SLOTS`] capacity. That case is
+    /// FAIL-CLOSED and LOUD — the caller drops the bar, counts it under
+    /// `tv_rest_candle_fold_dropped_total{reason="slot_capacity"}` and the
+    /// dedicated `tv_rest_candle_fold_slots_exhausted_total`, and a coded
+    /// [`ErrorCode::RestCandleFold01Degraded`] names the instrument. Never a
+    /// silent drop, never unbounded growth.
+    ///
+    /// O(1) average on the steady-state path (one hash lookup per bar).
+    fn slot_index(&mut self, feed: Feed, security_id: SecurityId, segment_code: u8) -> Option<u32> {
+        let key = (feed, security_id, segment_code);
+        if let Some(&idx) = self.index.get(&key) {
+            return Some(idx);
+        }
+        if self.slots.len() >= FOLD_MAX_SLOTS {
+            counter!("tv_rest_candle_fold_slots_exhausted_total").increment(1);
+            counter!("tv_rest_candle_fold_dropped_total", "reason" => "slot_capacity").increment(1);
+            if !self.exhausted_warned {
+                self.exhausted_warned = true;
+                error!(
+                    code = ErrorCode::RestCandleFold01Degraded.code_str(),
+                    stage = "slot_capacity",
+                    feed = feed.as_str(),
+                    security_id,
+                    segment_code,
+                    capacity = FOLD_MAX_SLOTS,
+                    "rest_candle_fold: fold-slot table at capacity — this \
+                     instrument derives NO candles this incarnation (bars \
+                     counted under reason=slot_capacity); raise FOLD_MAX_SLOTS. \
+                     Further occurrences coalesce to the counters"
+                );
+            }
+            return None;
+        }
+        // Cast is exact: len() < FOLD_MAX_SLOTS (25_000) < u32::MAX.
+        let idx = self.slots.len() as u32;
+        self.slots
+            .push(SidDayFold::new(feed, security_id, segment_code));
+        self.index.insert(key, idx);
+        Some(idx)
+    }
+
+    /// Finds or creates the (feed, sid, segment) live slot. `None` at
+    /// capacity (fail-closed — see [`Self::slot_index`]).
+    pub fn slot_mut(
+        &mut self,
+        feed: Feed,
+        security_id: SecurityId,
+        segment_code: u8,
+    ) -> Option<&mut SidDayFold> {
+        let idx = self.slot_index(feed, security_id, segment_code)? as usize;
+        self.slots.get_mut(idx)
+    }
+
+    /// Installs a boot-catch-up-seeded slot, REPLACING any existing slot for
+    /// the same composite identity. Returns `false` when the table is at
+    /// capacity (fail-closed, already counted + logged).
+    ///
+    /// Replaces the boot path's own `iter().position(..)` scan — same O(n)
+    /// class as the live one, over `days x SIDs` iterations.
+    pub fn replace_or_insert(&mut self, slot: SidDayFold) -> bool {
+        let feed = slot.engine.feed;
+        let security_id = slot.engine.security_id;
+        let segment_code = slot.engine.exchange_segment_code;
+        let Some(idx) = self.slot_index(feed, security_id, segment_code) else {
+            return false;
+        };
+        // slot_index guarantees the index is in range (it either found an
+        // existing slot or just pushed one).
+        if let Some(existing) = self.slots.get_mut(idx as usize) {
+            *existing = slot;
+        }
+        true
+    }
+}
+
+impl std::ops::Index<usize> for FoldSlots {
+    type Output = SidDayFold;
+
+    fn index(&self, idx: usize) -> &Self::Output {
+        &self.slots[idx]
+    }
+}
+
+impl std::ops::IndexMut<usize> for FoldSlots {
+    fn index_mut(&mut self, idx: usize) -> &mut Self::Output {
+        &mut self.slots[idx]
+    }
 }
 
 /// One per-slot seal emission produced by [`apply_bar_batch`].
@@ -920,6 +1096,10 @@ pub struct BatchOutcome {
     /// Round-3: future-dated drops (a bar dated after the wall-clock IST
     /// today never rolls the live day forward).
     pub future_dated: u64,
+    /// 2026-08-09: bars dropped because the fold-slot table is at
+    /// [`FOLD_MAX_SLOTS`] capacity (fail-closed — see
+    /// [`FoldSlots::slot_index`]). Always 0 below capacity.
+    pub slot_exhausted: u64,
 }
 
 /// Applies one drained batch of confirmed bars (round-3 repair-burst
@@ -930,19 +1110,29 @@ pub struct BatchOutcome {
 /// same-slot repair may momentarily carry pre-repair values; the
 /// batch-end refold re-emits them corrected (DEDUP UPSERT heals in place).
 pub fn apply_bar_batch(
-    engines: &mut Vec<SidDayFold>,
+    engines: &mut FoldSlots,
     batch: &[ConfirmedBar],
     today: NaiveDate,
 ) -> BatchOutcome {
     let mut out = BatchOutcome::default();
-    let mut dirty: Vec<(Feed, SecurityId, u8)> = Vec::new();
+    // Dirty slots are tracked by INDEX (a bijection with the composite key,
+    // and index-stable because slots are append-only) and de-duplicated
+    // through a hash set — the predecessor's `Vec::contains` was a second
+    // O(n) scan per repair bar, i.e. the same O(n^2) class as the slot scan
+    // across a large repair burst. Push order is preserved, so refold
+    // emission order is unchanged. `HashSet::new()` does not allocate until
+    // the first repair, so a repair-free batch pays nothing.
+    let mut dirty: Vec<u32> = Vec::new();
+    let mut dirty_seen: HashSet<u32> = HashSet::new();
     for bar in batch {
-        let slot = slot_mut(
-            engines,
-            bar.feed,
-            bar.security_id,
-            bar.exchange_segment_code,
-        );
+        let Some(slot_idx) =
+            engines.slot_index(bar.feed, bar.security_id, bar.exchange_segment_code)
+        else {
+            // Fail-closed at capacity (counted + coded inside slot_index).
+            out.slot_exhausted += 1;
+            continue;
+        };
+        let slot = &mut engines[slot_idx as usize];
         match slot.apply_live_bar_deferred(bar, today) {
             DeferredBarAction::Folded(sealed) => out.emissions.push(BatchEmission {
                 feed: bar.feed,
@@ -952,9 +1142,8 @@ pub fn apply_bar_batch(
                 is_refold: false,
             }),
             DeferredBarAction::RepairDeferred => {
-                let key = (bar.feed, bar.security_id, bar.exchange_segment_code);
-                if !dirty.contains(&key) {
-                    dirty.push(key);
+                if dirty_seen.insert(slot_idx) {
+                    dirty.push(slot_idx);
                 }
             }
             DeferredBarAction::DuplicateNoop => out.duplicates += 1,
@@ -970,8 +1159,13 @@ pub fn apply_bar_batch(
             out.past_day.push(displaced);
         }
     }
-    for (feed, security_id, segment_code) in dirty {
-        let slot = slot_mut(engines, feed, security_id, segment_code);
+    for slot_idx in dirty {
+        // Direct index — no re-lookup at all (the predecessor re-ran the
+        // linear scan once per dirty slot).
+        let slot = &mut engines[slot_idx as usize];
+        let feed = slot.engine.feed;
+        let security_id = slot.engine.security_id;
+        let segment_code = slot.engine.exchange_segment_code;
         out.emissions.push(BatchEmission {
             feed,
             security_id,
@@ -1257,8 +1451,9 @@ pub fn day_start_nanos(date: NaiveDate) -> i64 {
 }
 
 struct FoldRuntime {
-    /// Per-(feed, sid, segment) live state: engine + current-day bar map.
-    engines: Vec<SidDayFold>,
+    /// Per-(feed, sid, segment) live state: engine + current-day bar map,
+    /// behind the O(1) composite-identity index (see [`FoldSlots`]).
+    engines: FoldSlots,
     /// M2: PAST-day refold queue — key → the newest triggering minute +
     /// the bounded attempt count (the current day never lands here).
     dirty: BTreeMap<DirtyDayKey, DirtyMark>,
@@ -1836,14 +2031,19 @@ async fn boot_catchup(runtime: &mut FoldRuntime, catchup_days: u32, today: Naive
                             today,
                             &today_catchup.bars,
                         );
-                        if let Some(pos) = runtime.engines.iter().position(|s| {
-                            s.engine.feed == *feed
-                                && s.engine.security_id == security_id
-                                && s.engine.exchange_segment_code == segment_code
-                        }) {
-                            runtime.engines[pos] = seeded;
-                        } else {
-                            runtime.engines.push(seeded);
+                        // O(1) indexed replace-or-insert (was the same
+                        // `iter().position(..)` linear scan as the live
+                        // path, run once per (feed, SID) at boot).
+                        if !runtime.engines.replace_or_insert(seeded) {
+                            error!(
+                                code = ErrorCode::RestCandleFold01Degraded.code_str(),
+                                stage = "slot_capacity",
+                                feed = feed.as_str(),
+                                security_id,
+                                "rest_candle_fold: catch-up seed dropped — fold-slot \
+                                 table at capacity (counted under \
+                                 reason=slot_capacity)"
+                            );
                         }
                     }
                     Ok(None) => {}
@@ -2049,7 +2249,7 @@ pub async fn run_rest_candle_fold(params: RestCandleFoldParams) {
     };
     let exec_url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
     let mut runtime = FoldRuntime {
-        engines: Vec::new(),
+        engines: FoldSlots::new(),
         dirty: BTreeMap::new(),
         dirty_since: None,
         client,
@@ -2125,6 +2325,21 @@ pub async fn run_rest_candle_fold(params: RestCandleFoldParams) {
                         "reason" => "out_of_session"
                     )
                     .increment(outcome.out_of_session);
+                }
+                if outcome.slot_exhausted > 0 {
+                    // 2026-08-09: the fold-slot table is at FOLD_MAX_SLOTS.
+                    // Per-bar counting + the coded error live in
+                    // FoldSlots::slot_index (coalesced to one error per
+                    // process); this arm is the batch-level forensic line.
+                    error!(
+                        code = ErrorCode::RestCandleFold01Degraded.code_str(),
+                        stage = "slot_capacity",
+                        dropped = outcome.slot_exhausted,
+                        capacity = FOLD_MAX_SLOTS,
+                        "rest_candle_fold: bar(s) dropped — fold-slot table at \
+                         capacity; those instruments derive NO candles this \
+                         incarnation (counted under reason=slot_capacity)"
+                    );
                 }
                 if outcome.future_dated > 0 {
                     // Round-3 (the BOUNDARY-01 future-skew class): counted
@@ -3046,7 +3261,7 @@ mod tests {
         // new-day first bar (rolls the map)] must NOT silently drop the
         // repair — the displaced OLD-day repair routes to the past-day
         // /exec queue so the old day heals THIS session, not at next boot.
-        let mut engines: Vec<SidDayFold> = Vec::new();
+        let mut engines = FoldSlots::new();
         let seed: Vec<ConfirmedBar> = (0..3)
             .map(|i| bar_at(i, 10.0, 11.0, 9.0, 10.5, 1))
             .collect();
@@ -3069,7 +3284,7 @@ mod tests {
 
         // A repair-free day roll displaces nothing (regression guard for
         // the pending-repair lifetime: cleared by every refold).
-        let mut fresh: Vec<SidDayFold> = Vec::new();
+        let mut fresh = FoldSlots::new();
         apply_bar_batch(&mut fresh, &seed, day0_date());
         let rolled = apply_bar_batch(&mut fresh, &[roll], day1_date());
         assert!(rolled.past_day.is_empty(), "clean roll queues nothing");
@@ -3192,7 +3407,7 @@ mod tests {
                 bar_at(i, base, base + 1.0, base - 1.0, base + 0.5, 5)
             })
             .collect();
-        let mut engines: Vec<SidDayFold> = Vec::new();
+        let mut engines = FoldSlots::new();
         let seed = apply_bar_batch(&mut engines, &bars, today);
         assert!(
             seed.emissions.iter().all(|e| !e.is_refold),
@@ -3339,5 +3554,380 @@ mod tests {
         assert_eq!(guard.try_recv().map(|b| b.open), Some(1.0));
         assert_eq!(guard.try_recv().map(|b| b.open), Some(2.0));
         assert!(guard.try_recv().is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // FoldSlots — the 2026-08-09 O(n) -> O(1) slot-lookup repair
+    // -----------------------------------------------------------------
+
+    /// [`bar_at`] with an explicit composite identity (feed, sid, segment).
+    fn bar_ident_at(
+        feed: Feed,
+        security_id: SecurityId,
+        exchange_segment_code: u8,
+        minute_offset: u32,
+        o: f64,
+        h: f64,
+        l: f64,
+        c: f64,
+        v: i64,
+    ) -> ConfirmedBar {
+        ConfirmedBar {
+            feed,
+            security_id,
+            exchange_segment_code,
+            ..bar_at(minute_offset, o, h, l, c, v)
+        }
+    }
+
+    /// The exact predecessor lookup — an O(n) linear scan over the backing
+    /// Vec. The index must agree with it for every identity, always.
+    fn reference_linear_scan(
+        slots: &FoldSlots,
+        feed: Feed,
+        security_id: SecurityId,
+        segment_code: u8,
+    ) -> Option<usize> {
+        (0..slots.len()).find(|&i| {
+            slots[i].engine.feed == feed
+                && slots[i].engine.security_id == security_id
+                && slots[i].engine.exchange_segment_code == segment_code
+        })
+    }
+
+    #[test]
+    fn test_fold_slots_new_is_empty_and_len_tracks_slot_mut_allocations() {
+        // The table starts empty; `slot_mut` allocates exactly once per
+        // NEW composite identity and is a pure lookup thereafter.
+        let mut slots = FoldSlots::new();
+        assert!(slots.is_empty(), "a new table is_empty");
+        assert_eq!(slots.len(), 0);
+
+        slots.slot_mut(Feed::Dhan, 13, 0).expect("first slot");
+        assert!(!slots.is_empty());
+        assert_eq!(slots.len(), 1);
+
+        // Same identity again — no growth.
+        slots.slot_mut(Feed::Dhan, 13, 0).expect("same slot");
+        assert_eq!(slots.len(), 1);
+
+        // New identity — exactly one more.
+        slots.slot_mut(Feed::Dhan, 25, 0).expect("second slot");
+        assert_eq!(slots.len(), 2);
+        assert!(!slots.is_empty());
+    }
+
+    #[test]
+    fn test_fold_slots_lookup_resolves_the_right_slot() {
+        // (a) The O(1) index must resolve each composite identity to the
+        // slot that actually carries it — and agree with the linear scan
+        // it replaced, for every identity, including misses.
+        let mut slots = FoldSlots::new();
+        let identities = [
+            (Feed::Dhan, 13_u64, 0_u8),
+            (Feed::Dhan, 25, 0),
+            (Feed::Dhan, 51, 0),
+            (Feed::Groww, 13, 0),
+        ];
+        for (feed, sid, seg) in identities {
+            assert!(
+                slots.lookup(feed, sid, seg).is_none(),
+                "lookup must not allocate a slot for an unseen identity"
+            );
+            slots
+                .slot_mut(feed, sid, seg)
+                .expect("capacity available far below FOLD_MAX_SLOTS");
+        }
+        assert_eq!(slots.len(), identities.len());
+
+        for (feed, sid, seg) in identities {
+            let idx = slots.lookup(feed, sid, seg).expect("identity is present");
+            // The slot the index points at really carries that identity.
+            assert_eq!(slots[idx].engine.feed, feed);
+            assert_eq!(slots[idx].engine.security_id, sid);
+            assert_eq!(slots[idx].engine.exchange_segment_code, seg);
+            // ...and it is EXACTLY what the old linear scan would return.
+            assert_eq!(Some(idx), reference_linear_scan(&slots, feed, sid, seg));
+        }
+
+        // A miss stays a miss and allocates nothing.
+        assert!(slots.lookup(Feed::Groww, 999, 0).is_none());
+        assert!(slots.lookup(Feed::Dhan, 13, 2).is_none());
+        assert_eq!(slots.len(), identities.len(), "lookup never allocates");
+    }
+
+    #[test]
+    fn test_fold_slots_same_security_id_across_segments_get_separate_slots() {
+        // (b) I-P1-11 (.claude/rules/project/security-id-uniqueness.md):
+        // security_id ALONE is not unique — Dhan reuses the same numeric id
+        // across segments (the live FINNIFTY id=27 IDX_I vs NSE_EQ case).
+        // Keying on the id alone would fold two DIFFERENT instruments into
+        // one candle series. The composite key must keep them apart.
+        let mut slots = FoldSlots::new();
+        let idx_i = slots
+            .slot_mut(Feed::Dhan, 27, 0)
+            .expect("slot")
+            .engine
+            .exchange_segment_code;
+        let nse_eq = slots
+            .slot_mut(Feed::Dhan, 27, 1)
+            .expect("slot")
+            .engine
+            .exchange_segment_code;
+        assert_eq!((idx_i, nse_eq), (0, 1));
+        assert_eq!(slots.len(), 2, "same id, two segments => TWO slots");
+        assert_ne!(
+            slots.lookup(Feed::Dhan, 27, 0),
+            slots.lookup(Feed::Dhan, 27, 1),
+            "segment must be part of the key"
+        );
+
+        // And they must fold INDEPENDENTLY — the collision-silent-merge bug
+        // would show up as one series carrying the other's prices.
+        let today = day0_date();
+        let batch = [
+            bar_ident_at(Feed::Dhan, 27, 0, 0, 100.0, 100.0, 100.0, 100.0, 1),
+            bar_ident_at(Feed::Dhan, 27, 1, 0, 900.0, 900.0, 900.0, 900.0, 7),
+        ];
+        let out = apply_bar_batch(&mut slots, &batch, today);
+        assert_eq!(slots.len(), 2, "folding must not create extra slots");
+        let m1: Vec<(u8, f64, i64)> = out
+            .emissions
+            .iter()
+            .flat_map(|e| {
+                e.sealed
+                    .iter()
+                    .filter(|s| s.tf == TfIndex::M1)
+                    .map(move |s| (e.segment_code, s.bucket.close, s.bucket.volume))
+            })
+            .collect();
+        assert_eq!(
+            m1,
+            vec![(0, 100.0, 1), (1, 900.0, 7)],
+            "each segment keeps its OWN prices and volume"
+        );
+    }
+
+    #[test]
+    fn test_fold_slots_same_security_id_across_feeds_get_separate_slots() {
+        // (b, feed half) The 2026-06-28 feed-in-key override: a Dhan row and
+        // a Groww row for the same instrument are DISTINCT rows, so they
+        // need distinct fold slots too.
+        let mut slots = FoldSlots::new();
+        slots.slot_mut(Feed::Dhan, 13, 0).expect("dhan slot");
+        slots.slot_mut(Feed::Groww, 13, 0).expect("groww slot");
+        slots
+            .slot_mut(Feed::Truedata, 13, 0)
+            .expect("truedata slot");
+        assert_eq!(slots.len(), 3, "same (id, segment), three feeds => 3 slots");
+
+        let dhan = slots.lookup(Feed::Dhan, 13, 0).expect("dhan");
+        let groww = slots.lookup(Feed::Groww, 13, 0).expect("groww");
+        let truedata = slots.lookup(Feed::Truedata, 13, 0).expect("truedata");
+        assert!(dhan != groww && groww != truedata && dhan != truedata);
+        assert_eq!(slots[dhan].engine.feed, Feed::Dhan);
+        assert_eq!(slots[groww].engine.feed, Feed::Groww);
+        assert_eq!(slots[truedata].engine.feed, Feed::Truedata);
+
+        // Re-resolving an existing identity must REUSE its slot, never push.
+        slots.slot_mut(Feed::Dhan, 13, 0).expect("reuse");
+        slots.slot_mut(Feed::Groww, 13, 0).expect("reuse");
+        assert_eq!(slots.len(), 3, "known identities must not grow the table");
+    }
+
+    #[test]
+    fn test_fold_slots_capacity_exhaustion_fails_closed() {
+        // (c) The predecessor Vec was PUSH-ONLY with no cap — it grew for
+        // the process lifetime. Growth is now bounded and exhaustion is
+        // fail-CLOSED (None + counters + one coded error), never a silent
+        // drop and never an unbounded Vec.
+        let mut slots = FoldSlots::new();
+        for i in 0..FOLD_MAX_SLOTS {
+            assert!(
+                slots.slot_mut(Feed::Dhan, i as u64, 0).is_some(),
+                "slot {i} must fit under capacity"
+            );
+        }
+        assert_eq!(slots.len(), FOLD_MAX_SLOTS);
+
+        // One past capacity: refused.
+        assert!(
+            slots
+                .slot_mut(Feed::Dhan, FOLD_MAX_SLOTS as u64, 0)
+                .is_none(),
+            "capacity+1 must fail CLOSED, not push"
+        );
+        assert_eq!(
+            slots.len(),
+            FOLD_MAX_SLOTS,
+            "a refusal must not grow the Vec"
+        );
+        // Repeated refusals stay bounded (the error is latched, the
+        // counters keep counting).
+        for _ in 0..5 {
+            assert!(
+                slots
+                    .slot_mut(Feed::Dhan, FOLD_MAX_SLOTS as u64 + 1, 0)
+                    .is_none()
+            );
+        }
+        assert_eq!(slots.len(), FOLD_MAX_SLOTS);
+
+        // ALREADY-KNOWN identities keep working at capacity — a saturated
+        // table must not blind the instruments it already serves.
+        assert!(
+            slots.slot_mut(Feed::Dhan, 0, 0).is_some(),
+            "an existing slot must still resolve at capacity"
+        );
+        // replace_or_insert refuses a NEW identity at capacity too.
+        assert!(
+            !slots.replace_or_insert(SidDayFold::new(Feed::Groww, 7, 0)),
+            "catch-up seeding of a NEW identity must fail closed at capacity"
+        );
+        assert_eq!(slots.len(), FOLD_MAX_SLOTS);
+    }
+
+    #[test]
+    fn test_apply_bar_batch_counts_slot_exhaustion_and_drops_the_bar() {
+        // (c, batch half) A bar that cannot get a slot is DROPPED and
+        // COUNTED on BatchOutcome — never silently folded into someone
+        // else's slot, never emitted.
+        let today = day0_date();
+        let mut slots = FoldSlots::new();
+        for i in 0..FOLD_MAX_SLOTS {
+            slots.slot_mut(Feed::Dhan, i as u64, 0).expect("fits");
+        }
+        let overflow = bar_ident_at(
+            Feed::Dhan,
+            FOLD_MAX_SLOTS as u64,
+            0,
+            0,
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+            1,
+        );
+        let known = bar_ident_at(Feed::Dhan, 0, 0, 0, 50.0, 50.0, 50.0, 50.0, 2);
+        let out = apply_bar_batch(&mut slots, &[overflow, known, overflow], today);
+        assert_eq!(out.slot_exhausted, 2, "both overflow bars counted");
+        assert_eq!(slots.len(), FOLD_MAX_SLOTS, "no unbounded growth");
+        // The in-capacity bar still folded — one bad instrument never
+        // starves the rest.
+        assert_eq!(out.emissions.len(), 1);
+        assert_eq!(out.emissions[0].security_id, 0);
+        assert!(
+            out.emissions[0]
+                .sealed
+                .iter()
+                .any(|s| s.tf == TfIndex::M1 && s.bucket.close == 50.0)
+        );
+    }
+
+    #[test]
+    fn test_fold_slots_multi_instrument_fold_values_unchanged() {
+        // (d) Behaviour preservation: this is a data-structure change, not a
+        // logic change. Many instruments interleaved through the indexed
+        // table must produce byte-identical seals to folding each one
+        // through its own isolated engine — and the index must agree with
+        // the linear scan for every identity at every step.
+        let today = day0_date();
+        let identities = [
+            (Feed::Dhan, 13_u64, 0_u8),
+            (Feed::Dhan, 25, 0),
+            (Feed::Groww, 13, 0),
+            (Feed::Dhan, 27, 1),
+        ];
+        // Interleaved batch: instrument-major order is deliberately NOT used.
+        let mut batch = Vec::new();
+        for minute in 0..7_u32 {
+            for (n, (feed, sid, seg)) in identities.iter().enumerate() {
+                let base = 100.0 + (n as f64) * 10.0 + f64::from(minute);
+                batch.push(bar_ident_at(
+                    *feed,
+                    *sid,
+                    *seg,
+                    minute,
+                    base,
+                    base + 1.0,
+                    base - 1.0,
+                    base + 0.5,
+                    (n as i64) + 1,
+                ));
+            }
+        }
+
+        let mut slots = FoldSlots::new();
+        let out = apply_bar_batch(&mut slots, &batch, today);
+        assert_eq!(slots.len(), identities.len());
+        assert!(out.emissions.iter().all(|e| !e.is_refold));
+        assert_eq!(out.slot_exhausted, 0);
+
+        for (n, (feed, sid, seg)) in identities.iter().enumerate() {
+            // Index == linear scan, still.
+            let idx = slots.lookup(*feed, *sid, *seg).expect("present");
+            assert_eq!(
+                Some(idx),
+                reference_linear_scan(&slots, *feed, *sid, *seg),
+                "index must agree with the scan it replaced"
+            );
+
+            // Reference: the same bars through a standalone engine.
+            let own: Vec<ConfirmedBar> = batch
+                .iter()
+                .filter(|b| {
+                    b.feed == *feed && b.security_id == *sid && b.exchange_segment_code == *seg
+                })
+                .copied()
+                .collect();
+            assert_eq!(own.len(), 7);
+            let mut reference = SidFoldState::new(*feed, *sid, *seg);
+            let reference_seals = fold_all(&mut reference, &own);
+
+            let mine: Vec<SealedBucket> = out
+                .emissions
+                .iter()
+                .filter(|e| e.feed == *feed && e.security_id == *sid && e.segment_code == *seg)
+                .flat_map(|e| e.sealed.iter().copied())
+                .collect();
+            assert_eq!(
+                mine, reference_seals,
+                "instrument {n} ({feed:?}, {sid}, {seg}) must fold exactly as \
+                 an isolated engine"
+            );
+            assert_eq!(
+                slots[idx].engine.force_seal_open(),
+                reference.force_seal_open(),
+                "instrument {n} live engine must equal the reference engine"
+            );
+            assert_eq!(slots[idx].day_map_len(), 7);
+        }
+    }
+
+    #[test]
+    fn test_fold_slots_replace_or_insert_is_keyed_on_the_composite_identity() {
+        // The boot catch-up seeding path (was its own linear scan): a seed
+        // must REPLACE the slot for the SAME composite identity in place,
+        // and INSERT for any differing component of the key.
+        let mut slots = FoldSlots::new();
+        slots.slot_mut(Feed::Dhan, 13, 0).expect("slot");
+        let original_idx = slots.lookup(Feed::Dhan, 13, 0).expect("present");
+
+        let seeded = SidDayFold::from_catchup(
+            SidFoldState::new(Feed::Dhan, 13, 0),
+            day0_date(),
+            &[bar_at(0, 1.0, 1.0, 1.0, 1.0, 1)],
+        );
+        assert!(slots.replace_or_insert(seeded));
+        assert_eq!(slots.len(), 1, "same identity must REPLACE, not push");
+        assert_eq!(slots.lookup(Feed::Dhan, 13, 0), Some(original_idx));
+        assert_eq!(slots[original_idx].day_map_len(), 1, "seed took effect");
+        assert_eq!(slots[original_idx].current_day(), Some(day0_date()));
+
+        // Differing feed / segment / id each INSERT a new slot.
+        assert!(slots.replace_or_insert(SidDayFold::new(Feed::Groww, 13, 0)));
+        assert!(slots.replace_or_insert(SidDayFold::new(Feed::Dhan, 13, 1)));
+        assert!(slots.replace_or_insert(SidDayFold::new(Feed::Dhan, 14, 0)));
+        assert_eq!(slots.len(), 4);
     }
 }

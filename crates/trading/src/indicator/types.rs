@@ -98,7 +98,30 @@ impl RingBuffer {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IndicatorSnapshot {
     /// Security identifier (for routing to correct strategy).
+    ///
+    /// This is the REAL, namespace-banded id (Groww `[2^62,2^63)`, GDF
+    /// `[2^60,2^62)`, TrueData `[2^59,2^60)`). It is what audit rows, logs,
+    /// persistence and cross-feed joins need, and it is NOT usable as an
+    /// array index — see `slot`.
     pub security_id: u64,
+
+    /// Dense slot assigned to this `security_id` by
+    /// [`crate::indicator::IndicatorEngine`], for O(1) indexing into
+    /// per-instrument state arrays.
+    ///
+    /// 2026-08-07 (§28.3): consumers used to compute `security_id as usize`
+    /// and index with it. That worked while ids were small u32 exchange
+    /// tokens, but ids are now namespace-banded and every live id is
+    /// astronomically larger than any array — so every such index missed its
+    /// bound and the consumer silently returned a default. §28.2 repaired the
+    /// engine's own indexing with a dense-slot allocator; this field carries
+    /// that already-resolved slot downstream so the strategy evaluator
+    /// indexes by the SAME dense value instead of re-deriving a broken one.
+    ///
+    /// A `Default`-constructed snapshot (which the engine returns when it is
+    /// at capacity) has `slot == 0` and `is_warm == false`; consumers MUST
+    /// gate on `is_warm` before trusting `slot`.
+    pub slot: u32,
 
     // --- Moving Averages ---
     /// Exponential Moving Average (fast period, typically 12).
@@ -845,6 +868,7 @@ mod tests {
         // it from this test.
         let mut snap = IndicatorSnapshot {
             security_id: 13,
+            slot: 0,
             ema_fast: f64::NAN,
             ema_slow: f64::NAN,
             sma: f64::NAN,

@@ -38,7 +38,7 @@ const TRADING_PIPELINE_LAG_ERROR_THRESHOLD: u64 = 1_000;
 use tickvault_common::config::{ApplicationConfig, OmsReconcileConfig};
 use tickvault_common::constants::{
     IST_UTC_OFFSET_SECONDS, MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS,
-    MAX_INDICATOR_INSTRUMENTS,
+    MAX_INDICATOR_INSTRUMENTS, SECONDS_PER_DAY,
 };
 
 /// Order-gate window open, seconds-of-day IST — DERIVED from the canonical
@@ -54,6 +54,26 @@ const ORDER_GATE_CLOSE_SECS_OF_DAY_IST: u32 = (MARKET_CLOSE_IST_NANOS / 1_000_00
 // Fail the BUILD if these ever drift from the session the rest of the tree uses.
 const _: () = assert!(ORDER_GATE_OPEN_SECS_OF_DAY_IST == 33_300);
 const _: () = assert!(ORDER_GATE_CLOSE_SECS_OF_DAY_IST == 56_400);
+
+/// Pure: IST seconds-of-day for a UTC epoch-seconds instant.
+///
+/// 2026-08-09 (clock-bug sweep): the order gate below computed this inline as
+/// `(now_ist % 86_400) as u32` — a TRUNCATING remainder — while the scheduled
+/// reconcile gate in this same file, `spot_1m_rest_boot::ist_millis_of_day_now`,
+/// `groww_spot_1m_boot`, and the canonical `audit-findings-2026-04-17.md`
+/// Rule 3 helper all use `rem_euclid`. The two disagree for a NEGATIVE
+/// `now_ist` — a container booted with a pre-1970 clock that NTP has not yet
+/// corrected: truncating `%` keeps the sign, and an int-to-int `as` cast
+/// TRUNCATES BITS rather than saturating, so the negative remainder wrapped to
+/// a ~4.29e9 `u32`. That is outside `[ORDER_GATE_OPEN, ORDER_GATE_CLOSE)`, so
+/// EVERY order entry was silently suppressed while exits (never gated) still
+/// fired — a one-sided pipeline with no log line. `rem_euclid` is the only
+/// correct reduction and is what every sibling already uses.
+fn ist_secs_of_day(now_utc_secs: i64) -> u32 {
+    let now_ist = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    // rem_euclid(86_400) is always in [0, 86_399] — the cast is lossless.
+    now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
+}
 use tickvault_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
@@ -429,11 +449,13 @@ async fn run_trading_pipeline(
                         // of the tree, so a future session change cannot desync
                         // this file again. `market-hours.md` explicitly forbids
                         // hardcoded bounds here.
-                        let ist_secs_of_day = {
-                            let now_utc = chrono::Utc::now().timestamp();
-                            let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS)); // +5:30
-                            (now_ist % 86_400) as u32
-                        };
+                        //
+                        // 2026-08-09: the reduction was a TRUNCATING `%`, which
+                        // returns a NEGATIVE value for a pre-epoch clock and then
+                        // WRAPS to a ~4.29e9 u32 on `as u32` — suppressing every
+                        // entry while exits stayed ungated. Now `rem_euclid`, via
+                        // the shared pure helper, matching every sibling.
+                        let ist_secs_of_day = ist_secs_of_day(chrono::Utc::now().timestamp());
                         let within_trading_hours = (ORDER_GATE_OPEN_SECS_OF_DAY_IST
                             ..ORDER_GATE_CLOSE_SECS_OF_DAY_IST)
                             .contains(&ist_secs_of_day);
@@ -828,7 +850,7 @@ async fn run_trading_pipeline(
                 // Rule 3 market-hours gate, re-checked on every tick.
                 let now_utc = chrono::Utc::now().timestamp();
                 let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-                let ist_secs_of_day = now_ist.rem_euclid(86_400) as u32;
+                let ist_secs_of_day = ist_secs_of_day(now_utc);
                 let calendar_says_trading_day = trading_calendar
                     .as_ref()
                     .map(|calendar| calendar.is_trading_day_today());
@@ -1128,6 +1150,99 @@ mod tests {
 
     use tickvault_core::auth::types::{DhanAuthResponseData, TokenState};
     use tickvault_trading::oms::TokenProvider;
+
+    // -----------------------------------------------------------------
+    // ist_secs_of_day — the 2026-08-09 truncating-`%` clock bug.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_ist_secs_of_day_is_always_in_range() {
+        for now_utc in [
+            i64::MIN,
+            -1_000_000_000,
+            -19_800,
+            -19_801,
+            -1,
+            0,
+            1,
+            1_700_000_000,
+            i64::MAX,
+        ] {
+            let secs = ist_secs_of_day(now_utc);
+            assert!(
+                secs < SECONDS_PER_DAY,
+                "ist_secs_of_day({now_utc}) = {secs} escaped [0, {SECONDS_PER_DAY})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ist_secs_of_day_epoch_is_0530_ist() {
+        // Unix epoch = 1970-01-01 00:00:00 UTC = 05:30:00 IST.
+        assert_eq!(ist_secs_of_day(0), 5 * 3_600 + 30 * 60);
+    }
+
+    #[test]
+    fn test_ist_secs_of_day_matches_rem_euclid_for_positive_clock() {
+        // A normal, NTP-correct clock: helper == the reconcile gate's own math.
+        for now_utc in [1_700_000_000_i64, 1_754_700_000, 1_754_733_299] {
+            let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+            assert_eq!(ist_secs_of_day(now_utc), now_ist.rem_euclid(86_400) as u32);
+        }
+    }
+
+    #[test]
+    fn test_ist_secs_of_day_negative_ist_instant_is_not_wrapped() {
+        // THE BUG: a pre-1970 container clock (NTP not yet applied) makes
+        // `now_ist` NEGATIVE. Truncating `%` keeps the sign, and an
+        // int->int `as` cast TRUNCATES BITS (it does not saturate), so the
+        // negative remainder wrapped to a ~4.29e9 u32 — far outside
+        // [ORDER_GATE_OPEN, ORDER_GATE_CLOSE). Every order entry was
+        // silently suppressed while exits, which are never gated, still
+        // fired: a one-sided pipeline with no log line.
+        // 1969-12-31 00:00:00 UTC == 1969-12-31 05:30:00 IST.
+        let now_utc = -86_400_i64;
+        let now_ist = now_utc + i64::from(IST_UTC_OFFSET_SECONDS);
+        assert!(now_ist < 0, "the bug needs a negative IST instant");
+
+        let old_math = (now_ist % 86_400) as u32;
+        assert_eq!(
+            old_math, 4_294_900_696,
+            "the old `%` math wrapped to a huge u32 (the bug)"
+        );
+        assert!(
+            !(ORDER_GATE_OPEN_SECS_OF_DAY_IST..ORDER_GATE_CLOSE_SECS_OF_DAY_IST)
+                .contains(&old_math),
+            "the wrapped value falls outside the order gate — entries suppressed"
+        );
+
+        // rem_euclid returns the real IST seconds-of-day: 05:30:00.
+        assert_eq!(ist_secs_of_day(now_utc), 5 * 3_600 + 30 * 60);
+    }
+
+    #[test]
+    fn test_ist_secs_of_day_negative_clock_can_land_inside_the_order_gate() {
+        // A pre-epoch clock whose IST wall-clock time is inside the trading
+        // window must be treated as inside it — the old `%` math forced 0
+        // (closed) for EVERY negative instant regardless of time of day.
+        // -86_400 + 33_300 - 19_800 => IST seconds-of-day == ORDER_GATE_OPEN.
+        let now_utc = -86_400_i64 + i64::from(ORDER_GATE_OPEN_SECS_OF_DAY_IST)
+            - i64::from(IST_UTC_OFFSET_SECONDS);
+        let secs = ist_secs_of_day(now_utc);
+        assert_eq!(secs, ORDER_GATE_OPEN_SECS_OF_DAY_IST);
+        assert!(
+            (ORDER_GATE_OPEN_SECS_OF_DAY_IST..ORDER_GATE_CLOSE_SECS_OF_DAY_IST).contains(&secs),
+            "negative-clock instant inside the session must gate OPEN"
+        );
+    }
+
+    #[test]
+    fn test_ist_secs_of_day_saturating_add_does_not_overflow() {
+        // i64::MAX + IST offset must saturate, never wrap into a negative.
+        let secs = ist_secs_of_day(i64::MAX);
+        assert!(secs < SECONDS_PER_DAY);
+        assert_eq!(secs, i64::MAX.rem_euclid(86_400) as u32);
+    }
 
     /// Creates a TokenHandle with a valid token for testing.
     fn make_token_handle_with_value(access_token: &str) -> TokenHandle {

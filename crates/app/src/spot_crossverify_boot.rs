@@ -60,10 +60,23 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 const MICROS_PER_SEC: i64 = 1_000_000;
 const SECS_PER_DAY: i64 = 86_400;
 
-/// NSE session window (seconds-of-day IST): [09:15, 15:30).
+/// NSE session window (seconds-of-day IST): [09:15, 15:40).
+///
+/// 2026-08-07: close was 55_800 (15:30) until the NSE Closing Auction change of
+/// 2026-08-03 moved it to 56_400 (15:40). The only assert here was
+/// `OPEN < CLOSE` — a relative check that stays true under drift — so this
+/// module silently kept 15:30 and the spot cross-verify never compared the
+/// closing-auction minutes. Per `websocket-connection-scope-lock.md` §C the
+/// REST comparisons are the ONLY independent OHLCV parity signal, so it was
+/// reporting clean over a window it could not see. Now pinned absolutely.
 const SESSION_OPEN_SECS_OF_DAY_IST: i64 = 33_300;
-const SESSION_CLOSE_SECS_OF_DAY_IST: i64 = 55_800;
+const SESSION_CLOSE_SECS_OF_DAY_IST: i64 = 56_400;
 const _: () = assert!(SESSION_OPEN_SECS_OF_DAY_IST < SESSION_CLOSE_SECS_OF_DAY_IST);
+const _: () = assert!(
+    SESSION_CLOSE_SECS_OF_DAY_IST * NANOS_PER_SEC
+        == tickvault_common::constants::MARKET_CLOSE_IST_NANOS,
+    "spot cross-verify session close drifted from the canonical constant"
+);
 const _: () = assert!(
     (SPOT_XVERIFY_TRIGGER_SECS_OF_DAY_IST as i64) > SESSION_CLOSE_SECS_OF_DAY_IST,
     "the comparator must fire AFTER the 15:30 close"

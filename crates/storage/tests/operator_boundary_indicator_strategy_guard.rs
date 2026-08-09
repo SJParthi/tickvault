@@ -49,9 +49,9 @@ const ENGINE_STATES_FIELD: &str = "states: Vec<IndicatorState>,";
 const BOUNDARY_FILES: &[(&str, u64, usize, usize)] = &[
     (
         "crates/trading/src/indicator/engine.rs",
-        0xf2a12824c086a9b7,
-        61730,
-        1656,
+        0x7678513682a80a70,
+        90247,
+        2292,
     ),
     (
         "crates/trading/src/indicator/mod.rs",
@@ -73,9 +73,9 @@ const BOUNDARY_FILES: &[(&str, u64, usize, usize)] = &[
     ),
     (
         "crates/trading/src/indicator/types.rs",
-        0x00b6a1289e81f81e,
-        32025,
-        968,
+        0xc115ec25e58a19e1,
+        33321,
+        992,
     ),
     (
         "crates/trading/src/strategy/config.rs",
@@ -91,9 +91,9 @@ const BOUNDARY_FILES: &[(&str, u64, usize, usize)] = &[
     ),
     (
         "crates/trading/src/strategy/evaluator.rs",
-        0xf20f51ffa10334c0,
-        76706,
-        2089,
+        0x78dd71e827b39a05,
+        82936,
+        2234,
     ),
     (
         "crates/trading/src/strategy/hot_reload.rs",
@@ -109,9 +109,9 @@ const BOUNDARY_FILES: &[(&str, u64, usize, usize)] = &[
     ),
     (
         "crates/trading/src/strategy/tests.rs",
-        0x9a83670568b0260f,
-        15843,
-        515,
+        0xa0a6ac25421d9e90,
+        16137,
+        520,
     ),
     (
         "crates/trading/src/strategy/types.rs",

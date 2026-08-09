@@ -8,8 +8,8 @@
 //! * mode="check"        @ 08:45 IST — verify the box started; self-heal
 //!   (ec2:StartInstances) + page if not; flag late starts; respect the
 //!   NSE-holiday intentional-stop marker (fail-open).
-//! * mode="stop_check"   @ 16:45 IST — verify the 16:30 stop worked;
-//!   self-stop a box left running since before 16:30; never touch a manual
+//! * mode="stop_check"   @ 17:45 IST — verify the 17:30 stop worked;
+//!   self-stop a box left running since before 17:30; never touch a manual
 //!   evening session.
 //! * mode="curfew_check" hourly — stop a forgotten out-of-hours box unless
 //!   a keep-alive override / launch grace applies (operator directive
@@ -35,16 +35,24 @@ use tracing::{error, info, warn};
 /// The daily_start EventBridge rule fires at 03:00 UTC (= 08:30 IST, Mon-Fri).
 pub const START_TRIGGER_UTC_HOUR: u32 = 3;
 pub const START_TRIGGER_UTC_MINUTE: u32 = 0;
-/// The daily_stop EventBridge rule fires at 11:00 UTC (= 16:30 IST, Mon-Fri).
-pub const STOP_TRIGGER_UTC_HOUR: u32 = 11;
+/// The daily_stop EventBridge rule fires at 12:00 UTC (= 17:30 IST, Mon-Fri).
+/// 2026-08-08 (operator Quote 14): moved from 11:00 UTC / 16:30 IST with the
+/// 9-hour window. KEEP IN LOCKSTEP with main.tf `daily_stop` schedule_expression.
+pub const STOP_TRIGGER_UTC_HOUR: u32 = 12;
 pub const STOP_TRIGGER_UTC_MINUTE: u32 = 0;
 /// EC2 start -> running takes <1 min; anything launched more than this many
 /// minutes after the trigger means the scheduled start did NOT do it.
 pub const LATE_START_GRACE_MINUTES: i64 = 5;
 
-/// Operating hours: 08:00-17:00 IST, Mon-Fri (curfew guard inactive inside).
+/// Operating hours: 08:00-**17:30** IST, Mon-Fri (curfew guard inactive inside).
+///
+/// 2026-08-08 (operator Quote 14): close moved 17:00 -> 17:30. LOAD-BEARING:
+/// the curfew guard STOPS a box running outside these hours, so a 17:00 close
+/// against a 17:30 EventBridge stop would have curfew-killed the box 30 min
+/// early every day. The 08:00 open is deliberately UNCHANGED — the start stays
+/// 08:30, so the open already has 30 min of slack and no morning schedule moves.
 pub const OPERATING_OPEN_IST_MINUTES: u32 = 8 * 60;
-pub const OPERATING_CLOSE_IST_MINUTES: u32 = 17 * 60;
+pub const OPERATING_CLOSE_IST_MINUTES: u32 = 17 * 60 + 30;
 /// Grace: never curfew-stop a box within this many minutes of its launch.
 pub const CURFEW_START_GRACE_MINUTES: i64 = 45;
 
@@ -516,8 +524,8 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
     }
 
     if mode == "stop_check" {
-        // @ 16:45 IST: verify the 16:30 daily_stop actually stopped the box.
-        // Self-heal rule: stop ONLY a box launched BEFORE today's 16:30
+        // @ 17:45 IST: verify the 17:30 daily_stop actually stopped the box.
+        // Self-heal rule: stop ONLY a box launched BEFORE today's 17:30
         // trigger; a box launched AFTER it is a deliberate manual evening
         // session and is NEVER touched.
         let (state, launch_time) = instance_info(ec2, &env.instance_id).await;
@@ -531,7 +539,7 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
         {
             info!(
                 launch_time = %lt,
-                "stop_check — running but launched after 16:30 IST: manual evening session, leaving it alone"
+                "stop_check — running but launched after 17:30 IST: manual evening session, leaving it alone"
             );
             return Ok(json!({"mode": "stop_check", "state": state, "alerted": false}));
         }
@@ -540,8 +548,8 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
             publish(
                 sns,
                 env,
-                "16:30 auto-stop FAILED — box still running",
-                "🆘 The 4:30 PM IST auto-stop did NOT stop the box and I could \
+                "17:30 auto-stop FAILED — box still running",
+                "🆘 The 5:30 PM IST auto-stop did NOT stop the box and I could \
 not read its launch time, so I won't risk killing a manual \
 session. If you are NOT using it right now, press \
 'Stop instance' on the portal — it bills every hour it runs.",
@@ -557,13 +565,13 @@ session. If you are NOT using it right now, press \
             publish(
                 sns,
                 env,
-                "16:30 auto-stop FAILED — watchdog stopped the box itself",
-                "🆘 The 4:30 PM IST auto-stop did NOT stop the box (it had been \
-running since before 4:30 PM). I have sent the stop command \
+                "17:30 auto-stop FAILED — watchdog stopped the box itself",
+                "🆘 The 5:30 PM IST auto-stop did NOT stop the box (it had been \
+running since before 5:30 PM). I have sent the stop command \
 myself. If you WANTED it running this evening, just press \
 'Start instance' on the portal — a box you start manually \
-after 4:30 PM is never auto-stopped. Also investigate why the \
-4:30 PM stop failed: AWS console → Systems Manager → \
+after 5:30 PM is never auto-stopped. Also investigate why the \
+5:30 PM stop failed: AWS console → Systems Manager → \
 Automation executions for AWS-StopEC2Instance.",
             )
             .await?;
@@ -571,9 +579,9 @@ Automation executions for AWS-StopEC2Instance.",
             publish(
                 sns,
                 env,
-                "16:30 auto-stop FAILED — manual stop NEEDED",
+                "17:30 auto-stop FAILED — manual stop NEEDED",
                 &format!(
-                    "🆘 The 4:30 PM IST auto-stop did NOT stop the box — and the \
+                    "🆘 The 5:30 PM IST auto-stop did NOT stop the box — and the \
 watchdog's own stop attempt ALSO failed. Press 'Stop instance' \
 on the portal, or run \
 `aws ec2 stop-instances --instance-ids {} \
@@ -1339,14 +1347,19 @@ mod tests {
     }
 
     // Stop-check window: 16:45 IST = 11:15 UTC; the stop trigger is 11:00 UTC.
+    // 2026-08-08 (Quote 14): the stop moved to 12:00 UTC (17:30 IST) and the
+    // stop_check to 12:15 UTC (17:45 IST). These fixtures moved with it — at
+    // the old values, 11:46 UTC (17:16 IST) is now BEFORE the stop trigger, so
+    // a deliberate manual evening session would have been misread as a box
+    // left running since morning and stopped.
     fn stop_check_now() -> DateTime<Utc> {
-        utc(2026, 6, 10, 11, 15)
+        utc(2026, 6, 10, 12, 15) // 17:45 IST — the stop_check slot
     }
     fn morning_launch() -> DateTime<Utc> {
-        utc(2026, 6, 10, 3, 13) // since morning
+        utc(2026, 6, 10, 3, 13) // 08:43 IST — since morning
     }
     fn evening_launch() -> DateTime<Utc> {
-        utc(2026, 6, 10, 11, 46) // manual 17:16 IST
+        utc(2026, 6, 10, 12, 16) // manual 17:46 IST — AFTER the 17:30 stop
     }
 
     #[tokio::test]
@@ -1367,7 +1380,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stop_check_running_since_morning_self_stops_and_pages() {
-        // 2026-06-10 incident: 16:30 stop silently failed; box (up since
+        // 2026-06-10 incident: the scheduled stop silently failed; box (up since
         // 08:43) still running. The 16:45 stop_check must stop it + page.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
@@ -1392,7 +1405,7 @@ mod tests {
     #[tokio::test]
     async fn test_stop_check_manual_evening_session_is_never_touched() {
         // Operator lock: out-of-window runs are manual + deliberate. A box
-        // launched AFTER the 16:30 trigger must be left alone, silently.
+        // launched AFTER the stop trigger must be left alone, silently.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(evening_launch());
         let out = run(
@@ -1931,8 +1944,13 @@ mod tests {
         // Wed 2026-07-01 boundaries.
         assert!(!is_within_operating_hours(at(2026, 7, 1, 7, 59)));
         assert!(is_within_operating_hours(at(2026, 7, 1, 8, 0)));
-        assert!(is_within_operating_hours(at(2026, 7, 1, 16, 59)));
-        assert!(!is_within_operating_hours(at(2026, 7, 1, 17, 0)));
+        // 2026-08-08 (Quote 14): close moved 17:00 -> 17:30, so 17:00 and
+        // 17:29 are now INSIDE and only 17:30 is out. The 17:00 assert is kept
+        // (inverted) as the regression pin: if the close slips back, the curfew
+        // guard stops the box 30 min before its scheduled 17:30 stop.
+        assert!(is_within_operating_hours(at(2026, 7, 1, 17, 0)));
+        assert!(is_within_operating_hours(at(2026, 7, 1, 17, 29)));
+        assert!(!is_within_operating_hours(at(2026, 7, 1, 17, 30)));
         // Sunday midday is never operating hours.
         assert!(!is_within_operating_hours(at(2026, 7, 5, 12, 0)));
     }

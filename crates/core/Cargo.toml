@@ -18,7 +18,12 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 arc-swap = { workspace = true }
 rtrb = { workspace = true }
-papaya = { workspace = true }
+# 2026-08-08: `papaya` REMOVED — it was declared here with ZERO usage anywhere in
+# crates/core (src, tests, benches all verified empty of it) while simultaneously
+# sitting in the cargo-machete `ignored` allowlist below, so unused-dep tooling
+# could never surface it. `papaya` is still a real, USED dependency of
+# crates/trading (src/in_mem/day_ohlc_tracker.rs) and stays pinned in the
+# workspace root Cargo.toml; only this unused core declaration is dropped.
 arrayvec = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
@@ -107,4 +112,7 @@ harness = false
 # (operator retirement directive 2026-07-13, scope-lock amendment §B).
 
 [package.metadata.cargo-machete]
-ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "loom", "papaya", "rtrb"]
+# 2026-08-08: "papaya" dropped from this allowlist together with the unused
+# dependency itself — an entry here permanently hides a dep from cargo-machete,
+# so the allowlist must shrink whenever the underlying dep goes.
+ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "loom", "rtrb"]

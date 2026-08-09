@@ -1010,6 +1010,7 @@ fn test_strategy_not_warm_returns_hold() {
 
     let snap = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0, // below 30, would normally trigger long
         is_warm: false,
         ..Default::default()
@@ -1027,18 +1028,38 @@ fn test_strategy_not_warm_returns_hold() {
 // =========================================================================
 
 #[test]
-fn test_strategy_oob_security_id_returns_hold() {
+fn test_strategy_oob_slot_returns_hold() {
     let def = make_test_strategy(0, false);
-    let mut instance = StrategyInstance::new(def, 50); // max sid = 50
+    let mut instance = StrategyInstance::new(def, 50); // 50 slots
 
-    let snap = IndicatorSnapshot {
-        security_id: 100, // OOB
+    // §28.3 (2026-08-07): the evaluator bounds-checks the DENSE SLOT, not the
+    // raw security_id. This test used to pass security_id=100 with no slot and
+    // assert Hold — encoding the silent-no-op DEFECT as the contract, exactly
+    // like the engine-side tests repaired in PR #1726. Now it tests the REAL
+    // bound.
+    let oob = IndicatorSnapshot {
+        security_id: 100,
+        slot: 100, // beyond the 50 pre-allocated slots
         is_warm: true,
         rsi: 20.0,
         ..Default::default()
     };
+    assert_eq!(instance.evaluate(&oob), Signal::Hold);
 
-    assert_eq!(instance.evaluate(&snap), Signal::Hold);
+    // The PRODUCTION shape: a namespace-banded id with an IN-RANGE slot must
+    // be PROCESSED. Before §28.3 this returned Hold for every live instrument.
+    let banded = IndicatorSnapshot {
+        security_id: 1_u64 << 62, // Groww index band
+        slot: 7,
+        is_warm: true,
+        rsi: 20.0,
+        ..Default::default()
+    };
+    assert_ne!(
+        instance.evaluate(&banded),
+        Signal::Hold,
+        "a banded security_id with a valid slot must be processed (§28.3)"
+    );
 }
 
 // =========================================================================
@@ -1052,6 +1073,7 @@ fn test_strategy_idle_to_enter_long_no_confirmation() {
 
     let snap = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0, // < 30 → long entry
         is_warm: true,
         atr: 5.0,
@@ -1093,6 +1115,7 @@ fn test_strategy_idle_to_enter_short_no_confirmation() {
 
     let snap = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 80.0, // > 70 → short entry
         is_warm: true,
         atr: 5.0,
@@ -1131,6 +1154,7 @@ fn test_strategy_confirmation_delays_entry() {
 
     let entry_snap = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0,
         is_warm: true,
         atr: 5.0,
@@ -1163,6 +1187,7 @@ fn test_strategy_confirmation_reverts_if_conditions_not_met() {
 
     let entry_snap = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0, // < 30
         is_warm: true,
         atr: 5.0,
@@ -1177,6 +1202,7 @@ fn test_strategy_confirmation_reverts_if_conditions_not_met() {
     // 3rd tick: conditions NO LONGER met
     let no_entry = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 55.0, // not < 30 anymore
         is_warm: true,
         atr: 5.0,
@@ -1203,6 +1229,7 @@ fn test_strategy_long_stop_loss_triggers_exit() {
     // Enter long
     let entry = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0,
         is_warm: true,
         atr: 5.0,
@@ -1214,6 +1241,7 @@ fn test_strategy_long_stop_loss_triggers_exit() {
     // Price drops below stop loss (90)
     let sl_hit = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 40.0,
         is_warm: true,
         last_traded_price: 89.0, // below SL of 90
@@ -1244,6 +1272,7 @@ fn test_strategy_long_target_triggers_exit() {
     // Enter long
     let entry = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0,
         is_warm: true,
         atr: 5.0,
@@ -1255,6 +1284,7 @@ fn test_strategy_long_target_triggers_exit() {
     // Price above target (115)
     let target_hit = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 40.0,
         is_warm: true,
         last_traded_price: 116.0,
@@ -1285,6 +1315,7 @@ fn test_strategy_exit_condition_triggers_signal_reversal() {
     // Enter long
     let entry = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0,
         is_warm: true,
         atr: 5.0,
@@ -1296,6 +1327,7 @@ fn test_strategy_exit_condition_triggers_signal_reversal() {
     // RSI > 50 exit condition met (but price still between SL and target)
     let exit_cond = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 55.0, // > 50 exit condition
         is_warm: true,
         last_traded_price: 105.0, // between SL(90) and target(115)
@@ -1325,6 +1357,7 @@ fn test_strategy_hold_when_no_entry_conditions_met() {
 
     let snap = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 50.0, // not < 30 (no long), not > 70 (no short)
         is_warm: true,
         ..Default::default()
@@ -1345,6 +1378,7 @@ fn test_strategy_exit_pending_holds_until_oms_reset() {
     // Enter and immediately trigger exit
     let entry = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0,
         is_warm: true,
         atr: 5.0,
@@ -1355,6 +1389,7 @@ fn test_strategy_exit_pending_holds_until_oms_reset() {
 
     let exit_snap = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 55.0,
         is_warm: true,
         last_traded_price: 105.0,
@@ -1376,6 +1411,7 @@ fn test_strategy_exit_pending_holds_until_oms_reset() {
     // Now can enter again
     let re_entry = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0,
         is_warm: true,
         atr: 5.0,
@@ -1400,6 +1436,7 @@ fn test_strategy_trailing_stop_long() {
     // Enter long at 100, SL=90, target=115, trail_mult=1.5
     let entry = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 20.0,
         is_warm: true,
         atr: 5.0,
@@ -1411,6 +1448,7 @@ fn test_strategy_trailing_stop_long() {
     // Price rises to 112 (new highest)
     let rising = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 40.0,
         is_warm: true,
         last_traded_price: 112.0,
@@ -1423,6 +1461,7 @@ fn test_strategy_trailing_stop_long() {
     // Price at 104 < 104.5 and 104.5 > original SL(90) → trailing stop hit
     let trail_hit = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 40.0,
         is_warm: true,
         last_traded_price: 104.0,
@@ -1453,6 +1492,7 @@ fn test_strategy_short_stop_loss_triggers_exit() {
     // Enter short (RSI > 70)
     let entry = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 80.0,
         is_warm: true,
         atr: 5.0,
@@ -1464,6 +1504,7 @@ fn test_strategy_short_stop_loss_triggers_exit() {
     // Price rises above SL (110)
     let sl_hit = IndicatorSnapshot {
         security_id: 100,
+        slot: 100,
         rsi: 60.0,
         is_warm: true,
         last_traded_price: 111.0,
@@ -1631,6 +1672,7 @@ mod proptest_strategy {
             let mut instance = StrategyInstance::new(def, 10);
             let snap = IndicatorSnapshot {
                 security_id: 1,
+                slot: 1,
                 rsi,
                 last_traded_price: ltp,
                 atr,
@@ -1653,6 +1695,7 @@ mod proptest_strategy {
             // Force long entry: RSI < 30
             let snap = IndicatorSnapshot {
                 security_id: 1,
+                slot: 1,
                 rsi: 20.0,
                 last_traded_price: ltp,
                 atr,
@@ -1680,6 +1723,7 @@ mod proptest_strategy {
             // Force short entry: RSI > 70
             let snap = IndicatorSnapshot {
                 security_id: 1,
+                slot: 1,
                 rsi: 85.0,
                 last_traded_price: ltp,
                 atr,
@@ -1706,6 +1750,7 @@ mod proptest_strategy {
             // Enter long at 100, ATR=5, SL=90
             let snap = IndicatorSnapshot {
                 security_id: 1,
+                slot: 1,
                 rsi: 20.0,
                 last_traded_price: 100.0,
                 atr: 5.0,
@@ -1718,6 +1763,7 @@ mod proptest_strategy {
             let sl_price = 90.0 - (drop_pct * 10.0);
             let snap = IndicatorSnapshot {
                 security_id: 1,
+                slot: 1,
                 rsi: 40.0,
                 last_traded_price: sl_price,
                 atr: 5.0,

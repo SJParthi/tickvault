@@ -140,16 +140,26 @@ impl SubscribedInstrument {
 /// Every tick from the WebSocket can be enriched in O(1) by looking up `security_id`.
 #[derive(Clone)]
 pub struct InstrumentRegistry {
-    /// O(1) lookup: security_id → instrument metadata.
-    ///
-    /// LEGACY single-segment lookup kept for the 59 existing call sites
-    /// that do not know the segment at lookup time. When two instruments
-    /// share the same `security_id` across different segments, one wins
-    /// this map (a WARN log fires per collision) — callers that need the
-    /// correct disambiguated lookup use `get_with_segment` instead.
-    // APPROVED: legacy single-segment index — I-P1-11.
-    instruments: HashMap<SecurityId, SubscribedInstrument>,
-
+    // 2026-08-08: the LEGACY single-segment `instruments` index — a map keyed
+    // on the BARE security_id, holding a full `SubscribedInstrument` per id —
+    // was DELETED here, together with the two collision-lossy accessors it
+    // served (`get(id)` / `contains(id)`).
+    //
+    // Its doc comment claimed it was "kept for the 59 existing call sites that
+    // do not know the segment at lookup time". A full sweep of crates/*/src on
+    // 2026-08-08 found ZERO production call sites — the 5 real ones were
+    // migrated to `get_with_segment` back in 2026-04-17 (commit c7397b3), and
+    // the only remaining callers were assertions in this file plus one DHAT
+    // test and one Criterion bench (both migrated in the same PR). So the map
+    // was storing a second full copy of every instrument, and exposing an API
+    // that silently returns the WRONG instrument on a cross-segment id reuse,
+    // purely to serve its own tests.
+    //
+    // `(security_id, exchange_segment)` is now the only way to reach an
+    // instrument, which is exactly what I-P1-11 requires. Collision detection
+    // is unchanged and still reported via `cross_segment_collisions()` /
+    // `collision_pairs()`; see `from_instruments` for the construction-time
+    // probe that replaced the duplicate-insert trick.
     /// I-P1-11 (2026-04-17): O(1) segment-aware lookup. Stores BOTH
     /// colliding entries when Dhan reuses a numeric `security_id` across
     /// segments (e.g. FINNIFTY IDX_I id=27 + NSE_EQ id=27). This is the
@@ -193,7 +203,6 @@ impl InstrumentRegistry {
     /// Creates an empty registry (used in tests or offline mode).
     pub fn empty() -> Self {
         Self {
-            instruments: HashMap::new(),
             by_composite: HashMap::new(),
             category_counts: HashMap::new(),
             total_count: 0,
@@ -219,8 +228,26 @@ impl InstrumentRegistry {
     ///   (e.g. tick processor reading byte 3 of the 8-byte header) use
     ///   `get_with_segment` for disambiguated lookup.
     pub fn from_instruments(instruments: Vec<SubscribedInstrument>) -> Self {
-        let mut map = HashMap::with_capacity(instruments.len());
         let mut by_composite: HashMap<(SecurityId, ExchangeSegment), SubscribedInstrument> =
+            HashMap::with_capacity(instruments.len());
+        // 2026-08-08: replaces the deleted legacy single-segment `instruments`
+        // map for the SOLE purpose of collision DETECTION. It records the
+        // last-seen segment per numeric id and is dropped at the end of
+        // construction — nothing looks up an instrument by id alone anymore.
+        // Semantics are byte-identical to the old `map.insert()` probe:
+        // `HashMap::insert` returns the previous value and overwrites, so a
+        // 3-segment collision still yields the same sequential
+        // (id, prev, new) pair chain it always did.
+        // I-P1-11 note: the map below is keyed on the bare `security_id` ON
+        // PURPOSE. It is NOT an instrument lookup table — it is the collision
+        // PROBE, and detecting "one id appearing under two segments" requires a
+        // key that deliberately ignores the segment. The segment is the VALUE,
+        // not part of the key; the map holds no instrument and is dropped at the
+        // end of construction, so nothing is ever RESOLVED through it. Every
+        // real lookup goes through `by_composite`, keyed on the full
+        // `(security_id, exchange_segment)` composite.
+        // APPROVED: single-segment context — collision probe only, never a lookup (I-P1-11).
+        let mut last_segment_for_id: HashMap<SecurityId, ExchangeSegment> =
             HashMap::with_capacity(instruments.len());
         // I-P1-11 gap G (2026-04-17): count cross-segment collisions
         // detected during build so callers in metrics-enabled crates
@@ -241,38 +268,46 @@ impl InstrumentRegistry {
                 instrument.clone(),
             );
 
-            // Legacy index: keyed on security_id alone. When two Dhan
-            // instruments share the same numeric id across segments
-            // (e.g. NIFTY id=13 IDX_I + ABB id=13 NSE_EQ), the second
-            // insert overwrites the first in THIS map. The authoritative
-            // `by_composite` map above has already stored BOTH entries
-            // safely — no data is lost. We log at INFO (not ERROR, not
-            // WARN) because every production caller looks up via
-            // `get_with_segment(id, segment)`; the legacy `get(id)`
-            // API is only used by test assertions. The count is exposed
-            // via `cross_segment_collisions()` for operator visibility
+            // I-P1-11 collision DETECTION. When two Dhan instruments share the
+            // same numeric id across segments (e.g. NIFTY id=13 IDX_I + ABB
+            // id=13 NSE_EQ) both are already stored above in the authoritative
+            // `by_composite` index — no data is lost, and since 2026-08-08
+            // there is no longer any id-only map for one of them to be dropped
+            // from. We log at INFO (not ERROR, not WARN) because every caller
+            // now looks up via `get_with_segment(id, segment)` — the lossy
+            // id-only `get(id)` API has been deleted, so this condition can no
+            // longer cause a wrong-instrument read. The count stays exposed via
+            // `cross_segment_collisions()` for operator visibility
             // (make doctor / /health surface it as a gauge).
-            if let Some(prev) = map.insert(instrument.security_id, instrument.clone())
-                && prev.exchange_segment != instrument.exchange_segment
+            if let Some(prev_segment) =
+                last_segment_for_id.insert(instrument.security_id, instrument.exchange_segment)
+                && prev_segment != instrument.exchange_segment
             {
                 cross_segment_collisions = cross_segment_collisions.saturating_add(1);
                 collision_pairs.push((
                     instrument.security_id,
-                    prev.exchange_segment,
+                    prev_segment,
                     instrument.exchange_segment,
                 ));
+                // The previously-seen instrument is still addressable in
+                // `by_composite` under its own segment, so the forensic
+                // `prev_symbol` field survives the removal of the legacy map
+                // without holding a second full copy of every instrument.
+                let prev_symbol = by_composite
+                    .get(&(instrument.security_id, prev_segment))
+                    .map_or("<unknown>", |prev| prev.underlying_symbol.as_str());
                 tracing::info!(
                     code = crate::error_code::ErrorCode::InstrumentP1CrossSegmentCollision.code_str(),
                     severity = crate::error_code::ErrorCode::InstrumentP1CrossSegmentCollision.severity().as_str(),
                     security_id = instrument.security_id,
-                    prev_segment = ?prev.exchange_segment,
+                    prev_segment = ?prev_segment,
                     new_segment = ?instrument.exchange_segment,
-                    prev_symbol = %prev.underlying_symbol,
+                    prev_symbol = %prev_symbol,
                     new_symbol = %instrument.underlying_symbol,
                     "I-P1-11: Dhan id reused across segments — BOTH entries \
                      stored safely in composite (id, segment) index. No data \
-                     loss. Production callers use get_with_segment(); legacy \
-                     get(id) is test-only."
+                     loss. All callers use get_with_segment(); the lossy \
+                     id-only get(id) API was deleted 2026-08-08."
                 );
             }
         }
@@ -308,7 +343,6 @@ impl InstrumentRegistry {
         }
 
         Self {
-            instruments: map,
             by_composite,
             category_counts,
             total_count,
@@ -346,17 +380,13 @@ impl InstrumentRegistry {
         self.cross_segment_collisions
     }
 
-    /// O(1) lookup: returns instrument metadata for a security_id, or `None` if not subscribed.
-    ///
-    /// LEGACY — uses the single-segment index. When a cross-segment
-    /// collision exists, this returns whichever entry won the insert
-    /// race (a WARN was logged at construction). For disambiguated
-    /// lookup use [`get_with_segment`](Self::get_with_segment).
-    #[inline]
-    pub fn get(&self, security_id: SecurityId) -> Option<&SubscribedInstrument> {
-        self.instruments.get(&security_id)
-    }
-
+    // 2026-08-08: `pub fn get(&self, security_id) -> Option<&SubscribedInstrument>`
+    // was DELETED here. It read the legacy single-segment index and therefore
+    // returned "whichever entry won the insert race" on a cross-segment id
+    // reuse — a silent wrong-instrument read. It had zero production callers.
+    // Use `get_with_segment(id, segment)`; the segment is always available at
+    // the call site (the tick processor reads it from byte 3 of the 8-byte
+    // binary header).
     /// I-P1-11 (2026-04-17): O(1) segment-aware lookup. Returns the
     /// exact instrument for the given `(security_id, segment)` pair,
     /// correctly disambiguating cross-segment collisions (e.g.
@@ -385,12 +415,11 @@ impl InstrumentRegistry {
         self.by_composite.contains_key(&(security_id, segment))
     }
 
-    /// Returns `true` if this security_id is in the registry.
-    #[inline]
-    pub fn contains(&self, security_id: SecurityId) -> bool {
-        self.instruments.contains_key(&security_id)
-    }
-
+    // 2026-08-08: `pub fn contains(&self, security_id) -> bool` was DELETED
+    // here for the same reason as `get`: it consulted the legacy single-segment
+    // index, so it reported `true` for an id that exists only under a
+    // DIFFERENT segment — a false positive by construction. Zero production
+    // callers. Use `contains_with_segment(id, segment)`.
     /// Total number of subscribed instruments.
     #[inline]
     pub fn len(&self) -> usize {
@@ -727,8 +756,12 @@ mod tests {
         let registry = InstrumentRegistry::empty();
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
-        assert!(registry.get(13).is_none());
-        assert!(!registry.contains(13));
+        assert!(
+            registry
+                .get_with_segment(13, ExchangeSegment::IdxI)
+                .is_none()
+        );
+        assert!(!registry.contains_with_segment(13, ExchangeSegment::IdxI));
     }
 
     /// Ratchet: the I-P1-11 cross-segment event is NOT a data loss —
@@ -770,9 +803,11 @@ mod tests {
         let registry = InstrumentRegistry::from_instruments(instruments);
         assert_eq!(registry.len(), 1);
         assert!(!registry.is_empty());
-        assert!(registry.contains(13));
-        assert!(!registry.contains(99));
-        let inst = registry.get(13).unwrap();
+        assert!(registry.contains_with_segment(13, ExchangeSegment::IdxI));
+        assert!(!registry.contains_with_segment(99, ExchangeSegment::IdxI));
+        let inst = registry
+            .get_with_segment(13, ExchangeSegment::IdxI)
+            .unwrap();
         assert_eq!(inst.security_id, 13);
         assert_eq!(inst.category, SubscriptionCategory::MajorIndexValue);
     }
@@ -1013,7 +1048,10 @@ mod tests {
         // HashMap insert order: last wins
         assert_eq!(registry.len(), 1);
         assert_eq!(
-            registry.get(13).unwrap().category,
+            registry
+                .get_with_segment(13, ExchangeSegment::IdxI)
+                .unwrap()
+                .category,
             SubscriptionCategory::DisplayIndex
         );
     }
@@ -1284,8 +1322,8 @@ mod tests {
         let cloned = original.clone();
 
         assert_eq!(original.len(), cloned.len());
-        assert!(cloned.contains(1));
-        assert!(cloned.contains(2));
+        assert!(cloned.contains_with_segment(1, ExchangeSegment::IdxI));
+        assert!(cloned.contains_with_segment(2, ExchangeSegment::IdxI));
         assert_eq!(
             cloned.category_count(SubscriptionCategory::MajorIndexValue),
             1,

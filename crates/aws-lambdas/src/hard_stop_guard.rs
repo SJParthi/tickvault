@@ -4,7 +4,7 @@
 //! Hourly EventBridge cron; the budget/schedule never-cross safety net:
 //!
 //! * Instance already stopped/stopping -> no-op.
-//! * Running OUTSIDE the Mon-Fri 08:30-16:30 IST up-window -> force stop +
+//! * Running OUTSIDE the Mon-Fri 08:30-17:30 IST up-window -> force stop +
 //!   Telegram (the legacy never-cross guard, unchanged).
 //! * Running INSIDE the up-window:
 //!     - MTD spend >= BUDGET_KILL_USD -> stop the instance, DISABLE the
@@ -34,10 +34,25 @@ use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
-/// Legacy parity: `BUDGET_KILL_USD = float(os.environ.get(..., "55"))`.
+/// Env-missing FALLBACK kill line. Terraform ALWAYS injects
+/// `BUDGET_KILL_USD` (budget-guards.tf), so this value only applies if that
+/// injection is missing or unparsable.
+///
 /// KEEP IN SYNC with budget.tf `limit_amount` AND `BUDGET_USD` in the daily
-/// digest — the three MUST agree on "breached".
-pub const DEFAULT_BUDGET_KILL_USD: f64 = 55.0;
+/// digest — the four MUST agree on "breached". Pinned by
+/// `crates/aws-lambdas/tests/budget_ceiling_lockstep_guard.rs`.
+///
+/// **2026-08-08: raised 55.0 → 100.0, and this was a live-consequence fix, not
+/// cosmetic.** The old 55.0 was a documented-safe fallback only because it sat
+/// ABOVE the then-current $35 ceiling — a missing env var killed LATER than the
+/// real line, which is the harmless direction. Quote 13 raised the real ceiling
+/// to $100, which SILENTLY INVERTED that property: 55 is now BELOW both the
+/// ceiling and the expected ~$73.60 monthly bill, so a missing or fat-fingered
+/// env var would have stopped the prod box mid-session at $55 every month. The
+/// stale fallback was a flagged follow-up while it was harmless; raising the
+/// ceiling made it a defect, so it is fixed here in the same change rather than
+/// left as a note.
+pub const DEFAULT_BUDGET_KILL_USD: f64 = 100.0;
 /// Legacy parity default for the change-only ping-state SSM param
 /// (NOT under the banned groww/* namespace).
 pub const DEFAULT_PING_STATE_PARAM: &str = "/tickvault/prod/budget-guard/ping-state";
@@ -77,7 +92,7 @@ impl GuardEnv {
             // never-cross guard entirely.
             budget_kill_usd: match std::env::var("BUDGET_KILL_USD") {
                 Ok(raw) => raw.parse::<f64>().unwrap_or_else(|e| {
-                    warn!(error = %e, raw = %raw, "BUDGET_KILL_USD unparsable — using default 55");
+                    warn!(error = %e, raw = %raw, default = %DEFAULT_BUDGET_KILL_USD, "BUDGET_KILL_USD unparsable — using the compiled default");
                     DEFAULT_BUDGET_KILL_USD
                 }),
                 Err(_) => DEFAULT_BUDGET_KILL_USD,
@@ -132,7 +147,14 @@ pub trait SsmApi {
     async fn put_parameter(&self, name: &str, value: &str) -> Result<(), String>;
 }
 
-/// Legacy `in_up_window`: Mon-Fri 08:30-16:30 IST (inclusive both ends).
+/// Mon-Fri 08:30-**17:30** IST (inclusive both ends).
+///
+/// 2026-08-08 (operator Quote 14): the close moved 16:30 -> 17:30 with the
+/// 9-hour trading window. This constant is LOAD-BEARING, not cosmetic: this
+/// guard runs HOURLY and force-stops any box running OUTSIDE the window, so
+/// leaving it at 16:30 while EventBridge stops at 17:30 would have had the
+/// guard kill the box at 17:00 every day and page — silently cancelling the
+/// extra hour the operator paid for.
 /// The guard NEVER stops the box during the window on schedule grounds —
 /// only a budget breach may stop it in-window.
 pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
@@ -141,7 +163,7 @@ pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
         return false;
     }
     let hhmm = ist_now.hour() * 100 + ist_now.minute();
-    (830..=1630).contains(&hhmm)
+    (830..=1730).contains(&hhmm)
 }
 
 /// Legacy `mtd_usd` — best-effort Cost Explorer month-to-date total.
@@ -576,7 +598,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
 _instance_: `{}`\n\
 _was_state_: {state}\n\
 Hourly out-of-window guard found the box running OUTSIDE the\n\
-08:30-16:30 IST Mon-Fri window. EventBridge 16:30 stop (or a\n\
+08:30-17:30 IST Mon-Fri window. EventBridge 17:30 stop (or a\n\
 manual start) left it up. Now stopped to protect the budget.\n",
             env.instance_id
         ),
@@ -775,7 +797,7 @@ mod tests {
             .expect("valid test timestamp")
     }
 
-    // 2026-07-07 is a Tuesday. 04:30 UTC = 10:00 IST (inside 08:30-16:30).
+    // 2026-07-07 is a Tuesday. 04:30 UTC = 10:00 IST (inside 08:30-17:30).
     fn in_window() -> DateTime<Utc> {
         utc(2026, 7, 7, 4, 30)
     }
@@ -1020,10 +1042,15 @@ mod tests {
     }
 
     #[test]
-    fn test_1630_ist_is_in_and_1631_is_out() {
-        // 11:00 UTC = 16:30 IST; 11:01 UTC = 16:31 IST (Tuesday).
+    fn test_1730_ist_is_in_and_1731_is_out() {
+        // 12:00 UTC = 17:30 IST; 12:01 UTC = 17:31 IST (Tuesday).
+        assert!(in_up_window(utc(2026, 7, 7, 12, 0)));
+        assert!(!in_up_window(utc(2026, 7, 7, 12, 1)));
+        // 2026-08-08 (Quote 14) regression pin: the OLD close was 16:30 IST
+        // (11:00 UTC). It must now be INSIDE the window — if this flips back,
+        // the hourly guard force-stops the box an hour before its schedule.
         assert!(in_up_window(utc(2026, 7, 7, 11, 0)));
-        assert!(!in_up_window(utc(2026, 7, 7, 11, 1)));
+        assert!(in_up_window(utc(2026, 7, 7, 11, 1)));
     }
 
     // --- MtdUsd ------------------------------------------------------------

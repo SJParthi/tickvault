@@ -71,8 +71,15 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 ENV="${TV_ENV:-prod}"
 REGION="${AWS_REGION:-ap-south-1}"          # ap-south-1 Mumbai per aws-budget.md
-FROM_TYPE="${FROM_TYPE:-t4g.medium}"        # the prior locked type to flip FROM (overridable)
-TO_TYPE="${TO_TYPE:-t4g.large}"             # operator lock 2026-08-07 §7 Quote 12 (capacity escape)
+FROM_TYPE="${FROM_TYPE:-t4g.large}"         # the prior locked type to flip FROM (overridable)
+TO_TYPE="${TO_TYPE:-r8g.xlarge}"            # operator lock 2026-08-08 §7 Quote 13 (13-TF + tick retention)
+# NOTE (2026-08-08): this script does an IN-PLACE stop/modify/start, which can
+# only ever land in the instance's EXISTING availability zone. It therefore
+# CANNOT deliver the multi-AZ escape that Quote 13 also authorizes — if the
+# current AZ is out of capacity, this script will fail exactly as the
+# 2026-08-07 attempt did (workflow run 31148235540). Use terraform with
+# var.availability_zone for a zone move; use this script only for a
+# same-zone type flip.
 NAME_TAG="tv-${ENV}-app"
 
 # Allowlist of flip targets. Adding a new type here is NOT the same as

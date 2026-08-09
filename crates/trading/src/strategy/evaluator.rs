@@ -49,8 +49,30 @@ impl StrategyInstance {
     /// The resulting `Signal` (Hold, EnterLong, EnterShort, or Exit).
     #[allow(clippy::arithmetic_side_effects)] // APPROVED: tick_counter saturating_add; ATR multiplications are bounded
     pub fn evaluate(&mut self, snapshot: &IndicatorSnapshot) -> Signal {
-        let sid = snapshot.security_id as usize;
-        if sid >= self.states.len() || !snapshot.is_warm {
+        // §28.3 (2026-08-07): index by the engine-assigned DENSE SLOT, never
+        // by `security_id`.
+        //
+        // This previously read `snapshot.security_id as usize`. Once ids
+        // became namespace-banded (Groww `[2^62,2^63)`, GDF `[2^60,2^62)`,
+        // TrueData `[2^59,2^60)`) EVERY live id exceeded `states.len()`
+        // (25_000), so this function returned `Signal::Hold` for every
+        // instrument, permanently, with no error and no counter — the
+        // identical silent no-op §28.2 repaired one stage upstream in
+        // `IndicatorEngine`. Indicators were computing correctly and the
+        // strategy was discarding all of them.
+        //
+        // `is_warm` is checked FIRST: a default snapshot (engine at capacity,
+        // or an instrument still warming up) carries `slot == 0`, which is a
+        // VALID index — so trusting it before checking warmth would attribute
+        // one instrument's state to another. The bounds check is retained as
+        // defence in depth; the engine guarantees `slot < states.len()` by
+        // construction, but a mismatched `max_security_id` at construction
+        // must degrade to Hold rather than panic.
+        if !snapshot.is_warm {
+            return Signal::Hold;
+        }
+        let sid = snapshot.slot as usize;
+        if sid >= self.states.len() {
             return Signal::Hold;
         }
 
@@ -367,10 +389,23 @@ impl StrategyInstance {
         &self.definition
     }
 
-    /// Resets the FSM state for a given security_id to Idle.
-    /// Called by the OMS after a position is fully closed.
-    pub fn reset_state(&mut self, security_id: u32) {
-        let sid = security_id as usize;
+    /// Resets the FSM state for a given DENSE SLOT to Idle.
+    ///
+    /// # The parameter is a slot, NOT a `security_id`
+    ///
+    /// 2026-08-07 (§28.3): this took a parameter named `security_id` and
+    /// indexed `states` with it directly — the same shape as the `evaluate()`
+    /// defect repaired above. It is harmless TODAY only because it has ZERO
+    /// production call sites (its old doc line "Called by the OMS after a
+    /// position is fully closed" described an intention, not a caller —
+    /// verified by grep: tests only). Whoever wires it would otherwise have
+    /// walked straight into the same silent no-op, since every live
+    /// `security_id` is namespace-banded and astronomically out of bounds.
+    ///
+    /// Pass `IndicatorSnapshot::slot` — the engine-assigned dense index —
+    /// never a raw `security_id`.
+    pub fn reset_state(&mut self, slot: u32) {
+        let sid = slot as usize;
         if sid < self.states.len() {
             self.states[sid] = StrategyState::Idle;
         }
@@ -407,9 +442,37 @@ mod tests {
         }
     }
 
+    /// §28.3: `slot` mirrors `security_id` here because these fixtures use
+    /// small ids, so every pre-existing test keeps its exact semantics. Tests
+    /// that need the REAL production shape — a banded id with a dense slot
+    /// that differs from it — construct the snapshot explicitly below.
     fn make_warm_snapshot(security_id: u64, ltp: f64, rsi: f64, atr: f64) -> IndicatorSnapshot {
         IndicatorSnapshot {
             security_id,
+            // APPROVED: test fixture ids are small and fit u32 by construction.
+            #[allow(clippy::cast_possible_truncation)]
+            slot: security_id as u32,
+            last_traded_price: ltp,
+            rsi,
+            atr,
+            is_warm: true,
+            ..Default::default()
+        }
+    }
+
+    /// The PRODUCTION shape: a namespace-banded `security_id` (astronomically
+    /// larger than any state array) paired with the dense `slot` the engine
+    /// actually assigned. Before §28.3 the evaluator indexed by the former.
+    fn make_banded_snapshot(
+        security_id: u64,
+        slot: u32,
+        ltp: f64,
+        rsi: f64,
+        atr: f64,
+    ) -> IndicatorSnapshot {
+        IndicatorSnapshot {
+            security_id,
+            slot,
             last_traded_price: ltp,
             rsi,
             atr,
@@ -423,14 +486,96 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_out_of_bounds_security_id_returns_hold() {
+    fn test_out_of_bounds_slot_returns_hold() {
         let def = make_long_only_definition(30.0);
-        let mut instance = StrategyInstance::new(def, 10); // max_security_id = 10
+        let mut instance = StrategyInstance::new(def, 10); // 10 slots
 
-        // security_id=100 is way beyond the pre-allocated state array
+        // slot=100 is way beyond the pre-allocated state array.
         let snap = make_warm_snapshot(100, 250.0, 25.0, 5.0);
         let signal = instance.evaluate(&snap);
-        assert_eq!(signal, Signal::Hold, "OOB security_id must return Hold");
+        assert_eq!(signal, Signal::Hold, "OOB slot must return Hold");
+    }
+
+    // -----------------------------------------------------------------------
+    // §28.3 regression: a namespace-banded security_id must be PROCESSED
+    // -----------------------------------------------------------------------
+
+    /// THE regression test for the 2026-08-07 audit finding.
+    ///
+    /// Before §28.3 the evaluator computed `security_id as usize` and bailed
+    /// when it exceeded `states.len()`. Every live id is namespace-banded and
+    /// astronomically larger than any array, so this returned `Signal::Hold`
+    /// for EVERY instrument, permanently and silently. This test fails against
+    /// the pre-§28.3 evaluator and passes after.
+    #[test]
+    fn test_banded_security_id_is_processed_not_silently_held() {
+        for (label, security_id) in [
+            ("groww index", 1_u64 << 62),
+            ("gdf token", 1_u64 << 61),
+            ("truedata", 1_u64 << 59),
+        ] {
+            let def = make_long_only_definition(30.0);
+            let mut instance = StrategyInstance::new(def, 200);
+
+            // RSI 25 < threshold 30 => the long-only definition must ENTER.
+            let snap = make_banded_snapshot(security_id, 7, 250.0, 25.0, 5.0);
+            let signal = instance.evaluate(&snap);
+
+            assert_ne!(
+                signal,
+                Signal::Hold,
+                "{label} (id {security_id}) was silently held — the §28.3 \
+                 banded-id defect has regressed"
+            );
+            assert_ne!(
+                instance.states[7],
+                StrategyState::Idle,
+                "{label}: FSM state at the dense slot must have advanced"
+            );
+        }
+    }
+
+    /// Two instruments with wildly different banded ids but distinct slots
+    /// must not share FSM state.
+    #[test]
+    fn test_banded_ids_with_distinct_slots_are_isolated() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 200);
+
+        let a = make_banded_snapshot(1_u64 << 62, 3, 250.0, 25.0, 5.0);
+        let _ = instance.evaluate(&a);
+
+        assert_ne!(instance.states[3], StrategyState::Idle, "slot 3 advanced");
+        assert_eq!(
+            instance.states[4],
+            StrategyState::Idle,
+            "slot 4 must be untouched — no cross-instrument bleed"
+        );
+    }
+
+    /// A cold/default snapshot carries `slot == 0`, which is a VALID index.
+    /// The warmth gate must run FIRST, or an unwarmed instrument would be
+    /// attributed to whatever lives in slot 0.
+    #[test]
+    fn test_cold_snapshot_holds_without_touching_slot_zero() {
+        let def = make_long_only_definition(30.0);
+        let mut instance = StrategyInstance::new(def, 200);
+
+        let cold = IndicatorSnapshot {
+            security_id: 1_u64 << 62,
+            slot: 0,
+            rsi: 25.0,
+            last_traded_price: 250.0,
+            atr: 5.0,
+            is_warm: false,
+            ..Default::default()
+        };
+        assert_eq!(instance.evaluate(&cold), Signal::Hold);
+        assert_eq!(
+            instance.states[0],
+            StrategyState::Idle,
+            "slot 0 must be untouched by a cold snapshot"
+        );
     }
 
     #[test]

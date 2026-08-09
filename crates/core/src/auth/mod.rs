@@ -6,6 +6,9 @@
 //!
 //! # Modules
 //!
+//! - [`dhan_token_publisher`] — Publishes the minted Dhan token to SSM so peer
+//!   consumers READ it instead of minting (Dhan allows ONE active token per
+//!   account; a second minter would invalidate ours). Operator 2026-08-08.
 //! - [`secret_manager`] — Fetches credentials from AWS SSM Parameter Store
 //! - [`totp_generator`] — Generates TOTP codes for 2FA
 //! - [`token_manager`] — JWT lifecycle with O(1) arc-swap reads and renewal
@@ -33,6 +36,7 @@
 //! let auth_header = token.access_token().expose_secret();
 //! ```
 
+pub mod dhan_token_publisher;
 pub mod mid_session_watchdog;
 pub mod secret_manager;
 pub mod token_cache;

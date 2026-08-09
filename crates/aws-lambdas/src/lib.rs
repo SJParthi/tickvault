@@ -29,6 +29,7 @@ pub mod budget_digest;
 pub mod budget_killswitch;
 pub mod clients;
 pub mod deploy_watchdog;
+pub mod dhan_token_minter;
 pub mod events;
 pub mod hard_stop_guard;
 pub mod logging;
