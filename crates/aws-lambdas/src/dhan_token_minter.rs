@@ -413,18 +413,6 @@ pub async fn fetch_credentials_from<S: SecretStore>(
     })
 }
 
-/// Reads all three Dhan credentials concurrently from live SSM.
-///
-/// # Errors
-///
-/// Returns [`MintError::CredentialRead`] if any parameter is missing or empty.
-pub async fn fetch_credentials(
-    ssm: &SsmClient,
-    environment: &str,
-) -> Result<DhanCredentials, MintError> {
-    fetch_credentials_from(&SsmSecretStore::new(ssm), environment).await
-}
-
 /// Mints a fresh Dhan access token via the TOTP flow.
 ///
 /// # Errors
@@ -507,19 +495,6 @@ pub async fn publish_token_to<S: SecretStore>(
     let path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_ACCESS_TOKEN_SECRET);
     store.write_secure(path.clone(), token.clone()).await?;
     Ok(path)
-}
-
-/// Publishes the token to the live SSM parameter consumers read.
-///
-/// # Errors
-///
-/// Returns [`MintError::Publish`] if the write fails.
-pub async fn publish_token(
-    ssm: &SsmClient,
-    environment: &str,
-    token: &SecretString,
-) -> Result<String, MintError> {
-    publish_token_to(&SsmSecretStore::new(ssm), environment, token).await
 }
 
 /// The full daily job: read credentials → mint → publish.
