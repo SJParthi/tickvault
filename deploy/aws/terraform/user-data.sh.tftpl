@@ -139,6 +139,46 @@ scrape_configs:
           host: tickvault-prod
 PROMCFG
 
+# ---------------------------------------------------------------------------
+# EMF `metric_selectors` COST NOTE — 2026-08-09 (metric-blindness fix)
+# ---------------------------------------------------------------------------
+# The selector below is an EXPLICIT, EXACT-NAME alternation — never a prefix
+# wildcard. That is deliberate: CloudWatch bills ~$0.30/custom-metric/month,
+# the live budget kill-ceiling is $100/mo, and its AUTOMATIC budget actions
+# fire STOP_EC2_INSTANCES at 90% ($90). A `tv_.*`-style prefix would publish
+# whatever the binary happens to emit and could stop the trading box
+# mid-session, so the count must stay auditable by reading this one line.
+#
+#   before 2026-08-09 : 11 names ≈ $3.30/mo
+#   after  2026-08-09 : 41 names ≈ $12.30/mo   (delta +30 names ≈ +$9.00/mo)
+#
+# The workspace emits ~352 distinct metric names; 311 are deliberately NOT
+# selected. Inclusion rule applied: a name is selected only if it means
+# FAILURE, SATURATION, or DATA LOSS *and* has a reachable producer on the
+# REST-only runtime. Deliberately EXCLUDED:
+#   - success/volume counters + latency histograms (tv_*_fetch_total,
+#     tv_*_close_to_data_ms, ...) — they answer "how much", not "what broke";
+#     the /metrics endpoint + errors.jsonl keep them for post-hoc triage
+#   - names whose ONLY emit sites are the stood-down per-minute boot legs
+#     ([spot_1m_rest]/[option_chain_1m]/[groww_*_1m] enabled=false since
+#     2026-07-17 — the cadence executors own the pulls), e.g.
+#     tv_spot1m_sid_not_served_total, tv_*_sweep_still_missing_total
+#   - names behind the non-default `groww_orders` cargo feature (Gate 2 of
+#     the §39.2 lattice — not compiled into the deploy build), e.g.
+#     tv_groww_push_supervisor_respawn_total
+#   - tv_ws_frame_spill_write_errors_total — no WS frame producer exists
+#     (both live feeds retired 2026-07-13/15); the boot-time replay counter
+#     tv_wal_replay_corrupted_segments_total IS selected because replay_all
+#     runs every boot
+#   - tv_api_auth_failed_total — already published via its own log metric
+#     filter (auth-failed-alarm.tf); EMF-selecting it would double-bill
+# A dead name in this list implies coverage no producer can publish, which
+# is the false-OK class this repo's guards forbid (audit-findings Rule 11).
+# LOCKSTEP: this literal MUST stay byte-identical to the copy in
+# deploy/aws/cloudwatch-agent.json — pinned by
+# crates/storage/tests/cw_agent_selector_lockstep_guard.rs, and the exact
+# count is pinned by crates/common/tests/cloudwatch_app_alarms_wiring.rs.
+# ---------------------------------------------------------------------------
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
 {
   "agent": { "metrics_collection_interval": 60 },
@@ -165,7 +205,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
               "source_labels": ["host"],
               "label_matcher": "^tickvault-prod$",
               "dimensions": [["host"]],
-              "metric_selectors": ["^(tv_questdb_disconnected_seconds|tv_token_remaining_seconds|tv_orders_rejected_total|tv_boot_completed|tv_clock_skew_seconds|tv_disk_watcher_respawn_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_rest_1m_fire_heartbeat|tv_daily_pnl|tv_order_fill_lag_seconds)$"]
+              "metric_selectors": ["^(tv_questdb_disconnected_seconds|tv_token_remaining_seconds|tv_orders_rejected_total|tv_boot_completed|tv_clock_skew_seconds|tv_disk_watcher_respawn_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_rest_1m_fire_heartbeat|tv_daily_pnl|tv_order_fill_lag_seconds|tv_spot1m_persist_errors_total|tv_chain1m_persist_errors_total|tv_groww_spot1m_persist_errors_total|tv_groww_chain1m_persist_errors_total|tv_rest_fetch_audit_persist_errors_total|tv_rest_fetch_audit_rows_discarded_total|tv_cadence_option_mark_unresolved_total|tv_cadence_ladder_exhausted_total|tv_cadence_boundary_skipped_total|tv_cadence_late_response_total|tv_cadence_runner_respawn_total|tv_cadence_gate_denials_total|tv_cadence_spot_fallback_total|tv_questdb_wal_suspended_tables|tv_questdb_reconnects_total|tv_partition_archive_failed_total|tv_wal_replay_corrupted_segments_total|tv_order_audit_rows_discarded_total|tv_order_audit_persist_errors_total|tv_order_update_events_dropped_total|tv_order_update_events_persist_errors_total|tv_order_update_events_rows_discarded_total|tv_dhan_order_push_respawn_total|tv_spill_dir_free_bytes|tv_open_fds|tv_oom_kills_total|tv_ram_store_dropped_total|tv_ram_store_errors_total|tv_mid_session_profile_rest_degraded_total|tv_boot_deadline_exceeded_total)$"]
             }
           ]
         }

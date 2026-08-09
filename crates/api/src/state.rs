@@ -60,6 +60,41 @@ pub struct SystemHealthStatus {
     ticks_spilled: AtomicU64,
     /// Boot timestamp (epoch seconds) — 0 if not yet booted.
     boot_epoch_secs: AtomicU64,
+
+    // -------------------------------------------------------------------
+    // "Has any producer EVER reported this subsystem?" flags (2026-08-09,
+    // observability-blind-spot audit).
+    // -------------------------------------------------------------------
+    // THE BUG THESE CLOSE: four setters above — `set_websocket_connections`,
+    // `set_order_update_connected`, `set_pipeline_active` and
+    // `set_tick_persistence_connected` — have ZERO production call sites
+    // (verified 2026-08-09: every caller is inside `#[cfg(test)]` or
+    // `crates/api/tests/`). Their fields therefore sit at their `new()`
+    // defaults forever, and `/health` rendered those defaults as hard
+    // failures: websocket "disconnected", tick_persistence "unavailable",
+    // pipeline "inactive", order_update "disconnected".
+    //
+    // Worse, `overall_status()` degraded on `websocket_connections() == 0`,
+    // so the endpoint's TOP-LEVEL verdict was permanently "degraded" no
+    // matter how healthy the system was — which trains every reader to
+    // ignore it, destroying the signal entirely.
+    //
+    // A zero here means "nobody has told us", which is NOT the same claim as
+    // "we looked and it is down". Distinguishing the two is the whole point:
+    // `/health` may now say `retired` / `unreported` instead of inventing a
+    // red status for a subsystem that either no longer exists or simply has
+    // no writer yet.
+    //
+    // ARM-ON-ARRIVAL (the house pattern, cf. order-side-alarms.tf): these
+    // flags flip the instant ANY producer calls the corresponding setter, so
+    // when the Dhan live main-feed WS revival lands (authorized 2026-08-09,
+    // `websocket-connection-scope-lock.md`) its pool watchdog re-arms both
+    // the `/health` rendering AND the `overall_status()` predicate with ZERO
+    // further edits here. Nothing needs to remember to undo this.
+    websocket_reported: AtomicBool,
+    order_update_reported: AtomicBool,
+    pipeline_reported: AtomicBool,
+    tick_persistence_reported: AtomicBool,
 }
 
 impl SystemHealthStatus {
@@ -80,12 +115,64 @@ impl SystemHealthStatus {
             tick_buffer_size: AtomicU64::new(0),
             ticks_spilled: AtomicU64::new(0),
             boot_epoch_secs: AtomicU64::new(0),
+            // 2026-08-09: all four start UNREPORTED — see the field docs.
+            websocket_reported: AtomicBool::new(false),
+            order_update_reported: AtomicBool::new(false),
+            pipeline_reported: AtomicBool::new(false),
+            tick_persistence_reported: AtomicBool::new(false),
         }
     }
 
     /// Updates the WebSocket connection count.
+    ///
+    /// Also marks the websocket subsystem as REPORTED (2026-08-09) — see
+    /// [`SystemHealthStatus::websocket_reported`].
     pub fn set_websocket_connections(&self, count: u64) {
         self.websocket_connections.store(count, Ordering::Relaxed);
+        self.websocket_reported.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether ANY producer has ever pushed a websocket connection count.
+    ///
+    /// `false` means "no writer exists" — the live market-data WebSocket
+    /// feeds were retired (Dhan 2026-07-13, Groww 2026-07-15) and the Dhan
+    /// pool watchdog was deleted with the lane, so nothing calls
+    /// [`SystemHealthStatus::set_websocket_connections`] today. `/health`
+    /// renders that as `retired`, never as `disconnected`, and
+    /// [`SystemHealthStatus::overall_status`] skips the connection-count
+    /// predicate while it holds.
+    pub fn websocket_reported(&self) -> bool {
+        self.websocket_reported.load(Ordering::Relaxed)
+    }
+
+    /// Whether ANY producer has ever pushed an order-update WS state.
+    ///
+    /// `false` means "no writer exists". Unlike the websocket/pipeline/
+    /// tick-persistence cases this subsystem IS alive — `dhan_rest_stack`
+    /// spawns the paper-mode receive-only order-update connection when
+    /// `[dhan_order_push] enabled = true` — it simply never reports into
+    /// `/health`. Rendered as `unreported` (an honest "we don't know"),
+    /// never as `disconnected`.
+    pub fn order_update_reported(&self) -> bool {
+        self.order_update_reported.load(Ordering::Relaxed)
+    }
+
+    /// Whether ANY producer has ever pushed a pipeline-active state.
+    ///
+    /// `false` means "no writer exists": `spawn_trading_pipeline` has no
+    /// production call site (the tick pipeline spawned only under the
+    /// now-retired live feeds).
+    pub fn pipeline_reported(&self) -> bool {
+        self.pipeline_reported.load(Ordering::Relaxed)
+    }
+
+    /// Whether ANY producer has ever pushed a tick-persistence state.
+    ///
+    /// `false` means "no writer exists": `crates/storage/src/tick_persistence.rs`
+    /// was DELETED in the 2026-07-17 stage-2 dead-WS sweep, so the subsystem
+    /// this field describes no longer exists in the binary at all.
+    pub fn tick_persistence_reported(&self) -> bool {
+        self.tick_persistence_reported.load(Ordering::Relaxed)
     }
 
     /// Returns current WebSocket connection count.
@@ -98,6 +185,7 @@ impl SystemHealthStatus {
     pub fn set_order_update_connected(&self, connected: bool) {
         self.order_update_connected
             .store(connected, Ordering::Relaxed);
+        self.order_update_reported.store(true, Ordering::Relaxed);
     }
 
     /// Returns whether order update WebSocket is connected.
@@ -116,6 +204,7 @@ impl SystemHealthStatus {
     /// processor is consuming ticks.
     pub fn set_pipeline_active(&self, active: bool) {
         self.pipeline_active.store(active, Ordering::Relaxed);
+        self.pipeline_reported.store(true, Ordering::Relaxed);
         metrics::gauge!("tv_pipeline_active").set(if active { 1.0 } else { 0.0 });
     }
 
@@ -164,6 +253,8 @@ impl SystemHealthStatus {
     pub fn set_tick_persistence_connected(&self, connected: bool) {
         self.tick_persistence_connected
             .store(connected, Ordering::Relaxed);
+        self.tick_persistence_reported
+            .store(true, Ordering::Relaxed);
     }
 
     /// Returns whether tick persistence is connected to QuestDB.
@@ -202,11 +293,33 @@ impl SystemHealthStatus {
     }
 
     /// Derives overall system status from subsystem states.
+    ///
+    /// Predicates are only applied to subsystems that a producer actually
+    /// REPORTS. `token_valid` and `questdb_reachable` both have verified
+    /// production writers (`dhan_rest_stack.rs` and `main.rs` respectively),
+    /// so they always count.
+    ///
+    /// The websocket connection count is gated on
+    /// [`SystemHealthStatus::websocket_reported`] (2026-08-09,
+    /// observability-blind-spot audit). BEFORE this gate, `/health` returned
+    /// `"degraded"` **permanently**: no production code has called
+    /// `set_websocket_connections` since the Dhan live-WS lane (and its pool
+    /// watchdog) was deleted on 2026-07-13, so the count sat at 0 forever and
+    /// this predicate fired on every single request. A verdict that is always
+    /// "degraded" carries no information — it cannot distinguish a real
+    /// outage from a healthy REST-only runtime, so an operator learns to
+    /// ignore it, which is strictly worse than having no endpoint.
+    ///
+    /// This is NOT a relaxation of the check: the moment the authorized Dhan
+    /// live main-feed WS revival (2026-08-09,
+    /// `websocket-connection-scope-lock.md`) pushes its first count, the flag
+    /// flips and a drop to 0 degrades the verdict exactly as before —
+    /// arm-on-arrival, no further edit needed here.
     pub fn overall_status(&self) -> &'static str {
         if !self.token_valid() {
             return "degraded";
         }
-        if self.websocket_connections() == 0 {
+        if self.websocket_reported() && self.websocket_connections() == 0 {
             return "degraded";
         }
         if !self.questdb_reachable() {
@@ -599,7 +712,9 @@ mod tests {
         let health = SystemHealthStatus::new();
         health.set_token_valid(true);
         health.set_questdb_reachable(true);
-        // websocket_connections stays 0
+        // 2026-08-09: a producer REPORTING zero is the real "ws down" case.
+        // An unwritten default no longer degrades — see `overall_status`.
+        health.set_websocket_connections(0);
         assert_eq!(health.overall_status(), "degraded");
     }
 
@@ -741,6 +856,133 @@ mod tests {
     // SystemHealthStatus: toggle operations
     // -------------------------------------------------------------------
 
+    // -------------------------------------------------------------------
+    // 2026-08-09 — observability-blind-spot audit: "has any producer ever
+    // reported this subsystem?" tracking.
+    // -------------------------------------------------------------------
+
+    // NOTE (2026-08-09): each of the four getters below gets its OWN test
+    // whose name embeds the fn name, so `.claude/hooks/pub-fn-test-guard.sh`
+    // (which matches `fn test_.*<fn_name>`) sees explicit coverage for every
+    // new pub fn rather than relying on incidental substring matches.
+
+    #[test]
+    fn test_websocket_reported_starts_false_and_latches_on_first_report() {
+        let health = SystemHealthStatus::new();
+        assert!(
+            !health.websocket_reported(),
+            "no producer has reported the websocket on a fresh status"
+        );
+        health.set_websocket_connections(0);
+        assert!(
+            health.websocket_reported(),
+            "reporting zero connections is still a report"
+        );
+    }
+
+    #[test]
+    fn test_order_update_reported_starts_false_and_latches_on_first_report() {
+        let health = SystemHealthStatus::new();
+        assert!(!health.order_update_reported());
+        health.set_order_update_connected(false);
+        assert!(health.order_update_reported());
+    }
+
+    #[test]
+    fn test_pipeline_reported_starts_false_and_latches_on_first_report() {
+        let health = SystemHealthStatus::new();
+        assert!(!health.pipeline_reported());
+        health.set_pipeline_active(false);
+        assert!(health.pipeline_reported());
+    }
+
+    #[test]
+    fn test_tick_persistence_reported_starts_false_and_latches_on_first_report() {
+        let health = SystemHealthStatus::new();
+        assert!(!health.tick_persistence_reported());
+        health.set_tick_persistence_connected(false);
+        assert!(health.tick_persistence_reported());
+    }
+
+    #[test]
+    fn test_each_setter_marks_only_its_own_subsystem_reported() {
+        // Cross-contamination would let one wired subsystem vouch for three
+        // unwired ones — the exact false-OK class this tracking prevents.
+        let health = SystemHealthStatus::new();
+        health.set_websocket_connections(2);
+        assert!(health.websocket_reported());
+        assert!(!health.order_update_reported());
+        assert!(!health.pipeline_reported());
+        assert!(!health.tick_persistence_reported());
+
+        let health = SystemHealthStatus::new();
+        health.set_order_update_connected(false);
+        assert!(health.order_update_reported());
+        assert!(!health.websocket_reported());
+
+        let health = SystemHealthStatus::new();
+        health.set_pipeline_active(false);
+        assert!(health.pipeline_reported());
+        assert!(!health.websocket_reported());
+
+        let health = SystemHealthStatus::new();
+        health.set_tick_persistence_connected(false);
+        assert!(health.tick_persistence_reported());
+        assert!(!health.websocket_reported());
+    }
+
+    #[test]
+    fn test_reported_flag_latches_and_survives_a_false_report() {
+        // Reporting `false`/`0` IS a report — the flag must latch, otherwise
+        // a genuinely-down subsystem would render as `retired`.
+        let health = SystemHealthStatus::new();
+        health.set_websocket_connections(0);
+        assert!(
+            health.websocket_reported(),
+            "reporting zero connections is still a report"
+        );
+        health.set_websocket_connections(3);
+        assert!(health.websocket_reported());
+        health.set_websocket_connections(0);
+        assert!(health.websocket_reported(), "the flag must never un-latch");
+    }
+
+    #[test]
+    fn test_overall_status_ignores_unreported_websocket() {
+        // THE HEADLINE REGRESSION: with no websocket producer (the live
+        // REST-only runtime since 2026-07-13/15), a valid token + reachable
+        // QuestDB must read HEALTHY, not a permanent "degraded".
+        let health = SystemHealthStatus::new();
+        health.set_token_valid(true);
+        health.set_questdb_reachable(true);
+        assert!(!health.websocket_reported());
+        assert_eq!(
+            health.overall_status(),
+            "healthy",
+            "an unwritten websocket counter must not pin the verdict to degraded"
+        );
+    }
+
+    #[test]
+    fn test_overall_status_rearms_once_websocket_is_reported() {
+        // Arm-on-arrival: the authorized Dhan live-WS revival re-enables the
+        // predicate purely by calling the setter.
+        let health = SystemHealthStatus::new();
+        health.set_token_valid(true);
+        health.set_questdb_reachable(true);
+        assert_eq!(health.overall_status(), "healthy");
+
+        health.set_websocket_connections(4);
+        assert_eq!(health.overall_status(), "healthy");
+
+        health.set_websocket_connections(0);
+        assert_eq!(
+            health.overall_status(),
+            "degraded",
+            "a reported drop to zero must degrade exactly as before"
+        );
+    }
+
     #[test]
     fn test_system_health_status_toggle_pipeline_active() {
         let health = SystemHealthStatus::new();
@@ -787,11 +1029,14 @@ mod tests {
     }
 
     #[test]
+    // 2026-08-09: `set_websocket_connections(0)` added — a REPORTED zero is
+    // what this test always meant; the unwritten default now renders
+    // `retired` instead (observability-blind-spot audit).
     fn test_overall_status_ws_zero_is_degraded_even_with_valid_token() {
         let health = SystemHealthStatus::default();
         health.set_token_valid(true);
         health.set_questdb_reachable(true);
-        // websocket_connections stays 0
+        health.set_websocket_connections(0);
         assert_eq!(health.overall_status(), "degraded");
     }
 

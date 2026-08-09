@@ -50,6 +50,55 @@
 # dropped baseline is the harmless 0 and both series are dense from boot.
 # Ratchet: crates/app/tests/order_side_paging_wiring_guard.rs.
 #
+# =============================================================================
+# ⚠ DORMANT-ALARM LEDGER — 2026-08-09 (observability-blind-spot audit)
+# =============================================================================
+# TWO of the three alarms in this file watch metrics with ZERO production
+# emit sites anywhere in crates/*/src (only #[cfg(test)] fixtures mention
+# them). Verified 2026-08-09 by source scan:
+#
+#   | alarm                        | metric                     | emit sites |
+#   |------------------------------|----------------------------|------------|
+#   | tv-<env>-daily-loss-breach   | tv_daily_pnl               | 0 (prod)   |
+#   | tv-<env>-order-fill-lag-high | tv_order_fill_lag_seconds  | 0 (prod)   |
+#
+# This is INTENTIONAL pre-wiring (arm-on-arrival, see the per-alarm blocks) —
+# it is NOT a defect and these resources MUST NOT be deleted. What follows is
+# the honest statement of what that costs today, so no future reader mistakes
+# their console state for a health signal:
+#
+# ⚠ THE FALSE-GREEN: `treat_missing_data = "notBreaching"` means a metric that
+#   NEVER publishes evaluates as **OK**. On the CloudWatch console, in an alarm
+#   strip, and in any "are we green?" sweep, these two alarms are visually
+#   INDISTINGUISHABLE from two genuinely-healthy alarms. In particular
+#   **the daily-loss kill signal does not exist today**: there is no
+#   tv_daily_pnl datapoint, so a real daily-loss breach would page NOTHING
+#   from this route. The live protections are the risk engine's own halt
+#   (RISK-GAP-01) + the Critical RiskHalt Telegram event; this alarm is the
+#   REDUNDANT counter-side route that is currently absent, not the primary.
+#
+# WHY treat_missing_data IS NOT CHANGED HERE (deliberate, not an oversight):
+#   - "breaching" is REJECTED — it would page continuously for the entire
+#     dry-run period, i.e. trade a silent gap for permanent alert fatigue.
+#   - "missing" is the technically-honest value (it holds the alarm in
+#     INSUFFICIENT_DATA — visibly NOT green — and still fires no action,
+#     because insufficient_data_actions is unset). It is NOT applied in this
+#     change because `treat_missing_data="notBreaching"` on daily_loss_breach
+#     is PINNED by crates/app/tests/order_side_paging_wiring_guard.rs
+#     (test_daily_loss_alarm_is_armed_with_no_ok_actions_and_not_breaching),
+#     so flipping it requires editing that app-crate guard in the same PR.
+#     FLAGGED FOLLOW-UP for whoever owns crates/app next: flip both alarms to
+#     treat_missing_data = "missing" + update that guard, and the dormancy
+#     becomes self-evident in the console instead of only in this comment.
+#
+# The dormancy claim above is not a promise — it is RATCHETED by
+# crates/storage/tests/cloudwatch_dormant_alarms_guard.rs, which fails the
+# build in BOTH directions: if the DORMANT markers vanish from the two
+# alarm_descriptions while the metrics still have no emitter, and (more
+# importantly) the moment either metric GAINS a production emit site, so the
+# arming PR is forced to revisit this ledger rather than inherit a stale one.
+# =============================================================================
+#
 # FUTURE EMF-ALLOWLISTING: if tv_orders_placed_total is ever added to the
 # EMF metric_selectors allowlist, the DERIVED filter name
 # (tv_orders_placed_delta_total) keeps the identities separate (no
@@ -118,7 +167,7 @@ resource "aws_cloudwatch_metric_alarm" "orders_placed_storm" {
 # if the app-side Telegram leg is degraded.
 resource "aws_cloudwatch_metric_alarm" "daily_loss_breach" {
   alarm_name          = "tv-${var.environment}-daily-loss-breach"
-  alarm_description   = "Daily P&L breached the loss limit (tv_daily_pnl Minimum below -1 x daily_loss_alarm_inr over 5 minutes). EMIT-SITE OWNERSHIP: the tv_daily_pnl gauge ships with cluster A - this alarm arms on data arrival with zero tf changes. Redundant with the risk engine's own halt (RISK-GAP-01 + the Critical RiskHalt Telegram page). NO OK page: the risk-engine halt latch outlives an intraday mark-to-market bounce - an auto-OK would say recovered while trading stays blocked (Rule-11)."
+  alarm_description   = "[DORMANT 2026-08-09 - NO PRODUCTION EMIT SITE: tv_daily_pnl is written by ZERO non-test code paths, so this alarm has never evaluated a datapoint. With treat_missing_data=notBreaching it reads OK - that OK means NO DATA, not healthy, and the daily-loss KILL SIGNAL DOES NOT EXIST via this route today. Live protection is the risk engine halt (RISK-GAP-01) + the Critical RiskHalt Telegram page.] Daily P&L breached the loss limit (tv_daily_pnl Minimum below -1 x daily_loss_alarm_inr over 5 minutes). EMIT-SITE OWNERSHIP: the tv_daily_pnl gauge ships with cluster A - this alarm arms on data arrival with zero tf changes. Redundant with the risk engine's own halt (RISK-GAP-01 + the Critical RiskHalt Telegram page). NO OK page: the risk-engine halt latch outlives an intraday mark-to-market bounce - an auto-OK would say recovered while trading stays blocked (Rule-11)."
   comparison_operator = "LessThanThreshold"
   threshold           = -1 * var.daily_loss_alarm_inr
   evaluation_periods  = 1
@@ -138,7 +187,7 @@ resource "aws_cloudwatch_metric_alarm" "daily_loss_breach" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
   alarm_name          = "tv-${var.environment}-order-fill-lag-high"
-  alarm_description   = "ARMED at Phase-1 live promotion (phase-0-architecture.md promotion criterion #5) — in dry-run the metric never publishes and an armed alarm would be a permanently-INSUFFICIENT_DATA dead pager. The arming PR must also decide: join the market-hours window gate (12→13 + dated doc corrections) OR make the emitter publish in-session-only (the gauge holds its last value across scrapes)."
+  alarm_description   = "[DORMANT 2026-08-09 - NO PRODUCTION EMIT SITE: tv_order_fill_lag_seconds is written by ZERO non-test code paths. This alarm additionally ships with actions_enabled=false, so it can page nobody regardless of state.] ARMED at Phase-1 live promotion (phase-0-architecture.md promotion criterion #5) — in dry-run the metric never publishes and an armed alarm would be a permanently-INSUFFICIENT_DATA dead pager. The arming PR must also decide: join the market-hours window gate (12→13 + dated doc corrections) OR make the emitter publish in-session-only (the gauge holds its last value across scrapes)."
   comparison_operator = "GreaterThanThreshold"
   threshold           = 10
   evaluation_periods  = 1
