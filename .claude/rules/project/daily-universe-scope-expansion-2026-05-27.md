@@ -989,6 +989,83 @@ corrected.
 tree. The guard stays ACTIVE — any further frozen-area edit beyond this recorded lift
 fails the build again and needs its own fresh dated quote.
 
+
+### §28.4 — NARROW LIFT for the NaN/non-finite INGEST GATE (operator-approved 2026-08-09)
+
+**The verbatim operator authorization (2026-08-09, typed directly in-session):**
+
+> "yes take acre of eveyhtitgn enitlerey rbo okay?"
+
+Given in DIRECT response to a ranked fix plan whose **P1** row read verbatim
+*"NaN poisoning (#1) + clock-lock bugs (#2,#3) — Silent mistrades"*, presented
+alongside the evidence below. That plan is the scope this quote authorizes.
+
+**The defect this lift repairs (Verified, red-team audit 2026-08-09).**
+`IndicatorEngine::update` widened `tick.day_high` / `tick.day_low` through
+`f32_to_f64_clean` with **no finite check**. `f32_to_f64_clean`
+(`crates/common/src/price_precision.rs:55`) deliberately passes NaN through, and
+the Dhan quote parser is PROVEN to emit NaN — `crates/core/src/parser/quote.rs:382`
+asserts `tick.day_high.is_nan()` in its own test.
+
+Because Wilder smoothing is absorbing (`state.atr = state.atr*(1.0-wf) +
+true_range*wf`), **one** NaN packet poisoned `atr`, `adx_tr_smooth`,
+`vwap_cumulative_pv`, `prev_high`/`prev_low` **permanently for the process
+lifetime**. `sanitize_nan_inf()` then clamped the SNAPSHOT to `0.0`, so the
+strategy read `atr=0.0, adx=0.0, vwap=0.0` — plausible values, not an error — and
+`reset_vwap_daily` / `reset_bollinger_daily` do **not** reset those fields, so the
+daily reset never cleared it. A silent permanent mistrade with no error and no
+counter: the exact false-OK class the charter forbids.
+
+**This is the finding §28.2 explicitly deferred.** §28.2 recorded it verbatim as
+*"NaN in `high`/`low`/`open` during REST warmup poisons indicator state permanently
+(only `close` is guarded) — red-team finding #5, in the frozen area, deliberately
+NOT taken in this lift."* This section is that deferred work, now authorized.
+
+**Scope of THIS lift (narrow, mechanical):** ONLY an INGEST VALIDATION GATE may be
+added. Non-finite (NaN/Inf) and non-positive LTP, and non-finite or negative
+high/low, are refused BEFORE any state mutation — fail-closed, so the prior good
+state survives intact and the instrument keeps computing on the next good tick.
+The same gate is applied to `warmup_from_candles`, validating the CONVERTED f32
+(which closes the NaN-high/low/open hole and the f64→f32 overflow hole together).
+**NO indicator math changes. NO strategy FSM changes. No `IndicatorState` field
+changes.** Every computation is byte-for-byte identical for inputs that were
+already valid; only invalid inputs change behaviour, and only from
+"silently poison forever" to "refuse, count, and log".
+
+**Fail-closed and LOUD, never silent:** a refused tick increments
+`tv_indicator_tick_rejected_total` and returns `is_warm: false` (which the
+evaluator reads as unconditional `Hold`); the warmup path increments
+`tv_indicator_warmup_candle_rejected_total`. Log lines are throttled to powers of
+two so a poison storm cannot flood the sink. The gate runs BEFORE `slot_for`, so a
+poison-only instrument cannot burn one of the 25,000 dense slots.
+
+**One deliberate deviation from the literal brief, recorded rather than hidden:**
+`high`/`low` of exactly `0.0` is ACCEPTED. `parse_ticker_packet`
+(`crates/core/src/parser/ticker.rs:50`) builds its `ParsedTick` via
+`..Default::default()` and the field docs state "0.0 for Ticker" — `0.0` is the
+documented ABSENT sentinel, not a bad price. Rejecting it would have silently
+dropped every Ticker-mode instrument, recreating the total-silent-no-op class
+§28.2 exists to eliminate. Negative high/low IS rejected. Zero and negative LTP
+ARE rejected. Pinned by `test_ticker_mode_zero_high_low_is_still_accepted`.
+
+**Still NOT remediated by this lift (recorded honestly, not silently carried):**
+- **C1 warmup gate** — unchanged, still TRACKED.
+- **I-P1-11 composite key** — the engine still keys on `security_id` alone with no
+  `ExchangeSegment`. Cross-FEED collision stays structurally impossible (disjoint
+  namespace bands); two instruments sharing a numeric id across SEGMENTS within one
+  feed would still share a slot. Unchanged by this lift; needs its own dated quote.
+- **No `ErrorCode` variant** was created — the enum has no indicator-ingest
+  variant, and adding one requires rule-file cross-reference edits outside this
+  lift's scope. The refusal logs a bare `warn!` plus the counters above.
+- **Neither new counter has a CloudWatch alarm or EMF allowlist entry**, matching
+  the existing `tv_indicator_slot_exhausted_total`, which also has none. Flagged
+  rather than assumed fine: today these are countable but not pageable.
+
+**Re-bless:** the `BOUNDARY_FILES` manifest in
+`operator_boundary_indicator_strategy_guard.rs` is regenerated for the post-repair
+tree (`engine.rs` moves from 62108 bytes / 1662 lines to the post-gate size). The
+guard stays ACTIVE — any further frozen-area edit beyond this recorded lift fails
+the build again and needs its own fresh dated quote.
 ---
 
 > **[ARCHIVED 2026-07-20]** §29 warm-resubscribe snapshot + §31 NTM subscription authorization (retired subscription chain; §31.1 mapping contract kept live) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).
