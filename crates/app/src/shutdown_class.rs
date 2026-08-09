@@ -2,7 +2,7 @@
 //! coordinator-relayed directive 2026-07-15).
 //!
 //! Every restart used to pair a boot bubble with a `[MEDIUM] Shutdown
-//! initiated` page — even the daily EventBridge 16:30 IST auto-stop. This
+//! initiated` page — even the daily EventBridge 17:30 IST auto-stop. This
 //! classifier turns the already-known signal kind + runtime source + IST
 //! clock + trading calendar into a [`ShutdownClass`], so the routine stops
 //! render one quiet Low line while anything unexpected STAYS Medium and
@@ -20,7 +20,7 @@
 //! weekend/holiday runs (§7 Quote 5) killed mid-session by a budget
 //! killswitch or console stop. Now only the holiday-gate self-stop window
 //! (08:25–09:00 IST, non-trading days — the box auto-starts 08:30 and the
-//! gate stops it minutes later) and the weekday 16:25–16:45 stop-cron
+//! gate stops it minutes later) and the weekday 17:25–17:45 stop-cron
 //! window are quiet; everything else stays Medium.
 //!
 //! Documented residual (plan Edge Cases): a genuine manual/budget stop
@@ -30,14 +30,23 @@
 
 use tickvault_core::notification::events::ShutdownClass;
 
-/// Start of the scheduled-stop IST window: 16:25:00 (the EventBridge stop
-/// cron fires 16:30 IST — `cron(0 11 ? * MON-FRI *)`, weekday-only and
+/// Start of the scheduled-stop IST window: 17:25:00 (the EventBridge stop
+/// cron fires 17:30 IST — `cron(0 12 ? * MON-FRI *)`, weekday-only and
 /// deliberately NOT holiday-aware; the wide window absorbs the documented
 /// EventBridge scheduler jitter).
-pub const SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST: u32 = 59_100;
+///
+/// MOVED 2026-08-08 with operator Quote 14 ("make it as 8.30 till 5.30 pm").
+/// This window is COUPLED to the stop cron and moving one without the other is
+/// a real defect, not a stale comment: with the cron at 17:30 and this window
+/// still at 16:25–16:45, EVERY ordinary weekday shutdown would fall outside
+/// the quiet arm and classify as `OperatorStop` — a loud Telegram page every
+/// single trading evening for a completely normal scheduled stop. Same failure
+/// class as the boot-heartbeat/stop-verify coupling recorded in
+/// daily-universe-scope-expansion-2026-05-27.md §7.
+pub const SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST: u32 = 62_700;
 
-/// End (exclusive) of the scheduled-stop IST window: 16:45:00.
-pub const SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 60_300;
+/// End (exclusive) of the scheduled-stop IST window: 17:45:00.
+pub const SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 63_900;
 
 /// Start of the holiday-gate self-stop IST window: 08:25:00 (G5, fix
 /// round 2). The box auto-starts 08:30 IST on weekdays; on a non-trading
@@ -66,7 +75,7 @@ pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 32_400;
 /// |----------|--------|--------------------------------------------|---------------|
 /// | ctrl_c   | any    | any                                        | OperatorStop  |
 /// | sigterm  | false  | any                                        | OperatorStop  |
-/// | sigterm  | true   | weekday ∧ 16:25–16:45 IST (any day)        | ScheduledStop |
+/// | sigterm  | true   | weekday ∧ 17:25–17:45 IST (any day)        | ScheduledStop |
 /// | sigterm  | true   | !is_trading_day ∧ 08:25–09:00 IST          | ScheduledStop |
 /// | sigterm  | true   | otherwise (incl. Muhurat / manual weekend) | ExternalStop  |
 /// | anything else     | —                                          | ExternalStop  |
@@ -86,9 +95,9 @@ pub fn classify_shutdown(
                 // Local `make stop` / container stop.
                 return ShutdownClass::OperatorStop;
             }
-            // The daily EventBridge 16:30 IST stop (weekday-only cron,
+            // The daily EventBridge 17:30 IST stop (weekday-only cron,
             // NOT holiday-aware — it fires on weekday holidays too),
-            // inside the jitter-absorbing 16:25–16:45 window. Applies on
+            // inside the jitter-absorbing 17:25–17:45 window. Applies on
             // trading AND non-trading weekdays alike.
             if is_weekday
                 && (SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST
@@ -123,20 +132,20 @@ pub fn classify_shutdown(
 mod tests {
     use super::*;
 
-    /// 16:30:00 IST — the EventBridge stop cron's nominal fire instant.
-    const STOP_CRON_SECS: u32 = 16 * 3600 + 30 * 60;
+    /// 17:30:00 IST — the EventBridge stop cron's nominal fire instant.
+    const STOP_CRON_SECS: u32 = 17 * 3600 + 30 * 60;
 
     #[test]
-    fn test_classify_shutdown_window_consts_are_1625_and_1645_ist() {
+    fn test_classify_shutdown_window_consts_are_1725_and_1745_ist() {
         assert_eq!(
             SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST,
-            16 * 3600 + 25 * 60
+            17 * 3600 + 25 * 60
         );
         assert_eq!(
             SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST,
-            16 * 3600 + 45 * 60
+            17 * 3600 + 45 * 60
         );
-        // The nominal 16:30 cron instant sits inside the window.
+        // The nominal 17:30 cron instant sits inside the window.
         assert!(
             (SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST
                 ..SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST)
@@ -179,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_classify_shutdown_window_boundaries() {
-        // Inclusive start: 16:25:00 exactly is scheduled.
+        // Inclusive start: 17:25:00 exactly is scheduled.
         assert_eq!(
             classify_shutdown(
                 "sigterm",
@@ -201,7 +210,7 @@ mod tests {
             ),
             ShutdownClass::ExternalStop
         );
-        // Exclusive end: 16:45:00 exactly is already outside — loud.
+        // Exclusive end: 17:45:00 exactly is already outside — loud.
         assert_eq!(
             classify_shutdown(
                 "sigterm",

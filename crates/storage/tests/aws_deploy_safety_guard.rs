@@ -129,9 +129,10 @@ fn deploy_instance_ignores_type_and_user_data_to_prevent_replace() {
 }
 
 /// Weekday-only schedule (trading days). Mon-Fri crons, not Mon-Sun.
-/// IST 08:30 start = 03:00 UTC; IST 16:30 stop = 11:00 UTC (operator narrowed
-/// the window back to 08:30-16:30 on 2026-06-05 — "make the aws instance start
-/// and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 08:00-17:00).
+/// IST 08:30 start = 03:00 UTC; IST 17:30 stop = 12:00 UTC (operator widened
+/// the window to 08:30-17:30 on 2026-08-08 — Quote 14, "make it as 8.30 till
+/// 5.30 pm"; supersedes the 2026-06-05 08:30-16:30 narrowing, which itself
+/// superseded the 2026-06-02 08:00-17:00 widening).
 #[test]
 fn deploy_schedule_is_weekday_only() {
     let body = read(MAIN_TF);
@@ -140,8 +141,15 @@ fn deploy_schedule_is_weekday_only() {
         "main.tf daily_start must be `cron(0 3 ? * MON-FRI *)` (08:30 IST, Mon-Fri)."
     );
     assert!(
-        body.contains("cron(0 11 ? * MON-FRI *)"),
-        "main.tf daily_stop must be `cron(0 11 ? * MON-FRI *)` (16:30 IST, Mon-Fri)."
+        body.contains("cron(0 12 ? * MON-FRI *)"),
+        "main.tf daily_stop must be `cron(0 12 ? * MON-FRI *)` (17:30 IST, Mon-Fri)."
+    );
+    // Inverted pin: the retired 16:30 IST stop must not return silently — it
+    // would kill the box a full hour before the operator expects it.
+    assert!(
+        !body.contains("cron(0 11 ? * MON-FRI *)"),
+        "the 16:30 IST stop cron is retired (operator widened to 17:30 IST, \
+         2026-08-08 Quote 14)."
     );
     assert!(
         !body.contains("MON-SUN") && !body.contains("* * ? * * *"),
@@ -175,27 +183,42 @@ fn deploy_eip_is_enabled_by_default() {
     );
 }
 
-/// EBS FRESH-PROVISION default is 20 GB (2026-07-15 downsize pre-stage —
-/// executor decision recorded in daily-universe-scope-expansion §0/§7 Rule 3,
-/// NOT operator-quoted scope). gp3 cannot SHRINK, so the LIVE root stays at
-/// its current size; 20 GB lands only via the terminate-and-recreate in the
-/// operator's erase window. 2026-07-19 correction: live root verified 30 GiB
-/// via describe-volumes — the 2026-07-13 approved 30 -> 50 grow was recorded
-/// but never physically applied. History 10 -> 30 -> [50 approved, never
-/// applied] -> 20 target; S3 cold-tier archives partitions > 90d.
+/// EBS FRESH-PROVISION default is 100 GB (operator Quote 13, 2026-08-08 —
+/// sized for the 13-timeframe current-day workload WITH raw-tick retention:
+/// ticks ~44-141 GB/mo (Assumed 25-80 M rows/day) + 13 sparse timeframes
+/// ~61 GB/mo, held ~30 days with S3 archival beyond). Supersedes the
+/// 2026-07-15 20 GB downsize pre-stage.
+///
+/// 100 and NOT 250 deliberately: gp3 grows online in one command and can NEVER
+/// shrink, so the small side is the only reversible direction. If real tick
+/// volume lands at the top of the Assumed range, grow it live.
+///
+/// This is a FRESH-PROVISION default only — `root_block_device[0].volume_size`
+/// sits in the instance's `lifecycle.ignore_changes`, so `terraform apply`
+/// never touches the live volume. History: 10 -> 30 -> [50 approved 2026-07-13,
+/// never physically applied, live verified 30 GiB on 2026-07-19] -> 20 target
+/// (2026-07-15) -> 100 (2026-08-08).
 #[test]
-fn deploy_ebs_default_is_20gb() {
+fn deploy_ebs_default_is_100gb() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"ebs_gp3_size_gb\""),
         "variables.tf must declare `ebs_gp3_size_gb`."
     );
     assert!(
-        vars.contains("type = number default = 20"),
-        "ebs_gp3_size_gb must default to 20 GB (2026-07-15 downsize pre-stage: \
-         fresh-volume replacement target only — the live root (30 GiB, \
-         verified 2026-07-19; the 2026-07-13 grow to 50 never applied) cannot \
-         shrink in place; supersedes the 2026-07-13 50 GB grow default)."
+        vars.contains("type = number default = 100"),
+        "ebs_gp3_size_gb must default to 100 GB (operator Quote 13, 2026-08-08 — \
+         the 13-timeframe + raw-tick-retention workload; supersedes the \
+         2026-07-15 20 GB pre-stage default)."
+    );
+    // Inverted pin: 250+ is NOT the safe direction. gp3 grows online and can
+    // never shrink, so over-provisioning is the irreversible mistake and pays
+    // for unused disk every month until an instance recreate.
+    assert!(
+        !vars.contains("type = number default = 250"),
+        "do not over-provision the fresh volume — gp3 grows online in one \
+         command but can NEVER shrink, so 100 GB is chosen as the reversible \
+         side. Grow it live if measured tick volume demands it."
     );
 }
 
@@ -208,13 +231,43 @@ fn deploy_subnet_alignment_is_fmt_canonical() {
     let body = read(MAIN_TF);
     // After `terraform fmt`, the comment-split group aligns to `availability_zone`
     // (17 chars), NOT to `map_public_ip_on_launch` below the comment.
+    //
+    // 2026-08-08: this guard used to additionally pin the AZ VALUE to
+    // `"${var.aws_region}a"`. That pin is REMOVED because the single-AZ pin it
+    // encoded is exactly what kept the box dark 2026-08-06 -> 08 (AWS had no
+    // capacity for ANY candidate type in ap-south-1a, so the 2026-08-07
+    // type-only flip was refused for the same reason and rolled back). Subnets
+    // are now provisioned for_each over a/b/c. What this test actually EXISTS
+    // to catch — the fmt over-alignment that broke the #866 terraform-apply
+    // run with `fmt -check` exit 3 — is unchanged and is now asserted
+    // positively AND negatively, so it is stronger than the version it
+    // replaces rather than merely relaxed.
     assert!(
         body.contains("vpc_id            = aws_vpc.dlt.id")
-            && body.contains("availability_zone = \"${var.aws_region}a\""),
+            && body.contains("cidr_block        = ")
+            && body.contains("availability_zone = "),
         "aws_subnet.public must be `terraform fmt`-canonical (the comment splits \
          the alignment group; the 3 lines align to `availability_zone`, not to \
          `map_public_ip_on_launch`). This is the exact fmt failure that broke \
          the #866 terraform-apply run."
+    );
+    // Inverted pin: the over-aligned forms are the #866 failure itself. If a
+    // future edit pads the group out to `map_public_ip_on_launch` width (23
+    // chars), `terraform fmt -check` fails and the apply dies again.
+    assert!(
+        !body.contains("vpc_id                  = aws_vpc.dlt.id")
+            && !body.contains("availability_zone       = "),
+        "aws_subnet.public is over-aligned to `map_public_ip_on_launch` width — \
+         this is the #866 `terraform fmt -check` exit-3 failure. The comment \
+         splits the group, so the 3 lines above it align only among themselves."
+    );
+    // The multi-AZ shape itself is load-bearing (operator Quote 13, 2026-08-08):
+    // re-pinning the subnet to one zone is a REJECT independent of instance type.
+    assert!(
+        body.contains("for_each = toset([\"a\", \"b\", \"c\"])"),
+        "aws_subnet.public must provision all three ap-south-1 AZs (operator \
+         Quote 13, 2026-08-08). A single-AZ pin is what caused the 2026-08-06..08 \
+         capacity outage: a stopped instance can only restart in its own zone."
     );
 }
 

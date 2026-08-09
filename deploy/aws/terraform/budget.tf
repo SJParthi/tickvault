@@ -94,8 +94,8 @@ resource "aws_budgets_budget" "tv_monthly" {
   # STOP_EC2 action targets, and every internal reference (which use the
   # `aws_budgets_budget.tv_monthly.name` attribute, not a hardcoded string)
   # are preserved exactly — the actions re-bind automatically to the new name.
-  name              = "tv-${var.environment}-monthly-budget-v2"
-  budget_type       = "COST"
+  name        = "tv-${var.environment}-monthly-budget-v2"
+  budget_type = "COST"
   # 2026-08-08 OPERATOR RULING (Quote 13) — LIMIT RAISED $35 -> $100.
   # Operator verbatim (typed directly in-session, typos preserved):
   #   "then can we go ahead with r8g x large dude"

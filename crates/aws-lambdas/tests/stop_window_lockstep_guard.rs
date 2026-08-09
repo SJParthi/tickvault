@@ -230,3 +230,48 @@ fn operator_facing_messages_state_the_current_stop_time() {
         "operator_control must assert the banner's CURRENT text (`auto-stops {stop}`)"
     );
 }
+
+/// The 12-hour clock times inside the operator-facing SNS/Telegram bodies are a
+/// SEVENTH lockstep site, and the one a reader trusts most.
+///
+/// Added 2026-08-08 (operator Quote 14) after finding six live message strings
+/// still reading "4:30 PM IST auto-stop" while EventBridge had moved to 17:30.
+/// Nothing crashes on a stale string — it just tells the operator the wrong
+/// time, in the exact place the 10 Telegram commandments demand a precise IST
+/// 12-hour time. That is a silent-wrong-answer bug, which is worse than a loud
+/// one, so it gets a build-failing pin like every other coupled site.
+///
+/// The pin is derived from `STOP_IST_HOUR`/`STOP_IST_MINUTE` (themselves derived
+/// from the Lambda's own UTC trigger constants), so it tracks any future move
+/// automatically instead of hardcoding another literal that can rot.
+#[test]
+fn operator_facing_stop_times_are_in_lockstep() {
+    let root = repo_root();
+    let body = read(&root.join("crates/aws-lambdas/src/start_watchdog.rs"));
+
+    // 24h -> 12h with meridiem, the form the message bodies actually use.
+    let (h12, meridiem) = match STOP_IST_HOUR {
+        0 => (12, "AM"),
+        h if h < 12 => (h, "AM"),
+        12 => (12, "PM"),
+        h => (h - 12, "PM"),
+    };
+    let current = format!("{h12}:{STOP_IST_MINUTE:02} {meridiem} IST");
+
+    assert!(
+        body.contains(&current),
+        "start_watchdog.rs operator-facing bodies must name the CURRENT stop \
+         time as `{current}` (derived from the Lambda's own UTC trigger \
+         constants). A body naming any other time tells the operator the wrong \
+         hour — commandment 9 requires a precise IST 12-hour time."
+    );
+
+    // Inverted pin: the retired 4:30 PM text must never come back. Every
+    // occurrence would be operator-facing, so one is already too many.
+    assert!(
+        !body.contains("4:30 PM"),
+        "the retired 4:30 PM IST stop time must not reappear in any \
+         operator-facing body (operator widened the window to 5:30 PM IST on \
+         2026-08-08, Quote 14)."
+    );
+}
