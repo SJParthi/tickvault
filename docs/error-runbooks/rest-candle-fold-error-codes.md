@@ -128,6 +128,7 @@ field):
 | `seal_send` | a sealed bucket could not be handed to the seal-writer channel (channel full past the boot-path pacing budget / global sender missing), or a confirmed-bar handoff was dropped (fold channel full/closed). Round-3: a CLOSED seal channel (seal-writer gone — shutdown/teardown) is labeled DISTINCTLY (`dropped{reason="seal_channel_closed"}`) on both the live and paced paths, never conflated with backpressure. |
 | `future_dated` | (round-3 — the BOUNDARY-01 future-skew class) a live bar's IST date is AFTER the wall-clock IST today — it can never roll the live day forward; dropped + counted (`dropped{reason="future_dated"}`), ONE coalesced coded error per drained batch (≤1/minute at the legs' fire cadence). |
 | `bad_identity` | (warn-level, once per process — coalesced) a spot-leg handoff carried an identity the fold's SecurityId space cannot represent (negative i64 — defensive); every occurrence is counted under `dropped{reason="bad_identity"}` (round-2 LOW-6 — previously a silent skip at the Groww hook sites). |
+| `slot_capacity` | (2026-08-09) the composite-key slot table hit `FOLD_MAX_SLOTS` (25,000) and refused to allocate a slot for a NOT-YET-SEEN instrument. Fail-closed by design: the bar is dropped + counted (`dropped{reason="slot_capacity"}` AND `tv_rest_candle_fold_slots_exhausted_total`), ONE latched coded error is emitted, and already-known instruments keep folding normally. This replaced an unbounded push-only `Vec` whose growth was monotonic for the process lifetime and whose per-bar `iter().position(..)` lookup was O(slots) — i.e. O(n²) per drained batch at the 25,000-instrument target. The slot key is the full composite `(feed, security_id, exchange_segment_code)` per I-P1-11, so two instruments sharing a numeric id across segments or feeds can never share a slot. |
 | `volume_saturated` | a TF bucket's volume i64 add saturated at `i64::MAX` — the fold stays ATOMIC (never a torn bucket), the saturated value is emitted honestly, one coalesced warn per (feed, SID, day) (2026-07-16 hostile-review M3). |
 | `receiver_lost` | the fold task started but the shared receiver slot was EMPTY — a previous incarnation failed to re-park it (the RAII guard makes this near-unreachable); the task exits LOUDLY, never a silent clean_exit (2026-07-16 hostile-review HIGH-2). |
 | `sender_install` | main.rs could not install the global fold-bar sender (already installed — a double-spawn class bug); the hook sites would feed a stale channel (LOW, 2026-07-16). |
@@ -162,6 +163,13 @@ field):
   boot catch-up / refold legs.
 - `tv_rest_candle_fold_errors_total{stage}` — degrade legs (the taxonomy
   above).
+- `tv_rest_candle_fold_slots_exhausted_total` — (2026-08-09) the
+  composite-key slot table hit `FOLD_MAX_SLOTS` (25,000) and REFUSED a slot
+  for a not-yet-seen instrument. Every increment is a bar DROPPED rather
+  than folded into some other instrument's slot (also counted under
+  `dropped{reason="slot_capacity"}`). Non-zero means the universe outgrew
+  the cap: raise `FOLD_MAX_SLOTS` and re-check the host memory budget —
+  never treat it as noise, it is real per-instrument data loss.
 - `tv_rest_candle_fold_dropped_total{reason}` —
   `channel_full` / `channel_closed` (confirmed-bar handoff),
   `seal_channel_full` / `seal_channel_closed` / `no_seal_sender` (seal

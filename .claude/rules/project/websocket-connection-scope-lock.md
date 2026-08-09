@@ -416,6 +416,77 @@ true); the §28 indicator/strategy boundary.
 (DRAFT — implementation may not start until the operator flips it to APPROVED, per the
 design-first wall).
 
+### 2026-08-09 (SAME DAY, SECOND QUOTE) — 16 CONNECTIONS + depth-20/depth-200 AUTHORIZED
+
+**The verbatim operator demand (2026-08-09, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "what the fuck bro our idea is toa dd live feed so oevrall 16 websocket
+> conbections rigth what na why the fuck puir arhcietctrue design plan fixes
+> solutions ntohign is hsown or applciabel here mtoehrfucke rhwy?"
+
+Reaffirmed moments later: *"whta the fuck we have deisgne dveeyhtign in PR 1731
+right?"*
+
+Given in direct response to a plan that had WRONGLY listed the feed choice as an
+open operator decision, when the revival had already been authorized earlier the
+same day by the quote in the section above. The operator is stating the intended
+SHAPE of that already-authorized revival: **a live feed totalling 16 WebSocket
+connections.**
+
+**This is the fresh dated quote that
+`.claude/plans/proposals/2026-08-09-dhan-16-connection-architecture.md` (PR #1731)
+names as its own precondition.** That proposal states it "cannot be implemented as
+written without a dated operator quote covering (1) depth-20 / depth-200, which
+that file currently lists as FORBIDDEN, and (2) a 5-connection main-feed pool,
+since the existing lock is 1 connection." Both are granted here.
+
+**What this quote authorizes, precisely:**
+
+| Surface | Before | Now |
+|---|---|---|
+| Main-feed connections | 1 | **up to 5** |
+| depth-20 (`depth-api-feed.dhan.co/twentydepth`) | FORBIDDEN | **ALLOWED, up to 5** |
+| depth-200 (`full-depth-api.dhan.co`) | FORBIDDEN | **ALLOWED, up to 5** |
+| Order-update WS | 1 (dormant module) | unchanged, 1 |
+| **Total live WebSocket connections** | 0 | **≤ 16** |
+
+The 16 figure is the operator's stated target and is consistent with Dhan's own
+limits: Dhan confirmed 2026-04-06 that the 5-connection cap applies **per endpoint
+type independently**, so 5 + 5 + 5 + 1 = 16. The binding constraint was never
+Dhan's — it was this file's own lock, and that lock is lifted to 16 here.
+
+The "What stays FORBIDDEN even under this revival" row four paragraphs above listed
+"depth-20 / depth-200 / any additional Dhan WS endpoint" — the depth-20 and
+depth-200 half of that row is SUPERSEDED by this quote (house convention: annotate
+in place, never rewrite). "Any ADDITIONAL Dhan WS endpoint" beyond these four
+stands FORBIDDEN.
+
+**What this quote does NOT authorize (unchanged, still REJECT):**
+
+- More than 16 total live WebSocket connections, or any endpoint beyond
+  main-feed / depth-20 / depth-200 / order-update.
+- Live ORDER FIRE. `dry_run` stays true and the §39 four-gate lattice is untouched
+  — this is a MARKET-DATA authorization only.
+- The Dhan instrument CSV download/parse chain (Q3 of the 2026-07-13 amendment
+  stands — hardcoded SIDs only, no daily master fetch).
+- Any edit to the §28 indicator/strategy frozen area beyond the recorded lifts.
+
+**The honest envelope carried over from the revival section above — NOT weakened by
+this quote:** the 2026-07-13 retirement reason remains UNADDRESSED, because every
+cause was Dhan-side. Measured 2026-07-06: p99 delivery lag 46.37 s (max 198.69 s)
+against Groww's 562 ms on the SAME host in the SAME minutes; 29–67 silent
+instruments per minute; live-vs-historical candle mismatches. Reviving the lane
+repairs none of that. Additionally, per PR #1731's protocol findings, the India
+feed has **no snapshot-on-subscribe** (documented only for the US global-stocks
+socket, feed code 29) and **no sequence number**, so packet loss is undetectable at
+the protocol level. The 15:31 REST cross-verification is therefore the ONLY
+available ground truth and must be live from day one — not a supplementary check.
+
+**Companion plans, both unblocked by this quote:**
+`.claude/plans/proposals/2026-08-09-dhan-live-ws-revival.md` and
+`.claude/plans/proposals/2026-08-09-dhan-16-connection-architecture.md` (PR #1731).
+
 ### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
 
 Operator Parthiban, 2026-07-24 (verbatim quotes preserved in

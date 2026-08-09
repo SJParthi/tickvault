@@ -429,14 +429,43 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // the names could never publish a datapoint again. Cost: -4 custom
     // metric series (~-$1.20/mo, Assumed — series-hours decay to $0 once
     // producers stop) — dated note in aws-budget.md (COST NOTE 2026-07-18).
+    // 41 (was 11) since 2026-08-09 (METRIC-BLINDNESS fix): the selector had
+    // shrunk to 11 names through the retirement sweeps above while the
+    // workspace emits ~352 distinct metric names — so ~95% of everything the
+    // binary measured was scraped locally and DISCARDED, and with Grafana +
+    // Prometheus retired (CloudWatch-only migration #O1/#O3, 2026-05-19)
+    // CloudWatch is the ONLY sink. +30 EXACT names ≈ +$9.00/mo (11 → 41
+    // names ≈ $3.30 → $12.30/mo at CloudWatch's ~$0.30/custom-metric/month).
+    //
+    // WHY EXACT NAMES AND NOT A `tv_.*` PREFIX: the live budget kill-ceiling
+    // is $100/mo and its AUTOMATIC budget actions fire STOP_EC2_INSTANCES at
+    // 90% ($90) — a prefix selector publishes whatever the binary happens to
+    // emit and could stop the trading box mid-session. An exact alternation
+    // keeps the bill a function of THIS list, which this assertion pins.
+    //
+    // INCLUSION RULE: a name is selected only if it means FAILURE,
+    // SATURATION or DATA LOSS *and* has a reachable producer on the REST-only
+    // runtime. 311 names are deliberately not selected — success/volume
+    // counters and latency histograms (they answer "how much", not "what
+    // broke"), names emitted only by the stood-down per-minute boot legs
+    // ([spot_1m_rest]/[option_chain_1m]/[groww_*_1m] enabled=false since
+    // 2026-07-17), names behind the non-default `groww_orders` cargo feature,
+    // tv_ws_frame_spill_write_errors_total (no WS frame producer exists since
+    // the 2026-07-13/15 live-feed retirements), and tv_api_auth_failed_total
+    // (already published by its own log metric filter — auth-failed-alarm.tf;
+    // EMF-selecting it would double-bill). Full rationale + the exclusion
+    // ledger: the COST NOTE above the CWCFG heredoc in user-data.sh.tftpl.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        11,
-        "Z+ L2 VERIFY ratchet: expected exactly 11 names in the MAIN EMF \
-         metric_selectors list (15 post-dashboard-tidy minus the 4 dead-tick \
-         names retired 2026-07-18, stage-4); found {}: {names:?}",
+        41,
+        "Z+ L2 VERIFY ratchet: expected exactly 41 names in the MAIN EMF \
+         metric_selectors list (11 post-stage-4 plus the 30 failure/saturation/loss \
+         names added 2026-08-09 for the metric-blindness fix); found {}: {names:?}. \
+         Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose budget \
+         actions STOP the prod box at 90% — update this count deliberately, with a \
+         dated cost note, never as a drive-by.",
         names.len()
     );
     for required in [
@@ -448,6 +477,16 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
         // 2026-07-14 cluster-C order-side (dormant until cluster A / Phase-1):
         "tv_daily_pnl",
         "tv_order_fill_lag_seconds",
+        // 2026-08-09 metric-blindness fix — one representative per family, so
+        // a partial revert of the widening fails loudly instead of silently
+        // shrinking the operator's only metric sink:
+        "tv_spot1m_persist_errors_total", // Dhan REST leg persist failure
+        "tv_groww_chain1m_persist_errors_total", // Groww REST leg persist failure
+        "tv_cadence_ladder_exhausted_total", // retry ladder gave up = minute lost
+        "tv_questdb_wal_suspended_tables", // QuestDB silently stops accepting writes
+        "tv_order_audit_rows_discarded_total", // SEBI 5-yr audit row loss
+        "tv_oom_kills_total",             // host memory saturation
+        "tv_ram_store_dropped_total",     // RAM decision surface dropping rows
     ] {
         assert!(
             names.iter().any(|n| n == required),

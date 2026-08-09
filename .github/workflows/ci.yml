@@ -846,6 +846,123 @@ jobs:
           fi
 
   # -------------------------------------------------------------------------
+  # Loom Concurrency — model-checked data-race detection.
+  #
+  # WHY THIS LANE EXISTS (audit finding, 2026-08-09): the four
+  # crates/*/tests/loom_*.rs targets are gated behind each crate's non-default
+  # `loom` Cargo feature. NO workflow enabled that feature, so on every PR
+  # they compiled to EMPTY test binaries and reported green — 24 loom tests
+  # that proved exactly nothing. CLAUDE.md lists loom as one of the 22 test
+  # categories and merge-gate-lock-2026-07-04.md §3 row 2 claims the Test job
+  # runs "full per-crate lib + integration suites", so the gap was invisible
+  # from the docs. The ONLY runner was scripts/git-hooks/pre-push, which is
+  # local, bypassable with --no-verify, and not installed in a fresh clone.
+  #
+  # This lane is modelled on the DHAT lane above and carries the SAME two
+  # false-OK guards (audit Rule 11):
+  #   1. a drift check — the loom_*.rs files on disk must match the explicit
+  #      list below, so a new/renamed loom target cannot silently run in no
+  #      lane (the exact rot that left dhat_tick_gap_detector broken ~2 weeks);
+  #   2. a "running 0 tests" scan — if the `--features loom` flag is ever
+  #      dropped, the targets compile to empty binaries and would pass
+  #      vacuously. That becomes a hard failure here instead.
+  #
+  # Weakening or deleting this lane to make CI green is a
+  # merge-gate-lock-2026-07-04.md §5-class REJECT.
+  # -------------------------------------------------------------------------
+  loom-concurrency:
+    name: "Loom Concurrency"
+    runs-on: ubuntu-latest
+    # Loom explores interleavings combinatorially; the local hook budgets 300s
+    # per crate on warm cache. 45 min matches the DHAT/Test lanes' cold-cache
+    # budget rather than guessing a tighter number.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Loom target drift check (no silent drops)
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(ls crates/*/tests/loom_*.rs | LC_ALL=C sort)
+          expected=$(LC_ALL=C sort <<'EOF'
+          crates/core/tests/loom_activity_watchdog.rs
+          crates/core/tests/loom_tick_dedup.rs
+          crates/core/tests/loom_ws_decoupling.rs
+          crates/trading/tests/loom_circuit_breaker.rs
+          EOF
+          )
+          # Defensive de-indent: YAML block scalars normally de-dent the
+          # heredoc to column 0, but a future re-indent must not silently
+          # break the comparison.
+          expected=$(echo "$expected" | sed 's/^[[:space:]]*//' | grep -v '^$')
+          if ! diff <(echo "$expected") <(echo "$actual"); then
+            echo "::error::crates/*/tests/loom_*.rs on disk disagrees with the explicit loom lane target list in ci.yml (loom-concurrency job). A new/renamed loom test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."
+            exit 1
+          fi
+          echo "Loom target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
+
+      - name: Install Rust toolchain 1.95.0
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # SHA-pinned (supply-chain hardening 2026-04-25)
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-loom-concurrency
+          cache-on-failure: true
+
+      # Plain `cargo test` (not nextest) mirrors scripts/git-hooks/pre-push so
+      # the local gate and this lane cannot diverge in behaviour, and so the
+      # classic harness "running N tests" line stays parseable for the
+      # vacuous-pass guard below.
+      - name: Loom (core, --features loom)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tickvault-core --features loom \
+            --test loom_activity_watchdog \
+            --test loom_tick_dedup \
+            --test loom_ws_decoupling 2>&1 | tee /tmp/loom-core.log
+          if grep -q "running 0 tests" /tmp/loom-core.log; then
+            echo "::error::A loom target in tickvault-core ran 0 tests — the crate's 'loom' feature is not reaching the cfg gate, so these binaries are EMPTY and this lane would pass vacuously."
+            exit 1
+          fi
+          # NOTE: unanchored + `.*` on purpose. CI sets CARGO_TERM_COLOR=always,
+          # so cargo emits "\e[1m\e[92m     Running\e[0m tests/..." and a `^     Running`
+          # anchor matches NOTHING through the ANSI prefix — it counted 0 while all
+          # targets had actually run (first live run, 2026-08-09). Mirrors the DHAT
+          # lane above, which has always used this form.
+          executed=$(grep -c 'Running.*tests/loom_' /tmp/loom-core.log || true)
+          if [ "$executed" -ne 3 ]; then
+            echo "::error::Expected 3 executed loom targets in tickvault-core, saw $executed — a --test flag was dropped from this step while the file and drift-list entry survived, silently un-gating that target."
+            exit 1
+          fi
+
+      - name: Loom (trading, --features loom)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tickvault-trading --features loom \
+            --test loom_circuit_breaker 2>&1 | tee /tmp/loom-trading.log
+          if grep -q "running 0 tests" /tmp/loom-trading.log; then
+            echo "::error::The loom target in tickvault-trading ran 0 tests — the crate's 'loom' feature is not reaching the cfg gate, so the binary is EMPTY and this lane would pass vacuously."
+            exit 1
+          fi
+          # NOTE: unanchored + `.*` on purpose. CI sets CARGO_TERM_COLOR=always,
+          # so cargo emits "\e[1m\e[92m     Running\e[0m tests/..." and a `^     Running`
+          # anchor matches NOTHING through the ANSI prefix — it counted 0 while all
+          # targets had actually run (first live run, 2026-08-09). Mirrors the DHAT
+          # lane above, which has always used this form.
+          executed=$(grep -c 'Running.*tests/loom_' /tmp/loom-trading.log || true)
+          if [ "$executed" -ne 1 ]; then
+            echo "::error::Expected 1 executed loom target in tickvault-trading, saw $executed — the --test flag was dropped from this step while the file and drift-list entry survived."
+            exit 1
+          fi
+
+  # -------------------------------------------------------------------------
   # All Green — the single merge choke point (merge-gate hardening 2026-07-04).
   #
   # WHY: on 2026-07-03 three PRs (#1387, #1388, #1382) merged seconds BEFORE
@@ -887,6 +1004,7 @@ jobs:
       - coverage-and-perf
       - repo-guards
       - dhat-zero-alloc
+      - loom-concurrency
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
