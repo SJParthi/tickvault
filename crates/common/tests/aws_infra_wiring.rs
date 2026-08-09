@@ -100,23 +100,34 @@ fn test_terraform_instance_type_pinned() {
     let content =
         std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
             .expect("variables.tf must be readable"); // APPROVED: test
-    // Operator-lock 2026-08-07 (daily-universe-scope-expansion-2026-05-27.md §7
-    // Quote 12): t4g.large ONLY (Graviton2 burstable, 8 GiB). NOT a performance
-    // upgrade — AWS ran out of t4g.medium capacity in ap-south-1a and the box,
-    // pinned to that single AZ by main.tf, could not start for whole trading
-    // sessions (Aug 5 = 0h, Aug 7 = 0h). A different instance type draws from a
-    // different capacity pool. SUPERSEDES the 2026-07-15 t4g.medium +
-    // 2026-06-30 r8g.large + 2026-05-29 m8g.large locks. Any reintroduction of
-    // t4g.medium / r8g.large / m8g.large / c7i.xlarge / c8g.xlarge as the
-    // PINNED type fails this test. (Retired types may still appear in
-    // SUPERSEDES prose — only the validation condition is forbidden.)
+    // Operator-lock 2026-08-08 (daily-universe-scope-expansion-2026-05-27.md §7
+    // Quote 13): r8g.xlarge ONLY (Graviton4 memory-optimised, 4 vCPU / 32 GiB).
+    // Sized for the 13-timeframe current-day workload WITH raw-tick retention at
+    // ~25,000 instruments. SUPERSEDES the 2026-08-07 t4g.large + 2026-07-15
+    // t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large locks.
+    //
+    // Why the 2026-08-07 t4g.large lock this row replaces did NOT fix anything:
+    // it changed the TYPE while main.tf still pinned the box to a single AZ, and
+    // AWS refused the new type in that same zone with the same
+    // InsufficientInstanceCapacity (workflow run 31148235540, rolled back). The
+    // constraint was the ZONE. The AZ pin is removed in the same change as this
+    // row — see instance_type_lock_guard::instance_lock_az_stays_unpinned.
+    //
+    // Any reintroduction of t4g.large / t4g.medium / r8g.large / m8g.large /
+    // c7i.xlarge / c8g.xlarge as the PINNED type fails this test. Retired types
+    // may still appear in SUPERSEDES prose — only the validation condition is
+    // forbidden.
     assert!(
-        content.contains("\"t4g.large\""),
-        "variables.tf must pin instance_type to t4g.large (operator lock 2026-08-07, see daily-universe-scope-expansion-2026-05-27.md §7 Quote 12)"
+        content.contains("\"r8g.xlarge\""),
+        "variables.tf must pin instance_type to r8g.xlarge (operator lock 2026-08-08, see daily-universe-scope-expansion-2026-05-27.md §7 Quote 13)"
     );
     assert!(
-        content.contains("var.instance_type == \"t4g.large\""),
+        content.contains("var.instance_type == \"r8g.xlarge\""),
         "variables.tf must VALIDATE instance_type pinning"
+    );
+    assert!(
+        !content.contains("var.instance_type == \"t4g.large\""),
+        "t4g.large retired as the pinned type (operator lock 2026-08-08 Quote 13 — it never escaped the capacity outage because the AZ pin, not the type, was the blocker)"
     );
     assert!(
         !content.contains("var.instance_type == \"t4g.medium\""),
@@ -293,10 +304,19 @@ fn test_terraform_eventbridge_schedules_match_budget() {
         content.contains("cron(0 3 ? * MON-FRI *)"),
         "main.tf missing weekday start schedule (03:00 UTC Mon-Fri = 08:30 IST)"
     );
-    // Weekday stop: 16:30 IST = 11:00 UTC Mon-Fri.
+    // Weekday stop: 17:30 IST = 12:00 UTC Mon-Fri (operator widened the window
+    // to 08:30-17:30 on 2026-08-08 — Quote 14, "make it as 8.30 till 5.30 pm";
+    // supersedes the 2026-06-05 08:30-16:30 narrowing).
     assert!(
-        content.contains("cron(0 11 ? * MON-FRI *)"),
-        "main.tf missing weekday stop schedule (11:00 UTC Mon-Fri = 16:30 IST)"
+        content.contains("cron(0 12 ? * MON-FRI *)"),
+        "main.tf missing weekday stop schedule (12:00 UTC Mon-Fri = 17:30 IST)"
+    );
+    // Inverted pin: the retired 16:30 IST stop must NOT come back silently. A
+    // shorter window would stop the box an hour before the operator expects,
+    // mid-session for anything running past 16:30.
+    assert!(
+        !content.contains("cron(0 11 ? * MON-FRI *)"),
+        "the 16:30 IST stop cron is retired (operator widened to 17:30 IST, 2026-08-08 Quote 14)"
     );
     // Negative asserts — the prior 7-day daily crons (every day, no MON-FRI
     // restriction) must NOT return. The weekday-only `? * MON-FRI` form is

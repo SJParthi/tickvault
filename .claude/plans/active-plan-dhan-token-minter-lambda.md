@@ -120,3 +120,48 @@ Disable the EventBridge rule (`state = "DISABLED"`) or delete the terraform file
 - Structured logs in `/aws/lambda/tv-<env>-dhan-token-minter` (30-day retention) carrying the failing `stage` label and the parameter written — never the token.
 - The published parameter's `LastModifiedDate` is itself the operator-visible health signal.
 - Cost: 1 invocation/day (free tier) + 2 alarms ≈ **$0.20/mo**.
+
+---
+
+## Per-Item Guarantee Matrix
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md`. All 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. Row-by-row, where this plan lands them:
+
+| 15-row demand | Where it is proved here |
+|---|---|
+| 100% code coverage | 24 unit tests over every pure branch (paths, mint URL, TOTP, JWT gate, 200-with-error envelope, truncation, publish refusal) |
+| 100% audit coverage | the published parameter's `LastModifiedDate` is the audit record; no new QuestDB table (`N/A — no table`) |
+| 100% testing coverage | unit + wiring-guard (terraform resources, scoped IAM, daily cron, both alarms, rule-file §10) |
+| 100% code checks | banned-pattern + secret-scan + pub-fn-test + pub-fn-wiring + fmt + clippy, all green |
+| 100% code performance | `N/A — cold path`, 1 invocation/day, no hot path touched, no DHAT surface |
+| 100% monitoring | 2 CloudWatch alarms (mint FAILED, mint DID-NOT-RUN) + structured logs with a `stage` label |
+| 100% logging | every failure path logs with its `stage`; the token/PIN/TOTP are never logged (length + shape verdict only) |
+| 100% alerting | `tv-<env>-dhan-token-minter-errors` + `tv-<env>-dhan-token-minter-not-invoked` (`treat_missing_data=breaching`, so a dropped schedule is not invisible) |
+| 100% security | `Secret<String>` in memory, `SecureString` at rest, enumerated read ARNs (never a `/dhan/*` wildcard), single-ARN write scope |
+| 100% security hardening | the mint URL is logged WITHOUT its query string (it carries the PIN); `reqwest` errors are reported by KIND because their `Display` embeds the full URL |
+| 100% bugs fixing | 3-agent adversarial pass; the caught class is the publish-a-bad-token path, now gated by a JWT shape check BEFORE the write |
+| 100% scenarios covering | SSM read failure, TOTP failure, HTTP failure, 200-with-error body, malformed token, oversized body, dropped schedule |
+| 100% functionalities covering | every new pub fn has a test AND a call site (pre-push gates 6 + 11) |
+| 100% code review | adversarial review before and after implementation |
+| 100% extreme check | the wiring guard fails the build on any regression of the resources, scopes, cron, or alarms |
+
+| 7-row resilience demand | Where it is proved here |
+|---|---|
+| Zero data loss | no tick path touched; a bad mint is REFUSED before the write, so a working token can never be overwritten by an error body |
+| WS never disconnects | `N/A — no WebSocket`; this Lambda only mints and publishes |
+| Never slow/locked/hanged | bounded HTTP timeout, single invocation, no shared lock, no retry loop |
+| QuestDB never fails | `N/A — no QuestDB access` |
+| O(1) latency | O(1) per invocation (3 SSM reads, 1 TOTP, 1 mint, 1 write); no scan, no loop over instruments |
+| Uniqueness + dedup | one parameter, one writer — the whole point of this plan is that exactly ONE minter exists per broker |
+| Real-time proof | the parameter's `LastModifiedDate` reading today's date, plus the two alarms; a stale parameter is what this plan exists to make impossible |
+
+**Honest envelope (per operator-charter §F):** 100% inside the tested envelope,
+with ratcheted regression coverage — the pure logic is unit-tested and the
+wiring is guard-pinned. **NOT claimed:** live behaviour. CI holds no AWS
+credentials, so the SSM reads, the SSM write, the real `generateAccessToken`
+call, and the EventBridge trigger are UNVERIFIED-LIVE until the first 06:05 IST
+invocation. **NOT claimed:** safe coexistence with a RUNNING box — §10.3 of
+`groww-shared-token-minter-2026-07-02.md` records that tickvault must switch to
+READING this parameter before the box next runs, or two minters race again.
