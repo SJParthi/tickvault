@@ -79,6 +79,57 @@ Each is recoverable from git history pre-`2026-07-17`, which makes this a **rest
 re-harden**, not a green-field build. The plan treats recovered code as a starting draft
 that must re-pass today's guards, never as trusted.
 
+### ⚠️ CORRECTION 2026-08-09 — the retirement is ENFORCED BY GUARDS, not just by absence
+
+**Operator directive (2026-08-09, verbatim):** *"see its easy to retain all tehse deleetd
+fiels right dude but ensure to cross verify and precisley dpo the doubel cheklc whetehr
+these changes are matchign with our current ongoing dhan urls dude okay?"*
+
+That double-check found a gap this plan originally MISSED, and it materially changes the
+size of the work. Restoring the five deleted modules is **not** sufficient: the retirement
+is actively **ratcheted by build-failing guards**, and every one of them fails the moment
+the lane returns. An earlier draft of this plan said "restore + re-harden 5 modules" —
+that was **too optimistic and is corrected here**.
+
+**URL verification (the operator's actual question) — PASSED:**
+`wss://api-feed.dhan.co?version=2&token=<ACCESS_TOKEN>&clientId=<CLIENT_ID>&authType=2`
+is confirmed against `docs/dhan-ref/03-live-market-feed-websocket.md:30` (the sole Dhan
+authority) and its §639 endpoint table. **The URL in this plan is correct and current.**
+BUT the constant itself is **GONE from `crates/common/src/constants.rs`** — only the two
+FORBIDDEN depth URLs survive there (`DHAN_TWENTY_DEPTH_WS_BASE_URL`,
+`DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL`, both dead constants for banned endpoints). So the
+main-feed constant must be **re-added**, and re-adding it is exactly what trips the guards
+below.
+
+**Blocking guards — each must be re-blessed IN THE SAME PR that revives its subject:**
+
+| # | Guard | What it asserts today | Why revival breaks it |
+|---|---|---|---|
+| 1 | `crates/core/tests/dhan_live_ws_retired_guard.rs::test_main_feed_ws_modules_stay_deleted` | connection/pool modules do NOT exist | PR-C recreates them |
+| 2 | same file `::test_no_main_feed_endpoint_connect_path_in_core_src` | **`api-feed.dhan.co` appears NOWHERE in core src** | PR-C must add the URL |
+| 3 | same file `::test_websocket_mod_exports_only_surviving_modules` | pins the exact `websocket/mod.rs` export list | PR-C adds exports |
+| 4 | `crates/common/src/feed.rs::live_ws_retired()` | **`Feed::Dhan => true`** (a code-level contract, not a test) + `test_live_ws_retired_true_for_both_retired_lanes` | must become `false` for Dhan |
+| 5 | `crates/app/tests/dhan_live_off_phase_a_guard.rs::test_configs_lock_dhan_live_ws_off` | `dhan_enabled = false` in base + production config | PR-B flips base.toml |
+| 6 | `crates/app/tests/d2a_start_dhan_lane_guard.rs` | tombstone: the whole lane suite is retired | PR-C/D revive the lane |
+| 7 | `crates/app/tests/per_feed_boot_isolation_guard.rs` | per-feed boot shape without a Dhan lane | PR-C adds one |
+| 8 | `crates/app/tests/feed_toggle_lifecycle_guard.rs` | the runtime-enable 409 refusal | PR-B removes the 409 |
+| 9 | `crates/aws-lambdas/src/operator_control.rs:2659` | `assert!(!joined.contains("api-feed.dhan.co"))` | the console would list the host again |
+| 10 | `crates/common/src/error_code.rs` retirement banners | the deleted lane's codes stay retired | PR-D re-adds WS-GAP-06 |
+
+Plus ~25 further files that merely *reference* the retired state (config round-trip,
+console views, `ws_event_audit` type lists, sanitize allowlists) and need review rather
+than inversion.
+
+**Consequence for sequencing — this is the honest correction:** every PR below must
+**invert its own retirement guard in the same commit**, with a dated note pointing at the
+2026-08-09 scope-lock quote. A PR that revives code and leaves its guard asserting
+"stays deleted" simply will not build. That is the guards working as designed, and it is
+also why this is a **7-PR effort rather than a 5-file restore**.
+
+**Also verified, so nobody re-discovers it painfully:** `crates/api/src/state.rs:427`
+already contains the literal `"wss://api-feed.dhan.co"` — it is a test/mock fixture, not
+a live connect path, so it is NOT evidence the lane survives. Do not mistake it for one.
+
 ### Deliberately NOT rebuilt
 
 - **The instrument CSV download/parse chain.** Q3 of the retirement stands: hardcoded
