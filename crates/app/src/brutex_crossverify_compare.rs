@@ -44,13 +44,32 @@ const SECS_PER_MINUTE: i64 = 60;
 /// Session open, seconds-of-day IST (09:15:00).
 const SESSION_OPEN_SECS_OF_DAY: i64 = 9 * 3600 + 15 * 60;
 
-/// Full-classification window end, seconds-of-day IST (15:28:00) — the
-/// 15:28/15:29 minutes are the close-seal tail (`tail_unsealed` when the
+/// Full-classification window end, seconds-of-day IST (15:38:00) — the
+/// 15:38/15:39 minutes are the close-seal tail (`tail_unsealed` when the
 /// live side has not sealed them yet).
-const FULL_CLASSIFY_END_SECS_OF_DAY: i64 = 15 * 3600 + 28 * 60;
+///
+/// 2026-08-07: moved 15:28 -> 15:38 alongside the session close 15:30 ->
+/// 15:40 (NSE CAS 2026-08-03). The tail is defined as the LAST TWO session
+/// minutes, so it must track the close; the assert below pins that
+/// relationship so the two can never drift apart.
+const FULL_CLASSIFY_END_SECS_OF_DAY: i64 = 15 * 3600 + 38 * 60;
+const _: () = assert!(
+    FULL_CLASSIFY_END_SECS_OF_DAY == SESSION_CLOSE_SECS_OF_DAY - 2 * SECS_PER_MINUTE,
+    "the close-seal tail must remain the last TWO session minutes"
+);
 
-/// Session close, seconds-of-day IST (15:30:00, exclusive).
-const SESSION_CLOSE_SECS_OF_DAY: i64 = 15 * 3600 + 30 * 60;
+/// Session close, seconds-of-day IST (15:40:00, exclusive).
+///
+/// 2026-08-07: was 15:30 (55_800) with no drift-pin, so it silently kept the
+/// pre-NSE-CAS boundary after the 2026-08-03 change. Live rows in
+/// 15:30–15:40 were classified `out_of_session` and dropped, leaving the
+/// backtest-vs-live parity comparison blind over the closing auction.
+const SESSION_CLOSE_SECS_OF_DAY: i64 = 15 * 3600 + 40 * 60;
+const _: () = assert!(
+    SESSION_CLOSE_SECS_OF_DAY * NANOS_PER_SEC
+        == tickvault_common::constants::MARKET_CLOSE_IST_NANOS,
+    "brutex cross-verify session close drifted from the canonical constant"
+);
 
 /// Maximum accepted price in paise (values above are junk / corrupt rows).
 const MAX_PRICE_PAISE: i64 = 1_000_000_000_000;
@@ -830,7 +849,7 @@ enum MinuteWindow {
     /// [15:28, 15:30) — compared when the live bar exists, else
     /// `tail_unsealed`.
     Tail,
-    /// Outside [09:15, 15:30) — recorded, never classified.
+    /// Outside [09:15, 15:40) — recorded, never classified.
     OutOfSession,
 }
 
@@ -1548,10 +1567,12 @@ mod tests {
     fn compare_tail_unsealed_and_tail_compared() {
         let mut brutex = HashMap::new();
         let mut live = HashMap::new();
-        // 15:28 absent live → tail_unsealed; 15:29 present live → compared.
-        brutex.insert(key("A", 15, 28), bar(1, 1, 1, 1));
-        brutex.insert(key("A", 15, 29), bar(2, 2, 2, 2));
-        live.insert(key("A", 15, 29), bar(2, 2, 2, 2));
+        // 2026-08-07: the close-seal tail moved 15:28/15:29 -> 15:38/15:39
+        // with the session close (15:30 -> 15:40, NSE CAS 2026-08-03).
+        // 15:38 absent live → tail_unsealed; 15:39 present live → compared.
+        brutex.insert(key("A", 15, 38), bar(1, 1, 1, 1));
+        brutex.insert(key("A", 15, 39), bar(2, 2, 2, 2));
+        live.insert(key("A", 15, 39), bar(2, 2, 2, 2));
         let day = compare_day(&brutex, &live, &CompareCfg::default());
         assert_eq!(day.tail_unsealed, 1);
         assert_eq!(day.minutes_compared, 1);
@@ -1570,7 +1591,9 @@ mod tests {
         let mut brutex = HashMap::new();
         let mut live = HashMap::new();
         brutex.insert(key("A", 9, 14), bar(1, 1, 1, 1)); // pre-open
-        brutex.insert(key("A", 15, 30), bar(1, 1, 1, 1)); // post-close
+        // 2026-08-07: 15:30 is now IN session (close moved to 15:40), so
+        // the post-close fixture must use a minute at/after 15:40.
+        brutex.insert(key("A", 15, 40), bar(1, 1, 1, 1)); // post-close
         brutex.insert(key("A", 9, 15), bar(3, 3, 3, 3));
         live.insert(key("A", 9, 15), bar(3, 3, 3, 3));
         let day = compare_day(&brutex, &live, &CompareCfg::default());
@@ -1709,11 +1732,14 @@ mod tests {
         assert_eq!(percentile_sorted(&[7], 95.0), 7);
         assert_eq!(percentile_sorted(&[1, 2, 3, 4], 50.0), 2);
         assert_eq!(classify_window(minute_nanos(9, 15)), MinuteWindow::Full);
-        assert_eq!(classify_window(minute_nanos(15, 27)), MinuteWindow::Full);
-        assert_eq!(classify_window(minute_nanos(15, 28)), MinuteWindow::Tail);
-        assert_eq!(classify_window(minute_nanos(15, 29)), MinuteWindow::Tail);
+        // 2026-08-07: close 15:30 -> 15:40, so Full extends to 15:37 and the
+        // close-seal tail is 15:38/15:39. 15:30 is now a FULL session minute.
+        assert_eq!(classify_window(minute_nanos(15, 30)), MinuteWindow::Full);
+        assert_eq!(classify_window(minute_nanos(15, 37)), MinuteWindow::Full);
+        assert_eq!(classify_window(minute_nanos(15, 38)), MinuteWindow::Tail);
+        assert_eq!(classify_window(minute_nanos(15, 39)), MinuteWindow::Tail);
         assert_eq!(
-            classify_window(minute_nanos(15, 30)),
+            classify_window(minute_nanos(15, 40)),
             MinuteWindow::OutOfSession
         );
         assert_eq!(

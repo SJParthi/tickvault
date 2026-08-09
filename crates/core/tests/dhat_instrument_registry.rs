@@ -4,9 +4,16 @@
 //! profiler per process. This test verifies Principle #1 for the
 //! instrument registry lookup on the tick-processing hot path.
 //!
-//! Every incoming tick calls `registry.get(security_id)` to resolve
-//! the instrument metadata. This MUST be zero-allocation since HashMap
-//! lookups are pointer-based with no heap activity.
+//! Every incoming tick calls `registry.get_with_segment(security_id, segment)`
+//! to resolve the instrument metadata — the segment comes from byte 3 of the
+//! 8-byte binary header. This MUST be zero-allocation since HashMap lookups are
+//! pointer-based with no heap activity.
+//!
+//! 2026-08-08: migrated from the id-only `registry.get()` / `contains()`, which
+//! were DELETED — they read a legacy single-segment index and returned the
+//! wrong instrument on a cross-segment id reuse (I-P1-11). This test now
+//! measures the SAME path production actually executes, which is what a
+//! hot-path allocation budget should guard.
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -19,7 +26,7 @@ fn dhat_instrument_registry_lookups_zero_alloc() {
         InstrumentRegistry, SubscriptionCategory, make_display_index_instrument,
         make_major_index_instrument,
     };
-    use tickvault_common::types::FeedMode;
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
 
     let _profiler = dhat::Profiler::builder().testing().build();
 
@@ -34,7 +41,7 @@ fn dhat_instrument_registry_lookups_zero_alloc() {
     let registry = InstrumentRegistry::from_instruments(instruments);
 
     // Warm up: first lookup may initialize internal state
-    let _warmup = registry.get(13);
+    let _warmup = registry.get_with_segment(13, ExchangeSegment::IdxI);
 
     // ---- Measure: all subsequent lookups must be zero-allocation ----
     // 2026-07-09: measured via the bounded phantom-retry helper (roaming
@@ -48,14 +55,14 @@ fn dhat_instrument_registry_lookups_zero_alloc() {
             // Simulate hot-path: 1000 registry lookups (what tick processor does)
             for _ in 0..1000 {
                 // Hit: known security_ids
-                let r1 = registry.get(13);
+                let r1 = registry.get_with_segment(13, ExchangeSegment::IdxI);
                 assert!(r1.is_some());
                 assert_eq!(
                     r1.expect("nifty").category,
                     SubscriptionCategory::MajorIndexValue
                 );
 
-                let r2 = registry.get(21);
+                let r2 = registry.get_with_segment(21, ExchangeSegment::IdxI);
                 assert!(r2.is_some());
                 assert_eq!(
                     r2.expect("vix").category,
@@ -63,14 +70,14 @@ fn dhat_instrument_registry_lookups_zero_alloc() {
                 );
 
                 // Miss: unknown security_id (also must be zero-alloc)
-                let r3 = registry.get(99999);
+                let r3 = registry.get_with_segment(99999, ExchangeSegment::IdxI);
                 assert!(r3.is_none());
             }
 
-            // Also verify contains() and len() are zero-alloc
+            // Also verify contains_with_segment() and len() are zero-alloc
             for _ in 0..1000 {
-                assert!(registry.contains(13));
-                assert!(!registry.contains(99999));
+                assert!(registry.contains_with_segment(13, ExchangeSegment::IdxI));
+                assert!(!registry.contains_with_segment(99999, ExchangeSegment::IdxI));
                 assert_eq!(registry.len(), 5);
                 assert!(!registry.is_empty());
             }

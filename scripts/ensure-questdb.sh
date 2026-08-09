@@ -31,7 +31,21 @@ SVC="tv-questdb"
 ENV="${TV_ENVIRONMENT:-prod}"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-south-1}}"
 COMPOSE_FILE="${TV_COMPOSE_FILE:-/opt/tickvault/repo/deploy/docker/docker-compose.yml}"
-IMAGE="questdb/questdb:9.3.5"
+# 2026-08-08: digest-pinned in lockstep with deploy/docker/docker-compose.yml so
+# the bootstrap path cannot drift from the compose path. Multi-arch OCI image
+# INDEX digest (verified live 2026-08-08: mediaType
+# application/vnd.oci.image.index.v1+json, carries linux/amd64 + linux/arm64,
+# round-trips by digest HTTP 200), so one digest serves dev and the ARM Graviton
+# prod box.
+#
+# `name:tag@sha256:` is the documented Docker CLI form for `pull` and `run`
+# (the digest wins; the tag is descriptive). Whether `docker image inspect`
+# (line ~121) resolves this exact form was NOT live-verifiable here — the
+# daemon was not running in this environment. It is fail-safe either way: an
+# inspect miss simply falls through to the existing 3-attempt bounded pull,
+# which then fetches by digest. Worst case is one redundant pull, never a
+# wrong or unpinned image.
+IMAGE="questdb/questdb:9.3.5@sha256:22ad030544f45a396c743124c928ce33de11666c104f63f69ce4e66e07e7b968"
 
 # SERVICE-USER PATH hardening (2026-07-13, deploy-hang fix companion): under
 # the systemd unit (ExecStartPre, User=ec2-user) PATH can be the minimal

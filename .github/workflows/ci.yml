@@ -590,6 +590,34 @@ jobs:
         shell: bash
         run: bash .claude/hooks/boot-symmetry-guard.sh
 
+      # 2026-08-07 (audit follow-up): the three RATCHET-BASELINE guards.
+      #
+      # These were made fail-closed-under-CI earlier the same day (their
+      # baselines moved from .gitignore into git, and each guard now exits
+      # non-zero rather than self-seeding when $CI is set). But they appeared
+      # in ZERO workflow files — verified by grep — so the fail-closed logic
+      # never executed server-side and the fix was inert. Guards that only
+      # run in a local pre-push hook are bypassed by `--no-verify` and by any
+      # web/API edit, which is exactly the bypass class the Repo Guards job
+      # exists to close.
+      #
+      # They run HERE, inside the existing repo-guards job, deliberately: a
+      # NEW top-level job would run without gating merges unless it were also
+      # added to All Green's needs list (merge-gate-lock-2026-07-04.md §5
+      # names that exact silent-regression shape). repo-guards is already in
+      # that list, so a failure here blocks the merge.
+      - name: Test-count ratchet (count may only increase)
+        shell: bash
+        run: bash .claude/hooks/test-count-guard.sh "$GITHUB_WORKSPACE"
+
+      - name: Pub-fn test guard (every new pub fn has a test or TEST-EXEMPT)
+        shell: bash
+        run: bash .claude/hooks/pub-fn-test-guard.sh "$GITHUB_WORKSPACE"
+
+      - name: Financial test guard (price/order fns have boundary tests)
+        shell: bash
+        run: bash .claude/hooks/financial-test-guard.sh "$GITHUB_WORKSPACE"
+
       # 2026-07-18 (rust-only phase 2b-2 wave 1): the legacy `make
       # lambda-test` step is RETIRED — the telegram-webhook Lambda is now
       # the Rust crate tickvault-aws-lambdas (its ported test suite runs in

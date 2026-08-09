@@ -117,7 +117,9 @@ resource "aws_lambda_function" "questdb_console_proxy" {
   memory_size      = 256
 
   vpc_config {
-    subnet_ids         = [aws_subnet.public.id] # the VPC's only subnet
+    # 2026-08-08: the VPC now has one public subnet per AZ; the console Lambda
+    # follows the instance into whichever zone var.availability_zone selects.
+    subnet_ids         = [aws_subnet.public[var.availability_zone].id]
     security_group_ids = [aws_security_group.qdb_console_lambda[0].id]
   }
 

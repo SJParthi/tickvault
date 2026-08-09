@@ -23,6 +23,42 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## OPERATOR RULING 2026-08-08 — kill-ceiling RAISED $35 → $100 (r8g.xlarge + multi-AZ; TARGET formally BREACHED)
+
+**The verbatim operator demands (2026-08-08 — typed directly in-session, preserve EXACTLY, typos included):**
+> "then can we go ahead with r8g x large dude"
+>
+> "yes dude go ahead but before that provide em tje rpecise detaield lsited plan dude okay?"
+>
+> "yes raise the ceilign ddue and make it as entirely acceptabel to oru newer requeirmeent dude okau?"
+
+**What this authorizes:** instance **t4g.large → r8g.xlarge** (Graviton4, 4 vCPU / 32 GiB), the **single-AZ subnet pin REMOVED** (subnets in ap-south-1a/b/c, zone by `var.availability_zone`), EBS fresh-provision **20 → 100 GB**, and the kill-ceiling **$35 → $100**. Full record + derivation: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 13 + §7 "Bill 2026-08-08".
+
+**The requirement it serves:** current-day **13 timeframes** (1s/5s/10s/15s/30s + 1m/2m/3m/5m/15m/30m/60m + 1d) **plus raw-tick retention** at a target ~25,000 instruments.
+
+**Why the AZ un-pin is the load-bearing half:** the 2026-08-07 t4g.large flip (the ruling below) was itself REFUSED by AWS with `InsufficientInstanceCapacity` (workflow run 31148235540) and rolled back — proving the constraint was the ZONE, not the instance size. `describe-instance-type-offerings` (live 2026-08-08) shows all 7 candidate types offered in all 3 AZs. CPU evidence: Aug 5 = 0h, Aug 7 = 0h, Aug 8 = 0h.
+
+**Why $100 (the actions fire at 90%/100% of the limit):**
+
+| Ceiling | 90% line | vs bill high estimate $73.60 | Verdict |
+|---|---|---|---|
+| $35 | $31.50 | ❌ far below | stops the box mid-session |
+| $80 | $72.00 | ❌ below | trips almost immediately |
+| **$100** | **$90.00** | ✅ clears with margin | **chosen** |
+| $250 | $225.00 | ✅ | rubber stamp, not a guard |
+
+**Bill: ~₹5,824–₹7,382/mo incl GST** (r8g.xlarge · 100 GB · ~210 hrs · EIP kept). EC2 rate DERIVED from the recorded r8g.large bill ($0.083/hr → $0.166/hr xlarge; AWS list may reach ~$0.24/hr, hence the range) — the method reproduces the t4g.medium ₹1,289 figure exactly.
+
+**The sub-₹1,000/month TARGET is formally BREACHED by ~6× and knowingly accepted.** It stands as a target; the downward ratchet ladder stays PAUSED. Recorded plainly rather than quietly dropped.
+
+**4-way lockstep applied (was 3-way + one drifted site):** `budget.tf limit_amount "100"` + `budget-guards.tf BUDGET_KILL_USD "100"` + `budget_digest.rs BUDGET_USD = 100.0` + **`hard_stop_guard.rs DEFAULT_BUDGET_KILL_USD = 100.0`**.
+
+That fourth site was a **real defect this raise created**, not a tidy-up. It had sat at 55.0 across the $55 → $25 → $35 steps, tolerated as a flagged follow-up because 55 was ABOVE the live ceiling — a missing env var killed LATER than the real line, the harmless direction. Raising the ceiling to $100 **silently inverted that**: 55 became BELOW both the ceiling and the expected ~$73.60 bill, so a missing or fat-fingered `BUDGET_KILL_USD` would have stopped the prod box mid-session at $55 every month, while the documented safety argument still read "kills later, never earlier". Fixed in the same change, and the comments-only "KEEP IN SYNC" is now a build-failing ratchet: `crates/aws-lambdas/tests/budget_ceiling_lockstep_guard.rs` (4 tests — all-four-agree, fallback-never-below-ceiling, ceiling-brackets-the-bill, rule-files-record-it).
+
+**FLAGGED, UNRESOLVED (Rule 11, no false-OK):** the 2026-07-31 ruling below recorded BOTH `STOP_EC2_INSTANCES` actions stuck in `EXECUTION_FAILURE`. The 2026-08-08 executing session could NOT verify their current state — `describe-budget-actions-for-budget` returned **AccessDenied** on the agent credentials. **Raising a ceiling does not repair a broken action: the kill switch may still not fire at all.** This needs its own live check with budget-action read access before the safety net can be claimed to work. Live budget read that DID succeed (2026-08-08): `tv-prod-monthly-budget-v2` limit $35, actual $3.78, forecast $15.79 — actual is low only because the box has barely run.
+
+---
+
 ## OPERATOR RULING 2026-07-31 — kill-ceiling RAISED $25 → $35 (breach incident; ladder paused, TARGET unchanged)
 
 **The verbatim operator demands (2026-07-31 — typed directly in-session, preserve EXACTLY, typos included):**

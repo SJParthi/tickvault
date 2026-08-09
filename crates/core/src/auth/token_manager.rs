@@ -29,6 +29,7 @@ use tickvault_common::error::ApplicationError;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
 use tickvault_common::url_join::join_api_url;
 
+use super::dhan_token_publisher;
 use super::secret_manager;
 use super::token_cache;
 use super::totp_generator::generate_totp_code;
@@ -845,6 +846,11 @@ impl TokenManager {
         // Cache for fast restart on crash recovery
         self.save_current_token_to_cache();
 
+        // Publish for peer consumers (Dhan allows ONE active token per account,
+        // so a peer minting its own would invalidate this one — operator
+        // 2026-08-08). Spawned + fail-soft: can never delay or fail the mint.
+        self.publish_current_token_to_ssm();
+
         Ok(())
     }
 
@@ -927,6 +933,10 @@ impl TokenManager {
 
         // Update cache for fast restart
         self.save_current_token_to_cache();
+
+        // Republish the refreshed token so peers never hold the invalidated one
+        // (see the note at the initial-mint site). Spawned + fail-soft.
+        self.publish_current_token_to_ssm();
 
         Ok(())
     }
@@ -1199,6 +1209,26 @@ impl TokenManager {
         let guard = self.token.load();
         if let Some(token_state) = guard.as_ref().as_ref() {
             token_cache::save_token_cache(token_state, &self.credentials.client_id);
+        }
+    }
+
+    /// Publishes the current token to SSM so peer consumers of the SAME Dhan
+    /// account read it instead of minting their own.
+    ///
+    /// Dhan allows exactly ONE active access token per account
+    /// (`docs/dhan-ref/02-authentication.md:216`), so a peer that mints would
+    /// invalidate the token this manager just stored — and this manager's
+    /// watchdog would then re-mint and invalidate the peer's, forever.
+    /// Publishing removes the peer's *reason* to mint. Operator 2026-08-08;
+    /// contract in `groww-shared-token-minter-2026-07-02.md` §9.
+    ///
+    /// Best-effort by construction: the publish is SPAWNED (never awaited), so
+    /// a slow or failing SSM call can never delay a mint or stall boot, and a
+    /// failure never propagates — this manager already holds the token.
+    fn publish_current_token_to_ssm(&self) {
+        let guard = self.token.load();
+        if let Some(token_state) = guard.as_ref().as_ref() {
+            dhan_token_publisher::spawn_publish_dhan_token(token_state);
         }
     }
 

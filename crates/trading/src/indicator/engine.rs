@@ -404,6 +404,12 @@ impl IndicatorEngine {
 
         let mut snapshot = IndicatorSnapshot {
             security_id: tick.security_id,
+            // §28.3: carry the ALREADY-RESOLVED dense slot downstream. The
+            // strategy evaluator indexes by this; deriving it again from
+            // security_id is what made it a silent no-op.
+            // APPROVED: sid is a dense slot < MAX_INDICATOR_INSTRUMENTS (25_000).
+            #[allow(clippy::cast_possible_truncation)]
+            slot: sid as u32,
             ema_fast: state.ema_fast,
             ema_slow: state.ema_slow,
             sma,

@@ -133,9 +133,19 @@ use tracing::{debug, error, info, warn};
 /// fails a silent flip).
 pub const READINESS_FIRE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60 + 30;
 
-/// Late-boot catch-up window end: 15:30:00 IST — the probe fires once per
-/// trading day inside `[09:15:30, 15:30:00)`, never after close.
-pub const READINESS_FIRE_WINDOW_END_SECS_IST: u32 = 15 * 3600 + 30 * 60;
+/// Late-boot catch-up window end: 15:40:00 IST — the probe fires once per
+/// trading day inside `[09:15:30, 15:40:00)`, never after close.
+///
+/// 2026-08-07: was 15:30 with no drift-pin, so it silently kept the
+/// pre-NSE-CAS boundary after the 2026-08-03 change — the order-readiness
+/// window closed ten minutes before the market actually did. Harmless while
+/// orders are locked; a live-trading hazard the moment they arm. Now pinned.
+pub const READINESS_FIRE_WINDOW_END_SECS_IST: u32 = 15 * 3600 + 40 * 60;
+const _: () = assert!(
+    READINESS_FIRE_WINDOW_END_SECS_IST as i64 * 1_000_000_000
+        == tickvault_common::constants::MARKET_CLOSE_IST_NANOS,
+    "readiness fire-window end drifted from the canonical constant"
+);
 
 /// The ONE bounded in-run retry gap (09:15:30 → 09:20:30). Trivially ≥ the
 /// caller's 60s token-re-read floor (`groww-shared-token-minter-2026-07-02.md`).
@@ -1931,7 +1941,8 @@ mod tests {
         let fire = READINESS_FIRE_SECS_OF_DAY_IST;
         let end = READINESS_FIRE_WINDOW_END_SECS_IST;
         assert_eq!(fire, 33_330);
-        assert_eq!(end, 55_800);
+        // 2026-08-07: 55_800 (15:30) -> 56_400 (15:40), NSE CAS 2026-08-03.
+        assert_eq!(end, 56_400);
         assert_eq!(
             readiness_fire_decision(false, true, fire, false),
             FireDecision::Disabled
@@ -1969,7 +1980,7 @@ mod tests {
         // requires a fresh dated §39 amendment FIRST, then this assertion
         // moves with it.
         let market_open = 9 * 3600 + 15 * 60;
-        let market_close = 15 * 3600 + 30 * 60;
+        let market_close = 15 * 3600 + 40 * 60;
         assert!(READINESS_FIRE_SECS_OF_DAY_IST >= market_open);
         assert!(READINESS_FIRE_SECS_OF_DAY_IST < market_close);
         assert!(READINESS_FIRE_WINDOW_END_SECS_IST <= market_close);

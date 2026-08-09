@@ -143,6 +143,67 @@ fn bench_gate_carries_hardware_drift_detection() {
     );
 }
 
+/// 2026-08-07 audit finding: the three ratchet-baseline guards were made
+/// fail-closed-under-CI, but appeared in ZERO workflow files — so the
+/// fail-closed logic never ran server-side and the fix was inert. A guard that
+/// only runs in a local pre-push hook is bypassed by `--no-verify` and by any
+/// web/API edit.
+///
+/// They must be invoked from `repo-guards`, which is already in All Green's
+/// `needs:` list. A NEW top-level job would run WITHOUT gating merges unless
+/// also added there — the silent-regression shape named by
+/// `merge-gate-lock-2026-07-04.md` §5.
+#[test]
+fn ratchet_guards_are_wired_into_ci() {
+    let ci = read(".github/workflows/ci.yml");
+    for guard in [
+        "test-count-guard.sh",
+        "pub-fn-test-guard.sh",
+        "financial-test-guard.sh",
+    ] {
+        assert!(
+            ci.contains(guard),
+            ".github/workflows/ci.yml no longer invokes {guard} — the guard's \
+             fail-closed-in-CI logic becomes inert server-side and every \
+             ratchet it protects passes vacuously (2026-08-07 audit finding)"
+        );
+    }
+
+    // They must live in repo-guards (an All-Green-gated job), not a new
+    // ungated job. Assert they appear AFTER the repo-guards job header and
+    // BEFORE the next top-level job definition.
+    let repo_guards_at = ci
+        .find("\n  repo-guards:")
+        .expect("ci.yml lost the repo-guards job");
+    let tail = &ci[repo_guards_at + 3..];
+    let next_job_at = tail.find("\n  ").map_or(tail.len(), |_| {
+        // find the next top-level job key: a line starting with exactly two
+        // spaces followed by an identifier and a colon, after our job body.
+        tail.match_indices("\n  ")
+            .find(|(i, _)| {
+                let rest = &tail[i + 3..];
+                rest.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && rest
+                        .lines()
+                        .next()
+                        .is_some_and(|l| l.trim_end().ends_with(':') && !l.starts_with(' '))
+            })
+            .map_or(tail.len(), |(i, _)| i)
+    });
+    let repo_guards_body = &tail[..next_job_at];
+    for guard in [
+        "test-count-guard.sh",
+        "pub-fn-test-guard.sh",
+        "financial-test-guard.sh",
+    ] {
+        assert!(
+            repo_guards_body.contains(guard),
+            "{guard} is in ci.yml but NOT inside the repo-guards job — a job \
+             outside All Green's needs list runs without gating the merge"
+        );
+    }
+}
+
 #[test]
 fn bench_gate_selftest_exists_and_covers_both_directions() {
     let body = read("scripts/bench-gate.selftest.sh");

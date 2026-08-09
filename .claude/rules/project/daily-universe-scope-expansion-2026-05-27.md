@@ -161,6 +161,89 @@ honestly recorded that the retained sizing formula predicts a ~2.5 GB app
 working set at ~770 SIDs — a figure that does NOT fit 4 GiB. That risk was
 outstanding and unmeasured; t4g.large removes it.
 
+**Quote 13 (2026-08-08, r8g.xlarge + AZ un-pin + 100 GB + budget ceiling raise — preserve EXACTLY, typos included):**
+> "then can we go ahead with r8g x large dude"
+>
+> "yes dude go ahead but before that provide em tje rpecise detaield lsited plan dude okay?"
+>
+> "yes raise the ceilign ddue and make it as entirely acceptabel to oru newer requeirmeent dude okau?"
+
+Given in direct response to a presented plan naming exactly these changes: instance
+**t4g.large → r8g.xlarge**, the **availability-zone pin removed**, EBS fresh-provision
+**20 → 100 GB**, weekday **08:00–17:00** (~210 hrs), and the budget kill-ceiling
+**$35 → $100**. The third quote authorizes the ceiling raise and the alignment of the
+cost envelope to the new requirement.
+
+**The requirement this serves (operator, 2026-08-08, verbatim):** *"current day ticks
+secodns multiple seocdns tiemframes liek 1 seocnd 5 seconds 10 15 30 seocnds dude nad
+then even mintue level tiemframes liek 1,2,3,5,15,30,60 and 1 dya also"* — i.e. **13
+timeframes** (S1, S5, S10, S15, S30 · M1, M2, M3, M5, M15, M30, M60 · D1) plus **raw
+tick retention**, current day, at a target scale of ~25,000 instruments.
+
+**The incident this closes (Verified, live AWS evidence, 2026-08-07/08).** The
+2026-08-07 Quote 12 t4g.large flip was itself REFUSED by AWS with
+`InsufficientInstanceCapacity` (workflow run 31148235540) and rolled back — proving the
+constraint is the **availability zone, not the instance type**. `main.tf:77` pins the
+only subnet to `${var.aws_region}a`. CPU evidence: Aug 5 = 0h, Aug 7 = 0h, Aug 8 = 0h.
+`describe-instance-type-offerings` (run live 2026-08-08) confirms **every** candidate
+type — t4g.medium, t4g.large, r8g.large, r8g.xlarge, r8gd.large, m8g.large, r8i.large —
+is offered in **all three** ap-south-1 AZs. The AZ pin is therefore the sole blocker,
+and it is removed here: subnets are provisioned in 1a/1b/1c and the instance's zone
+becomes `var.availability_zone`, so a future capacity refusal is a one-variable change.
+
+**Why r8g.xlarge specifically.** `r` = 8 GiB RAM per vCPU (memory-optimised); the
+workload is memory-bound, not CPU-bound. Sizing (Verified against source): 13 TF ×
+`LiveCandleState` **128 B** (`live_candle_state.rs` — 11×f64 + 2×u64 + i64 + 3×u32 =
+124, padded) × 25,000 = **42 MB**; seal ring 200,000 × ≤144 B = **29 MB**; one day of
+ticks in RAM 2.3–7.2 GB; QuestDB 8–16 GB; app + OS 4–8 GB ⇒ **14–31 GB**, fits 32 GiB.
+REJECTED alternatives: `m8g` (4 GiB/vCPU forces buying unused CPU to reach 16 GiB);
+`r8gd` (local NVMe is **wiped on stop** and the box stops daily); `r8i` (Intel would
+force an x86 rebuild of the entire ARM pipeline including the lambdas).
+
+**Honest cost (recorded, not buried).** r8g.xlarge · 100 GB · ~210 hrs · ticks retained
+= **$58.06–$73.60/mo → ~₹5,824–₹7,382/mo incl GST** (EC2 rate DERIVED from the recorded
+r8g.large bill: ₹3,101 ÷ 1.18 ÷ 85 = $30.92, minus EIP $3.60 + EBS(50) $4.56 + S3 $0.18
++ SMS $0.28 = $22.30 ÷ 270 hrs = **$0.083/hr** for r8g.large ⇒ **$0.166/hr** xlarge; the
+method reproduces the t4g.medium ₹1,289 figure exactly. AWS list may reach ~$0.24/hr —
+re-verify on the first invoice). **The Quote 9 sub-₹1,000/month target is BREACHED by
+~6×** and is NOT met; this quote knowingly accepts that to serve the 13-timeframe /
+25,000-instrument / tick-retention requirement. The Quote 9 target stands as a target
+and the downward ratchet ladder remains PAUSED.
+
+**Budget ceiling $35 → $100 (the third quote).** The plan's high estimate is $73.60;
+the budget's AUTOMATIC `STOP_EC2_INSTANCES` actions fire at 90% and 100%, so a $35 (or
+even $80) ceiling would try to stop the box mid-session. $100 puts the 90% line at $90,
+comfortably above the $73.60 worst case, while remaining a real guard rather than a
+rubber stamp. **UNRESOLVED, flagged (Rule 11, no false-OK):** the 2026-07-31 ruling
+recorded BOTH budget actions stuck in `EXECUTION_FAILURE`; the executing session's
+credentials could NOT read `describe-budget-actions-for-budget` (AccessDenied), so
+whether they still fail is **Unknown**. Raising a ceiling does not repair a broken
+action — the kill-switch may not actually fire. This needs its own live check with
+budget-action read access before the safety net can be claimed to work.
+
+**Disk 20 → 100 GB fresh-provision.** Live root is 30 GB (Cost Explorer
+`VolumeUsage.gp3` qty=30.0 at $2.736/mo — nothing is free-tier). Estimated load: ticks
+25–80 M rows/day (**Assumed**, swings disk 3×) ≈ 44–141 GB/mo; 13 TFs sparse ≈ 46 M
+rows/day ≈ 61 GB/mo. Sparse is Verified by `live_candle_state.rs:105` — an unopened
+bucket is a sentinel and emits nothing (dense would be 808 M rows/day = 35,900/sec
+against the ~5,000/sec envelope; sparse is ~2,050/sec). 100 GB is chosen deliberately
+over 250: **gp3 grows online in one command and can NEVER shrink** (Rule 3), so the
+small side is the reversible direction. `variables.tf` already permits 10–200 GB.
+
+**EIP: KEPT (no change).** Quote 10 (2026-07-19) approves release for the
+no-live-orders period and a bundled recreate is the sanctioned path, but the operator
+did not answer the release question in this exchange, so the **reversible default
+applies** — the address is retained (~₹360/mo). Releasing remains available under
+Quote 10 via `docs/runbooks/eip-release.md`.
+
+**SCOPE HONESTY — capacity is not data.** This quote sizes a box that CAN hold the
+requirement. It does NOT deliver it. The runtime is REST-only on the hardcoded
+`SPOT_1M_REST_INDICES` (+ INDIA VIX); **no live tick feed exists** (Dhan live WS retired
+2026-07-13, Groww live WS retired 2026-07-15, GDF and TrueData are both DEFAULT-OFF
+trial-first locks whose implementation PRs never started). Reaching ~25,000 instruments
+requires a feed trial plus its own dated scope edits to
+`websocket-connection-scope-lock.md` and this file — deliberately NOT authorized here.
+
 ---
 
 > **[ARCHIVED 2026-07-20]** §1 The rule (retired subscription contract) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).
@@ -241,7 +324,15 @@ SEBI retention: 5 years (matches the `order_audit` table standard).
 
 ---
 
-## §7. Instance lock — t4g.large (LOCKED 2026-08-07 per §0 Quote 12 — capacity escape; supersedes the 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
+## §7. Instance lock — r8g.xlarge, MULTI-AZ (LOCKED 2026-08-08 per §0 Quote 13 — the 13-timeframe + tick-retention requirement, and the AZ un-pin that actually ends the capacity outage; supersedes the 2026-08-07 t4g.large + 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large + 2026-05-27 t4g.large + 2026-05-18 t4g.medium locks)
+
+> **2026-08-08 (Quote 13) — the AZ pin is REMOVED, and that is the load-bearing
+> change.** Every prior instance lock in this section assumed the box lives in
+> `${var.aws_region}a`. The 2026-08-07 t4g.large flip proved that assumption is what
+> broke the box: AWS refused the NEW type in the SAME zone for the SAME reason. So the
+> zone is now `var.availability_zone` over subnets in 1a/1b/1c, and a capacity refusal
+> is a one-variable re-apply instead of days of downtime. **Any future instance-type
+> change must keep the multi-AZ shape — re-pinning to a single zone is a REJECT.**
 
 **2026-07-15 change (operator Quote 8):** instance lock → **t4g.medium**
 (ARM Graviton2, burstable general-purpose) — **4 GiB RAM** (DOWN from the
@@ -257,7 +348,8 @@ per-minute-REST workload is NOT yet live-validated on credits — watch
 
 | Spec | Value |
 |---|---|
-| Instance | **t4g.large** — ARM Graviton2, **2 vCPU, 8 GiB RAM** (burstable general-purpose). *(Changed from t4g.medium 2026-08-07 per §0 Quote 12 — an AWS `InsufficientInstanceCapacity` outage in ap-south-1a left the box unstartable for whole trading sessions; a different type draws from a different capacity pool. Cost ~+₹400–600/mo — the Quote 9 sub-₹1,000 target is NOT met; see Quote 12 for the arithmetic.)* |
+| Instance | **r8g.xlarge** — ARM Graviton4, **4 vCPU, 32 GiB RAM** (memory-optimised). *(Changed from t4g.large 2026-08-08 per §0 Quote 13 — to serve the 13-timeframe + current-day tick-retention requirement at ~25,000 instruments. `r` = 8 GiB/vCPU because the workload is memory-bound; `m8g` would force buying unused CPU to reach the same RAM, `r8gd`'s local NVMe is wiped on every stop (the box stops daily), and `r8i` would force an x86 rebuild of the whole ARM pipeline. Cost ~₹5,824–₹7,382/mo — the Quote 9 sub-₹1,000 target is BREACHED ~6× and knowingly accepted; see Quote 13 for the derivation.)* |
+| **Availability zone** | **NOT PINNED** — subnets provisioned in `ap-south-1{a,b,c}`, instance zone selected by `var.availability_zone` (default `b`). *(2026-08-08, Quote 13. The old single-AZ pin at `main.tf:77` is what kept the box dark 2026-08-06→08: `describe-instance-type-offerings` confirms all 7 candidate types are offered in all 3 AZs, so the zone — not the type — was the blocker. Re-pinning to one zone is a REJECT.)* |
 | Region | ap-south-1 (Mumbai) |
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.0224/hr** (ap-south-1, console-verified 2026-05-18 — re-verify at execution) — no Reserved / Savings Plan / Spot |
@@ -300,6 +392,34 @@ used it). **EBS = 30 GB live** (verified 2026-07-19 — the 2026-07-13 grow to
 **Elastic IP KEPT**. t4g.medium @ $0.0224/hr, $1 ≈ ₹85. **Every running
 component is itemised below — monitoring, alerting, Docker, Lambdas,
 Telegram are all included and free-tier.**
+
+### Bill 2026-08-08 (Quote 13) — r8g.xlarge · 100 GB · ~210 hrs · EIP kept
+
+Weekday 08:00–17:00 = 22 × 9 = 198 hrs + manual/deploy starts ⇒ **~210 hrs**
+(supersedes the 270-hr ceiling basis for THIS bill; 270 remains the ceiling if
+weekends are run). EC2 rate DERIVED from the recorded r8g.large bill — see §0
+Quote 13 for the arithmetic; AWS list may reach ~$0.24/hr, hence the range.
+
+| Line | Calc | USD (low) | USD (high) |
+|---|---|---|---|
+| EC2 **r8g.xlarge** (app + Docker + QuestDB) | $0.166–$0.24/hr × 210 hrs | $34.86 | $50.40 |
+| Elastic IP (24/7, KEPT — see Quote 13) | $0.005 × 720 | $3.60 | $3.60 |
+| EBS gp3 **100 GB** (fresh provision) | $0.0912 × 100 | $9.12 | $9.12 |
+| S3 cold (ticks + candles aged out) | grows with retention | $7.50 | $7.50 |
+| CloudWatch alarms/metrics (the ~$2.7 of dated COST-NOTE alarms, itemised HERE unlike prior bills) | — | $2.70 | $2.70 |
+| SNS → SMS (optional) | ~100 India msgs | $0.28 | $0.28 |
+| **Subtotal (pre-GST)** | | **$58.06** | **$73.60** |
+| **× ₹85/$** | | ₹4,935 | ₹6,256 |
+| **+ 18% GST** | | **~₹5,824/mo** | **~₹7,382/mo** |
+
+**Honest envelope for this bill:** ~6× the Quote 9 sub-₹1,000 target — **NOT met,
+knowingly**. Releasing the EIP under Quote 10 saves ~₹360/mo. The S3 line is the
+loosest estimate (it scales with the **Assumed** 25–80 M ticks/day, which swings
+disk 3×) — measure on the first live day. The budget kill-ceiling moves $35 → $100
+in lockstep (Quote 13); a ceiling below ~$82 would fire `STOP_EC2_INSTANCES`
+mid-session at the 90% action threshold.
+
+### Bill 2026-07-19 (SUPERSEDED by the 2026-08-08 bill above; retained as audit)
 
 | Line | Calc | USD |
 |---|---|---|
@@ -364,8 +484,78 @@ $25) with BOTH AUTOMATIC `STOP_EC2_INSTANCES` actions stuck in
 UNCHANGED; the downward ladder is PAUSED, not cancelled, and resumes once
 the ~$8.31/mo standing waste is cut. Full record: `aws-budget.md`
 "OPERATOR RULING 2026-07-31".)*
+*(2026-08-08 ruling — Quote 13: the kill ceiling is RAISED $35 → **$100**. The
+plan's high estimate is $73.60 and the AUTOMATIC actions fire at 90%/100%, so any
+ceiling below ~$82 would try to stop the box mid-session; $100 puts the 90% line at
+$90. The < ₹1,000/mo TARGET is formally BREACHED by this ruling (~6×) and the
+downward ladder stays PAUSED. **FLAGGED, UNRESOLVED:** the 2026-07-31 record has
+BOTH `STOP_EC2_INSTANCES` actions in `EXECUTION_FAILURE`, and the 2026-08-08
+executing session could NOT verify their current state —
+`describe-budget-actions-for-budget` returned AccessDenied. Raising a ceiling does
+not repair a broken action; the kill switch may still not fire. Needs a live check
+with budget-action read access before the safety net can be claimed to work.)*
 
-> **Note on instance schedule (2026-05-29):** trading WEEKDAYS only
+**Quote 14 (2026-08-08, the 9-hour window — preserve EXACTLY, typos included):**
+> "Yes dude make it as 8.30 till 5.30 pm dude okay?  Go ahead ddue oaky"
+
+Operator chose **08:30–17:30 IST** rather than the 08:00–17:00 I had proposed, and
+that choice is what made the change safe. **Keeping the 08:30 START untouched
+sidesteps the entire morning coupling** I had flagged as a blocker: the
+start-watchdog arm + retry, market-open-readiness, the boot-heartbeat window open,
+and the deploy-watchdog are all timed off 08:30 and every one stays correct. Only
+the EVENING edge moves, and the boot-heartbeat false-page-every-morning risk
+disappears entirely.
+
+**APPLIED in the same PR** (four coupled sites, three of which would actively
+FIGHT the schedule if left behind):
+
+| Site | 16:30 → 17:30 | What a partial edit would have done |
+|---|---|---|
+| `main.tf` `daily_stop` cron | `cron(0 11)` → `cron(0 12)` | box stops an hour early |
+| `hard_stop_guard::in_up_window` | `830..=1630` → `830..=1730` | runs HOURLY and **force-stops** any box outside its window ⇒ kills the box at 17:00, pages, silently cancels the paid hour |
+| `start_watchdog::OPERATING_CLOSE_IST_MINUTES` | `17*60` → `17*60+30` | curfew guard **stops the box 30 min early** |
+| `start_watchdog::STOP_TRIGGER_UTC_HOUR` + stop-verify cron | `11`→`12`, `cron(15 11)`→`cron(15 12)` (17:45 IST) | verify fires 45 min BEFORE the stop ⇒ false "auto-stop FAILED" page **every trading day** |
+
+Plus the two operator-facing strings (console banner + offline message) and 5
+existing tests whose boundaries encoded 16:30. Pinned by
+`crates/aws-lambdas/tests/stop_window_lockstep_guard.rs` (6 tests, all three
+force-stop sites bite-tested). Billing basis moves ~176 → **~198 hrs** (22 × 9),
+inside the ~210-hr Quote 13 envelope — so the recorded bill is unchanged.
+
+> **Note on instance schedule (2026-08-08, Quote 13) — SUPERSEDED SAME DAY by
+> Quote 14 above, which APPLIED a 08:30–17:30 window. Retained as the record of
+> why 08:00–17:00 was NOT taken.**
+>
+> The operator approved a weekday **08:00–17:00 IST** (9-hour) window, and the
+> Quote 13 bill is costed at the resulting ~210-hr basis (22 × 9 = 198 hrs + manual
+> starts). **The EventBridge crons are deliberately UNCHANGED in the PR that
+> records this quote**, because the start time is not a standalone value — five
+> Lambda/alarm schedules are timed as OFFSETS from the 08:30 start, and moving only
+> `daily_start`/`daily_stop` would fire them against a box in the wrong state:
+>
+> | Coupled schedule | Now | Why it breaks on a naive shift |
+> |---|---|---|
+> | `start-watchdog` stop-verify (`cron(15 11)` = 16:45) | verifies the box stopped | would fire 15 min BEFORE a 17:00 stop and report a false failure |
+> | `boot-heartbeat` window open (`cron(20 3)` = 08:50) | opens the boot alarm | an 08:00 start completes boot ~08:05; by 08:50 `tv_boot_completed` is >10 min stale ⇒ false page every morning |
+> | `start-watchdog` arm + retry (`cron(0 3)`, `cron(15 3)`) | start + retry | fire after an 08:00 start — benign but semantically wrong |
+> | `market-open-readiness` (`cron(15 3)` = 08:45) | pre-open readiness | still before 09:15 — benign |
+> | `deploy-watchdog` (`cron(20 3)` = 08:50) | deploy check | benign |
+>
+> **Applying the 9-hour window therefore requires re-timing the whole chain in one
+> change, with the boot-heartbeat window and the stop-verify as the two that
+> genuinely misfire.** That is a scoped follow-up, not a line edit — and shipping
+> the start/stop pair alone would trade ₹400–600/mo of savings for a false page
+> every trading morning. The ~210-hr billing basis above is therefore the APPROVED
+> TARGET; until the chain is re-timed the live basis stays ~176 hrs (08:30–16:30),
+> which bills LESS, never more — the Quote 13 cost envelope is a ceiling, not an
+> understatement.
+
+> **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08 (Quote 14 → 08:30–17:30).**
+> Trading WEEKDAYS only (Mon–Fri), **08:30–16:30 IST** auto start/stop.
+>
+> **CURRENT LIVE SCHEDULE: 08:30–17:30 IST Mon–Fri** (Quote 14).
+
+> **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08:** trading WEEKDAYS only
 > (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays
 > = instance OFF unless the operator manually starts it. The 08:30 start
 > gives the cold-boot + Step 1–6 auth + 08:45 CSV-fetch retry budget so
@@ -375,7 +565,27 @@ the ~$8.31/mo standing waste is cut. Full record: `aws-budget.md`
 
 ### Mechanical Rules (replaces aws-budget.md mechanical rules 1+6)
 
-1. **Instance type is t4g.large. PERIOD.** *(2026-08-07, §0 Quote 12 — was
+1. **Instance type is r8g.xlarge AND the AZ stays UN-PINNED. PERIOD.** *(2026-08-08,
+   §0 Quote 13 — was t4g.large from 2026-08-07.)* Two things are locked by this rule,
+   not one: the **type** (4 vCPU / 32 GiB Graviton4) and the **multi-AZ shape**
+   (subnets in 1a/1b/1c, zone chosen by `var.availability_zone`). Re-pinning the
+   subnet to a single AZ is a REJECT on its own, independent of the type — that pin
+   is what caused the 2026-08-06→08 outage, and the 2026-08-07 type flip failed
+   precisely because it changed the type while leaving the pin in place. Changing
+   either requires:
+   - Operator explicit approval with dated quote (see §0 Quote 13)
+   - Update to this file
+   - Update to `aws-indices-only-locked-architecture.md` §5
+   - Update to `aws-budget.md`
+   - Ratchet test `crates/storage/tests/instance_type_lock_guard.rs` updated to pin
+     the new type
+   - Update to `deploy/aws/terraform/variables.tf` `instance_type` default +
+     validation, and `availability_zone` if the zone shape changes
+   - Update to `scripts/aws-upgrade-instance.sh` `FROM_TYPE`/`TO_TYPE` defaults
+
+   *(Superseded history below, retained as audit.)*
+
+   ~~**Instance type is t4g.large. PERIOD.**~~ *(2026-08-07, §0 Quote 12 — was
    t4g.medium from 2026-07-15.)* Changing it (back to t4g.medium, to r8g.large,
    etc.) requires:
    - Operator explicit approval with dated quote (see §0 Quote 8)
@@ -386,7 +596,33 @@ the ~$8.31/mo standing waste is cut. Full record: `aws-budget.md`
    - Update to `deploy/aws/terraform/variables.tf` `instance_type` default + validation
    - Update to `scripts/aws-upgrade-instance.sh` `FROM_TYPE` default
 
-2. **Host memory budget for t4g.medium (4 GiB total) — Groww-only runtime (~770-SID universe, 21 TFs):**
+2. **Host memory budget for r8g.xlarge (32 GiB total) — the 13-TF + tick-retention
+   target (~25,000 instruments)** *(2026-08-08, Quote 13 — supersedes the t4g.medium
+   4 GiB budget retained below)*. Sizing Verified against source, not estimated:
+   - Live candle slots: 13 TF × **128 B** (`LiveCandleState` — 11×f64 + 2×u64 + i64
+     + 3×u32 = 124, padded) × 25,000 = **42 MB**. *(At the post-3.1 `TF_COUNT = 24`
+     slot array it is 77 MB — still negligible.)*
+   - Seal ring: 200,000 × ≤144 B (`seal_ring.rs:134` assertion) = **29 MB**
+   - One day of ticks resident: **2.3–7.2 GB** (25–80 M × ~90 B — the tick count is
+     **Assumed**, see Quote 13)
+   - QuestDB: **8–16 GB** (`QDB_MEM_LIMIT` retuned at cutover — the 1g cap was sized
+     for the 4-SID universe and is NOT valid here)
+   - App remainder (indicator state, registry, ILP + audit buffers, tracing): 2–4 GB
+   - OS + FS cache + kernel: 2–4 GB
+   - **Total ~14–31 GB in 32 GiB.** Headroom is real but NOT generous at the top of
+     the tick range.
+   - **The t4g.medium Rule 2 FLAG is RETIRED by this change** — that flag recorded a
+     ~2.5 GB predicted working set that did not fit 4 GiB. It fits 32 GiB.
+   - **NEW FLAG (honest, unmeasured — Rule 11):** the 25–80 M ticks/day figure is
+     **Assumed**; at the top of that range plus a QuestDB that grows past 16 GB, 32
+     GiB gets tight. **The first live session at scale is the measured gate** — read
+     `tv_process_rss_bytes` / RESOURCE-02 and `mem_used_percent`; r8g.2xlarge (64
+     GiB) is the rip-cord. Graviton4 is NOT burstable, so `CPUCreditBalance` no
+     longer applies (the t4g credit-starvation risk retires with the type).
+
+   *(Superseded t4g.medium budget retained as audit.)*
+
+   ~~**Host memory budget for t4g.medium (4 GiB total)**~~ — Groww-only runtime (~770-SID universe, 21 TFs):
    - QuestDB process: ~1.0 GB (`QDB_MEM_LIMIT=1g` — compose default + the on-box `deploy/docker/.env`, retuned by the downsize workflow's SSM step)
    - Tickvault app: ~700 MB actual **(the 2026-05-18 4-SID-universe measurement — NOT a ~770-SID measurement)** / 1.5 GB cap (see the FLAG below for what the retained sizing formula predicts at ~770 SIDs)
    - App: seal ring (200K seal cap, fixed): ~29 MB *(2026-07-18: replaces the deleted tick rescue-ring row — the 100K tick ring + its constant died with the dead tick writer, stage-2/4 sweeps; 200_000 seals × 144 B per `seal_ring.rs`)*
@@ -397,7 +633,25 @@ the ~$8.31/mo standing waste is cut. Full record: `aws-budget.md`
    - **Total used: ~2.3 GB (app at the ~700 MB 4-SID actual) – ~3.1 GB (app at the 1.5 GB cap)** — the rows above sum to ~2.27 GB / ~3.07 GB (arithmetic corrected 2026-07-15; an earlier draft said "~2.6–3.1") *(2026-07-18: the seal-ring row replaced the 10 MB tick-ring row, +~19 MB — inside the ~ rounding, totals unchanged)*
    - **Headroom: ~0.9–1.7 GB** — above the 1 GB Linux kswapd floor only while the app stays at/under its cap. **FLAG (honest, unresolved — Assumed until measured; Rule 11, no false-OK):** the pre-downsize Rule 2 sizing formula this file has always carried (≈3.2 MB × SID for the 21-TF today+yesterday RAM-resident set) predicts an app working set of **~2.5 GB at ~770 SIDs** — with QuestDB at 1g that totals ~4.1 GB (2.5 app + 1.0 QDB + ~0.17 buffers + ~0.4 OS) and does **NOT fit in 4 GiB**. The ~700 MB "actual" and the formula cannot both hold at ~770 SIDs; **the first live session on t4g.medium is the measured gate** — read `tv_process_rss_bytes` / RESOURCE-02 and `mem_used_percent` before AND after cutover; if live RSS is materially above ~1.5 GB, 4 GiB does not fit and t4g.large (8 GiB) is the rip-cord. QuestDB at 1g serving today's ~770-SID Groww write load is likewise re-validated live (the old 1g-class budget served the 4-SID universe). BURSTABLE CPU: watch `CPUCreditBalance` after cutover.
 
-3. **EBS = 30 GB gp3 LIVE (verified 2026-07-19 — the 2026-07-13 approved 30→50 grow was recorded but never physically applied); 20 GB is the pre-staged fresh-volume TARGET** (executor decision 2026-07-15, recorded in §0 under Quote 8 — NOT operator-quoted scope). gp3 grows online but can NEVER shrink: `modify-volume` refuses a smaller size and a larger snapshot cannot restore into a smaller volume (the 30 GB snapshot cannot restore into 20 GB), so 30 → 20 requires a volume/instance REPLACEMENT (terraform terminate-and-recreate in the operator's post-market erase window; the box is fully cattle-provisioned by `user-data.sh.tftpl`; the 2026-07-15 pre-downsize snapshot is the rollback, kept ~1 week; the GitHub secret `EC2_INSTANCE_ID` must be rotated to the new id at recreate time). Terraform `ebs_gp3_size_gb` default = 20 documents FRESH-PROVISION intent only — `root_block_device[0].volume_size` is in the instance `lifecycle.ignore_changes`, so `terraform apply` never touches the live volume. History: 10 GB → 30 GB (2026-05-29 Quote 6) → [50 GB approved 2026-07-13 (disk-pressure grow) — RECORDED but never physically applied; live verified 30 GB by `describe-volumes` 2026-07-19] → 20 GB target (2026-07-15) → **30 GB ACCEPTED (2026-07-19 Quote 9 — the 50 GB grow CANCELLED)**. **FLAGGED FOLLOW-UP (2026-07-19):** the unapplied grow means the 2026-07-13 82%-disk-pressure remediation never landed — applying it (or accepting 30 GB) is an operator/infra decision. *(RESOLVED same day by Quote 9: 30 GB is formally ACCEPTED, the grow is CANCELLED — the disk-pressure class is handled by code retention + S3 archival on the 30 GB root; any future grow needs a fresh dated quote. The 20 GB fresh-volume TARGET stays a separate un-quoted executor pre-stage — going below the accepted 30 needs its own operator go.)* The partition manager keeps auto-archiving partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window.
+3. **EBS = 100 GB gp3 on the fresh volume (2026-08-08, Quote 13 — supersedes the 20 GB
+   fresh-provision target; the LIVE root remains 30 GB until the recreate).** Sized for
+   the 13-TF + tick-retention load: ticks ≈ 44–141 GB/mo (**Assumed** 25–80 M rows/day,
+   swings 3×) + 13 TFs sparse ≈ 61 GB/mo, held ~30 days on disk with S3 archival beyond.
+   Sparsity is Verified — `live_candle_state.rs:105` makes an unopened bucket a sentinel
+   that emits nothing, which is the difference between ~46 M rows/day (2,050/sec, inside
+   the ~5,000/sec envelope) and a dense 808 M rows/day (35,900/sec, 7× over).
+   **100 and NOT 250 deliberately:** gp3 grows online in one command and can NEVER
+   shrink, so the small side is the only reversible direction — if the real tick volume
+   lands high, grow it live. `variables.tf` already permits 10–200 GB, so no validation
+   change is needed. The AZ move forces a snapshot→restore (EBS is zone-locked), and the
+   old volume is retained until explicit operator sign-off. Everything in the superseded
+   text below about gp3's shrink impossibility, the `lifecycle.ignore_changes` on
+   `root_block_device[0].volume_size`, the `EC2_INSTANCE_ID` secret rotation at recreate,
+   and the >90d S3 archival **still applies verbatim**.
+
+   *(Superseded 20 GB target retained as audit.)*
+
+   ~~**EBS = 30 GB gp3 LIVE (verified 2026-07-19 — the 2026-07-13 approved 30→50 grow was recorded but never physically applied); 20 GB is the pre-staged fresh-volume TARGET**~~ (executor decision 2026-07-15, recorded in §0 under Quote 8 — NOT operator-quoted scope). gp3 grows online but can NEVER shrink: `modify-volume` refuses a smaller size and a larger snapshot cannot restore into a smaller volume (the 30 GB snapshot cannot restore into 20 GB), so 30 → 20 requires a volume/instance REPLACEMENT (terraform terminate-and-recreate in the operator's post-market erase window; the box is fully cattle-provisioned by `user-data.sh.tftpl`; the 2026-07-15 pre-downsize snapshot is the rollback, kept ~1 week; the GitHub secret `EC2_INSTANCE_ID` must be rotated to the new id at recreate time). Terraform `ebs_gp3_size_gb` default = 20 documents FRESH-PROVISION intent only — `root_block_device[0].volume_size` is in the instance `lifecycle.ignore_changes`, so `terraform apply` never touches the live volume. History: 10 GB → 30 GB (2026-05-29 Quote 6) → [50 GB approved 2026-07-13 (disk-pressure grow) — RECORDED but never physically applied; live verified 30 GB by `describe-volumes` 2026-07-19] → 20 GB target (2026-07-15) → **30 GB ACCEPTED (2026-07-19 Quote 9 — the 50 GB grow CANCELLED)**. **FLAGGED FOLLOW-UP (2026-07-19):** the unapplied grow means the 2026-07-13 82%-disk-pressure remediation never landed — applying it (or accepting 30 GB) is an operator/infra decision. *(RESOLVED same day by Quote 9: 30 GB is formally ACCEPTED, the grow is CANCELLED — the disk-pressure class is handled by code retention + S3 archival on the 30 GB root; any future grow needs a fresh dated quote. The 20 GB fresh-volume TARGET stays a separate un-quoted executor pre-stage — going below the accepted 30 needs its own operator go.)* The partition manager keeps auto-archiving partitions >90d to the S3 cold bucket (~4× cheaper per GB than EBS), so EBS holds only the hot window.
 
 4. **No paid AWS services** (RDS, ElastiCache, NAT Gateway, ALB) without budget review.
 
@@ -668,6 +922,72 @@ used to reach a slot is corrected.
 `operator_boundary_indicator_strategy_guard.rs` is regenerated for the
 post-repair tree. The guard stays ACTIVE — any further frozen-area edit beyond
 this recorded lift fails the build again and needs its own fresh dated quote.
+
+### §28.3 — NARROW LIFT for the STRATEGY-EVALUATOR slot repair (operator-approved 2026-08-07)
+
+**The verbatim operator authorization (2026-08-07, typed directly in-session):**
+
+> "fi everyhtugn dude oaky?"
+
+Given in DIRECT response to a message that named exactly three fixes and asked the
+operator to pick — quote: *"Say **\"fix the clock\"**, or **\"do 1 and 2\"**"* — with
+the third row of that table reading **"fix the strategy" — brain offline**. The
+operator answered "fix everything", which selects all three including this one. Same
+authorization shape as the §28.2 quote ("go ahead and fix and implement eveuthign dude
+okay>"), and recorded here BEFORE any code change, per this file's own protocol.
+
+**The defect this lift repairs (Verified, 6-agent audit 2026-08-07, re-verified in
+source by the executor before writing this).** §28.2 repaired `IndicatorEngine` — but
+it explicitly scoped itself to the engine and stated "NO strategy FSM logic changes".
+The strategy evaluator one stage downstream carries the **identical unrepaired cast**:
+
+```rust
+// crates/trading/src/strategy/evaluator.rs:52
+let sid = snapshot.security_id as usize;
+if sid >= self.states.len() || !snapshot.is_warm {   // states.len() == 25_000
+    return Signal::Hold;
+}
+```
+
+`engine.rs:406` populates the snapshot with `security_id: tick.security_id` — the RAW
+banded id, NOT the dense slot the engine just resolved for its own use. Live ids are
+namespace-banded (Groww `[2^62,2^63)`, GDF `[2^60,2^62)`, TrueData `[2^59,2^60)`), all
+astronomically `>= 25_000`. So `evaluate()` returns `Signal::Hold` for **every live
+instrument, permanently, with no error, no counter and no log line** — the exact silent
+no-op signature §28.2 was written to eliminate, surviving one stage downstream.
+
+Net effect after §28.2 alone: indicators compute **correctly** and the strategy
+**discards every one of them**. Runtime-dead today (the trading pipeline spawns only
+under `dhan_enabled || groww_enabled`, both retired), exactly as the engine defect was
+— and, like it, a silent catastrophe the moment strategies go live. Unlike the engine
+defect it is **not** covered by the §28.2 fail-closed counter
+(`tv_indicator_slot_exhausted_total`), because the evaluator never reaches the engine's
+allocator at all.
+
+**Scope of THIS lift (narrow, mechanical):** ONLY the id→slot mapping used by the
+evaluator may change. The engine's already-resolved dense slot is carried on
+`IndicatorSnapshot` as a NEW field and the evaluator indexes by that. `security_id`
+keeps carrying the real banded id for every downstream consumer that legitimately needs
+it (audit rows, logs, persistence, cross-feed joins) — it is NOT repurposed.
+**NO indicator math changes. NO strategy FSM transition logic changes. No
+`IndicatorState` or FSM state-machine field changes.** Every condition evaluation and
+every transition stays byte-for-byte identical; only the index used to reach a slot is
+corrected.
+
+**Still NOT remediated by this lift (recorded honestly, not silently carried):**
+- **C1 warmup gate** — unchanged, still TRACKED.
+- **I-P1-11 composite key** — the evaluator, like the engine, keys on `security_id`
+  alone with no `ExchangeSegment`. Cross-FEED collision is structurally impossible
+  (disjoint bands), but two instruments sharing a numeric id across SEGMENTS within one
+  feed would still share a slot. Fixing that needs a signature cascade and its own
+  dated quote.
+- **NaN in `high`/`low`/`open` during REST warmup** poisons indicator state permanently
+  (only `close` is guarded) — deliberately NOT taken in this lift.
+
+**Re-bless:** the `BOUNDARY_FILES` manifest in
+`operator_boundary_indicator_strategy_guard.rs` is regenerated for the post-repair
+tree. The guard stays ACTIVE — any further frozen-area edit beyond this recorded lift
+fails the build again and needs its own fresh dated quote.
 
 ---
 

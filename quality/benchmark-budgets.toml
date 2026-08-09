@@ -18,7 +18,13 @@ max_regression_pct = 5.0
 # as lowercased with / replaced by _. See scripts/bench-gate.sh for matching logic.
 dispatch_frame           = 10           # <10ns  — matches dispatch_frame/ticker, dispatch_frame/quote
 pipeline                 = 100          # <100ns per tick — matches pipeline/batch_100_mixed, pipeline/burst_100_ticker
-registry_get             = 50           # <50ns  — matches registry/get_hit, registry/get_miss (papaya O(1) lookup)
+# 2026-08-08: comment corrected — this guards a plain `std::HashMap` keyed on the
+# I-P1-11 composite `(security_id, exchange_segment)`, NOT `papaya`. `papaya` is a
+# real workspace dep but is used only in crates/trading (in_mem/day_ohlc_tracker.rs);
+# it was never used by InstrumentRegistry. Budget value UNCHANGED at 50ns, and the
+# Criterion IDs are unchanged — only the methods measured moved to the segment-aware
+# accessors after the id-only ones were deleted.
+registry_get             = 50           # <50ns  — matches registry/get_hit, registry/get_miss (HashMap O(1) composite lookup)
 token_handle             = 50           # <50ns  — matches token_handle/load (arc-swap hot-path read)
 # f32_to_f64_clean budget removed in the stage-2 dead-WS sweep (2026-07-17):
 # its Criterion bench lived in the deleted crates/storage/benches/

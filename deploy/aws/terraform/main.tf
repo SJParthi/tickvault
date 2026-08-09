@@ -28,7 +28,9 @@
 #   - SSM parameters for Dhan credentials, Telegram tokens, QuestDB creds,
 #     instance lock (dual-instance prevention — see crates/core/src/instance_lock.rs)
 #   - SNS topic for CRITICAL alerts → 4-channel fan-out (SMS+Telegram+Email+Connect)
-#   - EventBridge rules for daily 08:30 IST start / 16:30 IST stop (Mon-Fri
+#   - EventBridge rules for daily 08:30 IST start / 17:30 IST stop (Mon-Fri;
+#     stop moved 16:30 -> 17:30 on 2026-08-08 per operator Quote 14 — the 9-hour
+#     window. The START is unchanged, which is why no morning schedule moved.)
 #     trading weekdays only per operator lock 2026-05-29 §7 Quote 5; weekends +
 #     NSE holidays = OFF unless the operator manually starts the instance)
 #   - CloudWatch log group + metric alarms (5 core infrastructure signals)
@@ -71,19 +73,40 @@ resource "aws_internet_gateway" "dlt" {
   }
 }
 
+# MULTI-AZ (2026-08-08, operator Quote 13 — daily-universe-scope-expansion §7).
+#
+# This used to be ONE subnet hardcoded to `${var.aws_region}a`, and that single
+# line is what kept the box dark 2026-08-06 -> 2026-08-08: ap-south-1a ran out of
+# capacity, and because a stopped instance can only restart in its own AZ, every
+# start attempt returned InsufficientInstanceCapacity. The 2026-08-07 attempt to
+# escape by changing the INSTANCE TYPE (t4g.medium -> t4g.large, workflow run
+# 31148235540) was refused for the SAME reason and rolled back — which is the
+# proof that the constraint was the ZONE, not the size.
+#
+# `describe-instance-type-offerings` (run live 2026-08-08) confirms all 7 candidate
+# types are offered in all three ap-south-1 AZs, so a subnet per AZ + a variable
+# turns a multi-day outage into a one-variable re-apply.
+#
+# A subnet is free; there is no cost to holding all three.
+#
+# DO NOT collapse this back to a single AZ — that is a REJECT per §7 Mechanical
+# Rule 1, independent of any instance-type change.
 resource "aws_subnet" "public" {
+  for_each = toset(["a", "b", "c"])
+
   vpc_id            = aws_vpc.dlt.id
-  cidr_block        = "10.42.1.0/24"
-  availability_zone = "${var.aws_region}a"
-  # Auto-assign a public IP on launch so the instance is reachable for
-  # the data-pull window WITHOUT a static EIP (var.enable_eip = false,
-  # operator lock 2026-05-29 §7 Quote 5 — no orders, no Dhan static-IP
-  # need). When enable_eip flips true for live trading, the EIP overrides
-  # this with a stable address.
+  cidr_block        = "10.42.${index(["a", "b", "c"], each.key) + 1}.0/24"
+  availability_zone = "${var.aws_region}${each.key}"
+
+  # Auto-assign a public IP on launch so a FRESH instance is reachable without a
+  # static EIP. Note this is a LAUNCH-TIME ENI attribute: it applies to newly
+  # launched instances only, which is why the 2026-07-19 finding (the live ENI can
+  # never mint an ephemeral IP after a stop/modify/start) does not contradict it —
+  # and why an EIP release is only safe bundled with a recreate.
   map_public_ip_on_launch = true
 
   tags = {
-    Name = "tv-${var.environment}-public-a"
+    Name = "tv-${var.environment}-public-${each.key}"
   }
 }
 
@@ -100,8 +123,12 @@ resource "aws_route_table" "public" {
   }
 }
 
+# One association per AZ subnet (2026-08-08 multi-AZ, Quote 13). All three
+# share the single public route table — the IGW route is identical per AZ.
 resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
+  for_each = aws_subnet.public
+
+  subnet_id      = each.value.id
   route_table_id = aws_route_table.public.id
 }
 
@@ -196,6 +223,20 @@ resource "aws_iam_role_policy" "tv_instance" {
         Action = [
           "ssm:GetParameter",
           "ssm:GetParameters",
+          # PutParameter is load-bearing for TWO things — do not narrow it
+          # without checking both:
+          #   1. the dual-instance lock (`crates/core/src/instance_lock.rs`);
+          #   2. the Dhan access-token publish (operator 2026-08-08,
+          #      `crates/core/src/auth/dhan_token_publisher.rs`) — tickvault is
+          #      the sole Dhan minter and publishes the token to
+          #      /tickvault/<env>/dhan/access-token so peer consumers READ it
+          #      instead of minting. Dhan allows ONE active token per account,
+          #      so a second minter would invalidate ours and start a re-mint
+          #      war. Contract: groww-shared-token-minter-2026-07-02.md §9.
+          # No extra KMS grant is needed for that param: it is written as a
+          # SecureString under the DEFAULT aws/ssm key. (The kms:Decrypt
+          # statement below is specific to the Groww param, which uses the
+          # customer-managed alias/tickvault-groww CMK owned by bruteX.)
           "ssm:PutParameter",
           # DeleteParameter needed for graceful release of the
           # dual-instance lock at shutdown — see PR #764
@@ -334,7 +375,12 @@ resource "aws_iam_role_policy_attachment" "tv_instance_ssm_core" {
 resource "aws_instance" "tv_app" {
   ami                    = var.ami_id
   instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public.id
+  # 2026-08-08 (Quote 13): the zone is now a VARIABLE, not a hardcoded "a".
+  # Changing var.availability_zone re-places the instance in a zone that HAS
+  # capacity — the whole point of the multi-AZ change. Note this forces a
+  # REPLACEMENT (an instance cannot move zones), which is expected and is why
+  # the migration is snapshot-based; see the plan's Phase 2.
+  subnet_id              = aws_subnet.public[var.availability_zone].id
   vpc_security_group_ids = [aws_security_group.tv_app.id]
   key_name               = var.key_name
   iam_instance_profile   = aws_iam_instance_profile.tv_instance.name
@@ -467,7 +513,7 @@ resource "aws_cloudwatch_log_group" "tv_app" {
 #
 # IST offset is UTC+5:30, so:
 #   Weekday start 08:30 IST = 03:00 UTC (Mon-Fri)
-#   Weekday stop  16:30 IST = 11:00 UTC (Mon-Fri)
+#   Weekday stop  17:30 IST = 12:00 UTC (Mon-Fri)  [2026-08-08 Quote 14]
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_event_rule" "daily_start" {
@@ -481,10 +527,25 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
   state = "ENABLED"
 }
 
+# 2026-08-08 (operator Quote 14): stop moved 16:30 -> 17:30 IST for the 9-hour
+# window (08:30-17:30). 12:00 UTC = 17:30 IST.
+#
+# The START is deliberately UNCHANGED at 08:30. That is what makes this change
+# cheap: five Lambda/alarm schedules are timed as offsets from the 08:30 start
+# (start-watchdog arm + retry, market-open-readiness, boot-heartbeat window
+# open, deploy-watchdog) and every one of them stays correct. Only the two
+# stop-side schedules move.
+#
+# KEEP IN LOCKSTEP (each force-stops or false-alarms if it disagrees):
+#   - start-watchdog-lambda.tf stop_check cron -> 17:45 IST
+#   - start_watchdog.rs STOP_TRIGGER_UTC_HOUR = 12
+#   - start_watchdog.rs OPERATING_CLOSE_IST_MINUTES = 17*60+30 (curfew)
+#   - hard_stop_guard.rs in_up_window upper bound = 1730
+# Pinned by crates/aws-lambdas/tests/stop_window_lockstep_guard.rs.
 resource "aws_cloudwatch_event_rule" "daily_stop" {
   name                = "tv-${var.environment}-daily-stop"
-  description         = "Stop tickvault instance at 16:30 IST on trading weekdays (Mon-Fri)"
-  schedule_expression = "cron(0 11 ? * MON-FRI *)"
+  description         = "Stop tickvault instance at 17:30 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(0 12 ? * MON-FRI *)"
 }
 
 # ---------------------------------------------------------------------------

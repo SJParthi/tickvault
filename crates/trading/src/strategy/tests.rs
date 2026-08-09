@@ -40,6 +40,11 @@ fn test_strategy() -> StrategyDefinition {
 fn make_snapshot(security_id: u64, rsi: f64, ltp: f64, atr: f64) -> IndicatorSnapshot {
     IndicatorSnapshot {
         security_id,
+        // §28.3: these fixtures use small ids, so mirroring id -> slot keeps
+        // every pre-existing test's semantics exactly.
+        // APPROVED: fixture ids are small and fit u32 by construction.
+        #[allow(clippy::cast_possible_truncation)]
+        slot: security_id as u32,
         rsi,
         last_traded_price: ltp,
         atr,
@@ -504,11 +509,11 @@ fn strategy_state_default_is_idle() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn out_of_bounds_sid_holds() {
+fn out_of_bounds_slot_holds() {
     let def = test_strategy();
     let mut instance = StrategyInstance::new(def, 5);
 
-    let snap = make_snapshot(100, 25.0, 100.0, 5.0); // sid=100, max=5
+    let snap = make_snapshot(100, 25.0, 100.0, 5.0); // slot=100, max=5
     let signal = instance.evaluate(&snap);
     assert_eq!(signal, Signal::Hold);
 }

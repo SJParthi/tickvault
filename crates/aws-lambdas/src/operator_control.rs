@@ -14,7 +14,7 @@
 //!
 //! SECURITY MODEL (deliberately strict — this can stop a live trading box):
 //! * Destructive box actions (stop/reboot/restart-app/stop-app) are blocked
-//!   during market hours (09:15-15:30 IST Mon-Fri) unless `{"force": true}`.
+//!   during market hours (09:15-15:40 IST Mon-Fri) unless `{"force": true}`.
 //! * DATA-DESTRUCTIVE actions (wipe-questdb/docker-reset/docker-nuke-bare)
 //!   are HARD-LOCKED during market hours — refused with 409 even with
 //!   `{"force": true}` (operator incident 2026-07-02 15:05 IST).
@@ -57,13 +57,27 @@ pub const DATA_DESTRUCTIVE: [&str; 3] = ["wipe-questdb", "docker-reset", "docker
 
 /// legacy: handler.py:125-129 (`_DATA_DESTRUCTIVE_LOCK_MSG`) — verbatim.
 pub const DATA_DESTRUCTIVE_LOCK_MSG: &str = "Data-destructive actions are locked during market hours \
-(09:15-15:30 IST) — a mid-market wipe destroys data that can never \
-be re-fetched. Run after 15:30.";
+(09:15-15:40 IST) — a mid-market wipe destroys data that can never \
+be re-fetched. Run after 15:40.";
 
 /// legacy: `_MKT_OPEN_SECS = 9 * 3600 + 15 * 60` (09:15 IST, seconds-of-day).
 pub const MKT_OPEN_SECS: u32 = 9 * 3600 + 15 * 60;
-/// legacy: `_MKT_CLOSE_SECS = 15 * 3600 + 30 * 60` (15:30 IST, seconds-of-day).
-pub const MKT_CLOSE_SECS: u32 = 15 * 3600 + 30 * 60;
+/// Market close, 15:40 IST (seconds-of-day). Legacy oracle value was
+/// `15 * 3600 + 30 * 60` (15:30).
+///
+/// 2026-08-07: moved 15:30 -> 15:40 to follow the NSE Closing Auction change
+/// of 2026-08-03 (canonical: `tickvault_common::constants::MARKET_CLOSE_IST_NANOS`).
+/// While it read 15:30, `is_market_hours` reported FALSE during the closing
+/// auction, so operator/infra actions gated on "outside market hours" could
+/// run against a live session.
+///
+/// NOTE: unlike the in-workspace sites fixed alongside this one, there is NO
+/// `const _: () = assert!(…)` drift-pin here — `aws-lambdas` deliberately does
+/// not depend on `tickvault-common` (keeping the lambda binaries small), so
+/// the canonical constant is not in scope. This value is therefore pinned by
+/// TEST only (`market_close_matches_canonical_ist_close`), not by the
+/// compiler. Stated plainly rather than implied.
+pub const MKT_CLOSE_SECS: u32 = 15 * 3600 + 40 * 60;
 /// legacy: `_IST_OFFSET_SECS = 19800  # +05:30`.
 pub const IST_OFFSET_SECS: i64 = 19_800;
 
@@ -129,7 +143,7 @@ pub const QDB_LINK_TTL_SECS: i64 = 90;
 // ------------------------------------------------------------- pure functions
 
 /// legacy: `_is_market_hours` (handler.py:193-199) — true during NSE market
-/// hours (Mon-Fri 09:15-15:30 IST). Fixed UTC+5:30 offset exactly like the
+/// hours (Mon-Fri 09:15-15:40 IST). Fixed UTC+5:30 offset exactly like the
 /// oracle (India has no DST).
 pub fn is_market_hours(now_utc: DateTime<Utc>) -> bool {
     let ist = now_utc + TimeDelta::seconds(IST_OFFSET_SECS);
@@ -1099,7 +1113,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         return resp(
             409,
             &json!({
-                "error": "blocked during market hours (09:15-15:30 IST). Re-send with {\"force\": true} to override.",
+                "error": "blocked during market hours (09:15-15:40 IST). Re-send with {\"force\": true} to override.",
                 "action": action,
             }),
         );
@@ -1902,6 +1916,33 @@ mod tests {
     }
 
     // ------------------------------------------------- class MarketHoursGuard
+
+    /// 2026-08-07 drift pin. `aws-lambdas` deliberately does NOT depend on
+    /// `tickvault-common` (lambda binary size), so `MARKET_CLOSE_IST_NANOS` is
+    /// out of scope for a `const _: () = assert!(…)`. This test is therefore
+    /// the ONLY thing pinning this boundary — it is checked by TEST, not by
+    /// the compiler, and that difference is stated plainly rather than implied.
+    ///
+    /// If the canonical NSE close moves again, this test must move with it.
+    #[test]
+    fn market_close_matches_canonical_ist_close() {
+        // MARKET_CLOSE_IST_NANOS == 56_400_000_000_000 (15:40 IST) since the
+        // NSE Closing Auction change of 2026-08-03.
+        assert_eq!(
+            MKT_CLOSE_SECS, 56_400,
+            "operator-control market close drifted from the canonical NSE close"
+        );
+        assert_eq!(MKT_OPEN_SECS, 33_300, "market open drifted");
+    }
+
+    #[test]
+    fn test_closing_auction_window_is_market_hours() {
+        // 15:35 IST Mon == 10:05 UTC Mon — inside the closing auction, which
+        // read as CLOSED while MKT_CLOSE_SECS was stale at 15:30.
+        let utc = Utc.with_ymd_and_hms(2026, 6, 1, 10, 5, 0).unwrap();
+        assert!(is_market_hours(utc));
+    }
+
     #[test]
     fn test_inside_window_monday_1100_ist_is_market_hours() {
         // 11:00 IST Mon == 05:30 UTC Mon.
@@ -2346,17 +2387,37 @@ mod tests {
 
     // ----------------------------------------- CONSOLE_HTML identity ratchet
     #[test]
-    fn console_html_is_byte_identical_to_legacy_pre_footer_template() {
-        // Golden sha256 of the RAW pre-footer legacy `_console_html()`
-        // template, captured by RUNNING the oracle before the legacy source
-        // was deleted in this PR (`sha256(handler._console_html())`). The
-        // footer is injected at request time via `replacen("</body>", …)` in
-        // BOTH implementations, so the stored template must be byte-equal.
+    fn console_html_content_pin() {
+        // ORIGINAL PURPOSE (unchanged in spirit): this pinned the RAW
+        // pre-footer legacy `_console_html()` template byte-for-byte, so the
+        // port could be proven not to have drifted during migration. That
+        // golden was
+        // `7edc78757c33cf3cd3f17971dd47648b50fbb151ae1a947da2cd06d3a6f430ce`.
+        //
+        // 2026-08-07: FIRST INTENTIONAL DIVERGENCE from the legacy template.
+        // The danger-zone label read "Locked until 3:30 PM IST" — factually
+        // WRONG after the NSE Closing Auction change of 2026-08-03 moved the
+        // close to 15:40. The destructive-action lock now genuinely holds
+        // until 15:40, so the old label told the operator the lock lifts ten
+        // minutes before it does — an operator-facing false signal in exactly
+        // the class this repo's guards exist to eliminate. Correcting it is
+        // worth more than byte-identity with a retired template.
+        //
+        // 2026-08-08: SECOND intentional divergence (operator Quote 14). The
+        // stopped-box banner read "auto-stops 16:30 IST" — factually wrong once
+        // the 9-hour window moved the stop to 17:30. Same class as the 2026-08-07
+        // correction above: an operator-facing time that lies by an hour. Note
+        // the ratchet caught this edit, which is exactly its job — the banner is
+        // the operator's only in-console statement of when the box goes down.
+        //
+        // The pin REMAINS a content ratchet — any further unreviewed edit to
+        // the console HTML still fails the build; it simply no longer claims
+        // legacy-byte-identity.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "7edc78757c33cf3cd3f17971dd47648b50fbb151ae1a947da2cd06d3a6f430ce"
+            "a0310d91329bd0c926261f79e907b9f35169a9234d791b09265d14f117636825"
         );
         assert_eq!(CONSOLE_HTML.len(), 45_612);
     }
@@ -3043,7 +3104,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_reset_blocked_during_market_hours_without_force() {
-        // 09:15-15:30 IST guard: with the correct confirm phrase but no force,
+        // 09:15-15:40 IST guard: with the correct confirm phrase but no force,
         // the nuke is 409-blocked while the market is open.
         let shell = MockShell {
             market_hours: true,
@@ -3757,7 +3818,7 @@ data-pull phase, so the system is never blinded mid-trade";
             let err = body["error"].as_str().unwrap();
             assert!(err.contains("locked during market hours"));
             assert!(err.contains("never be re-fetched"));
-            assert!(err.contains("Run after 15:30"));
+            assert!(err.contains("Run after 15:40"));
         }
     }
 
@@ -3820,13 +3881,18 @@ data-pull phase, so the system is never blinded mid-trade";
 
     #[test]
     fn test_boundary_minutes_pin_exact_semantics() {
-        // Pinned lock window semantics: 09:15:00 ≤ t < 15:30:00 IST Mon-Fri.
+        // Pinned lock window semantics: 09:15:00 ≤ t < 15:40:00 IST Mon-Fri.
+        // 2026-08-07: upper bound moved 15:30 -> 15:40 with the NSE Closing
+        // Auction change of 2026-08-03. While it read 15:30, the destructive-
+        // action lock LIFTED ten minutes before the market actually closed.
         // 2026-06-01 is a Monday; IST = UTC + 05:30.
         let cases = [
             ((3, 44, 59), false), // 09:14:59 IST — open
             ((3, 45, 0), true),   // 09:15:00 IST — locked
             ((9, 59, 59), true),  // 15:29:59 IST — locked
-            ((10, 0, 0), false),  // 15:30:00 IST — open
+            ((10, 0, 0), true),   // 15:30:00 IST — STILL locked (was open)
+            ((10, 9, 59), true),  // 15:39:59 IST — locked
+            ((10, 10, 0), false), // 15:40:00 IST — open
         ];
         for ((h, m, s), locked) in cases {
             let utc = Utc.with_ymd_and_hms(2026, 6, 1, h, m, s).unwrap();
@@ -3838,7 +3904,7 @@ data-pull phase, so the system is never blinded mid-trade";
     fn test_danger_zone_shows_lock_label_when_market_open() {
         // The label exists, starts hidden, and names the lock honestly.
         assert!(CONSOLE_HTML.contains(r#"id="dangerlock""#));
-        assert!(CONSOLE_HTML.contains("Locked until 3:30 PM IST"));
+        assert!(CONSOLE_HTML.contains("Locked until 3:40 PM IST"));
         assert!(CONSOLE_HTML.contains("even with force"));
         // loadOverview un-hides it from the server's market_hours flag.
         assert!(CONSOLE_HTML.contains("dl.hidden=!j.market_hours"));
@@ -4098,7 +4164,7 @@ data-pull phase, so the system is never blinded mid-trade";
         // One calm banner replaces the per-shield "unreachable" scatter…
         assert!(CONSOLE_HTML.contains(r#"id="stoppedbanner""#));
         assert!(CONSOLE_HTML.contains(
-        "Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start"
+        "Box stopped (auto-stops 17:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start"
     ));
         assert!(CONSOLE_HTML.contains("$('stoppedbanner').hidden=running"));
         // …and the shield greys out as "—" ONLY when the box is not running.

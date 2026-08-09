@@ -632,6 +632,25 @@ pub const SSM_GROWW_SERVICE: &str = "groww";
 /// `crates/common/tests/groww_no_mint_guard.rs`.
 pub const GROWW_ACCESS_TOKEN_SECRET: &str = "access-token";
 
+/// SSM secret name for the **Dhan** access token that tickvault MINTS and
+/// PUBLISHES (`/tickvault/<env>/dhan/access-token`).
+///
+/// Operator directive 2026-08-08
+/// (`.claude/rules/project/groww-shared-token-minter-2026-07-02.md` §9):
+/// Dhan permits exactly ONE active token per account
+/// (`docs/dhan-ref/02-authentication.md:216`), so a second minter on the same
+/// account invalidates tickvault's token and triggers a re-mint war. tickvault
+/// is the SOLE Dhan minter and publishes the token here so peers READ instead
+/// of minting. Mirrors the Groww contract with the roles reversed.
+///
+/// The parameter name was already reserved (unwired) at
+/// `deploy/aws/terraform/variables.tf` `dhan_access_token_ssm_param`.
+///
+/// The write lives in `crates/core/src/auth/dhan_token_publisher.rs` — NEVER in
+/// `secret_manager.rs`, which stays read-only per the build-failing pin
+/// `crates/common/tests/groww_no_mint_guard.rs:129`.
+pub const DHAN_ACCESS_TOKEN_SECRET: &str = "access-token";
+
 /// Groww master instrument CSV (public static asset, no auth). Source of every
 /// Groww `exchange_token` — joined to NTM ISINs to build the watch-list (§31).
 pub const GROWW_INSTRUMENT_CSV_URL: &str =
