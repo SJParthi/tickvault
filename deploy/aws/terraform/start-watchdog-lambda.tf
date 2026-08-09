@@ -219,11 +219,11 @@ resource "aws_lambda_permission" "start_watchdog_check" {
 # 16:45 IST stop-check — added 2026-06-10 after BOTH schedule directions
 # failed silently the same day (start at 08:30, stop at 16:30). Verifies the
 # 16:30 daily_stop actually stopped the box; self-heals (stop) ONLY when the
-# box has been running since before 16:30 — a manual evening start (launch
-# after 16:30) is the operator's deliberate session and is never touched.
+# box has been running since before 17:30 — a manual evening start (launch
+# after 17:30) is the operator's deliberate session and is never touched.
 resource "aws_cloudwatch_event_rule" "start_watchdog_stop_check" {
-  name                = "tv-${var.environment}-start-watchdog-stop-check"
-  description         = "16:45 IST (Mon-Fri) verify the box actually stopped; self-heal + page if not"
+  name        = "tv-${var.environment}-start-watchdog-stop-check"
+  description = "17:45 IST (Mon-Fri) verify the box actually stopped; self-heal + page if not"
   # 2026-08-08 (operator Quote 14): 16:45 -> 17:45 IST, tracking the daily_stop
   # move to 17:30. If this had stayed at 16:45 it would fire 45 min BEFORE the
   # stop and report a false "auto-stop FAILED" every single trading day.
@@ -249,8 +249,8 @@ resource "aws_lambda_permission" "start_watchdog_stop_check" {
 # I started this instance right out of the expected market hours … by mistake
 # if I don't stop manually means it should be auto triggered … manual human
 # error is not acceptable"). Fires every hour; the HANDLER gates itself so it
-# NEVER acts inside 08:00-17:00 IST Mon-Fri (the normal 08:30/16:30 schedule +
-# 16:45 stop_check own that window, unchanged). Outside the window a running
+# NEVER acts inside 08:00-17:30 IST Mon-Fri (the normal 08:30/17:30 schedule +
+# 17:45 stop_check own that window; widened 2026-08-08 with Quote 14). Outside it a running
 # box with no keep-alive override (SSM /tickvault/<env>/keep-alive-until) and
 # past the 45-min launch grace is stopped + Telegram-paged. Cost: 24
 # invokes/day — free tier.

@@ -549,7 +549,7 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
                 sns,
                 env,
                 "17:30 auto-stop FAILED — box still running",
-                "🆘 The 4:30 PM IST auto-stop did NOT stop the box and I could \
+                "🆘 The 5:30 PM IST auto-stop did NOT stop the box and I could \
 not read its launch time, so I won't risk killing a manual \
 session. If you are NOT using it right now, press \
 'Stop instance' on the portal — it bills every hour it runs.",
@@ -566,12 +566,12 @@ session. If you are NOT using it right now, press \
                 sns,
                 env,
                 "17:30 auto-stop FAILED — watchdog stopped the box itself",
-                "🆘 The 4:30 PM IST auto-stop did NOT stop the box (it had been \
-running since before 4:30 PM). I have sent the stop command \
+                "🆘 The 5:30 PM IST auto-stop did NOT stop the box (it had been \
+running since before 5:30 PM). I have sent the stop command \
 myself. If you WANTED it running this evening, just press \
 'Start instance' on the portal — a box you start manually \
-after 4:30 PM is never auto-stopped. Also investigate why the \
-4:30 PM stop failed: AWS console → Systems Manager → \
+after 5:30 PM is never auto-stopped. Also investigate why the \
+5:30 PM stop failed: AWS console → Systems Manager → \
 Automation executions for AWS-StopEC2Instance.",
             )
             .await?;
@@ -581,7 +581,7 @@ Automation executions for AWS-StopEC2Instance.",
                 env,
                 "17:30 auto-stop FAILED — manual stop NEEDED",
                 &format!(
-                    "🆘 The 4:30 PM IST auto-stop did NOT stop the box — and the \
+                    "🆘 The 5:30 PM IST auto-stop did NOT stop the box — and the \
 watchdog's own stop attempt ALSO failed. Press 'Stop instance' \
 on the portal, or run \
 `aws ec2 stop-instances --instance-ids {} \

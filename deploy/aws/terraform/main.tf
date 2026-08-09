@@ -373,8 +373,8 @@ resource "aws_iam_role_policy_attachment" "tv_instance_ssm_core" {
 # ---------------------------------------------------------------------------
 
 resource "aws_instance" "tv_app" {
-  ami                    = var.ami_id
-  instance_type          = var.instance_type
+  ami           = var.ami_id
+  instance_type = var.instance_type
   # 2026-08-08 (Quote 13): the zone is now a VARIABLE, not a hardcoded "a".
   # Changing var.availability_zone re-places the instance in a zone that HAS
   # capacity — the whole point of the multi-AZ change. Note this forces a
