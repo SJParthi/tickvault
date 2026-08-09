@@ -495,8 +495,36 @@ executing session could NOT verify their current state —
 not repair a broken action; the kill switch may still not fire. Needs a live check
 with budget-action read access before the safety net can be claimed to work.)*
 
-> **Note on instance schedule (2026-08-08, Quote 13) — THE 9-HOUR WINDOW IS
-> APPROVED BUT NOT YET APPLIED; the live schedule is STILL 08:30–16:30 IST.**
+**Quote 14 (2026-08-08, the 9-hour window — preserve EXACTLY, typos included):**
+> "Yes dude make it as 8.30 till 5.30 pm dude okay?  Go ahead ddue oaky"
+
+Operator chose **08:30–17:30 IST** rather than the 08:00–17:00 I had proposed, and
+that choice is what made the change safe. **Keeping the 08:30 START untouched
+sidesteps the entire morning coupling** I had flagged as a blocker: the
+start-watchdog arm + retry, market-open-readiness, the boot-heartbeat window open,
+and the deploy-watchdog are all timed off 08:30 and every one stays correct. Only
+the EVENING edge moves, and the boot-heartbeat false-page-every-morning risk
+disappears entirely.
+
+**APPLIED in the same PR** (four coupled sites, three of which would actively
+FIGHT the schedule if left behind):
+
+| Site | 16:30 → 17:30 | What a partial edit would have done |
+|---|---|---|
+| `main.tf` `daily_stop` cron | `cron(0 11)` → `cron(0 12)` | box stops an hour early |
+| `hard_stop_guard::in_up_window` | `830..=1630` → `830..=1730` | runs HOURLY and **force-stops** any box outside its window ⇒ kills the box at 17:00, pages, silently cancels the paid hour |
+| `start_watchdog::OPERATING_CLOSE_IST_MINUTES` | `17*60` → `17*60+30` | curfew guard **stops the box 30 min early** |
+| `start_watchdog::STOP_TRIGGER_UTC_HOUR` + stop-verify cron | `11`→`12`, `cron(15 11)`→`cron(15 12)` (17:45 IST) | verify fires 45 min BEFORE the stop ⇒ false "auto-stop FAILED" page **every trading day** |
+
+Plus the two operator-facing strings (console banner + offline message) and 5
+existing tests whose boundaries encoded 16:30. Pinned by
+`crates/aws-lambdas/tests/stop_window_lockstep_guard.rs` (6 tests, all three
+force-stop sites bite-tested). Billing basis moves ~176 → **~198 hrs** (22 × 9),
+inside the ~210-hr Quote 13 envelope — so the recorded bill is unchanged.
+
+> **Note on instance schedule (2026-08-08, Quote 13) — SUPERSEDED SAME DAY by
+> Quote 14 above, which APPLIED a 08:30–17:30 window. Retained as the record of
+> why 08:00–17:00 was NOT taken.**
 >
 > The operator approved a weekday **08:00–17:00 IST** (9-hour) window, and the
 > Quote 13 bill is costed at the resulting ~210-hr basis (22 × 9 = 198 hrs + manual
@@ -522,8 +550,10 @@ with budget-action read access before the safety net can be claimed to work.)*
 > which bills LESS, never more — the Quote 13 cost envelope is a ceiling, not an
 > understatement.
 
-> **Note on instance schedule (2026-05-29) — CURRENT LIVE SCHEDULE:** trading WEEKDAYS only
-> (Mon–Fri), **08:30–16:30 IST** auto start/stop.
+> **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08 (Quote 14 → 08:30–17:30).**
+> Trading WEEKDAYS only (Mon–Fri), **08:30–16:30 IST** auto start/stop.
+>
+> **CURRENT LIVE SCHEDULE: 08:30–17:30 IST Mon–Fri** (Quote 14).
 
 > **Note on instance schedule (2026-05-29) — SUPERSEDED 2026-08-08:** trading WEEKDAYS only
 > (Mon–Fri), **08:30–16:30 IST** auto start/stop. Weekends + NSE holidays

@@ -28,7 +28,9 @@
 #   - SSM parameters for Dhan credentials, Telegram tokens, QuestDB creds,
 #     instance lock (dual-instance prevention — see crates/core/src/instance_lock.rs)
 #   - SNS topic for CRITICAL alerts → 4-channel fan-out (SMS+Telegram+Email+Connect)
-#   - EventBridge rules for daily 08:30 IST start / 16:30 IST stop (Mon-Fri
+#   - EventBridge rules for daily 08:30 IST start / 17:30 IST stop (Mon-Fri;
+#     stop moved 16:30 -> 17:30 on 2026-08-08 per operator Quote 14 — the 9-hour
+#     window. The START is unchanged, which is why no morning schedule moved.)
 #     trading weekdays only per operator lock 2026-05-29 §7 Quote 5; weekends +
 #     NSE holidays = OFF unless the operator manually starts the instance)
 #   - CloudWatch log group + metric alarms (5 core infrastructure signals)
@@ -511,7 +513,7 @@ resource "aws_cloudwatch_log_group" "tv_app" {
 #
 # IST offset is UTC+5:30, so:
 #   Weekday start 08:30 IST = 03:00 UTC (Mon-Fri)
-#   Weekday stop  16:30 IST = 11:00 UTC (Mon-Fri)
+#   Weekday stop  17:30 IST = 12:00 UTC (Mon-Fri)  [2026-08-08 Quote 14]
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_event_rule" "daily_start" {
@@ -525,10 +527,25 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
   state = "ENABLED"
 }
 
+# 2026-08-08 (operator Quote 14): stop moved 16:30 -> 17:30 IST for the 9-hour
+# window (08:30-17:30). 12:00 UTC = 17:30 IST.
+#
+# The START is deliberately UNCHANGED at 08:30. That is what makes this change
+# cheap: five Lambda/alarm schedules are timed as offsets from the 08:30 start
+# (start-watchdog arm + retry, market-open-readiness, boot-heartbeat window
+# open, deploy-watchdog) and every one of them stays correct. Only the two
+# stop-side schedules move.
+#
+# KEEP IN LOCKSTEP (each force-stops or false-alarms if it disagrees):
+#   - start-watchdog-lambda.tf stop_check cron -> 17:45 IST
+#   - start_watchdog.rs STOP_TRIGGER_UTC_HOUR = 12
+#   - start_watchdog.rs OPERATING_CLOSE_IST_MINUTES = 17*60+30 (curfew)
+#   - hard_stop_guard.rs in_up_window upper bound = 1730
+# Pinned by crates/aws-lambdas/tests/stop_window_lockstep_guard.rs.
 resource "aws_cloudwatch_event_rule" "daily_stop" {
   name                = "tv-${var.environment}-daily-stop"
-  description         = "Stop tickvault instance at 16:30 IST on trading weekdays (Mon-Fri)"
-  schedule_expression = "cron(0 11 ? * MON-FRI *)"
+  description         = "Stop tickvault instance at 17:30 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(0 12 ? * MON-FRI *)"
 }
 
 # ---------------------------------------------------------------------------

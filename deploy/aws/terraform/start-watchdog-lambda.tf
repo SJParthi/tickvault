@@ -224,7 +224,10 @@ resource "aws_lambda_permission" "start_watchdog_check" {
 resource "aws_cloudwatch_event_rule" "start_watchdog_stop_check" {
   name                = "tv-${var.environment}-start-watchdog-stop-check"
   description         = "16:45 IST (Mon-Fri) verify the box actually stopped; self-heal + page if not"
-  schedule_expression = "cron(15 11 ? * MON-FRI *)"
+  # 2026-08-08 (operator Quote 14): 16:45 -> 17:45 IST, tracking the daily_stop
+  # move to 17:30. If this had stayed at 16:45 it would fire 45 min BEFORE the
+  # stop and report a false "auto-stop FAILED" every single trading day.
+  schedule_expression = "cron(15 12 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_target" "start_watchdog_stop_check" {

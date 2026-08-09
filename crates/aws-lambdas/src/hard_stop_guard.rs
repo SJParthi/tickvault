@@ -4,7 +4,7 @@
 //! Hourly EventBridge cron; the budget/schedule never-cross safety net:
 //!
 //! * Instance already stopped/stopping -> no-op.
-//! * Running OUTSIDE the Mon-Fri 08:30-16:30 IST up-window -> force stop +
+//! * Running OUTSIDE the Mon-Fri 08:30-17:30 IST up-window -> force stop +
 //!   Telegram (the legacy never-cross guard, unchanged).
 //! * Running INSIDE the up-window:
 //!     - MTD spend >= BUDGET_KILL_USD -> stop the instance, DISABLE the
@@ -147,7 +147,14 @@ pub trait SsmApi {
     async fn put_parameter(&self, name: &str, value: &str) -> Result<(), String>;
 }
 
-/// Legacy `in_up_window`: Mon-Fri 08:30-16:30 IST (inclusive both ends).
+/// Mon-Fri 08:30-**17:30** IST (inclusive both ends).
+///
+/// 2026-08-08 (operator Quote 14): the close moved 16:30 -> 17:30 with the
+/// 9-hour trading window. This constant is LOAD-BEARING, not cosmetic: this
+/// guard runs HOURLY and force-stops any box running OUTSIDE the window, so
+/// leaving it at 16:30 while EventBridge stops at 17:30 would have had the
+/// guard kill the box at 17:00 every day and page — silently cancelling the
+/// extra hour the operator paid for.
 /// The guard NEVER stops the box during the window on schedule grounds —
 /// only a budget breach may stop it in-window.
 pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
@@ -156,7 +163,7 @@ pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
         return false;
     }
     let hhmm = ist_now.hour() * 100 + ist_now.minute();
-    (830..=1630).contains(&hhmm)
+    (830..=1730).contains(&hhmm)
 }
 
 /// Legacy `mtd_usd` — best-effort Cost Explorer month-to-date total.
@@ -591,7 +598,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
 _instance_: `{}`\n\
 _was_state_: {state}\n\
 Hourly out-of-window guard found the box running OUTSIDE the\n\
-08:30-16:30 IST Mon-Fri window. EventBridge 16:30 stop (or a\n\
+08:30-17:30 IST Mon-Fri window. EventBridge 17:30 stop (or a\n\
 manual start) left it up. Now stopped to protect the budget.\n",
             env.instance_id
         ),
@@ -790,7 +797,7 @@ mod tests {
             .expect("valid test timestamp")
     }
 
-    // 2026-07-07 is a Tuesday. 04:30 UTC = 10:00 IST (inside 08:30-16:30).
+    // 2026-07-07 is a Tuesday. 04:30 UTC = 10:00 IST (inside 08:30-17:30).
     fn in_window() -> DateTime<Utc> {
         utc(2026, 7, 7, 4, 30)
     }
@@ -1035,10 +1042,15 @@ mod tests {
     }
 
     #[test]
-    fn test_1630_ist_is_in_and_1631_is_out() {
-        // 11:00 UTC = 16:30 IST; 11:01 UTC = 16:31 IST (Tuesday).
+    fn test_1730_ist_is_in_and_1731_is_out() {
+        // 12:00 UTC = 17:30 IST; 12:01 UTC = 17:31 IST (Tuesday).
+        assert!(in_up_window(utc(2026, 7, 7, 12, 0)));
+        assert!(!in_up_window(utc(2026, 7, 7, 12, 1)));
+        // 2026-08-08 (Quote 14) regression pin: the OLD close was 16:30 IST
+        // (11:00 UTC). It must now be INSIDE the window — if this flips back,
+        // the hourly guard force-stops the box an hour before its schedule.
         assert!(in_up_window(utc(2026, 7, 7, 11, 0)));
-        assert!(!in_up_window(utc(2026, 7, 7, 11, 1)));
+        assert!(in_up_window(utc(2026, 7, 7, 11, 1)));
     }
 
     // --- MtdUsd ------------------------------------------------------------

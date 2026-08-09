@@ -80,7 +80,7 @@ pub const PASSTHROUGH_PARAMS: [&str; 7] = [
 pub const STATIC_ALLOWED_PARAMS: [&str; 6] = ["f", "j", "v", "version", "nm", "src"];
 
 /// Legacy `_OFFLINE_MSG` — byte-exact (en dash + em dash included).
-pub const OFFLINE_MSG: &str = "tickvault box is offline (auto-stopped outside 08:30–16:30 IST) — \
+pub const OFFLINE_MSG: &str = "tickvault box is offline (auto-stopped outside 08:30–17:30 IST) — \
                                try during market hours";
 
 // -------------------------------------------------------- legacy semantics

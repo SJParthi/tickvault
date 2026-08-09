@@ -391,13 +391,12 @@ fn instance_lock_2026_07_19_eip_release_ruling_pinned() {
 /// the window back to 08:30-16:30 on 2026-06-05: "make the aws instance start
 /// and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening).
 #[test]
-fn instance_lock_schedule_pinned_to_0830_ist_start() {
+fn instance_lock_schedule_pinned_to_0830_1730_ist_window() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
     assert!(
-        body.contains("CURRENT LIVE SCHEDULE")
-            && (body.contains("08:30–16:30 IST") || body.contains("08:30 IST")),
+        body.contains("CURRENT LIVE SCHEDULE: 08:30–17:30 IST"),
         "rule file §7 must pin 08:30 IST as the CURRENT LIVE schedule. The bare \
          `08:30` substring is NOT enough on its own: the file retains superseded \
          schedule notes that also contain it, so an unqualified assert would pass \
