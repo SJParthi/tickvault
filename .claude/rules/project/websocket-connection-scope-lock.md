@@ -354,6 +354,68 @@ with the two dependabot bumps and the second-scale frame diet. `dry_run` stays t
 `GROWW_ORDER_LIVE_FIRE` stays false; serde defaults stay OFF — capture only, zero
 live orders.
 
+### 2026-08-09 — DHAN LIVE MAIN-FEED WS REVIVAL AUTHORIZED (reverses the 2026-07-13 retirement)
+
+**The verbatim operator demand (2026-08-09, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "do thsi dude opkay? but ensiure to sue oen and onl yRUST O(1) dude okay?C — revive Dhan live WS	r8g.xlarge justified	~₹5,824–7,382	Needs a dated quote reversing your 13 July retirement — and that retirement was because Dhan's live data didn't match its own historical record."
+
+Given in direct response to a presented three-option table in which **Option C** read
+verbatim *"revive Dhan live WS · r8g.xlarge justified · ~₹5,824–7,382 · Needs a dated
+quote reversing your 13 July retirement — and that retirement was because Dhan's live
+data didn't match its own historical record."* The operator selected C, quoting the row
+back including its warning, and added the standing **Rust-O(1)-only** constraint.
+
+**This is the fresh dated quote the §D REJECT row demands.** It authorizes
+re-introducing the Dhan main-feed market-data WebSocket, reversing the 2026-07-13
+retirement (Q1/Q2/Q3 of the "2026-07-13 Amendment" above).
+
+**Why the operator needs it (recorded):** with TrueData explicitly excluded from this
+instance (operator, 2026-08-09: *"as of now dont add or implement anm.y truedata i said
+this isntance is one and onlmy for dhan dude okay?"*) and both Groww and GDF off, the
+Dhan live WS is the **ONLY tick source the account can reach**. Without it there are
+zero ticks, so the 5 second-scale timeframes (1s/5s/10s/15s/30s) of the 13-timeframe
+requirement are unachievable and the r8g.xlarge 32 GiB has nothing to hold. Reviving it
+is what makes the Quote 13 instance sizing coherent.
+
+**⚠ WHAT THIS DOES NOT FIX — the retirement reason is UNADDRESSED (Rule 11, no false-OK).**
+The 2026-07-13 retirement was not arbitrary; §E of this file quantifies it, and reviving
+the lane changes NONE of it because every cause is Dhan-side:
+
+| Measured on 2026-07-06 (776-SID Quote subscription, all trading day) | Value |
+|---|---|
+| Delivery lag (exchange LTT → our receive) | p50 1.38 s · p90 8.50 s · p95 14.93 s · **p99 46.37 s · max 198.69 s** |
+| Groww, SAME host, SAME minutes | **p99 562 ms — ~82× better** (rules out our host/NIC/pipeline) |
+| Silent instruments per minute | **29–67**, gaps 300–978 s, **590 gap events** |
+| Live-vs-historical candle agreement | operator verdict: *"massive major mismatches"* |
+
+The operator has accepted this knowingly by selecting an option whose own text named the
+reason. **The revival must therefore ship the mismatch DETECTION, not a claim that the
+mismatch is gone:** the 15:31 cross-verify (fixed 2026-07-11, PR #1474 — it had been
+BLIND SINCE BIRTH on a nanosecond-vs-microsecond literal bug) must be live from day one,
+and its divergence counts are the honest measure of whether this feed is usable.
+
+**O(1) status (Verified, not assumed):** the Dhan binary parser SURVIVED the July
+deletions in full — `crates/core/src/parser/{header,ticker,quote,full_packet,oi,previous_close,disconnect,dispatcher,market_status,read_helpers}.rs`
+are all present. That is the fixed-offset `from_le_bytes` hot path with its DHAT
+zero-alloc tests, so the O(1) core needs **no rebuild** and the operator's
+Rust-O(1)-only constraint is met by existing, already-gated code.
+
+**What the revival MUST rebuild (all deleted 2026-07-13/17 — Verified by file scan):**
+main-feed connection + reconnect/pool, subscription builder (hardcoded SIDs per Q3 —
+**NOT** the CSV download chain), `MultiTfAggregator` (tick→timeframe), `tick_persistence.rs`
++ `DEDUP_KEY_TICKS` as a **const** (never an inline literal — an inline key evades the
+feed-in-key allowlist guard), the tick-gap detector, and the WAL→ring→spill→DLQ wiring.
+
+**What stays FORBIDDEN even under this revival** (unchanged from §D unless separately
+quoted): the Dhan instrument CSV download/parse chain (Q3 stands — hardcoded SIDs only);
+depth-20 / depth-200 / any additional Dhan WS endpoint; live order fire (`dry_run` stays
+true); the §28 indicator/strategy boundary.
+
+**Companion plan:** `.claude/plans/proposals/2026-08-09-dhan-live-ws-revival.md`
+(DRAFT — implementation may not start until the operator flips it to APPROVED, per the
+design-first wall).
+
 ### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
 
 Operator Parthiban, 2026-07-24 (verbatim quotes preserved in
