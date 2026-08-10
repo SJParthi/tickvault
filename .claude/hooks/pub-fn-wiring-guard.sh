@@ -22,11 +22,29 @@
 set -uo pipefail
 
 REPO_ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
-cd "$REPO_ROOT" || exit 0
+# 2026-08-10: fail CLOSED. `|| exit 0` reported success while having scanned
+# nothing — indistinguishable from a clean run.
+cd "$REPO_ROOT" || { echo "FATAL: cannot cd to $REPO_ROOT — refusing to pass vacuously" >&2; exit 1; }
 
-# Determine scope: pre-commit uses staged diff, pre-push uses pushed range.
+# Determine scope: pre-commit uses the staged diff, pre-push the pushed range,
+# and CI the pull request's own diff.
+#
+# 2026-08-10: the CI branch is NEW. Of the ten local guards, this was the ONLY
+# one with no server-side twin - verified by scanning every workflow - so a
+# gate-skipping push, or any edit made through the web UI, missed it entirely.
+# That is precisely the bypass class the Repo Guards job exists to close
+# (merge-gate-lock section 3 row 6), and this guard is not a ratchet-baseline
+# guard, so nothing prevented it running there.
+#
+# GITHUB_BASE_REF is set only on pull_request events and is checked FIRST,
+# because CI's HEAD~1..HEAD is meaningless there: actions/checkout defaults to
+# depth 1, so HEAD~1 does not exist and the range silently yields nothing - a
+# vacuous pass wearing the shape of a real scan. The CI step deepens the fetch
+# before calling this.
 SCOPE_FILES=""
-if git rev-parse --verify HEAD >/dev/null 2>&1; then
+if [ -n "${GITHUB_BASE_REF:-}" ] && git rev-parse --verify "origin/${GITHUB_BASE_REF}" >/dev/null 2>&1; then
+  SCOPE_FILES=$(git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" -- 'crates/**/*.rs' 2>/dev/null || true)
+elif git rev-parse --verify HEAD >/dev/null 2>&1; then
   if [ -n "$(git diff --cached --name-only -- 'crates/**/*.rs' 2>/dev/null || true)" ]; then
     SCOPE_FILES=$(git diff --cached --name-only -- 'crates/**/*.rs' 2>/dev/null || true)
   else
@@ -43,6 +61,14 @@ if git rev-parse --verify HEAD >/dev/null 2>&1; then
       SCOPE_FILES=$(git diff --name-only HEAD~1..HEAD -- 'crates/**/*.rs' 2>/dev/null || true)
     fi
   fi
+fi
+
+# Under CI on a pull request, an empty scope is only legitimate when the PR
+# genuinely touched no Rust. If the base ref could not be resolved we cannot
+# tell the two apart, so refuse rather than report a pass we did not earn.
+if [ -n "${GITHUB_BASE_REF:-}" ] && ! git rev-parse --verify "origin/${GITHUB_BASE_REF}" >/dev/null 2>&1; then
+  echo "FATAL: GITHUB_BASE_REF=${GITHUB_BASE_REF} is set but origin/${GITHUB_BASE_REF} is not fetched - cannot compute the PR diff, and an empty scan here would be a false pass" >&2
+  exit 1
 fi
 
 if [ -z "$SCOPE_FILES" ]; then

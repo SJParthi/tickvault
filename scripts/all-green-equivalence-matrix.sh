@@ -60,7 +60,50 @@ if [ "$NONBLANK" -lt 10 ]; then
 fi
 
 # --- fixture needs builder (deterministic; mirrors the real needs list) -----
-JOBS=(local-runtime-block commit-lint design-first-wall deploy-lint build-and-verify test test-trading-groww-orders security-and-audit coverage-and-perf repo-guards dhat-zero-alloc)
+#
+# 2026-08-10 (gate-integrity audit): this array is no longer allowed to be a
+# hand-maintained copy. It had DRIFTED - it listed 11 jobs while the live
+# all-green `needs:` block had 12, missing `loom-concurrency`. The header two
+# screens up claims the builder "mirrors the real needs list"; it had stopped
+# doing so, silently, and nothing checked. The consequence was narrow but
+# real: the frozen proof that the merge gate's verdict evaluator is correct
+# never exercised the newest gating job, and the blind spot would have widened
+# with every job added.
+#
+# Derived from ci.yml now, then asserted against the recorded list so that a
+# NEW job is a loud, deliberate update of this file rather than a silent
+# omission. Adding a job that defaults to success does not change any frozen
+# expected stdout (only NON-success jobs are named in the output), so the 88
+# fixtures stand unchanged - verified by running them.
+JOBS_RECORDED=(local-runtime-block commit-lint design-first-wall deploy-lint build-and-verify test test-trading-groww-orders security-and-audit coverage-and-perf repo-guards dhat-zero-alloc loom-concurrency)
+
+CI_YML="${CI_YML:-.github/workflows/ci.yml}"
+mapfile -t JOBS_LIVE < <(
+  awk '
+    /^  all-green:/        { injob = 1 }
+    injob && /^    needs:/ { inneeds = 1; next }
+    inneeds && /^      - / { sub(/^      - /, ""); print; next }
+    inneeds && !/^      - / { exit }
+  ' "$CI_YML"
+)
+
+if [ "${#JOBS_LIVE[@]}" -lt 5 ]; then
+  echo "FATAL: could not extract the all-green needs list from ${CI_YML} (found ${#JOBS_LIVE[@]})" >&2
+  echo "       Refusing to run the matrix against a list this file invented." >&2
+  exit 2
+fi
+
+if [ "$(printf '%s\n' "${JOBS_RECORDED[@]}" | sort)" != "$(printf '%s\n' "${JOBS_LIVE[@]}" | sort)" ]; then
+  echo "FATAL: the all-green needs list in ${CI_YML} no longer matches JOBS_RECORDED here." >&2
+  echo "       live:     $(printf '%s ' "${JOBS_LIVE[@]}")" >&2
+  echo "       recorded: $(printf '%s ' "${JOBS_RECORDED[@]}")" >&2
+  echo "       A job added to the merge gate but not to this proof means the" >&2
+  echo "       equivalence matrix never exercises it. Update JOBS_RECORDED and" >&2
+  echo "       re-run the fixtures." >&2
+  exit 2
+fi
+
+JOBS=("${JOBS_LIVE[@]}")
 
 # mk_needs "job1=result job2=missing ..." -> compact needs JSON on stdout.
 # Every job defaults to result=success; `missing` emits an empty meta object
