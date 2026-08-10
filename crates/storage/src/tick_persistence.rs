@@ -1165,12 +1165,24 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/tick_persistence.rs"),
         )
         .expect("own source");
+        // The needles are ASSEMBLED, never written literally, so that no line
+        // of this detector can match itself.
+        //
+        // A `// SCANNER-SELF` opt-out comment is not sufficient on its own:
+        // it pins the exclusion to a LINE, and rustfmt is free to move code
+        // between lines. That is not hypothetical -- a `cargo fmt --all` run
+        // reflowed the original single-line predicate and separated it from
+        // its marker, so the scanner flagged its own source and the test
+        // failed in CI while passing before the format. Assembling the
+        // needles makes the detector unmatchable by construction, which no
+        // formatter can undo.
+        let needle_f32 = concat!("f", "32");
+        let needle_widen = concat!(" as ", "f64");
         for (idx, line) in src.lines().enumerate() {
             if line.contains("SCANNER-SELF") || line.trim_start().starts_with("//") {
                 continue;
             }
-            if line.contains("f32") && line.contains(" as f64") {
-                // SCANNER-SELF
+            if line.contains(needle_f32) && line.contains(needle_widen) {
                 panic!("line {} widens an f32 with `as f64`: {line}", idx + 1); // SCANNER-SELF
             }
         }
