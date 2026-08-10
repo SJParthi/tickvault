@@ -161,6 +161,42 @@ elif [ "$STATE" = "stopped" ]; then
   fi
   # Nothing else to check on a stopped box.
   STATE="stopped"
+elif [ "$STATE" = "None" ] || [ -z "$STATE" ]; then
+  # 2026-08-10: `describe-instances --instance-ids <id>` on an id that does not
+  # exist returns an EMPTY `Reservations[]`, and `--query ...State.Name` renders
+  # that as the literal string "None". The old message ("state=None (not
+  # running/stopped)") described the SYMPTOM and left the operator to guess the
+  # cause, which is almost always one specific thing: the EC2_INSTANCE_ID
+  # GitHub secret still names an instance that has been replaced.
+  #
+  # This is not hypothetical — it is the live state as of 2026-08-10. The box
+  # was recreated as part of escaping the ap-south-1a capacity outage, and
+  # daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 3 warns
+  # explicitly: "the GitHub secret EC2_INSTANCE_ID must be rotated to the new
+  # id at recreate time". It was not.
+  #
+  # Why this matters beyond autopilot: deploy-aws.yml reads the same secret in
+  # 11 places to target SSM, so while it is stale NO DEPLOY CAN REACH THE BOX
+  # and prod silently keeps running whatever binary it launched with. Autopilot
+  # is the only lane that reports it, so it must report it in full.
+  #
+  # Resolve the live instance by its Name tag so the message can hand the
+  # operator the exact value to paste. Best-effort: a lookup failure must not
+  # replace the diagnosis with a shell error.
+  LIVE_ID=$(aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:Name,Values=tv-${ENVIRONMENT}-app" \
+              "Name=instance-state-name,Values=running,stopped,stopping,starting" \
+    --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "")
+  if [ -n "$LIVE_ID" ] && [ "$LIVE_ID" != "None" ]; then
+    note_issue "EC2_INSTANCE_ID secret is STALE — it names an instance that no longer exists. \
+The live tv-${ENVIRONMENT}-app instance is ${LIVE_ID}. Rotate the GitHub secret EC2_INSTANCE_ID \
+to ${LIVE_ID} (Settings > Secrets and variables > Actions). Until then deploy-aws.yml cannot \
+reach the box and prod keeps running its launch-time binary."
+  else
+    note_issue "EC2 instance state=$STATE — the id in EC2_INSTANCE_ID does not exist, and no \
+tv-${ENVIRONMENT}-app instance was found to suggest as its replacement. Check the region and \
+whether the box was terminated without being recreated."
+  fi
 else
   note_issue "EC2 instance state=$STATE (not running/stopped)"
 fi
