@@ -13,7 +13,8 @@
 > | 5 | Pin the mutable action tags | ✅ **DONE** (3 of 4 pinned; the 4th is a different major with no verified SHA and is flagged in-file rather than guessed) |
 > | 6 | Correct 3 stale claims in the master doc (2 O(1) entries + frontend-retired) | ✅ **DONE + guard re-verified** |
 > | 7 | Close the second auto-merge arming path that never reads All Green | ✅ **DONE + bite-tested 6 cases** |
-> | 8 | Tighten the over-broad secret-scanner line exclusion | ⬜ TODO |
+> | 8 | Tighten the over-broad secret-scanner line exclusion | ✅ **DONE + bite-tested 7 cases, 0 false positives on 400 real files** |
+> | **0** | 🔴 **`live_feed_purity_guard` is VACUOUS ON DISK RIGHT NOW** — see §4c | ⬛ **TOP PRIORITY, needs a decision** |
 > | 9 | **OPERATOR DECISION** — are 18 CI JavaScript blocks, 1 Perl gate and 94 shell scripts in scope for "Rust only"? | ⬛ BLOCKED on operator |
 > | 10 | Vacuous-guard sweep across ALL `*_guard.rs` (its agent never launched) | ⬜ TODO |
 >
@@ -308,6 +309,74 @@ into a run block) and no `permissions: write-all` anywhere in `.github/workflows
   `mock`/`stub`/`fixture`/`dummy` **anywhere** is excluded, so a real token on a
   line carrying a trailing "stub for tests" comment passes both the local
   scanner and the CI lane that reuses the same script.
+
+## §4c. 🔴 A guard that is GREEN while enforcing NOTHING — today, on disk
+
+A dedicated vacuity sweep examined **162 guard files**. The denominator matters:
+**138** assert against explicitly-named single files and are structurally sound
+(a missing file fails the read). **24** walk a corpus. Of those 24: **5 sound**,
+**12 vacuity-prone**, and **1 CONFIRMED VACUOUS RIGHT NOW**.
+
+### The confirmed one: `crates/storage/tests/live_feed_purity_guard.rs` [V]
+
+All three of its scan roots **no longer exist**:
+
+    ❌ crates/core/src/historical
+    ❌ crates/core/src/rest
+    ❌ crates/core/src/backfill
+
+and the loop skips anything missing:
+
+    for dir in historical_flow_paths() {
+        if !dir.is_dir() { continue; }      // <-- all three skip here
+
+so `violations` stays empty and the test **passes while checking zero files**.
+
+**Why nobody noticed — the part that matters most.** The guard HAS an
+anti-vacuity self-test, and it is a **tautology**:
+
+    let paths = historical_flow_paths();
+    assert!(paths.iter().any(|p| p.ends_with("historical")));
+
+`historical_flow_paths()` returns a hardcoded list. Asserting that list contains
+a path ending in "historical" is true **regardless of whether that directory
+exists**. The check designed to prove the guard was working is precisely why the
+rot went undetected. **A fake non-vacuity test is worse than none**, because it
+converts "unverified" into "verified" on the status board.
+
+**Why it is acute, not theoretical:** this guard exists to stop `append_tick(` /
+`TickPersistenceWriter` from re-entering a historical/REST flow and writing
+synthetic ticks into the real `ticks` table. The 2026-08-09 Dhan revival plan
+mandates **rebuilding `tick_persistence.rs` and the REST legs** — exactly the
+code this guard was built to police. It would be rebuilt with the guard asleep.
+
+**NOT fixed here, and the reason is honest rather than convenient.** The correct
+repair is to repoint the scan roots at today's REST/persistence modules and make
+a missing root a hard failure instead of a `continue`. But *which* paths are
+correct depends on the Dhan revival plan, which is still **DRAFT and unapproved**
+— and I cannot verify a `crates/storage` test change without a build the current
+disk cannot afford. Pushing an unverified change to a security guard, on a guess
+about an unapproved plan, would be worse than the disclosed gap. It needs a
+decision plus a build budget.
+
+### The 12 vacuity-prone siblings [A]
+
+Same family, not yet fired. The two most consequential:
+
+| Guard | Trigger | Invariant that would silently go unenforced |
+|---|---|---|
+| `error_level_meta_guard.rs:94` | `let Ok(entries) = fs::read_dir(dir) else { return; }` + a root fallback that silently mis-roots on any layout change | Rule 6 — flush/persist failures must be `error!`, not `warn!`. A downgrade stops paging → silent data loss |
+| `error_code_tag_guard.rs:64` | same swallow + `.unwrap_or_else(\|\| PathBuf::from("."))` CWD fallback | Rule 5 — every `error!` carries its code. Untagged errors never match the CloudWatch metric filters, so the 9 paging codes go dark |
+
+Both also carry **fake non-vacuity tests** of the same shape: they assert a
+constant the test file itself declares is non-empty, never that a single source
+file was actually scanned.
+
+**The one-line pattern fix for all 12:** replace
+`let Ok(entries) = fs::read_dir(dir) else { return; }` with an
+`.unwrap_or_else(|e| panic!("guard corpus unreadable: {dir:?}: {e}"))`, and add a
+real `assert!(files_scanned > 100)` to each walker. `dhan_exit_order_lockout_guard.rs:157`
+already proves that pattern works in this repo.
 
 ## §5. Recommended fix order (NOT applied — operator's call)
 
