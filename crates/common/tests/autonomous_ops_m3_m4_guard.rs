@@ -38,9 +38,12 @@ fn is_executable(path: &Path) -> bool {
 
 fn list_autofix_scripts(scripts_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(scripts_dir) else {
-        return out;
-    };
+    let entries = std::fs::read_dir(scripts_dir).unwrap_or_else(|e| {
+        // 2026-08-10: was a silent `else { return; }` — an unreadable or
+        // MISSING directory became "nothing to check, pass", so the guard
+        // could report green while scanning zero files.
+        panic!("guard corpus unreadable {:?}: {}", scripts_dir, e)
+    });
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name();
         let Some(n) = name.to_str() else { continue };

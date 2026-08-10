@@ -236,9 +236,12 @@ fn load_all_rule_text() -> String {
 }
 
 fn collect_markdown_contents(dir: &Path, out: &mut String) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| {
+        // 2026-08-10: was a silent `else { return; }` — an unreadable or
+        // MISSING directory became "nothing to check, pass", so the guard
+        // could report green while scanning zero files.
+        panic!("guard corpus unreadable {:?}: {}", dir, e)
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
