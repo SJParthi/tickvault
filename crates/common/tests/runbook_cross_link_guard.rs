@@ -22,9 +22,12 @@ fn workspace_root() -> PathBuf {
 
 fn runbook_paths() -> Vec<PathBuf> {
     let dir = workspace_root().join(RUNBOOK_DIR);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
+    let entries = fs::read_dir(&dir).unwrap_or_else(|e| {
+        // 2026-08-10: was a silent `else { return; }` — an unreadable or
+        // MISSING directory became "nothing to check, pass", so the guard
+        // could report green while scanning zero files.
+        panic!("guard corpus unreadable {:?}: {}", &dir, e)
+    });
     entries
         .flatten()
         .map(|e| e.path())
