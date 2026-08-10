@@ -183,12 +183,18 @@ fn chaos_disk_full_via_ulimit_subprocess() {
         return;
     }
 
-    // Skip if we cannot get the current exe path (e.g. weird
-    // cargo-test harness). Safer to skip than fail a meta-test.
-    let Ok(current_exe) = env::current_exe() else {
-        eprintln!("note: env::current_exe unavailable — disk-full chaos skipped");
-        return;
-    };
+    // CHANGED 2026-08-10 from a silent `return` to a hard failure.
+    //
+    // `env::current_exe()` failing is not a portability case — it means the
+    // test harness itself is broken. Skipping made a broken harness
+    // indistinguishable from a passing chaos test, and nextest swallows
+    // `eprintln!`, so the "note" nobody saw was the only difference between
+    // "disk-full survival proven" and "nothing ran".
+    let current_exe = env::current_exe().expect(
+        "env::current_exe() failed — the disk-full chaos test cannot respawn \
+         itself. This is a broken harness, not a platform limitation: failing \
+         loudly beats silently reporting that disk-full survival was proven.",
+    );
 
     // Respawn self under `ulimit -f N`. `cargo test` passes the
     // test name on argv; use `--exact` + `--test-threads=1` so the
@@ -208,8 +214,16 @@ fn chaos_disk_full_via_ulimit_subprocess() {
     {
         Ok(o) => o,
         Err(err) => {
-            eprintln!("note: failed to spawn ulimit child ({err}) — chaos skipped");
-            return;
+            // CHANGED 2026-08-10 from a silent `return` to a hard failure, same
+            // reasoning as the current_exe arm above: `sh` was already proven
+            // present, so a spawn failure here is a broken environment, not an
+            // unsupported platform. Skipping let a chaos test that never ran
+            // report exactly like one that ran and passed.
+            panic!(
+                "failed to spawn the ulimit child ({err}) — the disk-full chaos \
+                 test did NOT run. /bin/sh was already located, so this is a \
+                 broken environment, not a platform gate."
+            );
         }
     };
 
