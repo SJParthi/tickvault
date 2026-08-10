@@ -1892,6 +1892,35 @@ async fn main() -> Result<()> {
     );
 
     // =======================================================================
+    // Dhan 16-connection LIVE FEED stack — DEFAULT-OFF, twice over.
+    //
+    // Authorized by the operator quote of 2026-08-09 in
+    // websocket-connection-scope-lock.md ("16 CONNECTIONS + depth-20/
+    // depth-200 AUTHORIZED"), which raised the main-feed pool 1 -> 5 and
+    // un-forbade depth-20 and depth-200 at 5 each: 5 + 5 + 5 + 1 = 16.
+    //
+    // The spawn is refused unless BOTH `[feeds] dhan_enabled` (false in
+    // base.toml AND production.toml) and the `TICKVAULT_DHAN_LIVE_FEED=1`
+    // environment opt-in are set, so this call is a boolean read plus one
+    // env lookup on every boot today and changes nothing. The environment
+    // gate is the belt to the config's braces: `FeedsConfig`'s STRUCT
+    // default for `dhan_enabled` is `true`, so config alone is not
+    // default-off by construction.
+    //
+    // Instruments are the hardcoded index set (Q3 of the 2026-07-13
+    // amendment stands — no CSV download, no parser). Depth sets are empty
+    // until an operator names instruments for them.
+    // =======================================================================
+    let _dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
+        tickvault_app::dhan_feed_stack::DhanFeedStackParams {
+            dhan_enabled: config.feeds.dhan_enabled,
+            main_feed_instruments: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+            depth_20_instruments: Vec::new(),
+            depth_200_instruments: Vec::new(),
+        },
+    );
+
+    // =======================================================================
     // Boot completion signals (deploy-hang fix 2026-07-13; unconditional +
     // non-blocking since PR-C2).
     //

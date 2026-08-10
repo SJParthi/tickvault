@@ -30,12 +30,29 @@ done
 
 PASS=0
 FAIL=0
+SKIP=0
 FAILED_CHECKS=()
+SKIPPED_CHECKS=()
 
 print_header() {
     echo "============================================================"
     echo "  tickvault doctor — $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
     echo "============================================================"
+}
+
+# glob_exists <path-glob>... — true if AT LEAST ONE operand exists.
+#
+# Deliberately not `ls a b`: ls exits non-zero when ANY operand is missing,
+# so `ls a b` means "a AND b", never "a OR b". The pre-2026-08-10 log checks
+# used exactly that form, which is why they could only ever have been true
+# by accident — and were masked by a `|| true` besides. Unmatched globs stay
+# literal and fail the -e test, which is the behaviour we want.
+glob_exists() {
+    local f
+    for f in "$@"; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
 }
 
 run_check() {
@@ -50,6 +67,39 @@ run_check() {
         FAIL=$((FAIL + 1))
         FAILED_CHECKS+=("${section}/${name}")
     fi
+}
+
+# run_check_when <section> <name> <precondition-cmd...> -- <assertion-cmd...>
+#
+# Rule 11 (no false-OK): a check whose precondition is not met is reported as
+# SKIP, never PASS. "We did not test this" and "this passed" are different
+# facts and must never render identically. In --gate mode (live session, the
+# app is supposed to be running) a SKIP is escalated to FAIL, because there
+# the precondition failing is itself the defect.
+run_check_when() {
+    local section="$1"
+    local name="$2"
+    shift 2
+    local pre=()
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+        pre+=("$1"); shift
+    done
+    shift  # drop the "--"
+
+    if ! "${pre[@]}" >/dev/null 2>&1; then
+        if [ "${GATE_MODE}" -eq 1 ]; then
+            printf "[FAIL] %-14s %s (precondition not met, --gate)\n" "${section}" "${name}"
+            FAIL=$((FAIL + 1))
+            FAILED_CHECKS+=("${section}/${name} (precondition not met)")
+        else
+            printf "[SKIP] %-14s %s (not applicable — app has not run yet)\n" "${section}" "${name}"
+            SKIP=$((SKIP + 1))
+            SKIPPED_CHECKS+=("${section}/${name}")
+        fi
+        return
+    fi
+
+    run_check "${section}" "${name}" "$@"
 }
 
 print_section() {
@@ -104,10 +154,26 @@ print_section "zero-touch artefacts"
 
 run_check "logs" "data/logs/ directory exists" \
     test -d data/logs
-run_check "logs" "errors.jsonl appender wrote at least once (optional — depends on uptime)" \
-    bash -c "ls data/logs/machine/errors.jsonl* data/logs/errors.jsonl* >/dev/null 2>&1 || true"
-run_check "logs" "errors.summary.md exists (if app has run)" \
-    bash -c "test ! -d data/logs || test -f data/logs/machine/errors.summary.md || test -f data/logs/errors.summary.md || ls data/logs/app.*.log >/dev/null 2>&1 || true"
+# Both checks below are gated on "the app has actually run" (an app log
+# exists). Before 2026-08-10 they ended in `|| true`, which made them
+# unfailable: "errors.jsonl wrote at least once" printed PASS on a tree
+# where nothing had ever been written. That is the Rule 11 false-OK class
+# the charter forbids — a check that cannot fail reports nothing.
+#
+# Cadence note: summary_writer refreshes errors.summary.md every 60s
+# (crates/core/src/notification/summary_writer.rs), so a doctor run inside
+# the first minute of a cold boot can legitimately FAIL here. That is the
+# correct direction of error: loud and self-resolving, never silent.
+app_has_run() {
+    glob_exists data/logs/app.*.log data/logs/machine/app.*.log
+}
+
+run_check_when "logs" "errors.jsonl appender wrote at least once" \
+    app_has_run \
+    -- glob_exists data/logs/machine/errors.jsonl* data/logs/errors.jsonl*
+run_check_when "logs" "errors.summary.md exists" \
+    app_has_run \
+    -- glob_exists data/logs/machine/errors.summary.md data/logs/errors.summary.md
 run_check "hooks" "error-triage hook executable" \
     test -x .claude/hooks/error-triage.sh
 run_check "hooks" "validate-automation script executable" \
@@ -180,8 +246,17 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "============================================================"
-echo "  PASS: ${PASS}    FAIL: ${FAIL}"
+echo "  PASS: ${PASS}    FAIL: ${FAIL}    SKIP: ${SKIP}"
 echo "============================================================"
+
+if [ "${SKIP}" -gt 0 ]; then
+    echo ""
+    echo "Skipped checks (precondition not met — NOT the same as passing):"
+    for check in "${SKIPPED_CHECKS[@]}"; do
+        echo "  - ${check}"
+    done
+    echo "  (re-run with --gate to treat these as failures)"
+fi
 
 if [ "${FAIL}" -gt 0 ]; then
     echo ""

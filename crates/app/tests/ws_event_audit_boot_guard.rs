@@ -52,12 +52,15 @@ fn test_order_update_connection_is_audit_wired() {
     // dhan_rest_stack Phase 5a MUST spawn the order-update WS again — as
     // the PAPER-MODE push channel, gated on `[dhan_order_push] enabled`
     // (default OFF) and Telegram-silent (the `None` notifier binding — the
-    // 2026-07-14 Dhan noise lock still owns the page surface). The ws
-    // lifecycle audit sender is honestly `None` at this site today (the
-    // shared consumer helper is not cheaply reachable in the stack —
-    // wiring it is a flagged follow-up); the in-file dhan_rest_stack
-    // ratchet (`test_rest_stack_order_update_push_gated_and_no_canary`)
-    // pins the exactly-once spawn count.
+    // 2026-07-14 Dhan noise lock still owns the page surface). The in-file
+    // dhan_rest_stack ratchet
+    // (`test_rest_stack_order_update_push_gated_and_no_canary`) pins the
+    // exactly-once spawn count.
+    //
+    // 2026-08-10: the ws lifecycle audit sender at this site is no longer
+    // `None`. This comment previously recorded it as "honestly absent, a
+    // flagged follow-up"; that follow-up is DONE, and the pins below turn
+    // the note into a ratchet so the seam cannot silently revert.
     let stack = rest_stack_src();
     let stack_prod = stack
         .split_once("#[cfg(test)]")
@@ -78,6 +81,29 @@ fn test_order_update_connection_is_audit_wired() {
         stack_prod.contains("let order_push_notifier: Option<Arc<NotificationService>> = None;"),
         "the order-update WS spawn must stay Telegram-silent — the notifier \
          arg is a NAMED None binding (2026-07-14 Dhan noise lock)."
+    );
+    // 2026-08-10: the lifecycle audit seam is WIRED, and it is what drives
+    // the /health `order_update` row. Before this, nothing ever called
+    // `set_order_update_connected`, so /health reported the only live Dhan
+    // socket as `unreported` — neither up nor down.
+    assert!(
+        stack_prod.contains("crate::ws_audit_consumer::spawn_ws_event_audit_consumer("),
+        "dhan_rest_stack must create a ws_event_audit consumer for the \
+         order-update push channel — lifecycle events are otherwise dropped."
+    );
+    assert!(
+        stack_prod.contains("order_push_audit_tx,"),
+        "the created audit sender must actually be passed to \
+         run_order_update_connection — creating a consumer and then passing \
+         `None` would be a false-OK (the seam looks wired and carries nothing)."
+    );
+    assert!(
+        stack_prod.contains("health_for_audit.set_order_update_connected(connected)"),
+        "the audit tee must drive the /health order_update row. Do NOT swap \
+         this onto `authenticated_latch`: that latch is ONE-SHOT \
+         (fire_authenticated_signal_once compare-exchanges false->true and \
+         never resets), so it would report `connected` forever through every \
+         later disconnect — the Rule 11 false-OK class."
     );
 }
 

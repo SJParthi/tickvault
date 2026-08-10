@@ -44,7 +44,6 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 rustls = { workspace = true }
 reqwest = { workspace = true }
-core_affinity = { workspace = true }
 # 2026-07-12 (BruteX crossverify Commit 2): the 15:50 IST daily task reads the
 # BruteX-produced Groww 1m CSVs from S3 (tv-prod-cold, read-only GET/List —
 # the instance role already holds the permissions; ZERO IAM change).

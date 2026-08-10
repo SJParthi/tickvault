@@ -112,6 +112,18 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // cross-feed comparison row).
     "spot_crossverify_cell_audit",
     "spot_crossverify_daily",
+    // Dhan live-WS vs Dhan REST 15:31 cross-verification (2026-08-09, the
+    // 16-connection live-feed revival): one row per divergent/missing cell /
+    // one row per trading-day summary. Same SEBI-audit class and DAY
+    // partitioning as the two cross-verify pairs above.
+    //
+    // This comparison carries more weight than its siblings: the Dhan feed has
+    // no sequence number and no snapshot-on-subscribe, so this is the ONLY
+    // ground truth available for whether the live capture is complete. The
+    // cell table is bounded by divergences, not by instruments, so it is
+    // normally near-empty — a large day IS the signal.
+    "dhan_live_crossverify_cell_audit",
+    "dhan_live_crossverify_daily",
     // SPOT1M-01/02 (2026-07-12, per-minute REST pipeline PR-2): one row per
     // fetched (minute, index) — ~1,125 rows/day (375 min × 3 IDX_I SIDs),
     // trivial disk; same DAY partitioning + retention class as the
