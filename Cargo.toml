@@ -86,7 +86,7 @@ tracing-appender = "0.2.5"
 # consumers anywhere in the repo — the Dhan JWT is handled as an opaque
 # Secret<String>, never decoded locally.
 arc-swap = "1.9.1"
-totp-rs = { version = "5.7.1", features = ["gen_secret", "otpauth"] }
+totp-rs = { version = "=6.0.0", features = ["gen_secret", "otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
 governor = "0.10.4"
