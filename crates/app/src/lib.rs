@@ -144,11 +144,26 @@ pub mod daily_task_marker;
 /// (`dhan_activation` — the lane cold-start watcher that preceded this
 /// decl — was deleted in PR-C2 with the Dhan live-WS lane.)
 pub mod dhan_data_api_limiter;
+/// Dhan 16-connection live-feed stack — boot wiring, DEFAULT-OFF behind BOTH
+/// `[feeds] dhan_enabled` and the `TICKVAULT_DHAN_LIVE_FEED=1` environment
+/// opt-in. Authorized by the operator quote of 2026-08-09 in
+/// `websocket-connection-scope-lock.md` ("16 CONNECTIONS + depth-20/depth-200
+/// AUTHORIZED"). Plans the 5 main-feed / 5 depth-20 / 5 depth-200 pools,
+/// reserves the connection budget, and hands the shape to
+/// `tickvault_core::websocket::pool_supervisor`.
+pub mod dhan_feed_stack;
 /// Shared Dhan `/v2/charts/intraday` 1m request/response primitives —
 /// relocated from `cross_verify_1m_boot.rs` in Phase C1 of the 2026-07-13
 /// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
 /// module the Phase C deletion PRs remove). Pure move, zero behavior change.
 pub mod dhan_intraday_parse;
+/// Daily 15:31 IST Dhan LIVE-vs-REST cross-verification comparator — the
+/// revived Dhan live feed's ONLY ground truth (the wire carries no sequence
+/// number and no snapshot-on-subscribe, so Dhan's own 1m tape is the only
+/// packet-loss proxy). Integer-paise OHLC compare, quantified noise profile,
+/// and a `blind` outcome that makes a zero-comparison run structurally
+/// incapable of reading as a pass — the PR #1474 blind-since-birth lesson.
+pub mod dhan_live_crossverify;
 /// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive
 /// 2026-07-16; governance on PR #1597): receive-only broadcast consumer
 /// mapping order updates to `order_audit` rows `feed='dhan'`/`mode='paper'`.
