@@ -3369,6 +3369,26 @@ impl ApplicationConfig {
             &self.instrument.build_window_end,
         )?;
 
+        // 2026-08-10: the LOWER bound was missing, and its absence was invisible
+        // because something else claimed it existed. `OrderRateLimiter::new`
+        // (crates/trading/src/oms/rate_limiter.rs) does
+        // `NonZeroU32` construction from this value, unwrapped under an
+        // `#[allow(clippy::expect_used)] // APPROVED: config validation ensures > 0`.
+        // That validation was never written — only the SEBI upper bound below
+        // existed — so the annotation suppressed the one lint that would have
+        // caught it, on the strength of a guarantee that did not exist.
+        //
+        // `[order_runtime] enabled = true` in config/base.toml makes the path
+        // reachable, so `max_orders_per_second = 0` in any config would pass
+        // validation and PANIC at boot. This makes the cited guarantee real.
+        if self.trading.max_orders_per_second == 0 {
+            bail!(
+                "trading.max_orders_per_second must be >= 1 (got 0). A zero rate \
+                 limit is not 'unlimited' — it makes the GCRA quota unconstructible \
+                 and panics the process at boot."
+            );
+        }
+
         // SEBI: max_orders_per_second must not exceed the SEBI limit.
         if self.trading.max_orders_per_second > SEBI_MAX_ORDERS_PER_SECOND {
             bail!(

@@ -208,7 +208,28 @@ for INV_TEST in bible_deletion_lockdown:tickvault-common; do
   CRATE="${INV_TEST##*:}"
   INV_OUT=$(timeout 60 cargo test -p "$CRATE" --test "$TEST_NAME" 2>&1)
   INV_EXIT=$?
-  if [ "$INV_EXIT" -ne 0 ]; then
+  # 2026-08-10: distinguish "the invariant is VIOLATED" from "we could not
+  # RUN it in 60s". Both used to print "invariant test failed at commit
+  # time", which sends the committer hunting a violation that does not
+  # exist. Observed live: a concurrent `cargo test` in another shell holds
+  # the cargo artifact-directory lock, this build blocks on it, `timeout`
+  # fires at 60s (exit 124), and the invariant — which passes in 0.00s once
+  # the lock is free — was reported as failing.
+  #
+  # A timeout still BLOCKS the commit. It is not downgraded to a warning:
+  # an un-run invariant is unverified, and treating unverified as OK is the
+  # false-OK this repo forbids. Only the DIAGNOSIS changes, so the fix is
+  # "retry, do not go hunting".
+  if [ "$INV_EXIT" -eq 124 ]; then
+    echo "$INV_OUT" | tail -5 >&2
+    echo "  FAIL: invariant test $TEST_NAME TIMED OUT after 60s — it was not run, so it is unverified." >&2
+    echo "        This is usually the cargo build lock, not a violated invariant:" >&2
+    echo "        another cargo/rust-analyzer process is holding target/. Look for" >&2
+    echo "        'Blocking waiting for file lock' above. Wait for it to finish (or" >&2
+    echo "        stop it) and re-commit; verify by hand with:" >&2
+    echo "          cargo test -p $CRATE --test $TEST_NAME" >&2
+    INVARIANT_FAILED=1
+  elif [ "$INV_EXIT" -ne 0 ]; then
     echo "$INV_OUT" | tail -10 >&2
     echo "  FAIL: invariant test $TEST_NAME failed at commit time" >&2
     INVARIANT_FAILED=1

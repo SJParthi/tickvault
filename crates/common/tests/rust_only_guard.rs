@@ -193,6 +193,27 @@ fn line_has_banned_token(line: &str) -> bool {
 }
 
 fn line_has_token(line: &str, tok: &str) -> bool {
+    // 2026-08-10 — CASE-SENSITIVITY IS DELIBERATE. KEEP IT.
+    //
+    // An audit flagged this matcher as CRITICAL because `PIP3 install ...` slips
+    // past a ban on the lowercase token. I implemented the case-insensitive fix,
+    // then RAN the test, and it was wrong on both counts:
+    //
+    // 1. It broke the build on a FALSE POSITIVE — `.claude/hooks/
+    //    banned-pattern-scanner.sh` carries a quoted human-readable message
+    //    naming a vendor's SDK by language, capitalised as English prose. That is
+    //    documentation, not an invocation, and the rust-only lock's own §0
+    //    explicitly RETAINS vendor-reference and provenance mentions.
+    //
+    // 2. The bypass it defended against cannot execute. Linux filenames are
+    //    case-sensitive (verified: `pip3` resolves, `PIP3` does not), so an
+    //    uppercase "invocation" is simply a command-not-found, never a working
+    //    evasion.
+    //
+    // Case-sensitivity is therefore doing useful WORK here: English prose
+    // capitalises a language name, shell invocations do not. Lowercasing would
+    // trade a real signal for noise. If a future reviewer re-reads that audit
+    // finding, this comment is the answer — it was tested, not assumed.
     let bytes = line.as_bytes();
     let needle = tok.as_bytes();
     let mut start = 0usize;
@@ -340,6 +361,23 @@ fn load_invocation_scan_files() -> Vec<(String, String)> {
 #[test]
 fn no_banned_files_outside_allowlist() {
     assert_sorted_unique(TRACKED_BANNED_ALLOWLIST, "TRACKED_BANNED_ALLOWLIST");
+    // 2026-08-10 ANTI-VACUITY, in the one shape that fits this test. ZERO tracked
+    // interpreted-language files is the CORRECT and desired state here, so a
+    // non-empty assert on the RESULT would be backwards. What must be proven
+    // instead is that the LOOKUP MECHANISM still works — otherwise a broken
+    // `git ls-files` returns nothing and this guard passes for the wrong reason,
+    // indistinguishable from success.
+    assert!(
+        git_ls_files(&["."]).len() > 100,
+        "RUST-ONLY GUARD IS BLIND: `git ls-files` returned almost nothing, so an \
+         interpreted-language file could exist and go unseen. This guard's PASS \
+         would be meaningless."
+    );
+    // Scope widened from `*.py` to the 9-extension BANNED_FILE_PATHSPECS by #1738,
+    // landed in parallel. Kept verbatim — it is strictly broader than what this
+    // test previously covered, and it composes with the assert above rather than
+    // competing with it: theirs widens WHAT is looked for, mine proves the looking
+    // actually happened.
     let tracked_banned = git_ls_files(BANNED_FILE_PATHSPECS);
     let new = py_files_not_in_allowlist(&tracked_banned, TRACKED_BANNED_ALLOWLIST);
     assert!(
@@ -376,6 +414,21 @@ fn allowlist_shrinks_monotonically() {
 fn no_new_banned_invocations() {
     assert_sorted_unique(INVOCATION_SITE_ALLOWLIST, "INVOCATION_SITE_ALLOWLIST");
     let files = load_invocation_scan_files();
+    // 2026-08-10 ANTI-VACUITY. Every assertion in this test checks that the
+    // VIOLATION set is empty; nothing checked that the SCANNED set was not. An
+    // empty file list — from a narrowed glob, a renamed directory, or a broken
+    // `git ls-files` — made both checks trivially true and this guard reported
+    // green while enforcing NOTHING. A sibling guard in this repo was found in
+    // exactly that state, and its own "proof of non-vacuity" was a tautology.
+    // ~160 files match today; 50 leaves 3x headroom and still fails loudly if
+    // the scan collapses.
+    assert!(
+        files.len() > 50,
+        "RUST-ONLY GUARD IS BLIND: the invocation scan matched only {} file(s). \
+         It is enforcing nothing. Expected >50. Check is_invocation_scan_target() \
+         and that `git ls-files` works from the test's working directory.",
+        files.len()
+    );
     let new = new_invocation_sites(&files, INVOCATION_SITE_ALLOWLIST);
     assert!(
         new.is_empty(),
@@ -389,6 +442,30 @@ fn no_new_banned_invocations() {
         "SHRINK THE RATCHET: these INVOCATION_SITE_ALLOWLIST entries no longer carry a \
          non-comment the banned interpreter token (file cleaned or deleted): {stale:?}. Remove the entries \
          from crates/common/tests/rust_only_guard.rs in the same PR."
+    );
+}
+
+/// 2026-08-10. The rust-only lock claims a "HARD ZERO floor" for both allowlists.
+/// Until this test, that floor was enforced by REVIEWER DISCIPLINE ONLY: a PR could
+/// re-add a banned file together with its own allowlist entry and stay green, because
+/// every other assertion here only compares the tree against the allowlist. This makes
+/// the floor mechanical — re-growing either list now fails the build.
+#[test]
+fn allowlists_are_pinned_at_zero() {
+    assert!(
+        TRACKED_BANNED_ALLOWLIST.is_empty(),
+        "TRACKED_BANNED_ALLOWLIST must stay EMPTY (hard-zero floor, rust-only \
+         directive 2026-07-31). It currently has {} entr(y/ies): {:?}. Port the \
+         logic to Rust instead of allowlisting it.",
+        TRACKED_BANNED_ALLOWLIST.len(),
+        TRACKED_BANNED_ALLOWLIST
+    );
+    assert!(
+        INVOCATION_SITE_ALLOWLIST.is_empty(),
+        "INVOCATION_SITE_ALLOWLIST must stay EMPTY (hard-zero floor). It currently \
+         has {} entr(y/ies): {:?}.",
+        INVOCATION_SITE_ALLOWLIST.len(),
+        INVOCATION_SITE_ALLOWLIST
     );
 }
 
