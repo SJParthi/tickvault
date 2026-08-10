@@ -327,6 +327,32 @@ impl RiskEngine {
     /// paths can never drift.
     fn daily_loss_state(&self) -> (f64, f64) {
         let total_pnl = self.total_realized_pnl + self.total_unrealized_pnl();
+        // 2026-08-10: publish the number the halt actually decides on.
+        //
+        // `tv_daily_pnl` was allowlisted in cloudwatch-agent.json and alarmed in
+        // order-side-alarms.tf, and written by NOTHING. The alarm's own
+        // description already said so: "that OK means NO DATA, not healthy" —
+        // a permanently-green alarm whose greenness carried no information.
+        //
+        // The in-process kill switch was never broken; `evaluate_daily_loss_halt`
+        // reads these fields directly and halts correctly. What did not exist was
+        // the INDEPENDENT route, and that is the whole point of the alarm: it is
+        // meant to page when the app-side Telegram leg is itself degraded. A
+        // redundancy that is only present when the primary works is not a
+        // redundancy.
+        //
+        // Emitted here rather than at the two call sites so `check_order` and
+        // `evaluate_daily_loss_halt` can never publish different values — the
+        // same reason this helper exists at all. Matches the existing gauge
+        // idiom in this file (`tv_realized_pnl`, `tv_unrealized_pnl`).
+        //
+        // Non-finite is deliberately NOT published: a NaN would be dropped or
+        // rendered as a garbage datapoint, and that case is already handled far
+        // more loudly one frame up — it fails closed into a halt and a Critical
+        // Telegram, which beats a gauge nobody is watching at that moment.
+        if total_pnl.is_finite() {
+            metrics::gauge!("tv_daily_pnl").set(total_pnl);
+        }
         (total_pnl, self.capital * self.max_daily_loss_fraction)
     }
 
