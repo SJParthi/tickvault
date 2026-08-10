@@ -125,19 +125,32 @@ already as loud as it gets"
 }
 
 #[test]
-fn all_three_pnl_gauges_survive_the_emf_allowlist() {
+fn daily_pnl_survives_the_emf_allowlist() {
     // A gauge that is emitted but not allowlisted is discarded by the agent on
     // the box. From CloudWatch it is indistinguishable from a gauge that was
     // never emitted — which is how this whole class of gap stays invisible.
+    //
+    // Only `tv_daily_pnl` is asserted, and that is a deliberate narrowing.
+    // The first version of this test also demanded `tv_realized_pnl` and
+    // `tv_unrealized_pnl` be allowlisted, and the count ratchet in
+    // `cloudwatch_app_alarms_wiring::test_emf_metric_selectors_name_count_is_pinned`
+    // caught it. That ratchet exists because the selector list IS the
+    // CloudWatch bill: ~$0.30/month per name against a $100 kill-ceiling whose
+    // budget action STOPS the prod box at 90%.
+    //
+    // Re-reading the list's own stated inclusion rule settled it: "a name is
+    // selected only if it means FAILURE, SATURATION or DATA LOSS". The two P&L
+    // component gauges are state, not failure — they answer "how much", which
+    // that rule explicitly excludes. `tv_daily_pnl` qualifies only because an
+    // alarm evaluates it. So the two were removed rather than the count bumped:
+    // the cost ratchet was right and the first version of this test was wrong.
     let agent = read(AGENT_JSON);
-    for metric in ["tv_daily_pnl", "tv_realized_pnl", "tv_unrealized_pnl"] {
-        assert!(
-            agent.contains(metric),
-            "{metric} is emitted by the risk engine but missing from the EMF \
-metric_selectors allowlist in {AGENT_JSON} — the agent drops it on the box and \
-it never reaches CloudWatch"
-        );
-    }
+    assert!(
+        agent.contains("tv_daily_pnl"),
+        "tv_daily_pnl is emitted by the risk engine and alarmed in {ALARM_TF}, \
+but is missing from the EMF metric_selectors allowlist in {AGENT_JSON} — the \
+agent would drop it on the box and the alarm would evaluate nothing"
+    );
 }
 
 #[test]

@@ -8,21 +8,23 @@
 # placement-side / P&L-side / fill-side coverage. This file adds:
 #   1. orders-placed-storm  — ARMED TODAY (valid in paper AND live mode; a
 #      runaway strategy loop places paper orders at the same rate).
-#   2. daily-loss-breach    — ARMED, structurally silent in dry-run
-#      (arm-on-arrival: tv_daily_pnl has NO emit site in this PR).
+#   2. daily-loss-breach    — ARMED AND LIVE since 2026-08-10 (tv_daily_pnl
+#      gained its emit site; see the block below).
 #   3. order-fill-lag-high  — SHIPS DISARMED (actions_enabled = false; the
 #      arming contract is in its description).
 #
 # COST (see aws-budget.md COST NOTE 2026-07-14): +3 alarms ≈ $0.30/mo;
 # +1 derived custom-metric series (tv_orders_placed_delta_total) ≈ $0.30/mo;
-# the 2 new EMF allowlist names (tv_daily_pnl, tv_order_fill_lag_seconds)
-# are DORMANT — zero datapoints = $0.00 until cluster A / Phase-1 ships
-# their emit sites, then ≈ +$0.60/mo (pre-noted there).
+# of the 2 new EMF allowlist names, tv_daily_pnl went LIVE 2026-08-10 (its
+# emit site landed) so its ≈ +$0.30/mo is now real; tv_order_fill_lag_seconds
+# stays DORMANT at $0.00 until Phase-1 ships its emitter.
 #
-# EMIT-SITE OWNERSHIP (the tv_daily_pnl hard boundary): tv_daily_pnl and
-# tv_order_fill_lag_seconds have NO Rust emit site in this PR — their
-# emitters ship with cluster A (daily-pnl gauge) / Phase-1 (fill lag). The
-# alarms here arm on data arrival with zero further tf changes. The
+# EMIT-SITE OWNERSHIP: tv_daily_pnl's emitter LANDED 2026-08-10 —
+# RiskEngine::daily_loss_state publishes the gauge (the shared helper both
+# the order gate and the standalone halt evaluation call, so the published
+# value is by construction the value the halt decided on).
+# tv_order_fill_lag_seconds still has NO Rust emit site — Phase-1 owns it,
+# and its alarm arms on data arrival with zero further tf changes. The
 # emit-site guard (cloudwatch_app_alarms_wiring.rs
 # test_every_alarm_metric_has_a_rust_emit_site) deliberately does NOT scan
 # this file — the dormant names would fail it; the shape guard
@@ -156,18 +158,31 @@ resource "aws_cloudwatch_metric_alarm" "orders_placed_storm" {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Daily-loss breach — ARMED, arm-on-arrival (tv_daily_pnl = cluster A)
+# 3. Daily-loss breach — ARMED AND RECEIVING DATA since 2026-08-10
 # ---------------------------------------------------------------------------
-# EMIT-SITE OWNERSHIP: tv_daily_pnl (gauge, INR, realized + unrealized) has
-# NO emit site in this PR — cluster A ships it. Until then the metric never
-# publishes: missing data + notBreaching = structurally silent (a dormant
-# armed alarm costs $0.10/mo and needs ZERO tf changes to go live).
+# ARMED 2026-08-10. tv_daily_pnl (gauge, INR, realized + unrealized) is now
+# published by RiskEngine::daily_loss_state — the shared helper that both
+# the order-gate check and the standalone halt evaluation call, so what
+# CloudWatch sees is by construction the number the halt decided on.
+#
+# treat_missing_data RE-DECIDED at arming (the dormancy ratchet in
+# crates/storage/tests/cloudwatch_dormant_alarms_guard.rs forces this to be
+# a conscious choice, not an inherited default): it stays "notBreaching".
+# Missing data is the NORMAL state here, not a fault — the box runs weekdays
+# 08:30-17:30 IST and the gauge only publishes while the order runtime is
+# evaluating, so "breaching" would page every single evening and all
+# weekend. HONEST LIMIT, stated rather than implied: notBreaching means this
+# alarm CANNOT detect an in-session data outage — a dead app reads as OK
+# here. That gap is covered by the market-hours liveness alarm and the boot
+# heartbeat, which exist for exactly that purpose; this alarm's job is the
+# BREACH, not the silence.
+#
 # Redundant counter-side route for the sink's Critical RiskHalt Telegram
 # page (the AGGREGATOR-DROP-01 dual-route precedent) — a breach pages even
 # if the app-side Telegram leg is degraded.
 resource "aws_cloudwatch_metric_alarm" "daily_loss_breach" {
   alarm_name          = "tv-${var.environment}-daily-loss-breach"
-  alarm_description   = "[DORMANT 2026-08-09 - NO PRODUCTION EMIT SITE: tv_daily_pnl is written by ZERO non-test code paths, so this alarm has never evaluated a datapoint. With treat_missing_data=notBreaching it reads OK - that OK means NO DATA, not healthy, and the daily-loss KILL SIGNAL DOES NOT EXIST via this route today. Live protection is the risk engine halt (RISK-GAP-01) + the Critical RiskHalt Telegram page.] Daily P&L breached the loss limit (tv_daily_pnl Minimum below -1 x daily_loss_alarm_inr over 5 minutes). EMIT-SITE OWNERSHIP: the tv_daily_pnl gauge ships with cluster A - this alarm arms on data arrival with zero tf changes. Redundant with the risk engine's own halt (RISK-GAP-01 + the Critical RiskHalt Telegram page). NO OK page: the risk-engine halt latch outlives an intraday mark-to-market bounce - an auto-OK would say recovered while trading stays blocked (Rule-11)."
+  alarm_description   = "Daily P&L breached the loss limit (tv_daily_pnl Minimum below -1 x daily_loss_alarm_inr over 5 minutes). ARMED 2026-08-10: the tv_daily_pnl gauge is emitted by RiskEngine::daily_loss_state, the same helper the halt decides on. treat_missing_data stays notBreaching because the box is off outside 08:30-17:30 IST weekdays, so no-data is normal here - this alarm reports a BREACH, not silence; a dead app is the liveness alarm/boot heartbeat job. Redundant with the risk engine's own halt (RISK-GAP-01 + the Critical RiskHalt Telegram page). NO OK page: the risk-engine halt latch outlives an intraday mark-to-market bounce - an auto-OK would say recovered while trading stays blocked (Rule-11)."
   comparison_operator = "LessThanThreshold"
   threshold           = -1 * var.daily_loss_alarm_inr
   evaluation_periods  = 1
