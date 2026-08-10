@@ -256,13 +256,24 @@ pub mod option_contract_1m_rest_persistence;
 // ILP-over-HTTP writer — one row per (target minute, symbol, feed, leg).
 pub mod rest_fetch_audit_persistence;
 // Stage-2 dead-WS sweep (2026-07-17): `tick_flush_worker` / `tick_persistence`
-// / `tick_row_builder` / `tick_spill_drain` DELETED with the dead Dhan tick
-// chain (`run_tick_processor` died in PR-C2/C3; the Groww live feed retired
-// 2026-07-15) — zero production callers re-verified before deletion. The
-// TICK-FLUSH-01 / HOT-PATH-01/02 ErrorCode variants are RETAINED (crossref);
-// the `tv_ticks_dropped_total` CloudWatch alarm becomes a dead monitor —
-// terraform/EMF retirement is dashboard-PR scope. `ws_frame_spill` (the WAL
-// durable floor) is KEPT — it is a separate, live surface.
+// / `tick_row_builder` / `tick_spill_drain` were DELETED with the dead Dhan
+// tick chain (`run_tick_processor` died in PR-C2/C3; the Groww live feed
+// retired 2026-07-15) — zero production callers at the time. The
+// TICK-FLUSH-01 / HOT-PATH-01/02 ErrorCode variants were RETAINED (crossref).
+// `ws_frame_spill` (the WAL durable floor) was KEPT throughout — a separate,
+// live surface.
+//
+// REBUILD 2026-08-09: the Dhan live main-feed WS was re-authorized by a dated
+// operator quote (`websocket-connection-scope-lock.md`), and that revival
+// names `tick_persistence.rs` + a `DEDUP_KEY_TICKS` **const** as required
+// deliverables — the const specifically so the `ticks` key stays inside the
+// `dedup_segment_meta_guard.rs` scan (an inline literal would evade it). The
+// `ticks` TABLE was never dropped and its schema is UNCHANGED here; the module
+// only reproduces it idempotently and writes rows, with `capture_seq`
+// populated per received frame (the intra-second dedup tiebreaker — without it
+// second-granular Dhan timestamps collapse every tick but the last in each
+// second).
+pub mod tick_persistence;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;
