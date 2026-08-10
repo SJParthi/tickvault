@@ -322,24 +322,46 @@ impl TfIndex {
     ///
     /// `tick_ist_secs` MUST be the IST epoch second derived from the
     /// WS LTT field (NEVER `Utc::now()` per `data-integrity.md`).
+    ///
+    /// # Saturating by design
+    ///
+    /// Every add here is `saturating_add`, NOT a bare `+`. The release profile
+    /// sets `overflow-checks = true` with `panic = "abort"`, so an arithmetic
+    /// overflow does not return a wrong number — it kills the process, and in
+    /// the 16-connection feed that means all sixteen sockets, not one tick.
+    ///
+    /// Today's only production caller (`MultiTfAggregator::consume_tick`)
+    /// gates on the session window first, and for any `ts` passing that gate
+    /// `ts % 86_400 >= MARKET_OPEN_SECS_OF_DAY_IST`, which algebraically rules
+    /// the overflow out. But that is an UNDOCUMENTED PRECONDITION on a `pub
+    /// fn`, enforced by a caller rather than by the type system — a second
+    /// call site would silently reintroduce a remote abort, since
+    /// `tick_ist_secs` is a raw `u32` off the wire that no parser
+    /// range-validates. Flagged by two independent adversarial reviews
+    /// (2026-08-09). Saturating makes the function safe for ANY input, so the
+    /// precondition stops being load-bearing.
     #[inline]
     #[must_use]
     pub const fn bucket_start(self, tick_ist_secs: u32) -> u32 {
         let secs = self.seconds_per_bucket();
         let day_start = (tick_ist_secs / 86_400) * 86_400;
-        let market_open = day_start + MARKET_OPEN_SECS_OF_DAY_IST;
+        let market_open = day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST);
         if tick_ist_secs <= market_open {
             return market_open;
         }
-        market_open + ((tick_ist_secs - market_open) / secs) * secs
+        market_open.saturating_add(((tick_ist_secs - market_open) / secs) * secs)
     }
 
     /// Returns the (exclusive) bucket-end for a given bucket-start.
-    /// Equivalent to `bucket_start + seconds_per_bucket()`.
+    /// Equivalent to `bucket_start + seconds_per_bucket()`, saturating.
+    ///
+    /// Saturating for the same reason as [`Self::bucket_start`]: this one has
+    /// NO production caller today, so it has no gate protecting it at all —
+    /// it is one direct call away from an abort on a wire-derived value.
     #[inline]
     #[must_use]
     pub const fn bucket_end(self, bucket_start: u32) -> u32 {
-        bucket_start + self.seconds_per_bucket()
+        bucket_start.saturating_add(self.seconds_per_bucket())
     }
 }
 
@@ -437,6 +459,36 @@ mod tests {
     /// variant at the end leaves every literal below untouched and passes;
     /// inserting or reordering fails the build. Add new frames HERE at the
     /// bottom only.
+    #[test]
+    /// ADVERSARIAL REGRESSION (2026-08-09, flagged by two independent
+    /// reviews). `tick_ist_secs` is a raw `u32` off the wire that no parser
+    /// range-validates. The release profile is `overflow-checks = true` with
+    /// `panic = "abort"`, so an overflow here does not produce a wrong candle
+    /// — it aborts the process, taking all sixteen sockets down. These must
+    /// return a saturated value for EVERY input, with no caller-side gate.
+    #[test]
+    fn test_bucket_math_saturates_instead_of_aborting_on_extreme_inputs() {
+        for tf in TfIndex::ALL {
+            for ts in [u32::MAX, u32::MAX - 1, u32::MAX - 86_399, 0, 1] {
+                let start = tf.bucket_start(ts);
+                // Reaching here at all is the assertion: a bare `+` would have
+                // aborted the test process under overflow-checks.
+                let end = tf.bucket_end(start);
+                assert!(
+                    end >= start,
+                    "{tf:?}: bucket_end({start}) = {end} must never wrap below \
+                     its start for ts {ts}"
+                );
+            }
+            // The saturating ceiling is reachable and stable.
+            assert_eq!(
+                tf.bucket_end(u32::MAX),
+                u32::MAX,
+                "{tf:?}: bucket_end must clamp at u32::MAX, not wrap to 0"
+            );
+        }
+    }
+
     #[test]
     fn test_tf_index_ordinals_are_append_only_literal_pins() {
         assert_eq!(TfIndex::M1 as u8, 0);

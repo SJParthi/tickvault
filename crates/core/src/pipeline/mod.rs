@@ -43,3 +43,11 @@ pub mod chain_snapshot;
 // `reset_day_lag_histogram` + the scoreboard's `day_lag_summary` drain are
 // live consumers.
 pub mod feed_lag_monitor;
+
+// Dhan live-feed revival (operator quote 2026-08-09, scope-lock
+// "2026-08-09 (SAME DAY, SECOND QUOTE)"): the India feed carries NO sequence
+// number, so packet loss is undetectable at the protocol level and must be
+// INFERRED from the payload — LTT monotonicity, volume/OI deltas and
+// per-instrument silence baselines. Replaces the silence-only detector
+// deleted in PR-C3 (2026-07-14).
+pub mod tick_gap_detector;

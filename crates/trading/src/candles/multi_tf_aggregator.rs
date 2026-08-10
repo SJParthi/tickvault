@@ -85,6 +85,34 @@ pub const AGGREGATOR_MAX_SLOTS: usize = 25_000;
 /// reallocs (cold path). The hard ceiling is [`AGGREGATOR_MAX_SLOTS`].
 pub const AGGREGATOR_DEFAULT_SLOTS: usize = 1_000;
 
+/// Slots added per growth step once the pre-allocated table is full.
+///
+/// Fixed-size, never doubling: growth memmoves the whole ~5.4 KB-per-slot
+/// table synchronously inside `consume_tick`, so the step size IS the
+/// worst-case hot-path pause. 1,000 slots is ~5.4 MB per move and bounds that
+/// pause no matter how large the universe grows.
+pub const AGGREGATOR_SLOT_GROWTH_CHUNK: usize = 1_000;
+
+/// Earliest `exchange_timestamp` (IST epoch seconds) treated as real.
+///
+/// 2020-09-13. Comfortably before any tickvault data has ever existed, so it
+/// can never reject a legitimate tick, while still rejecting the small values
+/// (0, 1, a few thousand) that a corrupt or zero-filled packet produces.
+pub const MIN_PLAUSIBLE_EXCHANGE_TS_SECS: u32 = 1_600_000_000;
+
+/// Latest `exchange_timestamp` (IST epoch seconds) treated as real.
+///
+/// 2050-01-01. `exchange_timestamp` is a raw `u32` off the wire that no parser
+/// range-validates, and it drives the event-time watermark, which in turn
+/// drives `catch_up_seal_all` across every slot. An all-ones LTT is
+/// ~4.29 billion (year 2106) and would force-seal the entire live book.
+///
+/// An ABSOLUTE bound rather than a relative jump cap, deliberately: the
+/// watermark starts at 0, so a relative cap cannot distinguish the first
+/// honest tick (a ~1.78-billion-second jump from zero) from poison. That
+/// exact mistake was made and caught by these tests before it shipped.
+pub const MAX_PLAUSIBLE_EXCHANGE_TS_SECS: u32 = 2_524_608_000;
+
 /// The composite identity. `security_id` alone is BANNED (I-P1-11); `feed` is
 /// part of it under the 2026-06-19 feed-in-key lock.
 type CompositeKey = (Feed, u64, u8);
@@ -125,14 +153,28 @@ pub struct ConsumeStats {
     /// instrument therefore has NO fold state. Fail-closed: nothing was
     /// folded, and the caller must treat it as a real data loss.
     pub slot_exhausted: bool,
+    /// `true` when `exchange_timestamp` fell outside
+    /// `[MIN_PLAUSIBLE_EXCHANGE_TS_SECS, MAX_PLAUSIBLE_EXCHANGE_TS_SECS]`.
+    /// Nothing was folded and the watermark was NOT advanced.
+    pub refused_timestamp: bool,
 }
 
 impl ConsumeStats {
     /// `true` when the tick was folded into at least the open buckets (i.e.
     /// it was neither refused, out of session, nor slot-exhausted).
+    ///
+    /// This is a NEGATIVE predicate — it reports success by the absence of
+    /// every known refusal — so ANY new refusal field MUST be added here too.
+    /// Miss one and a refused tick reports itself as folded, which is the
+    /// false-OK class the charter forbids. The test
+    /// `test_every_refusal_field_makes_folded_false` enforces it mechanically
+    /// rather than relying on whoever adds the next field remembering.
     #[must_use]
     pub fn folded(&self) -> bool {
-        !self.refused_price && !self.out_of_session && !self.slot_exhausted
+        !self.refused_price
+            && !self.out_of_session
+            && !self.slot_exhausted
+            && !self.refused_timestamp
     }
 }
 
@@ -314,6 +356,29 @@ impl MultiTfAggregator {
             }
             return None;
         }
+        // Grow in FIXED chunks, never by doubling.
+        //
+        // ADVERSARIAL FINDING (2026-08-09, HIGH): `Vec` doubling puts a
+        // synchronous memmove of the whole slot table inside `consume_tick`.
+        // `InstrumentSlot` is ~5.4 KB, so the 8,000 -> 16,000 growth alone
+        // moves ~43 MB — roughly 4-8 ms, i.e. 60-120 packets' worth of the
+        // 66.7 microsecond per-packet budget, while the socket reader backs up
+        // behind it and stops emitting pongs. Doubling also overshoots the
+        // ceiling: 25,000 instruments would allocate 32,768 slots (~177 MB,
+        // and ~265 MB transient with the old buffer still live), which is why
+        // the ~135 MB figure quoted on AGGREGATOR_MAX_SLOTS was understated.
+        //
+        // A fixed chunk bounds the worst-case pause to one chunk-sized move
+        // regardless of how large the universe grows, and clamping to the
+        // ceiling means the table never allocates a slot it may not use.
+        if self.slots.len() == self.slots.capacity() {
+            let head_room = capacity.saturating_sub(self.slots.capacity());
+            let chunk = head_room.min(AGGREGATOR_SLOT_GROWTH_CHUNK);
+            if chunk > 0 {
+                self.slots.reserve_exact(chunk);
+                self.index.reserve(chunk);
+            }
+        }
         // Exact: len() < capacity <= AGGREGATOR_MAX_SLOTS (25_000) << u32::MAX.
         let idx = self.slots.len();
         self.slots.push(InstrumentSlot {
@@ -353,18 +418,54 @@ impl MultiTfAggregator {
     where
         F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
     {
-        // Advance the watermark BEFORE any gate: a post-close tick must still
-        // let the final session bar become catch-up-sealable.
-        if tick.exchange_timestamp > self.watermark_secs {
-            self.watermark_secs = tick.exchange_timestamp;
-        }
-
         if !tick_price_is_sane(tick) {
             counter!("tv_aggregator_tick_refused_total", "reason" => "price").increment(1);
             return ConsumeStats {
                 refused_price: true,
                 ..ConsumeStats::default()
             };
+        }
+
+        // Advance the watermark AFTER the price gate but BEFORE the session
+        // gate. The session-gate half is deliberate and load-bearing: a
+        // post-close tick must still let the final session bar become
+        // catch-up-sealable. The price-gate half is a security fix.
+        //
+        // ADVERSARIAL FINDING (2026-08-09, HIGH): the advance used to run
+        // before EVERY gate, on a raw `u32` LTT read straight off the wire
+        // with no range validation in any parser. A single malformed or
+        // hostile packet carrying LTT = 0xFFFFFFFF (~year 2106) was refused
+        // for FOLDING but still set the watermark ~4.29 billion. Because the
+        // watermark drives `catch_up_seal_all`, the next catch-up cycle would
+        // then satisfy `bucket_end <= cutoff` for essentially every open
+        // bucket across all ~25,000 slots and force-seal the entire live book
+        // early, with incomplete OHLCV, silently — and the watermark never
+        // regresses, so it could not recover. One crafted packet, whole-book
+        // corruption. That is worse than a crash, because nothing reports it.
+        //
+        // Two independent defences, because either alone is insufficient:
+        //   1. Only a price-sane tick may advance it at all.
+        //   2. The timestamp must fall in an ABSOLUTE plausible epoch range;
+        //      an implausible one refuses the whole tick, so it can neither
+        //      move the watermark nor fold into a far-future bucket.
+        //
+        // Defence 2 is absolute rather than a relative jump cap on purpose.
+        // A relative cap looks appealing but is WRONG at cold start: the
+        // watermark begins at 0, so the first honest tick is itself a
+        // ~1.78-billion-second jump and a relative cap clamps it to garbage.
+        // That mistake was written, caught by these tests, and replaced.
+        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
+        {
+            counter!("tv_aggregator_tick_refused_total", "reason" => "timestamp").increment(1);
+            return ConsumeStats {
+                refused_timestamp: true,
+                ..ConsumeStats::default()
+            };
+        }
+
+        if tick.exchange_timestamp > self.watermark_secs {
+            self.watermark_secs = tick.exchange_timestamp;
         }
 
         // Candle-window gate. The bucket grid is 09:15-ANCHORED
@@ -1024,6 +1125,169 @@ mod tests {
             |_, _, _, _, _| {},
         );
         assert!(stats.folded());
+    }
+
+    /// `folded()` reports success by the ABSENCE of every refusal flag, so a
+    /// newly-added refusal that is not wired into it makes a refused tick
+    /// claim it folded — a false-OK.
+    ///
+    /// The exhaustive destructure below is the mechanical half: adding a
+    /// field to `ConsumeStats` fails to COMPILE here until it is listed,
+    /// which forces whoever adds it to decide whether it belongs in
+    /// `folded()`. A plain list of assertions would silently stay green.
+    #[test]
+    fn test_every_refusal_field_makes_folded_false() {
+        let ConsumeStats {
+            sealed_count: _,
+            amended_count: _,
+            late_count: _,
+            refused_price: _,
+            out_of_session: _,
+            slot_exhausted: _,
+            refused_timestamp: _,
+        } = ConsumeStats::default();
+
+        assert!(
+            ConsumeStats::default().folded(),
+            "a clean default must count as folded, or the checks below are vacuous"
+        );
+
+        for (name, stats) in [
+            (
+                "refused_price",
+                ConsumeStats {
+                    refused_price: true,
+                    ..ConsumeStats::default()
+                },
+            ),
+            (
+                "out_of_session",
+                ConsumeStats {
+                    out_of_session: true,
+                    ..ConsumeStats::default()
+                },
+            ),
+            (
+                "slot_exhausted",
+                ConsumeStats {
+                    slot_exhausted: true,
+                    ..ConsumeStats::default()
+                },
+            ),
+            (
+                "refused_timestamp",
+                ConsumeStats {
+                    refused_timestamp: true,
+                    ..ConsumeStats::default()
+                },
+            ),
+        ] {
+            assert!(
+                !stats.folded(),
+                "{name} is set but folded() still reports success — a refused \
+                 tick would be counted as captured"
+            );
+        }
+    }
+
+    /// ADVERSARIAL REGRESSION (2026-08-09, security review, HIGH).
+    ///
+    /// A hostile or malformed packet carrying an all-ones LTT must not be able
+    /// to shove the event-time watermark into the far future. Before the fix
+    /// the advance ran ahead of every gate, so one such packet — refused for
+    /// folding — still set the watermark to ~4.29 billion, and the next
+    /// catch-up cycle force-sealed every open bucket in the entire book with
+    /// incomplete OHLCV. Silent, whole-book, and unrecoverable (the watermark
+    /// never regresses).
+    #[test]
+    fn test_watermark_cannot_be_poisoned_by_an_all_ones_timestamp() {
+        let mut agg = MultiTfAggregator::default();
+
+        // Establish a normal watermark from a legitimate in-session tick.
+        agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN + 60, 100.0, 1),
+            None,
+            |_, _, _, _, _| {},
+        );
+        let honest = agg.watermark_secs();
+        assert_eq!(honest, OPEN + 60);
+
+        // The poison packets: sane price, garbage timestamps at both ends.
+        for poison in [u32::MAX, MAX_PLAUSIBLE_EXCHANGE_TS_SECS + 1, 0, 1] {
+            let stats = agg.consume_tick(
+                Feed::Dhan,
+                &tick(13, SEG_IDX, poison, 100.0, 2),
+                None,
+                |_, _, _, _, _| panic!("an implausible timestamp must never seal"),
+            );
+            assert!(
+                stats.refused_timestamp,
+                "ts {poison} must be refused as implausible"
+            );
+            assert!(!stats.folded());
+            assert_eq!(
+                agg.watermark_secs(),
+                honest,
+                "ts {poison} moved the watermark — one crafted packet would \
+                 then force-seal the entire book on the next catch-up"
+            );
+        }
+    }
+
+    /// A tick refused for an insane price must not move the watermark at all.
+    #[test]
+    fn test_watermark_does_not_advance_on_a_price_refused_tick() {
+        let mut agg = MultiTfAggregator::default();
+        agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN + 60, 100.0, 1),
+            None,
+            |_, _, _, _, _| {},
+        );
+        let before = agg.watermark_secs();
+
+        let stats = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN + 120, f32::NAN, 2),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(stats.refused_price, "NaN price must be refused");
+        assert_eq!(
+            agg.watermark_secs(),
+            before,
+            "a refused tick must not advance the watermark"
+        );
+    }
+
+    /// The post-close advance is LOAD-BEARING and must survive the fix: the
+    /// watermark still moves past the session end so the final bar of the day
+    /// becomes catch-up-sealable. Non-vacuity for the two tests above — they
+    /// must not have been satisfied by simply never advancing.
+    #[test]
+    fn test_watermark_still_advances_past_session_close_for_the_final_seal() {
+        let mut agg = MultiTfAggregator::default();
+        agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN + 60, 100.0, 1),
+            None,
+            |_, _, _, _, _| {},
+        );
+        let post_close = DAY + 56_500; // past the 15:40 session upper bound
+        let stats = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, post_close, 100.0, 2),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(stats.out_of_session, "post-close tick is gated for folding");
+        assert_eq!(
+            agg.watermark_secs(),
+            post_close,
+            "but it MUST still advance the watermark, or the final session \
+             bar never becomes catch-up-sealable"
+        );
     }
 
     #[test]
