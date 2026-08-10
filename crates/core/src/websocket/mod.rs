@@ -17,11 +17,31 @@
 //!   (Q4-i; spawned by `dhan_rest_stack`)
 //! - `activity_watchdog` / `market_hours_gate` / `tls` — shared plumbing the
 //!   order-update connection uses
+//!
+//! # 2026-08-09 revival — connection-layer PURE LOGIC (this round)
+//! The operator authorized a 16-connection Dhan live feed on 2026-08-09 (see
+//! `websocket-connection-scope-lock.md`, "2026-08-09 (SAME DAY, SECOND QUOTE)
+//! — 16 CONNECTIONS + depth-20/depth-200 AUTHORIZED"). The DECISION half of
+//! the deleted connection layer is rebuilt first — pure, allocation-free and
+//! exhaustively unit-testable — before anything opens a socket:
+//! - `reconnect_ladder` — the 0ms/1s/2s/5s/15s/30s-cap ladder plus the
+//!   deterministic per-connection jitter that stops sixteen simultaneously
+//!   dropped sockets from reconnecting in lockstep
+//! - `idle_watchdog` — the 27-second monotonic-clock idle-reconnect decision
+//! - `pool_budget` — per-endpoint-type and global 16-connection caps,
+//!   fail-closed, because Dhan does not reject an over-limit socket: it
+//!   silently disconnects the OLDEST one with code 805
+//!
+//! These three modules open no sockets, spawn no tasks, and are NOT yet wired
+//! into the boot sequence.
 // PR #4 (2026-05-19): `depth_connection` module DELETED.
 
 pub mod activity_watchdog;
+pub mod idle_watchdog;
 pub mod market_hours_gate;
 pub mod order_update_connection;
+pub mod pool_budget;
+pub mod reconnect_ladder;
 pub mod tls;
 pub mod types;
 
