@@ -172,15 +172,38 @@ fn banned_token() -> String {
 /// setup scripts. Banning the runtime while permitting its package manager
 /// is not a ban; these tokens close that hole.
 ///
+/// `perl` JOINED the ban 2026-08-10. It was previously excluded because
+/// `terraform-apply.yml` ran a 13-line `perl -ne` program to reject non-ASCII
+/// security-group rule descriptions. That check is now
+/// `crates/common/tests/sg_rule_description_ascii_guard.rs` — same semantics,
+/// broader coverage (it runs in `Test (common)` on every PR, where the perl
+/// step ran only on the path-filtered terraform workflow). With the last site
+/// gone, the ratchet SHRINKS, which is the only direction it may move.
+///
 /// Deliberately NOT included (each would fail the guard TODAY and needs its
 /// own decision, never a silent allowlist entry):
-///   - `venv` — `deploy-aws.yml` has a `rm -rf …/venv` CLEANUP line
-///   - `perl` — `terraform-apply.yml` non-ASCII SG-description guard
-///   - `node`/`npx` — `.mcp.json` dev-only MCP servers
-/// All three are recorded in `rust-only-forever-lock-2026-07-19.md`.
+///   - `venv` — `deploy-aws.yml` has a `rm -rf …/venv` CLEANUP line, which
+///     only DELETES; banning the token would fail on the line that removes the
+///     very thing the directive objects to
+///   - `node`/`npx` — `.mcp.json` dev-only MCP servers for the Claude session;
+///     never deployed, never in the product path. Removing them breaks local
+///     tooling and buys nothing on the box, so this is an operator call rather
+///     than a silent guard edit. Note `node` is additionally ambiguous: AWS's
+///     own "SSM managed node" wording appears in `scripts/aws-autopilot.sh`,
+///     so a bare `node` token would false-positive on prose about AWS.
+/// Both are recorded in `rust-only-forever-lock-2026-07-19.md`.
 fn banned_tokens() -> Vec<String> {
     let mut tokens = vec![banned_token()];
-    for extra in ["pip", "pipx", "uv", "uvx", "poetry", "conda", "virtualenv"] {
+    for extra in [
+        "pip",
+        "pipx",
+        "uv",
+        "uvx",
+        "poetry",
+        "conda",
+        "virtualenv",
+        "perl",
+    ] {
         tokens.push(extra.to_string());
     }
     tokens
