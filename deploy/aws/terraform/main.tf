@@ -594,14 +594,30 @@ resource "aws_iam_role_policy" "eventbridge_ec2_scheduler" {
     Version = "2012-10-17"
     Statement = [
       {
+        # 2026-08-10 (security review): the two Describe* actions have no
+        # resource-level condition in IAM and must stay "*". Start/Stop do,
+        # and previously rode along on the same "*" — giving the daily
+        # start/stop cron authority over every instance in the account. Split
+        # so the schedule can only touch the box it schedules.
         Effect = "Allow"
         Action = [
-          "ec2:StartInstances",
-          "ec2:StopInstances",
           "ec2:DescribeInstances",
           "ec2:DescribeInstanceStatus"
         ]
         Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:StartInstances",
+          "ec2:StopInstances"
+        ]
+        Resource = "arn:aws:ec2:${var.aws_region}:*:instance/*"
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/Name" = "tv-${var.environment}-app"
+          }
+        }
       },
       {
         Effect = "Allow"

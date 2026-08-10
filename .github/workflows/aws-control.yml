@@ -120,10 +120,21 @@ jobs:
 
       - name: Market-hours guard (IST 09:15-15:30 Mon-Fri)
         id: guard
+        # 2026-08-10 (security review): both inputs come in through `env:`,
+        # never spliced into the script text. `force` is a free-form string,
+        # so a dispatched value containing a newline used to be substituted
+        # into this `run:` body BEFORE bash saw it — arbitrary commands, in a
+        # step that runs AFTER the AWS credentials are already exported into
+        # the job environment. `action` is a `choice` and is therefore
+        # constrained by GitHub, but it moves too so the pattern here is
+        # uniform and nobody has to remember which one was safe.
+        env:
+          ACTION_INPUT: ${{ github.event.inputs.action }}
+          FORCE_INPUT: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
-          action="${{ github.event.inputs.action }}"
-          force="${{ github.event.inputs.force }}"
+          action="$ACTION_INPUT"
+          force="$FORCE_INPUT"
           # Only stop/reboot/restart-app interrupt a live session.
           case "$action" in
             stop|reboot|restart-app|stop-app|rotate-ip) sensitive=1 ;;
@@ -470,11 +481,19 @@ jobs:
       # now derives from the run instead of asserting it.
       - name: Summary
         if: always()
+        # Same treatment as the guard step: dispatch inputs reach the shell as
+        # environment variables, never as text substituted into the script.
+        # This one writes them into GITHUB_STEP_SUMMARY, which is just as
+        # injectable as a command line.
+        env:
+          ACTION_INPUT: ${{ github.event.inputs.action }}
+          FORCE_INPUT: ${{ github.event.inputs.force }}
+          IID_OUT: ${{ steps.iid.outputs.id }}
         run: |
           if [ "${{ job.status }}" = "success" ]; then
             VERDICT="✅ succeeded"
           else
             VERDICT="🆘 FAILED (job.status=${{ job.status }}) — the action did NOT complete; scroll up for the AWS error"
           fi
-          echo "## AWS Control: \`${{ github.event.inputs.action }}\` — $VERDICT" >> "$GITHUB_STEP_SUMMARY"
-          echo "Instance: ${{ steps.iid.outputs.id }} | region: ${AWS_REGION} | force: ${{ github.event.inputs.force }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## AWS Control: \`$ACTION_INPUT\` — $VERDICT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Instance: $IID_OUT | region: ${AWS_REGION} | force: $FORCE_INPUT" >> "$GITHUB_STEP_SUMMARY"

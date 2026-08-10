@@ -32,6 +32,13 @@ const EPOCH_SECS_FLOAT_MIN: f64 = 1.0e9;
 /// Upper bound of the float-timestamp sanity window (see above).
 const EPOCH_SECS_FLOAT_MAX: f64 = 4.0e9;
 
+/// Magnitude ceiling for a float-typed `volume` cell before the `as i64` cast.
+///
+/// `9.2e18` is just under `i64::MAX` (~9.223e18), the same bound the Groww leg
+/// uses in `tolerant_i64`. Above it the cast saturates silently to `i64::MAX`
+/// instead of failing, and that value then poisons the whole day's fold.
+const VOLUME_FLOAT_MAX_ABS: f64 = 9.2e18;
+
 /// One 1-minute candle, keyed by its IST-minute bucket. `volume` is `i64`
 /// (exact integer compare). Prices are `f64` (our `candles_1m` and Dhan REST
 /// are both f64 — exact compare per the operator's "exact match").
@@ -149,9 +156,33 @@ pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
         ) else {
             continue;
         };
+        // 2026-08-10 (hostile review): the float fallback had NO range gate
+        // and NO rounding, unlike every sibling that parses the same wire —
+        // including `timestamp_epoch_secs` fifty lines above, which was
+        // hardened for exactly this reason when Dhan drifted its number typing
+        // on 2026-07-15. The volume fallback right next to it was not.
+        //
+        // Rust's float→int `as` SATURATES, so a legal-but-huge JSON float such
+        // as `1.0e19` became `i64::MAX` rather than being rejected. That value
+        // is not merely wrong for one row: `rest_candle_fold` sums volumes with
+        // `checked_add`, so one such cell overflows the day and stamps EVERY
+        // timeframe bucket for that (feed, sid, day) with `i64::MAX`, and the
+        // operator is then told "stored volume is a FLOOR for the affected
+        // buckets" — asserting the true volume is at least i64::MAX, when it
+        // was one garbage cell. The Groww leg writing the SAME table rejects
+        // the identical input and stores 0; the two legs disagreed by i64::MAX.
+        //
+        // `.round()` rather than truncation matches `parse_spot_bars`, which
+        // reads these rows back out of QuestDB — truncating here and rounding
+        // there made a 19095.7 wire value differ by 1 across a cross-verify.
         let volume = vol[i]
             .as_i64()
-            .or_else(|| vol[i].as_f64().map(|f| f as i64))
+            .or_else(|| {
+                vol[i]
+                    .as_f64()
+                    .filter(|f| f.is_finite() && f.abs() < VOLUME_FLOAT_MAX_ABS)
+                    .map(|f| f.round() as i64)
+            })
             .unwrap_or(0);
         out.push(MinuteCandle {
             minute_ts_ist_nanos: intraday_utc_secs_to_ist_minute_nanos(t),
@@ -378,5 +409,67 @@ mod tests {
             intraday_utc_secs_to_ist_minute_nanos(1_784_087_100),
             "rounds to 1784087100, not truncates to ...099"
         );
+    }
+
+    #[test]
+    fn test_huge_float_volume_is_rejected_not_saturated_to_i64_max() {
+        // THE BUG: `1.0e19 as i64` saturates to i64::MAX in Rust. One such
+        // cell used to overflow the day's volume fold and stamp EVERY
+        // timeframe bucket for that (feed, sid, day) with i64::MAX, under an
+        // operator message claiming the true volume was at least that.
+        let body = r#"{"open":[1.0],"high":[2.0],"low":[0.5],"close":[1.5],
+                       "volume":[1.0e19],"timestamp":[1700000000]}"#;
+        let c = parse_intraday_1m_candles(body);
+        assert_eq!(c.len(), 1, "the row itself must still parse");
+        assert_eq!(
+            c[0].volume, 0,
+            "an out-of-range float volume must be REFUSED (0), never saturated \
+             to i64::MAX — the Groww leg parsing the same wire into the same \
+             table already rejects it, and the two must not disagree by i64::MAX"
+        );
+    }
+
+    #[test]
+    fn test_json_cannot_express_a_non_finite_volume_so_the_guard_is_defensive() {
+        // Recorded rather than asserted, because I checked instead of assuming:
+        // serde_json REJECTS `1e400` at the DOCUMENT level ("number out of
+        // range"), and JSON has no NaN/Infinity literal at all. So the
+        // `is_finite()` half of the volume guard can never fire from a parsed
+        // wire body — it is belt-and-braces against a future caller that builds
+        // a Value some other way, not a reachable Dhan case.
+        //
+        // The REACHABLE case is the finite-but-huge one, covered by
+        // `test_huge_float_volume_is_rejected_not_saturated_to_i64_max` above.
+        // Saying this out loud stops a later reader from believing the finite
+        // check is what protects us, when the magnitude bound does the work.
+        let body = r#"{"open":[1.0],"high":[2.0],"low":[0.5],"close":[1.5],
+                       "volume":[1e400],"timestamp":[1700000000]}"#;
+        assert!(
+            parse_intraday_1m_candles(body).is_empty(),
+            "an out-of-range float makes the WHOLE document unparseable, so the \
+             existing malformed-body path handles it — not the volume guard"
+        );
+    }
+
+    #[test]
+    fn test_fractional_float_volume_rounds_not_truncates() {
+        // `parse_spot_bars` rounds when reading these rows back out of
+        // QuestDB. Truncating here made a cross-verify see a phantom 1-unit
+        // difference against the same wire value.
+        let body = r#"{"open":[1.0],"high":[2.0],"low":[0.5],"close":[1.5],
+                       "volume":[19095.7],"timestamp":[1700000000]}"#;
+        let c = parse_intraday_1m_candles(body);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].volume, 19096, "must round, matching parse_spot_bars");
+    }
+
+    #[test]
+    fn test_ordinary_integer_volume_is_unchanged() {
+        // Non-vacuity: the guard must not have broken the normal path.
+        let body = r#"{"open":[1.0],"high":[2.0],"low":[0.5],"close":[1.5],
+                       "volume":[123456],"timestamp":[1700000000]}"#;
+        let c = parse_intraday_1m_candles(body);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].volume, 123_456);
     }
 }
