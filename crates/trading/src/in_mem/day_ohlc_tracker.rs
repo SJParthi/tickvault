@@ -117,6 +117,38 @@ impl DayOhlc {
     /// `day_open` is set ONCE per trading day and never mutated thereafter.
     #[inline]
     pub fn update_tick(&mut self, last_price: f64) {
+        // INGEST GATE (2026-08-10, hostile review). The only protection here
+        // used to be the `debug_assert!` inside `arm_from_first_tick`, and the
+        // release profile does not enable debug assertions — so in production
+        // that check does not exist.
+        //
+        // The failure it lets through is absorbing and silent. The Dhan
+        // parsers are PROVEN to emit NaN LTP (four parser tests assert
+        // `last_traded_price.is_nan()` on real packet shapes). If the FIRST
+        // tick of a day carries NaN, all four fields arm to NaN and `armed`
+        // flips true. Every later comparison is then false — `100.0 > NaN` and
+        // `100.0 < NaN` are both false — so `day_high` and `day_low` stay NaN
+        // for the entire session while `is_armed()` reports true and
+        // `snapshot()` hands the NaN out as a valid reading. Only the daily
+        // reset clears it.
+        //
+        // A zero or negative first tick is the quieter variant: it arms
+        // `day_low` at 0.0 and nothing is ever below it, producing a
+        // plausible-looking "day low 0.00" that no reader would question. The
+        // old excuse for tolerating that — "tick_processor filters it
+        // downstream" — refers to a module deleted in the 2026-07-17 sweep.
+        //
+        // Refusing costs one comparison and loses nothing: a non-finite or
+        // non-positive price is not a price. Same shape as the ingest gate
+        // §28.4 added to IndicatorEngine::update, and as
+        // RiskEngine::update_market_price.
+        //
+        // Dormant today (no tick publisher exists) but not hypothetical: the
+        // Dhan live main-feed revival was operator-authorized 2026-08-09, and
+        // restoring the publisher is precisely what that work does.
+        if !last_price.is_finite() || last_price <= 0.0 {
+            return;
+        }
         if !self.armed {
             self.arm_from_first_tick(last_price);
             return;
@@ -449,5 +481,66 @@ mod tests {
     fn test_ist_seconds_of_day_within_bounds() {
         let sec = ist_seconds_of_day();
         assert!(sec < 86_400);
+    }
+
+    // ---- ingest gate (2026-08-10 hostile review) --------------------------
+
+    #[test]
+    fn test_nan_first_tick_does_not_arm_or_poison_the_day() {
+        // THE BUG: pre-fix this armed all four fields to NaN and set
+        // armed=true, after which every comparison was false forever. The
+        // only guard was a debug_assert, which the release profile compiles
+        // out — so this was live in production and invisible.
+        let mut d = DayOhlc::disarmed();
+        d.update_tick(f64::NAN);
+        assert!(
+            !d.is_armed(),
+            "a NaN tick must not arm the day — arming on it poisons high/low \
+             for the whole session, because every later comparison against NaN \
+             is false in both directions"
+        );
+
+        // The next honest tick must arm cleanly, as if the NaN never arrived.
+        d.update_tick(100.0);
+        assert!(d.is_armed());
+        assert_eq!(d.day_high, 100.0);
+        assert_eq!(d.day_low, 100.0);
+        assert_eq!(d.day_open, 100.0);
+    }
+
+    #[test]
+    fn test_nan_mid_session_tick_cannot_poison_an_armed_day() {
+        let mut d = DayOhlc::disarmed();
+        d.update_tick(100.0);
+        d.update_tick(105.0);
+        d.update_tick(f64::NAN);
+        d.update_tick(f64::INFINITY);
+        d.update_tick(f64::NEG_INFINITY);
+        assert_eq!(d.day_high, 105.0, "high must survive a NaN/Inf tick");
+        assert_eq!(d.day_low, 100.0, "low must survive a NaN/Inf tick");
+        assert_eq!(d.day_close, 105.0, "close must not adopt a non-finite tick");
+    }
+
+    #[test]
+    fn test_zero_and_negative_first_tick_are_refused() {
+        // The quiet variant: arming at 0.0 gives a day low nothing can beat,
+        // and "day low 0.00" reads as data rather than as a fault.
+        for bad in [0.0_f64, -1.0_f64] {
+            let mut d = DayOhlc::disarmed();
+            d.update_tick(bad);
+            assert!(!d.is_armed(), "{bad} must not arm the day");
+        }
+    }
+
+    #[test]
+    fn test_a_refused_tick_leaves_close_untouched() {
+        let mut d = DayOhlc::disarmed();
+        d.update_tick(42.5);
+        d.update_tick(0.0);
+        assert_eq!(
+            d.day_close, 42.5,
+            "a refused tick must not become the day close — that would publish \
+             a zero price as the last traded value"
+        );
     }
 }
