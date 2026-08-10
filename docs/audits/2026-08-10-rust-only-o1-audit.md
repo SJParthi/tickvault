@@ -188,6 +188,74 @@ list already warns of itself that it was found incomplete once before
 on t4g.medium"), DHAT zero-alloc assertions, and the memory ceilings. No bench or
 test was run, so this audit makes no runtime claim about them.
 
+## §4b. Enforcement-chain security — one CRITICAL bypass [V]
+
+The fifth agent completed after the first commit of this document. Its top
+finding was re-verified by reading the source directly.
+
+### CRITICAL — a newline defeats the compound-command guard
+
+`.claude/hooks/pre-tool-dispatch.sh`
+
+Two independent defects combine into a full bypass of the pre-commit battery:
+
+1. **The separator alternation (L21) lists only `&&`, `||` and semicolon —
+   newline is absent.** `grep` is line-oriented, so in a two-line command
+   neither line contains a separator followed by a gated verb, and **the guard
+   does not fire.** (Verified: this same guard DID correctly block an
+   ampersand-joined stage-then-commit during this session, so the documented
+   path works and only the newline path leaks. It also blocked an early draft
+   of this very section for quoting its own patterns — the matcher is
+   content-blind.)
+
+2. **Routing (L47-55) is first-substring-match-wins, and the push arm is
+   tested BEFORE the commit arm**, each arm ending in `exit $?`. Neither test
+   is anchored, so a command containing BOTH verbs matches the push arm first
+   and routes to the push gate **only**; the commit gate is never reached.
+
+**Consequence:** a single Bash call carrying a commit on one line and a push on
+the next runs **neither** the compound block **nor** `pre-commit-gate.sh`. That
+skips fmt, banned-pattern scan, data-integrity, O(1)/dedup scan,
+**secret-scanner**, version-pinning, commit-message validation and the
+commit-time invariant test. Worse, `pre-push-gate.sh` computes its diff against
+`HEAD` *before* the pending commit exists, so the new commit's content is
+invisible to it as well. CI is the only remaining backstop.
+
+**Deliberately NOT exploited and NOT fixed here.** The minimal fix is to add
+newline to the separator alternation, and to make the router run *both* gates,
+in order, when both verbs are present. I did not apply it: the operator deferred
+remediation, and changing enforcement routing can block every future commit if it
+misfires — that is the operator's call, not mine.
+
+### HIGH — a second auto-merge arming path that never reads All Green [A]
+
+`.github/workflows/auto-merge.yml:46-68` — the manual-dispatch fallback arms
+GitHub auto-merge after checking only same-repo origin and non-draft. It **never
+consults the `all-green` job result**. That is a side door around the merge-gate
+lock's central control and reproduces the 2026-07-03 red-merge class. The file's
+header credits "the same guard from PR #1390", but that guard was the fork/draft
+check only.
+
+### The All-Green fan-in itself reviewed CLEAN [A]
+
+`needs:` covers every job defined in `ci.yml` (no orphan job that runs without
+gating); a skipped result fails the gate except the documented
+`{commit-lint, design-first-wall, local-runtime-block}` carve-out on non-PR
+events; a missing/null job result renders `None` and is treated as failure. No
+script injection (`pull_request_target`, unsanitised PR title/body interpolated
+into a run block) and no `permissions: write-all` anywhere in `.github/workflows/`.
+
+### Lower-severity, both NEW [A]
+
+- `aws-control.yml:426-441` — SSM values decrypted into a plain shell variable
+  and passed as a CLI argument. Because the value never flowed through the
+  `secrets:` context, Actions' automatic log-masking does **not** apply; a future
+  trace flag or an argv-echoing error would print real credentials into the log.
+- `.claude/hooks/secret-scanner.sh:79-88` — a line containing `example`/`test_`/
+  `mock`/`stub`/`fixture`/`dummy` **anywhere** is excluded, so a real token on a
+  line carrying a trailing "stub for tests" comment passes both the local
+  scanner and the CI lane that reuses the same script.
+
 ## §5. Recommended fix order (NOT applied — operator's call)
 
 1. **Invert the guard's scope.** Replace the extension allow-list with *scan every
@@ -212,11 +280,12 @@ policy decision with real cost, and this audit deliberately does not presume it.
 Six agents dispatched; **five launched** (one — the vacuous-guard hunter — failed
 on a transient model-availability error, not a real fault). **Four completed and
 are folded in:** interpreted-language census, guard bypass hunt, O(1) hot-path
-verification, CI/deploy non-Rust sweep. **One was still running at commit time:**
-the enforcement-chain security review (hook/CI bypass surface, All-Green fan-in
-integrity, secret exposure, script injection). **That dimension is NOT covered
-here** and a later session should re-run it, along with the vacuous-guard sweep
-across all `*_guard.rs` files that never launched.
+verification, CI/deploy non-Rust sweep. **All five that launched have now
+completed** — the enforcement-chain security review landed after the first commit
+of this document and is folded in as §4b. **Still NOT covered:** the
+vacuous-guard sweep across all `*_guard.rs` files, whose agent never launched. A
+later session should run that dimension; `rust_only_guard.rs` is confirmed
+vacuity-prone (§2.1) and its siblings were never checked for the same pattern.
 
 Cross-agent review changed two conclusions before commit: the CI JavaScript was
 demoted from "merge-blocking" to "not on the merge path" after direct
