@@ -552,7 +552,7 @@ impl TickWriter {
     // exercised by tick_writer_new_is_lazy_and_buffers_without_network, and every
     // append/flush path is covered via for_test().
     pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {
-        match Sender::from_conf(&ticks_ilp_http_conf(config)) {
+        match Sender::from_conf(ticks_ilp_http_conf(config)) {
             Ok(s) => {
                 let b = s.new_buffer();
                 Self {

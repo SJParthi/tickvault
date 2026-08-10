@@ -114,6 +114,12 @@ pub mod brutex_crossverify_persistence;
 /// the "every day, week, month, precisely at what time" system-of-record.
 /// See `.claude/rules/project/cadence-error-codes.md` §4 (CADENCE-04).
 pub mod cross_fill_audit_persistence;
+/// Daily 15:31 IST Dhan LIVE-vs-REST cross-verification audit (the revived
+/// Dhan live feed's ONLY ground truth — the wire carries no sequence number,
+/// so Dhan's own 1m tape is the only packet-loss proxy available). Cell-level
+/// findings + a daily run row whose `blind` outcome makes a zero-comparison
+/// run structurally incapable of reading as a pass (the PR #1474 lesson).
+pub mod dhan_live_crossverify_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): one classified row per feed
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
