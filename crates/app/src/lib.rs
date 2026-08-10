@@ -210,6 +210,14 @@ pub mod shutdown_class;
 // PR #3 (2026-05-19): `greeks_pipeline` module DELETED. Greeks
 // pipeline retired alongside the indices-only universe. Option Chain
 // REST overlay (PR #8) ships Dhan-computed greeks separately.
+/// Boot-time verification of the kernel limits the market-data feed depends on
+/// (2026-08-10). `deploy/aws/sysctl/99-tickvault-net.conf` raises the socket
+/// receive buffer from the stock ~212 KB to 128 MB, but user-data applies it
+/// exactly ONCE at first boot — an AMI predating the file, a hand-edited box, or
+/// a partial `sysctl --system` all leave the app running untuned and silently
+/// losing ticks under load. This reads what the kernel actually gave us and says
+/// so. Reports, never halts: the runtime is useful without tuned buffers.
+pub mod host_limits;
 pub mod infra;
 // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
 // `movers_pipeline` orchestrator is DELETED. Operator directive:

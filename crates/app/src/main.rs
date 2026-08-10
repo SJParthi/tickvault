@@ -40,7 +40,7 @@ use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
-use tickvault_app::{infra, observability, subsystem_memory};
+use tickvault_app::{host_limits, infra, observability, subsystem_memory};
 
 use std::net::SocketAddr;
 
@@ -828,6 +828,16 @@ async fn main() -> Result<()> {
     metrics::counter!("tv_orders_rejected_total").increment(0);
     metrics::counter!("tv_orders_placed_total", "mode" => "paper").increment(0);
     metrics::counter!("tv_orders_placed_total", "mode" => "live").increment(0);
+
+    // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
+    // is installed — gauges written before install resolve to a no-op recorder
+    // and would be silently discarded, same rationale as the registrations
+    // above. Deliberately non-fatal: the return value is ignored because a
+    // tuning miss degrades the feed under load, it does not make the process
+    // wrong to run — and today's runtime is REST-only, where the receive-buffer
+    // size is irrelevant. The WARN lines + `tv_host_limits_unmet_total` are the
+    // operator signal. Ratchet: crates/app/tests/host_limits_lockstep_guard.rs.
+    let _host_limits_unmet = host_limits::check_and_report_host_limits();
 
     // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
     // register the per-subsystem memory gauges, the sampler heartbeat,

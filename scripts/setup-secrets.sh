@@ -6,7 +6,9 @@
 # Secrets are managed by Parthiban via AWS Console — this script only READS.
 #
 # What it does:
-#   1. Ensures AWS CLI is installed (auto-installs via pip if missing)
+#   1. Ensures AWS CLI is installed (via scripts/ensure-aws-cli.sh — the
+#      official self-contained installer; the old package-manager path was
+#      removed 2026-08-01 under the Rust-only directive)
 #   2. Verifies AWS credentials are configured
 #   3. Verifies all 9 secrets exist in real AWS SSM
 #   4. Sends test Telegram notification
