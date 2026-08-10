@@ -115,6 +115,11 @@ jobs:
 
       - name: Open regression issue on failure
         if: failure() && steps.test.conclusion == 'failure'
+        # TODO(pin, 2026-08-10 audit): MUTABLE TAG — this is a known gap, not an
+        # oversight. The repo's other github-script uses are SHA-pinned, but the
+        # known-good SHA in this repo is for v7 and this site is a different
+        # major. Inventing or guessing a v8 SHA would be worse than the gap it
+        # closes, so it is left visible until someone resolves the real one.
         uses: actions/github-script@v8
         with:
           script: |
