@@ -41,6 +41,13 @@ pub mod idle_watchdog;
 pub mod market_hours_gate;
 pub mod order_update_connection;
 pub mod pool_budget;
+// 2026-08-09 revival, wiring round: the connection-pool SUPERVISOR — the pure
+// per-connection state machine (reconnect policy, disconnect classification,
+// subscribe guard, thundering-herd stagger) plus the thin async shell that
+// executes it. Opens no socket itself: the transport is a trait
+// (`DhanFeedSocket`) so every decision branch is unit-testable without a
+// network. Spawned by `tickvault_app::dhan_feed_stack`, DEFAULT-OFF.
+pub mod pool_supervisor;
 pub mod reconnect_ladder;
 pub mod tls;
 pub mod types;
