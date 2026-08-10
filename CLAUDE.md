@@ -27,9 +27,10 @@ this list is now stated as audited-as-of a date rather than as exhaustive.
 
 | Non-O(1) path | What it actually is |
 |---|---|
-| `crates/trading/src/in_mem/spot_bar_store.rs` | reads **O(log n)** (`RwLock` + binary search) fronted by an **O(#slots ≤ 256)** linear scan on EVERY read and write; writes O(log n) typical and **O(n)** on a worst-case memmove; `latest_n()` / `stats()` / `depth_days()` are **O(n)** scans (`latest_n` also allocates). *(The slot scan and the 256 cap were both missing here before 2026-08-09; the file's own header still said "≤ 8" after the cap was raised.)* |
+| `crates/trading/src/in_mem/spot_bar_store.rs` | reads **O(log n)** (`RwLock` + binary search). *(**Corrected 2026-08-10:** this row previously said the read was "fronted by an **O(#slots ≤ 256)** linear scan on EVERY read and write". That scan is GONE — `slots` is now `RwLock<HashMap<SlotKey, Arc<Slot>>>` and `find_slot` is a `slots.get(&key)` hash lookup, i.e. **O(1) average**. The old text OVER-stated cost, which is the safe direction to be wrong in, but it was still wrong.)* writes O(log n) typical and **O(n)** on a worst-case memmove; `latest_n()` / `stats()` / `depth_days()` are **O(n)** scans (`latest_n` also allocates). *(The slot scan and the 256 cap were both missing here before 2026-08-09; the file's own header still said "≤ 8" after the cap was raised.)* |
 | `crates/core/src/pipeline/chain_day_store.rs` | reads **O(log n)** under `RwLock` (`BTreeMap`), `latest_minutes()` **O(n)** + allocates. Kept off the decision path — `chain_snapshot::load_chain_snapshot` is the O(1) lock-free read. |
 | `crates/core/src/pipeline/tick_gap_detector.rs::scan_silence` | **O(n)** in tracked instruments. Inherent: "which instruments are silent?" is a question about all of them at once. Cold-path sweep, zero-alloc. |
+| `crates/app/src/rest_candle_fold.rs` — `FoldSlots` *(**added 2026-08-10:** this path was MISSING from this table entirely. It was an O(bars × slots) linear scan — at ~25,000 instruments that degrades to effectively **O(n²) per minute** — until repaired on 2026-08-09. It is now `index: HashMap<FoldSlotKey, u32>`, **O(1) average**, so this is a documentation gap being closed, not a live defect. It is recorded because the omission is exactly the failure mode this table's own header warns about.)* | **O(1) average** today; O(n²)-class before 2026-08-09 |
 | `crates/trading/src/candles/multi_tf_aggregator.rs` slot growth | a single growth step is **O(n)** and UNBOUNDED (the `Vec` copies every existing ~5.4 KB slot). Eliminated by pre-sizing with `with_capacity` at boot; never claimed bounded. |
 
 Each of those files states its own complexity honestly in its own header — this
@@ -181,7 +182,16 @@ crates/
 ### crates/api — HTTP Server (12 routes)
 
 Post-AWS-lifecycle (PRs #2-#7d, 2026-05-19) the API surface narrowed
-to operator/observability endpoints. The entire `/portal/*` HTML
+to operator/observability endpoints.
+
+> **Corrected 2026-08-10 (audit):** the sentence below is true of `/portal/*`
+> SPECIFICALLY, but is STALE read as a global "there is no frontend" claim.
+> **Four browser-facing surfaces are live today** (~1,053 lines of JavaScript):
+> `crates/api/src/handlers/{dashboard_page,feeds_page,board_page}.rs` and
+> `crates/aws-lambdas/src/operator_control_console.html`. They postdate the
+> 2026-05-19 retirement and are the legitimate frontend set under the operator's
+> "Rust only, except frontend" carve-out. Nothing else qualifies — server-side
+> shell and CI JavaScript cannot claim that exemption. The entire `/portal/*` HTML
 frontend + `/api/option-chain` + `/api/pcr` + `/api/market/indices`
 + `/api/movers*` + `/api/instruments/*` + `/api/index-constituency*`
 routes were retired (replacement: CloudWatch Dashboards / Telegram /
