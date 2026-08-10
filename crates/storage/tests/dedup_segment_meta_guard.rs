@@ -312,7 +312,20 @@ fn every_audit_dedup_key_must_include_designated_timestamp_ts() {
 // PR-C3, 2026-07-14; zero callers). The `prev_day_ohlcv` table stays
 // read-only, SEBI-retained, DB-side DEDUP config intact — the same shape as
 // the DEDUP_KEY_TICKS removal above. The surviving two keys stay pinned.
-const FEED_KEYED_MARKET_DATA_KEYS: &[&str] = &["DEDUP_KEY_CANDLES", "DEDUP_KEY_WS_EVENT_AUDIT"];
+// REBUILD 2026-08-09: `DEDUP_KEY_TICKS` is RE-ADDED to this pinned subset.
+// `tick_persistence.rs` was rebuilt for the re-authorized Dhan live main-feed
+// WS (`websocket-connection-scope-lock.md`, dated operator quote), so the
+// constant exists again — and this is the strongest pin available for it:
+// the test below panics if the constant is renamed, removed, or ever loses
+// `feed`. `ticks` is the table where losing a key column is most expensive
+// (its DEDUP additionally carries `capture_seq`, the intra-second tiebreaker
+// without which second-granular Dhan timestamps collapse every tick but the
+// last in each second).
+const FEED_KEYED_MARKET_DATA_KEYS: &[&str] = &[
+    "DEDUP_KEY_TICKS",
+    "DEDUP_KEY_CANDLES",
+    "DEDUP_KEY_WS_EVENT_AUDIT",
+];
 
 #[test]
 fn per_feed_market_data_dedup_keys_must_include_feed() {

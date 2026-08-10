@@ -225,7 +225,15 @@ jobs:
           set -euo pipefail
           ZIP_DIR="${{ env.TF_DIR }}/.lambda-zips"
           mkdir -p "${ZIP_DIR}"
-          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control"
+          # MUST stay in lockstep with the [[bin]] targets in
+          # crates/aws-lambdas/Cargo.toml. A bin declared there but absent
+          # here builds fine and is silently never zipped; terraform then
+          # fails at APPLY time -- i.e. AFTER real infrastructure has already
+          # changed. That is how the 2026-08-09 apply died: dhan-token-minter
+          # reached Cargo.toml + terraform but not this list, so the run
+          # rebuilt the EC2 box and then aborted red. Pinned by
+          # crates/common/tests/lambda_zip_bins_lockstep_guard.rs.
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control dhan-token-minter"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
           #
           # 2026-08-01 (operator directive — Rust-O(1)-only workspace): this
@@ -428,7 +436,15 @@ jobs:
           set -euo pipefail
           ZIP_DIR="${{ env.TF_DIR }}/.lambda-zips"
           mkdir -p "${ZIP_DIR}"
-          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control"
+          # MUST stay in lockstep with the [[bin]] targets in
+          # crates/aws-lambdas/Cargo.toml. A bin declared there but absent
+          # here builds fine and is silently never zipped; terraform then
+          # fails at APPLY time -- i.e. AFTER real infrastructure has already
+          # changed. That is how the 2026-08-09 apply died: dhan-token-minter
+          # reached Cargo.toml + terraform but not this list, so the run
+          # rebuilt the EC2 box and then aborted red. Pinned by
+          # crates/common/tests/lambda_zip_bins_lockstep_guard.rs.
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control dhan-token-minter"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
           #
           # 2026-08-01 (operator directive — Rust-O(1)-only workspace): this

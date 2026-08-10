@@ -42,10 +42,13 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 /// The NSE regular session closes at 15:30:00 — the candle window is
 /// the half-open interval `[09:15:00, 15:30:00)`, so the last 1-minute
 /// candle is `[15:29:00, 15:30:00)` (stamped 15:29). 375 1m candles/day.
-/// Test-only since the stage-3 dead-WS sweep (2026-07-17): its sole
-/// production consumer was the DELETED tick aggregator's session-window
-/// truncation; the pin tests below keep the canonical value asserted.
-#[cfg(test)]
+/// Production consumer restored 2026-08-09 with the tick aggregator rebuild:
+/// `MultiTfAggregator::consume_tick` gates the candle window on
+/// `[MARKET_OPEN_SECS_OF_DAY_IST, MARKET_CLOSE_SECS_OF_DAY_IST)`. (It was
+/// `#[cfg(test)]` between the 2026-07-17 stage-3 sweep, which deleted its
+/// only caller, and that rebuild.) NOTE the value is 56_400 = 15:40:00 IST,
+/// not 15:30 — the NSE CAS change of 2026-08-03; the pin test below asserts
+/// it against the common-crate G1 gate so the two can never drift.
 pub(crate) const MARKET_CLOSE_SECS_OF_DAY_IST: u32 = 56_400;
 
 /// Runtime-indexable handle for the 21 candle timeframes.
@@ -418,6 +421,58 @@ mod tests {
         }
     }
 
+    /// APPEND-ONLY ORDINAL PIN (2026-08-09, added with the tick-aggregator
+    /// rebuild).
+    ///
+    /// Every other ordinal test in this file derives its expectation from
+    /// `TfIndex::ALL` or from `as u8`, so all of them stay green if a variant
+    /// is INSERTED in the middle and `ALL` is updated to match. That edit is
+    /// exactly the catastrophic one: the ordinal is serialised into
+    /// seal-spill records ON DISK (`SEAL_SPILL_FORMAT_VERSION` 1) and used as
+    /// the `[…; TF_COUNT]` slot index, so inserting `S45` between `D1` and
+    /// `S1` would silently re-interpret every already-spilled ordinal ≥ 5 as
+    /// a different timeframe — historical bars re-mapped, no error anywhere.
+    ///
+    /// This test pins each variant to a LITERAL integer. Appending a new
+    /// variant at the end leaves every literal below untouched and passes;
+    /// inserting or reordering fails the build. Add new frames HERE at the
+    /// bottom only.
+    #[test]
+    fn test_tf_index_ordinals_are_append_only_literal_pins() {
+        assert_eq!(TfIndex::M1 as u8, 0);
+        assert_eq!(TfIndex::M3 as u8, 1);
+        assert_eq!(TfIndex::M5 as u8, 2);
+        assert_eq!(TfIndex::M15 as u8, 3);
+        assert_eq!(TfIndex::D1 as u8, 4);
+        assert_eq!(TfIndex::S1 as u8, 5);
+        assert_eq!(TfIndex::S2 as u8, 6);
+        assert_eq!(TfIndex::S3 as u8, 7);
+        assert_eq!(TfIndex::S4 as u8, 8);
+        assert_eq!(TfIndex::S5 as u8, 9);
+        assert_eq!(TfIndex::S6 as u8, 10);
+        assert_eq!(TfIndex::S7 as u8, 11);
+        assert_eq!(TfIndex::S8 as u8, 12);
+        assert_eq!(TfIndex::S9 as u8, 13);
+        assert_eq!(TfIndex::S10 as u8, 14);
+        assert_eq!(TfIndex::S11 as u8, 15);
+        assert_eq!(TfIndex::S12 as u8, 16);
+        assert_eq!(TfIndex::S13 as u8, 17);
+        assert_eq!(TfIndex::S14 as u8, 18);
+        assert_eq!(TfIndex::S15 as u8, 19);
+        assert_eq!(TfIndex::S30 as u8, 20);
+        // The pinned block above must cover EVERY variant: a new appended
+        // frame that nobody pinned would slip through otherwise.
+        assert_eq!(
+            TF_COUNT, 21,
+            "a frame was added — pin its literal ordinal above"
+        );
+        // …and the seconds are pinned per-ordinal too, so a variant cannot be
+        // re-pointed at a different bucket size while keeping its ordinal.
+        assert_eq!(TfIndex::M1.seconds_per_bucket(), 60);
+        assert_eq!(TfIndex::D1.seconds_per_bucket(), 86_400);
+        assert_eq!(TfIndex::S1.seconds_per_bucket(), 1);
+        assert_eq!(TfIndex::S30.seconds_per_bucket(), 30);
+    }
     #[test]
     fn test_tf_index_ordinal_round_trip() {
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
