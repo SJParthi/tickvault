@@ -6,17 +6,23 @@
 //! Two of the three alarms in `order-side-alarms.tf` watch metrics that have
 //! **ZERO production emit sites** anywhere under `crates/*/src`:
 //!
-//! | alarm                        | metric                    |
-//! |------------------------------|---------------------------|
-//! | `tv-<env>-daily-loss-breach` | `tv_daily_pnl`            |
-//! | `tv-<env>-order-fill-lag-high` | `tv_order_fill_lag_seconds` |
+//! | alarm                          | metric                      | state |
+//! |--------------------------------|-----------------------------|-------|
+//! | `tv-<env>-daily-loss-breach`   | `tv_daily_pnl`              | **ARMED 2026-08-10** — emit site landed, row removed from the ledger below |
+//! | `tv-<env>-order-fill-lag-high` | `tv_order_fill_lag_seconds` | still dormant (Phase-1 owns the emitter) |
 //!
 //! That is INTENTIONAL pre-wiring ("arm-on-arrival" — the emit sites ship
 //! with cluster A / Phase-1), so the alarms must NOT be deleted. But both
 //! carry `treat_missing_data = "notBreaching"`, which makes a metric that
-//! never publishes evaluate as **OK** — visually identical to two healthy
-//! alarms. The daily-loss KILL SIGNAL therefore does not exist via this
-//! route today, and nothing in the console says so.
+//! never publishes evaluate as **OK** — visually identical to a healthy
+//! alarm, with nothing in the console saying otherwise.
+//!
+//! Precision the original text got wrong, corrected 2026-08-10: the phrase
+//! "the daily-loss KILL SIGNAL does not exist" was too strong. The in-process
+//! kill switch always existed and worked — `evaluate_daily_loss_halt` reads
+//! the risk engine's fields directly. What did not exist was this INDEPENDENT
+//! route, which matters precisely because its job is to page when the
+//! app-side Telegram leg is degraded.
 //!
 //! ## What this guard enforces (both directions — the anti-drift contract)
 //!
@@ -32,8 +38,8 @@
 //! Point 3 is the whole reason this is a test and not a comment: a comment
 //! claiming dormancy silently becomes a LIE the day someone wires the gauge.
 //!
-//! Scope note: `tv_daily_pnl` / `tv_order_fill_lag_seconds` appear today only
-//! inside `crates/*/tests/` guard files, so scanning `crates/*/src` alone is
+//! Scope note: the remaining dormant metric appears today only inside
+//! `crates/*/tests/` guard files, so scanning `crates/*/src` alone is
 //! sufficient and needs no `#[cfg(test)]` heuristics.
 
 #![cfg(test)]
@@ -44,11 +50,19 @@ use std::path::{Path, PathBuf};
 /// The two (alarm resource name, metric name, human label) triples this
 /// guard governs. Adding a row here is how a future dormant alarm opts in.
 const DORMANT_ALARMS: &[(&str, &str, &str)] = &[
-    (
-        "daily_loss_breach",
-        "tv_daily_pnl",
-        "daily-loss kill signal",
-    ),
+    // 2026-08-10 — `daily_loss_breach` / `tv_daily_pnl` REMOVED from this
+    // ledger because the metric was ARMED: `RiskEngine::daily_loss_state` now
+    // publishes the gauge. This is the transition the three tests below were
+    // written to force, and it worked exactly as designed — the arming PR
+    // landed the emit site, `dormancy_claim_is_true_today` went red, and the
+    // failure message named the four things to do (strip the DORMANT markers,
+    // re-decide treat_missing_data, update the tf ledger, delete this row).
+    // All four were done in that PR. The alarm's `treat_missing_data` was
+    // consciously KEPT at "notBreaching" with the reason recorded in
+    // `order-side-alarms.tf`: the box is off outside 08:30-17:30 IST weekdays,
+    // so no-data is the normal state and "breaching" would page nightly — with
+    // the honest limit that this alarm therefore cannot detect an in-session
+    // data outage, which is the liveness alarm's job.
     (
         "order_fill_lag_high",
         "tv_order_fill_lag_seconds",
