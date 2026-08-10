@@ -7,15 +7,24 @@
 > | # | Item | Status |
 > |---|---|---|
 > | 1 | **CRITICAL** — gate-bypass routing in the dispatch hook | ✅ **FIXED + bite-tested** (this session) |
-> | 2 | Guard vacuity: add a non-emptiness assert on the scanned corpus | ⬜ TODO |
-> | 3 | Guard case-sensitivity: lowercase before matching | ⬜ TODO |
-> | 4 | Pin both guard allowlists at length 0 so re-growing fails the build | ⬜ TODO |
-> | 5 | Pin the 4 mutable action tags | ⬜ TODO |
-> | 6 | Correct 3 stale claims in the master doc (2 O(1) entries + frontend-retired) | ⬜ TODO |
-> | 7 | Close the second auto-merge arming path that never reads All Green | ⬜ TODO |
+> | 2 | Guard vacuity: add a non-emptiness assert on the scanned corpus | 🔵 **OWNED BY THE PARALLEL SESSION** |
+> | 3 | Guard case-sensitivity: lowercase before matching | 🔵 **OWNED BY THE PARALLEL SESSION** |
+> | 4 | Pin both guard allowlists at length 0 so re-growing fails the build | 🔵 **OWNED BY THE PARALLEL SESSION** |
+> | 5 | Pin the mutable action tags | ✅ **DONE** (3 of 4 pinned; the 4th is a different major with no verified SHA and is flagged in-file rather than guessed) |
+> | 6 | Correct 3 stale claims in the master doc (2 O(1) entries + frontend-retired) | ✅ **DONE + guard re-verified** |
+> | 7 | Close the second auto-merge arming path that never reads All Green | ✅ **DONE + bite-tested 6 cases** |
 > | 8 | Tighten the over-broad secret-scanner line exclusion | ⬜ TODO |
 > | 9 | **OPERATOR DECISION** — are 18 CI JavaScript blocks, 1 Perl gate and 94 shell scripts in scope for "Rust only"? | ⬛ BLOCKED on operator |
 > | 10 | Vacuous-guard sweep across ALL `*_guard.rs` (its agent never launched) | ⬜ TODO |
+>
+> ⚠ **TWO SESSIONS ARE WORKING THIS REPO.** A parallel session ("Market data
+> platform analysis") is mid-edit on `crates/common/tests/rust_only_guard.rs`
+> (items 2/3/4). This session has deliberately NOT touched that file — two
+> sessions editing one file is how work gets lost. Confirm which branch that
+> session targets before merging either. Note also that it reported the pinned
+> toolchain's standard library missing in its container and fell back to stable
+> 1.94.1, while CI pins 1.95.0 — its local green is therefore NOT the final
+> word; CI on the pinned toolchain is.
 >
 > **Before running any cargo command:** check `df -h /` first. Each commit triggers
 > the invariant test, which rebuilds `target/` to ~28 GB against a ~38 GB quota.
