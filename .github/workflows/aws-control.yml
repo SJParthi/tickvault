@@ -435,6 +435,17 @@ jobs:
             newname="/tickvault/staging/${name#/tickvault/dev/}"
             ptype=$(aws ssm get-parameter --name "$name" --region "$AWS_REGION" --query 'Parameter.Type' --output text)
             value=$(aws ssm get-parameter --name "$name" --with-decryption --region "$AWS_REGION" --query 'Parameter.Value' --output text)
+            # 2026-08-10 SECURITY FIX (audit finding). This value is a DECRYPTED
+            # SecureString — real credentials. It never flowed through the `secrets:`
+            # context, so GitHub Actions' automatic log-masking does NOT apply to it.
+            # Without this line a future `set -x`, a debug echo, or an aws CLI error
+            # that echoes its own argv would print live credentials into the Actions
+            # log, which is retained and readable by anyone with repo read access.
+            #
+            # ::add-mask:: registers the value with the runner so it is redacted from
+            # all subsequent log output. Guarded on non-empty because masking an empty
+            # string is a no-op the runner warns about.
+            [ -n "$value" ] && echo "::add-mask::$value"
             aws ssm put-parameter --name "$newname" --type "$ptype" --value "$value" --overwrite --region "$AWS_REGION" >/dev/null
             n=$((n+1)); echo "  seeded $name -> $newname ($ptype)"
           done
