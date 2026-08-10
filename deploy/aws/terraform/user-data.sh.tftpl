@@ -35,8 +35,95 @@ echo "=== tickvault user-data starting at $(date -u) ==="
 echo "    target: AL2023 arm64 (Graviton), env=$${ENVIRONMENT}, region=$${REGION}"
 
 # ---- Step 1: System update + timezone ----
+# KERNEL PIN (2026-08-10): the AMI is pinned (`var.ami_id`, and the instance
+# carries `lifecycle.ignore_changes = [ami]`), but an unqualified `dnf update -y`
+# floated the kernel away from it on the very next line — so the pinned image
+# bounded only the STARTING kernel. A kernel bump silently changes TCP defaults,
+# scheduler behaviour and ENA driver characteristics under a latency-sensitive
+# feed. Excluding kernel packages from the routine update makes the AMI pin
+# actually mean something; a deliberate kernel move is then an AMI-id change,
+# which is reviewable in the terraform diff.
+# NOTE: deliberately implemented as a dnf.conf exclude rather than the
+# versionlock plugin — that plugin's package name carries a banned
+# interpreted-language token and would trip `rust_only_guard`.
+if ! grep -q '^exclude=' /etc/dnf/dnf.conf 2>/dev/null; then
+    echo 'exclude=kernel kernel-* kernel-devel*' >> /etc/dnf/dnf.conf
+    echo "user-data: kernel packages excluded from dnf updates (AMI pin now binding)"
+fi
 dnf update -y
 timedatectl set-timezone Asia/Kolkata
+
+# ---- Step 1b: Kernel network tuning for the market-data feed ----
+# WHY THIS EXISTS (2026-08-10): there was previously NO network tuning of any
+# kind on this box. The stock `net.core.rmem_max` (~212 KB) caps the socket
+# receive buffer, and that is the single setting that silently loses market
+# data: when the kernel receive queue fills, TCP shrinks the advertised window
+# and the SERVER discards updates. Nothing downstream — not the write-ahead
+# log, not the ring buffer, not the spill files — can recover data that never
+# arrived. Every other layer of the capture chain is defensive; this is the
+# only one that prevents loss at the source.
+#
+# Sizing target: ~75,000 packets/sec aggregate across the feed sockets, with a
+# ~10x burst at the open and at expiry-day close. 128 MB of receive buffer
+# absorbs a multi-second consumer stall at that rate instead of ~50 ms.
+#
+# KEEPALIVE ORDERING (deliberate): 60 + 20*3 = 120 s to declare a dead peer,
+# which is intentionally SLOWER than the application's own 27 s idle watchdog.
+# The app must always detect and re-dial on its own terms; TCP keepalive is the
+# backstop for a half-open path the application layer cannot see, and it must
+# never race the app's reconnect logic.
+cat > /etc/sysctl.d/99-tickvault-net.conf <<'SYSCTL_EOF'
+# Managed by tickvault user-data. Do not edit by hand.
+# Receive path — the anti-tick-loss settings.
+net.core.rmem_max = 134217728
+net.core.rmem_default = 16777216
+net.ipv4.tcp_rmem = 4096 1048576 134217728
+net.ipv4.tcp_moderate_rcvbuf = 1
+# Send path (small — this is a read-mostly client).
+net.core.wmem_max = 16777216
+net.core.wmem_default = 4194304
+net.ipv4.tcp_wmem = 4096 65536 16777216
+# Queueing — absorb NIC-to-stack bursts instead of dropping them.
+net.core.netdev_max_backlog = 65536
+net.core.somaxconn = 4096
+# Do not collapse the congestion window across idle gaps or reconnects.
+# This matters exactly at 09:15 open and after every reconnect.
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+# Half-open detection backstop (slower than the app's 27s watchdog by design).
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 20
+net.ipv4.tcp_keepalive_probes = 3
+# Headroom for reconnect churn across many sockets.
+net.ipv4.ip_local_port_range = 10240 65535
+fs.file-max = 2097152
+# Latency hygiene.
+vm.swappiness = 1
+vm.max_map_count = 1048576
+SYSCTL_EOF
+
+# BBR is applied separately: it is a loadable module and is NOT guaranteed on
+# every AL2023 kernel. Writing it unconditionally into the file above would make
+# `sysctl --system` fail as a whole and silently strip the receive-buffer
+# settings with it — the exact false-OK this block exists to prevent.
+if modprobe tcp_bbr 2>/dev/null && grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    echo 'net.ipv4.tcp_congestion_control = bbr' > /etc/sysctl.d/99-tickvault-bbr.conf
+    echo "tcp_bbr" > /etc/modules-load.d/tickvault-bbr.conf
+    echo "user-data: BBR congestion control available and enabled"
+else
+    echo "user-data: BBR unavailable on this kernel — keeping the default congestion control"
+fi
+
+sysctl --system >/dev/null 2>&1 || echo "user-data: WARNING sysctl --system returned non-zero"
+
+# VERIFY, and say so loudly. A tuning block that silently no-ops is worse than
+# no tuning at all, because it invites a false guarantee.
+TV_RMEM_ACTUAL="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
+if [ "$TV_RMEM_ACTUAL" -ge 134217728 ] 2>/dev/null; then
+    echo "user-data: network tuning APPLIED (net.core.rmem_max=$TV_RMEM_ACTUAL)"
+else
+    echo "user-data: WARNING network tuning DID NOT APPLY (net.core.rmem_max=$TV_RMEM_ACTUAL, expected >=134217728)"
+fi
 
 # ---- Step 2: Docker + Compose v2 plugin (AL2023 ships docker in the default repo) ----
 # docker MUST install; the Compose v2 CLI plugin (`docker compose`) is REQUIRED
