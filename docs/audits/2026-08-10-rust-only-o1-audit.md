@@ -1,9 +1,33 @@
-# Rust-O(1)-Only Audit — 2026-08-10 (findings only; NO fixes applied)
+# Rust-O(1)-Only Audit — 2026-08-10
 
-> **Status:** EVIDENCE HANDOFF. Nothing in this file has been fixed. The operator
-> deferred remediation to a later session ("we will take care of this in another
-> session"). This document exists so that session starts from verified evidence
-> instead of re-running the audit cold.
+> ## ▶ RESUME HERE (handoff for the next session)
+>
+> **Branch:** `claude/codebase-optimization-hardening-bg3oar` · **PR #1737** (DRAFT)
+>
+> | # | Item | Status |
+> |---|---|---|
+> | 1 | **CRITICAL** — gate-bypass routing in the dispatch hook | ✅ **FIXED + bite-tested** (this session) |
+> | 2 | Guard vacuity: add a non-emptiness assert on the scanned corpus | ⬜ TODO |
+> | 3 | Guard case-sensitivity: lowercase before matching | ⬜ TODO |
+> | 4 | Pin both guard allowlists at length 0 so re-growing fails the build | ⬜ TODO |
+> | 5 | Pin the 4 mutable action tags | ⬜ TODO |
+> | 6 | Correct 3 stale claims in the master doc (2 O(1) entries + frontend-retired) | ⬜ TODO |
+> | 7 | Close the second auto-merge arming path that never reads All Green | ⬜ TODO |
+> | 8 | Tighten the over-broad secret-scanner line exclusion | ⬜ TODO |
+> | 9 | **OPERATOR DECISION** — are 18 CI JavaScript blocks, 1 Perl gate and 94 shell scripts in scope for "Rust only"? | ⬛ BLOCKED on operator |
+> | 10 | Vacuous-guard sweep across ALL `*_guard.rs` (its agent never launched) | ⬜ TODO |
+>
+> **Before running any cargo command:** check `df -h /` first. Each commit triggers
+> the invariant test, which rebuilds `target/` to ~28 GB against a ~38 GB quota.
+> Recovery when it fills: delete the agent transcript files under the session
+> tasks directory, then `cargo clean --profile dev -p <crates>`. This filled the
+> disk FIVE times in one session.
+
+> **Status:** EVIDENCE + PARTIAL REMEDIATION. The operator authorised fixes
+> ("fix and work and implement everything"), then asked for the work to be pushed
+> so it can resume in a fresh session. **Item 1 — the only CRITICAL — is fixed and
+> verified.** Items 2-8 and 10 remain; item 9 is a policy decision only the
+> operator can make. This document is the handoff.
 >
 > **Scope of the operator's ask (2026-08-10):** *"Ensure to use one and only RUST
 > O(1) in the entire workspace codebase except frontend alone so check this every
@@ -221,11 +245,31 @@ commit-time invariant test. Worse, `pre-push-gate.sh` computes its diff against
 `HEAD` *before* the pending commit exists, so the new commit's content is
 invisible to it as well. CI is the only remaining backstop.
 
-**Deliberately NOT exploited and NOT fixed here.** The minimal fix is to add
-newline to the separator alternation, and to make the router run *both* gates,
-in order, when both verbs are present. I did not apply it: the operator deferred
-remediation, and changing enforcement routing can block every future commit if it
-misfires — that is the operator's call, not mine.
+### ✅ FIXED 2026-08-10 (verified)
+
+The router now runs **both** gates, commit first, whenever a command carries both
+verbs. The fix targets the SECURITY property (every applicable gate runs) rather
+than the cosmetic rule (one verb per call), so it holds regardless of which
+separator is used — newline included.
+
+Bite-tested across five shapes; normal routing is unchanged and only the bypass
+shape changed behaviour:
+
+| Command shape | Before | After |
+|---|---|---|
+| plain commit | commit gate | commit gate *(unchanged)* |
+| plain push | push gate | push gate *(unchanged)* |
+| **commit + newline + push** | **push gate ONLY — the bypass** | **BOTH gates** |
+| pr create / pr merge | their own gates | *(unchanged)* |
+| unrelated command | no gate | *(unchanged)* |
+
+**Accepted cost, recorded not hidden:** a commit whose message merely QUOTES these
+verbs (e.g. documentation about them) now pays one extra gate run. Wasted seconds,
+never a wrong answer, and it fails in the safe direction — a redundant check
+rather than a skipped one. The compound-block regex above was deliberately left
+alone: teaching it to treat newline as a separator would block legitimate
+documentation commits, and with both gates now running it is no longer
+load-bearing for security.
 
 ### HIGH — a second auto-merge arming path that never reads All Green [A]
 

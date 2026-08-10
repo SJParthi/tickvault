@@ -40,6 +40,37 @@ fi
 
 # Route to the correct gate based on command content.
 # Only ONE gate runs per command — no wasted work.
+#
+# 2026-08-10 SECURITY FIX (audit finding, docs/audits/2026-08-10-rust-only-o1-audit.md
+# section 4b). Before this, a command carrying BOTH a commit and a push routed to
+# the push gate ONLY: the chain below is first-substring-match-wins, the push arm
+# is tested before the commit arm, and each arm ends in `exit $?`. The compound
+# block above does not catch the two-line form either, because its separator
+# alternation lists && / || / semicolon and grep is line-oriented, so a NEWLINE
+# between them matches nothing.
+#
+# Net effect of the old behaviour: one ordinary-looking two-line command skipped
+# the ENTIRE pre-commit battery — fmt, banned patterns, data integrity, dedup,
+# the SECRET SCANNER, version pinning, commit-message validation and the
+# commit-time invariant test — while both operations executed for real. The push
+# gate could not compensate: it diffs against HEAD, which at that moment does not
+# yet contain the pending commit.
+#
+# The fix deliberately targets the SECURITY property (every applicable gate runs)
+# rather than the cosmetic rule (one verb per call). Both gates now run, commit
+# first, matching execution order.
+#
+# Accepted cost, stated rather than hidden: this also fires when a verb appears
+# only inside heredoc TEXT (e.g. committing documentation that quotes these
+# commands), so such a commit pays one extra gate run. That is wasted time, never
+# a wrong answer, and it fails in the safe direction — a redundant check rather
+# than a skipped one.
+if echo "$COMMAND" | grep -q 'git commit' && echo "$COMMAND" | grep -q 'git push'; then
+  echo "$INPUT" | "$HOOKS_DIR/pre-commit-gate.sh" || exit 2
+  echo "$INPUT" | "$HOOKS_DIR/pre-push-gate.sh" || exit 2
+  exit 0
+fi
+
 if echo "$COMMAND" | grep -qE '^\s*gh\s+pr\s+merge'; then
   echo "$INPUT" | "$HOOKS_DIR/pre-merge-gate.sh"
   exit $?
