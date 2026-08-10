@@ -217,6 +217,11 @@ pub struct DhanRestStackParams {
     pub leg_pnl_tx: Option<tokio::sync::mpsc::Sender<crate::order_runtime::LegPnlEvent>>,
 }
 
+/// Capacity of the order-update ws-audit tee channel (2026-08-10). Sized to
+/// match the downstream persistence channel; overflow drops a forensic row
+/// (counted) and never stalls the socket.
+const WS_AUDIT_TEE_CAPACITY: usize = 1024;
+
 /// Cadence (seconds) of the /health token-block writer (PR-C2 re-home of
 /// the deleted lane's `spawn_token_health_writer` — B3 round-2 lineage).
 /// Matches the former 10s cadence so the /health / READY / EOD token block
@@ -798,15 +803,67 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         // The 2026-07-14 Dhan noise lock stands: this socket pages NOTHING —
         // NO NotificationService is handed to the connection.
         let order_push_notifier: Option<Arc<NotificationService>> = None;
+
+        // ---------------------------------------------------------------
+        // ws lifecycle audit + /health order_update wiring (2026-08-10).
+        //
+        // TWO gaps closed by ONE wire. Until now this spawn passed `None`
+        // for `ws_audit_tx` (the comment below called it "honestly absent
+        // rather than half-wired"), and nothing ever called
+        // `set_order_update_connected`, so GET /health rendered the only
+        // live Dhan socket as `unreported` — neither up nor down.
+        //
+        // Why the audit seam and not the auth latch: `authenticated_latch`
+        // is a ONE-SHOT (`fire_authenticated_signal_once` compare-exchanges
+        // false->true and never resets). Driving health from it would
+        // report `connected` forever after the first successful auth, right
+        // through every subsequent disconnect — a false-OK, which is the
+        // exact class Rule 11 forbids. The audit stream carries real
+        // transitions in both directions, so it is the only seam here that
+        // can report a DISCONNECT truthfully.
+        //
+        // Backpressure: the producer emits with `try_send` (drop on full,
+        // never stall the order read loop). This tee preserves that
+        // property by forwarding with `try_send` too — a slow QuestDB can
+        // cost a forensic row, never a stalled socket and never a stale
+        // health verdict, because health is updated BEFORE the forward.
+        let order_push_audit_tx = {
+            let persist_tx =
+                crate::ws_audit_consumer::spawn_ws_event_audit_consumer(config.questdb.clone());
+            let (tee_tx, mut tee_rx) = tokio::sync::mpsc::channel::<
+                tickvault_common::ws_event_types::WsEventAuditRow,
+            >(WS_AUDIT_TEE_CAPACITY);
+            let health_for_audit = params.health.clone();
+            tokio::spawn(async move {
+                use tickvault_common::ws_event_types::WsEventKind;
+                while let Some(row) = tee_rx.recv().await {
+                    let connected = match row.event_kind {
+                        WsEventKind::Connected
+                        | WsEventKind::Reconnected
+                        | WsEventKind::SleepResumed => true,
+                        WsEventKind::Disconnected
+                        | WsEventKind::DisconnectedOffHours
+                        | WsEventKind::SleepEntered
+                        | WsEventKind::StallRestarted => false,
+                    };
+                    // Health first: it is the operator-facing verdict and
+                    // must not depend on the forensic write succeeding.
+                    health_for_audit.set_order_update_connected(connected);
+                    if persist_tx.try_send(row).is_err() {
+                        metrics::counter!("tv_order_update_ws_audit_dropped_total").increment(1);
+                    }
+                }
+            });
+            Some(tee_tx)
+        };
         // Positional args of the dormant core module's entrypoint, in
         // order: url, client id, token handle, order sender, calendar,
         // then the five gated/absent seams as `None` — durable frame
         // capture (live re-arm territory), auth signal, auth latch, the
         // Telegram notifier (noise lock), the ws lifecycle audit sender
-        // (not cheaply reachable in this stack — the shared consumer
-        // helper lives with the main.rs producer sites; wiring it here is
-        // a follow-up, honestly absent rather than half-wired), and the
-        // runtime feed flag (this channel is config-gated instead).
+        // (WIRED 2026-08-10 via the tee above — it also drives the
+        // /health order_update row), and the runtime feed flag (this
+        // channel is config-gated instead).
         tokio::spawn(tickvault_core::websocket::run_order_update_connection(
             config.dhan.order_update_websocket_url.clone(),
             client_id.clone(),
@@ -817,7 +874,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
             None,
             None,
             order_push_notifier,
-            None,
+            order_push_audit_tx,
             None,
         ));
         info!(
