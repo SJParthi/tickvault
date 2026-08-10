@@ -9,7 +9,12 @@
 set -uo pipefail
 
 PROJECT_DIR="${1:-.}"
-cd "$PROJECT_DIR" || exit 0
+# 2026-08-10: was `|| exit 0` — a failed cd exited SUCCESS with no output, so
+# a bad working directory became a silent vacuous pass. That is the same
+# fail-open class both of these files were rewritten to eliminate for their
+# zero-count and missing-baseline cases; this was the last one left in a guard
+# that now gates merges. `plan-gate.sh` already does it this way.
+cd "$PROJECT_DIR" || { echo "FATAL: cannot cd to $PROJECT_DIR — refusing to pass vacuously" >&2; exit 1; }
 
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASELINE_FILE="$HOOKS_DIR/.test-count-baseline"
