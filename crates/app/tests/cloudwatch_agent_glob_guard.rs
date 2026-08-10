@@ -623,8 +623,15 @@ fn test_holiday_stop_marker_chain_is_wired() {
     let marker_call = watchdog
         .find("if holiday_stop_is_today(ssm, &env.holiday_stop_param, now).await")
         .expect("check mode must consult the marker in its not-running branch"); // APPROVED: test
+    // Pin the CALL, not the binding it is assigned to. This guard exists to
+    // enforce ORDER (marker consult before self-heal start); tying it to a
+    // variable name made it fail on 2026-08-10 for a rename that preserved the
+    // ordering completely — `let self_started = ...` became `let attempt = ...`
+    // when try_self_start started classifying capacity refusals. A guard that
+    // breaks on a faithful refactor trains people to edit the guard, which is
+    // exactly how a guard stops being trusted.
     let self_start_call = watchdog
-        .find("let self_started = try_self_start(ec2, &env.instance_id).await")
+        .find("try_self_start(ec2, &env.instance_id).await")
         .expect("check mode must keep its self-heal start for real trading days"); // APPROVED: test
     assert!(
         marker_call < self_start_call,
