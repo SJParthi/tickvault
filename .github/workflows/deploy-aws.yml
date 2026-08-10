@@ -465,10 +465,30 @@ jobs:
           SECRET_IID: ${{ secrets.EC2_INSTANCE_ID }}
         run: |
           set -euo pipefail
+          # 2026-08-10 FIX (adversarial review of my own first version). This
+          # previously ended in `2>/dev/null || true`, which LAUNDERED an API or
+          # permission failure into an empty result — indistinguishable from
+          # "no instance carries that tag". Expired credentials or a missing
+          # ec2:DescribeInstances permission would therefore fall through to the
+          # stale-secret fallback and log "No tv-prod-app instance found by tag":
+          # a false diagnosis pointing the operator AWAY from the real cause,
+          # while the deploy silently re-targeted the dead box. That is the
+          # original bug restored, wearing a reassuring warning.
+          #
+          # The call's EXIT STATUS is now distinguished from its OUTPUT: a failed
+          # call is a hard error naming the AWS stderr; only a SUCCESSFUL call
+          # that returns nothing counts as "not found".
+          set +e
           found=$(aws ec2 describe-instances --region "$REGION" \
             --filters "Name=tag:Name,Values=tv-prod-app" \
                       "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null || true)
+            --query 'Reservations[].Instances[].InstanceId' --output text 2>/tmp/tv-ec2-describe.err)
+          describe_rc=$?
+          set -e
+          if [ "$describe_rc" -ne 0 ]; then
+            echo "::error::describe-instances FAILED (exit $describe_rc). This is NOT 'instance not found' — it is an API, credential or permission failure, and falling back to the stored id would silently re-target a possibly-dead box. AWS said: $(tr '\n' ' ' < /tmp/tv-ec2-describe.err | cut -c1-400)"
+            exit 1
+          fi
           count=$(printf '%s\n' $found | grep -c . || true)
           if [ "$count" -gt 1 ]; then
             echo "::error::Found $count non-terminated tv-prod-app instances ($found). Refusing to guess which one to deploy to."
@@ -999,14 +1019,14 @@ jobs:
           probe() {
             local cid
             cid=$(aws ssm send-command \
-              --region "$REGION" --instance-ids "$IID" \
+              --region "$REGION" --instance-ids "${IID:?instance id not resolved — the resolve-prod-instance-id step must have run and succeeded}" \
               --document-name "AWS-RunShellScript" \
               --parameters 'commands=["printf STATE=; systemctl is-active tickvault 2>/dev/null || true; printf NRESTARTS=; systemctl show -p NRestarts --value tickvault 2>/dev/null || true"]' \
               --query 'Command.CommandId' --output text 2>/dev/null)
             if [ -z "$cid" ] || [ "$cid" = "None" ]; then echo "STATE=probefailed NRESTARTS="; return; fi
             sleep 4
             aws ssm get-command-invocation \
-              --region "$REGION" --command-id "$cid" --instance-id "$IID" \
+              --region "$REGION" --command-id "$cid" --instance-id "${IID:?instance id not resolved}" \
               --query 'StandardOutputContent' --output text 2>/dev/null | tr -d '[:space:]'
           }
           parse_state() { printf '%s' "$1" | sed -n 's/.*STATE=\([a-z-]*\).*/\1/p'; }
@@ -1064,7 +1084,7 @@ jobs:
               CRASHED=0; VERIFIED=1
             else
               EXT_CMD=$(aws ssm send-command \
-                --region "$REGION" --instance-ids "$IID" \
+                --region "$REGION" --instance-ids "${IID:?instance id not resolved — the resolve-prod-instance-id step must have run and succeeded}" \
                 --document-name "AWS-RunShellScript" \
                 --comment "tickvault external-stop check sha=${{ github.sha }}" \
                 --parameters 'commands=["systemctl show tickvault -p ActiveState,SubState,Result 2>/dev/null || true","echo ===JOURNAL-LAST-20===","journalctl -u tickvault -n 20 --no-pager 2>&1 || true"]' \
