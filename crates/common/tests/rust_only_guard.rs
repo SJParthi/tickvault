@@ -66,6 +66,23 @@ const TRACKED_BANNED_ALLOWLIST: &[&str] = &[];
 /// have its entry removed in the same PR.
 const INVOCATION_SITE_ALLOWLIST: &[&str] = &[];
 
+/// Every tracked-file extension this guard refuses, as `git ls-files` pathspecs.
+///
+/// SCOPE FIX (2026-08-10): this guard previously scanned `*.py` and NOTHING
+/// ELSE, so a tracked `.js` / `.ts` / `.rb` / `.pl` / `.lua` file passed GREEN —
+/// and because `banned_tokens()` deliberately excludes `node`/`npx`, a committed
+/// `.js` invoked via `npx` cleared BOTH real-tree tests. That is exactly the
+/// failure shape this file's own header warns about ("a guard is only as good as
+/// its SCOPE, and scope errors are invisible by construction: they produce
+/// green, not red") — the 2026-08-01 `pip`-verb correction was the same class.
+///
+/// Verified at fix time: `git ls-files` returns ZERO matches for every pathspec
+/// below, so widening the scope keeps both allowlists at their hard-zero floor
+/// and the ratchet can never be re-grown.
+const BANNED_FILE_PATHSPECS: &[&str] = &[
+    "*.py", "*.js", "*.mjs", "*.cjs", "*.ts", "*.rb", "*.pl", "*.lua", "*.ipynb",
+];
+
 // ============================ PURE CORE ============================
 
 /// Tracked `.py` paths NOT covered by the allowlist (must be empty).
@@ -338,37 +355,48 @@ fn load_invocation_scan_files() -> Vec<(String, String)> {
 
 // ============================ REAL-TREE TESTS ============================
 
-/// (a) NO NEW tracked `.py` — the rust-only forever-guard.
+/// (a) NO NEW tracked interpreted-language file — the rust-only forever-guard.
+/// Scope widened 2026-08-10 from `.py`-only to every extension in
+/// `BANNED_FILE_PATHSPECS` (see that const for the scope-hole record).
 #[test]
 fn no_banned_files_outside_allowlist() {
     assert_sorted_unique(TRACKED_BANNED_ALLOWLIST, "TRACKED_BANNED_ALLOWLIST");
     // 2026-08-10 ANTI-VACUITY, in the one shape that fits this test. ZERO tracked
-    // .py files is the CORRECT and desired state here, so a non-empty assert on
-    // the result would be wrong. What must be proven instead is that the LOOKUP
-    // MECHANISM still works — otherwise a broken `git ls-files` returns nothing
-    // and this guard passes for the wrong reason, indistinguishably from success.
+    // interpreted-language files is the CORRECT and desired state here, so a
+    // non-empty assert on the RESULT would be backwards. What must be proven
+    // instead is that the LOOKUP MECHANISM still works — otherwise a broken
+    // `git ls-files` returns nothing and this guard passes for the wrong reason,
+    // indistinguishable from success.
     assert!(
         git_ls_files(&["."]).len() > 100,
-        "RUST-ONLY GUARD IS BLIND: `git ls-files` returned almost nothing, so a \
-         .py file could exist and go unseen. This guard's PASS would be meaningless."
+        "RUST-ONLY GUARD IS BLIND: `git ls-files` returned almost nothing, so an \
+         interpreted-language file could exist and go unseen. This guard's PASS \
+         would be meaningless."
     );
-    let tracked_py = git_ls_files(&["*.py"]);
-    let new = py_files_not_in_allowlist(&tracked_py, TRACKED_BANNED_ALLOWLIST);
+    // Scope widened from `*.py` to the 9-extension BANNED_FILE_PATHSPECS by #1738,
+    // landed in parallel. Kept verbatim — it is strictly broader than what this
+    // test previously covered, and it composes with the assert above rather than
+    // competing with it: theirs widens WHAT is looked for, mine proves the looking
+    // actually happened.
+    let tracked_banned = git_ls_files(BANNED_FILE_PATHSPECS);
+    let new = py_files_not_in_allowlist(&tracked_banned, TRACKED_BANNED_ALLOWLIST);
     assert!(
         new.is_empty(),
-        "RUST-ONLY VIOLATION: new tracked .py file(s) {new:?}. The rust-only operator \
-         directive (2026-07-18) forbids ANY new the banned interpreter in this repo, forever. This test \
-         (crates/common/tests/rust_only_guard.rs) is the gate: do NOT extend \
-         TRACKED_BANNED_ALLOWLIST — port the logic to Rust instead."
+        "RUST-ONLY VIOLATION: new tracked interpreted-language file(s) {new:?}. The rust-only \
+         operator directive (2026-07-18) forbids ANY new interpreted-language runtime in this \
+         repo, forever. This test (crates/common/tests/rust_only_guard.rs) is the gate: do NOT \
+         extend TRACKED_BANNED_ALLOWLIST and do NOT narrow BANNED_FILE_PATHSPECS — port the \
+         logic to Rust instead."
     );
 }
 
 /// (b) The shrinking ratchet: every allowlist entry must still be tracked.
-/// A deleted .py MUST have its entry removed in the SAME PR.
+/// A deleted interpreted-language file MUST have its entry removed in the SAME PR.
+/// Scans the SAME pathspec set as test (a) so the two can never drift apart.
 #[test]
 fn allowlist_shrinks_monotonically() {
-    let tracked_py = git_ls_files(&["*.py"]);
-    let stale = stale_entries(TRACKED_BANNED_ALLOWLIST, &tracked_py);
+    let tracked_banned = git_ls_files(BANNED_FILE_PATHSPECS);
+    let stale = stale_entries(TRACKED_BANNED_ALLOWLIST, &tracked_banned);
     assert!(
         stale.is_empty(),
         "SHRINK THE RATCHET: these TRACKED_BANNED_ALLOWLIST entries point at files no longer \
