@@ -18,14 +18,24 @@ Every file, function, config decision must pass all three. No exceptions.
 O(1) is VERIFIED on the tick hot path — packet decode is fixed-offset
 `from_le_bytes` with no loop and no allocation, proven by DHAT tests that gate
 every PR, and instrument lookup is an O(1) composite-key hash. It is **not**
-universally true, and this file must not be read as claiming it is. The known
-exception is the RAM decision store `crates/trading/src/in_mem/spot_bar_store.rs`:
-reads are **O(log n)** (`RwLock` + binary search) with an O(slots) scan, writes
-are O(log n) typical and **O(n)** on a worst-case memmove, and `latest_n()` /
-`stats()` / `depth_days()` are **O(n)** full scans (`latest_n` also allocates).
-That file's own header already says so — it never claimed otherwise. Per the
-operator's standing rule, an inherently non-O(1) step is FLAGGED as such with
-its constraint and its chosen alternative; it is never relabelled O(1).
+universally true, and this file must not be read as claiming it is.
+
+**The exception list below was INCOMPLETE until 2026-08-09**, when a two-agent
+workspace-wide complexity audit found three more. That matters more than the
+entries themselves: a partial disclosure reads exactly like a complete one, so
+this list is now stated as audited-as-of a date rather than as exhaustive.
+
+| Non-O(1) path | What it actually is |
+|---|---|
+| `crates/trading/src/in_mem/spot_bar_store.rs` | reads **O(log n)** (`RwLock` + binary search) fronted by an **O(#slots ≤ 256)** linear scan on EVERY read and write; writes O(log n) typical and **O(n)** on a worst-case memmove; `latest_n()` / `stats()` / `depth_days()` are **O(n)** scans (`latest_n` also allocates). *(The slot scan and the 256 cap were both missing here before 2026-08-09; the file's own header still said "≤ 8" after the cap was raised.)* |
+| `crates/core/src/pipeline/chain_day_store.rs` | reads **O(log n)** under `RwLock` (`BTreeMap`), `latest_minutes()` **O(n)** + allocates. Kept off the decision path — `chain_snapshot::load_chain_snapshot` is the O(1) lock-free read. |
+| `crates/core/src/pipeline/tick_gap_detector.rs::scan_silence` | **O(n)** in tracked instruments. Inherent: "which instruments are silent?" is a question about all of them at once. Cold-path sweep, zero-alloc. |
+| `crates/trading/src/candles/multi_tf_aggregator.rs` slot growth | a single growth step is **O(n)** and UNBOUNDED (the `Vec` copies every existing ~5.4 KB slot). Eliminated by pre-sizing with `with_capacity` at boot; never claimed bounded. |
+
+Each of those files states its own complexity honestly in its own header — this
+summary was the stale part, not the code. Per the operator's standing rule, an
+inherently non-O(1) step is FLAGGED as such with its constraint and its chosen
+alternative; it is never relabelled O(1).
 Non-hot-path cold code (boot, daily builds, REST pulls) is not held to
 principle 2 at all.
 

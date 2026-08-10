@@ -33,7 +33,7 @@
 //!
 //! ## Read path (HONEST envelope)
 //! Guarded locks (`parking_lot::RwLock`, ~30 ns uncontended) + binary
-//! search: O(#slots ≤ 8) slot scan + O(log ring) — NOT lock-free and NOT
+//! search: O(#slots ≤ 256) slot scan + O(log ring) — NOT lock-free and NOT
 //! claimed O(1). Reads are COLD today: NO strategy consumer exists (the
 //! §28 boundary — this is the read contract only, the `chain_snapshot`
 //! precedent; any future consumer is bound by the §38.8 decision-freshness

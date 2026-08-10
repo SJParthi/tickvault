@@ -427,7 +427,22 @@ impl SealSpillWriter {
 
     /// Append one serialised seal to the daily spill file.
     /// Creates the spill directory + file if needed.
-    /// O(1) per call; uses `BufWriter` to coalesce small writes.
+    /// O(1) work per call, but **3-4 syscalls per seal — the `BufWriter`
+    /// coalesces NOTHING across calls.**
+    ///
+    /// Corrected 2026-08-09. The previous line read "uses `BufWriter` to
+    /// coalesce small writes", which is not what the code does: the
+    /// `BufWriter` is constructed and dropped INSIDE this function, so every
+    /// call pays `create_dir_all` + `open` + `write_all` + `flush`. It
+    /// coalesces the writes of a single seal, not writes across seals — the
+    /// opposite of what a reader would take from that sentence.
+    ///
+    /// The complexity claim itself is fine (constant work per seal); the
+    /// LATENCY is not bounded, because filesystem syscalls are not. This is
+    /// tier 2 of the ring -> spill -> DLQ chain and runs off the socket read
+    /// path, so it is acceptable — but if it ever moves closer to the reader
+    /// it needs the `ws_frame_spill` shape instead: a bounded channel plus a
+    /// dedicated writer task holding one long-lived `BufWriter`.
     ///
     /// Per locked decision L-C1, this is the SECOND tier of the
     /// ring → spill → DLQ chain. Failures bubble up to the caller

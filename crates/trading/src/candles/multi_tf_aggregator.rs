@@ -85,14 +85,6 @@ pub const AGGREGATOR_MAX_SLOTS: usize = 25_000;
 /// reallocs (cold path). The hard ceiling is [`AGGREGATOR_MAX_SLOTS`].
 pub const AGGREGATOR_DEFAULT_SLOTS: usize = 1_000;
 
-/// Slots added per growth step once the pre-allocated table is full.
-///
-/// Fixed-size, never doubling: growth memmoves the whole ~5.4 KB-per-slot
-/// table synchronously inside `consume_tick`, so the step size IS the
-/// worst-case hot-path pause. 1,000 slots is ~5.4 MB per move and bounds that
-/// pause no matter how large the universe grows.
-pub const AGGREGATOR_SLOT_GROWTH_CHUNK: usize = 1_000;
-
 /// Earliest `exchange_timestamp` (IST epoch seconds) treated as real.
 ///
 /// 2020-09-13. Comfortably before any tickvault data has ever existed, so it
@@ -356,29 +348,34 @@ impl MultiTfAggregator {
             }
             return None;
         }
-        // Grow in FIXED chunks, never by doubling.
+        // GROWTH IS NOT O(1) AND IS NOT BOUNDED. Pre-size to avoid it.
         //
-        // ADVERSARIAL FINDING (2026-08-09, HIGH): `Vec` doubling puts a
-        // synchronous memmove of the whole slot table inside `consume_tick`.
-        // `InstrumentSlot` is ~5.4 KB, so the 8,000 -> 16,000 growth alone
-        // moves ~43 MB — roughly 4-8 ms, i.e. 60-120 packets' worth of the
-        // 66.7 microsecond per-packet budget, while the socket reader backs up
-        // behind it and stops emitting pongs. Doubling also overshoots the
-        // ceiling: 25,000 instruments would allocate 32,768 slots (~177 MB,
-        // and ~265 MB transient with the old buffer still live), which is why
-        // the ~135 MB figure quoted on AGGREGATOR_MAX_SLOTS was understated.
+        // History, because this was got wrong once and the wrong version is
+        // superficially convincing:
         //
-        // A fixed chunk bounds the worst-case pause to one chunk-sized move
-        // regardless of how large the universe grows, and clamping to the
-        // ceiling means the table never allocates a slot it may not use.
-        if self.slots.len() == self.slots.capacity() {
-            let head_room = capacity.saturating_sub(self.slots.capacity());
-            let chunk = head_room.min(AGGREGATOR_SLOT_GROWTH_CHUNK);
-            if chunk > 0 {
-                self.slots.reserve_exact(chunk);
-                self.index.reserve(chunk);
-            }
-        }
+        // An adversarial review flagged that `Vec` doubling memmoves the whole
+        // ~5.4 KB-per-slot table inside `consume_tick` (the 8,000 -> 16,000
+        // step alone moves ~43 MB, ~4-8 ms, 60-120 packets of the 66.7 us
+        // budget, during which the reader stops emitting pongs and Dhan drops
+        // the socket). The fix attempted here was `reserve_exact` in fixed
+        // 1,000-slot chunks, documented as "bounds the worst-case pause to one
+        // chunk-sized move regardless of universe size".
+        //
+        // That claim was FALSE, and a second audit caught it. `reserve_exact`
+        // at `len == capacity` allocates a new buffer and copies ALL `len`
+        // existing slots — the copy is O(n) and grows with n exactly as
+        // doubling does. Worse, fixed chunks make the AGGREGATE quadratic:
+        // reaching 24,000 slots in 1,000-slot steps moves ~300,000 slots
+        // (~1.6 GB) versus doubling's ~24,000 (~130 MB). It was strictly worse
+        // than what it replaced, while reading as an improvement.
+        //
+        // So: plain `Vec` growth (amortized O(1), aggregate O(n)) is retained
+        // as the fallback, and the honest statement is that a single growth
+        // step is O(n) and unbounded. The ONLY way to get the guarantee is to
+        // not grow at all — `with_capacity` at boot, sized to the real
+        // universe. `AGGREGATOR_DEFAULT_SLOTS` covers the adaptive sizer's
+        // starting range so the common case never reallocates.
+        //
         // Exact: len() < capacity <= AGGREGATOR_MAX_SLOTS (25_000) << u32::MAX.
         let idx = self.slots.len();
         self.slots.push(InstrumentSlot {

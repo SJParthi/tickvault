@@ -114,9 +114,21 @@ impl DisconnectCause {
 /// is case-insensitive and the order encodes priority (a Dhan code embedded in
 /// the string is honoured before the generic reset/handshake buckets).
 ///
-/// # Performance
-/// O(1) — a fixed number of substring checks over the (short) reason string. No
-/// allocation. See module docs.
+/// # Performance — corrected 2026-08-09
+///
+/// **O(len(reason)), with ONE short-lived heap allocation. Cold path.**
+///
+/// This previously read "O(1) ... No allocation", which was simply false:
+/// `reason.to_ascii_lowercase()` allocates a `String`, and the nine
+/// `contains()` calls are each a substring search over the whole reason
+/// string. The number of CHECKS is fixed; the cost of each is not.
+///
+/// Corrected rather than optimised: this runs once per disconnect, not per
+/// packet, so the allocation is irrelevant to latency — but the false claim
+/// was not irrelevant. An O(1)-and-no-allocation label is exactly the kind of
+/// assertion someone later trusts when deciding what may sit on a hot path.
+/// If this ever needs to be genuinely allocation-free, match on
+/// `reason.as_bytes()` with a case-insensitive comparison instead.
 #[must_use]
 pub fn classify_disconnect_cause(reason: &str, dhan_code: Option<u16>) -> DisconnectCause {
     // 1) Authoritative Dhan disconnect code, if we have it. This is the ONLY
