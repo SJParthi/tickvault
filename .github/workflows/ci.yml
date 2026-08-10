@@ -610,9 +610,14 @@ jobs:
         shell: bash
         run: bash .claude/hooks/test-count-guard.sh "$GITHUB_WORKSPACE"
 
+      # `all` is load-bearing, not decoration. The hook defaults to
+      # MODE="staged" and scans `git diff --cached`; a CI checkout has NOTHING
+      # staged, so the default invocation found zero files and exited 0 on
+      # every run — a guard that could never fail. The full-tree ratchet (and
+      # its CI fail-closed branch) live in the `all` mode only.
       - name: Pub-fn test guard (every new pub fn has a test or TEST-EXEMPT)
         shell: bash
-        run: bash .claude/hooks/pub-fn-test-guard.sh "$GITHUB_WORKSPACE"
+        run: bash .claude/hooks/pub-fn-test-guard.sh "$GITHUB_WORKSPACE" all
 
       - name: Financial test guard (price/order fns have boundary tests)
         shell: bash

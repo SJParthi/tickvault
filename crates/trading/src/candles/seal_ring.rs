@@ -184,9 +184,15 @@ impl SealRing {
     /// to honor the locked capacity.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
+        // A zero capacity makes `len() >= capacity` true while the deque is
+        // EMPTY, so the eviction arm of `try_buffer` would call `pop_front` on
+        // an empty deque and hit its invariant-violation `panic!` on the very
+        // first push. Clamping to 1 keeps the ring degenerate-but-sound
+        // (every push evicts the previous seal to the next tier) instead of
+        // panicking on a hot-path push. `new()` is unaffected.
         Self {
-            inner: VecDeque::with_capacity(capacity),
-            capacity,
+            inner: VecDeque::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
         }
     }
 

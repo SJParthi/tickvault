@@ -57,7 +57,7 @@ use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
 
 use crate::candles::aggregator_cell::{
-    AggregatorCell, ConsumeOutcome, FeedStrategy, tick_price_is_sane,
+    AggregatorCell, ConsumeOutcome, FeedStrategy, TickPrices, tick_price_is_sane,
 };
 use crate::candles::tf_index::{MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF_DAY_IST};
 use crate::candles::{BufferOutcome, BufferedSeal, LiveCandleState, SealRing, TfIndex};
@@ -506,11 +506,22 @@ impl MultiTfAggregator {
         let baseline = slot.last_cumulative;
         let mut stats = ConsumeStats::default();
 
+        // Widen the tick's prices ONCE, not once per timeframe. The three
+        // source fields are identical across all `TF_COUNT` timeframes, and
+        // `f32_to_f64_clean` costs a decimal round-trip (~50 ns) rather than a
+        // cast — folding it inside this loop multiplied one tick's conversion
+        // cost by `TF_COUNT × 3` for no added information.
+        let prices = TickPrices::from_tick(tick);
+
         for tf in TfIndex::ALL {
-            match slot
-                .cell
-                .consume_tick(tf, tick, baseline, strategy, cumulative_volume)
-            {
+            match slot.cell.consume_tick_with_prices(
+                tf,
+                tick,
+                prices,
+                baseline,
+                strategy,
+                cumulative_volume,
+            ) {
                 ConsumeOutcome::Updated => {}
                 ConsumeOutcome::Sealed { sealed_state } => {
                     stats.sealed_count = stats.sealed_count.saturating_add(1);
