@@ -50,6 +50,7 @@ use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_ilp_symbol;
 
 /// QuestDB table name — one row per `(trading_date_ist, feed)` per day.
 pub const FEED_SCOREBOARD_DAILY_TABLE: &str = "feed_scoreboard_daily";
@@ -530,7 +531,18 @@ impl FeedScoreboardWriter {
             .context("exchange_segment")?
             .symbol("feed", r.feed.as_str())
             .context("feed")?
-            .symbol("symbol_name", r.symbol_name.as_str())
+            // 2026-08-10 (security review): `symbol_name` is the ONLY field on
+            // this row sourced from vendor text (the Dhan/Groww instrument
+            // master) rather than a fixed enum, and it was the ONLY `.symbol()`
+            // call in the crate reaching ILP unsanitized. ILP tags are
+            // comma/equals delimited and QuestDB auto-creates unknown columns
+            // from a frame, so a master row whose name contained `,x=1` would
+            // have spliced an attacker-chosen column into this table. Its two
+            // neighbours above are enum-backed and cannot carry a delimiter.
+            .symbol(
+                "symbol_name",
+                sanitize_ilp_symbol(r.symbol_name.as_str()).as_ref(),
+            )
             .context("symbol_name")?
             .column_ts(
                 "trading_date_ist",
