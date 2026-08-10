@@ -55,30 +55,51 @@ fn read_rust_files(dir: &Path) -> Vec<(PathBuf, String)> {
 /// Files under these paths MUST NOT touch tick-writer APIs.
 fn historical_flow_paths() -> Vec<PathBuf> {
     let root = workspace_root();
-    // 2026-08-10 REPOINT. The previous three targets —
-    // crates/core/src/{historical,rest,backfill} — were DELETED from the tree,
-    // and because the scan loop did `if !dir.is_dir() { continue; }` this guard
-    // passed while reading ZERO files. It had been asleep for an unknown period.
+    // 2026-08-10 (SECOND REVISION, after an adversarial review of the first).
     //
-    // That was not theoretical: `crates/storage/src/tick_persistence.rs` (which
-    // owns `append_tick(`) was REBUILT for the Dhan revival while this guard was
-    // blind, and `TickPersistenceWriter` now appears in 5 source files. Those
-    // live-feed homes are legitimate — the invariant is that the REST/historical
-    // flow must never reach them.
+    // The ORIGINAL scanned three DIRECTORIES and carried the comment
+    // "Future-proofed — any new rest/backfill path would land here". Those
+    // directories were later deleted, and because a missing dir was skipped
+    // silently the guard passed while reading ZERO files.
     //
-    // Targets are now the REST/historical flow that ACTUALLY EXISTS. They are
-    // files, not directories, so the scan handles both. Every one is asserted to
-    // exist: a deleted target must fail loudly and be repointed deliberately,
-    // never skipped silently.
-    vec![
-        root.join("crates/app/src/spot_1m_rest_boot.rs"),
-        root.join("crates/app/src/rest_candle_fold.rs"),
-        root.join("crates/app/src/dhan_rest_stack.rs"),
-        root.join("crates/app/src/groww_rest_burst.rs"),
-        root.join("crates/storage/src/spot_1m_rest_persistence.rs"),
-        root.join("crates/storage/src/option_contract_1m_rest_persistence.rs"),
-        root.join("crates/storage/src/rest_fetch_audit_persistence.rs"),
-    ]
+    // My FIRST repair replaced them with a hardcoded list of 7 files. That fixed
+    // the blindness but DESTROYED the future-proofing, and it missed 5 of the 12
+    // REST modules that already existed — so a banned symbol added to, say,
+    // groww_spot_1m_boot.rs would have gone unseen while the guard reported a
+    // healthy "7 files scanned". That is precisely the false-OK this guard exists
+    // to prevent, reintroduced by its own repair.
+    //
+    // This revision DISCOVERS the REST/historical flow by walking the two source
+    // directories and selecting by filename, so a new module is covered the day
+    // it is added — the original's best property, without the silent-skip bug.
+    // The caller asserts the discovered set is non-trivial, so a naming-convention
+    // change that empties it fails LOUDLY instead of quietly scanning nothing.
+    let mut out = Vec::new();
+    for dir in [root.join("crates/app/src"), root.join("crates/storage/src")] {
+        assert!(
+            dir.is_dir(),
+            "LIVE-FEED-PURITY guard is BLIND: source directory {dir:?} is missing."
+        );
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("LIVE-FEED-PURITY guard cannot read {dir:?}: {e}"));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.contains("rest")
+                        || n.contains("historical")
+                        || n.contains("backfill")
+                        || n.contains("option_chain")
+                        || n.contains("spot_1m")
+                        || n.contains("contract_1m")
+                })
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 // ============================================================================
@@ -145,10 +166,11 @@ fn live_feed_purity_no_tick_writer_in_historical_flow() {
     // Anti-vacuity: a guard that scanned nothing must FAIL, not pass. This is the
     // assertion whose absence let the guard sleep.
     assert!(
-        scanned_files > 0,
-        "LIVE-FEED-PURITY guard scanned ZERO files — it is enforcing NOTHING. \
-         This assert exists because the guard previously passed in exactly that \
-         state for an unknown period."
+        scanned_files >= 10,
+        "LIVE-FEED-PURITY guard scanned only {scanned_files} REST/historical \
+         module(s). 12 exist today, so anything below 10 means discovery broke \
+         or the naming convention changed — either way the guard is no longer \
+         covering the flow it claims to. Fix historical_flow_paths()."
     );
 
     assert!(
