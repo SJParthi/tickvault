@@ -404,16 +404,86 @@ pub async fn instance_public_ip<E: Ec2Api>(ec2: &E, instance_id: &str) -> Option
     }
 }
 
-/// Legacy `_try_self_start` — true iff the call was accepted; never raises.
-pub async fn try_self_start<E: Ec2Api>(ec2: &E, instance_id: &str) -> bool {
+/// Why a `StartInstances` call was refused.
+///
+/// This distinction is load-bearing, not cosmetic. Until 2026-08-10 EVERY start
+/// failure produced the same page telling the operator to press "Start instance"
+/// — advice that is CORRECT for a transient/permissions failure and USELESS for
+/// a capacity refusal, because a stopped instance can only restart in its OWN
+/// availability zone, so the manual press fails for exactly the same reason.
+///
+/// This is not hypothetical: on 2026-08-06 → 08 the box sat at 0h CPU for three
+/// days on `InsufficientInstanceCapacity` in ap-south-1a, and on 2026-07-20 nine
+/// consecutive attempts (auto + watchdog + manual) all failed the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartFailureKind {
+    /// AWS has no capacity for this instance type in the instance's zone.
+    /// Retrying — by cron or by hand — cannot succeed; only a zone move can.
+    CapacityRefusal,
+    /// Anything else (permissions, throttling, state conflict, network).
+    /// A retry is legitimate here.
+    Other,
+}
+
+/// Outcome of a self-heal start attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartAttempt {
+    Started,
+    Failed(StartFailureKind),
+}
+
+impl StartAttempt {
+    /// True iff the start call was accepted by AWS.
+    #[must_use]
+    pub fn started(self) -> bool {
+        matches!(self, StartAttempt::Started)
+    }
+}
+
+/// Classify a `StartInstances` error string. Pure — no I/O, no allocation
+/// beyond the lowercase copy, and total: every input maps to a variant.
+///
+/// Matching is case-insensitive substring, because the AWS SDK wraps the API
+/// error code in varying envelope text across SDK versions and error shapes.
+/// The code string itself (`InsufficientInstanceCapacity`) is stable API
+/// surface, so the substring is the durable thing to match on.
+#[must_use]
+pub fn classify_start_failure(error_text: &str) -> StartFailureKind {
+    if error_text
+        .to_ascii_lowercase()
+        .contains("insufficientinstancecapacity")
+    {
+        StartFailureKind::CapacityRefusal
+    } else {
+        StartFailureKind::Other
+    }
+}
+
+/// Legacy `_try_self_start` — never raises; classifies the refusal so the
+/// caller can page with advice that will actually work.
+pub async fn try_self_start<E: Ec2Api>(ec2: &E, instance_id: &str) -> StartAttempt {
     match ec2.start_instances(instance_id).await {
         Ok(()) => {
             info!(instance = instance_id, "self-heal start_instances issued");
-            true
+            StartAttempt::Started
         }
         Err(exc) => {
-            error!(error = %exc, "self-heal start_instances FAILED");
-            false
+            let kind = classify_start_failure(&exc);
+            match kind {
+                StartFailureKind::CapacityRefusal => error!(
+                    error = %exc,
+                    "self-heal start_instances REFUSED — AWS has no capacity for this \
+                     instance type in the instance's availability zone. Retrying cannot \
+                     succeed: a stopped instance can only restart in its own zone. The \
+                     remedy is a zone move (terraform var availability_zone; subnets \
+                     already exist in a/b/c), which REPLACES the instance — the root \
+                     volume is zone-locked and does not follow, so snapshot first."
+                ),
+                StartFailureKind::Other => {
+                    error!(error = %exc, "self-heal start_instances FAILED");
+                }
+            }
+            StartAttempt::Failed(kind)
         }
     }
 }
@@ -752,8 +822,41 @@ for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations."
     }
 
     // Fix first, page second.
-    let self_started = try_self_start(ec2, &env.instance_id).await;
-    if self_started {
+    let attempt = try_self_start(ec2, &env.instance_id).await;
+
+    // A capacity refusal gets its OWN page. The generic "press Start instance"
+    // advice below is actively WRONG here: a stopped instance can only restart
+    // in its own availability zone, so the manual press fails identically. The
+    // operator needs the zone-move remedy, and needs to know the disk does not
+    // follow. Evidence: 2026-08-06 -> 08, three days at 0h CPU; 2026-07-20,
+    // nine consecutive refusals across auto, watchdog and manual attempts.
+    if attempt == StartAttempt::Failed(StartFailureKind::CapacityRefusal) {
+        publish(
+            sns,
+            env,
+            "08:30 auto-start REFUSED — AWS has no machines free in our zone",
+            &format!(
+                "🆘 The box did NOT start, and this one is NOT fixable by pressing \
+'Start instance' — that will fail the same way. Amazon currently has no \
+machine of our size free in the zone our box lives in, and a stopped box \
+can only restart in its own zone. Market opens 9:15 AM.\n\n\
+What actually fixes it: move the box to another zone (we already have \
+space reserved in all three). Be aware this REPLACES the machine and the \
+disk does NOT move with it — take a snapshot first.\n\n\
+Box: {}. This has happened before: three full days lost in August, and \
+nine failed attempts in a row in July. Retrying is not the answer.",
+                env.instance_id
+            ),
+        )
+        .await?;
+        return Ok(json!({
+            "action": "start_refused_no_capacity",
+            "instance": env.instance_id,
+            "remedy": "move_availability_zone",
+        }));
+    }
+
+    if attempt.started() {
         publish(
             sns,
             env,
@@ -784,6 +887,7 @@ failed. Market opens 9:15 AM. Start it NOW: portal 'Start instance' or \
         )
         .await?;
     }
+    let self_started = attempt.started();
     error!(state = %state, self_started, "check FAILED — operator paged");
     Ok(json!({
         "mode": "check", "state": state, "alerted": true, "self_started": self_started
@@ -968,6 +1072,7 @@ mod tests {
         state: Option<String>,
         launch_time: Option<DateTime<Utc>>,
         start_raises: bool,
+        start_error_text: String,
         stop_raises: bool,
         public_ip: Option<String>,
         start_calls: RefCell<Vec<String>>,
@@ -980,6 +1085,7 @@ mod tests {
                 state: state.map(str::to_string),
                 launch_time: None,
                 start_raises: false,
+                start_error_text: "AccessDenied".to_string(),
                 stop_raises: false,
                 public_ip: None,
                 start_calls: RefCell::new(Vec::new()),
@@ -996,6 +1102,13 @@ mod tests {
         }
         fn start_raises(mut self) -> Self {
             self.start_raises = true;
+            self
+        }
+        /// Refuse the start with a specific AWS error text, so tests can drive
+        /// the capacity-refusal branch with the real API error code.
+        fn start_raises_with(mut self, error_text: &str) -> Self {
+            self.start_raises = true;
+            self.start_error_text = error_text.to_string();
             self
         }
         fn stop_raises(mut self) -> Self {
@@ -1018,7 +1131,7 @@ mod tests {
 
         async fn start_instances(&self, instance_id: &str) -> Result<(), String> {
             if self.start_raises {
-                return Err("AccessDenied".to_string());
+                return Err(self.start_error_text.clone());
             }
             self.start_calls.borrow_mut().push(instance_id.to_string());
             Ok(())
@@ -1258,6 +1371,106 @@ mod tests {
         let published = sns.published.borrow();
         assert!(published[0].subject.contains("FAILED"));
         assert!(published[0].subject.contains("started the box itself"));
+    }
+
+    #[test]
+    fn test_classify_start_failure_detects_capacity_refusal() {
+        // The bare API error code.
+        assert_eq!(
+            classify_start_failure("InsufficientInstanceCapacity"),
+            StartFailureKind::CapacityRefusal
+        );
+        // Wrapped in SDK envelope text, which is how it actually arrives.
+        assert_eq!(
+            classify_start_failure(
+                "service error: unhandled error: InsufficientInstanceCapacity: We currently \
+                 do not have sufficient t4g.medium capacity in the Availability Zone you \
+                 requested (ap-south-1a)."
+            ),
+            StartFailureKind::CapacityRefusal
+        );
+        // Case-insensitive: SDK versions differ in how they echo the code.
+        assert_eq!(
+            classify_start_failure("insufficientinstancecapacity"),
+            StartFailureKind::CapacityRefusal
+        );
+    }
+
+    #[test]
+    fn test_classify_start_failure_other_errors_are_not_capacity() {
+        // These are RETRYABLE — misclassifying them as capacity would send the
+        // operator chasing a zone move for a permissions problem.
+        for other in [
+            "AccessDenied",
+            "UnauthorizedOperation",
+            "RequestLimitExceeded",
+            "IncorrectInstanceState",
+            "connection timed out",
+            "",
+        ] {
+            assert_eq!(
+                classify_start_failure(other),
+                StartFailureKind::Other,
+                "{other:?} must NOT be classified as a capacity refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_start_attempt_started_predicate() {
+        assert!(StartAttempt::Started.started());
+        assert!(!StartAttempt::Failed(StartFailureKind::CapacityRefusal).started());
+        assert!(!StartAttempt::Failed(StartFailureKind::Other).started());
+    }
+
+    #[tokio::test]
+    async fn test_check_stopped_capacity_refusal_pages_zone_move_not_press_start() {
+        // Regression: 2026-08-10 — a capacity refusal used to page "press
+        // 'Start instance'", which fails identically because a stopped
+        // instance can only restart in its own zone. Three days of downtime
+        // (2026-08-06 -> 08) were spent following that advice.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped")).start_raises_with(
+            "InsufficientInstanceCapacity: We currently do not have sufficient capacity \
+             in the Availability Zone you requested.",
+        );
+        let out = run(
+            json!({"mode": "check"}),
+            &ec2,
+            &FakeSsm::raising(),
+            &sns,
+            in_window_now(),
+        )
+        .await;
+
+        assert_eq!(out["action"], json!("start_refused_no_capacity"));
+        assert_eq!(out["remedy"], json!("move_availability_zone"));
+
+        let published = sns.published.borrow();
+        assert_eq!(
+            published.len(),
+            1,
+            "exactly one page for a capacity refusal"
+        );
+        let page = &published[0];
+        assert!(
+            page.subject.contains("no machines free"),
+            "subject must name the real cause, got: {}",
+            page.subject
+        );
+        // The whole point: it must NOT repeat the useless advice.
+        assert!(
+            !page.message.contains("start-instances"),
+            "must NOT tell the operator to retry the start — it cannot succeed"
+        );
+        assert!(
+            page.message.contains("zone"),
+            "must name the zone move as the remedy"
+        );
+        assert!(
+            page.message.contains("snapshot"),
+            "must warn that the disk does not follow the move"
+        );
     }
 
     #[tokio::test]
