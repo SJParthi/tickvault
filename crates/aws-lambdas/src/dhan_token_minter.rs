@@ -231,28 +231,54 @@ pub fn parse_mint_response(body: &str) -> Result<SecretString, MintError> {
 ///
 /// # Errors
 ///
-/// Returns [`MintError::TotpGeneration`] if the secret is not valid base32 or
-/// the code cannot be produced.
+/// Returns [`MintError::TotpGeneration`] if the secret is not valid base32,
+/// the parameters are rejected, or the system clock predates the unix epoch.
 pub fn generate_totp_code(totp_secret: &SecretString) -> Result<String, MintError> {
-    use totp_rs::{Algorithm, Secret as TotpSecret, TOTP};
+    // The clock is read HERE rather than via `Totp::generate_current()`.
+    //
+    // totp-rs 6.0.0 changed `generate_current()` to PANIC on a pre-epoch
+    // clock instead of returning `Result`. This workspace builds release with
+    // `panic = "abort"`, so calling it would convert a previously-HANDLED error
+    // into a process abort on the mint path. Reading the clock here and calling
+    // `generate(t)` reproduces the 5.7.x contract exactly: a bad clock stays a
+    // typed `MintError::TotpGeneration`.
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| {
+            MintError::TotpGeneration(format!("system clock is before the unix epoch: {err}"))
+        })?
+        .as_secs();
 
-    let secret_bytes = TotpSecret::Encoded(totp_secret.expose_secret().to_string())
-        .to_bytes()
+    generate_totp_code_at_unix_time(totp_secret, unix_secs)
+}
+
+/// Generates the TOTP code for an EXPLICIT unix timestamp (seconds).
+///
+/// Deliberately time-injected: this is the seam that lets the known-answer
+/// tests pin exact code values against the RFC 6238 vectors. A silent change
+/// to the algorithm, digit count, time step, or dynamic truncation fails those
+/// tests instead of shipping.
+fn generate_totp_code_at_unix_time(
+    totp_secret: &SecretString,
+    unix_secs: u64,
+) -> Result<String, MintError> {
+    use totp_rs::{Algorithm, Builder as TotpBuilder, Secret as TotpSecret};
+
+    let secret = TotpSecret::try_from_base32(totp_secret.expose_secret())
         .map_err(|err| MintError::TotpGeneration(format!("invalid base32 secret: {err}")))?;
 
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        secret_bytes,
-        Some("tickvault".to_string()),
-        "dhan-auth".to_string(),
-    )
-    .map_err(|err| MintError::TotpGeneration(format!("TOTP initialization failed: {err}")))?;
+    let totp = TotpBuilder::new()
+        .with_algorithm(Algorithm::SHA1)
+        .with_digits(6)
+        .with_skew(1)
+        .with_step_duration(30)
+        .with_secret(secret)
+        .with_issuer(Some("tickvault"))
+        .with_account_name("dhan-auth")
+        .build()
+        .map_err(|err| MintError::TotpGeneration(format!("TOTP initialization failed: {err}")))?;
 
-    totp.generate_current()
-        .map_err(|err| MintError::TotpGeneration(format!("code generation failed: {err}")))
+    Ok(totp.generate(unix_secs).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -870,6 +896,119 @@ mod tests {
             generate_totp_code(&secret),
             Err(MintError::TotpGeneration(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pinned known-answer tests (KAT)
+    //
+    // The two shape tests above cannot see an algorithm change — a swap to
+    // SHA-256, a different time step, or broken dynamic truncation all still
+    // produce "6 numeric digits". These pin EXACT codes for FIXED
+    // (secret, timestamp) pairs, so any such change fails the build. They also
+    // pin this Lambda to the SAME answers as
+    // `tickvault_core::auth::totp_generator`, which is the property the doc
+    // comment on `generate_totp_code` claims.
+    // -----------------------------------------------------------------------
+
+    /// RFC 6238 Appendix B seed: ASCII "12345678901234567890", base32-encoded.
+    const RFC6238_SHA1_SEED_BASE32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    #[test]
+    fn test_rfc6238_seed_base32_literal_decodes_to_the_ascii_seed() {
+        let decoded = totp_rs::Secret::try_from_base32(RFC6238_SHA1_SEED_BASE32)
+            .expect("RFC 6238 seed must be valid base32");
+        assert_eq!(
+            decoded.as_bytes(),
+            b"12345678901234567890",
+            "a typo in the base32 literal would silently move every KAT below"
+        );
+    }
+
+    #[test]
+    fn test_generate_totp_code_at_unix_time_matches_rfc6238_truncated_to_six_digits() {
+        // The official RFC 6238 SHA-1 vectors (8-digit): 94287082, 07081804,
+        // 14050471, 89005924, 69279037, 65353130. Truncation is
+        // `value % 10^digits` and 10^6 divides 10^8, so the 6-digit answer is
+        // exactly the last 6 digits, zero-padded (see the t=1234567890 row).
+        let secret = SecretString::from(RFC6238_SHA1_SEED_BASE32.to_string());
+
+        let vectors: [(u64, &str, &str); 6] = [
+            (59, "94287082", "287082"),
+            (1_111_111_109, "07081804", "081804"),
+            (1_111_111_111, "14050471", "050471"),
+            (1_234_567_890, "89005924", "005924"),
+            (2_000_000_000, "69279037", "279037"),
+            (20_000_000_000, "65353130", "353130"),
+        ];
+
+        for (unix_secs, official_eight, expected_six) in vectors {
+            assert_eq!(
+                expected_six,
+                &official_eight[2..],
+                "the 6-digit expectation must be the last 6 digits of the official answer"
+            );
+            let code = generate_totp_code_at_unix_time(&secret, unix_secs)
+                .expect("RFC 6238 seed must produce a code");
+            assert_eq!(
+                code, expected_six,
+                "generate_totp_code_at_unix_time at t={unix_secs} must be exactly {expected_six}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_totp_code_at_unix_time_pins_our_own_secret_vectors() {
+        // Golden vectors on this module's own test secret, on and around
+        // 30-second step boundaries. These are the SAME values the core crate
+        // pins for the same secret — the two implementations must not drift.
+        let secret = SecretString::from("OBWGC2LOFVZXI4TJNZTS243FMNZGK5BN".to_string());
+
+        // Timestamps are 30-second-STEP-ALIGNED where noted, so the pairs
+        // (aligned, aligned+29) provably sit inside one step.
+        let vectors: [(u64, &str); 6] = [
+            (0, "379080"),             // step 0
+            (29, "379080"),            // step 0 — same code, proves the step window
+            (30, "514961"),            // step 1
+            (59, "514961"),            // step 1 — same code
+            (1_700_000_010, "878957"), // step 56666667 (30-aligned)
+            (1_700_000_040, "502753"), // step 56666668
+        ];
+
+        for (unix_secs, expected) in vectors {
+            let code = generate_totp_code_at_unix_time(&secret, unix_secs)
+                .expect("valid base32 secret must produce a code");
+            assert_eq!(
+                code, expected,
+                "generate_totp_code_at_unix_time at t={unix_secs} must be exactly {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_totp_code_at_unix_time_rejects_invalid_base32() {
+        let secret = SecretString::from("!!! not base32 !!!".to_string());
+        match generate_totp_code_at_unix_time(&secret, 59) {
+            Err(MintError::TotpGeneration(reason)) => {
+                assert!(reason.contains("invalid base32"), "got: {reason}");
+            }
+            other => panic!("expected TotpGeneration, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generate_totp_code_at_unix_time_rejects_too_short_secret() {
+        // A well-formed base32 string under 128 bits must be REFUSED as a typed
+        // error at builder validation — never a panic on the mint path.
+        let secret = SecretString::from("MFRGGZDF".to_string());
+        match generate_totp_code_at_unix_time(&secret, 59) {
+            Err(MintError::TotpGeneration(reason)) => {
+                assert!(
+                    reason.contains("TOTP initialization failed"),
+                    "a short secret must fail at builder validation, got: {reason}"
+                );
+            }
+            other => panic!("expected TotpGeneration, got: {other:?}"),
+        }
     }
 
     #[test]
