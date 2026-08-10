@@ -362,17 +362,24 @@ fn load_invocation_scan_files() -> Vec<(String, String)> {
 fn no_banned_files_outside_allowlist() {
     assert_sorted_unique(TRACKED_BANNED_ALLOWLIST, "TRACKED_BANNED_ALLOWLIST");
     // 2026-08-10 ANTI-VACUITY, in the one shape that fits this test. ZERO tracked
-    // .py files is the CORRECT and desired state here, so a non-empty assert on
-    // the result would be wrong. What must be proven instead is that the LOOKUP
-    // MECHANISM still works — otherwise a broken `git ls-files` returns nothing
-    // and this guard passes for the wrong reason, indistinguishably from success.
+    // interpreted-language files is the CORRECT and desired state here, so a
+    // non-empty assert on the RESULT would be backwards. What must be proven
+    // instead is that the LOOKUP MECHANISM still works — otherwise a broken
+    // `git ls-files` returns nothing and this guard passes for the wrong reason,
+    // indistinguishable from success.
     assert!(
         git_ls_files(&["."]).len() > 100,
-        "RUST-ONLY GUARD IS BLIND: `git ls-files` returned almost nothing, so a \
-         .py file could exist and go unseen. This guard's PASS would be meaningless."
+        "RUST-ONLY GUARD IS BLIND: `git ls-files` returned almost nothing, so an \
+         interpreted-language file could exist and go unseen. This guard's PASS \
+         would be meaningless."
     );
-    let tracked_py = git_ls_files(&["*.py"]);
-    let new = py_files_not_in_allowlist(&tracked_py, TRACKED_BANNED_ALLOWLIST);
+    // Scope widened from `*.py` to the 9-extension BANNED_FILE_PATHSPECS by #1738,
+    // landed in parallel. Kept verbatim — it is strictly broader than what this
+    // test previously covered, and it composes with the assert above rather than
+    // competing with it: theirs widens WHAT is looked for, mine proves the looking
+    // actually happened.
+    let tracked_banned = git_ls_files(BANNED_FILE_PATHSPECS);
+    let new = py_files_not_in_allowlist(&tracked_banned, TRACKED_BANNED_ALLOWLIST);
     assert!(
         new.is_empty(),
         "RUST-ONLY VIOLATION: new tracked interpreted-language file(s) {new:?}. The rust-only \
