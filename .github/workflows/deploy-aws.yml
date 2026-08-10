@@ -435,6 +435,61 @@ jobs:
         id: acct
         run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve prod instance id at runtime
+        # 2026-08-10 ROOT-CAUSE FIX — deliberately the SAME pattern, and the same
+        # rationale, as the account-id step directly above: derive the value from
+        # live AWS instead of trusting a hand-maintained GitHub secret that goes
+        # stale silently. That step exists because AWS_ACCOUNT_ID was empty and
+        # SNS publish failed with `Invalid parameter: AccountId`. This is the
+        # identical failure mode one field over.
+        #
+        # THE INCIDENT: EC2_INSTANCE_ID named an instance that no longer exists.
+        # Every `aws ssm send-command` in this job targets $IID, so the deploy
+        # could not reach the box at all. A secret cannot self-heal and nothing
+        # here noticed it had rotted.
+        #
+        # WHY DISCOVERY IS SAFE HERE: the box is tagged by terraform
+        # (Name=tv-prod-app, Environment=prod, Project=tickvault). Verified live
+        # 2026-08-10: exactly one non-terminated match, i-0c3fe906dad5492fc,
+        # running r8g.xlarge in ap-south-1b. After this, a terminate-and-recreate
+        # — which the instance locks explicitly anticipate for the AZ move and the
+        # volume resize — costs nothing: the next deploy finds the new box by tag,
+        # with no secret to rotate.
+        #
+        # FAIL-SAFE BY CONSTRUCTION: on ZERO matches we fall back to the secret,
+        # so this step can never make the deploy worse than the pre-fix behaviour.
+        # On MORE THAN ONE match we STOP — guessing which box to deploy a trading
+        # system to is exactly the decision that must never be automated.
+        env:
+          REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          SECRET_IID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          found=$(aws ec2 describe-instances --region "$REGION" \
+            --filters "Name=tag:Name,Values=tv-prod-app" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null || true)
+          count=$(printf '%s\n' $found | grep -c . || true)
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Found $count non-terminated tv-prod-app instances ($found). Refusing to guess which one to deploy to."
+            exit 1
+          fi
+          if [ "$count" -eq 1 ]; then
+            RESOLVED="$found"
+            if [ -n "${SECRET_IID:-}" ] && [ "$SECRET_IID" != "$RESOLVED" ]; then
+              echo "::warning::EC2_INSTANCE_ID secret is STALE. Discovered $RESOLVED by tag and using that. Rotate the secret to $RESOLVED, or delete it — this step no longer depends on it."
+            fi
+          else
+            RESOLVED="${SECRET_IID:-}"
+            echo "::warning::No tv-prod-app instance found by tag; falling back to the EC2_INSTANCE_ID secret."
+          fi
+          if [ -z "$RESOLVED" ]; then
+            echo "::error::No instance id available: tag discovery found none AND the EC2_INSTANCE_ID secret is empty."
+            exit 1
+          fi
+          echo "IID=$RESOLVED" >> "$GITHUB_ENV"
+          echo "Deploy target instance: $RESOLVED"
+
       - name: Ensure instance running (self-start + wait for SSM online)
         # ROOT-CAUSE FIX 2026-06-02: every deploy ships the binary via
         # `aws ssm send-command`, which can ONLY reach a RUNNING, SSM-online
@@ -466,7 +521,7 @@ jobs:
         #      fails RED + pages, so real-failure detection is unchanged.
         env:
           REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
-          IID: ${{ secrets.EC2_INSTANCE_ID }}
+          IID: ${{ env.IID }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -uo pipefail
@@ -650,7 +705,7 @@ jobs:
         run: |
           CMD_ID=$(aws ssm send-command \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-ids "$IID" \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault deploy sha=${{ github.sha }}" \
             --parameters 'commands=[
@@ -847,7 +902,7 @@ jobs:
           set -uo pipefail
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
           CMD_ID="${{ steps.ssm.outputs.command_id }}"
-          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          IID="${IID:?instance id was not resolved — the resolve-prod-instance-id step must run first}"
           # 240 polls × 5s = 1200s nominal. Bumped 120 → 240 (2026-07-13):
           # the observed cadence is ~6.3s/poll (5s sleep + ~1.3s API
           # round-trip — runs 29269805430 / 29273283894 burned 120 polls in
@@ -894,20 +949,20 @@ jobs:
           STATUS=$(aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
-            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-id "$IID" \
             --query 'Status' --output text)
           echo "===== SSM command status: ${STATUS} ====="
           echo "----- STDOUT (on-box) -----"
           aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
-            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-id "$IID" \
             --query 'StandardOutputContent' --output text || true
           echo "----- STDERR (on-box) -----"
           aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
-            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-id "$IID" \
             --query 'StandardErrorContent' --output text || true
           if [ "${STATUS}" != "Success" ]; then
             echo "::error::SSM command on the box failed with status=${STATUS} — see STDOUT/STDERR above for the on-box reason."
@@ -936,7 +991,7 @@ jobs:
         run: |
           set +e
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
-          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          IID="${IID:?instance id was not resolved — the resolve-prod-instance-id step must run first}"
           # One SSM round-trip returns BOTH the systemd state and the auto-restart
           # count so we can tell "still booting (activating / replaying WAL)" apart
           # from "crashed (failed, or Restart=always looping)". Single-line
@@ -1110,7 +1165,7 @@ jobs:
         run: |
           set +e
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
-          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          IID="${IID:?instance id was not resolved — the resolve-prod-instance-id step must run first}"
           # START_MS captured HERE, in-step, AFTER readiness — any event found
           # below was ingested after the agent restart with the new config, so
           # a success proves the NEW globs ship (not a leftover from the old
@@ -1246,7 +1301,7 @@ jobs:
           # itself succeeded. The message is now split into two `;`-free echos.
           aws ssm send-command \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-ids "$IID" \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
             --parameters 'commands=["systemctl stop tickvault || true","echo AUTO-STOPPED-UNIT-STAYS-ENABLED: stopped to break the Restart=always spam loop for this boot","echo unit kept ENABLED so it auto-starts at the next boot and aws-autopilot self-heals it"]' \
@@ -1295,7 +1350,7 @@ jobs:
         if: always() && env.DEPLOY_STARTED_STOPPED_BOX == 'yes'
         env:
           REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
-          IID: ${{ secrets.EC2_INSTANCE_ID }}
+          IID: ${{ env.IID }}
         run: |
           set -uo pipefail
           DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
