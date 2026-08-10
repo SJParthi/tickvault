@@ -60,13 +60,18 @@ jobs:
         env:
           OIDC_ROLE: ${{ secrets.AWS_ROLE_ARN }}
           ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          EC2_ID: ${{ secrets.EC2_INSTANCE_ID }}
         run: |
-          if { [ -n "$OIDC_ROLE" ] || [ -n "$ACCESS_KEY" ]; } && [ -n "$EC2_ID" ]; then
+          # 2026-08-10: EC2_INSTANCE_ID deliberately NOT required here. It used
+          # to gate this job, which meant an unset-or-stale instance secret
+          # switched OFF the one lane whose job is to notice that the instance
+          # secret is wrong. The script now discovers the box by its Name tag
+          # and treats the secret as a hint, so credentials are the only real
+          # prerequisite.
+          if [ -n "$OIDC_ROLE" ] || [ -n "$ACCESS_KEY" ]; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
           else
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::AWS bootstrap secrets / EC2_INSTANCE_ID not set — autopilot skipped."
+            echo "::notice::AWS bootstrap credentials not set — autopilot skipped."
           fi
 
   autopilot:
