@@ -128,6 +128,66 @@ pub fn tick_price_is_sane(tick: &ParsedTick) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Hoisted price widening — pay the f32→f64 conversion ONCE per tick
+// ---------------------------------------------------------------------------
+
+/// The three `f32`→`f64`-widened prices a fold needs, converted ONCE per tick.
+///
+/// [`f32_to_f64_clean`] is NOT a free cast — it round-trips through a shortest
+/// decimal string (ryu format + parse, ~50 ns) to avoid IEEE-754 widening
+/// artifacts. That cost is correct and non-negotiable, but it must be paid per
+/// TICK, not per TIMEFRAME: the three source fields (`last_traded_price`,
+/// `day_open`, `day_close`) are identical across all `TF_COUNT` timeframes, so
+/// converting inside the fold multiplied one tick's conversion cost by
+/// `TF_COUNT × 3` (63 at `TF_COUNT = 21`) — ~3.15 µs against the 100 ns/tick
+/// hot-path budget, a ~31× overrun for zero added information.
+///
+/// Widening is applied here EXACTLY as the folds applied it, so behaviour is
+/// bit-identical: `day_open` / `day_close` are widened only when strictly
+/// positive and stored as `0.0` otherwise. `> 0.0` is false for `NaN`, so a
+/// poisoned field still collapses to the `0.0` sentinel rather than
+/// propagating — and because the clean conversion preserves sign and
+/// magnitude, `converted > 0.0` holds exactly when `raw > 0.0` did. Callers
+/// therefore test the CONVERTED value and get the original semantics.
+///
+/// # Complexity
+/// O(1) — at most three conversions, no allocation, no loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TickPrices {
+    /// Widened last-traded price. Always converted (the fold always needs it).
+    pub last_traded_price: f64,
+    /// Widened `day_open`, or `0.0` when absent / non-positive / `NaN`.
+    pub day_open: f64,
+    /// Widened `day_close`, or `0.0` when absent / non-positive / `NaN`.
+    pub day_close: f64,
+}
+
+impl TickPrices {
+    /// Widens a tick's three fold-relevant prices once.
+    ///
+    /// # Complexity
+    /// O(1) — no allocation, no loop.
+    #[inline]
+    #[must_use]
+    pub fn from_tick(tick: &ParsedTick) -> Self {
+        Self {
+            last_traded_price: f32_to_f64_clean(tick.last_traded_price),
+            // `> 0.0` is false for NaN — a poisoned field can never be adopted.
+            day_open: if tick.day_open > 0.0 {
+                f32_to_f64_clean(tick.day_open)
+            } else {
+                0.0
+            },
+            day_close: if tick.day_close > 0.0 {
+                f32_to_f64_clean(tick.day_close)
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ConsumeOutcome
 // ---------------------------------------------------------------------------
 
@@ -253,12 +313,50 @@ impl AggregatorCell {
     /// The caller is responsible for [`tick_price_is_sane`]; this function
     /// assumes a sane price so the check is paid once per tick, not 21 times.
     ///
+    /// Convenience wrapper that widens the tick's prices itself. Callers that
+    /// fold ONE tick across MANY timeframes must use
+    /// [`AggregatorCell::consume_tick_with_prices`] instead and hoist
+    /// [`TickPrices::from_tick`] out of their timeframe loop — otherwise the
+    /// widening cost is multiplied by the timeframe count for no added
+    /// information (see [`TickPrices`]).
+    ///
     /// # Complexity
     /// O(1) — one array index, scalar comparisons, no allocation, no loop.
     pub fn consume_tick(
         &mut self,
         tf: TfIndex,
         tick: &ParsedTick,
+        bucket_start_cumulative: u64,
+        strategy: FeedStrategy,
+        cumulative_volume: u64,
+    ) -> ConsumeOutcome {
+        self.consume_tick_with_prices(
+            tf,
+            tick,
+            TickPrices::from_tick(tick),
+            bucket_start_cumulative,
+            strategy,
+            cumulative_volume,
+        )
+    }
+
+    /// Folds one tick into ONE timeframe slot using PRE-WIDENED prices.
+    ///
+    /// Identical to [`AggregatorCell::consume_tick`] except the caller supplies
+    /// the widened prices, so a multi-timeframe fold pays the `f32`→`f64`
+    /// conversion once per TICK rather than once per (tick × timeframe). See
+    /// [`TickPrices`] for why that distinction is load-bearing on the hot path.
+    ///
+    /// `prices` MUST have been derived from `tick` via [`TickPrices::from_tick`];
+    /// passing another tick's prices silently folds the wrong price.
+    ///
+    /// # Complexity
+    /// O(1) — one array index, scalar comparisons, no allocation, no loop.
+    pub fn consume_tick_with_prices(
+        &mut self,
+        tf: TfIndex,
+        tick: &ParsedTick,
+        prices: TickPrices,
         bucket_start_cumulative: u64,
         strategy: FeedStrategy,
         cumulative_volume: u64,
@@ -277,7 +375,7 @@ impl AggregatorCell {
                 if matches!(strategy.late_policy, LatePolicy::Refold)
                     && bucket_start == last.bucket_start_ist_secs
                 {
-                    fold_late_hlc(&mut self.last_sealed[ord], tick);
+                    fold_late_hlc(&mut self.last_sealed[ord], tick, prices);
                     return ConsumeOutcome::AmendedLate {
                         amended_state: self.last_sealed[ord],
                     };
@@ -288,6 +386,7 @@ impl AggregatorCell {
             self.armed_for_day_open[ord] = false;
             self.slots[ord] = open_bucket(
                 tick,
+                prices,
                 bucket_start,
                 bucket_start_cumulative,
                 use_day_open,
@@ -301,7 +400,7 @@ impl AggregatorCell {
         // In-bucket — the common case, and the one that must survive many
         // ticks sharing one second.
         if bucket_start == open_start {
-            fold_in_bucket(&mut self.slots[ord], tick, cumulative_volume);
+            fold_in_bucket(&mut self.slots[ord], tick, prices, cumulative_volume);
             return ConsumeOutcome::Updated;
         }
 
@@ -312,6 +411,7 @@ impl AggregatorCell {
                 &mut self.slots[ord],
                 open_bucket(
                     tick,
+                    prices,
                     bucket_start,
                     bucket_start_cumulative,
                     false,
@@ -326,7 +426,7 @@ impl AggregatorCell {
         if matches!(strategy.late_policy, LatePolicy::Refold) {
             let last = self.last_sealed[ord];
             if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
-                fold_late_hlc(&mut self.last_sealed[ord], tick);
+                fold_late_hlc(&mut self.last_sealed[ord], tick, prices);
                 return ConsumeOutcome::AmendedLate {
                     amended_state: self.last_sealed[ord],
                 };
@@ -412,15 +512,17 @@ impl AggregatorCell {
 #[inline]
 fn open_bucket(
     tick: &ParsedTick,
+    prices: TickPrices,
     bucket_start: u32,
     bucket_start_cumulative: u64,
     use_day_open: bool,
     cumulative_volume: u64,
 ) -> LiveCandleState {
-    let price = f32_to_f64_clean(tick.last_traded_price);
-    // `> 0.0` is false for NaN, so a poisoned day_open can never be adopted.
-    let open = if use_day_open && tick.day_open > 0.0 {
-        f32_to_f64_clean(tick.day_open)
+    let price = prices.last_traded_price;
+    // `day_open` is already `0.0` unless the raw field was strictly positive
+    // (NaN included), so this test carries the original `> 0.0` semantics.
+    let open = if use_day_open && prices.day_open > 0.0 {
+        prices.day_open
     } else {
         price
     };
@@ -456,8 +558,13 @@ fn open_bucket(
 /// Folds an in-bucket tick. The caller has already established that the tick
 /// belongs to THIS bucket.
 #[inline]
-fn fold_in_bucket(state: &mut LiveCandleState, tick: &ParsedTick, cumulative_volume: u64) {
-    let price = f32_to_f64_clean(tick.last_traded_price);
+fn fold_in_bucket(
+    state: &mut LiveCandleState,
+    tick: &ParsedTick,
+    prices: TickPrices,
+    cumulative_volume: u64,
+) {
+    let price = prices.last_traded_price;
     if price > state.high {
         state.high = price;
     }
@@ -472,12 +579,14 @@ fn fold_in_bucket(state: &mut LiveCandleState, tick: &ParsedTick, cumulative_vol
     state.oi = i64::from(tick.open_interest);
     state.tick_count = state.tick_count.saturating_add(1);
     // Last NON-ZERO wins: a blank pre-market 0 must never clobber a real
-    // baseline captured earlier in the session.
-    if tick.day_close > 0.0 {
-        state.prev_day_close = f32_to_f64_clean(tick.day_close);
+    // baseline captured earlier in the session. The widened fields are `0.0`
+    // unless the raw field was strictly positive, so testing the CONVERTED
+    // value preserves the original `tick.day_* > 0.0` semantics exactly.
+    if prices.day_close > 0.0 {
+        state.prev_day_close = prices.day_close;
     }
-    if tick.day_open > 0.0 {
-        state.session_open = f32_to_f64_clean(tick.day_open);
+    if prices.day_open > 0.0 {
+        state.session_open = prices.day_open;
     }
 }
 
@@ -489,8 +598,8 @@ fn fold_in_bucket(state: &mut LiveCandleState, tick: &ParsedTick, cumulative_vol
 /// `volume` / `oi` are untouched: `open` belongs to the first tick, and the
 /// cumulative snapshots are order-dependent and ambiguous for a latecomer.
 #[inline]
-fn fold_late_hlc(state: &mut LiveCandleState, tick: &ParsedTick) {
-    let price = f32_to_f64_clean(tick.last_traded_price);
+fn fold_late_hlc(state: &mut LiveCandleState, tick: &ParsedTick, prices: TickPrices) {
+    let price = prices.last_traded_price;
     if price > state.high {
         state.high = price;
     }
@@ -534,6 +643,89 @@ mod tests {
             volume: cum_volume,
             ..ParsedTick::default()
         }
+    }
+
+    #[test]
+    fn test_tick_prices_widening_is_pure_and_matches_the_inline_fold() {
+        // Widening must be a pure function of the tick — that is precisely
+        // what makes hoisting it out of the timeframe loop safe. If this ever
+        // stops holding, one derivation per tick is NOT interchangeable with
+        // TF_COUNT of them and `consume_tick_with_prices` becomes unsound.
+        let t = tick_at(OPEN, 24_000.05, 10);
+        assert_eq!(TickPrices::from_tick(&t), TickPrices::from_tick(&t));
+
+        // And it must agree, bit for bit, with the conversion the fold used to
+        // perform inline — this is the equivalence the hoist relies on.
+        let mut full = tick_at(OPEN, 24_000.05, 10);
+        full.day_open = 24_000.25;
+        full.day_close = 23_950.75;
+        let p = TickPrices::from_tick(&full);
+        assert_eq!(
+            p.last_traded_price,
+            f32_to_f64_clean(full.last_traded_price)
+        );
+        assert_eq!(p.day_open, f32_to_f64_clean(full.day_open));
+        assert_eq!(p.day_close, f32_to_f64_clean(full.day_close));
+    }
+
+    #[test]
+    fn test_tick_prices_collapses_absent_and_nan_day_fields_to_sentinel() {
+        // `> 0.0` is false for NaN, so a poisoned day field must land on the
+        // 0.0 sentinel rather than propagate — otherwise NaN would be
+        // absorbing under the fold's comparisons and poison the bar. Callers
+        // test the CONVERTED value, so this preserves the original semantics.
+        let mut blank = tick_at(OPEN, 24_000.05, 10);
+        blank.day_open = 0.0;
+        blank.day_close = f32::NAN;
+        let p = TickPrices::from_tick(&blank);
+        assert_eq!(
+            p.day_open, 0.0,
+            "absent day_open must widen to the sentinel"
+        );
+        assert_eq!(
+            p.day_close, 0.0,
+            "NaN day_close must collapse to the sentinel, never propagate"
+        );
+        assert!(
+            p.last_traded_price > 0.0,
+            "a sane LTP still widens normally"
+        );
+
+        // A NEGATIVE day field is equally non-adoptable.
+        let mut neg = tick_at(OPEN, 24_000.05, 10);
+        neg.day_open = -1.0;
+        assert_eq!(TickPrices::from_tick(&neg).day_open, 0.0);
+    }
+
+    #[test]
+    fn test_consume_tick_with_prices_matches_the_convenience_wrapper() {
+        // The wrapper must be a pure delegation: same outcome, same state.
+        // If these ever diverge, the hot loop and every test call site are
+        // exercising different code.
+        let t = tick_at(OPEN, 24_000.05, 10);
+        let mut a = AggregatorCell::empty();
+        let mut b = AggregatorCell::empty();
+
+        let out_a = a.consume_tick(TfIndex::M1, &t, 0, FeedStrategy::DEFAULT, 10);
+        let out_b = b.consume_tick_with_prices(
+            TfIndex::M1,
+            &t,
+            TickPrices::from_tick(&t),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+
+        assert_eq!(
+            format!("{out_a:?}"),
+            format!("{out_b:?}"),
+            "wrapper and hoisted-price path must return the same outcome"
+        );
+        assert_eq!(
+            a.snapshot(TfIndex::M1),
+            b.snapshot(TfIndex::M1),
+            "wrapper and hoisted-price path must leave identical bar state"
+        );
     }
 
     #[test]

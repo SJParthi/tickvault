@@ -264,6 +264,9 @@ if [ -z "$QDB_MEM" ]; then
     r8g.large)
       QDB_MEM="4g"
       ok "Target r8g.large (16 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in repo/deploy/docker/.env at Step 8, coupled to the resize)." ;;
+    r8g.xlarge)
+      QDB_MEM="12g"
+      ok "Target r8g.xlarge (32 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (operator Quote 13, 2026-08-08 — §7 Rule 2 sizes QuestDB at 8-16 GB of the 32 GiB budget; set in repo/deploy/docker/.env at Step 8, coupled to the resize)." ;;
     *) : ;; # no auto-default for other targets — --qdb-mem is explicit-only
   esac
 fi

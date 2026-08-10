@@ -285,31 +285,63 @@ const UPGRADE_SCRIPT: &str = "scripts/aws-upgrade-instance.sh";
 const APP_ALARMS_TF: &str = "deploy/aws/terraform/app-alarms.tf";
 const DOCKER_COMPOSE: &str = "deploy/docker/docker-compose.yml";
 
-/// The QuestDB-1g HALF of operator Quote 8 (2026-07-15, "Flip tonight:
-/// t4g.medium, QuestDB 1g, automated") — review round 6 ratchet. Two pins:
+/// The QuestDB memory ceiling must track the LOCKED INSTANCE TYPE.
 ///
+/// RE-BLESSED 2026-08-10 for operator Quote 13 (2026-08-08, r8g.xlarge —
+/// 4 vCPU / 32 GiB, multi-AZ). This test previously asserted the t4g.medium
+/// `${QDB_MEM_LIMIT:-1g}` of Quote 8 (2026-07-15), and that assertion SURVIVED
+/// the r8g.xlarge migration — so a build-failing ratchet was actively
+/// FORBIDDING anyone from giving QuestDB more than 1 GiB on a 32 GiB box.
+/// Raising the ceiling was therefore not a config edit; the guard had to be
+/// re-blessed first. That is the failure mode this rewrite is designed to
+/// prevent recurring: the test now derives its expectation from the locked
+/// instance type rather than freezing a literal, so the NEXT instance change
+/// fails here loudly instead of silently pinning a stale ceiling.
+///
+/// Three pins:
 ///   1. `deploy/docker/docker-compose.yml` must default the QuestDB container
-///      memory to `${QDB_MEM_LIMIT:-1g}` — a silent revert to `:-4g` would
-///      over-commit the 4 GiB t4g.medium host on any boot path that never
-///      wrote the on-box `.env` override.
-///   2. `scripts/aws-upgrade-instance.sh` must keep the per-target auto-default
-///      arm `t4g.medium) QDB_MEM="1g"` — the manual-fallback flip must couple
-///      the QuestDB ceiling to the instance size exactly like the workflow.
+///      memory to the ceiling for the LOCKED type — 12g for r8g.xlarge
+///      (§7 Rule 2 sizes QuestDB at 8–16 GB of the 32 GiB budget).
+///   2. `scripts/aws-upgrade-instance.sh` must carry a per-target auto-default
+///      arm for the locked type, so the manual fallback couples the QuestDB
+///      ceiling to the instance size exactly like the workflow does.
+///   3. The compose default must NOT be a superseded smaller-host value. A
+///      `1g`/`4g` default on the 32 GiB box is the stale-ceiling bug itself.
 #[test]
-fn deploy_questdb_mem_limit_pins_1g_for_t4g_medium() {
+fn deploy_questdb_mem_limit_tracks_locked_instance_type() {
+    // The locked type per `daily-universe-scope-expansion-2026-05-27.md` §7
+    // (operator Quote 13, 2026-08-08). Changing the instance REQUIRES changing
+    // this pair, which is what forces the compose + script sizing to move too.
+    const LOCKED_INSTANCE_TYPE: &str = "r8g.xlarge";
+    const LOCKED_QDB_MEM: &str = "12g";
+
     let compose = read(DOCKER_COMPOSE);
     assert!(
-        compose.contains("${QDB_MEM_LIMIT:-1g}"),
+        compose.contains(&format!("${{QDB_MEM_LIMIT:-{LOCKED_QDB_MEM}}}")),
         "docker-compose.yml must default the QuestDB mem_limit to \
-         `${{QDB_MEM_LIMIT:-1g}}` (operator Quote 8, 2026-07-15 — the QuestDB-1g \
-         half of the t4g.medium downsize; a 4g default over-commits the 4 GiB host)."
+         `${{QDB_MEM_LIMIT:-{LOCKED_QDB_MEM}}}` for the locked \
+         {LOCKED_INSTANCE_TYPE} (operator Quote 13, 2026-08-08). §7 Rule 2 \
+         budgets QuestDB at 8-16 GB of the 32 GiB host."
     );
+    // The stale-ceiling pin: the values sized for the retired 4 GiB / 16 GiB
+    // hosts must not reappear as the DEFAULT on the 32 GiB box.
+    for stale in ["${QDB_MEM_LIMIT:-1g}", "${QDB_MEM_LIMIT:-4g}"] {
+        assert!(
+            !compose.contains(stale),
+            "docker-compose.yml still defaults QuestDB to `{stale}` — that is a \
+             retired smaller-host ceiling (t4g.medium 4 GiB / r8g.large 16 GiB). \
+             On the locked {LOCKED_INSTANCE_TYPE} (32 GiB) it caps QuestDB at a \
+             fraction of the host and makes the upgrade unreachable."
+        );
+    }
     let script = squish(&code_only(&read(UPGRADE_SCRIPT)));
     assert!(
-        script.contains("t4g.medium) QDB_MEM=\"1g\""),
-        "aws-upgrade-instance.sh must keep the `t4g.medium) QDB_MEM=\"1g\"` \
-         auto-default arm (operator Quote 8, 2026-07-15) so the manual fallback \
-         couples QuestDB to 1g whenever the target is t4g.medium."
+        script.contains(&format!(
+            "{LOCKED_INSTANCE_TYPE}) QDB_MEM=\"{LOCKED_QDB_MEM}\""
+        )),
+        "aws-upgrade-instance.sh must carry the \
+         `{LOCKED_INSTANCE_TYPE}) QDB_MEM=\"{LOCKED_QDB_MEM}\"` auto-default arm \
+         so the manual fallback couples QuestDB to the locked instance size."
     );
 }
 
