@@ -16,7 +16,7 @@
 > | 8 | Tighten the over-broad secret-scanner line exclusion | ✅ **DONE + bite-tested 7 cases, 0 false positives on 400 real files** |
 > | **0** | 🔴 **`live_feed_purity_guard` is VACUOUS ON DISK RIGHT NOW** — see §4c | ⬛ **TOP PRIORITY, needs a decision** |
 > | 9 | **OPERATOR DECISION** — are 18 CI JavaScript blocks, 1 Perl gate and 94 shell scripts in scope for "Rust only"? | ⬛ BLOCKED on operator |
-> | 10 | Vacuous-guard sweep across ALL `*_guard.rs` (its agent never launched) | ⬜ TODO |
+> | 10 | Vacuous-guard sweep across ALL `*_guard.rs` | 🟡 **SWEEP DONE (162 examined) · 2 of 12 siblings HARDENED** — `error_code_tag_guard` + `error_level_meta_guard`; 10 remain, all sharing one fix pattern |
 >
 > ⚠ **TWO SESSIONS ARE WORKING THIS REPO.** A parallel session ("Market data
 > platform analysis") is mid-edit on `crates/common/tests/rust_only_guard.rs`
