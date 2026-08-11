@@ -1927,6 +1927,13 @@ async fn main() -> Result<()> {
             main_feed_instruments: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
+            questdb: config.questdb.clone(),
+            // The process-wide WAL opened in STAGE-C above. This is the FIRST
+            // frame-append consumer since PR-C2 retired the Dhan lane on
+            // 2026-07-13 (the note there — "there is no frame APPEND site left
+            // in this process" — is what this line changes). `None` refuses
+            // the lane outright rather than capturing without a durable floor.
+            spill: _ws_frame_spill.clone(),
         },
     );
 

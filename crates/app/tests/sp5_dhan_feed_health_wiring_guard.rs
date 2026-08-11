@@ -18,6 +18,44 @@
 //! Still pending (cosmetic, not a false-OK): `record_candle(Feed::Dhan)` at the
 //! Dhan seal site (makes `candles_total` non-zero) — folded into the SP6 page work.
 
+//! ## RE-BLESSED 2026-08-11 — Dhan 16-connection live-feed revival
+//!
+//! The operator authorized the Dhan live main-feed revival on 2026-08-09
+//! (websocket-connection-scope-lock.md, "DHAN LIVE MAIN-FEED WS REVIVAL
+//! AUTHORIZED" + the same-day second quote raising the cap to 16), approved
+//! 2026-08-11.
+//!
+//! **Nothing in this file is defused, because nothing here blocks the
+//! revival — the surviving assertion actively SUPPORTS it.** Verified
+//! 2026-08-11: `test_sp5_1_drops_dimension_wired_in_spill` asserts
+//! `WsType::LiveFeed.owning_feed() == Some(Feed::Dhan)`, i.e. that a
+//! dropped live-feed frame is attributed to Dhan. That is exactly the
+//! behaviour the revived lane needs; it was written to survive the
+//! retirement and it holds unchanged. The RETIRED notes above are prose,
+//! not assertions — a doc-comment naming a deleted test cannot fail a
+//! build, so there is no landmine here to disarm.
+//!
+//! **What IS still missing (stated plainly, not implied closed):** of the
+//! three SP5 health dimensions, only `drops` is pinned. The other two
+//! retired with the lane and are NOT restored by this re-blessing:
+//!
+//! - **connected** — the pool watchdog's `set_connected(Feed::Dhan, …)`
+//!   write. Until this returns, `/api/feeds/health` cannot distinguish "the
+//!   Dhan feed is down" from "the Dhan feed was never started".
+//! - **freshness** — the `record_tick(Feed::Dhan, …)` write that lived in
+//!   the deleted `tick_processor.rs`. Without it a CONNECTED-but-silent
+//!   Dhan feed reads as healthy, which is the connected+stale false-OK
+//!   (audit Rule 11) — and per the scope lock's own honest envelope, the
+//!   retirement measured 29–67 silent instruments per minute on this feed,
+//!   so silence is a demonstrated failure mode here, not a hypothetical.
+//!
+//! These are deliberately NOT pinned now: their record-sites do not exist
+//! yet (the revival's connection/tick path is still being written, and
+//! `tickvault-core` does not currently compile), so a pin would fail for
+//! absence rather than regression and would block the work. They MUST be
+//! re-pinned in the PR that wires them — otherwise the revived feed ships
+//! with strictly less health coverage than the retired one had.
+
 use std::path::PathBuf;
 
 // RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator

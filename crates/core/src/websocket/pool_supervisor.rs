@@ -73,7 +73,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
-use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, next_frame_seq};
 use tracing::{error, info, warn};
 
 use super::idle_watchdog::IdleWatchdog;
@@ -768,6 +768,35 @@ pub trait FrameSink: Send + Sync + 'static {
     fn accept(&self, frame: Bytes) -> FrameSinkOutcome;
 }
 
+/// One captured frame and the sequence it was stamped with at the read
+/// instant.
+///
+/// The sequence travels WITH the bytes rather than being re-derived
+/// downstream, and that is the whole design. `next_frame_seq` is minted
+/// exactly once per received frame and written into the WAL record; the
+/// consumer must stamp `ticks.capture_seq` with the SAME value, because on
+/// replay the WAL hands back its stored sequence. A consumer that minted its
+/// own would produce a different key for a replayed frame and the DEDUP
+/// collapse that makes replay idempotent would never happen — every restart
+/// would silently duplicate the session (`data-integrity.md`, TICK-SEQ-01).
+#[derive(Debug, Clone)]
+pub struct CapturedFrame {
+    /// The replay-stable sequence, already persisted in the WAL record.
+    pub seq: u64,
+    /// Which socket this frame came off.
+    ///
+    /// Load-bearing, not decoration: the main feed and the depth feeds use
+    /// DIFFERENT wire formats — an 8-byte header versus a 12-byte one whose
+    /// first two bytes are a message length. A consumer that cannot tell them
+    /// apart will feed a depth frame to the main-feed parser, where byte 0 is a
+    /// length low-byte matching no response code, and silently discard every
+    /// depth packet as unparseable. Carrying the endpoint makes that mistake
+    /// impossible to make by accident.
+    pub endpoint: DhanEndpointType,
+    /// The frame exactly as it arrived. Never parsed on the read task.
+    pub bytes: Bytes,
+}
+
 /// Production [`FrameSink`]: append to the write-ahead log, then push into the
 /// bounded ring. In that order, always.
 ///
@@ -777,7 +806,7 @@ pub trait FrameSink: Send + Sync + 'static {
 /// therefore a lag signal, not a loss event.
 pub struct WalRingSink {
     spill: std::sync::Arc<WsFrameSpill>,
-    ring: tokio::sync::mpsc::Sender<Bytes>,
+    ring: tokio::sync::mpsc::Sender<CapturedFrame>,
     ws_type: WsType,
     endpoint: DhanEndpointType,
 }
@@ -787,7 +816,7 @@ impl WalRingSink {
     #[must_use]
     pub fn new(
         spill: std::sync::Arc<WsFrameSpill>,
-        ring: tokio::sync::mpsc::Sender<Bytes>,
+        ring: tokio::sync::mpsc::Sender<CapturedFrame>,
         ws_type: WsType,
         endpoint: DhanEndpointType,
     ) -> Self {
@@ -802,15 +831,28 @@ impl WalRingSink {
 
 impl FrameSink for WalRingSink {
     fn accept(&self, frame: Bytes) -> FrameSinkOutcome {
+        // Minted ONCE, here, at the read instant — see `CapturedFrame`.
+        let seq = next_frame_seq();
         // Step 1 — durability. `Bytes` into the WAL is an Arc refcount bump.
+        // `append_with_seq`, never `append`: `append` would mint a SECOND
+        // sequence internally and the WAL record would then disagree with the
+        // one the consumer stamps.
         // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
-        if self.spill.append(self.ws_type, frame.clone()) == AppendOutcome::Dropped {
+        if self.spill.append_with_seq(self.ws_type, frame.clone(), seq) == AppendOutcome::Dropped {
             metrics::counter!(WAL_DROP_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
             return FrameSinkOutcome::WalDropped;
         }
         // Step 2 — visibility. `try_send` never awaits; a full ring returns
         // immediately so the reader keeps polling (and therefore keeps ponging).
-        if self.ring.try_send(frame).is_err() {
+        if self
+            .ring
+            .try_send(CapturedFrame {
+                seq,
+                endpoint: self.endpoint,
+                bytes: frame,
+            })
+            .is_err()
+        {
             metrics::counter!(RING_FULL_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
             return FrameSinkOutcome::RingFull;
         }
@@ -1826,7 +1868,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
             tx,
@@ -1836,7 +1878,43 @@ mod tests {
 
         let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
         assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::Captured);
-        assert_eq!(rx.try_recv().ok(), Some(frame));
+        let published = rx.try_recv().expect("a captured frame must be published");
+        assert_eq!(published.bytes, frame);
+        assert!(
+            published.seq > 0,
+            "the published frame must carry the sequence minted at the read \
+             instant — a zero would mean nothing stamped it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_ring_sink_stamps_a_distinct_ascending_seq_per_frame() {
+        // Two arrivals of BYTE-IDENTICAL content must still receive distinct
+        // sequences, or the DEDUP key would collapse them and the second tick
+        // would be silently lost. This is the live index-loss class recorded in
+        // data-integrity.md (23,146.45 → .75 → .45 on a volume-0 index).
+        let dir = wal_dir("seqascend");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let sink = WalRingSink::new(spill, tx, WsType::LiveFeed, DhanEndpointType::MainFeed);
+
+        let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::Captured);
+        assert_eq!(sink.accept(frame), FrameSinkOutcome::Captured);
+
+        let first = rx.try_recv().expect("first frame published");
+        let second = rx.try_recv().expect("second frame published");
+        assert!(
+            second.seq > first.seq,
+            "identical content must still get a strictly greater sequence: \
+             {} then {}",
+            first.seq,
+            second.seq
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1849,7 +1927,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
         let sink = WalRingSink::new(spill, tx, WsType::LiveFeed, DhanEndpointType::MainFeed);
 
         assert_eq!(

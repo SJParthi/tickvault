@@ -234,6 +234,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_check_and_report_host_limits_is_total_and_counts_only_unmet() {
+        // Runs the real reporting function against whatever /proc this machine
+        // actually has. Two things are being pinned, and neither depends on
+        // the host's tuning:
+        //
+        // 1. It never panics. It reads /proc paths that may be absent (a
+        //    container, macOS, a hardened image), and boot calls it before
+        //    anything else — a panic here would take down the process over a
+        //    diagnostic.
+        // 2. Its return value is bounded by the number of limits checked. It
+        //    counts UNMET limits, so it can never exceed the list, and a
+        //    return of 0 means every limit was both readable and satisfied.
+        let unmet = check_and_report_host_limits();
+        assert!(
+            unmet <= CHECKED_LIMITS.len(),
+            "reported {unmet} unmet limits but only {} are checked — the counter must \
+             count limits, not something else",
+            CHECKED_LIMITS.len()
+        );
+
+        // Idempotent: boot may retry, and a second call must not accumulate.
+        assert_eq!(
+            unmet,
+            check_and_report_host_limits(),
+            "the check must be a pure read of /proc — calling it twice must give the \
+             same answer"
+        );
+    }
+
+    #[test]
     fn classify_meets_when_equal_to_requirement() {
         // Boundary: exactly the required value MUST pass. An off-by-one here
         // would page every correctly-tuned box.

@@ -244,13 +244,10 @@ if modprobe tcp_bbr 2>/dev/null; then
     echo tcp_bbr > /etc/modules-load.d/tickvault-bbr.conf
 fi
 sysctl --system >/dev/null 2>&1 || echo "user-data: WARNING sysctl --system non-zero"
-# Verify loudly. Tuning that silently no-ops invites a false guarantee.
-TV_RMEM="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
-if [ "$TV_RMEM" -ge 134217728 ] 2>/dev/null; then
-    echo "user-data: network tuning APPLIED (rmem_max=$TV_RMEM)"
-else
-    echo "user-data: WARNING tuning DID NOT APPLY (rmem_max=$TV_RMEM, want >=134217728)"
-fi
+# Verify EVERY load-bearing value, not just rmem_max, and report to journald +
+# /opt/tickvault/net-tuning.status so the verdict outlives cloud-init's log.
+# Non-zero exit is deliberate and deliberately not fatal — see the script header.
+bash /opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh || true
 
 # ---- Step 6: Start the Docker Compose stack ----
 # Post-CloudWatch-only migration (#O1/#O2/#O3/#O4): the stack is QuestDB

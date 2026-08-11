@@ -56,8 +56,30 @@ use tokio::sync::mpsc;
 use tickvault_trading::candles::BufferedSeal;
 
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
-use crate::seal_writer_task::{DrainOutcome, drain_once};
+use crate::seal_dlq::SealDlqWriter;
+use crate::seal_spill::SealSpillWriter;
+use crate::seal_writer_task::{BootDrainOutcome, DrainOutcome, drain_once, drain_recovered_seals};
 use crate::shadow_candle_writer::ShadowCandleWriter;
+
+/// Production spill directory, derived through the public `SealSpillWriter`
+/// API so this module never duplicates the path literal (a drifted copy
+/// would silently recover from the wrong directory — i.e. recover nothing).
+fn production_spill_dir() -> std::path::PathBuf {
+    SealSpillWriter::new()
+        .spill_path(0)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// Production DLQ directory — same derivation as [`production_spill_dir`].
+fn production_dlq_dir() -> std::path::PathBuf {
+    SealDlqWriter::new()
+        .dlq_path(0)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
+}
 
 /// Wave 6 Sub-PR #1 item 1.4c — process-global mpsc Sender that any
 /// producer (e.g. the future aggregator task that subscribes to the
@@ -159,6 +181,12 @@ pub struct SealWriterRunner {
     /// Max seals to drain from ring → ILP per cycle. Bounded so a
     /// catastrophic burst doesn't monopolise the writer task.
     max_drain_per_cycle: usize,
+    /// Spill directory this runner's pipeline writes to. Retained so the
+    /// boot-time recovery drain reads back from the SAME directory the
+    /// rescue path spills into (the pipeline owns its writers privately).
+    spill_dir: std::path::PathBuf,
+    /// DLQ directory — same reasoning as `spill_dir`.
+    dlq_dir: std::path::PathBuf,
 }
 
 impl SealWriterRunner {
@@ -178,6 +206,8 @@ impl SealWriterRunner {
             pipeline,
             writer,
             max_drain_per_cycle,
+            spill_dir: production_spill_dir(),
+            dlq_dir: production_dlq_dir(),
         })
     }
 
@@ -197,8 +227,8 @@ impl SealWriterRunner {
         let writer = ShadowCandleWriter::for_test();
         let pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
             ring_capacity,
-            spill_dir,
-            dlq_dir,
+            spill_dir.clone(),
+            dlq_dir.clone(),
         );
         let (sender, receiver) = mpsc::channel(mpsc_capacity);
         Self {
@@ -207,7 +237,37 @@ impl SealWriterRunner {
             pipeline,
             writer,
             max_drain_per_cycle,
+            spill_dir,
+            dlq_dir,
         }
+    }
+
+    /// Boot-time recovery drain: reads back every orphaned spill / DLQ file
+    /// and re-ingests it into QuestDB. Called ONCE by the writer loop before
+    /// its drain ticker starts.
+    ///
+    /// Without this, seals rescued to disk during a QuestDB outage were never
+    /// read back by anything — see the module docs on
+    /// [`crate::seal_writer_task::drain_recovered_seals`].
+    pub fn boot_drain(&mut self) -> BootDrainOutcome {
+        drain_recovered_seals(
+            &mut self.writer,
+            &self.spill_dir,
+            &self.dlq_dir,
+            self.max_drain_per_cycle,
+        )
+    }
+
+    /// Spill directory this runner recovers from (test observability).
+    #[must_use]
+    pub fn spill_dir(&self) -> &std::path::Path {
+        &self.spill_dir
+    }
+
+    /// DLQ directory this runner recovers from (test observability).
+    #[must_use]
+    pub fn dlq_dir(&self) -> &std::path::Path {
+        &self.dlq_dir
     }
 
     /// Cloneable producer-side handle. The future aggregator passes
