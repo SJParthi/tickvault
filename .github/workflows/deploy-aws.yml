@@ -445,6 +445,15 @@ jobs:
         # never blocks the deploy — that inversion is the whole point.
         # Fail-closed on the part that matters: if the tag resolves to nothing
         # we stop, because a deploy with no target is not a deploy.
+        #
+        # MERGE NOTE 2026-08-11: two independent fixes for this same incident
+        # landed in parallel — this one and a "Resolve prod instance id at
+        # runtime" step on main. Both wrote $IID, so keeping both meant the
+        # second silently overwrote the first: two resolvers disagreeing is
+        # strictly worse than one. They are folded into this single step, each
+        # keeping what the other lacked — the LaunchTime sort and the
+        # environment parameterisation from here, the exit-status-vs-output
+        # distinction below from there.
         env:
           REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
           ENVIRONMENT: ${{ vars.TV_ENVIRONMENT || 'prod' }}
@@ -465,11 +474,28 @@ jobs:
           # (they are pending/running/shutting-down/terminated/stopping/
           # stopped); it matched nothing. `pending` is what was meant, and a
           # freshly-launched replacement sits there.
+          #
+          # The call's EXIT STATUS is distinguished from its OUTPUT. An earlier
+          # version of this step ended in `2>/dev/null || echo ""`, which
+          # LAUNDERED an API, credential or permission failure into an empty
+          # result — indistinguishable from "no instance carries that tag", so
+          # expired credentials would have been reported as a missing box: a
+          # false diagnosis pointing the operator away from the real cause.
+          set +e
           MATCHES=$(aws ec2 describe-instances --region "$REGION" \
             --filters "Name=tag:Name,Values=tv-${ENVIRONMENT}-app" \
                       "Name=instance-state-name,Values=running,pending,stopped,stopping" \
             --query 'sort_by(Reservations[].Instances[], &LaunchTime)[].InstanceId' \
-            --output text 2>/dev/null || echo "")
+            --output text 2>/tmp/tv-ec2-describe.err)
+          DESCRIBE_RC=$?
+          set -e
+          if [ "$DESCRIBE_RC" -ne 0 ]; then
+            echo "::error::describe-instances FAILED (exit ${DESCRIBE_RC}). This is NOT 'instance"
+            echo "::error::not found' — it is an API, credential or permission failure, and"
+            echo "::error::treating it as 'not found' would send the operator hunting a"
+            echo "::error::terminated box that is fine. AWS said: $(tr '\n' ' ' < /tmp/tv-ec2-describe.err | cut -c1-400)"
+            exit 1
+          fi
           # One id per line, blanks removed. `None` is what the AWS CLI prints
           # for an empty result set, so it is filtered out as well.
           IDS=$(printf '%s\n' "$MATCHES" | tr '\t' '\n' | grep -v '^None$' | grep . || true)
@@ -482,7 +508,7 @@ jobs:
             # or a stale instance was never cleaned up; either way, picking one
             # silently is how you deploy to the wrong host.
             echo "::error::${MATCH_COUNT} instances carry the tag tv-${ENVIRONMENT}-app:"
-            printf '%s\n' "$MATCHES" | tr '\t' '\n' | sed 's/^/::error::  /'
+            printf '%s\n' "$IDS" | sed 's/^/::error::  /'
             echo "::error::Refusing to guess which one is production. Terminate the stale"
             echo "::error::instance, or remove its Name tag, then re-run."
             exit 1
@@ -491,7 +517,9 @@ jobs:
           if [ -z "$LIVE_IID" ] || [ "$LIVE_IID" = "None" ]; then
             echo "::error::No tv-${ENVIRONMENT}-app instance found in ${REGION}. Cannot deploy:"
             echo "::error::there is no target. Check the region, and whether the box was"
-            echo "::error::terminated without being recreated."
+            echo "::error::terminated without being recreated. Deliberately NOT falling back"
+            echo "::error::to the EC2_INSTANCE_ID secret (${SECRET_IID:-<empty>}) — a stale"
+            echo "::error::secret pointing at a dead box is the incident this step ends."
             exit 1
           fi
 
@@ -928,7 +956,7 @@ jobs:
           set -uo pipefail
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
           CMD_ID="${{ steps.ssm.outputs.command_id }}"
-          IID="${IID:?resolve-instance-step-did-not-run}"
+          IID="${IID:?instance id was not resolved — the Resolve-the-LIVE-instance-id-by-tag step must run first}"
           # 240 polls × 5s = 1200s nominal. Bumped 120 → 240 (2026-07-13):
           # the observed cadence is ~6.3s/poll (5s sleep + ~1.3s API
           # round-trip — runs 29269805430 / 29273283894 burned 120 polls in
@@ -1017,7 +1045,7 @@ jobs:
         run: |
           set +e
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
-          IID="${IID:?resolve-instance-step-did-not-run}"
+          IID="${IID:?instance id was not resolved — the Resolve-the-LIVE-instance-id-by-tag step must run first}"
           # One SSM round-trip returns BOTH the systemd state and the auto-restart
           # count so we can tell "still booting (activating / replaying WAL)" apart
           # from "crashed (failed, or Restart=always looping)". Single-line
@@ -1025,14 +1053,14 @@ jobs:
           probe() {
             local cid
             cid=$(aws ssm send-command \
-              --region "$REGION" --instance-ids "$IID" \
+              --region "$REGION" --instance-ids "${IID:?instance id not resolved — the Resolve-the-LIVE-instance-id-by-tag step must have run and succeeded}" \
               --document-name "AWS-RunShellScript" \
               --parameters 'commands=["printf STATE=; systemctl is-active tickvault 2>/dev/null || true; printf NRESTARTS=; systemctl show -p NRestarts --value tickvault 2>/dev/null || true"]' \
               --query 'Command.CommandId' --output text 2>/dev/null)
             if [ -z "$cid" ] || [ "$cid" = "None" ]; then echo "STATE=probefailed NRESTARTS="; return; fi
             sleep 4
             aws ssm get-command-invocation \
-              --region "$REGION" --command-id "$cid" --instance-id "$IID" \
+              --region "$REGION" --command-id "$cid" --instance-id "${IID:?instance id not resolved}" \
               --query 'StandardOutputContent' --output text 2>/dev/null | tr -d '[:space:]'
           }
           parse_state() { printf '%s' "$1" | sed -n 's/.*STATE=\([a-z-]*\).*/\1/p'; }
@@ -1090,7 +1118,7 @@ jobs:
               CRASHED=0; VERIFIED=1
             else
               EXT_CMD=$(aws ssm send-command \
-                --region "$REGION" --instance-ids "$IID" \
+                --region "$REGION" --instance-ids "${IID:?instance id not resolved — the Resolve-the-LIVE-instance-id-by-tag step must have run and succeeded}" \
                 --document-name "AWS-RunShellScript" \
                 --comment "tickvault external-stop check sha=${{ github.sha }}" \
                 --parameters 'commands=["systemctl show tickvault -p ActiveState,SubState,Result 2>/dev/null || true","echo ===JOURNAL-LAST-20===","journalctl -u tickvault -n 20 --no-pager 2>&1 || true"]' \
@@ -1191,7 +1219,7 @@ jobs:
         run: |
           set +e
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
-          IID="${IID:?resolve-instance-step-did-not-run}"
+          IID="${IID:?instance id was not resolved — the Resolve-the-LIVE-instance-id-by-tag step must run first}"
           # START_MS captured HERE, in-step, AFTER readiness — any event found
           # below was ingested after the agent restart with the new config, so
           # a success proves the NEW globs ship (not a leftover from the old

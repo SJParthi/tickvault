@@ -504,3 +504,58 @@ output "market_hours_liveness_alarm_name" {
   description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a session where NO REST 1m leg ever fired, in the 09:20-15:35 IST window). Signal: the tv_rest_1m_fire_heartbeat gauge MISSING (treat_missing_data=breaching) — set once per per-minute fire by the retained REST 1m spot legs (spot_1m_rest_boot.rs + groww_spot_1m_boot.rs), in the CW-agent filter (user-data.sh.tftpl). Signal moved off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entry (app-log-ingestion-silent — list trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain; previously trimmed to 4 on 2026-07-15 with the Groww live-feed retirement)."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }
+
+# =============================================================================
+# 2026-08-10 — "DID THE GATE ACTUALLY RUN?" alarm
+# =============================================================================
+# THE GAP THIS CLOSES. The market-hours liveness alarm above is deliberately
+# actions_enabled=false and is ARMED each weekday morning by the gate Lambda.
+# That makes the gate a single point of failure for app-death detection, and
+# nothing watched whether it ran. Its own Errors alarm cannot see this: a Lambda
+# that is NEVER INVOKED produces no error, so the Errors alarm sits permanently
+# OK on notBreaching.
+#
+# Consequence if one EventBridge firing is dropped — a class this repo has
+# ALREADY suffered (the 2026-07-02 repo-wide scheduler drop, which is why
+# postmerge-catchup.yml exists): the liveness alarms stay disarmed for the whole
+# session, the app's own Telegram path is dead by definition (it dies with the
+# process), the EC2 alarms stay green because the INSTANCE is healthy and only
+# the PROCESS is dead, and the operator dashboards render empty because the app
+# is what serves them. The app can be dead an entire trading day and reach
+# nobody, with every console surface showing OK.
+#
+# Pattern copied from dhan_token_minter_not_invoked, which already proves it.
+#
+# WHY 3 PERIODS AND NOT 1 — the honest trade-off. The token minter runs DAILY,
+# so a 1-day window works there. This gate runs WEEKDAYS ONLY
+# (cron(50 3 ? * MON-FRI *)), so a 1-day breaching window would false-page every
+# Saturday and Sunday. A weekend produces at most TWO consecutive missing days,
+# so requiring THREE consecutive breaching periods is the smallest window that
+# is quiet on weekends.
+#
+# The cost of that choice, stated rather than buried: detection takes up to ~3
+# days, so a firing dropped on Monday is not reported until Wednesday. That is
+# strictly better than the current state (never reported) but it is NOT
+# same-day. Making it same-day needs either a weekday-aware evaluator or a
+# heartbeat the gate itself publishes — a larger change, deliberately not taken
+# here.
+resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_gate_not_invoked" {
+  alarm_name          = "tv-${var.environment}-market-hours-gate-not-invoked"
+  alarm_description   = "The market-hours liveness GATE Lambda has not run for ~3 days - its EventBridge schedule was dropped or disabled. While it does not run, the app-death liveness alarms stay DISARMED (actions_enabled=false) and a dead app reaches nobody. The gate's Errors alarm cannot detect this: no invocation means no error."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 86400
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a MISSING Invocations datapoint is precisely the condition being
+  # detected, so missing data must count as bad, not be ignored.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_market_hours_liveness_gate.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = []
+}

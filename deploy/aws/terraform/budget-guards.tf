@@ -158,9 +158,25 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
     Version = "2012-10-17"
     Statement = [
       {
+        # 2026-08-10 (security review): Describe* has NO resource-level
+        # condition in IAM, so it genuinely must stay "*". StopInstances does
+        # not — and bundling the two under one "*" granted this role the
+        # ability to stop ANY instance in the account, not just the trading
+        # box. Split, and the mutating half scoped by the Name tag exactly as
+        # the instance-profile self-stop policy in main.tf already does.
         Effect   = "Allow"
-        Action   = ["ec2:DescribeInstances", "ec2:StopInstances"]
+        Action   = ["ec2:DescribeInstances"]
         Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ec2:StopInstances"]
+        Resource = "arn:aws:ec2:${var.aws_region}:*:instance/*"
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/Name" = "tv-${var.environment}-app"
+          }
+        }
       },
       {
         # Read-only MTD spend for the hourly cost ping AND the GAP 1

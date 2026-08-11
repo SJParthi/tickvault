@@ -9,17 +9,41 @@
 set -uo pipefail
 
 PROJECT_DIR="${1:-.}"
-cd "$PROJECT_DIR" || exit 0
+# 2026-08-10: was `|| exit 0` — a failed cd exited SUCCESS with no output, so
+# a bad working directory became a silent vacuous pass. That is the same
+# fail-open class both of these files were rewritten to eliminate for their
+# zero-count and missing-baseline cases; this was the last one left in a guard
+# that now gates merges. `plan-gate.sh` already does it this way.
+cd "$PROJECT_DIR" || { echo "FATAL: cannot cd to $PROJECT_DIR — refusing to pass vacuously" >&2; exit 1; }
 
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASELINE_FILE="$HOOKS_DIR/.test-count-baseline"
 
-# Count #[test] functions across all crates
-CURRENT_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
+# Count test functions across all crates.
+#
+# 2026-08-10 FIX — BLIND SPOT: this counted ONLY `#[test]`. The string
+# `#[tokio::test]` does NOT contain `#[test]` (verified: grep -c '#\[test\]'
+# against a file holding `#[tokio::test]` returns 0), so every async test was
+# invisible to the ratchet. At the time of this fix that was 1,166 test
+# functions — roughly an eighth of the suite — which could have been deleted
+# wholesale without the "count may only increase" guard noticing.
+#
+# Both forms are now counted. Because this ADDS a category the total can only
+# rise, so the baseline is re-stamped to the true combined count in the same
+# commit; the ratchet stays strictly stronger, never weaker.
+SYNC_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
+ASYNC_COUNT=$(grep -rE '#\[(tokio|async_std)::test' crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
+CURRENT_COUNT=$(( SYNC_COUNT + ASYNC_COUNT ))
 
 if [ -z "$CURRENT_COUNT" ] || [ "$CURRENT_COUNT" -eq 0 ]; then
-  echo "  WARNING: Zero tests detected. Skipping guard." >&2
-  exit 0
+  # 2026-08-10: was `WARNING ... exit 0` — a VACUOUS PASS. A zero count does not
+  # mean "no tests to check", it means the count MECHANISM broke (wrong working
+  # directory, crates/ renamed, grep unavailable). Passing there is the exact
+  # false-OK this repo forbids: the guard reports green having compared nothing.
+  echo "  FAIL: test-count guard counted ZERO tests." >&2
+  echo "  That is a broken COUNT, not an empty suite — crates/ has thousands." >&2
+  echo "  Check the working directory and that crates/ exists." >&2
+  exit 1
 fi
 
 if [ ! -f "$BASELINE_FILE" ]; then

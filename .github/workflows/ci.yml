@@ -644,6 +644,32 @@ jobs:
         shell: bash
         run: bash .claude/hooks/financial-test-guard.sh "$GITHUB_WORKSPACE"
 
+      # 2026-08-10 (gate-integrity audit): the S6-G1 wiring guard was the ONLY
+      # one of the ten local guards with no server-side twin - confirmed by
+      # scanning every workflow file - so it ran exclusively in the local
+      # pre-push hook and was missed by any push that skipped hooks and by
+      # every edit made through the web UI. It is not a ratchet-baseline guard
+      # (no baseline file, diff-scoped, exits 2 on a finding), so nothing
+      # justified keeping it local-only.
+      #
+      # It lives in this job rather than a new one on purpose: a new top-level
+      # job would run without gating merges unless it were also added to All
+      # Green's needs list, which merge-gate-lock section 5 names as a silent
+      # regression shape. repo-guards is already in that list.
+      #
+      # The fetch is required, not decorative. actions/checkout defaults to
+      # depth 1, so without it the guard's PR-diff range cannot resolve and it
+      # refuses (fail-closed) rather than scanning nothing.
+      - name: Pub-fn wiring guard (every new pub fn has a call site)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=50 origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+          bash .claude/hooks/pub-fn-wiring-guard.sh "$GITHUB_WORKSPACE"
+
       # 2026-07-18 (rust-only phase 2b-2 wave 1): the legacy `make
       # lambda-test` step is RETIRED — the telegram-webhook Lambda is now
       # the Rust crate tickvault-aws-lambdas (its ported test suite runs in

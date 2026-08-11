@@ -24,15 +24,57 @@
 set -uo pipefail
 
 REGION="${AWS_REGION:-ap-south-1}"
-INSTANCE_ID="${EC2_INSTANCE_ID:-}"
 # Single real env (operator 2026-06-30): default prod. NO real orders —
 # production.toml locks dry_run=true.
 ENVIRONMENT="${TV_ENVIRONMENT:-prod}"
 STRICT="${STRICT:-no}"
 
-if [ -z "$INSTANCE_ID" ]; then
-  echo "::error::EC2_INSTANCE_ID not set — cannot run autopilot."
+# --- instance identity: the TAG is the authority, the secret is a hint -------
+# 2026-08-10. This script used to take EC2_INSTANCE_ID as gospel and abort when
+# it was empty. That made a stale-or-unset repo secret able to disable the one
+# lane whose entire job is noticing that the repo secret is stale — a watchdog
+# switched off by the fault it watches for. It also meant a human had to rotate
+# a secret before ANY self-healing could resume.
+#
+# Now the live box is discovered from its Name tag on every run and used
+# directly, so autopilot keeps working through a secret rotation that never
+# happened. The secret is compared, and a mismatch is reported as an issue
+# (below, once note_issue exists) instead of being fatal.
+SECRET_INSTANCE_ID="${EC2_INSTANCE_ID:-}"
+INSTANCE_ID=""
+SECRET_DRIFT_MSG=""
+
+RESOLVED_IDS=$(aws ec2 describe-instances --region "$REGION" \
+  --filters "Name=tag:Name,Values=tv-${ENVIRONMENT}-app" \
+            "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+  --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null)
+RESOLVED_COUNT=$(printf '%s\n' $RESOLVED_IDS | grep -c . || true)
+
+if [ "$RESOLVED_COUNT" -gt 1 ]; then
+  # Refuse to guess which box to heal. Two instances carrying the prod Name tag
+  # is itself the emergency; picking one and running SSM against it could
+  # restart the wrong machine.
+  echo "::error::$RESOLVED_COUNT instances carry tag Name=tv-${ENVIRONMENT}-app — refusing to guess which one to operate on. Found: $RESOLVED_IDS"
   exit 1
+elif [ "$RESOLVED_COUNT" -eq 1 ]; then
+  INSTANCE_ID=$(printf '%s\n' $RESOLVED_IDS | head -1)
+  if [ -n "$SECRET_INSTANCE_ID" ] && [ "$SECRET_INSTANCE_ID" != "$INSTANCE_ID" ]; then
+    SECRET_DRIFT_MSG="EC2_INSTANCE_ID secret is STALE — it names ${SECRET_INSTANCE_ID}, but the live \
+tv-${ENVIRONMENT}-app instance is ${INSTANCE_ID}. Autopilot healed itself by using the live id, so this \
+run is valid. Rotate the GitHub secret EC2_INSTANCE_ID to ${INSTANCE_ID} (Settings > Secrets and \
+variables > Actions) so every other lane that still reads it targets the right box."
+  fi
+else
+  # Tag lookup found nothing. Fall back to the secret rather than giving up —
+  # a missing tag is a weaker signal than a configured id.
+  INSTANCE_ID="$SECRET_INSTANCE_ID"
+  if [ -z "$INSTANCE_ID" ]; then
+    echo "::error::no instance carries tag Name=tv-${ENVIRONMENT}-app in $REGION and EC2_INSTANCE_ID is unset — nothing to check."
+    exit 1
+  fi
+  SECRET_DRIFT_MSG="no instance carries tag Name=tv-${ENVIRONMENT}-app in ${REGION} — falling back to the \
+EC2_INSTANCE_ID secret (${INSTANCE_ID}). Either the box was terminated without being recreated, or its \
+Name tag is wrong. Every tag-discovery lane (deploy, resize) is blind until this is corrected."
 fi
 
 ISSUES=()       # human-action-needed
@@ -42,6 +84,12 @@ OK=()           # already healthy
 note_ok()     { OK+=("$1");     echo "OK    : $1"; }
 note_heal()   { HEALED+=("$1"); echo "HEAL  : $1"; }
 note_issue()  { ISSUES+=("$1"); echo "ISSUE : $1"; }
+
+# Report instance-identity drift now that note_issue exists. Deliberately an
+# ISSUE and not a fatal: the run itself already healed around it.
+if [ -n "$SECRET_DRIFT_MSG" ]; then
+  note_issue "$SECRET_DRIFT_MSG"
+fi
 
 # --- helper: run a shell command ON the box via SSM, capture stdout ----------
 ssm_run() {

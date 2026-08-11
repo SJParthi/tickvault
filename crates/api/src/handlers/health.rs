@@ -195,13 +195,19 @@ pub const STATUS_UNWIRED: &str = "unwired";
 /// | `websocket`        | `retired`        | live feeds retired 2026-07-13 / 2026-07-15   |
 /// | `pipeline`         | `retired`        | `spawn_trading_pipeline` has no call site    |
 /// | `tick_persistence` | `retired`        | `tick_persistence.rs` deleted 2026-07-17     |
-/// | `order_update`     | `unreported`     | subsystem IS live; the setter is unwired     |
+/// | `order_update`     | live             | wired 2026-08-10 — see below                 |
 ///
-/// The `order_update` row is the one genuine wiring gap: `dhan_rest_stack`
-/// spawns the paper-mode receive-only order-update connection when
-/// `[dhan_order_push] enabled = true`, but never calls
-/// `set_order_update_connected`. It is reported as `unreported` rather than
-/// silently green, and wiring it is a tracked follow-up in that file.
+/// The `order_update` row WAS the one genuine wiring gap: `dhan_rest_stack`
+/// spawned the paper-mode receive-only order-update connection when
+/// `[dhan_order_push] enabled = true` but never called
+/// `set_order_update_connected`, so the only live Dhan socket rendered as
+/// `unreported` — neither up nor down. **Wired 2026-08-10**: the connection's
+/// ws lifecycle audit stream (which carries real Connected / Disconnected /
+/// Sleep transitions) is teed into this setter, so the row now tracks the
+/// socket for real. It still reads `unreported` until the first event, which
+/// is correct — with `[dhan_order_push] enabled = false` (the default) no
+/// producer exists, and inventing a status for an unspawned subsystem is the
+/// false-OK this whole table was written to avoid.
 ///
 /// All four are ARM-ON-ARRIVAL: the first setter call from any producer
 /// flips the field back to live reporting with no change needed here.

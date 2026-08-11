@@ -114,7 +114,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type the EXACT instance id (i-0b956d0209231a48b) to confirm the downsize.'
+        description: 'Type the EXACT id of the live tv-prod-app instance (aws ec2 describe-instances --filters Name=tag:Name,Values=tv-prod-app) to confirm.'
         required: true
       force_market_hours:
         description: 'Override the post-market guard? Type "yes" only for an emergency.'
@@ -142,7 +142,10 @@ permissions:
 
 env:
   REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
-  IID: i-0b956d0209231a48b # pinned; must equal secrets.EC2_INSTANCE_ID
+  # IID is NOT hardcoded: it is discovered by tag at runtime (see 'Resolve prod
+  # instance id at runtime') and exported to GITHUB_ENV. The old literal pin
+  # (i-0b956d0209231a48b) outlived the instance it named and made every
+  # dispatch refuse. Do not re-add a literal here.
   EXPECTED_EIP: 13.234.145.177 # Dhan static-IP — abort loudly if it changes
   # 2026-08-07 (operator Quote 12, daily-universe-scope-expansion-2026-05-27.md
   # §0/§7): retargeted t4g.medium -> t4g.large. This is an UPSIZE, not a
@@ -163,17 +166,17 @@ jobs:
     runs-on: ubuntu-24.04
     environment: prod
     steps:
-      - name: Confirm input matches the pinned instance id
+      # Pre-credential SHAPE check only. The identity check ("is this the LIVE
+      # tv-prod-app box?") cannot happen here — AWS credentials are not
+      # configured until the steps below — so it lives in "Resolve prod
+      # instance id at runtime", which compares this same input against the
+      # tag-resolved id before ANY mutation.
+      - name: Confirm input is a well-formed instance id
         env:
           CONFIRM_INPUT: ${{ github.event.inputs.confirm }}
-          SECRET_IID: ${{ secrets.EC2_INSTANCE_ID }}
         run: |
-          if [ "$CONFIRM_INPUT" != "$IID" ]; then
-            echo "::error::confirm input does not match the pinned instance id — refusing."
-            exit 1
-          fi
-          if [ "$SECRET_IID" != "$IID" ]; then
-            echo "::error::secrets.EC2_INSTANCE_ID does not match the pinned id — repo secret drift; refusing."
+          if ! printf '%s' "$CONFIRM_INPUT" | grep -Eq '^i-[0-9a-f]{8,17}$'; then
+            echo "::error::confirm input ('$CONFIRM_INPUT') is not a well-formed EC2 instance id (i-<hex>) — refusing."
             exit 1
           fi
 
@@ -215,6 +218,60 @@ jobs:
       - name: Resolve AWS account id at runtime # = deploy-aws.yml (SNS topic ARN)
         id: acct
         run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      # ── Resolve the LIVE prod instance id by tag (2026-08-10).
+      # This step replaced a hardcoded `IID: i-0b956d0209231a48b` job env var
+      # that had gone STALE: that instance no longer exists, so every dispatch
+      # of this workflow refused at the confirm gate against an id that could
+      # never be operated on. The tag is the authority; the operator's typed
+      # `confirm` input is checked against what we RESOLVE, not against a
+      # literal frozen in the file. That is strictly STRONGER than the old
+      # pin — a stale pin fails open into "unusable workflow", whereas a
+      # resolved id plus a human-typed match cannot silently target the wrong
+      # box. Mirrors the identical discovery step in deploy-aws.yml.
+      - name: Resolve prod instance id at runtime (tag Name=tv-prod-app)
+        env:
+          CONFIRM_INPUT: ${{ github.event.inputs.confirm }}
+          SECRET_IID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set +e
+          found=$(aws ec2 describe-instances --region "$REGION" \
+            --filters 'Name=tag:Name,Values=tv-prod-app' \
+                      'Name=instance-state-name,Values=pending,running,stopping,stopped' \
+            --query 'Reservations[].Instances[].InstanceId' --output text 2>/tmp/tv-ec2-describe.err)
+          describe_rc=$?
+          set -e
+          if [ "$describe_rc" -ne 0 ]; then
+            echo "::error::describe-instances FAILED (exit $describe_rc). This is NOT 'instance not found' — it is an API/permission/region failure, and treating it as 'no instance' would be a false-OK. Nothing was changed."
+            sed -e 's/^/    /' /tmp/tv-ec2-describe.err || true
+            exit 1
+          fi
+          count=$(printf '%s\n' $found | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no non-terminated EC2 instance carries tag Name=tv-prod-app in $REGION. Nothing was changed."
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::error::$count instances carry tag Name=tv-prod-app — refusing to guess which one to stop/modify. Found: $found"
+            exit 1
+          fi
+          RESOLVED=$(printf '%s\n' $found | head -1)
+          echo "resolved prod instance: $RESOLVED"
+          if [ "$CONFIRM_INPUT" != "$RESOLVED" ]; then
+            echo "::error::confirm input ('$CONFIRM_INPUT') does not match the LIVE tv-prod-app instance ('$RESOLVED') — refusing. Re-dispatch typing the resolved id exactly."
+            exit 1
+          fi
+          # The repo secret is a convenience MIRROR, not the authority — the tag
+          # is. A stale secret warns loudly (so it gets rotated) but must not
+          # block a correctly-confirmed run against the real box; that coupling
+          # is exactly what froze this workflow when the old instance was
+          # replaced and the secret was never rotated.
+          if [ -z "$SECRET_IID" ]; then
+            echo "::warning::secrets.EC2_INSTANCE_ID is unset — proceeding on the tag-resolved id ($RESOLVED)."
+          elif [ "$SECRET_IID" != "$RESOLVED" ]; then
+            echo "::warning::secrets.EC2_INSTANCE_ID ('$SECRET_IID') is STALE — the live tv-prod-app instance is '$RESOLVED'. Proceeding on the resolved id; rotate the repo secret."
+          fi
+          echo "IID=$RESOLVED" >> "$GITHUB_ENV"
 
       # ── STEP 0: IAM capability probe — FAIL GRACEFULLY naming the missing action.
       # Probes EVERY action this workflow ACTUALLY USES (review round 6 — the
@@ -774,6 +831,16 @@ jobs:
           SNAP_ID: ${{ steps.snap.outputs.snap_id }}
         run: |
           IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
+          if [ -z "${IID:-}" ]; then
+            # Failed BEFORE the tag-resolve step — no instance was ever
+            # targeted, so nothing was touched. Say that plainly instead of
+            # letting the reads below degrade to a vague "could not be read".
+            aws sns publish --region "$REGION" \
+              --topic-arn "arn:aws:sns:$REGION:${{ steps.acct.outputs.id }}:tv-prod-alerts" \
+              --subject "🆘 downsize FAILED (before it started)" \
+              --message "🆘 The server downsize stopped at ${IST_TIME} BEFORE it identified the box — confirmation, credentials, or instance lookup failed. NOTHING was changed; the server is exactly as it was. Fix the named cause in the run log and re-dispatch. Run: ${{ github.run_id }}" || true
+            exit 0
+          fi
           LIVE_TYPE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
             --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null || echo unknown)
           LIVE_STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \

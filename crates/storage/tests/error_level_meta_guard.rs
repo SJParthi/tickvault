@@ -68,10 +68,27 @@ fn flush_persist_broadcast_failures_must_use_error_level() {
     let root = workspace_root();
     let mut violations: Vec<String> = Vec::new();
 
+    // 2026-08-10 anti-vacuity: count what was actually read. Before this, an
+    // unreadable or moved directory made the walker return silently, so the
+    // guard passed having inspected ZERO files while reporting green.
+    let mut scanned_files: usize = 0;
     for crate_name in ["common", "storage", "core", "trading", "api", "app"] {
         let src_dir = root.join("crates").join(crate_name).join("src");
-        scan_rust_files_recursive(&src_dir, &mut violations);
+        assert!(
+            src_dir.is_dir(),
+            "error-level guard is BLIND: {src_dir:?} is not a directory. A \
+             missing crate root used to be skipped silently."
+        );
+        scan_rust_files_recursive(&src_dir, &mut violations, &mut scanned_files);
     }
+
+    // Real corpus is ~291 .rs files across the six crates; 100 leaves 3x headroom
+    // while still failing loudly if the walk collapses.
+    assert!(
+        scanned_files > 100,
+        "error-level guard scanned only {scanned_files} files — it is \
+         effectively enforcing NOTHING. Expected >100."
+    );
 
     assert!(
         violations.is_empty(),
@@ -87,25 +104,29 @@ fn workspace_root() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .unwrap_or(manifest)
+        // 2026-08-10: was `.unwrap_or(manifest)` — on any layout change this
+        // silently rooted at crates/storage, every crates/<name>/src join missed,
+        // and the guard passed having scanned nothing. Fail loudly instead.
+        .expect("workspace root must exist above crates/storage")
 }
 
-fn scan_rust_files_recursive(dir: &Path, violations: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
+fn scan_rust_files_recursive(dir: &Path, violations: &mut Vec<String>, scanned: &mut usize) {
+    // 2026-08-10: both swallows below used to turn a corpus-read failure into
+    // "nothing to check, pass". A guard cannot report on files it never opened.
+    let entries = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("error-level guard corpus unreadable {dir:?}: {e}"));
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            scan_rust_files_recursive(&path, violations);
+            scan_rust_files_recursive(&path, violations, scanned);
             continue;
         }
         if path.extension().and_then(|s| s.to_str()) != Some("rs") {
             continue;
         }
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
-        };
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("error-level guard cannot read {path:?}: {e}"));
+        *scanned = scanned.saturating_add(1);
         scan_file(&path, &contents, violations);
     }
 }
