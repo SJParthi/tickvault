@@ -1,11 +1,36 @@
 # Proposal: Dhan live-feed revival — 16-connection architecture
 
-**Status:** DRAFT — implementation may NOT start until the operator flips this to APPROVED
+**Status:** APPROVED — 2026-08-11, operator (Parthiban), direct in-session
 **Date:** 2026-08-09
-**Approved by:** pending
-**Authority needed:** a dated operator quote in `websocket-connection-scope-lock.md` covering
-(a) depth-20 / depth-200, which that file currently FORBIDS, and (b) a 5-connection main-feed
-pool, since the existing lock is 1 connection.
+**Approved by:** Parthiban (operator)
+**Authority satisfied:** BOTH conditions below are met.
+
+(a) and (b) — the dated operator quote required in
+`websocket-connection-scope-lock.md` LANDED 2026-08-09 (see that file's section
+"2026-08-09 (SAME DAY, SECOND QUOTE) — 16 CONNECTIONS + depth-20/depth-200
+AUTHORIZED"), which explicitly lifts the depth-20/depth-200 ban and raises the
+main-feed pool from 1 to 5. So the "Authority needed" this header used to
+carry was already discharged two days before this flip.
+
+**The approval quote for THIS flip (2026-08-11, typed directly in-session —
+preserve EXACTLY, typos and expletives included):**
+
+> "Yes bro our plan is to put back the entire 16 websocket connections to check
+> and connect wirh all these massively right dude by upgrading our instance to
+> the super instance right dude then why the fuck again and again confused dude
+> I have provided the newer architecture newer design everything entilrey
+> related to dhan right dude then why confusion dude just go ahead dude okay?
+> Entirely go through dude okay?"
+
+Reaffirmed twice in the same message with the zero-tick-loss and
+no-reconnect-issue requirements, and the explicit instruction to use the
+r8g.xlarge upgrade's kernel/cores/memory/core-pinning.
+
+**Recorded honestly:** the executing session had been treating the DRAFT status
+as a blocker and asking for a flip. That was over-cautious — the substantive
+scope authorization already existed in the scope lock. The `Status:` line is a
+workflow artifact owned by the operator, and the operator has now flipped it.
+Implementation may start.
 
 ---
 
