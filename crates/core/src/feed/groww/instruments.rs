@@ -414,7 +414,11 @@ pub fn stable_index_security_id(groww_symbol: &str) -> i64 {
 /// the Groww `exchange_token` (a NAME for NSE, the numeric `"1"` for BSE SENSEX),
 /// while the stored `security_id` is the Groww-native stable id derived from the
 /// `groww_symbol`. Deterministic order (token asc), deduped by token.
-#[must_use]
+//
+// The `#[must_use]` that sat here was removed 2026-08-11: `Result` is already
+// `#[must_use]`, so the attribute added nothing and tripped
+// `clippy::double_must_use`. It was latent until the CI clippy step was armed
+// with `-D warnings` in the same PR — the first thing that arming caught.
 fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Result<Vec<WatchEntry>, WatchBuildError> {
     let mut entries: Vec<WatchEntry> = rows
         .iter()

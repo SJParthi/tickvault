@@ -196,14 +196,27 @@ fn dhan_feed_stack_gate_still_defaults_off() {
     );
 }
 
+/// INVERTED 2026-08-11. This asserted `dhan_enabled` stays `false`, on the
+/// reasoning that "enabling live capture is a separate operator decision from
+/// building the lane". That reasoning was right, and the separate decision has
+/// now been made: the operator quote of 2026-08-11 recorded in
+/// `websocket-connection-scope-lock.md` ("THE DEFAULT IS FLIPPED ON").
+///
+/// It keeps checking the `[feeds]` section specifically — not the whole file —
+/// so a `dhan_enabled` line in some other section could never satisfy it. That
+/// section-scoping is why this guard is kept rather than folded into the two
+/// simpler string pins in `dhan_live_off_phase_a_guard.rs` and
+/// `production_config_wiring.rs`; three guards checking one flag three ways is
+/// deliberate for a flag that decides whether market data is captured at all.
 #[test]
-fn dhan_feed_stack_is_not_enabled_in_tracked_config() {
+fn dhan_feed_stack_is_enabled_in_tracked_config() {
     for file in ["../../config/base.toml", "../../config/production.toml"] {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
         let Ok(src) = std::fs::read_to_string(&path) else {
             continue;
         };
         let mut in_feeds = false;
+        let mut seen = false;
         for line in src.lines() {
             let code = line.split('#').next().unwrap_or("").trim();
             if code.starts_with('[') {
@@ -211,13 +224,27 @@ fn dhan_feed_stack_is_not_enabled_in_tracked_config() {
                 continue;
             }
             if in_feeds && code.starts_with("dhan_enabled") {
+                seen = true;
                 assert!(
-                    code.contains("false"),
-                    "{file}: [feeds] dhan_enabled must stay false — enabling live \
-                     capture is a separate operator decision from building the lane"
+                    code.contains("true"),
+                    "{file}: [feeds] dhan_enabled must be true — the live lane was \
+                     switched on by the operator quote of 2026-08-11. Turning it off \
+                     stops all tick capture while looking like a healthy REST-only \
+                     boot; reverting needs a fresh dated quote in \
+                     websocket-connection-scope-lock.md and this guard updated in the \
+                     same PR."
                 );
             }
         }
+        // A silently-absent key is the third state neither branch above covers:
+        // it falls through to the serde default, which is exactly the drift this
+        // guard exists to catch.
+        assert!(
+            seen,
+            "{file}: [feeds] has no dhan_enabled key at all — the live-capture \
+             decision must be explicit in tracked config, not left to a struct \
+             default that a future refactor can change without touching config"
+        );
     }
 }
 
