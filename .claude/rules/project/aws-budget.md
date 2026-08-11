@@ -307,6 +307,51 @@ requires the full §7 dated-quote protocol in
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
 
+## COST NOTE 2026-08-11 — Dhan live-lane loss counters reach CloudWatch (+~$2.10/mo)
+
+The Dhan live WebSocket lane was switched ON the same day (operator quote,
+`websocket-connection-scope-lock.md` "2026-08-11 — THE DEFAULT IS FLIPPED
+ON"). Its **seven** loss counters were emitted by the binary and selected by
+neither EMF allowlist, so every way the lane can lose data was counted
+in-process and discarded at the agent:
+
+| Counter | What its non-zero value means |
+|---|---|
+| `tv_dhan_ws_wal_dropped_total` | a frame was never durably captured |
+| `tv_dhan_ws_ring_full_total` | the frame ring hit its COUNT bound |
+| `tv_dhan_ws_ring_bytes_full_total` | the frame ring hit its BYTE bound (new same day) |
+| `tv_dhan_ws_frame_refused_total` | a frame was refused before the ring |
+| `tv_dhan_ws_subscribe_failed_total` | an instrument was never subscribed |
+| `tv_dhan_feed_seals_dropped_total` | a computed candle was discarded |
+| `tv_dhan_feed_seq_refused` | a sequence number could not be represented |
+
+A lane whose drop paths are invisible reports healthy while losing ticks —
+the false-OK class rule 11 forbids, and the reason this is a cost worth
+paying rather than a nice-to-have.
+
+**Cost:** +7 custom metric series ≈ **+$2.10/mo** (41 → 48 EMF-selected
+names; ~$12.30 → ~$14.40/mo at CloudWatch's ~$0.30/custom-metric/month)
+against the $100 kill-ceiling whose AUTOMATIC budget actions fire
+`STOP_EC2_INSTANCES` at 90% ($90). Headroom is unaffected at this scale.
+Added to BOTH allowlist copies (`user-data.sh.tftpl` + the reference
+`cloudwatch-agent.json`) in lockstep; the count ratchet
+(`cloudwatch_app_alarms_wiring::test_emf_metric_selectors_name_count_is_pinned`)
+was bumped 41 → 48 with the rationale in-place, per its own instruction that
+a count change be deliberate and dated, never a drive-by.
+
+**NOT claimed:** these names now PAGE. The allowlist makes the metric exist
+in CloudWatch; alarms on top of them, and pre-registering each series at 0
+at boot so the first alarm sample is not the outage itself (the
+first-sample-baseline lesson), are a **flagged follow-up** — stated here
+rather than left to be discovered from a quiet dashboard.
+
+**Also flagged, deliberately not taken:** the exclusion ledger in
+`user-data.sh.tftpl` still excludes `tv_ws_frame_spill_write_errors_total`
+because "no WS frame producer exists since the 2026-07-13/15 live-feed
+retirements". The revived lane IS a WS frame producer, so that stated reason
+no longer holds. Recorded rather than silently added — adding it is its own
+cost decision and would make this note's +7 delta untrue.
+
 ## COST NOTE 2026-08-11 — Critical-severity paging-gap sweep (+~$0.40/mo)
 
 A mechanical sweep of all 167 `ErrorCode` variants found **29** at
