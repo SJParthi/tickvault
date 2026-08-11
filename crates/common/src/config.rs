@@ -4474,6 +4474,7 @@ mod tests {
             order_update_events: OrderUpdateEventsConfig::default(),
             order_leg_pnl: OrderLegPnlConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
+            dhan_universe: DhanUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
