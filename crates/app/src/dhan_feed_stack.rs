@@ -106,8 +106,8 @@ use tickvault_core::websocket::connection::{
 };
 use tickvault_core::websocket::pool_budget::{ConnectionSlot, DhanEndpointType};
 use tickvault_core::websocket::pool_supervisor::{
-    CapturedFrame, ConnectionSupervisor, PoolSupervisor, SubscribeGuard, SubscribeGuardRefusal,
-    SubscribeInstrument, WalRingSink, run_connection,
+    CapturedFrame, ConnectionSupervisor, PoolSupervisor, RingByteBudget, SubscribeGuard,
+    SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection,
 };
 use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
@@ -882,6 +882,47 @@ pub const FLUSH_COUNTER: &str = "tv_dhan_feed_flush_total";
 /// time `try_send` is attempted (`WalRingSink`).
 pub const FRAME_RING_CAPACITY: usize = 65_536;
 
+/// The ring's byte ceiling — the bound the frame count alone does not give.
+///
+/// `FRAME_RING_CAPACITY` bounds how MANY frames sit in the ring, not how much
+/// memory they occupy, and `CapturedFrame` owns a `Bytes` of peer-chosen
+/// length up to `max_frame_bytes(endpoint)`: 256 KiB on the main feed, 512 KiB
+/// on depth-200. 65,536 × 256 KiB is **16 GiB**, and 65,536 × 512 KiB is
+/// **32 GiB** — the whole r8g.xlarge, held by a queue whose own doc comment
+/// called it a bounded burst absorber. The count bound is real; it just does
+/// not bound the thing that runs out.
+///
+/// 256 MiB, chosen so it is INERT in normal operation and decisive outside it.
+/// A real Dhan Quote packet is 50 bytes and a frame batches a handful, so at
+/// realistic sizes the count bound is reached at roughly 64 MiB resident and
+/// this ceiling is never consulted — behaviour is unchanged on every normal
+/// day. It engages only when frames are large AND the fold has stalled, which
+/// is simultaneously the hostile-peer shape and the genuine-stall shape, and
+/// caps both at a quarter gigabyte instead of the host.
+///
+/// It is deliberately NOT sized as "N seconds of traffic": that framing is what
+/// produced a count-only bound in the first place. This is a memory ceiling,
+/// and the unit it is expressed in is the unit that runs out.
+pub const FRAME_RING_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+// A ceiling below the largest single admissible frame would refuse EVERY frame
+// from that endpoint — a total feed outage wearing the shape of backpressure.
+// This asserts a real margin above that floor, so the byte bound stays a burst
+// absorber rather than becoming a gate.
+//
+// The margin is 64×, not the 512× today's numbers happen to give
+// (256 MiB / 512 KiB = exactly 512 depth-200 frames, or 1,024 main-feed ones).
+// A first draft of this line asserted the coincidental figure and failed the
+// build on its own arithmetic — a `>` against an exactly-equal value. A
+// const-assert should pin the PROPERTY that must hold, not today's quotient;
+// pinning the quotient turns any future re-sizing into a spurious failure and
+// teaches the next reader to edit the assertion instead of thinking about it.
+const _: () = assert!(
+    FRAME_RING_MAX_BYTES > tickvault_core::websocket::connection::DEPTH_200_MAX_FRAME_BYTES * 64,
+    "FRAME_RING_MAX_BYTES must hold many maximum-size frames, or the byte budget \
+     stops being a burst absorber and becomes a refusal gate"
+);
+
 /// Counter: frames taken off the ring, labelled by what the parser made of
 /// them.
 pub const DRAIN_FRAMES_COUNTER: &str = "tv_dhan_feed_drain_frames_total";
@@ -917,6 +958,7 @@ const DRAIN_REPORT_EVERY: u64 = 1_024;
 async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
+    ring_budget: Arc<RingByteBudget>,
 ) -> DrainOutcome {
     let mut seen: u64 = 0;
     let mut folded: u64 = 0;
@@ -932,6 +974,15 @@ async fn run_frame_drain(
             biased;
             maybe_frame = rx.recv() => {
                 let Some(frame) = maybe_frame else { break };
+                // Release the byte reservation the instant the frame leaves the
+                // ring — BEFORE any parsing, and on EVERY path out of this arm.
+                // Releasing after a successful parse instead would leak the
+                // budget for every unparseable or depth-unconsumed frame, and
+                // those are exactly the frames a degraded feed produces most:
+                // the bound would tighten precisely when the feed most needs
+                // head-room, and the process would strangle itself with what is
+                // meant to protect it.
+                ring_budget.release(frame.bytes.len());
                 seen = seen.saturating_add(1);
                 let c = counters();
                 let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -1444,7 +1495,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     }
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
-    let drain = tokio::spawn(run_frame_drain(frame_rx, ingest));
+    // The ring's second bound. One budget shared by every socket, because the
+    // heap it protects is one heap: five main-feed connections each holding a
+    // per-pool share would bound five times the memory the host actually has.
+    let ring_budget = Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES));
+    let drain = tokio::spawn(run_frame_drain(frame_rx, ingest, Arc::clone(&ring_budget)));
 
     // ---- the sockets -------------------------------------------------------
     let mut dialed = 0usize;
@@ -1482,6 +1537,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         let sink = Arc::new(WalRingSink::new(
             Arc::clone(&spill),
             frame_tx.clone(),
+            Arc::clone(&ring_budget),
             WsType::LiveFeed,
             endpoint,
         ));
@@ -1534,6 +1590,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         dialed,
         seeded,
         ring_capacity = FRAME_RING_CAPACITY,
+        // BOTH bounds, because reporting only the frame count is what let a
+        // 16 GiB memory ceiling hide behind a 65,536 that looks modest. An
+        // operator reading this line should be able to see the queue's real
+        // size in the unit that runs out.
+        ring_max_bytes = ring_budget.cap(),
         "Dhan 16-connection live feed is up: sockets dialed, frames captured to the WAL before \
          broadcast, and the tick fold is consuming the ring"
     );
@@ -2399,7 +2460,11 @@ mod tests {
         // sender is gone, or a dead lane would look alive forever.
         let drained = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_frame_drain(rx, ingest),
+            run_frame_drain(
+                rx,
+                ingest,
+                Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+            ),
         )
         .await
         .expect("the drain must end when the ring closes");
@@ -2445,7 +2510,11 @@ mod tests {
 
         let drained = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_frame_drain(rx, ingest),
+            run_frame_drain(
+                rx,
+                ingest,
+                Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+            ),
         )
         .await
         .expect("a depth frame must never hang or panic the drain");
