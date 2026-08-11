@@ -1510,6 +1510,16 @@ async fn main() -> Result<()> {
     // enabled, serde default OFF; base.toml opts in); disabled = one info! +
     // nothing spawned. Independent of feeds.groww_enabled / the retired live
     // lane — the REST-legs pattern (main.rs Groww REST spawns).
+    // [dhan_universe] — the daily Dhan instrument-master + NSE India index
+    // download and ISIN join (operator directive 2026-08-11, reversing Q3;
+    // verbatim quote in websocket-connection-scope-lock.md). Spawned
+    // unconditionally: the rider itself checks `enabled` and logs one line
+    // when off, so a disabled boot has exactly one observable difference from
+    // an enabled one — which is what makes "is it on?" answerable from the
+    // log rather than from the config file.
+    let _dhan_universe_rider =
+        tickvault_app::dhan_universe::spawn_dhan_universe_rider(config.dhan_universe.clone());
+
     if config.groww_universe.enabled {
         let _groww_universe_rider =
             tickvault_app::groww_universe::spawn_groww_universe_rider(config.questdb.clone());

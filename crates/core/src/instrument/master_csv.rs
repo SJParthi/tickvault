@@ -818,7 +818,40 @@ mod tests {
     }
 
     #[test]
-    fn test_join_resolves_by_isin_and_names_every_failure() {
+    fn test_isin_index_is_empty_and_len_report_resolvable_entries_only() {
+        // `is_empty` is the caller's cheapest "did the master give us
+        // anything?" check, and it must count RESOLVABLE entries — not rows
+        // seen, not ambiguous ones. An index built entirely from ambiguous
+        // ISINs resolves nothing, and reporting it as non-empty would let a
+        // caller proceed into a join that can only fail.
+        let empty = build_isin_index(&[]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let all_ambiguous = build_isin_index(&[
+            row(1, "INE002A01018", "RELIANCE"),
+            row(2, "INE002A01018", "RELIANCE"),
+        ]);
+        assert!(
+            all_ambiguous.is_empty(),
+            "an index whose only ISIN was excluded as ambiguous resolves \
+             nothing and must report empty"
+        );
+        assert_eq!(all_ambiguous.len(), 0);
+        assert_eq!(
+            all_ambiguous.ambiguous.len(),
+            1,
+            "the excluded ISIN is still reported, so the operator sees WHY \
+             the index is empty rather than just THAT it is"
+        );
+
+        let one = build_isin_index(&[row(2885, "INE002A01018", "RELIANCE")]);
+        assert!(!one.is_empty());
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn test_join_constituents_resolves_by_isin_and_names_every_failure() {
         let index = build_isin_index(&[row(2885, "INE002A01018", "RELIANCE")]);
         let out = join_constituents(
             &[
@@ -845,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn test_join_distinguishes_ambiguous_from_absent() {
+    fn test_join_constituents_distinguishes_ambiguous_from_absent() {
         // Both fail, but they are different operator actions: "the master
         // disagrees with itself" vs "this security is not listed".
         let index = build_isin_index(&[
@@ -857,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_join_is_case_insensitive_on_isin() {
+    fn test_join_constituents_is_case_insensitive_on_isin() {
         // Vendors drift on case; ISIN is defined uppercase. A case mismatch
         // must not read as "not listed".
         let index = build_isin_index(&[row(2885, "INE002A01018", "RELIANCE")]);
@@ -866,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn test_join_dedups_within_an_index_but_keeps_cross_index_membership() {
+    fn test_join_constituents_dedups_within_index_keeps_cross_index_membership() {
         // The same security legitimately belongs to many indices. Deduping
         // across indices would destroy the membership data this produces.
         let index = build_isin_index(&[row(2885, "INE002A01018", "RELIANCE")]);

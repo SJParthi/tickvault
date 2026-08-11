@@ -592,6 +592,24 @@ enabled = false # stood down 2026-07-17 — the cadence scheduler's real executo
 enabled = true
 
 # ===========================================================================
+# Daily Dhan instrument-master + NSE India index download and ISIN join
+# (operator directive 2026-08-11, reversing Q3 of the 2026-07-13 amendment;
+# verbatim quote in websocket-connection-scope-lock.md).
+#
+# target_secs_of_day_ist = 28800 is 08:00 IST, the operator's stated time.
+# The box powers on at 08:30, so 08:00 is a TARGET, not a schedule: the rider
+# runs immediately when it starts up after the target with no build for the
+# day. On the live schedule that lands ~08:30 — still 45 minutes before the
+# 09:15 open — and a day can never pass without a build attempt.
+#
+# The serde default is OFF; this section opts in.
+# ===========================================================================
+[dhan_universe]
+enabled = true
+target_secs_of_day_ist = 28800
+retry_backoff_cap_secs = 300
+
+# ===========================================================================
 # Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
 # of the Groww per-minute REST plan). When enabled: every session minute —
 # sequenced right after the Groww spot fetch — pull the CURRENT-expiry
