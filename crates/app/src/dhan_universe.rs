@@ -60,6 +60,38 @@ const MIGRATION_GATE_WAIT_SECS: u64 = 120;
 /// Provenance stamped on every persisted constituent row.
 const CONSTITUENCY_SOURCE: &str = "niftyindices";
 
+/// Backoff before respawning a died rider task. Matches the house sibling
+/// (`groww_universe`, `disk_health_watcher`) — short, because the thing that
+/// is not happening while we wait is the day's entire instrument mapping.
+const RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// Non-zero means the rider task died and was restarted. In a release build
+/// (`panic = "abort"`) the process dies instead, so this is an unwind-build
+/// signal — kept because a respawn LOOP is otherwise invisible.
+const RESPAWN_COUNTER: &str = "tv_dhan_universe_respawn_total";
+
+/// Daily build outcomes, labelled `ok` / `failed`. Both pre-registered at 0
+/// so "no build has ever run" is distinguishable from "no metric reported".
+const BUILD_COUNTER: &str = "tv_dhan_universe_builds_total";
+
+/// Constituents resolved in the last successful build.
+const RESOLVED_GAUGE: &str = "tv_dhan_universe_resolved_constituents";
+
+/// Unresolved fraction of the last successful build, in `[0, 1]`.
+///
+/// The most useful single number here: it moves BEFORE builds start failing
+/// outright, so a vendor quietly dropping constituents is visible while the
+/// build is still passing its tolerance gate.
+const UNRESOLVED_FRACTION_GAUGE: &str = "tv_dhan_universe_unresolved_fraction";
+
+/// Index lists that failed to download or parse in the last build attempt.
+///
+/// Deliberately separate from the build outcome: a build can SUCCEED with
+/// several lists missing, because the tolerance gate judges the joined
+/// result, not the download count. Without this number that partial failure
+/// is invisible behind a green build.
+const INDEX_LISTS_FAILED_GAUGE: &str = "tv_dhan_universe_index_lists_failed";
+
 /// Backoff floor between failed attempts, doubling to the configured cap.
 const RETRY_BASE_SECS: u64 = 10;
 
@@ -236,6 +268,11 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
             }
         }
     }
+    // Published even on a build that goes on to succeed: the tolerance gate
+    // judges the JOINED RESULT, so a build can pass with several lists
+    // missing entirely. Without this gauge that partial failure hides behind
+    // a green build outcome.
+    metrics::gauge!(INDEX_LISTS_FAILED_GAUGE).set(failed_lists as f64);
     info!(
         lists = INDEX_CONSTITUENCY_SLUGS.len(),
         failed = failed_lists,
@@ -445,17 +482,31 @@ fn write_mapping_atomic(
     Ok(())
 }
 
-/// Spawns the supervised daily rider.
+/// Spawns the SUPERVISED daily rider.
 ///
-/// Supervised for the same reason every other rider here is: a silent task
-/// death would stop the mapping updating while every other signal stayed
-/// green, and a stale mapping is worse than an absent one because nothing
-/// looks wrong.
+/// # Why the supervisor exists (added on review of my own first draft)
+///
+/// The first version of this function was a single `tokio::spawn` around the
+/// day loop. A panic anywhere inside — a slice index, an unwrap in a
+/// dependency, an allocation failure — would kill the task, and NOTHING would
+/// restart it. The daily download would simply stop happening, forever,
+/// with no error after the panic line and every other signal still green.
+/// That is the precise failure this codebase keeps finding and this rider
+/// would have shipped it.
+///
+/// So the shape now matches `groww_universe.rs` exactly: an outer loop owns
+/// an inner `JoinHandle`, and since the inner task is an infinite loop, ANY
+/// resolution of that handle is abnormal. Cancellation is the one legitimate
+/// exit (graceful shutdown) and returns; everything else counts, logs, backs
+/// off and respawns.
+///
+/// Honest limit: release builds use `panic = "abort"`, so the respawn arm is
+/// reachable only in unwind builds. The counter is what makes a panic loop
+/// visible in production, where the process dies instead.
 #[must_use]
-// TEST-EXEMPT: spawns an endless supervised task whose body is network I/O. Its one piece of
-// real logic — WHEN to run, including the boot-catch-up case that makes the 08:00 target work
-// against an 08:30 box — is `next_wait`, which is pure and has five tests covering both
-// boundaries and schedule drift.
+// TEST-EXEMPT: tokio supervisor wiring over an infinite daily control-plane loop driving live
+// network + QuestDB I/O. The pure primitives it composes (`next_wait`, `ist_secs_of_day`,
+// `parse_constituent_csv`, `ist_midnight_nanos`) are unit-tested in this module.
 pub fn spawn_dhan_universe_rider(
     config: DhanUniverseConfig,
     questdb: QuestDbConfig,
@@ -465,6 +516,37 @@ pub fn spawn_dhan_universe_rider(
             info!("[dhan_universe] disabled — no instrument master download this boot");
             return;
         }
+        // Pre-register at 0 so a dashboard distinguishes "never respawned"
+        // from "never reported" — the first-sample-baseline discipline the
+        // loss counters got today.
+        metrics::counter!(RESPAWN_COUNTER, "reason" => "panic").increment(0);
+        metrics::counter!(BUILD_COUNTER, "outcome" => "ok").increment(0);
+        metrics::counter!(BUILD_COUNTER, "outcome" => "failed").increment(0);
+        loop {
+            let inner = tokio::spawn(run_dhan_universe_rider(config.clone(), questdb.clone()));
+            let result = inner.await;
+            if let Err(join_err) = &result
+                && join_err.is_cancelled()
+            {
+                // Graceful shutdown teardown — not an abort.
+                return;
+            }
+            let reason = tickvault_storage::disk_health_watcher::classify_join_exit(&result);
+            metrics::counter!(RESPAWN_COUNTER, "reason" => reason).increment(1);
+            error!(
+                reason,
+                backoff_secs = RESPAWN_BACKOFF_SECS,
+                "[dhan_universe] daily rider task DIED — respawning. Until this respawn \
+                 completes there is no daily instrument mapping being produced."
+            );
+            tokio::time::sleep(Duration::from_secs(RESPAWN_BACKOFF_SECS)).await;
+        }
+    })
+}
+
+/// The rider loop body (supervised above): one build per IST day, forever.
+async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbConfig) {
+    {
         info!(
             target_secs_of_day_ist = config.target_secs_of_day_ist,
             "[dhan_universe] daily instrument master + NSE indices rider armed"
@@ -483,14 +565,23 @@ pub fn spawn_dhan_universe_rider(
                 Ok(outcome) => {
                     attempt = 0;
                     built_for = Some(today.clone());
+                    metrics::counter!(BUILD_COUNTER, "outcome" => "ok").increment(1);
+                    metrics::gauge!(RESOLVED_GAUGE).set(outcome.resolved.len() as f64);
+                    // The fraction is the health signal that matters: it moves
+                    // BEFORE the build starts failing outright, so a vendor
+                    // slowly dropping constituents is visible while it is still
+                    // passing the gate.
+                    metrics::gauge!(UNRESOLVED_FRACTION_GAUGE).set(outcome.unresolved_fraction());
                     info!(
                         date = %today,
                         resolved = outcome.resolved.len(),
                         unresolved = outcome.unresolved.len(),
+                        unresolved_fraction = outcome.unresolved_fraction(),
                         "[dhan_universe] daily build COMPLETE"
                     );
                 }
                 Err(err) => {
+                    metrics::counter!(BUILD_COUNTER, "outcome" => "failed").increment(1);
                     attempt = attempt.saturating_add(1);
                     let backoff = RETRY_BASE_SECS
                         .saturating_mul(1u64 << attempt.min(5))
@@ -510,7 +601,7 @@ pub fn spawn_dhan_universe_rider(
                 }
             }
         }
-    })
+    }
 }
 
 #[cfg(test)]
