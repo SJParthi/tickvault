@@ -138,7 +138,8 @@ const MAPPING_DIR: &str = "data/instrument-cache";
 /// Never frozen at spawn: a retry loop that crosses IST midnight must name
 /// the NEW day's artifact, or a vendor outage spanning midnight writes
 /// yesterday's filename with today's data.
-fn today_ist_date() -> String {
+#[must_use]
+pub fn today_ist_date() -> String {
     (chrono::Utc::now() + chrono::TimeDelta::seconds(IST_UTC_OFFSET_SECONDS_I64))
         .format("%Y-%m-%d")
         .to_string()
@@ -531,7 +532,8 @@ async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &Joi
 /// audit tables store IST-as-epoch and NEVER add the +5:30 offset a second
 /// time. Getting this wrong shifts every row by 5.5 hours into the wrong
 /// trading day.
-fn ist_midnight_nanos(date: &str) -> i64 {
+#[must_use]
+pub fn ist_midnight_nanos(date: &str) -> i64 {
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .ok()
         .and_then(|d| d.and_hms_opt(0, 0, 0))

@@ -144,6 +144,10 @@ pub mod daily_task_marker;
 /// (`dhan_activation` — the lane cold-start watcher that preceded this
 /// decl — was deleted in PR-C2 with the Dhan live-WS lane.)
 pub mod dhan_data_api_limiter;
+/// `[groww_universe]` process-global daily Groww watch-set + shared-master
+/// rider (2026-07-15 live-feed retirement re-home of the activation daily
+/// build loop + the sole persist_groww_instruments caller).
+pub mod dhan_depth_universe;
 /// Dhan 16-connection live-feed stack — boot wiring, DEFAULT-OFF behind BOTH
 /// `[feeds] dhan_enabled` and the `TICKVAULT_DHAN_LIVE_FEED=1` environment
 /// opt-in. Authorized by the operator quote of 2026-08-09 in
@@ -176,9 +180,6 @@ pub mod dhan_order_push_observability;
 /// TokenManager → renewal + mid-session watchdog → REST canary +
 /// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
 pub mod dhan_rest_stack;
-/// `[groww_universe]` process-global daily Groww watch-set + shared-master
-/// rider (2026-07-15 live-feed retirement re-home of the activation daily
-/// build loop + the sole persist_groww_instruments caller).
 pub mod dhan_universe;
 /// Groww order/position PUSH channel — Stage D app consumer (2026-07-17,
 /// operator-authorized paper-mode receive-only build): bridges trading-side
