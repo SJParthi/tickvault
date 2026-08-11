@@ -116,6 +116,16 @@ pub const PARK_METRIC: &str = "tv_dhan_ws_park_total";
 /// durable in the WAL, the downstream consumer is behind. Label: `endpoint`.
 pub const RING_FULL_METRIC: &str = "tv_dhan_ws_ring_full_total";
 
+/// Counter: the ring refusal above was the BYTE budget, not the frame count.
+///
+/// A strict subset of `RING_FULL_METRIC` — every byte-refusal increments both,
+/// so the ring-full alarm keeps working unchanged and this one answers the
+/// follow-up question the operator will actually have: was the queue long, or
+/// were the frames huge? Those have different causes (a stalled fold versus an
+/// oversized or hostile peer) and, at the count bound alone, are
+/// indistinguishable. Label: `endpoint`.
+pub const RING_BYTES_FULL_METRIC: &str = "tv_dhan_ws_ring_bytes_full_total";
+
 /// Counter: the WAL itself refused a frame. This is the only genuine capture
 /// loss path. Label: `endpoint`.
 pub const WAL_DROP_METRIC: &str = "tv_dhan_ws_wal_dropped_total";
@@ -836,6 +846,108 @@ pub struct CapturedFrame {
     pub bytes: Bytes,
 }
 
+/// The ring's SECOND bound: total bytes resident, not just frame count.
+///
+/// A channel bounded only by count is bounded only if the items are a known
+/// size, and these are not. `CapturedFrame` owns a `Bytes` whose length is
+/// whatever the peer sent, up to `max_frame_bytes(endpoint)` — 256 KiB on the
+/// main feed, 512 KiB on depth-200. At the ring's 65,536-frame capacity that
+/// is **16 GiB of resident heap on the main feed alone, 32 GiB with the depth
+/// pools open**: the entire machine, held by a queue whose own documentation
+/// called it a bounded burst absorber.
+///
+/// It never bites in normal operation, which is exactly why it is worth
+/// bounding. Real Dhan frames are small — a Quote packet is 50 bytes and a
+/// frame batches a handful — so the count bound engages first and this budget
+/// is inert. It engages only when frames are large AND the fold has stalled,
+/// which is the shape of both a hostile peer and a genuine downstream stall,
+/// and in that shape the count bound alone permits the process to eat the host.
+///
+/// Refusal here is the SAME event as a count-full ring, not a new failure mode:
+/// the frame is already durable in the WAL by the time this is consulted, so a
+/// refusal is a lag signal and the outcome is `RingFull`.
+#[derive(Debug)]
+pub struct RingByteBudget {
+    resident: std::sync::atomic::AtomicUsize,
+    cap: usize,
+}
+
+impl RingByteBudget {
+    /// A budget capped at `cap` resident bytes.
+    #[must_use]
+    pub const fn new(cap: usize) -> Self {
+        Self {
+            resident: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// The configured ceiling.
+    #[must_use]
+    pub const fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Bytes currently reserved by frames sitting in the ring.
+    #[must_use]
+    pub fn resident(&self) -> usize {
+        self.resident.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reserves `len` bytes, or refuses.
+    ///
+    /// CAS loop rather than a `fetch_add`-then-check: `fetch_add` would
+    /// momentarily push `resident` past the cap, and with N reader tasks all
+    /// adding at once the overshoot is unbounded — the very thing being
+    /// bounded. This way `resident` never exceeds `cap`, even transiently.
+    ///
+    /// A frame LARGER than the whole cap can never be admitted. That is
+    /// deliberate: the per-endpoint frame caps are two to three orders of
+    /// magnitude above real traffic, so such a frame is already outside the
+    /// envelope, and admitting it would mean the budget does not bound.
+    pub fn try_reserve(&self, len: usize) -> bool {
+        self.resident
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+                |cur| {
+                    let next = cur.checked_add(len)?;
+                    (next <= self.cap).then_some(next)
+                },
+            )
+            .is_ok()
+    }
+
+    /// Returns `len` bytes to the budget as a frame leaves the ring.
+    ///
+    /// Saturating, never wrapping. An underflow here would be a bookkeeping
+    /// bug, and the wrong response to one is to wrap to `usize::MAX` and refuse
+    /// every frame forever — that converts a counting error into a total feed
+    /// outage. Saturating at zero degrades to "the budget stops bounding",
+    /// which is the same state as not having it, and stays visible through
+    /// `resident()`.
+    pub fn release(&self, len: usize) {
+        // An explicit CAS loop rather than `fetch_update`, because the closure
+        // form can only ever return `Some` here and its `Result` would then have
+        // to be discarded — and `let _ =` on a `#[must_use]` value is exactly
+        // what this crate's `let_underscore_must_use` deny exists to stop. The
+        // loop has no result to throw away.
+        let mut cur = self.resident.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(len);
+            match self.resident.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
+
 /// Production [`FrameSink`]: append to the write-ahead log, then push into the
 /// bounded ring. In that order, always.
 ///
@@ -846,22 +958,25 @@ pub struct CapturedFrame {
 pub struct WalRingSink {
     spill: std::sync::Arc<WsFrameSpill>,
     ring: tokio::sync::mpsc::Sender<CapturedFrame>,
+    budget: std::sync::Arc<RingByteBudget>,
     ws_type: WsType,
     endpoint: DhanEndpointType,
 }
 
 impl WalRingSink {
-    /// Wires a sink to a WAL and a bounded ring.
+    /// Wires a sink to a WAL, a bounded ring, and the ring's byte budget.
     #[must_use]
     pub fn new(
         spill: std::sync::Arc<WsFrameSpill>,
         ring: tokio::sync::mpsc::Sender<CapturedFrame>,
+        budget: std::sync::Arc<RingByteBudget>,
         ws_type: WsType,
         endpoint: DhanEndpointType,
     ) -> Self {
         Self {
             spill,
             ring,
+            budget,
             ws_type,
             endpoint,
         }
@@ -881,7 +996,19 @@ impl FrameSink for WalRingSink {
             metrics::counter!(WAL_DROP_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
             return FrameSinkOutcome::WalDropped;
         }
-        // Step 2 — visibility. `try_send` never awaits; a full ring returns
+        // Step 2 — byte budget. Consulted BEFORE `try_send` because a reserve
+        // taken after a successful send could not be refused, and one taken
+        // for a send that then fails would leak. Reserve, then send, then
+        // release on failure: the only ordering with no window in which the
+        // budget and the ring disagree.
+        let len = frame.len();
+        if !self.budget.try_reserve(len) {
+            metrics::counter!(RING_FULL_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
+            metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => self.endpoint.as_str())
+                .increment(1);
+            return FrameSinkOutcome::RingFull;
+        }
+        // Step 3 — visibility. `try_send` never awaits; a full ring returns
         // immediately so the reader keeps polling (and therefore keeps ponging).
         if self
             .ring
@@ -892,6 +1019,12 @@ impl FrameSink for WalRingSink {
             })
             .is_err()
         {
+            // The frame never entered the ring, so nothing downstream will ever
+            // release its reservation. Give it back here or the budget ratchets
+            // down on every count-full frame until it refuses everything —
+            // a slow strangulation that would look like the feed dying for no
+            // reason.
+            self.budget.release(len);
             metrics::counter!(RING_FULL_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
             return FrameSinkOutcome::RingFull;
         }
@@ -2016,6 +2149,7 @@ mod tests {
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
             tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
         );
@@ -2044,7 +2178,13 @@ mod tests {
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
-        let sink = WalRingSink::new(spill, tx, WsType::LiveFeed, DhanEndpointType::MainFeed);
+        let sink = WalRingSink::new(
+            spill,
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+        );
 
         let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
         assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::Captured);
@@ -2072,7 +2212,13 @@ mod tests {
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
-        let sink = WalRingSink::new(spill, tx, WsType::LiveFeed, DhanEndpointType::MainFeed);
+        let sink = WalRingSink::new(
+            spill,
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+        );
 
         assert_eq!(
             sink.accept(Bytes::from_static(b"first")),
@@ -2082,6 +2228,170 @@ mod tests {
             sink.accept(Bytes::from_static(b"second")),
             FrameSinkOutcome::RingFull,
             "a full ring is a lag signal, never silent capture loss"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- ring byte budget ---------------------------------------------------
+
+    #[test]
+    fn test_ring_byte_budget_cap_reports_the_configured_ceiling() {
+        // `cap()` is what the lane's boot line reports as `ring_max_bytes`.
+        // It exists so the operator sees the queue's size in the unit that
+        // actually runs out — reporting only the 65,536 frame count is how a
+        // 16 GiB ceiling hid behind a number that looks modest.
+        let b = RingByteBudget::new(256 * 1024 * 1024);
+        assert_eq!(b.cap(), 256 * 1024 * 1024);
+        assert_eq!(b.resident(), 0, "a fresh budget holds nothing");
+        assert!(b.try_reserve(1_000));
+        assert_eq!(
+            b.cap(),
+            256 * 1024 * 1024,
+            "cap is the CEILING and must not move as frames come and go — only \
+             resident() tracks occupancy"
+        );
+    }
+
+    #[test]
+    fn test_try_reserve_never_exceeds_the_cap() {
+        let b = RingByteBudget::new(100);
+        assert!(b.try_reserve(60));
+        assert_eq!(b.resident(), 60);
+        assert!(b.try_reserve(40), "exactly filling the cap must be allowed");
+        assert_eq!(b.resident(), 100);
+        assert!(!b.try_reserve(1), "one byte past the cap must be refused");
+        assert_eq!(
+            b.resident(),
+            100,
+            "a REFUSED reserve must not move the counter — a fetch_add-then-check \
+             would have left the overshoot behind, which is the bound failing to bound"
+        );
+    }
+
+    #[test]
+    fn test_try_reserve_refuses_a_frame_larger_than_the_whole_cap() {
+        let b = RingByteBudget::new(1_024);
+        assert!(
+            !b.try_reserve(4_096),
+            "a frame bigger than the entire budget cannot be admitted — admitting it \
+             would mean the budget does not bound"
+        );
+        assert_eq!(b.resident(), 0);
+        // And the budget is still usable afterwards: one oversized frame must
+        // not poison it for the frames that follow.
+        assert!(b.try_reserve(512));
+        assert_eq!(b.resident(), 512);
+    }
+
+    #[test]
+    fn test_ring_byte_budget_release_saturates_and_never_wraps() {
+        let b = RingByteBudget::new(1_000);
+        assert!(b.try_reserve(100));
+        // Over-release: a bookkeeping bug, deliberately made harmless. Wrapping
+        // to usize::MAX here would refuse every subsequent frame forever —
+        // turning a counting error into a total feed outage.
+        b.release(10_000);
+        assert_eq!(b.resident(), 0, "release must saturate at zero, not wrap");
+        assert!(
+            b.try_reserve(1_000),
+            "the budget must still admit frames after an over-release"
+        );
+    }
+
+    #[test]
+    fn test_wal_ring_sink_returns_the_reservation_when_the_count_bound_refuses() {
+        // The leak this pins: the byte reserve is taken BEFORE `try_send`, so a
+        // frame refused by the COUNT bound has a reservation nothing downstream
+        // will ever release. Without the release on that path the budget
+        // ratchets down on every count-full frame until it refuses everything —
+        // a slow strangulation that would present as the feed dying for no
+        // visible reason, long after the burst that caused it.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-ring-budget-leak-{}-{}",
+            std::process::id(),
+            next_frame_seq()
+        ));
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        // Capacity 1: the second frame is refused by COUNT, not by bytes.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+        let budget = std::sync::Arc::new(RingByteBudget::new(1_000_000));
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+        );
+
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"0123456789")),
+            FrameSinkOutcome::Captured
+        );
+        assert_eq!(budget.resident(), 10);
+
+        for _ in 0..50 {
+            assert_eq!(
+                sink.accept(Bytes::from_static(b"0123456789")),
+                FrameSinkOutcome::RingFull
+            );
+        }
+        assert_eq!(
+            budget.resident(),
+            10,
+            "only the ONE frame actually sitting in the ring may hold a reservation; \
+             50 count-refused frames must each have given theirs back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_ring_sink_refuses_on_the_byte_bound_before_the_count_bound() {
+        // The whole point of the second bound: a ring with plenty of SLOTS free
+        // still refuses when those slots would hold too many BYTES.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-ring-budget-bytes-{}-{}",
+            std::process::id(),
+            next_frame_seq()
+        ));
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        // 64 slots, but only 25 bytes of budget: the count bound cannot bind.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(64);
+        let budget = std::sync::Arc::new(RingByteBudget::new(25));
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                sink.accept(Bytes::from_static(b"0123456789")),
+                FrameSinkOutcome::Captured
+            );
+        }
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"0123456789")),
+            FrameSinkOutcome::RingFull,
+            "20 of 25 bytes are resident and 62 slots are free — the BYTE bound must \
+             refuse the third frame, which is the bound the count alone never gave"
+        );
+
+        // Draining releases, and the sink accepts again — proving this is
+        // backpressure, not a latch.
+        let taken = rx.try_recv().expect("a captured frame must be published");
+        budget.release(taken.bytes.len());
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"0123456789")),
+            FrameSinkOutcome::Captured,
+            "releasing on drain must re-open the budget"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

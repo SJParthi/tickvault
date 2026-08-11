@@ -796,4 +796,62 @@ mod tests {
             .expect("panic");
         cleanup(&spill, &dlq);
     }
+
+    /// `record_boot_drain_observability` had no direct test — it reached
+    /// coverage only incidentally, through whichever boot-drain path happened
+    /// to run, and none of its four branches was exercised deliberately.
+    ///
+    /// Each branch is guarded by `> 0`, and the guards are the point: a boot
+    /// that recovered nothing must emit NOTHING rather than four zero-valued
+    /// counter increments. A zero increment is not harmless here — the
+    /// `boot_pending` label is the honest "seals still on disk and not in
+    /// QuestDB" signal, and a series that appears on every clean boot at zero
+    /// trains the reader to ignore it, which is precisely when it next carries
+    /// a real number.
+    ///
+    /// The assertion is on reachability, not on emitted values: no metrics
+    /// recorder is installed in a unit test, so `metrics::counter!` is a no-op
+    /// by construction and reading it back would assert on the test harness
+    /// rather than on this function. What is genuinely verified is that every
+    /// branch is entered and none panics — including the all-zero case, which
+    /// must enter none of them.
+    #[test]
+    fn boot_drain_observability_covers_every_branch_and_emits_nothing_when_idle() {
+        // All-zero: the clean-boot shape. Every guard must refuse.
+        record_boot_drain_observability(&BootDrainOutcome::default());
+
+        // Each field alone, so a branch cannot pass by riding another's guard.
+        for outcome in [
+            BootDrainOutcome {
+                seals_recovered: 3,
+                ..Default::default()
+            },
+            BootDrainOutcome {
+                seals_reingested: 2,
+                ..Default::default()
+            },
+            BootDrainOutcome {
+                records_undecodable: 1,
+                ..Default::default()
+            },
+            BootDrainOutcome {
+                seals_left_pending: 7,
+                ..Default::default()
+            },
+        ] {
+            record_boot_drain_observability(&outcome);
+        }
+
+        // All four at once — the worst real boot: something recovered, something
+        // re-ingested, something undecodable, and something still on disk.
+        record_boot_drain_observability(&BootDrainOutcome {
+            files_staged: 4,
+            seals_recovered: 900,
+            seals_reingested: 850,
+            files_archived: 3,
+            files_left_pending: 1,
+            seals_left_pending: 50,
+            records_undecodable: 2,
+        });
+    }
 }

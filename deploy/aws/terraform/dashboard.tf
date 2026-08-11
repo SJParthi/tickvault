@@ -348,9 +348,9 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 12
         height = 6
         properties = {
-          title  = "Spill disk free (bytes) — the zero-loss safety margin"
-          region = local.dash_region
-          view   = "timeSeries"
+          title   = "Spill disk free (bytes) — the zero-loss safety margin"
+          region  = local.dash_region
+          view    = "timeSeries"
           metrics = [[local.dash_namespace, "tv_spill_dir_free_bytes"]]
           period  = 300
           stat    = "Minimum"
