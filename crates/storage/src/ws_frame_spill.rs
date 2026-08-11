@@ -152,7 +152,22 @@ pub struct ReplayedFrame {
 /// latency on a contended host) now absorbs without dropping. Memory cost
 /// at idle is ~3 MiB extra (131k × ~24 B/`WalRecord` header), trivial on
 /// the 4 GiB t4g.medium target.
-const SPILL_CHANNEL_CAPACITY: usize = 131_072;
+///
+/// 2026-08-10: raised 131,072 → 524,288 (4×). The 13-second stall headroom
+/// quoted above was computed for **ONE** WebSocket producer. The operator's
+/// 2026-08-09 authorization (`websocket-connection-scope-lock.md`, the
+/// 16-connection amendment) takes the live feed to **up to 16 sockets** — 5
+/// main-feed + 5 depth-20 + 5 depth-200 + 1 order-update — all funnelling into
+/// this ONE shared channel. At 16 producers the same absorbency is ~0.8s, and
+/// the capture-at-receipt contract (WAL BEFORE parse/broadcast) means a full
+/// channel is not backpressure but **dropped frames on the durable floor** —
+/// the one thing the zero-loss envelope must never trade away.
+///
+/// 4× restores roughly the original per-socket headroom at the authorized
+/// connection count rather than merely surviving the chaos test. Memory at
+/// idle ≈ 12 MiB (524k × ~24 B) — 0.04% of the r8g.xlarge 32 GiB host
+/// (operator Quote 13), which is what makes the honest sizing affordable.
+const SPILL_CHANNEL_CAPACITY: usize = 524_288;
 
 /// WAL file magic bytes — segment-local sanity check.
 ///
