@@ -526,9 +526,12 @@ mod tests {
     }
 
     #[test]
-    fn test_seal_ring_handles_all_21_tfs_distinctly() {
+    fn test_seal_ring_handles_every_tf_distinctly() {
         // Push one seal per TF, drain in FIFO, verify TfIndex preserved.
-        let mut ring = SealRing::with_capacity(21);
+        // Capacity is TF_COUNT, not a literal: at a hardcoded 21 the three
+        // frames appended on 2026-08-10 would have been silently EVICTED
+        // and this test would have asserted against a truncated drain.
+        let mut ring = SealRing::with_capacity(TF_COUNT);
         for tf in TfIndex::ALL {
             ring.try_buffer(mk_seal(13, 0, tf, 1_716_000_900, 100.0));
         }

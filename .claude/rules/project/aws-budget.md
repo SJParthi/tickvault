@@ -307,6 +307,47 @@ requires the full §7 dated-quote protocol in
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
 
+## COST NOTE 2026-08-11 — Critical-severity paging-gap sweep (+~$0.40/mo)
+
+A mechanical sweep of all 167 `ErrorCode` variants found **29** at
+`Severity::Critical` but only **4** with an `error_code_alerts` entry
+(DH-901, AUTH-GAP-04, PROC-01, AGGREGATOR-DROP-01). A Critical that reaches
+no human surface is a silent failure by definition — the 2026-07-06
+zero-page class, inverted. Added, per `deploy/aws/terraform/error-code-alarms.tf`:
+
+- **+4 errcode log-filter alarms ≈ $0.40/mo (Verified against the terraform
+  diff — 11 → 15 map entries, each generating one filter + one alarm via the
+  existing `for_each`):** `boot-02` (QuestDB boot-probe deadline — boot
+  BLOCKS; also repairs a documented false-OK, since the `wal-suspend-01`
+  description told the operator "BOOT-01/02 own that page" while BOOT-02
+  owned no page at all), `boot-03` (clock skew — every IST timestamp wrong),
+  `oms-gap-06` (dry-run order runtime died; paper book + day P&L silently
+  zeroed), `ws-spill-02` (raw WS frame dropped at the capture-at-receipt WAL
+  — the raw-frame twin of AGGREGATOR-DROP-01). Their log-derived metrics are
+  sparse + dimensionless (billed only in hours a code fires — near-free); no
+  `default_value`, so no always-billed series. Zero new EMF allowlist names,
+  zero new dashboards, zero new Lambdas.
+
+Total **≈ $0.40/mo pre-GST (~₹40/mo incl. 18% GST at ₹85/$)** — inside the
+$100/mo pre-GST budget kill ceiling (2026-08-08 ruling).
+
+**Deliberately NOT added (cost + lock discipline, no false-OK):** 14 Critical
+codes have **no `error!` emit site at all** and were NOT alarmed — a filter
+with no possible emit site is a dead monitor that reads permanently green
+(the ws-reinject-01 / tick-conserve-01 precedent); they are enum-retirement
+candidates instead, listed in `observability-architecture.md`. Four more
+already reach a human via a typed `NotificationEvent` and are not duplicated
+(≈ $0.40/mo avoided). Three are **BLOCKED pending a dated operator quote**:
+AUTH-GAP-01 + DATA-805 are Dhan-scoped and
+`dhan-rest-only-noise-lock-2026-07-14.md` §3 REJECTs any new Dhan-scoped page
+outside its 4-item family without a fresh dated quote in THAT file first;
+GROWW-OCO-02 is compiled out by the non-default `groww_orders` cargo feature.
+Covering those three would add ≈ $0.30/mo once quoted.
+
+Ratchet: `crates/storage/tests/critical_errcode_alarm_coverage_guard.rs`
+(7 assertions + a shrinking allowlist) fails the build if a Critical code
+with a real emit site is neither alarmed nor allowlisted.
+
 ## COST NOTE 2026-07-17 — dashboard tidy (−~$0.70/mo + 1 free-tier dashboard slot)
 
 The dashboard-tidy PR (cleanup wave, Track B) retired the dead Dhan-lag

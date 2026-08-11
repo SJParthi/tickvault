@@ -123,66 +123,58 @@ jobs:
           path: fuzz/artifacts/
           retention-days: 90
 
+      # Ported off actions/github-script to `gh` CLI (2026-08-11, rust-only
+      # forever-lock): the inline JS was an interpreted-language runtime the
+      # `rust_only_guard` invocation scan could not see. Dedup semantics are
+      # unchanged (exact-title match over the 100 newest open `fuzz` issues:
+      # comment if found, else create). `matrix.target` now travels via
+      # `env:` instead of being spliced into a JS template literal, and the
+      # jq filter reads it through `env.TITLE` so no value is interpolated
+      # into the query string.
       - name: Create issue on crash (deduplicated)
         if: failure() && steps.fuzz.outputs.fuzz_crashed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
-        with:
-          script: |
-            const title = `🔴 Fuzz: Crash in ${{ matrix.target }}`;
-            // Check for existing open issue with same title
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'fuzz',
-              per_page: 100,
-            });
-            const duplicate = existing.find(i => i.title === title);
-            if (duplicate) {
-              // Comment on existing issue instead of creating a new one
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: duplicate.number,
-                body: `Still reproducing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              return;
-            }
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body: `Fuzz testing found a crash in target \`${{ matrix.target }}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nCrash artifacts uploaded — reproduce with:\n\`\`\`\ncargo +nightly fuzz run ${{ matrix.target }}\n\`\`\``,
-              labels: ['bug', 'fuzz', 'critical'],
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE="🔴 Fuzz: Crash in ${TARGET}"
+          export TITLE
+          existing=$(gh issue list --state open --label fuzz --limit 100 \
+            --json number,title --jq '[.[] | select(.title == env.TITLE) | .number] | first // empty')
+          if [ -n "$existing" ]; then
+            printf 'Still reproducing as of %s.\n\nSee: %s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_URL" > /tmp/fuzz-comment.md
+            gh issue comment "$existing" --body-file /tmp/fuzz-comment.md
+            exit 0
+          fi
+          printf 'Fuzz testing found a crash in target `%s`.\n\nSee: %s\n\nCrash artifacts uploaded — reproduce with:\n```\ncargo +nightly fuzz run %s\n```\n' \
+            "$TARGET" "$RUN_URL" "$TARGET" > /tmp/fuzz-body.md
+          gh issue create --title "$TITLE" --body-file /tmp/fuzz-body.md \
+            --label bug --label fuzz --label critical
 
+      # Ported off actions/github-script to `gh` CLI (2026-08-11, rust-only
+      # forever-lock) — same dedup semantics as the crash step above.
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
-        with:
-          script: |
-            const title = `⚠️ Fuzz: Build failure for ${{ matrix.target }}`;
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'fuzz',
-              per_page: 100,
-            });
-            const duplicate = existing.find(i => i.title === title);
-            if (duplicate) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: duplicate.number,
-                body: `Still failing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              return;
-            }
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body: `Fuzz target \`${{ matrix.target }}\` failed to **build** (not a crash).\nThis is typically a nightly toolchain compatibility issue.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: update \`NIGHTLY_VERSION\` in \`.github/workflows/fuzz.yml\` to a compatible nightly date.`,
-              labels: ['bug', 'fuzz'],
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE="⚠️ Fuzz: Build failure for ${TARGET}"
+          export TITLE
+          existing=$(gh issue list --state open --label fuzz --limit 100 \
+            --json number,title --jq '[.[] | select(.title == env.TITLE) | .number] | first // empty')
+          if [ -n "$existing" ]; then
+            printf 'Still failing as of %s.\n\nSee: %s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_URL" > /tmp/fuzz-comment.md
+            gh issue comment "$existing" --body-file /tmp/fuzz-comment.md
+            exit 0
+          fi
+          printf 'Fuzz target `%s` failed to **build** (not a crash).\nThis is typically a nightly toolchain compatibility issue.\n\nSee: %s\n\nTo fix: update `NIGHTLY_VERSION` in `.github/workflows/fuzz.yml` to a compatible nightly date.\n' \
+            "$TARGET" "$RUN_URL" > /tmp/fuzz-body.md
+          gh issue create --title "$TITLE" --body-file /tmp/fuzz-body.md \
+            --label bug --label fuzz

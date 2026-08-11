@@ -662,7 +662,13 @@ mod tests {
         assert_eq!(bars_per_day(TfIndex::M5), 77);
         assert_eq!(bars_per_day(TfIndex::M15), 26);
         assert_eq!(bars_per_day(TfIndex::D1), 1);
-        assert_eq!(total_bars_per_day_all_tfs(), 618);
+        // 2026-08-10: M2/M30/M60 appended (operator Quote 13's thirteen
+        // frames). ceil(23_100/120)=193, ceil(23_100/1800)=13,
+        // ceil(23_100/3600)=7 → 618 + 213 = 831.
+        assert_eq!(bars_per_day(TfIndex::M2), 193);
+        assert_eq!(bars_per_day(TfIndex::M30), 13);
+        assert_eq!(bars_per_day(TfIndex::M60), 7);
+        assert_eq!(total_bars_per_day_all_tfs(), 831);
         assert_eq!(SESSION_SECS, 23_100);
     }
 
@@ -671,9 +677,10 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 618 × 35 × 8 × 48 = 8_305_920 B ≈ 7.9 MiB
-        // (2026-08-07: 601 -> 618 bars/day with the 385-minute session).
-        assert_eq!(bytes, 8_305_920);
+        // 831 × 35 × 8 × 48 = 11_168_640 B ≈ 10.6 MiB
+        // (2026-08-07: 601 -> 618 bars/day with the 385-minute session;
+        //  2026-08-10: 618 -> 831 with M2/M30/M60, operator Quote 13.)
+        assert_eq!(bytes, 11_168_640);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -857,8 +864,9 @@ mod tests {
         assert_eq!(stats.bars_resident_per_feed[Feed::Groww.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Groww.index()], 1);
-        // Two slots × 1 day × 618 bars × 48 B of pre-allocated capacity (385-min session).
-        assert_eq!(stats.estimated_bytes, 2 * 618 * 48);
+        // Two slots × 1 day × 831 bars × 48 B of pre-allocated capacity
+        // (385-min session; 618 -> 831 on 2026-08-10 with M2/M30/M60).
+        assert_eq!(stats.estimated_bytes, 2 * 831 * 48);
     }
 
     #[test]
@@ -883,11 +891,14 @@ mod tests {
         // so the number is the would-be formula cost, not allocated memory.
         assert_eq!(gated_formula_total, 77_422, "gated formula sum drifted");
         // The resident total + byte estimate exclude the gated frames.
-        assert_eq!(total_bars_per_day_all_tfs(), 618);
+        // 2026-08-10: 618 -> 831 with M2/M30/M60 (operator Quote 13). These
+        // three are minute-scale, so unlike the GDF-gated second frames they
+        // ARE resident and DO count toward the byte estimate.
+        assert_eq!(total_bars_per_day_all_tfs(), 831);
         let store = SpotBarStore::new(35);
         store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
         let stats = store.stats();
-        assert_eq!(stats.estimated_bytes, 618 * 35 * 48);
+        assert_eq!(stats.estimated_bytes, 831 * 35 * 48);
         let slot = store.find_slot(key()).expect("slot exists");
         let rings = slot.rings.read();
         assert_eq!(rings.len(), TF_COUNT, "one ring per TfIndex ordinal");
