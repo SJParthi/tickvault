@@ -355,9 +355,10 @@ const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 /// An empty result is never reported as success. An empty instrument set opens
 /// ZERO sockets, and calling that "depth enabled" is exactly the false-OK the
 /// scope-lock forbids.
-// TEST-EXEMPT: network I/O (QuestDB /exec) — every decision it makes is delegated to
-// the unit-tested pure fns: build_depth_candidate_query, parse_depth_candidates_dataset,
-// select_depth_universe. This wrapper only moves bytes and logs.
+// Every decision this makes is delegated to the unit-tested pure fns
+// (build_depth_candidate_query, parse_depth_candidates_dataset,
+// select_depth_universe); this wrapper only moves bytes and logs.
+// TEST-EXEMPT: network I/O (QuestDB /exec) — see the note above.
 pub async fn load_depth_universe(
     questdb: &tickvault_common::config::QuestDbConfig,
     today_ist_nanos: i64,
