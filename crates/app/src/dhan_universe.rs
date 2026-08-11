@@ -493,16 +493,34 @@ async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &Joi
     )
     .await
     {
-        Ok(()) => info!(
-            rows = rows.len(),
-            date, "index_constituency rows persisted (feed=dhan)"
-        ),
+        Ok(()) => {
+            info!(
+                rows = rows.len(),
+                date, "index_constituency rows persisted (feed=dhan)"
+            );
+            // ONLY on the success arm. Absence from today's rows is the sole
+            // evidence a constituent was dropped at a rebalance — and a FAILED
+            // write produces exactly the same absence. Running this after an
+            // error would read our own outage as "every stock left its index"
+            // and expire the live universe in one pass. The gating is the
+            // safety property; nothing inside the expiry call can recover it.
+            tickvault_storage::index_constituency_persistence::mark_missing_index_constituents_expired(
+                questdb,
+                tickvault_storage::index_constituency_persistence::INDEX_CONSTITUENCY_FEED_DHAN,
+                false,
+                trading_date_ist_nanos,
+            )
+            .await;
+        }
         Err(err) => error!(
             rows = rows.len(),
             date,
             error = %err,
             "index_constituency persist FAILED — the mapping file is still correct on disk and \
-             tomorrow's write is DEDUP-idempotent, but today's point-in-time row is missing"
+             tomorrow's write is DEDUP-idempotent, but today's point-in-time row is missing. \
+             The rebalance-expiry pass is deliberately SKIPPED: a failed write is \
+             indistinguishable from every constituent being dropped, so running it here \
+             would expire the live universe"
         ),
     }
 }
