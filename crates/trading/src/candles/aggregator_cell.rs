@@ -142,13 +142,31 @@ pub fn tick_price_is_sane(tick: &ParsedTick) -> bool {
 /// `TF_COUNT × 3` (63 at `TF_COUNT = 21`) — ~3.15 µs against the 100 ns/tick
 /// hot-path budget, a ~31× overrun for zero added information.
 ///
-/// Widening is applied here EXACTLY as the folds applied it, so behaviour is
-/// bit-identical: `day_open` / `day_close` are widened only when strictly
-/// positive and stored as `0.0` otherwise. `> 0.0` is false for `NaN`, so a
-/// poisoned field still collapses to the `0.0` sentinel rather than
-/// propagating — and because the clean conversion preserves sign and
-/// magnitude, `converted > 0.0` holds exactly when `raw > 0.0` did. Callers
-/// therefore test the CONVERTED value and get the original semantics.
+/// Widening is applied here as the folds applied it: `day_open` / `day_close`
+/// are widened only when strictly positive and stored as `0.0` otherwise.
+/// `> 0.0` is false for `NaN`, so a poisoned field still collapses to the
+/// `0.0` sentinel rather than propagating.
+///
+/// HONEST LIMIT (corrected 2026-08-10 — an earlier version of this comment
+/// claimed the change was "bit-identical", which is FALSE). The guard tests
+/// the CONVERTED value where the old fold tested the RAW one, and those are
+/// NOT equivalent for every `f32`. [`f32_to_f64_clean`] formats through a
+/// 24-byte stack buffer; Rust's `f32` `Display` never uses scientific
+/// notation, so a positive subnormal (⪅ `1e-23`, e.g. `f32::MIN_POSITIVE`)
+/// expands past that buffer, the write fails mid-way, and the truncated
+/// decimal parses back to `0.0`. For such a value `raw > 0.0` is true while
+/// `converted > 0.0` is false.
+///
+/// The resulting divergence is confined to that subnormal band and is, if
+/// anything, the safer behaviour — a sub-`1e-23` "price" is not a real quote,
+/// and treating it as absent beats adopting a garbage session open. It is
+/// recorded here rather than smoothed over because the previous wording
+/// asserted an identity a future reader would have trusted. Pinned by
+/// `test_tick_prices_subnormal_day_field_collapses_to_sentinel`.
+///
+/// (Pre-existing and unchanged by this refactor: `f32::MAX` widens to
+/// `3.4028235e23`, off by 15 orders of magnitude, for the same
+/// buffer-truncation reason.)
 ///
 /// # Complexity
 /// O(1) — at most three conversions, no allocation, no loop.
@@ -613,12 +631,26 @@ fn fold_late_hlc(state: &mut LiveCandleState, tick: &ParsedTick, prices: TickPri
     state.tick_count = state.tick_count.saturating_add(1);
 }
 
-// Per-instrument RAM pin. 21 TF × 128 B × 2 arrays + 21 flags, padded.
-// Bumping this multiplies by the slot ceiling (25,000) — update
-// `aws-budget.md` before raising it.
+// Per-instrument RAM pin. TF_COUNT × 128 B × 2 arrays (`slots` +
+// `last_sealed`) + TF_COUNT flags, padded.
+//
+// RAISED 2026-08-10: 5_632 → 6_400 for TF_COUNT 21 → 24 (M2/M30/M60
+// appended to complete operator Quote 13's thirteen frames). The bound is
+// deliberately derived from TF_COUNT rather than re-frozen as a literal, so
+// the next frame change moves it arithmetically instead of tripping a
+// mystery const-assert.
+//
+// Fleet cost at the slot ceiling, stated because this constant multiplies:
+//   24 TF × 128 B × 2 = 6_144 B, padded ≤ 6_400 B per instrument
+//   × AGGREGATOR_MAX_SLOTS (25,000) = ~160 MB
+// against the r8g.xlarge 32 GiB host (operator Quote 13) that is 0.49% —
+// up from ~141 MB at 21 frames. On the retired 4 GiB t4g.medium the same
+// table would have been ~3.9% of the entire machine, which is the sort of
+// number that used to make "just add three timeframes" a real decision.
+const MAX_AGGREGATOR_CELL_BYTES: usize = TF_COUNT * 128 * 2 + TF_COUNT * 4 + 160;
 const _: () = assert!(
-    std::mem::size_of::<AggregatorCell>() <= 5_632,
-    "AggregatorCell exceeded its 5.5 KB per-instrument budget — this multiplies by AGGREGATOR_MAX_SLOTS; update aws-budget.md before raising."
+    std::mem::size_of::<AggregatorCell>() <= MAX_AGGREGATOR_CELL_BYTES,
+    "AggregatorCell exceeded its per-instrument budget — this multiplies by AGGREGATOR_MAX_SLOTS (25,000); update aws-budget.md before raising."
 );
 
 // ---------------------------------------------------------------------------
@@ -646,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tick_prices_widening_is_pure_and_matches_the_inline_fold() {
+    fn test_tick_prices_from_tick_widening_is_pure_and_matches_the_inline_fold() {
         // Widening must be a pure function of the tick — that is precisely
         // what makes hoisting it out of the timeframe loop safe. If this ever
         // stops holding, one derivation per tick is NOT interchangeable with
@@ -666,6 +698,27 @@ mod tests {
         );
         assert_eq!(p.day_open, f32_to_f64_clean(full.day_open));
         assert_eq!(p.day_close, f32_to_f64_clean(full.day_close));
+    }
+
+    #[test]
+    fn test_tick_prices_subnormal_day_field_collapses_to_sentinel() {
+        // Pins the HONEST LIMIT documented on `TickPrices`: the widening is
+        // NOT bit-identical to the old raw-value guard for subnormal f32.
+        // `f32_to_f64_clean` formats through a 24-byte buffer and Rust's f32
+        // Display never uses scientific notation, so a positive subnormal
+        // overflows it and parses back to 0.0.
+        let mut t = tick_at(OPEN, 24_000.05, 10);
+        t.day_open = f32::MIN_POSITIVE;
+        let p = TickPrices::from_tick(&t);
+        assert!(
+            t.day_open > 0.0,
+            "precondition: the RAW value is strictly positive"
+        );
+        assert_eq!(
+            p.day_open, 0.0,
+            "a subnormal day_open widens to the 0.0 sentinel — the documented \
+             divergence from the old raw-value guard, not an identity"
+        );
     }
 
     #[test]

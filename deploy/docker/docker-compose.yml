@@ -5,14 +5,20 @@
 # operator-lock 2026-07-15 Quote 8 in daily-universe-scope-expansion-2026-05-27.md §7).
 #
 # Post-CloudWatch-only migration (#O1/#O2/#O3/#O4), Groww-only ~770-SID universe.
-#   Compose default QDB_MEM_LIMIT=1g — the prod box downsizes to the t4g.medium
-#   4 GiB host (operator downsize 2026-07-15, executed by the guarded
-#   downsize-instance.yml workflow), so 1g is the steady-state QuestDB budget
-#   per §7 Rule 2: QuestDB ~1GB + App ~0.7–1.5GB + OS/FS-cache ~0.4GB =
-#   ~2.6–3.1GB total on 4 GiB. (Was 4g on the r8g.large 16 GiB host,
-#   2026-07-01 → 2026-07-15; the on-box deploy/docker/.env override is
-#   retuned to 1g by the downsize workflow's SSM step — the .env OVERRIDES
-#   this compose default, so the repo change alone never retunes the box.)
+#   Compose default QDB_MEM_LIMIT=12g — the r8g.xlarge 32 GiB host (operator
+#   Quote 13, 2026-08-08), per §7 Rule 2: QuestDB 8–16 GB + resident ticks
+#   2.3–7.2 GB + app 2–4 GB + OS/FS-cache 2–4 GB = ~14–31 GB of 32 GiB.
+#   History: 4g on r8g.large (2026-07-01 → 2026-07-15), then 1g on the
+#   t4g.medium downsize (2026-07-15 → 2026-08-10).
+#
+#   ⚠ THE REPO CHANGE ALONE DOES NOT RETUNE THE BOX. The on-box
+#   deploy/docker/.env OVERRIDES this default, and it was written to 1g by
+#   the downsize workflow's SSM step. Until
+#   `scripts/aws-upgrade-instance.sh --qdb-mem 12g --apply-ssm` runs against
+#   the live instance, prod QuestDB stays at 1g regardless of this file.
+#   Note also that `.github/workflows/downsize-instance.yml` still hard-
+#   asserts 1073741824 and will FAIL against a 12g box — that workflow is a
+#   t4g.medium-era tool and must not be dispatched at the current lock.
 #
 # REMOVED (CloudWatch-only migration):
 #   - Grafana       -> CloudWatch Dashboards (#O1)

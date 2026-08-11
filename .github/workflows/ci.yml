@@ -36,12 +36,17 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   # NOTE: we intentionally do NOT set `RUSTFLAGS: "-D warnings"` at the
-  # env level. That would make every rustc warning across the workspace
-  # fatal (including in test builds), and there are ~24 pre-existing
-  # warnings that need a dedicated cleanup pass. The project's per-crate
-  # `#![cfg_attr(not(test), deny(...))]` in lib.rs already enforces the
-  # strictest lints on prod code. Once the cleanup PR lands, set this
-  # to "-D warnings" and tighten clippy back up.
+  # env level, because that would make every rustc warning fatal in TEST
+  # builds too, and test-target warnings are neither measured nor clean.
+  #
+  # Corrected 2026-08-11: this note used to cite "~24 pre-existing
+  # warnings that need a dedicated cleanup pass" and promised to tighten
+  # clippy "once the cleanup PR lands". That cleanup HAS landed, so the
+  # clippy step below is now armed with `-D warnings` (lib+bins). The
+  # env-level RUSTFLAGS stays unset on the test-target grounds above —
+  # that is the only surviving reason, and it is a narrower one.
+  # Prod code remains additionally protected by the per-crate
+  # `#![cfg_attr(not(test), deny(...))]` in each lib.rs.
 
 jobs:
   # -------------------------------------------------------------------------
@@ -204,13 +209,29 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy (workspace, libs + bins only)
-        # NOTE: we deliberately do NOT pass `--all-targets` or
-        # `-D warnings` here. Test code legitimately uses `eprintln!`
-        # (calibration output) and there are ~24 pre-existing lib
-        # warnings scheduled for a follow-up cleanup pass. Prod code is
-        # still protected via `#![cfg_attr(not(test), deny(...))]` in
-        # each crate's lib.rs.
-        run: cargo clippy --workspace --no-deps
+        # THE GATE IS ARMED (2026-08-11). `-D warnings` is ON: any clippy
+        # warning in lib+bin code now FAILS this job, and Build & Verify is
+        # a needed job of All Green, so it blocks the merge.
+        #
+        # It was off because of "~24 pre-existing lib warnings scheduled for
+        # a follow-up cleanup pass". That cleanup HAS landed (the
+        # `#![allow(clippy::doc_lazy_continuation)]` /
+        # `doc_overindented_list_items` lines now in all 8 lib.rs files), so
+        # the only stated justification for an unfailable lint gate was
+        # stale. Measured before arming: `cargo clippy --workspace --no-deps
+        # -- -D warnings` exits 0 on this tree.
+        #
+        # `--all-targets` is STILL deliberately omitted, and that is a real
+        # remaining gap, not an oversight: test code legitimately uses
+        # `eprintln!` (calibration output), the workspace does not currently
+        # build clean in that mode, and its true warning count is UNMEASURED.
+        # Arming it is separate work with its own measurement — do not
+        # bundle it in by adding the flag here.
+        #
+        # Ratcheted by `crates/common/tests/rust_only_guard.rs::
+        # ci_clippy_gate_stays_armed` so `-D warnings` cannot be silently
+        # dropped again.
+        run: cargo clippy --workspace --no-deps -- -D warnings
 
   # -------------------------------------------------------------------------
   # Test — one job per crate, parallel. Matrix + fail-fast: false so a

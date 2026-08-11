@@ -1641,9 +1641,12 @@ mod c3_tf_ordinal_pins {
     use tickvault_trading::candles::tf_index::TF_COUNT;
 
     #[test]
-    fn test_tf_ordinal_roundtrip_covers_all_21_frames() {
-        assert_eq!(TF_COUNT, 21);
-        for ord in 0..=20usize {
+    fn test_tf_ordinal_roundtrip_covers_all_frames() {
+        // 24 since 2026-08-10 (M2/M30/M60 appended, operator Quote 13).
+        // The loop bound is derived from TF_COUNT so an appended frame is
+        // actually exercised instead of silently falling outside the range.
+        assert_eq!(TF_COUNT, 24);
+        for ord in 0..TF_COUNT {
             let tf =
                 TfIndex::from_ordinal(ord).unwrap_or_else(|| panic!("ordinal {ord} must decode"));
             assert_eq!(tf.as_ordinal(), ord, "round-trip broke at {ord}");
@@ -1657,8 +1660,8 @@ mod c3_tf_ordinal_pins {
     }
 
     #[test]
-    fn test_from_ordinal_refuses_21_and_255_without_panic() {
-        assert!(TfIndex::from_ordinal(21).is_none());
+    fn test_from_ordinal_refuses_past_the_end_and_255_without_panic() {
+        assert!(TfIndex::from_ordinal(TF_COUNT).is_none());
         assert!(TfIndex::from_ordinal(255).is_none());
         for ord in TF_COUNT..=255usize {
             assert!(TfIndex::from_ordinal(ord).is_none(), "{ord} must refuse");

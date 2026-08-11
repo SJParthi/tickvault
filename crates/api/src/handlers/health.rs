@@ -18,7 +18,13 @@ pub struct HealthResponse {
 }
 
 /// Per-subsystem health status.
-#[derive(Serialize)]
+///
+/// `Serialize` is hand-written (2026-08-11) so the response can carry the
+/// `runtime` map from `LIVE_RUNTIME_SUBSYSTEMS` WITHOUT adding a struct
+/// field. A field would have forced every existing caller that builds this
+/// struct literally to change; the live-runtime list is a compile-time
+/// constant with no per-instance state, so a field would have carried no
+/// information anyway.
 pub struct SubsystemStatus {
     pub websocket: SubsystemInfo,
     pub order_update: SubsystemInfo,
@@ -28,6 +34,125 @@ pub struct SubsystemStatus {
     pub pipeline: SubsystemInfo,
     pub tick_persistence: SubsystemInfo,
 }
+
+impl Serialize for SubsystemStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("SubsystemStatus", 7)?;
+        s.serialize_field("websocket", &self.websocket)?;
+        s.serialize_field("order_update", &self.order_update)?;
+        s.serialize_field("questdb", &self.questdb)?;
+        s.serialize_field("token", &self.token)?;
+        s.serialize_field("pipeline", &self.pipeline)?;
+        s.serialize_field("tick_persistence", &self.tick_persistence)?;
+        // The live runtime — always present, never derived from caller state.
+        //
+        // Serialized COMPACTLY as {name: metric} with one shared status
+        // field, not as an array of objects: `/health` is read by scripts
+        // with small body limits, and repeating `"status":"unwired"` plus a
+        // prose sentence on all nine rows tripled the response for zero
+        // extra information. The per-row status is identical by contract
+        // (the ratchet enforces it), so it is stated once.
+        s.serialize_field("runtime_status", STATUS_UNWIRED)?;
+        s.serialize_field("runtime", &RuntimeMetricMap)?;
+        s.end()
+    }
+}
+
+/// One live runtime subsystem and where its real liveness signal lives.
+#[derive(Serialize)]
+pub struct RuntimeSubsystem {
+    /// Stable machine name, matched by the boot-path ratchet.
+    pub name: &'static str,
+    pub status: &'static str,
+    /// The CloudWatch/Prometheus series that DOES carry this subsystem's
+    /// liveness, since `/health` cannot measure it in-process.
+    pub metric: &'static str,
+}
+
+/// Serializes `LIVE_RUNTIME_SUBSYSTEMS` as a compact `{name: metric}` map.
+struct RuntimeMetricMap;
+
+impl Serialize for RuntimeMetricMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = serializer.serialize_map(Some(LIVE_RUNTIME_SUBSYSTEMS.len()))?;
+        for row in LIVE_RUNTIME_SUBSYSTEMS {
+            m.serialize_entry(row.name, row.metric)?;
+        }
+        m.end()
+    }
+}
+
+/// The subsystems that actually run on today's REST-only runtime, each
+/// paired with the metric that genuinely observes it (2026-08-11,
+/// observability-blind-spot audit round 2).
+///
+/// # Why every row is `unwired` and NOT a green boolean
+///
+/// `SystemHealthStatus` (the only state `/health` can read) exposes no
+/// setter for any of these — they are spawned in the boot path and report
+/// through `metrics::` counters, never through the API state. Rendering
+/// them `up` would be a fabricated health signal for something this
+/// handler cannot measure; rendering them `down` would be an equally
+/// invented failure. So each row states plainly that `/health` does not
+/// observe it and names the series that does.
+///
+/// Wiring any of these to a real signal is a state-layer change (a new
+/// setter on `SystemHealthStatus` plus a producer call at the spawn
+/// site); until then this list is the honest answer to "what runs?".
+///
+/// The boot-path ratchet
+/// (`crates/api/tests/health_subsystem_boot_parity_guard.rs`) fails the
+/// build in BOTH directions: a row here whose spawn site has been deleted,
+/// and a live spawn site with no row here.
+pub const LIVE_RUNTIME_SUBSYSTEMS: &[RuntimeSubsystem] = &[
+    RuntimeSubsystem {
+        name: "cadence_scheduler",
+        status: STATUS_UNWIRED,
+        metric: "tv_cadence_runner_respawn_total",
+    },
+    RuntimeSubsystem {
+        name: "dhan_rest_stack",
+        status: STATUS_UNWIRED,
+        metric: "tv_token_remaining_seconds",
+    },
+    RuntimeSubsystem {
+        name: "dhan_spot_1m",
+        status: STATUS_UNWIRED,
+        metric: "tv_spot1m_persist_errors_total",
+    },
+    RuntimeSubsystem {
+        name: "dhan_option_chain_1m",
+        status: STATUS_UNWIRED,
+        metric: "tv_chain1m_persist_errors_total",
+    },
+    RuntimeSubsystem {
+        name: "groww_spot_1m",
+        status: STATUS_UNWIRED,
+        metric: "tv_groww_spot1m_persist_errors_total",
+    },
+    RuntimeSubsystem {
+        name: "groww_option_chain_1m",
+        status: STATUS_UNWIRED,
+        metric: "tv_groww_chain1m_persist_errors_total",
+    },
+    RuntimeSubsystem {
+        name: "seal_writer",
+        status: STATUS_UNWIRED,
+        metric: "tv_seal_writer_drain_total",
+    },
+    RuntimeSubsystem {
+        name: "market_ram_store",
+        status: STATUS_UNWIRED,
+        metric: "tv_ram_store_errors_total",
+    },
+    RuntimeSubsystem {
+        name: "order_runtime",
+        status: STATUS_UNWIRED,
+        metric: "tv_orders_rejected_total",
+    },
+];
 
 /// Individual subsystem status info.
 #[derive(Serialize)]
@@ -47,6 +172,12 @@ const STATUS_RETIRED: &str = "retired";
 /// pushing its state into `/health` yet (2026-08-09). An honest "we don't
 /// know" — never a fabricated "disconnected".
 const STATUS_UNREPORTED: &str = "unreported";
+
+/// Status for a subsystem that PROVABLY runs (it has a boot-path spawn
+/// site) but pushes no liveness signal into `/health` (2026-08-11). The
+/// honest "we don't measure this here" — never a fabricated `up`, never an
+/// invented `down`. Each row names the metric that DOES observe it.
+pub const STATUS_UNWIRED: &str = "unwired";
 
 /// GET /health — returns 200 OK with subsystem status.
 ///
@@ -74,6 +205,26 @@ const STATUS_UNREPORTED: &str = "unreported";
 ///
 /// All four are ARM-ON-ARRIVAL: the first setter call from any producer
 /// flips the field back to live reporting with no change needed here.
+/// They are KEPT (not deleted) precisely because of that: the Dhan live
+/// main-feed WS revival is operator-authorized (2026-08-09), and deleting
+/// the field would silently drop its re-arm path.
+///
+/// # The omission this round fixes (2026-08-11)
+///
+/// The six fields above are the ONLY things `/health` reported — and three
+/// of them are retired. Nothing that actually runs today appeared at all:
+/// the cadence scheduler, the four per-minute REST legs, the seal writer,
+/// the RAM store and the paper order runtime. `/health` could therefore
+/// answer "healthy" while every live subsystem was dead — a lie by
+/// omission, and the exact "answer 'is everything working?' with no human
+/// digging" failure the operator named.
+///
+/// The `runtime` array now lists all nine, each as `unwired` with the
+/// metric that genuinely observes it. `unwired` is deliberate and is NOT
+/// an improvement waiting to be "finished into green": this handler reads
+/// `SystemHealthStatus`, which has no setter for any of them, so any
+/// boolean here would be invented. Naming the real series is the honest,
+/// actionable answer; a `true` would be a fabrication.
 pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthResponse> {
     let health = state.health_status();
 
@@ -90,11 +241,11 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
     } else {
         SubsystemInfo {
             status: STATUS_RETIRED,
-            detail: Some(
-                "live market-data WebSocket feeds retired (Dhan 2026-07-13, Groww 2026-07-15); \
-                 runtime is REST-only, so there is no connection count to report"
-                    .to_string(),
-            ),
+            // Details are deliberately terse: `/health` is polled by
+            // scripts that read a bounded body (the api contract test caps
+            // at 1 KiB), and the full explanation lives in this handler's
+            // doc comment where it costs no bytes on the wire.
+            detail: Some("live feeds retired 2026-07-13/15".to_string()),
         }
     };
 
@@ -110,11 +261,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
     } else {
         SubsystemInfo {
             status: STATUS_UNREPORTED,
-            detail: Some(
-                "order-update channel runs in paper mode when [dhan_order_push] is enabled, \
-                 but nothing reports its connection state to /health yet"
-                    .to_string(),
-            ),
+            detail: Some("paper channel exists; no reporter".to_string()),
         }
     };
 
@@ -153,11 +300,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
     } else {
         SubsystemInfo {
             status: STATUS_RETIRED,
-            detail: Some(
-                "the tick pipeline spawned only under the live feeds; with both retired it \
-                 has no production call site"
-                    .to_string(),
-            ),
+            detail: Some("no call site since feeds retired".to_string()),
         }
     };
 
@@ -183,11 +326,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
     } else {
         SubsystemInfo {
             status: STATUS_RETIRED,
-            detail: Some(
-                "tick persistence was deleted in the 2026-07-17 dead-WS sweep; no tick writer \
-                 exists on the REST-only runtime"
-                    .to_string(),
-            ),
+            detail: Some("tick writer deleted 2026-07-17".to_string()),
         }
     };
 

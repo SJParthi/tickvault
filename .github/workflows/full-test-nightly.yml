@@ -113,16 +113,24 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # Ported off actions/github-script to `gh` CLI (2026-08-11, rust-only
+      # forever-lock): the inline JS was an interpreted-language runtime the
+      # `rust_only_guard` invocation scan could not see. Behaviour is
+      # unchanged. Security note: the old JS spliced the step output into a
+      # JS TEMPLATE LITERAL (`const body = ` + backtick), so a backtick or
+      # `${` in failing-test output could break or execute inside the script;
+      # the body now travels via `env:` + `--body-file` and is never parsed.
       - name: Open regression issue on failure
         if: failure() && steps.test.conclusion == 'failure'
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const body = `${{ steps.summary.outputs.body }}`;
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `nightly regression: full-workspace test failed @ ${context.sha.substring(0, 7)}`,
-              body,
-              labels: ['nightly-regression', 'auto-triage'],
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_BODY: ${{ steps.summary.outputs.body }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$ISSUE_BODY" > /tmp/nightly-issue-body.md
+          gh issue create \
+            --title "nightly regression: full-workspace test failed @ ${COMMIT_SHA:0:7}" \
+            --body-file /tmp/nightly-issue-body.md \
+            --label nightly-regression \
+            --label auto-triage
