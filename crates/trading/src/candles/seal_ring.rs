@@ -17,9 +17,11 @@
 //!
 //! ## RAM budget
 //!
-//! `SEAL_BUFFER_CAPACITY = 200_000` and `BufferedSeal` ≤ 144 bytes →
-//! ~29 MB worst-case. Fits comfortably in the 2 GB App envelope from
-//! `aws-budget.md`.
+//! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 21
+//! = 525,000) and `BufferedSeal` ≤ 144 bytes → **~76 MB worst-case**.
+//! 0.23% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
+//! Was a hardcoded 200,000 (~29 MB) until 2026-08-10 — see the constant's
+//! own doc for why that literal under-sized the midnight burst by 2.6×.
 //!
 //! ## Drop semantics on overflow
 //!
@@ -56,10 +58,28 @@ use crate::candles::{LiveCandleState, TfIndex};
 /// triggers either a drop (OLDEST evicted, returned to caller) or
 /// disk spill (handled by the storage-crate writer slice).
 ///
-/// Generously sized to absorb the IST-midnight force-seal burst
-/// across all instruments × 21 TFs plus headroom for downstream
+/// Sized to absorb the IST-midnight force-seal burst across ALL
+/// instruments × ALL timeframes, plus headroom for downstream
 /// backpressure spikes. Per locked decision L-C1.
-pub const SEAL_BUFFER_CAPACITY: usize = 200_000;
+///
+/// DERIVED, not a literal, since 2026-08-10. The previous 200,000
+/// carried the comment "generously sized to absorb the IST-midnight
+/// force-seal burst across all instruments × 21 TFs" — which was
+/// arithmetically FALSE at the configured ceiling:
+/// `force_seal_all` emits `AGGREGATOR_MAX_SLOTS × TF_COUNT`
+/// = 25,000 × 21 = **525,000** seals in one burst, so 200,000 would
+/// have force-evicted 325,000 of them down the spill/DLQ tiers in a
+/// single tokio yield, every midnight, while the header claimed
+/// headroom. Deriving the constant makes that class of drift
+/// impossible: change either input and this follows.
+///
+/// Cost at the derived value: 525,000 × ≤144 B ≈ **76 MB** — 0.23% of
+/// the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08). On the
+/// retired 4 GiB t4g.medium the same correctness would have cost ~1.9%
+/// of the entire machine, which is very likely why the literal was left
+/// low; the instance upgrade is what makes the honest value affordable.
+pub const SEAL_BUFFER_CAPACITY: usize =
+    crate::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS * crate::candles::tf_index::TF_COUNT;
 
 /// One sealed bar ready to flush to its `candles_*` plain table.
 /// `Copy` so the ring's `VecDeque<BufferedSeal>` does not need
@@ -128,8 +148,8 @@ impl BufferedSeal {
 // Compile-time size assertion. `BufferedSeal` carries the entire
 // `LiveCandleState` (128 bytes after the 2026-06-05 Option B `close_ts_ist_secs`)
 // + the routing fields (security_id + segment + tf + padding). 144 bytes covers
-// it. Ring RAM = SEAL_BUFFER_CAPACITY (200_000) × 144 ≈ 28.8 MB (was 25.6 MB at
-// 128) — +3.2 MB, negligible on the 8 GiB host (see aws-budget.md Tier 1).
+// it. Ring RAM = SEAL_BUFFER_CAPACITY (525,000) × 144 ≈ 75.6 MB — 0.23% of the
+// r8g.xlarge 32 GiB host. Was ≈28.8 MB at the old hardcoded 200,000 capacity.
 const _: () = assert!(
     std::mem::size_of::<BufferedSeal>() <= 144,
     "BufferedSeal exceeded 144-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
@@ -184,9 +204,15 @@ impl SealRing {
     /// to honor the locked capacity.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
+        // A zero capacity makes `len() >= capacity` true while the deque is
+        // EMPTY, so the eviction arm of `try_buffer` would call `pop_front` on
+        // an empty deque and hit its invariant-violation `panic!` on the very
+        // first push. Clamping to 1 keeps the ring degenerate-but-sound
+        // (every push evicts the previous seal to the next tier) instead of
+        // panicking on a hot-path push. `new()` is unaffected.
         Self {
-            inner: VecDeque::with_capacity(capacity),
-            capacity,
+            inner: VecDeque::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
         }
     }
 
@@ -273,6 +299,8 @@ impl Default for SealRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
+    use crate::candles::tf_index::TF_COUNT;
     use crate::candles::{LiveCandleState, TfIndex};
 
     fn mk_state(bucket_start: u32, close_price: f64) -> LiveCandleState {
@@ -319,12 +347,41 @@ mod tests {
     }
 
     #[test]
-    fn test_seal_buffer_capacity_constant_is_locked_value() {
-        // L-C1 design lock: SEAL_BUFFER_CAPACITY = 200_000. Any
-        // operator-approved change must come with an update to
-        // aws-budget.md and the plan's "Locked design decisions" row
-        // for L-C1.
-        assert_eq!(SEAL_BUFFER_CAPACITY, 200_000);
+    fn test_seal_buffer_capacity_absorbs_the_whole_midnight_burst() {
+        // L-C1 design lock, RE-BLESSED 2026-08-10. The lock is no longer a
+        // literal but the PROPERTY the literal was meant to guarantee: the
+        // ring must hold an entire `force_seal_all` burst without evicting.
+        //
+        // The old form asserted `== 200_000` while `force_seal_all` emits
+        // AGGREGATOR_MAX_SLOTS × TF_COUNT = 525,000 — so the ratchet was
+        // actively PINNING a capacity 2.6× too small and reading as a safety
+        // guarantee. Asserting the property instead of the number means
+        // raising either input can never silently outgrow the ring again.
+        assert_eq!(
+            SEAL_BUFFER_CAPACITY,
+            AGGREGATOR_MAX_SLOTS * TF_COUNT,
+            "the ring must be sized to the full midnight force-seal burst"
+        );
+        assert!(
+            SEAL_BUFFER_CAPACITY >= AGGREGATOR_MAX_SLOTS * TF_COUNT,
+            "SEAL_BUFFER_CAPACITY {SEAL_BUFFER_CAPACITY} is smaller than one \
+             force_seal_all burst ({AGGREGATOR_MAX_SLOTS} slots × {TF_COUNT} \
+             timeframes) — the excess would be force-evicted to spill/DLQ in a \
+             single yield every IST midnight"
+        );
+    }
+
+    #[test]
+    fn test_seal_ring_ram_budget_fits_the_locked_host() {
+        // 32 GiB host (r8g.xlarge, operator Quote 13). The ring must stay a
+        // rounding error against it, or the derivation above has quietly
+        // become a memory problem rather than a correctness fix.
+        const HOST_BYTES: usize = 32 * 1024 * 1024 * 1024;
+        let ring_bytes = SEAL_BUFFER_CAPACITY * std::mem::size_of::<BufferedSeal>();
+        assert!(
+            ring_bytes * 100 < HOST_BYTES,
+            "seal ring would take {ring_bytes} bytes, over 1% of the 32 GiB host"
+        );
     }
 
     #[test]
@@ -469,9 +526,12 @@ mod tests {
     }
 
     #[test]
-    fn test_seal_ring_handles_all_21_tfs_distinctly() {
+    fn test_seal_ring_handles_every_tf_distinctly() {
         // Push one seal per TF, drain in FIFO, verify TfIndex preserved.
-        let mut ring = SealRing::with_capacity(21);
+        // Capacity is TF_COUNT, not a literal: at a hardcoded 21 the three
+        // frames appended on 2026-08-10 would have been silently EVICTED
+        // and this test would have asserted against a truncated drain.
+        let mut ring = SealRing::with_capacity(TF_COUNT);
         for tf in TfIndex::ALL {
             ring.try_buffer(mk_seal(13, 0, tf, 1_716_000_900, 100.0));
         }

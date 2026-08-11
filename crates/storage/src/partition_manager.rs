@@ -678,7 +678,7 @@ mod tests {
         // number 21 (M1/M3/M5/M15/D1 + S1..S15 + S30, TF-diet second-scale) —
         // the exact bug #1022 had (phantom `_shadow` names).
         let names = crate::shadow_persistence::candle_table_names();
-        assert_eq!(names.len(), 21, "expected 21 live candle tables");
+        assert_eq!(names.len(), 24, "expected 24 live candle tables");
         for name in names {
             assert!(
                 name.starts_with("candles_"),

@@ -30,7 +30,15 @@
 /// 2026-07-21): 1s..15s + 30s + 1m/3m/5m/15m + broker 1d — the 16
 /// second-scale frames are STRUCTURAL ONLY (GDF-feed-gated, zero rows
 /// until the GDF 1s live feed lands in its own lane).
-pub const TF_COUNT: usize = 21;
+///
+/// 24 since 2026-08-10: M2/M30/M60 appended (ordinals 21/22/23) to
+/// complete the thirteen current-day frames of operator Quote 13
+/// (2026-08-08). Three of those thirteen previously had no enum variant
+/// at all, so they could not be derived, stored, or queried. The append
+/// is ordinal-stable — every pre-existing ordinal 0..=20 is unchanged,
+/// so `SEAL_SPILL_FORMAT_VERSION` stays 1 and previously-spilled
+/// segments still replay.
+pub const TF_COUNT: usize = 24;
 
 /// 09:15:00 IST expressed as seconds-of-day (`9*3600 + 15*60`).
 /// The NSE regular trading session opens at 09:15:00 — every candle
@@ -112,6 +120,34 @@ pub enum TfIndex {
     S15 = 19,
     /// 30-second candles (30 s). GDF-feed-gated (structural).
     S30 = 20,
+    // -- Minute frames completing the operator's 13-frame set ---------
+    // APPENDED after S30 (2026-08-10) so every pre-existing ordinal
+    // (0..=20) stays byte-stable and SEAL_SPILL_FORMAT_VERSION stays 1.
+    //
+    // WHY these three and not others: operator Quote 13 (2026-08-08,
+    // `daily-universe-scope-expansion-2026-05-27.md` §0) specifies
+    // thirteen current-day timeframes — 1s/5s/10s/15s/30s, then
+    // 1m/2m/3m/5m/15m/30m/60m, then 1d. Ten of the thirteen already
+    // existed; M2, M30 and M60 did NOT, so three of the frames the
+    // r8g.xlarge upgrade was bought to serve were literally
+    // unrepresentable. These are the missing three.
+    //
+    // Unlike the second-scale block above, these are NOT structural
+    // placeholders: the minute-scale frames are derivable from the
+    // existing tick and REST-fold paths the moment a producer exists.
+    /// 2-minute candles (120 s).
+    M2 = 21,
+    /// 30-minute candles (1_800 s).
+    M30 = 22,
+    /// 60-minute candles (3_600 s). NOTE the 09:15 IST session anchor
+    /// means the final 60m bucket of a regular session is PARTIAL —
+    /// the grid runs 09:15/10:15/…/15:15, so the last bar covers
+    /// 15:15–15:30 (15 minutes), not a full hour. Same for M30's
+    /// 15:15–15:30 bucket. That is a property of anchoring to the open
+    /// rather than to the hour, and it is deliberate: a bar that starts
+    /// at the open is comparable across days, one that starts at 09:00
+    /// is not.
+    M60 = 23,
 }
 
 impl TfIndex {
@@ -144,6 +180,9 @@ impl TfIndex {
         TfIndex::S14,
         TfIndex::S15,
         TfIndex::S30,
+        TfIndex::M2,
+        TfIndex::M30,
+        TfIndex::M60,
     ];
 
     /// Returns the ordinal (`0..TF_COUNT`) used to index the
@@ -184,6 +223,9 @@ impl TfIndex {
             18 => Some(Self::S14),
             19 => Some(Self::S15),
             20 => Some(Self::S30),
+            21 => Some(Self::M2),
+            22 => Some(Self::M30),
+            23 => Some(Self::M60),
             _ => None,
         }
     }
@@ -216,6 +258,9 @@ impl TfIndex {
             Self::S14 => "candles_14s",
             Self::S15 => "candles_15s",
             Self::S30 => "candles_30s",
+            Self::M2 => "candles_2m",
+            Self::M30 => "candles_30m",
+            Self::M60 => "candles_60m",
         }
     }
 
@@ -266,6 +311,9 @@ impl TfIndex {
             Self::S14 => 14,
             Self::S15 => 15,
             Self::S30 => 30,
+            Self::M2 => 120,
+            Self::M30 => 1_800,
+            Self::M60 => 3_600,
         }
     }
 
@@ -307,6 +355,9 @@ impl TfIndex {
             Self::S14 => "14s",
             Self::S15 => "15s",
             Self::S30 => "30s",
+            Self::M2 => "2m",
+            Self::M30 => "30m",
+            Self::M60 => "60m",
         }
     }
 
@@ -403,13 +454,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tf_index_all_has_twenty_one_distinct_variants() {
+    fn test_tf_index_all_has_twenty_four_distinct_variants() {
         let mut seen = std::collections::HashSet::new();
         for tf in TfIndex::ALL {
             assert!(seen.insert(tf), "duplicate variant in TfIndex::ALL: {tf:?}");
         }
         assert_eq!(TfIndex::ALL.len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 21);
+        assert_eq!(TF_COUNT, 24);
     }
 
     /// C3 (2026-07-21): the 16 second-scale frames are APPENDED after
@@ -424,10 +475,14 @@ mod tests {
             .iter()
             .map(|tf| tf.seconds_per_bucket())
             .collect();
+        // Appended 2026-08-10: M2/M30/M60 (120/1800/3600) complete the
+        // operator's thirteen frames. They land at the END of the
+        // second-scale block, which keeps that block strictly ascending —
+        // the property the windows() check below relies on.
         let expected: Vec<u32> = [60_u32, 180, 300, 900, 86_400]
             .into_iter()
             .chain(1..=15)
-            .chain([30])
+            .chain([30, 120, 1_800, 3_600])
             .collect();
         assert_eq!(secs, expected, "ordinal seconds sequence drifted");
         for block in [&secs[..5], &secs[5..]] {
@@ -443,23 +498,6 @@ mod tests {
         }
     }
 
-    /// APPEND-ONLY ORDINAL PIN (2026-08-09, added with the tick-aggregator
-    /// rebuild).
-    ///
-    /// Every other ordinal test in this file derives its expectation from
-    /// `TfIndex::ALL` or from `as u8`, so all of them stay green if a variant
-    /// is INSERTED in the middle and `ALL` is updated to match. That edit is
-    /// exactly the catastrophic one: the ordinal is serialised into
-    /// seal-spill records ON DISK (`SEAL_SPILL_FORMAT_VERSION` 1) and used as
-    /// the `[…; TF_COUNT]` slot index, so inserting `S45` between `D1` and
-    /// `S1` would silently re-interpret every already-spilled ordinal ≥ 5 as
-    /// a different timeframe — historical bars re-mapped, no error anywhere.
-    ///
-    /// This test pins each variant to a LITERAL integer. Appending a new
-    /// variant at the end leaves every literal below untouched and passes;
-    /// inserting or reordering fails the build. Add new frames HERE at the
-    /// bottom only.
-    #[test]
     /// ADVERSARIAL REGRESSION (2026-08-09, flagged by two independent
     /// reviews). `tick_ist_secs` is a raw `u32` off the wire that no parser
     /// range-validates. The release profile is `overflow-checks = true` with
@@ -512,10 +550,16 @@ mod tests {
         assert_eq!(TfIndex::S14 as u8, 18);
         assert_eq!(TfIndex::S15 as u8, 19);
         assert_eq!(TfIndex::S30 as u8, 20);
+        // Appended 2026-08-10 to complete the operator's thirteen frames
+        // (Quote 13). ADD NEW FRAMES BELOW THIS LINE ONLY — inserting one
+        // above silently re-maps every already-spilled ordinal.
+        assert_eq!(TfIndex::M2 as u8, 21);
+        assert_eq!(TfIndex::M30 as u8, 22);
+        assert_eq!(TfIndex::M60 as u8, 23);
         // The pinned block above must cover EVERY variant: a new appended
         // frame that nobody pinned would slip through otherwise.
         assert_eq!(
-            TF_COUNT, 21,
+            TF_COUNT, 24,
             "a frame was added — pin its literal ordinal above"
         );
         // …and the seconds are pinned per-ordinal too, so a variant cannot be
@@ -572,6 +616,11 @@ mod tests {
             "candles_14s",
             "candles_15s",
             "candles_30s",
+            // Appended 2026-08-10 with M2/M30/M60 — the three frames of the
+            // operator's thirteen that previously had no enum variant.
+            "candles_2m",
+            "candles_30m",
+            "candles_60m",
         ];
         assert_eq!(names, expected);
         // No `_shadow` suffix anywhere — these are first-class tables.
@@ -628,7 +677,9 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         let expected = [
             "1m", "3m", "5m", "15m", "1d", "1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "9s",
-            "10s", "11s", "12s", "13s", "14s", "15s", "30s",
+            "10s", "11s", "12s", "13s", "14s", "15s",
+            "30s", // Appended 2026-08-10 (operator Quote 13's thirteen frames).
+            "2m", "30m", "60m",
         ];
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
             let name = tf.display_name();

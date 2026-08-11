@@ -79,8 +79,20 @@ const INVOCATION_SITE_ALLOWLIST: &[&str] = &[];
 /// Verified at fix time: `git ls-files` returns ZERO matches for every pathspec
 /// below, so widening the scope keeps both allowlists at their hard-zero floor
 /// and the ratchet can never be re-grown.
+/// SCOPE FIX #2 (2026-08-11): `*.py` was banned but `*.pyw` / `*.pyi` / `*.pyx`
+/// were not — a ONE-CHARACTER rename evaded the primary ban entirely, and
+/// `.pyw` is a directly-executable form on some platforms. The remaining
+/// additions close the equivalent one-rename escape for the other interpreted
+/// families already listed (`.jsx`/`.tsx`/`.mts`/`.cts` for the JS/TS pair)
+/// plus the interpreted runtimes that were simply never enumerated.
+///
+/// Verified at fix time (`git ls-files -- <pathspec>` for EVERY entry below):
+/// ZERO tracked matches, so both allowlists stay at their hard-zero floor and
+/// the ratchet cannot be re-grown by this widening.
 const BANNED_FILE_PATHSPECS: &[&str] = &[
-    "*.py", "*.js", "*.mjs", "*.cjs", "*.ts", "*.rb", "*.pl", "*.lua", "*.ipynb",
+    "*.py", "*.pyw", "*.pyi", "*.pyx", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.es6", "*.coffee",
+    "*.ts", "*.tsx", "*.mts", "*.cts", "*.rb", "*.pl", "*.php", "*.lua", "*.tcl", "*.groovy",
+    "*.jl", "*.ipynb",
 ];
 
 // ============================ PURE CORE ============================
@@ -135,7 +147,26 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path == "Dockerfile"
         || path.ends_with("/Dockerfile")
         || path.rsplit('/').next().is_some_and(|f| f.starts_with("Dockerfile."))
-        || path == ".mcp.json"
+        // 2026-08-11 SCOPE FIX #3 — EXECUTABLE-MANIFEST classes. Only
+        // `.mcp.json` was matched, by exact path, so `.claude/settings.json`
+        // (which carries the Claude Code HOOK command lines — a real
+        // executable surface) was structurally unscanned, as were systemd
+        // units (`ExecStart=`), launchd agents (`ProgramArguments`), IDE
+        // run-configs (`.run/*.xml`), and the Alloy collector config. Each
+        // class can name an interpreter as the program it launches, which is
+        // precisely the invocation shape this scan exists to catch.
+        //
+        // Verified at fix time: all 16 tracked files across these five
+        // classes (3 `.service`, 1 `.plist`, 5 `.xml`, 1 `.alloy`, 6 `.json`)
+        // are token-clean, so this closes a LATENT blind spot and keeps
+        // INVOCATION_SITE_ALLOWLIST empty. Same lesson as the 2026-08-07
+        // `.tf`/Dockerfile row and the 2026-08-01 package-manager row: scope
+        // errors are invisible by construction — they produce green, not red.
+        || path.ends_with(".service")
+        || path.ends_with(".plist")
+        || path.ends_with(".xml")
+        || path.ends_with(".alloy")
+        || path.ends_with(".json")
         || path == "Makefile"
         || path.ends_with("/Makefile")
         || path.starts_with("scripts/git-hooks/")
@@ -172,15 +203,38 @@ fn banned_token() -> String {
 /// setup scripts. Banning the runtime while permitting its package manager
 /// is not a ban; these tokens close that hole.
 ///
+/// `perl` JOINED the ban 2026-08-10. It was previously excluded because
+/// `terraform-apply.yml` ran a 13-line `perl -ne` program to reject non-ASCII
+/// security-group rule descriptions. That check is now
+/// `crates/common/tests/sg_rule_description_ascii_guard.rs` — same semantics,
+/// broader coverage (it runs in `Test (common)` on every PR, where the perl
+/// step ran only on the path-filtered terraform workflow). With the last site
+/// gone, the ratchet SHRINKS, which is the only direction it may move.
+///
 /// Deliberately NOT included (each would fail the guard TODAY and needs its
 /// own decision, never a silent allowlist entry):
-///   - `venv` — `deploy-aws.yml` has a `rm -rf …/venv` CLEANUP line
-///   - `perl` — `terraform-apply.yml` non-ASCII SG-description guard
-///   - `node`/`npx` — `.mcp.json` dev-only MCP servers
-/// All three are recorded in `rust-only-forever-lock-2026-07-19.md`.
+///   - `venv` — `deploy-aws.yml` has a `rm -rf …/venv` CLEANUP line, which
+///     only DELETES; banning the token would fail on the line that removes the
+///     very thing the directive objects to
+///   - `node`/`npx` — `.mcp.json` dev-only MCP servers for the Claude session;
+///     never deployed, never in the product path. Removing them breaks local
+///     tooling and buys nothing on the box, so this is an operator call rather
+///     than a silent guard edit. Note `node` is additionally ambiguous: AWS's
+///     own "SSM managed node" wording appears in `scripts/aws-autopilot.sh`,
+///     so a bare `node` token would false-positive on prose about AWS.
+/// Both are recorded in `rust-only-forever-lock-2026-07-19.md`.
 fn banned_tokens() -> Vec<String> {
     let mut tokens = vec![banned_token()];
-    for extra in ["pip", "pipx", "uv", "uvx", "poetry", "conda", "virtualenv"] {
+    for extra in [
+        "pip",
+        "pipx",
+        "uv",
+        "uvx",
+        "poetry",
+        "conda",
+        "virtualenv",
+        "perl",
+    ] {
         tokens.push(extra.to_string());
     }
     tokens
@@ -269,6 +323,111 @@ fn stale_invocation_sites(files: &[(String, String)], allowlist: &[&str]) -> Vec
         })
         .map(|e| (*e).to_string())
         .collect()
+}
+
+// ---- SCOPE FIX #4 (2026-08-11): Rust-side process spawns ----
+//
+// `*.rs` was EXCLUDED from the invocation scan by design ("a Rust-side spawn
+// would be a reviewed code change"). That reasoning does not hold for
+// `build.rs`, which EXECUTES on every single build, and it leaves the most
+// direct re-entry path — `Command::new("<interpreter>")` — structurally
+// invisible. A blanket token scan over `*.rs` would be unusable (every prose
+// mention in a doc-comment would fire), so this scan is deliberately NARROW:
+// it looks ONLY at the string literal a process spawn is given.
+//
+// Verified at fix time: the only literal spawns in the workspace are `git`,
+// `docker`, `df`, `bash`, `sh`, `open`, `chronyc` — all benign.
+//
+// HONEST LIMIT: spawns through a NON-literal program (`Command::new(program)`
+// where `program` is a variable — 6 such sites exist, e.g. `infra.rs`,
+// `tv_doctor.rs`) cannot be resolved statically and are NOT covered. This
+// catches the direct, greppable re-introduction, not a determined author.
+fn extract_spawn_literals(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for marker in ["Command::new(\"", ".arg(\""] {
+        let mut rest = content;
+        while let Some(i) = rest.find(marker) {
+            let after = &rest[i + marker.len()..];
+            if let Some(end) = after.find('"') {
+                out.push(after[..end].to_string());
+            }
+            rest = &rest[i + marker.len()..];
+        }
+    }
+    out
+}
+
+/// Spawn literals in this file that name a banned interpreter/package manager.
+fn rust_spawn_violations(content: &str) -> Vec<String> {
+    let mut hits: Vec<String> = extract_spawn_literals(content)
+        .into_iter()
+        .filter(|lit| line_has_banned_token(lit))
+        .collect();
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+// ---- SCOPE FIX #5 (2026-08-11): inline JavaScript in workflows ----
+//
+// `actions/github-script` executes an inline JavaScript program supplied in a
+// `script:` block. That is an interpreted-language runtime living inside a
+// `.yml` file, so NEITHER real-tree test could see it: the file-extension ban
+// only looks at tracked FILENAMES, and `banned_tokens()` deliberately excludes
+// `node`/`npx`. 18 such blocks were running in this repo unnoticed.
+//
+// Ratchet shape is the house allowlist pattern, per FILE and per COUNT: a
+// count ABOVE the budget is a new usage (forbidden); a count BELOW it means
+// someone ported a block and must shrink the budget in the same PR. A file
+// absent from the budget must have ZERO.
+const GITHUB_SCRIPT_BUDGET: &[(&str, usize)] = &[
+    (".github/workflows/dep-freshness-nightly.yml", 2),
+    (".github/workflows/safety.yml", 12),
+];
+
+/// Count real `uses: …github-script…` step lines. Comment lines are skipped so
+/// a `#`-prefixed explanation of a COMPLETED port never counts as a usage.
+fn count_github_script_uses(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|l| !is_comment_line(l))
+        .filter(|l| {
+            let t = l.trim_start().trim_start_matches("- ");
+            t.starts_with("uses:") && t.contains("github-script")
+        })
+        .count()
+}
+
+/// Count inline `script:` block scalars (`script: |`, `script: |-`, `script: >`).
+fn count_inline_script_blocks(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|l| !is_comment_line(l))
+        .filter(|l| {
+            let t = l.trim_start().trim_start_matches("- ");
+            t.starts_with("script:") && t.trim_end().ends_with(['|', '-', '>'])
+        })
+        .count()
+}
+
+/// Files whose count EXCEEDS budget (new usage) and files BELOW it (shrink me).
+/// Returns `(over, under)` as `(path, actual, budget)` triples.
+type BudgetDrift = (Vec<(String, usize, usize)>, Vec<(String, usize, usize)>);
+fn github_script_budget_drift(files: &[(String, usize)], budget: &[(&str, usize)]) -> BudgetDrift {
+    let (mut over, mut under) = (Vec::new(), Vec::new());
+    for (path, actual) in files {
+        let allowed = budget
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        if *actual > allowed {
+            over.push((path.clone(), *actual, allowed));
+        } else if *actual < allowed {
+            under.push((path.clone(), *actual, allowed));
+        }
+    }
+    (over, under)
 }
 
 /// Pure parse of `git ls-files -z` stdout: NUL-delimited bytes -> sorted
@@ -445,6 +604,116 @@ fn no_new_banned_invocations() {
     );
 }
 
+/// (e) NO Rust-side process spawn of a banned interpreter (SCOPE FIX #4).
+/// Narrow by design: only the string literal handed to `Command::new` /
+/// `.arg` is inspected, so doc-comment prose can never false-positive.
+/// Covers `build.rs`, which runs on EVERY build.
+#[test]
+fn no_rust_spawn_of_banned_interpreter() {
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    for path in git_ls_files(&["*.rs"]) {
+        // This guard names the tokens it bans; scanning itself would be
+        // self-referential. Its own spawns are `git` only (see `git_ls_files`).
+        if path.ends_with("crates/common/tests/rust_only_guard.rs") {
+            continue;
+        }
+        let content = std::fs::read_to_string(root.join(&path))
+            .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{path}`: {e}"));
+        for hit in rust_spawn_violations(&content) {
+            violations.push(format!("{path}: spawns `{hit}`"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "RUST-ONLY VIOLATION: Rust code spawns a banned interpreter: {violations:?}. \
+         The rust-only operator directive (2026-07-19) forbids it — port the logic to \
+         Rust instead of shelling out to another runtime."
+    );
+}
+
+/// (f) The inline-JavaScript shrinking ratchet (SCOPE FIX #5).
+/// `actions/github-script` runs an interpreted program inside a `.yml`, which
+/// neither the filename ban nor `banned_tokens()` can see. Budget may only
+/// shrink: a count over budget is a NEW usage; a count under it means a block
+/// was ported and the budget must be decremented in the SAME PR.
+#[test]
+fn github_script_usage_only_shrinks() {
+    assert_sorted_unique(
+        &GITHUB_SCRIPT_BUDGET
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<Vec<_>>(),
+        "GITHUB_SCRIPT_BUDGET",
+    );
+    let root = repo_root();
+    let mut counted: Vec<(String, usize)> = Vec::new();
+    for path in git_ls_files(&[".github/workflows/*.yml", ".github/workflows/*.yaml"]) {
+        let content = std::fs::read_to_string(root.join(&path))
+            .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{path}`: {e}"));
+        let uses = count_github_script_uses(&content);
+        let blocks = count_inline_script_blocks(&content);
+        // A `script:` block without its `uses:` line (or vice versa) is still
+        // interpreted-language surface — take the larger, never the smaller.
+        counted.push((path, uses.max(blocks)));
+    }
+    let (over, under) = github_script_budget_drift(&counted, GITHUB_SCRIPT_BUDGET);
+    assert!(
+        over.is_empty(),
+        "RUST-ONLY VIOLATION: new inline-JavaScript (`actions/github-script`) usage \
+         {over:?} (path, actual, budget). Inline `script:` blocks are an interpreted \
+         runtime the rust-only directive (2026-07-19) forbids adding to. Use the `gh` \
+         CLI in a `run:` step instead — see the ported steps in fuzz.yml / \
+         chaos-nightly.yml / full-test-nightly.yml. Do NOT raise GITHUB_SCRIPT_BUDGET."
+    );
+    assert!(
+        under.is_empty(),
+        "SHRINK THE RATCHET: these files now carry FEWER inline-JavaScript blocks than \
+         budgeted {under:?} (path, actual, budget). Whoever ported them must LOWER the \
+         entry in GITHUB_SCRIPT_BUDGET (crates/common/tests/rust_only_guard.rs) in the \
+         same PR — the budget only ever shrinks."
+    );
+}
+
+/// (g) The CI clippy gate stays ARMED (2026-08-11).
+///
+/// `ci.yml`'s clippy step ran WITHOUT `-D warnings` for months, justified by a
+/// comment about "~24 pre-existing lib warnings scheduled for a follow-up
+/// cleanup pass". That cleanup landed, but nobody re-armed the gate, so the
+/// lint job could not fail — a stale comment was the only thing holding a
+/// merge-blocking gate open. Measured before arming: `cargo clippy --workspace
+/// --no-deps -- -D warnings` exits 0.
+///
+/// HONEST SCOPE: this pins the FLAG, not the lint result — CI itself is what
+/// actually runs clippy. It also does NOT require `--all-targets`, which is
+/// deliberately still absent (test-target warnings are unmeasured).
+#[test]
+fn ci_clippy_gate_stays_armed() {
+    let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
+        .expect("rust_only_guard: cannot read .github/workflows/ci.yml");
+    let armed = ci
+        .lines()
+        .filter(|l| !is_comment_line(l))
+        .filter(|l| l.contains("cargo clippy") && l.contains("--workspace"))
+        .collect::<Vec<_>>();
+    assert!(
+        !armed.is_empty(),
+        "ci.yml no longer has a `cargo clippy --workspace` step — the lint gate \
+         vanished entirely. Restore it WITH `-D warnings`."
+    );
+    for step in &armed {
+        assert!(
+            step.contains("-D warnings"),
+            "CI LINT GATE DISARMED: the ci.yml clippy step `{}` dropped `-D warnings`, \
+             so clippy findings can no longer fail Build & Verify (a needed job of All \
+             Green). It was armed on 2026-08-11 after the pre-existing-warning cleanup \
+             landed and `cargo clippy --workspace --no-deps -- -D warnings` measured \
+             clean. Re-arm it, or land a dated operator note first.",
+            step.trim()
+        );
+    }
+}
+
 /// 2026-08-10. The rust-only lock claims a "HARD ZERO floor" for both allowlists.
 /// Until this test, that floor was enforced by REVIEWER DISCIPLINE ONLY: a PR could
 /// re-add a banned file together with its own allowlist entry and stay green, because
@@ -588,6 +857,71 @@ fn guard_self_test() {
         std::panic::catch_unwind(|| parse_nul_delimited_paths(b"\"mangled\\303\\244.sh\"\0"))
             .is_err(),
         "a C-quoted path must panic loudly, never be scanned"
+    );
+
+    // ---- SCOPE FIX #3: executable-manifest classes are in scope (2026-08-11).
+    assert!(is_invocation_scan_target(
+        "deploy/systemd/tickvault.service"
+    ));
+    assert!(is_invocation_scan_target(
+        "scripts/tv-tunnel/com.tickvault.tunnel.plist"
+    ));
+    assert!(is_invocation_scan_target(".run/Run tickvault.run.xml"));
+    assert!(is_invocation_scan_target(
+        "deploy/docker/alloy/alloy-config.alloy"
+    ));
+    // `.claude/settings.json` carries hook COMMAND lines and was previously
+    // unscanned — only the exact path `.mcp.json` matched.
+    assert!(is_invocation_scan_target(".claude/settings.json"));
+    assert!(is_invocation_scan_target(".mcp.json"));
+
+    // ---- SCOPE FIX #4: Rust spawn literals.
+    assert_eq!(
+        rust_spawn_violations(&format!("let c = Command::new(\"{t}3\");")),
+        vec![format!("{t}3")],
+        "self-test: a banned interpreter spawn must be detected"
+    );
+    assert_eq!(
+        rust_spawn_violations(&format!("cmd.arg(\"/usr/bin/{t}\");")),
+        vec![format!("/usr/bin/{t}")],
+        "self-test: an absolute-path spawn arg must be detected"
+    );
+    assert!(
+        rust_spawn_violations("Command::new(\"git\").arg(\"ls-files\");").is_empty(),
+        "self-test: benign spawns must not fire"
+    );
+    assert!(
+        rust_spawn_violations(&format!("/// We used to call {t} here, but no longer.\n"))
+            .is_empty(),
+        "self-test: doc-comment prose must never false-positive (narrow-scan design)"
+    );
+
+    // ---- SCOPE FIX #5: inline-JavaScript counting + budget drift.
+    let wf = "      - uses: actions/github-script@v7\n        with:\n          script: |\n            await x();\n";
+    assert_eq!(count_github_script_uses(wf), 1);
+    assert_eq!(count_inline_script_blocks(wf), 1);
+    assert_eq!(
+        count_github_script_uses("      # Ported off actions/github-script — uses: gone\n"),
+        0,
+        "self-test: a comment describing a COMPLETED port must not count as a usage"
+    );
+    let (over, under) = github_script_budget_drift(
+        &[
+            ("a.yml".to_string(), 3),
+            ("b.yml".to_string(), 1),
+            ("c.yml".to_string(), 1),
+        ],
+        &[("a.yml", 2), ("b.yml", 2)],
+    );
+    assert_eq!(
+        over,
+        vec![("a.yml".to_string(), 3, 2), ("c.yml".to_string(), 1, 0)],
+        "self-test: over-budget AND unbudgeted files must be flagged as new usage"
+    );
+    assert_eq!(
+        under,
+        vec![("b.yml".to_string(), 1, 2)],
+        "self-test: a ported block must force the budget to shrink"
     );
 
     // New-site + stale-site detection over synthetic files.

@@ -91,8 +91,13 @@ fn main_rs_spawns_fold_gated_after_seal_writer_install() {
         .max()
         .expect("non-empty call_sites has a max");
 
+    // The `if` — the GATE itself, not any mention of the flag. Since
+    // 2026-08-11 the live-feed lane also reads this flag (it refuses to run
+    // while the fold is writing the same Dhan candles), and that read sits
+    // earlier in main.rs; a bare-flag needle found it and made the
+    // same-block distance check compare a gate against an unrelated line.
     let gate_idx = main_rs
-        .find("config.rest_candle_fold.enabled")
+        .find("if config.rest_candle_fold.enabled {")
         .expect("main.rs must gate the fold spawn on [rest_candle_fold] enabled");
     let sender_install_idx = main_rs
         .find("rest_candle_fold::set_global_fold_bar_sender(")

@@ -78,8 +78,16 @@ fn main_rs_installs_ram_stores_before_the_fold_spawn_gate() {
     let stats_idx = main_rs
         .find("market_ram_store_boot::spawn_ram_store_stats_task(")
         .expect("main.rs must spawn the stats/heartbeat task");
+    // Anchored on the `if` — the GATE — not on a bare mention of the flag.
+    //
+    // 2026-08-11: the loose needle broke when the live-feed lane started
+    // reading the same flag (to refuse running while the fold also writes
+    // Dhan candles). That read sits earlier in main.rs, so `find` returned
+    // it instead of the spawn gate and this assertion compared the wrong two
+    // positions. The flag now legitimately appears more than once; the gate
+    // does not.
     let fold_gate_idx = main_rs
-        .find("config.rest_candle_fold.enabled")
+        .find("if config.rest_candle_fold.enabled {")
         .expect("main.rs must still gate the fold spawn");
 
     assert!(

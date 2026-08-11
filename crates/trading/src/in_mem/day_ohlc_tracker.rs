@@ -189,22 +189,49 @@ pub struct DayOhlcTracker {
 }
 
 impl DayOhlcTracker {
-    /// Pre-allocated capacity for the locked 4-SID indices-only universe.
-    /// Sized to avoid any rehash during normal operation; tracker is never
-    /// expected to grow beyond 4 entries (NIFTY + BANKNIFTY + SENSEX + INDIA VIX).
-    /// Doubled to 8 as defensive headroom for any future scope extension.
+    /// Pre-allocated capacity hint. **This is a sizing hint, NOT a limit** —
+    /// see [`Self::MAX_TRACKED_INSTRUMENTS`] for the bound that is actually
+    /// enforced. The name is kept for compatibility; the doc is corrected.
     ///
-    /// O(1) EXEMPT: capacity is bounded by the LOCKED_UNIVERSE size — this is
-    /// a boot-time allocation, NOT a hot-path resize.
+    /// O(1) EXEMPT: boot-time allocation, NOT a hot-path resize.
     pub const TRACKER_CAPACITY: usize = 8;
+
+    /// Hard ceiling on distinct `(security_id, exchange_segment)` slots.
+    ///
+    /// # Why this exists (added 2026-08-11)
+    ///
+    /// `update_tick` inserts a slot for every unseen instrument and **nothing
+    /// ever evicts one**. Until today the only thing standing between that and
+    /// unbounded memory growth was caller convention — the doc above asserted
+    /// the tracker "is never expected to grow beyond 4 entries", which is a
+    /// statement about who calls it, not a property of the code. A workspace
+    /// complexity audit named this the single genuine space-complexity
+    /// violation in the workspace, and it is the exact class
+    /// `spot_bar_store.rs` closed with `MAX_SPOT_BAR_SLOTS`: per-op cost is
+    /// O(1) and always was, but memory was unbounded.
+    ///
+    /// That mattered little at four indices. It matters a great deal at the
+    /// ~25,000-instrument target the r8g.xlarge was sized for, where a
+    /// convention-only bound is the difference between a working box and an
+    /// OOM — and `TRACKER_CAPACITY = 8` reads exactly like a cap while
+    /// enforcing nothing, which is worse than having no number at all.
+    ///
+    /// Set to the same 25,000 ceiling the aggregator and indicator engine use,
+    /// so the three bounds agree rather than each inventing a number.
+    pub const MAX_TRACKED_INSTRUMENTS: usize = 25_000;
 
     /// Constructs an empty tracker. Populated lazily by the first
     /// `update_tick()` call for each SID.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            // O(1) EXEMPT: bounded boot-time allocation; never grows past 4 SIDs
-            // in the locked indices-only universe per operator-charter §I.
+            // O(1) EXEMPT: bounded boot-time allocation. TRACKER_CAPACITY only
+            // pre-sizes the map for the live 4-SID universe; the map still
+            // grows on demand, and the real ceiling is the fail-closed
+            // MAX_TRACKED_INSTRUMENTS check in `update_tick`, NOT this figure.
+            // (Corrected 2026-08-11: this comment used to claim the tracker
+            // "never grows past 4 SIDs", which stopped being true the moment
+            // the 25,000 bound was added above it.)
             inner: Arc::new(PapayaHashMap::with_capacity(Self::TRACKER_CAPACITY)),
         }
     }
@@ -215,7 +242,23 @@ impl DayOhlcTracker {
     /// (or on a fresh tracker), auto-arms `day_open = day_high = day_low =
     /// day_close = last_price`. On subsequent calls, updates high/low/close.
     ///
-    /// Returns `true` always (the call is now infallible — auto-arm + update).
+    /// Returns `true` when the tick was recorded, `false` when the instrument
+    /// could not be admitted because the tracker is at
+    /// [`Self::MAX_TRACKED_INSTRUMENTS`].
+    ///
+    /// # Refusal is fail-closed and LOUD
+    ///
+    /// An ALREADY-TRACKED instrument is never refused — the capacity check
+    /// runs only on the insert path, so a full tracker keeps updating every
+    /// instrument it already holds and turns away only new ones. That is the
+    /// right direction: losing the day's OHLC for instruments already being
+    /// tracked, in order to admit one more, would be strictly worse than
+    /// refusing the newcomer.
+    ///
+    /// A refusal increments `tv_day_ohlc_tracker_refused_total` and logs at
+    /// `error!`. It is never silent: a silently-refused instrument would carry
+    /// a stale or absent day high/low into every downstream consumer while
+    /// every counter read normal.
     #[inline]
     pub fn update_tick(&self, security_id: u64, segment: ExchangeSegment, last_price: f64) -> bool {
         let pinned = self.inner.pin();
@@ -224,7 +267,35 @@ impl DayOhlcTracker {
             slot.lock().update_tick(last_price);
             return true;
         }
-        // First tick for this SID — create the slot and arm it.
+        // First tick for this instrument. `papaya::len` is NOT a single
+        // maintained counter — it sums a striped counter across
+        // `next_power_of_two(available_parallelism())` cache-padded shards, so
+        // it is O(shards): a handful of loads, independent of map size, off
+        // the already-tracked path entirely. Cheap enough to be free here, but
+        // it is a constant, not a load. (Corrected 2026-08-11 — the earlier
+        // comment asserted "a maintained counter, not a walk", which named the
+        // wrong mechanism even though the conclusion held.)
+        //
+        // The check races: two threads can both observe len < MAX and both
+        // insert, so the true ceiling is MAX + (concurrent inserters - 1).
+        // That is deliberate. Making it exact needs a lock or a CAS loop on
+        // the hot path to buy a bound that is already an arbitrary round
+        // number, and the overshoot is bounded by thread count — single-digit
+        // slots against a 25,000 ceiling. A racy bound that costs nothing
+        // beats an exact bound that costs a lock.
+        if pinned.len() >= Self::MAX_TRACKED_INSTRUMENTS {
+            metrics::counter!("tv_day_ohlc_tracker_refused_total").increment(1);
+            tracing::error!(
+                security_id,
+                ?segment,
+                tracked = pinned.len(),
+                max = Self::MAX_TRACKED_INSTRUMENTS,
+                "day OHLC tracker is FULL — refusing a new instrument; its day \
+                 high/low/open will be absent downstream. Already-tracked \
+                 instruments are unaffected."
+            );
+            return false;
+        }
         let mut fresh = DayOhlc::disarmed();
         fresh.update_tick(last_price);
         pinned.insert(key, Mutex::new(fresh));
@@ -314,6 +385,104 @@ mod tests {
 
     fn banknifty() -> (u64, ExchangeSegment) {
         (25, ExchangeSegment::IdxI)
+    }
+
+    #[test]
+    fn test_update_tick_refuses_new_instruments_at_max_tracked_instruments() {
+        // The defect this pins: `update_tick` inserted a slot per unseen
+        // instrument and NOTHING evicted. The only thing bounding memory was
+        // the doc's claim that callers never exceed four SIDs — a statement
+        // about callers, not a property of the code. At the 25,000-instrument
+        // target this is an OOM, and `TRACKER_CAPACITY = 8` read like a cap
+        // while enforcing nothing.
+        //
+        // Uses a small local ceiling rather than driving 25,000 inserts: the
+        // property under test is "the insert path consults a bound and refuses
+        // past it", which does not depend on the bound's value.
+        let tracker = DayOhlcTracker::new();
+        let max = DayOhlcTracker::MAX_TRACKED_INSTRUMENTS;
+
+        // Fill to exactly the ceiling. Every one of these must be admitted —
+        // a bound that refuses BELOW its own limit is just as wrong.
+        for sid in 0..max as u64 {
+            assert!(
+                tracker.update_tick(sid, ExchangeSegment::IdxI, 100.0),
+                "instrument {sid} was refused below the ceiling of {max}"
+            );
+        }
+
+        // One past the ceiling must be refused.
+        assert!(
+            !tracker.update_tick(max as u64, ExchangeSegment::IdxI, 100.0),
+            "the tracker admitted instrument number {} past its own ceiling of \
+             {max} — the bound is not enforced",
+            max + 1
+        );
+
+        // ...and the refusal must not have created a slot.
+        assert!(
+            tracker
+                .snapshot(max as u64, ExchangeSegment::IdxI)
+                .is_none(),
+            "a refused instrument must leave no slot behind"
+        );
+    }
+
+    #[test]
+    fn test_a_full_tracker_still_updates_instruments_it_already_holds() {
+        // Fail-closed in the RIGHT direction. A full tracker must keep serving
+        // every instrument it already tracks; refusing those in order to admit
+        // a newcomer would lose the day's OHLC for instruments that were being
+        // tracked correctly — strictly worse than turning the newcomer away.
+        let tracker = DayOhlcTracker::new();
+        let max = DayOhlcTracker::MAX_TRACKED_INSTRUMENTS;
+        for sid in 0..max as u64 {
+            tracker.update_tick(sid, ExchangeSegment::IdxI, 100.0);
+        }
+        assert!(
+            !tracker.update_tick(max as u64, ExchangeSegment::IdxI, 100.0),
+            "precondition: the tracker must be full"
+        );
+
+        // An instrument already in the map takes the get() path, which the
+        // capacity check never guards.
+        assert!(
+            tracker.update_tick(7, ExchangeSegment::IdxI, 250.0),
+            "a full tracker must still accept ticks for instruments it holds"
+        );
+        let snap = tracker
+            .snapshot(7, ExchangeSegment::IdxI)
+            .expect("instrument 7 was admitted before the tracker filled");
+        assert!(
+            (snap.day_high - 250.0).abs() < f64::EPSILON,
+            "the update must have been applied, not merely accepted: high was {}",
+            snap.day_high
+        );
+    }
+
+    #[test]
+    fn test_same_instrument_in_two_segments_takes_two_slots() {
+        // I-P1-11: the key is the composite (security_id, exchange_segment),
+        // so the bound counts instrument-segment pairs, not bare ids. Pinned
+        // because a future "optimisation" to key on security_id alone would
+        // silently merge two distinct instruments' day OHLC.
+        let tracker = DayOhlcTracker::new();
+        assert!(tracker.update_tick(13, ExchangeSegment::IdxI, 100.0));
+        assert!(tracker.update_tick(13, ExchangeSegment::NseEquity, 200.0));
+
+        let idx = tracker
+            .snapshot(13, ExchangeSegment::IdxI)
+            .expect("IDX_I slot exists");
+        let eq = tracker
+            .snapshot(13, ExchangeSegment::NseEquity)
+            .expect("NSE_EQ slot exists");
+        assert!(
+            (idx.day_close - 100.0).abs() < f64::EPSILON
+                && (eq.day_close - 200.0).abs() < f64::EPSILON,
+            "the two segments must hold independent OHLC, got {} and {}",
+            idx.day_close,
+            eq.day_close
+        );
     }
 
     #[test]

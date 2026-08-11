@@ -236,10 +236,32 @@ elif [ "$STATE" = "None" ] || [ -z "$STATE" ]; then
               "Name=instance-state-name,Values=running,stopped,stopping,starting" \
     --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "")
   if [ -n "$LIVE_ID" ] && [ "$LIVE_ID" != "None" ]; then
+    # ACTUALLY ADOPT THE LIVE ID (2026-08-11).
+    #
+    # Until today this branch resolved `LIVE_ID`, reported it, and then threw
+    # it away — `INSTANCE_ID` kept the dead value and `STATE` stayed "None", so
+    # the `if [ "$STATE" = "running" ]` gate below skipped EVERY remaining
+    # check: EIP, SSM ping, app health, QuestDB, disk, feed. Autopilot became
+    # blind on precisely the day it was most needed, while its Telegram text
+    # told the operator it "healed itself by using the live id, so this run is
+    # valid". That sentence was false — nothing downstream used the id. A
+    # monitor that reports one problem while silently skipping eight checks is
+    # worse than one that fails loudly (audit Rule 11, no false-OK).
+    #
+    # Adopting the id makes the claim true: the rest of this script now runs
+    # against the real box. The secret is still stale and that is still
+    # reported — but as a DEPLOY-lane problem, which is what it is.
+    INSTANCE_ID="$LIVE_ID"
+    STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+      --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo None)
+    note_heal "adopted the live instance id ${LIVE_ID} for this run — every check below \
+ran against the real box, not the dead id in the secret"
     note_issue "EC2_INSTANCE_ID secret is STALE — it names an instance that no longer exists. \
 The live tv-${ENVIRONMENT}-app instance is ${LIVE_ID}. Rotate the GitHub secret EC2_INSTANCE_ID \
 to ${LIVE_ID} (Settings > Secrets and variables > Actions). Until then deploy-aws.yml cannot \
 reach the box and prod keeps running its launch-time binary."
+    # Fall through to the running-box checks below with the healed id. If the
+    # live box is stopped, `STATE` now says so honestly instead of "None".
   else
     note_issue "EC2 instance state=$STATE — the id in EC2_INSTANCE_ID does not exist, and no \
 tv-${ENVIRONMENT}-app instance was found to suggest as its replacement. Check the region and \

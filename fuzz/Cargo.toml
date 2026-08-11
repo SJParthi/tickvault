@@ -29,3 +29,19 @@ doc = false
 name = "ws_frame_wal_replay"
 path = "fuzz_targets/ws_frame_wal_replay.rs"
 doc = false
+
+# Depth-20 / depth-200 packets. NOT covered by `tick_parser`: the depth feeds
+# use a 12-byte header with f64 prices and are unreachable from
+# `dispatch_frame` (see crates/core/src/parser/mod.rs).
+[[bin]]
+name = "dhan_depth_packet"
+path = "fuzz_targets/dhan_depth_packet.rs"
+doc = false
+
+# TrueData frame decoder (binary + JSON). Closes the zero-fuzz gap on the
+# ~7,062-LoC truedata* parser tree; see
+# .claude/rules/project/truedata-feed-scope-2026-07-24.md §11.7.
+[[bin]]
+name = "truedata_frame_decoder"
+path = "fuzz_targets/truedata_frame_decoder.rs"
+doc = false

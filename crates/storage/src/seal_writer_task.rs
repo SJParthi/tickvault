@@ -45,12 +45,17 @@
 //! hot-path zero-alloc rule applies to `MultiTfAggregator::consume_tick`
 //! and below, NOT to the storage drain task.
 
-use tracing::error;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+
+use tracing::{error, info, warn};
 
 use tickvault_common::error_code::ErrorCode;
 use tickvault_trading::candles::BufferedSeal;
 
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
+use crate::seal_dlq::SealDlqRecord;
+use crate::seal_spill::{SEAL_SPILL_RECORD_SIZE, SerializedSeal};
 use crate::shadow_candle_writer::ShadowCandleWriter;
 
 /// Outcome counters for one [`drain_once`] cycle. Maps 1:1 to the
@@ -223,6 +228,457 @@ fn rescue_one(
         // bug and surface for triage; for now we count nothing.
         SubmitOutcome::Buffered => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// Boot-time recovery drain (2026-08-11 — closes the silent-loss gap)
+// ---------------------------------------------------------------------------
+//
+// ## The gap this closes
+//
+// `drain_once` above rescues sealed candles to `SealSpillWriter` /
+// `SealDlqWriter` whenever the ILP flush fails. Both writers have always
+// carried a `read_all` + `clear_*_for_date` pair, and both doc-comments say
+// "the caller (writer task) deletes the spill file after `read_all` is fully
+// replayed". **That caller never existed.** Verified 2026-08-11: every
+// `read_all` call site in `crates/*/src` sits inside its own file's
+// `#[cfg(test)] mod tests` block, and no crate outside `storage` references
+// the spill/DLQ types at all. So every candle rescued during a QuestDB outage
+// landed in a file that nothing ever read back — permanent, silent loss, while
+// `tv_seal_writer_drain_total{kind="rescued_spill"}` reported it ABSORBED.
+//
+// ## The recovery contract (two-phase, mirrors `ws_frame_spill`)
+//
+// Lifted verbatim in shape from the WAL replay staging pattern
+// (`ws_frame_spill.rs` — the `replaying/` → confirm → `archive/` chain):
+//
+// 1. **Stage.** Every `seals-*` file in the spill / DLQ dir is MOVED into
+//    `<dir>/replaying/`. Leftovers already sitting in `replaying/` from a
+//    prior crashed boot are re-globbed too, so a crash mid-recovery loses
+//    nothing.
+// 2. **Re-ingest.** Records are decoded and appended straight into the ILP
+//    writer, flushed in bounded batches.
+// 3. **Confirm.** ONLY after a successful flush does the file move
+//    `replaying/` → `archive/`. `archive/` is never re-globbed, so confirmed
+//    history never re-injects.
+// 4. **Fail-closed.** A failed flush leaves the file in `replaying/` and
+//    STOPS the drain (QuestDB is down; the next file would just burn another
+//    bounded flush timeout). Next boot re-globs it.
+//
+// ## Why this is idempotent
+//
+// Two independent layers, because either one alone is insufficient:
+//
+// - **File side:** a file is in exactly ONE of `replaying/` (not yet
+//   confirmed) or `archive/` (confirmed). The rename is the commit point, so
+//   a crash anywhere re-reads at most the one in-flight file — never a file
+//   already archived. Recovered seals are deliberately NOT re-submitted into
+//   the absorption pipeline: doing so would let a still-dead QuestDB rescue
+//   them into a FRESH spill file while the staged copy also survives,
+//   multiplying the on-disk set on every failed boot.
+// - **DB side:** the candle tables' DEDUP UPSERT KEYS
+//   `(ts, security_id, segment, feed)` collapse a re-ingest of the same seal,
+//   which covers the residual window where a flush commits server-side but
+//   the process dies before the archive rename.
+//
+// ## Honesty (Rule 11 — no false-OK)
+//
+// `seals_left_pending` is reported to the caller and surfaced as a counter +
+// an `error!`. Seals sitting in `replaying/` are on DISK and NOT in QuestDB;
+// this module never reports them as absorbed.
+
+/// Staging directory for files that have been read back but whose re-ingest
+/// is not yet confirmed. Re-globbed on every boot until confirmed.
+pub const SEAL_REPLAYING_SUBDIR: &str = "replaying";
+
+/// Confirmed-history directory. NEVER re-globbed, so an archived file can
+/// never re-inject.
+pub const SEAL_ARCHIVE_SUBDIR: &str = "archive";
+
+/// Filename prefix shared by both the spill (`.bin`) and DLQ (`.ndjson`)
+/// daily files (`seals-YYYY-MM-DD.*`).
+const SEAL_FILE_PREFIX: &str = "seals-";
+
+/// Outcome of one [`drain_recovered_seals`] pass. Every field maps to a
+/// `tv_seal_writer_drain_total{kind=...}` label emitted by the writer loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootDrainOutcome {
+    /// Files moved into (or already sitting in) `replaying/` this pass.
+    pub files_staged: usize,
+    /// Records successfully decoded off disk.
+    pub seals_recovered: usize,
+    /// Recovered seals that a successful flush committed to QuestDB.
+    pub seals_reingested: usize,
+    /// Files confirmed and moved to `archive/`.
+    pub files_archived: usize,
+    /// Files still in `replaying/` (flush failed or never attempted).
+    pub files_left_pending: usize,
+    /// Seals still on disk and NOT in QuestDB. The honest loss-risk number.
+    pub seals_left_pending: usize,
+    /// Records that could not be decoded (corrupt tail / legacy format /
+    /// unknown timeframe ordinal). Their bytes survive in `archive/`.
+    pub records_undecodable: usize,
+}
+
+impl BootDrainOutcome {
+    /// `true` if nothing was found on disk (the healthy fresh-boot path).
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.files_staged == 0
+    }
+}
+
+/// Which on-disk format a staged file carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedKind {
+    /// Fixed 128-byte binary records (`SealSpillWriter`).
+    Spill,
+    /// NDJSON lines (`SealDlqWriter`).
+    Dlq,
+}
+
+/// Moves every `seals-*` file in `dir` into `dir/replaying/` and returns the
+/// full staged set (including leftovers from a prior crashed boot).
+///
+/// A file that cannot be moved is skipped with a `warn!` and left in place —
+/// it is retried on the next boot. Never deletes, never loses.
+fn stage_pending_files(dir: &Path) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let replaying = dir.join(SEAL_REPLAYING_SUBDIR);
+    if let Err(err) = std::fs::create_dir_all(&replaying) {
+        warn!(?replaying, ?err, "cannot create seal replay staging dir");
+        return Vec::new();
+    }
+
+    // Move live files into staging. `rename` within one directory tree is
+    // atomic, so a crash leaves the file in exactly one of the two places.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_seal_file(&path) {
+                continue;
+            }
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let target = replaying.join(name);
+            if target.exists() {
+                // A same-named leftover is already staged (prior crashed
+                // boot). Keep BOTH: park the live one under a free name
+                // rather than clobbering un-recovered records.
+                let target = free_path(&replaying, name);
+                if let Err(err) = std::fs::rename(&path, &target) {
+                    warn!(?path, ?err, "cannot stage seal file — retried next boot");
+                }
+                continue;
+            }
+            if let Err(err) = std::fs::rename(&path, &target) {
+                warn!(?path, ?err, "cannot stage seal file — retried next boot");
+            }
+        }
+    }
+
+    // Re-glob the staging dir: this pass's moves PLUS any unconfirmed
+    // leftovers. Sorted so recovery is deterministic (oldest date first).
+    let mut staged: Vec<PathBuf> = std::fs::read_dir(&replaying)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| is_seal_file(p))
+        .collect();
+    staged.sort();
+    staged
+}
+
+/// `true` for a regular file named `seals-*.bin` or `seals-*.ndjson`.
+fn is_seal_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.starts_with(SEAL_FILE_PREFIX) && staged_kind(path).is_some()
+}
+
+/// Classifies a staged file by extension. Collision-suffixed names
+/// (`seals-2026-08-11.bin.1`) keep their kind via the embedded extension.
+fn staged_kind(path: &Path) -> Option<StagedKind> {
+    let name = path.file_name().and_then(|n| n.to_str())?;
+    // Split off any `.N` collision suffix before classifying.
+    let base = name.rsplit_once('.').map_or(name, |(head, tail)| {
+        if tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
+            head
+        } else {
+            name
+        }
+    });
+    if base.ends_with(".bin") {
+        Some(StagedKind::Spill)
+    } else if base.ends_with(".ndjson") {
+        Some(StagedKind::Dlq)
+    } else {
+        None
+    }
+}
+
+/// Returns `dir/name`, appending `.1`, `.2`, … until the path is free.
+/// Bounded so a pathological directory cannot spin forever.
+fn free_path(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let base = dir.join(name);
+    if !base.exists() {
+        return base;
+    }
+    let stem = name.to_string_lossy().into_owned();
+    for suffix in 1..10_000u32 {
+        let candidate = dir.join(format!("{stem}.{suffix}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{stem}.overflow"))
+}
+
+/// Decodes every fixed-size record in a staged spill file.
+/// Returns `(records, undecodable_count)`.
+fn read_staged_spill(path: &Path) -> (Vec<SerializedSeal>, usize) {
+    let Ok(file) = std::fs::File::open(path) else {
+        warn!(?path, "cannot open staged spill file");
+        return (Vec::new(), 0);
+    };
+    let mut reader = BufReader::new(file);
+    let mut out = Vec::new();
+    let mut undecodable = 0usize;
+    let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
+    // The loop ends on the first read error, which is either a clean EOF or a
+    // truncated trailing record (a torn write at the moment of the crash).
+    // Either way nothing further in the file is readable.
+    while reader.read_exact(&mut buf).is_ok() {
+        // Same format-version gate as `SealSpillWriter::read_all`: a byte-7 of
+        // 0 is a pre-renumber record whose tf ordinal lives in the OLD
+        // 12-frame space and would silently mis-decode.
+        if buf[7] == 0 {
+            undecodable += 1;
+            continue;
+        }
+        match SerializedSeal::from_bytes(&buf) {
+            Some(seal) => out.push(seal),
+            None => undecodable += 1,
+        }
+    }
+    (out, undecodable)
+}
+
+/// Decodes every NDJSON line in a staged DLQ file.
+/// Returns `(records, undecodable_count)`.
+fn read_staged_dlq(path: &Path) -> (Vec<SerializedSeal>, usize) {
+    let Ok(file) = std::fs::File::open(path) else {
+        warn!(?path, "cannot open staged dlq file");
+        return (Vec::new(), 0);
+    };
+    let mut out = Vec::new();
+    let mut undecodable = 0usize;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            undecodable += 1;
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<SealDlqRecord>(&line) {
+            Ok(record) => out.push(SerializedSeal::from(&record)),
+            Err(_) => undecodable += 1,
+        }
+    }
+    (out, undecodable)
+}
+
+/// Moves a confirmed file from `replaying/` to `archive/`.
+fn archive_staged(path: &Path) -> std::io::Result<()> {
+    let Some(replaying_dir) = path.parent() else {
+        return Ok(());
+    };
+    let Some(root) = replaying_dir.parent() else {
+        return Ok(());
+    };
+    let archive = root.join(SEAL_ARCHIVE_SUBDIR);
+    std::fs::create_dir_all(&archive)?;
+    let Some(name) = path.file_name() else {
+        return Ok(());
+    };
+    std::fs::rename(path, free_path(&archive, name))
+}
+
+/// The narrow slice of [`ShadowCandleWriter`] the recovery drain needs.
+///
+/// Exists so the recovery path is testable end-to-end WITHOUT a live
+/// QuestDB: `ShadowCandleWriter::for_test()` is permanently disconnected, so
+/// its `flush()` can only ever fail, which would leave the success path — the
+/// half that actually proves seals are re-ingested and files archived —
+/// untestable and therefore unproven.
+///
+/// Cold path, static dispatch (`impl Trait`), no `dyn`, no allocation.
+pub trait SealSink {
+    /// Append one seal to the wire buffer.
+    fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()>;
+    /// Flush the wire buffer to the database.
+    fn flush(&mut self) -> anyhow::Result<()>;
+    /// Discard the retained buffer after a failed flush (poison recovery).
+    fn discard_pending(&mut self);
+}
+
+impl SealSink for ShadowCandleWriter {
+    fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+        Self::append_seal(self, seal)
+    }
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Self::flush(self)
+    }
+    fn discard_pending(&mut self) {
+        Self::discard_pending(self);
+    }
+}
+
+/// Boot-time recovery: reads every orphaned spill / DLQ file back and
+/// re-ingests it into QuestDB through `writer`.
+///
+/// Cold path — runs ONCE at writer-loop startup, before the drain ticker.
+/// Allowed to allocate.
+///
+/// Stops at the first flush failure (QuestDB is down; the remaining files
+/// stay staged for the next boot) and reports exactly how many seals are
+/// still on disk rather than in the database.
+pub fn drain_recovered_seals<S: SealSink>(
+    writer: &mut S,
+    spill_dir: &Path,
+    dlq_dir: &Path,
+    max_batch: usize,
+) -> BootDrainOutcome {
+    let mut outcome = BootDrainOutcome::default();
+    let batch = max_batch.max(1);
+
+    let mut staged = stage_pending_files(spill_dir);
+    if dlq_dir != spill_dir {
+        staged.extend(stage_pending_files(dlq_dir));
+    }
+    outcome.files_staged = staged.len();
+    if staged.is_empty() {
+        return outcome;
+    }
+
+    info!(
+        files = staged.len(),
+        "seal recovery: replaying orphaned spill/DLQ files from disk"
+    );
+
+    let mut halted = false;
+    for path in &staged {
+        if halted {
+            // QuestDB is down — count the untouched remainder honestly
+            // instead of burning a bounded flush timeout per file.
+            outcome.files_left_pending += 1;
+            continue;
+        }
+        let (records, undecodable) = match staged_kind(path) {
+            Some(StagedKind::Spill) => read_staged_spill(path),
+            Some(StagedKind::Dlq) => read_staged_dlq(path),
+            None => (Vec::new(), 0),
+        };
+        outcome.records_undecodable += undecodable;
+        outcome.seals_recovered += records.len();
+        if undecodable > 0 {
+            warn!(
+                ?path,
+                undecodable,
+                "seal recovery: records could not be decoded — bytes retained in archive/"
+            );
+        }
+
+        let mut committed = 0usize;
+        let mut file_ok = true;
+        for chunk in records.chunks(batch) {
+            let mut appended = 0usize;
+            for record in chunk {
+                let Some(seal) = record.try_into_buffered_seal() else {
+                    // Forward-compat guard: unknown tf ordinal.
+                    outcome.records_undecodable += 1;
+                    outcome.seals_recovered = outcome.seals_recovered.saturating_sub(1);
+                    continue;
+                };
+                if let Err(append_err) = writer.append_seal(&seal) {
+                    error!(
+                        code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                        ?append_err,
+                        security_id = seal.security_id,
+                        "seal recovery: append failed for a recovered seal"
+                    );
+                    continue;
+                }
+                appended += 1;
+            }
+            if appended == 0 {
+                continue;
+            }
+            match writer.flush() {
+                Ok(()) => committed += appended,
+                Err(flush_err) => {
+                    error!(
+                        code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                        ?flush_err,
+                        ?path,
+                        pending = records.len().saturating_sub(committed),
+                        "seal recovery: flush failed — file stays staged for the next boot"
+                    );
+                    // Poison-buffer recovery, same reasoning as `drain_once`.
+                    writer.discard_pending();
+                    file_ok = false;
+                    break;
+                }
+            }
+        }
+
+        outcome.seals_reingested += committed;
+
+        if file_ok {
+            match archive_staged(path) {
+                Ok(()) => outcome.files_archived += 1,
+                Err(err) => {
+                    // Re-ingest succeeded but the rename did not. The file
+                    // stays staged; the next boot re-reads it and QuestDB's
+                    // DEDUP keys collapse the duplicate rows.
+                    warn!(?path, ?err, "seal recovery: archive rename failed");
+                    outcome.files_left_pending += 1;
+                }
+            }
+        } else {
+            outcome.files_left_pending += 1;
+            outcome.seals_left_pending += records.len().saturating_sub(committed);
+            halted = true;
+        }
+    }
+
+    if outcome.files_left_pending > 0 {
+        error!(
+            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+            files_pending = outcome.files_left_pending,
+            seals_pending = outcome.seals_left_pending,
+            seals_reingested = outcome.seals_reingested,
+            "seal recovery INCOMPLETE — sealed candles are on DISK and NOT in QuestDB"
+        );
+    } else {
+        info!(
+            files_archived = outcome.files_archived,
+            seals_reingested = outcome.seals_reingested,
+            records_undecodable = outcome.records_undecodable,
+            "seal recovery complete — every recovered seal re-ingested"
+        );
+    }
+
+    outcome
 }
 
 // ---------------------------------------------------------------------------

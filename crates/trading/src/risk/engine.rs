@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::types::ExchangeSegment;
 use tracing::{error, info, instrument, warn};
 
 use super::types::{PositionInfo, RiskBreach, RiskCheck};
@@ -21,6 +22,31 @@ use super::types::{PositionInfo, RiskBreach, RiskCheck};
 
 /// Initial capacity for the positions HashMap.
 const POSITIONS_INITIAL_CAPACITY: usize = 512;
+
+/// Composite position key per I-P1-11 — `security_id` ALONE IS NOT UNIQUE.
+///
+/// Dhan reuses one numeric `security_id` across segments (the live 2026-04-17
+/// FINNIFTY `id=27` IDX_I / NSE_EQ collision), and Groww's CASH and FNO
+/// `exchange_token` spaces overlap numerically. Keying position or mark-price
+/// state on the bare id lets two DIFFERENT instruments share one row, which
+/// nets their lots and cross-prices their P&L.
+///
+/// See `.claude/rules/project/security-id-uniqueness.md`.
+type PositionKey = (u64, ExchangeSegment);
+
+/// Segment assumed by the LEGACY, segment-less method overloads.
+///
+/// # This constant is a MIGRATION SHIM, not a fix
+///
+/// Every caller that reaches the engine through a segment-less method lands
+/// in this ONE bucket, so those callers get exactly the pre-refactor
+/// (colliding) behaviour. The collision is only actually eliminated for
+/// callers that pass a real `ExchangeSegment` via the `*_in_segment` methods.
+///
+/// `IdxI` is chosen because it is the segment of the current live universe
+/// (`LOCKED_UNIVERSE` is 4 `IDX_I` SIDs), so the shim is behaviour-preserving
+/// for today's runtime rather than silently re-bucketing it.
+const LEGACY_DEFAULT_SEGMENT: ExchangeSegment = ExchangeSegment::IdxI;
 
 // ---------------------------------------------------------------------------
 // RiskEngine
@@ -39,10 +65,13 @@ pub struct RiskEngine {
     max_position_lots: u32,
     /// Trading capital for daily loss calculation (in rupees).
     capital: f64,
-    /// Per-instrument positions keyed by security_id.
-    positions: HashMap<u64, PositionInfo>,
-    /// Latest market prices keyed by security_id (for unrealized P&L).
-    market_prices: HashMap<u64, f64>,
+    /// Per-instrument positions keyed by the COMPOSITE `(security_id,
+    /// exchange_segment)` per I-P1-11 — never by `security_id` alone.
+    positions: HashMap<PositionKey, PositionInfo>,
+    /// Latest market prices keyed by the same composite key (for unrealized
+    /// P&L). Keying marks on the bare id priced one leg with another leg's
+    /// market price and fabricated the P&L the daily-loss halt reads.
+    market_prices: HashMap<PositionKey, f64>,
     /// Sum of all realized P&L from closed trades today.
     total_realized_pnl: f64,
     /// Whether trading is halted due to a risk breach.
@@ -100,14 +129,36 @@ impl RiskEngine {
 
     /// Pre-trade risk check. Returns `Approved` or `Rejected` with reason.
     ///
+    /// LEGACY segment-less overload — assumes [`LEGACY_DEFAULT_SEGMENT`].
+    ///
+    /// # I-P1-11 warning
+    /// Two instruments sharing a numeric `security_id` in DIFFERENT segments
+    /// collapse into one position row on this path, so their lots NET and the
+    /// limit check can approve an order that actually breaches
+    /// `max_position_lots`. Prefer [`Self::check_order_in_segment`].
+    ///
+    /// # Performance
+    /// O(1) — HashMap lookup + arithmetic comparison.
+    pub fn check_order(&mut self, security_id: u64, order_lots: i32) -> RiskCheck {
+        self.check_order_in_segment(security_id, LEGACY_DEFAULT_SEGMENT, order_lots)
+    }
+
+    /// Pre-trade risk check, disambiguated by `(security_id, segment)`.
+    ///
     /// # Arguments
     /// * `security_id` — instrument to trade
+    /// * `segment` — the instrument's exchange segment (I-P1-11)
     /// * `order_lots` — number of lots in this order (positive = buy, negative = sell)
     ///
     /// # Performance
     /// O(1) — HashMap lookup + arithmetic comparison.
     #[instrument(skip_all, fields(security_id))]
-    pub fn check_order(&mut self, security_id: u64, order_lots: i32) -> RiskCheck {
+    pub fn check_order_in_segment(
+        &mut self,
+        security_id: u64,
+        segment: ExchangeSegment,
+        order_lots: i32,
+    ) -> RiskCheck {
         self.total_checks = self.total_checks.saturating_add(1);
 
         // Auto-halt: reject all orders once halted
@@ -139,10 +190,11 @@ impl RiskEngine {
             };
         }
 
-        // Check 2: Position size limit
+        // Check 2: Position size limit — read the COMPOSITE row so a
+        // same-id/different-segment instrument can never net against this one.
         let current_pos = self
             .positions
-            .get(&security_id)
+            .get(&(security_id, segment))
             .copied()
             .unwrap_or_default();
         let new_net = current_pos.net_lots.saturating_add(order_lots);
@@ -152,8 +204,11 @@ impl RiskEngine {
                 breach: RiskBreach::PositionSizeLimitExceeded,
                 // O(1) EXEMPT: error path, only reached on position limit breach
                 reason: format!(
-                    "resulting position {} lots exceeds max {} for security {}",
-                    new_net, self.max_position_lots, security_id
+                    "resulting position {} lots exceeds max {} for security {} in {}",
+                    new_net,
+                    self.max_position_lots,
+                    security_id,
+                    segment.as_str()
                 ),
             };
         }
@@ -163,14 +218,37 @@ impl RiskEngine {
 
     /// Records a fill (trade execution) to update position and P&L tracking.
     ///
-    /// # Arguments
-    /// * `security_id` — instrument traded
-    /// * `filled_lots` — lots filled (positive = buy, negative = sell)
-    /// * `fill_price` — execution price per lot (in rupees)
-    /// * `lot_size` — contract lot size (e.g., 25 for NIFTY options)
+    /// LEGACY segment-less overload — assumes [`LEGACY_DEFAULT_SEGMENT`].
+    /// Prefer [`Self::record_fill_in_segment`]; see the I-P1-11 warning on
+    /// [`Self::check_order`].
     pub fn record_fill(
         &mut self,
         security_id: u64,
+        filled_lots: i32,
+        fill_price: f64,
+        lot_size: u32,
+    ) {
+        self.record_fill_in_segment(
+            security_id,
+            LEGACY_DEFAULT_SEGMENT,
+            filled_lots,
+            fill_price,
+            lot_size,
+        );
+    }
+
+    /// Records a fill against the COMPOSITE `(security_id, segment)` row.
+    ///
+    /// # Arguments
+    /// * `security_id` — instrument traded
+    /// * `segment` — the instrument's exchange segment (I-P1-11)
+    /// * `filled_lots` — lots filled (positive = buy, negative = sell)
+    /// * `fill_price` — execution price per lot (in rupees)
+    /// * `lot_size` — contract lot size (e.g., 25 for NIFTY options)
+    pub fn record_fill_in_segment(
+        &mut self,
+        security_id: u64,
+        segment: ExchangeSegment,
         filled_lots: i32,
         fill_price: f64,
         lot_size: u32,
@@ -198,7 +276,7 @@ impl RiskEngine {
             // never emits zero-lot FillEvents).
             return;
         }
-        let pos = self.positions.entry(security_id).or_default();
+        let pos = self.positions.entry((security_id, segment)).or_default();
         // 2026-07-14 unrealized-P&L fix: store the lot size so mark-to-market
         // P&L multiplies by the SAME contract multiplier realized P&L uses.
         pos.lot_size = lot_size.max(1);
@@ -280,14 +358,34 @@ impl RiskEngine {
 
     /// Updates the mark-to-market price for an instrument (for unrealized P&L).
     ///
+    /// LEGACY segment-less overload — assumes [`LEGACY_DEFAULT_SEGMENT`].
+    /// Prefer [`Self::update_market_price_in_segment`]; on this path a
+    /// same-id/different-segment instrument overwrites this one's mark, so
+    /// unrealized P&L (and therefore the daily-loss halt) is computed from
+    /// another instrument's price.
+    ///
     /// # Performance
     /// O(1) — HashMap lookup + field update.
     pub fn update_market_price(&mut self, security_id: u64, current_price: f64) {
+        self.update_market_price_in_segment(security_id, LEGACY_DEFAULT_SEGMENT, current_price);
+    }
+
+    /// Updates the mark price for the COMPOSITE `(security_id, segment)` row.
+    ///
+    /// # Performance
+    /// O(1) — HashMap lookup + field update.
+    pub fn update_market_price_in_segment(
+        &mut self,
+        security_id: u64,
+        segment: ExchangeSegment,
+        current_price: f64,
+    ) {
         // RISK-GAP-02: Reject non-positive and non-finite prices.
         if !current_price.is_finite() || current_price <= 0.0 {
             return;
         }
-        self.market_prices.insert(security_id, current_price);
+        self.market_prices
+            .insert((security_id, segment), current_price);
     }
 
     /// Mark-to-market daily-loss evaluation OUTSIDE the order path
@@ -395,15 +493,37 @@ impl RiskEngine {
     }
 
     /// Returns the net lots for a specific security (positive = long, negative = short, 0 = flat).
+    ///
+    /// LEGACY segment-less overload — assumes [`LEGACY_DEFAULT_SEGMENT`].
+    /// Prefer [`Self::net_lots_for_in_segment`].
     pub fn net_lots_for(&self, security_id: u64) -> i32 {
-        self.positions.get(&security_id).map_or(0, |p| p.net_lots)
+        self.net_lots_for_in_segment(security_id, LEGACY_DEFAULT_SEGMENT)
+    }
+
+    /// Returns the net lots for the COMPOSITE `(security_id, segment)` row.
+    pub fn net_lots_for_in_segment(&self, security_id: u64, segment: ExchangeSegment) -> i32 {
+        self.positions
+            .get(&(security_id, segment))
+            .map_or(0, |p| p.net_lots)
     }
 
     /// Iterates the security ids of every tracked position row (including
     /// flat rows) — the union-side input of the order runtime's local
     /// reconcile invariant (C7 fix-round 2026-07-14: a risk-side position
     /// absent from the FillEvent mirror must be checkable too).
+    ///
+    /// # I-P1-11 note
+    /// Drops the segment, so a numeric id tracked in two segments yields the
+    /// SAME id twice. Consumers that need to address a specific row must use
+    /// [`Self::position_keys`].
     pub fn position_security_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.positions.keys().map(|&(security_id, _)| security_id)
+    }
+
+    /// Iterates the full composite `(security_id, segment)` key of every
+    /// tracked position row — the I-P1-11-correct companion to
+    /// [`Self::position_security_ids`].
+    pub fn position_keys(&self) -> impl Iterator<Item = PositionKey> + '_ {
         self.positions.keys().copied()
     }
 
@@ -418,11 +538,15 @@ impl RiskEngine {
     /// O(N) where N = open positions (cold path, called during risk checks).
     pub fn total_unrealized_pnl(&self) -> f64 {
         let mut total = 0.0_f64;
-        for (security_id, pos) in &self.positions {
+        for (key, pos) in &self.positions {
             if pos.net_lots == 0 {
                 continue;
             }
-            if let Some(&market_price) = self.market_prices.get(security_id) {
+            // Composite-key lookup (I-P1-11): each leg is priced with ITS OWN
+            // segment's mark. Keyed on the bare id, a same-id/different-segment
+            // instrument supplied the mark here and fabricated the unrealized
+            // P&L that the daily-loss auto-halt reads.
+            if let Some(&market_price) = self.market_prices.get(key) {
                 // Delegates to the ONE per-leg formula
                 // (`PositionInfo::unrealized_at`, order-leg-pnl Item 1) —
                 // preserves the 2026-07-14 lot-size fix (multiply by the
@@ -445,8 +569,20 @@ impl RiskEngine {
     }
 
     /// Returns the position info for a specific instrument.
+    ///
+    /// LEGACY segment-less overload — assumes [`LEGACY_DEFAULT_SEGMENT`].
+    /// Prefer [`Self::position_in_segment`].
     pub fn position(&self, security_id: u64) -> Option<&PositionInfo> {
-        self.positions.get(&security_id)
+        self.position_in_segment(security_id, LEGACY_DEFAULT_SEGMENT)
+    }
+
+    /// Returns the position info for the COMPOSITE `(security_id, segment)` row.
+    pub fn position_in_segment(
+        &self,
+        security_id: u64,
+        segment: ExchangeSegment,
+    ) -> Option<&PositionInfo> {
+        self.positions.get(&(security_id, segment))
     }
 
     /// Returns the number of instruments with open positions.
@@ -1084,42 +1220,68 @@ mod tests {
         let mut engine = make_engine();
         engine.update_market_price(1001, f64::NAN);
         // NaN should NOT be stored
-        assert!(!engine.market_prices.contains_key(&1001));
+        assert!(
+            !engine
+                .market_prices
+                .contains_key(&(1001, LEGACY_DEFAULT_SEGMENT))
+        );
     }
 
     #[test]
     fn test_infinity_price_rejected() {
         let mut engine = make_engine();
         engine.update_market_price(1001, f64::INFINITY);
-        assert!(!engine.market_prices.contains_key(&1001));
+        assert!(
+            !engine
+                .market_prices
+                .contains_key(&(1001, LEGACY_DEFAULT_SEGMENT))
+        );
     }
 
     #[test]
     fn test_negative_infinity_price_rejected() {
         let mut engine = make_engine();
         engine.update_market_price(1001, f64::NEG_INFINITY);
-        assert!(!engine.market_prices.contains_key(&1001));
+        assert!(
+            !engine
+                .market_prices
+                .contains_key(&(1001, LEGACY_DEFAULT_SEGMENT))
+        );
     }
 
     #[test]
     fn test_zero_price_rejected() {
         let mut engine = make_engine();
         engine.update_market_price(1001, 0.0);
-        assert!(!engine.market_prices.contains_key(&1001));
+        assert!(
+            !engine
+                .market_prices
+                .contains_key(&(1001, LEGACY_DEFAULT_SEGMENT))
+        );
     }
 
     #[test]
     fn test_negative_price_rejected() {
         let mut engine = make_engine();
         engine.update_market_price(1001, -1.0);
-        assert!(!engine.market_prices.contains_key(&1001));
+        assert!(
+            !engine
+                .market_prices
+                .contains_key(&(1001, LEGACY_DEFAULT_SEGMENT))
+        );
     }
 
     #[test]
     fn test_valid_price_accepted() {
         let mut engine = make_engine();
         engine.update_market_price(1001, 100.0);
-        assert_eq!(*engine.market_prices.get(&1001).unwrap(), 100.0);
+        assert_eq!(
+            *engine
+                .market_prices
+                .get(&(1001, LEGACY_DEFAULT_SEGMENT))
+                .unwrap(),
+            100.0
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1280,22 +1442,46 @@ mod tests {
         // Very small positive subnormal is finite and positive → accepted
         let subnormal = f64::MIN_POSITIVE;
         engine.update_market_price(1001, subnormal);
-        assert_eq!(*engine.market_prices.get(&1001).unwrap(), subnormal);
+        assert_eq!(
+            *engine
+                .market_prices
+                .get(&(1001, LEGACY_DEFAULT_SEGMENT))
+                .unwrap(),
+            subnormal
+        );
     }
 
     #[test]
     fn test_update_market_price_overwrites_previous() {
         let mut engine = make_engine();
         engine.update_market_price(1001, 100.0);
-        assert_eq!(*engine.market_prices.get(&1001).unwrap(), 100.0);
+        assert_eq!(
+            *engine
+                .market_prices
+                .get(&(1001, LEGACY_DEFAULT_SEGMENT))
+                .unwrap(),
+            100.0
+        );
 
         // Update with new valid price
         engine.update_market_price(1001, 200.0);
-        assert_eq!(*engine.market_prices.get(&1001).unwrap(), 200.0);
+        assert_eq!(
+            *engine
+                .market_prices
+                .get(&(1001, LEGACY_DEFAULT_SEGMENT))
+                .unwrap(),
+            200.0
+        );
 
         // Attempt NaN → rejected, old price preserved
         engine.update_market_price(1001, f64::NAN);
-        assert_eq!(*engine.market_prices.get(&1001).unwrap(), 200.0);
+        assert_eq!(
+            *engine
+                .market_prices
+                .get(&(1001, LEGACY_DEFAULT_SEGMENT))
+                .unwrap(),
+            200.0
+        );
     }
 
     // -----------------------------------------------------------------------

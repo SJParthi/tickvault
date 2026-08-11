@@ -590,7 +590,14 @@ mod tests {
     #[tokio::test]
     async fn test_set_feed_dhan_disable_rejected_when_live_trading() {
         // PR-E safety gate: once live trading is on, disabling Dhan is refused.
+        //
+        // Dhan is turned on EXPLICITLY. The test used to inherit it from
+        // `FeedsConfig::default()`, which meant the safety gate's own test
+        // depended on an unrelated default — and broke when that default
+        // flipped to OFF on 2026-08-11. What is under test is the REFUSAL,
+        // and a refusal test needs the thing it refuses to disable to be on.
         let state = test_state(FeedsConfig::default());
+        state.feed_runtime().set_enabled(Feed::Dhan, true);
         state.feed_runtime().set_dhan_disable_allowed(false);
         let res = set_feed(
             State(state.clone()),

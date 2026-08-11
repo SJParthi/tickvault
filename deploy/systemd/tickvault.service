@@ -137,6 +137,22 @@ Environment=AWS_SHARED_CREDENTIALS_FILE=/dev/null
 # covers the live ~779 count with headroom. Per .claude/rules/project/
 # groww-second-feed-scope-2026-06-19.md.
 Environment=GROWW_MAX_SUBSCRIBE=1000
+# TICKVAULT_DHAN_LIVE_FEED is the SECOND of the two gates on the Dhan live
+# WebSocket lane; `[feeds] dhan_enabled = true` in config is the first, and
+# `spawn_dhan_feed_stack` requires BOTH. Set to 1 here on 2026-08-11 per the
+# operator quote recorded in websocket-connection-scope-lock.md ("2026-08-11 —
+# THE DEFAULT IS FLIPPED ON").
+#
+# It lives HERE and not in the config on purpose: the config file is shared
+# with every developer checkout, so a config-only flip would open sockets on
+# a laptop running `cargo run`. Scoping the second gate to the deployed unit
+# means the lane goes live on the box and stays dark everywhere else — the
+# same reason TV_ENVIRONMENT is set here rather than defaulted in code.
+#
+# Turning it off is the fastest rollback available: comment this line, then
+# `systemctl daemon-reload && systemctl restart tickvault`. No rebuild, no
+# deploy, no config edit — the gate is read at boot.
+Environment=TICKVAULT_DHAN_LIVE_FEED=1
 
 # Resource limits
 LimitNOFILE=65536

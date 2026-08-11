@@ -204,26 +204,56 @@ fn test_indicator_engine_states_field_unchanged_since_2026_05_27() {
     );
 }
 
-/// Every pinned frozen file matches its captured content exactly.
+/// Prints the current manifest for re-blessing. Does NOT enforce anything.
+///
+/// SPLIT OUT of the enforcing test 2026-08-11. This body used to live at the
+/// top of `test_indicator_strategy_boundary_files_unchanged` behind
+/// `if std::env::var("BLESS_BOUNDARY").is_ok() { … return; }` — an environment
+/// variable that made the ENFORCING test return before a single assertion ran.
+/// Bite-proven during the guard-vacuity audit: `BLESS_BOUNDARY=1 cargo test`
+/// reported 3 passed while checking nothing.
+///
+/// That is a skip path on the operator's §28 frozen-area lock — the one guard
+/// standing over `types.rs`, `obi.rs` and `evaluator.rs`, which no other test
+/// covers (`engine.rs` alone has an independent pin). A lock with an
+/// environment-variable bypass is a lock with a key taped to the door, and it
+/// would report green in exactly the run where someone had set the variable to
+/// get past it.
+///
+/// `#[ignore]` rather than an env var, deliberately: an ignored test cannot be
+/// activated by ambient environment, only by typing
+/// `cargo test -p tickvault-storage --test operator_boundary_indicator_strategy_guard
+/// -- --ignored bless`, and it now runs ALONGSIDE the enforcing test rather
+/// than instead of it.
+#[test]
+#[ignore = "re-bless helper: prints the manifest, enforces nothing"]
+fn bless_indicator_strategy_boundary_manifest() {
+    eprintln!("// re-blessed manifest — paste over BOUNDARY_FILES:");
+    for dir in FROZEN_DIRS {
+        for rel in frozen_files_on_disk().iter().filter(|r| r.starts_with(dir)) {
+            let bytes = read_rel(rel);
+            let lines = bytes.iter().filter(|&&b| b == b'\n').count();
+            eprintln!(
+                "    (\"{rel}\", 0x{:016x}, {}, {}),",
+                fnv1a64(&bytes),
+                bytes.len(),
+                lines
+            );
+        }
+    }
+}
+
+/// The enforcing test has NO skip path — see
+/// [`bless_indicator_strategy_boundary_manifest`] for why that sentence is
+/// load-bearing.
 #[test]
 fn test_indicator_strategy_boundary_files_unchanged() {
-    if std::env::var("BLESS_BOUNDARY").is_ok() {
-        // Re-bless mode: print the current manifest and skip assertions.
-        eprintln!("// re-blessed manifest — paste over BOUNDARY_FILES:");
-        for dir in FROZEN_DIRS {
-            for rel in frozen_files_on_disk().iter().filter(|r| r.starts_with(dir)) {
-                let bytes = read_rel(rel);
-                let lines = bytes.iter().filter(|&&b| b == b'\n').count();
-                eprintln!(
-                    "    (\"{rel}\", 0x{:016x}, {}, {}),",
-                    fnv1a64(&bytes),
-                    bytes.len(),
-                    lines
-                );
-            }
-        }
-        return;
-    }
+    assert!(
+        BOUNDARY_FILES.len() >= 4,
+        "§28 guard has gone vacuous: the manifest holds {} entries. It must pin every \
+         frozen file, and an empty or near-empty manifest passes while enforcing nothing.",
+        BOUNDARY_FILES.len()
+    );
 
     for (rel, want_fnv, want_len, want_lines) in BOUNDARY_FILES {
         let bytes = read_rel(rel);

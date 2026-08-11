@@ -186,6 +186,16 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     // The value of this list is not the reasons. It is that from today the set
     // can only SHRINK, and no NEW High/Critical code can join it without
     // someone typing it in on purpose.
+    //
+    // SHRUNK 2026-08-11 (merge): BOOT-02, BOOT-03, OMS-GAP-06 and WS-SPILL-02
+    // are removed because they now HAVE CloudWatch filters. This list was
+    // seeded on one branch while the Critical-severity paging-gap sweep added
+    // those four alarms on another; the merge made the entries stale and
+    // `exemption_list_has_no_stale_entries` failed on exactly them, by name.
+    // Worth recording because it is the ratchet earning its keep on its first
+    // real merge: had the entries survived, a later removal of those four
+    // alarms would have passed silently — the exact failure mode the test was
+    // written to prevent, arrived at by accident rather than intent.
     "AGGREGATOR-LAG-01",
     "AGGREGATOR-LATE-01",
     "AUTH-GAP-01",
@@ -194,8 +204,6 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "BAR-MISMATCH-02",
     "BAR-MISMATCH-03",
     "BOOT-01",
-    "BOOT-02",
-    "BOOT-03",
     "BRUTEX-XVERIFY-01",
     "BRUTEX-XVERIFY-02",
     "CADENCE-01",
@@ -251,7 +259,6 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "OMS-GAP-03",
     "OMS-GAP-04",
     "OMS-GAP-05",
-    "OMS-GAP-06",
     "ORDER-EVT-01",
     "ORDER-PNL-01",
     "ORDER-READY-01",
@@ -275,7 +282,6 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "VOLUME-MONO-01",
     "WS-GAP-10",
     "WS-SPILL-01",
-    "WS-SPILL-02",
 ];
 
 #[test]

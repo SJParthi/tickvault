@@ -103,7 +103,10 @@ coded filter; both stages are once-per-episode page-worthy and the
 probe-only path never emits it at ERROR**)**, and **CHAIN-04 (added
 2026-07-14** — SCOPED to the down-for-the-day `stage="warmup"` arm only;
 the probe_* / warmup_no_token stages are log-only-by-design
-transient/respawn arms**)**. **Everything else
+transient/respawn arms**)**, and **BOOT-02, BOOT-03, OMS-GAP-06,
+WS-SPILL-02 (added 2026-08-11, Critical-severity paging-gap sweep** — see
+the dated subsection below this paragraph for the full classification**)**.
+**Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added
 2026-07-14 (REST-audit gap 05): `tv-<env>-telegram-drops`
@@ -113,6 +116,48 @@ pattern; a broken bot silently killed every typed-event page; honest
 residual: the counter is NOT yet pre-registered at 0 post-recorder-install,
 so the session's first drop per reason-series is eaten as the CW delta
 baseline — flagged crates follow-up).
+
+**Critical-severity paging-gap sweep (2026-08-11).** A mechanical sweep of
+all 167 `ErrorCode` variants found **29** at `Severity::Critical`, of which
+only **4** carried an `error_code_alerts` entry (`DH-901`, `AUTH-GAP-04`,
+`PROC-01`, `AGGREGATOR-DROP-01`). A Critical that reaches no human surface
+is a silent failure by definition — the 2026-07-06 zero-page class,
+inverted. Classification of the other 25:
+
+- **14 have NO `error!`-level emit site at all** — `AUTH-GAP-02`,
+  `DH-902`, `DH-903`, `DATA-808`, `DATA-809`, `DATA-810`, `SELFTEST-02`,
+  `PREVCLOSE-03`, `BAR-MISMATCH-01/-02/-03`, `GROWW-SCALE-03`,
+  `GROWW-SCALE-05`, `GROWW-ORD-03`. These are deliberately **NOT** alarmed:
+  a filter with no possible emit site is a dead filter that reads as a
+  permanently-green alarm forever (the `ws-reinject-01` /
+  `tick-conserve-01` precedent). They are **enum-retirement candidates** —
+  each carries a `runbook_path()` and advertises coverage that does not
+  exist. Pinned in count by the ratchet so the set can only shrink.
+- **4 already reach a human** via a typed `NotificationEvent` dispatched at
+  the emit site (`ORPHAN-POSITION-01` → `OrphanPositionDetected`,
+  `RESILIENCE-01` → `DualInstanceDetected`, `RESILIENCE-03` →
+  `AuthenticationFailed`, `OMS-GAP-03` → `CircuitBreakerOpened` per
+  `dhan-rest-only-noise-lock-2026-07-14.md` §2a). Not duplicated as
+  CloudWatch alarms, on cost discipline (~$0.10/mo each).
+- **3 are BLOCKED pending a dated operator quote.** `AUTH-GAP-01` and
+  `DATA-805` are Dhan-scoped, and an alarm → SNS → Telegram IS a new
+  Dhan-scoped page, which `dhan-rest-only-noise-lock-2026-07-14.md` §3
+  REJECTs without a fresh dated operator quote in THAT file first (its §1
+  fixes the Dhan alert set at 4 items). `GROWW-OCO-02` is compiled out by
+  the non-default `groww_orders` cargo feature (Gate 2 of the
+  `groww-second-feed-scope-2026-06-19.md` §39 lattice), so an alarm for it
+  would be dormant-by-construction.
+- **4 were genuinely silent and are now alarmed** — the entries added to
+  the list above. `BOOT-02` additionally repairs a documented false-OK: the
+  WAL-suspension entry's description told the operator that the boot-probe
+  escalation codes "own that page" while one of them owned no page at all.
+
+Ratchet: `crates/storage/tests/critical_errcode_alarm_coverage_guard.rs`
+re-derives this whole classification on every build and fails if a Critical
+code with a real emit site is neither alarmed nor allowlisted, if an
+allowlist row goes stale, or if a no-emit Critical code gains an alarm
+(dead monitor). Its allowlist is a shrinking ratchet. Cost: +4 alarms
+≈ +$0.40/mo — see `aws-budget.md` COST NOTE 2026-08-11.
 
 **Retired paging entries:** the `ws-gap-07` filter+alarm was RETIRED
 PR-C2 2026-07-13 — its only ERROR-level emit site (the main-feed

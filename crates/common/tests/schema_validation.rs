@@ -314,3 +314,98 @@ fn test_dedup_key_derivative_contracts_includes_underlying_symbol() {
 // as false assurance. I-P1-06's contract (segment in every tick dedup
 // key) stands in gap-enforcement.md and binds any future tick writer,
 // which must restore a REAL-constant-bound guard.
+//
+// RE-BLESSED 2026-08-11 (Dhan 16-connection live-feed revival, authorized
+// by the operator quotes of 2026-08-09 recorded in
+// websocket-connection-scope-lock.md "2026-08-09 — DHAN LIVE MAIN-FEED WS
+// REVIVAL AUTHORIZED" + "SAME DAY, SECOND QUOTE"): `tick_persistence.rs`
+// is BACK, so a live `ticks` writer exists again and the retirement
+// premise above no longer holds. The tombstone named the precondition for
+// its own reversal — "binds any future tick writer, which must restore a
+// REAL-constant-bound guard" — and that is exactly what the test below
+// does. It is deliberately NOT a restoration of the old shape: the 2017
+// failure mode was a SELF-CONTAINED local copy that drifted from the real
+// key without ever failing (it still read "security_id, segment,
+// received_at" long after production had moved to the 5-part key). This
+// guard instead PARSES the literal out of the production const, so a
+// silent drift is impossible by construction — if the writer's key
+// changes, this test reads the new value and re-checks the invariant
+// rather than comparing against a stale copy nobody remembered to update.
+
+/// I-P1-06 (re-blessed 2026-08-11) — every tick DEDUP key must carry the
+/// exchange segment, bound to the REAL `DEDUP_KEY_TICKS` const rather than
+/// a local copy.
+///
+/// Why a source scan and not a direct `use`: `crates/common` sits at the
+/// BOTTOM of the dependency flow (`common ← core ← trading ← storage`), so
+/// importing `tickvault_storage` here would invert the workspace layering
+/// for a single assertion. Reading the const out of the production file is
+/// the house source-scan-ratchet pattern and keeps the binding real — the
+/// test fails if the const is renamed, deleted, or weakened.
+#[test]
+fn test_dedup_key_ticks_is_bound_to_the_real_const_and_includes_segment() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(|root| root.join("crates/storage/src/tick_persistence.rs"))
+        .expect("workspace root must exist above crates/common"); // APPROVED: test
+
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "I-P1-06: read {}: {e} — the tick writer is expected to exist \
+             again under the 2026-08-09 Dhan live-feed revival. If the \
+             writer is retired a SECOND time, retire this guard in the same \
+             PR with a dated note rather than leaving it to fail obscurely.",
+            path.display()
+        )
+    });
+
+    // Parse the literal out of `pub const DEDUP_KEY_TICKS: &str = "...";`
+    // so the assertion below reads PRODUCTION's value, never a copy.
+    const NEEDLE: &str = "pub const DEDUP_KEY_TICKS: &str = \"";
+    let start = src.find(NEEDLE).unwrap_or_else(|| {
+        panic!(
+            "I-P1-06: `DEDUP_KEY_TICKS` const not found in {} — a tick \
+             writer that inlines its DEDUP key as a bare string literal \
+             evades every dedup meta-guard in the workspace; the key MUST \
+             stay a named const (data-integrity.md).",
+            path.display()
+        )
+    }) + NEEDLE.len();
+    let len = src[start..]
+        .find('"')
+        .expect("DEDUP_KEY_TICKS literal must be terminated"); // APPROVED: test
+    let key = &src[start..start + len];
+
+    // I-P1-06 itself: `security_id` alone is NOT unique — the same numeric
+    // id is reused across exchange segments, so a key without `segment`
+    // silently upserts two different instruments onto one row.
+    assert!(
+        key.contains("segment"),
+        "I-P1-06 regression: DEDUP_KEY_TICKS = ({key}) does not contain \
+         `segment`. Dhan reuses `security_id` across segments, so this key \
+         would silently collapse two distinct instruments into one row."
+    );
+    assert!(
+        key.contains("security_id"),
+        "DEDUP_KEY_TICKS = ({key}) must contain `security_id`."
+    );
+    // feed-in-key (operator override 2026-06-28, data-integrity.md): with
+    // the Dhan lane revived alongside the REST legs, a Dhan row and another
+    // feed's row for the same instrument-second must stay DISTINCT rows.
+    assert!(
+        key.contains("feed"),
+        "feed-in-key regression: DEDUP_KEY_TICKS = ({key}) does not contain \
+         `feed` — a revived Dhan tick could overwrite another feed's row for \
+         the same instrument and second (silent cross-feed tick loss)."
+    );
+    // Same-second survival: trade timestamps are whole seconds on several
+    // feeds, so without a per-tick disambiguator every tick but the last in
+    // each second is upserted away.
+    assert!(
+        key.contains("capture_seq"),
+        "same-second regression: DEDUP_KEY_TICKS = ({key}) does not contain \
+         `capture_seq` — many ticks share one whole-second `ts`, so all but \
+         the last would be silently destroyed on upsert."
+    );
+}

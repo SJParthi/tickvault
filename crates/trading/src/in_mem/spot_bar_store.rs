@@ -180,10 +180,23 @@ pub struct BlockOutcome {
 /// 2026-08-07: before this, the slot table grew unbounded — one entry per
 /// distinct instrument ever seen, never evicted. It was safe only by the
 /// external convention that callers feed the small hardcoded index list; the
-/// type enforced nothing. 256 is ~32x today's ~8 live slots, so it cannot bite
-/// current operation, while making the growth bounded BY CONSTRUCTION.
-/// Raising it is a deliberate, reviewable edit — which is the point.
-pub const MAX_SPOT_BAR_SLOTS: usize = 256;
+/// type enforced nothing. Capping it made the growth bounded BY CONSTRUCTION.
+///
+/// 2026-08-10: raised 256 → 25,000 to match [`AGGREGATOR_MAX_SLOTS`]. The 256
+/// was sized as "~32x today's ~8 live slots" when the runtime was REST-only on
+/// four indices. Under the authorized r8g.xlarge target (operator Quote 13,
+/// 2026-08-08 — 13 timeframes at ~25,000 instruments) that cap **refuses
+/// 24,744 of 25,000 instruments** with `SlotCapacityExhausted`, i.e. zero RAM
+/// retention for all but the first 256 — a fail-closed refusal, so it would
+/// have been loud rather than silent, but it would have made the upgrade
+/// useless for its stated purpose.
+///
+/// Sized to the SAME ceiling as the aggregator so the two cannot disagree
+/// about how many instruments the box admits. Memory is bounded by
+/// construction: the slot table is `RwLock<HashMap<SlotKey, Arc<Slot>>>`, so
+/// this is a ceiling on entries actually inserted, not a pre-allocation.
+/// Raising it further is a deliberate, reviewable edit — which is the point.
+pub const MAX_SPOT_BAR_SLOTS: usize = crate::candles::AGGREGATOR_MAX_SLOTS;
 
 /// One per-TF sorted ring of sealed bars.
 #[derive(Debug)]
@@ -649,7 +662,13 @@ mod tests {
         assert_eq!(bars_per_day(TfIndex::M5), 77);
         assert_eq!(bars_per_day(TfIndex::M15), 26);
         assert_eq!(bars_per_day(TfIndex::D1), 1);
-        assert_eq!(total_bars_per_day_all_tfs(), 618);
+        // 2026-08-10: M2/M30/M60 appended (operator Quote 13's thirteen
+        // frames). ceil(23_100/120)=193, ceil(23_100/1800)=13,
+        // ceil(23_100/3600)=7 → 618 + 213 = 831.
+        assert_eq!(bars_per_day(TfIndex::M2), 193);
+        assert_eq!(bars_per_day(TfIndex::M30), 13);
+        assert_eq!(bars_per_day(TfIndex::M60), 7);
+        assert_eq!(total_bars_per_day_all_tfs(), 831);
         assert_eq!(SESSION_SECS, 23_100);
     }
 
@@ -658,9 +677,10 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 618 × 35 × 8 × 48 = 8_305_920 B ≈ 7.9 MiB
-        // (2026-08-07: 601 -> 618 bars/day with the 385-minute session).
-        assert_eq!(bytes, 8_305_920);
+        // 831 × 35 × 8 × 48 = 11_168_640 B ≈ 10.6 MiB
+        // (2026-08-07: 601 -> 618 bars/day with the 385-minute session;
+        //  2026-08-10: 618 -> 831 with M2/M30/M60, operator Quote 13.)
+        assert_eq!(bytes, 11_168_640);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -844,8 +864,9 @@ mod tests {
         assert_eq!(stats.bars_resident_per_feed[Feed::Groww.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Groww.index()], 1);
-        // Two slots × 1 day × 618 bars × 48 B of pre-allocated capacity (385-min session).
-        assert_eq!(stats.estimated_bytes, 2 * 618 * 48);
+        // Two slots × 1 day × 831 bars × 48 B of pre-allocated capacity
+        // (385-min session; 618 -> 831 on 2026-08-10 with M2/M30/M60).
+        assert_eq!(stats.estimated_bytes, 2 * 831 * 48);
     }
 
     #[test]
@@ -870,11 +891,14 @@ mod tests {
         // so the number is the would-be formula cost, not allocated memory.
         assert_eq!(gated_formula_total, 77_422, "gated formula sum drifted");
         // The resident total + byte estimate exclude the gated frames.
-        assert_eq!(total_bars_per_day_all_tfs(), 618);
+        // 2026-08-10: 618 -> 831 with M2/M30/M60 (operator Quote 13). These
+        // three are minute-scale, so unlike the GDF-gated second frames they
+        // ARE resident and DO count toward the byte estimate.
+        assert_eq!(total_bars_per_day_all_tfs(), 831);
         let store = SpotBarStore::new(35);
         store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
         let stats = store.stats();
-        assert_eq!(stats.estimated_bytes, 618 * 35 * 48);
+        assert_eq!(stats.estimated_bytes, 831 * 35 * 48);
         let slot = store.find_slot(key()).expect("slot exists");
         let rings = slot.rings.read();
         assert_eq!(rings.len(), TF_COUNT, "one ring per TfIndex ordinal");

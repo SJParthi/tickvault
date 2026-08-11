@@ -36,12 +36,17 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   # NOTE: we intentionally do NOT set `RUSTFLAGS: "-D warnings"` at the
-  # env level. That would make every rustc warning across the workspace
-  # fatal (including in test builds), and there are ~24 pre-existing
-  # warnings that need a dedicated cleanup pass. The project's per-crate
-  # `#![cfg_attr(not(test), deny(...))]` in lib.rs already enforces the
-  # strictest lints on prod code. Once the cleanup PR lands, set this
-  # to "-D warnings" and tighten clippy back up.
+  # env level, because that would make every rustc warning fatal in TEST
+  # builds too, and test-target warnings are neither measured nor clean.
+  #
+  # Corrected 2026-08-11: this note used to cite "~24 pre-existing
+  # warnings that need a dedicated cleanup pass" and promised to tighten
+  # clippy "once the cleanup PR lands". That cleanup HAS landed, so the
+  # clippy step below is now armed with `-D warnings` (lib+bins). The
+  # env-level RUSTFLAGS stays unset on the test-target grounds above —
+  # that is the only surviving reason, and it is a narrower one.
+  # Prod code remains additionally protected by the per-crate
+  # `#![cfg_attr(not(test), deny(...))]` in each lib.rs.
 
 jobs:
   # -------------------------------------------------------------------------
@@ -204,13 +209,29 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy (workspace, libs + bins only)
-        # NOTE: we deliberately do NOT pass `--all-targets` or
-        # `-D warnings` here. Test code legitimately uses `eprintln!`
-        # (calibration output) and there are ~24 pre-existing lib
-        # warnings scheduled for a follow-up cleanup pass. Prod code is
-        # still protected via `#![cfg_attr(not(test), deny(...))]` in
-        # each crate's lib.rs.
-        run: cargo clippy --workspace --no-deps
+        # THE GATE IS ARMED (2026-08-11). `-D warnings` is ON: any clippy
+        # warning in lib+bin code now FAILS this job, and Build & Verify is
+        # a needed job of All Green, so it blocks the merge.
+        #
+        # It was off because of "~24 pre-existing lib warnings scheduled for
+        # a follow-up cleanup pass". That cleanup HAS landed (the
+        # `#![allow(clippy::doc_lazy_continuation)]` /
+        # `doc_overindented_list_items` lines now in all 8 lib.rs files), so
+        # the only stated justification for an unfailable lint gate was
+        # stale. Measured before arming: `cargo clippy --workspace --no-deps
+        # -- -D warnings` exits 0 on this tree.
+        #
+        # `--all-targets` is STILL deliberately omitted, and that is a real
+        # remaining gap, not an oversight: test code legitimately uses
+        # `eprintln!` (calibration output), the workspace does not currently
+        # build clean in that mode, and its true warning count is UNMEASURED.
+        # Arming it is separate work with its own measurement — do not
+        # bundle it in by adding the flag here.
+        #
+        # Ratcheted by `crates/common/tests/rust_only_guard.rs::
+        # ci_clippy_gate_stays_armed` so `-D warnings` cannot be silently
+        # dropped again.
+        run: cargo clippy --workspace --no-deps -- -D warnings
 
   # -------------------------------------------------------------------------
   # Test — one job per crate, parallel. Matrix + fail-fast: false so a
@@ -610,9 +631,14 @@ jobs:
         shell: bash
         run: bash .claude/hooks/test-count-guard.sh "$GITHUB_WORKSPACE"
 
+      # `all` is load-bearing, not decoration. The hook defaults to
+      # MODE="staged" and scans `git diff --cached`; a CI checkout has NOTHING
+      # staged, so the default invocation found zero files and exited 0 on
+      # every run — a guard that could never fail. The full-tree ratchet (and
+      # its CI fail-closed branch) live in the `all` mode only.
       - name: Pub-fn test guard (every new pub fn has a test or TEST-EXEMPT)
         shell: bash
-        run: bash .claude/hooks/pub-fn-test-guard.sh "$GITHUB_WORKSPACE"
+        run: bash .claude/hooks/pub-fn-test-guard.sh "$GITHUB_WORKSPACE" all
 
       - name: Financial test guard (price/order fns have boundary tests)
         shell: bash
@@ -737,11 +763,14 @@ jobs:
           crates/app/tests/dhat_mark_forward.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_cadence_decide.rs
+          crates/core/tests/dhat_depth_packet_zero_alloc.rs
           crates/core/tests/dhat_instrument_registry.rs
           crates/core/tests/dhat_moneyness.rs
           crates/core/tests/dhat_telegram_dispatcher.rs
           crates/core/tests/dhat_token_handle.rs
+          crates/core/tests/dhat_truedata_decode_zero_alloc.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
+          crates/trading/tests/dhat_multi_tf_fold.rs
           crates/trading/tests/dhat_risk_engine.rs
           EOF
           )
@@ -782,13 +811,21 @@ jobs:
           set -euo pipefail
           # Stage-2 dead-WS sweep (2026-07-17): dhat_feed_consumer +
           # dhat_prev_close_writer deleted with the dead tick chain.
+          # 2026-08-11: dhat_depth_packet_zero_alloc + dhat_truedata_decode_
+          # zero_alloc added. Both shipped in the live-lane branch WITHOUT
+          # being wired here, so they existed on disk and ran in no CI lane
+          # at all — the exact silent drop this job's drift check exists to
+          # catch, and it caught it. Both are feature-UNGATED, so `Test
+          # (core)` also runs them; this lane remains the ratchet authority.
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
             --test dhat_cadence_decide \
+            --test dhat_depth_packet_zero_alloc \
             --test dhat_instrument_registry \
             --test dhat_moneyness \
             --test dhat_telegram_dispatcher \
             --test dhat_token_handle \
+            --test dhat_truedata_decode_zero_alloc \
             --test dhat_ws_reader_zero_alloc \
             2>&1 | tee /tmp/dhat-core.log
           if grep -q 'running 0 tests' /tmp/dhat-core.log; then
@@ -815,8 +852,10 @@ jobs:
           # Dhan-lag publisher chain (run_dhan_lag_publisher/FeedLagRing): 9 -> 8.
           # 2026-07-18 (stage-4 dead-producer sweep): dhat_feed_presence
           # deleted with the producer-less presence registry: 8 -> 7.
-          if [ "$ran" -ne 7 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 7 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-08-11 (live-lane wiring): dhat_depth_packet_zero_alloc +
+          # dhat_truedata_decode_zero_alloc added: 7 -> 9.
+          if [ "$ran" -ne 9 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
@@ -835,7 +874,11 @@ jobs:
           # module (dead live-WS sweep stage 1, 2026-07-17); dhat_multi_tf_
           # consume_tick DELETED with the tick aggregator (stage-3 sweep,
           # 2026-07-17) — target count 3→2→1.
+          # 2026-08-11: dhat_multi_tf_fold added with the rebuilt aggregator
+          # fold path — 1 → 2. It had been landing on disk with no CI lane
+          # running it; the drift check above is what surfaced that.
           cargo test -p tickvault-trading \
+            --test dhat_multi_tf_fold \
             --test dhat_risk_engine \
             2>&1 | tee /tmp/dhat-trading.log
           if grep -q 'running 0 tests' /tmp/dhat-trading.log; then
@@ -843,8 +886,8 @@ jobs:
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
-          if [ "$ran" -ne 1 ]; then
-            echo "::error::trading DHAT step executed $ran targets, expected 1 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 2 ]; then
+            echo "::error::trading DHAT step executed $ran targets, expected 2 — a --test flag was dropped from this step."
             exit 1
           fi
 

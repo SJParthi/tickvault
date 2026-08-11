@@ -182,58 +182,56 @@ jobs:
             /tmp/docker-logs.txt
           retention-days: 14
 
+      # Ported off actions/github-script to `gh` CLI (2026-08-11, rust-only
+      # forever-lock): the inline JS was an interpreted-language runtime the
+      # `rust_only_guard` invocation scan could not see. The fallback ladder,
+      # the 100-line tail, the title and the body layout are unchanged.
       - name: Open regression issue on failure
         if: failure() && github.event_name == 'schedule'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
-        with:
-          script: |
-            const fs = require('fs');
-            // Fallback ladder: the run can die BEFORE the chaos test step
-            // (compose up, cargo build), in which case /tmp/chaos.log never
-            // exists. Walk the step logs newest-stage-first so the issue
-            // always quotes the log of the stage that actually failed —
-            // never the "(chaos log not captured)" dead end again.
-            const sources = [
-              { path: '/tmp/chaos.log', note: 'chaos.log (chaos test step output)' },
-              { path: '/tmp/build.log', note: 'build.log (failure occurred before the chaos test step, during cargo build)' },
-              { path: '/tmp/compose-up.log', note: 'compose-up.log (failure occurred before the chaos test step, during docker compose up)' },
-              { path: '/tmp/docker-logs.txt', note: 'docker-logs.txt (container logs from teardown)' },
-            ];
-            let log = '';
-            let sourceNote = '(no logs captured — failure before any logged step)';
-            for (const s of sources) {
-              try {
-                log = fs.readFileSync(s.path, 'utf8');
-                sourceNote = `log source: ${s.note}`;
-                break;
-              } catch (e) {
-                // ENOENT — this stage never ran; try the next rung.
-              }
-            }
-            // Keep the issue body small — last 100 lines is plenty.
-            log = log.split('\n').slice(-100).join('\n');
-            const title = `chaos-regression: nightly ${new Date().toISOString().slice(0,10)}`;
-            const body = [
-              '## Chaos test suite failed',
-              '',
-              `Workflow: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              '',
-              sourceNote,
-              '',
-              '### Last 100 lines',
-              '```',
-              log,
-              '```',
-              '',
-              '### Artifacts',
-              `- chaos-logs: full stdout + docker compose logs`,
-              '',
-              `Labels: chaos-regression`,
-            ].join('\n');
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body,
-              labels: ['chaos-regression'],
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Fallback ladder: the run can die BEFORE the chaos test step
+          # (compose up, cargo build), in which case /tmp/chaos.log never
+          # exists. Walk the step logs newest-stage-first so the issue
+          # always quotes the log of the stage that actually failed —
+          # never the "(chaos log not captured)" dead end again.
+          source_note='(no logs captured — failure before any logged step)'
+          : > /tmp/chaos-issue-log.txt
+          for path in /tmp/chaos.log /tmp/build.log /tmp/compose-up.log /tmp/docker-logs.txt; do
+            [ -f "$path" ] || continue
+            case "$path" in
+              /tmp/chaos.log)       note='chaos.log (chaos test step output)' ;;
+              /tmp/build.log)       note='build.log (failure occurred before the chaos test step, during cargo build)' ;;
+              /tmp/compose-up.log)  note='compose-up.log (failure occurred before the chaos test step, during docker compose up)' ;;
+              /tmp/docker-logs.txt) note='docker-logs.txt (container logs from teardown)' ;;
+            esac
+            # Keep the issue body small — last 100 lines is plenty.
+            tail -100 "$path" > /tmp/chaos-issue-log.txt
+            source_note="log source: $note"
+            break
+          done
+          {
+            echo '## Chaos test suite failed'
+            echo ''
+            echo "Workflow: $RUN_URL"
+            echo ''
+            echo "$source_note"
+            echo ''
+            echo '### Last 100 lines'
+            echo '```'
+            cat /tmp/chaos-issue-log.txt
+            echo '```'
+            echo ''
+            echo '### Artifacts'
+            echo '- chaos-logs: full stdout + docker compose logs'
+            echo ''
+            echo 'Labels: chaos-regression'
+          } > /tmp/chaos-issue-body.md
+          gh issue create \
+            --title "chaos-regression: nightly $(date -u +%Y-%m-%d)" \
+            --body-file /tmp/chaos-issue-body.md \
+            --label chaos-regression
+

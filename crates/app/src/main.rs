@@ -40,7 +40,7 @@ use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
-use tickvault_app::{infra, observability, subsystem_memory};
+use tickvault_app::{host_limits, infra, observability, subsystem_memory};
 
 use std::net::SocketAddr;
 
@@ -829,6 +829,16 @@ async fn main() -> Result<()> {
     metrics::counter!("tv_orders_placed_total", "mode" => "paper").increment(0);
     metrics::counter!("tv_orders_placed_total", "mode" => "live").increment(0);
 
+    // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
+    // is installed — gauges written before install resolve to a no-op recorder
+    // and would be silently discarded, same rationale as the registrations
+    // above. Deliberately non-fatal: the return value is ignored because a
+    // tuning miss degrades the feed under load, it does not make the process
+    // wrong to run — and today's runtime is REST-only, where the receive-buffer
+    // size is irrelevant. The WARN lines + `tv_host_limits_unmet_total` are the
+    // operator signal. Ratchet: crates/app/tests/host_limits_lockstep_guard.rs.
+    let _host_limits_unmet = host_limits::check_and_report_host_limits();
+
     // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
     // register the per-subsystem memory gauges, the sampler heartbeat,
     // and the market-hours-active quiet-hours gate. The sampler task
@@ -1500,6 +1510,18 @@ async fn main() -> Result<()> {
     // enabled, serde default OFF; base.toml opts in); disabled = one info! +
     // nothing spawned. Independent of feeds.groww_enabled / the retired live
     // lane — the REST-legs pattern (main.rs Groww REST spawns).
+    // [dhan_universe] — the daily Dhan instrument-master + NSE India index
+    // download and ISIN join (operator directive 2026-08-11, reversing Q3;
+    // verbatim quote in websocket-connection-scope-lock.md). Spawned
+    // unconditionally: the rider itself checks `enabled` and logs one line
+    // when off, so a disabled boot has exactly one observable difference from
+    // an enabled one — which is what makes "is it on?" answerable from the
+    // log rather than from the config file.
+    let _dhan_universe_rider = tickvault_app::dhan_universe::spawn_dhan_universe_rider(
+        config.dhan_universe.clone(),
+        config.questdb.clone(),
+    );
+
     if config.groww_universe.enabled {
         let _groww_universe_rider =
             tickvault_app::groww_universe::spawn_groww_universe_rider(config.questdb.clone());
@@ -1806,11 +1828,30 @@ async fn main() -> Result<()> {
     }
     if !ws_wal_replay_live_feed.is_empty() {
         let dropped = ws_wal_replay_live_feed.len() as u64;
-        warn!(
+        // 2026-08-11 — this message was written on 2026-07-14, when it was
+        // true: the Dhan live WS had just been retired, nothing appended
+        // LiveFeed frames, and anything found here really was pre-retirement
+        // residue being tidied away.
+        //
+        // It stopped being true when the live lane came back and became the
+        // WAL's first frame producer since that retirement. These frames can
+        // now be TODAY'S — captured minutes ago by a session that died — and
+        // the operator reading "residual ... from a pre-retirement session"
+        // would file it as housekeeping rather than as data loss.
+        //
+        // The frames are genuinely preserved on disk, and re-folding them is
+        // real work (the fold path takes a live ring, not a replay batch), so
+        // this stays a drop for now. What changes is that it stops describing
+        // a live gap as historical tidying, and says plainly what was lost.
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
             frames = dropped,
-            "STAGE-C.2b: residual LiveFeed WAL frames from a pre-retirement session have no \
-             re-injection target (the Dhan live WS was retired 2026-07-13) — counted and \
-             archived with the WAL segments; the raw frames remain on disk in the archive"
+            "STAGE-C.2b: {dropped} captured live-feed frames were replayed from the \
+             write-ahead log and DROPPED — there is no re-fold path, so the ticks and candles \
+             they contain are NOT in the database. The raw frames are preserved in the WAL \
+             archive and can be recovered manually. If this session followed an unclean stop \
+             during market hours, this is real data loss for that window, not leftover residue \
+             from an old session."
         );
         metrics::counter!(
             "tv_ws_frame_wal_reinjected_dropped_total",
@@ -1911,12 +1952,75 @@ async fn main() -> Result<()> {
     // amendment stands — no CSV download, no parser). Depth sets are empty
     // until an operator names instruments for them.
     // =======================================================================
+    // -----------------------------------------------------------------------
+    // Register the 15:31 cross-verification dependencies BEFORE the lane
+    // spawns (2026-08-11).
+    //
+    // Without this call `spawn_daily_crossverify` takes its refusal branch and
+    // the lane runs with NO loss detector at all. That is not a degraded mode
+    // — it is the absence of the only detector that can exist here: the Dhan
+    // main feed carries no sequence number and no snapshot-on-subscribe, so a
+    // dropped packet is invisible at the protocol level. The 15:31 comparison
+    // against Dhan's own REST record is the entire safety net.
+    //
+    // This was missed once already. The comparator's stub was replaced with a
+    // real implementation on 2026-08-10, and the registration it depends on
+    // was never written — so the "fix" changed a log line and nothing else.
+    // The lane now REFUSES to start without it (see `run_dhan_feed_stack`),
+    // which is what stops that from being possible a third time.
+    let crossverify_installed = tickvault_app::dhan_feed_stack::install_crossverify_deps(
+        tickvault_app::dhan_feed_stack::CrossverifyDeps {
+            questdb_exec_url: format!(
+                "http://{}:{}/exec",
+                config.questdb.host, config.questdb.http_port
+            ),
+            intraday_url: format!(
+                "{}{}",
+                config.dhan.rest_api_base_url,
+                tickvault_common::constants::DHAN_CHARTS_INTRADAY_PATH
+            ),
+            // A closure, not a value: the JWT rotates roughly every 23h and
+            // this scheduler outlives any single token. Reading it fresh at
+            // each run is the only correct shape.
+            jwt_provider: Box::new(|| {
+                let manager = tickvault_core::auth::token_manager::global_token_manager()?;
+                let guard = manager.token_handle().load();
+                guard.as_ref().as_ref().map(|state| {
+                    use secrecy::ExposeSecret as _;
+                    state.access_token().expose_secret().to_string()
+                })
+            }),
+            config: tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig::default(),
+        },
+    );
+    if !crossverify_installed {
+        // Idempotent by design — first call wins. A second call means someone
+        // added a rival registration, which would silently decide which
+        // endpoints the only ground-truth check uses.
+        tracing::warn!(
+            "cross-verification dependencies were already registered — the first \
+             registration stands; check for a duplicate install site"
+        );
+    }
+
     let _dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             dhan_enabled: config.feeds.dhan_enabled,
             main_feed_instruments: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
+            questdb: config.questdb.clone(),
+            // The process-wide WAL opened in STAGE-C above. This is the FIRST
+            // frame-append consumer since PR-C2 retired the Dhan lane on
+            // 2026-07-13 (the note there — "there is no frame APPEND site left
+            // in this process" — is what this line changes). `None` refuses
+            // the lane outright rather than capturing without a durable floor.
+            spill: _ws_frame_spill.clone(),
+            // Both paths seal into the same `candles_<tf>` tables under
+            // `feed='dhan'`, and the dedup key has no column that separates
+            // them. Passing the fold's real state lets the lane refuse rather
+            // than let one writer silently overwrite the other.
+            rest_fold_writes_dhan_candles: config.rest_candle_fold.enabled,
         },
     );
 

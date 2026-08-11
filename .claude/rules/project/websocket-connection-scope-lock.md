@@ -487,6 +487,284 @@ available ground truth and must be live from day one — not a supplementary che
 `.claude/plans/proposals/2026-08-09-dhan-live-ws-revival.md` and
 `.claude/plans/proposals/2026-08-09-dhan-16-connection-architecture.md` (PR #1731).
 
+### 2026-08-11 — THE DEFAULT IS FLIPPED ON (the lane goes live, not just buildable)
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "switch the dhan feed on espeic llay to cpature all tehs eirght dude am i irght dude?"
+
+This is the **change of DEFAULT** that the 2026-08-09 quotes deliberately did not
+make. Those quotes authorized the CODE and the 16-socket budget; the lane still
+shipped dark behind a double gate. This quote opens both gates:
+
+| Gate | Before | After |
+|---|---|---|
+| `[feeds] dhan_enabled` (base.toml + production.toml) | `false` | **`true`** |
+| `TICKVAULT_DHAN_LIVE_FEED` env opt-in | unset | **`=1`** in `deploy/systemd/tickvault.service` |
+
+It is also the "fresh dated operator quote" that
+`crates/app/tests/dhan_live_off_phase_a_guard.rs` and
+`crates/common/tests/production_config_wiring.rs` name as the precondition for
+flipping the flag; both guards are INVERTED in the same PR to pin the ON state,
+so the flag can never silently drift back OFF either.
+
+**The coupled change this forces — `[rest_candle_fold]` goes OFF.** The live lane
+and the REST candle fold both seal into the same `candles_<tf>` tables stamped
+`feed='dhan'`, and the dedup key `(ts, security_id, segment, feed)` has no column
+that separates them: one silently overwrites the other, and the 15:31
+cross-verification would compare the REST record against itself and agree every
+time. The lane's exclusivity floor already REFUSES to open a socket while the fold
+is on, so leaving the fold enabled would have made this flip a no-op wearing a
+success message. The fold is therefore disabled here. **Honest cost:** its 35-day
+`catchup_days` backfill of historical minute candles stops running; live capture
+replaces it going forward but does NOT backfill the past. Re-enabling it means
+turning the live lane off again, until a source discriminator is added to the
+candle key — a schema decision, deliberately not taken here.
+
+**⚠ WHAT THIS QUOTE CANNOT DELIVER — 11 of the 16 sockets stay shut, and not for
+lack of code.** The operator's words are "capture all these", so this must be said
+plainly rather than left to be discovered:
+
+- **Main feed: 1 socket of the 5 granted.** The universe is
+  `SPOT_1M_REST_INDICES` — NIFTY, BANKNIFTY, SENSEX, INDIA VIX. Four instruments
+  fit one connection; the pool shards by need, so four more sockets are authorized
+  and unused. Widening the universe is blocked by Q3 of the 2026-07-13 amendment
+  ("hardcoded security IDs only, no instrument download/parsing"), which this
+  quote does not touch.
+- **depth-20 and depth-200: 0 sockets of the 10 granted.** Both instrument lists
+  are empty, and `plan_pool` opens nothing for an empty set. This is a **rule
+  conflict, not a gap**: depth needs a tradeable order book, indices do not have
+  one, and reaching real option/future contracts requires either the instrument
+  master download (forbidden by Q3) or a hardcoded contract list that expires
+  every week. Populating depth needs its own dated quote resolving that conflict —
+  it is not a config flip.
+- **Ticks are captured; the 5 second-scale timeframes are not yet proven.** The
+  13-timeframe requirement (Quote 13, 2026-08-08) is what the r8g.xlarge was sized
+  for; this flip starts the tick flow that feeds it.
+
+So the accurate one-line summary of this change is: **the Dhan live feed goes from
+zero sockets to one, carrying four index instruments** — a real and necessary
+first step, and materially less than "all these".
+
+**Everything else stays REJECT** exactly as the 2026-08-09 sections state: no live
+order fire (`dry_run` stays true), no CSV download, no fifth endpoint type, no
+edit to the §28 frozen area.
+
+### 2026-08-11 (SAME DAY, SECOND QUOTE) — ALL 16 SOCKETS ORDERED OPEN; per-minute REST KEPT RUNNING ALONGSIDE
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "bro fix all tehse issues whatevr is mentioend dude see emanhwiel ensure to enable connect estbalish al lteh 16 ocnenctions defintitley ddue okay? Meanwhile elt the current rest api hit of evry minute for btoh dhan and groww shodu land let ir run dude okay? do youu nderstand whayt imasnkign ddue okay?"
+
+Given in DIRECT response to a message that stated the opposite of what the
+operator wanted and named the blocker: that 11 of the 16 authorized sockets were
+shut, that depth-20 and depth-200 sat at ZERO because depth needs a tradeable
+order book which an index does not have, and that reaching real contracts
+"requires either the instrument master download (forbidden by Q3) or a hardcoded
+contract list that expires every week … it is not a config flip." The operator
+read that and answered **"definitely"**. This section is the dated quote the
+2026-08-09 sections' own REJECT rows demand before that shape changes.
+
+**What this quote authorizes, precisely:**
+
+| Surface | Before this quote | Now |
+|---|---|---|
+| Main feed | 5 authorized, **1** open | 5 authorized, **open as many as the instrument set needs** |
+| depth-20 | 5 authorized, **0** open — no instrument list | 5 authorized, **ORDERED OPEN** |
+| depth-200 | 5 authorized, **0** open — no instrument list | 5 authorized, **ORDERED OPEN** |
+| Order-update | 1, paper-mode receive-only | unchanged, 1 |
+| Per-minute REST (Dhan + Groww) | running | **explicitly ORDERED to keep running** alongside the live lane |
+| **Total** | 1 socket carrying data | **16** |
+
+**The REST half is an explicit KEEP, not an afterthought.** The operator's
+second sentence — *"let the current rest api hit of every minute for both dhan
+and groww … let it run"* — makes the per-minute REST legs a KEPT surface that
+the live lane must COEXIST with, never replace. Any change that stands a REST
+leg down "because the live feed covers it now" is a REJECT under this quote.
+The two write DIFFERENT tables (`ticks` / `candles_<tf>` for the live lane;
+`spot_1m_rest` / `option_chain_1m` / `option_contract_1m_rest` for the REST
+legs), which is what makes coexistence structurally safe — and is exactly why
+the earlier same-day `[rest_candle_fold]` stand-down was correct and is NOT
+touched by this quote: that fold wrote into `candles_<tf>`, the live lane's own
+table, under a key that cannot separate them. REST legs that write their own
+tables coexist; a REST fold that writes the live lane's table does not.
+
+**⚠ THE CONSTRAINT THIS QUOTE DOES *NOT* LIFT (Rule 11, no false-OK).**
+The operator ordered the sockets open. He did NOT authorize an instrument-master
+CSV download, and **Q3 of the 2026-07-13 amendment stands** (*"hereafter no Dhan
+instrument download/parsing — just direct hardcoded security IDs"*). Depth needs
+tradeable contract security-ids, and there are exactly three ways to obtain them:
+
+| Source | Rule status | Automation status |
+|---|---|---|
+| Dhan instrument-master CSV | **FORBIDDEN** by Q3 — not lifted by this quote | would be automatic |
+| A hardcoded contract list in Rust | permitted by Q3's letter | **FAILS** the operator's own standing "no manual intervention" mandate — option contracts expire weekly, so a hardcoded list needs a human edit every week and silently goes stale between edits |
+| **An already-authorized live source that carries contract security-ids** | permitted — no new fetch class | automatic, self-rolling |
+
+Only the third satisfies BOTH this quote and the operator's standing
+zero-manual-intervention rule at the same time. **The implementation MUST use
+the third form.** A depth lane fed by a stale hardcoded list would subscribe
+expired contracts, receive nothing, and report healthy: the exact false-OK class
+this file exists to prevent.
+
+#### The third form EXISTS for OPTIONS — resolved 2026-08-11, same day
+
+The already-authorized, already-running per-minute Dhan option-chain pull
+(`POST /v2/optionchain`, the §8 grant of
+`no-rest-except-live-feed-2026-06-27.md`) returns a **per-leg
+`security_id`** — the tradeable contract's own Dhan id. It is already parsed
+(`crates/app/src/option_chain_1m_boot.rs:431`, `ParsedLeg.contract_security_id`)
+and already persisted every minute (`option_chain_1m.contract_security_id LONG`,
+`crates/storage/src/option_chain_1m_persistence.rs:776`). The vendor doc states
+it outright: *"gives you the SecurityId of each option contract directly, no
+instrument master lookup needed for subscriptions"*
+(`docs/dhan-ref/06-option-chain.md:195`).
+
+**This is the sanctioned depth instrument source.** It costs no new fetch class,
+adds no REST call, breaks no rule, and self-rolls: when the expiry changes the
+chain returns the new contracts and the depth set follows automatically — the
+zero-manual-intervention property the hardcoded-list option cannot provide.
+
+Two things this source does NOT give, both recorded rather than papered over:
+
+1. **The contract's EXCHANGE SEGMENT is absent from the response.** The stored
+   `exchange_segment` is the UNDERLYING's (`IDX_I`, hardcoded at
+   `option_chain_1m_persistence.rs:108`). Depth subscription needs the
+   CONTRACT's segment (`NSE_FNO` = 2 for NIFTY/BANKNIFTY, `BSE_FNO` = 8 for
+   SENSEX). That mapping is deterministic from the underlying but is OUR
+   assumption, not vendor-supplied — it must be a named, tested, single-source
+   mapping, never an inline literal, and it must fail closed on an unknown
+   underlying rather than guessing a segment.
+2. **`contract_security_id` populated-in-practice is UNVERIFIED-LIVE.** The
+   parser defaults it to `0` when the field is absent, and the field is marked
+   "added v2.5" upstream. One query settles it —
+   `SELECT count(*) FROM option_chain_1m WHERE contract_security_id = 0` — and
+   the implementation MUST treat a `0` id as REFUSED-and-counted, never
+   subscribed. A zero id would otherwise subscribe instrument 0 and look fine.
+
+#### FUTURES depth is NOT reachable — stated plainly, not silently dropped
+
+There is **no path from any authorized Dhan source to a FUTIDX `security_id`**.
+`/v2/optionchain` returns `ce`/`pe` legs only; the expiry-list endpoint returns
+DATES, not ids; and `index_futures.rs::select_index_future_expiries` is a pure
+date filter fed exclusively by the **Groww** master CSV, whose ids are a
+different id space entirely (`exchange_token`, not Dhan `security_id`).
+
+So depth on index FUTURES needs the forbidden CSV, a monthly-expiring hardcoded
+list, or its own fresh operator quote. **It is therefore OUT of this quote's
+deliverable**, and any claim that "all 16 sockets carry data" must not be read as
+including futures depth. Option depth is what this quote can actually deliver.
+
+**What a PR that violates this section looks like (REJECT):**
+
+- Revives the Dhan instrument-master CSV download/parse chain (Q3 stands; this
+  quote does not lift it).
+- Hardcodes an expiring option/future contract list as the depth instrument
+  source (breaks the standing no-manual-intervention mandate and goes silently
+  stale).
+- Stands down, disables, or starves ANY per-minute REST leg for Dhan or Groww
+  in the name of the live lane (the explicit KEEP above).
+- Opens a fifth Dhan endpoint type, or exceeds 16 total live connections.
+- Reports depth as "enabled" when its instrument set is empty — an empty set
+  opens zero sockets, and calling that success is the false-OK this file forbids.
+- Flips `dry_run`, touches the §28 frozen area, or arms live order fire — none
+  of which this quote mentions.
+
+### 2026-08-11 (SAME DAY, THIRD QUOTE) — Q3 IS REVERSED: the daily Dhan master CSV + NSE India indices download is ORDERED BACK
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "yes go ahead dude we ened to downlaod the dhan master csv evry day startign right dude espeiclaly to udpate the mappigns and its data entirley always a swell right dude menahwiel see from nse india websote alwyas evryday mornign you need to downlaod all teh indices as well right i mean. to find the rpeicse mappigns between nse india websoite nse idncies csv data with our daily downlaoded new master instruemnts scirpt csv fiel dtaa rigth ddue am i irght dude tell me dude okay?"
+
+Given in DIRECT response to a message that laid out the two options side by side
+— keep Q3 and accept that futures depth is impossible, or reverse Q3 and rebuild
+the deleted download chain — and named the rebuild cost. The operator chose the
+rebuild, and named the JOIN between the two files as the actual deliverable.
+
+**This quote REVERSES Q3 of the 2026-07-13 amendment.** That directive read
+*"hereafter no Dhan instrument download/parsing — just direct hardcoded security
+IDs passed to spot 1m and option chain"*, and it is the authority every "no CSV
+download" REJECT row in this file cites — including the two rows written earlier
+TODAY (the 2026-08-11 first and second quotes). Those rows are superseded to
+exactly the extent stated here and no further.
+
+#### What is authorized
+
+| Surface | Before this quote | Now |
+|---|---|---|
+| Dhan instrument-master CSV | FORBIDDEN (Q3); every module DELETED | **DAILY DOWNLOAD ORDERED** |
+| NSE India (niftyindices) index constituent lists | one list (NIFTY Total Market) fetched as a Groww watch-build input | **ALL index lists, every morning, as a first-class pipeline** |
+| The ISIN join between them | did not exist | **THE DELIVERABLE** — precise constituent → Dhan `security_id` mapping |
+| Live-lane universe | 4 hardcoded index SIDs | may be sourced from the rebuilt master (a SEPARATE step; see below) |
+| Everything else | — | UNCHANGED |
+
+#### What this quote does NOT authorize (Rule 11 — no scope smuggling)
+
+- **Live order fire.** `dry_run` stays true. Not mentioned, not touched.
+- **A fifth Dhan WS endpoint type**, or more than 16 total connections.
+- **Any edit to the §28 frozen indicator/strategy area.**
+- **Standing down the per-minute REST legs** — the second 2026-08-11 quote's
+  explicit KEEP stands and is reinforced, not replaced, by this one.
+- **Automatically widening the live subscription set.** The download produces a
+  MAPPING; pointing the live lane at it changes what we subscribe and is its own
+  decision with its own bandwidth and cost consequences. Building the pipeline is
+  ordered here; re-pointing the lane is not, and must not be smuggled in.
+
+#### The mapping contract is ALREADY LOCKED — build to it, do not reinvent it
+
+`daily-universe-scope-expansion-2026-05-27.md` §31.1 (operator-confirmed
+2026-06-06) already specifies precisely the join this quote asks for, and it
+stands unamended:
+
+1. **PRIMARY KEY = ISIN.** Match the NSE list's `ISIN Code` against the Dhan
+   master's `ISIN`, filtered to `EXCH_ID == NSE AND SEGMENT == E AND SERIES == EQ`.
+   The matched row's `SECURITY_ID` is the answer.
+2. **SECONDARY / cross-check = `(Symbol, Series=EQ, NSE, Equity)`.** Symbol-ALONE
+   is BANNED as a primary key — tickers are reused and renamed, so a symbol join
+   can silently map to the WRONG security, which is worse than failing.
+3. **O(1) build.** One `HashMap<ISIN, (security_id, ExchangeSegment)>` built once
+   from the Dhan NSE-EQ rows; each constituent is then an O(1) lookup. Never a
+   per-constituent scan of the master.
+4. **Fail-closed.** An unresolved constituent is COUNTED and LOGGED BY NAME,
+   never silently dropped. Past the tolerance, REJECT the whole build.
+5. **Dedup** by the I-P1-11 composite `(security_id, exchange_segment)`.
+6. **Role tagging** so `index_constituent` vs `fno_underlying` is an O(1) filter.
+
+The §18 downloader hardening contract (redirect policy `none`, 50 MB body cap,
+content-type assertion, cache-path validation, 10s connect / 60s read timeouts,
+never log the URL) is likewise already locked and binds this rebuild verbatim.
+
+#### The honest envelope
+
+- **Two tolerances, deliberately different, and they must not be merged:** the
+  NSE membership-list tolerance (2%, raised from 0.5% after the 2026-06-08 live
+  boot degraded the universe over 5 stragglers out of 748) and the order-critical
+  Dhan-master F&O dangling guard (0.5%, unchanged). Collapsing them into one
+  number breaks one of the two.
+- **A same-wrong-on-both-sides input is invisible by construction.** The join
+  detects disagreement between the two files; it cannot detect two files that are
+  consistently wrong. Nothing here claims otherwise.
+- **Derivative security_ids are documented by Dhan as unstable across days.** The
+  mapping is therefore a POINT-IN-TIME artifact per trading day — which is why
+  the SEBI tables are append-with-history and never overwritten in place.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Joins on SYMBOL as the primary key, or drops the ISIN cross-check.
+- Silently skips unresolved constituents instead of counting + naming them.
+- Merges the 2% membership tolerance and the 0.5% F&O dangling tolerance.
+- Ships the downloader without the §18 hardening (a redirect-following client,
+  an uncapped body, or no content-type assertion is a REJECT on its own).
+- Logs the CSV URL with query parameters, or writes outside the validated cache
+  directory.
+- Re-points the live subscription set at the new master without its own dated
+  quote (see "does NOT authorize" above).
+- Presents a build that resolved zero constituents as success — a zero-row join
+  passing a "no mismatches" check is the false-OK class this file exists to stop.
+
 ### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
 
 Operator Parthiban, 2026-07-24 (verbatim quotes preserved in

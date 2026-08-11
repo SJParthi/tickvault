@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 tickvault-common = { path = "../common" }
 tokio = { workspace = true }
-anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

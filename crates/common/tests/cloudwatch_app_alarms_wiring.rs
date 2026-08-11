@@ -446,6 +446,28 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // emit and could stop the trading box mid-session. An exact alternation
     // keeps the bill a function of THIS list, which this assertion pins.
     //
+    // 48 (was 41) since 2026-08-11 (DHAN LIVE LANE SWITCHED ON): the live
+    // Dhan WebSocket lane went from dark to carrying data, and its SEVEN loss
+    // counters were emitted by the binary while selected by nothing — every
+    // way the lane can lose data (WAL write refused, frame ring full by
+    // count, frame ring full by BYTES, frame refused, subscribe failed, seal
+    // dropped, sequence refused) was counted in-process and discarded at the
+    // agent. A lane whose drop paths are invisible reports healthy while
+    // losing ticks, which is the precise false-OK class rule 11 forbids.
+    // +7 EXACT names ≈ +$2.10/mo (41 → 48 names ≈ $12.30 → $14.40/mo at
+    // CloudWatch's ~$0.30/custom-metric/month) against the $100 ceiling whose
+    // budget actions STOP the box at $90 — headroom is unaffected at this
+    // scale. Dated note: aws-budget.md (COST NOTE 2026-08-11).
+    //
+    // FLAGGED, deliberately NOT taken here: the exclusion ledger below still
+    // excludes tv_ws_frame_spill_write_errors_total on the stated ground that
+    // "no WS frame producer exists since the 2026-07-13/15 live-feed
+    // retirements". That premise is FALSE as of today — the revived lane IS a
+    // WS frame producer, so the name now has a reachable emitter and its
+    // exclusion rests on a reason that no longer holds. It is recorded rather
+    // than silently added: adding it is a cost decision of its own and would
+    // make this commit's delta something other than the seven names it claims.
+    //
     // INCLUSION RULE: a name is selected only if it means FAILURE,
     // SATURATION or DATA LOSS *and* has a reachable producer on the REST-only
     // runtime. 311 names are deliberately not selected — success/volume
@@ -462,10 +484,11 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        41,
-        "Z+ L2 VERIFY ratchet: expected exactly 41 names in the MAIN EMF \
-         metric_selectors list (11 post-stage-4 plus the 30 failure/saturation/loss \
-         names added 2026-08-09 for the metric-blindness fix); found {}: {names:?}. \
+        48,
+        "Z+ L2 VERIFY ratchet: expected exactly 48 names in the MAIN EMF \
+         metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
+         names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
+         loss counters added 2026-08-11 when the lane was switched on); found {}: {names:?}. \
          Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose budget \
          actions STOP the prod box at 90% — update this count deliberately, with a \
          dated cost note, never as a drive-by.",

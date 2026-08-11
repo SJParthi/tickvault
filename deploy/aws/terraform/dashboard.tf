@@ -202,6 +202,159 @@ resource "aws_cloudwatch_dashboard" "operator" {
           ]
           period = 300
         }
+      },
+
+      # ----- Row 7: the LIVE runtime (2026-08-11, observability audit r2) -----
+      # The dashboard charted 8 series and NONE of them covered the four
+      # per-minute REST legs, the seal writer, the RAM store or the cadence
+      # scheduler — i.e. everything that actually runs. The operator could
+      # look at an all-green page while the whole runtime was dead.
+      #
+      # EVERY metric below was verified twice before being charted, because a
+      # widget with no producer renders as "no data", which an operator reads
+      # as "fine" — strictly worse than no widget:
+      #   1. a producer exists in crates/*/src  (grep-verified 2026-08-11)
+      #   2. the name is in the CloudWatch agent EMF allowlist
+      #      (user-data.sh.tftpl + cloudwatch-agent.json) — without this the
+      #      series never reaches the Tickvault/Prod namespace at all.
+      # Metrics failing check 2 are deliberately NOT charted here; widening
+      # the allowlist is a separate owner's file.
+      {
+        type   = "text"
+        x      = 0
+        y      = 36
+        width  = 24
+        height = 2
+        properties = {
+          markdown = "## The live runtime — per-minute pulls, storage, memory\nThese are the parts that actually run today. **Persist-error lines should sit flat at zero.** A rising line means candles are being fetched but not saved. If the fire heartbeat at the top is missing during market hours, nothing is being pulled at all."
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 38
+        width  = 12
+        height = 6
+        properties = {
+          title  = "REST 1m legs — persist errors (flat zero = healthy)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_spot1m_persist_errors_total", { label = "Dhan spot 1m", stat = "Sum" }],
+            [local.dash_namespace, "tv_chain1m_persist_errors_total", { label = "Dhan option chain 1m", stat = "Sum" }],
+            [local.dash_namespace, "tv_groww_spot1m_persist_errors_total", { label = "Groww spot 1m", stat = "Sum" }],
+            [local.dash_namespace, "tv_groww_chain1m_persist_errors_total", { label = "Groww option chain 1m", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 38
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Restarts — cadence scheduler / disk watcher / order push"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_cadence_runner_respawn_total", { label = "cadence scheduler", stat = "Sum" }],
+            [local.dash_namespace, "tv_disk_watcher_respawn_total", { label = "disk watcher", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_order_push_respawn_total", { label = "order push", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 44
+        width  = 8
+        height = 6
+        properties = {
+          title  = "Cadence pulls skipped / denied / exhausted"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_cadence_boundary_skipped_total", { label = "minute skipped", stat = "Sum" }],
+            [local.dash_namespace, "tv_cadence_gate_denials_total", { label = "gate denied", stat = "Sum" }],
+            [local.dash_namespace, "tv_cadence_ladder_exhausted_total", { label = "retries exhausted", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 8
+        y      = 44
+        width  = 8
+        height = 6
+        properties = {
+          title  = "In-memory store — dropped / errors (flat zero = healthy)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_ram_store_dropped_total", { label = "dropped", stat = "Sum" }],
+            [local.dash_namespace, "tv_ram_store_errors_total", { label = "errors", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 16
+        y      = 44
+        width  = 8
+        height = 6
+        properties = {
+          title  = "Database write health — WAL suspended tables / reconnects"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_questdb_wal_suspended_tables", { label = "WAL suspended tables", stat = "Maximum" }],
+            [local.dash_namespace, "tv_questdb_reconnects_total", { label = "reconnects", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+
+      # ----- Row 8: host memory + spill headroom -----
+      # The 32 GiB sizing flagged an UNMEASURED memory risk (rule file
+      # daily-universe §7 Rule 2 NEW FLAG: "the first live session at scale
+      # is the measured gate — read tv_process_rss_bytes"). It was not
+      # charted anywhere. Now it is.
+      {
+        type   = "metric"
+        x      = 0
+        y      = 50
+        width  = 12
+        height = 6
+        properties = {
+          title  = "App memory used (bytes) + OOM kills"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_process_rss_bytes", { label = "app memory used", stat = "Maximum" }],
+            [local.dash_namespace, "tv_oom_kills_total", { label = "OOM kills", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 50
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Spill disk free (bytes) — the zero-loss safety margin"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_spill_dir_free_bytes"]]
+          period  = 300
+          stat    = "Minimum"
+        }
       }
     ]
   })

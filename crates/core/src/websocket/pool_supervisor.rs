@@ -73,14 +73,16 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
-use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, next_frame_seq};
 use tracing::{error, info, warn};
 
 use super::idle_watchdog::IdleWatchdog;
 use super::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, PoolBudget, PoolBudgetRefusal,
 };
-use super::reconnect_ladder::reconnect_delay_with_jitter_ms;
+use super::reconnect_ladder::{
+    reconnect_delay_ms, reconnect_delay_with_jitter_ms, reconnect_jitter_ms,
+};
 use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 
 // ---------------------------------------------------------------------------
@@ -113,6 +115,16 @@ pub const PARK_METRIC: &str = "tv_dhan_ws_park_total";
 /// Counter: frame captured but the bounded ring refused it — the frame is
 /// durable in the WAL, the downstream consumer is behind. Label: `endpoint`.
 pub const RING_FULL_METRIC: &str = "tv_dhan_ws_ring_full_total";
+
+/// Counter: the ring refusal above was the BYTE budget, not the frame count.
+///
+/// A strict subset of `RING_FULL_METRIC` — every byte-refusal increments both,
+/// so the ring-full alarm keeps working unchanged and this one answers the
+/// follow-up question the operator will actually have: was the queue long, or
+/// were the frames huge? Those have different causes (a stalled fold versus an
+/// oversized or hostile peer) and, at the count bound alone, are
+/// indistinguishable. Label: `endpoint`.
+pub const RING_BYTES_FULL_METRIC: &str = "tv_dhan_ws_ring_bytes_full_total";
 
 /// Counter: the WAL itself refused a frame. This is the only genuine capture
 /// loss path. Label: `endpoint`.
@@ -495,7 +507,29 @@ impl ConnectionSupervisor {
                         self.park(ParkReason::FatalDisconnect)
                     }
                     DisconnectClass::TokenStale => {
-                        let delay = self.next_delay_ms().max(TOKEN_STALE_REDIAL_FLOOR_MS);
+                        // Floor the LADDER, then add this socket's stagger —
+                        // never the other way round (2026-08-11).
+                        //
+                        // This was `next_delay_ms().max(FLOOR)`, which reads
+                        // as "at least the floor" and is, but it also silently
+                        // discarded the jitter. The ladder's first three rungs
+                        // are 0/1000/2000 ms and the whole jitter range is
+                        // 0-375 ms, so every jittered value on those rungs is
+                        // below the 5,000 ms floor and `max` collapsed all of
+                        // them onto exactly 5,000.
+                        //
+                        // That is precisely the wrong behaviour for the event
+                        // this arm exists to handle: a token expiring kills
+                        // ALL sixteen sockets at once, so all sixteen slept an
+                        // identical 5,000 ms, woke in the same tick, and hit
+                        // the token endpoint together — a self-inflicted
+                        // thundering herd on the one code path guaranteed to
+                        // be entered by every connection simultaneously.
+                        //
+                        // Flooring the base first keeps the "wait at least
+                        // 5 s" intent and restores the fan-out on top of it.
+                        let base = self.next_ladder_delay_ms().max(TOKEN_STALE_REDIAL_FLOOR_MS);
+                        let delay = base.saturating_add(self.jitter_ms());
                         self.enter_backoff(ReconnectReason::TokenStale);
                         SupervisorAction::RefreshTokenThenDial { delay_ms: delay }
                     }
@@ -542,6 +576,21 @@ impl ConnectionSupervisor {
     /// per-slot stagger. Does NOT mutate.
     fn next_delay_ms(&self) -> u64 {
         reconnect_delay_with_jitter_ms(self.attempt, self.slot.global_index)
+    }
+
+    /// The ladder delay for this attempt WITHOUT this socket's stagger.
+    ///
+    /// Split out so a caller that needs to raise the floor can floor the
+    /// ladder and then add the stagger, rather than flooring the sum and
+    /// throwing the stagger away — see the `TokenStale` arm.
+    fn next_ladder_delay_ms(&self) -> u64 {
+        reconnect_delay_ms(self.attempt)
+    }
+
+    /// This socket's fixed fan-out offset. Index 0 always gets zero, so one
+    /// connection per pool keeps the exact instant-retry behaviour.
+    fn jitter_ms(&self) -> u64 {
+        reconnect_jitter_ms(self.slot.global_index)
     }
 
     /// Common tail for every retryable failure: compute the delay, count it,
@@ -768,6 +817,137 @@ pub trait FrameSink: Send + Sync + 'static {
     fn accept(&self, frame: Bytes) -> FrameSinkOutcome;
 }
 
+/// One captured frame and the sequence it was stamped with at the read
+/// instant.
+///
+/// The sequence travels WITH the bytes rather than being re-derived
+/// downstream, and that is the whole design. `next_frame_seq` is minted
+/// exactly once per received frame and written into the WAL record; the
+/// consumer must stamp `ticks.capture_seq` with the SAME value, because on
+/// replay the WAL hands back its stored sequence. A consumer that minted its
+/// own would produce a different key for a replayed frame and the DEDUP
+/// collapse that makes replay idempotent would never happen — every restart
+/// would silently duplicate the session (`data-integrity.md`, TICK-SEQ-01).
+#[derive(Debug, Clone)]
+pub struct CapturedFrame {
+    /// The replay-stable sequence, already persisted in the WAL record.
+    pub seq: u64,
+    /// Which socket this frame came off.
+    ///
+    /// Load-bearing, not decoration: the main feed and the depth feeds use
+    /// DIFFERENT wire formats — an 8-byte header versus a 12-byte one whose
+    /// first two bytes are a message length. A consumer that cannot tell them
+    /// apart will feed a depth frame to the main-feed parser, where byte 0 is a
+    /// length low-byte matching no response code, and silently discard every
+    /// depth packet as unparseable. Carrying the endpoint makes that mistake
+    /// impossible to make by accident.
+    pub endpoint: DhanEndpointType,
+    /// The frame exactly as it arrived. Never parsed on the read task.
+    pub bytes: Bytes,
+}
+
+/// The ring's SECOND bound: total bytes resident, not just frame count.
+///
+/// A channel bounded only by count is bounded only if the items are a known
+/// size, and these are not. `CapturedFrame` owns a `Bytes` whose length is
+/// whatever the peer sent, up to `max_frame_bytes(endpoint)` — 256 KiB on the
+/// main feed, 512 KiB on depth-200. At the ring's 65,536-frame capacity that
+/// is **16 GiB of resident heap on the main feed alone, 32 GiB with the depth
+/// pools open**: the entire machine, held by a queue whose own documentation
+/// called it a bounded burst absorber.
+///
+/// It never bites in normal operation, which is exactly why it is worth
+/// bounding. Real Dhan frames are small — a Quote packet is 50 bytes and a
+/// frame batches a handful — so the count bound engages first and this budget
+/// is inert. It engages only when frames are large AND the fold has stalled,
+/// which is the shape of both a hostile peer and a genuine downstream stall,
+/// and in that shape the count bound alone permits the process to eat the host.
+///
+/// Refusal here is the SAME event as a count-full ring, not a new failure mode:
+/// the frame is already durable in the WAL by the time this is consulted, so a
+/// refusal is a lag signal and the outcome is `RingFull`.
+#[derive(Debug)]
+pub struct RingByteBudget {
+    resident: std::sync::atomic::AtomicUsize,
+    cap: usize,
+}
+
+impl RingByteBudget {
+    /// A budget capped at `cap` resident bytes.
+    #[must_use]
+    pub const fn new(cap: usize) -> Self {
+        Self {
+            resident: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// The configured ceiling.
+    #[must_use]
+    pub const fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Bytes currently reserved by frames sitting in the ring.
+    #[must_use]
+    pub fn resident(&self) -> usize {
+        self.resident.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reserves `len` bytes, or refuses.
+    ///
+    /// CAS loop rather than a `fetch_add`-then-check: `fetch_add` would
+    /// momentarily push `resident` past the cap, and with N reader tasks all
+    /// adding at once the overshoot is unbounded — the very thing being
+    /// bounded. This way `resident` never exceeds `cap`, even transiently.
+    ///
+    /// A frame LARGER than the whole cap can never be admitted. That is
+    /// deliberate: the per-endpoint frame caps are two to three orders of
+    /// magnitude above real traffic, so such a frame is already outside the
+    /// envelope, and admitting it would mean the budget does not bound.
+    pub fn try_reserve(&self, len: usize) -> bool {
+        self.resident
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+                |cur| {
+                    let next = cur.checked_add(len)?;
+                    (next <= self.cap).then_some(next)
+                },
+            )
+            .is_ok()
+    }
+
+    /// Returns `len` bytes to the budget as a frame leaves the ring.
+    ///
+    /// Saturating, never wrapping. An underflow here would be a bookkeeping
+    /// bug, and the wrong response to one is to wrap to `usize::MAX` and refuse
+    /// every frame forever — that converts a counting error into a total feed
+    /// outage. Saturating at zero degrades to "the budget stops bounding",
+    /// which is the same state as not having it, and stays visible through
+    /// `resident()`.
+    pub fn release(&self, len: usize) {
+        // An explicit CAS loop rather than `fetch_update`, because the closure
+        // form can only ever return `Some` here and its `Result` would then have
+        // to be discarded — and `let _ =` on a `#[must_use]` value is exactly
+        // what this crate's `let_underscore_must_use` deny exists to stop. The
+        // loop has no result to throw away.
+        let mut cur = self.resident.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(len);
+            match self.resident.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
+
 /// Production [`FrameSink`]: append to the write-ahead log, then push into the
 /// bounded ring. In that order, always.
 ///
@@ -777,41 +957,122 @@ pub trait FrameSink: Send + Sync + 'static {
 /// therefore a lag signal, not a loss event.
 pub struct WalRingSink {
     spill: std::sync::Arc<WsFrameSpill>,
-    ring: tokio::sync::mpsc::Sender<Bytes>,
+    ring: tokio::sync::mpsc::Sender<CapturedFrame>,
+    budget: std::sync::Arc<RingByteBudget>,
     ws_type: WsType,
     endpoint: DhanEndpointType,
+    /// Loss counters resolved ONCE at construction — see the note on
+    /// [`WalRingSink::new`] for why the macro form is banned on this path.
+    wal_dropped: metrics::Counter,
+    ring_full: metrics::Counter,
+    ring_bytes_full: metrics::Counter,
 }
 
 impl WalRingSink {
-    /// Wires a sink to a WAL and a bounded ring.
+    /// Wires a sink to a WAL, a bounded ring, and the ring's byte budget.
+    ///
+    /// # Why the counters are resolved here and not at the emit site
+    ///
+    /// `metrics::counter!(NAME, "label" => value)` builds a `Key` on EVERY
+    /// call, and a keyed `Key` owns a `Vec<Label>` — so the macro form heap
+    /// allocates once per invocation. Putting it on `accept`'s drop paths puts
+    /// an allocation on the one path that only executes when the system is
+    /// ALREADY under pressure: the ring is full, the WAL refused, the process
+    /// is losing data. Allocating there is both a violation of principle 1
+    /// (zero allocation on the hot path) and, practically, the worst possible
+    /// moment to ask the allocator for anything.
+    ///
+    /// The `endpoint` label is fixed for the lifetime of a sink, so a single
+    /// handle per sink covers every emit — no `OnceLock`, no per-call lookup.
+    /// `Counter::increment` on a resolved handle is a plain atomic add: O(1),
+    /// zero allocation. Same shape as `DrainCounters` in the app crate and
+    /// `dispatcher.rs`'s pre-resolved handles.
     #[must_use]
     pub fn new(
         spill: std::sync::Arc<WsFrameSpill>,
-        ring: tokio::sync::mpsc::Sender<Bytes>,
+        ring: tokio::sync::mpsc::Sender<CapturedFrame>,
+        budget: std::sync::Arc<RingByteBudget>,
         ws_type: WsType,
         endpoint: DhanEndpointType,
     ) -> Self {
-        Self {
+        let endpoint_label = endpoint.as_str();
+        let sink = Self {
             spill,
             ring,
+            budget,
             ws_type,
             endpoint,
-        }
+            wal_dropped: metrics::counter!(WAL_DROP_METRIC, "endpoint" => endpoint_label),
+            ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
+            ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
+        };
+        sink.pre_register();
+        sink
+    }
+
+    /// Publishes a zero on every loss series this sink owns.
+    ///
+    /// # Why a zero has to be published at all
+    ///
+    /// The CloudWatch agent computes a counter's alarm value as a DELTA
+    /// between consecutive samples, and it has no previous sample for a series
+    /// that has never been emitted — so it drops the first one. If the first
+    /// emission a series ever sees is the outage itself, that outage is the
+    /// dropped sample and the alarm does not fire for it. Publishing a zero at
+    /// construction makes the harmless zero the dropped sample instead, which
+    /// is the whole point.
+    ///
+    /// Called from `new` so it cannot be forgotten at a call site: a sink that
+    /// exists has published its baseline.
+    fn pre_register(&self) {
+        self.wal_dropped.increment(0);
+        self.ring_full.increment(0);
+        self.ring_bytes_full.increment(0);
     }
 }
 
 impl FrameSink for WalRingSink {
     fn accept(&self, frame: Bytes) -> FrameSinkOutcome {
+        // Minted ONCE, here, at the read instant — see `CapturedFrame`.
+        let seq = next_frame_seq();
         // Step 1 — durability. `Bytes` into the WAL is an Arc refcount bump.
+        // `append_with_seq`, never `append`: `append` would mint a SECOND
+        // sequence internally and the WAL record would then disagree with the
+        // one the consumer stamps.
         // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
-        if self.spill.append(self.ws_type, frame.clone()) == AppendOutcome::Dropped {
-            metrics::counter!(WAL_DROP_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
+        if self.spill.append_with_seq(self.ws_type, frame.clone(), seq) == AppendOutcome::Dropped {
+            self.wal_dropped.increment(1);
             return FrameSinkOutcome::WalDropped;
         }
-        // Step 2 — visibility. `try_send` never awaits; a full ring returns
+        // Step 2 — byte budget. Consulted BEFORE `try_send` because a reserve
+        // taken after a successful send could not be refused, and one taken
+        // for a send that then fails would leak. Reserve, then send, then
+        // release on failure: the only ordering with no window in which the
+        // budget and the ring disagree.
+        let len = frame.len();
+        if !self.budget.try_reserve(len) {
+            self.ring_full.increment(1);
+            self.ring_bytes_full.increment(1);
+            return FrameSinkOutcome::RingFull;
+        }
+        // Step 3 — visibility. `try_send` never awaits; a full ring returns
         // immediately so the reader keeps polling (and therefore keeps ponging).
-        if self.ring.try_send(frame).is_err() {
-            metrics::counter!(RING_FULL_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
+        if self
+            .ring
+            .try_send(CapturedFrame {
+                seq,
+                endpoint: self.endpoint,
+                bytes: frame,
+            })
+            .is_err()
+        {
+            // The frame never entered the ring, so nothing downstream will ever
+            // release its reservation. Give it back here or the budget ratchets
+            // down on every count-full frame until it refuses everything —
+            // a slow strangulation that would look like the feed dying for no
+            // reason.
+            self.budget.release(len);
+            self.ring_full.increment(1);
             return FrameSinkOutcome::RingFull;
         }
         FrameSinkOutcome::Captured
@@ -1119,6 +1380,12 @@ where
     // idleness the instant it comes up.
     ticker.tick().await;
 
+    // Per-socket count of frames the ring refused, used only to throttle the
+    // log below. Scoped to this drain call, so a reconnect starts the ladder
+    // again — deliberate: a fresh connection that immediately backs up is
+    // worth hearing about even if the previous one already reported.
+    let mut ring_full_seen: u64 = 0;
+
     while action == SupervisorAction::Continue {
         tokio::select! {
             biased;
@@ -1139,6 +1406,41 @@ where
                                 "write-ahead log refused a Dhan frame — that frame is lost; \
                                  the reader keeps draining so the socket is not also lost"
                             );
+                        }
+                        if outcome == FrameSinkOutcome::RingFull {
+                            // 2026-08-11: this outcome used to bump a counter
+                            // and produce NO log line at all.
+                            //
+                            // The counter's documentation calls a full ring
+                            // "not capture loss — the consumer is behind",
+                            // and for a brief burst that is fair: the frame is
+                            // already in the WAL. But nothing re-folds WAL
+                            // frames into the database, so in practice a full
+                            // ring means those ticks and candles never arrive
+                            // — while the lane's health gauge still reads 1.
+                            // Silent permanent loss behind a green light is
+                            // exactly the class the charter forbids.
+                            //
+                            // Throttled by powers of two rather than rate-
+                            // limited: the first occurrence is always
+                            // reported, and a sustained storm degrades to a
+                            // handful of lines instead of one per frame. A
+                            // slow consumer must not be able to drown the log
+                            // it is being reported in.
+                            ring_full_seen = ring_full_seen.saturating_add(1);
+                            if ring_full_seen.is_power_of_two() {
+                                error!(
+                                    code = ErrorCode::WsGapConnectionState.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    dropped_on_this_socket = ring_full_seen,
+                                    "the frame ring is FULL — the fold cannot keep up, so this \
+                                     frame is not being turned into ticks or candles. It is in \
+                                     the write-ahead log, but nothing re-folds WAL frames, so \
+                                     treat this as data loss until that changes. Logged at \
+                                     1, 2, 4, 8 ... occurrences per socket to bound the noise."
+                                );
+                            }
                         }
                     }
                     SocketEvent::Closed { code } => {
@@ -1636,6 +1938,70 @@ mod tests {
         assert_eq!(spread, 15 * RECONNECT_JITTER_STEP_MS);
     }
 
+    #[test]
+    fn test_token_expiry_drops_all_sixteen_and_they_still_receive_distinct_delays() {
+        // The test above uses `code: None` — a Transient disconnect, which
+        // never touches the token-stale floor. So it proved the jitter works
+        // on the ONE path where sixteen sockets do NOT reliably drop together,
+        // and proved nothing about the path where they always do.
+        //
+        // Token expiry (807) is the real simultaneous-drop event: one JWT
+        // backs all sixteen sockets, so when it dies Dhan closes all sixteen
+        // inside the same second. That arm floors the delay at 5,000 ms, and
+        // until 2026-08-11 it floored the ALREADY-JITTERED value — every
+        // jittered delay on ladder rungs 0/1/2 is below 5,000, so `max`
+        // flattened all sixteen onto exactly 5,000 ms. Sixteen simultaneous
+        // wakeups, sixteen token renewals, sixteen handshakes, in one tick.
+        //
+        // This test fails on that code and passes on the fix.
+        let now = t0();
+        let mut delays = Vec::new();
+        for endpoint in DhanEndpointType::ALL {
+            for pool_index in 0..endpoint.max_connections() {
+                let mut s = sup(endpoint, pool_index, now);
+                let _ = s.on_event(ConnEvent::BeginDial, now);
+                let _ = s.on_event(ConnEvent::DialSucceeded, now);
+                let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+                match s.on_event(
+                    ConnEvent::Disconnected {
+                        code: Some(DisconnectCode::AccessTokenExpired),
+                    },
+                    now,
+                ) {
+                    SupervisorAction::RefreshTokenThenDial { delay_ms } => delays.push(delay_ms),
+                    other => panic!("807 must refresh the token then dial, got {other:?}"),
+                }
+            }
+        }
+
+        assert_eq!(delays.len(), 16, "the authorized ceiling is 16 connections");
+        let unique: BTreeSet<u64> = delays.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            16,
+            "a token expiry drops ALL sixteen at once — each must still wake at its own \
+             instant, or we hand Dhan sixteen simultaneous renewals: {delays:?}"
+        );
+
+        // Every one still respects the floor: the point of the fix is to keep
+        // the floor AND the fan-out, not to trade one for the other.
+        for d in &delays {
+            assert!(
+                *d >= TOKEN_STALE_REDIAL_FLOOR_MS,
+                "a token-stale redial must never be shorter than the floor: {d}"
+            );
+        }
+        // Index 0 gets zero stagger, so the minimum is exactly the floor.
+        assert_eq!(
+            delays.iter().min().copied().unwrap_or(0),
+            TOKEN_STALE_REDIAL_FLOOR_MS
+        );
+        assert_eq!(
+            delays.iter().max().copied().unwrap_or(0),
+            TOKEN_STALE_REDIAL_FLOOR_MS + 15 * RECONNECT_JITTER_STEP_MS
+        );
+    }
+
     proptest! {
         #[test]
         fn prop_on_event_is_total_and_delays_stay_bounded(
@@ -1826,17 +2192,60 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
             tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
         );
 
         let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
         assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::Captured);
-        assert_eq!(rx.try_recv().ok(), Some(frame));
+        let published = rx.try_recv().expect("a captured frame must be published");
+        assert_eq!(published.bytes, frame);
+        assert!(
+            published.seq > 0,
+            "the published frame must carry the sequence minted at the read \
+             instant — a zero would mean nothing stamped it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_ring_sink_stamps_a_distinct_ascending_seq_per_frame() {
+        // Two arrivals of BYTE-IDENTICAL content must still receive distinct
+        // sequences, or the DEDUP key would collapse them and the second tick
+        // would be silently lost. This is the live index-loss class recorded in
+        // data-integrity.md (23,146.45 → .75 → .45 on a volume-0 index).
+        let dir = wal_dir("seqascend");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let sink = WalRingSink::new(
+            spill,
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+        );
+
+        let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::Captured);
+        assert_eq!(sink.accept(frame), FrameSinkOutcome::Captured);
+
+        let first = rx.try_recv().expect("first frame published");
+        let second = rx.try_recv().expect("second frame published");
+        assert!(
+            second.seq > first.seq,
+            "identical content must still get a strictly greater sequence: \
+             {} then {}",
+            first.seq,
+            second.seq
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1849,8 +2258,14 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Bytes>(1);
-        let sink = WalRingSink::new(spill, tx, WsType::LiveFeed, DhanEndpointType::MainFeed);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+        let sink = WalRingSink::new(
+            spill,
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+        );
 
         assert_eq!(
             sink.accept(Bytes::from_static(b"first")),
@@ -1860,6 +2275,170 @@ mod tests {
             sink.accept(Bytes::from_static(b"second")),
             FrameSinkOutcome::RingFull,
             "a full ring is a lag signal, never silent capture loss"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- ring byte budget ---------------------------------------------------
+
+    #[test]
+    fn test_ring_byte_budget_cap_reports_the_configured_ceiling() {
+        // `cap()` is what the lane's boot line reports as `ring_max_bytes`.
+        // It exists so the operator sees the queue's size in the unit that
+        // actually runs out — reporting only the 65,536 frame count is how a
+        // 16 GiB ceiling hid behind a number that looks modest.
+        let b = RingByteBudget::new(256 * 1024 * 1024);
+        assert_eq!(b.cap(), 256 * 1024 * 1024);
+        assert_eq!(b.resident(), 0, "a fresh budget holds nothing");
+        assert!(b.try_reserve(1_000));
+        assert_eq!(
+            b.cap(),
+            256 * 1024 * 1024,
+            "cap is the CEILING and must not move as frames come and go — only \
+             resident() tracks occupancy"
+        );
+    }
+
+    #[test]
+    fn test_try_reserve_never_exceeds_the_cap() {
+        let b = RingByteBudget::new(100);
+        assert!(b.try_reserve(60));
+        assert_eq!(b.resident(), 60);
+        assert!(b.try_reserve(40), "exactly filling the cap must be allowed");
+        assert_eq!(b.resident(), 100);
+        assert!(!b.try_reserve(1), "one byte past the cap must be refused");
+        assert_eq!(
+            b.resident(),
+            100,
+            "a REFUSED reserve must not move the counter — a fetch_add-then-check \
+             would have left the overshoot behind, which is the bound failing to bound"
+        );
+    }
+
+    #[test]
+    fn test_try_reserve_refuses_a_frame_larger_than_the_whole_cap() {
+        let b = RingByteBudget::new(1_024);
+        assert!(
+            !b.try_reserve(4_096),
+            "a frame bigger than the entire budget cannot be admitted — admitting it \
+             would mean the budget does not bound"
+        );
+        assert_eq!(b.resident(), 0);
+        // And the budget is still usable afterwards: one oversized frame must
+        // not poison it for the frames that follow.
+        assert!(b.try_reserve(512));
+        assert_eq!(b.resident(), 512);
+    }
+
+    #[test]
+    fn test_ring_byte_budget_release_saturates_and_never_wraps() {
+        let b = RingByteBudget::new(1_000);
+        assert!(b.try_reserve(100));
+        // Over-release: a bookkeeping bug, deliberately made harmless. Wrapping
+        // to usize::MAX here would refuse every subsequent frame forever —
+        // turning a counting error into a total feed outage.
+        b.release(10_000);
+        assert_eq!(b.resident(), 0, "release must saturate at zero, not wrap");
+        assert!(
+            b.try_reserve(1_000),
+            "the budget must still admit frames after an over-release"
+        );
+    }
+
+    #[test]
+    fn test_wal_ring_sink_returns_the_reservation_when_the_count_bound_refuses() {
+        // The leak this pins: the byte reserve is taken BEFORE `try_send`, so a
+        // frame refused by the COUNT bound has a reservation nothing downstream
+        // will ever release. Without the release on that path the budget
+        // ratchets down on every count-full frame until it refuses everything —
+        // a slow strangulation that would present as the feed dying for no
+        // visible reason, long after the burst that caused it.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-ring-budget-leak-{}-{}",
+            std::process::id(),
+            next_frame_seq()
+        ));
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        // Capacity 1: the second frame is refused by COUNT, not by bytes.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+        let budget = std::sync::Arc::new(RingByteBudget::new(1_000_000));
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+        );
+
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"0123456789")),
+            FrameSinkOutcome::Captured
+        );
+        assert_eq!(budget.resident(), 10);
+
+        for _ in 0..50 {
+            assert_eq!(
+                sink.accept(Bytes::from_static(b"0123456789")),
+                FrameSinkOutcome::RingFull
+            );
+        }
+        assert_eq!(
+            budget.resident(),
+            10,
+            "only the ONE frame actually sitting in the ring may hold a reservation; \
+             50 count-refused frames must each have given theirs back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_ring_sink_refuses_on_the_byte_bound_before_the_count_bound() {
+        // The whole point of the second bound: a ring with plenty of SLOTS free
+        // still refuses when those slots would hold too many BYTES.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-ring-budget-bytes-{}-{}",
+            std::process::id(),
+            next_frame_seq()
+        ));
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        // 64 slots, but only 25 bytes of budget: the count bound cannot bind.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(64);
+        let budget = std::sync::Arc::new(RingByteBudget::new(25));
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                sink.accept(Bytes::from_static(b"0123456789")),
+                FrameSinkOutcome::Captured
+            );
+        }
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"0123456789")),
+            FrameSinkOutcome::RingFull,
+            "20 of 25 bytes are resident and 62 slots are free — the BYTE bound must \
+             refuse the third frame, which is the bound the count alone never gave"
+        );
+
+        // Draining releases, and the sink accepts again — proving this is
+        // backpressure, not a latch.
+        let taken = rx.try_recv().expect("a captured frame must be published");
+        budget.release(taken.bytes.len());
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"0123456789")),
+            FrameSinkOutcome::Captured,
+            "releasing on drain must re-open the budget"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -3712,12 +3712,26 @@ mod tests {
         assert!(!s.contains("cross_source_spot_divergence"));
     }
 
-    /// PHASE-B2 (item 2): kill-switch-OFF byte-equivalence pin — with
-    /// `native_retry_enabled = false` the runner passes `leg_is_chain = true`
-    /// for spots, so every class keeps the legacy class-blind budget and the
-    /// legacy target expression survives in the source. Malformed is the ONE
-    /// spec-sanctioned exception on BOTH arms: never retried (budget 0).
-    #[test]
+    // ⚠ ORPHANED DOC — 2026-08-11. The block below documents a PHASE-B2
+    // (item 2) kill-switch-OFF byte-equivalence pin: with
+    // `native_retry_enabled = false` the runner passes `leg_is_chain = true`
+    // for spots, so every class keeps the legacy class-blind budget and the
+    // legacy target expression survives in the source; Malformed is the ONE
+    // spec-sanctioned exception on BOTH arms (never retried, budget 0).
+    //
+    // ITS FUNCTION BODY DOES NOT EXIST. The doc and a bare `#[test]` sat here
+    // with no `fn` after them, so the attribute bound to the NEXT test
+    // instead — which rustc reported only as a `duplicated attribute`
+    // warning inside a test module, where `cargo clippy --workspace` (no
+    // `--tests`) never looks. The described pin has therefore been absent for
+    // however long, while its documentation read as though it were enforced.
+    //
+    // Converted to a plain comment rather than deleted: deleting it would
+    // erase the evidence that a regression pin was lost, which is the only
+    // reason anyone would know to restore it. Reconstructing the body is a
+    // cadence-lane task with its own scope — flagged, deliberately not
+    // guessed at here, because a re-written pin that asserts something
+    // subtly different from the original is worse than a missing one.
     /// 2026-07-31 REGRESSION PIN. The rung index was clamped with a literal
     /// `.min(2)` — the last index of the then-3-rung table. When #1714 grew
     /// the ladder to 6 rungs that literal shipped unchanged, so every attempt

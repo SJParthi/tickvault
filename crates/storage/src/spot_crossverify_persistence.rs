@@ -707,4 +707,57 @@ mod tests {
         assert!(conf.starts_with("http::addr=tv-questdb:9000;"));
         assert!(!conf.contains("tcp::"), "must not use ILP TCP: {conf}");
     }
+
+    #[test]
+    fn test_new_never_panics_when_questdb_is_unreachable() {
+        // The production constructor runs at BOOT, and boot happens on a box
+        // where QuestDB may not be up yet -- the container start is racing us.
+        // Its whole contract is "degrade, never panic": a panic here takes the
+        // process down before a single cross-verification can run, so the
+        // audit trail this writer exists to produce would be lost for the day
+        // by the very code meant to record it.
+        //
+        // A host that cannot resolve is the realistic shape of that race.
+        let cfg = QuestDbConfig {
+            host: "questdb-that-does-not-exist.invalid".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let writer = SpotXverifyAuditWriter::new(&cfg);
+
+        // Whichever arm the ILP builder takes -- HTTP senders are lazy, so an
+        // unresolvable host may still construct -- the writer must come back
+        // USABLE and empty. Asserting the arm itself would pin a reqwest
+        // implementation detail; asserting the invariant pins the contract.
+        assert_eq!(
+            writer.pending(),
+            0,
+            "a freshly constructed writer holds no rows"
+        );
+    }
+
+    #[test]
+    fn test_new_produces_a_writer_that_still_buffers_without_a_connection() {
+        // The degraded writer must keep ACCEPTING rows rather than refusing
+        // them: the findings are computed once a day and cannot be
+        // recomputed, so dropping them at append time loses them permanently.
+        // Buffering keeps them alive for a later flush, and flush is where the
+        // honest failure is reported.
+        let cfg = QuestDbConfig {
+            host: "questdb-that-does-not-exist.invalid".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let mut writer = SpotXverifyAuditWriter::new(&cfg);
+        writer
+            .append_cell(&sample_cell())
+            .expect("append must succeed even with no live connection");
+        assert_eq!(
+            writer.pending(),
+            1,
+            "the row must be buffered, not silently discarded"
+        );
+    }
 }
