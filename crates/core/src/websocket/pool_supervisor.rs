@@ -961,10 +961,32 @@ pub struct WalRingSink {
     budget: std::sync::Arc<RingByteBudget>,
     ws_type: WsType,
     endpoint: DhanEndpointType,
+    /// Loss counters resolved ONCE at construction — see the note on
+    /// [`WalRingSink::new`] for why the macro form is banned on this path.
+    wal_dropped: metrics::Counter,
+    ring_full: metrics::Counter,
+    ring_bytes_full: metrics::Counter,
 }
 
 impl WalRingSink {
     /// Wires a sink to a WAL, a bounded ring, and the ring's byte budget.
+    ///
+    /// # Why the counters are resolved here and not at the emit site
+    ///
+    /// `metrics::counter!(NAME, "label" => value)` builds a `Key` on EVERY
+    /// call, and a keyed `Key` owns a `Vec<Label>` — so the macro form heap
+    /// allocates once per invocation. Putting it on `accept`'s drop paths puts
+    /// an allocation on the one path that only executes when the system is
+    /// ALREADY under pressure: the ring is full, the WAL refused, the process
+    /// is losing data. Allocating there is both a violation of principle 1
+    /// (zero allocation on the hot path) and, practically, the worst possible
+    /// moment to ask the allocator for anything.
+    ///
+    /// The `endpoint` label is fixed for the lifetime of a sink, so a single
+    /// handle per sink covers every emit — no `OnceLock`, no per-call lookup.
+    /// `Counter::increment` on a resolved handle is a plain atomic add: O(1),
+    /// zero allocation. Same shape as `DrainCounters` in the app crate and
+    /// `dispatcher.rs`'s pre-resolved handles.
     #[must_use]
     pub fn new(
         spill: std::sync::Arc<WsFrameSpill>,
@@ -973,13 +995,39 @@ impl WalRingSink {
         ws_type: WsType,
         endpoint: DhanEndpointType,
     ) -> Self {
-        Self {
+        let endpoint_label = endpoint.as_str();
+        let sink = Self {
             spill,
             ring,
             budget,
             ws_type,
             endpoint,
-        }
+            wal_dropped: metrics::counter!(WAL_DROP_METRIC, "endpoint" => endpoint_label),
+            ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
+            ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
+        };
+        sink.pre_register();
+        sink
+    }
+
+    /// Publishes a zero on every loss series this sink owns.
+    ///
+    /// # Why a zero has to be published at all
+    ///
+    /// The CloudWatch agent computes a counter's alarm value as a DELTA
+    /// between consecutive samples, and it has no previous sample for a series
+    /// that has never been emitted — so it drops the first one. If the first
+    /// emission a series ever sees is the outage itself, that outage is the
+    /// dropped sample and the alarm does not fire for it. Publishing a zero at
+    /// construction makes the harmless zero the dropped sample instead, which
+    /// is the whole point.
+    ///
+    /// Called from `new` so it cannot be forgotten at a call site: a sink that
+    /// exists has published its baseline.
+    fn pre_register(&self) {
+        self.wal_dropped.increment(0);
+        self.ring_full.increment(0);
+        self.ring_bytes_full.increment(0);
     }
 }
 
@@ -993,7 +1041,7 @@ impl FrameSink for WalRingSink {
         // one the consumer stamps.
         // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
         if self.spill.append_with_seq(self.ws_type, frame.clone(), seq) == AppendOutcome::Dropped {
-            metrics::counter!(WAL_DROP_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
+            self.wal_dropped.increment(1);
             return FrameSinkOutcome::WalDropped;
         }
         // Step 2 — byte budget. Consulted BEFORE `try_send` because a reserve
@@ -1003,9 +1051,8 @@ impl FrameSink for WalRingSink {
         // budget and the ring disagree.
         let len = frame.len();
         if !self.budget.try_reserve(len) {
-            metrics::counter!(RING_FULL_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
-            metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => self.endpoint.as_str())
-                .increment(1);
+            self.ring_full.increment(1);
+            self.ring_bytes_full.increment(1);
             return FrameSinkOutcome::RingFull;
         }
         // Step 3 — visibility. `try_send` never awaits; a full ring returns
@@ -1025,7 +1072,7 @@ impl FrameSink for WalRingSink {
             // a slow strangulation that would look like the feed dying for no
             // reason.
             self.budget.release(len);
-            metrics::counter!(RING_FULL_METRIC, "endpoint" => self.endpoint.as_str()).increment(1);
+            self.ring_full.increment(1);
             return FrameSinkOutcome::RingFull;
         }
         FrameSinkOutcome::Captured
