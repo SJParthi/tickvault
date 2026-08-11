@@ -1517,8 +1517,10 @@ async fn main() -> Result<()> {
     // when off, so a disabled boot has exactly one observable difference from
     // an enabled one — which is what makes "is it on?" answerable from the
     // log rather than from the config file.
-    let _dhan_universe_rider =
-        tickvault_app::dhan_universe::spawn_dhan_universe_rider(config.dhan_universe.clone());
+    let _dhan_universe_rider = tickvault_app::dhan_universe::spawn_dhan_universe_rider(
+        config.dhan_universe.clone(),
+        config.questdb.clone(),
+    );
 
     if config.groww_universe.enabled {
         let _groww_universe_rider =
