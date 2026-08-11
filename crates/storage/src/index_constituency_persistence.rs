@@ -8,11 +8,32 @@
 //! ```sql
 //! -- which stocks are in NIFTY BANK today?
 //! SELECT symbol_name FROM index_constituency
-//!   WHERE ts = today() AND index_name = 'Nifty Bank';
+//!   WHERE index_name = 'Nifty Bank' AND status = 'active';
 //! -- which indices is RELIANCE (sid 2885) in today?
 //! SELECT index_name FROM index_constituency
-//!   WHERE ts = today() AND security_id = 2885;
+//!   WHERE security_id = 2885 AND status = 'active';
 //! ```
+//!
+//! ## `status = 'active'` is MANDATORY on every membership query
+//!
+//! The designated `ts` is pinned to a constant (see below), so it carries NO
+//! date information and `WHERE ts = today()` is meaningless here — the earlier
+//! version of this doc showed exactly that query, which is why the filter is
+//! spelled out now rather than left implied.
+//!
+//! Rows are UPSERTed in place and **never deleted** (SEBI point-in-time, §25),
+//! so a stock DROPPED from an index at a rebalance keeps its row forever. Read
+//! without the `status` filter and you get the historical UNION of everything
+//! that has ever been in that index — which reads exactly like a correct
+//! answer, just with too many stocks in it.
+//!
+//! Since 2026-08-11 that is detectable: every row carries `status`,
+//! `last_seen_date` and `expired_date` (the `instrument_lifecycle` I-P1-08
+//! pattern), and [`mark_missing_index_constituents_expired`] runs after each
+//! successful bulk write to flip rows that today's lists did not mention. A
+//! constituent that returns to the index auto-reactivates on the next write —
+//! ILP UPSERT replaces the whole row, so `status` goes back to `active` and
+//! `expired_date` returns to NULL.
 //!
 //! This is the MAP-ONLY surface (§31 item 2). It does NOT change the live
 //! WebSocket subscription, which stays the NTM-union-only set (the 2-WS lock +
@@ -65,6 +86,18 @@ pub const INDEX_CONSTITUENCY_FEED_DHAN: &str = tickvault_common::feed::Feed::Dha
 /// S3 archive job depend on the exact string.
 pub const QUESTDB_TABLE_INDEX_CONSTITUENCY: &str = "index_constituency";
 
+/// `status` value for a constituent present in TODAY's constituent list.
+///
+/// Wire-format SYMBOL — operator SQL filters on this literal, so it is stable
+/// across releases (the `instrument_lifecycle` I-P1-08 precedent).
+pub const INDEX_CONSTITUENCY_STATUS_ACTIVE: &str = "active";
+
+/// `status` value for a constituent that was in this table but is ABSENT from
+/// today's list — i.e. dropped at an index rebalance.
+///
+/// The row is NEVER deleted (SEBI point-in-time retention, §25); it is marked.
+pub const INDEX_CONSTITUENCY_STATUS_EXPIRED: &str = "expired";
+
 /// Composite DEDUP key — one CURRENT-STATE row per (index, stock, feed).
 ///
 /// `ts` is the designated timestamp, satisfying QuestDB's
@@ -110,6 +143,9 @@ const INDEX_CONSTITUENCY_COLUMNS: &[&str] = &[
     "source",
     "dry_run",
     "feed",
+    "status",
+    "last_seen_date",
+    "expired_date",
 ];
 
 /// One `index_constituency` row — borrows so the bulk writer allocates nothing
@@ -145,6 +181,22 @@ pub struct IndexConstituencyRow<'a> {
     pub feed: &'a str,
 }
 
+impl IndexConstituencyRow<'_> {
+    /// The `last_seen_date` this row stamps: the IST trading-date midnight it
+    /// was built for.
+    ///
+    /// Deliberately derived from `trading_date_ist_nanos` rather than added as
+    /// a fourth caller-supplied field. That field was previously vestigial —
+    /// retained only "for caller compatibility" after the ts-pin took its
+    /// original job away — so reusing it both keeps every call site unchanged
+    /// and gives it a real purpose again. Two sources for one date could drift;
+    /// one cannot.
+    #[must_use]
+    pub const fn last_seen_date_nanos(&self) -> i64 {
+        self.trading_date_ist_nanos
+    }
+}
+
 /// Idempotent `CREATE TABLE IF NOT EXISTS` for `index_constituency`.
 ///
 /// Cold path — called once at boot before the bulk write. Logs (does not
@@ -177,7 +229,10 @@ pub async fn ensure_index_constituency_table(questdb_config: &QuestDbConfig) {
             via_isin BOOLEAN, \
             source SYMBOL, \
             dry_run BOOLEAN, \
-            feed SYMBOL\
+            feed SYMBOL, \
+            status SYMBOL, \
+            last_seen_date TIMESTAMP, \
+            expired_date TIMESTAMP\
         ) timestamp(ts) PARTITION BY DAY WAL \
         DEDUP UPSERT KEYS({DEDUP_KEY_INDEX_CONSTITUENCY});"
     );
@@ -223,6 +278,35 @@ pub async fn ensure_index_constituency_table(questdb_config: &QuestDbConfig) {
         format!(
             "ALTER TABLE {QUESTDB_TABLE_INDEX_CONSTITUENCY} \
              DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_INDEX_CONSTITUENCY});"
+        ),
+        // Rebalance-lifecycle self-heal (2026-08-11). Additive + idempotent.
+        // These three columns are deliberately NOT in the DEDUP key: they are
+        // MUTABLE per-row state, and an UPSERT must be able to flip `status`
+        // back to active in place. Putting `status` in the key would make an
+        // expired row and its reactivated twin two SEPARATE rows — the exact
+        // duplicate-accumulation the ts-pin was introduced to kill.
+        format!(
+            "ALTER TABLE {QUESTDB_TABLE_INDEX_CONSTITUENCY} \
+             ADD COLUMN IF NOT EXISTS status SYMBOL;"
+        ),
+        format!(
+            "ALTER TABLE {QUESTDB_TABLE_INDEX_CONSTITUENCY} \
+             ADD COLUMN IF NOT EXISTS last_seen_date TIMESTAMP;"
+        ),
+        format!(
+            "ALTER TABLE {QUESTDB_TABLE_INDEX_CONSTITUENCY} \
+             ADD COLUMN IF NOT EXISTS expired_date TIMESTAMP;"
+        ),
+        // Legacy rows (written before this change) carry a NULL status, and a
+        // NULL never matches `status = 'active'` — so without this backfill
+        // every pre-existing row would silently vanish from the very queries
+        // the new filter is meant to make correct. Seeding them `active` is
+        // the non-destructive direction: today's build then flips whichever
+        // ones are genuinely absent, so the table converges after ONE run
+        // instead of losing history.
+        format!(
+            "UPDATE {QUESTDB_TABLE_INDEX_CONSTITUENCY} \
+             SET status = '{INDEX_CONSTITUENCY_STATUS_ACTIVE}' WHERE status IS NULL;"
         ),
     ];
     for ddl in &self_heal {
@@ -574,6 +658,11 @@ fn build_index_constituency_ilp_row(
     buffer.symbol("source", sanitize_ilp_symbol(row.source).as_ref())?;
     // `feed` is a DEDUP-key SYMBOL — ALWAYS written (operator override 2026-06-28).
     buffer.symbol("feed", sanitize_ilp_symbol(row.feed).as_ref())?;
+    // Every row this writer emits came from TODAY's constituent list, so it is
+    // active BY CONSTRUCTION — there is no code path that ILP-writes an expired
+    // row. Expiry is only ever applied afterwards, by the UPDATE in
+    // `mark_missing_index_constituents_expired`, to rows today did NOT touch.
+    buffer.symbol("status", INDEX_CONSTITUENCY_STATUS_ACTIVE)?;
     // Optional SYMBOL — skip when empty (→ NULL, not empty ILP symbol).
     if !row.isin.is_empty() {
         buffer.symbol("isin", sanitize_ilp_symbol(row.isin).as_ref())?;
@@ -582,6 +671,15 @@ fn build_index_constituency_ilp_row(
     buffer.column_i64("security_id", row.security_id)?;
     buffer.column_bool("via_isin", row.via_isin)?;
     buffer.column_bool("dry_run", row.dry_run)?;
+    buffer.column_ts(
+        "last_seen_date",
+        TimestampNanos::new(row.last_seen_date_nanos()),
+    )?;
+    // `expired_date` is deliberately NOT written. QuestDB's DEDUP UPSERT
+    // replaces the WHOLE row, so an omitted column lands NULL — which is
+    // precisely the reactivation semantics we want: a constituent that returns
+    // to the index gets a clean `active` row with no stale expiry date on it.
+    // Writing a sentinel here would leave that date to be misread later.
     // Pin the designated ts to constant epoch 0 (NOT row.trading_date_ist_nanos)
     // so DEDUP collapses cross-day duplicates — mirrors lifecycle_designated_ts_nanos().
     buffer.at(TimestampNanos::new(index_constituency_designated_ts_nanos()))?;
@@ -624,6 +722,129 @@ pub async fn append_index_constituency_rows(
     Ok(())
 }
 
+/// Build the rebalance-expiry `UPDATE` for one `(feed, dry_run)` build.
+///
+/// Pure + unit-tested; [`mark_missing_index_constituents_expired`] is the thin
+/// network wrapper around it.
+///
+/// ## Why the `last_seen_date IS NULL` arm is load-bearing
+///
+/// `NULL < x` evaluates to NULL, not true — so a plain `last_seen_date <
+/// today` silently skips every row written before this column existed, and
+/// those are exactly the rows most likely to be stale. Because this UPDATE runs
+/// AFTER the bulk write, a legacy row that is STILL a constituent has just been
+/// UPSERTed with today's date and no longer matches; only the genuinely absent
+/// legacy rows keep their NULL. So the NULL arm expires precisely the right set,
+/// and the table converges after one run instead of carrying pre-2026-08-11
+/// rows as permanently active.
+///
+/// ## Why it is scoped by `feed` AND `dry_run`
+///
+/// Absence-from-today's-list is only evidence about the build that just ran.
+/// An unscoped UPDATE would let a Dhan build expire Groww's rows (a feed that
+/// simply did not run today looks identical to a feed whose constituents all
+/// vanished), and would let a `--dry-run-universe` boot expire real production
+/// rows — breaking the §27 dry-run isolation. Both are fail-closed here: a
+/// build can only ever expire rows it is itself responsible for.
+#[must_use]
+pub fn build_index_constituency_expiry_sql(
+    feed: &str,
+    dry_run: bool,
+    today_ist_nanos: i64,
+) -> String {
+    let today_micros = today_ist_nanos / 1_000;
+    let feed_symbol = sanitize_ilp_symbol(feed);
+    format!(
+        "UPDATE {QUESTDB_TABLE_INDEX_CONSTITUENCY} \
+         SET status = '{INDEX_CONSTITUENCY_STATUS_EXPIRED}', expired_date = {today_micros} \
+         WHERE status = '{INDEX_CONSTITUENCY_STATUS_ACTIVE}' \
+         AND feed = '{feed}' AND dry_run = {dry_run} \
+         AND (last_seen_date IS NULL OR last_seen_date < {today_micros});",
+        feed = feed_symbol.as_ref()
+    )
+}
+
+/// Flip constituents that today's lists did NOT mention to `expired`.
+///
+/// Call this ONLY after a SUCCESSFUL [`append_index_constituency_rows`] for the
+/// same build. Calling it after a partial or failed write would read that
+/// failure as "these stocks left their index" and expire live constituents —
+/// the caller therefore gates on the write's `Ok`, and the gating is what makes
+/// this safe rather than anything inside this function.
+///
+/// Never deletes (SEBI point-in-time, §25) and never touches another feed's or
+/// the other `dry_run` half's rows. Idempotent: a second run matches nothing,
+/// because the first already moved those rows out of `status = 'active'`.
+///
+/// Logs rather than returning `Err` — the mapping itself is already durably
+/// written at this point, and a failed expiry pass degrades to the PREVIOUS
+/// behaviour (a stale-but-present row) rather than losing anything. It is
+/// still logged at `error!` because a silently-skipped pass means membership
+/// queries quietly over-report, which is the defect this whole change exists
+/// to close.
+// TEST-EXEMPT: network I/O — the SQL is built by the unit-tested pure `build_index_constituency_expiry_sql`.
+pub async fn mark_missing_index_constituents_expired(
+    questdb_config: &QuestDbConfig,
+    feed: &str,
+    dry_run: bool,
+    today_ist_nanos: i64,
+) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            error!(
+                ?err,
+                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                "index_constituency rebalance-expiry: HTTP client build failed — \
+                 dropped constituents stay marked active, so membership queries \
+                 will over-report until the next successful run"
+            );
+            return;
+        }
+    };
+    let sql = build_index_constituency_expiry_sql(feed, dry_run, today_ist_nanos);
+    match client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                feed, dry_run, "index_constituency rebalance-expiry pass applied"
+            );
+        }
+        Ok(resp) => {
+            error!(
+                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                status = %resp.status(),
+                feed,
+                dry_run,
+                "index_constituency rebalance-expiry non-2xx — dropped constituents \
+                 stay marked active; membership queries will over-report"
+            );
+        }
+        Err(err) => {
+            error!(
+                ?err,
+                table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
+                feed,
+                dry_run,
+                "index_constituency rebalance-expiry request failed — dropped \
+                 constituents stay marked active; membership queries will over-report"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,10 +878,119 @@ mod tests {
         );
     }
 
+    /// The NULL arm is the whole reason a legacy table converges. `NULL < x` is
+    /// NULL in SQL, so without it every row written before `last_seen_date`
+    /// existed would stay `active` forever — and those are precisely the rows
+    /// most likely to be stale. Dropping this arm is a silent half-fix, which
+    /// is why it gets its own test rather than riding along in a broader one.
+    #[test]
+    fn test_expiry_sql_matches_null_last_seen_date_not_just_older_dates() {
+        let sql = build_index_constituency_expiry_sql(INDEX_CONSTITUENCY_FEED_DHAN, false, 0);
+        assert!(
+            sql.contains("last_seen_date IS NULL"),
+            "legacy rows carry a NULL last_seen_date and NULL < x is NULL, so \
+             omitting this arm leaves every pre-migration row permanently active: {sql}"
+        );
+        assert!(
+            sql.contains("last_seen_date <"),
+            "the ordinary stale-date arm must survive alongside the NULL arm: {sql}"
+        );
+    }
+
+    /// Absence from today's list is evidence about THIS build only. Without the
+    /// feed scope a Dhan-only run would expire every Groww row (a feed that did
+    /// not run looks identical to one whose constituents all vanished); without
+    /// the dry_run scope a `--dry-run-universe` boot would expire real rows,
+    /// breaking §27 isolation.
+    #[test]
+    fn test_expiry_sql_is_scoped_by_feed_and_dry_run() {
+        let sql = build_index_constituency_expiry_sql(INDEX_CONSTITUENCY_FEED_DHAN, false, 0);
+        assert!(
+            sql.contains("feed = 'dhan'"),
+            "must not expire another feed's rows: {sql}"
+        );
+        assert!(
+            sql.contains("dry_run = false"),
+            "must not let a dry-run build expire production rows: {sql}"
+        );
+
+        let dry = build_index_constituency_expiry_sql(INDEX_CONSTITUENCY_FEED_DHAN, true, 0);
+        assert!(
+            dry.contains("dry_run = true"),
+            "and symmetrically, a real build must not expire dry-run rows: {dry}"
+        );
+    }
+
+    /// Only `active` rows are candidates. Re-running must be a no-op rather
+    /// than re-stamping `expired_date` and destroying the original drop date —
+    /// which is the one fact the SEBI point-in-time record needs from this row.
+    #[test]
+    fn test_expiry_sql_is_idempotent_by_targeting_active_rows_only() {
+        let sql = build_index_constituency_expiry_sql(INDEX_CONSTITUENCY_FEED_DHAN, false, 0);
+        assert!(
+            sql.contains("WHERE status = 'active'"),
+            "a second pass must match nothing, preserving the first expiry date: {sql}"
+        );
+        assert!(
+            !sql.contains("DELETE"),
+            "rows are marked, never deleted — SEBI point-in-time §25: {sql}"
+        );
+    }
+
+    /// QuestDB SQL takes MICROseconds while the row API speaks nanoseconds. A
+    /// 1000× error here would compare an IST midnight against a timestamp in
+    /// 1970 and expire the entire table on the first run.
+    #[test]
+    fn test_expiry_sql_converts_nanos_to_micros() {
+        let nanos = 1_780_000_000_000_000_000_i64;
+        let sql = build_index_constituency_expiry_sql(INDEX_CONSTITUENCY_FEED_DHAN, false, nanos);
+        let micros = nanos / 1_000;
+        assert!(
+            sql.contains(&micros.to_string()),
+            "expected micros {micros} in: {sql}"
+        );
+        assert!(
+            !sql.contains(&nanos.to_string()),
+            "raw nanos must never reach the SQL — QuestDB would read it as a \
+             far-future timestamp and match every row: {sql}"
+        );
+    }
+
+    /// A row this writer emits is active by construction, and `last_seen_date`
+    /// must carry the build's own trading date — the value the expiry pass
+    /// compares against. If the writer stamped nothing, every row would look
+    /// legacy-NULL and the next run would expire the entire universe.
+    #[test]
+    fn test_written_row_is_active_and_stamps_last_seen_date() {
+        let row = sample_row();
+        assert_eq!(
+            row.last_seen_date_nanos(),
+            row.trading_date_ist_nanos,
+            "last_seen_date is derived from the build's trading date"
+        );
+
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        build_index_constituency_ilp_row(&mut buffer, &row).expect("row builds");
+        let wire = std::str::from_utf8(buffer.as_bytes()).expect("utf8 ILP");
+        assert!(
+            wire.contains("status=active"),
+            "every emitted row is from today's list, so it is active: {wire}"
+        );
+        assert!(
+            wire.contains("last_seen_date="),
+            "the expiry pass compares against this column: {wire}"
+        );
+        assert!(
+            !wire.contains("expired_date="),
+            "expired_date must be OMITTED so an UPSERT clears it on reactivation \
+             — writing a sentinel would leave a stale date to be misread: {wire}"
+        );
+    }
+
     #[test]
     fn test_ddl_columns_constant_matches_schema() {
-        // The 10 columns the DDL writes, pinned so the writer can't drift.
-        assert_eq!(INDEX_CONSTITUENCY_COLUMNS.len(), 10);
+        // The 13 columns the DDL writes, pinned so the writer can't drift.
+        assert_eq!(INDEX_CONSTITUENCY_COLUMNS.len(), 13);
         for col in [
             "ts",
             "index_name",
@@ -672,10 +1002,28 @@ mod tests {
             "source",
             "dry_run",
             "feed",
+            "status",
+            "last_seen_date",
+            "expired_date",
         ] {
             assert!(
                 INDEX_CONSTITUENCY_COLUMNS.contains(&col),
                 "missing column {col}"
+            );
+        }
+    }
+
+    /// The three lifecycle columns are mutable per-row STATE. Putting `status`
+    /// in the DEDUP key would make an expired row and its reactivated twin two
+    /// separate rows — re-creating exactly the duplicate accumulation the
+    /// constant-ts pin was introduced to eliminate.
+    #[test]
+    fn test_lifecycle_columns_are_not_in_the_dedup_key() {
+        for col in ["status", "last_seen_date", "expired_date"] {
+            assert!(
+                !DEDUP_KEY_INDEX_CONSTITUENCY.contains(col),
+                "{col} is mutable state and must stay OUT of the DEDUP key, so an \
+                 UPSERT can flip it in place: {DEDUP_KEY_INDEX_CONSTITUENCY}"
             );
         }
     }
