@@ -20,10 +20,17 @@ const STACK_SRC: &str = include_str!("../src/dhan_feed_stack.rs");
 #[test]
 fn dhan_feed_ingest_calls_the_aggregator_fold() {
     assert!(
-        STACK_SRC.contains("consume_tick_into_ring("),
+        STACK_SRC.contains("aggregator.consume_tick("),
         "LiveIngest must call the aggregator fold. `MultiTfAggregator` compiled \
          and passed its own unit tests with ZERO production callers from \
-         2026-07-17 until this lane wired it — existence proves nothing."
+         2026-07-17 until this lane wired it — existence proves nothing.\n\n\
+         (Needle updated 2026-08-11: the call was `consume_tick_into_ring` \
+         until the seals were re-routed from a private ring nothing drained \
+         to the process-wide seal writer. This guard went red at that rename \
+         and stayed red through a push, because only `--lib` tests were run. \
+         It is anchored on `aggregator.consume_tick(` — the receiver, not \
+         just the method — so an unrelated `consume_tick` elsewhere cannot \
+         satisfy it.)"
     );
 }
 
@@ -120,7 +127,7 @@ fn dhan_feed_gap_detector_observes_before_aggregator_refusal() {
         .find("self.detector.observe(")
         .expect("detector call site");
     let fold = STACK_SRC
-        .find("consume_tick_into_ring(")
+        .find("aggregator.consume_tick(")
         .expect("aggregator call site");
     assert!(
         observe < fold,

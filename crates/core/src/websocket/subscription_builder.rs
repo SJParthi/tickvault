@@ -300,9 +300,14 @@ pub fn build_twenty_depth_subscription_messages(
 /// Builds batched 20-level depth unsubscribe messages (RequestCode **25**).
 ///
 /// NOT 24. `docs/dhan-ref/04-full-market-depth-websocket.md:280` records that
-/// the vendor Python SDK's `fulldepth.py` derives unsubscribe as
-/// `subscribe_code + 1` = 24, which is a vendor SDK BUG; the Dhan Annexure
-/// value is 25 and that is what we send.
+/// the vendor's own reference client derives unsubscribe as
+/// `subscribe_code + 1` = 24, which is a bug in that client; the Dhan
+/// Annexure value is 25 and that is what we send.
+///
+/// (The vendor client's language is named in the referenced doc, not here —
+/// `rust-only-forever-lock-2026-07-19.md` keeps the interpreted-runtime's
+/// name out of Rust source, and the guard that enforces it does not care
+/// that the mention was descriptive.)
 pub fn build_twenty_depth_unsubscription_messages(
     instruments: &[InstrumentSubscription],
     batch_size: usize,

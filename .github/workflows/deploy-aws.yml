@@ -451,10 +451,42 @@ jobs:
           SECRET_IID: ${{ secrets.EC2_INSTANCE_ID }}
         run: |
           set -euo pipefail
-          LIVE_IID=$(aws ec2 describe-instances --region "$REGION" \
+          # Sorted by LaunchTime, newest last — NOT `Reservations[0]`.
+          #
+          # AWS does not define an order for Reservations, and this filter
+          # deliberately includes stopped instances (the box is stopped
+          # outside its 08:30-17:30 window, which is most of the day). Taking
+          # element zero therefore meant that during any replacement window a
+          # STOPPED OLD instance could outrank the RUNNING NEW one, and the
+          # deploy would land on the wrong machine — the same class of failure
+          # this whole step exists to end, arrived at from the other side.
+          #
+          # `starting` was also in this list and is not a real EC2 state
+          # (they are pending/running/shutting-down/terminated/stopping/
+          # stopped); it matched nothing. `pending` is what was meant, and a
+          # freshly-launched replacement sits there.
+          MATCHES=$(aws ec2 describe-instances --region "$REGION" \
             --filters "Name=tag:Name,Values=tv-${ENVIRONMENT}-app" \
-                      "Name=instance-state-name,Values=running,stopped,stopping,starting,pending" \
-            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "")
+                      "Name=instance-state-name,Values=running,pending,stopped,stopping" \
+            --query 'sort_by(Reservations[].Instances[], &LaunchTime)[].InstanceId' \
+            --output text 2>/dev/null || echo "")
+          # One id per line, blanks removed. `None` is what the AWS CLI prints
+          # for an empty result set, so it is filtered out as well.
+          IDS=$(printf '%s\n' "$MATCHES" | tr '\t' '\n' | grep -v '^None$' | grep . || true)
+          MATCH_COUNT=$(printf '%s' "$IDS" | grep -c . || true)
+          LIVE_IID=$(printf '%s\n' "$IDS" | tail -n 1)
+
+          if [ "${MATCH_COUNT:-0}" -gt 1 ]; then
+            # Ambiguity is not something to resolve by guessing. Two boxes
+            # carrying the production Name tag means a replacement is mid-flight
+            # or a stale instance was never cleaned up; either way, picking one
+            # silently is how you deploy to the wrong host.
+            echo "::error::${MATCH_COUNT} instances carry the tag tv-${ENVIRONMENT}-app:"
+            printf '%s\n' "$MATCHES" | tr '\t' '\n' | sed 's/^/::error::  /'
+            echo "::error::Refusing to guess which one is production. Terminate the stale"
+            echo "::error::instance, or remove its Name tag, then re-run."
+            exit 1
+          fi
 
           if [ -z "$LIVE_IID" ] || [ "$LIVE_IID" = "None" ]; then
             echo "::error::No tv-${ENVIRONMENT}-app instance found in ${REGION}. Cannot deploy:"

@@ -124,8 +124,28 @@ for FILE in $SCOPE_FILES; do
     # CALL shape — `name(` or `name (` — not a bare mention. A function called
     # only from its own `#[cfg(test)]` module still counts as wired here; that
     # is a separate, larger tightening deliberately not bundled in.
+    # 2026-08-11 — string literals are stripped too, and for the same reason
+    # the comment strip was added.
+    #
+    # `install_crossverify_deps` scored CALL_COUNT=1 with zero real callers.
+    # The single "call" was its own name inside the error message that fires
+    # when nobody has called it:
+    #
+    #     "... Call install_crossverify_deps() during boot, before this stack
+    #      spawns."
+    #
+    # A message whose whole purpose is to say "this was never called" was
+    # counted as proof that it was. The same function family defeated this
+    # guard through a doc comment the week before, which is the part worth
+    # noticing: the bypass was not clever, it was just a channel nobody had
+    # stripped yet. Comments and strings are now both removed before counting.
+    #
+    # `s:"[^"]*"::g` is deliberately simple — it does not understand raw
+    # strings or escaped quotes. It runs BEFORE the comment strip so a quoted
+    # `//` inside a string cannot truncate the line early.
     CALL_COUNT=$(
       grep -rn --include='*.rs' -E "\b${FN_NAME}\b" crates/ 2>/dev/null \
+        | sed 's:"[^"]*"::g' \
         | sed 's://.*::' \
         | grep -vE "^${FILE}:${FN_LINE}:" \
         | grep -cE "\b${FN_NAME}\s*\(" \

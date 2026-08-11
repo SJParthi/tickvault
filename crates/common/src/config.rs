@@ -368,11 +368,12 @@ impl Default for OrderRuntimeConfig {
 /// Groww-only, or both in parallel. Mirrors the `NotificationConfig`
 /// simple-boolean-with-`Default`-impl convention.
 ///
-/// `dhan_enabled` defaults to `true` (the existing system is UNCHANGED);
-/// `groww_enabled` defaults to `false` so a fresh deployment behaves
-/// exactly like today until Groww is explicitly switched on. Groww is
-/// native tickvault Rust reusing the same WAL/ring/spill/DLQ/aggregator
-/// chain — brutex is a design reference only, no code pulled.
+/// EVERY feed defaults to `false` (corrected 2026-08-11 — `dhan_enabled`
+/// previously defaulted to `true`, so an absent `[feeds]` section enabled a
+/// live market-data lane). A fresh or partial config now connects nothing;
+/// each feed is opt-in by explicit key. Groww is native tickvault Rust
+/// reusing the same WAL/ring/spill/DLQ/aggregator chain — brutex is a design
+/// reference only, no code pulled.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FeedsConfig {
     /// Dhan live feed (feed #1). Default ON — disabling it is only for
@@ -403,9 +404,23 @@ pub struct FeedsConfig {
 }
 
 impl Default for FeedsConfig {
+    /// Every feed OFF.
+    ///
+    /// `dhan_enabled` was `true` here until 2026-08-11, dating from when the
+    /// Dhan live feed was the only feed and "default = the existing system,
+    /// unchanged" was the right instinct. It stopped being right when that
+    /// feed was retired (2026-07-13) and the flag inverted meaning: it now
+    /// gates a lane that is supposed to be off, so an ABSENT or misspelled
+    /// `[feeds]` section silently turned it back on.
+    ///
+    /// That is a default failing OPEN on a live market-data connection. The
+    /// boot site's own comment described the environment variable as "the
+    /// belt to the config's braces" — but the braces were backwards, and a
+    /// belt is not a reason to leave them that way. Absent config now means
+    /// nothing connects.
     fn default() -> Self {
         Self {
-            dhan_enabled: true,
+            dhan_enabled: false,
             groww_enabled: false,
             truedata_enabled: false,
             truedata: TruedataConfig::default(),
@@ -5447,21 +5462,31 @@ mod tests {
     // dhan ON/groww OFF (default), groww-only, both, both-off.
     // =======================================================================
 
-    /// RATCHET: the default MUST keep Dhan ON and Groww OFF so a fresh
-    /// deployment (or a missing `[feeds]` block) behaves byte-identically
-    /// to today's Dhan-only system. Flipping either default requires a
-    /// dated operator quote per the scope rule file.
+    /// RATCHET: EVERY feed defaults OFF, so a fresh deployment or a missing
+    /// `[feeds]` block connects nothing.
+    ///
+    /// This ratchet was inverted on 2026-08-11. It previously required Dhan
+    /// to default ON, with the stated reason "a fresh deployment behaves
+    /// byte-identically to today's Dhan-only system" — correct when written,
+    /// and quietly wrong from the moment the Dhan live feed was retired on
+    /// 2026-07-13. After that, "unchanged" meant OFF, and the ratchet was
+    /// pinning a default that would silently enable a live market-data lane
+    /// whenever the `[feeds]` section was absent, misspelled, or lost.
+    ///
+    /// A default that fails toward CONNECTING is the wrong direction for a
+    /// feed flag. Turning a feed on should require saying so.
     #[test]
-    fn test_feeds_config_default_dhan_on_groww_off() {
+    fn test_feeds_config_default_is_every_feed_off() {
         let feeds = FeedsConfig::default();
         assert!(
-            feeds.dhan_enabled,
-            "Dhan must default ON (system unchanged)"
+            !feeds.dhan_enabled,
+            "Dhan must default OFF — an absent [feeds] section must never enable a live feed"
         );
         assert!(
             !feeds.groww_enabled,
             "Groww must default OFF (opt-in; zero prod behaviour change)"
         );
+        assert!(!feeds.truedata_enabled, "TrueData must default OFF");
     }
 
     /// Dual-feed scoreboard PR-A (2026-07-10): the `[scoreboard]` section
@@ -7128,7 +7153,12 @@ mod tests {
             .merge(Toml::string("[other]\nx = 1\n"))
             .extract()
             .expect("missing [feeds] must use defaults, not error");
-        assert!(wrapper.feeds.dhan_enabled);
+        // Every feed OFF since 2026-08-11 — a config with no `[feeds]` block
+        // must not bring a live market-data lane up by omission.
+        assert!(
+            !wrapper.feeds.dhan_enabled,
+            "a missing [feeds] section must leave Dhan OFF"
+        );
         assert!(!wrapper.feeds.groww_enabled);
         // TrueData (feed #4) ships DEFAULT-OFF; an absent key/section keeps
         // the day-0 disabled shape (serde default) — port 8086 sandbox default.

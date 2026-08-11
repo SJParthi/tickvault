@@ -917,8 +917,11 @@ const DRAIN_REPORT_EVERY: u64 = 1_024;
 async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
-) {
+) -> DrainOutcome {
     let mut seen: u64 = 0;
+    let mut folded: u64 = 0;
+    let mut depth_unconsumed: u64 = 0;
+    let mut unparseable: u64 = 0;
     let mut flush_timer = tokio::time::interval(FLUSH_INTERVAL);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -944,9 +947,11 @@ async fn run_frame_drain(
                 // would be counted "unparseable" and silently lost.
                 match frame.endpoint {
                     DhanEndpointType::MainFeed => {
-                        drain_main_feed_frame(
+                        let outcome = drain_main_feed_frame(
                             &mut ingest, &frame, received_at_nanos, recv_millis, c,
                         );
+                        folded = folded.saturating_add(outcome.folded);
+                        unparseable = unparseable.saturating_add(outcome.unparseable);
                     }
                     DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => {
                         // Captured durably in the WAL, counted here, and NOT
@@ -954,6 +959,7 @@ async fn run_frame_drain(
                         // has named no depth instruments. Counting it as its own
                         // outcome keeps it honest — it is neither a tick nor a
                         // parse failure.
+                        depth_unconsumed = depth_unconsumed.saturating_add(1);
                         c.depth_unconsumed.increment(1);
                     }
                     DhanEndpointType::OrderUpdate => c.non_tick.increment(1),
@@ -995,6 +1001,18 @@ async fn run_frame_drain(
          live ticks will be folded this session"
     );
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
+    // Returned so the fold is OBSERVABLE (2026-08-11). Previously this took
+    // `ingest` by value and returned `()`, which made the drain a black box:
+    // its test could assert only that the future completed, and would have
+    // passed just as happily on a drain that discarded every frame. The
+    // production caller ignores the value; the tests are why it exists.
+    DrainOutcome {
+        ingest,
+        frames_seen: seen,
+        folded,
+        depth_unconsumed,
+        unparseable,
+    }
 }
 
 /// Rows buffered before a flush is forced. At ~150 B/row this is a ~150 KB ILP
@@ -1021,7 +1039,8 @@ fn drain_main_feed_frame(
     received_at_nanos: i64,
     recv_millis: u64,
     c: &DrainCounters,
-) {
+) -> FrameOutcome {
+    let mut out = FrameOutcome::default();
     // A single WebSocket message may carry SEVERAL stacked packets — the
     // frame cap is sized for ~1,600 of them. Walking the frame packet by
     // packet is what stops packets 2..N being silently discarded.
@@ -1032,12 +1051,13 @@ fn drain_main_feed_frame(
             // Unrecognised code or a trailing partial packet: stop here rather
             // than resynchronising on a guess, which would fabricate ticks.
             c.unparseable.increment(1);
-            return;
+            out.unparseable = out.unparseable.saturating_add(1);
+            return out;
         };
         let end = offset.saturating_add(len);
         if end > frame.bytes.len() {
             c.truncated.increment(1);
-            return;
+            return out;
         }
         match dispatch_frame(&frame.bytes[offset..end], received_at_nanos) {
             Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _)) => {
@@ -1045,7 +1065,10 @@ fn drain_main_feed_frame(
                 // per ROW or two ticks in one message would collapse into one
                 // under the DEDUP key. The packet index is folded in.
                 match ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis) {
-                    IngestOutcome::Folded { .. } => c.folded.increment(1),
+                    IngestOutcome::Folded { .. } => {
+                        c.folded.increment(1);
+                        out.folded = out.folded.saturating_add(1);
+                    }
                     IngestOutcome::SeqUnrepresentable => c.seq_unrepresentable.increment(1),
                     IngestOutcome::AggregatorRefused => c.aggregator_refused.increment(1),
                     IngestOutcome::WriteFailed => c.write_failed.increment(1),
@@ -1061,6 +1084,7 @@ fn drain_main_feed_frame(
                 // logs protocol drift; a second log line here would amplify a
                 // malformed-frame storm into a log flood.
                 c.unparseable.increment(1);
+                out.unparseable = out.unparseable.saturating_add(1);
             }
         }
         offset = end;
@@ -1069,9 +1093,42 @@ fn drain_main_feed_frame(
             // A frame claiming more packets than the protocol can produce is
             // malformed or hostile; stop walking rather than loop on it.
             c.truncated.increment(1);
-            return;
+            return out;
         }
     }
+    out
+}
+
+/// What one main-feed frame produced.
+///
+/// These numbers are already published as metrics; this struct exists so they
+/// are also RETURNABLE. Metrics are process-global and awkward to assert on,
+/// which is precisely why the drain's tests could only check that it finished.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FrameOutcome {
+    /// Packets in this frame that became a buffered row.
+    pub folded: u64,
+    /// Packets refused by the parser or by an unknown response code.
+    pub unparseable: u64,
+}
+
+/// What a whole drain run produced, plus the ingest it produced it with.
+///
+/// Returned rather than discarded so the socket→store seam is observable from
+/// a test. Without it, `run_frame_drain` is a black box whose only assertable
+/// property is that it terminates — and a drain that silently threw every
+/// frame away terminates just as promptly as one that works.
+pub struct DrainOutcome {
+    /// The ingest, after the final flush.
+    pub ingest: LiveIngest,
+    /// Frames taken off the ring.
+    pub frames_seen: u64,
+    /// Packets folded into buffered rows.
+    pub folded: u64,
+    /// Depth frames captured and deliberately not folded.
+    pub depth_unconsumed: u64,
+    /// Packets the parser refused.
+    pub unparseable: u64,
 }
 
 /// Packets we will walk within one main-feed message before declaring the
@@ -1179,6 +1236,26 @@ pub struct DhanFeedStackParams {
     /// is the durability floor, and a live feed without it would report ticks
     /// as captured that a process kill would erase.
     pub spill: Option<Arc<WsFrameSpill>>,
+    /// Whether the REST candle fold is also running and writing Dhan candles.
+    ///
+    /// Both this lane and the REST fold send sealed candles to the SAME
+    /// process-wide seal writer, which lands them in the same `candles_<tf>`
+    /// tables stamped `feed='dhan'`. The DEDUP key is
+    /// `(ts, security_id, segment, feed)` — every column identical for the
+    /// same minute of the same instrument. There is no column that says WHICH
+    /// source produced the row, so QuestDB upserts one over the other and the
+    /// survivor is whichever wrote last.
+    ///
+    /// That is bad on its own and worse downstream: the 15:31 comparator reads
+    /// `candles_1m WHERE feed='dhan'` as the LIVE side of its check. If
+    /// REST-derived rows land there, it compares the REST record against the
+    /// REST record — a tautology that always agrees, on the one check that
+    /// exists to detect disagreement.
+    ///
+    /// Separating them properly needs a source discriminator in the key, which
+    /// is a schema decision. Until that decision is made, running both is
+    /// REFUSED rather than silently corrupted.
+    pub rest_fold_writes_dhan_candles: bool,
 }
 
 /// Brings up the Dhan 16-connection live feed if — and only if — both gates are
@@ -1261,12 +1338,59 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         "Dhan 16-connection live feed planned (operator authorization 2026-08-09)"
     );
 
+    // ---- exclusivity floor -------------------------------------------------
+    // Two writers into one table under a key that cannot tell them apart is
+    // silent data loss, so this refuses rather than corrupts. See the
+    // `rest_fold_writes_dhan_candles` field docs for the full reasoning.
+    if params.rest_fold_writes_dhan_candles {
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            "Dhan live feed is enabled while the REST candle fold is ALSO writing Dhan \
+             candles — REFUSING to open any socket. Both write sealed candles into the same \
+             candles_<tf> tables stamped feed='dhan', and the dedup key cannot tell them \
+             apart, so one silently overwrites the other. It would also make the 15:31 \
+             cross-verification compare the REST record against itself and always agree. \
+             Turn OFF [rest_candle_fold] to run the live lane, or leave the live lane off."
+        );
+        return;
+    }
+
+    // ---- verification floor ------------------------------------------------
     // The 15:31 cross-verify is BLOCKING, not optional: the main feed has no
     // snapshot-on-subscribe and no sequence number, so packet loss is
     // invisible at the protocol level and this comparator is the only ground
-    // truth the lane has. Spawned here, inside the same gate, so it can never
-    // be enabled without its own verifier.
-    spawn_daily_crossverify(&params.main_feed_instruments);
+    // truth the lane has.
+    //
+    // 2026-08-11: this block previously CALLED `spawn_daily_crossverify` and
+    // discarded the result, one line below a comment asserting the check was
+    // "BLOCKING, not optional ... it can never be enabled without its own
+    // verifier". Both halves were false. Nothing registered the comparator's
+    // dependencies, so it always took its refusal branch, and the lane opened
+    // all sixteen sockets regardless — capturing data it had no way to verify
+    // while the comment said that was impossible.
+    //
+    // It is now a real refusal, in the same shape as the WAL floor below.
+    // Ordered FIRST among the three because it is the cheapest to satisfy and
+    // the most expensive to discover missing: a lane with no WAL loses ticks
+    // visibly on the next restart, whereas a lane with no verifier looks
+    // perfect right up until someone compares it against the broker's record.
+    let Some(crossverify) = spawn_daily_crossverify(&params.main_feed_instruments) else {
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            planned_connections = plan.len(),
+            "Dhan live feed is enabled but the 15:31 cross-verification could not be armed — \
+             REFUSING to open any socket. This feed carries no sequence number and no \
+             snapshot-on-subscribe, so the daily comparison against Dhan's own REST record is \
+             the ONLY way packet loss can ever be detected. Capturing without it would produce \
+             data that cannot be verified, and a missing minute would be indistinguishable \
+             from a quiet one. Call install_crossverify_deps() during boot, before this stack \
+             spawns."
+        );
+        return;
+    };
+    // Held for the lane's lifetime so the comparator cannot be dropped while
+    // sockets are still capturing.
+    let _crossverify = crossverify;
 
     // ---- capture floor -----------------------------------------------------
     // Refused, not degraded: a live feed with no write-ahead log would report
@@ -1912,8 +2036,56 @@ mod tests {
             // Deliberately `Some`-less: proving the CONFIG gate refuses first,
             // before anything looks at the durability floor.
             spill: None,
+            // Likewise irrelevant here — the config gate is checked before any
+            // of the three floors, and this test pins that ordering.
+            rest_fold_writes_dhan_candles: false,
         });
         assert!(handle.is_none(), "a disabled lane must spawn nothing");
+    }
+
+    #[test]
+    fn test_dual_candle_writer_refusal_is_wired_before_any_socket() {
+        // Source-order pin for the exclusivity floor.
+        //
+        // The live lane and the REST fold both seal into `candles_<tf>`
+        // stamped `feed='dhan'`, and the dedup key — ts, security_id, segment,
+        // feed — has no column that distinguishes them. Every column matches
+        // for the same minute of the same instrument, so QuestDB upserts one
+        // over the other with no error and no counter. The 15:31 comparator
+        // then reads that same table as its LIVE side, which would make it
+        // compare the REST record against the REST record and agree every
+        // time.
+        //
+        // Asserting on source order rather than behaviour because the refusal
+        // returns before constructing anything observable — the property that
+        // matters is that it happens BEFORE the sockets, not that it logs.
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        let refusal = production
+            .find("rest_fold_writes_dhan_candles {")
+            .expect("the exclusivity floor must exist in the bring-up");
+        let verification = production
+            .find("spawn_daily_crossverify(&params.main_feed_instruments)")
+            .expect("the verification floor must exist");
+        // `run_connection` is the call that actually opens a socket. Anchoring
+        // on the bare word "dial" matched a doc comment hundreds of lines
+        // earlier and made this assertion pass for the wrong reason — the
+        // same read-the-prose-not-the-code mistake the wiring guard made.
+        let dial = production
+            .find("run_connection(socket")
+            .expect("the dial site must exist");
+
+        assert!(
+            refusal < verification,
+            "the exclusivity check must come before the comparator is armed — arming a \
+             comparator that would then read its own input is worse than not arming it"
+        );
+        assert!(
+            refusal < dial,
+            "the exclusivity check must come before ANY socket is dialed"
+        );
     }
 
     #[test]
@@ -2225,12 +2397,31 @@ mod tests {
 
         // Completes rather than hanging: the drain must exit when its last
         // sender is gone, or a dead lane would look alive forever.
-        tokio::time::timeout(
+        let drained = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             run_frame_drain(rx, ingest),
         )
         .await
         .expect("the drain must end when the ring closes");
+
+        // And it must actually have FOLDED the frame. Until 2026-08-11 this
+        // test stopped at the line above — it asserted only that the future
+        // completed, which a drain that discarded every frame would satisfy
+        // just as well. The name said "folds"; the body checked "ends".
+        assert_eq!(
+            drained.folded, 1,
+            "the ticker frame must be folded, not merely consumed"
+        );
+        assert_eq!(
+            drained.ingest.pending_rows(),
+            0,
+            "the drain's exit flush must clear the buffer — this is the tail of the \
+             session, and rows left pending here never reach the database"
+        );
+        assert_eq!(
+            drained.unparseable, 0,
+            "a well-formed ticker frame must not be counted unparseable"
+        );
     }
 
     #[tokio::test]
@@ -2252,12 +2443,31 @@ mod tests {
         .expect("send");
         drop(tx);
 
-        tokio::time::timeout(
+        let drained = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             run_frame_drain(rx, ingest),
         )
         .await
         .expect("a depth frame must never hang or panic the drain");
+
+        // This test had ZERO assertions until 2026-08-11. Feeding a depth
+        // frame to the main-feed dispatcher returns an Err rather than
+        // panicking, so the misrouting the test is named for would have left
+        // it green. It now pins the routing itself.
+        assert_eq!(
+            drained.depth_unconsumed, 1,
+            "a depth frame must be routed by its endpoint and counted as unconsumed"
+        );
+        assert_eq!(
+            drained.unparseable, 0,
+            "a depth frame must NEVER reach the main-feed parser — its 12-byte header \
+             parsed as an 8-byte one is the bug this routing exists to prevent, and it \
+             shows up here as an unparseable count"
+        );
+        assert_eq!(
+            drained.folded, 0,
+            "depth is captured but not folded into ticks today"
+        );
     }
 
     // -- structural proofs --------------------------------------------------
