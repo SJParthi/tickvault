@@ -1497,12 +1497,19 @@ mod tests {
         );
     }
 
-    /// Scoreboard PR-D meta-guard: main.rs MUST (a) init the per-instrument
-    /// presence registry in the process-global boot prefix BEFORE the Groww
-    /// feed spawns (the boot-read fold gate; single boot path since PR-C2,
-    /// 2026-07-13 — the fast crash-recovery arm was deleted with the Dhan
-    /// live-WS lane) and (b) reset the presence bitsets in the IST-midnight
-    /// task next to the day-lag histogram reset.
+    // ORPHANED DOC, demoted to a plain comment 2026-08-11. This block used
+    // `///` while the test it documented had already been retired below, so
+    // it was documentation attached to whatever item happened to follow —
+    // here, an unrelated AUTH-GAP-05 guard. Demoted rather than deleted: the
+    // text records what the retired guard covered, which is the only way a
+    // future reader learns the coverage existed.
+    //
+    // Scoreboard PR-D meta-guard: main.rs MUST (a) init the per-instrument
+    // presence registry in the process-global boot prefix BEFORE the Groww
+    // feed spawns (the boot-read fold gate; single boot path since PR-C2,
+    // 2026-07-13 — the fast crash-recovery arm was deleted with the Dhan
+    // live-WS lane) and (b) reset the presence bitsets in the IST-midnight
+    // task next to the day-lag histogram reset.
     // RETIRED (2026-07-18, stage-4 dead-producer sweep):
     // test_feed_presence_is_wired_into_main died with the machinery it
     // pinned — the per-instrument presence registry

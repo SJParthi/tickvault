@@ -1604,7 +1604,7 @@ mod tests {
         );
         let rows = parse_groww_master(&csv).unwrap();
         let (map, ambiguous) = build_isin_token_map(&rows);
-        assert!(map.get("INE002A01018").is_none(), "ambiguous ISIN excluded");
+        assert!(!map.contains_key("INE002A01018"), "ambiguous ISIN excluded");
         assert_eq!(ambiguous, vec!["INE002A01018".to_string()]);
     }
 
