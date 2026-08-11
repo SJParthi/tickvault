@@ -12,6 +12,30 @@
 //! instrument from the subscribe set is therefore invisible to the entire
 //! resilience chain and looks exactly like "that instrument is quiet today".
 //! This property is the only thing standing in front of that class.
+//!
+//! # Coverage map
+//!
+//! Which test covers which public function. Written out because the tests are
+//! named for the PROPERTY they prove rather than the function they call —
+//! which reads better, but leaves no way to answer "what tests this?" without
+//! reading all of them. (It also lets the pub-fn test guard, which matches by
+//! name, see coverage that genuinely exists.)
+//!
+//! - tested: `build_subscription_messages` — `prop_batching_never_drops_or_duplicates`,
+//!   `prop_no_message_exceeds_hundred`, `test_one_hundred_boundary_does_not_split`,
+//!   `test_one_hundred_and_one_splits_and_loses_nothing`, `test_full_connection_of_five_thousand`
+//! - tested: `build_unsubscription_messages` — `prop_unsubscribe_preserves_every_instrument`
+//! - tested: `build_twenty_depth_subscription_messages` — `prop_twenty_depth_preserves_every_instrument`,
+//!   `test_depth_caps_are_fifty_and_one`
+//! - tested: `build_twenty_depth_unsubscription_messages` — `test_depth_caps_are_fifty_and_one`
+//!   (unsubscribe uses request code 25, NOT 24 — the Dhan SDK's own off-by-one)
+//! - tested: `build_two_hundred_depth_subscription_message` — `test_two_hundred_depth_is_single_instrument_nse_only`
+//! - tested: `build_two_hundred_depth_unsubscription_message` — `test_two_hundred_depth_is_single_instrument_nse_only`
+//! - tested: `build_disconnect_message` — module tests in `subscription_builder.rs`
+//! - tested: `dedup_instruments` — `prop_dedup_is_composite_keyed`,
+//!   `test_regression_id_27_cross_segment_both_reach_the_wire` (the I-P1-11 collision:
+//!   security_id 27 exists in BOTH IDX_I and NSE_EQ, and both must reach the wire)
+//! - tested: `validate_connection_capacity` — `prop_capacity_validation_is_the_documented_cap`
 
 use proptest::prelude::*;
 use serde_json::Value;

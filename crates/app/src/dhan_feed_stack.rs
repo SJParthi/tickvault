@@ -807,6 +807,9 @@ struct DrainCounters {
     flush_failed: metrics::Counter,
     depth_unconsumed: metrics::Counter,
     truncated: metrics::Counter,
+    xverify_ran: metrics::Counter,
+    xverify_failed: metrics::Counter,
+    xverify_no_token: metrics::Counter,
 }
 
 impl DrainCounters {
@@ -845,8 +848,16 @@ fn counters() -> &'static DrainCounters {
         flush_failed: metrics::counter!(FLUSH_COUNTER, "outcome" => "failed"),
         depth_unconsumed: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "depth_unconsumed"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
+        xverify_ran: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "ran"),
+        xverify_failed: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed"),
+        xverify_no_token: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token"),
     })
 }
+
+/// Counter: daily cross-verification attempts, by outcome. Anything other than
+/// `ran` means the session's captured candles were never checked against
+/// Dhan's own record.
+pub const XVERIFY_RUNS_COUNTER: &str = "tv_dhan_feed_xverify_runs_total";
 
 /// Counter: sealed candles handed to the process-wide seal writer.
 pub const SEALS_EMITTED_COUNTER: &str = "tv_dhan_feed_seals_emitted_total";
@@ -1504,12 +1515,110 @@ pub fn spawn_daily_crossverify(
         return None;
     }
     Some(tokio::spawn(async move {
+        // 2026-08-11 — this body used to be a single `info!` saying the
+        // verification was "scheduled". Nothing was scheduled. The lane's ONLY
+        // loss detector was a log line, and the log line said it was working:
+        // the precise false-OK shape audit Rule 11 exists to forbid, in the
+        // one place where being wrong is undetectable by any other means (the
+        // main feed carries no sequence number and no snapshot-on-subscribe).
         info!(
             targets = targets.len(),
             run_at_ist = "15:31",
-            "Dhan live-feed 15:31 cross-verification scheduled"
+            "Dhan live-feed cross-verification armed — it will compare captured candles \
+             against Dhan's own REST record after the close"
         );
+        loop {
+            let sleep_secs = secs_until_next_run_ist(now_ist_secs_of_day());
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+
+            let Some(deps) = CROSSVERIFY_DEPS.get() else {
+                // Unreachable in practice (the caller checked), but a `let
+                // else` beats an unwrap on a path that must never panic a
+                // long-lived task.
+                return;
+            };
+            let Some(jwt) = (deps.jwt_provider)() else {
+                counters().xverify_no_token.increment(1);
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    "Dhan live-feed cross-verification could not run: no JWT available. The \
+                     day's captured candles are UNVERIFIED — packet loss for this session is \
+                     undetectable."
+                );
+                continue;
+            };
+
+            let ist = tickvault_common::trading_calendar::ist_offset();
+            let today = chrono::Utc::now().with_timezone(&ist).date_naive();
+            let day_start_ist_nanos = today
+                .and_hms_opt(0, 0, 0)
+                .and_then(|dt| dt.and_local_timezone(ist).single())
+                .map_or(0, |dt| dt.timestamp_nanos_opt().unwrap_or(0));
+
+            let client = reqwest::Client::new();
+            match crate::dhan_live_crossverify::run_cross_verification(
+                &client,
+                &deps.questdb_exec_url,
+                &deps.intraday_url,
+                &jwt,
+                &targets,
+                today,
+                day_start_ist_nanos,
+                &deps.config,
+            )
+            .await
+            {
+                Ok(report) => {
+                    counters().xverify_ran.increment(1);
+                    info!(
+                        targets = targets.len(),
+                        ?report,
+                        "Dhan live-feed cross-verification finished — this is the honest \
+                         measure of whether the revived feed agrees with Dhan's own record"
+                    );
+                }
+                Err(err) => {
+                    counters().xverify_failed.increment(1);
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        %err,
+                        "Dhan live-feed cross-verification FAILED to run — the day's captured \
+                         candles are UNVERIFIED, never assume they are clean"
+                    );
+                }
+            }
+        }
     }))
+}
+
+/// IST seconds-of-day at which the comparator runs: 15:31, one minute after
+/// the 15:30 close, so the final minute's candle has sealed.
+pub const XVERIFY_RUN_AT_SECS_OF_DAY_IST: u64 = 15 * 3_600 + 31 * 60;
+
+/// Seconds in a day.
+const SECS_PER_DAY: u64 = 24 * 3_600;
+
+/// Seconds to sleep from `now_secs_of_day` until the next 15:31 IST.
+///
+/// Pure, so the schedule is testable without waiting a day. Returns a full day
+/// when called exactly at the run time, which is the right way round: firing
+/// twice in one session would double-count the verdict, and firing a day late
+/// merely delays it.
+#[must_use]
+pub const fn secs_until_next_run_ist(now_secs_of_day: u64) -> u64 {
+    if now_secs_of_day < XVERIFY_RUN_AT_SECS_OF_DAY_IST {
+        XVERIFY_RUN_AT_SECS_OF_DAY_IST - now_secs_of_day
+    } else {
+        SECS_PER_DAY - now_secs_of_day + XVERIFY_RUN_AT_SECS_OF_DAY_IST
+    }
+}
+
+/// Current IST seconds-of-day.
+#[must_use]
+pub fn now_ist_secs_of_day() -> u64 {
+    let ist = chrono::Utc::now().with_timezone(&tickvault_common::trading_calendar::ist_offset());
+    let t = ist.time();
+    u64::from(chrono::Timelike::num_seconds_from_midnight(&t))
 }
 
 #[cfg(test)]
@@ -1923,7 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_packet_frame_yields_a_distinct_sequence_per_packet() {
+    fn test_ingest_tick_at_yields_a_distinct_sequence_per_packet() {
         // One WebSocket message, two packets for the SAME instrument. If both
         // rows shared the frame's single sequence they would share every
         // column of the ticks DEDUP key and QuestDB would upsert one onto the
@@ -1949,6 +2058,134 @@ mod tests {
             2,
             "both packets must produce their own row"
         );
+    }
+
+    #[test]
+    fn test_capture_seq_from_frame_seq_narrows_or_refuses() {
+        // Narrowing must never saturate. Saturating would pin every later tick
+        // to `i64::MAX`, collapsing them all onto ONE row under the DEDUP key —
+        // unbounded silent loss. Refusing loses one tick, loudly.
+        assert_eq!(capture_seq_from_frame_seq(0), Some(0));
+        assert_eq!(capture_seq_from_frame_seq(42), Some(42));
+        let max_ok = u64::try_from(i64::MAX).expect("i64::MAX fits u64");
+        assert_eq!(capture_seq_from_frame_seq(max_ok), Some(i64::MAX));
+        assert_eq!(
+            capture_seq_from_frame_seq(max_ok + 1),
+            None,
+            "an unrepresentable sequence must be REFUSED, never clamped"
+        );
+        assert_eq!(capture_seq_from_frame_seq(u64::MAX), None);
+    }
+
+    #[test]
+    fn test_seq_unrepresentable_tick_is_refused_and_counted_not_written() {
+        // The fail-closed path: nothing folded, nothing buffered, and the
+        // refusal is visible. A silently-stamped tick would corrupt a row that
+        // already exists.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let packet = ticker_packet(13, 100.0, 1_779_355_000);
+        let ParsedFrame::Tick(tick) =
+            dispatch_frame(&packet, 1_779_355_000_000_000_000).expect("parse")
+        else {
+            panic!("expected a tick");
+        };
+
+        let outcome = ingest.ingest_tick(&tick, u64::MAX, 1_779_355_000_000);
+
+        assert_eq!(outcome, IngestOutcome::SeqUnrepresentable);
+        assert_eq!(ingest.seq_refused(), 1, "the refusal must be counted");
+        assert_eq!(
+            ingest.pending_rows(),
+            0,
+            "a refused tick must not reach the writer buffer"
+        );
+    }
+
+    #[test]
+    fn test_crossverify_targets_and_crossverify_deps_installed_mirror_reality() {
+        // The comparator must verify exactly what was captured. Verifying a
+        // different set would produce a clean verdict about instruments the
+        // lane never subscribed.
+        let universe = hardcoded_index_universe();
+        let targets = crossverify_targets(&universe);
+
+        assert_eq!(
+            targets.len(),
+            universe.len(),
+            "one target per subscribed instrument, no more and no fewer"
+        );
+        for (t, i) in targets.iter().zip(universe.iter()) {
+            assert_eq!(t.security_id, i64::try_from(i.security_id).expect("fits"));
+            assert_eq!(t.segment, i.segment.as_str());
+        }
+        assert!(
+            crossverify_targets(&[]).is_empty(),
+            "an empty universe yields no targets rather than a default one"
+        );
+    }
+
+    #[test]
+    fn test_spawn_daily_crossverify_refuses_unless_install_crossverify_deps_ran() {
+        // A live lane with no verifier cannot detect the packet loss its
+        // protocol cannot report. `None` is a refusal, not a skip — and the
+        // caller logs it at ERROR.
+        //
+        // Note this asserts the state of a process-global OnceLock: in a test
+        // binary nothing installs deps, so `installed` is false here.
+        assert!(
+            !crossverify_deps_installed(),
+            "no test may install the global provider — it would leak across tests"
+        );
+        assert!(
+            spawn_daily_crossverify(&hardcoded_index_universe()).is_none(),
+            "without a provider the comparator must refuse to spawn"
+        );
+    }
+
+    #[test]
+    fn test_crossverify_schedule_lands_on_1531_ist_and_never_double_fires() {
+        // 15:31 = one minute after the close, so the final minute has sealed.
+        assert_eq!(XVERIFY_RUN_AT_SECS_OF_DAY_IST, 55_860);
+
+        // Before the run time: wait until today's.
+        assert_eq!(secs_until_next_run_ist(0), 55_860, "midnight → today 15:31");
+        assert_eq!(
+            secs_until_next_run_ist(55_859),
+            1,
+            "one second before → one second to wait"
+        );
+
+        // AT the run time: a full day, never zero. Zero would busy-loop the
+        // task and fire the comparator repeatedly within one session.
+        assert_eq!(
+            secs_until_next_run_ist(55_860),
+            SECS_PER_DAY,
+            "exactly at the run time must wait a full day, not fire again"
+        );
+
+        // After: tomorrow's.
+        assert_eq!(secs_until_next_run_ist(55_861), SECS_PER_DAY - 1);
+        assert_eq!(
+            secs_until_next_run_ist(SECS_PER_DAY - 1),
+            55_861,
+            "one second before midnight → tomorrow 15:31"
+        );
+
+        // Total over every second of the day: always a positive, bounded wait.
+        for s in (0..SECS_PER_DAY).step_by(97) {
+            let wait = secs_until_next_run_ist(s);
+            assert!(
+                wait > 0 && wait <= SECS_PER_DAY,
+                "wait from {s} was {wait} — must be positive and at most one day"
+            );
+        }
+    }
+
+    #[test]
+    fn test_now_ist_secs_of_day_is_within_a_day() {
+        // Total by construction; pinned so a timezone-handling change cannot
+        // silently produce an out-of-range value that skews the schedule.
+        assert!(now_ist_secs_of_day() < SECS_PER_DAY);
     }
 
     #[test]
@@ -2039,12 +2276,55 @@ mod tests {
             concat!("api-scrip-", "master"),
             concat!("Subscription", "Scope"),
             concat!("LOCKED_", "UNIVERSE"),
-            concat!("reqwest", "::"),
+            // The instrument-master CSV host. THIS is the thing Q3 forbids —
+            // an instrument download — and it stays banned by name.
+            concat!("images.", "dhan.co"),
         ] {
             assert!(
                 !production_half.contains(banned),
                 "the live-feed stack must never reach for an instrument download; found \
                  `{banned}`"
+            );
+        }
+
+        // NARROWED 2026-08-11, deliberately and with the reason recorded.
+        //
+        // This list used to ban `reqwest::` outright, as a blunt proxy for "no
+        // downloads". That proxy was wrong in a way that mattered: the 15:31
+        // cross-verification MUST make an HTTP call — it compares our captured
+        // candles against Dhan's own REST record, and it is the only ground
+        // truth this lane has (the main feed carries no sequence number and no
+        // snapshot-on-subscribe). Banning all HTTP would have banned the
+        // verifier that `websocket-connection-scope-lock.md` requires to be
+        // live from day one.
+        //
+        // So the ban moves from the TRANSPORT to the TARGET, which is what Q3
+        // actually cares about: no instrument-master host, no CSV downloader,
+        // no parser, no universe enum. HTTP to the authorized intraday-candles
+        // endpoint (a KEEP class under `no-rest-except-live-feed-2026-06-27.md`
+        // §8) is permitted — and pinned below to that one use, so this cannot
+        // quietly become a general licence to fetch.
+        let http_uses = production_half.matches(concat!("reqwest", "::")).count();
+        assert!(
+            http_uses <= 2,
+            "HTTP in this module is permitted ONLY for the 15:31 comparator (a Client type \
+             and its constructor). Found {http_uses} uses — if a new one is legitimate, say \
+             why here; if it is a fetch of instrument data, it violates Q3."
+        );
+        for (needle, why) in [
+            (
+                concat!("run_cross_", "verification"),
+                "the comparator must still be the caller",
+            ),
+            (
+                "intraday_url",
+                "the only endpoint this module may reach is the authorized intraday one",
+            ),
+        ] {
+            assert!(
+                production_half.contains(needle),
+                "the HTTP allowance is scoped to the comparator, but {why} — missing \
+                 `{needle}`"
             );
         }
     }

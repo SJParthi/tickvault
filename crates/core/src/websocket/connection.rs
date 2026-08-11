@@ -961,10 +961,179 @@ fn ws_bytes_to_bytes(payload: WsBytes) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickvault_common::constants::{TWENTY_DEPTH_PACKET_SIZE, TWO_HUNDRED_DEPTH_PACKET_SIZE};
+    use tickvault_common::constants::{
+        DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL,
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, TWENTY_DEPTH_PACKET_SIZE,
+        TWO_HUNDRED_DEPTH_PACKET_SIZE,
+    };
     use tickvault_common::types::{ExchangeSegment, SecurityId};
 
+    #[test]
+    fn test_build_feed_url_shape_per_endpoint() {
+        // Dhan's own reference requires all four query parameters on the main
+        // feed, and `version=2` ONLY there. A missing parameter is refused at
+        // the handshake with a code that looks like an auth failure, which
+        // sends the operator hunting the wrong problem.
+        let main = build_feed_url(
+            DhanEndpointType::MainFeed,
+            DHAN_MAIN_FEED_WS_BASE_URL,
+            FAKE_TOKEN,
+            FAKE_CLIENT_ID,
+        );
+        assert!(main.starts_with("wss://api-feed.dhan.co?version=2&token="));
+        assert!(main.contains("&clientId="));
+        assert!(main.ends_with("&authType=2"));
+
+        // depth-20 takes the same parameters WITHOUT `version=2`.
+        let d20 = build_feed_url(
+            DhanEndpointType::Depth20,
+            DHAN_TWENTY_DEPTH_WS_BASE_URL,
+            FAKE_TOKEN,
+            FAKE_CLIENT_ID,
+        );
+        assert!(
+            !d20.contains("version=2"),
+            "version=2 is main-feed only; sending it elsewhere is protocol drift"
+        );
+        assert!(d20.starts_with("wss://depth-api-feed.dhan.co/twentydepth?token="));
+
+        // depth-200 connects on the ROOT path — `/?token=`. This exact detail
+        // cost two weeks of ResetWithoutClosingHandshake in April 2026 before
+        // Dhan's own SDK settled it, so it is pinned rather than trusted.
+        let d200 = build_feed_url(
+            DhanEndpointType::Depth200,
+            DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
+            FAKE_TOKEN,
+            FAKE_CLIENT_ID,
+        );
+        assert!(
+            d200.starts_with("wss://full-depth-api.dhan.co/?token="),
+            "depth-200 must use the root path: {}",
+            redact_url_params(&d200)
+        );
+    }
+
+    #[test]
+    fn test_build_feed_url_tolerates_a_trailing_slash_on_the_base() {
+        // A base URL with a trailing slash is an easy config slip. Producing
+        // `host//?token=` would be refused by the server for a reason that
+        // reads as an auth problem, so the slash is trimmed rather than
+        // trusted.
+        let a = build_feed_url(
+            DhanEndpointType::MainFeed,
+            &trailing_slash_base(),
+            FAKE_TOKEN,
+            FAKE_CLIENT_ID,
+        );
+        let b = build_feed_url(
+            DhanEndpointType::MainFeed,
+            DHAN_MAIN_FEED_WS_BASE_URL,
+            FAKE_TOKEN,
+            FAKE_CLIENT_ID,
+        );
+        assert_eq!(*a, *b, "a trailing slash must not change the URL");
+    }
+
+    #[test]
+    fn test_build_subscribe_payload_refuses_an_empty_batch() {
+        // An empty batch means the caller has nothing to subscribe. Sending a
+        // zero-instrument message would be accepted by the server and deliver
+        // nothing forever — silence that looks like a dead market.
+        assert!(matches!(
+            build_subscribe_payload(DhanEndpointType::MainFeed, FeedMode::Quote, &[]),
+            Err(SubscribePayloadError::EmptyBatch)
+        ));
+    }
+
+    #[test]
+    fn test_build_subscribe_payload_refuses_an_overfull_depth_200_batch() {
+        // depth-200 is one instrument per connection. Silently dropping the
+        // extras would subscribe less than the caller asked for while
+        // reporting success.
+        let two = [
+            SubscribeInstrument {
+                security_id: SecurityId::from(13u32),
+                segment: ExchangeSegment::IdxI,
+            },
+            SubscribeInstrument {
+                security_id: SecurityId::from(25u32),
+                segment: ExchangeSegment::IdxI,
+            },
+        ];
+        assert!(matches!(
+            build_subscribe_payload(DhanEndpointType::Depth200, FeedMode::Quote, &two),
+            Err(SubscribePayloadError::Depth200Overfull { got: 2 })
+        ));
+    }
+
+    #[test]
+    fn test_build_subscribe_payload_emits_security_ids_as_strings() {
+        // Dhan requires SecurityId as a JSON STRING. A numeric id is rejected
+        // by the server, and the rejection does not name the field — so this
+        // is pinned at the payload level.
+        let one = [SubscribeInstrument {
+            security_id: SecurityId::from(13u32),
+            segment: ExchangeSegment::IdxI,
+        }];
+        let payload = build_subscribe_payload(DhanEndpointType::MainFeed, FeedMode::Quote, &one)
+            .expect("a single valid instrument must build");
+        assert!(
+            payload.contains("\"13\""),
+            "SecurityId must serialize as a string: {payload}"
+        );
+        assert!(
+            !payload.contains(":13,") && !payload.contains(&bare_id_at_object_end()),
+            "SecurityId must NOT serialize as a bare number: {payload}"
+        );
+    }
+
     const FAKE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMTA2NjU2ODgyIn0.sig";
+
+    /// The main-feed base with a trailing slash, for the trim test.
+    ///
+    /// Built by concatenation rather than written as a literal because the
+    /// banned-pattern scanner tracks `#[cfg(test)]` regions by counting braces
+    /// in the raw source — a `{` or `}` inside a string literal (as a
+    /// `format!` placeholder would be) closes the skip region early and
+    /// exposes the rest of the test module to production-only rules. Cheap to
+    /// avoid; confusing to debug.
+    fn trailing_slash_base() -> String {
+        let mut s = String::from(DHAN_MAIN_FEED_WS_BASE_URL);
+        s.push('/');
+        s
+    }
+
+    /// A bare numeric SecurityId immediately before a JSON object close.
+    ///
+    /// Assembled from a byte rather than written as a literal, and this doc
+    /// comment names no brace either, for one reason worth knowing before you
+    /// simplify it: the banned-pattern scanner decides where the
+    /// test-only region ends by counting brace characters in the RAW SOURCE,
+    /// comments and string contents included. A balanced pair (every format
+    /// placeholder) nets out and is harmless; a LONE closing brace shifts the
+    /// depth, ends the skip region early, and silently exposes the rest of
+    /// this test module to production-only rules. Two earlier attempts at this
+    /// helper — one in code, one in this very comment — did exactly that, and
+    /// the symptom was a pre-existing test 300 lines below being reported as a
+    /// hot-path violation.
+    fn bare_id_at_object_end() -> String {
+        let mut s = String::from(":13");
+        s.push(char::from(OBJECT_CLOSE_BYTE));
+        s
+    }
+
+    /// ASCII `0x7D`, the JSON object terminator.
+    const OBJECT_CLOSE_BYTE: u8 = 0x7D;
+
+    /// Owned copies of the production base URL / client id for the socket
+    /// constructors, which take `String`.
+    fn main_feed_base() -> String {
+        String::from(DHAN_MAIN_FEED_WS_BASE_URL)
+    }
+
+    fn fake_client_id() -> String {
+        String::from(FAKE_CLIENT_ID)
+    }
     /// A deliberately SYNTHETIC client id.
     ///
     /// This constant previously held the operator's REAL Dhan client id. The
@@ -1091,7 +1260,7 @@ mod tests {
         // `03-live-market-feed-websocket.md` rule 2: all four are required.
         let url = build_feed_url(
             DhanEndpointType::MainFeed,
-            "wss://api-feed.dhan.co",
+            DHAN_MAIN_FEED_WS_BASE_URL,
             FAKE_TOKEN,
             FAKE_CLIENT_ID,
         );
@@ -1108,7 +1277,7 @@ mod tests {
         // ResetWithoutClosingHandshake; the root path is what actually works.
         let url = build_feed_url(
             DhanEndpointType::Depth200,
-            "wss://full-depth-api.dhan.co",
+            DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
             FAKE_TOKEN,
             FAKE_CLIENT_ID,
         );
@@ -1125,7 +1294,7 @@ mod tests {
     fn test_depth_20_url_keeps_its_path_and_omits_version() {
         let url = build_feed_url(
             DhanEndpointType::Depth20,
-            "wss://depth-api-feed.dhan.co/twentydepth",
+            DHAN_TWENTY_DEPTH_WS_BASE_URL,
             FAKE_TOKEN,
             FAKE_CLIENT_ID,
         );
@@ -1138,7 +1307,7 @@ mod tests {
     fn test_trailing_slash_on_a_base_url_never_produces_a_double_slash() {
         let url = build_feed_url(
             DhanEndpointType::MainFeed,
-            "wss://api-feed.dhan.co/",
+            &trailing_slash_base(),
             FAKE_TOKEN,
             FAKE_CLIENT_ID,
         );
@@ -1171,7 +1340,7 @@ mod tests {
         // the exact leak class `redact_url_params` was extended for.
         let url = build_feed_url(
             DhanEndpointType::MainFeed,
-            "wss://api-feed.dhan.co",
+            DHAN_MAIN_FEED_WS_BASE_URL,
             FAKE_TOKEN,
             FAKE_CLIENT_ID,
         );
@@ -1404,8 +1573,8 @@ mod tests {
         let socket = DhanFeedSocketImpl::new(
             DhanSocketParams::new(
                 DhanEndpointType::MainFeed,
-                "wss://api-feed.dhan.co".to_string(),
-                FAKE_CLIENT_ID.to_string(),
+                main_feed_base(),
+                fake_client_id(),
             ),
             || None,
         );
@@ -1419,8 +1588,8 @@ mod tests {
         let mut socket = DhanFeedSocketImpl::new(
             DhanSocketParams::new(
                 DhanEndpointType::MainFeed,
-                "wss://api-feed.dhan.co".to_string(),
-                FAKE_CLIENT_ID.to_string(),
+                main_feed_base(),
+                fake_client_id(),
             ),
             || None,
         );
@@ -1433,8 +1602,8 @@ mod tests {
         let mut socket = DhanFeedSocketImpl::new(
             DhanSocketParams::new(
                 DhanEndpointType::MainFeed,
-                "wss://api-feed.dhan.co".to_string(),
-                FAKE_CLIENT_ID.to_string(),
+                main_feed_base(),
+                fake_client_id(),
             ),
             || None,
         );
@@ -1448,8 +1617,8 @@ mod tests {
         let mut socket = DhanFeedSocketImpl::new(
             DhanSocketParams::new(
                 DhanEndpointType::MainFeed,
-                "wss://api-feed.dhan.co".to_string(),
-                FAKE_CLIENT_ID.to_string(),
+                main_feed_base(),
+                fake_client_id(),
             ),
             || None,
         );
@@ -1464,8 +1633,8 @@ mod tests {
         let mut socket = DhanFeedSocketImpl::new(
             DhanSocketParams::new(
                 DhanEndpointType::MainFeed,
-                "wss://api-feed.dhan.co".to_string(),
-                FAKE_CLIENT_ID.to_string(),
+                main_feed_base(),
+                fake_client_id(),
             ),
             || None,
         );
@@ -1570,8 +1739,8 @@ mod tests {
         let mut socket = DhanFeedSocketImpl::new(
             DhanSocketParams::new(
                 DhanEndpointType::MainFeed,
-                "wss://api-feed.dhan.co".to_string(),
-                FAKE_CLIENT_ID.to_string(),
+                main_feed_base(),
+                fake_client_id(),
             ),
             || None,
         );
