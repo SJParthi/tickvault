@@ -2003,12 +2003,33 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Depth instrument sets, sourced from the per-minute option chain (operator
+    // 2026-08-11, second quote — "enable connect estbalish al lteh 16
+    // ocnenctions"). Indices have no order book, so the main feed's 4 hardcoded
+    // SIDs can never populate depth; the chain's per-leg `contract_security_id`
+    // is the only already-authorized source that also self-rolls at expiry.
+    //
+    // Selected BEFORE the spawn because the pool takes its instrument set once.
+    // An empty result opens zero depth sockets and says so at `error!` — it is
+    // never reported as "depth enabled" (the scope-lock's false-OK row).
+    let depth_universe = tickvault_app::dhan_depth_universe::load_depth_universe(
+        &config.questdb,
+        // Reuses the universe rider's own IST helpers rather than restating the
+        // convention here: IST wall-clock stamped as epoch, never the +5:30
+        // offset applied twice. A second copy of that rule is a second place
+        // for it to drift by 5.5 hours.
+        tickvault_app::dhan_universe::ist_midnight_nanos(
+            &tickvault_app::dhan_universe::today_ist_date(),
+        ),
+    )
+    .await;
+
     let _dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             dhan_enabled: config.feeds.dhan_enabled,
             main_feed_instruments: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
-            depth_20_instruments: Vec::new(),
-            depth_200_instruments: Vec::new(),
+            depth_20_instruments: depth_universe.depth_20,
+            depth_200_instruments: depth_universe.depth_200,
             questdb: config.questdb.clone(),
             // The process-wide WAL opened in STAGE-C above. This is the FIRST
             // frame-append consumer since PR-C2 retired the Dhan lane on
