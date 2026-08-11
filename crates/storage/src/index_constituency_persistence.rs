@@ -933,7 +933,7 @@ mod tests {
     /// most likely to be stale. Dropping this arm is a silent half-fix, which
     /// is why it gets its own test rather than riding along in a broader one.
     #[test]
-    fn test_expiry_sql_matches_null_last_seen_date_not_just_older_dates() {
+    fn test_build_index_constituency_expiry_sql_matches_null_last_seen_date() {
         let sql = build_index_constituency_expiry_sql(INDEX_CONSTITUENCY_FEED_DHAN, false, 0);
         assert!(
             sql.contains("last_seen_date IS NULL"),
