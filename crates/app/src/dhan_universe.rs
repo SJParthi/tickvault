@@ -32,7 +32,7 @@
 
 use std::time::Duration;
 
-use tickvault_common::config::DhanUniverseConfig;
+use tickvault_common::config::{DhanUniverseConfig, QuestDbConfig};
 use tickvault_common::constants::{
     DHAN_DETAILED_CSV_URL, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS_I64,
 };
@@ -47,6 +47,18 @@ use tracing::{error, info, warn};
 
 /// Seconds in a day. Named so the modulo below reads as intent.
 const SECS_PER_DAY: i64 = 86_400;
+
+/// How long to wait for the `index_constituency` TRUNCATE migration gate.
+///
+/// That one-shot migration wipes the WHOLE table — QuestDB has no row-level
+/// delete, so it cannot be scoped to one feed. Every writer must therefore
+/// wait for it, or its just-written rows are erased by a migration that ran
+/// moments later. Bounded so a gate that never opens degrades to a loud skip
+/// rather than wedging the rider forever.
+const MIGRATION_GATE_WAIT_SECS: u64 = 120;
+
+/// Provenance stamped on every persisted constituent row.
+const CONSTITUENCY_SOURCE: &str = "niftyindices";
 
 /// Backoff floor between failed attempts, doubling to the configured cap.
 const RETRY_BASE_SECS: u64 = 10;
@@ -178,7 +190,7 @@ fn parse_constituent_csv(index_name: &str, csv: &str) -> Vec<Constituent> {
 /// Any failure that leaves the day without a trustworthy mapping. The caller
 /// retries with backoff — it never proceeds on a partial result, because a
 /// partial mapping subscribes a partial universe and reports success.
-async fn build_once(date: &str) -> anyhow::Result<JoinOutcome> {
+async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinOutcome> {
     let client = build_hardened_csv_client().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // 1. The Dhan master. Logged by LABEL, never by URL (§18 last row).
@@ -259,8 +271,119 @@ async fn build_once(date: &str) -> anyhow::Result<JoinOutcome> {
         );
     }
 
+    // Disk first, then the table. The artifact is the cheaper, more reliable
+    // record; writing it before the network call means a QuestDB outage
+    // cannot cost us the day's mapping.
     write_mapping_atomic(date, &master, &index, &outcome)?;
+    persist_constituents(questdb, date, &outcome).await;
     Ok(outcome)
+}
+
+/// Persists the resolved mapping into the SEBI `index_constituency` table.
+///
+/// Runs only AFTER the join has passed its tolerance gate, so a rejected
+/// build never reaches the table — the artifact on disk and the table can
+/// disagree about a failed day, and the table is the one that must stay
+/// clean.
+///
+/// # Why failure here does NOT fail the build
+///
+/// The mapping is already written to disk and already correct. A QuestDB
+/// outage should not send the rider back to re-download 15 MB and redo a
+/// join that succeeded; the DEDUP UPSERT keys make tomorrow's write
+/// idempotent, so the row lands then. Reported at `error!` because a
+/// persistent failure means the SEBI point-in-time history is developing a
+/// hole, which is worth waking someone for — just not worth discarding good
+/// work over.
+async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &JoinOutcome) {
+    if outcome.resolved.is_empty() {
+        // Unreachable while the tolerance gate stands (an empty join reports
+        // fraction 1.0 and is rejected upstream), but asserted here anyway:
+        // if that gate is ever loosened, this must not quietly write nothing
+        // and log success.
+        warn!("no resolved constituents to persist — skipping (this should be unreachable)");
+        return;
+    }
+
+    tickvault_storage::index_constituency_persistence::ensure_index_constituency_table(questdb)
+        .await;
+
+    // The TRUNCATE migration is not feed-scoped: it wipes every row of every
+    // feed. Writing before it opens means writing rows it then erases —
+    // silently, since the write itself succeeds.
+    let gate =
+        tickvault_storage::index_constituency_persistence::index_constituency_migration_gate();
+    if !gate
+        .wait(Duration::from_secs(MIGRATION_GATE_WAIT_SECS))
+        .await
+    {
+        error!(
+            timeout_secs = MIGRATION_GATE_WAIT_SECS,
+            "index_constituency migration gate did not open — SKIPPING the persist rather than \
+             writing rows a later TRUNCATE would erase"
+        );
+        return;
+    }
+
+    let trading_date_ist_nanos = ist_midnight_nanos(date);
+    let rows: Vec<tickvault_storage::index_constituency_persistence::IndexConstituencyRow<'_>> =
+        outcome
+            .resolved
+            .iter()
+            .map(|r| {
+                tickvault_storage::index_constituency_persistence::IndexConstituencyRow {
+                    trading_date_ist_nanos,
+                    index_name: &r.index_name,
+                    // The table's column is i64; a security_id above i64::MAX
+                    // cannot exist in the master (it parsed from a decimal
+                    // field), but saturating beats wrapping into a negative id.
+                    security_id: i64::try_from(r.security_id).unwrap_or(i64::MAX),
+                    exchange_segment: r.exchange_segment.as_str(),
+                    symbol_name: &r.symbol,
+                    isin: &r.isin,
+                    // Every row here came from the ISIN primary key — the join
+                    // has no symbol-fallback path. Stamped true honestly, not
+                    // by default: if a fallback is ever added, this must
+                    // become per-row or the provenance column starts lying.
+                    via_isin: true,
+                    source: CONSTITUENCY_SOURCE,
+                    dry_run: false,
+                    feed: tickvault_storage::index_constituency_persistence::INDEX_CONSTITUENCY_FEED_DHAN,
+                }
+            })
+            .collect();
+
+    match tickvault_storage::index_constituency_persistence::append_index_constituency_rows(
+        questdb, &rows,
+    )
+    .await
+    {
+        Ok(()) => info!(
+            rows = rows.len(),
+            date, "index_constituency rows persisted (feed=dhan)"
+        ),
+        Err(err) => error!(
+            rows = rows.len(),
+            date,
+            error = %err,
+            "index_constituency persist FAILED — the mapping file is still correct on disk and \
+             tomorrow's write is DEDUP-idempotent, but today's point-in-time row is missing"
+        ),
+    }
+}
+
+/// IST midnight of `date` (`YYYY-MM-DD`) in epoch nanoseconds.
+///
+/// IST wall-clock stamped as epoch, per the house convention: the tick and
+/// audit tables store IST-as-epoch and NEVER add the +5:30 offset a second
+/// time. Getting this wrong shifts every row by 5.5 hours into the wrong
+/// trading day.
+fn ist_midnight_nanos(date: &str) -> i64 {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+        .unwrap_or(0)
 }
 
 /// Writes the day's mapping atomically: temp file, then rename.
@@ -333,7 +456,10 @@ fn write_mapping_atomic(
 // real logic — WHEN to run, including the boot-catch-up case that makes the 08:00 target work
 // against an 08:30 box — is `next_wait`, which is pure and has five tests covering both
 // boundaries and schedule drift.
-pub fn spawn_dhan_universe_rider(config: DhanUniverseConfig) -> tokio::task::JoinHandle<()> {
+pub fn spawn_dhan_universe_rider(
+    config: DhanUniverseConfig,
+    questdb: QuestDbConfig,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !config.enabled {
             info!("[dhan_universe] disabled — no instrument master download this boot");
@@ -353,7 +479,7 @@ pub fn spawn_dhan_universe_rider(config: DhanUniverseConfig) -> tokio::task::Joi
                 tokio::time::sleep(wait).await;
                 continue;
             }
-            match build_once(&today).await {
+            match build_once(&today, &questdb).await {
                 Ok(outcome) => {
                     attempt = 0;
                     built_for = Some(today.clone());
@@ -473,6 +599,45 @@ mod tests {
         let utc_2000 = 20 * 3600;
         assert_eq!(ist_secs_of_day(utc_2000), 3600 + 1800);
         assert!(ist_secs_of_day(utc_2000) < SECS_PER_DAY as u32);
+    }
+
+    #[test]
+    fn test_ist_midnight_nanos_stamps_ist_wall_clock_without_a_second_offset() {
+        // The house convention (data-integrity.md): IST wall-clock is stored
+        // AS the epoch value — the +5:30 is never added a second time. Adding
+        // it here would push every constituent row 5.5 hours forward, which
+        // on a date boundary files it under the WRONG TRADING DAY. That is
+        // invisible in a spot check and wrong in every point-in-time query.
+        let nanos = ist_midnight_nanos("2026-08-11");
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+            .expect("a fixed valid date");
+        assert_eq!(
+            nanos, expected,
+            "the stamp must be IST midnight as-epoch, with NO added offset"
+        );
+        // Explicitly assert the wrong answer is not produced.
+        assert_ne!(
+            nanos,
+            expected + 19_800 * 1_000_000_000,
+            "a second +5:30 offset would shift the row into the wrong day"
+        );
+    }
+
+    #[test]
+    fn test_ist_midnight_nanos_returns_zero_on_a_malformed_date() {
+        // Fail-soft rather than panic: the rider must not die on the boot
+        // path over a date it derived itself. Zero is an obviously-wrong
+        // sentinel that shows up immediately in the table, rather than a
+        // plausible-looking wrong timestamp that does not.
+        assert_eq!(ist_midnight_nanos("not-a-date"), 0);
+        assert_eq!(ist_midnight_nanos(""), 0);
+        assert_eq!(
+            ist_midnight_nanos("2026-02-30"),
+            0,
+            "a calendar-invalid date must not silently roll into March"
+        );
     }
 
     #[test]
