@@ -21,13 +21,24 @@
 //!
 //! # Complexity
 //!
-//! Parse is O(rows) with a single pass and one allocation per retained row —
-//! inherently O(n) because it must look at every row, and honestly labelled as
-//! such rather than called O(1). The JOIN, which is the part that runs per
-//! constituent, is **O(1) average per lookup** against a `HashMap` built once:
-//! `build_isin_index` is O(master rows), then each of the ~750 constituents is
-//! a single hash lookup. This is COLD PATH — once per trading day, at boot or
-//! on the daily rider — and never touches the tick path.
+//! Parse is O(rows) with a single pass — inherently O(n) because it must look
+//! at every row, and honestly labelled as such rather than called O(1). It is
+//! NOT allocation-light: each retained row costs one `MasterRow` plus five
+//! owned `String`s, and the tokenizer allocates a `String` per FIELD of every
+//! line it visits (~26 per row on the real master, discarded for the columns
+//! we do not keep). At ~150,000 rows that is millions of short-lived
+//! allocations — acceptable only because this is COLD PATH.
+//!
+//! The JOIN, which is the part that runs per constituent, is **O(1) average
+//! per lookup** against a `HashMap` built once: `build_isin_index` is
+//! O(master rows) — every probe, including the ambiguity check, is a hash
+//! lookup — then each constituent is a single hash lookup. Constituent count
+//! is ~37,000 across all 49 index lists (a stock appears once per index it
+//! belongs to; there is deliberately no cross-index dedup — membership per
+//! index IS the product), not the ~750 of any single list.
+//!
+//! Cold path throughout: once per trading day, at boot or on the daily rider,
+//! never on the tick path.
 
 use std::collections::HashMap;
 
@@ -173,7 +184,16 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
 /// why [`parse_master_csv`] treats a short row as a bad row rather than
 /// attempting recovery: guessing at a continuation is how a parser silently
 /// shifts every subsequent column.
-fn split_csv_line(line: &str, out: &mut Vec<String>) {
+///
+/// `pub` because the NSE constituent lists need the identical treatment — their
+/// `Company Name` column routinely contains a quoted comma, and their
+/// `ISIN Code` is the LAST column, so a naive `split(',')` shifts the join key
+/// off the end of the row and silently loses the constituent. Exporting the one
+/// tokenizer is strictly better than the app crate growing a second, weaker one.
+///
+/// `out` is CLEARED on entry and reused across calls — pass the same buffer in
+/// a parse loop rather than allocating per line.
+pub fn split_csv_line(line: &str, out: &mut Vec<String>) {
     out.clear();
     let mut field = String::new();
     let mut in_quotes = false;
@@ -222,7 +242,10 @@ fn split_csv_line(line: &str, out: &mut Vec<String>) {
 ///
 /// # Complexity
 ///
-/// O(rows), single pass, one `MasterRow` allocation per retained row. Cold path.
+/// O(rows), single pass. Allocation-heavy, not allocation-light: the shared
+/// `fields` buffer is reused across lines, but `split_csv_line` pushes an
+/// owned `String` per FIELD (~26 on the real master), and each retained row
+/// keeps five more. Cold path — see the module header.
 pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
     let csv = csv.strip_prefix('\u{feff}').unwrap_or(csv);
     let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
@@ -317,11 +340,17 @@ pub struct Constituent {
 /// Picking either one is a coin flip that subscribes a possibly-wrong
 /// instrument and reports success. The pair is EXCLUDED from the index and
 /// listed in [`IsinIndex::ambiguous`] so the operator sees the name.
+/// # Why `ambiguous` is a set and not a `Vec`
+///
+/// It is membership-tested inside two per-row loops. As a `Vec` that test is
+/// a linear scan, so the build degenerates to Θ(n²) on a master with many
+/// colliding ISINs — minutes of CPU on the boot path, with no timeout above
+/// it. A `HashSet` makes both loops honestly linear.
 #[derive(Debug, Default)]
 pub struct IsinIndex {
     by_isin: HashMap<String, (u64, ExchangeSegment)>,
     /// ISINs seen on more than one NSE cash-equity row, excluded from lookup.
-    pub ambiguous: Vec<String>,
+    pub ambiguous: std::collections::HashSet<String>,
 }
 
 impl IsinIndex {
@@ -329,6 +358,16 @@ impl IsinIndex {
     #[must_use]
     pub fn get(&self, isin: &str) -> Option<(u64, ExchangeSegment)> {
         self.by_isin.get(isin).copied()
+    }
+
+    /// True when this ISIN was EXCLUDED for matching more than one row.
+    ///
+    /// O(1) average. Distinguishes "the master disagrees with itself about
+    /// this security" from "the master has never heard of it" — two failures
+    /// that need different operator responses.
+    #[must_use]
+    pub fn is_ambiguous(&self, isin: &str) -> bool {
+        self.ambiguous.contains(isin)
     }
 
     /// Number of resolvable ISINs.
@@ -354,13 +393,15 @@ impl IsinIndex {
 ///
 /// # Complexity
 ///
-/// O(master rows) once. Every subsequent constituent lookup is O(1) average —
-/// this is the whole point of building an index rather than scanning the master
-/// per constituent, which would be O(constituents × master rows).
+/// O(master rows) once — one hash probe per row, including the
+/// already-proven-ambiguous check (see [`IsinIndex`] on why that set is not a
+/// `Vec`). Every subsequent constituent lookup is O(1) average — this is the
+/// whole point of building an index rather than scanning the master per
+/// constituent, which would be O(constituents × master rows).
 #[must_use]
 pub fn build_isin_index(master: &[MasterRow]) -> IsinIndex {
     let mut by_isin: HashMap<String, (u64, ExchangeSegment)> = HashMap::new();
-    let mut ambiguous: Vec<String> = Vec::new();
+    let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
     for row in master.iter().filter(|r| r.is_nse_cash_equity()) {
         if row.isin.is_empty() {
             continue;
@@ -373,10 +414,10 @@ pub fn build_isin_index(master: &[MasterRow]) -> IsinIndex {
             }
             Some(_) => {
                 by_isin.remove(&row.isin);
-                ambiguous.push(row.isin.clone());
+                ambiguous.insert(row.isin.clone());
             }
             None => {
-                if ambiguous.iter().any(|a| a == &row.isin) {
+                if ambiguous.contains(&row.isin) {
                     continue;
                 }
                 by_isin.insert(
@@ -472,7 +513,9 @@ pub const NSE_MEMBERSHIP_TOLERANCE: f64 = 0.02;
 ///
 /// # Complexity
 ///
-/// O(constituents) — one O(1) index lookup each, plus an O(1) dedup-set probe.
+/// O(constituents) — per constituent: one O(1) index lookup, one O(1)
+/// dedup-set probe, and (on a miss only) one O(1) ambiguous-set probe. Two
+/// `String` allocations per constituent for the uppercased key and symbol.
 #[must_use]
 pub fn join_constituents(constituents: &[Constituent], index: &IsinIndex) -> JoinOutcome {
     let mut out = JoinOutcome::default();
@@ -493,7 +536,7 @@ pub fn join_constituents(constituents: &[Constituent], index: &IsinIndex) -> Joi
             continue;
         }
         let Some((security_id, segment)) = index.get(&isin) else {
-            let reason = if index.ambiguous.iter().any(|a| a == &isin) {
+            let reason = if index.is_ambiguous(&isin) {
                 UnresolvedReason::AmbiguousIsin
             } else {
                 UnresolvedReason::IsinNotInMaster
@@ -756,7 +799,62 @@ mod tests {
             index.get("INE002A01018").is_none(),
             "an ambiguous ISIN must not resolve"
         );
-        assert_eq!(index.ambiguous, vec!["INE002A01018".to_string()]);
+        assert_eq!(index.ambiguous.len(), 1);
+        assert!(index.ambiguous.contains("INE002A01018"));
+    }
+
+    #[test]
+    fn test_isin_index_is_ambiguous_separates_excluded_from_never_seen() {
+        // The whole point of keeping the excluded set: "the master disagrees
+        // with itself about this security" and "the master has never heard of
+        // it" are different failures and need different operator responses.
+        let index = build_isin_index(&[
+            row(1, "INE002A01018", "RELIANCE"),
+            row(2, "INE002A01018", "RELIANCE"),
+            row(3, "INE009A01021", "INFY"),
+        ]);
+        assert!(index.is_ambiguous("INE002A01018"), "excluded for colliding");
+        assert!(!index.is_ambiguous("INE009A01021"), "resolved cleanly");
+        assert!(!index.is_ambiguous("INE999Z01099"), "never seen at all");
+    }
+
+    #[test]
+    fn test_build_isin_index_stays_linear_when_most_isins_are_ambiguous() {
+        // REGRESSION (2026-08-11): `ambiguous` was a Vec and the "already
+        // proven ambiguous" check was `.iter().any(...)` INSIDE the per-row
+        // loop, so a master where many ISINs collide degenerated to Θ(n²) —
+        // minutes of CPU on the boot path with no timeout above it. This
+        // shape (every ISIN colliding, then a third row per ISIN hitting the
+        // exact scan) is the worst case; a Vec-backed build spends ~A probes
+        // per row here, a set-backed one spends 1.
+        //
+        // The fixture size is MEASURED, not guessed. Release-build timings of
+        // both forms on this exact shape: 3,000 ISINs → Vec 25 ms / set
+        // 0.7 ms; 10,000 → 254 ms / 2.5 ms; 25,000 → 1.58 s / 6.1 ms; 45,000
+        // → 5.24 s / 13.3 ms. A 3,000-ISIN fixture would therefore NOT bite a
+        // regression at any sane threshold — 20,000 is the smallest round
+        // size whose quadratic form is comfortably seconds while the linear
+        // form stays milliseconds, with debug builds slowing both alike.
+        let mut master = Vec::new();
+        for i in 0..20_000u64 {
+            let isin = format!("INE{i:09}");
+            master.push(row(i * 2 + 1, &isin, "SYM"));
+            master.push(row(i * 2 + 2, &isin, "SYM"));
+            // The third row is what re-probed the ambiguous list every time.
+            master.push(row(i * 2 + 3, &isin, "SYM"));
+        }
+        let started = std::time::Instant::now();
+        let index = build_isin_index(&master);
+        let elapsed = started.elapsed();
+
+        assert_eq!(index.len(), 0, "every ISIN collided, so none resolve");
+        assert_eq!(index.ambiguous.len(), 20_000);
+        // Generous by design: this must fail on Θ(n²), never on a slow CI box.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "build_isin_index took {elapsed:?} for 60,000 rows — the \
+             ambiguity check has regressed to a linear scan"
+        );
     }
 
     #[test]
@@ -807,6 +905,27 @@ mod tests {
             "only the ISIN-bearing equity row is indexed"
         );
         assert!(index.get("").is_none());
+    }
+
+    #[test]
+    fn test_split_csv_line_keeps_the_last_column_when_an_earlier_field_is_quoted() {
+        // This is the exact shape that loses an NSE constituent: the company
+        // name carries a quoted comma and the ISIN is LAST, so a naive
+        // `split(',')` yields 6 fields and the join key lands in the wrong
+        // slot — a silently dropped stock, not an error.
+        let mut out = Vec::new();
+        split_csv_line(
+            "\"Foo, Bar Ltd.\",Energy,RELIANCE,EQ,INE002A01018",
+            &mut out,
+        );
+        assert_eq!(out.len(), 5, "a quoted comma must not create a field");
+        assert_eq!(out[0], "Foo, Bar Ltd.");
+        assert_eq!(out[2], "RELIANCE");
+        assert_eq!(out[4], "INE002A01018", "the ISIN must stay last");
+
+        // Reuse clears: a longer line must not leave stale trailing fields.
+        split_csv_line("a,b", &mut out);
+        assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
     }
 
     fn con(index: &str, sym: &str, isin: &str) -> Constituent {

@@ -225,8 +225,13 @@ impl DayOhlcTracker {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            // O(1) EXEMPT: bounded boot-time allocation; never grows past 4 SIDs
-            // in the locked indices-only universe per operator-charter §I.
+            // O(1) EXEMPT: bounded boot-time allocation. TRACKER_CAPACITY only
+            // pre-sizes the map for the live 4-SID universe; the map still
+            // grows on demand, and the real ceiling is the fail-closed
+            // MAX_TRACKED_INSTRUMENTS check in `update_tick`, NOT this figure.
+            // (Corrected 2026-08-11: this comment used to claim the tracker
+            // "never grows past 4 SIDs", which stopped being true the moment
+            // the 25,000 bound was added above it.)
             inner: Arc::new(PapayaHashMap::with_capacity(Self::TRACKER_CAPACITY)),
         }
     }
@@ -262,9 +267,14 @@ impl DayOhlcTracker {
             slot.lock().update_tick(last_price);
             return true;
         }
-        // First tick for this instrument. `papaya::len` is O(1) (a maintained
-        // counter, not a walk), so this bound costs nothing on the insert path
-        // and nothing at all on the far more common already-tracked path above.
+        // First tick for this instrument. `papaya::len` is NOT a single
+        // maintained counter — it sums a striped counter across
+        // `next_power_of_two(available_parallelism())` cache-padded shards, so
+        // it is O(shards): a handful of loads, independent of map size, off
+        // the already-tracked path entirely. Cheap enough to be free here, but
+        // it is a constant, not a load. (Corrected 2026-08-11 — the earlier
+        // comment asserted "a maintained counter, not a walk", which named the
+        // wrong mechanism even though the conclusion held.)
         //
         // The check races: two threads can both observe len < MAX and both
         // insert, so the true ceiling is MAX + (concurrent inserters - 1).

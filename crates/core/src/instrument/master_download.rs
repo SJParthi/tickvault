@@ -229,9 +229,17 @@ fn sanitize_transport_error(msg: &str, url: &str) -> String {
     // target) is replaced wholesale rather than parsed. Cheap, and it cannot
     // be defeated by a shape we failed to anticipate.
     while let Some(start) = out.find("://") {
+        // `i + c.len_utf8()`, NOT `i + 1`: a char-pattern search reports the
+        // byte index where the char STARTS, so on any multi-byte char (an
+        // ellipsis, a localized OS error, any non-ASCII in a proxy message)
+        // `i + 1` lands mid-character and `replace_range` panics on a
+        // non-char-boundary. Release builds are `panic = "abort"`, so that
+        // panic takes the whole trading process down — from a log-sanitizer.
         let scheme_start = out[..start]
-            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '-' && c != '.')
-            .map_or(0, |i| i + 1);
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !c.is_ascii_alphanumeric() && *c != '+' && *c != '-' && *c != '.')
+            .map_or(0, |(i, c)| i + c.len_utf8());
         let after = start + 3;
         let end = out[after..]
             .find(|c: char| c.is_whitespace() || c == ')' || c == '"' || c == ',')
@@ -389,6 +397,33 @@ mod tests {
             "no urls here at all",
             "https://x https://y https://z",
             "(https://a.b/c) and \"https://d.e/f\", plus https://g.h/i",
+        ] {
+            let out = sanitize_transport_error(msg, "https://unrelated.invalid/");
+            assert!(
+                !out.contains("://"),
+                "scrubber left a URL behind in {msg:?} -> {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_transport_error_survives_multibyte_text_before_a_url() {
+        // REGRESSION (2026-08-11): the scheme-start scan used `rfind(..) + 1`.
+        // A char-pattern search reports where the char STARTS, so on a
+        // multi-byte char that +1 lands mid-character and `replace_range`
+        // panics on a non-char-boundary. Release builds are `panic = "abort"`,
+        // so a log sanitizer could take the trading process down — and the
+        // trigger is ordinary: an ellipsis, a localized OS error string, any
+        // non-ASCII a proxy puts in its message.
+        //
+        // Every case here panicked before the fix.
+        for msg in [
+            "dns…https://host/path",
+            "erreur de résolution: https://user:pw@proxy.internal/ failed",
+            "错误 https://a.b/c",
+            "…",
+            "café://not-a-scheme",
+            "🚀https://rocket.invalid/x",
         ] {
             let out = sanitize_transport_error(msg, "https://unrelated.invalid/");
             assert!(
