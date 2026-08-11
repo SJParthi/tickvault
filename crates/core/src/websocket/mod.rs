@@ -37,6 +37,12 @@
 // PR #4 (2026-05-19): `depth_connection` module DELETED.
 
 pub mod activity_watchdog;
+// 2026-08-09 revival, transport round: the ONE `DhanFeedSocket` implementation
+// — tokio-tungstenite over TLS with an EXPLICIT frame cap (the library default
+// is a 64 MiB message, which sixteen sockets could turn into a gigabyte of
+// attacker-controlled allocation). Contains no policy: every reconnect, park
+// and resubscribe decision stays in `pool_supervisor`.
+pub mod connection;
 pub mod idle_watchdog;
 pub mod market_hours_gate;
 pub mod order_update_connection;
@@ -49,6 +55,10 @@ pub mod pool_budget;
 // network. Spawned by `tickvault_app::dhan_feed_stack`, DEFAULT-OFF.
 pub mod pool_supervisor;
 pub mod reconnect_ladder;
+// Rebuilt 2026-08-11 with the operator-approved 16-connection revival
+// (websocket-connection-scope-lock.md, the two 2026-08-09 sections). Deleted
+// in the 2026-07-17 stage-3 sweep alongside the lane it served.
+pub mod subscription_builder;
 pub mod tls;
 pub mod types;
 

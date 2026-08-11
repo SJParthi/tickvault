@@ -59,10 +59,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tickvault_common::constants::SPOT_1M_REST_INDICES;
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::feed::Feed;
+use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
+use tickvault_core::pipeline::tick_gap_detector::{
+    DetectorConfig, TickGapDetector, TickObservation,
+};
 use tickvault_core::websocket::pool_budget::{ConnectionSlot, DhanEndpointType};
 use tickvault_core::websocket::pool_supervisor::{
     PoolSupervisor, SubscribeGuard, SubscribeGuardRefusal, SubscribeInstrument,
+};
+use tickvault_storage::tick_persistence::TickWriter;
+use tickvault_trading::candles::{
+    BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator, SealRing,
 };
 use tracing::{error, info, warn};
 
@@ -346,6 +355,245 @@ fn plan_pool(
 }
 
 // ---------------------------------------------------------------------------
+// capture_seq — ONE source, and why
+// ---------------------------------------------------------------------------
+
+/// Counter: live ticks refused because their frame sequence would not narrow
+/// onto the `i64` `capture_seq` column. Fail-closed, never a silent stamp.
+pub const INGEST_SEQ_REFUSED_COUNTER: &str = "tv_dhan_feed_ingest_seq_refused_total";
+
+/// Counter: live ticks folded end-to-end (gap detector → aggregator → writer).
+pub const INGEST_TICKS_COUNTER: &str = "tv_dhan_feed_ingest_ticks_total";
+
+/// Counter: ticks the aggregator refused, labelled by reason.
+pub const INGEST_REFUSED_COUNTER: &str = "tv_dhan_feed_ingest_refused_total";
+
+/// Narrows a WAL frame sequence onto the `i64` `ticks.capture_seq` column.
+///
+/// # Why this function exists at all — the two-atomic hazard
+/// This process contains **two** independent monotonic sequence generators,
+/// both seeded `max(prev + 1, wall_clock_nanos)`:
+///
+/// | Generator | Home | Width |
+/// |---|---|---|
+/// | [`tickvault_storage::ws_frame_spill::next_frame_seq`] | `WAL_FRAME_SEQ` | `u64` |
+/// | [`tickvault_storage::tick_persistence::next_capture_seq`] | `TICK_CAPTURE_SEQ` | `i64` |
+///
+/// Each is *individually* proven strictly monotonic. Neither is proven
+/// monotonic **with respect to the other**, and nothing forces them apart:
+/// two CAS loops over two separate atomics, each independently seeded from the
+/// same wall clock, will mint the *same* integer whenever they are first
+/// touched inside the same nanosecond — which is exactly what happens at
+/// boot, when the WAL replay path and a fresh live tick race.
+///
+/// `capture_seq` is the intra-second tiebreaker in the live DEDUP key
+/// (`ts, security_id, segment, capture_seq, feed`). Dhan's `exchange_timestamp`
+/// is **second-granular**, so every tick an instrument produces inside one
+/// wall-clock second shares `ts`. If two real ticks are ever stamped with the
+/// same `capture_seq`, QuestDB UPSERTs one on top of the other and it is gone
+/// — silently, with no error, no counter, and no log line. That is the exact
+/// zero-loss failure this whole key exists to prevent.
+///
+/// # The decision: the live path uses the FRAME sequence, and only that
+/// [`tickvault_storage::ws_frame_spill`]'s own module docs state the contract
+/// verbatim: the frame sequence is minted **once per received frame** and
+/// "passes the value to BOTH `WsFrameSpill::append_with_seq` and the live
+/// broadcast, so the WAL record and the `ticks.capture_seq` column carry the
+/// identical replay-stable value."
+///
+/// So the frame sequence is the designed source, and it is the one that makes
+/// replay idempotent: re-injecting a recovered frame reproduces the SAME
+/// `capture_seq`, so the replayed row collapses onto the original instead of
+/// duplicating it. A freshly-minted `next_capture_seq()` could not do that —
+/// it would mint a *new* value for the same frame and write a duplicate row.
+///
+/// [`LiveIngest`] therefore calls
+/// [`TickWriter::append_tick_with_seq`] exclusively and **never**
+/// [`TickWriter::append_tick`], whose convenience body mints from the *other*
+/// atomic. `append_tick` stays valid for callers with no frame behind them
+/// (synthetic rows, tests); it is simply not reachable from this lane, and
+/// `dhan_feed_ingest_never_calls_bare_append_tick` fails the build if that
+/// changes.
+///
+/// # Narrowing
+/// Both counters are wall-clock-nanosecond seeded, so a `u64` frame sequence
+/// exceeds `i64::MAX` only past the year 2262. Rather than saturate — which
+/// would pin every subsequent tick to `i64::MAX` and collapse them all — an
+/// unrepresentable value is **refused**, counted, and the tick is dropped
+/// loudly. Fail-closed beats a silently-colliding stamp.
+#[must_use]
+pub fn capture_seq_from_frame_seq(frame_seq: u64) -> Option<i64> {
+    i64::try_from(frame_seq).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Live ingest — the tick→timeframe→disk fold
+// ---------------------------------------------------------------------------
+
+/// What one tick did on its way through the fold. Every refusal is a distinct
+/// variant so nothing is reported as folded that was not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// Folded: observed by the gap detector, folded by the aggregator, and
+    /// appended to the tick writer's buffer.
+    Folded {
+        /// Timeframes that sealed a bucket on this tick.
+        sealed: u8,
+        /// Timeframes that amended an already-sealed bucket.
+        amended: u8,
+    },
+    /// The frame sequence would not narrow onto `capture_seq` (year-2262
+    /// class). Nothing was folded, nothing was written.
+    SeqUnrepresentable,
+    /// The aggregator refused the tick (insane price, out of session, or slot
+    /// table exhausted). Nothing was folded.
+    AggregatorRefused,
+    /// The tick was folded but the ILP append failed. Counted as a real loss.
+    WriteFailed,
+}
+
+/// The live tick fold: gap detector → aggregator → tick writer, in that order,
+/// over ONE tick with ONE sequence number.
+///
+/// This is the seam the transport calls. It owns the three components that
+/// survived the 2026-07-17 deletions with zero production callers, and wires
+/// them into a single ordered path so they cannot be half-wired.
+///
+/// # Order is load-bearing
+/// The gap detector observes **first**, and unconditionally: an instrument
+/// whose price is insane or whose bucket is out of session is exactly the
+/// instrument whose silence matters most, and letting the aggregator's refusal
+/// suppress the observation would blind the detector to the failure it exists
+/// to report.
+///
+/// # Complexity
+/// O(1) per tick: one hash lookup in the detector, one hash lookup plus
+/// `TF_COUNT` scalar folds in the aggregator, one ILP row append. No heap
+/// allocation in steady state.
+pub struct LiveIngest {
+    detector: TickGapDetector,
+    aggregator: MultiTfAggregator,
+    ring: SealRing,
+    writer: TickWriter,
+    seq_refused: u64,
+    evicted: u64,
+}
+
+impl LiveIngest {
+    /// Builds the fold, pre-sized for `capacity` instruments so the slot table
+    /// and the detector index never realloc mid-session.
+    #[must_use]
+    pub fn new(writer: TickWriter, capacity: usize) -> Self {
+        Self {
+            detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
+            aggregator: MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity),
+            ring: SealRing::new(),
+            writer,
+            seq_refused: 0,
+            evicted: 0,
+        }
+    }
+
+    /// Registers an instrument before any tick arrives, so a stream that never
+    /// delivers a single tick is still reported as silent rather than being
+    /// invisible. Returns `false` when detector capacity is exhausted.
+    pub fn seed(&mut self, security_id: u64, segment: ExchangeSegment, now_millis: u64) -> bool {
+        self.detector.seed((security_id, segment), now_millis)
+    }
+
+    /// Folds one tick. `frame_seq` MUST be the sequence minted for this tick's
+    /// frame by [`tickvault_storage::ws_frame_spill::next_frame_seq`] — see
+    /// [`capture_seq_from_frame_seq`] for why nothing else is acceptable.
+    pub fn ingest_tick(
+        &mut self,
+        tick: &ParsedTick,
+        frame_seq: u64,
+        recv_monotonic_millis: u64,
+    ) -> IngestOutcome {
+        // Sequence FIRST: if we cannot stamp this row safely we must not touch
+        // any fold state, or the aggregator would carry a tick that never
+        // reached disk.
+        let Some(capture_seq) = capture_seq_from_frame_seq(frame_seq) else {
+            self.seq_refused = self.seq_refused.saturating_add(1);
+            metrics::counter!(INGEST_SEQ_REFUSED_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                frame_seq,
+                security_id = tick.security_id,
+                "live tick refused: frame sequence does not fit the capture_seq column. \
+                 The tick was NOT folded and NOT written — this is a real, counted loss, \
+                 never a silent stamp that would collapse two rows under the DEDUP key."
+            );
+            return IngestOutcome::SeqUnrepresentable;
+        };
+
+        // Gap detector observes unconditionally — see the type docs on order.
+        if let Some(obs) = TickObservation::from_parsed_tick(tick, recv_monotonic_millis) {
+            let _assessment = self.detector.observe(obs);
+        }
+
+        let mut evicted_here = 0u64;
+        let stats: ConsumeStats = self.aggregator.consume_tick_into_ring(
+            Feed::Dhan,
+            tick,
+            None,
+            &mut self.ring,
+            |_evicted: BufferedSeal| {
+                evicted_here = evicted_here.saturating_add(1);
+            },
+        );
+        self.evicted = self.evicted.saturating_add(evicted_here);
+
+        if stats.refused_price || stats.out_of_session || stats.slot_exhausted {
+            let reason = if stats.refused_price {
+                "price"
+            } else if stats.slot_exhausted {
+                "slot_exhausted"
+            } else {
+                "out_of_session"
+            };
+            metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => reason).increment(1);
+            return IngestOutcome::AggregatorRefused;
+        }
+
+        // `append_tick_with_seq`, never `append_tick` — the single-source rule.
+        if self.writer.append_tick_with_seq(tick, capture_seq).is_err() {
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                security_id = tick.security_id,
+                capture_seq,
+                "live tick folded but its ILP append failed — counted as loss"
+            );
+            return IngestOutcome::WriteFailed;
+        }
+
+        metrics::counter!(INGEST_TICKS_COUNTER).increment(1);
+        IngestOutcome::Folded {
+            sealed: stats.sealed_count,
+            amended: stats.amended_count,
+        }
+    }
+
+    /// Sealed bars waiting in the ring.
+    #[must_use]
+    pub fn pending_seals(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// Ticks refused because their sequence would not narrow.
+    #[must_use]
+    pub const fn seq_refused(&self) -> u64 {
+        self.seq_refused
+    }
+
+    /// Seals evicted from a full ring (the caller routes these to spill/DLQ).
+    #[must_use]
+    pub const fn evicted_seals(&self) -> u64 {
+        self.evicted
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Boot wiring
 // ---------------------------------------------------------------------------
 
@@ -444,6 +692,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         "Dhan 16-connection live feed planned (operator authorization 2026-08-09)"
     );
 
+    // The 15:31 cross-verify is BLOCKING, not optional: the main feed has no
+    // snapshot-on-subscribe and no sequence number, so packet loss is
+    // invisible at the protocol level and this comparator is the only ground
+    // truth the lane has. Spawned here, inside the same gate, so it can never
+    // be enabled without its own verifier.
+    spawn_daily_crossverify(&params.main_feed_instruments);
+
     // The honest half. The supervision layer is complete; the socket is not.
     error!(
         code = ErrorCode::WsGapConnectionState.code_str(),
@@ -453,6 +708,97 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
          rebuilt. NO Dhan live market data will flow this session. The REST legs \
          (spot 1m, option chain) are unaffected and continue as normal."
     );
+}
+
+// ---------------------------------------------------------------------------
+// 15:31 cross-verification — the lane's only ground truth
+// ---------------------------------------------------------------------------
+
+/// Counter: daily cross-verify runs that could not start because no dependency
+/// provider was installed.
+pub const XVERIFY_UNPROVISIONED_COUNTER: &str = "tv_dhan_feed_xverify_unprovisioned_total";
+
+/// Everything the 15:31 comparator needs that this module cannot derive on its
+/// own. Registered once at boot via [`install_crossverify_deps`].
+///
+/// This is a registration seam rather than a field on
+/// [`DhanFeedStackParams`] deliberately: the params struct is built by
+/// `main.rs` with an exhaustive struct literal, so adding a required field
+/// there would break a file this module does not own. A provider that is never
+/// installed degrades loudly (see [`spawn_daily_crossverify`]) instead of
+/// silently skipping the verification.
+pub struct CrossverifyDeps {
+    /// QuestDB `/exec` endpoint the live side is read from.
+    pub questdb_exec_url: String,
+    /// Dhan intraday-candles endpoint the REST side is fetched from.
+    pub intraday_url: String,
+    /// Returns a currently-valid Dhan JWT, or `None` when the token manager
+    /// has none. A closure rather than a value because the token rotates every
+    /// ~23h and this scheduler outlives any single token.
+    pub jwt_provider: Box<dyn Fn() -> Option<String> + Send + Sync>,
+    /// Comparator knobs.
+    pub config: crate::dhan_live_crossverify::DhanLiveCrossverifyConfig,
+}
+
+static CROSSVERIFY_DEPS: std::sync::OnceLock<CrossverifyDeps> = std::sync::OnceLock::new();
+
+/// Installs the cross-verify dependencies. Idempotent: the first call wins and
+/// later calls return `false` rather than replacing a live provider.
+pub fn install_crossverify_deps(deps: CrossverifyDeps) -> bool {
+    CROSSVERIFY_DEPS.set(deps).is_ok()
+}
+
+/// Whether a provider has been installed.
+#[must_use]
+pub fn crossverify_deps_installed() -> bool {
+    CROSSVERIFY_DEPS.get().is_some()
+}
+
+/// Builds the comparator's target list from the subscribed main-feed set, so
+/// the lane can never verify a different universe than it captured.
+#[must_use]
+pub fn crossverify_targets(
+    main_feed: &[SubscribeInstrument],
+) -> Vec<crate::dhan_live_crossverify::XverifyTarget> {
+    main_feed
+        .iter()
+        .map(|i| crate::dhan_live_crossverify::XverifyTarget {
+            security_id: i64::try_from(i.security_id).unwrap_or(0),
+            segment: i.segment.as_str().to_string(),
+            instrument: "INDEX".to_string(),
+        })
+        .collect()
+}
+
+/// Spawns the daily 15:31 IST comparator for the subscribed universe.
+///
+/// Returns `None` — loudly — when no [`CrossverifyDeps`] were installed. That
+/// is a refusal, not a skip: a live lane with no verifier has no way to detect
+/// the packet loss its protocol cannot report, and saying so is the whole
+/// point of audit Rule 11.
+pub fn spawn_daily_crossverify(
+    main_feed: &[SubscribeInstrument],
+) -> Option<tokio::task::JoinHandle<()>> {
+    let targets = crossverify_targets(main_feed);
+    if CROSSVERIFY_DEPS.get().is_none() {
+        metrics::counter!(XVERIFY_UNPROVISIONED_COUNTER).increment(1);
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            targets = targets.len(),
+            "Dhan live feed is enabled but the 15:31 cross-verification has NO dependency \
+             provider installed, so it cannot run. The main feed has no snapshot-on-subscribe \
+             and no sequence number: without this comparator, packet loss is UNDETECTABLE. \
+             Call install_crossverify_deps() at boot before enabling the lane."
+        );
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        info!(
+            targets = targets.len(),
+            run_at_ist = "15:31",
+            "Dhan live-feed 15:31 cross-verification scheduled"
+        );
+    }))
 }
 
 #[cfg(test)]

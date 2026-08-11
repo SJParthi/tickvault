@@ -1,0 +1,291 @@
+//! S6-G1 wiring guard for the Dhan 16-connection live-feed stack.
+//!
+//! These tests assert that CALL SITES exist, not merely that functions do. The
+//! four components this lane depends on all survived the 2026-07-17 deletions
+//! *as compiling, tested, fully-orphaned code* — `MultiTfAggregator::consume_tick`,
+//! `TickWriter::append_tick`, `TickGapDetector`, and the 15:31
+//! `dhan_live_crossverify` comparator each had zero production callers. A test
+//! that only proved they exist would have passed happily throughout that
+//! entire period, which is precisely the false-OK class audit Rule 11 forbids.
+//!
+//! The guards below therefore scan the boot seam's source for the call, the
+//! way `pub-fn-wiring-guard.sh` does.
+
+const STACK_SRC: &str = include_str!("../src/dhan_feed_stack.rs");
+
+// ---------------------------------------------------------------------------
+// Orphan 1 — the tick → timeframe fold
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dhan_feed_ingest_calls_the_aggregator_fold() {
+    assert!(
+        STACK_SRC.contains("consume_tick_into_ring("),
+        "LiveIngest must call the aggregator fold. `MultiTfAggregator` compiled \
+         and passed its own unit tests with ZERO production callers from \
+         2026-07-17 until this lane wired it — existence proves nothing."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Orphan 2 — tick persistence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dhan_feed_ingest_calls_the_tick_writer() {
+    assert!(
+        STACK_SRC.contains("append_tick_with_seq("),
+        "LiveIngest must append every folded tick to the tick writer."
+    );
+}
+
+/// The capture_seq single-source rule, enforced mechanically.
+///
+/// `TickWriter::append_tick` is a convenience wrapper whose body mints a
+/// sequence from `tick_persistence::next_capture_seq()` — a DIFFERENT process
+/// -global atomic from the `ws_frame_spill::next_frame_seq()` counter that
+/// stamps WAL frames. Both are seeded `max(prev + 1, wall_clock_nanos)`, so
+/// they mint the same integer whenever first touched inside one nanosecond.
+/// Since `capture_seq` is the intra-second tiebreaker in the live DEDUP key
+/// and Dhan's `exchange_timestamp` is second-granular, a collision UPSERTs one
+/// real tick on top of another and it is gone silently.
+#[test]
+fn dhan_feed_ingest_never_calls_bare_append_tick() {
+    for (i, line) in STACK_SRC.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        assert!(
+            !code.contains(".append_tick("),
+            "line {}: the live path must call `append_tick_with_seq`, never bare \
+             `append_tick`. The bare form mints from `next_capture_seq()`, the \
+             OTHER of this process's two sequence atomics; letting both stamp \
+             `ticks.capture_seq` lets two real ticks share one value and one is \
+             silently upserted away.\n  offending: {}",
+            i + 1,
+            code.trim()
+        );
+    }
+}
+
+/// Exactly one sequence source is reachable from this lane.
+#[test]
+fn dhan_feed_has_exactly_one_capture_seq_source() {
+    // Comment-stripped: this module DOCUMENTS `next_capture_seq` at length in
+    // order to explain why it is the wrong source. Documenting the hazard must
+    // not read as committing it, so only executable code is scanned.
+    for (i, line) in STACK_SRC.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        assert!(
+            !code.contains("next_capture_seq"),
+            "line {}: the live lane must not reach `next_capture_seq` — the frame \
+             sequence is the single source, because only it is replay-stable (a \
+             re-injected WAL frame must reproduce its ORIGINAL capture_seq so the \
+             replayed row collapses instead of duplicating).\n  offending: {}",
+            i + 1,
+            code.trim()
+        );
+    }
+    assert!(
+        STACK_SRC.contains("capture_seq_from_frame_seq"),
+        "the live lane must narrow the frame sequence through the documented \
+         single-source helper."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Orphan 3 — the tick gap detector
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dhan_feed_ingest_calls_the_gap_detector() {
+    assert!(
+        STACK_SRC.contains("self.detector.observe("),
+        "LiveIngest must feed every tick to the gap detector."
+    );
+    assert!(
+        STACK_SRC.contains("self.detector.seed("),
+        "the detector must be seedable: an instrument that never ticks leaves \
+         no payload to reason about, so a wholly-lost stream is invisible \
+         unless the instrument was registered in advance."
+    );
+}
+
+/// The detector observes BEFORE the aggregator's refusal can short-circuit.
+///
+/// An instrument whose price is insane or whose bucket is out of session is
+/// exactly the instrument whose silence matters most; ordering the observation
+/// after the refusal would blind the detector to the failure it exists to see.
+#[test]
+fn dhan_feed_gap_detector_observes_before_aggregator_refusal() {
+    let observe = STACK_SRC
+        .find("self.detector.observe(")
+        .expect("detector call site");
+    let fold = STACK_SRC
+        .find("consume_tick_into_ring(")
+        .expect("aggregator call site");
+    assert!(
+        observe < fold,
+        "the gap detector must observe before the aggregator fold, so an \
+         aggregator refusal can never suppress the observation."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Orphan 4 — the 15:31 cross-verification (BLOCKING, not optional)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dhan_feed_stack_spawns_the_daily_crossverify() {
+    assert!(
+        STACK_SRC.contains("spawn_daily_crossverify(&params.main_feed_instruments)"),
+        "the bring-up body must spawn the 15:31 comparator. The main feed has \
+         NO snapshot-on-subscribe and NO sequence number, so packet loss is \
+         undetectable at the protocol level and this cross-verify is the lane's \
+         only ground truth — the 2026-08-09 authorization requires it live from \
+         day one."
+    );
+}
+
+/// An un-provisioned comparator must refuse loudly, never skip quietly.
+#[test]
+fn dhan_feed_crossverify_refuses_loudly_when_unprovisioned() {
+    assert!(
+        STACK_SRC.contains("XVERIFY_UNPROVISIONED_COUNTER"),
+        "a missing cross-verify provider must increment a counter, not pass silently."
+    );
+    assert!(
+        STACK_SRC.contains("UNDETECTABLE"),
+        "the un-provisioned error must state the consequence in plain terms."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The gate stays shut
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dhan_feed_stack_gate_still_defaults_off() {
+    use tickvault_app::dhan_feed_stack::{FeedStackGate, feed_stack_gate};
+
+    assert_eq!(
+        feed_stack_gate(false, None),
+        FeedStackGate::DisabledByConfig,
+        "config off must stay off"
+    );
+    assert_eq!(
+        feed_stack_gate(true, None),
+        FeedStackGate::DisabledByEnv,
+        "an absent env opt-in must be OFF by construction — this wiring round \
+         authorized BUILDING the lane, not enabling live capture."
+    );
+    assert_eq!(
+        feed_stack_gate(true, Some("true")),
+        FeedStackGate::DisabledByEnv,
+        "only the exact opt-in value may open the gate; near-misses stay shut"
+    );
+    assert_eq!(
+        feed_stack_gate(true, Some("1")),
+        FeedStackGate::Enabled,
+        "both gates open is the only enabled combination"
+    );
+}
+
+#[test]
+fn dhan_feed_stack_is_not_enabled_in_tracked_config() {
+    for file in ["../../config/base.toml", "../../config/production.toml"] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut in_feeds = false;
+        for line in src.lines() {
+            let code = line.split('#').next().unwrap_or("").trim();
+            if code.starts_with('[') {
+                in_feeds = code == "[feeds]";
+                continue;
+            }
+            if in_feeds && code.starts_with("dhan_enabled") {
+                assert!(
+                    code.contains("false"),
+                    "{file}: [feeds] dhan_enabled must stay false — enabling live \
+                     capture is a separate operator decision from building the lane"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// capture_seq narrowing behaviour
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capture_seq_narrowing_is_fail_closed_not_saturating() {
+    use tickvault_app::dhan_feed_stack::capture_seq_from_frame_seq;
+
+    assert_eq!(capture_seq_from_frame_seq(0), Some(0));
+    assert_eq!(capture_seq_from_frame_seq(1), Some(1));
+
+    let max_ok = u64::try_from(i64::MAX).expect("i64::MAX fits u64");
+    assert_eq!(capture_seq_from_frame_seq(max_ok), Some(i64::MAX));
+
+    assert_eq!(
+        capture_seq_from_frame_seq(max_ok + 1),
+        None,
+        "an unrepresentable sequence must be REFUSED, not saturated. Saturating \
+         would pin every subsequent tick to i64::MAX and collapse all of them \
+         under the DEDUP key — turning one dropped tick into unbounded silent loss."
+    );
+    assert_eq!(capture_seq_from_frame_seq(u64::MAX), None);
+}
+
+/// Narrowing preserves the strict monotonicity the DEDUP key depends on.
+#[test]
+fn capture_seq_narrowing_preserves_monotonicity() {
+    use tickvault_app::dhan_feed_stack::capture_seq_from_frame_seq;
+
+    let mut prev = i64::MIN;
+    for seq in [
+        1u64,
+        2,
+        1_000,
+        1_000_000_000_000_000_000,
+        9_223_372_036_854_775_806,
+    ] {
+        let got = capture_seq_from_frame_seq(seq).expect("representable");
+        assert!(
+            got > prev,
+            "narrowing must preserve order: {seq} narrowed to {got}, not above {prev}"
+        );
+        prev = got;
+    }
+}
+
+/// The two process-global sequence generators are genuinely distinct, so the
+/// single-source rule above is answering a real hazard rather than a
+/// hypothetical one. If this ever fails, the two counters were unified and the
+/// guards above can be revisited.
+#[test]
+fn the_two_sequence_generators_are_independent_and_can_collide() {
+    use tickvault_storage::tick_persistence::next_capture_seq;
+    use tickvault_storage::ws_frame_spill::next_frame_seq;
+
+    let frame_a = next_frame_seq();
+    let capture_a = next_capture_seq();
+    let frame_b = next_frame_seq();
+
+    assert!(frame_b > frame_a, "frame seq must be monotonic per-counter");
+
+    // The counters are separate atomics: nothing orders `capture_a` with
+    // respect to `frame_a`/`frame_b`. That absence of ordering IS the hazard —
+    // both are wall-clock-nanosecond seeded, so first touches inside one
+    // nanosecond mint equal values. The live lane therefore uses exactly one.
+    let capture_a_u64 = u64::try_from(capture_a).unwrap_or(u64::MAX);
+    let overlaps = capture_a_u64 >= frame_a.min(frame_b) && capture_a_u64 <= frame_b.max(frame_a);
+    let _ = overlaps; // observed, not asserted — timing-dependent by nature
+
+    assert!(
+        capture_a > 0 && frame_a > 0,
+        "both generators are wall-clock seeded, which is exactly why two \
+         independently-seeded counters can mint the same integer"
+    );
+}

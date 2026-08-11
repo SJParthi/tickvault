@@ -64,6 +64,7 @@ use tracing::{debug, error, info};
 use tickvault_common::error_code::ErrorCode;
 
 use crate::seal_writer_runner::{CycleOutcome, SealWriterRunner};
+use crate::seal_writer_task::BootDrainOutcome;
 
 /// Drain interval — the loop wakes every 100 ms during normal
 /// operation and drains the mpsc + ring through the ILP buffer.
@@ -186,7 +187,39 @@ fn record_cycle_observability(outcome: &CycleOutcome, dropped_this_cycle: u64) {
 /// Emits the unconditional once-per-window positive progress report.
 /// `info!` even when every count is zero — an idle seal writer must say
 /// so out loud (2026-07-06 exam-fix: silence can never mean unknown).
+///
+/// ## 2026-08-11 honesty fix — "rescued" is not "absorbed"
+///
+/// Before this change a window that rescued seals to spill/DLQ reported them
+/// at `info!` under the word "rescued", and the only `error!` in the loop
+/// fired for `dropped`. That read as SUCCESS — three tiers of absorption
+/// working as designed — when in fact those candles were sitting in a file
+/// that nothing ever read back (see
+/// [`crate::seal_writer_task::drain_recovered_seals`]). Now that a boot-time
+/// recovery drain exists, spill/DLQ is genuinely recoverable — but it is
+/// still NOT persisted yet, and a window that produced any is escalated to
+/// `error!` so the operator sees a real signal at the time it happens rather
+/// than discovering it at the next restart.
 fn emit_progress_report(snapshot: &SealWriterProgress, ring_len: usize) {
+    let on_disk = snapshot
+        .rescued_to_spill
+        .saturating_add(snapshot.rescued_to_dlq);
+    if on_disk > 0 {
+        error!(
+            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+            cycles = snapshot.cycles,
+            submitted = snapshot.submitted,
+            rows_written = snapshot.flushed_rows,
+            flush_failures = snapshot.flush_failures,
+            rescued_to_spill = snapshot.rescued_to_spill,
+            rescued_to_dlq = snapshot.rescued_to_dlq,
+            dropped = snapshot.dropped,
+            ring_len,
+            "seal writer: {on_disk} sealed candles went to DISK, NOT QuestDB this window \
+             — recoverable at next boot, but NOT persisted now"
+        );
+        return;
+    }
     info!(
         cycles = snapshot.cycles,
         submitted = snapshot.submitted,
@@ -198,6 +231,29 @@ fn emit_progress_report(snapshot: &SealWriterProgress, ring_len: usize) {
         ring_len,
         "seal writer progress (last 60s window)"
     );
+}
+
+/// Fans the boot-recovery outcome into the existing
+/// `tv_seal_writer_drain_total` counter (NEW LABEL VALUES on the EXISTING
+/// metric name — deliberately not a new metric, so the metrics-catalog and
+/// dashboard guards keep matching on a name that already ships).
+fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
+    if outcome.seals_recovered > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_recovered")
+            .increment(outcome.seals_recovered as u64);
+    }
+    if outcome.seals_reingested > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_reingested")
+            .increment(outcome.seals_reingested as u64);
+    }
+    if outcome.records_undecodable > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_undecodable")
+            .increment(outcome.records_undecodable as u64);
+    }
+    if outcome.seals_left_pending > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_pending")
+            .increment(outcome.seals_left_pending as u64);
+    }
 }
 
 /// Returns the current UTC unix timestamp in seconds. Used to
@@ -255,6 +311,35 @@ pub async fn run_seal_writer_loop(
         max_drain = runner.max_drain_per_cycle(),
         "seal writer loop starting"
     );
+
+    // 2026-08-11 — BOOT RECOVERY DRAIN, before the first tick.
+    //
+    // Seals rescued to spill/DLQ during a QuestDB outage used to sit in files
+    // that NO production code ever read back (verified: every `read_all` call
+    // site lived inside a test-only module). This is that missing caller. It
+    // runs here rather than in `main.rs` because the loop already owns the
+    // runner and is itself the boot-time entry point for the writer task.
+    //
+    // NOTE for future editors: do NOT write the cfg-test attribute literally
+    // in this region. The `test_ratchet_loop_wires_observability_not_silence`
+    // ratchet splits this file at the FIRST occurrence of that token to scan
+    // production code only; an earlier literal silently shrinks the scanned
+    // region and would let the observability wiring be deleted unnoticed.
+    let boot = runner.boot_drain();
+    record_boot_drain_observability(&boot);
+    if !boot.is_clean() {
+        info!(
+            files_staged = boot.files_staged,
+            seals_recovered = boot.seals_recovered,
+            seals_reingested = boot.seals_reingested,
+            files_archived = boot.files_archived,
+            files_left_pending = boot.files_left_pending,
+            seals_left_pending = boot.seals_left_pending,
+            records_undecodable = boot.records_undecodable,
+            "seal writer boot recovery drain finished"
+        );
+    }
+
     let mut ticker = tokio::time::interval(interval);
     // If the runtime stalls and we miss multiple ticks (e.g. tokio
     // reactor was pinned by another task), DO NOT fire all the

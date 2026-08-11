@@ -39,6 +39,47 @@
 //! Flipping `dhan_enabled` back to `true` (Phase-A rollback) requires a
 //! fresh dated operator quote + updating this guard and
 //! `crates/common/tests/production_config_wiring.rs` in the same PR.
+//!
+//! ## RE-BLESSED 2026-08-11 — every pin below is DELIBERATELY KEPT
+//!
+//! The operator authorized the Dhan 16-connection live main-feed revival on
+//! 2026-08-09 (websocket-connection-scope-lock.md, "DHAN LIVE MAIN-FEED WS
+//! REVIVAL AUTHORIZED" + the same-day second quote raising the cap to 16),
+//! approved 2026-08-11. That is the "fresh dated operator quote" the
+//! paragraph above names — so it is reasonable to assume this guard should
+//! now be inverted to pin the lane's PRESENCE.
+//!
+//! **It should NOT be, and inverting it would be a real regression.** The
+//! revival authorizes the CODE, not a change of default. Verified in tree
+//! 2026-08-11: the revival lands as
+//! `crates/app/src/dhan_feed_stack.rs::spawn_dhan_feed_stack` behind a
+//! DOUBLE gate — `feed_stack_gate()` requires BOTH `feeds.dhan_enabled`
+//! (still `false` in `config/base.toml` and `config/production.toml`) AND
+//! an explicit `DHAN_LIVE_FEED_ENV_ON` env opt-in. This is the same
+//! ships-dark-by-default pattern every other feed uses (GDF and TrueData
+//! both ship `default-OFF`, trial-first, per their scope locks), and it is
+//! what lets revival code land and be reviewed without a config change
+//! silently putting 16 sockets into production.
+//!
+//! So Pin 1 is not an obstacle to the revival — it is the mechanism the
+//! revival relies on to stay dark until deliberately switched on. Deleting
+//! or inverting it would remove the only build-failing check that a
+//! `dhan_enabled = true` never lands unnoticed, which is strictly weaker
+//! than what the retirement had.
+//!
+//! **Verification status (honest):** these pins could NOT be executed on
+//! 2026-08-11 — `tickvault-core` does not compile mid-revival (a
+//! `DhanSocketParams` field is in flight in another agent's branch work),
+//! so `cargo test -p tickvault-app` cannot build this target. The pins were
+//! reviewed statically against the tree and none of them reference the
+//! live-feed lane's new symbols, so none is expected to trip; that
+//! expectation is UNVERIFIED until core builds again and must be
+//! re-confirmed by whoever lands the revival.
+//!
+//! When the operator does authorize switching the feed ON, the correct
+//! change is: a fresh dated quote in the scope-lock file, then flip Pin 1's
+//! polarity here and in `production_config_wiring.rs` IN THE SAME PR — not
+//! a quiet config edit.
 
 use std::fs;
 use std::path::PathBuf;

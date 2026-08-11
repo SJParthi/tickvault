@@ -213,6 +213,95 @@ fn metrics_catalog_every_required_metric_is_emitted() {
     );
 }
 
+/// Metrics retired with the Dhan live-WS lane (PR-C2 2026-07-13 / stage-2
+/// sweep 2026-07-17) whose PRODUCERS return with the 16-connection revival
+/// authorized by the operator quotes of 2026-08-09
+/// (websocket-connection-scope-lock.md "2026-08-09 — DHAN LIVE MAIN-FEED WS
+/// REVIVAL AUTHORIZED" + "SAME DAY, SECOND QUOTE"), operator-approved
+/// 2026-08-11.
+///
+/// Why this list exists (the silent-rot this closes): every other test in
+/// this file checks CATALOG → SOURCE ("is each catalogued metric emitted?").
+/// Nothing checked SOURCE → CATALOG. So when these producers resurrect, the
+/// catalog does not fail — it just silently stops describing them, and the
+/// metrics ship undocumented, unpanelled and unalarmed. That is a coverage
+/// hole that opens quietly, which is worse than a loud break.
+///
+/// These are deliberately NOT re-added to `REQUIRED_METRICS` yet: verified
+/// 2026-08-11, all five have ZERO emission sites in `crates/*/src` (the
+/// revival's connection/pool code is still being written), so cataloguing
+/// them today would fail `metrics_catalog_every_required_metric_is_emitted`
+/// and block the very work this re-blessing exists to unblock.
+const REVIVAL_PENDING_METRICS: &[&str] = &[
+    "tv_ws_graceful_unsub_total",
+    "tv_ws_graceful_shutdown_signalled_total",
+    "tv_pool_self_halts_total",
+    "tv_pool_degraded_seconds",
+    "tv_pool_halts_total",
+];
+
+/// RE-BLESSED 2026-08-11 — the retirement note above is inverted into an
+/// ACTIVE gate instead of passive prose.
+///
+/// Each metric is in exactly one of two legal states: **not emitted
+/// anywhere** (still retired — fine), or **emitted AND catalogued** (revived
+/// properly — fine). The illegal third state is *emitted but uncatalogued*,
+/// which is precisely how a resurrected producer would slip in undocumented.
+///
+/// So the moment an agent wires up e.g. `tv_pool_halts_total`, this test
+/// fails and tells them to move the name from `REVIVAL_PENDING_METRICS` into
+/// `REQUIRED_METRICS` with a real description. The protection that used to
+/// say "these are deleted" now says "these may return, but only with their
+/// documentation" — same guard, new direction.
+#[test]
+fn revival_pending_metrics_are_catalogued_the_moment_they_are_emitted() {
+    let haystack = read_all_sources();
+    let catalogued: std::collections::HashSet<&str> =
+        REQUIRED_METRICS.iter().map(|(n, _)| *n).collect();
+
+    let mut undocumented = Vec::new();
+    for name in REVIVAL_PENDING_METRICS {
+        let emitted = haystack.contains(&format!("\"{name}\""));
+        if emitted && !catalogued.contains(name) {
+            undocumented.push(*name);
+        }
+    }
+
+    assert!(
+        undocumented.is_empty(),
+        "{} Dhan-lane metric(s) are emitted in production source but absent \
+         from REQUIRED_METRICS:\n{}\n\nThese retired with the Dhan live-WS \
+         lane and are returning with the 2026-08-09-authorized revival. Move \
+         each name out of REVIVAL_PENDING_METRICS and into REQUIRED_METRICS \
+         with a real operator-readable description — and add its dashboard \
+         panel + alert rule in the same PR (operator-charter-forever.md §C: \
+         a counter with no panel and no alert is not monitoring). Do NOT \
+         silence this by deleting the name from REVIVAL_PENDING_METRICS.",
+        undocumented.len(),
+        undocumented
+            .iter()
+            .map(|n| format!("  - {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Guards the guard: a name may not sit in BOTH lists (that would make the
+/// anti-rot check above vacuous for that metric).
+#[test]
+fn revival_pending_metrics_are_disjoint_from_required() {
+    let catalogued: std::collections::HashSet<&str> =
+        REQUIRED_METRICS.iter().map(|(n, _)| *n).collect();
+    for name in REVIVAL_PENDING_METRICS {
+        assert!(
+            !catalogued.contains(name),
+            "{name} is in BOTH REQUIRED_METRICS and REVIVAL_PENDING_METRICS \
+             — once catalogued it must be REMOVED from the pending list, or \
+             the emitted-but-uncatalogued check silently stops covering it."
+        );
+    }
+}
+
 /// E1: Sanity check — REQUIRED_METRICS itself must not contain duplicates.
 /// A duplicate would mean two different descriptions point at the same
 /// metric name, which would silently confuse operators.

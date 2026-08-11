@@ -213,6 +213,23 @@ fn is_test_cfg(attr: &str) -> bool {
 ///   static near the TOP of the file, and a naive split there hid the
 ///   real WS-GAP-07 emit at line ~1853 (a FALSE "dead filter" found
 ///   while bringing this guard up on 2026-07-10).
+///
+///   CITATION STATUS 2026-08-11 (Dhan 16-connection live-feed revival,
+///   authorized 2026-08-09 per websocket-connection-scope-lock.md): the
+///   cited file and line numbers above are HISTORICAL. `connection.rs`
+///   was deleted with the lane and is being rebuilt by the revival, so
+///   ":20" and ":1853" will not correspond to the same content — treat
+///   them as a record of the bug that shaped this function, not as a
+///   pointer to live code. **The behaviour they justify is unaffected
+///   and this guard does not break:** verified 2026-08-11, the
+///   regression pin for this case (in the tests below) runs against a
+///   SYNTHETIC in-test fixture string, never against `connection.rs` on
+///   disk — so the shape stays enforced whether or not that file exists.
+///   Deliberately annotated rather than deleted: the citation explains
+///   WHY a naive split is wrong, and a future reader who removes the
+///   excision logic because "the example file is gone" would silently
+///   re-open the false-dead-filter class this function exists to
+///   prevent.
 /// - NOT a truncation at the first test-gated MODULE either (the
 ///   2026-07-10 shape of this function): `crates/app/src/
 ///   cross_verify_1m_boot.rs` carried a MID-FILE `#[cfg(test)] mod
