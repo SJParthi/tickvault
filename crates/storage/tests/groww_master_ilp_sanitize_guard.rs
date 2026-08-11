@@ -68,6 +68,30 @@ fn extract_fn_body<'a>(src: &'a str, fn_sig_marker: &str) -> &'a str {
     &rest[open_rel..=close_rel]
 }
 
+/// Strip `//` line comments, treating `://` (URL scheme separators inside
+/// string literals) as code — the house stripper, copied verbatim from
+/// `cadence_boot_wiring_guard.rs` (itself the `http_client_fallback_guard.rs`
+/// precedent). Needle scans run on the STRIPPED source so a prose comment
+/// carrying a needle can neither vacuously satisfy a pin nor falsely trip one.
+fn strip_line_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let bytes = line.as_bytes();
+        let mut cut = line.len();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'/' && bytes[i + 1] == b'/' && (i == 0 || bytes[i - 1] != b':') {
+                cut = i;
+                break;
+            }
+            i += 1;
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
 /// For every `.symbol(...)` / `.column_str(...)` STATEMENT (which rustfmt may wrap
 /// across several lines) that references a raw `row.<field>` String, the statement
 /// must also contain a `sanitize_ilp_` wrapper.
@@ -77,6 +101,18 @@ fn extract_fn_body<'a>(src: &'a str, fn_sig_marker: &str) -> &'a str {
 /// arbitrary operator/CSV input, so they are legitimately written raw and are
 /// exempted. The injection risk is only for free-text String fields.
 fn assert_all_row_string_writes_sanitized(body: &str, fn_name: &str) {
+    // Scan CODE, not prose. Before this stripper the needle `row.` matched
+    // inside rationale comments, so a sentence that happened to end a line with
+    // "… an expired row." flagged the very next `.symbol()` call — even one
+    // writing a `&'static str` constant that cannot carry an injection.
+    //
+    // That is worth fixing in the guard rather than by rewording the comment:
+    // a check that prose can trip is one that people learn to satisfy by
+    // rewording, which trains exactly the wrong reflex about a security guard.
+    // House stripper (URL-safe: `://` is code), same one used by
+    // `cadence_boot_wiring_guard` / `cadence_executor_purity_guard` /
+    // `http_client_fallback_guard`.
+    let body = &strip_line_comments(body);
     let mut checked = 0usize;
     // Split into statements (terminated by `?;`) so a rustfmt-wrapped multi-line
     // `.symbol(\n  "x",\n  sanitize_ilp_symbol(row.x).as_ref(),\n)?;` is ONE unit.
