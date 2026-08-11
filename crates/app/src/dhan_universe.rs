@@ -38,7 +38,7 @@ use tickvault_common::constants::{
 };
 use tickvault_core::instrument::master_csv::{
     Constituent, JoinOutcome, NSE_MEMBERSHIP_TOLERANCE, build_isin_index, join_constituents,
-    parse_master_csv,
+    parse_master_csv, split_csv_line,
 };
 use tickvault_core::instrument::master_download::{
     build_hardened_csv_client, fetch_csv_hardened, nse_index_csv_url, nse_user_agent,
@@ -86,14 +86,49 @@ const UNRESOLVED_FRACTION_GAUGE: &str = "tv_dhan_universe_unresolved_fraction";
 
 /// Index lists that failed to download or parse in the last build attempt.
 ///
-/// Deliberately separate from the build outcome: a build can SUCCEED with
-/// several lists missing, because the tolerance gate judges the joined
-/// result, not the download count. Without this number that partial failure
-/// is invisible behind a green build.
+/// Deliberately separate from the unresolved fraction: that gate judges the
+/// joined result, not the download count. This gauge is what makes a partial
+/// download visible; [`MAX_FAILED_INDEX_LIST_FRACTION`] is what makes it fatal.
 const INDEX_LISTS_FAILED_GAUGE: &str = "tv_dhan_universe_index_lists_failed";
+
+/// How many of the ~49 NSE index lists may fail before the build is REJECTED.
+///
+/// # Why the unresolved-fraction gate cannot cover this
+///
+/// That gate divides by the constituents actually DOWNLOADED, so a list that
+/// never arrived is not in its denominator — invisible to it by construction.
+/// 48 lists failing while the 49th returns clean data yields a fraction of
+/// 0.0: a green build carrying ~2% of the intended membership. Worse, because
+/// `index_constituency` rows are never evicted, yesterday's rows for the 48
+/// missing indices are still in the table, so even a SQL spot-check reads
+/// complete. That is precisely the false-OK class the charter forbids, and it
+/// needs its own gate over the list COUNT.
+///
+/// Set to 10% — about 4 of 49 — because individual niftyindices lists do
+/// genuinely flake, and rejecting the day over one of them would make the
+/// pipeline as reliable as its least reliable list (the same reasoning that
+/// makes a single failure non-fatal in the loop below).
+const MAX_FAILED_INDEX_LIST_FRACTION: f64 = 0.10;
 
 /// Backoff floor between failed attempts, doubling to the configured cap.
 const RETRY_BASE_SECS: u64 = 10;
+
+/// Whole-build deadline. Exceeding it fails the attempt; it never wedges.
+///
+/// The per-request timeouts (10 s connect / 60 s read) bound each HTTP attempt
+/// individually. Nothing bounded their SUM: ~50 sequential fetches at the read
+/// timeout is ~50 minutes, which starting at 08:00 IST would run past the 09:15
+/// open — and the QuestDB ILP flush at the end has no timeout of its own, so a
+/// server that accepts the connection then stops reading blocks forever. Either
+/// way the loop stalls with the task still ALIVE, so the supervisor never fires
+/// and no counter moves: the rider is silently gone, which is worse than a loud
+/// failure.
+///
+/// 15 minutes is ~10× a healthy build (the master download dominates at ~1–2
+/// min) and still leaves room for several retries between the 08:00 target and
+/// the 09:15 open. A build slow enough to hit this is not one to keep waiting
+/// on — retrying from the top is both faster and louder.
+const BUILD_DEADLINE_SECS: u64 = 900;
 
 /// Directory for the resolved mapping artifact.
 const MAPPING_DIR: &str = "data/instrument-cache";
@@ -182,18 +217,46 @@ struct MappingEntry {
     exchange_segment: u8,
 }
 
+/// Fraction of index lists that failed, in `[0.0, 1.0]`.
+///
+/// Routed through `u32` so `f64::from` is lossless — no precision-loss
+/// `#[allow]`, and a count that somehow exceeded `u32::MAX` saturates toward
+/// REJECTION rather than wrapping into a healthy-looking small number.
+///
+/// Returns `1.0` when `total` is zero: an empty slug list means nothing was
+/// even attempted, and reporting a perfect 0.0 for it is the same false-OK the
+/// gate exists to close.
+fn failed_list_fraction(failed: usize, total: usize) -> f64 {
+    if total == 0 {
+        return 1.0;
+    }
+    let failed = u32::try_from(failed).unwrap_or(u32::MAX);
+    let total = u32::try_from(total).unwrap_or(u32::MAX);
+    f64::from(failed) / f64::from(total)
+}
+
 /// Parses one niftyindices constituent CSV.
 ///
 /// Columns are resolved BY NAME (`Symbol`, `ISIN Code`) for the same reason
 /// the master parser does: the layout is the vendor's to change.
+///
+/// Tokenizing uses the master parser's quote-aware [`split_csv_line`], NOT a
+/// bare `split(',')`. The niftyindices layout is
+/// `Company Name,Industry,Symbol,Series,ISIN Code` — the company name routinely
+/// contains a comma and is therefore quoted, and the join key is the LAST
+/// column, so a naive split shifts `ISIN Code` off the end. The failure is
+/// silent and passes the tolerance gate: the row still yields a non-empty
+/// "ISIN" (the value of some other column), which misses the index and is
+/// reported as `IsinNotInMaster` against a garbled symbol.
 fn parse_constituent_csv(index_name: &str, csv: &str) -> Vec<Constituent> {
     let csv = csv.strip_prefix('\u{feff}').unwrap_or(csv);
     let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
     let Some(header) = lines.next() else {
         return Vec::new();
     };
-    let cols: Vec<&str> = header.trim_end_matches('\r').split(',').collect();
-    let find = |name: &str| cols.iter().position(|c| c.trim() == name);
+    let mut fields: Vec<String> = Vec::new();
+    split_csv_line(header.trim_end_matches('\r'), &mut fields);
+    let find = |name: &str| fields.iter().position(|c| c.trim() == name);
     let (Some(i_sym), Some(i_isin)) = (find("Symbol"), find("ISIN Code")) else {
         // A list whose header we cannot read yields NOTHING rather than
         // guessing at positions. Zero constituents from one index is visible
@@ -203,14 +266,14 @@ fn parse_constituent_csv(index_name: &str, csv: &str) -> Vec<Constituent> {
     let widest = i_sym.max(i_isin);
     let mut out = Vec::new();
     for line in lines {
-        let f: Vec<&str> = line.trim_end_matches('\r').split(',').collect();
-        if f.len() <= widest {
+        split_csv_line(line.trim_end_matches('\r'), &mut fields);
+        if fields.len() <= widest {
             continue;
         }
         out.push(Constituent {
             index_name: index_name.to_string(),
-            symbol: f[i_sym].trim().to_uppercase(),
-            isin: f[i_isin].trim().to_uppercase(),
+            symbol: fields[i_sym].trim().to_uppercase(),
+            isin: fields[i_isin].trim().to_uppercase(),
         });
     }
     out
@@ -222,6 +285,28 @@ fn parse_constituent_csv(index_name: &str, csv: &str) -> Vec<Constituent> {
 /// Any failure that leaves the day without a trustworthy mapping. The caller
 /// retries with backoff — it never proceeds on a partial result, because a
 /// partial mapping subscribes a partial universe and reports success.
+///
+/// # Complexity — time AND space
+///
+/// Time is O(master rows + constituents), every step a single pass or a hash
+/// probe; the network wait dominates by orders of magnitude.
+///
+/// Space is the part worth stating, because this is the process's peak: the
+/// downloaded master body (~15 MB, capped at 50 MB), the parsed `Vec<MasterRow>`
+/// (~150,000 rows × 5 owned `String`s), the ISIN index over its NSE-cash-equity
+/// subset, the accumulated `Vec<Constituent>` across all 49 lists (~37,000
+/// rows × 3 `String`s), and then the `JoinOutcome` plus the serialized JSON
+/// artifact. Rough peak ~70–90 MB, held for the duration of one daily build on
+/// a 32 GiB box and dropped when this function returns. It runs ONCE per day,
+/// off the tick path, before the market opens — which is the only reason a
+/// peak this shape is acceptable at all.
+///
+/// The per-list bodies are dropped as the loop advances, so the 50 MB download
+/// cap bounds each list individually but NOT the accumulated `constituents`
+/// vector — a vendor serving millions of minimal rows across 49 lists could
+/// still grow it without limit. Recorded rather than fixed here: the honest
+/// bound is a row-count ceiling per list, which needs a number the vendor's
+/// real list sizes have to justify.
 async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinOutcome> {
     let client = build_hardened_csv_client().map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -268,10 +353,8 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
             }
         }
     }
-    // Published even on a build that goes on to succeed: the tolerance gate
-    // judges the JOINED RESULT, so a build can pass with several lists
-    // missing entirely. Without this gauge that partial failure hides behind
-    // a green build outcome.
+    // Published even on a build that goes on to succeed, so a partial download
+    // is visible in the gauge as well as in the gate below.
     metrics::gauge!(INDEX_LISTS_FAILED_GAUGE).set(failed_lists as f64);
     info!(
         lists = INDEX_CONSTITUENCY_SLUGS.len(),
@@ -279,6 +362,21 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
         constituents = constituents.len(),
         "NSE India index lists downloaded"
     );
+
+    // 2b. Reject a build that is missing too many lists ENTIRELY. This gate
+    // exists because the unresolved-fraction gate below structurally cannot
+    // see a missing list — see MAX_FAILED_INDEX_LIST_FRACTION.
+    let failed_fraction = failed_list_fraction(failed_lists, INDEX_CONSTITUENCY_SLUGS.len());
+    if failed_fraction > MAX_FAILED_INDEX_LIST_FRACTION {
+        anyhow::bail!(
+            "build REJECTED: {failed_lists} of {} NSE index lists failed ({:.1}%), above the \
+             {:.1}% ceiling — the surviving lists would join cleanly and report a healthy day \
+             while carrying a fraction of the intended membership",
+            INDEX_CONSTITUENCY_SLUGS.len(),
+            failed_fraction * 100.0,
+            MAX_FAILED_INDEX_LIST_FRACTION * 100.0,
+        );
+    }
 
     // 3. The join — the actual deliverable.
     let outcome = join_constituents(&constituents, &index);
@@ -464,7 +562,15 @@ fn write_mapping_atomic(
                 symbol: r.symbol.clone(),
                 isin: r.isin.clone(),
                 security_id: r.security_id,
-                exchange_segment: r.exchange_segment as u8,
+                // `binary_code()`, NOT `as u8`: Dhan's wire codes have a GAP
+                // (there is no 6, between MCX_COMM=5 and BSE_CURRENCY=7), so
+                // declaration order and wire value diverge for BseCurrency
+                // (6 vs 7) and BseFno (7 vs 8). The artifact is consumed as
+                // Dhan segment codes, so it must carry Dhan's numbering.
+                // Latent today — the join only ever emits NseEquity, whose
+                // two numberings coincide at 1 — which is exactly why it
+                // would have gone unnoticed until the first non-equity row.
+                exchange_segment: r.exchange_segment.binary_code(),
             })
             .collect(),
     };
@@ -561,7 +667,27 @@ async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbCon
                 tokio::time::sleep(wait).await;
                 continue;
             }
-            match build_once(&today, &questdb).await {
+            // A whole-build deadline, on top of the per-request timeouts. Those
+            // bound each HTTP attempt; nothing bounded the SUM of ~50 sequential
+            // fetches plus the parse and the QuestDB flush, and the ILP flush in
+            // particular has no timeout of its own — a QuestDB that accepts the
+            // connection and then stops reading blocks the writer forever. That
+            // wedges this loop with the task still ALIVE, so the supervisor
+            // never fires, no counter moves, and the rider is silently gone.
+            // The deadline turns that into an ordinary failed attempt that
+            // retries on the backoff ladder.
+            let build = tokio::time::timeout(
+                Duration::from_secs(BUILD_DEADLINE_SECS),
+                build_once(&today, &questdb),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "build exceeded the {BUILD_DEADLINE_SECS}s deadline — treating as a failed \
+                     attempt so the retry ladder runs instead of the rider wedging silently"
+                ))
+            });
+            match build {
                 Ok(outcome) => {
                     attempt = 0;
                     built_for = Some(today.clone());
@@ -781,5 +907,89 @@ mod tests {
         let csv = "Symbol,ISIN Code\nRELIANCE,INE002A01018\nBROKEN";
         let rows = parse_constituent_csv("NIFTY 50", csv);
         assert_eq!(rows.len(), 1, "a short row is skipped, never padded");
+    }
+
+    #[test]
+    fn test_parse_constituent_csv_survives_a_quoted_comma_in_the_company_name() {
+        // REGRESSION (2026-08-11): this parser used a bare `split(',')` while
+        // the master parser next door used a quote-aware tokenizer. The real
+        // niftyindices layout puts the quoted company name FIRST and the join
+        // key LAST, so one comma inside a company name shifted `ISIN Code` off
+        // the end of the row. The constituent was then silently lost — and lost
+        // QUIETLY, because the garbled row still produced a non-empty "ISIN"
+        // that simply missed the master and counted as IsinNotInMaster.
+        let csv = "Company Name,Industry,Symbol,Series,ISIN Code\n\
+                   \"Foo, Bar Ltd.\",Energy,RELIANCE,EQ,INE002A01018\n\
+                   Plain Ltd.,IT,INFY,EQ,INE009A01021";
+        let rows = parse_constituent_csv("NIFTY 50", csv);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].symbol, "RELIANCE");
+        assert_eq!(
+            rows[0].isin, "INE002A01018",
+            "a quoted comma must not shift the join key"
+        );
+        assert_eq!(rows[1].symbol, "INFY");
+        assert_eq!(rows[1].isin, "INE009A01021");
+    }
+
+    #[test]
+    fn test_mapping_artifact_uses_dhan_wire_segment_codes_not_declaration_order() {
+        // The artifact's `exchange_segment` is consumed as a DHAN segment
+        // code, and Dhan's numbering has a gap (no 6). `as u8` would give
+        // declaration order, which diverges for exactly two variants — and
+        // NOT for NseEquity, the only one the join emits today, so the bug
+        // would stay invisible until the first non-equity mapping.
+        use tickvault_common::types::ExchangeSegment;
+        assert_eq!(ExchangeSegment::NseEquity.binary_code(), 1);
+        assert_eq!(
+            ExchangeSegment::BseCurrency.binary_code(),
+            7,
+            "declaration order says 6; the wire says 7"
+        );
+        assert_eq!(
+            ExchangeSegment::BseFno.binary_code(),
+            8,
+            "declaration order says 7; the wire says 8"
+        );
+        // The divergence is real, so `as u8` is not an acceptable shortcut.
+        assert_ne!(
+            ExchangeSegment::BseFno as u8,
+            ExchangeSegment::BseFno.binary_code()
+        );
+    }
+
+    #[test]
+    fn test_failed_list_fraction_treats_nothing_attempted_as_total_failure() {
+        assert!(
+            (failed_list_fraction(0, 49) - 0.0).abs() < f64::EPSILON,
+            "a clean day is 0.0"
+        );
+        assert!((failed_list_fraction(49, 49) - 1.0).abs() < f64::EPSILON);
+        // 4 of 49 ≈ 8.2% — under the ceiling, so a few flaky lists still build.
+        assert!(failed_list_fraction(4, 49) <= MAX_FAILED_INDEX_LIST_FRACTION);
+        // 5 of 49 ≈ 10.2% — over it.
+        assert!(failed_list_fraction(5, 49) > MAX_FAILED_INDEX_LIST_FRACTION);
+        // The false-OK case: an empty slug list means nothing was attempted,
+        // which must read as total failure, never as a flawless 0.0.
+        assert!(
+            (failed_list_fraction(0, 0) - 1.0).abs() < f64::EPSILON,
+            "nothing attempted must never render as a perfect score"
+        );
+    }
+
+    #[test]
+    fn test_max_failed_index_list_fraction_rejects_the_48_of_49_false_ok() {
+        // The scenario the gate exists for: 48 lists fail, the 49th returns
+        // clean data, so the unresolved fraction is a flawless 0.0 over the
+        // handful of constituents that did arrive.
+        let total = INDEX_CONSTITUENCY_SLUGS.len();
+        assert!(total > 1, "the gate is meaningless with one list");
+        let fraction = failed_list_fraction(total - 1, total);
+        assert!(
+            fraction > MAX_FAILED_INDEX_LIST_FRACTION,
+            "{} of {total} lists failing ({fraction:.3}) must be REJECTED — a green build \
+             here would carry a fraction of the intended membership",
+            total - 1
+        );
     }
 }
