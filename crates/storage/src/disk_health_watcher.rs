@@ -31,11 +31,26 @@ use tracing::{debug, error, info};
 pub const SPILL_DISK_HEALTH_POLL_INTERVAL_SECS: u64 = 60;
 
 /// Threshold below which the spill dir is considered critically low. The
-/// matching Prometheus alert rule routes to Telegram CRITICAL when the
-/// gauge dips below this. Default 1 GiB — at the typical observed spill
-/// rate during a sustained QuestDB outage (~10 MB/min) this gives ~100
-/// minutes of operator warning before the disk actually fills.
-pub const SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// matching alert routes to Telegram CRITICAL when the gauge dips below this.
+///
+/// 2026-08-10: raised 1 GiB → 10 GiB. The 1 GiB was justified as "~100 minutes
+/// of operator warning" at a spill rate of ~10 MB/min — a rate measured when
+/// the only writer was a QuestDB outage backing up a 4-index REST runtime.
+/// That reasoning does not survive the authorized target: at the r8g.xlarge
+/// scale (operator Quote 13, 2026-08-08 — 13 timeframes at ~25,000
+/// instruments, tick retention on a 100 GB volume) the §7 Rule 3 estimate is
+/// 44–141 GB of ticks per MONTH, i.e. ~1–3 GB/day steady-state and far higher
+/// during a spill episode. At those rates 1 GiB of free space is **under an
+/// hour of runway**, and a threshold that fires with under an hour left is a
+/// notification, not a warning.
+///
+/// 10 GiB restores a genuinely actionable margin (~10% of the 100 GB volume)
+/// without being so large it fires during normal operation. Deliberately a
+/// FIXED byte count rather than a percentage: the spill directory and the data
+/// volume can be sized independently, and a percentage silently re-scales the
+/// alarm every time the disk changes — which is the drift class this whole
+/// sweep exists to eliminate.
+pub const SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
 /// Outcome of one health check, exposed for unit testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

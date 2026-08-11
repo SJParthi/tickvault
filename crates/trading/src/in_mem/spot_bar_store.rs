@@ -180,10 +180,23 @@ pub struct BlockOutcome {
 /// 2026-08-07: before this, the slot table grew unbounded — one entry per
 /// distinct instrument ever seen, never evicted. It was safe only by the
 /// external convention that callers feed the small hardcoded index list; the
-/// type enforced nothing. 256 is ~32x today's ~8 live slots, so it cannot bite
-/// current operation, while making the growth bounded BY CONSTRUCTION.
-/// Raising it is a deliberate, reviewable edit — which is the point.
-pub const MAX_SPOT_BAR_SLOTS: usize = 256;
+/// type enforced nothing. Capping it made the growth bounded BY CONSTRUCTION.
+///
+/// 2026-08-10: raised 256 → 25,000 to match [`AGGREGATOR_MAX_SLOTS`]. The 256
+/// was sized as "~32x today's ~8 live slots" when the runtime was REST-only on
+/// four indices. Under the authorized r8g.xlarge target (operator Quote 13,
+/// 2026-08-08 — 13 timeframes at ~25,000 instruments) that cap **refuses
+/// 24,744 of 25,000 instruments** with `SlotCapacityExhausted`, i.e. zero RAM
+/// retention for all but the first 256 — a fail-closed refusal, so it would
+/// have been loud rather than silent, but it would have made the upgrade
+/// useless for its stated purpose.
+///
+/// Sized to the SAME ceiling as the aggregator so the two cannot disagree
+/// about how many instruments the box admits. Memory is bounded by
+/// construction: the slot table is `RwLock<HashMap<SlotKey, Arc<Slot>>>`, so
+/// this is a ceiling on entries actually inserted, not a pre-allocation.
+/// Raising it further is a deliberate, reviewable edit — which is the point.
+pub const MAX_SPOT_BAR_SLOTS: usize = crate::candles::AGGREGATOR_MAX_SLOTS;
 
 /// One per-TF sorted ring of sealed bars.
 #[derive(Debug)]
