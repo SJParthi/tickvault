@@ -590,6 +590,40 @@ mod tests {
     }
 
     #[test]
+    /// The whole point of this helper is that callers never do the
+    /// multiplication themselves. If it ever disagrees with its own two
+    /// inputs, a caller sizing a subscription set against it would build a
+    /// set `plan_pool` then refuses WHOLESALE — taking the endpoint down
+    /// rather than degrading it.
+    #[test]
+    fn test_subscription_capacity_is_connections_times_instruments() {
+        for endpoint in [
+            DhanEndpointType::MainFeed,
+            DhanEndpointType::Depth20,
+            DhanEndpointType::Depth200,
+            DhanEndpointType::OrderUpdate,
+        ] {
+            assert_eq!(
+                endpoint.subscription_capacity(),
+                endpoint.max_connections() as usize
+                    * endpoint.max_instruments_per_connection() as usize,
+                "{} capacity must equal its own two inputs",
+                endpoint.as_str()
+            );
+        }
+        // The authorized envelopes, spelled out so a silent budget change is
+        // visible here and not only in the constants.
+        assert_eq!(DhanEndpointType::MainFeed.subscription_capacity(), 25_000);
+        assert_eq!(DhanEndpointType::Depth20.subscription_capacity(), 250);
+        assert_eq!(DhanEndpointType::Depth200.subscription_capacity(), 5);
+        assert_eq!(
+            DhanEndpointType::OrderUpdate.subscription_capacity(),
+            0,
+            "the order-update socket carries no instrument subscriptions"
+        );
+    }
+
+    #[test]
     fn test_max_instruments_per_connection_matches_dhan_limits() {
         assert_eq!(
             DhanEndpointType::MainFeed.max_instruments_per_connection(),

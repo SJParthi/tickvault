@@ -228,8 +228,10 @@ pub fn select_live_universe(
 ///
 /// Returns the index universe unchanged in every failure mode, always with a
 /// logged reason.
-// TEST-EXEMPT: filesystem I/O — the parse, the selection, the envelope refusal and the
-// fallback classification are all delegated to unit-tested pure fns above.
+// The parse, the selection, the envelope refusal and the fallback
+// classification are all delegated to unit-tested pure fns above; this wrapper
+// only reads a file and logs.
+// TEST-EXEMPT: filesystem I/O — see the note above.
 pub fn resolve_live_universe(
     cfg: &tickvault_common::config::DhanUniverseConfig,
     index_universe: Vec<SubscribeInstrument>,
@@ -446,7 +448,7 @@ mod tests {
     /// mismatch here would make the reader fall back forever while looking
     /// exactly like an empty master.
     #[test]
-    fn test_reader_and_writer_agree_on_the_artifact_filename() {
+    fn test_mapping_artifact_path_is_shared_by_reader_and_writer() {
         let path = crate::dhan_universe::mapping_artifact_path("2026-08-12");
         assert_eq!(
             path.to_string_lossy(),
