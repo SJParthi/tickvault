@@ -749,6 +749,70 @@ impl LiveIngest {
         }
     }
 
+    /// Seals every OPEN bucket across every instrument and timeframe, routing
+    /// each one to the same seal writer the per-tick fold uses.
+    ///
+    /// # Why this has to exist
+    ///
+    /// A bucket seals when a LATER tick crosses its boundary. That rule has a
+    /// hole at exactly one place — the end — and the end happens every single
+    /// day: at 15:30 the final bucket of every timeframe for every instrument
+    /// is still open, no further tick will ever arrive to close it, and it is
+    /// discarded when the process exits. One bar per instrument per timeframe,
+    /// lost daily, with no counter moving and no log line.
+    ///
+    /// `MultiTfAggregator::force_seal_all` was written for this and had **zero
+    /// production callers** — found 2026-08-11 by a workspace complexity audit,
+    /// and it is the fourth defect of this exact shape in this lane: code that
+    /// exists, is tested, and is never invoked. `seal_ring.rs` even sizes the
+    /// ring to absorb the burst this produces, so the buffer was provisioned
+    /// for a caller that did not exist.
+    ///
+    /// Returns `(emitted, dropped)`. Both are added to the running totals, so
+    /// the close seal shows up in the same counters as the per-tick path — a
+    /// close-time drop is as much a loss as a mid-session one and must not be
+    /// accounted separately.
+    ///
+    /// # Complexity
+    /// O(slots × TF). COLD — once per session, never per tick.
+    pub fn seal_open_buckets_at_close(&mut self) -> (u64, u64) {
+        let mut emitted = 0u64;
+        let mut dropped = 0u64;
+        let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
+        let bars = self
+            .aggregator
+            .force_seal_all(|feed, security_id, segment_code, tf, state| {
+                let Some(tx) = sender else {
+                    dropped = dropped.saturating_add(1);
+                    return;
+                };
+                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
+                // `try_send` for the same reason the per-tick path uses it: a
+                // slow writer must never block the caller. At close the caller
+                // is the drain's own shutdown, and blocking it would hold the
+                // whole lane open past the session.
+                if tx.try_send(seal).is_err() {
+                    dropped = dropped.saturating_add(1);
+                } else {
+                    emitted = emitted.saturating_add(1);
+                }
+            });
+        debug_assert_eq!(
+            bars as u64,
+            emitted.saturating_add(dropped),
+            "every bar force_seal_all produced must be accounted as emitted or dropped"
+        );
+        self.seals_emitted = self.seals_emitted.saturating_add(emitted);
+        self.seals_dropped = self.seals_dropped.saturating_add(dropped);
+        if emitted > 0 {
+            counters().seals_emitted.increment(emitted);
+        }
+        if dropped > 0 {
+            counters().seals_dropped.increment(dropped);
+        }
+        (emitted, dropped)
+    }
+
     /// Sealed candles handed to the process-wide seal writer.
     #[must_use]
     pub const fn seals_emitted(&self) -> u64 {
@@ -1036,8 +1100,21 @@ async fn run_frame_drain(
         }
     }
 
-    // Every sender was dropped, so no socket is left. Flush what is still
-    // buffered BEFORE reporting down — the tail of the session is exactly the
+    // Every sender was dropped, so no socket is left.
+    //
+    // ORDER MATTERS, and it is the reverse of the obvious one. Seal FIRST,
+    // flush SECOND. A bucket closes only when a later tick crosses its
+    // boundary, so at this instant the final bucket of every timeframe for
+    // every instrument is still open and no tick will ever arrive to close
+    // it. Flushing first and sealing after would push those bars into a
+    // writer that has already been told the session is over.
+    //
+    // Skipping this step entirely is what the code did until 2026-08-11: one
+    // bar per instrument per timeframe, discarded every single day, with no
+    // counter moving and no log line. See `seal_open_buckets_at_close`.
+    let (close_emitted, close_dropped) = ingest.seal_open_buckets_at_close();
+
+    // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
     let tail = ingest.flush();
     publish_fold_depth(&ingest);
@@ -1045,6 +1122,8 @@ async fn run_frame_drain(
         code = ErrorCode::WsGapConnectionState.code_str(),
         frames = seen,
         final_flush_rows = tail,
+        close_seals_emitted = close_emitted,
+        close_seals_dropped = close_dropped,
         seals_emitted = ingest.seals_emitted(),
         seals_dropped = ingest.seals_dropped(),
         seq_refused = ingest.seq_refused(),
@@ -1735,10 +1814,44 @@ pub fn spawn_daily_crossverify(
 
             let ist = tickvault_common::trading_calendar::ist_offset();
             let today = chrono::Utc::now().with_timezone(&ist).date_naive();
+            // IST-wall-clock-as-epoch, NOT the true UTC instant of IST
+            // midnight. `and_utc()`, deliberately, on a date that is already
+            // the IST date.
+            //
+            // FIXED 2026-08-11, and this was blind-since-birth. The previous
+            // line was `.and_local_timezone(ist)`, which yields the real UTC
+            // instant — 18:30Z the previous day. But BOTH sides of this
+            // comparison stamp IST wall-clock as though it were epoch: the
+            // live side because `ticks.ts` is `exchange_timestamp * 1e9` with
+            // no offset (Dhan's LTT is already IST epoch seconds — see
+            // data-integrity.md, "NEVER ADD +5:30 TO ts"), and the REST side
+            // because `intraday_utc_secs_to_ist_minute_nanos` adds the offset
+            // to a UTC epoch. Subtracting a true-UTC origin from an
+            // IST-wall-as-epoch value therefore produced `wall_secs + 19800`.
+            //
+            // The consequence was not a small drift. `is_in_session` accepts
+            // [33300, 55800); with the skew, a bucket left the window as soon
+            // as `wall_secs >= 36000` — 10:00 IST. Every minute from 10:00
+            // onward was dropped as `out_of_session` on BOTH sides before the
+            // join, so the comparison saw 45 of the day's 375 session minutes
+            // and, because `out_of_session` feeds no verdict and 45 is not
+            // vacuous, still reported Clean. The tail amnesty landed on
+            // 09:58-09:59 instead of 15:28-15:29, hiding the genuine tail too.
+            //
+            // This is the SAME defect class as the nanosecond-vs-microsecond
+            // bug that made the 2026-07 cross-verify blind since birth and
+            // helped retire the feed — re-created in a different coordinate
+            // system, in the one check that exists to catch disagreement.
             let day_start_ist_nanos = today
                 .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(ist).single())
-                .map_or(0, |dt| dt.timestamp_nanos_opt().unwrap_or(0));
+                .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+                .unwrap_or(0);
+            debug_assert_eq!(
+                day_start_ist_nanos % (24 * 3600 * 1_000_000_000_i64),
+                0,
+                "an IST-wall-as-epoch midnight must land exactly on a day boundary; a \
+                 non-zero remainder means a real-timezone origin crept back in"
+            );
 
             let client = reqwest::Client::new();
             match crate::dhan_live_crossverify::run_cross_verification(
@@ -2235,6 +2348,65 @@ mod tests {
     }
 
     #[test]
+    fn test_seal_open_buckets_at_close_accounts_every_bar_it_produces() {
+        // The defect this pins: `force_seal_all` had ZERO production callers,
+        // so the final open bucket of every timeframe was discarded at
+        // shutdown — one bar per instrument per timeframe, lost daily, with
+        // no counter moving and no log line.
+        //
+        // Honest scope: this unit test runs with no seal writer installed, so
+        // every bar lands on the `dropped` side. That is deliberate and it is
+        // still the assertion that matters — a non-zero total proves the
+        // aggregator was actually walked and OPEN buckets were found, which
+        // is precisely what the missing call site was failing to do. The
+        // emitted-vs-dropped SPLIT is exercised by the writer-side tests; the
+        // invariant here is that no bar escapes accounting on either side.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let packet = ticker_packet(13, 23_146.45, 1_779_355_000);
+        let ParsedFrame::Tick(tick) =
+            dispatch_frame(&packet, 1_779_355_000_000_000_000).expect("parse")
+        else {
+            panic!("expected a tick");
+        };
+        ingest.ingest_tick(&tick, 1, 1_779_355_000_000);
+
+        let before_emitted = ingest.seals_emitted();
+        let before_dropped = ingest.seals_dropped();
+        let (emitted, dropped) = ingest.seal_open_buckets_at_close();
+
+        assert!(
+            emitted.saturating_add(dropped) > 0,
+            "one tick opens a bucket in every timeframe, so the close seal \
+             must produce at least one bar — zero here means the aggregator \
+             was never walked, which is the exact silent loss this exists to \
+             prevent"
+        );
+        assert_eq!(
+            ingest.seals_emitted().saturating_sub(before_emitted),
+            emitted,
+            "close-seal emissions must land in the SAME running counter as \
+             the per-tick path — a close-time bar accounted separately is a \
+             bar the operator cannot see"
+        );
+        assert_eq!(
+            ingest.seals_dropped().saturating_sub(before_dropped),
+            dropped,
+            "close-time drops are as much a loss as mid-session drops and \
+             must move the same counter"
+        );
+
+        // Idempotence: the buckets are consumed, so a second call at the same
+        // shutdown cannot re-emit them. A double-seal would write duplicate
+        // bars for the session's final minute.
+        let (again_emitted, again_dropped) = ingest.seal_open_buckets_at_close();
+        assert_eq!(
+            (again_emitted, again_dropped),
+            (0, 0),
+            "sealing twice must not re-emit already-sealed buckets"
+        );
+    }
+
+    #[test]
     fn test_flush_drains_the_buffer_so_rows_can_reach_the_database() {
         // The defect this pins: `append` only BUFFERS. Without a flush the
         // rows never leave the process, while the ingest counter happily
@@ -2689,5 +2861,79 @@ mod tests {
                 "`{needle}` must REFUSE the lane, never warn and continue"
             );
         }
+    }
+
+    /// The 15:31 comparator's day origin must be IST-WALL-AS-EPOCH, because
+    /// that is how both compared sides stamp their minutes.
+    ///
+    /// This test exists because the origin was built with
+    /// `.and_local_timezone(ist)` — the TRUE UTC instant of IST midnight —
+    /// while `ticks.ts` is `exchange_timestamp * 1e9` with no offset and the
+    /// REST side adds the offset to a UTC epoch. The 19,800-second skew pushed
+    /// every bucket from 10:00 IST onward out of `is_in_session`, so the only
+    /// loss detector this lane has compared 45 of 375 minutes and still
+    /// reported Clean.
+    ///
+    /// The assertion below is deliberately end-to-end over the WHOLE session
+    /// rather than a spot check on the origin: a test that only asserted
+    /// "origin == some constant" would have been satisfied by the broken value
+    /// too, as long as the constant were derived the same broken way.
+    #[test]
+    fn test_crossverify_day_origin_covers_the_entire_session_not_just_the_first_45_minutes() {
+        use crate::dhan_live_crossverify::{is_in_session, is_tail_minute};
+
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"); // APPROVED: test
+        // Built EXACTLY as the runner builds it.
+        let origin = day
+            .and_hms_opt(0, 0, 0)
+            .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+            .expect("origin"); // APPROVED: test
+
+        // The DATA's stamping convention — fixed, and DELIBERATELY not derived
+        // from `origin`.
+        //
+        // The first draft of this test built `ts` from `origin`, so `ts -
+        // origin` cancelled the origin entirely and the assertion held for ANY
+        // origin. It passed with the bug deliberately re-injected. A test whose
+        // subject cancels out of its own arithmetic proves nothing — which is
+        // exactly the class this audit was hunting, found in the test written
+        // to close it.
+        //
+        // `ticks.ts` is `exchange_timestamp * 1e9`, and Dhan's LTT is already
+        // IST epoch seconds, so an IST wall-clock time is stamped as though it
+        // were UTC. `and_utc()` on the IST date reproduces that.
+        let data_midnight_secs = day
+            .and_hms_opt(0, 0, 0)
+            .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+            .expect("data midnight") // APPROVED: test
+            / 1_000_000_000;
+        let stamp = |h: i64, mi: i64| (data_midnight_secs + h * 3600 + mi * 60) * 1_000_000_000;
+
+        let mut in_session = 0i64;
+        for m in 0..(24 * 60) {
+            let ts = (data_midnight_secs + i64::from(m) * 60) * 1_000_000_000;
+            if is_in_session(ts, origin) {
+                in_session += 1;
+            }
+        }
+        assert_eq!(
+            in_session, 375,
+            "the session gate must accept all 375 minutes of 09:15..15:30. \
+             Got {in_session} — a count near 45 is the +19,800s IST-origin skew returning."
+        );
+
+        // And the tail amnesty must land on the REAL tail (15:28, 15:29), not
+        // on 09:58/09:59 as it did under the skew.
+        let tail_at = |h: i64, mi: i64| is_tail_minute(stamp(h, mi), origin);
+        assert!(tail_at(15, 28), "15:28 must be tail-amnestied");
+        assert!(tail_at(15, 29), "15:29 must be tail-amnestied");
+        assert!(
+            !tail_at(9, 58),
+            "09:58 is NOT the tail — that is the skew signature"
+        );
+        assert!(
+            !tail_at(9, 59),
+            "09:59 is NOT the tail — that is the skew signature"
+        );
     }
 }
