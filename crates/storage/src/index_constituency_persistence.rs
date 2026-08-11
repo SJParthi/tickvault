@@ -878,6 +878,55 @@ mod tests {
         );
     }
 
+    /// The DDL path must degrade quietly against a dead database — a boot that
+    /// cannot reach QuestDB has bigger problems than this table, and the bulk
+    /// write immediately after is what surfaces a hard failure.
+    ///
+    /// This also exercises every DDL string this module builds, including the
+    /// four rebalance-lifecycle statements: the `format!`s run before the HTTP
+    /// send, so a malformed one (an unbalanced brace, a stale column name)
+    /// fails here rather than silently at 08:00 against the real server.
+    #[tokio::test]
+    async fn test_ensure_table_degrades_quietly_when_questdb_is_unreachable() {
+        ensure_index_constituency_table(&unreachable_questdb()).await;
+    }
+
+    /// The expiry pass must DEGRADE, never propagate or panic, when QuestDB is
+    /// unreachable. The mapping is already durably written by the time this
+    /// runs, so a failure here is "membership queries over-report until the
+    /// next run" — bad, logged at `error!`, but strictly better than unwinding
+    /// through a boot rider whose remaining work is still useful.
+    ///
+    /// It returns `()` deliberately: there is no error for the caller to act
+    /// on that the log line does not already carry, and a `Result` here would
+    /// invite a `?` that aborts the rider.
+    #[tokio::test]
+    async fn test_expiry_pass_degrades_quietly_when_questdb_is_unreachable() {
+        // Completes rather than panicking or hanging — that IS the assertion.
+        mark_missing_index_constituents_expired(
+            &unreachable_questdb(),
+            INDEX_CONSTITUENCY_FEED_DHAN,
+            false,
+            1_780_000_000_000_000_000,
+        )
+        .await;
+    }
+
+    /// The dry-run half must degrade identically. A `--dry-run-universe` boot
+    /// hitting a dead database must not behave differently from a real one —
+    /// divergence there would mean the isolation path is exercised only in
+    /// production, which is the wrong way round.
+    #[tokio::test]
+    async fn test_expiry_pass_degrades_quietly_in_dry_run_mode_too() {
+        mark_missing_index_constituents_expired(
+            &unreachable_questdb(),
+            INDEX_CONSTITUENCY_FEED_DHAN,
+            true,
+            1_780_000_000_000_000_000,
+        )
+        .await;
+    }
+
     /// The NULL arm is the whole reason a legacy table converges. `NULL < x` is
     /// NULL in SQL, so without it every row written before `last_seen_date`
     /// existed would stay `active` forever — and those are precisely the rows

@@ -355,6 +355,9 @@ const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 /// An empty result is never reported as success. An empty instrument set opens
 /// ZERO sockets, and calling that "depth enabled" is exactly the false-OK the
 /// scope-lock forbids.
+// TEST-EXEMPT: network I/O (QuestDB /exec) — every decision it makes is delegated to
+// the unit-tested pure fns: build_depth_candidate_query, parse_depth_candidates_dataset,
+// select_depth_universe. This wrapper only moves bytes and logs.
 pub async fn load_depth_universe(
     questdb: &tickvault_common::config::QuestDbConfig,
     today_ist_nanos: i64,
@@ -469,7 +472,7 @@ mod tests {
     /// shape of wrongness that survives review, which is why the map is
     /// fail-closed and this test names SENSEX explicitly.
     #[test]
-    fn test_segment_map_is_fail_closed_and_bse_is_not_defaulted_to_nse() {
+    fn test_contract_segment_for_underlying_is_fail_closed_and_bse_is_not_defaulted() {
         assert_eq!(
             contract_segment_for_underlying("NIFTY"),
             Some(ExchangeSegment::NseFno)
@@ -495,7 +498,7 @@ mod tests {
     /// the id — subscribing it sends a well-formed request for a nonexistent
     /// instrument and receives silence that reads exactly like a quiet book.
     #[test]
-    fn test_zero_contract_id_is_refused_and_counted_never_subscribed() {
+    fn test_select_depth_universe_refuses_and_counts_zero_contract_ids() {
         let rows = vec![
             candidate("NIFTY", 0, 100.0, "CE"),
             candidate("NIFTY", -1, 100.0, "PE"),
@@ -641,7 +644,7 @@ mod tests {
     /// two very differently, and conflating them is how a parse failure
     /// becomes a silent zero-socket depth lane.
     #[test]
-    fn test_malformed_dataset_is_an_error_not_an_empty_list() {
+    fn test_parse_depth_candidates_dataset_errors_on_garbage_not_empty_list() {
         assert!(parse_depth_candidates_dataset("not json").is_err());
         assert!(parse_depth_candidates_dataset("{}").is_err());
         assert_eq!(
@@ -665,7 +668,7 @@ mod tests {
     /// without the expiry bound a rolled expiry would keep being subscribed and
     /// return silence indistinguishable from a quiet book.
     #[test]
-    fn test_query_bounds_by_expiry_and_refuses_zero_ids() {
+    fn test_build_depth_candidate_query_bounds_by_expiry_and_refuses_zero_ids() {
         let sql = build_depth_candidate_query(1_780_000_000_000_000_000);
         assert!(
             sql.contains("expiry >="),
