@@ -146,6 +146,10 @@ pub fn content_type_is_allowed(header: Option<&str>) -> bool {
 ///
 /// # Errors
 /// [`DownloadError`] — every variant refuses the whole body.
+// TEST-EXEMPT: network I/O. Every DECISION it makes is factored out and unit-tested —
+// `content_type_is_allowed` (the allowlist), `sanitize_transport_error` (the URL/credential
+// scrub) and the `DownloadError` Display. What remains here is reqwest orchestration, which
+// a unit test could only cover by mocking reqwest into asserting itself.
 pub async fn fetch_csv_hardened(
     client: &reqwest::Client,
     url: &str,
@@ -263,7 +267,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hardened_client_builds() {
+    fn test_build_hardened_csv_client_builds() {
         assert!(
             build_hardened_csv_client().is_ok(),
             "the §18 client configuration must be constructible"
@@ -271,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn test_content_type_allows_the_three_csv_shapes() {
+    fn test_content_type_is_allowed_accepts_the_three_csv_shapes() {
         for ct in ALLOWED_CSV_CONTENT_TYPES {
             assert!(
                 content_type_is_allowed(Some(ct)),
@@ -281,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn test_content_type_rejects_html_and_json() {
+    fn test_content_type_is_allowed_rejects_html_and_json() {
         // The two that matter: an HTML body is a WAF block page, a JSON body
         // is a broken API. Both would otherwise reach the CSV parser and
         // present as "a CSV that happens to fail".
@@ -291,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn test_content_type_strips_parameters_and_folds_case() {
+    fn test_content_type_is_allowed_strips_parameters_and_folds_case() {
         // A real server sends `text/csv; charset=utf-8`, and case is not
         // guaranteed. A naive equality check rejects both — taking the
         // pipeline down on a correct response, which is the worst failure
@@ -304,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_content_type_absent_is_accepted_but_empty_essence_too() {
+    fn test_content_type_is_allowed_accepts_absent_and_empty_essence() {
         // Documented trade: static CDN objects omit the header, and refusing
         // them would break on a vendor CDN change. The byte cap and the
         // parser's own checks still stand behind this.
@@ -314,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn test_content_type_rejects_a_prefix_lookalike() {
+    fn test_content_type_is_allowed_rejects_a_prefix_lookalike() {
         // `text/csvx` must not pass on a `starts_with`-style reading, and
         // `application/octet-stream-x` likewise.
         assert!(!content_type_is_allowed(Some("text/csvx")));
@@ -326,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nse_index_url_shape_is_pinned() {
+    fn test_nse_index_csv_url_shape_is_pinned() {
         let url = nse_index_csv_url("ind_nifty50list");
         assert_eq!(
             url,

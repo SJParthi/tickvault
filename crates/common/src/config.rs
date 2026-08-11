@@ -254,6 +254,16 @@ pub struct ApplicationConfig {
     /// (fail-safe default off); `config/base.toml` opts in.
     #[serde(default)]
     pub groww_universe: GrowwUniverseConfig,
+    /// `[dhan_universe]` — the daily Dhan instrument-master + NSE India
+    /// index-constituent download and ISIN join (operator directive
+    /// 2026-08-11, reversing Q3 of the 2026-07-13 amendment; recorded
+    /// verbatim in `websocket-connection-scope-lock.md`). Once per IST day it
+    /// fetches the Dhan detailed master and the niftyindices constituent
+    /// lists, joins them on ISIN per §31.1, and writes the resolved mapping.
+    /// Absent section ⇒ DISABLED (fail-safe default off); `config/base.toml`
+    /// opts in.
+    #[serde(default)]
+    pub dhan_universe: DhanUniverseConfig,
     /// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
     /// 2026-07-14, `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
     /// §39). GATE 1 of the 4-gate live-fire lattice: every key default-OFF, so
@@ -1916,6 +1926,61 @@ pub struct GrowwUniverseConfig {
     /// rider. Default OFF (fail-safe).
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// `[dhan_universe]` — daily Dhan master + NSE India indices download + join.
+///
+/// Fail-safe shape, the house pattern: `enabled` is `#[serde(default)]` =
+/// `false`, so an absent section (or a TOML written before this feature)
+/// disables the rider entirely and the boot is byte-identical to before it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DhanUniverseConfig {
+    /// Master switch for the daily download + join rider. Default OFF.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// IST second-of-day at which the daily build is TARGETED.
+    ///
+    /// # Why a target rather than a guarantee
+    ///
+    /// The prod box powers on at 08:30 IST, so a target earlier than that
+    /// fires into a machine that is not running. Rather than silently never
+    /// executing — which is what a bare scheduler would do, while still
+    /// LOOKING scheduled — the rider treats this as "run at or after this
+    /// time": if the process starts later than the target and today's build
+    /// has not happened, it runs IMMEDIATELY. On the live schedule that is
+    /// ~08:30, still 45 minutes before market open.
+    ///
+    /// Defaults to 08:00 IST per the operator's 2026-08-11 directive.
+    #[serde(default = "default_dhan_universe_target_secs")]
+    pub target_secs_of_day_ist: u32,
+
+    /// Retry backoff ceiling, in seconds, for a failed daily build.
+    ///
+    /// The rider retries with exponential backoff up to this ceiling and
+    /// NEVER gives up for the day: a vendor outage that clears at 10:00 must
+    /// still produce the day's mapping, and a rider that stopped after N
+    /// attempts would leave the day silently unmapped.
+    #[serde(default = "default_dhan_universe_backoff_cap_secs")]
+    pub retry_backoff_cap_secs: u64,
+}
+
+const fn default_dhan_universe_target_secs() -> u32 {
+    8 * 3600
+}
+
+const fn default_dhan_universe_backoff_cap_secs() -> u64 {
+    300
+}
+
+impl Default for DhanUniverseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_secs_of_day_ist: default_dhan_universe_target_secs(),
+            retry_backoff_cap_secs: default_dhan_universe_backoff_cap_secs(),
+        }
+    }
 }
 
 /// `[dhan_order_push]` — 🔷 DHAN order-update WS paper-mode push channel
