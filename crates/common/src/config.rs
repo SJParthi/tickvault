@@ -1963,6 +1963,30 @@ pub struct DhanUniverseConfig {
     /// attempts would leave the day silently unmapped.
     #[serde(default = "default_dhan_universe_backoff_cap_secs")]
     pub retry_backoff_cap_secs: u64,
+
+    /// Point the LIVE subscription set at the resolved master, instead of the
+    /// 4 hardcoded index SIDs. **Default OFF, and that default is the point.**
+    ///
+    /// The rider that produces the mapping was authorized separately from the
+    /// decision to subscribe it — the operator's 2026-08-11 third quote ordered
+    /// the download and explicitly carved the lane out: *"Building the pipeline
+    /// is ordered here; re-pointing the lane is not, and must not be smuggled
+    /// in."* The fourth quote authorized BUILDING this path; nothing authorizes
+    /// enabling it. Both quotes are recorded in
+    /// `.claude/rules/project/websocket-connection-scope-lock.md`.
+    ///
+    /// # Why this should stay off until after a live probe
+    ///
+    /// Flipping it takes the subscription from 4 instruments to a few hundred
+    /// or a few thousand. On a lane that has never received a live tick since
+    /// the 2026-07-13 retirement, that turns a first failure from a readable
+    /// signal into an unreadable pile. Prove the 4-index path first.
+    ///
+    /// Turning it on is a config change plus a restart — never a runtime
+    /// toggle — so the subscribed set for a session is fixed at boot and
+    /// visible in the boot log.
+    #[serde(default)]
+    pub live_subscription_from_master: bool,
 }
 
 const fn default_dhan_universe_target_secs() -> u32 {
@@ -1979,6 +2003,7 @@ impl Default for DhanUniverseConfig {
             enabled: false,
             target_secs_of_day_ist: default_dhan_universe_target_secs(),
             retry_backoff_cap_secs: default_dhan_universe_backoff_cap_secs(),
+            live_subscription_from_master: false,
         }
     }
 }

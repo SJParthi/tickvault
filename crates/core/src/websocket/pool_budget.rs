@@ -241,6 +241,18 @@ impl DhanEndpointType {
         }
     }
 
+    /// Total instruments this endpoint type can carry across its whole
+    /// authorized pool — `max_connections × max_instruments_per_connection`.
+    ///
+    /// Exists so callers sizing a subscription set never multiply those two
+    /// numbers themselves. A set larger than this makes `plan_pool` refuse the
+    /// ENTIRE pool, not just the excess, so an off-by-one in a caller's own
+    /// arithmetic takes the whole endpoint down rather than degrading it.
+    #[must_use]
+    pub const fn subscription_capacity(self) -> usize {
+        self.max_connections() as usize * self.max_instruments_per_connection() as usize
+    }
+
     /// Max instruments this endpoint type accepts in ONE JSON subscribe
     /// message. A larger set is dispatched as several sequential messages on
     /// the same connection.

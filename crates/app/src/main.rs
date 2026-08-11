@@ -2027,7 +2027,19 @@ async fn main() -> Result<()> {
     let _dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             dhan_enabled: config.feeds.dhan_enabled,
-            main_feed_instruments: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+            // DEFAULT-OFF: with `live_subscription_from_master = false` (the
+            // shipped value) this returns the same 4 hardcoded index SIDs the
+            // lane has always used, so the operator's 2026-08-11 third-quote
+            // carve-out — "re-pointing the lane… must not be smuggled in" — is
+            // honoured in substance: the live set does not move until a human
+            // flips the flag and restarts.
+            main_feed_instruments: tickvault_app::dhan_live_universe::resolve_live_universe(
+                &config.dhan_universe,
+                tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+                &tickvault_app::dhan_universe::today_ist_date(),
+                tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
+                    .subscription_capacity(),
+            ),
             depth_20_instruments: depth_universe.depth_20,
             depth_200_instruments: depth_universe.depth_200,
             questdb: config.questdb.clone(),

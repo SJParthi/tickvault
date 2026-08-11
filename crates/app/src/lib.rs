@@ -168,6 +168,7 @@ pub mod dhan_intraday_parse;
 /// and a `blind` outcome that makes a zero-comparison run structurally
 /// incapable of reading as a pass — the PR #1474 blind-since-birth lesson.
 pub mod dhan_live_crossverify;
+pub mod dhan_live_universe;
 /// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive
 /// 2026-07-16; governance on PR #1597): receive-only broadcast consumer
 /// mapping order updates to `order_audit` rows `feed='dhan'`/`mode='paper'`.

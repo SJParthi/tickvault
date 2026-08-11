@@ -1,0 +1,456 @@
+//! The live main-feed subscription set, optionally sourced from the daily
+//! resolved instrument master.
+//!
+//! Authorized to be BUILT by the operator's 2026-08-11 fourth quote; the
+//! verbatim quote, the tension with the same day's third quote, and the
+//! reasoning for shipping DEFAULT-OFF are recorded in
+//! `.claude/rules/project/websocket-connection-scope-lock.md`.
+//!
+//! # This module changes nothing until a human turns it on
+//!
+//! With `[dhan_universe] live_subscription_from_master = false` — the default,
+//! and the shipped value — [`select_live_universe`] returns the same 4 hardcoded
+//! index SIDs the lane has always used. The master-sourced path is code that
+//! *can* widen the subscription, sitting behind an off switch, which is what
+//! keeps the third quote's carve-out ("re-pointing the lane… must not be
+//! smuggled in") honoured in substance rather than only in wording.
+//!
+//! # Fallback is never silent
+//!
+//! Every path that cannot produce a trustworthy master-sourced set falls back
+//! to the index universe and says so at `error!`. That matters more here than
+//! in most places: a fallback that logged nothing would look identical to a
+//! successful widening in every metric the lane exposes — the connection count
+//! would simply be lower, and nobody reads a connection count expecting it to
+//! carry an error.
+
+use tickvault_common::types::{ExchangeSegment, SecurityId};
+use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
+
+/// Where the session's subscription set actually came from.
+///
+/// Carried rather than inferred: "we widened" and "we tried to widen and fell
+/// back" produce very different instrument counts and must never be told apart
+/// by guessing from the count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniverseSource {
+    /// The 4 hardcoded index SIDs — the historical, always-safe set.
+    HardcodedIndices,
+    /// The index SIDs plus constituents resolved from today's master.
+    MasterSourced,
+    /// Master sourcing was requested but could not be trusted; the index set
+    /// is in use and the reason has been logged.
+    FellBackToIndices,
+}
+
+impl UniverseSource {
+    /// Stable label for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HardcodedIndices => "hardcoded_indices",
+            Self::MasterSourced => "master_sourced",
+            Self::FellBackToIndices => "fell_back_to_indices",
+        }
+    }
+}
+
+/// The chosen subscription set plus an account of what was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveUniverseSelection {
+    /// What the main feed subscribes this session.
+    pub instruments: Vec<SubscribeInstrument>,
+    /// Where it came from.
+    pub source: UniverseSource,
+    /// Master entries whose `security_id` was 0.
+    pub refused_zero_id: usize,
+    /// Master entries whose segment byte is not a known Dhan segment.
+    ///
+    /// Dhan's segment numbering has a GAP at 6 (`MCX_COMM` is 5, `BSE_CURRENCY`
+    /// is 7). A byte that does not decode is refused rather than coerced —
+    /// coercing would subscribe a real id under the wrong segment, and
+    /// `(security_id, segment)` is the composite identity everything downstream
+    /// keys on (I-P1-11).
+    pub refused_unknown_segment: usize,
+    /// Entries dropped because they duplicate an already-selected
+    /// `(security_id, segment)` pair.
+    pub deduped: usize,
+}
+
+/// One resolved constituent, as the daily rider wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasterEntry {
+    /// Resolved Dhan `security_id`.
+    pub security_id: u64,
+    /// Segment as the artifact's wire byte — decoded, never cast.
+    pub exchange_segment_code: u8,
+}
+
+/// Parse the daily mapping artifact.
+///
+/// Fail-LOUD on a malformed body or a missing `mappings` key; fail-soft per
+/// entry. The distinction is the same one `parse_lifecycle_dataset` draws, and
+/// it matters more here: an empty `Vec` returned for garbage is
+/// indistinguishable from "the master legitimately resolved nothing", and those
+/// two must produce different behaviour — one is a parse bug, the other is a
+/// vendor problem.
+///
+/// # Errors
+/// Returns `Err` when the body is not JSON or carries no `mappings` array.
+pub fn parse_mapping_artifact(body: &str) -> Result<Vec<MasterEntry>, String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Err("mapping artifact is not valid JSON".to_owned());
+    };
+    let Some(rows) = v.get("mappings").and_then(|m| m.as_array()) else {
+        return Err("mapping artifact has no `mappings` array".to_owned());
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(security_id) = row.get("security_id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(seg) = row
+            .get("exchange_segment")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        let Ok(exchange_segment_code) = u8::try_from(seg) else {
+            continue;
+        };
+        out.push(MasterEntry {
+            security_id,
+            exchange_segment_code,
+        });
+    }
+    Ok(out)
+}
+
+/// Build the session's subscription set.
+///
+/// `index_universe` is always included — the index spot values are the
+/// reference every option and future is priced against, so widening ADDS to
+/// them rather than replacing them.
+///
+/// `capacity` is the authorized main-feed envelope (connections ×
+/// instruments-per-connection). Exceeding it is refused as a whole rather than
+/// truncated, because `plan_pool` refuses the ENTIRE pool when a set does not
+/// fit — a set one instrument too large would take the main feed down with it,
+/// so silently trimming to fit would be the wrong repair and blowing the lane
+/// up would be worse. Falling back to the index set keeps the feed alive and
+/// makes the problem loud.
+#[must_use]
+pub fn select_live_universe(
+    index_universe: &[SubscribeInstrument],
+    master: Option<&[MasterEntry]>,
+    capacity: usize,
+) -> LiveUniverseSelection {
+    let Some(master) = master else {
+        return LiveUniverseSelection {
+            instruments: index_universe.to_vec(),
+            source: UniverseSource::HardcodedIndices,
+            refused_zero_id: 0,
+            refused_unknown_segment: 0,
+            deduped: 0,
+        };
+    };
+
+    let mut refused_zero_id = 0usize;
+    let mut refused_unknown_segment = 0usize;
+    let mut deduped = 0usize;
+
+    // Seeded with the index set so a master entry that repeats an index SID
+    // cannot be subscribed twice. `(security_id, segment)` is the composite
+    // identity per I-P1-11 — a bare id would collapse two real instruments.
+    let mut seen: Vec<(SecurityId, ExchangeSegment)> = index_universe
+        .iter()
+        .map(|i| (i.security_id, i.segment))
+        .collect();
+    let mut instruments = index_universe.to_vec();
+
+    for entry in master {
+        if entry.security_id == 0 {
+            refused_zero_id += 1;
+            continue;
+        }
+        let Some(segment) = ExchangeSegment::from_byte(entry.exchange_segment_code) else {
+            refused_unknown_segment += 1;
+            continue;
+        };
+        let key = (entry.security_id as SecurityId, segment);
+        if seen.contains(&key) {
+            deduped += 1;
+            continue;
+        }
+        seen.push(key);
+        instruments.push(SubscribeInstrument {
+            security_id: key.0,
+            segment,
+        });
+    }
+
+    if instruments.len() > capacity {
+        return LiveUniverseSelection {
+            instruments: index_universe.to_vec(),
+            source: UniverseSource::FellBackToIndices,
+            refused_zero_id,
+            refused_unknown_segment,
+            deduped,
+        };
+    }
+
+    // A master that resolved nothing usable adds nothing, and reporting that as
+    // "widened" would be a false-OK: the count would equal the index set and
+    // every downstream signal would look like an ordinary narrow session.
+    let source = if instruments.len() > index_universe.len() {
+        UniverseSource::MasterSourced
+    } else {
+        UniverseSource::FellBackToIndices
+    };
+
+    LiveUniverseSelection {
+        instruments,
+        source,
+        refused_zero_id,
+        refused_unknown_segment,
+        deduped,
+    }
+}
+
+// The artifact path is deliberately NOT restated here — it comes from
+// `dhan_universe::mapping_artifact_path`, the same function the writer uses.
+// A second copy of that filename fails silently: the reader looks for a name
+// the writer never produces, finds nothing, falls back, and the result is
+// indistinguishable from "the master resolved nothing usable".
+
+/// Resolve the session's subscription set, reading the master only when the
+/// operator has turned that on.
+///
+/// Returns the index universe unchanged in every failure mode, always with a
+/// logged reason.
+// TEST-EXEMPT: filesystem I/O — the parse, the selection, the envelope refusal and the
+// fallback classification are all delegated to unit-tested pure fns above.
+pub fn resolve_live_universe(
+    cfg: &tickvault_common::config::DhanUniverseConfig,
+    index_universe: Vec<SubscribeInstrument>,
+    date_ist: &str,
+    capacity: usize,
+) -> Vec<SubscribeInstrument> {
+    if !cfg.live_subscription_from_master {
+        tracing::info!(
+            instruments = index_universe.len(),
+            source = UniverseSource::HardcodedIndices.as_str(),
+            "live universe: the 4 hardcoded index SIDs (master sourcing is OFF by \
+             default; enabling it is a config change plus a restart)"
+        );
+        return index_universe;
+    }
+
+    let path = crate::dhan_universe::mapping_artifact_path(date_ist);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                path = %path.display(),
+                "live universe: today's mapping artifact is unreadable — falling back to \
+                 the index universe. Master sourcing was REQUESTED and is NOT in effect; \
+                 the subscribed set is 4 instruments, not the widened set."
+            );
+            return index_universe;
+        }
+    };
+
+    let master = match parse_mapping_artifact(&body) {
+        Ok(m) => m,
+        Err(reason) => {
+            tracing::error!(
+                reason,
+                path = %path.display(),
+                "live universe: mapping artifact did not parse — falling back to the index \
+                 universe. Master sourcing was REQUESTED and is NOT in effect."
+            );
+            return index_universe;
+        }
+    };
+
+    let selection = select_live_universe(&index_universe, Some(&master), capacity);
+    match selection.source {
+        UniverseSource::MasterSourced => {
+            tracing::info!(
+                instruments = selection.instruments.len(),
+                master_entries = master.len(),
+                refused_zero_id = selection.refused_zero_id,
+                refused_unknown_segment = selection.refused_unknown_segment,
+                deduped = selection.deduped,
+                capacity,
+                source = selection.source.as_str(),
+                "live universe: widened from today's resolved master"
+            );
+        }
+        _ => {
+            tracing::error!(
+                master_entries = master.len(),
+                refused_zero_id = selection.refused_zero_id,
+                refused_unknown_segment = selection.refused_unknown_segment,
+                deduped = selection.deduped,
+                capacity,
+                source = selection.source.as_str(),
+                "live universe: master sourcing was REQUESTED but produced no usable \
+                 widening (or exceeded the authorized {capacity}-instrument envelope) — \
+                 subscribing the index universe instead. This is NOT a widened session."
+            );
+        }
+    }
+    selection.instruments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idx() -> Vec<SubscribeInstrument> {
+        vec![
+            SubscribeInstrument {
+                security_id: 13,
+                segment: ExchangeSegment::IdxI,
+            },
+            SubscribeInstrument {
+                security_id: 25,
+                segment: ExchangeSegment::IdxI,
+            },
+        ]
+    }
+
+    fn entry(security_id: u64, code: u8) -> MasterEntry {
+        MasterEntry {
+            security_id,
+            exchange_segment_code: code,
+        }
+    }
+
+    /// The default path must be byte-identical to the pre-existing behaviour.
+    /// If this ever diverges, the "ships default-OFF" claim in the scope-lock
+    /// is false and the third quote's carve-out has been breached in code.
+    #[test]
+    fn test_select_live_universe_without_master_returns_the_index_set_unchanged() {
+        let sel = select_live_universe(&idx(), None, 25_000);
+        assert_eq!(sel.instruments, idx());
+        assert_eq!(sel.source, UniverseSource::HardcodedIndices);
+    }
+
+    /// Widening ADDS to the indices rather than replacing them — index spots are
+    /// the reference every derivative is priced against.
+    #[test]
+    fn test_select_live_universe_keeps_the_indices_when_widening() {
+        let sel = select_live_universe(&idx(), Some(&[entry(2885, 1)]), 25_000);
+        assert_eq!(sel.source, UniverseSource::MasterSourced);
+        assert_eq!(sel.instruments.len(), 3);
+        assert!(
+            sel.instruments
+                .iter()
+                .any(|i| i.security_id == 13 && i.segment == ExchangeSegment::IdxI),
+            "the index SIDs must survive widening"
+        );
+    }
+
+    /// Dhan's segment numbering has a GAP at 6. Coercing an undecodable byte
+    /// would subscribe a real id under the wrong segment, and
+    /// `(security_id, segment)` is the composite identity everything keys on.
+    #[test]
+    fn test_select_live_universe_refuses_the_segment_gap_rather_than_coercing() {
+        let sel = select_live_universe(&idx(), Some(&[entry(2885, 6), entry(2886, 99)]), 25_000);
+        assert_eq!(sel.refused_unknown_segment, 2);
+        assert_eq!(
+            sel.instruments.len(),
+            idx().len(),
+            "nothing undecodable may be subscribed"
+        );
+    }
+
+    #[test]
+    fn test_select_live_universe_refuses_zero_security_ids() {
+        let sel = select_live_universe(&idx(), Some(&[entry(0, 1)]), 25_000);
+        assert_eq!(sel.refused_zero_id, 1);
+        assert_eq!(sel.instruments.len(), idx().len());
+    }
+
+    /// Dedup is on the I-P1-11 composite pair, not the bare id — two real
+    /// instruments can share a numeric id across segments, and collapsing them
+    /// would silently drop one.
+    #[test]
+    fn test_select_live_universe_dedups_on_the_composite_pair_not_the_bare_id() {
+        // 13/IdxI duplicates an index entry; 13/NseEquity is a DIFFERENT
+        // instrument and must survive.
+        let sel = select_live_universe(&idx(), Some(&[entry(13, 0), entry(13, 1)]), 25_000);
+        assert_eq!(
+            sel.deduped, 1,
+            "only the exact (id, segment) repeat is a dup"
+        );
+        assert!(
+            sel.instruments
+                .iter()
+                .any(|i| i.security_id == 13 && i.segment == ExchangeSegment::NseEquity),
+            "a same-id different-segment instrument is not a duplicate"
+        );
+    }
+
+    /// `plan_pool` refuses the ENTIRE pool when a set does not fit, so an
+    /// oversized set would take the main feed down. Falling back keeps the feed
+    /// alive; truncating to fit would silently subscribe an arbitrary subset.
+    #[test]
+    fn test_select_live_universe_falls_back_whole_when_over_the_envelope() {
+        let master: Vec<MasterEntry> = (1..=10).map(|i| entry(1000 + i, 1)).collect();
+        let sel = select_live_universe(&idx(), Some(&master), 5);
+        assert_eq!(sel.source, UniverseSource::FellBackToIndices);
+        assert_eq!(
+            sel.instruments,
+            idx(),
+            "over-envelope must fall back whole, never truncate to fit"
+        );
+    }
+
+    /// A master that resolves nothing usable must not be reported as widened —
+    /// the instrument count would equal the index set and every downstream
+    /// signal would look like an ordinary narrow session.
+    #[test]
+    fn test_select_live_universe_does_not_claim_widening_when_nothing_was_added() {
+        let sel = select_live_universe(&idx(), Some(&[]), 25_000);
+        assert_eq!(sel.source, UniverseSource::FellBackToIndices);
+    }
+
+    #[test]
+    fn test_parse_mapping_artifact_errors_on_garbage_not_empty_list() {
+        assert!(parse_mapping_artifact("not json").is_err());
+        assert!(
+            parse_mapping_artifact(r#"{"resolved":3}"#).is_err(),
+            "a body with no `mappings` key is a parse failure, not an empty master"
+        );
+        assert_eq!(parse_mapping_artifact(r#"{"mappings":[]}"#), Ok(vec![]));
+    }
+
+    #[test]
+    fn test_parse_mapping_artifact_reads_the_rider_shape() {
+        let body = r#"{"mappings":[
+            {"index_name":"Nifty 50","symbol":"RELIANCE","isin":"INE002A01018",
+             "security_id":2885,"exchange_segment":1}]}"#;
+        assert_eq!(
+            parse_mapping_artifact(body),
+            Ok(vec![entry(2885, 1)]),
+            "must decode the exact field names the rider writes"
+        );
+    }
+
+    /// The reader and the writer must agree on the filename. They share one
+    /// function so they cannot drift, and this pins the shared value — a
+    /// mismatch here would make the reader fall back forever while looking
+    /// exactly like an empty master.
+    #[test]
+    fn test_reader_and_writer_agree_on_the_artifact_filename() {
+        let path = crate::dhan_universe::mapping_artifact_path("2026-08-12");
+        assert_eq!(
+            path.to_string_lossy(),
+            "data/instrument-cache/dhan-nse-mapping-2026-08-12.json"
+        );
+    }
+}
