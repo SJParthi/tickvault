@@ -317,8 +317,23 @@ auto_start_docker = true
 # Groww is the live feed. The Dhan REST retained surface is brought up
 # WITHOUT the WS lane by crates/app/src/dhan_rest_stack.rs when
 # dhan_enabled = false (Phase A — flip + REST-only bootstrap).
+#
+# 2026-08-11 — dhan_enabled flipped false -> TRUE. Operator quote, recorded
+# verbatim in websocket-connection-scope-lock.md under "2026-08-11 — THE
+# DEFAULT IS FLIPPED ON": "switch the dhan feed on espeic llay to cpature all
+# tehs eirght dude am i irght dude?".
+#
+# This is ONE of two gates. `spawn_dhan_feed_stack` also requires the
+# TICKVAULT_DHAN_LIVE_FEED=1 env opt-in (set in deploy/systemd/tickvault.service),
+# so a local `cargo run` that has not exported it still opens no socket — the
+# flag alone does not put sockets into a developer's machine.
+#
+# It also FORCED [rest_candle_fold] enabled = false further down this file:
+# both writers seal into candles_<tf> stamped feed='dhan' under a key that
+# cannot separate them, so the lane refuses to open a socket while the fold
+# runs. That is not a preference; leaving the fold on makes this flip a no-op.
 [feeds]
-dhan_enabled = false
+dhan_enabled = true
 groww_enabled = false
 # TrueData (feed #4, operator lock 2026-07-24 —
 # .claude/rules/project/truedata-feed-scope-2026-07-24.md). The intended
@@ -726,9 +741,25 @@ enabled = true
 # premarket"). NEVER touches `ticks` (live-feed-purity; rule 10 carries the
 # dated candles_1d edit). Serde default is OFF (fail-safe) — this section
 # opts in; `enabled = false` is the rollback switch.
+#
+# 2026-08-11 — DISABLED, forced by the Dhan live-feed flip above. This is a
+# MUTUAL EXCLUSION, not a preference: the live lane and this fold both seal
+# into the same candles_<tf> tables stamped feed='dhan', and the dedup key
+# (ts, security_id, segment, feed) has no column that separates them — every
+# column matches for the same minute of the same instrument, so QuestDB
+# upserts one over the other with no error and no counter. It would also make
+# the 15:31 cross-verification read REST-derived rows as its LIVE side and so
+# compare the REST record against itself, agreeing every time, on the one
+# check that exists to detect disagreement. `dhan_feed_stack` therefore
+# REFUSES to open any socket while this is true.
+#
+# HONEST COST: the 35-day boot catch-up over stored spot bars stops running.
+# Live capture replaces it going FORWARD; it does not backfill the past.
+# Re-enabling this means turning the live lane off, until a source
+# discriminator is added to the candle dedup key — a schema decision.
 # ===========================================================================
 [rest_candle_fold]
-enabled = true
+enabled = false
 catchup_days = 35
 
 # ===========================================================================

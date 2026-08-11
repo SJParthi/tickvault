@@ -487,6 +487,70 @@ available ground truth and must be live from day one — not a supplementary che
 `.claude/plans/proposals/2026-08-09-dhan-live-ws-revival.md` and
 `.claude/plans/proposals/2026-08-09-dhan-16-connection-architecture.md` (PR #1731).
 
+### 2026-08-11 — THE DEFAULT IS FLIPPED ON (the lane goes live, not just buildable)
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "switch the dhan feed on espeic llay to cpature all tehs eirght dude am i irght dude?"
+
+This is the **change of DEFAULT** that the 2026-08-09 quotes deliberately did not
+make. Those quotes authorized the CODE and the 16-socket budget; the lane still
+shipped dark behind a double gate. This quote opens both gates:
+
+| Gate | Before | After |
+|---|---|---|
+| `[feeds] dhan_enabled` (base.toml + production.toml) | `false` | **`true`** |
+| `TICKVAULT_DHAN_LIVE_FEED` env opt-in | unset | **`=1`** in `deploy/systemd/tickvault.service` |
+
+It is also the "fresh dated operator quote" that
+`crates/app/tests/dhan_live_off_phase_a_guard.rs` and
+`crates/common/tests/production_config_wiring.rs` name as the precondition for
+flipping the flag; both guards are INVERTED in the same PR to pin the ON state,
+so the flag can never silently drift back OFF either.
+
+**The coupled change this forces — `[rest_candle_fold]` goes OFF.** The live lane
+and the REST candle fold both seal into the same `candles_<tf>` tables stamped
+`feed='dhan'`, and the dedup key `(ts, security_id, segment, feed)` has no column
+that separates them: one silently overwrites the other, and the 15:31
+cross-verification would compare the REST record against itself and agree every
+time. The lane's exclusivity floor already REFUSES to open a socket while the fold
+is on, so leaving the fold enabled would have made this flip a no-op wearing a
+success message. The fold is therefore disabled here. **Honest cost:** its 35-day
+`catchup_days` backfill of historical minute candles stops running; live capture
+replaces it going forward but does NOT backfill the past. Re-enabling it means
+turning the live lane off again, until a source discriminator is added to the
+candle key — a schema decision, deliberately not taken here.
+
+**⚠ WHAT THIS QUOTE CANNOT DELIVER — 11 of the 16 sockets stay shut, and not for
+lack of code.** The operator's words are "capture all these", so this must be said
+plainly rather than left to be discovered:
+
+- **Main feed: 1 socket of the 5 granted.** The universe is
+  `SPOT_1M_REST_INDICES` — NIFTY, BANKNIFTY, SENSEX, INDIA VIX. Four instruments
+  fit one connection; the pool shards by need, so four more sockets are authorized
+  and unused. Widening the universe is blocked by Q3 of the 2026-07-13 amendment
+  ("hardcoded security IDs only, no instrument download/parsing"), which this
+  quote does not touch.
+- **depth-20 and depth-200: 0 sockets of the 10 granted.** Both instrument lists
+  are empty, and `plan_pool` opens nothing for an empty set. This is a **rule
+  conflict, not a gap**: depth needs a tradeable order book, indices do not have
+  one, and reaching real option/future contracts requires either the instrument
+  master download (forbidden by Q3) or a hardcoded contract list that expires
+  every week. Populating depth needs its own dated quote resolving that conflict —
+  it is not a config flip.
+- **Ticks are captured; the 5 second-scale timeframes are not yet proven.** The
+  13-timeframe requirement (Quote 13, 2026-08-08) is what the r8g.xlarge was sized
+  for; this flip starts the tick flow that feeds it.
+
+So the accurate one-line summary of this change is: **the Dhan live feed goes from
+zero sockets to one, carrying four index instruments** — a real and necessary
+first step, and materially less than "all these".
+
+**Everything else stays REJECT** exactly as the 2026-08-09 sections state: no live
+order fire (`dry_run` stays true), no CSV download, no fifth endpoint type, no
+edit to the §28 frozen area.
+
 ### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
 
 Operator Parthiban, 2026-07-24 (verbatim quotes preserved in

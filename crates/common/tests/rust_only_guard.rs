@@ -714,6 +714,30 @@ fn ci_clippy_gate_stays_armed() {
     }
 }
 
+/// 2026-08-10. The rust-only lock claims a "HARD ZERO floor" for both allowlists.
+/// Until this test, that floor was enforced by REVIEWER DISCIPLINE ONLY: a PR could
+/// re-add a banned file together with its own allowlist entry and stay green, because
+/// every other assertion here only compares the tree against the allowlist. This makes
+/// the floor mechanical — re-growing either list now fails the build.
+#[test]
+fn allowlists_are_pinned_at_zero() {
+    assert!(
+        TRACKED_BANNED_ALLOWLIST.is_empty(),
+        "TRACKED_BANNED_ALLOWLIST must stay EMPTY (hard-zero floor, rust-only \
+         directive 2026-07-31). It currently has {} entr(y/ies): {:?}. Port the \
+         logic to Rust instead of allowlisting it.",
+        TRACKED_BANNED_ALLOWLIST.len(),
+        TRACKED_BANNED_ALLOWLIST
+    );
+    assert!(
+        INVOCATION_SITE_ALLOWLIST.is_empty(),
+        "INVOCATION_SITE_ALLOWLIST must stay EMPTY (hard-zero floor). It currently \
+         has {} entr(y/ies): {:?}.",
+        INVOCATION_SITE_ALLOWLIST.len(),
+        INVOCATION_SITE_ALLOWLIST
+    );
+}
+
 // ============================ SELF-TESTS (fixtures) ============================
 
 /// (d) The scanner detects a synthetic NEW .py / stale entry / new site —
