@@ -425,6 +425,55 @@ jobs:
           aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
           role-session-name: tv-github-deploy-${{ github.run_id }}
 
+      - name: Resolve the LIVE instance id by tag
+        # 2026-08-11 — this step exists because every deploy since the
+        # 2026-08-08 AZ un-pin silently targeted a dead instance.
+        #
+        # Un-pinning the availability zone REPLACES the instance (variables.tf
+        # says so explicitly), and the replacement gets a new id. The eleven
+        # `secrets.EC2_INSTANCE_ID` references below then pointed at the old
+        # one, so every `ssm send-command` failed with `InvalidInstanceId` and
+        # prod kept running whatever binary it launched with. The proposal that
+        # authorised the un-pin even predicted it: rotating the secret was "the
+        # most likely thing to be forgotten". It was forgotten — because it is
+        # a human step, and human steps get forgotten.
+        #
+        # So the secret stops being load-bearing. The Name tag is stable across
+        # every replacement, so the id is resolved at RUN TIME and the deploy
+        # self-heals. The secret is kept as an ASSERTION only: a mismatch warns
+        # loudly (other lanes still read it, so it should still be rotated) but
+        # never blocks the deploy — that inversion is the whole point.
+        # Fail-closed on the part that matters: if the tag resolves to nothing
+        # we stop, because a deploy with no target is not a deploy.
+        env:
+          REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          ENVIRONMENT: ${{ vars.TV_ENVIRONMENT || 'prod' }}
+          SECRET_IID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          LIVE_IID=$(aws ec2 describe-instances --region "$REGION" \
+            --filters "Name=tag:Name,Values=tv-${ENVIRONMENT}-app" \
+                      "Name=instance-state-name,Values=running,stopped,stopping,starting,pending" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "")
+
+          if [ -z "$LIVE_IID" ] || [ "$LIVE_IID" = "None" ]; then
+            echo "::error::No tv-${ENVIRONMENT}-app instance found in ${REGION}. Cannot deploy:"
+            echo "::error::there is no target. Check the region, and whether the box was"
+            echo "::error::terminated without being recreated."
+            exit 1
+          fi
+
+          if [ -n "$SECRET_IID" ] && [ "$SECRET_IID" != "$LIVE_IID" ]; then
+            echo "::warning::EC2_INSTANCE_ID secret is STALE: it names ${SECRET_IID} but the"
+            echo "::warning::live tv-${ENVIRONMENT}-app instance is ${LIVE_IID}. THIS DEPLOY IS"
+            echo "::warning::FINE — it uses the live id. Other lanes still read the secret, so"
+            echo "::warning::rotate it to ${LIVE_IID} (Settings > Secrets and variables >"
+            echo "::warning::Actions)."
+          fi
+
+          echo "IID=${LIVE_IID}" >> "$GITHUB_ENV"
+          echo "Deploy target: ${LIVE_IID}"
+
       - name: Resolve AWS account id at runtime
         # Derive the account id from the live credentials instead of relying on
         # the AWS_ACCOUNT_ID GitHub secret (which was empty -> SNS publish failed
@@ -466,7 +515,7 @@ jobs:
         #      fails RED + pages, so real-failure detection is unchanged.
         env:
           REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
-          IID: ${{ secrets.EC2_INSTANCE_ID }}
+          IID: ${{ env.IID }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -uo pipefail
@@ -650,7 +699,7 @@ jobs:
         run: |
           CMD_ID=$(aws ssm send-command \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-ids "$IID" \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault deploy sha=${{ github.sha }}" \
             --parameters 'commands=[
@@ -847,7 +896,7 @@ jobs:
           set -uo pipefail
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
           CMD_ID="${{ steps.ssm.outputs.command_id }}"
-          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          IID="${IID:?resolve-instance-step-did-not-run}"
           # 240 polls × 5s = 1200s nominal. Bumped 120 → 240 (2026-07-13):
           # the observed cadence is ~6.3s/poll (5s sleep + ~1.3s API
           # round-trip — runs 29269805430 / 29273283894 burned 120 polls in
@@ -894,20 +943,20 @@ jobs:
           STATUS=$(aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
-            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-id "$IID" \
             --query 'Status' --output text)
           echo "===== SSM command status: ${STATUS} ====="
           echo "----- STDOUT (on-box) -----"
           aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
-            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-id "$IID" \
             --query 'StandardOutputContent' --output text || true
           echo "----- STDERR (on-box) -----"
           aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
-            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-id "$IID" \
             --query 'StandardErrorContent' --output text || true
           if [ "${STATUS}" != "Success" ]; then
             echo "::error::SSM command on the box failed with status=${STATUS} — see STDOUT/STDERR above for the on-box reason."
@@ -936,7 +985,7 @@ jobs:
         run: |
           set +e
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
-          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          IID="${IID:?resolve-instance-step-did-not-run}"
           # One SSM round-trip returns BOTH the systemd state and the auto-restart
           # count so we can tell "still booting (activating / replaying WAL)" apart
           # from "crashed (failed, or Restart=always looping)". Single-line
@@ -1110,7 +1159,7 @@ jobs:
         run: |
           set +e
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
-          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          IID="${IID:?resolve-instance-step-did-not-run}"
           # START_MS captured HERE, in-step, AFTER readiness — any event found
           # below was ingested after the agent restart with the new config, so
           # a success proves the NEW globs ship (not a leftover from the old
@@ -1246,7 +1295,7 @@ jobs:
           # itself succeeded. The message is now split into two `;`-free echos.
           aws ssm send-command \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+            --instance-ids "$IID" \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
             --parameters 'commands=["systemctl stop tickvault || true","echo AUTO-STOPPED-UNIT-STAYS-ENABLED: stopped to break the Restart=always spam loop for this boot","echo unit kept ENABLED so it auto-starts at the next boot and aws-autopilot self-heals it"]' \
@@ -1295,7 +1344,7 @@ jobs:
         if: always() && env.DEPLOY_STARTED_STOPPED_BOX == 'yes'
         env:
           REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
-          IID: ${{ secrets.EC2_INSTANCE_ID }}
+          IID: ${{ env.IID }}
         run: |
           set -uo pipefail
           DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun

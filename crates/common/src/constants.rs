@@ -1539,8 +1539,23 @@ pub const DHAN_PNL_EXIT_PATH: &str = "/pnlExit";
 pub const DHAN_ALERTS_MULTI_ORDERS_PATH: &str = "/alerts/multi/orders";
 
 // ---------------------------------------------------------------------------
-// Full Market Depth — WebSocket Base URLs
+// Live Market Feed + Full Market Depth — WebSocket Base URLs
 // ---------------------------------------------------------------------------
+
+/// Main live-feed WebSocket base URL.
+/// Full URL: `wss://api-feed.dhan.co?version=2&token=TOKEN&clientId=CLIENT_ID&authType=2`
+/// (`docs/dhan-ref/03-live-market-feed-websocket.md` rule 2 — all four query
+/// parameters are required).
+///
+/// Restored 2026-08-11 with the operator-approved 16-connection revival. It was
+/// deleted on 2026-07-13 when the operator retired the Dhan live feed; the two
+/// dated 2026-08-09 quotes in
+/// `.claude/rules/project/websocket-connection-scope-lock.md` reverse that
+/// retirement and raise the main-feed pool from one connection to five. The
+/// §D REJECT list still stands for everything those quotes did not name —
+/// re-introducing the instrument CSV chain, or any endpoint beyond
+/// main-feed / depth-20 / depth-200 / order-update, needs its own fresh quote.
+pub const DHAN_MAIN_FEED_WS_BASE_URL: &str = "wss://api-feed.dhan.co"; // APPROVED: infrastructure constant
 
 /// 20-level depth WebSocket base URL.
 /// Full URL: `wss://depth-api-feed.dhan.co/twentydepth?token=TOKEN&clientId=CLIENT_ID&authType=2`

@@ -92,6 +92,12 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_
 use tracing::{debug, error, warn};
 use zeroize::Zeroizing;
 
+// Re-exported so a caller outside this crate can implement `FeedTokenSource`
+// without taking its own `zeroize` dependency — and, more to the point, so it
+// cannot accidentally satisfy the trait with a plain `String` that lingers on
+// the heap after the dial.
+pub use zeroize::Zeroizing as FeedTokenBuffer;
+
 use super::pool_budget::DhanEndpointType;
 use super::pool_supervisor::{DhanFeedSocket, SocketEvent, SocketFailure, SubscribeInstrument};
 use super::subscription_builder::{

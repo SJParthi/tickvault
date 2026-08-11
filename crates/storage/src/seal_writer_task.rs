@@ -453,24 +453,20 @@ fn read_staged_spill(path: &Path) -> (Vec<SerializedSeal>, usize) {
     let mut out = Vec::new();
     let mut undecodable = 0usize;
     let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
-    loop {
-        match reader.read_exact(&mut buf) {
-            Ok(()) => {
-                // Same format-version gate as `SealSpillWriter::read_all`: a
-                // byte-7 of 0 is a pre-renumber record whose tf ordinal lives
-                // in the OLD 12-frame space and would silently mis-decode.
-                if buf[7] == 0 {
-                    undecodable += 1;
-                    continue;
-                }
-                match SerializedSeal::from_bytes(&buf) {
-                    Some(seal) => out.push(seal),
-                    None => undecodable += 1,
-                }
-            }
-            // Clean EOF or a truncated trailing record (torn write at the
-            // moment of the crash). Nothing further is readable.
-            Err(_) => break,
+    // The loop ends on the first read error, which is either a clean EOF or a
+    // truncated trailing record (a torn write at the moment of the crash).
+    // Either way nothing further in the file is readable.
+    while reader.read_exact(&mut buf).is_ok() {
+        // Same format-version gate as `SealSpillWriter::read_all`: a byte-7 of
+        // 0 is a pre-renumber record whose tf ordinal lives in the OLD
+        // 12-frame space and would silently mis-decode.
+        if buf[7] == 0 {
+            undecodable += 1;
+            continue;
+        }
+        match SerializedSeal::from_bytes(&buf) {
+            Some(seal) => out.push(seal),
+            None => undecodable += 1,
         }
     }
     (out, undecodable)
