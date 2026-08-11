@@ -672,6 +672,99 @@ including futures depth. Option depth is what this quote can actually deliver.
 - Flips `dry_run`, touches the §28 frozen area, or arms live order fire — none
   of which this quote mentions.
 
+### 2026-08-11 (SAME DAY, THIRD QUOTE) — Q3 IS REVERSED: the daily Dhan master CSV + NSE India indices download is ORDERED BACK
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "yes go ahead dude we ened to downlaod the dhan master csv evry day startign right dude espeiclaly to udpate the mappigns and its data entirley always a swell right dude menahwiel see from nse india websote alwyas evryday mornign you need to downlaod all teh indices as well right i mean. to find the rpeicse mappigns between nse india websoite nse idncies csv data with our daily downlaoded new master instruemnts scirpt csv fiel dtaa rigth ddue am i irght dude tell me dude okay?"
+
+Given in DIRECT response to a message that laid out the two options side by side
+— keep Q3 and accept that futures depth is impossible, or reverse Q3 and rebuild
+the deleted download chain — and named the rebuild cost. The operator chose the
+rebuild, and named the JOIN between the two files as the actual deliverable.
+
+**This quote REVERSES Q3 of the 2026-07-13 amendment.** That directive read
+*"hereafter no Dhan instrument download/parsing — just direct hardcoded security
+IDs passed to spot 1m and option chain"*, and it is the authority every "no CSV
+download" REJECT row in this file cites — including the two rows written earlier
+TODAY (the 2026-08-11 first and second quotes). Those rows are superseded to
+exactly the extent stated here and no further.
+
+#### What is authorized
+
+| Surface | Before this quote | Now |
+|---|---|---|
+| Dhan instrument-master CSV | FORBIDDEN (Q3); every module DELETED | **DAILY DOWNLOAD ORDERED** |
+| NSE India (niftyindices) index constituent lists | one list (NIFTY Total Market) fetched as a Groww watch-build input | **ALL index lists, every morning, as a first-class pipeline** |
+| The ISIN join between them | did not exist | **THE DELIVERABLE** — precise constituent → Dhan `security_id` mapping |
+| Live-lane universe | 4 hardcoded index SIDs | may be sourced from the rebuilt master (a SEPARATE step; see below) |
+| Everything else | — | UNCHANGED |
+
+#### What this quote does NOT authorize (Rule 11 — no scope smuggling)
+
+- **Live order fire.** `dry_run` stays true. Not mentioned, not touched.
+- **A fifth Dhan WS endpoint type**, or more than 16 total connections.
+- **Any edit to the §28 frozen indicator/strategy area.**
+- **Standing down the per-minute REST legs** — the second 2026-08-11 quote's
+  explicit KEEP stands and is reinforced, not replaced, by this one.
+- **Automatically widening the live subscription set.** The download produces a
+  MAPPING; pointing the live lane at it changes what we subscribe and is its own
+  decision with its own bandwidth and cost consequences. Building the pipeline is
+  ordered here; re-pointing the lane is not, and must not be smuggled in.
+
+#### The mapping contract is ALREADY LOCKED — build to it, do not reinvent it
+
+`daily-universe-scope-expansion-2026-05-27.md` §31.1 (operator-confirmed
+2026-06-06) already specifies precisely the join this quote asks for, and it
+stands unamended:
+
+1. **PRIMARY KEY = ISIN.** Match the NSE list's `ISIN Code` against the Dhan
+   master's `ISIN`, filtered to `EXCH_ID == NSE AND SEGMENT == E AND SERIES == EQ`.
+   The matched row's `SECURITY_ID` is the answer.
+2. **SECONDARY / cross-check = `(Symbol, Series=EQ, NSE, Equity)`.** Symbol-ALONE
+   is BANNED as a primary key — tickers are reused and renamed, so a symbol join
+   can silently map to the WRONG security, which is worse than failing.
+3. **O(1) build.** One `HashMap<ISIN, (security_id, ExchangeSegment)>` built once
+   from the Dhan NSE-EQ rows; each constituent is then an O(1) lookup. Never a
+   per-constituent scan of the master.
+4. **Fail-closed.** An unresolved constituent is COUNTED and LOGGED BY NAME,
+   never silently dropped. Past the tolerance, REJECT the whole build.
+5. **Dedup** by the I-P1-11 composite `(security_id, exchange_segment)`.
+6. **Role tagging** so `index_constituent` vs `fno_underlying` is an O(1) filter.
+
+The §18 downloader hardening contract (redirect policy `none`, 50 MB body cap,
+content-type assertion, cache-path validation, 10s connect / 60s read timeouts,
+never log the URL) is likewise already locked and binds this rebuild verbatim.
+
+#### The honest envelope
+
+- **Two tolerances, deliberately different, and they must not be merged:** the
+  NSE membership-list tolerance (2%, raised from 0.5% after the 2026-06-08 live
+  boot degraded the universe over 5 stragglers out of 748) and the order-critical
+  Dhan-master F&O dangling guard (0.5%, unchanged). Collapsing them into one
+  number breaks one of the two.
+- **A same-wrong-on-both-sides input is invisible by construction.** The join
+  detects disagreement between the two files; it cannot detect two files that are
+  consistently wrong. Nothing here claims otherwise.
+- **Derivative security_ids are documented by Dhan as unstable across days.** The
+  mapping is therefore a POINT-IN-TIME artifact per trading day — which is why
+  the SEBI tables are append-with-history and never overwritten in place.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Joins on SYMBOL as the primary key, or drops the ISIN cross-check.
+- Silently skips unresolved constituents instead of counting + naming them.
+- Merges the 2% membership tolerance and the 0.5% F&O dangling tolerance.
+- Ships the downloader without the §18 hardening (a redirect-following client,
+  an uncapped body, or no content-type assertion is a REJECT on its own).
+- Logs the CSV URL with query parameters, or writes outside the validated cache
+  directory.
+- Re-points the live subscription set at the new master without its own dated
+  quote (see "does NOT authorize" above).
+- Presents a build that resolved zero constituents as success — a zero-row join
+  passing a "no mismatches" check is the false-OK class this file exists to stop.
+
 ### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
 
 Operator Parthiban, 2026-07-24 (verbatim quotes preserved in
