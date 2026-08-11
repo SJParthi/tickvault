@@ -402,4 +402,121 @@ mod tests {
         assert!(!is_stock_split(100, 100, 1.0, f64::NAN));
         assert!(!is_stock_split(100, 100, f64::NAN, 0.05));
     }
+
+    // ── Adversarial inputs from the rebuilt daily master (2026-08-11) ──
+    //
+    // These functions are about to be driven by the daily Dhan master CSV
+    // again, so they see whatever the vendor serves. The cases below are the
+    // ones a real file can produce and that a naive implementation gets
+    // wrong SILENTLY — a wrong split verdict writes a spurious corporate
+    // -action row into a SEBI never-delete table, which is not something a
+    // later run can take back.
+
+    #[test]
+    fn test_is_stock_split_never_overflows_on_extreme_lot_sizes() {
+        // `2 * new <= old` in i32 would overflow for a large new lot size and
+        // wrap NEGATIVE, making the comparison true — a phantom split from
+        // arithmetic alone. The i64 widening is what prevents that, and this
+        // is the input that proves it.
+        assert!(
+            !is_stock_split(1, i32::MAX, 1.0, 1.0),
+            "a lot size GROWING to i32::MAX is not a split; a wrapped \
+             comparison would report one"
+        );
+        assert!(
+            is_stock_split(i32::MAX, 1, 1.0, 1.0),
+            "i32::MAX -> 1 is a genuine collapse and must still be detected"
+        );
+    }
+
+    #[test]
+    fn test_is_stock_split_ignores_negative_lot_sizes() {
+        // A malformed row can yield a negative lot size. It means "unknown",
+        // exactly as 0 does -- never "the lot halved".
+        assert!(!is_stock_split(-100, 50, 1.0, 1.0));
+        assert!(!is_stock_split(100, -50, 1.0, 1.0));
+        assert!(!is_stock_split(i32::MIN, i32::MIN, 1.0, 1.0));
+    }
+
+    #[test]
+    fn test_is_stock_split_boundary_is_inclusive_at_exactly_half() {
+        // The doc says "half or less". Exactly half must be INSIDE the
+        // split verdict, and one unit above it must be outside -- an
+        // off-by-one here silently reclassifies every 2:1 split.
+        assert!(is_stock_split(100, 50, 1.0, 1.0), "exactly half IS a split");
+        assert!(
+            !is_stock_split(100, 51, 1.0, 1.0),
+            "just above half is not a split"
+        );
+        assert!(
+            is_stock_split(100, 100, 0.10, 0.05),
+            "tick exactly halving IS a split"
+        );
+        assert!(
+            !is_stock_split(100, 100, 0.10, 0.06),
+            "tick above half is not a split"
+        );
+    }
+
+    #[test]
+    fn test_is_stock_split_ignores_non_positive_tick_sizes() {
+        // Zero means "unknown" per the doc; negative is corrupt. Neither may
+        // produce a split, and a negative new tick would satisfy a naive
+        // `new <= old * 0.5` on its own.
+        assert!(!is_stock_split(100, 100, 0.0, 0.0));
+        assert!(!is_stock_split(100, 100, 1.0, 0.0));
+        assert!(
+            !is_stock_split(100, 100, 1.0, -1.0),
+            "a negative tick satisfies new <= old*0.5 arithmetically and must \
+             still be refused"
+        );
+        assert!(!is_stock_split(100, 100, -1.0, 0.05));
+    }
+
+    #[test]
+    fn test_is_stock_split_either_signal_alone_is_sufficient() {
+        // The two signals are independent -- a split shows in the lot OR the
+        // tick, and requiring both would miss the common case.
+        assert!(
+            is_stock_split(100, 50, 1.0, 1.0),
+            "lot alone must trigger with the tick unchanged"
+        );
+        assert!(
+            is_stock_split(100, 100, 1.0, 0.5),
+            "tick alone must trigger with the lot unchanged"
+        );
+        assert!(
+            !is_stock_split(100, 100, 1.0, 1.0),
+            "neither signal, no split"
+        );
+    }
+
+    #[test]
+    fn test_classify_disappearance_state_is_exact_match_not_fuzzy() {
+        // The master's INSTRUMENT_TYPE is uppercase by parse convention. A
+        // case or whitespace variant must fall to the DERIVATIVE default,
+        // never be silently treated as INDEX/EQUITY -- the fallback is the
+        // conservative direction (a contract expiring is the common case),
+        // and pinning it stops a future "helpful" case-insensitive match
+        // from reclassifying real indices.
+        assert_eq!(
+            classify_disappearance_state("index"),
+            LifecycleState::ExpiredContract,
+            "lowercase must NOT match INDEX"
+        );
+        assert_eq!(
+            classify_disappearance_state(" INDEX"),
+            LifecycleState::ExpiredContract,
+            "a leading space must NOT match INDEX"
+        );
+        assert_eq!(
+            classify_disappearance_state(""),
+            LifecycleState::ExpiredContract,
+            "an empty type falls to the contract default"
+        );
+        assert_eq!(
+            classify_disappearance_state("FUTIDX"),
+            LifecycleState::ExpiredContract
+        );
+    }
 }
