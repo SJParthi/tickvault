@@ -1153,8 +1153,29 @@ fn production_region(source: &str) -> &str {
 /// ALPN assert message). A trailing-comment mention on a code line would
 /// over-count and fail LOUDLY — the conservative direction for an orphan
 /// pin.
+/// # 2026-08-11 — the annotation moved orphan → LIVE
+///
+/// This guard was written to fail the moment a depth consumer reappeared,
+/// and it did exactly that. Recording why it is now inverted rather than
+/// deleted:
+///
+/// The operator authorized depth-20 and depth-200 on 2026-08-09 with a dated
+/// quote in `websocket-connection-scope-lock.md` ("16 CONNECTIONS +
+/// depth-20/depth-200 AUTHORIZED"), lifting the two endpoints from FORBIDDEN
+/// to ALLOWED at up to 5 connections each. The rule edit landed BEFORE the
+/// code, which is the order this guard's own message demands. What did NOT
+/// happen is the second half of that demand — "must update this ledger's
+/// orphan annotations (orphan -> live) in the same PR" — so the constants
+/// gained a consumer while the ledger still called them orphaned, and this
+/// test correctly refused.
+///
+/// The pin is INVERTED, not weakened. Before, zero consumers were allowed;
+/// now the consumer set is pinned to exactly the authorized lane. A depth
+/// URL appearing in any OTHER production file still fails here, which is the
+/// property worth keeping: the scope lock permits depth on four named
+/// endpoints inside one lane, not depth anywhere.
 #[test]
-fn test_depth_ws_url_constants_are_orphaned() {
+fn test_depth_ws_url_constants_are_live_only_in_the_authorized_lane() {
     use tickvault_common::constants::{
         DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
     };
@@ -1203,13 +1224,22 @@ fn test_depth_ws_url_constants_are_orphaned() {
             consumers.push(path_text);
         }
     }
+    // The ONE file the 2026-08-09 operator authorization covers.
+    const AUTHORIZED_CONSUMER: &str = "crates/app/src/dhan_feed_stack.rs";
+    let unauthorized: Vec<&String> = consumers
+        .iter()
+        .filter(|p| !p.ends_with(AUTHORIZED_CONSUMER))
+        .collect();
+
     assert!(
-        consumers.is_empty(),
-        "the 2 depth WS URL constants are ORPHANED (PR #4 deleted their \
-         consumers; depth is FORBIDDEN FOREVER per \
-         websocket-connection-scope-lock.md) — a new consumer/code mention \
-         requires the scope-lock rule edit FIRST and must update this \
-         ledger's orphan annotations (orphan -> live) in the same PR. \
+        unauthorized.is_empty(),
+        "a depth WS URL constant is referenced OUTSIDE the authorized live-feed lane. \
+         The 2026-08-09 operator quote in websocket-connection-scope-lock.md permits \
+         depth-20/depth-200 on the 16-connection lane in {AUTHORIZED_CONSUMER} — it does \
+         NOT permit depth anywhere else. A new consumer requires its own dated rule edit \
+         FIRST, then this ledger updated in the same PR. Found: {unauthorized:?}. \
+         (Historical: this assertion required ZERO consumers until 2026-08-11, when the \
+         authorized lane landed.) \
          Found:\n{}",
         consumers.join("\n")
     );

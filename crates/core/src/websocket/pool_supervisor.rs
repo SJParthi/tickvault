@@ -80,7 +80,9 @@ use super::idle_watchdog::IdleWatchdog;
 use super::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, PoolBudget, PoolBudgetRefusal,
 };
-use super::reconnect_ladder::reconnect_delay_with_jitter_ms;
+use super::reconnect_ladder::{
+    reconnect_delay_ms, reconnect_delay_with_jitter_ms, reconnect_jitter_ms,
+};
 use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 
 // ---------------------------------------------------------------------------
@@ -495,7 +497,29 @@ impl ConnectionSupervisor {
                         self.park(ParkReason::FatalDisconnect)
                     }
                     DisconnectClass::TokenStale => {
-                        let delay = self.next_delay_ms().max(TOKEN_STALE_REDIAL_FLOOR_MS);
+                        // Floor the LADDER, then add this socket's stagger —
+                        // never the other way round (2026-08-11).
+                        //
+                        // This was `next_delay_ms().max(FLOOR)`, which reads
+                        // as "at least the floor" and is, but it also silently
+                        // discarded the jitter. The ladder's first three rungs
+                        // are 0/1000/2000 ms and the whole jitter range is
+                        // 0-375 ms, so every jittered value on those rungs is
+                        // below the 5,000 ms floor and `max` collapsed all of
+                        // them onto exactly 5,000.
+                        //
+                        // That is precisely the wrong behaviour for the event
+                        // this arm exists to handle: a token expiring kills
+                        // ALL sixteen sockets at once, so all sixteen slept an
+                        // identical 5,000 ms, woke in the same tick, and hit
+                        // the token endpoint together — a self-inflicted
+                        // thundering herd on the one code path guaranteed to
+                        // be entered by every connection simultaneously.
+                        //
+                        // Flooring the base first keeps the "wait at least
+                        // 5 s" intent and restores the fan-out on top of it.
+                        let base = self.next_ladder_delay_ms().max(TOKEN_STALE_REDIAL_FLOOR_MS);
+                        let delay = base.saturating_add(self.jitter_ms());
                         self.enter_backoff(ReconnectReason::TokenStale);
                         SupervisorAction::RefreshTokenThenDial { delay_ms: delay }
                     }
@@ -542,6 +566,21 @@ impl ConnectionSupervisor {
     /// per-slot stagger. Does NOT mutate.
     fn next_delay_ms(&self) -> u64 {
         reconnect_delay_with_jitter_ms(self.attempt, self.slot.global_index)
+    }
+
+    /// The ladder delay for this attempt WITHOUT this socket's stagger.
+    ///
+    /// Split out so a caller that needs to raise the floor can floor the
+    /// ladder and then add the stagger, rather than flooring the sum and
+    /// throwing the stagger away — see the `TokenStale` arm.
+    fn next_ladder_delay_ms(&self) -> u64 {
+        reconnect_delay_ms(self.attempt)
+    }
+
+    /// This socket's fixed fan-out offset. Index 0 always gets zero, so one
+    /// connection per pool keeps the exact instant-retry behaviour.
+    fn jitter_ms(&self) -> u64 {
+        reconnect_jitter_ms(self.slot.global_index)
     }
 
     /// Common tail for every retryable failure: compute the delay, count it,
@@ -1161,6 +1200,12 @@ where
     // idleness the instant it comes up.
     ticker.tick().await;
 
+    // Per-socket count of frames the ring refused, used only to throttle the
+    // log below. Scoped to this drain call, so a reconnect starts the ladder
+    // again — deliberate: a fresh connection that immediately backs up is
+    // worth hearing about even if the previous one already reported.
+    let mut ring_full_seen: u64 = 0;
+
     while action == SupervisorAction::Continue {
         tokio::select! {
             biased;
@@ -1181,6 +1226,41 @@ where
                                 "write-ahead log refused a Dhan frame — that frame is lost; \
                                  the reader keeps draining so the socket is not also lost"
                             );
+                        }
+                        if outcome == FrameSinkOutcome::RingFull {
+                            // 2026-08-11: this outcome used to bump a counter
+                            // and produce NO log line at all.
+                            //
+                            // The counter's documentation calls a full ring
+                            // "not capture loss — the consumer is behind",
+                            // and for a brief burst that is fair: the frame is
+                            // already in the WAL. But nothing re-folds WAL
+                            // frames into the database, so in practice a full
+                            // ring means those ticks and candles never arrive
+                            // — while the lane's health gauge still reads 1.
+                            // Silent permanent loss behind a green light is
+                            // exactly the class the charter forbids.
+                            //
+                            // Throttled by powers of two rather than rate-
+                            // limited: the first occurrence is always
+                            // reported, and a sustained storm degrades to a
+                            // handful of lines instead of one per frame. A
+                            // slow consumer must not be able to drown the log
+                            // it is being reported in.
+                            ring_full_seen = ring_full_seen.saturating_add(1);
+                            if ring_full_seen.is_power_of_two() {
+                                error!(
+                                    code = ErrorCode::WsGapConnectionState.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    dropped_on_this_socket = ring_full_seen,
+                                    "the frame ring is FULL — the fold cannot keep up, so this \
+                                     frame is not being turned into ticks or candles. It is in \
+                                     the write-ahead log, but nothing re-folds WAL frames, so \
+                                     treat this as data loss until that changes. Logged at \
+                                     1, 2, 4, 8 ... occurrences per socket to bound the noise."
+                                );
+                            }
                         }
                     }
                     SocketEvent::Closed { code } => {
@@ -1676,6 +1756,70 @@ mod tests {
         let spread =
             delays.iter().max().copied().unwrap_or(0) - delays.iter().min().copied().unwrap_or(0);
         assert_eq!(spread, 15 * RECONNECT_JITTER_STEP_MS);
+    }
+
+    #[test]
+    fn test_token_expiry_drops_all_sixteen_and_they_still_receive_distinct_delays() {
+        // The test above uses `code: None` — a Transient disconnect, which
+        // never touches the token-stale floor. So it proved the jitter works
+        // on the ONE path where sixteen sockets do NOT reliably drop together,
+        // and proved nothing about the path where they always do.
+        //
+        // Token expiry (807) is the real simultaneous-drop event: one JWT
+        // backs all sixteen sockets, so when it dies Dhan closes all sixteen
+        // inside the same second. That arm floors the delay at 5,000 ms, and
+        // until 2026-08-11 it floored the ALREADY-JITTERED value — every
+        // jittered delay on ladder rungs 0/1/2 is below 5,000, so `max`
+        // flattened all sixteen onto exactly 5,000 ms. Sixteen simultaneous
+        // wakeups, sixteen token renewals, sixteen handshakes, in one tick.
+        //
+        // This test fails on that code and passes on the fix.
+        let now = t0();
+        let mut delays = Vec::new();
+        for endpoint in DhanEndpointType::ALL {
+            for pool_index in 0..endpoint.max_connections() {
+                let mut s = sup(endpoint, pool_index, now);
+                let _ = s.on_event(ConnEvent::BeginDial, now);
+                let _ = s.on_event(ConnEvent::DialSucceeded, now);
+                let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+                match s.on_event(
+                    ConnEvent::Disconnected {
+                        code: Some(DisconnectCode::AccessTokenExpired),
+                    },
+                    now,
+                ) {
+                    SupervisorAction::RefreshTokenThenDial { delay_ms } => delays.push(delay_ms),
+                    other => panic!("807 must refresh the token then dial, got {other:?}"),
+                }
+            }
+        }
+
+        assert_eq!(delays.len(), 16, "the authorized ceiling is 16 connections");
+        let unique: BTreeSet<u64> = delays.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            16,
+            "a token expiry drops ALL sixteen at once — each must still wake at its own \
+             instant, or we hand Dhan sixteen simultaneous renewals: {delays:?}"
+        );
+
+        // Every one still respects the floor: the point of the fix is to keep
+        // the floor AND the fan-out, not to trade one for the other.
+        for d in &delays {
+            assert!(
+                *d >= TOKEN_STALE_REDIAL_FLOOR_MS,
+                "a token-stale redial must never be shorter than the floor: {d}"
+            );
+        }
+        // Index 0 gets zero stagger, so the minimum is exactly the floor.
+        assert_eq!(
+            delays.iter().min().copied().unwrap_or(0),
+            TOKEN_STALE_REDIAL_FLOOR_MS
+        );
+        assert_eq!(
+            delays.iter().max().copied().unwrap_or(0),
+            TOKEN_STALE_REDIAL_FLOOR_MS + 15 * RECONNECT_JITTER_STEP_MS
+        );
     }
 
     proptest! {

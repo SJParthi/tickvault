@@ -1816,11 +1816,30 @@ async fn main() -> Result<()> {
     }
     if !ws_wal_replay_live_feed.is_empty() {
         let dropped = ws_wal_replay_live_feed.len() as u64;
-        warn!(
+        // 2026-08-11 — this message was written on 2026-07-14, when it was
+        // true: the Dhan live WS had just been retired, nothing appended
+        // LiveFeed frames, and anything found here really was pre-retirement
+        // residue being tidied away.
+        //
+        // It stopped being true when the live lane came back and became the
+        // WAL's first frame producer since that retirement. These frames can
+        // now be TODAY'S — captured minutes ago by a session that died — and
+        // the operator reading "residual ... from a pre-retirement session"
+        // would file it as housekeeping rather than as data loss.
+        //
+        // The frames are genuinely preserved on disk, and re-folding them is
+        // real work (the fold path takes a live ring, not a replay batch), so
+        // this stays a drop for now. What changes is that it stops describing
+        // a live gap as historical tidying, and says plainly what was lost.
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
             frames = dropped,
-            "STAGE-C.2b: residual LiveFeed WAL frames from a pre-retirement session have no \
-             re-injection target (the Dhan live WS was retired 2026-07-13) — counted and \
-             archived with the WAL segments; the raw frames remain on disk in the archive"
+            "STAGE-C.2b: {dropped} captured live-feed frames were replayed from the \
+             write-ahead log and DROPPED — there is no re-fold path, so the ticks and candles \
+             they contain are NOT in the database. The raw frames are preserved in the WAL \
+             archive and can be recovered manually. If this session followed an unclean stop \
+             during market hours, this is real data loss for that window, not leftover residue \
+             from an old session."
         );
         metrics::counter!(
             "tv_ws_frame_wal_reinjected_dropped_total",
@@ -1921,6 +1940,57 @@ async fn main() -> Result<()> {
     // amendment stands — no CSV download, no parser). Depth sets are empty
     // until an operator names instruments for them.
     // =======================================================================
+    // -----------------------------------------------------------------------
+    // Register the 15:31 cross-verification dependencies BEFORE the lane
+    // spawns (2026-08-11).
+    //
+    // Without this call `spawn_daily_crossverify` takes its refusal branch and
+    // the lane runs with NO loss detector at all. That is not a degraded mode
+    // — it is the absence of the only detector that can exist here: the Dhan
+    // main feed carries no sequence number and no snapshot-on-subscribe, so a
+    // dropped packet is invisible at the protocol level. The 15:31 comparison
+    // against Dhan's own REST record is the entire safety net.
+    //
+    // This was missed once already. The comparator's stub was replaced with a
+    // real implementation on 2026-08-10, and the registration it depends on
+    // was never written — so the "fix" changed a log line and nothing else.
+    // The lane now REFUSES to start without it (see `run_dhan_feed_stack`),
+    // which is what stops that from being possible a third time.
+    let crossverify_installed = tickvault_app::dhan_feed_stack::install_crossverify_deps(
+        tickvault_app::dhan_feed_stack::CrossverifyDeps {
+            questdb_exec_url: format!(
+                "http://{}:{}/exec",
+                config.questdb.host, config.questdb.http_port
+            ),
+            intraday_url: format!(
+                "{}{}",
+                config.dhan.rest_api_base_url,
+                tickvault_common::constants::DHAN_CHARTS_INTRADAY_PATH
+            ),
+            // A closure, not a value: the JWT rotates roughly every 23h and
+            // this scheduler outlives any single token. Reading it fresh at
+            // each run is the only correct shape.
+            jwt_provider: Box::new(|| {
+                let manager = tickvault_core::auth::token_manager::global_token_manager()?;
+                let guard = manager.token_handle().load();
+                guard.as_ref().as_ref().map(|state| {
+                    use secrecy::ExposeSecret as _;
+                    state.access_token().expose_secret().to_string()
+                })
+            }),
+            config: tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig::default(),
+        },
+    );
+    if !crossverify_installed {
+        // Idempotent by design — first call wins. A second call means someone
+        // added a rival registration, which would silently decide which
+        // endpoints the only ground-truth check uses.
+        tracing::warn!(
+            "cross-verification dependencies were already registered — the first \
+             registration stands; check for a duplicate install site"
+        );
+    }
+
     let _dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             dhan_enabled: config.feeds.dhan_enabled,
@@ -1934,6 +2004,11 @@ async fn main() -> Result<()> {
             // in this process" — is what this line changes). `None` refuses
             // the lane outright rather than capturing without a durable floor.
             spill: _ws_frame_spill.clone(),
+            // Both paths seal into the same `candles_<tf>` tables under
+            // `feed='dhan'`, and the dedup key has no column that separates
+            // them. Passing the fold's real state lets the lane refuse rather
+            // than let one writer silently overwrite the other.
+            rest_fold_writes_dhan_candles: config.rest_candle_fold.enabled,
         },
     );
 

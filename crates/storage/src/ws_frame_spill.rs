@@ -1,10 +1,27 @@
 // STAGE-C: Non-blocking disk-durable spill for every WebSocket frame.
 //
 // Hot-path `append()` is O(1) and never blocks: it uses a crossbeam bounded
-// channel with `try_send`. A dedicated background thread fsyncs records to
+// channel with `try_send`. A dedicated background thread writes records to
 // append-only WAL segment files. On startup, `replay_all()` walks every WAL
 // file, validates CRC32, and returns the recovered frames so downstream
 // consumers can drain them before live reads resume.
+//
+// DURABILITY — read this before relying on the word "durable" (corrected
+// 2026-08-11). The writer thread calls `BufWriter::flush()`, which hands
+// bytes to the OPERATING SYSTEM. It does NOT call `sync_all`/`sync_data`,
+// so nothing forces them onto the physical disk. Concretely:
+//
+//   * process killed (SIGKILL, panic, OOM) -> flushed records SURVIVE, because
+//     the page cache belongs to the kernel, not to us. This is the case the
+//     WAL exists for and it is genuinely covered.
+//   * machine loses power, kernel panics, or the host is force-stopped ->
+//     records written since the last kernel writeback are LOST.
+//
+// Three comments in this file previously said "fsync". None was ever true —
+// there is no `sync_all` anywhere in this crate. The claim mattered because
+// the live feed refuses to open a socket without this WAL, citing it as the
+// durability floor; overstating that floor is how a gap gets discovered late.
+// Adding a real fsync is a deliberate throughput trade, not a typo fix.
 //
 // Record format on disk:
 //     [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame:len bytes][crc32:u32 LE]
@@ -148,7 +165,7 @@ pub struct ReplayedFrame {
 /// thread, exceeding the 65k cap and tripping the safety-floor invariant
 /// (`tv_ws_frame_spill_drop_critical == 0` in healthy ops). The new ceiling
 /// stays above the 100k chaos test threshold AND doubles burst headroom for
-/// production: a transient writer stall of up to 13s (e.g. brief disk fsync
+/// production: a transient writer stall of up to 13s (e.g. brief disk writeback
 /// latency on a contended host) now absorbs without dropping. Memory cost
 /// at idle is ~3 MiB extra (131k × ~24 B/`WalRecord` header), trivial on
 /// the 4 GiB t4g.medium target.
@@ -186,7 +203,9 @@ const WAL_MIN_RECORD_V2: usize = 21;
 /// Rotate to a new segment after this many bytes.
 const WAL_SEGMENT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Writer buffer size — large enough to batch-fsync hundreds of records.
+/// Writer buffer size — large enough to batch hundreds of records into one
+/// write syscall. (Not an fsync batch: see the DURABILITY note in the module
+/// header — this path never calls `sync_all`.)
 const WAL_WRITER_BUFFER: usize = 256 * 1024;
 
 /// Backoff before the supervisor re-enters the writer loop after a panic or a
@@ -1074,6 +1093,58 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn test_durability_claim_matches_what_the_code_actually_does() {
+        // A documentation ratchet, and the only kind that works for a claim
+        // like this one: durability is invisible in a unit test — a flushed
+        // record and a synced record are byte-identical until the machine
+        // loses power — so nothing but a source scan can keep the words and
+        // the syscalls in agreement.
+        //
+        // Until 2026-08-11 this module asserted "fsync" three times while
+        // calling `sync_all` zero times. The live feed refuses to open a
+        // socket without this WAL and names it the durability floor, so the
+        // overstatement was load-bearing.
+        //
+        // Either direction of drift now fails: adding a sync without
+        // correcting the note, or restoring the claim without the sync.
+        let src = include_str!("ws_frame_spill.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        let syncs = production.matches(concat!("sync_", "all")).count()
+            + production.matches(concat!("sync_", "data")).count();
+
+        if syncs == 0 {
+            assert!(
+                production.contains("DURABILITY"),
+                "this module performs no fsync, so its header MUST carry the DURABILITY note \
+                 explaining that flushed records survive a process kill but not power loss"
+            );
+            // The word may appear ONLY in that corrective note, never as a
+            // description of what the writer does.
+            for line in production.lines() {
+                if !line.contains("fsync") {
+                    continue;
+                }
+                let l = line.to_lowercase();
+                assert!(
+                    l.contains("previously")
+                        || l.contains("never true")
+                        || l.contains("not an fsync")
+                        || l.contains("deliberate throughput"),
+                    "this line claims fsync behaviour the code does not have — either add a \
+                     real sync_all or reword it: {line}"
+                );
+            }
+        } else {
+            assert!(
+                production.contains("sync_all") || production.contains("sync_data"),
+                "sanity: counted a sync but cannot find one"
+            );
+        }
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()

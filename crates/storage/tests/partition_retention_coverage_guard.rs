@@ -116,7 +116,58 @@ fn candle_tables_are_swept_via_single_source() {
     );
 
     let names = tickvault_storage::shadow_persistence::candle_table_names();
-    assert_eq!(names.len(), 21, "expected 21 live candle tables");
+
+    // 21 → 24 on 2026-08-11: the live-feed revival added the three
+    // second-scale frames the operator's 13-timeframe requirement needs.
+    //
+    // The count is asserted BY NAME, not as a bare number. A count tells you
+    // a number moved; it does not tell you WHICH table lost its retention
+    // sweep — and an unswept candle table grows until the disk fills, which
+    // is a slow failure nobody attributes to a test that once said "21".
+    let expected = [
+        // Second scale — 1s..15s plus 30s. These are the frames the
+        // 13-timeframe requirement added, and the reason the count moved.
+        "candles_1s",
+        "candles_2s",
+        "candles_3s",
+        "candles_4s",
+        "candles_5s",
+        "candles_6s",
+        "candles_7s",
+        "candles_8s",
+        "candles_9s",
+        "candles_10s",
+        "candles_11s",
+        "candles_12s",
+        "candles_13s",
+        "candles_14s",
+        "candles_15s",
+        "candles_30s",
+        // Minute scale and the day frame.
+        "candles_1m",
+        "candles_2m",
+        "candles_3m",
+        "candles_5m",
+        "candles_15m",
+        "candles_30m",
+        "candles_60m",
+        "candles_1d",
+    ];
+    let actual: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+    let want: std::collections::BTreeSet<&str> = expected.iter().copied().collect();
+    let missing: Vec<_> = want.difference(&actual).collect();
+    let extra: Vec<_> = actual.difference(&want).collect();
+    assert!(
+        missing.is_empty(),
+        "these candle tables lost their retention sweep — they will grow \
+         without bound: {missing:?}"
+    );
+    assert!(
+        extra.is_empty(),
+        "new candle tables appeared without being added to this ledger — \
+         confirm each is swept, then list it here: {extra:?}"
+    );
+
     for n in names {
         assert!(
             n.starts_with("candles_") && !n.contains("_shadow"),
