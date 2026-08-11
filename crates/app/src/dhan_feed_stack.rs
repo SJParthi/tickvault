@@ -749,8 +749,6 @@ impl LiveIngest {
         }
     }
 
-    /// Sealed candles handed to the process-wide seal writer.
-    #[must_use]
     /// Seals every OPEN bucket across every instrument and timeframe, routing
     /// each one to the same seal writer the per-tick fold uses.
     ///
@@ -815,6 +813,8 @@ impl LiveIngest {
         (emitted, dropped)
     }
 
+    /// Sealed candles handed to the process-wide seal writer.
+    #[must_use]
     pub const fn seals_emitted(&self) -> u64 {
         self.seals_emitted
     }
@@ -2344,6 +2344,65 @@ mod tests {
             ingest.seq_refused(),
             0,
             "a representable sequence must not be refused"
+        );
+    }
+
+    #[test]
+    fn test_seal_open_buckets_at_close_accounts_every_bar_it_produces() {
+        // The defect this pins: `force_seal_all` had ZERO production callers,
+        // so the final open bucket of every timeframe was discarded at
+        // shutdown — one bar per instrument per timeframe, lost daily, with
+        // no counter moving and no log line.
+        //
+        // Honest scope: this unit test runs with no seal writer installed, so
+        // every bar lands on the `dropped` side. That is deliberate and it is
+        // still the assertion that matters — a non-zero total proves the
+        // aggregator was actually walked and OPEN buckets were found, which
+        // is precisely what the missing call site was failing to do. The
+        // emitted-vs-dropped SPLIT is exercised by the writer-side tests; the
+        // invariant here is that no bar escapes accounting on either side.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let packet = ticker_packet(13, 23_146.45, 1_779_355_000);
+        let ParsedFrame::Tick(tick) =
+            dispatch_frame(&packet, 1_779_355_000_000_000_000).expect("parse")
+        else {
+            panic!("expected a tick");
+        };
+        ingest.ingest_tick(&tick, 1, 1_779_355_000_000);
+
+        let before_emitted = ingest.seals_emitted();
+        let before_dropped = ingest.seals_dropped();
+        let (emitted, dropped) = ingest.seal_open_buckets_at_close();
+
+        assert!(
+            emitted.saturating_add(dropped) > 0,
+            "one tick opens a bucket in every timeframe, so the close seal \
+             must produce at least one bar — zero here means the aggregator \
+             was never walked, which is the exact silent loss this exists to \
+             prevent"
+        );
+        assert_eq!(
+            ingest.seals_emitted().saturating_sub(before_emitted),
+            emitted,
+            "close-seal emissions must land in the SAME running counter as \
+             the per-tick path — a close-time bar accounted separately is a \
+             bar the operator cannot see"
+        );
+        assert_eq!(
+            ingest.seals_dropped().saturating_sub(before_dropped),
+            dropped,
+            "close-time drops are as much a loss as mid-session drops and \
+             must move the same counter"
+        );
+
+        // Idempotence: the buckets are consumed, so a second call at the same
+        // shutdown cannot re-emit them. A double-seal would write duplicate
+        // bars for the session's final minute.
+        let (again_emitted, again_dropped) = ingest.seal_open_buckets_at_close();
+        assert_eq!(
+            (again_emitted, again_dropped),
+            (0, 0),
+            "sealing twice must not re-emit already-sealed buckets"
         );
     }
 
