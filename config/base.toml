@@ -608,6 +608,20 @@ enabled = true
 enabled = true
 target_secs_of_day_ist = 28800
 retry_backoff_cap_secs = 300
+# Widen the live main-feed set from the 4 hardcoded index SIDs to today's
+# resolved master. Operator quote 2026-08-12 ("i need all 16 sow hatevr is
+# needed fix and impelemnt"), recorded verbatim in
+# `.claude/rules/project/websocket-connection-scope-lock.md` BEFORE this flip.
+#
+# Why it is REQUIRED for 16 sockets: the main feed spreads one shard per
+# connection, and 4 instruments can only fill 4 of the 5 authorized sockets —
+# an empty fifth is refused by design.
+#
+# The serde default stays `false`, so an absent section still means the 4-SID
+# universe. Fail-soft: an unreadable/unparseable mapping artifact falls back to
+# those 4 SIDs with a coded error saying master sourcing was REQUESTED and is
+# NOT in effect. Reversible by setting this back to false + a restart.
+live_subscription_from_master = true
 
 # ===========================================================================
 # Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
