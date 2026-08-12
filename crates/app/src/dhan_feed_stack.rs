@@ -90,7 +90,7 @@ use tickvault_common::constants::{
     DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
     DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE,
     PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, SPOT_1M_REST_INDICES,
-    TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST, TICKER_PACKET_SIZE,
+    TICK_PERSIST_END_SECS_OF_DAY_IST, TICKER_PACKET_SIZE,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
@@ -2371,8 +2371,13 @@ pub fn now_ist_secs_of_day() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: production stopped importing this when the silence gate moved
+    // from the persistence window (09:00) to the continuous session (09:15).
+    // The tests still need it — proving 09:00 is OUTSIDE the gate is exactly
+    // what pins that the pre-open cannot page.
     use std::collections::BTreeSet;
     use std::time::Instant;
+    use tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
     use tickvault_common::types::SecurityId;
 
     fn instruments(n: usize) -> Vec<SubscribeInstrument> {
