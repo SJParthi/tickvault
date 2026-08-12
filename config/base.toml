@@ -793,7 +793,35 @@ catchup_days = 35
 # ===========================================================================
 [market_ram_store]
 enabled = true
-spot_days = 35
+# CURRENT DAY (operator directive 2026-08-12, stated three times: "for the
+# entire current day ram will not even cross more than max 10 gb — I'm talking
+# about current day").
+#
+# Was 35. The spot rings are VecDeque::with_capacity(bars_per_day x spot_days),
+# allocated EAGERLY when a slot is first created — so capacity is memory the
+# process commits the moment an instrument is seen, not memory it grows into.
+# At the store's own MAX_SPOT_BAR_SLOTS ceiling (25,000) that made 35 days
+# 34.9 GB: the single largest RAM commitment in the process, larger than
+# QuestDB's own 12g cap, and the ONE thing that broke the 10 GB budget.
+# Nothing else came close - the aggregator is 155 MB, indicators 18 MB, and
+# raw ticks cost ZERO (folded then dropped; RAM is O(instruments), not
+# O(ticks), so tick rate does not enter this budget at all).
+#
+# Nothing reads the depth. A full call-site sweep found the ONLY production
+# reader of this store is the 60s gauge task that reports how deep the store
+# is - self-referential. Indicator warmup takes a &[Candle] slice and has zero
+# production callers; the 15:31 cross-verify reads QuestDB over /exec; the
+# prev-day pct columns are carried on the seal itself; the chain store is
+# sized independently by chain_row_cap. So 35 days bought retention for a
+# consumer that does not exist, at 34 GB.
+#
+# Cost of this change: depth_days() reports 1, and if [rest_candle_fold] is
+# ever re-enabled with catchup_days = 35 the install emits its existing
+# "spot_days is SHALLOWER than the fold catch-up window" warn and evicts the
+# older fetched days. Raising it back is a one-line config change with no
+# schema impact - but do the arithmetic first: at 25,000 slots each day costs
+# ~1 GB, so the 10 GB budget is spot_days <= 9.
+spot_days = 1
 chain_row_cap = 1000
 
 # ===========================================================================

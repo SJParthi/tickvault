@@ -2563,6 +2563,27 @@ async fn build_shared_infra(
     // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
     tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
 
+    // --- `ticks` DDL — the SAME reasoning, and it had NO caller at all ---
+    //
+    // `ensure_ticks_table` issues CREATE TABLE plus the five-key
+    // `DEDUP ENABLE UPSERT KEYS(ts, security_id, segment, capture_seq, feed)`.
+    // It had ZERO production call sites repo-wide — every reference was its
+    // own doc comments and its own tests — while the live lane above writes
+    // `ticks` on every fold.
+    //
+    // So on a fresh QuestDB volume, ILP auto-created `ticks` WITHOUT DEDUP.
+    // That is silent in the worst way: rows land, counts look right, nothing
+    // errors — and the intra-second tiebreaker that makes WAL replay
+    // idempotent simply is not enforced, so a replay or a reconnect
+    // re-send duplicates rows instead of collapsing onto them. The candle
+    // tables were protected against exactly this class three weeks ago; the
+    // tick table was left out of that fix.
+    //
+    // Awaited INLINE here, beside the candle DDL, for the same ordering
+    // reason: it must complete before the first ILP row can auto-create the
+    // table with the wrong shape.
+    tickvault_storage::tick_persistence::ensure_ticks_table(&config.questdb).await;
+
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
 

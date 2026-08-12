@@ -946,6 +946,22 @@ pub const FLUSH_COUNTER: &str = "tv_dhan_feed_flush_total";
 /// time `try_send` is attempted (`WalRingSink`).
 pub const FRAME_RING_CAPACITY: usize = 65_536;
 
+/// How many times the lane re-checks for the token manager before refusing.
+///
+/// Sized against what it is actually waiting for: `TokenManager::initialize`
+/// performs SSM credential reads, a TOTP computation and an HTTPS
+/// `generateAccessToken` round-trip inside a retry loop whose backoff floor is
+/// >=130s. One retry cycle therefore has to fit, or a single transient auth
+/// failure would still cost the whole session. 60 attempts x 5s = 5 minutes,
+/// which covers a first attempt plus a full backoff plus a second attempt,
+/// and still lands well before the 09:15 IST open on the 08:30 boot schedule.
+pub const TOKEN_MANAGER_WAIT_ATTEMPTS: u64 = 60;
+
+/// Seconds between token-manager re-checks. Short enough that the common case
+/// — the manager appearing within a second or two of a fast auth — costs
+/// almost nothing, since the loop exits on the first success.
+pub const TOKEN_MANAGER_WAIT_INTERVAL_SECS: u64 = 5;
+
 /// The ring's byte ceiling — the bound the frame count alone does not give.
 ///
 /// `FRAME_RING_CAPACITY` bounds how MANY frames sit in the ring, not how much
@@ -1573,14 +1589,50 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     };
 
     // The client id is a credential-adjacent value the token manager owns. No
-    // manager means the REST stack has not registered one, which also means
-    // there is no JWT to dial with — refuse rather than dial with a blank.
-    let Some(client_id) = global_token_manager().map(|m| m.client_id_string()) else {
+    // manager means there is no JWT to dial with — refuse rather than dial
+    // with a blank.
+    //
+    // WAIT for it, do not race it. This was a bare `else { return }`, and it
+    // lost that race on essentially every boot.
+    //
+    // The registrar is `dhan_rest_stack`, which registers the manager only
+    // AFTER `TokenManager::initialize` — SSM credential reads, a TOTP
+    // computation, and an HTTPS `generateAccessToken` round-trip, inside a
+    // retry loop with a >=130s backoff floor. This lane is spawned from the
+    // same boot path with exactly ONE await between the two (a localhost
+    // QuestDB GET for the depth universe, single-digit milliseconds). A
+    // localhost query cannot outlast a remote auth handshake, so the lane
+    // reached this line first, refused, and returned — permanently for that
+    // process, because nothing re-checked.
+    //
+    // The refusal was loud, which is the only reason this was recoverable at
+    // all. But a lane that logs an error and exits on every single boot is
+    // indistinguishable, in effect, from a lane that was never wired.
+    let mut client_id: Option<String> = None;
+    for attempt in 0..TOKEN_MANAGER_WAIT_ATTEMPTS {
+        if let Some(id) = global_token_manager().map(|m| m.client_id_string()) {
+            if attempt > 0 {
+                info!(
+                    waited_secs = attempt * TOKEN_MANAGER_WAIT_INTERVAL_SECS,
+                    "Dhan live feed: token manager registered — proceeding to dial"
+                );
+            }
+            client_id = Some(id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            TOKEN_MANAGER_WAIT_INTERVAL_SECS,
+        ))
+        .await;
+    }
+    let Some(client_id) = client_id else {
         error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
-            "Dhan live feed is enabled but no token manager is registered, so there is neither \
-             a client id nor a JWT to dial with. REFUSING to open any socket. The Dhan REST \
-             stack registers the manager at boot — this means it has not reached that step."
+            waited_secs = TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS,
+            "Dhan live feed is enabled but no token manager registered within the wait budget, \
+             so there is neither a client id nor a JWT to dial with. REFUSING to open any \
+             socket. The Dhan REST stack registers the manager after authentication — this \
+             means authentication did not complete in time (check AUTH-GAP-* and DH-901)."
         );
         return;
     };
@@ -2936,7 +2988,7 @@ mod tests {
 
         for needle in [
             "let Some(spill) = params.spill else",
-            "let Some(client_id) = global_token_manager()",
+            "let Some(client_id) = client_id else",
         ] {
             let at = production_half
                 .find(needle)
@@ -2948,6 +3000,33 @@ mod tests {
                 "`{needle}` must REFUSE the lane, never warn and continue"
             );
         }
+
+        // The token-manager guard must WAIT before it refuses.
+        //
+        // This arm used to pin `let Some(client_id) = global_token_manager()`
+        // — the bare one-shot check — and it passed happily while the lane
+        // lost a race it could not win: the registrar sits behind an SSM +
+        // TOTP + HTTPS auth round-trip, and this lane is spawned with a
+        // single localhost query between them. A guard that is CORRECT
+        // (refusing without a credential is right) can still be WRONG in
+        // timing, and a source pin on the refusal alone cannot tell the
+        // difference. Pin the wait too.
+        assert!(
+            production_half.contains("for attempt in 0..TOKEN_MANAGER_WAIT_ATTEMPTS"),
+            "the lane must RETRY for the token manager, not one-shot it — the \
+             registrar completes a remote auth handshake first, so a single \
+             check loses on essentially every boot"
+        );
+        assert!(
+            production_half.contains("tokio::time::sleep"),
+            "the token-manager wait must actually yield between attempts"
+        );
+        assert!(
+            TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS >= 260,
+            "the wait budget must cover at least two TokenManager::initialize \
+             attempts across its >=130s backoff floor, or one transient auth \
+             failure still costs the whole session"
+        );
     }
 
     /// The 15:31 comparator's day origin must be IST-WALL-AS-EPOCH, because
