@@ -68,7 +68,23 @@ const LOSS_SUFFIXES: &[&str] = &[
 /// between. 12 lines forward and 4 back covers the observed shapes without
 /// reaching into an unrelated neighbouring statement.
 const LOG_LOOKAHEAD_LINES: usize = 12;
-const LOG_LOOKBEHIND_LINES: usize = 4;
+
+/// Hard ceiling on the backward walk. The real stop is the enclosing block
+/// boundary (see `logged_near`); this only bounds the search.
+///
+/// 24, not 4. The house pattern for a loss site is one `error!` describing
+/// what was lost, followed by several `metrics::counter!` calls attributing
+/// it — and those `error!` blocks are multi-line, with a field per line. In
+/// `ws_frame_spill` the `error!` sits **17 lines** above `tv_ticks_lost_total`
+/// inside the same `TrySendError::Full` arm. A 4-line window called that
+/// counter unreachable when it is in fact one of the loudest sites in the
+/// workspace, which is how a false gap gets manufactured.
+///
+/// Widening alone was NOT enough and briefly made things worse: at 24 lines
+/// with no block check, a planted counter picked up an `error!` from the
+/// PREVIOUS function and the guard stopped biting. A gate that cannot fail is
+/// decoration. Hence the indentation-aware stop in `logged_near`.
+const LOG_LOOKBEHIND_LINES: usize = 24;
 
 /// Counters that are neither shipped nor logged, each with the reason it is
 /// tolerated. **This list may only SHRINK.**
@@ -120,19 +136,7 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "untriaged (seeded 2026-08-12)",
     ),
     (
-        "tv_dhan_pool_budget_refused_total",
-        "untriaged (seeded 2026-08-12)",
-    ),
-    (
-        "tv_dhan_universe_index_lists_failed",
-        "untriaged (seeded 2026-08-12)",
-    ),
-    (
         "tv_dhan_ws_dial_failed_total",
-        "untriaged (seeded 2026-08-12)",
-    ),
-    (
-        "tv_errors_summary_refresh_failed_total",
         "untriaged (seeded 2026-08-12)",
     ),
     (
@@ -144,14 +148,6 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "untriaged (seeded 2026-08-12)",
     ),
     (
-        "tv_groww_order_push_sink_dropped_total",
-        "groww_orders feature — compiled out of the deploy build, cannot emit",
-    ),
-    (
-        "tv_groww_push_decode_errors_total",
-        "groww_orders feature — compiled out of the deploy build, cannot emit",
-    ),
-    (
         "tv_groww_push_sink_dropped_total",
         "groww_orders feature — compiled out of the deploy build, cannot emit",
     ),
@@ -160,16 +156,8 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "untriaged (seeded 2026-08-12)",
     ),
     (
-        "tv_index_futures_cap_dropped_total",
-        "untriaged (seeded 2026-08-12)",
-    ),
-    (
         "tv_mark_forward_dropped_total",
         "heartbeat — reported by the order-runtime reconcile heartbeat, not at the emit site (the DHAT budget there forbids a log line)",
-    ),
-    (
-        "tv_oms_unknown_segment_fills_refused_total",
-        "untriaged (seeded 2026-08-12)",
     ),
     (
         "tv_oom_monitor_probe_failed_total",
@@ -197,7 +185,7 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_seal_spill_write_errors_total",
-        "untriaged (seeded 2026-08-12) — LIVE PATH, triage first",
+        "propagated — both emit sites bail!/Err out of SealSpillWriter and seal_absorption.rs logs the returned error at its append_seal call site (verified 2026-08-12)",
     ),
     (
         "tv_spot1m_rows_discarded_total",
@@ -209,14 +197,6 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_tf_verify_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
-    ),
-    (
-        "tv_ticks_lost_total",
-        "untriaged (seeded 2026-08-12) — LIVE PATH, triage first",
-    ),
-    (
-        "tv_ws_frame_wal_reinjected_dropped_total",
         "untriaged (seeded 2026-08-12)",
     ),
 ];
@@ -324,35 +304,144 @@ struct Emit {
     logged: bool,
 }
 
+/// `const FOO: &str = "tv_bar_dropped_total";` — the indirection that made the
+/// first version of this scanner blind.
+///
+/// Roughly half the counters in this workspace are declared as a named const
+/// and emitted as `counter!(FOO)`. The literal then appears ONLY on the
+/// declaration line, usually hundreds of lines away from any emit, so
+/// checking log-proximity at the literal checks the wrong place entirely and
+/// reports a well-logged counter as unreachable. Resolving the alias is what
+/// makes the proximity check mean anything for those.
+fn const_aliases(lines: &[&str], cutoff: usize) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in lines.iter().take(cutoff) {
+        let t = line.trim_start();
+        if t.starts_with("//") || !t.contains("const ") || !t.contains(": &str") {
+            continue;
+        }
+        let Some(after_const) = t.split("const ").nth(1) else {
+            continue;
+        };
+        let Some(ident) = after_const.split(':').next() else {
+            continue;
+        };
+        let ident = ident.trim();
+        for name in tv_names_in(line) {
+            if is_loss_shaped(&name) && !ident.is_empty() {
+                out.push((ident.to_string(), name));
+            }
+        }
+    }
+    out
+}
+
 fn scan_emits() -> Vec<Emit> {
     let mut found: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    // A counter emitted from several sites is reachable if ANY site reaches a
+    // human — the operator only needs one way in. Written as a fn taking the
+    // map rather than a closure capturing it, so the declaration pass below
+    // can also touch the map without a double-borrow.
+    fn note(found: &mut std::collections::BTreeMap<String, bool>, name: String, logged: bool) {
+        found
+            .entry(name)
+            .and_modify(|e| *e = *e || logged)
+            .or_insert(logged);
+    }
+
     for path in production_rs_files() {
         let Ok(src) = fs::read_to_string(&path) else {
             continue;
         };
         let lines: Vec<&str> = src.lines().collect();
         let cutoff = test_module_start(&lines);
+        let aliases = const_aliases(&lines, cutoff);
+
+        // Proximity ALONE is not enough in either direction, and both failure
+        // modes were observed on this codebase:
+        //
+        //   too narrow (4 lines back) — missed the `error!` sitting 17 lines
+        //     above `tv_ticks_lost_total` in the same match arm, and reported
+        //     one of the loudest sites in the workspace as unreachable.
+        //   too wide (24 lines back, unbounded) — a planted counter at the top
+        //     of a file picked up an `error!` from the PREVIOUS function and
+        //     passed. The guard stopped biting, which is worse: a gate that
+        //     cannot fail is decoration.
+        //
+        // So the backward walk stops at the enclosing block boundary: a `}`
+        // indented LESS than the counter line closes a scope the counter is
+        // not in, and anything above it belongs to different code. That keeps
+        // the same-arm `error!` and rejects the previous function's.
+        let indent_of = |l: &str| l.len() - l.trim_start().len();
+        let logged_near = |idx: usize| -> bool {
+            let here = indent_of(lines[idx]);
+            let floor = idx.saturating_sub(LOG_LOOKBEHIND_LINES);
+            let mut lo = idx;
+            while lo > floor {
+                let prev = lo - 1;
+                let t = lines[prev].trim_start();
+                let ind = indent_of(lines[prev]);
+                // Closing brace of a shallower scope: everything above belongs
+                // to code this counter is not in.
+                if t.starts_with('}') && ind < here {
+                    break;
+                }
+                // A top-level item boundary also stops the walk. Without this
+                // a counter at indent 0 — a one-liner `fn f() { counter!(..) }`
+                // — has NO shallower brace to find, so the walk ran the full
+                // window and adopted the previous function's `error!`. Found by
+                // the bite test: the planted violation passed, which means the
+                // guard had quietly stopped guarding.
+                if ind == 0
+                    && (t.starts_with('}')
+                        || t.starts_with("fn ")
+                        || t.starts_with("pub fn ")
+                        || t.starts_with("impl ")
+                        || t.starts_with("pub struct ")
+                        || t.starts_with("struct "))
+                {
+                    break;
+                }
+                lo = prev;
+            }
+            let hi = (idx + LOG_LOOKAHEAD_LINES).min(cutoff);
+            lines[lo..hi]
+                .iter()
+                .any(|l| l.contains("error!") || l.contains("warn!"))
+        };
+
         for (idx, line) in lines.iter().enumerate().take(cutoff) {
             // Comments describe counters constantly in this codebase; only
             // real code counts as an emit site.
             if line.trim_start().starts_with("//") {
                 continue;
             }
+
+            // Direct literal use.
             for name in tv_names_in(line) {
                 if !is_loss_shaped(&name) {
                     continue;
                 }
-                let lo = idx.saturating_sub(LOG_LOOKBEHIND_LINES);
-                let hi = (idx + LOG_LOOKAHEAD_LINES).min(cutoff);
-                let logged = lines[lo..hi]
-                    .iter()
-                    .any(|l| l.contains("error!") || l.contains("warn!"));
-                // A counter emitted from several sites is reachable if ANY
-                // site logs — the operator only needs one way in.
-                found
-                    .entry(name)
-                    .and_modify(|e| *e = *e || logged)
-                    .or_insert(logged);
+                // A const DECLARATION is not an emit site — judging proximity
+                // there is what produced the false "unreachable" verdicts. Its
+                // real sites are handled by the alias pass below.
+                let is_decl = aliases.iter().any(|(_, n)| *n == name)
+                    && line.contains("const ")
+                    && line.contains(": &str");
+                if is_decl {
+                    // Register it so it is never silently dropped, but let the
+                    // alias pass decide reachability.
+                    found.entry(name).or_insert(false);
+                    continue;
+                }
+                note(&mut found, name, logged_near(idx));
+            }
+
+            // Aliased use: `counter!(INGEST_REFUSED_COUNTER, ...)`.
+            for (ident, name) in &aliases {
+                if line.contains(ident.as_str()) && !line.contains(": &str") {
+                    note(&mut found, name.clone(), logged_near(idx));
+                }
             }
         }
     }
@@ -415,7 +504,7 @@ fn allowlist_has_no_stale_entries() {
         let emit = emits.iter().find(|e| e.name == *name);
         match emit {
             None => stale.push(format!("{name}: no emit site at all ({reason})")),
-            Some(e) if shipped.contains(*name) => {
+            Some(_e) if shipped.contains(*name) => {
                 stale.push(format!("{name}: now SHIPPED, drop the row ({reason})"));
             }
             Some(e) if e.logged => {
