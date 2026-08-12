@@ -109,7 +109,7 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     //                  from examining it.
     (
         "tv_aggregator_tick_refused_total",
-        "untriaged (seeded 2026-08-12) — LIVE PATH, triage first",
+        "periodic report — the refusal arm is per-tick and cannot log (flood risk under a bad-data burst); the lane counts it and the 30s drain timer reports the delta with a coded error! (wired 2026-08-12)",
     ),
     (
         "tv_chain1m_rows_discarded_total",
@@ -121,11 +121,11 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_dhan_feed_ingest_refused_total",
-        "untriaged (seeded 2026-08-12) — LIVE PATH, triage first",
+        "periodic report — same per-tick flood constraint; counted into LiveIngest::refusals and reported as a 30s delta by run_frame_drain (wired 2026-08-12)",
     ),
     (
         "tv_dhan_feed_ingest_seq_refused_total",
-        "untriaged (seeded 2026-08-12) — LIVE PATH, triage first",
+        "logged — the emit is counters().ingest_seq_refused, three levels of indirection from the literal (const -> struct field -> method), and the error! sits directly beside it; the scanner cannot follow that chain (verified 2026-08-12)",
     ),
     (
         "tv_dhan_feed_seals_dropped",
