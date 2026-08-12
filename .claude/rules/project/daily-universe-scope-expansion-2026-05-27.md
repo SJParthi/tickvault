@@ -244,6 +244,50 @@ trial-first locks whose implementation PRs never started). Reaching ~25,000 inst
 requires a feed trial plus its own dated scope edits to
 `websocket-connection-scope-lock.md` and this file — deliberately NOT authorized here.
 
+**Quote 15 (2026-08-12, r8g.xlarge FINALISED — preserve EXACTLY, typos included):**
+> "dude this is our finalsied instancue dude okay? just sue this evrywhere neitlrey dude okay?Instance type — terraform says r8g.xlarge (32 GiB),"
+
+Given in direct response to an audit line reporting the instance type as an
+UNCONFIRMED blocker — *"terraform says `r8g.xlarge` (32 GiB), live box was
+`t4g.medium` (4 GiB) after the capacity-refused flip rolled back"*. The
+operator resolves that ambiguity: **r8g.xlarge is FINAL and is the value every
+surface must carry.** This does not change the Quote 13 sizing decision; it
+CONFIRMS it and orders the remaining drift closed.
+
+**What this quote settles (the drift it was given to close).** Quote 13 pinned
+r8g.xlarge in `variables.tf` (default + validation) and in §7 above, but four
+surfaces were left behind — and one of them was live-dangerous:
+
+| Surface | Was | Now |
+|---|---|---|
+| `.github/workflows/downsize-instance.yml` `TO_TYPE` | **`t4g.large`** — a manually-dispatchable workflow that would have moved the box OFF the locked type | `r8g.xlarge` |
+| `scripts/aws-upgrade-instance.sh` `--to` default | `t4g.medium` | `r8g.xlarge` |
+| `aws-budget.md` H1 | "t4g.medium LOCKED ~₹1,022/mo" | r8g.xlarge, with the real bill |
+| `variables.tf` AMI description | "t4g.medium is Graviton" | r8g.xlarge is Graviton4 |
+
+The `downsize-instance.yml` row is the one that mattered: the lock lived in
+terraform's validation, which only binds `terraform apply`. That workflow
+mutates the instance through `ec2 modify-instance-attribute` directly, so it
+never consulted the validation at all — a lock the enforcement path could walk
+straight past.
+
+**⚠ WHAT THIS QUOTE DOES NOT DO — the live box (Rule 11, no false-OK).**
+Recording r8g.xlarge everywhere in the repository does NOT make the running
+instance r8g.xlarge. The only recorded flip attempt (2026-08-07, Quote 12,
+t4g.large) was REFUSED by AWS with `InsufficientInstanceCapacity` and rolled
+back; no successful r8g.xlarge apply is recorded anywhere in this repo, and
+the executing session has no AWS credentials to check. **The live type is
+therefore Unknown from here and must be verified on the box**
+(`aws ec2 describe-instances --filters Name=tag:Name,Values=tv-prod-app
+--query 'Reservations[].Instances[].InstanceType'`) before any claim that the
+box IS r8g.xlarge. What this change guarantees is narrower and worth stating
+plainly: every surface now NAMES the same type, and nothing in the repo can
+move the box away from it.
+
+**Cost is unchanged by this quote** — the Quote 13 envelope stands
+(~₹5,824–7,382/mo incl GST, ~6× the Quote 9 sub-₹1,000 target, knowingly
+breached; kill-ceiling $100).
+
 ---
 
 > **[ARCHIVED 2026-07-20]** §1 The rule (retired subscription contract) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).

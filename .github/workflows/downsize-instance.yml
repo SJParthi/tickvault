@@ -156,8 +156,32 @@ env:
   # A different instance type draws from a different capacity pool.
   # QDB_MEM stays 1g — with 8 GiB there is now headroom to raise it, but that
   # is a separate tuning decision and is deliberately NOT coupled to this flip.
+  # 2026-08-12 (operator Quote 15, daily-universe §0: "this is our finalsied
+  # instancue ... just sue this evrywhere neitlrey"): TO_TYPE moves to the
+  # LOCKED type. It read `t4g.large` until now, which meant this
+  # manually-dispatchable workflow would have flipped the box OFF the
+  # r8g.xlarge lock that Quote 13 set on 2026-08-08.
+  #
+  # That gap existed because the lock lived in `variables.tf` validation, and
+  # validation only binds `terraform apply`. This workflow mutates the
+  # instance directly via `ec2 modify-instance-attribute`, so it never
+  # consulted the lock at all — the enforcement path walked straight past it.
+  # Pinned by instance_type_lock_guard.rs so the two cannot drift again.
+  #
+  # FROM_TYPE stays t4g.medium: that is the last type the box was VERIFIED at
+  # (the 2026-08-07 t4g.large flip was refused by AWS with
+  # InsufficientInstanceCapacity and rolled back), and the script refuses
+  # unless the live type matches, so a wrong guess here fails closed rather
+  # than mutating something unexpected. If the box is already r8g.xlarge the
+  # script's own already-at-target arm continues in retune-only mode.
+  #
+  # QDB_MEM stays 1g deliberately. It was sized for the 4-SID universe on a
+  # 4 GiB host; 32 GiB has room for far more, and §7 Rule 2 budgets QuestDB at
+  # 8–16 GB — but raising it is a tuning decision with its own measurement,
+  # NOT a free rider on an instance flip. Left at 1g so this workflow changes
+  # exactly one thing.
   FROM_TYPE: t4g.medium
-  TO_TYPE: t4g.large
+  TO_TYPE: r8g.xlarge
   QDB_MEM: 1g
 
 jobs:
