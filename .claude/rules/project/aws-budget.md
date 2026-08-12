@@ -9,7 +9,22 @@ paths:
   - "crates/trading/src/strategy/**"
 ---
 
-# AWS Budget Enforcement — t4g.medium LOCKED ~₹1,022/mo
+# AWS Budget Enforcement — r8g.xlarge LOCKED ~₹5,824–7,382/mo
+
+> **⚠ TITLE CORRECTED 2026-08-12 (operator Quote 15 — "this is our finalsied
+> instancue dude okay? just sue this evrywhere neitlrey").** This H1 read
+> **"t4g.medium LOCKED ~₹1,022/mo"** until now — a figure from 2026-05-18, two
+> instance locks and a 6× cost change out of date, sitting at the very top of
+> the file whose entire job is to state the bill. Every dated banner below
+> already carried the correct supersession chain, so a careful reader was
+> served; a quick one read the title and got a number roughly **one sixth** of
+> the real one. The live lock is **r8g.xlarge** (Quote 13, 2026-08-08 — the
+> 13-timeframe + current-day tick-retention sizing), the bill is
+> **~₹5,824–7,382/mo incl GST** at ~210 hrs, and the Quote 9 sub-₹1,000 target
+> is **knowingly breached ~6×** with the downward ratchet ladder PAUSED. The
+> ₹1,022 figure below is retained as 2026-05-18 historical audit — it describes
+> a different instance, a different universe, and a different stack, and must
+> never be quoted as current.
 
 > **⚠ SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** instance upgraded t4g.medium → t4g.large (8 GiB), bill ~₹1,022/mo → ~₹1,514/mo, cron 08:00 → 08:30 IST. Contents below retained as 2026-05-18 historical audit; current effective contract lives in the superseding file.
 >
