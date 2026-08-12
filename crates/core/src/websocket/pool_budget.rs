@@ -589,7 +589,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// The whole point of this helper is that callers never do the
     /// multiplication themselves. If it ever disagrees with its own two
     /// inputs, a caller sizing a subscription set against it would build a

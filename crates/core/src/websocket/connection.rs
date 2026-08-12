@@ -289,6 +289,60 @@ where
 /// against Dhan's own vendor SDK on 2026-04-23 after `/twohundreddepth`
 /// produced two solid weeks of `ResetWithoutClosingHandshake`; that constant's
 /// doc comment carries the full history.
+/// Whether a base URL carries a path component after its authority.
+///
+/// # The incident this exists for (prod, 2026-08-12)
+///
+/// The revived main feed failed EVERY dial attempt for a whole session with
+/// `WS-GAP-03 … "HTTP error: 400 Bad Request"`, retrying every 30s from
+/// 09:29 IST. The daily cross-verification then reported `compared: 0,
+/// missing_live: 373` — the live lane produced zero candles all day, while
+/// the REST record had all 373 minutes.
+///
+/// The cause was one missing character. `build_feed_url` appended `?` directly
+/// to `wss://api-feed.dhan.co`, and tungstenite writes its request line as
+/// `GET {path_and_query} HTTP/1.1`
+/// (`tungstenite-0.29 handshake/client.rs:114-117`). For a URL with no path,
+/// `Uri::path_and_query()` returns `"?version=2&…"` — with **no leading
+/// slash** — so the bytes on the wire were:
+///
+/// ```text
+/// GET ?version=2&token=…&clientId=…&authType=2 HTTP/1.1
+/// ```
+///
+/// RFC 9112 §3.2.1 requires an origin-form request-target to begin with `/`.
+/// Dhan's edge rejected it with 400 before the WebSocket upgrade was ever
+/// considered — so this was never a credential, entitlement, or subscription
+/// problem, which is exactly why it survived a session of investigation
+/// pointed at the token.
+///
+/// # Why the other three endpoints were unaffected
+///
+/// depth-20's base already ends in `/twentydepth`, and depth-200 was given a
+/// literal `/?` by a special case in the builder. The main feed was the ONLY
+/// endpoint reaching the wire without a path — which is precisely the set that
+/// failed. The special case is now gone: the rule is derived from the URL
+/// rather than hardcoded per endpoint, so a future change to any base-URL
+/// constant is covered automatically instead of needing someone to remember
+/// this.
+///
+/// # What "has a path" means here
+///
+/// True when a `/` appears after the `://` authority. Deliberately conservative
+/// about inputs it does not recognise: a string with no `://` is reported as
+/// HAVING a path, so no slash is inserted into something that is not a URL.
+#[must_use]
+pub fn url_has_path(base_url: &str) -> bool {
+    match base_url.find("://") {
+        // `+ 3` skips the `://` itself so the scheme's own slashes cannot be
+        // mistaken for a path.
+        Some(scheme_end) => base_url[scheme_end.saturating_add(3)..].contains('/'),
+        // Not a URL shape we understand — say "has a path" so the caller
+        // leaves it alone rather than corrupting it.
+        None => true,
+    }
+}
+
 #[must_use]
 pub fn build_feed_url(
     endpoint: DhanEndpointType,
@@ -299,11 +353,13 @@ pub fn build_feed_url(
     let trimmed = base_url.trim_end_matches('/');
     let mut url = String::with_capacity(trimmed.len() + token.len() + client_id.len() + 64);
     url.push_str(trimmed);
-    match endpoint {
-        // The 200-level socket connects on the ROOT path: `wss://host/?token=`.
-        DhanEndpointType::Depth200 => url.push_str("/?"),
-        _ => url.push('?'),
+    // A URL whose authority is followed directly by `?` produces an HTTP
+    // request-target with NO leading slash, and that is malformed — see
+    // `url_has_path` for the full incident.
+    if !url_has_path(trimmed) {
+        url.push('/');
     }
+    url.push('?');
     if endpoint == DhanEndpointType::MainFeed {
         url.push_str("version=2&");
     }
@@ -974,6 +1030,64 @@ mod tests {
     };
     use tickvault_common::types::{ExchangeSegment, SecurityId};
 
+    /// EVERY endpoint's URL must yield a request-target starting with `/`.
+    ///
+    /// This is the regression pin for the 2026-08-12 all-day main-feed outage:
+    /// twelve `400 Bad Request` dials and a cross-verify reporting
+    /// `compared: 0, missing_live: 373`, all caused by one missing slash.
+    ///
+    /// It asserts on `path_and_query()` rather than on the URL string because
+    /// that is the value tungstenite actually writes into the request line
+    /// (`GET {path_and_query} HTTP/1.1`, `handshake/client.rs:114-117`). A test
+    /// that only checked our own formatting would have passed throughout the
+    /// outage — the URL string looked exactly like the vendor doc's example.
+    #[test]
+    fn test_every_endpoint_request_target_starts_with_a_slash() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        for (endpoint, base) in [
+            (DhanEndpointType::MainFeed, DHAN_MAIN_FEED_WS_BASE_URL),
+            (DhanEndpointType::Depth20, DHAN_TWENTY_DEPTH_WS_BASE_URL),
+            (
+                DhanEndpointType::Depth200,
+                DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
+            ),
+        ] {
+            let url = build_feed_url(endpoint, base, FAKE_TOKEN, FAKE_CLIENT_ID);
+            let request = url
+                .as_str()
+                .into_client_request()
+                .expect("the built URL must parse as a client request");
+            let target = request
+                .uri()
+                .path_and_query()
+                .expect("a websocket URL always has a query here")
+                .as_str();
+            assert!(
+                target.starts_with('/'),
+                "{endpoint:?} produces request line `GET {target} HTTP/1.1` — an \
+                 origin-form request-target must begin with '/' (RFC 9112 3.2.1). \
+                 Dhan answers 400 and the socket never opens."
+            );
+        }
+    }
+
+    /// The slash is inserted from the URL's SHAPE, not from a per-endpoint
+    /// special case — so a future base-URL constant change is covered without
+    /// anyone remembering the incident.
+    #[test]
+    fn test_url_has_path_drives_the_slash_rather_than_the_endpoint_kind() {
+        assert!(!url_has_path("wss://api-feed.dhan.co"));
+        assert!(!url_has_path("wss://full-depth-api.dhan.co"));
+        assert!(url_has_path("wss://depth-api-feed.dhan.co/twentydepth"));
+        assert!(url_has_path("wss://host.example/"));
+        // A scheme's own `//` must never be mistaken for a path.
+        assert!(!url_has_path("ws://h"));
+        // Unrecognised shapes are left ALONE rather than "fixed" into
+        // something else.
+        assert!(url_has_path("not-a-url"));
+    }
+
     #[test]
     fn test_build_feed_url_shape_per_endpoint() {
         // Dhan's own reference requires all four query parameters on the main
@@ -986,7 +1100,10 @@ mod tests {
             FAKE_TOKEN,
             FAKE_CLIENT_ID,
         );
-        assert!(main.starts_with("wss://api-feed.dhan.co?version=2&token="));
+        // NOTE the `/` before `?`. Without it tungstenite writes a request
+        // line of `GET ?version=2… HTTP/1.1`, which Dhan answers with 400 —
+        // the 2026-08-12 all-day outage. See `url_has_path`.
+        assert!(main.starts_with("wss://api-feed.dhan.co/?version=2&token="));
         assert!(main.contains("&clientId="));
         assert!(main.ends_with("&authType=2"));
 
@@ -1270,7 +1387,7 @@ mod tests {
             FAKE_TOKEN,
             FAKE_CLIENT_ID,
         );
-        assert!(url.starts_with("wss://api-feed.dhan.co?"));
+        assert!(url.starts_with("wss://api-feed.dhan.co/?"));
         assert!(url.contains("version=2"));
         assert!(url.contains(&format!("token={FAKE_TOKEN}")));
         assert!(url.contains(&format!("clientId={FAKE_CLIENT_ID}")));
