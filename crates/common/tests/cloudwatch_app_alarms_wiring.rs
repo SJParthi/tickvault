@@ -484,14 +484,20 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        48,
-        "Z+ L2 VERIFY ratchet: expected exactly 48 names in the MAIN EMF \
+        52,
+        "Z+ L2 VERIFY ratchet: expected exactly 52 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
-         loss counters added 2026-08-11 when the lane was switched on); found {}: {names:?}. \
-         Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose budget \
-         actions STOP the prod box at 90% — update this count deliberately, with a \
-         dated cost note, never as a drive-by.",
+         loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
+         PERSIST-side loss counters added 2026-08-12 — tv_ticks_dropped_total, \
+         tv_tick_persist_errors_total, tv_tick_rows_refused_total, \
+         tv_ws_frame_spill_write_errors_total. The 2026-08-11 addition instrumented \
+         the lane at the SOCKET and left it blind at the DATABASE; the spill-write \
+         counter had been excluded on the stated grounds that 'no WS frame producer \
+         exists', which stopped being true the day the lane was revived); found {}: \
+         {names:?}. Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose \
+         budget actions STOP the prod box at 90% — update this count deliberately, \
+         with a dated cost note, never as a drive-by.",
         names.len()
     );
     for required in [
