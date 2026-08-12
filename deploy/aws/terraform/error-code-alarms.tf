@@ -466,6 +466,42 @@ locals {
     # silent-data-loss class that earned aggregator-drop-01 its alarm on
     # 2026-07-09 (that one is the sealed-candle side; this is the raw-frame
     # side). ok_recovery = false: permanent loss.
+    # WS-SPILL-01: the WAL spill WRITER hit an I/O error - it could not open
+    # a segment, or a write_record failed (Severity High). 2026-08-12: added
+    # after noticing WS-SPILL-02 was alarmed and its SIBLING was not, which
+    # left the more common disk failure mode unpaged.
+    #
+    # Why this matters as much as -02: `WsFrameSpill::append` returns
+    # `Spilled` the instant a record enters the crossbeam channel, and the
+    # disk write happens LATER on the writer thread. So when the disk is
+    # full or the WAL dir is unwritable, every caller keeps being told the
+    # frame was durably captured while `persist_record_resilient` quietly
+    # returns 0 and moves on (deliberately - it must not kill the writer
+    # thread). The capture-at-receipt durable floor is GONE and nothing
+    # upstream can tell. This alarm is the only thing that says so.
+    #
+    # Distinct from -02 by cause, not by severity of consequence: -02 is
+    # "the channel was full at the append instant" (frame never entered the
+    # WAL); -01 is "the frame entered the WAL and the disk refused it".
+    # Both end with the raw frame absent from the durable chain.
+    #
+    # eval = 3 x 300s deliberately matches -02: a single transient I/O blip
+    # self-heals on the next record (the writer reopens the segment), and
+    # this file's own convention is that a real failure sustains. A flapping
+    # writer is the documented "disk dying" signal.
+    #
+    # ok_recovery = false: while the writer is down, the frames that arrived
+    # are not written anywhere retroactively. The disk recovering does not
+    # bring them back, so an OK page would read as "we got the data back".
+    "ws-spill-01" = {
+      pattern     = "{ $.code = \"WS-SPILL-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-08-12: the frames that arrived while the writer was down were never written - a recovering disk does not restore them (Rule-11 false-recovery; ws-spill-02 precedent)
+      desc        = "WS-SPILL-01: the capture-at-receipt WAL writer hit a disk I/O error and could not persist frames (could not open a segment, or a record write failed). The writer thread deliberately stays alive and retries, so the app looks healthy and append() still reports frames as spilled - but the durable floor is NOT holding while this fires. Triage: df -h on the data volume FIRST (disk full is the usual cause), then ls -la data/spill/ for permissions/mount, then dmesg for device errors. Read the stage field in errors-jsonl to tell open_segment / no_segment / write_record apart. NO recovered/OK page: frames that arrived during the outage were never written and do not come back. Runbook: docs/error-runbooks/ws-frame-spill-error-codes.md"
+    }
     "ws-spill-02" = {
       pattern     = "{ $.code = \"WS-SPILL-02\" && $.level = \"ERROR\" }"
       period      = 300

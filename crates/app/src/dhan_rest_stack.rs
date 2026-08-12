@@ -201,6 +201,13 @@ pub struct DhanRestStackParams {
     /// legs take at each mark forward; 2026-07-17 truth-sync — the
     /// live-bridge per-tick load died with #1581).
     pub marks_wanted: Arc<AtomicBool>,
+    /// Shared mark-DROP counter (2026-08-12). The forwarder's drop arm is
+    /// DHAT-budgeted (≤1 KiB / ≤8 blocks over 10,000 calls) and cannot
+    /// afford a log line of its own, so it only increments this; the
+    /// runtime's reconcile heartbeat reads it and reports the delta. Before
+    /// this the drop was counted into a Prometheus counter nothing on this
+    /// box scrapes and printed nowhere — a silent tick-of-P&L loss.
+    pub marks_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// Shared /health state (PR-C2, 2026-07-13): the stack owns the token
     /// block writer (`token_remaining_secs` + `token_valid`) — the lane's
     /// `spawn_token_health_writer` died with the lane, and without a writer
@@ -947,6 +954,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 first_order_update_rx,
                 mark_rx,
                 marks_wanted: Arc::clone(&params.marks_wanted),
+                marks_dropped: Arc::clone(&params.marks_dropped),
                 token_handle: Arc::clone(&token_handle),
                 client_id: client_id.clone(),
                 auth_notify: auth_signal,
