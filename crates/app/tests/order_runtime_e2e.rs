@@ -31,7 +31,7 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tickvault_app::order_runtime::{MarkUpdate, OrderRuntimeParams, spawn_order_runtime};
@@ -109,6 +109,7 @@ async fn order_runtime_e2e_orphan_updates_and_mark_drain() {
         first_order_update_rx: first_rx,
         mark_rx,
         marks_wanted: Arc::clone(&marks_wanted),
+        marks_dropped: Arc::new(AtomicU64::new(0)),
         token_handle,
         client_id: "1106656882".to_string(),
         auth_notify,
@@ -207,6 +208,7 @@ async fn order_runtime_e2e_mark_channel_close_does_not_exit_the_loop() {
         first_order_update_rx: first_rx,
         mark_rx,
         marks_wanted: Arc::clone(&marks_wanted),
+        marks_dropped: Arc::new(AtomicU64::new(0)),
         token_handle,
         client_id: "1106656882".to_string(),
         auth_notify,
