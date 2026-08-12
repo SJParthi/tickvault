@@ -858,6 +858,28 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     health_for_audit.set_order_update_connected(connected);
                     if persist_tx.try_send(row).is_err() {
                         metrics::counter!("tv_order_update_ws_audit_dropped_total").increment(1);
+                        // Counted AND said out loud. Until 2026-08-12 this arm
+                        // incremented a counter that was in no EMF selector and
+                        // had no log, so a dropped WebSocket-lifecycle audit row
+                        // left no trace anywhere: the health verdict above still
+                        // flipped, the socket carried on, and the forensic record
+                        // of the transition simply did not exist. AUDIT-WS-01
+                        // rows are the reconstruction trail for a disconnect, so
+                        // losing one silently is the exact false-OK this repo
+                        // bans.
+                        //
+                        // `warn!`, not `error!`: the health verdict is set BEFORE
+                        // this line and does not depend on the write, so the
+                        // operator-facing state stays correct — what is lost is
+                        // forensic depth, not liveness. Paper-mode order-update
+                        // capture today; this becomes materially more serious
+                        // when live order events flow through it.
+                        warn!(
+                            "order-update audit row DROPPED — the persist channel \
+                             was full. The WebSocket health verdict is unaffected, \
+                             but this lifecycle transition will be missing from \
+                             ws_event_audit and cannot be reconstructed later."
+                        );
                     }
                 }
             });

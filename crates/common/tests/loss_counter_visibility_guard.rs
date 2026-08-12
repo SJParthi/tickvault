@@ -109,23 +109,23 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     //                  from examining it.
     (
         "tv_aggregator_tick_refused_total",
-        "untriaged (seeded 2026-08-12) — LIVE PATH, triage first",
+        "periodic report — the refusal arm is per-tick and cannot log (flood risk under a bad-data burst); the lane counts it and the 30s drain timer reports the delta with a coded error! (wired 2026-08-12)",
     ),
     (
         "tv_chain1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_cross_fill_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_dhan_feed_ingest_refused_total",
-        "untriaged (seeded 2026-08-12) — LIVE PATH, triage first",
+        "periodic report — same per-tick flood constraint; counted into LiveIngest::refusals and reported as a 30s delta by run_frame_drain (wired 2026-08-12)",
     ),
     (
         "tv_dhan_feed_ingest_seq_refused_total",
-        "untriaged (seeded 2026-08-12) — LIVE PATH, triage first",
+        "logged — the emit is counters().ingest_seq_refused, three levels of indirection from the literal (const -> struct field -> method), and the error! sits directly beside it; the scanner cannot follow that chain (verified 2026-08-12)",
     ),
     (
         "tv_dhan_feed_seals_dropped",
@@ -133,19 +133,19 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_dhan_live_xverify_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_dhan_ws_dial_failed_total",
-        "untriaged (seeded 2026-08-12)",
+        "logged — the counter is behind count_dial_failure(); every call site (no_token, tls_config, bad_url, timeout) carries its own error! or warn! (all arms verified 2026-08-12)",
     ),
     (
         "tv_groww_chain1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_groww_contract1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_groww_push_sink_dropped_total",
@@ -153,35 +153,23 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_groww_spot1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_mark_forward_dropped_total",
         "heartbeat — reported by the order-runtime reconcile heartbeat, not at the emit site (the DHAT budget there forbids a log line)",
     ),
     (
-        "tv_oom_monitor_probe_failed_total",
-        "untriaged (seeded 2026-08-12)",
-    ),
-    (
         "tv_order_leg_pnl_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
-    ),
-    (
-        "tv_order_update_ws_audit_dropped_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_partition_dropped_total",
-        "untriaged (seeded 2026-08-12)",
+        "NOT A LOSS COUNTER — my own 2026-08-12 label of VERIFIED SILENT was WRONG. It fires on the Ok(()) arm of a SUCCESSFUL retention drop and is immediately followed by append_audit(ArchiveOutcome::Dropped), which writes a QuestDB audit row — a stronger operator surface than a log. The name matches the loss classifier only because dropped sits in the tail, the same false positive as tv_errors_summary_refresh_total.",
     ),
     (
         "tv_pnl_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
-    ),
-    (
-        "tv_resource_monitor_probe_failed_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_seal_spill_write_errors_total",
@@ -189,15 +177,15 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_spot1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_spot_xverify_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
         "tv_tf_verify_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
 ];
 
@@ -317,6 +305,30 @@ fn const_aliases(lines: &[&str], cutoff: usize) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in lines.iter().take(cutoff) {
         let t = line.trim_start();
+
+        // Local counter HANDLES: `let m_probe_failed = metrics::counter!("tv_x");`
+        // then `m_probe_failed.increment(1)` somewhere else in the loop.
+        //
+        // This is the second indirection shape in the workspace and it hides
+        // counters exactly as thoroughly as the const one: the literal appears
+        // once at handle creation, and every real emit is a method call on the
+        // binding. `resource_monitor` logs at ALL THREE of its probe-failure
+        // arms and still looked unreachable, because the name is 40+ lines
+        // above them at the `let`.
+        if !t.starts_with("//") && t.starts_with("let ") && t.contains("counter!(") {
+            if let Some(ident) = t
+                .strip_prefix("let ")
+                .and_then(|r| r.split('=').next())
+                .map(|s| s.trim().trim_start_matches("mut ").trim())
+            {
+                for name in tv_names_in(line) {
+                    if is_loss_shaped(&name) && !ident.is_empty() {
+                        out.push((ident.to_string(), name));
+                    }
+                }
+            }
+        }
+
         if t.starts_with("//") || !t.contains("const ") || !t.contains(": &str") {
             continue;
         }

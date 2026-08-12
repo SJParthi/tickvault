@@ -515,6 +515,22 @@ pub struct LiveIngest {
     aggregator: MultiTfAggregator,
     writer: TickWriter,
     seq_refused: u64,
+    /// Ticks the AGGREGATOR refused, cumulative, by reason.
+    ///
+    /// These exist because the refusal arm below cannot log. It sits on the
+    /// per-tick path, and the honest options there are a log line that floods
+    /// under a bad-data burst, or nothing. Both are bad. So the arm stays
+    /// silent and cheap, the counts accumulate here, and the 30s drain timer
+    /// reports the DELTA — the same shape the mark-forward drop uses, for the
+    /// same reason.
+    ///
+    /// Before this, `tv_dhan_feed_ingest_refused_total` incremented and
+    /// reached nobody: not the EMF allowlist, not a log. A tick refused for a
+    /// bad price or an exhausted slot vanished, and the lane reported healthy.
+    refused_price: u64,
+    refused_timestamp: u64,
+    refused_slot: u64,
+    refused_out_of_session: u64,
     seals_emitted: u64,
     seals_dropped: u64,
     /// Rows appended to the ILP buffer since the last flush. The buffer is a
@@ -533,10 +549,31 @@ impl LiveIngest {
             aggregator: MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity),
             writer,
             seq_refused: 0,
+            refused_price: 0,
+            refused_timestamp: 0,
+            refused_slot: 0,
+            refused_out_of_session: 0,
             seals_emitted: 0,
             seals_dropped: 0,
             pending_rows: 0,
         }
+    }
+
+    /// Cumulative aggregator refusals by reason: (price, timestamp, slot,
+    /// out-of-session).
+    ///
+    /// `out_of_session` is returned but is NOT a defect: ticks arriving
+    /// outside the fold window are refused by design. It is reported
+    /// separately from the other three precisely so a caller cannot lump a
+    /// normal pre-open tick in with a bad price and page on it.
+    #[must_use]
+    pub const fn refusals(&self) -> (u64, u64, u64, u64) {
+        (
+            self.refused_price,
+            self.refused_timestamp,
+            self.refused_slot,
+            self.refused_out_of_session,
+        )
     }
 
     /// Flushes the ILP buffer to QuestDB. Call on a size OR time trigger —
@@ -734,14 +771,23 @@ impl LiveIngest {
             || stats.refused_timestamp
         {
             let reason = if stats.refused_price {
+                self.refused_price = self.refused_price.saturating_add(1);
                 "price"
             } else if stats.refused_timestamp {
+                self.refused_timestamp = self.refused_timestamp.saturating_add(1);
                 "timestamp"
             } else if stats.slot_exhausted {
+                self.refused_slot = self.refused_slot.saturating_add(1);
                 "slot_exhausted"
             } else {
+                self.refused_out_of_session = self.refused_out_of_session.saturating_add(1);
                 "out_of_session"
             };
+            // No log here, deliberately: this is the per-tick path, and a bad
+            // upstream burst would turn a log line into a flood that buries
+            // the signal it was meant to raise. The counts above are reported
+            // as a delta by the 30s drain timer instead — visible, bounded,
+            // and impossible to flood.
             counters().refused(reason).increment(1);
             return IngestOutcome::AggregatorRefused;
         }
@@ -1349,6 +1395,10 @@ async fn run_frame_drain(
     // once, the falling edge logs recovery at info and re-arms.
     let mut silent_scans: u32 = 0;
     let mut silence_reported = false;
+    // Last reported aggregator-refusal totals, so the 30s arm can report a
+    // DELTA rather than a cumulative that looks alarming forever after one
+    // bad minute.
+    let mut last_refusals: (u64, u64, u64, u64) = (0, 0, 0, 0);
 
     loop {
         tokio::select! {
@@ -1446,6 +1496,36 @@ async fn run_frame_drain(
                 let now_millis = u64::try_from(
                     chrono::Utc::now().timestamp_millis().max(0)
                 ).unwrap_or(0);
+
+                // Aggregator-refusal read-out. The refusal arm itself cannot
+                // log (per-tick path, flood risk), so this is where those
+                // counts become visible. Reported BEFORE the silence gate's
+                // market-hours `continue` below, because a refusal is a
+                // defect at any hour — unlike silence, which is normal after
+                // the close.
+                let now = ingest.refusals();
+                let d_price = now.0.saturating_sub(last_refusals.0);
+                let d_ts = now.1.saturating_sub(last_refusals.1);
+                let d_slot = now.2.saturating_sub(last_refusals.2);
+                // `out_of_session` (now.3) is deliberately NOT reported: it is
+                // the designed refusal for a tick outside the fold window, and
+                // folding it in here would page for normal pre-open traffic —
+                // exactly the false-alarm class the silence gate was fixed for.
+                if d_price > 0 || d_ts > 0 || d_slot > 0 {
+                    error!(
+                        code = ErrorCode::AggregatorDrop01.code_str(),
+                        refused_price = d_price,
+                        refused_timestamp = d_ts,
+                        refused_slot_exhausted = d_slot,
+                        "Dhan live feed: the aggregator refused ticks in the last 30s. \
+                         These ticks were NOT folded into any candle and NOT written. \
+                         A price or timestamp refusal means the upstream packet failed \
+                         a sanity check; a slot refusal means the instrument capacity \
+                         is exhausted and NEW instruments are being turned away."
+                    );
+                    last_refusals = now;
+                }
+
                 let (silent, never) = ingest.scan_silence(now_millis);
                 // Gauges publish unconditionally — a dashboard reading zero
                 // outside market hours is correct, and gating the gauge would
@@ -2981,6 +3061,47 @@ mod tests {
             ingest.tracked_instruments(),
             3,
             "security_id alone is not unique — (id, segment) is"
+        );
+    }
+
+    /// A refused tick must be COUNTED, because the refusal arm cannot log.
+    ///
+    /// The arm sits on the per-tick path where a log line would flood under a
+    /// bad-data burst, so it stays silent and the 30s drain timer reports the
+    /// delta instead. That only works if the count is actually kept — before
+    /// this, `tv_dhan_feed_ingest_refused_total` incremented and reached
+    /// nobody, and a tick refused for a bad price simply vanished while the
+    /// lane reported healthy.
+    #[test]
+    fn test_aggregator_refusal_is_counted_for_the_periodic_report() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(
+            ingest.refusals(),
+            (0, 0, 0, 0),
+            "a fresh fold has refused nothing"
+        );
+
+        // NaN LTP: refused by the aggregator's price sanity check.
+        let packet = ticker_packet(13, f32::NAN, 1_779_355_000);
+        let parsed = dispatch_frame(&packet, 1_779_355_000_000_000_000)
+            .expect("a well-formed ticker packet must parse even with a NaN price");
+        let ParsedFrame::Tick(tick) = parsed else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+
+        let outcome = ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
+        assert!(
+            matches!(outcome, IngestOutcome::AggregatorRefused),
+            "a NaN price must be refused, got {outcome:?}"
+        );
+
+        let (price, ts, slot, oos) = ingest.refusals();
+        assert_eq!(price, 1, "the price refusal must be counted for the report");
+        assert_eq!((ts, slot), (0, 0), "only the price counter moves");
+        assert_eq!(
+            oos, 0,
+            "an in-session tick must not be booked as out-of-session — that \
+             bucket is deliberately excluded from the page"
         );
     }
 
