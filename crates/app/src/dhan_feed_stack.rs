@@ -559,13 +559,32 @@ impl LiveIngest {
             }
             Err(err) => {
                 counters().flush_failed.increment(1);
+                // 2026-08-12 — the second sentence of this message used to
+                // read "The raw frames remain in the write-ahead log and are
+                // recoverable by replay." That was wrong in a way that
+                // mattered: an operator reading it would treat a flush
+                // failure as deferred rather than as loss.
+                //
+                // Replay does not recover these. It runs at BOOT only, and
+                // when it runs, `main.rs` STAGE-C.2b logs the replayed
+                // live-feed frames and DROPS them — there is no re-fold path
+                // (the fold takes a live ring, not a replay batch). So the
+                // frames are preserved on disk as bytes and recoverable only
+                // by hand; nothing automatic puts these rows in QuestDB.
+                //
+                // Kept aligned with the STAGE-C.2b wording deliberately: the
+                // two messages describe the same loss from the two ends of
+                // it, and they must not tell the operator different stories.
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     %err,
                     rows = covered,
                     "live tick flush to QuestDB FAILED — the buffered rows were discarded by \
-                     the writer contract and are a counted loss. The raw frames remain in the \
-                     write-ahead log and are recoverable by replay."
+                     the writer contract and are a counted loss: these ticks are NOT in the \
+                     database and nothing re-inserts them. The raw frames are preserved in the \
+                     write-ahead log and can be recovered manually, but boot replay DROPS \
+                     live-feed frames (there is no re-fold path), so do not wait for a restart \
+                     to fix this."
                 );
                 0
             }

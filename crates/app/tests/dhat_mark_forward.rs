@@ -40,7 +40,7 @@
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tickvault_app::order_runtime::MarkForwarder;
 
@@ -60,6 +60,7 @@ fn dhat_mark_forward_hot_arms_zero_allocation() {
     let disarmed = MarkForwarder {
         marks_wanted: Arc::new(AtomicBool::new(false)),
         tx: disarmed_tx,
+        dropped: Arc::new(AtomicU64::new(0)),
     };
     // Warm once (nothing lazy on this arm, but keep the house shape).
     disarmed.mark_forward(13, 0, 25_000.0);
@@ -72,6 +73,10 @@ fn dhat_mark_forward_hot_arms_zero_allocation() {
     let armed = MarkForwarder {
         marks_wanted: Arc::new(AtomicBool::new(true)),
         tx: armed_tx,
+        // 2026-08-12: the drop arm's ONLY report channel. It is a plain
+        // `Relaxed` fetch_add precisely so this budget still holds — the
+        // heartbeat, not the tap, does the logging.
+        dropped: Arc::new(AtomicU64::new(0)),
     };
     for i in 0..5_u32 {
         armed.mark_forward(u64::from(i), 0, 1.0);
@@ -117,6 +122,27 @@ fn dhat_mark_forward_hot_arms_zero_allocation() {
         "mark_forward ARMED+FULL drop arm allocated {b_bytes} bytes / {b_blocks} \
          blocks over 10,000 calls (budget {BUDGET_BYTES} B / {BUDGET_BLOCKS} blocks) \
          — the backpressure drop must stay alloc-free (counter key is static)"
+    );
+
+    // The drop arm must have COUNTED every one of those drops — 5 warm-up +
+    // 10,000 measured. Before 2026-08-12 the drop incremented only a
+    // Prometheus counter that nothing on the prod box scrapes and printed
+    // nothing, so a full mark channel lost marks silently; the shared atomic
+    // is what makes the reconcile heartbeat able to report them.
+    // Lower bound, not equality: the channel absorbs its first 4 warm-up
+    // sends before filling, and `measure_with_phantom_retry` may replay the
+    // measured closure. Both make an exact total brittle; "at least every
+    // measured call counted a drop" is the invariant that matters.
+    let armed_drops = armed.dropped.load(Ordering::Relaxed);
+    assert!(
+        armed_drops >= 10_000,
+        "every ARMED+FULL mark_forward must increment the shared drop counter \
+         (saw {armed_drops} for ≥10,000 full-channel calls)"
+    );
+    assert_eq!(
+        disarmed.dropped.load(Ordering::Relaxed),
+        0,
+        "the DISARMED arm returns before the channel and must never count a drop"
     );
 
     drop(armed_rx);
