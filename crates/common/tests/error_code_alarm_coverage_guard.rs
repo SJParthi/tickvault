@@ -281,7 +281,10 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "TICK-FLUSH-01",
     "VOLUME-MONO-01",
     "WS-GAP-10",
-    "WS-SPILL-01",
+    // WS-SPILL-01 left this list on 2026-08-12 — it is now ALARMED
+    // (`deploy/aws/terraform/error-code-alarms.tf`, entry "ws-spill-01").
+    // Its sibling WS-SPILL-02 had been alarmed since 2026-08-11 while the
+    // disk-failure half — the more common one — stayed log-sink-only.
 ];
 
 #[test]

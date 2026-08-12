@@ -531,27 +531,39 @@ async fn main() -> Result<()> {
     // config-dead unless a legacy leg is re-enabled): marks are the
     // OWN-FIRE just-closed 1m candle closes, forwarded at the executor's
     // persist-confirm choke point.
-    let (order_runtime_mark_forwarder, order_runtime_mark_rx_slot, order_runtime_marks_wanted) =
-        if config.order_runtime.enabled {
-            let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
-                tickvault_app::order_runtime::MarkUpdate,
-            >(config.order_runtime.mark_channel_capacity);
-            let marks_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            (
-                Some(tickvault_app::order_runtime::MarkForwarder {
-                    marks_wanted: std::sync::Arc::clone(&marks_wanted),
-                    tx: mark_tx,
-                }),
-                std::sync::Arc::new(std::sync::Mutex::new(Some(mark_rx))),
-                marks_wanted,
-            )
-        } else {
-            (
-                None,
-                std::sync::Arc::new(std::sync::Mutex::new(None)),
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )
-        };
+    let (
+        order_runtime_mark_forwarder,
+        order_runtime_mark_rx_slot,
+        order_runtime_marks_wanted,
+        order_runtime_marks_dropped,
+    ) = if config.order_runtime.enabled {
+        let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
+            tickvault_app::order_runtime::MarkUpdate,
+        >(config.order_runtime.mark_channel_capacity);
+        let marks_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Shared with the runtime so the reconcile heartbeat can report
+        // drops. The tap increments; the heartbeat reads and reports the
+        // delta. Split that way because the tap is DHAT-budgeted and cannot
+        // afford the log line itself.
+        let marks_dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        (
+            Some(tickvault_app::order_runtime::MarkForwarder {
+                marks_wanted: std::sync::Arc::clone(&marks_wanted),
+                tx: mark_tx,
+                dropped: std::sync::Arc::clone(&marks_dropped),
+            }),
+            std::sync::Arc::new(std::sync::Mutex::new(Some(mark_rx))),
+            marks_wanted,
+            marks_dropped,
+        )
+    } else {
+        (
+            None,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    };
     // ── per-instrument presence registry — RETIRED 2026-07-18 (stage-4
     // dead-producer sweep): the registry
     // (crates/core/src/pipeline/feed_presence.rs) was deleted — its
@@ -1920,6 +1932,7 @@ async fn main() -> Result<()> {
             // with the lane).
             mark_rx_slot: std::sync::Arc::clone(&order_runtime_mark_rx_slot),
             marks_wanted: std::sync::Arc::clone(&order_runtime_marks_wanted),
+            marks_dropped: std::sync::Arc::clone(&order_runtime_marks_dropped),
             // ORDER-EVT-01 (2026-07-18): the full-fidelity capture sender the
             // Phase 5a paper consumer publishes each Dhan order push into.
             // None = the [order_update_events] capture lane is disabled.
@@ -2562,6 +2575,27 @@ async fn build_shared_infra(
     // the module's 60s quiet-probe; a down QuestDB skips the DDL loudly.
     // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
     tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
+
+    // --- `ticks` DDL — the SAME reasoning, and it had NO caller at all ---
+    //
+    // `ensure_ticks_table` issues CREATE TABLE plus the five-key
+    // `DEDUP ENABLE UPSERT KEYS(ts, security_id, segment, capture_seq, feed)`.
+    // It had ZERO production call sites repo-wide — every reference was its
+    // own doc comments and its own tests — while the live lane above writes
+    // `ticks` on every fold.
+    //
+    // So on a fresh QuestDB volume, ILP auto-created `ticks` WITHOUT DEDUP.
+    // That is silent in the worst way: rows land, counts look right, nothing
+    // errors — and the intra-second tiebreaker that makes WAL replay
+    // idempotent simply is not enforced, so a replay or a reconnect
+    // re-send duplicates rows instead of collapsing onto them. The candle
+    // tables were protected against exactly this class three weeks ago; the
+    // tick table was left out of that fix.
+    //
+    // Awaited INLINE here, beside the candle DDL, for the same ordering
+    // reason: it must complete before the first ILP row can auto-create the
+    // table with the wrong shape.
+    tickvault_storage::tick_persistence::ensure_ticks_table(&config.questdb).await;
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);

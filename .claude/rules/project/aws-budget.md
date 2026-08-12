@@ -307,6 +307,40 @@ requires the full §7 dated-quote protocol in
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
 
+## COST NOTE 2026-08-12 — PERSIST-side loss counters reach CloudWatch (+~$1.20/mo)
+
+The 2026-08-11 note below instrumented the revived Dhan live lane at the
+**socket** and left it blind at the **database**. Four counters on the path
+between a received packet and a durable row published nowhere:
+
+| Counter | What a non-zero value means |
+|---|---|
+| `tv_ticks_dropped_total` | buffered rows were DISCARDED on a flush failure — the largest single tick-loss window in the lane |
+| `tv_tick_persist_errors_total` | the ILP client failed to build, connect, or apply DDL |
+| `tv_tick_rows_refused_total` | a row was refused before it reached the buffer |
+| `tv_ws_frame_spill_write_errors_total` | the capture-at-receipt durable floor failed to write |
+
+The last one had been **deliberately excluded** on the recorded grounds that
+"no WS frame producer exists (both live feeds retired 2026-07-13/15)". That
+reason stopped holding on 2026-08-09/11 when the lane was revived, and the
+exclusion silently survived it. It matters more than the others because
+`ws_frame_spill::accept` returns `Spilled` even on a full disk — the writer
+thread drains and discards — so this counter is the ONLY signal that the
+durable floor has stopped holding.
+
+**Cost:** +4 custom metric series ≈ **+$1.20/mo** (48 → 52 EMF-selected names;
+~$14.40 → ~$15.60/mo) against the $100 kill-ceiling whose AUTOMATIC budget
+actions fire `STOP_EC2_INSTANCES` at 90% ($90). Headroom unaffected. Added to
+BOTH allowlist copies in lockstep (`user-data.sh.tftpl` + the reference
+`cloudwatch-agent.json`), count ratchet bumped 48 → 52 with the rationale
+in-place.
+
+**NOT claimed:** that these names now PAGE. The allowlist makes the metric
+exist in CloudWatch; alarms on top of them, and pre-registering each series at
+0 at boot so the first alarm sample is not the outage itself, remain the same
+flagged follow-up the 2026-08-11 note recorded. Stated here rather than left to
+be discovered from a quiet dashboard.
+
 ## COST NOTE 2026-08-11 — Dhan live-lane loss counters reach CloudWatch (+~$2.10/mo)
 
 The Dhan live WebSocket lane was switched ON the same day (operator quote,
@@ -351,6 +385,32 @@ because "no WS frame producer exists since the 2026-07-13/15 live-feed
 retirements". The revived lane IS a WS frame producer, so that stated reason
 no longer holds. Recorded rather than silently added — adding it is its own
 cost decision and would make this note's +7 delta untrue.
+
+## COST NOTE 2026-08-12 — WS-SPILL-01 alarm (+~$0.10/mo)
+
+The 2026-08-11 sweep below was scoped to `Severity::Critical`. WS-SPILL-01 is
+`High`, so it fell outside — and the result was that WS-SPILL-02 (the spill
+channel full at the append instant) got an alarm while WS-SPILL-01 (the disk
+refusing the write) did not. That is the wrong half to leave unpaged: a full
+or unwritable data volume is the more common failure, and
+`WsFrameSpill::append` returns `Spilled` the instant a record enters the
+crossbeam channel, so on a bad disk every caller keeps being told the frame
+was durably captured while `persist_record_resilient` counts the failure and
+returns 0. The capture-at-receipt floor is gone with nothing upstream able to
+tell.
+
+**Cost:** +1 errcode log-filter alarm ≈ **+$0.10/mo** (15 → 16 map entries in
+`error-code-alarms.tf`). The derived metric is sparse and dimensionless —
+billed only in hours the code actually fires — so it is near-free at rest.
+Zero new EMF allowlist names (`tv_ws_frame_spill_write_errors_total` was
+already added earlier the same day), zero dashboards, zero Lambdas. Well
+inside the $100 kill ceiling whose 90% line is $90.
+
+**Not claimed:** that this makes the durable floor self-healing. It does not —
+the writer thread deliberately stays alive and retries, and frames that
+arrive while the disk is refusing writes are never written retroactively.
+`ok_recovery = false` for exactly that reason: a recovering disk is not a
+recovered dataset.
 
 ## COST NOTE 2026-08-11 — Critical-severity paging-gap sweep (+~$0.40/mo)
 

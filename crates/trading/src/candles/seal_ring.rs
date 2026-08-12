@@ -67,17 +67,25 @@ use crate::candles::{LiveCandleState, TfIndex};
 /// force-seal burst across all instruments × 21 TFs" — which was
 /// arithmetically FALSE at the configured ceiling:
 /// `force_seal_all` emits `AGGREGATOR_MAX_SLOTS × TF_COUNT`
-/// = 25,000 × 21 = **525,000** seals in one burst, so 200,000 would
-/// have force-evicted 325,000 of them down the spill/DLQ tiers in a
-/// single tokio yield, every midnight, while the header claimed
-/// headroom. Deriving the constant makes that class of drift
-/// impossible: change either input and this follows.
+/// seals in one burst, so 200,000 would have force-evicted the
+/// remainder down the spill/DLQ tiers in a single tokio yield, every
+/// midnight, while the header claimed headroom. Deriving the constant
+/// makes that class of drift impossible: change either input and this
+/// follows.
 ///
-/// Cost at the derived value: 525,000 × ≤144 B ≈ **76 MB** — 0.23% of
-/// the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08). On the
-/// retired 4 GiB t4g.medium the same correctness would have cost ~1.9%
-/// of the entire machine, which is very likely why the literal was left
-/// low; the instance upgrade is what makes the honest value affordable.
+/// **Do not restate the product as a literal in prose.** The original
+/// 2026-08-10 note hardcoded "25,000 × 21 = 525,000 ≈ 76 MB"; `TF_COUNT`
+/// then moved to 24, and the derived constant silently became 600,000
+/// (≈86 MB) while every comment still said 525,000. The number was
+/// re-derived correctly by the compiler and re-stated wrongly by the
+/// docs — which is how the storage-side `SEAL_MPSC_CAPACITY` in front of
+/// this ring was left at 200,000 through the whole 2026-08-10 repair.
+/// Cost scales as `AGGREGATOR_MAX_SLOTS × TF_COUNT × size_of::<BufferedSeal>()`;
+/// at the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08) that is
+/// a fraction of a percent either way. On the retired 4 GiB t4g.medium
+/// the same correctness would have cost ~2% of the entire machine, which
+/// is very likely why the literal was left low; the instance upgrade is
+/// what makes the honest value affordable.
 pub const SEAL_BUFFER_CAPACITY: usize =
     crate::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS * crate::candles::tf_index::TF_COUNT;
 
@@ -148,8 +156,8 @@ impl BufferedSeal {
 // Compile-time size assertion. `BufferedSeal` carries the entire
 // `LiveCandleState` (128 bytes after the 2026-06-05 Option B `close_ts_ist_secs`)
 // + the routing fields (security_id + segment + tf + padding). 144 bytes covers
-// it. Ring RAM = SEAL_BUFFER_CAPACITY (525,000) × 144 ≈ 75.6 MB — 0.23% of the
-// r8g.xlarge 32 GiB host. Was ≈28.8 MB at the old hardcoded 200,000 capacity.
+// it. Ring RAM = SEAL_BUFFER_CAPACITY × this size — see that constant's note on
+// why the product is deliberately NOT restated as a literal here.
 const _: () = assert!(
     std::mem::size_of::<BufferedSeal>() <= 144,
     "BufferedSeal exceeded 144-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."

@@ -559,13 +559,32 @@ impl LiveIngest {
             }
             Err(err) => {
                 counters().flush_failed.increment(1);
+                // 2026-08-12 — the second sentence of this message used to
+                // read "The raw frames remain in the write-ahead log and are
+                // recoverable by replay." That was wrong in a way that
+                // mattered: an operator reading it would treat a flush
+                // failure as deferred rather than as loss.
+                //
+                // Replay does not recover these. It runs at BOOT only, and
+                // when it runs, `main.rs` STAGE-C.2b logs the replayed
+                // live-feed frames and DROPS them — there is no re-fold path
+                // (the fold takes a live ring, not a replay batch). So the
+                // frames are preserved on disk as bytes and recoverable only
+                // by hand; nothing automatic puts these rows in QuestDB.
+                //
+                // Kept aligned with the STAGE-C.2b wording deliberately: the
+                // two messages describe the same loss from the two ends of
+                // it, and they must not tell the operator different stories.
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     %err,
                     rows = covered,
                     "live tick flush to QuestDB FAILED — the buffered rows were discarded by \
-                     the writer contract and are a counted loss. The raw frames remain in the \
-                     write-ahead log and are recoverable by replay."
+                     the writer contract and are a counted loss: these ticks are NOT in the \
+                     database and nothing re-inserts them. The raw frames are preserved in the \
+                     write-ahead log and can be recovered manually, but boot replay DROPS \
+                     live-feed frames (there is no re-fold path), so do not wait for a restart \
+                     to fix this."
                 );
                 0
             }
@@ -946,6 +965,22 @@ pub const FLUSH_COUNTER: &str = "tv_dhan_feed_flush_total";
 /// time `try_send` is attempted (`WalRingSink`).
 pub const FRAME_RING_CAPACITY: usize = 65_536;
 
+/// How many times the lane re-checks for the token manager before refusing.
+///
+/// Sized against what it is actually waiting for: `TokenManager::initialize`
+/// performs SSM credential reads, a TOTP computation and an HTTPS
+/// `generateAccessToken` round-trip inside a retry loop whose backoff floor is
+/// >=130s. One retry cycle therefore has to fit, or a single transient auth
+/// failure would still cost the whole session. 60 attempts x 5s = 5 minutes,
+/// which covers a first attempt plus a full backoff plus a second attempt,
+/// and still lands well before the 09:15 IST open on the 08:30 boot schedule.
+pub const TOKEN_MANAGER_WAIT_ATTEMPTS: u64 = 60;
+
+/// Seconds between token-manager re-checks. Short enough that the common case
+/// — the manager appearing within a second or two of a fast auth — costs
+/// almost nothing, since the loop exits on the first success.
+pub const TOKEN_MANAGER_WAIT_INTERVAL_SECS: u64 = 5;
+
 /// The ring's byte ceiling — the bound the frame count alone does not give.
 ///
 /// `FRAME_RING_CAPACITY` bounds how MANY frames sit in the ring, not how much
@@ -1019,6 +1054,40 @@ const DRAIN_REPORT_EVERY: u64 = 1_024;
 /// O(1) per frame: one fixed-offset parse, one hash lookup in the gap
 /// detector, one hash lookup plus `TF_COUNT` scalar folds in the aggregator,
 /// one ILP row append. No heap allocation in steady state.
+/// Run the SYNCHRONOUS blocking ILP-over-HTTP flush OFF the async worker
+/// (the `order_observability::blocking_flush` house pattern — the same shape
+/// is inlined at `seal_writer_loop.rs`, `groww_order_observability.rs`,
+/// `dhan_order_push_observability.rs`, `order_update_events_boot.rs` and
+/// `cadence_escalation.rs`).
+///
+/// `TickWriter::flush` is a blocking HTTP call bounded by the conf-pinned
+/// `request_timeout=5000`. Called bare on this task it pins a tokio worker;
+/// on a 2-worker host that is HALF the runtime, and the worker it pins is
+/// shared with the WS read loops — which stop pumping pongs and get the
+/// socket dropped. Worse, the drain stops draining, so the 65,536-frame ring
+/// fills in ~13 s at 5,000 fps and every frame after that is refused. Those
+/// frames reach the WAL, but the WAL has no re-fold path, so they never
+/// become rows. A third-party database stall therefore became permanent tick
+/// loss plus a disconnect — via a task that had no business blocking at all.
+///
+/// The runtime-flavor guard is MANDATORY, not stylistic: `block_in_place`
+/// panics on a current-thread runtime, and this module's drain tests are bare
+/// `#[tokio::test]` (current_thread).
+///
+/// `block_in_place` rather than `spawn_blocking` because the closure borrows
+/// `&mut ingest` — no `'static`/`Send` bound, no channel round-trip — and it
+/// converts the CURRENT worker into a blocking thread while the runtime spins
+/// up a replacement, so the effective worker count is preserved.
+fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(flush)
+    } else {
+        flush()
+    }
+}
+
 async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
@@ -1084,7 +1153,7 @@ async fn run_frame_drain(
                 // QuestDB — an unflushed buffer is not storage, it is a leak
                 // with a success counter in front of it.
                 if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD {
-                    ingest.flush();
+                    blocking_flush(|| ingest.flush());
                 }
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
                     publish_fold_depth(&ingest);
@@ -1094,7 +1163,7 @@ async fn run_frame_drain(
             // instrument sit unflushed below the size threshold waiting for a
             // next tick which, at the close, never comes.
             _ = flush_timer.tick() => {
-                ingest.flush();
+                blocking_flush(|| ingest.flush());
                 publish_fold_depth(&ingest);
             }
         }
@@ -1116,7 +1185,7 @@ async fn run_frame_drain(
 
     // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
-    let tail = ingest.flush();
+    let tail = blocking_flush(|| ingest.flush());
     publish_fold_depth(&ingest);
     warn!(
         code = ErrorCode::WsGapConnectionState.code_str(),
@@ -1539,14 +1608,50 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     };
 
     // The client id is a credential-adjacent value the token manager owns. No
-    // manager means the REST stack has not registered one, which also means
-    // there is no JWT to dial with — refuse rather than dial with a blank.
-    let Some(client_id) = global_token_manager().map(|m| m.client_id_string()) else {
+    // manager means there is no JWT to dial with — refuse rather than dial
+    // with a blank.
+    //
+    // WAIT for it, do not race it. This was a bare `else { return }`, and it
+    // lost that race on essentially every boot.
+    //
+    // The registrar is `dhan_rest_stack`, which registers the manager only
+    // AFTER `TokenManager::initialize` — SSM credential reads, a TOTP
+    // computation, and an HTTPS `generateAccessToken` round-trip, inside a
+    // retry loop with a >=130s backoff floor. This lane is spawned from the
+    // same boot path with exactly ONE await between the two (a localhost
+    // QuestDB GET for the depth universe, single-digit milliseconds). A
+    // localhost query cannot outlast a remote auth handshake, so the lane
+    // reached this line first, refused, and returned — permanently for that
+    // process, because nothing re-checked.
+    //
+    // The refusal was loud, which is the only reason this was recoverable at
+    // all. But a lane that logs an error and exits on every single boot is
+    // indistinguishable, in effect, from a lane that was never wired.
+    let mut client_id: Option<String> = None;
+    for attempt in 0..TOKEN_MANAGER_WAIT_ATTEMPTS {
+        if let Some(id) = global_token_manager().map(|m| m.client_id_string()) {
+            if attempt > 0 {
+                info!(
+                    waited_secs = attempt * TOKEN_MANAGER_WAIT_INTERVAL_SECS,
+                    "Dhan live feed: token manager registered — proceeding to dial"
+                );
+            }
+            client_id = Some(id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            TOKEN_MANAGER_WAIT_INTERVAL_SECS,
+        ))
+        .await;
+    }
+    let Some(client_id) = client_id else {
         error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
-            "Dhan live feed is enabled but no token manager is registered, so there is neither \
-             a client id nor a JWT to dial with. REFUSING to open any socket. The Dhan REST \
-             stack registers the manager at boot — this means it has not reached that step."
+            waited_secs = TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS,
+            "Dhan live feed is enabled but no token manager registered within the wait budget, \
+             so there is neither a client id nor a JWT to dial with. REFUSING to open any \
+             socket. The Dhan REST stack registers the manager after authentication — this \
+             means authentication did not complete in time (check AUTH-GAP-* and DH-901)."
         );
         return;
     };
@@ -2714,6 +2819,59 @@ mod tests {
     // -- structural proofs --------------------------------------------------
 
     #[test]
+    fn test_drain_never_flushes_bare_on_the_async_worker() {
+        // The drain task owns the ONLY consumer of the frame ring. Its
+        // `flush()` is a SYNCHRONOUS blocking ILP-over-HTTP call bounded by
+        // request_timeout=5000, so calling it bare pins a tokio worker — on a
+        // 2-worker host that is half the runtime, shared with the WS read
+        // loops that must keep pumping pongs. The drain then stops draining
+        // and the 65,536-frame ring fills in ~13s at 5,000 fps; those frames
+        // reach the WAL, which has no re-fold path, so they never become rows.
+        //
+        // Five sibling sites in this workspace already route through the
+        // flavor-guarded helper. This one did not, and nothing caught it,
+        // because "is this call blocking?" is invisible to the type system.
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production_half = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production_half.contains("fn blocking_flush<T>"),
+            "the flavor-guarded blocking_flush helper must exist"
+        );
+        assert!(
+            production_half.contains("block_in_place"),
+            "blocking_flush must actually move the flush off-worker on the \
+             multi-thread runtime"
+        );
+        assert!(
+            production_half.contains("RuntimeFlavor::MultiThread"),
+            "the runtime-flavor guard is mandatory, not stylistic: \
+             block_in_place PANICS on a current_thread runtime and this \
+             module's drain tests are bare #[tokio::test]"
+        );
+
+        // The load-bearing assertion: no production call site may invoke
+        // flush() bare. Written as a search for the bare form so that adding a
+        // FOURTH flush site without the helper fails here rather than in prod.
+        let bare = production_half.matches("ingest.flush()").count();
+        let wrapped = production_half
+            .matches("blocking_flush(|| ingest.flush())")
+            .count();
+        assert_eq!(
+            bare, wrapped,
+            "every production ingest.flush() must be wrapped in blocking_flush; \
+             found {bare} call(s) and {wrapped} wrapped — the difference is a \
+             blocking HTTP call sitting on the async drain task"
+        );
+        assert!(
+            wrapped >= 3,
+            "expected at least the 3 known flush sites (size trigger, time \
+             trigger, shutdown tail); found {wrapped} — did a site get deleted?"
+        );
+    }
+
+    #[test]
     fn test_stack_never_reaches_for_an_instrument_download() {
         // Q3 of the 2026-07-13 amendment: hardcoded security ids only. This is
         // the mechanical half of that promise.
@@ -2849,7 +3007,7 @@ mod tests {
 
         for needle in [
             "let Some(spill) = params.spill else",
-            "let Some(client_id) = global_token_manager()",
+            "let Some(client_id) = client_id else",
         ] {
             let at = production_half
                 .find(needle)
@@ -2861,6 +3019,33 @@ mod tests {
                 "`{needle}` must REFUSE the lane, never warn and continue"
             );
         }
+
+        // The token-manager guard must WAIT before it refuses.
+        //
+        // This arm used to pin `let Some(client_id) = global_token_manager()`
+        // — the bare one-shot check — and it passed happily while the lane
+        // lost a race it could not win: the registrar sits behind an SSM +
+        // TOTP + HTTPS auth round-trip, and this lane is spawned with a
+        // single localhost query between them. A guard that is CORRECT
+        // (refusing without a credential is right) can still be WRONG in
+        // timing, and a source pin on the refusal alone cannot tell the
+        // difference. Pin the wait too.
+        assert!(
+            production_half.contains("for attempt in 0..TOKEN_MANAGER_WAIT_ATTEMPTS"),
+            "the lane must RETRY for the token manager, not one-shot it — the \
+             registrar completes a remote auth handshake first, so a single \
+             check loses on essentially every boot"
+        );
+        assert!(
+            production_half.contains("tokio::time::sleep"),
+            "the token-manager wait must actually yield between attempts"
+        );
+        assert!(
+            TOKEN_MANAGER_WAIT_ATTEMPTS * TOKEN_MANAGER_WAIT_INTERVAL_SECS >= 260,
+            "the wait budget must cover at least two TokenManager::initialize \
+             attempts across its >=130s backoff floor, or one transient auth \
+             failure still costs the whole session"
+        );
     }
 
     /// The 15:31 comparator's day origin must be IST-WALL-AS-EPOCH, because

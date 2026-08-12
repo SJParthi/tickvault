@@ -38,10 +38,28 @@ runtime.
 - **Names behind the non-default `groww_orders` cargo feature** (Gate 2 of the
   §39.2 lattice — not compiled into the deploy build), e.g.
   `tv_groww_push_supervisor_respawn_total`.
-- **`tv_ws_frame_spill_write_errors_total`** — no WS frame producer exists (both
-  live feeds retired 2026-07-13/15); the boot-time replay counter
-  `tv_wal_replay_corrupted_segments_total` IS selected because `replay_all` runs
-  every boot.
+- ~~**`tv_ws_frame_spill_write_errors_total`** — no WS frame producer exists (both
+  live feeds retired 2026-07-13/15)~~ **STALE, CORRECTED 2026-08-12 — now
+  SELECTED.** The Dhan live WS lane was revived 2026-08-09/11 and IS a WS frame
+  producer, so the stated reason stopped holding the day the lane came back and
+  the exclusion silently survived it. This is the exact failure the closing
+  sentence of this section warns about, running in reverse: a stale EXCLUSION
+  hides a live producer's loss signal just as effectively as a dead INCLUSION
+  advertises coverage that cannot exist. It matters more than most, because
+  `ws_frame_spill::accept` returns `Spilled` even when the disk is full (the
+  writer thread drains and discards), so this counter is the ONLY signal that
+  the capture-at-receipt durable floor has stopped holding. The boot-time replay
+  counter `tv_wal_replay_corrupted_segments_total` remains selected because
+  `replay_all` runs every boot.
+- **Tick-persist loss counters — SELECTED 2026-08-12** (`tv_ticks_dropped_total`,
+  `tv_tick_persist_errors_total`, `tv_tick_rows_refused_total`). Same cause: the
+  ingest-side loss counters (`tv_dhan_ws_wal_dropped_total`,
+  `tv_dhan_feed_seals_dropped_total`, …) were added when the lane was revived,
+  but the PERSIST-side ones were not — so the pipeline was instrumented at the
+  socket and blind at the database, while `dhan_enabled = true` and
+  `TICKVAULT_DHAN_LIVE_FEED=1`. `tv_ticks_dropped_total` in particular fires on
+  the flush-failure path that DISCARDS the buffered rows, which is the single
+  largest tick-loss window in the live lane.
 - **`tv_api_auth_failed_total`** — already published via its own log metric
   filter (`auth-failed-alarm.tf`); EMF-selecting it would double-bill.
 
