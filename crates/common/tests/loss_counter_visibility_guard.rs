@@ -113,11 +113,11 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_chain1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_cross_fill_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_dhan_feed_ingest_refused_total",
@@ -133,19 +133,19 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_dhan_live_xverify_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_dhan_ws_dial_failed_total",
-        "untriaged (seeded 2026-08-12)",
+        "logged — the counter is behind count_dial_failure(); every call site (no_token, tls_config, bad_url, timeout) carries its own error! or warn! (all arms verified 2026-08-12)",
     ),
     (
         "tv_groww_chain1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_groww_contract1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_groww_push_sink_dropped_total",
@@ -153,7 +153,7 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_groww_spot1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_mark_forward_dropped_total",
@@ -161,27 +161,27 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_oom_monitor_probe_failed_total",
-        "untriaged (seeded 2026-08-12)",
+        "logged — incremented via a local counter handle (m_probe_failed) whose ProbeFailed arm carries an adjacent warn!; the literal only appears at handle creation, which is what hid it (verified 2026-08-12)",
     ),
     (
         "tv_order_leg_pnl_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_order_update_ws_audit_dropped_total",
-        "untriaged (seeded 2026-08-12)",
+        "VERIFIED SILENT (2026-08-12) — real gap, not unexamined: the emit in dhan_rest_stack has no adjacent log and no caller-side report. Paper-mode order-update audit today, so nothing trades on it; fix before live order capture.",
     ),
     (
         "tv_partition_dropped_total",
-        "untriaged (seeded 2026-08-12)",
+        "VERIFIED SILENT (2026-08-12) — real gap: partition_archive increments with no adjacent log. A dropped QuestDB partition is retention working as designed, but a WRONG drop would be invisible; wants an info! naming the partition.",
     ),
     (
         "tv_pnl_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_resource_monitor_probe_failed_total",
-        "untriaged (seeded 2026-08-12)",
+        "VERIFIED SILENT (2026-08-12) — real gap, PARTIAL: the (None, _) fd-probe arms increment with no log, while a sibling arm in the same match does carry an error!. A blind fd probe reads identically to a healthy one.",
     ),
     (
         "tv_seal_spill_write_errors_total",
@@ -189,15 +189,15 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_spot1m_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_spot_xverify_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
         "tv_tf_verify_audit_rows_discarded_total",
-        "untriaged (seeded 2026-08-12)",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
 ];
 
