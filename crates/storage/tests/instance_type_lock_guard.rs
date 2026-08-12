@@ -163,6 +163,54 @@ fn instance_lock_supersession_markers_present_in_aws_budget() {
         body.contains("RE-SUPERSEDED → t4g.medium 2026-07-15"),
         "aws-budget.md must carry the 2026-07-15 t4g.medium downsize banner (Quote 8)"
     );
+    // 2026-08-12 (Quote 15). The banners above are dated HISTORY and are
+    // asserted as such. The H1 is not history — it is the first thing a reader
+    // sees, and it said "t4g.medium LOCKED ~₹1,022/mo" for four days after the
+    // r8g.xlarge lock landed: two instance locks and a ~6x cost change stale,
+    // at the top of the file whose whole job is to state the bill.
+    assert!(
+        body.contains("# AWS Budget Enforcement — r8g.xlarge LOCKED"),
+        "aws-budget.md H1 must name the CURRENT locked instance type (r8g.xlarge), \
+         not a superseded one — the dated banners below carry the history"
+    );
+}
+
+/// The instance-type lock must bind the paths that can actually MUTATE the
+/// live box, not just `terraform apply`.
+///
+/// This is the gap Quote 15 was given to close. The lock lived in
+/// `variables.tf` validation, which only runs under `terraform apply` —
+/// while `.github/workflows/downsize-instance.yml` is a manually-dispatchable
+/// workflow that mutates the instance directly through
+/// `ec2 modify-instance-attribute`. Its `TO_TYPE` read `t4g.large`, so firing
+/// it would have moved the box straight OFF the r8g.xlarge lock, with every
+/// terraform-side guard passing. A lock the enforcement path can walk past is
+/// not a lock.
+#[test]
+fn instance_lock_binds_the_mutating_workflow_not_just_terraform() {
+    let root = repo_root();
+
+    let wf = read(&root.join(".github/workflows/downsize-instance.yml"));
+    assert!(
+        wf.contains("TO_TYPE: r8g.xlarge"),
+        "downsize-instance.yml TO_TYPE must be the LOCKED type (r8g.xlarge). \
+         This workflow mutates the instance via ec2 modify-instance-attribute, \
+         so terraform's validation never sees it — if TO_TYPE drifts, a single \
+         manual dispatch moves the box off the lock with every other gate green."
+    );
+
+    let script = read(&root.join("scripts/aws-upgrade-instance.sh"));
+    assert!(
+        script.contains("TO_TYPE=\"${TO_TYPE:-r8g.xlarge}\""),
+        "aws-upgrade-instance.sh --to default must be the LOCKED type \
+         (r8g.xlarge) — it is the manual twin of the workflow above"
+    );
+    assert!(
+        script.contains("LOCK is r8g.xlarge everywhere"),
+        "aws-upgrade-instance.sh header must name the CURRENT lock; it claimed \
+         `LOCK is t4g.medium everywhere` while defaulting --to to r8g.xlarge, \
+         which is worse than either alone — the comment and the code disagreed"
+    );
 }
 
 #[test]

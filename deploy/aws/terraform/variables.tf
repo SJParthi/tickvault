@@ -47,7 +47,7 @@ variable "availability_zone" {
 }
 
 variable "ami_id" {
-  description = "Amazon Linux 2023 arm64 AMI for ap-south-1. t4g.medium is Graviton — arm64 is mandatory (x86_64 will fail to boot). AL2023 chosen 2026-05-24 over Ubuntu because CloudWatch agent + SSM agent + AWS CLI are pre-installed (no apt-get equivalents needed in user-data)."
+  description = "Amazon Linux 2023 arm64 AMI for ap-south-1. r8g.xlarge is Graviton4 — arm64 is mandatory (x86_64 will fail to boot), and that constraint is exactly why r8i was REJECTED in the Quote 13 sizing: an Intel type would force an x86 rebuild of the whole ARM pipeline including the lambdas. (Named t4g.medium here until 2026-08-12; corrected under operator Quote 15. The arm64 requirement is unchanged — both are Graviton — but a stale type name in an AMI description is how someone talks themselves into an x86 AMI.) AL2023 chosen 2026-05-24 over Ubuntu because CloudWatch agent + SSM agent + AWS CLI are pre-installed (no apt-get equivalents needed in user-data)."
   type        = string
   # Default = al2023-ami-2023.11.20260514.0 arm64 (operator confirmed via AWS
   # console 2026-05-24 — published 2026-05-15). Quarterly refresh recommended:
