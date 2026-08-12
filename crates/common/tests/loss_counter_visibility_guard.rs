@@ -160,28 +160,16 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "heartbeat — reported by the order-runtime reconcile heartbeat, not at the emit site (the DHAT budget there forbids a log line)",
     ),
     (
-        "tv_oom_monitor_probe_failed_total",
-        "logged — incremented via a local counter handle (m_probe_failed) whose ProbeFailed arm carries an adjacent warn!; the literal only appears at handle creation, which is what hid it (verified 2026-08-12)",
-    ),
-    (
         "tv_order_leg_pnl_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
     ),
     (
-        "tv_order_update_ws_audit_dropped_total",
-        "VERIFIED SILENT (2026-08-12) — real gap, not unexamined: the emit in dhan_rest_stack has no adjacent log and no caller-side report. Paper-mode order-update audit today, so nothing trades on it; fix before live order capture.",
-    ),
-    (
         "tv_partition_dropped_total",
-        "VERIFIED SILENT (2026-08-12) — real gap: partition_archive increments with no adjacent log. A dropped QuestDB partition is retention working as designed, but a WRONG drop would be invisible; wants an info! naming the partition.",
+        "NOT A LOSS COUNTER — my own 2026-08-12 label of VERIFIED SILENT was WRONG. It fires on the Ok(()) arm of a SUCCESSFUL retention drop and is immediately followed by append_audit(ArchiveOutcome::Dropped), which writes a QuestDB audit row — a stronger operator surface than a log. The name matches the loss classifier only because dropped sits in the tail, the same false positive as tv_errors_summary_refresh_total.",
     ),
     (
         "tv_pnl_audit_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that logs the returned count with error! or bail! one function away (all 11 of this family verified 2026-08-12)",
-    ),
-    (
-        "tv_resource_monitor_probe_failed_total",
-        "VERIFIED SILENT (2026-08-12) — real gap, PARTIAL: the (None, _) fd-probe arms increment with no log, while a sibling arm in the same match does carry an error!. A blind fd probe reads identically to a healthy one.",
     ),
     (
         "tv_seal_spill_write_errors_total",
@@ -317,6 +305,30 @@ fn const_aliases(lines: &[&str], cutoff: usize) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in lines.iter().take(cutoff) {
         let t = line.trim_start();
+
+        // Local counter HANDLES: `let m_probe_failed = metrics::counter!("tv_x");`
+        // then `m_probe_failed.increment(1)` somewhere else in the loop.
+        //
+        // This is the second indirection shape in the workspace and it hides
+        // counters exactly as thoroughly as the const one: the literal appears
+        // once at handle creation, and every real emit is a method call on the
+        // binding. `resource_monitor` logs at ALL THREE of its probe-failure
+        // arms and still looked unreachable, because the name is 40+ lines
+        // above them at the `let`.
+        if !t.starts_with("//") && t.starts_with("let ") && t.contains("counter!(") {
+            if let Some(ident) = t
+                .strip_prefix("let ")
+                .and_then(|r| r.split('=').next())
+                .map(|s| s.trim().trim_start_matches("mut ").trim())
+            {
+                for name in tv_names_in(line) {
+                    if is_loss_shaped(&name) && !ident.is_empty() {
+                        out.push((ident.to_string(), name));
+                    }
+                }
+            }
+        }
+
         if t.starts_with("//") || !t.contains("const ") || !t.contains(": &str") {
             continue;
         }
