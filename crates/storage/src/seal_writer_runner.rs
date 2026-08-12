@@ -125,11 +125,35 @@ pub fn global_seal_sender() -> Option<&'static mpsc::Sender<BufferedSeal>> {
     GLOBAL_SEAL_SENDER.get()
 }
 
-/// Bounded mpsc capacity for the producer→consumer wire. Sized to
-/// absorb the IST-midnight burst (~99K seals across 11K instruments
-/// × 9 TFs) without saturating; matches `SEAL_BUFFER_CAPACITY` for
-/// symmetry with the locked Wave-6 ring sizing per L-C1.
-pub const SEAL_MPSC_CAPACITY: usize = 200_000;
+/// Bounded mpsc capacity for the producer→consumer wire.
+///
+/// DERIVED from [`SEAL_BUFFER_CAPACITY`], not a literal, since
+/// 2026-08-12. The previous `200_000` carried the comment "absorbs the
+/// IST-midnight burst (~99K seals across 11K instruments × 9 TFs)" —
+/// which described a universe that no longer exists and was
+/// arithmetically FALSE at the configured ceiling.
+///
+/// This channel sits IN FRONT OF the ring. `force_seal_all` emits
+/// `AGGREGATOR_MAX_SLOTS × TF_COUNT` = 25,000 × 24 = **600,000** seals
+/// in one burst, and every one of them must pass through here before it
+/// can reach the ring's three absorbing tiers. At 200,000 the channel
+/// force-dropped **400,000** of them on `try_send` — counter-only, no
+/// log line, no alarm — every midnight, while the ring behind it was
+/// correctly sized for the full burst and sat mostly empty.
+///
+/// That is the exact drift class `SEAL_BUFFER_CAPACITY` was derived to
+/// prevent on 2026-08-10; the ring was fixed and the channel in front of
+/// it was missed, so the bound simply moved one hop upstream. Deriving
+/// BOTH from the same inputs closes it: change `AGGREGATOR_MAX_SLOTS` or
+/// `TF_COUNT` and both follow, and the ratchet below fails the build if
+/// they ever diverge again.
+///
+/// Cost at the derived value: the mpsc allocates its buffer lazily per
+/// queued item (tokio `mpsc` does NOT pre-allocate capacity slots), so
+/// the steady-state cost is ~0 and the worst case equals the burst
+/// itself — 600,000 × ≤144 B ≈ **86 MB**, matching the ring, 0.26% of
+/// the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
+pub const SEAL_MPSC_CAPACITY: usize = tickvault_trading::candles::SEAL_BUFFER_CAPACITY;
 
 /// Outcome of one [`SealWriterRunner::run_one_cycle`] call.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -597,10 +621,39 @@ mod tests {
 
     #[test]
     fn test_seal_mpsc_capacity_constant_pinned() {
-        // Pin the locked mpsc capacity so a regression PR can't
-        // silently lower it (which would push more producer-side
-        // drops at IST midnight).
-        assert_eq!(SEAL_MPSC_CAPACITY, 200_000);
+        // The mpsc sits IN FRONT OF the ring: every seal must pass
+        // through it before it can reach the ring's three absorbing
+        // tiers, so a channel smaller than the ring silently relocates
+        // the drop one hop upstream of every absorption mechanism.
+        //
+        // This test used to pin the literal 200_000. That literal was
+        // correct when written and became a 400,000-seal-per-midnight
+        // drop the moment the ring was derived (2026-08-10) and TF_COUNT
+        // moved 21 -> 24 — and the pin PASSED throughout, because it
+        // asserted the stale value rather than the relationship. Pinning
+        // the RELATIONSHIP is what makes the drift impossible.
+        assert_eq!(
+            SEAL_MPSC_CAPACITY,
+            tickvault_trading::candles::SEAL_BUFFER_CAPACITY,
+            "the producer->consumer mpsc must be at least the ring's capacity, \
+             or force_seal_all drops the difference before any absorbing tier sees it"
+        );
+    }
+
+    #[test]
+    fn test_seal_mpsc_capacity_absorbs_a_whole_force_seal_burst() {
+        // The concrete failure this closes: force_seal_all emits
+        // AGGREGATOR_MAX_SLOTS x TF_COUNT seals in a single yield at the
+        // IST day boundary. Anything less than that here is a guaranteed
+        // per-midnight loss with a counter but no log and no alarm.
+        let burst = tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS
+            * tickvault_trading::candles::tf_index::TF_COUNT;
+        assert!(
+            SEAL_MPSC_CAPACITY >= burst,
+            "mpsc capacity {SEAL_MPSC_CAPACITY} < one force_seal_all burst {burst} — \
+             {} seals would be dropped every IST midnight",
+            burst.saturating_sub(SEAL_MPSC_CAPACITY)
+        );
     }
 
     // -----------------------------------------------------------------------
