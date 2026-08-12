@@ -129,7 +129,7 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_dhan_feed_seals_dropped",
-        "untriaged (seeded 2026-08-12) — gauge twin of the shipped _total counter",
+        "gauge twin — VERIFIED 2026-08-12: this is the session GAUGE (SEALS_DROPPED_GAUGE, set once per drain in run_frame_drain). Its COUNTER twin tv_dhan_feed_seals_dropped_total IS in the EMF selector, so the loss itself is shipped and alarmable; the gauge is the same number in instantaneous form and shipping both would double-bill one signal.",
     ),
     (
         "tv_dhan_live_xverify_audit_rows_discarded_total",
@@ -562,6 +562,44 @@ fn allowlist_is_sorted_and_unique_with_reasons() {
              able to check it"
         );
     }
+}
+
+/// No row may say "untriaged". Every exemption states a checkable mechanism.
+///
+/// This exists because of a mistake worth not repeating. The allowlist was
+/// seeded with 20 rows reading `"untriaged (seeded 2026-08-12)"`, and after
+/// working through them I reported "untriaged: 20 → 0" — in a commit message
+/// and a PR body — on the strength of
+/// `grep -c '"untriaged (seeded 2026-08-12)"'` returning zero.
+///
+/// One row had an ANNOTATED variant (`"untriaged (…) — gauge twin of …"`),
+/// which that exact-match grep never saw. The count said zero, the claim said
+/// zero, and one row was still unexamined. A substring check would have caught
+/// it; an exact-string check verified a narrower thing than the sentence it was
+/// used to support.
+///
+/// So the property is asserted directly on the data instead of being counted by
+/// hand: if anyone seeds a fresh batch of untriaged rows, the build says so
+/// rather than waiting for someone to grep for the right spelling.
+#[test]
+fn no_allowlist_row_is_still_untriaged() {
+    let stalled: Vec<&str> = UNREACHABLE_ALLOWLIST
+        .iter()
+        .filter(|(_, reason)| reason.to_ascii_lowercase().contains("untriaged"))
+        .map(|(name, _)| *name)
+        .collect();
+
+    assert!(
+        stalled.is_empty(),
+        "{} allowlist row(s) still say `untriaged`, meaning nobody has looked \
+         at them:\n  {}\n\n\
+         An allowlist of unexamined entries records ignorance without reducing \
+         it, and decays into a permanent exemption list. Replace each with the \
+         mechanism that actually makes the counter reachable — or, if it is \
+         genuinely unreachable, fix the emit site.",
+        stalled.len(),
+        stalled.join("\n  ")
+    );
 }
 
 /// The scanner must actually find things, or every assertion above is vacuous.
