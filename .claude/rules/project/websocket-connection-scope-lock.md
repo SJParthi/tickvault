@@ -837,6 +837,91 @@ actually does; it does not improve it.
 - Flips the default ON without a fresh dated quote in THIS section recording the
   operator's explicit go AFTER a live probe.
 
+### 2026-08-12 — the probe RAN, the lane was BROKEN, and the master-sourced universe is now ON
+
+**The verbatim operator demand (2026-08-12, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "i need all 16 sow hatevr is needed fix and impelemnt dude okay>"
+
+This is the fresh dated quote the REJECT row immediately above requires, and it
+is recorded HERE before the config flip, per this file's own rule-file-first
+law. It follows the same-day operator instruction to fix and implement whatever
+the 16 connections need.
+
+#### The probe ran. It did not validate the feed — it found a bug.
+
+The fourth quote conditioned the flip on "a live probe". **2026-08-12 was that
+probe: the lane's first live session since the 2026-07-13 retirement.** It must
+not be reported as a pass, because it was not one. What it produced:
+
+| Evidence (CloudWatch `/tickvault/prod/app`, 2026-08-12) | Value |
+|---|---|
+| Main-feed dial attempts | **12, all failed** — `WS-GAP-03`, `"HTTP error: 400 Bad Request"`, every 30s from 09:29:28 IST |
+| Daily cross-verification | `outcome: Degraded`, **`compared: 0`, `missing_live: 373`**, `missing_rest: 0` |
+| depth-200 subscribe | `WS-GAP-02` at 09:06:49 — `"... got: BSE_FNO"`, socket opened and torn down |
+| Sockets planned vs carrying data | 8 planned; **only the order-update socket alive** |
+
+So the live lane produced **zero candles for the entire 373-minute session**,
+and the main feed never completed a handshake even once.
+
+**Both causes were found and fixed the same day, and neither was Dhan's:**
+
+1. **A missing `/`.** `build_feed_url` appended `?` directly to a pathless base
+   URL, so tungstenite — which writes `GET {path_and_query} HTTP/1.1` — put
+   `GET ?version=2&token=… HTTP/1.1` on the wire. An origin-form request-target
+   must begin with `/` (RFC 9112 §3.2.1), so Dhan's edge answered 400 before the
+   upgrade was ever considered. The main feed was the ONLY endpoint without a
+   path, which is why it was the only one failing.
+2. **BSE_FNO in the depth sets.** SENSEX options are `BSE_FNO` and Dhan serves
+   depth on NSE only, so a SENSEX depth socket can only ever die on connect
+   (depth-200) or sit live and silent (depth-20, which had no builder check at
+   all). Refused at selection time now, and counted.
+
+#### What is flipped, and the honest risk
+
+`[dhan_universe] live_subscription_from_master` moves `false → true` in
+`config/base.toml`. The **serde default stays `false`** — an absent section
+still means the 4 hardcoded index SIDs, so the fail-safe is unchanged and the
+REJECT row above ("enabled by default … or serde default") is not breached.
+
+Why the flip is needed at all: 16 sockets is arithmetically impossible without
+it. The main feed spreads its set across the 5 authorized connections one shard
+each, and the index universe is **4 instruments** — four sockets, and an empty
+fifth is refused by design (an empty subscribe is `EmptyBatch`). Reaching the
+fifth main-feed socket requires a fifth instrument, and the master is the only
+authorized source of one.
+
+**The honest risk, stated rather than buried.** The fourth quote's own warning
+still applies and is not retired by this section: this widens the set from 4
+instruments to whatever today's master resolves (**4,565** on 2026-08-12) on a
+lane that has **never successfully received a single tick**. If something is
+still wrong after the two fixes above, it now arrives across 4,565 instruments
+instead of 4. That is a real cost and it was accepted deliberately, on the
+operator's explicit instruction, against a box (r8g.xlarge, 32 GiB) sized for
+exactly this load.
+
+Three things bound it, none of which is a promise that it works:
+- **Fail-soft, loudly.** An unreadable or unparseable mapping artifact falls
+  back to the 4 index SIDs with a coded `error!` saying master sourcing was
+  REQUESTED and is NOT in effect — never a silent partial widening.
+- **Fail-closed on the envelope.** A master resolving more SIDs than the 5
+  connections can carry refuses the WHOLE pool rather than truncating.
+- **Reversible in one line.** Setting the flag back to `false` restores the
+  4-SID universe with a restart.
+
+#### What is still NOT delivered, at 16 sockets or otherwise
+
+- **Futures depth remains unreachable.** No authorized Dhan source yields a
+  FUTIDX `security_id` (§ the 2026-08-11 second quote). Unchanged.
+- **The 2026-07-13 retirement reasons remain unrepaired** — p99 46.37s delivery
+  lag, 29–67 silent instruments/minute — because every one of them is Dhan-side.
+- **Nothing here proves the feed works.** The 400 fix explains and removes a
+  handshake failure; it does not demonstrate tick delivery. **The measurement
+  that settles it is the same cross-verification line that exposed the outage:
+  a non-zero `compared`.** Until a session reports one, "the Dhan live feed is
+  working" is not a claim this repository can make.
+
 ### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
 
 Operator Parthiban, 2026-07-24 (verbatim quotes preserved in
