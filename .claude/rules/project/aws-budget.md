@@ -386,6 +386,39 @@ retirements". The revived lane IS a WS frame producer, so that stated reason
 no longer holds. Recorded rather than silently added — adding it is its own
 cost decision and would make this note's +7 delta untrue.
 
+## COST NOTE 2026-08-12 — silence read-out gauges (+~$0.60/mo)
+
+The live lane seeded every subscribed instrument into a `TickGapDetector` and
+called `observe()` on it for every tick — and never asked it a single
+question. `scan_silence` had **zero production callers**: a fully wired sensor
+with no read-out, which reads *greener* than dead code does, because every
+part of it looks connected.
+
+The scan now runs on its own 30s timer and publishes two gauges, both added to
+the EMF selector:
+
+| Gauge | What a non-zero value means |
+|---|---|
+| `tv_dhan_feed_instruments_silent` | instruments quiet beyond their OWN learned cadence (sparse ones excluded, §36.4 precedent) |
+| `tv_dhan_feed_instruments_never_ticked` | instruments that produced **nothing** since being subscribed |
+
+The second is the one that earns its cost. A subscribe that silently did not
+take produces **no other signal at all** — there is no payload to count, no
+parse to fail, and no error to log. Absence measured against a seeded key is
+the only evidence that exists. Leaving it in a `/metrics` endpoint nothing on
+this box scrapes would have repeated exactly the mistake the two notes below
+correct.
+
+**Cost:** +2 custom metric series ≈ **+$0.60/mo** (52 → 54 EMF-selected names;
+~$15.60 → ~$16.20/mo). Added to both allowlist copies in lockstep; count
+ratchet bumped with its rationale in place.
+
+**NOT claimed:** that these now PAGE. They are visible, not pageable — an
+alarm needs the market-hours window gate (its `ALARM_NAMES` list arms a named
+set), which is its own terraform change. Flagged here rather than left to be
+discovered from a quiet dashboard. The `error!` the scan emits (`RISK-GAP-03`,
+edge-latched, two consecutive scans, market-hours gated) is log-sink-only.
+
 ## COST NOTE 2026-08-12 — WS-SPILL-01 alarm (+~$0.10/mo)
 
 The 2026-08-11 sweep below was scoped to `Severity::Critical`. WS-SPILL-01 is

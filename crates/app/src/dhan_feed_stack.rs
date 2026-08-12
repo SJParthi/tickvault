@@ -89,7 +89,8 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
     DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE,
-    PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, SPOT_1M_REST_INDICES, TICKER_PACKET_SIZE,
+    PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, SPOT_1M_REST_INDICES,
+    TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST, TICKER_PACKET_SIZE,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
@@ -99,7 +100,7 @@ use tickvault_core::auth::token_manager::global_token_manager;
 use tickvault_core::parser::ParsedFrame;
 use tickvault_core::parser::dispatcher::dispatch_frame;
 use tickvault_core::pipeline::tick_gap_detector::{
-    DetectorConfig, TickGapDetector, TickObservation,
+    DetectorConfig, SilenceVerdict, TickGapDetector, TickObservation,
 };
 use tickvault_core::websocket::connection::{
     DhanFeedSocketImpl, DhanSocketParams, FeedTokenBuffer,
@@ -112,7 +113,7 @@ use tickvault_core::websocket::pool_supervisor::{
 use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
 use tickvault_trading::candles::{BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Environment opt-in that must be `1` for the lane to run, on top of
 /// `[feeds] dhan_enabled`. Absent means OFF, which is the whole point.
@@ -832,6 +833,186 @@ impl LiveIngest {
         (emitted, dropped)
     }
 
+    /// Asks the gap detector what it has been recording, and reports it.
+    ///
+    /// # Why this has to exist
+    ///
+    /// The lane builds a [`TickGapDetector`], seeds every subscribed
+    /// instrument into it, and calls `observe` on every tick — and then never
+    /// asked it a single question. `scan_silence` had **zero production
+    /// callers**: a fully wired sensor with no read-out, which reads greener
+    /// than dead code does, because every part of it looks connected.
+    ///
+    /// Two distinct failures become visible here, and neither is visible any
+    /// other way:
+    ///
+    /// * [`SilenceVerdict::NeverTicked`] — the instrument was subscribed and
+    ///   has produced nothing at all. A subscribe that silently did not take
+    ///   leaves no payload to reason about, so *absence against a seeded key*
+    ///   is the only evidence that exists. This is the partial-subscribe
+    ///   detector.
+    /// * [`SilenceVerdict::Exceeded`] — the instrument ticked, then went quiet
+    ///   for longer than its OWN learned cadence predicts. Judged per
+    ///   instrument rather than against one global threshold, so a slow
+    ///   contract is not compared to a fast index.
+    ///
+    /// Sparse instruments (far-month options, the INDIA VIX class) are
+    /// reported but never counted toward the alarm — the §36.4 precedent.
+    /// Counting them would page for legitimate quiet and the whole read-out
+    /// would be turned off within a week.
+    ///
+    /// Returns `(silent, never_ticked)` where `silent` counts only
+    /// alarm-worthy reports.
+    ///
+    /// # Complexity
+    /// O(n) in tracked instruments, allocation-free (the sink is a closure
+    /// over stack locals, not a `Vec`). COLD — every
+    /// [`SILENCE_SCAN_INTERVAL`], never per tick.
+    pub fn scan_silence(&self, now_millis: u64) -> (u64, u64) {
+        let mut silent = 0u64;
+        let mut never = 0u64;
+        // Worst offender, kept for the log line so the operator gets a name
+        // and not just a count. One `Copy` key, no allocation.
+        let mut worst: Option<(
+            u64,
+            tickvault_core::pipeline::tick_gap_detector::SilenceReport,
+        )> = None;
+        self.detector.scan_silence(now_millis, |report| {
+            if !report.counts_toward_alarm() {
+                return;
+            }
+            // `NeverTicked` is returned by `classify_silence` the instant an
+            // instrument is seeded, with NO elapsed-time condition — it means
+            // "has never ticked", full stop. Counting it raw would report
+            // every instrument in the book as silent for the whole window
+            // between subscribing and the first tick, which is a false alarm
+            // on every single boot. `silent_millis` is time-since-seeding for
+            // this verdict, so requiring it to clear the same quiet ceiling
+            // the other verdicts are judged against gives the subscribe a
+            // fair chance to produce something first.
+            //
+            // Found by a test, not by review: the first version asserted a
+            // freshly-seeded instrument reports nothing and it reported (1,1).
+            if report.silent_millis <= report.expected_millis {
+                return;
+            }
+            silent = silent.saturating_add(1);
+            if report.verdict == SilenceVerdict::NeverTicked {
+                never = never.saturating_add(1);
+            }
+            if worst.is_none_or(|(w, _)| report.silent_millis > w) {
+                worst = Some((report.silent_millis, report));
+            }
+        });
+        metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
+        metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
+        if let Some((_, w)) = worst {
+            debug!(
+                security_id = w.key.0,
+                segment = w.key.1.as_str(),
+                silent_millis = w.silent_millis,
+                expected_millis = w.expected_millis,
+                baseline_millis = w.baseline_millis,
+                samples = w.samples,
+                "quietest tracked instrument this scan"
+            );
+        }
+        (silent, never)
+    }
+
+    /// Seals every bucket the watermark has moved past, mid-session.
+    ///
+    /// # Why this has to exist
+    ///
+    /// A bucket closes when a LATER tick for the SAME instrument crosses its
+    /// boundary. For a liquid index that is a non-issue. For an instrument
+    /// that ticks once at 10:00:30 and then goes quiet, its 10:00 bar sits
+    /// open in memory until the session-close sweep — so a bar that was
+    /// complete at 10:01 does not reach the database until 15:30.
+    ///
+    /// That is a LATENCY defect, not a loss defect, and it is worth being
+    /// precise about the difference: the bar is stamped correctly and
+    /// `seal_open_buckets_at_close` does eventually write it. Nothing is lost
+    /// today. What is lost is the *point* of intraday timeframes — a 1-minute
+    /// candle that materialises five hours late is not a 1-minute candle any
+    /// consumer can act on.
+    ///
+    /// `catch_up_seal_all` was written for exactly this and had **zero
+    /// production callers** — the third member of the same family as
+    /// `force_seal_all` and `scan_silence`.
+    ///
+    /// # The cutoff, and why it is not just the watermark
+    ///
+    /// The cutoff is `watermark − CATCHUP_LATENESS_MARGIN_SECS`, never the
+    /// watermark itself. The watermark is the highest exchange timestamp seen
+    /// across ALL instruments, and ticks arrive out of order between them, so
+    /// sealing right at the watermark would close a bucket whose own final
+    /// ticks are still in flight — turning a latency fix into a truncated-bar
+    /// bug, which is strictly worse than the problem it solves. The margin
+    /// buys back that reordering window.
+    ///
+    /// A watermark below the margin (session not started) yields a saturating
+    /// zero cutoff, which seals nothing — the correct answer, not a special
+    /// case.
+    ///
+    /// Returns `(emitted, dropped)`, both folded into the same running totals
+    /// as the per-tick and close paths: a catch-up drop is as much a loss as
+    /// any other and must not be accounted separately.
+    ///
+    /// # Complexity
+    /// O(slots × TF). COLD — every [`CATCHUP_SEAL_INTERVAL`], never per tick.
+    pub fn catch_up_seal(&mut self) -> (u64, u64) {
+        let cutoff = self
+            .aggregator
+            .watermark_secs()
+            .saturating_sub(CATCHUP_LATENESS_MARGIN_SECS);
+        if cutoff == 0 {
+            return (0, 0);
+        }
+        let mut emitted = 0u64;
+        let mut dropped = 0u64;
+        let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
+        let bars = self.aggregator.catch_up_seal_all(
+            cutoff,
+            |feed, security_id, segment_code, tf, state| {
+                let Some(tx) = sender else {
+                    dropped = dropped.saturating_add(1);
+                    return;
+                };
+                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
+                if tx.try_send(seal).is_err() {
+                    dropped = dropped.saturating_add(1);
+                } else {
+                    emitted = emitted.saturating_add(1);
+                }
+            },
+        );
+        debug_assert_eq!(
+            bars as u64,
+            emitted.saturating_add(dropped),
+            "every bar catch_up_seal_all produced must be accounted as emitted or dropped"
+        );
+        self.seals_emitted = self.seals_emitted.saturating_add(emitted);
+        self.seals_dropped = self.seals_dropped.saturating_add(dropped);
+        if emitted > 0 {
+            counters().seals_emitted.increment(emitted);
+        }
+        if dropped > 0 {
+            counters().seals_dropped.increment(dropped);
+        }
+        (emitted, dropped)
+    }
+
+    /// Instruments the gap detector is tracking. O(1).
+    ///
+    /// Reported alongside the silent count so the operator can tell "3 of 4
+    /// quiet" from "3 of 25,000 quiet" — the same number means very different
+    /// things at those two scales.
+    #[must_use]
+    pub fn tracked_instruments(&self) -> usize {
+        self.detector.tracked_instruments()
+    }
+
     /// Sealed candles handed to the process-wide seal writer.
     #[must_use]
     pub const fn seals_emitted(&self) -> u64 {
@@ -1039,6 +1220,62 @@ pub const SEALS_DROPPED_GAUGE: &str = "tv_dhan_feed_seals_dropped";
 /// `capture_seq`. A counted loss, never a silent stamp.
 pub const SEQ_REFUSED_GAUGE: &str = "tv_dhan_feed_seq_refused";
 
+/// Gauge: subscribed instruments that are quiet beyond their own learned
+/// cadence, excluding legitimately-sparse ones. The read-out of the gap
+/// detector the lane has always fed and never questioned.
+pub const INSTRUMENTS_SILENT_GAUGE: &str = "tv_dhan_feed_instruments_silent";
+
+/// Gauge: subscribed instruments that have produced NOTHING since being
+/// seeded. Distinct from the gauge above because the cause is different: a
+/// never-ticked instrument usually means the subscribe did not take, and a
+/// silently-unsubscribed instrument is invisible in every other signal the
+/// lane produces — there is no payload to count, no parse to fail, and no
+/// error to log. Absence against a seeded key is the only evidence.
+pub const INSTRUMENTS_NEVER_TICKED_GAUGE: &str = "tv_dhan_feed_instruments_never_ticked";
+
+/// How often the lane seals buckets the watermark has already moved past.
+///
+/// 5s is chosen against the SHORTEST timeframe the aggregator carries (1s):
+/// a bar can be late by at most this interval plus the lateness margin, so
+/// the 1s frame lands within seconds rather than at the 15:30 close sweep.
+pub const CATCHUP_SEAL_INTERVAL_SECS: u64 = 5;
+
+/// [`CATCHUP_SEAL_INTERVAL_SECS`] as a `Duration`.
+const CATCHUP_SEAL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(CATCHUP_SEAL_INTERVAL_SECS);
+
+/// How far BEHIND the watermark the catch-up cutoff sits.
+///
+/// The watermark is the highest exchange timestamp across ALL instruments,
+/// and ticks arrive out of order between them — so sealing exactly at the
+/// watermark would close a bucket whose own last ticks are still in flight,
+/// producing a truncated bar. That is strictly worse than the late bar this
+/// mechanism exists to fix, so the margin is not optional.
+///
+/// 2s covers the observed inter-instrument reordering window with room to
+/// spare, at the cost of 2s of extra latency on every catch-up bar.
+const CATCHUP_LATENESS_MARGIN_SECS: u32 = 2;
+
+/// How often the lane asks the gap detector what it has recorded.
+///
+/// 30s matches [`DEFAULT_SILENCE_FLOOR_MILLIS`] — scanning faster cannot
+/// surface anything new, because nothing can be judged silent below that
+/// floor. The scan is O(n) in tracked instruments, so it deliberately does
+/// NOT ride the 500 ms flush timer.
+pub const SILENCE_SCAN_INTERVAL_SECS: u64 = 30;
+
+/// [`SILENCE_SCAN_INTERVAL_SECS`] as a `Duration`.
+const SILENCE_SCAN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(SILENCE_SCAN_INTERVAL_SECS);
+
+/// Consecutive silence scans that must agree before the lane pages.
+///
+/// One scan is not evidence: a scan landing in the shadow of a reconnect, or
+/// during the first seconds after a subscribe batch, sees instruments that
+/// are legitimately not ticking YET. Two consecutive scans 30s apart mean the
+/// condition survived a full detector cycle.
+const SILENCE_SCANS_BEFORE_ALERT: u32 = 2;
+
 /// How many frames pass before the fold republishes its depth gauges.
 const DRAIN_REPORT_EVERY: u64 = 1_024;
 
@@ -1099,6 +1336,19 @@ async fn run_frame_drain(
     let mut unparseable: u64 = 0;
     let mut flush_timer = tokio::time::interval(FLUSH_INTERVAL);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Mid-session catch-up seal. Without it, a bar for an instrument that
+    // stops ticking waits for the 15:30 close sweep — correct, but hours late.
+    let mut catchup_timer = tokio::time::interval(CATCHUP_SEAL_INTERVAL);
+    catchup_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Deliberately its OWN timer rather than a counter on the flush arm: the
+    // scan is O(n) in tracked instruments and the flush arm runs at 500 ms.
+    let mut silence_timer = tokio::time::interval(SILENCE_SCAN_INTERVAL);
+    silence_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Consecutive alarm-worthy scans, and whether we have already paged for
+    // this episode. Edge-triggered per audit Rule 4: the rising edge fires
+    // once, the falling edge logs recovery at info and re-arms.
+    let mut silent_scans: u32 = 0;
+    let mut silence_reported = false;
 
     loop {
         tokio::select! {
@@ -1165,6 +1415,78 @@ async fn run_frame_drain(
             _ = flush_timer.tick() => {
                 blocking_flush(|| ingest.flush());
                 publish_fold_depth(&ingest);
+            }
+            // Mid-session catch-up seal. Deliberately BEFORE the silence arm
+            // in source order but with no `biased` dependency between them —
+            // they touch disjoint state (aggregator vs detector) and neither
+            // starves the other, because both are timers, not a queue.
+            _ = catchup_timer.tick() => {
+                let (emitted, dropped) = ingest.catch_up_seal();
+                if emitted > 0 || dropped > 0 {
+                    publish_fold_depth(&ingest);
+                }
+                if dropped > 0 {
+                    // Same class as a per-tick seal drop: the candle was
+                    // computed and thrown away. Counted in the shared totals
+                    // by `catch_up_seal`; named here so the operator learns
+                    // WHICH path lost it.
+                    warn!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        emitted,
+                        dropped,
+                        "catch-up seal dropped {dropped} computed candle(s) — the seal \
+                         writer was absent or its queue was full"
+                    );
+                }
+            }
+            // The detector's read-out. Until 2026-08-12 the lane fed this
+            // detector on every tick and never asked it anything, so a
+            // subscribe that silently did not take produced no signal at all.
+            _ = silence_timer.tick() => {
+                let now_millis = u64::try_from(
+                    chrono::Utc::now().timestamp_millis().max(0)
+                ).unwrap_or(0);
+                let (silent, never) = ingest.scan_silence(now_millis);
+                // Gauges publish unconditionally — a dashboard reading zero
+                // outside market hours is correct, and gating the gauge would
+                // make "no data" and "nothing wrong" indistinguishable.
+                // Only the PAGE is market-hours gated (audit Rule 3): the
+                // whole universe is legitimately silent after 15:30, and a
+                // detector that pages every evening gets muted by lunchtime.
+                if !is_within_market_hours_ist(now_ist_secs_of_day()) {
+                    silent_scans = 0;
+                    silence_reported = false;
+                    continue;
+                }
+                if silent == 0 {
+                    if silence_reported {
+                        info!(
+                            "Dhan live feed: every tracked instrument is ticking again \
+                             within its own expected cadence"
+                        );
+                    }
+                    silent_scans = 0;
+                    silence_reported = false;
+                    continue;
+                }
+                silent_scans = silent_scans.saturating_add(1);
+                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported {
+                    silence_reported = true;
+                    error!(
+                        code = ErrorCode::RiskGapTickGap.code_str(),
+                        silent,
+                        never_ticked = never,
+                        tracked = ingest.tracked_instruments(),
+                        consecutive_scans = silent_scans,
+                        "Dhan live feed: {silent} subscribed instrument(s) are quiet beyond \
+                         their own learned cadence across {silent_scans} consecutive 30s scans, \
+                         of which {never} have produced NOTHING since being subscribed. A \
+                         never-ticked instrument usually means its subscribe did not take — \
+                         there is no other signal for that, because a stream that never \
+                         arrives leaves nothing to count or fail to parse. \
+                         Legitimately-sparse instruments are excluded from this count."
+                    );
+                }
             }
         }
     }
@@ -2016,6 +2338,28 @@ pub const fn secs_until_next_run_ist(now_secs_of_day: u64) -> u64 {
     }
 }
 
+/// IST seconds-of-day at which continuous trading actually begins (09:15:00).
+///
+/// Deliberately NOT [`TICK_PERSIST_START_SECS_OF_DAY_IST`] (09:00): the
+/// persistence window opens 15 minutes early to capture the pre-open session,
+/// during which no continuous trading happens and therefore EVERY instrument
+/// is legitimately silent. Judging silence from 09:00 would page every
+/// trading morning at ~09:01.
+const CONTINUOUS_SESSION_START_SECS_OF_DAY_IST: u64 = 9 * 3_600 + 15 * 60;
+
+/// True when `secs_of_day` (IST) is inside the window where an instrument is
+/// EXPECTED to be ticking, so silence is evidence of a fault.
+///
+/// Narrower than the persistence window on purpose — see
+/// [`CONTINUOUS_SESSION_START_SECS_OF_DAY_IST`] for why the 09:00–09:15
+/// pre-open is excluded. Pure and total, so both boundaries are testable
+/// without a clock.
+#[must_use]
+pub const fn is_within_market_hours_ist(secs_of_day: u64) -> bool {
+    secs_of_day >= CONTINUOUS_SESSION_START_SECS_OF_DAY_IST
+        && secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST as u64
+}
+
 /// Current IST seconds-of-day.
 #[must_use]
 pub fn now_ist_secs_of_day() -> u64 {
@@ -2541,6 +2885,214 @@ mod tests {
         assert_eq!(ingest.flush(), 0, "flushing an empty buffer is a no-op");
     }
 
+    /// A seeded-but-never-ticked instrument must be reported.
+    ///
+    /// This is the partial-subscribe detector's whole reason to exist: a
+    /// subscribe that silently did not take produces no payload to count, no
+    /// parse to fail and no error to log, so the ONLY evidence is absence
+    /// measured against a key we know we asked for.
+    #[test]
+    fn test_scan_silence_reports_a_seeded_instrument_that_never_ticked() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let seeded_at = 1_000u64;
+        assert!(
+            ingest.seed(13, ExchangeSegment::IdxI, seeded_at),
+            "precondition: the instrument is tracked"
+        );
+        assert_eq!(ingest.tracked_instruments(), 1);
+
+        // Immediately after seeding, nothing may be counted yet.
+        //
+        // This assertion is the one that caught the defect. `classify_silence`
+        // returns NeverTicked with NO elapsed-time condition, so the first
+        // version of `scan_silence` reported (1, 1) here — meaning every
+        // instrument in the book would have been counted as silent for the
+        // whole gap between subscribing and its first tick, on every boot.
+        let (silent, never) = ingest.scan_silence(seeded_at);
+        assert_eq!(
+            (silent, never),
+            (0, 0),
+            "an instrument seeded this instant has not had time to be silent — \
+             counting it here is a false alarm on every single startup"
+        );
+
+        // Still inside the quiet ceiling: not yet evidence of anything.
+        let floor = tickvault_core::pipeline::tick_gap_detector::DEFAULT_SILENCE_FLOOR_MILLIS;
+        assert_eq!(
+            ingest.scan_silence(seeded_at + floor),
+            (0, 0),
+            "at exactly the quiet ceiling the instrument is still given the \
+             benefit of the doubt"
+        );
+
+        // Well past the detector's silence floor and it has still produced
+        // nothing — that is the subscribe-did-not-take signature.
+        let (silent, never) = ingest.scan_silence(
+            seeded_at
+                + tickvault_core::pipeline::tick_gap_detector::DEFAULT_SILENCE_FLOOR_MILLIS
+                + 1,
+        );
+        assert_eq!(silent, 1, "a never-ticked instrument counts as silent");
+        assert_eq!(
+            never, 1,
+            "and is reported SEPARATELY from merely-quiet ones, because the \
+             cause is different: never-ticked usually means the subscribe \
+             itself did not take"
+        );
+    }
+
+    /// `tracked_instruments` counts what the detector actually holds.
+    ///
+    /// It exists so the silence page can say "3 of 4 quiet" rather than a
+    /// bare "3" — the same number means very different things at a 4-SID
+    /// universe and at the 25,000-instrument target, and an operator cannot
+    /// triage the count without the denominator.
+    #[test]
+    fn test_tracked_instruments_counts_seeded_keys_and_ignores_repeats() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(
+            ingest.tracked_instruments(),
+            0,
+            "a fresh book holds nothing"
+        );
+
+        assert!(ingest.seed(13, ExchangeSegment::IdxI, 1_000));
+        assert!(ingest.seed(25, ExchangeSegment::IdxI, 1_000));
+        assert_eq!(ingest.tracked_instruments(), 2);
+
+        // Re-seeding a key already tracked must not double-count it — the
+        // denominator would drift upward on every reconnect re-subscribe.
+        assert!(ingest.seed(13, ExchangeSegment::IdxI, 2_000));
+        assert_eq!(
+            ingest.tracked_instruments(),
+            2,
+            "re-seeding an existing key must not inflate the count"
+        );
+
+        // I-P1-11: the same numeric id in a DIFFERENT segment is a different
+        // instrument and must occupy its own slot.
+        assert!(ingest.seed(13, ExchangeSegment::NseEquity, 1_000));
+        assert_eq!(
+            ingest.tracked_instruments(),
+            3,
+            "security_id alone is not unique — (id, segment) is"
+        );
+    }
+
+    /// An empty book is not a silent book.
+    #[test]
+    fn test_scan_silence_on_an_empty_book_reports_nothing() {
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(ingest.tracked_instruments(), 0);
+        assert_eq!(
+            ingest.scan_silence(u64::MAX),
+            (0, 0),
+            "with nothing subscribed there is nothing to be silent — reporting \
+             a count here would page on every boot before the first subscribe"
+        );
+    }
+
+    /// An instrument that IS ticking must not be reported.
+    #[test]
+    fn test_scan_silence_does_not_report_a_live_instrument() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let ts = 1_779_355_000u32;
+        let packet = ticker_packet(13, 100.0, ts);
+        let ParsedFrame::Tick(tick) =
+            dispatch_frame(&packet, i64::from(ts) * 1_000_000_000).expect("parse")
+        else {
+            panic!("expected a tick");
+        };
+        let recv_millis = u64::from(ts) * 1_000;
+        ingest.ingest_tick(&tick, 7, recv_millis);
+
+        let (silent, never) = ingest.scan_silence(recv_millis);
+        assert_eq!(
+            (silent, never),
+            (0, 0),
+            "an instrument that just ticked is live — a detector that reports \
+             it would be crying wolf on the healthy case, which is how these \
+             alerts get muted"
+        );
+    }
+
+    /// The catch-up seal must never close a bucket the watermark has not
+    /// cleared by the full lateness margin.
+    ///
+    /// This is the failure mode that makes the fix worse than the problem: a
+    /// bar sealed while its own last ticks are still in flight is TRUNCATED —
+    /// wrong data written confidently — whereas the defect being fixed is
+    /// merely a correct bar arriving late.
+    #[test]
+    fn test_catch_up_seal_never_seals_inside_the_lateness_margin() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let ts = 1_779_355_000;
+        let packet = ticker_packet(13, 100.0, ts);
+        let ParsedFrame::Tick(tick) =
+            dispatch_frame(&packet, i64::from(ts) * 1_000_000_000).expect("parse")
+        else {
+            panic!("expected a tick");
+        };
+        ingest.ingest_tick(&tick, 7, u64::from(ts) * 1_000);
+
+        // The watermark now sits at `ts`, so the cutoff is `ts - margin`. The
+        // bucket this tick opened ends AFTER that cutoff, so nothing may seal.
+        let (emitted, dropped) = ingest.catch_up_seal();
+        assert_eq!(
+            (emitted, dropped),
+            (0, 0),
+            "a bucket whose end is inside the lateness margin must stay open — \
+             sealing it would write a truncated bar, which is worse than the \
+             late bar this mechanism exists to prevent"
+        );
+    }
+
+    /// A watermark below the margin (session not yet started) must be a
+    /// no-op, not an underflow into a huge cutoff that seals everything.
+    #[test]
+    fn test_catch_up_seal_is_a_no_op_before_the_watermark_moves() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(
+            ingest.catch_up_seal(),
+            (0, 0),
+            "with a zero watermark the saturating cutoff is 0, which must seal \
+             nothing — an underflow here would wrap to ~u32::MAX and seal every \
+             open bucket in the book at once"
+        );
+    }
+
+    /// The catch-up seal is wired into the drain loop and does not ride the
+    /// flush timer.
+    ///
+    /// Ratchet for the defect: `catch_up_seal_all` existed, was documented,
+    /// was tested, and had ZERO production callers — so every bar for an
+    /// instrument that stopped ticking waited for the 15:30 close sweep.
+    #[test]
+    fn test_the_drain_runs_the_catch_up_seal() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain function must exist")
+            .1;
+        for needle in [
+            "let mut catchup_timer",
+            "catchup_timer.tick()",
+            "ingest.catch_up_seal()",
+        ] {
+            assert!(
+                body.contains(needle),
+                "run_frame_drain must contain `{needle}` — without it a bar for an \
+                 instrument that stops ticking mid-session is not written until the \
+                 session-close sweep"
+            );
+        }
+        assert!(
+            CATCHUP_LATENESS_MARGIN_SECS >= 1,
+            "a zero margin would seal at the watermark itself, truncating bars \
+             whose final ticks are still in flight"
+        );
+    }
+
     #[test]
     fn test_ingest_tick_at_yields_a_distinct_sequence_per_packet() {
         // One WebSocket message, two packets for the SAME instrument. If both
@@ -2936,6 +3488,110 @@ mod tests {
                  `{needle}`"
             );
         }
+    }
+
+    /// The market-hours gate on the silence PAGE, at its exact boundaries.
+    ///
+    /// Pure and total, so the edges are pinned without a clock. The gate is
+    /// half-open on purpose: 09:00:00 is in, 15:40:00 is out. An inclusive
+    /// upper bound would page on the very second the persistence window
+    /// closes, which is the one second the whole universe is guaranteed to
+    /// look silent.
+    #[test]
+    fn test_is_within_market_hours_ist_gates_the_silence_page_to_continuous_trading() {
+        let open = CONTINUOUS_SESSION_START_SECS_OF_DAY_IST;
+        let close = u64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+
+        assert!(!is_within_market_hours_ist(0), "midnight is not in session");
+        assert!(
+            !is_within_market_hours_ist(open - 1),
+            "one second before the window opens must NOT page"
+        );
+        assert!(
+            is_within_market_hours_ist(open),
+            "the opening second is in session"
+        );
+        // The pre-open window is the reason this gate is not simply the
+        // persistence window: nothing trades between 09:00 and 09:15, so
+        // every instrument is legitimately silent and a page there would
+        // fire every single trading morning.
+        assert!(
+            !is_within_market_hours_ist(u64::from(TICK_PERSIST_START_SECS_OF_DAY_IST)),
+            "09:00 opens PERSISTENCE, not trading — silence is expected here"
+        );
+        assert!(
+            u64::from(TICK_PERSIST_START_SECS_OF_DAY_IST) < open,
+            "precondition: the persistence window really does open earlier"
+        );
+        assert!(
+            is_within_market_hours_ist(close - 1),
+            "the last second before close is still in session"
+        );
+        assert!(
+            !is_within_market_hours_ist(close),
+            "the closing second is OUT — every instrument goes quiet here by \
+             design, and paging for it would train the operator to ignore this \
+             alert entirely"
+        );
+        assert!(
+            !is_within_market_hours_ist(86_399),
+            "the end of the day is not in session"
+        );
+    }
+
+    /// The scan cadence must not be able to outrun what the detector can
+    /// actually judge.
+    #[test]
+    fn test_silence_scan_interval_is_not_faster_than_the_detector_floor() {
+        let floor_millis =
+            u128::from(tickvault_core::pipeline::tick_gap_detector::DEFAULT_SILENCE_FLOOR_MILLIS);
+        assert!(
+            SILENCE_SCAN_INTERVAL.as_millis() >= floor_millis,
+            "scanning every {:?} cannot surface anything the detector could not \
+             already judge at a {floor_millis} ms floor — it would only burn an \
+             O(n) sweep for no new signal",
+            SILENCE_SCAN_INTERVAL
+        );
+        assert!(
+            SILENCE_SCANS_BEFORE_ALERT >= 2,
+            "one scan is not evidence: a scan landing in the shadow of a \
+             reconnect sees instruments that are legitimately not ticking yet"
+        );
+    }
+
+    /// The read-out exists and is wired into the drain loop.
+    ///
+    /// This is the ratchet for the defect the whole feature answers: the
+    /// detector was seeded and fed on every tick while `scan_silence` had
+    /// ZERO production callers. A wired sensor with no read-out reads greener
+    /// than dead code, so the wiring itself has to be pinned.
+    #[test]
+    fn test_the_drain_actually_asks_the_detector_what_it_recorded() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain function must exist")
+            .1;
+        for needle in [
+            "silence_timer.tick()",
+            "ingest.scan_silence(",
+            "is_within_market_hours_ist(",
+            "SILENCE_SCANS_BEFORE_ALERT",
+        ] {
+            assert!(
+                body.contains(needle),
+                "run_frame_drain must contain `{needle}` — without it the gap \
+                 detector is fed on every tick and never questioned, which is \
+                 exactly the defect this scan was added to close"
+            );
+        }
+        // And the scan must NOT ride the 500 ms flush arm: it is O(n) in
+        // tracked instruments, so at 25,000 instruments that would be a
+        // 25,000-element sweep twice a second.
+        assert!(
+            body.contains("let mut silence_timer"),
+            "the silence scan must have its OWN timer, never the flush timer"
+        );
     }
 
     #[test]

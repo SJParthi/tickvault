@@ -480,12 +480,34 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // (already published by its own log metric filter — auth-failed-alarm.tf;
     // EMF-selecting it would double-bill). Full rationale + the exclusion
     // ledger: the COST NOTE above the CWCFG heredoc in user-data.sh.tftpl.
+    // 54 (was 52) since 2026-08-12 (SILENCE READ-OUT): the lane seeded every
+    // subscribed instrument into a TickGapDetector and called observe() on
+    // every tick, while `scan_silence` had ZERO production callers — a fully
+    // wired sensor with no read-out, which reads greener than dead code
+    // because every part of it looks connected. The scan now runs on its own
+    // 30s timer and publishes two gauges, both selected here:
+    // tv_dhan_feed_instruments_silent (quiet beyond the instrument's OWN
+    // learned cadence, sparse instruments excluded per the §36.4 precedent)
+    // and tv_dhan_feed_instruments_never_ticked. The second matters most: a
+    // subscribe that silently did not take produces NO other signal — there
+    // is no payload to count, no parse to fail, no error to log — so absence
+    // against a seeded key is the only evidence that exists, and leaving it
+    // in a /metrics endpoint nothing on the box scrapes would repeat the
+    // exact mistake the 2026-08-11 and 2026-08-12 additions above corrected.
+    // +2 EXACT names ≈ +$0.60/mo (52 → 54 ≈ $15.60 → $16.20/mo). Dated note:
+    // aws-budget.md (COST NOTE 2026-08-12, silence read-out).
+    //
+    // FLAGGED, deliberately NOT taken here: neither gauge has an ALARM, so
+    // today they are visible but not pageable. An alarm needs the
+    // market-hours window gate (its ALARM_NAMES list arms a named set), which
+    // is its own terraform change — recorded rather than left to be
+    // discovered from a quiet dashboard.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        52,
-        "Z+ L2 VERIFY ratchet: expected exactly 52 names in the MAIN EMF \
+        54,
+        "Z+ L2 VERIFY ratchet: expected exactly 54 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
