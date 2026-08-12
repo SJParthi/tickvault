@@ -104,6 +104,42 @@ fn arb_instrument() -> impl Strategy<Value = InstrumentSubscription> {
     })
 }
 
+/// Segments Dhan's Full Market Depth actually serves.
+///
+/// `docs/dhan-ref/04-full-market-depth-websocket.md:13` — "Only NSE Equity
+/// and Derivatives segments supported".
+const DEPTH_ELIGIBLE_SEGMENTS: [ExchangeSegment; 2] =
+    [ExchangeSegment::NseEquity, ExchangeSegment::NseFno];
+
+/// An instrument in a segment that CAN carry depth.
+fn arb_depth_eligible_instrument() -> impl Strategy<Value = InstrumentSubscription> {
+    (0usize..DEPTH_ELIGIBLE_SEGMENTS.len(), 0u64..40).prop_map(|(index, security_id)| {
+        InstrumentSubscription::new(DEPTH_ELIGIBLE_SEGMENTS[index], security_id)
+    })
+}
+
+/// An instrument in a segment that can NEVER carry depth.
+///
+/// Derived by SUBTRACTION from `ALL_SEGMENTS` rather than listed by hand, so
+/// a segment added to the enum later is automatically covered as ineligible
+/// until someone deliberately adds it to `DEPTH_ELIGIBLE_SEGMENTS`. A
+/// hand-written list would silently stop testing the new segment.
+fn arb_depth_ineligible_instrument() -> impl Strategy<Value = InstrumentSubscription> {
+    let ineligible: Vec<ExchangeSegment> = ALL_SEGMENTS
+        .iter()
+        .copied()
+        .filter(|s| !DEPTH_ELIGIBLE_SEGMENTS.contains(s))
+        .collect();
+    assert!(
+        !ineligible.is_empty(),
+        "if every segment became depth-eligible this generator is vacuous and \
+         the refusal property would pass without testing anything"
+    );
+    (0usize..ineligible.len(), 0u64..40).prop_map(move |(index, security_id)| {
+        InstrumentSubscription::new(ineligible[index], security_id)
+    })
+}
+
 proptest! {
     /// ZERO-LOSS: batching is a pure regrouping — the concatenation of every
     /// produced batch equals the input exactly, in order. Nothing dropped,
@@ -185,17 +221,52 @@ proptest! {
     }
 
     /// Depth-20 batching obeys the same zero-loss property.
+    ///
+    /// Generated from `arb_depth_eligible_instrument` rather than the
+    /// all-segments generator: Dhan serves depth on NSE only
+    /// (`docs/dhan-ref/04-full-market-depth-websocket.md:13`), so a BSE_FNO
+    /// input is REFUSED by the builder and has no batching behaviour to
+    /// preserve. Narrowing the generator keeps this property about batching;
+    /// the refusal itself is proved separately by
+    /// `prop_twenty_depth_refuses_every_ineligible_segment` below.
     #[test]
     fn prop_twenty_depth_preserves_every_instrument(
-        instruments in prop::collection::vec(arb_instrument(), 0..150),
+        instruments in prop::collection::vec(arb_depth_eligible_instrument(), 0..150),
         batch_size in 0usize..150,
     ) {
-        let messages = build_twenty_depth_subscription_messages(&instruments, batch_size);
+        let messages = build_twenty_depth_subscription_messages(&instruments, batch_size)
+            .expect("every generated segment is depth-eligible");
         let expected: Vec<(String, String)> = instruments
             .iter()
             .map(|i| (i.exchange_segment.clone(), i.security_id.clone()))
             .collect();
         prop_assert_eq!(flatten_wire_instruments(&messages), expected);
+    }
+
+    /// ONE ineligible instrument anywhere in the batch refuses the WHOLE batch.
+    ///
+    /// This is the property that closes the 2026-08-12 prod defect: a SENSEX
+    /// (`BSE_FNO`) contract used to build a well-formed depth-20 payload that
+    /// Dhan answered with silence — indistinguishable from a quiet book. The
+    /// position of the offender must not matter, hence the arbitrary split
+    /// point: an implementation that only checked the first element would
+    /// pass a hand-written test and fail here.
+    #[test]
+    fn prop_twenty_depth_refuses_every_ineligible_segment(
+        eligible in prop::collection::vec(arb_depth_eligible_instrument(), 0..20),
+        offender in arb_depth_ineligible_instrument(),
+        split in 0usize..21,
+    ) {
+        let mut instruments = eligible;
+        let at = split.min(instruments.len());
+        instruments.insert(at, offender);
+
+        let result = build_twenty_depth_subscription_messages(&instruments, 100);
+        prop_assert!(
+            result.is_err(),
+            "a depth-ineligible segment at index {at} must refuse the batch — \
+             silence on the wire is indistinguishable from a quiet book"
+        );
     }
 
     /// I-P1-11: dedup collapses ONLY exact `(segment, security_id)` repeats.
@@ -264,7 +335,11 @@ fn instruments(count: usize) -> Vec<InstrumentSubscription> {
 fn test_empty_produces_zero_messages() {
     assert!(build_subscription_messages(&[], FeedMode::Ticker, 100).is_empty());
     assert!(build_unsubscription_messages(&[], FeedMode::Ticker, 100).is_empty());
-    assert!(build_twenty_depth_subscription_messages(&[], 100).is_empty());
+    assert!(
+        build_twenty_depth_subscription_messages(&[], 100)
+            .expect("an empty batch has no segment to refuse")
+            .is_empty()
+    );
 }
 
 #[test]

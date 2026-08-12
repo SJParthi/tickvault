@@ -439,8 +439,14 @@ pub fn build_subscribe_payload(
         ));
     }
     let mut messages = match endpoint {
+        // Depth is NSE-only at the vendor. A BSE_FNO (SENSEX) contract here
+        // used to build a well-formed payload that came back as SILENCE —
+        // indistinguishable from a quiet book. It is now refused through the
+        // same `Refused` path the 200-level endpoint has always used, so the
+        // socket is torn down loudly instead of sitting live and blind.
         DhanEndpointType::Depth20 => {
             build_twenty_depth_subscription_messages(&instruments, batch.len())
+                .map_err(|reason| SubscribePayloadError::Refused { reason })?
         }
         _ => build_subscription_messages(&instruments, feed_mode, batch.len()),
     };
