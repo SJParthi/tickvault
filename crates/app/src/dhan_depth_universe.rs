@@ -50,19 +50,33 @@ use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 /// without touching the connection budget.
 pub const DEPTH_20_ATM_STRIKES_EACH_SIDE: usize = 10;
 
-/// CE/PE pairs that depth-200 subscribes, across all underlyings.
+/// Instruments depth-200 subscribes, across all underlyings.
 ///
-/// depth-200 allows ONE instrument per connection and 5 connections, so the
-/// hard ceiling is 5 instruments — an odd number against a market that trades
-/// in CE/PE pairs.
+/// depth-200 allows ONE instrument per connection and 5 connections, so 5 is
+/// the vendor ceiling AND the budget — an odd number against a market that
+/// trades in CE/PE pairs. Filling it means 2 whole pairs plus one lone leg.
 ///
-/// This takes 2 pairs (4 sockets) and leaves the 5th slot deliberately
-/// EMPTY rather than subscribing a half-pair. A 200-level book on one leg
-/// without the other cannot answer the spread and fill questions this data
-/// exists for, so the "spare" socket would carry cost and produce an
-/// analytically unusable stream. Splitting a pair to reach 5/5 would optimise
-/// the socket count at the expense of the only thing the sockets are for.
-pub const DEPTH_200_MAX_PAIRS: usize = 2;
+/// **This deliberately reverses an earlier decision, so the reversal is
+/// recorded rather than quietly applied.** The constant used to be
+/// `DEPTH_200_MAX_PAIRS = 2`, taking 4 sockets and leaving the 5th empty, on
+/// the stated grounds that a lone leg "cannot answer the spread and fill
+/// questions this data exists for" and would be "analytically unusable".
+///
+/// That reasoning was half right and overstated the half it got wrong. A
+/// 200-level book on a lone leg genuinely cannot answer CE-vs-PE questions —
+/// synthetic parity, straddle spread, relative skew — because those need both
+/// legs at the same strike simultaneously. But the questions a 200-level book
+/// answers MOST of the time are within-leg: how much size rests at each of 200
+/// levels, where the real liquidity cliff is, what a large order would sweep.
+/// A lone leg answers all of those completely. "Unusable" was the wrong word;
+/// "narrower" was the right one, and the difference decides whether the 5th
+/// socket is worth opening.
+///
+/// So the 5th socket is filled with the next-nearest-ATM CE — see
+/// [`DepthSelection::depth_200_lone_leg`], which reports whether a lone leg
+/// was taken so the limitation is visible at the point of USE rather than
+/// only here in a comment.
+pub const DEPTH_200_MAX_SOCKETS: usize = 5;
 
 /// One contract from a chain snapshot, before selection.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +104,19 @@ pub struct DepthSelection {
     pub depth_20: Vec<SubscribeInstrument>,
     /// depth-200 subscription set.
     pub depth_200: Vec<SubscribeInstrument>,
+    /// Whether the last depth-200 socket carries a LONE leg (no partner).
+    ///
+    /// The 5-socket budget is odd and options trade in pairs, so a full
+    /// budget always ends in one unpartnered leg. That leg's 200-level book
+    /// answers every within-leg question (resting size per level, the
+    /// liquidity cliff, sweep cost) and answers NO cross-leg question
+    /// (synthetic parity, straddle spread, relative skew) because its
+    /// partner is not subscribed.
+    ///
+    /// Surfaced as a field rather than left in a comment so any consumer that
+    /// computes a cross-leg quantity can see that the data cannot support it,
+    /// instead of computing a number from a book whose other half is absent.
+    pub depth_200_lone_leg: bool,
     /// Rows whose `contract_security_id` was 0 or negative.
     ///
     /// The chain parser defaults this field to `0` when absent, and the field
@@ -100,6 +127,26 @@ pub struct DepthSelection {
     pub refused_zero_id: usize,
     /// Rows whose underlying has no known contract segment.
     pub refused_unknown_underlying: usize,
+    /// Rows whose contract segment cannot carry market depth AT ALL.
+    ///
+    /// Dhan's Full Market Depth is NSE-only —
+    /// `docs/dhan-ref/04-full-market-depth-websocket.md:13` ("Only NSE Equity
+    /// and Derivatives segments supported") and `:274` ("No BSE, MCX, or
+    /// currency") — and that overview line governs the 20-level and 200-level
+    /// endpoints alike. SENSEX options are `BSE_FNO`, so **no amount of
+    /// configuration can give SENSEX a depth book**; it is a vendor
+    /// limitation, not a budget one.
+    ///
+    /// Refusing here rather than at subscribe time is the whole point. Before
+    /// this counter existed the selector handed BSE_FNO contracts to the
+    /// planner, which opened a socket for them; the depth-200 builder then
+    /// refused the payload and the connection was torn down — one of the five
+    /// authorized 200-level sockets spent, live, on an instrument that can
+    /// never deliver (observed in prod 2026-08-12 09:06:49 IST, `WS-GAP-02`,
+    /// `reason: "... got: BSE_FNO"`). The depth-20 path was worse: it had no
+    /// such builder check, so the same contracts went on the wire and came
+    /// back as silence, which is indistinguishable from a quiet book.
+    pub refused_depth_ineligible_segment: usize,
     /// Rows with a non-finite or non-positive strike/spot.
     pub refused_bad_price: usize,
 }
@@ -127,6 +174,33 @@ pub fn contract_segment_for_underlying(underlying: &str) -> Option<ExchangeSegme
         "SENSEX" | "BANKEX" => Some(ExchangeSegment::BseFno),
         _ => None,
     }
+}
+
+/// Whether a segment can carry Dhan market depth at all.
+///
+/// This is a VENDOR limitation, not ours and not a budget choice:
+/// `docs/dhan-ref/04-full-market-depth-websocket.md:13` states "Only NSE
+/// Equity and Derivatives segments supported" in the OVERVIEW — above the
+/// 20-level and 200-level endpoint sections both — and `:274` repeats it as
+/// "No BSE, MCX, or currency".
+///
+/// The consequence worth stating plainly: **SENSEX can never have a depth
+/// book.** SENSEX options trade in `BSE_FNO`, so no config flag, no extra
+/// socket, and no operator authorization can produce depth for it. Any plan
+/// that counts a SENSEX depth socket is counting a socket that dies on
+/// connect.
+///
+/// Mirrors `subscription_builder::validate_depth_segment`, deliberately.
+/// That function is the last line of defence at payload-build time; this one
+/// is the first, at SELECTION time — and the two must agree. A divergence is
+/// caught by `test_segment_supports_depth_matches_the_builders_own_guard`,
+/// which runs both over every segment.
+#[must_use]
+pub const fn segment_supports_depth(segment: ExchangeSegment) -> bool {
+    matches!(
+        segment,
+        ExchangeSegment::NseEquity | ExchangeSegment::NseFno
+    )
 }
 
 /// Distance from at-the-money. `f64::MAX` for unusable prices so they sort last
@@ -167,6 +241,10 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
             out.refused_unknown_underlying += 1;
             continue;
         };
+        if !segment_supports_depth(segment) {
+            out.refused_depth_ineligible_segment += 1;
+            continue;
+        }
         if atm_distance(c) == f64::MAX {
             out.refused_bad_price += 1;
             continue;
@@ -252,8 +330,27 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
         }
     }
 
+    // ── depth-200: whole pairs first, then one lone leg for the odd socket. ──
+    //
+    // Pairs are taken nearest-ATM first so the two complete books are the two
+    // most informative ones. Only once no WHOLE pair fits in the remaining
+    // budget does a lone leg get taken — so the lone leg is always the LAST
+    // socket, never a pair displaced by a half.
     pair_pool.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for (_, ce, pe) in pair_pool.into_iter().take(DEPTH_200_MAX_PAIRS) {
+    let mut remaining_pairs = pair_pool.into_iter();
+    for (_, ce, pe) in remaining_pairs.by_ref() {
+        // `+ 2` because a pair costs two sockets; a pair that would overflow
+        // the budget is skipped, and the loop falls through to the lone-leg
+        // step below rather than truncating the pair here.
+        if out.depth_200.len().saturating_add(2) > DEPTH_200_MAX_SOCKETS {
+            // The CE of this rejected pair is the nearest-ATM leg still
+            // unspent, which makes it the best candidate for the odd socket.
+            if out.depth_200.len() < DEPTH_200_MAX_SOCKETS {
+                out.depth_200.push(ce);
+                out.depth_200_lone_leg = true;
+            }
+            break;
+        }
         out.depth_200.push(ce);
         out.depth_200.push(pe);
     }
@@ -433,6 +530,7 @@ pub async fn load_depth_universe(
             refused_zero_id = selection.refused_zero_id,
             refused_unknown_underlying = selection.refused_unknown_underlying,
             refused_bad_price = selection.refused_bad_price,
+            refused_depth_ineligible_segment = selection.refused_depth_ineligible_segment,
             "depth universe is EMPTY — depth-20 and depth-200 will open ZERO sockets \
              this session. Expected on the morning after an expiry (yesterday's \
              contracts are dead and today's chain has not been fetched yet); a restart \
@@ -447,6 +545,7 @@ pub async fn load_depth_universe(
             refused_zero_id = selection.refused_zero_id,
             refused_unknown_underlying = selection.refused_unknown_underlying,
             refused_bad_price = selection.refused_bad_price,
+            refused_depth_ineligible_segment = selection.refused_depth_ineligible_segment,
             "depth universe selected from the option chain"
         );
     }
@@ -522,12 +621,12 @@ mod tests {
         assert!(sel.depth_200.is_empty());
     }
 
-    /// depth-200 has 5 slots and the market trades in pairs. Taking 2 whole
-    /// pairs and leaving one slot empty beats splitting a pair to fill it: a
-    /// 200-level book on one leg cannot answer the spread question the data
-    /// exists for.
+    /// depth-200 has 5 slots and options trade in pairs, so a full budget is
+    /// 2 whole pairs plus one lone leg. Pair ORDER is what this pins: the two
+    /// complete books must be the two nearest ATM, and the lone leg must be
+    /// the LAST socket — never a pair displaced by a half.
     #[test]
-    fn test_depth_200_takes_whole_pairs_and_never_splits_one() {
+    fn test_depth_200_fills_all_five_sockets_pairs_first_then_one_lone_leg() {
         let rows = vec![
             candidate("NIFTY", 1, 100.0, "CE"),
             candidate("NIFTY", 2, 100.0, "PE"),
@@ -539,18 +638,50 @@ mod tests {
         let sel = select_depth_universe(&rows);
         assert_eq!(
             sel.depth_200.len(),
-            DEPTH_200_MAX_PAIRS * 2,
-            "whole pairs only — 4 of the 5 slots, never a half-pair to reach 5"
+            DEPTH_200_MAX_SOCKETS,
+            "all five authorized 200-level sockets must be used"
         );
-        // The two nearest-ATM pairs (spot 100) are (1,2) then (3,4).
+        // Nearest-ATM pairs (spot 100) are (1,2) then (3,4); the 5th socket
+        // takes the CE of the next pair — id 5, not id 6.
         let ids: Vec<u64> = sel.depth_200.iter().map(|i| i.security_id).collect();
-        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5],
+            "two whole pairs first, then the nearest unspent CE"
+        );
+        assert!(
+            sel.depth_200_lone_leg,
+            "the lone leg must be REPORTED — a consumer computing a cross-leg \
+             quantity from an unpartnered book would be computing from half \
+             the data with no way to know it"
+        );
     }
 
-    /// A strike carrying only one leg must not be promoted into depth-200 to
-    /// pad the count.
+    /// A budget that only fits whole pairs must NOT report a lone leg.
+    ///
+    /// The flag is what a consumer keys its cross-leg logic off, so a flag
+    /// that is set unconditionally is worse than no flag at all.
     #[test]
-    fn test_lone_leg_never_becomes_a_depth_200_pair() {
+    fn test_lone_leg_flag_is_false_when_the_budget_holds_only_whole_pairs() {
+        let rows = vec![
+            candidate("NIFTY", 1, 100.0, "CE"),
+            candidate("NIFTY", 2, 100.0, "PE"),
+            candidate("NIFTY", 3, 105.0, "CE"),
+            candidate("NIFTY", 4, 105.0, "PE"),
+        ];
+        let sel = select_depth_universe(&rows);
+        assert_eq!(sel.depth_200.len(), 4, "only two pairs exist to take");
+        assert!(
+            !sel.depth_200_lone_leg,
+            "no lone leg was taken, so the flag must stay false"
+        );
+    }
+
+    /// A strike carrying only one leg is not a PAIR and must not be ranked as
+    /// one. It may still reach the odd socket, but only via the lone-leg step
+    /// after the pairs are placed — never ahead of a complete pair.
+    #[test]
+    fn test_a_half_strike_never_displaces_a_whole_pair() {
         let rows = vec![
             candidate("NIFTY", 1, 100.0, "CE"), // no PE at this strike
             candidate("NIFTY", 3, 105.0, "CE"),
@@ -558,7 +689,88 @@ mod tests {
         ];
         let sel = select_depth_universe(&rows);
         let ids: Vec<u64> = sel.depth_200.iter().map(|i| i.security_id).collect();
-        assert_eq!(ids, vec![3, 4], "the lone CE at 100 must be skipped");
+        assert_eq!(
+            ids,
+            vec![3, 4],
+            "the pair at 105 is taken; the lone CE at 100 is nearer ATM but is \
+             not a pair, and with no second pair to reject there is no lone-leg \
+             step to place it"
+        );
+        assert!(!sel.depth_200_lone_leg);
+    }
+
+    /// SENSEX can NEVER have a depth book, and the selector — not the socket —
+    /// is where that has to be enforced.
+    ///
+    /// Regression for the 2026-08-12 prod defect: the selector handed BSE_FNO
+    /// contracts to the planner, one of the five authorized 200-level sockets
+    /// was opened for them, and the builder then refused the payload
+    /// (`WS-GAP-02`, 09:06:49 IST) and tore the connection down. The depth-20
+    /// path had no such check at all, so the same contracts went on the wire
+    /// and came back as silence.
+    #[test]
+    fn test_bse_fno_is_refused_before_it_can_cost_a_socket() {
+        let rows = vec![
+            candidate("SENSEX", 10, 100.0, "CE"),
+            candidate("SENSEX", 11, 100.0, "PE"),
+            candidate("NIFTY", 1, 100.0, "CE"),
+            candidate("NIFTY", 2, 100.0, "PE"),
+        ];
+        let sel = select_depth_universe(&rows);
+
+        assert_eq!(
+            sel.refused_depth_ineligible_segment, 2,
+            "both SENSEX legs must be refused AND counted — a silent skip \
+             would leave the operator unable to explain the missing underlying"
+        );
+        let all: Vec<u64> = sel
+            .depth_20
+            .iter()
+            .chain(sel.depth_200.iter())
+            .map(|i| i.security_id)
+            .collect();
+        assert_eq!(
+            all,
+            vec![1, 2, 1, 2],
+            "only the NIFTY legs survive, in both depth sets"
+        );
+        assert!(
+            sel.depth_20
+                .iter()
+                .chain(sel.depth_200.iter())
+                .all(|i| i.segment != ExchangeSegment::BseFno),
+            "no BSE_FNO instrument may reach either depth set"
+        );
+    }
+
+    /// The selection-time gate and the payload-time gate must agree exactly.
+    ///
+    /// They are two functions in two crates encoding one vendor rule, which is
+    /// precisely the shape that drifts. If a future edit widens one, this
+    /// fails rather than letting the selector queue instruments the builder
+    /// will refuse (a socket opened to die) or — worse — letting the builder
+    /// accept what the selector would have rejected.
+    #[test]
+    fn test_segment_supports_depth_matches_the_builders_own_guard() {
+        use tickvault_core::websocket::subscription_builder::validate_depth_segment;
+
+        for segment in [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::BseFno,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseCurrency,
+        ] {
+            assert_eq!(
+                segment_supports_depth(segment),
+                validate_depth_segment(segment).is_ok(),
+                "selection and payload gates disagree on {segment:?} — one of \
+                 them will admit an instrument the other refuses"
+            );
+        }
     }
 
     /// A chain legitimately carries weeklies AND monthlies. Depth on a far
@@ -618,27 +830,48 @@ mod tests {
         );
     }
 
-    /// The whole point of this source: SENSEX contracts must carry BSE_FNO
-    /// while NIFTY carries NSE_FNO, in one selection.
+    /// Segments are resolved PER UNDERLYING, and the BSE answer is then what
+    /// disqualifies SENSEX from depth entirely.
+    ///
+    /// **This test previously asserted the opposite** — that a SENSEX row
+    /// reaches `depth_20` carrying `BSE_FNO`. It passed, and the behaviour it
+    /// pinned was the 2026-08-12 prod defect: a `BSE_FNO` instrument in a
+    /// depth set costs a socket that either dies on connect (depth-200) or
+    /// sits live and silent (depth-20). The mapping half of the old assertion
+    /// was right and is kept via `contract_segment_for_underlying`; the
+    /// reaches-the-depth-set half was the bug and is now inverted.
     #[test]
-    fn test_segments_are_per_underlying_within_one_selection() {
+    fn test_segments_are_per_underlying_and_bse_is_then_disqualified() {
+        // The mapping itself still distinguishes them — that is what makes the
+        // disqualification possible rather than a blanket refusal.
+        assert_eq!(
+            contract_segment_for_underlying("NIFTY"),
+            Some(ExchangeSegment::NseFno)
+        );
+        assert_eq!(
+            contract_segment_for_underlying("SENSEX"),
+            Some(ExchangeSegment::BseFno)
+        );
+
         let rows = vec![
             candidate("NIFTY", 11, 100.0, "CE"),
             candidate("SENSEX", 22, 100.0, "CE"),
         ];
         let sel = select_depth_universe(&rows);
+
         let nifty = sel
             .depth_20
             .iter()
             .find(|i| i.security_id == 11)
-            .expect("nifty present");
-        let sensex = sel
-            .depth_20
-            .iter()
-            .find(|i| i.security_id == 22)
-            .expect("sensex present");
+            .expect("NIFTY is NSE_FNO and depth-eligible");
         assert_eq!(nifty.segment, ExchangeSegment::NseFno);
-        assert_eq!(sensex.segment, ExchangeSegment::BseFno);
+
+        assert!(
+            sel.depth_20.iter().all(|i| i.security_id != 22),
+            "SENSEX must NOT reach the depth set — Dhan serves no BSE depth, \
+             so this socket could only ever be silent"
+        );
+        assert_eq!(sel.refused_depth_ineligible_segment, 1);
     }
 
     /// Garbage must NOT read as "the chain is empty" — the caller treats those

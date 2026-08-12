@@ -286,15 +286,37 @@ pub fn build_disconnect_message() -> String {
 /// `validate_connection_capacity(EndpointKind::TwentyDepth, n)`; the
 /// per-MESSAGE clamp here remains 100, since the message limit and the
 /// connection limit are different constraints.
+/// # Segment eligibility
+///
+/// Refuses if ANY instrument sits in a segment Dhan's Full Market Depth does
+/// not serve. `docs/dhan-ref/04-full-market-depth-websocket.md:13` puts "Only
+/// NSE Equity and Derivatives segments supported" in the OVERVIEW, above the
+/// 20-level and 200-level sections alike — so the restriction the 200-level
+/// builder has always enforced applies here identically.
+///
+/// It was not enforced here until 2026-08-12, and the asymmetry mattered: a
+/// BSE_FNO (SENSEX) contract sent to the 200-level builder produced a loud
+/// `WS-GAP-02` refusal and a torn-down socket, while the SAME contract sent
+/// here went on the wire and came back as **silence** — which is exactly what
+/// a legitimately quiet order book looks like. The louder failure was the
+/// safer one; this makes both loud.
+///
+/// Refusing the whole batch rather than filtering the offender out is
+/// deliberate: a caller that asked for depth on an ineligible instrument has
+/// a selection bug, and silently serving a subset would hide it behind a
+/// partially-working feed.
 pub fn build_twenty_depth_subscription_messages(
     instruments: &[InstrumentSubscription],
     batch_size: usize,
-) -> Vec<String> {
-    build_batched(
+) -> Result<Vec<String>, String> {
+    for instrument in instruments {
+        validate_depth_segment_str(&instrument.exchange_segment)?;
+    }
+    Ok(build_batched(
         instruments,
         tickvault_common::constants::FEED_REQUEST_TWENTY_DEPTH,
         batch_size,
-    )
+    ))
 }
 
 /// Builds batched 20-level depth unsubscribe messages (RequestCode **25**).
@@ -383,6 +405,30 @@ fn build_two_hundred_depth_message(
 /// currency"). Rejected at BUILD time so an unsupported subscribe is never
 /// put on the wire — Dhan's failure mode for one would be silence, not an
 /// error frame.
+/// The wire-string form of [`validate_depth_segment`].
+///
+/// [`InstrumentSubscription::exchange_segment`] is a `String` (it is the JSON
+/// field Dhan receives), so the 20-level batch path has a string in hand and
+/// no typed segment. Rather than parse-then-validate — which would need a
+/// fallible parse whose failure mode is a THIRD outcome to reason about —
+/// this compares against the two accepted wire strings directly.
+///
+/// Fail-closed by construction: anything that is not exactly one of the two
+/// accepted strings is refused, including a typo, an empty string, or a
+/// segment Dhan adds later. `test_validate_depth_segment_str_agrees_with_the_typed_guard`
+/// runs both guards over every `ExchangeSegment` so the two can never drift.
+pub fn validate_depth_segment_str(segment: &str) -> Result<(), String> {
+    if segment == ExchangeSegment::NseEquity.as_str() || segment == ExchangeSegment::NseFno.as_str()
+    {
+        return Ok(());
+    }
+    Err([
+        "Full Market Depth only supports NSE_EQ and NSE_FNO, got: ",
+        segment,
+    ]
+    .concat())
+}
+
 pub fn validate_depth_segment(segment: ExchangeSegment) -> Result<(), String> {
     match segment {
         ExchangeSegment::NseEquity | ExchangeSegment::NseFno => Ok(()),
@@ -712,7 +758,8 @@ mod tests {
 
     #[test]
     fn test_twenty_depth_subscribe_is_code_23() {
-        let messages = build_twenty_depth_subscription_messages(&make_instruments(1), 100);
+        let messages = build_twenty_depth_subscription_messages(&make_instruments(1), 100)
+            .expect("NSE_FNO is depth-eligible");
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("\"RequestCode\":23"));
     }
@@ -729,7 +776,11 @@ mod tests {
 
     #[test]
     fn test_twenty_depth_empty_returns_empty() {
-        assert!(build_twenty_depth_subscription_messages(&[], 100).is_empty());
+        assert!(
+            build_twenty_depth_subscription_messages(&[], 100)
+                .expect("an empty batch has no segment to refuse")
+                .is_empty()
+        );
         assert!(build_twenty_depth_unsubscription_messages(&[], 100).is_empty());
     }
 
@@ -737,7 +788,8 @@ mod tests {
     fn test_twenty_depth_fifty_is_one_full_connection() {
         // 50 = the per-connection cap (doc 04:76) and still one message.
         let instruments = make_instruments(MAX_INSTRUMENTS_PER_TWENTY_DEPTH_CONNECTION);
-        let messages = build_twenty_depth_subscription_messages(&instruments, 100);
+        let messages = build_twenty_depth_subscription_messages(&instruments, 100)
+            .expect("NSE_FNO is depth-eligible");
         assert_eq!(messages.len(), 1);
         assert_eq!(total_instruments(&messages), 50);
         assert!(validate_connection_capacity(EndpointKind::TwentyDepth, 50).is_ok());
@@ -812,6 +864,59 @@ mod tests {
             let err = validate_depth_segment(segment).unwrap_err();
             assert!(err.contains("NSE_EQ and NSE_FNO"));
             assert!(err.contains(segment.as_str()));
+        }
+    }
+
+    /// The string guard must agree with the typed one on EVERY segment.
+    ///
+    /// They are two encodings of one vendor rule, applied on two different
+    /// code paths (the 20-level batch path has a `String`, the 200-level path
+    /// has an `ExchangeSegment`). If they ever disagree, one path admits an
+    /// instrument the other refuses — which is how the 2026-08-12 asymmetry
+    /// happened in the first place: the 200-level path checked, the 20-level
+    /// path did not, and SENSEX went on the wire and came back as silence.
+    #[test]
+    fn test_validate_depth_segment_str_agrees_with_the_typed_guard() {
+        for segment in [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ] {
+            assert_eq!(
+                validate_depth_segment_str(segment.as_str()).is_ok(),
+                validate_depth_segment(segment).is_ok(),
+                "the two depth guards disagree on {segment:?}"
+            );
+        }
+    }
+
+    /// Anything that is not exactly an accepted wire string is REFUSED.
+    ///
+    /// The string guard compares literals rather than parsing, so its whole
+    /// safety argument rests on being fail-closed: a typo, a case variant, an
+    /// empty string, or a segment Dhan adds later must all land in the refusal
+    /// arm rather than slipping through some lenient parse.
+    #[test]
+    fn test_validate_depth_segment_str_is_fail_closed_on_anything_unrecognised() {
+        for bad in [
+            "",
+            " ",
+            "nse_fno",  // wrong case — the wire form is upper
+            "NSE_FN0",  // digit zero for the letter O
+            " NSE_FNO", // leading space
+            "NSE_FNO ", // trailing space
+            "SOME_FUTURE_SEGMENT",
+        ] {
+            let err = validate_depth_segment_str(bad).unwrap_err();
+            assert!(
+                err.contains("NSE_EQ and NSE_FNO"),
+                "refusal for {bad:?} must name what IS accepted"
+            );
         }
     }
 }
