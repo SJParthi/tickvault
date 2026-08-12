@@ -307,6 +307,40 @@ requires the full §7 dated-quote protocol in
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
 
+## COST NOTE 2026-08-12 — PERSIST-side loss counters reach CloudWatch (+~$1.20/mo)
+
+The 2026-08-11 note below instrumented the revived Dhan live lane at the
+**socket** and left it blind at the **database**. Four counters on the path
+between a received packet and a durable row published nowhere:
+
+| Counter | What a non-zero value means |
+|---|---|
+| `tv_ticks_dropped_total` | buffered rows were DISCARDED on a flush failure — the largest single tick-loss window in the lane |
+| `tv_tick_persist_errors_total` | the ILP client failed to build, connect, or apply DDL |
+| `tv_tick_rows_refused_total` | a row was refused before it reached the buffer |
+| `tv_ws_frame_spill_write_errors_total` | the capture-at-receipt durable floor failed to write |
+
+The last one had been **deliberately excluded** on the recorded grounds that
+"no WS frame producer exists (both live feeds retired 2026-07-13/15)". That
+reason stopped holding on 2026-08-09/11 when the lane was revived, and the
+exclusion silently survived it. It matters more than the others because
+`ws_frame_spill::accept` returns `Spilled` even on a full disk — the writer
+thread drains and discards — so this counter is the ONLY signal that the
+durable floor has stopped holding.
+
+**Cost:** +4 custom metric series ≈ **+$1.20/mo** (48 → 52 EMF-selected names;
+~$14.40 → ~$15.60/mo) against the $100 kill-ceiling whose AUTOMATIC budget
+actions fire `STOP_EC2_INSTANCES` at 90% ($90). Headroom unaffected. Added to
+BOTH allowlist copies in lockstep (`user-data.sh.tftpl` + the reference
+`cloudwatch-agent.json`), count ratchet bumped 48 → 52 with the rationale
+in-place.
+
+**NOT claimed:** that these names now PAGE. The allowlist makes the metric
+exist in CloudWatch; alarms on top of them, and pre-registering each series at
+0 at boot so the first alarm sample is not the outage itself, remain the same
+flagged follow-up the 2026-08-11 note recorded. Stated here rather than left to
+be discovered from a quiet dashboard.
+
 ## COST NOTE 2026-08-11 — Dhan live-lane loss counters reach CloudWatch (+~$2.10/mo)
 
 The Dhan live WebSocket lane was switched ON the same day (operator quote,

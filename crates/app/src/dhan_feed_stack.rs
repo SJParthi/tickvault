@@ -1019,6 +1019,40 @@ const DRAIN_REPORT_EVERY: u64 = 1_024;
 /// O(1) per frame: one fixed-offset parse, one hash lookup in the gap
 /// detector, one hash lookup plus `TF_COUNT` scalar folds in the aggregator,
 /// one ILP row append. No heap allocation in steady state.
+/// Run the SYNCHRONOUS blocking ILP-over-HTTP flush OFF the async worker
+/// (the `order_observability::blocking_flush` house pattern — the same shape
+/// is inlined at `seal_writer_loop.rs`, `groww_order_observability.rs`,
+/// `dhan_order_push_observability.rs`, `order_update_events_boot.rs` and
+/// `cadence_escalation.rs`).
+///
+/// `TickWriter::flush` is a blocking HTTP call bounded by the conf-pinned
+/// `request_timeout=5000`. Called bare on this task it pins a tokio worker;
+/// on a 2-worker host that is HALF the runtime, and the worker it pins is
+/// shared with the WS read loops — which stop pumping pongs and get the
+/// socket dropped. Worse, the drain stops draining, so the 65,536-frame ring
+/// fills in ~13 s at 5,000 fps and every frame after that is refused. Those
+/// frames reach the WAL, but the WAL has no re-fold path, so they never
+/// become rows. A third-party database stall therefore became permanent tick
+/// loss plus a disconnect — via a task that had no business blocking at all.
+///
+/// The runtime-flavor guard is MANDATORY, not stylistic: `block_in_place`
+/// panics on a current-thread runtime, and this module's drain tests are bare
+/// `#[tokio::test]` (current_thread).
+///
+/// `block_in_place` rather than `spawn_blocking` because the closure borrows
+/// `&mut ingest` — no `'static`/`Send` bound, no channel round-trip — and it
+/// converts the CURRENT worker into a blocking thread while the runtime spins
+/// up a replacement, so the effective worker count is preserved.
+fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(flush)
+    } else {
+        flush()
+    }
+}
+
 async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
@@ -1084,7 +1118,7 @@ async fn run_frame_drain(
                 // QuestDB — an unflushed buffer is not storage, it is a leak
                 // with a success counter in front of it.
                 if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD {
-                    ingest.flush();
+                    blocking_flush(|| ingest.flush());
                 }
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
                     publish_fold_depth(&ingest);
@@ -1094,7 +1128,7 @@ async fn run_frame_drain(
             // instrument sit unflushed below the size threshold waiting for a
             // next tick which, at the close, never comes.
             _ = flush_timer.tick() => {
-                ingest.flush();
+                blocking_flush(|| ingest.flush());
                 publish_fold_depth(&ingest);
             }
         }
@@ -1116,7 +1150,7 @@ async fn run_frame_drain(
 
     // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
-    let tail = ingest.flush();
+    let tail = blocking_flush(|| ingest.flush());
     publish_fold_depth(&ingest);
     warn!(
         code = ErrorCode::WsGapConnectionState.code_str(),
@@ -2712,6 +2746,59 @@ mod tests {
     }
 
     // -- structural proofs --------------------------------------------------
+
+    #[test]
+    fn test_drain_never_flushes_bare_on_the_async_worker() {
+        // The drain task owns the ONLY consumer of the frame ring. Its
+        // `flush()` is a SYNCHRONOUS blocking ILP-over-HTTP call bounded by
+        // request_timeout=5000, so calling it bare pins a tokio worker — on a
+        // 2-worker host that is half the runtime, shared with the WS read
+        // loops that must keep pumping pongs. The drain then stops draining
+        // and the 65,536-frame ring fills in ~13s at 5,000 fps; those frames
+        // reach the WAL, which has no re-fold path, so they never become rows.
+        //
+        // Five sibling sites in this workspace already route through the
+        // flavor-guarded helper. This one did not, and nothing caught it,
+        // because "is this call blocking?" is invisible to the type system.
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production_half = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production_half.contains("fn blocking_flush<T>"),
+            "the flavor-guarded blocking_flush helper must exist"
+        );
+        assert!(
+            production_half.contains("block_in_place"),
+            "blocking_flush must actually move the flush off-worker on the \
+             multi-thread runtime"
+        );
+        assert!(
+            production_half.contains("RuntimeFlavor::MultiThread"),
+            "the runtime-flavor guard is mandatory, not stylistic: \
+             block_in_place PANICS on a current_thread runtime and this \
+             module's drain tests are bare #[tokio::test]"
+        );
+
+        // The load-bearing assertion: no production call site may invoke
+        // flush() bare. Written as a search for the bare form so that adding a
+        // FOURTH flush site without the helper fails here rather than in prod.
+        let bare = production_half.matches("ingest.flush()").count();
+        let wrapped = production_half
+            .matches("blocking_flush(|| ingest.flush())")
+            .count();
+        assert_eq!(
+            bare, wrapped,
+            "every production ingest.flush() must be wrapped in blocking_flush; \
+             found {bare} call(s) and {wrapped} wrapped — the difference is a \
+             blocking HTTP call sitting on the async drain task"
+        );
+        assert!(
+            wrapped >= 3,
+            "expected at least the 3 known flush sites (size trigger, time \
+             trigger, shutdown tail); found {wrapped} — did a site get deleted?"
+        );
+    }
 
     #[test]
     fn test_stack_never_reaches_for_an_instrument_download() {
