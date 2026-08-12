@@ -105,7 +105,19 @@ probe-only path never emits it at ERROR**)**, and **CHAIN-04 (added
 the probe_* / warmup_no_token stages are log-only-by-design
 transient/respawn arms**)**, and **BOOT-02, BOOT-03, OMS-GAP-06,
 WS-SPILL-02 (added 2026-08-11, Critical-severity paging-gap sweep** — see
-the dated subsection below this paragraph for the full classification**)**.
+the dated subsection below this paragraph for the full classification**)**,
+and **WS-SPILL-01 (added 2026-08-12** — the sibling that sweep left behind.
+The sweep was scoped to `Severity::Critical`; WS-SPILL-01 is `High`, so the
+WAL writer's own disk failure — the MORE common of the two — stayed unpaged
+while WS-SPILL-02 got an alarm. It matters because `WsFrameSpill::append`
+returns `Spilled` the instant a record enters the crossbeam channel and the
+disk write happens LATER on the writer thread: on a full or unwritable disk
+`persist_record_resilient` counts the failure and returns 0 while every
+caller is still told the frame was durably captured, so the
+capture-at-receipt floor is gone and nothing upstream can tell. Same 3×300s
+shape and `ok_recovery = false` as its sibling — frames that arrived during
+the outage were never written, so a recovering disk does not restore
+them**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added

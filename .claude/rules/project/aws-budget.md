@@ -386,6 +386,32 @@ retirements". The revived lane IS a WS frame producer, so that stated reason
 no longer holds. Recorded rather than silently added — adding it is its own
 cost decision and would make this note's +7 delta untrue.
 
+## COST NOTE 2026-08-12 — WS-SPILL-01 alarm (+~$0.10/mo)
+
+The 2026-08-11 sweep below was scoped to `Severity::Critical`. WS-SPILL-01 is
+`High`, so it fell outside — and the result was that WS-SPILL-02 (the spill
+channel full at the append instant) got an alarm while WS-SPILL-01 (the disk
+refusing the write) did not. That is the wrong half to leave unpaged: a full
+or unwritable data volume is the more common failure, and
+`WsFrameSpill::append` returns `Spilled` the instant a record enters the
+crossbeam channel, so on a bad disk every caller keeps being told the frame
+was durably captured while `persist_record_resilient` counts the failure and
+returns 0. The capture-at-receipt floor is gone with nothing upstream able to
+tell.
+
+**Cost:** +1 errcode log-filter alarm ≈ **+$0.10/mo** (15 → 16 map entries in
+`error-code-alarms.tf`). The derived metric is sparse and dimensionless —
+billed only in hours the code actually fires — so it is near-free at rest.
+Zero new EMF allowlist names (`tv_ws_frame_spill_write_errors_total` was
+already added earlier the same day), zero dashboards, zero Lambdas. Well
+inside the $100 kill ceiling whose 90% line is $90.
+
+**Not claimed:** that this makes the durable floor self-healing. It does not —
+the writer thread deliberately stays alive and retries, and frames that
+arrive while the disk is refusing writes are never written retroactively.
+`ok_recovery = false` for exactly that reason: a recovering disk is not a
+recovered dataset.
+
 ## COST NOTE 2026-08-11 — Critical-severity paging-gap sweep (+~$0.40/mo)
 
 A mechanical sweep of all 167 `ErrorCode` variants found **29** at
