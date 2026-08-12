@@ -502,12 +502,32 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // market-hours window gate (its ALARM_NAMES list arms a named set), which
     // is its own terraform change — recorded rather than left to be
     // discovered from a quiet dashboard.
+    // +1 EXACT name 2026-08-12 (54 → 55 ≈ $16.20 → $16.50/mo):
+    // `tv_dhan_feed_stack_connections` — the per-endpoint OPEN-SOCKET gauge
+    // (`FEED_STACK_CONNECTIONS_GAUGE`, dhan_feed_stack.rs), labelled
+    // main_feed / depth_20 / depth_200.
+    //
+    // Why it belongs here rather than in the "visible enough" pile: the
+    // operator asked how many of the 16 authorized connections were actually
+    // open, and the ONLY way to answer was to `filter-log-events` the app log
+    // for the planning line. The gauge was emitted by the binary and selected
+    // by NOTHING — the same shape as `tv_dhan_ws_ring_bytes_full_total` before
+    // 2026-08-09 and `tv_ws_frame_spill_write_errors_total` before 2026-08-12.
+    // A socket count that lives only in a log line cannot carry an alarm and
+    // cannot be charted, so "is the feed actually connected?" stayed a
+    // grep-the-logs question on a system whose whole point is live capture.
+    //
+    // FLAGGED, deliberately NOT taken here: this gauge has no ALARM either.
+    // The obvious one — main_feed drops to 0 during market hours — needs the
+    // market-hours window gate's ALARM_NAMES list, which is its own terraform
+    // change. Recorded rather than left to be discovered from a quiet
+    // dashboard.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        54,
-        "Z+ L2 VERIFY ratchet: expected exactly 54 names in the MAIN EMF \
+        55,
+        "Z+ L2 VERIFY ratchet: expected exactly 55 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
