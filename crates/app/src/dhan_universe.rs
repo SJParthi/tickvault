@@ -133,6 +133,18 @@ const BUILD_DEADLINE_SECS: u64 = 900;
 /// Directory for the resolved mapping artifact.
 const MAPPING_DIR: &str = "data/instrument-cache";
 
+/// Path of the day's resolved mapping artifact.
+///
+/// Shared by the writer here and the reader in `dhan_live_universe`, on
+/// purpose. Two copies of this filename would have a silent failure mode: the
+/// reader looks for a name the writer never produces, finds nothing, and falls
+/// back to the index universe — which is indistinguishable from "the master
+/// resolved nothing usable" in every log line and counter.
+#[must_use]
+pub fn mapping_artifact_path(date_ist: &str) -> std::path::PathBuf {
+    std::path::Path::new(MAPPING_DIR).join(format!("dhan-nse-mapping-{date_ist}.json"))
+}
+
 /// Today's IST date as `YYYY-MM-DD`, recomputed per attempt.
 ///
 /// Never frozen at spawn: a retry loop that crosses IST midnight must name
@@ -595,7 +607,7 @@ fn write_mapping_atomic(
             .collect(),
     };
     std::fs::create_dir_all(MAPPING_DIR)?;
-    let path = std::path::Path::new(MAPPING_DIR).join(format!("dhan-nse-mapping-{date}.json"));
+    let path = mapping_artifact_path(date);
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&artifact)?)?;
     std::fs::rename(&tmp, &path)?;

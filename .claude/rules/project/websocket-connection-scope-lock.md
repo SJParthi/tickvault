@@ -765,6 +765,78 @@ never log the URL) is likewise already locked and binds this rebuild verbatim.
 - Presents a build that resolved zero constituents as success — a zero-row join
   passing a "no mismatches" check is the false-OK class this file exists to stop.
 
+### 2026-08-11 (FOURTH QUOTE) — master-sourced live universe authorized to be BUILT, shipped DEFAULT-OFF
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Just go ahead and fix everything dude okau"
+
+**Read this section before treating that quote as broader than it is.** It is a
+GENERAL reaffirmation, not a targeted instruction about the subscription set.
+What makes it usable here is what it answered: the immediately preceding message
+named this work explicitly — *"Fork B (widening the live subscription)"* — and
+stated its magnitude, *"from 4 instruments to ~25,000"*, alongside the
+recommendation that it be built but not activated before the first live probe.
+The operator read that and said fix everything.
+
+That is the same authorization shape §28.2 and §28.3 of
+`daily-universe-scope-expansion-2026-05-27.md` already accept ("go ahead and fix
+and implement eveuthign dude okay>" and "fi everyhtugn dude oaky?"), where a
+general go-ahead selected work the preceding message had enumerated. It is
+recorded HERE, before any implementation, because this file's own third-quote
+section requires exactly that.
+
+#### The tension with the THIRD quote, stated rather than glossed
+
+The third quote of the same day carved this out in as many words: *"the rider
+emits a mapping; it does NOT re-point the live subscription set at it… Building
+the pipeline is ordered here; re-pointing the lane is not, and must not be
+smuggled in."*
+
+A general "fix everything" does not obviously overturn a specific carve-out, and
+this section does not pretend that it does. It resolves the tension the only way
+that is safe in both directions:
+
+| | |
+|---|---|
+| **Authorized here** | BUILDING the master-sourced universe path, and landing it in the tree |
+| **NOT authorized here** | Any change to what we actually subscribe |
+| **Mechanism** | The path ships **DEFAULT-OFF**. Nothing is re-pointed; the live set stays the 4 hardcoded index SIDs until a human flips the flag |
+
+So the carve-out is honoured in substance — the thing it protects is the live
+subscription set, and that set does not move. What lands is code that *can* move
+it, sitting behind an off switch.
+
+#### Flipping the default needs its own explicit go, and should wait for the probe
+
+Not merely as protocol. **2026-08-12 is this lane's first live session since the
+2026-07-13 retirement** — it has never received a Dhan tick. Taking that session
+from 4 instruments to ~25,000 means any failure arrives as an unreadable pile
+instead of a diagnosable signal. The 4-index probe first, then widen, is the only
+ordering that produces an answer.
+
+The recorded reasons for the retirement are also still unrepaired, because they
+were never ours to repair: p99 delivery lag 46.37 s (max 198.69 s) against
+Groww's 562 ms on the same host in the same minutes, and 29–67 silent
+instruments per minute. Widening the universe multiplies whatever that feed
+actually does; it does not improve it.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships the master-sourced universe **enabled by default**, in any config file,
+  env var, deploy script, or serde default.
+- Widens the live set without the boot-time envelope check, so a master that
+  returns more SIDs than the authorized 5 main-feed connections can carry takes
+  the WHOLE lane down (`plan_pool` refuses the entire pool, not just the excess).
+- Subscribes an instrument the master did not resolve, or one whose segment was
+  inferred rather than read.
+- Presents an empty or partial master-sourced set as "widened" — an empty set
+  silently falls back to the index universe, and reporting that as success is the
+  false-OK this file exists to stop.
+- Flips the default ON without a fresh dated quote in THIS section recording the
+  operator's explicit go AFTER a live probe.
+
 ### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
 
 Operator Parthiban, 2026-07-24 (verbatim quotes preserved in

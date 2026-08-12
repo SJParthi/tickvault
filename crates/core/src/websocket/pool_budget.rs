@@ -241,6 +241,18 @@ impl DhanEndpointType {
         }
     }
 
+    /// Total instruments this endpoint type can carry across its whole
+    /// authorized pool — `max_connections × max_instruments_per_connection`.
+    ///
+    /// Exists so callers sizing a subscription set never multiply those two
+    /// numbers themselves. A set larger than this makes `plan_pool` refuse the
+    /// ENTIRE pool, not just the excess, so an off-by-one in a caller's own
+    /// arithmetic takes the whole endpoint down rather than degrading it.
+    #[must_use]
+    pub const fn subscription_capacity(self) -> usize {
+        self.max_connections() as usize * self.max_instruments_per_connection() as usize
+    }
+
     /// Max instruments this endpoint type accepts in ONE JSON subscribe
     /// message. A larger set is dispatched as several sequential messages on
     /// the same connection.
@@ -574,6 +586,40 @@ mod tests {
         assert_eq!(
             DEPTH_200_INSTRUMENTS_PER_CONNECTION as usize,
             MAX_INSTRUMENTS_PER_TWO_HUNDRED_DEPTH_CONNECTION
+        );
+    }
+
+    #[test]
+    /// The whole point of this helper is that callers never do the
+    /// multiplication themselves. If it ever disagrees with its own two
+    /// inputs, a caller sizing a subscription set against it would build a
+    /// set `plan_pool` then refuses WHOLESALE — taking the endpoint down
+    /// rather than degrading it.
+    #[test]
+    fn test_subscription_capacity_is_connections_times_instruments() {
+        for endpoint in [
+            DhanEndpointType::MainFeed,
+            DhanEndpointType::Depth20,
+            DhanEndpointType::Depth200,
+            DhanEndpointType::OrderUpdate,
+        ] {
+            assert_eq!(
+                endpoint.subscription_capacity(),
+                endpoint.max_connections() as usize
+                    * endpoint.max_instruments_per_connection() as usize,
+                "{} capacity must equal its own two inputs",
+                endpoint.as_str()
+            );
+        }
+        // The authorized envelopes, spelled out so a silent budget change is
+        // visible here and not only in the constants.
+        assert_eq!(DhanEndpointType::MainFeed.subscription_capacity(), 25_000);
+        assert_eq!(DhanEndpointType::Depth20.subscription_capacity(), 250);
+        assert_eq!(DhanEndpointType::Depth200.subscription_capacity(), 5);
+        assert_eq!(
+            DhanEndpointType::OrderUpdate.subscription_capacity(),
+            0,
+            "the order-update socket carries no instrument subscriptions"
         );
     }
 
