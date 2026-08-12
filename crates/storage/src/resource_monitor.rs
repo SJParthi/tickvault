@@ -275,6 +275,19 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
                 }
                 (None, _) => {
                     m_probe_failed.increment(1);
+                    // A blind probe must not read like a healthy one. Until
+                    // 2026-08-12 these three arms incremented a counter that
+                    // was in no EMF selector and had no log, so an fd probe
+                    // that could not read /proc looked exactly like an fd
+                    // count comfortably under budget -- the monitor reported
+                    // nothing and the operator concluded nothing was wrong.
+                    // Sibling arms in this same match already log; only the
+                    // failure arms were mute.
+                    warn!(
+                        "resource monitor: fd probe FAILED -- open-fd count is \
+                         UNKNOWN this cycle, not known-good. A socket leak \
+                         would be invisible until connect() starts failing."
+                    );
                 }
             }
 
@@ -302,6 +315,13 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
                 }
                 None => {
                     m_probe_failed.increment(1);
+                    // Same class as the fd arm above: an unreadable RSS is
+                    // UNKNOWN, not fine. Silence here would hide a memory
+                    // climb on a host whose whole sizing argument is memory.
+                    warn!(
+                        "resource monitor: RSS probe FAILED -- process memory is \
+                         UNKNOWN this cycle, not known-good."
+                    );
                 }
             }
 
@@ -336,6 +356,14 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
                 }
                 DiskHealthOutcome::ProbeFailed { .. } => {
                     m_probe_failed.increment(1);
+                    // Same class again. A spill directory whose free space
+                    // cannot be read is the one place silence is least
+                    // affordable: the spill tier IS the durability floor when
+                    // QuestDB is unreachable.
+                    warn!(
+                        "resource monitor: spill-dir free-space probe FAILED -- \
+                         spill headroom is UNKNOWN this cycle, not known-good."
+                    );
                 }
             }
         }
