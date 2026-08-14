@@ -252,3 +252,34 @@ copies drift on token refresh, which is the one behaviour that must be identical
 consuming BEFORE the depth universe resolves. If that ordering inverts, the change
 trades 5 working sockets for 0 during market hours — the exact failure this plan
 exists to avoid.
+
+**H-D. The sender-clone vs ring-close tension — FOUND AND RESOLVED 2026-08-14.**
+
+H-B says the depth task must own a `frame_tx` clone (so the `:2195` drop is not
+delayed). But a held clone keeps the ring OPEN for the entire ~45-minute wait, so if
+every main-feed socket died in that window the drain could not close and the lane
+would look alive while producing nothing — reintroducing, from a new direction, the
+exact false-OK this plan exists to remove. H-B and the ring-close invariant are in
+direct tension, and the plan as first written did not resolve it.
+
+**Resolution: the depth task holds a `tokio::sync::mpsc::WeakSender`, not a
+`Sender`.** Verified against the pinned dependency, not assumed —
+`tokio-1.53.1/src/sync/mpsc/bounded.rs`: `WeakSender<T>` (`:56`),
+`Sender::downgrade()` (`:1576`), `WeakSender::upgrade() -> Option<Sender<T>>`
+(`:1665`).
+
+Shape:
+- main flow: `let depth_weak = frame_tx.downgrade();` then `drop(frame_tx)` stays
+  EXACTLY where it is at `:2195` — a weak handle does not keep the channel open.
+- depth task, once the universe resolves: `let Some(tx) = depth_weak.upgrade() else
+  { /* ring already closed — the lane went dark while we waited; log coded and
+  return */ };` then build the `WalRingSink` from `tx` and dial.
+
+This is strictly better than a bare clone: it not only preserves the close
+invariant, it gives depth a CORRECT answer when the lane died during the wait —
+it declines to dial into a dead ring instead of opening sockets that feed nothing.
+
+With H-D resolved, the remaining work is mechanical: extract the dial body
+(`:2126-2191`) into a reusable fn, move `pool` into the spawned depth task
+(confirmed no use after the loop), and add the bounded retry loop around
+`load_depth_universe(&params.questdb, ist_midnight_nanos(today))`.
