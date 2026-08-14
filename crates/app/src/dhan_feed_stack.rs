@@ -1903,6 +1903,209 @@ pub struct DhanFeedStackParams {
 // The gate, the universe and the plan are each unit-tested below;
 // `test_spawn_dhan_feed_stack_is_refused_when_the_lane_is_disabled` covers the
 // disabled path, which is the only path any boot takes today.
+/// How often the depth late-attach re-asks for its instrument set.
+///
+/// The option-chain leg fires once a minute, so a shorter poll only re-reads
+/// the same table; a longer one delays depth past the strikes it selected.
+pub const DEPTH_ATTACH_RETRY_SECS: u64 = 60;
+
+/// IST second-of-day past which the depth late-attach gives up for the session.
+///
+/// 10:00 IST — 44 minutes after the option-chain leg's first fire. Past this,
+/// a still-empty chain is not "not yet", it is broken, and quietly polling a
+/// broken table until 15:30 would report nothing while looking busy.
+pub const DEPTH_ATTACH_DEADLINE_IST_SECS: u32 = 10 * 3_600;
+
+/// Current IST second-of-day.
+fn ist_second_of_day_now() -> u32 {
+    let now_ist = chrono::Utc::now().timestamp().saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    u32::try_from(now_ist.rem_euclid(i64::from(tickvault_common::constants::SECONDS_PER_DAY)))
+        .unwrap_or(0)
+}
+
+/// Poll for depth's instrument set and dial its sockets when it arrives.
+///
+/// See the call site for why this exists at all (the set is published ~45
+/// minutes after this stack spawns) and why the sender is weak.
+///
+/// Fail-CLOSED and LOUD at the deadline: zero depth sockets with a coded error
+/// naming the reason, never a silent session that looks configured.
+async fn attach_depth_when_available(
+    mut pool: PoolSupervisor,
+    questdb: tickvault_common::config::QuestDbConfig,
+    client_id: String,
+    spill: Arc<WsFrameSpill>,
+    frame_weak: tokio::sync::mpsc::WeakSender<CapturedFrame>,
+    ring_budget: Arc<RingByteBudget>,
+) {
+    let mut attempts: u32 = 0;
+    loop {
+        if ist_second_of_day_now() >= DEPTH_ATTACH_DEADLINE_IST_SECS {
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                attempts,
+                "depth late-attach gave up: option_chain_1m still yielded no depth candidates by \
+                 the 10:00 IST deadline, so depth-20 and depth-200 will carry NO data this \
+                 session. Check that the option-chain leg is running and that \
+                 contract_security_id is populated."
+            );
+            return;
+        }
+        // Re-derived every attempt, never hoisted: this task can outlive an
+        // IST midnight, and a hoisted date would then query yesterday forever.
+        let selection = crate::dhan_depth_universe::load_depth_universe(
+            &questdb,
+            crate::dhan_universe::ist_midnight_nanos(&crate::dhan_universe::today_ist_date()),
+        )
+        .await;
+        attempts = attempts.saturating_add(1);
+
+        if !selection.depth_20.is_empty() || !selection.depth_200.is_empty() {
+            // Upgrade LAST, immediately before dialing. `None` means every
+            // socket died and the ring closed while we waited — dialing into a
+            // closed ring would open sockets whose frames reach nothing.
+            let Some(frame_tx) = frame_weak.upgrade() else {
+                warn!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    attempts,
+                    depth_20 = selection.depth_20.len(),
+                    depth_200 = selection.depth_200.len(),
+                    "depth late-attach resolved its instruments but the frame ring had already \
+                     closed — the lane went dark while it waited. Refusing to dial sockets whose \
+                     frames would reach no consumer."
+                );
+                return;
+            };
+            match build_feed_stack_plan(
+                &mut pool,
+                Instant::now(),
+                &[],
+                &selection.depth_20,
+                &selection.depth_200,
+            ) {
+                Ok(plan) => {
+                    let dialed = dial_planned_connections(
+                        plan,
+                        &mut pool,
+                        &client_id,
+                        &spill,
+                        &frame_tx,
+                        &ring_budget,
+                    );
+                    info!(
+                        dialed,
+                        attempts,
+                        depth_20 = selection.depth_20.len(),
+                        depth_200 = selection.depth_200.len(),
+                        "depth late-attach opened its sockets: the option-chain leg published \
+                         today's contracts and depth dialed against them without a restart"
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        ?err,
+                        depth_20 = selection.depth_20.len(),
+                        depth_200 = selection.depth_200.len(),
+                        "depth late-attach resolved its instruments but planning refused them — \
+                         depth carries no data this session"
+                    );
+                }
+            }
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(DEPTH_ATTACH_RETRY_SECS)).await;
+    }
+}
+
+/// Dial every connection in `plan`, returning how many sockets were opened.
+///
+/// Extracted from `run_dhan_feed_stack` so BOTH dial phases share one body: the
+/// main feed dials at market open, and depth dials later, once the option-chain
+/// leg has populated the table depth's instrument set is derived from. Two
+/// copies of this loop would be free to drift on the token-refresh closure —
+/// the one behaviour that must be identical on every endpoint, because a
+/// depth socket that re-dials with a stale JWT after an 807 never recovers.
+fn dial_planned_connections(
+    plan: FeedStackPlan,
+    pool: &mut PoolSupervisor,
+    client_id: &str,
+    spill: &Arc<WsFrameSpill>,
+    frame_tx: &tokio::sync::mpsc::Sender<CapturedFrame>,
+    ring_budget: &Arc<RingByteBudget>,
+) -> usize {
+    let mut dialed = 0usize;
+    for planned in plan.connections {
+        let endpoint = planned.slot.endpoint;
+        let Some(base_url) = base_url_for(endpoint) else {
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                endpoint = endpoint.as_str(),
+                "the live-feed stack was asked to dial a non-market-data endpoint — refusing. \
+                 The order-update socket belongs to the Dhan REST stack and its spawn is \
+                 retired (scope-lock §A.1)."
+            );
+            continue;
+        };
+        let Some(supervisor) = pool.connection_mut(planned.slot.global_index).map(|s| {
+            // Take the supervisor's state by value: `run_connection` drives one
+            // connection for its whole life and must own its policy object.
+            core::mem::replace(s, ConnectionSupervisor::new(planned.slot, Instant::now()))
+        }) else {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                endpoint = endpoint.as_str(),
+                pool_index = planned.slot.pool_index,
+                "planned connection has no registered supervisor — skipping it rather than \
+                 dialing an unsupervised socket"
+            );
+            continue;
+        };
+
+        let socket = DhanFeedSocketImpl::new(
+            DhanSocketParams::new(endpoint, base_url.to_string(), client_id.to_string()),
+            current_feed_token,
+        );
+        let sink = Arc::new(WalRingSink::new(
+            Arc::clone(spill),
+            frame_tx.clone(),
+            Arc::clone(ring_budget),
+            WsType::LiveFeed,
+            endpoint,
+        ));
+        let guard = planned.guard;
+        tokio::spawn(async move {
+            let exit = run_connection(socket, supervisor, guard, sink, || async {
+                // Post-807/809 re-dial: ask the token manager for a fresh JWT
+                // before presenting a credential again. Failure is logged by
+                // the manager and left to the reconnect ladder — re-dialing
+                // with the stale token is the supervisor's own next step and
+                // it will park after the ladder is exhausted.
+                if let Some(manager) = global_token_manager()
+                    && let Err(err) = manager.force_renewal().await
+                {
+                    warn!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        %err,
+                        "Dhan live feed could not refresh its token before re-dialing"
+                    );
+                }
+            })
+            .await;
+            info!(
+                endpoint = endpoint.as_str(),
+                pool_index = planned.slot.pool_index,
+                ?exit,
+                "supervised Dhan live-feed connection finished"
+            );
+        });
+        dialed = dialed.saturating_add(1);
+    }
+    dialed
+}
+
 pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task::JoinHandle<()>> {
     let env_opt_in = std::env::var(DHAN_LIVE_FEED_ENV).ok();
     let gate = feed_stack_gate(params.dhan_enabled, env_opt_in.as_deref());
@@ -2122,76 +2325,41 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     let drain = tokio::spawn(run_frame_drain(frame_rx, ingest, Arc::clone(&ring_budget)));
 
     // ---- the sockets -------------------------------------------------------
-    let mut dialed = 0usize;
-    for planned in plan.connections {
-        let endpoint = planned.slot.endpoint;
-        let Some(base_url) = base_url_for(endpoint) else {
-            error!(
-                code = ErrorCode::WsGapConnectionState.code_str(),
-                endpoint = endpoint.as_str(),
-                "the live-feed stack was asked to dial a non-market-data endpoint — refusing. \
-                 The order-update socket belongs to the Dhan REST stack and its spawn is \
-                 retired (scope-lock §A.1)."
-            );
-            continue;
-        };
-        let Some(supervisor) = pool.connection_mut(planned.slot.global_index).map(|s| {
-            // Take the supervisor's state by value: `run_connection` drives one
-            // connection for its whole life and must own its policy object.
-            core::mem::replace(s, ConnectionSupervisor::new(planned.slot, Instant::now()))
-        }) else {
-            warn!(
-                code = ErrorCode::WsGapConnectionState.code_str(),
-                endpoint = endpoint.as_str(),
-                pool_index = planned.slot.pool_index,
-                "planned connection has no registered supervisor — skipping it rather than \
-                 dialing an unsupervised socket"
-            );
-            continue;
-        };
+    let dialed =
+        dial_planned_connections(plan, &mut pool, &client_id, &spill, &frame_tx, &ring_budget);
 
-        let socket = DhanFeedSocketImpl::new(
-            DhanSocketParams::new(endpoint, base_url.to_string(), client_id.clone()),
-            current_feed_token,
-        );
-        let sink = Arc::new(WalRingSink::new(
+    // Depth late-attach. Depth's instrument set is derived from
+    // `option_chain_1m`, which the option-chain leg does not populate until its
+    // first fire at 09:16 IST — but this stack is spawned at boot (~08:30). A
+    // boot-time load therefore asks for the set ~45 minutes before it exists,
+    // which is why depth has opened ZERO of its ten authorized sockets every
+    // session, and why the empty-selection log prescribed a manual restart.
+    //
+    // A WEAK sender, never a clone: a held `Sender` would keep the ring open
+    // for the whole wait, so if every main-feed socket died in that window the
+    // drain could not close and the lane would read alive while producing
+    // nothing — the same false-OK, arriving from a new direction. `upgrade()`
+    // additionally gives depth a CORRECT answer when the lane died while it
+    // waited: it declines to dial into a dead ring rather than opening sockets
+    // that feed nothing.
+    //
+    // Spawned only when the operator supplied no depth set at boot; an
+    // explicit set is already dialed above and must not be second-guessed.
+    if params.depth_20_instruments.is_empty() && params.depth_200_instruments.is_empty() {
+        tokio::spawn(attach_depth_when_available(
+            pool,
+            params.questdb.clone(),
+            client_id.clone(),
             Arc::clone(&spill),
-            frame_tx.clone(),
+            frame_tx.downgrade(),
             Arc::clone(&ring_budget),
-            WsType::LiveFeed,
-            endpoint,
         ));
-        let guard = planned.guard;
-        tokio::spawn(async move {
-            let exit = run_connection(socket, supervisor, guard, sink, || async {
-                // Post-807/809 re-dial: ask the token manager for a fresh JWT
-                // before presenting a credential again. Failure is logged by
-                // the manager and left to the reconnect ladder — re-dialing
-                // with the stale token is the supervisor's own next step and
-                // it will park after the ladder is exhausted.
-                if let Some(manager) = global_token_manager()
-                    && let Err(err) = manager.force_renewal().await
-                {
-                    warn!(
-                        code = ErrorCode::WsGapConnectionState.code_str(),
-                        %err,
-                        "Dhan live feed could not refresh its token before re-dialing"
-                    );
-                }
-            })
-            .await;
-            info!(
-                endpoint = endpoint.as_str(),
-                pool_index = planned.slot.pool_index,
-                ?exit,
-                "supervised Dhan live-feed connection finished"
-            );
-        });
-        dialed = dialed.saturating_add(1);
     }
+
     // Drop the template sender: while it lived, the ring could never close, so
     // the drain would hang forever after the last socket died instead of
-    // reporting that the lane went dark.
+    // reporting that the lane went dark. The depth attach holds only a WEAK
+    // handle, so this drop stays exactly where it has always been.
     drop(frame_tx);
 
     if dialed == 0 {
@@ -2931,13 +3099,25 @@ mod tests {
         let verification = production
             .find("spawn_daily_crossverify(&params.main_feed_instruments)")
             .expect("the verification floor must exist");
-        // `run_connection` is the call that actually opens a socket. Anchoring
-        // on the bare word "dial" matched a doc comment hundreds of lines
-        // earlier and made this assertion pass for the wrong reason — the
-        // same read-the-prose-not-the-code mistake the wiring guard made.
+        // Anchor on the CALL SITE, not the socket-opening statement.
+        //
+        // This used to search for `run_connection(socket`, which lives inside
+        // the dial loop. That worked while the loop was inline in
+        // `run_dhan_feed_stack`, but the loop was extracted into
+        // `dial_planned_connections` (2026-08-14) so both dial phases — main
+        // feed at open, depth after 09:16 — share one body. The helper is
+        // DEFINED above `run_dhan_feed_stack` and CALLED below the refusal, so
+        // a text-position search now reports the dial as "first" purely because
+        // of where the function sits in the file.
+        //
+        // The invariant this test exists for is about EXECUTION order, and the
+        // call site is what carries it. Anchoring on the definition made the
+        // guard sensitive to code motion that changes nothing it cares about —
+        // the same class of mistake as the earlier bare-"dial" anchor that
+        // matched a doc comment.
         let dial = production
-            .find("run_connection(socket")
-            .expect("the dial site must exist");
+            .find("dial_planned_connections(plan")
+            .expect("the dial call site must exist inside the bring-up");
 
         assert!(
             refusal < verification,
@@ -4055,6 +4235,71 @@ mod tests {
         assert!(
             !tail_at(9, 59),
             "09:59 is NOT the tail — that is the skew signature"
+        );
+    }
+
+    /// THE regression that would cost real ticks: the depth late-attach must
+    /// never sit between the main-feed dial and the ring's template drop.
+    ///
+    /// Depth waits until ~09:16 IST. If that wait were inline, the main feed
+    /// would dial 45 minutes late and the lane would miss the open — trading 5
+    /// working sockets for 0, which is strictly worse than the 5-of-16 this
+    /// change exists to improve on.
+    #[test]
+    fn test_depth_late_attach_cannot_delay_the_main_feed_dial() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let main_dial = production
+            .find("dial_planned_connections(plan")
+            .expect("the main-feed dial call site must exist");
+        let depth_attach = production
+            .find("tokio::spawn(attach_depth_when_available(")
+            .expect("the depth late-attach SPAWN SITE must exist (anchor on the call, never the definition — the helper is defined above the bring-up)");
+        assert!(
+            main_dial < depth_attach,
+            "the main feed must be dialed BEFORE the depth late-attach is set up — depth waits \
+             ~45 minutes for the option-chain leg, and doing that first would cost the market open"
+        );
+        assert!(
+            production.contains("tokio::spawn(attach_depth_when_available("),
+            "the depth late-attach MUST be spawned, never awaited inline — an inline await \
+             would block the bring-up (and therefore the template-sender drop) for the whole wait"
+        );
+    }
+
+    /// The depth task must hold a WEAK sender.
+    ///
+    /// A held `Sender` clone keeps the frame ring OPEN for the whole wait, so
+    /// if every main-feed socket died in that window the drain could not close
+    /// and the lane would read alive while producing nothing — the same
+    /// false-OK this lane's observability work exists to remove, arriving from
+    /// a new direction.
+    #[test]
+    fn test_depth_late_attach_holds_only_a_weak_sender() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        assert!(
+            production.contains("frame_tx.downgrade()"),
+            "the depth late-attach must be handed a WeakSender via downgrade(), never a clone"
+        );
+        assert!(
+            production.contains("frame_weak.upgrade()"),
+            "the depth task must upgrade() at dial time so it declines to dial into a ring that \
+             closed while it waited"
+        );
+        // The template drop must still be present and must NOT have been moved
+        // behind the attach: that drop is what lets the ring close at all.
+        let downgrade = production
+            .find("frame_tx.downgrade()")
+            .expect("downgrade site");
+        let drop_site = production
+            .find("drop(frame_tx);")
+            .expect("the template-sender drop must still exist");
+        assert!(
+            downgrade < drop_site,
+            "downgrade() must happen before the template sender is dropped"
         );
     }
 }
