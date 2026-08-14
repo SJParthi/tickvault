@@ -244,6 +244,98 @@ trial-first locks whose implementation PRs never started). Reaching ~25,000 inst
 requires a feed trial plus its own dated scope edits to
 `websocket-connection-scope-lock.md` and this file — deliberately NOT authorized here.
 
+**Quote 15 (2026-08-12, r8g.xlarge FINALISED — preserve EXACTLY, typos included):**
+> "dude this is our finalsied instancue dude okay? just sue this evrywhere neitlrey dude okay?Instance type — terraform says r8g.xlarge (32 GiB),"
+
+Given in direct response to an audit line reporting the instance type as an
+UNCONFIRMED blocker — *"terraform says `r8g.xlarge` (32 GiB), live box was
+`t4g.medium` (4 GiB) after the capacity-refused flip rolled back"*. The
+operator resolves that ambiguity: **r8g.xlarge is FINAL and is the value every
+surface must carry.** This does not change the Quote 13 sizing decision; it
+CONFIRMS it and orders the remaining drift closed.
+
+**What this quote settles (the drift it was given to close).** Quote 13 pinned
+r8g.xlarge in `variables.tf` (default + validation) and in §7 above, but four
+surfaces were left behind — and one of them was live-dangerous:
+
+| Surface | Was | Now |
+|---|---|---|
+| `.github/workflows/downsize-instance.yml` `TO_TYPE` | **`t4g.large`** — a manually-dispatchable workflow that would have moved the box OFF the locked type | `r8g.xlarge` |
+| `scripts/aws-upgrade-instance.sh` `--to` default | `t4g.medium` | `r8g.xlarge` |
+| `aws-budget.md` H1 | "t4g.medium LOCKED ~₹1,022/mo" | r8g.xlarge, with the real bill |
+| `variables.tf` AMI description | "t4g.medium is Graviton" | r8g.xlarge is Graviton4 |
+
+The `downsize-instance.yml` row is the one that mattered: the lock lived in
+terraform's validation, which only binds `terraform apply`. That workflow
+mutates the instance through `ec2 modify-instance-attribute` directly, so it
+never consulted the validation at all — a lock the enforcement path could walk
+straight past.
+
+**⚠ WHAT THIS QUOTE DOES NOT DO — the live box (Rule 11, no false-OK).**
+Recording r8g.xlarge everywhere in the repository does NOT make the running
+instance r8g.xlarge. The only recorded flip attempt (2026-08-07, Quote 12,
+t4g.large) was REFUSED by AWS with `InsufficientInstanceCapacity` and rolled
+back; no successful r8g.xlarge apply is recorded anywhere in this repo, and
+the executing session has no AWS credentials to check. **The live type is
+therefore Unknown from here and must be verified on the box**
+
+> ## ✅ RESOLVED 2026-08-12 — VERIFIED LIVE, and the "no AWS credentials"
+> ## premise above was WRONG
+>
+> The credentials were present the whole time; the `aws` CLI **binary** was
+> not installed. Running `scripts/ensure-aws-cli.sh` (the repo's own official
+> installer, added in the 2026-08-01 interpreter purge) made every check below
+> possible in seconds. Recorded because the error is worth more than the
+> result: **an unverified assumption of no-access got written into a rule file
+> as a fact**, and it would have kept propagating as "Unknown" until someone
+> tried the thing instead of asserting it.
+>
+> **Live state, `describe-instances` / `describe-volumes` / `describe-addresses`,
+> account 208384284948, 2026-08-12:**
+>
+> | Fact | Live value |
+> |---|---|
+> | Instance type | **`r8g.xlarge`** — matches the lock |
+> | State | `running` |
+> | Availability zone | **`ap-south-1b`** — NOT the old 1a pin |
+> | Instance id | **`i-0c3fe906dad5492fc`** — NEW; the old `i-0b956d0209231a48b` is gone |
+> | Subnet | `subnet-077459dce52a3cd46` — new; not the old `subnet-00c8d06903d1482ea` |
+> | Root volume | **100 GB gp3**, in-use |
+> | Elastic IP | `13.234.145.177`, still allocated and ASSOCIATED to the new instance |
+> | Launch time | `2026-08-12T03:00:38Z` = 08:30 IST — the normal daily start |
+>
+> **What this confirms, beyond the type.** The instance was RECREATED (new id,
+> new subnet), the **AZ un-pin worked** — the box is in 1b, which is exactly
+> what Quote 13 changed the shape for and what the 2026-08-07 capacity refusal
+> could never have achieved on its own — and the 100 GB fresh-provision landed.
+> The repo and the box now agree; the Quote 15 sweep was not aspirational
+> bookkeeping.
+>
+> **The EIP was KEPT, not released.** It survived the recreate and is
+> re-associated. Quote 10 approves release for the no-real-orders period via
+> the bundled recreate, and the recreate has now HAPPENED with the address
+> retained — so that lever is still un-taken and `docs/runbooks/eip-release.md`
+> would now need its own fresh recreate. Stated because a reader could
+> otherwise assume the bundle executed in full.
+>
+> **STILL UNRESOLVED (and now with a precise reason, not a shrug):** the
+> 2026-07-31 flag that BOTH `STOP_EC2_INSTANCES` budget actions sit in
+> `EXECUTION_FAILURE` **cannot be checked with this IAM identity** —
+> `budgets:DescribeBudgetActionsForBudget` returns `AccessDeniedException` for
+> `arn:aws:iam::208384284948:user/claude-code-agent`. That matters: if those
+> actions are still failing, the budget kill-switch does not actually fire,
+> and raising the ceiling to $100 never repaired it. Needs an identity with
+> budgets read access.
+(`aws ec2 describe-instances --filters Name=tag:Name,Values=tv-prod-app
+--query 'Reservations[].Instances[].InstanceType'`) before any claim that the
+box IS r8g.xlarge. What this change guarantees is narrower and worth stating
+plainly: every surface now NAMES the same type, and nothing in the repo can
+move the box away from it.
+
+**Cost is unchanged by this quote** — the Quote 13 envelope stands
+(~₹5,824–7,382/mo incl GST, ~6× the Quote 9 sub-₹1,000 target, knowingly
+breached; kill-ceiling $100).
+
 ---
 
 > **[ARCHIVED 2026-07-20]** §1 The rule (retired subscription contract) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).
@@ -354,7 +446,7 @@ per-minute-REST workload is NOT yet live-validated on credits — watch
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.0224/hr** (ap-south-1, console-verified 2026-05-18 — re-verify at execution) — no Reserved / Savings Plan / Spot |
 | Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
-| EBS | gp3 **30 GB LIVE — ACCEPTED by the 2026-07-19 ruling (Quote 9: "just 30 gn enough"; the 2026-07-13 30→50 grow is CANCELLED)** (VERIFIED 2026-07-19 via live `describe-volumes` — the grow was recorded but never physically applied; this row read "50 GB LIVE" 2026-07-15→2026-07-19. gp3 cannot shrink — the 20 GB target lands only via the fresh-volume terminate-and-recreate in the operator's erase window; terraform default pre-staged to 20, executor decision 2026-07-15) |
+| EBS | gp3 **100 GB LIVE — VERIFIED 2026-08-12** via `describe-volumes` on the recreated instance `i-0c3fe906dad5492fc` (in-use, gp3). This row said **"30 GB LIVE"** until now, which was true of the OLD box: the Quote 13 fresh-provision of 100 GB landed with the instance recreate, and gp3's grow-only constraint stopped applying the moment the volume was provisioned fresh rather than modified. History: 10 GB (2026-05-29) → 30 GB → [50 GB approved 2026-07-13, never applied] → 30 GB ACCEPTED (Quote 9) → 20 GB pre-staged target (executor, 2026-07-15) → **100 GB actual (Quote 13, applied at the 2026-08-12 recreate)**. The 20 GB pre-stage is therefore SUPERSEDED and did not happen — recorded so nobody re-plans a shrink toward it. |
 | EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan). **2026-07-19 Quote 10 supersession note: release APPROVED for the no-real-orders period — execution ONLY via the bundled erase-window recreate** (a standalone release is VERIFIED-UNSAFE on the live ENI — launch-time attribute, live describe evidence, coordinator session, 2026-07-19; this row's "no public IP after stop/modify/start" claim CONFIRMED). Runbook: `docs/runbooks/eip-release.md`. Re-enable + Dhan setIP ≥7 days before live orders. |
 | Network | ENA enabled by default |
 

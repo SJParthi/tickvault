@@ -43,6 +43,16 @@ REQUIRED_common="1 2 3 4 5 6 13 16 17 18 21 22"
 REQUIRED_storage="1 2 3 4 5 13 18 22"
 REQUIRED_api="1 2 3 13 22"
 REQUIRED_app="1 22"
+# ADDED 2026-08-10. These two crates existed with NO entry here, and the
+# unknown-crate branch below SKIPPED them silently — so the guard printed
+# "All required test types present" while never looking at them at all.
+# aws-lambdas is not incidental: it ships the Dhan token minter and the budget
+# kill-switch that can stop the prod box. A guard that reports success on a set
+# it never examined is the false-OK class this repo forbids.
+# Bar is deliberately the same as app's (smoke + integration) — the point is to
+# END the silent skip, not to fail the build on day one. Raise it in its own PR.
+REQUIRED_aws_lambdas="1 22"
+REQUIRED_tickvault_logs_mcp="1 22"
 
 # ---------------------------------------------------------------------------
 # Type check functions — each returns 0 (found) or 1 (not found)
@@ -180,7 +190,25 @@ type_name() {
 # Determine which crates to check
 # ---------------------------------------------------------------------------
 if [ "$SCOPE" = "all" ] || [ "$SCOPE" = "ALL" ]; then
-  CRATES_TO_CHECK="core trading common storage api app"
+  # CHANGED 2026-08-10: was the HARDCODED list
+  # "core trading common storage api app".
+  #
+  # The workspace has EIGHT crates. This list had six. So the guard printed
+  # "full workspace" and "All required test types present" while never looking
+  # at aws-lambdas (the Dhan token minter + the budget kill-switch that can stop
+  # the prod box) or tickvault-logs-mcp. They were not failing — they were
+  # invisible, which is worse, because the output actively asserted completeness.
+  #
+  # Deriving from the filesystem means a crate cannot be omitted by forgetting to
+  # add it here; a new crate without a REQUIRED_* entry now hits the fail-closed
+  # branch below instead of vanishing.
+  CRATES_TO_CHECK=$(
+    find crates -mindepth 1 -maxdepth 1 -type d -exec test -f '{}/Cargo.toml' ';' -print \
+      | sed 's|^crates/||' \
+      | sort \
+      | tr '\n' ' '
+  )
+  CRATES_TO_CHECK="${CRATES_TO_CHECK% }"
   SCOPE_LABEL="full workspace"
 else
   CRATES_TO_CHECK=""
@@ -220,7 +248,23 @@ for crate in $CRATES_TO_CHECK; do
   REQUIRED_TYPES="${!REQUIRED_VAR:-}"
 
   if [ -z "$REQUIRED_TYPES" ]; then
-    echo "  SKIP: $crate (no requirements defined)" >&2
+    # CHANGED 2026-08-10 from a silent `continue` to a hard failure.
+    #
+    # The skip meant any crate without a REQUIRED_* entry was never examined,
+    # while the guard still printed "All required test types present" and exited
+    # 0. Two production crates sat in exactly that state — aws-lambdas (the Dhan
+    # token minter and the budget kill-switch that can stop the prod box) and
+    # tickvault-logs-mcp. Neither appeared anywhere in the output, so nothing
+    # signalled that they were unchecked rather than passing.
+    #
+    # Failing closed means a NEW crate cannot exempt itself from the 22-type
+    # standard just by existing. The remedy is one line, and the message says so.
+    echo "  FAIL: $crate has NO REQUIRED_* entry in this script." >&2
+    echo "        A crate with no entry was previously SKIPPED SILENTLY while" >&2
+    echo "        the guard still reported success — an unchecked crate is not" >&2
+    echo "        a passing crate. Add REQUIRED_${crate//-/_}=\"...\" near the" >&2
+    echo "        top of this file (start at \"1 22\" if unsure) and re-run." >&2
+    FAILED=1
     continue
   fi
 

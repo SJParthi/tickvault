@@ -17,8 +17,10 @@
 //!   Self-contained; does NOT import `tickvault-trading` so this slice
 //!   adds no new workspace dep edge.
 //! - [`SealSpillWriter`] — append-only file writer with:
-//!   - IST-date file rotation (`seals-2026-05-10.bin`).
-//!   - Idempotent fixed-record append (`O(1)` per append).
+//!   - IST-date file rotation (`seals-2026-05-10.bin`), on a LONG-LIVED
+//!     handle: the file is opened once per IST day, not once per seal
+//!     (2026-08-10 — see [`SealSpillWriter::append_seal`]).
+//!   - Idempotent fixed-record append (`O(1)` per append, ONE `write(2)`).
 //!   - `read_all()` recovery scan for the writer-task drain loop.
 //!   - `set_spill_dir_for_test()` for parallel test isolation
 //!     (mirrors `tick_persistence::TickPersistenceWriter`).
@@ -67,8 +69,10 @@
 //! pre-2026-06-02 records have zero at bytes 104..120, so they decode
 //! `change_pct = 0.0` / `open_gap_pct = 0.0` (all backward-compatible).
 
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -393,12 +397,41 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
     dt.format("seals-%Y-%m-%d.bin").to_string()
 }
 
+/// IST calendar-day number (days since the IST-shifted epoch) for a UTC
+/// unix timestamp. This is the ROTATION identity: two timestamps share a
+/// spill file iff they share this number.
+///
+/// Deliberately integer-only — O(1), zero allocation, no `chrono` formatting
+/// — so the per-seal hot check costs an add + a divide instead of building a
+/// `String` filename. Equivalent BY CONSTRUCTION to the day component of
+/// [`ist_date_filename`] (which formats the same IST-shifted epoch as a UTC
+/// calendar date); pinned by
+/// `test_ist_day_number_agrees_with_ist_date_filename_across_boundaries`.
+fn ist_day_number(now_unix_secs: i64) -> i64 {
+    now_unix_secs
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+        .div_euclid(86_400)
+}
+
+/// The currently-open daily spill file plus the IST day it belongs to.
+struct OpenSpillFile {
+    ist_day: i64,
+    file: File,
+}
+
 /// Append-only spill writer. One instance lives in the writer task;
 /// `append_seal` is the single producer entry point.
 pub struct SealSpillWriter {
     /// Spill directory — production uses `SEAL_SPILL_DIR`; tests
     /// override via `with_spill_dir_for_test`.
     spill_dir: PathBuf,
+    /// Long-lived append handle for the current IST day (2026-08-10).
+    ///
+    /// `Mutex` because `append_seal` takes `&self` (the absorption
+    /// pipeline's `escalate_evicted` rescue path is `&self`) yet must mutate
+    /// the cached handle. Uncontended: the seal writer task is the single
+    /// producer, so this is an uncontended lock/unlock pair, not a wait.
+    open: Mutex<Option<OpenSpillFile>>,
 }
 
 impl SealSpillWriter {
@@ -407,6 +440,7 @@ impl SealSpillWriter {
     pub fn new() -> Self {
         Self {
             spill_dir: PathBuf::from(SEAL_SPILL_DIR),
+            open: Mutex::new(None),
         }
     }
 
@@ -415,7 +449,37 @@ impl SealSpillWriter {
     #[must_use]
     // TEST-EXEMPT: test-only helper used as construction source by every test in this module (test_append_seal_then_read_all_roundtrip, test_seal_spill_writer_clear_*, test_seal_spill_writer_truncated_tail_*, etc.). Separate name-matched test would be redundant.
     pub fn with_spill_dir_for_test(dir: PathBuf) -> Self {
-        Self { spill_dir: dir }
+        Self {
+            spill_dir: dir,
+            open: Mutex::new(None),
+        }
+    }
+
+    /// Locks the cached-handle slot, treating a poisoned mutex as the value
+    /// it holds. A panic in another thread while holding this lock cannot
+    /// leave the spill writer permanently dead — the worst case is a stale
+    /// handle, which the day check and the write-error path both correct.
+    fn lock_open(&self) -> std::sync::MutexGuard<'_, Option<OpenSpillFile>> {
+        self.open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Opens (creating as needed) the append handle for `path`.
+    ///
+    /// Still calls `create_dir_all` — the chaos suite injects "spill disk
+    /// dead" by placing a regular FILE at the spill-dir path, which makes
+    /// this call fail deterministically on every OS and forces the tier-2 →
+    /// tier-3 DLQ escalation (`chaos_seal_disk_full_dlq_capture.rs`). Moving
+    /// it off the per-append path did NOT move it off the per-OPEN path.
+    fn open_append_handle(&self, path: &Path) -> Result<File> {
+        std::fs::create_dir_all(&self.spill_dir)
+            .with_context(|| format!("failed to create spill dir {:?}", self.spill_dir))?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open spill file {path:?}"))
     }
 
     /// Returns the path of the spill file for the given UTC unix
@@ -426,8 +490,39 @@ impl SealSpillWriter {
     }
 
     /// Append one serialised seal to the daily spill file.
-    /// Creates the spill directory + file if needed.
-    /// O(1) per call; uses `BufWriter` to coalesce small writes.
+    /// O(1) work per call and, in steady state, **exactly ONE syscall per
+    /// seal** (`write(2)` on a long-lived append handle).
+    ///
+    /// ## What changed 2026-08-10 (and what deliberately did NOT)
+    ///
+    /// Before: the `BufWriter` was constructed and dropped INSIDE this
+    /// function, so every seal paid `create_dir_all` + `open` + `write_all` +
+    /// `flush` (+ the `close` on drop) — 3-4 syscalls, and the buffer
+    /// coalesced only the writes of a single 128-byte record, i.e. nothing.
+    /// The 2026-08-09 doc correction said so honestly; this is the code fix.
+    ///
+    /// Now: the file is opened ONCE per IST day and cached
+    /// ([`OpenSpillFile`]). `create_dir_all` + `open` + `close` amortise to
+    /// once per rotation instead of once per seal.
+    ///
+    /// **Cross-seal buffering is deliberately NOT introduced**, and that is a
+    /// durability decision rather than an oversight. The absorption pipeline
+    /// treats an `Ok` here as "tier 2 accepted it" and returns
+    /// `SubmitOutcome::Spilled`; an `Err` is what escalates that specific
+    /// seal to the tier-3 DLQ. A user-space buffer would (a) make seals that
+    /// are reported `Spilled` vanish on a process kill — precisely the
+    /// recovery `chaos_seal_sigkill_spill_replay.rs` asserts — and (b) surface
+    /// a write failure at flush time, long after the seal that caused it has
+    /// been reported absorbed and can no longer be escalated. The
+    /// `ws_frame_spill` channel+writer-thread shape can batch because its
+    /// producer contract is fire-and-forget (`AppendOutcome::Spilled` means
+    /// "queued"); this one's is synchronous and error-returning. Copying the
+    /// shape without copying the contract would trade 1 syscall for a silent
+    /// loss path.
+    ///
+    /// LATENCY is still not bounded — filesystem syscalls are not — but this
+    /// is tier 2 of the ring → spill → DLQ chain and runs off the socket read
+    /// path.
     ///
     /// Per locked decision L-C1, this is the SECOND tier of the
     /// ring → spill → DLQ chain. Failures bubble up to the caller
@@ -435,23 +530,67 @@ impl SealSpillWriter {
     /// slice) and on triple failure logs
     /// `error!(code = AGGREGATOR-DROP-01)`.
     pub fn append_seal(&self, seal: &SerializedSeal, now_unix_secs: i64) -> Result<()> {
-        std::fs::create_dir_all(&self.spill_dir)
-            .with_context(|| format!("failed to create spill dir {:?}", self.spill_dir))?;
-        let path = self.spill_path(now_unix_secs);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open spill file {path:?}"))?;
-        let mut writer = BufWriter::new(file);
         let bytes = seal.to_bytes();
-        writer
-            .write_all(&bytes)
-            .with_context(|| format!("failed to write seal to {path:?}"))?;
-        writer
-            .flush()
-            .with_context(|| format!("failed to flush seal to {path:?}"))?;
+        let day = ist_day_number(now_unix_secs);
+        let mut open = self.lock_open();
+
+        // Rotate only when the IST day actually changed (or nothing is open
+        // yet, incl. after a write error dropped the handle). The check is an
+        // integer compare — no filename is built on the steady-state path.
+        let stale = match open.as_ref() {
+            Some(current) => current.ist_day != day,
+            None => true,
+        };
+        if stale {
+            // Close the previous day's handle BEFORE opening the next, so a
+            // rotation never holds two descriptors.
+            *open = None;
+            let path = self.spill_path(now_unix_secs);
+            let file = self.open_append_handle(&path)?;
+            *open = Some(OpenSpillFile { ist_day: day, file });
+        }
+        let Some(current) = open.as_mut() else {
+            // Structurally unreachable: the branch above either populated the
+            // slot or returned Err. Refuse loudly rather than assume.
+            metrics::counter!("tv_seal_spill_write_errors_total", "stage" => "no_handle")
+                .increment(1);
+            anyhow::bail!(
+                "seal spill handle missing after open — refusing to claim a durable write"
+            );
+        };
+
+        // ONE `write(2)`. The file is unbuffered by design: the previous
+        // implementation's `BufWriter::flush()` bought exactly this syscall
+        // (a 128-byte record never fills an 8 KiB buffer, so without the
+        // flush nothing reached the kernel at all). Writing through keeps the
+        // SAME durability contract — once `append_seal` returns `Ok`, the
+        // record is in the page cache and survives a process kill, which is
+        // what `chaos_seal_sigkill_spill_replay.rs` recovers. Introducing a
+        // cross-seal user-space buffer WOULD regress that; see the
+        // module-level note on why it is deliberately not done.
+        if let Err(err) = current.file.write_all(&bytes) {
+            // Drop the possibly-broken handle so the next call reopens —
+            // mirrors `ws_frame_spill::persist_record_resilient`. The error
+            // still propagates, so the absorption pipeline escalates THIS
+            // seal to the tier-3 DLQ exactly as before.
+            *open = None;
+            metrics::counter!("tv_seal_spill_write_errors_total", "stage" => "write").increment(1);
+            let path = self.spill_path(now_unix_secs);
+            return Err(err).with_context(|| format!("failed to write seal to {path:?}"));
+        }
         Ok(())
+    }
+
+    /// Closes the cached append handle, if any.
+    ///
+    /// MUST be called whenever the underlying file is unlinked or replaced:
+    /// on POSIX a descriptor keeps the removed inode alive, so appending
+    /// through a stale handle would write seals into a file no `read_all`
+    /// can ever see — a silent loss that the per-call-open version could not
+    /// have. Pinned by
+    /// `test_append_after_clear_reopens_and_is_visible_to_read_all`.
+    fn close_open_handle(&self) {
+        *self.lock_open() = None;
     }
 
     /// Drains the daily spill file by reading every full 128-byte
@@ -520,6 +659,12 @@ impl SealSpillWriter {
     /// writer task after `read_all` is fully replayed via ILP.
     /// Idempotent: missing file returns Ok.
     pub fn clear_spill_for_date(&self, now_unix_secs: i64) -> Result<()> {
+        // Invalidate FIRST and unconditionally: after the unlink, a cached
+        // descriptor would keep appending into an orphaned inode that no
+        // `read_all` can reach. Doing it before the `exists()` check also
+        // covers the "already gone" path, where a stale handle is just as
+        // wrong.
+        self.close_open_handle();
         let path = self.spill_path(now_unix_secs);
         if !path.exists() {
             return Ok(());
@@ -1011,6 +1156,271 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // -----------------------------------------------------------------
+    // 2026-08-10 — long-lived append handle (was 3-4 syscalls per seal).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_ist_day_number_agrees_with_ist_date_filename_across_boundaries() {
+        // The integer day number is the ROTATION identity that replaced
+        // building a filename per seal. If it ever disagrees with the
+        // filename, seals silently land in the wrong day's file — so pin the
+        // equivalence directly: the filename changes EXACTLY when the day
+        // number changes, swept minute-by-minute across an IST midnight.
+        let ist_midnight_utc = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 9, 18, 30, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        for offset in -120i64..=120 {
+            let a = ist_midnight_utc + offset * 60;
+            let b = a + 60;
+            assert_eq!(
+                ist_day_number(a) == ist_day_number(b),
+                ist_date_filename(a) == ist_date_filename(b),
+                "day-number and filename disagreed at offset {offset} min"
+            );
+        }
+        // The boundary itself rolls exactly once.
+        assert_eq!(
+            ist_day_number(ist_midnight_utc) - ist_day_number(ist_midnight_utc - 1),
+            1,
+            "IST midnight must advance the day number by exactly 1"
+        );
+        // Pre-epoch timestamps floor correctly (div_euclid, not truncation).
+        assert_eq!(
+            ist_day_number(-i64::from(IST_UTC_OFFSET_SECONDS)),
+            0,
+            "the IST-shifted epoch is day 0"
+        );
+        assert_eq!(
+            ist_day_number(-i64::from(IST_UTC_OFFSET_SECONDS) - 1),
+            -1,
+            "one second earlier is the PREVIOUS day, never day 0"
+        );
+    }
+
+    #[test]
+    fn test_append_seal_is_durable_without_dropping_the_writer() {
+        // THE durability pin. The previous implementation flushed inside
+        // every call; this one writes through a cached handle. Both must mean
+        // the same thing: once `append_seal` returns Ok, the bytes are in the
+        // kernel, NOT in a user-space buffer that a SIGKILL would discard.
+        //
+        // The writer is deliberately NOT dropped and no flush is called
+        // before reading — a `Drop`-time flush (which the sigkill chaos test
+        // cannot distinguish) would not save a buffered implementation here.
+        let dir = temp_spill_dir("durable-no-drop");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let s1 = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        writer.append_seal(&s1, now).expect("append s1");
+
+        let raw = std::fs::read(writer.spill_path(now)).expect("read raw while writer is alive");
+        assert_eq!(
+            raw.len(),
+            SEAL_SPILL_RECORD_SIZE,
+            "the record must be on disk BEFORE the writer is dropped"
+        );
+        assert_eq!(SerializedSeal::from_bytes(&raw), Some(s1));
+
+        // Still true after many appends — nothing accumulates in memory.
+        for i in 1..50u32 {
+            writer
+                .append_seal(
+                    &mk_seal(13, 0, 0, 1_716_000_900 + i, 100.0 + f64::from(i)),
+                    now,
+                )
+                .expect("append");
+        }
+        let raw = std::fs::read(writer.spill_path(now)).expect("read raw");
+        assert_eq!(raw.len(), 50 * SEAL_SPILL_RECORD_SIZE);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_append_seal_rotates_the_cached_handle_across_ist_day_boundary() {
+        // The cached handle must follow the IST date, not outlive it —
+        // otherwise every seal after midnight lands in yesterday's file.
+        let dir = temp_spill_dir("day-rotation");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let day_a = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 9, 12, 0, 0) // 17:30 IST, 2026-05-09
+            .single()
+            .expect("valid")
+            .timestamp();
+        let day_b = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 9, 19, 0, 0) // 00:30 IST, 2026-05-10
+            .single()
+            .expect("valid")
+            .timestamp();
+        assert_ne!(writer.spill_path(day_a), writer.spill_path(day_b));
+
+        let a = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        let b = mk_seal(25, 1, 2, 1_716_001_500, 200.0);
+        writer.append_seal(&a, day_a).expect("append day A");
+        writer.append_seal(&b, day_b).expect("append day B");
+
+        let drained_a = writer.read_all(day_a).expect("read A");
+        let drained_b = writer.read_all(day_b).expect("read B");
+        assert_eq!(drained_a, vec![a], "day A file holds ONLY day A's seal");
+        assert_eq!(drained_b, vec![b], "day B file holds ONLY day B's seal");
+
+        // Rotating BACK (a late seal stamped with the earlier day) reopens
+        // day A rather than appending into day B.
+        let late = mk_seal(51, 0, 0, 1_716_002_100, 300.0);
+        writer.append_seal(&late, day_a).expect("append late day A");
+        assert_eq!(writer.read_all(day_a).expect("read A again"), vec![a, late]);
+        assert_eq!(writer.read_all(day_b).expect("read B again"), vec![b]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_append_after_clear_reopens_and_is_visible_to_read_all() {
+        // The failure mode a cached descriptor introduces: after
+        // `clear_spill_for_date` unlinks the file, POSIX keeps the orphaned
+        // inode alive for the open fd. Appending through a stale handle would
+        // write seals nobody can ever read back — a SILENT loss the
+        // per-call-open version could not produce. The handle must be
+        // invalidated at clear time.
+        let dir = temp_spill_dir("clear-then-append");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let first = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        writer.append_seal(&first, now).expect("append first");
+        assert_eq!(writer.read_all(now).expect("read"), vec![first]);
+
+        writer.clear_spill_for_date(now).expect("clear");
+        assert!(!writer.spill_path(now).exists());
+
+        let second = mk_seal(25, 0, 1, 1_716_001_500, 200.0);
+        writer
+            .append_seal(&second, now)
+            .expect("append after clear");
+        assert!(
+            writer.spill_path(now).exists(),
+            "the post-clear append must recreate the file, not write to an orphan"
+        );
+        assert_eq!(
+            writer.read_all(now).expect("read after clear"),
+            vec![second],
+            "exactly the post-clear seal — no ghost, no resurrection"
+        );
+
+        // Repeated clear→append cycles stay correct (idempotent).
+        writer.clear_spill_for_date(now).expect("clear 2");
+        writer
+            .clear_spill_for_date(now)
+            .expect("clear 2 idempotent");
+        writer.append_seal(&first, now).expect("append 3");
+        assert_eq!(writer.read_all(now).expect("read 3"), vec![first]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_append_seal_errors_while_spill_dir_is_unusable_then_self_heals() {
+        // Failure injection identical to the chaos suite's "spill disk dead"
+        // (`chaos_seal_disk_full_dlq_capture.rs`): a regular FILE occupies the
+        // spill-dir path, so `create_dir_all` fails on every OS.
+        //
+        // Two properties the caching must not break: (1) EVERY append still
+        // returns Err — the absorption pipeline needs that to escalate each
+        // seal to the tier-3 DLQ, so a cached-handle design must keep RETRYING
+        // the open, never fail once and go quiet; (2) once the blocker is
+        // removed the very next append succeeds — a dropped handle is
+        // re-acquired, not permanently poisoned.
+        let base = temp_spill_dir("dir-blocked");
+        let blocked = base.join("spill_is_a_file");
+        std::fs::write(&blocked, b"not a directory").expect("write blocker");
+
+        let writer = SealSpillWriter::with_spill_dir_for_test(blocked.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let seal = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        for attempt in 0..5 {
+            assert!(
+                writer.append_seal(&seal, now).is_err(),
+                "attempt {attempt} must FAIL so the caller escalates to the DLQ"
+            );
+        }
+        // read_all over a dead spill dir is a clean empty, never a panic.
+        assert!(
+            writer
+                .read_all(now)
+                .expect("read_all on dead dir")
+                .is_empty()
+        );
+
+        // Un-block: the writer recovers on the next call with no restart.
+        std::fs::remove_file(&blocked).expect("remove blocker");
+        writer
+            .append_seal(&seal, now)
+            .expect("append after recovery");
+        assert_eq!(writer.read_all(now).expect("read"), vec![seal]);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_append_seal_is_send_sync_and_serialises_concurrent_appends() {
+        // `append_seal` takes `&self` (the absorption pipeline's rescue path
+        // is `&self`), so the cached handle sits behind a Mutex. Prove the
+        // writer is shareable and that concurrent appends neither interleave
+        // within a record nor lose one.
+        let dir = temp_spill_dir("concurrent-appends");
+        let writer = std::sync::Arc::new(SealSpillWriter::with_spill_dir_for_test(dir.clone()));
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        const THREADS: u32 = 4;
+        const PER_THREAD: u32 = 100;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let writer = std::sync::Arc::clone(&writer);
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let seal = mk_seal(
+                            u64::from(t + 1),
+                            0,
+                            0,
+                            1_716_000_000 + i,
+                            f64::from(t * PER_THREAD + i),
+                        );
+                        writer.append_seal(&seal, now).expect("concurrent append");
+                    }
+                });
+            }
+        });
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(
+            drained.len(),
+            (THREADS * PER_THREAD) as usize,
+            "every concurrently-appended seal must survive, none torn"
+        );
+        // Every record decoded cleanly (a torn write would break read_all's
+        // fixed-size framing and truncate the tail).
+        let mut per_thread = [0u32; THREADS as usize];
+        for seal in &drained {
+            let idx = (seal.security_id - 1) as usize;
+            assert!(idx < THREADS as usize, "decoded a garbage security_id");
+            per_thread[idx] += 1;
+        }
+        assert_eq!(per_thread, [PER_THREAD; THREADS as usize]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn test_seal_spill_io_timeout_constant_pinned() {
         assert_eq!(SEAL_SPILL_IO_TIMEOUT, Duration::from_secs(5));
@@ -1231,9 +1641,12 @@ mod c3_tf_ordinal_pins {
     use tickvault_trading::candles::tf_index::TF_COUNT;
 
     #[test]
-    fn test_tf_ordinal_roundtrip_covers_all_21_frames() {
-        assert_eq!(TF_COUNT, 21);
-        for ord in 0..=20usize {
+    fn test_tf_ordinal_roundtrip_covers_all_frames() {
+        // 24 since 2026-08-10 (M2/M30/M60 appended, operator Quote 13).
+        // The loop bound is derived from TF_COUNT so an appended frame is
+        // actually exercised instead of silently falling outside the range.
+        assert_eq!(TF_COUNT, 24);
+        for ord in 0..TF_COUNT {
             let tf =
                 TfIndex::from_ordinal(ord).unwrap_or_else(|| panic!("ordinal {ord} must decode"));
             assert_eq!(tf.as_ordinal(), ord, "round-trip broke at {ord}");
@@ -1247,8 +1660,8 @@ mod c3_tf_ordinal_pins {
     }
 
     #[test]
-    fn test_from_ordinal_refuses_21_and_255_without_panic() {
-        assert!(TfIndex::from_ordinal(21).is_none());
+    fn test_from_ordinal_refuses_past_the_end_and_255_without_panic() {
+        assert!(TfIndex::from_ordinal(TF_COUNT).is_none());
         assert!(TfIndex::from_ordinal(255).is_none());
         for ord in TF_COUNT..=255usize {
             assert!(TfIndex::from_ordinal(ord).is_none(), "{ord} must refuse");

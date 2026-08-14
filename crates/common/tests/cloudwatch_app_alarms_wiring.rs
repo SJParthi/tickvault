@@ -57,9 +57,12 @@ fn alarm_metric_names() -> Vec<String> {
 
 /// Collect every `.rs` source file under `crates/` (depth-first walk).
 fn collect_rs_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| {
+        // 2026-08-10: was a silent `else { return; }` — an unreadable or
+        // MISSING directory became "nothing to check, pass", so the guard
+        // could report green while scanning zero files.
+        panic!("guard corpus unreadable {:?}: {}", dir, e)
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -443,6 +446,28 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // emit and could stop the trading box mid-session. An exact alternation
     // keeps the bill a function of THIS list, which this assertion pins.
     //
+    // 48 (was 41) since 2026-08-11 (DHAN LIVE LANE SWITCHED ON): the live
+    // Dhan WebSocket lane went from dark to carrying data, and its SEVEN loss
+    // counters were emitted by the binary while selected by nothing — every
+    // way the lane can lose data (WAL write refused, frame ring full by
+    // count, frame ring full by BYTES, frame refused, subscribe failed, seal
+    // dropped, sequence refused) was counted in-process and discarded at the
+    // agent. A lane whose drop paths are invisible reports healthy while
+    // losing ticks, which is the precise false-OK class rule 11 forbids.
+    // +7 EXACT names ≈ +$2.10/mo (41 → 48 names ≈ $12.30 → $14.40/mo at
+    // CloudWatch's ~$0.30/custom-metric/month) against the $100 ceiling whose
+    // budget actions STOP the box at $90 — headroom is unaffected at this
+    // scale. Dated note: aws-budget.md (COST NOTE 2026-08-11).
+    //
+    // FLAGGED, deliberately NOT taken here: the exclusion ledger below still
+    // excludes tv_ws_frame_spill_write_errors_total on the stated ground that
+    // "no WS frame producer exists since the 2026-07-13/15 live-feed
+    // retirements". That premise is FALSE as of today — the revived lane IS a
+    // WS frame producer, so the name now has a reachable emitter and its
+    // exclusion rests on a reason that no longer holds. It is recorded rather
+    // than silently added: adding it is a cost decision of its own and would
+    // make this commit's delta something other than the seven names it claims.
+    //
     // INCLUSION RULE: a name is selected only if it means FAILURE,
     // SATURATION or DATA LOSS *and* has a reachable producer on the REST-only
     // runtime. 311 names are deliberately not selected — success/volume
@@ -455,17 +480,124 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // (already published by its own log metric filter — auth-failed-alarm.tf;
     // EMF-selecting it would double-bill). Full rationale + the exclusion
     // ledger: the COST NOTE above the CWCFG heredoc in user-data.sh.tftpl.
+    // 54 (was 52) since 2026-08-12 (SILENCE READ-OUT): the lane seeded every
+    // subscribed instrument into a TickGapDetector and called observe() on
+    // every tick, while `scan_silence` had ZERO production callers — a fully
+    // wired sensor with no read-out, which reads greener than dead code
+    // because every part of it looks connected. The scan now runs on its own
+    // 30s timer and publishes two gauges, both selected here:
+    // tv_dhan_feed_instruments_silent (quiet beyond the instrument's OWN
+    // learned cadence, sparse instruments excluded per the §36.4 precedent)
+    // and tv_dhan_feed_instruments_never_ticked. The second matters most: a
+    // subscribe that silently did not take produces NO other signal — there
+    // is no payload to count, no parse to fail, no error to log — so absence
+    // against a seeded key is the only evidence that exists, and leaving it
+    // in a /metrics endpoint nothing on the box scrapes would repeat the
+    // exact mistake the 2026-08-11 and 2026-08-12 additions above corrected.
+    // +2 EXACT names ≈ +$0.60/mo (52 → 54 ≈ $15.60 → $16.20/mo). Dated note:
+    // aws-budget.md (COST NOTE 2026-08-12, silence read-out).
+    //
+    // FLAGGED, deliberately NOT taken here: neither gauge has an ALARM, so
+    // today they are visible but not pageable. An alarm needs the
+    // market-hours window gate (its ALARM_NAMES list arms a named set), which
+    // is its own terraform change — recorded rather than left to be
+    // discovered from a quiet dashboard.
+    // +1 EXACT name 2026-08-12 (54 → 55 ≈ $16.20 → $16.50/mo):
+    // `tv_dhan_feed_stack_connections` — the per-endpoint OPEN-SOCKET gauge
+    // (`FEED_STACK_CONNECTIONS_GAUGE`, dhan_feed_stack.rs), labelled
+    // main_feed / depth_20 / depth_200.
+    //
+    // Why it belongs here rather than in the "visible enough" pile: the
+    // operator asked how many of the 16 authorized connections were actually
+    // open, and the ONLY way to answer was to `filter-log-events` the app log
+    // for the planning line. The gauge was emitted by the binary and selected
+    // by NOTHING — the same shape as `tv_dhan_ws_ring_bytes_full_total` before
+    // 2026-08-09 and `tv_ws_frame_spill_write_errors_total` before 2026-08-12.
+    // A socket count that lives only in a log line cannot carry an alarm and
+    // cannot be charted, so "is the feed actually connected?" stayed a
+    // grep-the-logs question on a system whose whole point is live capture.
+    //
+    // FLAGGED, deliberately NOT taken here: this gauge has no ALARM either.
+    // The obvious one — main_feed drops to 0 during market hours — needs the
+    // market-hours window gate's ALARM_NAMES list, which is its own terraform
+    // change. Recorded rather than left to be discovered from a quiet
+    // dashboard.
+    // +9 EXACT names 2026-08-14 (55 → 64): the lane's own LIVENESS and LOSS
+    // signals. The trigger is a finding that is worse than any single missing
+    // metric — of every `tv_dhan_feed_*` series the binary emits, the ONLY one
+    // selected was `tv_dhan_feed_stack_connections`, a BOOT-TIME CONSTANT that
+    // reports "5 depth-20" whether or not a single byte ever arrives. So the
+    // one lane signal reaching CloudWatch was the one that cannot be wrong,
+    // while every signal that could reveal a dark feed — frames drained, ticks
+    // ingested, the stack's own up bit, dial failures — reached only the log
+    // sink. That is the exact shape of the 2026-08-12 blackout: 12 consecutive
+    // HTTP 400 dial failures and `compared: 0` for a whole session, with a
+    // connection gauge that read healthy throughout.
+    //
+    // The nine: tv_dhan_feed_stack_up (the lane's own alive bit),
+    // tv_dhan_feed_drain_frames_total (frames actually drained, by outcome),
+    // tv_dhan_feed_ingest_ticks_total (ticks actually folded),
+    // tv_dhan_feed_ingest_refused_total, tv_dhan_ws_reconnect_total,
+    // tv_dhan_ws_park_total (a parked socket is a PERMANENTLY dark shard —
+    // ParkReason::FatalDisconnect is never re-dialed),
+    // tv_dhan_ws_dial_failed_total (the 2026-08-12 class itself),
+    // tv_ticks_lost_total (the workspace's only explicit tick-loss SLA
+    // counter), tv_ws_frame_spill_drop_critical (the WAL durable-floor breach).
+    //
+    // HONEST COST: +9 NAMES ≈ +$2.70/mo by the per-name arithmetic used above
+    // ($16.50 → ~$19.20), but the true bill is HIGHER than the name count
+    // implies and this note must not understate it: CloudWatch bills per
+    // metric, and a name with labels is many metrics.
+    // tv_dhan_feed_drain_frames_total carries 8 `outcome` values and
+    // tv_ticks_lost_total carries source × ws_type, so the realistic addition
+    // is ~20 series ≈ $6/mo, not $2.70. Against the $100 kill-ceiling and a
+    // ~$58–74/mo envelope that is affordable; it is recorded at the honest
+    // number rather than the flattering one.
+    //
+    // FLAGGED, deliberately NOT taken here, and it is the bigger gap: NONE of
+    // these nine has an ALARM — and neither does any of the 14 Dhan-lane names
+    // already in this list. The lane's entire failure surface is now published
+    // and nothing looks at it, so the chain still ends at "a human opens a
+    // dashboard", which the zero-manual-intervention mandate forbids. Alarms
+    // need the market-hours window gate's ALARM_NAMES list (its own terraform
+    // change) and a sustained baseline these series do not yet have. Recorded
+    // here rather than left to be discovered from a quiet dashboard.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
+    // 2026-08-14: 64 -> 65. ONE name added, `tv_dhan_ws_lag_excluded_total`,
+    // alongside the first live-socket delivery-lag measurement. Cost ~$0.30/mo
+    // against the $100 kill-ceiling — deliberate, not a drive-by.
+    //
+    // A SECOND name was added and then REMOVED again in the same change, and
+    // the reason is worth keeping: `tv_dhan_ws_lag_ms` is a HISTOGRAM. A
+    // Prometheus histogram is exposed as `_bucket{le=…}` / `_sum` / `_count`,
+    // and this selector is anchored `^(…)$`, so the bare name matches NOTHING.
+    // Adding it would have published no datapoint while looking correct in the
+    // diff — a false-OK, and one this list is especially prone to because every
+    // name in it today is a counter or a gauge. (`tv_order_fill_lag_seconds`
+    // reads like a counter-example but has ZERO source references: it is a dead
+    // selector entry, not a working histogram precedent.)
+    //
+    // The histogram is therefore NOT EMF-shipped. It lives on `/metrics` for
+    // the operator console to scrape. Shipping its buckets would also multiply
+    // cost by the bucket count × 16 connections, which is precisely the kind of
+    // cardinality this ratchet exists to make someone think about.
     assert_eq!(
         names.len(),
-        41,
-        "Z+ L2 VERIFY ratchet: expected exactly 41 names in the MAIN EMF \
-         metric_selectors list (11 post-stage-4 plus the 30 failure/saturation/loss \
-         names added 2026-08-09 for the metric-blindness fix); found {}: {names:?}. \
-         Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose budget \
-         actions STOP the prod box at 90% — update this count deliberately, with a \
-         dated cost note, never as a drive-by.",
+        65,
+        "Z+ L2 VERIFY ratchet: expected exactly 65 names in the MAIN EMF \
+         metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
+         names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
+         loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
+         PERSIST-side loss counters added 2026-08-12 — tv_ticks_dropped_total, \
+         tv_tick_persist_errors_total, tv_tick_rows_refused_total, \
+         tv_ws_frame_spill_write_errors_total. The 2026-08-11 addition instrumented \
+         the lane at the SOCKET and left it blind at the DATABASE; the spill-write \
+         counter had been excluded on the stated grounds that 'no WS frame producer \
+         exists', which stopped being true the day the lane was revived); found {}: \
+         {names:?}. Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose \
+         budget actions STOP the prod box at 90% — update this count deliberately, \
+         with a dated cost note, never as a drive-by.",
         names.len()
     );
     for required in [

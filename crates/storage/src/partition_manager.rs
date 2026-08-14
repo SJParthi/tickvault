@@ -112,17 +112,29 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // cross-feed comparison row).
     "spot_crossverify_cell_audit",
     "spot_crossverify_daily",
+    // Dhan live-WS vs Dhan REST 15:31 cross-verification (2026-08-09, the
+    // 16-connection live-feed revival): one row per divergent/missing cell /
+    // one row per trading-day summary. Same SEBI-audit class and DAY
+    // partitioning as the two cross-verify pairs above.
+    //
+    // This comparison carries more weight than its siblings: the Dhan feed has
+    // no sequence number and no snapshot-on-subscribe, so this is the ONLY
+    // ground truth available for whether the live capture is complete. The
+    // cell table is bounded by divergences, not by instruments, so it is
+    // normally near-empty — a large day IS the signal.
+    "dhan_live_crossverify_cell_audit",
+    "dhan_live_crossverify_daily",
     // SPOT1M-01/02 (2026-07-12, per-minute REST pipeline PR-2): one row per
     // fetched (minute, index) — ~1,125 rows/day (375 min × 3 IDX_I SIDs),
     // trivial disk; same DAY partitioning + retention class as the
     // daily-data tables above; `feed` is in the DEDUP key.
-    "spot_1m_rest",
+    "rest_spot_1m",
     // CHAIN-03 (2026-07-12, per-minute REST pipeline PR-3): one row per
     // fetched (minute, underlying, expiry, strike, leg) — ~1-3K rows/min
     // worst case (~70 MB/day at wide chains; disk envelope flagged as an
     // operator retention follow-up in option_chain_1m_persistence.rs);
     // same DAY partitioning + retention class; `feed` is in the DEDUP key.
-    "option_chain_1m",
+    "rest_option_chain_1m",
     // Partition archive→verify→drop forensic chain (2026-07-13, disk-pressure
     // remediation): one row per archive attempt outcome — same SEBI-audit
     // class + DAY partitioning as the audit tables above; `feed` is in the
@@ -134,7 +146,7 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // the per-minute selection cap (~30 contracts × 375 min ≈ ~11K rows/day,
     // trivial disk); same DAY partitioning + retention class; `feed` +
     // `exchange_segment` are in the DEDUP key.
-    "option_contract_1m_rest",
+    "rest_option_contract_1m",
     // SPOT1M-02 stages audit_ensure_* (2026-07-13, Groww spot-1m PR-2): one
     // row per REST fetch attempt outcome per (minute, symbol, feed, leg) —
     // ~1-2K rows/day for the Groww spot leg (375 min x 3 symbols x attempts),
@@ -185,7 +197,68 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
 /// (always >90d-old) partition would be detached every run, removing the live
 /// master. It is small (~742 rows) + fully re-derivable from CSV each boot, so
 /// it is exempt exactly like `instrument_lifecycle`.
-pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &["instrument_lifecycle", "index_constituency"];
+///
+/// The three `spot_1m_rest` / `option_chain_1m` / `option_contract_1m_rest`
+/// entries (added 2026-08-14) are the PRE-RENAME names, and they are exempt for
+/// a different reason than the two above: **they name a table that ceases to
+/// exist.** The boot migration issues `RENAME TABLE '<old>' TO '<new>'`
+/// (`spot_1m_rest_persistence.rs`, `option_chain_1m_persistence.rs`,
+/// `option_contract_1m_rest_persistence.rs`), which carries every row forward
+/// under the new name — so after the first boot on this build there is no old
+/// table left to sweep. They are listed only because their `LEGACY_*_TABLE`
+/// constants still exist to drive that rename, and
+/// `partition_retention_coverage_guard` — correctly — demands a decision for
+/// every table-name constant in the crate rather than letting one slip through
+/// undeclared.
+///
+/// Putting them in a SWEEP list instead would be wrong twice over: the sweeper
+/// would issue partition detaches against a name that no longer resolves, and
+/// the real data would be swept anyway under its new name, which is already
+/// covered above. Exempt is the honest answer, and it costs nothing — the row
+/// data itself is retained and swept under the new name.
+///
+/// **CORRECTION, same day (2026-08-14).** The paragraph above named all three
+/// modules as issuing the rename. That was true of two of them:
+/// `option_contract_1m_rest_persistence.rs` had NO rename at all — its
+/// `LEGACY_*` constant existed but nothing consumed it, so on any box that had
+/// already written that table the CREATE would mint an empty table beside the
+/// populated one, and this exemption would have shielded the resulting orphan
+/// from ever being swept. The missing rename was added in the same change.
+///
+/// **SECOND CORRECTION, same day, and this one matters more.** Adding the
+/// rename does NOT make the reasoning above hold — an earlier version of this
+/// paragraph claimed it did, which repeated the exact error it was written to
+/// record. A rename that is ISSUED is not a rename that SUCCEEDED. If the new
+/// name already exists (a box that ran the CREATE-without-rename build, or a
+/// rollback to a pre-rename build whose ILP writer re-creates the old name),
+/// QuestDB refuses the rename and BOTH tables survive — at which point this
+/// list exempts a populated, growing, SEBI-retained orphan from ever being
+/// swept, silently, on a 100 GB root.
+///
+/// What actually discharges the exemption is DETECTION, not intent:
+/// `try_rename_legacy_table` probes for the legacy table after any refusal and
+/// returns `LegacyRenameOutcome::Split` when it is still there, and all three
+/// call sites turn that into a coded `error!` plus a `*_persist_errors_total`
+/// increment on EVERY boot until an operator resolves it. So the exemption is
+/// safe in the only sense that can be verified at runtime: either the old table
+/// is gone (nothing to sweep) or its continued existence is loud.
+///
+/// **Un-discharged today:** `option_contract_1m_rest`. Its `ensure_*` has one
+/// caller, `groww_contract_1m_boot`, gated on `groww_contract_1m.enabled`,
+/// which `config/base.toml` ships `false`. The rename and its split detection
+/// therefore do not execute in the shipped configuration, so that third
+/// exemption rests on nothing being written to the table either. Stated rather
+/// than assumed — a retention exemption granted on a premise that does not hold
+/// is the failure mode this list must never carry, and it has now been recorded
+/// twice in one day for the same reason.
+pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
+    "instrument_lifecycle",
+    "index_constituency",
+    // Pre-2026-08-14 names, renamed forward at boot — see the doc comment above.
+    "spot_1m_rest",
+    "option_chain_1m",
+    "option_contract_1m_rest",
+];
 
 // ---------------------------------------------------------------------------
 // Partition Manager
@@ -666,7 +739,7 @@ mod tests {
         // number 21 (M1/M3/M5/M15/D1 + S1..S15 + S30, TF-diet second-scale) —
         // the exact bug #1022 had (phantom `_shadow` names).
         let names = crate::shadow_persistence::candle_table_names();
-        assert_eq!(names.len(), 21, "expected 21 live candle tables");
+        assert_eq!(names.len(), 24, "expected 24 live candle tables");
         for name in names {
             assert!(
                 name.starts_with("candles_"),

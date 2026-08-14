@@ -55,8 +55,9 @@ use tickvault_core::pipeline::chain_day_store::{
 use tickvault_core::pipeline::chain_snapshot::{
     ChainMoneynessSnapshot, ChainUnderlying, SnapshotRow,
 };
+use tickvault_storage::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE;
 use tickvault_trading::in_mem::spot_bar_store::{
-    estimated_capacity_bytes, install_spot_bar_store, spot_bar_store,
+    MAX_SPOT_BAR_SLOTS, estimated_capacity_bytes, install_spot_bar_store, spot_bar_store,
 };
 use tracing::{error, info, warn};
 
@@ -82,6 +83,32 @@ pub const RAM_CHAIN_REHYDRATE_WINDOW_MINUTES: usize = 30;
 /// Session windows per day: 13 × 30 min covers [09:15, 15:45) IST — the
 /// 375-minute session plus the legs' boundary-fire margin.
 pub const RAM_CHAIN_REHYDRATE_WINDOW_COUNT: usize = 13;
+
+/// Ceiling on the spot store's PROJECTED ring capacity, in bytes.
+///
+/// The spot rings are `VecDeque::with_capacity(bars_per_day × spot_days)`,
+/// allocated **eagerly when a slot is created** — so this memory is committed
+/// the moment an instrument is first seen, whether or not a single bar ever
+/// fills it. Capacity is therefore a promise the process makes up front, not
+/// a high-water mark it grows into, and it is the right thing to bound.
+///
+/// 10 GiB is the operator's stated current-day RAM budget (2026-08-12,
+/// restated three times). Sized against the r8g.xlarge 32 GiB host it leaves
+/// room for QuestDB (`QDB_MEM_LIMIT` default 12g), the aggregator's ~155 MB,
+/// the seal + frame rings, and the OS — while still being generous enough
+/// that no honest current-day configuration trips it.
+pub const RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// The spot store's own slot ceiling, as the `u32` the capacity estimator
+/// takes. Same 25,000 the aggregator, indicator engine and day-OHLC tracker
+/// are sized to — projecting at anything smaller is what hid the overshoot.
+pub const MAX_SPOT_BAR_SLOTS_U32: u32 = MAX_SPOT_BAR_SLOTS as u32;
+
+/// A small illustrative slot count, reported ALONGSIDE the ceiling so the
+/// gap between today's 4-index universe and the 25,000 target is visible in
+/// one line rather than inferred. Never the only figure logged — reporting
+/// this alone is precisely the bug being fixed.
+pub const RAM_STORE_SAMPLE_SLOT_COUNT: u32 = 8;
 
 /// NSE session open, IST seconds-of-day (09:15).
 const SESSION_OPEN_SECS_OF_DAY: i64 = 9 * 3600 + 15 * 60;
@@ -129,14 +156,57 @@ pub fn install_market_ram_stores(cfg: &MarketRamStoreConfig, catchup_days: u32) 
              to keep the whole window resident)"
         );
     }
+    // The projected capacity at the store's OWN slot ceiling, not at a
+    // sample size.
+    //
+    // This line used to pass a hardcoded `8` for slot_count, and that single
+    // literal is why a 34.9 GB configuration read as harmless for months.
+    // Eight slots is roughly today's universe (the 4 SPOT_1M_REST_INDICES),
+    // so at `spot_days = 35` the log printed ~11 MB and every reader
+    // reasonably concluded the store was cheap. The store's real ceiling is
+    // `MAX_SPOT_BAR_SLOTS` (25,000) — the same number the aggregator, the
+    // indicator engine and the day-OHLC tracker are all sized to — at which
+    // the identical config commits **3,000× more memory**.
+    //
+    // A sizing log that is blind to scale is worse than no sizing log: it
+    // answers the question "is this expensive?" with a number that is
+    // accurate for a universe nobody is targeting. Project at the ceiling,
+    // and report BOTH so the gap between today and the target is visible
+    // rather than inferred.
+    let projected_bytes = estimated_capacity_bytes(cfg.spot_days, MAX_SPOT_BAR_SLOTS_U32);
+    let today_bytes = estimated_capacity_bytes(cfg.spot_days, RAM_STORE_SAMPLE_SLOT_COUNT);
+
+    if projected_bytes > RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES {
+        // Fail LOUD, not closed. Refusing the install would leave the
+        // decision path with no RAM store at all, which is strictly worse
+        // than an oversized one — and the overshoot only materialises as the
+        // universe actually grows, so there is real time to act. The gauge +
+        // this coded line are the signal; the operator lowers `spot_days`.
+        error!(
+            code = ErrorCode::RamStore01Degraded.code_str(),
+            stage = "capacity_projection",
+            spot_days = cfg.spot_days,
+            projected_bytes,
+            budget_bytes = RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES,
+            slot_ceiling = MAX_SPOT_BAR_SLOTS_U32,
+            "RAMSTORE-01: spot ring capacity at the slot ceiling EXCEEDS the \
+             RAM budget — the rings allocate eagerly per slot, so this much \
+             memory is committed as instruments are first seen, not as bars \
+             arrive. Lower [market_ram_store] spot_days until the projection \
+             fits, or raise the budget deliberately"
+        );
+    }
+
     info!(
         spot_days = cfg.spot_days,
         chain_row_cap = cfg.chain_row_cap,
-        spot_capacity_bytes = estimated_capacity_bytes(cfg.spot_days, 8),
-        "market_ram_store: RAM residency stores installed — spots month-deep \
-         (filled by the fold catch-up + live seals; depth bounded by CAPTURED \
-         history, shown honestly by tv_ram_store_spot_days_depth), options \
-         current-day (chain publishes + boot rehydrate)"
+        spot_capacity_bytes_at_slot_ceiling = projected_bytes,
+        spot_capacity_bytes_at_sample = today_bytes,
+        slot_ceiling = MAX_SPOT_BAR_SLOTS_U32,
+        budget_bytes = RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES,
+        "market_ram_store: RAM residency stores installed — spot depth bounded \
+         by CAPTURED history (shown honestly by tv_ram_store_spot_days_depth), \
+         options current-day (chain publishes + boot rehydrate)"
     );
 }
 
@@ -185,7 +255,7 @@ pub fn chain_rehydrate_sql(
         "SELECT (ts / 1) * 1000 AS ts_nanos, strike, leg, last_price, moneyness, \
          underlying_spot, (expiry / 1) * 1000 AS expiry_nanos, \
          (fetched_at / 1) * 1000 AS fetched_nanos \
-         FROM option_chain_1m \
+         FROM {OPTION_CHAIN_1M_TABLE} \
          WHERE feed = '{feed}' AND underlying_symbol = '{underlying_symbol}' \
          AND ts >= {start_micros} AND ts < {end_micros} \
          ORDER BY ts ASC LIMIT {fetch_limit}"
@@ -611,7 +681,11 @@ mod tests {
         assert!(sql.contains("(ts / 1) * 1000 AS ts_nanos"));
         assert!(sql.contains("(expiry / 1) * 1000 AS expiry_nanos"));
         assert!(sql.contains("(fetched_at / 1) * 1000 AS fetched_nanos"));
-        assert!(sql.contains("FROM option_chain_1m"));
+        // The reader MUST target the renamed REST table (2026-08-14). Asserting
+        // the literal, not the constant, is deliberate: a test that formats the
+        // same constant the code formats would pass through any rename and
+        // prove nothing.
+        assert!(sql.contains("FROM rest_option_chain_1m"), "{sql}");
         assert!(sql.contains("feed = 'dhan'"));
         assert!(sql.contains("underlying_symbol = 'NIFTY'"));
         assert!(sql.contains("ts >= 2000 AND ts < 3000"));

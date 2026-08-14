@@ -9,7 +9,22 @@ paths:
   - "crates/trading/src/strategy/**"
 ---
 
-# AWS Budget Enforcement — t4g.medium LOCKED ~₹1,022/mo
+# AWS Budget Enforcement — r8g.xlarge LOCKED ~₹5,824–7,382/mo
+
+> **⚠ TITLE CORRECTED 2026-08-12 (operator Quote 15 — "this is our finalsied
+> instancue dude okay? just sue this evrywhere neitlrey").** This H1 read
+> **"t4g.medium LOCKED ~₹1,022/mo"** until now — a figure from 2026-05-18, two
+> instance locks and a 6× cost change out of date, sitting at the very top of
+> the file whose entire job is to state the bill. Every dated banner below
+> already carried the correct supersession chain, so a careful reader was
+> served; a quick one read the title and got a number roughly **one sixth** of
+> the real one. The live lock is **r8g.xlarge** (Quote 13, 2026-08-08 — the
+> 13-timeframe + current-day tick-retention sizing), the bill is
+> **~₹5,824–7,382/mo incl GST** at ~210 hrs, and the Quote 9 sub-₹1,000 target
+> is **knowingly breached ~6×** with the downward ratchet ladder PAUSED. The
+> ₹1,022 figure below is retained as 2026-05-18 historical audit — it describes
+> a different instance, a different universe, and a different stack, and must
+> never be quoted as current.
 
 > **⚠ SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** instance upgraded t4g.medium → t4g.large (8 GiB), bill ~₹1,022/mo → ~₹1,514/mo, cron 08:00 → 08:30 IST. Contents below retained as 2026-05-18 historical audit; current effective contract lives in the superseding file.
 >
@@ -306,6 +321,185 @@ requires the full §7 dated-quote protocol in
 > **Authority:** Parthiban (architect). Non-negotiable.
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
+
+## COST NOTE 2026-08-12 — PERSIST-side loss counters reach CloudWatch (+~$1.20/mo)
+
+The 2026-08-11 note below instrumented the revived Dhan live lane at the
+**socket** and left it blind at the **database**. Four counters on the path
+between a received packet and a durable row published nowhere:
+
+| Counter | What a non-zero value means |
+|---|---|
+| `tv_ticks_dropped_total` | buffered rows were DISCARDED on a flush failure — the largest single tick-loss window in the lane |
+| `tv_tick_persist_errors_total` | the ILP client failed to build, connect, or apply DDL |
+| `tv_tick_rows_refused_total` | a row was refused before it reached the buffer |
+| `tv_ws_frame_spill_write_errors_total` | the capture-at-receipt durable floor failed to write |
+
+The last one had been **deliberately excluded** on the recorded grounds that
+"no WS frame producer exists (both live feeds retired 2026-07-13/15)". That
+reason stopped holding on 2026-08-09/11 when the lane was revived, and the
+exclusion silently survived it. It matters more than the others because
+`ws_frame_spill::accept` returns `Spilled` even on a full disk — the writer
+thread drains and discards — so this counter is the ONLY signal that the
+durable floor has stopped holding.
+
+**Cost:** +4 custom metric series ≈ **+$1.20/mo** (48 → 52 EMF-selected names;
+~$14.40 → ~$15.60/mo) against the $100 kill-ceiling whose AUTOMATIC budget
+actions fire `STOP_EC2_INSTANCES` at 90% ($90). Headroom unaffected. Added to
+BOTH allowlist copies in lockstep (`user-data.sh.tftpl` + the reference
+`cloudwatch-agent.json`), count ratchet bumped 48 → 52 with the rationale
+in-place.
+
+**NOT claimed:** that these names now PAGE. The allowlist makes the metric
+exist in CloudWatch; alarms on top of them, and pre-registering each series at
+0 at boot so the first alarm sample is not the outage itself, remain the same
+flagged follow-up the 2026-08-11 note recorded. Stated here rather than left to
+be discovered from a quiet dashboard.
+
+## COST NOTE 2026-08-11 — Dhan live-lane loss counters reach CloudWatch (+~$2.10/mo)
+
+The Dhan live WebSocket lane was switched ON the same day (operator quote,
+`websocket-connection-scope-lock.md` "2026-08-11 — THE DEFAULT IS FLIPPED
+ON"). Its **seven** loss counters were emitted by the binary and selected by
+neither EMF allowlist, so every way the lane can lose data was counted
+in-process and discarded at the agent:
+
+| Counter | What its non-zero value means |
+|---|---|
+| `tv_dhan_ws_wal_dropped_total` | a frame was never durably captured |
+| `tv_dhan_ws_ring_full_total` | the frame ring hit its COUNT bound |
+| `tv_dhan_ws_ring_bytes_full_total` | the frame ring hit its BYTE bound (new same day) |
+| `tv_dhan_ws_frame_refused_total` | a frame was refused before the ring |
+| `tv_dhan_ws_subscribe_failed_total` | an instrument was never subscribed |
+| `tv_dhan_feed_seals_dropped_total` | a computed candle was discarded |
+| `tv_dhan_feed_seq_refused` | a sequence number could not be represented |
+
+A lane whose drop paths are invisible reports healthy while losing ticks —
+the false-OK class rule 11 forbids, and the reason this is a cost worth
+paying rather than a nice-to-have.
+
+**Cost:** +7 custom metric series ≈ **+$2.10/mo** (41 → 48 EMF-selected
+names; ~$12.30 → ~$14.40/mo at CloudWatch's ~$0.30/custom-metric/month)
+against the $100 kill-ceiling whose AUTOMATIC budget actions fire
+`STOP_EC2_INSTANCES` at 90% ($90). Headroom is unaffected at this scale.
+Added to BOTH allowlist copies (`user-data.sh.tftpl` + the reference
+`cloudwatch-agent.json`) in lockstep; the count ratchet
+(`cloudwatch_app_alarms_wiring::test_emf_metric_selectors_name_count_is_pinned`)
+was bumped 41 → 48 with the rationale in-place, per its own instruction that
+a count change be deliberate and dated, never a drive-by.
+
+**NOT claimed:** these names now PAGE. The allowlist makes the metric exist
+in CloudWatch; alarms on top of them, and pre-registering each series at 0
+at boot so the first alarm sample is not the outage itself (the
+first-sample-baseline lesson), are a **flagged follow-up** — stated here
+rather than left to be discovered from a quiet dashboard.
+
+**Also flagged, deliberately not taken:** the exclusion ledger in
+`user-data.sh.tftpl` still excludes `tv_ws_frame_spill_write_errors_total`
+because "no WS frame producer exists since the 2026-07-13/15 live-feed
+retirements". The revived lane IS a WS frame producer, so that stated reason
+no longer holds. Recorded rather than silently added — adding it is its own
+cost decision and would make this note's +7 delta untrue.
+
+## COST NOTE 2026-08-12 — silence read-out gauges (+~$0.60/mo)
+
+The live lane seeded every subscribed instrument into a `TickGapDetector` and
+called `observe()` on it for every tick — and never asked it a single
+question. `scan_silence` had **zero production callers**: a fully wired sensor
+with no read-out, which reads *greener* than dead code does, because every
+part of it looks connected.
+
+The scan now runs on its own 30s timer and publishes two gauges, both added to
+the EMF selector:
+
+| Gauge | What a non-zero value means |
+|---|---|
+| `tv_dhan_feed_instruments_silent` | instruments quiet beyond their OWN learned cadence (sparse ones excluded, §36.4 precedent) |
+| `tv_dhan_feed_instruments_never_ticked` | instruments that produced **nothing** since being subscribed |
+
+The second is the one that earns its cost. A subscribe that silently did not
+take produces **no other signal at all** — there is no payload to count, no
+parse to fail, and no error to log. Absence measured against a seeded key is
+the only evidence that exists. Leaving it in a `/metrics` endpoint nothing on
+this box scrapes would have repeated exactly the mistake the two notes below
+correct.
+
+**Cost:** +2 custom metric series ≈ **+$0.60/mo** (52 → 54 EMF-selected names;
+~$15.60 → ~$16.20/mo). Added to both allowlist copies in lockstep; count
+ratchet bumped with its rationale in place.
+
+**NOT claimed:** that these now PAGE. They are visible, not pageable — an
+alarm needs the market-hours window gate (its `ALARM_NAMES` list arms a named
+set), which is its own terraform change. Flagged here rather than left to be
+discovered from a quiet dashboard. The `error!` the scan emits (`RISK-GAP-03`,
+edge-latched, two consecutive scans, market-hours gated) is log-sink-only.
+
+## COST NOTE 2026-08-12 — WS-SPILL-01 alarm (+~$0.10/mo)
+
+The 2026-08-11 sweep below was scoped to `Severity::Critical`. WS-SPILL-01 is
+`High`, so it fell outside — and the result was that WS-SPILL-02 (the spill
+channel full at the append instant) got an alarm while WS-SPILL-01 (the disk
+refusing the write) did not. That is the wrong half to leave unpaged: a full
+or unwritable data volume is the more common failure, and
+`WsFrameSpill::append` returns `Spilled` the instant a record enters the
+crossbeam channel, so on a bad disk every caller keeps being told the frame
+was durably captured while `persist_record_resilient` counts the failure and
+returns 0. The capture-at-receipt floor is gone with nothing upstream able to
+tell.
+
+**Cost:** +1 errcode log-filter alarm ≈ **+$0.10/mo** (15 → 16 map entries in
+`error-code-alarms.tf`). The derived metric is sparse and dimensionless —
+billed only in hours the code actually fires — so it is near-free at rest.
+Zero new EMF allowlist names (`tv_ws_frame_spill_write_errors_total` was
+already added earlier the same day), zero dashboards, zero Lambdas. Well
+inside the $100 kill ceiling whose 90% line is $90.
+
+**Not claimed:** that this makes the durable floor self-healing. It does not —
+the writer thread deliberately stays alive and retries, and frames that
+arrive while the disk is refusing writes are never written retroactively.
+`ok_recovery = false` for exactly that reason: a recovering disk is not a
+recovered dataset.
+
+## COST NOTE 2026-08-11 — Critical-severity paging-gap sweep (+~$0.40/mo)
+
+A mechanical sweep of all 167 `ErrorCode` variants found **29** at
+`Severity::Critical` but only **4** with an `error_code_alerts` entry
+(DH-901, AUTH-GAP-04, PROC-01, AGGREGATOR-DROP-01). A Critical that reaches
+no human surface is a silent failure by definition — the 2026-07-06
+zero-page class, inverted. Added, per `deploy/aws/terraform/error-code-alarms.tf`:
+
+- **+4 errcode log-filter alarms ≈ $0.40/mo (Verified against the terraform
+  diff — 11 → 15 map entries, each generating one filter + one alarm via the
+  existing `for_each`):** `boot-02` (QuestDB boot-probe deadline — boot
+  BLOCKS; also repairs a documented false-OK, since the `wal-suspend-01`
+  description told the operator "BOOT-01/02 own that page" while BOOT-02
+  owned no page at all), `boot-03` (clock skew — every IST timestamp wrong),
+  `oms-gap-06` (dry-run order runtime died; paper book + day P&L silently
+  zeroed), `ws-spill-02` (raw WS frame dropped at the capture-at-receipt WAL
+  — the raw-frame twin of AGGREGATOR-DROP-01). Their log-derived metrics are
+  sparse + dimensionless (billed only in hours a code fires — near-free); no
+  `default_value`, so no always-billed series. Zero new EMF allowlist names,
+  zero new dashboards, zero new Lambdas.
+
+Total **≈ $0.40/mo pre-GST (~₹40/mo incl. 18% GST at ₹85/$)** — inside the
+$100/mo pre-GST budget kill ceiling (2026-08-08 ruling).
+
+**Deliberately NOT added (cost + lock discipline, no false-OK):** 14 Critical
+codes have **no `error!` emit site at all** and were NOT alarmed — a filter
+with no possible emit site is a dead monitor that reads permanently green
+(the ws-reinject-01 / tick-conserve-01 precedent); they are enum-retirement
+candidates instead, listed in `observability-architecture.md`. Four more
+already reach a human via a typed `NotificationEvent` and are not duplicated
+(≈ $0.40/mo avoided). Three are **BLOCKED pending a dated operator quote**:
+AUTH-GAP-01 + DATA-805 are Dhan-scoped and
+`dhan-rest-only-noise-lock-2026-07-14.md` §3 REJECTs any new Dhan-scoped page
+outside its 4-item family without a fresh dated quote in THAT file first;
+GROWW-OCO-02 is compiled out by the non-default `groww_orders` cargo feature.
+Covering those three would add ≈ $0.30/mo once quoted.
+
+Ratchet: `crates/storage/tests/critical_errcode_alarm_coverage_guard.rs`
+(7 assertions + a shrinking allowlist) fails the build if a Critical code
+with a real emit site is neither alarmed nor allowlisted.
 
 ## COST NOTE 2026-07-17 — dashboard tidy (−~$0.70/mo + 1 free-tier dashboard slot)
 

@@ -61,7 +61,7 @@ qualified exactly:
 
 > "100% inside the tested envelope, with ratcheted regression coverage:
 > ≤60s QuestDB outage absorbed by rescue→spill→DLQ;
-> ≤200,000-seal ring buffer capacity (constant `SEAL_BUFFER_CAPACITY`,
+> the derived seal-ring capacity `AGGREGATOR_MAX_SLOTS × TF_COUNT` (600,000 at TF_COUNT=24 — never restate this as a literal: the docs said 200,000, then 525,000 at TF_COUNT=21, and TF_COUNT is now 24. Read the constant, do not quote a number) (constant `SEAL_BUFFER_CAPACITY`,
 > `crates/trading/src/candles/seal_ring.rs`, ratcheted by
 > `seal_ring.rs::test_seal_buffer_capacity_constant_is_locked_value`)
 > → NDJSON spill → DLQ; bench-gated

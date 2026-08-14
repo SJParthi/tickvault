@@ -120,10 +120,21 @@ jobs:
 
       - name: Market-hours guard (IST 09:15-15:30 Mon-Fri)
         id: guard
+        # 2026-08-10 (security review): both inputs come in through `env:`,
+        # never spliced into the script text. `force` is a free-form string,
+        # so a dispatched value containing a newline used to be substituted
+        # into this `run:` body BEFORE bash saw it — arbitrary commands, in a
+        # step that runs AFTER the AWS credentials are already exported into
+        # the job environment. `action` is a `choice` and is therefore
+        # constrained by GitHub, but it moves too so the pattern here is
+        # uniform and nobody has to remember which one was safe.
+        env:
+          ACTION_INPUT: ${{ github.event.inputs.action }}
+          FORCE_INPUT: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
-          action="${{ github.event.inputs.action }}"
-          force="${{ github.event.inputs.force }}"
+          action="$ACTION_INPUT"
+          force="$FORCE_INPUT"
           # Only stop/reboot/restart-app interrupt a live session.
           case "$action" in
             stop|reboot|restart-app|stop-app|rotate-ip) sensitive=1 ;;
@@ -435,6 +446,17 @@ jobs:
             newname="/tickvault/staging/${name#/tickvault/dev/}"
             ptype=$(aws ssm get-parameter --name "$name" --region "$AWS_REGION" --query 'Parameter.Type' --output text)
             value=$(aws ssm get-parameter --name "$name" --with-decryption --region "$AWS_REGION" --query 'Parameter.Value' --output text)
+            # 2026-08-10 SECURITY FIX (audit finding). This value is a DECRYPTED
+            # SecureString — real credentials. It never flowed through the `secrets:`
+            # context, so GitHub Actions' automatic log-masking does NOT apply to it.
+            # Without this line a future `set -x`, a debug echo, or an aws CLI error
+            # that echoes its own argv would print live credentials into the Actions
+            # log, which is retained and readable by anyone with repo read access.
+            #
+            # ::add-mask:: registers the value with the runner so it is redacted from
+            # all subsequent log output. Guarded on non-empty because masking an empty
+            # string is a no-op the runner warns about.
+            [ -n "$value" ] && echo "::add-mask::$value"
             aws ssm put-parameter --name "$newname" --type "$ptype" --value "$value" --overwrite --region "$AWS_REGION" >/dev/null
             n=$((n+1)); echo "  seeded $name -> $newname ($ptype)"
           done
@@ -459,11 +481,19 @@ jobs:
       # now derives from the run instead of asserting it.
       - name: Summary
         if: always()
+        # Same treatment as the guard step: dispatch inputs reach the shell as
+        # environment variables, never as text substituted into the script.
+        # This one writes them into GITHUB_STEP_SUMMARY, which is just as
+        # injectable as a command line.
+        env:
+          ACTION_INPUT: ${{ github.event.inputs.action }}
+          FORCE_INPUT: ${{ github.event.inputs.force }}
+          IID_OUT: ${{ steps.iid.outputs.id }}
         run: |
           if [ "${{ job.status }}" = "success" ]; then
             VERDICT="✅ succeeded"
           else
             VERDICT="🆘 FAILED (job.status=${{ job.status }}) — the action did NOT complete; scroll up for the AWS error"
           fi
-          echo "## AWS Control: \`${{ github.event.inputs.action }}\` — $VERDICT" >> "$GITHUB_STEP_SUMMARY"
-          echo "Instance: ${{ steps.iid.outputs.id }} | region: ${AWS_REGION} | force: ${{ github.event.inputs.force }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## AWS Control: \`$ACTION_INPUT\` — $VERDICT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Instance: $IID_OUT | region: ${AWS_REGION} | force: $FORCE_INPUT" >> "$GITHUB_STEP_SUMMARY"

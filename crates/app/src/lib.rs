@@ -144,11 +144,31 @@ pub mod daily_task_marker;
 /// (`dhan_activation` — the lane cold-start watcher that preceded this
 /// decl — was deleted in PR-C2 with the Dhan live-WS lane.)
 pub mod dhan_data_api_limiter;
+/// `[groww_universe]` process-global daily Groww watch-set + shared-master
+/// rider (2026-07-15 live-feed retirement re-home of the activation daily
+/// build loop + the sole persist_groww_instruments caller).
+pub mod dhan_depth_universe;
+/// Dhan 16-connection live-feed stack — boot wiring, DEFAULT-OFF behind BOTH
+/// `[feeds] dhan_enabled` and the `TICKVAULT_DHAN_LIVE_FEED=1` environment
+/// opt-in. Authorized by the operator quote of 2026-08-09 in
+/// `websocket-connection-scope-lock.md` ("16 CONNECTIONS + depth-20/depth-200
+/// AUTHORIZED"). Plans the 5 main-feed / 5 depth-20 / 5 depth-200 pools,
+/// reserves the connection budget, and hands the shape to
+/// `tickvault_core::websocket::pool_supervisor`.
+pub mod dhan_feed_stack;
 /// Shared Dhan `/v2/charts/intraday` 1m request/response primitives —
 /// relocated from `cross_verify_1m_boot.rs` in Phase C1 of the 2026-07-13
 /// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
 /// module the Phase C deletion PRs remove). Pure move, zero behavior change.
 pub mod dhan_intraday_parse;
+/// Daily 15:31 IST Dhan LIVE-vs-REST cross-verification comparator — the
+/// revived Dhan live feed's ONLY ground truth (the wire carries no sequence
+/// number and no snapshot-on-subscribe, so Dhan's own 1m tape is the only
+/// packet-loss proxy). Integer-paise OHLC compare, quantified noise profile,
+/// and a `blind` outcome that makes a zero-comparison run structurally
+/// incapable of reading as a pass — the PR #1474 blind-since-birth lesson.
+pub mod dhan_live_crossverify;
+pub mod dhan_live_universe;
 /// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive
 /// 2026-07-16; governance on PR #1597): receive-only broadcast consumer
 /// mapping order updates to `order_audit` rows `feed='dhan'`/`mode='paper'`.
@@ -161,6 +181,7 @@ pub mod dhan_order_push_observability;
 /// TokenManager → renewal + mid-session watchdog → REST canary +
 /// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
 pub mod dhan_rest_stack;
+pub mod dhan_universe;
 /// Groww order/position PUSH channel — Stage D app consumer (2026-07-17,
 /// operator-authorized paper-mode receive-only build): bridges trading-side
 /// `BrokerOrderEvent`s from the supervised push runner into `order_audit`
@@ -169,9 +190,6 @@ pub mod dhan_rest_stack;
 /// `[groww_orders] order_push_enabled` flag (Gate 1, default OFF).
 #[cfg(feature = "groww_orders")]
 pub mod groww_order_observability;
-/// `[groww_universe]` process-global daily Groww watch-set + shared-master
-/// rider (2026-07-15 live-feed retirement re-home of the activation daily
-/// build loop + the sole persist_groww_instruments caller).
 pub mod groww_universe;
 pub mod groww_watch_paths;
 /// RAM residency stores boot (operator directive 2026-07-16, PR-2):
@@ -195,6 +213,14 @@ pub mod shutdown_class;
 // PR #3 (2026-05-19): `greeks_pipeline` module DELETED. Greeks
 // pipeline retired alongside the indices-only universe. Option Chain
 // REST overlay (PR #8) ships Dhan-computed greeks separately.
+/// Boot-time verification of the kernel limits the market-data feed depends on
+/// (2026-08-10). `deploy/aws/sysctl/99-tickvault-net.conf` raises the socket
+/// receive buffer from the stock ~212 KB to 128 MB, but user-data applies it
+/// exactly ONCE at first boot — an AMI predating the file, a hand-edited box, or
+/// a partial `sysctl --system` all leave the app running untuned and silently
+/// losing ticks under load. This reads what the kernel actually gave us and says
+/// so. Reports, never halts: the runtime is useful without tuned buffers.
+pub mod host_limits;
 pub mod infra;
 // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
 // `movers_pipeline` orchestrator is DELETED. Operator directive:

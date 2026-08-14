@@ -56,8 +56,30 @@ use tokio::sync::mpsc;
 use tickvault_trading::candles::BufferedSeal;
 
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
-use crate::seal_writer_task::{DrainOutcome, drain_once};
+use crate::seal_dlq::SealDlqWriter;
+use crate::seal_spill::SealSpillWriter;
+use crate::seal_writer_task::{BootDrainOutcome, DrainOutcome, drain_once, drain_recovered_seals};
 use crate::shadow_candle_writer::ShadowCandleWriter;
+
+/// Production spill directory, derived through the public `SealSpillWriter`
+/// API so this module never duplicates the path literal (a drifted copy
+/// would silently recover from the wrong directory — i.e. recover nothing).
+fn production_spill_dir() -> std::path::PathBuf {
+    SealSpillWriter::new()
+        .spill_path(0)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// Production DLQ directory — same derivation as [`production_spill_dir`].
+fn production_dlq_dir() -> std::path::PathBuf {
+    SealDlqWriter::new()
+        .dlq_path(0)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
+}
 
 /// Wave 6 Sub-PR #1 item 1.4c — process-global mpsc Sender that any
 /// producer (e.g. the future aggregator task that subscribes to the
@@ -103,11 +125,35 @@ pub fn global_seal_sender() -> Option<&'static mpsc::Sender<BufferedSeal>> {
     GLOBAL_SEAL_SENDER.get()
 }
 
-/// Bounded mpsc capacity for the producer→consumer wire. Sized to
-/// absorb the IST-midnight burst (~99K seals across 11K instruments
-/// × 9 TFs) without saturating; matches `SEAL_BUFFER_CAPACITY` for
-/// symmetry with the locked Wave-6 ring sizing per L-C1.
-pub const SEAL_MPSC_CAPACITY: usize = 200_000;
+/// Bounded mpsc capacity for the producer→consumer wire.
+///
+/// DERIVED from [`SEAL_BUFFER_CAPACITY`], not a literal, since
+/// 2026-08-12. The previous `200_000` carried the comment "absorbs the
+/// IST-midnight burst (~99K seals across 11K instruments × 9 TFs)" —
+/// which described a universe that no longer exists and was
+/// arithmetically FALSE at the configured ceiling.
+///
+/// This channel sits IN FRONT OF the ring. `force_seal_all` emits
+/// `AGGREGATOR_MAX_SLOTS × TF_COUNT` = 25,000 × 24 = **600,000** seals
+/// in one burst, and every one of them must pass through here before it
+/// can reach the ring's three absorbing tiers. At 200,000 the channel
+/// force-dropped **400,000** of them on `try_send` — counter-only, no
+/// log line, no alarm — every midnight, while the ring behind it was
+/// correctly sized for the full burst and sat mostly empty.
+///
+/// That is the exact drift class `SEAL_BUFFER_CAPACITY` was derived to
+/// prevent on 2026-08-10; the ring was fixed and the channel in front of
+/// it was missed, so the bound simply moved one hop upstream. Deriving
+/// BOTH from the same inputs closes it: change `AGGREGATOR_MAX_SLOTS` or
+/// `TF_COUNT` and both follow, and the ratchet below fails the build if
+/// they ever diverge again.
+///
+/// Cost at the derived value: the mpsc allocates its buffer lazily per
+/// queued item (tokio `mpsc` does NOT pre-allocate capacity slots), so
+/// the steady-state cost is ~0 and the worst case equals the burst
+/// itself — 600,000 × ≤144 B ≈ **86 MB**, matching the ring, 0.26% of
+/// the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
+pub const SEAL_MPSC_CAPACITY: usize = tickvault_trading::candles::SEAL_BUFFER_CAPACITY;
 
 /// Outcome of one [`SealWriterRunner::run_one_cycle`] call.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -159,6 +205,12 @@ pub struct SealWriterRunner {
     /// Max seals to drain from ring → ILP per cycle. Bounded so a
     /// catastrophic burst doesn't monopolise the writer task.
     max_drain_per_cycle: usize,
+    /// Spill directory this runner's pipeline writes to. Retained so the
+    /// boot-time recovery drain reads back from the SAME directory the
+    /// rescue path spills into (the pipeline owns its writers privately).
+    spill_dir: std::path::PathBuf,
+    /// DLQ directory — same reasoning as `spill_dir`.
+    dlq_dir: std::path::PathBuf,
 }
 
 impl SealWriterRunner {
@@ -178,6 +230,8 @@ impl SealWriterRunner {
             pipeline,
             writer,
             max_drain_per_cycle,
+            spill_dir: production_spill_dir(),
+            dlq_dir: production_dlq_dir(),
         })
     }
 
@@ -197,8 +251,8 @@ impl SealWriterRunner {
         let writer = ShadowCandleWriter::for_test();
         let pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
             ring_capacity,
-            spill_dir,
-            dlq_dir,
+            spill_dir.clone(),
+            dlq_dir.clone(),
         );
         let (sender, receiver) = mpsc::channel(mpsc_capacity);
         Self {
@@ -207,7 +261,37 @@ impl SealWriterRunner {
             pipeline,
             writer,
             max_drain_per_cycle,
+            spill_dir,
+            dlq_dir,
         }
+    }
+
+    /// Boot-time recovery drain: reads back every orphaned spill / DLQ file
+    /// and re-ingests it into QuestDB. Called ONCE by the writer loop before
+    /// its drain ticker starts.
+    ///
+    /// Without this, seals rescued to disk during a QuestDB outage were never
+    /// read back by anything — see the module docs on
+    /// [`crate::seal_writer_task::drain_recovered_seals`].
+    pub fn boot_drain(&mut self) -> BootDrainOutcome {
+        drain_recovered_seals(
+            &mut self.writer,
+            &self.spill_dir,
+            &self.dlq_dir,
+            self.max_drain_per_cycle,
+        )
+    }
+
+    /// Spill directory this runner recovers from (test observability).
+    #[must_use]
+    pub fn spill_dir(&self) -> &std::path::Path {
+        &self.spill_dir
+    }
+
+    /// DLQ directory this runner recovers from (test observability).
+    #[must_use]
+    pub fn dlq_dir(&self) -> &std::path::Path {
+        &self.dlq_dir
     }
 
     /// Cloneable producer-side handle. The future aggregator passes
@@ -537,10 +621,39 @@ mod tests {
 
     #[test]
     fn test_seal_mpsc_capacity_constant_pinned() {
-        // Pin the locked mpsc capacity so a regression PR can't
-        // silently lower it (which would push more producer-side
-        // drops at IST midnight).
-        assert_eq!(SEAL_MPSC_CAPACITY, 200_000);
+        // The mpsc sits IN FRONT OF the ring: every seal must pass
+        // through it before it can reach the ring's three absorbing
+        // tiers, so a channel smaller than the ring silently relocates
+        // the drop one hop upstream of every absorption mechanism.
+        //
+        // This test used to pin the literal 200_000. That literal was
+        // correct when written and became a 400,000-seal-per-midnight
+        // drop the moment the ring was derived (2026-08-10) and TF_COUNT
+        // moved 21 -> 24 — and the pin PASSED throughout, because it
+        // asserted the stale value rather than the relationship. Pinning
+        // the RELATIONSHIP is what makes the drift impossible.
+        assert_eq!(
+            SEAL_MPSC_CAPACITY,
+            tickvault_trading::candles::SEAL_BUFFER_CAPACITY,
+            "the producer->consumer mpsc must be at least the ring's capacity, \
+             or force_seal_all drops the difference before any absorbing tier sees it"
+        );
+    }
+
+    #[test]
+    fn test_seal_mpsc_capacity_absorbs_a_whole_force_seal_burst() {
+        // The concrete failure this closes: force_seal_all emits
+        // AGGREGATOR_MAX_SLOTS x TF_COUNT seals in a single yield at the
+        // IST day boundary. Anything less than that here is a guaranteed
+        // per-midnight loss with a counter but no log and no alarm.
+        let burst = tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS
+            * tickvault_trading::candles::tf_index::TF_COUNT;
+        assert!(
+            SEAL_MPSC_CAPACITY >= burst,
+            "mpsc capacity {SEAL_MPSC_CAPACITY} < one force_seal_all burst {burst} — \
+             {} seals would be dropped every IST midnight",
+            burst.saturating_sub(SEAL_MPSC_CAPACITY)
+        );
     }
 
     // -----------------------------------------------------------------------

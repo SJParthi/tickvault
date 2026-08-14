@@ -86,7 +86,7 @@ tracing-appender = "0.2.5"
 # consumers anywhere in the repo — the Dhan JWT is handled as an opaque
 # Secret<String>, never decoded locally.
 arc-swap = "1.9.1"
-totp-rs = { version = "5.7.1", features = ["gen_secret", "otpauth"] }
+totp-rs = { version = "=6.0.0", features = ["otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
 governor = "0.10.4"
@@ -123,7 +123,13 @@ bytes = "1.11.1"
 sha2 = "0.11.0"
 
 # ---- Section 12: System & Resilience ----
-core_affinity = "0.8.3"
+# core_affinity REMOVED 2026-08-10 — declared since Wave 5 (2026-05-01) with
+# ZERO call sites in any crate, while the resilience matrix advertised
+# "core_affinity Core 0" as a delivered guarantee. Re-adding it requires a real
+# call site in the same PR (ratchet: crates/common/tests/core_affinity_claim_guard.rs)
+# and should NOT target core 0 — that core services network interrupts, so
+# pinning the decoder there puts it in contention with the softirq work it
+# depends on. See the dated correction in operator-charter-forever.md.
 memmap2 = "0.9.11"
 notify = "8.2.0"
 # signal-hook-tokio removed in S11 — dead dep with zero references across

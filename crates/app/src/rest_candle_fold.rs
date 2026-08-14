@@ -111,6 +111,7 @@ use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS}
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::types::SecurityId;
+use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TF_COUNT, TfIndex};
 use tickvault_trading::in_mem::spot_bar_store::{RamBar, SlotKey, spot_bar_store};
 use tokio::sync::mpsc;
@@ -1200,7 +1201,7 @@ pub fn spot_bars_sql(
     let fetch_limit = limit.saturating_add(1);
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, open, high, low, close, volume \
-         FROM spot_1m_rest \
+         FROM {SPOT_1M_REST_TABLE} \
          WHERE security_id = {security_id} AND exchange_segment = '{segment}' \
          AND feed = '{feed}' AND ts >= {start_micros} AND ts < {end_micros} \
          ORDER BY ts ASC LIMIT {fetch_limit}"
@@ -1214,7 +1215,7 @@ pub fn spot_discovery_sql(feed: &str, window_start_nanos: i64, limit: usize) -> 
     let start_micros = window_start_nanos / 1_000;
     let fetch_limit = limit.saturating_add(1);
     format!(
-        "SELECT DISTINCT security_id, exchange_segment FROM spot_1m_rest \
+        "SELECT DISTINCT security_id, exchange_segment FROM {SPOT_1M_REST_TABLE} \
          WHERE feed = '{feed}' AND ts >= {start_micros} LIMIT {fetch_limit}"
     )
 }
@@ -2484,7 +2485,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_bar_folds_into_all_5_tfs_and_m1_seals() {
+    fn test_single_bar_folds_into_every_minute_scale_tf_and_m1_seals() {
         let mut e = SidFoldState::new(Feed::Dhan, 13, 0);
         let outcome = e.fold_bar(&bar_at(0, 100.0, 101.0, 99.0, 100.5, 10));
         let FoldOutcome::Folded(sealed) = outcome else {
@@ -2495,8 +2496,37 @@ mod tests {
         assert_eq!(sealed[0].tf, TfIndex::M1);
         assert_eq!(sealed[0].bucket.open, 100.0);
         assert_eq!(sealed[0].bucket.close, 100.5);
-        // The other 4 TFs (3m/5m/15m/1d) are open.
-        assert_eq!(e.open_bucket_count(), 4);
+
+        // Every OTHER minute-scale frame is left open. Asserted BY NAME, not
+        // by count: this test previously read "all 5 TFs" and checked `== 4`,
+        // which silently stayed green in spirit but went stale the moment the
+        // frame set grew (M2/M30/M60 joined). A bare count cannot tell you
+        // WHICH frame went missing, so it is the wrong shape for a guard.
+        let mut open: Vec<TfIndex> = TfIndex::ALL
+            .into_iter()
+            .filter(|tf| e.buckets[*tf as usize].is_some())
+            .collect();
+        open.sort_by_key(|tf| *tf as usize);
+        assert_eq!(
+            open,
+            vec![
+                TfIndex::M3,
+                TfIndex::M5,
+                TfIndex::M15,
+                TfIndex::D1,
+                TfIndex::M2,
+                TfIndex::M30,
+                TfIndex::M60,
+            ],
+            "one 1m bar must open exactly the minute-scale frames above 1m"
+        );
+        // And NOT one second-scale frame: a 1m bar spans sixty 1s buckets, so
+        // folding it into them would fabricate fifty-nine candles that no
+        // trade ever printed. Those frames wait for the GDF 1s feed.
+        assert!(
+            !open.iter().any(|tf| tf.is_second_scale()),
+            "the REST 1m fold must never open a sub-minute bucket"
+        );
     }
 
     #[test]

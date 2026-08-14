@@ -254,6 +254,16 @@ pub struct ApplicationConfig {
     /// (fail-safe default off); `config/base.toml` opts in.
     #[serde(default)]
     pub groww_universe: GrowwUniverseConfig,
+    /// `[dhan_universe]` — the daily Dhan instrument-master + NSE India
+    /// index-constituent download and ISIN join (operator directive
+    /// 2026-08-11, reversing Q3 of the 2026-07-13 amendment; recorded
+    /// verbatim in `websocket-connection-scope-lock.md`). Once per IST day it
+    /// fetches the Dhan detailed master and the niftyindices constituent
+    /// lists, joins them on ISIN per §31.1, and writes the resolved mapping.
+    /// Absent section ⇒ DISABLED (fail-safe default off); `config/base.toml`
+    /// opts in.
+    #[serde(default)]
+    pub dhan_universe: DhanUniverseConfig,
     /// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
     /// 2026-07-14, `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
     /// §39). GATE 1 of the 4-gate live-fire lattice: every key default-OFF, so
@@ -368,11 +378,12 @@ impl Default for OrderRuntimeConfig {
 /// Groww-only, or both in parallel. Mirrors the `NotificationConfig`
 /// simple-boolean-with-`Default`-impl convention.
 ///
-/// `dhan_enabled` defaults to `true` (the existing system is UNCHANGED);
-/// `groww_enabled` defaults to `false` so a fresh deployment behaves
-/// exactly like today until Groww is explicitly switched on. Groww is
-/// native tickvault Rust reusing the same WAL/ring/spill/DLQ/aggregator
-/// chain — brutex is a design reference only, no code pulled.
+/// EVERY feed defaults to `false` (corrected 2026-08-11 — `dhan_enabled`
+/// previously defaulted to `true`, so an absent `[feeds]` section enabled a
+/// live market-data lane). A fresh or partial config now connects nothing;
+/// each feed is opt-in by explicit key. Groww is native tickvault Rust
+/// reusing the same WAL/ring/spill/DLQ/aggregator chain — brutex is a design
+/// reference only, no code pulled.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FeedsConfig {
     /// Dhan live feed (feed #1). Default ON — disabling it is only for
@@ -403,9 +414,23 @@ pub struct FeedsConfig {
 }
 
 impl Default for FeedsConfig {
+    /// Every feed OFF.
+    ///
+    /// `dhan_enabled` was `true` here until 2026-08-11, dating from when the
+    /// Dhan live feed was the only feed and "default = the existing system,
+    /// unchanged" was the right instinct. It stopped being right when that
+    /// feed was retired (2026-07-13) and the flag inverted meaning: it now
+    /// gates a lane that is supposed to be off, so an ABSENT or misspelled
+    /// `[feeds]` section silently turned it back on.
+    ///
+    /// That is a default failing OPEN on a live market-data connection. The
+    /// boot site's own comment described the environment variable as "the
+    /// belt to the config's braces" — but the braces were backwards, and a
+    /// belt is not a reason to leave them that way. Absent config now means
+    /// nothing connects.
     fn default() -> Self {
         Self {
-            dhan_enabled: true,
+            dhan_enabled: false,
             groww_enabled: false,
             truedata_enabled: false,
             truedata: TruedataConfig::default(),
@@ -1903,6 +1928,86 @@ pub struct GrowwUniverseConfig {
     pub enabled: bool,
 }
 
+/// `[dhan_universe]` — daily Dhan master + NSE India indices download + join.
+///
+/// Fail-safe shape, the house pattern: `enabled` is `#[serde(default)]` =
+/// `false`, so an absent section (or a TOML written before this feature)
+/// disables the rider entirely and the boot is byte-identical to before it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DhanUniverseConfig {
+    /// Master switch for the daily download + join rider. Default OFF.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// IST second-of-day at which the daily build is TARGETED.
+    ///
+    /// # Why a target rather than a guarantee
+    ///
+    /// The prod box powers on at 08:30 IST, so a target earlier than that
+    /// fires into a machine that is not running. Rather than silently never
+    /// executing — which is what a bare scheduler would do, while still
+    /// LOOKING scheduled — the rider treats this as "run at or after this
+    /// time": if the process starts later than the target and today's build
+    /// has not happened, it runs IMMEDIATELY. On the live schedule that is
+    /// ~08:30, still 45 minutes before market open.
+    ///
+    /// Defaults to 08:00 IST per the operator's 2026-08-11 directive.
+    #[serde(default = "default_dhan_universe_target_secs")]
+    pub target_secs_of_day_ist: u32,
+
+    /// Retry backoff ceiling, in seconds, for a failed daily build.
+    ///
+    /// The rider retries with exponential backoff up to this ceiling and
+    /// NEVER gives up for the day: a vendor outage that clears at 10:00 must
+    /// still produce the day's mapping, and a rider that stopped after N
+    /// attempts would leave the day silently unmapped.
+    #[serde(default = "default_dhan_universe_backoff_cap_secs")]
+    pub retry_backoff_cap_secs: u64,
+
+    /// Point the LIVE subscription set at the resolved master, instead of the
+    /// 4 hardcoded index SIDs. **Default OFF, and that default is the point.**
+    ///
+    /// The rider that produces the mapping was authorized separately from the
+    /// decision to subscribe it — the operator's 2026-08-11 third quote ordered
+    /// the download and explicitly carved the lane out: *"Building the pipeline
+    /// is ordered here; re-pointing the lane is not, and must not be smuggled
+    /// in."* The fourth quote authorized BUILDING this path; nothing authorizes
+    /// enabling it. Both quotes are recorded in
+    /// `.claude/rules/project/websocket-connection-scope-lock.md`.
+    ///
+    /// # Why this should stay off until after a live probe
+    ///
+    /// Flipping it takes the subscription from 4 instruments to a few hundred
+    /// or a few thousand. On a lane that has never received a live tick since
+    /// the 2026-07-13 retirement, that turns a first failure from a readable
+    /// signal into an unreadable pile. Prove the 4-index path first.
+    ///
+    /// Turning it on is a config change plus a restart — never a runtime
+    /// toggle — so the subscribed set for a session is fixed at boot and
+    /// visible in the boot log.
+    #[serde(default)]
+    pub live_subscription_from_master: bool,
+}
+
+const fn default_dhan_universe_target_secs() -> u32 {
+    8 * 3600
+}
+
+const fn default_dhan_universe_backoff_cap_secs() -> u64 {
+    300
+}
+
+impl Default for DhanUniverseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_secs_of_day_ist: default_dhan_universe_target_secs(),
+            retry_backoff_cap_secs: default_dhan_universe_backoff_cap_secs(),
+            live_subscription_from_master: false,
+        }
+    }
+}
+
 /// `[dhan_order_push]` — 🔷 DHAN order-update WS paper-mode push channel
 /// (operator directive 2026-07-16; governance authorization on PR #1597).
 /// Receive-only observability wiring: the dhan_rest_stack spawns the
@@ -3369,6 +3474,26 @@ impl ApplicationConfig {
             &self.instrument.build_window_end,
         )?;
 
+        // 2026-08-10: the LOWER bound was missing, and its absence was invisible
+        // because something else claimed it existed. `OrderRateLimiter::new`
+        // (crates/trading/src/oms/rate_limiter.rs) does
+        // `NonZeroU32` construction from this value, unwrapped under an
+        // `#[allow(clippy::expect_used)] // APPROVED: config validation ensures > 0`.
+        // That validation was never written — only the SEBI upper bound below
+        // existed — so the annotation suppressed the one lint that would have
+        // caught it, on the strength of a guarantee that did not exist.
+        //
+        // `[order_runtime] enabled = true` in config/base.toml makes the path
+        // reachable, so `max_orders_per_second = 0` in any config would pass
+        // validation and PANIC at boot. This makes the cited guarantee real.
+        if self.trading.max_orders_per_second == 0 {
+            bail!(
+                "trading.max_orders_per_second must be >= 1 (got 0). A zero rate \
+                 limit is not 'unlimited' — it makes the GCRA quota unconstructible \
+                 and panics the process at boot."
+            );
+        }
+
         // SEBI: max_orders_per_second must not exceed the SEBI limit.
         if self.trading.max_orders_per_second > SEBI_MAX_ORDERS_PER_SECOND {
             bail!(
@@ -4374,6 +4499,7 @@ mod tests {
             order_update_events: OrderUpdateEventsConfig::default(),
             order_leg_pnl: OrderLegPnlConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
+            dhan_universe: DhanUniverseConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
@@ -5427,21 +5553,31 @@ mod tests {
     // dhan ON/groww OFF (default), groww-only, both, both-off.
     // =======================================================================
 
-    /// RATCHET: the default MUST keep Dhan ON and Groww OFF so a fresh
-    /// deployment (or a missing `[feeds]` block) behaves byte-identically
-    /// to today's Dhan-only system. Flipping either default requires a
-    /// dated operator quote per the scope rule file.
+    /// RATCHET: EVERY feed defaults OFF, so a fresh deployment or a missing
+    /// `[feeds]` block connects nothing.
+    ///
+    /// This ratchet was inverted on 2026-08-11. It previously required Dhan
+    /// to default ON, with the stated reason "a fresh deployment behaves
+    /// byte-identically to today's Dhan-only system" — correct when written,
+    /// and quietly wrong from the moment the Dhan live feed was retired on
+    /// 2026-07-13. After that, "unchanged" meant OFF, and the ratchet was
+    /// pinning a default that would silently enable a live market-data lane
+    /// whenever the `[feeds]` section was absent, misspelled, or lost.
+    ///
+    /// A default that fails toward CONNECTING is the wrong direction for a
+    /// feed flag. Turning a feed on should require saying so.
     #[test]
-    fn test_feeds_config_default_dhan_on_groww_off() {
+    fn test_feeds_config_default_is_every_feed_off() {
         let feeds = FeedsConfig::default();
         assert!(
-            feeds.dhan_enabled,
-            "Dhan must default ON (system unchanged)"
+            !feeds.dhan_enabled,
+            "Dhan must default OFF — an absent [feeds] section must never enable a live feed"
         );
         assert!(
             !feeds.groww_enabled,
             "Groww must default OFF (opt-in; zero prod behaviour change)"
         );
+        assert!(!feeds.truedata_enabled, "TrueData must default OFF");
     }
 
     /// Dual-feed scoreboard PR-A (2026-07-10): the `[scoreboard]` section
@@ -7108,7 +7244,12 @@ mod tests {
             .merge(Toml::string("[other]\nx = 1\n"))
             .extract()
             .expect("missing [feeds] must use defaults, not error");
-        assert!(wrapper.feeds.dhan_enabled);
+        // Every feed OFF since 2026-08-11 — a config with no `[feeds]` block
+        // must not bring a live market-data lane up by omission.
+        assert!(
+            !wrapper.feeds.dhan_enabled,
+            "a missing [feeds] section must leave Dhan OFF"
+        );
         assert!(!wrapper.feeds.groww_enabled);
         // TrueData (feed #4) ships DEFAULT-OFF; an absent key/section keeps
         // the day-0 disabled shape (serde default) — port 8086 sandbox default.

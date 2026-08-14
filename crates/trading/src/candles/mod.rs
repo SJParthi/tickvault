@@ -37,10 +37,34 @@
 //!   operator directive via coordinator): the cold-path boundary-timer
 //!   pure-function primitives had zero callers anywhere.
 
+//! ## 2026-08-09 — the TICK aggregator is REBUILT
+//!
+//! The operator's dated 2026-08-09 authorization revives the Dhan live
+//! main-feed WebSocket (`websocket-connection-scope-lock.md`, "2026-08-09 —
+//! DHAN LIVE MAIN-FEED WS REVIVAL AUTHORIZED"), which restores a tick source
+//! and therefore the need for a tick→timeframe fold. `aggregator_cell` and
+//! `multi_tf_aggregator` are back — REBUILT, not restored: single-owner
+//! (`&mut self`, no per-slot `Mutex`, no `papaya`), keyed on the FULL
+//! composite `(feed, security_id, exchange_segment_code)`, with a bounded
+//! fail-closed slot table and a fail-closed price guard at ingest. See
+//! `aggregator_cell`'s module docs for the full diff against the deleted
+//! shape, and `multi_tf_aggregator`'s for the key + slot-allocation rationale.
+//!
+//! The REST-era bar fold (`crates/app/src/rest_candle_fold.rs`, FOLD-01)
+//! remains a separate, independent seal producer — the two write the same
+//! tables and are distinguished by the `feed` column that is part of every
+//! candle DEDUP key.
+
+pub mod aggregator_cell;
 pub mod live_candle_state;
+pub mod multi_tf_aggregator;
 pub mod seal_ring;
 pub mod tf_index;
 
+pub use aggregator_cell::{
+    AggregatorCell, ConsumeOutcome, FeedStrategy, LatePolicy, tick_price_is_sane,
+};
 pub use live_candle_state::LiveCandleState;
+pub use multi_tf_aggregator::{AGGREGATOR_MAX_SLOTS, ConsumeStats, MultiTfAggregator};
 pub use seal_ring::{BufferOutcome, BufferedSeal, SEAL_BUFFER_CAPACITY, SealRing};
 pub use tf_index::{TF_COUNT, TfIndex};

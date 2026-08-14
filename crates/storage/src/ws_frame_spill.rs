@@ -1,10 +1,27 @@
 // STAGE-C: Non-blocking disk-durable spill for every WebSocket frame.
 //
 // Hot-path `append()` is O(1) and never blocks: it uses a crossbeam bounded
-// channel with `try_send`. A dedicated background thread fsyncs records to
+// channel with `try_send`. A dedicated background thread writes records to
 // append-only WAL segment files. On startup, `replay_all()` walks every WAL
 // file, validates CRC32, and returns the recovered frames so downstream
 // consumers can drain them before live reads resume.
+//
+// DURABILITY — read this before relying on the word "durable" (corrected
+// 2026-08-11). The writer thread calls `BufWriter::flush()`, which hands
+// bytes to the OPERATING SYSTEM. It does NOT call `sync_all`/`sync_data`,
+// so nothing forces them onto the physical disk. Concretely:
+//
+//   * process killed (SIGKILL, panic, OOM) -> flushed records SURVIVE, because
+//     the page cache belongs to the kernel, not to us. This is the case the
+//     WAL exists for and it is genuinely covered.
+//   * machine loses power, kernel panics, or the host is force-stopped ->
+//     records written since the last kernel writeback are LOST.
+//
+// Three comments in this file previously said "fsync". None was ever true —
+// there is no `sync_all` anywhere in this crate. The claim mattered because
+// the live feed refuses to open a socket without this WAL, citing it as the
+// durability floor; overstating that floor is how a gap gets discovered late.
+// Adding a real fsync is a deliberate throughput trade, not a typo fix.
 //
 // Record format on disk:
 //     [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame:len bytes][crc32:u32 LE]
@@ -148,11 +165,26 @@ pub struct ReplayedFrame {
 /// thread, exceeding the 65k cap and tripping the safety-floor invariant
 /// (`tv_ws_frame_spill_drop_critical == 0` in healthy ops). The new ceiling
 /// stays above the 100k chaos test threshold AND doubles burst headroom for
-/// production: a transient writer stall of up to 13s (e.g. brief disk fsync
+/// production: a transient writer stall of up to 13s (e.g. brief disk writeback
 /// latency on a contended host) now absorbs without dropping. Memory cost
 /// at idle is ~3 MiB extra (131k × ~24 B/`WalRecord` header), trivial on
 /// the 4 GiB t4g.medium target.
-const SPILL_CHANNEL_CAPACITY: usize = 131_072;
+///
+/// 2026-08-10: raised 131,072 → 524,288 (4×). The 13-second stall headroom
+/// quoted above was computed for **ONE** WebSocket producer. The operator's
+/// 2026-08-09 authorization (`websocket-connection-scope-lock.md`, the
+/// 16-connection amendment) takes the live feed to **up to 16 sockets** — 5
+/// main-feed + 5 depth-20 + 5 depth-200 + 1 order-update — all funnelling into
+/// this ONE shared channel. At 16 producers the same absorbency is ~0.8s, and
+/// the capture-at-receipt contract (WAL BEFORE parse/broadcast) means a full
+/// channel is not backpressure but **dropped frames on the durable floor** —
+/// the one thing the zero-loss envelope must never trade away.
+///
+/// 4× restores roughly the original per-socket headroom at the authorized
+/// connection count rather than merely surviving the chaos test. Memory at
+/// idle ≈ 12 MiB (524k × ~24 B) — 0.04% of the r8g.xlarge 32 GiB host
+/// (operator Quote 13), which is what makes the honest sizing affordable.
+const SPILL_CHANNEL_CAPACITY: usize = 524_288;
 
 /// WAL file magic bytes — segment-local sanity check.
 ///
@@ -171,7 +203,9 @@ const WAL_MIN_RECORD_V2: usize = 21;
 /// Rotate to a new segment after this many bytes.
 const WAL_SEGMENT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Writer buffer size — large enough to batch-fsync hundreds of records.
+/// Writer buffer size — large enough to batch hundreds of records into one
+/// write syscall. (Not an fsync batch: see the DURABILITY note in the module
+/// header — this path never calls `sync_all`.)
 const WAL_WRITER_BUFFER: usize = 256 * 1024;
 
 /// Backoff before the supervisor re-enters the writer loop after a panic or a
@@ -189,10 +223,113 @@ const WAL_WRITER_IO_RETRY_BACKOFF: Duration = Duration::from_millis(50); // APPR
 // WsFrameSpill
 // ---------------------------------------------------------------------------
 
+/// Number of [`WsType`] variants — the width of every pre-resolved counter
+/// table below. Pinned against the enum by
+/// `tests::test_ws_type_index_is_dense_and_matches_all`, so adding a variant
+/// without widening the tables fails the build rather than panicking at
+/// runtime on an out-of-range index.
+/// NOTE: this is THIS module's own three-variant [`WsType`] (the WAL transport
+/// tag, `LiveFeed`/`OrderUpdate`/`TruedataFeed`), NOT the seven-variant
+/// `tickvault_common::ws_event_types::WsType` used for audit rows.
+const WS_TYPE_COUNT: usize = 3;
+
+/// Dense index for a [`WsType`], used only to address the pre-resolved counter
+/// tables in [`SpillDropCounters`].
+///
+/// Deliberately local to this module rather than a method on `WsType` in
+/// `crates/common`: the index is an implementation detail of THIS module's
+/// counter tables, and widening `crates/common` would escalate every change
+/// here to a workspace-wide test run for no behavioural gain.
+const fn ws_type_index(ws_type: WsType) -> usize {
+    // Exhaustive by construction — no `_` arm, so adding a `WsType` variant
+    // fails THIS match at compile time rather than silently folding the new
+    // transport's losses into another variant's counter.
+    match ws_type {
+        WsType::LiveFeed => 0,
+        WsType::OrderUpdate => 1,
+        WsType::TruedataFeed => 2,
+    }
+}
+
+/// Every [`WsType`], in [`ws_type_index`] order — the build order for the
+/// counter tables. Kept beside the index so the two cannot drift.
+const WS_TYPES_BY_INDEX: [WsType; WS_TYPE_COUNT] =
+    [WsType::LiveFeed, WsType::OrderUpdate, WsType::TruedataFeed];
+
+/// Loss counters resolved ONCE at construction, one handle per `WsType`.
+///
+/// # Why the macro form is banned on this path
+///
+/// `metrics::counter!(NAME, "label" => value)` builds a `Key` on EVERY call,
+/// and a keyed `Key` owns a `Vec<Label>` — so the macro form heap-allocates
+/// once per invocation. Both call sites are the WAL **drop** arms, which
+/// execute only when the process is ALREADY losing data: the spill channel is
+/// full or its writer thread is dead. Allocating there violates principle 1
+/// (zero allocation on the hot path) and, practically, asks the allocator for
+/// memory at the worst possible moment — a frame-drop storm becomes an
+/// allocation storm on top of the loss it is trying to report.
+///
+/// `ws_type` is a per-CALL parameter here (unlike `WalRingSink`, whose
+/// endpoint is fixed for the sink's lifetime), so one handle is not enough —
+/// hence a dense table per series, addressed by [`ws_type_index`].
+/// `Counter::increment` on a resolved handle is a plain atomic add: O(1),
+/// zero allocation.
+struct SpillDropCounters {
+    /// `tv_ws_frame_spill_drop_critical{ws_type}` — both drop arms.
+    drop_critical: [metrics::Counter; WS_TYPE_COUNT],
+    /// `tv_ticks_lost_total{source="spill_drop_critical", ws_type}` — Full arm.
+    ticks_lost_channel_full: [metrics::Counter; WS_TYPE_COUNT],
+    /// `tv_ticks_lost_total{source="spill_writer_dead", ws_type}` — Disconnected arm.
+    ticks_lost_writer_dead: [metrics::Counter; WS_TYPE_COUNT],
+}
+
+impl SpillDropCounters {
+    /// Resolves every handle and publishes a zero on each.
+    ///
+    /// The zero matters: the CloudWatch agent computes a counter's alarm value
+    /// as a DELTA between consecutive samples and has no previous sample for a
+    /// series that has never been emitted, so it drops the first one. If the
+    /// first emission a series ever sees is the outage itself, that outage is
+    /// the dropped sample and the alarm does not fire for it. Publishing a zero
+    /// at construction makes the harmless zero the dropped sample instead —
+    /// the same discipline as `WalRingSink::pre_register`.
+    fn new() -> Self {
+        let drop_critical = WS_TYPES_BY_INDEX
+            .map(|t| metrics::counter!("tv_ws_frame_spill_drop_critical", "ws_type" => t.as_str()));
+        let ticks_lost_channel_full = WS_TYPES_BY_INDEX.map(|t| {
+            metrics::counter!(
+                "tv_ticks_lost_total",
+                "source" => "spill_drop_critical",
+                "ws_type" => t.as_str(),
+            )
+        });
+        let ticks_lost_writer_dead = WS_TYPES_BY_INDEX.map(|t| {
+            metrics::counter!(
+                "tv_ticks_lost_total",
+                "source" => "spill_writer_dead",
+                "ws_type" => t.as_str(),
+            )
+        });
+        let counters = Self {
+            drop_critical,
+            ticks_lost_channel_full,
+            ticks_lost_writer_dead,
+        };
+        for idx in 0..WS_TYPE_COUNT {
+            counters.drop_critical[idx].increment(0);
+            counters.ticks_lost_channel_full[idx].increment(0);
+            counters.ticks_lost_writer_dead[idx].increment(0);
+        }
+        counters
+    }
+}
+
 pub struct WsFrameSpill {
     spill_tx: Sender<WalRecord>,
     drop_critical: Arc<AtomicU64>,
     persisted_total: Arc<AtomicU64>,
+    /// Pre-resolved per-`WsType` loss counters — see [`SpillDropCounters`].
+    drop_counters: SpillDropCounters,
     /// SP5.1: optional per-feed health registry. When `Some`, a dropped
     /// LIVE-FEED (Dhan) frame records a Dhan drop so `/api/feeds/health` flips
     /// `Degraded` — closing the SP5 connected+fresh-but-dropping false-OK.
@@ -268,6 +405,7 @@ impl WsFrameSpill {
             spill_tx: tx,
             drop_critical,
             persisted_total,
+            drop_counters: SpillDropCounters::new(),
             feed_health: None,
         })
     }
@@ -297,6 +435,7 @@ impl WsFrameSpill {
             spill_tx: tx,
             drop_critical: Arc::new(AtomicU64::new(0)),
             persisted_total: Arc::new(AtomicU64::new(0)),
+            drop_counters: SpillDropCounters::new(),
             feed_health: None,
         }
     }
@@ -337,23 +476,18 @@ impl WsFrameSpill {
                     drop_count = prev + 1,
                     "CRITICAL: WAL spill channel FULL — frame dropped (writer stalled)"
                 );
-                metrics::counter!(
-                    "tv_ws_frame_spill_drop_critical",
-                    "ws_type" => ws_type.as_str()
-                )
-                .increment(1);
+                // Pre-resolved handles, NEVER the labelled macro form — this arm
+                // runs only when the process is already losing frames, which is
+                // the worst possible moment to allocate. See `SpillDropCounters`.
+                let idx = ws_type_index(ws_type);
+                self.drop_counters.drop_critical[idx].increment(1);
                 // SLA counter: every dropped frame is one tick-equivalent lost.
                 // Parthiban 2026-04-20: explicit metric so the zero-tick-loss
                 // invariant can be asserted in CI instead of inferred from a
                 // gap between `tv_ticks_processed_total` and
                 // `tv_ticks_persisted_total`. Labelled with the same `ws_type`
-                // so a Grafana heatmap can attribute losses per WebSocket.
-                metrics::counter!(
-                    "tv_ticks_lost_total",
-                    "source" => "spill_drop_critical",
-                    "ws_type" => ws_type.as_str(),
-                )
-                .increment(1);
+                // so a per-WebSocket loss attribution stays possible.
+                self.drop_counters.ticks_lost_channel_full[idx].increment(1);
                 self.record_feed_drop_for_health(ws_type);
                 AppendOutcome::Dropped
             }
@@ -372,19 +506,12 @@ impl WsFrameSpill {
                 );
                 // Same label set as the Full arm so existing alerts on
                 // `tv_ws_frame_spill_drop_critical` fire for this cause too.
-                metrics::counter!(
-                    "tv_ws_frame_spill_drop_critical",
-                    "ws_type" => ws_type.as_str()
-                )
-                .increment(1);
+                // Pre-resolved handles for the same reason as the Full arm.
+                let idx = ws_type_index(ws_type);
+                self.drop_counters.drop_critical[idx].increment(1);
                 // The distinguishing cause lives on the SLA counter's `source`
                 // label (Full arm uses "spill_drop_critical").
-                metrics::counter!(
-                    "tv_ticks_lost_total",
-                    "source" => "spill_writer_dead",
-                    "ws_type" => ws_type.as_str(),
-                )
-                .increment(1);
+                self.drop_counters.ticks_lost_writer_dead[idx].increment(1);
                 self.record_feed_drop_for_health(ws_type);
                 AppendOutcome::Dropped
             }
@@ -580,11 +707,57 @@ fn maybe_test_panic(r: &WalRecord) {
     }
 }
 
-/// Process-wide strictly-monotonic frame sequence: `max(prev+1, wall_nanos)`.
+/// Bits reserved at the BOTTOM of every frame sequence for a packet index.
+///
+/// A single main-feed message can carry several stacked packets, and each one
+/// becomes its own `ticks` row. `capture_seq` is part of the DEDUP key
+/// `(ts, security_id, segment, capture_seq, feed)`, so every packet needs a
+/// DISTINCT value — and, for WAL replay to be idempotent rather than
+/// duplicating, a value that can be REGENERATED from what the WAL persisted.
+///
+/// The WAL record stores the frame's sequence, not each packet's. So the
+/// packet index is carried in reserved low bits of that one number: packet `i`
+/// of frame `F` is `F | i`, which replay reproduces exactly.
+///
+/// `2^17 = 131_072` covers `MAX_PACKETS_PER_FRAME` (70,000) with room to spare.
+pub const PACKET_INDEX_BITS: u32 = 17;
+
+/// Largest packet index representable in the reserved bits.
+pub const MAX_PACKET_INDEX: u64 = (1 << PACKET_INDEX_BITS) - 1;
+
+/// Process-wide strictly-monotonic frame sequence, with the low
+/// [`PACKET_INDEX_BITS`] always ZERO so callers can OR a packet index in.
+///
 /// Lock-free CAS, O(1), zero heap alloc. The WS read loop calls this ONCE per
 /// frame and passes the value to BOTH [`WsFrameSpill::append_with_seq`] and the
 /// live broadcast, so the WAL record and the `ticks.capture_seq` column carry
 /// the identical replay-stable value.
+///
+/// ## Why the shift, and why NOT multiplication (2026-08-14)
+///
+/// Before this change the value was `max(prev+1, wall_nanos)` with no reserved
+/// bits, and the doc above was true only of packet 0: packets 1..N of a stacked
+/// frame minted a FRESH sequence, which is not in the WAL and cannot be
+/// regenerated. Replaying such a frame would therefore write DUPLICATE rows
+/// instead of collapsing onto the originals — which is why WAL re-fold could
+/// not safely be built on top of it.
+///
+/// The obvious repair, `frame_seq * MAX_PACKETS_PER_FRAME`, is arithmetically
+/// impossible and was rejected on measurement, not taste: a 2026 nanosecond
+/// clock is ≈1.786e18, and ×70,000 is ≈1.25e23 — past `i64::MAX` (9.223e18) by
+/// four orders of magnitude, so `capture_seq_from_frame_seq`'s `i64::try_from`
+/// would refuse EVERY tick.
+///
+/// Shifting the SEED instead costs nothing: `(n >> 17) << 17` only clears the
+/// low bits, so the magnitude is unchanged and the headroom to `i64::MAX`
+/// stays the same ≈5.16× it already was. Uniqueness is by construction, not by
+/// luck — every frame's low bits are zero and the base is strictly increasing,
+/// so one frame's packet slots can never reach the next frame's base.
+///
+/// Honest cost: base granularity becomes 131,072 ns ≈ 131 µs, so at sustained
+/// rates above ~7,600 frames/s the counter advances on `prev+1` faster than the
+/// wall clock. At 10,000 frames/s that drift is ≈113 days of clock-equivalent
+/// per calendar year, against ≈236 years of headroom.
 static WAL_FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn next_frame_seq() -> u64 {
@@ -592,9 +765,16 @@ pub fn next_frame_seq() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0);
+    // Work in BASE units (nanos >> reserved bits) so the returned value always
+    // ends in zeroed low bits.
+    let now_base = now >> PACKET_INDEX_BITS;
+    // Never let the shift back up overflow u64.
+    let base_ceiling = u64::MAX >> PACKET_INDEX_BITS;
     loop {
         let prev = WAL_FRAME_SEQ.load(Ordering::Relaxed);
-        let next = prev.saturating_add(1).max(now);
+        let prev_base = prev >> PACKET_INDEX_BITS;
+        let next_base = prev_base.saturating_add(1).max(now_base).min(base_ceiling);
+        let next = next_base << PACKET_INDEX_BITS;
         if WAL_FRAME_SEQ
             .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
@@ -602,6 +782,25 @@ pub fn next_frame_seq() -> u64 {
             return next;
         }
     }
+}
+
+/// The replay-stable `capture_seq` for packet `packet_index` of the frame whose
+/// sequence is `frame_seq`.
+///
+/// `None` when the index does not fit the reserved bits — the caller must then
+/// REFUSE the packet and count it, never fall back to a fresh sequence. A fresh
+/// sequence is exactly the un-regenerable value this whole scheme exists to
+/// eliminate, and silently minting one here would reintroduce duplicate rows on
+/// replay while looking like it worked.
+#[must_use]
+pub fn packet_capture_seq(frame_seq: u64, packet_index: u64) -> Option<u64> {
+    if packet_index > MAX_PACKET_INDEX {
+        return None;
+    }
+    // Defensive: a v1 (`TVW1`) record or a hand-built seq may not be
+    // base-aligned. Clear the low bits rather than OR-ing into a dirty slot,
+    // which could otherwise collide with a neighbouring packet.
+    Some((frame_seq & !MAX_PACKET_INDEX) | packet_index)
 }
 
 fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
@@ -1060,6 +1259,58 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn test_durability_claim_matches_what_the_code_actually_does() {
+        // A documentation ratchet, and the only kind that works for a claim
+        // like this one: durability is invisible in a unit test — a flushed
+        // record and a synced record are byte-identical until the machine
+        // loses power — so nothing but a source scan can keep the words and
+        // the syscalls in agreement.
+        //
+        // Until 2026-08-11 this module asserted "fsync" three times while
+        // calling `sync_all` zero times. The live feed refuses to open a
+        // socket without this WAL and names it the durability floor, so the
+        // overstatement was load-bearing.
+        //
+        // Either direction of drift now fails: adding a sync without
+        // correcting the note, or restoring the claim without the sync.
+        let src = include_str!("ws_frame_spill.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        let syncs = production.matches(concat!("sync_", "all")).count()
+            + production.matches(concat!("sync_", "data")).count();
+
+        if syncs == 0 {
+            assert!(
+                production.contains("DURABILITY"),
+                "this module performs no fsync, so its header MUST carry the DURABILITY note \
+                 explaining that flushed records survive a process kill but not power loss"
+            );
+            // The word may appear ONLY in that corrective note, never as a
+            // description of what the writer does.
+            for line in production.lines() {
+                if !line.contains("fsync") {
+                    continue;
+                }
+                let l = line.to_lowercase();
+                assert!(
+                    l.contains("previously")
+                        || l.contains("never true")
+                        || l.contains("not an fsync")
+                        || l.contains("deliberate throughput"),
+                    "this line claims fsync behaviour the code does not have — either add a \
+                     real sync_all or reword it: {line}"
+                );
+            }
+        } else {
+            assert!(
+                production.contains("sync_all") || production.contains("sync_data"),
+                "sanity: counted a sync but cannot find one"
+            );
+        }
+    }
+
     fn tmp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1471,6 +1722,90 @@ mod tests {
     }
 
     #[test]
+    fn test_next_frame_seq_always_leaves_the_packet_index_bits_free() {
+        // The whole replay-stability scheme rests on this: if a frame sequence
+        // ever arrives with a low bit set, `packet_capture_seq` would be
+        // OR-ing into an occupied slot and two packets could collide.
+        for _ in 0..5_000 {
+            let seq = next_frame_seq();
+            assert_eq!(
+                seq & MAX_PACKET_INDEX,
+                0,
+                "frame_seq {seq} has a non-zero packet-index slot"
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_capture_seq_is_distinct_per_packet_and_never_reaches_the_next_frame() {
+        let a = next_frame_seq();
+        let b = next_frame_seq();
+        assert!(b > a);
+
+        // Every packet of one frame is distinct...
+        let mut seen = std::collections::BTreeSet::new();
+        for idx in [0u64, 1, 2, 69_999, MAX_PACKET_INDEX] {
+            let seq = packet_capture_seq(a, idx).expect("index fits the reserved bits");
+            assert!(
+                seen.insert(seq),
+                "packet index {idx} produced a duplicate seq"
+            );
+            // ...and none of them can reach the NEXT frame's base, which is the
+            // property that makes cross-frame collision impossible rather than
+            // merely unlikely.
+            assert!(
+                seq < b,
+                "packet {idx} of frame {a} produced {seq}, which reaches into frame {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_capture_seq_refuses_an_index_beyond_the_reserved_bits() {
+        // Must be None, never a wrapped or freshly-minted value: the caller is
+        // required to REFUSE and count. A fallback here would silently restore
+        // the duplicate-on-replay defect this scheme removes.
+        let seq = next_frame_seq();
+        assert_eq!(packet_capture_seq(seq, MAX_PACKET_INDEX + 1), None);
+        assert_eq!(packet_capture_seq(seq, u64::MAX), None);
+    }
+
+    #[test]
+    fn test_packet_capture_seq_is_replay_stable_and_fits_the_i64_column() {
+        // Replay reproduces the identical value from the SAME persisted
+        // frame_seq — this is the property that makes a re-fold collapse onto
+        // the original row instead of duplicating it.
+        let frame_seq = next_frame_seq();
+        for idx in [0u64, 1, 7, 70_000] {
+            let first = packet_capture_seq(frame_seq, idx);
+            let replayed = packet_capture_seq(frame_seq, idx);
+            assert_eq!(
+                first, replayed,
+                "replay must reproduce packet {idx} exactly"
+            );
+            let seq = first.expect("index fits");
+            assert!(
+                i64::try_from(seq).is_ok(),
+                "capture_seq {seq} must fit the i64 ticks column — the shift must \
+                 not have consumed headroom (the multiplication scheme did)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_capture_seq_normalises_a_non_aligned_frame_seq() {
+        // A v1 (`TVW1`) record carries frame_seq = 0, and a hand-built or
+        // legacy value may not be base-aligned. OR-ing into a dirty slot could
+        // collide with a neighbouring packet, so the low bits are cleared first.
+        let dirty = (42u64 << PACKET_INDEX_BITS) | 12_345;
+        assert_eq!(
+            packet_capture_seq(dirty, 7),
+            Some((42u64 << PACKET_INDEX_BITS) | 7)
+        );
+        assert_eq!(packet_capture_seq(0, 3), Some(3));
+    }
+
+    #[test]
     fn test_replay_handles_missing_dir() {
         let dir = std::env::temp_dir().join("tv-wal-nonexistent-xyz");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1814,5 +2149,190 @@ mod tests {
             "a future-mtime file (clock skew) must be kept — never delete on uncertainty"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pre-resolved counter tables in `SpillDropCounters` are addressed by
+    /// `ws_type_index`, so the index MUST be dense, unique, and exactly as wide
+    /// as `WS_TYPE_COUNT`. Without this, adding a `WsType` variant compiles
+    /// (the `match` in `ws_type_index` would fail — but a careless `_ =>` arm
+    /// would not) and then indexes the wrong series or panics out of range on
+    /// the one path that runs while the process is already losing frames.
+    #[test]
+    fn test_ws_type_index_is_dense_and_matches_all() {
+        let all = WS_TYPES_BY_INDEX;
+        assert_eq!(
+            all.len(),
+            WS_TYPE_COUNT,
+            "WS_TYPE_COUNT must equal the number of WsType variants; widen the \
+             SpillDropCounters tables when adding a variant"
+        );
+        // Every u8 the wire can carry must map into the table — this is what
+        // catches a variant added to the enum but not to WS_TYPES_BY_INDEX.
+        for byte in 0u8..=u8::MAX {
+            if let Some(ws_type) = WsType::from_u8(byte) {
+                assert!(
+                    all.contains(&ws_type),
+                    "WsType::from_u8({byte}) = {} is missing from \
+                     WS_TYPES_BY_INDEX — its losses would be counted against \
+                     another transport",
+                    ws_type.as_str()
+                );
+            }
+        }
+        let mut seen = [false; WS_TYPE_COUNT];
+        for ws_type in all {
+            let idx = ws_type_index(ws_type);
+            assert!(
+                idx < WS_TYPE_COUNT,
+                "ws_type_index({}) = {idx} is out of range for the counter tables",
+                ws_type.as_str()
+            );
+            assert!(
+                !seen[idx],
+                "ws_type_index collision at {idx} for {} — two WsType variants \
+                 would share one counter series and under-report loss",
+                ws_type.as_str()
+            );
+            seen[idx] = true;
+        }
+        assert!(
+            seen.iter().all(|hit| *hit),
+            "ws_type_index must be dense — an unused slot means a variant maps \
+             nowhere and its losses are invisible"
+        );
+    }
+
+    /// Both WAL drop arms must use the pre-resolved handles, never the labelled
+    /// `metrics::counter!` macro form: a keyed `Key` owns a `Vec<Label>`, so the
+    /// macro heap-allocates once per DROPPED frame — an allocation storm layered
+    /// on top of the data loss it is reporting.
+    #[test]
+    fn test_drop_arms_never_use_the_allocating_macro_form() {
+        let src = include_str!("ws_frame_spill.rs");
+        // Split on the tests MODULE marker, not a bare `#[cfg(test)]`. This
+        // file has a `#[cfg(test)]` item (`new_with_dead_writer_for_test`)
+        // ABOVE the drop arms, so a bare split truncates the "production half"
+        // before the code under test and the scan silently checks nothing —
+        // the exact vacuous-guard shape this test exists to prevent. Caught by
+        // this test failing against its own first draft.
+        let production = src
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("source has a production half");
+        assert!(
+            production.contains("fn append_with_seq"),
+            "the production half must actually contain the drop arms — if this \
+             trips, the split marker drifted and the scan below is vacuous"
+        );
+        for banned in [
+            "metrics::counter!(\n                    \"tv_ws_frame_spill_drop_critical\"",
+            "metrics::counter!(\n                    \"tv_ticks_lost_total\"",
+        ] {
+            assert!(
+                !production.contains(banned),
+                "the WAL drop arms must increment pre-resolved SpillDropCounters \
+                 handles, not build a labelled Key per dropped frame"
+            );
+        }
+        assert!(
+            production.contains("self.drop_counters.drop_critical[idx].increment(1)"),
+            "the drop arms must increment the pre-resolved drop_critical handle"
+        );
+    }
+
+    /// EXHAUSTIVE permutation sweep of the writer-dead drop arm.
+    ///
+    /// Every `WsType` × every adversarial frame shape must: return `Dropped`,
+    /// increment the drop ledger exactly once, never panic, and never let one
+    /// transport's loss land on another transport's counter. The frame shapes
+    /// are deliberately hostile — empty, single byte, a length that lies about
+    /// the payload, a full 64 KiB frame, and all-0xFF — because the drop arm
+    /// runs on malformed traffic at least as often as on well-formed traffic,
+    /// and that is precisely when it must stay cheap and correct.
+    #[test]
+    fn test_drop_arm_permutations_every_ws_type_every_frame_shape() {
+        let shapes: [(&str, Vec<u8>); 6] = [
+            ("empty", Vec::new()),
+            ("one_byte", vec![0x00]),
+            ("header_only", vec![2, 0, 0, 0, 0, 0, 0, 0]),
+            ("lying_length", vec![2, 0xFF, 0xFF, 0, 0, 0, 0, 0]),
+            ("all_ones", vec![0xFF; 64]),
+            ("max_frame", vec![0xAB; 64 * 1024]),
+        ];
+
+        for ws_type in WS_TYPES_BY_INDEX {
+            for (shape_name, frame) in &shapes {
+                // A FRESH spill per permutation so the ledger reading is
+                // unambiguous — a shared instance would let an earlier
+                // permutation's count mask a later one that failed to increment.
+                let spill = WsFrameSpill::new_with_dead_writer_for_test();
+                assert_eq!(
+                    spill.drop_critical_count(),
+                    0,
+                    "{}/{shape_name}: a fresh spill must start at zero",
+                    ws_type.as_str()
+                );
+
+                let outcome = spill.append(ws_type, frame.clone());
+                assert_eq!(
+                    outcome,
+                    AppendOutcome::Dropped,
+                    "{}/{shape_name}: a dead writer must report Dropped, never \
+                     a silent Spilled — a silent success here is the durable \
+                     floor lying about itself",
+                    ws_type.as_str()
+                );
+                assert_eq!(
+                    spill.drop_critical_count(),
+                    1,
+                    "{}/{shape_name}: exactly one drop must be ledgered",
+                    ws_type.as_str()
+                );
+
+                // Repeat on the SAME instance: the ledger must accumulate, not
+                // latch. A latching counter under-reports a drop storm to
+                // exactly the degree the storm is bad.
+                let _ = spill.append(ws_type, frame.clone());
+                let _ = spill.append(ws_type, frame.clone());
+                assert_eq!(
+                    spill.drop_critical_count(),
+                    3,
+                    "{}/{shape_name}: the drop ledger must accumulate",
+                    ws_type.as_str()
+                );
+            }
+        }
+    }
+
+    /// Interleaving every `WsType` through ONE spill must not lose or misattribute
+    /// a single drop. This is the cross-talk check the per-type table exists for:
+    /// with a shared handle (the pre-2026-08-14 macro form rebuilt a Key per
+    /// call) an indexing mistake is invisible, because every increment lands on
+    /// whatever Key was built last.
+    #[test]
+    fn test_drop_arm_interleaved_ws_types_never_cross_talk() {
+        let spill = WsFrameSpill::new_with_dead_writer_for_test();
+        let mut expected = 0u64;
+        // Three full rotations, so an off-by-one index would desynchronise.
+        for _round in 0..3 {
+            for ws_type in WS_TYPES_BY_INDEX {
+                assert_eq!(
+                    spill.append(ws_type, vec![1, 2, 3, 4]),
+                    AppendOutcome::Dropped
+                );
+                expected += 1;
+                assert_eq!(
+                    spill.drop_critical_count(),
+                    expected,
+                    "interleaved {} must ledger exactly one drop per append",
+                    ws_type.as_str()
+                );
+            }
+        }
+        assert_eq!(
+            expected,
+            (WS_TYPE_COUNT as u64) * 3,
+            "the sweep must have covered every WsType three times"
+        );
     }
 }

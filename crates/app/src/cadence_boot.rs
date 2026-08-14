@@ -151,12 +151,24 @@ pub fn spawn_cadence_scheduler(
         let questdb = config.questdb.clone();
         drop(tokio::spawn(async move {
             tickvault_storage::spot_1m_rest_persistence::ensure_spot_1m_rest_table(&questdb).await;
+            // ORDER IS LOAD-BEARING (2026-08-14): ensure BEFORE migrate.
+            //
+            // `ensure_option_chain_1m_table` now owns the legacy-name rename,
+            // so on the first boot of a renaming build the current table does
+            // not exist until it runs. The column migration below targets the
+            // CURRENT name and classifies its failures by matching "invalid
+            // column" / "does not exist" in the body — a missing TABLE matches
+            // neither, so running it first fired a spurious coded CHAIN-03 and
+            // a `tv_chain1m_persist_errors_total` increment on exactly the
+            // boot this change exists to keep clean. Self-healing next boot is
+            // not good enough: a false error on the migration boot is the same
+            // false-OK erosion in the other direction.
+            tickvault_storage::option_chain_1m_persistence::ensure_option_chain_1m_table(&questdb)
+                .await;
             tickvault_storage::option_chain_1m_persistence::migrate_drop_moneyness_depth_column(
                 &questdb,
             )
             .await;
-            tickvault_storage::option_chain_1m_persistence::ensure_option_chain_1m_table(&questdb)
-                .await;
             tickvault_storage::rest_fetch_audit_persistence::ensure_rest_fetch_audit_table(
                 &questdb,
             )

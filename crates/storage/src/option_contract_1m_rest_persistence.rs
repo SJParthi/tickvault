@@ -57,7 +57,10 @@ use tracing::{error, warn};
 use tickvault_common::config::QuestDbConfig;
 
 /// QuestDB table name — one row per fetched `(minute, contract)`.
-pub const OPTION_CONTRACT_1M_REST_TABLE: &str = "option_contract_1m_rest";
+pub const OPTION_CONTRACT_1M_REST_TABLE: &str = "rest_option_contract_1m";
+
+/// The pre-2026-08-14 name — boot-migration rename source only.
+pub const LEGACY_OPTION_CONTRACT_1M_REST_TABLE: &str = "option_contract_1m_rest";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule);
 /// `exchange_segment` alongside `security_id` (I-P1-11 — Groww
@@ -213,6 +216,49 @@ pub async fn ensure_option_contract_1m_rest_table(questdb_config: &QuestDbConfig
             return;
         }
     };
+    // RENAME-FIRST migration — this table was MISSING it (2026-08-14 fix).
+    //
+    // The rename to the `rest_` prefix landed for the spot and chain tables
+    // but not this one, even though `LEGACY_OPTION_CONTRACT_1M_REST_TABLE`
+    // was defined alongside them. Consequence on any box that had already
+    // written this table: the CREATE below mints an EMPTY table under the new
+    // name beside the populated old one, and the history silently splits in
+    // two — the exact failure the RENAME-FIRST ordering exists to prevent.
+    // Worse, the legacy name was simultaneously added to the partition
+    // manager's retention-exempt list on the reasoning that a rename makes
+    // the old table cease to exist; with no rename, that orphan was exempted
+    // from ever being swept.
+    // The ONE refusal that is not routine: both tables present means the
+    // history is split and only an operator can decide how to merge it. This
+    // leg is the likeliest to hit it, because it shipped the CREATE without a
+    // rename — any box that ran that build already has the empty new table.
+    if crate::http_client::try_rename_legacy_table(
+        &client,
+        &base_url,
+        LEGACY_OPTION_CONTRACT_1M_REST_TABLE,
+        OPTION_CONTRACT_1M_REST_TABLE,
+    )
+    .await
+        == crate::http_client::LegacyRenameOutcome::Split
+    {
+        metrics::counter!(
+            "tv_groww_contract1m_persist_errors_total",
+            "stage" => "legacy_table_split"
+        )
+        .increment(1);
+        error!(
+            code = "SPOT1M-02",
+            stage = "legacy_table_split",
+            leg = "contract_1m",
+            legacy_table = LEGACY_OPTION_CONTRACT_1M_REST_TABLE,
+            current_table = OPTION_CONTRACT_1M_REST_TABLE,
+            "SPOT1M-02: both the legacy and current option_contract_1m_rest \
+             tables exist — the history is SPLIT across two SEBI-retained \
+             tables. New rows land in the current name; everything written \
+             before the rename stays in the legacy one. Neither is dropped; \
+             merging is an operator decision"
+        );
+    }
     let mut statements = vec![option_contract_1m_rest_create_ddl()];
     // Per-column self-heal for tables created by earlier builds
     // (observability-architecture.md schema-self-heal pattern). QuestDB
@@ -515,8 +561,8 @@ mod tests {
     fn test_partition_manager_registers_option_contract_1m_rest() {
         let src = include_str!("partition_manager.rs");
         assert!(
-            src.contains("\"option_contract_1m_rest\""),
-            "partition_manager.rs must register option_contract_1m_rest for retention"
+            src.contains("\"rest_option_contract_1m\""),
+            "partition_manager.rs must register rest_option_contract_1m for retention"
         );
     }
 
@@ -616,7 +662,11 @@ mod tests {
 
     #[test]
     fn test_option_contract_1m_rest_symbol_labels_stable() {
-        assert_eq!(OPTION_CONTRACT_1M_REST_TABLE, "option_contract_1m_rest");
+        assert_eq!(OPTION_CONTRACT_1M_REST_TABLE, "rest_option_contract_1m");
+        assert_eq!(
+            LEGACY_OPTION_CONTRACT_1M_REST_TABLE,
+            "option_contract_1m_rest"
+        );
         assert_eq!(OPTION_CONTRACT_1M_REST_FEED_GROWW, "groww");
         assert_eq!(OPTION_CONTRACT_1M_REST_SOURCE_GROWW_CANDLES, "rest_candles");
         assert_eq!(OPTION_CONTRACT_1M_REST_SEGMENT_NSE_FNO, "NSE_FNO");

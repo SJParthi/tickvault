@@ -1,29 +1,16 @@
 #!/bin/bash
-# Amazon Linux 2023 first-boot user-data — t4g.medium arm64 (Graviton).
+# Amazon Linux 2023 first-boot user-data — arm64 (Graviton), user `ec2-user`,
+# package manager `dnf`. AWS CLI v2, SSM agent, CloudWatch agent, jq/curl/git
+# are all PRE-INSTALLED. The numbered Step comments below are the running order.
 #
-# AL2023 ships with the following PRE-INSTALLED (no install step needed):
-#   - AWS CLI v2
-#   - amazon-ssm-agent (for `aws ssm start-session` no-SSH access)
-#   - amazon-cloudwatch-agent (provides system metrics + log forwarding)
-#   - jq + curl + git
+# The Rust binary is dropped on by the deploy-aws workflow AFTER user-data
+# completes — first boot leaves the unit dormant, second boot picks it up.
 #
-# AL2023 uses `dnf` (RHEL family). User account: `ec2-user` (NOT `ubuntu`).
-#
-# What this script does on first boot (runs once via cloud-init):
-#   1. Set timezone to Asia/Kolkata (operator convenience; app uses UTC internally)
-#   2. Install Docker (`dnf install docker`) + the Compose v2 plugin
-#      (`docker-compose-plugin`, with a Docker-CE-repo fallback + verify)
-#   3. Enable Docker daemon at boot
-#   4. Create /opt/tickvault/{config,data/spill,logs,bin}
-#   5. Clone the repo (shallow, main branch)
-#   6. Configure CloudWatch agent with the metrics + log scrape config
-#   7. Bring up the Docker stack (QuestDB only post-#O4)
-#   8. Install + ENABLE (not start) the systemd unit so every subsequent
-#      EC2 boot (EventBridge cron) auto-starts tickvault.
-#
-# The Rust binary itself is dropped onto the instance by the GitHub Actions
-# `deploy-aws` workflow AFTER user-data completes — first boot leaves the
-# unit dormant, second boot picks up the binary.
+# ⚠ SIZE BUDGET: EC2 caps user_data at 16384 bytes and terraform REFUSES the
+# plan above it. This file was measured at 16382 on 2026-08-10 — two bytes of
+# headroom — and adding an inline sysctl block broke the plan. Put new content
+# in a repo file and `cp` it after the Step 5 clone instead. Pinned by
+# crates/common/tests/user_data_size_guard.rs.
 
 set -euo pipefail
 
@@ -35,24 +22,28 @@ echo "=== tickvault user-data starting at $(date -u) ==="
 echo "    target: AL2023 arm64 (Graviton), env=$${ENVIRONMENT}, region=$${REGION}"
 
 # ---- Step 1: System update + timezone ----
+# KERNEL PIN (2026-08-10): the AMI is pinned and the instance carries
+# lifecycle.ignore_changes=[ami], but an unqualified `dnf update -y` floated the
+# kernel away from it on the next line, so the pin bounded only the STARTING
+# kernel. Excluding kernel packages makes a kernel move a reviewable AMI change.
+# (dnf.conf exclude, not the versionlock plugin — that package name carries a
+# banned interpreted-language token and would trip rust_only_guard.)
+if ! grep -q '^exclude=' /etc/dnf/dnf.conf 2>/dev/null; then
+    echo 'exclude=kernel kernel-* kernel-devel*' >> /etc/dnf/dnf.conf
+fi
 dnf update -y
 timedatectl set-timezone Asia/Kolkata
 
 # ---- Step 2: Docker + Compose v2 plugin (AL2023 ships docker in the default repo) ----
-# docker MUST install; the Compose v2 CLI plugin (`docker compose`) is REQUIRED
-# by BOTH the app boot (crates/app/src/infra.rs runs `docker compose -f … up -d
-# --force-recreate`, retried every 10s) AND the systemd self-heal
-# (scripts/ensure-questdb.sh). Without a working `docker compose` the app
-# crash-loops on BOOT-02 (QuestDB never starts) and the boot logs show the
-# `docker compose up -d failed (exit status: 125): unknown shorthand flag: 'f'`
-# cascade — the docker CLI does not recognise the `compose` subcommand, so `-f`
-# reaches the top-level parser.
+# The Compose v2 plugin (`docker compose`) is REQUIRED by BOTH the app boot
+# (infra.rs, retried every 10s) AND the systemd self-heal (ensure-questdb.sh).
+# Without it the app crash-loops on BOOT-02 with `exit status: 125: unknown
+# shorthand flag: 'f'` — the CLI lacks the `compose` subcommand so `-f` hits the
+# top-level parser.
 #
-# Install docker FIRST on its own line so a plugin-package hiccup can never abort
-# first-boot under `set -euo pipefail`. Then install the plugin from the AL2023
-# default repo; if that repo does not carry `docker-compose-plugin` (varies by
-# AL2023 minor version), add Docker's official CE repo (which manages the plugin
-# version — no hard-coded version to drift) and install from there.
+# Install docker FIRST on its own line so a plugin-package hiccup cannot abort
+# first-boot under `set -euo pipefail`. Fall back to Docker's official CE repo
+# when AL2023's default repo lacks `docker-compose-plugin` (varies by minor).
 dnf install -y docker git jq
 if docker compose version >/dev/null 2>&1; then
     echo "user-data: docker compose plugin already present — skipping install"
@@ -139,46 +130,11 @@ scrape_configs:
           host: tickvault-prod
 PROMCFG
 
-# ---------------------------------------------------------------------------
-# EMF `metric_selectors` COST NOTE — 2026-08-09 (metric-blindness fix)
-# ---------------------------------------------------------------------------
-# The selector below is an EXPLICIT, EXACT-NAME alternation — never a prefix
-# wildcard. That is deliberate: CloudWatch bills ~$0.30/custom-metric/month,
-# the live budget kill-ceiling is $100/mo, and its AUTOMATIC budget actions
-# fire STOP_EC2_INSTANCES at 90% ($90). A `tv_.*`-style prefix would publish
-# whatever the binary happens to emit and could stop the trading box
-# mid-session, so the count must stay auditable by reading this one line.
-#
-#   before 2026-08-09 : 11 names ≈ $3.30/mo
-#   after  2026-08-09 : 41 names ≈ $12.30/mo   (delta +30 names ≈ +$9.00/mo)
-#
-# The workspace emits ~352 distinct metric names; 311 are deliberately NOT
-# selected. Inclusion rule applied: a name is selected only if it means
-# FAILURE, SATURATION, or DATA LOSS *and* has a reachable producer on the
-# REST-only runtime. Deliberately EXCLUDED:
-#   - success/volume counters + latency histograms (tv_*_fetch_total,
-#     tv_*_close_to_data_ms, ...) — they answer "how much", not "what broke";
-#     the /metrics endpoint + errors.jsonl keep them for post-hoc triage
-#   - names whose ONLY emit sites are the stood-down per-minute boot legs
-#     ([spot_1m_rest]/[option_chain_1m]/[groww_*_1m] enabled=false since
-#     2026-07-17 — the cadence executors own the pulls), e.g.
-#     tv_spot1m_sid_not_served_total, tv_*_sweep_still_missing_total
-#   - names behind the non-default `groww_orders` cargo feature (Gate 2 of
-#     the §39.2 lattice — not compiled into the deploy build), e.g.
-#     tv_groww_push_supervisor_respawn_total
-#   - tv_ws_frame_spill_write_errors_total — no WS frame producer exists
-#     (both live feeds retired 2026-07-13/15); the boot-time replay counter
-#     tv_wal_replay_corrupted_segments_total IS selected because replay_all
-#     runs every boot
-#   - tv_api_auth_failed_total — already published via its own log metric
-#     filter (auth-failed-alarm.tf); EMF-selecting it would double-bill
-# A dead name in this list implies coverage no producer can publish, which
-# is the false-OK class this repo's guards forbid (audit-findings Rule 11).
-# LOCKSTEP: this literal MUST stay byte-identical to the copy in
-# deploy/aws/cloudwatch-agent.json — pinned by
-# crates/storage/tests/cw_agent_selector_lockstep_guard.rs, and the exact
-# count is pinned by crates/common/tests/cloudwatch_app_alarms_wiring.rs.
-# ---------------------------------------------------------------------------
+# EMF metric_selectors: EXACT-NAME alternation, never a prefix wildcard —
+# CloudWatch bills per custom metric and the budget auto-stops the box at 90%.
+# Full cost note + inclusion/exclusion rules: deploy/aws/EMF-METRIC-SELECTOR-NOTES.md
+# LOCKSTEP: the selector literal below MUST stay byte-identical to the copy in
+# deploy/aws/cloudwatch-agent.json (cw_agent_selector_lockstep_guard.rs).
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
 {
   "agent": { "metrics_collection_interval": 60 },
@@ -205,7 +161,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
               "source_labels": ["host"],
               "label_matcher": "^tickvault-prod$",
               "dimensions": [["host"]],
-              "metric_selectors": ["^(tv_questdb_disconnected_seconds|tv_token_remaining_seconds|tv_orders_rejected_total|tv_boot_completed|tv_clock_skew_seconds|tv_disk_watcher_respawn_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_rest_1m_fire_heartbeat|tv_daily_pnl|tv_order_fill_lag_seconds|tv_spot1m_persist_errors_total|tv_chain1m_persist_errors_total|tv_groww_spot1m_persist_errors_total|tv_groww_chain1m_persist_errors_total|tv_rest_fetch_audit_persist_errors_total|tv_rest_fetch_audit_rows_discarded_total|tv_cadence_option_mark_unresolved_total|tv_cadence_ladder_exhausted_total|tv_cadence_boundary_skipped_total|tv_cadence_late_response_total|tv_cadence_runner_respawn_total|tv_cadence_gate_denials_total|tv_cadence_spot_fallback_total|tv_questdb_wal_suspended_tables|tv_questdb_reconnects_total|tv_partition_archive_failed_total|tv_wal_replay_corrupted_segments_total|tv_order_audit_rows_discarded_total|tv_order_audit_persist_errors_total|tv_order_update_events_dropped_total|tv_order_update_events_persist_errors_total|tv_order_update_events_rows_discarded_total|tv_dhan_order_push_respawn_total|tv_spill_dir_free_bytes|tv_open_fds|tv_oom_kills_total|tv_ram_store_dropped_total|tv_ram_store_errors_total|tv_mid_session_profile_rest_degraded_total|tv_boot_deadline_exceeded_total)$"]
+              "metric_selectors": ["^(tv_questdb_disconnected_seconds|tv_token_remaining_seconds|tv_orders_rejected_total|tv_boot_completed|tv_clock_skew_seconds|tv_disk_watcher_respawn_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_rest_1m_fire_heartbeat|tv_daily_pnl|tv_order_fill_lag_seconds|tv_spot1m_persist_errors_total|tv_chain1m_persist_errors_total|tv_groww_spot1m_persist_errors_total|tv_groww_chain1m_persist_errors_total|tv_rest_fetch_audit_persist_errors_total|tv_rest_fetch_audit_rows_discarded_total|tv_cadence_option_mark_unresolved_total|tv_cadence_ladder_exhausted_total|tv_cadence_boundary_skipped_total|tv_cadence_late_response_total|tv_cadence_runner_respawn_total|tv_cadence_gate_denials_total|tv_cadence_spot_fallback_total|tv_questdb_wal_suspended_tables|tv_questdb_reconnects_total|tv_partition_archive_failed_total|tv_wal_replay_corrupted_segments_total|tv_order_audit_rows_discarded_total|tv_order_audit_persist_errors_total|tv_order_update_events_dropped_total|tv_order_update_events_persist_errors_total|tv_order_update_events_rows_discarded_total|tv_dhan_order_push_respawn_total|tv_spill_dir_free_bytes|tv_open_fds|tv_oom_kills_total|tv_ram_store_dropped_total|tv_ram_store_errors_total|tv_mid_session_profile_rest_degraded_total|tv_boot_deadline_exceeded_total|tv_dhan_ws_wal_dropped_total|tv_dhan_ws_ring_full_total|tv_dhan_ws_ring_bytes_full_total|tv_dhan_ws_frame_refused_total|tv_dhan_ws_subscribe_failed_total|tv_dhan_feed_seals_dropped_total|tv_dhan_feed_seq_refused|tv_dhan_feed_instruments_silent|tv_dhan_feed_instruments_never_ticked|tv_ticks_dropped_total|tv_tick_persist_errors_total|tv_tick_rows_refused_total|tv_ws_frame_spill_write_errors_total|tv_dhan_feed_stack_up|tv_dhan_feed_drain_frames_total|tv_dhan_feed_ingest_ticks_total|tv_dhan_feed_ingest_refused_total|tv_dhan_ws_reconnect_total|tv_dhan_ws_park_total|tv_dhan_ws_dial_failed_total|tv_ticks_lost_total|tv_ws_frame_spill_drop_critical|tv_dhan_feed_stack_connections|tv_dhan_ws_lag_excluded_total)$"]
             }
           ]
         }
@@ -268,6 +224,26 @@ sudo -u ec2-user git clone --depth 1 \
 # Copy is idempotent — re-running user-data refreshes config from repo.
 cp -f /opt/tickvault/repo/config/*.toml /opt/tickvault/config/ 2>/dev/null || true
 chown -R ec2-user:ec2-user /opt/tickvault/config
+
+# ---- Step 5c: Kernel network tuning (the anti-tick-loss settings) ----
+# Content + rationale: deploy/aws/sysctl/99-tickvault-net.conf (kept in the repo,
+# not inline — EC2 caps user-data at 16384 B; inlining broke plan 2026-08-10).
+# Applied post-clone because that is the first point the file exists.
+cp -f /opt/tickvault/repo/deploy/aws/sysctl/99-tickvault-net.conf /etc/sysctl.d/ || true
+# BBR only if the module actually loads — an unavailable value fails
+# `sysctl --system` as a whole and would strip the receive buffers with it.
+if modprobe tcp_bbr 2>/dev/null; then
+    echo 'net.ipv4.tcp_congestion_control = bbr' > /etc/sysctl.d/99-tickvault-bbr.conf
+    echo tcp_bbr > /etc/modules-load.d/tickvault-bbr.conf
+fi
+sysctl --system >/dev/null 2>&1 || echo "user-data: WARNING sysctl --system non-zero"
+# Verify EVERY load-bearing value, not just rmem_max, and report to journald +
+# /opt/tickvault/net-tuning.status so the verdict outlives cloud-init's log.
+# Non-zero exit is deliberate and deliberately not fatal — see the script header.
+bash /opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh || true
+
+# ---- Step 5d: Non-sysctl host tuning (THP + clock) ----
+bash /opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh || true
 
 # ---- Step 6: Start the Docker Compose stack ----
 # Post-CloudWatch-only migration (#O1/#O2/#O3/#O4): the stack is QuestDB

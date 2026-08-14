@@ -9,14 +9,25 @@
 # preserved across the upgrade.
 #
 # This is READY-TO-FIRE TOOLING, not an actual upgrade. The instance-type
-# LOCK is t4g.medium everywhere (Terraform validation +
-# instance_type_lock_guard.rs) per operator Quote 8 (2026-07-15 downsize;
-# supersedes the 2026-06-30 r8g.large Quote 7 lock). Flipping the lock to a
-# different type requires a dated operator quote + the 4-file lock update
-# FIRST (see daily-universe-scope-expansion-2026-05-27.md §7 Mechanical
-# Rule 1). This script is the MANUAL fallback for the r8g.large → t4g.medium
-# flip (the primary path is .github/workflows/downsize-instance.yml) — the
-# safe defaults below are the current locked types.
+# LOCK is r8g.xlarge everywhere (Terraform validation +
+# instance_type_lock_guard.rs) per operator Quote 13 (2026-08-08, the
+# 13-timeframe + current-day tick-retention sizing) and CONFIRMED FINAL by
+# Quote 15 (2026-08-12, "this is our finalsied instancue ... just sue this
+# evrywhere neitlrey"). This supersedes the Quote 8 t4g.medium lock the
+# paragraph here used to name, and the 2026-08-07 t4g.large attempt that AWS
+# refused with InsufficientInstanceCapacity and that was rolled back.
+# Flipping the lock to a different type requires a dated operator quote + the
+# 4-file lock update FIRST (see daily-universe-scope-expansion-2026-05-27.md
+# §7 Mechanical Rule 1). This script is the MANUAL fallback for the
+# instance-type flip (the primary path is
+# .github/workflows/downsize-instance.yml) — the safe defaults below are the
+# current locked types.
+#
+# The ALLOWLIST below deliberately stays WIDER than the lock. It is the
+# emergency roll-BACK surface: if r8g.xlarge cannot be obtained in any AZ,
+# an operator needs a running box more than a locked one. The allowlist
+# permits the attempt; the lock decides the destination; --from must match
+# the live type, so a wrong guess fails closed instead of mutating.
 #
 # What it does (each step idempotent / guarded):
 #   1. Discover the instance by Name tag `tv-${ENV}-app` (default env=prod).
@@ -264,6 +275,9 @@ if [ -z "$QDB_MEM" ]; then
     r8g.large)
       QDB_MEM="4g"
       ok "Target r8g.large (16 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in repo/deploy/docker/.env at Step 8, coupled to the resize)." ;;
+    r8g.xlarge)
+      QDB_MEM="12g"
+      ok "Target r8g.xlarge (32 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (operator Quote 13, 2026-08-08 — §7 Rule 2 sizes QuestDB at 8-16 GB of the 32 GiB budget; set in repo/deploy/docker/.env at Step 8, coupled to the resize)." ;;
     *) : ;; # no auto-default for other targets — --qdb-mem is explicit-only
   esac
 fi

@@ -454,9 +454,22 @@ mod tests {
     }
 
     #[test]
-    fn test_default_is_dhan_on_groww_off() {
+    fn test_default_is_every_feed_off() {
+        // Was `test_default_is_dhan_on_groww_off` until 2026-08-11, when the
+        // `FeedsConfig` default flipped Dhan from ON to OFF.
+        //
+        // The old default dated from when Dhan was the only feed and "default
+        // = the system unchanged" meant ON. After the 2026-07-13 retirement it
+        // meant the opposite: an absent or misspelled `[feeds]` section would
+        // silently enable a live market-data lane that is supposed to be off.
+        //
+        // This test is the pin for that contract, so it is UPDATED rather than
+        // deleted — the assertion is the point, only its expected value moved.
         let state = FeedRuntimeState::default();
-        assert!(state.is_enabled(Feed::Dhan));
+        assert!(
+            !state.is_enabled(Feed::Dhan),
+            "an absent config must not enable a live feed"
+        );
         assert!(!state.is_enabled(Feed::Groww));
     }
 
@@ -485,7 +498,13 @@ mod tests {
 
     #[test]
     fn test_is_enabled_reads_the_current_flag() {
+        // Dhan is set explicitly rather than inherited from the default: this
+        // test is about the READ following the flag, so leaning on whatever
+        // the default happens to be would make it fail for an unrelated
+        // reason the day that default changes — which is exactly what
+        // happened on 2026-08-11.
         let state = FeedRuntimeState::default();
+        state.set_enabled(Feed::Dhan, true);
         assert!(state.is_enabled(Feed::Dhan));
         assert!(!state.is_enabled(Feed::Groww));
         state.set_enabled(Feed::Groww, true);
@@ -504,7 +523,10 @@ mod tests {
 
     #[test]
     fn test_toggling_groww_does_not_touch_dhan() {
+        // Dhan set explicitly — the property under test is INDEPENDENCE of
+        // the two flags, which needs a known starting value, not a default.
         let state = FeedRuntimeState::default();
+        state.set_enabled(Feed::Dhan, true);
         state.set_enabled(Feed::Groww, true);
         assert!(
             state.is_enabled(Feed::Dhan),
@@ -519,11 +541,16 @@ mod tests {
 
     #[test]
     fn test_snapshot_reflects_current_state() {
+        // `dhan_enabled: false` since 2026-08-11 — the `FeedsConfig` default
+        // flipped so an absent `[feeds]` section can no longer enable a live
+        // feed. This test reads the snapshot of a DEFAULT state, so its
+        // expected value moves with that default; the property it pins (the
+        // snapshot mirrors the flags) is unchanged.
         let state = FeedRuntimeState::default();
         assert_eq!(
             state.snapshot(),
             FeedStatus {
-                dhan_enabled: true,
+                dhan_enabled: false,
                 groww_enabled: false,
                 groww_lane_running: false,
                 dhan_lane_running: false,
@@ -534,7 +561,9 @@ mod tests {
         assert_eq!(
             state.snapshot(),
             FeedStatus {
-                dhan_enabled: true,
+                // Still false — flipping Groww must not move Dhan, and the
+                // default is now OFF (2026-08-11).
+                dhan_enabled: false,
                 groww_enabled: true,
                 groww_lane_running: false,
                 dhan_lane_running: false,

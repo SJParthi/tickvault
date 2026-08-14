@@ -40,7 +40,7 @@ use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
-use tickvault_app::{infra, observability, subsystem_memory};
+use tickvault_app::{host_limits, infra, observability, subsystem_memory};
 
 use std::net::SocketAddr;
 
@@ -531,27 +531,39 @@ async fn main() -> Result<()> {
     // config-dead unless a legacy leg is re-enabled): marks are the
     // OWN-FIRE just-closed 1m candle closes, forwarded at the executor's
     // persist-confirm choke point.
-    let (order_runtime_mark_forwarder, order_runtime_mark_rx_slot, order_runtime_marks_wanted) =
-        if config.order_runtime.enabled {
-            let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
-                tickvault_app::order_runtime::MarkUpdate,
-            >(config.order_runtime.mark_channel_capacity);
-            let marks_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            (
-                Some(tickvault_app::order_runtime::MarkForwarder {
-                    marks_wanted: std::sync::Arc::clone(&marks_wanted),
-                    tx: mark_tx,
-                }),
-                std::sync::Arc::new(std::sync::Mutex::new(Some(mark_rx))),
-                marks_wanted,
-            )
-        } else {
-            (
-                None,
-                std::sync::Arc::new(std::sync::Mutex::new(None)),
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )
-        };
+    let (
+        order_runtime_mark_forwarder,
+        order_runtime_mark_rx_slot,
+        order_runtime_marks_wanted,
+        order_runtime_marks_dropped,
+    ) = if config.order_runtime.enabled {
+        let (mark_tx, mark_rx) = tokio::sync::mpsc::channel::<
+            tickvault_app::order_runtime::MarkUpdate,
+        >(config.order_runtime.mark_channel_capacity);
+        let marks_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Shared with the runtime so the reconcile heartbeat can report
+        // drops. The tap increments; the heartbeat reads and reports the
+        // delta. Split that way because the tap is DHAT-budgeted and cannot
+        // afford the log line itself.
+        let marks_dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        (
+            Some(tickvault_app::order_runtime::MarkForwarder {
+                marks_wanted: std::sync::Arc::clone(&marks_wanted),
+                tx: mark_tx,
+                dropped: std::sync::Arc::clone(&marks_dropped),
+            }),
+            std::sync::Arc::new(std::sync::Mutex::new(Some(mark_rx))),
+            marks_wanted,
+            marks_dropped,
+        )
+    } else {
+        (
+            None,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    };
     // ── per-instrument presence registry — RETIRED 2026-07-18 (stage-4
     // dead-producer sweep): the registry
     // (crates/core/src/pipeline/feed_presence.rs) was deleted — its
@@ -828,6 +840,16 @@ async fn main() -> Result<()> {
     metrics::counter!("tv_orders_rejected_total").increment(0);
     metrics::counter!("tv_orders_placed_total", "mode" => "paper").increment(0);
     metrics::counter!("tv_orders_placed_total", "mode" => "live").increment(0);
+
+    // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
+    // is installed — gauges written before install resolve to a no-op recorder
+    // and would be silently discarded, same rationale as the registrations
+    // above. Deliberately non-fatal: the return value is ignored because a
+    // tuning miss degrades the feed under load, it does not make the process
+    // wrong to run — and today's runtime is REST-only, where the receive-buffer
+    // size is irrelevant. The WARN lines + `tv_host_limits_unmet_total` are the
+    // operator signal. Ratchet: crates/app/tests/host_limits_lockstep_guard.rs.
+    let _host_limits_unmet = host_limits::check_and_report_host_limits();
 
     // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
     // register the per-subsystem memory gauges, the sampler heartbeat,
@@ -1500,6 +1522,18 @@ async fn main() -> Result<()> {
     // enabled, serde default OFF; base.toml opts in); disabled = one info! +
     // nothing spawned. Independent of feeds.groww_enabled / the retired live
     // lane — the REST-legs pattern (main.rs Groww REST spawns).
+    // [dhan_universe] — the daily Dhan instrument-master + NSE India index
+    // download and ISIN join (operator directive 2026-08-11, reversing Q3;
+    // verbatim quote in websocket-connection-scope-lock.md). Spawned
+    // unconditionally: the rider itself checks `enabled` and logs one line
+    // when off, so a disabled boot has exactly one observable difference from
+    // an enabled one — which is what makes "is it on?" answerable from the
+    // log rather than from the config file.
+    let _dhan_universe_rider = tickvault_app::dhan_universe::spawn_dhan_universe_rider(
+        config.dhan_universe.clone(),
+        config.questdb.clone(),
+    );
+
     if config.groww_universe.enabled {
         let _groww_universe_rider =
             tickvault_app::groww_universe::spawn_groww_universe_rider(config.questdb.clone());
@@ -1806,11 +1840,30 @@ async fn main() -> Result<()> {
     }
     if !ws_wal_replay_live_feed.is_empty() {
         let dropped = ws_wal_replay_live_feed.len() as u64;
-        warn!(
+        // 2026-08-11 — this message was written on 2026-07-14, when it was
+        // true: the Dhan live WS had just been retired, nothing appended
+        // LiveFeed frames, and anything found here really was pre-retirement
+        // residue being tidied away.
+        //
+        // It stopped being true when the live lane came back and became the
+        // WAL's first frame producer since that retirement. These frames can
+        // now be TODAY'S — captured minutes ago by a session that died — and
+        // the operator reading "residual ... from a pre-retirement session"
+        // would file it as housekeeping rather than as data loss.
+        //
+        // The frames are genuinely preserved on disk, and re-folding them is
+        // real work (the fold path takes a live ring, not a replay batch), so
+        // this stays a drop for now. What changes is that it stops describing
+        // a live gap as historical tidying, and says plainly what was lost.
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
             frames = dropped,
-            "STAGE-C.2b: residual LiveFeed WAL frames from a pre-retirement session have no \
-             re-injection target (the Dhan live WS was retired 2026-07-13) — counted and \
-             archived with the WAL segments; the raw frames remain on disk in the archive"
+            "STAGE-C.2b: {dropped} captured live-feed frames were replayed from the \
+             write-ahead log and DROPPED — there is no re-fold path, so the ticks and candles \
+             they contain are NOT in the database. The raw frames are preserved in the WAL \
+             archive and can be recovered manually. If this session followed an unclean stop \
+             during market hours, this is real data loss for that window, not leftover residue \
+             from an old session."
         );
         metrics::counter!(
             "tv_ws_frame_wal_reinjected_dropped_total",
@@ -1879,6 +1932,7 @@ async fn main() -> Result<()> {
             // with the lane).
             mark_rx_slot: std::sync::Arc::clone(&order_runtime_mark_rx_slot),
             marks_wanted: std::sync::Arc::clone(&order_runtime_marks_wanted),
+            marks_dropped: std::sync::Arc::clone(&order_runtime_marks_dropped),
             // ORDER-EVT-01 (2026-07-18): the full-fidelity capture sender the
             // Phase 5a paper consumer publishes each Dhan order push into.
             // None = the [order_update_events] capture lane is disabled.
@@ -1888,6 +1942,144 @@ async fn main() -> Result<()> {
             // Order-leg P&L (2026-07-19): sink for the runtime's paper-leg
             // realized/unrealized events. None = feature OFF.
             leg_pnl_tx: order_leg_pnl_tx,
+        },
+    );
+
+    // =======================================================================
+    // Dhan 16-connection LIVE FEED stack — DEFAULT-OFF, twice over.
+    //
+    // Authorized by the operator quote of 2026-08-09 in
+    // websocket-connection-scope-lock.md ("16 CONNECTIONS + depth-20/
+    // depth-200 AUTHORIZED"), which raised the main-feed pool 1 -> 5 and
+    // un-forbade depth-20 and depth-200 at 5 each: 5 + 5 + 5 + 1 = 16.
+    //
+    // The spawn is refused unless BOTH `[feeds] dhan_enabled` (false in
+    // base.toml AND production.toml) and the `TICKVAULT_DHAN_LIVE_FEED=1`
+    // environment opt-in are set, so this call is a boolean read plus one
+    // env lookup on every boot today and changes nothing. The environment
+    // gate is the belt to the config's braces: `FeedsConfig`'s STRUCT
+    // default for `dhan_enabled` is `true`, so config alone is not
+    // default-off by construction.
+    //
+    // Instruments are the hardcoded index set (Q3 of the 2026-07-13
+    // amendment stands — no CSV download, no parser). Depth sets are empty
+    // until an operator names instruments for them.
+    // =======================================================================
+    // -----------------------------------------------------------------------
+    // Register the 15:31 cross-verification dependencies BEFORE the lane
+    // spawns (2026-08-11).
+    //
+    // Without this call `spawn_daily_crossverify` takes its refusal branch and
+    // the lane runs with NO loss detector at all. That is not a degraded mode
+    // — it is the absence of the only detector that can exist here: the Dhan
+    // main feed carries no sequence number and no snapshot-on-subscribe, so a
+    // dropped packet is invisible at the protocol level. The 15:31 comparison
+    // against Dhan's own REST record is the entire safety net.
+    //
+    // This was missed once already. The comparator's stub was replaced with a
+    // real implementation on 2026-08-10, and the registration it depends on
+    // was never written — so the "fix" changed a log line and nothing else.
+    // The lane now REFUSES to start without it (see `run_dhan_feed_stack`),
+    // which is what stops that from being possible a third time.
+    let crossverify_installed = tickvault_app::dhan_feed_stack::install_crossverify_deps(
+        tickvault_app::dhan_feed_stack::CrossverifyDeps {
+            questdb_exec_url: format!(
+                "http://{}:{}/exec",
+                config.questdb.host, config.questdb.http_port
+            ),
+            intraday_url: format!(
+                "{}{}",
+                config.dhan.rest_api_base_url,
+                tickvault_common::constants::DHAN_CHARTS_INTRADAY_PATH
+            ),
+            // A closure, not a value: the JWT rotates roughly every 23h and
+            // this scheduler outlives any single token. Reading it fresh at
+            // each run is the only correct shape.
+            jwt_provider: Box::new(|| {
+                let manager = tickvault_core::auth::token_manager::global_token_manager()?;
+                let guard = manager.token_handle().load();
+                guard.as_ref().as_ref().map(|state| {
+                    use secrecy::ExposeSecret as _;
+                    state.access_token().expose_secret().to_string()
+                })
+            }),
+            config: tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig::default(),
+        },
+    );
+    if !crossverify_installed {
+        // Idempotent by design — first call wins. A second call means someone
+        // added a rival registration, which would silently decide which
+        // endpoints the only ground-truth check uses.
+        tracing::warn!(
+            "cross-verification dependencies were already registered — the first \
+             registration stands; check for a duplicate install site"
+        );
+    }
+
+    // Depth instrument sets, sourced from the per-minute option chain (operator
+    // 2026-08-11, second quote — "enable connect estbalish al lteh 16
+    // ocnenctions"). Indices have no order book, so the main feed's 4 hardcoded
+    // SIDs can never populate depth; the chain's per-leg `contract_security_id`
+    // is the only already-authorized source that also self-rolls at expiry.
+    //
+    // NOT selected here, deliberately (changed 2026-08-14). This ran at boot
+    // (~08:30 IST) against `option_chain_1m`, which the option-chain leg does
+    // not populate until its first fire at 09:16 — so it asked for the set ~45
+    // minutes before the set existed. Two daily failures followed: on a normal
+    // morning `LATEST ON ts` returned YESTERDAY's rows, so depth ranked ATM off
+    // a stale spot on contract ids Dhan documents as unstable across days; on
+    // the morning after an expiry it returned nothing and the error text
+    // prescribed a manual restart, which the zero-manual-intervention mandate
+    // forbids.
+    //
+    // The stack now owns this: it dials the main feed immediately and attaches
+    // depth once the chain leg publishes (`attach_depth_when_available`). Empty
+    // sets here mean "you fetch it", not "there is none".
+
+    // Signalled at shutdown so the lane can seal + flush before the process
+    // exits (2026-08-14). Held here because the shutdown block below is the
+    // only thing that fires it.
+    let dhan_feed_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
+        tickvault_app::dhan_feed_stack::DhanFeedStackParams {
+            shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),
+            // So the lane's silence page and its 15:31 cross-verification stay
+            // quiet on NSE holidays. EventBridge starts this box MON-FRI, which
+            // includes them (2026-08-14).
+            calendar: std::sync::Arc::clone(&trading_calendar),
+            dhan_enabled: config.feeds.dhan_enabled,
+            // DEFAULT-OFF: with `live_subscription_from_master = false` (the
+            // shipped value) this returns the same 4 hardcoded index SIDs the
+            // lane has always used, so the operator's 2026-08-11 third-quote
+            // carve-out — "re-pointing the lane… must not be smuggled in" — is
+            // honoured in substance: the live set does not move until a human
+            // flips the flag and restarts.
+            main_feed_instruments: tickvault_app::dhan_live_universe::resolve_live_universe(
+                &config.dhan_universe,
+                tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+                &tickvault_app::dhan_universe::today_ist_date(),
+                tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
+                    .subscription_capacity(),
+            ),
+            // Empty by design — the stack late-attaches depth after 09:16 IST.
+            depth_20_instruments: Vec::new(),
+            depth_200_instruments: Vec::new(),
+            questdb: config.questdb.clone(),
+            // So the lane can report whether it is ACTUALLY running, instead of
+            // the console reading a flag nothing ever set (2026-08-14).
+            feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            // The process-wide WAL opened in STAGE-C above. This is the FIRST
+            // frame-append consumer since PR-C2 retired the Dhan lane on
+            // 2026-07-13 (the note there — "there is no frame APPEND site left
+            // in this process" — is what this line changes). `None` refuses
+            // the lane outright rather than capturing without a durable floor.
+            spill: _ws_frame_spill.clone(),
+            // Both paths seal into the same `candles_<tf>` tables under
+            // `feed='dhan'`, and the dedup key has no column that separates
+            // them. Passing the fold's real state lets the lane refuse rather
+            // than let one writer silently overwrite the other.
+            rest_fold_writes_dhan_candles: config.rest_candle_fold.enabled,
         },
     );
 
@@ -1941,6 +2133,8 @@ async fn main() -> Result<()> {
         &notifier,
         &config,
         trading_calendar.clone(),
+        dhan_feed_shutdown,
+        dhan_feed_stack_monitor,
     )
     .await
 }
@@ -2397,6 +2591,27 @@ async fn build_shared_infra(
     // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
     tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
 
+    // --- `ticks` DDL — the SAME reasoning, and it had NO caller at all ---
+    //
+    // `ensure_ticks_table` issues CREATE TABLE plus the five-key
+    // `DEDUP ENABLE UPSERT KEYS(ts, security_id, segment, capture_seq, feed)`.
+    // It had ZERO production call sites repo-wide — every reference was its
+    // own doc comments and its own tests — while the live lane above writes
+    // `ticks` on every fold.
+    //
+    // So on a fresh QuestDB volume, ILP auto-created `ticks` WITHOUT DEDUP.
+    // That is silent in the worst way: rows land, counts look right, nothing
+    // errors — and the intra-second tiebreaker that makes WAL replay
+    // idempotent simply is not enforced, so a replay or a reconnect
+    // re-send duplicates rows instead of collapsing onto them. The candle
+    // tables were protected against exactly this class three weeks ago; the
+    // tick table was left out of that fix.
+    //
+    // Awaited INLINE here, beside the candle DDL, for the same ordering
+    // reason: it must complete before the first ILP row can auto-create the
+    // table with the wrong shape.
+    tickvault_storage::tick_persistence::ensure_ticks_table(&config.questdb).await;
+
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
 
@@ -2579,6 +2794,21 @@ async fn build_shared_infra(
 // wait, then stops the PROCESS API server + flushes otel. The shared infra
 // stays up for Groww until the shutdown signal.
 // ---------------------------------------------------------------------------
+/// How long the process waits for the Dhan live lane to seal + flush the day
+/// before exiting anyway (2026-08-14).
+///
+/// Bounded in both directions on purpose. Unbounded, a hung or unreachable
+/// QuestDB holds the process past systemd's stop timeout, systemd escalates to
+/// SIGKILL, and we lose the exact tail this wait exists to save. Too short and
+/// a healthy-but-busy flush is cut off. 20s sits comfortably inside the
+/// service's stop timeout while being far longer than a flush of one
+/// sub-threshold ILP batch needs.
+const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 20;
+
+/// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`] as a `Duration`.
+const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS);
+
 async fn run_process_runloop(
     api_handle: Option<tokio::task::JoinHandle<()>>,
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
@@ -2588,6 +2818,12 @@ async fn run_process_runloop(
     // calendar (Saturday/Sunday/holiday suppression). See
     // `boot_helpers::should_emit_post_market_alert`.
     trading_calendar: std::sync::Arc<TradingCalendar>,
+    // The Dhan live lane's shutdown signal and its task handle (2026-08-14).
+    // Threaded in rather than global because this function owns the ONLY
+    // place the signal is fired: without them the lane's final seal+flush
+    // never runs and the day's tail dies with the process.
+    dhan_feed_shutdown: std::sync::Arc<tokio::sync::Notify>,
+    dhan_feed_stack_monitor: Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     // Truthfulness rider: the runtime is dry-run/paper only — no real-money
     // orders are placed. Render "RUNNING (paper)" so the boot Telegram cannot
@@ -2814,8 +3050,40 @@ async fn run_process_runloop(
         std::process::exit(1);
     });
 
-    // (PR-C2, 2026-07-13: the Dhan-lane teardown steps 1–5 are deleted with
-    // the lane — the PROCESS infra below is torn down regardless.)
+    // 5b. Dhan live lane: seal + flush the day's tail (RESTORED 2026-08-14).
+    //
+    // The comment that stood here said the Dhan-lane teardown "is deleted with
+    // the lane" (PR-C2, 2026-07-13). That was true then. The lane came back on
+    // 2026-08-09 and the teardown did not, which made every 17:30 stop a
+    // silent partial data loss: nothing closed the sockets, so the ring never
+    // closed, so the drain never broke out of `rx.recv()`, so its final
+    // `ingest.flush()` never ran. Open candles and every ILP row still under
+    // the 1,000-row flush threshold went with the process — and the next line
+    // printed "tickvault stopped", classifying it clean. No metric differed
+    // between a day that flushed and a day that did not.
+    //
+    // Bounded deliberately: a hung or unreachable QuestDB must not hold the
+    // process past systemd's stop timeout, or systemd escalates to SIGKILL and
+    // we lose the very tail this is here to save. On timeout we say so at
+    // ERROR rather than exiting quietly — a flush that did not finish is not
+    // the same as one that did, and the operator must be able to tell.
+    dhan_feed_shutdown.notify_one();
+    if let Some(handle) = dhan_feed_stack_monitor {
+        match tokio::time::timeout(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET, handle).await {
+            Ok(Ok(())) => info!("Dhan live feed: sealed and flushed cleanly on shutdown"),
+            Ok(Err(err)) => error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                %err,
+                "Dhan live feed: the lane task failed while shutting down — the day's tail may \
+                 not have been persisted"
+            ),
+            Err(_) => error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                "Dhan live feed: the shutdown seal+flush did NOT finish within 20s — exiting \
+                 anyway so systemd does not SIGKILL us, but the day's tail may be incomplete"
+            ),
+        }
+    }
 
     // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
     // summaries + write the final episode snapshot (bounded 10s inside

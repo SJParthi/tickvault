@@ -1,0 +1,3045 @@
+//! Dhan connection-pool supervisor — pure decision core plus a thin async shell.
+//!
+//! Part of the 16-connection revival authorized by the operator on 2026-08-09
+//! (`.claude/rules/project/websocket-connection-scope-lock.md`, section
+//! "2026-08-09 (SAME DAY, SECOND QUOTE) — 16 CONNECTIONS + depth-20/depth-200
+//! AUTHORIZED"). The connection layer was deleted 2026-07-17 with the retired
+//! lane; this module rebuilds the *supervision* half of it on top of the three
+//! pure modules that landed first — [`super::reconnect_ladder`],
+//! [`super::idle_watchdog`] and [`super::pool_budget`] — which it REUSES rather
+//! than re-deriving.
+//!
+//! # THE ONE RULE
+//! The socket read task does exactly two things: append the raw frame to the
+//! write-ahead log, and push it into the bounded ring. Nothing else, ever. No
+//! parsing, no aggregation, no database write, no lock shared with a writer, no
+//! await on network or disk.
+//!
+//! This is not a style preference, it is the disconnect-prevention mechanism.
+//! `15-live-market-feed.md:75`: "An automated pong is sent by websocket
+//! library." The library can only emit that pong **while the read loop is
+//! polling the socket**, and `:77` gives the server-side death sentence at
+//! "more than 40 seconds" of client silence. A reader that blocks to do work
+//! therefore stops ponging while looking perfectly healthy locally, and Dhan
+//! closes it. A slow consumer on this feed is not merely late — it is
+//! disconnected.
+//!
+//! The rule is expressed in code as [`FrameSink`], whose ONLY implementation on
+//! the production path is [`WalRingSink`]: one WAL append, one non-blocking
+//! `try_send`, no `.await`. Everything downstream of the ring may stall, crash
+//! or fall behind without the reader noticing.
+//!
+//! # Shape: pure core, thin shell
+//! [`ConnectionSupervisor::on_event`] and [`ConnectionSupervisor::poll`] are
+//! total, allocation-free, clock-injected functions from
+//! `(state, event, now)` to [`SupervisorAction`]. Every reconnect, park and
+//! resubscribe decision this product makes is reachable from a unit test
+//! without opening a socket. [`run_connection`] is the shell that executes
+//! those actions against a [`DhanFeedSocket`]; it contains no policy of its own.
+//!
+//! # Why the clock is monotonic everywhere
+//! The idle watchdog is driven by [`std::time::Instant`] via
+//! [`IdleWatchdog`], never by wall time. An NTP step of +30s against wall time
+//! would push ALL sixteen sockets past the idle threshold in the same instant —
+//! synthesising the exact simultaneous-drop thundering herd that
+//! [`super::reconnect_ladder`]'s jitter exists to prevent, on sixteen sockets
+//! that were perfectly healthy. This module never reads the wall clock; that is
+//! enforced mechanically by `test_pool_supervisor_source_never_reads_wall_clock`.
+//!
+//! # Complexity
+//! | Path | Cost | Note |
+//! |---|---|---|
+//! | [`ConnectionSupervisor::on_event`] | O(1), zero alloc | enum match + integer arithmetic |
+//! | [`ConnectionSupervisor::poll`] | O(1), zero alloc | one `Instant` subtraction |
+//! | [`classify_disconnect`] | O(1), zero alloc | enum match |
+//! | [`WalRingSink::accept`] | O(1), zero alloc *of ours* | WAL append + `try_send`; see the honesty note below |
+//! | [`SubscribeGuard::batches`] | O(1) per batch, zero alloc | slice `chunks`, no copy |
+//! | [`SubscribeGuard`] full iteration | **O(n) in instruments — NOT O(1)** | inherent: every instrument must be named on the wire. Cold path: once per connect, ≤5,000 items, ~50 messages |
+//! | [`PoolSupervisor::poll_all`] | **O(N) with N ≤ 16 — NOT O(1)** | bounded by the operator-authorized ceiling, so it is a fixed constant, but it is a scan and is labelled as one |
+//! | [`PoolSupervisor::admit`] | O(1), zero alloc | delegates to the four-counter [`PoolBudget`] |
+//!
+//! **Honesty on "zero allocation on the per-frame path."** The claim is exact
+//! for the code in this module: [`WalRingSink::accept`] performs no heap
+//! allocation, and the `Bytes` hand-off into the WAL is an `Arc` refcount bump,
+//! not a copy. It is NOT a claim about the whole read loop — `tokio-tungstenite`
+//! allocates the frame buffer when it decodes a message, upstream of anything
+//! here, and that allocation is not ours to remove. Per frame this module also
+//! performs one `Instant::now()` (a ~20ns vDSO read) to feed the watchdog:
+//! 0.03% of the 66.7µs per-packet budget on the busiest socket. Both costs are
+//! recorded rather than rounded away.
+
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use tickvault_common::error_code::ErrorCode;
+use tickvault_common::types::{ExchangeSegment, SecurityId};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, next_frame_seq};
+use tracing::{error, info, warn};
+
+use super::idle_watchdog::IdleWatchdog;
+use super::pool_budget::{
+    ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, PoolBudget, PoolBudgetRefusal,
+};
+use super::reconnect_ladder::{
+    reconnect_delay_ms, reconnect_delay_with_jitter_ms, reconnect_jitter_ms,
+};
+use super::types::{ConnectionId, ConnectionState, DisconnectCode};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Minimum delay before re-dialing after a token-staleness disconnect (807/809).
+///
+/// Deliberately far above the ladder's instant first rung. A stale token is not
+/// a transient TCP event: re-dialing immediately presents the SAME dead token
+/// and earns the same rejection, sixteen times over, which is precisely the
+/// retry storm the house rules ban. This floor gives the REST stack's renewal
+/// loop / mid-session watchdog room to publish a fresh token before we ask for
+/// one again.
+pub const TOKEN_STALE_REDIAL_FLOOR_MS: u64 = 5_000;
+
+/// How often the shell wakes to ask the supervisor whether a socket has gone
+/// idle. One second gives a 27–28s detection window against the 27s threshold,
+/// comfortably inside Dhan's documented 40s server-side close, at a cost of one
+/// timer wake per connection per second.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Counter: connection dropped and is being re-dialed. Labels: `endpoint`, `reason`.
+pub const RECONNECT_METRIC: &str = "tv_dhan_ws_reconnect_total";
+
+/// Counter: connection parked permanently. Labels: `endpoint`, `reason`.
+pub const PARK_METRIC: &str = "tv_dhan_ws_park_total";
+
+/// Counter: frame captured but the bounded ring refused it — the frame is
+/// durable in the WAL, the downstream consumer is behind. Label: `endpoint`.
+pub const RING_FULL_METRIC: &str = "tv_dhan_ws_ring_full_total";
+
+/// Counter: the ring refusal above was the BYTE budget, not the frame count.
+///
+/// A strict subset of `RING_FULL_METRIC` — every byte-refusal increments both,
+/// so the ring-full alarm keeps working unchanged and this one answers the
+/// follow-up question the operator will actually have: was the queue long, or
+/// were the frames huge? Those have different causes (a stalled fold versus an
+/// oversized or hostile peer) and, at the count bound alone, are
+/// indistinguishable. Label: `endpoint`.
+pub const RING_BYTES_FULL_METRIC: &str = "tv_dhan_ws_ring_bytes_full_total";
+
+/// Counter: the WAL itself refused a frame. This is the only genuine capture
+/// loss path. Label: `endpoint`.
+pub const WAL_DROP_METRIC: &str = "tv_dhan_ws_wal_dropped_total";
+
+// ---------------------------------------------------------------------------
+// Disconnect classification (WS-GAP-01)
+// ---------------------------------------------------------------------------
+
+/// What a disconnect means for the reconnect decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectClass {
+    /// Network reset, server hiccup, or an unrecognised code. Retry on the ladder.
+    Transient,
+    /// The access token is expired or invalid (807 / 809). Retry, but only
+    /// after obtaining a fresh token and only past [`TOKEN_STALE_REDIAL_FLOOR_MS`].
+    TokenStale,
+    /// 805 — too many connections. **Park.**
+    ///
+    /// `15-live-market-feed.md:209` and `16-full-market-depth.md:183`, verbatim:
+    /// "If more than 5 websockets are established, then the first socket will be
+    /// disconnected with `805` with every additional connection." Exceeding the
+    /// cap does not reject the NEW socket, it kills the OLDEST one — so a
+    /// reconnect loop against 805 does not retry a failure, it executes one
+    /// healthy fully-subscribed pool member per attempt. Re-dialing here makes
+    /// the situation strictly worse, which is why this is the one transport
+    /// error that must stop rather than back off.
+    PoolOverflow,
+    /// Entitlement or credential errors that never self-heal without operator
+    /// action (806 data-API not subscribed, 808 auth failed, 810 client id
+    /// invalid). Park; a human must fix the account or the config.
+    Fatal,
+}
+
+/// Classifies a disconnect code into a reconnect policy. Total: an absent or
+/// unknown code is [`DisconnectClass::Transient`], the fail-safe direction
+/// (retry politely on the ladder rather than park a healthy pool).
+///
+/// Runbook: WS-GAP-01 ([`ErrorCode::WsGapDisconnectClassification`]).
+#[must_use]
+pub fn classify_disconnect(code: Option<DisconnectCode>) -> DisconnectClass {
+    match code {
+        Some(DisconnectCode::ExceededActiveConnections) => DisconnectClass::PoolOverflow,
+        Some(DisconnectCode::AccessTokenExpired | DisconnectCode::AccessTokenInvalid) => {
+            DisconnectClass::TokenStale
+        }
+        Some(
+            DisconnectCode::DataApiSubscriptionRequired
+            | DisconnectCode::AuthenticationFailed
+            | DisconnectCode::ClientIdInvalid
+            // 804 — "Requested number of instruments exceeds limit."
+            //
+            // MOVED here from the `_ => Transient` catch-all on 2026-08-14.
+            // Transient means "retry on the ladder", and retrying 804 re-sends
+            // the IDENTICAL over-limit subscribe set that was just rejected —
+            // forever, every 30s at the ladder's cap. Nothing in that loop can
+            // ever succeed, because nothing about the request changes between
+            // attempts. It is a request-shaped error wearing a transport-code
+            // costume, and the catch-all could not tell the difference.
+            //
+            // Worse, it is self-amplifying in exactly the direction that hurts
+            // most: a permanent connect/subscribe/reject cycle is precisely
+            // the traffic pattern 805 describes as "too many requests", whose
+            // documented consequence is the USER being blocked — so retrying
+            // one account-level rejection can earn another.
+            //
+            // Fatal parks the socket, and since 2026-08-14 a park is no longer
+            // silent: it emits a coded error naming the endpoint and slot, and
+            // `tv_dhan_ws_park_total` has an alarm. So this turns an invisible
+            // infinite loop into one page that names the real problem —
+            // somebody asked for more instruments than the endpoint allows.
+            | DisconnectCode::InstrumentsExceedLimit,
+        ) => DisconnectClass::Fatal,
+        _ => DisconnectClass::Transient,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State machine vocabulary
+// ---------------------------------------------------------------------------
+
+/// Lifecycle phase of one supervised connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnPhase {
+    /// Constructed, never dialed.
+    Idle,
+    /// A dial is in flight.
+    Dialing,
+    /// Socket is up; subscribe batches are being sent.
+    Subscribing,
+    /// Socket is up and delivering frames.
+    Live,
+    /// Waiting out a reconnect delay.
+    Backoff,
+    /// Stopped permanently. Never dials again this process.
+    Parked,
+}
+
+impl ConnPhase {
+    /// Whether the idle watchdog applies. Only phases where we legitimately
+    /// expect traffic are watched: during [`ConnPhase::Backoff`] we are
+    /// deliberately silent, and parking is terminal.
+    #[must_use]
+    pub const fn is_watchdog_eligible(self) -> bool {
+        matches!(self, Self::Dialing | Self::Subscribing | Self::Live)
+    }
+
+    /// Stable lowercase tag for logs and metric labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Dialing => "dialing",
+            Self::Subscribing => "subscribing",
+            Self::Live => "live",
+            Self::Backoff => "backoff",
+            Self::Parked => "parked",
+        }
+    }
+}
+
+/// Something that happened to a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnEvent {
+    /// The shell is about to dial. Idempotent from [`ConnPhase::Idle`] or
+    /// [`ConnPhase::Backoff`]; ignored once parked.
+    BeginDial,
+    /// Socket established.
+    DialSucceeded,
+    /// Dial failed before the socket came up.
+    DialFailed,
+    /// Every subscribe batch for this connection was accepted by the socket.
+    SubscribeAcked,
+    /// A subscribe batch could not be sent.
+    SubscribeFailed,
+    /// One frame arrived.
+    FrameReceived,
+    /// The socket closed, optionally carrying a Dhan disconnect code.
+    Disconnected { code: Option<DisconnectCode> },
+    /// The watchdog fired: no traffic for the idle threshold.
+    IdleElapsed,
+    /// Orderly shutdown.
+    ShutdownRequested,
+}
+
+/// Why a connection stopped permanently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkReason {
+    /// 805 — re-dialing would kill a sibling. See [`DisconnectClass::PoolOverflow`].
+    PoolOverflow,
+    /// An entitlement or credential error that needs operator action.
+    FatalDisconnect,
+    /// Orderly shutdown.
+    Shutdown,
+}
+
+impl ParkReason {
+    /// Every reason, for baseline pre-registration of the park counter.
+    pub const ALL: [Self; 3] = [Self::PoolOverflow, Self::FatalDisconnect, Self::Shutdown];
+
+    /// Stable lowercase tag for logs and metric labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PoolOverflow => "pool_overflow",
+            Self::FatalDisconnect => "fatal_disconnect",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Why a connection is being re-dialed. Metric label only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectReason {
+    /// The dial itself failed.
+    DialFailed,
+    /// A subscribe batch could not be sent.
+    SubscribeFailed,
+    /// The socket closed on a retryable code.
+    Disconnected,
+    /// The token was rejected.
+    TokenStale,
+    /// The watchdog fired.
+    IdleSilence,
+}
+
+impl ReconnectReason {
+    /// Stable lowercase tag for logs and metric labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DialFailed => "dial_failed",
+            Self::SubscribeFailed => "subscribe_failed",
+            Self::Disconnected => "disconnected",
+            Self::TokenStale => "token_stale",
+            Self::IdleSilence => "idle_silence",
+        }
+    }
+}
+
+/// What the shell must do next. The supervisor emits exactly one of these per
+/// event; the shell contains no policy beyond executing them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorAction {
+    /// Dial now. Any existing socket must be closed first.
+    Dial,
+    /// Close any existing socket, sleep `delay_ms`, then send
+    /// [`ConnEvent::BeginDial`].
+    SleepThenDial { delay_ms: u64 },
+    /// As [`SupervisorAction::SleepThenDial`], but the caller MUST obtain a
+    /// fresh access token before dialing — the previous socket died on a stale
+    /// one, so re-presenting it would simply be rejected again.
+    RefreshTokenThenDial { delay_ms: u64 },
+    /// Send this connection's subscribe batches.
+    Subscribe,
+    /// Stop permanently; never dial again this process.
+    Park { reason: ParkReason },
+    /// Nothing to do.
+    Continue,
+}
+
+// ---------------------------------------------------------------------------
+// Per-connection supervisor (the pure core)
+// ---------------------------------------------------------------------------
+
+/// The state machine for ONE connection.
+///
+/// Plain value, single-owner: the connection task owns it outright, so no lock
+/// is taken on the per-frame path. That is a load-bearing property, not an
+/// implementation detail — a mutex here would be shared with the frame path and
+/// would violate THE ONE RULE.
+#[derive(Debug, Clone)]
+pub struct ConnectionSupervisor {
+    slot: ConnectionSlot,
+    phase: ConnPhase,
+    /// Consecutive failed attempts so far; also the ladder index for the NEXT
+    /// delay. Reset to zero when the connection proves healthy.
+    attempt: u32,
+    watchdog: IdleWatchdog,
+    /// Whether a frame has arrived since the current socket came up. The
+    /// attempt counter resets on the FIRST FRAME rather than on a successful
+    /// dial, because a socket that connects and subscribes but never delivers
+    /// anything is not healthy — resetting on dial would let such a socket
+    /// re-dial instantly forever.
+    proven_healthy: bool,
+    frames: u64,
+    reconnects: u64,
+    /// Set exactly once, when the supervisor parks. Retained so the shell can
+    /// report WHY without re-deriving it, and so a caller handed an
+    /// already-parked supervisor can exit instead of spinning.
+    park_reason: Option<ParkReason>,
+}
+
+impl ConnectionSupervisor {
+    /// A fresh supervisor for `slot`, idle and never dialed.
+    #[must_use]
+    pub fn new(slot: ConnectionSlot, now: Instant) -> Self {
+        Self {
+            slot,
+            phase: ConnPhase::Idle,
+            attempt: 0,
+            watchdog: IdleWatchdog::new(now),
+            proven_healthy: false,
+            frames: 0,
+            reconnects: 0,
+            park_reason: None,
+        }
+    }
+
+    /// The budget-granted slot this supervisor drives.
+    #[must_use]
+    pub const fn slot(&self) -> ConnectionSlot {
+        self.slot
+    }
+
+    /// Current lifecycle phase.
+    #[must_use]
+    pub const fn phase(&self) -> ConnPhase {
+        self.phase
+    }
+
+    /// Consecutive failed attempts; the ladder index for the next delay.
+    #[must_use]
+    pub const fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Frames observed on this connection since process start.
+    #[must_use]
+    pub const fn frames_received(&self) -> u64 {
+        self.frames
+    }
+
+    /// Reconnect cycles this connection has entered since process start.
+    #[must_use]
+    pub const fn reconnects(&self) -> u64 {
+        self.reconnects
+    }
+
+    /// Why this connection parked, if it has. `None` while it is still alive.
+    #[must_use]
+    pub const fn park_reason(&self) -> Option<ParkReason> {
+        self.park_reason
+    }
+
+    /// Phase projected onto the shared [`ConnectionState`] vocabulary, for
+    /// `ws_event_audit` rows and the `/health` surface.
+    #[must_use]
+    pub const fn connection_state(&self) -> ConnectionState {
+        match self.phase {
+            ConnPhase::Idle | ConnPhase::Parked => ConnectionState::Disconnected,
+            ConnPhase::Dialing => ConnectionState::Connecting,
+            ConnPhase::Subscribing | ConnPhase::Live => ConnectionState::Connected,
+            ConnPhase::Backoff => ConnectionState::Reconnecting,
+        }
+    }
+
+    /// Feeds one event through the state machine and returns the action the
+    /// shell must take. Total, allocation-free, O(1).
+    pub fn on_event(&mut self, event: ConnEvent, now: Instant) -> SupervisorAction {
+        // Parking is terminal and absorbs everything except a repeat shutdown.
+        if self.phase == ConnPhase::Parked {
+            return SupervisorAction::Continue;
+        }
+
+        match event {
+            ConnEvent::ShutdownRequested => self.park(ParkReason::Shutdown),
+
+            ConnEvent::BeginDial => {
+                self.phase = ConnPhase::Dialing;
+                self.proven_healthy = false;
+                // Reset here, not on dial completion: the watchdog must also
+                // cover a dial that hangs forever without ever completing.
+                self.watchdog.record_activity(now);
+                SupervisorAction::Dial
+            }
+
+            ConnEvent::DialSucceeded => {
+                self.phase = ConnPhase::Subscribing;
+                self.watchdog.record_activity(now);
+                SupervisorAction::Subscribe
+            }
+
+            ConnEvent::DialFailed => self.schedule_redial(ReconnectReason::DialFailed, now),
+
+            ConnEvent::SubscribeFailed => {
+                // WS-GAP-02: a subscribe that will not go out leaves the socket
+                // connected but blind. Tear it down rather than sit on a live
+                // socket carrying nothing.
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = self.slot.endpoint.as_str(),
+                    pool_index = self.slot.pool_index,
+                    "subscribe batch could not be sent — tearing the socket down and re-dialing"
+                );
+                self.schedule_redial(ReconnectReason::SubscribeFailed, now)
+            }
+
+            ConnEvent::SubscribeAcked => {
+                self.phase = ConnPhase::Live;
+                self.watchdog.record_activity(now);
+                SupervisorAction::Continue
+            }
+
+            ConnEvent::FrameReceived => {
+                self.watchdog.record_activity(now);
+                self.frames = self.frames.saturating_add(1);
+                if !self.proven_healthy {
+                    self.proven_healthy = true;
+                    self.attempt = 0;
+                }
+                // A frame can legitimately arrive before our own subscribe ack
+                // (the prev-close packet is pushed on subscribe). Treat it as
+                // proof the socket is live.
+                if self.phase == ConnPhase::Subscribing {
+                    self.phase = ConnPhase::Live;
+                }
+                SupervisorAction::Continue
+            }
+
+            ConnEvent::Disconnected { code } => {
+                self.reconnects = self.reconnects.saturating_add(1);
+                match classify_disconnect(code) {
+                    DisconnectClass::PoolOverflow => {
+                        error!(
+                            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                            endpoint = self.slot.endpoint.as_str(),
+                            pool_index = self.slot.pool_index,
+                            "Dhan closed this socket with 805 (too many connections). Dhan kills \
+                             the OLDEST socket per extra connection, so re-dialing would destroy \
+                             a healthy sibling instead of recovering this one — parking. Check \
+                             for a second process holding Dhan sockets on this account."
+                        );
+                        self.park(ParkReason::PoolOverflow)
+                    }
+                    DisconnectClass::Fatal => {
+                        error!(
+                            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                            endpoint = self.slot.endpoint.as_str(),
+                            pool_index = self.slot.pool_index,
+                            disconnect_code = code.map_or(0, |c| c.as_u16()),
+                            "Dhan closed this socket with a credential or entitlement error that \
+                             cannot self-heal — parking. Operator action required."
+                        );
+                        self.park(ParkReason::FatalDisconnect)
+                    }
+                    DisconnectClass::TokenStale => {
+                        // Floor the LADDER, then add this socket's stagger —
+                        // never the other way round (2026-08-11).
+                        //
+                        // This was `next_delay_ms().max(FLOOR)`, which reads
+                        // as "at least the floor" and is, but it also silently
+                        // discarded the jitter. The ladder's first three rungs
+                        // are 0/1000/2000 ms and the whole jitter range is
+                        // 0-375 ms, so every jittered value on those rungs is
+                        // below the 5,000 ms floor and `max` collapsed all of
+                        // them onto exactly 5,000.
+                        //
+                        // That is precisely the wrong behaviour for the event
+                        // this arm exists to handle: a token expiring kills
+                        // ALL sixteen sockets at once, so all sixteen slept an
+                        // identical 5,000 ms, woke in the same tick, and hit
+                        // the token endpoint together — a self-inflicted
+                        // thundering herd on the one code path guaranteed to
+                        // be entered by every connection simultaneously.
+                        //
+                        // Flooring the base first keeps the "wait at least
+                        // 5 s" intent and restores the fan-out on top of it.
+                        let base = self.next_ladder_delay_ms().max(TOKEN_STALE_REDIAL_FLOOR_MS);
+                        let delay = base.saturating_add(self.jitter_ms());
+                        self.enter_backoff(ReconnectReason::TokenStale);
+                        SupervisorAction::RefreshTokenThenDial { delay_ms: delay }
+                    }
+                    DisconnectClass::Transient => {
+                        let delay = self.next_delay_ms();
+                        self.enter_backoff(ReconnectReason::Disconnected);
+                        SupervisorAction::SleepThenDial { delay_ms: delay }
+                    }
+                }
+            }
+
+            ConnEvent::IdleElapsed => {
+                if !self.phase.is_watchdog_eligible() {
+                    return SupervisorAction::Continue;
+                }
+                self.reconnects = self.reconnects.saturating_add(1);
+                warn!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    endpoint = self.slot.endpoint.as_str(),
+                    pool_index = self.slot.pool_index,
+                    phase = self.phase.as_str(),
+                    idle_secs = self.watchdog.idle_for(now).as_secs(),
+                    "socket silent past the idle threshold — reconnecting on our terms before \
+                     Dhan closes it at 40s"
+                );
+                let delay = self.next_delay_ms();
+                self.enter_backoff(ReconnectReason::IdleSilence);
+                SupervisorAction::SleepThenDial { delay_ms: delay }
+            }
+        }
+    }
+
+    /// Asks whether the idle watchdog has fired. Returns
+    /// [`SupervisorAction::Continue`] when it has not. Call at
+    /// [`IDLE_POLL_INTERVAL`]. O(1), no allocation, monotonic clock only.
+    pub fn poll(&mut self, now: Instant) -> SupervisorAction {
+        if !self.phase.is_watchdog_eligible() || !self.watchdog.is_expired(now) {
+            return SupervisorAction::Continue;
+        }
+        self.on_event(ConnEvent::IdleElapsed, now)
+    }
+
+    /// Ladder delay for the next attempt, including this connection's fixed
+    /// per-slot stagger. Does NOT mutate.
+    fn next_delay_ms(&self) -> u64 {
+        reconnect_delay_with_jitter_ms(self.attempt, self.slot.global_index)
+    }
+
+    /// The ladder delay for this attempt WITHOUT this socket's stagger.
+    ///
+    /// Split out so a caller that needs to raise the floor can floor the
+    /// ladder and then add the stagger, rather than flooring the sum and
+    /// throwing the stagger away — see the `TokenStale` arm.
+    fn next_ladder_delay_ms(&self) -> u64 {
+        reconnect_delay_ms(self.attempt)
+    }
+
+    /// This socket's fixed fan-out offset. Index 0 always gets zero, so one
+    /// connection per pool keeps the exact instant-retry behaviour.
+    fn jitter_ms(&self) -> u64 {
+        reconnect_jitter_ms(self.slot.global_index)
+    }
+
+    /// Common tail for every retryable failure: compute the delay, count it,
+    /// advance the ladder, drop into backoff.
+    fn schedule_redial(&mut self, reason: ReconnectReason, _now: Instant) -> SupervisorAction {
+        let delay = self.next_delay_ms();
+        self.enter_backoff(reason);
+        SupervisorAction::SleepThenDial { delay_ms: delay }
+    }
+
+    fn enter_backoff(&mut self, reason: ReconnectReason) {
+        self.attempt = self.attempt.saturating_add(1);
+        self.phase = ConnPhase::Backoff;
+        self.proven_healthy = false;
+        metrics::counter!(
+            RECONNECT_METRIC,
+            "endpoint" => self.slot.endpoint.as_str(),
+            "reason" => reason.as_str(),
+        )
+        .increment(1);
+    }
+
+    fn park(&mut self, reason: ParkReason) -> SupervisorAction {
+        self.phase = ConnPhase::Parked;
+        self.park_reason = Some(reason);
+        metrics::counter!(
+            PARK_METRIC,
+            "endpoint" => self.slot.endpoint.as_str(),
+            "reason" => reason.as_str(),
+        )
+        .increment(1);
+        // A park is PERMANENT — this socket will never dial again for the rest
+        // of the session, by design (re-dialing into a 805 kills a healthy pool
+        // member, and re-dialing into a credential rejection just repeats it).
+        //
+        // The park POLICY is correct and is not changed here. What was wrong,
+        // until 2026-08-14, is that it happened in complete silence: the
+        // counter above was incremented and nothing else. The counter had no
+        // alarm and no log line, so a socket could drop out of a 16-socket pool
+        // permanently and the only way to notice was to go looking for a
+        // metric nobody was watching. A permanent capacity loss must announce
+        // itself.
+        //
+        // Cold path by construction: a park is terminal for this slot, so this
+        // can log at most once per connection per session.
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            endpoint = self.slot.endpoint.as_str(),
+            connection_index = self.slot.global_index,
+            reason = reason.as_str(),
+            "a Dhan live-feed socket has PARKED PERMANENTLY and will not dial again this \
+             session — the pool is now carrying fewer connections than it was planned for, \
+             and this one only returns on a process restart"
+        );
+        SupervisorAction::Park { reason }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subscribe guard — subscriptions survive reconnect
+// ---------------------------------------------------------------------------
+
+/// One instrument in a connection's subscription set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeInstrument {
+    /// Dhan `SecurityId`. Serialised as a STRING on the wire by the transport
+    /// (`15-live-market-feed.md` — the subscribe payload uses string ids); the
+    /// guard stores the numeric identity.
+    ///
+    /// The shared 64-bit alias, not a narrower local type: the id space was
+    /// widened to `u64` by the §28.1 lift and is namespace-banded per feed, so
+    /// a `u32` here would reintroduce the silent truncation that widening
+    /// removed.
+    pub security_id: SecurityId,
+    /// The instrument's segment. Carried alongside the id because
+    /// `security_id` ALONE is not unique — the only unique instrument key is
+    /// `(security_id, exchange_segment)` per I-P1-11.
+    pub segment: ExchangeSegment,
+}
+
+/// Why a subscription set was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SubscribeGuardRefusal {
+    /// More instruments than this endpoint type permits on ONE connection.
+    #[error("{endpoint} accepts at most {max} instruments per connection, {requested} requested")]
+    TooManyInstruments {
+        /// Endpoint type asked for.
+        endpoint: DhanEndpointType,
+        /// Instruments the caller supplied.
+        requested: usize,
+        /// Documented per-connection cap.
+        max: u32,
+    },
+}
+
+/// The subscription set for ONE connection, and the fact of whether the live
+/// socket has it.
+///
+/// This is what makes subscriptions survive a reconnect: the set is built once
+/// at boot and OUTLIVES every socket. A reconnect does not rebuild it, it
+/// replays it — so a resubscribe cannot silently drop instruments because a
+/// rebuild path had different inputs.
+#[derive(Debug, Clone)]
+pub struct SubscribeGuard {
+    endpoint: DhanEndpointType,
+    instruments: Vec<SubscribeInstrument>,
+    /// Bumped on every confirmed subscribe. Lets a consumer discard a frame
+    /// attributed to a previous socket incarnation.
+    generation: u64,
+    confirmed: bool,
+}
+
+impl SubscribeGuard {
+    /// Builds a guard, refusing a set larger than the endpoint's documented
+    /// per-connection cap.
+    ///
+    /// Fail-closed by design: Dhan answers an over-limit subscribe with 804
+    /// rather than silently truncating, so refusing locally turns a live
+    /// disconnect into a boot-time error at the place the mistake was made.
+    ///
+    /// # Errors
+    /// [`SubscribeGuardRefusal::TooManyInstruments`] when the set exceeds
+    /// [`DhanEndpointType::max_instruments_per_connection`].
+    pub fn try_new(
+        endpoint: DhanEndpointType,
+        instruments: Vec<SubscribeInstrument>,
+    ) -> Result<Self, SubscribeGuardRefusal> {
+        let max = endpoint.max_instruments_per_connection();
+        let requested = instruments.len();
+        if u64::try_from(requested).unwrap_or(u64::MAX) > u64::from(max) {
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = endpoint.as_str(),
+                requested,
+                max,
+                "refusing a subscription set larger than the endpoint's per-connection cap"
+            );
+            return Err(SubscribeGuardRefusal::TooManyInstruments {
+                endpoint,
+                requested,
+                max,
+            });
+        }
+        Ok(Self {
+            endpoint,
+            instruments,
+            generation: 0,
+            confirmed: false,
+        })
+    }
+
+    /// Endpoint type this set belongs to.
+    #[must_use]
+    pub const fn endpoint(&self) -> DhanEndpointType {
+        self.endpoint
+    }
+
+    /// Instruments in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.instruments.len()
+    }
+
+    /// Whether the set is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.instruments.is_empty()
+    }
+
+    /// Incarnation counter — bumped on every confirmed subscribe.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether the live socket is known to hold this subscription.
+    #[must_use]
+    pub const fn is_confirmed(&self) -> bool {
+        self.confirmed
+    }
+
+    /// Whether the set must be (re)sent before the connection is useful.
+    #[must_use]
+    pub const fn needs_resubscribe(&self) -> bool {
+        !self.confirmed
+    }
+
+    /// The subscribe messages for this set, honouring the endpoint's documented
+    /// per-message cap (100 for the main feed, 50 for depth-20).
+    ///
+    /// Zero-allocation: each item is a borrowed slice of the set, not a copy.
+    /// The iteration itself is O(n) in instruments — inherent, since every
+    /// instrument must be named on the wire — and runs on the cold path, once
+    /// per connect.
+    pub fn batches(&self) -> impl Iterator<Item = &[SubscribeInstrument]> {
+        // `max(1)`: a zero cap would panic `chunks`. Only order-update reports
+        // zero, and it never carries instruments, so this is a totality guard
+        // rather than a live path.
+        let per_message = usize::try_from(self.endpoint.max_instruments_per_subscribe_message())
+            .unwrap_or(usize::MAX)
+            .max(1);
+        self.instruments.chunks(per_message)
+    }
+
+    /// Number of subscribe messages [`SubscribeGuard::batches`] will yield.
+    #[must_use]
+    pub fn batch_count(&self) -> usize {
+        self.batches().count()
+    }
+
+    /// Records that the live socket accepted the whole set.
+    pub fn mark_confirmed(&mut self) {
+        self.confirmed = true;
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    /// Records that the socket carrying this subscription is gone. The set is
+    /// retained verbatim for replay on the next connect.
+    pub fn mark_lost(&mut self) {
+        self.confirmed = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frame sink — THE ONE RULE, made executable
+// ---------------------------------------------------------------------------
+
+/// What happened to one captured frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSinkOutcome {
+    /// Durable in the WAL and handed to the ring.
+    Captured,
+    /// Durable in the WAL; the bounded ring refused it because the downstream
+    /// consumer is behind. NOT capture loss — replay recovers it.
+    RingFull,
+    /// The WAL refused it. This is the only genuine capture-loss path.
+    WalDropped,
+}
+
+/// The only thing a socket read task is permitted to do with a frame.
+///
+/// One method, no `async`: an `async fn` here would let a future implementation
+/// `.await` inside the read loop, which is exactly the disconnect mechanism
+/// described in the module docs. The signature is the enforcement.
+pub trait FrameSink: Send + Sync + 'static {
+    /// Accepts one raw frame. MUST NOT block, allocate, or await.
+    fn accept(&self, frame: Bytes) -> FrameSinkOutcome;
+}
+
+/// One captured frame and the sequence it was stamped with at the read
+/// instant.
+///
+/// The sequence travels WITH the bytes rather than being re-derived
+/// downstream, and that is the whole design. `next_frame_seq` is minted
+/// exactly once per received frame and written into the WAL record; the
+/// consumer must stamp `ticks.capture_seq` with the SAME value, because on
+/// replay the WAL hands back its stored sequence. A consumer that minted its
+/// own would produce a different key for a replayed frame and the DEDUP
+/// collapse that makes replay idempotent would never happen — every restart
+/// would silently duplicate the session (`data-integrity.md`, TICK-SEQ-01).
+#[derive(Debug, Clone)]
+pub struct CapturedFrame {
+    /// The replay-stable sequence, already persisted in the WAL record.
+    pub seq: u64,
+    /// Which socket this frame came off.
+    ///
+    /// Load-bearing, not decoration: the main feed and the depth feeds use
+    /// DIFFERENT wire formats — an 8-byte header versus a 12-byte one whose
+    /// first two bytes are a message length. A consumer that cannot tell them
+    /// apart will feed a depth frame to the main-feed parser, where byte 0 is a
+    /// length low-byte matching no response code, and silently discard every
+    /// depth packet as unparseable. Carrying the endpoint makes that mistake
+    /// impossible to make by accident.
+    pub endpoint: DhanEndpointType,
+    /// WHICH socket of that endpoint's pool, `0..MAX_TOTAL_DHAN_CONNECTIONS`.
+    ///
+    /// `endpoint` alone cannot answer "is ONE socket sick?" — it folds all five
+    /// main-feed connections into a single identity, so a socket delivering
+    /// minutes-late ticks would be averaged away by its four healthy siblings.
+    /// A `u8` alongside the existing enum adds no allocation: `Bytes` remains
+    /// the only heap member of this struct.
+    pub connection_index: u8,
+    /// The frame exactly as it arrived. Never parsed on the read task.
+    pub bytes: Bytes,
+}
+
+/// The ring's SECOND bound: total bytes resident, not just frame count.
+///
+/// A channel bounded only by count is bounded only if the items are a known
+/// size, and these are not. `CapturedFrame` owns a `Bytes` whose length is
+/// whatever the peer sent, up to `max_frame_bytes(endpoint)` — 256 KiB on the
+/// main feed, 512 KiB on depth-200. At the ring's 65,536-frame capacity that
+/// is **16 GiB of resident heap on the main feed alone, 32 GiB with the depth
+/// pools open**: the entire machine, held by a queue whose own documentation
+/// called it a bounded burst absorber.
+///
+/// It never bites in normal operation, which is exactly why it is worth
+/// bounding. Real Dhan frames are small — a Quote packet is 50 bytes and a
+/// frame batches a handful — so the count bound engages first and this budget
+/// is inert. It engages only when frames are large AND the fold has stalled,
+/// which is the shape of both a hostile peer and a genuine downstream stall,
+/// and in that shape the count bound alone permits the process to eat the host.
+///
+/// Refusal here is the SAME event as a count-full ring, not a new failure mode:
+/// the frame is already durable in the WAL by the time this is consulted, so a
+/// refusal is a lag signal and the outcome is `RingFull`.
+#[derive(Debug)]
+pub struct RingByteBudget {
+    resident: std::sync::atomic::AtomicUsize,
+    cap: usize,
+}
+
+impl RingByteBudget {
+    /// A budget capped at `cap` resident bytes.
+    #[must_use]
+    pub const fn new(cap: usize) -> Self {
+        Self {
+            resident: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// The configured ceiling.
+    #[must_use]
+    pub const fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Bytes currently reserved by frames sitting in the ring.
+    #[must_use]
+    pub fn resident(&self) -> usize {
+        self.resident.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reserves `len` bytes, or refuses.
+    ///
+    /// CAS loop rather than a `fetch_add`-then-check: `fetch_add` would
+    /// momentarily push `resident` past the cap, and with N reader tasks all
+    /// adding at once the overshoot is unbounded — the very thing being
+    /// bounded. This way `resident` never exceeds `cap`, even transiently.
+    ///
+    /// A frame LARGER than the whole cap can never be admitted. That is
+    /// deliberate: the per-endpoint frame caps are two to three orders of
+    /// magnitude above real traffic, so such a frame is already outside the
+    /// envelope, and admitting it would mean the budget does not bound.
+    pub fn try_reserve(&self, len: usize) -> bool {
+        self.resident
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+                |cur| {
+                    let next = cur.checked_add(len)?;
+                    (next <= self.cap).then_some(next)
+                },
+            )
+            .is_ok()
+    }
+
+    /// Returns `len` bytes to the budget as a frame leaves the ring.
+    ///
+    /// Saturating, never wrapping. An underflow here would be a bookkeeping
+    /// bug, and the wrong response to one is to wrap to `usize::MAX` and refuse
+    /// every frame forever — that converts a counting error into a total feed
+    /// outage. Saturating at zero degrades to "the budget stops bounding",
+    /// which is the same state as not having it, and stays visible through
+    /// `resident()`.
+    pub fn release(&self, len: usize) {
+        // An explicit CAS loop rather than `fetch_update`, because the closure
+        // form can only ever return `Some` here and its `Result` would then have
+        // to be discarded — and `let _ =` on a `#[must_use]` value is exactly
+        // what this crate's `let_underscore_must_use` deny exists to stop. The
+        // loop has no result to throw away.
+        let mut cur = self.resident.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(len);
+            match self.resident.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
+
+/// Production [`FrameSink`]: append to the write-ahead log, then push into the
+/// bounded ring. In that order, always.
+///
+/// The order is the durability guarantee. The WAL append happens BEFORE the
+/// frame is visible to anything downstream, so a process kill between the two
+/// steps loses nothing — replay finds the frame. A ring that is full is
+/// therefore a lag signal, not a loss event.
+pub struct WalRingSink {
+    spill: std::sync::Arc<WsFrameSpill>,
+    ring: tokio::sync::mpsc::Sender<CapturedFrame>,
+    budget: std::sync::Arc<RingByteBudget>,
+    ws_type: WsType,
+    endpoint: DhanEndpointType,
+    /// Which socket of the pool this sink serves; stamped onto every frame
+    /// so a single sick connection cannot be averaged away by its siblings.
+    connection_index: u8,
+    /// Loss counters resolved ONCE at construction — see the note on
+    /// [`WalRingSink::new`] for why the macro form is banned on this path.
+    wal_dropped: metrics::Counter,
+    ring_full: metrics::Counter,
+    ring_bytes_full: metrics::Counter,
+}
+
+impl WalRingSink {
+    /// Wires a sink to a WAL, a bounded ring, and the ring's byte budget.
+    ///
+    /// # Why the counters are resolved here and not at the emit site
+    ///
+    /// `metrics::counter!(NAME, "label" => value)` builds a `Key` on EVERY
+    /// call, and a keyed `Key` owns a `Vec<Label>` — so the macro form heap
+    /// allocates once per invocation. Putting it on `accept`'s drop paths puts
+    /// an allocation on the one path that only executes when the system is
+    /// ALREADY under pressure: the ring is full, the WAL refused, the process
+    /// is losing data. Allocating there is both a violation of principle 1
+    /// (zero allocation on the hot path) and, practically, the worst possible
+    /// moment to ask the allocator for anything.
+    ///
+    /// The `endpoint` label is fixed for the lifetime of a sink, so a single
+    /// handle per sink covers every emit — no `OnceLock`, no per-call lookup.
+    /// `Counter::increment` on a resolved handle is a plain atomic add: O(1),
+    /// zero allocation. Same shape as `DrainCounters` in the app crate and
+    /// `dispatcher.rs`'s pre-resolved handles.
+    #[must_use]
+    pub fn new(
+        spill: std::sync::Arc<WsFrameSpill>,
+        ring: tokio::sync::mpsc::Sender<CapturedFrame>,
+        budget: std::sync::Arc<RingByteBudget>,
+        ws_type: WsType,
+        endpoint: DhanEndpointType,
+        connection_index: u8,
+    ) -> Self {
+        let endpoint_label = endpoint.as_str();
+        let sink = Self {
+            spill,
+            ring,
+            budget,
+            ws_type,
+            endpoint,
+            connection_index,
+            wal_dropped: metrics::counter!(WAL_DROP_METRIC, "endpoint" => endpoint_label),
+            ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
+            ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
+        };
+        sink.pre_register();
+        sink
+    }
+
+    /// Publishes a zero on every loss series this sink owns.
+    ///
+    /// # Why a zero has to be published at all
+    ///
+    /// The CloudWatch agent computes a counter's alarm value as a DELTA
+    /// between consecutive samples, and it has no previous sample for a series
+    /// that has never been emitted — so it drops the first one. If the first
+    /// emission a series ever sees is the outage itself, that outage is the
+    /// dropped sample and the alarm does not fire for it. Publishing a zero at
+    /// construction makes the harmless zero the dropped sample instead, which
+    /// is the whole point.
+    ///
+    /// Called from `new` so it cannot be forgotten at a call site: a sink that
+    /// exists has published its baseline.
+    fn pre_register(&self) {
+        self.wal_dropped.increment(0);
+        self.ring_full.increment(0);
+        self.ring_bytes_full.increment(0);
+    }
+}
+
+impl FrameSink for WalRingSink {
+    fn accept(&self, frame: Bytes) -> FrameSinkOutcome {
+        // Minted ONCE, here, at the read instant — see `CapturedFrame`.
+        let seq = next_frame_seq();
+        // Step 1 — durability. `Bytes` into the WAL is an Arc refcount bump.
+        // `append_with_seq`, never `append`: `append` would mint a SECOND
+        // sequence internally and the WAL record would then disagree with the
+        // one the consumer stamps.
+        // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
+        if self.spill.append_with_seq(self.ws_type, frame.clone(), seq) == AppendOutcome::Dropped {
+            self.wal_dropped.increment(1);
+            return FrameSinkOutcome::WalDropped;
+        }
+        // Step 2 — byte budget. Consulted BEFORE `try_send` because a reserve
+        // taken after a successful send could not be refused, and one taken
+        // for a send that then fails would leak. Reserve, then send, then
+        // release on failure: the only ordering with no window in which the
+        // budget and the ring disagree.
+        let len = frame.len();
+        if !self.budget.try_reserve(len) {
+            self.ring_full.increment(1);
+            self.ring_bytes_full.increment(1);
+            return FrameSinkOutcome::RingFull;
+        }
+        // Step 3 — visibility. `try_send` never awaits; a full ring returns
+        // immediately so the reader keeps polling (and therefore keeps ponging).
+        if self
+            .ring
+            .try_send(CapturedFrame {
+                seq,
+                endpoint: self.endpoint,
+                connection_index: self.connection_index,
+                bytes: frame,
+            })
+            .is_err()
+        {
+            // The frame never entered the ring, so nothing downstream will ever
+            // release its reservation. Give it back here or the budget ratchets
+            // down on every count-full frame until it refuses everything —
+            // a slow strangulation that would look like the feed dying for no
+            // reason.
+            self.budget.release(len);
+            self.ring_full.increment(1);
+            return FrameSinkOutcome::RingFull;
+        }
+        FrameSinkOutcome::Captured
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pool supervisor — N connections of one endpoint type
+// ---------------------------------------------------------------------------
+
+/// Owns the connection budget and the per-connection supervisors for a whole
+/// pool.
+///
+/// Plain value with no interior mutability: it lives on the pool's own task.
+/// Keeping it lock-free is what lets the per-frame path stay lock-free.
+#[derive(Debug)]
+pub struct PoolSupervisor {
+    budget: PoolBudget,
+    connections: Vec<ConnectionSupervisor>,
+}
+
+impl PoolSupervisor {
+    /// An empty supervisor with a fresh budget.
+    #[must_use]
+    pub fn new() -> Self {
+        // Publish a zero on every (endpoint, reason) series the park counter
+        // can ever produce, BEFORE any socket is admitted.
+        //
+        // The CloudWatch agent computes a counter's alarm value as the DELTA
+        // between consecutive samples and has no previous sample for a series
+        // it has never seen, so it drops the first one. A park happens at most
+        // once per connection per session and is otherwise never emitted — so
+        // without this, the FIRST park a series ever sees IS the dropped
+        // sample, it publishes no datapoint, and `tv-<env>-dhan-socket-parked`
+        // (threshold 1, one 300s period) never fires for it. The alarm would
+        // be dead precisely for the single-park case, which is the normal
+        // shape of the incident it exists to catch.
+        //
+        // Both labels must be enumerated, not just one: the agent baselines
+        // per Prometheus SERIES, and the EMF processor folds the labels to
+        // `{host}` afterwards by summing the per-series deltas. A series left
+        // unregistered contributes nothing to that sum on the sample where it
+        // is born, so one missing combination is one invisible park.
+        //
+        // Twelve series at the /metrics endpoint, ONE series in CloudWatch
+        // after folding — so this costs nothing on the bill.
+        //
+        // Done in `new` so it cannot be forgotten at a call site: a supervisor
+        // that exists has published its baseline. Same discipline as
+        // `WalRingSink::pre_register` and `SpillDropCounters::new`.
+        for endpoint in DhanEndpointType::ALL {
+            for reason in ParkReason::ALL {
+                metrics::counter!(
+                    PARK_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "reason" => reason.as_str(),
+                )
+                .increment(0);
+            }
+        }
+        Self {
+            budget: PoolBudget::new(),
+            // Pre-sized to the hard ceiling rather than left unsized: the pool
+            // can never exceed MAX_TOTAL_DHAN_CONNECTIONS, so one small
+            // allocation here means the connection table never reallocates.
+            connections: Vec::with_capacity(MAX_TOTAL_DHAN_CONNECTIONS as usize),
+        }
+    }
+
+    /// Reserves one connection of `endpoint` and registers a supervisor for it.
+    ///
+    /// Refusal is the fail-closed direction: better fifteen connections and a
+    /// loud refusal than sixteen and a silently murdered pool member (see
+    /// [`DisconnectClass::PoolOverflow`]).
+    ///
+    /// # Errors
+    /// Whatever [`PoolBudget::try_open`] refuses with.
+    pub fn admit(
+        &mut self,
+        endpoint: DhanEndpointType,
+        now: Instant,
+    ) -> Result<ConnectionSlot, PoolBudgetRefusal> {
+        let slot = self.budget.try_open(endpoint)?;
+        self.connections.push(ConnectionSupervisor::new(slot, now));
+        Ok(slot)
+    }
+
+    /// Connections currently registered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Whether nothing is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.connections.is_empty()
+    }
+
+    /// Total connections open across every endpoint type.
+    #[must_use]
+    pub const fn total_open(&self) -> u16 {
+        self.budget.total_open()
+    }
+
+    /// Connections open for one endpoint type.
+    #[must_use]
+    pub const fn open_count(&self, endpoint: DhanEndpointType) -> u8 {
+        self.budget.open_count(endpoint)
+    }
+
+    /// Mutable access to the supervisor at `global_index`, if registered.
+    pub fn connection_mut(
+        &mut self,
+        global_index: ConnectionId,
+    ) -> Option<&mut ConnectionSupervisor> {
+        self.connections
+            .iter_mut()
+            .find(|c| c.slot().global_index == global_index)
+    }
+
+    /// Read-only view of every registered supervisor.
+    #[must_use]
+    pub fn connections(&self) -> &[ConnectionSupervisor] {
+        &self.connections
+    }
+
+    /// Runs the idle watchdog across every registered connection, returning the
+    /// slots that need re-dialing.
+    ///
+    /// **O(N), not O(1)** — a scan. N is bounded by the operator-authorized
+    /// ceiling of 16, so the cost is a fixed constant, but it is a scan and is
+    /// labelled as one rather than dressed up. It runs once per
+    /// [`IDLE_POLL_INTERVAL`] on the cold path, never per frame. The returned
+    /// `Vec` allocates; also cold path, and empty in the overwhelmingly common
+    /// case where nothing timed out.
+    pub fn poll_all(&mut self, now: Instant) -> Vec<(ConnectionSlot, SupervisorAction)> {
+        // Pre-sized to the ceiling: at most one action per connection, and the
+        // pool is hard-capped, so this never reallocates mid-sweep.
+        let mut due = Vec::with_capacity(MAX_TOTAL_DHAN_CONNECTIONS as usize);
+        for conn in &mut self.connections {
+            let action = conn.poll(now);
+            if action != SupervisorAction::Continue {
+                due.push((conn.slot(), action));
+            }
+        }
+        due
+    }
+
+    /// Releases one connection of `endpoint` back to the budget and forgets its
+    /// supervisor. Used when a parked connection is retired.
+    pub fn retire(&mut self, slot: ConnectionSlot) {
+        self.connections
+            .retain(|c| c.slot().global_index != slot.global_index);
+        self.budget.release(slot.endpoint);
+    }
+}
+
+impl Default for PoolSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The thin async shell
+// ---------------------------------------------------------------------------
+
+/// What a socket read returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketEvent {
+    /// One raw frame, exactly as it arrived. Never parsed here.
+    Frame(Bytes),
+    /// The socket closed, optionally with a Dhan disconnect code.
+    Closed { code: Option<DisconnectCode> },
+}
+
+/// The transport a supervised connection drives.
+///
+/// Deliberately a trait rather than a concrete socket: it keeps every branch of
+/// [`run_connection`] — dial failure, subscribe failure, 805, token staleness,
+/// idle timeout, shutdown — reachable from a unit test with no network. The
+/// production implementation (tokio-tungstenite over TLS) is a separate module
+/// and is NOT part of this round.
+///
+/// Returns are written as `impl Future + Send` rather than `async fn` so the
+/// `Send` bound is explicit at the definition, which is what lets a supervised
+/// connection be `tokio::spawn`ed.
+pub trait DhanFeedSocket: Send {
+    /// Dial and complete the handshake.
+    fn connect(&mut self) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    /// Send ONE subscribe message for the given batch.
+    fn send_subscribe(
+        &mut self,
+        batch: &[SubscribeInstrument],
+    ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    /// Await the next socket event. This is the call that keeps the automatic
+    /// pong flowing — nothing may be done between two of these but
+    /// [`FrameSink::accept`].
+    fn recv(&mut self) -> impl std::future::Future<Output = SocketEvent> + Send;
+    /// Close the socket, best effort.
+    fn close(&mut self) -> impl std::future::Future<Output = ()> + Send;
+}
+
+/// A transport-level failure. Opaque on purpose: policy lives in the
+/// supervisor, not in the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("dhan socket failure")]
+pub struct SocketFailure;
+
+/// Why a supervised connection loop returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionExit {
+    /// The supervisor parked the connection.
+    Parked(ParkReason),
+}
+
+/// Drives ONE connection for its whole life: dial, subscribe, drain, reconnect,
+/// park.
+///
+/// Contains no policy — every decision comes from `supervisor`. The inner drain
+/// loop does exactly two things per frame: [`FrameSink::accept`], and one
+/// `Instant::now()` to feed the watchdog. It never parses, never writes to a
+/// database, never takes a lock, and never awaits anything but the socket
+/// itself and the one-second idle tick.
+///
+/// `refresh_token` is invoked before re-dialing after a token-staleness
+/// disconnect; supply a no-op when the transport does not carry a token.
+// Every decision this executes is unit-tested via `ConnectionSupervisor`, and
+// the loop itself is driven end-to-end against a fake transport by the
+// `test_run_connection_*` cases below — dial retry, subscribe failure, 805,
+// token staleness and the already-parked entry are each covered.
+pub async fn run_connection<S, K, F, Fut>(
+    mut socket: S,
+    mut supervisor: ConnectionSupervisor,
+    mut guard: SubscribeGuard,
+    sink: std::sync::Arc<K>,
+    mut refresh_token: F,
+) -> ConnectionExit
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let endpoint = supervisor.slot().endpoint.as_str();
+    let pool_index = supervisor.slot().pool_index;
+    let mut action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
+
+    loop {
+        match action {
+            SupervisorAction::Park { reason } => {
+                socket.close().await;
+                info!(
+                    endpoint,
+                    pool_index,
+                    reason = reason.as_str(),
+                    frames = supervisor.frames_received(),
+                    reconnects = supervisor.reconnects(),
+                    "supervised Dhan connection parked"
+                );
+                return ConnectionExit::Parked(reason);
+            }
+
+            SupervisorAction::Continue => {
+                // Reachable only if a caller hands in a supervisor that is not
+                // freshly constructed. An ALREADY-PARKED supervisor absorbs
+                // every event and would otherwise spin here forever, so it is
+                // checked first; anything else re-enters the dial cycle.
+                if let Some(reason) = supervisor.park_reason() {
+                    socket.close().await;
+                    return ConnectionExit::Parked(reason);
+                }
+                action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
+            }
+
+            SupervisorAction::SleepThenDial { delay_ms } => {
+                socket.close().await;
+                guard.mark_lost();
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
+            }
+
+            SupervisorAction::RefreshTokenThenDial { delay_ms } => {
+                socket.close().await;
+                guard.mark_lost();
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                refresh_token().await;
+                action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
+            }
+
+            SupervisorAction::Dial => {
+                let event = match socket.connect().await {
+                    Ok(()) => ConnEvent::DialSucceeded,
+                    Err(_) => ConnEvent::DialFailed,
+                };
+                action = supervisor.on_event(event, Instant::now());
+            }
+
+            SupervisorAction::Subscribe => {
+                let mut failed = false;
+                for batch in guard.batches() {
+                    if socket.send_subscribe(batch).await.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
+                    action = supervisor.on_event(ConnEvent::SubscribeFailed, Instant::now());
+                    continue;
+                }
+                guard.mark_confirmed();
+                action = supervisor.on_event(ConnEvent::SubscribeAcked, Instant::now());
+                // Drain until something changes.
+                action = drain(&mut socket, &mut supervisor, sink.as_ref(), action).await;
+            }
+        }
+    }
+}
+
+/// The drain loop. Returns as soon as the supervisor asks for anything other
+/// than [`SupervisorAction::Continue`].
+///
+/// THE ONE RULE lives here: per frame, one [`FrameSink::accept`] and one
+/// watchdog update. Nothing else is permitted between two `recv()` calls,
+/// because the automatic pong is only emitted while `recv()` is polling.
+async fn drain<S, K>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    mut action: SupervisorAction,
+) -> SupervisorAction
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+{
+    let mut ticker = tokio::time::interval(IDLE_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick so a fresh socket is not polled for
+    // idleness the instant it comes up.
+    ticker.tick().await;
+
+    // Per-socket count of frames the ring refused, used only to throttle the
+    // log below. Scoped to this drain call, so a reconnect starts the ladder
+    // again — deliberate: a fresh connection that immediately backs up is
+    // worth hearing about even if the previous one already reported.
+    let mut ring_full_seen: u64 = 0;
+
+    while action == SupervisorAction::Continue {
+        tokio::select! {
+            biased;
+            event = socket.recv() => {
+                match event {
+                    SocketEvent::Frame(frame) => {
+                        // Two operations. That is the whole loop body.
+                        let outcome = sink.accept(frame);
+                        action = supervisor.on_event(ConnEvent::FrameReceived, Instant::now());
+                        if outcome == FrameSinkOutcome::WalDropped {
+                            // Loud, but the reader does NOT stop draining:
+                            // stopping would cost the pong and turn one lost
+                            // frame into a disconnect.
+                            error!(
+                                code = ErrorCode::WsGapConnectionState.code_str(),
+                                endpoint = supervisor.slot().endpoint.as_str(),
+                                pool_index = supervisor.slot().pool_index,
+                                "write-ahead log refused a Dhan frame — that frame is lost; \
+                                 the reader keeps draining so the socket is not also lost"
+                            );
+                        }
+                        if outcome == FrameSinkOutcome::RingFull {
+                            // 2026-08-11: this outcome used to bump a counter
+                            // and produce NO log line at all.
+                            //
+                            // The counter's documentation calls a full ring
+                            // "not capture loss — the consumer is behind",
+                            // and for a brief burst that is fair: the frame is
+                            // already in the WAL. But nothing re-folds WAL
+                            // frames into the database, so in practice a full
+                            // ring means those ticks and candles never arrive
+                            // — while the lane's health gauge still reads 1.
+                            // Silent permanent loss behind a green light is
+                            // exactly the class the charter forbids.
+                            //
+                            // Throttled by powers of two rather than rate-
+                            // limited: the first occurrence is always
+                            // reported, and a sustained storm degrades to a
+                            // handful of lines instead of one per frame. A
+                            // slow consumer must not be able to drown the log
+                            // it is being reported in.
+                            ring_full_seen = ring_full_seen.saturating_add(1);
+                            if ring_full_seen.is_power_of_two() {
+                                error!(
+                                    code = ErrorCode::WsGapConnectionState.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    dropped_on_this_socket = ring_full_seen,
+                                    "the frame ring is FULL — the fold cannot keep up, so this \
+                                     frame is not being turned into ticks or candles. It is in \
+                                     the write-ahead log, but nothing re-folds WAL frames, so \
+                                     treat this as data loss until that changes. Logged at \
+                                     1, 2, 4, 8 ... occurrences per socket to bound the noise."
+                                );
+                            }
+                        }
+                    }
+                    SocketEvent::Closed { code } => {
+                        action = supervisor
+                            .on_event(ConnEvent::Disconnected { code }, Instant::now());
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                action = supervisor.poll(Instant::now());
+            }
+        }
+    }
+    action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::{BTreeSet, VecDeque};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::super::reconnect_ladder::{
+        RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS, reconnect_delay_ms,
+    };
+
+    #[test]
+    fn test_park_reason_all_covers_every_variant_so_no_series_goes_unbaselined() {
+        // `ParkReason::ALL` drives the metric pre-registration in
+        // `PoolSupervisor::new`, and the CloudWatch agent baselines PER LABEL
+        // COMBINATION: a reason missing from ALL has its first park eaten as
+        // the delta baseline, so `tv-<env>-dhan-socket-parked` stays silent for
+        // exactly that reason. `[Self; 3]` alone does not protect against
+        // that — adding a variant forces only `as_str()`'s match to change,
+        // and the array compiles untouched.
+        //
+        // Same shape as `pool_budget::test_endpoint_type_has_exactly_four_...`,
+        // which is what makes `DhanEndpointType::ALL` — the other half of the
+        // registration loop — genuinely compile-protected.
+        assert_eq!(ParkReason::ALL.len(), 3, "exactly three park reasons");
+
+        // Exhaustive match: adding a variant stops this compiling until ALL
+        // and this arm list are updated together.
+        for reason in ParkReason::ALL {
+            match reason {
+                ParkReason::PoolOverflow | ParkReason::FatalDisconnect | ParkReason::Shutdown => {}
+            }
+        }
+
+        // No duplicate standing in for a missing variant — an ALL of
+        // `[PoolOverflow, PoolOverflow, Shutdown]` has the right length and
+        // matches exhaustively, yet leaves FatalDisconnect unregistered.
+        let distinct: BTreeSet<&'static str> = ParkReason::ALL
+            .into_iter()
+            .map(ParkReason::as_str)
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            ParkReason::ALL.len(),
+            "every park reason must contribute a DISTINCT metric label"
+        );
+    }
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+
+    fn slot(endpoint: DhanEndpointType, pool_index: u8) -> ConnectionSlot {
+        ConnectionSlot {
+            endpoint,
+            pool_index,
+            global_index: endpoint.jitter_base().saturating_add(pool_index),
+        }
+    }
+
+    fn sup(endpoint: DhanEndpointType, pool_index: u8, now: Instant) -> ConnectionSupervisor {
+        ConnectionSupervisor::new(slot(endpoint, pool_index), now)
+    }
+
+    fn instruments(n: usize) -> Vec<SubscribeInstrument> {
+        (0..n)
+            .map(|i| SubscribeInstrument {
+                security_id: SecurityId::try_from(i).unwrap_or(SecurityId::MAX),
+                segment: ExchangeSegment::NseFno,
+            })
+            .collect()
+    }
+
+    // -- disconnect classification (WS-GAP-01) ------------------------------
+
+    #[test]
+    fn test_classify_disconnect_805_is_pool_overflow_not_a_retry() {
+        // The single most consequential classification in this module: Dhan
+        // kills the OLDEST socket per extra connection, so retrying 805 kills
+        // a healthy sibling per attempt instead of recovering this one.
+        assert_eq!(
+            classify_disconnect(Some(DisconnectCode::ExceededActiveConnections)),
+            DisconnectClass::PoolOverflow
+        );
+    }
+
+    #[test]
+    fn test_classify_disconnect_token_codes_are_token_stale() {
+        for code in [
+            DisconnectCode::AccessTokenExpired,
+            DisconnectCode::AccessTokenInvalid,
+        ] {
+            assert_eq!(
+                classify_disconnect(Some(code)),
+                DisconnectClass::TokenStale,
+                "{code:?} must demand a fresh token before re-dialing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_disconnect_credential_and_entitlement_errors_are_fatal() {
+        for code in [
+            DisconnectCode::DataApiSubscriptionRequired,
+            DisconnectCode::AuthenticationFailed,
+            DisconnectCode::ClientIdInvalid,
+        ] {
+            assert_eq!(
+                classify_disconnect(Some(code)),
+                DisconnectClass::Fatal,
+                "{code:?} never self-heals — retrying it is a storm with no upside"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_disconnect_absent_and_unknown_codes_are_transient() {
+        // Fail-safe direction: retry politely rather than park a healthy pool
+        // on a code we simply have not seen before.
+        assert_eq!(classify_disconnect(None), DisconnectClass::Transient);
+        assert_eq!(
+            classify_disconnect(Some(DisconnectCode::Unknown(4242))),
+            DisconnectClass::Transient
+        );
+        assert_eq!(
+            classify_disconnect(Some(DisconnectCode::InternalServerError)),
+            DisconnectClass::Transient
+        );
+    }
+
+    /// 804 must NOT ride the reconnect ladder (2026-08-14 regression pin).
+    ///
+    /// "Requested number of instruments exceeds limit" is a REQUEST error
+    /// wearing a transport-code costume. Retrying it re-sends the identical
+    /// over-limit subscribe set that was just rejected, forever, every 30s at
+    /// the ladder's cap — nothing about the request changes between attempts,
+    /// so nothing in that loop can ever succeed.
+    ///
+    /// It is also self-amplifying in the worst direction: a permanent
+    /// connect/subscribe/reject cycle is exactly the traffic 805 calls "too
+    /// many requests", whose documented consequence is the USER being blocked.
+    /// So retrying one account-level rejection can earn another.
+    #[test]
+    fn test_classify_disconnect_804_is_fatal_not_an_infinite_retry() {
+        assert_eq!(
+            classify_disconnect(Some(DisconnectCode::InstrumentsExceedLimit)),
+            DisconnectClass::Fatal,
+            "804 (instruments exceed limit) must PARK, not retry. Transient here means \
+             re-sending the same rejected subscribe set every 30s forever."
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn prop_classify_disconnect_is_total_over_every_u16(raw in any::<u16>()) {
+            // Annexure rule: never panic on an unknown code.
+            let _ = classify_disconnect(Some(DisconnectCode::from_u16(raw)));
+        }
+    }
+
+    // -- phase + label vocabulary ------------------------------------------
+
+    #[test]
+    fn test_conn_phase_watchdog_eligibility_excludes_backoff_and_parked() {
+        // Arming the watchdog during a deliberate backoff sleep would make a
+        // 30s ladder rung self-cancel at 27s.
+        assert!(ConnPhase::Dialing.is_watchdog_eligible());
+        assert!(ConnPhase::Subscribing.is_watchdog_eligible());
+        assert!(ConnPhase::Live.is_watchdog_eligible());
+        assert!(!ConnPhase::Idle.is_watchdog_eligible());
+        assert!(!ConnPhase::Backoff.is_watchdog_eligible());
+        assert!(!ConnPhase::Parked.is_watchdog_eligible());
+    }
+
+    #[test]
+    fn test_label_strings_are_unique_within_each_vocabulary() {
+        let phases: BTreeSet<&str> = [
+            ConnPhase::Idle,
+            ConnPhase::Dialing,
+            ConnPhase::Subscribing,
+            ConnPhase::Live,
+            ConnPhase::Backoff,
+            ConnPhase::Parked,
+        ]
+        .iter()
+        .map(|p| p.as_str())
+        .collect();
+        assert_eq!(phases.len(), 6, "phase labels must not collide in metrics");
+
+        let parks: BTreeSet<&str> = [
+            ParkReason::PoolOverflow,
+            ParkReason::FatalDisconnect,
+            ParkReason::Shutdown,
+        ]
+        .iter()
+        .map(|p| p.as_str())
+        .collect();
+        assert_eq!(parks.len(), 3);
+
+        let reasons: BTreeSet<&str> = [
+            ReconnectReason::DialFailed,
+            ReconnectReason::SubscribeFailed,
+            ReconnectReason::Disconnected,
+            ReconnectReason::TokenStale,
+            ReconnectReason::IdleSilence,
+        ]
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+        assert_eq!(reasons.len(), 5);
+    }
+
+    // -- the state machine --------------------------------------------------
+
+    #[test]
+    fn test_supervisor_begins_idle_and_first_dial_is_instant_for_slot_zero() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        assert_eq!(s.phase(), ConnPhase::Idle);
+        assert_eq!(s.attempt(), 0);
+        assert_eq!(s.park_reason(), None);
+
+        assert_eq!(
+            s.on_event(ConnEvent::BeginDial, now),
+            SupervisorAction::Dial
+        );
+        assert_eq!(s.phase(), ConnPhase::Dialing);
+
+        // First failure re-dials at the ladder's instant rung. global_index 0
+        // takes zero stagger, so at least one connection keeps the exact
+        // historical "instant first attempt" behaviour.
+        assert_eq!(
+            s.on_event(ConnEvent::DialFailed, now),
+            SupervisorAction::SleepThenDial { delay_ms: 0 }
+        );
+        assert_eq!(s.phase(), ConnPhase::Backoff);
+        assert_eq!(s.attempt(), 1);
+    }
+
+    #[test]
+    fn test_supervisor_ladder_advances_on_repeated_dial_failure() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            let _ = s.on_event(ConnEvent::BeginDial, now);
+            match s.on_event(ConnEvent::DialFailed, now) {
+                SupervisorAction::SleepThenDial { delay_ms } => seen.push(delay_ms),
+                other => panic!("expected SleepThenDial, got {other:?}"),
+            }
+        }
+        // Slot 0 has zero jitter, so these are the bare ladder rungs.
+        assert_eq!(seen, vec![0, 1_000, 2_000, 5_000, 15_000, 30_000, 30_000]);
+    }
+
+    #[test]
+    fn test_supervisor_attempt_resets_on_first_frame_not_on_a_successful_dial() {
+        // A socket that connects and subscribes but never delivers anything is
+        // NOT healthy. Resetting on dial would let it re-dial instantly for
+        // ever; resetting on the first frame makes the ladder bite.
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        for _ in 0..3 {
+            let _ = s.on_event(ConnEvent::BeginDial, now);
+            let _ = s.on_event(ConnEvent::DialFailed, now);
+        }
+        assert_eq!(s.attempt(), 3);
+
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        assert_eq!(
+            s.on_event(ConnEvent::DialSucceeded, now),
+            SupervisorAction::Subscribe
+        );
+        assert_eq!(s.attempt(), 3, "a successful dial alone proves nothing");
+
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+        assert_eq!(
+            s.attempt(),
+            3,
+            "a successful subscribe alone proves nothing"
+        );
+
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+        assert_eq!(s.attempt(), 0, "the first frame is the health proof");
+        assert_eq!(s.frames_received(), 1);
+    }
+
+    #[test]
+    fn test_supervisor_805_parks_permanently_and_never_dials_again() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 2, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+
+        assert_eq!(
+            s.on_event(
+                ConnEvent::Disconnected {
+                    code: Some(DisconnectCode::ExceededActiveConnections)
+                },
+                now
+            ),
+            SupervisorAction::Park {
+                reason: ParkReason::PoolOverflow
+            }
+        );
+        assert_eq!(s.phase(), ConnPhase::Parked);
+        assert_eq!(s.park_reason(), Some(ParkReason::PoolOverflow));
+
+        // The critical property: nothing can talk it back into dialing.
+        for ev in [
+            ConnEvent::BeginDial,
+            ConnEvent::DialSucceeded,
+            ConnEvent::FrameReceived,
+            ConnEvent::IdleElapsed,
+            ConnEvent::Disconnected { code: None },
+        ] {
+            assert_eq!(
+                s.on_event(ev, now),
+                SupervisorAction::Continue,
+                "a parked 805 connection must never be re-dialed by {ev:?}"
+            );
+            assert_eq!(s.phase(), ConnPhase::Parked);
+        }
+    }
+
+    #[test]
+    fn test_supervisor_fatal_disconnect_parks() {
+        let now = t0();
+        for code in [
+            DisconnectCode::AuthenticationFailed,
+            DisconnectCode::ClientIdInvalid,
+            DisconnectCode::DataApiSubscriptionRequired,
+        ] {
+            let mut s = sup(DhanEndpointType::Depth20, 1, now);
+            let _ = s.on_event(ConnEvent::BeginDial, now);
+            assert_eq!(
+                s.on_event(ConnEvent::Disconnected { code: Some(code) }, now),
+                SupervisorAction::Park {
+                    reason: ParkReason::FatalDisconnect
+                },
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_supervisor_token_stale_demands_a_refresh_and_floors_the_delay() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+
+        // Attempt 0's bare ladder rung is 0ms; a stale token must NOT be
+        // re-presented instantly — that is a 16-way rejection storm.
+        match s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::AccessTokenExpired),
+            },
+            now,
+        ) {
+            SupervisorAction::RefreshTokenThenDial { delay_ms } => {
+                assert_eq!(delay_ms, TOKEN_STALE_REDIAL_FLOOR_MS);
+                assert!(delay_ms > reconnect_delay_ms(0));
+            }
+            other => panic!("expected RefreshTokenThenDial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_supervisor_token_stale_floor_never_shortens_a_longer_ladder_rung() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        for _ in 0..6 {
+            let _ = s.on_event(ConnEvent::BeginDial, now);
+            let _ = s.on_event(ConnEvent::DialFailed, now);
+        }
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        match s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::AccessTokenInvalid),
+            },
+            now,
+        ) {
+            SupervisorAction::RefreshTokenThenDial { delay_ms } => {
+                assert_eq!(delay_ms, 30_000, "the floor is a floor, not a clamp");
+            }
+            other => panic!("expected RefreshTokenThenDial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_supervisor_idle_timeout_reconnects_before_dhan_would_close() {
+        use super::super::idle_watchdog::{
+            DHAN_SERVER_CLOSE_AFTER_SILENCE_SECS, IDLE_RECONNECT_TIMEOUT_SECS,
+        };
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+
+        // One second before the threshold: still quiet, still fine.
+        assert_eq!(
+            s.poll(now + Duration::from_secs(IDLE_RECONNECT_TIMEOUT_SECS - 1)),
+            SupervisorAction::Continue
+        );
+        // At the threshold: we tear down on OUR terms.
+        let at = now + Duration::from_secs(IDLE_RECONNECT_TIMEOUT_SECS);
+        assert!(matches!(s.poll(at), SupervisorAction::SleepThenDial { .. }));
+        assert_eq!(s.phase(), ConnPhase::Backoff);
+        assert!(
+            IDLE_RECONNECT_TIMEOUT_SECS < DHAN_SERVER_CLOSE_AFTER_SILENCE_SECS,
+            "we must always act before Dhan's documented server-side close"
+        );
+    }
+
+    #[test]
+    fn test_supervisor_idle_watchdog_is_disarmed_during_backoff() {
+        // Otherwise a 30s ladder rung would be cancelled by the 27s watchdog
+        // and the ladder could never reach its cap.
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialFailed, now);
+        assert_eq!(s.phase(), ConnPhase::Backoff);
+        assert_eq!(
+            s.poll(now + Duration::from_secs(600)),
+            SupervisorAction::Continue
+        );
+        assert_eq!(s.phase(), ConnPhase::Backoff);
+    }
+
+    #[test]
+    fn test_supervisor_frame_arriving_before_our_subscribe_ack_promotes_to_live() {
+        // Dhan pushes the prev-close packet on subscribe, so a frame can beat
+        // our own batch-completion bookkeeping.
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        assert_eq!(s.phase(), ConnPhase::Subscribing);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+        assert_eq!(s.phase(), ConnPhase::Live);
+    }
+
+    #[test]
+    fn test_supervisor_subscribe_failure_tears_the_socket_down() {
+        // A connected-but-blind socket is worse than no socket: it consumes a
+        // pool slot and delivers nothing.
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        assert!(matches!(
+            s.on_event(ConnEvent::SubscribeFailed, now),
+            SupervisorAction::SleepThenDial { .. }
+        ));
+        assert_eq!(s.phase(), ConnPhase::Backoff);
+    }
+
+    #[test]
+    fn test_supervisor_shutdown_parks_with_the_shutdown_reason() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 3, now);
+        assert_eq!(
+            s.on_event(ConnEvent::ShutdownRequested, now),
+            SupervisorAction::Park {
+                reason: ParkReason::Shutdown
+            }
+        );
+        assert_eq!(s.park_reason(), Some(ParkReason::Shutdown));
+    }
+
+    #[test]
+    fn test_supervisor_connection_state_projection_covers_every_phase() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        assert_eq!(s.connection_state(), ConnectionState::Disconnected);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        assert_eq!(s.connection_state(), ConnectionState::Connecting);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        assert_eq!(s.connection_state(), ConnectionState::Connected);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+        assert_eq!(s.connection_state(), ConnectionState::Connected);
+        let _ = s.on_event(ConnEvent::Disconnected { code: None }, now);
+        assert_eq!(s.connection_state(), ConnectionState::Reconnecting);
+        assert_eq!(s.reconnects(), 1);
+        let _ = s.on_event(ConnEvent::ShutdownRequested, now);
+        assert_eq!(s.connection_state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn test_supervisor_slot_is_reported_verbatim() {
+        let now = t0();
+        let s = sup(DhanEndpointType::Depth20, 4, now);
+        assert_eq!(s.slot().endpoint, DhanEndpointType::Depth20);
+        assert_eq!(s.slot().pool_index, 4);
+        assert_eq!(
+            s.slot().global_index,
+            DhanEndpointType::Depth20.jitter_base() + 4
+        );
+    }
+
+    // -- thundering-herd guard ---------------------------------------------
+
+    #[test]
+    fn test_all_sixteen_simultaneous_drops_receive_distinct_delays() {
+        // The scenario the design calls out: every socket drops in the same
+        // instant. If they all redialled together we would hand Dhan sixteen
+        // handshakes plus sixteen subscribe bursts inside one scheduler tick.
+        let now = t0();
+        let mut delays = Vec::new();
+        for endpoint in DhanEndpointType::ALL {
+            for pool_index in 0..endpoint.max_connections() {
+                let mut s = sup(endpoint, pool_index, now);
+                let _ = s.on_event(ConnEvent::BeginDial, now);
+                let _ = s.on_event(ConnEvent::DialSucceeded, now);
+                let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+                match s.on_event(ConnEvent::Disconnected { code: None }, now) {
+                    SupervisorAction::SleepThenDial { delay_ms } => delays.push(delay_ms),
+                    other => panic!("expected SleepThenDial, got {other:?}"),
+                }
+            }
+        }
+        assert_eq!(delays.len(), 16, "the authorized ceiling is 16 connections");
+        let unique: BTreeSet<u64> = delays.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            16,
+            "every one of the sixteen must get its own delay: {delays:?}"
+        );
+        // And the spread stays negligible against the reconnect path itself.
+        let spread =
+            delays.iter().max().copied().unwrap_or(0) - delays.iter().min().copied().unwrap_or(0);
+        assert_eq!(spread, 15 * RECONNECT_JITTER_STEP_MS);
+    }
+
+    #[test]
+    fn test_token_expiry_drops_all_sixteen_and_they_still_receive_distinct_delays() {
+        // The test above uses `code: None` — a Transient disconnect, which
+        // never touches the token-stale floor. So it proved the jitter works
+        // on the ONE path where sixteen sockets do NOT reliably drop together,
+        // and proved nothing about the path where they always do.
+        //
+        // Token expiry (807) is the real simultaneous-drop event: one JWT
+        // backs all sixteen sockets, so when it dies Dhan closes all sixteen
+        // inside the same second. That arm floors the delay at 5,000 ms, and
+        // until 2026-08-11 it floored the ALREADY-JITTERED value — every
+        // jittered delay on ladder rungs 0/1/2 is below 5,000, so `max`
+        // flattened all sixteen onto exactly 5,000 ms. Sixteen simultaneous
+        // wakeups, sixteen token renewals, sixteen handshakes, in one tick.
+        //
+        // This test fails on that code and passes on the fix.
+        let now = t0();
+        let mut delays = Vec::new();
+        for endpoint in DhanEndpointType::ALL {
+            for pool_index in 0..endpoint.max_connections() {
+                let mut s = sup(endpoint, pool_index, now);
+                let _ = s.on_event(ConnEvent::BeginDial, now);
+                let _ = s.on_event(ConnEvent::DialSucceeded, now);
+                let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+                match s.on_event(
+                    ConnEvent::Disconnected {
+                        code: Some(DisconnectCode::AccessTokenExpired),
+                    },
+                    now,
+                ) {
+                    SupervisorAction::RefreshTokenThenDial { delay_ms } => delays.push(delay_ms),
+                    other => panic!("807 must refresh the token then dial, got {other:?}"),
+                }
+            }
+        }
+
+        assert_eq!(delays.len(), 16, "the authorized ceiling is 16 connections");
+        let unique: BTreeSet<u64> = delays.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            16,
+            "a token expiry drops ALL sixteen at once — each must still wake at its own \
+             instant, or we hand Dhan sixteen simultaneous renewals: {delays:?}"
+        );
+
+        // Every one still respects the floor: the point of the fix is to keep
+        // the floor AND the fan-out, not to trade one for the other.
+        for d in &delays {
+            assert!(
+                *d >= TOKEN_STALE_REDIAL_FLOOR_MS,
+                "a token-stale redial must never be shorter than the floor: {d}"
+            );
+        }
+        // Index 0 gets zero stagger, so the minimum is exactly the floor.
+        assert_eq!(
+            delays.iter().min().copied().unwrap_or(0),
+            TOKEN_STALE_REDIAL_FLOOR_MS
+        );
+        assert_eq!(
+            delays.iter().max().copied().unwrap_or(0),
+            TOKEN_STALE_REDIAL_FLOOR_MS + 15 * RECONNECT_JITTER_STEP_MS
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn prop_on_event_is_total_and_delays_stay_bounded(
+            endpoint_idx in 0usize..4,
+            pool_index in 0u8..5,
+            events in prop::collection::vec(0u8..9, 1..60),
+        ) {
+            let now = Instant::now();
+            let endpoint = DhanEndpointType::ALL[endpoint_idx];
+            let mut s = ConnectionSupervisor::new(
+                ConnectionSlot {
+                    endpoint,
+                    pool_index,
+                    global_index: endpoint.jitter_base().saturating_add(pool_index),
+                },
+                now,
+            );
+            for e in events {
+                let event = match e {
+                    0 => ConnEvent::BeginDial,
+                    1 => ConnEvent::DialSucceeded,
+                    2 => ConnEvent::DialFailed,
+                    3 => ConnEvent::SubscribeAcked,
+                    4 => ConnEvent::SubscribeFailed,
+                    5 => ConnEvent::FrameReceived,
+                    6 => ConnEvent::Disconnected { code: None },
+                    7 => ConnEvent::IdleElapsed,
+                    _ => ConnEvent::Disconnected {
+                        code: Some(DisconnectCode::InternalServerError),
+                    },
+                };
+                match s.on_event(event, now) {
+                    SupervisorAction::SleepThenDial { delay_ms } => {
+                        prop_assert!(delay_ms <= RECONNECT_DELAY_WITH_JITTER_MAX_MS);
+                    }
+                    SupervisorAction::RefreshTokenThenDial { delay_ms } => {
+                        prop_assert!(
+                            delay_ms
+                                <= RECONNECT_DELAY_WITH_JITTER_MAX_MS
+                                    .max(TOKEN_STALE_REDIAL_FLOOR_MS)
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // -- subscribe guard ----------------------------------------------------
+
+    #[test]
+    fn test_subscribe_guard_try_new_refuses_a_set_above_the_per_connection_cap() {
+        let over = usize::try_from(DhanEndpointType::Depth20.max_instruments_per_connection() + 1)
+            .unwrap_or(usize::MAX);
+        let err = SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(over))
+            .expect_err("51 instruments on a 50-cap depth-20 connection must be refused");
+        assert!(matches!(
+            err,
+            SubscribeGuardRefusal::TooManyInstruments { max: 50, .. }
+        ));
+    }
+
+    #[test]
+    fn test_subscribe_guard_accepts_exactly_the_cap() {
+        let at_cap = usize::try_from(DhanEndpointType::MainFeed.max_instruments_per_connection())
+            .unwrap_or(usize::MAX);
+        let g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(at_cap))
+            .expect("5,000 instruments is exactly the documented main-feed cap");
+        assert_eq!(g.len(), 5_000);
+        assert!(!g.is_empty());
+        assert_eq!(g.endpoint(), DhanEndpointType::MainFeed);
+    }
+
+    #[test]
+    fn test_subscribe_guard_batches_and_batch_count_respect_the_per_message_cap() {
+        // Main feed: 100 per message (15-live-market-feed.md:50).
+        let g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("250 is inside the 5,000 cap");
+        let batches: Vec<usize> = g.batches().map(<[SubscribeInstrument]>::len).collect();
+        assert_eq!(batches, vec![100, 100, 50]);
+        assert_eq!(g.batch_count(), 3);
+
+        // Depth-20 explicitly permits all 50 in one message.
+        let d = SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(50))
+            .expect("50 is the depth-20 cap");
+        assert_eq!(d.batch_count(), 1);
+    }
+
+    #[test]
+    fn test_subscribe_guard_batches_cover_every_instrument_exactly_once() {
+        let g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(1_003))
+            .expect("inside cap");
+        let seen: Vec<SecurityId> = g
+            .batches()
+            .flat_map(|b| b.iter().map(|i| i.security_id))
+            .collect();
+        assert_eq!(
+            seen.len(),
+            1_003,
+            "no instrument may be dropped by batching"
+        );
+        let unique: BTreeSet<SecurityId> = seen.iter().copied().collect();
+        assert_eq!(unique.len(), 1_003, "no instrument may be duplicated");
+    }
+
+    #[test]
+    fn test_subscribe_guard_mark_lost_then_mark_confirmed_survives_reconnect() {
+        // The whole point: a reconnect REPLAYS the set, it does not rebuild it.
+        let g0 = instruments(120);
+        let mut g =
+            SubscribeGuard::try_new(DhanEndpointType::MainFeed, g0.clone()).expect("inside cap");
+        assert!(g.needs_resubscribe());
+        g.mark_confirmed();
+        assert!(g.is_confirmed());
+        assert_eq!(g.generation(), 1);
+
+        g.mark_lost();
+        assert!(
+            g.needs_resubscribe(),
+            "a lost socket must force a resubscribe"
+        );
+        let replayed: Vec<SubscribeInstrument> =
+            g.batches().flat_map(|b| b.iter().copied()).collect();
+        assert_eq!(
+            replayed, g0,
+            "the set must survive the socket byte for byte"
+        );
+
+        g.mark_confirmed();
+        assert_eq!(
+            g.generation(),
+            2,
+            "each incarnation gets its own generation"
+        );
+    }
+
+    #[test]
+    fn test_subscribe_guard_depth_200_is_one_instrument_per_connection() {
+        assert!(
+            SubscribeGuard::try_new(DhanEndpointType::Depth200, instruments(1)).is_ok(),
+            "200-level depth is one instrument per connection"
+        );
+        assert!(
+            SubscribeGuard::try_new(DhanEndpointType::Depth200, instruments(2)).is_err(),
+            "two instruments on a depth-200 connection must be refused locally"
+        );
+    }
+
+    #[test]
+    fn test_subscribe_guard_zero_cap_endpoint_does_not_panic_on_batching() {
+        // order-update reports a zero per-message cap and carries no
+        // instruments; `chunks(0)` would panic, so the batcher floors at 1.
+        let g = SubscribeGuard::try_new(DhanEndpointType::OrderUpdate, Vec::new())
+            .expect("an empty set is always admissible");
+        assert!(g.is_empty());
+        assert_eq!(g.batch_count(), 0);
+    }
+
+    // -- frame sink: THE ONE RULE ------------------------------------------
+
+    /// Recording sink used to prove ordering and to prove the drain loop does
+    /// nothing else per frame.
+    #[derive(Default)]
+    struct RecordingSink {
+        accepted: Mutex<Vec<Bytes>>,
+    }
+
+    impl FrameSink for RecordingSink {
+        fn accept(&self, frame: Bytes) -> FrameSinkOutcome {
+            if let Ok(mut g) = self.accepted.lock() {
+                g.push(frame);
+            }
+            FrameSinkOutcome::Captured
+        }
+    }
+
+    fn wal_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("tv-poolsup-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn test_wal_ring_sink_captures_durably_then_publishes() {
+        let dir = wal_dir("capture");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+
+        let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::Captured);
+        let published = rx.try_recv().expect("a captured frame must be published");
+        assert_eq!(published.bytes, frame);
+        assert!(
+            published.seq > 0,
+            "the published frame must carry the sequence minted at the read \
+             instant — a zero would mean nothing stamped it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_ring_sink_stamps_a_distinct_ascending_seq_per_frame() {
+        // Two arrivals of BYTE-IDENTICAL content must still receive distinct
+        // sequences, or the DEDUP key would collapse them and the second tick
+        // would be silently lost. This is the live index-loss class recorded in
+        // data-integrity.md (23,146.45 → .75 → .45 on a volume-0 index).
+        let dir = wal_dir("seqascend");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let sink = WalRingSink::new(
+            spill,
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+
+        let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::Captured);
+        assert_eq!(sink.accept(frame), FrameSinkOutcome::Captured);
+
+        let first = rx.try_recv().expect("first frame published");
+        let second = rx.try_recv().expect("second frame published");
+        assert!(
+            second.seq > first.seq,
+            "identical content must still get a strictly greater sequence: \
+             {} then {}",
+            first.seq,
+            second.seq
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_ring_sink_full_ring_is_lag_not_capture_loss() {
+        // A full ring must NOT stop the reader: stopping costs the pong and
+        // turns downstream lag into a disconnect. The frame is already durable.
+        let dir = wal_dir("ringfull");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+        let sink = WalRingSink::new(
+            spill,
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"first")),
+            FrameSinkOutcome::Captured
+        );
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"second")),
+            FrameSinkOutcome::RingFull,
+            "a full ring is a lag signal, never silent capture loss"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- ring byte budget ---------------------------------------------------
+
+    #[test]
+    fn test_ring_byte_budget_cap_reports_the_configured_ceiling() {
+        // `cap()` is what the lane's boot line reports as `ring_max_bytes`.
+        // It exists so the operator sees the queue's size in the unit that
+        // actually runs out — reporting only the 65,536 frame count is how a
+        // 16 GiB ceiling hid behind a number that looks modest.
+        let b = RingByteBudget::new(256 * 1024 * 1024);
+        assert_eq!(b.cap(), 256 * 1024 * 1024);
+        assert_eq!(b.resident(), 0, "a fresh budget holds nothing");
+        assert!(b.try_reserve(1_000));
+        assert_eq!(
+            b.cap(),
+            256 * 1024 * 1024,
+            "cap is the CEILING and must not move as frames come and go — only \
+             resident() tracks occupancy"
+        );
+    }
+
+    #[test]
+    fn test_try_reserve_never_exceeds_the_cap() {
+        let b = RingByteBudget::new(100);
+        assert!(b.try_reserve(60));
+        assert_eq!(b.resident(), 60);
+        assert!(b.try_reserve(40), "exactly filling the cap must be allowed");
+        assert_eq!(b.resident(), 100);
+        assert!(!b.try_reserve(1), "one byte past the cap must be refused");
+        assert_eq!(
+            b.resident(),
+            100,
+            "a REFUSED reserve must not move the counter — a fetch_add-then-check \
+             would have left the overshoot behind, which is the bound failing to bound"
+        );
+    }
+
+    #[test]
+    fn test_try_reserve_refuses_a_frame_larger_than_the_whole_cap() {
+        let b = RingByteBudget::new(1_024);
+        assert!(
+            !b.try_reserve(4_096),
+            "a frame bigger than the entire budget cannot be admitted — admitting it \
+             would mean the budget does not bound"
+        );
+        assert_eq!(b.resident(), 0);
+        // And the budget is still usable afterwards: one oversized frame must
+        // not poison it for the frames that follow.
+        assert!(b.try_reserve(512));
+        assert_eq!(b.resident(), 512);
+    }
+
+    #[test]
+    fn test_ring_byte_budget_release_saturates_and_never_wraps() {
+        let b = RingByteBudget::new(1_000);
+        assert!(b.try_reserve(100));
+        // Over-release: a bookkeeping bug, deliberately made harmless. Wrapping
+        // to usize::MAX here would refuse every subsequent frame forever —
+        // turning a counting error into a total feed outage.
+        b.release(10_000);
+        assert_eq!(b.resident(), 0, "release must saturate at zero, not wrap");
+        assert!(
+            b.try_reserve(1_000),
+            "the budget must still admit frames after an over-release"
+        );
+    }
+
+    #[test]
+    fn test_wal_ring_sink_returns_the_reservation_when_the_count_bound_refuses() {
+        // The leak this pins: the byte reserve is taken BEFORE `try_send`, so a
+        // frame refused by the COUNT bound has a reservation nothing downstream
+        // will ever release. Without the release on that path the budget
+        // ratchets down on every count-full frame until it refuses everything —
+        // a slow strangulation that would present as the feed dying for no
+        // visible reason, long after the burst that caused it.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-ring-budget-leak-{}-{}",
+            std::process::id(),
+            next_frame_seq()
+        ));
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        // Capacity 1: the second frame is refused by COUNT, not by bytes.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+        let budget = std::sync::Arc::new(RingByteBudget::new(1_000_000));
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"0123456789")),
+            FrameSinkOutcome::Captured
+        );
+        assert_eq!(budget.resident(), 10);
+
+        for _ in 0..50 {
+            assert_eq!(
+                sink.accept(Bytes::from_static(b"0123456789")),
+                FrameSinkOutcome::RingFull
+            );
+        }
+        assert_eq!(
+            budget.resident(),
+            10,
+            "only the ONE frame actually sitting in the ring may hold a reservation; \
+             50 count-refused frames must each have given theirs back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_ring_sink_refuses_on_the_byte_bound_before_the_count_bound() {
+        // The whole point of the second bound: a ring with plenty of SLOTS free
+        // still refuses when those slots would hold too many BYTES.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-ring-budget-bytes-{}-{}",
+            std::process::id(),
+            next_frame_seq()
+        ));
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        // 64 slots, but only 25 bytes of budget: the count bound cannot bind.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(64);
+        let budget = std::sync::Arc::new(RingByteBudget::new(25));
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                sink.accept(Bytes::from_static(b"0123456789")),
+                FrameSinkOutcome::Captured
+            );
+        }
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"0123456789")),
+            FrameSinkOutcome::RingFull,
+            "20 of 25 bytes are resident and 62 slots are free — the BYTE bound must \
+             refuse the third frame, which is the bound the count alone never gave"
+        );
+
+        // Draining releases, and the sink accepts again — proving this is
+        // backpressure, not a latch.
+        let taken = rx.try_recv().expect("a captured frame must be published");
+        budget.release(taken.bytes.len());
+        assert_eq!(
+            sink.accept(Bytes::from_static(b"0123456789")),
+            FrameSinkOutcome::Captured,
+            "releasing on drain must re-open the budget"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- pool supervisor ----------------------------------------------------
+
+    #[test]
+    fn test_pool_supervisor_admits_exactly_the_authorized_sixteen() {
+        let now = t0();
+        let mut pool = PoolSupervisor::new();
+        assert!(pool.is_empty());
+        let mut admitted = 0usize;
+        for endpoint in DhanEndpointType::ALL {
+            for _ in 0..endpoint.max_connections() {
+                assert!(pool.admit(endpoint, now).is_ok());
+                admitted += 1;
+            }
+            // The sixth of any five-cap type is refused.
+            if endpoint.max_connections() == 5 {
+                assert!(pool.admit(endpoint, now).is_err());
+            }
+        }
+        assert_eq!(admitted, 16);
+        assert_eq!(pool.len(), 16);
+        assert_eq!(pool.total_open(), 16);
+        assert_eq!(pool.open_count(DhanEndpointType::MainFeed), 5);
+        assert_eq!(pool.open_count(DhanEndpointType::OrderUpdate), 1);
+    }
+
+    #[test]
+    fn test_pool_supervisor_refuses_the_sixth_main_feed_before_dialing() {
+        // Fail-closed: fifteen connections and a loud refusal beats sixteen
+        // and a silently murdered pool member.
+        let now = t0();
+        let mut pool = PoolSupervisor::new();
+        for _ in 0..5 {
+            assert!(pool.admit(DhanEndpointType::MainFeed, now).is_ok());
+        }
+        let refusal = pool
+            .admit(DhanEndpointType::MainFeed, now)
+            .expect_err("the sixth main-feed socket must be refused locally");
+        assert_eq!(refusal.endpoint(), DhanEndpointType::MainFeed);
+        assert_eq!(pool.len(), 5, "a refusal must register nothing");
+    }
+
+    #[test]
+    fn test_pool_supervisor_poll_all_returns_only_the_expired_connections() {
+        let now = t0();
+        let mut pool = PoolSupervisor::new();
+        for _ in 0..3 {
+            let _ = pool.admit(DhanEndpointType::MainFeed, now);
+        }
+        // Drive two of them live; leave the third idle (never dialed).
+        for gi in [0u8, 1] {
+            if let Some(c) = pool.connection_mut(gi) {
+                let _ = c.on_event(ConnEvent::BeginDial, now);
+                let _ = c.on_event(ConnEvent::DialSucceeded, now);
+                let _ = c.on_event(ConnEvent::SubscribeAcked, now);
+            }
+        }
+        assert!(pool.poll_all(now).is_empty(), "nothing is idle yet");
+
+        let later = now + Duration::from_secs(60);
+        let due = pool.poll_all(later);
+        assert_eq!(due.len(), 2, "only the two live connections time out");
+        for (s, a) in &due {
+            assert_eq!(s.endpoint, DhanEndpointType::MainFeed);
+            assert!(matches!(a, SupervisorAction::SleepThenDial { .. }));
+        }
+        assert_eq!(pool.connections().len(), 3);
+    }
+
+    #[test]
+    fn test_pool_supervisor_retire_frees_the_budget_slot() {
+        let now = t0();
+        let mut pool = PoolSupervisor::default();
+        let mut slots = Vec::new();
+        for _ in 0..5 {
+            if let Ok(s) = pool.admit(DhanEndpointType::MainFeed, now) {
+                slots.push(s);
+            }
+        }
+        assert!(pool.admit(DhanEndpointType::MainFeed, now).is_err());
+        if let Some(&s) = slots.first() {
+            pool.retire(s);
+        }
+        assert_eq!(pool.len(), 4);
+        assert!(
+            pool.admit(DhanEndpointType::MainFeed, now).is_ok(),
+            "retiring a parked connection must return its slot to the budget"
+        );
+    }
+
+    #[test]
+    fn test_pool_supervisor_connection_mut_addresses_by_global_index() {
+        let now = t0();
+        let mut pool = PoolSupervisor::new();
+        let _ = pool.admit(DhanEndpointType::MainFeed, now);
+        let _ = pool.admit(DhanEndpointType::Depth200, now);
+        let depth_gi = DhanEndpointType::Depth200.jitter_base();
+        assert_eq!(
+            pool.connection_mut(depth_gi).map(|c| c.slot().endpoint),
+            Some(DhanEndpointType::Depth200)
+        );
+        assert!(pool.connection_mut(200).is_none());
+    }
+
+    // -- the async shell ----------------------------------------------------
+
+    #[derive(Default)]
+    struct FakeState {
+        connect_results: VecDeque<bool>,
+        subscribe_results: VecDeque<bool>,
+        recv_events: VecDeque<SocketEvent>,
+        connects: usize,
+        subscribes: usize,
+        closes: usize,
+    }
+
+    struct FakeSocket {
+        state: std::sync::Arc<Mutex<FakeState>>,
+    }
+
+    impl DhanFeedSocket for FakeSocket {
+        fn connect(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+            let state = std::sync::Arc::clone(&self.state);
+            async move {
+                let ok = match state.lock() {
+                    Ok(mut s) => {
+                        s.connects += 1;
+                        s.connect_results.pop_front().unwrap_or(true)
+                    }
+                    Err(_) => true,
+                };
+                if ok { Ok(()) } else { Err(SocketFailure) }
+            }
+        }
+
+        fn send_subscribe(
+            &mut self,
+            _batch: &[SubscribeInstrument],
+        ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+            let state = std::sync::Arc::clone(&self.state);
+            async move {
+                let ok = match state.lock() {
+                    Ok(mut s) => {
+                        s.subscribes += 1;
+                        s.subscribe_results.pop_front().unwrap_or(true)
+                    }
+                    Err(_) => true,
+                };
+                if ok { Ok(()) } else { Err(SocketFailure) }
+            }
+        }
+
+        fn recv(&mut self) -> impl std::future::Future<Output = SocketEvent> + Send {
+            let state = std::sync::Arc::clone(&self.state);
+            async move {
+                match state.lock() {
+                    Ok(mut s) => s.recv_events.pop_front().unwrap_or(
+                        // Terminator: a fatal code parks the loop, so an
+                        // exhausted script ends the test instead of hanging.
+                        SocketEvent::Closed {
+                            code: Some(DisconnectCode::AuthenticationFailed),
+                        },
+                    ),
+                    Err(_) => SocketEvent::Closed {
+                        code: Some(DisconnectCode::AuthenticationFailed),
+                    },
+                }
+            }
+        }
+
+        fn close(&mut self) -> impl std::future::Future<Output = ()> + Send {
+            let state = std::sync::Arc::clone(&self.state);
+            async move {
+                if let Ok(mut s) = state.lock() {
+                    s.closes += 1;
+                }
+            }
+        }
+    }
+
+    fn fake(state: &std::sync::Arc<Mutex<FakeState>>) -> FakeSocket {
+        FakeSocket {
+            state: std::sync::Arc::clone(state),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_dials_subscribes_and_drains_every_frame() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![
+                SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+                SocketEvent::Frame(Bytes::from_static(b"bbbbbbbb")),
+                SocketEvent::Frame(Bytes::from_static(b"cccccccc")),
+            ]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let seen = sink.accepted.lock().map(|g| g.len()).unwrap_or(0);
+        assert_eq!(seen, 3, "every frame must reach the sink exactly once");
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1);
+        assert_eq!(s.subscribes, 3, "250 instruments = three 100-cap messages");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_parks_on_805_without_ever_redialing() {
+        // The safety property that protects sibling sockets.
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![SocketEvent::Closed {
+                code: Some(DisconnectCode::ExceededActiveConnections),
+            }]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            sink,
+            || async {},
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::PoolOverflow));
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 1,
+            "805 must never be retried — a retry kills a healthy sibling"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_retries_a_failed_dial_then_succeeds() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            connect_results: VecDeque::from(vec![false, false, true]),
+            recv_events: VecDeque::from(vec![SocketEvent::Frame(Bytes::from_static(b"tick"))]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 3, "two failures then a success");
+        assert_eq!(sink.accepted.lock().map(|g| g.len()).unwrap_or(0), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_refreshes_the_token_before_redialing_on_807() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![SocketEvent::Closed {
+                code: Some(DisconnectCode::AccessTokenExpired),
+            }]),
+            ..FakeState::default()
+        }));
+        let refreshes = std::sync::Arc::new(AtomicUsize::new(0));
+        let r = std::sync::Arc::clone(&refreshes);
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            sink,
+            move || {
+                let r = std::sync::Arc::clone(&r);
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        assert_eq!(
+            refreshes.load(Ordering::SeqCst),
+            1,
+            "a stale token must be replaced before the socket is re-dialed"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 2,
+            "one original dial plus one post-refresh dial"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_tears_down_when_a_subscribe_batch_fails() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            subscribe_results: VecDeque::from(vec![true, false]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(150))
+            .expect("inside cap");
+
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            sink,
+            || async {},
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let s = st.lock().expect("fake state");
+        assert!(s.closes >= 1, "a blind socket must be closed, not kept");
+        assert!(s.connects >= 2, "and re-dialed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_exits_immediately_on_an_already_parked_supervisor() {
+        // Regression guard: the `Continue` arm must not spin on a supervisor
+        // that absorbs every event.
+        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(1))
+            .expect("inside cap");
+        let mut s = sup(DhanEndpointType::MainFeed, 0, t0());
+        let _ = s.on_event(ConnEvent::ShutdownRequested, t0());
+
+        let exit = run_connection(fake(&st), s, guard, sink, || async {}).await;
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
+        assert_eq!(
+            st.lock().map(|g| g.connects).unwrap_or(usize::MAX),
+            0,
+            "a parked supervisor must never dial"
+        );
+    }
+
+    // -- structural proofs --------------------------------------------------
+
+    #[test]
+    fn test_pool_supervisor_source_never_reads_the_wall_clock() {
+        // An NTP step must be unable to expire all sixteen sockets at once.
+        let src = include_str!("pool_supervisor.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production_half = src.split(test_marker).next().unwrap_or(src);
+        assert!(production_half.contains("Instant"), "sanity");
+        for needle in [
+            concat!("System", "Time"),
+            concat!("Utc", "::now"),
+            concat!("chr", "ono"),
+            concat!("UNIX_", "EPOCH"),
+            concat!("Local", "::now"),
+        ] {
+            assert!(
+                !production_half.contains(needle),
+                "pool supervisor production code must never touch the wall clock, \
+                 found `{needle}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_drain_loop_body_does_nothing_but_capture_and_watchdog() {
+        // THE ONE RULE, as a build-failing structural assertion. If a future
+        // change adds parsing, a database write, or a lock to the per-frame
+        // path, this fails before it can cost us the pong.
+        let src = include_str!("pool_supervisor.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production_half = src.split(test_marker).next().unwrap_or(src);
+        let drain_body = production_half
+            .split("async fn drain<S, K>")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            drain_body.contains("sink.accept(frame)"),
+            "sanity: the drain body must still be the real one"
+        );
+        for banned in [
+            concat!("dispatch_", "frame"),
+            concat!("parse_", "depth"),
+            concat!("consume_", "tick"),
+            concat!(".lock", "()"),
+            concat!("questdb", ""),
+            concat!("write_", "row"),
+        ] {
+            assert!(
+                !drain_body.contains(banned),
+                "the drain loop must do nothing but append+push per frame; found `{banned}`. \
+                 Dhan's automatic pong is only emitted while the read loop is polling, so \
+                 work here does not merely lag — it gets the socket disconnected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_frame_sink_trait_is_not_async_so_a_future_impl_cannot_await() {
+        // The signature IS the enforcement: an `async fn accept` would let a
+        // future implementation await inside the read loop.
+        let src = include_str!("pool_supervisor.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production_half = src.split(test_marker).next().unwrap_or(src);
+        let trait_body = production_half
+            .split("pub trait FrameSink")
+            .nth(1)
+            .unwrap_or("")
+            .split("}\n")
+            .next()
+            .unwrap_or("");
+        assert!(trait_body.contains("fn accept"), "sanity");
+        assert!(
+            !trait_body.contains("async") && !trait_body.contains("Future"),
+            "FrameSink::accept must stay synchronous"
+        );
+    }
+}

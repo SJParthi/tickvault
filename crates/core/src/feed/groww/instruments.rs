@@ -147,6 +147,26 @@ pub struct GrowwWatchSet {
 /// counts so the operator alert names the exact problem.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchBuildError {
+    /// Two DISTINCT Groww index symbols derived the SAME `security_id`.
+    ///
+    /// `stable_index_security_id` truncates an FNV-1a hash to 62 bits, so it is
+    /// NOT injective — its doc previously asserted "distinct symbols -> distinct
+    /// ids", which is false for any truncated hash. Without this check a
+    /// collision was SILENT and permanent: every Groww persisted key is
+    /// `(ts, security_id, exchange_segment, feed)`, so one index's minute bar
+    /// would UPSERT the other's, indistinguishably from normal data.
+    ///
+    /// Fail-closed by design, matching the contract the TrueData scope lock
+    /// (§9.5) already specifies for its own derivation — "a derivation collision
+    /// FAILS CLOSED" — which was specified but never built for Groww.
+    IndexSecurityIdCollision {
+        /// First symbol (sorted, so the message is deterministic).
+        symbol_a: String,
+        /// Second symbol that derived the same id.
+        symbol_b: String,
+        /// The colliding derived id.
+        security_id: i64,
+    },
     /// Groww master CSV had no usable rows / no header.
     GrowwMasterEmpty,
     /// A mandatory Groww CSV column is missing (header drift) — fail-closed (§26).
@@ -368,6 +388,12 @@ const INDEX_SECURITY_ID_BIT: i64 = 1 << 62;
 /// lane's ticks/candles for these indices (cross-source joins work by
 /// construction). Any consumer deriving a Groww index id MUST call this —
 /// never re-implement the hash.
+///
+/// NOT INJECTIVE. Truncating a 64-bit hash to 62 bits cannot guarantee distinct
+/// symbols produce distinct ids — an earlier version of this comment claimed it
+/// did. Callers mapping a SET of symbols must therefore check for collisions;
+/// `extract_index_entries` does exactly that and fails closed via
+/// `WatchBuildError::IndexSecurityIdCollision`.
 #[must_use]
 pub fn stable_index_security_id(groww_symbol: &str) -> i64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -377,7 +403,7 @@ pub fn stable_index_security_id(groww_symbol: &str) -> i64 {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    // Keep the low 62 bits of the hash (distinct symbols → distinct ids) and set
+    // Keep the low 62 bits of the hash and set
     // bit 62 → range [2^62, 2^63): positive, and disjoint from stock tokens.
     ((hash & 0x3fff_ffff_ffff_ffff) as i64) | INDEX_SECURITY_ID_BIT
 }
@@ -388,8 +414,12 @@ pub fn stable_index_security_id(groww_symbol: &str) -> i64 {
 /// the Groww `exchange_token` (a NAME for NSE, the numeric `"1"` for BSE SENSEX),
 /// while the stored `security_id` is the Groww-native stable id derived from the
 /// `groww_symbol`. Deterministic order (token asc), deduped by token.
-#[must_use]
-fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
+//
+// The `#[must_use]` that sat here was removed 2026-08-11: `Result` is already
+// `#[must_use]`, so the attribute added nothing and tripped
+// `clippy::double_must_use`. It was latent until the CI clippy step was armed
+// with `-D warnings` in the same PR — the first thing that arming caught.
+fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Result<Vec<WatchEntry>, WatchBuildError> {
     let mut entries: Vec<WatchEntry> = rows
         .iter()
         .filter(|r| {
@@ -420,7 +450,33 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
         .collect();
     entries.sort_by(|a, b| a.exchange_token.cmp(&b.exchange_token));
     entries.dedup_by(|a, b| a.exchange_token == b.exchange_token);
-    entries
+
+    // 2026-08-10 FAIL-CLOSED COLLISION CHECK. `stable_index_security_id` is a
+    // truncated (62-bit) hash and therefore NOT injective. A collision here is
+    // permanent, invisible data loss — one index's minute bar UPSERTs the
+    // other's under the shared `(ts, security_id, exchange_segment, feed)` key —
+    // so it must stop the build rather than be discovered later in the data.
+    //
+    // O(n) over a handful of indices, on the daily cold-path build.
+    let mut seen: HashMap<i64, String> = HashMap::with_capacity(entries.len());
+    for e in &entries {
+        let symbol = e.index_name.clone().unwrap_or_default();
+        if let Some(prev) = seen.insert(e.security_id, symbol.clone())
+            && prev != symbol
+        {
+            let (symbol_a, symbol_b) = if prev <= symbol {
+                (prev, symbol)
+            } else {
+                (symbol, prev)
+            };
+            return Err(WatchBuildError::IndexSecurityIdCollision {
+                symbol_a,
+                symbol_b,
+                security_id: e.security_id,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 /// §36 (2026-07-08) / §36.7 (2026-07-10): extracts ALL monthly-expiry
@@ -1013,7 +1069,7 @@ fn build_groww_watch_from_csvs(
             "groww watch: excluded ambiguous ISINs (>1 token) — not guessed"
         );
     }
-    let index_entries = extract_index_entries(&rows);
+    let index_entries = extract_index_entries(&rows)?;
     // FIX C (2026-06-28): audit Groww vs Dhan index coverage. Emit ONE boot
     // line naming the Dhan-tracked indices that Groww's master does not carry
     // as an IDX row, so the genuine Groww limitation is VISIBLE, never silently
@@ -1548,7 +1604,7 @@ mod tests {
         );
         let rows = parse_groww_master(&csv).unwrap();
         let (map, ambiguous) = build_isin_token_map(&rows);
-        assert!(map.get("INE002A01018").is_none(), "ambiguous ISIN excluded");
+        assert!(!map.contains_key("INE002A01018"), "ambiguous ISIN excluded");
         assert_eq!(ambiguous, vec!["INE002A01018".to_string()]);
     }
 
@@ -1561,7 +1617,7 @@ mod tests {
             eq_row("2885", "INE002A01018")
         );
         let rows = parse_groww_master(&csv).unwrap();
-        let idx = extract_index_entries(&rows);
+        let idx = extract_index_entries(&rows).expect("no id collision in fixture");
         assert_eq!(idx.len(), 2);
         assert_eq!(idx[0].exchange_token, "BANKNIFTY"); // sorted asc
         assert_eq!(idx[0].kind, WatchKind::IndexValue);
@@ -1578,7 +1634,7 @@ mod tests {
             "BSE,99,BANKEX,BSE-BANKEX,,IDX,CASH,,,,,,,,,,0,0,0,BANKEX,0"
         );
         let rows = parse_groww_master(&csv).unwrap();
-        let idx = extract_index_entries(&rows);
+        let idx = extract_index_entries(&rows).expect("no id collision in fixture");
         assert_eq!(
             idx.len(),
             2,
@@ -1659,7 +1715,7 @@ mod tests {
         // master-row `index_name`, and carry no ISIN/symbol_name.
         let csv = format!("{HEADER}\n{}", idx_row("NIFTY"));
         let rows = parse_groww_master(&csv).unwrap();
-        let entries = extract_index_entries(&rows);
+        let entries = extract_index_entries(&rows).expect("no id collision in fixture");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].index_name.as_deref(), Some("NSE-NIFTY"));
         assert_eq!(entries[0].isin, None);
@@ -1673,7 +1729,7 @@ mod tests {
         // `symbol_name` so the coverage audit can canonicalize it.
         let csv = format!("{HEADER}\n{}", idx_row_named("NIFTYAUTO", "NIFTY Auto"));
         let rows = parse_groww_master(&csv).unwrap();
-        let entries = extract_index_entries(&rows);
+        let entries = extract_index_entries(&rows).expect("no id collision in fixture");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].exchange_token, "NIFTYAUTO");
         assert_eq!(entries[0].symbol_name.as_deref(), Some("NIFTY Auto"));
@@ -2062,7 +2118,7 @@ mod tests {
         csv.push('\n');
 
         let rows = parse_groww_master(&csv).unwrap();
-        let index_entries = extract_index_entries(&rows);
+        let index_entries = extract_index_entries(&rows).expect("no id collision in fixture");
 
         // No resolved index was dropped: every NSE name we put in resolves back.
         let resolved_canon: std::collections::HashSet<String> = index_entries
@@ -2139,7 +2195,7 @@ mod tests {
         csv.push('\n');
 
         let rows = parse_groww_master(&csv).unwrap();
-        let index_entries = extract_index_entries(&rows);
+        let index_entries = extract_index_entries(&rows).expect("no id collision in fixture");
 
         let absent = groww_indices_absent_vs_dhan(&index_entries);
         let absent_set: std::collections::HashSet<String> = absent
@@ -2177,7 +2233,7 @@ mod tests {
         }
         csv.push('\n');
         let rows = parse_groww_master(&csv).unwrap();
-        let index_entries = extract_index_entries(&rows);
+        let index_entries = extract_index_entries(&rows).expect("no id collision in fixture");
         let absent = groww_indices_absent_vs_dhan(&index_entries);
         assert!(
             absent.is_empty(),

@@ -379,6 +379,138 @@ locals {
       ok_recovery = false # 2026-07-14: once-per-day emitter - the day stays chain-less when the datapoint ages out; recovery = the next trading-day boot's clean warmup
       desc        = "CHAIN-04 warmup FAILED: the day-start option-chain expirylist warmup exhausted its bounded retries - the chain pipeline is DOWN FOR THE DAY (expiry dates are never guessed; no mid-day retry by design). Triage: cross-check DH-901 + the WS feed (the REST canary was retired 2026-07-14); a healthy REST surface with only the expirylist failing points at the option-chain API specifically. Restart the app once the REST surface is healthy to re-run the warmup, else tomorrow's boot re-warms. NO recovered/OK page: the day stays down when the datapoint ages out. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
     }
+    # =====================================================================
+    # 2026-08-11 — CRITICAL-SEVERITY PAGING GAP (+4 entries -> 15 filters +
+    # 15 alarms, ~+$0.40/mo; see aws-budget.md COST NOTE 2026-08-11).
+    #
+    # THE GAP: a Severity::Critical code that reaches NO human surface is a
+    # silent failure by definition. A mechanical sweep of all 167 ErrorCode
+    # variants found 29 Critical; only 4 of them had an entry in this map
+    # (dh-901, auth-gap-04, proc-01, aggregator-drop-01). Of the remaining
+    # 25, fourteen have NO error!-level emit site at all (dead enum entries
+    # — listed for retirement, NEVER alarmed here: a filter with no possible
+    # emit site is a dead filter per error_code_paging_filter_drift_guard.rs
+    # — the ws-reinject-01 / tick-conserve-01 precedent), and eleven have a
+    # real emit. Of those eleven, four already reach a human through a typed
+    # NotificationEvent dispatch at the emit site (ORPHAN-POSITION-01 ->
+    # OrphanPositionDetected, RESILIENCE-01 -> DualInstanceDetected,
+    # RESILIENCE-03 -> AuthenticationFailed, OMS-GAP-03 ->
+    # CircuitBreakerOpened per dhan-rest-only-noise-lock §2a) and are NOT
+    # duplicated here on cost discipline; three are BLOCKED pending a dated
+    # operator quote (AUTH-GAP-01 / DATA-805 are Dhan-scoped, and
+    # dhan-rest-only-noise-lock-2026-07-14.md §3 REJECTs any new Dhan-scoped
+    # page outside its 4-item family; GROWW-OCO-02 is compiled out by the
+    # non-default `groww_orders` cargo feature — Gate 2 of the §39 lattice —
+    # so an alarm for it would be dormant-by-construction). The FOUR below
+    # are the genuinely silent, genuinely reachable, genuinely unblocked
+    # remainder. Ratchet: crates/storage/tests/
+    # critical_errcode_alarm_coverage_guard.rs re-derives this whole
+    # classification on every build and FAILS if a Critical code with a real
+    # emit site is neither alarmed nor allowlisted.
+    # =====================================================================
+    # BOOT-02: the QuestDB boot-probe deadline (Severity Critical — boot
+    # BLOCKS). This entry also repairs a documented FALSE-OK: the
+    # wal-suspend-01 desc above tells the operator "a merely-DOWN QuestDB
+    # never fires it — BOOT-01/02 own that page", but BOOT-02 owned no page
+    # at all until this entry existed. ok_recovery = false: boot-blocking is
+    # terminal for that boot — the process does not proceed, so the auto-OK
+    # ~15 min after the datapoint ages out can only mean the app stopped
+    # emitting (it exited), never "QuestDB came back" (Rule-11
+    # false-recovery; the proc-01 precedent).
+    "boot-02" = {
+      pattern     = "{ $.code = \"BOOT-02\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-08-11: boot-blocking terminal event - the auto-OK ~15 min later means the app stopped emitting (it exited), never that QuestDB recovered (Rule-11 false-recovery; proc-01 precedent)
+      desc        = "BOOT-02: the QuestDB boot probe exceeded its deadline - BOOT IS BLOCKED and the app is NOT running (no REST legs, no persistence, no cadence). Triage: docker ps / QuestDB container health, df -h /data, QuestDB logs; the app self-restarts under systemd once QuestDB answers. NO recovered/OK page: the auto-OK only means the process stopped emitting - confirm the app is actually UP (health endpoint + tv_boot_completed) before treating it as recovery. Runbook: docs/error-runbooks/wave-2-error-codes.md"
+    }
+    # BOOT-03: clock skew beyond the boot tolerance (Severity Critical). A
+    # skewed clock silently corrupts EVERY IST timestamp the system writes -
+    # candle bucket boundaries, dedup keys, the SEBI audit trail - so it is
+    # a data-integrity event, not a nuisance. ok_recovery = false: same
+    # boot-blocking terminal shape as boot-02.
+    "boot-03" = {
+      pattern     = "{ $.code = \"BOOT-03\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-08-11: boot-blocking terminal event - same shape as boot-02; the auto-OK means emissions stopped, not that the clock was corrected
+      desc        = "BOOT-03: host CLOCK SKEW exceeded the boot tolerance - every IST timestamp this host writes would be wrong (candle bucket boundaries, dedup keys, the SEBI audit trail), so boot is BLOCKED rather than writing corrupt history. Triage: timedatectl / chrony-ntp sync status on the box, then restart the app. NO recovered/OK page: confirm the clock is actually synced before treating the auto-OK as recovery. Runbook: docs/error-runbooks/wave-2-c-error-codes.md"
+    }
+    # OMS-GAP-06: the dry-run/paper order runtime task DIED and was
+    # respawned with a FRESH paper book (Severity Critical). Per the emit
+    # site's own honesty note, PAPER positions + day P&L are in-RAM only and
+    # are SILENTLY ZEROED by the respawn - nothing replays in the
+    # socket-free shape. Order-execution family, NOT a Dhan REST page:
+    # dhan-rest-only-noise-lock-2026-07-14.md §2a states the order-execution
+    # family is a separate landed family outside the §2 4-item Dhan set, so
+    # this entry does not touch that lock. ok_recovery = false: a discrete
+    # book-loss event - the zeroed paper positions do not come back when the
+    # datapoint ages out (the aggregator-drop-01 precedent).
+    "oms-gap-06" = {
+      pattern     = "{ $.code = \"OMS-GAP-06\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-08-11: discrete book-loss event - the silently-zeroed paper positions + day P&L do not come back when the episode ages out (Rule-11 false-recovery; aggregator-drop-01 precedent)
+      desc        = "OMS-GAP-06: the dry-run order runtime task DIED and respawned with a FRESH paper book - paper positions and day P&L are in-RAM only and were SILENTLY ZEROED (nothing replays in the socket-free shape). Any P&L or position number read after this point is measured from zero, not from the real session. Triage: read the reason + consecutive_abnormal_exits fields in the errors-jsonl stream; repeated respawns mean a real defect in the runtime, not a blip. NO recovered/OK page: the lost book does not return when the episode ages out. Runbook: .claude/rules/project/order-runtime-dryrun.md"
+    }
+    # WS-SPILL-02: a raw WS frame was DROPPED at the capture-at-receipt WAL
+    # because the writer was dead at the append instant (Severity Critical).
+    # This is the durable floor's own failure - the frame is gone BEFORE
+    # parse/broadcast, so no downstream tier can recover it. Exactly the
+    # silent-data-loss class that earned aggregator-drop-01 its alarm on
+    # 2026-07-09 (that one is the sealed-candle side; this is the raw-frame
+    # side). ok_recovery = false: permanent loss.
+    # WS-SPILL-01: the WAL spill WRITER hit an I/O error - it could not open
+    # a segment, or a write_record failed (Severity High). 2026-08-12: added
+    # after noticing WS-SPILL-02 was alarmed and its SIBLING was not, which
+    # left the more common disk failure mode unpaged.
+    #
+    # Why this matters as much as -02: `WsFrameSpill::append` returns
+    # `Spilled` the instant a record enters the crossbeam channel, and the
+    # disk write happens LATER on the writer thread. So when the disk is
+    # full or the WAL dir is unwritable, every caller keeps being told the
+    # frame was durably captured while `persist_record_resilient` quietly
+    # returns 0 and moves on (deliberately - it must not kill the writer
+    # thread). The capture-at-receipt durable floor is GONE and nothing
+    # upstream can tell. This alarm is the only thing that says so.
+    #
+    # Distinct from -02 by cause, not by severity of consequence: -02 is
+    # "the channel was full at the append instant" (frame never entered the
+    # WAL); -01 is "the frame entered the WAL and the disk refused it".
+    # Both end with the raw frame absent from the durable chain.
+    #
+    # eval = 3 x 300s deliberately matches -02: a single transient I/O blip
+    # self-heals on the next record (the writer reopens the segment), and
+    # this file's own convention is that a real failure sustains. A flapping
+    # writer is the documented "disk dying" signal.
+    #
+    # ok_recovery = false: while the writer is down, the frames that arrived
+    # are not written anywhere retroactively. The disk recovering does not
+    # bring them back, so an OK page would read as "we got the data back".
+    "ws-spill-01" = {
+      pattern     = "{ $.code = \"WS-SPILL-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-08-12: the frames that arrived while the writer was down were never written - a recovering disk does not restore them (Rule-11 false-recovery; ws-spill-02 precedent)
+      desc        = "WS-SPILL-01: the capture-at-receipt WAL writer hit a disk I/O error and could not persist frames (could not open a segment, or a record write failed). The writer thread deliberately stays alive and retries, so the app looks healthy and append() still reports frames as spilled - but the durable floor is NOT holding while this fires. Triage: df -h on the data volume FIRST (disk full is the usual cause), then ls -la data/spill/ for permissions/mount, then dmesg for device errors. Read the stage field in errors-jsonl to tell open_segment / no_segment / write_record apart. NO recovered/OK page: frames that arrived during the outage were never written and do not come back. Runbook: docs/error-runbooks/ws-frame-spill-error-codes.md"
+    }
+    "ws-spill-02" = {
+      pattern     = "{ $.code = \"WS-SPILL-02\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-08-11: discrete PERMANENT data loss - the dropped raw frames are gone from the durable chain and do not come back when the episode ages out (Rule-11 false-recovery; aggregator-drop-01 precedent)
+      desc        = "WS-SPILL-02: a raw WebSocket frame was DROPPED at the capture-at-receipt WAL (the spill writer was dead at the append instant) - the frame is lost BEFORE parse and broadcast, so no downstream tier can recover it. This is the raw-frame twin of AGGREGATOR-DROP-01 (sealed candles) and is the durable floor's own failure mode. Triage: df -h /data, ls -la data/spill/, host + container health; if the host is healthy and the dirs writable, restart the app. NO recovered/OK page: the loss is permanent - the auto-OK only means the episode aged out. Runbook: docs/error-runbooks/ws-frame-spill-error-codes.md"
+    }
   }
 }
 

@@ -89,9 +89,29 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 
 | Demand | Honest envelope (the truth) | Per-item proof |
 |---|---|---|
-| Zero data loss | Bounded zero loss inside chaos envelope: 200,000-seal ring buffer capacity (`SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ *(2026-07-18: the tick rescue ring + its capacity constant were deleted with the dead tick writer — the seal chain is the live absorption tier)* | item must not introduce new seal-drop path |
+| Zero data loss | Bounded zero loss inside chaos envelope: the derived seal-ring capacity `AGGREGATOR_MAX_SLOTS × TF_COUNT` (600,000 at TF_COUNT=24) (`SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ *(2026-07-18: the tick rescue ring + its capacity constant were deleted with the dead tick writer — the seal chain is the live absorption tier)* | item must not introduce new seal-drop path |
 | WS never disconnects | SEBI 24h JWT forces ≥1 reconnect/day BY LAW. DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close. | item must not break `SubscribeRxGuard` or pool watchdog |
-| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns enqueue; tick-gap >30s coalesced Telegram; core_affinity Core 0 | item must not add hot-path allocation |
+| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns enqueue; tick-gap >30s coalesced Telegram; ~~core_affinity Core 0~~ **(CORRECTED 2026-08-10 — see note below)** | item must not add hot-path allocation |
+
+> **⚠ CORRECTION 2026-08-10 — the "core_affinity Core 0" cell above was FALSE and is
+> withdrawn.** A workspace audit found `core_affinity` declared in both the root
+> `Cargo.toml` and `crates/app/Cargo.toml` since Wave 5 (2026-05-01) with **ZERO call
+> sites in any `.rs` file** — the only occurrence in source was a comment. No thread was
+> ever pinned to any core. The dependency is REMOVED in the same change as this note, so
+> the matrix no longer advertises a guarantee that nothing implements.
+>
+> Two reasons it was removed rather than wired: (1) the live box is **t4g.medium, 2 vCPU**
+> — and "Core 0" is the worst available choice, because core 0 services network
+> interrupts, so pinning the decoder there puts it in direct contention with the softirq
+> work it depends on; (2) the tick decode thread **does not currently exist** (the Dhan
+> feed transport was deleted 2026-07-17 and is not rebuilt), so wiring a pin today would
+> pin a thread that processes nothing — making the claim technically true while delivering
+> nothing, which is the exact false-OK class rule 11 forbids.
+>
+> Re-introducing it requires a real call site in the SAME PR, enforced by
+> `crates/common/tests/core_affinity_claim_guard.rs`, plus a measurement showing the pin
+> helps on the instance class actually in use. Until then this row's other three
+> mechanisms (DHAT, Criterion, tick-gap) stand unchanged and remain enforced.
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal via `ALTER ADD COLUMN IF NOT EXISTS` | item must not break self-heal |
 | O(1) latency | `from_le_bytes` + `papaya` + `Arc<HashMap>` + SPSC bounded; bench-gate ≤5% regression on hot path | item adds Criterion bench if hot path |
 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS on every storage table | item DEDUP key includes segment |
@@ -140,7 +160,7 @@ When ANY PR body / commit message / Telegram message / docs writes "100% guarant
 
 > "100% inside the tested envelope, with ratcheted regression coverage:
 > ≤60s QuestDB outage absorbed by rescue→spill→DLQ;
-> ≤200,000-seal ring buffer capacity (constant `SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ;
+> the derived seal-ring capacity `AGGREGATOR_MAX_SLOTS × TF_COUNT` (600,000 at TF_COUNT=24 — never restate this as a literal: the docs said 200,000, then 525,000 at TF_COUNT=21, and TF_COUNT is now 24. Read the constant, do not quote a number) (constant `SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ;
 > bench-gated O(1) hot path;
 > composite-key uniqueness;
 > chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake.

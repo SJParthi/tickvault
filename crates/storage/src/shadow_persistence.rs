@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn test_candle_table_names_has_tf_count_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 21);
+        assert_eq!(TF_COUNT, 24);
     }
 
     #[test]
@@ -1060,6 +1060,12 @@ mod tests {
             "candles_14s",
             "candles_15s",
             "candles_30s",
+            // Appended 2026-08-10 with TfIndex::{M2, M30, M60} — the three
+            // frames of the operator's thirteen (Quote 13, 2026-08-08) that
+            // previously had no enum variant.
+            "candles_2m",
+            "candles_30m",
+            "candles_60m",
         ];
         assert_eq!(names, expected);
     }

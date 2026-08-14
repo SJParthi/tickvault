@@ -15,3 +15,44 @@ a = "audit"
 # NOTE: target-cpu=native is intentionally NOT set here.
 # It would make the binary non-portable (Mac build won't run on AWS x86_64).
 # Use --target flags explicitly when cross-compiling for production.
+
+# ---------------------------------------------------------------------------
+# ARM64 production target — CPU baseline (2026-08-14)
+# ---------------------------------------------------------------------------
+# The note above is about the DEFAULT profile and still stands: nothing here
+# changes a local or x86 build. This section is scoped to the one target the
+# deploy pipeline actually cross-compiles for
+# (`cargo build --release --target aarch64-unknown-linux-musl`, deploy-aws.yml),
+# so the portability concern that motivated the note does not apply to it.
+#
+# WHY THIS IS WORTH DOING: without a `target-cpu`, rustc emits generic
+# ARMv8.0-A. That baseline predates LSE (Large System Extensions) atomics, so
+# every atomic operation compiles to an LL/SC retry loop
+# (`ldaxr`/`stlxr`) instead of a single instruction. This codebase is unusually
+# atomic-dense on its hot path — the capture ring's byte budget, the frame
+# sequence mint, the per-drain counters, and arc-swap token reads are all
+# atomics executed per frame — so this is one of the few flags that actually
+# earns its place here rather than being cargo-cult tuning.
+#
+# WHY `neoverse-n1` AND NOT `neoverse-v2`: the live box is r8g.xlarge
+# (Graviton4 = Neoverse V2), and v2 would be the maximal choice. It is also
+# the WRONG one, because the instance can legitimately end up on Graviton2.
+# `.github/workflows/downsize-instance.yml` auto-rolls-back to t4g.medium when
+# AWS refuses capacity for the larger type, and that is not hypothetical — it
+# happened on 2026-08-07, when a t4g.large flip was refused with
+# `InsufficientInstanceCapacity` and the workflow rolled the box back. t4g is
+# Graviton2 (Neoverse N1), and a binary built for V2 would fault with an
+# illegal instruction on it: the rollback that exists to SAVE the box would
+# instead brick the app on arrival, at exactly the moment nobody is watching
+# closely.
+#
+# `neoverse-n1` is ARMv8.2-A with LSE, which every Graviton generation from 2
+# onward implements. It captures the atomics win — the part that matters for
+# this workload — and runs unmodified on Graviton2, 3 and 4. The remaining
+# delta to V2 is mostly wider SVE vectorisation, which this codebase does not
+# exercise: the tick decode is fixed-offset scalar loads, not numeric kernels.
+#
+# Raising this to `neoverse-v2` requires FIRST removing the Graviton2 rollback
+# path, not merely observing that the box is currently r8g.
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=neoverse-n1"]

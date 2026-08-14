@@ -35,7 +35,9 @@
 set -uo pipefail
 
 REPO_ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
-cd "$REPO_ROOT" || exit 0
+# 2026-08-10: fail CLOSED. `|| exit 0` reported success while having scanned
+# nothing — indistinguishable from a clean run.
+cd "$REPO_ROOT" || { echo "FATAL: cannot cd to $REPO_ROOT — refusing to pass vacuously" >&2; exit 1; }
 
 # Mode flags.
 JSON_OUTPUT=0

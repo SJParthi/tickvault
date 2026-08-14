@@ -20,7 +20,7 @@
 
 use std::hint::black_box;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -33,6 +33,7 @@ fn bench_mark_forward(c: &mut Criterion) {
         let forwarder = MarkForwarder {
             marks_wanted: Arc::new(AtomicBool::new(false)),
             tx,
+            dropped: Arc::new(AtomicU64::new(0)),
         };
         c.bench_function("order_gate/mark_forward_disarmed", |b| {
             let mut i: u32 = 0;
@@ -54,6 +55,7 @@ fn bench_mark_forward(c: &mut Criterion) {
         let forwarder = MarkForwarder {
             marks_wanted: Arc::new(AtomicBool::new(true)),
             tx,
+            dropped: Arc::new(AtomicU64::new(0)),
         };
         for i in 0..4_u32 {
             forwarder.mark_forward(u64::from(i), 0, 1.0);
@@ -79,6 +81,7 @@ fn bench_mark_forward(c: &mut Criterion) {
         let forwarder = MarkForwarder {
             marks_wanted: Arc::new(AtomicBool::new(true)),
             tx,
+            dropped: Arc::new(AtomicU64::new(0)),
         };
         c.bench_function("order_gate/mark_forward_armed_accept", |b| {
             let mut i: u32 = 0;

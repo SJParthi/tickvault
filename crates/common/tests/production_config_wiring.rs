@@ -81,17 +81,38 @@ fn test_production_rest_only_no_live_feeds() {
     // crates/app/src/dhan_rest_stack.rs. Phase A is a config flip +
     // additive bootstrap — flipping dhan_enabled back to true requires a
     // fresh dated operator quote HERE first.
-    let prod = std::fs::read_to_string(workspace_root().join("config").join("production.toml"))
-        .expect("production.toml must be readable"); // APPROVED: test
+    // 2026-08-11: comment lines are stripped before every needle below. These
+    // assertions were raw `contains` on the whole file, so the dated rationale
+    // comments this flip added — which necessarily quote BOTH `dhan_enabled =
+    // true` and `dhan_enabled = false` while explaining the change — would have
+    // satisfied and violated the pins at the same time. A guard that reads
+    // prose is a guard that can be talked out of its own assertion.
+    let strip_toml_comments = |src: &str| {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let prod = strip_toml_comments(
+        &std::fs::read_to_string(workspace_root().join("config").join("production.toml"))
+            .expect("production.toml must be readable"), // APPROVED: test
+    );
+    // INVERTED 2026-08-11 — see the same-dated inversion note in
+    // crates/app/tests/dhan_live_off_phase_a_guard.rs. The operator quote in
+    // websocket-connection-scope-lock.md ("2026-08-11 — THE DEFAULT IS FLIPPED
+    // ON") is the "fresh dated operator quote HERE first" the paragraph above
+    // demands. The pin is kept and reversed, not removed: OFF is now the state
+    // that must never land unnoticed, because it silently stops live capture
+    // while looking identical to a healthy REST-only boot.
     assert!(
-        prod.contains("dhan_enabled = false"),
-        "production.toml must DISABLE the Dhan live WS feed (operator \
-         directive 2026-07-13 — Dhan is REST-only; the WS lane is retired)"
+        prod.contains("dhan_enabled = true"),
+        "production.toml must ENABLE the Dhan live WS feed (operator quote \
+         2026-08-11, recorded in websocket-connection-scope-lock.md)"
     );
     assert!(
-        !prod.contains("dhan_enabled = true"),
-        "production.toml must NOT re-enable the Dhan live WS feed — that \
-         resurrects the retired lane (operator directive 2026-07-13)"
+        !prod.contains("dhan_enabled = false"),
+        "production.toml must NOT disable the Dhan live WS feed — reverting \
+         needs a fresh dated operator quote + this guard updated in the same PR"
     );
     assert!(
         prod.contains("groww_enabled = false"),
@@ -105,19 +126,46 @@ fn test_production_rest_only_no_live_feeds() {
          (operator directive 2026-07-15)"
     );
 
-    // base.toml carries the same Dhan-off default so a TV_ENVIRONMENT=dev/
-    // local boot (base-only merge) can never resurrect the retired lane.
-    let base = std::fs::read_to_string(workspace_root().join("config").join("base.toml"))
-        .expect("base.toml must be readable"); // APPROVED: test
-    assert!(
-        base.contains("dhan_enabled = false"),
-        "base.toml must DISABLE the Dhan live WS feed (operator directive \
-         2026-07-13 — Dhan is REST-only everywhere, not just in prod)"
+    // base.toml carries the same Dhan setting so a TV_ENVIRONMENT=dev/local
+    // boot (base-only merge) agrees with prod rather than diverging silently.
+    //
+    // INVERTED 2026-08-11 alongside the prod pin above. Note the second gate:
+    // `spawn_dhan_feed_stack` ALSO requires TICKVAULT_DHAN_LIVE_FEED=1, which
+    // is set only in deploy/systemd/tickvault.service — so base.toml saying
+    // `true` does NOT put sockets into a developer's `cargo run`.
+    let base = strip_toml_comments(
+        &std::fs::read_to_string(workspace_root().join("config").join("base.toml"))
+            .expect("base.toml must be readable"), // APPROVED: test
     );
     assert!(
-        !base.contains("dhan_enabled = true"),
-        "base.toml must NOT re-enable the Dhan live WS feed (operator \
-         directive 2026-07-13)"
+        base.contains("dhan_enabled = true"),
+        "base.toml must ENABLE the Dhan live WS feed (operator quote 2026-08-11)"
+    );
+    assert!(
+        !base.contains("dhan_enabled = false"),
+        "base.toml must NOT disable the Dhan live WS feed — reverting needs a \
+         fresh dated operator quote + this guard updated in the same PR"
+    );
+
+    // The second gate, pinned so the flip cannot be half-applied. A config
+    // saying `true` with no env opt-in on the box is a lane that reports
+    // enabled and opens nothing — the false-OK shape this repo's rule 11
+    // forbids, and the exact failure a config-only flip would produce.
+    let unit = std::fs::read_to_string(
+        workspace_root()
+            .join("deploy")
+            .join("systemd")
+            .join("tickvault.service"),
+    )
+    .expect("tickvault.service must be readable"); // APPROVED: test
+    assert!(
+        unit.lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .any(|l| l.trim() == "Environment=TICKVAULT_DHAN_LIVE_FEED=1"),
+        "deploy/systemd/tickvault.service must set \
+         Environment=TICKVAULT_DHAN_LIVE_FEED=1 — it is the SECOND of the two \
+         gates on the live lane, and without it `dhan_enabled = true` opens no \
+         socket at all while every config surface reports the feed as enabled"
     );
 }
 

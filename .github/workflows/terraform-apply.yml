@@ -225,7 +225,15 @@ jobs:
           set -euo pipefail
           ZIP_DIR="${{ env.TF_DIR }}/.lambda-zips"
           mkdir -p "${ZIP_DIR}"
-          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control"
+          # MUST stay in lockstep with the [[bin]] targets in
+          # crates/aws-lambdas/Cargo.toml. A bin declared there but absent
+          # here builds fine and is silently never zipped; terraform then
+          # fails at APPLY time -- i.e. AFTER real infrastructure has already
+          # changed. That is how the 2026-08-09 apply died: dhan-token-minter
+          # reached Cargo.toml + terraform but not this list, so the run
+          # rebuilt the EC2 box and then aborted red. Pinned by
+          # crates/common/tests/lambda_zip_bins_lockstep_guard.rs.
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control dhan-token-minter"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
           #
           # 2026-08-01 (operator directive — Rust-O(1)-only workspace): this
@@ -277,18 +285,15 @@ jobs:
       # an em-dash in main.tf's B4 ingress description hard-failed apply).
       # Guard: scan ingress/egress blocks in all .tf files for non-ASCII
       # description values. Variable/output/alarm descriptions are unaffected.
-      - name: ASCII-only SG rule descriptions
-        run: |
-          perl -ne '
-            $in = 1 if /^\s*(dynamic\s+")?(ingress|egress)"?\s*\{/;
-            if ($in) {
-              $d += () = /\{/g; $d -= () = /\}/g;
-              if (/^\s*description\s*=/ && /[^\x00-\x7F]/) { print "$ARGV:$.: non-ASCII in SG rule description: $_"; $bad = 1 }
-              if ($d <= 0) { $in = 0; $d = 0 }
-            }
-            close ARGV if eof;
-            END { exit($bad ? 1 : 0) }
-          ' ${{ env.TF_DIR }}/*.tf
+      # MOVED TO RUST 2026-08-10 — this step was a `perl -ne` program, the last
+      # live interpreter invocation in the repository, against the operator's
+      # standing Rust-only directive (rust-only-forever-lock-2026-07-19.md).
+      # The check now lives in
+      # crates/common/tests/sg_rule_description_ascii_guard.rs, which runs in
+      # `Test (common)` on EVERY PR through All Green — strictly broader
+      # coverage than this path-filtered workflow gave it. Re-adding an
+      # interpreter here needs a dated operator quote in that rule file; the
+      # Rust guard asserts this file stays perl-free.
 
       - name: terraform init (with S3 backend)
         run: |
@@ -428,7 +433,15 @@ jobs:
           set -euo pipefail
           ZIP_DIR="${{ env.TF_DIR }}/.lambda-zips"
           mkdir -p "${ZIP_DIR}"
-          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control"
+          # MUST stay in lockstep with the [[bin]] targets in
+          # crates/aws-lambdas/Cargo.toml. A bin declared there but absent
+          # here builds fine and is silently never zipped; terraform then
+          # fails at APPLY time -- i.e. AFTER real infrastructure has already
+          # changed. That is how the 2026-08-09 apply died: dhan-token-minter
+          # reached Cargo.toml + terraform but not this list, so the run
+          # rebuilt the EC2 box and then aborted red. Pinned by
+          # crates/common/tests/lambda_zip_bins_lockstep_guard.rs.
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control dhan-token-minter"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
           #
           # 2026-08-01 (operator directive — Rust-O(1)-only workspace): this

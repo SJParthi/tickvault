@@ -37,7 +37,11 @@ use tracing::{error, warn};
 use tickvault_common::config::QuestDbConfig;
 
 /// QuestDB table name — one row per fetched `(minute, index)`.
-pub const SPOT_1M_REST_TABLE: &str = "spot_1m_rest";
+pub const SPOT_1M_REST_TABLE: &str = "rest_spot_1m";
+
+/// The pre-2026-08-14 name. Retained ONLY so the boot migration can rename an
+/// existing populated table forward. Never write through this.
+pub const LEGACY_SPOT_1M_REST_TABLE: &str = "spot_1m_rest";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule);
 /// `exchange_segment` alongside `security_id` (I-P1-11); `feed` in-key
@@ -150,6 +154,42 @@ pub async fn ensure_spot_1m_rest_table(questdb_config: &QuestDbConfig) {
             return;
         }
     };
+    // RENAME-FIRST migration (2026-08-14, operator: REST tables must be
+    // prefix-identifiable). The legacy name is renamed BEFORE the CREATE, so
+    // an existing populated table carries its rows across instead of the
+    // CREATE minting an empty table beside it and splitting the history.
+    //
+    // Run SEPARATELY from the statement loop below, and deliberately so: the
+    // RENAME succeeds exactly once in the life of a deployment, and its
+    // failure is the steady state (target exists from the second boot onward;
+    // source absent on a fresh install). Inside the loop it fired a coded
+    // `error!` and incremented `tv_spot1m_persist_errors_total` on EVERY boot
+    // but one — into a counter that is EMF-published and charted on the
+    // operator dashboard. Never a DROP: these tables are SEBI-retained.
+    // The ONE refusal that is not routine: both tables present means the
+    // history is split and only an operator can decide how to merge it.
+    if crate::http_client::try_rename_legacy_table(
+        &client,
+        &base_url,
+        LEGACY_SPOT_1M_REST_TABLE,
+        SPOT_1M_REST_TABLE,
+    )
+    .await
+        == crate::http_client::LegacyRenameOutcome::Split
+    {
+        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "legacy_table_split")
+            .increment(1);
+        error!(
+            code = "SPOT1M-02",
+            stage = "legacy_table_split",
+            legacy_table = LEGACY_SPOT_1M_REST_TABLE,
+            current_table = SPOT_1M_REST_TABLE,
+            "SPOT1M-02: both the legacy and current spot_1m_rest tables exist — \
+             the history is SPLIT across two SEBI-retained tables. New rows land \
+             in the current name; everything written before the rename stays in \
+             the legacy one. Neither is dropped; merging is an operator decision"
+        );
+    }
     let mut statements = vec![spot_1m_rest_create_ddl()];
     // Per-column self-heal for tables created by earlier builds
     // (observability-architecture.md schema-self-heal pattern). QuestDB
@@ -504,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_spot_1m_rest_symbol_labels_stable() {
-        assert_eq!(SPOT_1M_REST_TABLE, "spot_1m_rest");
+        assert_eq!(SPOT_1M_REST_TABLE, "rest_spot_1m");
         assert_eq!(SPOT_1M_REST_FEED_DHAN, "dhan");
         assert_eq!(SPOT_1M_REST_SOURCE, "rest_intraday");
         assert_eq!(SPOT_1M_REST_SEGMENT_IDX_I, "IDX_I");

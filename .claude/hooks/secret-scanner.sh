@@ -76,6 +76,28 @@ scan_secret() {
       | grep -v 'fetch_ssm_secret' \
       | grep -v 'rotate_secret' \
       | grep -v '_SECRET: &str' \
+      `# 2026-08-10 SECURITY FIX (audit item 8). Everything ABOVE this line is` \
+      `# matched against the RAW line, because those exclusions are deliberately` \
+      `# comment-scoped ('// test', '/// ', '#[doc', '#[cfg(test)]') or are code` \
+      `# identifiers. Everything BELOW is a bare English word, and those were` \
+      `# being matched against the whole line too — so a REAL secret was excused` \
+      `# by a word in a trailing comment.` \
+      `#` \
+      `# PROVEN before the fix: access_token = "AAAA1111BBBB2222CCCC3333" was` \
+      `# CAUGHT bare, and reported CLEAN with '// stub for tests' appended. Same` \
+      `# secret, same file — one comment defeated the scanner, locally AND in the` \
+      `# CI lane that reuses this script.` \
+      `#` \
+      `# Genuine fixtures do NOT depend on these words: test paths are already` \
+      `# excluded wholesale above (/tests/, _test.rs, /test_, _tests.rs,` \
+      `# /benches/, /fixtures/), so this layer only ever governed PRODUCTION` \
+      `# files, where a real secret must never be excused by a comment.` \
+      `#` \
+      `# The strip is deliberately conservative: '//' is ignored when preceded by` \
+      `# ':' so URLs (https://...) are never truncated, and '#' only counts as a` \
+      `# comment when preceded by whitespace so URL fragments survive. Both` \
+      `# choices fail toward MORE detection, never less.` \
+      | sed -E 's@([^:])//.*$@\1@; s@[[:space:]]+#.*$@@' \
       | grep -v 'REDACTED' \
       | grep -v 'placeholder' \
       | grep -v 'example' \

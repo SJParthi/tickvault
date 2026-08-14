@@ -283,7 +283,16 @@ fi
 # ---- Step 10: Verify Observability Stack ----
 echo -e "${CYAN}[10/10]${NC} Verifying observability stack..."
 if [ -f "scripts/verify-stack.sh" ]; then
-    bash scripts/verify-stack.sh || true
+    # `|| true` alone would let a failed verification vanish under the
+    # "Bootstrap complete!" banner below. Bootstrap still must not ABORT on it
+    # (a dev box without the observability stack up is a normal state), so
+    # report it the way Step 9 reports test failures, rather than swallowing it.
+    if bash scripts/verify-stack.sh; then
+        echo -e "  ${GREEN}observability stack verified${NC}"
+    else
+        echo -e "  ${YELLOW}observability stack verification FAILED${NC}"
+        echo "  Bootstrap continued anyway. Run 'bash scripts/verify-stack.sh' for details."
+    fi
 else
     echo -e "  ${YELLOW}scripts/verify-stack.sh not found — skipping${NC}"
 fi

@@ -55,7 +55,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -164,6 +164,11 @@ pub struct MarkForwarder {
     pub marks_wanted: Arc<AtomicBool>,
     /// Bounded channel into the runtime's mark arm.
     pub tx: mpsc::Sender<MarkUpdate>,
+    /// Marks dropped because the channel was full, cumulative for the
+    /// process. Shared with the runtime so the reconcile heartbeat can
+    /// REPORT them — see [`MarkForwarder::mark_forward`] for why the
+    /// reporting lives there and not at the drop site.
+    pub dropped: Arc<AtomicU64>,
 }
 
 impl MarkForwarder {
@@ -187,6 +192,30 @@ impl MarkForwarder {
             .is_err()
         {
             metrics::counter!("tv_mark_forward_dropped_total").increment(1);
+            // Counted here, REPORTED from the reconcile heartbeat.
+            //
+            // Until 2026-08-12 this site had the counter and nothing else:
+            // no log line at any level, and no alarm on the metric. A
+            // dropped mark means the risk engine and the daily-loss halt
+            // are deciding on a stale price, so a path that can do that
+            // with no operator-visible trace is the false-OK class — and
+            // it was the only TRULY silent one left in the runtime.
+            //
+            // The obvious fix — log right here — is the wrong one. This
+            // function is `#[inline]` and hot-path-grade by contract, with
+            // a DHAT budget of <=1 KiB / <=8 blocks across 10,000 calls
+            // that drives THIS EXACT drop arm, plus a <=100ns Criterion
+            // budget. A `warn!` with fields allocates; even throttled to
+            // powers of two it would fire ~14 times inside that DHAT run
+            // and blow the block budget. Trading a proven zero-alloc
+            // guarantee for a log line is a bad trade when a cold path is
+            // already running that can carry the same information.
+            //
+            // So the hot path pays one Relaxed `fetch_add` (~1ns, no
+            // allocation, both budgets intact) and the reconcile heartbeat
+            // — which already wakes on a timer and already logs — reports
+            // the delta. Same visibility, no hot-path cost.
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -300,6 +329,11 @@ pub struct OrderRuntimeParams {
     pub mark_rx: mpsc::Receiver<MarkUpdate>,
     /// Shared arm flag (the hot-path gate half of the mark bridge).
     pub marks_wanted: Arc<AtomicBool>,
+    /// Shared drop counter from the mark tap. The hot path only increments
+    /// it; the reconcile heartbeat reads it and reports the delta, which is
+    /// what makes a dropped mark visible without putting a log line on a
+    /// DHAT-budgeted path.
+    pub marks_dropped: Arc<AtomicU64>,
     /// Live token handle (dry-run never uses it for HTTP; wired for parity
     /// with the future live path).
     pub token_handle: TokenHandle,
@@ -324,6 +358,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
             first_order_update_rx,
             mark_rx,
             marks_wanted,
+            marks_dropped,
             token_handle,
             client_id,
             auth_notify,
@@ -349,6 +384,7 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 notifier: Arc::clone(&notifier),
                 calendar: Arc::clone(&calendar),
                 marks_wanted: Arc::clone(&marks_wanted),
+                marks_dropped: Arc::clone(&marks_dropped),
                 token_handle: token_handle.clone(),
                 client_id: client_id.clone(),
                 auth_notify: Arc::clone(&auth_notify),
@@ -412,6 +448,9 @@ struct RuntimeCtx {
     notifier: Arc<NotificationService>,
     calendar: Arc<TradingCalendar>,
     marks_wanted: Arc<AtomicBool>,
+    /// Read-only view of the mark tap's drop counter (the tap owns the
+    /// increment side). Read once per reconcile heartbeat.
+    marks_dropped: Arc<AtomicU64>,
     token_handle: TokenHandle,
     client_id: String,
     auth_notify: Arc<Notify>,
@@ -1009,6 +1048,9 @@ async fn run_order_runtime(
         std::time::Instant::now() + Duration::from_secs(ORDER_RUNTIME_BOOT_RECONCILE_DELAY_SECS);
     let mut last_reset_epoch: i64 = i64::MIN;
     let mut last_close_sweep_day: i64 = i64::MIN;
+    // High-water mark of reported mark drops, so each heartbeat reports the
+    // DELTA rather than re-reporting a cumulative total forever.
+    let mut marks_dropped_reported: u64 = 0;
     // Fix F (2026-07-17 respawn flap): the mark producers are DAY-SCOPED —
     // the Groww per-minute REST legs' supervisors exit at day completion
     // ("day complete — supervisor exiting", ~15:31 IST after the
@@ -1178,6 +1220,12 @@ async fn run_order_runtime(
                         && ctx.calendar.is_trading_day_today()
                     {
                         run_reconcile_cycle(&mut oms, &risk, &book).await;
+                        // Rides the SAME market-hours + trading-day gate as
+                        // the reconcile (audit Rule 3): a drop outside the
+                        // session is not an operator signal, and reporting
+                        // one would be the evening-noise class the depth
+                        // rebalancer was fixed for.
+                        report_marks_dropped(&ctx.marks_dropped, &mut marks_dropped_reported);
                     }
                 }
 
@@ -1440,6 +1488,39 @@ fn republish_marks_wanted(
 
 /// Reconcile cycle: honest dry-run heartbeat + the REAL local invariant
 /// (F14); live mode (future) delegates to `oms.reconcile()`.
+/// Reports marks dropped since the previous heartbeat.
+///
+/// The mark tap can only count drops — it is `#[inline]`, DHAT-budgeted and
+/// Criterion-budgeted, so it cannot afford a log line (see
+/// [`MarkForwarder::mark_forward`]). This is the other half: a cold-path
+/// reader that turns the counter into something an operator actually sees.
+///
+/// `warn!` rather than `error!` deliberately. Marks are best-effort BY
+/// DESIGN — the next minute close supersedes a dropped one, so the honest
+/// recovery latency is ~60s and positions stay exact. What a drop does mean
+/// is that the daily-loss halt evaluated on a stale price for up to a
+/// minute, which is worth seeing and is not worth paging on.
+///
+/// Reports the DELTA, not the total: a single cumulative number climbing in
+/// the background reads the same whether it moved once an hour ago or is
+/// moving right now, and it is the second of those that matters.
+fn report_marks_dropped(marks_dropped: &AtomicU64, last_reported: &mut u64) {
+    let total = marks_dropped.load(Ordering::Relaxed);
+    let delta = total.saturating_sub(*last_reported);
+    if delta == 0 {
+        return;
+    }
+    *last_reported = total;
+    warn!(
+        dropped_since_last_heartbeat = delta,
+        dropped_total = total,
+        "mark channel FULL — {delta} price mark(s) dropped since the last \
+         heartbeat. Marks are best-effort: the next minute close supersedes a \
+         dropped one, so positions stay exact, but unrealized P&L and the \
+         daily-loss halt evaluated on a stale price until it arrived"
+    );
+}
+
 async fn run_reconcile_cycle(oms: &mut OrderManagementSystem, risk: &RiskEngine, book: &BookState) {
     if oms.is_dry_run() {
         metrics::counter!("tv_oms_reconcile_runs_total", "mode" => "paper_noop").increment(1);
@@ -1804,6 +1885,7 @@ mod tests {
             notifier: NotificationService::disabled(),
             calendar,
             marks_wanted: Arc::new(AtomicBool::new(false)),
+            marks_dropped: Arc::new(AtomicU64::new(0)),
             token_handle: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             client_id: "100".to_string(),
             auth_notify: Arc::new(Notify::new()),
@@ -1856,11 +1938,18 @@ mod tests {
         let fwd = MarkForwarder {
             marks_wanted: Arc::new(AtomicBool::new(false)),
             tx,
+            dropped: Arc::new(AtomicU64::new(0)),
         };
         fwd.mark_forward(13, 0, 23_146.45);
         assert!(
             rx.try_recv().is_err(),
             "marks_wanted=false must skip the send entirely"
+        );
+        assert_eq!(
+            fwd.dropped.load(Ordering::Relaxed),
+            0,
+            "a disarmed skip is not a DROP — counting it would make the \
+             heartbeat report losses that never happened"
         );
     }
 
@@ -1870,28 +1959,74 @@ mod tests {
         let fwd = MarkForwarder {
             marks_wanted: Arc::new(AtomicBool::new(true)),
             tx,
+            dropped: Arc::new(AtomicU64::new(0)),
         };
         fwd.mark_forward(13, 0, 23_146.45);
         let m = rx.try_recv().expect("armed forwarder must send"); // APPROVED: test
         assert_eq!(m.security_id, 13);
         assert_eq!(m.segment_code, 0);
+        assert_eq!(
+            fwd.dropped.load(Ordering::Relaxed),
+            0,
+            "an ACCEPTED mark must never be counted as dropped"
+        );
     }
 
     /// L1 (fix-round 2026-07-14): renamed honestly — the drop-arm COUNTER
-    /// increment is not assertable without a metrics recorder in this test
-    /// process; what this pins is the no-block / no-panic overflow contract.
+    /// increment was not assertable without a metrics recorder in this test
+    /// process; what this pinned was the no-block / no-panic overflow
+    /// contract.
+    ///
+    /// 2026-08-12: the drop is now ALSO recorded in a shared atomic that the
+    /// reconcile heartbeat reads, so the count IS assertable — and asserted
+    /// below. That is the whole point of the atomic: the Prometheus counter
+    /// alone was invisible on this box (nothing scrapes `/metrics` in prod),
+    /// so a full mark channel silently lost marks.
     #[tokio::test]
-    async fn test_mark_forward_channel_full_never_blocks_or_panics() {
+    async fn test_mark_forward_channel_full_counts_drops_and_never_blocks() {
         let (tx, _rx) = mpsc::channel::<MarkUpdate>(1);
         let fwd = MarkForwarder {
             marks_wanted: Arc::new(AtomicBool::new(true)),
             tx,
+            dropped: Arc::new(AtomicU64::new(0)),
         };
         // Fill the 1-slot channel, then overflow — must return immediately
         // (try_send), never block, never panic.
         fwd.mark_forward(13, 0, 1.0);
         fwd.mark_forward(13, 0, 2.0);
         fwd.mark_forward(13, 0, 3.0);
+        assert_eq!(
+            fwd.dropped.load(Ordering::Relaxed),
+            2,
+            "the 1-slot channel accepts one mark; the other two are drops \
+             and must both be counted for the heartbeat to report them"
+        );
+    }
+
+    /// The heartbeat reports a DELTA, so a persistent drop count must not
+    /// re-report forever, and a later burst must still surface.
+    #[test]
+    fn test_report_marks_dropped_reports_delta_only() {
+        let dropped = AtomicU64::new(0);
+        let mut reported: u64 = 0;
+
+        // Nothing dropped → nothing to report, watermark untouched.
+        report_marks_dropped(&dropped, &mut reported);
+        assert_eq!(reported, 0);
+
+        // First burst → reported in full.
+        dropped.store(7, Ordering::Relaxed);
+        report_marks_dropped(&dropped, &mut reported);
+        assert_eq!(reported, 7, "the whole first burst must be reported once");
+
+        // Quiet heartbeat → watermark stays put (no re-report of the same 7).
+        report_marks_dropped(&dropped, &mut reported);
+        assert_eq!(reported, 7);
+
+        // Second burst → only the NEW drops matter.
+        dropped.store(10, Ordering::Relaxed);
+        report_marks_dropped(&dropped, &mut reported);
+        assert_eq!(reported, 10, "a later burst must still surface");
     }
 
     /// MarkUpdate stays a small Copy payload (the zero-alloc contract).

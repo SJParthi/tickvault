@@ -240,3 +240,150 @@ async fn build_watch_for_today(questdb: &QuestDbConfig, max_subscribe: Option<us
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes env mutation across parallel test threads.
+    ///
+    /// Rust 2024 promoted `set_var`/`remove_var` to `unsafe` precisely because
+    /// they race with any other thread reading the env, and this repo has
+    /// already paid for ignoring that: a ThreadSanitizer run (issue #304)
+    /// caught parallel tests mutating `TV_API_TOKEN`, and a later flake in
+    /// `tv_api_token_prod_guard` merged a red PR. Same guard shape as
+    /// `middleware.rs::lock_env`, for the same reason.
+    ///
+    /// Poison is recovered rather than propagated: the env may be wrong, but
+    /// the test that panicked already reported its own failure, and blocking
+    /// every downstream env test on one earlier panic is worse CI signal.
+    static ENV_MUTATION_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTATION_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Restores `GROWW_MAX_SUBSCRIBE` to its prior value on drop, so a test
+    /// that panics mid-body cannot leak an override into the next one.
+    struct MaxSubscribeEnvGuard {
+        prior: Option<String>,
+    }
+
+    impl MaxSubscribeEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prior = std::env::var("GROWW_MAX_SUBSCRIBE").ok();
+            match value {
+                Some(v) => unsafe { std::env::set_var("GROWW_MAX_SUBSCRIBE", v) },
+                None => unsafe { std::env::remove_var("GROWW_MAX_SUBSCRIBE") },
+            }
+            Self { prior }
+        }
+    }
+
+    impl Drop for MaxSubscribeEnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var("GROWW_MAX_SUBSCRIBE", v) },
+                None => unsafe { std::env::remove_var("GROWW_MAX_SUBSCRIBE") },
+            }
+        }
+    }
+
+    /// The date must be IST, not UTC — the whole point of the offset.
+    ///
+    /// Between 18:30 and 24:00 UTC the IST date is already TOMORROW. A UTC
+    /// date there would name the wrong trading day, and the watch file is
+    /// keyed by that date: the REST legs would read yesterday's set on a live
+    /// morning. Asserted against an independently computed IST date rather
+    /// than by re-running the function's own arithmetic.
+    #[test]
+    fn test_today_ist_date_is_ist_not_utc() {
+        let expected =
+            (chrono::Utc::now() + chrono::TimeDelta::hours(5) + chrono::TimeDelta::minutes(30))
+                .format("%Y-%m-%d")
+                .to_string();
+        assert_eq!(
+            today_ist_date(),
+            expected,
+            "the watch-file date must be the IST calendar day — a UTC date is \
+             a different day for the 5.5 hours before midnight UTC"
+        );
+    }
+
+    /// Shape, so a format-string change cannot silently produce a key the
+    /// watch-file consumers do not recognise.
+    #[test]
+    fn test_today_ist_date_is_yyyy_mm_dd() {
+        let d = today_ist_date();
+        assert_eq!(d.len(), 10, "expected YYYY-MM-DD, got {d:?}");
+        let parts: Vec<&str> = d.split('-').collect();
+        assert_eq!(parts.len(), 3, "expected two dashes, got {d:?}");
+        assert_eq!(parts[0].len(), 4, "year must be 4 digits, got {d:?}");
+        assert_eq!(parts[1].len(), 2, "month must be zero-padded, got {d:?}");
+        assert_eq!(parts[2].len(), 2, "day must be zero-padded, got {d:?}");
+        assert!(
+            d.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "date must be digits and dashes only, got {d:?}"
+        );
+    }
+
+    /// Absent env → the pinned default, never `None`.
+    ///
+    /// `None` would mean "no cap", and an uncapped watch-set assembly is the
+    /// unbounded-growth class this workspace bans elsewhere.
+    #[test]
+    fn test_resolve_max_subscribe_falls_back_to_the_pinned_default() {
+        let _lock = lock_env();
+        let _guard = MaxSubscribeEnvGuard::set(None);
+        assert_eq!(
+            resolve_max_subscribe(),
+            Some(tickvault_core::feed::groww::instruments::GROWW_DEFAULT_MAX_SUBSCRIBE),
+            "with no override the cap must be the pinned default — never None, \
+             which would read as no cap at all"
+        );
+    }
+
+    /// A valid override wins.
+    #[test]
+    fn test_resolve_max_subscribe_honours_a_valid_override() {
+        let _lock = lock_env();
+        let _guard = MaxSubscribeEnvGuard::set(Some("42"));
+        assert_eq!(resolve_max_subscribe(), Some(42));
+    }
+
+    /// Garbage falls back to the default rather than disabling the cap.
+    ///
+    /// This is the arm that matters: `.and_then(parse.ok())` yields `None` on
+    /// unparseable input, and without the trailing `.or(Some(default))` a
+    /// typo in a deploy env var would silently remove the bound instead of
+    /// being ignored.
+    #[test]
+    fn test_resolve_max_subscribe_ignores_garbage_and_keeps_the_cap() {
+        let _lock = lock_env();
+        for garbage in ["not-a-number", "", "-1", "3.5"] {
+            let _guard = MaxSubscribeEnvGuard::set(Some(garbage));
+            assert_eq!(
+                resolve_max_subscribe(),
+                Some(tickvault_core::feed::groww::instruments::GROWW_DEFAULT_MAX_SUBSCRIBE),
+                "override {garbage:?} is unparseable and must fall back to the \
+                 default cap — never to None, which would uncap the watch set"
+            );
+        }
+    }
+
+    /// The respawn backoff must be non-zero.
+    ///
+    /// A zero backoff turns a task that dies immediately on start into a hot
+    /// respawn loop that burns a core and floods the log sink.
+    #[test]
+    fn test_respawn_backoff_is_non_zero() {
+        assert!(
+            GROWW_UNIVERSE_RESPAWN_BACKOFF_SECS > 0,
+            "a zero respawn backoff makes an instantly-dying task a hot loop"
+        );
+    }
+}

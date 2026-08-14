@@ -28,10 +28,34 @@ fn every_error_macro_tagged_with_a_known_code_carries_code_field() {
     let mut violations: Vec<String> = Vec::new();
     let tagged_prefixes = compute_tagged_prefixes();
 
+    // 2026-08-10 anti-vacuity: count what was actually read. Before this, an
+    // unreadable or moved directory made scan_dir return silently, so the guard
+    // passed having inspected ZERO files while reporting green.
+    let mut scanned_files: usize = 0;
     for crate_name in ["common", "storage", "core", "trading", "api", "app"] {
         let src_dir = root.join("crates").join(crate_name).join("src");
-        scan_dir(&src_dir, &tagged_prefixes, &mut violations);
+        assert!(
+            src_dir.is_dir(),
+            "error-code tag guard is BLIND: {src_dir:?} is not a directory. A \
+             missing crate root used to be skipped silently. Repoint the crate \
+             list or fix the workspace root."
+        );
+        scan_dir(
+            &src_dir,
+            &tagged_prefixes,
+            &mut violations,
+            &mut scanned_files,
+        );
     }
+
+    // The real corpus is ~291 .rs files across the six crates; 100 leaves 3x
+    // headroom while still failing loudly if the walk collapses.
+    assert!(
+        scanned_files > 100,
+        "error-code tag guard scanned only {scanned_files} files — it is \
+         effectively enforcing NOTHING. Expected >100. This assert exists \
+         because the guard previously passed while scanning zero."
+    );
 
     assert!(
         violations.is_empty(),
@@ -57,25 +81,35 @@ fn workspace_root() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+        // 2026-08-10: was `.unwrap_or_else(|| PathBuf::from("."))` — a silent CWD
+        // fallback. If the layout ever changed, every crate path missed, the walk
+        // found nothing, and the guard passed. Fail loudly instead.
+        .expect("workspace root must exist above crates/common")
 }
 
-fn scan_dir(dir: &Path, tagged: &BTreeSet<String>, violations: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
+fn scan_dir(
+    dir: &Path,
+    tagged: &BTreeSet<String>,
+    violations: &mut Vec<String>,
+    scanned: &mut usize,
+) {
+    // 2026-08-10: both of the swallows below used to convert a corpus-read
+    // failure into "nothing to check, pass". A guard cannot report on files it
+    // never managed to open, so read failures now panic with the path.
+    let entries = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("error-code tag guard corpus unreadable {dir:?}: {e}"));
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            scan_dir(&path, tagged, violations);
+            scan_dir(&path, tagged, violations, scanned);
             continue;
         }
         if path.extension().and_then(|s| s.to_str()) != Some("rs") {
             continue;
         }
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
-        };
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("error-code tag guard cannot read {path:?}: {e}"));
+        *scanned = scanned.saturating_add(1);
         scan_file(&path, &contents, tagged, violations);
     }
 }
@@ -154,4 +188,30 @@ fn tagged_prefix_set_is_non_empty() {
     assert!(!tagged.is_empty());
     // Every ErrorCode should contribute exactly 2 entries (": " and " ").
     assert_eq!(tagged.len(), ErrorCode::all().len() * 2);
+}
+
+/// 2026-08-10. `tagged_prefix_set_is_non_empty` above is a genuine check of the
+/// PREFIX SET, but it is NOT a non-vacuity check of this guard: it asserts on the
+/// `ErrorCode` enum, which the test itself derives, and would keep passing even
+/// if the file walk read nothing at all. That distinction is exactly how a
+/// sibling guard in this repo stayed green for an unknown period while scanning
+/// zero files.
+///
+/// This test asserts the thing that actually matters — that the corpus the guard
+/// walks EXISTS and is substantial.
+#[test]
+fn scan_corpus_exists_and_is_substantial() {
+    let root = workspace_root();
+    let mut total = 0usize;
+    for crate_name in ["common", "storage", "core", "trading", "api", "app"] {
+        let src_dir = root.join("crates").join(crate_name).join("src");
+        assert!(src_dir.is_dir(), "scan corpus missing: {src_dir:?}");
+        let mut violations: Vec<String> = Vec::new();
+        let tagged = BTreeSet::new();
+        scan_dir(&src_dir, &tagged, &mut violations, &mut total);
+    }
+    assert!(
+        total > 100,
+        "scan corpus collapsed to {total} files — the guard would enforce nothing"
+    );
 }

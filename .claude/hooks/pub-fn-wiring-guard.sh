@@ -22,16 +22,53 @@
 set -uo pipefail
 
 REPO_ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
-cd "$REPO_ROOT" || exit 0
+# 2026-08-10: fail CLOSED. `|| exit 0` reported success while having scanned
+# nothing — indistinguishable from a clean run.
+cd "$REPO_ROOT" || { echo "FATAL: cannot cd to $REPO_ROOT — refusing to pass vacuously" >&2; exit 1; }
 
-# Determine scope: pre-commit uses staged diff, pre-push uses pushed range.
+# Determine scope: pre-commit uses the staged diff, pre-push the pushed range,
+# and CI the pull request's own diff.
+#
+# 2026-08-10: the CI branch is NEW. Of the ten local guards, this was the ONLY
+# one with no server-side twin - verified by scanning every workflow - so a
+# gate-skipping push, or any edit made through the web UI, missed it entirely.
+# That is precisely the bypass class the Repo Guards job exists to close
+# (merge-gate-lock section 3 row 6), and this guard is not a ratchet-baseline
+# guard, so nothing prevented it running there.
+#
+# GITHUB_BASE_REF is set only on pull_request events and is checked FIRST,
+# because CI's HEAD~1..HEAD is meaningless there: actions/checkout defaults to
+# depth 1, so HEAD~1 does not exist and the range silently yields nothing - a
+# vacuous pass wearing the shape of a real scan. The CI step deepens the fetch
+# before calling this.
 SCOPE_FILES=""
-if git rev-parse --verify HEAD >/dev/null 2>&1; then
+if [ -n "${GITHUB_BASE_REF:-}" ] && git rev-parse --verify "origin/${GITHUB_BASE_REF}" >/dev/null 2>&1; then
+  SCOPE_FILES=$(git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" -- 'crates/**/*.rs' 2>/dev/null || true)
+elif git rev-parse --verify HEAD >/dev/null 2>&1; then
   if [ -n "$(git diff --cached --name-only -- 'crates/**/*.rs' 2>/dev/null || true)" ]; then
     SCOPE_FILES=$(git diff --cached --name-only -- 'crates/**/*.rs' 2>/dev/null || true)
   else
-    SCOPE_FILES=$(git diff --name-only HEAD~1..HEAD -- 'crates/**/*.rs' 2>/dev/null || true)
+    # FIXED 2026-08-10. This was HEAD~1..HEAD — the LAST COMMIT ONLY. On a
+    # branch of N commits (the normal PR shape here) a pre-push run inspected
+    # one commit and never saw pub fns added in the others. Now it scans the
+    # whole branch against its merge-base with the default branch, so every
+    # commit in the PR is covered. Falls back to the old single-commit range
+    # when no merge-base resolves (detached CI ref, shallow clone).
+    MERGE_BASE=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || true)
+    if [ -n "$MERGE_BASE" ] && [ "$MERGE_BASE" != "$(git rev-parse HEAD)" ]; then
+      SCOPE_FILES=$(git diff --name-only "$MERGE_BASE"..HEAD -- 'crates/**/*.rs' 2>/dev/null || true)
+    else
+      SCOPE_FILES=$(git diff --name-only HEAD~1..HEAD -- 'crates/**/*.rs' 2>/dev/null || true)
+    fi
   fi
+fi
+
+# Under CI on a pull request, an empty scope is only legitimate when the PR
+# genuinely touched no Rust. If the base ref could not be resolved we cannot
+# tell the two apart, so refuse rather than report a pass we did not earn.
+if [ -n "${GITHUB_BASE_REF:-}" ] && ! git rev-parse --verify "origin/${GITHUB_BASE_REF}" >/dev/null 2>&1; then
+  echo "FATAL: GITHUB_BASE_REF=${GITHUB_BASE_REF} is set but origin/${GITHUB_BASE_REF} is not fetched - cannot compute the PR diff, and an empty scan here would be a false pass" >&2
+  exit 1
 fi
 
 if [ -z "$SCOPE_FILES" ]; then
@@ -75,16 +112,50 @@ for FILE in $SCOPE_FILES; do
       continue
     fi
 
-    # Check for a call site anywhere in crates/ (excluding the declaration line itself).
-    # Use ripgrep if available, else fall back to grep.
-    if command -v rg >/dev/null 2>&1; then
-      CALL_COUNT=$(rg --type rust --count-matches "\b${FN_NAME}\b" crates/ 2>/dev/null | awk -F: '{ sum += $2 } END { print sum+0 }')
-    else
-      CALL_COUNT=$(grep -rE "\b${FN_NAME}\b" crates/ --include='*.rs' 2>/dev/null | wc -l | tr -d ' ')
-    fi
+    # FIXED 2026-08-10. This previously counted BARE IDENTIFIER MENTIONS and
+    # treated any count > 1 as "a caller exists". Comments and doc comments
+    # counted. Proven miss: `run_cross_verification` in dhan_live_crossverify.rs
+    # — whose own header calls it "the only ground truth available" — scored 2
+    # (its declaration plus ONE doc comment) and sailed through, while having
+    # zero real callers. The guard built to catch dormant pub fns waved through
+    # the most consequential dormant function in the repo.
+    #
+    # Now: strip // comments, drop the declaration line itself, and require a
+    # CALL shape — `name(` or `name (` — not a bare mention. A function called
+    # only from its own `#[cfg(test)]` module still counts as wired here; that
+    # is a separate, larger tightening deliberately not bundled in.
+    # 2026-08-11 — string literals are stripped too, and for the same reason
+    # the comment strip was added.
+    #
+    # `install_crossverify_deps` scored CALL_COUNT=1 with zero real callers.
+    # The single "call" was its own name inside the error message that fires
+    # when nobody has called it:
+    #
+    #     "... Call install_crossverify_deps() during boot, before this stack
+    #      spawns."
+    #
+    # A message whose whole purpose is to say "this was never called" was
+    # counted as proof that it was. The same function family defeated this
+    # guard through a doc comment the week before, which is the part worth
+    # noticing: the bypass was not clever, it was just a channel nobody had
+    # stripped yet. Comments and strings are now both removed before counting.
+    #
+    # `s:"[^"]*"::g` is deliberately simple — it does not understand raw
+    # strings or escaped quotes. It runs BEFORE the comment strip so a quoted
+    # `//` inside a string cannot truncate the line early.
+    CALL_COUNT=$(
+      grep -rn --include='*.rs' -E "\b${FN_NAME}\b" crates/ 2>/dev/null \
+        | sed 's:"[^"]*"::g' \
+        | sed 's://.*::' \
+        | grep -vE "^${FILE}:${FN_LINE}:" \
+        | grep -cE "\b${FN_NAME}\s*\(" \
+        || true
+    )
+    CALL_COUNT=${CALL_COUNT:-0}
 
-    # The declaration itself shows up in the count (1 reference). Anything > 1 means a caller exists.
-    if [ "$CALL_COUNT" -le 1 ]; then
+    # The declaration line is already excluded, so ANY remaining call-shaped
+    # reference means a caller exists. Zero means dormant.
+    if [ "$CALL_COUNT" -le 0 ]; then
       VIOLATIONS+=("${FILE}:${FN_LINE}: pub fn ${FN_NAME}() has no call sites")
     fi
   done < <(grep -nE '^\s*pub\s+(async\s+|const\s+|unsafe\s+)?fn\s+[a-zA-Z_]' "$FILE" 2>/dev/null || true)

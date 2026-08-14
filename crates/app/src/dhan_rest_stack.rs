@@ -201,6 +201,13 @@ pub struct DhanRestStackParams {
     /// legs take at each mark forward; 2026-07-17 truth-sync — the
     /// live-bridge per-tick load died with #1581).
     pub marks_wanted: Arc<AtomicBool>,
+    /// Shared mark-DROP counter (2026-08-12). The forwarder's drop arm is
+    /// DHAT-budgeted (≤1 KiB / ≤8 blocks over 10,000 calls) and cannot
+    /// afford a log line of its own, so it only increments this; the
+    /// runtime's reconcile heartbeat reads it and reports the delta. Before
+    /// this the drop was counted into a Prometheus counter nothing on this
+    /// box scrapes and printed nowhere — a silent tick-of-P&L loss.
+    pub marks_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// Shared /health state (PR-C2, 2026-07-13): the stack owns the token
     /// block writer (`token_remaining_secs` + `token_valid`) — the lane's
     /// `spawn_token_health_writer` died with the lane, and without a writer
@@ -216,6 +223,11 @@ pub struct DhanRestStackParams {
     /// Order-leg P&L sink threaded from main.rs boot (None = feature OFF).
     pub leg_pnl_tx: Option<tokio::sync::mpsc::Sender<crate::order_runtime::LegPnlEvent>>,
 }
+
+/// Capacity of the order-update ws-audit tee channel (2026-08-10). Sized to
+/// match the downstream persistence channel; overflow drops a forensic row
+/// (counted) and never stalls the socket.
+const WS_AUDIT_TEE_CAPACITY: usize = 1024;
 
 /// Cadence (seconds) of the /health token-block writer (PR-C2 re-home of
 /// the deleted lane's `spawn_token_health_writer` — B3 round-2 lineage).
@@ -798,15 +810,89 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         // The 2026-07-14 Dhan noise lock stands: this socket pages NOTHING —
         // NO NotificationService is handed to the connection.
         let order_push_notifier: Option<Arc<NotificationService>> = None;
+
+        // ---------------------------------------------------------------
+        // ws lifecycle audit + /health order_update wiring (2026-08-10).
+        //
+        // TWO gaps closed by ONE wire. Until now this spawn passed `None`
+        // for `ws_audit_tx` (the comment below called it "honestly absent
+        // rather than half-wired"), and nothing ever called
+        // `set_order_update_connected`, so GET /health rendered the only
+        // live Dhan socket as `unreported` — neither up nor down.
+        //
+        // Why the audit seam and not the auth latch: `authenticated_latch`
+        // is a ONE-SHOT (`fire_authenticated_signal_once` compare-exchanges
+        // false->true and never resets). Driving health from it would
+        // report `connected` forever after the first successful auth, right
+        // through every subsequent disconnect — a false-OK, which is the
+        // exact class Rule 11 forbids. The audit stream carries real
+        // transitions in both directions, so it is the only seam here that
+        // can report a DISCONNECT truthfully.
+        //
+        // Backpressure: the producer emits with `try_send` (drop on full,
+        // never stall the order read loop). This tee preserves that
+        // property by forwarding with `try_send` too — a slow QuestDB can
+        // cost a forensic row, never a stalled socket and never a stale
+        // health verdict, because health is updated BEFORE the forward.
+        let order_push_audit_tx = {
+            let persist_tx =
+                crate::ws_audit_consumer::spawn_ws_event_audit_consumer(config.questdb.clone());
+            let (tee_tx, mut tee_rx) = tokio::sync::mpsc::channel::<
+                tickvault_common::ws_event_types::WsEventAuditRow,
+            >(WS_AUDIT_TEE_CAPACITY);
+            let health_for_audit = params.health.clone();
+            tokio::spawn(async move {
+                use tickvault_common::ws_event_types::WsEventKind;
+                while let Some(row) = tee_rx.recv().await {
+                    let connected = match row.event_kind {
+                        WsEventKind::Connected
+                        | WsEventKind::Reconnected
+                        | WsEventKind::SleepResumed => true,
+                        WsEventKind::Disconnected
+                        | WsEventKind::DisconnectedOffHours
+                        | WsEventKind::SleepEntered
+                        | WsEventKind::StallRestarted => false,
+                    };
+                    // Health first: it is the operator-facing verdict and
+                    // must not depend on the forensic write succeeding.
+                    health_for_audit.set_order_update_connected(connected);
+                    if persist_tx.try_send(row).is_err() {
+                        metrics::counter!("tv_order_update_ws_audit_dropped_total").increment(1);
+                        // Counted AND said out loud. Until 2026-08-12 this arm
+                        // incremented a counter that was in no EMF selector and
+                        // had no log, so a dropped WebSocket-lifecycle audit row
+                        // left no trace anywhere: the health verdict above still
+                        // flipped, the socket carried on, and the forensic record
+                        // of the transition simply did not exist. AUDIT-WS-01
+                        // rows are the reconstruction trail for a disconnect, so
+                        // losing one silently is the exact false-OK this repo
+                        // bans.
+                        //
+                        // `warn!`, not `error!`: the health verdict is set BEFORE
+                        // this line and does not depend on the write, so the
+                        // operator-facing state stays correct — what is lost is
+                        // forensic depth, not liveness. Paper-mode order-update
+                        // capture today; this becomes materially more serious
+                        // when live order events flow through it.
+                        warn!(
+                            "order-update audit row DROPPED — the persist channel \
+                             was full. The WebSocket health verdict is unaffected, \
+                             but this lifecycle transition will be missing from \
+                             ws_event_audit and cannot be reconstructed later."
+                        );
+                    }
+                }
+            });
+            Some(tee_tx)
+        };
         // Positional args of the dormant core module's entrypoint, in
         // order: url, client id, token handle, order sender, calendar,
         // then the five gated/absent seams as `None` — durable frame
         // capture (live re-arm territory), auth signal, auth latch, the
         // Telegram notifier (noise lock), the ws lifecycle audit sender
-        // (not cheaply reachable in this stack — the shared consumer
-        // helper lives with the main.rs producer sites; wiring it here is
-        // a follow-up, honestly absent rather than half-wired), and the
-        // runtime feed flag (this channel is config-gated instead).
+        // (WIRED 2026-08-10 via the tee above — it also drives the
+        // /health order_update row), and the runtime feed flag (this
+        // channel is config-gated instead).
         tokio::spawn(tickvault_core::websocket::run_order_update_connection(
             config.dhan.order_update_websocket_url.clone(),
             client_id.clone(),
@@ -817,7 +903,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
             None,
             None,
             order_push_notifier,
-            None,
+            order_push_audit_tx,
             None,
         ));
         info!(
@@ -890,6 +976,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 first_order_update_rx,
                 mark_rx,
                 marks_wanted: Arc::clone(&params.marks_wanted),
+                marks_dropped: Arc::clone(&params.marks_dropped),
                 token_handle: Arc::clone(&token_handle),
                 client_id: client_id.clone(),
                 auth_notify: auth_signal,

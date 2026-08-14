@@ -33,18 +33,14 @@ opentelemetry-otlp = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 figment = { workspace = true }
-clap = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
-signal-hook = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
 rustls = { workspace = true }
 reqwest = { workspace = true }
-core_affinity = { workspace = true }
 # 2026-07-12 (BruteX crossverify Commit 2): the 15:50 IST daily task reads the
 # BruteX-produced Groww 1m CSVs from S3 (tv-prod-cold, read-only GET/List —
 # the instance role already holds the permissions; ZERO IAM change).

@@ -31,10 +31,29 @@
 //!   (the catch-up iterates days NEWEST→OLDEST, so an all-older day block
 //!   PREPENDS in one O(day) pass; a day already resident upserts in place).
 //!
+//! ## Slot lookup (2026-08-10)
+//! Slots live in a `HashMap<SlotKey, Arc<Slot>>` keyed on the FULL I-P1-11
+//! composite `(feed, security_id, exchange_segment_code)` — `security_id`
+//! alone is NEVER a key. Lookup is therefore **O(1) average** (one hash +
+//! one bucket probe), independent of `MAX_SPOT_BAR_SLOTS`.
+//!
+//! Before 2026-08-10 this was a `Vec<Arc<Slot>>` walked linearly on EVERY
+//! read and EVERY write — O(#slots), i.e. up to 256 `SlotKey` comparisons
+//! per bar. The module header still claimed "O(#slots ≤ 8)" from the era
+//! when the cap was 8; the cap became 256 on 2026-08-07 and the scan cost
+//! rose 32x with it. The structure, not the comment, is fixed here.
+//!
+//! Honest residual: the returned `Arc<Slot>` still costs one atomic refcount
+//! bump per call. That is O(1) (a single `fetch_add`), not a scan, and it is
+//! what lets the caller release the table lock BEFORE taking the slot lock —
+//! the property that keeps `find_or_create_slot`'s read→write upgrade
+//! deadlock-free. It is deliberately kept.
+//!
 //! ## Read path (HONEST envelope)
 //! Guarded locks (`parking_lot::RwLock`, ~30 ns uncontended) + binary
-//! search: O(#slots ≤ 8) slot scan + O(log ring) — NOT lock-free and NOT
-//! claimed O(1). Reads are COLD today: NO strategy consumer exists (the
+//! search: O(1)-average slot lookup + O(log ring) bucket search — NOT
+//! lock-free, and the RING half is NOT claimed O(1). Reads are COLD
+//! today: NO strategy consumer exists (the
 //! §28 boundary — this is the read contract only, the `chain_snapshot`
 //! precedent; any future consumer is bound by the §38.8 decision-freshness
 //! gate under its own dated operator scope).
@@ -45,6 +64,7 @@
 //! PR-1's boot catch-up. Depth is bounded by CAPTURED history — the depth
 //! accessors/gauges show the honest fill level, never a fabricated month.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -160,10 +180,23 @@ pub struct BlockOutcome {
 /// 2026-08-07: before this, the slot table grew unbounded — one entry per
 /// distinct instrument ever seen, never evicted. It was safe only by the
 /// external convention that callers feed the small hardcoded index list; the
-/// type enforced nothing. 256 is ~32x today's ~8 live slots, so it cannot bite
-/// current operation, while making the growth bounded BY CONSTRUCTION.
-/// Raising it is a deliberate, reviewable edit — which is the point.
-pub const MAX_SPOT_BAR_SLOTS: usize = 256;
+/// type enforced nothing. Capping it made the growth bounded BY CONSTRUCTION.
+///
+/// 2026-08-10: raised 256 → 25,000 to match [`AGGREGATOR_MAX_SLOTS`]. The 256
+/// was sized as "~32x today's ~8 live slots" when the runtime was REST-only on
+/// four indices. Under the authorized r8g.xlarge target (operator Quote 13,
+/// 2026-08-08 — 13 timeframes at ~25,000 instruments) that cap **refuses
+/// 24,744 of 25,000 instruments** with `SlotCapacityExhausted`, i.e. zero RAM
+/// retention for all but the first 256 — a fail-closed refusal, so it would
+/// have been loud rather than silent, but it would have made the upgrade
+/// useless for its stated purpose.
+///
+/// Sized to the SAME ceiling as the aggregator so the two cannot disagree
+/// about how many instruments the box admits. Memory is bounded by
+/// construction: the slot table is `RwLock<HashMap<SlotKey, Arc<Slot>>>`, so
+/// this is a ceiling on entries actually inserted, not a pre-allocation.
+/// Raising it further is a deliberate, reviewable edit — which is the point.
+pub const MAX_SPOT_BAR_SLOTS: usize = crate::candles::AGGREGATOR_MAX_SLOTS;
 
 /// One per-TF sorted ring of sealed bars.
 #[derive(Debug)]
@@ -276,7 +309,12 @@ impl TfRing {
 /// Composite slot identity (I-P1-11: `security_id` alone is never unique —
 /// the segment is mandatory; `feed` keeps Dhan/Groww bars distinct, the
 /// candles feed-in-key mirror).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` (2026-08-10) makes this the direct key of the slot map, so the
+/// I-P1-11 composite IS the hash key — there is no narrower key anywhere in
+/// the lookup path that a same-`security_id`-different-segment pair could
+/// collide on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SlotKey {
     pub feed: Feed,
     pub security_id: SecurityId,
@@ -312,7 +350,12 @@ pub struct SpotStoreStats {
 /// contract + honest envelope.
 pub struct SpotBarStore {
     spot_days: u32,
-    slots: RwLock<Vec<std::sync::Arc<Slot>>>,
+    /// O(1)-average slot index keyed on the FULL I-P1-11 composite
+    /// (`SlotKey` = feed + security_id + exchange_segment_code). Replaced a
+    /// `Vec` linear scan on 2026-08-10; capacity is still bounded by
+    /// [`MAX_SPOT_BAR_SLOTS`] (the bound is enforced in
+    /// `find_or_create_slot`, not by the container).
+    slots: RwLock<HashMap<SlotKey, std::sync::Arc<Slot>>>,
     middle_inserts: AtomicU64,
     dropped_over_window: AtomicU64,
 }
@@ -325,7 +368,10 @@ impl SpotBarStore {
     pub fn new(spot_days: u32) -> Self {
         Self {
             spot_days,
-            slots: RwLock::new(Vec::with_capacity(8)),
+            // Pre-sized to the ~8 live spot slots so the steady-state store
+            // never rehashes; growth beyond that is bounded by
+            // MAX_SPOT_BAR_SLOTS at the creation site.
+            slots: RwLock::new(HashMap::with_capacity(8)),
             middle_inserts: AtomicU64::new(0),
             dropped_over_window: AtomicU64::new(0),
         }
@@ -338,14 +384,13 @@ impl SpotBarStore {
         self.spot_days
     }
 
+    /// O(1) average: one hash of the I-P1-11 composite + one bucket probe,
+    /// plus one atomic refcount bump on the returned `Arc`. Independent of
+    /// [`MAX_SPOT_BAR_SLOTS`] (was an O(#slots ≤ 256) scan before
+    /// 2026-08-10).
     fn find_slot(&self, key: SlotKey) -> Option<std::sync::Arc<Slot>> {
         let slots = self.slots.read();
-        for slot in slots.iter() {
-            if slot.key == key {
-                return Some(std::sync::Arc::clone(slot));
-            }
-        }
-        None
+        slots.get(&key).map(std::sync::Arc::clone)
     }
 
     fn find_or_create_slot(&self, key: SlotKey) -> Option<std::sync::Arc<Slot>> {
@@ -353,11 +398,10 @@ impl SpotBarStore {
             return Some(slot);
         }
         let mut slots = self.slots.write();
-        // Re-check under the write lock (another writer may have raced).
-        for slot in slots.iter() {
-            if slot.key == key {
-                return Some(std::sync::Arc::clone(slot));
-            }
+        // Re-check under the write lock (another writer may have raced) —
+        // O(1) average, same composite key.
+        if let Some(slot) = slots.get(&key) {
+            return Some(std::sync::Arc::clone(slot));
         }
         // 2026-08-07: HARD CAP. Before this, `slots` grew by one entry for
         // every distinct (feed, security_id, exchange_segment) ever seen and
@@ -396,7 +440,7 @@ impl SpotBarStore {
             key,
             rings: RwLock::new(rings),
         });
-        slots.push(std::sync::Arc::clone(&slot));
+        slots.insert(key, std::sync::Arc::clone(&slot));
         Some(slot)
     }
 
@@ -515,7 +559,7 @@ impl SpotBarStore {
         let slot_arcs: Vec<std::sync::Arc<Slot>> = {
             let slots = self.slots.read();
             let mut copies = Vec::with_capacity(slots.len());
-            for slot in slots.iter() {
+            for slot in slots.values() {
                 copies.push(std::sync::Arc::clone(slot));
             }
             copies
@@ -618,7 +662,13 @@ mod tests {
         assert_eq!(bars_per_day(TfIndex::M5), 77);
         assert_eq!(bars_per_day(TfIndex::M15), 26);
         assert_eq!(bars_per_day(TfIndex::D1), 1);
-        assert_eq!(total_bars_per_day_all_tfs(), 618);
+        // 2026-08-10: M2/M30/M60 appended (operator Quote 13's thirteen
+        // frames). ceil(23_100/120)=193, ceil(23_100/1800)=13,
+        // ceil(23_100/3600)=7 → 618 + 213 = 831.
+        assert_eq!(bars_per_day(TfIndex::M2), 193);
+        assert_eq!(bars_per_day(TfIndex::M30), 13);
+        assert_eq!(bars_per_day(TfIndex::M60), 7);
+        assert_eq!(total_bars_per_day_all_tfs(), 831);
         assert_eq!(SESSION_SECS, 23_100);
     }
 
@@ -627,9 +677,10 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 618 × 35 × 8 × 48 = 8_305_920 B ≈ 7.9 MiB
-        // (2026-08-07: 601 -> 618 bars/day with the 385-minute session).
-        assert_eq!(bytes, 8_305_920);
+        // 831 × 35 × 8 × 48 = 11_168_640 B ≈ 10.6 MiB
+        // (2026-08-07: 601 -> 618 bars/day with the 385-minute session;
+        //  2026-08-10: 618 -> 831 with M2/M30/M60, operator Quote 13.)
+        assert_eq!(bytes, 11_168_640);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -813,8 +864,9 @@ mod tests {
         assert_eq!(stats.bars_resident_per_feed[Feed::Groww.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Groww.index()], 1);
-        // Two slots × 1 day × 618 bars × 48 B of pre-allocated capacity (385-min session).
-        assert_eq!(stats.estimated_bytes, 2 * 618 * 48);
+        // Two slots × 1 day × 831 bars × 48 B of pre-allocated capacity
+        // (385-min session; 618 -> 831 on 2026-08-10 with M2/M30/M60).
+        assert_eq!(stats.estimated_bytes, 2 * 831 * 48);
     }
 
     #[test]
@@ -839,11 +891,14 @@ mod tests {
         // so the number is the would-be formula cost, not allocated memory.
         assert_eq!(gated_formula_total, 77_422, "gated formula sum drifted");
         // The resident total + byte estimate exclude the gated frames.
-        assert_eq!(total_bars_per_day_all_tfs(), 618);
+        // 2026-08-10: 618 -> 831 with M2/M30/M60 (operator Quote 13). These
+        // three are minute-scale, so unlike the GDF-gated second frames they
+        // ARE resident and DO count toward the byte estimate.
+        assert_eq!(total_bars_per_day_all_tfs(), 831);
         let store = SpotBarStore::new(35);
         store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
         let stats = store.stats();
-        assert_eq!(stats.estimated_bytes, 618 * 35 * 48);
+        assert_eq!(stats.estimated_bytes, 831 * 35 * 48);
         let slot = store.find_slot(key()).expect("slot exists");
         let rings = slot.rings.read();
         assert_eq!(rings.len(), TF_COUNT, "one ring per TfIndex ordinal");
@@ -857,6 +912,279 @@ mod tests {
                     ring.capacity,
                     (bars_per_day(tf) as usize) * 35,
                     "{tf:?} live-frame ring capacity drifted"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-08-10 — O(1) composite-key slot lookup (was an O(#slots ≤ 256)
+    // linear scan on EVERY read and EVERY write).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_find_slot_composite_key_isolates_same_security_id_across_segments() {
+        // I-P1-11: `security_id` alone is NEVER the key. The SAME numeric id
+        // under two segments (the live FINNIFTY id=27 IDX_I vs NSE_EQ class)
+        // must resolve to two INDEPENDENT slots — a same-id collapse would be
+        // exactly the silent data loss the hash-key change must not introduce.
+        let store = SpotBarStore::new(2);
+        let idx = SlotKey {
+            feed: Feed::Dhan,
+            security_id: 27,
+            exchange_segment_code: 0, // IDX_I
+        };
+        let eq = SlotKey {
+            feed: Feed::Dhan,
+            security_id: 27,
+            exchange_segment_code: 1, // NSE_EQ
+        };
+        // Same id, same segment, DIFFERENT feed — the third key axis.
+        let groww_idx = SlotKey {
+            feed: Feed::Groww,
+            security_id: 27,
+            exchange_segment_code: 0,
+        };
+        assert_eq!(
+            store.append_sealed(idx, TfIndex::M1, bar(OPEN0, 100.0)),
+            UpsertOutcome::Appended
+        );
+        assert_eq!(
+            store.append_sealed(eq, TfIndex::M1, bar(OPEN0, 200.0)),
+            UpsertOutcome::Appended,
+            "a different segment must open its OWN slot, not replace in an existing one"
+        );
+        assert_eq!(
+            store.append_sealed(groww_idx, TfIndex::M1, bar(OPEN0, 300.0)),
+            UpsertOutcome::Appended,
+            "a different feed must open its OWN slot"
+        );
+        assert_eq!(store.stats().slots, 3, "three distinct composite keys");
+        assert_eq!(
+            store.bar_at(idx, TfIndex::M1, OPEN0).map(|b| b.close),
+            Some(100.0)
+        );
+        assert_eq!(
+            store.bar_at(eq, TfIndex::M1, OPEN0).map(|b| b.close),
+            Some(200.0)
+        );
+        assert_eq!(
+            store.bar_at(groww_idx, TfIndex::M1, OPEN0).map(|b| b.close),
+            Some(300.0)
+        );
+        // And the hash lookup itself distinguishes them.
+        assert!(store.find_slot(idx).is_some());
+        assert!(store.find_slot(eq).is_some());
+        assert!(
+            store
+                .find_slot(SlotKey {
+                    feed: Feed::Dhan,
+                    security_id: 27,
+                    exchange_segment_code: 8, // never written
+                })
+                .is_none(),
+            "an unwritten segment must MISS, not alias onto a sibling"
+        );
+    }
+
+    #[test]
+    fn test_find_or_create_slot_boundary_exactly_at_cap_then_one_past() {
+        // Boundary permutation: fill EXACTLY MAX_SPOT_BAR_SLOTS distinct
+        // composite keys (all must land), then one MORE (must be refused,
+        // loudly, as SlotCapacityExhausted — not evicted, not silently
+        // dropped), then prove an ALREADY-RESIDENT slot still works after
+        // exhaustion (a cap refusal must never break live retention).
+        let store = SpotBarStore::new(1);
+        for i in 0..MAX_SPOT_BAR_SLOTS {
+            let key = SlotKey {
+                feed: Feed::Dhan,
+                security_id: i as u64,
+                exchange_segment_code: 0,
+            };
+            assert_eq!(
+                store.append_sealed(key, TfIndex::M1, bar(OPEN0, i as f64)),
+                UpsertOutcome::Appended,
+                "slot {i} must land at/below the cap"
+            );
+        }
+        assert_eq!(store.stats().slots, MAX_SPOT_BAR_SLOTS);
+
+        let one_past = SlotKey {
+            feed: Feed::Dhan,
+            security_id: MAX_SPOT_BAR_SLOTS as u64,
+            exchange_segment_code: 0,
+        };
+        assert_eq!(
+            store.append_sealed(one_past, TfIndex::M1, bar(OPEN0, 1.0)),
+            UpsertOutcome::SlotCapacityExhausted,
+            "one past the cap must be REFUSED"
+        );
+        assert_eq!(
+            store.stats().slots,
+            MAX_SPOT_BAR_SLOTS,
+            "a refusal must not grow the table"
+        );
+        assert!(
+            store.bar_at(one_past, TfIndex::M1, OPEN0).is_none(),
+            "the refused instrument has NO retention — never a silent partial"
+        );
+        // The block path reports the same refusal honestly.
+        let block = store.record_day_block(
+            one_past,
+            TfIndex::M1,
+            &[bar(OPEN0, 1.0), bar(OPEN0 + 60, 2.0)],
+        );
+        assert_eq!(block.recorded, 0);
+        assert_eq!(block.dropped_over_window, 2, "every bar accounted for");
+
+        // Resident slots are untouched by the refusal.
+        let resident = SlotKey {
+            feed: Feed::Dhan,
+            security_id: 7,
+            exchange_segment_code: 0,
+        };
+        assert_eq!(
+            store.append_sealed(resident, TfIndex::M1, bar(OPEN0 + 60, 42.0)),
+            UpsertOutcome::Appended
+        );
+        assert_eq!(
+            store.bar_at(resident, TfIndex::M1, OPEN0).map(|b| b.close),
+            Some(7.0),
+            "the original bar survived"
+        );
+    }
+
+    #[test]
+    fn test_find_slot_serves_concurrent_readers_during_writes() {
+        // Concurrency permutation: readers hammer the hash lookup while a
+        // writer creates NEW slots (the write-lock path that rehashes). No
+        // panic, no torn read — a reader either misses or sees a whole bar.
+        let store = SpotBarStore::new(1);
+        let seeded = SlotKey {
+            feed: Feed::Dhan,
+            security_id: 1_000_000,
+            exchange_segment_code: 0,
+        };
+        store.append_sealed(seeded, TfIndex::M1, bar(OPEN0, 555.0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..2_000 {
+                        // The seeded slot is ALWAYS present and never rewritten.
+                        assert_eq!(
+                            store.bar_at(seeded, TfIndex::M1, OPEN0).map(|b| b.close),
+                            Some(555.0),
+                            "a resident slot must stay readable across concurrent inserts"
+                        );
+                        let churn = SlotKey {
+                            feed: Feed::Groww,
+                            security_id: 42,
+                            exchange_segment_code: 0,
+                        };
+                        // Either missing or complete — never a partial bar.
+                        if let Some(b) = store.bar_at(churn, TfIndex::M1, OPEN0) {
+                            assert_eq!(b.close, 9.0);
+                        }
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for i in 0..200u64 {
+                    let key = SlotKey {
+                        feed: Feed::Dhan,
+                        security_id: i,
+                        exchange_segment_code: 0,
+                    };
+                    store.append_sealed(key, TfIndex::M1, bar(OPEN0, i as f64));
+                }
+                store.append_sealed(
+                    SlotKey {
+                        feed: Feed::Groww,
+                        security_id: 42,
+                        exchange_segment_code: 0,
+                    },
+                    TfIndex::M1,
+                    bar(OPEN0, 9.0),
+                );
+            });
+        });
+
+        assert_eq!(
+            store.bar_at(seeded, TfIndex::M1, OPEN0).map(|b| b.close),
+            Some(555.0)
+        );
+    }
+
+    #[test]
+    fn test_find_slot_empty_store_and_maximal_key_values_miss_cleanly() {
+        // Empty + maximal inputs: an empty store misses on every accessor
+        // without panicking, and u64::MAX / u8::MAX key components hash and
+        // compare like any other (no width truncation in the key).
+        let store = SpotBarStore::new(1);
+        let maximal = SlotKey {
+            feed: Feed::Truedata,
+            security_id: u64::MAX,
+            exchange_segment_code: u8::MAX,
+        };
+        assert!(store.find_slot(maximal).is_none());
+        assert!(store.bar_at(maximal, TfIndex::M1, OPEN0).is_none());
+        assert!(store.latest_n(maximal, TfIndex::M1, 5).is_empty());
+        assert_eq!(store.depth_days(maximal), 0);
+        assert_eq!(store.stats().slots, 0);
+
+        assert_eq!(
+            store.append_sealed(maximal, TfIndex::M1, bar(u32::MAX, 1.0)),
+            UpsertOutcome::Appended
+        );
+        assert_eq!(
+            store
+                .bar_at(maximal, TfIndex::M1, u32::MAX)
+                .map(|b| b.close),
+            Some(1.0)
+        );
+        // The neighbouring id must NOT alias onto it.
+        assert!(
+            store
+                .find_slot(SlotKey {
+                    security_id: u64::MAX - 1,
+                    ..maximal
+                })
+                .is_none()
+        );
+    }
+
+    proptest::proptest! {
+        /// Random composite keys: every distinct `(feed, sid, segment)` triple
+        /// must round-trip to its OWN bar, and two triples differing in ANY
+        /// single component must never share a slot. This is the property the
+        /// linear scan gave for free and the hash key must preserve.
+        #[test]
+        fn test_find_slot_hash_key_roundtrips_arbitrary_composites(
+            raw in proptest::collection::vec(
+                (0usize..Feed::COUNT, 0u64..40, 0u8..4),
+                1..40,
+            )
+        ) {
+            let store = SpotBarStore::new(1);
+            // Deduplicate by composite; the LAST write for a key wins (upsert).
+            let mut expected: std::collections::HashMap<SlotKey, f64> =
+                std::collections::HashMap::with_capacity(raw.len());
+            for (idx, (feed_idx, sid, seg)) in raw.iter().enumerate() {
+                let key = SlotKey {
+                    feed: Feed::ALL[*feed_idx],
+                    security_id: *sid,
+                    exchange_segment_code: *seg,
+                };
+                let close = idx as f64 + 1.0;
+                store.append_sealed(key, TfIndex::M1, bar(OPEN0, close));
+                expected.insert(key, close);
+            }
+            proptest::prop_assert_eq!(store.stats().slots, expected.len());
+            for (key, close) in &expected {
+                proptest::prop_assert_eq!(
+                    store.bar_at(*key, TfIndex::M1, OPEN0).map(|b| b.close),
+                    Some(*close)
                 );
             }
         }

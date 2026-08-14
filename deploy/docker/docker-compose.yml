@@ -5,14 +5,20 @@
 # operator-lock 2026-07-15 Quote 8 in daily-universe-scope-expansion-2026-05-27.md §7).
 #
 # Post-CloudWatch-only migration (#O1/#O2/#O3/#O4), Groww-only ~770-SID universe.
-#   Compose default QDB_MEM_LIMIT=1g — the prod box downsizes to the t4g.medium
-#   4 GiB host (operator downsize 2026-07-15, executed by the guarded
-#   downsize-instance.yml workflow), so 1g is the steady-state QuestDB budget
-#   per §7 Rule 2: QuestDB ~1GB + App ~0.7–1.5GB + OS/FS-cache ~0.4GB =
-#   ~2.6–3.1GB total on 4 GiB. (Was 4g on the r8g.large 16 GiB host,
-#   2026-07-01 → 2026-07-15; the on-box deploy/docker/.env override is
-#   retuned to 1g by the downsize workflow's SSM step — the .env OVERRIDES
-#   this compose default, so the repo change alone never retunes the box.)
+#   Compose default QDB_MEM_LIMIT=12g — the r8g.xlarge 32 GiB host (operator
+#   Quote 13, 2026-08-08), per §7 Rule 2: QuestDB 8–16 GB + resident ticks
+#   2.3–7.2 GB + app 2–4 GB + OS/FS-cache 2–4 GB = ~14–31 GB of 32 GiB.
+#   History: 4g on r8g.large (2026-07-01 → 2026-07-15), then 1g on the
+#   t4g.medium downsize (2026-07-15 → 2026-08-10).
+#
+#   ⚠ THE REPO CHANGE ALONE DOES NOT RETUNE THE BOX. The on-box
+#   deploy/docker/.env OVERRIDES this default, and it was written to 1g by
+#   the downsize workflow's SSM step. Until
+#   `scripts/aws-upgrade-instance.sh --qdb-mem 12g --apply-ssm` runs against
+#   the live instance, prod QuestDB stays at 1g regardless of this file.
+#   Note also that `.github/workflows/downsize-instance.yml` still hard-
+#   asserts 1073741824 and will FAIL against a 12g box — that workflow is a
+#   t4g.medium-era tool and must not be dispatched at the current lock.
 #
 # REMOVED (CloudWatch-only migration):
 #   - Grafana       -> CloudWatch Dashboards (#O1)
@@ -97,22 +103,33 @@ services:
     container_name: tv-questdb
     hostname: tv-questdb
     restart: unless-stopped
-    # Default 1g is the steady-state QuestDB budget on the t4g.medium 4 GiB box
-    # (operator downsize r8g.large → t4g.medium, 2026-07-15 Quote 8). Per §7
-    # Rule 2: QuestDB ~1GB + App ~0.7–1.5GB + OS/FS-cache ~0.4GB = ~2.6–3.1GB
-    # total on 4 GiB. Was 4g on the r8g.large 16 GiB host (2026-07-01 →
-    # 2026-07-15). NOTE: the on-box deploy/docker/.env (written by the flip
-    # tooling) OVERRIDES this default — the downsize workflow's SSM step
-    # rewrites that .env to 1g; the compose change alone never retunes a box
-    # whose .env still carries 4g.
+    # Default 12g is the steady-state QuestDB budget on the r8g.xlarge 32 GiB
+    # box (operator Quote 13, 2026-08-08 — 4 vCPU / 32 GiB, multi-AZ). Per
+    # `daily-universe-scope-expansion-2026-05-27.md` §7 Rule 2 the sizing for
+    # the 13-timeframe + tick-retention target is: QuestDB 8–16 GB + one day of
+    # resident ticks 2.3–7.2 GB + app remainder 2–4 GB + OS/FS-cache 2–4 GB =
+    # ~14–31 GB of 32 GiB. 12g sits mid-band, leaving room for the app and the
+    # page cache at the top of the tick range.
+    #
+    # HISTORY — why this was WRONG until 2026-08-10: the value stayed at the
+    # t4g.medium `1g` (operator Quote 8, 2026-07-15) for two days AFTER the
+    # r8g.xlarge migration, and a build-failing ratchet ASSERTED that `1g`, so
+    # raising it was not a config edit — the guard had to be re-blessed first.
+    # QuestDB was therefore capped at 1/32nd of the host it had just been moved
+    # to, which is the single line that made most of the upgrade unreachable.
+    #
+    # NOTE: the on-box deploy/docker/.env (written by the flip tooling)
+    # OVERRIDES this default — a box whose .env still carries `1g` is NOT
+    # retuned by this compose change alone; `scripts/aws-upgrade-instance.sh
+    # --qdb-mem 12g --apply-ssm` rewrites it.
     # QuestDB mmaps data files — actual RSS is much lower than limit.
     # Partition manager keeps hot data bounded to ~90 days.
-    # Env-driven so scripts/aws-upgrade-instance.sh --qdb-mem can raise it
-    # (e.g. the emergency roll-UP to r8g.large auto-defaults 4g). Override
-    # QDB_MEM_LIMIT to set a different value on a Mac dev box.
-    mem_limit: ${QDB_MEM_LIMIT:-1g}
-    mem_reservation: 1g
-    cpus: 2.0
+    mem_limit: ${QDB_MEM_LIMIT:-12g}
+    mem_reservation: 2g
+    # 3.0 of the box's 4 vCPU. Was 2.0, sized for the t4g.medium's 2 vCPU —
+    # which capped QuestDB at half the new machine. The remaining core is left
+    # for the tickvault app + OS.
+    cpus: 3.0
     # OOM protection: prefer killing other containers over QuestDB.
     # QuestDB holds all trading data — losing it mid-session is catastrophic.
     oom_score_adj: -500
@@ -175,8 +192,10 @@ services:
       # --- Crash Recovery & Stability ---
       # Writer append page size: 1MB. Reduces mmap syscalls for large batches.
       QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "1048576"
-      # Parallel WAL apply threads: 2 (matches t4g.medium 2 vCPUs).
-      QDB_WAL_APPLY_WORKER_COUNT: "2"
+      # Parallel WAL apply threads: 4 (matches the r8g.xlarge 4 vCPU, operator
+      # Quote 13 2026-08-08). Was 2, explicitly "matches t4g.medium 2 vCPUs" —
+      # which halved WAL→table merge throughput on the new box.
+      QDB_WAL_APPLY_WORKER_COUNT: "4"
       QDB_PG_USER: ${TV_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${TV_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     logging:

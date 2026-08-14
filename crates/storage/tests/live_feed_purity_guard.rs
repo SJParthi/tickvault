@@ -34,9 +34,10 @@ fn workspace_root() -> PathBuf {
 /// Recursively read every `.rs` file under `dir`, returning (path, contents).
 fn read_rust_files(dir: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
+    // 2026-08-10: was `else { return out; }` — an unreadable directory silently
+    // became "nothing to check, pass". Corpus-read failure now fails LOUD.
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("LIVE-FEED-PURITY guard corpus unreadable {dir:?}: {e}"));
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -54,12 +55,51 @@ fn read_rust_files(dir: &Path) -> Vec<(PathBuf, String)> {
 /// Files under these paths MUST NOT touch tick-writer APIs.
 fn historical_flow_paths() -> Vec<PathBuf> {
     let root = workspace_root();
-    vec![
-        root.join("crates/core/src/historical"),
-        // Future-proofed — any new rest/backfill path would land here.
-        root.join("crates/core/src/rest"),
-        root.join("crates/core/src/backfill"),
-    ]
+    // 2026-08-10 (SECOND REVISION, after an adversarial review of the first).
+    //
+    // The ORIGINAL scanned three DIRECTORIES and carried the comment
+    // "Future-proofed — any new rest/backfill path would land here". Those
+    // directories were later deleted, and because a missing dir was skipped
+    // silently the guard passed while reading ZERO files.
+    //
+    // My FIRST repair replaced them with a hardcoded list of 7 files. That fixed
+    // the blindness but DESTROYED the future-proofing, and it missed 5 of the 12
+    // REST modules that already existed — so a banned symbol added to, say,
+    // groww_spot_1m_boot.rs would have gone unseen while the guard reported a
+    // healthy "7 files scanned". That is precisely the false-OK this guard exists
+    // to prevent, reintroduced by its own repair.
+    //
+    // This revision DISCOVERS the REST/historical flow by walking the two source
+    // directories and selecting by filename, so a new module is covered the day
+    // it is added — the original's best property, without the silent-skip bug.
+    // The caller asserts the discovered set is non-trivial, so a naming-convention
+    // change that empties it fails LOUDLY instead of quietly scanning nothing.
+    let mut out = Vec::new();
+    for dir in [root.join("crates/app/src"), root.join("crates/storage/src")] {
+        assert!(
+            dir.is_dir(),
+            "LIVE-FEED-PURITY guard is BLIND: source directory {dir:?} is missing."
+        );
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("LIVE-FEED-PURITY guard cannot read {dir:?}: {e}"));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.contains("rest")
+                        || n.contains("historical")
+                        || n.contains("backfill")
+                        || n.contains("option_chain")
+                        || n.contains("spot_1m")
+                        || n.contains("contract_1m")
+                })
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 // ============================================================================
@@ -81,11 +121,26 @@ const BANNED_IN_HISTORICAL_FLOW: &[&str] = &[
 fn live_feed_purity_no_tick_writer_in_historical_flow() {
     let mut violations: Vec<String> = Vec::new();
 
-    for dir in historical_flow_paths() {
-        if !dir.is_dir() {
-            continue;
-        }
-        for (path, content) in read_rust_files(&dir) {
+    let mut scanned_files: usize = 0;
+    for target in historical_flow_paths() {
+        assert!(
+            target.exists(),
+            "LIVE-FEED-PURITY guard is BLIND: scan target {target:?} does not \
+             exist. A missing target used to be skipped silently, which let this \
+             guard pass while reading ZERO files. Repoint historical_flow_paths() \
+             at the current REST/historical flow, or remove the entry \
+             deliberately — never leave it dangling."
+        );
+        let files = if target.is_dir() {
+            read_rust_files(&target)
+        } else {
+            let content = std::fs::read_to_string(&target).unwrap_or_else(|e| {
+                panic!("LIVE-FEED-PURITY guard cannot read scan target {target:?}: {e}")
+            });
+            vec![(target.clone(), content)]
+        };
+        scanned_files = scanned_files.saturating_add(files.len());
+        for (path, content) in files {
             for banned in BANNED_IN_HISTORICAL_FLOW {
                 if let Some(line_idx) = content
                     .lines()
@@ -107,6 +162,16 @@ fn live_feed_purity_no_tick_writer_in_historical_flow() {
             }
         }
     }
+
+    // Anti-vacuity: a guard that scanned nothing must FAIL, not pass. This is the
+    // assertion whose absence let the guard sleep.
+    assert!(
+        scanned_files >= 10,
+        "LIVE-FEED-PURITY guard scanned only {scanned_files} REST/historical \
+         module(s). 12 exist today, so anything below 10 means discovery broke \
+         or the naming convention changed — either way the guard is no longer \
+         covering the flow it claims to. Fix historical_flow_paths()."
+    );
 
     assert!(
         violations.is_empty(),
@@ -180,7 +245,26 @@ fn self_test_workspace_root_contains_cargo_toml() {
 }
 
 #[test]
-fn self_test_historical_flow_paths_contain_historical_dir() {
+fn self_test_historical_flow_paths_all_exist_on_disk() {
+    // 2026-08-10 REPLACED A TAUTOLOGY. This previously asserted that the
+    // hardcoded vec returned by historical_flow_paths() contained a path ending
+    // in "historical" — true regardless of whether that path existed on disk. It
+    // was the check meant to PROVE the guard was working, and it is precisely why
+    // the guard's blindness went unnoticed: it reported healthy while every real
+    // target had been deleted. A fake non-vacuity test is worse than none,
+    // because it converts "unverified" into "verified".
+    //
+    // It now asserts the thing that actually matters: the targets EXIST.
     let paths = historical_flow_paths();
-    assert!(paths.iter().any(|p| p.ends_with("historical")));
+    assert!(
+        !paths.is_empty(),
+        "historical_flow_paths() is empty — the guard would scan nothing"
+    );
+    for p in paths {
+        assert!(
+            p.exists(),
+            "historical_flow_paths() names {p:?}, which does not exist on disk — \
+             the guard would silently scan nothing for this target"
+        );
+    }
 }

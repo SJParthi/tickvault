@@ -133,6 +133,45 @@ enforcement or provenance while appearing to advance the directive.
 
 ---
 
+## §0.1. 2026-08-14 — AUDIT: the workspace IS Rust-only; the GUARD has four scope holes
+
+A hostile sweep re-verified the lock end to end (read-only; no build). **Verdict:
+YES, the workspace is Rust-only today.** Zero tracked files in any of the 22
+banned extensions; both allowlists empty and mechanically pinned at zero; all 99
+tracked shebangs are `bash`; every `Command::new` literal is a benign binary;
+the inline-JS budget matches the 4 sanctioned frontend surfaces exactly; and
+every `pip`/`perl` hit in an executable surface is a `#`-comment recording a
+completed port.
+
+**But the guard's coverage gap is SCOPE, not tokens — the same class that
+produced both prior breaches.** It decides what to read from a hardcoded list of
+extensions plus one directory prefix, so several re-entry paths were green by
+construction.
+
+**CLOSED in this change:**
+
+| # | Hole | Fix |
+|---|---|---|
+| 1 | An extension-less `#!` executable outside `scripts/git-hooks/` (`tools/deploy`, `bin/run`) was neither extension-banned nor invocation-scanned | `has_interpreter_shebang` — **any** tracked file whose first line is `#!` is now scanned, whatever it is called |
+| 2 | `.bash` / `.zsh` / `.ksh` / `.ps1` / `.bat` escaped the `.sh` check — the one-rename evasion the `.pyw`/`.pyi` additions closed for the interpreter's own extensions | subsumed by #1 |
+| 3 | `.cargo/config.toml` `[target.*] runner` / `linker` **executes on every build** and was structurally unscanned. This is not hypothetical: §0's 2026-08-01 correction records an interpreter package having actually BEEN the arm64 linker for every production Rust lambda | `.cargo/config.toml` + `Cargo.toml` added to the scan |
+
+Hole #1 is the structural one and deliberately replaces enumeration with a
+question about the FILE rather than its NAME — because the enumerate-one-more-
+extension approach has now been wrong four times, always in the same direction:
+a class nobody listed is invisible, and invisibility reads as green.
+
+**OPEN, recorded rather than silently carried:**
+
+| # | Hole | Why it is not closed here |
+|---|---|---|
+| 4 | `node`, `npx`, `npm`, `yarn`, `pnpm`, `deno`, `bun`, `ruby`, `gem`, `php`, `lua` are **not banned tokens**. `.mcp.json` uses `npx` live | Banning them would fail the guard on `.mcp.json`, which is dev-session MCP tooling that is never deployed and never in the product path. Removing it breaks local tooling and buys nothing on the box — an **operator call**, not a silent guard edit. `node` is additionally prose-ambiguous (AWS's "SSM managed node") |
+| 5 | `.html` is neither banned nor scanned, and the 4-surface frontend carve-out is described in prose but **pinned by nothing** — a 5th `.html` lands green | Needs a budget const mirroring `GITHUB_SCRIPT_BUDGET`, complicated by 12 legitimate vendor-reference `.html` files under `docs/`. Deferred rather than guessed |
+| 6 | ~11 GitHub Actions (`actions/checkout`, `actions/cache`, `Swatinem/rust-cache`, …) are `using: node20` JS actions, while `github-script` **is** budgeted as an interpreted surface | The scope is genuinely inconsistent, but the boundary is a policy question: third-party CI actions are not "our workspace codebase". Needs an operator ruling, then either a budget or an explicit written boundary |
+
+Items 4–6 each require an operator decision, so they are stated here instead of
+being resolved by executor judgment. None of them is an active violation today.
+
 ## §1. The rule (one line)
 
 **Every new executable / runtime component defaults to Rust with O(1) hot-path discipline — the three principles: (1) zero allocation on the hot path, (2) O(1) or fail at compile time, (3) every version pinned — and any non-Rust executable addition needs a fresh dated operator quote recorded in this file FIRST.**

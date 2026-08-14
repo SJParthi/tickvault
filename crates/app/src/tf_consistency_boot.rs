@@ -59,6 +59,7 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::segment::{segment_code_to_str, segment_str_to_code};
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
+use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 use tickvault_storage::tf_consistency_audit_persistence::{
     FindingCategory, TfConsistencyAuditWriter, TfConsistencyFinding,
     ensure_tf_consistency_audit_table,
@@ -850,7 +851,7 @@ pub fn select_instruments_sql(feed: &str, day_start_ist_nanos: i64) -> String {
 pub fn select_spot_1m_count_sql(feed: &str, day_start_ist_nanos: i64) -> String {
     let (start, end) = day_bounds_micros(day_start_ist_nanos);
     format!(
-        "SELECT count(*) FROM spot_1m_rest \
+        "SELECT count(*) FROM {SPOT_1M_REST_TABLE} \
          WHERE feed = '{feed}' AND ts >= {start} AND ts < {end}"
     )
 }
@@ -2512,19 +2513,50 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn test_tf_verify_targets_exclude_m1_and_d1() {
+    fn test_tf_verify_targets_are_every_minute_frame_above_1m_except_d1() {
+        // Asserted BY NAME. The old form of this test pinned `len() == 3` with
+        // the comment "5 TFs minus M1 minus D1"; when M2/M30/M60 joined the
+        // frame set it failed on the count alone, which tells you a number
+        // changed but not whether the RIGHT frames are covered. Naming them
+        // means a frame that quietly loses verification coverage — the actual
+        // risk — fails the build too.
         let targets = tf_verify_targets();
-        assert_eq!(targets.len(), 3, "5 TFs minus M1 minus D1");
+        assert_eq!(
+            targets,
+            vec![
+                TfIndex::M3,
+                TfIndex::M5,
+                TfIndex::M15,
+                TfIndex::M2,
+                TfIndex::M30,
+                TfIndex::M60,
+            ],
+            "every minute-scale frame the REST fold writes must be verified"
+        );
+
+        // M1 is the baseline the others are recomputed FROM — verifying it
+        // against itself proves nothing. D1 spans the whole session, so its
+        // only window is still open at the 15:40 pass.
         assert!(!targets.contains(&TfIndex::M1));
         assert!(!targets.contains(&TfIndex::D1));
-        assert_eq!(targets.first(), Some(&TfIndex::M3));
-        assert_eq!(targets.last(), Some(&TfIndex::M15));
+
+        // Structural cross-check: every frame the REST fold actually writes,
+        // minus those two, must appear here. This is what catches a NEW frame
+        // being added to the fold and silently never verified.
+        let folded_by_rest: Vec<TfIndex> = TfIndex::ALL
+            .into_iter()
+            .filter(|tf| !tf.is_second_scale() && !matches!(tf, TfIndex::M1 | TfIndex::D1))
+            .collect();
+        assert_eq!(
+            targets, folded_by_rest,
+            "a frame written by the REST fold but absent here would ship unverified"
+        );
     }
 
     /// C3: second-scale frames are GDF-feed-gated (zero rows arrive from
     /// the REST 1m fold), and a 30s target's penultimate window
     /// E=55_770 would sit inside the catchup margin — so the 15:40
-    /// verify pass must stay the minute-scale trio exactly.
+    /// verify pass must stay minute-scale.
     #[test]
     fn test_verify_targets_exclude_second_scale_frames() {
         let targets = tf_verify_targets();
@@ -2532,7 +2564,9 @@ mod tests {
             targets.iter().all(|tf| !tf.is_second_scale()),
             "second-scale frame leaked into verify targets: {targets:?}"
         );
-        assert_eq!(targets, vec![TfIndex::M3, TfIndex::M5, TfIndex::M15]);
+        // Deliberately NOT re-listing the frames here: the sibling test above
+        // owns that list. Two copies of the same expectation is how one of
+        // them goes stale unnoticed.
     }
 
     /// Per-TF daily bucket counts pinned as literals — each equals
@@ -2982,9 +3016,17 @@ mod tests {
     }
 
     #[test]
-    fn test_select_tf_union_sql_has_3_arms_excludes_1m_and_1d() {
+    fn test_select_tf_union_sql_has_one_arm_per_target_and_excludes_1m_and_1d() {
         let sql = select_tf_union_sql("groww", 1333, "NSE_EQ", 1_784_005_200_000_000_000);
-        assert_eq!(sql.matches(" UNION ALL ").count(), 2, "3 arms");
+        // Derived from the target list rather than hardcoded, so adding a
+        // frame cannot leave this arm count behind.
+        let targets = tf_verify_targets();
+        assert_eq!(
+            sql.matches(" UNION ALL ").count(),
+            targets.len() - 1,
+            "one arm per verify target ({} targets): {sql}",
+            targets.len()
+        );
         for tf in tf_verify_targets() {
             assert!(
                 sql.contains(&format!("FROM {}", tf.table_name())),
@@ -3017,10 +3059,15 @@ mod tests {
     }
 
     #[test]
-    fn test_select_instruments_sql_unions_all_4_tables_with_limit() {
+    fn test_select_instruments_sql_unions_1m_plus_every_target_with_limit() {
         let sql = select_instruments_sql("dhan", 1_784_005_200_000_000_000);
         assert!(sql.starts_with("SELECT DISTINCT security_id, segment FROM ("));
-        assert_eq!(sql.matches(" UNION ALL ").count(), 3, "1m + 3 targets");
+        // 1m (the baseline) plus one arm per verify target.
+        assert_eq!(
+            sql.matches(" UNION ALL ").count(),
+            tf_verify_targets().len(),
+            "1m + one arm per target: {sql}"
+        );
         assert!(sql.contains("FROM candles_1m"), "{sql}");
         assert!(sql.contains("FROM candles_15m"), "{sql}");
         assert!(!sql.contains("candles_1d"), "{sql}");
@@ -3149,7 +3196,10 @@ mod tests {
     fn test_select_spot_1m_count_sql_and_parse_count_dataset() {
         let day_start_nanos = 1_752_600_600_000_000_000_i64;
         let sql = select_spot_1m_count_sql("dhan", day_start_nanos);
-        assert!(sql.starts_with("SELECT count(*) FROM spot_1m_rest"));
+        assert!(
+            sql.starts_with("SELECT count(*) FROM rest_spot_1m"),
+            "{sql}"
+        );
         assert!(sql.contains("feed = 'dhan'"));
         // Micros window, same day-bounds shape as the sibling builders.
         let (start, end) = day_bounds_micros(day_start_nanos);

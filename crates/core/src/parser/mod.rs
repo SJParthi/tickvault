@@ -12,8 +12,19 @@
 //! - Market Status (8 bytes, code 7) — header only
 //! - Full (162 bytes, code 8) — Quote + OI + 5-level depth
 //! - Disconnect (10 bytes, code 50) — disconnect reason code
+//!
+//! # Depth feeds (SEPARATE endpoints, different wire shape)
+//! The depth-20 / depth-200 feeds use a **12-byte** header with `f64`
+//! prices and 16-byte one-sided levels, and bid/ask arrive as SEPARATE
+//! packets (codes 41 / 51). They are parsed by `depth.rs` via
+//! `split_depth_frame()` + `dispatch_depth_packet()` — NEVER by
+//! `dispatch_frame()`, whose 8-byte header would mis-read every field.
 
 // PR #4 (2026-05-19): `deep_depth` + `market_depth` parser modules DELETED.
+// 2026-08-09: `depth` re-added for the depth-20 / depth-200 revival — a
+// clean-room rebuild against `docs/dhan-ref/04-full-market-depth-websocket.md`,
+// not a restore of the deleted modules.
+pub mod depth;
 pub mod disconnect;
 pub mod dispatcher;
 pub mod full_packet;
@@ -33,7 +44,11 @@ pub mod truedata_router;
 pub mod truedata_session;
 pub mod types;
 
-// PR #4 (2026-05-19): depth re-exports retired.
-pub use dispatcher::{dispatch_frame, prewarm_dispatcher_counters};
+pub use depth::{
+    DepthFeedKind, DepthFrameIter, DepthLevelBuffer, DepthPacket, DepthPacketHeader, DepthPayload,
+    DepthSide, DepthSplitStop, depth_level_count, depth_packet_len, parse_depth_header,
+    parse_depth_packet, split_depth_frame,
+};
+pub use dispatcher::{dispatch_depth_packet, dispatch_frame, prewarm_dispatcher_counters};
 pub use order_update::{OrderUpdateParseError, build_order_update_login, parse_order_update};
 pub use types::{PacketHeader, ParseError, ParsedFrame};

@@ -67,5 +67,13 @@ sns_enabled = true
 # "Groww is the live feed" note; the Dhan REST retained surface is brought up
 # WITHOUT the WS lane by crates/app/src/dhan_rest_stack.rs.)
 # Neither feed places orders — dry_run=true above gates all order placement.
-dhan_enabled = false
+#
+# 2026-08-11 — dhan_enabled flipped false -> TRUE (operator quote, verbatim in
+# websocket-connection-scope-lock.md "2026-08-11 — THE DEFAULT IS FLIPPED ON").
+# The 2026-07-13 retirement note above is SUPERSEDED for the live WS lane; the
+# REST retained surface is unaffected and still runs alongside. Second gate:
+# TICKVAULT_DHAN_LIVE_FEED=1 in deploy/systemd/tickvault.service. Coupled
+# change: [rest_candle_fold] is OFF in base.toml — the two cannot both write
+# candles_<tf> under feed='dhan'.
+dhan_enabled = true
 groww_enabled = false

@@ -7,14 +7,18 @@ use std::sync::OnceLock;
 
 use metrics::Counter;
 use tickvault_common::constants::{
-    RESPONSE_CODE_DISCONNECT, RESPONSE_CODE_FULL, RESPONSE_CODE_INDEX_TICKER,
-    RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI,
-    RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
+    DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, RESPONSE_CODE_DISCONNECT,
+    RESPONSE_CODE_FULL, RESPONSE_CODE_INDEX_TICKER, RESPONSE_CODE_MARKET_DEPTH,
+    RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI, RESPONSE_CODE_PREVIOUS_CLOSE,
+    RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
 };
 
 // PR #4 (2026-05-19): DEEP_DEPTH_HEADER_SIZE retired alongside the
 // deleted deep_depth + market_depth parser modules.
 
+use super::depth::{
+    DepthFeedKind, DepthLevelBuffer, DepthPacket, DepthPayload, DepthSide, parse_depth_packet,
+};
 use super::disconnect::parse_disconnect_packet;
 use super::full_packet::parse_full_packet;
 use super::header::parse_header;
@@ -40,6 +44,13 @@ static C_FULL: OnceLock<Counter> = OnceLock::new();
 static C_DISCONNECT: OnceLock<Counter> = OnceLock::new();
 static C_UNKNOWN: OnceLock<Counter> = OnceLock::new();
 static C_UNKNOWN_RESPONSE_CODES_TOTAL: OnceLock<Counter> = OnceLock::new();
+// Depth-feed arms. Deliberately reuse the SAME metric name with new label
+// values rather than minting a new metric — same "packets by code" semantics,
+// zero new registration surface.
+static C_DEPTH_BID: OnceLock<Counter> = OnceLock::new();
+static C_DEPTH_ASK: OnceLock<Counter> = OnceLock::new();
+static C_DEPTH_DISCONNECT: OnceLock<Counter> = OnceLock::new();
+static C_DEPTH_UNKNOWN: OnceLock<Counter> = OnceLock::new();
 
 #[inline]
 fn dispatcher_counter(code: u8) -> &'static Counter {
@@ -73,6 +84,25 @@ fn dispatcher_counter(code: u8) -> &'static Counter {
     }
 }
 
+/// O(1) cached Counter handle for a depth-feed packet code (41 / 51 / 50).
+#[inline]
+fn depth_dispatcher_counter(code: u8) -> &'static Counter {
+    match DepthSide::from_feed_code(code) {
+        Some(DepthSide::Bid) => C_DEPTH_BID.get_or_init(
+            || metrics::counter!("tv_packets_by_response_code", "code" => "depth_bid"),
+        ),
+        Some(DepthSide::Ask) => C_DEPTH_ASK.get_or_init(
+            || metrics::counter!("tv_packets_by_response_code", "code" => "depth_ask"),
+        ),
+        None if code == RESPONSE_CODE_DISCONNECT => C_DEPTH_DISCONNECT.get_or_init(
+            || metrics::counter!("tv_packets_by_response_code", "code" => "depth_disconnect"),
+        ),
+        None => C_DEPTH_UNKNOWN.get_or_init(
+            || metrics::counter!("tv_packets_by_response_code", "code" => "depth_unknown"),
+        ),
+    }
+}
+
 #[inline]
 fn unknown_response_codes_counter() -> &'static Counter {
     C_UNKNOWN_RESPONSE_CODES_TOTAL
@@ -99,6 +129,10 @@ pub fn prewarm_dispatcher_counters() {
     dispatcher_counter(RESPONSE_CODE_FULL);
     dispatcher_counter(RESPONSE_CODE_DISCONNECT);
     dispatcher_counter(0xFF);
+    depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_BID);
+    depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_ASK);
+    depth_dispatcher_counter(RESPONSE_CODE_DISCONNECT);
+    depth_dispatcher_counter(0xFF);
     unknown_response_codes_counter();
 }
 
@@ -183,6 +217,64 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
 
 // PR #4 (2026-05-19): `dispatch_deep_depth_frame` + `split_stacked_depth_packets`
 // fns retired alongside deleted deep_depth + market_depth parser modules.
+// 2026-08-09: the depth entry point returns under a NEW shape — the frame
+// splitter lives in `depth::split_depth_frame` (an allocation-free iterator,
+// because one frame can carry many stacked packets) and this dispatcher parses
+// ONE already-split packet.
+
+/// Dispatches ONE depth-feed packet, already split out of its frame.
+///
+/// This is the depth-feed twin of [`dispatch_frame`] and is a SEPARATE entry
+/// point on purpose: depth packets carry a 12-byte header with `f64` prices,
+/// so routing them through `dispatch_frame`'s 8-byte header would mis-read
+/// every field and produce plausible-but-wrong prices.
+///
+/// Callers MUST split the frame first — a single WebSocket frame may carry
+/// several stacked packets:
+///
+/// ```ignore
+/// let mut buf = DepthLevelBuffer::new();
+/// let mut frames = split_depth_frame(raw, DepthFeedKind::Twenty);
+/// for packet in frames.by_ref() {
+///     let parsed = dispatch_depth_packet(packet, DepthFeedKind::Twenty, &mut buf)?;
+/// }
+/// // `frames.stop_reason()` reports a malformed tail rather than hiding it.
+/// ```
+///
+/// `kind` cannot be derived from the bytes — depth-20 and depth-200 share
+/// codes 41/51 and differ only in the meaning of header bytes 8..12 — so the
+/// connection supplies it.
+///
+/// # Errors
+/// Propagates every [`ParseError`] from [`parse_depth_packet`]: a short frame,
+/// an unknown response code, or a depth-200 row count above 200.
+///
+/// # Performance
+/// O(levels), bounded at 200. Zero heap allocation — levels are written into
+/// the caller's reusable buffer and the counter handles are cached.
+#[inline]
+pub fn dispatch_depth_packet<'b>(
+    raw: &[u8],
+    kind: DepthFeedKind,
+    buf: &'b mut DepthLevelBuffer,
+) -> Result<DepthPacket<'b>, ParseError> {
+    let packet = match parse_depth_packet(raw, kind, buf) {
+        Ok(packet) => packet,
+        Err(err) => {
+            if let ParseError::UnknownResponseCode(code) = err {
+                depth_dispatcher_counter(code).increment(1);
+                unknown_response_codes_counter().increment(1);
+            }
+            return Err(err);
+        }
+    };
+    let code = match packet.payload {
+        DepthPayload::Levels { side, .. } => side.as_feed_code(),
+        DepthPayload::Disconnect { .. } => RESPONSE_CODE_DISCONNECT,
+    };
+    depth_dispatcher_counter(code).increment(1);
+    Ok(packet)
+}
 
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
@@ -619,5 +711,133 @@ mod tests {
         buf[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
         let tick = unwrap_tick(dispatch_frame(&buf, 0).unwrap());
         assert!(tick.last_traded_price.is_nan());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Depth-feed dispatch tests (2026-08-09)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: test builders use constant offsets for packet construction
+mod depth_dispatch_tests {
+    use super::*;
+    use tickvault_common::constants::{
+        DEEP_DEPTH_HEADER_SIZE, DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS,
+    };
+
+    fn build_twenty(code: u8, sid: u32) -> Vec<u8> {
+        let total = DEEP_DEPTH_HEADER_SIZE + TWENTY_DEPTH_LEVELS * DEEP_DEPTH_LEVEL_SIZE;
+        let mut buf = vec![0u8; total];
+        buf[0..2].copy_from_slice(&(total as u16).to_le_bytes());
+        buf[2] = code;
+        buf[3] = 1; // NSE_EQ
+        buf[4..8].copy_from_slice(&sid.to_le_bytes());
+        for i in 0..TWENTY_DEPTH_LEVELS {
+            let base = DEEP_DEPTH_HEADER_SIZE + i * DEEP_DEPTH_LEVEL_SIZE;
+            buf[base..base + 8].copy_from_slice(&(1000.0_f64 + i as f64).to_le_bytes());
+            buf[base + 8..base + 12].copy_from_slice(&(5_u32 * (i as u32 + 1)).to_le_bytes());
+            buf[base + 12..base + 16].copy_from_slice(&(i as u32 + 1).to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn test_dispatch_depth_packet_routes_bid_and_ask() {
+        let mut buf = DepthLevelBuffer::new();
+        for (code, expected) in [
+            (DEEP_DEPTH_FEED_CODE_BID, DepthSide::Bid),
+            (DEEP_DEPTH_FEED_CODE_ASK, DepthSide::Ask),
+        ] {
+            let raw = build_twenty(code, 1333);
+            let packet =
+                dispatch_depth_packet(&raw, DepthFeedKind::Twenty, &mut buf).expect("parses");
+            assert_eq!(packet.header.security_id, 1333);
+            match packet.payload {
+                DepthPayload::Levels { side, levels } => {
+                    assert_eq!(side, expected);
+                    assert_eq!(levels.len(), TWENTY_DEPTH_LEVELS);
+                    assert!((levels[0].price - 1000.0).abs() < f64::EPSILON);
+                    assert_eq!(levels[0].quantity, 5);
+                }
+                DepthPayload::Disconnect { .. } => panic!("expected levels"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_dispatch_depth_packet_refuses_unknown_code() {
+        let mut raw = build_twenty(DEEP_DEPTH_FEED_CODE_BID, 1);
+        raw[2] = 77;
+        let mut buf = DepthLevelBuffer::new();
+        let err = dispatch_depth_packet(&raw, DepthFeedKind::Twenty, &mut buf).unwrap_err();
+        assert!(
+            matches!(err, ParseError::UnknownResponseCode(77)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_depth_packet_refuses_short_frame() {
+        let raw = build_twenty(DEEP_DEPTH_FEED_CODE_BID, 1);
+        let mut buf = DepthLevelBuffer::new();
+        let err = dispatch_depth_packet(&raw[..40], DepthFeedKind::Twenty, &mut buf).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InsufficientBytes { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_depth_packet_drives_a_stacked_frame_via_split() {
+        // The documented consumption pattern: split first, dispatch each packet.
+        let mut frame = build_twenty(DEEP_DEPTH_FEED_CODE_BID, 1333);
+        frame.extend_from_slice(&build_twenty(DEEP_DEPTH_FEED_CODE_ASK, 1333));
+
+        let mut buf = DepthLevelBuffer::new();
+        let mut iter = super::super::depth::split_depth_frame(&frame, DepthFeedKind::Twenty);
+        let mut sides = Vec::new();
+        // Collect first so the buffer borrow ends before the next dispatch.
+        let packets: Vec<&[u8]> = iter.by_ref().collect();
+        for packet in packets {
+            let parsed = dispatch_depth_packet(packet, DepthFeedKind::Twenty, &mut buf)
+                .expect("stacked packet parses");
+            if let DepthPayload::Levels { side, .. } = parsed.payload {
+                sides.push(side);
+            }
+        }
+        assert_eq!(sides, vec![DepthSide::Bid, DepthSide::Ask]);
+        assert!(iter.stop_reason().is_some());
+    }
+
+    #[test]
+    fn test_dispatch_depth_packet_never_panics_on_garbage() {
+        let mut state: u32 = 0x0BAD_F00D;
+        let mut buf = DepthLevelBuffer::new();
+        for len in 0..300_usize {
+            let mut frame = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                frame.push((state >> 8) as u8);
+            }
+            for kind in [DepthFeedKind::Twenty, DepthFeedKind::TwoHundred] {
+                let _ = dispatch_depth_packet(&frame, kind, &mut buf);
+            }
+        }
+    }
+
+    #[test]
+    fn test_prewarm_dispatcher_counters_includes_depth_arms() {
+        // Idempotent; must not panic and must touch the depth label arms.
+        prewarm_dispatcher_counters();
+        prewarm_dispatcher_counters();
+        assert!(std::ptr::eq(
+            depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_BID),
+            depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_BID)
+        ));
+        assert!(!std::ptr::eq(
+            depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_BID),
+            depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_ASK)
+        ));
     }
 }

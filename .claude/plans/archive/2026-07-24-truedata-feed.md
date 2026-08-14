@@ -1,6 +1,26 @@
 # Implementation Plan: TrueData Fourth Live-Tick Feed (feed='truedata')
 
-**Status:** APPROVED
+> **⚠ ARCHIVED 2026-08-10 — NOT completed, NOT cancelled on merit. Parked by a vendor
+> decision.** The operator asked whether to spend ~₹63,000/yr on TrueData instead of
+> ~₹7,066/yr on Dhan. An 11-agent audit found: (a) **both feeds are ~1-second conflated
+> L1** — TrueData's own corpus says "L1 data @1sec frequency", and NSE does not
+> redistribute tick-by-tick to ANY vendor, so the premium buys **no** granularity;
+> (b) TrueData's own words — *"as an Authorized Data Feed Vendor of NSE and MCX, they
+> provide only Level 1 Data"*, its depth product being *"Exclusive to BSE"* — mean it
+> **cannot sell 20-level or 200-level NSE depth at any price**, which Dhan includes in the
+> ₹499/month; (c) TrueData has **never delivered a single live byte to us**, so its
+> reliability is Unknown. TrueData's genuine advantages — a per-symbol tick **sequence
+> number** (the only protocol-level loss proof either vendor offers) and
+> **snapshot-on-subscribe** (Dhan has neither) — are real and are recorded here so a future
+> revisit starts from evidence, not memory.
+>
+> Archived to free the `plan-gate` V7 slot for `active-plan-feed-hardening.md`
+> (operator choice, AskUserQuestion 2026-08-10). **Nothing is deleted** — the ~7,000 LoC of
+> TrueData parsers already written remain in the tree, and the scope lock
+> `truedata-feed-scope-2026-07-24.md` (default-OFF, trial-first) is UNTOUCHED and still
+> governs. Reviving this plan needs only a fresh dated operator quote; no code is lost.
+
+**Status:** APPROVED (superseded by the 2026-08-10 vendor decision above)
 **Date:** 2026-07-24
 **Approved by:** Parthiban (operator) — approved 2026-07-24 in-session (AskUserQuestion: "Approve the plan, don't merge yet")
 **Scope authority:** `.claude/rules/project/truedata-feed-scope-2026-07-24.md` (operator quotes 2026-07-24)

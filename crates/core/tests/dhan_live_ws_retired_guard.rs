@@ -22,12 +22,25 @@ fn websocket_src_dir() -> PathBuf {
 
 #[test]
 fn test_main_feed_ws_modules_stay_deleted() {
-    // The five lane modules deleted by PR-C2. Re-creating any of them is a
-    // scope-lock violation without a fresh dated operator quote.
+    // RE-BLESSED 2026-08-11 for the operator-approved 16-connection revival.
+    //
+    // `connection.rs` and `subscription_builder.rs` were REMOVED from this
+    // list because the escape hatch this guard's own message names has been
+    // taken: the fresh dated operator quotes landed 2026-08-09 in
+    // websocket-connection-scope-lock.md (the revival section plus the
+    // "SAME DAY, SECOND QUOTE — 16 CONNECTIONS + depth-20/depth-200
+    // AUTHORIZED" section), and the companion plan was flipped to APPROVED
+    // on 2026-08-11. Those two modules are now REQUIRED, and their presence
+    // is asserted by `test_revived_lane_modules_are_present` below — so the
+    // protection is inverted, not dropped.
+    //
+    // The rest stay deleted. `connection_pool.rs` and `pool_watchdog.rs` are
+    // superseded by `pool_supervisor.rs` (a different, tested design), and
+    // re-creating the old ones would give the lane TWO supervisors.
+    // `depth_connection.rs` predates the revival and its replacement belongs
+    // to the depth work, not here.
     for deleted in [
-        "connection.rs",
         "connection_pool.rs",
-        "subscription_builder.rs",
         "pool_watchdog.rs",
         "rate_limit_cooldown.rs",
         "depth_connection.rs", // deleted earlier (AWS-lifecycle PR #4); stays gone
@@ -57,9 +70,12 @@ fn production_region(src: &str) -> String {
 }
 
 fn scan_rs_files(dir: &Path, hits: &mut Vec<String>, needle: &str) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| {
+        // 2026-08-10: was a silent `else { return; }` — an unreadable or
+        // MISSING directory became "nothing to check, pass", so the guard
+        // could report green while scanning zero files.
+        panic!("guard corpus unreadable {:?}: {}", dir, e)
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -96,10 +112,12 @@ fn test_websocket_mod_exports_only_surviving_modules() {
     // The websocket mod must not re-declare the deleted lane modules.
     let mod_src = fs::read_to_string(websocket_src_dir().join("mod.rs"))
         .expect("read crates/core/src/websocket/mod.rs");
+    // RE-BLESSED 2026-08-11 — see the note on
+    // `test_main_feed_ws_modules_stay_deleted`. `pub mod connection;` and
+    // `pub mod subscription_builder;` are now REQUIRED declarations, pinned
+    // positively by `test_revived_lane_modules_are_present`.
     for banned in [
-        "pub mod connection;",
         "pub mod connection_pool;",
-        "pub mod subscription_builder;",
         "pub mod pool_watchdog;",
         "pub mod rate_limit_cooldown;",
     ] {

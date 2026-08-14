@@ -39,6 +39,40 @@
 //! Flipping `dhan_enabled` back to `true` (Phase-A rollback) requires a
 //! fresh dated operator quote + updating this guard and
 //! `crates/common/tests/production_config_wiring.rs` in the same PR.
+//!
+//! ## INVERTED 2026-08-11 — Pin 1 now asserts the lane is ON
+//!
+//! An earlier revision of this header argued at length that the guard should
+//! NOT be inverted, on the reasoning that the 2026-08-09 revival quotes
+//! authorized the CODE and not a change of default. That reasoning was
+//! correct, and it was superseded the same week: on 2026-08-11 the operator
+//! gave the separate switch-it-on directive, recorded verbatim in
+//! `websocket-connection-scope-lock.md` under "2026-08-11 — THE DEFAULT IS
+//! FLIPPED ON". Both configs now carry `dhan_enabled = true` and the systemd
+//! unit sets `TICKVAULT_DHAN_LIVE_FEED=1`.
+//!
+//! The old text is deleted rather than annotated because it did not merely go
+//! stale — it gave a future reader a direct instruction ("inverting it would
+//! be a real regression") that, followed, would silently stop all live tick
+//! capture. A doc comment that argues against its own code is worse than no
+//! doc comment: the code is right and the prose is persuasive.
+//!
+//! The pin is KEPT and REVERSED, not removed. OFF is now the state that must
+//! never land unnoticed — a `dhan_enabled = false` looks identical to a
+//! healthy REST-only boot from every surface an operator reads, so only a
+//! build-failing assertion distinguishes "deliberately stood down" from
+//! "quietly broken".
+//!
+//! Verified executable 2026-08-11: `cargo test -p tickvault-app --test
+//! dhan_live_off_phase_a_guard` runs 4 tests green, and flipping either config
+//! to `false` turns `test_configs_lock_dhan_live_ws_on` red. (The earlier
+//! header's "could not be executed — core does not compile" note described a
+//! mid-revival tree and no longer applies.)
+//!
+//! Standing it back down is a scope change, not a config edit: record a fresh
+//! dated quote in the scope-lock file, then flip Pin 1's polarity here, in
+//! `production_config_wiring.rs`, and in `dhan_feed_wiring_guard.rs` — all in
+//! the same PR.
 
 use std::fs;
 use std::path::PathBuf;
@@ -69,22 +103,38 @@ fn strip_line_comments(src: &str) -> String {
         .join("\n")
 }
 
-/// Pin 1 — both boot-profile TOMLs lock the Dhan live WS feed OFF.
+/// Pin 1 — both boot-profile TOMLs lock the Dhan live WS feed state.
+///
+/// **INVERTED 2026-08-11.** This pinned `dhan_enabled = false` from the
+/// 2026-07-13 retirement until the operator quote recorded in
+/// `websocket-connection-scope-lock.md` ("2026-08-11 — THE DEFAULT IS FLIPPED
+/// ON") — the exact "fresh dated operator quote + update this guard in the same
+/// PR" protocol the old assertion message demanded. It now pins `= true`.
+///
+/// The pin is KEPT rather than deleted, and that is the whole point: a state
+/// nobody asserts is a state that drifts. Pinning ON means the flag cannot be
+/// quietly reverted to `false` — which would silently stop all live capture and
+/// look identical to a healthy REST-only boot — any more than it could
+/// previously be quietly set to `true`. The direction changed; the discipline
+/// did not.
 #[test]
-fn test_configs_lock_dhan_live_ws_off() {
+fn test_configs_lock_dhan_live_ws_on() {
     for rel in ["config/base.toml", "config/production.toml"] {
         let content = strip_line_comments(&read(rel));
         assert!(
-            content.contains("dhan_enabled = false"),
-            "{rel} must carry `dhan_enabled = false` — the Dhan live WS lane \
-             is retired by operator directive 2026-07-13 (Dhan is REST-only; \
-             Groww is the live feed)"
+            content.contains("dhan_enabled = true"),
+            "{rel} must carry `dhan_enabled = true` — the Dhan live WS lane was \
+             switched ON by the operator quote of 2026-08-11 recorded in \
+             .claude/rules/project/websocket-connection-scope-lock.md. Turning it \
+             back off is a scope change: record a fresh dated quote there and \
+             update this guard in the same PR."
         );
         assert!(
-            !content.contains("dhan_enabled = true"),
-            "{rel} must NOT carry `dhan_enabled = true` — re-enabling the \
-             retired live WS lane requires a fresh dated operator quote + \
-             updating this guard in the same PR"
+            !content.contains("dhan_enabled = false"),
+            "{rel} must NOT carry `dhan_enabled = false` — that silently stops all \
+             live tick capture while looking exactly like a healthy REST-only \
+             boot. Reverting needs a fresh dated operator quote + this guard \
+             updated in the same PR."
         );
     }
     // 2026-07-15: the Groww LIVE feed is retired too — prod is REST-only.

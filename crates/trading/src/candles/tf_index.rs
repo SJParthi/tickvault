@@ -30,7 +30,15 @@
 /// 2026-07-21): 1s..15s + 30s + 1m/3m/5m/15m + broker 1d — the 16
 /// second-scale frames are STRUCTURAL ONLY (GDF-feed-gated, zero rows
 /// until the GDF 1s live feed lands in its own lane).
-pub const TF_COUNT: usize = 21;
+///
+/// 24 since 2026-08-10: M2/M30/M60 appended (ordinals 21/22/23) to
+/// complete the thirteen current-day frames of operator Quote 13
+/// (2026-08-08). Three of those thirteen previously had no enum variant
+/// at all, so they could not be derived, stored, or queried. The append
+/// is ordinal-stable — every pre-existing ordinal 0..=20 is unchanged,
+/// so `SEAL_SPILL_FORMAT_VERSION` stays 1 and previously-spilled
+/// segments still replay.
+pub const TF_COUNT: usize = 24;
 
 /// 09:15:00 IST expressed as seconds-of-day (`9*3600 + 15*60`).
 /// The NSE regular trading session opens at 09:15:00 — every candle
@@ -42,10 +50,13 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 /// The NSE regular session closes at 15:30:00 — the candle window is
 /// the half-open interval `[09:15:00, 15:30:00)`, so the last 1-minute
 /// candle is `[15:29:00, 15:30:00)` (stamped 15:29). 375 1m candles/day.
-/// Test-only since the stage-3 dead-WS sweep (2026-07-17): its sole
-/// production consumer was the DELETED tick aggregator's session-window
-/// truncation; the pin tests below keep the canonical value asserted.
-#[cfg(test)]
+/// Production consumer restored 2026-08-09 with the tick aggregator rebuild:
+/// `MultiTfAggregator::consume_tick` gates the candle window on
+/// `[MARKET_OPEN_SECS_OF_DAY_IST, MARKET_CLOSE_SECS_OF_DAY_IST)`. (It was
+/// `#[cfg(test)]` between the 2026-07-17 stage-3 sweep, which deleted its
+/// only caller, and that rebuild.) NOTE the value is 56_400 = 15:40:00 IST,
+/// not 15:30 — the NSE CAS change of 2026-08-03; the pin test below asserts
+/// it against the common-crate G1 gate so the two can never drift.
 pub(crate) const MARKET_CLOSE_SECS_OF_DAY_IST: u32 = 56_400;
 
 /// Runtime-indexable handle for the 21 candle timeframes.
@@ -109,6 +120,34 @@ pub enum TfIndex {
     S15 = 19,
     /// 30-second candles (30 s). GDF-feed-gated (structural).
     S30 = 20,
+    // -- Minute frames completing the operator's 13-frame set ---------
+    // APPENDED after S30 (2026-08-10) so every pre-existing ordinal
+    // (0..=20) stays byte-stable and SEAL_SPILL_FORMAT_VERSION stays 1.
+    //
+    // WHY these three and not others: operator Quote 13 (2026-08-08,
+    // `daily-universe-scope-expansion-2026-05-27.md` §0) specifies
+    // thirteen current-day timeframes — 1s/5s/10s/15s/30s, then
+    // 1m/2m/3m/5m/15m/30m/60m, then 1d. Ten of the thirteen already
+    // existed; M2, M30 and M60 did NOT, so three of the frames the
+    // r8g.xlarge upgrade was bought to serve were literally
+    // unrepresentable. These are the missing three.
+    //
+    // Unlike the second-scale block above, these are NOT structural
+    // placeholders: the minute-scale frames are derivable from the
+    // existing tick and REST-fold paths the moment a producer exists.
+    /// 2-minute candles (120 s).
+    M2 = 21,
+    /// 30-minute candles (1_800 s).
+    M30 = 22,
+    /// 60-minute candles (3_600 s). NOTE the 09:15 IST session anchor
+    /// means the final 60m bucket of a regular session is PARTIAL —
+    /// the grid runs 09:15/10:15/…/15:15, so the last bar covers
+    /// 15:15–15:30 (15 minutes), not a full hour. Same for M30's
+    /// 15:15–15:30 bucket. That is a property of anchoring to the open
+    /// rather than to the hour, and it is deliberate: a bar that starts
+    /// at the open is comparable across days, one that starts at 09:00
+    /// is not.
+    M60 = 23,
 }
 
 impl TfIndex {
@@ -141,6 +180,9 @@ impl TfIndex {
         TfIndex::S14,
         TfIndex::S15,
         TfIndex::S30,
+        TfIndex::M2,
+        TfIndex::M30,
+        TfIndex::M60,
     ];
 
     /// Returns the ordinal (`0..TF_COUNT`) used to index the
@@ -181,6 +223,9 @@ impl TfIndex {
             18 => Some(Self::S14),
             19 => Some(Self::S15),
             20 => Some(Self::S30),
+            21 => Some(Self::M2),
+            22 => Some(Self::M30),
+            23 => Some(Self::M60),
             _ => None,
         }
     }
@@ -213,6 +258,9 @@ impl TfIndex {
             Self::S14 => "candles_14s",
             Self::S15 => "candles_15s",
             Self::S30 => "candles_30s",
+            Self::M2 => "candles_2m",
+            Self::M30 => "candles_30m",
+            Self::M60 => "candles_60m",
         }
     }
 
@@ -263,6 +311,9 @@ impl TfIndex {
             Self::S14 => 14,
             Self::S15 => 15,
             Self::S30 => 30,
+            Self::M2 => 120,
+            Self::M30 => 1_800,
+            Self::M60 => 3_600,
         }
     }
 
@@ -304,6 +355,9 @@ impl TfIndex {
             Self::S14 => "14s",
             Self::S15 => "15s",
             Self::S30 => "30s",
+            Self::M2 => "2m",
+            Self::M30 => "30m",
+            Self::M60 => "60m",
         }
     }
 
@@ -319,24 +373,46 @@ impl TfIndex {
     ///
     /// `tick_ist_secs` MUST be the IST epoch second derived from the
     /// WS LTT field (NEVER `Utc::now()` per `data-integrity.md`).
+    ///
+    /// # Saturating by design
+    ///
+    /// Every add here is `saturating_add`, NOT a bare `+`. The release profile
+    /// sets `overflow-checks = true` with `panic = "abort"`, so an arithmetic
+    /// overflow does not return a wrong number — it kills the process, and in
+    /// the 16-connection feed that means all sixteen sockets, not one tick.
+    ///
+    /// Today's only production caller (`MultiTfAggregator::consume_tick`)
+    /// gates on the session window first, and for any `ts` passing that gate
+    /// `ts % 86_400 >= MARKET_OPEN_SECS_OF_DAY_IST`, which algebraically rules
+    /// the overflow out. But that is an UNDOCUMENTED PRECONDITION on a `pub
+    /// fn`, enforced by a caller rather than by the type system — a second
+    /// call site would silently reintroduce a remote abort, since
+    /// `tick_ist_secs` is a raw `u32` off the wire that no parser
+    /// range-validates. Flagged by two independent adversarial reviews
+    /// (2026-08-09). Saturating makes the function safe for ANY input, so the
+    /// precondition stops being load-bearing.
     #[inline]
     #[must_use]
     pub const fn bucket_start(self, tick_ist_secs: u32) -> u32 {
         let secs = self.seconds_per_bucket();
         let day_start = (tick_ist_secs / 86_400) * 86_400;
-        let market_open = day_start + MARKET_OPEN_SECS_OF_DAY_IST;
+        let market_open = day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST);
         if tick_ist_secs <= market_open {
             return market_open;
         }
-        market_open + ((tick_ist_secs - market_open) / secs) * secs
+        market_open.saturating_add(((tick_ist_secs - market_open) / secs) * secs)
     }
 
     /// Returns the (exclusive) bucket-end for a given bucket-start.
-    /// Equivalent to `bucket_start + seconds_per_bucket()`.
+    /// Equivalent to `bucket_start + seconds_per_bucket()`, saturating.
+    ///
+    /// Saturating for the same reason as [`Self::bucket_start`]: this one has
+    /// NO production caller today, so it has no gate protecting it at all —
+    /// it is one direct call away from an abort on a wire-derived value.
     #[inline]
     #[must_use]
     pub const fn bucket_end(self, bucket_start: u32) -> u32 {
-        bucket_start + self.seconds_per_bucket()
+        bucket_start.saturating_add(self.seconds_per_bucket())
     }
 }
 
@@ -378,13 +454,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tf_index_all_has_twenty_one_distinct_variants() {
+    fn test_tf_index_all_has_twenty_four_distinct_variants() {
         let mut seen = std::collections::HashSet::new();
         for tf in TfIndex::ALL {
             assert!(seen.insert(tf), "duplicate variant in TfIndex::ALL: {tf:?}");
         }
         assert_eq!(TfIndex::ALL.len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 21);
+        assert_eq!(TF_COUNT, 24);
     }
 
     /// C3 (2026-07-21): the 16 second-scale frames are APPENDED after
@@ -399,10 +475,14 @@ mod tests {
             .iter()
             .map(|tf| tf.seconds_per_bucket())
             .collect();
+        // Appended 2026-08-10: M2/M30/M60 (120/1800/3600) complete the
+        // operator's thirteen frames. They land at the END of the
+        // second-scale block, which keeps that block strictly ascending —
+        // the property the windows() check below relies on.
         let expected: Vec<u32> = [60_u32, 180, 300, 900, 86_400]
             .into_iter()
             .chain(1..=15)
-            .chain([30])
+            .chain([30, 120, 1_800, 3_600])
             .collect();
         assert_eq!(secs, expected, "ordinal seconds sequence drifted");
         for block in [&secs[..5], &secs[5..]] {
@@ -418,6 +498,77 @@ mod tests {
         }
     }
 
+    /// ADVERSARIAL REGRESSION (2026-08-09, flagged by two independent
+    /// reviews). `tick_ist_secs` is a raw `u32` off the wire that no parser
+    /// range-validates. The release profile is `overflow-checks = true` with
+    /// `panic = "abort"`, so an overflow here does not produce a wrong candle
+    /// — it aborts the process, taking all sixteen sockets down. These must
+    /// return a saturated value for EVERY input, with no caller-side gate.
+    #[test]
+    fn test_bucket_math_saturates_instead_of_aborting_on_extreme_inputs() {
+        for tf in TfIndex::ALL {
+            for ts in [u32::MAX, u32::MAX - 1, u32::MAX - 86_399, 0, 1] {
+                let start = tf.bucket_start(ts);
+                // Reaching here at all is the assertion: a bare `+` would have
+                // aborted the test process under overflow-checks.
+                let end = tf.bucket_end(start);
+                assert!(
+                    end >= start,
+                    "{tf:?}: bucket_end({start}) = {end} must never wrap below \
+                     its start for ts {ts}"
+                );
+            }
+            // The saturating ceiling is reachable and stable.
+            assert_eq!(
+                tf.bucket_end(u32::MAX),
+                u32::MAX,
+                "{tf:?}: bucket_end must clamp at u32::MAX, not wrap to 0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tf_index_ordinals_are_append_only_literal_pins() {
+        assert_eq!(TfIndex::M1 as u8, 0);
+        assert_eq!(TfIndex::M3 as u8, 1);
+        assert_eq!(TfIndex::M5 as u8, 2);
+        assert_eq!(TfIndex::M15 as u8, 3);
+        assert_eq!(TfIndex::D1 as u8, 4);
+        assert_eq!(TfIndex::S1 as u8, 5);
+        assert_eq!(TfIndex::S2 as u8, 6);
+        assert_eq!(TfIndex::S3 as u8, 7);
+        assert_eq!(TfIndex::S4 as u8, 8);
+        assert_eq!(TfIndex::S5 as u8, 9);
+        assert_eq!(TfIndex::S6 as u8, 10);
+        assert_eq!(TfIndex::S7 as u8, 11);
+        assert_eq!(TfIndex::S8 as u8, 12);
+        assert_eq!(TfIndex::S9 as u8, 13);
+        assert_eq!(TfIndex::S10 as u8, 14);
+        assert_eq!(TfIndex::S11 as u8, 15);
+        assert_eq!(TfIndex::S12 as u8, 16);
+        assert_eq!(TfIndex::S13 as u8, 17);
+        assert_eq!(TfIndex::S14 as u8, 18);
+        assert_eq!(TfIndex::S15 as u8, 19);
+        assert_eq!(TfIndex::S30 as u8, 20);
+        // Appended 2026-08-10 to complete the operator's thirteen frames
+        // (Quote 13). ADD NEW FRAMES BELOW THIS LINE ONLY — inserting one
+        // above silently re-maps every already-spilled ordinal.
+        assert_eq!(TfIndex::M2 as u8, 21);
+        assert_eq!(TfIndex::M30 as u8, 22);
+        assert_eq!(TfIndex::M60 as u8, 23);
+        // The pinned block above must cover EVERY variant: a new appended
+        // frame that nobody pinned would slip through otherwise.
+        assert_eq!(
+            TF_COUNT, 24,
+            "a frame was added — pin its literal ordinal above"
+        );
+        // …and the seconds are pinned per-ordinal too, so a variant cannot be
+        // re-pointed at a different bucket size while keeping its ordinal.
+        assert_eq!(TfIndex::M1.seconds_per_bucket(), 60);
+        assert_eq!(TfIndex::D1.seconds_per_bucket(), 86_400);
+        assert_eq!(TfIndex::S1.seconds_per_bucket(), 1);
+        assert_eq!(TfIndex::S30.seconds_per_bucket(), 30);
+    }
     #[test]
     fn test_tf_index_ordinal_round_trip() {
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
@@ -465,6 +616,11 @@ mod tests {
             "candles_14s",
             "candles_15s",
             "candles_30s",
+            // Appended 2026-08-10 with M2/M30/M60 — the three frames of the
+            // operator's thirteen that previously had no enum variant.
+            "candles_2m",
+            "candles_30m",
+            "candles_60m",
         ];
         assert_eq!(names, expected);
         // No `_shadow` suffix anywhere — these are first-class tables.
@@ -521,7 +677,9 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         let expected = [
             "1m", "3m", "5m", "15m", "1d", "1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "9s",
-            "10s", "11s", "12s", "13s", "14s", "15s", "30s",
+            "10s", "11s", "12s", "13s", "14s", "15s",
+            "30s", // Appended 2026-08-10 (operator Quote 13's thirteen frames).
+            "2m", "30m", "60m",
         ];
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
             let name = tf.display_name();

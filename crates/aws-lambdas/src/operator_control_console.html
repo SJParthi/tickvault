@@ -158,8 +158,17 @@
         <div class="muted" id="feedsmsg" style="margin-top:8px"></div>
         <div class="muted" style="margin-top:6px">Every feed the app reports appears here automatically (a future feed #3 needs zero portal changes). Turning a feed OFF asks for confirmation; disabling Dhan during live trading is refused by the app itself. The pull line below each feed comes from today's fetch log: how many minute-pulls succeeded / failed / were rate-limited, and how fast the successful pulls landed in the last hour.</div>
       </div>
-      <div class="card"><div class="lbl">latency — how fast each official minute candle arrives after its minute closes</div>
+      <div class="card"><div class="lbl">latency — live feed, and how fast each official minute candle arrives</div>
         <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
+        <div class="lbl" style="margin-top:4px">live websocket — exchange stamp → arrived here, per socket</div>
+        <div id="latws" style="overflow:auto"></div>
+        <div class="muted" style="margin-top:6px">One row per open socket, read live from the app's own counters — NOT from the
+          database, because no table holds live-feed lag. <b>±1 second floor:</b> the exchange sends its timestamp in whole
+          seconds, so this shows outages and drift honestly but can never show milliseconds — treat a sub-second reading as
+          "under a second", not as a precise number. Figures are bucket upper bounds, so they over-state slightly within a
+          bucket. "+Inf" means slower than the largest bucket, i.e. unbounded. An empty table means the live feed produced no
+          ticks at all — never read that as "fast".</div>
+        <div class="lbl" style="margin-top:14px">official minute candles (REST pulls)</div>
         <div id="latrest" style="overflow:auto"></div>
         <div class="muted" style="margin-top:6px">One row per (broker, pull type) read from today's fetch log on the box —
           p50/p99 of "minute closed → data in hand", successful pulls only (approximate percentiles, 3 significant
@@ -187,7 +196,7 @@
           </div>
           <div style="flex:2 1 380px;min-width:280px">
             <div class="lbl">query</div>
-            <textarea id="dbsql" spellcheck="false">SELECT * FROM spot_1m_rest ORDER BY ts DESC LIMIT 50</textarea>
+            <textarea id="dbsql" spellcheck="false">SELECT * FROM rest_spot_1m ORDER BY ts DESC LIMIT 50</textarea>
             <div class="row" style="margin-top:10px">
               <button class="b-blu" onclick="runDbSql()">▶ Run</button>
               <button class="b-ghost" onclick="dbDownloadCsv()">⬇ Download CSV</button></div>
@@ -312,7 +321,7 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   const vals=tkeys.map(k=>String(rt[k]==null?'':rt[k]).trim()===''?null:(parseInt(rt[k],10)||0));
   const mx=Math.max(1,...vals.map(v=>v||0));
   $('bars').innerHTML=tkeys.map((k,i)=>bar(k,vals[i],mx)).join('');
-  // Dedup-key check: the real spot_1m_rest upsert key is 4 columns
+  // Dedup-key check: the real rest_spot_1m upsert key is 4 columns
   // (ts, security_id, exchange_segment, feed) per DEDUP_KEY_SPOT_1M_REST.
   // Three distinct states:
   //   4 = OK (green) · 0 = DEDUP disabled entirely (RED — duplicate rows will
@@ -480,7 +489,20 @@ function fmtLagMs(v){ if(v==null) return '-'; v=Number(v);
 // "-" = no successful pulls recorded today for that pair (never fake zeros).
 async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>';
   $('latrest').innerHTML='<span class="muted">measuring…</span>';
-  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latrest').innerHTML=''; return; }
+  $('latws').innerHTML='<span class="muted">measuring…</span>';
+  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latrest').innerHTML=''; $('latws').innerHTML=''; return; }
+  // Live socket lag. Deliberately rendered BEFORE the REST table: this is the
+  // path that carries ticks, and until 2026-08-14 nothing measured it at all.
+  const ws=Array.isArray(j.ws_latency)?j.ws_latency:[];
+  if(ws.length){
+    let w='<table><tr><th>socket</th><th>ticks measured</th><th>p50 exchange→here</th><th>p99 exchange→here</th></tr>';
+    ws.forEach(r=>{ w+='<tr><td><b>#'+esc(String(r.connection))+'</b></td>'
+      +'<td>'+Number(r.samples||0).toLocaleString()+'</td>'
+      +'<td>'+esc(fmtLagMs(r.p50_ms))+'</td><td>'+esc(fmtLagMs(r.p99_ms))+'</td></tr>'; });
+    $('latws').innerHTML=w+'</table>';
+  } else {
+    $('latws').innerHTML='<span class="warn">no live ticks measured — the live feed is off, produced nothing, or the app is unreachable. This is NOT a zero-latency reading.</span>';
+  }
   const rows=Array.isArray(j.rest_latency)?j.rest_latency:[];
   if(rows.length){
     let h='<table><tr><th>broker</th><th>pull type</th><th>ok pulls today</th><th>p50 after close</th><th>p99 after close</th></tr>';

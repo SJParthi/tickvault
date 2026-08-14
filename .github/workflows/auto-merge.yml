@@ -36,6 +36,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # 2026-08-10 audit: needed to READ the All Green check-run conclusion before
+  # arming. Read-only; it grants no new write surface.
+  checks: read
 
 jobs:
   auto-merge:
@@ -65,4 +68,37 @@ jobs:
             echo "::error::PR #${PR_NUMBER} is a draft — refusing to arm auto-merge."
             exit 1
           fi
+
+          # ---------------------------------------------------------------
+          # 2026-08-10 SECURITY FIX (audit finding, section 4b of
+          # docs/audits/2026-08-10-rust-only-o1-audit.md).
+          #
+          # Until now this fallback checked only fork-origin and draft status,
+          # then armed. It NEVER consulted the All Green result — so a manual
+          # dispatch could arm a PR whose only-green checks were the 4 legacy
+          # branch-protection ones, while Test / Coverage / Repo Guards were
+          # still red or pending. That is a side door around the exact control
+          # the 2026-07-04 hardening was built to create, and it reproduces the
+          # 2026-07-03 red-merge class (#1387 / #1388 / #1382) through a path
+          # the ci.yml redesign never touched.
+          #
+          # The header above already claims this file carries "the same guard
+          # from PR #1390". That guard was the fork/draft check ONLY. This is
+          # the missing half.
+          #
+          # Per merge-gate-lock §3.2 the verdict must be bound to the EXACT
+          # final head SHA: a green All Green on a superseded head counts for
+          # NOTHING, which is why the conclusion is read for head_sha rather
+          # than for the PR in general.
+          # ---------------------------------------------------------------
+          head_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')
+          all_green=$(gh api "repos/${REPO}/commits/${head_sha}/check-runs" \
+            --jq '[.check_runs[] | select(.name == "All Green")]
+                  | sort_by(.completed_at) | last | .conclusion // "missing"')
+          if [ "$all_green" != "success" ]; then
+            echo "::error::All Green is '${all_green}' on head ${head_sha} for PR #${PR_NUMBER} — refusing to arm auto-merge. Nothing merges without All Green (merge-gate-lock 2026-07-04 §2)."
+            exit 1
+          fi
+          echo "All Green verified success on head ${head_sha} — arming auto-merge."
+
           gh pr merge --auto --squash "https://github.com/${REPO}/pull/${PR_NUMBER}"
