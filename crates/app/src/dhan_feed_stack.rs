@@ -360,10 +360,10 @@ fn plan_pool(
     if set.is_empty() {
         return Ok(());
     }
-    let per_connection = usize::try_from(endpoint.max_instruments_per_connection())
+    let cap_per_connection = usize::try_from(endpoint.max_instruments_per_connection())
         .unwrap_or(usize::MAX)
         .max(1);
-    let needed = set.len().div_ceil(per_connection);
+    let needed = set.len().div_ceil(cap_per_connection);
     let available = endpoint.max_connections();
     if needed > usize::from(available) {
         error!(
@@ -384,7 +384,41 @@ fn plan_pool(
         });
     }
 
-    for shard in set.chunks(per_connection) {
+    // SPREAD across the authorized connections rather than PACK into the
+    // fewest (operator directive 2026-08-12, recorded in
+    // websocket-connection-scope-lock.md).
+    //
+    // Packing was `chunks(cap_per_connection)`, which put 4,565 main-feed
+    // instruments on ONE socket because Dhan allows 5,000 — leaving four
+    // authorized connections idle. Spreading uses the connections the operator
+    // paid the authorization for, and is better for three independent reasons:
+    //
+    //   - failure isolation: one socket dying takes ~1/5 of the book with it,
+    //     not all of it;
+    //   - head-of-line blocking: one slow frame stalls its own socket's
+    //     stream, and a fifth of the universe waits instead of all of it;
+    //   - decode parallelism: each connection's read task drains
+    //     independently, so frame decode spreads across cores.
+    //
+    // The Dhan per-connection CAP is still absolute. The shard width is
+    // `ceil(len / connections_to_use)`, which is `<= cap_per_connection`
+    // whenever `needed <= available` — the condition already enforced above —
+    // so spreading can never produce an over-subscribed socket. Pinned by
+    // `test_spread_shard_width_never_exceeds_the_dhan_cap`.
+    //
+    // `connections_to_use` is bounded by the instrument count as well: with 4
+    // depth-200 instruments and a 1-per-connection cap, this opens 4 sockets,
+    // NOT 5 with an empty one. An empty subscribe is a socket that reports
+    // healthy while carrying nothing — the false-OK the scope lock bans.
+    let connections_to_use = usize::from(available).min(set.len()).max(1);
+    let shard_width = set.len().div_ceil(connections_to_use).max(1);
+    debug_assert!(
+        shard_width <= cap_per_connection,
+        "spread shard width {shard_width} exceeds the Dhan per-connection cap \
+         {cap_per_connection} for {endpoint:?}"
+    );
+
+    for shard in set.chunks(shard_width) {
         let guard = SubscribeGuard::try_new(endpoint, shard.to_vec())?;
         let slot = pool
             .admit(endpoint, now)
@@ -2469,6 +2503,115 @@ mod tests {
             .collect()
     }
 
+    // -- pool spreading (operator directive 2026-08-12: use all 16) ---------
+
+    /// A set that FITS one connection must still spread across the authorized
+    /// five.
+    ///
+    /// This is the whole point of the change. 4,565 main-feed instruments fit
+    /// one 5,000-instrument socket, so packing opened exactly ONE connection
+    /// and left four authorized ones idle — which is how "16 authorized" was
+    /// really 7 in practice.
+    #[test]
+    fn test_main_feed_spreads_a_fitting_set_across_all_five_connections() {
+        let mut pool = PoolSupervisor::new();
+        let now = std::time::Instant::now();
+        // The real resolved-master size on the live box, 2026-08-12.
+        let plan = build_feed_stack_plan(&mut pool, now, &instruments(4565), &[], &[])
+            .expect("4565 instruments must plan cleanly");
+        assert_eq!(
+            plan.count_for(DhanEndpointType::MainFeed),
+            5,
+            "4,565 instruments must SPREAD across all 5 authorized main-feed \
+             connections; packing put them on 1 and left 4 idle"
+        );
+    }
+
+    /// The Dhan per-connection cap is absolute and spreading must never breach it.
+    ///
+    /// Spreading widens shards only when a set fits in FEWER connections than
+    /// are authorized, so the width can only shrink relative to the cap — but
+    /// this asserts the invariant directly rather than trusting that argument.
+    #[test]
+    fn test_spread_shard_width_never_exceeds_the_dhan_cap() {
+        for n in [1usize, 2, 49, 50, 51, 200, 249, 250, 4565, 25_000] {
+            let mut pool = PoolSupervisor::new();
+            let now = std::time::Instant::now();
+            let Ok(plan) = build_feed_stack_plan(&mut pool, now, &instruments(n), &[], &[]) else {
+                // Beyond 5 x 5,000 the planner refuses outright — that arm is
+                // covered by the PoolTooSmall path, not by this invariant.
+                continue;
+            };
+            let conns = plan.count_for(DhanEndpointType::MainFeed);
+            assert!(
+                conns <= 5,
+                "{n} instruments planned {conns} connections, over the cap"
+            );
+            if conns > 0 {
+                let widest = n.div_ceil(conns);
+                assert!(
+                    widest <= 5000,
+                    "{n} instruments over {conns} connections gives shards of \
+                     {widest}, above Dhan's 5,000 per-connection cap"
+                );
+            }
+        }
+    }
+
+    /// Never open a connection with nothing on it.
+    ///
+    /// With 4 depth-200 instruments and a 1-per-connection cap, the answer is
+    /// 4 sockets — not 5 with an empty one. An empty subscribe is a socket
+    /// that reports healthy while carrying nothing, which is exactly the
+    /// false-OK the scope lock forbids.
+    #[test]
+    fn test_spread_never_opens_an_empty_connection() {
+        let mut pool = PoolSupervisor::new();
+        let now = std::time::Instant::now();
+        let plan = build_feed_stack_plan(&mut pool, now, &[], &[], &instruments(4))
+            .expect("4 depth-200 instruments must plan cleanly");
+        assert_eq!(
+            plan.count_for(DhanEndpointType::Depth200),
+            4,
+            "4 instruments at 1-per-connection is 4 sockets — never 5 with one \
+             carrying nothing"
+        );
+    }
+
+    /// Depth-20 reaches all five without widening the strike selection.
+    ///
+    /// 84 instruments packed at 50-per-connection gave 2. Spread across the
+    /// authorized 5 gives shards of 17 — well inside the cap, and it needs no
+    /// deep-OTM strikes whose order books never move.
+    #[test]
+    fn test_depth_20_spreads_the_live_84_across_all_five() {
+        let mut pool = PoolSupervisor::new();
+        let now = std::time::Instant::now();
+        let plan = build_feed_stack_plan(&mut pool, now, &[], &instruments(84), &[])
+            .expect("84 depth-20 instruments must plan cleanly");
+        assert_eq!(
+            plan.count_for(DhanEndpointType::Depth20),
+            5,
+            "the live 84-instrument depth-20 set must use all 5 connections"
+        );
+    }
+
+    /// A set genuinely too large still fails closed.
+    ///
+    /// Spreading must not weaken the refusal: beyond 5 x 5,000 the planner
+    /// still refuses the WHOLE pool rather than silently truncating.
+    #[test]
+    fn test_oversize_set_still_refuses_rather_than_truncating() {
+        let mut pool = PoolSupervisor::new();
+        let now = std::time::Instant::now();
+        let err = build_feed_stack_plan(&mut pool, now, &instruments(25_001), &[], &[])
+            .expect_err("25,001 instruments exceed 5 x 5,000 and must refuse");
+        assert!(
+            matches!(err, FeedStackPlanError::PoolTooSmall { .. }),
+            "expected PoolTooSmall, got {err:?}"
+        );
+    }
+
     // -- the gate -----------------------------------------------------------
 
     #[test]
@@ -2555,7 +2698,11 @@ mod tests {
     // -- planning -----------------------------------------------------------
 
     #[test]
-    fn test_build_feed_stack_plan_shards_the_index_universe_onto_one_connection() {
+    fn test_build_feed_stack_plan_spreads_the_index_universe_one_per_connection() {
+        // CHANGED 2026-08-12 (spread, not pack): four index SIDs now open FOUR
+        // main-feed sockets, one instrument each, where packing opened one.
+        // Bounded by the instrument count, so no socket is empty — four
+        // instruments can never justify a fifth connection.
         let mut pool = PoolSupervisor::new();
         let plan = build_feed_stack_plan(
             &mut pool,
@@ -2564,20 +2711,24 @@ mod tests {
             &[],
             &[],
         )
-        .expect("four indices fit on one connection");
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 1);
+        .expect("four indices plan cleanly");
+        assert_eq!(plan.len(), 4);
+        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 4);
         assert_eq!(plan.count_for(DhanEndpointType::Depth20), 0);
         assert_eq!(plan.count_for(DhanEndpointType::Depth200), 0);
-        assert_eq!(pool.total_open(), 1);
+        assert_eq!(pool.total_open(), 4);
     }
 
     #[test]
-    fn test_plan_count_for_shards_at_the_documented_per_connection_caps() {
+    fn test_plan_count_for_spreads_across_the_authorized_connections() {
         let mut pool = PoolSupervisor::new();
-        // 12,001 main-feed instruments = 3 connections at 5,000 each.
-        // 101 depth-20 instruments = 3 connections at 50 each.
-        // 3 depth-200 instruments = 3 connections at 1 each.
+        // CHANGED 2026-08-12 (spread, not pack). Every set below fits inside
+        // the authorized pools, so each SPREADS across all 5 connections
+        // rather than packing into the fewest:
+        //   12,001 main-feed -> 5 conns of 2,401 (cap 5,000, well inside)
+        //      101 depth-20   -> 5 conns of 21    (cap 50)
+        // depth-200 is capped at 1 instrument per connection, so 3
+        // instruments is 3 sockets — bounded by the set, never padded.
         let plan = build_feed_stack_plan(
             &mut pool,
             Instant::now(),
@@ -2586,11 +2737,11 @@ mod tests {
             &instruments(3),
         )
         .expect("all three shards fit inside the authorized pools");
-        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 3);
-        assert_eq!(plan.count_for(DhanEndpointType::Depth20), 3);
+        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 5);
+        assert_eq!(plan.count_for(DhanEndpointType::Depth20), 5);
         assert_eq!(plan.count_for(DhanEndpointType::Depth200), 3);
-        assert_eq!(plan.len(), 9);
-        assert_eq!(pool.total_open(), 9);
+        assert_eq!(plan.len(), 13);
+        assert_eq!(pool.total_open(), 13);
     }
 
     #[test]
@@ -2665,7 +2816,10 @@ mod tests {
             .expect("inside the pool");
         let total: usize = plan.connections.iter().map(|c| c.guard.len()).sum();
         assert_eq!(total, 7_777, "sharding must not drop or duplicate anything");
-        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 2);
+        // CHANGED 2026-08-12: spread gives 5 conns of 1,556 rather than 2 of
+        // 5,000. Conservation above is the invariant that actually matters and
+        // is unchanged.
+        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 5);
     }
 
     #[test]
