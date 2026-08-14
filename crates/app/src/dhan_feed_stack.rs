@@ -1942,7 +1942,16 @@ async fn attach_depth_when_available(
 ) {
     let mut attempts: u32 = 0;
     loop {
-        if ist_second_of_day_now() >= DEPTH_ATTACH_DEADLINE_IST_SECS {
+        // The deadline gates RETRIES, never the FIRST attempt.
+        //
+        // Checking it before attempt 1 made a mid-session restart give up
+        // without even asking: a 12:30 IST redeploy is already past the 10:00
+        // deadline, yet that is precisely the moment the chain table is
+        // FULLEST — it has been filling since 09:16. Refusing to look would
+        // have left depth dark after every intra-day restart, which is the
+        // failure this whole task exists to end. Found before deploying,
+        // because the deploy that motivated it happened to be mid-session.
+        if attempts > 0 && ist_second_of_day_now() >= DEPTH_ATTACH_DEADLINE_IST_SECS {
             error!(
                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                 attempts,
@@ -4300,6 +4309,29 @@ mod tests {
         assert!(
             downgrade < drop_site,
             "downgrade() must happen before the template sender is dropped"
+        );
+    }
+
+    /// The deadline must gate RETRIES, never the FIRST attempt.
+    ///
+    /// A mid-session restart (a 12:30 IST redeploy, say) is already past the
+    /// 10:00 IST deadline — but that is exactly when `option_chain_1m` is
+    /// FULLEST, having filled since 09:16. Checking the deadline before
+    /// attempt 1 made depth give up without asking, leaving it dark after
+    /// every intra-day restart: the precise failure the late-attach exists to
+    /// end. Caught before deploying only because the deploy was mid-session.
+    #[test]
+    fn test_depth_deadline_gates_retries_not_the_first_attempt() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        assert!(
+            production.contains(
+                "attempts > 0 && ist_second_of_day_now() >= DEPTH_ATTACH_DEADLINE_IST_SECS"
+            ),
+            "the depth deadline MUST be guarded by `attempts > 0` — an unguarded check makes a \
+             mid-session restart give up before it has looked even once, exactly when the chain \
+             table is fullest"
         );
     }
 }
