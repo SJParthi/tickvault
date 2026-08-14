@@ -197,7 +197,33 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
 /// (always >90d-old) partition would be detached every run, removing the live
 /// master. It is small (~742 rows) + fully re-derivable from CSV each boot, so
 /// it is exempt exactly like `instrument_lifecycle`.
-pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &["instrument_lifecycle", "index_constituency"];
+///
+/// The three `spot_1m_rest` / `option_chain_1m` / `option_contract_1m_rest`
+/// entries (added 2026-08-14) are the PRE-RENAME names, and they are exempt for
+/// a different reason than the two above: **they name a table that ceases to
+/// exist.** The boot migration issues `RENAME TABLE '<old>' TO '<new>'`
+/// (`spot_1m_rest_persistence.rs`, `option_chain_1m_persistence.rs`,
+/// `option_contract_1m_rest_persistence.rs`), which carries every row forward
+/// under the new name — so after the first boot on this build there is no old
+/// table left to sweep. They are listed only because their `LEGACY_*_TABLE`
+/// constants still exist to drive that rename, and
+/// `partition_retention_coverage_guard` — correctly — demands a decision for
+/// every table-name constant in the crate rather than letting one slip through
+/// undeclared.
+///
+/// Putting them in a SWEEP list instead would be wrong twice over: the sweeper
+/// would issue partition detaches against a name that no longer resolves, and
+/// the real data would be swept anyway under its new name, which is already
+/// covered above. Exempt is the honest answer, and it costs nothing — the row
+/// data itself is retained and swept under the new name.
+pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
+    "instrument_lifecycle",
+    "index_constituency",
+    // Pre-2026-08-14 names, renamed forward at boot — see the doc comment above.
+    "spot_1m_rest",
+    "option_chain_1m",
+    "option_contract_1m_rest",
+];
 
 // ---------------------------------------------------------------------------
 // Partition Manager
