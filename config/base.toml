@@ -624,6 +624,37 @@ retry_backoff_cap_secs = 300
 live_subscription_from_master = true
 
 # ===========================================================================
+# Boot-time WAL re-fold (2026-08-14).
+#
+# Every frame the live lane receives is written to a write-ahead log BEFORE it
+# is parsed. That is the durability floor the whole capture design rests on —
+# and until now the log was WRITE-ONLY: on boot the staged live-feed frames
+# were counted, logged, and dropped, so a session that died mid-market lost
+# every frame captured since its last flush, and every "the ring refused it but
+# replay recovers it" comment in the codebase was false.
+#
+# Turning this on is safe because of two properties, neither optional:
+#
+#   1. Replay-stable sequences. A re-appended row carries the SAME
+#      (ts, security_id, segment, capture_seq, feed) key as the original, so it
+#      collapses into it. Re-folding rows that already persisted is a no-op —
+#      which is what makes running this on every boot safe rather than a
+#      double-count.
+#   2. TICKS ONLY. The aggregator is not run. A crashed session's log holds a
+#      TAIL of a minute, so folding it into candles could compute a bar from
+#      fewer ticks than the original and overwrite a good candle with a worse
+#      one. Candles for a recovered window are rebuilt from the ticks.
+#
+# The serde default stays `false`, so an absent section is byte-identical to
+# the pre-feature boot. Reversible by setting this back to false + a restart.
+[dhan_wal_replay]
+enabled = true
+# Boot is latency-sensitive: the box starts 08:30 IST and the market opens
+# 09:15. Beyond this cap the remaining frames are left staged and reported
+# LOUDLY, never silently discarded.
+max_frames = 200000
+
+# ===========================================================================
 # Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
 # of the Groww per-minute REST plan). When enabled: every session minute —
 # sequenced right after the Groww spot fetch — pull the CURRENT-expiry
