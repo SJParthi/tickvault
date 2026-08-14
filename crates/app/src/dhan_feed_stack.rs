@@ -2992,7 +2992,7 @@ mod tests {
     const SIMULTANEOUS_RECV_NANOS: i64 = (LTT_IST_SECS as i64 - 19_800) * 1_000_000_000;
 
     #[test]
-    fn ws_lag_subtracts_the_ist_offset_and_never_adds_it() {
+    fn ws_lag_ms_subtracts_the_ist_offset_and_never_adds_it() {
         // THE test. `data-integrity.md` calls the WebSocket timestamp rule the
         // single most critical data-integrity rule in the repo: the exchange
         // stamp is IST-epoch, so comparing it to a UTC clock requires
@@ -3016,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn ws_lag_measures_a_real_delay_in_milliseconds() {
+    fn ws_lag_ms_measures_a_real_delay_in_milliseconds() {
         let recv = SIMULTANEOUS_RECV_NANOS + 250 * 1_000_000;
         assert_eq!(ws_lag_ms(LTT_IST_SECS, recv), Some(WsLag::Measured(250.0)));
         // The 46-second class this feed was retired for must render honestly.
@@ -3028,7 +3028,7 @@ mod tests {
     }
 
     #[test]
-    fn ws_lag_clamps_a_negative_rather_than_recording_it() {
+    fn ws_lag_ms_clamps_a_negative_rather_than_recording_it() {
         // Dhan sends LTT as whole SECONDS, so truncation alone can make a fast
         // delivery compute negative. Recording a negative would corrupt the
         // histogram; silently dropping it would hide a genuinely wrong host
@@ -3038,7 +3038,7 @@ mod tests {
     }
 
     #[test]
-    fn ws_lag_excludes_an_implausible_timestamp_instead_of_recording_zero() {
+    fn ws_lag_ms_excludes_an_implausible_timestamp_instead_of_recording_zero() {
         // A zero or garbage LTT is not a zero-latency tick. Folding it in as
         // 0.0 would drag every percentile toward zero and make a DEGRADING
         // feed look like it was getting faster — the false-OK class rule 11
