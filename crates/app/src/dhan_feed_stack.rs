@@ -1966,11 +1966,12 @@ pub fn ws_lag_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<WsLa
     if lag_ms < 0 {
         return Some(WsLag::ClampedNegative);
     }
-    // APPROVED: i64 -> f64 loses precision only above 2^53, which is ~285,000
-    // YEARS expressed in milliseconds. Every value reaching here is a delivery
-    // lag bounded in practice by the reconnect ladder and in principle by the
+    // i64 -> f64 loses precision only above 2^53, which is ~285,000 YEARS
+    // expressed in milliseconds. Every value reaching here is a delivery lag,
+    // bounded in practice by the reconnect ladder and in principle by the
     // plausibility floor above, so the lossy range is unreachable. The metrics
     // crate takes f64, so the conversion is required, not incidental.
+    // APPROVED: lossy range (>2^53 ms ~ 285,000 years) is unreachable for a lag.
     #[allow(clippy::cast_precision_loss)]
     Some(WsLag::Measured(lag_ms as f64))
 }
