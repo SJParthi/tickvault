@@ -217,3 +217,67 @@ logs + `tv_dhan_order_updates_total` / `tv_dhan_order_push_respawn_total` +
 ws_event_audit + order_audit mode='paper' rows. Serde default stays OFF; live order
 fire remains locked. The operator's go for the merge lands here verbatim:
 <OPERATOR-GO-HERE>
+
+---
+
+## §2.3 — 2026-08-14: the REVIVED LIVE-LANE alert family joins the allowed set
+
+**The verbatim operator authorization (2026-08-14, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Go ahead with the entire fixes dude okay? Not per Sid cloudwatch right per websocket
+> connections or entire webscoket connections right dude ami right dude"
+
+Given in DIRECT response to a message whose priority table listed, as item 3 of eight,
+*"Stop the console lying + wire alarms"* — for a lane the same message had just shown to
+have **zero CloudWatch alarms and zero Telegram events**. This dated row is the rule-file
+edit §3 demands before any new Dhan-scoped page, and it is recorded BEFORE the terraform
+lands.
+
+**Why this file, when its §1 governs the REST-only surface.** When this lock was written
+on 2026-07-14 the Dhan live WebSocket had been retired for a day, so "Dhan-scoped alert"
+and "Dhan REST alert" were the same set. The 2026-08-09 revival re-created a Dhan surface
+this lock never contemplated. Rather than let a whole live lane page the operator through
+a gap in an unrelated file's wording, the family is declared HERE, under the same
+discipline as the other four.
+
+**The new family (5) — LIVE-LANE INTEGRITY.** Four alarms, all on metrics that **already
+exist and are already shipped to CloudWatch today with nothing consuming them**:
+
+| Metric | Alarm fires when | Why it is not noise |
+|---|---|---|
+| `tv_dhan_feed_stack_up` | `< 1` | The lane is down. Today this can only be discovered by opening a console that reports a hardcoded constant. |
+| `tv_ticks_dropped_total` | non-zero over a window | The repo's own EMF notes call this "the single largest tick-loss window". It is billed and shipped today with **no alarm** — paying to publish a number nobody watches. |
+| `tv_dhan_ws_park_total` | non-zero | A socket has parked PERMANENTLY on a fatal disconnect and will never dial again. Silent today. |
+| `tv_dhan_feed_drain_respawn_total` | exceeds its restart cap | The drain died repeatedly; the lane is carrying nothing. |
+
+**Deliberately NOT alarmed, and the reason recorded so it is not "fixed" later:**
+per-instrument latency and per-instrument silence. Latency alarms on a per-instrument
+basis would page constantly, because Dhan's LTT is last-TRADE time and a thin option is
+legitimately minutes stale — that is the instrument being quiet, not the feed being
+broken. Silence is already owned by `scan_silence` → `RISK-GAP-03`. Adding a second
+signal for the same condition would produce two contradicting pages for one event.
+
+**Cardinality is bounded by design (the operator's own correction, second sentence of the
+quote above):** latency is dimensioned **per WebSocket connection — 16 fixed slots** —
+never per instrument. Per-instrument figures live in RAM and are served over the existing
+API. This is not a preference: 4,565 per-instrument CloudWatch metrics ≈ $1,369/mo
+against a budget whose AUTOMATIC action is `STOP_EC2_INSTANCES`, i.e. the observability
+feature would stop the trading box. 16 dimensions ≈ $4.80/mo.
+
+**Cost:** +4 alarms + the per-connection latency dimensions ≈ **$6–7/mo**. This is
+inside the operator's ₹7,500/mo ceiling ONLY alongside the Elastic-IP release he already
+approved on 2026-07-19 (−₹361/mo); without that lever the high-side envelope sits ~₹118
+under the ceiling, which is not real margin. Stated plainly rather than absorbed
+silently.
+
+**The §2 four-item REST family is UNCHANGED.** This family covers the LIVE lane only.
+Every "deleted or silenced" row in §2's second table stays deleted and silenced — the
+mid-session profile pages, the REST canary, the no-tick watchdog, and the two
+order-update alarms are NOT revived by this row.
+
+**What a PR that violates §2.3 looks like (REJECT):** adds a per-INSTRUMENT CloudWatch
+dimension for latency or any other live-lane signal; adds a live-lane page outside the
+four metrics above without its own dated row here; re-introduces any of the §2 deleted
+alarms under cover of this family; or claims sub-second latency accuracy anywhere in an
+operator-facing surface (the ±1 s floor is structural — Dhan's LTT is whole seconds).

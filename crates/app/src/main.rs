@@ -2056,6 +2056,9 @@ async fn main() -> Result<()> {
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
             questdb: config.questdb.clone(),
+            // So the lane can report whether it is ACTUALLY running, instead of
+            // the console reading a flag nothing ever set (2026-08-14).
+            feed_runtime: std::sync::Arc::clone(&feed_runtime),
             // The process-wide WAL opened in STAGE-C above. This is the FIRST
             // frame-append consumer since PR-C2 retired the Dhan lane on
             // 2026-07-13 (the note there — "there is no frame APPEND site left
