@@ -34,7 +34,7 @@ for t in $TARGETS; do
 done"#,
     r#"systemctl enable tickvault || true"#,
     r#"systemctl start tickvault || true"#,
-    r#"sleep 3; qc() { curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20$1" 2>/dev/null | grep -o '\[\[[0-9]*' | grep -o '[0-9]*'; }; T=$(qc ticks); C=$(qc candles_1m); S=$(qc spot_1m_rest); O=$(qc option_chain_1m); K=$(qc option_contract_1m_rest); A=$(qc rest_fetch_audit); echo "WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?} spot_1m_rest=${S:-?} option_chain_1m=${O:-?} option_contract_1m_rest=${K:-?} rest_fetch_audit=${A:-?}"; if [ "${T:-0}" = 0 ] && [ "${C:-0}" = 0 ] && [ "${S:-0}" = 0 ] && [ "${O:-0}" = 0 ] && [ "${K:-0}" = 0 ] && [ "${A:-0}" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain — inspect the counts + TRUNCATE-FAILED lines above'; fi"#,
+    r#"sleep 3; qc() { curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20$1" 2>/dev/null | grep -o '\[\[[0-9]*' | grep -o '[0-9]*'; }; T=$(qc ticks); C=$(qc candles_1m); S=$(qc rest_spot_1m); O=$(qc rest_option_chain_1m); K=$(qc rest_option_contract_1m); A=$(qc rest_fetch_audit); echo "WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?} rest_spot_1m=${S:-?} rest_option_chain_1m=${O:-?} rest_option_contract_1m=${K:-?} rest_fetch_audit=${A:-?}"; if [ "${T:-0}" = 0 ] && [ "${C:-0}" = 0 ] && [ "${S:-0}" = 0 ] && [ "${O:-0}" = 0 ] && [ "${K:-0}" = 0 ] && [ "${A:-0}" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain — inspect the counts + TRUNCATE-FAILED lines above'; fi"#,
 ];
 
 /// legacy: `lambda_handler docker-reset cmds` (handler.py:1258-1306) — captured from the RUNNING oracle.

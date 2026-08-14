@@ -187,7 +187,7 @@
           </div>
           <div style="flex:2 1 380px;min-width:280px">
             <div class="lbl">query</div>
-            <textarea id="dbsql" spellcheck="false">SELECT * FROM spot_1m_rest ORDER BY ts DESC LIMIT 50</textarea>
+            <textarea id="dbsql" spellcheck="false">SELECT * FROM rest_spot_1m ORDER BY ts DESC LIMIT 50</textarea>
             <div class="row" style="margin-top:10px">
               <button class="b-blu" onclick="runDbSql()">▶ Run</button>
               <button class="b-ghost" onclick="dbDownloadCsv()">⬇ Download CSV</button></div>
@@ -312,7 +312,7 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   const vals=tkeys.map(k=>String(rt[k]==null?'':rt[k]).trim()===''?null:(parseInt(rt[k],10)||0));
   const mx=Math.max(1,...vals.map(v=>v||0));
   $('bars').innerHTML=tkeys.map((k,i)=>bar(k,vals[i],mx)).join('');
-  // Dedup-key check: the real spot_1m_rest upsert key is 4 columns
+  // Dedup-key check: the real rest_spot_1m upsert key is 4 columns
   // (ts, security_id, exchange_segment, feed) per DEDUP_KEY_SPOT_1M_REST.
   // Three distinct states:
   //   4 = OK (green) · 0 = DEDUP disabled entirely (RED — duplicate rows will

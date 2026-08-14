@@ -2410,6 +2410,17 @@ mod tests {
         // the ratchet caught this edit, which is exactly its job — the banner is
         // the operator's only in-console statement of when the box goes down.
         //
+        // 2026-08-14: THIRD divergence, and unlike the first two this one is
+        // not a correction — it is a mechanical follow-on. The QuestDB table
+        // `spot_1m_rest` was renamed `rest_spot_1m`, and the console embeds
+        // that name in two places: the Data-tab default query the operator
+        // actually runs, and a dedup-key comment. A stale name in the default
+        // query is not cosmetic — it hands the operator a query that errors
+        // out on a table that no longer exists, on the one screen he uses to
+        // check the box. Byte-length is UNCHANGED (both names are 12 chars),
+        // so only the digest moves; that is itself the evidence this edit is
+        // a rename and nothing else.
+        //
         // The pin REMAINS a content ratchet — any further unreviewed edit to
         // the console HTML still fails the build; it simply no longer claims
         // legacy-byte-identity.
@@ -2417,7 +2428,7 @@ mod tests {
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "a0310d91329bd0c926261f79e907b9f35169a9234d791b09265d14f117636825"
+            "5de4e40e73edba376d27a382c3ee358bead2741c05513c00fdb7373873e28d2b"
         );
         assert_eq!(CONSOLE_HTML.len(), 45_612);
     }
@@ -2590,15 +2601,15 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_key_query_targets_spot_1m_rest() {
-        // REST-era repoint (2026-07-16): the shield reads spot_1m_rest's
+    fn test_dedup_key_query_targets_rest_spot_1m() {
+        // REST-era repoint (2026-07-16): the shield reads rest_spot_1m's
         // 4-column key (ts, security_id, exchange_segment, feed per
         // DEDUP_KEY_SPOT_1M_REST), not the retired ticks 5-column key.
         let dedup_cmd = VIEW_COMMANDS
             .iter()
             .find(|c| c.contains("DEDUP_KEYS="))
             .unwrap();
-        assert!(dedup_cmd.contains("table_columns(%27spot_1m_rest%27)"));
+        assert!(dedup_cmd.contains("table_columns(%27rest_spot_1m%27)"));
         assert!(!dedup_cmd.contains("'ticks'"));
     }
 
@@ -2618,7 +2629,7 @@ mod tests {
 
     #[test]
     fn test_db_console_default_query_targets_live_table() {
-        assert!(CONSOLE_HTML.contains("SELECT * FROM spot_1m_rest ORDER BY ts DESC LIMIT 50"));
+        assert!(CONSOLE_HTML.contains("SELECT * FROM rest_spot_1m ORDER BY ts DESC LIMIT 50"));
         assert!(!CONSOLE_HTML.contains("SELECT * FROM ticks ORDER BY ts DESC LIMIT 50"));
     }
 
@@ -3038,7 +3049,7 @@ mod tests {
         ] {
             assert!(joined.contains(&format!("$(qc {t})")), "{t}");
         }
-        assert!(joined.contains("spot_1m_rest=${S:-?}"));
+        assert!(joined.contains("rest_spot_1m=${S:-?}"));
         // Review fix M2: a missing/erroring count defaults to 0 (absent
         // table = nothing left = wiped). The old default-to-1 made EVERY
         // post-nuke wipe read WIPE-PARTIAL forever.
@@ -3632,7 +3643,7 @@ data-pull phase, so the system is never blinded mid-trade";
     }
 
     // ---------------------------------------------------- class DedupKeyShield
-    // The dedup shield reads spot_1m_rest's REAL 4-column upsert key
+    // The dedup shield reads rest_spot_1m's REAL 4-column upsert key
     // (ts, security_id, exchange_segment, feed per DEDUP_KEY_SPOT_1M_REST in
     // crates/storage/src/spot_1m_rest_persistence.rs) — repointed 2026-07-16
     // from the retired ticks 5-column key.
