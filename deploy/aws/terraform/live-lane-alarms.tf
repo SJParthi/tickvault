@@ -169,3 +169,91 @@ resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
   # mean the dropped ticks came back.
   ok_actions = []
 }
+
+# ---------------------------------------------------------------------------
+# 4. The ring REFUSED frames (2026-08-14 — audit finding)
+# ---------------------------------------------------------------------------
+# Added after an adversarial tick-loss sweep found that the ring's own refusal
+# counters were EMF-shipped and alarmed by nothing. That is the same
+# paid-for-and-unwatched shape alarm 3 above was created to end, and it matters
+# more here: a ring refusal is not backpressure that later drains, it is the
+# frame being discarded. The sink-side doc-comment used to call this "NOT
+# capture loss — replay recovers it"; that is FALSE as shipped, because boot
+# replay drops every live-feed frame (there is no re-fold path). The drain-side
+# log says so honestly. Until a WAL re-fold exists, a ring refusal is permanent
+# loss and must page.
+#
+# Both counters are summed across their labels: `tv_dhan_ws_ring_full_total`
+# (slot exhaustion, 65,536 frames) and `tv_dhan_ws_ring_bytes_full_total`
+# (byte budget, 256 MiB). They are separate alarms because they have different
+# causes and different fixes — slots mean the fold is behind, bytes mean a few
+# large frames (depth-200 is 512 KiB, so 512 of them exhaust the whole budget
+# and starve the main feed).
+resource "aws_cloudwatch_metric_alarm" "ws_ring_full" {
+  alarm_name        = "tv-${var.environment}-ws-ring-full"
+  alarm_description = "The live-feed frame ring REFUSED frames because its 65,536 slots were full. Those frames are gone: boot replay deliberately drops live-feed WAL records, so nothing re-folds them into the ticks table. The cause is almost always downstream — a QuestDB stall or a slow ILP flush blocks the drain, so the ring backs up and the sink refuses the newest frames. Triage: check QuestDB health and flush latency first, then tv_ticks_dropped_total to see whether rows were also lost at the writer."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_dhan_ws_ring_full_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions — a refused frame never comes back.
+  ok_actions = []
+}
+
+resource "aws_cloudwatch_metric_alarm" "ws_ring_bytes_full" {
+  alarm_name        = "tv-${var.environment}-ws-ring-bytes-full"
+  alarm_description = "The live-feed frame ring REFUSED frames because its 256 MiB byte budget was exhausted, even though slots remained. This is the LARGE-FRAME shape rather than the slow-drain shape: a depth-200 frame can be 512 KiB, so roughly 512 of them consume the entire budget and every main-feed frame is then refused behind them. The frames are permanently lost — boot replay drops live-feed WAL records. Triage: confirm whether depth sockets are attached, then check whether the drain is also stalled (tv_dhan_ws_ring_full_total)."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_dhan_ws_ring_bytes_full_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  ok_actions    = []
+}
+
+# ---------------------------------------------------------------------------
+# 5. Master sourcing silently collapsed the universe (2026-08-14 — audit)
+# ---------------------------------------------------------------------------
+# The worst signal in the lane, because it looks exactly like health. When the
+# resolved-master artifact is missing or unparseable, the lane falls back to the
+# 4 hardcoded index SIDs while the config asks for the full resolved set — 4,565
+# instruments on 2026-08-12, i.e. a 99.9% collapse. Every other gauge reads
+# normal: the lane is up, ticks flow, and the gap detector reports zero
+# never-ticked instruments because it only seeds what was actually subscribed.
+# Before this alarm the sole evidence was one uncoded error line.
+resource "aws_cloudwatch_metric_alarm" "live_universe_fallback" {
+  alarm_name        = "tv-${var.environment}-live-universe-fallback"
+  alarm_description = "The live lane fell back to the 4 hardcoded index instruments while the config requested the master-sourced universe. This is a ~99.9% collapse of the subscribed set that looks HEALTHY on every other signal — the lane is up, ticks flow, and never-ticked reads zero because only the subscribed instruments are seeded. Cause is the day's resolved-mapping artifact being missing or unparseable. Triage: check that the daily universe rider ran and wrote today's artifact, then restart the app; the universe is resolved once at boot and does not re-resolve mid-session."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_dhan_live_universe_fallback_total"
+  namespace           = local.app_namespace
+  # The universe is resolved ONCE per boot, so this fires at most once per
+  # restart. A 300s window with threshold 1 catches that single increment.
+  period             = 300
+  statistic          = "Sum"
+  dimensions         = local.app_dimensions
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions: the counter is cumulative and the session is already running
+  # on the wrong universe. Only a restart fixes it, and that is a new session.
+  ok_actions = []
+}

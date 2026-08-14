@@ -167,8 +167,30 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path.ends_with(".xml")
         || path.ends_with(".alloy")
         || path.ends_with(".json")
-        || path == "Makefile"
-        || path.ends_with("/Makefile")
+        // 2026-08-14 SCOPE FIX #7 — MAKE'S OTHER NAMES. The check was
+        // `path == "Makefile" || path.ends_with("/Makefile")`, case-SENSITIVE
+        // and single-name. GNU make's search order is `GNUmakefile`,
+        // `makefile`, `Makefile` — so a tracked `GNUmakefile` SHADOWS the
+        // scanned `Makefile` entirely while being invisible here, and it
+        // carries no shebang, so the first-line fallback does not catch it
+        // either. `*.mk` includes are the same class. This is precisely the
+        // enumerate-one-more-name failure the `has_interpreter_shebang`
+        // docblock below says has already been wrong four times; the honest
+        // fix for make is to enumerate the names make itself enumerates.
+        || matches!(
+            path.rsplit('/').next(),
+            Some("Makefile" | "makefile" | "GNUmakefile")
+        )
+        || path.ends_with(".mk")
+        // `<name>.Dockerfile` — the `docker build -f prod.Dockerfile`
+        // convention, which `Dockerfile.*` does not match. Latent (zero
+        // tracked Dockerfiles today), enumerated for the same reason.
+        || path.ends_with(".Dockerfile")
+        // Copy-into-place settings carriers. `.claude/settings.local.json`
+        // itself is gitignored, but its tracked `.example`/`.template` seeds
+        // carry hook COMMAND lines and end in neither `.json` nor a shebang.
+        || path.ends_with(".json.example")
+        || path.ends_with(".json.template")
         || path.starts_with("scripts/git-hooks/")
         // 2026-08-14 SCOPE FIX #4 — CARGO CONFIG. `.cargo/config.toml` can set
         // `[target.*] runner = …` and `linker = …`, which the toolchain
@@ -386,10 +408,28 @@ fn stale_invocation_sites(files: &[(String, String)], allowlist: &[&str]) -> Vec
 // Verified at fix time: the only literal spawns in the workspace are `git`,
 // `docker`, `df`, `bash`, `sh`, `open`, `chronyc` — all benign.
 //
-// HONEST LIMIT: spawns through a NON-literal program (`Command::new(program)`
+// HONEST LIMIT 1: spawns through a NON-literal program (`Command::new(program)`
 // where `program` is a variable — 6 such sites exist, e.g. `infra.rs`,
 // `tv_doctor.rs`) cannot be resolved statically and are NOT covered. This
 // catches the direct, greppable re-introduction, not a determined author.
+//
+// HONEST LIMIT 2 (2026-08-14, found by audit — recorded, NOT closed): a spawn
+// routed through a WRAPPER function is invisible here, and such a wrapper
+// already exists — `tickvault-logs-mcp/src/tools.rs::run_with_timeout(program,
+// …)`, called with bare `"bash"` / `"git"` / `"docker"` literals that sit in
+// neither marker form. Closing this needs call-graph analysis, not a string
+// scan, so it is stated rather than pretended away. The shebang fallback and
+// the file-extension ban both still apply to whatever such a wrapper launches.
+//
+// 2026-08-14 SCOPE FIX #6 — `.args([…])`. The old marker set was
+// `Command::new("` and `.arg("`, and the PLURAL form does not contain the
+// singular one (an `s` intervenes before the paren). So
+// `Command::new("env").args(["<interpreter>", "-c", "…"])` was FULLY LITERAL
+// and FULLY GREEN: the extractor saw only the benign `"env"` and never looked
+// at the payload. That is not a hypothetical shape — `.args([…])` is already
+// the dominant form in this workspace (20+ sites, including `build.rs`, which
+// executes on every build). Same lesson as every scope row above: the hole was
+// in what the scan LOOKED AT, not in what it banned.
 fn extract_spawn_literals(content: &str) -> Vec<String> {
     let mut out = Vec::new();
     for marker in ["Command::new(\"", ".arg(\""] {
@@ -401,6 +441,26 @@ fn extract_spawn_literals(content: &str) -> Vec<String> {
             }
             rest = &rest[i + marker.len()..];
         }
+    }
+    // Plural form: take EVERY string literal inside the `[...]` group.
+    let mut rest = content;
+    while let Some(i) = rest.find(".args([") {
+        let after = &rest[i + ".args([".len()..];
+        // Bound the scan at the closing bracket so a later, unrelated literal
+        // on a following line is never attributed to this spawn.
+        let group = after.find(']').map_or(after, |end| &after[..end]);
+        let mut tail = group;
+        while let Some(open) = tail.find('"') {
+            let lit = &tail[open + 1..];
+            match lit.find('"') {
+                Some(close) => {
+                    out.push(lit[..close].to_string());
+                    tail = &lit[close + 1..];
+                }
+                None => break,
+            }
+        }
+        rest = &rest[i + ".args([".len()..];
     }
     out
 }
@@ -845,6 +905,52 @@ fn guard_self_test() {
     assert!(!is_invocation_scan_target("scripts/foo.py"));
     assert!(!is_invocation_scan_target("docs/runbooks/foo.md"));
     assert!(!is_invocation_scan_target("crates/common/src/lib.rs"));
+
+    // SCOPE FIX #7 (2026-08-14) — make's OTHER names. `GNUmakefile` and
+    // `makefile` are searched by GNU make BEFORE `Makefile`, so either one
+    // SHADOWS the scanned file entirely. Neither carries a shebang, so the
+    // first-line fallback cannot rescue them.
+    assert!(is_invocation_scan_target("GNUmakefile"));
+    assert!(is_invocation_scan_target("makefile"));
+    assert!(is_invocation_scan_target("sub/dir/GNUmakefile"));
+    assert!(is_invocation_scan_target("build/rules.mk"));
+    assert!(is_invocation_scan_target("prod.Dockerfile"));
+    assert!(is_invocation_scan_target(
+        ".claude/settings.local.json.example"
+    ));
+    assert!(is_invocation_scan_target(
+        ".claude/settings.local.json.template"
+    ));
+    // A file merely CONTAINING the word must still be out of scope, or the
+    // widening becomes a false-positive engine.
+    assert!(!is_invocation_scan_target(
+        "docs/how-to-write-a-Makefile.md"
+    ));
+
+    // SCOPE FIX #6 (2026-08-14) — `.args([…])`. The old marker set was
+    // `Command::new("` and `.arg("`; the PLURAL form contains NEITHER (an `s`
+    // sits between `arg` and the paren), so a fully-literal
+    // `Command::new("env").args(["<interpreter>", "-c", …])` passed GREEN with
+    // only the benign `"env"` ever extracted. `.args([…])` is already the
+    // dominant form in this workspace, including in `build.rs`.
+    let t = banned_token();
+    let plural = format!(r#"Command::new("env").args(["{t}3", "-c", "print(1)"]);"#);
+    let hits = extract_spawn_literals(&plural);
+    assert!(
+        hits.iter().any(|h| h == &format!("{t}3")),
+        "self-test: the plural .args([..]) payload must be extracted, got {hits:?}"
+    );
+    assert!(
+        !rust_spawn_violations(&plural).is_empty(),
+        "self-test: a banned interpreter inside .args([..]) must be a violation"
+    );
+    // The group is bounded at its closing bracket, so a later unrelated literal
+    // on a following line is never attributed to this spawn.
+    let bounded = format!(r#"c.args(["git", "log"]);{}let s = "{t}3";"#, '\n');
+    assert!(
+        rust_spawn_violations(&bounded).is_empty(),
+        "self-test: extraction must stop at ']' and not swallow later literals"
+    );
 
     // Token boundaries.
     let t = banned_token();

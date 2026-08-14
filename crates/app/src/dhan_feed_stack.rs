@@ -2085,17 +2085,70 @@ fn ws_lag_handles() -> &'static WsLagHandles {
 fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos: i64) {
     let handles = ws_lag_handles();
     match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
-        Some(WsLag::Measured(ms)) => {
-            handles.histogram_for(connection_index).record(ms);
-        }
+        Some(WsLag::Measured(ms)) => handles.for_connection(connection_index).record(ms),
         Some(WsLag::ClampedNegative) => {
-            handles.histogram_for(connection_index).record(0.0);
-            handles.excluded_clamped_negative.increment(1);
+            handles.for_connection(connection_index).record(0.0);
+            handles.clamped_negative.increment(1);
         }
-        None => {
-            handles.excluded_implausible_ltt.increment(1);
-        }
+        None => handles.implausible_ltt.increment(1),
     }
+}
+
+/// The number of `connection` label values this histogram can produce.
+///
+/// The operator lock caps live sockets at 16 (5 main-feed + 5 depth-20 +
+/// 5 depth-200 + 1 order-update), and `connection_index` is a slot within a
+/// pool, so 16 is a ceiling with headroom rather than a tight fit. An index at
+/// or beyond it folds into the last slot instead of allocating a fresh key —
+/// the same fail-into-a-known-bucket shape as `DrainCounters::refused`.
+const WS_LAG_CONNECTION_SLOTS: usize = 16;
+
+/// Pre-resolved handles for the per-TICK lag path.
+///
+/// This exists because the first cut of `record_ws_lag` called
+/// `metrics::histogram!(NAME, "connection" => idx.to_string())` directly, which
+/// allocated TWICE per tick — a `String` for the label value, and then a `Vec`
+/// for the label set, because a non-literal label value drops the macro to its
+/// `vec![Label::new(..)]` arm. At the ~5,000 packet/sec envelope that is ~36
+/// million allocations an hour on the path this module's own docs promise is
+/// allocation-free.
+///
+/// It is the exact hazard `DrainCounters` (~800 lines above) was written to
+/// avoid, and it landed anyway — which is the useful lesson: the warning was
+/// present, correct, and in the same file, and a per-tick allocation still got
+/// through review. A comment is not a gate. Caught by the 2026-08-14
+/// complexity audit and repaired the same day.
+struct WsLagHandles {
+    per_connection: [metrics::Histogram; WS_LAG_CONNECTION_SLOTS],
+    clamped_negative: metrics::Counter,
+    implausible_ltt: metrics::Counter,
+}
+
+impl WsLagHandles {
+    /// Handle for one socket slot; out-of-range folds into the last slot.
+    fn for_connection(&self, connection_index: u8) -> &metrics::Histogram {
+        let slot = usize::from(connection_index).min(WS_LAG_CONNECTION_SLOTS - 1);
+        &self.per_connection[slot]
+    }
+}
+
+/// Label values, spelled as literals so the macro takes its static-label arm.
+/// Indexed by slot, so the array position IS the label — a mismatch between
+/// this table and the array it builds is impossible by construction.
+const WS_LAG_CONNECTION_LABELS: [&str; WS_LAG_CONNECTION_SLOTS] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+];
+
+/// Process-wide handle set, resolved on first use.
+fn ws_lag_handles() -> &'static WsLagHandles {
+    static HANDLES: std::sync::OnceLock<WsLagHandles> = std::sync::OnceLock::new();
+    HANDLES.get_or_init(|| WsLagHandles {
+        per_connection: std::array::from_fn(|slot| {
+            metrics::histogram!(WS_LAG_HISTOGRAM, "connection" => WS_LAG_CONNECTION_LABELS[slot])
+        }),
+        clamped_negative: metrics::counter!(WS_LAG_EXCLUDED_COUNTER, "reason" => "clamped_negative"),
+        implausible_ltt: metrics::counter!(WS_LAG_EXCLUDED_COUNTER, "reason" => "implausible_ltt"),
+    })
 }
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
@@ -3275,6 +3328,68 @@ mod tests {
         // The floor itself is inclusive-valid.
         assert!(ws_lag_ms(1_600_000_000, SIMULTANEOUS_RECV_NANOS).is_some());
     }
+
+    #[test]
+    fn ws_lag_handles_are_resolved_once_and_never_allocate_per_tick() {
+        // The first cut of `record_ws_lag` built its label with
+        // `connection_index.to_string()`, which allocated a String AND — because
+        // a non-literal label value drops the macro to its `vec![Label::new(..)]`
+        // arm — a Vec, TWICE per tick, on the path this module's docs call
+        // allocation-free. `DrainCounters` 800 lines above warns about exactly
+        // that, in this same file, and it happened anyway. So the shape is now
+        // pinned mechanically rather than by comment.
+        let handles = ws_lag_handles();
+        assert!(
+            std::ptr::eq(handles, ws_lag_handles()),
+            "handles must be resolved once and reused, not rebuilt per call"
+        );
+
+        // Every socket slot has its OWN handle: folding two sockets onto one
+        // would silently merge their percentiles and hide a single slow
+        // connection, which is the one thing this metric exists to expose.
+        for (slot, label) in WS_LAG_CONNECTION_LABELS.iter().enumerate() {
+            assert_eq!(
+                *label,
+                slot.to_string(),
+                "label table position must equal its own value, else a slot reports another socket's lag"
+            );
+            let by_index = u8::try_from(slot).expect("slot count fits u8");
+            assert!(
+                std::ptr::eq(
+                    handles.for_connection(by_index),
+                    &handles.per_connection[slot]
+                ),
+                "connection {slot} must map to its own handle"
+            );
+        }
+
+        // Out of range folds into the LAST slot rather than allocating a fresh
+        // key on the hot path. Wrong bucket, bounded cost — the same
+        // fail-into-a-known-bucket choice `DrainCounters::refused` makes.
+        assert!(
+            std::ptr::eq(
+                handles.for_connection(u8::MAX),
+                &handles.per_connection[WS_LAG_CONNECTION_SLOTS - 1]
+            ),
+            "an out-of-range index must fold, never allocate"
+        );
+
+        // Source-scan: the allocating forms must not come back.
+        let src = include_str!("dhan_feed_stack.rs");
+        let body_start = src
+            .find("fn record_ws_lag(")
+            .expect("record_ws_lag must exist");
+        let body = &src[body_start..body_start + 600];
+        assert!(
+            !body.contains("to_string()"),
+            "record_ws_lag must not build label values on the hot path"
+        );
+        assert!(
+            !body.contains("metrics::histogram!"),
+            "record_ws_lag must use pre-resolved handles, not the macro"
+        );
+    }
+
     use tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
     use tickvault_common::types::SecurityId;
 
