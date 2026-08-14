@@ -672,7 +672,14 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
 
             let quantile = |q: f64| -> Value {
                 let target = q * count;
-                for (bound, le, cum) in &bounds {
+                // The bucket's `le` STRING is deliberately unused here — the
+                // decision below is made on the PARSED value's finiteness, for
+                // the reason spelled out in the comment inside the branch. It
+                // stays in the tuple because `bounds` is also the sort key
+                // carrier; binding it as `_le` keeps that shape while telling
+                // the compiler (and `-D warnings`, which `Build & Verify` runs)
+                // that the omission is deliberate rather than an oversight.
+                for (bound, _le, cum) in &bounds {
                     if *cum >= target {
                         // NOT `le.parse().is_err()`: Rust parses "+Inf" as a
                         // VALID f64 infinity, so an Err branch here never

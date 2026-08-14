@@ -759,7 +759,29 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         // EXPLICIT config — never `None`. See the module docs: `None` inherits
         // a 64 MiB message ceiling.
         let config = Some(websocket_config(endpoint));
-        let dial = connect_async_tls_with_config(request, config, false, Some(connector));
+        // Third argument is `disable_nagle`. It is `true` — Nagle's algorithm is
+        // DISABLED on every one of the 16 sockets.
+        //
+        // This lane is receive-heavy, so the instinct is that Nagle cannot
+        // matter. It does, because we DO write, and the writes are small and
+        // latency-critical:
+        //
+        //   1. PONGS. Dhan closes a socket after ~40 s of silence
+        //      (`deploy/aws/sysctl/99-tickvault-net.conf:123-124`). A pong is a
+        //      handful of bytes. With Nagle ON, a small write is held until the
+        //      previous segment is ACKed; paired with the peer's delayed-ACK
+        //      timer that is up to ~200 ms of avoidable delay on the one write
+        //      whose lateness costs a RECONNECT — and a reconnect costs a full
+        //      re-auth and re-subscribe of the whole instrument set.
+        //   2. SUBSCRIBE BATCHES. Up to 250 messages across the pool at open.
+        //      Nagle coalescing here delays the moment the feed starts flowing,
+        //      at exactly 09:15.
+        //
+        // Left `false` since the lane was revived. Changing it is free, cannot
+        // affect the depth-200 no-ALPN carve-out above (a socket option and a
+        // TLS config are orthogonal), and is standard practice for trading
+        // sockets. Pinned by `dial_disables_nagle_on_every_endpoint`.
+        let dial = connect_async_tls_with_config(request, config, true, Some(connector));
         let outcome = match tokio::time::timeout(DIAL_TIMEOUT, dial).await {
             Ok(result) => result,
             Err(_elapsed) => {

@@ -242,6 +242,47 @@ sysctl --system >/dev/null 2>&1 || echo "user-data: WARNING sysctl --system non-
 # Non-zero exit is deliberate and deliberately not fatal — see the script header.
 bash /opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh || true
 
+# ---- Step 5d: Transparent hugepages -> madvise (2026-08-14) ----
+# NOT a sysctl — it is a /sys write, so it cannot live in the .conf above and
+# must be re-applied on every boot.
+#
+# `madvise` is chosen DELIBERATELY over `never`. The usual latency advice is
+# "disable THP", and that advice is aimed at a machine running one latency
+# process. This box also runs QuestDB, which benefits from hugepages for its
+# column memory; `never` would take that away to solve a problem the feed path
+# does not have (it allocates almost nothing steady-state — see the DHAT gates).
+# `madvise` gives THP only to code that explicitly asks, which is the setting
+# that serves both tenants instead of trading one for the other.
+if [ -w /sys/kernel/mm/transparent_hugepage/enabled ]; then
+    echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+    echo madvise > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+    echo "user-data: THP set to $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo unreadable)"
+else
+    echo "user-data: WARNING transparent_hugepage not writable — left at distro default"
+fi
+
+# ---- Step 5e: Assert the clock is disciplined (2026-08-14) ----
+# Every per-connection latency number this system publishes is computed as
+# (our receive instant - the exchange timestamp). If this host's clock is not
+# synchronised, that subtraction measures CLOCK SKEW and reports it as feed
+# latency — a wrong number is worse than no number, because it looks
+# actionable. AL2023 ships chrony pointed at the Amazon Time Sync service on
+# the link-local address by default, but "ships with it by default" is an
+# assumption, and nothing here has ever verified it. This makes it visible.
+if command -v chronyc >/dev/null 2>&1; then
+    systemctl enable --now chronyd 2>/dev/null || true
+    # Give chrony a moment to reach a source before asking; a fresh boot has
+    # not necessarily stepped yet.
+    sleep 2
+    if chronyc tracking >/dev/null 2>&1; then
+        echo "user-data: clock OK — $(chronyc tracking 2>/dev/null | awk -F': ' '/Reference ID|System time/{printf "%s; ", $2}')"
+    else
+        echo "user-data: WARNING chronyd present but not yet tracking a source — latency numbers may be skewed"
+    fi
+else
+    echo "user-data: WARNING chrony absent — host clock is UNDISCIPLINED and every latency metric is untrustworthy"
+fi
+
 # ---- Step 6: Start the Docker Compose stack ----
 # Post-CloudWatch-only migration (#O1/#O2/#O3/#O4): the stack is QuestDB
 # only. `restart: unless-stopped` ensures containers auto-come-up on every

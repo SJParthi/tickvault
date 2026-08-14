@@ -101,6 +101,28 @@ else
 ok         keepalive ladder = ${ka_total}s (fires after Dhan's 40 s, after the app's 27 s)"
 fi
 
+# Writeback ratios are the SECOND "bigger is not better" pair, for the same
+# reason keepalive is: the kernel defaults (20 / 10) would sail through a
+# ">= minimum" check while leaving the multi-GiB writeback stall fully armed.
+# A stalled host is a stalled CONSUMER, and a stalled consumer is dropped ticks
+# — so these are checked as CEILINGS. Added 2026-08-14 alongside the keys.
+dirty="$(sysctl -n vm.dirty_ratio 2>/dev/null || echo 0)"
+dirty_bg="$(sysctl -n vm.dirty_background_ratio 2>/dev/null || echo 0)"
+if [ "$dirty" -le 0 ] 2>/dev/null || [ "$dirty" -gt 10 ] 2>/dev/null; then
+    report="$report
+BELOW      vm.dirty_ratio = $dirty (wanted 1..10; stock 20 arms a multi-GiB writeback stall)"
+    fail=$((fail + 1))
+elif [ "$dirty_bg" -le 0 ] 2>/dev/null || [ "$dirty_bg" -ge "$dirty" ] 2>/dev/null; then
+    # Background MUST trip before the synchronous threshold, or it never gets
+    # the chance to prevent the stall it exists to prevent.
+    report="$report
+BELOW      vm.dirty_background_ratio = $dirty_bg (must be >0 and below vm.dirty_ratio = $dirty)"
+    fail=$((fail + 1))
+else
+    report="$report
+ok         writeback ratios = ${dirty_bg}% background / ${dirty}% synchronous"
+fi
+
 if [ "$fail" -eq 0 ]; then
     verdict="APPLIED — all kernel tuning verified for the 16-WebSocket feed"
 else
