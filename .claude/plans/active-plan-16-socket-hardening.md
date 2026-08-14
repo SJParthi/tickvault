@@ -213,3 +213,42 @@ with zero data — the same false-OK class as the boot-time connections constant
 
 Even after Item 6 opens depth, this gauge cannot confirm it. Flip it to set on first
 successful frame per endpoint, not on spawn.
+
+### Item 6 — implementation hazards found 2026-08-14 by tracing the real code
+
+Three details decide whether this change works or silently kills the main feed.
+Found by reading `run_dhan_feed_stack` end to end; recorded so they are not
+rediscovered the hard way.
+
+**H-A. `params.questdb` is ALREADY on `DhanFeedStackParams` (`:1868`).** An earlier
+estimate in this session claimed a new params field plus a call-site cascade was
+needed. That was WRONG. `run_dhan_feed_stack` can call `load_depth_universe`
+itself with no signature change. The change is materially smaller than first scoped.
+
+**H-B. `drop(frame_tx)` at `:2195` is load-bearing and must NOT be delayed.** The
+template sender is dropped immediately after the dial loop precisely so the ring
+can close when the last socket dies — otherwise the drain hangs forever instead of
+reporting the lane went dark. A depth phase inserted inline BEFORE that drop would
+hold the template alive for the whole ~45-minute wait, so a total socket failure in
+that window would look like a live lane instead of a dead one. The depth attach
+MUST therefore own its own `frame_tx.clone()` and run as a SPAWNED task, leaving
+the `:2195` drop exactly where it is.
+
+**H-C. `pool` ownership.** The dial loop takes supervisors out of `pool` by index
+(`core::mem::replace`, `:2138-2142`). A spawned depth task needs `&mut pool` too,
+so `pool` must be MOVED into that task (verify no later use in
+`run_dhan_feed_stack` first) rather than borrowed across the await.
+
+**Consequence for sequencing:** the depth phase goes AFTER the main dial loop and
+AFTER `drop(frame_tx)`, as a spawned task owning `(pool, frame_tx.clone(), spill,
+ring_budget, client_id, token)`. `drain` is already a spawned task (`:2123`), so the
+main feed and the fold are entirely unaffected by however long depth waits.
+
+**Dial-body extraction:** the loop body (`:2126-2191`, ~65 lines) must become a
+reusable fn — it is needed for both phases, and duplicating it would let the two
+copies drift on token refresh, which is the one behaviour that must be identical.
+
+**The single test that matters most:** assert the main feed dials and the drain is
+consuming BEFORE the depth universe resolves. If that ordering inverts, the change
+trades 5 working sockets for 0 during market hours — the exact failure this plan
+exists to avoid.
