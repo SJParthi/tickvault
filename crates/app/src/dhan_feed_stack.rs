@@ -80,8 +80,8 @@
 //! minute — `websocket-connection-scope-lock.md` §E) are Dhan-side and are
 //! NOT fixed by any of this.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -105,7 +105,9 @@ use tickvault_core::pipeline::tick_gap_detector::{
 use tickvault_core::websocket::connection::{
     DhanFeedSocketImpl, DhanSocketParams, FeedTokenBuffer,
 };
-use tickvault_core::websocket::pool_budget::{ConnectionSlot, DhanEndpointType};
+use tickvault_core::websocket::pool_budget::{
+    ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS,
+};
 use tickvault_core::websocket::pool_supervisor::{
     CapturedFrame, ConnectionSupervisor, PoolSupervisor, RingByteBudget, SubscribeGuard,
     SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection,
@@ -707,20 +709,37 @@ impl LiveIngest {
     /// replayed frame reproduces the identical `capture_seq` and collapses onto
     /// the original row instead of duplicating it.
     ///
-    /// Packets 1..N mint a FRESH sequence from the same process-wide counter.
-    /// Those values are globally unique — they can never collide with any frame
-    /// sequence — but they are NOT reproducible: a replay that re-folded such a
-    /// frame would write duplicate rows for its 2nd..Nth packets. That is the
-    /// honest cost, and it is the right way round. A duplicate row is visible,
-    /// counted, and removable; a silently-dropped tick is neither. (Today
-    /// nothing re-folds from replay — recovery restores frames to the WAL
-    /// staging area — so the cost is latent rather than live.)
+    /// Packets 1..N derive theirs from the SAME frame sequence by OR-ing the
+    /// packet index into reserved low bits
+    /// (`ws_frame_spill::packet_capture_seq`), so every packet of a replayed
+    /// frame reproduces its original `capture_seq` exactly and collapses onto
+    /// the original row.
     ///
-    /// Arithmetic on the frame sequence was rejected: the counter is
-    /// wall-clock-nanosecond seeded with a `prev + 1` fallback under burst, so
-    /// consecutive frames can differ by exactly 1. There is no headroom to
-    /// carve a packet index into, and inventing some would trade a visible
-    /// duplicate for an invisible collision.
+    /// ## What this replaced, and why the old reasoning was wrong (2026-08-14)
+    ///
+    /// Until now packets 1..N minted a FRESH sequence from the process-wide
+    /// counter. Those values are globally unique, but they are NOT in the WAL
+    /// and cannot be regenerated — so a replay that re-folded such a frame
+    /// would write DUPLICATE rows for its 2nd..Nth packets. The comment here
+    /// argued that was "the right way round" because a duplicate row is
+    /// visible and a dropped tick is not.
+    ///
+    /// That trade was real but it was blocking the wrong thing: it made WAL
+    /// re-fold — the single largest CONTROLLABLE tick-loss path in the system —
+    /// unsafe to build. The premise it rested on was also wrong. It said
+    /// "there is no headroom to carve a packet index into", having considered
+    /// only MULTIPLYING the sequence (`frame_seq * MAX_PACKETS_PER_FRAME`),
+    /// which is indeed impossible: ≈1.786e18 × 70,000 ≈ 1.25e23 overflows
+    /// `i64::MAX` by four orders of magnitude and would refuse every tick.
+    ///
+    /// Reserving low bits in the SEED costs no headroom at all —
+    /// `(n >> 17) << 17` only clears bits, leaving the magnitude and the ≈5.16×
+    /// margin to `i64::MAX` unchanged. Uniqueness is structural: every frame
+    /// base ends in 17 zero bits and the base is strictly increasing, so one
+    /// frame's 131,072 packet slots cannot reach the next frame's base. The
+    /// old comment's fear — trading a visible duplicate for an invisible
+    /// collision — does not apply to a scheme where collisions are impossible
+    /// by construction rather than unlikely by argument.
     pub fn ingest_tick_at(
         &mut self,
         tick: &ParsedTick,
@@ -728,10 +747,29 @@ impl LiveIngest {
         packet_index: u32,
         recv_monotonic_millis: u64,
     ) -> IngestOutcome {
-        let frame_seq = if packet_index == 0 {
-            frame_seq
-        } else {
-            tickvault_storage::ws_frame_spill::next_frame_seq()
+        // REFUSE rather than fall back to a fresh sequence when the index does
+        // not fit: a fresh sequence is precisely the un-regenerable value this
+        // scheme exists to eliminate, so falling back would quietly restore the
+        // duplicate-on-replay defect while looking like it had worked.
+        let frame_seq = match tickvault_storage::ws_frame_spill::packet_capture_seq(
+            frame_seq,
+            u64::from(packet_index),
+        ) {
+            Some(seq) => seq,
+            None => {
+                self.seq_refused = self.seq_refused.saturating_add(1);
+                counters().ingest_seq_refused.increment(1);
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    frame_seq,
+                    packet_index,
+                    security_id = tick.security_id,
+                    "live tick refused: packet index exceeds the bits reserved in \
+                     capture_seq. The tick was NOT folded and NOT written — a counted \
+                     loss, never a fresh sequence that would duplicate on WAL replay."
+                );
+                return IngestOutcome::SeqUnrepresentable;
+            }
         };
         // Sequence FIRST: if we cannot stamp this row safely we must not touch
         // any fold state, or the aggregator would carry a tick that never
@@ -1368,9 +1406,20 @@ const DRAIN_REPORT_EVERY: u64 = 1_024;
 /// a WAL that already holds every frame.
 ///
 /// # Complexity
-/// O(1) per frame: one fixed-offset parse, one hash lookup in the gap
-/// detector, one hash lookup plus `TF_COUNT` scalar folds in the aggregator,
-/// one ILP row append. No heap allocation in steady state.
+///
+/// **O(1) per PACKET, O(packets) per FRAME.** Per packet: one fixed-offset
+/// parse, one hash lookup in the gap detector, one hash lookup plus
+/// `TF_COUNT` scalar folds in the aggregator, one ILP row append. No heap
+/// allocation in steady state.
+///
+/// The per-FRAME cost is NOT constant, and this comment said it was until
+/// 2026-08-14. A main-feed message may carry several stacked packets —
+/// `drain_main_feed_frame` walks them in a `while offset < frame.bytes.len()`
+/// loop bounded by `MAX_PACKETS_PER_FRAME` — so worst-case frame cost is that
+/// bound times the per-packet cost, not one packet's worth. Calling that O(1)
+/// understated the worst case by orders of magnitude, which is exactly the
+/// kind of claim CLAUDE.md's complexity table exists to stop us making.
+/// Typical frames carry one packet per subscribed instrument on that socket.
 /// Run the SYNCHRONOUS blocking ILP-over-HTTP flush OFF the async worker
 /// (the `order_observability::blocking_flush` house pattern — the same shape
 /// is inlined at `seal_writer_loop.rs`, `groww_order_observability.rs`,
@@ -1409,6 +1458,7 @@ async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
     ring_budget: Arc<RingByteBudget>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) -> DrainOutcome {
     let mut seen: u64 = 0;
     let mut folded: u64 = 0;
@@ -1493,6 +1543,58 @@ async fn run_frame_drain(
                     publish_fold_depth(&ingest);
                 }
             }
+            // SHUTDOWN (added 2026-08-14). Deliberately placed BELOW the frame
+            // arm in this `biased` select, and that ordering is load-bearing:
+            // a shutdown signal must not preempt frames already sitting in the
+            // ring. Placed above, the permit wins the very first poll and the
+            // drain exits abandoning queued work — which is a different way of
+            // losing the tail than the bug this arm exists to fix. The test
+            // `test_drain_exits_on_shutdown_signal_with_the_ring_still_open`
+            // caught exactly that during development, which is why it asserts
+            // the queued frame was FOLDED and not merely that the drain ended.
+            //
+            // Before this arm existed the drain
+            // could only end when the ring closed, and nothing closed it: the
+            // lane's handle was bound to `_dhan_feed_stack_monitor` and the
+            // shutdown path's Dhan steps had been "deleted with the lane" in
+            // 2026-07-13 — then the lane came back and the teardown did not.
+            //
+            // The consequence was silent and daily. At the 17:30 stop, SIGTERM
+            // ran the process teardown, `main` returned `Ok(())`, and the log
+            // printed "tickvault stopped" and classified the shutdown clean —
+            // while every ILP row still under FLUSH_ROW_THRESHOLD and every
+            // open candle in the aggregator went with the process. There was
+            // no metric whose value differed between a day that flushed and a
+            // day that did not.
+            //
+            // `Notify::notify_one` is permit-based, so a signal that arrives
+            // while this task is inside another arm is retained rather than
+            // lost — the lost-wake hazard that makes `notify_waiters` the
+            // wrong primitive here (audit-findings Rule 16).
+            () = shutdown.notified() => {
+                info!("Dhan live feed: shutdown signalled — sealing and flushing before exit");
+                // Seal whatever the aggregator still holds, THEN flush, in
+                // that order: sealing produces rows, so flushing first would
+                // leave exactly the rows sealing just created.
+                let (emitted, dropped) = ingest.catch_up_seal();
+                blocking_flush(|| ingest.flush());
+                if dropped > 0 {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        emitted,
+                        dropped,
+                        "Dhan live feed: candles were DROPPED during the shutdown seal — the \
+                         seal ring could not take them and they are lost with the process"
+                    );
+                } else {
+                    info!(
+                        emitted,
+                        "Dhan live feed: shutdown seal + flush complete — the day's tail is \
+                         persisted"
+                    );
+                }
+                break;
+            }
             // TIME trigger. Without it, the last rows of a thinly-traded
             // instrument sit unflushed below the size threshold waiting for a
             // next tick which, at the close, never comes.
@@ -1567,7 +1669,22 @@ async fn run_frame_drain(
                 // Only the PAGE is market-hours gated (audit Rule 3): the
                 // whole universe is legitimately silent after 15:30, and a
                 // detector that pages every evening gets muted by lunchtime.
-                if !is_within_market_hours_ist(now_ist_secs_of_day()) {
+                //
+                // The TRADING-DAY half of that gate is just as load-bearing and
+                // was missing until 2026-08-14. EventBridge starts this box on
+                // `MON-FRI`, which includes NSE holidays, so on a weekday
+                // holiday the lane seeds the whole universe, receives nothing —
+                // correctly, the market is shut — and every seeded instrument
+                // crosses the silence floor at once. The page that follows says
+                // `silent=<universe>, never_ticked=<universe>`, which is
+                // indistinguishable from a total subscribe failure. Every
+                // sibling leg in this repo already gates on the calendar
+                // (`groww_contract_1m_boot`, `groww_option_chain_1m_boot`,
+                // `brutex_crossverify_boot`, `feed_scoreboard_boot`); the
+                // revived lane was the one regression.
+                if !is_within_market_hours_ist(now_ist_secs_of_day())
+                    || !silence_page_allowed_today()
+                {
                     silent_scans = 0;
                     silence_reported = false;
                     continue;
@@ -1696,6 +1813,16 @@ fn drain_main_feed_frame(
         }
         match dispatch_frame(&frame.bytes[offset..end], received_at_nanos) {
             Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _)) => {
+                // Delivery lag, per SOCKET. Recorded here because this is the
+                // only point where the exchange stamp, the receipt instant and
+                // the originating connection are all in hand.
+                //
+                // Only packet types that actually carry an LTT reach this arm —
+                // OI, PrevClose and MarketStatus decode to non-`Tick` variants
+                // and never appear here — so a missing timestamp is a garbage
+                // timestamp, not an absent one, and is EXCLUDED rather than
+                // recorded as zero.
+                record_ws_lag(frame.connection_index, &tick, received_at_nanos);
                 // `frame.seq` is per-FRAME, but `capture_seq` must be unique
                 // per ROW or two ticks in one message would collapse into one
                 // under the DEDUP key. The packet index is folded in.
@@ -1767,9 +1894,220 @@ pub struct DrainOutcome {
 }
 
 /// Packets we will walk within one main-feed message before declaring the
-/// message malformed. The 1 MiB frame cap over the smallest (16-byte) packet
-/// bounds a legitimate message well under this.
+/// message malformed.
+///
+/// **The arithmetic here was wrong until 2026-08-14** and is worth stating
+/// rather than quietly fixing. The comment claimed "the 1 MiB frame cap over
+/// the smallest (16-byte) packet bounds a legitimate message well under this".
+/// Two errors: the cap is `MAIN_FEED_MAX_FRAME_BYTES` = 162 × 5,000 × 2 =
+/// 1,620,000 bytes (~1.55 MiB, not 1 MiB), and 1,620,000 / 16 = **101,250**,
+/// which is ABOVE this ceiling, not well under it. A maximum-size frame made
+/// entirely of 16-byte ticker packets would be truncated here, its remainder
+/// counted as unparseable.
+///
+/// The ceiling is nonetheless kept, because it is a defence against a hostile
+/// or malfunctioning peer rather than a capacity limit, and the shape it
+/// bounds cannot occur legitimately: a socket carries at most
+/// `MAIN_FEED_INSTRUMENTS_PER_CONNECTION` (5,000) subscriptions, so a
+/// legitimate frame carries on the order of 5,000 packets — 14× below this —
+/// and reaching 101,250 would require the peer to send ~20 packets per
+/// subscribed instrument in a single message. Raising the ceiling to clear the
+/// theoretical maximum would weaken the defence to buy nothing.
+///
+/// What changed is only the honesty of the justification: the bound is a
+/// deliberate policy ceiling, not the arithmetic consequence the old comment
+/// asserted.
 pub const MAX_PACKETS_PER_FRAME: u32 = 70_000;
+
+/// Prometheus histogram of exchange→receipt delivery lag on the LIVE socket.
+///
+/// The `_ms` suffix is load-bearing, not cosmetic: `observability.rs` matches
+/// `Matcher::Suffix("_ms")` to install the millisecond bucket set. A `_seconds`
+/// name renders as a summary with no `_bucket` series, and the panel would have
+/// nothing to read.
+pub const WS_LAG_HISTOGRAM: &str = "tv_dhan_ws_lag_ms";
+
+/// Ticks deliberately EXCLUDED from the lag histogram, by reason.
+///
+/// Counted rather than recorded-as-zero. A packet with no usable exchange
+/// timestamp is not a zero-latency tick, and folding it in as `0.0` would drag
+/// every percentile toward zero and make a degrading feed look like it was
+/// getting faster.
+pub const WS_LAG_EXCLUDED_COUNTER: &str = "tv_dhan_ws_lag_excluded_total";
+
+/// Delivery lag in milliseconds, or `None` when this tick must be EXCLUDED.
+///
+/// # The offset rule this encodes
+///
+/// `ParsedTick::exchange_timestamp` is **IST epoch seconds** — IST wall-clock
+/// rendered as an epoch — while `received_at_nanos` is true UTC epoch nanos.
+/// To compare them the exchange stamp must have the IST offset **SUBTRACTED**:
+///
+/// ```text
+/// lag_ms = received_ms − (ltt_secs − 19_800) × 1000
+/// ```
+///
+/// Adding the offset is the single most destructive mistake available here —
+/// `data-integrity.md` calls the WebSocket timestamp rule "THE SINGLE MOST
+/// CRITICAL DATA INTEGRITY RULE" — and it would not look broken: it would
+/// report a steady 39,600,000 ms (11 h) lag, which a reader could mistake for a
+/// unit bug rather than a sign error. A test pins the exact zero case.
+///
+/// # Why `None` rather than a number
+///
+/// - `ltt < MIN_PLAUSIBLE_EXCHANGE_TS_SECS` — a zero or garbage stamp would
+///   render as a ~55-year lag and destroy every percentile in the bucket set.
+/// - Packets carrying no LTT at all (OI code 5, PrevClose 6, MarketStatus 7)
+///   never reach this function; only ticker (2), quote (4) and full (8) parsers
+///   populate `exchange_timestamp`.
+///
+/// # The ±1 s floor, stated where it is computed
+///
+/// Dhan sends LTT as whole SECONDS. Truncation alone therefore makes a tick
+/// look up to ~1 s early, so a genuinely-fast delivery can compute NEGATIVE.
+/// Negatives clamp to zero and are counted separately — never recorded as a
+/// negative, and never claimed as sub-second precision. This measures outages
+/// and drift honestly; it cannot measure microseconds, and no arithmetic here
+/// can recover precision the vendor never transmitted.
+#[must_use]
+pub fn ws_lag_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<WsLag> {
+    if exchange_timestamp
+        < tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+    {
+        return None;
+    }
+    let ltt_utc_secs = i64::from(exchange_timestamp)
+        - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+    let received_ms = received_at_nanos / 1_000_000;
+    let lag_ms = received_ms - ltt_utc_secs.saturating_mul(1_000);
+    if lag_ms < 0 {
+        return Some(WsLag::ClampedNegative);
+    }
+    // i64 -> f64 loses precision only above 2^53, which is ~285,000 YEARS
+    // expressed in milliseconds. Every value reaching here is a delivery lag,
+    // bounded in practice by the reconnect ladder and in principle by the
+    // plausibility floor above, so the lossy range is unreachable. The metrics
+    // crate takes f64, so the conversion is required, not incidental.
+    // APPROVED: lossy range (>2^53 ms ~ 285,000 years) is unreachable for a lag.
+    #[allow(clippy::cast_precision_loss)]
+    Some(WsLag::Measured(lag_ms as f64))
+}
+
+/// Record one tick's delivery lag against the socket it arrived on.
+///
+/// Labelled by `connection`, not by instrument. That is a cost decision with a
+/// hard number behind it: at the ~4,565-instrument live universe a per-instrument
+/// label would be ~4,565 CloudWatch series ≈ $1,369/mo, against a budget whose
+/// automatic action is `STOP_EC2_INSTANCES` — the observability feature would
+/// stop the trading box. Sixteen connection slots is ≈$4.80/mo.
+///
+/// It is also the more useful cut. Per-instrument lag is dominated by how often
+/// that instrument TRADES (LTT is last-trade time, so a thin option is
+/// legitimately minutes stale and would page constantly); per-socket lag
+/// isolates the thing we can act on — one connection delivering late.
+/// Pre-resolved lag-metric handles, one histogram per connection slot.
+///
+/// # Why this exists
+///
+/// `record_ws_lag` runs on the PER-TICK path. The previous form built its label
+/// with `connection_index.to_string()` and passed it to `metrics::histogram!`,
+/// which constructs a `Key` owning a `Vec<Label>` — so recording a tick's own
+/// latency cost **two heap allocations per tick**, on the one path this module
+/// promises is allocation-free.
+///
+/// That is the identical defect `parser/dispatcher.rs:32-35` and `DrainCounters`
+/// (above, in this file) already solved. The label set here is bounded and known
+/// at compile time — `MAX_TOTAL_DHAN_CONNECTIONS` slots — so every handle is
+/// resolved ONCE and recording becomes a plain atomic update.
+///
+/// The emitted series are byte-identical to before
+/// (`tv_dhan_ws_lag_ms{connection="0".."15"}`), which is what makes this a safe
+/// refactor: no dashboard, alarm, or EMF selector can tell the difference.
+struct WsLagHandles {
+    /// Indexed by connection slot. Built once; never resized.
+    per_connection: [metrics::Histogram; MAX_TOTAL_DHAN_CONNECTIONS as usize],
+    /// Fallback for a slot outside the pool budget. Should be unreachable —
+    /// `ConnectionSlot` is allocated from the same budget — but a hot-path
+    /// index must never panic and must never allocate, so it degrades into a
+    /// counted bucket instead.
+    unknown_connection: metrics::Histogram,
+    unknown_slot: metrics::Counter,
+    excluded_clamped_negative: metrics::Counter,
+    excluded_implausible_ltt: metrics::Counter,
+}
+
+impl WsLagHandles {
+    fn new() -> Self {
+        Self {
+            // `to_string()` here runs at most 16 times, at first-tick, on the
+            // cold path — not per tick. That is the whole point of the cache.
+            per_connection: std::array::from_fn(
+                |slot| metrics::histogram!(WS_LAG_HISTOGRAM, "connection" => slot.to_string()),
+            ),
+            unknown_connection: metrics::histogram!(
+                WS_LAG_HISTOGRAM,
+                "connection" => "unknown"
+            ),
+            unknown_slot: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "unknown_connection_slot"
+            ),
+            excluded_clamped_negative: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "clamped_negative"
+            ),
+            excluded_implausible_ltt: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "implausible_ltt"
+            ),
+        }
+    }
+
+    /// The histogram for one slot. Out-of-range degrades to a counted bucket —
+    /// never a panic, never an allocation.
+    fn histogram_for(&self, connection_index: u8) -> &metrics::Histogram {
+        match self.per_connection.get(connection_index as usize) {
+            Some(histogram) => histogram,
+            None => {
+                self.unknown_slot.increment(1);
+                &self.unknown_connection
+            }
+        }
+    }
+}
+
+static WS_LAG_HANDLES: OnceLock<WsLagHandles> = OnceLock::new();
+
+fn ws_lag_handles() -> &'static WsLagHandles {
+    WS_LAG_HANDLES.get_or_init(WsLagHandles::new)
+}
+
+fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos: i64) {
+    let handles = ws_lag_handles();
+    match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
+        Some(WsLag::Measured(ms)) => {
+            handles.histogram_for(connection_index).record(ms);
+        }
+        Some(WsLag::ClampedNegative) => {
+            handles.histogram_for(connection_index).record(0.0);
+            handles.excluded_clamped_negative.increment(1);
+        }
+        None => {
+            handles.excluded_implausible_ltt.increment(1);
+        }
+    }
+}
+
+/// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WsLag {
+    /// A real, non-negative lag in milliseconds.
+    Measured(f64),
+    /// The arithmetic came out negative — whole-second truncation, or a host
+    /// clock behind the exchange. Recorded as zero and counted, so a clock
+    /// problem shows up as a rising counter instead of a silently skewed p50.
+    ClampedNegative,
+}
 
 /// Byte length of the main-feed packet starting at `bytes`, from its response
 /// code. `None` for an unknown code or a header too short to classify.
@@ -1891,6 +2229,62 @@ pub struct DhanFeedStackParams {
     /// is a schema decision. Until that decision is made, running both is
     /// REFUSED rather than silently corrupted.
     pub rest_fold_writes_dhan_candles: bool,
+    /// The operator-facing feed state, so the lane can report whether it is
+    /// ACTUALLY running.
+    ///
+    /// Added 2026-08-14. `set_dhan_lane_running` previously had zero
+    /// production callers, which made `feed_health`'s Dhan verdict a constant
+    /// — it read "enabled, but the feed was not started at boot" whether the
+    /// lane was up, down, or absent. The lane owns that truth, so the lane is
+    /// what sets it: `true` once sockets are dialed and the fold is consuming
+    /// them, `false` on every exit path.
+    pub feed_runtime: Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    /// Signalled at process shutdown so the drain can SEAL and FLUSH before
+    /// the process exits.
+    ///
+    /// Added 2026-08-14. Until then the drain could only end when the ring
+    /// closed, and nothing closed it — so at every 17:30 stop the day's tail
+    /// (open candles, plus every ILP row still under the flush threshold) went
+    /// with the process while the log printed "tickvault stopped" and
+    /// classified the shutdown clean.
+    pub shutdown: Arc<tokio::sync::Notify>,
+    /// NSE trading calendar, used to keep the lane's loudest pages off days the
+    /// market is shut.
+    ///
+    /// Added 2026-08-14. The silence detector and the 15:31 cross-verification
+    /// both gated on TIME-OF-DAY only, and EventBridge starts this box on
+    /// `MON-FRI` — which includes NSE holidays. On such a day the lane dials,
+    /// seeds the whole universe, receives nothing (correctly — the market is
+    /// shut), and fires `silent=<universe>, never_ticked=<universe>`: the most
+    /// alarming page the system can produce, false, several times a year. The
+    /// real cost is second-order — it trains the operator to mute the ONE
+    /// detector that catches a silently-failed subscribe.
+    pub calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+}
+
+/// Process-wide handle to the trading calendar, installed by
+/// [`spawn_dhan_feed_stack`] from its params.
+///
+/// A `OnceLock` rather than two threaded parameters because the two consumers
+/// (`run_frame_drain` and `spawn_daily_crossverify`) sit in different tasks with
+/// different signatures, and this file already uses exactly this shape for
+/// `CROSSVERIFY_DEPS`.
+static TRADING_CALENDAR: OnceLock<Arc<tickvault_common::trading_calendar::TradingCalendar>> =
+    OnceLock::new();
+
+/// True when today is an NSE trading day — or when the calendar is not
+/// installed.
+///
+/// **Fail-OPEN, deliberately.** This gates whether a silence page may fire. The
+/// two error directions are not symmetric: a false page is noise, while a
+/// SUPPRESSED page on a real trading day is undetected data loss on a lane
+/// whose protocol carries no sequence number and no snapshot-on-subscribe, so
+/// silence is the only signal there is. If the calendar is somehow absent, page
+/// anyway.
+fn silence_page_allowed_today() -> bool {
+    TRADING_CALENDAR
+        .get()
+        .is_none_or(|calendar| calendar.is_trading_day_today())
 }
 
 /// Brings up the Dhan 16-connection live feed if — and only if — both gates are
@@ -2083,6 +2477,10 @@ fn dial_planned_connections(
             Arc::clone(ring_budget),
             WsType::LiveFeed,
             endpoint,
+            // `global_index` (0..16), not `pool_index` — pool indices repeat
+            // across endpoints, so labelling by them would merge main-feed
+            // socket 0 with depth-20 socket 0 and hide which one is sick.
+            planned.slot.global_index,
         ));
         let guard = planned.guard;
         tokio::spawn(async move {
@@ -2135,6 +2533,15 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
              pool by silently killing its OLDEST socket."
         );
         return None;
+    }
+    // Installed BEFORE the bring-up task is spawned, so neither the silence
+    // detector nor the 15:31 cross-verification can ever observe an empty cell
+    // and fall back to its fail-open branch on a real trading day.
+    if TRADING_CALENDAR.set(Arc::clone(&params.calendar)).is_err() {
+        // Already installed. `FEED_STACK_SPAWNED` above makes a second spawn
+        // impossible in production, so this can only be a repeat call under
+        // test; the first calendar stays authoritative either way.
+        tracing::debug!("Dhan lane trading calendar was already installed — keeping the first");
     }
     Some(tokio::spawn(run_dhan_feed_stack(params)))
 }
@@ -2331,7 +2738,12 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // heap it protects is one heap: five main-feed connections each holding a
     // per-pool share would bound five times the memory the host actually has.
     let ring_budget = Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES));
-    let drain = tokio::spawn(run_frame_drain(frame_rx, ingest, Arc::clone(&ring_budget)));
+    let drain = tokio::spawn(run_frame_drain(
+        frame_rx,
+        ingest,
+        Arc::clone(&ring_budget),
+        Arc::clone(&params.shutdown),
+    ));
 
     // ---- the sockets -------------------------------------------------------
     let dialed =
@@ -2383,6 +2795,18 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Up means SOCKETS DIALED AND A FOLD CONSUMING THEM — not "config was
     // enabled". It is set here and cleared by the drain when the ring closes.
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(1.0);
+
+    // Tell the operator-facing feed state the same thing the gauge just said.
+    //
+    // Before 2026-08-14 `set_dhan_lane_running` had ZERO production call sites
+    // — eight matches repo-wide, every one of them in a test. The flag is
+    // initialised `false` and nothing ever moved it, so `feed_health` reported
+    // `Degraded: "enabled, but the feed was not started at boot"` for a lane
+    // that was healthy, a lane that was dead, and a lane that had never been
+    // configured, identically and forever. The operator console printed that
+    // constant as if it were a diagnosis, and the feeds page then prescribed a
+    // restart from it. A status line that cannot vary is not a status line.
+    params.feed_runtime.set_dhan_lane_running(true);
     info!(
         dialed,
         seeded,
@@ -2399,18 +2823,48 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Hold the task alive with the drain so the stack's JoinHandle reflects the
     // lane's real lifetime rather than completing the instant it finished
     // dialing.
-    if let Err(err) = drain.await {
+    let drain_outcome = drain.await;
+
+    // Clear the up-gauge on EVERY exit, not just the error one.
+    //
+    // Until 2026-08-14 this was inside the `if let Err(...)` arm below, which
+    // left a false-OK with a very specific shape: when the drain returns
+    // NORMALLY — which is what happens once every socket has died and the ring
+    // closes — `drain.await` is `Ok`, the arm never runs, and
+    // `tv_dhan_feed_stack_up` stays pinned at 1.0 for the rest of the process.
+    // The one metric whose entire job is to say "the lane is carrying data"
+    // would report a healthy lane precisely when every socket was gone. The
+    // gauge now falls on the normal path, the error path, and the
+    // nothing-dialed path alike.
+    metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
+    params.feed_runtime.set_dhan_lane_running(false);
+
+    if let Err(err) = drain_outcome {
         // The drain is the ONLY consumer of the ring. If it panicked, every
         // socket is still capturing to the WAL but nothing is folding — the
-        // exact shape of a lane that looks alive and produces no candles. Say
-        // so at ERROR and drop the up-gauge; never let it end quietly.
+        // exact shape of a lane that looks alive and produces no candles.
+        //
+        // Honest note on reachability (verified 2026-08-14): the release
+        // profile sets `panic = "abort"`, so a genuine panic in the drain
+        // aborts the PROCESS rather than surfacing here, and systemd
+        // (`Restart=always`, `RestartSec=3`) brings the lane back within
+        // seconds. In a release build this arm is therefore reached only by
+        // task cancellation, not by a panic. It is retained because it IS
+        // reachable in a debug build and because a silent join failure must
+        // never pass unlogged — but nobody should read it as the production
+        // recovery story. The production recovery story is the process
+        // restart, and it already works.
         error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             %err,
             "the Dhan live-feed frame drain DIED — frames are still being captured to the \
              write-ahead log but nothing is folding them into candles this session"
         );
-        metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
+    } else {
+        info!(
+            "the Dhan live-feed frame drain exited cleanly — every socket is closed and the \
+             ring is drained; the lane is reporting itself DOWN"
+        );
     }
 }
 
@@ -2512,6 +2966,21 @@ pub fn spawn_daily_crossverify(
         loop {
             let sleep_secs = secs_until_next_run_ist(now_ist_secs_of_day());
             tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+
+            // Same trading-day gate as the silence detector, for the same
+            // reason. On a weekday NSE holiday both sides of this comparison
+            // are legitimately empty, and the run reports "found no data on
+            // either side today" — a warning about the lane's ONLY loss
+            // detector, fired on a day it had nothing to detect. Left ungated
+            // it compounds the silence detector's false page into a pattern the
+            // operator learns to ignore.
+            if !silence_page_allowed_today() {
+                info!(
+                    "Dhan live-feed cross-verification skipped — not an NSE trading day. \
+                     No candles were expected, so there is nothing to verify."
+                );
+                continue;
+            }
 
             let Some(deps) = CROSSVERIFY_DEPS.get() else {
                 // Unreachable in practice (the caller checked), but a `let
@@ -2668,6 +3137,144 @@ mod tests {
     // what pins that the pre-open cannot page.
     use std::collections::BTreeSet;
     use std::time::Instant;
+
+    /// A calendar carrying one known NSE holiday, for the trading-day gate.
+    fn synthetic_calendar() -> tickvault_common::trading_calendar::TradingCalendar {
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+        let cfg = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: "2026-01-26".to_string(),
+                name: "Republic Day".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        tickvault_common::trading_calendar::TradingCalendar::from_config(&cfg)
+            .expect("synthetic calendar builds")
+    }
+
+    /// A WEEKDAY NSE holiday is NOT a trading day — this is the exact shape
+    /// that produced the false `silent=<universe>` page: EventBridge starts the
+    /// box `MON-FRI`, the market is shut, and every seeded instrument crosses
+    /// the silence floor at once.
+    #[test]
+    fn weekday_nse_holiday_is_not_a_trading_day() {
+        let calendar = synthetic_calendar();
+        // 2026-01-26 is a Monday AND a configured NSE holiday.
+        let holiday = chrono::NaiveDate::from_ymd_opt(2026, 1, 26).expect("valid date");
+        assert_eq!(
+            chrono::Datelike::weekday(&holiday),
+            chrono::Weekday::Mon,
+            "the fixture must be a WEEKDAY holiday — a weekend proves nothing, \
+             because the EventBridge schedule already excludes weekends"
+        );
+        assert!(
+            !calendar.is_trading_day(holiday),
+            "a weekday NSE holiday must not be treated as a trading day"
+        );
+        // Control: the next day is an ordinary trading Tuesday.
+        let next = chrono::NaiveDate::from_ymd_opt(2026, 1, 27).expect("valid date");
+        assert!(
+            calendar.is_trading_day(next),
+            "the day after the holiday must still page normally — this gate must \
+             narrow the page, never disable it"
+        );
+    }
+
+    /// With no calendar installed the gate FAILS OPEN.
+    ///
+    /// Direction matters and is not symmetric: a false page is noise, a
+    /// suppressed page on a real trading day is undetected data loss on a feed
+    /// whose protocol carries no sequence number and no snapshot-on-subscribe.
+    #[test]
+    fn silence_page_gate_fails_open_when_no_calendar_is_installed() {
+        // This process may or may not have had a calendar installed by another
+        // test; the invariant under test is that the ABSENT case allows the
+        // page, so only assert when the cell is genuinely empty.
+        if TRADING_CALENDAR.get().is_none() {
+            assert!(
+                silence_page_allowed_today(),
+                "an uninstalled calendar must never suppress a silence page"
+            );
+        }
+    }
+
+    /// A real NSE-session second, well past the plausibility floor.
+    const LTT_IST_SECS: u32 = 1_772_073_900;
+
+    /// The UTC nanosecond instant that is EXACTLY simultaneous with
+    /// `LTT_IST_SECS` — i.e. zero delivery lag.
+    const SIMULTANEOUS_RECV_NANOS: i64 = (LTT_IST_SECS as i64 - 19_800) * 1_000_000_000;
+
+    #[test]
+    fn ws_lag_ms_subtracts_the_ist_offset_and_never_adds_it() {
+        // THE test. `data-integrity.md` calls the WebSocket timestamp rule the
+        // single most critical data-integrity rule in the repo: the exchange
+        // stamp is IST-epoch, so comparing it to a UTC clock requires
+        // SUBTRACTING 19,800 s. Adding instead would not look obviously broken
+        // — it would report a steady 11-hour lag, which reads like a unit bug
+        // rather than a sign error, and every percentile would be garbage.
+        assert_eq!(
+            ws_lag_ms(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS),
+            Some(WsLag::Measured(0.0)),
+            "a simultaneous tick must measure exactly zero lag"
+        );
+
+        // Pin the magnitude a sign error would produce, so the failure message
+        // names the actual mistake instead of just showing two numbers.
+        let wrong_direction = SIMULTANEOUS_RECV_NANOS + 2 * 19_800 * 1_000_000_000;
+        assert_eq!(
+            ws_lag_ms(LTT_IST_SECS, wrong_direction),
+            Some(WsLag::Measured(39_600_000.0)),
+            "39,600,000 ms = 11 h is the signature of a +19800 sign error"
+        );
+    }
+
+    #[test]
+    fn ws_lag_ms_measures_a_real_delay_in_milliseconds() {
+        let recv = SIMULTANEOUS_RECV_NANOS + 250 * 1_000_000;
+        assert_eq!(ws_lag_ms(LTT_IST_SECS, recv), Some(WsLag::Measured(250.0)));
+        // The 46-second class this feed was retired for must render honestly.
+        let recv_slow = SIMULTANEOUS_RECV_NANOS + 46_370 * 1_000_000;
+        assert_eq!(
+            ws_lag_ms(LTT_IST_SECS, recv_slow),
+            Some(WsLag::Measured(46_370.0))
+        );
+    }
+
+    #[test]
+    fn ws_lag_ms_clamps_a_negative_rather_than_recording_it() {
+        // Dhan sends LTT as whole SECONDS, so truncation alone can make a fast
+        // delivery compute negative. Recording a negative would corrupt the
+        // histogram; silently dropping it would hide a genuinely wrong host
+        // clock. Clamp AND count is the only honest option.
+        let early = SIMULTANEOUS_RECV_NANOS - 900 * 1_000_000;
+        assert_eq!(ws_lag_ms(LTT_IST_SECS, early), Some(WsLag::ClampedNegative));
+    }
+
+    #[test]
+    fn ws_lag_ms_excludes_an_implausible_timestamp_instead_of_recording_zero() {
+        // A zero or garbage LTT is not a zero-latency tick. Folding it in as
+        // 0.0 would drag every percentile toward zero and make a DEGRADING
+        // feed look like it was getting faster — the false-OK class rule 11
+        // forbids. `None` means the caller counts it as excluded.
+        for garbage in [0u32, 1, 1_599_999_999] {
+            assert_eq!(
+                ws_lag_ms(garbage, SIMULTANEOUS_RECV_NANOS),
+                None,
+                "LTT {garbage} is below the plausibility floor and must be excluded"
+            );
+        }
+        // The floor itself is inclusive-valid.
+        assert!(ws_lag_ms(1_600_000_000, SIMULTANEOUS_RECV_NANOS).is_some());
+    }
     use tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
     use tickvault_common::types::SecurityId;
 
@@ -3078,6 +3685,13 @@ mod tests {
             // Likewise irrelevant here — the config gate is checked before any
             // of the three floors, and this test pins that ordering.
             rest_fold_writes_dhan_candles: false,
+            // A real state object, default-constructed: the disabled lane must
+            // spawn nothing, and must therefore leave this flag untouched at
+            // its `false` default. Asserted below, so this test also pins that
+            // a refused lane never claims to be running.
+            feed_runtime: Arc::new(tickvault_api::feed_state::FeedRuntimeState::default()),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            calendar: Arc::new(synthetic_calendar()),
         });
         assert!(handle.is_none(), "a disabled lane must spawn nothing");
     }
@@ -3748,6 +4362,7 @@ mod tests {
         tx.send(CapturedFrame {
             seq: 42,
             endpoint: DhanEndpointType::MainFeed,
+            connection_index: 0,
             bytes: bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, 1_779_355_000)),
         })
         .await
@@ -3762,6 +4377,7 @@ mod tests {
                 rx,
                 ingest,
                 Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+                Arc::new(tokio::sync::Notify::new()),
             ),
         )
         .await
@@ -3785,6 +4401,75 @@ mod tests {
             drained.unparseable, 0,
             "a well-formed ticker frame must not be counted unparseable"
         );
+        // (see `test_drain_exits_on_shutdown_signal_with_the_ring_still_open`
+        // for the other exit path — the one that did not exist until
+        // 2026-08-14.)
+    }
+
+    /// The drain must exit on the shutdown signal **while the ring is still
+    /// open** — the exit path that did not exist until 2026-08-14.
+    ///
+    /// Holding a live sender is the whole point of this test. Before the
+    /// shutdown arm, `rx.recv()` was the only way out, so a drain with any
+    /// sender alive ran forever. At the 17:30 stop nothing closed the sockets,
+    /// so nothing closed the ring, so the final `ingest.flush()` never ran and
+    /// the day's tail died with the process — while the log printed
+    /// "tickvault stopped" and classified the shutdown clean.
+    ///
+    /// The timeout is the assertion: a drain that ignores the signal hangs
+    /// here rather than failing an equality check, which is the honest shape
+    /// for "this must terminate".
+    #[tokio::test]
+    async fn test_drain_exits_on_shutdown_signal_with_the_ring_still_open() {
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+
+        tx.send(CapturedFrame {
+            seq: 7,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: 0,
+            bytes: bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, 1_779_355_000)),
+        })
+        .await
+        .expect("the ring must accept a frame");
+
+        let drain = tokio::spawn(run_frame_drain(
+            rx,
+            ingest,
+            Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+            Arc::clone(&shutdown),
+        ));
+
+        // `notify_one` is permit-based, so this is safe to fire before the
+        // drain has parked on its shutdown arm — the permit is retained. That
+        // is precisely why it is used instead of `notify_waiters`, whose wake
+        // would be lost if the drain happened to be inside another arm.
+        shutdown.notify_one();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect(
+                "the drain must exit on the shutdown signal even with a live sender still \
+                 holding the ring open — hanging here IS the bug this test exists to catch",
+            )
+            .expect("the drain task must not panic");
+
+        assert_eq!(
+            outcome.folded, 1,
+            "the drain should have folded the queued frame before honouring shutdown — \
+             exiting on the signal must not mean abandoning what was already in the ring"
+        );
+        assert_eq!(
+            outcome.ingest.pending_rows(),
+            0,
+            "the shutdown path must FLUSH, not merely exit. Rows left pending here are \
+             exactly the day's tail that used to die with the process every evening."
+        );
+
+        // The sender is still alive until this line, proving the exit came
+        // from the signal and not from the ring closing.
+        drop(tx);
     }
 
     #[tokio::test]
@@ -3800,6 +4485,7 @@ mod tests {
         tx.send(CapturedFrame {
             seq: 1,
             endpoint: DhanEndpointType::Depth20,
+            connection_index: 5,
             bytes: bytes::Bytes::from_static(&[0x0C, 0x00, 0x29, 0x00, 0x0D, 0x00, 0x00, 0x00]),
         })
         .await
@@ -3812,6 +4498,7 @@ mod tests {
                 rx,
                 ingest,
                 Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+                Arc::new(tokio::sync::Notify::new()),
             ),
         )
         .await

@@ -139,7 +139,8 @@ pub fn tick_price_is_sane(tick: &ParsedTick) -> bool {
 /// TICK, not per TIMEFRAME: the three source fields (`last_traded_price`,
 /// `day_open`, `day_close`) are identical across all `TF_COUNT` timeframes, so
 /// converting inside the fold multiplied one tick's conversion cost by
-/// `TF_COUNT × 3` (63 at `TF_COUNT = 21`) — ~3.15 µs against the 100 ns/tick
+/// `TF_COUNT × 3` (72 at the current `TF_COUNT = 24`; the comment said 63 at
+/// 21 until 2026-08-14, stale since the 2026-08-10 raise) — ~3.6 µs against the 100 ns/tick
 /// hot-path budget, a ~31× overrun for zero added information.
 ///
 /// Widening is applied here as the folds applied it: `day_open` / `day_close`
@@ -246,9 +247,9 @@ pub enum ConsumeOutcome {
 /// # Layout and RAM
 ///
 /// `[LiveCandleState; TF_COUNT] × 2` + `[bool; TF_COUNT]` =
-/// `21 × 128 × 2 + 21` ≈ **5.4 KB per instrument** (pinned by a
+/// `24 × 128 × 2 + 24` ≈ **6.2 KB per instrument** (pinned by a
 /// compile-time assertion below). At the 25,000-instrument slot ceiling that
-/// is ~135 MB — real, budgeted against the 32 GiB r8g.xlarge host, and it
+/// is ~154 MB — real, budgeted against the 32 GiB r8g.xlarge host, and it
 /// only materialises for instruments that actually tick (slots are allocated
 /// on first sight, never pre-populated).
 ///

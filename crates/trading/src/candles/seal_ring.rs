@@ -17,11 +17,18 @@
 //!
 //! ## RAM budget
 //!
-//! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 21
-//! = 525,000) and `BufferedSeal` ≤ 144 bytes → **~76 MB worst-case**.
-//! 0.23% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
+//! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 24
+//! = 600,000) and `BufferedSeal` ≤ 144 bytes → **~86 MB worst-case**.
+//! 0.26% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
 //! Was a hardcoded 200,000 (~29 MB) until 2026-08-10 — see the constant's
-//! own doc for why that literal under-sized the midnight burst by 2.6×.
+//! own doc for why that literal under-sized the midnight burst by 3×.
+//!
+//! **This paragraph restated the product as a literal and went stale**
+//! (2026-08-14): it read "25,000 × 21 = 525,000 → ~76 MB" after `TF_COUNT`
+//! moved 21 → 24 on 2026-08-10. The constant's own doc, forty lines below,
+//! explicitly warns against doing exactly that — and this header did it
+//! anyway. The numbers above are re-derived; if you are reading them long
+//! after 2026-08-14, verify against `TF_COUNT` rather than trusting them.
 //!
 //! ## Drop semantics on overflow
 //!

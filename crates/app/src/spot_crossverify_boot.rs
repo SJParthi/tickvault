@@ -27,6 +27,7 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
+use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 use tickvault_storage::spot_crossverify_persistence::{
     SpotXverifyAuditWriter, SpotXverifyCellFinding, SpotXverifyCellKind, SpotXverifyDailyRow,
     SpotXverifyOutcome, ensure_spot_crossverify_tables,
@@ -554,7 +555,7 @@ pub fn select_spot_1m_sql(feed: &str, day_start_ist_nanos: i64) -> String {
     let probe_limit = SPOT_XVERIFY_ROW_LIMIT + 1;
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, symbol, open, high, low, close, volume \
-         FROM spot_1m_rest \
+         FROM {SPOT_1M_REST_TABLE} \
          WHERE feed = '{feed}' AND exchange_segment = 'IDX_I' \
          AND ts >= {start} AND ts < {end} ORDER BY ts ASC LIMIT {probe_limit}"
     )
@@ -1345,7 +1346,7 @@ mod tests {
         let sql = select_spot_1m_sql("dhan", 0);
         assert!(sql.contains("feed = 'dhan'"));
         assert!(sql.contains("exchange_segment = 'IDX_I'"));
-        assert!(sql.contains("FROM spot_1m_rest"));
+        assert!(sql.contains("FROM rest_spot_1m"), "{sql}");
         // The house LIMIT+1 probe: the query asks for cap+1 so an
         // exactly-cap healthy day is complete, never a false PARTIAL.
         assert!(sql.contains(&format!("LIMIT {}", SPOT_XVERIFY_ROW_LIMIT + 1)));

@@ -40,6 +40,7 @@
 
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
+use tickvault_storage::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE;
 
 /// Strikes each side of at-the-money that depth-20 subscribes, per underlying.
 ///
@@ -386,7 +387,7 @@ pub fn build_depth_candidate_query(today_ist_nanos: i64) -> String {
         // socket count — correct but worse. Day bound and late-attach are one
         // change; do not separate them.
         "SELECT underlying_symbol, contract_security_id, expiry, strike, \
-         underlying_spot, leg FROM option_chain_1m \
+         underlying_spot, leg FROM {OPTION_CHAIN_1M_TABLE} \
          WHERE feed = 'dhan' AND contract_security_id > 0 AND expiry >= {today_micros} \
          AND ts >= {today_micros} \
          LATEST ON ts PARTITION BY underlying_security_id, expiry, strike, leg;"
@@ -923,6 +924,14 @@ mod tests {
         assert!(
             sql.contains("contract_security_id > 0"),
             "must exclude vendor-absent ids: {sql}"
+        );
+        // The 2026-08-14 rename: this reader is what feeds the 10 depth
+        // sockets, so a stale table name here is the difference between
+        // depth-live and depth-dark. Literal on purpose — see the note in
+        // market_ram_store_boot.
+        assert!(
+            sql.contains("FROM rest_option_chain_1m"),
+            "depth reader must follow the renamed REST table: {sql}"
         );
         assert!(
             sql.contains("LATEST ON ts"),

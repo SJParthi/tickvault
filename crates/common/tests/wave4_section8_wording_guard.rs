@@ -87,11 +87,27 @@ fn section8_keeps_seal_ring_claim_with_evidence_pointer() {
         // 2026-07-18 (stage-4 sweep): the honest-100% template cites the
         // LIVE seal-ring envelope. The claim must cite the constant +
         // its in-file ratchet test so future readers can verify the proof.
+        //
+        // 2026-08-14 — THIS ASSERTION PINNED A NUMBER THAT HAD GONE WRONG.
+        // It required the literal "200,000-seal ring buffer capacity" in all
+        // three rule files. `SEAL_BUFFER_CAPACITY` is not 200,000 and has not
+        // been since 2026-08-10: it derives as `AGGREGATOR_MAX_SLOTS ×
+        // TF_COUNT`, which was 525,000 at TF_COUNT=21 and is 600,000 now that
+        // TF_COUNT is 24. So this guard was actively HOLDING THE OPERATOR-
+        // FACING CLAIM AT A FIGURE 3× BELOW REALITY, and failing any attempt
+        // to correct it — a ratchet enforcing a falsehood is worse than no
+        // ratchet, because it makes the falsehood look verified.
+        //
+        // The fix is to pin the DERIVATION rather than a literal, which is
+        // exactly what `seal_ring.rs`'s own constant doc tells readers to do.
+        // A number in prose goes stale silently; a formula does not.
         assert!(
-            text.contains("200,000-seal ring buffer capacity"),
-            "{label} ({path}) must keep the proven 200,000-seal ring \
-             buffer capacity claim (the live absorption tier per the L-C1 \
-             design lock in seal_ring.rs)."
+            text.contains("`AGGREGATOR_MAX_SLOTS × TF_COUNT`"),
+            "{label} ({path}) must state the seal-ring envelope as the \
+             DERIVATION `AGGREGATOR_MAX_SLOTS × TF_COUNT`, not as a literal \
+             row count. A literal goes stale the next time TF_COUNT moves — \
+             it already did, twice (200,000 → 525,000 → 600,000), and this \
+             guard previously pinned the oldest of the three."
         );
         assert!(
             text.contains("`SEAL_BUFFER_CAPACITY`"),

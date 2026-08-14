@@ -170,6 +170,17 @@ resource "aws_cloudwatch_metric_alarm" "token_remaining_low" {
 # alarms (treat_missing_data = notBreaching) were permanently-dead monitors.
 # The candle-side seal chain keeps its own pagers (seal-drop-alarm.tf +
 # the AGGREGATOR-DROP-01 errcode alarm).
+#
+# 2026-08-14 CORRECTION — the tv_ticks_dropped_total half of the paragraph
+# above is now STALE. It was TRUE when written: tick_persistence.rs had just
+# been deleted in the stage-2 dead-WS sweep. The 2026-08-09 Dhan live-lane
+# revival REBUILT that module, and it emits tv_ticks_dropped_total again today
+# (tick_persistence.rs:784, verified in source). The retirement was correct at
+# its date and the metric is live again at this one; both statements are true,
+# which is exactly why a re-added alarm must re-verify the emit site rather
+# than trust this comment. A replacement alarm lives in live-lane-alarms.tf.
+# tv_dlq_ticks_total and tv_spill_dropped_total are UNCHANGED — still no emit
+# sites, still correctly un-alarmed.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

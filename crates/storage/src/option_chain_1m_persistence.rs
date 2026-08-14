@@ -58,7 +58,11 @@ use tickvault_common::moneyness::MoneynessStepLabel;
 
 /// QuestDB table name — one row per fetched `(minute, underlying, expiry,
 /// strike, leg)`.
-pub const OPTION_CHAIN_1M_TABLE: &str = "option_chain_1m";
+pub const OPTION_CHAIN_1M_TABLE: &str = "rest_option_chain_1m";
+
+/// The pre-2026-08-14 name. Retained ONLY so the boot migration can rename an
+/// existing populated table forward. Never write through this.
+pub const LEGACY_OPTION_CHAIN_1M_TABLE: &str = "option_chain_1m";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule);
 /// `exchange_segment` alongside the underlying id (I-P1-11); `feed` in-key
@@ -511,6 +515,37 @@ pub async fn ensure_option_chain_1m_table(questdb_config: &QuestDbConfig) {
             return;
         }
     };
+    // RENAME-FIRST migration — see `ensure_spot_1m_rest_table` for the full
+    // reasoning. Rename before CREATE so an existing populated table carries
+    // its rows forward instead of a fresh empty table appearing beside it.
+    // Run OUTSIDE the statement loop: the RENAME legitimately fails once the
+    // new name exists (every boot after the first) and on a fresh install, and
+    // inside the loop that expected failure fired a coded `error!` plus a
+    // `tv_chain1m_persist_errors_total` increment on every such boot.
+    // The ONE refusal that is not routine: both tables present means the
+    // history is split and only an operator can decide how to merge it.
+    if crate::http_client::try_rename_legacy_table(
+        &client,
+        &base_url,
+        LEGACY_OPTION_CHAIN_1M_TABLE,
+        OPTION_CHAIN_1M_TABLE,
+    )
+    .await
+        == crate::http_client::LegacyRenameOutcome::Split
+    {
+        metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "legacy_table_split")
+            .increment(1);
+        error!(
+            code = "CHAIN-03",
+            stage = "legacy_table_split",
+            legacy_table = LEGACY_OPTION_CHAIN_1M_TABLE,
+            current_table = OPTION_CHAIN_1M_TABLE,
+            "CHAIN-03: both the legacy and current option_chain_1m tables exist — \
+             the history is SPLIT across two SEBI-retained tables. New rows land \
+             in the current name; everything written before the rename stays in \
+             the legacy one. Neither is dropped; merging is an operator decision"
+        );
+    }
     let mut statements = vec![option_chain_1m_create_ddl()];
     // Per-column self-heal for tables created by earlier builds
     // (observability-architecture.md schema-self-heal pattern). QuestDB
@@ -974,7 +1009,7 @@ mod tests {
 
     #[test]
     fn test_option_chain_1m_symbol_labels_stable() {
-        assert_eq!(OPTION_CHAIN_1M_TABLE, "option_chain_1m");
+        assert_eq!(OPTION_CHAIN_1M_TABLE, "rest_option_chain_1m");
         assert_eq!(OPTION_CHAIN_1M_FEED_DHAN, "dhan");
         assert_eq!(OPTION_CHAIN_1M_FEED_GROWW, "groww");
         assert_eq!(OPTION_CHAIN_1M_SOURCE, "rest_optionchain");

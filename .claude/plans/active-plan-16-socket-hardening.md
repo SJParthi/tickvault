@@ -283,3 +283,411 @@ With H-D resolved, the remaining work is mechanical: extract the dial body
 (`:2126-2191`) into a reusable fn, move `pool` into the spawned depth task
 (confirmed no use after the loop), and add the bounded retry loop around
 `load_depth_universe(&params.questdb, ist_midnight_nanos(today))`.
+
+---
+
+## ITEMS 8–14 (added 2026-08-14) — operator: "Go ahead with the entire fixes"
+
+**The verbatim operator authorization (2026-08-14, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Go ahead with the entire fixes dude okay? Not per Sid cloudwatch right per websocket
+> connections or entire webscoket connections right dude ami right dude"
+
+Given in DIRECT response to a message that enumerated exactly eight fixes in a priority
+table (drain respawn · token cooldown · stop the console lying + alarms · depth ring
+budget · ILP over TCP · WAL re-fold · receipt-time latency · `target-cpu`). That table is
+the scope this quote authorizes. The second sentence is a DESIGN CORRECTION the operator
+made himself and it is adopted verbatim: latency is dimensioned **per WebSocket
+connection (16)**, never per instrument (4,565).
+
+**Why the correction is right, and recorded so nobody "improves" it back:** 4,565
+per-instrument CloudWatch metrics ≈ $1,369/mo against a budget whose AUTOMATIC action is
+`STOP_EC2_INSTANCES` — the observability feature would stop the trading box. 16
+per-connection metrics ≈ $4.80/mo. Per-instrument drill-down stays in RAM, served over
+the existing API, costing zero CloudWatch dimensions.
+
+**This adds NO new scope.** No socket is opened beyond the 16 already authorized
+(2026-08-09 second quote), no universe is widened, `dry_run` is untouched, and the §28
+frozen area is not edited. Every item below repairs code that PR #1743–#1750 already
+landed.
+
+### Item 8 — the frame drain must be unkillable
+
+`dhan_feed_stack.rs:2402-2416` awaits the drain join handle, logs one `error!`, sets the
+gauge to 0, and **returns**. A panic in any drain arm therefore ends the only ring
+consumer for the rest of the session: sockets keep capturing, the WAL keeps growing, and
+zero rows reach `ticks` or `candles_*`. The silence detector cannot warn, because it
+lives INSIDE the dead task. Fix: supervise the drain with the house respawn pattern
+(`cadence_runner` precedent) — bounded restarts, `tv_dhan_feed_drain_respawn_total`,
+coded `error!` per respawn, and a permanent-failure page after the cap.
+
+### Item 9 — a fatally-parked socket must not be silent
+
+`pool_supervisor.rs:1690` parks a socket permanently on a fatal disconnect (805) and never
+dials again — deliberate, and correct as a dial policy. What is NOT correct is that
+nothing tells the operator. Fix: `tv_dhan_ws_park_total` gains a CloudWatch alarm; the
+park site emits a coded `error!` naming the endpoint and slot. The park policy itself is
+UNCHANGED (re-dialling into a fatal reject is worse).
+
+### Item 10 — the 807 token stampede
+
+Every one of the 16 connection closures calls `manager.force_renewal()`
+(`dhan_feed_stack.rs:2090-2103`). `try_renew_token` is never cooldown-gated, and the mint
+guard is a **check-then-act across an `.await`** (read `token_manager.rs:960-965`, written
+inside `acquire_token` at `:768-770`) — so two callers can both pass. Dhan permits ONE
+active token per account, so mint *n* invalidates mint *n−1* and the sockets that already
+re-dialled get 807 again. This path executes **every 24 h by regulation**, so it is not a
+tail risk. Fix: a single-flight gate — the first caller mints, the other fifteen await the
+same result; the cooldown stamp is written BEFORE the await, not after.
+
+### Item 11 — stop the console lying
+
+`set_dhan_lane_running` has ZERO production call sites (8 repo-wide hits, all tests), so
+`feed_health.rs:162` returns `Degraded, "enabled, but the feed was not started at boot"`
+**unconditionally** — whether the lane is healthy, dead, or never started. `feeds_page.rs`
+then prescribes a restart from that constant. Separately, no `record_ticks` call site
+exists, so Dhan feed health can never read `Down` — it returns a benign
+`Unknown, "not instrumented yet"` for a corpse. Fix: call `set_dhan_lane_running(true)`
+when the stack is actually up and `(false)` on every exit path; wire `record_ticks` from
+the drain so health can fall.
+
+### Item 12 — per-connection latency, receipt-stamped
+
+Three defects make today's numbers unusable even if published: (a) the receive stamp is
+taken in the DRAIN, after the shared 65,536-frame ring (`dhan_feed_stack.rs:1455`), so
+under load it measures OUR queueing, not Dhan's delivery; (b) `CapturedFrame`
+(`pool_supervisor.rs:832`) carries no slot, so a tick cannot be attributed to a socket;
+(c) `DailyLagHistogram::record_ns` takes **unsigned** — one negative sample (host clock
+behind exchange, or a garbage LTT) stores a ~570-million-year maximum permanently.
+
+Fix: stamp receipt in the read task and carry it plus `slot: ConnectionId` on
+`CapturedFrame` (a `u64` + a `u8` — no allocation; `Bytes` remains the only heap member).
+Compute lag in `i64` on ONE explicit IST basis, clamp negatives to zero and COUNT the
+clamp, reject `ts == 0` and `ts == u32::MAX` before recording. Publish p50/p99 per
+connection (16 dimensions). Per-instrument stays in a RAM ring served over the API.
+
+**Honest limits, stated at the point of display, not buried:** Dhan's LTT is whole
+SECONDS, so every lag figure carries a ±1 s truncation floor and a mean +500 ms bias —
+sub-second precision is structurally unavailable and must never be claimed. Only the 5
+main-feed sockets produce ticks; depth sockets get a frame-CADENCE metric instead, and
+the order-update socket is a separate JSON path. Idle instruments are excluded — LTT is
+last-TRADE time, so a thin option is legitimately minutes stale and must never page.
+Silence remains owned by `scan_silence`.
+
+### Item 13 — alarms for a lane that currently has none
+
+`grep NotificationEvent` over the feed stack returns EMPTY, and no `tv_dhan_*` metric
+appears in any `deploy/aws/terraform/*.tf` alarm. Meanwhile `tv_ticks_dropped_total` is
+already billed and shipped to CloudWatch with no alarm consuming it — the repo's own EMF
+notes call it "the single largest tick-loss window". Fix: alarms on
+`tv_dhan_feed_stack_up < 1`, `tv_ticks_dropped_total`, `tv_dhan_ws_park_total`, and the
+ring-full counter. **A dated row lands in `dhan-rest-only-noise-lock-2026-07-14.md` §2
+FIRST** — that file's §3 makes any new Dhan-scoped page a REJECT without one.
+
+### Item 14 — build for the CPU we actually run on
+
+`.cargo/config.toml` deliberately does not set `target-cpu`, and its stated reason is
+portability between a Mac dev build and AWS. That reason is sound for the LOCAL profile
+and does not apply to the deploy path, which cross-compiles for a KNOWN r8g.xlarge
+(Graviton4 = `neoverse-v2`). Fix: set `-C target-cpu=neoverse-v2` in the deploy build
+only, leaving the local build generic. The portability comment stays and gains the
+carve-out so the next reader does not undo it.
+
+## Item 8–14 Edge Cases
+
+- Drain respawn must NOT restart into a poison frame forever — the restart budget is
+  bounded and exhaustion pages rather than looping.
+- The single-flight token gate must not deadlock when the first caller panics — the
+  permit is released on drop, not on success.
+- `set_dhan_lane_running(false)` must fire on EVERY exit path including panic-unwind,
+  or the console flips from one lie to the opposite lie.
+- The lag histogram must reject a frame stamped before its own connection opened (clock
+  step during dial).
+- A depth socket must never contribute to the main-feed lag percentiles.
+
+## Item 8–14 Failure Modes
+
+| Mode | Detection | Recovery |
+|---|---|---|
+| Drain panics repeatedly | respawn counter + cap | page after cap, gauge 0 |
+| Token mint fails for all 16 | single-flight returns one error to all | existing backoff ladder |
+| Clock steps backward mid-session | negative-lag clamp counter | series annotated, not silently zeroed |
+| EMF name budget exceeded (16,382/16,384 bytes today) | terraform plan fails | short metric names, counted before adding |
+
+## Item 8–14 Test Plan
+
+Unit: single-flight gate under 16 concurrent callers (loom where practical); negative and
+`u32::MAX` lag inputs clamp and count; `set_dhan_lane_running` toggles on both the success
+and the panic path. Integration: drain respawn after an induced panic. Ratchet: a guard
+asserting `set_dhan_lane_running` has ≥1 production call site — the defect class that
+caused Item 11 in the first place. DHAT: the receipt stamp adds no allocation.
+
+## Item 8–14 Rollback
+
+Every item is independently revertable. Items 8–11 and 13 are additive (a supervisor, a
+gate, a setter call, alarms) and removing them restores today's behaviour exactly. Item 12
+adds two fields to an internal struct. Item 14 is one build flag.
+
+## Item 8–14 Observability
+
+New: `tv_dhan_feed_drain_respawn_total`, `tv_dhan_lag_negative_clamped_total`,
+per-connection lag p50/p99 (16 dims). Existing-but-unwatched gain alarms:
+`tv_dhan_feed_stack_up`, `tv_ticks_dropped_total`, `tv_dhan_ws_park_total`.
+
+## Item 8–14 Honest envelope
+
+100% inside the tested envelope: after these items nothing is lost after a frame reaches
+our NIC, no failure is silent, and every stage of the chain is measured. NOT claimed:
+(a) sub-second latency accuracy — Dhan's LTT is whole seconds and the ±1 s floor is
+structural; (b) any improvement to Dhan's own delivery, measured 2026-07-06 at p99
+46.37 s / max 198.69 s — every one of these fixes is on OUR side of the NIC and changes
+that number by exactly zero; (c) detection of a tick Dhan never sent — their India feed
+carries no sequence number and no snapshot-on-subscribe, so upstream loss stays invisible
+at the protocol level; (d) that the lane has been exercised at 4,565 instruments — it has
+not, on any day, and the first live session at that scale remains the measured gate.
+
+---
+
+## ITEMS 15–21 (added 2026-08-14) — operator: "Solve and fix all these also dude okay!"
+
+Given in DIRECT response to the six-agent audit table naming these findings. No new
+scope: no socket beyond the authorized 16, no universe widening, `dry_run` untouched,
+§28 frozen area untouched. Every item repairs code already landed.
+
+**15 — Frame cap sized off the wrong quantity (CRITICAL).**
+`MAIN_FEED_MAX_FRAME_BYTES = 256 KiB`, justified in its own comment by a *subscribe
+batch* of 100 instruments (~16 KiB). The subscribe batch has nothing to do with how many
+packets Dhan coalesces into one WebSocket message. A socket carries up to 5,000
+instruments; 5,000 × 162 B Full = 810 KiB. On overflow `Error::Capacity` maps to
+`reason="oversize"` and returns `SocketEvent::Closed`, so the ladder reconnects,
+resubscribes, and the burst repeats — a permanent reconnect loop precisely at 09:15.
+Fix: size the cap from `instruments_per_connection × max_packet_bytes` with headroom,
+and pin the derivation so it cannot drift from the subscribe-batch reasoning again.
+
+**16 — The 16 second-scale timeframes are NOT gated (CRITICAL).**
+`tf_index.rs` documents them as "GDF-feed-gated, zero rows until the GDF 1s live feed
+lands". No gate exists — every tick path iterates `TfIndex::ALL` unconditionally, so a
+Dhan tick opens AND seals S1..S30. At scale that is ~70 GB/day onto a 100 GB disk. Fix:
+make the documented gate real, per feed, defaulting to the documented behaviour.
+
+**17 — No shutdown teardown; the day's tail is lost silently (HIGH).**
+The lane's handle is bound to `_dhan_feed_stack_monitor` and the shutdown path's Dhan
+steps were "deleted with the lane" — the lane returned, the teardown did not. Nothing
+closes the sockets, so the ring never closes, so the drain never breaks, so the final
+`ingest.flush()` never runs. Sub-threshold ILP rows and open candle state evaporate while
+the log prints "tickvault stopped" and classifies the shutdown clean. **This is losing
+data today**, in Quote mode, at 4,565 instruments. Fix: signal the lane on shutdown and
+flush before exit.
+
+**18 — 804 misclassified as Transient (HIGH).** `classify_disconnect`'s catch-all sends
+"instruments exceed limit" onto the infinite reconnect ladder, re-sending the identical
+over-limit set every 30s forever. Fix: classify as Fatal → park (the park now pages).
+
+**19 — 250 subscribe messages with zero pacing (HIGH).** Dhan documents no subscribe
+rate limit, and 805's own text says "too many requests … may result in user being
+blocked". We send the account's maximum possible subscribe volume as fast as the socket
+accepts writes, on five sockets at once. Fix: a small inter-message delay and per-slot
+connect stagger.
+
+**20 — Seal ring evicts OLDEST (HIGH).** For a current-day store, drop-oldest destroys
+the morning. Recorded; fix is a policy decision (drop-newest + loud counter) that needs
+its own review, so it is FLAGGED here rather than silently changed.
+
+**21 — QuestDB tuned for TCP 9009 while every writer uses HTTP 9000 (MED).** Five
+`QDB_LINE_TCP_*` knobs tune a receiver nothing connects to; there is zero `line.http.*`
+tuning. Fix: tune the transport actually in use, or move to ILP/TCP deliberately.
+
+## Items 15–21 Edge Cases / Failure Modes / Test Plan / Rollback / Observability
+
+Edge cases: a raised frame cap must not mask a genuinely runaway frame (keep a ceiling
+and count refusals); the TF gate must not silently disable timeframes a feed legitimately
+produces; shutdown flush must be bounded so a hung QuestDB cannot block SIGTERM past
+systemd's timeout. Failure modes: flush-on-shutdown fails → coded error, never a silent
+clean exit. Test plan: unit tests for the cap derivation and the 804 classification; a
+source-order pin that the shutdown path signals the lane; bite-proofs for each guard.
+Rollback: every item is independently revertable; 15/18 are constant changes, 17 is
+additive. Observability: refusal counters already exist for oversize frames; the shutdown
+flush gets an explicit outcome log.
+
+## Items 15–21 Honest envelope
+
+NOT claimed: that any of this has been exercised at 25,000 instruments or in Full mode —
+neither has ever run. Item 15's 810 KiB figure is arithmetic from the documented packet
+size and per-connection cap, not an observed frame. Item 16's ~70 GB/day is arithmetic
+from row sizes, not a measurement. The measured evidence remains ~3,000 ticks/sec
+aggregate in QUOTE mode; there is no Full-mode measurement in the repository at all.
+
+---
+
+## ITEMS 22–28 (added 2026-08-14) — operator: "yes dude fix evryhtign espeiclaly entilrey relaetd to this"
+
+**The verbatim operator authorization (2026-08-14, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "yes dude fix evryhtign espeiclaly entilrey relaetd to this dudde okay? see espeiclaly
+> entiley related to linx kernel aws isnatcne see its betst toe ntolrey suie the entirte
+> aws sinatcnec tunign eprformance optimisatiosn efficient to use ithe maixmsied entire
+> ocnfirguatiosn dude ... i mena see not even a singke tikcs hsodu lenevr evr be lsot we
+> hsodcu lalwya smaintian the dhan fast consumer espeicllay by mainitaning this becuase
+> only then we can avoid websocket disocnenctiona nd websocket reconenciton espeicllay we
+> hsodu lnto even face the smaller level of millsieocd latencye form dhan to aws"
+
+Given in DIRECT response to a nine-agent audit whose fix queue named exactly these items.
+**No new scope:** no socket beyond the authorized 16, no universe widening, `dry_run`
+untouched, §28 frozen area untouched. Every item repairs code already landed.
+
+### Design
+
+**Item 22 — the required CI gate is RED (blocks everything else).** Commit `09fd3c2`
+(today) introduced an unused binding at `operator_control.rs:675`. `Build & Verify` runs
+`cargo clippy --workspace --no-deps -- -D warnings`, so this is a hard error — reproduced
+locally at **exit 101**. Nothing else in this plan can merge until it is fixed. Rename the
+binding to `_le`; the loop genuinely does not use it (the `+Inf` bound is read from
+`bound`, and the comment below the loop explains why the string form is deliberately
+unused).
+
+**Item 23 — Nagle is enabled on all 16 sockets.** `connection.rs:762` calls
+`connect_async_tls_with_config(request, config, false, Some(connector))`. The third
+parameter is `disable_nagle`, so `false` leaves Nagle ON. The lane is receive-heavy, but
+the client does send: subscribe batches (up to 250 messages) and — critically — **pongs**.
+Dhan closes a socket after 40 s of silence (`99-tickvault-net.conf:123-124`), and Nagle
+can hold a small write behind an unacknowledged segment for up to ~200 ms while delayed-ACK
+waits on the peer. That is latency the operator explicitly asked to remove, on the one
+write whose lateness costs a reconnect. Pass `true`.
+
+**Item 24 — the TLS connector is rebuilt on every dial.** `connection.rs:718-722` calls
+`build_websocket_tls_connector*()` inside the dial path, so each of the 16 sockets — and
+every reconnect thereafter — constructs a fresh `rustls::ClientConfig`. Two costs follow:
+(a) `rustls_native_certs::load_native_certs()` re-reads and re-parses the entire system CA
+bundle **from disk** on the recovery path, which is exactly when the box is least idle;
+(b) a fresh `ClientConfig` carries a fresh, empty session-resumption store, so every
+reconnect is a full 2-RTT handshake instead of an abbreviated one. Cache both connector
+variants in `OnceLock`s and hand out clones (`Connector::Rustls(Arc<ClientConfig>)` is
+already `Arc`-backed, so a clone is a refcount bump). Resumption then works because all
+sockets of a kind share one config.
+
+**Item 25 — a heap allocation on every tick.** `record_ws_lag`
+(`dhan_feed_stack.rs:1994,1998`) calls `connection_index.to_string()` and passes it as a
+metric label. `metrics::histogram!` with a label builds a `Key` owning a `Vec<Label>`, so
+this is **two heap allocations per tick** on the live path — the exact cost
+`parser/dispatcher.rs:32-35` and `DrainCounters` (`:1158-1170`) both exist to avoid. The
+label set is bounded and known at compile time (`MAX_TOTAL_DHAN_CONNECTIONS = 16`), so
+resolve all 16 histogram handles plus the two excluded-counter handles once into a
+`OnceLock<WsLagHandles>` and index by connection. This is the same fix, in the same file,
+as the pattern two hundred lines above it.
+
+**Item 26 — the silence pager has no trading-day gate.** `is_within_market_hours_ist`
+(`dhan_feed_stack.rs:2964`) checks time-of-day only; the file imports `trading_calendar`
+solely for `ist_offset()`. EventBridge starts the box on `MON-FRI`, which includes NSE
+holidays. On such a day the lane dials, seeds ~4,565 instruments, receives nothing, and at
+09:15 + two 30 s scans fires `RISK-GAP-03` with `silent=4565, never_ticked=4565` — the
+most alarming page the system can produce, false, roughly six times a year. The second-order
+cost is what matters: it trains the operator to mute the ONE detector that catches a
+silently-failed subscribe. Every sibling leg already gates on `is_trading_day`
+(`groww_contract_1m_boot.rs:1900`, `groww_option_chain_1m_boot.rs:1819`,
+`brutex_crossverify_boot.rs:1673`, `feed_scoreboard_boot.rs:188`). Gate the page — not the
+gauges, which are correct to publish zero on a holiday.
+
+**Item 27 — the 15:31 cross-verification also fires on holidays.** Same root cause
+(`dhan_feed_stack.rs:2828`), same fix. Today it warns "found no data on either side" every
+weekday holiday, compounding Item 26's fatigue on the lane's only loss detector.
+
+**Item 28 — two host-tuning gaps the kernel audit found.** The sysctl set is otherwise
+strong (20 knobs, applied at boot and verified). Missing: (a) **VM dirty ratios** — QuestDB
+shares this box, and an unbounded writeback burst can stall the host, which stalls the
+consumer, which is the actual tick-loss trigger; set `dirty_ratio=10` /
+`dirty_background_ratio=3` so writeback is frequent and small rather than rare and huge.
+(b) **Transparent hugepages** left at the distro default; set `madvise` — not `never`,
+because the co-tenant database benefits from THP and `never` would hurt it. Also assert
+**chrony** in provisioning: AL2023 ships it pointed at the Amazon Time Sync service by
+default, but nothing in `user-data.sh.tftpl` verifies it, and every latency number in Item
+12 is meaningless if the clock is unsynchronised.
+
+### Edge Cases
+
+- `disable_nagle=true` must not alter the depth-200 no-ALPN path — the two are orthogonal
+  (one is a socket option, one is a TLS config), and the depth-200 ALPN carve-out
+  (`connection.rs:712-717`) must survive untouched.
+- Cached TLS connector must NOT be shared between the ALPN and no-ALPN variants — they are
+  different configs and crossing them re-opens the 2026-04-23
+  `ResetWithoutClosingHandshake` class. Two separate `OnceLock`s, never one.
+- A TLS build failure must still be reported per-dial (it currently increments
+  `tls_config`); caching must not turn a transient first failure into a permanent poisoned
+  `OnceLock`. Cache only on success.
+- Lag handles: `connection_index` is a `u8` and must be bounds-checked against
+  `MAX_TOTAL_DHAN_CONNECTIONS` before indexing — an out-of-range slot must fall back to a
+  counted "unknown" bucket, never panic on the hot path and never allocate.
+- Holiday gate must NOT suppress the gauges — a holiday reading zero silent instruments is
+  correct data. Only the PAGE is gated.
+- Holiday gate must not suppress a page on a trading day that merely starts late.
+- `vm.dirty_ratio` must stay well above the writeback the ILP path can produce in one
+  flush, or the flush itself starts throttling — 10% of 32 GiB is ~3.2 GiB, far above it.
+- THP `madvise` is a boot-time write to `/sys`, not a sysctl — it must be applied in
+  user-data and be idempotent across reboots and re-provisions.
+
+### Failure Modes
+
+| Failure | Detection | Response |
+|---|---|---|
+| Clippy regression reintroduced | `Build & Verify` (required check) | merge blocked |
+| Nagle silently re-enabled by a future edit | ratchet asserting the literal `true` at the dial site | build fails |
+| TLS connectors crossed (ALPN into depth-200) | ratchet asserting two distinct cached handles | build fails |
+| Per-tick allocation reintroduced | pre-resolved handles + the Item 1 DHAT gate once it lands | build fails / gate catches |
+| Holiday page fires anyway | unit test drives a known NSE holiday through the gate | build fails |
+| sysctl file rejected as a whole by a bad key | `verify-net-tuning.sh` already checks 8 keys post-apply | boot marker absent, loud |
+| chrony absent | new provisioning assertion logs loudly to journald | visible at boot |
+
+### Test Plan
+
+- `connection.rs` — unit test asserting the dial passes `disable_nagle = true`; source-order
+  ratchet so the literal cannot silently flip back.
+- `tls.rs` — test that two calls to each builder return handles sharing one `Arc`
+  (`Arc::ptr_eq`), and that the ALPN and no-ALPN caches are NOT the same handle.
+- `dhan_feed_stack.rs` — unit tests: all 16 connection slots resolve a distinct handle; an
+  out-of-range index falls back and counts rather than panicking; existing `ws_lag_ms`
+  behaviour (clamped-negative, implausible-LTT) is unchanged.
+- Holiday gate — unit tests over a known NSE holiday from `base.toml`, a normal trading day,
+  and a weekend, asserting page-suppressed / page-allowed / page-suppressed respectively,
+  and asserting the gauge publishes in all three.
+- Scope per `testing-scope.md`: `cargo test -p tickvault-core -p tickvault-app`; no
+  `crates/common` change, so no workspace escalation.
+- `cargo clippy --workspace --no-deps -- -D warnings` must return 0 — that is Item 22's
+  acceptance test and it is reproduced before and after.
+
+### Rollback
+
+Every item is independently revertable and none changes a schema, a DEDUP key, a config
+default, or a metric name. Item 22 is a rename. Item 23 is one boolean. Item 24 is a cache
+in front of an unchanged builder — reverting restores per-dial construction. Item 25 is a
+mechanical metrics refactor emitting the identical series, so dashboards and alarms cannot
+notice a revert. Items 26–27 gate a page and are revertable by deleting the gate. Item 28
+is host configuration applied at boot; reverting the sysctl file and re-running
+`sysctl --system` restores prior behaviour without touching the app.
+
+### Observability
+
+No new metric series. Item 25 emits exactly the series it emits today
+(`tv_dhan_ws_lag_ms{connection}`, `tv_dhan_ws_lag_excluded_total{reason}`), which is what
+makes it a safe refactor, plus one bounded fallback label for an out-of-range slot. Items
+26–27 REDUCE noise by suppressing false pages; the underlying gauges are unchanged, so a
+real silence on a real trading day still pages exactly as it does now. Item 28 is visible
+through the existing boot verification marker.
+
+### Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: after these items the
+CI gate is green, no write on the socket path waits on Nagle, reconnects reuse a TLS
+config instead of re-reading the CA store from disk, the tick path allocates nothing to
+record its own latency, and the lane's loudest page cannot fire on a day the market is shut.
+
+**NOT claimed:** (a) that any of this improves Dhan's delivery — measured 2026-07-06 at
+p99 46.37 s / max 198.69 s against a second vendor's 562 ms on the same host in the same
+minutes; every item here is on our side of the NIC and moves that number by exactly zero.
+(b) That millisecond-level end-to-end latency is measurable at all — Dhan's LTT is whole
+seconds, so a ±1 s truncation floor is structural. (c) That the WAL re-fold (Item 2) is
+addressed — it is NOT; replayed live-feed frames are still counted and dropped at
+`main.rs:1841-1873`, and that remains the single largest known tick-loss path we control.
+It is deliberately left to Item 2 because the fold path takes a live ring rather than a
+replay batch, and a half-done version risks the 5 working main-feed sockets. (d) Any
+measurement at 4,565 instruments — the lane has still never been observed receiving a tick.

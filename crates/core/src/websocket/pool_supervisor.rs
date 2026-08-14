@@ -174,7 +174,29 @@ pub fn classify_disconnect(code: Option<DisconnectCode>) -> DisconnectClass {
         Some(
             DisconnectCode::DataApiSubscriptionRequired
             | DisconnectCode::AuthenticationFailed
-            | DisconnectCode::ClientIdInvalid,
+            | DisconnectCode::ClientIdInvalid
+            // 804 — "Requested number of instruments exceeds limit."
+            //
+            // MOVED here from the `_ => Transient` catch-all on 2026-08-14.
+            // Transient means "retry on the ladder", and retrying 804 re-sends
+            // the IDENTICAL over-limit subscribe set that was just rejected —
+            // forever, every 30s at the ladder's cap. Nothing in that loop can
+            // ever succeed, because nothing about the request changes between
+            // attempts. It is a request-shaped error wearing a transport-code
+            // costume, and the catch-all could not tell the difference.
+            //
+            // Worse, it is self-amplifying in exactly the direction that hurts
+            // most: a permanent connect/subscribe/reject cycle is precisely
+            // the traffic pattern 805 describes as "too many requests", whose
+            // documented consequence is the USER being blocked — so retrying
+            // one account-level rejection can earn another.
+            //
+            // Fatal parks the socket, and since 2026-08-14 a park is no longer
+            // silent: it emits a coded error naming the endpoint and slot, and
+            // `tv_dhan_ws_park_total` has an alarm. So this turns an invisible
+            // infinite loop into one page that names the real problem —
+            // somebody asked for more instruments than the endpoint allows.
+            | DisconnectCode::InstrumentsExceedLimit,
         ) => DisconnectClass::Fatal,
         _ => DisconnectClass::Transient,
     }
@@ -260,6 +282,9 @@ pub enum ParkReason {
 }
 
 impl ParkReason {
+    /// Every reason, for baseline pre-registration of the park counter.
+    pub const ALL: [Self; 3] = [Self::PoolOverflow, Self::FatalDisconnect, Self::Shutdown];
+
     /// Stable lowercase tag for logs and metric labels.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -622,6 +647,29 @@ impl ConnectionSupervisor {
             "reason" => reason.as_str(),
         )
         .increment(1);
+        // A park is PERMANENT — this socket will never dial again for the rest
+        // of the session, by design (re-dialing into a 805 kills a healthy pool
+        // member, and re-dialing into a credential rejection just repeats it).
+        //
+        // The park POLICY is correct and is not changed here. What was wrong,
+        // until 2026-08-14, is that it happened in complete silence: the
+        // counter above was incremented and nothing else. The counter had no
+        // alarm and no log line, so a socket could drop out of a 16-socket pool
+        // permanently and the only way to notice was to go looking for a
+        // metric nobody was watching. A permanent capacity loss must announce
+        // itself.
+        //
+        // Cold path by construction: a park is terminal for this slot, so this
+        // can log at most once per connection per session.
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            endpoint = self.slot.endpoint.as_str(),
+            connection_index = self.slot.global_index,
+            reason = reason.as_str(),
+            "a Dhan live-feed socket has PARKED PERMANENTLY and will not dial again this \
+             session — the pool is now carrying fewer connections than it was planned for, \
+             and this one only returns on a process restart"
+        );
         SupervisorAction::Park { reason }
     }
 }
@@ -842,6 +890,14 @@ pub struct CapturedFrame {
     /// depth packet as unparseable. Carrying the endpoint makes that mistake
     /// impossible to make by accident.
     pub endpoint: DhanEndpointType,
+    /// WHICH socket of that endpoint's pool, `0..MAX_TOTAL_DHAN_CONNECTIONS`.
+    ///
+    /// `endpoint` alone cannot answer "is ONE socket sick?" — it folds all five
+    /// main-feed connections into a single identity, so a socket delivering
+    /// minutes-late ticks would be averaged away by its four healthy siblings.
+    /// A `u8` alongside the existing enum adds no allocation: `Bytes` remains
+    /// the only heap member of this struct.
+    pub connection_index: u8,
     /// The frame exactly as it arrived. Never parsed on the read task.
     pub bytes: Bytes,
 }
@@ -961,6 +1017,9 @@ pub struct WalRingSink {
     budget: std::sync::Arc<RingByteBudget>,
     ws_type: WsType,
     endpoint: DhanEndpointType,
+    /// Which socket of the pool this sink serves; stamped onto every frame
+    /// so a single sick connection cannot be averaged away by its siblings.
+    connection_index: u8,
     /// Loss counters resolved ONCE at construction — see the note on
     /// [`WalRingSink::new`] for why the macro form is banned on this path.
     wal_dropped: metrics::Counter,
@@ -994,6 +1053,7 @@ impl WalRingSink {
         budget: std::sync::Arc<RingByteBudget>,
         ws_type: WsType,
         endpoint: DhanEndpointType,
+        connection_index: u8,
     ) -> Self {
         let endpoint_label = endpoint.as_str();
         let sink = Self {
@@ -1002,6 +1062,7 @@ impl WalRingSink {
             budget,
             ws_type,
             endpoint,
+            connection_index,
             wal_dropped: metrics::counter!(WAL_DROP_METRIC, "endpoint" => endpoint_label),
             ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
             ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
@@ -1062,6 +1123,7 @@ impl FrameSink for WalRingSink {
             .try_send(CapturedFrame {
                 seq,
                 endpoint: self.endpoint,
+                connection_index: self.connection_index,
                 bytes: frame,
             })
             .is_err()
@@ -1098,6 +1160,41 @@ impl PoolSupervisor {
     /// An empty supervisor with a fresh budget.
     #[must_use]
     pub fn new() -> Self {
+        // Publish a zero on every (endpoint, reason) series the park counter
+        // can ever produce, BEFORE any socket is admitted.
+        //
+        // The CloudWatch agent computes a counter's alarm value as the DELTA
+        // between consecutive samples and has no previous sample for a series
+        // it has never seen, so it drops the first one. A park happens at most
+        // once per connection per session and is otherwise never emitted — so
+        // without this, the FIRST park a series ever sees IS the dropped
+        // sample, it publishes no datapoint, and `tv-<env>-dhan-socket-parked`
+        // (threshold 1, one 300s period) never fires for it. The alarm would
+        // be dead precisely for the single-park case, which is the normal
+        // shape of the incident it exists to catch.
+        //
+        // Both labels must be enumerated, not just one: the agent baselines
+        // per Prometheus SERIES, and the EMF processor folds the labels to
+        // `{host}` afterwards by summing the per-series deltas. A series left
+        // unregistered contributes nothing to that sum on the sample where it
+        // is born, so one missing combination is one invisible park.
+        //
+        // Twelve series at the /metrics endpoint, ONE series in CloudWatch
+        // after folding — so this costs nothing on the bill.
+        //
+        // Done in `new` so it cannot be forgotten at a call site: a supervisor
+        // that exists has published its baseline. Same discipline as
+        // `WalRingSink::pre_register` and `SpillDropCounters::new`.
+        for endpoint in DhanEndpointType::ALL {
+            for reason in ParkReason::ALL {
+                metrics::counter!(
+                    PARK_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "reason" => reason.as_str(),
+                )
+                .increment(0);
+            }
+        }
         Self {
             budget: PoolBudget::new(),
             // Pre-sized to the hard ceiling rather than left unsized: the pool
@@ -1469,6 +1566,43 @@ mod tests {
         RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS, reconnect_delay_ms,
     };
 
+    #[test]
+    fn test_park_reason_all_covers_every_variant_so_no_series_goes_unbaselined() {
+        // `ParkReason::ALL` drives the metric pre-registration in
+        // `PoolSupervisor::new`, and the CloudWatch agent baselines PER LABEL
+        // COMBINATION: a reason missing from ALL has its first park eaten as
+        // the delta baseline, so `tv-<env>-dhan-socket-parked` stays silent for
+        // exactly that reason. `[Self; 3]` alone does not protect against
+        // that — adding a variant forces only `as_str()`'s match to change,
+        // and the array compiles untouched.
+        //
+        // Same shape as `pool_budget::test_endpoint_type_has_exactly_four_...`,
+        // which is what makes `DhanEndpointType::ALL` — the other half of the
+        // registration loop — genuinely compile-protected.
+        assert_eq!(ParkReason::ALL.len(), 3, "exactly three park reasons");
+
+        // Exhaustive match: adding a variant stops this compiling until ALL
+        // and this arm list are updated together.
+        for reason in ParkReason::ALL {
+            match reason {
+                ParkReason::PoolOverflow | ParkReason::FatalDisconnect | ParkReason::Shutdown => {}
+            }
+        }
+
+        // No duplicate standing in for a missing variant — an ALL of
+        // `[PoolOverflow, PoolOverflow, Shutdown]` has the right length and
+        // matches exhaustively, yet leaves FatalDisconnect unregistered.
+        let distinct: BTreeSet<&'static str> = ParkReason::ALL
+            .into_iter()
+            .map(ParkReason::as_str)
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            ParkReason::ALL.len(),
+            "every park reason must contribute a DISTINCT metric label"
+        );
+    }
+
     fn t0() -> Instant {
         Instant::now()
     }
@@ -1548,6 +1682,28 @@ mod tests {
         assert_eq!(
             classify_disconnect(Some(DisconnectCode::InternalServerError)),
             DisconnectClass::Transient
+        );
+    }
+
+    /// 804 must NOT ride the reconnect ladder (2026-08-14 regression pin).
+    ///
+    /// "Requested number of instruments exceeds limit" is a REQUEST error
+    /// wearing a transport-code costume. Retrying it re-sends the identical
+    /// over-limit subscribe set that was just rejected, forever, every 30s at
+    /// the ladder's cap — nothing about the request changes between attempts,
+    /// so nothing in that loop can ever succeed.
+    ///
+    /// It is also self-amplifying in the worst direction: a permanent
+    /// connect/subscribe/reject cycle is exactly the traffic 805 calls "too
+    /// many requests", whose documented consequence is the USER being blocked.
+    /// So retrying one account-level rejection can earn another.
+    #[test]
+    fn test_classify_disconnect_804_is_fatal_not_an_infinite_retry() {
+        assert_eq!(
+            classify_disconnect(Some(DisconnectCode::InstrumentsExceedLimit)),
+            DisconnectClass::Fatal,
+            "804 (instruments exceed limit) must PARK, not retry. Transient here means \
+             re-sending the same rejected subscribe set every 30s forever."
         );
     }
 
@@ -2199,6 +2355,7 @@ mod tests {
             std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
@@ -2231,6 +2388,7 @@ mod tests {
             std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
@@ -2265,6 +2423,7 @@ mod tests {
             std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         assert_eq!(
@@ -2371,6 +2530,7 @@ mod tests {
             std::sync::Arc::clone(&budget),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         assert_eq!(
@@ -2416,6 +2576,7 @@ mod tests {
             std::sync::Arc::clone(&budget),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         for _ in 0..2 {

@@ -595,6 +595,121 @@ fn sec_to_ms(s: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Extract a label's value from a Prometheus series line.
+///
+/// `tv_dhan_ws_lag_ms_bucket{connection="3",le="250"} 17` → `("3")` for
+/// `connection`. Returns `None` when the label is absent, which is how a
+/// malformed or unexpected line is DROPPED rather than defaulted into
+/// connection 0 and silently merged with a real socket's samples.
+fn prom_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+    let needle = format!("{label}=\"");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// The numeric sample at the end of a Prometheus series line.
+fn prom_value(line: &str) -> Option<f64> {
+    line.rsplit_once(' ')
+        .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+}
+
+/// Per-connection `{connection, samples, p50_ms, p99_ms}` rows from the raw
+/// `tv_dhan_ws_lag_ms` histogram lines.
+///
+/// # Why the percentiles are computed here and not in shell
+///
+/// A histogram is exposed as cumulative `_bucket{le=…}` series plus `_sum` and
+/// `_count`. Deriving a percentile means finding the first bucket whose
+/// cumulative count reaches `q × total`. Doing that in awk on the box would
+/// produce a number that LOOKS right when the bucket walk is subtly wrong —
+/// precisely the failure this panel exists to end.
+///
+/// # The resolution limit, which the panel must state
+///
+/// The value returned is the bucket's UPPER BOUND, so it OVER-estimates within
+/// a bucket: a p99 of 250 means "at or below 250 ms", not "250 ms". Combined
+/// with the ±1 s floor from Dhan's whole-second timestamps, this is an outage
+/// and drift signal, never a precision instrument. `+Inf` is reported as-is
+/// rather than as a number, because a p99 in the overflow bucket means the true
+/// value is unbounded above and printing the largest finite bound would be a
+/// lie in the safe direction.
+fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
+    use std::collections::BTreeMap;
+    // connection -> (buckets: le -> cumulative count, total count)
+    let mut per_conn: BTreeMap<String, (BTreeMap<String, f64>, f64)> = BTreeMap::new();
+
+    for line in raw {
+        let Some(conn) = prom_label(line, "connection") else {
+            continue;
+        };
+        let Some(value) = prom_value(line) else {
+            continue;
+        };
+        let entry = per_conn
+            .entry(conn.to_string())
+            .or_insert_with(|| (BTreeMap::new(), 0.0));
+        if line.starts_with("tv_dhan_ws_lag_ms_bucket") {
+            if let Some(le) = prom_label(line, "le") {
+                entry.0.insert(le.to_string(), value);
+            }
+        } else if line.starts_with("tv_dhan_ws_lag_ms_count") {
+            entry.1 = value;
+        }
+    }
+
+    per_conn
+        .into_iter()
+        .filter(|(_, (_, count))| *count > 0.0)
+        .map(|(conn, (buckets, count))| {
+            // Sort by numeric bound; `+Inf` sorts last by construction.
+            let mut bounds: Vec<(f64, &String, f64)> = buckets
+                .iter()
+                .map(|(le, cum)| (le.parse::<f64>().unwrap_or(f64::INFINITY), le, *cum))
+                .collect();
+            bounds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let quantile = |q: f64| -> Value {
+                let target = q * count;
+                // The bucket's `le` STRING is deliberately unused here — the
+                // decision below is made on the PARSED value's finiteness, for
+                // the reason spelled out in the comment inside the branch. It
+                // stays in the tuple because `bounds` is also the sort key
+                // carrier; binding it as `_le` keeps that shape while telling
+                // the compiler (and `-D warnings`, which `Build & Verify` runs)
+                // that the omission is deliberate rather than an oversight.
+                for (bound, _le, cum) in &bounds {
+                    if *cum >= target {
+                        // NOT `le.parse().is_err()`: Rust parses "+Inf" as a
+                        // VALID f64 infinity, so an Err branch here never
+                        // fires — and `serde_json` cannot encode infinity, so
+                        // the overflow bucket would silently render as `null`
+                        // and the panel would show a blank cell for the worst
+                        // case it exists to expose. Test the finiteness of the
+                        // parsed value instead.
+                        return if bound.is_finite() {
+                            json!(*bound)
+                        } else {
+                            // Unbounded above. A string so the page cannot
+                            // render it as a finite number.
+                            json!("+Inf")
+                        };
+                    }
+                }
+                Value::Null
+            };
+
+            json!({
+                "connection": conn,
+                "samples": count,
+                "p50_ms": quantile(0.50),
+                "p99_ms": quantile(0.99),
+            })
+        })
+        .collect()
+}
+
 /// legacy: `_parse_latency` (handler.py:535-585) — parse the labeled latency
 /// snapshot. RESTLAT_ROW lines carry the per-(feed, leg) rest_fetch_audit
 /// aggregate; the METRICS block carries the dormant order-placement
@@ -604,12 +719,17 @@ pub fn parse_latency(stdout: &str) -> Value {
     let mut metrics: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut rest_rows: Vec<Value> = Vec::new();
     let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut ws_raw: Vec<String> = Vec::new();
     let mut in_metrics = false;
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix("RESTLAT_ROW=") {
             if let Some(row) = parse_rest_lat_row(rest) {
                 rest_rows.push(row);
             }
+            continue;
+        }
+        if let Some(raw) = line.strip_prefix("WSLAT_RAW=") {
+            ws_raw.push(raw.to_string());
             continue;
         }
         if line == "METRICS_BEGIN" {
@@ -644,6 +764,10 @@ pub fn parse_latency(stdout: &str) -> Value {
         // list = the box returned no rows (stopped box, empty fetch log, or
         // query failed) — the page says so honestly.
         "rest_latency": rest_rows,
+        // Per-SOCKET live-feed delivery lag. Empty list = the lane produced no
+        // ticks (feed off, box stopped, or /metrics unreachable) — the page
+        // says that rather than showing a comforting zero.
+        "ws_latency": parse_ws_lag_rows(&ws_raw),
         "questdb_ms": sec_to_ms(fields.get("QDB").map_or("", String::as_str)),
         "clock_skew_ms": sec_to_ms(fields.get("SKEW").map_or("", String::as_str)),
         "order_place_avg_ns": order_avg.map(round1),
@@ -2410,6 +2534,39 @@ mod tests {
         // the ratchet caught this edit, which is exactly its job — the banner is
         // the operator's only in-console statement of when the box goes down.
         //
+        // 2026-08-14: THIRD divergence, and unlike the first two this one is
+        // not a correction — it is a mechanical follow-on. The QuestDB table
+        // `spot_1m_rest` was renamed `rest_spot_1m`, and the console embeds
+        // that name in two places: the Data-tab default query the operator
+        // actually runs, and a dedup-key comment. A stale name in the default
+        // query is not cosmetic — it hands the operator a query that errors
+        // out on a table that no longer exists, on the one screen he uses to
+        // check the box. Byte-length is UNCHANGED (both names are 12 chars),
+        // so only the digest moves; that is itself the evidence this edit is
+        // a rename and nothing else.
+        //
+        // 2026-08-14: FOURTH divergence, and the first that ADDS a panel
+        // rather than correcting a string. The LATENCY card showed only REST
+        // pull rows — the operator noticed and asked where the WebSocket
+        // numbers were. The honest answer was that NOTHING on the box measured
+        // live-socket lag: `tv_dhan_exchange_lag_p99_seconds` was retired
+        // 2026-07-17 and nothing replaced it, so "the live feed is fast" was
+        // unfalsifiable and the p99 46 s that retired this feed on 2026-07-13
+        // could be neither reproduced nor refuted.
+        //
+        // The card now renders a per-SOCKET live table ABOVE the REST table,
+        // fed from the app's own histogram via /metrics (no table holds live
+        // lag). The caption states the ±1 s floor at the point of display,
+        // because Dhan sends its timestamp in whole seconds and a reader must
+        // not take a sub-second figure as precision. The empty state says "no
+        // live ticks measured — this is NOT a zero-latency reading", since a
+        // blank latency table is exactly the shape that otherwise reads as
+        // "instant".
+        //
+        // Byte length MOVES this time (45,612 -> 47,467): a panel was added,
+        // not a name swapped. Both numbers are updated together so the pin
+        // keeps proving what it claims.
+        //
         // The pin REMAINS a content ratchet — any further unreviewed edit to
         // the console HTML still fails the build; it simply no longer claims
         // legacy-byte-identity.
@@ -2417,9 +2574,9 @@ mod tests {
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "a0310d91329bd0c926261f79e907b9f35169a9234d791b09265d14f117636825"
+            "31b3cc9bb1e436d9ae87b7b3844566dd3f969c2a9d07258b72a6db81af67c915"
         );
-        assert_eq!(CONSOLE_HTML.len(), 45_612);
+        assert_eq!(CONSOLE_HTML.len(), 47_467);
     }
 
     // --------------------------------------------------------- class ParseView
@@ -2590,22 +2747,26 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_key_query_targets_spot_1m_rest() {
-        // REST-era repoint (2026-07-16): the shield reads spot_1m_rest's
+    fn test_dedup_key_query_targets_rest_spot_1m() {
+        // REST-era repoint (2026-07-16): the shield reads rest_spot_1m's
         // 4-column key (ts, security_id, exchange_segment, feed per
         // DEDUP_KEY_SPOT_1M_REST), not the retired ticks 5-column key.
         let dedup_cmd = VIEW_COMMANDS
             .iter()
             .find(|c| c.contains("DEDUP_KEYS="))
             .unwrap();
-        assert!(dedup_cmd.contains("table_columns(%27spot_1m_rest%27)"));
+        assert!(dedup_cmd.contains("table_columns(%27rest_spot_1m%27)"));
         assert!(!dedup_cmd.contains("'ticks'"));
     }
 
     #[test]
     fn test_view_commands_target_live_rest_tables() {
         let joined = VIEW_COMMANDS.join("\n");
-        for live in ["spot_1m_rest", "option_chain_1m", "option_contract_1m_rest"] {
+        for live in [
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
+        ] {
             assert!(joined.contains(live), "{live}");
         }
         // Today windows use the house `ts IN today()` convention.
@@ -2614,7 +2775,7 @@ mod tests {
 
     #[test]
     fn test_db_console_default_query_targets_live_table() {
-        assert!(CONSOLE_HTML.contains("SELECT * FROM spot_1m_rest ORDER BY ts DESC LIMIT 50"));
+        assert!(CONSOLE_HTML.contains("SELECT * FROM rest_spot_1m ORDER BY ts DESC LIMIT 50"));
         assert!(!CONSOLE_HTML.contains("SELECT * FROM ticks ORDER BY ts DESC LIMIT 50"));
     }
 
@@ -2708,6 +2869,79 @@ mod tests {
         ] {
             assert!(parse_rest_lat_row(bad).is_none(), "{bad:?}");
         }
+    }
+
+    /// Two sockets, one healthy and one badly late — the exact shape the panel
+    /// exists to make visible, and the one a `{host}`-folded or per-endpoint
+    /// metric would average away.
+    #[test]
+    fn test_parse_ws_lag_rows_reports_each_socket_separately() {
+        let raw: Vec<String> = [
+            r#"tv_dhan_ws_lag_ms_bucket{connection="0",le="100"} 90"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="0",le="250"} 100"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="0",le="+Inf"} 100"#,
+            r#"tv_dhan_ws_lag_ms_count{connection="0"} 100"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="3",le="100"} 0"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="3",le="60000"} 100"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="3",le="+Inf"} 100"#,
+            r#"tv_dhan_ws_lag_ms_count{connection="3"} 100"#,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        let rows = parse_ws_lag_rows(&raw);
+        assert_eq!(rows.len(), 2, "one row per socket, never merged");
+
+        assert_eq!(rows[0]["connection"], "0");
+        assert_eq!(rows[0]["p50_ms"], 100.0);
+        assert_eq!(rows[0]["p99_ms"], 250.0);
+
+        // The sick socket must NOT be smoothed by its healthy sibling.
+        assert_eq!(rows[1]["connection"], "3");
+        assert_eq!(rows[1]["p50_ms"], 60_000.0);
+    }
+
+    #[test]
+    fn test_parse_ws_lag_rows_reports_an_overflow_p99_as_inf_not_a_number() {
+        // A p99 in the overflow bucket means the true value is unbounded above.
+        // Printing the largest finite bound would understate it — a lie in the
+        // comfortable direction, which is the one that matters here.
+        let raw: Vec<String> = [
+            r#"tv_dhan_ws_lag_ms_bucket{connection="1",le="60000"} 50"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="1",le="+Inf"} 100"#,
+            r#"tv_dhan_ws_lag_ms_count{connection="1"} 100"#,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let rows = parse_ws_lag_rows(&raw);
+        assert_eq!(rows[0]["p99_ms"], "+Inf");
+    }
+
+    #[test]
+    fn test_parse_ws_lag_rows_is_empty_when_the_lane_produced_nothing() {
+        // Feed off, box stopped, or /metrics unreachable. An empty table is the
+        // honest answer; a zero would read as "instant delivery".
+        assert!(parse_ws_lag_rows(&[]).is_empty());
+        // A series present but with zero samples must also not render a row.
+        let zero: Vec<String> = vec![r#"tv_dhan_ws_lag_ms_count{connection="0"} 0"#.to_string()];
+        assert!(parse_ws_lag_rows(&zero).is_empty());
+    }
+
+    #[test]
+    fn test_parse_ws_lag_rows_drops_a_line_with_no_connection_label() {
+        // Never default a malformed line into connection 0 — that would merge
+        // unattributable samples into a real socket's numbers.
+        let raw: Vec<String> = vec![
+            "tv_dhan_ws_lag_ms_count 500".to_string(),
+            r#"tv_dhan_ws_lag_ms_count{connection="2"} 4"#.to_string(),
+            r#"tv_dhan_ws_lag_ms_bucket{connection="2",le="50"} 4"#.to_string(),
+        ];
+        let rows = parse_ws_lag_rows(&raw);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["connection"], "2");
+        assert_eq!(rows[0]["samples"], 4.0);
     }
 
     #[test]
@@ -3011,9 +3245,9 @@ mod tests {
         // embedded interpreter program was retired). Each of the four LIVE
         // REST tables must still appear as its own equality arm.
         for live in [
-            "spot_1m_rest",
-            "option_chain_1m",
-            "option_contract_1m_rest",
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
             "rest_fetch_audit",
         ] {
             assert!(
@@ -3027,14 +3261,14 @@ mod tests {
         for t in [
             "ticks",
             "candles_1m",
-            "spot_1m_rest",
-            "option_chain_1m",
-            "option_contract_1m_rest",
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
             "rest_fetch_audit",
         ] {
             assert!(joined.contains(&format!("$(qc {t})")), "{t}");
         }
-        assert!(joined.contains("spot_1m_rest=${S:-?}"));
+        assert!(joined.contains("rest_spot_1m=${S:-?}"));
         // Review fix M2: a missing/erroring count defaults to 0 (absent
         // table = nothing left = wiped). The old default-to-1 made EVERY
         // post-nuke wipe read WIPE-PARTIAL forever.
@@ -3295,9 +3529,9 @@ mod tests {
     #[test]
     fn test_view_commands_query_live_tables_grouped_by_feed() {
         for (label, table) in [
-            ("SPOT_BY_FEED=", "spot_1m_rest"),
-            ("CHAIN_BY_FEED=", "option_chain_1m"),
-            ("CONTRACT_BY_FEED=", "option_contract_1m_rest"),
+            ("SPOT_BY_FEED=", "rest_spot_1m"),
+            ("CHAIN_BY_FEED=", "rest_option_chain_1m"),
+            ("CONTRACT_BY_FEED=", "rest_option_contract_1m"),
         ] {
             let cmd = VIEW_COMMANDS.iter().find(|c| c.contains(label)).unwrap();
             assert!(cmd.contains("GROUP%20BY%20feed"));
@@ -3628,7 +3862,7 @@ data-pull phase, so the system is never blinded mid-trade";
     }
 
     // ---------------------------------------------------- class DedupKeyShield
-    // The dedup shield reads spot_1m_rest's REAL 4-column upsert key
+    // The dedup shield reads rest_spot_1m's REAL 4-column upsert key
     // (ts, security_id, exchange_segment, feed per DEDUP_KEY_SPOT_1M_REST in
     // crates/storage/src/spot_1m_rest_persistence.rs) — repointed 2026-07-16
     // from the retired ticks 5-column key.

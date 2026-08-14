@@ -111,6 +111,7 @@ use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS}
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::types::SecurityId;
+use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TF_COUNT, TfIndex};
 use tickvault_trading::in_mem::spot_bar_store::{RamBar, SlotKey, spot_bar_store};
 use tokio::sync::mpsc;
@@ -1200,7 +1201,7 @@ pub fn spot_bars_sql(
     let fetch_limit = limit.saturating_add(1);
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, open, high, low, close, volume \
-         FROM spot_1m_rest \
+         FROM {SPOT_1M_REST_TABLE} \
          WHERE security_id = {security_id} AND exchange_segment = '{segment}' \
          AND feed = '{feed}' AND ts >= {start_micros} AND ts < {end_micros} \
          ORDER BY ts ASC LIMIT {fetch_limit}"
@@ -1214,7 +1215,7 @@ pub fn spot_discovery_sql(feed: &str, window_start_nanos: i64, limit: usize) -> 
     let start_micros = window_start_nanos / 1_000;
     let fetch_limit = limit.saturating_add(1);
     format!(
-        "SELECT DISTINCT security_id, exchange_segment FROM spot_1m_rest \
+        "SELECT DISTINCT security_id, exchange_segment FROM {SPOT_1M_REST_TABLE} \
          WHERE feed = '{feed}' AND ts >= {start_micros} LIMIT {fetch_limit}"
     )
 }

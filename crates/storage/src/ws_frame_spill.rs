@@ -707,11 +707,57 @@ fn maybe_test_panic(r: &WalRecord) {
     }
 }
 
-/// Process-wide strictly-monotonic frame sequence: `max(prev+1, wall_nanos)`.
+/// Bits reserved at the BOTTOM of every frame sequence for a packet index.
+///
+/// A single main-feed message can carry several stacked packets, and each one
+/// becomes its own `ticks` row. `capture_seq` is part of the DEDUP key
+/// `(ts, security_id, segment, capture_seq, feed)`, so every packet needs a
+/// DISTINCT value — and, for WAL replay to be idempotent rather than
+/// duplicating, a value that can be REGENERATED from what the WAL persisted.
+///
+/// The WAL record stores the frame's sequence, not each packet's. So the
+/// packet index is carried in reserved low bits of that one number: packet `i`
+/// of frame `F` is `F | i`, which replay reproduces exactly.
+///
+/// `2^17 = 131_072` covers `MAX_PACKETS_PER_FRAME` (70,000) with room to spare.
+pub const PACKET_INDEX_BITS: u32 = 17;
+
+/// Largest packet index representable in the reserved bits.
+pub const MAX_PACKET_INDEX: u64 = (1 << PACKET_INDEX_BITS) - 1;
+
+/// Process-wide strictly-monotonic frame sequence, with the low
+/// [`PACKET_INDEX_BITS`] always ZERO so callers can OR a packet index in.
+///
 /// Lock-free CAS, O(1), zero heap alloc. The WS read loop calls this ONCE per
 /// frame and passes the value to BOTH [`WsFrameSpill::append_with_seq`] and the
 /// live broadcast, so the WAL record and the `ticks.capture_seq` column carry
 /// the identical replay-stable value.
+///
+/// ## Why the shift, and why NOT multiplication (2026-08-14)
+///
+/// Before this change the value was `max(prev+1, wall_nanos)` with no reserved
+/// bits, and the doc above was true only of packet 0: packets 1..N of a stacked
+/// frame minted a FRESH sequence, which is not in the WAL and cannot be
+/// regenerated. Replaying such a frame would therefore write DUPLICATE rows
+/// instead of collapsing onto the originals — which is why WAL re-fold could
+/// not safely be built on top of it.
+///
+/// The obvious repair, `frame_seq * MAX_PACKETS_PER_FRAME`, is arithmetically
+/// impossible and was rejected on measurement, not taste: a 2026 nanosecond
+/// clock is ≈1.786e18, and ×70,000 is ≈1.25e23 — past `i64::MAX` (9.223e18) by
+/// four orders of magnitude, so `capture_seq_from_frame_seq`'s `i64::try_from`
+/// would refuse EVERY tick.
+///
+/// Shifting the SEED instead costs nothing: `(n >> 17) << 17` only clears the
+/// low bits, so the magnitude is unchanged and the headroom to `i64::MAX`
+/// stays the same ≈5.16× it already was. Uniqueness is by construction, not by
+/// luck — every frame's low bits are zero and the base is strictly increasing,
+/// so one frame's packet slots can never reach the next frame's base.
+///
+/// Honest cost: base granularity becomes 131,072 ns ≈ 131 µs, so at sustained
+/// rates above ~7,600 frames/s the counter advances on `prev+1` faster than the
+/// wall clock. At 10,000 frames/s that drift is ≈113 days of clock-equivalent
+/// per calendar year, against ≈236 years of headroom.
 static WAL_FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn next_frame_seq() -> u64 {
@@ -719,9 +765,16 @@ pub fn next_frame_seq() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0);
+    // Work in BASE units (nanos >> reserved bits) so the returned value always
+    // ends in zeroed low bits.
+    let now_base = now >> PACKET_INDEX_BITS;
+    // Never let the shift back up overflow u64.
+    let base_ceiling = u64::MAX >> PACKET_INDEX_BITS;
     loop {
         let prev = WAL_FRAME_SEQ.load(Ordering::Relaxed);
-        let next = prev.saturating_add(1).max(now);
+        let prev_base = prev >> PACKET_INDEX_BITS;
+        let next_base = prev_base.saturating_add(1).max(now_base).min(base_ceiling);
+        let next = next_base << PACKET_INDEX_BITS;
         if WAL_FRAME_SEQ
             .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
@@ -729,6 +782,25 @@ pub fn next_frame_seq() -> u64 {
             return next;
         }
     }
+}
+
+/// The replay-stable `capture_seq` for packet `packet_index` of the frame whose
+/// sequence is `frame_seq`.
+///
+/// `None` when the index does not fit the reserved bits — the caller must then
+/// REFUSE the packet and count it, never fall back to a fresh sequence. A fresh
+/// sequence is exactly the un-regenerable value this whole scheme exists to
+/// eliminate, and silently minting one here would reintroduce duplicate rows on
+/// replay while looking like it worked.
+#[must_use]
+pub fn packet_capture_seq(frame_seq: u64, packet_index: u64) -> Option<u64> {
+    if packet_index > MAX_PACKET_INDEX {
+        return None;
+    }
+    // Defensive: a v1 (`TVW1`) record or a hand-built seq may not be
+    // base-aligned. Clear the low bits rather than OR-ing into a dirty slot,
+    // which could otherwise collide with a neighbouring packet.
+    Some((frame_seq & !MAX_PACKET_INDEX) | packet_index)
 }
 
 fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
@@ -1647,6 +1719,90 @@ mod tests {
             );
             prev = cur;
         }
+    }
+
+    #[test]
+    fn test_next_frame_seq_always_leaves_the_packet_index_bits_free() {
+        // The whole replay-stability scheme rests on this: if a frame sequence
+        // ever arrives with a low bit set, `packet_capture_seq` would be
+        // OR-ing into an occupied slot and two packets could collide.
+        for _ in 0..5_000 {
+            let seq = next_frame_seq();
+            assert_eq!(
+                seq & MAX_PACKET_INDEX,
+                0,
+                "frame_seq {seq} has a non-zero packet-index slot"
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_capture_seq_is_distinct_per_packet_and_never_reaches_the_next_frame() {
+        let a = next_frame_seq();
+        let b = next_frame_seq();
+        assert!(b > a);
+
+        // Every packet of one frame is distinct...
+        let mut seen = std::collections::BTreeSet::new();
+        for idx in [0u64, 1, 2, 69_999, MAX_PACKET_INDEX] {
+            let seq = packet_capture_seq(a, idx).expect("index fits the reserved bits");
+            assert!(
+                seen.insert(seq),
+                "packet index {idx} produced a duplicate seq"
+            );
+            // ...and none of them can reach the NEXT frame's base, which is the
+            // property that makes cross-frame collision impossible rather than
+            // merely unlikely.
+            assert!(
+                seq < b,
+                "packet {idx} of frame {a} produced {seq}, which reaches into frame {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_capture_seq_refuses_an_index_beyond_the_reserved_bits() {
+        // Must be None, never a wrapped or freshly-minted value: the caller is
+        // required to REFUSE and count. A fallback here would silently restore
+        // the duplicate-on-replay defect this scheme removes.
+        let seq = next_frame_seq();
+        assert_eq!(packet_capture_seq(seq, MAX_PACKET_INDEX + 1), None);
+        assert_eq!(packet_capture_seq(seq, u64::MAX), None);
+    }
+
+    #[test]
+    fn test_packet_capture_seq_is_replay_stable_and_fits_the_i64_column() {
+        // Replay reproduces the identical value from the SAME persisted
+        // frame_seq — this is the property that makes a re-fold collapse onto
+        // the original row instead of duplicating it.
+        let frame_seq = next_frame_seq();
+        for idx in [0u64, 1, 7, 70_000] {
+            let first = packet_capture_seq(frame_seq, idx);
+            let replayed = packet_capture_seq(frame_seq, idx);
+            assert_eq!(
+                first, replayed,
+                "replay must reproduce packet {idx} exactly"
+            );
+            let seq = first.expect("index fits");
+            assert!(
+                i64::try_from(seq).is_ok(),
+                "capture_seq {seq} must fit the i64 ticks column — the shift must \
+                 not have consumed headroom (the multiplication scheme did)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_capture_seq_normalises_a_non_aligned_frame_seq() {
+        // A v1 (`TVW1`) record carries frame_seq = 0, and a hand-built or
+        // legacy value may not be base-aligned. OR-ing into a dirty slot could
+        // collide with a neighbouring packet, so the low bits are cleared first.
+        let dirty = (42u64 << PACKET_INDEX_BITS) | 12_345;
+        assert_eq!(
+            packet_capture_seq(dirty, 7),
+            Some((42u64 << PACKET_INDEX_BITS) | 7)
+        );
+        assert_eq!(packet_capture_seq(0, 3), Some(3));
     }
 
     #[test]

@@ -171,9 +171,333 @@ pub fn shared_probe_client() -> Result<&'static Client, HttpClientBuildError> {
     Ok(PROBE_CLIENT.get_or_init(move || client))
 }
 
+/// Verdict of a best-effort legacy-table rename.
+///
+/// Two of the four arms are NORMAL operation, which is most of the reason this
+/// type exists — see [`try_rename_legacy_table`]. The third,
+/// [`LegacyRenameOutcome::Split`], is the one that must never be silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyRenameOutcome {
+    /// The rename applied: the legacy table's rows carried forward into the
+    /// current name. Happens at most ONCE per table, on the first boot of the
+    /// build that introduced the new name.
+    Migrated,
+    /// QuestDB refused the rename AND the legacy table is gone. This is the
+    /// STEADY STATE, not a fault — the migration already ran on an earlier
+    /// boot, or the source never existed on a fresh install.
+    NotNeeded,
+    /// QuestDB refused the rename and the legacy table IS STILL THERE.
+    ///
+    /// Both names now exist, so the history is SPLIT ACROSS TWO TABLES: new
+    /// rows land under the current name while the legacy table holds
+    /// everything written before. Reachable when a CREATE minted the new name
+    /// before any rename ran — a rollback to a pre-rename build (whose ILP
+    /// writer re-creates the legacy name) and then forward again, or a build
+    /// that shipped the CREATE without its rename.
+    ///
+    /// This is the ONE arm callers must escalate. Before this variant existed
+    /// the whole non-2xx case collapsed into `NotNeeded` at `debug!`, which
+    /// meant moving the rename out of the error-logging statement loop
+    /// destroyed the only signal that a split had happened. Loud here, not
+    /// because a rename failed, but because two SEBI-retained tables now hold
+    /// one table's history and only an operator can decide how to merge them.
+    Split,
+    /// The request never reached QuestDB, or the follow-up existence probe did
+    /// not. Deliberately not escalated here: the CREATE/ALTER statements that
+    /// follow hit the same dead server and own the loud, coded report, so
+    /// raising it twice would double-count one outage across two codes.
+    Unreachable,
+}
+
+/// Does this table exist? `None` means QuestDB could not be reached, which is
+/// deliberately distinct from `Some(false)` — "absent" and "unknown" lead to
+/// different verdicts in [`try_rename_legacy_table`], and conflating them is
+/// how a split history would go unreported during an outage.
+///
+/// `count()` rather than a row read: QuestDB answers it from metadata, so the
+/// cost does not scale with a table that may hold months of SEBI-retained rows.
+async fn table_exists(client: &Client, exec_url: &str, table: &str) -> Option<bool> {
+    let query = format!("SELECT count() FROM '{table}';");
+    match client
+        .get(exec_url)
+        .query(&[("query", query.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => Some(true),
+        // A non-2xx here is QuestDB saying the table is not there. Any other
+        // SQL fault on a statement this simple would also mean we cannot read
+        // it, and treating that as "absent" only ever suppresses a Split — the
+        // conservative direction is the opposite, so this stays `false` and the
+        // caller's CREATE reports anything genuinely broken under its own code.
+        Ok(_) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// Run a one-shot `RENAME TABLE '<legacy>' TO '<current>'` whose failure is
+/// EXPECTED and therefore must not be reported as an error.
+///
+/// ## The defect this exists to prevent (2026-08-14)
+///
+/// The REST tables gained a `rest_` name prefix, and each `ensure_*_table`
+/// pushed the RENAME into the same statement vector as the CREATE and the
+/// ALTERs, then ran the whole vector through one loop whose non-2xx arm fires
+/// a coded `error!` and increments the table's `*_persist_errors_total`
+/// counter.
+///
+/// But a RENAME that fails is the NORMAL case. It succeeds exactly once, ever.
+/// From the second boot onward the target exists and QuestDB refuses it; on a
+/// fresh install the source is absent and QuestDB refuses it. So every boot
+/// but one logged a coded error and incremented a persist-error counter that
+/// is EMF-published to CloudWatch and charted on the operator dashboard — an
+/// error signal whose steady-state value is "one per boot, forever". That
+/// trains the operator to discount the very counter that is supposed to mean
+/// the REST tables are failing to persist.
+///
+/// The migration comment in those files already said the failure "is not an
+/// error"; the code said it was. This function is the code agreeing with the
+/// comment.
+///
+/// ## Why a refusal is not simply "fine" (the correction, same day)
+///
+/// Moving the RENAME out of the error-logging loop silenced a signal along
+/// with the noise. QuestDB answers non-2xx for BOTH "target already exists"
+/// and "source does not exist", so the first draft collapsed them into one
+/// `NotNeeded` arm at `debug!`. Those two causes are not equivalent: if the
+/// target exists AND the legacy table is still there, the history is split
+/// across two SEBI-retained tables and nothing would ever have said so.
+///
+/// So a refusal now asks one more question — is the legacy table still
+/// present? — and answers [`LegacyRenameOutcome::Split`] when it is. The
+/// probe is a bounded `SELECT count() FROM '<legacy>'`, run ONLY on the
+/// refusal path, so the steady state costs exactly one extra round trip per
+/// table per boot and the happy path costs nothing.
+///
+/// Never a DROP, never a DELETE: these tables are SEBI-retained. Resolving a
+/// split is an operator decision, and this function's only job is to make sure
+/// they are told.
+pub async fn try_rename_legacy_table(
+    client: &Client,
+    exec_url: &str,
+    legacy: &str,
+    current: &str,
+) -> LegacyRenameOutcome {
+    let ddl = format!("RENAME TABLE '{legacy}' TO '{current}';");
+    match client
+        .get(exec_url)
+        .query(&[("query", ddl.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            // Worth exactly one INFO line in the process's life: it is the
+            // moment a populated table carried its history across a rename.
+            tracing::info!(
+                legacy_table = legacy,
+                current_table = current,
+                "legacy table renamed forward — existing rows carried into the new name"
+            );
+            LegacyRenameOutcome::Migrated
+        }
+        Ok(_) => match table_exists(client, exec_url, legacy).await {
+            Some(true) => {
+                // Deliberately NOT logged here. The caller owns the coded
+                // `error!` because the error code is per-table (SPOT1M-02,
+                // CHAIN-02, …) and a second log line from inside this helper
+                // would double-report one condition.
+                LegacyRenameOutcome::Split
+            }
+            Some(false) => {
+                tracing::debug!(
+                    legacy_table = legacy,
+                    current_table = current,
+                    "legacy-table rename not applicable — the legacy table does \
+                     not exist (migration already ran, or fresh install). \
+                     Expected, not a fault"
+                );
+                LegacyRenameOutcome::NotNeeded
+            }
+            None => {
+                // The rename got an HTTP answer but the probe did not, so we
+                // cannot tell NotNeeded from Split. Claiming either would be a
+                // guess; `Unreachable` is the honest verdict and the CREATE
+                // that follows reports the outage under its own code.
+                tracing::debug!(
+                    legacy_table = legacy,
+                    current_table = current,
+                    "legacy-table rename refused and the existence probe could \
+                     not reach QuestDB — split state undetermined this boot"
+                );
+                LegacyRenameOutcome::Unreachable
+            }
+        },
+        Err(err) => {
+            tracing::debug!(
+                legacy_table = legacy,
+                current_table = current,
+                ?err,
+                "legacy-table rename could not reach QuestDB — the CREATE that \
+                 follows reports the outage under its own code"
+            );
+            LegacyRenameOutcome::Unreachable
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Byte counts are exact on purpose. An overstated Content-Length makes a
+    // client that READS the body block until its timeout instead of returning
+    // — and the split-detection probe added on 2026-08-14 does exactly that on
+    // the refusal path, so a wrong length here would surface as a mystery
+    // flake rather than a failed assertion. `{"error":"..."}` bodies below are
+    // 24 and 27 bytes.
+    const OK_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const REFUSED_400: &str =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 24\r\n\r\n{\"error\":\"table exists\"}";
+    const ABSENT_400: &str =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 27\r\n\r\n{\"error\":\"table does not\"}";
+
+    /// A QuestDB stand-in that answers the RENAME and the existence probe
+    /// DIFFERENTLY, because the whole point of the split detection is that
+    /// those two answers disagree.
+    ///
+    /// Routing is on the literal `RENAME` in the percent-encoded query string
+    /// (`serde_urlencoded` leaves ASCII letters alone), so the mock cannot
+    /// accidentally answer the probe with the rename's response.
+    ///
+    /// `probe_response: None` hangs up without replying — the transport
+    /// failure that must classify `Unreachable`, never a guessed verdict.
+    async fn spawn_questdb_mock(
+        rename_response: &'static str,
+        probe_response: Option<&'static str>,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let reply = if req.contains("RENAME") {
+                            Some(rename_response)
+                        } else {
+                            probe_response
+                        };
+                        if let Some(body) = reply {
+                            let _ = stream.write_all(body.as_bytes()).await;
+                        }
+                        // `None` => drop the stream unanswered.
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn test_try_rename_legacy_table_2xx_is_migrated() {
+        let port = spawn_questdb_mock(OK_200, Some(ABSENT_400)).await;
+        let client = build_probe_client(2).expect("probe client");
+        let url = format!("http://127.0.0.1:{port}/exec");
+        assert_eq!(
+            try_rename_legacy_table(&client, &url, "old_t", "rest_old_t").await,
+            LegacyRenameOutcome::Migrated
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refused_rename_with_legacy_table_gone_is_not_needed_not_an_error() {
+        // The steady state: QuestDB refuses because the migration already ran
+        // (or never applied), and the legacy table is not there. Must NOT be
+        // error-shaped, or the boot-time coded error and the false
+        // persist-error increment come straight back every boot.
+        let port = spawn_questdb_mock(REFUSED_400, Some(ABSENT_400)).await;
+        let client = build_probe_client(2).expect("probe client");
+        let url = format!("http://127.0.0.1:{port}/exec");
+        assert_eq!(
+            try_rename_legacy_table(&client, &url, "old_t", "rest_old_t").await,
+            LegacyRenameOutcome::NotNeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refused_rename_with_legacy_table_still_present_is_split() {
+        // THE regression this variant exists for. Same refusal as the test
+        // above — the ONLY difference is that the legacy table still answers,
+        // which means both names hold rows and the history is split.
+        //
+        // Collapsing this into NotNeeded is what the first draft did, and it
+        // silently removed the only signal that a SEBI-retained table had been
+        // orphaned. If this test ever asserts NotNeeded again, that regression
+        // is back.
+        let port = spawn_questdb_mock(REFUSED_400, Some(OK_200)).await;
+        let client = build_probe_client(2).expect("probe client");
+        let url = format!("http://127.0.0.1:{port}/exec");
+        assert_eq!(
+            try_rename_legacy_table(&client, &url, "old_t", "rest_old_t").await,
+            LegacyRenameOutcome::Split
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refused_rename_with_unanswerable_probe_is_unreachable_not_a_guess() {
+        // The rename got an HTTP answer, the probe did not. We cannot tell
+        // "absent" from "split", so the verdict must be Unreachable. Returning
+        // NotNeeded here would quietly assert the safe case during an outage —
+        // exactly the false-OK this whole change is about.
+        let port = spawn_questdb_mock(REFUSED_400, None).await;
+        let client = build_probe_client(2).expect("probe client");
+        let url = format!("http://127.0.0.1:{port}/exec");
+        assert_eq!(
+            try_rename_legacy_table(&client, &url, "old_t", "rest_old_t").await,
+            LegacyRenameOutcome::Unreachable
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_rename_legacy_table_unreachable_questdb_is_typed_not_panic() {
+        // Port 1 is reserved and never listening — a real transport failure
+        // without touching any live service.
+        let client = build_probe_client(2).expect("probe client");
+        assert_eq!(
+            try_rename_legacy_table(&client, "http://127.0.0.1:1/exec", "old_t", "rest_old_t")
+                .await,
+            LegacyRenameOutcome::Unreachable
+        );
+    }
+
+    #[test]
+    fn test_legacy_rename_outcome_arms_are_distinct_and_only_split_escalates() {
+        use LegacyRenameOutcome::{Migrated, NotNeeded, Split, Unreachable};
+        let all = [Migrated, NotNeeded, Split, Unreachable];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "outcome arms must stay distinguishable");
+            }
+        }
+        // Exhaustive match: adding a fifth arm stops this compiling until the
+        // author decides whether the new state is one a caller must escalate.
+        // Escalation policy lives here, next to the type, rather than being
+        // re-derived at each of the three call sites.
+        for outcome in all {
+            let escalates = match outcome {
+                Split => true,
+                Migrated | NotNeeded | Unreachable => false,
+            };
+            assert_eq!(
+                escalates,
+                outcome == Split,
+                "only Split is the operator-actionable arm"
+            );
+        }
+    }
 
     #[test]
     fn test_client_from_build_result_maps_error_without_panic() {

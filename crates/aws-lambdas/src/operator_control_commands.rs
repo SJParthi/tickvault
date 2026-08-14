@@ -10,7 +10,7 @@
 //! inside the ?query= value, which the QuestDB /exp query-string parser
 //! mis-handled, returning empty so the dashboard dedup panel showed "?".
 //! The encoded form yields a clean count of the 4 upsert-key columns — the
-//! REAL `spot_1m_rest` DEDUP key is (ts, security_id, exchange_segment, feed)
+//! REAL `rest_spot_1m` DEDUP key is (ts, security_id, exchange_segment, feed)
 //! per DEDUP_KEY_SPOT_1M_REST in crates/storage/src/spot_1m_rest_persistence.rs
 //! (the designated ts is always an upsertKey column).
 //!
@@ -25,20 +25,20 @@ pub const VIEW_COMMANDS: [&str; 13] = [
     r"set +e",
     r#"echo "APP=$(systemctl is-active tickvault 2>/dev/null || echo inactive)""#,
     r"Q='http://127.0.0.1:9000/exp?query='",
-    r#"echo "SPOT_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20spot_1m_rest%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)""#,
-    r#"echo "CHAIN_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20option_chain_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)""#,
-    r#"echo "CONTRACT_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20option_contract_1m_rest%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)""#,
-    r#"echo "SPOT_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20spot_1m_rest%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
-    r#"echo "CHAIN_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20option_chain_1m%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
-    r#"echo "CONTRACT_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20option_contract_1m_rest%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
-    r#"echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27spot_1m_rest%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)""#,
+    r#"echo "SPOT_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20rest_spot_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)""#,
+    r#"echo "CHAIN_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20rest_option_chain_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)""#,
+    r#"echo "CONTRACT_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20rest_option_contract_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)""#,
+    r#"echo "SPOT_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20rest_spot_1m%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
+    r#"echo "CHAIN_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20rest_option_chain_1m%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
+    r#"echo "CONTRACT_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20rest_option_contract_1m%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
+    r#"echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27rest_spot_1m%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)""#,
     r#"echo "ERRORS_BEGIN""#,
     r"journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
     r#"echo "ERRORS_END""#,
 ];
 
 /// legacy: `_LATENCY_COMMANDS = _latency_commands()` (handler.py:461-483).
-pub const LATENCY_COMMANDS: [&str; 7] = [
+pub const LATENCY_COMMANDS: [&str; 8] = [
     r"set +e",
     r#"echo "METRICS_BEGIN""#,
     r"curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_order_placement_duration_ns' || echo none",
@@ -46,6 +46,20 @@ pub const LATENCY_COMMANDS: [&str; 7] = [
     r#"echo "QDB=$(curl -o /dev/null -s -w '%{time_total}' --max-time 3 'http://127.0.0.1:9000/exec?query=SELECT%201' 2>/dev/null)""#,
     r#"echo "SKEW=$(chronyc tracking 2>/dev/null | awk '/Last offset/{print $4}')""#,
     r#"curl -fsS --max-time 4 -G 'http://127.0.0.1:9000/exp' --data-urlencode "query=select feed, leg, count() ok_rows, approx_percentile(close_to_data_ms, 0.5, 3) p50, approx_percentile(close_to_data_ms, 0.99, 3) p99 from rest_fetch_audit where ts in today() and outcome = 'ok' and close_to_data_ms >= 0 group by feed, leg order by feed, leg" 2>/dev/null | tail -n +2 | sed 's/^/RESTLAT_ROW=/'"#,
+    // LIVE WebSocket delivery lag, per socket.
+    //
+    // Read from /metrics, NOT from QuestDB: no table carries live-socket lag,
+    // and the histogram is deliberately not EMF-shipped (a Prometheus histogram
+    // is exposed as _bucket/_sum/_count, which the anchored EMF selector cannot
+    // match — see cloudwatch_app_alarms_wiring.rs). Port 9091 matches the
+    // order-placement curl three lines above; the metrics endpoint binds
+    // 127.0.0.1, so this only works from ON the box, which is where SSM
+    // RunCommand puts us.
+    //
+    // The raw lines are shipped and the percentiles computed in Rust rather
+    // than in awk: bucket arithmetic that silently produces a plausible wrong
+    // number is exactly the failure this panel exists to end.
+    r"curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_dhan_ws_lag_ms_(bucket|count|sum)' | sed 's/^/WSLAT_RAW=/' || true",
 ];
 
 /// legacy: `_STORAGE_COMMANDS` (handler.py:591-595).
