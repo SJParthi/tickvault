@@ -518,12 +518,35 @@ pub async fn ensure_option_chain_1m_table(questdb_config: &QuestDbConfig) {
     // RENAME-FIRST migration — see `ensure_spot_1m_rest_table` for the full
     // reasoning. Rename before CREATE so an existing populated table carries
     // its rows forward instead of a fresh empty table appearing beside it.
-    // Best-effort and idempotent: the RENAME legitimately fails once the new
-    // name exists (every boot after the first) and on a fresh install.
-    let mut statements = vec![
-        format!("RENAME TABLE '{LEGACY_OPTION_CHAIN_1M_TABLE}' TO '{OPTION_CHAIN_1M_TABLE}';"),
-        option_chain_1m_create_ddl(),
-    ];
+    // Run OUTSIDE the statement loop: the RENAME legitimately fails once the
+    // new name exists (every boot after the first) and on a fresh install, and
+    // inside the loop that expected failure fired a coded `error!` plus a
+    // `tv_chain1m_persist_errors_total` increment on every such boot.
+    // The ONE refusal that is not routine: both tables present means the
+    // history is split and only an operator can decide how to merge it.
+    if crate::http_client::try_rename_legacy_table(
+        &client,
+        &base_url,
+        LEGACY_OPTION_CHAIN_1M_TABLE,
+        OPTION_CHAIN_1M_TABLE,
+    )
+    .await
+        == crate::http_client::LegacyRenameOutcome::Split
+    {
+        metrics::counter!("tv_chain1m_persist_errors_total", "stage" => "legacy_table_split")
+            .increment(1);
+        error!(
+            code = "CHAIN-03",
+            stage = "legacy_table_split",
+            legacy_table = LEGACY_OPTION_CHAIN_1M_TABLE,
+            current_table = OPTION_CHAIN_1M_TABLE,
+            "CHAIN-03: both the legacy and current option_chain_1m tables exist — \
+             the history is SPLIT across two SEBI-retained tables. New rows land \
+             in the current name; everything written before the rename stays in \
+             the legacy one. Neither is dropped; merging is an operator decision"
+        );
+    }
+    let mut statements = vec![option_chain_1m_create_ddl()];
     // Per-column self-heal for tables created by earlier builds
     // (observability-architecture.md schema-self-heal pattern). QuestDB
     // ignores ADDs that already exist, so running every boot is free.

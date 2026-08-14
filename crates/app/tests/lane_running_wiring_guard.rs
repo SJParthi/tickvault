@@ -119,18 +119,46 @@ fn the_up_gauge_is_cleared_outside_the_error_arm() {
     let text =
         strip_cfg_test_modules(&fs::read_to_string(&stack).expect("read dhan_feed_stack.rs"));
 
-    let clear_idx = text
-        .find("FEED_STACK_UP_GAUGE).set(0.0)")
-        .expect("the up-gauge is never cleared anywhere in the lane");
+    // The window that matters is between awaiting the drain and inspecting its
+    // outcome. A clear anywhere else does not prove the normal-exit path is
+    // covered.
+    //
+    // The first version of this test used `text.find(...)` for the clear and
+    // compared it against the error arm's index. That was VACUOUS: `find`
+    // returns the FIRST match in the file, and two unrelated `set(0.0)` calls
+    // already precede this function entirely (one inside the drain, one at the
+    // top of `run_dhan_feed_stack`). Deleting the clear this test exists to
+    // protect left the assertion passing. Caught by adversarial review the
+    // same day it was written — a guard that cannot fail is worse than none,
+    // because it advertises coverage it does not provide.
+    let await_idx = text
+        .find("let drain_outcome = drain.await;")
+        .expect("the drain await is missing — this guard needs updating");
     let err_arm_idx = text
         .find("if let Err(err) = drain_outcome")
         .expect("the drain-outcome error arm is missing — this guard needs updating");
-
     assert!(
-        clear_idx < err_arm_idx,
-        "`tv_dhan_feed_stack_up` is cleared only INSIDE the drain's error arm.\n\
-         A drain that exits normally (every socket dead, ring closed) then leaves the \
-         gauge at 1.0 forever, so the lane reports itself healthy with nothing \
-         connected. Clear it on every exit path, before the error arm."
+        await_idx < err_arm_idx,
+        "guard assumption broken: the drain await must precede its outcome check"
+    );
+
+    let between = &text[await_idx..err_arm_idx];
+    assert!(
+        between.contains("FEED_STACK_UP_GAUGE).set(0.0)"),
+        "`tv_dhan_feed_stack_up` is not cleared between awaiting the drain and inspecting \
+         its outcome, which means it is cleared only INSIDE the error arm.\n\
+         A drain that exits NORMALLY — which is exactly what happens once every socket has \
+         died and the ring closes — then leaves the gauge pinned at 1.0 for the life of the \
+         process, so the one metric whose job is \"the lane is carrying data\" reports a \
+         healthy lane precisely when nothing is connected."
+    );
+
+    // Non-vacuity companion: the flag must be cleared in the same window, for
+    // the same reason. Without this, the gauge could fall while the console
+    // kept claiming the lane runs.
+    assert!(
+        between.contains("set_dhan_lane_running(false)"),
+        "the lane's running flag is not cleared alongside the up-gauge — the metric would \
+         fall while the operator console still reported the lane as running"
     );
 }

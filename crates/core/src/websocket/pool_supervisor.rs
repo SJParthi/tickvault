@@ -282,6 +282,9 @@ pub enum ParkReason {
 }
 
 impl ParkReason {
+    /// Every reason, for baseline pre-registration of the park counter.
+    pub const ALL: [Self; 3] = [Self::PoolOverflow, Self::FatalDisconnect, Self::Shutdown];
+
     /// Stable lowercase tag for logs and metric labels.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -1143,6 +1146,41 @@ impl PoolSupervisor {
     /// An empty supervisor with a fresh budget.
     #[must_use]
     pub fn new() -> Self {
+        // Publish a zero on every (endpoint, reason) series the park counter
+        // can ever produce, BEFORE any socket is admitted.
+        //
+        // The CloudWatch agent computes a counter's alarm value as the DELTA
+        // between consecutive samples and has no previous sample for a series
+        // it has never seen, so it drops the first one. A park happens at most
+        // once per connection per session and is otherwise never emitted — so
+        // without this, the FIRST park a series ever sees IS the dropped
+        // sample, it publishes no datapoint, and `tv-<env>-dhan-socket-parked`
+        // (threshold 1, one 300s period) never fires for it. The alarm would
+        // be dead precisely for the single-park case, which is the normal
+        // shape of the incident it exists to catch.
+        //
+        // Both labels must be enumerated, not just one: the agent baselines
+        // per Prometheus SERIES, and the EMF processor folds the labels to
+        // `{host}` afterwards by summing the per-series deltas. A series left
+        // unregistered contributes nothing to that sum on the sample where it
+        // is born, so one missing combination is one invisible park.
+        //
+        // Twelve series at the /metrics endpoint, ONE series in CloudWatch
+        // after folding — so this costs nothing on the bill.
+        //
+        // Done in `new` so it cannot be forgotten at a call site: a supervisor
+        // that exists has published its baseline. Same discipline as
+        // `WalRingSink::pre_register` and `SpillDropCounters::new`.
+        for endpoint in DhanEndpointType::ALL {
+            for reason in ParkReason::ALL {
+                metrics::counter!(
+                    PARK_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "reason" => reason.as_str(),
+                )
+                .increment(0);
+            }
+        }
         Self {
             budget: PoolBudget::new(),
             // Pre-sized to the hard ceiling rather than left unsized: the pool
@@ -1513,6 +1551,43 @@ mod tests {
     use super::super::reconnect_ladder::{
         RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS, reconnect_delay_ms,
     };
+
+    #[test]
+    fn test_park_reason_all_covers_every_variant_so_no_series_goes_unbaselined() {
+        // `ParkReason::ALL` drives the metric pre-registration in
+        // `PoolSupervisor::new`, and the CloudWatch agent baselines PER LABEL
+        // COMBINATION: a reason missing from ALL has its first park eaten as
+        // the delta baseline, so `tv-<env>-dhan-socket-parked` stays silent for
+        // exactly that reason. `[Self; 3]` alone does not protect against
+        // that — adding a variant forces only `as_str()`'s match to change,
+        // and the array compiles untouched.
+        //
+        // Same shape as `pool_budget::test_endpoint_type_has_exactly_four_...`,
+        // which is what makes `DhanEndpointType::ALL` — the other half of the
+        // registration loop — genuinely compile-protected.
+        assert_eq!(ParkReason::ALL.len(), 3, "exactly three park reasons");
+
+        // Exhaustive match: adding a variant stops this compiling until ALL
+        // and this arm list are updated together.
+        for reason in ParkReason::ALL {
+            match reason {
+                ParkReason::PoolOverflow | ParkReason::FatalDisconnect | ParkReason::Shutdown => {}
+            }
+        }
+
+        // No duplicate standing in for a missing variant — an ALL of
+        // `[PoolOverflow, PoolOverflow, Shutdown]` has the right length and
+        // matches exhaustively, yet leaves FatalDisconnect unregistered.
+        let distinct: BTreeSet<&'static str> = ParkReason::ALL
+            .into_iter()
+            .map(ParkReason::as_str)
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            ParkReason::ALL.len(),
+            "every park reason must contribute a DISTINCT metric label"
+        );
+    }
 
     fn t0() -> Instant {
         Instant::now()

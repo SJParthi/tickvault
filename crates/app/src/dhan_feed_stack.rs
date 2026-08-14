@@ -1368,9 +1368,20 @@ const DRAIN_REPORT_EVERY: u64 = 1_024;
 /// a WAL that already holds every frame.
 ///
 /// # Complexity
-/// O(1) per frame: one fixed-offset parse, one hash lookup in the gap
-/// detector, one hash lookup plus `TF_COUNT` scalar folds in the aggregator,
-/// one ILP row append. No heap allocation in steady state.
+///
+/// **O(1) per PACKET, O(packets) per FRAME.** Per packet: one fixed-offset
+/// parse, one hash lookup in the gap detector, one hash lookup plus
+/// `TF_COUNT` scalar folds in the aggregator, one ILP row append. No heap
+/// allocation in steady state.
+///
+/// The per-FRAME cost is NOT constant, and this comment said it was until
+/// 2026-08-14. A main-feed message may carry several stacked packets —
+/// `drain_main_feed_frame` walks them in a `while offset < frame.bytes.len()`
+/// loop bounded by `MAX_PACKETS_PER_FRAME` — so worst-case frame cost is that
+/// bound times the per-packet cost, not one packet's worth. Calling that O(1)
+/// understated the worst case by orders of magnitude, which is exactly the
+/// kind of claim CLAUDE.md's complexity table exists to stop us making.
+/// Typical frames carry one packet per subscribed instrument on that socket.
 /// Run the SYNCHRONOUS blocking ILP-over-HTTP flush OFF the async worker
 /// (the `order_observability::blocking_flush` house pattern — the same shape
 /// is inlined at `seal_writer_loop.rs`, `groww_order_observability.rs`,
@@ -1820,8 +1831,29 @@ pub struct DrainOutcome {
 }
 
 /// Packets we will walk within one main-feed message before declaring the
-/// message malformed. The 1 MiB frame cap over the smallest (16-byte) packet
-/// bounds a legitimate message well under this.
+/// message malformed.
+///
+/// **The arithmetic here was wrong until 2026-08-14** and is worth stating
+/// rather than quietly fixing. The comment claimed "the 1 MiB frame cap over
+/// the smallest (16-byte) packet bounds a legitimate message well under this".
+/// Two errors: the cap is `MAIN_FEED_MAX_FRAME_BYTES` = 162 × 5,000 × 2 =
+/// 1,620,000 bytes (~1.55 MiB, not 1 MiB), and 1,620,000 / 16 = **101,250**,
+/// which is ABOVE this ceiling, not well under it. A maximum-size frame made
+/// entirely of 16-byte ticker packets would be truncated here, its remainder
+/// counted as unparseable.
+///
+/// The ceiling is nonetheless kept, because it is a defence against a hostile
+/// or malfunctioning peer rather than a capacity limit, and the shape it
+/// bounds cannot occur legitimately: a socket carries at most
+/// `MAIN_FEED_INSTRUMENTS_PER_CONNECTION` (5,000) subscriptions, so a
+/// legitimate frame carries on the order of 5,000 packets — 14× below this —
+/// and reaching 101,250 would require the peer to send ~20 packets per
+/// subscribed instrument in a single message. Raising the ceiling to clear the
+/// theoretical maximum would weaken the defence to buy nothing.
+///
+/// What changed is only the honesty of the justification: the bound is a
+/// deliberate policy ceiling, not the arithmetic consequence the old comment
+/// asserted.
 pub const MAX_PACKETS_PER_FRAME: u32 = 70_000;
 
 /// Byte length of the main-feed packet starting at `bytes`, from its response

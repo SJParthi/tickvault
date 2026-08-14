@@ -159,15 +159,38 @@ pub async fn ensure_spot_1m_rest_table(questdb_config: &QuestDbConfig) {
     // an existing populated table carries its rows across instead of the
     // CREATE minting an empty table beside it and splitting the history.
     //
-    // Idempotent by construction: QuestDB fails the RENAME when the target
-    // already exists (second boot onward) and when the source does not (fresh
-    // install). Both are expected, so the statement is best-effort and its
-    // failure is not an error — the CREATE that follows is the real
-    // guarantee. Never a DROP: these tables are SEBI-retained.
-    let mut statements = vec![
-        format!("RENAME TABLE '{LEGACY_SPOT_1M_REST_TABLE}' TO '{SPOT_1M_REST_TABLE}';"),
-        spot_1m_rest_create_ddl(),
-    ];
+    // Run SEPARATELY from the statement loop below, and deliberately so: the
+    // RENAME succeeds exactly once in the life of a deployment, and its
+    // failure is the steady state (target exists from the second boot onward;
+    // source absent on a fresh install). Inside the loop it fired a coded
+    // `error!` and incremented `tv_spot1m_persist_errors_total` on EVERY boot
+    // but one — into a counter that is EMF-published and charted on the
+    // operator dashboard. Never a DROP: these tables are SEBI-retained.
+    // The ONE refusal that is not routine: both tables present means the
+    // history is split and only an operator can decide how to merge it.
+    if crate::http_client::try_rename_legacy_table(
+        &client,
+        &base_url,
+        LEGACY_SPOT_1M_REST_TABLE,
+        SPOT_1M_REST_TABLE,
+    )
+    .await
+        == crate::http_client::LegacyRenameOutcome::Split
+    {
+        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "legacy_table_split")
+            .increment(1);
+        error!(
+            code = "SPOT1M-02",
+            stage = "legacy_table_split",
+            legacy_table = LEGACY_SPOT_1M_REST_TABLE,
+            current_table = SPOT_1M_REST_TABLE,
+            "SPOT1M-02: both the legacy and current spot_1m_rest tables exist — \
+             the history is SPLIT across two SEBI-retained tables. New rows land \
+             in the current name; everything written before the rename stays in \
+             the legacy one. Neither is dropped; merging is an operator decision"
+        );
+    }
+    let mut statements = vec![spot_1m_rest_create_ddl()];
     // Per-column self-heal for tables created by earlier builds
     // (observability-architecture.md schema-self-heal pattern). QuestDB
     // ignores ADDs that already exist, so running every boot is free.
