@@ -59,6 +59,7 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::segment::{segment_code_to_str, segment_str_to_code};
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
+use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 use tickvault_storage::tf_consistency_audit_persistence::{
     FindingCategory, TfConsistencyAuditWriter, TfConsistencyFinding,
     ensure_tf_consistency_audit_table,
@@ -850,7 +851,7 @@ pub fn select_instruments_sql(feed: &str, day_start_ist_nanos: i64) -> String {
 pub fn select_spot_1m_count_sql(feed: &str, day_start_ist_nanos: i64) -> String {
     let (start, end) = day_bounds_micros(day_start_ist_nanos);
     format!(
-        "SELECT count(*) FROM spot_1m_rest \
+        "SELECT count(*) FROM {SPOT_1M_REST_TABLE} \
          WHERE feed = '{feed}' AND ts >= {start} AND ts < {end}"
     )
 }
@@ -3195,7 +3196,10 @@ mod tests {
     fn test_select_spot_1m_count_sql_and_parse_count_dataset() {
         let day_start_nanos = 1_752_600_600_000_000_000_i64;
         let sql = select_spot_1m_count_sql("dhan", day_start_nanos);
-        assert!(sql.starts_with("SELECT count(*) FROM spot_1m_rest"));
+        assert!(
+            sql.starts_with("SELECT count(*) FROM rest_spot_1m"),
+            "{sql}"
+        );
         assert!(sql.contains("feed = 'dhan'"));
         // Micros window, same day-bounds shape as the sibling builders.
         let (start, end) = day_bounds_micros(day_start_nanos);

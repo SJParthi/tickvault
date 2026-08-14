@@ -66,6 +66,7 @@ use tickvault_storage::feed_scoreboard_persistence::{
     LAG_FLOOR_MS_GROWW, LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_SESSION_MINUTES,
     SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables,
 };
+use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 
 /// Parses the QuestDB `/exec` count response (`{"dataset":[[N]]}`). Pure.
 /// Relocated 2026-07-18 from the retired `tick_conservation_boot` module
@@ -2443,7 +2444,7 @@ pub fn build_rest_fetch_audit_day_sql(target_ist_day: u64) -> String {
 pub fn build_spot1m_close_latency_day_sql(target_ist_day: u64) -> String {
     let (start, end) = day_bounds_micros(target_ist_day);
     format!(
-        "select feed, close_to_data_ms from spot_1m_rest \
+        "select feed, close_to_data_ms from {SPOT_1M_REST_TABLE} \
          where ts >= {start} and ts < {end} and close_to_data_ms >= 0"
     )
 }
@@ -6618,7 +6619,7 @@ mod tests {
             "micros window literals required: {audit_sql}"
         );
         let fb_sql = build_spot1m_close_latency_day_sql(DAY);
-        assert!(fb_sql.contains("from spot_1m_rest"), "{fb_sql}");
+        assert!(fb_sql.contains("from rest_spot_1m"), "{fb_sql}");
         assert!(
             fb_sql.contains("close_to_data_ms >= 0"),
             "the -1 sentinel rows must never reach the distribution: {fb_sql}"

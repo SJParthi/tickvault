@@ -128,13 +128,13 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // fetched (minute, index) — ~1,125 rows/day (375 min × 3 IDX_I SIDs),
     // trivial disk; same DAY partitioning + retention class as the
     // daily-data tables above; `feed` is in the DEDUP key.
-    "spot_1m_rest",
+    "rest_spot_1m",
     // CHAIN-03 (2026-07-12, per-minute REST pipeline PR-3): one row per
     // fetched (minute, underlying, expiry, strike, leg) — ~1-3K rows/min
     // worst case (~70 MB/day at wide chains; disk envelope flagged as an
     // operator retention follow-up in option_chain_1m_persistence.rs);
     // same DAY partitioning + retention class; `feed` is in the DEDUP key.
-    "option_chain_1m",
+    "rest_option_chain_1m",
     // Partition archive→verify→drop forensic chain (2026-07-13, disk-pressure
     // remediation): one row per archive attempt outcome — same SEBI-audit
     // class + DAY partitioning as the audit tables above; `feed` is in the
@@ -146,7 +146,7 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // the per-minute selection cap (~30 contracts × 375 min ≈ ~11K rows/day,
     // trivial disk); same DAY partitioning + retention class; `feed` +
     // `exchange_segment` are in the DEDUP key.
-    "option_contract_1m_rest",
+    "rest_option_contract_1m",
     // SPOT1M-02 stages audit_ensure_* (2026-07-13, Groww spot-1m PR-2): one
     // row per REST fetch attempt outcome per (minute, symbol, feed, leg) —
     // ~1-2K rows/day for the Groww spot leg (375 min x 3 symbols x attempts),

@@ -58,7 +58,11 @@ use tickvault_common::moneyness::MoneynessStepLabel;
 
 /// QuestDB table name — one row per fetched `(minute, underlying, expiry,
 /// strike, leg)`.
-pub const OPTION_CHAIN_1M_TABLE: &str = "option_chain_1m";
+pub const OPTION_CHAIN_1M_TABLE: &str = "rest_option_chain_1m";
+
+/// The pre-2026-08-14 name. Retained ONLY so the boot migration can rename an
+/// existing populated table forward. Never write through this.
+pub const LEGACY_OPTION_CHAIN_1M_TABLE: &str = "option_chain_1m";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule);
 /// `exchange_segment` alongside the underlying id (I-P1-11); `feed` in-key
@@ -511,7 +515,15 @@ pub async fn ensure_option_chain_1m_table(questdb_config: &QuestDbConfig) {
             return;
         }
     };
-    let mut statements = vec![option_chain_1m_create_ddl()];
+    // RENAME-FIRST migration — see `ensure_spot_1m_rest_table` for the full
+    // reasoning. Rename before CREATE so an existing populated table carries
+    // its rows forward instead of a fresh empty table appearing beside it.
+    // Best-effort and idempotent: the RENAME legitimately fails once the new
+    // name exists (every boot after the first) and on a fresh install.
+    let mut statements = vec![
+        format!("RENAME TABLE '{LEGACY_OPTION_CHAIN_1M_TABLE}' TO '{OPTION_CHAIN_1M_TABLE}';"),
+        option_chain_1m_create_ddl(),
+    ];
     // Per-column self-heal for tables created by earlier builds
     // (observability-architecture.md schema-self-heal pattern). QuestDB
     // ignores ADDs that already exist, so running every boot is free.
@@ -974,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_option_chain_1m_symbol_labels_stable() {
-        assert_eq!(OPTION_CHAIN_1M_TABLE, "option_chain_1m");
+        assert_eq!(OPTION_CHAIN_1M_TABLE, "rest_option_chain_1m");
         assert_eq!(OPTION_CHAIN_1M_FEED_DHAN, "dhan");
         assert_eq!(OPTION_CHAIN_1M_FEED_GROWW, "groww");
         assert_eq!(OPTION_CHAIN_1M_SOURCE, "rest_optionchain");

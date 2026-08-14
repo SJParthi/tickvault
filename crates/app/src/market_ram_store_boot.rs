@@ -55,6 +55,7 @@ use tickvault_core::pipeline::chain_day_store::{
 use tickvault_core::pipeline::chain_snapshot::{
     ChainMoneynessSnapshot, ChainUnderlying, SnapshotRow,
 };
+use tickvault_storage::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE;
 use tickvault_trading::in_mem::spot_bar_store::{
     MAX_SPOT_BAR_SLOTS, estimated_capacity_bytes, install_spot_bar_store, spot_bar_store,
 };
@@ -254,7 +255,7 @@ pub fn chain_rehydrate_sql(
         "SELECT (ts / 1) * 1000 AS ts_nanos, strike, leg, last_price, moneyness, \
          underlying_spot, (expiry / 1) * 1000 AS expiry_nanos, \
          (fetched_at / 1) * 1000 AS fetched_nanos \
-         FROM option_chain_1m \
+         FROM {OPTION_CHAIN_1M_TABLE} \
          WHERE feed = '{feed}' AND underlying_symbol = '{underlying_symbol}' \
          AND ts >= {start_micros} AND ts < {end_micros} \
          ORDER BY ts ASC LIMIT {fetch_limit}"
@@ -680,7 +681,11 @@ mod tests {
         assert!(sql.contains("(ts / 1) * 1000 AS ts_nanos"));
         assert!(sql.contains("(expiry / 1) * 1000 AS expiry_nanos"));
         assert!(sql.contains("(fetched_at / 1) * 1000 AS fetched_nanos"));
-        assert!(sql.contains("FROM option_chain_1m"));
+        // The reader MUST target the renamed REST table (2026-08-14). Asserting
+        // the literal, not the constant, is deliberate: a test that formats the
+        // same constant the code formats would pass through any rename and
+        // prove nothing.
+        assert!(sql.contains("FROM rest_option_chain_1m"), "{sql}");
         assert!(sql.contains("feed = 'dhan'"));
         assert!(sql.contains("underlying_symbol = 'NIFTY'"));
         assert!(sql.contains("ts >= 2000 AND ts < 3000"));

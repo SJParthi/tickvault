@@ -150,7 +150,7 @@ use tickvault_storage::rest_fetch_audit_persistence::{
 };
 use tickvault_storage::spot_1m_rest_persistence::{
     SPOT_1M_REST_FEED_GROWW, SPOT_1M_REST_SEGMENT_IDX_I, SPOT_1M_REST_SOURCE_GROWW_CANDLES,
-    Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
+    SPOT_1M_REST_TABLE, Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
 };
 
 use crate::dhan_intraday_parse::MinuteCandle;
@@ -881,7 +881,7 @@ pub fn select_pre_boot_persisted_sql(
     let end = window_end_nanos / 1_000;
     let probe_limit = GROWW_SPOT1M_PRE_BOOT_READ_CAP + 1;
     format!(
-        "SELECT DISTINCT (ts / 1) * 1000 AS ts_nanos FROM spot_1m_rest \
+        "SELECT DISTINCT (ts / 1) * 1000 AS ts_nanos FROM {SPOT_1M_REST_TABLE} \
          WHERE feed = '{SPOT_1M_REST_FEED_GROWW}' AND security_id = {security_id} \
          AND ts >= {start} AND ts < {end} LIMIT {probe_limit}"
     )

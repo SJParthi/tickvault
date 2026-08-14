@@ -57,7 +57,10 @@ use tracing::{error, warn};
 use tickvault_common::config::QuestDbConfig;
 
 /// QuestDB table name — one row per fetched `(minute, contract)`.
-pub const OPTION_CONTRACT_1M_REST_TABLE: &str = "option_contract_1m_rest";
+pub const OPTION_CONTRACT_1M_REST_TABLE: &str = "rest_option_contract_1m";
+
+/// The pre-2026-08-14 name — boot-migration rename source only.
+pub const LEGACY_OPTION_CONTRACT_1M_REST_TABLE: &str = "option_contract_1m_rest";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule);
 /// `exchange_segment` alongside `security_id` (I-P1-11 — Groww
@@ -515,8 +518,8 @@ mod tests {
     fn test_partition_manager_registers_option_contract_1m_rest() {
         let src = include_str!("partition_manager.rs");
         assert!(
-            src.contains("\"option_contract_1m_rest\""),
-            "partition_manager.rs must register option_contract_1m_rest for retention"
+            src.contains("\"rest_option_contract_1m\""),
+            "partition_manager.rs must register rest_option_contract_1m for retention"
         );
     }
 
@@ -616,7 +619,11 @@ mod tests {
 
     #[test]
     fn test_option_contract_1m_rest_symbol_labels_stable() {
-        assert_eq!(OPTION_CONTRACT_1M_REST_TABLE, "option_contract_1m_rest");
+        assert_eq!(OPTION_CONTRACT_1M_REST_TABLE, "rest_option_contract_1m");
+        assert_eq!(
+            LEGACY_OPTION_CONTRACT_1M_REST_TABLE,
+            "option_contract_1m_rest"
+        );
         assert_eq!(OPTION_CONTRACT_1M_REST_FEED_GROWW, "groww");
         assert_eq!(OPTION_CONTRACT_1M_REST_SOURCE_GROWW_CANDLES, "rest_candles");
         assert_eq!(OPTION_CONTRACT_1M_REST_SEGMENT_NSE_FNO, "NSE_FNO");
