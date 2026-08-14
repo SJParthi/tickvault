@@ -2022,20 +2022,19 @@ async fn main() -> Result<()> {
     // SIDs can never populate depth; the chain's per-leg `contract_security_id`
     // is the only already-authorized source that also self-rolls at expiry.
     //
-    // Selected BEFORE the spawn because the pool takes its instrument set once.
-    // An empty result opens zero depth sockets and says so at `error!` — it is
-    // never reported as "depth enabled" (the scope-lock's false-OK row).
-    let depth_universe = tickvault_app::dhan_depth_universe::load_depth_universe(
-        &config.questdb,
-        // Reuses the universe rider's own IST helpers rather than restating the
-        // convention here: IST wall-clock stamped as epoch, never the +5:30
-        // offset applied twice. A second copy of that rule is a second place
-        // for it to drift by 5.5 hours.
-        tickvault_app::dhan_universe::ist_midnight_nanos(
-            &tickvault_app::dhan_universe::today_ist_date(),
-        ),
-    )
-    .await;
+    // NOT selected here, deliberately (changed 2026-08-14). This ran at boot
+    // (~08:30 IST) against `option_chain_1m`, which the option-chain leg does
+    // not populate until its first fire at 09:16 — so it asked for the set ~45
+    // minutes before the set existed. Two daily failures followed: on a normal
+    // morning `LATEST ON ts` returned YESTERDAY's rows, so depth ranked ATM off
+    // a stale spot on contract ids Dhan documents as unstable across days; on
+    // the morning after an expiry it returned nothing and the error text
+    // prescribed a manual restart, which the zero-manual-intervention mandate
+    // forbids.
+    //
+    // The stack now owns this: it dials the main feed immediately and attaches
+    // depth once the chain leg publishes (`attach_depth_when_available`). Empty
+    // sets here mean "you fetch it", not "there is none".
 
     let _dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
@@ -2053,8 +2052,9 @@ async fn main() -> Result<()> {
                 tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
                     .subscription_capacity(),
             ),
-            depth_20_instruments: depth_universe.depth_20,
-            depth_200_instruments: depth_universe.depth_200,
+            // Empty by design — the stack late-attaches depth after 09:16 IST.
+            depth_20_instruments: Vec::new(),
+            depth_200_instruments: Vec::new(),
             questdb: config.questdb.clone(),
             // The process-wide WAL opened in STAGE-C above. This is the FIRST
             // frame-append consumer since PR-C2 retired the Dhan lane on
