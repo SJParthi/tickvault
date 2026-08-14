@@ -522,11 +522,51 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // market-hours window gate's ALARM_NAMES list, which is its own terraform
     // change. Recorded rather than left to be discovered from a quiet
     // dashboard.
+    // +9 EXACT names 2026-08-14 (55 → 64): the lane's own LIVENESS and LOSS
+    // signals. The trigger is a finding that is worse than any single missing
+    // metric — of every `tv_dhan_feed_*` series the binary emits, the ONLY one
+    // selected was `tv_dhan_feed_stack_connections`, a BOOT-TIME CONSTANT that
+    // reports "5 depth-20" whether or not a single byte ever arrives. So the
+    // one lane signal reaching CloudWatch was the one that cannot be wrong,
+    // while every signal that could reveal a dark feed — frames drained, ticks
+    // ingested, the stack's own up bit, dial failures — reached only the log
+    // sink. That is the exact shape of the 2026-08-12 blackout: 12 consecutive
+    // HTTP 400 dial failures and `compared: 0` for a whole session, with a
+    // connection gauge that read healthy throughout.
+    //
+    // The nine: tv_dhan_feed_stack_up (the lane's own alive bit),
+    // tv_dhan_feed_drain_frames_total (frames actually drained, by outcome),
+    // tv_dhan_feed_ingest_ticks_total (ticks actually folded),
+    // tv_dhan_feed_ingest_refused_total, tv_dhan_ws_reconnect_total,
+    // tv_dhan_ws_park_total (a parked socket is a PERMANENTLY dark shard —
+    // ParkReason::FatalDisconnect is never re-dialed),
+    // tv_dhan_ws_dial_failed_total (the 2026-08-12 class itself),
+    // tv_ticks_lost_total (the workspace's only explicit tick-loss SLA
+    // counter), tv_ws_frame_spill_drop_critical (the WAL durable-floor breach).
+    //
+    // HONEST COST: +9 NAMES ≈ +$2.70/mo by the per-name arithmetic used above
+    // ($16.50 → ~$19.20), but the true bill is HIGHER than the name count
+    // implies and this note must not understate it: CloudWatch bills per
+    // metric, and a name with labels is many metrics.
+    // tv_dhan_feed_drain_frames_total carries 8 `outcome` values and
+    // tv_ticks_lost_total carries source × ws_type, so the realistic addition
+    // is ~20 series ≈ $6/mo, not $2.70. Against the $100 kill-ceiling and a
+    // ~$58–74/mo envelope that is affordable; it is recorded at the honest
+    // number rather than the flattering one.
+    //
+    // FLAGGED, deliberately NOT taken here, and it is the bigger gap: NONE of
+    // these nine has an ALARM — and neither does any of the 14 Dhan-lane names
+    // already in this list. The lane's entire failure surface is now published
+    // and nothing looks at it, so the chain still ends at "a human opens a
+    // dashboard", which the zero-manual-intervention mandate forbids. Alarms
+    // need the market-hours window gate's ALARM_NAMES list (its own terraform
+    // change) and a sustained baseline these series do not yet have. Recorded
+    // here rather than left to be discovered from a quiet dashboard.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        55,
+        64,
         "Z+ L2 VERIFY ratchet: expected exactly 55 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \

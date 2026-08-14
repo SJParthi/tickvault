@@ -157,24 +157,41 @@ nothing outside `websocket/` and the guard file changes.
 
 ## Plan Items
 
-- [ ] Item 1 — `MainFeedSocket` implementing `DhanFeedSocket` (connect/subscribe/next_event/close)
-  - Files: `crates/core/src/websocket/main_feed_socket.rs`, `crates/core/src/websocket/mod.rs`
-  - Tests: `test_connect_url_redacts_token_and_client_id`, `test_subscribe_payload_security_id_is_string`, `test_subscribe_batches_at_100`
-- [ ] Item 2 — frame splitting + dispatch, capture-at-receipt ordering
-  - Files: `crates/core/src/websocket/main_feed_socket.rs`
-  - Tests: `test_split_stacked_frames`, `test_truncated_frame_is_counted_not_panicked`, `test_oversized_message_length_is_rejected`, `proptest_arbitrary_bytes_never_panic`
-- [ ] Item 3 — disconnect classification + reconnect/token-refresh wiring
-  - Files: `crates/core/src/websocket/main_feed_socket.rs`
-  - Tests: `test_807_triggers_token_refresh_before_reconnect`, `test_805_is_terminal_not_retried`
-- [ ] Item 4 — wire the socket into `dhan_feed_stack`, publish ticks, flip the up-gauge
-  - Files: `crates/app/src/dhan_feed_stack.rs`
-  - Tests: `test_stack_reports_up_only_when_streaming`, `test_ticks_reach_the_broadcast_channel`
-- [ ] Item 5 — retire the superseded ratchet rows with the dated 2026-08-09 authority; add the capture-at-receipt ordering guard
-  - Files: `crates/core/tests/dhan_live_ws_retired_guard.rs`, `crates/core/tests/main_feed_capture_order_guard.rs`
-  - Tests: `test_capture_precedes_parse_in_source_order`
-- [ ] Item 6 — DHAT zero-alloc gate on the read path
-  - Files: `crates/core/tests/dhat_main_feed_read_path.rs`
-  - Tests: `test_read_path_zero_alloc_over_10k_frames`
+> **ARCHIVED 2026-08-14 with a PER-ITEM verdict, not a blanket tick.** The transport
+> shipped, but it shipped in `crates/core/src/websocket/connection.rs` as
+> `DhanFeedSocketImpl` — NOT in the `main_feed_socket.rs` this plan names, which was
+> never created. Items 1–4 are ticked against the code that actually exists. Items 5
+> and 6 are recorded **NOT SHIPPED**: `main_feed_capture_order_guard.rs` and
+> `dhat_main_feed_read_path.rs` do not exist on `main` at 5346209 (verified by
+> `ls`). Ticking them to clear the plan-gate slot would be the false-OK class
+> `audit-findings-2026-04-17.md` Rule 11 forbids — a plan that reports done for a
+> guard nobody wrote. They are CARRIED FORWARD into
+> `active-plan-16-socket-hardening.md` (its Items 1 and 5), which is where they are
+> actually built.
+
+- [x] Item 1 — socket implementing `DhanFeedSocket` (connect/recv/close)
+  - Shipped as: `crates/core/src/websocket/connection.rs::DhanFeedSocketImpl`
+    (`connect` :668, `recv` :859, `close` :943; trait impl :667)
+  - Honest deviation: no `subscribe` method on the socket — subscription is owned by
+    the pool/`SubscribeGuard` path, so the plan's `test_subscribe_*` names never
+    existed under these files.
+- [x] Item 2 — frame splitting + dispatch
+  - Shipped as: `crates/core/src/parser/dispatcher.rs::dispatch_frame` (:156) plus
+    `split_stacked_depth_packets` (:218-233), not on the socket type.
+- [x] Item 3 — disconnect classification wiring
+  - Shipped as: `DisconnectCode` consumed in `connection.rs` (7 sites); classification
+    itself lives in `crates/core/src/parser/disconnect.rs` + `websocket/types.rs`.
+- [x] Item 4 — wire the socket into `dhan_feed_stack`, publish ticks
+  - Shipped as: `crates/app/src/dhan_feed_stack.rs:2153` (`DhanFeedSocketImpl::new`).
+- [ ] Item 5 — capture-at-receipt ordering guard — **NOT SHIPPED**
+  - `crates/core/tests/main_feed_capture_order_guard.rs` does not exist.
+    (`dhan_live_ws_retired_guard.rs` DOES exist — the retirement half landed.)
+  - CARRIED FORWARD → `active-plan-16-socket-hardening.md` Item 5.
+- [ ] Item 6 — DHAT zero-alloc gate on the read path — **NOT SHIPPED**
+  - `crates/core/tests/dhat_main_feed_read_path.rs` does not exist. The read path has
+    had no allocation gate since the transport landed.
+  - CARRIED FORWARD → `active-plan-16-socket-hardening.md` Item 1, widened to the
+    whole 16-socket seam (sink, budget, drain, fold, writer).
 
 ## Honest envelope
 

@@ -54,6 +54,14 @@ use std::path::{Path, PathBuf};
 /// Suffixes that make a counter name a claim about LOSS.
 const LOSS_SUFFIXES: &[&str] = &[
     "dropped",
+    // "drop" (singular) is NOT a synonym-for-completeness — it is a real
+    // blind-spot fix found 2026-08-14. `tv_ws_frame_spill_drop_critical` is the
+    // WAL durable-floor breach counter, arguably the most critical loss series
+    // in the workspace, and its second-to-last segment is "drop", not
+    // "dropped". Without this entry `is_loss_shaped` returned false for it, so
+    // the guard that exists to make loss visible could not see the one counter
+    // that reports the durable floor being breached.
+    "drop",
     "refused",
     "errors",
     "discarded",
@@ -119,10 +127,9 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "tv_cross_fill_audit_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
-    (
-        "tv_dhan_feed_ingest_refused_total",
-        "periodic report — same per-tick flood constraint; counted into LiveIngest::refusals and reported as a 30s delta by run_frame_drain (wired 2026-08-12)",
-    ),
+    // REMOVED 2026-08-14: `tv_dhan_feed_ingest_refused_total` is now in the EMF
+    // selector, so the "periodic report is good enough" exemption no longer
+    // applies — it ships and is checked like any other loss counter.
     (
         "tv_dhan_feed_ingest_seq_refused_total",
         "logged — the emit is counters().ingest_seq_refused, three levels of indirection from the literal (const -> struct field -> method), and the error! sits directly beside it; the scanner cannot follow that chain (verified 2026-08-12)",
@@ -135,10 +142,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "tv_dhan_live_xverify_audit_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
-    (
-        "tv_dhan_ws_dial_failed_total",
-        "logged — the counter is behind count_dial_failure(); every call site (no_token, tls_config, bad_url, timeout) carries its own error! or warn! (all arms verified 2026-08-12)",
-    ),
+    // REMOVED 2026-08-14: `tv_dhan_ws_dial_failed_total` is now in the EMF
+    // selector. This is the counter that would have made the 2026-08-12
+    // blackout visible — 12 consecutive HTTP 400 dial failures that reached
+    // only the log sink. "Logged" was never an adequate exemption for it.
     (
         "tv_groww_chain1m_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",

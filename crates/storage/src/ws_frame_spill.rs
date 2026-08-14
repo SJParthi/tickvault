@@ -223,10 +223,113 @@ const WAL_WRITER_IO_RETRY_BACKOFF: Duration = Duration::from_millis(50); // APPR
 // WsFrameSpill
 // ---------------------------------------------------------------------------
 
+/// Number of [`WsType`] variants — the width of every pre-resolved counter
+/// table below. Pinned against the enum by
+/// `tests::test_ws_type_index_is_dense_and_matches_all`, so adding a variant
+/// without widening the tables fails the build rather than panicking at
+/// runtime on an out-of-range index.
+/// NOTE: this is THIS module's own three-variant [`WsType`] (the WAL transport
+/// tag, `LiveFeed`/`OrderUpdate`/`TruedataFeed`), NOT the seven-variant
+/// `tickvault_common::ws_event_types::WsType` used for audit rows.
+const WS_TYPE_COUNT: usize = 3;
+
+/// Dense index for a [`WsType`], used only to address the pre-resolved counter
+/// tables in [`SpillDropCounters`].
+///
+/// Deliberately local to this module rather than a method on `WsType` in
+/// `crates/common`: the index is an implementation detail of THIS module's
+/// counter tables, and widening `crates/common` would escalate every change
+/// here to a workspace-wide test run for no behavioural gain.
+const fn ws_type_index(ws_type: WsType) -> usize {
+    // Exhaustive by construction — no `_` arm, so adding a `WsType` variant
+    // fails THIS match at compile time rather than silently folding the new
+    // transport's losses into another variant's counter.
+    match ws_type {
+        WsType::LiveFeed => 0,
+        WsType::OrderUpdate => 1,
+        WsType::TruedataFeed => 2,
+    }
+}
+
+/// Every [`WsType`], in [`ws_type_index`] order — the build order for the
+/// counter tables. Kept beside the index so the two cannot drift.
+const WS_TYPES_BY_INDEX: [WsType; WS_TYPE_COUNT] =
+    [WsType::LiveFeed, WsType::OrderUpdate, WsType::TruedataFeed];
+
+/// Loss counters resolved ONCE at construction, one handle per `WsType`.
+///
+/// # Why the macro form is banned on this path
+///
+/// `metrics::counter!(NAME, "label" => value)` builds a `Key` on EVERY call,
+/// and a keyed `Key` owns a `Vec<Label>` — so the macro form heap-allocates
+/// once per invocation. Both call sites are the WAL **drop** arms, which
+/// execute only when the process is ALREADY losing data: the spill channel is
+/// full or its writer thread is dead. Allocating there violates principle 1
+/// (zero allocation on the hot path) and, practically, asks the allocator for
+/// memory at the worst possible moment — a frame-drop storm becomes an
+/// allocation storm on top of the loss it is trying to report.
+///
+/// `ws_type` is a per-CALL parameter here (unlike `WalRingSink`, whose
+/// endpoint is fixed for the sink's lifetime), so one handle is not enough —
+/// hence a dense table per series, addressed by [`ws_type_index`].
+/// `Counter::increment` on a resolved handle is a plain atomic add: O(1),
+/// zero allocation.
+struct SpillDropCounters {
+    /// `tv_ws_frame_spill_drop_critical{ws_type}` — both drop arms.
+    drop_critical: [metrics::Counter; WS_TYPE_COUNT],
+    /// `tv_ticks_lost_total{source="spill_drop_critical", ws_type}` — Full arm.
+    ticks_lost_channel_full: [metrics::Counter; WS_TYPE_COUNT],
+    /// `tv_ticks_lost_total{source="spill_writer_dead", ws_type}` — Disconnected arm.
+    ticks_lost_writer_dead: [metrics::Counter; WS_TYPE_COUNT],
+}
+
+impl SpillDropCounters {
+    /// Resolves every handle and publishes a zero on each.
+    ///
+    /// The zero matters: the CloudWatch agent computes a counter's alarm value
+    /// as a DELTA between consecutive samples and has no previous sample for a
+    /// series that has never been emitted, so it drops the first one. If the
+    /// first emission a series ever sees is the outage itself, that outage is
+    /// the dropped sample and the alarm does not fire for it. Publishing a zero
+    /// at construction makes the harmless zero the dropped sample instead —
+    /// the same discipline as `WalRingSink::pre_register`.
+    fn new() -> Self {
+        let drop_critical = WS_TYPES_BY_INDEX
+            .map(|t| metrics::counter!("tv_ws_frame_spill_drop_critical", "ws_type" => t.as_str()));
+        let ticks_lost_channel_full = WS_TYPES_BY_INDEX.map(|t| {
+            metrics::counter!(
+                "tv_ticks_lost_total",
+                "source" => "spill_drop_critical",
+                "ws_type" => t.as_str(),
+            )
+        });
+        let ticks_lost_writer_dead = WS_TYPES_BY_INDEX.map(|t| {
+            metrics::counter!(
+                "tv_ticks_lost_total",
+                "source" => "spill_writer_dead",
+                "ws_type" => t.as_str(),
+            )
+        });
+        let counters = Self {
+            drop_critical,
+            ticks_lost_channel_full,
+            ticks_lost_writer_dead,
+        };
+        for idx in 0..WS_TYPE_COUNT {
+            counters.drop_critical[idx].increment(0);
+            counters.ticks_lost_channel_full[idx].increment(0);
+            counters.ticks_lost_writer_dead[idx].increment(0);
+        }
+        counters
+    }
+}
+
 pub struct WsFrameSpill {
     spill_tx: Sender<WalRecord>,
     drop_critical: Arc<AtomicU64>,
     persisted_total: Arc<AtomicU64>,
+    /// Pre-resolved per-`WsType` loss counters — see [`SpillDropCounters`].
+    drop_counters: SpillDropCounters,
     /// SP5.1: optional per-feed health registry. When `Some`, a dropped
     /// LIVE-FEED (Dhan) frame records a Dhan drop so `/api/feeds/health` flips
     /// `Degraded` — closing the SP5 connected+fresh-but-dropping false-OK.
@@ -302,6 +405,7 @@ impl WsFrameSpill {
             spill_tx: tx,
             drop_critical,
             persisted_total,
+            drop_counters: SpillDropCounters::new(),
             feed_health: None,
         })
     }
@@ -331,6 +435,7 @@ impl WsFrameSpill {
             spill_tx: tx,
             drop_critical: Arc::new(AtomicU64::new(0)),
             persisted_total: Arc::new(AtomicU64::new(0)),
+            drop_counters: SpillDropCounters::new(),
             feed_health: None,
         }
     }
@@ -371,23 +476,18 @@ impl WsFrameSpill {
                     drop_count = prev + 1,
                     "CRITICAL: WAL spill channel FULL — frame dropped (writer stalled)"
                 );
-                metrics::counter!(
-                    "tv_ws_frame_spill_drop_critical",
-                    "ws_type" => ws_type.as_str()
-                )
-                .increment(1);
+                // Pre-resolved handles, NEVER the labelled macro form — this arm
+                // runs only when the process is already losing frames, which is
+                // the worst possible moment to allocate. See `SpillDropCounters`.
+                let idx = ws_type_index(ws_type);
+                self.drop_counters.drop_critical[idx].increment(1);
                 // SLA counter: every dropped frame is one tick-equivalent lost.
                 // Parthiban 2026-04-20: explicit metric so the zero-tick-loss
                 // invariant can be asserted in CI instead of inferred from a
                 // gap between `tv_ticks_processed_total` and
                 // `tv_ticks_persisted_total`. Labelled with the same `ws_type`
-                // so a Grafana heatmap can attribute losses per WebSocket.
-                metrics::counter!(
-                    "tv_ticks_lost_total",
-                    "source" => "spill_drop_critical",
-                    "ws_type" => ws_type.as_str(),
-                )
-                .increment(1);
+                // so a per-WebSocket loss attribution stays possible.
+                self.drop_counters.ticks_lost_channel_full[idx].increment(1);
                 self.record_feed_drop_for_health(ws_type);
                 AppendOutcome::Dropped
             }
@@ -406,19 +506,12 @@ impl WsFrameSpill {
                 );
                 // Same label set as the Full arm so existing alerts on
                 // `tv_ws_frame_spill_drop_critical` fire for this cause too.
-                metrics::counter!(
-                    "tv_ws_frame_spill_drop_critical",
-                    "ws_type" => ws_type.as_str()
-                )
-                .increment(1);
+                // Pre-resolved handles for the same reason as the Full arm.
+                let idx = ws_type_index(ws_type);
+                self.drop_counters.drop_critical[idx].increment(1);
                 // The distinguishing cause lives on the SLA counter's `source`
                 // label (Full arm uses "spill_drop_critical").
-                metrics::counter!(
-                    "tv_ticks_lost_total",
-                    "source" => "spill_writer_dead",
-                    "ws_type" => ws_type.as_str(),
-                )
-                .increment(1);
+                self.drop_counters.ticks_lost_writer_dead[idx].increment(1);
                 self.record_feed_drop_for_health(ws_type);
                 AppendOutcome::Dropped
             }
@@ -1900,5 +1993,190 @@ mod tests {
             "a future-mtime file (clock skew) must be kept — never delete on uncertainty"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pre-resolved counter tables in `SpillDropCounters` are addressed by
+    /// `ws_type_index`, so the index MUST be dense, unique, and exactly as wide
+    /// as `WS_TYPE_COUNT`. Without this, adding a `WsType` variant compiles
+    /// (the `match` in `ws_type_index` would fail — but a careless `_ =>` arm
+    /// would not) and then indexes the wrong series or panics out of range on
+    /// the one path that runs while the process is already losing frames.
+    #[test]
+    fn test_ws_type_index_is_dense_and_matches_all() {
+        let all = WS_TYPES_BY_INDEX;
+        assert_eq!(
+            all.len(),
+            WS_TYPE_COUNT,
+            "WS_TYPE_COUNT must equal the number of WsType variants; widen the \
+             SpillDropCounters tables when adding a variant"
+        );
+        // Every u8 the wire can carry must map into the table — this is what
+        // catches a variant added to the enum but not to WS_TYPES_BY_INDEX.
+        for byte in 0u8..=u8::MAX {
+            if let Some(ws_type) = WsType::from_u8(byte) {
+                assert!(
+                    all.contains(&ws_type),
+                    "WsType::from_u8({byte}) = {} is missing from \
+                     WS_TYPES_BY_INDEX — its losses would be counted against \
+                     another transport",
+                    ws_type.as_str()
+                );
+            }
+        }
+        let mut seen = [false; WS_TYPE_COUNT];
+        for ws_type in all {
+            let idx = ws_type_index(ws_type);
+            assert!(
+                idx < WS_TYPE_COUNT,
+                "ws_type_index({}) = {idx} is out of range for the counter tables",
+                ws_type.as_str()
+            );
+            assert!(
+                !seen[idx],
+                "ws_type_index collision at {idx} for {} — two WsType variants \
+                 would share one counter series and under-report loss",
+                ws_type.as_str()
+            );
+            seen[idx] = true;
+        }
+        assert!(
+            seen.iter().all(|hit| *hit),
+            "ws_type_index must be dense — an unused slot means a variant maps \
+             nowhere and its losses are invisible"
+        );
+    }
+
+    /// Both WAL drop arms must use the pre-resolved handles, never the labelled
+    /// `metrics::counter!` macro form: a keyed `Key` owns a `Vec<Label>`, so the
+    /// macro heap-allocates once per DROPPED frame — an allocation storm layered
+    /// on top of the data loss it is reporting.
+    #[test]
+    fn test_drop_arms_never_use_the_allocating_macro_form() {
+        let src = include_str!("ws_frame_spill.rs");
+        // Split on the tests MODULE marker, not a bare `#[cfg(test)]`. This
+        // file has a `#[cfg(test)]` item (`new_with_dead_writer_for_test`)
+        // ABOVE the drop arms, so a bare split truncates the "production half"
+        // before the code under test and the scan silently checks nothing —
+        // the exact vacuous-guard shape this test exists to prevent. Caught by
+        // this test failing against its own first draft.
+        let production = src
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("source has a production half");
+        assert!(
+            production.contains("fn append_with_seq"),
+            "the production half must actually contain the drop arms — if this \
+             trips, the split marker drifted and the scan below is vacuous"
+        );
+        for banned in [
+            "metrics::counter!(\n                    \"tv_ws_frame_spill_drop_critical\"",
+            "metrics::counter!(\n                    \"tv_ticks_lost_total\"",
+        ] {
+            assert!(
+                !production.contains(banned),
+                "the WAL drop arms must increment pre-resolved SpillDropCounters \
+                 handles, not build a labelled Key per dropped frame"
+            );
+        }
+        assert!(
+            production.contains("self.drop_counters.drop_critical[idx].increment(1)"),
+            "the drop arms must increment the pre-resolved drop_critical handle"
+        );
+    }
+
+    /// EXHAUSTIVE permutation sweep of the writer-dead drop arm.
+    ///
+    /// Every `WsType` × every adversarial frame shape must: return `Dropped`,
+    /// increment the drop ledger exactly once, never panic, and never let one
+    /// transport's loss land on another transport's counter. The frame shapes
+    /// are deliberately hostile — empty, single byte, a length that lies about
+    /// the payload, a full 64 KiB frame, and all-0xFF — because the drop arm
+    /// runs on malformed traffic at least as often as on well-formed traffic,
+    /// and that is precisely when it must stay cheap and correct.
+    #[test]
+    fn test_drop_arm_permutations_every_ws_type_every_frame_shape() {
+        let shapes: [(&str, Vec<u8>); 6] = [
+            ("empty", Vec::new()),
+            ("one_byte", vec![0x00]),
+            ("header_only", vec![2, 0, 0, 0, 0, 0, 0, 0]),
+            ("lying_length", vec![2, 0xFF, 0xFF, 0, 0, 0, 0, 0]),
+            ("all_ones", vec![0xFF; 64]),
+            ("max_frame", vec![0xAB; 64 * 1024]),
+        ];
+
+        for ws_type in WS_TYPES_BY_INDEX {
+            for (shape_name, frame) in &shapes {
+                // A FRESH spill per permutation so the ledger reading is
+                // unambiguous — a shared instance would let an earlier
+                // permutation's count mask a later one that failed to increment.
+                let spill = WsFrameSpill::new_with_dead_writer_for_test();
+                assert_eq!(
+                    spill.drop_critical_count(),
+                    0,
+                    "{}/{shape_name}: a fresh spill must start at zero",
+                    ws_type.as_str()
+                );
+
+                let outcome = spill.append(ws_type, frame.clone());
+                assert_eq!(
+                    outcome,
+                    AppendOutcome::Dropped,
+                    "{}/{shape_name}: a dead writer must report Dropped, never \
+                     a silent Spilled — a silent success here is the durable \
+                     floor lying about itself",
+                    ws_type.as_str()
+                );
+                assert_eq!(
+                    spill.drop_critical_count(),
+                    1,
+                    "{}/{shape_name}: exactly one drop must be ledgered",
+                    ws_type.as_str()
+                );
+
+                // Repeat on the SAME instance: the ledger must accumulate, not
+                // latch. A latching counter under-reports a drop storm to
+                // exactly the degree the storm is bad.
+                let _ = spill.append(ws_type, frame.clone());
+                let _ = spill.append(ws_type, frame.clone());
+                assert_eq!(
+                    spill.drop_critical_count(),
+                    3,
+                    "{}/{shape_name}: the drop ledger must accumulate",
+                    ws_type.as_str()
+                );
+            }
+        }
+    }
+
+    /// Interleaving every `WsType` through ONE spill must not lose or misattribute
+    /// a single drop. This is the cross-talk check the per-type table exists for:
+    /// with a shared handle (the pre-2026-08-14 macro form rebuilt a Key per
+    /// call) an indexing mistake is invisible, because every increment lands on
+    /// whatever Key was built last.
+    #[test]
+    fn test_drop_arm_interleaved_ws_types_never_cross_talk() {
+        let spill = WsFrameSpill::new_with_dead_writer_for_test();
+        let mut expected = 0u64;
+        // Three full rotations, so an off-by-one index would desynchronise.
+        for _round in 0..3 {
+            for ws_type in WS_TYPES_BY_INDEX {
+                assert_eq!(
+                    spill.append(ws_type, vec![1, 2, 3, 4]),
+                    AppendOutcome::Dropped
+                );
+                expected += 1;
+                assert_eq!(
+                    spill.drop_critical_count(),
+                    expected,
+                    "interleaved {} must ledger exactly one drop per append",
+                    ws_type.as_str()
+                );
+            }
+        }
+        assert_eq!(
+            expected,
+            (WS_TYPE_COUNT as u64) * 3,
+            "the sweep must have covered every WsType three times"
+        );
     }
 }

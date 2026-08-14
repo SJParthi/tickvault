@@ -374,9 +374,21 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
 pub fn build_depth_candidate_query(today_ist_nanos: i64) -> String {
     let today_micros = today_ist_nanos / 1_000;
     format!(
+        // `ts >= {today_micros}` added 2026-08-14. Without it `LATEST ON ts`
+        // returns the newest row per partition from ANY day, so a pre-09:16
+        // caller silently got YESTERDAY's chain — stale `underlying_spot`
+        // driving ATM ranking, on derivative ids Dhan documents as unstable
+        // across days.
+        //
+        // This bound is safe ONLY because the caller now retries
+        // (`dhan_feed_stack::attach_depth_when_available`). Added alone, it
+        // would have turned a boot-time read into zero rows and REDUCED the
+        // socket count — correct but worse. Day bound and late-attach are one
+        // change; do not separate them.
         "SELECT underlying_symbol, contract_security_id, expiry, strike, \
          underlying_spot, leg FROM option_chain_1m \
          WHERE feed = 'dhan' AND contract_security_id > 0 AND expiry >= {today_micros} \
+         AND ts >= {today_micros} \
          LATEST ON ts PARTITION BY underlying_security_id, expiry, strike, leg;"
     )
 }
@@ -947,6 +959,25 @@ mod tests {
             sel.depth_200.len() <= 5,
             "depth-200 envelope is 5 conns x 1 = 5, got {}",
             sel.depth_200.len()
+        );
+    }
+
+    /// The day bound is what stops a pre-09:16 caller from silently receiving
+    /// YESTERDAY's chain. `LATEST ON ts` returns the newest row per partition
+    /// from ANY day without it.
+    #[test]
+    fn test_depth_candidate_query_is_day_bounded() {
+        let today = 1_786_000_000_000_000_000i64;
+        let sql = build_depth_candidate_query(today);
+        let micros = today / 1_000;
+        assert!(
+            sql.contains(&format!("ts >= {micros}")),
+            "the depth candidate query MUST bound ts to today — without it LATEST ON ts \
+             returns yesterday's chain and depth ranks ATM off a stale spot. sql={sql}"
+        );
+        assert!(
+            sql.contains(&format!("expiry >= {micros}")),
+            "the expiry filter must survive alongside the day bound. sql={sql}"
         );
     }
 }
