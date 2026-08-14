@@ -257,3 +257,49 @@ resource "aws_cloudwatch_metric_alarm" "live_universe_fallback" {
   # on the wrong universe. Only a restart fixes it, and that is a new session.
   ok_actions = []
 }
+
+# ---------------------------------------------------------------------------
+# 6. PARTIAL socket loss (2026-08-14 — audit)
+# ---------------------------------------------------------------------------
+# Alarm 1 above (lane down) can only see TOTAL failure: tv_dhan_feed_stack_up
+# clears when the frame ring closes, and the ring closes only when EVERY sender
+# is dropped. The planned-connections gauge is a boot-time constant. So four of
+# five main-feed sockets could park and both signals would still read healthy
+# while roughly 80% of the subscribed universe went dark.
+#
+# tv_dhan_ws_alive_connections is the state those two could not express: it is
+# incremented before each supervisor task starts and decremented when that task
+# returns, so it answers "how many sockets exist right now". The park counter
+# fires on the transition, but a counter cannot be queried for current state at
+# 09:30 — a delta that already scrolled past is not a health signal.
+#
+# Threshold is deliberately "fewer than 1" rather than "fewer than planned":
+# the planned count varies with the resolved universe (4 index SIDs open one
+# socket; 4,565 open five), so a fixed comparison would page every day the
+# master sourcing legitimately changed shape. Partial loss above zero is caught
+# by the park alarm; this catches the all-sockets-gone case that the ring-close
+# gauge misses when a sender is still held somewhere.
+resource "aws_cloudwatch_metric_alarm" "ws_no_alive_connections" {
+  alarm_name        = "tv-${var.environment}-ws-no-alive-connections"
+  alarm_description = "Every Dhan live-feed socket is gone, while the lane may still report itself up. The lane-up gauge only clears when the frame ring closes, which requires every sender to be dropped, so a lane holding a sender with zero live sockets reads healthy and produces nothing. Triage: journalctl -u tickvault for the park reasons (WS-GAP-03) — a 805/804/806/808/810 disconnect parks a socket permanently and nothing re-dials it, so the fix is a restart once the underlying cause (token, entitlement, subscription) is addressed."
+
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  evaluation_periods  = 2
+  metric_name         = "tv_dhan_ws_alive_connections"
+  namespace           = local.app_namespace
+  # 2 periods: a rolling restart legitimately passes through zero for a moment.
+  # Two consecutive 5-minute windows at zero is not a restart, it is an outage.
+  period             = 300
+  statistic          = "Minimum"
+  dimensions         = local.app_dimensions
+  # notBreaching, NOT breaching: outside market hours the lane is deliberately
+  # down and the gauge is legitimately absent. Treating missing as breaching
+  # would page every evening.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # An OK here is a genuine recovery — sockets came back — so it is worth
+  # sending, unlike the loss alarms above where recovery is impossible.
+  ok_actions = local.app_alarm_actions
+}
