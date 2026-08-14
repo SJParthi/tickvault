@@ -672,7 +672,10 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
 
             let quantile = |q: f64| -> Value {
                 let target = q * count;
-                for (bound, le, cum) in &bounds {
+                // `le` (the raw label text) is intentionally not bound: the
+                // finiteness of the PARSED bound is what decides the branch
+                // below, precisely because "+Inf" parses successfully.
+                for (bound, _le, cum) in &bounds {
                     if *cum >= target {
                         // NOT `le.parse().is_err()`: Rust parses "+Inf" as a
                         // VALID f64 infinity, so an Err branch here never
