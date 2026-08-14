@@ -89,10 +89,28 @@ const INVOCATION_SITE_ALLOWLIST: &[&str] = &[];
 /// Verified at fix time (`git ls-files -- <pathspec>` for EVERY entry below):
 /// ZERO tracked matches, so both allowlists stay at their hard-zero floor and
 /// the ratchet cannot be re-grown by this widening.
+/// 2026-08-14 SCOPE FIX #6 — the shell-variant row.
+///
+/// The nine-agent audit bite-tested fourteen evasion vectors and found this one
+/// only PARTIALLY caught: a `.bash` / `.zsh` / `.ksh` / `.ps1` / `.bat` file was
+/// caught only if it happened to carry BOTH a shebang and a banned token. A
+/// PowerShell or batch script carries no shebang at all, so it was invisible —
+/// the one-rename evasion that the `.pyw`/`.pyi` row already closed for the
+/// interpreter's own extensions, still open for every shell variant.
+///
+/// This repository's shell is bash, universally: all 99 tracked shebangs are
+/// `bash` or `sh`, and `.sh` is the only shell extension in use. Banning the
+/// variants therefore costs nothing and removes a whole class.
+///
+/// Verified at fix time (`git ls-files -- <pathspec>` for EVERY entry below):
+/// ZERO tracked matches for all seven, so both allowlists stay at their
+/// hard-zero floor and the ratchet cannot be re-grown by this widening.
 const BANNED_FILE_PATHSPECS: &[&str] = &[
     "*.py", "*.pyw", "*.pyi", "*.pyx", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.es6", "*.coffee",
     "*.ts", "*.tsx", "*.mts", "*.cts", "*.rb", "*.pl", "*.php", "*.lua", "*.tcl", "*.groovy",
-    "*.jl", "*.ipynb",
+    "*.jl",
+    "*.ipynb", // SCOPE FIX #6 — shell variants (all zero tracked; `.sh` + bash only)
+    "*.bash", "*.zsh", "*.ksh", "*.ps1", "*.bat", "*.fish", "*.nu",
 ];
 
 // ============================ PURE CORE ============================
