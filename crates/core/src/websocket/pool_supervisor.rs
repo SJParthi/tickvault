@@ -622,6 +622,29 @@ impl ConnectionSupervisor {
             "reason" => reason.as_str(),
         )
         .increment(1);
+        // A park is PERMANENT — this socket will never dial again for the rest
+        // of the session, by design (re-dialing into a 805 kills a healthy pool
+        // member, and re-dialing into a credential rejection just repeats it).
+        //
+        // The park POLICY is correct and is not changed here. What was wrong,
+        // until 2026-08-14, is that it happened in complete silence: the
+        // counter above was incremented and nothing else. The counter had no
+        // alarm and no log line, so a socket could drop out of a 16-socket pool
+        // permanently and the only way to notice was to go looking for a
+        // metric nobody was watching. A permanent capacity loss must announce
+        // itself.
+        //
+        // Cold path by construction: a park is terminal for this slot, so this
+        // can log at most once per connection per session.
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            endpoint = self.slot.endpoint.as_str(),
+            connection_index = self.slot.global_index,
+            reason = reason.as_str(),
+            "a Dhan live-feed socket has PARKED PERMANENTLY and will not dial again this \
+             session — the pool is now carrying fewer connections than it was planned for, \
+             and this one only returns on a process restart"
+        );
         SupervisorAction::Park { reason }
     }
 }
