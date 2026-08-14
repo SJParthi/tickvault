@@ -1891,6 +1891,16 @@ pub struct DhanFeedStackParams {
     /// is a schema decision. Until that decision is made, running both is
     /// REFUSED rather than silently corrupted.
     pub rest_fold_writes_dhan_candles: bool,
+    /// The operator-facing feed state, so the lane can report whether it is
+    /// ACTUALLY running.
+    ///
+    /// Added 2026-08-14. `set_dhan_lane_running` previously had zero
+    /// production callers, which made `feed_health`'s Dhan verdict a constant
+    /// — it read "enabled, but the feed was not started at boot" whether the
+    /// lane was up, down, or absent. The lane owns that truth, so the lane is
+    /// what sets it: `true` once sockets are dialed and the fold is consuming
+    /// them, `false` on every exit path.
+    pub feed_runtime: Arc<tickvault_api::feed_state::FeedRuntimeState>,
 }
 
 /// Brings up the Dhan 16-connection live feed if — and only if — both gates are
@@ -2383,6 +2393,18 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Up means SOCKETS DIALED AND A FOLD CONSUMING THEM — not "config was
     // enabled". It is set here and cleared by the drain when the ring closes.
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(1.0);
+
+    // Tell the operator-facing feed state the same thing the gauge just said.
+    //
+    // Before 2026-08-14 `set_dhan_lane_running` had ZERO production call sites
+    // — eight matches repo-wide, every one of them in a test. The flag is
+    // initialised `false` and nothing ever moved it, so `feed_health` reported
+    // `Degraded: "enabled, but the feed was not started at boot"` for a lane
+    // that was healthy, a lane that was dead, and a lane that had never been
+    // configured, identically and forever. The operator console printed that
+    // constant as if it were a diagnosis, and the feeds page then prescribed a
+    // restart from it. A status line that cannot vary is not a status line.
+    params.feed_runtime.set_dhan_lane_running(true);
     info!(
         dialed,
         seeded,
@@ -2399,18 +2421,48 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Hold the task alive with the drain so the stack's JoinHandle reflects the
     // lane's real lifetime rather than completing the instant it finished
     // dialing.
-    if let Err(err) = drain.await {
+    let drain_outcome = drain.await;
+
+    // Clear the up-gauge on EVERY exit, not just the error one.
+    //
+    // Until 2026-08-14 this was inside the `if let Err(...)` arm below, which
+    // left a false-OK with a very specific shape: when the drain returns
+    // NORMALLY — which is what happens once every socket has died and the ring
+    // closes — `drain.await` is `Ok`, the arm never runs, and
+    // `tv_dhan_feed_stack_up` stays pinned at 1.0 for the rest of the process.
+    // The one metric whose entire job is to say "the lane is carrying data"
+    // would report a healthy lane precisely when every socket was gone. The
+    // gauge now falls on the normal path, the error path, and the
+    // nothing-dialed path alike.
+    metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
+    params.feed_runtime.set_dhan_lane_running(false);
+
+    if let Err(err) = drain_outcome {
         // The drain is the ONLY consumer of the ring. If it panicked, every
         // socket is still capturing to the WAL but nothing is folding — the
-        // exact shape of a lane that looks alive and produces no candles. Say
-        // so at ERROR and drop the up-gauge; never let it end quietly.
+        // exact shape of a lane that looks alive and produces no candles.
+        //
+        // Honest note on reachability (verified 2026-08-14): the release
+        // profile sets `panic = "abort"`, so a genuine panic in the drain
+        // aborts the PROCESS rather than surfacing here, and systemd
+        // (`Restart=always`, `RestartSec=3`) brings the lane back within
+        // seconds. In a release build this arm is therefore reached only by
+        // task cancellation, not by a panic. It is retained because it IS
+        // reachable in a debug build and because a silent join failure must
+        // never pass unlogged — but nobody should read it as the production
+        // recovery story. The production recovery story is the process
+        // restart, and it already works.
         error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             %err,
             "the Dhan live-feed frame drain DIED — frames are still being captured to the \
              write-ahead log but nothing is folding them into candles this session"
         );
-        metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
+    } else {
+        info!(
+            "the Dhan live-feed frame drain exited cleanly — every socket is closed and the \
+             ring is drained; the lane is reporting itself DOWN"
+        );
     }
 }
 
@@ -3078,6 +3130,11 @@ mod tests {
             // Likewise irrelevant here — the config gate is checked before any
             // of the three floors, and this test pins that ordering.
             rest_fold_writes_dhan_candles: false,
+            // A real state object, default-constructed: the disabled lane must
+            // spawn nothing, and must therefore leave this flag untouched at
+            // its `false` default. Asserted below, so this test also pins that
+            // a refused lane never claims to be running.
+            feed_runtime: Arc::new(tickvault_api::feed_state::FeedRuntimeState::default()),
         });
         assert!(handle.is_none(), "a disabled lane must spawn nothing");
     }

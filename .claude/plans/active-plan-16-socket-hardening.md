@@ -283,3 +283,166 @@ With H-D resolved, the remaining work is mechanical: extract the dial body
 (`:2126-2191`) into a reusable fn, move `pool` into the spawned depth task
 (confirmed no use after the loop), and add the bounded retry loop around
 `load_depth_universe(&params.questdb, ist_midnight_nanos(today))`.
+
+---
+
+## ITEMS 8–14 (added 2026-08-14) — operator: "Go ahead with the entire fixes"
+
+**The verbatim operator authorization (2026-08-14, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Go ahead with the entire fixes dude okay? Not per Sid cloudwatch right per websocket
+> connections or entire webscoket connections right dude ami right dude"
+
+Given in DIRECT response to a message that enumerated exactly eight fixes in a priority
+table (drain respawn · token cooldown · stop the console lying + alarms · depth ring
+budget · ILP over TCP · WAL re-fold · receipt-time latency · `target-cpu`). That table is
+the scope this quote authorizes. The second sentence is a DESIGN CORRECTION the operator
+made himself and it is adopted verbatim: latency is dimensioned **per WebSocket
+connection (16)**, never per instrument (4,565).
+
+**Why the correction is right, and recorded so nobody "improves" it back:** 4,565
+per-instrument CloudWatch metrics ≈ $1,369/mo against a budget whose AUTOMATIC action is
+`STOP_EC2_INSTANCES` — the observability feature would stop the trading box. 16
+per-connection metrics ≈ $4.80/mo. Per-instrument drill-down stays in RAM, served over
+the existing API, costing zero CloudWatch dimensions.
+
+**This adds NO new scope.** No socket is opened beyond the 16 already authorized
+(2026-08-09 second quote), no universe is widened, `dry_run` is untouched, and the §28
+frozen area is not edited. Every item below repairs code that PR #1743–#1750 already
+landed.
+
+### Item 8 — the frame drain must be unkillable
+
+`dhan_feed_stack.rs:2402-2416` awaits the drain join handle, logs one `error!`, sets the
+gauge to 0, and **returns**. A panic in any drain arm therefore ends the only ring
+consumer for the rest of the session: sockets keep capturing, the WAL keeps growing, and
+zero rows reach `ticks` or `candles_*`. The silence detector cannot warn, because it
+lives INSIDE the dead task. Fix: supervise the drain with the house respawn pattern
+(`cadence_runner` precedent) — bounded restarts, `tv_dhan_feed_drain_respawn_total`,
+coded `error!` per respawn, and a permanent-failure page after the cap.
+
+### Item 9 — a fatally-parked socket must not be silent
+
+`pool_supervisor.rs:1690` parks a socket permanently on a fatal disconnect (805) and never
+dials again — deliberate, and correct as a dial policy. What is NOT correct is that
+nothing tells the operator. Fix: `tv_dhan_ws_park_total` gains a CloudWatch alarm; the
+park site emits a coded `error!` naming the endpoint and slot. The park policy itself is
+UNCHANGED (re-dialling into a fatal reject is worse).
+
+### Item 10 — the 807 token stampede
+
+Every one of the 16 connection closures calls `manager.force_renewal()`
+(`dhan_feed_stack.rs:2090-2103`). `try_renew_token` is never cooldown-gated, and the mint
+guard is a **check-then-act across an `.await`** (read `token_manager.rs:960-965`, written
+inside `acquire_token` at `:768-770`) — so two callers can both pass. Dhan permits ONE
+active token per account, so mint *n* invalidates mint *n−1* and the sockets that already
+re-dialled get 807 again. This path executes **every 24 h by regulation**, so it is not a
+tail risk. Fix: a single-flight gate — the first caller mints, the other fifteen await the
+same result; the cooldown stamp is written BEFORE the await, not after.
+
+### Item 11 — stop the console lying
+
+`set_dhan_lane_running` has ZERO production call sites (8 repo-wide hits, all tests), so
+`feed_health.rs:162` returns `Degraded, "enabled, but the feed was not started at boot"`
+**unconditionally** — whether the lane is healthy, dead, or never started. `feeds_page.rs`
+then prescribes a restart from that constant. Separately, no `record_ticks` call site
+exists, so Dhan feed health can never read `Down` — it returns a benign
+`Unknown, "not instrumented yet"` for a corpse. Fix: call `set_dhan_lane_running(true)`
+when the stack is actually up and `(false)` on every exit path; wire `record_ticks` from
+the drain so health can fall.
+
+### Item 12 — per-connection latency, receipt-stamped
+
+Three defects make today's numbers unusable even if published: (a) the receive stamp is
+taken in the DRAIN, after the shared 65,536-frame ring (`dhan_feed_stack.rs:1455`), so
+under load it measures OUR queueing, not Dhan's delivery; (b) `CapturedFrame`
+(`pool_supervisor.rs:832`) carries no slot, so a tick cannot be attributed to a socket;
+(c) `DailyLagHistogram::record_ns` takes **unsigned** — one negative sample (host clock
+behind exchange, or a garbage LTT) stores a ~570-million-year maximum permanently.
+
+Fix: stamp receipt in the read task and carry it plus `slot: ConnectionId` on
+`CapturedFrame` (a `u64` + a `u8` — no allocation; `Bytes` remains the only heap member).
+Compute lag in `i64` on ONE explicit IST basis, clamp negatives to zero and COUNT the
+clamp, reject `ts == 0` and `ts == u32::MAX` before recording. Publish p50/p99 per
+connection (16 dimensions). Per-instrument stays in a RAM ring served over the API.
+
+**Honest limits, stated at the point of display, not buried:** Dhan's LTT is whole
+SECONDS, so every lag figure carries a ±1 s truncation floor and a mean +500 ms bias —
+sub-second precision is structurally unavailable and must never be claimed. Only the 5
+main-feed sockets produce ticks; depth sockets get a frame-CADENCE metric instead, and
+the order-update socket is a separate JSON path. Idle instruments are excluded — LTT is
+last-TRADE time, so a thin option is legitimately minutes stale and must never page.
+Silence remains owned by `scan_silence`.
+
+### Item 13 — alarms for a lane that currently has none
+
+`grep NotificationEvent` over the feed stack returns EMPTY, and no `tv_dhan_*` metric
+appears in any `deploy/aws/terraform/*.tf` alarm. Meanwhile `tv_ticks_dropped_total` is
+already billed and shipped to CloudWatch with no alarm consuming it — the repo's own EMF
+notes call it "the single largest tick-loss window". Fix: alarms on
+`tv_dhan_feed_stack_up < 1`, `tv_ticks_dropped_total`, `tv_dhan_ws_park_total`, and the
+ring-full counter. **A dated row lands in `dhan-rest-only-noise-lock-2026-07-14.md` §2
+FIRST** — that file's §3 makes any new Dhan-scoped page a REJECT without one.
+
+### Item 14 — build for the CPU we actually run on
+
+`.cargo/config.toml` deliberately does not set `target-cpu`, and its stated reason is
+portability between a Mac dev build and AWS. That reason is sound for the LOCAL profile
+and does not apply to the deploy path, which cross-compiles for a KNOWN r8g.xlarge
+(Graviton4 = `neoverse-v2`). Fix: set `-C target-cpu=neoverse-v2` in the deploy build
+only, leaving the local build generic. The portability comment stays and gains the
+carve-out so the next reader does not undo it.
+
+## Item 8–14 Edge Cases
+
+- Drain respawn must NOT restart into a poison frame forever — the restart budget is
+  bounded and exhaustion pages rather than looping.
+- The single-flight token gate must not deadlock when the first caller panics — the
+  permit is released on drop, not on success.
+- `set_dhan_lane_running(false)` must fire on EVERY exit path including panic-unwind,
+  or the console flips from one lie to the opposite lie.
+- The lag histogram must reject a frame stamped before its own connection opened (clock
+  step during dial).
+- A depth socket must never contribute to the main-feed lag percentiles.
+
+## Item 8–14 Failure Modes
+
+| Mode | Detection | Recovery |
+|---|---|---|
+| Drain panics repeatedly | respawn counter + cap | page after cap, gauge 0 |
+| Token mint fails for all 16 | single-flight returns one error to all | existing backoff ladder |
+| Clock steps backward mid-session | negative-lag clamp counter | series annotated, not silently zeroed |
+| EMF name budget exceeded (16,382/16,384 bytes today) | terraform plan fails | short metric names, counted before adding |
+
+## Item 8–14 Test Plan
+
+Unit: single-flight gate under 16 concurrent callers (loom where practical); negative and
+`u32::MAX` lag inputs clamp and count; `set_dhan_lane_running` toggles on both the success
+and the panic path. Integration: drain respawn after an induced panic. Ratchet: a guard
+asserting `set_dhan_lane_running` has ≥1 production call site — the defect class that
+caused Item 11 in the first place. DHAT: the receipt stamp adds no allocation.
+
+## Item 8–14 Rollback
+
+Every item is independently revertable. Items 8–11 and 13 are additive (a supervisor, a
+gate, a setter call, alarms) and removing them restores today's behaviour exactly. Item 12
+adds two fields to an internal struct. Item 14 is one build flag.
+
+## Item 8–14 Observability
+
+New: `tv_dhan_feed_drain_respawn_total`, `tv_dhan_lag_negative_clamped_total`,
+per-connection lag p50/p99 (16 dims). Existing-but-unwatched gain alarms:
+`tv_dhan_feed_stack_up`, `tv_ticks_dropped_total`, `tv_dhan_ws_park_total`.
+
+## Item 8–14 Honest envelope
+
+100% inside the tested envelope: after these items nothing is lost after a frame reaches
+our NIC, no failure is silent, and every stage of the chain is measured. NOT claimed:
+(a) sub-second latency accuracy — Dhan's LTT is whole seconds and the ±1 s floor is
+structural; (b) any improvement to Dhan's own delivery, measured 2026-07-06 at p99
+46.37 s / max 198.69 s — every one of these fixes is on OUR side of the NIC and changes
+that number by exactly zero; (c) detection of a tick Dhan never sent — their India feed
+carries no sequence number and no snapshot-on-subscribe, so upstream loss stays invisible
+at the protocol level; (d) that the lane has been exercised at 4,565 instruments — it has
+not, on any day, and the first live session at that scale remains the measured gate.
