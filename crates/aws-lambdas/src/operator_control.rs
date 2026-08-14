@@ -2605,7 +2605,11 @@ mod tests {
     #[test]
     fn test_view_commands_target_live_rest_tables() {
         let joined = VIEW_COMMANDS.join("\n");
-        for live in ["spot_1m_rest", "option_chain_1m", "option_contract_1m_rest"] {
+        for live in [
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
+        ] {
             assert!(joined.contains(live), "{live}");
         }
         // Today windows use the house `ts IN today()` convention.
@@ -3011,9 +3015,9 @@ mod tests {
         // embedded interpreter program was retired). Each of the four LIVE
         // REST tables must still appear as its own equality arm.
         for live in [
-            "spot_1m_rest",
-            "option_chain_1m",
-            "option_contract_1m_rest",
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
             "rest_fetch_audit",
         ] {
             assert!(
@@ -3027,9 +3031,9 @@ mod tests {
         for t in [
             "ticks",
             "candles_1m",
-            "spot_1m_rest",
-            "option_chain_1m",
-            "option_contract_1m_rest",
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
             "rest_fetch_audit",
         ] {
             assert!(joined.contains(&format!("$(qc {t})")), "{t}");
@@ -3295,9 +3299,9 @@ mod tests {
     #[test]
     fn test_view_commands_query_live_tables_grouped_by_feed() {
         for (label, table) in [
-            ("SPOT_BY_FEED=", "spot_1m_rest"),
-            ("CHAIN_BY_FEED=", "option_chain_1m"),
-            ("CONTRACT_BY_FEED=", "option_contract_1m_rest"),
+            ("SPOT_BY_FEED=", "rest_spot_1m"),
+            ("CHAIN_BY_FEED=", "rest_option_chain_1m"),
+            ("CONTRACT_BY_FEED=", "rest_option_contract_1m"),
         ] {
             let cmd = VIEW_COMMANDS.iter().find(|c| c.contains(label)).unwrap();
             assert!(cmd.contains("GROUP%20BY%20feed"));

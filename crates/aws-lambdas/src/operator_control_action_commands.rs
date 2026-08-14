@@ -27,7 +27,7 @@ pub const WIPE_QUESTDB_COMMANDS: [&str; 10] = [
     // never a silent success.
     r#"QDB='http://127.0.0.1:9000'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" | tail -n +2 | tr -d '"\r' | sed '/^$/d')
-TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || index($0,"candles_")==1 || $0=="prev_day_ohlcv" || $0=="spot_1m_rest" || $0=="option_chain_1m" || $0=="option_contract_1m_rest" || $0=="rest_fetch_audit"' | sort)
+TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || index($0,"candles_")==1 || $0=="prev_day_ohlcv" || $0=="rest_spot_1m" || $0=="rest_option_chain_1m" || $0=="rest_option_contract_1m" || $0=="rest_fetch_audit"' | sort)
 echo "WIPE-TARGETS $(printf '%s\n' "$TARGETS" | sed '/^$/d' | wc -l | tr -d ' ') $(printf '%s\n' "$TARGETS" | sed '/^$/d' | paste -sd' ' -)"
 for t in $TARGETS; do
   if curl -fsS --max-time 30 --get --data-urlencode "query=TRUNCATE TABLE $t" "$QDB/exec" >/dev/null; then echo "TRUNCATED $t"; else echo "TRUNCATE-FAILED $t"; fi

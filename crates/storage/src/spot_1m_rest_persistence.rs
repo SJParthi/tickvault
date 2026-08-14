@@ -37,7 +37,11 @@ use tracing::{error, warn};
 use tickvault_common::config::QuestDbConfig;
 
 /// QuestDB table name — one row per fetched `(minute, index)`.
-pub const SPOT_1M_REST_TABLE: &str = "spot_1m_rest";
+pub const SPOT_1M_REST_TABLE: &str = "rest_spot_1m";
+
+/// The pre-2026-08-14 name. Retained ONLY so the boot migration can rename an
+/// existing populated table forward. Never write through this.
+pub const LEGACY_SPOT_1M_REST_TABLE: &str = "spot_1m_rest";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule);
 /// `exchange_segment` alongside `security_id` (I-P1-11); `feed` in-key
@@ -150,7 +154,20 @@ pub async fn ensure_spot_1m_rest_table(questdb_config: &QuestDbConfig) {
             return;
         }
     };
-    let mut statements = vec![spot_1m_rest_create_ddl()];
+    // RENAME-FIRST migration (2026-08-14, operator: REST tables must be
+    // prefix-identifiable). The legacy name is renamed BEFORE the CREATE, so
+    // an existing populated table carries its rows across instead of the
+    // CREATE minting an empty table beside it and splitting the history.
+    //
+    // Idempotent by construction: QuestDB fails the RENAME when the target
+    // already exists (second boot onward) and when the source does not (fresh
+    // install). Both are expected, so the statement is best-effort and its
+    // failure is not an error — the CREATE that follows is the real
+    // guarantee. Never a DROP: these tables are SEBI-retained.
+    let mut statements = vec![
+        format!("RENAME TABLE '{LEGACY_SPOT_1M_REST_TABLE}' TO '{SPOT_1M_REST_TABLE}';"),
+        spot_1m_rest_create_ddl(),
+    ];
     // Per-column self-heal for tables created by earlier builds
     // (observability-architecture.md schema-self-heal pattern). QuestDB
     // ignores ADDs that already exist, so running every boot is free.
@@ -504,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_spot_1m_rest_symbol_labels_stable() {
-        assert_eq!(SPOT_1M_REST_TABLE, "spot_1m_rest");
+        assert_eq!(SPOT_1M_REST_TABLE, "rest_spot_1m");
         assert_eq!(SPOT_1M_REST_FEED_DHAN, "dhan");
         assert_eq!(SPOT_1M_REST_SOURCE, "rest_intraday");
         assert_eq!(SPOT_1M_REST_SEGMENT_IDX_I, "IDX_I");

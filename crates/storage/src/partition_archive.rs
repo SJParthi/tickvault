@@ -1809,11 +1809,11 @@ mod tests {
         // the heaviest daily volume — they ride the market-data hot window
         // (35d) instead of the 90d Standard class.
         assert_eq!(
-            retention_class("option_chain_1m"),
+            retention_class("rest_option_chain_1m"),
             RetentionClass::MarketData
         );
         assert_eq!(
-            retention_class("option_contract_1m_rest"),
+            retention_class("rest_option_contract_1m"),
             RetentionClass::MarketData
         );
     }
@@ -1825,7 +1825,7 @@ mod tests {
             "instrument_fetch_audit",
             "prev_day_ohlcv",
             "feed_scoreboard_daily",
-            "spot_1m_rest",
+            "rest_spot_1m",
             "partition_archive_audit",
         ] {
             assert_eq!(
