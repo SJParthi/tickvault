@@ -403,7 +403,8 @@ impl MultiTfAggregator {
     ///
     /// # Complexity
     /// O(1) per tick: one hash lookup + [`TF_COUNT`](crate::candles::TF_COUNT)
-    /// (a compile-time constant, 21) scalar folds. Zero heap allocation in
+    /// (a compile-time constant — read the symbol, do not quote a number: it
+    /// moved 21 → 24 on 2026-08-10) scalar folds. Zero heap allocation in
     /// steady state.
     pub fn consume_tick<F>(
         &mut self,

@@ -78,6 +78,48 @@ resource "aws_cloudwatch_metric_alarm" "dhan_live_lane_down" {
 }
 
 # ---------------------------------------------------------------------------
+# WHY THE TWO COUNTER ALARMS BELOW WATCH `{host}` ON A LABELLED METRIC
+# ---------------------------------------------------------------------------
+# Both counters carry Prometheus labels — `tv_dhan_ws_park_total` has
+# `endpoint` + `reason` (pool_supervisor.rs), `tv_ticks_dropped_total` has
+# `feed` (tick_persistence.rs) — yet both alarms declare `dimensions =
+# local.app_dimensions` (`{host}`). That looks like a dimension mismatch and
+# is not one.
+#
+# The CloudWatch agent's EMF processor publishes each selected metric under
+# the dimension sets named in its `metric_declaration`, and this deployment
+# declares exactly one: `"dimensions": [["host"]]`
+# (deploy/aws/cloudwatch-agent.json + user-data.sh.tftpl). Extra Prometheus
+# labels ride along as non-dimension EMF fields, so a labelled metric is
+# FOLDED to `{host}` — summed across its label values — before it reaches
+# CloudWatch. `{host}` is therefore its real and only dimension set.
+#
+# In-repo proof rather than assertion: when the 2026-07-06 silent-feed work
+# needed a per-feed dimension it had to ADD A SECOND declaration
+# (`[["host","feed"]]`), stating the reason verbatim — "host-only folding
+# would mask a Dhan storm under the Groww baseline". That declaration was
+# later retired; one `[["host"]]` declaration remains. Folding is exactly
+# what these two alarms want: any socket parking, any tick dropped, on any
+# label, must page.
+#
+# RECORDED BECAUSE IT WAS GOT WRONG HERE FIRST (2026-08-14, same day): a
+# round-2 edit to this file asserted the opposite as fact — "No datapoint is
+# ever published under {host} alone" — and shipped two log metric filters
+# deriving host-only series to work around a problem that does not exist.
+# That cost two duplicate paid series and broke the house rule in
+# seal-drop-alarm.tf ("re-point this alarm at the EMF-published metric and
+# remove the filter... to avoid paying for both series"), since both metrics
+# are already in the EMF allowlist. The filters were deleted and the alarms
+# restored to the raw EMF metric names.
+#
+# The lesson worth keeping is not about dimensions: a claim about how a
+# remote system behaves was written into a comment as established fact
+# without being checked against the config file two directories away that
+# answers it.
+#
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # 2. A socket has PARKED PERMANENTLY
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "dhan_socket_parked" {

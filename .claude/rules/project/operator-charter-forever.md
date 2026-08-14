@@ -89,7 +89,7 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 
 | Demand | Honest envelope (the truth) | Per-item proof |
 |---|---|---|
-| Zero data loss | Bounded zero loss inside chaos envelope: 200,000-seal ring buffer capacity (`SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ *(2026-07-18: the tick rescue ring + its capacity constant were deleted with the dead tick writer — the seal chain is the live absorption tier)* | item must not introduce new seal-drop path |
+| Zero data loss | Bounded zero loss inside chaos envelope: the derived seal-ring capacity `AGGREGATOR_MAX_SLOTS × TF_COUNT` (600,000 at TF_COUNT=24) (`SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ *(2026-07-18: the tick rescue ring + its capacity constant were deleted with the dead tick writer — the seal chain is the live absorption tier)* | item must not introduce new seal-drop path |
 | WS never disconnects | SEBI 24h JWT forces ≥1 reconnect/day BY LAW. DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close. | item must not break `SubscribeRxGuard` or pool watchdog |
 | Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns enqueue; tick-gap >30s coalesced Telegram; ~~core_affinity Core 0~~ **(CORRECTED 2026-08-10 — see note below)** | item must not add hot-path allocation |
 
@@ -160,7 +160,7 @@ When ANY PR body / commit message / Telegram message / docs writes "100% guarant
 
 > "100% inside the tested envelope, with ratcheted regression coverage:
 > ≤60s QuestDB outage absorbed by rescue→spill→DLQ;
-> ≤200,000-seal ring buffer capacity (constant `SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ;
+> the derived seal-ring capacity `AGGREGATOR_MAX_SLOTS × TF_COUNT` (600,000 at TF_COUNT=24 — never restate this as a literal: the docs said 200,000, then 525,000 at TF_COUNT=21, and TF_COUNT is now 24. Read the constant, do not quote a number) (constant `SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ;
 > bench-gated O(1) hot path;
 > composite-key uniqueness;
 > chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake.

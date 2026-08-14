@@ -545,6 +545,30 @@ pub struct TickWriter {
     last_capture_seq: i64,
 }
 
+/// Publish a zero on this feed's drop series before any row can be written.
+///
+/// The CloudWatch agent computes a counter's alarm value as the DELTA between
+/// consecutive samples and drops the first sample of a series it has never
+/// seen. `tv_ticks_dropped_total` increments ONLY when buffered rows are
+/// discarded on a flush failure, so without this the first drop episode IS the
+/// dropped baseline sample: it publishes no datapoint and
+/// `tv-<env>-ticks-dropped` (threshold 1, one 300s period) does not fire. A
+/// single backpressure episode — the ordinary shape — would be silently
+/// unwatched, which is the exact false-OK that alarm exists to prevent.
+///
+/// Registered per FEED, matching the emit site's label, because the agent
+/// baselines per Prometheus series and the EMF processor folds the labels to
+/// `{host}` afterwards by summing per-series deltas: an unregistered feed
+/// contributes nothing on the sample where it is born. Same discipline as
+/// `WalRingSink::pre_register`.
+///
+/// Called from EVERY constructor rather than just the production one — see
+/// [`TickWriter::for_test`] for why that is not merely tidiness. Idempotent:
+/// `increment(0)` on an already-registered series is a no-op.
+fn register_drop_baseline(feed: Feed) {
+    metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str()).increment(0);
+}
+
 impl TickWriter {
     /// Production constructor — ILP-over-HTTP, lazy on connect failure.
     #[must_use]
@@ -552,6 +576,7 @@ impl TickWriter {
     // exercised by tick_writer_new_is_lazy_and_buffers_without_network, and every
     // append/flush path is covered via for_test().
     pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {
+        register_drop_baseline(feed);
         match Sender::from_conf(ticks_ilp_http_conf(config)) {
             Ok(s) => {
                 let b = s.new_buffer();
@@ -581,9 +606,17 @@ impl TickWriter {
     }
 
     /// Test constructor — disconnected writer with an empty buffer.
+    ///
+    /// Registers the same baseline as [`TickWriter::new`], deliberately. This
+    /// is `pub` and NOT `#[cfg(test)]`-gated — it cannot be, because
+    /// `crates/app`'s own tests construct it across the crate boundary, where
+    /// `cfg(test)` does not reach. That makes it a real bypass of the drop
+    /// baseline if the registration lives only in `new`, so the registration
+    /// lives in one shared place that both constructors call.
     #[must_use]
     // TEST-EXEMPT: test-only helper used by the append/flush unit tests below.
     pub fn for_test(feed: Feed) -> Self {
+        register_drop_baseline(feed);
         Self {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
