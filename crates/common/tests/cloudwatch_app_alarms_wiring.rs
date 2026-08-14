@@ -564,10 +564,28 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // here rather than left to be discovered from a quiet dashboard.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
+    // 2026-08-14: 64 -> 65. ONE name added, `tv_dhan_ws_lag_excluded_total`,
+    // alongside the first live-socket delivery-lag measurement. Cost ~$0.30/mo
+    // against the $100 kill-ceiling — deliberate, not a drive-by.
+    //
+    // A SECOND name was added and then REMOVED again in the same change, and
+    // the reason is worth keeping: `tv_dhan_ws_lag_ms` is a HISTOGRAM. A
+    // Prometheus histogram is exposed as `_bucket{le=…}` / `_sum` / `_count`,
+    // and this selector is anchored `^(…)$`, so the bare name matches NOTHING.
+    // Adding it would have published no datapoint while looking correct in the
+    // diff — a false-OK, and one this list is especially prone to because every
+    // name in it today is a counter or a gauge. (`tv_order_fill_lag_seconds`
+    // reads like a counter-example but has ZERO source references: it is a dead
+    // selector entry, not a working histogram precedent.)
+    //
+    // The histogram is therefore NOT EMF-shipped. It lives on `/metrics` for
+    // the operator console to scrape. Shipping its buckets would also multiply
+    // cost by the bucket count × 16 connections, which is precisely the kind of
+    // cardinality this ratchet exists to make someone think about.
     assert_eq!(
         names.len(),
-        64,
-        "Z+ L2 VERIFY ratchet: expected exactly 55 names in the MAIN EMF \
+        65,
+        "Z+ L2 VERIFY ratchet: expected exactly 65 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \

@@ -707,20 +707,37 @@ impl LiveIngest {
     /// replayed frame reproduces the identical `capture_seq` and collapses onto
     /// the original row instead of duplicating it.
     ///
-    /// Packets 1..N mint a FRESH sequence from the same process-wide counter.
-    /// Those values are globally unique — they can never collide with any frame
-    /// sequence — but they are NOT reproducible: a replay that re-folded such a
-    /// frame would write duplicate rows for its 2nd..Nth packets. That is the
-    /// honest cost, and it is the right way round. A duplicate row is visible,
-    /// counted, and removable; a silently-dropped tick is neither. (Today
-    /// nothing re-folds from replay — recovery restores frames to the WAL
-    /// staging area — so the cost is latent rather than live.)
+    /// Packets 1..N derive theirs from the SAME frame sequence by OR-ing the
+    /// packet index into reserved low bits
+    /// (`ws_frame_spill::packet_capture_seq`), so every packet of a replayed
+    /// frame reproduces its original `capture_seq` exactly and collapses onto
+    /// the original row.
     ///
-    /// Arithmetic on the frame sequence was rejected: the counter is
-    /// wall-clock-nanosecond seeded with a `prev + 1` fallback under burst, so
-    /// consecutive frames can differ by exactly 1. There is no headroom to
-    /// carve a packet index into, and inventing some would trade a visible
-    /// duplicate for an invisible collision.
+    /// ## What this replaced, and why the old reasoning was wrong (2026-08-14)
+    ///
+    /// Until now packets 1..N minted a FRESH sequence from the process-wide
+    /// counter. Those values are globally unique, but they are NOT in the WAL
+    /// and cannot be regenerated — so a replay that re-folded such a frame
+    /// would write DUPLICATE rows for its 2nd..Nth packets. The comment here
+    /// argued that was "the right way round" because a duplicate row is
+    /// visible and a dropped tick is not.
+    ///
+    /// That trade was real but it was blocking the wrong thing: it made WAL
+    /// re-fold — the single largest CONTROLLABLE tick-loss path in the system —
+    /// unsafe to build. The premise it rested on was also wrong. It said
+    /// "there is no headroom to carve a packet index into", having considered
+    /// only MULTIPLYING the sequence (`frame_seq * MAX_PACKETS_PER_FRAME`),
+    /// which is indeed impossible: ≈1.786e18 × 70,000 ≈ 1.25e23 overflows
+    /// `i64::MAX` by four orders of magnitude and would refuse every tick.
+    ///
+    /// Reserving low bits in the SEED costs no headroom at all —
+    /// `(n >> 17) << 17` only clears bits, leaving the magnitude and the ≈5.16×
+    /// margin to `i64::MAX` unchanged. Uniqueness is structural: every frame
+    /// base ends in 17 zero bits and the base is strictly increasing, so one
+    /// frame's 131,072 packet slots cannot reach the next frame's base. The
+    /// old comment's fear — trading a visible duplicate for an invisible
+    /// collision — does not apply to a scheme where collisions are impossible
+    /// by construction rather than unlikely by argument.
     pub fn ingest_tick_at(
         &mut self,
         tick: &ParsedTick,
@@ -728,10 +745,29 @@ impl LiveIngest {
         packet_index: u32,
         recv_monotonic_millis: u64,
     ) -> IngestOutcome {
-        let frame_seq = if packet_index == 0 {
-            frame_seq
-        } else {
-            tickvault_storage::ws_frame_spill::next_frame_seq()
+        // REFUSE rather than fall back to a fresh sequence when the index does
+        // not fit: a fresh sequence is precisely the un-regenerable value this
+        // scheme exists to eliminate, so falling back would quietly restore the
+        // duplicate-on-replay defect while looking like it had worked.
+        let frame_seq = match tickvault_storage::ws_frame_spill::packet_capture_seq(
+            frame_seq,
+            u64::from(packet_index),
+        ) {
+            Some(seq) => seq,
+            None => {
+                self.seq_refused = self.seq_refused.saturating_add(1);
+                counters().ingest_seq_refused.increment(1);
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    frame_seq,
+                    packet_index,
+                    security_id = tick.security_id,
+                    "live tick refused: packet index exceeds the bits reserved in \
+                     capture_seq. The tick was NOT folded and NOT written — a counted \
+                     loss, never a fresh sequence that would duplicate on WAL replay."
+                );
+                return IngestOutcome::SeqUnrepresentable;
+            }
         };
         // Sequence FIRST: if we cannot stamp this row safely we must not touch
         // any fold state, or the aggregator would carry a tick that never
@@ -1760,6 +1796,16 @@ fn drain_main_feed_frame(
         }
         match dispatch_frame(&frame.bytes[offset..end], received_at_nanos) {
             Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _)) => {
+                // Delivery lag, per SOCKET. Recorded here because this is the
+                // only point where the exchange stamp, the receipt instant and
+                // the originating connection are all in hand.
+                //
+                // Only packet types that actually carry an LTT reach this arm —
+                // OI, PrevClose and MarketStatus decode to non-`Tick` variants
+                // and never appear here — so a missing timestamp is a garbage
+                // timestamp, not an absent one, and is EXCLUDED rather than
+                // recorded as zero.
+                record_ws_lag(frame.connection_index, &tick, received_at_nanos);
                 // `frame.seq` is per-FRAME, but `capture_seq` must be unique
                 // per ROW or two ticks in one message would collapse into one
                 // under the DEDUP key. The packet index is folded in.
@@ -1855,6 +1901,120 @@ pub struct DrainOutcome {
 /// deliberate policy ceiling, not the arithmetic consequence the old comment
 /// asserted.
 pub const MAX_PACKETS_PER_FRAME: u32 = 70_000;
+
+/// Prometheus histogram of exchange→receipt delivery lag on the LIVE socket.
+///
+/// The `_ms` suffix is load-bearing, not cosmetic: `observability.rs` matches
+/// `Matcher::Suffix("_ms")` to install the millisecond bucket set. A `_seconds`
+/// name renders as a summary with no `_bucket` series, and the panel would have
+/// nothing to read.
+pub const WS_LAG_HISTOGRAM: &str = "tv_dhan_ws_lag_ms";
+
+/// Ticks deliberately EXCLUDED from the lag histogram, by reason.
+///
+/// Counted rather than recorded-as-zero. A packet with no usable exchange
+/// timestamp is not a zero-latency tick, and folding it in as `0.0` would drag
+/// every percentile toward zero and make a degrading feed look like it was
+/// getting faster.
+pub const WS_LAG_EXCLUDED_COUNTER: &str = "tv_dhan_ws_lag_excluded_total";
+
+/// Delivery lag in milliseconds, or `None` when this tick must be EXCLUDED.
+///
+/// # The offset rule this encodes
+///
+/// `ParsedTick::exchange_timestamp` is **IST epoch seconds** — IST wall-clock
+/// rendered as an epoch — while `received_at_nanos` is true UTC epoch nanos.
+/// To compare them the exchange stamp must have the IST offset **SUBTRACTED**:
+///
+/// ```text
+/// lag_ms = received_ms − (ltt_secs − 19_800) × 1000
+/// ```
+///
+/// Adding the offset is the single most destructive mistake available here —
+/// `data-integrity.md` calls the WebSocket timestamp rule "THE SINGLE MOST
+/// CRITICAL DATA INTEGRITY RULE" — and it would not look broken: it would
+/// report a steady 39,600,000 ms (11 h) lag, which a reader could mistake for a
+/// unit bug rather than a sign error. A test pins the exact zero case.
+///
+/// # Why `None` rather than a number
+///
+/// - `ltt < MIN_PLAUSIBLE_EXCHANGE_TS_SECS` — a zero or garbage stamp would
+///   render as a ~55-year lag and destroy every percentile in the bucket set.
+/// - Packets carrying no LTT at all (OI code 5, PrevClose 6, MarketStatus 7)
+///   never reach this function; only ticker (2), quote (4) and full (8) parsers
+///   populate `exchange_timestamp`.
+///
+/// # The ±1 s floor, stated where it is computed
+///
+/// Dhan sends LTT as whole SECONDS. Truncation alone therefore makes a tick
+/// look up to ~1 s early, so a genuinely-fast delivery can compute NEGATIVE.
+/// Negatives clamp to zero and are counted separately — never recorded as a
+/// negative, and never claimed as sub-second precision. This measures outages
+/// and drift honestly; it cannot measure microseconds, and no arithmetic here
+/// can recover precision the vendor never transmitted.
+#[must_use]
+pub fn ws_lag_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<WsLag> {
+    if exchange_timestamp
+        < tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+    {
+        return None;
+    }
+    let ltt_utc_secs = i64::from(exchange_timestamp)
+        - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+    let received_ms = received_at_nanos / 1_000_000;
+    let lag_ms = received_ms - ltt_utc_secs.saturating_mul(1_000);
+    if lag_ms < 0 {
+        return Some(WsLag::ClampedNegative);
+    }
+    // i64 -> f64 loses precision only above 2^53, which is ~285,000 YEARS
+    // expressed in milliseconds. Every value reaching here is a delivery lag,
+    // bounded in practice by the reconnect ladder and in principle by the
+    // plausibility floor above, so the lossy range is unreachable. The metrics
+    // crate takes f64, so the conversion is required, not incidental.
+    // APPROVED: lossy range (>2^53 ms ~ 285,000 years) is unreachable for a lag.
+    #[allow(clippy::cast_precision_loss)]
+    Some(WsLag::Measured(lag_ms as f64))
+}
+
+/// Record one tick's delivery lag against the socket it arrived on.
+///
+/// Labelled by `connection`, not by instrument. That is a cost decision with a
+/// hard number behind it: at the ~4,565-instrument live universe a per-instrument
+/// label would be ~4,565 CloudWatch series ≈ $1,369/mo, against a budget whose
+/// automatic action is `STOP_EC2_INSTANCES` — the observability feature would
+/// stop the trading box. Sixteen connection slots is ≈$4.80/mo.
+///
+/// It is also the more useful cut. Per-instrument lag is dominated by how often
+/// that instrument TRADES (LTT is last-trade time, so a thin option is
+/// legitimately minutes stale and would page constantly); per-socket lag
+/// isolates the thing we can act on — one connection delivering late.
+fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos: i64) {
+    match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
+        Some(WsLag::Measured(ms)) => {
+            metrics::histogram!(WS_LAG_HISTOGRAM, "connection" => connection_index.to_string())
+                .record(ms);
+        }
+        Some(WsLag::ClampedNegative) => {
+            metrics::histogram!(WS_LAG_HISTOGRAM, "connection" => connection_index.to_string())
+                .record(0.0);
+            metrics::counter!(WS_LAG_EXCLUDED_COUNTER, "reason" => "clamped_negative").increment(1);
+        }
+        None => {
+            metrics::counter!(WS_LAG_EXCLUDED_COUNTER, "reason" => "implausible_ltt").increment(1);
+        }
+    }
+}
+
+/// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WsLag {
+    /// A real, non-negative lag in milliseconds.
+    Measured(f64),
+    /// The arithmetic came out negative — whole-second truncation, or a host
+    /// clock behind the exchange. Recorded as zero and counted, so a clock
+    /// problem shows up as a rising counter instead of a silently skewed p50.
+    ClampedNegative,
+}
 
 /// Byte length of the main-feed packet starting at `bytes`, from its response
 /// code. `None` for an unknown code or a header too short to classify.
@@ -2187,6 +2347,10 @@ fn dial_planned_connections(
             Arc::clone(ring_budget),
             WsType::LiveFeed,
             endpoint,
+            // `global_index` (0..16), not `pool_index` — pool indices repeat
+            // across endpoints, so labelling by them would merge main-feed
+            // socket 0 with depth-20 socket 0 and hide which one is sick.
+            planned.slot.global_index,
         ));
         let guard = planned.guard;
         tokio::spawn(async move {
@@ -2819,6 +2983,76 @@ mod tests {
     // what pins that the pre-open cannot page.
     use std::collections::BTreeSet;
     use std::time::Instant;
+
+    /// A real NSE-session second, well past the plausibility floor.
+    const LTT_IST_SECS: u32 = 1_772_073_900;
+
+    /// The UTC nanosecond instant that is EXACTLY simultaneous with
+    /// `LTT_IST_SECS` — i.e. zero delivery lag.
+    const SIMULTANEOUS_RECV_NANOS: i64 = (LTT_IST_SECS as i64 - 19_800) * 1_000_000_000;
+
+    #[test]
+    fn ws_lag_ms_subtracts_the_ist_offset_and_never_adds_it() {
+        // THE test. `data-integrity.md` calls the WebSocket timestamp rule the
+        // single most critical data-integrity rule in the repo: the exchange
+        // stamp is IST-epoch, so comparing it to a UTC clock requires
+        // SUBTRACTING 19,800 s. Adding instead would not look obviously broken
+        // — it would report a steady 11-hour lag, which reads like a unit bug
+        // rather than a sign error, and every percentile would be garbage.
+        assert_eq!(
+            ws_lag_ms(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS),
+            Some(WsLag::Measured(0.0)),
+            "a simultaneous tick must measure exactly zero lag"
+        );
+
+        // Pin the magnitude a sign error would produce, so the failure message
+        // names the actual mistake instead of just showing two numbers.
+        let wrong_direction = SIMULTANEOUS_RECV_NANOS + 2 * 19_800 * 1_000_000_000;
+        assert_eq!(
+            ws_lag_ms(LTT_IST_SECS, wrong_direction),
+            Some(WsLag::Measured(39_600_000.0)),
+            "39,600,000 ms = 11 h is the signature of a +19800 sign error"
+        );
+    }
+
+    #[test]
+    fn ws_lag_ms_measures_a_real_delay_in_milliseconds() {
+        let recv = SIMULTANEOUS_RECV_NANOS + 250 * 1_000_000;
+        assert_eq!(ws_lag_ms(LTT_IST_SECS, recv), Some(WsLag::Measured(250.0)));
+        // The 46-second class this feed was retired for must render honestly.
+        let recv_slow = SIMULTANEOUS_RECV_NANOS + 46_370 * 1_000_000;
+        assert_eq!(
+            ws_lag_ms(LTT_IST_SECS, recv_slow),
+            Some(WsLag::Measured(46_370.0))
+        );
+    }
+
+    #[test]
+    fn ws_lag_ms_clamps_a_negative_rather_than_recording_it() {
+        // Dhan sends LTT as whole SECONDS, so truncation alone can make a fast
+        // delivery compute negative. Recording a negative would corrupt the
+        // histogram; silently dropping it would hide a genuinely wrong host
+        // clock. Clamp AND count is the only honest option.
+        let early = SIMULTANEOUS_RECV_NANOS - 900 * 1_000_000;
+        assert_eq!(ws_lag_ms(LTT_IST_SECS, early), Some(WsLag::ClampedNegative));
+    }
+
+    #[test]
+    fn ws_lag_ms_excludes_an_implausible_timestamp_instead_of_recording_zero() {
+        // A zero or garbage LTT is not a zero-latency tick. Folding it in as
+        // 0.0 would drag every percentile toward zero and make a DEGRADING
+        // feed look like it was getting faster — the false-OK class rule 11
+        // forbids. `None` means the caller counts it as excluded.
+        for garbage in [0u32, 1, 1_599_999_999] {
+            assert_eq!(
+                ws_lag_ms(garbage, SIMULTANEOUS_RECV_NANOS),
+                None,
+                "LTT {garbage} is below the plausibility floor and must be excluded"
+            );
+        }
+        // The floor itself is inclusive-valid.
+        assert!(ws_lag_ms(1_600_000_000, SIMULTANEOUS_RECV_NANOS).is_some());
+    }
     use tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
     use tickvault_common::types::SecurityId;
 
@@ -3905,6 +4139,7 @@ mod tests {
         tx.send(CapturedFrame {
             seq: 42,
             endpoint: DhanEndpointType::MainFeed,
+            connection_index: 0,
             bytes: bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, 1_779_355_000)),
         })
         .await
@@ -3970,6 +4205,7 @@ mod tests {
         tx.send(CapturedFrame {
             seq: 7,
             endpoint: DhanEndpointType::MainFeed,
+            connection_index: 0,
             bytes: bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, 1_779_355_000)),
         })
         .await
@@ -4026,6 +4262,7 @@ mod tests {
         tx.send(CapturedFrame {
             seq: 1,
             endpoint: DhanEndpointType::Depth20,
+            connection_index: 5,
             bytes: bytes::Bytes::from_static(&[0x0C, 0x00, 0x29, 0x00, 0x0D, 0x00, 0x00, 0x00]),
         })
         .await

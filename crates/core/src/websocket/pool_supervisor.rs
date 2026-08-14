@@ -890,6 +890,14 @@ pub struct CapturedFrame {
     /// depth packet as unparseable. Carrying the endpoint makes that mistake
     /// impossible to make by accident.
     pub endpoint: DhanEndpointType,
+    /// WHICH socket of that endpoint's pool, `0..MAX_TOTAL_DHAN_CONNECTIONS`.
+    ///
+    /// `endpoint` alone cannot answer "is ONE socket sick?" — it folds all five
+    /// main-feed connections into a single identity, so a socket delivering
+    /// minutes-late ticks would be averaged away by its four healthy siblings.
+    /// A `u8` alongside the existing enum adds no allocation: `Bytes` remains
+    /// the only heap member of this struct.
+    pub connection_index: u8,
     /// The frame exactly as it arrived. Never parsed on the read task.
     pub bytes: Bytes,
 }
@@ -1009,6 +1017,9 @@ pub struct WalRingSink {
     budget: std::sync::Arc<RingByteBudget>,
     ws_type: WsType,
     endpoint: DhanEndpointType,
+    /// Which socket of the pool this sink serves; stamped onto every frame
+    /// so a single sick connection cannot be averaged away by its siblings.
+    connection_index: u8,
     /// Loss counters resolved ONCE at construction — see the note on
     /// [`WalRingSink::new`] for why the macro form is banned on this path.
     wal_dropped: metrics::Counter,
@@ -1042,6 +1053,7 @@ impl WalRingSink {
         budget: std::sync::Arc<RingByteBudget>,
         ws_type: WsType,
         endpoint: DhanEndpointType,
+        connection_index: u8,
     ) -> Self {
         let endpoint_label = endpoint.as_str();
         let sink = Self {
@@ -1050,6 +1062,7 @@ impl WalRingSink {
             budget,
             ws_type,
             endpoint,
+            connection_index,
             wal_dropped: metrics::counter!(WAL_DROP_METRIC, "endpoint" => endpoint_label),
             ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
             ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
@@ -1110,6 +1123,7 @@ impl FrameSink for WalRingSink {
             .try_send(CapturedFrame {
                 seq,
                 endpoint: self.endpoint,
+                connection_index: self.connection_index,
                 bytes: frame,
             })
             .is_err()
@@ -2341,6 +2355,7 @@ mod tests {
             std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
@@ -2373,6 +2388,7 @@ mod tests {
             std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         let frame = Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0]);
@@ -2407,6 +2423,7 @@ mod tests {
             std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         assert_eq!(
@@ -2513,6 +2530,7 @@ mod tests {
             std::sync::Arc::clone(&budget),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         assert_eq!(
@@ -2558,6 +2576,7 @@ mod tests {
             std::sync::Arc::clone(&budget),
             WsType::LiveFeed,
             DhanEndpointType::MainFeed,
+            0,
         );
 
         for _ in 0..2 {
