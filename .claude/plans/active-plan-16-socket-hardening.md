@@ -446,3 +446,74 @@ that number by exactly zero; (c) detection of a tick Dhan never sent — their I
 carries no sequence number and no snapshot-on-subscribe, so upstream loss stays invisible
 at the protocol level; (d) that the lane has been exercised at 4,565 instruments — it has
 not, on any day, and the first live session at that scale remains the measured gate.
+
+---
+
+## ITEMS 15–21 (added 2026-08-14) — operator: "Solve and fix all these also dude okay!"
+
+Given in DIRECT response to the six-agent audit table naming these findings. No new
+scope: no socket beyond the authorized 16, no universe widening, `dry_run` untouched,
+§28 frozen area untouched. Every item repairs code already landed.
+
+**15 — Frame cap sized off the wrong quantity (CRITICAL).**
+`MAIN_FEED_MAX_FRAME_BYTES = 256 KiB`, justified in its own comment by a *subscribe
+batch* of 100 instruments (~16 KiB). The subscribe batch has nothing to do with how many
+packets Dhan coalesces into one WebSocket message. A socket carries up to 5,000
+instruments; 5,000 × 162 B Full = 810 KiB. On overflow `Error::Capacity` maps to
+`reason="oversize"` and returns `SocketEvent::Closed`, so the ladder reconnects,
+resubscribes, and the burst repeats — a permanent reconnect loop precisely at 09:15.
+Fix: size the cap from `instruments_per_connection × max_packet_bytes` with headroom,
+and pin the derivation so it cannot drift from the subscribe-batch reasoning again.
+
+**16 — The 16 second-scale timeframes are NOT gated (CRITICAL).**
+`tf_index.rs` documents them as "GDF-feed-gated, zero rows until the GDF 1s live feed
+lands". No gate exists — every tick path iterates `TfIndex::ALL` unconditionally, so a
+Dhan tick opens AND seals S1..S30. At scale that is ~70 GB/day onto a 100 GB disk. Fix:
+make the documented gate real, per feed, defaulting to the documented behaviour.
+
+**17 — No shutdown teardown; the day's tail is lost silently (HIGH).**
+The lane's handle is bound to `_dhan_feed_stack_monitor` and the shutdown path's Dhan
+steps were "deleted with the lane" — the lane returned, the teardown did not. Nothing
+closes the sockets, so the ring never closes, so the drain never breaks, so the final
+`ingest.flush()` never runs. Sub-threshold ILP rows and open candle state evaporate while
+the log prints "tickvault stopped" and classifies the shutdown clean. **This is losing
+data today**, in Quote mode, at 4,565 instruments. Fix: signal the lane on shutdown and
+flush before exit.
+
+**18 — 804 misclassified as Transient (HIGH).** `classify_disconnect`'s catch-all sends
+"instruments exceed limit" onto the infinite reconnect ladder, re-sending the identical
+over-limit set every 30s forever. Fix: classify as Fatal → park (the park now pages).
+
+**19 — 250 subscribe messages with zero pacing (HIGH).** Dhan documents no subscribe
+rate limit, and 805's own text says "too many requests … may result in user being
+blocked". We send the account's maximum possible subscribe volume as fast as the socket
+accepts writes, on five sockets at once. Fix: a small inter-message delay and per-slot
+connect stagger.
+
+**20 — Seal ring evicts OLDEST (HIGH).** For a current-day store, drop-oldest destroys
+the morning. Recorded; fix is a policy decision (drop-newest + loud counter) that needs
+its own review, so it is FLAGGED here rather than silently changed.
+
+**21 — QuestDB tuned for TCP 9009 while every writer uses HTTP 9000 (MED).** Five
+`QDB_LINE_TCP_*` knobs tune a receiver nothing connects to; there is zero `line.http.*`
+tuning. Fix: tune the transport actually in use, or move to ILP/TCP deliberately.
+
+## Items 15–21 Edge Cases / Failure Modes / Test Plan / Rollback / Observability
+
+Edge cases: a raised frame cap must not mask a genuinely runaway frame (keep a ceiling
+and count refusals); the TF gate must not silently disable timeframes a feed legitimately
+produces; shutdown flush must be bounded so a hung QuestDB cannot block SIGTERM past
+systemd's timeout. Failure modes: flush-on-shutdown fails → coded error, never a silent
+clean exit. Test plan: unit tests for the cap derivation and the 804 classification; a
+source-order pin that the shutdown path signals the lane; bite-proofs for each guard.
+Rollback: every item is independently revertable; 15/18 are constant changes, 17 is
+additive. Observability: refusal counters already exist for oversize frames; the shutdown
+flush gets an explicit outcome log.
+
+## Items 15–21 Honest envelope
+
+NOT claimed: that any of this has been exercised at 25,000 instruments or in Full mode —
+neither has ever run. Item 15's 810 KiB figure is arithmetic from the documented packet
+size and per-connection cap, not an observed frame. Item 16's ~70 GB/day is arithmetic
+from row sizes, not a measurement. The measured evidence remains ~3,000 ticks/sec
+aggregate in QUOTE mode; there is no Full-mode measurement in the repository at all.
