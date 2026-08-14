@@ -200,6 +200,42 @@ pub struct TokenManager {
     /// std Mutex, poisoning-safe reads (`unwrap_or_else(into_inner)`),
     /// cold path only.
     last_mint_attempt: std::sync::Mutex<Option<std::time::Instant>>,
+    /// SINGLE-FLIGHT gate for the whole renew-or-mint sequence (2026-08-14).
+    ///
+    /// ## The stampede this closes
+    ///
+    /// Every one of the up-to-16 live-feed connection closures calls
+    /// `force_renewal()` on a 807 (token expired), and a 807 is not a tail
+    /// event — the JWT expires every 24 h by regulation, so this path executes
+    /// **daily**. Before this gate, all sixteen raced:
+    ///
+    /// 1. `try_renew_token` was deliberately UNGATED, on the stated reasoning
+    ///    that "renewing our own active token harms nothing". That reasoning
+    ///    was **wrong**: Dhan's own documentation (Verified live 2026-07-14,
+    ///    `.claude/rules/dhan/authentication.md` rule 5) states RenewToken
+    ///    "expires your current token and provides you with a new token", and
+    ///    Dhan permits **one active token at a time**. Sixteen concurrent
+    ///    renewals therefore mint sixteen tokens, each invalidating the last,
+    ///    and every socket that already re-dialled with an earlier one gets
+    ///    807 again — a self-sustaining token war.
+    /// 2. The mint cooldown that guarded the FALLBACK was a check-then-act
+    ///    across an `.await`: the gate was read in `renew_with_fallback` and
+    ///    the stamp written later inside `acquire_token`, so two callers could
+    ///    both observe "no recent attempt" and both proceed.
+    ///
+    /// Holding this gate across the entire sequence makes the cooldown read
+    /// and its stamp atomic with respect to each other, which fixes (2) as a
+    /// side effect of fixing (1).
+    ///
+    /// A `tokio::Mutex` (not `std`) because the guarded region awaits network
+    /// I/O. Cold path — contention here is at most 16 callers once a day.
+    renew_gate: tokio::sync::Mutex<()>,
+    /// Bumped once per SUCCESSFUL token replacement. A caller samples this
+    /// before queueing on [`Self::renew_gate`]; if it has moved by the time
+    /// the gate is acquired, some other caller already produced a fresh token
+    /// and this caller returns success WITHOUT issuing its own request. That
+    /// is what turns sixteen renewals into one.
+    renew_generation: std::sync::atomic::AtomicU64,
 }
 
 impl TokenManager {
@@ -300,6 +336,8 @@ impl TokenManager {
             notifier: Arc::clone(notifier),
             instance_lock_held,
             last_mint_attempt: std::sync::Mutex::new(None),
+            renew_gate: tokio::sync::Mutex::new(()),
+            renew_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         // Fast path: try loading a cached token from a previous run.
@@ -842,6 +880,11 @@ impl TokenManager {
 
         let token_state = TokenState::from_generate_response(&body);
         self.token.store(Arc::new(Some(token_state)));
+        // Single-flight bookkeeping (2026-08-14): publish that a fresh token
+        // now exists, so any caller queued on `renew_gate` returns success
+        // instead of issuing a request that would invalidate this one.
+        self.renew_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
 
         // Cache for fast restart on crash recovery
         self.save_current_token_to_cache();
@@ -930,6 +973,12 @@ impl TokenManager {
 
         let new_token_state = TokenState::from_generate_response(&body);
         self.token.store(Arc::new(Some(new_token_state)));
+        // Single-flight bookkeeping (2026-08-14) — see the sibling bump in
+        // `acquire_token`. RenewToken REPLACES the token (Dhan: "expires your
+        // current token and provides you with a new token"), so a successful
+        // renewal is exactly as much a new-token event as a mint is.
+        self.renew_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
 
         // Update cache for fast restart
         self.save_current_token_to_cache();
@@ -950,10 +999,46 @@ impl TokenManager {
     /// (prefix [`MINT_COOLDOWN_REFUSAL_REASON_PREFIX`]) instead of hitting
     /// Dhan — closing the AG5-R2-1 residual where the watchdog, the GAP-02
     /// 900s sweep and the renewal loop could double-mint inside Dhan's
-    /// ~125s window. `RenewToken` itself is NEVER gated (renewing our own
-    /// active token harms nothing), and the boot-time `initialize` retry
-    /// loop calls `acquire_token` directly — deliberately ungated.
+    /// ~125s window. The boot-time `initialize` retry loop calls
+    /// `acquire_token` directly — deliberately ungated.
+    ///
+    /// **CORRECTED 2026-08-14.** This comment previously read "`RenewToken`
+    /// itself is NEVER gated (renewing our own active token harms nothing)".
+    /// That premise is false, and it is the reason the 807 stampede existed.
+    /// Dhan's documentation (Verified live 2026-07-14,
+    /// `.claude/rules/dhan/authentication.md` rule 5) states RenewToken
+    /// "expires your current token and provides you with a new token", and
+    /// Dhan permits ONE active token at a time — so a renewal is a
+    /// token-REPLACEMENT event, and sixteen concurrent ones mint sixteen
+    /// tokens that each invalidate the last. Both the renewal and the fallback
+    /// mint now run under the single-flight [`Self::renew_gate`].
     async fn renew_with_fallback(&self) -> Result<(), ApplicationError> {
+        // SINGLE-FLIGHT (2026-08-14). Sample the generation BEFORE queueing,
+        // then take the gate. Sixteen sockets hitting 807 within milliseconds
+        // of each other now produce ONE renewal: the first through the gate
+        // does the work, the other fifteen wake, observe the generation has
+        // moved, and return that caller's success as their own.
+        let seen_generation = self
+            .renew_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let _flight = self.renew_gate.lock().await;
+        let current_generation = self
+            .renew_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if current_generation != seen_generation {
+            // Someone else renewed while we queued. Issuing our own request
+            // now would INVALIDATE the token they just installed — the exact
+            // war this gate exists to end.
+            metrics::counter!("tv_token_renew_coalesced_total").increment(1);
+            tracing::debug!(
+                seen_generation,
+                current_generation,
+                "token renewal coalesced — another caller already installed a fresh token \
+                 while this one queued, so no second request was issued"
+            );
+            return Ok(());
+        }
+
         match self.try_renew_token().await {
             Ok(()) => Ok(()),
             Err(renew_err) => {
@@ -1437,6 +1522,8 @@ impl TokenManager {
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held,
             last_mint_attempt: std::sync::Mutex::new(None),
+            renew_gate: tokio::sync::Mutex::new(()),
+            renew_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -1512,6 +1599,72 @@ mod tests {
     /// test-only construction lives in one place.
     fn make_test_manager(initial_token: Option<TokenState>) -> Arc<TokenManager> {
         TokenManager::new_for_test(initial_token)
+    }
+
+    /// Single-flight proof (2026-08-14): a caller that queues on the renewal
+    /// gate while another caller installs a fresh token must return success
+    /// WITHOUT issuing its own request.
+    ///
+    /// This is the 807 token-stampede scenario in miniature. Up to 16 live
+    /// connection closures call `force_renewal()` within milliseconds of each
+    /// other every time the JWT expires — which is daily, by regulation. Dhan
+    /// permits ONE active token and RenewToken *replaces* it, so sixteen
+    /// concurrent renewals mint sixteen tokens, each invalidating the last.
+    ///
+    /// The test is constructed so that a network attempt CANNOT be mistaken
+    /// for success: the manager's base URLs point at `example.com`, so any
+    /// caller that actually reaches the request path fails. `Ok(())` is
+    /// therefore only reachable via the coalescing branch.
+    #[tokio::test]
+    async fn test_renewal_coalesces_instead_of_stampeding() {
+        let manager = make_test_manager(None);
+
+        // Occupy the gate so the caller below is forced to queue, exactly as
+        // the 2nd..16th socket would while the 1st is mid-renewal.
+        let held = manager.renew_gate.lock().await;
+
+        let follower = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.renew_with_fallback().await })
+        };
+
+        // Let the follower sample the generation and park on the gate.
+        tokio::task::yield_now().await;
+
+        // The "leader" completes: a fresh token now exists.
+        manager
+            .renew_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        drop(held);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), follower)
+            .await
+            .expect("the coalesced caller must not hang on the gate")
+            .expect("the follower task must not panic");
+
+        assert!(
+            outcome.is_ok(),
+            "a caller that queued while another installed a fresh token must coalesce and \
+             return success; instead it returned {outcome:?}. Any network attempt here would \
+             have failed against example.com, so an Err means the follower issued its OWN \
+             renewal — which is the stampede that invalidates the leader's token."
+        );
+    }
+
+    /// The companion: with NO concurrent renewal, the generation is unchanged
+    /// and the caller must NOT coalesce — it has to do the real work. Without
+    /// this, a bug that always-coalesces would look like a pass above while
+    /// silently never renewing anything.
+    #[tokio::test]
+    async fn test_renewal_does_not_coalesce_when_nobody_else_renewed() {
+        let manager = make_test_manager(None);
+        let outcome = manager.renew_with_fallback().await;
+        assert!(
+            outcome.is_err(),
+            "with no competing renewal the caller must take the real path (which fails here \
+             because the base URL is unroutable); an Ok would mean the gate coalesces \
+             unconditionally and no token is ever actually refreshed"
+        );
     }
 
     /// SEC-C2-2 ratchet (2026-07-07): every PRODUCTION `reqwest::Client`
@@ -2218,6 +2371,8 @@ mod tests {
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
             last_mint_attempt: std::sync::Mutex::new(None),
+            renew_gate: tokio::sync::Mutex::new(()),
+            renew_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2612,6 +2767,8 @@ mod tests {
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
             last_mint_attempt: std::sync::Mutex::new(None),
+            renew_gate: tokio::sync::Mutex::new(()),
+            renew_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2887,6 +3044,8 @@ mod tests {
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
             last_mint_attempt: std::sync::Mutex::new(None),
+            renew_gate: tokio::sync::Mutex::new(()),
+            renew_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         let handle = manager.spawn_renewal_task();
@@ -3063,6 +3222,8 @@ mod tests {
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
             last_mint_attempt: std::sync::Mutex::new(None),
+            renew_gate: tokio::sync::Mutex::new(()),
+            renew_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -3128,6 +3289,8 @@ mod tests {
             notifier: crate::notification::service::NotificationService::disabled(),
             instance_lock_held: None,
             last_mint_attempt: std::sync::Mutex::new(None),
+            renew_gate: tokio::sync::Mutex::new(()),
+            renew_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
