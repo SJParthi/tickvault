@@ -174,7 +174,29 @@ pub fn classify_disconnect(code: Option<DisconnectCode>) -> DisconnectClass {
         Some(
             DisconnectCode::DataApiSubscriptionRequired
             | DisconnectCode::AuthenticationFailed
-            | DisconnectCode::ClientIdInvalid,
+            | DisconnectCode::ClientIdInvalid
+            // 804 — "Requested number of instruments exceeds limit."
+            //
+            // MOVED here from the `_ => Transient` catch-all on 2026-08-14.
+            // Transient means "retry on the ladder", and retrying 804 re-sends
+            // the IDENTICAL over-limit subscribe set that was just rejected —
+            // forever, every 30s at the ladder's cap. Nothing in that loop can
+            // ever succeed, because nothing about the request changes between
+            // attempts. It is a request-shaped error wearing a transport-code
+            // costume, and the catch-all could not tell the difference.
+            //
+            // Worse, it is self-amplifying in exactly the direction that hurts
+            // most: a permanent connect/subscribe/reject cycle is precisely
+            // the traffic pattern 805 describes as "too many requests", whose
+            // documented consequence is the USER being blocked — so retrying
+            // one account-level rejection can earn another.
+            //
+            // Fatal parks the socket, and since 2026-08-14 a park is no longer
+            // silent: it emits a coded error naming the endpoint and slot, and
+            // `tv_dhan_ws_park_total` has an alarm. So this turns an invisible
+            // infinite loop into one page that names the real problem —
+            // somebody asked for more instruments than the endpoint allows.
+            | DisconnectCode::InstrumentsExceedLimit,
         ) => DisconnectClass::Fatal,
         _ => DisconnectClass::Transient,
     }
@@ -1571,6 +1593,28 @@ mod tests {
         assert_eq!(
             classify_disconnect(Some(DisconnectCode::InternalServerError)),
             DisconnectClass::Transient
+        );
+    }
+
+    /// 804 must NOT ride the reconnect ladder (2026-08-14 regression pin).
+    ///
+    /// "Requested number of instruments exceeds limit" is a REQUEST error
+    /// wearing a transport-code costume. Retrying it re-sends the identical
+    /// over-limit subscribe set that was just rejected, forever, every 30s at
+    /// the ladder's cap — nothing about the request changes between attempts,
+    /// so nothing in that loop can ever succeed.
+    ///
+    /// It is also self-amplifying in the worst direction: a permanent
+    /// connect/subscribe/reject cycle is exactly the traffic 805 calls "too
+    /// many requests", whose documented consequence is the USER being blocked.
+    /// So retrying one account-level rejection can earn another.
+    #[test]
+    fn test_classify_disconnect_804_is_fatal_not_an_infinite_retry() {
+        assert_eq!(
+            classify_disconnect(Some(DisconnectCode::InstrumentsExceedLimit)),
+            DisconnectClass::Fatal,
+            "804 (instruments exceed limit) must PARK, not retry. Transient here means \
+             re-sending the same rejected subscribe set every 30s forever."
         );
     }
 

@@ -98,7 +98,7 @@ use zeroize::Zeroizing;
 // the heap after the dial.
 pub use zeroize::Zeroizing as FeedTokenBuffer;
 
-use super::pool_budget::DhanEndpointType;
+use super::pool_budget::{DhanEndpointType, MAIN_FEED_INSTRUMENTS_PER_CONNECTION};
 use super::pool_supervisor::{DhanFeedSocket, SocketEvent, SocketFailure, SubscribeInstrument};
 use super::subscription_builder::{
     build_subscription_messages, build_twenty_depth_subscription_messages,
@@ -117,15 +117,43 @@ const MAIN_FEED_LARGEST_PACKET_BYTES: usize = 162;
 
 /// Ceiling on a main-feed WebSocket message.
 ///
-/// Sizing: the largest documented main-feed packet is 162 bytes
-/// ([`MAIN_FEED_LARGEST_PACKET_BYTES`]) and a subscribe message is capped at
-/// 100 instruments, so even a hypothetical fully-batched burst of one Full
-/// packet per instrument in a single subscribe batch is ~16 KiB. 256 KiB is
-/// **~1,618 Full packets in one message** — roughly 16× that already
-/// implausible worst case, and 256× smaller than the library default this
-/// replaces. Generous enough that no legitimate Dhan behaviour can trip it,
-/// finite enough that sixteen hostile sockets cost ≤ 5 MiB rather than 1 GiB.
-pub const MAIN_FEED_MAX_FRAME_BYTES: usize = 256 * 1024;
+/// ## CORRECTED 2026-08-14 — the previous sizing measured the wrong thing
+///
+/// This constant was 256 KiB, justified as follows (quoted from the comment it
+/// replaces, because the error is instructive rather than careless):
+///
+/// > "a subscribe message is capped at 100 instruments, so even a hypothetical
+/// > fully-batched burst of one Full packet per instrument in a single
+/// > subscribe batch is ~16 KiB"
+///
+/// The arithmetic is correct. The **quantity is not**. How many instruments we
+/// name in one *subscribe request* has nothing to do with how many *data
+/// packets* Dhan coalesces into one WebSocket message on the way back. The
+/// binding number is instruments **per connection**, which is
+/// [`MAIN_FEED_INSTRUMENTS_PER_CONNECTION`] = 5,000 — fifty times the
+/// subscribe-batch figure the old sizing reasoned from.
+///
+/// Why it matters, concretely: at 5,000 instruments × 162 B, one message
+/// carrying a single Full packet per instrument is **~810 KiB**, three times
+/// the old cap. That burst is not exotic — it is what the vendor's queued
+/// backlog looks like at 09:15 after a quiet pre-open. Exceeding the cap
+/// raises `Error::Capacity`, which this module maps to `reason="oversize"` and
+/// returns as `SocketEvent::Closed`, so the supervisor reconnects,
+/// re-subscribes all 5,000, and the same backlog arrives again: a permanent
+/// reconnect loop at market open, on a metric with no alarm, while
+/// `tv_dhan_feed_stack_up` still reads 1.0 because the other sockets are fine.
+///
+/// The cap is now DERIVED from the two facts that actually bound it rather
+/// than written as a literal, so it cannot drift back to a subscribe-batch
+/// rationale. `×2` headroom covers coalescing that exceeds one packet per
+/// instrument in a single message; the result is ~1.6 MiB.
+///
+/// Still finite, deliberately: this is a defence against a hostile or
+/// malfunctioning peer, so it must remain a ceiling. Sixteen sockets at this
+/// cap is ~26 MiB of worst-case buffering — larger than the old ~5 MiB, and
+/// still nowhere near the 64 MiB-per-socket library default this replaces.
+pub const MAIN_FEED_MAX_FRAME_BYTES: usize =
+    MAIN_FEED_LARGEST_PACKET_BYTES * (MAIN_FEED_INSTRUMENTS_PER_CONNECTION as usize) * 2;
 
 /// Ceiling on a depth-20 WebSocket message.
 ///
@@ -1285,6 +1313,45 @@ mod tests {
 
     // -- frame caps ---------------------------------------------------------
 
+    /// The main-feed cap must admit the burst a FULLY-SUBSCRIBED connection
+    /// can produce, not the burst a single subscribe batch describes.
+    ///
+    /// This is the 2026-08-14 regression pin. The old cap was 256 KiB, sized
+    /// from "a subscribe message is capped at 100 instruments … ~16 KiB". A
+    /// connection carries up to 5,000 instruments, so one message with a
+    /// single Full packet per instrument is ~810 KiB — three times that cap.
+    /// Exceeding it raises `Error::Capacity`, which this module reports as a
+    /// disconnect, so the supervisor reconnects, re-subscribes all 5,000, and
+    /// the same vendor backlog arrives again: a permanent reconnect loop at
+    /// 09:15, while `tv_dhan_feed_stack_up` still reads 1.0.
+    #[test]
+    fn test_main_feed_cap_admits_a_full_connection_burst_not_a_subscribe_batch() {
+        let one_packet_per_instrument =
+            MAIN_FEED_LARGEST_PACKET_BYTES * (MAIN_FEED_INSTRUMENTS_PER_CONNECTION as usize);
+
+        assert!(
+            MAIN_FEED_MAX_FRAME_BYTES >= one_packet_per_instrument,
+            "main-feed cap {MAIN_FEED_MAX_FRAME_BYTES} is below {one_packet_per_instrument}, \
+             the size of ONE Full packet for every instrument a connection carries \
+             ({MAIN_FEED_INSTRUMENTS_PER_CONNECTION} x {MAIN_FEED_LARGEST_PACKET_BYTES} B). \
+             At market open Dhan flushes its queued backlog, so this is the ordinary case, \
+             not the worst one — and a cap below it turns every open into a reconnect loop."
+        );
+
+        // Non-vacuity: the cap must be derived from the per-CONNECTION count,
+        // not the per-SUBSCRIBE-MESSAGE count. If someone re-derives it from
+        // the 100-instrument batch again, this catches it — 100 x 162 x 2 is
+        // ~32 KiB, nowhere near the bound above.
+        let subscribe_batch_sized = MAIN_FEED_LARGEST_PACKET_BYTES * 100 * 2;
+        assert!(
+            MAIN_FEED_MAX_FRAME_BYTES > subscribe_batch_sized,
+            "main-feed cap {MAIN_FEED_MAX_FRAME_BYTES} looks like it was sized from the \
+             100-instrument SUBSCRIBE BATCH ({subscribe_batch_sized} B) rather than the \
+             5,000 instruments a CONNECTION carries. That is the exact reasoning error this \
+             pin exists to prevent."
+        );
+    }
+
     #[test]
     fn test_every_endpoint_cap_is_finite_and_far_below_the_library_default() {
         // The whole point of this module's config: tungstenite's default is a
@@ -1294,15 +1361,27 @@ mod tests {
         for endpoint in DhanEndpointType::ALL {
             let cap = max_frame_bytes(endpoint);
             assert!(cap > 0, "{endpoint} cap must be positive");
+            // 2026-08-14: was `cap <= 512 * 1024`, "the few-hundred-KiB
+            // envelope". That bound encoded the SAME mistake the main-feed cap
+            // itself did — it was derived from a 100-instrument subscribe
+            // batch rather than from the 5,000 instruments a connection
+            // actually carries, so it would have rejected any correctly-sized
+            // cap. A test that enforces a wrong constant is worse than no
+            // test: it makes the fix look like the regression.
+            //
+            // The real invariant is not an absolute byte count — it is that
+            // the cap stays bounded relative to the traffic it must admit and
+            // far below the library default. Both are asserted below.
             assert!(
-                cap <= 512 * 1024,
-                "{endpoint} cap {cap} exceeds the few-hundred-KiB envelope"
+                cap <= 4 << 20,
+                "{endpoint} cap {cap} exceeds 4 MiB. The cap exists to bound a hostile or \
+                 malfunctioning peer; past this it stops being a defence."
             );
-            // 64× headroom: even the largest cap (depth-200, whose packet is
-            // twenty times the main feed's) stays two orders of magnitude under
-            // the default it replaces.
+            // 16× headroom: even the largest cap stays an order of magnitude
+            // under the default it replaces, so sixteen sockets cannot turn
+            // into a gigabyte of attacker-controlled allocation.
             assert!(
-                cap * 64 < LIBRARY_DEFAULT_MESSAGE_BYTES,
+                cap * 16 < LIBRARY_DEFAULT_MESSAGE_BYTES,
                 "{endpoint} cap {cap} is not materially below the library default"
             );
         }
