@@ -707,20 +707,37 @@ impl LiveIngest {
     /// replayed frame reproduces the identical `capture_seq` and collapses onto
     /// the original row instead of duplicating it.
     ///
-    /// Packets 1..N mint a FRESH sequence from the same process-wide counter.
-    /// Those values are globally unique — they can never collide with any frame
-    /// sequence — but they are NOT reproducible: a replay that re-folded such a
-    /// frame would write duplicate rows for its 2nd..Nth packets. That is the
-    /// honest cost, and it is the right way round. A duplicate row is visible,
-    /// counted, and removable; a silently-dropped tick is neither. (Today
-    /// nothing re-folds from replay — recovery restores frames to the WAL
-    /// staging area — so the cost is latent rather than live.)
+    /// Packets 1..N derive theirs from the SAME frame sequence by OR-ing the
+    /// packet index into reserved low bits
+    /// (`ws_frame_spill::packet_capture_seq`), so every packet of a replayed
+    /// frame reproduces its original `capture_seq` exactly and collapses onto
+    /// the original row.
     ///
-    /// Arithmetic on the frame sequence was rejected: the counter is
-    /// wall-clock-nanosecond seeded with a `prev + 1` fallback under burst, so
-    /// consecutive frames can differ by exactly 1. There is no headroom to
-    /// carve a packet index into, and inventing some would trade a visible
-    /// duplicate for an invisible collision.
+    /// ## What this replaced, and why the old reasoning was wrong (2026-08-14)
+    ///
+    /// Until now packets 1..N minted a FRESH sequence from the process-wide
+    /// counter. Those values are globally unique, but they are NOT in the WAL
+    /// and cannot be regenerated — so a replay that re-folded such a frame
+    /// would write DUPLICATE rows for its 2nd..Nth packets. The comment here
+    /// argued that was "the right way round" because a duplicate row is
+    /// visible and a dropped tick is not.
+    ///
+    /// That trade was real but it was blocking the wrong thing: it made WAL
+    /// re-fold — the single largest CONTROLLABLE tick-loss path in the system —
+    /// unsafe to build. The premise it rested on was also wrong. It said
+    /// "there is no headroom to carve a packet index into", having considered
+    /// only MULTIPLYING the sequence (`frame_seq * MAX_PACKETS_PER_FRAME`),
+    /// which is indeed impossible: ≈1.786e18 × 70,000 ≈ 1.25e23 overflows
+    /// `i64::MAX` by four orders of magnitude and would refuse every tick.
+    ///
+    /// Reserving low bits in the SEED costs no headroom at all —
+    /// `(n >> 17) << 17` only clears bits, leaving the magnitude and the ≈5.16×
+    /// margin to `i64::MAX` unchanged. Uniqueness is structural: every frame
+    /// base ends in 17 zero bits and the base is strictly increasing, so one
+    /// frame's 131,072 packet slots cannot reach the next frame's base. The
+    /// old comment's fear — trading a visible duplicate for an invisible
+    /// collision — does not apply to a scheme where collisions are impossible
+    /// by construction rather than unlikely by argument.
     pub fn ingest_tick_at(
         &mut self,
         tick: &ParsedTick,
@@ -728,10 +745,29 @@ impl LiveIngest {
         packet_index: u32,
         recv_monotonic_millis: u64,
     ) -> IngestOutcome {
-        let frame_seq = if packet_index == 0 {
-            frame_seq
-        } else {
-            tickvault_storage::ws_frame_spill::next_frame_seq()
+        // REFUSE rather than fall back to a fresh sequence when the index does
+        // not fit: a fresh sequence is precisely the un-regenerable value this
+        // scheme exists to eliminate, so falling back would quietly restore the
+        // duplicate-on-replay defect while looking like it had worked.
+        let frame_seq = match tickvault_storage::ws_frame_spill::packet_capture_seq(
+            frame_seq,
+            u64::from(packet_index),
+        ) {
+            Some(seq) => seq,
+            None => {
+                self.seq_refused = self.seq_refused.saturating_add(1);
+                counters().ingest_seq_refused.increment(1);
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    frame_seq,
+                    packet_index,
+                    security_id = tick.security_id,
+                    "live tick refused: packet index exceeds the bits reserved in \
+                     capture_seq. The tick was NOT folded and NOT written — a counted \
+                     loss, never a fresh sequence that would duplicate on WAL replay."
+                );
+                return IngestOutcome::SeqUnrepresentable;
+            }
         };
         // Sequence FIRST: if we cannot stamp this row safely we must not touch
         // any fold state, or the aggregator would carry a tick that never
