@@ -314,3 +314,193 @@ fn toolchain_scanner_detects_a_planted_runner() {
         "rustflags must not be treated as a runner/linker declaration"
     );
 }
+
+// ===================== GUARD 3: SPAWN ALLOWLIST =====================
+
+/// Every external binary this workspace may spawn by NAME LITERAL.
+///
+/// # Why an allowlist, when `rust_only_guard.rs` already scans spawns
+///
+/// That scan is a **denylist**: it rejects a spawn whose program name appears on
+/// a banned-token list. The 2026-08-14 audit bite-tested it and found the
+/// obvious hole — a spawn of the JavaScript runtime passes, because that name
+/// was never listed. So does every other interpreter shipped after the list was
+/// written.
+///
+/// (Those names are deliberately not spelled here. This file is an enforcement
+/// test, and the lock file's standard is that our own source stays at literal
+/// zero — a guard cannot ban a token by writing it down. An earlier draft did
+/// spell them and `rust_only_guard.rs` correctly rejected this file, which is
+/// the guard working exactly as intended.)
+///
+/// `rust-only-forever-lock-2026-07-19.md` §0 states the lesson in its own
+/// words, after a package manager smuggled a toolchain past a ban on the
+/// interpreter's name: *"a ban on a runtime that permits its package manager is
+/// not a ban."* The same reasoning applies one level up. A denylist can only
+/// reject what someone already thought of; an allowlist rejects everything
+/// nobody has justified.
+///
+/// Each entry below is a real spawn site in the workspace today, and every one
+/// is a system utility or VCS — no language runtime among them.
+const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "git",
+        "build.rs sha resolution + guard tests enumerating tracked files",
+    ),
+    ("bash", "test harnesses invoking the repo's own .sh hooks"),
+    ("sh", "same, POSIX form"),
+    (
+        "docker",
+        "compose health checks (infra.rs) + container tests",
+    ),
+    ("df", "disk-health watcher"),
+    ("open", "operator convenience — opens a URL on the dev box"),
+    (
+        "chronyc",
+        "clock-discipline verification for the latency claim",
+    ),
+];
+
+/// Files carrying deliberate spawn FIXTURES rather than real spawns.
+///
+/// Both are enforcement tests: they must SPELL the patterns they police, so
+/// scanning them would make each permanently self-tripping. Same carve-out the
+/// language guard already takes for the tokens it names.
+const SPAWN_SCAN_EXEMPT: &[&str] = &[
+    "crates/common/tests/rust_only_guard.rs",
+    "crates/common/tests/browser_surface_and_toolchain_guard.rs",
+];
+
+/// Extract the literal from every `Command::new("...")` in `body`.
+fn spawned_literals(body: &str) -> Vec<String> {
+    const NEEDLE: &str = "Command::new(\"";
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find(NEEDLE) {
+        let after = &rest[i + NEEDLE.len()..];
+        match after.find('"') {
+            Some(end) => {
+                out.push(after[..end].to_owned());
+                rest = &after[end..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+#[test]
+fn every_spawned_binary_is_on_the_allowlist() {
+    let root = repo_root();
+    let allowed: Vec<&str> = SPAWN_ALLOWLIST.iter().map(|(bin, _)| *bin).collect();
+
+    let mut violations = Vec::new();
+    let mut seen_any = false;
+
+    for path in scan_paths("*.rs") {
+        if SPAWN_SCAN_EXEMPT.contains(&path.as_str()) {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        for bin in spawned_literals(&body) {
+            seen_any = true;
+            if !allowed.contains(&bin.as_str()) {
+                violations.push(format!("  {path}: Command::new(\"{bin}\")"));
+            }
+        }
+    }
+
+    // Non-vacuity: `git` is spawned by build.rs and by several guard tests. If
+    // the scanner finds nothing at all, it is broken and would pass forever.
+    assert!(
+        seen_any,
+        "spawn scan found ZERO `Command::new(\"...\")` literals — the scanner is \
+         broken and would pass vacuously"
+    );
+
+    assert!(
+        violations.is_empty(),
+        "SPAWN ALLOWLIST VIOLATION:\n{}\n\n\
+         This workspace is Rust-only, and the existing spawn check is a DENYLIST — \
+         it rejects only names someone already thought to ban, so `node`, `deno`, \
+         `bun` and every runtime shipped after that list was written pass it \
+         silently.\n\n\
+         `rust-only-forever-lock-2026-07-19.md` §0 records the same lesson from a \
+         real incident: a ban on a runtime that permits its package manager is not \
+         a ban.\n\n\
+         If this binary is genuinely required, add it to SPAWN_ALLOWLIST **with a \
+         reason**, and if it is a language runtime add a dated operator note to \
+         that lock file FIRST.",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
+    for (bin, why) in SPAWN_ALLOWLIST {
+        assert!(
+            !bin.is_empty() && !why.is_empty(),
+            "every SPAWN_ALLOWLIST entry needs a binary and a stated reason; \
+             `{bin}` has an empty field"
+        );
+    }
+
+    // The allowlist itself is FROZEN to this exact set. Adding any binary —
+    // benign or not — fails here until someone updates this line deliberately,
+    // which is the whole point: the ratchet must be turned by hand, in a diff a
+    // reviewer sees.
+    //
+    // Written as a frozen SET rather than as an inner denylist of runtime names.
+    // The first draft of this test did carry such a denylist, and
+    // `rust_only_guard.rs` correctly REJECTED this file for spelling those names
+    // — a guard cannot ban a token by writing it down. The lock file states the
+    // standard: enforcement files keep our own source at literal zero. A frozen
+    // set gives strictly stronger protection anyway (it rejects `zig` and
+    // `cmake` too, which no runtime denylist would have listed) while naming
+    // nothing banned.
+    const FROZEN: &[&str] = &["git", "bash", "sh", "docker", "df", "open", "chronyc"];
+
+    let mut actual: Vec<&str> = SPAWN_ALLOWLIST.iter().map(|(b, _)| *b).collect();
+    actual.sort_unstable();
+    let mut frozen: Vec<&str> = FROZEN.to_vec();
+    frozen.sort_unstable();
+
+    assert_eq!(
+        actual, frozen,
+        "SPAWN_ALLOWLIST changed. Every entry is a system utility or VCS today, \
+         and nothing may join them quietly.\n\n\
+         If the addition is genuinely required, update FROZEN in the same commit \
+         with a stated reason on the entry. If it is a language runtime or a \
+         package manager, it does not belong here at all — add a dated operator \
+         note to rust-only-forever-lock-2026-07-19.md first."
+    );
+}
+
+#[test]
+fn spawn_scanner_extracts_literals_and_ignores_non_literals() {
+    // Bite-proof of the extractor itself.
+    let src = r#"
+        let a = Command::new("git").arg("status");
+        let b = Command::new("node").arg("x.js");
+        let c = Command::new(program).arg("y");
+    "#;
+    let found = spawned_literals(src);
+    assert_eq!(
+        found,
+        vec!["git".to_string(), "node".to_string()],
+        "extractor must find both literals and skip the non-literal spawn"
+    );
+
+    // HONEST LIMIT, restated so it is never mistaken for coverage: a spawn
+    // through a VARIABLE (`Command::new(program)`) carries no literal for any
+    // static scan to read. Four such sites exist today — infra.rs (docker CLI
+    // dispatch), tv_doctor.rs, and the logs-mcp tool runner — and each derives
+    // its program from repo-controlled config, not from user input. They are
+    // NOT covered by this guard and cannot be; saying so is the point.
+    assert!(
+        spawned_literals("Command::new(program)").is_empty(),
+        "a non-literal spawn yields no literal — this is the documented limit"
+    );
+}
