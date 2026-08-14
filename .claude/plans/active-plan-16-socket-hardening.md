@@ -141,3 +141,75 @@ with `missing_live: 373`, and no session has yet reported a non-zero `compared`.
 46.37 s, 29–67 silent instruments/minute) — every one of those is Dhan-side and none is
 touched here. **NOT claimed:** any measurement at the ~4,565-instrument scale; the
 allocation gate is a unit-level proof, not a load test.
+
+---
+
+## ITEM 6 (added 2026-08-14, operator: "i want all 16 wecoekst shdu lwork") — depth late-attach
+
+**This is THE change that opens the 10 dark depth sockets.** Everything else in this
+plan hardens a lane that is running; this one changes how many sockets carry data.
+
+### Root cause (Verified, file:line)
+
+`load_depth_universe` is called ONCE at `main.rs:2028`, during boot (~08:30 IST). Its
+only data source is the `option_chain_1m` table, which the option-chain leg does not
+populate until its first fire at **09:16 IST**. Depth therefore asks for its instrument
+set ~45 minutes before that set exists.
+
+`build_depth_candidate_query` (`dhan_depth_universe.rs:374`) additionally has **no day
+bound on `ts`** — `LATEST ON ts PARTITION BY ...` returns the newest row per partition
+from ANY day. Two distinct daily failures follow:
+
+| Morning | Behaviour |
+|---|---|
+| Normal | Returns YESTERDAY's rows. Depth opens, but ranks ATM off a stale `underlying_spot`, on contract ids Dhan documents as unstable across days. |
+| After expiry | `expiry >= today` filters everything out → **zero depth sockets**, and `dhan_depth_universe.rs:527-537` prescribes a manual restart — which violates the zero-manual-intervention mandate. |
+
+### Why the one-line fix is REJECTED
+
+Adding `AND ts >= {today_micros}` alone is *correct* but strictly reduces socket count:
+at 08:30 the day-bounded query returns zero rows, so depth would open 0 sockets instead
+of 10-on-stale-data. The day bound MUST land together with late-attach, never before it.
+
+### The change
+
+1. **Split the dial flow in `run_dhan_feed_stack`.** Plan + dial `MainFeed` immediately
+   (it must be live at 09:00 — delaying it to 09:16 loses the first minute of ticks,
+   which is real, unrecoverable loss). Then, in the SAME task, await the depth universe
+   and dial `Depth20`/`Depth200` when it arrives. The pool must survive across that
+   await; `FEED_STACK_SPAWNED` forbids a second stack, so this cannot be bolted on from
+   outside the function.
+2. **Move the depth-universe load off boot** into that task, as a bounded retry:
+   re-query every 60 s from 09:16 IST until non-empty or a 10:00 IST deadline.
+   Fail-LOUD and fail-closed at the deadline (coded `error!` + counter), never a silent
+   zero-socket session.
+3. **Add the day bound** `AND ts >= {today_micros}` — safe only once (1) and (2) land.
+4. **Re-select on expiry roll**: because the set is now acquired after the chain leg
+   runs, the post-expiry morning resolves itself with no restart.
+
+### Test plan
+
+- Empty-at-boot → non-empty-at-09:16 opens depth sockets without a restart (the whole
+  point; assert socket count goes 0 → N).
+- Main feed dials at 09:00 and is NOT delayed by the depth wait (assert ordering) — this
+  is the regression that would cost real ticks if got wrong.
+- Deadline path with a permanently empty chain: zero depth sockets, coded error, counter,
+  main feed unaffected.
+- Day-bounded query returns nothing for yesterday-only rows.
+- `FEED_STACK_SPAWNED` still refuses a duplicate stack.
+
+### Honest risk
+
+This touches the live-feed spawn lifecycle. A half-done version takes the 5 WORKING
+main-feed sockets down with it. It must not be attempted without room to run
+`cargo test -p tickvault-app` and the wiring guards to completion.
+
+## ITEM 7 — `tv_dhan_feed_stack_up` is set on SPAWN, not on CONNECT
+
+`dhan_feed_stack.rs:2216` sets the gauge to 1 after the dial loop *spawns tasks*, and it
+clears only when the drain loop breaks. `DialFailed`/`Transient` never park, so on a
+total dial outage all sockets loop forever holding their senders and the gauge reads 1
+with zero data — the same false-OK class as the boot-time connections constant.
+
+Even after Item 6 opens depth, this gauge cannot confirm it. Flip it to set on first
+successful frame per endpoint, not on spawn.
