@@ -300,6 +300,53 @@ pub fn secs_until_next_market_open_ist() -> u64 {
 mod tests {
     use super::*;
 
+    /// Serialises every test that touches `TEST_FORCE_IN_MARKET_HOURS`.
+    ///
+    /// ## The flake this closes (2026-08-14)
+    ///
+    /// That flag is a PROCESS-GLOBAL atomic, and ten tests in this module set
+    /// it. `cargo test` runs them on parallel threads, so one test's
+    /// `set(false)` — or its trailing reset — lands in the middle of another
+    /// test's forced-`true` window. The victim then reads a value it did not
+    /// write and fails an assertion about behaviour that is actually correct.
+    ///
+    /// Measured before the fix: `set_market_calendar_for_session_is_idempotent_and_gates_holidays`
+    /// failed **3 of 5** consecutive module runs, and passed 100% when run
+    /// alone. It failed CI on a commit that does not touch this file.
+    ///
+    /// This is the same shape, and the same fix, as the `TV_API_TOKEN` race
+    /// recorded in `merge-gate-lock-2026-07-04.md` §3.2: a shared static
+    /// `Mutex` plus a scoped guard that restores the value on drop, poisoning
+    /// -safe via `into_inner` so one failing test cannot cascade into every
+    /// other test in the module reporting a poisoned lock instead of its own
+    /// verdict.
+    ///
+    /// Holding a guard twice on one thread would DEADLOCK (`std::sync::Mutex`
+    /// is not reentrant), which is why the tests take exactly one guard each
+    /// and let `Drop` do the reset rather than calling the setter again.
+    static FORCE_HOURS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ForceHours(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl ForceHours {
+        fn set(value: bool) -> Self {
+            let guard = FORCE_HOURS_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_test_force_in_market_hours(value);
+            Self(guard)
+        }
+    }
+
+    impl Drop for ForceHours {
+        fn drop(&mut self) {
+            // Always restore the default, even on an assertion unwind — a test
+            // that panics mid-window must not leave the flag forced for
+            // whichever test acquires the lock next.
+            set_test_force_in_market_hours(false);
+        }
+    }
+
     /// Direct unit test for `is_within_market_hours_ist` — returns a bool
     /// without I/O beyond a single `Utc::now()` call. Behavioural assertion
     /// (post-market silence does not alert) is exercised by the
@@ -311,14 +358,13 @@ mod tests {
 
     #[test]
     fn test_force_override_returns_true_when_set() {
-        set_test_force_in_market_hours(true);
+        let _force_guard = ForceHours::set(true);
         assert!(is_within_market_hours_ist());
-        set_test_force_in_market_hours(false);
     }
 
     #[test]
     fn test_force_override_resets_cleanly() {
-        set_test_force_in_market_hours(true);
+        let _force_guard = ForceHours::set(true);
         set_test_force_in_market_hours(false);
         // After reset, helper falls through to real wall-clock check;
         // we only assert no panic and a bool was produced.
@@ -337,9 +383,8 @@ mod tests {
     /// otherwise tests that pin "in market hours" would break the gate.
     #[test]
     fn trading_session_force_override_returns_true_when_set() {
-        set_test_force_in_market_hours(true);
+        let _force_guard = ForceHours::set(true);
         assert!(is_within_trading_session_ist());
-        set_test_force_in_market_hours(false);
     }
 
     /// The trading-session gate MUST always be a subset of the market-hours
@@ -347,7 +392,7 @@ mod tests {
     /// trading session, regardless of weekday.
     #[test]
     fn trading_session_implies_market_hours() {
-        set_test_force_in_market_hours(false);
+        let _force_guard = ForceHours::set(false);
         if !is_within_market_hours_ist() {
             assert!(
                 !is_within_trading_session_ist(),
@@ -433,7 +478,7 @@ mod tests {
     /// only assert the fallback identity holds when the calendar is absent.)
     #[test]
     fn trading_session_now_falls_back_to_weekday_gate_when_no_calendar() {
-        set_test_force_in_market_hours(false);
+        let _force_guard = ForceHours::set(false);
         if SESSION_CALENDAR.get().is_none() {
             assert_eq!(
                 is_trading_session_now(),
@@ -477,7 +522,7 @@ mod tests {
         // combined answer must equal the calendar's is_trading_day_today() — so
         // on a weekend/holiday (calendar says false) it is CLOSED despite the
         // forced in-hours flag, and on a real weekday it is OPEN.
-        set_test_force_in_market_hours(true);
+        let _force_guard = ForceHours::set(true);
         let expected = SESSION_CALENDAR
             .get()
             .map(|c| c.is_trading_day_today())
@@ -487,7 +532,6 @@ mod tests {
             expected,
             "with a calendar installed, the session gate must follow is_trading_day_today"
         );
-        set_test_force_in_market_hours(false);
     }
 
     /// Guard: the window bounds come from common constants, not hardcoded
@@ -506,9 +550,8 @@ mod tests {
 
     #[test]
     fn secs_until_next_open_returns_zero_during_market_hours() {
-        set_test_force_in_market_hours(true);
+        let _force_guard = ForceHours::set(true);
         assert_eq!(secs_until_next_market_open_ist(), 0);
-        set_test_force_in_market_hours(false);
     }
 
     /// Upper-bound sanity: 24h == 86,400s. The answer must be less than
@@ -530,7 +573,7 @@ mod tests {
     #[test]
     fn secs_until_next_open_positive_when_off_hours() {
         // Force off-hours by clearing the override (default state).
-        set_test_force_in_market_hours(false);
+        let _force_guard = ForceHours::set(false);
         if !is_within_market_hours_ist() {
             assert!(
                 secs_until_next_market_open_ist() > 0,
@@ -558,9 +601,8 @@ mod tests {
     /// regardless of when CI runs.
     #[test]
     fn test_now_ist_secs_of_day_test_override_returns_open_phase() {
-        set_test_force_in_market_hours(true);
+        let _force_guard = ForceHours::set(true);
         let s = now_ist_secs_of_day();
-        set_test_force_in_market_hours(false);
         assert_eq!(s, 9 * 3600 + 30 * 60, "test override must return 09:30 IST");
     }
 
@@ -582,9 +624,8 @@ mod tests {
     /// scheduler test exercises the loop without a 24h sleep.
     #[test]
     fn test_secs_until_next_ist_midnight_test_override() {
-        set_test_force_in_market_hours(true);
+        let _force_guard = ForceHours::set(true);
         let s = secs_until_next_ist_midnight();
-        set_test_force_in_market_hours(false);
         assert_eq!(s, 1, "test override must return 1s");
     }
 }

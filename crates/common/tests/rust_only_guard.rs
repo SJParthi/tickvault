@@ -170,6 +170,54 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path == "Makefile"
         || path.ends_with("/Makefile")
         || path.starts_with("scripts/git-hooks/")
+        // 2026-08-14 SCOPE FIX #4 — CARGO CONFIG. `.cargo/config.toml` can set
+        // `[target.*] runner = …` and `linker = …`, which the toolchain
+        // EXECUTES on every single build. That is the most privileged
+        // invocation surface in the repo and it was structurally unscanned:
+        // no `.toml` is a scan target, and `.toml` is not a banned extension
+        // either, so an interpreter named as the linker would have passed
+        // green while linking every production binary. This is not
+        // hypothetical shape — the 2026-08-01 correction records an
+        // interpreter package having ACTUALLY BEEN the arm64 linker for every
+        // production Rust lambda.
+        //
+        // Scoped to the cargo manifests specifically rather than all `.toml`,
+        // because `config/base.toml` and the rule/quality TOMLs carry English
+        // prose where a bare token would false-positive.
+        //
+        // Verified at fix time: `.cargo/config.toml` carries only
+        // `rustflags = ["-C", "target-cpu=neoverse-n1"]` — token-clean, so
+        // this closes a LATENT blind spot and the allowlists stay at zero.
+        || path == ".cargo/config.toml"
+        || path.ends_with("/.cargo/config.toml")
+        || path == "Cargo.toml"
+        || path.ends_with("/Cargo.toml")
+}
+
+/// Does this file's FIRST LINE select an interpreter to execute it?
+///
+/// 2026-08-14 SCOPE FIX #5 — THE STRUCTURAL ONE. Every scope fix before this
+/// (the `.tf`/Dockerfile row, the executable-manifest row, the cargo-config
+/// row above) closed a hole by ENUMERATING one more extension. That approach
+/// has now been wrong four times, and each time in the same direction: a file
+/// class nobody listed was invisible, and invisibility reads as green.
+///
+/// The enumeration left two escapes open at once. An extension-less tracked
+/// executable anywhere outside the single hardcoded `scripts/git-hooks/`
+/// prefix — `tools/deploy`, `bin/run` — is neither extension-banned nor
+/// invocation-scanned. And a shell script renamed `.bash`, `.zsh`, `.ksh`,
+/// `.ps1` or `.bat` escapes the `.sh` check, the same one-rename evasion the
+/// `.pyw`/`.pyi` additions closed for the interpreter's own extensions.
+///
+/// A shebang is not a naming convention — it is the kernel's instruction for
+/// which interpreter runs the file. So asking the FILE what executes it,
+/// rather than asking its NAME, closes both escapes at once and, more
+/// importantly, closes the ones nobody has thought of yet.
+///
+/// Verified at fix time: all 99 tracked shebangs are `bash`, so this closes
+/// LATENT blind spots and both allowlists stay at their hard-zero floor.
+fn has_interpreter_shebang(content: &str) -> bool {
+    content.lines().next().is_some_and(|l| l.starts_with("#!"))
 }
 
 /// Whole-line comment: first non-whitespace char is `#` — but a shebang
@@ -499,15 +547,30 @@ fn git_ls_files(pathspecs: &[&str]) -> Vec<String> {
 }
 
 /// All tracked invocation-scan targets, loaded as (path, content).
+///
+/// Selection is by PATH first (`is_invocation_scan_target`) and then, for
+/// everything the path rules did not already claim, by CONTENT — any tracked
+/// file whose first line is a shebang is executable regardless of what it is
+/// called (`has_interpreter_shebang`). See that function for why the
+/// path-enumeration approach kept failing in the same direction.
+///
+/// Binary and unreadable files are skipped rather than fatal: `read_to_string`
+/// fails on non-UTF-8, and a PNG has no shebang to find. Path-selected targets
+/// keep the original fail-loud behaviour, because a scan target we cannot read
+/// IS a guard failure.
 fn load_invocation_scan_files() -> Vec<(String, String)> {
     let root = repo_root();
     git_ls_files(&["."])
         .into_iter()
-        .filter(|p| is_invocation_scan_target(p))
-        .map(|p| {
-            let content = std::fs::read_to_string(root.join(&p))
-                .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{p}`: {e}"));
-            (p, content)
+        .filter_map(|p| {
+            if is_invocation_scan_target(&p) {
+                let content = std::fs::read_to_string(root.join(&p))
+                    .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{p}`: {e}"));
+                return Some((p, content));
+            }
+            // Content-selected: unreadable => not a shebang script => skip.
+            let content = std::fs::read_to_string(root.join(&p)).ok()?;
+            has_interpreter_shebang(&content).then_some((p, content))
         })
         .collect()
 }
