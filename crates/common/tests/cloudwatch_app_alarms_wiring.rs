@@ -584,8 +584,8 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // cardinality this ratchet exists to make someone think about.
     assert_eq!(
         names.len(),
-        68,
-        "Z+ L2 VERIFY ratchet: expected exactly 68 names in the MAIN EMF \
+        70,
+        "Z+ L2 VERIFY ratchet: expected exactly 70 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
@@ -604,7 +604,12 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
          the lane had NO signal for PARTIAL socket loss, because stack_up clears only \
          when the frame ring closes (every sender dropped) and the planned-connections \
          gauge is a boot-time constant, so four of five sockets could park with both \
-         reading healthy. +$0.30/mo); found {}: \
+         reading healthy. +$0.30/mo; plus the 2 WAL-RECOVERY names added the same day — \
+         tv_dhan_wal_refold_total and tv_ws_frame_wal_reinjected_dropped_total. The \
+         write-ahead log was WRITE-ONLY until 2026-08-14: frames staged at boot were \
+         counted, logged and discarded, so a session that died mid-market lost everything \
+         captured since its last flush and no metric anyone watched moved. +$0.60/mo); \
+         found {}: \
          {names:?}. Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose \
          budget actions STOP the prod box at 90% — update this count deliberately, \
          with a dated cost note, never as a drive-by.",

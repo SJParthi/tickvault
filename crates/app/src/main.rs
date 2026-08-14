@@ -1851,25 +1851,101 @@ async fn main() -> Result<()> {
         // the operator reading "residual ... from a pre-retirement session"
         // would file it as housekeeping rather than as data loss.
         //
-        // The frames are genuinely preserved on disk, and re-folding them is
-        // real work (the fold path takes a live ring, not a replay batch), so
-        // this stays a drop for now. What changes is that it stops describing
-        // a live gap as historical tidying, and says plainly what was lost.
-        error!(
-            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-            frames = dropped,
-            "STAGE-C.2b: {dropped} captured live-feed frames were replayed from the \
-             write-ahead log and DROPPED — there is no re-fold path, so the ticks and candles \
-             they contain are NOT in the database. The raw frames are preserved in the WAL \
-             archive and can be recovered manually. If this session followed an unclean stop \
-             during market hours, this is real data loss for that window, not leftover residue \
-             from an old session."
-        );
-        metrics::counter!(
-            "tv_ws_frame_wal_reinjected_dropped_total",
-            "ws_type" => "live_feed"
-        )
-        .increment(dropped);
+        // 2026-08-14 — THE RE-FOLD. The paragraph above ended "this stays a
+        // drop for now"; this is the "for now" expiring. Two things had to
+        // land first: replay-stable `capture_seq` (so a re-appended row lands
+        // on the SAME DEDUP key and collapses instead of double-counting), and
+        // a tick-only path (so a partial tail can never overwrite a good
+        // candle with a worse one).
+        if config.dhan_wal_replay.enabled {
+            let report = tickvault_app::dhan_feed_stack::refold_live_feed_frames(
+                &ws_wal_replay_live_feed,
+                &config.questdb,
+                config.dhan_wal_replay.max_frames,
+            );
+            for (outcome, n) in [
+                ("recovered", report.ticks),
+                ("non_tick", report.non_tick),
+                ("unparseable", report.unparseable),
+                ("seq_refused", report.seq_refused),
+                ("refused_price", report.refused_price),
+                ("over_cap", report.over_cap as u64),
+            ] {
+                if n > 0 {
+                    metrics::counter!(
+                        tickvault_app::dhan_feed_stack::WAL_REFOLD_COUNTER,
+                        "outcome" => outcome
+                    )
+                    .increment(n);
+                }
+            }
+            if report.flush_failed {
+                // Loud, and NOT counted as recovered: the rows were built and
+                // then lost at the writer, which is the same outcome as the
+                // drop this code replaced. Reporting it as recovery would be
+                // the exact false-OK the re-fold exists to end.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    frames = dropped,
+                    ticks = report.ticks,
+                    "STAGE-C.2b: WAL re-fold built {} tick rows from {dropped} captured \
+                     frames and the ILP FLUSH FAILED — none of them reached the database. \
+                     The raw frames remain in the WAL archive. Check QuestDB health.",
+                    report.ticks
+                );
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_dropped_total",
+                    "ws_type" => "live_feed"
+                )
+                .increment(dropped);
+            } else {
+                info!(
+                    frames = report.frames,
+                    ticks = report.ticks,
+                    non_tick = report.non_tick,
+                    unparseable = report.unparseable,
+                    seq_refused = report.seq_refused,
+                    refused_price = report.refused_price,
+                    over_cap = report.over_cap,
+                    "STAGE-C.2b: WAL re-fold recovered {} tick rows from {} captured \
+                     live-feed frames left by a previous session. Re-appending a row that \
+                     already persisted is a no-op under the DEDUP key, so this is safe to \
+                     run on every boot. TICKS ONLY: candles are NOT re-folded, because a \
+                     recovered tail is a partial minute and would overwrite a complete bar \
+                     with an incomplete one.",
+                    report.ticks,
+                    report.frames
+                );
+                if report.over_cap > 0 {
+                    warn!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                            .code_str(),
+                        over_cap = report.over_cap,
+                        max_frames = config.dhan_wal_replay.max_frames,
+                        "STAGE-C.2b: {} replayed frames were left UNWALKED at the boot cap. \
+                         They are still on disk, not discarded — but they are not in the \
+                         database either, and this boot will archive the segments, so they \
+                         need manual recovery or a raised cap.",
+                        report.over_cap
+                    );
+                }
+            }
+        } else {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                frames = dropped,
+                "STAGE-C.2b: {dropped} captured live-feed frames were replayed from the \
+                 write-ahead log and DROPPED — `[dhan_wal_replay] enabled` is off, so the \
+                 ticks they contain are NOT in the database. The raw frames are preserved \
+                 in the WAL archive and can be recovered manually. If this session followed \
+                 an unclean stop during market hours, this is real data loss for that window."
+            );
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_dropped_total",
+                "ws_type" => "live_feed"
+            )
+            .increment(dropped);
+        }
         ws_wal_replay_live_feed.clear();
     }
     {

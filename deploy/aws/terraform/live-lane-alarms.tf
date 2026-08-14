@@ -303,3 +303,40 @@ resource "aws_cloudwatch_metric_alarm" "ws_no_alive_connections" {
   # sending, unlike the loss alarms above where recovery is impossible.
   ok_actions = local.app_alarm_actions
 }
+
+# ---------------------------------------------------------------------------
+# 7. Captured frames were NOT recovered at boot (2026-08-14)
+# ---------------------------------------------------------------------------
+# The write-ahead log is the durability floor the entire capture design rests
+# on: every frame is written to it BEFORE it is parsed. Until 2026-08-14 that
+# log was write-ONLY — on boot the staged live-feed frames were counted,
+# logged, and discarded — so a session that died mid-market lost every frame
+# captured since its last flush, and no alarm existed because "loss at boot"
+# had no metric anyone watched.
+#
+# The re-fold now recovers them, which makes THIS counter meaningful: it moves
+# only when recovery did NOT happen — the feature is disabled, or the rows were
+# built and the ILP flush failed. Either way the ticks are on disk and not in
+# the database, which is precisely the state that needs a human.
+resource "aws_cloudwatch_metric_alarm" "wal_frames_not_recovered" {
+  alarm_name        = "tv-${var.environment}-wal-frames-not-recovered"
+  alarm_description = "Live-feed frames captured by a previous session were replayed from the write-ahead log and NOT recovered into the database. The raw frames are preserved in the WAL archive, so this is recoverable — but not automatically, and not after the segments are archived. Causes, in order of likelihood: [dhan_wal_replay] enabled is false; or the re-fold built the rows and the QuestDB flush failed. Triage: journalctl -u tickvault for the STAGE-C.2b line, which names which of the two it was and how many frames were involved."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_ws_frame_wal_reinjected_dropped_total"
+  namespace           = local.app_namespace
+  # Boot-time only, so this fires at most once per restart. Threshold 1 with a
+  # single period catches that lone increment.
+  period             = 300
+  statistic          = "Sum"
+  dimensions         = local.app_dimensions
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions: the counter is cumulative and the window is already past.
+  # Only a deliberate manual recovery changes the outcome, and that is not an
+  # event this alarm can observe.
+  ok_actions = []
+}
