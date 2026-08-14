@@ -223,6 +223,33 @@ pub fn select_live_universe(
 // the writer never produces, finds nothing, falls back, and the result is
 // indistinguishable from "the master resolved nothing usable".
 
+/// Counter: master sourcing was REQUESTED but did not take effect, by reason.
+///
+/// Non-zero means the live lane is subscribing the 4 hardcoded index SIDs while
+/// the operator's config asks for the resolved master — on 2026-08-12 that was
+/// **4,565** instruments, so this is a 99.9% collapse of the subscribed set.
+///
+/// It needs its own signal because the collapse is otherwise INDISTINGUISHABLE
+/// from a healthy 4-SID day on every other gauge: the gap detector seeds only
+/// what was actually subscribed, so `instruments_never_ticked` reads 0, the
+/// lane-up gauge reads 1, and ticks flow normally — for four instruments.
+/// Before this counter the only evidence was one uncoded `error!` line, which
+/// no triage path and no alarm could see.
+pub const MASTER_SOURCING_FALLBACK_COUNTER: &str = "tv_dhan_live_universe_fallback_total";
+
+/// Count one fallback, and publish the resulting subscribed size so the size
+/// itself is visible without parsing a log line.
+fn record_master_sourcing_fallback(reason: &'static str, fell_back_to: usize) {
+    metrics::counter!(MASTER_SOURCING_FALLBACK_COUNTER, "reason" => reason).increment(1);
+    // Cold path — once per boot at most — so the macro's key build is fine here.
+    #[allow(clippy::cast_precision_loss)]
+    // APPROVED: instrument counts are bounded by MAX_DAILY_UNIVERSE_SIZE, far below 2^53.
+    metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(fell_back_to as f64);
+}
+
+/// Gauge: how many instruments the live lane actually subscribed.
+pub const LIVE_UNIVERSE_SIZE_GAUGE: &str = "tv_dhan_live_universe_instruments";
+
 /// Resolve the session's subscription set, reading the master only when the
 /// operator has turned that on.
 ///
@@ -231,6 +258,11 @@ pub fn select_live_universe(
 // The parse, the selection, the envelope refusal and the fallback
 // classification are all delegated to unit-tested pure fns above; this wrapper
 // only reads a file and logs.
+//
+// The TEST-EXEMPT marker below MUST stay on the line immediately preceding
+// `pub fn` — the guard reads exactly one line back. Inserting anything between
+// them silently orphans the exemption and the function reads as newly untested,
+// which is how this very block got separated from its function on 2026-08-14.
 // TEST-EXEMPT: filesystem I/O — see the note above.
 pub fn resolve_live_universe(
     cfg: &tickvault_common::config::DhanUniverseConfig,
@@ -252,7 +284,9 @@ pub fn resolve_live_universe(
     let body = match std::fs::read_to_string(&path) {
         Ok(b) => b,
         Err(err) => {
+            record_master_sourcing_fallback("artifact_unreadable", index_universe.len());
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                 ?err,
                 path = %path.display(),
                 "live universe: today's mapping artifact is unreadable — falling back to \
@@ -266,7 +300,9 @@ pub fn resolve_live_universe(
     let master = match parse_mapping_artifact(&body) {
         Ok(m) => m,
         Err(reason) => {
+            record_master_sourcing_fallback("artifact_unparseable", index_universe.len());
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                 reason,
                 path = %path.display(),
                 "live universe: mapping artifact did not parse — falling back to the index \
@@ -279,6 +315,13 @@ pub fn resolve_live_universe(
     let selection = select_live_universe(&index_universe, Some(&master), capacity);
     match selection.source {
         UniverseSource::MasterSourced => {
+            // Publish the size on the SUCCESS path too, so the gauge is a live
+            // reading of the universe rather than a fallback-only tripwire. A
+            // metric that only ever appears when something breaks cannot be
+            // compared against a known-good value.
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: bounded by the capacity envelope, far below 2^53.
+            metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(selection.instruments.len() as f64);
             tracing::info!(
                 instruments = selection.instruments.len(),
                 master_entries = master.len(),
@@ -291,7 +334,9 @@ pub fn resolve_live_universe(
             );
         }
         _ => {
+            record_master_sourcing_fallback("no_usable_widening", selection.instruments.len());
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                 master_entries = master.len(),
                 refused_zero_id = selection.refused_zero_id,
                 refused_unknown_segment = selection.refused_unknown_segment,

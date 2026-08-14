@@ -161,6 +161,35 @@ question about the FILE rather than its NAME — because the enumerate-one-more-
 extension approach has now been wrong four times, always in the same direction:
 a class nobody listed is invisible, and invisibility reads as green.
 
+**CLOSED in the SECOND sweep of the same day** (a follow-up adversarial audit
+run specifically to try to sneak a non-Rust executable past the just-widened
+guard — it found four more, three of which needed no exotic technique):
+
+| # | Hole | Fix |
+|---|---|---|
+| 6 | **`.args([…])` was invisible to the Rust spawn scan.** The marker set was `Command::new("` and `.arg("`; the PLURAL form contains neither, because an `s` sits between `arg` and the paren. So `Command::new("env").args(["<interpreter>", "-c", …])` was **fully literal and fully green** — the extractor saw only the benign `"env"` and never looked at the payload. `.args([…])` is the DOMINANT form in this workspace (20+ sites, including `build.rs`, which executes on every build) | `extract_spawn_literals` takes every string literal inside the bracket group, bounded at `]`; bite-proven both directions in `guard_self_test` |
+| 7 | **Make's other names.** The check was `path == "Makefile"`, case-sensitive and single-name. GNU make searches `GNUmakefile`, `makefile`, `Makefile` **in that order**, so a tracked `GNUmakefile` SHADOWS the scanned `Makefile` entirely — and make files carry no shebang, so fix #1 above could not rescue them | `GNUmakefile` / `makefile` / `*.mk` added, plus `*.Dockerfile` (the `docker build -f prod.Dockerfile` convention, which `Dockerfile.*` does not match) and `*.json.example` / `*.json.template` (tracked seeds carrying hook COMMAND lines) |
+
+**Recorded as an HONEST LIMIT rather than closed — a wrapper function defeats
+the spawn scan, and the wrapper already exists.**
+`crates/tickvault-logs-mcp/src/tools.rs::run_with_timeout(program, …)` is
+called with bare `"bash"` / `"git"` / `"docker"` literals that sit in neither
+marker form; a new call site passing an interpreter name would pass green.
+Closing this needs call-graph analysis, not a string scan, so it is stated at
+the function (`HONEST LIMIT 2`) rather than pretended away. The shebang
+fallback and the file-extension ban still apply to whatever such a wrapper
+launches.
+
+**Also recorded, not closed:** inline JavaScript inside `.rs` string literals
+is unbudgeted. The three `crates/api/src/handlers/*_page.rs` surfaces carry
+~726 JS lines in raw strings; `.rs` is excluded from token scanning by design
+and the spawn scan is literal-only, so a FIFTH browser surface — or unbounded
+JS growth inside the existing three — is structurally invisible. The
+"4 surfaces" figure in CLAUDE.md is prose enforced by nothing, while inline JS
+in `.yml` **is** budgeted (`GITHUB_SCRIPT_BUDGET`). That asymmetry is a real
+gap; closing it needs a budget const and an operator ruling on the 12
+legitimate vendor-reference `.html` files under `docs/`.
+
 **OPEN, recorded rather than silently carried:**
 
 | # | Hole | Why it is not closed here |
