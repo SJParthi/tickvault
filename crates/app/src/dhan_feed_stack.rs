@@ -1409,6 +1409,7 @@ async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
     ring_budget: Arc<RingByteBudget>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) -> DrainOutcome {
     let mut seen: u64 = 0;
     let mut folded: u64 = 0;
@@ -1492,6 +1493,58 @@ async fn run_frame_drain(
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
                     publish_fold_depth(&ingest);
                 }
+            }
+            // SHUTDOWN (added 2026-08-14). Deliberately placed BELOW the frame
+            // arm in this `biased` select, and that ordering is load-bearing:
+            // a shutdown signal must not preempt frames already sitting in the
+            // ring. Placed above, the permit wins the very first poll and the
+            // drain exits abandoning queued work — which is a different way of
+            // losing the tail than the bug this arm exists to fix. The test
+            // `test_drain_exits_on_shutdown_signal_with_the_ring_still_open`
+            // caught exactly that during development, which is why it asserts
+            // the queued frame was FOLDED and not merely that the drain ended.
+            //
+            // Before this arm existed the drain
+            // could only end when the ring closed, and nothing closed it: the
+            // lane's handle was bound to `_dhan_feed_stack_monitor` and the
+            // shutdown path's Dhan steps had been "deleted with the lane" in
+            // 2026-07-13 — then the lane came back and the teardown did not.
+            //
+            // The consequence was silent and daily. At the 17:30 stop, SIGTERM
+            // ran the process teardown, `main` returned `Ok(())`, and the log
+            // printed "tickvault stopped" and classified the shutdown clean —
+            // while every ILP row still under FLUSH_ROW_THRESHOLD and every
+            // open candle in the aggregator went with the process. There was
+            // no metric whose value differed between a day that flushed and a
+            // day that did not.
+            //
+            // `Notify::notify_one` is permit-based, so a signal that arrives
+            // while this task is inside another arm is retained rather than
+            // lost — the lost-wake hazard that makes `notify_waiters` the
+            // wrong primitive here (audit-findings Rule 16).
+            () = shutdown.notified() => {
+                info!("Dhan live feed: shutdown signalled — sealing and flushing before exit");
+                // Seal whatever the aggregator still holds, THEN flush, in
+                // that order: sealing produces rows, so flushing first would
+                // leave exactly the rows sealing just created.
+                let (emitted, dropped) = ingest.catch_up_seal();
+                blocking_flush(|| ingest.flush());
+                if dropped > 0 {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        emitted,
+                        dropped,
+                        "Dhan live feed: candles were DROPPED during the shutdown seal — the \
+                         seal ring could not take them and they are lost with the process"
+                    );
+                } else {
+                    info!(
+                        emitted,
+                        "Dhan live feed: shutdown seal + flush complete — the day's tail is \
+                         persisted"
+                    );
+                }
+                break;
             }
             // TIME trigger. Without it, the last rows of a thinly-traded
             // instrument sit unflushed below the size threshold waiting for a
@@ -1901,6 +1954,15 @@ pub struct DhanFeedStackParams {
     /// what sets it: `true` once sockets are dialed and the fold is consuming
     /// them, `false` on every exit path.
     pub feed_runtime: Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    /// Signalled at process shutdown so the drain can SEAL and FLUSH before
+    /// the process exits.
+    ///
+    /// Added 2026-08-14. Until then the drain could only end when the ring
+    /// closed, and nothing closed it — so at every 17:30 stop the day's tail
+    /// (open candles, plus every ILP row still under the flush threshold) went
+    /// with the process while the log printed "tickvault stopped" and
+    /// classified the shutdown clean.
+    pub shutdown: Arc<tokio::sync::Notify>,
 }
 
 /// Brings up the Dhan 16-connection live feed if — and only if — both gates are
@@ -2341,7 +2403,12 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // heap it protects is one heap: five main-feed connections each holding a
     // per-pool share would bound five times the memory the host actually has.
     let ring_budget = Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES));
-    let drain = tokio::spawn(run_frame_drain(frame_rx, ingest, Arc::clone(&ring_budget)));
+    let drain = tokio::spawn(run_frame_drain(
+        frame_rx,
+        ingest,
+        Arc::clone(&ring_budget),
+        Arc::clone(&params.shutdown),
+    ));
 
     // ---- the sockets -------------------------------------------------------
     let dialed =
@@ -3135,6 +3202,7 @@ mod tests {
             // its `false` default. Asserted below, so this test also pins that
             // a refused lane never claims to be running.
             feed_runtime: Arc::new(tickvault_api::feed_state::FeedRuntimeState::default()),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         });
         assert!(handle.is_none(), "a disabled lane must spawn nothing");
     }
@@ -3819,6 +3887,7 @@ mod tests {
                 rx,
                 ingest,
                 Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+                Arc::new(tokio::sync::Notify::new()),
             ),
         )
         .await
@@ -3842,6 +3911,74 @@ mod tests {
             drained.unparseable, 0,
             "a well-formed ticker frame must not be counted unparseable"
         );
+        // (see `test_drain_exits_on_shutdown_signal_with_the_ring_still_open`
+        // for the other exit path — the one that did not exist until
+        // 2026-08-14.)
+    }
+
+    /// The drain must exit on the shutdown signal **while the ring is still
+    /// open** — the exit path that did not exist until 2026-08-14.
+    ///
+    /// Holding a live sender is the whole point of this test. Before the
+    /// shutdown arm, `rx.recv()` was the only way out, so a drain with any
+    /// sender alive ran forever. At the 17:30 stop nothing closed the sockets,
+    /// so nothing closed the ring, so the final `ingest.flush()` never ran and
+    /// the day's tail died with the process — while the log printed
+    /// "tickvault stopped" and classified the shutdown clean.
+    ///
+    /// The timeout is the assertion: a drain that ignores the signal hangs
+    /// here rather than failing an equality check, which is the honest shape
+    /// for "this must terminate".
+    #[tokio::test]
+    async fn test_drain_exits_on_shutdown_signal_with_the_ring_still_open() {
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+
+        tx.send(CapturedFrame {
+            seq: 7,
+            endpoint: DhanEndpointType::MainFeed,
+            bytes: bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, 1_779_355_000)),
+        })
+        .await
+        .expect("the ring must accept a frame");
+
+        let drain = tokio::spawn(run_frame_drain(
+            rx,
+            ingest,
+            Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+            Arc::clone(&shutdown),
+        ));
+
+        // `notify_one` is permit-based, so this is safe to fire before the
+        // drain has parked on its shutdown arm — the permit is retained. That
+        // is precisely why it is used instead of `notify_waiters`, whose wake
+        // would be lost if the drain happened to be inside another arm.
+        shutdown.notify_one();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect(
+                "the drain must exit on the shutdown signal even with a live sender still \
+                 holding the ring open — hanging here IS the bug this test exists to catch",
+            )
+            .expect("the drain task must not panic");
+
+        assert_eq!(
+            outcome.folded, 1,
+            "the drain should have folded the queued frame before honouring shutdown — \
+             exiting on the signal must not mean abandoning what was already in the ring"
+        );
+        assert_eq!(
+            outcome.ingest.pending_rows(),
+            0,
+            "the shutdown path must FLUSH, not merely exit. Rows left pending here are \
+             exactly the day's tail that used to die with the process every evening."
+        );
+
+        // The sender is still alive until this line, proving the exit came
+        // from the signal and not from the ring closing.
+        drop(tx);
     }
 
     #[tokio::test]
@@ -3869,6 +4006,7 @@ mod tests {
                 rx,
                 ingest,
                 Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+                Arc::new(tokio::sync::Notify::new()),
             ),
         )
         .await

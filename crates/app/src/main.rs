@@ -2036,8 +2036,14 @@ async fn main() -> Result<()> {
     // depth once the chain leg publishes (`attach_depth_when_available`). Empty
     // sets here mean "you fetch it", not "there is none".
 
-    let _dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
+    // Signalled at shutdown so the lane can seal + flush before the process
+    // exits (2026-08-14). Held here because the shutdown block below is the
+    // only thing that fires it.
+    let dhan_feed_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
+            shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),
             dhan_enabled: config.feeds.dhan_enabled,
             // DEFAULT-OFF: with `live_subscription_from_master = false` (the
             // shipped value) this returns the same 4 hardcoded index SIDs the
@@ -2123,6 +2129,8 @@ async fn main() -> Result<()> {
         &notifier,
         &config,
         trading_calendar.clone(),
+        dhan_feed_shutdown,
+        dhan_feed_stack_monitor,
     )
     .await
 }
@@ -2782,6 +2790,21 @@ async fn build_shared_infra(
 // wait, then stops the PROCESS API server + flushes otel. The shared infra
 // stays up for Groww until the shutdown signal.
 // ---------------------------------------------------------------------------
+/// How long the process waits for the Dhan live lane to seal + flush the day
+/// before exiting anyway (2026-08-14).
+///
+/// Bounded in both directions on purpose. Unbounded, a hung or unreachable
+/// QuestDB holds the process past systemd's stop timeout, systemd escalates to
+/// SIGKILL, and we lose the exact tail this wait exists to save. Too short and
+/// a healthy-but-busy flush is cut off. 20s sits comfortably inside the
+/// service's stop timeout while being far longer than a flush of one
+/// sub-threshold ILP batch needs.
+const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 20;
+
+/// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`] as a `Duration`.
+const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS);
+
 async fn run_process_runloop(
     api_handle: Option<tokio::task::JoinHandle<()>>,
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
@@ -2791,6 +2814,12 @@ async fn run_process_runloop(
     // calendar (Saturday/Sunday/holiday suppression). See
     // `boot_helpers::should_emit_post_market_alert`.
     trading_calendar: std::sync::Arc<TradingCalendar>,
+    // The Dhan live lane's shutdown signal and its task handle (2026-08-14).
+    // Threaded in rather than global because this function owns the ONLY
+    // place the signal is fired: without them the lane's final seal+flush
+    // never runs and the day's tail dies with the process.
+    dhan_feed_shutdown: std::sync::Arc<tokio::sync::Notify>,
+    dhan_feed_stack_monitor: Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     // Truthfulness rider: the runtime is dry-run/paper only — no real-money
     // orders are placed. Render "RUNNING (paper)" so the boot Telegram cannot
@@ -3017,8 +3046,40 @@ async fn run_process_runloop(
         std::process::exit(1);
     });
 
-    // (PR-C2, 2026-07-13: the Dhan-lane teardown steps 1–5 are deleted with
-    // the lane — the PROCESS infra below is torn down regardless.)
+    // 5b. Dhan live lane: seal + flush the day's tail (RESTORED 2026-08-14).
+    //
+    // The comment that stood here said the Dhan-lane teardown "is deleted with
+    // the lane" (PR-C2, 2026-07-13). That was true then. The lane came back on
+    // 2026-08-09 and the teardown did not, which made every 17:30 stop a
+    // silent partial data loss: nothing closed the sockets, so the ring never
+    // closed, so the drain never broke out of `rx.recv()`, so its final
+    // `ingest.flush()` never ran. Open candles and every ILP row still under
+    // the 1,000-row flush threshold went with the process — and the next line
+    // printed "tickvault stopped", classifying it clean. No metric differed
+    // between a day that flushed and a day that did not.
+    //
+    // Bounded deliberately: a hung or unreachable QuestDB must not hold the
+    // process past systemd's stop timeout, or systemd escalates to SIGKILL and
+    // we lose the very tail this is here to save. On timeout we say so at
+    // ERROR rather than exiting quietly — a flush that did not finish is not
+    // the same as one that did, and the operator must be able to tell.
+    dhan_feed_shutdown.notify_one();
+    if let Some(handle) = dhan_feed_stack_monitor {
+        match tokio::time::timeout(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET, handle).await {
+            Ok(Ok(())) => info!("Dhan live feed: sealed and flushed cleanly on shutdown"),
+            Ok(Err(err)) => error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                %err,
+                "Dhan live feed: the lane task failed while shutting down — the day's tail may \
+                 not have been persisted"
+            ),
+            Err(_) => error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                "Dhan live feed: the shutdown seal+flush did NOT finish within 20s — exiting \
+                 anyway so systemd does not SIGKILL us, but the day's tail may be incomplete"
+            ),
+        }
+    }
 
     // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
     // summaries + write the final episode snapshot (bounded 10s inside
