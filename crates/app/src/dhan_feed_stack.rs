@@ -81,7 +81,7 @@
 //! NOT fixed by any of this.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -128,7 +128,34 @@ pub const DHAN_LIVE_FEED_ENV_ON: &str = "1";
 pub const FEED_STACK_UP_GAUGE: &str = "tv_dhan_feed_stack_up";
 
 /// Gauge: connections the plan reserved, by endpoint type.
+///
+/// PLANNED, not alive. It is written once at bring-up and never moves again, so
+/// it answers "what did we intend?" and cannot answer "what is still running?".
+/// Use [`ALIVE_CONNECTIONS_GAUGE`] for the latter.
 pub const FEED_STACK_CONNECTIONS_GAUGE: &str = "tv_dhan_feed_stack_connections";
+
+/// Gauge: sockets whose supervisor task is still running, right now.
+///
+/// 2026-08-14. The lane had exactly two liveness signals and neither could see
+/// a PARTIAL failure: `tv_dhan_feed_stack_up` is cleared only when the ring
+/// closes — which needs EVERY sender dropped — and the planned-connections
+/// gauge is a boot-time constant. So four of five main-feed sockets could park
+/// and both signals would still read healthy while ~80% of the universe went
+/// dark. The park counter fires on the transition, but a counter cannot answer
+/// "how many are up right now", and a delta that already scrolled past is not
+/// a state anyone can query at 09:30.
+pub const ALIVE_CONNECTIONS_GAUGE: &str = "tv_dhan_ws_alive_connections";
+
+/// Live count behind [`ALIVE_CONNECTIONS_GAUGE`].
+static ALIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish the alive-socket count.
+fn publish_alive_connections(alive: usize) {
+    // `u32::try_from` then `f64::from`: lossless by construction (bounded by
+    // the 16-socket lock) and no lossy `as` cast to justify.
+    metrics::gauge!(ALIVE_CONNECTIONS_GAUGE)
+        .set(f64::from(u32::try_from(alive).unwrap_or(u32::MAX)));
+}
 
 /// Process-global once-guard: two feed stacks would fight over the same
 /// sixteen-socket budget and Dhan would answer by killing the oldest sockets.
@@ -1319,6 +1346,53 @@ const _: () = assert!(
      stops being a burst absorber and becomes a refusal gate"
 );
 
+/// The main feed's share of the ring's byte ceiling.
+///
+/// 2026-08-14: the ceiling above used to be ONE budget shared by all sixteen
+/// sockets, and the comment at its call site argued for that — "the heap it
+/// protects is one heap". True, and it still refused to bound five times the
+/// host's memory. But sharing one budget across endpoints that carry different
+/// PAYLOADS has a failure mode the memory argument misses:
+///
+/// a depth-200 frame may be 512 KiB against a main-feed frame's ~4 KiB, so
+/// roughly **512 depth frames exhaust the entire budget** — and every main-feed
+/// frame behind them is then refused. Depth frames are `depth_unconsumed`:
+/// counted and DISCARDED, because nothing folds them today. So the shared
+/// budget let a stream we throw away evict the only stream we keep.
+///
+/// Splitting the same total keeps the memory ceiling identical (the host is no
+/// worse off) and makes that eviction impossible: depth can exhaust depth.
+pub const MAIN_FEED_RING_MAX_BYTES: usize = FRAME_RING_MAX_BYTES * 3 / 4;
+
+/// Depth's share of the same ceiling — the other quarter, for both depth-20 and
+/// depth-200 together.
+///
+/// The split is 3:1 toward the main feed rather than by socket count (5 vs 10)
+/// because the split follows the DATA, not the sockets: the main feed carries
+/// every tick that reaches the database, and depth currently carries none.
+/// A quarter of 256 MiB is 64 MiB — still 128 maximum-size depth-200 frames,
+/// so depth keeps a real burst absorber rather than a token allocation.
+pub const DEPTH_RING_MAX_BYTES: usize = FRAME_RING_MAX_BYTES - MAIN_FEED_RING_MAX_BYTES;
+
+// The split must remain exhaustive: any drift turns a memory ceiling into
+// either an over-commitment of the host or a silently smaller ring.
+const _: () = assert!(
+    MAIN_FEED_RING_MAX_BYTES + DEPTH_RING_MAX_BYTES == FRAME_RING_MAX_BYTES,
+    "the per-endpoint budgets must sum to the total, or the host ceiling moved"
+);
+// Each share must still clear the same floor the total does, for the same
+// reason: a share below the largest admissible frame from its own endpoint
+// refuses every frame and reads as backpressure rather than as an outage.
+const _: () = assert!(
+    DEPTH_RING_MAX_BYTES > tickvault_core::websocket::connection::DEPTH_200_MAX_FRAME_BYTES * 64,
+    "the depth share must hold many maximum-size depth frames"
+);
+const _: () = assert!(
+    MAIN_FEED_RING_MAX_BYTES
+        > tickvault_core::websocket::connection::DEPTH_200_MAX_FRAME_BYTES * 64,
+    "the main-feed share must hold many maximum-size frames"
+);
+
 /// Counter: frames taken off the ring, labelled by what the parser made of
 /// them.
 pub const DRAIN_FRAMES_COUNTER: &str = "tv_dhan_feed_drain_frames_total";
@@ -1455,7 +1529,8 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
 async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
-    ring_budget: Arc<RingByteBudget>,
+    main_feed_budget: Arc<RingByteBudget>,
+    depth_budget: Arc<RingByteBudget>,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> DrainOutcome {
     let mut seen: u64 = 0;
@@ -1497,7 +1572,17 @@ async fn run_frame_drain(
                 // the bound would tighten precisely when the feed most needs
                 // head-room, and the process would strangle itself with what is
                 // meant to protect it.
-                ring_budget.release(frame.bytes.len());
+                //
+                // Released to the SAME budget that reserved it, chosen by the
+                // frame's own endpoint rather than by position. Releasing to
+                // the wrong pool would be worse than not splitting at all: one
+                // budget would drift permanently full while the other drifted
+                // negative-clamped to zero, so the feed would refuse frames it
+                // had head-room for and admit frames it did not.
+                match frame.endpoint {
+                    DhanEndpointType::MainFeed => main_feed_budget.release(frame.bytes.len()),
+                    _ => depth_budget.release(frame.bytes.len()),
+                }
                 seen = seen.saturating_add(1);
                 let c = counters();
                 let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -1988,7 +2073,7 @@ pub fn ws_lag_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<WsLa
 /// that instrument TRADES (LTT is last-trade time, so a thin option is
 /// legitimately minutes stale and would page constantly); per-socket lag
 /// isolates the thing we can act on — one connection delivering late.
-fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos: i64) {
+pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos: i64) {
     let handles = ws_lag_handles();
     match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
         Some(WsLag::Measured(ms)) => handles.for_connection(connection_index).record(ms),
@@ -2254,7 +2339,14 @@ async fn attach_depth_when_available(
     client_id: String,
     spill: Arc<WsFrameSpill>,
     frame_weak: tokio::sync::mpsc::WeakSender<CapturedFrame>,
-    ring_budget: Arc<RingByteBudget>,
+    // Depth's own budget, not the shared one. This path dials ONLY depth
+    // sockets, so passing the main feed's share here would silently undo the
+    // split it exists to enforce.
+    depth_budget: Arc<RingByteBudget>,
+    // Passed only because `dial_planned_connections` selects per endpoint; this
+    // path never produces a main-feed connection, and the plan builder is what
+    // guarantees that rather than this argument.
+    main_feed_budget: Arc<RingByteBudget>,
 ) {
     let mut attempts: u32 = 0;
     loop {
@@ -2317,7 +2409,8 @@ async fn attach_depth_when_available(
                         &client_id,
                         &spill,
                         &frame_tx,
-                        &ring_budget,
+                        &main_feed_budget,
+                        &depth_budget,
                     );
                     info!(
                         dialed,
@@ -2359,7 +2452,8 @@ fn dial_planned_connections(
     client_id: &str,
     spill: &Arc<WsFrameSpill>,
     frame_tx: &tokio::sync::mpsc::Sender<CapturedFrame>,
-    ring_budget: &Arc<RingByteBudget>,
+    main_feed_budget: &Arc<RingByteBudget>,
+    depth_budget: &Arc<RingByteBudget>,
 ) -> usize {
     let mut dialed = 0usize;
     for planned in plan.connections {
@@ -2393,10 +2487,16 @@ fn dial_planned_connections(
             DhanSocketParams::new(endpoint, base_url.to_string(), client_id.to_string()),
             current_feed_token,
         );
+        // Endpoint decides the budget. Depth may exhaust depth; it may not
+        // evict the feed that actually carries ticks.
+        let budget = match endpoint {
+            DhanEndpointType::MainFeed => main_feed_budget,
+            _ => depth_budget,
+        };
         let sink = Arc::new(WalRingSink::new(
             Arc::clone(spill),
             frame_tx.clone(),
-            Arc::clone(ring_budget),
+            Arc::clone(budget),
             WsType::LiveFeed,
             endpoint,
             // `global_index` (0..16), not `pool_index` — pool indices repeat
@@ -2405,6 +2505,9 @@ fn dial_planned_connections(
             planned.slot.global_index,
         ));
         let guard = planned.guard;
+        // Count it alive BEFORE the task starts, so the gauge can never read
+        // high because a spawn lost a race with its own decrement.
+        publish_alive_connections(ALIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst) + 1);
         tokio::spawn(async move {
             let exit = run_connection(socket, supervisor, guard, sink, || async {
                 // Post-807/809 re-dial: ask the token manager for a fresh JWT
@@ -2423,9 +2526,18 @@ fn dial_planned_connections(
                 }
             })
             .await;
+            // `run_connection` returning means this socket is GONE — parked,
+            // errored, or shut down. Nothing re-dials it, and its shard of the
+            // universe stops delivering. Publishing here is what turns
+            // "sockets we planned" into "sockets that exist".
+            let remaining = ALIVE_CONNECTIONS
+                .fetch_sub(1, Ordering::SeqCst)
+                .saturating_sub(1);
+            publish_alive_connections(remaining);
             info!(
                 endpoint = endpoint.as_str(),
                 pool_index = planned.slot.pool_index,
+                alive_connections = remaining,
                 ?exit,
                 "supervised Dhan live-feed connection finished"
             );
@@ -2647,20 +2759,44 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     }
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
-    // The ring's second bound. One budget shared by every socket, because the
-    // heap it protects is one heap: five main-feed connections each holding a
-    // per-pool share would bound five times the memory the host actually has.
-    let ring_budget = Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES));
+    // The ring's second bound, split by ENDPOINT rather than shared.
+    //
+    // One budget per POOL would bound five times the host's memory, which is
+    // why the original was shared. But one budget for ALL endpoints let the
+    // depth stream — whose frames are 512 KiB and whose payload is discarded
+    // unparsed — exhaust the whole ceiling and evict main-feed frames, i.e.
+    // every tick that reaches the database. Two budgets summing to the SAME
+    // total keep the host ceiling identical while making that eviction
+    // impossible.
+    let main_feed_budget = Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES));
+    let depth_budget = Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES));
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
-        Arc::clone(&ring_budget),
+        Arc::clone(&main_feed_budget),
+        Arc::clone(&depth_budget),
         Arc::clone(&params.shutdown),
     ));
 
     // ---- the sockets -------------------------------------------------------
-    let dialed =
-        dial_planned_connections(plan, &mut pool, &client_id, &spill, &frame_tx, &ring_budget);
+    //
+    // MAIN-FEED-DIAL-SITE: a deliberate, greppable anchor. Two source-order
+    // guards below depend on finding THIS call and not the depth one or the
+    // function's own definition, and they used to anchor on the literal
+    // `dial_planned_connections(plan` — which broke the moment the argument
+    // list wrapped onto its own line for an unrelated reason. A marker that
+    // exists to be found cannot be broken by rustfmt; an incidental text
+    // pattern can, and when it does the guard fails for a reason that has
+    // nothing to do with the invariant it protects.
+    let dialed = dial_planned_connections(
+        plan,
+        &mut pool,
+        &client_id,
+        &spill,
+        &frame_tx,
+        &main_feed_budget,
+        &depth_budget,
+    );
 
     // Depth late-attach. Depth's instrument set is derived from
     // `option_chain_1m`, which the option-chain leg does not populate until its
@@ -2686,7 +2822,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             client_id.clone(),
             Arc::clone(&spill),
             frame_tx.downgrade(),
-            Arc::clone(&ring_budget),
+            Arc::clone(&depth_budget),
+            Arc::clone(&main_feed_budget),
         ));
     }
 
@@ -2728,7 +2865,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // 16 GiB memory ceiling hide behind a 65,536 that looks modest. An
         // operator reading this line should be able to see the queue's real
         // size in the unit that runs out.
-        ring_max_bytes = ring_budget.cap(),
+        ring_max_bytes = main_feed_budget.cap() + depth_budget.cap(),
+        // Both shares, because the split is the thing an operator needs to
+        // reason about when one endpoint starts refusing and the other does not.
+        ring_main_feed_max_bytes = main_feed_budget.cap(),
+        ring_depth_max_bytes = depth_budget.cap(),
         "Dhan 16-connection live feed is up: sockets dialed, frames captured to the WAL before \
          broadcast, and the tick fold is consuming the ring"
     );
@@ -3107,7 +3248,7 @@ mod tests {
     }
 
     #[test]
-    fn ws_lag_handles_are_resolved_once_and_never_allocate_per_tick() {
+    fn record_ws_lag_uses_resolved_handles_and_never_allocates_per_tick() {
         // The first cut of `record_ws_lag` built its label with
         // `connection_index.to_string()`, which allocated a String AND — because
         // a non-literal label value drops the macro to its `vec![Label::new(..)]`
@@ -3630,7 +3771,7 @@ mod tests {
         // the same class of mistake as the earlier bare-"dial" anchor that
         // matched a doc comment.
         let dial = production
-            .find("dial_planned_connections(plan")
+            .find("MAIN-FEED-DIAL-SITE")
             .expect("the dial call site must exist inside the bring-up");
 
         assert!(
@@ -4267,7 +4408,8 @@ mod tests {
             run_frame_drain(
                 rx,
                 ingest,
-                Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
             ),
         )
@@ -4328,7 +4470,8 @@ mod tests {
         let drain = tokio::spawn(run_frame_drain(
             rx,
             ingest,
-            Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+            Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+            Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
             Arc::clone(&shutdown),
         ));
 
@@ -4388,7 +4531,8 @@ mod tests {
             run_frame_drain(
                 rx,
                 ingest,
-                Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
             ),
         )
@@ -4838,7 +4982,7 @@ mod tests {
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);
         let main_dial = production
-            .find("dial_planned_connections(plan")
+            .find("MAIN-FEED-DIAL-SITE")
             .expect("the main-feed dial call site must exist");
         let depth_attach = production
             .find("tokio::spawn(attach_depth_when_available(")

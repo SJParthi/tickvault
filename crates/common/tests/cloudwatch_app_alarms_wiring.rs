@@ -584,8 +584,8 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // cardinality this ratchet exists to make someone think about.
     assert_eq!(
         names.len(),
-        67,
-        "Z+ L2 VERIFY ratchet: expected exactly 67 names in the MAIN EMF \
+        68,
+        "Z+ L2 VERIFY ratchet: expected exactly 68 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
@@ -600,7 +600,11 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
          adversarial sweep found: when the resolved-master artifact is missing, the lane \
          subscribes 4 instruments instead of 4,565 and every OTHER signal reads healthy \
          — lane up, ticks flowing, never-ticked zero, because only the subscribed set is \
-         seeded. +$0.60/mo); found {}: \
+         seeded. +$0.60/mo; plus tv_dhan_ws_alive_connections, added the same day — \
+         the lane had NO signal for PARTIAL socket loss, because stack_up clears only \
+         when the frame ring closes (every sender dropped) and the planned-connections \
+         gauge is a boot-time constant, so four of five sockets could park with both \
+         reading healthy. +$0.30/mo); found {}: \
          {names:?}. Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose \
          budget actions STOP the prod box at 90% — update this count deliberately, \
          with a dated cost note, never as a drive-by.",
