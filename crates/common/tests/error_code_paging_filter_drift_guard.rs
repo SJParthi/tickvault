@@ -1144,3 +1144,104 @@ fn synthetic_emit_detector_is_level_aware() {
                         ErrorCode::Proc01OomKillDetected.code_str(), \"m\"); }\n";
     assert!(synth_detect(fields_first, "Proc01OomKillDetected"));
 }
+
+// ---------------------------------------------------------------------
+// AWS ceiling: alarm_description is limited to 1024 characters
+// ---------------------------------------------------------------------
+
+/// Every alarm description must fit AWS's 1024-character ceiling, INCLUDING
+/// the provenance suffix the resource appends to it.
+///
+/// # Why this exists
+///
+/// A `desc` that is one character too long is not a lint. It is a hard
+/// `terraform plan` failure:
+///
+/// ```text
+/// Error: expected length of alarm_description to be in the range (0 - 1024),
+/// got RISK-GAP-03: the live feed is CONNECTED BUT HEARING NOTHING ...
+/// ```
+///
+/// That failure arrived from CI at 07:23 on 2026-08-15, minutes after the
+/// alarm was written, on a job that needs AWS credentials and therefore
+/// cannot run locally at all. Nothing in the repository could have caught it
+/// first — the descriptions are prose in a `.tf` map, and prose grows.
+///
+/// The count is deliberately made HERE, in a test that runs on every PR
+/// without credentials, so the feedback arrives at `cargo test` speed rather
+/// than at `terraform plan` speed. The suffix is included because it is what
+/// actually pushed the offending entry over: the desc alone was 957 and the
+/// rendered description was 1119.
+///
+/// The margin is not cosmetic either. These strings ARE the runbook the
+/// operator reads at 2am, so the pressure is always to write more; a limit
+/// that is only discovered by exceeding it gets discovered while someone is
+/// mid-incident.
+#[test]
+fn every_alarm_description_fits_the_aws_ceiling_with_its_suffix() {
+    const AWS_ALARM_DESCRIPTION_MAX: usize = 1024;
+
+    let tf = read("deploy/aws/terraform/error-code-alarms.tf");
+    let stripped = strip_hcl_comments(&tf);
+
+    // The suffix the `aws_cloudwatch_metric_alarm.error_code` resource
+    // interpolates after `each.value.desc`. Measured from the resource itself
+    // rather than hardcoded, so editing the suffix cannot silently eat the
+    // headroom this test is protecting.
+    let suffix_len = stripped
+        .lines()
+        .find(|l| l.contains("alarm_description") && l.contains("each.value.desc"))
+        .map(|l| {
+            // Everything after the `${each.value.desc}` interpolation, minus
+            // the trailing quote. `${var.environment}` renders to "prod",
+            // which is longer than the literal — count it as 4 to be safe.
+            let after = l.split("${each.value.desc}").nth(1).unwrap_or("");
+            after.trim_end().trim_end_matches('"').len()
+        })
+        .expect("the error_code alarm resource must build alarm_description from each.value.desc");
+
+    let mut over: Vec<String> = Vec::new();
+    let mut worst = 0usize;
+
+    for entry in stripped.split("desc        = \"").skip(1) {
+        let Some(end) = entry.find("\"\n") else {
+            continue;
+        };
+        let desc_len = entry[..end].len();
+        let total = desc_len + suffix_len;
+        worst = worst.max(total);
+        if total > AWS_ALARM_DESCRIPTION_MAX {
+            let head: String = entry[..end.min(70)].to_string();
+            over.push(format!("{total} chars: {head}…"));
+        }
+    }
+    // The `desc = "` (single-space) form the risk-gap-03 entry uses.
+    for entry in stripped.split("desc = \"").skip(1) {
+        let Some(end) = entry.find("\"\n") else {
+            continue;
+        };
+        let desc_len = entry[..end].len();
+        let total = desc_len + suffix_len;
+        worst = worst.max(total);
+        if total > AWS_ALARM_DESCRIPTION_MAX {
+            let head: String = entry[..end.min(70)].to_string();
+            over.push(format!("{total} chars: {head}…"));
+        }
+    }
+
+    assert!(
+        worst > 0,
+        "parser self-check: no alarm descriptions were measured, so this test \
+         would pass vacuously against any length"
+    );
+    assert!(
+        over.is_empty(),
+        "these alarm descriptions exceed the AWS 1024-character ceiling once \
+         the {suffix_len}-char provenance suffix is appended, and will FAIL \
+         `terraform plan`:\n  {}\n\nShorten the `desc`. Keep the triage steps \
+         and drop the restatement — the operator reads this mid-incident, so \
+         the first sentence and the concrete next action are what has to \
+         survive.",
+        over.join("\n  ")
+    );
+}

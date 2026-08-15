@@ -549,7 +549,10 @@ locals {
       eval        = 1
       dta         = 1
       ok_recovery = true # silence genuinely ends - unlike a dropped frame, this recovery is real
-      desc        = "RISK-GAP-03: the live feed is CONNECTED BUT HEARING NOTHING from instruments it subscribed. The 30s silence scan found instruments quiet beyond their own learned cadence, or that never ticked at all since being subscribed - the second is the serious one, because a subscribe that silently did not take leaves no other trace: no payload, no parse failure, no error, and every loss counter reads a healthy zero. Fires once per episode, gated to the continuous session (09:15+) so the legitimately-silent pre-open never pages. Triage: read tv_dhan_feed_instruments_never_ticked vs tv_dhan_feed_instruments_silent on the operator dashboard live-lane row - never_ticked climbing means subscriptions are not taking (check tv_dhan_ws_subscribe_failed_total and the subscribe batches in the app log); silent climbing with never_ticked at zero usually means a thin universe on a quiet day, not a fault. Runbook: .claude/rules/project/gap-enforcement.md (RISK-GAP-03)"
+      # Kept under the 1024-char alarm_description ceiling INCLUDING the
+      # suffix the resource appends (~162 chars) - see the length guard in
+      # crates/common/tests/error_code_paging_filter_drift_guard.rs.
+      desc = "RISK-GAP-03: the live feed is CONNECTED BUT HEARING NOTHING from instruments it subscribed. The 30s silence scan found instruments quiet beyond their own learned cadence, or that never ticked at all - the second is the serious one, because a subscribe that silently did not take leaves NO other trace: no payload, no parse failure, no error, and every loss counter reads a healthy zero. Once per episode, session-gated so the legitimately-silent pre-open never pages. Triage on the dashboard live-lane row: never_ticked climbing means subscriptions are not taking (check tv_dhan_ws_subscribe_failed_total and the subscribe batches in the app log); silent climbing while never_ticked stays 0 is usually a thin universe on a quiet day, not a fault. Runbook: .claude/rules/project/gap-enforcement.md"
     }
   }
 }
