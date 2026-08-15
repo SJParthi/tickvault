@@ -340,6 +340,104 @@ impl TokenManager {
             renew_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
+        // FIRST path: adopt the SHARED token from SSM.
+        //
+        // # The re-mint war this ends (prod evidence, 2026-08-14/15)
+        //
+        // Dhan permits ONE active token per account. Two minters exist against
+        // this one: the `tv-<env>-dhan-token-minter` Lambda at 06:05 IST, and
+        // this process at boot. `groww-shared-token-minter-2026-07-02.md`
+        // §10.3 predicted exactly this and left the fix as REQUIRED before the
+        // box next ran — "tickvault must READ this parameter instead of
+        // minting". The box then ran for days without it.
+        //
+        // The signature is in the log: `CHAIN-04 ... http 401 ...
+        // "808":"Authentication Failed - Client ID or Token invalid"` at 08:32
+        // IST, minutes after a boot that took the local-cache fast path below
+        // and adopted a token the 06:05 Lambda mint had already killed.
+        //
+        // # Why it is placed BEFORE the local cache, not after
+        //
+        // That ordering is the entire fix. The local cache is this box's
+        // memory of a token IT minted; the SSM parameter is the account-wide
+        // truth written by the scheduled minter. When they disagree, the cache
+        // is the stale one by construction — the Lambda mints daily at 06:05
+        // and the cache survives from whenever this box last minted. Reading
+        // the cache first is what turned a healthy shared token into a 401.
+        //
+        // # Fail-soft in every direction
+        //
+        // A missing parameter, an unreadable one, a token whose `exp` cannot
+        // be decoded, or one already expired: each falls through to the paths
+        // below unchanged. This can adopt a good token or do nothing — it has
+        // no branch that makes a working boot worse.
+        match secret_manager::fetch_dhan_access_token().await {
+            Ok(shared) => {
+                let raw = shared.expose_secret();
+                match crate::auth::types::jwt_exp_epoch_seconds(raw) {
+                    Some(exp_secs) => {
+                        let now_ist = chrono::Utc::now()
+                            .with_timezone(&tickvault_common::trading_calendar::ist_offset());
+                        let expires_at = chrono::DateTime::from_timestamp(exp_secs, 0).map(|dt| {
+                            dt.with_timezone(&tickvault_common::trading_calendar::ist_offset())
+                        });
+                        match expires_at {
+                            Some(expires_at) if expires_at > now_ist => {
+                                let state = TokenState::from_cached(
+                                    secrecy::SecretString::from(raw.to_owned()),
+                                    expires_at,
+                                    now_ist,
+                                );
+                                manager.token.store(Arc::new(Some(state)));
+                                info!(
+                                    expires_at = %manager.current_expiry_display(),
+                                    "adopted the SHARED Dhan token from SSM — no mint, so the \
+                                     scheduled minter's token stays the one active token for \
+                                     this account"
+                                );
+                                notifier.notify(NotificationEvent::AuthenticationSuccess);
+                                return Ok(manager);
+                            }
+                            Some(expires_at) => {
+                                warn!(
+                                    %expires_at,
+                                    "the shared Dhan token in SSM has already expired — falling \
+                                     back. If this repeats daily the scheduled minter is not \
+                                     running; check the tv-<env>-dhan-token-minter Lambda before \
+                                     assuming this box needs to mint"
+                                );
+                            }
+                            None => {
+                                warn!(
+                                    exp_secs,
+                                    "the shared Dhan token's exp claim is not a representable \
+                                     timestamp — declining to adopt rather than guessing an \
+                                     expiry, which would let the renewal loop sleep through the \
+                                     real one"
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        warn!(
+                            "could not read an exp claim from the shared Dhan token — declining \
+                             to adopt. A guessed expiry is worse than no adoption: the renewal \
+                             loop would sleep past the real expiry and the first symptom would \
+                             be a 401 mid-session"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                info!(
+                    error = %err,
+                    "no shared Dhan token available in SSM — this box will mint its own. That is \
+                     correct when the scheduled minter has not run yet, and a re-mint war when it \
+                     has, so a repeating message here is worth investigating"
+                );
+            }
+        }
+
         // Fast path: try loading a cached token from a previous run.
         // This skips the Dhan HTTP auth call (~500ms-2s), saving significant
         // boot time on crash recovery. SSM credentials are still fetched above
@@ -4138,6 +4236,92 @@ mod tests {
             acquire_body.contains("last_mint_attempt"),
             "acquire_token must STAMP the mint attempt so all \
              renew_with_fallback callers share one cooldown window"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_token_adoption_tests {
+    /// The shared-token read must come BEFORE the local-cache fast path.
+    ///
+    /// # Why the ORDER is the fix, not the read
+    ///
+    /// Adding a shared-token read *after* the local cache would change
+    /// nothing: the cache hit returns early, so the read would never run on
+    /// the boot that matters. That is precisely the boot that produced the
+    /// 2026-08-14 401 — a locally-cached token, minted by this box on an
+    /// earlier day, adopted at 08:31 after the scheduled Lambda had already
+    /// invalidated it at 06:05.
+    ///
+    /// The two sources disagree in one direction by construction. The Lambda
+    /// mints daily; the cache survives from whenever this box last minted. So
+    /// when they differ, the cache is the stale one — and reading it first is
+    /// what turns a healthy shared token into an authentication failure.
+    ///
+    /// A source-order scan rather than a behavioural test because both paths
+    /// need real SSM and a real Dhan account; the ordering is the whole
+    /// contract and it is statically checkable.
+    #[test]
+    fn test_shared_ssm_token_is_read_before_the_local_cache() {
+        let src = include_str!("token_manager.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        let shared = production
+            .find("secret_manager::fetch_dhan_access_token()")
+            .expect("initialize must read the shared token from SSM");
+        let cache = production
+            .find("token_cache::load_token_cache(")
+            .expect("the local-cache fast path must still exist");
+
+        assert!(
+            shared < cache,
+            "the local-cache fast path is read BEFORE the shared SSM token \
+             (shared @{shared}, cache @{cache}). The cache returns early on a \
+             hit, so the shared read would never run on the boot that matters \
+             — the one after the scheduled minter replaced the token this box \
+             had cached. That is the 2026-08-14 401 exactly."
+        );
+    }
+
+    #[test]
+    fn test_adoption_declines_rather_than_guessing_an_expiry() {
+        let src = include_str!("token_manager.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        // The adoption block must consult the token's own exp claim. A default
+        // validity here would be actively dangerous: a token minted at 06:05
+        // and adopted at 15:00 would be treated as fresh until the following
+        // afternoon, so the renewal loop would sleep through its real expiry
+        // and the first symptom would be a 401 mid-session.
+        assert!(
+            production.contains("jwt_exp_epoch_seconds"),
+            "the shared-token adoption must read the JWT's own exp claim — a \
+             token adopted with an assumed expiry is worse than one not \
+             adopted at all"
+        );
+        // And an already-expired shared token must NOT be adopted.
+        assert!(
+            production.contains("Some(expires_at) if expires_at > now_ist"),
+            "adoption must refuse an already-expired shared token; adopting \
+             one would replace a mintable boot with a guaranteed 401"
+        );
+    }
+
+    #[test]
+    fn test_the_publisher_still_exists_so_a_fallback_mint_is_shared() {
+        let src = include_str!("token_manager.rs");
+        // If this box DOES fall through and mint (the scheduled minter has not
+        // run, or its token is unreadable), the result must still be published
+        // so the account converges on one token again rather than this box
+        // hoarding a private one — which is the original defect the publisher
+        // was added for, arriving from the other side.
+        assert!(
+            src.contains("dhan_token_publisher::spawn_publish_dhan_token"),
+            "the token publisher was removed. Adoption handles the normal day; \
+             the publisher is what makes a FALLBACK mint converge instead of \
+             starting a fresh war"
         );
     }
 }
