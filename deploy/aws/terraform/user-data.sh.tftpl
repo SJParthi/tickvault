@@ -225,25 +225,16 @@ sudo -u ec2-user git clone --depth 1 \
 cp -f /opt/tickvault/repo/config/*.toml /opt/tickvault/config/ 2>/dev/null || true
 chown -R ec2-user:ec2-user /opt/tickvault/config
 
-# ---- Step 5c: Kernel network tuning (the anti-tick-loss settings) ----
-# Content + rationale: deploy/aws/sysctl/99-tickvault-net.conf (kept in the repo,
-# not inline — EC2 caps user-data at 16384 B; inlining broke plan 2026-08-10).
-# Applied post-clone because that is the first point the file exists.
-cp -f /opt/tickvault/repo/deploy/aws/sysctl/99-tickvault-net.conf /etc/sysctl.d/ || true
-# BBR only if the module actually loads — an unavailable value fails
+# ---- Step 5c: BBR (once — the drop-ins persist across boots) ----
+# Only if the module actually loads: an unavailable value fails
 # `sysctl --system` as a whole and would strip the receive buffers with it.
 if modprobe tcp_bbr 2>/dev/null; then
     echo 'net.ipv4.tcp_congestion_control = bbr' > /etc/sysctl.d/99-tickvault-bbr.conf
     echo tcp_bbr > /etc/modules-load.d/tickvault-bbr.conf
 fi
-sysctl --system >/dev/null 2>&1 || echo "user-data: WARNING sysctl --system non-zero"
-# Verify EVERY load-bearing value, not just rmem_max, and report to journald +
-# /opt/tickvault/net-tuning.status so the verdict outlives cloud-init's log.
-# Non-zero exit is deliberate and deliberately not fatal — see the script header.
-bash /opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh || true
 
-# ---- Step 5d: Non-sysctl host tuning (THP + clock) ----
-bash /opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh || true
+# ---- Step 5d: all other tuning = tickvault-host-tuning.service (Step 7) ----
+# Moved there so it re-runs EVERY boot, not once per instance. Why: unit header.
 
 # ---- Step 6: Start the Docker Compose stack ----
 # Post-CloudWatch-only migration (#O1/#O2/#O3/#O4): the stack is QuestDB
@@ -268,14 +259,8 @@ cp /opt/tickvault/repo/deploy/systemd/tickvault.service /etc/systemd/system/
 chmod +x /opt/tickvault/repo/deploy/aws/holiday-gate.sh
 cp /opt/tickvault/repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/
 
-# Host tuning as a BOOT unit, not a launch-time script (2026-08-15).
-#
-# The Step-5c/5d calls above run exactly once, when this instance is created.
-# The box stops and starts every weekday, and THP is a /sys write that does not
-# survive a reboot — so every trading day after the first ran on distro-default
-# huge pages, and any tuning merged after the last instance replacement had
-# never been applied at all. The scripts' own headers say "every boot"; this is
-# the wiring that makes that true.
+# Host tuning as a BOOT unit, not a launch-time script (2026-08-15) — see the
+# unit header for why per-instance wiring silently under-tuned every restart.
 chmod +x /opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh
 chmod +x /opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh
 cp /opt/tickvault/repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/
@@ -284,6 +269,7 @@ systemctl daemon-reload
 systemctl enable tickvault.service
 systemctl enable tickvault-holiday-gate.service
 systemctl enable tickvault-host-tuning.service
+systemctl start tickvault-host-tuning.service || true
 
 echo "=== tickvault user-data complete at $(date -u) ==="
 echo "Next step: GitHub Actions deploy-aws workflow will scp the first binary."
