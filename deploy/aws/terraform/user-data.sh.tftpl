@@ -268,9 +268,22 @@ cp /opt/tickvault/repo/deploy/systemd/tickvault.service /etc/systemd/system/
 chmod +x /opt/tickvault/repo/deploy/aws/holiday-gate.sh
 cp /opt/tickvault/repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/
 
+# Host tuning as a BOOT unit, not a launch-time script (2026-08-15).
+#
+# The Step-5c/5d calls above run exactly once, when this instance is created.
+# The box stops and starts every weekday, and THP is a /sys write that does not
+# survive a reboot — so every trading day after the first ran on distro-default
+# huge pages, and any tuning merged after the last instance replacement had
+# never been applied at all. The scripts' own headers say "every boot"; this is
+# the wiring that makes that true.
+chmod +x /opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh
+chmod +x /opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh
+cp /opt/tickvault/repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/
+
 systemctl daemon-reload
 systemctl enable tickvault.service
 systemctl enable tickvault-holiday-gate.service
+systemctl enable tickvault-host-tuning.service
 
 echo "=== tickvault user-data complete at $(date -u) ==="
 echo "Next step: GitHub Actions deploy-aws workflow will scp the first binary."
