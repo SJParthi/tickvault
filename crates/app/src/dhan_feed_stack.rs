@@ -1795,38 +1795,30 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Flushes the depth ILP buffer, if a depth ingest is wired.
+/// Has a RISK-GAP-03 page fired recently enough to suppress the next one?
 ///
-/// Deliberately a separate call from the tick flush rather than folded into
-/// it: the two writers hold independent buffers over independent tables, and
-/// a tick-flush failure must not skip the depth flush (nor the reverse). The
-/// writer already discards-and-logs its own failure, so the failure is loud at
-/// its source and this wrapper does not need to re-report it.
-fn flush_depth(depth: Option<&mut DepthIngest>) {
-    let Some(depth) = depth else { return };
-    if depth.pending_rows() == 0 {
-        return;
-    }
-    // The writer counts its own discards, but that counter lives in the
-    // storage crate and is NOT the EMF-shipped name. Mirroring the DELTA into
-    // the labelled drain counter is what makes a database-side depth loss
-    // visible in CloudWatch at all — and the delta, not the total, because a
-    // cumulative would read alarming forever after one bad flush.
-    let before = depth.dropped_rows();
-    if let Err(err) = blocking_flush(|| depth.flush()) {
-        // Deliberately `debug!`, not a second `error!`: the writer already
-        // logged this failure at ERROR with the discarded row count, and
-        // re-reporting it here would double every depth flush failure in the
-        // log while adding nothing an operator can act on.
-        tracing::debug!(
-            ?err,
-            "market_depth flush failed (already reported by the writer)"
-        );
-    }
-    let delta = depth.dropped_rows().saturating_sub(before);
-    if delta > 0 {
-        counters().depth_dropped.increment(delta);
-    }
+/// Extracted as a pure function rather than written inline because the inline
+/// form was only checkable by a source scan, and a source scan for a literal
+/// is defeated by the same blanket edit that would break the code — a first
+/// draft of that guard rewrote the assertion and the call site together and
+/// passed. Behaviour is testable; text is not.
+///
+/// Returns `false` when no page has fired yet, so the FIRST page of a session
+/// is never suppressed.
+///
+/// # Clock, not counter
+///
+/// Both arguments are seconds. The call site sits a few lines below a binding
+/// named `now` that holds `ingest.refusals()` — a counter — so passing the
+/// wrong one compiles and produces a cooldown that is either permanent or
+/// inert depending on how many refusals happened to have occurred.
+/// `test_a_counter_shaped_value_does_not_silently_work_as_a_clock` pins the
+/// consequence.
+fn silence_page_is_cooling(last_page_secs: Option<u64>, now_secs: u64, cooldown: u64) -> bool {
+    // saturating_sub, because a clock that steps backwards (NTP correction)
+    // must not wrap into a gigantic elapsed value and silently clear the
+    // cooldown at the one moment the log is hardest to read.
+    last_page_secs.is_some_and(|last| now_secs.saturating_sub(last) < cooldown)
 }
 
 async fn run_frame_drain(
@@ -1858,6 +1850,10 @@ async fn run_frame_drain(
     // once, the falling edge logs recovery at info and re-arms.
     let mut silent_scans: u32 = 0;
     let mut silence_reported = false;
+    /// Shortest gap between two RISK-GAP-03 pages, however many separate
+    /// silence episodes occur inside it. See `last_silence_page` below.
+    const SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800;
+    let mut last_silence_page: Option<u64> = None;
     // Last reported aggregator-refusal totals, so the 30s arm can report a
     // DELTA rather than a cumulative that looks alarming forever after one
     // bad minute.
@@ -2120,40 +2116,61 @@ async fn run_frame_drain(
                         );
                     }
                     silent_scans = 0;
-                    // Re-arm ONLY when nothing is still in the never-ticked
-                    // set.
+                    // Re-arm only once nothing is left in the never-ticked
+                    // set. `never_ticked` is one-way within a session — an
+                    // instrument leaves it only by producing something, which
+                    // also removes it from `silent` — so re-paging while it is
+                    // non-zero restates a fact that cannot have changed.
                     //
-                    // # The alarm storm this prevents (prod evidence,
-                    // # 2026-08-14)
-                    //
-                    // This latch cleared on any scan where `silent` happened
-                    // to read 0, and the result was 25 distinct RISK-GAP-03
-                    // emits in one session — 09:15, then roughly every two to
-                    // five minutes from 12:59 to 14:53 — for a condition that
-                    // never changed: `never_ticked=4` of 4 instruments, all
-                    // day. The count oscillated because a sparse-cadence
-                    // instrument drifts in and out of the silent set; the
-                    // never-ticked set did not move at all.
-                    //
-                    // `never_ticked` is one-way within a session. An
-                    // instrument that has produced nothing can only leave that
-                    // set by producing something, and producing something also
-                    // takes it out of `silent`. So re-paging while it is
-                    // non-zero cannot carry new information — it is the same
-                    // fact, restated every few minutes.
-                    //
-                    // That matters because RISK-GAP-03 gained a CloudWatch
-                    // page on 2026-08-15. Without this, an unchanged condition
-                    // would have produced ~25 alarm transitions per session,
-                    // which is how an operator learns to ignore a pager.
+                    // This gate alone is NOT what stops the page storm; see
+                    // the cooldown at the emit below, and the measured numbers
+                    // recorded there.
                     if never == 0 {
                         silence_reported = false;
                     }
                     continue;
                 }
                 silent_scans = silent_scans.saturating_add(1);
-                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported {
+                // A cooldown between PAGES, not between episodes.
+                //
+                // # What the 2026-08-14 session actually did
+                //
+                // 25 distinct RISK-GAP-03 emits in one trading day. The
+                // `silent` count oscillated the whole time — 4, 9, 1, 2, 1, 3,
+                // 208, 10 — clearing to zero between episodes and re-arming
+                // the latch each time, entirely legitimately: these are
+                // sparse-cadence instruments going quiet and coming back.
+                //
+                // So the per-episode latch was working exactly as designed and
+                // still produced ~25 pages, because the real world produced ~25
+                // episodes. `never_ticked` was 4 on the 09:15 emit and 0 on
+                // every one after it, so the feed WAS delivering — gating on
+                // never-ticked alone (above) would have suppressed almost none
+                // of this.
+                //
+                // That became a paging problem on 2026-08-15, when RISK-GAP-03
+                // gained a CloudWatch alarm: at a 5-minute window with a
+                // recovery page, 25 episodes is ~50 operator messages a day.
+                // Half an hour is chosen to sit above the observed inter-episode
+                // gap (two to five minutes through the afternoon) while staying
+                // far below the session, so a genuinely new problem hours later
+                // still pages.
+                //
+                // The counter is deliberately NOT gated — every episode still
+                // increments `tv_dhan_feed_instruments_silent`, so the
+                // suppressed ones remain countable on the dashboard. Only the
+                // page is rate-limited, and the log line says how many were
+                // folded in.
+                // `now_millis`, not `now` — the latter is bound to
+                // `ingest.refusals()` a few lines above, which is a COUNTER.
+                // Dividing it by 1,000 compiles and yields a plausible-looking
+                // small number that has nothing to do with time.
+                let now_secs = now_millis / 1_000;
+                let cooling =
+                    silence_page_is_cooling(last_silence_page, now_secs, SILENCE_PAGE_COOLDOWN_SECS);
+                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported && !cooling {
                     silence_reported = true;
+                    last_silence_page = Some(now_secs);
                     error!(
                         code = ErrorCode::RiskGapTickGap.code_str(),
                         silent,
@@ -6960,66 +6977,138 @@ mod host_sizing_tests {
 
 #[cfg(test)]
 mod silence_latch_tests {
-    /// The silence latch must not re-arm while instruments have never ticked.
+    use super::silence_page_is_cooling;
+
+    /// RISK-GAP-03 must be rate-limited between PAGES, not just per episode.
     ///
-    /// # The alarm storm this pins shut (prod evidence, 2026-08-14)
+    /// # What the 2026-08-14 session actually did
     ///
-    /// The latch cleared on any scan where the silent count happened to read
-    /// zero. That produced 25 distinct RISK-GAP-03 emits in one session — at
-    /// 09:15, then every two to five minutes from 12:59 to 14:53 — for a
-    /// condition that never changed once: `never_ticked=4` of 4 instruments,
-    /// all day. The silent count oscillated because a sparse-cadence
-    /// instrument drifts in and out of that set; the never-ticked set never
-    /// moved.
+    /// 25 distinct emits in one trading day. The `silent` count oscillated
+    /// throughout — 4, 9, 1, 2, 1, 3, 208, 10 — clearing to zero between
+    /// episodes and re-arming the per-episode latch each time, entirely
+    /// legitimately: sparse-cadence instruments go quiet and come back.
     ///
-    /// `never_ticked` is one-way within a session: an instrument leaves it
-    /// only by producing something, which also removes it from `silent`. So a
-    /// re-page while it is non-zero cannot carry new information.
+    /// So the latch worked exactly as designed and still produced ~25 pages,
+    /// because the world produced ~25 episodes. `never_ticked` was 4 on the
+    /// 09:15 emit and 0 on every one after it, so the feed WAS delivering.
     ///
-    /// It stopped being cosmetic on 2026-08-15, when RISK-GAP-03 gained a
-    /// CloudWatch page. An unchanged condition emitting 25 times per session
-    /// is how an operator learns to ignore a pager — and the pager they learn
-    /// to ignore is the only signal that exists for a subscribe that silently
+    /// That became a paging problem on 2026-08-15, when RISK-GAP-03 gained a
+    /// CloudWatch alarm: 25 episodes at a 5-minute window with a recovery page
+    /// is ~50 operator messages a day, which is how a pager gets ignored — and
+    /// this one is the only signal that exists for a subscribe that silently
     /// did not take.
     ///
     /// A source scan because reproducing it behaviourally needs a live socket,
-    /// a seeded universe and eleven minutes of wall clock; the re-arm
-    /// condition is one line and its shape is the whole fix.
+    /// a seeded universe and a session of wall clock; the emit condition is
+    /// one expression and its shape is the whole fix.
     #[test]
-    fn test_silence_latch_does_not_rearm_while_instruments_have_never_ticked() {
+    fn test_risk_gap_03_page_is_rate_limited_across_episodes() {
         let src = include_str!("dhan_feed_stack.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);
 
-        let zero_arm = production
-            .find("if silent == 0 {")
-            .expect("the silence loop must have a cleared-silence arm");
-        let after = &production[zero_arm..];
-        let arm_end = after
-            .find("silent_scans = silent_scans.saturating_add(1);")
-            .unwrap_or(after.len());
-        let arm = &after[..arm_end];
-
         assert!(
-            arm.contains("if never == 0 {"),
-            "the cleared-silence arm re-arms the page latch unconditionally. \
-             That re-pages an unchanged never-ticked condition every few \
-             minutes — 25 times in the 2026-08-14 session — and RISK-GAP-03 \
-             now drives a CloudWatch page"
+            production.contains("!silence_reported && !cooling"),
+            "the RISK-GAP-03 emit is gated only by the per-episode latch. The \
+             2026-08-14 session had ~25 legitimate episodes, so a per-episode \
+             latch pages ~25 times — and this code now drives a CloudWatch alarm"
         );
         assert!(
-            arm.contains("silence_reported = false;"),
-            "the arm must still be ABLE to re-arm — a latch that never clears \
-             would report the first episode of the day and stay silent through \
-             every later one"
+            production.contains("SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800"),
+            "the page cooldown must sit above the observed inter-episode gap \
+             (two to five minutes on 2026-08-14) and far below a session, so a \
+             genuinely new problem hours later still pages"
+        );
+
+        // The suppressed episodes must stay COUNTABLE. Rate-limiting the page
+        // while also gating the gauge would trade a noisy signal for no signal.
+        let scan_arm = production
+            .split("let (silent, never) = ingest.scan_silence(now_millis);")
+            .nth(1)
+            .unwrap_or_default();
+        let gauge = scan_arm
+            .find("tv_dhan_feed_instruments_silent")
+            .expect("the silent gauge must publish from the scan arm");
+        let cooldown = scan_arm.find("!cooling").unwrap_or(usize::MAX);
+        assert!(
+            gauge < cooldown,
+            "the silent gauge publishes after the page gate, so a rate-limited \
+             episode would go uncounted as well as unpaged"
         );
     }
 
-    /// The alarm window must be wide enough to absorb the oscillation.
+    /// The first page of a session is never suppressed.
+    #[test]
+    fn test_the_first_silence_page_of_a_session_always_fires() {
+        assert!(
+            !silence_page_is_cooling(None, 34_200, 1_800),
+            "no page has fired yet, so nothing can be cooling — suppressing \
+             the first page would lose the 09:15 emit entirely"
+        );
+    }
+
+    /// The observed inter-episode gap must be suppressed; a later hour must not.
+    #[test]
+    fn test_the_cooldown_spans_the_observed_episode_gap_but_not_the_session() {
+        let first = 46_800; // 13:00 IST, in seconds of day
+
+        // 2026-08-14 re-fired every two to five minutes through the
+        // afternoon. Every one of those must fold into the first page.
+        for gap in [120, 180, 300, 600, 1_799] {
+            assert!(
+                silence_page_is_cooling(Some(first), first + gap, 1_800),
+                "a re-fire {gap}s later still pages. The 2026-08-14 session \
+                 had ~25 legitimate episodes at exactly these gaps, which is \
+                 ~50 operator messages once the CloudWatch alarm is attached"
+            );
+        }
+
+        // A genuinely new problem later must still reach the operator.
+        for gap in [1_800, 3_600, 7_200] {
+            assert!(
+                !silence_page_is_cooling(Some(first), first + gap, 1_800),
+                "a fresh episode {gap}s later is suppressed. The cooldown \
+                 must bound noise, not blind the rest of the session"
+            );
+        }
+    }
+
+    /// A counter-shaped value must not quietly behave like a clock.
     ///
-    /// Fixing the emit alone would leave the alarm at a 5-minute window, which
-    /// flaps ALARM/OK on any residual oscillation and pages on both edges.
-    /// Both halves are the same defect and must move together.
+    /// The call site sits a few lines below a binding named `now` holding
+    /// `ingest.refusals()`. Passing that instead of the clock compiles. This
+    /// pins what it would do: with a small refusal count the cooldown is
+    /// permanently active after the first page — every later episode silently
+    /// suppressed for the rest of the session.
+    #[test]
+    fn test_a_counter_shaped_value_does_not_silently_work_as_a_clock() {
+        // A refusal counter that never moves: every subsequent call sees the
+        // same "time", so elapsed is 0 and the cooldown never expires.
+        let refusals_as_secs = 0_u64;
+        assert!(
+            silence_page_is_cooling(Some(refusals_as_secs), refusals_as_secs, 1_800),
+            "a frozen counter must read as still-cooling — this is the \
+             failure mode, recorded so the guard above has teeth"
+        );
+
+        // And with the real clock the same elapsed span does expire, which is
+        // the difference the call site has to get right.
+        let t = 46_800_u64;
+        assert!(!silence_page_is_cooling(Some(t), t + 1_800, 1_800));
+    }
+
+    /// A clock stepping backwards must not clear the cooldown.
+    #[test]
+    fn test_a_backwards_clock_step_does_not_clear_the_cooldown() {
+        let first = 46_800;
+        assert!(
+            silence_page_is_cooling(Some(first), first - 5, 1_800),
+            "an NTP correction that steps the clock back must not wrap into a \
+             huge elapsed value and release the cooldown at the exact moment \
+             the logs are hardest to read"
+        );
+    }
+
     #[test]
     fn test_the_risk_gap_03_alarm_window_absorbs_oscillation() {
         let tf = std::fs::read_to_string(
