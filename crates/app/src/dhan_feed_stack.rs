@@ -1388,15 +1388,62 @@ pub const FRAME_RING_RAM_PERCENT: usize = 2;
 /// has had the same format for decades. `None` on anything unexpected — a host
 /// whose memory cannot be read must fall back, never guess.
 fn host_total_ram_bytes() -> Option<usize> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kb: usize = meminfo
+    parse_meminfo_total_bytes(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Pure `/proc/meminfo` → total-RAM-in-bytes parser.
+///
+/// Split out from the file read so hostile input is REACHABLE by a test. The
+/// previous shape read the live file inline, which meant the only input this
+/// code could ever be tested against was the one the CI runner happened to
+/// have — every malformed, truncated, unit-shifted or adversarial variant was
+/// unreachable, and "it works on this machine" was the whole of the evidence.
+///
+/// # What it refuses, and why each refusal is load-bearing
+///
+/// - **No `MemTotal:` line** → `None`. A file that does not answer the question
+///   must not be guessed at.
+/// - **Unit token that is not `kB`** → `None`. This is the one that silently
+///   costs a factor of 1024: every Linux kernel to date reports kB, but a value
+///   read as kB when it is bytes under-sizes the ring by 1024× (invisible — it
+///   just clamps to the floor and looks normal), and read as bytes when it is
+///   kB over-sizes by 1024× (clamps to the ceiling, equally quiet). Requiring
+///   the unit turns a silent mis-scale into an explicit fallback.
+/// - **Non-numeric, negative, or empty value** → `None`.
+/// - **Multiplication overflow** → `None` (checked, never wrapping).
+///
+/// A `MemTotal:` line appearing more than once takes the FIRST — matching the
+/// kernel's own single-line contract rather than inventing a merge rule.
+fn parse_meminfo_total_bytes(meminfo: &str) -> Option<usize> {
+    let rest = meminfo
         .lines()
-        .find_map(|l| l.strip_prefix("MemTotal:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
-    kb.checked_mul(1024)
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+
+    let mut fields = rest.split_whitespace();
+    let kb: usize = fields.next()?.parse().ok()?;
+
+    // The unit is mandatory. See the doc comment: a missing unit is exactly
+    // where a 1024× mis-scale hides, and both directions of that error are
+    // silent because the clamps absorb them.
+    match fields.next() {
+        Some("kB") => kb.checked_mul(1024),
+        _ => None,
+    }
+}
+
+/// Pure sizing arithmetic: host RAM (or `None`) → ring byte budget.
+///
+/// Separated from [`frame_ring_max_bytes_for_host`] so the bounds can be proven
+/// against the REAL function across the whole input range, including values no
+/// machine this runs on will ever report. A test that re-implements the formula
+/// in its own closure proves the copy, not the code.
+fn ring_bytes_for_ram(total_ram_bytes: Option<usize>) -> usize {
+    match total_ram_bytes {
+        Some(total) => (total / 100)
+            .saturating_mul(FRAME_RING_RAM_PERCENT)
+            .clamp(FRAME_RING_MAX_BYTES, FRAME_RING_MAX_BYTES_CEILING),
+        None => FRAME_RING_MAX_BYTES,
+    }
 }
 
 /// The ring byte ceiling for THIS host.
@@ -1421,12 +1468,7 @@ fn host_total_ram_bytes() -> Option<usize> {
 /// - **Unreadable `/proc/meminfo` → the floor.** Fail to the known-good value,
 ///   never to a guess.
 pub fn frame_ring_max_bytes_for_host() -> usize {
-    match host_total_ram_bytes() {
-        Some(total) => (total / 100)
-            .saturating_mul(FRAME_RING_RAM_PERCENT)
-            .clamp(FRAME_RING_MAX_BYTES, FRAME_RING_MAX_BYTES_CEILING),
-        None => FRAME_RING_MAX_BYTES,
-    }
+    ring_bytes_for_ram(host_total_ram_bytes())
 }
 
 // A ceiling below the largest single admissible frame would refuse EVERY frame
@@ -5698,28 +5740,242 @@ mod host_sizing_tests {
         }
     }
 
+    const GIB: usize = 1024 * 1024 * 1024;
+
     #[test]
     fn test_ring_sizing_is_monotonic_in_host_ram() {
         // The property that matters: a bigger box gets at least as much ring.
-        // Verified on the pure arithmetic rather than the live host, so it
-        // holds on every machine this ever runs on.
-        let size_for = |ram: usize| -> usize {
-            (ram / 100)
-                .saturating_mul(FRAME_RING_RAM_PERCENT)
-                .clamp(FRAME_RING_MAX_BYTES, FRAME_RING_MAX_BYTES_CEILING)
-        };
-        let gib = 1024 * 1024 * 1024;
-        assert_eq!(size_for(4 * gib), FRAME_RING_MAX_BYTES, "4 GiB -> floor");
+        // Asserted against the REAL sizing function — an earlier version of
+        // this test re-implemented the formula in a local closure, which proves
+        // the copy and would have passed even if the production arithmetic were
+        // deleted outright.
+        assert_eq!(
+            ring_bytes_for_ram(Some(4 * GIB)),
+            FRAME_RING_MAX_BYTES,
+            "4 GiB -> floor"
+        );
         assert!(
-            size_for(32 * gib) > FRAME_RING_MAX_BYTES,
+            ring_bytes_for_ram(Some(32 * GIB)) > FRAME_RING_MAX_BYTES,
             "a 32 GiB host must get MORE than the 4 GiB-era floor — that gap is \
              the entire reason this function exists"
         );
-        assert!(size_for(32 * gib) <= size_for(64 * gib), "monotonic");
+        assert!(
+            ring_bytes_for_ram(Some(32 * GIB)) <= ring_bytes_for_ram(Some(64 * GIB)),
+            "monotonic"
+        );
         assert_eq!(
-            size_for(1024 * gib),
+            ring_bytes_for_ram(Some(1024 * GIB)),
             FRAME_RING_MAX_BYTES_CEILING,
             "an enormous host is capped, not unbounded"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Extreme permutations of the sizing input
+    // -----------------------------------------------------------------------
+
+    /// The bounds must hold for EVERY input, not the handful a real machine
+    /// reports.
+    ///
+    /// The sizing function is the one place in this lane where an outside
+    /// number (a file the kernel writes) decides how much memory the process
+    /// takes. Anything that number can be, it will eventually be — on a
+    /// container with a synthetic `/proc`, on a host with an absurd
+    /// hugepage-backed total, on a kernel that changes its mind about units.
+    /// So the guarantee has to be range-wide, not sample-wide.
+    #[test]
+    fn test_ring_bytes_stays_inside_its_bounds_for_every_conceivable_ram() {
+        let mut cases: Vec<Option<usize>> = vec![
+            None,             // unreadable /proc/meminfo
+            Some(0),          // a kernel reporting zero
+            Some(1),          // one byte
+            Some(99),         // below the /100 divisor — integer division to zero
+            Some(100),        // exactly the divisor
+            Some(101),        // just above
+            Some(usize::MAX), // the overflow edge
+            Some(usize::MAX / 2),
+        ];
+        // Every power of two from 1 byte to the top of the type: catches a
+        // shift/rounding error at any scale, not just the plausible ones.
+        for shift in 0..usize::BITS {
+            cases.push(Some(1usize << shift));
+        }
+        // And every whole GiB from 1 to 4096 — the range a real box lives in.
+        for gib in 1..=4096usize {
+            cases.push(Some(gib * GIB));
+        }
+
+        for input in cases {
+            let out = ring_bytes_for_ram(input);
+            assert!(
+                out >= FRAME_RING_MAX_BYTES,
+                "ring_bytes_for_ram({input:?}) = {out} fell BELOW the proven \
+                 floor. The floor is what makes auto-sizing unable to regress a \
+                 working configuration; below it this change becomes a \
+                 tick-loss risk instead of a headroom gain"
+            );
+            assert!(
+                out <= FRAME_RING_MAX_BYTES_CEILING,
+                "ring_bytes_for_ram({input:?}) = {out} exceeded the ceiling — \
+                 the ring would start competing with QuestDB for the same RAM"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ring_sizing_never_panics_and_never_wraps_at_the_type_edge() {
+        // `usize::MAX / 100 * 2` overflows in debug builds without the
+        // saturating multiply, and WRAPS to a tiny number in release — which
+        // would clamp back to the floor and look perfectly healthy while the
+        // arithmetic was silently broken. Pin both directions.
+        assert_eq!(
+            ring_bytes_for_ram(Some(usize::MAX)),
+            FRAME_RING_MAX_BYTES_CEILING,
+            "the largest representable host must saturate to the ceiling, not \
+             wrap into the floor"
+        );
+        assert_eq!(
+            ring_bytes_for_ram(Some(0)),
+            FRAME_RING_MAX_BYTES,
+            "a zero-RAM reading must land on the floor"
+        );
+    }
+
+    #[test]
+    fn test_ring_sizing_is_monotonic_across_the_whole_gib_range() {
+        // Monotonicity at three sample points is a spot check. Across the full
+        // range it is a property: more RAM can never produce a smaller ring, at
+        // any boundary, including the two clamp edges where an off-by-one would
+        // otherwise hide.
+        let mut prev = ring_bytes_for_ram(Some(0));
+        for gib in 1..=512usize {
+            let now = ring_bytes_for_ram(Some(gib * GIB));
+            assert!(
+                now >= prev,
+                "sizing went DOWN between {} and {gib} GiB ({prev} -> {now})",
+                gib - 1
+            );
+            prev = now;
+        }
+    }
+
+    #[test]
+    fn test_the_percentage_actually_binds_somewhere_in_the_real_range() {
+        // Non-vacuity of the whole feature. If the floor and ceiling were set
+        // such that the percentage never decided anything, every bounds test
+        // above would still pass and the function would be an elaborate way of
+        // returning a constant.
+        let strictly_between = (1..=256usize)
+            .map(|gib| ring_bytes_for_ram(Some(gib * GIB)))
+            .filter(|&b| b > FRAME_RING_MAX_BYTES && b < FRAME_RING_MAX_BYTES_CEILING)
+            .count();
+        assert!(
+            strictly_between > 0,
+            "no host size between 1 and 256 GiB produces a ring strictly \
+             between the floor and the ceiling — the percentage never binds, \
+             so auto-sizing is decorative"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Extreme permutations of the /proc/meminfo TEXT
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_meminfo_parser_accepts_the_real_shape() {
+        let real = "MemTotal:       32819128 kB\nMemFree:         1234567 kB\n";
+        assert_eq!(
+            parse_meminfo_total_bytes(real),
+            Some(32_819_128 * 1024),
+            "the ordinary Linux shape must parse"
+        );
+    }
+
+    #[test]
+    fn test_meminfo_parser_refuses_every_malformed_shape() {
+        // Each of these once looked like "obviously fine" input. The refusal is
+        // the point: an unparseable file falls back to the proven floor, which
+        // is a correct system running with less headroom — never a guess.
+        let hostile: &[(&str, &str)] = &[
+            ("", "empty file"),
+            ("\n\n\n", "blank lines only"),
+            ("MemFree: 100 kB\n", "no MemTotal line at all"),
+            ("MemTotal:\n", "key with no value"),
+            ("MemTotal:       \n", "key with whitespace only"),
+            ("MemTotal: notanumber kB\n", "non-numeric value"),
+            ("MemTotal: -1 kB\n", "negative value"),
+            ("MemTotal: 3.5 kB\n", "fractional value"),
+            (
+                "MemTotal: 32819128\n",
+                "value with NO unit — the 1024x trap",
+            ),
+            ("MemTotal: 32819128 MB\n", "wrong unit MB"),
+            ("MemTotal: 32819128 B\n", "wrong unit bytes"),
+            ("MemTotal: 32819128 kb\n", "wrong case — kernel writes kB"),
+            ("memtotal: 32819128 kB\n", "lowercase key"),
+            (
+                "MemTotalSwap: 5 kB\n",
+                "a DIFFERENT key that shares the prefix",
+            ),
+            (" MemTotal: 5 kB\n", "leading space breaks the line anchor"),
+            (
+                "MemTotal: 99999999999999999999999999 kB\n",
+                "value beyond usize — must not wrap",
+            ),
+        ];
+        for (input, why) in hostile {
+            assert_eq!(
+                parse_meminfo_total_bytes(input),
+                None,
+                "parser ACCEPTED malformed input ({why}): {input:?}. Accepting \
+                 it would size a live buffer from a number nobody validated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_meminfo_parser_takes_the_first_memtotal_when_duplicated() {
+        // The kernel writes one. A synthetic /proc (containers, test harnesses,
+        // a hostile mount) can write several. Pick deterministically rather
+        // than inventing a merge rule that nobody can predict.
+        let dup = "MemTotal: 1000 kB\nMemTotal: 9999999 kB\n";
+        assert_eq!(parse_meminfo_total_bytes(dup), Some(1000 * 1024));
+    }
+
+    #[test]
+    fn test_meminfo_parser_tolerates_odd_but_valid_whitespace() {
+        // These are NOT malformed — the kernel's column alignment varies with
+        // the value width, so the parser must not be brittle about spacing.
+        for ok in [
+            "MemTotal: 4194304 kB\n",
+            "MemTotal:4194304 kB\n",
+            "MemTotal:\t4194304\tkB\n",
+            "MemTotal:          4194304    kB",
+            "MemFree: 1 kB\nMemTotal: 4194304 kB\nSwapTotal: 0 kB\n",
+        ] {
+            assert_eq!(
+                parse_meminfo_total_bytes(ok),
+                Some(4_194_304 * 1024),
+                "parser rejected a VALID kernel spacing variant: {ok:?}. A \
+                 false rejection is not harmless — it silently drops the box \
+                 back to the 4 GiB-era floor"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_refused_meminfo_lands_exactly_on_todays_behaviour() {
+        // The end-to-end safety claim, stated as one assertion: every way the
+        // parse can fail produces the byte budget that shipped before this
+        // feature existed. That is what makes the change unable to make
+        // anything worse.
+        for broken in ["", "garbage", "MemTotal: x kB", "MemTotal: 1"] {
+            assert_eq!(
+                ring_bytes_for_ram(parse_meminfo_total_bytes(broken)),
+                FRAME_RING_MAX_BYTES,
+                "a broken meminfo ({broken:?}) must land on the pre-existing \
+                 constant, not on a guess"
+            );
+        }
     }
 }
