@@ -2120,6 +2120,10 @@ async fn main() -> Result<()> {
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),
+            // So the lane's silence page and its 15:31 cross-verification stay
+            // quiet on NSE holidays. EventBridge starts this box MON-FRI, which
+            // includes them (2026-08-14).
+            calendar: std::sync::Arc::clone(&trading_calendar),
             dhan_enabled: config.feeds.dhan_enabled,
             // DEFAULT-OFF: with `live_subscription_from_master = false` (the
             // shipped value) this returns the same 4 hardcoded index SIDs the

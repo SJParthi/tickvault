@@ -517,3 +517,177 @@ neither has ever run. Item 15's 810 KiB figure is arithmetic from the documented
 size and per-connection cap, not an observed frame. Item 16's ~70 GB/day is arithmetic
 from row sizes, not a measurement. The measured evidence remains ~3,000 ticks/sec
 aggregate in QUOTE mode; there is no Full-mode measurement in the repository at all.
+
+---
+
+## ITEMS 22–28 (added 2026-08-14) — operator: "yes dude fix evryhtign espeiclaly entilrey relaetd to this"
+
+**The verbatim operator authorization (2026-08-14, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "yes dude fix evryhtign espeiclaly entilrey relaetd to this dudde okay? see espeiclaly
+> entiley related to linx kernel aws isnatcne see its betst toe ntolrey suie the entirte
+> aws sinatcnec tunign eprformance optimisatiosn efficient to use ithe maixmsied entire
+> ocnfirguatiosn dude ... i mena see not even a singke tikcs hsodu lenevr evr be lsot we
+> hsodcu lalwya smaintian the dhan fast consumer espeicllay by mainitaning this becuase
+> only then we can avoid websocket disocnenctiona nd websocket reconenciton espeicllay we
+> hsodu lnto even face the smaller level of millsieocd latencye form dhan to aws"
+
+Given in DIRECT response to a nine-agent audit whose fix queue named exactly these items.
+**No new scope:** no socket beyond the authorized 16, no universe widening, `dry_run`
+untouched, §28 frozen area untouched. Every item repairs code already landed.
+
+### Design
+
+**Item 22 — the required CI gate is RED (blocks everything else).** Commit `09fd3c2`
+(today) introduced an unused binding at `operator_control.rs:675`. `Build & Verify` runs
+`cargo clippy --workspace --no-deps -- -D warnings`, so this is a hard error — reproduced
+locally at **exit 101**. Nothing else in this plan can merge until it is fixed. Rename the
+binding to `_le`; the loop genuinely does not use it (the `+Inf` bound is read from
+`bound`, and the comment below the loop explains why the string form is deliberately
+unused).
+
+**Item 23 — Nagle is enabled on all 16 sockets.** `connection.rs:762` calls
+`connect_async_tls_with_config(request, config, false, Some(connector))`. The third
+parameter is `disable_nagle`, so `false` leaves Nagle ON. The lane is receive-heavy, but
+the client does send: subscribe batches (up to 250 messages) and — critically — **pongs**.
+Dhan closes a socket after 40 s of silence (`99-tickvault-net.conf:123-124`), and Nagle
+can hold a small write behind an unacknowledged segment for up to ~200 ms while delayed-ACK
+waits on the peer. That is latency the operator explicitly asked to remove, on the one
+write whose lateness costs a reconnect. Pass `true`.
+
+**Item 24 — the TLS connector is rebuilt on every dial.** `connection.rs:718-722` calls
+`build_websocket_tls_connector*()` inside the dial path, so each of the 16 sockets — and
+every reconnect thereafter — constructs a fresh `rustls::ClientConfig`. Two costs follow:
+(a) `rustls_native_certs::load_native_certs()` re-reads and re-parses the entire system CA
+bundle **from disk** on the recovery path, which is exactly when the box is least idle;
+(b) a fresh `ClientConfig` carries a fresh, empty session-resumption store, so every
+reconnect is a full 2-RTT handshake instead of an abbreviated one. Cache both connector
+variants in `OnceLock`s and hand out clones (`Connector::Rustls(Arc<ClientConfig>)` is
+already `Arc`-backed, so a clone is a refcount bump). Resumption then works because all
+sockets of a kind share one config.
+
+**Item 25 — a heap allocation on every tick.** `record_ws_lag`
+(`dhan_feed_stack.rs:1994,1998`) calls `connection_index.to_string()` and passes it as a
+metric label. `metrics::histogram!` with a label builds a `Key` owning a `Vec<Label>`, so
+this is **two heap allocations per tick** on the live path — the exact cost
+`parser/dispatcher.rs:32-35` and `DrainCounters` (`:1158-1170`) both exist to avoid. The
+label set is bounded and known at compile time (`MAX_TOTAL_DHAN_CONNECTIONS = 16`), so
+resolve all 16 histogram handles plus the two excluded-counter handles once into a
+`OnceLock<WsLagHandles>` and index by connection. This is the same fix, in the same file,
+as the pattern two hundred lines above it.
+
+**Item 26 — the silence pager has no trading-day gate.** `is_within_market_hours_ist`
+(`dhan_feed_stack.rs:2964`) checks time-of-day only; the file imports `trading_calendar`
+solely for `ist_offset()`. EventBridge starts the box on `MON-FRI`, which includes NSE
+holidays. On such a day the lane dials, seeds ~4,565 instruments, receives nothing, and at
+09:15 + two 30 s scans fires `RISK-GAP-03` with `silent=4565, never_ticked=4565` — the
+most alarming page the system can produce, false, roughly six times a year. The second-order
+cost is what matters: it trains the operator to mute the ONE detector that catches a
+silently-failed subscribe. Every sibling leg already gates on `is_trading_day`
+(`groww_contract_1m_boot.rs:1900`, `groww_option_chain_1m_boot.rs:1819`,
+`brutex_crossverify_boot.rs:1673`, `feed_scoreboard_boot.rs:188`). Gate the page — not the
+gauges, which are correct to publish zero on a holiday.
+
+**Item 27 — the 15:31 cross-verification also fires on holidays.** Same root cause
+(`dhan_feed_stack.rs:2828`), same fix. Today it warns "found no data on either side" every
+weekday holiday, compounding Item 26's fatigue on the lane's only loss detector.
+
+**Item 28 — two host-tuning gaps the kernel audit found.** The sysctl set is otherwise
+strong (20 knobs, applied at boot and verified). Missing: (a) **VM dirty ratios** — QuestDB
+shares this box, and an unbounded writeback burst can stall the host, which stalls the
+consumer, which is the actual tick-loss trigger; set `dirty_ratio=10` /
+`dirty_background_ratio=3` so writeback is frequent and small rather than rare and huge.
+(b) **Transparent hugepages** left at the distro default; set `madvise` — not `never`,
+because the co-tenant database benefits from THP and `never` would hurt it. Also assert
+**chrony** in provisioning: AL2023 ships it pointed at the Amazon Time Sync service by
+default, but nothing in `user-data.sh.tftpl` verifies it, and every latency number in Item
+12 is meaningless if the clock is unsynchronised.
+
+### Edge Cases
+
+- `disable_nagle=true` must not alter the depth-200 no-ALPN path — the two are orthogonal
+  (one is a socket option, one is a TLS config), and the depth-200 ALPN carve-out
+  (`connection.rs:712-717`) must survive untouched.
+- Cached TLS connector must NOT be shared between the ALPN and no-ALPN variants — they are
+  different configs and crossing them re-opens the 2026-04-23
+  `ResetWithoutClosingHandshake` class. Two separate `OnceLock`s, never one.
+- A TLS build failure must still be reported per-dial (it currently increments
+  `tls_config`); caching must not turn a transient first failure into a permanent poisoned
+  `OnceLock`. Cache only on success.
+- Lag handles: `connection_index` is a `u8` and must be bounds-checked against
+  `MAX_TOTAL_DHAN_CONNECTIONS` before indexing — an out-of-range slot must fall back to a
+  counted "unknown" bucket, never panic on the hot path and never allocate.
+- Holiday gate must NOT suppress the gauges — a holiday reading zero silent instruments is
+  correct data. Only the PAGE is gated.
+- Holiday gate must not suppress a page on a trading day that merely starts late.
+- `vm.dirty_ratio` must stay well above the writeback the ILP path can produce in one
+  flush, or the flush itself starts throttling — 10% of 32 GiB is ~3.2 GiB, far above it.
+- THP `madvise` is a boot-time write to `/sys`, not a sysctl — it must be applied in
+  user-data and be idempotent across reboots and re-provisions.
+
+### Failure Modes
+
+| Failure | Detection | Response |
+|---|---|---|
+| Clippy regression reintroduced | `Build & Verify` (required check) | merge blocked |
+| Nagle silently re-enabled by a future edit | ratchet asserting the literal `true` at the dial site | build fails |
+| TLS connectors crossed (ALPN into depth-200) | ratchet asserting two distinct cached handles | build fails |
+| Per-tick allocation reintroduced | pre-resolved handles + the Item 1 DHAT gate once it lands | build fails / gate catches |
+| Holiday page fires anyway | unit test drives a known NSE holiday through the gate | build fails |
+| sysctl file rejected as a whole by a bad key | `verify-net-tuning.sh` already checks 8 keys post-apply | boot marker absent, loud |
+| chrony absent | new provisioning assertion logs loudly to journald | visible at boot |
+
+### Test Plan
+
+- `connection.rs` — unit test asserting the dial passes `disable_nagle = true`; source-order
+  ratchet so the literal cannot silently flip back.
+- `tls.rs` — test that two calls to each builder return handles sharing one `Arc`
+  (`Arc::ptr_eq`), and that the ALPN and no-ALPN caches are NOT the same handle.
+- `dhan_feed_stack.rs` — unit tests: all 16 connection slots resolve a distinct handle; an
+  out-of-range index falls back and counts rather than panicking; existing `ws_lag_ms`
+  behaviour (clamped-negative, implausible-LTT) is unchanged.
+- Holiday gate — unit tests over a known NSE holiday from `base.toml`, a normal trading day,
+  and a weekend, asserting page-suppressed / page-allowed / page-suppressed respectively,
+  and asserting the gauge publishes in all three.
+- Scope per `testing-scope.md`: `cargo test -p tickvault-core -p tickvault-app`; no
+  `crates/common` change, so no workspace escalation.
+- `cargo clippy --workspace --no-deps -- -D warnings` must return 0 — that is Item 22's
+  acceptance test and it is reproduced before and after.
+
+### Rollback
+
+Every item is independently revertable and none changes a schema, a DEDUP key, a config
+default, or a metric name. Item 22 is a rename. Item 23 is one boolean. Item 24 is a cache
+in front of an unchanged builder — reverting restores per-dial construction. Item 25 is a
+mechanical metrics refactor emitting the identical series, so dashboards and alarms cannot
+notice a revert. Items 26–27 gate a page and are revertable by deleting the gate. Item 28
+is host configuration applied at boot; reverting the sysctl file and re-running
+`sysctl --system` restores prior behaviour without touching the app.
+
+### Observability
+
+No new metric series. Item 25 emits exactly the series it emits today
+(`tv_dhan_ws_lag_ms{connection}`, `tv_dhan_ws_lag_excluded_total{reason}`), which is what
+makes it a safe refactor, plus one bounded fallback label for an out-of-range slot. Items
+26–27 REDUCE noise by suppressing false pages; the underlying gauges are unchanged, so a
+real silence on a real trading day still pages exactly as it does now. Item 28 is visible
+through the existing boot verification marker.
+
+### Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: after these items the
+CI gate is green, no write on the socket path waits on Nagle, reconnects reuse a TLS
+config instead of re-reading the CA store from disk, the tick path allocates nothing to
+record its own latency, and the lane's loudest page cannot fire on a day the market is shut.
+
+**NOT claimed:** (a) that any of this improves Dhan's delivery — measured 2026-07-06 at
+p99 46.37 s / max 198.69 s against a second vendor's 562 ms on the same host in the same
+minutes; every item here is on our side of the NIC and moves that number by exactly zero.
+(b) That millisecond-level end-to-end latency is measurable at all — Dhan's LTT is whole
+seconds, so a ±1 s truncation floor is structural. (c) That the WAL re-fold (Item 2) is
+addressed — it is NOT; replayed live-feed frames are still counted and dropped at
+`main.rs:1841-1873`, and that remains the single largest known tick-loss path we control.
+It is deliberately left to Item 2 because the fold path takes a live ring rather than a
+replay batch, and a half-done version risks the 5 working main-feed sockets. (d) Any
+measurement at 4,565 instruments — the lane has still never been observed receiving a tick.

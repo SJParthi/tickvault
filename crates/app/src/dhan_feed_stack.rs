@@ -80,8 +80,8 @@
 //! minute — `websocket-connection-scope-lock.md` §E) are Dhan-side and are
 //! NOT fixed by any of this.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -105,7 +105,9 @@ use tickvault_core::pipeline::tick_gap_detector::{
 use tickvault_core::websocket::connection::{
     DhanFeedSocketImpl, DhanSocketParams, FeedTokenBuffer,
 };
-use tickvault_core::websocket::pool_budget::{ConnectionSlot, DhanEndpointType};
+use tickvault_core::websocket::pool_budget::{
+    ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS,
+};
 use tickvault_core::websocket::pool_supervisor::{
     CapturedFrame, ConnectionSupervisor, PoolSupervisor, RingByteBudget, SubscribeGuard,
     SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection,
@@ -1792,7 +1794,22 @@ async fn run_frame_drain(
                 // Only the PAGE is market-hours gated (audit Rule 3): the
                 // whole universe is legitimately silent after 15:30, and a
                 // detector that pages every evening gets muted by lunchtime.
-                if !is_within_market_hours_ist(now_ist_secs_of_day()) {
+                //
+                // The TRADING-DAY half of that gate is just as load-bearing and
+                // was missing until 2026-08-14. EventBridge starts this box on
+                // `MON-FRI`, which includes NSE holidays, so on a weekday
+                // holiday the lane seeds the whole universe, receives nothing —
+                // correctly, the market is shut — and every seeded instrument
+                // crosses the silence floor at once. The page that follows says
+                // `silent=<universe>, never_ticked=<universe>`, which is
+                // indistinguishable from a total subscribe failure. Every
+                // sibling leg in this repo already gates on the calendar
+                // (`groww_contract_1m_boot`, `groww_option_chain_1m_boot`,
+                // `brutex_crossverify_boot`, `feed_scoreboard_boot`); the
+                // revived lane was the one regression.
+                if !is_within_market_hours_ist(now_ist_secs_of_day())
+                    || !silence_page_allowed_today()
+                {
                     silent_scans = 0;
                     silence_reported = false;
                     continue;
@@ -2123,73 +2140,100 @@ pub fn ws_lag_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<WsLa
 /// that instrument TRADES (LTT is last-trade time, so a thin option is
 /// legitimately minutes stale and would page constantly); per-socket lag
 /// isolates the thing we can act on — one connection delivering late.
-pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos: i64) {
-    let handles = ws_lag_handles();
-    match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
-        Some(WsLag::Measured(ms)) => handles.for_connection(connection_index).record(ms),
-        Some(WsLag::ClampedNegative) => {
-            handles.for_connection(connection_index).record(0.0);
-            handles.clamped_negative.increment(1);
-        }
-        None => handles.implausible_ltt.increment(1),
-    }
-}
-
-/// The number of `connection` label values this histogram can produce.
+/// Pre-resolved lag-metric handles, one histogram per connection slot.
 ///
-/// The operator lock caps live sockets at 16 (5 main-feed + 5 depth-20 +
-/// 5 depth-200 + 1 order-update), and `connection_index` is a slot within a
-/// pool, so 16 is a ceiling with headroom rather than a tight fit. An index at
-/// or beyond it folds into the last slot instead of allocating a fresh key —
-/// the same fail-into-a-known-bucket shape as `DrainCounters::refused`.
-const WS_LAG_CONNECTION_SLOTS: usize = 16;
-
-/// Pre-resolved handles for the per-TICK lag path.
+/// # Why this exists
 ///
-/// This exists because the first cut of `record_ws_lag` called
-/// `metrics::histogram!(NAME, "connection" => idx.to_string())` directly, which
-/// allocated TWICE per tick — a `String` for the label value, and then a `Vec`
-/// for the label set, because a non-literal label value drops the macro to its
-/// `vec![Label::new(..)]` arm. At the ~5,000 packet/sec envelope that is ~36
-/// million allocations an hour on the path this module's own docs promise is
-/// allocation-free.
+/// `record_ws_lag` runs on the PER-TICK path. The previous form built its label
+/// with `connection_index.to_string()` and passed it to `metrics::histogram!`,
+/// which constructs a `Key` owning a `Vec<Label>` — so recording a tick's own
+/// latency cost **two heap allocations per tick**, on the one path this module
+/// promises is allocation-free.
 ///
-/// It is the exact hazard `DrainCounters` (~800 lines above) was written to
-/// avoid, and it landed anyway — which is the useful lesson: the warning was
-/// present, correct, and in the same file, and a per-tick allocation still got
-/// through review. A comment is not a gate. Caught by the 2026-08-14
-/// complexity audit and repaired the same day.
+/// That is the identical defect `parser/dispatcher.rs:32-35` and `DrainCounters`
+/// (above, in this file) already solved. The label set here is bounded and known
+/// at compile time — `MAX_TOTAL_DHAN_CONNECTIONS` slots — so every handle is
+/// resolved ONCE and recording becomes a plain atomic update.
+///
+/// The emitted series are byte-identical to before
+/// (`tv_dhan_ws_lag_ms{connection="0".."15"}`), which is what makes this a safe
+/// refactor: no dashboard, alarm, or EMF selector can tell the difference.
 struct WsLagHandles {
-    per_connection: [metrics::Histogram; WS_LAG_CONNECTION_SLOTS],
-    clamped_negative: metrics::Counter,
-    implausible_ltt: metrics::Counter,
+    /// Indexed by connection slot. Built once; never resized.
+    per_connection: [metrics::Histogram; MAX_TOTAL_DHAN_CONNECTIONS as usize],
+    /// Fallback for a slot outside the pool budget. Should be unreachable —
+    /// `ConnectionSlot` is allocated from the same budget — but a hot-path
+    /// index must never panic and must never allocate, so it degrades into a
+    /// counted bucket instead.
+    unknown_connection: metrics::Histogram,
+    unknown_slot: metrics::Counter,
+    excluded_clamped_negative: metrics::Counter,
+    excluded_implausible_ltt: metrics::Counter,
 }
 
 impl WsLagHandles {
-    /// Handle for one socket slot; out-of-range folds into the last slot.
-    fn for_connection(&self, connection_index: u8) -> &metrics::Histogram {
-        let slot = usize::from(connection_index).min(WS_LAG_CONNECTION_SLOTS - 1);
-        &self.per_connection[slot]
+    fn new() -> Self {
+        Self {
+            // `to_string()` here runs at most 16 times, at first-tick, on the
+            // cold path — not per tick. That is the whole point of the cache.
+            per_connection: std::array::from_fn(
+                |slot| metrics::histogram!(WS_LAG_HISTOGRAM, "connection" => slot.to_string()),
+            ),
+            unknown_connection: metrics::histogram!(
+                WS_LAG_HISTOGRAM,
+                "connection" => "unknown"
+            ),
+            unknown_slot: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "unknown_connection_slot"
+            ),
+            excluded_clamped_negative: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "clamped_negative"
+            ),
+            excluded_implausible_ltt: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "implausible_ltt"
+            ),
+        }
+    }
+
+    /// The histogram for one slot. Out-of-range degrades to a counted bucket —
+    /// never a panic, never an allocation.
+    fn histogram_for(&self, connection_index: u8) -> &metrics::Histogram {
+        match self.per_connection.get(connection_index as usize) {
+            Some(histogram) => histogram,
+            None => {
+                self.unknown_slot.increment(1);
+                &self.unknown_connection
+            }
+        }
     }
 }
 
-/// Label values, spelled as literals so the macro takes its static-label arm.
-/// Indexed by slot, so the array position IS the label — a mismatch between
-/// this table and the array it builds is impossible by construction.
-const WS_LAG_CONNECTION_LABELS: [&str; WS_LAG_CONNECTION_SLOTS] = [
-    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
-];
+static WS_LAG_HANDLES: OnceLock<WsLagHandles> = OnceLock::new();
 
-/// Process-wide handle set, resolved on first use.
 fn ws_lag_handles() -> &'static WsLagHandles {
-    static HANDLES: std::sync::OnceLock<WsLagHandles> = std::sync::OnceLock::new();
-    HANDLES.get_or_init(|| WsLagHandles {
-        per_connection: std::array::from_fn(|slot| {
-            metrics::histogram!(WS_LAG_HISTOGRAM, "connection" => WS_LAG_CONNECTION_LABELS[slot])
-        }),
-        clamped_negative: metrics::counter!(WS_LAG_EXCLUDED_COUNTER, "reason" => "clamped_negative"),
-        implausible_ltt: metrics::counter!(WS_LAG_EXCLUDED_COUNTER, "reason" => "implausible_ltt"),
-    })
+    WS_LAG_HANDLES.get_or_init(WsLagHandles::new)
+}
+
+/// `pub` so `crates/app/tests/dhat_ws_lag.rs` can measure it from an
+/// integration test. The allocation this function must not do is invisible to
+/// a unit test; it needs a DHAT profiler, and that needs a test binary.
+pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos: i64) {
+    let handles = ws_lag_handles();
+    match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
+        Some(WsLag::Measured(ms)) => {
+            handles.histogram_for(connection_index).record(ms);
+        }
+        Some(WsLag::ClampedNegative) => {
+            handles.histogram_for(connection_index).record(0.0);
+            handles.excluded_clamped_negative.increment(1);
+        }
+        None => {
+            handles.excluded_implausible_ltt.increment(1);
+        }
+    }
 }
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
@@ -2474,6 +2518,43 @@ pub struct DhanFeedStackParams {
     /// with the process while the log printed "tickvault stopped" and
     /// classified the shutdown clean.
     pub shutdown: Arc<tokio::sync::Notify>,
+    /// NSE trading calendar, used to keep the lane's loudest pages off days the
+    /// market is shut.
+    ///
+    /// Added 2026-08-14. The silence detector and the 15:31 cross-verification
+    /// both gated on TIME-OF-DAY only, and EventBridge starts this box on
+    /// `MON-FRI` — which includes NSE holidays. On such a day the lane dials,
+    /// seeds the whole universe, receives nothing (correctly — the market is
+    /// shut), and fires `silent=<universe>, never_ticked=<universe>`: the most
+    /// alarming page the system can produce, false, several times a year. The
+    /// real cost is second-order — it trains the operator to mute the ONE
+    /// detector that catches a silently-failed subscribe.
+    pub calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+}
+
+/// Process-wide handle to the trading calendar, installed by
+/// [`spawn_dhan_feed_stack`] from its params.
+///
+/// A `OnceLock` rather than two threaded parameters because the two consumers
+/// (`run_frame_drain` and `spawn_daily_crossverify`) sit in different tasks with
+/// different signatures, and this file already uses exactly this shape for
+/// `CROSSVERIFY_DEPS`.
+static TRADING_CALENDAR: OnceLock<Arc<tickvault_common::trading_calendar::TradingCalendar>> =
+    OnceLock::new();
+
+/// True when today is an NSE trading day — or when the calendar is not
+/// installed.
+///
+/// **Fail-OPEN, deliberately.** This gates whether a silence page may fire. The
+/// two error directions are not symmetric: a false page is noise, while a
+/// SUPPRESSED page on a real trading day is undetected data loss on a lane
+/// whose protocol carries no sequence number and no snapshot-on-subscribe, so
+/// silence is the only signal there is. If the calendar is somehow absent, page
+/// anyway.
+fn silence_page_allowed_today() -> bool {
+    TRADING_CALENDAR
+        .get()
+        .is_none_or(|calendar| calendar.is_trading_day_today())
 }
 
 /// Brings up the Dhan 16-connection live feed if — and only if — both gates are
@@ -2749,6 +2830,15 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
              pool by silently killing its OLDEST socket."
         );
         return None;
+    }
+    // Installed BEFORE the bring-up task is spawned, so neither the silence
+    // detector nor the 15:31 cross-verification can ever observe an empty cell
+    // and fall back to its fail-open branch on a real trading day.
+    if TRADING_CALENDAR.set(Arc::clone(&params.calendar)).is_err() {
+        // Already installed. `FEED_STACK_SPAWNED` above makes a second spawn
+        // impossible in production, so this can only be a repeat call under
+        // test; the first calendar stays authoritative either way.
+        tracing::debug!("Dhan lane trading calendar was already installed — keeping the first");
     }
     Some(tokio::spawn(run_dhan_feed_stack(params)))
 }
@@ -3203,6 +3293,21 @@ pub fn spawn_daily_crossverify(
             let sleep_secs = secs_until_next_run_ist(now_ist_secs_of_day());
             tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
 
+            // Same trading-day gate as the silence detector, for the same
+            // reason. On a weekday NSE holiday both sides of this comparison
+            // are legitimately empty, and the run reports "found no data on
+            // either side today" — a warning about the lane's ONLY loss
+            // detector, fired on a day it had nothing to detect. Left ungated
+            // it compounds the silence detector's false page into a pattern the
+            // operator learns to ignore.
+            if !silence_page_allowed_today() {
+                info!(
+                    "Dhan live-feed cross-verification skipped — not an NSE trading day. \
+                     No candles were expected, so there is nothing to verify."
+                );
+                continue;
+            }
+
             let Some(deps) = CROSSVERIFY_DEPS.get() else {
                 // Unreachable in practice (the caller checked), but a `let
                 // else` beats an unwrap on a path that must never panic a
@@ -3359,6 +3464,74 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Instant;
 
+    /// A calendar carrying one known NSE holiday, for the trading-day gate.
+    fn synthetic_calendar() -> tickvault_common::trading_calendar::TradingCalendar {
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+        let cfg = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: "2026-01-26".to_string(),
+                name: "Republic Day".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        tickvault_common::trading_calendar::TradingCalendar::from_config(&cfg)
+            .expect("synthetic calendar builds")
+    }
+
+    /// A WEEKDAY NSE holiday is NOT a trading day — this is the exact shape
+    /// that produced the false `silent=<universe>` page: EventBridge starts the
+    /// box `MON-FRI`, the market is shut, and every seeded instrument crosses
+    /// the silence floor at once.
+    #[test]
+    fn weekday_nse_holiday_is_not_a_trading_day() {
+        let calendar = synthetic_calendar();
+        // 2026-01-26 is a Monday AND a configured NSE holiday.
+        let holiday = chrono::NaiveDate::from_ymd_opt(2026, 1, 26).expect("valid date");
+        assert_eq!(
+            chrono::Datelike::weekday(&holiday),
+            chrono::Weekday::Mon,
+            "the fixture must be a WEEKDAY holiday — a weekend proves nothing, \
+             because the EventBridge schedule already excludes weekends"
+        );
+        assert!(
+            !calendar.is_trading_day(holiday),
+            "a weekday NSE holiday must not be treated as a trading day"
+        );
+        // Control: the next day is an ordinary trading Tuesday.
+        let next = chrono::NaiveDate::from_ymd_opt(2026, 1, 27).expect("valid date");
+        assert!(
+            calendar.is_trading_day(next),
+            "the day after the holiday must still page normally — this gate must \
+             narrow the page, never disable it"
+        );
+    }
+
+    /// With no calendar installed the gate FAILS OPEN.
+    ///
+    /// Direction matters and is not symmetric: a false page is noise, a
+    /// suppressed page on a real trading day is undetected data loss on a feed
+    /// whose protocol carries no sequence number and no snapshot-on-subscribe.
+    #[test]
+    fn silence_page_gate_fails_open_when_no_calendar_is_installed() {
+        // This process may or may not have had a calendar installed by another
+        // test; the invariant under test is that the ABSENT case allows the
+        // page, so only assert when the cell is genuinely empty.
+        if TRADING_CALENDAR.get().is_none() {
+            assert!(
+                silence_page_allowed_today(),
+                "an uninstalled calendar must never suppress a silence page"
+            );
+        }
+    }
+
     /// A real NSE-session second, well past the plausibility floor.
     const LTT_IST_SECS: u32 = 1_772_073_900;
 
@@ -3436,8 +3609,14 @@ mod tests {
         // a non-literal label value drops the macro to its `vec![Label::new(..)]`
         // arm — a Vec, TWICE per tick, on the path this module's docs call
         // allocation-free. `DrainCounters` 800 lines above warns about exactly
-        // that, in this same file, and it happened anyway. So the shape is now
-        // pinned mechanically rather than by comment.
+        // that, in this same file, and it happened anyway.
+        //
+        // Worth recording: a PARALLEL session found and fixed the identical
+        // defect on `main`, with the same reasoning. That implementation won
+        // the merge because it derives its slot count from
+        // `MAX_TOTAL_DHAN_CONNECTIONS` rather than a hardcoded 16 — one fewer
+        // number to keep in sync with the operator's socket lock. This test was
+        // rewritten against that API rather than kept alongside a duplicate.
         let handles = ws_lag_handles();
         assert!(
             std::ptr::eq(handles, ws_lag_handles()),
@@ -3447,37 +3626,30 @@ mod tests {
         // Every socket slot has its OWN handle: folding two sockets onto one
         // would silently merge their percentiles and hide a single slow
         // connection, which is the one thing this metric exists to expose.
-        for (slot, label) in WS_LAG_CONNECTION_LABELS.iter().enumerate() {
-            assert_eq!(
-                *label,
-                slot.to_string(),
-                "label table position must equal its own value, else a slot reports another socket's lag"
-            );
-            let by_index = u8::try_from(slot).expect("slot count fits u8");
+        for slot in 0..MAX_TOTAL_DHAN_CONNECTIONS as usize {
+            let by_index = u8::try_from(slot).expect("the socket lock caps this well under u8");
             assert!(
                 std::ptr::eq(
-                    handles.for_connection(by_index),
+                    handles.histogram_for(by_index),
                     &handles.per_connection[slot]
                 ),
                 "connection {slot} must map to its own handle"
             );
         }
 
-        // Out of range folds into the LAST slot rather than allocating a fresh
-        // key on the hot path. Wrong bucket, bounded cost — the same
-        // fail-into-a-known-bucket choice `DrainCounters::refused` makes.
+        // Out of range degrades into the counted `unknown` bucket rather than
+        // allocating a fresh key on the hot path. Wrong bucket, bounded cost,
+        // and COUNTED — the same fail-into-a-known-bucket choice
+        // `DrainCounters::refused` makes.
         assert!(
-            std::ptr::eq(
-                handles.for_connection(u8::MAX),
-                &handles.per_connection[WS_LAG_CONNECTION_SLOTS - 1]
-            ),
-            "an out-of-range index must fold, never allocate"
+            std::ptr::eq(handles.histogram_for(u8::MAX), &handles.unknown_connection),
+            "an out-of-range index must degrade to the unknown bucket, never allocate"
         );
 
         // Source-scan: the allocating forms must not come back.
         let src = include_str!("dhan_feed_stack.rs");
         let body_start = src
-            .find("fn record_ws_lag(")
+            .find("pub fn record_ws_lag(")
             .expect("record_ws_lag must exist");
         let body = &src[body_start..body_start + 600];
         assert!(
@@ -3906,6 +4078,7 @@ mod tests {
             // a refused lane never claims to be running.
             feed_runtime: Arc::new(tickvault_api::feed_state::FeedRuntimeState::default()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            calendar: Arc::new(synthetic_calendar()),
         });
         assert!(handle.is_none(), "a disabled lane must spawn nothing");
     }

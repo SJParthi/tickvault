@@ -12,7 +12,7 @@
 //!   http/1.1 ALPN) produced `Protocol(ResetWithoutClosingHandshake)`
 //!   disconnects for 2+ weeks on `full-depth-api.dhan.co`.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio_tungstenite::Connector;
 
@@ -47,14 +47,89 @@ pub fn build_websocket_tls_connector_no_alpn() -> Result<Connector, WebSocketErr
     build_tls_connector_inner(false)
 }
 
+/// Process-wide cache for the HTTP/1.1-ALPN client config.
+///
+/// SEPARATE from [`NO_ALPN_CLIENT_CONFIG`] and it must STAY separate: crossing
+/// the two re-opens the 2026-04-23 `ResetWithoutClosingHandshake` class, where
+/// depth-200 received an ALPN it must not advertise. Two caches, never one.
+static ALPN_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+
+/// Process-wide cache for the no-ALPN client config (depth-200 only).
+static NO_ALPN_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+
+/// Returns the shared client config for one ALPN profile, building it at most
+/// once per process per profile.
+///
+/// # Why this is cached
+///
+/// The connector used to be rebuilt inside the dial path, so each of the 16
+/// sockets — and every reconnect thereafter — paid for a fresh config. Two
+/// costs followed, and the second is the one that matters:
+///
+/// 1. `load_native_certs()` re-reads and re-parses the ENTIRE system CA bundle
+///    from disk. That happened on the recovery path, which is exactly when the
+///    box is least idle.
+/// 2. A fresh `ClientConfig` carries a fresh, EMPTY session-resumption store.
+///    rustls only resumes a session between configs that share that store, so
+///    per-dial construction made TLS resumption structurally impossible: every
+///    reconnect paid a full 2-RTT handshake. Sharing one config per profile is
+///    what makes an abbreviated handshake possible at all.
+///
+/// # Failure is never cached
+///
+/// A build error returns without populating the cell, so a transient failure
+/// (CA store briefly unreadable) is retried on the next dial rather than
+/// poisoning the process. Only success is stored.
+///
+/// # Benign race
+///
+/// Two concurrent first-dials can both build a config; exactly one wins the
+/// cell and the loser returns its own valid-but-unshared handle. That costs one
+/// extra build at boot and nothing afterwards — worth it to avoid holding a
+/// lock across the CA parse.
+fn cached_client_config(
+    force_http11_alpn: bool,
+) -> Result<Arc<rustls::ClientConfig>, WebSocketError> {
+    let cell = if force_http11_alpn {
+        &ALPN_CLIENT_CONFIG
+    } else {
+        &NO_ALPN_CLIENT_CONFIG
+    };
+
+    if let Some(shared) = cell.get() {
+        return Ok(Arc::clone(shared));
+    }
+
+    let built = Arc::new(build_client_config(force_http11_alpn)?);
+
+    if cell.set(Arc::clone(&built)).is_err() {
+        // Lost the benign race described above: a concurrent first-dial cached
+        // its config first. Prefer THAT handle, so every caller ends up sharing
+        // one config and therefore one resumption store.
+        if let Some(shared) = cell.get() {
+            return Ok(Arc::clone(shared));
+        }
+    }
+
+    Ok(built)
+}
+
 fn build_tls_connector_inner(force_http11_alpn: bool) -> Result<Connector, WebSocketError> {
+    // `Connector` is `Clone` and its rustls arm holds an `Arc`, so wrapping the
+    // cached config is a refcount bump — no TLS work happens here after the
+    // first successful build.
+    Ok(Connector::Rustls(cached_client_config(force_http11_alpn)?))
+}
+
+fn build_client_config(force_http11_alpn: bool) -> Result<rustls::ClientConfig, WebSocketError> {
     let mut root_store = rustls::RootCertStore::empty();
 
     let native_certs = rustls_native_certs::load_native_certs();
     let certs = native_certs.certs;
     let (added, _ignored) = root_store.add_parsable_certificates(certs);
 
-    // O(1) EXEMPT: begin — TLS setup runs once per connect, not per tick
+    // O(1) EXEMPT: begin — TLS setup runs at most once per process per ALPN
+    // profile (see `cached_client_config`), not per connect and not per tick.
     if added == 0 {
         return Err(WebSocketError::TlsConfigurationFailed {
             reason: "no native root CA certificates found".to_string(),
@@ -71,7 +146,7 @@ fn build_tls_connector_inner(force_http11_alpn: bool) -> Result<Connector, WebSo
     }
     // O(1) EXEMPT: end
 
-    Ok(Connector::Rustls(Arc::new(config)))
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -94,6 +169,75 @@ mod tests {
             Connector::Rustls(config) => config,
             _other => panic!("expected Connector::Rustls, got non-Rustls variant"),
         }
+    }
+
+    /// The ALPN connector hands out ONE shared config, not a fresh one per
+    /// call. This is what makes TLS session resumption possible across the 16
+    /// sockets and every reconnect: rustls only resumes between configs that
+    /// share a resumption store. It also stops `load_native_certs()` re-reading
+    /// the whole CA bundle from disk on the recovery path.
+    #[test]
+    fn alpn_connector_reuses_one_shared_client_config() {
+        install_crypto_provider();
+        let first = unwrap_rustls_config(
+            build_websocket_tls_connector().expect("first ALPN connector builds"),
+        );
+        let second = unwrap_rustls_config(
+            build_websocket_tls_connector().expect("second ALPN connector builds"),
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the ALPN client config must be cached process-wide — a fresh config per \
+             dial carries an empty resumption store, so every reconnect pays a full \
+             2-RTT handshake and re-parses the system CA bundle from disk"
+        );
+    }
+
+    /// Same guarantee for the depth-200 (no-ALPN) profile.
+    #[test]
+    fn no_alpn_connector_reuses_one_shared_client_config() {
+        install_crypto_provider();
+        let first = unwrap_rustls_config(
+            build_websocket_tls_connector_no_alpn().expect("first no-ALPN connector builds"),
+        );
+        let second = unwrap_rustls_config(
+            build_websocket_tls_connector_no_alpn().expect("second no-ALPN connector builds"),
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the no-ALPN client config must be cached process-wide"
+        );
+    }
+
+    /// The two profiles must NEVER collapse into one cache entry.
+    ///
+    /// Handing depth-200 a config that advertises `http/1.1` ALPN is exactly
+    /// the wire mismatch that produced two weeks of
+    /// `Protocol(ResetWithoutClosingHandshake)` on `full-depth-api.dhan.co`
+    /// until the 2026-04-23 vendor-SDK verification. Caching made that mistake
+    /// newly possible (one cell instead of two), so it is pinned here.
+    #[test]
+    fn alpn_and_no_alpn_configs_are_never_the_same_handle() {
+        install_crypto_provider();
+        let alpn =
+            unwrap_rustls_config(build_websocket_tls_connector().expect("ALPN connector builds"));
+        let no_alpn = unwrap_rustls_config(
+            build_websocket_tls_connector_no_alpn().expect("no-ALPN connector builds"),
+        );
+        assert!(
+            !Arc::ptr_eq(&alpn, &no_alpn),
+            "the ALPN and no-ALPN caches must stay separate — sharing one would give \
+             depth-200 an ALPN it must not advertise"
+        );
+        assert_eq!(
+            alpn.alpn_protocols,
+            vec![b"http/1.1".to_vec()],
+            "the ALPN profile must still force http/1.1"
+        );
+        assert!(
+            no_alpn.alpn_protocols.is_empty(),
+            "the depth-200 profile must advertise NO ALPN"
+        );
     }
 
     #[test]
@@ -256,18 +400,45 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Multiple sequential builds produce independent configs
+    // Multiple sequential builds SHARE one config (inverted 2026-08-14)
     // -----------------------------------------------------------------------
 
+    /// This test previously asserted the OPPOSITE — that two builds return
+    /// independent `Arc`s, commented "not sharing state". It is inverted here
+    /// deliberately, and the reasoning is recorded so nobody reads this as a
+    /// test bent to make a build pass.
+    ///
+    /// The old assertion pinned an INCIDENTAL property of the old
+    /// implementation (a fresh config per call) and gave no functional reason
+    /// for it. There is none: rustls documents sharing one `ClientConfig` across
+    /// many connections as the intended usage, and explicitly notes that
+    /// resumption is only possible BETWEEN configs that share a resumption
+    /// store. Independence was therefore not a feature — it was the thing
+    /// making every one of the 16 sockets pay a full 2-RTT handshake on every
+    /// reconnect, and re-parse the system CA bundle from disk while doing it.
+    ///
+    /// The invariant that IS load-bearing — that the ALPN and no-ALPN profiles
+    /// never share a config, which is what the 2026-04-23 depth-200 incident
+    /// was about — is pinned separately and explicitly by
+    /// `alpn_and_no_alpn_configs_are_never_the_same_handle`. That guarantee is
+    /// strengthened by this change, not weakened: it moves from "every config
+    /// happens to be distinct" to "these two are asserted distinct by name".
+    ///
+    /// Sharing across the three feed hosts is safe: rustls keys its resumption
+    /// store by server name, so `api-feed`, `depth-api-feed` and
+    /// `full-depth-api` each resume against their own tickets.
     #[test]
-    fn test_build_websocket_tls_connector_produces_independent_configs() {
+    fn test_build_websocket_tls_connector_shares_one_config() {
         install_crypto_provider();
-        let c1 = build_websocket_tls_connector().unwrap();
-        let c2 = build_websocket_tls_connector().unwrap();
-        let cfg1 = unwrap_rustls_config(c1);
-        let cfg2 = unwrap_rustls_config(c2);
-        // They should be different Arc instances (not sharing state)
-        assert!(!Arc::ptr_eq(&cfg1, &cfg2));
+        let cfg1 =
+            unwrap_rustls_config(build_websocket_tls_connector().expect("first connector builds"));
+        let cfg2 =
+            unwrap_rustls_config(build_websocket_tls_connector().expect("second connector builds"));
+        assert!(
+            Arc::ptr_eq(&cfg1, &cfg2),
+            "sequential builds must hand out ONE shared config — that is what makes \
+             TLS session resumption possible across reconnects"
+        );
     }
 
     // -----------------------------------------------------------------------
