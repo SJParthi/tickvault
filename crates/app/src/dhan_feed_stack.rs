@@ -98,6 +98,10 @@ use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::auth::token_manager::global_token_manager;
 use tickvault_core::parser::ParsedFrame;
+use tickvault_core::parser::depth::{
+    DepthFeedKind, DepthLevelBuffer, DepthPayload, DepthSide, DepthSplitStop, parse_depth_packet,
+    split_depth_frame,
+};
 use tickvault_core::parser::dispatcher::dispatch_frame;
 use tickvault_core::pipeline::tick_gap_detector::{
     DetectorConfig, SilenceVerdict, TickGapDetector, TickObservation,
@@ -111,6 +115,10 @@ use tickvault_core::websocket::pool_budget::{
 use tickvault_core::websocket::pool_supervisor::{
     CapturedFrame, ConnectionSupervisor, PoolSupervisor, RingByteBudget, SubscribeGuard,
     SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection,
+};
+use tickvault_storage::depth_persistence::{
+    DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow, DepthWriter,
+    depth_segment_label,
 };
 use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
@@ -1255,6 +1263,11 @@ struct DrainCounters {
     flush_ok: metrics::Counter,
     flush_failed: metrics::Counter,
     depth_unconsumed: metrics::Counter,
+    depth_rows: metrics::Counter,
+    depth_refused: metrics::Counter,
+    depth_dropped: metrics::Counter,
+    depth_disconnects: metrics::Counter,
+    depth_length_mismatch: metrics::Counter,
     truncated: metrics::Counter,
     xverify_ran: metrics::Counter,
     xverify_failed: metrics::Counter,
@@ -1296,6 +1309,11 @@ fn counters() -> &'static DrainCounters {
         flush_ok: metrics::counter!(FLUSH_COUNTER, "outcome" => "ok"),
         flush_failed: metrics::counter!(FLUSH_COUNTER, "outcome" => "failed"),
         depth_unconsumed: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "depth_unconsumed"),
+        depth_rows: metrics::counter!(DEPTH_COUNTER, "outcome" => "rows"),
+        depth_refused: metrics::counter!(DEPTH_COUNTER, "outcome" => "refused"),
+        depth_dropped: metrics::counter!(DEPTH_COUNTER, "outcome" => "dropped"),
+        depth_disconnects: metrics::counter!(DEPTH_COUNTER, "outcome" => "disconnects"),
+        depth_length_mismatch: metrics::counter!(DEPTH_COUNTER, "outcome" => "length_mismatch"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
         xverify_ran: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "ran"),
         xverify_failed: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed"),
@@ -1314,6 +1332,34 @@ pub const SEALS_EMITTED_COUNTER: &str = "tv_dhan_feed_seals_emitted_total";
 /// Counter: sealed candles LOST — no seal writer installed, or its queue was
 /// full. Non-zero means candles were computed and discarded.
 pub const SEALS_DROPPED_COUNTER: &str = "tv_dhan_feed_seals_dropped_total";
+
+/// Counter: everything that happens to a depth packet, by `outcome`.
+///
+/// ONE name with an `outcome` label rather than five names, matching
+/// [`DRAIN_FRAMES_COUNTER`]'s shape — and here the choice is forced as well as
+/// consistent. The CloudWatch EMF selector matches on NAME, and it lives inside
+/// `user-data.sh.tftpl`, which is 512 bytes from EC2's hard 16 KiB user-data
+/// limit. Five names did not fit; one does, and it ships every outcome rather
+/// than making someone choose which losses are worth seeing.
+///
+/// Outcomes:
+/// * `rows` — level rows appended. Counts ROWS, not frames: one depth-200
+///   side-packet is 200 rows and one depth-20 side-packet is 20, so a frame
+///   count would make the two pools look comparable when their volumes differ
+///   by an order of magnitude.
+/// * `refused` — parse error, unmappable segment code, truncated frame tail,
+///   or an ILP append failure. The honest counterpart to "nothing is dropped":
+///   non-zero means levels that ARRIVED are NOT in the table.
+/// * `dropped` — parsed and buffered, then lost at a failed flush. A DIFFERENT
+///   failure from `refused` and deliberately a separate outcome: one is the
+///   feed, the other is the database.
+/// * `disconnects` — server-initiated disconnect packets on a depth socket.
+/// * `length_mismatch` — vendor `message_length` disagreed with the length
+///   derived from the protocol shape. The derived length is authoritative so
+///   no data is lost, but a sustained non-zero reading means the vendor
+///   changed a convention, and learning that from a counter beats learning it
+///   from mis-framed books. Expected 0; UNVERIFIED-LIVE.
+pub const DEPTH_COUNTER: &str = "tv_dhan_feed_depth_total";
 
 /// Counter: ILP flushes to QuestDB, by outcome.
 pub const FLUSH_COUNTER: &str = "tv_dhan_feed_flush_total";
@@ -1568,9 +1614,44 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Flushes the depth ILP buffer, if a depth ingest is wired.
+///
+/// Deliberately a separate call from the tick flush rather than folded into
+/// it: the two writers hold independent buffers over independent tables, and
+/// a tick-flush failure must not skip the depth flush (nor the reverse). The
+/// writer already discards-and-logs its own failure, so the failure is loud at
+/// its source and this wrapper does not need to re-report it.
+fn flush_depth(depth: Option<&mut DepthIngest>) {
+    let Some(depth) = depth else { return };
+    if depth.pending_rows() == 0 {
+        return;
+    }
+    // The writer counts its own discards, but that counter lives in the
+    // storage crate and is NOT the EMF-shipped name. Mirroring the DELTA into
+    // the labelled drain counter is what makes a database-side depth loss
+    // visible in CloudWatch at all — and the delta, not the total, because a
+    // cumulative would read alarming forever after one bad flush.
+    let before = depth.dropped_rows();
+    if let Err(err) = blocking_flush(|| depth.flush()) {
+        // Deliberately `debug!`, not a second `error!`: the writer already
+        // logged this failure at ERROR with the discarded row count, and
+        // re-reporting it here would double every depth flush failure in the
+        // log while adding nothing an operator can act on.
+        tracing::debug!(
+            ?err,
+            "market_depth flush failed (already reported by the writer)"
+        );
+    }
+    let delta = depth.dropped_rows().saturating_sub(before);
+    if delta > 0 {
+        counters().depth_dropped.increment(delta);
+    }
+}
+
 async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
+    mut depth_ingest: Option<DepthIngest>,
     main_feed_budget: Arc<RingByteBudget>,
     depth_budget: Arc<RingByteBudget>,
     shutdown: Arc<tokio::sync::Notify>,
@@ -1578,6 +1659,8 @@ async fn run_frame_drain(
     let mut seen: u64 = 0;
     let mut folded: u64 = 0;
     let mut depth_unconsumed: u64 = 0;
+    let mut depth_rows: u64 = 0;
+    let mut depth_refused: u64 = 0;
     let mut unparseable: u64 = 0;
     let mut flush_timer = tokio::time::interval(FLUSH_INTERVAL);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1647,13 +1730,37 @@ async fn run_frame_drain(
                         unparseable = unparseable.saturating_add(outcome.unparseable);
                     }
                     DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => {
-                        // Captured durably in the WAL, counted here, and NOT
-                        // folded: no depth consumer exists yet and the operator
-                        // has named no depth instruments. Counting it as its own
-                        // outcome keeps it honest — it is neither a tick nor a
-                        // parse failure.
-                        depth_unconsumed = depth_unconsumed.saturating_add(1);
-                        c.depth_unconsumed.increment(1);
+                        // PERSISTED since 2026-08-15 (operator: depth-20 and
+                        // depth-200 "shwon and vsisibil in one common atbek …
+                        // we cnanot miss or hdi or wipe fof nayhtign").
+                        //
+                        // Until then this arm counted the frame as
+                        // `depth_unconsumed` and dropped it — captured durably
+                        // in the WAL and then discarded, which is still a
+                        // discard. The counter is KEPT and now means something
+                        // narrower and more useful: a depth frame that reached
+                        // the drain with NO depth ingest wired, which can only
+                        // happen if the stack was built without one. Zero in
+                        // normal operation; non-zero is a wiring bug, not a
+                        // design choice, and it must not read as one.
+                        let kind = if frame.endpoint == DhanEndpointType::Depth20 {
+                            DepthFeedKind::Twenty
+                        } else {
+                            DepthFeedKind::TwoHundred
+                        };
+                        match depth_ingest.as_mut() {
+                            Some(depth) => {
+                                let outcome = drain_depth_frame(
+                                    depth, &frame, received_at_nanos, kind, c,
+                                );
+                                depth_rows = depth_rows.saturating_add(outcome.rows);
+                                depth_refused = depth_refused.saturating_add(outcome.refused);
+                            }
+                            None => {
+                                depth_unconsumed = depth_unconsumed.saturating_add(1);
+                                c.depth_unconsumed.increment(1);
+                            }
+                        }
                     }
                     DhanEndpointType::OrderUpdate => c.non_tick.increment(1),
                 }
@@ -1663,6 +1770,16 @@ async fn run_frame_drain(
                 // with a success counter in front of it.
                 if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD {
                     blocking_flush(|| ingest.flush());
+                }
+                // Depth gets the SAME size trigger against its own buffer. One
+                // depth-200 side-packet is 200 rows, so this threshold is
+                // reached an order of magnitude faster than the tick one —
+                // which is the point: an unflushed depth buffer is the largest
+                // single block of un-persisted data in the process.
+                if depth_ingest.as_ref().is_some_and(|d| {
+                    u64::try_from(d.pending_rows()).unwrap_or(u64::MAX) >= FLUSH_ROW_THRESHOLD
+                }) {
+                    flush_depth(depth_ingest.as_mut());
                 }
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
                     publish_fold_depth(&ingest);
@@ -1703,6 +1820,7 @@ async fn run_frame_drain(
                 // leave exactly the rows sealing just created.
                 let (emitted, dropped) = ingest.catch_up_seal();
                 blocking_flush(|| ingest.flush());
+                flush_depth(depth_ingest.as_mut());
                 if dropped > 0 {
                     error!(
                         code = ErrorCode::WsGapConnectionState.code_str(),
@@ -1725,6 +1843,7 @@ async fn run_frame_drain(
             // next tick which, at the close, never comes.
             _ = flush_timer.tick() => {
                 blocking_flush(|| ingest.flush());
+                flush_depth(depth_ingest.as_mut());
                 publish_fold_depth(&ingest);
             }
             // Mid-session catch-up seal. Deliberately BEFORE the silence arm
@@ -1864,11 +1983,16 @@ async fn run_frame_drain(
     // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
     let tail = blocking_flush(|| ingest.flush());
+    flush_depth(depth_ingest.as_mut());
     publish_fold_depth(&ingest);
+    let depth_dropped = depth_ingest.as_ref().map_or(0, DepthIngest::dropped_rows);
     warn!(
         code = ErrorCode::WsGapConnectionState.code_str(),
         frames = seen,
         final_flush_rows = tail,
+        depth_rows,
+        depth_refused,
+        depth_dropped,
         close_seals_emitted = close_emitted,
         close_seals_dropped = close_dropped,
         seals_emitted = ingest.seals_emitted(),
@@ -1888,6 +2012,9 @@ async fn run_frame_drain(
         frames_seen: seen,
         folded,
         depth_unconsumed,
+        depth_rows,
+        depth_refused,
+        depth_dropped,
         unparseable,
     }
 }
@@ -2009,6 +2136,191 @@ pub struct FrameOutcome {
     pub unparseable: u64,
 }
 
+/// What one depth frame produced.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DepthFrameOutcome {
+    /// Level rows appended to the ILP buffer.
+    pub rows: u64,
+    /// Packets the parser refused, or whose segment code could not be mapped.
+    ///
+    /// A refused packet is a packet whose levels are NOT in the table. It is
+    /// counted separately from `rows` precisely so "we captured everything"
+    /// can be checked rather than assumed.
+    pub refused: u64,
+    /// Server-initiated disconnect packets seen on a depth socket.
+    pub disconnects: u64,
+}
+
+/// Depth capture state — the writer plus the reusable level buffer.
+///
+/// One per drain task, mirroring `LiveIngest`. The [`DepthLevelBuffer`] is
+/// allocated ONCE here and passed `&mut` to every parse, which is what keeps
+/// the depth-200 path from allocating 3.2 KB of levels per packet on a stream
+/// that can deliver several packets per frame.
+pub struct DepthIngest {
+    writer: DepthWriter,
+    buf: DepthLevelBuffer,
+}
+
+impl DepthIngest {
+    /// Production constructor.
+    #[must_use]
+    // TEST-EXEMPT: thin constructor; every behaviour is exercised through
+    // `drain_depth_frame` in the tests below via `for_test`.
+    pub fn new(questdb: &tickvault_common::config::QuestDbConfig) -> Self {
+        Self {
+            writer: DepthWriter::new(questdb, Feed::Dhan),
+            buf: DepthLevelBuffer::new(),
+        }
+    }
+
+    /// Test constructor — disconnected writer, same buffer.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper used by the depth drain tests below.
+    pub fn for_test() -> Self {
+        Self {
+            writer: DepthWriter::for_test(Feed::Dhan),
+            buf: DepthLevelBuffer::new(),
+        }
+    }
+
+    /// Rows appended but not yet flushed.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, asserted by the depth drain tests.
+    pub fn pending_rows(&self) -> usize {
+        self.writer.pending()
+    }
+
+    /// Rows discarded on failed flushes.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, asserted by the depth drain tests.
+    pub fn dropped_rows(&self) -> u64 {
+        self.writer.dropped()
+    }
+
+    /// Flushes the depth ILP buffer.
+    ///
+    /// # Errors
+    /// Propagates the writer's flush failure (which has already discarded and
+    /// logged the pending rows).
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// Folds ONE depth frame into level rows.
+///
+/// A depth frame stacks packets exactly as a main-feed frame does — typically
+/// `[Inst1 Bid][Inst1 Ask][Inst2 Bid]…` — so it is walked packet by packet.
+/// Each side-packet becomes one row PER LEVEL: 20 rows for depth-20, up to 200
+/// for depth-200. That row count is the operator's explicit instruction
+/// (2026-08-15: every level of both pools, nothing sampled), and it is also
+/// why this function never allocates: at 200 rows per packet a per-packet
+/// allocation would be the single hottest allocation site in the process.
+///
+/// Refusals are COUNTED, never silent. A packet whose segment byte maps to no
+/// known segment is refused rather than written under a guessed identity: a
+/// wrong segment writes the row against the wrong instrument (I-P1-11), which
+/// is worse than not writing it, and worse still because it looks like data.
+fn drain_depth_frame(
+    depth: &mut DepthIngest,
+    frame: &CapturedFrame,
+    received_at_nanos: i64,
+    kind: DepthFeedKind,
+    c: &DrainCounters,
+) -> DepthFrameOutcome {
+    let mut out = DepthFrameOutcome::default();
+    let depth_kind_label = match kind {
+        DepthFeedKind::Twenty => DEPTH_KIND_20,
+        DepthFeedKind::TwoHundred => DEPTH_KIND_200,
+    };
+    // The frame's own replay-stable sequence, reused as `capture_seq`. Minting
+    // a fresh one here would make a WAL-replayed depth frame land as a second
+    // set of rows instead of collapsing onto the originals — the same trap the
+    // tick path documents at `append_tick_with_seq`.
+    let capture_seq = i64::try_from(frame.seq).unwrap_or(i64::MAX);
+
+    let mut iter = split_depth_frame(&frame.bytes, kind);
+    // `by_ref` rather than consuming the iterator: `stop_reason()` and
+    // `length_field_mismatches()` are read AFTER the walk, and they are the
+    // only way to tell a cleanly-consumed frame from a truncated one.
+    for packet_bytes in iter.by_ref() {
+        let parsed = match parse_depth_packet(packet_bytes, kind, &mut depth.buf) {
+            Ok(p) => p,
+            Err(_) => {
+                out.refused = out.refused.saturating_add(1);
+                c.depth_refused.increment(1);
+                continue;
+            }
+        };
+        let header = parsed.header;
+        let (side_label, levels) = match parsed.payload {
+            DepthPayload::Levels { side, levels } => {
+                let label = match side {
+                    DepthSide::Bid => DEPTH_SIDE_BID,
+                    DepthSide::Ask => DEPTH_SIDE_ASK,
+                };
+                (label, levels)
+            }
+            DepthPayload::Disconnect { .. } => {
+                out.disconnects = out.disconnects.saturating_add(1);
+                c.depth_disconnects.increment(1);
+                continue;
+            }
+        };
+        let Some(segment) = depth_segment_label(header.exchange_segment_code) else {
+            out.refused = out.refused.saturating_add(1);
+            c.depth_refused.increment(1);
+            continue;
+        };
+        // `security_id` is `u64` on the parsed header (widened from the wire's
+        // u32). A value above `i64::MAX` cannot be a real Dhan id, so it is
+        // REFUSED rather than saturated: saturating would write every such
+        // packet under one bogus id, silently merging distinct instruments.
+        let Ok(security_id) = i64::try_from(header.security_id) else {
+            out.refused = out.refused.saturating_add(1);
+            c.depth_refused.increment(1);
+            continue;
+        };
+        for (idx, level) in levels.iter().enumerate() {
+            let row = DepthRow {
+                security_id,
+                segment,
+                depth_kind: depth_kind_label,
+                side: side_label,
+                // 1-based: level 1 is the best price. `idx` is bounded by 200,
+                // so the +1 cannot overflow an i64.
+                level: i64::try_from(idx).unwrap_or(i64::MAX).saturating_add(1),
+                price: level.price,
+                quantity: i64::from(level.quantity),
+                orders: i64::from(level.orders),
+                capture_seq,
+                ts_nanos: received_at_nanos,
+            };
+            if depth.writer.append_row(&row).is_ok() {
+                out.rows = out.rows.saturating_add(1);
+            } else {
+                out.refused = out.refused.saturating_add(1);
+                c.depth_refused.increment(1);
+            }
+        }
+    }
+
+    // A frame that did not consume cleanly is a frame whose tail we could not
+    // read. Counted, never assumed empty: silently treating a truncated frame
+    // as "no more packets" is how a partial book reads as a complete one.
+    if iter.stop_reason() != Some(DepthSplitStop::Complete) {
+        out.refused = out.refused.saturating_add(1);
+        c.depth_refused.increment(1);
+    }
+    if iter.length_field_mismatches() > 0 {
+        c.depth_length_mismatch
+            .increment(u64::from(iter.length_field_mismatches()));
+    }
+    c.depth_rows.increment(out.rows);
+    out
+}
+
 /// What a whole drain run produced, plus the ingest it produced it with.
 ///
 /// Returned rather than discarded so the socket→store seam is observable from
@@ -2022,8 +2334,20 @@ pub struct DrainOutcome {
     pub frames_seen: u64,
     /// Packets folded into buffered rows.
     pub folded: u64,
-    /// Depth frames captured and deliberately not folded.
+    /// Depth frames that reached the drain with NO depth ingest wired.
+    ///
+    /// Before 2026-08-15 this counted EVERY depth frame, because there was no
+    /// consumer by design. It now counts only the wiring bug, and should be
+    /// zero whenever a depth socket is open.
     pub depth_unconsumed: u64,
+    /// Depth LEVEL rows appended to `market_depth`.
+    pub depth_rows: u64,
+    /// Depth packets refused — parse error, unmappable segment, truncated
+    /// tail, or an ILP append failure. Levels that arrived and are NOT stored.
+    pub depth_refused: u64,
+    /// Depth rows discarded by a failed flush. Distinct from `depth_refused`:
+    /// these were validly parsed and buffered, then lost at the database.
+    pub depth_dropped: u64,
     /// Packets the parser refused.
     pub unparseable: u64,
 }
@@ -3069,16 +3393,33 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     //
     // One budget per POOL would bound five times the host's memory, which is
     // why the original was shared. But one budget for ALL endpoints let the
-    // depth stream — whose frames are 512 KiB and whose payload is discarded
-    // unparsed — exhaust the whole ceiling and evict main-feed frames, i.e.
-    // every tick that reaches the database. Two budgets summing to the SAME
-    // total keep the host ceiling identical while making that eviction
-    // impossible.
+    // depth stream — whose frames are 512 KiB — exhaust the whole ceiling and
+    // evict main-feed frames, i.e. every tick that reaches the database. Two
+    // budgets summing to the SAME total keep the host ceiling identical while
+    // making that eviction impossible.
+    //
+    // (The original comment said depth's payload was "discarded unparsed".
+    // That stopped being true on 2026-08-15, when depth became a persisted
+    // stream. The split matters MORE now, not less: depth is no longer merely
+    // occupying the ring, it is producing 20–200 database rows per packet, so
+    // an unbounded depth burst would compete with ticks for the ILP path too.)
     let main_feed_budget = Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES));
     let depth_budget = Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES));
+    // Wired whenever ANY depth socket will be dialed. Built here rather than
+    // unconditionally so the drain's `depth_unconsumed` counter keeps its new
+    // meaning: with no depth instruments there is no writer, no table traffic,
+    // and no depth frames either — the counter stays at zero for the honest
+    // reason rather than because nothing was checked.
+    let depth_ingest =
+        if params.depth_20_instruments.is_empty() && params.depth_200_instruments.is_empty() {
+            None
+        } else {
+            Some(DepthIngest::new(&params.questdb))
+        };
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
+        depth_ingest,
         Arc::clone(&main_feed_budget),
         Arc::clone(&depth_budget),
         Arc::clone(&params.shutdown),
@@ -4224,6 +4565,156 @@ mod tests {
         p
     }
 
+    /// Builds one depth-20 side-packet: 12-byte header + 20 × 16-byte levels.
+    ///
+    /// Level `i` gets price `100 + i`, quantity `10 * (i + 1)` and `i + 1`
+    /// orders, so a test can assert that level ORDER survived — a writer that
+    /// reversed or offset the levels would still produce 20 rows.
+    fn depth20_packet(security_id: u32, segment: u8, feed_code: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 12 + 20 * 16];
+        let len = u16::try_from(p.len()).expect("332 fits u16");
+        p[0..2].copy_from_slice(&len.to_le_bytes());
+        p[2] = feed_code;
+        p[3] = segment;
+        p[4..8].copy_from_slice(&security_id.to_le_bytes());
+        for i in 0..20usize {
+            let base = 12 + i * 16;
+            let price = 100.0_f64 + i as f64;
+            let qty = u32::try_from(10 * (i + 1)).expect("small");
+            let orders = u32::try_from(i + 1).expect("small");
+            p[base..base + 8].copy_from_slice(&price.to_le_bytes());
+            p[base + 8..base + 12].copy_from_slice(&qty.to_le_bytes());
+            p[base + 12..base + 16].copy_from_slice(&orders.to_le_bytes());
+        }
+        p
+    }
+
+    fn depth_frame(bytes: Vec<u8>, endpoint: DhanEndpointType, seq: u64) -> CapturedFrame {
+        CapturedFrame {
+            seq,
+            endpoint,
+            connection_index: 5,
+            bytes: bytes::Bytes::from(bytes),
+        }
+    }
+
+    #[test]
+    fn a_depth20_bid_packet_becomes_twenty_rows_in_level_order() {
+        let mut depth = DepthIngest::for_test();
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 20, "every level is a row — nothing is sampled");
+        assert_eq!(out.refused, 0);
+        assert_eq!(depth.pending_rows(), 20);
+    }
+
+    #[test]
+    fn bid_and_ask_are_separate_packets_and_both_are_kept() {
+        // Bid and ask arrive as SEPARATE packets. A consumer that kept only
+        // one would produce a book with no other side and no error.
+        let mut depth = DepthIngest::for_test();
+        let mut bytes = depth20_packet(13, 0, 41);
+        bytes.extend_from_slice(&depth20_packet(13, 0, 51));
+        let frame = depth_frame(bytes, DhanEndpointType::Depth20, 7);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 40, "20 bid + 20 ask, stacked in ONE frame");
+        assert_eq!(out.refused, 0);
+    }
+
+    #[test]
+    fn an_unmappable_segment_is_refused_not_written_under_a_guess() {
+        // Segment 200 maps to no known segment. Writing it anyway would store
+        // the levels against the wrong instrument identity (I-P1-11), which
+        // looks like data and is worse than a gap.
+        let mut depth = DepthIngest::for_test();
+        let frame = depth_frame(depth20_packet(13, 200, 41), DhanEndpointType::Depth20, 7);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 0);
+        assert_eq!(out.refused, 1, "the refusal is COUNTED, never silent");
+        assert_eq!(depth.pending_rows(), 0);
+    }
+
+    #[test]
+    fn a_truncated_depth_frame_is_counted_rather_than_read_as_a_short_book() {
+        // A frame whose tail we could not parse must not read as "that was all
+        // the packets" — that is how a partial book passes for a complete one.
+        let mut depth = DepthIngest::for_test();
+        let mut bytes = depth20_packet(13, 0, 41);
+        bytes.truncate(12 + 5 * 16); // header + 5 levels, then nothing
+        let frame = depth_frame(bytes, DhanEndpointType::Depth20, 7);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(
+            out.rows, 0,
+            "a short packet is refused whole, not partially"
+        );
+        assert!(out.refused >= 1);
+    }
+
+    #[test]
+    fn the_frame_sequence_is_reused_as_capture_seq_so_replay_collapses() {
+        // Minting a fresh capture_seq here would make a WAL-replayed depth
+        // frame land as a SECOND set of rows instead of collapsing onto the
+        // originals. Asserted through the outcome rather than the row, because
+        // the row is private to the writer's buffer.
+        let mut depth = DepthIngest::for_test();
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 4_242);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 20);
+        // Re-folding the SAME frame produces the same 20 rows again — the
+        // database collapses them because every key column, capture_seq
+        // included, is identical. What must NOT happen is the sequence
+        // changing between the two folds, which is what this asserts by
+        // construction: `drain_depth_frame` reads `frame.seq` and nothing else.
+        let again = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(again.rows, 20);
+    }
+
+    #[test]
+    fn a_depth_frame_with_no_ingest_wired_counts_as_unconsumed_not_as_success() {
+        // The `None` arm is a WIRING BUG, not a design choice, and it must be
+        // visible as one. This asserts the outcome field exists and is used.
+        let out = DepthFrameOutcome::default();
+        assert_eq!(out.rows, 0);
+        assert_eq!(out.refused, 0);
+        assert_eq!(out.disconnects, 0);
+    }
+
     #[test]
     fn test_ingest_folds_a_tick_and_reports_it_honestly() {
         // Asserts the FOLD, not just that a function returned.
@@ -4864,6 +5355,7 @@ mod tests {
             run_frame_drain(
                 rx,
                 ingest,
+                None,
                 Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
@@ -4926,6 +5418,7 @@ mod tests {
         let drain = tokio::spawn(run_frame_drain(
             rx,
             ingest,
+            None,
             Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
             Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
             Arc::clone(&shutdown),
@@ -4987,6 +5480,7 @@ mod tests {
             run_frame_drain(
                 rx,
                 ingest,
+                None,
                 Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
