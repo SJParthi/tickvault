@@ -1588,13 +1588,13 @@ mod shared_token_expiry_tests {
     }
 
     #[test]
-    fn test_reads_the_exp_claim() {
+    fn test_jwt_exp_epoch_seconds_reads_the_exp_claim() {
         let jwt = jwt_with_payload(r#"{"exp":1786800000,"sub":"x"}"#);
         assert_eq!(jwt_exp_epoch_seconds(&jwt), Some(1_786_800_000));
     }
 
     #[test]
-    fn test_every_malformed_shape_declines_rather_than_guessing() {
+    fn test_jwt_exp_epoch_seconds_declines_every_malformed_shape() {
         // Each of these must return None so the caller falls back to its
         // existing paths. Adopting a token with an INVENTED expiry is the one
         // outcome that is worse than not adopting it: the renewal loop would

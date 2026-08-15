@@ -289,6 +289,7 @@ pub async fn fetch_groww_access_token() -> Result<SecretString, ApplicationError
 /// it is never fatal, because a missing shared token must not stop a box that
 /// can still mint its own.
 #[instrument(fields(environment))]
+// TEST-EXEMPT: live AWS SSM fetch — mirrors the TEST-EXEMPT fetch_groww_access_token; path construction is covered by build_ssm_path tests, and the adoption logic it feeds is covered in token_manager.
 pub async fn fetch_dhan_access_token() -> Result<SecretString, ApplicationError> {
     let environment = resolve_environment()?;
     tracing::Span::current().record("environment", environment.as_str());
