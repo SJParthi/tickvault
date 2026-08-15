@@ -124,6 +124,11 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
             "ensure_option_contract_1m_rest_table",
             "src/groww_contract_1m_boot.rs",
         ),
+        // market_depth — the depth-20 + depth-200 common table (2026-08-15).
+        // Its DEDUP key carries a `depth_kind` discriminator no other table
+        // needs; an ILP-auto-created table arrives without it and the two
+        // depth pools begin silently overwriting each other's levels.
+        ("ensure_market_depth_table", "src/main.rs"),
         // rest_fetch_audit — every REST leg's forensics
         ("ensure_rest_fetch_audit_table", "src/spot_1m_rest_boot.rs"),
         // tf_consistency_audit — 15:40 IST verifier
