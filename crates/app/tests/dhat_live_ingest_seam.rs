@@ -158,3 +158,151 @@ fn gate_is_not_vacuous() {
          measuring an empty loop"
     );
 }
+
+/// The FRAME seam — the function the original allocation actually lived in.
+///
+/// # Why this test exists on top of the one above
+///
+/// The 2026-08-14 audit found a per-tick `to_string()` plus a `Vec` build in
+/// `record_ws_lag`. The gate written in response measured `ingest_tick_at` —
+/// and `record_ws_lag` is called from `drain_main_feed_frame`, one line ABOVE
+/// the `ingest_tick_at` call. So the gate built to stop that regression did
+/// not cover the function the regression was in. It could have been
+/// reintroduced the next day with every DHAT target in the repository green.
+///
+/// Found by an adversarial hot-path review on 2026-08-15 and verified in
+/// source before this test was written: `dhan_feed_stack.rs` calls
+/// `record_ws_lag` at the top of the tick arm of `drain_main_feed_frame`, and
+/// `ingest_tick_at` on the line after.
+///
+/// This measures the WHOLE frame walk: header dispatch, per-packet decode, the
+/// lag recorder, and the fold. It therefore supersedes nothing — the narrower
+/// gate above still isolates the fold — but it is the one that would have
+/// caught the actual defect.
+///
+/// # Budget
+///
+/// Blocks, not bytes, for the same reason the fold gate gives: the row buffer
+/// is supposed to grow with tick count. A frame carrying 4 packets folded
+/// 2,500 times is 10,000 ticks through the same path as the gate above, so the
+/// same 512-block ceiling applies and means the same thing.
+#[test]
+fn frame_drain_seam_does_not_allocate_per_tick() {
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    /// One 50-byte Quote packet, built to the wire layout in
+    /// `crates/core/src/parser/quote.rs`.
+    fn quote_packet(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 50];
+        buf[0] = 4; // RESPONSE_CODE_QUOTE
+        buf[1..3].copy_from_slice(&50u16.to_le_bytes());
+        buf[3] = 0; // IDX_I
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&ltp.to_le_bytes());
+        buf[14..18].copy_from_slice(&ltt.to_le_bytes());
+        buf
+    }
+
+    /// Four packets stacked in ONE frame — the real shape. A single-packet
+    /// frame would not exercise the multi-packet walk, which is where an
+    /// allocation would scale worst.
+    fn frame(seq: u64, n: u64) -> CapturedFrame {
+        let mut bytes = Vec::with_capacity(200);
+        for i in 0..4u32 {
+            bytes.extend_from_slice(&quote_packet(
+                13 + i,
+                100.0 + (n % 97) as f32 * 0.05,
+                1_000 + (n % 600) as u32,
+            ));
+        }
+        CapturedFrame {
+            seq,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: (n % 4) as u8,
+            bytes: bytes.into(),
+        }
+    }
+
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    let c = counters();
+
+    // Warm-up OUTSIDE the window, same reasoning as the fold gate: first touch
+    // of an instrument allocates its slot and registers its metric keys.
+    for n in 0..4u64 {
+        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), 1_000_000, 1_000, c);
+    }
+
+    const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks, as above
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    for n in 0..FRAMES {
+        let _ = drain_main_feed_frame(
+            &mut ingest,
+            &frame(100 + n, n),
+            1_000_000 + n as i64,
+            1_000 + n,
+            c,
+        );
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    assert!(
+        stats.total_blocks <= MAX_BLOCKS,
+        "PER-TICK ALLOCATION ON THE FRAME SEAM.\n\n\
+         {FRAMES} frames x 4 packets allocated {} blocks ({} bytes); the budget \
+         is {MAX_BLOCKS}.\n\n\
+         This seam covers `record_ws_lag`, which the narrower fold gate does \
+         NOT — the 2026-08-14 regression lived exactly there, and was measured \
+         by nothing until this test.",
+        stats.total_blocks,
+        stats.total_bytes
+    );
+}
+
+/// Non-vacuity for the frame gate.
+///
+/// The budget is an upper bound, so a walk that decoded nothing would satisfy
+/// it. This proves the frames are actually being folded.
+#[test]
+fn frame_drain_gate_is_not_vacuous() {
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    let mut buf = vec![0u8; 50];
+    buf[0] = 4;
+    buf[1..3].copy_from_slice(&50u16.to_le_bytes());
+    buf[4..8].copy_from_slice(&13u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&100.5f32.to_le_bytes());
+    buf[14..18].copy_from_slice(&1_000u32.to_le_bytes());
+
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    assert_eq!(
+        ingest.tracked_instruments(),
+        0,
+        "a fresh ingest must track nothing"
+    );
+
+    let out = drain_main_feed_frame(
+        &mut ingest,
+        &CapturedFrame {
+            seq: 1,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: 0,
+            bytes: buf.into(),
+        },
+        1_000_000,
+        1_000,
+        counters(),
+    );
+
+    assert_eq!(
+        out.folded, 1,
+        "the frame walk must fold the packet it was given — otherwise the \
+         allocation budget above is measuring an empty loop"
+    );
+    assert!(ingest.tracked_instruments() > 0);
+}
