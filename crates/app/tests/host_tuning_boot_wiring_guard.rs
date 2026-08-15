@@ -190,3 +190,85 @@ fn guard_is_not_vacuous() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// QuestDB memory ceiling — the silent-3% foot-gun
+// ---------------------------------------------------------------------------
+
+/// The database memory cap must match the host it runs on.
+///
+/// # The defect this pins
+///
+/// `docker-compose.yml` reads `${QDB_MEM_LIMIT:-12g}`. That default applies
+/// ONLY when the variable is unset — and the 2026-07-15 downsize wrote
+/// `QDB_MEM_LIMIT=1g` into the on-box `.env` for a 4 GiB t4g.medium. The host
+/// is now a 32 GiB r8g.xlarge, so a surviving `1g` caps the database at **3%
+/// of the machine** while every config file in the repo reads 12g.
+///
+/// Nothing anywhere would report it. The container starts, the app connects,
+/// and the only symptom is a database quietly thrashing inside a ceiling
+/// nobody set on purpose.
+///
+/// `downsize-instance.yml` is the specific hazard: it is manually
+/// dispatchable, it writes that `.env` over SSM, and after the Quote-15 sweep
+/// it targets **r8g.xlarge** while still writing the 4 GiB-era value — a
+/// workflow that would throttle a 32 GiB box to 1 GiB in one click.
+#[test]
+fn questdb_memory_cap_matches_the_locked_host_size() {
+    let compose = read("deploy/docker/docker-compose.yml");
+    let downsize = read(".github/workflows/downsize-instance.yml");
+
+    assert!(
+        compose.contains("QDB_MEM_LIMIT:-12g"),
+        "the compose default is no longer 12g — on a 32 GiB host that is the \
+         value a box with no .env override must land on"
+    );
+
+    // The hazard is a WRITER of the on-box override disagreeing with the
+    // compose default. Any `QDB_MEM_LIMIT=<value>` written by automation must
+    // match, or the override silently wins over every file in the repo.
+    for (idx, line) in downsize.lines().enumerate() {
+        if let Some(pos) = line.find("QDB_MEM_LIMIT=") {
+            let tail = &line[pos + "QDB_MEM_LIMIT=".len()..];
+            let value: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if value.is_empty() {
+                continue; // a grep/sed pattern, not an assignment
+            }
+            assert_eq!(
+                value,
+                "12g",
+                "downsize-instance.yml:{} writes QDB_MEM_LIMIT={} to the on-box \
+                 .env, but the host is 32 GiB and compose defaults to 12g.\n\n\
+                 That override WINS over the compose default, so this one line \
+                 caps the database at a fraction of the machine — silently, \
+                 with no error anywhere. This workflow targets r8g.xlarge; the \
+                 value must match the host it now flips to.",
+                idx + 1,
+                value
+            );
+        }
+    }
+}
+
+#[test]
+fn questdb_cap_guard_is_not_vacuous() {
+    // The loop above passes trivially if no assignment is ever found.
+    let downsize = read(".github/workflows/downsize-instance.yml");
+    let assignments = downsize
+        .lines()
+        .filter(|l| {
+            l.find("QDB_MEM_LIMIT=").is_some_and(|p| {
+                l[p + "QDB_MEM_LIMIT=".len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
+            })
+        })
+        .count();
+    assert!(
+        assignments >= 2,
+        "found {assignments} QDB_MEM_LIMIT assignments in downsize-instance.yml \
+         — expected at least 2 (repo .env + on-box .env). The scanner is not \
+         matching, so the check above would pass vacuously"
+    );
+}
