@@ -102,6 +102,12 @@ pub const NAMED_VIEW_CANDLES_BASE: &str = "candles_1m";
 /// Equality is pinned by the ratchet test
 /// `test_lifecycle_dim_matches_persistence_const`.
 const NAMED_VIEW_LIFECYCLE_DIM: &str = "instrument_lifecycle";
+/// Wire-format name of the human-readable market-depth console view.
+pub const VIEW_DEPTH_NAMED: &str = "market_depth_named";
+/// Market-depth base table. Mirrors
+/// `depth_persistence::MARKET_DEPTH_TABLE`; equality is pinned by
+/// `test_depth_base_matches_persistence_const`.
+const NAMED_VIEW_DEPTH_BASE: &str = "market_depth";
 /// DDL HTTP timeout (same value as every other boot-DDL ensure site).
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -152,6 +158,34 @@ pub fn candles_named_view_ddl() -> String {
          ON c.security_id = il.security_id \
          AND c.segment = il.exchange_segment \
          AND c.feed = il.feed;"
+    )
+}
+
+/// DDL for the `market_depth_named` view — the human-readable face of the ONE
+/// COMMON depth table (operator 2026-08-15).
+///
+/// `depth_kind` is projected immediately after the identity columns rather
+/// than buried among the numbers, deliberately: it is the column that says
+/// WHICH book a row came from, and an analyst who cannot see it at a glance
+/// will read a depth-20 row and a depth-200 row as the same observation. It is
+/// also the DEDUP discriminator, so a row where it is unexpectedly NULL is the
+/// first sign the table was auto-created without its keys.
+///
+/// `ORDER BY` is deliberately absent: at 20–200 rows per packet an implicit
+/// sort would make every ad-hoc query expensive. Analysts filter first
+/// (`WHERE symbol_name = … AND depth_kind = 'd200'`) and sort what remains.
+pub fn depth_named_view_ddl() -> String {
+    let dim = lifecycle_dim_subquery();
+    format!(
+        "CREATE OR REPLACE VIEW {VIEW_DEPTH_NAMED} AS \
+         SELECT d.ts, il.symbol_name, il.display_name, il.instrument_type, \
+         d.depth_kind, d.side, d.level, d.price, d.quantity, d.orders, \
+         d.feed, d.segment, d.security_id, d.capture_seq \
+         FROM {NAMED_VIEW_DEPTH_BASE} d \
+         LEFT JOIN {dim} \
+         ON d.security_id = il.security_id \
+         AND d.segment = il.exchange_segment \
+         AND d.feed = il.feed;"
     )
 }
 
@@ -246,6 +280,17 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         &candles_named_view_ddl(),
     )
     .await;
+    // Depth joined its siblings 2026-08-15. It is attempted LAST and
+    // independently: on a box whose `market_depth` table does not exist yet
+    // (no depth socket has ever opened) this DDL warn-fails and the two views
+    // an analyst uses every day are already created.
+    run_view_ddl(
+        &client,
+        &base_url,
+        VIEW_DEPTH_NAMED,
+        &depth_named_view_ddl(),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -256,11 +301,58 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
 mod tests {
     use super::*;
 
-    fn both_ddls() -> [(&'static str, String); 2] {
+    // Named `both_ddls` when there were two. Kept under its original name so
+    // the shared assertions that call it stay greppable across history; it now
+    // carries all THREE console views, and every new view must join it or the
+    // shared invariants (single statement, LEFT JOIN, dry-run isolation) would
+    // silently not apply to it.
+    fn both_ddls() -> [(&'static str, String); 3] {
         [
             ("ticks_named", ticks_named_view_ddl()),
             ("candles_named", candles_named_view_ddl()),
+            ("market_depth_named", depth_named_view_ddl()),
         ]
+    }
+
+    #[test]
+    fn test_depth_named_view_ddl_is_single_terminated_statement() {
+        let ddl = depth_named_view_ddl();
+        assert!(ddl.ends_with(';'), "depth view DDL must end with ';'");
+        assert_eq!(
+            ddl.matches(';').count(),
+            1,
+            "depth view DDL must be exactly ONE statement (no injection surface)"
+        );
+    }
+
+    #[test]
+    fn test_depth_view_shows_the_kind_discriminator_next_to_identity() {
+        // An analyst who cannot see `depth_kind` at a glance will read a
+        // depth-20 row and a depth-200 row as the same observation.
+        let ddl = depth_named_view_ddl();
+        let kind_at = ddl.find("d.depth_kind").expect("depth_kind projected");
+        let price_at = ddl.find("d.price").expect("price projected");
+        assert!(
+            kind_at < price_at,
+            "depth_kind must come before the numbers, not after them: {ddl}"
+        );
+        for col in ["d.side", "d.level", "d.quantity", "d.orders"] {
+            assert!(ddl.contains(col), "{col} missing from the depth view");
+        }
+    }
+
+    #[test]
+    fn test_depth_base_matches_persistence_const() {
+        assert_eq!(
+            NAMED_VIEW_DEPTH_BASE,
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            "the view's base table drifted from the writer's table"
+        );
+    }
+
+    #[test]
+    fn test_depth_view_name_is_stable() {
+        assert_eq!(VIEW_DEPTH_NAMED, "market_depth_named");
     }
 
     #[test]

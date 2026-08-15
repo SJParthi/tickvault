@@ -205,6 +205,16 @@ fn every_dedup_key_is_listed_here_for_auditing() {
     //   (Plus the feed-scoreboard/coverage/rest-fetch/spot-1m families that
     //   carry security_id — the scanner lists them all; every one is
     //   segment-paired, enforced independently by the test above.)
+    // 2026-08-09: `DEDUP_KEY_TICKS` is BACK — the Dhan live main-feed WS was
+    // re-authorized and `tick_persistence.rs` rebuilt with it. The stage-2
+    // note above is history, not current state.
+    // 2026-08-15: `DEDUP_KEY_MARKET_DEPTH` added (depth_persistence.rs) for
+    // the one-common-table depth capture. It carries an extra discriminator
+    // the other keys do not need — `depth_kind` — because depth-20 and
+    // depth-200 both emit a level 5 bid for the same instrument-second from
+    // different sockets, and without it one silently overwrites the other.
+    // The segment/feed halves are enforced by the two tests above; the
+    // discriminator is enforced at its declaration site.
     let decls = collect_dedup_key_declarations();
     let keys_with_security_id: Vec<&str> = decls
         .iter()

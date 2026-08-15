@@ -582,24 +582,39 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // the operator console to scrape. Shipping its buckets would also multiply
     // cost by the bucket count × 16 connections, which is precisely the kind of
     // cardinality this ratchet exists to make someone think about.
+    // 2026-08-15 (+1, ~$0.30/mo): `tv_dhan_feed_depth_total`, added when
+    // depth-20 and depth-200 stopped being captured-then-discarded and became a
+    // persisted stream (operator directive: one common `market_depth` table,
+    // "we cannot miss or hide or wipe off anything").
     //
-    // 2026-08-15: 65 -> 67. TWO gauges added with host-adaptive ring sizing —
-    // `tv_host_total_ram_bytes` (what the process actually measured about its
-    // machine) and `tv_dhan_feed_ring_max_bytes` (what it decided as a result).
-    // Cost ~$0.60/mo; dated note in `aws-budget.md`.
+    // ONE name carrying an `outcome` label — rows / refused / dropped /
+    // disconnects / length_mismatch — rather than five names. That was not a
+    // stylistic preference: five names pushed `user-data.sh.tftpl` 64 bytes
+    // past the size guard's budget, and that guard explicitly forbids buying
+    // room by shaving unrelated blocks. The label shape (the same one
+    // `tv_dhan_feed_drain_frames_total` already uses) fits in one selector
+    // entry AND ships every outcome, so nobody had to choose which losses were
+    // worth seeing. The two that matter most are the two that answer "did a
+    // level that arrived fail to reach the table": `refused` (never stored —
+    // parse error, unmappable segment, truncated tail, ILP append failure) and
+    // `dropped` (stored in the buffer, then lost at a failed flush — the drain
+    // mirrors the writer's discard DELTA into this counter precisely so a
+    // database-side depth loss is visible in CloudWatch at all).
     //
-    // They are published as a PAIR deliberately. The ring budget is now derived
-    // at runtime rather than being a compile-time constant, so "what is the
-    // buffer?" stops being answerable by reading the source. Publishing only the
-    // decision would leave a number nobody can check; publishing only the input
-    // would leave the decision invisible. Together they make a mis-sized ring —
-    // a fallback on an unreadable /proc/meminfo, or a clamp firing — visible as
-    // an arithmetic disagreement between two series, without opening a shell on
-    // the box.
+    // FLAGGED, not hidden: the template now renders to 15,870 bytes against a
+    // 15,872 budget. TWO bytes. The next selector addition WILL fail this
+    // guard, and the correct response is the one the guard itself prescribes —
+    // move content out of user-data into a file copied in after the repo
+    // clone — not another round of name-shortening.
+    //
+    // HONEST: this is SHIPPED but not ALARMED. It is queryable and
+    // dashboard-able today; paging on it is a new Dhan-scoped alert, which
+    // `dhan-rest-only-noise-lock-2026-07-14.md` §3 REJECTs without its own
+    // dated row in THAT file first. Visible now, pageable after that edit.
     assert_eq!(
         names.len(),
-        67,
-        "Z+ L2 VERIFY ratchet: expected exactly 67 names in the MAIN EMF \
+        69,
+        "Z+ L2 VERIFY ratchet: expected exactly 69 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
