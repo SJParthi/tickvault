@@ -1170,7 +1170,7 @@ impl LiveIngest {
 /// is a plain atomic add. Every label value here is a compile-time-known
 /// `&'static str`, so the full set is enumerable up front — there is no
 /// unbounded label cardinality hiding in this struct.
-struct DrainCounters {
+pub struct DrainCounters {
     folded: metrics::Counter,
     non_tick: metrics::Counter,
     unparseable: metrics::Counter,
@@ -1209,7 +1209,14 @@ impl DrainCounters {
 }
 
 /// Process-wide handle set, resolved on first use.
-fn counters() -> &'static DrainCounters {
+/// The process-wide cached handle set.
+///
+/// `pub` so the DHAT gate can drive `drain_main_feed_frame`. Handing the test
+/// the SAME `OnceLock` the production path uses is the point: a gate that
+/// built its own counters would measure a different function than the one that
+/// ships, and the whole reason these handles exist is that resolving a metric
+/// key per frame allocates.
+pub fn counters() -> &'static DrainCounters {
     static COUNTERS: std::sync::OnceLock<DrainCounters> = std::sync::OnceLock::new();
     COUNTERS.get_or_init(|| DrainCounters {
         folded: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "folded"),
@@ -1965,7 +1972,17 @@ pub const FLUSH_INTERVAL: std::time::Duration =
 
 /// Parses and folds ONE main-feed frame. Split out so the endpoint routing in
 /// the drain reads as routing rather than as a wall of parse logic.
-fn drain_main_feed_frame(
+/// Decode one captured WebSocket frame and fold every packet it carries.
+///
+/// # Why this is `pub`
+///
+/// It is the true per-frame entry point, and the allocation this lane
+/// regressed on in 2026-08-14 lived HERE — in `record_ws_lag`, called at the
+/// top of the tick arm — not in `ingest_tick_at`. The DHAT gate written in
+/// response measured `ingest_tick_at` alone, so the exact function it was
+/// built for sat one line outside it. Exposing this closes that gap:
+/// `dhat_live_ingest_seam.rs` now measures the whole frame walk.
+pub fn drain_main_feed_frame(
     ingest: &mut LiveIngest,
     frame: &CapturedFrame,
     received_at_nanos: i64,
