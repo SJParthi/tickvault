@@ -1771,13 +1771,11 @@ async fn run_frame_drain(
                 if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD {
                     blocking_flush(|| ingest.flush());
                 }
-                // Depth gets the SAME size trigger against its own buffer. One
-                // depth-200 side-packet is 200 rows, so this threshold is
-                // reached an order of magnitude faster than the tick one —
-                // which is the point: an unflushed depth buffer is the largest
-                // single block of un-persisted data in the process.
+                // Depth gets its OWN size trigger — see
+                // `DEPTH_FLUSH_ROW_THRESHOLD` for why reusing the tick one
+                // would have turned the drain into a synchronous HTTP loop.
                 if depth_ingest.as_ref().is_some_and(|d| {
-                    u64::try_from(d.pending_rows()).unwrap_or(u64::MAX) >= FLUSH_ROW_THRESHOLD
+                    u64::try_from(d.pending_rows()).unwrap_or(u64::MAX) >= DEPTH_FLUSH_ROW_THRESHOLD
                 }) {
                     flush_depth(depth_ingest.as_mut());
                 }
@@ -2024,6 +2022,30 @@ async fn run_frame_drain(
 /// loses well under a second of ticks (and the frames themselves survive in the
 /// write-ahead log regardless).
 pub const FLUSH_ROW_THRESHOLD: u64 = 1_000;
+
+/// Rows buffered before a DEPTH flush is forced — 10× the tick threshold, and
+/// the multiplier is the whole point.
+///
+/// Depth produces rows at an order of magnitude above the tick path, because
+/// one packet is 20 or 200 rows rather than one. At the 250-instrument
+/// depth-20 pool and one snapshot per second that is 10,000 rows/second;
+/// at five snapshots per second, 50,000. Against the tick threshold of 1,000
+/// that would force **10 to 50 flushes per second**, each a synchronous
+/// ILP-over-HTTP round trip executed inside `block_in_place` **on the same
+/// task that drains ticks**. At 5 ms per round trip the high case spends a
+/// quarter of every second blocked, and the thing it blocks is the tick fold.
+///
+/// The tick threshold was sized by PAYLOAD (~1,000 rows ≈ 150 KB), and by that
+/// measure 1,000 depth rows is also ≈160 KB — which is exactly why the reused
+/// constant looked right and was not. Payload is the wrong axis here; FLUSH
+/// RATE is, because the cost that matters is occupancy of the drain task.
+///
+/// 10,000 rows ≈ 1.6 MB per POST, and combined with the 500 ms time trigger it
+/// caps depth at ~5 flushes/second in the worst modelled case and ~2 in the
+/// expected one. The extra buffered rows are not a durability risk: every
+/// frame behind them is already in the write-ahead log, so a crash re-folds
+/// them rather than losing them.
+pub const DEPTH_FLUSH_ROW_THRESHOLD: u64 = 10_000;
 
 /// Longest a buffered row may wait before being flushed anyway, in
 /// milliseconds. Half a second bounds how much of a thin instrument's tail can
