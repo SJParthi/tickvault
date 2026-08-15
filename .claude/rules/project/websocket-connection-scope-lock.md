@@ -941,3 +941,96 @@ tick layout + the zero-tick-loss / O(1) / instance / reversibility envelope:
 `truedata-feed-scope-2026-07-24.md`. Companion plan:
 `.claude/plans/active-plan-truedata-feed.md` (DRAFT — operator flips to APPROVED before any
 implementation PR).
+
+### 2026-08-15 — FULL-MODE, FULL-UNIVERSE SUBSCRIPTION SCOPE (the ~24,600-instrument set)
+
+**The verbatim operator demand (2026-08-15, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "bro see clelary note our entire NTM and entire nse idncies indices and thee ntire ntm and nse indices neitre futures of all the expirires shdou lbe fully subscribed dude wiht full mdoe dude and tehn see one and onl yfor indcies for nifty and banknifty entire options contarcts shodu lbe fully subscribed dude that too alwyas one and onl yfor the current expiry dude okay? then onely fir stocks the max atm plus or minus 25 for btoh call and put should be entirley susbcribed that toto here also current expireis alone right dude alwyas full mdoe right due am i irgth dude tell me dude okay? see emanwhiel what ahpepend to this fuckign 250 dpeth 20 and 5 depth 200 and its precise tabels also ddue okay?"
+
+**The authorization (2026-08-15, same session, in direct response to a message
+that laid out the counted scope, the three blockers, and the depth finding):**
+
+> "fix all of thes eneitrley dude okay?"
+
+That second quote is the go. It was given AFTER the reply that named
+`MAX_DAILY_UNIVERSE_SIZE = 1200`, the Quote-mode scope lock, and the fact that
+depth has no table — so it authorizes those three specifically, not a vague
+"do more".
+
+#### The authorized subscription set
+
+| Class | Mode | Expiry scope | Count |
+|---|---|---|---|
+| All NSE indices | **Full** | n/a | ~30 |
+| NTM constituents (spot) | **Full** | n/a | ~750 |
+| Index futures | **Full** | **ALL expiries** | ~21 (Assumed 7 × 3) |
+| Stock futures | **Full** | **ALL expiries** | ~660 (Assumed 220 × 3) |
+| NIFTY + BANKNIFTY options | **Full** | **current expiry ONLY** | ~700 (Assumed) |
+| Stock options, **ATM ± 25 both legs** | **Full** | **current expiry ONLY** | 22,440 (220 × 51 × 2) |
+| **TOTAL** | | | **~24,600 of 25,000** |
+
+The set is sized to the 5 × 5,000 main-feed capacity with ~400 spare. Only the
+stock-option row is arithmetic; every other count is **Assumed** until the
+master resolves live.
+
+#### What this quote CHANGES (each needs its own lockstep edit)
+
+1. **`MAX_DAILY_UNIVERSE_SIZE` 1,200 → 25,000.** The authorized set is 20×
+   the current boot-halt envelope. Without this the lane refuses to boot.
+2. **`DEFAULT_MAIN_FEED_MODE` Quote → Full.** 50 B → 162 B per packet, 3.24×
+   the bytes. The test `test_the_default_feed_mode_is_the_scope_locked_quote_mode`
+   pins the old value and must be re-blessed in the SAME change.
+3. **Universe builder gains contracts.** It resolves SPOT only today (4,565).
+   Options and futures selection does not exist and must self-roll at expiry —
+   a hardcoded contract list is a REJECT (it goes stale weekly, breaching the
+   standing no-manual-intervention mandate).
+4. **Depth gets tables, or depth stops dialing.** See below.
+
+#### The depth finding this quote responds to (Verified in source, 2026-08-15)
+
+The operator asked what happened to the 250 depth-20 and 5 depth-200 and their
+tables. Traced end to end:
+
+- The drain routes `Depth20 | Depth200` frames to a `depth_unconsumed` counter.
+  Its own comment: *"Captured durably in the WAL, counted here, and NOT folded:
+  no depth consumer exists yet."*
+- `ls crates/storage/src/ | grep -i depth` → **NONE**. `market_depth` and
+  `deep_market_depth` were deleted with the earlier live-feed retirements.
+  Only the packet-layout constants survive in `constants.rs`.
+
+So today depth-200 pulls 512 KiB frames and **discards every one**. That is the
+largest wasted bandwidth in the design and the reason the 2026-08-14 ring split
+(`MAIN_FEED_RING_MAX_BYTES` 3:1) exists — a discarded stream must not evict the
+kept one.
+
+**BINDING:** depth sockets may not be dialed against instrument sets whose
+frames have no consumer. Either the vertical (parser call → DDL → writer →
+dedup keys → retention → alarms) lands, or the depth pools stay at zero
+instruments. Opening 255 sockets that discard everything is strictly worse
+than opening none, and reporting them as "connected" is the false-OK this file
+exists to stop.
+
+#### Honest envelope
+
+- **Full mode already carries 5 levels of bid/ask** inside its 162 bytes. Full
+  mode on 25,000 instruments therefore overlaps much of what depth-20 is for;
+  whether depth-20 is still wanted on the SAME instruments is an open operator
+  question, not a settled part of this authorization.
+- **CPU at this scale is UNMEASURED.** ~12,500 packets/sec at the open × (decode
+  + 24-timeframe fold + ILP append) has never run. Memory fits 32 GiB per the
+  Quote-13 sizing; CPU has no such analysis.
+- **Nothing here makes the feed work.** No Dhan tick has been received since
+  2026-07-13. The measurement that settles it is a non-zero `compared` from the
+  15:31 cross-verification.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Raises the universe cap without raising it in lockstep across the constant,
+  this file, and the ratchet that pins it.
+- Flips the feed mode without re-blessing the scope-lock test in the same PR.
+- Sources option/future contracts from a hardcoded list (goes stale weekly).
+- Dials depth sockets whose frames still have no consumer, or reports an
+  instrument-less depth pool as "enabled".
+- Claims any of this is working before a non-zero `compared`.
