@@ -2120,7 +2120,35 @@ async fn run_frame_drain(
                         );
                     }
                     silent_scans = 0;
-                    silence_reported = false;
+                    // Re-arm ONLY when nothing is still in the never-ticked
+                    // set.
+                    //
+                    // # The alarm storm this prevents (prod evidence,
+                    // # 2026-08-14)
+                    //
+                    // This latch cleared on any scan where `silent` happened
+                    // to read 0, and the result was 25 distinct RISK-GAP-03
+                    // emits in one session — 09:15, then roughly every two to
+                    // five minutes from 12:59 to 14:53 — for a condition that
+                    // never changed: `never_ticked=4` of 4 instruments, all
+                    // day. The count oscillated because a sparse-cadence
+                    // instrument drifts in and out of the silent set; the
+                    // never-ticked set did not move at all.
+                    //
+                    // `never_ticked` is one-way within a session. An
+                    // instrument that has produced nothing can only leave that
+                    // set by producing something, and producing something also
+                    // takes it out of `silent`. So re-paging while it is
+                    // non-zero cannot carry new information — it is the same
+                    // fact, restated every few minutes.
+                    //
+                    // That matters because RISK-GAP-03 gained a CloudWatch
+                    // page on 2026-08-15. Without this, an unchanged condition
+                    // would have produced ~25 alarm transitions per session,
+                    // which is how an operator learns to ignore a pager.
+                    if never == 0 {
+                        silence_reported = false;
+                    }
                     continue;
                 }
                 silent_scans = silent_scans.saturating_add(1);
@@ -6863,5 +6891,101 @@ mod host_sizing_tests {
                  constant, not on a guess"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod silence_latch_tests {
+    /// The silence latch must not re-arm while instruments have never ticked.
+    ///
+    /// # The alarm storm this pins shut (prod evidence, 2026-08-14)
+    ///
+    /// The latch cleared on any scan where the silent count happened to read
+    /// zero. That produced 25 distinct RISK-GAP-03 emits in one session — at
+    /// 09:15, then every two to five minutes from 12:59 to 14:53 — for a
+    /// condition that never changed once: `never_ticked=4` of 4 instruments,
+    /// all day. The silent count oscillated because a sparse-cadence
+    /// instrument drifts in and out of that set; the never-ticked set never
+    /// moved.
+    ///
+    /// `never_ticked` is one-way within a session: an instrument leaves it
+    /// only by producing something, which also removes it from `silent`. So a
+    /// re-page while it is non-zero cannot carry new information.
+    ///
+    /// It stopped being cosmetic on 2026-08-15, when RISK-GAP-03 gained a
+    /// CloudWatch page. An unchanged condition emitting 25 times per session
+    /// is how an operator learns to ignore a pager — and the pager they learn
+    /// to ignore is the only signal that exists for a subscribe that silently
+    /// did not take.
+    ///
+    /// A source scan because reproducing it behaviourally needs a live socket,
+    /// a seeded universe and eleven minutes of wall clock; the re-arm
+    /// condition is one line and its shape is the whole fix.
+    #[test]
+    fn test_silence_latch_does_not_rearm_while_instruments_have_never_ticked() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        let zero_arm = production
+            .find("if silent == 0 {")
+            .expect("the silence loop must have a cleared-silence arm");
+        let after = &production[zero_arm..];
+        let arm_end = after
+            .find("silent_scans = silent_scans.saturating_add(1);")
+            .unwrap_or(after.len());
+        let arm = &after[..arm_end];
+
+        assert!(
+            arm.contains("if never == 0 {"),
+            "the cleared-silence arm re-arms the page latch unconditionally. \
+             That re-pages an unchanged never-ticked condition every few \
+             minutes — 25 times in the 2026-08-14 session — and RISK-GAP-03 \
+             now drives a CloudWatch page"
+        );
+        assert!(
+            arm.contains("silence_reported = false;"),
+            "the arm must still be ABLE to re-arm — a latch that never clears \
+             would report the first episode of the day and stay silent through \
+             every later one"
+        );
+    }
+
+    /// The alarm window must be wide enough to absorb the oscillation.
+    ///
+    /// Fixing the emit alone would leave the alarm at a 5-minute window, which
+    /// flaps ALARM/OK on any residual oscillation and pages on both edges.
+    /// Both halves are the same defect and must move together.
+    #[test]
+    fn test_the_risk_gap_03_alarm_window_absorbs_oscillation() {
+        let tf = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/aws/terraform/error-code-alarms.tf"),
+        )
+        .expect("error-code-alarms.tf must be readable");
+
+        let entry = tf
+            .split("\"risk-gap-03\" = {")
+            .nth(1)
+            .expect("the risk-gap-03 alarm entry must exist");
+        // Bound on `desc`, not on the first `}` — the `pattern` attribute is a
+        // CloudWatch filter expression that contains braces of its own, so a
+        // brace scan stops before the attributes this test is about. A first
+        // draft did exactly that and reported the values missing when they
+        // were present three lines further down.
+        let entry = &entry[..entry.find("desc").unwrap_or(entry.len())];
+
+        assert!(
+            entry.contains("period      = 3600"),
+            "the risk-gap-03 alarm window shrank below an hour. A 5-minute \
+             window flaps on the residual oscillation and pages on every edge \
+             — the 2026-08-14 session would have produced ~25 transitions"
+        );
+        assert!(
+            entry.contains("ok_recovery = false"),
+            "the risk-gap-03 alarm sends a recovery page. It cannot tell 'the \
+             feed is healthy again' from 'one sparse contract traded once', so \
+             an OK here reads as the first while meaning the second"
+        );
     }
 }
