@@ -169,7 +169,21 @@ pub enum RetentionClass {
     /// Everything else (audit / daily-data tables) — the existing
     /// `retention_days` window (default 90).
     Standard,
+    /// `market_depth` — its own class because it is an order of magnitude
+    /// heavier than anything else stored (2026-08-15). ~21 GB/day measured
+    /// over the 24,000-second session at 72 B/row, ~104 GB/day at five
+    /// snapshots per second. Under the MarketData window it would commit
+    /// 735 GB minimum on a 100 GB root, so the sweep could never fire before
+    /// the disk filled — and a full disk stops EVERY table, not just this one.
+    Depth,
 }
+
+/// Tables in the [`RetentionClass::Depth`] window.
+///
+/// Checked BEFORE the market-data test in [`retention_class`], because
+/// `market_depth` is also HOUR-partitioned and would otherwise be swept on
+/// the 35-day market-data window by virtue of that membership alone.
+const DEPTH_TABLES: [&str; 1] = [crate::depth_persistence::MARKET_DEPTH_TABLE];
 
 /// The two per-minute option-chain capture tables (operator directive
 /// 2026-07-16: *"for only spots we will have minimum one month data …
@@ -205,7 +219,13 @@ const CHAIN_MARKET_DATA_TABLES: [&str; 2] = [
 /// source of truth (`candle_table_names()`) + the two per-minute chain
 /// tables (2026-07-16); everything else is Standard.
 pub(crate) fn retention_class(table: &str) -> RetentionClass {
-    if HOUR_PARTITIONED_TABLES.contains(&table)
+    // Depth FIRST. `market_depth` is also HOUR-partitioned, so testing the
+    // market-data list before this would classify it on the 35-day window by
+    // virtue of that membership alone — 735 GB on a 100 GB root, and the
+    // sweep would never fire before the disk filled.
+    if DEPTH_TABLES.contains(&table) {
+        RetentionClass::Depth
+    } else if HOUR_PARTITIONED_TABLES.contains(&table)
         || crate::shadow_persistence::candle_table_names().contains(&table)
         || CHAIN_MARKET_DATA_TABLES.contains(&table)
     {
@@ -227,6 +247,7 @@ pub(crate) fn hot_window_days(table: &str, cfg: &PartitionRetentionConfig) -> u3
     let class_days = match retention_class(table) {
         RetentionClass::MarketData => cfg.market_data_hot_days,
         RetentionClass::Standard => cfg.retention_days,
+        RetentionClass::Depth => cfg.depth_hot_days,
     };
     effective_hot_days(class_days)
 }
@@ -1779,10 +1800,78 @@ mod tests {
         PartitionRetentionConfig {
             retention_days,
             market_data_hot_days,
+            depth_hot_days: 3,
             archive_enabled: true,
             archive_bucket: String::new(),
             max_partitions_per_run: 200,
         }
+    }
+
+    // ---- depth retention class (2026-08-15) --------------------------------
+
+    #[test]
+    fn market_depth_is_its_own_retention_class_not_market_data() {
+        // `market_depth` is HOUR-partitioned, so a naive class check that
+        // tests the market-data list first would classify it on the 35-day
+        // window — 735 GB minimum on a 100 GB root at the measured ~21 GB/day.
+        // The depth test must come FIRST, and this proves it does.
+        assert_eq!(
+            retention_class(crate::depth_persistence::MARKET_DEPTH_TABLE),
+            RetentionClass::Depth,
+            "market_depth must NOT inherit the 35-day market-data window"
+        );
+        assert_eq!(retention_class("ticks"), RetentionClass::MarketData);
+    }
+
+    #[test]
+    fn depth_hot_window_is_far_shorter_than_the_market_data_window() {
+        let c = cfg(90, 35);
+        let depth = hot_window_days(crate::depth_persistence::MARKET_DEPTH_TABLE, &c);
+        let ticks = hot_window_days("ticks", &c);
+        assert!(
+            depth < ticks,
+            "depth ({depth}d) must retain a SHORTER hot window than ticks ({ticks}d) — \
+             it is ~1000x the bytes per instrument-day"
+        );
+        assert_eq!(depth, 3);
+    }
+
+    #[test]
+    fn depth_hot_window_respects_the_min_hot_days_floor() {
+        // Today and yesterday stay untouchable even if the operator sets 0 —
+        // the same floor every other class gets. A depth partition dropped on
+        // the day it was written would lose the session in progress.
+        let mut c = cfg(90, 35);
+        c.depth_hot_days = 0;
+        assert_eq!(
+            hot_window_days(crate::depth_persistence::MARKET_DEPTH_TABLE, &c),
+            MIN_HOT_DAYS
+        );
+    }
+
+    #[test]
+    fn market_depth_is_actually_swept_not_merely_classified() {
+        // A retention CLASS on a table nobody sweeps is decoration. The
+        // archiver's worklist is built from the partition-manager lists, so
+        // membership there is what makes the class bite.
+        assert!(
+            HOUR_PARTITIONED_TABLES.contains(&crate::depth_persistence::MARKET_DEPTH_TABLE),
+            "market_depth must be in a swept-table list or its retention class \
+             never runs and the table grows until the disk dies"
+        );
+    }
+
+    #[test]
+    fn every_retention_class_maps_to_a_configured_window() {
+        // Exhaustiveness by construction: adding a class without a config
+        // knob would not compile in `hot_window_days`, but a class that maps
+        // to an EXISTING knob by accident would. This pins that the three
+        // classes read three DIFFERENT knobs.
+        let c = cfg(90, 35);
+        let standard = hot_window_days("ws_event_audit", &c);
+        let market = hot_window_days("ticks", &c);
+        let depth = hot_window_days(crate::depth_persistence::MARKET_DEPTH_TABLE, &c);
+        assert_eq!((standard, market, depth), (90, 35, 3));
     }
 
     // ---- retention-class mapping -------------------------------------------
@@ -2751,6 +2840,7 @@ mod stub_integration_tests {
         PartitionRetentionConfig {
             retention_days: 90,
             market_data_hot_days: 14,
+            depth_hot_days: 3,
             archive_enabled: true,
             archive_bucket: "tv-test-cold".to_string(),
             max_partitions_per_run: max_per_run,

@@ -38,7 +38,7 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // and OMITTED every live growing table, so the retention sweep visited nothing
 // real → unbounded active-table growth (a storage/cost runaway). `ticks` is the
 // only live HOUR-partitioned table.
-pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks"];
+pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks", "market_depth"];
 
 /// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
 /// past the hot window. The 5 live **candle** tables (`candles_1m` …
@@ -679,9 +679,21 @@ mod tests {
         );
     }
 
+    /// Renamed from `test_ticks_is_the_only_hour_table` on 2026-08-15, when
+    /// `market_depth` joined the list. A test whose NAME asserts one thing
+    /// while its body asserts another is worse than no test: the next reader
+    /// greps the name, believes it, and never opens the body.
+    ///
+    /// Both entries are HOUR-partitioned for the same reason — they are the
+    /// two highest-volume tables on the box, and an hourly partition is what
+    /// makes archive→verify→drop possible without dropping a partition that
+    /// is still being written. They do NOT share a retention window:
+    /// `market_depth` is its own `RetentionClass::Depth` (see
+    /// `partition_archive::retention_class`), because at ~21 GB/day the
+    /// 35-day market-data window would commit 735 GB on a 100 GB root.
     #[test]
-    fn test_ticks_is_the_only_hour_table() {
-        assert_eq!(HOUR_PARTITIONED_TABLES, &["ticks"]);
+    fn test_hour_partitioned_list_is_ticks_and_market_depth() {
+        assert_eq!(HOUR_PARTITIONED_TABLES, &["ticks", "market_depth"]);
     }
 
     #[test]
