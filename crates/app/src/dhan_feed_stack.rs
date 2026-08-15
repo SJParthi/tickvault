@@ -1303,6 +1303,65 @@ pub const TOKEN_MANAGER_WAIT_INTERVAL_SECS: u64 = 5;
 /// and the unit it is expressed in is the unit that runs out.
 pub const FRAME_RING_MAX_BYTES: usize = 256 * 1024 * 1024;
 
+/// Hard ceiling for the auto-sized ring. Above this the ring stops being a
+/// burst absorber and starts competing with QuestDB for the same RAM.
+pub const FRAME_RING_MAX_BYTES_CEILING: usize = 2 * 1024 * 1024 * 1024;
+
+/// Share of host RAM the ring may occupy when auto-sizing.
+///
+/// 2% of a 32 GiB host is 655 MiB — roughly 2.5× today's fixed value, still
+/// under a fortieth of the machine, and comfortably clear of the ~14–31 GiB
+/// the sizing note budgets for QuestDB, the tick set and the OS.
+pub const FRAME_RING_RAM_PERCENT: usize = 2;
+
+/// Total host RAM in bytes, read from `/proc/meminfo`.
+///
+/// Deliberately parses `/proc/meminfo` rather than taking a dependency: adding
+/// a crate needs operator approval, and this is one integer from a file that
+/// has had the same format for decades. `None` on anything unexpected — a host
+/// whose memory cannot be read must fall back, never guess.
+fn host_total_ram_bytes() -> Option<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: usize = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    kb.checked_mul(1024)
+}
+
+/// The ring byte ceiling for THIS host.
+///
+/// # Why this is not a constant
+///
+/// Until 2026-08-15 every buffer in this lane was a fixed number. The host was
+/// upgraded 4 GiB → 8 → 16 → 32 GiB across four operator decisions and **not
+/// one of these values moved**, so a 32 GiB machine ran the ring sized for a
+/// 4 GiB one — 0.8% of the box. The instance grew; the software never noticed.
+///
+/// That is the "dynamic, scalable" property the charter asks for, absent in
+/// the one place it costs money.
+///
+/// # The bounds are the safety, not the percentage
+///
+/// - **Floor = [`FRAME_RING_MAX_BYTES`]**, today's proven value. Auto-sizing can
+///   only ever grow the budget, so a small or unreadable host lands exactly
+///   where it is now. This can never regress a working configuration.
+/// - **Ceiling = [`FRAME_RING_MAX_BYTES_CEILING`]**, so a very large host does
+///   not hand the ring memory QuestDB needs.
+/// - **Unreadable `/proc/meminfo` → the floor.** Fail to the known-good value,
+///   never to a guess.
+pub fn frame_ring_max_bytes_for_host() -> usize {
+    match host_total_ram_bytes() {
+        Some(total) => (total / 100)
+            .saturating_mul(FRAME_RING_RAM_PERCENT)
+            .clamp(FRAME_RING_MAX_BYTES, FRAME_RING_MAX_BYTES_CEILING),
+        None => FRAME_RING_MAX_BYTES,
+    }
+}
+
 // A ceiling below the largest single admissible frame would refuse EVERY frame
 // from that endpoint — a total feed outage wearing the shape of backpressure.
 // This asserts a real margin above that floor, so the byte bound stays a burst
@@ -2890,7 +2949,24 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // The ring's second bound. One budget shared by every socket, because the
     // heap it protects is one heap: five main-feed connections each holding a
     // per-pool share would bound five times the memory the host actually has.
-    let ring_budget = Arc::new(RingByteBudget::new(FRAME_RING_MAX_BYTES));
+    // Sized from the HOST, not from a constant — see
+    // `frame_ring_max_bytes_for_host`. Logged because a silently auto-sized
+    // buffer is worse than a fixed one: nobody could tell what it chose.
+    let ring_max_bytes = frame_ring_max_bytes_for_host();
+    info!(
+        ring_max_bytes,
+        floor_bytes = FRAME_RING_MAX_BYTES,
+        auto_sized = ring_max_bytes > FRAME_RING_MAX_BYTES,
+        "frame ring byte ceiling selected for this host"
+    );
+    // Published as a GAUGE, not left in a boot log. An auto-sized buffer that
+    // nobody can see is worse than a fixed one: with a constant you can at
+    // least read the source and know the value. This makes the choice visible
+    // on the dashboard, and makes "did the ring actually grow when we paid for
+    // a bigger box?" a question with an answer.
+    metrics::gauge!("tv_dhan_feed_ring_max_bytes").set(ring_max_bytes as f64);
+    metrics::gauge!("tv_host_total_ram_bytes").set(host_total_ram_bytes().unwrap_or(0) as f64);
+    let ring_budget = Arc::new(RingByteBudget::new(ring_max_bytes));
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
@@ -5245,6 +5321,77 @@ mod wal_refold_tests {
             loop_body.matches("out.lost = out.lost").count(),
             1,
             "exactly one site may increment `lost`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_sizing_tests {
+    use super::*;
+
+    #[test]
+    fn test_frame_ring_max_bytes_for_host_never_below_the_proven_floor() {
+        // The floor is today's fixed value. Auto-sizing may only GROW the
+        // budget, so a small host — or one whose memory cannot be read — lands
+        // exactly where it is now. This is what makes the change unable to
+        // regress a working configuration.
+        assert!(frame_ring_max_bytes_for_host() >= FRAME_RING_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_frame_ring_max_bytes_for_host_never_above_the_ceiling() {
+        // Above the ceiling the ring stops absorbing bursts and starts
+        // competing with the database for the same RAM.
+        assert!(frame_ring_max_bytes_for_host() <= FRAME_RING_MAX_BYTES_CEILING);
+    }
+
+    #[test]
+    fn test_host_total_ram_is_readable_and_plausible() {
+        // Non-vacuity: if this returned None everywhere, the two bounds tests
+        // above would pass while the sizing never actually did anything.
+        // Plausibility bounds rather than an exact value, because CI runners
+        // and the prod box differ.
+        match host_total_ram_bytes() {
+            Some(total) => {
+                assert!(
+                    total >= 256 * 1024 * 1024,
+                    "implausibly small MemTotal ({total} bytes) — parse is wrong"
+                );
+                assert!(
+                    total <= 8 * 1024 * 1024 * 1024 * 1024,
+                    "implausibly large MemTotal ({total} bytes) — unit is wrong \
+                     (kB vs bytes is the classic error here)"
+                );
+            }
+            None => {
+                // Acceptable on a non-Linux or restricted host; the fallback is
+                // the floor, which the first test already pins.
+            }
+        }
+    }
+
+    #[test]
+    fn test_ring_sizing_is_monotonic_in_host_ram() {
+        // The property that matters: a bigger box gets at least as much ring.
+        // Verified on the pure arithmetic rather than the live host, so it
+        // holds on every machine this ever runs on.
+        let size_for = |ram: usize| -> usize {
+            (ram / 100)
+                .saturating_mul(FRAME_RING_RAM_PERCENT)
+                .clamp(FRAME_RING_MAX_BYTES, FRAME_RING_MAX_BYTES_CEILING)
+        };
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(size_for(4 * gib), FRAME_RING_MAX_BYTES, "4 GiB -> floor");
+        assert!(
+            size_for(32 * gib) > FRAME_RING_MAX_BYTES,
+            "a 32 GiB host must get MORE than the 4 GiB-era floor — that gap is \
+             the entire reason this function exists"
+        );
+        assert!(size_for(32 * gib) <= size_for(64 * gib), "monotonic");
+        assert_eq!(
+            size_for(1024 * gib),
+            FRAME_RING_MAX_BYTES_CEILING,
+            "an enormous host is capped, not unbounded"
         );
     }
 }

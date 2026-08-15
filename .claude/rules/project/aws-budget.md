@@ -401,6 +401,41 @@ retirements". The revived lane IS a WS frame producer, so that stated reason
 no longer holds. Recorded rather than silently added — adding it is its own
 cost decision and would make this note's +7 delta untrue.
 
+## COST NOTE 2026-08-15 — host-sizing gauges (+~$0.60/mo)
+
+The live lane's frame-ring byte budget stopped being a compile-time constant:
+it is now derived at boot from the machine's own RAM (2% of `MemTotal`,
+clamped to the previous constant as a floor and 2 GiB as a ceiling). That is
+what makes "dynamic/scalable" true rather than aspirational — the same binary
+sizes itself for a 4 GiB box and a 32 GiB one — but it also means **the answer
+to "how big is the buffer?" is no longer readable from the source**.
+
+Two gauges, published as a pair, restore that:
+
+| Gauge | What it answers |
+|---|---|
+| `tv_host_total_ram_bytes` | what the process measured about its own machine |
+| `tv_dhan_feed_ring_max_bytes` | what it decided as a result |
+
+Publishing only the decision would leave a number nobody can check; only the
+input would leave the decision invisible. Together, a mis-sized ring — the
+fallback firing on an unreadable `/proc/meminfo`, or either clamp binding — is
+visible as an arithmetic disagreement between two series, with no shell on the
+box. That matters because every failure mode here is silent: a fallback to the
+floor on a 32 GiB host is a correctly-running lane with 16× less headroom than
+intended, and nothing else would ever say so.
+
+**Cost:** +2 custom metric series ≈ **+$0.60/mo** (65 → 67 EMF-selected names)
+against the $100 kill-ceiling whose AUTOMATIC budget actions fire
+`STOP_EC2_INSTANCES` at 90% ($90). Added to both allowlist copies in lockstep;
+the count ratchet bumped 65 → 67 with its rationale in place.
+
+**NOT claimed:** that these page. They are gauges with no alarm — an alarm on a
+capacity *decision* would need a baseline nobody has yet, and the operator
+signal for the ring actually filling is `tv_dhan_ws_ring_bytes_full_total`,
+which has been EMF-selected since 2026-08-11. Stated here rather than left to
+be inferred from a dashboard.
+
 ## COST NOTE 2026-08-12 — silence read-out gauges (+~$0.60/mo)
 
 The live lane seeded every subscribed instrument into a `TickGapDetector` and
