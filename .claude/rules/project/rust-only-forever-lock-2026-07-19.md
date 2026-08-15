@@ -190,6 +190,32 @@ in `.yml` **is** budgeted (`GITHUB_SCRIPT_BUDGET`). That asymmetry is a real
 gap; closing it needs a budget const and an operator ruling on the 12
 legitimate vendor-reference `.html` files under `docs/`.
 
+**CLOSED 2026-08-15 — the node-family gap (was open item 4).**
+
+`node` / `npx` / `npm` / `yarn` / `pnpm` / `deno` / `bun` were never banned
+tokens, and `.mcp.json` runs `npx` live. The gap sat open because both obvious
+fixes were wrong:
+
+- **Adding them to `banned_tokens()`** fails the build on `.mcp.json` itself —
+  dev-session MCP tooling that never reaches the box. Breaking local tooling to
+  satisfy a lock that exists to protect the RUNTIME is the wrong trade.
+- **A plain word-boundary scan** would flag `scripts/aws-autopilot.sh`'s three
+  "SSM managed node" lines. A guard whose first act is three false positives
+  teaches the reader that the cheapest fix is to allowlist it — the same
+  dynamic that has weakened three anchors in this branch already.
+
+The shape that is right for both: scan **command position**, not free text. The
+token must BEGIN a command — line start, after a pipe / `&&` / `;` / `$(`, or
+as a JSON `"command":` value. `managed node` fails that test; `npx -y pkg`
+passes it. Then a shrink-only budget (`NODE_RUNTIME_BUDGET`, the
+`GITHUB_SCRIPT_BUDGET` shape) pins the two existing `.mcp.json` entries so they
+cannot grow, while a NEW node-family invocation anywhere fails the build.
+
+Bite-proven in `guard_self_test` in BOTH directions: six real invocation forms
+must count, and six mention-forms — including all three real "SSM managed node"
+lines from the live script — must not. The false-positive half is the half that
+matters; without it this guard would have been allowlisted within a week.
+
 **OPEN, recorded rather than silently carried:**
 
 | # | Hole | Why it is not closed here |

@@ -506,6 +506,82 @@ fn rust_spawn_violations(content: &str) -> Vec<String> {
 // count ABOVE the budget is a new usage (forbidden); a count BELOW it means
 // someone ported a block and must shrink the budget in the same PR. A file
 // absent from the budget must have ZERO.
+// ---- SCOPE FIX #9 (2026-08-15): the NODE-family runtimes ----
+//
+// `node` / `npx` / `npm` / `yarn` / `pnpm` / `deno` / `bun` were never banned
+// tokens, and `.mcp.json` runs `npx` live. The rule file recorded that as an
+// OPEN gap needing an operator ruling, because the obvious fix — adding them to
+// `banned_tokens()` — would fail the build on `.mcp.json` itself, and that file
+// is dev-session MCP tooling that is never deployed to the box. Breaking local
+// tooling to satisfy a lock that exists to protect the RUNTIME would be the
+// wrong trade.
+//
+// A blanket token ban is also wrong for a second reason: `node` is
+// prose-ambiguous. `scripts/aws-autopilot.sh` says "SSM managed node online?"
+// three times, and a word-boundary scan would flag all three. A guard whose
+// first act is three false positives teaches the reader to allowlist it.
+//
+// So this scans COMMAND POSITION, not free text: the token must begin a
+// command — at line start, after a pipe/`&&`/`;`/`$(`, or as a JSON
+// `"command":` value. "managed node" fails that test; `npx -y pkg` passes it.
+// Shrink-only budget, same shape as the github-script one: a NEW node-family
+// invocation anywhere fails; the two existing `.mcp.json` entries are pinned so
+// they cannot grow, and removing them forces the budget down in the same PR.
+const NODE_RUNTIME_BUDGET: &[(&str, usize)] = &[(".mcp.json", 2)];
+
+/// The node-family runtimes, as command names.
+const NODE_FAMILY: &[&str] = &["node", "npx", "npm", "yarn", "pnpm", "deno", "bun"];
+
+/// Does `token` start a COMMAND at byte offset `at` within `line`?
+///
+/// Command position is what separates an invocation from a mention. Checking it
+/// is why this guard can ban a runtime that the word "node" also names in
+/// ordinary English prose about AWS.
+fn is_command_position(line: &str, at: usize) -> bool {
+    let before = line[..at].trim_end();
+    if before.is_empty() {
+        return true;
+    }
+    // JSON `"command": "npx"` — the invocation form in `.mcp.json`.
+    if before.ends_with("\"command\":") || before.ends_with('"') && before.contains("\"command\"") {
+        return true;
+    }
+    before.ends_with('|')
+        || before.ends_with("&&")
+        || before.ends_with("||")
+        || before.ends_with(';')
+        || before.ends_with("$(")
+        || before.ends_with('(')
+        || before.ends_with('`')
+}
+
+/// Count node-family invocations in COMMAND POSITION on non-comment lines.
+fn count_node_invocations(content: &str) -> usize {
+    let mut hits = 0usize;
+    for line in content.lines() {
+        if is_comment_line(line) {
+            continue;
+        }
+        for name in NODE_FAMILY {
+            let mut rest = line;
+            let mut base = 0usize;
+            while let Some(i) = rest.find(name) {
+                let at = base + i;
+                let after = line[at + name.len()..].chars().next();
+                // A whole word, not a prefix of `nodejs_helper` or a suffix of
+                // `managed-node`.
+                let word_end = after.is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-');
+                if word_end && is_command_position(line, at) {
+                    hits = hits.saturating_add(1);
+                }
+                base = at + name.len();
+                rest = &line[base..];
+            }
+        }
+    }
+    hits
+}
+
 const GITHUB_SCRIPT_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/dep-freshness-nightly.yml", 2),
     (".github/workflows/safety.yml", 12),
@@ -831,6 +907,49 @@ fn github_script_usage_only_shrinks() {
     );
 }
 
+/// (g3) The NODE-family runtimes only shrink (2026-08-15).
+///
+/// Closes the last OPEN item the rust-only lock recorded as needing a ruling.
+/// The ruling it encodes: dev-session tooling that never reaches the box may
+/// keep its existing invocations, pinned so they cannot grow; a NEW one
+/// anywhere fails the build.
+#[test]
+fn node_family_invocations_only_shrink() {
+    assert_sorted_unique(
+        &NODE_RUNTIME_BUDGET
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<Vec<_>>(),
+        "NODE_RUNTIME_BUDGET",
+    );
+    let mut counted: Vec<(String, usize)> = Vec::new();
+    // The SAME file set `no_new_banned_invocations` scans — so the node budget
+    // inherits every scope fix that set has accumulated (shebang detection,
+    // make's other names, cargo config, executable manifests) instead of
+    // growing its own list to drift out of sync.
+    for (path, content) in load_invocation_scan_files() {
+        let n = count_node_invocations(&content);
+        if n > 0 || NODE_RUNTIME_BUDGET.iter().any(|(p, _)| *p == path) {
+            counted.push((path, n));
+        }
+    }
+    let (over, under) = github_script_budget_drift(&counted, NODE_RUNTIME_BUDGET);
+    assert!(
+        over.is_empty(),
+        "RUST-ONLY VIOLATION: new node-family invocation {over:?} (path, actual, budget). \
+         The runtime is Rust-only (operator directive 2026-07-19). The ONLY tolerated \
+         node-family invocations are the dev-session MCP entries in `.mcp.json`, which \
+         never reach the box. If you need a tool, write it in Rust or call a real binary \
+         — do NOT raise NODE_RUNTIME_BUDGET."
+    );
+    assert!(
+        under.is_empty(),
+        "SHRINK THE RATCHET: fewer node-family invocations than budgeted {under:?} \
+         (path, actual, budget). Lower the entry in NODE_RUNTIME_BUDGET in the same PR — \
+         the budget only ever shrinks."
+    );
+}
+
 /// (g) The CI clippy gate stays ARMED (2026-08-11).
 ///
 /// `ci.yml`'s clippy step ran WITHOUT `-D warnings` for months, justified by a
@@ -984,6 +1103,44 @@ fn guard_self_test() {
         rust_spawn_violations(&bounded).is_empty(),
         "self-test: extraction must stop at ']' and not swallow later literals"
     );
+
+    // SCOPE FIX #9 — node-family COMMAND POSITION, both directions.
+    //
+    // The false-negative half: these are real invocations and must count.
+    for invocation in [
+        r#"    "command": "npx","#,
+        "npx -y @scope/pkg",
+        "cat x | node -e 'x'",
+        "make build && yarn install",
+        "$(npm bin)/tool",
+        "deno run mod.ts; echo done",
+    ] {
+        assert_eq!(
+            count_node_invocations(invocation),
+            1,
+            "self-test: `{invocation}` is a node-family INVOCATION and must be counted"
+        );
+    }
+
+    // The false-POSITIVE half, which is why this scans command position at all.
+    // `scripts/aws-autopilot.sh` says "SSM managed node" three times; a plain
+    // word-boundary token scan would flag all three, and a guard whose first
+    // act is three false positives teaches the reader to allowlist it.
+    for prose in [
+        "  # 3. SSM managed node online?",
+        "  note_ok \"SSM managed node Online\"",
+        "  note_issue \"SSM managed node not Online (ping=$PING)\"",
+        "echo \"the node is healthy\"",
+        "nodejs_helper --run",
+        "kubectl get managed-node",
+    ] {
+        assert_eq!(
+            count_node_invocations(prose),
+            0,
+            "self-test: `{prose}` MENTIONS a node-family word without invoking one — \
+             counting it would make this guard a false-positive engine"
+        );
+    }
 
     // Token boundaries.
     let t = banned_token();
