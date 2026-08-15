@@ -83,12 +83,26 @@
 //! ## `capture_seq` is in the key for the same reason it is in `ticks`
 //!
 //! Several snapshots of one instrument can arrive inside one second. Without
-//! the intra-second tiebreaker every one but the last collapses. The sequence
-//! is minted by [`tick_persistence::next_capture_seq`] — the SAME process-global
-//! counter the tick path uses, deliberately, so a depth row and a tick row can
-//! never mint the same value and the WAL-replay path can re-stamp a recovered
-//! frame with its original sequence instead of minting a new one (which would
-//! land as a duplicate rather than collapsing).
+//! the intra-second tiebreaker every one but the last collapses.
+//!
+//! The value is **derived from the WAL frame sequence, not minted** —
+//! `ws_frame_spill::packet_capture_seq(frame.seq, packet_index)`, narrowed by
+//! `capture_seq_from_frame_seq`. Deriving rather than minting is what makes a
+//! WAL-replayed depth frame collapse onto its original rows instead of landing
+//! as a second copy; a freshly-minted sequence could not do that. The
+//! packet-index component is what keeps two packets for the same
+//! `(security_id, segment, side)` **inside one frame** distinct — a frame
+//! stacks packets, so without it all eight key columns would match and one
+//! would be upserted away.
+//!
+//! *(Corrected 2026-08-15. This paragraph previously said the sequence was
+//! "minted by `tick_persistence::next_capture_seq` — the SAME process-global
+//! counter the tick path uses … so a depth row and a tick row can never mint
+//! the same value". Every clause of that was wrong: different atomic, not
+//! minted at all, and no cross-table uniqueness claim is needed since `ticks`
+//! and `market_depth` are separate tables with separate keys. It is recorded
+//! rather than quietly rewritten because an auditor checking the intra-frame
+//! collision would have read that paragraph and concluded it was handled.)*
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -432,9 +446,26 @@ impl DepthWriter {
         self.dropped
     }
 
-    /// Test-only view of the raw ILP buffer bytes (wire-shape assertions).
-    #[cfg(test)]
-    fn buffer_utf8(&self) -> String {
+    /// Raw ILP buffer text — the ONLY way a caller can assert what was actually
+    /// emitted.
+    ///
+    /// Deliberately `pub` and cross-crate visible (it was `#[cfg(test)]` and
+    /// storage-private until 2026-08-15). The mapping that turns a parsed
+    /// packet into `side` / `depth_kind` symbols lives in the APP crate's
+    /// `drain_depth_frame`, so a storage-private accessor could never let a
+    /// test see it — and a 2026-08-15 test audit found exactly that gap: swap
+    /// the bid and ask arms and the book inverts silently while every existing
+    /// assertion (`out.rows == 40`) still passes. An inverted book is the
+    /// worst-consequence bug this protocol has.
+    ///
+    /// Exposes nothing sensitive: the buffer holds only market data, and every
+    /// symbol in it is a closed `&'static str` set.
+    #[must_use]
+    // Its whole purpose is to be asserted against, and it is — by the append
+    // tests below and by the app-crate drain tests that could not otherwise
+    // see their own label mapping.
+    // TEST-EXEMPT: observability accessor, asserted by the tests it enables.
+    pub fn buffer_utf8(&self) -> String {
         String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
     }
 

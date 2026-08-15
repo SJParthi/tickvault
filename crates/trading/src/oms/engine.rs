@@ -422,6 +422,17 @@ impl OrderManagementSystem {
         &mut self,
         err: &OmsError,
         endpoint: OrderEndpoint,
+        // THIS BOOL IS THE ENFORCEMENT of annexure-enums rule 11 — "DH-901:
+        // rotate token -> retry ONCE -> HALT. Never more." (mirrored for the
+        // 807/808/809 refresh class below). It is deliberately a bool and not a
+        // counter compared against a constant: a bool can be consumed exactly
+        // once, so "never more than one" is a property of the TYPE, whereas a
+        // `max_retries` value is a knob someone can quietly set to 2.
+        //
+        // `constants::DH901_ROTATE_MAX_RETRIES` (= 1) used to carry that rule
+        // in prose. It was retired 2026-08-15 having never had a single
+        // reference — the citation lives here, at the code that actually
+        // enforces it.
         auth_retry_used: &mut bool,
     ) -> EngineAction {
         let Some(class) = error_taxonomy::classify_oms_error(err) else {

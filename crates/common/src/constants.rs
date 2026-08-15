@@ -3092,8 +3092,19 @@ pub const DATA_805_STOP_ALL_COOLDOWN_SECS: u64 = 60;
 /// DH-901/DATA-807-809: wait between the rotation request and the single retry
 /// (gives the async renewal machinery a chance to swap the arc-swap token).
 pub const DH901_ROTATE_RETRY_DELAY_SECS: u64 = 5;
-/// DH-901: rotate token -> retry ONCE -> HALT (annexure rule 11). Never more.
-pub const DH901_ROTATE_MAX_RETRIES: u32 = 1;
+// DH901_ROTATE_MAX_RETRIES (= 1) was RETIRED here on 2026-08-15. It had zero
+// references anywhere in the workspace since its declaration, and wiring it
+// would have made things WORSE, not better: annexure rule 11 says "rotate ->
+// retry ONCE -> HALT. Never more", and a `u32` constant compared against an
+// attempt counter is a KNOB — someone can set it to 2 and the regulatory rule
+// silently becomes something else.
+//
+// The rule is instead enforced STRUCTURALLY, and stronger, by the
+// `auth_retry_used: &mut bool` threaded through
+// `OrderManagementSystem::apply_engine_error_policy`
+// (`crates/trading/src/oms/engine.rs`): a bool can be consumed exactly once, so
+// "never more than one retry" is a property of the type rather than of a value
+// someone may edit. That is where the annexure citation now lives.
 /// Cancel-only single transient retry delay (908/909/800/5xx/transport classes).
 /// Cancel is exposure-REDUCING and double-cancel is a benign terminal error.
 pub const DHAN_CANCEL_TRANSIENT_RETRY_DELAY_SECS: u64 = 2;
@@ -3203,9 +3214,21 @@ pub const MINIMUM_VALID_EXCHANGE_TIMESTAMP: u32 = 946_684_800;
 /// a corrupt / garbage frame — NOT a real observation — and is filtered as junk
 /// BEFORE it can poison a candle's high/low or a `ticks` row.
 ///
-/// `is_valid_ltp` already rejects NaN / Inf / ≤ 0, but an absurd-but-FINITE
-/// value (e.g. `f32::MAX` ≈ 3.4e38 from a mangled frame) slips through and the
-/// O(1) candle fold sets `high = 3.4e38`, permanently corrupting that minute.
+/// ENFORCEMENT SITE: `tickvault_trading::candles::tick_price_is_sane`, the
+/// live fold's ingest gate. That gate already rejected NaN / Inf / ≤ 0, but an
+/// absurd-but-FINITE value (e.g. `f32::MAX` ≈ 3.4e38 from a mangled frame)
+/// slipped through, and `high` is a running `max` — so ONE such packet pinned
+/// the bucket's high at 3.4e38 and persisted it.
+///
+/// This constant had **zero references anywhere in the workspace** from its
+/// Phase-0 declaration until 2026-08-15 — a named limit that enforced nothing,
+/// while the doc above described the corruption it was failing to stop. The
+/// wiring is one comparison on the raw `f32`, before any widening.
+///
+/// *(The pre-2026-08-15 text cited `is_valid_ltp` as the companion gate. No
+/// such function has ever existed in this workspace — the citation was
+/// unverifiable from the moment it was written, which is exactly how a
+/// constant reaches production enforcing nothing while reading as if it does.)*
 ///
 /// 100,000,000 (₹10 crore) is ~500× above the highest-priced real NSE
 /// instrument (MRF ≈ ₹1.5 lakh; SENSEX ≈ 80k; BANKNIFTY ≈ 52k), so it can NEVER
@@ -4470,7 +4493,9 @@ mod tests {
     fn test_order_taxonomy_constants() {
         assert_eq!(DATA_805_STOP_ALL_COOLDOWN_SECS, 60);
         assert_eq!(DH901_ROTATE_RETRY_DELAY_SECS, 5);
-        assert_eq!(DH901_ROTATE_MAX_RETRIES, 1);
+        // DH901_ROTATE_MAX_RETRIES retired 2026-08-15 — see the comment at its
+        // former declaration. Its "retry ONCE" rule is now a bool in
+        // oms/engine.rs, which cannot be tuned to 2.
         assert_eq!(DHAN_CANCEL_TRANSIENT_RETRY_DELAY_SECS, 2);
         assert_eq!(DHAN_ERROR_BODY_SCAN_CAP_BYTES, 4_096);
         assert_eq!(DHAN_ERROR_CODE_MAX_LEN, 32);

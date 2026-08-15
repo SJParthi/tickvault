@@ -17,7 +17,7 @@
 //! | `[parking_lot::Mutex<LiveCandleState>; 21]` per instrument | plain `[LiveCandleState; 21]`, reached through `&mut self` | the fold has exactly ONE owner (the tick-consumer task). A lock that is never contended is pure cost — ~30 ns × 21 TF × every tick. Sharing is re-introduced by the caller (channel / `SealRing`), not by this type. |
 //! | `Arc<AggregatorCell>` handed out of a `papaya::HashMap` | owned by value inside the container's slot table | same reason: no cross-thread sharing to make lock-free. |
 //! | key `(security_id, segment_code)` | key `(feed, security_id, segment_code)` | I-P1-11 + the 2026-06-19 feed-in-key operator lock. See [`crate::candles::MultiTfAggregator`]. |
-//! | ticks folded unconditionally | non-finite / non-positive LTP REFUSED at ingest | `f32_to_f64_clean` passes `NaN` straight through and the Dhan quote parser is PROVEN to emit `NaN` OHLC. `NaN` is absorbing under `>`/`<`, so ONE such packet poisons `high`/`low` for the rest of the bucket AND every downstream row. Fail closed at ingest. |
+//! | ticks folded unconditionally | non-finite / non-positive / absurd LTP REFUSED at ingest | `f32_to_f64_clean` passes `NaN` straight through and the Dhan quote parser is PROVEN to emit `NaN` OHLC. `NaN` is absorbing under `>`/`<`, so ONE such packet poisons `high`/`low` for the rest of the bucket AND every downstream row. The same is true of an absurd-but-FINITE price (`f32::MAX` from a mangled frame) against a running-`max` `high` — bounded by `MAX_PLAUSIBLE_LTP` since 2026-08-15. Fail closed at ingest. |
 //!
 //! # What is preserved verbatim (do not "simplify" these)
 //!
@@ -42,6 +42,7 @@
 //! [`AggregatorCell::consume_tick`] is O(1): one ordinal index into a fixed
 //! array, a handful of scalar comparisons, no loop over data, no allocation.
 
+use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
 use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
@@ -111,20 +112,40 @@ impl Default for FeedStrategy {
 
 /// Returns `true` when a tick's last-traded price may be folded.
 ///
-/// Accepts finite AND strictly positive only. `NaN` and `±Inf` reach this
-/// point because [`f32_to_f64_clean`] deliberately passes them through, and
-/// the Dhan quote parser is proven to emit both `NaN` OHLC and negative LTP.
-/// `NaN` is absorbing under comparison, so a single poisoned packet would
-/// leave `high`/`low` permanently wrong for the bucket and write that row to
-/// QuestDB. Refusing costs two comparisons.
+/// Accepts finite, strictly positive, AND below [`MAX_PLAUSIBLE_LTP`].
+///
+/// `NaN` and `±Inf` reach this point because [`f32_to_f64_clean`] deliberately
+/// passes them through, and the Dhan quote parser is proven to emit both `NaN`
+/// OHLC and negative LTP. `NaN` is absorbing under comparison, so a single
+/// poisoned packet would leave `high`/`low` permanently wrong for the bucket
+/// and write that row to QuestDB.
+///
+/// The CEILING closes the remaining half of that same hole (wired 2026-08-15;
+/// `MAX_PLAUSIBLE_LTP` had been declared since Phase 0 with **zero references**
+/// anywhere in the workspace — a named limit that enforced nothing). An
+/// absurd-but-FINITE price from a mangled frame — `f32::MAX` ≈ 3.4e38 is the
+/// worst case — passes `is_finite() && > 0.0` cleanly, and `high` is a running
+/// `max`, so ONE such packet pins that bucket's high at 3.4e38 for the rest of
+/// the minute and persists it. Refusing is one more comparison.
+///
+/// The check runs on the RAW `f32`, deliberately BEFORE any widening: passing
+/// `f32::MAX` through [`f32_to_f64_clean`] first would yield `3.4028235e23`
+/// (the documented buffer-truncation limit on [`TickPrices`]), still absurd but
+/// 15 orders of magnitude off — the raw value is the honest one to bound.
+///
+/// The ceiling can NEVER reject a genuine quote: ₹10 crore is ~500× the
+/// highest-priced real NSE instrument (MRF ≈ ₹1.5 lakh, SENSEX ≈ 80k), and it
+/// is an absolute ceiling rather than a per-instrument band precisely so a
+/// legitimate limit-up move is never dropped — the prime directive is to never
+/// miss a real tick.
 ///
 /// # Complexity
-/// O(1) — two scalar comparisons, no allocation.
+/// O(1) — three scalar comparisons, no allocation.
 #[inline]
 #[must_use]
 pub fn tick_price_is_sane(tick: &ParsedTick) -> bool {
     let p = tick.last_traded_price;
-    p.is_finite() && p > 0.0
+    p.is_finite() && p > 0.0 && p <= MAX_PLAUSIBLE_LTP
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +812,52 @@ mod tests {
                 "price {bad} must be refused"
             );
         }
+    }
+
+    /// The half the finite/positive gate never covered: an absurd-but-FINITE
+    /// price. `f32::MAX` passes `is_finite() && > 0.0` cleanly, and before the
+    /// ceiling was wired it pinned the bucket's running-max `high` at 3.4e38
+    /// for the rest of the minute. Bite-proven: delete the `<= MAX_PLAUSIBLE_LTP`
+    /// term and the `f32::MAX` / `1e30` rows below flip to accepted.
+    #[test]
+    fn test_tick_price_is_sane_rejects_absurd_but_finite_prices() {
+        for absurd in [f32::MAX, 1e30, 1e20, MAX_PLAUSIBLE_LTP * 1.5] {
+            assert!(
+                !tick_price_is_sane(&tick_at(OPEN, absurd, 0)),
+                "price {absurd} is finite and positive but 500x+ above any real \
+                 NSE instrument — it must be refused before it poisons a high/low"
+            );
+        }
+    }
+
+    /// The ceiling must never cost a real quote. MRF (~1.5 lakh) is the most
+    /// expensive real NSE instrument; the boundary itself is inclusive.
+    #[test]
+    fn test_tick_price_is_sane_accepts_every_real_instrument_price() {
+        for real in [0.05, 1.0, 52_000.0, 82_000.0, 150_000.0, MAX_PLAUSIBLE_LTP] {
+            assert!(
+                tick_price_is_sane(&tick_at(OPEN, real, 0)),
+                "price {real} is a plausible quote and must be folded"
+            );
+        }
+    }
+
+    /// The ceiling is checked on the RAW `f32`, deliberately before widening.
+    /// This pins WHY: `f32_to_f64_clean(f32::MAX)` is `3.4028235e23`, not
+    /// `3.4e38` (the buffer-truncation limit documented on `TickPrices`), so a
+    /// post-widening check would bound a value 15 orders of magnitude off from
+    /// what the wire actually carried.
+    #[test]
+    fn test_tick_price_ceiling_is_checked_before_widening_not_after() {
+        let widened = f32_to_f64_clean(f32::MAX);
+        assert!(
+            widened < f64::from(f32::MAX) / 1e10,
+            "premise: widening f32::MAX truncates to ~3.4e23, got {widened}"
+        );
+        assert!(
+            !tick_price_is_sane(&tick_at(OPEN, f32::MAX, 0)),
+            "the raw value is what gets bounded"
+        );
     }
 
     #[test]

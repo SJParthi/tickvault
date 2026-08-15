@@ -9,6 +9,49 @@ paths:
 
 # Phase 0 Architecture (auto-loaded rule)
 
+> **⚠ CORRECTION 2026-08-15 — MOST OF PILLAR 2 AND PILLAR 3 BELOW DESCRIBE CODE
+> THAT NO LONGER EXISTS. Read this banner before believing any of it.**
+>
+> Found while auditing constants that claim enforcement and deliver none. Every
+> row below was checked against the live tree, not inferred:
+>
+> **PILLAR 2 — three of the five named guards have NEVER existed in this
+> workspace.** `grep -rn "fn is_valid_ltp\|fn is_valid_tick\|fn
+> check_tick_ohlc_integrity" crates/*/src` returns ZERO. That last one is
+> described here in convincing operational detail — "3-bit violation mask", "3
+> separate static-label counters per bit" — for a function with no declaration
+> anywhere in git history. `sanitize_nan_inf` (7 call sites) and
+> `compute_dh904_backoff` (9 call sites) are REAL and wired; those two rows
+> stand. `SELF_TRADE_COOLDOWN_SECS` is declared in `constants.rs` and has
+> **zero references** — the wash-trade cooldown it names is not implemented,
+> and `RiskEngine` has no fill-timestamp state to implement it from.
+>
+> **PILLAR 3 — 10 of the 11 audit tables are DELETED.** Only `pnl_audit`
+> survives. They were real once: `static_ip_audit_persistence.rs` landed in
+> PR #630 and is called "the canonical reference" three sections below, then
+> was removed — 10 modules in `c7a25fe8` (#T2a, "drop 10 **dead** audit-table
+> persistence modules") and 9 more in `3d43b9a8` (#T2b, "delete 9 **wired**
+> audit modules"). So one batch had never been called at all, and the other
+> was deliberately unwired first. Either way, **the SEBI forensic chain this
+> pillar describes does not exist today**, and the 8-element template section
+> points at a file you cannot open.
+>
+> **Why this matters more than the individual rows.** This file is auto-loaded
+> for every session touching OMS, indicator, or audit paths. A session reading
+> PILLAR 3 concludes the forensic chain is live and builds on it; a session
+> reading PILLAR 2 concludes ticks are OHLC-integrity-checked and does not add
+> the check. Prose that describes deleted code is not merely stale — it
+> actively manufactures false findings, the same failure mode CLAUDE.md's own
+> O(1) table records costing a real error on 2026-08-12.
+>
+> **What is NOT claimed by this correction:** that the deletions were wrong.
+> Removing dead modules is correct. Leaving the document that advertises them
+> as the live architecture is the defect, and this banner is the fix that was
+> owed at the time. Rebuilding any of it is an operator decision, not an
+> executor one — the Phase-1 promotion criteria below are therefore
+> **unmeetable as written**, and that is stated here rather than discovered by
+> whoever tries to meet them.
+
 > **Authority:** CLAUDE.md > `.claude/rules/project/operator-charter-forever.md` > this file > defaults.
 > **Scope:** Every PR touching Phase 0 work — audit tables, OMS, risk engine, indicator engine, defensive guards.
 > **Trigger:** Always loaded for sessions editing `crates/storage/src/*_audit_persistence.rs`,
