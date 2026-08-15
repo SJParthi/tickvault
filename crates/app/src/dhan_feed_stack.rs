@@ -2430,6 +2430,48 @@ pub const DEPTH_ATTACH_RETRY_SECS: u64 = 60;
 /// broken table until 15:30 would report nothing while looking busy.
 pub const DEPTH_ATTACH_DEADLINE_IST_SECS: u32 = 10 * 3_600;
 
+/// The minimum time this task always gets, whatever the wall clock says.
+///
+/// # The live defect this closes (prod evidence, 2026-08-15)
+///
+/// The wall-clock deadline alone produced exactly ONE doomed attempt on any
+/// late start. Measured, from the prod log:
+///
+/// ```text
+/// 10:01:09 IST  tickvault starting
+/// 10:01:2x IST  attempt 1 — option_chain_1m empty (the chain leg has not
+///               fired yet; the app is 20 seconds old)
+/// 10:02:2x IST  attempts > 0 && now >= 10:00  ->  GIVE UP
+/// 10:03:26 IST  WS-GAP-02 "gave up ... attempts: 1"
+/// ```
+///
+/// The existing carve-out — "the deadline gates RETRIES, never the FIRST
+/// attempt" — was written for a mid-session redeploy, where the table is
+/// FULLEST because it has been filling since 09:16. That reasoning is sound
+/// and it does not transfer to a late BOX start, where the table is empty for
+/// today AND the clock is past the deadline. There the one permitted attempt
+/// is taken seconds after boot, before the chain leg has ever run, so it is
+/// guaranteed to find nothing — and then the deadline cancels every retry that
+/// would have found something a minute later.
+///
+/// The condition being tested was "is it late?" when the question that matters
+/// is "has the chain leg had a chance since WE started?". Those are the same
+/// question on a normal morning and opposite questions after a late start,
+/// which is why one deadline could not answer both.
+///
+/// 30 minutes: the chain leg fires once a minute, so any healthy start gets
+/// ~30 chances. It is deliberately longer than a QuestDB restart or a
+/// token-refresh stall, and short enough that a genuinely broken chain is
+/// still declared broken well inside the session.
+pub const DEPTH_ATTACH_MIN_WINDOW_SECS: u64 = 30 * 60;
+
+/// IST second-of-day past which depth is not worth attaching at all.
+///
+/// 15:30 IST — the close. The minimum window above must not be able to keep
+/// this task polling into the evening after a 15:25 restart; depth on a closed
+/// market subscribes contracts that will not trade again today.
+pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 = 15 * 3_600 + 30 * 60;
+
 /// Current IST second-of-day.
 fn ist_second_of_day_now() -> u32 {
     let now_ist = chrono::Utc::now().timestamp().saturating_add(i64::from(
@@ -2455,6 +2497,7 @@ async fn attach_depth_when_available(
     ring_budget: Arc<RingByteBudget>,
 ) {
     let mut attempts: u32 = 0;
+    let started = Instant::now();
     loop {
         // The deadline gates RETRIES, never the FIRST attempt.
         //
@@ -2465,14 +2508,37 @@ async fn attach_depth_when_available(
         // have left depth dark after every intra-day restart, which is the
         // failure this whole task exists to end. Found before deploying,
         // because the deploy that motivated it happened to be mid-session.
-        if attempts > 0 && ist_second_of_day_now() >= DEPTH_ATTACH_DEADLINE_IST_SECS {
+        //
+        // AND the task always gets DEPTH_ATTACH_MIN_WINDOW_SECS, whatever the
+        // clock says. 2026-08-15 prod evidence: an app that started at 10:01
+        // IST took its one permitted attempt 20 seconds later — before the
+        // chain leg had fired even once — and the wall-clock deadline then
+        // cancelled every retry. One doomed look, then dark for the session.
+        // "Is it late?" and "has the chain had a chance since we started?" are
+        // the same question on a normal morning and opposite ones after a late
+        // start; both have to be asked.
+        let now_ist = ist_second_of_day_now();
+        let window_elapsed = started.elapsed().as_secs();
+        let past_hard_stop = now_ist >= DEPTH_ATTACH_HARD_STOP_IST_SECS;
+        let past_deadline_and_window = now_ist >= DEPTH_ATTACH_DEADLINE_IST_SECS
+            && window_elapsed >= DEPTH_ATTACH_MIN_WINDOW_SECS;
+
+        if attempts > 0 && (past_hard_stop || past_deadline_and_window) {
             error!(
                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                 attempts,
-                "depth late-attach gave up: option_chain_1m still yielded no depth candidates by \
-                 the 10:00 IST deadline, so depth-20 and depth-200 will carry NO data this \
-                 session. Check that the option-chain leg is running and that \
-                 contract_security_id is populated."
+                window_elapsed_secs = window_elapsed,
+                ist_second_of_day = now_ist,
+                reason = if past_hard_stop {
+                    "market close reached"
+                } else {
+                    "past the 10:00 IST deadline and the minimum window"
+                },
+                "depth late-attach gave up: option_chain_1m still yielded no depth candidates, so \
+                 depth-20 and depth-200 will carry NO data this session. Check that the \
+                 option-chain leg is running and that contract_security_id is populated. If \
+                 `attempts` is small, this app started late — the chain leg publishes from 09:16 \
+                 IST and cannot have run before the app did."
             );
             return;
         }
@@ -5287,12 +5353,78 @@ mod tests {
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);
         assert!(
-            production.contains(
-                "attempts > 0 && ist_second_of_day_now() >= DEPTH_ATTACH_DEADLINE_IST_SECS"
-            ),
-            "the depth deadline MUST be guarded by `attempts > 0` — an unguarded check makes a \
+            production.contains("if attempts > 0 && (past_hard_stop || past_deadline_and_window)"),
+            "the depth give-up MUST be guarded by `attempts > 0` — an unguarded check makes a \
              mid-session restart give up before it has looked even once, exactly when the chain \
              table is fullest"
+        );
+    }
+
+    /// The wall-clock deadline alone must not be able to end the task.
+    ///
+    /// Prod, 2026-08-15: the app started at 10:01 IST, took its one permitted
+    /// attempt 20 seconds later — before the option-chain leg had fired even
+    /// once — and the 10:00 deadline then cancelled every retry. One doomed
+    /// look, dark for the session, `attempts: 1` in the log.
+    ///
+    /// A source scan rather than a behavioural test because the alternative is
+    /// a 30-minute sleep or a clock injection through five call sites; the
+    /// condition is a pure boolean and its shape is the whole fix.
+    #[test]
+    fn test_depth_give_up_requires_both_the_deadline_and_a_minimum_window() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("window_elapsed >= DEPTH_ATTACH_MIN_WINDOW_SECS"),
+            "the give-up condition no longer requires a minimum window since THIS task started. \
+             Without it, any start after ~09:59 IST gets exactly one attempt, taken seconds \
+             after boot when the chain leg cannot yet have run — guaranteed empty, then \
+             permanently dark"
+        );
+        assert!(
+            production.contains("now_ist >= DEPTH_ATTACH_DEADLINE_IST_SECS")
+                && production.contains("&& window_elapsed"),
+            "the deadline and the window must be ANDed. ORing them restores the 2026-08-15 \
+             defect: the clock alone would again be sufficient to give up"
+        );
+        assert!(
+            production.contains("past_hard_stop"),
+            "the minimum window must be bounded by a hard stop, or a 15:25 restart would keep \
+             this task polling into the evening for contracts that will not trade again today"
+        );
+    }
+
+    #[test]
+    fn test_depth_attach_windows_are_ordered_and_inside_the_session() {
+        // The three constants only make sense in one order, and getting it
+        // wrong is silent: a hard stop below the deadline would end the task
+        // before the deadline could ever be reached, making the deadline dead
+        // code that reads as if it were live.
+        assert!(
+            DEPTH_ATTACH_DEADLINE_IST_SECS < DEPTH_ATTACH_HARD_STOP_IST_SECS,
+            "the hard stop must be AFTER the deadline, or the deadline is unreachable"
+        );
+        assert!(
+            DEPTH_ATTACH_HARD_STOP_IST_SECS <= 15 * 3_600 + 30 * 60,
+            "the hard stop must not run past the 15:30 IST close — depth on a closed market \
+             subscribes contracts that will not trade again today"
+        );
+        assert!(
+            DEPTH_ATTACH_MIN_WINDOW_SECS >= 10 * DEPTH_ATTACH_RETRY_SECS,
+            "the minimum window must allow at least ten polls, or a transient QuestDB stall \
+             consumes the whole allowance and depth gives up on a healthy chain"
+        );
+        // And the window must fit inside the session from the deadline, or a
+        // start at exactly the deadline would be cut short by the hard stop.
+        let from_deadline_to_close =
+            u64::from(DEPTH_ATTACH_HARD_STOP_IST_SECS - DEPTH_ATTACH_DEADLINE_IST_SECS);
+        assert!(
+            DEPTH_ATTACH_MIN_WINDOW_SECS <= from_deadline_to_close,
+            "the minimum window ({DEPTH_ATTACH_MIN_WINDOW_SECS}s) is longer than the time \
+             between the deadline and the close ({from_deadline_to_close}s), so a start at the \
+             deadline could never use its full allowance"
         );
     }
 }
