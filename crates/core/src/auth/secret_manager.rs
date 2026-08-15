@@ -12,10 +12,11 @@ use secrecy::SecretString;
 use tracing::{info, instrument, warn};
 
 use tickvault_common::constants::{
-    DEFAULT_SSM_ENVIRONMENT, DHAN_CLIENT_ID_SECRET, DHAN_CLIENT_SECRET_SECRET,
-    DHAN_SANDBOX_CLIENT_ID_SECRET, DHAN_SANDBOX_TOKEN_SECRET, DHAN_TOTP_SECRET,
-    GROWW_ACCESS_TOKEN_SECRET, QUESTDB_PG_PASSWORD_SECRET, QUESTDB_PG_USER_SECRET,
-    SSM_DHAN_SERVICE, SSM_GROWW_SERVICE, SSM_QUESTDB_SERVICE, SSM_SECRET_BASE_PATH,
+    DEFAULT_SSM_ENVIRONMENT, DHAN_ACCESS_TOKEN_SECRET, DHAN_CLIENT_ID_SECRET,
+    DHAN_CLIENT_SECRET_SECRET, DHAN_SANDBOX_CLIENT_ID_SECRET, DHAN_SANDBOX_TOKEN_SECRET,
+    DHAN_TOTP_SECRET, GROWW_ACCESS_TOKEN_SECRET, QUESTDB_PG_PASSWORD_SECRET,
+    QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE, SSM_GROWW_SERVICE, SSM_QUESTDB_SERVICE,
+    SSM_SECRET_BASE_PATH,
 };
 use tickvault_common::error::ApplicationError;
 
@@ -254,6 +255,56 @@ pub async fn fetch_groww_access_token() -> Result<SecretString, ApplicationError
     let token = fetch_secret(&ssm_client, &token_path).await?;
 
     info!("Groww access token fetched successfully from SSM");
+
+    Ok(token)
+}
+
+/// Fetches the SHARED Dhan access token from SSM — READ-ONLY, never a mint.
+///
+/// # Why this exists (prod evidence, 2026-08-15)
+///
+/// Dhan permits **one active token per account**: minting a new one
+/// invalidates the old. There are two minters against this account — the
+/// `tv-<env>-dhan-token-minter` Lambda at 06:05 IST, and the box itself at
+/// boot — which is the re-mint war `groww-shared-token-minter-2026-07-02.md`
+/// §10.3 predicted in writing and left as a REQUIRED follow-up:
+///
+/// > "It is NOT safe once the box starts: two minters against a
+/// >  one-active-token account is precisely the re-mint war §9 set out to
+/// >  end, re-created from the other direction. REQUIRED before the box next
+/// >  runs: tickvault must READ this parameter instead of minting."
+///
+/// The box then ran for days without that change, and the signature is in the
+/// log: `CHAIN-04 ... http 401 ... "808":"Authentication Failed - Client ID
+/// or Token invalid"` at 08:32 IST on 2026-08-14, minutes after a boot that
+/// had adopted a locally-cached token the 06:05 Lambda mint had already
+/// killed.
+///
+/// This is the reader half — deliberately the SAME posture Groww has had
+/// since 2026-07-02, where exactly one minter writes and everyone else reads.
+///
+/// # Errors
+/// Returns `Err` when the environment cannot be resolved or the parameter is
+/// absent/unreadable. Callers treat that as "no shared token" and fall back;
+/// it is never fatal, because a missing shared token must not stop a box that
+/// can still mint its own.
+#[instrument(fields(environment))]
+pub async fn fetch_dhan_access_token() -> Result<SecretString, ApplicationError> {
+    let environment = resolve_environment()?;
+    tracing::Span::current().record("environment", environment.as_str());
+
+    let ssm_client = create_ssm_client().await;
+    let token_path = build_ssm_path(&environment, SSM_DHAN_SERVICE, DHAN_ACCESS_TOKEN_SECRET);
+
+    info!(
+        token_path = %token_path,
+        "fetching the shared Dhan access token from SSM (read-only; minted by the \
+         tv-<env>-dhan-token-minter Lambda)"
+    );
+
+    let token = fetch_secret(&ssm_client, &token_path).await?;
+
+    info!("shared Dhan access token fetched successfully from SSM");
 
     Ok(token)
 }
