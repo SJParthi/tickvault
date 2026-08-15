@@ -88,8 +88,8 @@ use secrecy::ExposeSecret;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-    DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE,
-    PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, SPOT_1M_REST_INDICES,
+    DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, MAX_PLAUSIBLE_LTP,
+    OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, SPOT_1M_REST_INDICES,
     TICK_PERSIST_END_SECS_OF_DAY_IST, TICKER_PACKET_SIZE,
 };
 use tickvault_common::error_code::ErrorCode;
@@ -2293,6 +2293,17 @@ impl DepthIngest {
         self.writer.pending()
     }
 
+    /// The ILP text this ingest has buffered — what a test must read to check
+    /// that the `side` / `depth_kind` / `capture_seq` MAPPING done in
+    /// [`drain_depth_frame`] is right. Row counts cannot see that mapping.
+    #[must_use]
+    // Asserted by the drain-label and capture_seq tests, which can only exist
+    // because this does.
+    // TEST-EXEMPT: observability accessor, asserted by the tests it enables.
+    pub fn pending_ilp(&self) -> String {
+        self.writer.buffer_utf8()
+    }
+
     /// Rows discarded on failed flushes.
     #[must_use]
     // TEST-EXEMPT: observability accessor, asserted by the depth drain tests.
@@ -2336,17 +2347,43 @@ fn drain_depth_frame(
         DepthFeedKind::Twenty => DEPTH_KIND_20,
         DepthFeedKind::TwoHundred => DEPTH_KIND_200,
     };
-    // The frame's own replay-stable sequence, reused as `capture_seq`. Minting
-    // a fresh one here would make a WAL-replayed depth frame land as a second
-    // set of rows instead of collapsing onto the originals — the same trap the
-    // tick path documents at `append_tick_with_seq`.
-    let capture_seq = i64::try_from(frame.seq).unwrap_or(i64::MAX);
-
     let mut iter = split_depth_frame(&frame.bytes, kind);
     // `by_ref` rather than consuming the iterator: `stop_reason()` and
     // `length_field_mismatches()` are read AFTER the walk, and they are the
     // only way to tell a cleanly-consumed frame from a truncated one.
-    for packet_bytes in iter.by_ref() {
+    //
+    // `enumerate` is load-bearing, not cosmetic — see the `capture_seq`
+    // derivation inside the loop.
+    for (packet_index, packet_bytes) in iter.by_ref().enumerate() {
+        // PER-PACKET `capture_seq`, exactly as `ingest_tick_at` derives it.
+        //
+        // A Dhan frame STACKS packets, and `capture_seq` is a DEDUP key column.
+        // Stamping the bare `frame.seq` on every packet in the frame — which
+        // this did until 2026-08-15 — makes all eight key columns identical for
+        // any two packets sharing `(security_id, segment, side)` in ONE frame,
+        // so QuestDB upserts one silently away. Worse, `out.rows` counts
+        // successful ILP APPENDS, not DB acceptance, so the loss would not even
+        // show up as a shortfall in our own counter — invisible loss in the one
+        // table whose entire premise is that nothing is lost.
+        //
+        // `next_frame_seq` deliberately zeroes the low `MAX_PACKET_INDEX` bits
+        // to reserve exactly this packet slot; the bare-seq version left all
+        // 131,071 of them unused. Both narrowings REFUSE rather than saturate:
+        // an `unwrap_or(i64::MAX)` would pin every over-range packet onto one
+        // key and collapse them together — the same silent-merge this fix
+        // exists to remove, reintroduced at the other end.
+        let Some(packet_seq) =
+            tickvault_storage::ws_frame_spill::packet_capture_seq(frame.seq, packet_index as u64)
+        else {
+            out.refused = out.refused.saturating_add(1);
+            c.depth_refused.increment(1);
+            continue;
+        };
+        let Some(capture_seq) = capture_seq_from_frame_seq(packet_seq) else {
+            out.refused = out.refused.saturating_add(1);
+            c.depth_refused.increment(1);
+            continue;
+        };
         let parsed = match parse_depth_packet(packet_bytes, kind, &mut depth.buf) {
             Ok(p) => p,
             Err(_) => {
@@ -2385,6 +2422,38 @@ fn drain_depth_frame(
             continue;
         };
         for (idx, level) in levels.iter().enumerate() {
+            // Price sanity, per level — the depth twin of `tick_price_is_sane`.
+            //
+            // `level.price` is `read_f64_le` straight off the wire, so EVERY
+            // 8-byte pattern is a valid `f64`: NaN, ±Inf, negative, 1e308. Two
+            // things go wrong without this gate, and the second is the worse
+            // one:
+            //
+            //   1. A NaN or absurd price renders through `market_depth_named`
+            //      as a real book price.
+            //   2. If the server REJECTS the resulting line, `flush` fails and
+            //      `discard_pending` clears the ENTIRE pending buffer — up to
+            //      `DEPTH_FLUSH_ROW_THRESHOLD` rows of perfectly good levels
+            //      from every other instrument in the batch. One poisoned
+            //      level from one instrument would cost everyone else's book.
+            //      Refusing per ROW turns a batch-wide loss into a single
+            //      counted row.
+            //
+            // ZERO IS ACCEPTED and is not corruption: depth-20 is a FIXED 20
+            // levels (`depth_level_count`), so an illiquid contract with three
+            // real bids still emits 20 rows and levels 4..20 are legitimately
+            // all-zero — the documented absent-level sentinel. Refusing them
+            // would count normal book shape as corruption and, worse, delete
+            // the operator's own "show me everything" view of how deep a book
+            // actually is. Negative is refused; a price cannot be below zero.
+            if !level.price.is_finite()
+                || level.price < 0.0
+                || level.price > f64::from(MAX_PLAUSIBLE_LTP)
+            {
+                out.refused = out.refused.saturating_add(1);
+                c.depth_refused.increment(1);
+                continue;
+            }
             let row = DepthRow {
                 security_id,
                 segment,
@@ -5010,12 +5079,17 @@ mod tests {
 
     #[test]
     fn the_frame_sequence_is_reused_as_capture_seq_so_replay_collapses() {
-        // Minting a fresh capture_seq here would make a WAL-replayed depth
-        // frame land as a SECOND set of rows instead of collapsing onto the
-        // originals. Asserted through the outcome rather than the row, because
-        // the row is private to the writer's buffer.
+        // REWRITTEN 2026-08-15. The previous version asserted `out.rows == 20`
+        // twice and never read capture_seq — it conceded in its own comment
+        // that the property held "by construction", which is a claim, not an
+        // assertion. Replacing the derivation with a fresh mint left it green
+        // while every WAL replay doubled the book.
         let mut depth = DepthIngest::for_test();
-        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 4_242);
+        let frame = depth_frame(
+            depth20_packet(13, 0, 41),
+            DhanEndpointType::Depth20,
+            556_007_424,
+        );
         let out = drain_depth_frame(
             &mut depth,
             &frame,
@@ -5024,29 +5098,124 @@ mod tests {
             counters(),
         );
         assert_eq!(out.rows, 20);
-        // Re-folding the SAME frame produces the same 20 rows again — the
-        // database collapses them because every key column, capture_seq
-        // included, is identical. What must NOT happen is the sequence
-        // changing between the two folds, which is what this asserts by
-        // construction: `drain_depth_frame` reads `frame.seq` and nothing else.
+        let first = depth.pending_ilp();
+        assert!(
+            first.contains("capture_seq=556007424i"),
+            "capture_seq must be DERIVED from frame.seq, not minted, not minted; got: {first}"
+        );
+
+        // Re-folding the SAME frame must reproduce the SAME sequence, so the
+        // database collapses the replay onto the originals instead of storing
+        // a second book. A mint would produce a different value here.
+        let mut replay = DepthIngest::for_test();
         let again = drain_depth_frame(
-            &mut depth,
+            &mut replay,
             &frame,
             1_779_355_000_000_000_000,
             DepthFeedKind::Twenty,
             counters(),
         );
         assert_eq!(again.rows, 20);
+        assert_eq!(
+            replay.pending_ilp(),
+            first,
+            "a replayed frame must emit byte-identical rows, or it lands as a duplicate book"
+        );
+    }
+
+    #[test]
+    fn two_packets_in_one_frame_get_distinct_capture_seqs() {
+        // A frame STACKS packets. `capture_seq` is a DEDUP key column, so if
+        // every packet in a frame carried the bare `frame.seq`, two packets
+        // sharing (security_id, segment, side) would match on all eight key
+        // columns and QuestDB would upsert one away — invisibly, because
+        // `out.rows` counts ILP appends, not DB acceptance.
+        //
+        // The packet index occupies the low bits `next_frame_seq` reserves, so
+        // consecutive packets differ by exactly 1.
+        let mut depth = DepthIngest::for_test();
+        let mut bytes = depth20_packet(13, 0, 41);
+        bytes.extend_from_slice(&depth20_packet(13, 0, 51));
+        let frame = depth_frame(bytes, DhanEndpointType::Depth20, 556_007_424);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 40, "20 bid + 20 ask");
+        let ilp = depth.pending_ilp();
+        assert!(
+            ilp.contains("capture_seq=556007424i"),
+            "packet 0 keeps the frame's own sequence: {ilp}"
+        );
+        assert!(
+            ilp.contains("capture_seq=556007425i"),
+            "packet 1 must occupy the NEXT reserved packet slot, not reuse 4242: {ilp}"
+        );
+    }
+
+    #[test]
+    fn bid_and_ask_reach_the_row_under_the_right_side_label() {
+        // The consequence of getting this wrong is an INVERTED ORDER BOOK — the
+        // worst failure this protocol has. Every prior assertion was
+        // `out.rows == 40`, which is equally true with the two arms swapped.
+        let mut depth = DepthIngest::for_test();
+        let mut bytes = depth20_packet(13, 0, 41); // 41 = bid
+        bytes.extend_from_slice(&depth20_packet(13, 0, 51)); // 51 = ask
+        let frame = depth_frame(bytes, DhanEndpointType::Depth20, 7);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 40);
+        let ilp = depth.pending_ilp();
+        assert!(ilp.contains("side=bid"), "bid packet lost its label: {ilp}");
+        assert!(ilp.contains("side=ask"), "ask packet lost its label: {ilp}");
+        assert!(
+            ilp.contains("depth_kind=d20"),
+            "a depth-20 frame must be labelled d20 — the discriminator is what \
+             stops the two pools overwriting each other: {ilp}"
+        );
+        assert!(
+            !ilp.contains("depth_kind=d200"),
+            "a depth-20 frame must never be labelled d200: {ilp}"
+        );
     }
 
     #[test]
     fn a_depth_frame_with_no_ingest_wired_counts_as_unconsumed_not_as_success() {
-        // The `None` arm is a WIRING BUG, not a design choice, and it must be
-        // visible as one. This asserts the outcome field exists and is used.
-        let out = DepthFrameOutcome::default();
-        assert_eq!(out.rows, 0);
-        assert_eq!(out.refused, 0);
-        assert_eq!(out.disconnects, 0);
+        // REWRITTEN 2026-08-15. The previous body built a `DepthFrameOutcome`
+        // with `default()` and asserted its three fields were zero — i.e. that
+        // the derive returns what the derive returns. It never called
+        // `drain_depth_frame` and never touched the `None`-ingest arm it is
+        // named for, so the wiring bug it claims to catch could ship freely.
+        // What is asserted now: a wired ingest actually produces rows, so the
+        // `None` arm is distinguishable from the success path by an observable
+        // difference rather than by inspection.
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let out = drain_depth_frame(
+            &mut DepthIngest::for_test(),
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 20, "with an ingest wired, rows land");
+
+        // HONEST LIMIT, stated rather than faked: the `None` arm itself lives
+        // inline in `run_frame_drain`'s select loop and cannot be reached from
+        // a unit test without standing up the whole drain. It is instead made
+        // UNREACHABLE by construction — `DepthIngest::new` is called
+        // unconditionally at stack build (it was gated on a boot-time
+        // instrument list that `main.rs` passes empty by design, which silently
+        // discarded every depth frame until 2026-08-15). That unconditional
+        // construction is what `depth_wiring_guard` pins; this test pins the
+        // other half, that a wired ingest is not itself a no-op.
     }
 
     #[test]
