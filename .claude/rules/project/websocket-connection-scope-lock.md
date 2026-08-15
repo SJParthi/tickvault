@@ -1075,24 +1075,42 @@ behaves.
 
 #### The honest cost — arithmetic, not a warning
 
-Row width ≈ 68 B. depth-20 emits 40 rows/update (20 levels × 2 sides);
-depth-200 emits 400.
+> **⚠ CORRECTED 2026-08-15 (same day), operator-caught.** The first version of
+> this table said **~70 GB/day** and **~350 GB/day**. Both were wrong by
+> **3.4×**, and the reason matters more than the numbers: the rate was
+> multiplied by **86,400 seconds — a full calendar day**. Depth frames only
+> arrive while the sockets are up, which is the persistence window 09:00–15:40
+> IST = **24,000 seconds**. Costing a market-data stream over a 24-hour day
+> credits it for the 62,400 seconds the exchange is shut. The row width was
+> also carried as a round "≈68 B" rather than derived; it is 72 B, shown below.
+
+Row width, derived: 4 SYMBOL columns (`feed`, `segment`, `depth_kind`, `side`)
+at 4 B of interned key each = 16 B, plus 7 eight-byte columns (`security_id`,
+`level`, `price`, `quantity`, `orders`, `capture_seq`, `ts`) = 56 B → **72 B**.
+depth-20 emits 40 rows/update (20 levels × 2 sides); depth-200 emits 400.
+Session = 24,000 s.
 
 | Pool | Instruments | Rows/update | At 1 update/s | At 5 updates/s |
 |---|---|---|---|---|
-| depth-20 | 250 | 40 | 58.8 GB/day | 294 GB/day |
-| depth-200 | 5 | 400 | 11.7 GB/day | 58.8 GB/day |
-| **Total** | | | **≈ 70 GB/day** | **≈ 350 GB/day** |
+| depth-20 | 250 | 40 | 17.3 GB/day | 86 GB/day |
+| depth-200 | 5 | 400 | 3.5 GB/day | 17 GB/day |
+| **Total** | | | **≈ 21 GB/day** | **≈ 104 GB/day** |
 
 **The 250-instrument depth-20 pool dominates, not depth-200.** That inverts the
 intuition the earlier recommendation was built on: the 5 deep sockets are the
-cheap half. The update rate is the unmeasured multiplier and swings the answer
-5×; it is **Assumed**, and the first live session measures it.
+cheap half — and it survives the correction, because both pools scaled by the
+same wrong factor. The update rate is the unmeasured multiplier and still swings
+the answer 5×; it is **Assumed**, and the first live session measures it.
 
-Against a **100 GB root**, that is **~1.4 days at the low estimate and ~7 hours
-at the high one.** gp3 grows online in one command and `variables.tf` permits up
-to 200 GB, which buys ~3 days at the low rate — it does not solve the problem, it
-moves it.
+Against a **100 GB root** that is **~4.8 days at the low estimate and ~23 hours
+at the high one** — not the ~1.4 days and ~7 hours the wrong figure implied. gp3
+grows online in one command and `variables.tf` permits up to 200 GB.
+
+A further **~17% is available and deliberately NOT taken**: `level` (≤200),
+`quantity` and `orders` are `u32` on the wire and stored as `LONG`, costing
+12 B/row. Narrowing them to `INT` needs an i64→INT ILP coercion for which this
+crate has no existing precedent to copy, and getting that wrong fails every
+depth write. Measure it against a live QuestDB before shipping it.
 
 #### How "nothing is dropped" is actually delivered
 
@@ -1108,11 +1126,20 @@ missed, hidden, or wiped — the hot window on local disk is simply short.** A
 drop that has not been verified in S3 first is a REJECT.
 
 Storage cost is real and belongs in front of the operator rather than inside a
-follow-up: ~70 GB/day is ~2.1 TB/month. In S3 Standard that is ~$48/mo — over
-half the current AWS ceiling on its own. In Glacier Instant Retrieval it is
-~$8/mo; in Deep Archive ~$2/mo. **The storage-class choice is therefore an
-operator decision, not an implementation detail**, and it changes the bill by
-24×. At the 5-updates/sec end every figure multiplies by five.
+follow-up. **Recomputed on the corrected 21 GB/day** (22 trading days, not 30
+calendar days — the same session-vs-calendar error, applied to the month):
+~**460 GB/month**. In S3 Standard that is ~**$10.6/mo**; in Glacier Instant
+Retrieval ~**$1.8/mo**; in Deep Archive ~**$0.45/mo**. The storage-class choice
+still changes the bill by ~24×, but at this corrected volume even the most
+expensive tier is a fraction of the AWS ceiling rather than half of it — which
+materially weakens the case for aggressive tiering and strengthens the case for
+keeping the data readily queryable. At the 5-updates/sec end every figure
+multiplies by five (~2.3 TB/mo, ~$53 Standard).
+
+*(The pre-correction text said "~2.1 TB/month … ~$48/mo … over half the current
+AWS ceiling on its own". That framing drove the original
+don't-persist-depth-200 recommendation the operator overruled. He was right on
+both counts: the recommendation AND the number behind it.)*
 
 #### What this quote does NOT change
 
