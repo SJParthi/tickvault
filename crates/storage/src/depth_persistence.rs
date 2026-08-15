@@ -32,10 +32,41 @@
 //! * `level` as a column means "the top 5 of everything" is
 //!   `WHERE level <= 5`, and it reads identically for both pools.
 //!
-//! The cost is real and was put in front of the operator before this landed:
-//! ~70 GB/day at one update per second per instrument, ~350 GB/day at five.
-//! See the rule-file section for the arithmetic and for the same-day S3
-//! archival that keeps "nothing is dropped" true on a 100 GB root.
+//! ## The storage arithmetic, corrected 2026-08-15
+//!
+//! An earlier version of this note said ~70 GB/day. **That was wrong by 3.4×**,
+//! and the error is worth recording because it is the easiest one to make here:
+//! it multiplied the per-second rate by **86,400 seconds**, a full 24-hour day.
+//! Depth frames only arrive while the sockets are up, which is the persistence
+//! window `TICK_PERSIST_START_SECS_OF_DAY_IST`..`TICK_PERSIST_END_SECS_OF_DAY_IST`
+//! — 09:00 to 15:40 IST, **24,000 seconds**. A market-data volume computed over
+//! a calendar day rather than a session is inflated by the 62,400 seconds the
+//! exchange is shut.
+//!
+//! Row width, derived rather than guessed: 4 SYMBOL columns (`feed`, `segment`,
+//! `depth_kind`, `side`) at 4 B of interned key each = 16 B, plus 7 eight-byte
+//! columns (`security_id`, `level`, `price`, `quantity`, `orders`,
+//! `capture_seq`, `ts`) = 56 B. **72 B/row.**
+//!
+//! | Pool | Instruments | Rows/update | At 1 update/s | At 5 updates/s |
+//! |---|---|---|---|---|
+//! | depth-20 | 250 | 40 | 17.3 GB/day | 86 GB/day |
+//! | depth-200 | 5 | 400 | 3.5 GB/day | 17 GB/day |
+//! | **Total** | | | **≈ 21 GB/day** | **≈ 104 GB/day** |
+//!
+//! Against a 100 GB root that is ~4.8 days at the low estimate, not the ~1.4
+//! the wrong figure implied. The update rate is still **Assumed** and remains
+//! the 5× swing; the first live session measures it.
+//!
+//! FLAGGED, not taken: `level` (≤200), `quantity` and `orders` are `u32` on the
+//! wire and are stored as `LONG`, costing 12 B/row — a ~17% saving is available
+//! by declaring them `INT`. Not done here because no ILP-written `INT` column
+//! exists anywhere in this crate to copy, and an unverified i64→INT coercion on
+//! the write path that must not fail is a worse trade than 17% of disk. Measure
+//! it against a live QuestDB first.
+//!
+//! See the rule-file section for the same-day S3 archival that keeps "nothing
+//! is dropped" true regardless of which end of that range the feed lands on.
 //!
 //! ## Honest: `ts` is ARRIVAL time, not exchange time
 //!
@@ -731,6 +762,61 @@ mod tests {
     fn depth_segment_label_maps_known_codes_to_their_wire_labels() {
         assert_eq!(depth_segment_label(0), Some("IDX_I"));
         assert_eq!(depth_segment_label(2), Some("NSE_FNO"));
+    }
+
+    // -- the storage estimate's own premise --------------------------------
+
+    #[test]
+    fn the_storage_estimate_is_costed_over_a_session_not_a_calendar_day() {
+        // The module docs quote ~21 GB/day. That figure is only true because
+        // depth arrives during the PERSISTENCE WINDOW, not around the clock:
+        // an earlier version multiplied by 86,400 and was wrong by 3.4×.
+        //
+        // This test pins the premise rather than the conclusion. If someone
+        // widens the window, the docs' number silently becomes an
+        // understatement — and the assertion message says so, which is the
+        // only way a prose figure can be kept honest by the build.
+        let window_secs = u64::from(
+            tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST
+                - tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST,
+        );
+        assert_eq!(
+            window_secs, 24_000,
+            "the depth storage estimate in this module's docs is derived from a \
+             24,000-second session (09:00–15:40 IST). The window is now \
+             {window_secs}s, so that figure is stale — recompute it before \
+             trusting any capacity or cost decision built on it."
+        );
+        assert!(
+            window_secs < 86_400,
+            "costing a market-data stream over a calendar day credits it for \
+             every second the exchange is shut — the exact 3.4× error this \
+             test exists to stop recurring"
+        );
+    }
+
+    #[test]
+    fn the_row_width_premise_matches_the_declared_columns() {
+        // The docs derive 72 B/row as 4 SYMBOL keys (4 B each) + 7 eight-byte
+        // columns. If a column is added or retyped, that derivation — and
+        // every GB/day figure resting on it — is stale.
+        let symbols = MARKET_DEPTH_COLUMNS
+            .iter()
+            .filter(|(_, ty)| *ty == "SYMBOL")
+            .count();
+        let wide = MARKET_DEPTH_COLUMNS
+            .iter()
+            .filter(|(_, ty)| *ty == "LONG" || *ty == "DOUBLE")
+            .count();
+        // +1 for `ts`, which is the designated timestamp and therefore not in
+        // the ALTER column list.
+        let derived = symbols * 4 + (wide + 1) * 8;
+        assert_eq!(
+            (symbols, wide, derived),
+            (4, 6, 72),
+            "row-width premise drifted: the docs' GB/day table assumes 4 SYMBOL \
+             + 7 eight-byte columns = 72 B/row"
+        );
     }
 
     #[test]
