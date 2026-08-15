@@ -3533,17 +3533,28 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // an unbounded depth burst would compete with ticks for the ILP path too.)
     let main_feed_budget = Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES));
     let depth_budget = Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES));
-    // Wired whenever ANY depth socket will be dialed. Built here rather than
-    // unconditionally so the drain's `depth_unconsumed` counter keeps its new
-    // meaning: with no depth instruments there is no writer, no table traffic,
-    // and no depth frames either — the counter stays at zero for the honest
-    // reason rather than because nothing was checked.
-    let depth_ingest =
-        if params.depth_20_instruments.is_empty() && params.depth_200_instruments.is_empty() {
-            None
-        } else {
-            Some(DepthIngest::new(&params.questdb))
-        };
+    // ALWAYS built, and that is load-bearing rather than lazy.
+    //
+    // The obvious shape — build it only when the boot-time depth sets are
+    // non-empty — is WRONG here, and wrong in a way that produces no error at
+    // all. Depth instruments do not exist at boot: `main.rs` passes empty
+    // vectors BY DESIGN, because a depth contract's `security_id` comes from
+    // the option-chain leg, which has not published today's contracts until
+    // after 09:16. `attach_depth_when_available` dials the depth sockets
+    // LATER, against instruments this function never saw.
+    //
+    // So a boot-time conditional leaves the writer `None` for the whole
+    // session while the late-attached sockets happily deliver frames — every
+    // one landing in the `None` arm, counted `depth_unconsumed` and DISCARDED.
+    // Sockets connected, frames arriving, nothing stored, no error anywhere:
+    // precisely the captured-then-thrown-away behaviour this change set out to
+    // end, reintroduced by the guard that was meant to be tidy. It shipped in
+    // the first draft of this commit's parent and is fixed here.
+    //
+    // Cost of building unconditionally: one lazily-connected ILP sender that
+    // stays idle if depth never attaches. In exchange `depth_unconsumed` keeps
+    // its meaning as a pure wiring-bug signal and should now be unreachable.
+    let depth_ingest = Some(DepthIngest::new(&params.questdb));
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
@@ -4175,6 +4186,59 @@ mod tests {
                 segment: ExchangeSegment::NseFno,
             })
             .collect()
+    }
+
+    #[test]
+    fn the_depth_writer_is_built_unconditionally_because_depth_attaches_late() {
+        // THE BUG THIS PINS, which shipped and was caught before merge:
+        // building the depth ingest only when the BOOT-time depth sets are
+        // non-empty leaves it `None` forever, because main.rs passes empty
+        // vectors by design — depth instruments come from the option-chain
+        // leg via `attach_depth_when_available` after 09:16 IST.
+        //
+        // The result was sockets connected, frames arriving, every one
+        // counted `depth_unconsumed` and DISCARDED, with no error anywhere:
+        // the exact captured-then-thrown-away behaviour the depth work
+        // existed to end, reintroduced by a guard meant to be tidy.
+        //
+        // A source scan rather than a runtime assertion because the
+        // construction happens inside `run_dhan_feed_stack`, which needs a
+        // live token manager and real sockets to reach.
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        // Anchored on the BINDING itself, not on the predicate. The same
+        // `params.depth_20_instruments.is_empty()` test appears a few lines
+        // below to gate the late-attach SPAWN, where it is exactly right — a
+        // blanket ban on the predicate would fail on correct code, and a guard
+        // that fails for a reason unrelated to what it protects teaches the
+        // next reader to delete it.
+        let binding = production
+            .lines()
+            .find(|l| l.trim_start().starts_with("let depth_ingest"))
+            .expect("the depth ingest binding must exist");
+        assert!(
+            binding.contains("Some(DepthIngest::new("),
+            "the depth ingest must be built UNCONDITIONALLY — gating it on the \
+             boot-time depth sets makes it None for the WHOLE session, because \
+             those sets are always empty at boot and depth attaches later. \
+             Found: {binding}"
+        );
+    }
+
+    #[test]
+    fn a_depth_frame_with_no_ingest_is_counted_as_a_wiring_bug_not_as_success() {
+        // The `None` arm still exists and is still honest: it counts rather
+        // than pretending. It should be unreachable in production now, which
+        // is why its counter's meaning is "a wiring bug", not "no depth".
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        assert!(
+            production.contains("c.depth_unconsumed.increment(1)"),
+            "the no-ingest arm must still COUNT — a silently dropped depth frame \
+             is what this whole path exists to eliminate"
+        );
     }
 
     // -- I-P1-11 dedup + distinct-slot sizing -------------------------------
