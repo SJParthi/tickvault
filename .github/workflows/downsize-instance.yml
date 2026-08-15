@@ -1,6 +1,6 @@
 # downsize-instance.yml — one-shot guarded downsize of the prod box.
 #
-#   r8g.large -> t4g.medium  +  QDB_MEM_LIMIT 4g -> 1g (on-box .env)
+#   r8g.large -> t4g.medium  +  QDB_MEM_LIMIT -> 12g (on-box .env; matches the r8g.xlarge 32 GiB host)
 #   + root-volume snapshot taken AFTER the (benign, reversible) stop — a clean
 #     rollback image with no in-flight writes. ⚠ NO snapshot auto-delete exists:
 #     manual deletion is required after the rollback window (~$2.5/mo on the
@@ -645,7 +645,7 @@ jobs:
           done
           [ "$PING" = "Online" ] || { echo "::error::SSM agent not Online within 3 min — re-dispatch this workflow to retry (retune-only mode)"; exit 1; }
 
-      # ── STEP 8: SSM — set QDB_MEM_LIMIT=1g in on-box .env + restart stack ──
+      # ── STEP 8: SSM — set QDB_MEM_LIMIT=12g in on-box .env + restart stack ──
       # Pattern = aws-upgrade-instance.sh Step 8 (env upsert) + deploy-aws.yml SSM rules:
       # single-line commands, escaped quotes only, NO apostrophes; manual poll, never `ssm wait`.
       # QUESTDB PG CREDS (review round 4 CRITICAL; hardened round 6): docker-compose.yml
@@ -673,7 +673,7 @@ jobs:
       # downsize signal, and the step fails loudly. The QuestDB HTTP readiness loop
       # is 24 x 10s = 240s (round 6 — was 30s, too tight next to the app's 300s
       # budget for a cold container on a burstable box).
-      - name: SSM — QDB_MEM_LIMIT=1g + recreate questdb + restart app
+      - name: SSM — QDB_MEM_LIMIT=12g + recreate questdb + restart app
         id: ssm
         run: |
           CMD_ID=$(aws ssm send-command \
@@ -684,8 +684,8 @@ jobs:
               "set -euo pipefail",
               "cd /opt/tickvault",
               "touch repo/deploy/docker/.env",
-              "grep -q \"^QDB_MEM_LIMIT=\" repo/deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=1g/\" repo/deploy/docker/.env || echo \"QDB_MEM_LIMIT=1g\" >> repo/deploy/docker/.env",
-              "if [ -f deploy/docker/.env ]; then grep -q \"^QDB_MEM_LIMIT=\" deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=1g/\" deploy/docker/.env || echo \"QDB_MEM_LIMIT=1g\" >> deploy/docker/.env; fi",
+              "grep -q \"^QDB_MEM_LIMIT=\" repo/deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=12g/\" repo/deploy/docker/.env || echo \"QDB_MEM_LIMIT=12g\" >> repo/deploy/docker/.env",
+              "if [ -f deploy/docker/.env ]; then grep -q \"^QDB_MEM_LIMIT=\" deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=12g/\" deploy/docker/.env || echo \"QDB_MEM_LIMIT=12g\" >> deploy/docker/.env; fi",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
               "TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value) || { echo FATAL: SSM fetch of /tickvault/prod/questdb/pg-user FAILED - refusing to recreate prod QuestDB on default creds; exit 1; }",
               "TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value) || { echo FATAL: SSM fetch of /tickvault/prod/questdb/pg-password FAILED - refusing to recreate prod QuestDB on default creds; exit 1; }",

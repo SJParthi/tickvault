@@ -287,24 +287,48 @@ fn keepalive_ladder_outlasts_both_application_deadlines() {
 
 #[test]
 fn user_data_runs_the_verifier_after_applying_the_sysctl_file() {
-    let ud = read(USER_DATA);
+    // 2026-08-15 — this chain MOVED from user-data into
+    // tickvault-host-tuning.service. user-data runs once per instance; the box
+    // restarts every weekday, so the tuning it applied was silently stale on
+    // every boot after the first. The unit re-applies it every boot.
+    //
+    // The invariant is unchanged and still fully enforced — install, then
+    // apply, then verify, in that order. Only the file it is read from moved.
+    // Verifying BEFORE applying would describe the pre-tuning kernel, which is
+    // exactly the false-OK this chain exists to prevent, so the ORDER check is
+    // kept verbatim.
+    let unit = read("deploy/systemd/tickvault-host-tuning.service");
+
     assert!(
-        ud.contains("99-tickvault-net.conf"),
-        "user-data no longer installs the sysctl file"
+        unit.contains("99-tickvault-net.conf"),
+        "the boot unit no longer installs the sysctl file"
     );
     assert!(
-        ud.contains("verify-net-tuning.sh"),
-        "user-data no longer runs verify-net-tuning.sh. Applying tuning without \
-         verifying it lands is the false-OK this whole chain exists to prevent."
+        unit.contains("verify-net-tuning.sh"),
+        "the boot unit no longer runs verify-net-tuning.sh. Applying tuning \
+         without verifying it lands is the false-OK this whole chain exists to \
+         prevent."
     );
-    let apply = ud
+
+    let apply = unit
         .find("sysctl --system")
-        .expect("user-data no longer applies sysctls");
-    let verify = ud.find("verify-net-tuning.sh").expect("no verifier call");
+        .expect("the boot unit no longer applies sysctls");
+    let verify = unit
+        .find("verify-net-tuning.sh")
+        .expect("no verifier call in the boot unit");
     assert!(
         apply < verify,
-        "user-data verifies the tuning BEFORE applying it — the verdict would \
-         describe the pre-tuning kernel"
+        "the boot unit verifies the tuning BEFORE applying it — the verdict \
+         would describe the pre-tuning kernel"
+    );
+
+    // And the unit must actually be reachable on a fresh instance, or the
+    // whole chain above is inert code on disk.
+    let ud = read(USER_DATA);
+    assert!(
+        ud.contains("systemctl enable tickvault-host-tuning"),
+        "user-data no longer enables the host-tuning unit, so none of the \
+         install/apply/verify chain above ever runs on a fresh instance"
     );
 }
 
