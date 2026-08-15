@@ -218,14 +218,16 @@ matters; without it this guard would have been allowlisted within a week.
 
 **OPEN, recorded rather than silently carried:**
 
-| # | Hole | Why it is not closed here |
+| # | Hole | Status |
 |---|---|---|
-| 4 | `node`, `npx`, `npm`, `yarn`, `pnpm`, `deno`, `bun`, `ruby`, `gem`, `php`, `lua` are **not banned tokens**. `.mcp.json` uses `npx` live | Banning them would fail the guard on `.mcp.json`, which is dev-session MCP tooling that is never deployed and never in the product path. Removing it breaks local tooling and buys nothing on the box — an **operator call**, not a silent guard edit. `node` is additionally prose-ambiguous (AWS's "SSM managed node") |
-| 5 | `.html` is neither banned nor scanned, and the 4-surface frontend carve-out is described in prose but **pinned by nothing** — a 5th `.html` lands green | Needs a budget const mirroring `GITHUB_SCRIPT_BUDGET`, complicated by 12 legitimate vendor-reference `.html` files under `docs/`. Deferred rather than guessed |
-| 6 | ~11 GitHub Actions (`actions/checkout`, `actions/cache`, `Swatinem/rust-cache`, …) are `using: node20` JS actions, while `github-script` **is** budgeted as an interpreted surface | The scope is genuinely inconsistent, but the boundary is a policy question: third-party CI actions are not "our workspace codebase". Needs an operator ruling, then either a budget or an explicit written boundary |
+| 4 | `node`, `npx`, `npm`, `yarn`, `pnpm`, `deno`, `bun`, `ruby`, `gem`, `php`, `lua` are not banned tokens | **CLOSED 2026-08-15** — see the command-position section above. All eleven are covered; the four non-node runtimes had their FILE extensions banned already, but an extension ban is not an invocation ban (the same distinction the 2026-08-01 `pip` correction turned on), and all four have zero live invocations |
+| 5 | `.html` neither banned nor scanned; the 4-surface frontend carve-out was prose pinned by nothing | **CLOSED 2026-08-14 by `browser_surface_and_toolchain_guard.rs`** (landed on `main` via #1753), which pins tracked `.html` as one frontend surface plus vendor docs under `docs/`, AND pins browser code inside `.rs` to the enumerated surfaces. A duplicate budget written in parallel in this file was deleted rather than kept alongside it |
+| 6 | ~11 GitHub Actions (`actions/checkout`, `actions/cache`, `Swatinem/rust-cache`, …) are `using: node20` JS actions, while `github-script` **is** budgeted as an interpreted surface | **STILL OPEN.** The scope is genuinely inconsistent, but the boundary is a policy question: third-party CI actions are not "our workspace codebase". Needs an operator ruling, then either a budget or an explicit written boundary |
 
-Items 4–6 each require an operator decision, so they are stated here instead of
-being resolved by executor judgment. None of them is an active violation today.
+Item 6 is the only one left, and it is a policy call rather than an executor
+judgment: banning it would mean vendoring or rewriting the standard CI actions
+this repo depends on. It is not an active violation — nothing in `crates/`,
+`scripts/`, or `deploy/` runs a non-Rust runtime.
 
 ## §1. The rule (one line)
 

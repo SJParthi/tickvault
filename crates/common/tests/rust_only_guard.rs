@@ -529,8 +529,18 @@ fn rust_spawn_violations(content: &str) -> Vec<String> {
 // they cannot grow, and removing them forces the budget down in the same PR.
 const NODE_RUNTIME_BUDGET: &[(&str, usize)] = &[(".mcp.json", 2)];
 
-/// The node-family runtimes, as command names.
-const NODE_FAMILY: &[&str] = &["node", "npx", "npm", "yarn", "pnpm", "deno", "bun"];
+/// Interpreted runtimes and their package managers, as COMMAND names.
+///
+/// Covers the node family plus `ruby`/`gem`/`php`/`lua`. The latter four have
+/// their FILE extensions banned already, so a tracked `.rb` cannot exist — but
+/// an extension does not stop an inline `ruby -e '…'` in a shell script, which
+/// is the same hole the 2026-08-01 correction found for `pip`: banning the
+/// artifact is not banning the invocation. All four have ZERO live invocations,
+/// so including them costs nothing and closes the class rather than one member
+/// of it.
+const NODE_FAMILY: &[&str] = &[
+    "node", "npx", "npm", "yarn", "pnpm", "deno", "bun", "ruby", "gem", "php", "lua",
+];
 
 /// Does `token` start a COMMAND at byte offset `at` within `line`?
 ///
