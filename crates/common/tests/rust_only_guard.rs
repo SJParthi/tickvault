@@ -511,42 +511,20 @@ const GITHUB_SCRIPT_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/safety.yml", 12),
 ];
 
-// ---- SCOPE FIX #8 (2026-08-14): the FRONTEND carve-out, made mechanical ----
+// The FRONTEND carve-out is pinned by `browser_surface_and_toolchain_guard.rs`,
+// NOT here (2026-08-14 merge resolution).
 //
-// The operator's rule is "Rust O(1) everywhere EXCEPT frontend alone". Until
-// now the exception was PROSE: CLAUDE.md names four browser-facing surfaces and
-// nothing enforced it. A fifth `<script>` surface — or unbounded JavaScript
-// growth inside the existing three — was structurally invisible, because `.rs`
-// is excluded from token scanning by design and `.html` was scanned by nothing.
+// Two sessions closed the same gap in parallel: this file briefly carried a
+// FRONTEND_SCRIPT_BUDGET, and `main` landed the sibling guard. The sibling is
+// strictly more thorough — it also pins tracked `.html` (frontend surface vs
+// vendor docs) and the `.cargo/config.toml` runner/linker, with a
+// planted-runner self-test — so the duplicate here was DELETED rather than
+// kept alongside it.
 //
-// The asymmetry is what makes it worth closing: inline JS in a `.yml` IS
-// budgeted (above), while inline JS in a `.rs` raw string was not. Same
-// language, same runtime, opposite treatment.
-//
-// Shrink-only, exactly like the budget above: a count ABOVE budget is a new
-// surface (forbidden); BELOW means someone removed one and must shrink the
-// budget in the same PR; a file absent from the list must have ZERO.
-const FRONTEND_SCRIPT_BUDGET: &[(&str, usize)] = &[
-    ("crates/api/src/handlers/board_page.rs", 1),
-    ("crates/api/src/handlers/dashboard_page.rs", 1),
-    ("crates/api/src/handlers/feeds_page.rs", 1),
-    ("crates/aws-lambdas/src/operator_control_console.html", 1),
-];
-
-/// Count `<script` occurrences in the PRODUCTION half of a file.
-///
-/// Truncating at the test module is load-bearing, not tidiness: six files carry
-/// `<script>` strings as XSS-ESCAPING FIXTURES — they assert that the escaper
-/// neutralises them. Counting those would either force them onto the budget
-/// (making the budget meaningless) or fail the build on tests that exist to
-/// prove the opposite of what the budget forbids.
-fn count_frontend_script_tags(content: &str) -> usize {
-    let production = match content.find("mod tests") {
-        Some(i) => &content[..i],
-        None => content,
-    };
-    production.matches("<script").count()
-}
+// Keeping both would have been worse than keeping neither: two budgets
+// asserting the same fact can disagree, and then an edit satisfies one guard
+// while failing the other for a reason that reads as arbitrary. One fact, one
+// ratchet.
 
 /// Count real `uses: …github-script…` step lines. Comment lines are skipped so
 /// a `#`-prefixed explanation of a COMPLETED port never counts as a usage.
@@ -850,74 +828,6 @@ fn github_script_usage_only_shrinks() {
          budgeted {under:?} (path, actual, budget). Whoever ported them must LOWER the \
          entry in GITHUB_SCRIPT_BUDGET (crates/common/tests/rust_only_guard.rs) in the \
          same PR — the budget only ever shrinks."
-    );
-}
-
-/// (g2) The FRONTEND carve-out is exactly four surfaces, and only shrinks.
-///
-/// The operator's standing rule is Rust everywhere "except frontend alone".
-/// This is the first mechanical statement of that exception: before it, the
-/// four-surface figure lived only in CLAUDE.md prose, so a fifth browser
-/// surface could land green.
-#[test]
-fn frontend_script_surfaces_only_shrink() {
-    assert_sorted_unique(
-        &FRONTEND_SCRIPT_BUDGET
-            .iter()
-            .map(|(p, _)| *p)
-            .collect::<Vec<_>>(),
-        "FRONTEND_SCRIPT_BUDGET",
-    );
-    let root = repo_root();
-    let mut counted: Vec<(String, usize)> = Vec::new();
-    for path in git_ls_files(&["*.rs", "*.html"]) {
-        // Vendor documentation saved to disk is DATA, not a surface we ship.
-        // Scoping to `crates/` keeps the scan on code we author and own.
-        if !path.starts_with("crates/") {
-            continue;
-        }
-        // Integration-test files are fixtures and assertions, never shipped
-        // surfaces — and THIS file is one of them: it has to spell `<script`
-        // to describe what it forbids, exactly as it has to spell the banned
-        // interpreter's name to ban it. A guard that fails on its own
-        // vocabulary teaches the next reader to weaken the guard.
-        if path.contains("/tests/") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
-        let tags = count_frontend_script_tags(&content);
-        if tags > 0 || FRONTEND_SCRIPT_BUDGET.iter().any(|(p, _)| *p == path) {
-            counted.push((path, tags));
-        }
-    }
-    let (over, under) = github_script_budget_drift(&counted, FRONTEND_SCRIPT_BUDGET);
-    assert!(
-        over.is_empty(),
-        "RUST-ONLY VIOLATION: new browser-facing JavaScript surface {over:?} \
-         (path, actual, budget). The operator's carve-out is 'Rust O(1) everywhere \
-         EXCEPT frontend alone', and the frontend is exactly the four surfaces in \
-         FRONTEND_SCRIPT_BUDGET. A fifth needs a dated operator quote in \
-         rust-only-forever-lock-2026-07-19.md FIRST, not a budget bump."
-    );
-    assert!(
-        under.is_empty(),
-        "SHRINK THE RATCHET: these surfaces now carry FEWER script blocks than budgeted \
-         {under:?} (path, actual, budget). Lower the entry in FRONTEND_SCRIPT_BUDGET in \
-         the same PR — the carve-out only ever shrinks."
-    );
-    // Anti-vacuity: the scan must actually be finding the surfaces. A path
-    // rename that silently emptied `counted` would otherwise pass green — the
-    // exact false-OK shape every scope fix in this file exists to prevent.
-    assert_eq!(
-        counted.len(),
-        FRONTEND_SCRIPT_BUDGET.len(),
-        "the frontend scan found {} file(s) carrying script tags but the budget names {}. \
-         Equal counts are required: a mismatch means either a surface moved (and the \
-         budget path is stale) or a new one appeared. Found: {counted:?}",
-        counted.len(),
-        FRONTEND_SCRIPT_BUDGET.len()
     );
 }
 
