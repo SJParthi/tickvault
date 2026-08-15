@@ -761,6 +761,7 @@ jobs:
           actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
           expected=$(LC_ALL=C sort <<'EOF'
           crates/app/tests/dhat_mark_forward.rs
+          crates/app/tests/dhat_ws_lag.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_cadence_decide.rs
           crates/core/tests/dhat_depth_packet_zero_alloc.rs
@@ -903,14 +904,15 @@ jobs:
           set -euo pipefail
           cargo test -p tickvault-app \
             --test dhat_mark_forward \
+            --test dhat_ws_lag \
             2>&1 | tee /tmp/dhat-app.log
           if grep -q 'running 0 tests' /tmp/dhat-app.log; then
             echo "::error::an app dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 1 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 1 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 2 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 2 — a --test flag was dropped from this step."
             exit 1
           fi
 
