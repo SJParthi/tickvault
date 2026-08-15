@@ -272,3 +272,48 @@ fn questdb_cap_guard_is_not_vacuous() {
          matching, so the check above would pass vacuously"
     );
 }
+
+/// The deploy path must SELF-HEAL a stale on-box memory cap.
+///
+/// # Why asserting the value in the repo is not enough
+///
+/// The previous test stops a bad value being WRITTEN. It cannot repair one
+/// already sitting in the on-box `.env` — and one plausibly is, left by the
+/// July downsize when the host was 4 GiB. compose only supplies its `12g`
+/// default when the variable is UNSET, so a stale line wins forever and no
+/// deploy, restart or reboot would ever notice.
+///
+/// That is a config value silently outliving the machine it was sized for:
+/// the same shape as the per-instance-vs-per-boot bug this whole file exists
+/// to close, one layer up. The fix is the same in kind — make the repo the
+/// source of truth on every deploy, so a stale value cannot survive one.
+#[test]
+fn deploy_self_heals_a_stale_questdb_memory_cap() {
+    let deploy = read(DEPLOY);
+
+    assert!(
+        deploy.contains("QDB_MEM_LIMIT=12g"),
+        "the deploy path no longer asserts QDB_MEM_LIMIT=12g on the box. A stale \
+         1g from the 4 GiB era would then cap the database at 3% of this 32 GiB \
+         host, silently and permanently"
+    );
+
+    // Writing the value without recreating the container would fix the FILE and
+    // leave the RUNNING database throttled until something else happened to
+    // restart it — a fix that reports success while changing nothing.
+    assert!(
+        deploy.contains("--force-recreate questdb"),
+        "the deploy path corrects the .env but never recreates questdb, so the \
+         corrected cap would not take effect on the running container"
+    );
+
+    // And it must only recreate when the value actually CHANGED — recreating the
+    // database on every deploy would be a self-inflicted outage in the name of a
+    // no-op correction.
+    assert!(
+        deploy.contains("QDB_BEFORE") && deploy.contains("QDB_AFTER"),
+        "the self-heal must compare before/after and recreate ONLY on a real \
+         change — an unconditional recreate restarts the database on every \
+         deploy for no reason"
+    );
+}
