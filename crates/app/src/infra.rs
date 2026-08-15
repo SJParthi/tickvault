@@ -45,6 +45,62 @@ const INFRA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Path to docker-compose file relative to project root.
 const DOCKER_COMPOSE_PATH: &str = "deploy/docker/docker-compose.yml";
 
+/// Where the compose file lives on the DEPLOYED box.
+///
+/// The systemd unit sets `WorkingDirectory=/opt/tickvault`, but the deploy
+/// clones the repository to `/opt/tickvault/repo`, so the compose file is one
+/// directory deeper than [`DOCKER_COMPOSE_PATH`] resolves to at runtime.
+const DEPLOYED_COMPOSE_PATH: &str = "repo/deploy/docker/docker-compose.yml";
+
+/// Resolve the compose file for THIS layout — repo checkout or deployed box.
+///
+/// # The live defect this fixes (prod evidence, 2026-08-15)
+///
+/// Every boot on the prod box logged this five times and then gave up:
+///
+/// ```text
+/// docker compose up -d failed (exit status: 14):
+///   stat /opt/tickvault/deploy/docker/docker-compose.yml: no such file or directory
+/// ```
+///
+/// The path was correct for a repo checkout and wrong for the deployed layout,
+/// where the tree lives under `/opt/tickvault/repo/`. So `ensure_docker_running`
+/// — the function whose entire job is to guarantee the database is up — had
+/// **never once succeeded in production**.
+///
+/// It went unnoticed because something else was quietly covering for it: the
+/// deploy workflow runs its own `docker compose up` (with the correct path),
+/// and the systemd unit's `ExecStartPre` runs `ensure-questdb.sh` (also with
+/// the correct path). QuestDB was therefore always already up by the time the
+/// app looked, so `classify_compose_outcome` returned `DegradedServiceUp` and
+/// the boot continued. A permanently-broken function reported a degraded-but-
+/// fine outcome on every single boot.
+///
+/// The cost was real even while masked: ~40 seconds of every boot spent
+/// retrying a file that cannot exist, five identical warnings buried in the
+/// boot log, and a `tv_boot_compose_recreate_degraded_total` counter that
+/// blamed "recreate churn" for what was a typo-class path bug.
+///
+/// The danger was larger than the cost. The one case this function exists for
+/// — QuestDB genuinely down at app boot — is the one case the redundancy does
+/// not cover, and there it would have returned `Critical` and refused to start
+/// the pipeline, because it could not find the file needed to bring the
+/// database up.
+///
+/// # Why a candidate list rather than an absolute path
+///
+/// The same binary runs from a repo checkout in development and from
+/// `/opt/tickvault` in production. Hardcoding either one breaks the other, and
+/// hardcoding the absolute `/opt/tickvault/repo/...` would additionally make
+/// the function untestable anywhere else. Both relative candidates are tried
+/// in the order that puts the developer's layout first, since that is the one
+/// where a wrong guess is noticed immediately.
+fn resolve_compose_path() -> Option<&'static str> {
+    [DOCKER_COMPOSE_PATH, DEPLOYED_COMPOSE_PATH]
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+}
+
 /// System-wide docker CLI plugin locations probed for the Compose v2 plugin
 /// binary when neither `docker compose` nor `docker-compose` resolves
 /// (issue #1505 — mirrors the `scripts/ensure-questdb.sh` rung-3c ladder).
@@ -337,9 +393,31 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
                  deterministic noise"
             );
         }
+        Some(cli) if resolve_compose_path().is_none() => {
+            // Same reasoning as the missing-CLI arm above: retrying a file that
+            // is not on disk five times is deterministic noise. Until
+            // 2026-08-15 this case fell through to the loop and produced
+            // exactly that — five identical warnings per boot, ~40s of dead
+            // time, and a "recreate churn" counter blaming the wrong cause.
+            metrics::counter!("tv_boot_compose_file_missing_total").increment(1);
+            tracing::error!(
+                compose_cli = cli.label(),
+                candidates = ?[DOCKER_COMPOSE_PATH, DEPLOYED_COMPOSE_PATH],
+                working_dir = ?std::env::current_dir().ok(),
+                "no docker-compose file found at any known layout. This is the \
+                 defect that ran unnoticed in production until 2026-08-15: the \
+                 relative path resolves under a repo checkout but not under the \
+                 deployed /opt/tickvault layout, where the tree lives in repo/. \
+                 The app cannot start QuestDB itself while this is true — it \
+                 has been relying entirely on the deploy workflow and the \
+                 unit's ExecStartPre having already done so. Skipping the \
+                 retry loop: a missing file does not become present on retry"
+            );
+        }
         Some(cli) => {
             info!(
                 compose_cli = cli.label(),
+                compose_file = resolve_compose_path().unwrap_or(DOCKER_COMPOSE_PATH),
                 "resolved Docker Compose front-end"
             );
             for attempt in 1..=COMPOSE_UP_MAX_RETRIES {
@@ -784,7 +862,10 @@ pub async fn container_health_counts() -> (usize, usize) {
     let output = match Command::new(cli.program())
         .args(compose_cli_args(
             cli,
-            DOCKER_COMPOSE_PATH,
+            // Same resolution as the up path — a health count taken against a
+            // missing file reports (0, 0), which reads as "no containers" and
+            // is indistinguishable from "everything is down".
+            resolve_compose_path().unwrap_or(DOCKER_COMPOSE_PATH),
             &["ps", "--format", "{{.Name}} {{.State}}"],
         ))
         .output()
@@ -1013,7 +1094,9 @@ async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> 
     let mut cmd = Command::new(cli.program());
     cmd.args(compose_cli_args(
         cli,
-        DOCKER_COMPOSE_PATH,
+        // Resolved, not the bare constant: on the deployed box the constant
+        // points at a file that does not exist. See `resolve_compose_path`.
+        resolve_compose_path().unwrap_or(DOCKER_COMPOSE_PATH),
         &["up", "-d", "--force-recreate"],
     ));
 
@@ -1683,6 +1766,105 @@ mod tests {
         if path.exists() {
             assert!(path.is_file(), "docker-compose path must be a file");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_compose_path — the deployed-layout defect (prod, 2026-08-15)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_deployed_compose_path_matches_the_systemd_working_directory() {
+        // This is the assertion that would have caught the live defect, and it
+        // is a pure string relationship between two files that must agree:
+        //
+        //   systemd:  WorkingDirectory=/opt/tickvault
+        //   deploy:   git clone ... /opt/tickvault/repo
+        //   ⇒ the compose file is at repo/deploy/docker/docker-compose.yml
+        //
+        // Reading BOTH files rather than asserting a literal, so a change to
+        // either one fails here instead of in production forty seconds into a
+        // boot nobody was watching.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        let unit = std::fs::read_to_string(root.join("deploy/systemd/tickvault.service"))
+            .expect("the systemd unit must be readable");
+        let workdir = unit
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("WorkingDirectory="))
+            .expect("the unit must set WorkingDirectory")
+            .trim()
+            .to_string();
+
+        let deploy = std::fs::read_to_string(root.join(".github/workflows/deploy-aws.yml"))
+            .expect("the deploy workflow must be readable");
+
+        // The workflow clones into <workdir>/repo. If that ever changes, the
+        // relative candidate below is wrong and this test says so by name.
+        let clone_target = format!("{workdir}/repo");
+        assert!(
+            deploy.contains(&clone_target),
+            "the deploy workflow no longer clones into {clone_target}, so \
+             DEPLOYED_COMPOSE_PATH ({DEPLOYED_COMPOSE_PATH}) is resolving \
+             against a layout that no longer exists"
+        );
+
+        assert_eq!(
+            DEPLOYED_COMPOSE_PATH,
+            format!("repo/{DOCKER_COMPOSE_PATH}"),
+            "the deployed candidate must be the repo-relative path prefixed \
+             with the clone directory — anything else silently stops the app \
+             from being able to start its own database"
+        );
+    }
+
+    #[test]
+    fn test_resolve_compose_path_finds_the_file_from_the_repo_root() {
+        // Non-vacuity. Both arms of the resolver return None when neither file
+        // exists, which is also what a broken resolver returns — so prove it
+        // actually finds the real file when run from a layout that has one.
+        //
+        // Guarded on cwd because the test harness's working directory is not
+        // guaranteed; when it IS the repo root, the resolver must succeed.
+        if std::path::Path::new(DOCKER_COMPOSE_PATH).is_file() {
+            assert_eq!(
+                resolve_compose_path(),
+                Some(DOCKER_COMPOSE_PATH),
+                "running from a repo checkout, the resolver must pick the \
+                 checkout path — preferring the deployed one here would break \
+                 every developer machine"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_compose_path_returns_none_when_no_layout_matches() {
+        // The case the production box was in for months. It must be
+        // representable and it must be None — not a path that "looks right"
+        // and fails later inside docker with an exit code nobody reads.
+        let tmp = std::env::temp_dir().join(format!(
+            "tv-compose-resolve-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&tmp).expect("temp dir");
+
+        let prev = std::env::current_dir().ok();
+        // SAFETY: single-threaded scope, restored immediately below. The two
+        // candidate paths are relative, so the only way to exercise the
+        // no-layout case is to stand somewhere that has neither.
+        if std::env::set_current_dir(&tmp).is_ok() {
+            let got = resolve_compose_path();
+            if let Some(p) = prev {
+                let _ = std::env::set_current_dir(p);
+            }
+            assert_eq!(
+                got, None,
+                "a directory with neither candidate must resolve to None so \
+                 the caller can log the candidate list and skip the retry \
+                 loop, instead of retrying a missing file five times"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // -----------------------------------------------------------------------
