@@ -542,13 +542,33 @@ locals {
     # again - after a resubscribe, or when a thin contract simply trades - and
     # "the feed is being heard again" is a real, self-explanatory recovery an
     # operator wants told.
+    # 2026-08-15, SAME DAY as this entry was added: period 300 -> 3600 and
+    # ok_recovery true -> false, after checking what the emit ACTUALLY does in
+    # production rather than what its edge-latch was designed to do.
+    #
+    # Friday 2026-08-14 produced 25 distinct RISK-GAP-03 emits in one session
+    # -- 09:15, then every two to five minutes from 12:59 to 14:53 -- for a
+    # condition that never changed: never_ticked=4 of 4 instruments, all day.
+    # At period 300 with an OK page, that is ~50 operator messages in a day for
+    # one unchanging fact, which is precisely how a pager gets ignored.
+    #
+    # The emit-side re-arm was fixed in the same change (the latch no longer
+    # clears while never_ticked > 0). This is the second half: an hour-long
+    # window collapses any remaining oscillation into ONE alarm state, and the
+    # alarm returns to OK silently via notBreaching once the emits stop.
+    #
+    # ok_recovery = false, reversing the note this entry shipped with. Silence
+    # ending is a real recovery for the INSTRUMENT, but the alarm cannot tell
+    # "the feed is healthy again" from "one sparse contract happened to trade".
+    # An OK page that means the second while reading as the first is worse than
+    # no page at all.
     "risk-gap-03" = {
       pattern     = "{ $.code = \"RISK-GAP-03\" && $.level = \"ERROR\" }"
-      period      = 300
+      period      = 3600
       threshold   = 1
       eval        = 1
       dta         = 1
-      ok_recovery = true # silence genuinely ends - unlike a dropped frame, this recovery is real
+      ok_recovery = false # 2026-08-15: an OK here cannot distinguish a recovered feed from one sparse instrument trading once
       # Kept under the 1024-char alarm_description ceiling INCLUDING the
       # suffix the resource appends (~162 chars) - see the length guard in
       # crates/common/tests/error_code_paging_filter_drift_guard.rs.
