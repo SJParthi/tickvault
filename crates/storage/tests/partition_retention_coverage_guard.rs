@@ -27,31 +27,103 @@ fn string_literals(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extract the VALUE of every `const …TABLE… : &str = "name"` declaration whose
-/// value is a bare table name (no spaces — excludes DDL strings).
-fn table_name_constants(text: &str) -> Vec<String> {
+/// Is this a plausible bare table name — lowercase/digits/underscore only?
+///
+/// This is what excludes DDL strings (spaces, uppercase) from being mistaken
+/// for table names.
+fn looks_like_table_name(val: &str) -> bool {
+    !val.is_empty()
+        && val
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Every `NAME = "value"` pair in a file, for constants whose value is a bare
+/// table name. Used to build the alias-resolution map from `constants.rs`.
+fn table_name_bindings(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if !t.contains("const ") || !t.contains(": &str") {
+            continue;
+        }
+        let Some(name_start) = t.find("const ") else {
+            continue;
+        };
+        let after = &t[name_start + 6..];
+        let Some(colon) = after.find(':') else {
+            continue;
+        };
+        let name = after[..colon].trim().to_string();
+        if let Some(start) = t.find("= \"") {
+            let rest = &t[start + 3..];
+            if let Some(end) = rest.find('"') {
+                let val = &rest[..end];
+                if looks_like_table_name(val) {
+                    out.push((name, val.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Extract the table NAME behind every `const …TABLE… : &str = …` declaration
+/// in a storage module — whether it is written as a string literal or as an
+/// ALIAS of a constant declared in `crates/common/src/constants.rs`.
+///
+/// The alias arm was added 2026-08-15 after a test audit found this guard blind
+/// to the two HIGHEST-VOLUME tables in the system. `TICKS_TABLE` and
+/// `MARKET_DEPTH_TABLE` are both written as
+/// `pub const X_TABLE: &str = QUESTDB_TABLE_X;` — no `= "` on the line — so the
+/// old literal-only extractor skipped them entirely, and the literal they point
+/// at lives in the `common` crate, outside the `src` directory this guard walks.
+///
+/// A guard whose stated purpose is "adding a new data table but forgetting a
+/// retention decision fails the build" was therefore silent about `ticks` and
+/// `market_depth`. Both happened to be covered by hand; nothing forced that.
+fn table_name_constants(text: &str, aliases: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
         let t = line.trim();
         if !t.contains("const ") || !t.contains("TABLE") || !t.contains(": &str") {
             continue;
         }
-        // value between the first `= "` and the next `"`
+        // Arm 1: a direct string literal — `= "foo_audit";`
         if let Some(start) = t.find("= \"") {
             let rest = &t[start + 3..];
             if let Some(end) = rest.find('"') {
                 let val = &rest[..end];
-                if !val.is_empty()
-                    && val
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-                {
+                if looks_like_table_name(val) {
                     out.push(val.to_string());
+                    continue;
                 }
             }
         }
+        // Arm 2: an ALIAS — `= QUESTDB_TABLE_FOO;` — resolved through the map.
+        let Some(eq) = t.find('=') else { continue };
+        let rhs = t[eq + 1..].trim().trim_end_matches(';').trim();
+        // Accept both a bare identifier and a path-qualified one.
+        let ident = rhs.rsplit("::").next().unwrap_or(rhs).trim();
+        if ident.is_empty() || ident.contains(' ') || ident.contains('"') {
+            continue;
+        }
+        if let Some((_, val)) = aliases.iter().find(|(name, _)| name == ident) {
+            out.push(val.clone());
+        }
     }
     out
+}
+
+/// The `NAME -> "table"` map, read from the crate that actually holds the
+/// literals. Resolving aliases needs it; without it arm 2 above is inert.
+fn common_table_aliases() -> Vec<(String, String)> {
+    let constants = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../common/src/constants.rs")
+        .canonicalize()
+        .expect("crates/common/src/constants.rs must exist — the alias map depends on it");
+    let text = fs::read_to_string(&constants).expect("read constants.rs");
+    table_name_bindings(&text)
 }
 
 #[test]
@@ -60,20 +132,37 @@ fn every_storage_table_constant_has_a_retention_decision() {
     let pm =
         fs::read_to_string(src.join("partition_manager.rs")).expect("read partition_manager.rs");
     let covered = string_literals(&pm);
+    let aliases = common_table_aliases();
 
     let mut missing: Vec<String> = Vec::new();
+    let mut seen_any_alias = false;
     for entry in fs::read_dir(&src).expect("read src dir") {
         let path = entry.expect("dir entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
         let text = fs::read_to_string(&path).unwrap_or_default();
-        for tbl in table_name_constants(&text) {
+        for tbl in table_name_constants(&text, &aliases) {
+            if tbl == "ticks" || tbl == "market_depth" {
+                seen_any_alias = true;
+            }
             if !covered.contains(&tbl) {
                 missing.push(format!("{tbl}  (constant in {})", path.display()));
             }
         }
     }
+
+    // NON-VACUITY. The alias arm is the whole point of the 2026-08-15 fix, and
+    // an alias resolver that silently resolves nothing looks exactly like one
+    // that works — the failure mode this guard exists to catch, reproduced
+    // inside the guard itself. `ticks` and `market_depth` are BOTH declared as
+    // aliases, so if neither surfaces, arm 2 is dead.
+    assert!(
+        seen_any_alias,
+        "the alias resolver found neither `ticks` nor `market_depth` — both are declared as \
+         `pub const X_TABLE: &str = QUESTDB_TABLE_X;`, so arm 2 of table_name_constants has \
+         stopped resolving and this guard is once again blind to the two highest-volume tables"
+    );
 
     assert!(
         missing.is_empty(),
@@ -92,11 +181,56 @@ fn guard_helpers_are_sane() {
         const BAR_DDL: &str = "CREATE TABLE x ( a int )";
         let xs = &["foo_audit", "kept"];
     "#;
-    assert_eq!(table_name_constants(sample), vec!["foo_audit".to_string()]);
+    let no_aliases: Vec<(String, String)> = Vec::new();
+    assert_eq!(
+        table_name_constants(sample, &no_aliases),
+        vec!["foo_audit".to_string()]
+    );
     assert!(string_literals(sample).contains(&"foo_audit".to_string()));
     assert!(string_literals(sample).contains(&"kept".to_string()));
     // the DDL string (has spaces/uppercase) must NOT be treated as a table name
-    assert!(!table_name_constants(sample).iter().any(|t| t.contains(' ')));
+    assert!(
+        !table_name_constants(sample, &no_aliases)
+            .iter()
+            .any(|t| t.contains(' '))
+    );
+
+    // ARM 2 self-test — the alias form that made this guard blind to `ticks`
+    // and `market_depth` until 2026-08-15. Without the alias map it must
+    // resolve to NOTHING (proving the old behaviour); with it, to the name.
+    let aliased = r#"pub const TICKS_TABLE: &str = QUESTDB_TABLE_TICKS;"#;
+    assert!(
+        table_name_constants(aliased, &no_aliases).is_empty(),
+        "premise: with no alias map an aliased const is invisible — this is exactly \
+         the blindness the fix removes"
+    );
+    let map = vec![("QUESTDB_TABLE_TICKS".to_string(), "ticks".to_string())];
+    assert_eq!(
+        table_name_constants(aliased, &map),
+        vec!["ticks".to_string()],
+        "arm 2 must resolve an aliased table constant through the common-crate map"
+    );
+
+    // The binding extractor that BUILDS that map.
+    let decls = r#"
+        pub const QUESTDB_TABLE_TICKS: &str = "ticks";
+        pub const SOME_DDL: &str = "CREATE TABLE x ( a int )";
+    "#;
+    let bindings = table_name_bindings(decls);
+    assert_eq!(
+        bindings,
+        vec![("QUESTDB_TABLE_TICKS".to_string(), "ticks".to_string())],
+        "table_name_bindings must capture the name->value pair and skip DDL strings"
+    );
+
+    // The real map must be non-empty, or every alias silently resolves to
+    // nothing and arm 2 is decoration.
+    assert!(
+        common_table_aliases()
+            .iter()
+            .any(|(n, _)| n.starts_with("QUESTDB_TABLE_")),
+        "constants.rs yielded no QUESTDB_TABLE_* bindings — the alias map is empty"
+    );
 }
 
 /// The 21 live candle tables are swept by iterating `candle_table_names()` (the

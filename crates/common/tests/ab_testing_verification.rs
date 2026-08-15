@@ -137,14 +137,21 @@ mod config_drift_detection {
         );
     }
 
-    /// DRIFT-15: Minimum valid exchange timestamp.
-    #[test]
-    fn drift_minimum_exchange_timestamp() {
-        assert!(
-            MINIMUM_VALID_EXCHANGE_TIMESTAMP > 946_684_799,
-            "Min timestamp should be >= 2000-01-01"
-        );
-    }
+    // DRIFT-15 (minimum valid exchange timestamp) was REMOVED 2026-08-15 with
+    // the constant it tested. It asserted `MINIMUM_VALID_EXCHANGE_TIMESTAMP >
+    // 946_684_799` — i.e. that a constant declared as exactly 946_684_800 was
+    // greater than 946_684_799, three files away from its own declaration. It
+    // could not fail, and the constant it "verified" had zero production
+    // references, so a passing DRIFT-15 raised the apparent assurance of a
+    // bound nothing consulted.
+    //
+    // The live bounds are `MIN_PLAUSIBLE_EXCHANGE_TS_SECS` /
+    // `MAX_PLAUSIBLE_EXCHANGE_TS_SECS` on the aggregator. They cannot be
+    // asserted from THIS crate (common cannot depend on trading), so the
+    // replacement assertion lives in
+    // `crates/app/tests/pipeline_smoke.rs::test_minimum_valid_exchange_timestamp_positive`,
+    // which can reach them. Deliberately not re-created here as a duplicated
+    // literal — that is how the two-constants-one-bound hazard starts.
 
     /// DRIFT-16: Data API error codes match Dhan annexure.
     #[test]

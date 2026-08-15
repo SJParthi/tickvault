@@ -4,9 +4,7 @@
 //! verify that key types from dependencies compile and behave as expected.
 
 use tickvault_common::config::NseHolidayEntry;
-use tickvault_common::constants::{
-    DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
-};
+use tickvault_common::constants::{DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS};
 use tickvault_common::trading_calendar::TradingCalendar;
 
 // ---------------------------------------------------------------------------
@@ -30,10 +28,30 @@ fn test_dedup_ring_buffer_power_in_valid_range() {
 
 #[test]
 fn test_minimum_valid_exchange_timestamp_positive() {
-    // Must be > 0 (some epoch after Unix epoch start)
-    const { assert!(MINIMUM_VALID_EXCHANGE_TIMESTAMP > 0) };
-    // Must be before year 2040 (~2208988800)
-    const { assert!(MINIMUM_VALID_EXCHANGE_TIMESTAMP < 2_208_988_800) };
+    // REPOINTED 2026-08-15. This used to assert
+    // `MINIMUM_VALID_EXCHANGE_TIMESTAMP > 0` and `< 2_208_988_800` against a
+    // constant that had ZERO production references — a bound compared to its
+    // own literal, which cannot fail and guarded nothing. That constant is
+    // retired; see the note at its former declaration in `constants.rs`.
+    //
+    // The bounds that are ACTUALLY consulted, per tick, live on the aggregator.
+    // Asserting them here keeps a real invariant: the window must be ordered,
+    // must exclude the zero-filled-packet range, and must not have drifted
+    // forward past dates we already hold data for.
+    use tickvault_trading::candles::multi_tf_aggregator::{
+        MAX_PLAUSIBLE_EXCHANGE_TS_SECS, MIN_PLAUSIBLE_EXCHANGE_TS_SECS,
+    };
+    const { assert!(MIN_PLAUSIBLE_EXCHANGE_TS_SECS < MAX_PLAUSIBLE_EXCHANGE_TS_SECS) };
+    // A corrupt or zero-filled packet produces 0 or a few thousand; the floor
+    // must sit far above that.
+    const { assert!(MIN_PLAUSIBLE_EXCHANGE_TS_SECS > 1_000_000_000) };
+    // ...and not so far above that it rejects data this system already holds.
+    // 2026-01-01 = 1_767_225_600.
+    const { assert!(MIN_PLAUSIBLE_EXCHANGE_TS_SECS < 1_767_225_600) };
+    // An all-ones LTT (~4.29e9, year 2106) must fall OUTSIDE the ceiling — it
+    // drives the event-time watermark, and accepting it force-seals the entire
+    // live book.
+    const { assert!(MAX_PLAUSIBLE_EXCHANGE_TS_SECS < u32::MAX) };
 }
 
 // ---------------------------------------------------------------------------

@@ -766,6 +766,7 @@ jobs:
           expected=$(LC_ALL=C sort <<'EOF'
           crates/app/tests/dhat_live_ingest_seam.rs
           crates/app/tests/dhat_mark_forward.rs
+          crates/app/tests/dhat_ws_lag.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_cadence_decide.rs
           crates/core/tests/dhat_depth_packet_zero_alloc.rs
@@ -775,6 +776,7 @@ jobs:
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_truedata_decode_zero_alloc.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
+          crates/storage/tests/dhat_depth_append_zero_alloc.rs
           crates/trading/tests/dhat_multi_tf_fold.rs
           crates/trading/tests/dhat_risk_engine.rs
           EOF
@@ -864,12 +866,44 @@ jobs:
             exit 1
           fi
 
-      # DHAT (storage) step RETIRED (stage-2 dead-WS sweep, 2026-07-17):
-      # all 3 storage dhat targets (dhat_tick_flush_offload,
-      # dhat_tick_persistence, dhat_tick_row_builder) died with the deleted
-      # tick chain — the storage crate currently has ZERO dhat targets. The
-      # drift-check step above still fails loudly if a new storage dhat
-      # file appears without a matching cargo test step being re-added here.
+      # DHAT (storage) — RETIRED 2026-07-17, RE-ADDED 2026-08-15.
+      #
+      # The stage-2 dead-WS sweep deleted all 3 storage dhat targets
+      # (dhat_tick_flush_offload, dhat_tick_persistence, dhat_tick_row_builder)
+      # with the dead tick chain, leaving the crate with zero, so this step was
+      # removed. The retirement note said: "the drift-check step above still
+      # fails loudly if a new storage dhat file appears without a matching
+      # cargo test step being re-added here."
+      #
+      # That is EXACTLY what happened. dhat_depth_append_zero_alloc landed on
+      # disk and the drift check failed the lane on the first push — the
+      # prediction and the guard both held, which is worth recording because
+      # this same class (a dhat target on disk running in no lane) had already
+      # rotted for ~2 weeks once before, undetected, and is why the drift check
+      # exists at all.
+      #
+      # The target measures DepthWriter::append_row, the highest-frequency
+      # persistence call in the live lane: depth-200 emits up to 400 rows per
+      # instrument update, ~10,200 rows per update cycle across the authorized
+      # pools, against the tick path's one row per packet. Feature-UNGATED
+      # (house pattern), so Test (storage) also runs it; this lane is the
+      # allocation-ratchet authority.
+      - name: DHAT (storage)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tickvault-storage \
+            --test dhat_depth_append_zero_alloc \
+            2>&1 | tee /tmp/dhat-storage.log
+          if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
+            echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
+            exit 1
+          fi
+          ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
+          if [ "$ran" -ne 1 ]; then
+            echo "::error::storage DHAT step executed $ran targets, expected 1 — a --test flag was dropped from this step."
+            exit 1
+          fi
 
       - name: DHAT (trading)
         shell: bash
@@ -909,6 +943,7 @@ jobs:
           cargo test -p tickvault-app \
             --test dhat_live_ingest_seam \
             --test dhat_mark_forward \
+            --test dhat_ws_lag \
             2>&1 | tee /tmp/dhat-app.log
           if grep -q 'running 0 tests' /tmp/dhat-app.log; then
             echo "::error::an app dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."

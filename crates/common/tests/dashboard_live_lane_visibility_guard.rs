@@ -54,14 +54,28 @@ const DASHBOARD: &str = "deploy/aws/terraform/dashboard.tf";
 /// Each entry must carry a reason. "We forgot" is not one of them — that is
 /// the case this guard exists to catch, and it looks identical to a deliberate
 /// omission until somebody writes down which it is.
-const DELIBERATELY_NOT_CHARTED: &[(&str, &str)] = &[(
-    "tv_dhan_ws_lag_excluded_total",
-    "counts lag SAMPLES excluded from the p99 (stale/negative exchange \
+const DELIBERATELY_NOT_CHARTED: &[(&str, &str)] = &[
+    (
+        "tv_dhan_feed_depth_total",
+        "SHIPPED but neither charted nor alarmed, and that is #1751's own \
+         recorded decision rather than an oversight: paging on it is a new \
+         Dhan-scoped alert, which dhan-rest-only-noise-lock-2026-07-14.md §3 \
+         REJECTs without a dated row in THAT file first. Charting it here \
+         would be the better half of the fix and is a one-widget follow-up; \
+         listing it keeps the gap WRITTEN DOWN in the meantime, which is the \
+         entire point of this list. It carries an `outcome` label whose \
+         `refused` and `dropped` values answer 'did a depth level that \
+         arrived fail to reach the table' — the two worth a chart first.",
+    ),
+    (
+        "tv_dhan_ws_lag_excluded_total",
+        "counts lag SAMPLES excluded from the p99 (stale/negative exchange \
      timestamps), not ticks lost. It is a quality qualifier for a histogram \
      that is deliberately NOT EMF-shipped, so charting it alone would show a \
      correction with nothing to correct. It belongs beside the lag histogram \
      on the /metrics endpoint, where the histogram actually lives.",
-)];
+    ),
+];
 
 /// Extract the EMF `metric_selectors` names from the deployed agent config.
 fn emf_selected_names(user_data: &str) -> Vec<String> {
@@ -107,6 +121,35 @@ fn every_published_live_lane_metric_is_visible_somewhere() {
     let selected = emf_selected_names(&read(USER_DATA));
     let dashboard = read(DASHBOARD);
 
+    // ALARMS COUNT AS VISIBLE, and until 2026-08-15 this guard did not look at
+    // them — while its own failure message said "and are in no alarm".
+    //
+    // That is a false claim inside a guard whose entire purpose is catching
+    // false claims, and it is not harmless: it sends the reader hunting for a
+    // missing alarm that already exists. It surfaced on the merge with #1751,
+    // which added `tv_dhan_live_universe_fallback_total` and
+    // `tv_dhan_ws_alive_connections` WITH alarms and no chart — correctly
+    // visible, wrongly reported.
+    //
+    // The test is named `..._is_visible_somewhere`. An alarm IS somewhere: a
+    // metric that pages an operator is not money spent on a number nobody
+    // sees. Charted-or-alarmed is the property; charted-only was a bug.
+    let alarms: String = std::fs::read_dir(repo_root().join("deploy/aws/terraform"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "tf"))
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    assert!(
+        alarms.contains("aws_cloudwatch_metric_alarm"),
+        "the terraform scan found no alarm definitions at all — the alarm half \
+         of this check would pass vacuously and re-create the exact blind spot \
+         it was added to close"
+    );
+
     let lane_metrics: Vec<&String> = selected
         .iter()
         .filter(|n| n.starts_with("tv_dhan_"))
@@ -119,9 +162,13 @@ fn every_published_live_lane_metric_is_visible_somewhere() {
         // quoted form is the right thing to look for: comments in this file
         // never quote the metric.
         let charted = dashboard.contains(&format!("\"{name}\""));
+        // `metric_name = "..."` is the alarm form; a bare comment mention is
+        // not, so the quoted form is again what distinguishes them.
+        let alarmed = alarms.contains(&format!("metric_name         = \"{name}\""))
+            || alarms.contains(&format!("metric_name = \"{name}\""));
         let excused = DELIBERATELY_NOT_CHARTED.iter().any(|(m, _)| m == *name);
 
-        if !charted && !excused {
+        if !charted && !alarmed && !excused {
             invisible.push((*name).clone());
         }
     }
