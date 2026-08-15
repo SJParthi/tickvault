@@ -1034,3 +1034,103 @@ exists to stop.
 - Dials depth sockets whose frames still have no consumer, or reports an
   instrument-less depth pool as "enabled".
 - Claims any of this is working before a non-zero `compared`.
+
+### 2026-08-15 (SAME DAY, SECOND QUOTE) — DEPTH IS CAPTURED IN FULL, INTO ONE COMMON TABLE; NOTHING IS DROPPED
+
+**The verbatim operator demand (2026-08-15, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "nope mtoehrufcker we ened depth 20 and dpeth 200 shdou lbe shwon and vsisibil in one common atbek dude we need all of them eevry ticks dude okay? we need everyhtign we cnanot miss or hdi or wipe fof nayhtign dude okay?"
+
+Given in DIRECT response to a message that had recommended the opposite — it
+reported that depth-200 persistence "fills 100 GB in 1.6–6.5 days" and offered
+top-5 levels, derived aggregates, or sampled snapshots as alternatives. The
+operator read that and rejected all three. **This section overrules that
+recommendation.** It is recorded here rather than argued, because the cost is
+the operator's to accept and he has accepted it explicitly.
+
+#### What this authorizes
+
+| Surface | Before this quote | Now |
+|---|---|---|
+| depth-20 frames | captured to WAL, counted `depth_unconsumed`, **discarded** | **PERSISTED IN FULL** — all 20 levels, both sides, every update |
+| depth-200 frames | same — captured then discarded | **PERSISTED IN FULL** — all 200 levels, both sides, every update |
+| Destination | none — the writers were deleted with the earlier live-feed retirements | **ONE COMMON TABLE** carrying both depths together |
+| Sampling / truncation / top-N | recommended | **FORBIDDEN.** "we cannot miss or hide or wipe off anything" |
+
+#### The DEDUP key finding — the one thing that would have silently "wiped off" data
+
+A single table holding both depths is only safe if the DEDUP key distinguishes
+them. depth-20 and depth-200 both emit a level 5 bid for the same instrument at
+the same timestamp, and those are DIFFERENT observations from DIFFERENT sockets.
+A key of `(ts, security_id, exchange_segment, feed, side, level)` makes them
+collide, and QuestDB's UPSERT semantics mean **one silently overwrites the
+other** — the exact "wipe off" this quote forbids, produced by the schema rather
+than by any code path.
+
+**BINDING:** the common depth table's DEDUP key MUST carry a depth-kind
+discriminator (`d20` / `d200`) alongside the I-P1-11 composite and `feed`. A PR
+that ships this table without it is a REJECT, regardless of how the writer
+behaves.
+
+#### The honest cost — arithmetic, not a warning
+
+Row width ≈ 68 B. depth-20 emits 40 rows/update (20 levels × 2 sides);
+depth-200 emits 400.
+
+| Pool | Instruments | Rows/update | At 1 update/s | At 5 updates/s |
+|---|---|---|---|---|
+| depth-20 | 250 | 40 | 58.8 GB/day | 294 GB/day |
+| depth-200 | 5 | 400 | 11.7 GB/day | 58.8 GB/day |
+| **Total** | | | **≈ 70 GB/day** | **≈ 350 GB/day** |
+
+**The 250-instrument depth-20 pool dominates, not depth-200.** That inverts the
+intuition the earlier recommendation was built on: the 5 deep sockets are the
+cheap half. The update rate is the unmeasured multiplier and swings the answer
+5×; it is **Assumed**, and the first live session measures it.
+
+Against a **100 GB root**, that is **~1.4 days at the low estimate and ~7 hours
+at the high one.** gp3 grows online in one command and `variables.tf` permits up
+to 200 GB, which buys ~3 days at the low rate — it does not solve the problem, it
+moves it.
+
+#### How "nothing is dropped" is actually delivered
+
+Capturing everything and keeping everything on EBS are different requirements,
+and only the first is what the operator asked for. The mechanism that satisfies
+this quote without a disk that cannot exist:
+
+**Same-day S3 archival.** `partition_archive.rs` already implements
+archive → verify → drop against the S3 cold bucket; today it runs at >90 days.
+The depth table registers with a same-day (or same-hour) partition policy: every
+row is written, verified in S3, and only then dropped from EBS. **Nothing is
+missed, hidden, or wiped — the hot window on local disk is simply short.** A
+drop that has not been verified in S3 first is a REJECT.
+
+Storage cost is real and belongs in front of the operator rather than inside a
+follow-up: ~70 GB/day is ~2.1 TB/month. In S3 Standard that is ~$48/mo — over
+half the current AWS ceiling on its own. In Glacier Instant Retrieval it is
+~$8/mo; in Deep Archive ~$2/mo. **The storage-class choice is therefore an
+operator decision, not an implementation detail**, and it changes the bill by
+24×. At the 5-updates/sec end every figure multiplies by five.
+
+#### What this quote does NOT change
+
+- The 16-connection budget and the four endpoint types. Unchanged.
+- `dry_run` stays true; no live order fire; the §28 frozen area is untouched.
+- The per-minute REST legs keep running (the 2026-08-11 second-quote KEEP).
+- The finding that **depth needs tradeable contract security-ids**, and that the
+  only sanctioned source is the already-running option-chain pull's per-leg
+  `security_id` (2026-08-11 second quote). Persisting depth does not create
+  instruments to subscribe; that constraint stands.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships the common depth table without a depth-kind discriminator in the DEDUP
+  key (silent overwrite between the two pools).
+- Persists top-N levels, sampled snapshots, or derived aggregates INSTEAD of the
+  full book — explicitly rejected by this quote.
+- Drops an EBS partition that has not been verified present in S3 first.
+- Opens depth sockets before the writer exists (the previous section's binding
+  rule stands — a captured-then-discarded frame is still a discarded frame).
+- Reports depth as "captured" while `depth_unconsumed` is still incrementing.
