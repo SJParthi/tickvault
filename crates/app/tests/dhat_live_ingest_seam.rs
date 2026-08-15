@@ -66,7 +66,31 @@ const FOLDS: u64 = 10_000;
 
 /// Ceilings. Deliberately generous in absolute terms and tight in SCALING
 /// terms: 10,000 folds may not cost 10,000 allocations.
-const MAX_BLOCKS: u64 = 512;
+// MEASURED, and deliberately NOT called zero-alloc.
+//
+// This was 512 while the fixtures carried a 1970 timestamp, so every tick was
+// refused and the gate measured the REFUSAL path — 276 blocks for work that
+// never happened. With real session timestamps the fold actually runs, and it
+// allocates ~5,100 blocks per 10,000 ticks: roughly one every two ticks.
+//
+// That is a REAL FINDING about the seam, not a budget to wave through, and it
+// is recorded rather than absorbed: the fold path allocates per tick today.
+// Chasing it needs a DHAT breakdown by call site and is beyond this change.
+//
+// So this is a RATCHET at the measured rate, not a zero-allocation claim. It
+// still catches a doubling — the 2026-08-14 regression added ~1 block per tick,
+// which would land near 15,000 and fail this by 2x. It does not certify the
+// seam as allocation-free, and no comment here should be read as saying so.
+const MAX_BLOCKS: u64 = 7_000;
+
+/// An exchange timestamp inside a real trading session (epoch seconds).
+///
+/// Load-bearing, not decoration: the aggregator refuses a tick whose stamp is
+/// implausible, and a small literal like `1_000` is January 1970. A frame built
+/// with one parses perfectly and is then refused, so the gate measures the
+/// refusal path instead of the fold — quietly, because a refusal allocates less
+/// and the budget still looks nearly met.
+const SESSION_EPOCH_SECS: u32 = 1_786_800_000;
 
 /// A tick shaped like a real Quote packet for one of the index instruments.
 fn tick(security_id: u64, price: f32, exchange_ts: u32) -> ParsedTick {
@@ -79,8 +103,17 @@ fn tick(security_id: u64, price: f32, exchange_ts: u32) -> ParsedTick {
     }
 }
 
+/// Serialised against the frame gate below.
+///
+/// `dhat::Profiler` is PROCESS-global. Two profiled tests running concurrently
+/// in the same binary measure each other, which is why this pair reported
+/// 5,114 then 10,515 blocks for identical work on consecutive runs. The lock
+/// makes each measurement see only its own allocations.
+static DHAT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn ingest_tick_seam_does_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
 
     // WARM-UP, OUTSIDE the measured window. First touch of an instrument
@@ -89,7 +122,7 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
     // would make this gate fail for the wrong reason and teach the next reader
     // to raise the budget instead of finding the leak.
     for i in 0..4u64 {
-        let _ = ingest.ingest_tick_at(&tick(13 + i, 100.0, 1_000), i as u64, 0, 1_000);
+        let _ = ingest.ingest_tick_at(&tick(13 + i, 100.0, SESSION_EPOCH_SECS), i as u64, 0, 1_000);
     }
 
     let profiler = dhat::Profiler::builder().testing().build();
@@ -100,7 +133,13 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
         let t = tick(
             13 + (n % 4),
             100.0 + (n % 97) as f32 * 0.05,
-            1_000 + (n % 600) as u32,
+            // See SESSION_EPOCH_SECS. This gate shipped with `1_000` — January
+            // 1970 — so the aggregator refused every tick and the budget was
+            // measuring the REFUSAL path, not the fold it was written to gate.
+            // Its non-vacuity companion did not catch that, because a slot is
+            // allocated before the refusal, so `tracked_instruments()` grows
+            // either way. Found 2026-08-15 while diagnosing the frame gate.
+            SESSION_EPOCH_SECS + (n % 600) as u32,
         );
         let _ = ingest.ingest_tick_at(&t, n, (n % 3) as u32, 1_000 + n);
     }
@@ -188,6 +227,7 @@ fn gate_is_not_vacuous() {
 /// same 512-block ceiling applies and means the same thing.
 #[test]
 fn frame_drain_seam_does_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
     use tickvault_core::websocket::pool_budget::DhanEndpointType;
     use tickvault_core::websocket::pool_supervisor::CapturedFrame;
@@ -214,7 +254,16 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
             bytes.extend_from_slice(&quote_packet(
                 13 + i,
                 100.0 + (n % 97) as f32 * 0.05,
-                1_000 + (n % 600) as u32,
+                // A REAL epoch inside a trading session, not a small literal.
+                //
+                // The first version used `1_000 + …`, i.e. January 1970, and
+                // the aggregator refused every tick as a garbage timestamp —
+                // `AggregatorRefused`, never `Folded`. The allocation budget
+                // then measured the REFUSAL path, which allocates far less
+                // than the fold it claims to gate: 1,536 blocks that would
+                // have looked like a near-pass rather than a broken test.
+                // The non-vacuity companion is what caught it.
+                SESSION_EPOCH_SECS + (n % 600) as u32,
             ));
         }
         CapturedFrame {
@@ -236,15 +285,25 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
 
     const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks, as above
 
+    // EVERY FIXTURE BUILT BEFORE THE PROFILER STARTS.
+    //
+    // The first version of this test called `frame(...)` inside the measured
+    // loop and CI reported 12,500 blocks against a 512 budget. That number was
+    // the harness, not the code: `frame` does one `Vec::with_capacity` plus
+    // four `vec![0u8; 50]`, so 2,500 x 5 = 12,500 exactly, and 1,000,000 bytes
+    // is 2,500 x 400. The arithmetic matched the fixture perfectly.
+    //
+    // A test that measures its own setup is worse than no test: it reports a
+    // per-tick allocation that does not exist, and the natural response is to
+    // raise the budget until it passes — which would leave the seam
+    // permanently unguarded while looking guarded. The fold gate above never
+    // had this problem because its fixture is a plain struct that never
+    // touches the heap; a frame is bytes, so it must be built up front.
+    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(100 + n, n)).collect();
+
     let profiler = dhat::Profiler::builder().testing().build();
-    for n in 0..FRAMES {
-        let _ = drain_main_feed_frame(
-            &mut ingest,
-            &frame(100 + n, n),
-            1_000_000 + n as i64,
-            1_000 + n,
-            c,
-        );
+    for (n, f) in frames.iter().enumerate() {
+        let _ = drain_main_feed_frame(&mut ingest, f, 1_000_000 + n as i64, 1_000 + n as u64, c);
     }
     let stats = dhat::HeapStats::get();
     drop(profiler);
@@ -277,7 +336,7 @@ fn frame_drain_gate_is_not_vacuous() {
     buf[1..3].copy_from_slice(&50u16.to_le_bytes());
     buf[4..8].copy_from_slice(&13u32.to_le_bytes());
     buf[8..12].copy_from_slice(&100.5f32.to_le_bytes());
-    buf[14..18].copy_from_slice(&1_000u32.to_le_bytes());
+    buf[14..18].copy_from_slice(&SESSION_EPOCH_SECS.to_le_bytes());
 
     let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
     assert_eq!(
@@ -302,7 +361,7 @@ fn frame_drain_gate_is_not_vacuous() {
     assert_eq!(
         out.folded, 1,
         "the frame walk must fold the packet it was given — otherwise the \
-         allocation budget above is measuring an empty loop"
+         allocation budget above is measuring an empty loop. outcome={out:?}"
     );
     assert!(ingest.tracked_instruments() > 0);
 }
