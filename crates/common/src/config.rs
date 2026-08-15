@@ -264,11 +264,6 @@ pub struct ApplicationConfig {
     /// opts in.
     #[serde(default)]
     pub dhan_universe: DhanUniverseConfig,
-    /// `[dhan_wal_replay]` — boot-time re-fold of live-feed frames captured by
-    /// a session that died. Absent section ⇒ DISABLED (fail-safe default off);
-    /// `config/base.toml` opts in.
-    #[serde(default)]
-    pub dhan_wal_replay: DhanWalReplayConfig,
     /// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
     /// 2026-07-14, `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
     /// §39). GATE 1 of the 4-gate live-fire lattice: every key default-OFF, so
@@ -2009,67 +2004,6 @@ impl Default for DhanUniverseConfig {
             target_secs_of_day_ist: default_dhan_universe_target_secs(),
             retry_backoff_cap_secs: default_dhan_universe_backoff_cap_secs(),
             live_subscription_from_master: false,
-        }
-    }
-}
-
-/// `[dhan_wal_replay]` — boot-time re-fold of captured live-feed frames.
-///
-/// # What this exists to end
-///
-/// Every frame the live lane receives is written to a write-ahead log BEFORE
-/// it is parsed or broadcast. That is the durability floor the whole design
-/// rests on — and until now the log was write-only. On boot the staged
-/// live-feed frames were counted, logged, and DROPPED, because "the fold path
-/// takes a live ring, not a replay batch". So every claim of the form "the
-/// ring refused it, but replay recovers it" was false, and a session that died
-/// mid-market lost every frame captured since its last flush.
-///
-/// # Why it is safe to turn on
-///
-/// Two properties, neither of them optional:
-///
-/// 1. **Replay-stable sequences.** Each frame carries the `frame_seq` it was
-///    written with, and the per-packet `capture_seq` derives from it
-///    deterministically. So a re-folded row lands on the SAME DEDUP key
-///    (`ts, security_id, segment, capture_seq, feed`) as the original and
-///    collapses into it. Re-folding rows that already persisted is a no-op,
-///    which is what makes an unconditional boot-time replay safe rather than a
-///    double-count.
-/// 2. **Ticks only, never candles.** The re-fold does not run the aggregator.
-///    A crashed session's WAL holds a TAIL, not a whole minute, so folding it
-///    into candles could compute a bar from fewer ticks than the original and
-///    overwrite a good candle with a worse one — silent corruption dressed as
-///    recovery. Raw ticks have no such hazard: a row is a row. Candles for a
-///    recovered window are rebuilt from the ticks, not from this path.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DhanWalReplayConfig {
-    /// Master switch. Default OFF so an absent section is byte-identical to
-    /// the pre-feature boot.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Hard ceiling on frames re-folded in one boot.
-    ///
-    /// Boot is a latency-sensitive window — the box starts at 08:30 IST and
-    /// the market opens at 09:15 — so an unbounded replay of a large archive
-    /// could delay the lane past the open, trading a recovered tail for a
-    /// missed session. Beyond the cap the remaining frames are left staged and
-    /// reported, never silently discarded.
-    #[serde(default = "default_wal_replay_max_frames")]
-    pub max_frames: usize,
-}
-
-/// 200,000 frames ≈ several minutes of peak capture, well inside a boot budget.
-fn default_wal_replay_max_frames() -> usize {
-    200_000
-}
-
-impl Default for DhanWalReplayConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_frames: default_wal_replay_max_frames(),
         }
     }
 }
@@ -4566,7 +4500,6 @@ mod tests {
             order_leg_pnl: OrderLegPnlConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             dhan_universe: DhanUniverseConfig::default(),
-            dhan_wal_replay: DhanWalReplayConfig::default(),
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
