@@ -1216,6 +1216,10 @@ impl DrainCounters {
 /// built its own counters would measure a different function than the one that
 /// ships, and the whole reason these handles exist is that resolving a metric
 /// key per frame allocates.
+// A OnceLock accessor over metrics handles: no branch to assert. Its REASON to
+// be pub is exercised by dhat_live_ingest_seam.rs, which drives
+// drain_main_feed_frame with these exact handles.
+// TEST-EXEMPT: OnceLock accessor with no branch; its purpose is covered by dhat_live_ingest_seam.rs
 pub fn counters() -> &'static DrainCounters {
     static COUNTERS: std::sync::OnceLock<DrainCounters> = std::sync::OnceLock::new();
     COUNTERS.get_or_init(|| DrainCounters {
@@ -1982,6 +1986,9 @@ pub const FLUSH_INTERVAL: std::time::Duration =
 /// response measured `ingest_tick_at` alone, so the exact function it was
 /// built for sat one line outside it. Exposing this closes that gap:
 /// `dhat_live_ingest_seam.rs` now measures the whole frame walk.
+// The guard matches tests BY NAME, and the two that drive this function are
+// named for the seam they gate rather than for the callee.
+// TEST-EXEMPT: driven directly by dhat_live_ingest_seam.rs — frame_drain_seam_does_not_allocate_per_tick + frame_drain_gate_is_not_vacuous
 pub fn drain_main_feed_frame(
     ingest: &mut LiveIngest,
     frame: &CapturedFrame,
