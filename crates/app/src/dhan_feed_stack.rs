@@ -95,7 +95,7 @@ use tickvault_common::constants::{
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
-use tickvault_common::types::ExchangeSegment;
+use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::auth::token_manager::global_token_manager;
 use tickvault_core::parser::ParsedFrame;
 use tickvault_core::parser::depth::{
@@ -122,6 +122,7 @@ use tickvault_storage::depth_persistence::{
 };
 use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
+use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
 use tickvault_trading::candles::{BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator};
 use tracing::{debug, error, info, warn};
 
@@ -382,9 +383,88 @@ pub fn build_feed_stack_plan(
         (DhanEndpointType::Depth20, depth_20),
         (DhanEndpointType::Depth200, depth_200),
     ] {
-        plan_pool(pool, now, endpoint, set, &mut plan)?;
+        let (deduped, duplicates) = dedup_subscribe_set(set);
+        if duplicates > 0 {
+            // Loud, because a duplicate is never harmless here. It burns one of
+            // Dhan's per-connection wire slots, and it makes the planner's count
+            // disagree with the aggregator's — which keys on
+            // `(Feed, security_id, segment)` and collapses them to one slot. The
+            // planner counting higher than the aggregator is how a set that
+            // "fits" turns into refused slots at fold time.
+            error!(
+                code = ErrorCode::InstrumentP1CrossSegmentCollision.code_str(),
+                endpoint = endpoint.as_str(),
+                submitted = set.len(),
+                unique = deduped.len(),
+                duplicates,
+                "duplicate instruments in the Dhan subscribe set — the same \
+                 (security_id, exchange_segment) appeared more than once (I-P1-11). \
+                 Subscribing the UNIQUE set; each duplicate would otherwise consume a \
+                 wire slot and inflate the planner's count above what the aggregator \
+                 actually allocates"
+            );
+        }
+        plan_pool(pool, now, endpoint, &deduped, &mut plan)?;
     }
     Ok(plan)
+}
+
+/// Removes repeated `(security_id, exchange_segment)` pairs, preserving order.
+///
+/// Returns the unique set and how many entries were dropped.
+///
+/// **`security_id` ALONE is not the key** (I-P1-11): Dhan reuses one numeric id
+/// across segments, so `13` is NIFTY on `IDX_I` and a different instrument on
+/// `NSE_EQ`. Deduping on the id alone would silently unsubscribe a real
+/// instrument — worse than the duplicate it set out to remove.
+///
+/// Cold path (boot), so the transient `HashSet` is not a hot-path allocation.
+/// O(n) average.
+#[must_use]
+pub fn dedup_subscribe_set(set: &[SubscribeInstrument]) -> (Vec<SubscribeInstrument>, usize) {
+    let mut seen: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+        std::collections::HashSet::with_capacity(set.len());
+    let mut out = Vec::with_capacity(set.len());
+    for inst in set {
+        if seen.insert((inst.security_id, inst.segment)) {
+            out.push(*inst);
+        }
+    }
+    let duplicates = set.len().saturating_sub(out.len());
+    (out, duplicates)
+}
+
+/// The number of distinct instruments the fold must allocate a slot for,
+/// across ALL THREE pools.
+///
+/// **Not the sum of the three lengths**, which is what the sizing used to be
+/// and which is wrong in both directions at once. The aggregator, the gap
+/// detector and the day-OHLC tracker all key on
+/// `(Feed, security_id, exchange_segment)` — so a NIFTY option that is
+/// subscribed on the main feed AND on depth-20 is **one** slot, not two. The
+/// old `main.len() + depth_20.len() + depth_200.len()` counted it twice, which
+/// inflated the sizing toward the 25,000 ceiling for instruments that need no
+/// extra slot at all.
+///
+/// Getting this wrong is not a rounding error: `plan_pool` refuses the ENTIRE
+/// endpoint when the count does not fit, so an inflated count can take a whole
+/// pool dark for capacity the process was never going to use.
+#[must_use]
+pub fn distinct_fold_slots(
+    main_feed: &[SubscribeInstrument],
+    depth_20: &[SubscribeInstrument],
+    depth_200: &[SubscribeInstrument],
+) -> usize {
+    let mut seen: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+        std::collections::HashSet::with_capacity(
+            main_feed.len() + depth_20.len() + depth_200.len(),
+        );
+    for set in [main_feed, depth_20, depth_200] {
+        for inst in set {
+            seen.insert((inst.security_id, inst.segment));
+        }
+    }
+    seen.len()
 }
 
 fn plan_pool(
@@ -3357,9 +3437,35 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     };
 
     // ---- the fold ----------------------------------------------------------
-    let capacity = params.main_feed_instruments.len()
-        + params.depth_20_instruments.len()
-        + params.depth_200_instruments.len();
+    // DISTINCT slots across all three pools — not the sum of their lengths.
+    // See `distinct_fold_slots` for why summing double-counts an instrument
+    // that is on both the main feed and a depth pool.
+    let capacity = distinct_fold_slots(
+        &params.main_feed_instruments,
+        &params.depth_20_instruments,
+        &params.depth_200_instruments,
+    );
+    // Say it at BOOT, before a socket opens, if the universe cannot fit the
+    // fold. The aggregator's own refusal is correct but arrives per-tick and
+    // is coalesced to one `error!` per PROCESS, so at scale the operator sees
+    // a single line and no count — long after the sockets came up looking
+    // healthy. This is the same fact, stated once, in advance, with the
+    // overflow named.
+    if capacity > AGGREGATOR_MAX_SLOTS {
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            distinct_instruments = capacity,
+            slot_ceiling = AGGREGATOR_MAX_SLOTS,
+            overflow = capacity.saturating_sub(AGGREGATOR_MAX_SLOTS),
+            "the live universe has MORE distinct instruments than the fold has slots — \
+             {} instrument(s) will have their ticks refused a slot and produce NO \
+             candles, silently from the socket's point of view. The sockets will still \
+             open and report healthy. Reduce the universe or raise AGGREGATOR_MAX_SLOTS \
+             deliberately (it also sizes the seal ring, the indicator engine and the \
+             day-OHLC tracker)",
+            capacity.saturating_sub(AGGREGATOR_MAX_SLOTS)
+        );
+    }
     let mut ingest = LiveIngest::new(
         TickWriter::new(&params.questdb, Feed::Dhan),
         capacity.max(1),
@@ -4069,6 +4175,148 @@ mod tests {
                 segment: ExchangeSegment::NseFno,
             })
             .collect()
+    }
+
+    // -- I-P1-11 dedup + distinct-slot sizing -------------------------------
+
+    fn inst(id: u64, seg: ExchangeSegment) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: SecurityId::from(id),
+            segment: seg,
+        }
+    }
+
+    #[test]
+    fn dedup_subscribe_set_removes_repeats_and_reports_how_many() {
+        let set = vec![
+            inst(13, ExchangeSegment::IdxI),
+            inst(25, ExchangeSegment::IdxI),
+            inst(13, ExchangeSegment::IdxI), // exact repeat
+        ];
+        let (unique, dupes) = dedup_subscribe_set(&set);
+        assert_eq!(unique.len(), 2);
+        assert_eq!(
+            dupes, 1,
+            "the count must be reported, never silently absorbed"
+        );
+    }
+
+    #[test]
+    fn dedup_subscribe_set_keys_on_the_composite_never_on_the_id_alone() {
+        // I-P1-11: Dhan reuses one numeric id across segments. 13 is NIFTY on
+        // IDX_I and a DIFFERENT instrument on NSE_EQ. Deduping on the id alone
+        // would unsubscribe a real instrument — strictly worse than the
+        // duplicate it set out to remove.
+        let set = vec![
+            inst(13, ExchangeSegment::IdxI),
+            inst(13, ExchangeSegment::NseEquity),
+        ];
+        let (unique, dupes) = dedup_subscribe_set(&set);
+        assert_eq!(
+            unique.len(),
+            2,
+            "same id, different segments = TWO instruments"
+        );
+        assert_eq!(dupes, 0);
+    }
+
+    #[test]
+    fn dedup_subscribe_set_preserves_order_so_shard_assignment_is_deterministic() {
+        let set = vec![
+            inst(3, ExchangeSegment::NseFno),
+            inst(1, ExchangeSegment::NseFno),
+            inst(3, ExchangeSegment::NseFno),
+            inst(2, ExchangeSegment::NseFno),
+        ];
+        let (unique, _) = dedup_subscribe_set(&set);
+        let ids: Vec<u64> = unique.iter().map(|i| u64::from(i.security_id)).collect();
+        assert_eq!(ids, vec![3, 1, 2], "first occurrence wins, order preserved");
+    }
+
+    #[test]
+    fn dedup_subscribe_set_of_an_empty_set_is_empty_and_reports_nothing() {
+        let (unique, dupes) = dedup_subscribe_set(&[]);
+        assert!(unique.is_empty());
+        assert_eq!(dupes, 0);
+    }
+
+    #[test]
+    fn distinct_fold_slots_does_not_double_count_across_pools() {
+        // The bug this replaces: capacity was
+        // `main.len() + depth_20.len() + depth_200.len()`. An option that is
+        // subscribed on the main feed AND on depth-20 is ONE aggregator slot
+        // — the aggregator keys on (Feed, security_id, segment) — but the sum
+        // counted it twice, inflating the sizing toward the 25,000 ceiling for
+        // capacity the process never needed.
+        let main = vec![
+            inst(100, ExchangeSegment::NseFno),
+            inst(101, ExchangeSegment::NseFno),
+        ];
+        let d20 = vec![inst(100, ExchangeSegment::NseFno)]; // also on the main feed
+        let d200 = vec![inst(102, ExchangeSegment::NseFno)];
+        assert_eq!(
+            main.len() + d20.len() + d200.len(),
+            4,
+            "the old sizing would have said 4"
+        );
+        assert_eq!(
+            distinct_fold_slots(&main, &d20, &d200),
+            3,
+            "there are only THREE distinct instruments"
+        );
+    }
+
+    #[test]
+    fn distinct_fold_slots_still_separates_the_same_id_in_two_segments() {
+        let main = vec![inst(13, ExchangeSegment::IdxI)];
+        let d20 = vec![inst(13, ExchangeSegment::NseEquity)];
+        assert_eq!(
+            distinct_fold_slots(&main, &d20, &[]),
+            2,
+            "collapsing these would size the fold for one instrument and run two"
+        );
+    }
+
+    #[test]
+    fn a_pool_of_pure_duplicates_plans_as_one_instrument() {
+        // End to end: 6,000 copies of one instrument would need 2 connections
+        // by the raw count and 1 by the real one. More importantly it proves
+        // the dedup runs INSIDE build_feed_stack_plan, not merely that the
+        // helper exists.
+        let mut pool = PoolSupervisor::new();
+        let now = std::time::Instant::now();
+        let set = vec![inst(13, ExchangeSegment::IdxI); 6_000];
+        let plan = build_feed_stack_plan(&mut pool, now, &set, &[], &[])
+            .expect("6,000 copies of ONE instrument must fit one connection");
+        let total: usize = plan
+            .connections
+            .iter()
+            .filter(|c| c.slot.endpoint == DhanEndpointType::MainFeed)
+            .map(|c| c.guard.len())
+            .sum();
+        assert_eq!(total, 1, "the wire must carry the instrument ONCE");
+    }
+
+    #[test]
+    fn duplicates_never_push_a_fitting_set_over_the_connection_limit() {
+        // 25,000 unique instruments exactly fill 5 x 5,000. Adding a duplicate
+        // of one of them takes the raw count to 25,001, which `plan_pool`
+        // refuses for the WHOLE endpoint — every socket dark. Dedup is what
+        // stops a repeated entry from causing a total outage.
+        let mut pool = PoolSupervisor::new();
+        let now = std::time::Instant::now();
+        let mut set = instruments(25_000);
+        set.push(set[0]);
+        assert_eq!(set.len(), 25_001);
+        let plan = build_feed_stack_plan(&mut pool, now, &set, &[], &[])
+            .expect("a duplicate must not take the main feed dark");
+        let total: usize = plan
+            .connections
+            .iter()
+            .filter(|c| c.slot.endpoint == DhanEndpointType::MainFeed)
+            .map(|c| c.guard.len())
+            .sum();
+        assert_eq!(total, 25_000);
     }
 
     // -- pool spreading (operator directive 2026-08-12: use all 16) ---------
