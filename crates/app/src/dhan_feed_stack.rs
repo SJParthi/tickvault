@@ -3065,6 +3065,7 @@ async fn attach_depth_when_available(
                         "depth late-attach opened its sockets: the option-chain leg published \
                          today's contracts and depth dialed against them without a restart"
                     );
+                    return;
                 }
                 Err(err) => {
                     error!(
@@ -3072,12 +3073,22 @@ async fn attach_depth_when_available(
                         ?err,
                         depth_20 = selection.depth_20.len(),
                         depth_200 = selection.depth_200.len(),
-                        "depth late-attach resolved its instruments but planning refused them — \
-                         depth carries no data this session"
+                        "depth late-attach resolved its instruments but planning refused them. \
+                         RETRYING until the 10:00 IST deadline — a refusal can be transient \
+                         (a connection budget that frees up), and giving up on the first one \
+                         would cost the whole session's depth."
                     );
+                    // FALL THROUGH to the sleep, do NOT return.
+                    //
+                    // Until 2026-08-15 the `return` below sat outside this
+                    // match, so an Err ended the retry loop permanently. A
+                    // refusal at 09:17 IST killed depth for the entire day
+                    // despite ~43 attempts still remaining before the deadline
+                    // — and refusals like a connection-budget denial are by
+                    // nature transient. The Ok arm keeps its return: once the
+                    // sockets are dialed there is nothing left to retry.
                 }
             }
-            return;
         }
         tokio::time::sleep(std::time::Duration::from_secs(DEPTH_ATTACH_RETRY_SECS)).await;
     }
@@ -4992,6 +5003,36 @@ mod tests {
         p
     }
 
+    /// A depth-200 packet with a CALLER-CHOSEN row count.
+    ///
+    /// Depth-200 is the variable-length half of the protocol: the row count is
+    /// read from header bytes 8..12 and the packet is `12 + rows * 16` bytes,
+    /// so the same code path that is fixed-at-20 for depth-20 is data-driven
+    /// here. Until 2026-08-15 the entire 400-rows-per-update pool had ZERO
+    /// end-to-end drain tests — every existing test built a depth-20 packet —
+    /// so the branch that reads that count was undriven.
+    fn depth200_packet(security_id: u32, segment: u8, feed_code: u8, rows: u32) -> Vec<u8> {
+        let n = rows as usize;
+        let mut p = vec![0u8; 12 + n * 16];
+        let len = u16::try_from(p.len()).expect("<= 3212 fits u16");
+        p[0..2].copy_from_slice(&len.to_le_bytes());
+        p[2] = feed_code;
+        p[3] = segment;
+        p[4..8].copy_from_slice(&security_id.to_le_bytes());
+        // The field depth-20 uses as a sequence is the ROW COUNT here.
+        p[8..12].copy_from_slice(&rows.to_le_bytes());
+        for i in 0..n {
+            let base = 12 + i * 16;
+            let price = 500.0_f64 + i as f64 * 0.25;
+            let qty = u32::try_from(7 * (i + 1)).expect("small");
+            let orders = u32::try_from(i + 1).expect("small");
+            p[base..base + 8].copy_from_slice(&price.to_le_bytes());
+            p[base + 8..base + 12].copy_from_slice(&qty.to_le_bytes());
+            p[base + 12..base + 16].copy_from_slice(&orders.to_le_bytes());
+        }
+        p
+    }
+
     fn depth_frame(bytes: Vec<u8>, endpoint: DhanEndpointType, seq: u64) -> CapturedFrame {
         CapturedFrame {
             seq,
@@ -5154,6 +5195,156 @@ mod tests {
             ilp.contains("capture_seq=556007425i"),
             "packet 1 must occupy the NEXT reserved packet slot, not reuse 4242: {ilp}"
         );
+    }
+
+    #[test]
+    fn a_depth200_packet_emits_exactly_its_header_row_count() {
+        // The variable-length half of the protocol. A fixed-20 assumption here
+        // would silently truncate or over-read every real depth-200 book.
+        for rows in [1u32, 5, 200] {
+            let mut depth = DepthIngest::for_test();
+            let frame = depth_frame(
+                depth200_packet(13, 0, 41, rows),
+                DhanEndpointType::Depth200,
+                556_007_424,
+            );
+            let out = drain_depth_frame(
+                &mut depth,
+                &frame,
+                1_779_355_000_000_000_000,
+                DepthFeedKind::TwoHundred,
+                counters(),
+            );
+            assert_eq!(
+                out.rows, rows as u64,
+                "a depth-200 packet declaring {rows} rows must emit exactly {rows}"
+            );
+            assert_eq!(out.refused, 0);
+            let ilp = depth.pending_ilp();
+            assert!(
+                ilp.contains("depth_kind=d200"),
+                "the d200 discriminator is what stops the two pools overwriting each \
+                 other in the shared table: {ilp}"
+            );
+            assert!(
+                !ilp.contains("depth_kind=d20,"),
+                "a depth-200 packet must never be labelled d20: {ilp}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_depth200_row_count_above_the_protocol_max_is_refused_not_truncated() {
+        // 201 exceeds the 200-level protocol ceiling. Truncating to 200 would
+        // publish a book we cannot vouch for; refusing keeps the gap honest.
+        let mut depth = DepthIngest::for_test();
+        let frame = depth_frame(
+            depth200_packet(13, 0, 41, 201),
+            DhanEndpointType::Depth200,
+            556_007_424,
+        );
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::TwoHundred,
+            counters(),
+        );
+        assert_eq!(out.rows, 0, "an over-max row count writes nothing");
+        assert!(out.refused >= 1, "and the refusal is COUNTED, never silent");
+    }
+
+    #[test]
+    fn a_depth200_packet_declaring_zero_rows_writes_nothing_and_stays_quiet() {
+        // Zero rows is an EMPTY BOOK, not corruption — an instrument with no
+        // resting orders. It must write nothing, and it must not be counted as
+        // a refusal either, or a legitimately empty book reads as a fault.
+        let mut depth = DepthIngest::for_test();
+        let frame = depth_frame(
+            depth200_packet(13, 0, 41, 0),
+            DhanEndpointType::Depth200,
+            556_007_424,
+        );
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::TwoHundred,
+            counters(),
+        );
+        assert_eq!(out.rows, 0);
+        assert_eq!(depth.pending_rows(), 0);
+    }
+
+    #[test]
+    fn an_absurd_or_non_finite_depth_price_is_refused_per_row_not_per_batch() {
+        // The whole point of the per-ROW gate: without it a single poisoned
+        // level fails the FLUSH, and `discard_pending` then wipes every good
+        // row buffered alongside it — one bad level costs every other
+        // instrument's book. Refusing the row keeps the other 19.
+        let mut bytes = depth20_packet(13, 0, 41);
+        // Level 0 gets NaN, level 1 gets f32::MAX-scale absurdity.
+        bytes[12..20].copy_from_slice(&f64::NAN.to_le_bytes());
+        bytes[28..36].copy_from_slice(&1.0e30_f64.to_le_bytes());
+        let mut depth = DepthIngest::for_test();
+        let frame = depth_frame(bytes, DhanEndpointType::Depth20, 556_007_424);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 18, "the 18 good levels still land");
+        assert_eq!(
+            out.refused, 2,
+            "both poisoned levels are counted, not silent"
+        );
+        let ilp = depth.pending_ilp();
+        assert!(!ilp.contains("NaN"), "no NaN may reach the wire: {ilp}");
+    }
+
+    #[test]
+    fn a_zero_priced_depth_level_is_kept_because_it_is_an_absent_level_not_corruption() {
+        // depth-20 is a FIXED 20 levels, so an illiquid contract with three
+        // real bids still emits 20 rows and the rest are legitimately all-zero.
+        // Refusing them would count normal book shape as corruption AND delete
+        // the operator's own view of how deep a book actually is.
+        let mut bytes = depth20_packet(13, 0, 41);
+        for i in 3..20usize {
+            let base = 12 + i * 16;
+            bytes[base..base + 8].copy_from_slice(&0.0_f64.to_le_bytes());
+        }
+        let mut depth = DepthIngest::for_test();
+        let frame = depth_frame(bytes, DhanEndpointType::Depth20, 556_007_424);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 20, "all 20 slots are kept, empty ones included");
+        assert_eq!(out.refused, 0, "an empty level is NOT a refusal");
+    }
+
+    #[test]
+    fn a_negative_depth_price_is_refused() {
+        // A price cannot be below zero; unlike 0.0 there is no reading under
+        // which this is a legitimate absent level.
+        let mut bytes = depth20_packet(13, 0, 41);
+        bytes[12..20].copy_from_slice(&(-1.0_f64).to_le_bytes());
+        let mut depth = DepthIngest::for_test();
+        let frame = depth_frame(bytes, DhanEndpointType::Depth20, 556_007_424);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 19);
+        assert_eq!(out.refused, 1);
     }
 
     #[test]

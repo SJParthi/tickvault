@@ -3120,10 +3120,21 @@ pub const DEPTH_BUFFER_CAPACITY: usize = 100_000;
 // Pipeline — Tick Validation Constants
 // ---------------------------------------------------------------------------
 
-/// Minimum valid exchange timestamp (epoch seconds).
-/// Any tick with exchange_timestamp below this is a junk/initialization frame.
-/// 946684800 = 2000-01-01T00:00:00Z — safely before any real market data.
-pub const MINIMUM_VALID_EXCHANGE_TIMESTAMP: u32 = 946_684_800;
+// MINIMUM_VALID_EXCHANGE_TIMESTAMP (= 946_684_800, 2000-01-01) was RETIRED here
+// on 2026-08-15. Zero references, and — unlike `MAX_PLAUSIBLE_LTP`, which was
+// wired the same day — the right action was deletion, because the rule it names
+// is ALREADY ENFORCED somewhere else with a tighter bound.
+//
+// The live gate is `MIN_PLAUSIBLE_EXCHANGE_TS_SECS` / `MAX_PLAUSIBLE_EXCHANGE_TS_SECS`
+// in `tickvault_trading::candles::multi_tf_aggregator`, checked per tick in
+// `consume_tick` before the event-time watermark moves. That pair is strictly
+// better: it is a two-sided range (an all-ones LTT reading as year 2106 would
+// force-seal the entire live book — a one-sided minimum cannot catch that), and
+// its floor of 2020-09-13 is twenty years tighter than this one.
+//
+// Keeping both would have been the real hazard: two constants naming the same
+// bound with different values, where only one is consulted. A future reader
+// tightening THIS one would change nothing and believe otherwise.
 
 /// Maximum plausible last-traded price (INR). A tick whose LTP exceeds this is
 /// a corrupt / garbage frame — NOT a real observation — and is filtered as junk
