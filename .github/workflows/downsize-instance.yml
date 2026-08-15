@@ -645,7 +645,7 @@ jobs:
           done
           [ "$PING" = "Online" ] || { echo "::error::SSM agent not Online within 3 min — re-dispatch this workflow to retry (retune-only mode)"; exit 1; }
 
-      # ── STEP 8: SSM — set QDB_MEM_LIMIT=12g in on-box .env + restart stack ──
+      # ── STEP 8: SSM — set QDB_MEM_LIMIT (derived from host RAM) in on-box .env + restart stack ──
       # Pattern = aws-upgrade-instance.sh Step 8 (env upsert) + deploy-aws.yml SSM rules:
       # single-line commands, escaped quotes only, NO apostrophes; manual poll, never `ssm wait`.
       # QUESTDB PG CREDS (review round 4 CRITICAL; hardened round 6): docker-compose.yml
@@ -673,7 +673,7 @@ jobs:
       # downsize signal, and the step fails loudly. The QuestDB HTTP readiness loop
       # is 24 x 10s = 240s (round 6 — was 30s, too tight next to the app's 300s
       # budget for a cold container on a burstable box).
-      - name: SSM — QDB_MEM_LIMIT=12g + recreate questdb + restart app
+      - name: SSM — QDB_MEM_LIMIT (derived from host RAM) + recreate questdb + restart app
         id: ssm
         run: |
           CMD_ID=$(aws ssm send-command \
@@ -684,8 +684,19 @@ jobs:
               "set -euo pipefail",
               "cd /opt/tickvault",
               "touch repo/deploy/docker/.env",
-              "grep -q \"^QDB_MEM_LIMIT=\" repo/deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=12g/\" repo/deploy/docker/.env || echo \"QDB_MEM_LIMIT=12g\" >> repo/deploy/docker/.env",
-              "if [ -f deploy/docker/.env ]; then grep -q \"^QDB_MEM_LIMIT=\" deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=12g/\" deploy/docker/.env || echo \"QDB_MEM_LIMIT=12g\" >> deploy/docker/.env; fi",
+              "# DERIVED from the host, and VERIFIED against the same derivation.",
+              "# Until 2026-08-15 this step wrote 12g and then asserted the container",
+              "# limit equalled 1073741824 bytes = 1g. Those cannot both be true, so the",
+              "# step FATALed every time it ran - and this is the ROLLBACK path of an",
+              "# instance flip, the thing you reach for when the box is already in",
+              "# trouble. It also hardcoded a 32 GiB-sized cap while its own header",
+              "# describes rolling back to a 4 GiB t4g.medium, which would have been a",
+              "# 3x overcommit had the write ever survived its own check.",
+              "MEMKB=$(awk \\"/^MemTotal:/ {print \\$2; exit}\\" /proc/meminfo 2>/dev/null || echo 0)",
+              "QDB_G=$(awk -v kb=$MEMKB \\"BEGIN{g=int(kb*4/10/1048576); if(g<1)g=1; if(g>12)g=12; print g}\\")",
+              "echo \\"qdb-retune: host MemTotal=${MEMKB}kB -> QDB_MEM_LIMIT=${QDB_G}g\\"",
+              "grep -q \"^QDB_MEM_LIMIT=\" repo/deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=${QDB_G}g/\" repo/deploy/docker/.env || echo \"QDB_MEM_LIMIT=${QDB_G}g\" >> repo/deploy/docker/.env",
+              "if [ -f deploy/docker/.env ]; then grep -q \"^QDB_MEM_LIMIT=\" deploy/docker/.env && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=${QDB_G}g/\" deploy/docker/.env || echo \"QDB_MEM_LIMIT=${QDB_G}g\" >> deploy/docker/.env; fi",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
               "TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value) || { echo FATAL: SSM fetch of /tickvault/prod/questdb/pg-user FAILED - refusing to recreate prod QuestDB on default creds; exit 1; }",
               "TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value) || { echo FATAL: SSM fetch of /tickvault/prod/questdb/pg-password FAILED - refusing to recreate prod QuestDB on default creds; exit 1; }",
@@ -696,7 +707,9 @@ jobs:
               "for i in $(seq 1 24); do if curl -fsS \"http://127.0.0.1:9000/exec?query=SELECT%201\" >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 10; if [ $i -eq 24 ]; then echo FATAL: QuestDB not responding within 240s after retune; exit 1; fi; done",
               "QDB_LIMIT_BYTES=$(docker inspect tv-questdb --format \"{{.HostConfig.Memory}}\")",
               "echo MEMLIMIT=$QDB_LIMIT_BYTES",
-              "if [ \"$QDB_LIMIT_BYTES\" != \"1073741824\" ]; then echo FATAL: QuestDB container memory limit is $QDB_LIMIT_BYTES bytes but 1073741824 = 1g was required. The .env upsert or compose recreate did NOT take effect; exit 1; fi",
+              "QDB_WANT_BYTES=$(awk -v g=$QDB_G \\"BEGIN{print g*1073741824}\\")",
+              "if [ \\"$QDB_LIMIT_BYTES\\" != \\"$QDB_WANT_BYTES\\" ]; then echo FATAL: QuestDB container memory limit is $QDB_LIMIT_BYTES bytes but $QDB_WANT_BYTES = ${QDB_G}g was required. The .env upsert or compose recreate did NOT take effect; exit 1; fi",
+              "echo MEMLIMIT_OK=$QDB_WANT_BYTES",
               "systemctl daemon-reload",
               "OLD_PID=$(systemctl show -p MainPID --value tickvault 2>/dev/null || echo 0)",
               "systemctl restart tickvault --no-block",
@@ -740,8 +753,8 @@ jobs:
           # on top of the on-box assertion (defense in depth against a truncated /
           # rewritten on-box script silently skipping the check).
           case "$BOX_OUT" in
-            *MEMLIMIT=1073741824*) echo "QuestDB 1g limit CONFIRMED (MEMLIMIT=1073741824 in the box output)";;
-            *) echo "::error::box output does not carry MEMLIMIT=1073741824 — the QuestDB 1g retune is NOT confirmed; refusing to report success. Re-dispatch this workflow (retune-only mode)."; exit 1;;
+            *MEMLIMIT_OK=*) echo "QuestDB memory cap CONFIRMED (the box verified its own derived value: $(printf %s "$OUT" | grep -o "MEMLIMIT_OK=[0-9]*" | head -1))";;
+            *) echo "::error::box output does not carry MEMLIMIT_OK= - the QuestDB retune is NOT confirmed; refusing to report success. Re-dispatch the workflow."; exit 1;;
           esac
 
       # ── STEP 9: health verify. deploy-aws.yml has NO /health-over-EIP pattern
