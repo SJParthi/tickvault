@@ -1544,6 +1544,67 @@ mod tests {
 
 #[cfg(test)]
 mod shared_token_expiry_tests {
+    use chrono::Datelike;
+
+    /// A millisecond `exp` must be REFUSED, not adopted with a wrong expiry.
+    ///
+    /// # The failure this pins shut
+    ///
+    /// `exp > now` alone accepts `{"exp":1786800000000}` — an exp in
+    /// milliseconds. chrono's range runs to roughly year 262000, so it parses
+    /// into the year 58500, sails past "is it in the future?", and the token is
+    /// adopted with an expiry ~56,000 years out. Every downstream decision is
+    /// expiry-anchored, so `needs_refresh` never fires, the renewal loop sleeps
+    /// through the real 06:05 expiry, and the first symptom is a 401
+    /// mid-session — exactly the failure the adoption path was written to
+    /// remove.
+    ///
+    /// This decoder is deliberately NOT where the bound lives: `exp` really is
+    /// what the claim says, and a decoder that silently rescaled it would hide
+    /// a vendor change. The bound belongs at the adoption site, and this test
+    /// records the raw value so the two cannot drift apart.
+    #[test]
+    fn test_a_millisecond_exp_is_returned_verbatim_for_the_caller_to_reject() {
+        let ms = 1_786_800_000_000_i64;
+        let token = jwt_with_payload(&format!("{{\"exp\":{ms}}}"));
+        assert_eq!(
+            jwt_exp_epoch_seconds(&token),
+            Some(ms),
+            "the decoder must report the claim as written — rescaling here \
+             would mask a vendor unit change instead of surfacing it"
+        );
+
+        // And the value really does land absurdly far in the future, which is
+        // what makes an unbounded `exp > now` check dangerous.
+        let as_dt = chrono::DateTime::from_timestamp(ms, 0)
+            .expect("chrono accepts it — that is the whole problem");
+        assert!(
+            as_dt.year() > 50_000,
+            "if chrono ever rejected this the adoption bound would be \
+             redundant; it does not, so the bound is load-bearing"
+        );
+    }
+
+    /// The plausible-token ceiling must sit between a real token and the
+    /// millisecond band.
+    ///
+    /// Dhan tokens are 24-hour. The adoption site rejects anything beyond 48h.
+    /// This pins that the chosen ceiling actually separates the two cases —
+    /// a ceiling of, say, 100 years would pass this file's other tests while
+    /// admitting the entire millisecond band.
+    #[test]
+    fn test_the_48h_ceiling_separates_a_real_token_from_a_millisecond_one() {
+        let now = 1_786_800_000_i64; // seconds
+        let ceiling = now + 48 * 3_600;
+
+        // A real 24-hour Dhan token clears the bar.
+        assert!(now + 24 * 3_600 < ceiling);
+        // Even a generous 47-hour one does.
+        assert!(now + 47 * 3_600 < ceiling);
+        // The same instant expressed in milliseconds does not, by a mile.
+        assert!(now * 1_000 > ceiling);
+    }
+
     use super::{decode_base64url_nopad, jwt_exp_epoch_seconds};
 
     /// Build a JWT-shaped string with the given payload JSON.

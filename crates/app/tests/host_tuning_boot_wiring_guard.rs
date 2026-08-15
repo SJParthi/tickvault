@@ -260,8 +260,19 @@ fn questdb_cap_guard_is_not_vacuous() {
     let assignments = downsize
         .lines()
         .filter(|l| {
-            l.find("QDB_MEM_LIMIT=").is_some_and(|p| {
-                l[p + "QDB_MEM_LIMIT=".len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
+            // Assignments are now DERIVED (`QDB_MEM_LIMIT=${QDB_G}g`), so the
+            // old "next char is alphanumeric" test — written when the value was
+            // the literal `12g` — matched nothing and this non-vacuity check
+            // failed the very change that improved the thing it guards. Accept
+            // either shape: what matters is that an assignment exists to scan.
+            // ANY occurrence on the line, not just the first. A real
+            // assignment line reads
+            //   grep -q "^QDB_MEM_LIMIT=" … && sed -i "s/…/QDB_MEM_LIMIT=${QDB_G}g/"
+            // so the FIRST match is the grep pattern, whose next character is a
+            // quote. Testing only the first occurrence found nothing and made
+            // this non-vacuity check fail on a file that plainly has three.
+            l.match_indices("QDB_MEM_LIMIT=").any(|(p, m)| {
+                l[p + m.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '$')
             })
         })
         .count();
@@ -291,11 +302,30 @@ fn questdb_cap_guard_is_not_vacuous() {
 fn deploy_self_heals_a_stale_questdb_memory_cap() {
     let deploy = read(DEPLOY);
 
+    // ANCHORED ON THE DERIVATION, not on a literal size.
+    //
+    // This assertion originally read `deploy.contains("QDB_MEM_LIMIT=12g")`,
+    // and on 2026-08-15 it did exactly what a literal-anchored guard does: it
+    // FAILED the fix that removed the hardcoded 12g in favour of a value
+    // derived from the host's MemTotal — the strictly better version of the
+    // property it was written to protect. Left as it was, it would have held
+    // a 32 GiB-sized constant in place across every future instance change,
+    // which is the very failure the surrounding file exists to prevent.
+    //
+    // The property that actually matters is "the deploy asserts a cap sized
+    // for THIS host, on every deploy". That is what is asserted now.
     assert!(
-        deploy.contains("QDB_MEM_LIMIT=12g"),
-        "the deploy path no longer asserts QDB_MEM_LIMIT=12g on the box. A stale \
-         1g from the 4 GiB era would then cap the database at 3% of this 32 GiB \
-         host, silently and permanently"
+        deploy.contains("QDB_MEM_LIMIT=$QDB_WANT"),
+        "the deploy path no longer asserts a QuestDB memory cap on the box. A \
+         stale 1g from the 4 GiB era would then cap the database at 3% of a \
+         32 GiB host, silently and permanently"
+    );
+    assert!(
+        deploy.contains("MemTotal"),
+        "the deploy's QuestDB cap is not derived from the host. A hardcoded \
+         value is right for exactly one instance size and wrong for every \
+         other — and a rollback to a 4 GiB box would cap the database ABOVE \
+         the host's own RAM"
     );
 
     // Writing the value without recreating the container would fix the FILE and
@@ -316,4 +346,82 @@ fn deploy_self_heals_a_stale_questdb_memory_cap() {
          change — an unconditional recreate restarts the database on every \
          deploy for no reason"
     );
+}
+
+/// The QuestDB memory cap must be DERIVED from the host, and every check of it
+/// must test the same derived value.
+///
+/// # The two defects this pins shut (adversarial review, 2026-08-15)
+///
+/// 1. **A write that fails its own verification.** `downsize-instance.yml`
+///    step 8 wrote `QDB_MEM_LIMIT=12g` and then asserted the resulting
+///    container limit equalled `1073741824` bytes — which is 1g, not 12g. Both
+///    cannot be true, so the step FATALed on every run. A second, workflow-level
+///    check demanded the same 1g literal. That step is the ROLLBACK path of an
+///    instance flip: the thing reached for when the box is already in trouble.
+///
+/// 2. **A cap sized for the wrong machine.** Both that workflow and the deploy
+///    self-heal hardcoded a 32 GiB-appropriate `12g`. The downsize workflow's
+///    own header describes rolling back to a 4 GiB `t4g.medium`, where a 12g
+///    cgroup ceiling is a 3x overcommit that invites the OOM killer — the same
+///    class as the frame ring that was still sized for a 4 GiB host four
+///    instance upgrades later.
+///
+/// Deriving from `MemTotal` makes both impossible: a 32 GiB box still lands on
+/// exactly 12g (no behaviour change), a 4 GiB box lands on 1g, and an
+/// unreadable `/proc/meminfo` lands on the 1g floor.
+#[test]
+fn test_the_questdb_memory_cap_is_derived_and_self_consistent() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+    for wf in ["deploy-aws.yml", "downsize-instance.yml"] {
+        let path = root.join(".github/workflows").join(wf);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        if !src.contains("QDB_MEM_LIMIT") {
+            continue;
+        }
+
+        assert!(
+            src.contains("MemTotal"),
+            "{wf} sets QDB_MEM_LIMIT without reading the host's MemTotal. A \
+             hardcoded cap is correct for exactly one instance size and wrong \
+             for every other one — and this repo has changed instance size four \
+             times"
+        );
+
+        // No assignment may carry a bare literal size.
+        for (n, line) in src.lines().enumerate() {
+            // These commands live inside a JSON array, so a comment line
+            // starts with `"#`, not `#`. A first draft checked only `#` and
+            // duly reported a COMMENT as a hardcoded assignment — the exact
+            // false-positive class this file's other guards warn about.
+            let code = line.trim_start().trim_start_matches('"').trim_start();
+            if line.contains("QDB_MEM_LIMIT=") && !code.starts_with('#') {
+                assert!(
+                    !line.contains("QDB_MEM_LIMIT=12g") && !line.contains("QDB_MEM_LIMIT=1g"),
+                    "{wf}:{} assigns a hardcoded QDB_MEM_LIMIT. Derive it from \
+                     MemTotal so a rollback to a smaller instance cannot leave \
+                     the database capped above the host's own RAM.\n  {line}",
+                    n + 1
+                );
+            }
+        }
+
+        // And no verification may compare against a bare byte literal — that is
+        // exactly how the write and its check came to disagree.
+        for (n, line) in src.lines().enumerate() {
+            if line.contains("QDB_LIMIT_BYTES") && line.contains("!=") {
+                assert!(
+                    !line.contains("1073741824\\\"") && !line.contains("\\\"1073741824"),
+                    "{wf}:{} verifies the container memory limit against a \
+                     hardcoded byte literal. The write is derived, so a literal \
+                     check can only ever agree with it by luck — and it did not: \
+                     it demanded 1g while the write said 12g.\n  {line}",
+                    n + 1
+                );
+            }
+        }
+    }
 }
