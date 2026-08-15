@@ -171,172 +171,50 @@ resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
 }
 
 # ---------------------------------------------------------------------------
-# 4. The ring REFUSED frames (2026-08-14 — audit finding)
+# 4. The DURABLE FLOOR was breached (2026-08-15)
 # ---------------------------------------------------------------------------
-# Added after an adversarial tick-loss sweep found that the ring's own refusal
-# counters were EMF-shipped and alarmed by nothing. That is the same
-# paid-for-and-unwatched shape alarm 3 above was created to end, and it matters
-# more here: a ring refusal is not backpressure that later drains, it is the
-# frame being discarded. The sink-side doc-comment used to call this "NOT
-# capture loss — replay recovers it"; that is FALSE as shipped, because boot
-# replay drops every live-feed frame (there is no re-fold path). The drain-side
-# log says so honestly. Until a WAL re-fold exists, a ring refusal is permanent
-# loss and must page.
+# This is the most serious counter in the lane, and until now it was the one
+# nobody watched.
 #
-# Both counters are summed across their labels: `tv_dhan_ws_ring_full_total`
-# (slot exhaustion, 65,536 frames) and `tv_dhan_ws_ring_bytes_full_total`
-# (byte budget, 256 MiB). They are separate alarms because they have different
-# causes and different fixes — slots mean the fold is behind, bytes mean a few
-# large frames (depth-200 is 512 KiB, so 512 of them exhaust the whole budget
-# and starve the main feed).
-resource "aws_cloudwatch_metric_alarm" "ws_ring_full" {
-  alarm_name        = "tv-${var.environment}-ws-ring-full"
-  alarm_description = "The live-feed frame ring REFUSED frames because its 65,536 slots were full. Those frames are gone: boot replay deliberately drops live-feed WAL records, so nothing re-folds them into the ticks table. The cause is almost always downstream — a QuestDB stall or a slow ILP flush blocks the drain, so the ring backs up and the sink refuses the newest frames. Triage: check QuestDB health and flush latency first, then tv_ticks_dropped_total to see whether rows were also lost at the writer."
+# Alarm 3 above watches `tv_ticks_dropped_total` — a loss BETWEEN the
+# write-ahead log and QuestDB. The bytes still exist on disk there. This alarm
+# watches a loss BEFORE the log: `WalRingSink` increments it when the
+# capture-at-receipt guarantee — the property this entire architecture is
+# built on — did not hold. The frame was never written anywhere.
+#
+# So the pair that shipped 2026-08-14 alarmed the RECOVERABLE half of the loss
+# chain and left the UNRECOVERABLE half silent. There is no second signal for
+# this one: the frame is simply gone, with no payload to count downstream and
+# no error raised later. If this counter moves and nobody is told, the loss is
+# both total and invisible.
+#
+# Authority: dhan-rest-only-noise-lock-2026-07-14.md §2.3a (operator quote
+# 2026-08-15), which also WITHDRAWS the §2.3 drain-respawn row — that metric
+# has zero emit sites because the drain is not respawned at all, so building
+# it would have created a permanently-green dead monitor.
+resource "aws_cloudwatch_metric_alarm" "dhan_wal_dropped" {
+  alarm_name        = "tv-${var.environment}-dhan-wal-dropped"
+  alarm_description = "A live frame was NEVER DURABLY CAPTURED. tv_dhan_ws_wal_dropped_total counts frames that failed the capture-at-receipt write-ahead log — the durable floor that every zero-loss claim in this system rests on. This is strictly worse than the ticks-dropped alarm: there, the frame is on disk and the loss is between the log and the database; here the bytes were never written at all, so no replay, no backfill and no cross-verification can recover them. There is no second signal for this condition anywhere in the system. Triage in this order: (1) disk — a full or read-only data volume is the most common cause, check tv_spill_dir_free_bytes and the WS-SPILL-01 alarm which may have fired first; (2) the WAL writer thread — WS-SPILL-02 indicates the spill channel was full at the append instant; (3) the coded lines in /tickvault/<env>/app naming the endpoint. Frames lost during the outage do NOT come back when the disk recovers."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
   evaluation_periods  = 1
-  metric_name         = "tv_dhan_ws_ring_full_total"
+  metric_name         = "tv_dhan_ws_wal_dropped_total"
   namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  dimensions          = local.app_dimensions
-  treat_missing_data  = "notBreaching"
-
-  alarm_actions = local.app_alarm_actions
-  # NO ok_actions — a refused frame never comes back.
-  ok_actions = []
-}
-
-resource "aws_cloudwatch_metric_alarm" "ws_ring_bytes_full" {
-  alarm_name        = "tv-${var.environment}-ws-ring-bytes-full"
-  alarm_description = "The live-feed frame ring REFUSED frames because its 256 MiB byte budget was exhausted, even though slots remained. This is the LARGE-FRAME shape rather than the slow-drain shape: a depth-200 frame can be 512 KiB, so roughly 512 of them consume the entire budget and every main-feed frame is then refused behind them. The frames are permanently lost — boot replay drops live-feed WAL records. Triage: confirm whether depth sockets are attached, then check whether the drain is also stalled (tv_dhan_ws_ring_full_total)."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 1
-  metric_name         = "tv_dhan_ws_ring_bytes_full_total"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Sum"
-  dimensions          = local.app_dimensions
-  treat_missing_data  = "notBreaching"
-
-  alarm_actions = local.app_alarm_actions
-  ok_actions    = []
-}
-
-# ---------------------------------------------------------------------------
-# 5. Master sourcing silently collapsed the universe (2026-08-14 — audit)
-# ---------------------------------------------------------------------------
-# The worst signal in the lane, because it looks exactly like health. When the
-# resolved-master artifact is missing or unparseable, the lane falls back to the
-# 4 hardcoded index SIDs while the config asks for the full resolved set — 4,565
-# instruments on 2026-08-12, i.e. a 99.9% collapse. Every other gauge reads
-# normal: the lane is up, ticks flow, and the gap detector reports zero
-# never-ticked instruments because it only seeds what was actually subscribed.
-# Before this alarm the sole evidence was one uncoded error line.
-resource "aws_cloudwatch_metric_alarm" "live_universe_fallback" {
-  alarm_name        = "tv-${var.environment}-live-universe-fallback"
-  alarm_description = "The live lane fell back to the 4 hardcoded index instruments while the config requested the master-sourced universe. This is a ~99.9% collapse of the subscribed set that looks HEALTHY on every other signal — the lane is up, ticks flow, and never-ticked reads zero because only the subscribed instruments are seeded. Cause is the day's resolved-mapping artifact being missing or unparseable. Triage: check that the daily universe rider ran and wrote today's artifact, then restart the app; the universe is resolved once at boot and does not re-resolve mid-session."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 1
-  metric_name         = "tv_dhan_live_universe_fallback_total"
-  namespace           = local.app_namespace
-  # The universe is resolved ONCE per boot, so this fires at most once per
-  # restart. A 300s window with threshold 1 catches that single increment.
-  period             = 300
-  statistic          = "Sum"
+  # Threshold 1 / eval 1, for the same reason as alarm 3 and more so: there is
+  # no acceptable number of frames that missed the durable floor, and waiting a
+  # second window to confirm only loses more of them.
+  period    = 300
+  statistic = "Sum"
+  # `{host}` deliberately — see the dimension-folding note above alarm 2. The
+  # EMF processor folds this metric's labels to the single declared dimension
+  # set, and folding is what this alarm wants: a drop on ANY endpoint pages.
   dimensions         = local.app_dimensions
   treat_missing_data = "notBreaching"
 
   alarm_actions = local.app_alarm_actions
-  # NO ok_actions: the counter is cumulative and the session is already running
-  # on the wrong universe. Only a restart fixes it, and that is a new session.
-  ok_actions = []
-}
-
-# ---------------------------------------------------------------------------
-# 6. PARTIAL socket loss (2026-08-14 — audit)
-# ---------------------------------------------------------------------------
-# Alarm 1 above (lane down) can only see TOTAL failure: tv_dhan_feed_stack_up
-# clears when the frame ring closes, and the ring closes only when EVERY sender
-# is dropped. The planned-connections gauge is a boot-time constant. So four of
-# five main-feed sockets could park and both signals would still read healthy
-# while roughly 80% of the subscribed universe went dark.
-#
-# tv_dhan_ws_alive_connections is the state those two could not express: it is
-# incremented before each supervisor task starts and decremented when that task
-# returns, so it answers "how many sockets exist right now". The park counter
-# fires on the transition, but a counter cannot be queried for current state at
-# 09:30 — a delta that already scrolled past is not a health signal.
-#
-# Threshold is deliberately "fewer than 1" rather than "fewer than planned":
-# the planned count varies with the resolved universe (4 index SIDs open one
-# socket; 4,565 open five), so a fixed comparison would page every day the
-# master sourcing legitimately changed shape. Partial loss above zero is caught
-# by the park alarm; this catches the all-sockets-gone case that the ring-close
-# gauge misses when a sender is still held somewhere.
-resource "aws_cloudwatch_metric_alarm" "ws_no_alive_connections" {
-  alarm_name        = "tv-${var.environment}-ws-no-alive-connections"
-  alarm_description = "Every Dhan live-feed socket is gone, while the lane may still report itself up. The lane-up gauge only clears when the frame ring closes, which requires every sender to be dropped, so a lane holding a sender with zero live sockets reads healthy and produces nothing. Triage: journalctl -u tickvault for the park reasons (WS-GAP-03) — a 805/804/806/808/810 disconnect parks a socket permanently and nothing re-dials it, so the fix is a restart once the underlying cause (token, entitlement, subscription) is addressed."
-
-  comparison_operator = "LessThanThreshold"
-  threshold           = 1
-  evaluation_periods  = 2
-  metric_name         = "tv_dhan_ws_alive_connections"
-  namespace           = local.app_namespace
-  # 2 periods: a rolling restart legitimately passes through zero for a moment.
-  # Two consecutive 5-minute windows at zero is not a restart, it is an outage.
-  period     = 300
-  statistic  = "Minimum"
-  dimensions = local.app_dimensions
-  # notBreaching, NOT breaching: outside market hours the lane is deliberately
-  # down and the gauge is legitimately absent. Treating missing as breaching
-  # would page every evening.
-  treat_missing_data = "notBreaching"
-
-  alarm_actions = local.app_alarm_actions
-  # An OK here is a genuine recovery — sockets came back — so it is worth
-  # sending, unlike the loss alarms above where recovery is impossible.
-  ok_actions = local.app_alarm_actions
-}
-
-# ---------------------------------------------------------------------------
-# 7. Captured frames were NOT recovered at boot (2026-08-14)
-# ---------------------------------------------------------------------------
-# The write-ahead log is the durability floor the entire capture design rests
-# on: every frame is written to it BEFORE it is parsed. Until 2026-08-14 that
-# log was write-ONLY — on boot the staged live-feed frames were counted,
-# logged, and discarded — so a session that died mid-market lost every frame
-# captured since its last flush, and no alarm existed because "loss at boot"
-# had no metric anyone watched.
-#
-# The re-fold now recovers them, which makes THIS counter meaningful: it moves
-# only when recovery did NOT happen — the feature is disabled, or the rows were
-# built and the ILP flush failed. Either way the ticks are on disk and not in
-# the database, which is precisely the state that needs a human.
-resource "aws_cloudwatch_metric_alarm" "wal_frames_not_recovered" {
-  alarm_name        = "tv-${var.environment}-wal-frames-not-recovered"
-  alarm_description = "Live-feed frames captured by a previous session were replayed from the write-ahead log and NOT recovered into the database. The raw frames are preserved in the WAL archive, so this is recoverable — but not automatically, and not after the segments are archived. Causes, in order of likelihood: [dhan_wal_replay] enabled is false; or the re-fold built the rows and the QuestDB flush failed. Triage: journalctl -u tickvault for the STAGE-C.2b line, which names which of the two it was and how many frames were involved."
-
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  evaluation_periods  = 1
-  metric_name         = "tv_ws_frame_wal_reinjected_dropped_total"
-  namespace           = local.app_namespace
-  # Boot-time only, so this fires at most once per restart. Threshold 1 with a
-  # single period catches that lone increment.
-  period             = 300
-  statistic          = "Sum"
-  dimensions         = local.app_dimensions
-  treat_missing_data = "notBreaching"
-
-  alarm_actions = local.app_alarm_actions
-  # NO ok_actions: the counter is cumulative and the window is already past.
-  # Only a deliberate manual recovery changes the outcome, and that is not an
-  # event this alarm can observe.
+  # NO ok_actions. Deltas returning to zero mean no ADDITIONAL frames were
+  # lost — never that the lost ones came back. An OK page here would be a false
+  # recovery of data that does not exist.
   ok_actions = []
 }

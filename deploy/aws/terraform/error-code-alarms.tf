@@ -511,6 +511,46 @@ locals {
       ok_recovery = false # 2026-08-11: discrete PERMANENT data loss - the dropped raw frames are gone from the durable chain and do not come back when the episode ages out (Rule-11 false-recovery; aggregator-drop-01 precedent)
       desc        = "WS-SPILL-02: a raw WebSocket frame was DROPPED at the capture-at-receipt WAL (the spill writer was dead at the append instant) - the frame is lost BEFORE parse and broadcast, so no downstream tier can recover it. This is the raw-frame twin of AGGREGATOR-DROP-01 (sealed candles) and is the durable floor's own failure mode. Triage: df -h /data, ls -la data/spill/, host + container health; if the host is healthy and the dirs writable, restart the app. NO recovered/OK page: the loss is permanent - the auto-OK only means the episode aged out. Runbook: docs/error-runbooks/ws-frame-spill-error-codes.md"
     }
+    # 2026-08-15 (authority: dhan-rest-only-noise-lock-2026-07-14.md §2.3a,
+    # operator quote same day) - the CONNECTED-BUT-SILENT page.
+    #
+    # This condition has NO other evidence anywhere in the system. A subscribe
+    # that silently did not take produces no payload to count, no parse to
+    # fail, and no error of its own; the socket is open, the lane gauge reads
+    # 1, and every loss counter sits at a healthy flat zero. Absence measured
+    # against a seeded key is the only thing that can ever report it, which is
+    # why scan_silence exists - and why leaving its verdict log-sink-only (as
+    # it was from 2026-08-12 to 2026-08-15) meant the one detector for an
+    # invisible failure was itself invisible.
+    #
+    # A LOG FILTER rather than a threshold on the gauges, deliberately: the
+    # app already gates the emit to the CONTINUOUS session (never the
+    # legitimately-silent pre-open) and edge-latches it to one per episode, so
+    # the coded error carries the market-hours gating and the de-duplication
+    # that a raw gauge alarm would need a window Lambda and an unknown
+    # baseline to reproduce. The derived metric is sparse and dimensionless -
+    # billed only in hours the code actually fires.
+    #
+    # eval = 1, unlike the ws-spill pair above: the emit is ALREADY latched to
+    # two consecutive 30s scans by the app, so the sustain requirement has been
+    # met before the line is ever written. Requiring three CloudWatch windows
+    # on top would delay the page by 10 minutes for a condition the detector
+    # has already confirmed.
+    #
+    # ok_recovery = true, ALSO unlike the ws-spill pair: silence is not a
+    # permanent loss of a specific frame. Instruments genuinely start ticking
+    # again - after a resubscribe, or when a thin contract simply trades - and
+    # "the feed is being heard again" is a real, self-explanatory recovery an
+    # operator wants told.
+    "risk-gap-03" = {
+      pattern     = "{ $.code = \"RISK-GAP-03\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = true # silence genuinely ends - unlike a dropped frame, this recovery is real
+      desc        = "RISK-GAP-03: the live feed is CONNECTED BUT HEARING NOTHING from instruments it subscribed. The 30s silence scan found instruments quiet beyond their own learned cadence, or that never ticked at all since being subscribed - the second is the serious one, because a subscribe that silently did not take leaves no other trace: no payload, no parse failure, no error, and every loss counter reads a healthy zero. Fires once per episode, gated to the continuous session (09:15+) so the legitimately-silent pre-open never pages. Triage: read tv_dhan_feed_instruments_never_ticked vs tv_dhan_feed_instruments_silent on the operator dashboard live-lane row - never_ticked climbing means subscriptions are not taking (check tv_dhan_ws_subscribe_failed_total and the subscribe batches in the app log); silent climbing with never_ticked at zero usually means a thin universe on a quiet day, not a fault. Runbook: .claude/rules/project/gap-enforcement.md (RISK-GAP-03)"
+    }
   }
 }
 

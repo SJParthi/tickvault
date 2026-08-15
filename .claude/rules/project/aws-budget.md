@@ -401,6 +401,47 @@ retirements". The revived lane IS a WS frame producer, so that stated reason
 no longer holds. Recorded rather than silently added — adding it is its own
 cost decision and would make this note's +7 delta untrue.
 
+## COST NOTE 2026-08-15 — the two unpaged failures that had no second signal (+~$0.20/mo)
+
+Authority: `dhan-rest-only-noise-lock-2026-07-14.md` §2.3a (operator quote same
+day). Two additions, chosen because in both cases **no other evidence of the
+failure exists anywhere in the system** — not because they were the next names
+on a list.
+
+| Added | What it costs | What it watches |
+|---|---|---|
+| `tv-<env>-dhan-wal-dropped` (metric alarm) | ~$0.10/mo | a frame that never reached the durable floor |
+| `errcode-risk-gap-03` (log filter + alarm) | ~$0.10/mo | connected but hearing nothing |
+
+**Why the first one matters more than the alarm that already exists.** The
+2026-08-14 family alarmed `tv_ticks_dropped_total` — a loss BETWEEN the
+write-ahead log and QuestDB, where the bytes are still on disk. This one is the
+loss BEFORE the log: capture-at-receipt did not hold, so nothing was written
+anywhere and no replay, backfill or cross-verification can recover it. The pair
+that shipped watched the recoverable half of the loss chain and left the
+unrecoverable half silent.
+
+**Why the second is a log filter and not a gauge threshold.** The gauges exist
+(added 2026-08-12) but a threshold on them needs a baseline nobody has and a
+market-hours gate to avoid paging through the legitimately-silent pre-open. The
+app already does both — session-gated, edge-latched to one emit per episode — so
+the coded error carries the gating for free. The derived metric is sparse and
+dimensionless: billed only in hours the code actually fires, near-free at rest.
+
+**Also recorded: one row of the 2026-08-14 family was WRONG and is withdrawn.**
+It named `tv_dhan_feed_drain_respawn_total`, which has zero emit sites and is in
+no allowlist, because the drain is not respawned at all — if it dies the lane
+ends and the up-gauge falls. Building it would have created a filter that can
+never match: a permanently-green dead monitor, the `ws-reinject-01` /
+`tick-conserve-01` class this repo has already retired twice.
+
+**Still visible-but-unpageable, deliberately:** `subscribe_failed`,
+`ring_full`, `ring_bytes_full`, `tick_persist_errors`, `tick_rows_refused`,
+`seals_dropped`. Each would add ~$0.10/mo, several are downstream symptoms the
+two alarms above would already have fired for, and eleven pagers for one
+subsystem trains an operator to ignore all of them. A stopping point on the
+record, not an oversight.
+
 ## COST NOTE 2026-08-15 — host-sizing gauges (+~$0.60/mo)
 
 The live lane's frame-ring byte budget stopped being a compile-time constant:
