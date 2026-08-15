@@ -290,9 +290,9 @@ resource "aws_cloudwatch_metric_alarm" "ws_no_alive_connections" {
   namespace           = local.app_namespace
   # 2 periods: a rolling restart legitimately passes through zero for a moment.
   # Two consecutive 5-minute windows at zero is not a restart, it is an outage.
-  period             = 300
-  statistic          = "Minimum"
-  dimensions         = local.app_dimensions
+  period     = 300
+  statistic  = "Minimum"
+  dimensions = local.app_dimensions
   # notBreaching, NOT breaching: outside market hours the lane is deliberately
   # down and the gauge is legitimately absent. Treating missing as breaching
   # would page every evening.
