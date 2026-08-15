@@ -546,16 +546,24 @@ locals {
     # ok_recovery true -> false, after checking what the emit ACTUALLY does in
     # production rather than what its edge-latch was designed to do.
     #
-    # Friday 2026-08-14 produced 25 distinct RISK-GAP-03 emits in one session
-    # -- 09:15, then every two to five minutes from 12:59 to 14:53 -- for a
-    # condition that never changed: never_ticked=4 of 4 instruments, all day.
-    # At period 300 with an OK page, that is ~50 operator messages in a day for
-    # one unchanging fact, which is precisely how a pager gets ignored.
+    # Friday 2026-08-14 produced 25 distinct RISK-GAP-03 emits in one session.
+    # The silent count oscillated the whole day -- 4, 9, 1, 2, 1, 3, 208, 10 --
+    # clearing between episodes and re-arming the per-episode latch each time,
+    # entirely legitimately: sparse-cadence instruments go quiet and come back.
+    # The latch worked as designed and still produced 25 pages, because the
+    # world produced 25 episodes. At period 300 with an OK page that is ~50
+    # operator messages in a day, which is how a pager gets ignored.
     #
-    # The emit-side re-arm was fixed in the same change (the latch no longer
-    # clears while never_ticked > 0). This is the second half: an hour-long
-    # window collapses any remaining oscillation into ONE alarm state, and the
-    # alarm returns to OK silently via notBreaching once the emits stop.
+    # (An earlier draft of this comment said the condition "never changed --
+    # never_ticked=4 of 4, all day". That was wrong: never_ticked was 4 on the
+    # 09:15 emit and 0 on every one after it, so the feed WAS delivering. The
+    # correction matters because it changes which fix works -- gating on
+    # never-ticked alone would have suppressed almost none of these.)
+    #
+    # The emit side gained a 30-minute cooldown between pages in the same
+    # change. This is the second half: an hour-long window collapses whatever
+    # still gets through into one alarm state, and the alarm returns to OK
+    # silently via notBreaching once the emits stop.
     #
     # ok_recovery = false, reversing the note this entry shipped with. Silence
     # ending is a real recovery for the INSTRUMENT, but the alarm cannot tell
