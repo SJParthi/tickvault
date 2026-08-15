@@ -2193,6 +2193,25 @@ fn current_feed_token() -> Option<FeedTokenBuffer<String>> {
 pub struct DhanFeedStackParams {
     /// `[feeds] dhan_enabled` from the boot config.
     pub dhan_enabled: bool,
+    /// Live-feed frames recovered from the write-ahead log at boot, as
+    /// `(frame_seq, raw_bytes)` — the exact bytes a previous session captured
+    /// but died before folding.
+    ///
+    /// # Why these arrive here rather than being folded at the replay site
+    ///
+    /// Replay happens during boot, in `main.rs`, where the thing that can fold
+    /// a frame does not exist yet: `LiveIngest` is constructed on THIS task.
+    /// Until 2026-08-15 the replay site therefore counted these frames and
+    /// **dropped** them — the largest tick-loss path the system actually owned,
+    /// since an unclean stop during market hours discarded every tick captured
+    /// since the last flush.
+    ///
+    /// Handing the batch to the lane is what closes it: the frames are folded
+    /// immediately after the ingest exists and before any socket opens, so a
+    /// recovered frame can never race a live one.
+    ///
+    /// Empty on a clean boot, which is the overwhelmingly common case.
+    pub wal_replay_live_feed: Vec<(u64, bytes::Bytes)>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -2513,6 +2532,108 @@ fn dial_planned_connections(
     dialed
 }
 
+/// What a WAL re-fold actually recovered.
+///
+/// `refolded` and `lost` are mutually exclusive per tick — a tick is folded XOR
+/// lost, never both — so `refolded + lost` is the total the batch contained and
+/// neither number can flatter the other.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WalRefoldOutcome {
+    /// Ticks successfully folded into the aggregator and queued for the DB.
+    pub refolded: u64,
+    /// Ticks parsed but REFUSED by the fold (sequence unrepresentable,
+    /// aggregator refusal, write failure). Real, counted loss.
+    pub lost: u64,
+    /// Frames whose bytes could not be parsed at all.
+    pub unparseable: u64,
+}
+
+/// Re-folds live-feed frames recovered from the write-ahead log.
+///
+/// # Why this is safe to run twice
+///
+/// It is idempotent by construction, and the reason is worth stating precisely
+/// because it is the whole basis for replaying at all. The `ticks` DEDUP key is
+/// `(ts, security_id, segment, capture_seq, feed)`. `capture_seq` is derived
+/// from the frame sequence stored IN the WAL record — it is read back, never
+/// re-stamped — so a frame folded twice produces byte-identical keys and the
+/// second write collapses onto the first instead of duplicating a tick.
+///
+/// The packet index is folded in for the same reason it is on the live path:
+/// one frame can carry many packets, and two trades on the same instrument in
+/// the same second would otherwise share a key and silently become one tick.
+///
+/// # Why it walks packets rather than parsing once
+///
+/// A single WebSocket message stacks up to ~1,600 packets. Parsing only the
+/// first would silently discard the rest — which would make this recovery path
+/// quietly lossy, the exact failure it exists to fix.
+///
+/// # Errors
+///
+/// Never returns an error. An unparseable frame is counted and skipped rather
+/// than aborting the batch, because one corrupt frame must not cost the
+/// recovery of every other frame beside it.
+pub fn refold_wal_frames(
+    ingest: &mut LiveIngest,
+    frames: &[(u64, bytes::Bytes)],
+) -> WalRefoldOutcome {
+    let mut out = WalRefoldOutcome::default();
+
+    // Recovered frames are historical: their exchange timestamps are whatever
+    // the exchange stamped, and the receipt instant is gone with the dead
+    // process. Using "now" is deliberate and only affects the delivery-lag
+    // reading, which is meaningless for a replayed frame — the tick's own
+    // exchange timestamp, which decides the candle bucket, is read from the
+    // packet exactly as on the live path.
+    let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let recv_millis = u64::try_from(received_at_nanos.max(0) / 1_000_000).unwrap_or(0);
+
+    for (frame_seq, bytes) in frames {
+        let mut offset = 0usize;
+        let mut packets = 0u32;
+        while offset < bytes.len() {
+            let Some(len) = main_feed_packet_len(&bytes[offset..]) else {
+                // Stop at the first unrecognised boundary rather than
+                // resynchronising on a guess, which would fabricate ticks.
+                out.unparseable = out.unparseable.saturating_add(1);
+                break;
+            };
+            let end = offset.saturating_add(len);
+            if end > bytes.len() {
+                out.unparseable = out.unparseable.saturating_add(1);
+                break;
+            }
+            if let Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _)) =
+                dispatch_frame(&bytes[offset..end], received_at_nanos)
+            {
+                // Deliberately NOT calling `record_ws_lag`: a replayed frame
+                // has no meaningful delivery latency, and feeding "now minus
+                // the exchange stamp" into the lag histogram would poison the
+                // one number the operator uses to judge the live feed.
+                match ingest.ingest_tick_at(&tick, *frame_seq, packets, recv_millis) {
+                    IngestOutcome::Folded { .. } => {
+                        out.refolded = out.refolded.saturating_add(1);
+                    }
+                    IngestOutcome::SeqUnrepresentable
+                    | IngestOutcome::AggregatorRefused
+                    | IngestOutcome::WriteFailed => {
+                        out.lost = out.lost.saturating_add(1);
+                    }
+                }
+            }
+            packets = packets.saturating_add(1);
+            offset = end;
+        }
+    }
+
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "refolded")
+        .increment(out.refolded);
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "lost").increment(out.lost);
+
+    out
+}
+
 pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task::JoinHandle<()>> {
     let env_opt_in = std::env::var(DHAN_LIVE_FEED_ENV).ok();
     let gate = feed_stack_gate(params.dhan_enabled, env_opt_in.as_deref());
@@ -2730,6 +2851,38 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     for instrument in &params.main_feed_instruments {
         if ingest.seed(instrument.security_id, instrument.segment, seed_millis) {
             seeded = seeded.saturating_add(1);
+        }
+    }
+
+    // ---- re-fold WAL frames recovered from a previous session --------------
+    //
+    // Deliberately placed AFTER seeding and BEFORE any socket opens. A
+    // recovered frame therefore cannot race a live frame for the same
+    // `capture_seq`, and the gap detector already knows every instrument, so a
+    // recovered tick lands against a seeded slot rather than creating one.
+    if !params.wal_replay_live_feed.is_empty() {
+        let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
+        if outcome.lost == 0 {
+            info!(
+                frames = params.wal_replay_live_feed.len(),
+                ticks = outcome.refolded,
+                "recovered live-feed frames from the write-ahead log and folded them — \
+                 ticks captured by a previous session are now in the database"
+            );
+        } else {
+            // Never silently green: a frame we could not re-fold is data we
+            // captured and then failed to save, which is exactly what this
+            // path exists to stop.
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                frames = params.wal_replay_live_feed.len(),
+                ticks = outcome.refolded,
+                lost = outcome.lost,
+                "recovered live-feed frames from the write-ahead log, but {} tick(s) could \
+                 NOT be folded — the raw frames remain in the WAL archive and can be \
+                 recovered manually",
+                outcome.lost
+            );
         }
     }
 
@@ -3670,6 +3823,9 @@ mod tests {
         // socket, no behaviour change.
         let handle = spawn_dhan_feed_stack(DhanFeedStackParams {
             dhan_enabled: false,
+            // A disabled lane never reaches the re-fold, which is exactly why
+            // main.rs still drops the batch loudly when the gate is closed.
+            wal_replay_live_feed: Vec::new(),
             main_feed_instruments: hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -5019,6 +5175,76 @@ mod tests {
             "the depth deadline MUST be guarded by `attempts > 0` — an unguarded check makes a \
              mid-session restart give up before it has looked even once, exactly when the chain \
              table is fullest"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wal_refold_tests {
+    use super::*;
+    use tickvault_common::feed::Feed;
+
+    fn ingest() -> LiveIngest {
+        LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+    }
+
+    #[test]
+    fn test_refold_wal_frames_empty_batch_recovers_nothing() {
+        let out = refold_wal_frames(&mut ingest(), &[]);
+        assert_eq!(out, WalRefoldOutcome::default());
+    }
+
+    #[test]
+    fn test_refold_wal_frames_unparseable_frame_is_counted() {
+        // A frame whose first byte is not a known packet code. The batch must
+        // survive it — one corrupt frame must never cost the recovery of the
+        // frames beside it — but it must NOT vanish silently either.
+        let frames = vec![(1u64, bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]))];
+        let out = refold_wal_frames(&mut ingest(), &frames);
+        assert_eq!(out.refolded, 0, "garbage must not produce ticks");
+        assert_eq!(
+            out.unparseable, 1,
+            "garbage must be COUNTED, not dropped silently"
+        );
+    }
+
+    #[test]
+    fn test_refold_wal_frames_truncated_packet_stops_at_boundary() {
+        // Claims a ticker packet but carries fewer bytes than one. The walker
+        // must stop at the boundary rather than reading past it or
+        // resynchronising on a guess, which would fabricate ticks.
+        let frames = vec![(7u64, bytes::Bytes::from_static(&[2, 0, 0, 0]))];
+        let out = refold_wal_frames(&mut ingest(), &frames);
+        assert_eq!(out.refolded, 0);
+        assert!(out.unparseable >= 1, "a truncated packet must be counted");
+    }
+
+    #[test]
+    fn test_wal_refold_outcome_refolded_and_lost_mutually_exclusive() {
+        // The arithmetic guarantee the operator relies on: a tick is folded
+        // XOR lost. If both could increment for one tick, a loss report could
+        // be hidden behind a success count.
+        let out = refold_wal_frames(&mut ingest(), &[]);
+        assert_eq!(out.refolded, 0);
+        assert_eq!(out.lost, 0);
+        // Structural: the fold loop's match arms are disjoint by construction —
+        // `Folded` increments `refolded`, every other outcome increments `lost`,
+        // and there is no arm that touches both.
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split("pub fn refold_wal_frames")
+            .nth(1)
+            .expect("refold_wal_frames must exist");
+        let loop_body = &body[..body.find("metrics::counter!").unwrap_or(body.len())];
+        assert_eq!(
+            loop_body.matches("out.refolded = out.refolded").count(),
+            1,
+            "exactly one site may increment `refolded`"
+        );
+        assert_eq!(
+            loop_body.matches("out.lost = out.lost").count(),
+            1,
+            "exactly one site may increment `lost`"
         );
     }
 }

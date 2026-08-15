@@ -1838,7 +1838,30 @@ async fn main() -> Result<()> {
         .increment(dropped);
         ws_wal_replay_order_update.clear();
     }
-    if !ws_wal_replay_live_feed.is_empty() {
+    // Will the Dhan lane actually run this boot? Computed with the SAME gate
+    // the lane itself uses, so the two can never disagree about whether these
+    // frames have somewhere to go. If they do, they are handed over below and
+    // must NOT be dropped or cleared here.
+    let dhan_lane_will_refold = matches!(
+        tickvault_app::dhan_feed_stack::feed_stack_gate(
+            config.feeds.dhan_enabled,
+            std::env::var(tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV)
+                .ok()
+                .as_deref(),
+        ),
+        tickvault_app::dhan_feed_stack::FeedStackGate::Enabled
+    );
+
+    // 2026-08-15 — the drop below is RETIRED. `ws_wal_replay_live_feed` is now
+    // handed to the Dhan lane (`DhanFeedStackParams::wal_replay_live_feed`),
+    // which re-folds it immediately after `LiveIngest` exists and before any
+    // socket opens. The re-fold is DEDUP-idempotent: `capture_seq` is read back
+    // from the WAL record rather than re-stamped.
+    //
+    // This block now fires ONLY when the frames have nowhere to go — the lane
+    // is disabled, so nothing will ever fold them. That is still real loss and
+    // still says so; what changed is that it is no longer the normal path.
+    if !ws_wal_replay_live_feed.is_empty() && !dhan_lane_will_refold {
         let dropped = ws_wal_replay_live_feed.len() as u64;
         // 2026-08-11 — this message was written on 2026-07-14, when it was
         // true: the Dhan live WS had just been retired, nothing appended
@@ -2049,6 +2072,11 @@ async fn main() -> Result<()> {
             // includes them (2026-08-14).
             calendar: std::sync::Arc::clone(&trading_calendar),
             dhan_enabled: config.feeds.dhan_enabled,
+            // Frames a previous session captured but died before folding. The
+            // lane re-folds them after its ingest exists and before any socket
+            // opens; DEDUP-idempotent via the replay-stable `capture_seq`.
+            // Empty on a clean boot.
+            wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
             // DEFAULT-OFF: with `live_subscription_from_master = false` (the
             // shipped value) this returns the same 4 hardcoded index SIDs the
             // lane has always used, so the operator's 2026-08-11 third-quote
