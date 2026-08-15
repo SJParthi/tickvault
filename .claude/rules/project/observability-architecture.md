@@ -117,7 +117,24 @@ caller is still told the frame was durably captured, so the
 capture-at-receipt floor is gone and nothing upstream can tell. Same 3×300s
 shape and `ok_recovery = false` as its sibling — frames that arrived during
 the outage were never written, so a recovering disk does not restore
-them**)**.
+them**)**, and **RISK-GAP-03 (added 2026-08-15** — the CONNECTED-BUT-SILENT
+page, authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.3a. The 30s
+silence scan was wired on 2026-08-12 and its verdict left log-sink-only,
+which made the one detector for an otherwise-invisible failure itself
+invisible: a subscribe that silently does not take produces no payload to
+count, no parse to fail, and no error of its own, so the socket stays open,
+the lane gauge reads 1, and every loss counter sits at a healthy flat zero.
+A LOG FILTER rather than a gauge threshold, deliberately — the app already
+gates the emit to the CONTINUOUS session (never the legitimately-silent
+pre-open) and edge-latches it to one per episode, so the coded line carries
+the market-hours gating and de-duplication a raw gauge alarm would need a
+window Lambda and an unknown baseline to reproduce. `eval = 1`, unlike the
+ws-spill pair, because the app has ALREADY required two consecutive 30s
+scans before writing the line — three more CloudWatch windows would delay
+the page ten minutes for a condition the detector has confirmed.
+`ok_recovery = true`, also unlike that pair: silence is not the permanent
+loss of a specific frame — instruments genuinely start ticking again, and
+"the feed is being heard again" is a real recovery worth telling**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added
