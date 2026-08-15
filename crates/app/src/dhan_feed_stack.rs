@@ -1832,6 +1832,40 @@ fn silence_page_is_cooling(last_page_secs: Option<u64>, now_secs: u64, cooldown:
     last_page_secs.is_some_and(|last| now_secs.saturating_sub(last) < cooldown)
 }
 
+/// Flushes the depth ILP buffer, if a depth ingest is wired.
+///
+/// Deliberately a separate call from the tick flush rather than folded into
+/// it: the two writers hold independent buffers over independent tables, and
+/// a tick-flush failure must not skip the depth flush (nor the reverse). The
+/// writer already discards-and-logs its own failure, so the failure is loud at
+/// its source and this wrapper does not need to re-report it.
+fn flush_depth(depth: Option<&mut DepthIngest>) {
+    let Some(depth) = depth else { return };
+    if depth.pending_rows() == 0 {
+        return;
+    }
+    // The writer counts its own discards, but that counter lives in the
+    // storage crate and is NOT the EMF-shipped name. Mirroring the DELTA into
+    // the labelled drain counter is what makes a database-side depth loss
+    // visible in CloudWatch at all — and the delta, not the total, because a
+    // cumulative would read alarming forever after one bad flush.
+    let before = depth.dropped_rows();
+    if let Err(err) = blocking_flush(|| depth.flush()) {
+        // Deliberately `debug!`, not a second `error!`: the writer already
+        // logged this failure at ERROR with the discarded row count, and
+        // re-reporting it here would double every depth flush failure in the
+        // log while adding nothing an operator can act on.
+        tracing::debug!(
+            ?err,
+            "market_depth flush failed (already reported by the writer)"
+        );
+    }
+    let delta = depth.dropped_rows().saturating_sub(before);
+    if delta > 0 {
+        counters().depth_dropped.increment(delta);
+    }
+}
+
 async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
@@ -3833,22 +3867,34 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     }
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
-    // The ring's second bound, split by ENDPOINT rather than shared.
+    // TWO properties, merged rather than picked between (2026-08-15).
     //
-    // One budget per POOL would bound five times the host's memory, which is
-    // why the original was shared. But one budget for ALL endpoints let the
-    // depth stream — whose frames are 512 KiB — exhaust the whole ceiling and
-    // evict main-feed frames, i.e. every tick that reaches the database. Two
-    // budgets summing to the SAME total keep the host ceiling identical while
-    // making that eviction impossible.
+    // origin/main SPLIT the ring budget by endpoint so a 512 KiB depth frame
+    // can no longer evict main-feed frames. This branch made the budget
+    // HOST-DERIVED so a 32 GiB box stops running a ring sized for a 4 GiB one.
+    // Taking either alone loses the other: main's split is expressed as
+    // fractions of the FRAME_RING_MAX_BYTES constant, so keeping it verbatim
+    // would re-introduce the exact hardcoded-for-the-wrong-machine defect this
+    // branch removed.
     //
-    // (The original comment said depth's payload was "discarded unparsed".
-    // That stopped being true on 2026-08-15, when depth became a persisted
-    // stream. The split matters MORE now, not less: depth is no longer merely
-    // occupying the ring, it is producing 20–200 database rows per packet, so
-    // an unbounded depth burst would compete with ticks for the ILP path too.)
-    let main_feed_budget = Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES));
-    let depth_budget = Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES));
+    // The fractions are what compose: apply main's 3/4 : 1/4 split to the
+    // derived TOTAL. The host ceiling stays whatever the host can afford, and
+    // depth still cannot starve the main feed.
+    let ring_max_bytes = frame_ring_max_bytes_for_host();
+    info!(
+        ring_max_bytes,
+        floor_bytes = FRAME_RING_MAX_BYTES,
+        auto_sized = ring_max_bytes > FRAME_RING_MAX_BYTES,
+        "frame ring byte ceiling selected for this host"
+    );
+    // Published as GAUGES, not left in a boot log. An auto-sized buffer nobody
+    // can see is worse than a fixed one: with a constant you can at least read
+    // the source and know the value.
+    metrics::gauge!("tv_dhan_feed_ring_max_bytes").set(ring_max_bytes as f64);
+    metrics::gauge!("tv_host_total_ram_bytes").set(host_total_ram_bytes().unwrap_or(0) as f64);
+    let main_feed_share = ring_max_bytes / 4 * 3;
+    let main_feed_budget = Arc::new(RingByteBudget::new(main_feed_share));
+    let depth_budget = Arc::new(RingByteBudget::new(ring_max_bytes - main_feed_share));
     // ALWAYS built, and that is load-bearing rather than lazy.
     //
     // The obvious shape — build it only when the boot-time depth sets are
