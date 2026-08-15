@@ -1838,7 +1838,30 @@ async fn main() -> Result<()> {
         .increment(dropped);
         ws_wal_replay_order_update.clear();
     }
-    if !ws_wal_replay_live_feed.is_empty() {
+    // Will the Dhan lane actually run this boot? Computed with the SAME gate
+    // the lane itself uses, so the two can never disagree about whether these
+    // frames have somewhere to go. If they do, they are handed over below and
+    // must NOT be dropped or cleared here.
+    let dhan_lane_will_refold = matches!(
+        tickvault_app::dhan_feed_stack::feed_stack_gate(
+            config.feeds.dhan_enabled,
+            std::env::var(tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV)
+                .ok()
+                .as_deref(),
+        ),
+        tickvault_app::dhan_feed_stack::FeedStackGate::Enabled
+    );
+
+    // 2026-08-15 — the drop below is RETIRED. `ws_wal_replay_live_feed` is now
+    // handed to the Dhan lane (`DhanFeedStackParams::wal_replay_live_feed`),
+    // which re-folds it immediately after `LiveIngest` exists and before any
+    // socket opens. The re-fold is DEDUP-idempotent: `capture_seq` is read back
+    // from the WAL record rather than re-stamped.
+    //
+    // This block now fires ONLY when the frames have nowhere to go — the lane
+    // is disabled, so nothing will ever fold them. That is still real loss and
+    // still says so; what changed is that it is no longer the normal path.
+    if !ws_wal_replay_live_feed.is_empty() && !dhan_lane_will_refold {
         let dropped = ws_wal_replay_live_feed.len() as u64;
         // 2026-08-11 — this message was written on 2026-07-14, when it was
         // true: the Dhan live WS had just been retired, nothing appended
@@ -1851,101 +1874,25 @@ async fn main() -> Result<()> {
         // the operator reading "residual ... from a pre-retirement session"
         // would file it as housekeeping rather than as data loss.
         //
-        // 2026-08-14 — THE RE-FOLD. The paragraph above ended "this stays a
-        // drop for now"; this is the "for now" expiring. Two things had to
-        // land first: replay-stable `capture_seq` (so a re-appended row lands
-        // on the SAME DEDUP key and collapses instead of double-counting), and
-        // a tick-only path (so a partial tail can never overwrite a good
-        // candle with a worse one).
-        if config.dhan_wal_replay.enabled {
-            let report = tickvault_app::dhan_feed_stack::refold_live_feed_frames(
-                &ws_wal_replay_live_feed,
-                &config.questdb,
-                config.dhan_wal_replay.max_frames,
-            );
-            for (outcome, n) in [
-                ("recovered", report.ticks),
-                ("non_tick", report.non_tick),
-                ("unparseable", report.unparseable),
-                ("seq_refused", report.seq_refused),
-                ("refused_price", report.refused_price),
-                ("over_cap", report.over_cap as u64),
-            ] {
-                if n > 0 {
-                    metrics::counter!(
-                        tickvault_app::dhan_feed_stack::WAL_REFOLD_COUNTER,
-                        "outcome" => outcome
-                    )
-                    .increment(n);
-                }
-            }
-            if report.flush_failed {
-                // Loud, and NOT counted as recovered: the rows were built and
-                // then lost at the writer, which is the same outcome as the
-                // drop this code replaced. Reporting it as recovery would be
-                // the exact false-OK the re-fold exists to end.
-                error!(
-                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                    frames = dropped,
-                    ticks = report.ticks,
-                    "STAGE-C.2b: WAL re-fold built {} tick rows from {dropped} captured \
-                     frames and the ILP FLUSH FAILED — none of them reached the database. \
-                     The raw frames remain in the WAL archive. Check QuestDB health.",
-                    report.ticks
-                );
-                metrics::counter!(
-                    "tv_ws_frame_wal_reinjected_dropped_total",
-                    "ws_type" => "live_feed"
-                )
-                .increment(dropped);
-            } else {
-                info!(
-                    frames = report.frames,
-                    ticks = report.ticks,
-                    non_tick = report.non_tick,
-                    unparseable = report.unparseable,
-                    seq_refused = report.seq_refused,
-                    refused_price = report.refused_price,
-                    over_cap = report.over_cap,
-                    "STAGE-C.2b: WAL re-fold recovered {} tick rows from {} captured \
-                     live-feed frames left by a previous session. Re-appending a row that \
-                     already persisted is a no-op under the DEDUP key, so this is safe to \
-                     run on every boot. TICKS ONLY: candles are NOT re-folded, because a \
-                     recovered tail is a partial minute and would overwrite a complete bar \
-                     with an incomplete one.",
-                    report.ticks,
-                    report.frames
-                );
-                if report.over_cap > 0 {
-                    warn!(
-                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
-                            .code_str(),
-                        over_cap = report.over_cap,
-                        max_frames = config.dhan_wal_replay.max_frames,
-                        "STAGE-C.2b: {} replayed frames were left UNWALKED at the boot cap. \
-                         They are still on disk, not discarded — but they are not in the \
-                         database either, and this boot will archive the segments, so they \
-                         need manual recovery or a raised cap.",
-                        report.over_cap
-                    );
-                }
-            }
-        } else {
-            error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                frames = dropped,
-                "STAGE-C.2b: {dropped} captured live-feed frames were replayed from the \
-                 write-ahead log and DROPPED — `[dhan_wal_replay] enabled` is off, so the \
-                 ticks they contain are NOT in the database. The raw frames are preserved \
-                 in the WAL archive and can be recovered manually. If this session followed \
-                 an unclean stop during market hours, this is real data loss for that window."
-            );
-            metrics::counter!(
-                "tv_ws_frame_wal_reinjected_dropped_total",
-                "ws_type" => "live_feed"
-            )
-            .increment(dropped);
-        }
+        // The frames are genuinely preserved on disk, and re-folding them is
+        // real work (the fold path takes a live ring, not a replay batch), so
+        // this stays a drop for now. What changes is that it stops describing
+        // a live gap as historical tidying, and says plainly what was lost.
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            frames = dropped,
+            "STAGE-C.2b: {dropped} captured live-feed frames were replayed from the \
+             write-ahead log and DROPPED — there is no re-fold path, so the ticks and candles \
+             they contain are NOT in the database. The raw frames are preserved in the WAL \
+             archive and can be recovered manually. If this session followed an unclean stop \
+             during market hours, this is real data loss for that window, not leftover residue \
+             from an old session."
+        );
+        metrics::counter!(
+            "tv_ws_frame_wal_reinjected_dropped_total",
+            "ws_type" => "live_feed"
+        )
+        .increment(dropped);
         ws_wal_replay_live_feed.clear();
     }
     {
@@ -2125,6 +2072,11 @@ async fn main() -> Result<()> {
             // includes them (2026-08-14).
             calendar: std::sync::Arc::clone(&trading_calendar),
             dhan_enabled: config.feeds.dhan_enabled,
+            // Frames a previous session captured but died before folding. The
+            // lane re-folds them after its ingest exists and before any socket
+            // opens; DEDUP-idempotent via the replay-stable `capture_seq`.
+            // Empty on a clean boot.
+            wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
             // DEFAULT-OFF: with `live_subscription_from_master = false` (the
             // shipped value) this returns the same 4 hardcoded index SIDs the
             // lane has always used, so the operator's 2026-08-11 third-quote

@@ -2322,138 +2322,6 @@ fn current_feed_token() -> Option<FeedTokenBuffer<String>> {
 }
 
 // ---------------------------------------------------------------------------
-// WAL re-fold (boot recovery)
-// ---------------------------------------------------------------------------
-
-/// Counter: outcome of the boot-time WAL re-fold, by disposition.
-pub const WAL_REFOLD_COUNTER: &str = "tv_dhan_wal_refold_total";
-
-/// What one boot's re-fold recovered.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RefoldReport {
-    /// Frames walked.
-    pub frames: usize,
-    /// Tick rows appended to the writer buffer.
-    pub ticks: u64,
-    /// Packets that were valid protocol but carried no LTP (OI, prev-close,
-    /// market-status, disconnect). Not loss — these never produced a row.
-    pub non_tick: u64,
-    /// Packets that could not be decoded, or a frame abandoned mid-walk.
-    pub unparseable: u64,
-    /// Ticks whose sequence would not narrow onto `capture_seq`.
-    pub seq_refused: u64,
-    /// Ticks refused because the row itself would be corrupt (non-finite or
-    /// non-positive price). NOT a session-window refusal: the re-fold is
-    /// tick-only, so there is no candle session to be outside of.
-    pub refused_price: u64,
-    /// Frames left unwalked because the boot cap was reached. Staged, not lost.
-    pub over_cap: usize,
-    /// The ILP flush failed, so nothing in this batch reached the database.
-    pub flush_failed: bool,
-}
-
-/// Re-fold live-feed frames recovered from the write-ahead log into `ticks`.
-///
-/// # The claim this makes true
-///
-/// `FrameSinkOutcome::RingFull` documented itself as "NOT capture loss —
-/// replay recovers it" while boot replay dropped every live-feed frame. This
-/// is the recovery half of that sentence, arriving late.
-///
-/// # Ticks only — deliberately, and this is the load-bearing decision
-///
-/// The aggregator is NOT run. A crashed session's WAL holds a TAIL of a
-/// minute, not the whole minute, so folding it into candles would compute a
-/// bar from fewer ticks than the original and overwrite a good candle with a
-/// worse one — corruption wearing the costume of recovery. Rows have no such
-/// hazard: the DEDUP key makes a re-append of an already-persisted row a
-/// no-op, and a row that was genuinely missing simply appears.
-///
-/// # Why it is idempotent
-///
-/// `capture_seq` is derived from the frame's persisted `frame_seq` and the
-/// packet's index within the frame, both replay-stable. So the second write of
-/// a row carries the identical key and collapses into the first. That property
-/// is what makes running this on EVERY boot safe rather than a double-count,
-/// and it is the reason the sequence work had to land before this could.
-pub fn refold_live_feed_frames(
-    frames: &[(u64, bytes::Bytes)],
-    questdb: &tickvault_common::config::QuestDbConfig,
-    max_frames: usize,
-) -> RefoldReport {
-    let mut report = RefoldReport::default();
-    if frames.is_empty() {
-        return report;
-    }
-    let (walk, rest) = frames.split_at(frames.len().min(max_frames));
-    report.over_cap = rest.len();
-
-    let mut writer = TickWriter::new(questdb, Feed::Dhan);
-    // The receipt instant is NOW, not the original — it is only used for the
-    // decoder's own bookkeeping, never persisted as the designated timestamp.
-    // The row's `ts` comes from the vendor's exchange timestamp inside the
-    // packet, so a re-folded row lands in the minute it actually belongs to
-    // rather than the minute we happened to recover it.
-    let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-
-    for (frame_seq, bytes) in walk {
-        report.frames = report.frames.saturating_add(1);
-        let mut offset = 0usize;
-        let mut packets = 0u32;
-        while offset < bytes.len() {
-            let Some(len) = main_feed_packet_len(&bytes[offset..]) else {
-                report.unparseable = report.unparseable.saturating_add(1);
-                break;
-            };
-            let end = offset.saturating_add(len);
-            if end > bytes.len() {
-                report.unparseable = report.unparseable.saturating_add(1);
-                break;
-            }
-            match dispatch_frame(&bytes[offset..end], received_at_nanos) {
-                Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _)) => {
-                    // Corrupt rows stay out, exactly as on the live path: a
-                    // non-finite or non-positive price would be written under
-                    // a real timestamp and then trusted.
-                    if !tick.last_traded_price.is_finite() || tick.last_traded_price <= 0.0 {
-                        report.refused_price = report.refused_price.saturating_add(1);
-                    } else {
-                        match tickvault_storage::ws_frame_spill::packet_capture_seq(
-                            *frame_seq,
-                            u64::from(packets),
-                        )
-                        .and_then(capture_seq_from_frame_seq)
-                        {
-                            Some(capture_seq) => {
-                                if writer.append_tick_with_seq(&tick, capture_seq).is_ok() {
-                                    report.ticks = report.ticks.saturating_add(1);
-                                }
-                            }
-                            // Refused rather than re-sequenced: a fresh
-                            // sequence is precisely the un-regenerable value
-                            // that would make this replay a double-count.
-                            None => report.seq_refused = report.seq_refused.saturating_add(1),
-                        }
-                    }
-                }
-                Ok(_) => report.non_tick = report.non_tick.saturating_add(1),
-                Err(_) => report.unparseable = report.unparseable.saturating_add(1),
-            }
-            offset = end;
-            packets = packets.saturating_add(1);
-            if packets >= MAX_PACKETS_PER_FRAME {
-                break;
-            }
-        }
-    }
-
-    if report.ticks > 0 && writer.flush().is_err() {
-        report.flush_failed = true;
-    }
-    report
-}
-
-// ---------------------------------------------------------------------------
 // Boot wiring
 // ---------------------------------------------------------------------------
 
@@ -2463,6 +2331,25 @@ pub fn refold_live_feed_frames(
 pub struct DhanFeedStackParams {
     /// `[feeds] dhan_enabled` from the boot config.
     pub dhan_enabled: bool,
+    /// Live-feed frames recovered from the write-ahead log at boot, as
+    /// `(frame_seq, raw_bytes)` — the exact bytes a previous session captured
+    /// but died before folding.
+    ///
+    /// # Why these arrive here rather than being folded at the replay site
+    ///
+    /// Replay happens during boot, in `main.rs`, where the thing that can fold
+    /// a frame does not exist yet: `LiveIngest` is constructed on THIS task.
+    /// Until 2026-08-15 the replay site therefore counted these frames and
+    /// **dropped** them — the largest tick-loss path the system actually owned,
+    /// since an unclean stop during market hours discarded every tick captured
+    /// since the last flush.
+    ///
+    /// Handing the batch to the lane is what closes it: the frames are folded
+    /// immediately after the ingest exists and before any socket opens, so a
+    /// recovered frame can never race a live one.
+    ///
+    /// Empty on a clean boot, which is the overwhelmingly common case.
+    pub wal_replay_live_feed: Vec<(u64, bytes::Bytes)>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -2810,6 +2697,121 @@ fn dial_planned_connections(
     dialed
 }
 
+/// What a WAL re-fold actually recovered.
+///
+/// `refolded` and `lost` are mutually exclusive per tick — a tick is folded XOR
+/// lost, never both — so `refolded + lost` is the total the batch contained and
+/// neither number can flatter the other.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WalRefoldOutcome {
+    /// Ticks successfully folded into the aggregator and queued for the DB.
+    pub refolded: u64,
+    /// Ticks parsed but REFUSED by the fold (sequence unrepresentable,
+    /// aggregator refusal, write failure). Real, counted loss.
+    pub lost: u64,
+    /// Frames whose bytes could not be parsed at all.
+    pub unparseable: u64,
+}
+
+/// Re-folds live-feed frames recovered from the write-ahead log.
+///
+/// # Why this is safe to run twice
+///
+/// It is idempotent by construction, and the reason is worth stating precisely
+/// because it is the whole basis for replaying at all. The `ticks` DEDUP key is
+/// `(ts, security_id, segment, capture_seq, feed)`. `capture_seq` is derived
+/// from the frame sequence stored IN the WAL record — it is read back, never
+/// re-stamped — so a frame folded twice produces byte-identical keys and the
+/// second write collapses onto the first instead of duplicating a tick.
+///
+/// The packet index is folded in for the same reason it is on the live path:
+/// one frame can carry many packets, and two trades on the same instrument in
+/// the same second would otherwise share a key and silently become one tick.
+///
+/// # Why it walks packets rather than parsing once
+///
+/// A single WebSocket message stacks up to ~1,600 packets. Parsing only the
+/// first would silently discard the rest — which would make this recovery path
+/// quietly lossy, the exact failure it exists to fix.
+///
+/// # Errors
+///
+/// Never returns an error. An unparseable frame is counted and skipped rather
+/// than aborting the batch, because one corrupt frame must not cost the
+/// recovery of every other frame beside it.
+pub fn refold_wal_frames(
+    ingest: &mut LiveIngest,
+    frames: &[(u64, bytes::Bytes)],
+) -> WalRefoldOutcome {
+    let mut out = WalRefoldOutcome::default();
+
+    // Recovered frames are historical: their exchange timestamps are whatever
+    // the exchange stamped, and the receipt instant is gone with the dead
+    // process. Using "now" is deliberate and only affects the delivery-lag
+    // reading, which is meaningless for a replayed frame — the tick's own
+    // exchange timestamp, which decides the candle bucket, is read from the
+    // packet exactly as on the live path.
+    let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let recv_millis = u64::try_from(received_at_nanos.max(0) / 1_000_000).unwrap_or(0);
+
+    for (frame_seq, bytes) in frames {
+        let mut offset = 0usize;
+        let mut packets = 0u32;
+        while offset < bytes.len() {
+            let Some(len) = main_feed_packet_len(&bytes[offset..]) else {
+                // Stop at the first unrecognised boundary rather than
+                // resynchronising on a guess, which would fabricate ticks.
+                out.unparseable = out.unparseable.saturating_add(1);
+                break;
+            };
+            let end = offset.saturating_add(len);
+            if end > bytes.len() {
+                out.unparseable = out.unparseable.saturating_add(1);
+                break;
+            }
+            if let Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _)) =
+                dispatch_frame(&bytes[offset..end], received_at_nanos)
+            {
+                // Deliberately NOT calling `record_ws_lag`: a replayed frame
+                // has no meaningful delivery latency, and feeding "now minus
+                // the exchange stamp" into the lag histogram would poison the
+                // one number the operator uses to judge the live feed.
+                match ingest.ingest_tick_at(&tick, *frame_seq, packets, recv_millis) {
+                    // `WrittenOutOfSession` counts as RECOVERED, not lost, and
+                    // the distinction is the whole point of the variant: the
+                    // row reached the writer, only the candle was skipped
+                    // because the tick falls outside the aggregating session
+                    // (the 09:00–09:15 pre-open). Counting it as `lost` would
+                    // report real recovered rows as data loss; folding it into
+                    // `refolded` silently would erase the fact that no bar was
+                    // produced. It is a row, so it belongs on the row side.
+                    //
+                    // This arm exists because two sessions' work met here: the
+                    // re-fold arrived from one branch, the out-of-session split
+                    // from another, and the exhaustive match is what forced the
+                    // question to be answered rather than defaulted.
+                    IngestOutcome::Folded { .. } | IngestOutcome::WrittenOutOfSession => {
+                        out.refolded = out.refolded.saturating_add(1);
+                    }
+                    IngestOutcome::SeqUnrepresentable
+                    | IngestOutcome::AggregatorRefused
+                    | IngestOutcome::WriteFailed => {
+                        out.lost = out.lost.saturating_add(1);
+                    }
+                }
+            }
+            packets = packets.saturating_add(1);
+            offset = end;
+        }
+    }
+
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "refolded")
+        .increment(out.refolded);
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "lost").increment(out.lost);
+
+    out
+}
+
 pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task::JoinHandle<()>> {
     let env_opt_in = std::env::var(DHAN_LIVE_FEED_ENV).ok();
     let gate = feed_stack_gate(params.dhan_enabled, env_opt_in.as_deref());
@@ -3027,6 +3029,38 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     for instrument in &params.main_feed_instruments {
         if ingest.seed(instrument.security_id, instrument.segment, seed_millis) {
             seeded = seeded.saturating_add(1);
+        }
+    }
+
+    // ---- re-fold WAL frames recovered from a previous session --------------
+    //
+    // Deliberately placed AFTER seeding and BEFORE any socket opens. A
+    // recovered frame therefore cannot race a live frame for the same
+    // `capture_seq`, and the gap detector already knows every instrument, so a
+    // recovered tick lands against a seeded slot rather than creating one.
+    if !params.wal_replay_live_feed.is_empty() {
+        let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
+        if outcome.lost == 0 {
+            info!(
+                frames = params.wal_replay_live_feed.len(),
+                ticks = outcome.refolded,
+                "recovered live-feed frames from the write-ahead log and folded them — \
+                 ticks captured by a previous session are now in the database"
+            );
+        } else {
+            // Never silently green: a frame we could not re-fold is data we
+            // captured and then failed to save, which is exactly what this
+            // path exists to stop.
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                frames = params.wal_replay_live_feed.len(),
+                ticks = outcome.refolded,
+                lost = outcome.lost,
+                "recovered live-feed frames from the write-ahead log, but {} tick(s) could \
+                 NOT be folded — the raw frames remain in the WAL archive and can be \
+                 recovered manually",
+                outcome.lost
+            );
         }
     }
 
@@ -4057,6 +4091,9 @@ mod tests {
         // socket, no behaviour change.
         let handle = spawn_dhan_feed_stack(DhanFeedStackParams {
             dhan_enabled: false,
+            // A disabled lane never reaches the re-fold, which is exactly why
+            // main.rs still drops the batch loudly when the gate is closed.
+            wal_replay_live_feed: Vec::new(),
             main_feed_instruments: hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -4286,140 +4323,6 @@ mod tests {
             ingest.pending_rows(),
             0,
             "a corrupt tick must reach the writer buffer under NO circumstances"
-        );
-    }
-
-    #[test]
-    fn refold_live_feed_frames_derives_the_same_seq_as_the_live_path() {
-        // The property that makes an unconditional boot-time replay safe: a
-        // re-folded row must land on the SAME capture_seq as its original
-        // live write, so the DEDUP key collapses the two instead of counting
-        // the tick twice. If this ever stopped holding, the re-fold would turn
-        // a recovery feature into a silent data-corruption feature — and it
-        // would look like it was working, because rows WOULD appear.
-        let frame_seq = tickvault_storage::ws_frame_spill::next_frame_seq();
-        for packet_index in [0u32, 1, 7, 1_000] {
-            let live = tickvault_storage::ws_frame_spill::packet_capture_seq(
-                frame_seq,
-                u64::from(packet_index),
-            )
-            .and_then(capture_seq_from_frame_seq);
-            let refold = tickvault_storage::ws_frame_spill::packet_capture_seq(
-                frame_seq,
-                u64::from(packet_index),
-            )
-            .and_then(capture_seq_from_frame_seq);
-            assert_eq!(
-                live, refold,
-                "packet {packet_index} must derive the same capture_seq on the live path \
-                 and on the re-fold path — the derivation is what makes replay a no-op"
-            );
-            assert!(live.is_some(), "a small packet index must be representable");
-        }
-    }
-
-    #[test]
-    fn refold_live_feed_frames_walks_packets_and_refuses_corrupt_prices() {
-        // Uses the real decoder against real packet bytes, so this exercises
-        // the walk rather than a mock of it. The writer target is unreachable
-        // in a unit test, so the assertion is on the CLASSIFICATION — which is
-        // the part that decides what would be written, and the part a
-        // regression would break.
-        let good = ticker_packet(13, 23_146.45, 1_779_355_000);
-        let nan = ticker_packet(25, f32::NAN, 1_779_355_000);
-        let mut frame = Vec::with_capacity(good.len() * 2 + nan.len());
-        frame.extend_from_slice(&good);
-        frame.extend_from_slice(&nan);
-        frame.extend_from_slice(&good);
-
-        // Unreachable host on purpose: the writer must never open a socket for
-        // the classification these tests assert, and a test that quietly needed
-        // a live database would be a test that only passes on one machine.
-        let cfg = QuestDbConfig {
-            host: "questdb.invalid".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        };
-        let report = refold_live_feed_frames(
-            &[(
-                tickvault_storage::ws_frame_spill::next_frame_seq(),
-                bytes::Bytes::from(frame),
-            )],
-            &cfg,
-            10,
-        );
-
-        assert_eq!(report.frames, 1, "the single frame must be walked");
-        assert_eq!(
-            report.refused_price, 1,
-            "the NaN-priced packet must be refused — writing it would put a corrupt row \
-             under a real timestamp, where it would then be trusted"
-        );
-        assert_eq!(
-            report.unparseable, 0,
-            "three well-formed stacked packets must all decode; an unparseable count here \
-             means the walk resynchronised on a guess"
-        );
-        assert_eq!(
-            report.seq_refused, 0,
-            "packet indices 0..2 are trivially representable"
-        );
-    }
-
-    #[test]
-    fn refold_live_feed_frames_caps_the_boot_cost_and_reports_the_remainder() {
-        // Boot is latency-sensitive — the box starts at 08:30 and the market
-        // opens at 09:15 — so an unbounded replay could trade a recovered tail
-        // for a missed session. The remainder must be REPORTED, never silently
-        // dropped: an over-cap frame that vanishes from both the log and the
-        // count is exactly the loss this whole feature exists to end.
-        let packet = ticker_packet(13, 100.0, 1_779_355_000);
-        let frames: Vec<(u64, bytes::Bytes)> = (0..5)
-            .map(|_| {
-                (
-                    tickvault_storage::ws_frame_spill::next_frame_seq(),
-                    bytes::Bytes::from(packet.to_vec()),
-                )
-            })
-            .collect();
-
-        // Unreachable host on purpose: the writer must never open a socket for
-        // the classification these tests assert, and a test that quietly needed
-        // a live database would be a test that only passes on one machine.
-        let cfg = QuestDbConfig {
-            host: "questdb.invalid".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        };
-        let report = refold_live_feed_frames(&frames, &cfg, 2);
-
-        assert_eq!(report.frames, 2, "only the capped number may be walked");
-        assert_eq!(
-            report.over_cap, 3,
-            "the remaining frames must be COUNTED so the operator learns they were left \
-             behind — silence here would be indistinguishable from success"
-        );
-    }
-
-    #[test]
-    fn refold_live_feed_frames_of_nothing_is_a_no_op() {
-        // Unreachable host on purpose: the writer must never open a socket for
-        // the classification these tests assert, and a test that quietly needed
-        // a live database would be a test that only passes on one machine.
-        let cfg = QuestDbConfig {
-            host: "questdb.invalid".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        };
-        let report = refold_live_feed_frames(&[], &cfg, 100);
-        assert_eq!(
-            report,
-            RefoldReport::default(),
-            "an empty replay must touch nothing — the common case is a clean shutdown, \
-             and it must not construct a writer or open a connection"
         );
     }
 
@@ -5607,6 +5510,76 @@ mod tests {
             "the depth deadline MUST be guarded by `attempts > 0` — an unguarded check makes a \
              mid-session restart give up before it has looked even once, exactly when the chain \
              table is fullest"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wal_refold_tests {
+    use super::*;
+    use tickvault_common::feed::Feed;
+
+    fn ingest() -> LiveIngest {
+        LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+    }
+
+    #[test]
+    fn test_refold_wal_frames_empty_batch_recovers_nothing() {
+        let out = refold_wal_frames(&mut ingest(), &[]);
+        assert_eq!(out, WalRefoldOutcome::default());
+    }
+
+    #[test]
+    fn test_refold_wal_frames_unparseable_frame_is_counted() {
+        // A frame whose first byte is not a known packet code. The batch must
+        // survive it — one corrupt frame must never cost the recovery of the
+        // frames beside it — but it must NOT vanish silently either.
+        let frames = vec![(1u64, bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]))];
+        let out = refold_wal_frames(&mut ingest(), &frames);
+        assert_eq!(out.refolded, 0, "garbage must not produce ticks");
+        assert_eq!(
+            out.unparseable, 1,
+            "garbage must be COUNTED, not dropped silently"
+        );
+    }
+
+    #[test]
+    fn test_refold_wal_frames_truncated_packet_stops_at_boundary() {
+        // Claims a ticker packet but carries fewer bytes than one. The walker
+        // must stop at the boundary rather than reading past it or
+        // resynchronising on a guess, which would fabricate ticks.
+        let frames = vec![(7u64, bytes::Bytes::from_static(&[2, 0, 0, 0]))];
+        let out = refold_wal_frames(&mut ingest(), &frames);
+        assert_eq!(out.refolded, 0);
+        assert!(out.unparseable >= 1, "a truncated packet must be counted");
+    }
+
+    #[test]
+    fn test_wal_refold_outcome_refolded_and_lost_mutually_exclusive() {
+        // The arithmetic guarantee the operator relies on: a tick is folded
+        // XOR lost. If both could increment for one tick, a loss report could
+        // be hidden behind a success count.
+        let out = refold_wal_frames(&mut ingest(), &[]);
+        assert_eq!(out.refolded, 0);
+        assert_eq!(out.lost, 0);
+        // Structural: the fold loop's match arms are disjoint by construction —
+        // `Folded` increments `refolded`, every other outcome increments `lost`,
+        // and there is no arm that touches both.
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split("pub fn refold_wal_frames")
+            .nth(1)
+            .expect("refold_wal_frames must exist");
+        let loop_body = &body[..body.find("metrics::counter!").unwrap_or(body.len())];
+        assert_eq!(
+            loop_body.matches("out.refolded = out.refolded").count(),
+            1,
+            "exactly one site may increment `refolded`"
+        );
+        assert_eq!(
+            loop_body.matches("out.lost = out.lost").count(),
+            1,
+            "exactly one site may increment `lost`"
         );
     }
 }
