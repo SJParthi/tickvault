@@ -846,12 +846,32 @@ impl SubscribeGuard {
 /// What happened to one captured frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameSinkOutcome {
-    /// Durable in the WAL and handed to the ring.
+    /// QUEUED for durable write, and handed to the ring.
+    ///
+    /// 2026-08-14 correction: this said "Durable in the WAL". It is not.
+    /// `append_with_seq` returns as soon as the record is on the writer
+    /// thread's bounded channel — its own doc says "queued for durable write"
+    /// — so a `SIGKILL` or host power loss discards everything still on that
+    /// channel plus the writer's buffer, ALL of it already reported here as
+    /// captured. There is no `fsync` anywhere on this path, deliberately: it
+    /// is a throughput trade, not an oversight. Naming the outcome for the
+    /// stronger property was the oversight.
     Captured,
-    /// Durable in the WAL; the bounded ring refused it because the downstream
-    /// consumer is behind. NOT capture loss — replay recovers it.
+    /// Queued for durable write; the bounded ring refused it because the
+    /// downstream consumer is behind.
+    ///
+    /// 2026-08-14 correction: this said "NOT capture loss — replay recovers
+    /// it." That was FALSE AS SHIPPED and had been since the live lane was
+    /// revived — boot replay DROPS every live-feed frame, because no re-fold
+    /// path exists. The drain-side log line has always said so honestly; this
+    /// doc did not, and a comment claiming recovery is worse than no comment,
+    /// because it tells the next reader not to look.
+    ///
+    /// Until a re-fold exists, a ring refusal is PERMANENT LOSS and is alarmed
+    /// as such (`tv-<env>-ws-ring-full`).
     RingFull,
-    /// The WAL refused it. This is the only genuine capture-loss path.
+    /// The WAL refused it outright — the queue itself was full, so the frame
+    /// reached neither disk nor the ring. Genuine, immediate capture loss.
     WalDropped,
 }
 

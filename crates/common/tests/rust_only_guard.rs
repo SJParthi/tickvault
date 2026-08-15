@@ -185,8 +185,30 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path.ends_with(".xml")
         || path.ends_with(".alloy")
         || path.ends_with(".json")
-        || path == "Makefile"
-        || path.ends_with("/Makefile")
+        // 2026-08-14 SCOPE FIX #7 — MAKE'S OTHER NAMES. The check was
+        // `path == "Makefile" || path.ends_with("/Makefile")`, case-SENSITIVE
+        // and single-name. GNU make's search order is `GNUmakefile`,
+        // `makefile`, `Makefile` — so a tracked `GNUmakefile` SHADOWS the
+        // scanned `Makefile` entirely while being invisible here, and it
+        // carries no shebang, so the first-line fallback does not catch it
+        // either. `*.mk` includes are the same class. This is precisely the
+        // enumerate-one-more-name failure the `has_interpreter_shebang`
+        // docblock below says has already been wrong four times; the honest
+        // fix for make is to enumerate the names make itself enumerates.
+        || matches!(
+            path.rsplit('/').next(),
+            Some("Makefile" | "makefile" | "GNUmakefile")
+        )
+        || path.ends_with(".mk")
+        // `<name>.Dockerfile` — the `docker build -f prod.Dockerfile`
+        // convention, which `Dockerfile.*` does not match. Latent (zero
+        // tracked Dockerfiles today), enumerated for the same reason.
+        || path.ends_with(".Dockerfile")
+        // Copy-into-place settings carriers. `.claude/settings.local.json`
+        // itself is gitignored, but its tracked `.example`/`.template` seeds
+        // carry hook COMMAND lines and end in neither `.json` nor a shebang.
+        || path.ends_with(".json.example")
+        || path.ends_with(".json.template")
         || path.starts_with("scripts/git-hooks/")
         // 2026-08-14 SCOPE FIX #4 — CARGO CONFIG. `.cargo/config.toml` can set
         // `[target.*] runner = …` and `linker = …`, which the toolchain
@@ -404,10 +426,28 @@ fn stale_invocation_sites(files: &[(String, String)], allowlist: &[&str]) -> Vec
 // Verified at fix time: the only literal spawns in the workspace are `git`,
 // `docker`, `df`, `bash`, `sh`, `open`, `chronyc` — all benign.
 //
-// HONEST LIMIT: spawns through a NON-literal program (`Command::new(program)`
+// HONEST LIMIT 1: spawns through a NON-literal program (`Command::new(program)`
 // where `program` is a variable — 6 such sites exist, e.g. `infra.rs`,
 // `tv_doctor.rs`) cannot be resolved statically and are NOT covered. This
 // catches the direct, greppable re-introduction, not a determined author.
+//
+// HONEST LIMIT 2 (2026-08-14, found by audit — recorded, NOT closed): a spawn
+// routed through a WRAPPER function is invisible here, and such a wrapper
+// already exists — `tickvault-logs-mcp/src/tools.rs::run_with_timeout(program,
+// …)`, called with bare `"bash"` / `"git"` / `"docker"` literals that sit in
+// neither marker form. Closing this needs call-graph analysis, not a string
+// scan, so it is stated rather than pretended away. The shebang fallback and
+// the file-extension ban both still apply to whatever such a wrapper launches.
+//
+// 2026-08-14 SCOPE FIX #6 — `.args([…])`. The old marker set was
+// `Command::new("` and `.arg("`, and the PLURAL form does not contain the
+// singular one (an `s` intervenes before the paren). So
+// `Command::new("env").args(["<interpreter>", "-c", "…"])` was FULLY LITERAL
+// and FULLY GREEN: the extractor saw only the benign `"env"` and never looked
+// at the payload. That is not a hypothetical shape — `.args([…])` is already
+// the dominant form in this workspace (20+ sites, including `build.rs`, which
+// executes on every build). Same lesson as every scope row above: the hole was
+// in what the scan LOOKED AT, not in what it banned.
 fn extract_spawn_literals(content: &str) -> Vec<String> {
     let mut out = Vec::new();
     for marker in ["Command::new(\"", ".arg(\""] {
@@ -419,6 +459,26 @@ fn extract_spawn_literals(content: &str) -> Vec<String> {
             }
             rest = &rest[i + marker.len()..];
         }
+    }
+    // Plural form: take EVERY string literal inside the `[...]` group.
+    let mut rest = content;
+    while let Some(i) = rest.find(".args([") {
+        let after = &rest[i + ".args([".len()..];
+        // Bound the scan at the closing bracket so a later, unrelated literal
+        // on a following line is never attributed to this spawn.
+        let group = after.find(']').map_or(after, |end| &after[..end]);
+        let mut tail = group;
+        while let Some(open) = tail.find('"') {
+            let lit = &tail[open + 1..];
+            match lit.find('"') {
+                Some(close) => {
+                    out.push(lit[..close].to_string());
+                    tail = &lit[close + 1..];
+                }
+                None => break,
+            }
+        }
+        rest = &rest[i + ".args([".len()..];
     }
     out
 }
@@ -446,10 +506,111 @@ fn rust_spawn_violations(content: &str) -> Vec<String> {
 // count ABOVE the budget is a new usage (forbidden); a count BELOW it means
 // someone ported a block and must shrink the budget in the same PR. A file
 // absent from the budget must have ZERO.
+// ---- SCOPE FIX #9 (2026-08-15): the NODE-family runtimes ----
+//
+// `node` / `npx` / `npm` / `yarn` / `pnpm` / `deno` / `bun` were never banned
+// tokens, and `.mcp.json` runs `npx` live. The rule file recorded that as an
+// OPEN gap needing an operator ruling, because the obvious fix — adding them to
+// `banned_tokens()` — would fail the build on `.mcp.json` itself, and that file
+// is dev-session MCP tooling that is never deployed to the box. Breaking local
+// tooling to satisfy a lock that exists to protect the RUNTIME would be the
+// wrong trade.
+//
+// A blanket token ban is also wrong for a second reason: `node` is
+// prose-ambiguous. `scripts/aws-autopilot.sh` says "SSM managed node online?"
+// three times, and a word-boundary scan would flag all three. A guard whose
+// first act is three false positives teaches the reader to allowlist it.
+//
+// So this scans COMMAND POSITION, not free text: the token must begin a
+// command — at line start, after a pipe/`&&`/`;`/`$(`, or as a JSON
+// `"command":` value. "managed node" fails that test; `npx -y pkg` passes it.
+// Shrink-only budget, same shape as the github-script one: a NEW node-family
+// invocation anywhere fails; the two existing `.mcp.json` entries are pinned so
+// they cannot grow, and removing them forces the budget down in the same PR.
+const NODE_RUNTIME_BUDGET: &[(&str, usize)] = &[(".mcp.json", 2)];
+
+/// Interpreted runtimes and their package managers, as COMMAND names.
+///
+/// Covers the node family plus `ruby`/`gem`/`php`/`lua`. The latter four have
+/// their FILE extensions banned already, so a tracked `.rb` cannot exist — but
+/// an extension does not stop an inline `ruby -e '…'` in a shell script, which
+/// is the same hole the 2026-08-01 correction found for `pip`: banning the
+/// artifact is not banning the invocation. All four have ZERO live invocations,
+/// so including them costs nothing and closes the class rather than one member
+/// of it.
+const NODE_FAMILY: &[&str] = &[
+    "node", "npx", "npm", "yarn", "pnpm", "deno", "bun", "ruby", "gem", "php", "lua",
+];
+
+/// Does `token` start a COMMAND at byte offset `at` within `line`?
+///
+/// Command position is what separates an invocation from a mention. Checking it
+/// is why this guard can ban a runtime that the word "node" also names in
+/// ordinary English prose about AWS.
+fn is_command_position(line: &str, at: usize) -> bool {
+    let before = line[..at].trim_end();
+    if before.is_empty() {
+        return true;
+    }
+    // JSON `"command": "npx"` — the invocation form in `.mcp.json`.
+    if before.ends_with("\"command\":") || before.ends_with('"') && before.contains("\"command\"") {
+        return true;
+    }
+    before.ends_with('|')
+        || before.ends_with("&&")
+        || before.ends_with("||")
+        || before.ends_with(';')
+        || before.ends_with("$(")
+        || before.ends_with('(')
+        || before.ends_with('`')
+}
+
+/// Count node-family invocations in COMMAND POSITION on non-comment lines.
+fn count_node_invocations(content: &str) -> usize {
+    let mut hits = 0usize;
+    for line in content.lines() {
+        if is_comment_line(line) {
+            continue;
+        }
+        for name in NODE_FAMILY {
+            let mut rest = line;
+            let mut base = 0usize;
+            while let Some(i) = rest.find(name) {
+                let at = base + i;
+                let after = line[at + name.len()..].chars().next();
+                // A whole word, not a prefix of `nodejs_helper` or a suffix of
+                // `managed-node`.
+                let word_end = after.is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-');
+                if word_end && is_command_position(line, at) {
+                    hits = hits.saturating_add(1);
+                }
+                base = at + name.len();
+                rest = &line[base..];
+            }
+        }
+    }
+    hits
+}
+
 const GITHUB_SCRIPT_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/dep-freshness-nightly.yml", 2),
     (".github/workflows/safety.yml", 12),
 ];
+
+// The FRONTEND carve-out is pinned by `browser_surface_and_toolchain_guard.rs`,
+// NOT here (2026-08-14 merge resolution).
+//
+// Two sessions closed the same gap in parallel: this file briefly carried a
+// FRONTEND_SCRIPT_BUDGET, and `main` landed the sibling guard. The sibling is
+// strictly more thorough — it also pins tracked `.html` (frontend surface vs
+// vendor docs) and the `.cargo/config.toml` runner/linker, with a
+// planted-runner self-test — so the duplicate here was DELETED rather than
+// kept alongside it.
+//
+// Keeping both would have been worse than keeping neither: two budgets
+// asserting the same fact can disagree, and then an edit satisfies one guard
+// while failing the other for a reason that reads as arbitrary. One fact, one
+// ratchet.
 
 /// Count real `uses: …github-script…` step lines. Comment lines are skipped so
 /// a `#`-prefixed explanation of a COMPLETED port never counts as a usage.
@@ -756,6 +917,49 @@ fn github_script_usage_only_shrinks() {
     );
 }
 
+/// (g3) The NODE-family runtimes only shrink (2026-08-15).
+///
+/// Closes the last OPEN item the rust-only lock recorded as needing a ruling.
+/// The ruling it encodes: dev-session tooling that never reaches the box may
+/// keep its existing invocations, pinned so they cannot grow; a NEW one
+/// anywhere fails the build.
+#[test]
+fn node_family_invocations_only_shrink() {
+    assert_sorted_unique(
+        &NODE_RUNTIME_BUDGET
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<Vec<_>>(),
+        "NODE_RUNTIME_BUDGET",
+    );
+    let mut counted: Vec<(String, usize)> = Vec::new();
+    // The SAME file set `no_new_banned_invocations` scans — so the node budget
+    // inherits every scope fix that set has accumulated (shebang detection,
+    // make's other names, cargo config, executable manifests) instead of
+    // growing its own list to drift out of sync.
+    for (path, content) in load_invocation_scan_files() {
+        let n = count_node_invocations(&content);
+        if n > 0 || NODE_RUNTIME_BUDGET.iter().any(|(p, _)| *p == path) {
+            counted.push((path, n));
+        }
+    }
+    let (over, under) = github_script_budget_drift(&counted, NODE_RUNTIME_BUDGET);
+    assert!(
+        over.is_empty(),
+        "RUST-ONLY VIOLATION: new node-family invocation {over:?} (path, actual, budget). \
+         The runtime is Rust-only (operator directive 2026-07-19). The ONLY tolerated \
+         node-family invocations are the dev-session MCP entries in `.mcp.json`, which \
+         never reach the box. If you need a tool, write it in Rust or call a real binary \
+         — do NOT raise NODE_RUNTIME_BUDGET."
+    );
+    assert!(
+        under.is_empty(),
+        "SHRINK THE RATCHET: fewer node-family invocations than budgeted {under:?} \
+         (path, actual, budget). Lower the entry in NODE_RUNTIME_BUDGET in the same PR — \
+         the budget only ever shrinks."
+    );
+}
+
 /// (g) The CI clippy gate stays ARMED (2026-08-11).
 ///
 /// `ci.yml`'s clippy step ran WITHOUT `-D warnings` for months, justified by a
@@ -863,6 +1067,90 @@ fn guard_self_test() {
     assert!(!is_invocation_scan_target("scripts/foo.py"));
     assert!(!is_invocation_scan_target("docs/runbooks/foo.md"));
     assert!(!is_invocation_scan_target("crates/common/src/lib.rs"));
+
+    // SCOPE FIX #7 (2026-08-14) — make's OTHER names. `GNUmakefile` and
+    // `makefile` are searched by GNU make BEFORE `Makefile`, so either one
+    // SHADOWS the scanned file entirely. Neither carries a shebang, so the
+    // first-line fallback cannot rescue them.
+    assert!(is_invocation_scan_target("GNUmakefile"));
+    assert!(is_invocation_scan_target("makefile"));
+    assert!(is_invocation_scan_target("sub/dir/GNUmakefile"));
+    assert!(is_invocation_scan_target("build/rules.mk"));
+    assert!(is_invocation_scan_target("prod.Dockerfile"));
+    assert!(is_invocation_scan_target(
+        ".claude/settings.local.json.example"
+    ));
+    assert!(is_invocation_scan_target(
+        ".claude/settings.local.json.template"
+    ));
+    // A file merely CONTAINING the word must still be out of scope, or the
+    // widening becomes a false-positive engine.
+    assert!(!is_invocation_scan_target(
+        "docs/how-to-write-a-Makefile.md"
+    ));
+
+    // SCOPE FIX #6 (2026-08-14) — `.args([…])`. The old marker set was
+    // `Command::new("` and `.arg("`; the PLURAL form contains NEITHER (an `s`
+    // sits between `arg` and the paren), so a fully-literal
+    // `Command::new("env").args(["<interpreter>", "-c", …])` passed GREEN with
+    // only the benign `"env"` ever extracted. `.args([…])` is already the
+    // dominant form in this workspace, including in `build.rs`.
+    let t = banned_token();
+    let plural = format!(r#"Command::new("env").args(["{t}3", "-c", "print(1)"]);"#);
+    let hits = extract_spawn_literals(&plural);
+    assert!(
+        hits.iter().any(|h| h == &format!("{t}3")),
+        "self-test: the plural .args([..]) payload must be extracted, got {hits:?}"
+    );
+    assert!(
+        !rust_spawn_violations(&plural).is_empty(),
+        "self-test: a banned interpreter inside .args([..]) must be a violation"
+    );
+    // The group is bounded at its closing bracket, so a later unrelated literal
+    // on a following line is never attributed to this spawn.
+    let bounded = format!(r#"c.args(["git", "log"]);{}let s = "{t}3";"#, '\n');
+    assert!(
+        rust_spawn_violations(&bounded).is_empty(),
+        "self-test: extraction must stop at ']' and not swallow later literals"
+    );
+
+    // SCOPE FIX #9 — node-family COMMAND POSITION, both directions.
+    //
+    // The false-negative half: these are real invocations and must count.
+    for invocation in [
+        r#"    "command": "npx","#,
+        "npx -y @scope/pkg",
+        "cat x | node -e 'x'",
+        "make build && yarn install",
+        "$(npm bin)/tool",
+        "deno run mod.ts; echo done",
+    ] {
+        assert_eq!(
+            count_node_invocations(invocation),
+            1,
+            "self-test: `{invocation}` is a node-family INVOCATION and must be counted"
+        );
+    }
+
+    // The false-POSITIVE half, which is why this scans command position at all.
+    // `scripts/aws-autopilot.sh` says "SSM managed node" three times; a plain
+    // word-boundary token scan would flag all three, and a guard whose first
+    // act is three false positives teaches the reader to allowlist it.
+    for prose in [
+        "  # 3. SSM managed node online?",
+        "  note_ok \"SSM managed node Online\"",
+        "  note_issue \"SSM managed node not Online (ping=$PING)\"",
+        "echo \"the node is healthy\"",
+        "nodejs_helper --run",
+        "kubectl get managed-node",
+    ] {
+        assert_eq!(
+            count_node_invocations(prose),
+            0,
+            "self-test: `{prose}` MENTIONS a node-family word without invoking one — \
+             counting it would make this guard a false-positive engine"
+        );
+    }
 
     // Token boundaries.
     let t = banned_token();

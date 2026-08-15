@@ -2640,6 +2640,23 @@ async fn build_shared_infra(
     // table with the wrong shape.
     tickvault_storage::tick_persistence::ensure_ticks_table(&config.questdb).await;
 
+    // --- `market_depth` DDL — the same class, and it matters MORE here ---
+    //
+    // The depth table's DEDUP key carries a `depth_kind` discriminator that no
+    // other table needs: depth-20 and depth-200 both emit a level-5 bid for
+    // the same instrument in the same second, from DIFFERENT sockets, and
+    // those are different observations of different books.
+    //
+    // If ILP auto-creates this table (no DDL ran, fresh volume) it arrives
+    // WITHOUT that key — and then the two pools begin silently overwriting
+    // each other's levels. Rows land, counts look plausible, nothing errors,
+    // and half the book is gone. That is a worse failure than the tick case
+    // above, because the loss is not duplicate rows but MISSING ones.
+    //
+    // Awaited INLINE, before the first depth ILP row can exist, for exactly
+    // the reason the two DDLs above are.
+    tickvault_storage::depth_persistence::ensure_market_depth_table(&config.questdb).await;
+
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
 

@@ -279,6 +279,7 @@ pub mod rest_fetch_audit_persistence;
 // populated per received frame (the intra-second dedup tiebreaker — without it
 // second-granular Dhan timestamps collapse every tick but the last in each
 // second).
+pub mod depth_persistence;
 pub mod tick_persistence;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.

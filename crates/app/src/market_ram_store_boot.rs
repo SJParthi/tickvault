@@ -658,6 +658,117 @@ pub fn spawn_ram_store_stats_task() -> tokio::task::JoinHandle<()> {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------
+    // Current-day RAM at the 25,000-instrument ceiling.
+    //
+    // The 2026-08-12 budget was computed BEFORE depth-20 / depth-200
+    // became a persisted stream (2026-08-15). Depth is the only path in
+    // the process whose RAM is O(ROWS) rather than O(instruments), so it
+    // is the one addition that could invalidate that budget — and the
+    // arithmetic below is what proves it does not, rather than assuming.
+    // -----------------------------------------------------------------
+
+    /// Every eagerly-committed current-day RAM term at the slot ceiling,
+    /// derived from the real constants and `size_of` rather than quoted.
+    fn current_day_ram_terms_at_ceiling() -> Vec<(&'static str, u64)> {
+        use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
+        use tickvault_trading::candles::seal_ring::SEAL_BUFFER_CAPACITY;
+        use tickvault_trading::candles::tf_index::TF_COUNT;
+
+        let slots = AGGREGATOR_MAX_SLOTS as u64;
+        vec![
+            // spot_days = 1 (current day) at the full slot ceiling.
+            (
+                "spot_bar_store",
+                estimated_capacity_bytes(1, MAX_SPOT_BAR_SLOTS_U32),
+            ),
+            // The aggregator's live candle grid: one cell per (slot, TF).
+            (
+                "aggregator",
+                slots
+                    * TF_COUNT as u64
+                    * core::mem::size_of::<
+                        tickvault_trading::candles::live_candle_state::LiveCandleState,
+                    >() as u64,
+            ),
+            // The seal ring is already slots × TF_COUNT entries.
+            (
+                "seal_ring",
+                SEAL_BUFFER_CAPACITY as u64
+                    * core::mem::size_of::<tickvault_trading::candles::seal_ring::BufferedSeal>()
+                        as u64,
+            ),
+            // The frame ring's byte CEILING — a bound, not a preallocation,
+            // but it must be budgeted because it can legitimately be reached.
+            (
+                "frame_ring_ceiling",
+                crate::dhan_feed_stack::FRAME_RING_MAX_BYTES as u64,
+            ),
+            // Depth's ONLY RAM term: the un-flushed ILP buffer, bounded by the
+            // row threshold. ~160 B of line protocol per row.
+            (
+                "depth_ilp_buffer",
+                crate::dhan_feed_stack::DEPTH_FLUSH_ROW_THRESHOLD * 160,
+            ),
+        ]
+    }
+
+    #[test]
+    fn current_day_ram_at_25k_instruments_fits_the_operator_budget() {
+        let terms = current_day_ram_terms_at_ceiling();
+        let total: u64 = terms.iter().map(|(_, b)| *b).sum();
+        let report: Vec<String> = terms
+            .iter()
+            .map(|(n, b)| format!("{n}={:.1} MB", *b as f64 / 1_048_576.0))
+            .collect();
+        assert!(
+            total <= RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES,
+            "current-day RAM at the 25,000-instrument ceiling is {:.2} GB, over the \
+             operator's 10 GiB budget (2026-08-12, stated three times). Terms: {}. \
+             Raw ticks contribute ZERO by design (folded then dropped), so an \
+             overshoot here means one of these structures grew — check which \
+             before raising the budget.",
+            total as f64 / 1_073_741_824.0,
+            report.join(", ")
+        );
+    }
+
+    #[test]
+    fn depth_is_a_rounding_error_in_the_current_day_ram_budget() {
+        // The load-bearing claim of the 2026-08-15 depth change: depth adds
+        // RAM proportional to the FLUSH THRESHOLD, not to instruments, rows
+        // captured, or levels. If someone raises the threshold far enough to
+        // make depth a real memory term, this fails and says so.
+        let terms = current_day_ram_terms_at_ceiling();
+        let depth = terms
+            .iter()
+            .find(|(n, _)| *n == "depth_ilp_buffer")
+            .map(|(_, b)| *b)
+            .expect("depth term present");
+        let total: u64 = terms.iter().map(|(_, b)| *b).sum();
+        assert!(
+            depth * 20 < total,
+            "the depth ILP buffer is {depth} B of a {total} B current-day footprint \
+             — no longer the rounding error the budget assumed. Depth RAM is \
+             DEPTH_FLUSH_ROW_THRESHOLD-bounded; raising that constant trades drain \
+             occupancy for memory and both sides must be re-argued."
+        );
+    }
+
+    #[test]
+    fn the_depth_flush_threshold_bounds_drain_occupancy_not_just_payload() {
+        // Reusing the tick threshold (1,000) would force 10–50 synchronous
+        // HTTP round trips per second on the task that also folds ticks,
+        // because depth emits 20–200 rows per packet where ticks emit one.
+        // The constant exists to break that coupling; this pins the ratio.
+        assert!(
+            crate::dhan_feed_stack::DEPTH_FLUSH_ROW_THRESHOLD
+                >= crate::dhan_feed_stack::FLUSH_ROW_THRESHOLD * 10,
+            "depth must flush at least 10x less often per row than ticks, or the \
+             drain spends its time blocked in ILP instead of folding ticks"
+        );
+    }
+
     const DAY: i64 = 20_650 * 86_400 * NANOS_PER_SEC;
     const MIN: i64 = NANOS_PER_MINUTE;
 

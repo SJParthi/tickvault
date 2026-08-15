@@ -161,16 +161,73 @@ question about the FILE rather than its NAME — because the enumerate-one-more-
 extension approach has now been wrong four times, always in the same direction:
 a class nobody listed is invisible, and invisibility reads as green.
 
+**CLOSED in the SECOND sweep of the same day** (a follow-up adversarial audit
+run specifically to try to sneak a non-Rust executable past the just-widened
+guard — it found four more, three of which needed no exotic technique):
+
+| # | Hole | Fix |
+|---|---|---|
+| 6 | **`.args([…])` was invisible to the Rust spawn scan.** The marker set was `Command::new("` and `.arg("`; the PLURAL form contains neither, because an `s` sits between `arg` and the paren. So `Command::new("env").args(["<interpreter>", "-c", …])` was **fully literal and fully green** — the extractor saw only the benign `"env"` and never looked at the payload. `.args([…])` is the DOMINANT form in this workspace (20+ sites, including `build.rs`, which executes on every build) | `extract_spawn_literals` takes every string literal inside the bracket group, bounded at `]`; bite-proven both directions in `guard_self_test` |
+| 7 | **Make's other names.** The check was `path == "Makefile"`, case-sensitive and single-name. GNU make searches `GNUmakefile`, `makefile`, `Makefile` **in that order**, so a tracked `GNUmakefile` SHADOWS the scanned `Makefile` entirely — and make files carry no shebang, so fix #1 above could not rescue them | `GNUmakefile` / `makefile` / `*.mk` added, plus `*.Dockerfile` (the `docker build -f prod.Dockerfile` convention, which `Dockerfile.*` does not match) and `*.json.example` / `*.json.template` (tracked seeds carrying hook COMMAND lines) |
+
+**Recorded as an HONEST LIMIT rather than closed — a wrapper function defeats
+the spawn scan, and the wrapper already exists.**
+`crates/tickvault-logs-mcp/src/tools.rs::run_with_timeout(program, …)` is
+called with bare `"bash"` / `"git"` / `"docker"` literals that sit in neither
+marker form; a new call site passing an interpreter name would pass green.
+Closing this needs call-graph analysis, not a string scan, so it is stated at
+the function (`HONEST LIMIT 2`) rather than pretended away. The shebang
+fallback and the file-extension ban still apply to whatever such a wrapper
+launches.
+
+**Also recorded, not closed:** inline JavaScript inside `.rs` string literals
+is unbudgeted. The three `crates/api/src/handlers/*_page.rs` surfaces carry
+~726 JS lines in raw strings; `.rs` is excluded from token scanning by design
+and the spawn scan is literal-only, so a FIFTH browser surface — or unbounded
+JS growth inside the existing three — is structurally invisible. The
+"4 surfaces" figure in CLAUDE.md is prose enforced by nothing, while inline JS
+in `.yml` **is** budgeted (`GITHUB_SCRIPT_BUDGET`). That asymmetry is a real
+gap; closing it needs a budget const and an operator ruling on the 12
+legitimate vendor-reference `.html` files under `docs/`.
+
+**CLOSED 2026-08-15 — the node-family gap (was open item 4).**
+
+`node` / `npx` / `npm` / `yarn` / `pnpm` / `deno` / `bun` were never banned
+tokens, and `.mcp.json` runs `npx` live. The gap sat open because both obvious
+fixes were wrong:
+
+- **Adding them to `banned_tokens()`** fails the build on `.mcp.json` itself —
+  dev-session MCP tooling that never reaches the box. Breaking local tooling to
+  satisfy a lock that exists to protect the RUNTIME is the wrong trade.
+- **A plain word-boundary scan** would flag `scripts/aws-autopilot.sh`'s three
+  "SSM managed node" lines. A guard whose first act is three false positives
+  teaches the reader that the cheapest fix is to allowlist it — the same
+  dynamic that has weakened three anchors in this branch already.
+
+The shape that is right for both: scan **command position**, not free text. The
+token must BEGIN a command — line start, after a pipe / `&&` / `;` / `$(`, or
+as a JSON `"command":` value. `managed node` fails that test; `npx -y pkg`
+passes it. Then a shrink-only budget (`NODE_RUNTIME_BUDGET`, the
+`GITHUB_SCRIPT_BUDGET` shape) pins the two existing `.mcp.json` entries so they
+cannot grow, while a NEW node-family invocation anywhere fails the build.
+
+Bite-proven in `guard_self_test` in BOTH directions: six real invocation forms
+must count, and six mention-forms — including all three real "SSM managed node"
+lines from the live script — must not. The false-positive half is the half that
+matters; without it this guard would have been allowlisted within a week.
+
 **OPEN, recorded rather than silently carried:**
 
-| # | Hole | Why it is not closed here |
+| # | Hole | Status |
 |---|---|---|
-| 4 | `node`, `npx`, `npm`, `yarn`, `pnpm`, `deno`, `bun`, `ruby`, `gem`, `php`, `lua` are **not banned tokens**. `.mcp.json` uses `npx` live | Banning them would fail the guard on `.mcp.json`, which is dev-session MCP tooling that is never deployed and never in the product path. Removing it breaks local tooling and buys nothing on the box — an **operator call**, not a silent guard edit. `node` is additionally prose-ambiguous (AWS's "SSM managed node") |
-| 5 | `.html` is neither banned nor scanned, and the 4-surface frontend carve-out is described in prose but **pinned by nothing** — a 5th `.html` lands green | Needs a budget const mirroring `GITHUB_SCRIPT_BUDGET`, complicated by 12 legitimate vendor-reference `.html` files under `docs/`. Deferred rather than guessed |
-| 6 | ~11 GitHub Actions (`actions/checkout`, `actions/cache`, `Swatinem/rust-cache`, …) are `using: node20` JS actions, while `github-script` **is** budgeted as an interpreted surface | The scope is genuinely inconsistent, but the boundary is a policy question: third-party CI actions are not "our workspace codebase". Needs an operator ruling, then either a budget or an explicit written boundary |
+| 4 | `node`, `npx`, `npm`, `yarn`, `pnpm`, `deno`, `bun`, `ruby`, `gem`, `php`, `lua` are not banned tokens | **CLOSED 2026-08-15** — see the command-position section above. All eleven are covered; the four non-node runtimes had their FILE extensions banned already, but an extension ban is not an invocation ban (the same distinction the 2026-08-01 `pip` correction turned on), and all four have zero live invocations |
+| 5 | `.html` neither banned nor scanned; the 4-surface frontend carve-out was prose pinned by nothing | **CLOSED 2026-08-14 by `browser_surface_and_toolchain_guard.rs`** (landed on `main` via #1753), which pins tracked `.html` as one frontend surface plus vendor docs under `docs/`, AND pins browser code inside `.rs` to the enumerated surfaces. A duplicate budget written in parallel in this file was deleted rather than kept alongside it |
+| 6 | ~11 GitHub Actions (`actions/checkout`, `actions/cache`, `Swatinem/rust-cache`, …) are `using: node20` JS actions, while `github-script` **is** budgeted as an interpreted surface | **STILL OPEN.** The scope is genuinely inconsistent, but the boundary is a policy question: third-party CI actions are not "our workspace codebase". Needs an operator ruling, then either a budget or an explicit written boundary |
 
-Items 4–6 each require an operator decision, so they are stated here instead of
-being resolved by executor judgment. None of them is an active violation today.
+Item 6 is the only one left, and it is a policy call rather than an executor
+judgment: banning it would mean vendoring or rewriting the standard CI actions
+this repo depends on. It is not an active violation — nothing in `crates/`,
+`scripts/`, or `deploy/` runs a non-Rust runtime.
 
 ## §1. The rule (one line)
 
