@@ -650,8 +650,24 @@ async fn connect_and_listen(
         .into_client_request()
         .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
 
+    // Third argument is `disable_nagle`, set `true` (2026-08-18) to match the
+    // main feed, which has disabled Nagle since the lane was revived. It was
+    // `false` here, so this socket alone still coalesced small writes.
+    //
+    // Why it matters on THIS socket specifically: the traffic is almost
+    // entirely tiny control frames — the MsgCode-42 auth payload at connect,
+    // then pong replies. Nagle holds a small write until the previous segment
+    // is ACKed, adding up to ~40ms of delay to exactly those frames, and Dhan
+    // tears the connection down on a missed ping deadline. A delayed pong is
+    // therefore a self-inflicted disconnect, and a reconnect on the
+    // order-update channel costs a full re-auth.
+    //
+    // Free and orthogonal to TLS (a socket option is not a TLS setting), and
+    // standard practice for trading sockets. Receive-only paper mode today,
+    // so the present blast radius is small — but this is the socket the live
+    // order path re-uses, and the disconnect it prevents is the expensive one.
     let (ws_stream, _response) =
-        connect_async_tls_with_config(request, None, false, Some(tls_connector))
+        connect_async_tls_with_config(request, None, true, Some(tls_connector))
             .await
             .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
     // O(1) EXEMPT: end

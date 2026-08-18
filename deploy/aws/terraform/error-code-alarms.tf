@@ -511,6 +511,77 @@ locals {
       ok_recovery = false # 2026-08-11: discrete PERMANENT data loss - the dropped raw frames are gone from the durable chain and do not come back when the episode ages out (Rule-11 false-recovery; aggregator-drop-01 precedent)
       desc        = "WS-SPILL-02: a raw WebSocket frame was DROPPED at the capture-at-receipt WAL (the spill writer was dead at the append instant) - the frame is lost BEFORE parse and broadcast, so no downstream tier can recover it. This is the raw-frame twin of AGGREGATOR-DROP-01 (sealed candles) and is the durable floor's own failure mode. Triage: df -h /data, ls -la data/spill/, host + container health; if the host is healthy and the dirs writable, restart the app. NO recovered/OK page: the loss is permanent - the auto-OK only means the episode aged out. Runbook: docs/error-runbooks/ws-frame-spill-error-codes.md"
     }
+    # 2026-08-15 (authority: dhan-rest-only-noise-lock-2026-07-14.md §2.3a,
+    # operator quote same day) - the CONNECTED-BUT-SILENT page.
+    #
+    # This condition has NO other evidence anywhere in the system. A subscribe
+    # that silently did not take produces no payload to count, no parse to
+    # fail, and no error of its own; the socket is open, the lane gauge reads
+    # 1, and every loss counter sits at a healthy flat zero. Absence measured
+    # against a seeded key is the only thing that can ever report it, which is
+    # why scan_silence exists - and why leaving its verdict log-sink-only (as
+    # it was from 2026-08-12 to 2026-08-15) meant the one detector for an
+    # invisible failure was itself invisible.
+    #
+    # A LOG FILTER rather than a threshold on the gauges, deliberately: the
+    # app already gates the emit to the CONTINUOUS session (never the
+    # legitimately-silent pre-open) and edge-latches it to one per episode, so
+    # the coded error carries the market-hours gating and the de-duplication
+    # that a raw gauge alarm would need a window Lambda and an unknown
+    # baseline to reproduce. The derived metric is sparse and dimensionless -
+    # billed only in hours the code actually fires.
+    #
+    # eval = 1, unlike the ws-spill pair above: the emit is ALREADY latched to
+    # two consecutive 30s scans by the app, so the sustain requirement has been
+    # met before the line is ever written. Requiring three CloudWatch windows
+    # on top would delay the page by 10 minutes for a condition the detector
+    # has already confirmed.
+    #
+    # ok_recovery = true, ALSO unlike the ws-spill pair: silence is not a
+    # permanent loss of a specific frame. Instruments genuinely start ticking
+    # again - after a resubscribe, or when a thin contract simply trades - and
+    # "the feed is being heard again" is a real, self-explanatory recovery an
+    # operator wants told.
+    # 2026-08-15, SAME DAY as this entry was added: period 300 -> 3600 and
+    # ok_recovery true -> false, after checking what the emit ACTUALLY does in
+    # production rather than what its edge-latch was designed to do.
+    #
+    # Friday 2026-08-14 produced 25 distinct RISK-GAP-03 emits in one session.
+    # The silent count oscillated the whole day -- 4, 9, 1, 2, 1, 3, 208, 10 --
+    # clearing between episodes and re-arming the per-episode latch each time,
+    # entirely legitimately: sparse-cadence instruments go quiet and come back.
+    # The latch worked as designed and still produced 25 pages, because the
+    # world produced 25 episodes. At period 300 with an OK page that is ~50
+    # operator messages in a day, which is how a pager gets ignored.
+    #
+    # (An earlier draft of this comment said the condition "never changed --
+    # never_ticked=4 of 4, all day". That was wrong: never_ticked was 4 on the
+    # 09:15 emit and 0 on every one after it, so the feed WAS delivering. The
+    # correction matters because it changes which fix works -- gating on
+    # never-ticked alone would have suppressed almost none of these.)
+    #
+    # The emit side gained a 30-minute cooldown between pages in the same
+    # change. This is the second half: an hour-long window collapses whatever
+    # still gets through into one alarm state, and the alarm returns to OK
+    # silently via notBreaching once the emits stop.
+    #
+    # ok_recovery = false, reversing the note this entry shipped with. Silence
+    # ending is a real recovery for the INSTRUMENT, but the alarm cannot tell
+    # "the feed is healthy again" from "one sparse contract happened to trade".
+    # An OK page that means the second while reading as the first is worse than
+    # no page at all.
+    "risk-gap-03" = {
+      pattern     = "{ $.code = \"RISK-GAP-03\" && $.level = \"ERROR\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # 2026-08-15: an OK here cannot distinguish a recovered feed from one sparse instrument trading once
+      # Kept under the 1024-char alarm_description ceiling INCLUDING the
+      # suffix the resource appends (~162 chars) - see the length guard in
+      # crates/common/tests/error_code_paging_filter_drift_guard.rs.
+      desc = "RISK-GAP-03: the live feed is CONNECTED BUT HEARING NOTHING from instruments it subscribed. The 30s silence scan found instruments quiet beyond their own learned cadence, or that never ticked at all - the second is the serious one, because a subscribe that silently did not take leaves NO other trace: no payload, no parse failure, no error, and every loss counter reads a healthy zero. Once per episode, session-gated so the legitimately-silent pre-open never pages. Triage on the dashboard live-lane row: never_ticked climbing means subscriptions are not taking (check tv_dhan_ws_subscribe_failed_total and the subscribe batches in the app log); silent climbing while never_ticked stays 0 is usually a thin universe on a quiet day, not a fault. Runbook: .claude/rules/project/gap-enforcement.md"
+    }
   }
 }
 

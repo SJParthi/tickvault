@@ -44,13 +44,44 @@ pub const SPOT_XVERIFY_RUN_BUDGET_SECS: u64 = 600;
 const SPOT_XVERIFY_HTTP_TIMEOUT_SECS: u64 = 15;
 /// 8 MiB `/exec` response cap (the TF_VERIFY_MAX_RESPONSE_BYTES shape).
 pub const SPOT_XVERIFY_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-/// Row CAP — 4 indices × 375 minutes = exactly 1,500 on a healthy full
-/// day. The query asks for `cap + 1` (the house LIMIT+1 probe) and only
-/// `returned > cap` flags truncation — honest at ANY cap size: a dataset
-/// that exactly fills the cap is complete, not truncated (the old
-/// `returned >= limit` check false-flagged every healthy full day
-/// PARTIAL at zero headroom). Fix E, 2026-07-17.
-pub const SPOT_XVERIFY_ROW_LIMIT: usize = 1_500;
+/// Row CAP — a STRUCTURAL bound, not an expectation.
+///
+/// # Why this stopped being `1_500` (prod evidence, 2026-08-14)
+///
+/// It was `4 indices × 375 session minutes = exactly 1,500`, which is the
+/// expected count on a healthy day and therefore has **zero headroom**. One
+/// legitimate extra row truncates. That is not hypothetical — Friday
+/// 2026-08-14 fired `SPOT-XVERIFY-02 stage=truncated feed=dhan`, and the
+/// day-wide query window makes the overflow ordinary rather than exotic:
+/// `select_spot_1m_sql` spans the whole IST day, so pre-open minutes, a
+/// muhurat session, or any future session extension push past 375 per index
+/// while nothing at all is wrong.
+///
+/// The consequence is worse than a warning. Truncation marks the run degraded
+/// and then **compares the surviving subset anyway** — so the only independent
+/// OHLCV parity signal this system has quietly becomes a partial compare, and
+/// the rows it dropped are the ones nobody looked at.
+///
+/// The 2026-07-17 "Fix E" note this constant shipped with was half the fix. It
+/// corrected `returned >= limit` to `returned > cap`, which stopped a
+/// full-but-complete day being called PARTIAL — a real off-by-one — and then
+/// left the zero headroom in place directly beneath a sentence naming it.
+///
+/// # The new bound
+///
+/// `SPOT_1M_REST_INDICES.len() × 1_440` — every index, every minute of a
+/// 24-hour day. The DEDUP key is `(ts, security_id, exchange_segment, feed)`,
+/// so at most ONE row can exist per index per minute; this count is therefore
+/// unreachable by construction on a correct day at any session length. Passing
+/// it no longer means "busy day", it means the dedup key is broken or the
+/// query is reading the wrong window — which is a finding worth the page.
+///
+/// Cost of the headroom is nil: ~5,760 CSV rows is a few hundred KB against
+/// the 8 MiB [`SPOT_XVERIFY_MAX_RESPONSE_BYTES`] cap that bounds memory
+/// regardless. Derived from the constant rather than written out, so widening
+/// the index list cannot silently re-create the zero-headroom state.
+pub const SPOT_XVERIFY_ROW_LIMIT: usize =
+    tickvault_common::constants::SPOT_1M_REST_INDICES.len() * 1_440;
 /// Max cell-audit rows written per run (a pathological day is bounded).
 pub const SPOT_XVERIFY_MAX_AUDIT_ROWS_PER_RUN: usize = 10_000;
 /// ≤3 example lines on the Telegram card (Fix E — commandment 8: one
@@ -1342,6 +1373,69 @@ mod tests {
     }
 
     #[test]
+    /// The row cap must stay a STRUCTURAL bound, never an expectation.
+    ///
+    /// # The degrade this pins shut (prod evidence, 2026-08-14)
+    ///
+    /// The cap was `4 indices x 375 session minutes = 1,500` — the exact count
+    /// of a healthy day, so one legitimate extra row truncated. Friday
+    /// 2026-08-14 duly fired `SPOT-XVERIFY-02 stage=truncated feed=dhan`, and
+    /// the query window makes the overflow ordinary: it spans the whole IST
+    /// day, so pre-open minutes or an extended session exceed 375 per index
+    /// while nothing is wrong.
+    ///
+    /// It matters because truncation does not stop the run — it marks it
+    /// degraded and compares the surviving subset, so the only independent
+    /// OHLCV parity signal silently becomes a partial compare over rows nobody
+    /// chose.
+    ///
+    /// The bound must therefore be one a correct day CANNOT reach. The DEDUP
+    /// key allows at most one row per index per minute, so a full 1,440-minute
+    /// day per index is unreachable by construction at any session length —
+    /// and hitting it means the dedup key is broken or the window is wrong,
+    /// which is worth a page.
+    #[test]
+    fn test_row_cap_is_unreachable_on_a_correct_day_not_merely_expected() {
+        let indices = tickvault_common::constants::SPOT_1M_REST_INDICES.len();
+
+        // The historical session count. The cap must clear it by a wide
+        // margin, not equal it.
+        let session_rows = indices * 375;
+        assert!(
+            SPOT_XVERIFY_ROW_LIMIT > session_rows * 3,
+            "the spot cross-verify row cap ({SPOT_XVERIFY_ROW_LIMIT}) is close \
+             to a healthy day ({session_rows}). At zero headroom one legitimate \
+             pre-open or extended-session row truncates the query, and \
+             truncation does not abort the run — it compares the surviving \
+             subset, so the only OHLCV parity signal degrades to a partial \
+             compare"
+        );
+
+        // A full day of minutes per index is the structural ceiling: the DEDUP
+        // key admits one row per index per minute.
+        assert_eq!(
+            SPOT_XVERIFY_ROW_LIMIT,
+            indices * 1_440,
+            "the cap must be every index across every minute of a day — the \
+             count a correct day cannot reach"
+        );
+
+        // Derived, so widening the index list cannot silently restore the
+        // zero-headroom state that caused the 2026-08-14 degrade.
+        let src = include_str!("spot_crossverify_boot.rs");
+        let decl = src
+            .split("pub const SPOT_XVERIFY_ROW_LIMIT")
+            .nth(1)
+            .and_then(|t| t.split(';').next())
+            .unwrap_or_default();
+        assert!(
+            decl.contains("SPOT_1M_REST_INDICES.len()"),
+            "the cap is a bare literal. It must be derived from the index \
+             list, or adding a 5th index re-creates the exact-fit cap that \
+             truncated the compare on 2026-08-14"
+        );
+    }
+
     fn select_sql_is_feed_and_segment_scoped_and_limited() {
         let sql = select_spot_1m_sql("dhan", 0);
         assert!(sql.contains("feed = 'dhan'"));

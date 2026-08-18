@@ -231,7 +231,15 @@ fi
 # Gate 6: Pub fn test guard (every public function has a test)
 echo "  [6/8] Pub fn test guard (full workspace)..." >&2
 if [ -x "$HOOKS_DIR/pub-fn-test-guard.sh" ]; then
-  PUBFN_OUT=$(timeout 120 "$HOOKS_DIR/pub-fn-test-guard.sh" "$CWD" "all" 2>&1)
+  # 300s, not 120s (2026-08-15). The full-workspace scan greps every crate for
+  # every pub fn and then for a name-matching #[test]; measured at 130s on this
+  # workspace, so the old 120s ceiling expired on a PASSING gate. Two failure
+  # modes came out of that: the push was blocked with the gate green, and the
+  # message read "timed out" — an infrastructure-hiccup shape that invites a
+  # retry — while the ONE real violation underneath it never printed. Raised so
+  # the gate can finish; it still FAILS a genuine violation, and 300s remains a
+  # real ceiling rather than an unbounded wait.
+  PUBFN_OUT=$(timeout 300 "$HOOKS_DIR/pub-fn-test-guard.sh" "$CWD" "all" 2>&1)
   PUBFN_EXIT=$?
   if [ "$PUBFN_EXIT" -eq 124 ]; then
     echo "  FAIL: Pub fn test guard timed out (120s) — blocking push" >&2

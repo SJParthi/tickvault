@@ -355,6 +355,197 @@ resource "aws_cloudwatch_dashboard" "operator" {
           period  = 300
           stat    = "Minimum"
         }
+      },
+
+      # ----- Row 9: the DHAN LIVE LANE (2026-08-15) -----
+      #
+      # The lane was switched on 2026-08-11 and its universe widened to ~4,565
+      # instruments on 2026-08-12. Twenty-one of its series were added to the
+      # CloudWatch agent's allowlist across three dated cost notes — and NOT
+      # ONE of them was charted anywhere. We were paying to publish the whole
+      # failure surface of the only live tick source and looking at none of it.
+      #
+      # That is the same defect the Row-7 comment above describes ("the
+      # operator could look at an all-green page while the whole runtime was
+      # dead"), recreated one subsystem later. It is also the more expensive
+      # half: the REST legs at least page on failure, whereas every counter
+      # below is visible-only — no alarm reads them — so a dashboard widget is
+      # currently the ONLY way any of this reaches a human.
+      #
+      # Every name below was checked against the EMF allowlist in
+      # user-data.sh.tftpl before charting, per the Row-7 rule: a widget with
+      # no producer renders as "no data", which reads as "fine".
+      {
+        type   = "text"
+        x      = 0
+        y      = 56
+        width  = 24
+        height = 2
+        properties = {
+          markdown = "## The live market-data feed (Dhan WebSocket)\n**Every loss line below should sit flat at zero.** A rising line is ticks going missing — the top-left panel tells you whether the feed is even connected, and the loss panels tell you where they are being lost: at the socket, in the buffer, or on the way to the database. The silence panel answers a different question: *are we connected but hearing nothing?*"
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 58
+        width  = 8
+        height = 6
+        properties = {
+          title  = "Feed alive? (1 = lane up) + open connections"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_feed_stack_up", { label = "lane up (1 = yes)", stat = "Minimum" }],
+            [local.dash_namespace, "tv_dhan_feed_stack_connections", { label = "open sockets", stat = "Maximum" }]
+          ]
+          period = 60
+        }
+      },
+      {
+        type   = "metric"
+        x      = 8
+        y      = 58
+        width  = 8
+        height = 6
+        properties = {
+          # These five are the SOCKET-side losses: a tick that dies here never
+          # reached the durable floor at all, so nothing downstream can recover
+          # it. `wal dropped` is the most serious line on this dashboard.
+          title  = "Ticks lost AT THE SOCKET (flat zero = healthy)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_ws_wal_dropped_total", { label = "never durably captured", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_ws_ring_full_total", { label = "buffer full (count)", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_ws_ring_bytes_full_total", { label = "buffer full (bytes)", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_ws_frame_refused_total", { label = "frame refused", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_ws_subscribe_failed_total", { label = "never subscribed", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 16
+        y      = 58
+        width  = 8
+        height = 6
+        properties = {
+          # The DATABASE side. The 2026-08-11 allowlist widening instrumented
+          # the socket and left this half blind for a day; splitting the two
+          # panels is what makes "where are they being lost?" answerable at a
+          # glance instead of by reading counter names.
+          title  = "Ticks lost ON THE WAY TO THE DATABASE (flat zero = healthy)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_ticks_dropped_total", { label = "discarded on flush failure", stat = "Sum" }],
+            [local.dash_namespace, "tv_tick_persist_errors_total", { label = "write errors", stat = "Sum" }],
+            [local.dash_namespace, "tv_tick_rows_refused_total", { label = "rows refused", stat = "Sum" }],
+            [local.dash_namespace, "tv_ws_frame_spill_write_errors_total", { label = "durable-floor write errors", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_feed_seals_dropped_total", { label = "candles discarded", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_feed_seq_refused", { label = "sequence unrepresentable", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 64
+        width  = 8
+        height = 6
+        properties = {
+          # Connected-but-silent is the failure mode with NO other evidence: a
+          # subscribe that quietly did not take produces no payload to count,
+          # no parse to fail and no error to log. Absence measured against a
+          # seeded key is the only signal that exists, which is why it earns a
+          # panel of its own rather than a line on a loss chart.
+          title  = "Connected but hearing nothing (instrument counts)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_feed_instruments_never_ticked", { label = "never ticked at all", stat = "Maximum" }],
+            [local.dash_namespace, "tv_dhan_feed_instruments_silent", { label = "gone quiet", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 8
+        y      = 64
+        width  = 8
+        height = 6
+        properties = {
+          # Socket churn. A parked socket is the quiet one: it has stopped
+          # retrying permanently and will never dial again, so a flat line here
+          # after a spike is worse news than a rising one.
+          #
+          # `tv_dhan_feed_drain_respawn_total` is deliberately NOT charted: it
+          # has ZERO emit sites and is not in the EMF allowlist, because the
+          # drain is not respawned at all — if it dies the lane is over, and
+          # the "lane up" gauge in the first panel falls to 0. Charting a
+          # counter nothing writes would render as "no data", which reads as
+          # "no restarts, all good" — the precise false-OK this row exists to
+          # remove. The correct signal for a dead drain is already the leftmost
+          # panel.
+          title  = "Socket churn — dial failures / reconnects / parked forever"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_ws_dial_failed_total", { label = "dial failed", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_ws_reconnect_total", { label = "reconnects", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_ws_park_total", { label = "parked PERMANENTLY", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 16
+        y      = 64
+        width  = 8
+        height = 6
+        properties = {
+          # The buffer budget is derived from the host's RAM at boot, so it is
+          # no longer readable from the source. These two lines are how that
+          # decision stays checkable: the ring should be ~2% of the host, and a
+          # ring sitting at exactly the 256 MiB floor on a 32 GiB box means the
+          # memory read failed and the lane is running with 16x less headroom
+          # than intended — a fully healthy-looking degradation.
+          title  = "Buffer budget vs host memory (sizing sanity check)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_host_total_ram_bytes", { label = "host RAM measured", stat = "Maximum" }],
+            [local.dash_namespace, "tv_dhan_feed_ring_max_bytes", { label = "buffer budget chosen", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 70
+        width  = 24
+        height = 6
+        properties = {
+          # Throughput. Non-vacuity for every panel above: all the loss charts
+          # read flat-zero when the feed is working AND when it is delivering
+          # nothing at all, and those two look identical. This is the line that
+          # tells them apart.
+          title  = "Feed throughput — frames in, ticks folded (this is the 'is it actually working' line)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_feed_drain_frames_total", { label = "frames received", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_feed_ingest_ticks_total", { label = "ticks folded into candles", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_feed_ingest_refused_total", { label = "ticks refused", stat = "Sum" }]
+          ]
+          period = 300
+        }
       }
     ]
   })

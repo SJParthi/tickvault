@@ -1838,7 +1838,30 @@ async fn main() -> Result<()> {
         .increment(dropped);
         ws_wal_replay_order_update.clear();
     }
-    if !ws_wal_replay_live_feed.is_empty() {
+    // Will the Dhan lane actually run this boot? Computed with the SAME gate
+    // the lane itself uses, so the two can never disagree about whether these
+    // frames have somewhere to go. If they do, they are handed over below and
+    // must NOT be dropped or cleared here.
+    let dhan_lane_will_refold = matches!(
+        tickvault_app::dhan_feed_stack::feed_stack_gate(
+            config.feeds.dhan_enabled,
+            std::env::var(tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV)
+                .ok()
+                .as_deref(),
+        ),
+        tickvault_app::dhan_feed_stack::FeedStackGate::Enabled
+    );
+
+    // 2026-08-15 — the drop below is RETIRED. `ws_wal_replay_live_feed` is now
+    // handed to the Dhan lane (`DhanFeedStackParams::wal_replay_live_feed`),
+    // which re-folds it immediately after `LiveIngest` exists and before any
+    // socket opens. The re-fold is DEDUP-idempotent: `capture_seq` is read back
+    // from the WAL record rather than re-stamped.
+    //
+    // This block now fires ONLY when the frames have nowhere to go — the lane
+    // is disabled, so nothing will ever fold them. That is still real loss and
+    // still says so; what changed is that it is no longer the normal path.
+    if !ws_wal_replay_live_feed.is_empty() && !dhan_lane_will_refold {
         let dropped = ws_wal_replay_live_feed.len() as u64;
         // 2026-08-11 — this message was written on 2026-07-14, when it was
         // true: the Dhan live WS had just been retired, nothing appended
@@ -1909,12 +1932,45 @@ async fn main() -> Result<()> {
     // lane cold-start fighting over the dual-instance SSM lock) is
     // structurally impossible now — no cold-start path exists.
     // =======================================================================
-    if feed_runtime.is_dhan_config_enabled() {
-        error!(
-            "boot TOML carries dhan_enabled=true but the Dhan live WS lane is RETIRED \
-             (operator directive 2026-07-13, deleted in PR-C2) — the flag is IGNORED; \
-             fix the config to dhan_enabled=false. The Dhan REST-only stack runs either way."
-        );
+    // 2026-08-15 — this branch used to log, at ERROR, on EVERY boot:
+    //
+    //   "boot TOML carries dhan_enabled=true but the Dhan live WS lane is
+    //    RETIRED ... the flag is IGNORED; fix the config to dhan_enabled=false"
+    //
+    // Every clause of that was false by 2026-08-11, and the instruction was
+    // actively harmful. The operator revived the lane on 2026-08-09 and flipped
+    // `dhan_enabled = true` on 2026-08-11 precisely to switch it ON;
+    // `feed_stack_gate` reads that exact flag, so `true` is now the CORRECT
+    // value and an operator who followed the advice would have turned off the
+    // live feed they had just deliberately enabled — guided there by an ERROR.
+    //
+    // The message survived the revival because nothing tied it to the flag it
+    // described. It was written when "dhan_enabled" had one consumer; a second
+    // consumer appeared and the sentence about the first kept printing.
+    //
+    // What is worth saying here is the combination that leaves the lane
+    // SILENTLY DARK: config on, environment opt-in absent. That state is
+    // otherwise indistinguishable from a healthy boot in the log — the REST
+    // stack starts, the app looks normal, and no live tick ever arrives.
+    match tickvault_app::dhan_feed_stack::feed_stack_gate(
+        config.feeds.dhan_enabled,
+        std::env::var(tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        tickvault_app::dhan_feed_stack::FeedStackGate::DisabledByEnv => {
+            error!(
+                env_var = tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV,
+                "config enables the Dhan live feed but the environment opt-in is missing, so NO \
+                 live market data will flow this session — no ticks, no live candles, and the \
+                 15:31 cross-verification will have nothing on its live side. The REST legs run \
+                 either way, which is why this boot otherwise looks completely normal. Set the \
+                 environment variable in the systemd unit, or set dhan_enabled=false so the \
+                 intent is at least consistent."
+            );
+        }
+        tickvault_app::dhan_feed_stack::FeedStackGate::DisabledByConfig
+        | tickvault_app::dhan_feed_stack::FeedStackGate::Enabled => {}
     }
     let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
         tickvault_app::dhan_rest_stack::DhanRestStackParams {
@@ -2049,6 +2105,11 @@ async fn main() -> Result<()> {
             // includes them (2026-08-14).
             calendar: std::sync::Arc::clone(&trading_calendar),
             dhan_enabled: config.feeds.dhan_enabled,
+            // Frames a previous session captured but died before folding. The
+            // lane re-folds them after its ingest exists and before any socket
+            // opens; DEDUP-idempotent via the replay-stable `capture_seq`.
+            // Empty on a clean boot.
+            wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
             // DEFAULT-OFF: with `live_subscription_from_master = false` (the
             // shipped value) this returns the same 4 hardcoded index SIDs the
             // lane has always used, so the operator's 2026-08-11 third-quote
@@ -2298,6 +2359,29 @@ async fn run_slow_boot_observability(
 /// in the slow boot path only, so FAST BOOT captured ticks but sealed no
 /// candles. `set_global_seal_sender` is idempotent (first installer wins), so
 /// calling this on whichever boot path runs is safe.
+/// Cancel signal for the seal writer loop. Held for the process lifetime so
+/// the loop's `.changed().await` never wakes on a disconnected channel, and
+/// reachable so shutdown can actually fire it. See `spawn_seal_writer_loop`.
+static SEAL_WRITER_CANCEL: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::OnceLock::new();
+
+/// Join handle for the seal writer loop, so shutdown can wait for its final
+/// post-cancel drain instead of killing it mid-flight.
+static SEAL_WRITER_HANDLE: std::sync::Mutex<
+    Option<tokio::task::JoinHandle<tickvault_storage::seal_writer_runner::CycleOutcome>>,
+> = std::sync::Mutex::new(None);
+
+/// Budget for the seal writer's final drain. Sized from the measured drain
+/// rate: 1,024 seals per 100ms is ~10.2k/s, so the 25,000-instrument worst
+/// case (600k seals) needs ~59s. Bounded for the same reason the lane's join
+/// is bounded — overrunning systemd's stop timeout earns a SIGKILL, which
+/// loses the very tail this exists to save.
+const SEAL_WRITER_SHUTDOWN_BUDGET_SECS: u64 = 75;
+
+/// [`SEAL_WRITER_SHUTDOWN_BUDGET_SECS`] as a `Duration`.
+const SEAL_WRITER_SHUTDOWN_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(SEAL_WRITER_SHUTDOWN_BUDGET_SECS);
+
 fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConfig) {
     use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
     use tickvault_storage::seal_writer_runner::SealWriterRunner;
@@ -2314,14 +2398,36 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
                 );
             }
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-            // Hold the watch sender for the process lifetime so the loop's
-            // `.changed().await` does not wake on a disconnected channel.
-            std::mem::forget(cancel_tx);
-            tokio::spawn(async move {
-                let _final_outcome =
-                    run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await;
-                tracing::info!("seal writer loop exited gracefully");
+            // 2026-08-18 — GRACEFUL-SHUTDOWN WIRING (was `std::mem::forget`).
+            //
+            // The sender still must outlive the spawn so the loop's
+            // `.changed().await` never wakes on a disconnected channel — but
+            // `forget` made that lifetime UNREACHABLE, so nothing could ever
+            // signal cancel. `run_seal_writer_loop` is built for this: it takes
+            // the receiver, performs ONE FINAL DRAIN on cancel, and RETURNS the
+            // outcome "so the caller can log / surface it for graceful-shutdown
+            // observability". There was no such caller.
+            //
+            // Consequence, every trading day at 17:30: the close force-seals
+            // every open bucket (~110k seals at today's 4,565-SID universe;
+            // 600k at the 25,000 cap) into this mpsc. The lane counts them
+            // `emitted` — which is QUEUE ADMISSION, not persistence — and its
+            // 20s join then succeeds, logging "sealed and flushed cleanly".
+            // But this loop drains 1,024 per 100ms (~10.2k/s), needing ~11s
+            // today and ~59s at cap, and NOTHING waited for it: the task died
+            // with the runtime mid-drain and every undrained seal was lost,
+            // while the log reported success. That is the false-OK class
+            // (audit rule 11) applied to the data itself.
+            //
+            // Storing both halves keeps the sender alive for exactly the same
+            // reason `forget` did, while making shutdown able to reach it.
+            let _ = SEAL_WRITER_CANCEL.set(cancel_tx);
+            let handle = tokio::spawn(async move {
+                run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
             });
+            if let Ok(mut slot) = SEAL_WRITER_HANDLE.lock() {
+                *slot = Some(handle);
+            }
             tracing::info!(
                 interval_ms = seal_drain_interval().as_millis(),
                 max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
@@ -2611,6 +2717,23 @@ async fn build_shared_infra(
     // reason: it must complete before the first ILP row can auto-create the
     // table with the wrong shape.
     tickvault_storage::tick_persistence::ensure_ticks_table(&config.questdb).await;
+
+    // --- `market_depth` DDL — the same class, and it matters MORE here ---
+    //
+    // The depth table's DEDUP key carries a `depth_kind` discriminator that no
+    // other table needs: depth-20 and depth-200 both emit a level-5 bid for
+    // the same instrument in the same second, from DIFFERENT sockets, and
+    // those are different observations of different books.
+    //
+    // If ILP auto-creates this table (no DDL ran, fresh volume) it arrives
+    // WITHOUT that key — and then the two pools begin silently overwriting
+    // each other's levels. Rows land, counts look plausible, nothing errors,
+    // and half the book is gone. That is a worse failure than the tick case
+    // above, because the loss is not duplicate rows but MISSING ones.
+    //
+    // Awaited INLINE, before the first depth ILP row can exist, for exactly
+    // the reason the two DDLs above are.
+    tickvault_storage::depth_persistence::ensure_market_depth_table(&config.questdb).await;
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
@@ -3081,6 +3204,59 @@ async fn run_process_runloop(
                 code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                 "Dhan live feed: the shutdown seal+flush did NOT finish within 20s — exiting \
                  anyway so systemd does not SIGKILL us, but the day's tail may be incomplete"
+            ),
+        }
+    }
+
+    // 5b-2. Seal writer final drain (2026-08-18).
+    //
+    // MUST run AFTER the lane join above: the lane's close force-seal only
+    // QUEUES seals into the writer's mpsc, so joining the lane proves nothing
+    // about persistence. Until now nothing signalled or waited for this task,
+    // so it died with the runtime mid-drain and the day's tail was lost while
+    // the line above logged "sealed and flushed cleanly".
+    //
+    // Reported honestly in all three directions: a completed drain says how
+    // many seals landed and where, a timeout says the tail may be incomplete
+    // rather than exiting quietly, and any truly-dropped seal fires
+    // AGGREGATOR-DROP-01 per its runbook.
+    if let Some(cancel) = SEAL_WRITER_CANCEL.get() {
+        let _ = cancel.send(true);
+    }
+    let seal_handle = SEAL_WRITER_HANDLE.lock().ok().and_then(|mut s| s.take());
+    if let Some(handle) = seal_handle {
+        match tokio::time::timeout(SEAL_WRITER_SHUTDOWN_BUDGET, handle).await {
+            Ok(Ok(outcome)) => {
+                if outcome.mpsc_submit_dropped > 0 {
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                        dropped = outcome.mpsc_submit_dropped,
+                        submitted = outcome.submitted_from_mpsc,
+                        "seal writer: seals were DROPPED on the final drain — all three \
+                         absorption tiers failed; these candles are gone"
+                    );
+                }
+                info!(
+                    submitted = outcome.submitted_from_mpsc,
+                    buffered = outcome.mpsc_submit_buffered,
+                    spilled = outcome.mpsc_submit_spilled,
+                    dlq = outcome.mpsc_submit_dlq,
+                    dropped = outcome.mpsc_submit_dropped,
+                    "seal writer: final drain complete on shutdown"
+                );
+            }
+            Ok(Err(err)) => error!(
+                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01
+                    .code_str(),
+                %err,
+                "seal writer: the task failed during its final drain — the day's tail may not \
+                 have been persisted"
+            ),
+            Err(_) => error!(
+                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                budget_secs = SEAL_WRITER_SHUTDOWN_BUDGET.as_secs(),
+                "seal writer: the final drain did NOT finish within budget — exiting anyway so \
+                 systemd does not SIGKILL us, but the day's tail is incomplete"
             ),
         }
     }

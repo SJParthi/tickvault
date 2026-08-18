@@ -174,6 +174,29 @@ retention_days = 90
 # "option only for the current day" direction — 35d is the smallest clean
 # change; a tighter chain-only knob is a follow-up if disk pressure demands).
 market_data_hot_days = 35
+# DEPTH hot window (2026-08-15) — its own knob because market_depth is an
+# order of magnitude heavier than anything else on the box.
+#
+# Measured, not guessed: 4 SYMBOL keys (4 B each) + 7 eight-byte columns =
+# 72 B/row; depth-20 emits 40 rows/update across 250 instruments and
+# depth-200 emits 400 across 5; the sockets are up for the 24,000-second
+# persistence window (09:00-15:40 IST), NOT a 24-hour day. That is
+# ~21 GB/DAY at one snapshot per second per instrument, ~104 GB/day at five.
+#
+# At market_data_hot_days = 35 that would commit 735 GB MINIMUM on a 100 GB
+# root: the sweep would never fire before the disk filled, and a full disk
+# stops every table, not just this one.
+#
+# 3 = today + yesterday + one day of slack for a sweep skipped because the
+# box was down. Clamped to the same MIN_HOT_DAYS = 2 floor as every other
+# class, so today and yesterday are untouchable even at 0.
+#
+# This is NOT a retention cut. Every partition is exported, uploaded and
+# row-count-VERIFIED in S3 before it leaves EBS — the data is kept in full,
+# only the hot window on local disk is short. The update rate is Assumed
+# until the first live session; if it lands at the high end, lower this to
+# 2 rather than growing the volume.
+depth_hot_days = 3
 # Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
 # Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
 # and size-verified. ROLLBACK: set false (or delete the key) to restore the

@@ -114,13 +114,29 @@ fn the_check_runs_after_the_metrics_recorder_is_installed() {
 
 #[test]
 fn user_data_installs_the_sysctl_file_it_checks() {
-    // The check verifies a file that only exists on the box if user-data copies
+    // The check verifies a file that only exists on the box if SOMETHING copies
     // it there. If that copy is dropped, every box warns and nobody knows why.
+    //
+    // 2026-08-15 — the copy MOVED. It used to live inline in user-data, which
+    // runs once per instance; it is now in tickvault-host-tuning.service, which
+    // runs every boot. The invariant this test protects is "the file reaches
+    // the box", not "user-data specifically puts it there", so accepting either
+    // installer keeps the guard honest rather than pinning a stale mechanism.
+    //
+    // Both are checked, not just one: user-data must still ENABLE the unit (or
+    // nothing installs the file on a fresh instance), and the unit must still
+    // reference the file (or enabling it achieves nothing).
     let tftpl = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let unit = read("deploy/systemd/tickvault-host-tuning.service");
     assert!(
-        tftpl.contains("99-tickvault-net.conf"),
-        "user-data no longer installs 99-tickvault-net.conf, but host_limits.rs \
-         still checks for the limits it sets"
+        unit.contains("99-tickvault-net.conf"),
+        "the host-tuning boot unit no longer installs 99-tickvault-net.conf, but \
+         host_limits.rs still checks for the limits it sets"
+    );
+    assert!(
+        tftpl.contains("tickvault-host-tuning"),
+        "user-data no longer installs/enables the host-tuning unit, so nothing \
+         puts 99-tickvault-net.conf on a fresh instance"
     );
     assert!(
         Path::new(&repo_root().join("deploy/aws/sysctl/99-tickvault-net.conf")).exists(),

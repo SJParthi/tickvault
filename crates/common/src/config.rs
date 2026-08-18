@@ -2928,6 +2928,27 @@ pub struct PartitionRetentionConfig {
     /// untouchable).
     #[serde(default = "default_market_data_hot_days")]
     pub market_data_hot_days: u32,
+    /// Hot window in days for the DEPTH class (`market_depth` — the common
+    /// depth-20 + depth-200 table, 2026-08-15).
+    ///
+    /// Its own knob because depth is an order of magnitude heavier than
+    /// anything else the box stores. Measured over the 24,000-second session
+    /// at 72 B/row: ~21 GB/DAY at one snapshot per second per instrument,
+    /// ~104 GB/day at five. The market-data window of 35 days would therefore
+    /// commit **735 GB minimum** on a 100 GB root — the sweep would never fire
+    /// before the disk died, and a full disk drops EVERYTHING, not just depth.
+    ///
+    /// Default 3: today, yesterday, and one day of slack for a sweep that was
+    /// skipped because the box was down. Clamped to the same hard MIN_HOT_DAYS
+    /// floor at use, so today and yesterday stay untouchable even at 0.
+    ///
+    /// This is NOT a retention reduction. Every partition is exported,
+    /// uploaded and row-count-VERIFIED in S3 before it is dropped from EBS, so
+    /// the data is retained in full — only the hot window on local disk is
+    /// short. A drop without a verified S3 copy cannot happen; the leg is
+    /// fail-closed by construction.
+    #[serde(default = "default_depth_hot_days")]
+    pub depth_hot_days: u32,
     /// Master gate for the archive→verify→drop leg. serde default FALSE so
     /// the destructive behaviour must be explicitly configured on
     /// (config/base.toml sets it true for prod); flipping it off restores
@@ -2952,6 +2973,7 @@ impl Default for PartitionRetentionConfig {
         Self {
             retention_days: default_retention_days(),
             market_data_hot_days: default_market_data_hot_days(),
+            depth_hot_days: default_depth_hot_days(),
             archive_enabled: false,
             archive_bucket: String::new(),
             max_partitions_per_run: default_max_partitions_per_run(),
@@ -2970,6 +2992,13 @@ const fn default_retention_days() -> u32 {
 /// is fail-closed (no verified S3 copy ⇒ no drop).
 const fn default_market_data_hot_days() -> u32 {
     35
+}
+
+/// Default depth hot window: 3 days. See `depth_hot_days` for the arithmetic
+/// — at ~21 GB/day the 35-day market-data window would commit 735 GB on a
+/// 100 GB root, so the sweep would never fire before the disk filled.
+const fn default_depth_hot_days() -> u32 {
+    3
 }
 
 /// Default per-run archive bound: 200 partitions. At ~8–24 hourly ticks
