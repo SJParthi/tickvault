@@ -756,12 +756,24 @@ jobs:
         # (`bin/tickvault.new smoke-test --duration 30`) was wrong and would
         # exit non-zero with "unrecognized subcommand".
         id: ssm
+        # EXPRESSION-LENGTH LOCK (2026-08-18): this run block MUST stay free of
+        # `${{ }}` interpolation. GitHub compiles any run script containing an
+        # expression into a SINGLE template expression capped at 21,000 chars;
+        # this block is ~23,100, so one interpolation makes the whole workflow
+        # file unparseable — `422 Exceeded max expression length 21000` — which
+        # kills the push trigger AND workflow_dispatch, silently blocking every
+        # deploy. Pass values through `env:` below and reference them as shell
+        # variables instead. Inside the single-quoted `--parameters 'commands=[…]'`
+        # payload use quote-splicing ('"$VAR"') — a bare $VAR will not expand.
+        env:
+          AWS_REGION_EFF: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          DEPLOY_SHA: ${{ github.sha }}
         run: |
           CMD_ID=$(aws ssm send-command \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --region "$AWS_REGION_EFF" \
             --instance-ids "$IID" \
             --document-name "AWS-RunShellScript" \
-            --comment "tickvault deploy sha=${{ github.sha }}" \
+            --comment "tickvault deploy sha=$DEPLOY_SHA" \
             --parameters 'commands=[
               "set -euo pipefail",
               "# SELF-HEAL box state before any cd (Z+ defense — idempotent).",
@@ -840,8 +852,8 @@ jobs:
               "# Back up the current binary so we can roll back",
               "if [ -f bin/tickvault ]; then cp bin/tickvault bin/tickvault.backup; fi",
               "# Download the new binaries from S3",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault  bin/tickvault.new",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test bin/smoke_test.new",
+              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/'"$DEPLOY_SHA"'/tickvault  bin/tickvault.new",
+              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/'"$DEPLOY_SHA"'/smoke_test bin/smoke_test.new",
               "chmod +x bin/tickvault.new bin/smoke_test.new",
               "# Run smoke test using the NEW standalone binary (must exit 0 in < 30s)",
               "timeout 40 bin/smoke_test.new --duration 30",

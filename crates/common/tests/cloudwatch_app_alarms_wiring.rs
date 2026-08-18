@@ -582,6 +582,20 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // the operator console to scrape. Shipping its buckets would also multiply
     // cost by the bucket count × 16 connections, which is precisely the kind of
     // cardinality this ratchet exists to make someone think about.
+    //
+    // 2026-08-15: 65 -> 67. TWO gauges added with host-adaptive ring sizing —
+    // `tv_host_total_ram_bytes` (what the process actually measured about its
+    // machine) and `tv_dhan_feed_ring_max_bytes` (what it decided as a result).
+    // Cost ~$0.60/mo; dated note in `aws-budget.md`.
+    //
+    // They are published as a PAIR deliberately. The ring budget is now derived
+    // at runtime rather than being a compile-time constant, so "what is the
+    // buffer?" stops being answerable by reading the source. Publishing only the
+    // decision would leave a number nobody can check; publishing only the input
+    // would leave the decision invisible. Together they make a mis-sized ring —
+    // a fallback on an unreadable /proc/meminfo, or a clamp firing — visible as
+    // an arithmetic disagreement between two series, without opening a shell on
+    // the box.
     // 2026-08-15 (+1, ~$0.30/mo): `tv_dhan_feed_depth_total`, added when
     // depth-20 and depth-200 stopped being captured-then-discarded and became a
     // persisted stream (operator directive: one common `market_depth` table,
