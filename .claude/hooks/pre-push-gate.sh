@@ -390,10 +390,35 @@ fi
 # a new Dhan ticket, quote the response in the rule file, and update the
 # assertion in the same commit — all three steps.
 echo "  [9/9] Dhan locked facts (Tickets #5519522, #5525125)..." >&2
-LOCKED_OUT=$(timeout 120 cargo test -p tickvault-common --test dhan_locked_facts --quiet 2>&1)
+# The timeout was 120s and the budget is spent almost entirely on COMPILING,
+# not asserting: the three tests themselves run in 0.00s, but a cold target
+# dir needs ~3m40s to build the test binary (measured 2026-08-18). So on any
+# fresh clone, any CI-like checkout, or any machine that has just had its
+# build cache evicted, `timeout` killed the compile and this gate announced
+# "Dhan LOCKED FACTS regressed" -- naming a support-ticket invariant as broken
+# when nothing had been asserted at all.
+#
+# That is a false FAIL, the mirror of the false-OK class the audit rules
+# forbid, and it is the more corrosive of the two: a gate that cries
+# regression on a cold cache teaches the next person to push past it.
+#
+# Two changes: a budget that fits a real cold build, and a verdict that
+# distinguishes "the invariant broke" from "the compiler did not finish".
+LOCKED_OUT=$(timeout 600 cargo test -p tickvault-common --test dhan_locked_facts --quiet 2>&1)
 LOCKED_EXIT=$?
 if [ "$LOCKED_EXIT" -eq 0 ]; then
   echo "  PASS: Dhan locked facts (8 invariants held)" >&2
+elif [ "$LOCKED_EXIT" -eq 124 ]; then
+  # `timeout` exits 124 when it kills the child. Nothing was proven either
+  # way, so say exactly that rather than accusing the tree of a regression.
+  echo "$LOCKED_OUT" >&2
+  echo "" >&2
+  echo "  FAIL: Dhan locked-facts gate TIMED OUT after 600s — build did not" >&2
+  echo "  finish, so the invariants were NOT checked. This is not a" >&2
+  echo "  regression report. Warm the cache with:" >&2
+  echo "    cargo test -p tickvault-common --test dhan_locked_facts" >&2
+  echo "  then push again." >&2
+  FAILED=1
 else
   echo "$LOCKED_OUT" >&2
   echo "" >&2
