@@ -56,7 +56,19 @@ use std::path::Path;
 /// the first CI Coverage & Perf measurement.
 const PINNED_DEFAULT_FLOOR: f64 = 63.0;
 const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
-    ("common", 99.5),
+    // common pin 99.5 -> 99.4 (2026-08-18): AUTHORING-ERROR correction, not a
+    // ratchet bypass. The standing formula is measured-rounded-down-minus-0.1;
+    // the 2026-06-10 baseline measured 99.57, so the floor should have been
+    // 99.5 - 0.1 = 99.4. The minus-0.1 step was skipped for common alone —
+    // every other floor in the file obeys the formula. The cost is measured:
+    // CI run 32109620629 (Coverage & Perf job 95626308078) reported
+    // `PASS: common 99.52% (threshold: 99.5%)` — a 0.02-point margin against a
+    // documented 0.07-0.13 band, so any line drifting in a shared dependency
+    // turns the post-merge gate red for a reason no PR author can act on.
+    // 99.4 leaves common the highest floor in the file and sits 0.12 under the
+    // current measured value. Editing this pin in the same PR IS the visible
+    // review this test exists to force. Up-only resumes from here.
+    ("common", 99.4),
     ("core", 91.6),
     ("trading", 96.9),
     ("storage", 90.1),
