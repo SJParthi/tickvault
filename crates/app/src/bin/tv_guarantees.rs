@@ -122,6 +122,60 @@ fn count_ext(files: &[String], exts: &[&str]) -> usize {
         .count()
 }
 
+/// Count tracked files whose FIRST TWO BYTES are `#!`, whatever they are named.
+///
+/// Deliberately reads the file rather than matching an extension list. The
+/// enumerate-one-more-extension approach has been wrong repeatedly in this
+/// repository, always in the same direction: a class nobody listed is
+/// invisible, and invisibility reads as green. `tools/deploy` with a `#!`
+/// first line is a script; `tools/deploy.txt` without one is not.
+fn count_shebangs(files: &[String]) -> usize {
+    use std::io::Read as _;
+    files
+        .iter()
+        .filter(|f| {
+            std::fs::File::open(f).is_ok_and(|mut fh| {
+                let mut head = [0u8; 2];
+                fh.read_exact(&mut head).is_ok() && &head == b"#!"
+            })
+        })
+        .count()
+}
+
+/// Count DISTINCT third-party actions referenced by any workflow.
+///
+/// Distinct rather than total, because ten `uses:` of `actions/checkout` is
+/// one external dependency, not ten. Counted here purely so the number is
+/// visible — this binary takes no position on whether they are in scope, and
+/// the lock leaves that open.
+fn count_third_party_actions() -> usize {
+    let Ok(entries) = std::fs::read_dir(".github/workflows") else {
+        return 0;
+    };
+    let mut seen: Vec<String> = Vec::new();
+    for e in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        for line in text.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("uses:") else {
+                continue;
+            };
+            let name = rest.trim();
+            // `./.github/...` is our own composite action, not a third party.
+            if name.starts_with('.') || name.is_empty() {
+                continue;
+            }
+            let base = name.split('@').next().unwrap_or(name).to_string();
+            if !seen.contains(&base) {
+                seen.push(base);
+            }
+        }
+    }
+    seen.len()
+}
+
 /// Count occurrences of a needle across a directory tree of `.rs` files.
 ///
 /// Walks with `std::fs` rather than shelling out to a search tool, so the
@@ -233,6 +287,21 @@ fn main() {
     let shell = count_ext(&files, &[".sh", ".bash", ".zsh"]);
     let rust = count_ext(&files, &[".rs"]);
 
+    // Extension-less `#!` executables. Counted SEPARATELY from `.sh` because
+    // the extension ban and the shebang check catch different things, and the
+    // 2026-08-14 audit found exactly this hole: `tools/deploy` with a `#!`
+    // first line is neither extension-banned nor invocation-scanned, so a
+    // one-rename evasion was invisible. Asking about the FILE rather than its
+    // NAME is the fix; this row makes the answer visible.
+    let shebangs = count_shebangs(&files);
+
+    // Third-party GitHub Actions. Each `uses:` is someone else's runtime —
+    // most of the standard set is `using: node20`. Reported because the
+    // rust-only lock's own §0.1 leaves this OPEN as a policy question
+    // ("third-party CI actions are not our workspace codebase") and an
+    // unreported open question reads exactly like a closed one.
+    let actions = count_third_party_actions();
+
     let lang = vec![
         Row::new(
             "Interpreted runtimes tracked",
@@ -255,6 +324,42 @@ fn main() {
             Verdict::Bounded,
             format!("{shell} files"),
             "CI/hook glue. NOT Rust. git invokes hooks as shell",
+        ),
+        Row::new(
+            "`#!` executables (any name)",
+            Verdict::Bounded,
+            format!("{shebangs} files"),
+            "asks the FILE, not its name -- closes the rename evasion",
+        ),
+        Row::new(
+            "Rust spawn literals",
+            Verdict::Guaranteed,
+            "benign only",
+            "rust_only_guard: Command::new/.arg/.args scanned",
+        ),
+        Row::new(
+            "Build toolchain surface",
+            Verdict::Guaranteed,
+            "scanned",
+            ".cargo/config runner+linker, Cargo.toml, make, Docker",
+        ),
+        Row::new(
+            "node-family invocations",
+            Verdict::Guaranteed,
+            "budgeted",
+            "command-position scan, shrink-only budget",
+        ),
+        Row::new(
+            "Third-party CI actions",
+            Verdict::Bounded,
+            format!("{actions} used"),
+            "someone else's runtime; OPEN policy question per lock §0.1",
+        ),
+        Row::new(
+            "Browser code in .rs",
+            Verdict::Bounded,
+            "pinned",
+            "browser_surface guard: enumerated surfaces only",
         ),
     ];
 
