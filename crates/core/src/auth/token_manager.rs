@@ -340,6 +340,18 @@ impl TokenManager {
             renew_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
+        // Set when SSM held a well-formed, unexpired token that Dhan REJECTED.
+        //
+        // That rejection is positive evidence the account's ONE active token is
+        // not ours — and the local cache below is strictly STALER than the token
+        // just proven dead, because every mint publishes to SSM. Returning the
+        // cache there would skip the mint and run the whole session on a
+        // guaranteed-dead token, 401-ing every REST leg, which is the exact
+        // class this ladder exists to prevent. The warning in that arm says
+        // "falling through to mint"; before this flag it fell through to the
+        // cache instead.
+        let mut shared_token_rejected_by_broker = false;
+
         // FIRST path: adopt the SHARED token from SSM.
         //
         // # The re-mint war this ends (prod evidence, 2026-08-14/15)
@@ -479,6 +491,7 @@ impl TokenManager {
                                     }
                                     Err(e) => {
                                         manager.token.store(Arc::new(None));
+                                        shared_token_rejected_by_broker = true;
                                         warn!(
                                             error = %e,
                                             "the shared Dhan token in SSM parses and has not \
@@ -539,7 +552,14 @@ impl TokenManager {
         // This skips the Dhan HTTP auth call (~500ms-2s), saving significant
         // boot time on crash recovery. SSM credentials are still fetched above
         // (needed for the renewal loop).
-        if let Some(cached_token) = token_cache::load_token_cache(&manager.credentials.client_id) {
+        //
+        // SKIPPED when SSM's token was broker-rejected: the cache is strictly
+        // staler than a token Dhan has already refused, so taking it here would
+        // hand the session a dead token and never reach the mint below.
+        if !shared_token_rejected_by_broker
+            && let Some(cached_token) =
+                token_cache::load_token_cache(&manager.credentials.client_id)
+        {
             manager.token.store(Arc::new(Some(cached_token)));
             info!(
                 expires_at = %manager.current_expiry_display(),

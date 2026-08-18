@@ -167,35 +167,59 @@ services:
     environment:
       QDB_LOG_W_STDOUT_LEVEL: ERROR
       QDB_TELEMETRY_ENABLED: "false"
-      QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL: "60000"
-      # Increase ILP connection idle timeout to prevent disconnects during
-      # low-activity periods. Default is too aggressive for burst-then-idle
-      # patterns (25K instruments send bursts, then pause between flush cycles).
-      QDB_LINE_TCP_DISCONNECT_ON_ERROR: "false"
       QDB_METRICS_ENABLED: "TRUE"
-      # --- WAL Tuning (Wave 7-A: tightened for 2GB ceiling) ---
-      # WAL segment rollover: 64MB. Fewer file ops for high-throughput ILP.
-      QDB_WAL_SEGMENT_ROLLOVER_SIZE: "67108864"
-      # Max uncommitted rows per WAL writer: 2M. Larger batches = fewer commits.
+      # --- WAL / writer tuning ---
+      #
+      # Every value below was VERIFIED against the running container on
+      # 2026-08-18 via `SHOW PARAMETERS`, not assumed. Five QDB_LINE_TCP_* vars
+      # and two misnamed WAL vars were DELETED here because that query proved
+      # they tune nothing:
+      #
+      #   * QDB_LINE_TCP_* (maintenance interval, disconnect-on-error,
+      #     connection limit, idle release, recv buffer) governed the :9009 TCP
+      #     receiver. All 44 production ILP senders use `http::addr=<host>:9000`
+      #     (tick_persistence.rs, depth_persistence.rs, ...); live socket counts
+      #     were 40 on :9000 and only listeners on :9009. They read as if the
+      #     write path were tuned while tuning nothing.
+      #   * QDB_WAL_SEGMENT_ROLLOVER_SIZE ("64MB") — live value was 52428800,
+      #     QuestDB's 50MB DEFAULT. The property is
+      #     `cairo.wal.segment.rollover.size`, so the env var must be
+      #     QDB_CAIRO_WAL_SEGMENT_ROLLOVER_SIZE. Ours never matched and was
+      #     silently ignored. Deleted rather than renamed: the default is fine
+      #     and a rename would change live behaviour on no evidence.
+      #   * QDB_WAL_APPLY_TABLE_TIME_QUOTA ("100000", commented "100ms") — live
+      #     value was 1000, the default. Same wrong-name problem. Deleting it is
+      #     the SAFE repair and renaming would be the dangerous one: the value
+      #     is in MILLISECONDS, so 100000 means 100 SECONDS, and activating it
+      #     would let one table hold the WAL apply job while the other ~25
+      #     starved.
       QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "2000000"
-      # WAL apply job interval: 100ms. Faster WAL→table merge for freshness.
-      QDB_WAL_APPLY_TABLE_TIME_QUOTA: "100000"
       # O3 max lag: 60s. Tighter out-of-order merge window.
       QDB_CAIRO_O3_MAX_LAG: "60000000"
-      # ILP connection limit: 20. We have ~15 writers (tick, depth, OBI, indicators, candles, etc.).
-      QDB_LINE_TCP_NET_ACTIVE_CONNECTION_LIMIT: "20"
-      # ILP idle timeout: 10 minutes. Prevents premature disconnect during
-      # burst-then-idle patterns (depth writers flush every 500 records, may idle 30-60s between).
-      QDB_LINE_TCP_MIN_IDLE_MS_BEFORE_WRITER_RELEASE: "600000"
-      # ILP connection receive buffer: 4MB. Handles burst ILP writes without backpressure.
-      QDB_LINE_TCP_NET_RECV_BUF_SIZE: "4194304"
       # --- Crash Recovery & Stability ---
-      # Writer append page size: 1MB. Reduces mmap syscalls for large batches.
-      QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "1048576"
-      # Parallel WAL apply threads: 4 (matches the r8g.xlarge 4 vCPU, operator
-      # Quote 13 2026-08-08). Was 2, explicitly "matches t4g.medium 2 vCPUs" —
-      # which halved WAL→table merge throughput on the new box.
-      QDB_WAL_APPLY_WORKER_COUNT: "4"
+      # Writer append page size: 16MB (QuestDB's default).
+      #
+      # Was 1048576 with the comment "1MB. Reduces mmap syscalls for large
+      # batches" — which is backwards. 1MB is 16x BELOW the default, so every
+      # column file remaps 16x MORE often. `SHOW PARAMETERS` confirmed this one
+      # WAS in force (correct env name), unlike the two above. market_depth is
+      # PARTITION BY HOUR, so ~72 live partitions x 11 columns is on the order
+      # of 800 append files remapping every megabyte.
+      #
+      # Measured on the box 2026-08-18 while this was 1MB: NVMe 74% util,
+      # 3,121 writes/sec, IO pressure full=13.97% (every task stalled on IO
+      # 14% of wall time) — with the app itself using 6.7% CPU.
+      QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "16777216"
+      # Parallel WAL apply threads: 3, matching the container's `cpus: 3.0`
+      # quota below.
+      #
+      # Was 4, justified as "matches the r8g.xlarge 4 vCPU" — but the container
+      # is capped at 3.0 CPUs, not 4, so the 4th worker bought only CFS
+      # throttling. Measured on the box 2026-08-18: nr_throttled 18,594 of
+      # nr_periods 85,149 = 21.8% of scheduling periods throttled, 232 seconds
+      # of throttled time. The host is 4 vCPU total and the app needs some of
+      # it, so the quota stays 3.0 and the worker count comes down to match.
+      QDB_WAL_APPLY_WORKER_COUNT: "3"
       QDB_PG_USER: ${TV_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${TV_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     logging:

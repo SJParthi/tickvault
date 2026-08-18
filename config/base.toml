@@ -196,7 +196,31 @@ market_data_hot_days = 35
 # only the hot window on local disk is short. The update rate is Assumed
 # until the first live session; if it lands at the high end, lower this to
 # 2 rather than growing the volume.
-depth_hot_days = 3
+# MEASURED 2026-08-18 (the first live session with depth actually flowing) —
+# lowered 3 -> 2 per this block's own standing instruction below.
+#
+# QuestDB on the box: market_depth = 9.2 GB after 104 minutes of capture
+# (first depth row 03:46:36Z, sampled 05:30Z) = 5.3 GB/HOUR. Across the
+# 6h40m persistence window that is ~35 GB/DAY — above the ~21 GB/day
+# one-snapshot-per-second estimate this block was written against, i.e. the
+# "high end" case it names. Live shape: d20 = 84 instruments x 20 levels,
+# d200 = 5 instruments x 200 levels, 133 M rows in those 104 minutes.
+#
+# At 3 days that commits ~106 GB of depth alone on a 100 GB root — the sweep
+# could not fire before the disk filled, and a full disk stops every table.
+# At 2 it is ~71 GB, which fits alongside the rest with the archive running.
+#
+# Still not a retention cut: every partition is exported, uploaded and
+# row-count-VERIFIED in S3 before it leaves EBS. 2 is also the MIN_HOT_DAYS
+# floor, so today and yesterday stay local and untouchable.
+#
+# FLAGGED, not fixed here: market_data_hot_days = 35 above is a 2026-07-16
+# OPERATOR DIRECTIVE, and ticks alone are now running ~2.5 GB/day, so that
+# window implies ~87 GB on its own. Changing it is an operator scope call,
+# not an executor one — but the arithmetic no longer fits beside depth, and
+# the honest options are a shorter market-data window or the 100 -> 200 GB
+# volume grow that variables.tf already permits.
+depth_hot_days = 2
 # Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
 # Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
 # and size-verified. ROLLBACK: set false (or delete the key) to restore the
