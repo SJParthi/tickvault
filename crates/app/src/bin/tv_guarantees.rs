@@ -140,13 +140,13 @@ fn count_in_rust_sources(root: &Path, needles: &[&str]) -> usize {
                     continue;
                 }
                 walk(&path, needles, acc);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    for line in text.lines() {
-                        let t = line.trim_start();
-                        if needles.iter().any(|n| t.starts_with(n)) {
-                            *acc += 1;
-                        }
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                for line in text.lines() {
+                    let t = line.trim_start();
+                    if needles.iter().any(|n| t.starts_with(n)) {
+                        *acc += 1;
                     }
                 }
             }
@@ -182,11 +182,10 @@ fn render(title: &str, rows: &[Row]) -> String {
     let _ = writeln!(s, "{}", "=".repeat(title.len()));
     let _ = writeln!(
         s,
-        "{:<w_what$}  {:<w_verd$}  {:<w_meas$}  {}",
+        "{:<w_what$}  {:<w_verd$}  {:<w_meas$}  PROOF / WHY",
         "WHAT",
         "VERDICT",
         "MEASURED",
-        "PROOF / WHY",
         w_what = w_what,
         w_verd = w_verd,
         w_meas = w_meas
