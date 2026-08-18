@@ -270,6 +270,7 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
             seq,
             endpoint: DhanEndpointType::MainFeed,
             connection_index: (n % 4) as u8,
+            received_at: std::time::Instant::now(),
             bytes: bytes.into(),
         }
     }
@@ -351,6 +352,7 @@ fn frame_drain_gate_is_not_vacuous() {
             seq: 1,
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
+            received_at: std::time::Instant::now(),
             bytes: buf.into(),
         },
         1_000_000,

@@ -918,6 +918,31 @@ pub struct CapturedFrame {
     /// A `u8` alongside the existing enum adds no allocation: `Bytes` remains
     /// the only heap member of this struct.
     pub connection_index: u8,
+    /// The monotonic instant this frame came off the socket.
+    ///
+    /// Stamped in the READ TASK, and monotonic on purpose — both halves
+    /// matter.
+    ///
+    /// **Why stamped here:** until 2026-08-18 the drain called the clock
+    /// itself and used that as the receive time, which measured
+    /// `Dhan's delivery + OUR time queued in the ring`. Those are different
+    /// quantities with different owners. Under a fold stall the ring backs up
+    /// and the drain falls behind, so every lag sample inflated precisely when
+    /// the cause was LOCAL — the lag alarm would fire hardest at our own
+    /// backlog while naming the vendor for it.
+    ///
+    /// **Why `Instant` and not a wall-clock stamp:** this module is forbidden
+    /// from reading the wall clock at all, and that ban is load-bearing rather
+    /// than stylistic — an NTP step must be unable to expire all sixteen
+    /// sockets at once (`test_pool_supervisor_source_never_reads_the_wall_clock`).
+    /// A monotonic stamp respects it, and is strictly better anyway: the
+    /// consumer derives the wall-clock receipt instant by subtracting
+    /// `elapsed()` from its own clock read, so a clock step landing between
+    /// receipt and fold cannot corrupt the measured lag.
+    ///
+    /// Costs one vDSO read per frame on a task that already performs one for
+    /// the watchdog. No allocation: `Bytes` remains the only heap member.
+    pub received_at: std::time::Instant,
     /// The frame exactly as it arrived. Never parsed on the read task.
     pub bytes: Bytes,
 }
@@ -1114,6 +1139,11 @@ impl WalRingSink {
 
 impl FrameSink for WalRingSink {
     fn accept(&self, frame: Bytes) -> FrameSinkOutcome {
+        // Stamped FIRST, before the WAL append and before the budget check.
+        // This is the frame's arrival instant; every microsecond of our own
+        // work after this line must NOT be charged to the vendor.
+        // Monotonic, never wall-clock — see `CapturedFrame::received_at`.
+        let received_at = Instant::now();
         // Minted ONCE, here, at the read instant — see `CapturedFrame`.
         let seq = next_frame_seq();
         // Step 1 — durability. `Bytes` into the WAL is an Arc refcount bump.
@@ -1144,6 +1174,7 @@ impl FrameSink for WalRingSink {
                 seq,
                 endpoint: self.endpoint,
                 connection_index: self.connection_index,
+                received_at,
                 bytes: frame,
             })
             .is_err()
@@ -2391,6 +2422,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn test_wal_ring_sink_stamps_receipt_time_in_the_read_task() {
+        // The published frame must carry a receipt stamp taken INSIDE
+        // `accept` — i.e. on the read task — not left for the drain to
+        // invent later. Bracketing the call proves the stamp belongs to the
+        // arrival instant and not to whenever a consumer got around to it.
+        //
+        // Why this matters enough to test: the drain used to call
+        // `Utc::now()` itself, so every lag sample measured
+        // `Dhan's delivery + our own time queued in the ring`. Under a fold
+        // stall the ring backs up and that number inflates — the lag alarm
+        // would fire hardest when the fault was LOCAL and name the vendor
+        // for it.
+        let dir = wal_dir("recvstamp");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+
+        let before = std::time::Instant::now();
+        assert_eq!(
+            sink.accept(Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0])),
+            FrameSinkOutcome::Captured
+        );
+        let after = std::time::Instant::now();
+
+        let published = rx.try_recv().expect("a captured frame must be published");
+        assert!(
+            published.received_at >= before && published.received_at <= after,
+            "the receipt stamp must be taken inside accept() — it fell outside the \
+             bracket taken around the call, so it was not stamped at receipt"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn test_wal_ring_sink_stamps_a_distinct_ascending_seq_per_frame() {
         // Two arrivals of BYTE-IDENTICAL content must still receive distinct
