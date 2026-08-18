@@ -85,7 +85,7 @@ jobs:
 
       - name: Auto-close cargo-careful build-failure issue on green build
         if: steps.build.outcome == 'success'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '⚠️ Safety Net: cargo-careful build failure (nightly compatibility)';
@@ -133,7 +133,7 @@ jobs:
 
       - name: Auto-close cargo-careful runtime issue on green run
         if: steps.test.outcome == 'success'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '🔴 Safety Net: cargo-careful found issues';
@@ -162,7 +162,7 @@ jobs:
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '🔴 Safety Net: cargo-careful found issues';
@@ -193,7 +193,7 @@ jobs:
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '⚠️ Safety Net: cargo-careful build failure (nightly compatibility)';
@@ -257,7 +257,7 @@ jobs:
 
       - name: Auto-close ASan build-failure issue on green build
         if: steps.build.outcome == 'success'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '⚠️ Safety Net: ASan build failure (nightly compatibility)';
@@ -363,7 +363,7 @@ jobs:
 
       - name: Auto-close ASan runtime issue on green run
         if: steps.test.outcome == 'success'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             // Close BOTH the real-finding title and the honest
@@ -399,7 +399,7 @@ jobs:
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             // Honest filing (#1495): only claim "found memory issues" when
@@ -442,7 +442,7 @@ jobs:
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '⚠️ Safety Net: ASan build failure (nightly compatibility)';
@@ -506,7 +506,7 @@ jobs:
 
       - name: Auto-close TSan build-failure issue on green build
         if: steps.build.outcome == 'success'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '⚠️ Safety Net: TSan build failure (nightly compatibility)';
@@ -613,7 +613,7 @@ jobs:
 
       - name: Auto-close TSan runtime issue on green run
         if: steps.test.outcome == 'success'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             // Close BOTH the real-finding title and the honest
@@ -649,7 +649,7 @@ jobs:
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             // Honest filing (#1495): only claim "found data races" when the
@@ -692,7 +692,7 @@ jobs:
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '⚠️ Safety Net: TSan build failure (nightly compatibility)';
