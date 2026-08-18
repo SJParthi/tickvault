@@ -858,3 +858,49 @@ lost before `accept` is not in scope and never was); recovery after WAL rotation
 counted, not repaired); that recovery is free (it competes for the drain's task and is
 therefore rate-limited by design); or any live verification — this design is UNVERIFIED
 against a real stall, and the first live stall is the probe.
+
+### A10. BLOCKER found while attempting implementation (2026-08-18) — the WAL has no bounded reader
+
+Implementation was attempted immediately after §A1–A9 and **stopped at a defect in
+this design's own §A3.4**, recorded here rather than worked around.
+
+§A3 says "re-fold from the durable WAL". The WAL's ONLY read API is
+`ws_frame_spill::replay_all(wal_dir) -> anyhow::Result<Vec<ReplayedFrame>>`, and it is
+**boot-shaped, not session-shaped**:
+
+| Property | Value | Consequence mid-session |
+|---|---|---|
+| Segment selection | globs **every** live `*.wal` plus `replaying/` leftovers | not "the stalled window" — the whole day so far |
+| Return type | `Vec<ReplayedFrame>`, each owning `frame: Vec<u8>` | every frame copied onto the heap at once |
+| When segments leave the glob | only after `confirm_replayed` moves them to `archive/` | nothing has left yet during a live session |
+
+At the documented envelope (~5,000 packets/sec, frames up to 256 KiB on the main feed)
+a mid-session `replay_all` would load the **entire session's captured frames** into
+memory in one allocation burst, on the drain task, on a 32 GiB box that is also running
+QuestDB. **That is an OOM, not a recovery** — and it would fire precisely during a
+database stall, i.e. exactly when the system is already degraded. Calling it would also
+be wrong in a second way: `confirm_replayed` must NOT run mid-session or it would
+archive segments the boot path still needs.
+
+**Therefore Item 2 gains a hard prerequisite** — a bounded, streaming WAL read:
+
+- read frames matching a supplied `capture_seq` set WITHOUT materialising the segment
+  (iterator/callback, not `Vec`);
+- bounded per call (a cap on frames returned per recovery pass);
+- tolerant of the ACTIVE segment being appended to concurrently — a torn final record
+  must be skipped, never parsed (the boot path only ever reads quiescent files, so this
+  requirement is genuinely new, not inherited);
+- must NOT mutate segment state (no `confirm_replayed`, no move to `replaying/`).
+
+`ReplayedFrame` already carries `frame_seq`, so the identity needed for exactly-once
+filtering exists — what is missing is a way to reach it without loading everything.
+
+**Honest consequence for sequencing:** Item 2 is NOT a single-crate change and cannot
+land as one PR. Order is (1) the bounded reader in `crates/storage`, with its own tests
+including the torn-tail case, then (2) the refused-seq tracker, then (3) the drain's
+recovery arm. Attempting (2) or (3) first produces code with nothing safe to call.
+
+**Status:** design AMENDED, implementation **NOT started** — deliberately. Shipping the
+naive version would have converted a bounded, loud, counted tick loss into an
+out-of-memory kill of the whole lane during a database stall. That trade is strictly
+worse than the defect it repairs.
