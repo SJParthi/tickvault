@@ -542,6 +542,20 @@ resource "aws_cloudwatch_dashboard" "operator" {
           metrics = [
             [local.dash_namespace, "tv_dhan_feed_drain_frames_total", { label = "frames received", stat = "Sum" }],
             [local.dash_namespace, "tv_dhan_feed_ingest_ticks_total", { label = "ticks folded into candles", stat = "Sum" }],
+            # Added 2026-08-18. The chain this widget exists to make legible
+            # ran frames -> ticks and then STOPPED, while the loss widget
+            # separately charted "candles discarded". So the operator could
+            # see candles thrown away but never candles produced, and a
+            # flat-zero discard line read identically whether the lane was
+            # healthy or emitting nothing at all — the exact ambiguity the
+            # comment above this widget was written to kill, left open one
+            # stage further down.
+            #
+            # The gap has a dated cause: the old "Candle seals emitted" widget
+            # was retired 2026-07-17 when its metric died with the tick
+            # aggregator (correct at the time). The aggregator was REBUILT on
+            # 2026-08-09 under a new metric name, and nothing restored it.
+            [local.dash_namespace, "tv_dhan_feed_seals_emitted_total", { label = "candles sealed and sent", stat = "Sum" }],
             [local.dash_namespace, "tv_dhan_feed_ingest_refused_total", { label = "ticks refused", stat = "Sum" }]
           ]
           period = 300
