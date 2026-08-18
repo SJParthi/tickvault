@@ -34,7 +34,17 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
 
 ## Plan Items
 
-- [ ] **Item 1 — Wire CPU affinity (make the claim true or delete it)**
+- [x] **Item 1 — Wire CPU affinity (make the claim true or delete it)** — **DONE via the
+  delete branch** (verified 2026-08-18, in source, not assumed): `core_affinity` appears
+  in ZERO manifests (root `Cargo.toml` carries only a comment recording the removal, and
+  no `crates/*/Cargo.toml` declares it); the charter's "core_affinity Core 0" resilience
+  claim is withdrawn in `operator-charter-forever.md`; and the ratchet this item asked
+  for exists and passes — `crates/common/tests/core_affinity_claim_guard.rs`
+  (`core_affinity_is_wired_or_absent_never_declared_but_dead`, 3/3 green), which fails
+  the build if the dependency ever returns without a call site. Ticked late: the work
+  landed 2026-08-10 and the box was never checked, so an APPROVED plan carried finished
+  work as pending — the same stale-state class that has manufactured false findings in
+  this repo before.
   - Pin the decode/aggregation thread off the core handling network interrupts.
   - If pinning is judged wrong for a 4-vCPU shared-tenancy VM, **delete the dependency and
     the claim** instead. An unused dependency backing a documented guarantee is worse than

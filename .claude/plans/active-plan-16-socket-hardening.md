@@ -742,3 +742,165 @@ addressed — it is NOT; replayed live-feed frames are still counted and dropped
 It is deliberately left to Item 2 because the fold path takes a live ring rather than a
 replay batch, and a half-done version risks the 5 working main-feed sockets. (d) Any
 measurement at 4,565 instruments — the lane has still never been observed receiving a tick.
+
+## ITEM 2 — DESIGN ADDENDUM (added 2026-08-18, operator: "fix ebrythgine ntirley ddue okay?")
+
+Item 2 above states the DEFECT and names the remedy ("re-fold from the WAL,
+DEDUP-idempotent via `capture_seq`"). This addendum is the DESIGN, written before any
+code, because the one-line remedy as stated is **not safe as written** — see §A2.
+
+**Status of the defect today (re-verified 2026-08-18, in source):** the loss is REAL but
+it is **not silent**. `WalRingSink::accept` returns `RingFull`; the frame is already in
+the WAL; `pool_supervisor.rs` then emits a coded `error!` per socket, throttled at
+1/2/4/8… occurrences, stating verbatim *"nothing re-folds WAL frames, so treat this as
+data loss until that changes."* It is counted (`tv_dhan_ws_ring_full_total`) and charted.
+What is missing is only the RECOVERY. Recording this so nobody re-reports "silent tick
+loss" — that half was fixed 2026-08-11.
+
+### A1. Why the boot path cannot simply be called mid-session
+
+`refold_wal_frames` has exactly ONE production call site, and its safety argument is
+positional, not defensive. The comment at that site states it is placed "AFTER seeding and
+BEFORE any socket opens" so a recovered frame "cannot race a live frame for the same
+`capture_seq`". Mid-session **every** premise of that sentence is false: sockets are live,
+seeding is done, and live frames are arriving concurrently. Calling it from the drain loop
+inherits none of its safety.
+
+### A2. The correctness trap — re-folding a SUPERSET is NOT idempotent
+
+Item 2's phrase "DEDUP-idempotent via `capture_seq`" is true of **ticks** and false of
+**candles**, and the difference decides the whole design:
+
+| Sink | Re-folding the same frame twice | Why |
+|---|---|---|
+| `ticks` table | **Safe** — collapses | DEDUP UPSERT KEYS `(ts, security_id, segment, capture_seq, feed)` include `capture_seq` |
+| Candle aggregator | **CORRUPTS** | The fold ACCUMULATES: `volume` and `tick_count` are summed, so a re-folded tick double-counts them |
+
+Therefore the recovery must re-fold **exactly** the refused frames — never "replay the
+segment and let dedup sort it out." That approach would silently inflate volume on every
+recovered candle, which is worse than the loss it repairs (wrong data beats missing data
+only when it is labelled wrong; here it would be neither).
+
+### A3. Design
+
+1. **Record the refusal, not the recovery.** `WalRingSink::accept` already knows the exact
+   moment a frame is refused. On `RingFull` it pushes that frame's `capture_seq` into a
+   fixed-capacity `RefusedSeqs` tracker (no allocation; a pre-sized ring of `u64`).
+2. **Bounded, fail-LOUD tracker.** Capacity is fixed at construction. If the tracker itself
+   overflows, we have lost the identity of the lost frames — that is unrecoverable and is
+   reported as such (`tv_dhan_refold_untracked_total` + a coded `error!`), never silently
+   truncated into a partial recovery that reads like a full one.
+3. **Recovery runs on the drain's own task, in its own bounded arm** — the established
+   house shape (`scan_silence` has a dedicated 30 s timer precisely because it is O(n);
+   `catch_up_seal_all` runs on the drain's `select!`). It must NOT run inside the flush
+   path it is recovering from, and it must NOT run while the channel is still backed up:
+   the trigger is "channel depth below a low-water mark AND `RefusedSeqs` non-empty."
+4. **Exactly-once fold.** Each recovered `capture_seq` is removed from the tracker only
+   after its fold returns, so a crash mid-recovery leaves it pending for the boot path.
+5. **Late arrival is an EXISTING solved problem, not a new one.** A recovered tick whose
+   bucket already sealed is a late tick, and the aggregator already has a late-tick policy
+   (`FeedStrategy` / `LatePolicy`, Dhan = Refold). The recovery reuses it rather than
+   inventing a second late path.
+
+### A4. Edge Cases
+
+| # | Case | Handling |
+|---|---|---|
+| 1 | Tracker overflows during a long stall | Unrecoverable-by-identity: count + coded error, never a partial recovery reported as whole |
+| 2 | WAL segment rotated/archived before recovery | Frame unreadable: count + coded error; recovery skips it and continues |
+| 3 | A second stall begins during recovery | Recovery is bounded per pass and re-armed; it never competes with live folding |
+| 4 | Socket reconnects mid-recovery | `capture_seq` is replay-stable, so identity survives the reconnect |
+| 5 | Recovered tick's bucket already sealed | Existing late-tick policy applies (§A3.5) |
+| 6 | Frame was refused but ALSO folded (double-path) | Impossible by construction: `accept` returns exactly one outcome per frame |
+| 7 | Recovery finds an empty tracker | No-op, no log, no cost |
+
+### A5. Failure Modes
+
+| Mode | Consequence if unhandled | Mitigation |
+|---|---|---|
+| Re-fold a superset | Inflated candle volume/tick_count — **wrong data** | §A2: exact-seq recovery only |
+| Recovery starves live folding | Live lag grows while repairing history | Bounded work per pass + low-water trigger |
+| Unbounded tracker | Memory growth under sustained stall | Fixed capacity, fail-loud on overflow |
+| Silent partial recovery | Loss reported as repaired | Overflow and unreadable-frame counters are separate and coded |
+
+### A6. Test Plan
+
+1. `refused_seq_is_recorded_on_ring_full` — accept returns `RingFull` ⇒ seq present.
+2. **`refold_twice_does_not_double_count_volume`** — the crux of §A2. Fold a tick, re-fold
+   the same frame, assert candle `volume`/`tick_count` unchanged. Expected to FAIL against
+   a superset-replay implementation; that is the point of writing it first.
+3. `tracker_overflow_is_counted_and_never_silently_truncated`.
+4. `recovery_is_bounded_per_pass` — N refused frames ⇒ ≤ budget folds per pass.
+5. `recovery_does_not_run_while_channel_is_backed_up`.
+6. `unreadable_wal_frame_is_counted_not_panicked`.
+7. DHAT: recovery path allocates zero per recovered frame in steady state.
+
+### A7. Rollback
+
+Recovery ships behind a config gate, serde default **OFF**. Flipping it off restores
+today's exact behaviour (loss + loud log). No schema change, no DEDUP-key change, no new
+table — so rollback is a config flip and a restart, never a migration.
+
+### A8. Observability
+
+New: `tv_dhan_refold_recovered_total`, `tv_dhan_refold_untracked_total`,
+`tv_dhan_refold_unreadable_total`. **Mandatory in the same PR:** the existing `RingFull`
+error text states *"nothing re-folds WAL frames"* — that sentence becomes FALSE the moment
+this lands, and a stale operator-facing message is the false-OK class the charter forbids.
+It must be updated in lockstep.
+
+### A9. Honest envelope
+
+100% inside the tested envelope: frames REFUSED by a full ring are recovered exactly-once
+from the durable WAL, bounded per pass, with overflow and unreadable frames counted
+separately and loudly. **NOT claimed:** recovery of frames the WAL never received (a frame
+lost before `accept` is not in scope and never was); recovery after WAL rotation (§A4.2 —
+counted, not repaired); that recovery is free (it competes for the drain's task and is
+therefore rate-limited by design); or any live verification — this design is UNVERIFIED
+against a real stall, and the first live stall is the probe.
+
+### A10. BLOCKER found while attempting implementation (2026-08-18) — the WAL has no bounded reader
+
+Implementation was attempted immediately after §A1–A9 and **stopped at a defect in
+this design's own §A3.4**, recorded here rather than worked around.
+
+§A3 says "re-fold from the durable WAL". The WAL's ONLY read API is
+`ws_frame_spill::replay_all(wal_dir) -> anyhow::Result<Vec<ReplayedFrame>>`, and it is
+**boot-shaped, not session-shaped**:
+
+| Property | Value | Consequence mid-session |
+|---|---|---|
+| Segment selection | globs **every** live `*.wal` plus `replaying/` leftovers | not "the stalled window" — the whole day so far |
+| Return type | `Vec<ReplayedFrame>`, each owning `frame: Vec<u8>` | every frame copied onto the heap at once |
+| When segments leave the glob | only after `confirm_replayed` moves them to `archive/` | nothing has left yet during a live session |
+
+At the documented envelope (~5,000 packets/sec, frames up to 256 KiB on the main feed)
+a mid-session `replay_all` would load the **entire session's captured frames** into
+memory in one allocation burst, on the drain task, on a 32 GiB box that is also running
+QuestDB. **That is an OOM, not a recovery** — and it would fire precisely during a
+database stall, i.e. exactly when the system is already degraded. Calling it would also
+be wrong in a second way: `confirm_replayed` must NOT run mid-session or it would
+archive segments the boot path still needs.
+
+**Therefore Item 2 gains a hard prerequisite** — a bounded, streaming WAL read:
+
+- read frames matching a supplied `capture_seq` set WITHOUT materialising the segment
+  (iterator/callback, not `Vec`);
+- bounded per call (a cap on frames returned per recovery pass);
+- tolerant of the ACTIVE segment being appended to concurrently — a torn final record
+  must be skipped, never parsed (the boot path only ever reads quiescent files, so this
+  requirement is genuinely new, not inherited);
+- must NOT mutate segment state (no `confirm_replayed`, no move to `replaying/`).
+
+`ReplayedFrame` already carries `frame_seq`, so the identity needed for exactly-once
+filtering exists — what is missing is a way to reach it without loading everything.
+
+**Honest consequence for sequencing:** Item 2 is NOT a single-crate change and cannot
+land as one PR. Order is (1) the bounded reader in `crates/storage`, with its own tests
+including the torn-tail case, then (2) the refused-seq tracker, then (3) the drain's
+recovery arm. Attempting (2) or (3) first produces code with nothing safe to call.
+
+**Status:** design AMENDED, implementation **NOT started** — deliberately. Shipping the
+naive version would have converted a bounded, loud, counted tick loss into an
+out-of-memory kill of the whole lane during a database stall. That trade is strictly
+worse than the defect it repairs.
