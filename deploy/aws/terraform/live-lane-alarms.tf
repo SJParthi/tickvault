@@ -65,11 +65,28 @@ resource "aws_cloudwatch_metric_alarm" "dhan_live_lane_down" {
   # threshold purely from the scrape that caught it mid-restart.
   dimensions = local.app_dimensions
 
-  # notBreaching, NOT breaching: the box is stopped outside 08:30-17:30 IST by
-  # design, and a stopped box publishes nothing. treat_missing_data=breaching
-  # would page every single evening at shutdown — the fastest possible way to
-  # train an operator to ignore this alarm.
-  treat_missing_data = "notBreaching"
+  # breaching, NOT notBreaching — safe ONLY because this alarm is now in the
+  # market-hours gate's ALARM_NAMES list (market-hours-liveness-alarm.tf), so
+  # its ACTIONS are disabled outside 09:20 IST -> close.
+  #
+  # Why this had to change: a gauge alarm on LessThanThreshold can only fire on
+  # a datapoint that exists. A CRASHED app publishes nothing at all, so the
+  # missing data was read as healthy and the lane-down alarm was blind to the
+  # exact total-failure case it exists for. Live proof, 2026-08-18: the alarm's
+  # own state reason read "no datapoints were received for 2 periods and 2
+  # missing datapoints were treated as [NonBreaching]" while it sat in OK.
+  #
+  # The previous comment here was RIGHT that a bare flip to breaching would
+  # page every evening at shutdown — "the fastest possible way to train an
+  # operator to ignore this alarm". That is why the gate membership is part of
+  # the same change and not a follow-up: without it this line is a regression.
+  #
+  # HONEST RESIDUAL: the gate opens at 09:20 IST but the persistence window
+  # starts at 09:00, so a crash in [09:00, 09:20) still pages only via the
+  # boot-heartbeat alarm's handover, not this one. Narrowing that seam means
+  # moving the gate open time, which arms other alarms whose signals are not
+  # valid before 09:20 — deliberately not done here.
+  treat_missing_data = "breaching"
 
   alarm_actions = local.app_alarm_actions
   # The lane coming back up IS meaningful and self-explanatory, so the

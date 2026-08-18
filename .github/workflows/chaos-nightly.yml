@@ -1,14 +1,20 @@
 # =============================================================================
 # tickvault — Chaos Test Suite (Weekly)
 # =============================================================================
-# Runs the 11 `#[ignore]`d chaos tests (across 19 chaos_* test files) that exercise:
+# Runs every chaos test function across the 11 `chaos_*` test files (44 as of
+# 2026-08-18, of which exactly ONE carries `#[ignore]`) that exercise:
 #
 # 1. QuestDB outage / pause / sigkill / disk-full
 # 2. WS frame WAL replay / spill saturation / disk IO failure
 # 3. Zero-tick-loss defense chain (with real Docker stack)
 # 4. Mock WS server end-to-end
 #
-# HONESTY NOTE: of the 11 ignored tests, several SELF-SKIP in this lane —
+# HONESTY NOTE (corrected 2026-08-18): the header above said "the 11 #[ignore]d
+# chaos tests (across 19 chaos_* test files)". Both numbers were wrong — there
+# are 11 chaos FILES, not 19, and exactly ONE #[ignore] attribute among them,
+# not 11. Paired with the `--ignored` flag this lane used, that meant the lane
+# ran a single self-skipping test. See the corrected note at the cargo test
+# step. Several tests still SELF-SKIP here —
 # some need a running tickvault app (TV_METRICS_PORT gate), others gate on
 # env flags this job does not set by default (CI_WITH_DOCKER,
 # CI_WITH_SIGKILL, TV_SLOW_CHAOS). This lane's green therefore covers the
@@ -149,19 +155,33 @@ jobs:
           set -euo pipefail
           cargo test --workspace --no-run --test 'chaos_*' 2>&1 | tee /tmp/build.log
 
-      - name: Run chaos tests (--ignored)
+      - name: Run chaos tests (--include-ignored)
         id: chaos
         run: |
           set -euo pipefail
-          # `--ignored` flips the #[ignore] bit so the chaos tests actually
-          # execute. We scope to the `chaos_*` test binaries via --test so
-          # unrelated #[ignore]'d tests (e.g. flaky GUI tests) don't join in.
+          # `--include-ignored`, NOT `--ignored` (corrected 2026-08-18).
+          #
+          # In libtest, `--ignored` runs ONLY the ignored tests; it EXCLUDES
+          # every normal one. Across all 11 `chaos_*.rs` files there is exactly
+          # ONE `#[ignore]` attribute today (chaos_cascade_triple_failure.rs),
+          # and that test's body self-skips when the stack is unreachable. So
+          # this lane was running ONE test that could return immediately while
+          # the other 43 chaos test functions never executed here at all — and
+          # it reported green while doing so, which is the false-OK class audit
+          # rule 11 forbids, in the one lane whose job is to disprove a
+          # guarantee. The tests were never dead (they run in the normal
+          # per-crate `test` job); the CHAOS lane's coverage was.
+          #
+          # `--include-ignored` runs the normal tests AND the ignored one, which
+          # is what this lane always claimed to do. Keep it. Reverting to
+          # `--ignored` re-empties the lane.
+          #
           # --no-fail-fast is intentional — we want the full failure matrix.
           cargo test \
             --workspace \
             --test 'chaos_*' \
             --no-fail-fast \
-            -- --ignored --nocapture 2>&1 | tee /tmp/chaos.log
+            -- --include-ignored --nocapture 2>&1 | tee /tmp/chaos.log
 
       - name: Tear down Docker compose stack
         if: always()

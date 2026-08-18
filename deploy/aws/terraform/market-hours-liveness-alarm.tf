@@ -350,7 +350,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
       # 2026-07-17 (dashboard tidy): dhan-exchange-lag-p99-high retired —
       # its gauge's only publisher (run_dhan_lag_publisher, dormant since
       # the PR-C2 lane deletion) is deleted with the dead Dhan-lag chain.
-      # The gate now arms 2 alarms.
+      # The gate now arms 3 alarms (dhan_live_lane_down joined 2026-08-18).
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         # aggregator_no_seals retired 2026-07-15 (dead monitor — see
@@ -359,6 +359,16 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # WS spawn (operator Dhan noise lock; the 4 Dhan-lane alarms left the
         # list 2026-07-13).
         aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
+        # 2026-08-18: dhan_live_lane_down JOINS the gate. It is not an
+        # off-hours false-pager like the others here — it is the opposite
+        # problem. Its treat_missing_data flipped notBreaching -> breaching in
+        # live-lane-alarms.tf so that a CRASHED app (which publishes no
+        # datapoint at all) actually pages, instead of its absence reading as
+        # health. That flip is only safe while something disables the alarm's
+        # actions overnight, and this list is that something. The two changes
+        # are one change: separating them re-creates the nightly false page the
+        # old comment correctly warned about.
+        aws_cloudwatch_metric_alarm.dhan_live_lane_down.alarm_name,
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS
         # sweep — its metric's writer, the tick aggregator, is deleted).
@@ -418,7 +428,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the
   # dead Dhan-lag publisher chain) lives HERE in
   # the comment; the description keeps only the operator-actionable core.
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 2 gated alarms (market-hours-liveness-missing, app-log-ingestion-silent - the Lambda's ALARM_NAMES env is the authoritative list; trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain). A failed open leaves both disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 2 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 3 gated alarms (market-hours-liveness-missing, app-log-ingestion-silent, dhan-live-lane-down - the Lambda's ALARM_NAMES env is the authoritative list; trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain). A failed open leaves both disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 3 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
