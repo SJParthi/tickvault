@@ -524,6 +524,20 @@ const MAPPING_POLL_INTERVAL_MS: u64 = 500;
 ///
 /// `outcome` is one of `not_requested`, `rider_disabled`, `already_present`,
 /// `became_ready`, `timed_out`.
+///
+/// # NOT shipped to CloudWatch — deliberately, and this is a real limitation
+///
+/// This counter is readable on the box's `/metrics` endpoint and nowhere else.
+/// Adding it to the EMF `metric_selectors` list was attempted and REVERTED:
+/// `user-data.sh.tftpl` currently renders to **15,870 bytes against a 15,872
+/// byte budget**, and the size guard that pins it explicitly forbids buying
+/// room by shaving unrelated blocks. Its prescribed remedy — moving content
+/// out of user-data into a file copied in after the repo clone — is a larger
+/// change than this fix should carry.
+///
+/// So a boot that timed out waiting is visible in the log line and on
+/// `/metrics`, but not in CloudWatch. Shipping it is a follow-up that has to
+/// deal with the byte budget first.
 pub const MAPPING_WAIT_COUNTER: &str = "tv_dhan_live_universe_mapping_wait_total";
 
 /// Wait — bounded — for today's mapping artifact to exist before the lane
