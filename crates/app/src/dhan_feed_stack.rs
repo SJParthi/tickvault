@@ -1325,7 +1325,7 @@ impl LiveIngest {
 /// is a plain atomic add. Every label value here is a compile-time-known
 /// `&'static str`, so the full set is enumerable up front — there is no
 /// unbounded label cardinality hiding in this struct.
-struct DrainCounters {
+pub struct DrainCounters {
     folded: metrics::Counter,
     non_tick: metrics::Counter,
     unparseable: metrics::Counter,
@@ -1369,7 +1369,18 @@ impl DrainCounters {
 }
 
 /// Process-wide handle set, resolved on first use.
-fn counters() -> &'static DrainCounters {
+/// The process-wide cached handle set.
+///
+/// `pub` so the DHAT gate can drive `drain_main_feed_frame`. Handing the test
+/// the SAME `OnceLock` the production path uses is the point: a gate that
+/// built its own counters would measure a different function than the one that
+/// ships, and the whole reason these handles exist is that resolving a metric
+/// key per frame allocates.
+// A OnceLock accessor over metrics handles: no branch to assert. Its REASON to
+// be pub is exercised by dhat_live_ingest_seam.rs, which drives
+// drain_main_feed_frame with these exact handles.
+// TEST-EXEMPT: OnceLock accessor with no branch; its purpose is covered by dhat_live_ingest_seam.rs
+pub fn counters() -> &'static DrainCounters {
     static COUNTERS: std::sync::OnceLock<DrainCounters> = std::sync::OnceLock::new();
     COUNTERS.get_or_init(|| DrainCounters {
         folded: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "folded"),
@@ -1495,6 +1506,107 @@ pub const TOKEN_MANAGER_WAIT_INTERVAL_SECS: u64 = 5;
 /// produced a count-only bound in the first place. This is a memory ceiling,
 /// and the unit it is expressed in is the unit that runs out.
 pub const FRAME_RING_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Hard ceiling for the auto-sized ring. Above this the ring stops being a
+/// burst absorber and starts competing with QuestDB for the same RAM.
+pub const FRAME_RING_MAX_BYTES_CEILING: usize = 2 * 1024 * 1024 * 1024;
+
+/// Share of host RAM the ring may occupy when auto-sizing.
+///
+/// 2% of a 32 GiB host is 655 MiB — roughly 2.5× today's fixed value, still
+/// under a fortieth of the machine, and comfortably clear of the ~14–31 GiB
+/// the sizing note budgets for QuestDB, the tick set and the OS.
+pub const FRAME_RING_RAM_PERCENT: usize = 2;
+
+/// Total host RAM in bytes, read from `/proc/meminfo`.
+///
+/// Deliberately parses `/proc/meminfo` rather than taking a dependency: adding
+/// a crate needs operator approval, and this is one integer from a file that
+/// has had the same format for decades. `None` on anything unexpected — a host
+/// whose memory cannot be read must fall back, never guess.
+fn host_total_ram_bytes() -> Option<usize> {
+    parse_meminfo_total_bytes(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Pure `/proc/meminfo` → total-RAM-in-bytes parser.
+///
+/// Split out from the file read so hostile input is REACHABLE by a test. The
+/// previous shape read the live file inline, which meant the only input this
+/// code could ever be tested against was the one the CI runner happened to
+/// have — every malformed, truncated, unit-shifted or adversarial variant was
+/// unreachable, and "it works on this machine" was the whole of the evidence.
+///
+/// # What it refuses, and why each refusal is load-bearing
+///
+/// - **No `MemTotal:` line** → `None`. A file that does not answer the question
+///   must not be guessed at.
+/// - **Unit token that is not `kB`** → `None`. This is the one that silently
+///   costs a factor of 1024: every Linux kernel to date reports kB, but a value
+///   read as kB when it is bytes under-sizes the ring by 1024× (invisible — it
+///   just clamps to the floor and looks normal), and read as bytes when it is
+///   kB over-sizes by 1024× (clamps to the ceiling, equally quiet). Requiring
+///   the unit turns a silent mis-scale into an explicit fallback.
+/// - **Non-numeric, negative, or empty value** → `None`.
+/// - **Multiplication overflow** → `None` (checked, never wrapping).
+///
+/// A `MemTotal:` line appearing more than once takes the FIRST — matching the
+/// kernel's own single-line contract rather than inventing a merge rule.
+fn parse_meminfo_total_bytes(meminfo: &str) -> Option<usize> {
+    let rest = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+
+    let mut fields = rest.split_whitespace();
+    let kb: usize = fields.next()?.parse().ok()?;
+
+    // The unit is mandatory. See the doc comment: a missing unit is exactly
+    // where a 1024× mis-scale hides, and both directions of that error are
+    // silent because the clamps absorb them.
+    match fields.next() {
+        Some("kB") => kb.checked_mul(1024),
+        _ => None,
+    }
+}
+
+/// Pure sizing arithmetic: host RAM (or `None`) → ring byte budget.
+///
+/// Separated from [`frame_ring_max_bytes_for_host`] so the bounds can be proven
+/// against the REAL function across the whole input range, including values no
+/// machine this runs on will ever report. A test that re-implements the formula
+/// in its own closure proves the copy, not the code.
+fn ring_bytes_for_ram(total_ram_bytes: Option<usize>) -> usize {
+    match total_ram_bytes {
+        Some(total) => (total / 100)
+            .saturating_mul(FRAME_RING_RAM_PERCENT)
+            .clamp(FRAME_RING_MAX_BYTES, FRAME_RING_MAX_BYTES_CEILING),
+        None => FRAME_RING_MAX_BYTES,
+    }
+}
+
+/// The ring byte ceiling for THIS host.
+///
+/// # Why this is not a constant
+///
+/// Until 2026-08-15 every buffer in this lane was a fixed number. The host was
+/// upgraded 4 GiB → 8 → 16 → 32 GiB across four operator decisions and **not
+/// one of these values moved**, so a 32 GiB machine ran the ring sized for a
+/// 4 GiB one — 0.8% of the box. The instance grew; the software never noticed.
+///
+/// That is the "dynamic, scalable" property the charter asks for, absent in
+/// the one place it costs money.
+///
+/// # The bounds are the safety, not the percentage
+///
+/// - **Floor = [`FRAME_RING_MAX_BYTES`]**, today's proven value. Auto-sizing can
+///   only ever grow the budget, so a small or unreadable host lands exactly
+///   where it is now. This can never regress a working configuration.
+/// - **Ceiling = [`FRAME_RING_MAX_BYTES_CEILING`]**, so a very large host does
+///   not hand the ring memory QuestDB needs.
+/// - **Unreadable `/proc/meminfo` → the floor.** Fail to the known-good value,
+///   never to a guess.
+pub fn frame_ring_max_bytes_for_host() -> usize {
+    ring_bytes_for_ram(host_total_ram_bytes())
+}
 
 // A ceiling below the largest single admissible frame would refuse EVERY frame
 // from that endpoint — a total feed outage wearing the shape of backpressure.
@@ -1694,6 +1806,32 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Has a RISK-GAP-03 page fired recently enough to suppress the next one?
+///
+/// Extracted as a pure function rather than written inline because the inline
+/// form was only checkable by a source scan, and a source scan for a literal
+/// is defeated by the same blanket edit that would break the code — a first
+/// draft of that guard rewrote the assertion and the call site together and
+/// passed. Behaviour is testable; text is not.
+///
+/// Returns `false` when no page has fired yet, so the FIRST page of a session
+/// is never suppressed.
+///
+/// # Clock, not counter
+///
+/// Both arguments are seconds. The call site sits a few lines below a binding
+/// named `now` that holds `ingest.refusals()` — a counter — so passing the
+/// wrong one compiles and produces a cooldown that is either permanent or
+/// inert depending on how many refusals happened to have occurred.
+/// `test_a_counter_shaped_value_does_not_silently_work_as_a_clock` pins the
+/// consequence.
+fn silence_page_is_cooling(last_page_secs: Option<u64>, now_secs: u64, cooldown: u64) -> bool {
+    // saturating_sub, because a clock that steps backwards (NTP correction)
+    // must not wrap into a gigantic elapsed value and silently clear the
+    // cooldown at the one moment the log is hardest to read.
+    last_page_secs.is_some_and(|last| now_secs.saturating_sub(last) < cooldown)
+}
+
 /// Flushes the depth ILP buffer, if a depth ingest is wired.
 ///
 /// Deliberately a separate call from the tick flush rather than folded into
@@ -1757,6 +1895,10 @@ async fn run_frame_drain(
     // once, the falling edge logs recovery at info and re-arms.
     let mut silent_scans: u32 = 0;
     let mut silence_reported = false;
+    /// Shortest gap between two RISK-GAP-03 pages, however many separate
+    /// silence episodes occur inside it. See `last_silence_page` below.
+    const SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800;
+    let mut last_silence_page: Option<u64> = None;
     // Last reported aggregator-refusal totals, so the 30s arm can report a
     // DELTA rather than a cumulative that looks alarming forever after one
     // bad minute.
@@ -2019,12 +2161,61 @@ async fn run_frame_drain(
                         );
                     }
                     silent_scans = 0;
-                    silence_reported = false;
+                    // Re-arm only once nothing is left in the never-ticked
+                    // set. `never_ticked` is one-way within a session — an
+                    // instrument leaves it only by producing something, which
+                    // also removes it from `silent` — so re-paging while it is
+                    // non-zero restates a fact that cannot have changed.
+                    //
+                    // This gate alone is NOT what stops the page storm; see
+                    // the cooldown at the emit below, and the measured numbers
+                    // recorded there.
+                    if never == 0 {
+                        silence_reported = false;
+                    }
                     continue;
                 }
                 silent_scans = silent_scans.saturating_add(1);
-                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported {
+                // A cooldown between PAGES, not between episodes.
+                //
+                // # What the 2026-08-14 session actually did
+                //
+                // 25 distinct RISK-GAP-03 emits in one trading day. The
+                // `silent` count oscillated the whole time — 4, 9, 1, 2, 1, 3,
+                // 208, 10 — clearing to zero between episodes and re-arming
+                // the latch each time, entirely legitimately: these are
+                // sparse-cadence instruments going quiet and coming back.
+                //
+                // So the per-episode latch was working exactly as designed and
+                // still produced ~25 pages, because the real world produced ~25
+                // episodes. `never_ticked` was 4 on the 09:15 emit and 0 on
+                // every one after it, so the feed WAS delivering — gating on
+                // never-ticked alone (above) would have suppressed almost none
+                // of this.
+                //
+                // That became a paging problem on 2026-08-15, when RISK-GAP-03
+                // gained a CloudWatch alarm: at a 5-minute window with a
+                // recovery page, 25 episodes is ~50 operator messages a day.
+                // Half an hour is chosen to sit above the observed inter-episode
+                // gap (two to five minutes through the afternoon) while staying
+                // far below the session, so a genuinely new problem hours later
+                // still pages.
+                //
+                // The counter is deliberately NOT gated — every episode still
+                // increments `tv_dhan_feed_instruments_silent`, so the
+                // suppressed ones remain countable on the dashboard. Only the
+                // page is rate-limited, and the log line says how many were
+                // folded in.
+                // `now_millis`, not `now` — the latter is bound to
+                // `ingest.refusals()` a few lines above, which is a COUNTER.
+                // Dividing it by 1,000 compiles and yields a plausible-looking
+                // small number that has nothing to do with time.
+                let now_secs = now_millis / 1_000;
+                let cooling =
+                    silence_page_is_cooling(last_silence_page, now_secs, SILENCE_PAGE_COOLDOWN_SECS);
+                if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported && !cooling {
                     silence_reported = true;
+                    last_silence_page = Some(now_secs);
                     error!(
                         code = ErrorCode::RiskGapTickGap.code_str(),
                         silent,
@@ -2139,7 +2330,20 @@ pub const FLUSH_INTERVAL: std::time::Duration =
 
 /// Parses and folds ONE main-feed frame. Split out so the endpoint routing in
 /// the drain reads as routing rather than as a wall of parse logic.
-fn drain_main_feed_frame(
+/// Decode one captured WebSocket frame and fold every packet it carries.
+///
+/// # Why this is `pub`
+///
+/// It is the true per-frame entry point, and the allocation this lane
+/// regressed on in 2026-08-14 lived HERE — in `record_ws_lag`, called at the
+/// top of the tick arm — not in `ingest_tick_at`. The DHAT gate written in
+/// response measured `ingest_tick_at` alone, so the exact function it was
+/// built for sat one line outside it. Exposing this closes that gap:
+/// `dhat_live_ingest_seam.rs` now measures the whole frame walk.
+// The guard matches tests BY NAME, and the two that drive this function are
+// named for the seam they gate rather than for the callee.
+// TEST-EXEMPT: driven directly by dhat_live_ingest_seam.rs — frame_drain_seam_does_not_allocate_per_tick + frame_drain_gate_is_not_vacuous
+pub fn drain_main_feed_frame(
     ingest: &mut LiveIngest,
     frame: &CapturedFrame,
     received_at_nanos: i64,
@@ -2962,6 +3166,48 @@ pub const DEPTH_ATTACH_RETRY_SECS: u64 = 60;
 /// broken table until 15:30 would report nothing while looking busy.
 pub const DEPTH_ATTACH_DEADLINE_IST_SECS: u32 = 10 * 3_600;
 
+/// The minimum time this task always gets, whatever the wall clock says.
+///
+/// # The live defect this closes (prod evidence, 2026-08-15)
+///
+/// The wall-clock deadline alone produced exactly ONE doomed attempt on any
+/// late start. Measured, from the prod log:
+///
+/// ```text
+/// 10:01:09 IST  tickvault starting
+/// 10:01:2x IST  attempt 1 — option_chain_1m empty (the chain leg has not
+///               fired yet; the app is 20 seconds old)
+/// 10:02:2x IST  attempts > 0 && now >= 10:00  ->  GIVE UP
+/// 10:03:26 IST  WS-GAP-02 "gave up ... attempts: 1"
+/// ```
+///
+/// The existing carve-out — "the deadline gates RETRIES, never the FIRST
+/// attempt" — was written for a mid-session redeploy, where the table is
+/// FULLEST because it has been filling since 09:16. That reasoning is sound
+/// and it does not transfer to a late BOX start, where the table is empty for
+/// today AND the clock is past the deadline. There the one permitted attempt
+/// is taken seconds after boot, before the chain leg has ever run, so it is
+/// guaranteed to find nothing — and then the deadline cancels every retry that
+/// would have found something a minute later.
+///
+/// The condition being tested was "is it late?" when the question that matters
+/// is "has the chain leg had a chance since WE started?". Those are the same
+/// question on a normal morning and opposite questions after a late start,
+/// which is why one deadline could not answer both.
+///
+/// 30 minutes: the chain leg fires once a minute, so any healthy start gets
+/// ~30 chances. It is deliberately longer than a QuestDB restart or a
+/// token-refresh stall, and short enough that a genuinely broken chain is
+/// still declared broken well inside the session.
+pub const DEPTH_ATTACH_MIN_WINDOW_SECS: u64 = 30 * 60;
+
+/// IST second-of-day past which depth is not worth attaching at all.
+///
+/// 15:30 IST — the close. The minimum window above must not be able to keep
+/// this task polling into the evening after a 15:25 restart; depth on a closed
+/// market subscribes contracts that will not trade again today.
+pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 = 15 * 3_600 + 30 * 60;
+
 /// Current IST second-of-day.
 fn ist_second_of_day_now() -> u32 {
     let now_ist = chrono::Utc::now().timestamp().saturating_add(i64::from(
@@ -2994,6 +3240,7 @@ async fn attach_depth_when_available(
     main_feed_budget: Arc<RingByteBudget>,
 ) {
     let mut attempts: u32 = 0;
+    let started = Instant::now();
     loop {
         // The deadline gates RETRIES, never the FIRST attempt.
         //
@@ -3004,14 +3251,37 @@ async fn attach_depth_when_available(
         // have left depth dark after every intra-day restart, which is the
         // failure this whole task exists to end. Found before deploying,
         // because the deploy that motivated it happened to be mid-session.
-        if attempts > 0 && ist_second_of_day_now() >= DEPTH_ATTACH_DEADLINE_IST_SECS {
+        //
+        // AND the task always gets DEPTH_ATTACH_MIN_WINDOW_SECS, whatever the
+        // clock says. 2026-08-15 prod evidence: an app that started at 10:01
+        // IST took its one permitted attempt 20 seconds later — before the
+        // chain leg had fired even once — and the wall-clock deadline then
+        // cancelled every retry. One doomed look, then dark for the session.
+        // "Is it late?" and "has the chain had a chance since we started?" are
+        // the same question on a normal morning and opposite ones after a late
+        // start; both have to be asked.
+        let now_ist = ist_second_of_day_now();
+        let window_elapsed = started.elapsed().as_secs();
+        let past_hard_stop = now_ist >= DEPTH_ATTACH_HARD_STOP_IST_SECS;
+        let past_deadline_and_window = now_ist >= DEPTH_ATTACH_DEADLINE_IST_SECS
+            && window_elapsed >= DEPTH_ATTACH_MIN_WINDOW_SECS;
+
+        if attempts > 0 && (past_hard_stop || past_deadline_and_window) {
             error!(
                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                 attempts,
-                "depth late-attach gave up: option_chain_1m still yielded no depth candidates by \
-                 the 10:00 IST deadline, so depth-20 and depth-200 will carry NO data this \
-                 session. Check that the option-chain leg is running and that \
-                 contract_security_id is populated."
+                window_elapsed_secs = window_elapsed,
+                ist_second_of_day = now_ist,
+                reason = if past_hard_stop {
+                    "market close reached"
+                } else {
+                    "past the 10:00 IST deadline and the minimum window"
+                },
+                "depth late-attach gave up: option_chain_1m still yielded no depth candidates, so \
+                 depth-20 and depth-200 will carry NO data this session. Check that the \
+                 option-chain leg is running and that contract_security_id is populated. If \
+                 `attempts` is small, this app started late — the chain leg publishes from 09:16 \
+                 IST and cannot have run before the app did."
             );
             return;
         }
@@ -3597,22 +3867,34 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     }
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
-    // The ring's second bound, split by ENDPOINT rather than shared.
+    // TWO properties, merged rather than picked between (2026-08-15).
     //
-    // One budget per POOL would bound five times the host's memory, which is
-    // why the original was shared. But one budget for ALL endpoints let the
-    // depth stream — whose frames are 512 KiB — exhaust the whole ceiling and
-    // evict main-feed frames, i.e. every tick that reaches the database. Two
-    // budgets summing to the SAME total keep the host ceiling identical while
-    // making that eviction impossible.
+    // origin/main SPLIT the ring budget by endpoint so a 512 KiB depth frame
+    // can no longer evict main-feed frames. This branch made the budget
+    // HOST-DERIVED so a 32 GiB box stops running a ring sized for a 4 GiB one.
+    // Taking either alone loses the other: main's split is expressed as
+    // fractions of the FRAME_RING_MAX_BYTES constant, so keeping it verbatim
+    // would re-introduce the exact hardcoded-for-the-wrong-machine defect this
+    // branch removed.
     //
-    // (The original comment said depth's payload was "discarded unparsed".
-    // That stopped being true on 2026-08-15, when depth became a persisted
-    // stream. The split matters MORE now, not less: depth is no longer merely
-    // occupying the ring, it is producing 20–200 database rows per packet, so
-    // an unbounded depth burst would compete with ticks for the ILP path too.)
-    let main_feed_budget = Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES));
-    let depth_budget = Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES));
+    // The fractions are what compose: apply main's 3/4 : 1/4 split to the
+    // derived TOTAL. The host ceiling stays whatever the host can afford, and
+    // depth still cannot starve the main feed.
+    let ring_max_bytes = frame_ring_max_bytes_for_host();
+    info!(
+        ring_max_bytes,
+        floor_bytes = FRAME_RING_MAX_BYTES,
+        auto_sized = ring_max_bytes > FRAME_RING_MAX_BYTES,
+        "frame ring byte ceiling selected for this host"
+    );
+    // Published as GAUGES, not left in a boot log. An auto-sized buffer nobody
+    // can see is worse than a fixed one: with a constant you can at least read
+    // the source and know the value.
+    metrics::gauge!("tv_dhan_feed_ring_max_bytes").set(ring_max_bytes as f64);
+    metrics::gauge!("tv_host_total_ram_bytes").set(host_total_ram_bytes().unwrap_or(0) as f64);
+    let main_feed_share = ring_max_bytes / 4 * 3;
+    let main_feed_budget = Arc::new(RingByteBudget::new(main_feed_share));
+    let depth_budget = Arc::new(RingByteBudget::new(ring_max_bytes - main_feed_share));
     // ALWAYS built, and that is load-bearing rather than lazy.
     //
     // The obvious shape — build it only when the boot-time depth sets are
@@ -6692,12 +6974,78 @@ mod tests {
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);
         assert!(
-            production.contains(
-                "attempts > 0 && ist_second_of_day_now() >= DEPTH_ATTACH_DEADLINE_IST_SECS"
-            ),
-            "the depth deadline MUST be guarded by `attempts > 0` — an unguarded check makes a \
+            production.contains("if attempts > 0 && (past_hard_stop || past_deadline_and_window)"),
+            "the depth give-up MUST be guarded by `attempts > 0` — an unguarded check makes a \
              mid-session restart give up before it has looked even once, exactly when the chain \
              table is fullest"
+        );
+    }
+
+    /// The wall-clock deadline alone must not be able to end the task.
+    ///
+    /// Prod, 2026-08-15: the app started at 10:01 IST, took its one permitted
+    /// attempt 20 seconds later — before the option-chain leg had fired even
+    /// once — and the 10:00 deadline then cancelled every retry. One doomed
+    /// look, dark for the session, `attempts: 1` in the log.
+    ///
+    /// A source scan rather than a behavioural test because the alternative is
+    /// a 30-minute sleep or a clock injection through five call sites; the
+    /// condition is a pure boolean and its shape is the whole fix.
+    #[test]
+    fn test_depth_give_up_requires_both_the_deadline_and_a_minimum_window() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("window_elapsed >= DEPTH_ATTACH_MIN_WINDOW_SECS"),
+            "the give-up condition no longer requires a minimum window since THIS task started. \
+             Without it, any start after ~09:59 IST gets exactly one attempt, taken seconds \
+             after boot when the chain leg cannot yet have run — guaranteed empty, then \
+             permanently dark"
+        );
+        assert!(
+            production.contains("now_ist >= DEPTH_ATTACH_DEADLINE_IST_SECS")
+                && production.contains("&& window_elapsed"),
+            "the deadline and the window must be ANDed. ORing them restores the 2026-08-15 \
+             defect: the clock alone would again be sufficient to give up"
+        );
+        assert!(
+            production.contains("past_hard_stop"),
+            "the minimum window must be bounded by a hard stop, or a 15:25 restart would keep \
+             this task polling into the evening for contracts that will not trade again today"
+        );
+    }
+
+    #[test]
+    fn test_depth_attach_windows_are_ordered_and_inside_the_session() {
+        // The three constants only make sense in one order, and getting it
+        // wrong is silent: a hard stop below the deadline would end the task
+        // before the deadline could ever be reached, making the deadline dead
+        // code that reads as if it were live.
+        assert!(
+            DEPTH_ATTACH_DEADLINE_IST_SECS < DEPTH_ATTACH_HARD_STOP_IST_SECS,
+            "the hard stop must be AFTER the deadline, or the deadline is unreachable"
+        );
+        assert!(
+            DEPTH_ATTACH_HARD_STOP_IST_SECS <= 15 * 3_600 + 30 * 60,
+            "the hard stop must not run past the 15:30 IST close — depth on a closed market \
+             subscribes contracts that will not trade again today"
+        );
+        assert!(
+            DEPTH_ATTACH_MIN_WINDOW_SECS >= 10 * DEPTH_ATTACH_RETRY_SECS,
+            "the minimum window must allow at least ten polls, or a transient QuestDB stall \
+             consumes the whole allowance and depth gives up on a healthy chain"
+        );
+        // And the window must fit inside the session from the deadline, or a
+        // start at exactly the deadline would be cut short by the hard stop.
+        let from_deadline_to_close =
+            u64::from(DEPTH_ATTACH_HARD_STOP_IST_SECS - DEPTH_ATTACH_DEADLINE_IST_SECS);
+        assert!(
+            DEPTH_ATTACH_MIN_WINDOW_SECS <= from_deadline_to_close,
+            "the minimum window ({DEPTH_ATTACH_MIN_WINDOW_SECS}s) is longer than the time \
+             between the deadline and the close ({from_deadline_to_close}s), so a start at the \
+             deadline could never use its full allowance"
         );
     }
 }
@@ -6768,6 +7116,459 @@ mod wal_refold_tests {
             loop_body.matches("out.lost = out.lost").count(),
             1,
             "exactly one site may increment `lost`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_sizing_tests {
+    use super::*;
+
+    #[test]
+    fn test_frame_ring_max_bytes_for_host_never_below_the_proven_floor() {
+        // The floor is today's fixed value. Auto-sizing may only GROW the
+        // budget, so a small host — or one whose memory cannot be read — lands
+        // exactly where it is now. This is what makes the change unable to
+        // regress a working configuration.
+        assert!(frame_ring_max_bytes_for_host() >= FRAME_RING_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_frame_ring_max_bytes_for_host_never_above_the_ceiling() {
+        // Above the ceiling the ring stops absorbing bursts and starts
+        // competing with the database for the same RAM.
+        assert!(frame_ring_max_bytes_for_host() <= FRAME_RING_MAX_BYTES_CEILING);
+    }
+
+    #[test]
+    fn test_host_total_ram_is_readable_and_plausible() {
+        // Non-vacuity: if this returned None everywhere, the two bounds tests
+        // above would pass while the sizing never actually did anything.
+        // Plausibility bounds rather than an exact value, because CI runners
+        // and the prod box differ.
+        match host_total_ram_bytes() {
+            Some(total) => {
+                assert!(
+                    total >= 256 * 1024 * 1024,
+                    "implausibly small MemTotal ({total} bytes) — parse is wrong"
+                );
+                assert!(
+                    total <= 8 * 1024 * 1024 * 1024 * 1024,
+                    "implausibly large MemTotal ({total} bytes) — unit is wrong \
+                     (kB vs bytes is the classic error here)"
+                );
+            }
+            None => {
+                // Acceptable on a non-Linux or restricted host; the fallback is
+                // the floor, which the first test already pins.
+            }
+        }
+    }
+
+    const GIB: usize = 1024 * 1024 * 1024;
+
+    #[test]
+    fn test_ring_sizing_is_monotonic_in_host_ram() {
+        // The property that matters: a bigger box gets at least as much ring.
+        // Asserted against the REAL sizing function — an earlier version of
+        // this test re-implemented the formula in a local closure, which proves
+        // the copy and would have passed even if the production arithmetic were
+        // deleted outright.
+        assert_eq!(
+            ring_bytes_for_ram(Some(4 * GIB)),
+            FRAME_RING_MAX_BYTES,
+            "4 GiB -> floor"
+        );
+        assert!(
+            ring_bytes_for_ram(Some(32 * GIB)) > FRAME_RING_MAX_BYTES,
+            "a 32 GiB host must get MORE than the 4 GiB-era floor — that gap is \
+             the entire reason this function exists"
+        );
+        assert!(
+            ring_bytes_for_ram(Some(32 * GIB)) <= ring_bytes_for_ram(Some(64 * GIB)),
+            "monotonic"
+        );
+        assert_eq!(
+            ring_bytes_for_ram(Some(1024 * GIB)),
+            FRAME_RING_MAX_BYTES_CEILING,
+            "an enormous host is capped, not unbounded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Extreme permutations of the sizing input
+    // -----------------------------------------------------------------------
+
+    /// The bounds must hold for EVERY input, not the handful a real machine
+    /// reports.
+    ///
+    /// The sizing function is the one place in this lane where an outside
+    /// number (a file the kernel writes) decides how much memory the process
+    /// takes. Anything that number can be, it will eventually be — on a
+    /// container with a synthetic `/proc`, on a host with an absurd
+    /// hugepage-backed total, on a kernel that changes its mind about units.
+    /// So the guarantee has to be range-wide, not sample-wide.
+    #[test]
+    fn test_ring_bytes_stays_inside_its_bounds_for_every_conceivable_ram() {
+        let mut cases: Vec<Option<usize>> = vec![
+            None,             // unreadable /proc/meminfo
+            Some(0),          // a kernel reporting zero
+            Some(1),          // one byte
+            Some(99),         // below the /100 divisor — integer division to zero
+            Some(100),        // exactly the divisor
+            Some(101),        // just above
+            Some(usize::MAX), // the overflow edge
+            Some(usize::MAX / 2),
+        ];
+        // Every power of two from 1 byte to the top of the type: catches a
+        // shift/rounding error at any scale, not just the plausible ones.
+        for shift in 0..usize::BITS {
+            cases.push(Some(1usize << shift));
+        }
+        // And every whole GiB from 1 to 4096 — the range a real box lives in.
+        for gib in 1..=4096usize {
+            cases.push(Some(gib * GIB));
+        }
+
+        for input in cases {
+            let out = ring_bytes_for_ram(input);
+            assert!(
+                out >= FRAME_RING_MAX_BYTES,
+                "ring_bytes_for_ram({input:?}) = {out} fell BELOW the proven \
+                 floor. The floor is what makes auto-sizing unable to regress a \
+                 working configuration; below it this change becomes a \
+                 tick-loss risk instead of a headroom gain"
+            );
+            assert!(
+                out <= FRAME_RING_MAX_BYTES_CEILING,
+                "ring_bytes_for_ram({input:?}) = {out} exceeded the ceiling — \
+                 the ring would start competing with QuestDB for the same RAM"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ring_sizing_never_panics_and_never_wraps_at_the_type_edge() {
+        // `usize::MAX / 100 * 2` overflows in debug builds without the
+        // saturating multiply, and WRAPS to a tiny number in release — which
+        // would clamp back to the floor and look perfectly healthy while the
+        // arithmetic was silently broken. Pin both directions.
+        assert_eq!(
+            ring_bytes_for_ram(Some(usize::MAX)),
+            FRAME_RING_MAX_BYTES_CEILING,
+            "the largest representable host must saturate to the ceiling, not \
+             wrap into the floor"
+        );
+        assert_eq!(
+            ring_bytes_for_ram(Some(0)),
+            FRAME_RING_MAX_BYTES,
+            "a zero-RAM reading must land on the floor"
+        );
+    }
+
+    #[test]
+    fn test_ring_sizing_is_monotonic_across_the_whole_gib_range() {
+        // Monotonicity at three sample points is a spot check. Across the full
+        // range it is a property: more RAM can never produce a smaller ring, at
+        // any boundary, including the two clamp edges where an off-by-one would
+        // otherwise hide.
+        let mut prev = ring_bytes_for_ram(Some(0));
+        for gib in 1..=512usize {
+            let now = ring_bytes_for_ram(Some(gib * GIB));
+            assert!(
+                now >= prev,
+                "sizing went DOWN between {} and {gib} GiB ({prev} -> {now})",
+                gib - 1
+            );
+            prev = now;
+        }
+    }
+
+    #[test]
+    fn test_the_percentage_actually_binds_somewhere_in_the_real_range() {
+        // Non-vacuity of the whole feature. If the floor and ceiling were set
+        // such that the percentage never decided anything, every bounds test
+        // above would still pass and the function would be an elaborate way of
+        // returning a constant.
+        let strictly_between = (1..=256usize)
+            .map(|gib| ring_bytes_for_ram(Some(gib * GIB)))
+            .filter(|&b| b > FRAME_RING_MAX_BYTES && b < FRAME_RING_MAX_BYTES_CEILING)
+            .count();
+        assert!(
+            strictly_between > 0,
+            "no host size between 1 and 256 GiB produces a ring strictly \
+             between the floor and the ceiling — the percentage never binds, \
+             so auto-sizing is decorative"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Extreme permutations of the /proc/meminfo TEXT
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_meminfo_parser_accepts_the_real_shape() {
+        let real = "MemTotal:       32819128 kB\nMemFree:         1234567 kB\n";
+        assert_eq!(
+            parse_meminfo_total_bytes(real),
+            Some(32_819_128 * 1024),
+            "the ordinary Linux shape must parse"
+        );
+    }
+
+    #[test]
+    fn test_meminfo_parser_refuses_every_malformed_shape() {
+        // Each of these once looked like "obviously fine" input. The refusal is
+        // the point: an unparseable file falls back to the proven floor, which
+        // is a correct system running with less headroom — never a guess.
+        let hostile: &[(&str, &str)] = &[
+            ("", "empty file"),
+            ("\n\n\n", "blank lines only"),
+            ("MemFree: 100 kB\n", "no MemTotal line at all"),
+            ("MemTotal:\n", "key with no value"),
+            ("MemTotal:       \n", "key with whitespace only"),
+            ("MemTotal: notanumber kB\n", "non-numeric value"),
+            ("MemTotal: -1 kB\n", "negative value"),
+            ("MemTotal: 3.5 kB\n", "fractional value"),
+            (
+                "MemTotal: 32819128\n",
+                "value with NO unit — the 1024x trap",
+            ),
+            ("MemTotal: 32819128 MB\n", "wrong unit MB"),
+            ("MemTotal: 32819128 B\n", "wrong unit bytes"),
+            ("MemTotal: 32819128 kb\n", "wrong case — kernel writes kB"),
+            ("memtotal: 32819128 kB\n", "lowercase key"),
+            (
+                "MemTotalSwap: 5 kB\n",
+                "a DIFFERENT key that shares the prefix",
+            ),
+            (" MemTotal: 5 kB\n", "leading space breaks the line anchor"),
+            (
+                "MemTotal: 99999999999999999999999999 kB\n",
+                "value beyond usize — must not wrap",
+            ),
+        ];
+        for (input, why) in hostile {
+            assert_eq!(
+                parse_meminfo_total_bytes(input),
+                None,
+                "parser ACCEPTED malformed input ({why}): {input:?}. Accepting \
+                 it would size a live buffer from a number nobody validated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_meminfo_parser_takes_the_first_memtotal_when_duplicated() {
+        // The kernel writes one. A synthetic /proc (containers, test harnesses,
+        // a hostile mount) can write several. Pick deterministically rather
+        // than inventing a merge rule that nobody can predict.
+        let dup = "MemTotal: 1000 kB\nMemTotal: 9999999 kB\n";
+        assert_eq!(parse_meminfo_total_bytes(dup), Some(1000 * 1024));
+    }
+
+    #[test]
+    fn test_meminfo_parser_tolerates_odd_but_valid_whitespace() {
+        // These are NOT malformed — the kernel's column alignment varies with
+        // the value width, so the parser must not be brittle about spacing.
+        for ok in [
+            "MemTotal: 4194304 kB\n",
+            "MemTotal:4194304 kB\n",
+            "MemTotal:\t4194304\tkB\n",
+            "MemTotal:          4194304    kB",
+            "MemFree: 1 kB\nMemTotal: 4194304 kB\nSwapTotal: 0 kB\n",
+        ] {
+            assert_eq!(
+                parse_meminfo_total_bytes(ok),
+                Some(4_194_304 * 1024),
+                "parser rejected a VALID kernel spacing variant: {ok:?}. A \
+                 false rejection is not harmless — it silently drops the box \
+                 back to the 4 GiB-era floor"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_refused_meminfo_lands_exactly_on_todays_behaviour() {
+        // The end-to-end safety claim, stated as one assertion: every way the
+        // parse can fail produces the byte budget that shipped before this
+        // feature existed. That is what makes the change unable to make
+        // anything worse.
+        for broken in ["", "garbage", "MemTotal: x kB", "MemTotal: 1"] {
+            assert_eq!(
+                ring_bytes_for_ram(parse_meminfo_total_bytes(broken)),
+                FRAME_RING_MAX_BYTES,
+                "a broken meminfo ({broken:?}) must land on the pre-existing \
+                 constant, not on a guess"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod silence_latch_tests {
+    use super::silence_page_is_cooling;
+
+    /// RISK-GAP-03 must be rate-limited between PAGES, not just per episode.
+    ///
+    /// # What the 2026-08-14 session actually did
+    ///
+    /// 25 distinct emits in one trading day. The `silent` count oscillated
+    /// throughout — 4, 9, 1, 2, 1, 3, 208, 10 — clearing to zero between
+    /// episodes and re-arming the per-episode latch each time, entirely
+    /// legitimately: sparse-cadence instruments go quiet and come back.
+    ///
+    /// So the latch worked exactly as designed and still produced ~25 pages,
+    /// because the world produced ~25 episodes. `never_ticked` was 4 on the
+    /// 09:15 emit and 0 on every one after it, so the feed WAS delivering.
+    ///
+    /// That became a paging problem on 2026-08-15, when RISK-GAP-03 gained a
+    /// CloudWatch alarm: 25 episodes at a 5-minute window with a recovery page
+    /// is ~50 operator messages a day, which is how a pager gets ignored — and
+    /// this one is the only signal that exists for a subscribe that silently
+    /// did not take.
+    ///
+    /// A source scan because reproducing it behaviourally needs a live socket,
+    /// a seeded universe and a session of wall clock; the emit condition is
+    /// one expression and its shape is the whole fix.
+    #[test]
+    fn test_risk_gap_03_page_is_rate_limited_across_episodes() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("!silence_reported && !cooling"),
+            "the RISK-GAP-03 emit is gated only by the per-episode latch. The \
+             2026-08-14 session had ~25 legitimate episodes, so a per-episode \
+             latch pages ~25 times — and this code now drives a CloudWatch alarm"
+        );
+        assert!(
+            production.contains("SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800"),
+            "the page cooldown must sit above the observed inter-episode gap \
+             (two to five minutes on 2026-08-14) and far below a session, so a \
+             genuinely new problem hours later still pages"
+        );
+
+        // The suppressed episodes must stay COUNTABLE. Rate-limiting the page
+        // while also gating the gauge would trade a noisy signal for no signal.
+        let scan_arm = production
+            .split("let (silent, never) = ingest.scan_silence(now_millis);")
+            .nth(1)
+            .unwrap_or_default();
+        let gauge = scan_arm
+            .find("tv_dhan_feed_instruments_silent")
+            .expect("the silent gauge must publish from the scan arm");
+        let cooldown = scan_arm.find("!cooling").unwrap_or(usize::MAX);
+        assert!(
+            gauge < cooldown,
+            "the silent gauge publishes after the page gate, so a rate-limited \
+             episode would go uncounted as well as unpaged"
+        );
+    }
+
+    /// The first page of a session is never suppressed.
+    #[test]
+    fn test_the_first_silence_page_of_a_session_always_fires() {
+        assert!(
+            !silence_page_is_cooling(None, 34_200, 1_800),
+            "no page has fired yet, so nothing can be cooling — suppressing \
+             the first page would lose the 09:15 emit entirely"
+        );
+    }
+
+    /// The observed inter-episode gap must be suppressed; a later hour must not.
+    #[test]
+    fn test_the_cooldown_spans_the_observed_episode_gap_but_not_the_session() {
+        let first = 46_800; // 13:00 IST, in seconds of day
+
+        // 2026-08-14 re-fired every two to five minutes through the
+        // afternoon. Every one of those must fold into the first page.
+        for gap in [120, 180, 300, 600, 1_799] {
+            assert!(
+                silence_page_is_cooling(Some(first), first + gap, 1_800),
+                "a re-fire {gap}s later still pages. The 2026-08-14 session \
+                 had ~25 legitimate episodes at exactly these gaps, which is \
+                 ~50 operator messages once the CloudWatch alarm is attached"
+            );
+        }
+
+        // A genuinely new problem later must still reach the operator.
+        for gap in [1_800, 3_600, 7_200] {
+            assert!(
+                !silence_page_is_cooling(Some(first), first + gap, 1_800),
+                "a fresh episode {gap}s later is suppressed. The cooldown \
+                 must bound noise, not blind the rest of the session"
+            );
+        }
+    }
+
+    /// A counter-shaped value must not quietly behave like a clock.
+    ///
+    /// The call site sits a few lines below a binding named `now` holding
+    /// `ingest.refusals()`. Passing that instead of the clock compiles. This
+    /// pins what it would do: with a small refusal count the cooldown is
+    /// permanently active after the first page — every later episode silently
+    /// suppressed for the rest of the session.
+    #[test]
+    fn test_a_counter_shaped_value_does_not_silently_work_as_a_clock() {
+        // A refusal counter that never moves: every subsequent call sees the
+        // same "time", so elapsed is 0 and the cooldown never expires.
+        let refusals_as_secs = 0_u64;
+        assert!(
+            silence_page_is_cooling(Some(refusals_as_secs), refusals_as_secs, 1_800),
+            "a frozen counter must read as still-cooling — this is the \
+             failure mode, recorded so the guard above has teeth"
+        );
+
+        // And with the real clock the same elapsed span does expire, which is
+        // the difference the call site has to get right.
+        let t = 46_800_u64;
+        assert!(!silence_page_is_cooling(Some(t), t + 1_800, 1_800));
+    }
+
+    /// A clock stepping backwards must not clear the cooldown.
+    #[test]
+    fn test_a_backwards_clock_step_does_not_clear_the_cooldown() {
+        let first = 46_800;
+        assert!(
+            silence_page_is_cooling(Some(first), first - 5, 1_800),
+            "an NTP correction that steps the clock back must not wrap into a \
+             huge elapsed value and release the cooldown at the exact moment \
+             the logs are hardest to read"
+        );
+    }
+
+    #[test]
+    fn test_the_risk_gap_03_alarm_window_absorbs_oscillation() {
+        let tf = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/aws/terraform/error-code-alarms.tf"),
+        )
+        .expect("error-code-alarms.tf must be readable");
+
+        let entry = tf
+            .split("\"risk-gap-03\" = {")
+            .nth(1)
+            .expect("the risk-gap-03 alarm entry must exist");
+        // Bound on `desc`, not on the first `}` — the `pattern` attribute is a
+        // CloudWatch filter expression that contains braces of its own, so a
+        // brace scan stops before the attributes this test is about. A first
+        // draft did exactly that and reported the values missing when they
+        // were present three lines further down.
+        let entry = &entry[..entry.find("desc").unwrap_or(entry.len())];
+
+        assert!(
+            entry.contains("period      = 3600"),
+            "the risk-gap-03 alarm window shrank below an hour. A 5-minute \
+             window flaps on the residual oscillation and pages on every edge \
+             — the 2026-08-14 session would have produced ~25 transitions"
+        );
+        assert!(
+            entry.contains("ok_recovery = false"),
+            "the risk-gap-03 alarm sends a recovery page. It cannot tell 'the \
+             feed is healthy again' from 'one sparse contract traded once', so \
+             an OK here reads as the first while meaning the second"
         );
     }
 }

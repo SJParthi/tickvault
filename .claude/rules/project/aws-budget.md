@@ -401,6 +401,82 @@ retirements". The revived lane IS a WS frame producer, so that stated reason
 no longer holds. Recorded rather than silently added — adding it is its own
 cost decision and would make this note's +7 delta untrue.
 
+## COST NOTE 2026-08-15 — the two unpaged failures that had no second signal (+~$0.20/mo)
+
+Authority: `dhan-rest-only-noise-lock-2026-07-14.md` §2.3a (operator quote same
+day). Two additions, chosen because in both cases **no other evidence of the
+failure exists anywhere in the system** — not because they were the next names
+on a list.
+
+| Added | What it costs | What it watches |
+|---|---|---|
+| `tv-<env>-dhan-wal-dropped` (metric alarm) | ~$0.10/mo | a frame that never reached the durable floor |
+| `errcode-risk-gap-03` (log filter + alarm) | ~$0.10/mo | connected but hearing nothing |
+
+**Why the first one matters more than the alarm that already exists.** The
+2026-08-14 family alarmed `tv_ticks_dropped_total` — a loss BETWEEN the
+write-ahead log and QuestDB, where the bytes are still on disk. This one is the
+loss BEFORE the log: capture-at-receipt did not hold, so nothing was written
+anywhere and no replay, backfill or cross-verification can recover it. The pair
+that shipped watched the recoverable half of the loss chain and left the
+unrecoverable half silent.
+
+**Why the second is a log filter and not a gauge threshold.** The gauges exist
+(added 2026-08-12) but a threshold on them needs a baseline nobody has and a
+market-hours gate to avoid paging through the legitimately-silent pre-open. The
+app already does both — session-gated, edge-latched to one emit per episode — so
+the coded error carries the gating for free. The derived metric is sparse and
+dimensionless: billed only in hours the code actually fires, near-free at rest.
+
+**Also recorded: one row of the 2026-08-14 family was WRONG and is withdrawn.**
+It named `tv_dhan_feed_drain_respawn_total`, which has zero emit sites and is in
+no allowlist, because the drain is not respawned at all — if it dies the lane
+ends and the up-gauge falls. Building it would have created a filter that can
+never match: a permanently-green dead monitor, the `ws-reinject-01` /
+`tick-conserve-01` class this repo has already retired twice.
+
+**Still visible-but-unpageable, deliberately:** `subscribe_failed`,
+`ring_full`, `ring_bytes_full`, `tick_persist_errors`, `tick_rows_refused`,
+`seals_dropped`. Each would add ~$0.10/mo, several are downstream symptoms the
+two alarms above would already have fired for, and eleven pagers for one
+subsystem trains an operator to ignore all of them. A stopping point on the
+record, not an oversight.
+
+## COST NOTE 2026-08-15 — host-sizing gauges (+~$0.60/mo)
+
+The live lane's frame-ring byte budget stopped being a compile-time constant:
+it is now derived at boot from the machine's own RAM (2% of `MemTotal`,
+clamped to the previous constant as a floor and 2 GiB as a ceiling). That is
+what makes "dynamic/scalable" true rather than aspirational — the same binary
+sizes itself for a 4 GiB box and a 32 GiB one — but it also means **the answer
+to "how big is the buffer?" is no longer readable from the source**.
+
+Two gauges, published as a pair, restore that:
+
+| Gauge | What it answers |
+|---|---|
+| `tv_host_total_ram_bytes` | what the process measured about its own machine |
+| `tv_dhan_feed_ring_max_bytes` | what it decided as a result |
+
+Publishing only the decision would leave a number nobody can check; only the
+input would leave the decision invisible. Together, a mis-sized ring — the
+fallback firing on an unreadable `/proc/meminfo`, or either clamp binding — is
+visible as an arithmetic disagreement between two series, with no shell on the
+box. That matters because every failure mode here is silent: a fallback to the
+floor on a 32 GiB host is a correctly-running lane with 16× less headroom than
+intended, and nothing else would ever say so.
+
+**Cost:** +2 custom metric series ≈ **+$0.60/mo** (65 → 67 EMF-selected names)
+against the $100 kill-ceiling whose AUTOMATIC budget actions fire
+`STOP_EC2_INSTANCES` at 90% ($90). Added to both allowlist copies in lockstep;
+the count ratchet bumped 65 → 67 with its rationale in place.
+
+**NOT claimed:** that these page. They are gauges with no alarm — an alarm on a
+capacity *decision* would need a baseline nobody has yet, and the operator
+signal for the ring actually filling is `tv_dhan_ws_ring_bytes_full_total`,
+which has been EMF-selected since 2026-08-11. Stated here rather than left to
+be inferred from a dashboard.
+
 ## COST NOTE 2026-08-12 — silence read-out gauges (+~$0.60/mo)
 
 The live lane seeded every subscribed instrument into a `TickGapDetector` and

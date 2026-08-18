@@ -161,7 +161,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
               "source_labels": ["host"],
               "label_matcher": "^tickvault-prod$",
               "dimensions": [["host"]],
-              "metric_selectors": ["^(tv_questdb_disconnected_seconds|tv_token_remaining_seconds|tv_orders_rejected_total|tv_boot_completed|tv_clock_skew_seconds|tv_disk_watcher_respawn_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_rest_1m_fire_heartbeat|tv_daily_pnl|tv_order_fill_lag_seconds|tv_spot1m_persist_errors_total|tv_chain1m_persist_errors_total|tv_groww_spot1m_persist_errors_total|tv_groww_chain1m_persist_errors_total|tv_rest_fetch_audit_persist_errors_total|tv_rest_fetch_audit_rows_discarded_total|tv_cadence_option_mark_unresolved_total|tv_cadence_ladder_exhausted_total|tv_cadence_boundary_skipped_total|tv_cadence_late_response_total|tv_cadence_runner_respawn_total|tv_cadence_gate_denials_total|tv_cadence_spot_fallback_total|tv_questdb_wal_suspended_tables|tv_questdb_reconnects_total|tv_partition_archive_failed_total|tv_wal_replay_corrupted_segments_total|tv_order_audit_rows_discarded_total|tv_order_audit_persist_errors_total|tv_order_update_events_dropped_total|tv_order_update_events_persist_errors_total|tv_order_update_events_rows_discarded_total|tv_dhan_order_push_respawn_total|tv_spill_dir_free_bytes|tv_open_fds|tv_oom_kills_total|tv_ram_store_dropped_total|tv_ram_store_errors_total|tv_mid_session_profile_rest_degraded_total|tv_boot_deadline_exceeded_total|tv_dhan_ws_wal_dropped_total|tv_dhan_ws_ring_full_total|tv_dhan_ws_ring_bytes_full_total|tv_dhan_ws_frame_refused_total|tv_dhan_ws_subscribe_failed_total|tv_dhan_feed_seals_dropped_total|tv_dhan_feed_seq_refused|tv_dhan_feed_instruments_silent|tv_dhan_feed_instruments_never_ticked|tv_ticks_dropped_total|tv_tick_persist_errors_total|tv_tick_rows_refused_total|tv_ws_frame_spill_write_errors_total|tv_dhan_feed_stack_up|tv_dhan_feed_drain_frames_total|tv_dhan_feed_ingest_ticks_total|tv_dhan_feed_ingest_refused_total|tv_dhan_ws_reconnect_total|tv_dhan_ws_park_total|tv_dhan_ws_dial_failed_total|tv_ticks_lost_total|tv_ws_frame_spill_drop_critical|tv_dhan_feed_stack_connections|tv_dhan_ws_lag_excluded_total|tv_dhan_live_universe_fallback_total|tv_dhan_ws_alive_connections|tv_ws_frame_wal_reinjected_dropped_total|tv_dhan_feed_depth_total)$"]
+              "metric_selectors": ["^(tv_questdb_disconnected_seconds|tv_token_remaining_seconds|tv_orders_rejected_total|tv_boot_completed|tv_clock_skew_seconds|tv_disk_watcher_respawn_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_rest_1m_fire_heartbeat|tv_daily_pnl|tv_order_fill_lag_seconds|tv_spot1m_persist_errors_total|tv_chain1m_persist_errors_total|tv_groww_spot1m_persist_errors_total|tv_groww_chain1m_persist_errors_total|tv_rest_fetch_audit_persist_errors_total|tv_rest_fetch_audit_rows_discarded_total|tv_cadence_option_mark_unresolved_total|tv_cadence_ladder_exhausted_total|tv_cadence_boundary_skipped_total|tv_cadence_late_response_total|tv_cadence_runner_respawn_total|tv_cadence_gate_denials_total|tv_cadence_spot_fallback_total|tv_questdb_wal_suspended_tables|tv_questdb_reconnects_total|tv_partition_archive_failed_total|tv_wal_replay_corrupted_segments_total|tv_order_audit_rows_discarded_total|tv_order_audit_persist_errors_total|tv_order_update_events_dropped_total|tv_order_update_events_persist_errors_total|tv_order_update_events_rows_discarded_total|tv_dhan_order_push_respawn_total|tv_spill_dir_free_bytes|tv_open_fds|tv_oom_kills_total|tv_ram_store_dropped_total|tv_ram_store_errors_total|tv_mid_session_profile_rest_degraded_total|tv_boot_deadline_exceeded_total|tv_dhan_ws_wal_dropped_total|tv_dhan_ws_ring_full_total|tv_dhan_ws_ring_bytes_full_total|tv_dhan_ws_frame_refused_total|tv_dhan_ws_subscribe_failed_total|tv_dhan_feed_seals_dropped_total|tv_dhan_feed_seq_refused|tv_dhan_feed_instruments_silent|tv_dhan_feed_instruments_never_ticked|tv_ticks_dropped_total|tv_tick_persist_errors_total|tv_tick_rows_refused_total|tv_ws_frame_spill_write_errors_total|tv_dhan_feed_stack_up|tv_dhan_feed_drain_frames_total|tv_dhan_feed_ingest_ticks_total|tv_dhan_feed_ingest_refused_total|tv_dhan_ws_reconnect_total|tv_dhan_ws_park_total|tv_dhan_ws_dial_failed_total|tv_ticks_lost_total|tv_ws_frame_spill_drop_critical|tv_dhan_feed_stack_connections|tv_dhan_ws_lag_excluded_total|tv_dhan_feed_ring_max_bytes|tv_host_total_ram_bytes|tv_dhan_live_universe_fallback_total|tv_dhan_ws_alive_connections|tv_ws_frame_wal_reinjected_dropped_total|tv_dhan_feed_depth_total)$"]
             }
           ]
         }
@@ -225,25 +225,16 @@ sudo -u ec2-user git clone --depth 1 \
 cp -f /opt/tickvault/repo/config/*.toml /opt/tickvault/config/ 2>/dev/null || true
 chown -R ec2-user:ec2-user /opt/tickvault/config
 
-# ---- Step 5c: Kernel network tuning (the anti-tick-loss settings) ----
-# Content + rationale: deploy/aws/sysctl/99-tickvault-net.conf (kept in the repo,
-# not inline — EC2 caps user-data at 16384 B; inlining broke plan 2026-08-10).
-# Applied post-clone because that is the first point the file exists.
-cp -f /opt/tickvault/repo/deploy/aws/sysctl/99-tickvault-net.conf /etc/sysctl.d/ || true
-# BBR only if the module actually loads — an unavailable value fails
+# ---- Step 5c: BBR (once — the drop-ins persist across boots) ----
+# Only if the module actually loads: an unavailable value fails
 # `sysctl --system` as a whole and would strip the receive buffers with it.
 if modprobe tcp_bbr 2>/dev/null; then
     echo 'net.ipv4.tcp_congestion_control = bbr' > /etc/sysctl.d/99-tickvault-bbr.conf
     echo tcp_bbr > /etc/modules-load.d/tickvault-bbr.conf
 fi
-sysctl --system >/dev/null 2>&1 || echo "user-data: WARNING sysctl --system non-zero"
-# Verify EVERY load-bearing value, not just rmem_max, and report to journald +
-# /opt/tickvault/net-tuning.status so the verdict outlives cloud-init's log.
-# Non-zero exit is deliberate and deliberately not fatal — see the script header.
-bash /opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh || true
 
-# ---- Step 5d: Non-sysctl host tuning (THP + clock) ----
-bash /opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh || true
+# ---- Step 5d: all other tuning = tickvault-host-tuning.service (Step 7) ----
+# Moved there so it re-runs EVERY boot, not once per instance. Why: unit header.
 
 # ---- Step 6: Start the Docker Compose stack ----
 # Post-CloudWatch-only migration (#O1/#O2/#O3/#O4): the stack is QuestDB
@@ -268,9 +259,17 @@ cp /opt/tickvault/repo/deploy/systemd/tickvault.service /etc/systemd/system/
 chmod +x /opt/tickvault/repo/deploy/aws/holiday-gate.sh
 cp /opt/tickvault/repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/
 
+# Host tuning as a BOOT unit, not a launch-time script (2026-08-15) — see the
+# unit header for why per-instance wiring silently under-tuned every restart.
+chmod +x /opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh
+chmod +x /opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh
+cp /opt/tickvault/repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/
+
 systemctl daemon-reload
 systemctl enable tickvault.service
 systemctl enable tickvault-holiday-gate.service
+systemctl enable tickvault-host-tuning.service
+systemctl start tickvault-host-tuning.service || true
 
 echo "=== tickvault user-data complete at $(date -u) ==="
 echo "Next step: GitHub Actions deploy-aws workflow will scp the first binary."

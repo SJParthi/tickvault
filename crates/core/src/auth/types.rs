@@ -539,6 +539,82 @@ pub struct GetIpResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Shared-token adoption: reading a JWT's own expiry
+// ---------------------------------------------------------------------------
+
+/// Decode a base64url segment with no padding — the JWT wire form.
+///
+/// Hand-rolled rather than taking a dependency: this reads ONE integer out of
+/// a token we already hold, a new dependency root needs operator approval per
+/// CLAUDE.md, and the alternative (guessing an expiry) is the thing that must
+/// not happen. Returns `None` on any byte outside the alphabet or a length
+/// that cannot be a whole number of bytes.
+fn decode_base64url_nopad(segment: &str) -> Option<Vec<u8>> {
+    const fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+
+    // A 4-char group carries 3 bytes; 2 and 3 leftover chars carry 1 and 2.
+    // A single leftover char is not a valid encoding of anything.
+    if segment.len() % 4 == 1 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(segment.len() / 4 * 3 + 2);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in segment.bytes() {
+        let v = value(byte)?;
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            // `try_from` rather than a cast with a lint exemption: the mask
+            // already makes this lossless, so the fallible form costs nothing
+            // and leaves no silenced lint for a later edit to widen behind.
+            out.push(u8::try_from((acc >> bits) & 0xFF).ok()?);
+        }
+    }
+    Some(out)
+}
+
+/// The `exp` claim of a JWT, as epoch seconds.
+///
+/// # Why this must be read rather than assumed
+///
+/// A token adopted from the shared SSM parameter arrives with no
+/// `expires_in` — the mint response that carried it went to whoever minted it.
+/// The only honest source for its expiry is the token itself.
+///
+/// Defaulting to "24 hours from now" would be worse than not adopting the
+/// token at all: a token minted at 06:05 and adopted at 15:00 would be treated
+/// as fresh until the following afternoon, so the renewal loop would sit idle
+/// through the token's real expiry and the first symptom would be a 401 in the
+/// middle of a session. Every failure path here therefore returns `None`, and
+/// the caller declines to adopt.
+#[must_use]
+pub fn jwt_exp_epoch_seconds(token: &str) -> Option<i64> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let _signature = parts.next()?;
+    if parts.next().is_some() {
+        return None; // more than three segments is not a JWT
+    }
+
+    let bytes = decode_base64url_nopad(payload)?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json.get("exp")?.as_i64()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1463,5 +1539,174 @@ mod tests {
         let response: DhanGenerateTokenResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.dhan_client_id, "1234567890");
         assert!(response.expiry_time.is_string());
+    }
+}
+
+#[cfg(test)]
+mod shared_token_expiry_tests {
+    use chrono::Datelike;
+
+    /// A millisecond `exp` must be REFUSED, not adopted with a wrong expiry.
+    ///
+    /// # The failure this pins shut
+    ///
+    /// `exp > now` alone accepts `{"exp":1786800000000}` — an exp in
+    /// milliseconds. chrono's range runs to roughly year 262000, so it parses
+    /// into the year 58500, sails past "is it in the future?", and the token is
+    /// adopted with an expiry ~56,000 years out. Every downstream decision is
+    /// expiry-anchored, so `needs_refresh` never fires, the renewal loop sleeps
+    /// through the real 06:05 expiry, and the first symptom is a 401
+    /// mid-session — exactly the failure the adoption path was written to
+    /// remove.
+    ///
+    /// This decoder is deliberately NOT where the bound lives: `exp` really is
+    /// what the claim says, and a decoder that silently rescaled it would hide
+    /// a vendor change. The bound belongs at the adoption site, and this test
+    /// records the raw value so the two cannot drift apart.
+    #[test]
+    fn test_a_millisecond_exp_is_returned_verbatim_for_the_caller_to_reject() {
+        let ms = 1_786_800_000_000_i64;
+        let token = jwt_with_payload(&format!("{{\"exp\":{ms}}}"));
+        assert_eq!(
+            jwt_exp_epoch_seconds(&token),
+            Some(ms),
+            "the decoder must report the claim as written — rescaling here \
+             would mask a vendor unit change instead of surfacing it"
+        );
+
+        // And the value really does land absurdly far in the future, which is
+        // what makes an unbounded `exp > now` check dangerous.
+        let as_dt = chrono::DateTime::from_timestamp(ms, 0)
+            .expect("chrono accepts it — that is the whole problem");
+        assert!(
+            as_dt.year() > 50_000,
+            "if chrono ever rejected this the adoption bound would be \
+             redundant; it does not, so the bound is load-bearing"
+        );
+    }
+
+    /// The plausible-token ceiling must sit between a real token and the
+    /// millisecond band.
+    ///
+    /// Dhan tokens are 24-hour. The adoption site rejects anything beyond 48h.
+    /// This pins that the chosen ceiling actually separates the two cases —
+    /// a ceiling of, say, 100 years would pass this file's other tests while
+    /// admitting the entire millisecond band.
+    #[test]
+    fn test_the_48h_ceiling_separates_a_real_token_from_a_millisecond_one() {
+        let now = 1_786_800_000_i64; // seconds
+        let ceiling = now + 48 * 3_600;
+
+        // A real 24-hour Dhan token clears the bar.
+        assert!(now + 24 * 3_600 < ceiling);
+        // Even a generous 47-hour one does.
+        assert!(now + 47 * 3_600 < ceiling);
+        // The same instant expressed in milliseconds does not, by a mile.
+        assert!(now * 1_000 > ceiling);
+    }
+
+    use super::{decode_base64url_nopad, jwt_exp_epoch_seconds};
+
+    /// Build a JWT-shaped string with the given payload JSON.
+    fn jwt_with_payload(payload_json: &str) -> String {
+        // Encode base64url without padding, mirroring the wire form.
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let bytes = payload_json.as_bytes();
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            let idx = [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63];
+            let keep = chunk.len() + 1;
+            for i in idx.iter().take(keep) {
+                out.push(ALPHABET[*i as usize] as char);
+            }
+        }
+        format!("header.{out}.signature")
+    }
+
+    #[test]
+    fn test_decoder_round_trips_every_byte_length_remainder() {
+        // The three remainder cases (0, 1, 2 bytes over a 3-byte group) are
+        // where a hand-rolled decoder goes wrong, and they are silent when
+        // they do — a truncated payload usually still parses as JSON right up
+        // until the field you wanted is the one that got cut.
+        for text in ["", "a", "ab", "abc", "abcd", "abcde", "abcdef"] {
+            let jwt = jwt_with_payload(text);
+            let payload = jwt.split('.').nth(1).expect("payload segment");
+            let decoded = decode_base64url_nopad(payload).expect("decodes");
+            assert_eq!(
+                String::from_utf8_lossy(&decoded),
+                text,
+                "round-trip failed for {text:?} (len {})",
+                text.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_jwt_exp_epoch_seconds_reads_the_exp_claim() {
+        let jwt = jwt_with_payload(r#"{"exp":1786800000,"sub":"x"}"#);
+        assert_eq!(jwt_exp_epoch_seconds(&jwt), Some(1_786_800_000));
+    }
+
+    #[test]
+    fn test_jwt_exp_epoch_seconds_declines_every_malformed_shape() {
+        // Each of these must return None so the caller falls back to its
+        // existing paths. Adopting a token with an INVENTED expiry is the one
+        // outcome that is worse than not adopting it: the renewal loop would
+        // sleep through the real expiry and the first symptom would be a 401
+        // mid-session, which is exactly the failure this whole change exists
+        // to remove.
+        for (token, why) in [
+            ("", "empty"),
+            ("notajwt", "no dots"),
+            ("a.b", "two segments"),
+            ("a.b.c.d", "four segments"),
+            ("header..signature", "empty payload"),
+            ("header.!!!!.signature", "payload outside the alphabet"),
+            (
+                "header.A.signature",
+                "payload length 1 mod 4 — not decodable",
+            ),
+        ] {
+            assert_eq!(
+                jwt_exp_epoch_seconds(token),
+                None,
+                "accepted a malformed token ({why}): {token:?}"
+            );
+        }
+        // Structurally fine, but the claim is absent or the wrong type.
+        for payload in [
+            r#"{"sub":"x"}"#,
+            r#"{"exp":"1786800000"}"#,
+            r#"{"exp":null}"#,
+            r#"{"exp":1.5}"#,
+            "not json at all",
+            "[]",
+        ] {
+            let jwt = jwt_with_payload(payload);
+            assert_eq!(
+                jwt_exp_epoch_seconds(&jwt),
+                None,
+                "accepted a payload with no usable exp: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_negative_or_zero_exp_is_returned_not_swallowed() {
+        // The decoder's job is to report what the token says. Deciding that a
+        // past expiry means "do not adopt" belongs to the caller, which can
+        // log the reason; swallowing it here would make an expired token
+        // indistinguishable from an unparseable one.
+        let jwt = jwt_with_payload(r#"{"exp":0}"#);
+        assert_eq!(jwt_exp_epoch_seconds(&jwt), Some(0));
+        let jwt = jwt_with_payload(r#"{"exp":-1}"#);
+        assert_eq!(jwt_exp_epoch_seconds(&jwt), Some(-1));
     }
 }

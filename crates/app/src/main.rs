@@ -1932,12 +1932,45 @@ async fn main() -> Result<()> {
     // lane cold-start fighting over the dual-instance SSM lock) is
     // structurally impossible now — no cold-start path exists.
     // =======================================================================
-    if feed_runtime.is_dhan_config_enabled() {
-        error!(
-            "boot TOML carries dhan_enabled=true but the Dhan live WS lane is RETIRED \
-             (operator directive 2026-07-13, deleted in PR-C2) — the flag is IGNORED; \
-             fix the config to dhan_enabled=false. The Dhan REST-only stack runs either way."
-        );
+    // 2026-08-15 — this branch used to log, at ERROR, on EVERY boot:
+    //
+    //   "boot TOML carries dhan_enabled=true but the Dhan live WS lane is
+    //    RETIRED ... the flag is IGNORED; fix the config to dhan_enabled=false"
+    //
+    // Every clause of that was false by 2026-08-11, and the instruction was
+    // actively harmful. The operator revived the lane on 2026-08-09 and flipped
+    // `dhan_enabled = true` on 2026-08-11 precisely to switch it ON;
+    // `feed_stack_gate` reads that exact flag, so `true` is now the CORRECT
+    // value and an operator who followed the advice would have turned off the
+    // live feed they had just deliberately enabled — guided there by an ERROR.
+    //
+    // The message survived the revival because nothing tied it to the flag it
+    // described. It was written when "dhan_enabled" had one consumer; a second
+    // consumer appeared and the sentence about the first kept printing.
+    //
+    // What is worth saying here is the combination that leaves the lane
+    // SILENTLY DARK: config on, environment opt-in absent. That state is
+    // otherwise indistinguishable from a healthy boot in the log — the REST
+    // stack starts, the app looks normal, and no live tick ever arrives.
+    match tickvault_app::dhan_feed_stack::feed_stack_gate(
+        config.feeds.dhan_enabled,
+        std::env::var(tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        tickvault_app::dhan_feed_stack::FeedStackGate::DisabledByEnv => {
+            error!(
+                env_var = tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV,
+                "config enables the Dhan live feed but the environment opt-in is missing, so NO \
+                 live market data will flow this session — no ticks, no live candles, and the \
+                 15:31 cross-verification will have nothing on its live side. The REST legs run \
+                 either way, which is why this boot otherwise looks completely normal. Set the \
+                 environment variable in the systemd unit, or set dhan_enabled=false so the \
+                 intent is at least consistent."
+            );
+        }
+        tickvault_app::dhan_feed_stack::FeedStackGate::DisabledByConfig
+        | tickvault_app::dhan_feed_stack::FeedStackGate::Enabled => {}
     }
     let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
         tickvault_app::dhan_rest_stack::DhanRestStackParams {

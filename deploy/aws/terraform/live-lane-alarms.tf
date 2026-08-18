@@ -340,3 +340,52 @@ resource "aws_cloudwatch_metric_alarm" "wal_frames_not_recovered" {
   # event this alarm can observe.
   ok_actions = []
 }
+
+# ---------------------------------------------------------------------------
+# 9. The DURABLE FLOOR was breached (2026-08-15)
+# ---------------------------------------------------------------------------
+# This is the most serious counter in the lane, and until now it was the one
+# nobody watched.
+#
+# Alarm 3 above watches `tv_ticks_dropped_total` — a loss BETWEEN the
+# write-ahead log and QuestDB. The bytes still exist on disk there. This alarm
+# watches a loss BEFORE the log: `WalRingSink` increments it when the
+# capture-at-receipt guarantee — the property this entire architecture is
+# built on — did not hold. The frame was never written anywhere.
+#
+# So the pair that shipped 2026-08-14 alarmed the RECOVERABLE half of the loss
+# chain and left the UNRECOVERABLE half silent. There is no second signal for
+# this one: the frame is simply gone, with no payload to count downstream and
+# no error raised later. If this counter moves and nobody is told, the loss is
+# both total and invisible.
+#
+# Authority: dhan-rest-only-noise-lock-2026-07-14.md §2.3a (operator quote
+# 2026-08-15), which also WITHDRAWS the §2.3 drain-respawn row — that metric
+# has zero emit sites because the drain is not respawned at all, so building
+# it would have created a permanently-green dead monitor.
+resource "aws_cloudwatch_metric_alarm" "dhan_wal_dropped" {
+  alarm_name        = "tv-${var.environment}-dhan-wal-dropped"
+  alarm_description = "A live frame was NEVER DURABLY CAPTURED. tv_dhan_ws_wal_dropped_total counts frames that failed the capture-at-receipt write-ahead log — the durable floor that every zero-loss claim in this system rests on. This is strictly worse than the ticks-dropped alarm: there, the frame is on disk and the loss is between the log and the database; here the bytes were never written at all, so no replay, no backfill and no cross-verification can recover them. There is no second signal for this condition anywhere in the system. Triage in this order: (1) disk — a full or read-only data volume is the most common cause, check tv_spill_dir_free_bytes and the WS-SPILL-01 alarm which may have fired first; (2) the WAL writer thread — WS-SPILL-02 indicates the spill channel was full at the append instant; (3) the coded lines in /tickvault/<env>/app naming the endpoint. Frames lost during the outage do NOT come back when the disk recovers."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_dhan_ws_wal_dropped_total"
+  namespace           = local.app_namespace
+  # Threshold 1 / eval 1, for the same reason as alarm 3 and more so: there is
+  # no acceptable number of frames that missed the durable floor, and waiting a
+  # second window to confirm only loses more of them.
+  period    = 300
+  statistic = "Sum"
+  # `{host}` deliberately — see the dimension-folding note above alarm 2. The
+  # EMF processor folds this metric's labels to the single declared dimension
+  # set, and folding is what this alarm wants: a drop on ANY endpoint pages.
+  dimensions         = local.app_dimensions
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. Deltas returning to zero mean no ADDITIONAL frames were
+  # lost — never that the lost ones came back. An OK page here would be a false
+  # recovery of data that does not exist.
+  ok_actions = []
+}

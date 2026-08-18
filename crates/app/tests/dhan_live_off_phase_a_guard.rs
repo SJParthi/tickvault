@@ -179,11 +179,22 @@ fn test_main_spawns_rest_stack_in_dhan_off_branch() {
     );
     let spawn_pos = spawn_positions[0];
 
-    // The loud ignored-flag error for a stale config-ON boot sits directly
-    // ahead of the spawn (a code string literal, survives the comment strip).
+    // The live-feed gate diagnostic sits directly ahead of the spawn (a code
+    // string literal, so it survives the comment strip).
+    //
+    // 2026-08-15: this used to anchor on "the flag is IGNORED", the text of a
+    // boot error that told the operator `dhan_enabled=true` was an illegal
+    // leftover and to set it to false. Every clause of that became untrue on
+    // 2026-08-11, when the operator flipped exactly that flag to switch the
+    // revived live feed ON — so the ERROR was instructing them to disable the
+    // feed they had just enabled, on every boot. This guard was PART of the
+    // problem: it pinned the sentence in place while the flag beneath it
+    // changed meaning, which is why the anchor is now the condition that is
+    // actually worth an error — config on, environment opt-in missing, lane
+    // silently dark.
     let ignored_pos = main_src
-        .find("the flag is IGNORED")
-        .expect("the config-ON ignored-flag error must exist in main.rs"); // APPROVED: test
+        .find("the environment opt-in is missing")
+        .expect("the live-feed gate diagnostic must exist in main.rs"); // APPROVED: test
     let runloop_pos = main_src
         .find("run_process_runloop(")
         .expect("run_process_runloop must exist in main.rs"); // APPROVED: test

@@ -1,0 +1,72 @@
+# tickvault — host tuning, re-applied on EVERY boot.
+#
+# WHY THIS UNIT EXISTS (2026-08-15)
+#
+# The tuning scripts were correct and their headers said so explicitly:
+# "applied at every boot" and "must be re-applied on every boot". But the only
+# thing that invoked them was `user-data.sh.tftpl`, and EC2 user-data runs ONCE
+# PER INSTANCE, not once per boot. There is no cloud-init per-boot directive in
+# that file.
+#
+# So the intent was per-boot and the wiring was per-instance. The gap is not
+# theoretical: this box STOPS AND STARTS EVERY WEEKDAY (08:30 / 17:30 IST), and
+# THP is a /sys write that does not survive a reboot. Every trading day after
+# the first was running on distro-default huge pages, and any tuning merged
+# after the last instance replacement had never been applied at all.
+#
+# The failure mode is the quiet kind: nothing errors, the app starts fine, and
+# the only symptom is worse tail latency and a higher chance of the receive
+# buffer overflowing into vendor-side drops — attributable to nothing.
+#
+# This unit makes the tuning follow the CODE rather than the machine's
+# lifecycle. It is ordered Before=tickvault.service so the app never starts on
+# an untuned host, and it is idempotent, so re-running it costs nothing.
+
+[Unit]
+Description=tickvault — kernel + host performance tuning (re-applied every boot)
+Documentation=https://github.com/SJParthi/tickvault
+After=network-online.target
+Wants=network-online.target
+# The app must never start on an untuned host. `Before=` only orders; it does
+# not make tickvault depend on success, which is deliberate — see the
+# SuccessExitStatus note below. Degraded tuning must not keep the feed down.
+Before=tickvault.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Runs as ROOT, unlike tickvault-holiday-gate.service: writing /etc/sysctl.d,
+# calling `sysctl --system`, and writing /sys/kernel/mm/transparent_hugepage
+# all require privilege. This is the narrowest thing on the box that needs it.
+WorkingDirectory=/opt/tickvault
+
+# 1. Re-install the sysctl file from the repo, so a deploy that changes tuning
+#    takes effect on the next boot without an instance replacement. `install`
+#    is idempotent and atomic.
+ExecStart=/usr/bin/install -m 0644 -o root -g root /opt/tickvault/repo/deploy/aws/sysctl/99-tickvault-net.conf /etc/sysctl.d/99-tickvault-net.conf
+
+# 2. Apply it. Covers the BBR drop-in too, which user-data writes once and which
+#    persists across boots via /etc/modules-load.d.
+ExecStart=/sbin/sysctl --system
+
+# 3. Verify EVERY load-bearing value and write the verdict where it outlives the
+#    boot log. Non-zero exit here is a REPORT, not a failure — see below.
+ExecStart=-/opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh
+
+# 4. The non-sysctl half: THP (a /sys write, lost on every reboot — the single
+#    strongest reason this unit exists) and the clock discipline check, without
+#    which every latency number the system reports is untrustworthy.
+ExecStart=-/opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh
+
+# A tuning failure must NEVER keep the trading app down. A host with default
+# buffers is slower; a host with no app is blind. The `-` prefixes above and
+# this line encode that ordering of harms deliberately — the failures are loud
+# in the journal and in net-tuning.status, and they do not gate the feed.
+SuccessExitStatus=0 1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tickvault-host-tuning
+
+[Install]
+WantedBy=multi-user.target

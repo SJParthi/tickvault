@@ -281,3 +281,64 @@ dimension for latency or any other live-lane signal; adds a live-lane page outsi
 four metrics above without its own dated row here; re-introduces any of the §2 deleted
 alarms under cover of this family; or claims sub-second latency accuracy anywhere in an
 operator-facing surface (the ±1 s floor is structural — Dhan's LTT is whole seconds).
+
+### §2.3a — 2026-08-15 amendment: the DURABLE FLOOR joins family (5), and one row of §2.3 was wrong
+
+**The verbatim operator authorization (2026-08-15, typed directly in-session):**
+
+> "fix evryhtign dude okay?"
+
+Given in DIRECT response to a table whose top open row read **"No loss counter pages
+you — High — alarms need the market-hours gate's named list"**. That row is the scope
+this quote authorizes, and this dated edit lands BEFORE the terraform, per §3.
+
+**First, a correction to my own §2.3 (Rule 11 — a stale row manufactures false work).**
+§2.3 lists four metrics, and the fourth is **`tv_dhan_feed_drain_respawn_total` "exceeds
+its restart cap"**. That metric **has ZERO emit sites** — verified by source scan
+2026-08-15 — and is not in the EMF allowlist, because **the drain is not respawned at
+all**. If it dies the lane is over, and `tv_dhan_feed_stack_up` falls to 0, which
+family-(5) alarm #1 already pages on. Building the fourth alarm as written would have
+created a filter that can never match: a permanently-green dead monitor, which is the
+`ws-reinject-01` / `tick-conserve-01` precedent this repo has retired twice before.
+**That row is WITHDRAWN.** The correct signal for a dead drain is alarm #1.
+
+**Second, the metric §2.3 should have named instead — `tv_dhan_ws_wal_dropped_total`.**
+It is the most serious counter in the lane and it is unalarmed today:
+
+| | `tv_ticks_dropped_total` (alarmed 2026-08-14) | `tv_dhan_ws_wal_dropped_total` (this row) |
+|---|---|---|
+| Where the loss happens | between the WAL and QuestDB | **before the WAL** |
+| Is the frame on disk? | yes | **no** |
+| Recoverable in principle | yes — the bytes exist | **no — they were never written** |
+
+So the alarm that shipped watches the *recoverable* half of the loss chain while the
+*unrecoverable* half watches nothing. `WalRingSink` counts a drop when the durable
+floor — the capture-at-receipt guarantee this entire architecture is built on — did not
+hold, and there is no other signal for it: the frame is simply gone, with no payload to
+count downstream and no error anywhere later.
+
+**Third, RISK-GAP-03 (`instruments never ticked / gone silent`) joins as log-filter.**
+The 2026-08-12 note that wired `scan_silence` recorded plainly that its `error!` is
+**log-sink-only**, and that alarming the gauges "needs the market-hours window gate". It
+does not: the app already gates the emit to the CONTINUOUS session and edge-latches it
+to one per episode, so a **coded-error log filter** carries the same signal with no gate
+Lambda change, no threshold baseline, and a sparse near-free derived metric. A
+silently-failed subscribe has **no other evidence in the entire system** — no payload,
+no parse failure, no log line of its own — so absence measured against a seeded key is
+the only thing that can ever report it.
+
+**Family (5) is therefore SIX signals, not four:** lane down · socket parked · ticks
+dropped · **durable floor breached (new)** · **connected-but-silent (new)** · [the
+withdrawn drain-respawn row]. Cost: **+1 metric alarm ≈ $0.10/mo** and **+1 errcode
+log-filter alarm ≈ $0.10/mo** (sparse, dimensionless, billed only in hours the code
+fires) — **~$0.20/mo total** against the $100 kill-ceiling whose 90% line is $90.
+
+**Still NOT claimed:** `tv_dhan_ws_subscribe_failed_total`, `tv_dhan_ws_ring_full_total`,
+`tv_dhan_ws_ring_bytes_full_total`, `tv_tick_persist_errors_total`,
+`tv_tick_rows_refused_total` and `tv_dhan_feed_seals_dropped_total` remain **visible but
+unpageable** — charted on the operator dashboard since 2026-08-15, alarmed by nothing.
+That is a deliberate stopping point rather than an oversight: each would add ~$0.10/mo,
+several are downstream symptoms that the two alarms above would already have fired for,
+and a family of eleven pagers for one subsystem trains an operator to ignore all of
+them. Listed here so the gap is a decision on the record, not something to be discovered
+from a quiet dashboard.

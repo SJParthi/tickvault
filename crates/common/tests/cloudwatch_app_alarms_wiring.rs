@@ -582,6 +582,20 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // the operator console to scrape. Shipping its buckets would also multiply
     // cost by the bucket count × 16 connections, which is precisely the kind of
     // cardinality this ratchet exists to make someone think about.
+    //
+    // 2026-08-15: 65 -> 67. TWO gauges added with host-adaptive ring sizing —
+    // `tv_host_total_ram_bytes` (what the process actually measured about its
+    // machine) and `tv_dhan_feed_ring_max_bytes` (what it decided as a result).
+    // Cost ~$0.60/mo; dated note in `aws-budget.md`.
+    //
+    // They are published as a PAIR deliberately. The ring budget is now derived
+    // at runtime rather than being a compile-time constant, so "what is the
+    // buffer?" stops being answerable by reading the source. Publishing only the
+    // decision would leave a number nobody can check; publishing only the input
+    // would leave the decision invisible. Together they make a mis-sized ring —
+    // a fallback on an unreadable /proc/meminfo, or a clamp firing — visible as
+    // an arithmetic disagreement between two series, without opening a shell on
+    // the box.
     // 2026-08-15 (+1, ~$0.30/mo): `tv_dhan_feed_depth_total`, added when
     // depth-20 and depth-200 stopped being captured-then-discarded and became a
     // persisted stream (operator directive: one common `market_depth` table,
@@ -611,10 +625,16 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // dashboard-able today; paging on it is a new Dhan-scoped alert, which
     // `dhan-rest-only-noise-lock-2026-07-14.md` §3 REJECTs without its own
     // dated row in THAT file first. Visible now, pageable after that edit.
+    //
+    // MERGE 2026-08-15: 65 -> 71. Both sides added to this list independently
+    // (2 here, 4 on main) and the union is the only correct resolution — an
+    // allowlist is what makes a metric reach CloudWatch at all, so dropping
+    // either side's entries would silently un-ship metrics whose alarms and
+    // dashboard widgets landed with them.
     assert_eq!(
         names.len(),
-        69,
-        "Z+ L2 VERIFY ratchet: expected exactly 69 names in the MAIN EMF \
+        71,
+        "Z+ L2 VERIFY ratchet: expected exactly 71 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
@@ -623,7 +643,12 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
          tv_ws_frame_spill_write_errors_total. The 2026-08-11 addition instrumented \
          the lane at the SOCKET and left it blind at the DATABASE; the spill-write \
          counter had been excluded on the stated grounds that 'no WS frame producer \
-         exists', which stopped being true the day the lane was revived; plus the 2 \
+         exists', which stopped being true the day the lane was revived, plus the 2 \
+         host-sizing gauges added 2026-08-15 — tv_host_total_ram_bytes and \
+         tv_dhan_feed_ring_max_bytes — which make a runtime-derived buffer budget \
+         checkable instead of source-readable; plus the 4 added on main the same \
+         day, see below); \
+         plus the 2 \
          UNIVERSE-INTEGRITY names added 2026-08-14 — tv_dhan_live_universe_fallback_total \
          and tv_dhan_live_universe_instruments. Those close the worst blind spot an \
          adversarial sweep found: when the resolved-master artifact is missing, the lane \

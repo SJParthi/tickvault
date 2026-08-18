@@ -731,7 +731,11 @@ jobs:
   # retirement (#1581) deleted dhat_feed_lag_groww (10 -> 9); the moneyness
   # PR re-added dhat_moneyness (9 -> 10); the cadence PR (#1608) added
   # dhat_cadence_decide (10 -> 11); the order-runtime dry-run PR added the
-  # app lane's dhat_mark_forward: 1 app; the stage-2 dead-WS sweep
+  # app lane's dhat_mark_forward: 1 app; the 16-socket plan Item 1
+  # (2026-08-15) added dhat_live_ingest_seam, the FIRST gate on the
+  # per-tick fold seam — no DHAT target had ever covered it, which is
+  # how the per-tick allocation removed in #1752 survived unnoticed
+  # (app 1 -> 2); the stage-2 dead-WS sweep
   # (2026-07-17) deleted dhat_feed_consumer + dhat_prev_close_writer
   # (core 11 -> 9) and ALL 3 storage targets — dhat_tick_flush_offload +
   # dhat_tick_persistence + dhat_tick_row_builder died with the deleted
@@ -760,6 +764,7 @@ jobs:
           set -euo pipefail
           actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
           expected=$(LC_ALL=C sort <<'EOF'
+          crates/app/tests/dhat_live_ingest_seam.rs
           crates/app/tests/dhat_mark_forward.rs
           crates/app/tests/dhat_ws_lag.rs
           crates/core/tests/dhat_allocation.rs
@@ -936,6 +941,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p tickvault-app \
+            --test dhat_live_ingest_seam \
             --test dhat_mark_forward \
             --test dhat_ws_lag \
             2>&1 | tee /tmp/dhat-app.log
@@ -943,9 +949,18 @@ jobs:
             echo "::error::an app dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
             exit 1
           fi
+          # 3, not 2 (2026-08-15). Both sides of a merge added a --test flag to
+          # this step — dhat_live_ingest_seam on the branch, dhat_ws_lag on
+          # main — and git took both while the count assertion stayed at 2. The
+          # step then ran three targets and failed itself.
+          #
+          # That is the auto-merge hazard this check is FOR, working correctly:
+          # a silently-dropped flag and a silently-added one look identical to
+          # the run step, so the count is the only thing that notices. Bumping
+          # it is the fix; loosening it to >= would delete the guard.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 2 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 2 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 3 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
             exit 1
           fi
 
