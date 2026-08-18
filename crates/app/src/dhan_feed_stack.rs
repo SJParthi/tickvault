@@ -699,6 +699,14 @@ pub struct LiveIngest {
     refused_out_of_session: u64,
     seals_emitted: u64,
     seals_dropped: u64,
+    /// Bars the fold produced for a timeframe nobody asked for.
+    ///
+    /// Its own bucket rather than a share of `seals_dropped`, because the two
+    /// mean opposite things: `dropped` is data we wanted and lost and should
+    /// page someone; this is data we deliberately never wanted. Folding them
+    /// together would bury a real loss inside a large, permanently-growing,
+    /// entirely benign number.
+    seals_skipped: u64,
     /// Rows appended to the ILP buffer since the last flush. The buffer is a
     /// staging area, NOT storage: without a flush the rows never leave the
     /// process, so this counter is what makes the flush happen at all.
@@ -720,6 +728,7 @@ impl LiveIngest {
             refused_slot: 0,
             refused_out_of_session: 0,
             seals_emitted: 0,
+            seals_skipped: 0,
             seals_dropped: 0,
             pending_rows: 0,
         }
@@ -932,12 +941,36 @@ impl LiveIngest {
         // front of a writer; without the writer it is a shredder.
         let mut emitted = 0u64;
         let mut dropped = 0u64;
+        let mut skipped = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
         let stats: ConsumeStats = self.aggregator.consume_tick(
             Feed::Dhan,
             tick,
             None,
             |feed, security_id, segment_code, tf, state| {
+                // Emit rows ONLY for the thirteen timeframes the operator
+                // asked for (Quote 13, 2026-08-08). The enum carries 24, so
+                // eleven second-scale frames — S2 S3 S4 S6 S7 S8 S9 S11 S12
+                // S13 S14 — were writing a row per bucket for nobody.
+                //
+                // Counted into its OWN bucket, never into `dropped`: that
+                // counter means data we wanted and lost, and conflating
+                // "never asked for it" with "lost it" would make every drop
+                // alarm permanently noisy while hiding real losses in the
+                // noise. It is counted rather than silently returned because
+                // `test_seal_open_buckets_at_close_accounts_every_bar_it_produces`
+                // pins that no bar escapes accounting on ANY side — a bare
+                // `return` here made bars vanish from the ledger entirely,
+                // and that test caught it.
+                //
+                // The fold still computes all 24 slots. Only emission is
+                // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
+                // audit-table `timeframe` symbols are all untouched.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_thirteen`.
+                if !tf.is_operator_requested() {
+                    skipped = skipped.saturating_add(1);
+                    return;
+                }
                 let Some(tx) = sender else {
                     dropped = dropped.saturating_add(1);
                     return;
@@ -955,6 +988,7 @@ impl LiveIngest {
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
+        self.seals_skipped = self.seals_skipped.saturating_add(skipped);
         if emitted > 0 {
             counters().seals_emitted.increment(emitted);
         }
@@ -1071,10 +1105,34 @@ impl LiveIngest {
     pub fn seal_open_buckets_at_close(&mut self) -> (u64, u64) {
         let mut emitted = 0u64;
         let mut dropped = 0u64;
+        let mut skipped = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
         let bars = self
             .aggregator
             .force_seal_all(|feed, security_id, segment_code, tf, state| {
+                // Emit rows ONLY for the thirteen timeframes the operator
+                // asked for (Quote 13, 2026-08-08). The enum carries 24, so
+                // eleven second-scale frames — S2 S3 S4 S6 S7 S8 S9 S11 S12
+                // S13 S14 — were writing a row per bucket for nobody.
+                //
+                // Counted into its OWN bucket, never into `dropped`: that
+                // counter means data we wanted and lost, and conflating
+                // "never asked for it" with "lost it" would make every drop
+                // alarm permanently noisy while hiding real losses in the
+                // noise. It is counted rather than silently returned because
+                // `test_seal_open_buckets_at_close_accounts_every_bar_it_produces`
+                // pins that no bar escapes accounting on ANY side — a bare
+                // `return` here made bars vanish from the ledger entirely,
+                // and that test caught it.
+                //
+                // The fold still computes all 24 slots. Only emission is
+                // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
+                // audit-table `timeframe` symbols are all untouched.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_thirteen`.
+                if !tf.is_operator_requested() {
+                    skipped = skipped.saturating_add(1);
+                    return;
+                }
                 let Some(tx) = sender else {
                     dropped = dropped.saturating_add(1);
                     return;
@@ -1092,11 +1150,13 @@ impl LiveIngest {
             });
         debug_assert_eq!(
             bars as u64,
-            emitted.saturating_add(dropped),
-            "every bar force_seal_all produced must be accounted as emitted or dropped"
+            emitted.saturating_add(dropped).saturating_add(skipped),
+            "every bar force_seal_all produced must be accounted as emitted, \
+             dropped, or skipped-as-unrequested"
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
+        self.seals_skipped = self.seals_skipped.saturating_add(skipped);
         if emitted > 0 {
             counters().seals_emitted.increment(emitted);
         }
@@ -1244,10 +1304,34 @@ impl LiveIngest {
         }
         let mut emitted = 0u64;
         let mut dropped = 0u64;
+        let mut skipped = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
         let bars = self.aggregator.catch_up_seal_all(
             cutoff,
             |feed, security_id, segment_code, tf, state| {
+                // Emit rows ONLY for the thirteen timeframes the operator
+                // asked for (Quote 13, 2026-08-08). The enum carries 24, so
+                // eleven second-scale frames — S2 S3 S4 S6 S7 S8 S9 S11 S12
+                // S13 S14 — were writing a row per bucket for nobody.
+                //
+                // Counted into its OWN bucket, never into `dropped`: that
+                // counter means data we wanted and lost, and conflating
+                // "never asked for it" with "lost it" would make every drop
+                // alarm permanently noisy while hiding real losses in the
+                // noise. It is counted rather than silently returned because
+                // `test_seal_open_buckets_at_close_accounts_every_bar_it_produces`
+                // pins that no bar escapes accounting on ANY side — a bare
+                // `return` here made bars vanish from the ledger entirely,
+                // and that test caught it.
+                //
+                // The fold still computes all 24 slots. Only emission is
+                // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
+                // audit-table `timeframe` symbols are all untouched.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_thirteen`.
+                if !tf.is_operator_requested() {
+                    skipped = skipped.saturating_add(1);
+                    return;
+                }
                 let Some(tx) = sender else {
                     dropped = dropped.saturating_add(1);
                     return;
@@ -1267,6 +1351,7 @@ impl LiveIngest {
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
+        self.seals_skipped = self.seals_skipped.saturating_add(skipped);
         if emitted > 0 {
             counters().seals_emitted.increment(emitted);
         }
@@ -1299,6 +1384,17 @@ impl LiveIngest {
     #[must_use]
     pub const fn seals_dropped(&self) -> u64 {
         self.seals_dropped
+    }
+
+    /// Bars produced for a timeframe nobody asked for, and therefore not sent.
+    ///
+    /// Expected to be LARGE and to grow steadily — eleven of the twenty-four
+    /// timeframes are unrequested, so on a busy fold this outruns
+    /// `seals_emitted`. A big number here is the gate working, not a fault,
+    /// which is exactly why it must never be added to `seals_dropped`.
+    #[must_use]
+    pub const fn seals_skipped(&self) -> u64 {
+        self.seals_skipped
     }
 
     /// Ticks refused because their sequence would not narrow.
@@ -2338,6 +2434,12 @@ async fn run_frame_drain(
         close_seals_dropped = close_dropped,
         seals_emitted = ingest.seals_emitted(),
         seals_dropped = ingest.seals_dropped(),
+        // Reported next to its siblings so the three are read together: a
+        // large `skipped` beside a small `emitted` is the operator-timeframe
+        // gate working as designed, and seeing it in isolation would invite
+        // exactly the wrong conclusion. A counter with no read-out is the
+        // failure mode this lane has already shipped twice.
+        seals_skipped = ingest.seals_skipped(),
         seq_refused = ingest.seq_refused(),
         "Dhan live-feed frame drain ended — every socket sender was dropped, so no further \
          live ticks will be folded this session"
@@ -5890,12 +5992,20 @@ mod tests {
         // no counter moving and no log line.
         //
         // Honest scope: this unit test runs with no seal writer installed, so
-        // every bar lands on the `dropped` side. That is deliberate and it is
-        // still the assertion that matters — a non-zero total proves the
-        // aggregator was actually walked and OPEN buckets were found, which
-        // is precisely what the missing call site was failing to do. The
+        // every REQUESTED bar lands on the `dropped` side. That is deliberate
+        // and it is still the assertion that matters — a non-zero total proves
+        // the aggregator was actually walked and OPEN buckets were found,
+        // which is precisely what the missing call site was failing to do. The
         // emitted-vs-dropped SPLIT is exercised by the writer-side tests; the
-        // invariant here is that no bar escapes accounting on either side.
+        // invariant here is that no bar escapes accounting on ANY side.
+        //
+        // Updated 2026-08-18 with the operator-timeframe gate: of the 24 bars
+        // the fold produces, 13 are requested and reach dropped/emitted, and
+        // 11 land in `seals_skipped`. This test FAILED when that gate first
+        // shipped as a bare `return` — the eleven vanished from the ledger and
+        // the production `debug_assert` caught it. That is the test doing
+        // exactly its job, so the fix was a third counter, never a relaxed
+        // assertion.
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let packet = ticker_packet(13, 23_146.45, 1_779_355_000);
         let ParsedFrame::Tick(tick) =
