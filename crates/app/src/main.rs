@@ -2144,6 +2144,11 @@ async fn main() -> Result<()> {
             // So the lane can report whether it is ACTUALLY running, instead of
             // the console reading a flag nothing ever set (2026-08-14).
             feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            // And so a DEAD lane can report dead (2026-08-18). The drain
+            // records rows flushed to QuestDB, which is what lets the Dhan
+            // health verdict fall to `Down` instead of answering a benign
+            // "not instrumented yet" forever.
+            feed_health: std::sync::Arc::clone(&feed_health),
             // The process-wide WAL opened in STAGE-C above. This is the FIRST
             // frame-append consumer since PR-C2 retired the Dhan lane on
             // 2026-07-13 (the note there — "there is no frame APPEND site left
