@@ -328,6 +328,63 @@ impl TfIndex {
         self.seconds_per_bucket() < 60
     }
 
+    /// True for the THIRTEEN timeframes the operator actually asked for.
+    ///
+    /// Operator, 2026-08-08 (verbatim, typos preserved — the same quote the
+    /// r8g.xlarge was sized against, `daily-universe-scope-expansion` Quote 13):
+    ///
+    /// > "current day ticks secodns multiple seocdns tiemframes liek 1 seocnd
+    /// > 5 seconds 10 15 30 seocnds dude nad then even mintue level tiemframes
+    /// > liek 1,2,3,5,15,30,60 and 1 dya also"
+    ///
+    /// That is `S1 S5 S10 S15 S30` + `M1 M2 M3 M5 M15 M30 M60` + `D1` = 13.
+    ///
+    /// # Why this exists
+    ///
+    /// The enum carries **24** variants, so **eleven** second-scale frames —
+    /// `S2 S3 S4 S6 S7 S8 S9 S11 S12 S13 S14` — are neither requested nor used
+    /// by anything. Before this gate the live lane sealed all 24 on every fold,
+    /// so those eleven wrote rows to disk every bucket, for nobody.
+    ///
+    /// The plan item that flagged this proposed gating **all sixteen**
+    /// second-scale frames off, citing the disk cost. That would have been
+    /// wrong in the opposite direction: it deletes `S1 S5 S10 S15 S30`, which
+    /// are five of the thirteen the operator explicitly requested and the
+    /// reason the 32 GiB instance was bought. Gating exactly the eleven
+    /// unrequested frames removes most of the cost while removing none of the
+    /// capability — the requirement and the disk concern were never actually
+    /// in conflict, only the two framings of the fix were.
+    ///
+    /// # Scope
+    ///
+    /// This gates ROW EMISSION, not folding. The aggregator still keeps its
+    /// `[_; TF_COUNT]` slots and ordinals, so nothing here changes the array
+    /// layout, the audit-table `timeframe` symbols, or ordinal decoding —
+    /// deleting variants would cascade through all of that for no benefit.
+    ///
+    /// Changing this set needs a fresh dated operator quote, exactly like the
+    /// constants it derives from; `tf_index_operator_set_is_thirteen` pins it.
+    #[inline]
+    #[must_use]
+    pub const fn is_operator_requested(self) -> bool {
+        matches!(
+            self,
+            Self::S1
+                | Self::S5
+                | Self::S10
+                | Self::S15
+                | Self::S30
+                | Self::M1
+                | Self::M2
+                | Self::M3
+                | Self::M5
+                | Self::M15
+                | Self::M30
+                | Self::M60
+                | Self::D1
+        )
+    }
+
     /// Short display name (`"1m"`, `"3m"`, ..., `"1d"`). Stable across
     /// the codebase and the audit-table `timeframe` SYMBOL column.
     #[inline]
@@ -810,5 +867,73 @@ mod tests {
         let mut sorted = TfIndex::ALL.to_vec();
         sorted.sort();
         assert_eq!(sorted, TfIndex::ALL);
+    }
+
+    /// The operator-requested set is EXACTLY the thirteen of Quote 13.
+    ///
+    /// Both halves are named individually rather than counted. A count alone
+    /// would pass if a requested frame were swapped for an unrequested one,
+    /// and that is precisely the mistake available here: eleven unrequested
+    /// second-scale variants sit immediately adjacent to the five wanted ones
+    /// (`S4`/`S5`/`S6`, `S14`/`S15`), so an off-by-one in either direction is
+    /// a plausible edit that a length check would wave through.
+    #[test]
+    fn tf_index_operator_set_is_thirteen() {
+        let requested: Vec<TfIndex> = TfIndex::ALL
+            .iter()
+            .copied()
+            .filter(|tf| tf.is_operator_requested())
+            .collect();
+
+        assert_eq!(
+            requested.len(),
+            13,
+            "operator Quote 13 (2026-08-08) names exactly 13 timeframes; found \
+             {}. Changing this set needs a fresh dated quote.",
+            requested.len()
+        );
+
+        // The thirteen that must emit rows.
+        for tf in [
+            TfIndex::S1,
+            TfIndex::S5,
+            TfIndex::S10,
+            TfIndex::S15,
+            TfIndex::S30,
+            TfIndex::M1,
+            TfIndex::M2,
+            TfIndex::M3,
+            TfIndex::M5,
+            TfIndex::M15,
+            TfIndex::M30,
+            TfIndex::M60,
+            TfIndex::D1,
+        ] {
+            assert!(
+                tf.is_operator_requested(),
+                "{tf:?} is one of the operator's thirteen and must emit rows"
+            );
+        }
+
+        // The eleven that exist but were never asked for.
+        for tf in [
+            TfIndex::S2,
+            TfIndex::S3,
+            TfIndex::S4,
+            TfIndex::S6,
+            TfIndex::S7,
+            TfIndex::S8,
+            TfIndex::S9,
+            TfIndex::S11,
+            TfIndex::S12,
+            TfIndex::S13,
+            TfIndex::S14,
+        ] {
+            assert!(
+                !tf.is_operator_requested(),
+                "{tf:?} was never requested — emitting it writes rows to disk \
+                 every bucket for nobody"
+            );
+        }
     }
 }
