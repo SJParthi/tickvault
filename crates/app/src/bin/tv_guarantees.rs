@@ -268,6 +268,96 @@ fn render(title: &str, rows: &[Row]) -> String {
     s
 }
 
+/// One workspace dependency, as the manifest actually declares it.
+struct DepPin {
+    name: String,
+    /// `Some(version)` when declared `"=x.y.z"`; `None` when the declaration
+    /// is a RANGE — which includes the bare `"x.y.z"` form, because cargo
+    /// reads an unadorned version as `^x.y.z`.
+    exact: Option<String>,
+}
+
+/// Parse `[workspace.dependencies]` from the root manifest.
+///
+/// Deliberately hand-rolled rather than `toml`-parsed: this must report on the
+/// literal TEXT an author wrote, and a parser normalises `"1.2.3"` and
+/// `"^1.2.3"` into the same `VersionReq` — erasing the exact distinction this
+/// row exists to measure.
+fn workspace_dep_pins(manifest: &str) -> Vec<DepPin> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for raw in manifest.lines() {
+        let line = raw.trim_start();
+        if line.starts_with('[') {
+            inside = line.starts_with("[workspace.dependencies]");
+            continue;
+        }
+        if !inside || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, rest)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            continue;
+        }
+        // `{ workspace = true }`, path and git deps carry no registry version.
+        let rest = rest.trim();
+        let literal = if let Some(idx) = rest.find("version") {
+            rest[idx..]
+                .split_once('"')
+                .and_then(|(_, r)| r.split_once('"'))
+        } else if let Some(after_quote) = rest.strip_prefix('"') {
+            after_quote.split_once('"')
+        } else {
+            None
+        };
+        let Some((version, _)) = literal else {
+            continue;
+        };
+        if version.is_empty() || !version.starts_with(|c: char| c == '=' || c.is_ascii_digit()) {
+            // ^ ~ * >= — an explicit range, same class as bare.
+            out.push(DepPin {
+                name: name.to_string(),
+                exact: None,
+            });
+            continue;
+        }
+        out.push(DepPin {
+            name: name.to_string(),
+            exact: version.strip_prefix('=').map(str::to_string),
+        });
+    }
+    out
+}
+
+/// Every `(name, version)` pair `Cargo.lock` actually resolved.
+fn lock_pairs(lock: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    for raw in lock.lines() {
+        let line = raw.trim();
+        if line == "[[package]]" {
+            name = None;
+        } else if let Some(v) = line.strip_prefix("name = \"") {
+            name = v.strip_suffix('"').map(str::to_string);
+        } else if let Some(v) = line.strip_prefix("version = \"")
+            && let (Some(n), Some(ver)) = (name.take(), v.strip_suffix('"'))
+        {
+            // `1.1.4+spec-1.1.0` — build metadata is not part of the version
+            // a requirement matches on.
+            let ver = ver.split('+').next().unwrap_or(ver);
+            out.push((n, ver.to_string()));
+        }
+    }
+    out
+}
+
 fn main() {
     let files = tracked_files();
     if files.is_empty() {
@@ -385,6 +475,19 @@ fn main() {
         })
         .count();
 
+    // Read the seam's allocation ceiling out of the gate that enforces it, so
+    // this row cannot drift from the test the way a copied number would.
+    let seam_budget: Option<u64> =
+        std::fs::read_to_string("crates/app/tests/dhat_live_ingest_seam.rs")
+            .ok()
+            .and_then(|src| {
+                src.lines()
+                    .map(str::trim)
+                    .find_map(|l| l.strip_prefix("const MAX_BLOCKS: u64 = "))
+                    .map(|v| v.trim_end_matches(';').replace('_', ""))
+            })
+            .and_then(|v| v.parse().ok());
+
     let o1 = vec![
         Row::new(
             "Packet decode (hot path)",
@@ -401,6 +504,24 @@ fn main() {
             },
             format!("{dhat} suites"),
             "each fails the build on a re-introduced allocation",
+        ),
+        // The row above certifies the DECODER. It does not certify the SEAM,
+        // and the difference was invisible here: `dhat_live_ingest_seam.rs`
+        // measured the full decode -> fold -> ILP-append path at ~5,100
+        // blocks per 10,000 ticks and says so in its own comment -- "the fold
+        // path allocates per tick today ... no comment here should be read as
+        // saying [it is allocation-free]". That honest number lived in a test
+        // comment while this report, the automated surface, showed only the
+        // zero-alloc decoder. Reading the budget from the constant puts the
+        // real figure on the same page as the claim it qualifies.
+        Row::new(
+            "Live ingest seam (decode->fold->append)",
+            Verdict::Bounded,
+            match seam_budget {
+                Some(b) => format!("<={b} blk/10k"),
+                None => "budget unread".to_string(),
+            },
+            "NOT zero-alloc: a ratchet at the measured per-tick rate",
         ),
         Row::new(
             "Instrument lookup",
@@ -525,6 +646,82 @@ fn main() {
     ];
 
     // ---------------------------------------------------------------
+    // Section 5 — every version pinned (THREE PRINCIPLES #3)
+    //
+    // This section exists because the report did not have one, and that
+    // absence was not cosmetic: principles 1 and 2 were measured here every
+    // run while principle 3 was checked only by a pre-commit grep for the
+    // literal `^` character. A bare `"1.2.3"` IS `^1.2.3` to cargo, so that
+    // grep passed 65 of 77 workspace deps green, and the lockfile drifted
+    // underneath the manifest unnoticed -- measured 2026-08-18, 21 crates
+    // adrift including tokio 1.52.3 -> 1.53.1 and rustls 0.23.40 -> 0.23.43.
+    //
+    // A guarantee nobody measures is a guarantee nobody has.
+    // ---------------------------------------------------------------
+    let manifest = std::fs::read_to_string("Cargo.toml").unwrap_or_default();
+    let lock = std::fs::read_to_string("Cargo.lock").unwrap_or_default();
+    let pins = workspace_dep_pins(&manifest);
+    let pairs = lock_pairs(&lock);
+
+    let ranged = pins.iter().filter(|p| p.exact.is_none()).count();
+    let exact = pins.len() - ranged;
+
+    // A dep the lock never resolved is DECLARED BUT UNUSED -- not a pinning
+    // failure, so it is counted separately rather than folded into a verdict
+    // it did not cause.
+    let mut drifted = 0usize;
+    let mut unresolved = 0usize;
+    for p in &pins {
+        let Some(want) = p.exact.as_deref() else {
+            continue;
+        };
+        let mut seen_name = false;
+        let mut matched = false;
+        for (n, v) in &pairs {
+            if n == &p.name {
+                seen_name = true;
+                if v == want {
+                    matched = true;
+                }
+            }
+        }
+        if !seen_name {
+            unresolved += 1;
+        } else if !matched {
+            drifted += 1;
+        }
+    }
+
+    let pinning = vec![
+        Row::new(
+            "Workspace deps exactly pinned",
+            if ranged == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{exact}/{} exact", pins.len()),
+            "a bare \"1.2.3\" is ^1.2.3 to cargo -- both are ranges",
+        ),
+        Row::new(
+            "Manifest agrees with Cargo.lock",
+            if drifted == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{drifted} adrift"),
+            "the version we declare is the version we build",
+        ),
+        Row::new(
+            "Declared but never resolved",
+            Verdict::Bounded,
+            format!("{unresolved} deps"),
+            "dead declarations: no member crate references them",
+        ),
+    ];
+
+    // ---------------------------------------------------------------
     // Report
     // ---------------------------------------------------------------
     println!("TICKVAULT GUARANTEE REPORT");
@@ -533,12 +730,14 @@ fn main() {
     print!("{}", render("2. O(1)", &o1));
     print!("{}", render("3. AUTOMATION", &auto));
     print!("{}", render("4. TEST SURFACE", &testing));
+    print!("{}", render("5. EVERY VERSION PINNED", &pinning));
 
     let all: Vec<Row> = lang
         .into_iter()
         .chain(o1)
         .chain(auto)
         .chain(testing)
+        .chain(pinning)
         .collect();
     let broken = all.iter().filter(|r| r.verdict == Verdict::Broken).count();
     let bounded = all.iter().filter(|r| r.verdict == Verdict::Bounded).count();

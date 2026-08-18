@@ -584,8 +584,13 @@ impl MultiTfAggregator {
     /// Returns the number of bars emitted.
     ///
     /// # Complexity
-    /// O(N × 21) where N is the number of allocated slots. COLD path — once
-    /// per day boundary, never per tick.
+    /// O(N × [`TF_COUNT`]) where N is the number of allocated slots. COLD
+    /// path — once per day boundary, never per tick.
+    ///
+    /// Written as the CONSTANT, not as a literal. This line said `21` while
+    /// `TF_COUNT` was 24 — understating the real cost by ~14% — because a
+    /// number copied into a doc comment has no way to stay true when the
+    /// constant beside it moves. Cite the symbol; let it move on its own.
     pub fn force_seal_all<F>(&mut self, mut on_seal: F) -> usize
     where
         F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
@@ -615,7 +620,12 @@ impl MultiTfAggregator {
     /// Returns the number of bars emitted.
     ///
     /// # Complexity
-    /// O(N × 21). COLD path — driven at a multi-second cadence.
+    /// O(N × [`TF_COUNT`]). Driven at a multi-second cadence — but NOT on a
+    /// background task: the caller drives this from the frame drain's own
+    /// `tokio::select!`, so a sweep is a periodic PAUSE of the drain, not
+    /// work that happens beside it. UNMEASURED at the 25,000-instrument
+    /// target. (The literal `21` this line used to carry was stale; cite the
+    /// constant so it cannot go stale again.)
     pub fn catch_up_seal_all<F>(&mut self, cutoff_secs: u32, mut on_seal: F) -> usize
     where
         F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
