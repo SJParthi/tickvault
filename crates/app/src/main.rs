@@ -2097,6 +2097,20 @@ async fn main() -> Result<()> {
     // only thing that fires it.
     let dhan_feed_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
 
+    // Close the boot race before the lane resolves its set. The daily rider
+    // (spawned above) WRITES today's mapping artifact; the lane READS it. Same
+    // boot, no ordering between them — and the filename is date-stamped, so
+    // yesterday's file cannot stand in. On 2026-08-17 the single 08:31 boot
+    // lost that race and the whole session ran on 4 instruments instead of
+    // 4,565, silently. This wait is bounded and fail-soft: on timeout the
+    // resolve below takes its existing, loudly-logged fallback.
+    let universe_date_ist = tickvault_app::dhan_universe::today_ist_date();
+    tickvault_app::dhan_live_universe::await_mapping_artifact(
+        &config.dhan_universe,
+        &universe_date_ist,
+    )
+    .await;
+
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),
@@ -2119,7 +2133,7 @@ async fn main() -> Result<()> {
             main_feed_instruments: tickvault_app::dhan_live_universe::resolve_live_universe(
                 &config.dhan_universe,
                 tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
-                &tickvault_app::dhan_universe::today_ist_date(),
+                &universe_date_ist,
                 tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
                     .subscription_capacity(),
             ),
