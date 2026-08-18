@@ -1932,7 +1932,32 @@ async fn run_frame_drain(
                 }
                 seen = seen.saturating_add(1);
                 let c = counters();
-                let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                // The frame's OWN receipt instant, reconstructed from the
+                // monotonic stamp the read task took when it came off the
+                // socket — NOT a fresh `Utc::now()` here.
+                //
+                // Until 2026-08-18 this bound `Utc::now()` directly, which
+                // made every lag sample
+                // `Dhan's delivery + however long the frame sat in the ring`.
+                // Those are different quantities with different owners: the
+                // first is the vendor's, the second is ours. Under a fold
+                // stall the ring backs up and the drain falls behind, so the
+                // measurement inflated precisely when the cause was LOCAL —
+                // the lag alarm would have fired hardest at our own backlog
+                // and named Dhan for it.
+                //
+                // Subtracting `elapsed()` rather than carrying a wall-clock
+                // stamp on the frame keeps `pool_supervisor` free of the wall
+                // clock (an NTP step must not be able to expire all sixteen
+                // sockets at once), and is strictly more robust: a clock step
+                // landing between receipt and fold cancels out of the
+                // difference instead of corrupting the sample.
+                let queued_nanos =
+                    i64::try_from(frame.received_at.elapsed().as_nanos()).unwrap_or(i64::MAX);
+                let received_at_nanos = chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(0)
+                    .saturating_sub(queued_nanos);
                 // The gap detector's clock is a millisecond reading; the same
                 // wall-clock instant is used so a frame's arrival and its
                 // silence-accounting can never disagree.
@@ -5320,6 +5345,7 @@ mod tests {
             seq,
             endpoint,
             connection_index: 5,
+            received_at: std::time::Instant::now(),
             bytes: bytes::Bytes::from(bytes),
         }
     }
@@ -6318,6 +6344,7 @@ mod tests {
             seq: 42,
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
+            received_at: std::time::Instant::now(),
             bytes: bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, 1_779_355_000)),
         })
         .await
@@ -6386,6 +6413,7 @@ mod tests {
             seq: 7,
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
+            received_at: std::time::Instant::now(),
             bytes: bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, 1_779_355_000)),
         })
         .await
@@ -6445,6 +6473,7 @@ mod tests {
             seq: 1,
             endpoint: DhanEndpointType::Depth20,
             connection_index: 5,
+            received_at: std::time::Instant::now(),
             bytes: bytes::Bytes::from_static(&[0x0C, 0x00, 0x29, 0x00, 0x0D, 0x00, 0x00, 0x00]),
         })
         .await
