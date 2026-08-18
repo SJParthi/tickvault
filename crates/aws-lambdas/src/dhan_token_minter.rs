@@ -224,6 +224,53 @@ pub fn parse_mint_response(body: &str) -> Result<SecretString, MintError> {
     Ok(SecretString::from(token.to_string()))
 }
 
+/// The TOTP time step, in seconds. RFC 6238 default and Dhan's contract.
+const TOTP_STEP_SECS: u64 = 30;
+
+/// Minimum remaining life a TOTP code must have before we spend it on a mint.
+///
+/// Sized from measured Dhan behaviour, not guessed. Across 2026-08-12..18 the
+/// mint round-trip was 80–246 ms on six days and **10,067 ms** on one
+/// (2026-08-17). 12 s clears that worst observed case with margin and still
+/// bounds the pre-mint sleep to 12 s.
+const MIN_CODE_LIFE_SECS: u64 = 12;
+
+/// How long to wait so the next generated TOTP code has a useful lifetime.
+///
+/// # The bug this fixes
+///
+/// EventBridge delivers this Lambda ~27.5 s after its cron minute, with
+/// millisecond consistency. The code was therefore generated at ~`:29.5` of a
+/// step that ends at `:30.000` — **200–540 ms of life, every single day**:
+///
+/// | Day | POST sent | Dhan RTT | Outcome |
+/// |---|---|---|---|
+/// | 08-12..08-16 | :29.46–:29.77 | 82–246 ms | OK |
+/// | 08-17 | :29.480 | 10,067 ms | **Invalid TOTP** |
+/// | 08-18 | :29.574 | 80 ms | **Invalid TOTP** |
+///
+/// Nothing changed on 08-17 — no commit touched this file and the secret has
+/// been stable since 2026-06-30. It was always a sub-second coin flip that
+/// happened to land heads five times, and on 08-18 it failed even at 80 ms RTT,
+/// which means Dhan's validator is at least ~350 ms ahead of us and applies no
+/// backward skew.
+///
+/// Returns the seconds to sleep: `0` when the current code already has
+/// [`MIN_CODE_LIFE_SECS`] left, otherwise just enough to cross into the next
+/// step, where the fresh code starts with a full 30 s.
+///
+/// Note `with_skew(1)` on the builder does NOT help here — skew widens
+/// `check_current` on the *verifier* side; it has no effect on `generate`.
+#[must_use]
+pub fn secs_to_sleep_for_fresh_totp(unix_secs: u64) -> u64 {
+    let remaining = TOTP_STEP_SECS - (unix_secs % TOTP_STEP_SECS);
+    if remaining < MIN_CODE_LIFE_SECS {
+        remaining
+    } else {
+        0
+    }
+}
+
 /// Generates the current 6-digit TOTP code from a base32 secret.
 ///
 /// SHA-1 / 6 digits / 30-second period, matching Dhan's 2FA requirement and
@@ -450,6 +497,22 @@ pub async fn mint_token(
     auth_base_url: &str,
     credentials: &DhanCredentials,
 ) -> Result<SecretString, MintError> {
+    // Never spend a TOTP code that is about to expire. Without this the mint
+    // POST went out with 200–540 ms of code life on every invocation, which
+    // failed as "Invalid TOTP" whenever Dhan's round-trip or clock offset
+    // exceeded that — twice in the week of 2026-08-17. See
+    // `secs_to_sleep_for_fresh_totp` for the measured evidence.
+    let sleep_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| secs_to_sleep_for_fresh_totp(d.as_secs()))
+        .unwrap_or(0);
+    if sleep_secs > 0 {
+        info!(
+            sleep_secs,
+            "waiting for the next TOTP step so the mint uses a code with a full 30s of life"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+    }
     let totp_code = generate_totp_code(&credentials.totp_secret)?;
     let url = build_mint_url(auth_base_url);
 
@@ -1678,5 +1741,72 @@ mod tests {
             store.writes(),
             vec![("/tickvault/prod/dhan/access-token".to_string(), jwt)]
         );
+    }
+
+    // ---- TOTP freshness (the 2026-08-17/18 "Invalid TOTP" regression) ----
+
+    #[test]
+    fn test_secs_to_sleep_for_fresh_totp_is_zero_when_the_code_has_plenty_of_life() {
+        // t % 30 == 0 -> a brand-new code with the full 30s ahead of it.
+        assert_eq!(secs_to_sleep_for_fresh_totp(1_787_011_200), 0);
+        // 17s left is still comfortably above the 12s floor.
+        assert_eq!(secs_to_sleep_for_fresh_totp(1_787_011_213), 0);
+    }
+
+    #[test]
+    fn test_secs_to_sleep_for_fresh_totp_crosses_into_the_next_step_when_stale() {
+        // THE production case. EventBridge lands this Lambda at ~:29.5 of the
+        // step, leaving ~0.5s of code life — which is exactly what failed on
+        // 2026-08-17 and 2026-08-18.
+        let t = 1_787_011_200 + 29; // 1s of life left
+        assert_eq!(
+            secs_to_sleep_for_fresh_totp(t),
+            1,
+            "a code with 1s left must be skipped, not spent"
+        );
+        let t = 1_787_011_200 + 20; // 10s left, still under the 12s floor
+        assert_eq!(secs_to_sleep_for_fresh_totp(t), 10);
+    }
+
+    #[test]
+    fn test_secs_to_sleep_for_fresh_totp_boundary_is_exactly_the_min_life_floor() {
+        // Exactly MIN_CODE_LIFE_SECS remaining must NOT sleep (the `<`
+        // comparison), and one second less must.
+        let base = 1_787_011_200;
+        let at_floor = base + (TOTP_STEP_SECS - MIN_CODE_LIFE_SECS);
+        assert_eq!(secs_to_sleep_for_fresh_totp(at_floor), 0);
+        assert_eq!(
+            secs_to_sleep_for_fresh_totp(at_floor + 1),
+            MIN_CODE_LIFE_SECS - 1
+        );
+    }
+
+    #[test]
+    fn test_secs_to_sleep_for_fresh_totp_never_exceeds_the_min_life_floor() {
+        // Bounds the added Lambda latency: whatever the clock says, we can
+        // never sleep longer than the floor, so the mint stays well inside the
+        // function timeout.
+        for offset in 0..600u64 {
+            let sleep = secs_to_sleep_for_fresh_totp(1_787_011_200 + offset);
+            assert!(
+                sleep < MIN_CODE_LIFE_SECS,
+                "offset {offset} produced a {sleep}s sleep, above the {MIN_CODE_LIFE_SECS}s floor"
+            );
+        }
+    }
+
+    #[test]
+    fn test_secs_to_sleep_for_fresh_totp_lands_on_a_step_boundary() {
+        // After sleeping, the resulting instant must start a fresh step — that
+        // is the whole point: a full 30s of life, not a partial top-up.
+        for offset in 0..600u64 {
+            let t = 1_787_011_200 + offset;
+            let after = t + secs_to_sleep_for_fresh_totp(t);
+            let life_left = TOTP_STEP_SECS - (after % TOTP_STEP_SECS);
+            assert!(
+                life_left >= MIN_CODE_LIFE_SECS,
+                "t={t} left only {life_left}s of code life after the wait"
+            );
+        }
     }
 }
