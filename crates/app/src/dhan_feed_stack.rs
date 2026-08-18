@@ -1902,6 +1902,52 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Flush the ILP buffer and tell feed-health how many rows actually landed.
+///
+/// The two halves live in one function because separating them is what went
+/// wrong. Before 2026-08-18 the drain called `ingest.flush()` at three
+/// steady-state sites and DISCARDED the returned row count at every one —
+/// the number was computed and dropped. Meanwhile `record_ticks` had ZERO
+/// production callers anywhere in the workspace, so the Dhan lane could pump
+/// rows all session and `feed_health` still answered
+/// `Unknown — "not instrumented yet"`. A dead lane and a healthy one produced
+/// the identical verdict, on the one signal an operator checks to find out
+/// which it is.
+///
+/// **Rows FLUSHED is the deliberate unit** — not frames received, not rows
+/// buffered:
+///
+/// * A frame that arrived and failed to parse must not make the feed look
+///   alive; nothing reached the database.
+/// * A row still in the ILP buffer is not readable by anything. Counting a
+///   buffer append as liveness would report health for data a crash takes
+///   with it.
+/// * A FAILED flush returns 0 by `TickWriter` contract, so it records nothing
+///   and health decays — which is correct. During a QuestDB outage the feed
+///   genuinely is not delivering, however busy the socket looks.
+///
+/// `record_ticks` is a no-op at `n == 0` and deliberately does not stamp the
+/// time in that case, so the 500 ms idle timer cannot forge liveness for an
+/// instrument set that never ticked.
+///
+/// Cost: two relaxed atomic stores plus one clock read, at FLUSH cadence
+/// (500 ms timer or the row threshold) — never per tick.
+fn flush_and_record(
+    ingest: &mut LiveIngest,
+    feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
+) -> u64 {
+    let rows = blocking_flush(|| ingest.flush());
+    feed_health.record_ticks(
+        Feed::Dhan,
+        rows,
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+    );
+    rows
+}
+
 /// Has a RISK-GAP-03 page fired recently enough to suppress the next one?
 ///
 /// Extracted as a pure function rather than written inline because the inline
@@ -1969,6 +2015,7 @@ async fn run_frame_drain(
     main_feed_budget: Arc<RingByteBudget>,
     depth_budget: Arc<RingByteBudget>,
     shutdown: Arc<tokio::sync::Notify>,
+    feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
 ) -> DrainOutcome {
     let mut seen: u64 = 0;
     let mut folded: u64 = 0;
@@ -2112,7 +2159,7 @@ async fn run_frame_drain(
                 // QuestDB — an unflushed buffer is not storage, it is a leak
                 // with a success counter in front of it.
                 if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD {
-                    blocking_flush(|| ingest.flush());
+                    flush_and_record(&mut ingest, &feed_health);
                 }
                 // Depth gets its OWN size trigger — see
                 // `DEPTH_FLUSH_ROW_THRESHOLD` for why reusing the tick one
@@ -2160,7 +2207,7 @@ async fn run_frame_drain(
                 // that order: sealing produces rows, so flushing first would
                 // leave exactly the rows sealing just created.
                 let (emitted, dropped) = ingest.catch_up_seal();
-                blocking_flush(|| ingest.flush());
+                flush_and_record(&mut ingest, &feed_health);
                 flush_depth(depth_ingest.as_mut());
                 if dropped > 0 {
                     error!(
@@ -2183,7 +2230,7 @@ async fn run_frame_drain(
             // instrument sit unflushed below the size threshold waiting for a
             // next tick which, at the close, never comes.
             _ = flush_timer.tick() => {
-                blocking_flush(|| ingest.flush());
+                flush_and_record(&mut ingest, &feed_health);
                 flush_depth(depth_ingest.as_mut());
                 publish_fold_depth(&ingest);
             }
@@ -2372,7 +2419,7 @@ async fn run_frame_drain(
 
     // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
-    let tail = blocking_flush(|| ingest.flush());
+    let tail = flush_and_record(&mut ingest, &feed_health);
     flush_depth(depth_ingest.as_mut());
     publish_fold_depth(&ingest);
     let depth_dropped = depth_ingest.as_ref().map_or(0, DepthIngest::dropped_rows);
@@ -3222,6 +3269,20 @@ pub struct DhanFeedStackParams {
     /// what sets it: `true` once sockets are dialed and the fold is consuming
     /// them, `false` on every exit path.
     pub feed_runtime: Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    /// The process-wide feed-health registry, so a DEAD Dhan lane can report
+    /// dead.
+    ///
+    /// Added 2026-08-18. Sibling of `feed_runtime` above, one step further
+    /// in: that field fixed the lane's RUNNING flag, but health also needs to
+    /// know whether the lane is DELIVERING. `record_ticks` had zero
+    /// production callers anywhere in the workspace, so the Dhan verdict
+    /// could never fall to `Down` — it answered a benign
+    /// `Unknown, "not instrumented yet"` for a corpse.
+    ///
+    /// The lane owns that truth, so the lane reports it: the drain records
+    /// rows FLUSHED TO QUESTDB after every flush. See `flush_and_record` for
+    /// why flushed rows are the unit rather than frames received.
+    pub feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
     /// Signalled at process shutdown so the drain can SEAL and FLUSH before
     /// the process exits.
     ///
@@ -4051,6 +4112,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         Arc::clone(&main_feed_budget),
         Arc::clone(&depth_budget),
         Arc::clone(&params.shutdown),
+        Arc::clone(&params.feed_health),
     ));
 
     // ---- the sockets -------------------------------------------------------
@@ -5278,6 +5340,7 @@ mod tests {
             // its `false` default. Asserted below, so this test also pins that
             // a refused lane never claims to be running.
             feed_runtime: Arc::new(tickvault_api::feed_state::FeedRuntimeState::default()),
+            feed_health: Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             calendar: Arc::new(synthetic_calendar()),
         });
@@ -6472,6 +6535,7 @@ mod tests {
                 Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
             ),
         )
         .await
@@ -6536,6 +6600,7 @@ mod tests {
             Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
             Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
             Arc::clone(&shutdown),
+            Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
         ));
 
         // `notify_one` is permit-based, so this is safe to fire before the
@@ -6569,6 +6634,41 @@ mod tests {
         drop(tx);
     }
 
+    #[test]
+    fn test_an_idle_flush_cannot_forge_feed_liveness() {
+        // `flush_and_record` runs on the 500 ms timer whether or not anything
+        // ticked, so the ZERO case is the one that decides whether this
+        // instrumentation is honest or actively harmful. If a no-row flush
+        // stamped the clock, an instrument set that never ticked would look
+        // permanently fresh — the Dhan verdict would move from "can never say
+        // Down" (the bug being fixed) to "says Up while dead", which is
+        // strictly worse than the state it replaced.
+        //
+        // The guarantee comes from `record_ticks`'s `n == 0` early return, so
+        // this test pins the BEHAVIOUR that `flush_and_record` relies on
+        // rather than restating its implementation.
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let now = 1_779_355_000_000_000_000_i64;
+
+        reg.record_ticks(Feed::Dhan, 0, now);
+        assert_eq!(
+            reg.last_tick_age_secs(Feed::Dhan, now),
+            None,
+            "a flush that covered ZERO rows must not stamp the clock — an idle \
+             500 ms timer tick would otherwise report a dead feed as fresh"
+        );
+
+        // And the positive case, so the assertion above cannot pass simply
+        // because nothing works.
+        reg.record_ticks(Feed::Dhan, 3, now);
+        assert_eq!(
+            reg.last_tick_age_secs(Feed::Dhan, now),
+            Some(0),
+            "a flush that covered rows MUST stamp the clock — without this the \
+             Dhan verdict can never leave `Unknown`, which is the whole defect"
+        );
+    }
+
     #[tokio::test]
     async fn test_depth_frames_are_not_fed_to_the_main_feed_parser() {
         // Depth uses a 12-byte header whose first bytes are a message length,
@@ -6599,6 +6699,7 @@ mod tests {
                 Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
             ),
         )
         .await
@@ -6641,7 +6742,27 @@ mod tests {
         // because "is this call blocking?" is invisible to the type system.
         let src = include_str!("dhan_feed_stack.rs");
         let test_marker = concat!("#[cfg(", "test)]");
-        let production_half = src.split(test_marker).next().unwrap_or(src);
+        let production_half_with_comments = src.split(test_marker).next().unwrap_or(src);
+        // Comments STRIPPED before counting (2026-08-18). The counting
+        // assertions below search for call syntax, and this module documents
+        // the old call shape while explaining why it changed — so an
+        // un-stripped scan counts the explanation as a call and fails on the
+        // very commit that fixes the defect. That is not hypothetical: it
+        // happened here, when `flush_and_record`'s doc comment named the shape
+        // it replaced.
+        //
+        // The `contains` assertions immediately below deliberately keep using
+        // the UNSTRIPPED text: they look for declarations, and stripping would
+        // not change their answer.
+        let production_half = production_half_with_comments
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let production_half = production_half.as_str();
 
         assert!(
             production_half.contains("fn blocking_flush<T>"),
@@ -6672,10 +6793,35 @@ mod tests {
              found {bare} call(s) and {wrapped} wrapped — the difference is a \
              blocking HTTP call sitting on the async drain task"
         );
+
+        // 2026-08-18: the drain's three flush sites now route through
+        // `flush_and_record`, which pairs the flush with the feed-health
+        // report, so exactly ONE wrapped `ingest.flush()` remains — inside
+        // that helper. This assertion used to require `wrapped >= 3` and
+        // counted the call sites directly.
+        //
+        // The invariant is UNCHANGED and is now checked at a better place: a
+        // single choke point is the only thing that can get the blocking call
+        // wrong, so it is pinned exactly, and the site count is checked
+        // separately below. Loosening `wrapped` alone would have been the
+        // wrong edit — it would stop noticing a bare flush entirely — which is
+        // why the equality above is kept and this pair replaces the count.
+        assert_eq!(
+            wrapped, 1,
+            "expected exactly ONE wrapped ingest.flush() — the single one \
+             inside `flush_and_record`. Found {wrapped}: either a flush site \
+             bypassed the helper, or the helper was inlined back into the \
+             drain (which re-opens the four-sites-to-keep-in-sync problem)"
+        );
+        let recorded_sites = production_half
+            .matches("flush_and_record(&mut ingest, &feed_health)")
+            .count();
         assert!(
-            wrapped >= 3,
+            recorded_sites >= 3,
             "expected at least the 3 known flush sites (size trigger, time \
-             trigger, shutdown tail); found {wrapped} — did a site get deleted?"
+             trigger, shutdown tail) routing through `flush_and_record`; found \
+             {recorded_sites} — did a site get deleted, or start calling the \
+             writer directly?"
         );
     }
 
