@@ -394,6 +394,57 @@ and does not apply to the deploy path, which cross-compiles for a KNOWN r8g.xlar
 only, leaving the local build generic. The portability comment stays and gains the
 carve-out so the next reader does not undo it.
 
+### Items 8, 12, 14 — closure record (2026-08-18)
+
+Verified in source on this branch before writing, not inferred from the item text above.
+
+**Item 12(a) — DONE by this change.** The drain no longer opens with its own
+`Utc::now()`. `CapturedFrame` carries `received_at`, a MONOTONIC instant stamped in the
+read task (`WalRingSink::accept`, before the WAL append), and the drain derives the
+receipt instant as `Utc::now() - frame.received_at.elapsed()`. A first attempt stamped a
+WALL CLOCK in `pool_supervisor` and was correctly rejected by the existing ratchet
+`test_pool_supervisor_source_never_reads_the_wall_clock` — that ban is load-bearing (an
+NTP step must not be able to expire all sixteen sockets at once). The monotonic shape
+respects it and is strictly better: a clock step landing between receipt and fold cancels
+out of the difference instead of corrupting the sample. Guarded by
+`dhan_feed_drain_consults_the_frames_receipt_stamp` and
+`dhan_feed_drain_actually_subtracts_the_queue_delay` — the second exists because
+computing `elapsed()` and then not applying it compiles, passes every unit test, and
+silently restores the exact wrong measurement.
+
+**Item 12(b) — already DONE by another route.** `CapturedFrame::connection_index: u8`
+(`pool_supervisor.rs`) already carries the slot, and `record_ws_lag` already resolves it
+to a per-slot histogram handle.
+
+**Item 12(c) — the LIVE path is covered; the named symbol is dormant, not fixed.** Stated
+precisely because this item names a specific symbol. The live per-connection path is
+covered: `ws_lag_ms` returns `WsLag::ClampedNegative` for a negative sample (recorded as
+0.0 and counted on `excluded_clamped_negative`) and `None` for an implausible LTT
+(counted on `excluded_implausible_ltt`). The symbol the item actually names —
+`DailyLagHistogram::record_ns` in `feed_lag_monitor.rs` — is STILL `u64` and is
+UNCHANGED. It is unreachable rather than repaired: it is private and has ZERO production
+producers (every call site is inside its own test module), which that file's own header
+already records. Recorded this way deliberately — calling it "fixed" would be the
+stale-row class this repo has had to correct repeatedly.
+
+**Item 8 — WITHDRAWN, not deferred.** The proposed respawn supervisor would be
+unreachable in production. The release profile sets `panic = "abort"` (`Cargo.toml:280`),
+so a panic in any drain arm aborts the PROCESS — there is no unwind for a supervisor to
+catch and no surviving task to respawn from. Recovery is already owned one layer up by
+systemd `Restart=always` (`deploy/systemd/tickvault.service:94`), which restarts the whole
+binary. Building the supervisor would add a respawn counter and a bounded-restart ladder
+that can never increment, i.e. a permanently-green monitor — the exact false-OK class
+Rule 11 forbids. The item's underlying concern (a dead drain must be visible) is real and
+is served by `tv_dhan_feed_stack_up < 1`, already alarmed under item 13.
+
+**Item 14 — already DONE, and deliberately `neoverse-n1`, not `-v2`.**
+`.cargo/config.toml:58` sets `rustflags = ["-C", "target-cpu=neoverse-n1"]` on the deploy
+target. The item text above proposes `neoverse-v2` (Graviton4). That is NOT an oversight
+to correct: the operator-sanctioned rollback path from r8g.xlarge runs t4g (Graviton2 =
+`neoverse-n1`), and a binary built for V2 would fault with SIGILL on a t4g box the moment
+that rollback was exercised. `n1` runs correctly on both, so it is the correct choice for
+a target set that includes the rollback host. Left as-is.
+
 ## Item 8–14 Edge Cases
 
 - Drain respawn must NOT restart into a poison frame forever — the restart budget is

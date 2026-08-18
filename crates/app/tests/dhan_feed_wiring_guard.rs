@@ -323,3 +323,81 @@ fn the_two_sequence_generators_are_independent_and_can_collide() {
          independently-seeded counters can mint the same integer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Orphan 5 — the receipt stamp must come from the FRAME, not from the drain
+// ---------------------------------------------------------------------------
+
+/// The drain must consult the frame's own read-task receipt stamp.
+///
+/// Until 2026-08-18 the drain bound its receive time from a fresh wall-clock
+/// read, so every WebSocket lag sample measured
+/// `Dhan's delivery + however long the frame sat in the ring`. Those are two
+/// different quantities with two different owners, and only the first is the
+/// vendor's. The failure mode is worse than imprecision: under a fold stall
+/// the ring backs up and the drain falls behind, so the number inflates
+/// *precisely* when the cause is LOCAL — the lag alarm fires hardest at our
+/// own backlog while naming Dhan for it.
+#[test]
+fn dhan_feed_drain_consults_the_frames_receipt_stamp() {
+    assert!(
+        drain_body().contains("frame.received_at.elapsed()"),
+        "the frame drain must read the frame's own read-task receipt stamp \
+         (`frame.received_at.elapsed()`). Without it the drain is timing its \
+         own queueing delay and reporting it as Dhan's delivery lag."
+    );
+}
+
+/// Reading the queue delay is not enough — it has to be SUBTRACTED.
+///
+/// This is the regression that would actually happen. Deleting
+/// `frame.received_at` outright is a compile error and needs no guard; quietly
+/// computing `elapsed()` and then not applying it compiles, passes every unit
+/// test, and silently restores the exact wrong measurement. That is the shape
+/// this file exists to catch.
+#[test]
+fn dhan_feed_drain_actually_subtracts_the_queue_delay() {
+    let body = drain_body();
+    assert!(
+        body.contains("saturating_sub(queued_nanos)"),
+        "the frame drain computes the ring queueing delay but no longer \
+         subtracts it from the wall-clock read. The receipt instant is \
+         `now - queued`, not `now`; without the subtraction the lag metric is \
+         back to charging our own backlog to the vendor."
+    );
+}
+
+/// The body of `run_frame_drain`, comments stripped, from its signature to the
+/// next top-level item.
+///
+/// Two deliberate choices, both learned the hard way while writing this guard:
+///
+/// * **Scoped to the function**, because `refold_wal_frames` legitimately uses
+///   "now" as a receive time — a frame replayed from the WAL after a crash has
+///   no surviving receipt instant, and its lag reading is meaningless anyway
+///   since the tick's own exchange timestamp decides the candle bucket. A
+///   whole-file scan would flag it, and a false positive in a ratchet is worse
+///   than no ratchet: the next reader deletes it and the real regression walks
+///   through the hole afterwards.
+/// * **Comments stripped**, because the drain carries a comment explaining
+///   what the old clock read was and why it went. A scan that could not tell
+///   the explanation from the thing explained would fail on the very commit
+///   that fixed the defect.
+fn drain_body() -> String {
+    const NEEDLE: &str = "async fn run_frame_drain(";
+    let start = STACK_SRC
+        .find(NEEDLE)
+        .expect("run_frame_drain must exist — it is the ring's only consumer");
+    let rest = &STACK_SRC[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("run_frame_drain must be closed by a top-level brace");
+    rest[..end]
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
