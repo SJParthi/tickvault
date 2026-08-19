@@ -241,10 +241,35 @@ pub struct ContractSelection {
     pub index_options: usize,
     /// Stock options selected (current expiry, ATM window both legs).
     pub stock_options: usize,
-    /// The ATM half-window actually used. Below
+    /// The ATM half-window actually APPLIED to at least one ladder. Below
     /// [`STOCK_OPTION_ATM_STRIKES_EACH_SIDE`] means the envelope forced a
     /// shrink — the operator asked for 25 and got this.
+    ///
+    /// **0 means no window was applied to anything.** Read it with
+    /// [`Self::atm_window_reason`], which names WHY — a window of 0 from a
+    /// full envelope and a window of 0 from an empty ladder set are different
+    /// failures with different remedies.
+    ///
+    /// CORRECTED 2026-08-19: this reported **25 while zero stock options were
+    /// selected** whenever the ladder set came back empty. The same run's
+    /// boot line then read `stock_options = 0, atm_window = 25` — a number
+    /// describing a window that had been applied to nothing. That is the
+    /// false-success shape this file's own header documents at the
+    /// segment-parse layer; the parse was repaired and this, the layer that
+    /// PRINTS the claim, was not.
     pub atm_window_used: usize,
+    /// Why [`Self::atm_window_used`] holds the value it does.
+    ///
+    /// `"applied"` — a real window was applied to at least one ladder.
+    /// `"no_room"` — ladders existed and not even the at-the-money strike fit.
+    /// `"no_ladders"` — there was nothing to apply a window to: no stock had
+    /// a live spot price, so no ladder was built. On a pre-open attach this is
+    /// NORMAL (no tick has landed yet); mid-session it means the price source
+    /// is unreachable and every stock option is silently absent.
+    ///
+    /// `&'static str`, so using it as a metric label takes the non-allocating
+    /// arm of the `metrics!` macros.
+    pub atm_window_reason: &'static str,
     /// Underlyings whose options were REFUSED because no live spot price was
     /// available to locate at-the-money. Never guessed.
     pub underlyings_without_spot: usize,
@@ -335,8 +360,12 @@ pub fn select_contract_universe(
     today_ymd: u32,
     capacity: usize,
 ) -> ContractSelection {
+    // Starts at "nothing applied", NOT at the operator's requested 25. A
+    // field that defaults to the number the operator asked for reports success
+    // for every path that never reaches the stock-option pass.
     let mut out = ContractSelection {
-        atm_window_used: STOCK_OPTION_ATM_STRIKES_EACH_SIDE,
+        atm_window_used: 0,
+        atm_window_reason: "no_ladders",
         ..ContractSelection::default()
     };
 
@@ -471,6 +500,7 @@ pub fn select_contract_universe(
     match fit_atm_window(&ladders, remaining) {
         Some(window) => {
             out.atm_window_used = window;
+            out.atm_window_reason = "applied";
             for ladder in &ladders {
                 for c in ladder.within(window) {
                     match push_contract(c, capacity, &mut chosen, &mut picked) {
@@ -488,6 +518,15 @@ pub fn select_contract_universe(
         // we subscribed nothing.
         None => {
             out.atm_window_used = 0;
+            // The two ways to reach zero are NOT the same failure. Ladders
+            // present but unaffordable is a capacity problem; no ladders at
+            // all is a price-source problem, and the remedies are opposite
+            // (shrink the universe vs. fix the feed).
+            out.atm_window_reason = if ladders.is_empty() {
+                "no_ladders"
+            } else {
+                "no_room"
+            };
             // Counts the FULL ask — what a window of 25 would have taken —
             // not the minimum viable one. The operator asked for ATM ± 25;
             // reporting only the two at-the-money contracts as "dropped"
@@ -701,8 +740,15 @@ fn build_ladders<'a>(
 /// contracts. Collapsing the two would report "we took the money" when the
 /// envelope had no room for anything at all.
 fn fit_atm_window(ladders: &[Ladder<'_>], remaining: usize) -> Option<usize> {
+    // No ladders means no stock had a live spot price, so there is nothing to
+    // fit a window AROUND. Until 2026-08-19 this returned
+    // `Some(STOCK_OPTION_ATM_STRIKES_EACH_SIDE)` — the operator's requested
+    // 25 — and the caller then recorded 25 as the window "used" while pushing
+    // zero contracts. `None` is the honest answer: no window was applied. The
+    // caller separates this from the no-room case by asking `is_empty()`
+    // itself, so the two remain distinguishable in the report.
     if ladders.is_empty() {
-        return Some(STOCK_OPTION_ATM_STRIKES_EACH_SIDE);
+        return None;
     }
     let total = |w: usize| -> usize {
         ladders
@@ -938,6 +984,7 @@ pub async fn load_contract_universe(
         index_options = selection.index_options,
         stock_options = selection.stock_options,
         atm_window = selection.atm_window_used,
+        atm_window_reason = selection.atm_window_reason,
         without_spot = selection.underlyings_without_spot,
         dropped_for_capacity = selection.dropped_for_capacity,
         "contract universe resolved"
@@ -1240,6 +1287,51 @@ mod tests {
             sel.instruments.is_empty(),
             "a guessed at-the-money is a plausible-looking window centred on nothing"
         );
+        // THE REGRESSION. Until 2026-08-19 this line read 25: `fit_atm_window`
+        // short-circuited on the empty ladder set and returned the operator's
+        // requested window, so the boot line printed `stock_options = 0,
+        // atm_window = 25` — a window applied to nothing, reported as the
+        // number the operator asked for. The test above already exercised this
+        // exact state and simply never looked at the field.
+        assert_eq!(
+            sel.atm_window_used, 0,
+            "no window was applied to anything — reporting 25 here claims the \
+             operator received ATM +/- 25 while zero contracts were selected"
+        );
+        assert_eq!(
+            sel.atm_window_reason, "no_ladders",
+            "the REASON must name the price source, not the envelope — the \
+             remedies are opposite"
+        );
+    }
+
+    #[test]
+    fn an_empty_master_reports_no_window_rather_than_the_requested_one() {
+        // The cheapest live path to the bug: QuestDB slow, unreachable, or
+        // simply pre-open (no tick has landed yet, so `ticks` legitimately has
+        // no rows for today). `fetch_spot_prices` degrades to an empty map,
+        // every stock becomes "no spot", and the ladder set is empty.
+        let sel = select_contract_universe(&[], &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.atm_window_used, 0);
+        assert_eq!(sel.atm_window_reason, "no_ladders");
+        assert_eq!(
+            sel.dropped_for_capacity, 0,
+            "nothing was dropped for capacity — there was nothing to drop, and \
+             saying otherwise would send the operator to shrink a universe that \
+             is not the problem"
+        );
+    }
+
+    #[test]
+    fn atm_window_reason_is_applied_only_when_a_window_really_was() {
+        let rows = stock_ladder("RELIANCE");
+        let mut prices = HashMap::new();
+        prices.insert("RELIANCE".to_string(), 1_000_00i64);
+        let sel = select_contract_universe(&rows, &prices, TODAY, 25_000);
+        assert!(sel.stock_options > 0, "the fixture must actually select");
+        assert_eq!(sel.atm_window_reason, "applied");
+        assert_eq!(sel.atm_window_used, STOCK_OPTION_ATM_STRIKES_EACH_SIDE);
     }
 
     #[test]
@@ -1355,6 +1447,10 @@ mod tests {
         // indistinguishable from one where the master had no options.
         assert_eq!(sel.dropped_for_capacity, 102);
         assert_eq!(sel.atm_window_used, 0, "no window was usable");
+        assert_eq!(
+            sel.atm_window_reason, "no_room",
+            "ladders existed, none fit"
+        );
     }
 
     #[test]
