@@ -442,7 +442,11 @@ resource "aws_cloudwatch_metric_alarm" "dhan_wal_dropped" {
 # real increment is never swallowed as the agent's missing baseline sample.
 resource "aws_cloudwatch_metric_alarm" "ticks_lost_spill" {
   alarm_name        = "tv-${var.environment}-ticks-lost-spill"
-  alarm_description = "Ticks were LOST AT THE SPILL WRITER and are gone for good. tv_ticks_lost_total counts frames the capture-at-receipt spill shed before they reached disk — either the spill channel was full (source=spill_drop_critical) or the spill writer task was dead (source=spill_writer_dead). Nothing downstream can recover them: there is no payload left to replay, no backfill that covers them, and the 15:31 cross-verification cannot see what was never captured. This is the same class as the wal-dropped alarm and is the LAST unwatched arm of the durable floor. WHAT TO DO: (1) check disk first — tv_spill_dir_free_bytes and the WS-SPILL-01 alarm, a full or read-only data volume is the most common cause and it usually fires first; (2) WS-SPILL-02 in /tickvault/<env>/app means the channel was full at the append instant, i.e. the writer could not keep up — check ILP flush latency and QuestDB health, which is what backs the writer up; (3) the coded WS-SPILL lines name the ws_type, so you can tell whether it was the live feed or the order-update socket. Frames lost during the window do NOT come back when the cause clears."
+  # NOTE: AWS caps alarm_description at 1024 characters. The long-form
+  # reasoning that used to live in this string is above; the description
+  # itself is the pager text and must stay under the cap. A terraform
+  # validate failure on 2026-08-19 is why this is stated here.
+  alarm_description = "Ticks LOST at the spill writer - unrecoverable. tv_ticks_lost_total counts frames the capture-at-receipt spill shed before reaching disk (source=spill_drop_critical: channel full; source=spill_writer_dead: writer task dead). No payload remains to replay and no backfill covers them. DO: (1) check disk - tv_spill_dir_free_bytes and the WS-SPILL-01 alarm; a full or read-only volume is the usual cause and usually fires first. (2) WS-SPILL-02 in /tickvault/<env>/app means the channel was full at append - check ILP flush latency and QuestDB health. (3) The coded WS-SPILL lines name ws_type (live feed vs order-update). Frames lost during the window do NOT come back when the cause clears."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
