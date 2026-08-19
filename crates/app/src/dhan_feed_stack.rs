@@ -117,8 +117,8 @@ use tickvault_core::websocket::pool_supervisor::{
     SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection,
 };
 use tickvault_storage::depth_persistence::{
-    DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow, DepthWriter,
-    depth_segment_label,
+    DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow,
+    DepthWriter, depth_segment_label,
 };
 use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
@@ -677,6 +677,15 @@ pub enum IngestOutcome {
 /// `TF_COUNT` scalar folds in the aggregator, one ILP row append. No heap
 /// allocation in steady state.
 pub struct LiveIngest {
+    /// Optional sink for the 5 depth levels that ride INLINE in every
+    /// Full-mode tick packet (2026-08-19).
+    ///
+    /// `None` unless `[dhan_feed] persist_full_mode_depth` is enabled, and
+    /// default-OFF deliberately — see that setting's documentation for the
+    /// volume arithmetic. Wiring it ON without deciding what happens to the
+    /// dedicated depth-20 pool ADDS storage rather than saving any; the saving
+    /// comes from the SWAP, which is an operator decision.
+    inline_depth: Option<DepthIngest>,
     detector: TickGapDetector,
     aggregator: MultiTfAggregator,
     writer: TickWriter,
@@ -719,11 +728,26 @@ pub struct LiveIngest {
 }
 
 impl LiveIngest {
+    /// Enables persistence of the 5 depth levels that ride inline in every
+    /// Full-mode tick packet.
+    ///
+    /// Builder rather than a constructor argument so every existing call site
+    /// keeps its current behaviour by construction — a change that silently
+    /// switched depth persistence on for all callers would be exactly the
+    /// wrong default for a path that writes hundreds of millions of rows a day.
+    #[must_use]
+    pub fn with_inline_depth(mut self, sink: DepthIngest) -> Self {
+        self.inline_depth = Some(sink);
+        self
+    }
+
     /// Builds the fold, pre-sized for `capacity` instruments so the slot table
     /// and the detector index never realloc mid-session.
     #[must_use]
     pub fn new(writer: TickWriter, capacity: usize) -> Self {
         Self {
+            // OFF unless explicitly enabled — see `with_inline_depth`.
+            inline_depth: None,
             detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
             aggregator: MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity),
             writer,
@@ -2660,7 +2684,31 @@ pub fn drain_main_feed_frame(
             return out;
         }
         match dispatch_frame(&frame.bytes[offset..end], received_at_nanos) {
-            Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _)) => {
+            Ok(parsed @ (ParsedFrame::Tick(_) | ParsedFrame::TickWithDepth(..))) => {
+                // Full mode carries 5 levels of bid/ask in EVERY tick packet.
+                // Until 2026-08-19 this arm bound them to `_` and threw them
+                // away — the lane paid 3.24x the bandwidth of Quote mode for a
+                // book it discarded, while separately storing 20 levels for a
+                // 250-instrument subset at ~506M rows/day.
+                //
+                // Gated, because turning it on is not free: at the 25,000
+                // target it is ~611M rows/day of its own. It is only a WIN
+                // alongside standing the dedicated depth-20 pool down, which
+                // trades 20 levels on 250 instruments for 5 levels on all
+                // 25,000 — less storage AND 100x the coverage. That swap is
+                // the operator's call, so this ships able but off.
+                if let (Some(sink), ParsedFrame::TickWithDepth(t, levels)) =
+                    (ingest.inline_depth.as_mut(), &parsed)
+                {
+                    out.inline_depth_rows = out
+                        .inline_depth_rows
+                        .saturating_add(append_inline_depth(sink, t, levels, received_at_nanos));
+                }
+                let tick = match parsed {
+                    ParsedFrame::Tick(t) | ParsedFrame::TickWithDepth(t, _) => t,
+                    // Unreachable: the match arm above admits only these two.
+                    _ => unreachable!("arm admits only Tick and TickWithDepth"),
+                };
                 // Delivery lag, per SOCKET. Recorded here because this is the
                 // only point where the exchange stamp, the receipt instant and
                 // the originating connection are all in hand.
@@ -2730,6 +2778,9 @@ pub struct FrameOutcome {
     pub folded: u64,
     /// Packets refused by the parser or by an unknown response code.
     pub unparseable: u64,
+    /// Depth rows appended from the 5 levels carried INLINE in Full-mode tick
+    /// packets. Zero unless `[dhan_feed] persist_full_mode_depth` is on.
+    pub inline_depth_rows: u64,
 }
 
 /// What one depth frame produced.
@@ -2829,6 +2880,97 @@ impl DepthIngest {
 /// known segment is refused rather than written under a guessed identity: a
 /// wrong segment writes the row against the wrong instrument (I-P1-11), which
 /// is worse than not writing it, and worse still because it looks like data.
+/// Appends the 5 depth levels carried inline in a Full-mode tick packet.
+///
+/// Returns the number of rows appended (10 per packet: 5 bid + 5 ask), so the
+/// drain can count what this path actually produced rather than inferring it.
+///
+/// # Why this is safe on the per-tick path
+///
+/// Ten `DepthRow` values built on the STACK and handed straight to the ILP
+/// writer. No `Vec`, no `String`, no per-row allocation — `segment` and the
+/// `d5`/`bid`/`ask` labels are all `&'static str`. Cost is the ILP append
+/// itself, which the dedicated depth pools already pay per level.
+///
+/// # Zero prices are WRITTEN, matching the dedicated drain
+///
+/// My first version skipped levels priced at zero, reasoning that a zero looks
+/// like a real bid at zero rupees. The dedicated depth drain does the opposite
+/// and documents why: depth is a FIXED level count, so an illiquid contract
+/// with three real bids still emits every level and the rest are legitimately
+/// all-zero — the documented absent-level sentinel. Refusing them would count
+/// normal book shape as corruption AND delete the operator's own
+/// show-me-everything view of how deep a book actually is.
+///
+/// Had `d5` skipped them, the same instrument would report 5 levels in one
+/// table and 3 in another for the same instant, and the difference would look
+/// like data loss rather than a convention mismatch. Negative and implausible
+/// prices ARE refused, exactly as they are there.
+fn append_inline_depth(
+    sink: &mut DepthIngest,
+    tick: &tickvault_common::tick_types::ParsedTick,
+    levels: &[tickvault_common::tick_types::MarketDepthLevel; 5],
+    received_at_nanos: i64,
+) -> u64 {
+    // Same posture as the dedicated depth drain: an unrecognised segment is
+    // REFUSED, never written under a placeholder. A row labelled "UNKNOWN"
+    // would silently merge distinct instruments under one segment value.
+    let Some(segment) = depth_segment_label(tick.exchange_segment_code) else {
+        return 0;
+    };
+    // A value above i64::MAX cannot be a real Dhan id. Refuse rather than
+    // saturate: saturating writes every such packet under one bogus id.
+    let Ok(security_id) = i64::try_from(tick.security_id) else {
+        return 0;
+    };
+    let mut rows = 0_u64;
+    for (idx, level) in levels.iter().enumerate() {
+        let level_no = i64::try_from(idx).unwrap_or(i64::MAX).saturating_add(1);
+        // capture_seq disambiguates rows sharing a timestamp. The two sides of
+        // one level are distinct observations, so they get distinct values.
+        let base_seq = level_no.saturating_mul(2);
+        let plausible = |p: f32| -> bool {
+            let p = f64::from(p);
+            p.is_finite() && p >= 0.0 && p <= f64::from(MAX_PLAUSIBLE_LTP)
+        };
+        if plausible(level.bid_price) {
+            let row = DepthRow {
+                security_id,
+                segment,
+                depth_kind: DEPTH_KIND_5,
+                side: DEPTH_SIDE_BID,
+                level: level_no,
+                price: f64::from(level.bid_price),
+                quantity: i64::from(level.bid_quantity),
+                orders: i64::from(level.bid_orders),
+                capture_seq: base_seq,
+                ts_nanos: received_at_nanos,
+            };
+            if sink.writer.append_row(&row).is_ok() {
+                rows = rows.saturating_add(1);
+            }
+        }
+        if plausible(level.ask_price) {
+            let row = DepthRow {
+                security_id,
+                segment,
+                depth_kind: DEPTH_KIND_5,
+                side: DEPTH_SIDE_ASK,
+                level: level_no,
+                price: f64::from(level.ask_price),
+                quantity: i64::from(level.ask_quantity),
+                orders: i64::from(level.ask_orders),
+                capture_seq: base_seq.saturating_add(1),
+                ts_nanos: received_at_nanos,
+            };
+            if sink.writer.append_row(&row).is_ok() {
+                rows = rows.saturating_add(1);
+            }
+        }
+    }
+    rows
+}
+
 fn drain_depth_frame(
     depth: &mut DepthIngest,
     frame: &CapturedFrame,
@@ -8079,6 +8221,100 @@ mod silence_latch_tests {
             "the risk-gap-03 alarm sends a recovery page. It cannot tell 'the \
              feed is healthy again' from 'one sparse contract traded once', so \
              an OK here reads as the first while meaning the second"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inline_depth_tests {
+    use super::*;
+
+    #[test]
+    fn with_inline_depth_is_off_by_default_and_the_builder_enables_it() {
+        // The default must stay OFF. At the 25,000 target this path writes
+        // ~611M rows/day; switching it on for every existing caller by
+        // accident is precisely the wrong default.
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        assert!(
+            ingest.inline_depth.is_none(),
+            "inline depth must be OFF by default"
+        );
+        let ingest = ingest.with_inline_depth(DepthIngest::for_test());
+        assert!(ingest.inline_depth.is_some(), "the builder must enable it");
+    }
+
+    #[test]
+    fn append_inline_depth_writes_both_sides_of_every_level() {
+        // 5 levels x 2 sides = 10 rows, and each side of a level gets its own
+        // capture_seq — they are distinct observations sharing a timestamp, so
+        // a shared seq would let the DEDUP key collapse them.
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+            bid_price: 100.5,
+            ask_price: 100.75,
+        }; 5];
+        let rows = append_inline_depth(&mut sink, &tick, &levels, 1_700_000_000_000_000_000);
+        assert_eq!(rows, 10, "5 levels x 2 sides");
+    }
+
+    #[test]
+    fn append_inline_depth_writes_zero_levels_but_refuses_negative() {
+        // Zero is the documented ABSENT-LEVEL sentinel and is written, matching
+        // the dedicated drain exactly — if d5 skipped them, the same instrument
+        // would report 5 levels in one table and fewer in another for the same
+        // instant, and that gap would read as data loss rather than a
+        // convention mismatch. A NEGATIVE price is impossible and is refused.
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let zero = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
+        assert_eq!(
+            append_inline_depth(&mut sink, &tick, &zero, 1),
+            10,
+            "zero-priced levels are the absent sentinel and MUST be written"
+        );
+
+        let mut neg = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
+        neg[0].bid_price = -1.0;
+        assert_eq!(
+            append_inline_depth(&mut sink, &tick, &neg, 1),
+            9,
+            "a negative price is impossible and must be refused"
+        );
+    }
+
+    #[test]
+    fn append_inline_depth_refuses_an_unknown_segment_rather_than_labelling_it() {
+        // Writing an unrecognised segment under a placeholder would silently
+        // merge distinct instruments under one label. Refuse, same as the
+        // dedicated drain.
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 250, // not a real segment
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            ..Default::default()
+        }; 5];
+        assert_eq!(
+            append_inline_depth(&mut sink, &tick, &levels, 1),
+            0,
+            "an unknown segment must produce NO rows"
         );
     }
 }
