@@ -450,7 +450,20 @@ fn stale_invocation_sites(files: &[(String, String)], allowlist: &[&str]) -> Vec
 // in what the scan LOOKED AT, not in what it banned.
 fn extract_spawn_literals(content: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for marker in ["Command::new(\"", ".arg(\""] {
+    // 2026-08-18 SCOPE FIX — WRAPPER FUNCTIONS (closes HONEST LIMIT 2's literal half).
+    //
+    // The marker set was `Command::new("` and `.arg("`, so a spawn routed through a
+    // helper was invisible even when the program name was a plain literal:
+    // `run_with_timeout("python3", ["-c", "…"])` contains NEITHER marker. That is
+    // not hypothetical — the wrapper already exists in the MCP crate and is called
+    // four times. An inline `-c` payload also dodges the file-extension ban AND the
+    // shebang fallback, so this was the one shape with no backstop at all.
+    //
+    // Listing the wrapper by name closes the literal form. A wrapper NOT listed here
+    // remains invisible — that residual is real and is why HONEST LIMIT 2 above stays
+    // on the record rather than being deleted. Adding a new wrapper is now a
+    // deliberate act, which is the most a string scan can honestly promise.
+    for marker in ["Command::new(\"", ".arg(\"", "run_with_timeout(\""] {
         let mut rest = content;
         while let Some(i) = rest.find(marker) {
             let after = &rest[i + marker.len()..];
@@ -1265,6 +1278,23 @@ fn guard_self_test() {
         "self-test: doc-comment prose must never false-positive (narrow-scan design)"
     );
 
+    // ---- SCOPE FIX (2026-08-18): spawn routed through a WRAPPER function.
+    //
+    // Both directions are asserted, and the second matters more than the first:
+    // the wrapper's four real callers pass `bash` / `git` / `docker` / `aws`, so a
+    // marker that fired on those would be deleted by the next reader as noise, and
+    // the hole would reopen permanently. A guard is only kept if it is quiet when
+    // it should be quiet.
+    assert_eq!(
+        rust_spawn_violations(&format!("let out = run_with_timeout(\"{t}3\", &args);")),
+        vec![format!("{t}3")],
+        "self-test: an interpreter spawned through the wrapper must be detected"
+    );
+    assert!(
+        rust_spawn_violations("let out = run_with_timeout(\"bash\", &args);").is_empty(),
+        "self-test: the wrapper's real callers must never false-positive"
+    );
+
     // ---- SCOPE FIX #5: inline-JavaScript counting + budget drift.
     let wf = "      - uses: actions/github-script@v7\n        with:\n          script: |\n            await x();\n";
     assert_eq!(count_github_script_uses(wf), 1);
@@ -1312,5 +1342,229 @@ fn guard_self_test() {
         stale_invocation_sites(&files, &site_allow),
         vec!["scripts/went_clean.sh".to_string()],
         "self-test: a cleaned/deleted site entry must be detected as stale"
+    );
+}
+
+// ============================================================================
+// SCOPE FIX (2026-08-18) — the two surfaces the 2026-08-14 audit left UNDEFINED
+// ============================================================================
+//
+// That audit closed four holes and RECORDED two it did not close. Recording a
+// hole is honest, but it is not a control: both stayed invisible to every gate,
+// so a new instance of either would land with no signal at all.
+//
+// Neither is made impossible here — a string scan cannot resolve a variable, and
+// vendor CI actions are genuinely not our source. What changes is the failure
+// mode: an UNDEFINED surface grows silently, a PINNED one fails the build. That
+// is the whole of the claim, and it is deliberately smaller than "fixed".
+
+/// Spawns whose program name is a VARIABLE — `Command::new(program)`.
+///
+/// HONEST LIMIT 1 explains why these cannot be resolved statically. What CAN be
+/// done is deny them room to multiply: the exact count per file is pinned, so a
+/// NEW variable-spawn site fails the build and has to be argued for in review.
+/// The six that exist launch operator tooling (docker / git / aws CLIs).
+const NON_LITERAL_SPAWN_BUDGET: &[(&str, usize)] = &[
+    ("crates/app/src/bin/tv_doctor.rs", 1),
+    ("crates/app/src/infra.rs", 4),
+    ("crates/tickvault-logs-mcp/src/tools.rs", 1),
+];
+
+/// Third-party GitHub Actions — every one a `node20` JavaScript runtime.
+///
+/// These run in CI, not in the product, and they are vendor code rather than
+/// ours, which is why the rust-only lock never banned them. But "not banned" had
+/// quietly become "not looked at". Pinning the SET — never the version, since
+/// tags and SHAs rotate legitimately — means a NEW vendor runtime entering CI
+/// fails the build instead of arriving unannounced.
+const CI_ACTION_ALLOWLIST: &[&str] = &[
+    "Swatinem/rust-cache",
+    "actions/cache",
+    "actions/cache/restore",
+    "actions/cache/save",
+    "actions/checkout",
+    "actions/download-artifact",
+    "actions/github-script",
+    "actions/upload-artifact",
+    "anthropics/claude-code-action",
+    "aws-actions/configure-aws-credentials",
+    "dtolnay/rust-toolchain",
+    "hashicorp/setup-terraform",
+    "peter-evans/create-pull-request",
+    "taiki-e/install-action",
+];
+
+/// Count `Command::new(<not a quote>)` — i.e. a variable program name.
+/// Comment lines are excluded so prose describing the shape never counts.
+fn non_literal_spawn_count(content: &str) -> usize {
+    const M: &str = "Command::new(";
+    content
+        .lines()
+        // `is_comment_line` is the SHELL/YAML `#` form and is wrong here — this
+        // scans Rust. Using it silently counted every `///` line that merely
+        // DESCRIBES the shape. Caught by this module's own self-test.
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .map(|line| {
+            let mut n = 0usize;
+            let mut rest = line;
+            while let Some(i) = rest.find(M) {
+                let after = &rest[i + M.len()..];
+                // A quote means the program is a LITERAL, already covered by the
+                // spawn scan. The BACKSLASH-escaped form matters just as much: a
+                // guard file carries `"Command::new(\""` as its own scan marker,
+                // and reading that as a variable spawn would make every scanner
+                // in this repo look like a violation.
+                if !(after.starts_with('"') || after.starts_with("\\\"")) {
+                    n += 1;
+                }
+                rest = after;
+            }
+            n
+        })
+        .sum()
+}
+
+/// Action names referenced by `uses:`, with the version/SHA stripped.
+/// Local (`./…`) and container (`docker://…`) steps are not vendor runtimes.
+fn ci_action_names(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if is_comment_line(trimmed) {
+            continue;
+        }
+        // Both real YAML forms must count: `- uses: foo@v1` (the step's first
+        // key, so it carries the list dash) and a bare `uses:` (the step began
+        // with `- name:`). Handling only the second silently under-counts, and
+        // an under-counting allowlist is worse than none — it reads as full
+        // coverage while a whole syntax form walks past it.
+        let trimmed = trimmed
+            .strip_prefix("- ")
+            .map_or(trimmed, |rest| rest.trim_start());
+        let Some(value) = trimmed.strip_prefix("uses:") else {
+            continue;
+        };
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        if value.is_empty() || value.starts_with("./") || value.starts_with("docker://") {
+            continue;
+        }
+        out.push(value.split('@').next().unwrap_or(value).to_string());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+#[test]
+fn non_literal_spawn_sites_only_shrink() {
+    let root = repo_root();
+    let mut counted: Vec<(String, usize)> = Vec::new();
+    for path in git_ls_files(&["*.rs"]) {
+        // PRODUCTION source only. Test files legitimately carry this shape as
+        // DATA: scan markers in string literals, and raw-string fixtures like
+        // `r#"Command::new(program)"#` that exist precisely to prove a scanner
+        // ignores non-literals. Counting those would make the guards themselves
+        // the repo's top violators and turn this budget into noise — and a
+        // budget that reads as noise is one the next reader deletes.
+        if !path.contains("/src/") {
+            continue;
+        }
+        let content = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+        let n = non_literal_spawn_count(&content);
+        if n > 0 || NON_LITERAL_SPAWN_BUDGET.iter().any(|(p, _)| *p == path) {
+            counted.push((path, n));
+        }
+    }
+    let (over, under) = github_script_budget_drift(&counted, NON_LITERAL_SPAWN_BUDGET);
+    assert!(
+        over.is_empty(),
+        "RUST-ONLY VIOLATION: a NEW variable-program spawn site appeared {over:?} as \
+         (path, actual, budget). A spawn through a variable cannot be checked by any \
+         string scan — it is exactly the shape that can launch another runtime \
+         unseen. Prefer a literal program name; if the variable is unavoidable, \
+         validate it against an allowlist AT THE CALL SITE and raise this budget in \
+         the same PR with that justification."
+    );
+    assert!(
+        under.is_empty(),
+        "STALE BUDGET: fewer variable-program spawns than pinned {under:?} as \
+         (path, actual, budget). Good news — lower NON_LITERAL_SPAWN_BUDGET in the \
+         same PR so the ratchet keeps its grip."
+    );
+}
+
+#[test]
+fn ci_actions_are_pinned_to_the_allowlist() {
+    assert_sorted_unique(CI_ACTION_ALLOWLIST, "CI_ACTION_ALLOWLIST");
+    let root = repo_root();
+    let mut seen: Vec<String> = Vec::new();
+    for path in git_ls_files(&[".github/workflows/*.yml", ".github/workflows/*.yaml"]) {
+        let content = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+        seen.extend(ci_action_names(&content));
+    }
+    seen.sort();
+    seen.dedup();
+
+    let added: Vec<&String> = seen
+        .iter()
+        .filter(|a| !CI_ACTION_ALLOWLIST.contains(&a.as_str()))
+        .collect();
+    assert!(
+        added.is_empty(),
+        "NEW third-party CI action(s) {added:?}. Every one is a JavaScript (node20) \
+         runtime executing in our CI with access to the checkout and to secrets. \
+         Adding one is a supply-chain decision, not a workflow detail: pin it to a \
+         full commit SHA rather than a moving tag, then add its NAME here."
+    );
+
+    let stale: Vec<&&str> = CI_ACTION_ALLOWLIST
+        .iter()
+        .filter(|a| !seen.iter().any(|s| s.as_str() == **a))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "STALE ALLOWLIST: pinned CI action(s) no longer used anywhere {stale:?}. \
+         Remove them in the same PR — an allowlist that outlives its entries \
+         silently re-opens room for a vendor runtime to return unnoticed."
+    );
+}
+
+#[test]
+fn scope_fix_2026_08_18_self_test() {
+    // Variable-program detection: the whole point is telling the two apart.
+    assert_eq!(
+        non_literal_spawn_count("let c = Command::new(program);"),
+        1,
+        "self-test: a variable program name must count"
+    );
+    assert_eq!(
+        non_literal_spawn_count("let c = Command::new(\"git\");"),
+        0,
+        "self-test: a literal program name must NOT count — it is already covered"
+    );
+    assert_eq!(
+        non_literal_spawn_count("// we could use Command::new(program) here"),
+        0,
+        "self-test: prose describing the shape must never count"
+    );
+
+    // CI action extraction.
+    assert_eq!(
+        ci_action_names("      - uses: actions/checkout@v7.0.1\n"),
+        vec!["actions/checkout".to_string()],
+        "self-test: the version must be stripped so SHA rotation is not a failure"
+    );
+    assert_eq!(
+        ci_action_names("      - uses: actions/checkout@3d3c42e5aac5\n"),
+        vec!["actions/checkout".to_string()],
+        "self-test: a SHA pin must resolve to the same NAME as a tag pin"
+    );
+    assert!(
+        ci_action_names("      - uses: ./.github/actions/local\n").is_empty(),
+        "self-test: a local composite action is our own code, not a vendor runtime"
+    );
+    assert!(
+        ci_action_names("      # uses: evil/action@v1\n").is_empty(),
+        "self-test: a commented-out action must never count"
     );
 }
