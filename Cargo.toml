@@ -24,11 +24,11 @@ license = "MIT"
 # Run `bash .claude/hooks/dep-freshness-scanner.sh` to check for drift.
 
 # ---- Section 2: Backend Core — Async Runtime ----
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "=1.53.1", features = ["full"] }
 
 # ---- Section 2: Backend Core — WebSocket ----
-tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
-futures-util = "0.3.32"
+tokio-tungstenite = { version = "=0.29.0", features = ["rustls-tls-native-roots"] }
+futures-util = "=0.3.34"
 
 # ---- Section 2: Backend Core — Zero-Copy Parsing ----
 # zerocopy removed 2026-06-10 (operator-approved dead-pin cleanup): declared
@@ -36,9 +36,9 @@ futures-util = "0.3.32"
 # from_le_bytes reads, never the zerocopy derive machinery.
 
 # ---- Section 3: Data Pipeline ----
-papaya = "0.2.4"
-crossbeam-channel = "0.5.15"
-rtrb = "0.3.4"
+papaya = "=0.2.4"
+crossbeam-channel = "=0.5.16"
+rtrb = "=0.3.4"
 # ringbuf removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers — hot-path ring buffers use rtrb + crossbeam-channel.
 # Wave 6 Sub-PR #1 (2026-05-10): per-cell mutex for the multi-TF
@@ -49,47 +49,47 @@ rtrb = "0.3.4"
 # spin-lock internally anyway. parking_lot::Mutex is ~30ns uncontended,
 # never poisons, and is already present transitively via tokio /
 # tokio-tungstenite.
-parking_lot = "0.12.5"
+parking_lot = "=0.12.5"
 
 # ---- Section 4: Database ----
 # Valkey/redis was removed in #O4 (2026-05-24). Dual-instance lock
 # lives in AWS SSM (PR #764); token-cache crash recovery is file-based
 # (`crates/core/src/auth/token_cache.rs`). No remaining production
 # caller needs an in-memory KV store.
-questdb-rs = { version = "6.1.0", features = ["chrono_timestamp"] }
+questdb-rs = { version = "=6.1.0", features = ["chrono_timestamp"] }
 
 # ---- Section 5: Observability — Metrics ----
-metrics = "0.24.6"
-metrics-exporter-prometheus = "0.18.3"
-quanta = "0.12.6"
+metrics = "=0.24.6"
+metrics-exporter-prometheus = "=0.18.3"
+quanta = "=0.12.6"
 
 # ---- Section 5: Observability — OpenTelemetry ----
 # The 4 otel crates are a MATCHED SET: tracing-opentelemetry 0.33.0 depends on
 # opentelemetry/opentelemetry_sdk/opentelemetry-otlp ^0.32. Bump all 4 together
 # or none (single-crate bumps split the dependency tree and fail to compile —
 # see .claude/plans/research/dep-decisions.md §1, dependabot PR #938 post-mortem).
-opentelemetry = "0.32.0"
-opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
+opentelemetry = "=0.32.0"
+opentelemetry_sdk = { version = "=0.32.1", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "=0.32.0", features = ["grpc-tonic"] }
 
 # ---- Section 5: Observability — Tracing ----
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
-tracing-opentelemetry = "0.33.0"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["json", "env-filter"] }
+tracing-opentelemetry = "=0.33.0"
 # Phase 2 of plans/active-plan.md: hourly-rotated ERROR-only JSONL stream
 # at data/logs/errors.jsonl so Claude Code / Loki / summary_writer can tail
 # a structured, append-only file instead of parsing journald prose.
-tracing-appender = "0.2.5"
+tracing-appender = "=0.2.5"
 
 # ---- Section 6: Trading Domain — Auth ----
 # jsonwebtoken removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers anywhere in the repo — the Dhan JWT is handled as an opaque
 # Secret<String>, never decoded locally.
-arc-swap = "1.9.1"
+arc-swap = "=1.9.2"
 totp-rs = { version = "=6.0.0", features = ["otpauth"] }
 
 # ---- Section 6: Trading Domain — OMS & Risk ----
-governor = "0.10.4"
+governor = "=0.10.4"
 
 # ---- Section 7: HTTP Client ----
 # reqwest 0.13: features that were "default" in 0.12 are now opt-in. We
@@ -97,30 +97,30 @@ governor = "0.10.4"
 # policy on this project) and explicitly enable: json (REST payloads),
 # rustls (TLS — was `rustls-tls` in 0.12), charset (Response::text() decoder),
 # http2 (Dhan REST uses HTTP/2), query (RequestBuilder::query for QuestDB ILP).
-reqwest = { version = "0.13.4", features = ["json", "rustls", "charset", "http2", "query"], default-features = false }
+reqwest = { version = "=0.13.4", features = ["json", "rustls", "charset", "http2", "query"], default-features = false }
 
 # ---- Section 8: HTTP Server ----
-axum = { version = "0.8.9", features = ["macros", "ws"] }
-tower = { version = "0.5.3", features = ["full"] }
-tower-http = { version = "0.6.11", features = ["cors", "trace", "compression-gzip", "fs"] }
+axum = { version = "=0.8.9", features = ["macros", "ws"] }
+tower = { version = "=0.5.3", features = ["full"] }
+tower-http = { version = "=0.6.11", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
-toml = "1.1.2"
-figment = { version = "0.10.19", features = ["toml", "env"] }
+toml = "=1.1.4"
+figment = { version = "=0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
-chrono = { version = "0.4.45", features = ["serde"] }
-chrono-tz = "0.10.4"
+chrono = { version = "=0.4.45", features = ["serde"] }
+chrono-tz = "=0.10.4"
 
 # ---- Section 11: Serialization & Errors ----
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-rkyv = { version = "0.8.16", features = ["std", "bytecheck"] }
-csv = "1.4.0"
-thiserror = "2.0.18"
-anyhow = "1.0.102"
-bytes = "1.11.1"
-sha2 = "0.11.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+rkyv = { version = "=0.8.18", features = ["std", "bytecheck"] }
+csv = "=1.4.0"
+thiserror = "=2.0.20"
+anyhow = "=1.0.104"
+bytes = "=1.12.1"
+sha2 = "=0.11.0"
 
 # ---- Section 12: System & Resilience ----
 # core_affinity REMOVED 2026-08-10 — declared since Wave 5 (2026-05-01) with
@@ -130,34 +130,34 @@ sha2 = "0.11.0"
 # and should NOT target core 0 — that core services network interrupts, so
 # pinning the decoder there puts it in contention with the softirq work it
 # depends on. See the dated correction in operator-charter-forever.md.
-memmap2 = "0.9.11"
-notify = "8.2.0"
+memmap2 = "=0.9.11"
+notify = "=8.2.0"
 # signal-hook-tokio removed in S11 — dead dep with zero references across
 # crates/ and fuzz/. signal-hook itself is kept because crates/app/Cargo.toml
 # declares it with { workspace = true } (via machete ignore list) for a
 # Windows-only code path we might enable later.
-signal-hook = "0.4.4"
-sd-notify = "0.5.0"
-ahash = "0.8.12"
-nohash-hasher = "0.2.0"
-arrayvec = "0.7.6"
+signal-hook = "=0.4.4"
+sd-notify = "=0.5.0"
+ahash = "=0.8.12"
+nohash-hasher = "=0.2.0"
+arrayvec = "=0.7.8"
 
 # ---- Section 14: Security & Secrets ----
-secrecy = { version = "0.10.3", features = ["serde"] }
-zeroize = { version = "1.8.2", features = ["derive"] }
+secrecy = { version = "=0.10.3", features = ["serde"] }
+zeroize = { version = "=1.9.0", features = ["derive"] }
 
 # ---- Section 14: TLS — Crypto Provider for rustls ----
 # Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
 # an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
-rustls = { version = "0.23.40", default-features = false, features = ["aws_lc_rs"] }
-rustls-native-certs = "0.8.4"
+rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs"] }
+rustls-native-certs = "=0.8.4"
 # 2026-07-04 (Groww native shadow client PR-R1, operator "go" this session):
 # promote aws-lc-rs from transitive (rustls already pulls it — Cargo.lock had
 # 1.17.0 resolved before this line existed) to a DIRECT dep for ed25519
 # session-keypair generation + NATS nonce signing in
 # crates/core/src/feed/groww/native/. No new supply-chain root — same crate,
 # same version the workspace already compiles.
-aws-lc-rs = "1.17.0"
+aws-lc-rs = "=1.18.0"
 
 # ---- Section 11: AWS SDK ----
 # 2026-05-23: opt out of each crate's legacy `rustls` feature (which pulls
@@ -166,9 +166,9 @@ aws-lc-rs = "1.17.0"
 # routes through `aws-smithy-http-client/rustls-aws-lc` (rustls 0.23 +
 # aws-lc-rs — already pinned by the workspace at line 136). Closes the 3
 # RUSTSEC advisories on the AWS chain without an upstream SDK release.
-aws-config = { version = "1.8.18", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
-aws-sdk-sns = { version = "1.103.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-sdk-ssm = { version = "1.112.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-config = { version = "=1.9.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-sns = { version = "=1.105.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "=1.116.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-07-12 (BruteX crossverify Commit 2, coordinator-approved): read-only
 # S3 GET/List of the BruteX-produced crossverify CSVs on tv-prod-cold.
 # 1.138.0 is the aws-sdk-s3 whose aws-smithy-* requirements (eventstream
@@ -222,14 +222,14 @@ aws-sdk-eventbridge = { version = "=1.110.0", default-features = false, features
 # Lambda runtime for the provided.al2023 bootstrap bins (tokio ^1.46 — the
 # workspace 1.52.3 pin satisfies it). cargo-lambda is a BUILD tool installed
 # in CI, never a dependency.
-lambda_runtime = "1.3.0"
+lambda_runtime = "=1.3.0"
 
 # ---- Section 11b: Compression (partition archive) ----
 # 2026-07-13: gzip encoder for the streamed QuestDB /exp CSV export before
 # S3 upload. NOT a new supply-chain root — flate2 1.1.9 was ALREADY resolved
 # in Cargo.lock (transitive via tower-http compression-gzip); this promotes
 # it to a direct pin — the aws-lc-rs promotion precedent above.
-flate2 = "1.1.9"
+flate2 = "=1.1.9"
 
 # ---- Section 11c: Regex (tickvault-logs-mcp grep_codebase) ----
 # 2026-07-18 (rust-only phase 2c): the Rust port of the tickvault-logs MCP
@@ -238,7 +238,7 @@ flate2 = "1.1.9"
 # resolved in Cargo.lock (transitive via criterion/proptest and others);
 # this promotes it to a direct pin — the aws-lc-rs / flate2 promotion
 # precedent above. Flagged in the PR body for operator visibility.
-regex = "1.12.3"
+regex = "=1.13.1"
 
 # ---- Section 11d: QuestDB-console Lambda pair (rust-only phase 2b-3) ----
 # 2026-07-18: the qdb-console-proxy / qdb-console-front handler.py ports
@@ -250,25 +250,25 @@ regex = "1.12.3"
 # form_urlencoded 1.2.2 via url/reqwest); this promotes them to direct
 # pins — the aws-lc-rs / flate2 / regex promotion precedent above.
 # Flagged in the PR body for operator visibility.
-base64 = "0.22.1"
-percent-encoding = "2.3.2"
-form_urlencoded = "1.2.2"
+base64 = "=0.22.1"
+percent-encoding = "=2.3.2"
+form_urlencoded = "=1.2.2"
 
 # ---- Section 16: CLI ----
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "=4.6.6", features = ["derive"] }
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "1.23.2", features = ["v4", "serde"] }
+uuid = { version = "=1.24.1", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
-teloxide = { version = "0.17.0", features = ["macros"] }
+teloxide = { version = "=0.17.0", features = ["macros"] }
 
 # ---- Section 13: Dev/Test Dependencies ----
-criterion = { version = "0.8.2", features = ["html_reports"] }
-proptest = "1.11.0"
-loom = "0.7.2"
-dhat = "0.3.3"
-tokio-test = "0.4.5"
+criterion = { version = "=0.8.2", features = ["html_reports"] }
+proptest = "=1.11.0"
+loom = "=0.7.2"
+dhat = "=0.3.3"
+tokio-test = "=0.4.5"
 
 # Build Profiles
 

@@ -48,9 +48,25 @@ tokio = { workspace = true }
 # rustls-webpki 0.101.7 also remains, pulled in by tokio-rustls 0.24.1
 # which is a deep AWS SDK transitive (aws-smithy-http-client 1.1.12).
 # Bumping the AWS SDK suite is a major change deferred to its own PR.
+# Each of the four below is a caret FLOOR, not a pin, and that is correct
+# here: the job is "at least the patched version". An `=` would freeze the
+# tree at today's fix and refuse the NEXT one, which is the opposite of what
+# a CVE remediation wants. The workspace-wide `=`-pin rule therefore does not
+# apply to them, and the marker below says so in a form the gate can read
+# rather than leaving a human to remember the distinction.
+#
+# Honest note (measured 2026-08-18): `aws-lc-rs` is ALSO declared in the root
+# manifest at `=1.18.0`, and Cargo.lock resolves 1.18.0. The floor here reads
+# 1.17.0, so it is satisfied and inert -- it constrains nothing today. Left at
+# the CVE-fix version deliberately: raising it to match the workspace pin
+# would couple a security floor to an unrelated upgrade decision.
+# SECURITY-FLOOR: AWS-LC X.509 Name Constraints Bypass + CRL scope check (HIGH)
 aws-lc-sys = "0.44.0"
+# SECURITY-FLOOR: transitive of aws-lc-sys; floor tracks the same advisories
 aws-lc-rs = "1.17.0"
+# SECURITY-FLOOR: CRLs-not-authoritative (Moderate) + name-constraints (Low x2)
 rustls-webpki = "0.103.13"
+# SECURITY-FLOOR: rand::rng() unsound with a custom logger (Low)
 rand = "0.10.1"
 
 [features]
