@@ -47,7 +47,7 @@
 //! the `data/dlq/` directory is unwritable.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
@@ -356,6 +356,51 @@ impl Default for SealDlqWriter {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Total bytes currently held in the DLQ directory.
+///
+/// # Why the DLQ is MEASURED and never pruned (2026-08-19)
+///
+/// The 2026-08-19 disk audit flagged `data/dlq/` alongside `data/spill/` as
+/// having no size cap. The spill directory got a retention sweep. This one
+/// deliberately does NOT, and the asymmetry is the point.
+///
+/// Spill holds seals awaiting replay — transient by design, and an aged file
+/// there means the replay path broke. The DLQ holds the last-resort record of
+/// seals that were LOST, in operator-readable NDJSON precisely so that after
+/// an incident someone can `cat | jq` and see exactly what went missing.
+/// Deleting it to reclaim disk would destroy the evidence it exists to
+/// preserve — the one directory on the box where automatic deletion is the
+/// wrong default.
+///
+/// Its growth is also self-limiting in a way spill's is not: nothing is
+/// written here in normal operation, so a growing DLQ IS the incident signal.
+/// Measuring it makes that signal observable; pruning it would erase it.
+///
+/// Exported as `tv_seal_dlq_bytes` so a rising DLQ is visible on the
+/// dashboard rather than discovered when the volume fills.
+#[must_use]
+pub fn dlq_bytes_at(dlq_dir: &Path) -> u64 {
+    // O(1) EXEMPT: periodic cold measurement, never the per-seal append
+    let Ok(entries) = std::fs::read_dir(dlq_dir) else {
+        return 0; // missing dir — nothing written yet, the healthy case
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("ndjson"))
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Measures the DLQ and publishes `tv_seal_dlq_bytes`. Cold path — called
+/// from the periodic retention loop alongside the spill sweep.
+// TEST-EXEMPT: thin gauge wrapper — byte accounting is covered by test_dlq_bytes_at_counts_only_ndjson_and_tolerates_a_missing_dir; this layer only publishes the metric.
+pub fn record_dlq_bytes(dlq_dir: &Path) -> u64 {
+    let bytes = dlq_bytes_at(dlq_dir);
+    metrics::gauge!("tv_seal_dlq_bytes").set(bytes as f64);
+    bytes
+}
 
 #[cfg(test)]
 mod tests {
@@ -775,5 +820,32 @@ mod tests {
             let _: SealDlqRecord = serde_json::from_str(line).expect("each line parses");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+    // ---- DLQ byte measurement (2026-08-19) --------------------------------
+
+    #[test]
+    fn test_dlq_bytes_at_counts_only_ndjson_and_tolerates_a_missing_dir() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("tv-dlq-bytes-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A directory that was never created is the HEALTHY case — nothing
+        // has ever been dead-lettered — and must read 0, not fail.
+        assert_eq!(dlq_bytes_at(&dir), 0, "missing dir is the healthy zero");
+
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert_eq!(dlq_bytes_at(&dir), 0, "empty dir is zero");
+
+        std::fs::write(dir.join("seals-2026-08-19.ndjson"), vec![0_u8; 700]).expect("w1");
+        std::fs::write(dir.join("seals-2026-08-18.ndjson"), vec![0_u8; 300]).expect("w2");
+        // A foreign file must not inflate the DLQ signal — a false "the DLQ
+        // is growing" reading would send an operator hunting a non-incident.
+        std::fs::write(dir.join("notes.txt"), vec![0_u8; 999_999]).expect("w3");
+
+        assert_eq!(dlq_bytes_at(&dir), 1000, "only .ndjson records count");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

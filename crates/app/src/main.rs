@@ -1354,6 +1354,15 @@ async fn async_main() -> Result<()> {
                 std::path::Path::new("data/spill"),
                 tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
             );
+            // The DLQ is MEASURED, never pruned — deliberately asymmetric
+            // with the spill sweep above. It holds the operator-readable
+            // record of seals that were LOST; deleting it to reclaim disk
+            // would destroy the evidence it exists to preserve. Nothing is
+            // written there in normal operation, so a growing DLQ IS the
+            // incident signal — publishing it makes that observable instead
+            // of something discovered when the volume fills.
+            let _dlq =
+                tickvault_storage::seal_dlq::record_dlq_bytes(std::path::Path::new("data/dlq"));
             tokio::time::sleep(Duration::from_secs(
                 tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
             ))
