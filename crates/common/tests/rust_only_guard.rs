@@ -185,6 +185,20 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path.ends_with(".xml")
         || path.ends_with(".alloy")
         || path.ends_with(".json")
+        // 2026-08-19 SCOPE FIX #8 — CONFIG FILES THAT CAN CARRY COMMANDS.
+        // `.conf` was structurally invisible: not an extension here, and
+        // config files carry no shebang so the first-line fallback misses
+        // them too. `deploy/aws/sysctl/99-tickvault-net.conf` is inert today
+        // (sysctl key=value only), but plenty of `.conf` formats — systemd
+        // units, supervisor, cron.d — take an executable command line, and
+        // "it happens to be inert right now" is not a scan boundary.
+        //
+        // `.service`/`.timer` are enumerated for the same reason: this repo
+        // SHIPS `deploy/systemd/tickvault.service`, whose ExecStart is a
+        // command line, and it was equally unscanned.
+        || path.ends_with(".conf")
+        || path.ends_with(".service")
+        || path.ends_with(".timer")
         // 2026-08-14 SCOPE FIX #7 — MAKE'S OTHER NAMES. The check was
         // `path == "Makefile" || path.ends_with("/Makefile")`, case-SENSITIVE
         // and single-name. GNU make's search order is `GNUmakefile`,

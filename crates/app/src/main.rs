@@ -1338,6 +1338,7 @@ async fn async_main() -> Result<()> {
             let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
+                tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
             );
             tokio::time::sleep(Duration::from_secs(
                 tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,

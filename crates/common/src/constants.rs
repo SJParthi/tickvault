@@ -3299,6 +3299,29 @@ pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// the real fix and is a separate change to the prune logic.
 pub const WS_WAL_ARCHIVE_RETENTION_SECS: u64 = 259_200;
 
+/// Byte ceiling on `<wal_dir>/archive/`, enforced oldest-first AFTER the age
+/// prune (2026-08-19 — the "FLAGGED, not fixed" follow-up above, now fixed).
+///
+/// An age bound alone scales linearly with traffic, so it bounds the archive
+/// only for the traffic level it was chosen against — which is precisely how
+/// the retention above went stale by ~30x without anything noticing. A byte
+/// bound holds regardless of what the market does.
+///
+/// 50 GB is a BACKSTOP, not the normal operating point. At today's live shape
+/// the archive runs ~8.5 GB/day, so 3 days is ~25 GB and this never engages.
+/// At the 25,000-instrument / 250-depth target it is ~19 GB/day = ~57 GB at
+/// 3 days, so the ceiling DOES engage there and shortens the effective window
+/// to ~2.6 days.
+///
+/// That is intended, and worth stating plainly rather than treating as a bug
+/// to tune away: when the disk cannot hold the configured window, something
+/// has to give, and dropping the OLDEST triage copy is strictly better than
+/// filling the volume and stopping every table on the box. The engagement is
+/// counted (`size_deleted`) and logged, never silent — so "the ceiling is
+/// biting" is an observable state that says the age window needs re-deriving
+/// against measured traffic.
+pub const WS_WAL_ARCHIVE_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+
 /// Cadence of the WAL archive prune task (6 hours in seconds).
 pub const WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS: u64 = 6 * 3600;
 
