@@ -37,6 +37,7 @@ pub mod feed_health;
 // Dead-code batch 2 (2026-07-18): `feed_parity` DELETED — the CANCELLED
 // §33.2 Groww live-vs-backtest 1m comparer (zero refs; NOT the index_futures
 // FUTIDX-02 seam, which stands). `formulas` DELETED — only ref was this decl.
+pub mod ingest_shed;
 pub mod instrument_registry;
 pub mod instrument_types;
 pub mod live_bar_freshness;

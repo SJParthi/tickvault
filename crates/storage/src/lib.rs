@@ -159,6 +159,7 @@ pub mod resource_monitor;
 // suspended table (post disk-full / apply error) silently stops applying
 // ILP-ACKed rows; this is the ONLY probe that sees it (boot probe +
 // questdb_health check reachability/connection, not per-table apply).
+pub mod wal_auto_resume;
 pub mod wal_suspension_watcher;
 // Sub-PR #10b-ε (2026-05-27): instrument_fetch_audit table contract —
 // schema constants + DEDUP key + FetchOutcome enum. Feature-gated under

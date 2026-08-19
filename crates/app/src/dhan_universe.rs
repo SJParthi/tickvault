@@ -341,6 +341,64 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
         "instrument master parsed"
     );
 
+    // 1b. The derivative subset, written for the contract attach.
+    //
+    // Written HERE, while the parsed master is still in hand, because it is
+    // dropped a few lines below and the attach runs much later — it waits for
+    // live prices to locate at-the-money. Without this the attach would have
+    // to re-download the same ~15 MB file in the minutes after the open.
+    //
+    // NON-FATAL by construction: a failure here costs the session its
+    // contracts and leaves the spot universe untouched, so it must never
+    // abort the mapping build that the whole rider exists for.
+    let contract_rows = crate::dhan_contract_universe::contract_rows_from_master(&master);
+    match crate::dhan_contract_universe::write_contract_artifact(date, &contract_rows) {
+        Ok(()) => info!(
+            source = "dhan_master",
+            contracts = contract_rows.len(),
+            "contract artifact written"
+        ),
+        Err(err) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            %err,
+            date,
+            "contract artifact could NOT be written — the live lane will carry its spot \
+             universe only, with no futures and no option contracts, until this is fixed. \
+             The mapping build below is unaffected."
+        ),
+    }
+
+    // 1c. The never-delete lifecycle record.
+    //
+    // Operator directive 2026-08-19: an expired instrument is MARKED expired,
+    // never removed, so the table answers "was this tradeable on that day?"
+    // for every instrument that has ever existed.
+    //
+    // NON-FATAL, like the artifact above: the mapping build is what the rider
+    // exists for, and a lifecycle write that fails must not cost the day its
+    // universe. It also runs AFTER the artifact so a failure here cannot stop
+    // the live lane getting its contracts.
+    let today_ymd = crate::dhan_feed_stack::ymd_from_ist_date(date);
+    let today_nanos = ist_midnight_nanos(date);
+    match crate::dhan_lifecycle::write_dhan_lifecycle(questdb, &master, today_ymd, today_nanos, "")
+        .await
+    {
+        Ok(tally) => info!(
+            active = tally.active,
+            expired_by_date = tally.expired_by_date,
+            expired_by_absence = tally.expired_by_absence,
+            "instrument lifecycle recorded"
+        ),
+        Err(err) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            %err,
+            date,
+            "instrument lifecycle could NOT be written — nothing was deleted (the table is \
+             append-and-upsert only), but today's expiry marks are missing, so a query \
+             asking which instruments were tradeable today will read yesterday's answer."
+        ),
+    }
+
     // 2. Every NSE India index list. A single list failing does NOT abort the
     // day: the tolerance gate below judges the RESULT, so one flaky index out
     // of ~49 degrades the fraction rather than losing the other 48. Aborting

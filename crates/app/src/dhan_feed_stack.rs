@@ -94,6 +94,7 @@ use tickvault_common::constants::{
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
+use tickvault_common::ingest_shed::INGEST_SHED;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::auth::token_manager::global_token_manager;
@@ -1586,6 +1587,14 @@ pub struct DrainCounters {
     /// more serious signal.
     depth_flush_failed: metrics::Counter,
     depth_unconsumed: metrics::Counter,
+    /// Depth frames and inline-depth packets DROPPED because the ingest-shed
+    /// gate is closed (`tickvault_common::ingest_shed`). Separate from every
+    /// other depth counter on purpose: these rows were not refused as bad, and
+    /// nothing failed — the box deliberately stopped writing them to stay
+    /// alive on a full disk, and reading that as corruption would send an
+    /// operator hunting a bug that does not exist.
+    shed_inline_depth: metrics::Counter,
+    shed_dedicated_depth: metrics::Counter,
     depth_rows: metrics::Counter,
     depth_refused: metrics::Counter,
     depth_dropped: metrics::Counter,
@@ -1645,6 +1654,8 @@ pub fn counters() -> &'static DrainCounters {
         flush_failed: metrics::counter!(FLUSH_COUNTER, "outcome" => "failed"),
         depth_flush_failed: metrics::counter!(FLUSH_COUNTER, "outcome" => "depth_failed"),
         depth_unconsumed: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "depth_unconsumed"),
+        shed_inline_depth: metrics::counter!(DEPTH_COUNTER, "outcome" => "shed_inline"),
+        shed_dedicated_depth: metrics::counter!(DEPTH_COUNTER, "outcome" => "shed_dedicated"),
         depth_rows: metrics::counter!(DEPTH_COUNTER, "outcome" => "rows"),
         depth_refused: metrics::counter!(DEPTH_COUNTER, "outcome" => "refused"),
         depth_dropped: metrics::counter!(DEPTH_COUNTER, "outcome" => "dropped"),
@@ -2303,6 +2314,15 @@ async fn run_frame_drain(
                             DepthFeedKind::TwoHundred
                         };
                         match depth_ingest.as_mut() {
+                            // The ingest-shed gate, read here rather than
+                            // inside `drain_depth_frame`, so a shed frame
+                            // costs one relaxed atomic load and NOT a parse.
+                            // The frame is already durable in the WAL by this
+                            // point — shedding drops the DATABASE write, never
+                            // the capture.
+                            Some(_) if !INGEST_SHED.allows_dedicated_depth() => {
+                                c.shed_dedicated_depth.increment(1);
+                            }
                             Some(depth) => {
                                 let outcome = drain_depth_frame(
                                     depth, &frame, received_at_nanos, kind, c,
@@ -2727,12 +2747,23 @@ pub fn drain_main_feed_frame(
                 // trades 20 levels on 250 instruments for 5 levels on all
                 // 25,000 — less storage AND 100x the coverage. That swap is
                 // the operator's call, so this ships able but off.
+                //
+                // The ingest-shed gate is consulted FIRST and cheaply: one
+                // relaxed atomic load, before the sink is even taken. Inline
+                // depth is the first thing shed on a filling disk because it
+                // is the widest and most redundant — 10 rows per packet across
+                // the whole universe, on instruments the dedicated feeds
+                // already cover more deeply. The tick itself is NEVER shed.
                 if let (Some(sink), ParsedFrame::TickWithDepth(t, levels)) =
                     (ingest.inline_depth.as_mut(), &parsed)
                 {
-                    out.inline_depth_rows = out
-                        .inline_depth_rows
-                        .saturating_add(append_inline_depth(sink, t, levels, received_at_nanos));
+                    if INGEST_SHED.allows_inline_depth() {
+                        out.inline_depth_rows = out.inline_depth_rows.saturating_add(
+                            append_inline_depth(sink, t, levels, received_at_nanos),
+                        );
+                    } else {
+                        c.shed_inline_depth.increment(1);
+                    }
                 }
                 let tick = match parsed {
                     ParsedFrame::Tick(t) | ParsedFrame::TickWithDepth(t, _) => t,
@@ -3809,6 +3840,60 @@ fn ist_second_of_day_now() -> u32 {
 ///
 /// Fail-CLOSED and LOUD at the deadline: zero depth sockets with a coded error
 /// naming the reason, never a silent session that looks configured.
+/// Main-feed instrument slots still free after the spot universe.
+///
+/// Expressed in whole CONNECTIONS rather than instruments, because that is the
+/// unit the pool actually allocates. The spot universe is ~4,565 instruments,
+/// which is one connection carrying 4,565 of its 5,000 — so 435 slots on that
+/// socket are unreachable to a second planning pass, and pretending otherwise
+/// would size a contract set that needs a sixth connection the lock forbids.
+///
+/// Returns 0 when the spot universe already used every connection: the correct
+/// answer is then "no contracts", not "squeeze them in somewhere".
+#[must_use]
+fn remaining_main_feed_capacity(connections_used: usize) -> usize {
+    let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
+    let per_connection = usize::try_from(
+        tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
+    )
+    .unwrap_or(usize::MAX);
+    max.saturating_sub(connections_used)
+        .saturating_mul(per_connection)
+}
+
+/// Main-feed connections a set of `instruments` occupies.
+#[must_use]
+fn main_feed_connections_for(instruments: usize) -> usize {
+    let per_connection = usize::try_from(
+        tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    instruments.div_ceil(per_connection)
+}
+
+/// Packs an IST `YYYY-MM-DD` date into the `YYYYMMDD` form contract selection
+/// compares expiries against.
+///
+/// Returns 0 on a malformed date, which selects NO contract — every expiry
+/// compares as "before today". That is the fail-closed direction: a garbled
+/// date must not subscribe an expired contract, whose silence is
+/// indistinguishable from a quiet book.
+#[must_use]
+pub fn ymd_from_ist_date(date_ist: &str) -> u32 {
+    let mut parts = date_ist.split('-');
+    let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
+        return 0;
+    };
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<u32>(), m.parse::<u32>(), d.parse::<u32>()) else {
+        return 0;
+    };
+    if !(1970..=2999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return 0;
+    }
+    y * 10_000 + m * 100 + d
+}
+
 async fn attach_depth_when_available(
     mut pool: PoolSupervisor,
     questdb: tickvault_common::config::QuestDbConfig,
@@ -3819,10 +3904,18 @@ async fn attach_depth_when_available(
     // sockets, so passing the main feed's share here would silently undo the
     // split it exists to enforce.
     depth_budget: Arc<RingByteBudget>,
-    // Passed only because `dial_planned_connections` selects per endpoint; this
-    // path never produces a main-feed connection, and the plan builder is what
-    // guarantees that rather than this argument.
+    // Since 2026-08-19 this path CAN produce main-feed connections — the
+    // contract universe attaches here too, because locating at-the-money needs
+    // live prices that do not exist at boot.
     main_feed_budget: Arc<RingByteBudget>,
+    // How many main-feed connections the SPOT universe already consumed.
+    //
+    // `plan_pool` sizes a set against the FULL per-endpoint connection cap and
+    // does not know what is already dialed, so without this the contract set
+    // would be planned as if all 5 main-feed sockets were free and the pool
+    // would be asked for a sixth. The 16-connection lock is arithmetic, not a
+    // hope, and this is the term that keeps it so.
+    main_feed_connections_used: usize,
 ) {
     let mut attempts: u32 = 0;
     let started = Instant::now();
@@ -3862,24 +3955,43 @@ async fn attach_depth_when_available(
                 } else {
                     "past the 10:00 IST deadline and the minimum window"
                 },
-                "depth late-attach gave up: option_chain_1m still yielded no depth candidates, so \
-                 depth-20 and depth-200 will carry NO data this session. Check that the \
-                 option-chain leg is running and that contract_security_id is populated. If \
-                 `attempts` is small, this app started late — the chain leg publishes from 09:16 \
-                 IST and cannot have run before the app did."
+                "late-attach gave up: neither the option chain nor the contract artifact \
+                 yielded anything, so depth-20 and depth-200 will carry NO data this session \
+                 AND the main feed will carry its SPOT universe only — no futures, no option \
+                 contracts. Check that the option-chain leg is running with \
+                 contract_security_id populated, and that the daily rider wrote today's \
+                 contract artifact. If `attempts` is small, this app started late — the chain \
+                 leg publishes from 09:16 IST and cannot have run before the app did."
             );
             return;
         }
         // Re-derived every attempt, never hoisted: this task can outlive an
         // IST midnight, and a hoisted date would then query yesterday forever.
-        let selection = crate::dhan_depth_universe::load_depth_universe(
+        let today_date = crate::dhan_universe::today_ist_date();
+        let today_nanos = crate::dhan_universe::ist_midnight_nanos(&today_date);
+        let selection =
+            crate::dhan_depth_universe::load_depth_universe(&questdb, today_nanos).await;
+
+        // The contract universe rides the SAME retry loop, and that is not a
+        // convenience — both wait on evidence that only exists after the open
+        // (depth on the chain leg's first publish, contracts on the first
+        // ticks), and both dial through the pool, which cannot be owned by two
+        // tasks at once.
+        let contracts = crate::dhan_contract_universe::load_contract_universe(
             &questdb,
-            crate::dhan_universe::ist_midnight_nanos(&crate::dhan_universe::today_ist_date()),
+            &today_date,
+            ymd_from_ist_date(&today_date),
+            today_nanos,
+            remaining_main_feed_capacity(main_feed_connections_used),
         )
         .await;
+
         attempts = attempts.saturating_add(1);
 
-        if !selection.depth_20.is_empty() || !selection.depth_200.is_empty() {
+        if !selection.depth_20.is_empty()
+            || !selection.depth_200.is_empty()
+            || !contracts.instruments.is_empty()
+        {
             // Upgrade LAST, immediately before dialing. `None` means every
             // socket died and the ring closed while we waited — dialing into a
             // closed ring would open sockets whose frames reach nothing.
@@ -3898,7 +4010,7 @@ async fn attach_depth_when_available(
             match build_feed_stack_plan(
                 &mut pool,
                 Instant::now(),
-                &[],
+                &contracts.instruments,
                 &selection.depth_20,
                 &selection.depth_200,
             ) {
@@ -3917,8 +4029,13 @@ async fn attach_depth_when_available(
                         attempts,
                         depth_20 = selection.depth_20.len(),
                         depth_200 = selection.depth_200.len(),
-                        "depth late-attach opened its sockets: the option-chain leg published \
-                         today's contracts and depth dialed against them without a restart"
+                        contracts = contracts.instruments.len(),
+                        stock_options = contracts.stock_options,
+                        index_options = contracts.index_options,
+                        futures = contracts.index_futures + contracts.stock_futures,
+                        atm_window = contracts.atm_window_used,
+                        "late-attach opened its sockets: today's contracts resolved and both \
+                         depth and the contract universe dialed against them without a restart"
                     );
                     return;
                 }
@@ -4573,6 +4690,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             frame_tx.downgrade(),
             Arc::clone(&depth_budget),
             Arc::clone(&main_feed_budget),
+            main_feed_connections_for(params.main_feed_instruments.len()),
         ));
     }
 
@@ -5201,6 +5319,42 @@ mod tests {
             production.contains("c.depth_unconsumed.increment(1)"),
             "the no-ingest arm must still COUNT — a silently dropped depth frame \
              is what this whole path exists to eliminate"
+        );
+    }
+
+    #[test]
+    fn both_depth_write_paths_consult_the_ingest_shed_gate_and_ticks_never_do() {
+        // The gate is only a lever if BOTH paths read it. A version that
+        // gated inline depth and forgot the dedicated feeds would shed the
+        // cheap half and keep writing the expensive one, on a disk that is
+        // already full — worse than not shedding at all, because the counters
+        // would say shedding is working.
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("INGEST_SHED.allows_inline_depth()"),
+            "the inline-depth append must be gated"
+        );
+        assert!(
+            production.contains("INGEST_SHED.allows_dedicated_depth()"),
+            "the depth-20 / depth-200 routing must be gated"
+        );
+        assert!(
+            production.contains("c.shed_inline_depth.increment(1)")
+                && production.contains("c.shed_dedicated_depth.increment(1)"),
+            "a shed row must be COUNTED — silently writing less is the false-OK \
+             this whole design exists to avoid"
+        );
+
+        // And the guarantee that makes shedding acceptable: no tick path may
+        // ever consult the gate. If this ever fails, someone has taught the
+        // box to drop prices to save disk, which is the one thing it must not
+        // do.
+        assert!(
+            !production.contains("INGEST_SHED.allows_ticks"),
+            "ticks are NEVER shed — no tick path may consult the gate"
         );
     }
 
@@ -8267,6 +8421,88 @@ mod silence_latch_tests {
              feed is healthy again' from 'one sparse contract traded once', so \
              an OK here reads as the first while meaning the second"
         );
+    }
+}
+
+#[cfg(test)]
+mod contract_attach_tests {
+    use super::*;
+
+    #[test]
+    fn remaining_capacity_is_counted_in_whole_connections() {
+        // The spot universe is ~4,565 instruments — one connection carrying
+        // 4,565 of its 5,000. The 435 unused slots on that socket are
+        // unreachable to a second planning pass, so the contract set gets 4
+        // connections, not 20,435 instruments.
+        assert_eq!(remaining_main_feed_capacity(1), 20_000);
+        assert_eq!(remaining_main_feed_capacity(0), 25_000);
+        assert_eq!(remaining_main_feed_capacity(4), 5_000);
+    }
+
+    #[test]
+    fn a_full_pool_leaves_no_room_rather_than_overflowing_it() {
+        // Every connection spent means NO contracts. Returning anything
+        // non-zero here would size a set the pool cannot dial, and `plan_pool`
+        // refuses the WHOLE pool — costing the session its depth as well.
+        assert_eq!(remaining_main_feed_capacity(5), 0);
+        assert_eq!(
+            remaining_main_feed_capacity(9),
+            0,
+            "saturating, never wraps"
+        );
+    }
+
+    #[test]
+    fn connection_count_rounds_up_because_a_partial_socket_is_still_a_socket() {
+        assert_eq!(main_feed_connections_for(0), 0);
+        assert_eq!(main_feed_connections_for(1), 1);
+        assert_eq!(main_feed_connections_for(5_000), 1);
+        assert_eq!(main_feed_connections_for(5_001), 2);
+        assert_eq!(main_feed_connections_for(4_565), 1, "today's spot universe");
+        assert_eq!(main_feed_connections_for(25_000), 5);
+    }
+
+    #[test]
+    fn the_two_helpers_can_never_together_exceed_the_authorized_pool() {
+        // The 16-connection lock has to be arithmetic, not a hope. For every
+        // reachable spot-universe size, connections used plus connections the
+        // remaining capacity could need must stay inside the cap.
+        let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
+        for spot in [0usize, 1, 4_565, 5_000, 5_001, 12_000, 24_999, 25_000] {
+            let used = main_feed_connections_for(spot);
+            let remaining = remaining_main_feed_capacity(used);
+            let would_need = main_feed_connections_for(remaining);
+            assert!(
+                used + would_need <= max,
+                "spot={spot} used={used} + contracts={would_need} exceeds {max}"
+            );
+        }
+    }
+
+    #[test]
+    fn ymd_from_ist_date_refuses_a_malformed_date_rather_than_selecting_an_expired_one() {
+        assert_eq!(ymd_from_ist_date("2026-08-19"), 2026_08_19);
+        // Every refusal returns 0, and 0 makes every expiry compare as "before
+        // today" — so the fail-closed direction is "no contracts", never "an
+        // expired one", whose silence looks exactly like a quiet book.
+        assert_eq!(ymd_from_ist_date(""), 0);
+        assert_eq!(ymd_from_ist_date("19-08-2026"), 0);
+        assert_eq!(ymd_from_ist_date("2026-13-01"), 0);
+        assert_eq!(ymd_from_ist_date("2026-08-32"), 0);
+        assert_eq!(ymd_from_ist_date("not-a-date"), 0);
+    }
+
+    #[test]
+    fn the_date_packing_matches_the_one_expiries_are_stored_in() {
+        // Both sides of the expiry comparison must pack identically or the
+        // whole >= today filter is meaningless. Same input, same answer.
+        for d in ["2026-08-19", "2026-01-01", "2026-12-31"] {
+            assert_eq!(
+                ymd_from_ist_date(d),
+                tickvault_core::instrument::master_csv::parse_expiry_ymd(d),
+                "the attach and the parser must agree on {d}"
+            );
+        }
     }
 }
 
