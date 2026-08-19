@@ -103,6 +103,63 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: `deploy/aws/terraform/main.tf`, `crates/aws-lambdas/src/start_watchdog.rs`
   - Tests: `az_failover_guard.rs`
 
+- [ ] **Item 8 — Rebuild cross-verification: Dhan-only, NTM + NSE indices, and RETIRE the
+  current post-market pass** — **QUEUED 2026-08-19 by operator directive** (verbatim, typos
+  preserved): *"see as of now add this into the queue dude which is for cross verification
+  enitlrey oen and only for ethe ntire ntm and entie idnices for dhan alone dude which is one
+  an donl yfor dhan with the entire cross evrification only for entire nifty total amrket and
+  entire nifty nse idncies aloen rigth ddue see do the cross evrificaiton oen and onlyh for
+  these dude add this into the plan as of now totally wipe off the current post market cross
+  evrification ddue okay?"*
+  - **The scope, exactly:** cross-verification runs for **Dhan only**, over **the entire
+    NIFTY Total Market constituent set** plus **the entire NSE index set** — and **nothing
+    else**. Every other instrument class is out: no futures, no options, no BSE, no Groww,
+    no bruteX-S3 leg.
+  - **The retirement is half the item, not a side effect.** The operator said *"totally wipe
+    off the current post market cross evrification"*. The existing pass is replaced, not
+    extended — so this item DELETES its scheduler arm, its audit-table writes and its
+    Telegram summary in the same change that lands the replacement. A PR that adds the new
+    pass and leaves the old one running is a REJECT: two passes writing overlapping verdicts
+    is precisely how the 2026-07-11 blind-since-birth comparison went unnoticed for weeks.
+  - **⚠ THIS ITEM MOVES THE PROJECT'S ONLY TICK-DELIVERY MEASUREMENT — read before starting.**
+    A non-zero `compared` from the 15:31 pass is the single measurement that distinguishes
+    "the Dhan feed works" from "the socket is open and silent"; the India feed has **no
+    snapshot-on-subscribe and no sequence number**, so packet loss is undetectable at the
+    protocol level and REST comparison is the only ground truth available. Retiring the
+    current pass therefore blinds that gate for exactly as long as the replacement is not
+    running. **Binding consequence: the replacement must be live in the SAME change, and the
+    first run must report a non-zero `compared` before this item can be called done.** A
+    green build is not the completion signal here.
+  - **What is genuinely better about the new scope, stated so it is not just churn:** the
+    current pass compares whatever happens to be in `candles_1m`, so a shrinking universe
+    silently shrinks the comparison and still reports "no mismatches". Pinning the set to
+    NTM + NSE indices makes the DENOMINATOR explicit — a missing constituent becomes a
+    `missing_live` row naming the instrument, instead of a smaller quiet pass.
+  - **The known trap this item must not repeat (Verified, PR #1474, 2026-07-11):** the last
+    implementation was **BLIND SINCE BIRTH** — the `candles_1m` side used NANOSECOND literals
+    against QuestDB's MICROSECOND timestamp comparison, so the WHERE window sat near year
+    58502, matched zero rows on every run since the feature shipped, and reported
+    `compared=0` honestly while nobody read it. The replacement needs a digit-magnitude
+    assertion on its own SQL literals, and a `compared == 0` verdict must classify **Blind
+    (High)**, never `Ok`.
+  - **Instrument sourcing (must self-roll, no hardcoded list):** the NTM constituents come
+    from the niftyindices list joined to the Dhan master by **ISIN** — the join is already
+    specified and locked in `daily-universe-scope-expansion-2026-05-27.md` §31.1 (ISIN
+    primary, `(Symbol, Series=EQ)` cross-check, symbol-alone BANNED, O(1) `HashMap` build,
+    unresolved constituents COUNTED and LOGGED BY NAME, 2% membership tolerance kept
+    separate from the 0.5% F&O dangling tolerance). Build to that contract; do not reinvent
+    it. The NSE index set comes from `NSE_INDEX_ALLOWLIST` + `canonicalize_index_symbol`.
+  - **Rule-file-first:** the scope change must be recorded with this dated quote in
+    `no-rest-except-live-feed-2026-06-27.md` (the §8 Dhan REST grant that feeds the
+    comparison) and in the cross-verify runbook BEFORE the code lands, and the
+    Groww/bruteX-side cross-verify sections annotated as superseded-in-place per house
+    convention — never rewritten.
+  - Files: `crates/app/src/cross_verify_*`, `crates/storage/src/*crossverify*`,
+    `crates/core/src/instrument/` (the ISIN join), the scheduler arm that fires the pass
+  - Tests: digit-magnitude SQL literal guard; `compared == 0` ⇒ Blind classification;
+    ISIN-join fail-closed + unresolved-named; a ratchet proving the OLD pass has no
+    remaining scheduler call site (so the retirement cannot half-land)
+
 ---
 
 ## Design

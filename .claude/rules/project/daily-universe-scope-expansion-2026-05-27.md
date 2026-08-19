@@ -405,6 +405,35 @@ breached; kill-ceiling $100).
 
 **Universe size envelope (mechanical bound):** `MAX_DAILY_UNIVERSE_SIZE = 1200` (raised from 400 per §31, NTM expansion 2026-06-06). Boot HALTS if computed universe is outside `[100, 1200]`. Fits comfortably on 1 main-feed connection (Dhan cap = 5,000 SIDs/conn). The §36.7 FUTIDX all-months grant (2026-07-10) adds the vendor-listed monthly serials (~12 SIDs typical, ≤24 by envelope) to the subscription set — still trivially inside `[100, 1200]` (≈343 total).
 
+> **⚠ CORRECTED + RAISED 2026-08-19 — the envelope is now `[100, 25,000]`, and the
+> "Boot HALTS" sentence above has been FALSE since 2026-07-13.** Two separate things,
+> recorded together because one hid the other:
+>
+> **(a) The halt does not exist.** The enforcing code was `build_daily_universe()`,
+> deleted with the Dhan instrument-fetch chain on 2026-07-13. A workspace scan on
+> 2026-08-19 found **zero production readers** of `MAX_DAILY_UNIVERSE_SIZE` or
+> `MIN_DAILY_UNIVERSE_SIZE` — only comments and the ratchet that pins the value. The
+> proof is live, not theoretical: the master-sourced flip on 2026-08-12 put **4,565
+> SIDs** in the live set — nearly **4× over** the stated 1200 cap — and the lane booted
+> normally, every trading day since, with nothing halting and nobody noticing. A
+> documented boot-halt that cannot fire is the exact false-OK class this file's own
+> O(1) table header warns about.
+>
+> **(b) The cap is raised 1200 → 25,000** per the 2026-08-15 full-universe
+> authorization in `websocket-connection-scope-lock.md` ("2026-08-15 — FULL-MODE,
+> FULL-UNIVERSE SUBSCRIPTION SCOPE"), whose REJECT list requires the constant, this
+> rule file and the ratchet to move in lockstep — all three moved in the same change.
+> 25,000 is not a round number: it is `5 connections × 5,000 instruments`, the
+> main-feed subscription capacity.
+>
+> **What actually bounds the live set** is `DhanEndpointType::MainFeed
+> .subscription_capacity()`, which `main.rs` passes to `resolve_live_universe` and
+> which `plan_pool` enforces **fail-closed — refusing the WHOLE pool rather than
+> truncating**. The constant is now numerically consistent with that real bound, so a
+> reader who trusts the number is not misled about the SIZE even while it is not the
+> thing doing the enforcing. The `[100, 1200]` text above is retained as the 2026-06-06
+> audit record per house convention.
+
 **Subscription dispatch:** 250 SIDs sent in 3 JSON batches (Dhan cap = 100 SIDs/message), sequential with `SubscribeRxGuard` (PR #337) preserving subscription state across reconnects.
 
 ---

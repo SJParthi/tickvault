@@ -1035,6 +1035,41 @@ exists to stop.
   instrument-less depth pool as "enabled".
 - Claims any of this is working before a non-zero `compared`.
 
+#### 2026-08-19 — APPLIED: the two constants this section's REJECT list names
+
+The 2026-08-15 authorization above listed four things it changes. **Two were
+recorded and never applied**, which is worth stating plainly: for four days the
+rule file said Full mode and 25,000 while the code said Quote and 1,200. This
+subsection closes that gap and is the lockstep record its own REJECT rows demand.
+
+| Constant | Was | Now | Ratchet re-blessed in the same change |
+|---|---|---|---|
+| `connection.rs::DEFAULT_MAIN_FEED_MODE` | `FeedMode::Quote` (code 17, 50 B) | **`FeedMode::Full`** (code 21, 162 B) | `test_the_default_feed_mode_is_the_scope_locked_full_mode` + `test_the_main_feed_payload_carries_the_full_request_code` |
+| `constants.rs::MAX_DAILY_UNIVERSE_SIZE` | `1200` | **`25_000`** | `max_daily_universe_size_pinned_at_25000` + the rule-file cross-ref |
+
+The second test on the mode row is the one that matters: a constant changed
+while `subscription_builder` still emitted 17 would subscribe Quote packets
+while every document claimed Full, and the only symptom would be a quiet
+`unparseable` counter. It asserts 21 is present **and** 17 is gone.
+
+**What the mode flip does NOT deliver (Rule 11).** Every Full packet carries 5
+levels of bid/ask, and the drain discards them — `ParsedFrame::TickWithDepth(tick, _)`
+folds the tick and drops the depth, because no depth writer and no depth table
+exist. So the lane now pays **3.24× the bandwidth** and consumes the tick half.
+That is deliberate, not an oversight: the same section's second quote binds
+depth to "either the vertical lands, or the depth pools stay at zero
+instruments", and a writer must exist before anything is claimed as captured.
+The 5-level depth inside Full is the *cheapest* future source for that writer —
+it arrives on a socket already open — but wiring it is its own unit of work.
+
+**Neither constant makes the feed work, and neither is the measurement.** The
+universe cap in particular enforces nothing at all — see the corrected §2
+envelope note in `daily-universe-scope-expansion-2026-05-27.md`, which records
+that the live lane ran at 4,565 SIDs for a week against a stated 1,200 "cap"
+with no halt, because the enforcing function was deleted on 2026-07-13. The
+measurement that settles whether any of this works remains a non-zero
+`compared` from the 15:31 cross-verification.
+
 ### 2026-08-15 (SAME DAY, SECOND QUOTE) — DEPTH IS CAPTURED IN FULL, INTO ONE COMMON TABLE; NOTHING IS DROPPED
 
 **The verbatim operator demand (2026-08-15, typed directly in-session — preserve
