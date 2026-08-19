@@ -977,7 +977,7 @@ mod risk_tick_gap {
         let base_ts = 1_700_000_000;
         // During warmup, even huge gaps must not alert
         for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            let result = tracker.record_tick(1001, base_ts + i * 1000);
+            let result = tracker.record_tick(1001, 0, base_ts + i * 1000);
             assert_eq!(result, TickGapResult::Ok, "warmup tick {i} must be Ok");
         }
         assert_eq!(tracker.total_warnings(), 0);
@@ -990,11 +990,11 @@ mod risk_tick_gap {
         let base_ts = 1_700_000_000;
         // Complete warmup
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Gap exactly at warning threshold
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         match result {
             TickGapResult::Warning { gap_secs } => {
                 assert_eq!(gap_secs, TICK_GAP_ALERT_THRESHOLD_SECS);
@@ -1009,10 +1009,10 @@ mod risk_tick_gap {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         match result {
             TickGapResult::Error { gap_secs } => {
                 assert_eq!(gap_secs, TICK_GAP_ERROR_THRESHOLD_SECS);
@@ -1028,20 +1028,20 @@ mod risk_tick_gap {
         let base_ts = 1_700_000_000;
         // Warmup security 1001
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Warmup security 2002
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(2002, base_ts + i);
+            tracker.record_tick(2002, 0, base_ts + i);
         }
         // Gap on 1001 must NOT affect 2002
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        let result_1001 = tracker.record_tick(1001, gap_ts);
+        let result_1001 = tracker.record_tick(1001, 0, gap_ts);
         assert!(matches!(result_1001, TickGapResult::Error { .. }));
 
         // Normal tick on 2002 — should be Ok
         let normal_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 1;
-        let result_2002 = tracker.record_tick(2002, normal_ts);
+        let result_2002 = tracker.record_tick(2002, 0, normal_ts);
         assert_eq!(result_2002, TickGapResult::Ok);
         assert_eq!(tracker.tracked_securities(), 2);
     }
@@ -1051,10 +1051,10 @@ mod risk_tick_gap {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Out-of-order: earlier timestamp than last — saturating_sub prevents underflow
-        let result = tracker.record_tick(1001, base_ts);
+        let result = tracker.record_tick(1001, 0, base_ts);
         assert_eq!(
             result,
             TickGapResult::Ok,
@@ -1067,10 +1067,10 @@ mod risk_tick_gap {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
-        tracker.record_tick(1001, gap_ts);
+        tracker.record_tick(1001, 0, gap_ts);
         assert!(tracker.total_warnings() > 0);
 
         tracker.reset();
