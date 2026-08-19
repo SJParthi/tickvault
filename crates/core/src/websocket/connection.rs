@@ -438,11 +438,30 @@ fn safe_err(err: &impl std::fmt::Display) -> String {
 
 /// The main-feed subscription mode.
 ///
-/// **Quote** is the mode the daily-universe scope lock fixes for this product
-/// ("Quote (request code 17) — 50-byte packets, gives day OHLC at fixed byte
-/// offsets"). Changing it is a scope decision, not a transport one, which is
-/// why it is a parameter rather than a constant here.
-pub const DEFAULT_MAIN_FEED_MODE: FeedMode = FeedMode::Quote;
+/// **Full** (request code 21 — 162-byte packets) since 2026-08-19, per the
+/// operator's 2026-08-15 authorization in `websocket-connection-scope-lock.md`
+/// ("entire NTM and entire nse indices … shdou lbe fully subscribed dude wiht
+/// full mdoe"). That quote landed in the rule file on 2026-08-15 and the
+/// constant was left at `Quote` — the flip is this line.
+///
+/// Changing it is a scope decision, not a transport one, which is why the
+/// scope-lock test below pins it and why moving it back requires the same
+/// rule-file-first protocol.
+///
+/// **What Full costs and what it buys, stated plainly.** 50 B → 162 B per
+/// packet is 3.24× the bytes on the wire for the same tick rate. In exchange
+/// the packet carries OI, day OHLC and 5 levels of bid/ask at fixed offsets.
+///
+/// **What it does NOT do today:** the 5 depth levels inside every Full packet
+/// are parsed and then DISCARDED — the drain matches
+/// `ParsedFrame::TickWithDepth(tick, _)` and folds only the tick, because no
+/// depth writer or depth table exists (both were deleted with the earlier
+/// live-feed retirements). So this flip pays the full 3.24× bandwidth and
+/// consumes the tick half of it. That is deliberate — the depth vertical
+/// (parser call → DDL → writer → dedup key → retention) is its own unit of
+/// work, and the operator's 2026-08-15 second quote requires the writer to
+/// exist before any depth is claimed as captured.
+pub const DEFAULT_MAIN_FEED_MODE: FeedMode = FeedMode::Full;
 
 /// Why a subscribe payload could not be built.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1677,27 +1696,39 @@ mod tests {
     }
 
     #[test]
-    fn test_the_default_feed_mode_is_the_scope_locked_quote_mode() {
-        // The daily-universe scope lock fixes Quote (request code 17) for this
-        // product: 50-byte packets carrying day OHLC at fixed byte offsets.
-        assert_eq!(DEFAULT_MAIN_FEED_MODE, FeedMode::Quote);
+    fn test_the_default_feed_mode_is_the_scope_locked_full_mode() {
+        // RE-BLESSED 2026-08-19. This test pinned `Quote` from the original
+        // daily-universe scope lock. The operator's 2026-08-15 authorization
+        // ("entire NTM and entire nse indices … shdou lbe fully subscribed
+        // dude wiht full mdoe") moved the scope to Full (request code 21,
+        // 162-byte packets); the rule file recorded that on 2026-08-15 and the
+        // constant did not follow until now. Moving it BACK requires the same
+        // rule-file-first protocol — this assertion is the gate.
+        assert_eq!(DEFAULT_MAIN_FEED_MODE, FeedMode::Full);
         let params = DhanSocketParams::new(
             DhanEndpointType::MainFeed,
             "wss://api-feed.dhan.co".to_string(),
             FAKE_CLIENT_ID.to_string(),
         );
-        assert_eq!(params.feed_mode, FeedMode::Quote);
+        assert_eq!(params.feed_mode, FeedMode::Full);
     }
 
     #[test]
-    fn test_the_main_feed_payload_carries_the_quote_request_code() {
+    fn test_the_main_feed_payload_carries_the_full_request_code() {
         // The code itself comes from `subscription_builder`; this pins that the
-        // transport asks for the scope-locked MODE and gets 17 back.
+        // transport asks for the scope-locked MODE and gets 21 back. It is the
+        // half of the flip that would silently fail: a constant changed with a
+        // builder that still emitted 17 would subscribe Quote while every doc
+        // claimed Full.
         let batch = [instrument(13, ExchangeSegment::IdxI)];
         let json =
             build_subscribe_payload(DhanEndpointType::MainFeed, DEFAULT_MAIN_FEED_MODE, &batch)
                 .expect("a single index subscribes");
-        assert!(json.contains("\"RequestCode\":17"), "{json}");
+        assert!(json.contains("\"RequestCode\":21"), "{json}");
+        assert!(
+            !json.contains("\"RequestCode\":17"),
+            "the Quote code must be gone, not merely joined: {json}"
+        );
     }
 
     // -- disconnect classification -----------------------------------------

@@ -1130,18 +1130,44 @@ pub const BOOT_STEP_QUESTDB_DDL_TIMEOUT_SECS: u64 = 60;
 /// failure → retry per §4 escalation ladder, not a permanent halt.
 pub const INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS: u64 = 60;
 
-/// Maximum daily-universe size (per rule file §2 + §4 + §15). Boot HALTS
-/// if computed universe size is outside `[MIN_DAILY_UNIVERSE_SIZE,
-/// MAX_DAILY_UNIVERSE_SIZE]`. Sub-PR #11 (boot-time-of-day guard) will
-/// enforce; this PR declares the bound.
+/// Minimum daily-universe size (per rule file §2 + §4 + §15).
+///
+/// ⚠ **CORRECTED 2026-08-19.** This doc read "Boot HALTS if computed universe
+/// size is outside `[MIN_DAILY_UNIVERSE_SIZE, MAX_DAILY_UNIVERSE_SIZE]`" —
+/// which was true of `build_daily_universe()` and stopped being true when that
+/// function was deleted with the Dhan instrument-fetch chain on 2026-07-13.
+/// Neither bound has a production reader today. See the honest note on
+/// `MAX_DAILY_UNIVERSE_SIZE` for what actually bounds the live set.
 pub const MIN_DAILY_UNIVERSE_SIZE: usize = 100;
 
-/// See `MIN_DAILY_UNIVERSE_SIZE`. Raised 400 → 1200 per rule file §31
-/// (operator authorization 2026-06-06) to fit the NIFTY Total Market
-/// stock expansion (~1,000 live SIDs + headroom). Still a boot-time
-/// validation bound only — not a pre-allocation (the aggregator is sized
-/// by the independent `AGGREGATOR_CAPACITY`).
-pub const MAX_DAILY_UNIVERSE_SIZE: usize = 1200;
+/// See `MIN_DAILY_UNIVERSE_SIZE`. Raised 1200 → 25,000 on 2026-08-19 per the
+/// operator's 2026-08-15 authorization in `websocket-connection-scope-lock.md`
+/// ("2026-08-15 — FULL-MODE, FULL-UNIVERSE SUBSCRIPTION SCOPE"), whose own
+/// REJECT list names raising this constant without the lockstep rule-file and
+/// ratchet edits. History: 400 → 1200 (§31, 2026-06-06, NTM stock expansion)
+/// → 25,000 (the ~24,600-instrument authorized set, sized to the 5 × 5,000
+/// main-feed subscription capacity with ~400 spare).
+///
+/// ⚠ **THIS CONSTANT ENFORCES NOTHING TODAY, and the doc above used to claim
+/// it did.** The "Boot HALTS if computed universe size is outside […]" wording
+/// on `MIN_DAILY_UNIVERSE_SIZE` described `build_daily_universe()`, which was
+/// DELETED with the Dhan instrument-fetch chain on 2026-07-13. A workspace
+/// scan on 2026-08-19 found ZERO production readers of either bound — only
+/// comments and the ratchet that pins the value. Recorded rather than quietly
+/// raised, because a documented boot-halt that cannot fire is exactly the
+/// false-OK class the codebase map's own header warns about: the live lane at
+/// 4,565 SIDs has been running *above* the old 1200 "cap" since 2026-08-12
+/// without halting, and nothing noticed.
+///
+/// The bound that ACTUALLY binds the live set is
+/// `DhanEndpointType::MainFeed.subscription_capacity()` (5 connections ×
+/// `MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION` = 25,000), which `main.rs`
+/// passes to `resolve_live_universe` and which `plan_pool` enforces
+/// fail-closed — refusing the WHOLE pool rather than truncating. This
+/// constant is now numerically consistent with that real bound, so a future
+/// reader who trusts it is not misled about the SIZE even while it is not the
+/// thing doing the enforcing.
+pub const MAX_DAILY_UNIVERSE_SIZE: usize = 25_000;
 
 /// CSV download body size cap (per rule file §18 hardening contract).
 /// Sub-PR #3 will enforce via `reqwest` bounded read. Expected real-world

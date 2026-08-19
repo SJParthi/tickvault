@@ -707,6 +707,11 @@ pub struct LiveIngest {
     /// together would bury a real loss inside a large, permanently-growing,
     /// entirely benign number.
     seals_skipped: u64,
+    /// Sealed candles the writer channel refused that were RESCUED to disk
+    /// (spill or DLQ) instead of discarded. Added 2026-08-19 with the no-drop
+    /// policy — see [`SEALS_RESCUED_COUNTER`] for why this is not a `dropped`
+    /// label.
+    seals_rescued: u64,
     /// Rows appended to the ILP buffer since the last flush. The buffer is a
     /// staging area, NOT storage: without a flush the rows never leave the
     /// process, so this counter is what makes the flush happen at all.
@@ -729,6 +734,7 @@ impl LiveIngest {
             refused_out_of_session: 0,
             seals_emitted: 0,
             seals_skipped: 0,
+            seals_rescued: 0,
             seals_dropped: 0,
             pending_rows: 0,
         }
@@ -941,6 +947,7 @@ impl LiveIngest {
         // front of a writer; without the writer it is a shredder.
         let mut emitted = 0u64;
         let mut dropped = 0u64;
+        let mut rescued = 0u64;
         let mut skipped = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
         let stats: ConsumeStats = self.aggregator.consume_tick(
@@ -971,16 +978,31 @@ impl LiveIngest {
                     skipped = skipped.saturating_add(1);
                     return;
                 }
+                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
+                // No writer channel installed at all. Before 2026-08-19 this
+                // discarded the seal outright; it now takes the same durable
+                // route a full channel does, so a boot-order problem costs a
+                // disk write rather than a day of candles.
                 let Some(tx) = sender else {
-                    dropped = dropped.saturating_add(1);
+                    match escalate_refused_seal(&seal) {
+                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
+                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
+                    }
                     return;
                 };
-                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
                 // `try_send`, never `send().await`: this closure runs inside
                 // the per-tick fold, and awaiting here would let a slow seal
                 // writer stall tick ingestion.
-                if tx.try_send(seal).is_err() {
-                    dropped = dropped.saturating_add(1);
+                // NEVER discard. Operator directive 2026-08-19: "never ever
+                // drop any ticks irrespective of any worst case". A refused
+                // seal goes to disk (spill, then DLQ); only a seal both disk
+                // tiers reject is counted as lost, and that fires
+                // AGGREGATOR-DROP-01.
+                if let Err(refused) = tx.try_send(seal) {
+                    match escalate_refused_seal(&refused.into_inner()) {
+                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
+                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
+                    }
                 } else {
                     emitted = emitted.saturating_add(1);
                 }
@@ -988,12 +1010,16 @@ impl LiveIngest {
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
+        self.seals_rescued = self.seals_rescued.saturating_add(rescued);
         self.seals_skipped = self.seals_skipped.saturating_add(skipped);
         if emitted > 0 {
             counters().seals_emitted.increment(emitted);
         }
         if dropped > 0 {
             counters().seals_dropped.increment(dropped);
+        }
+        if rescued > 0 {
+            counters().seals_rescued.increment(rescued);
         }
 
         // `refused_timestamp` is checked here alongside the other three. It was
@@ -1105,6 +1131,7 @@ impl LiveIngest {
     pub fn seal_open_buckets_at_close(&mut self) -> (u64, u64) {
         let mut emitted = 0u64;
         let mut dropped = 0u64;
+        let mut rescued = 0u64;
         let mut skipped = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
         let bars = self
@@ -1133,17 +1160,32 @@ impl LiveIngest {
                     skipped = skipped.saturating_add(1);
                     return;
                 }
+                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
+                // No writer channel installed at all. Before 2026-08-19 this
+                // discarded the seal outright; it now takes the same durable
+                // route a full channel does, so a boot-order problem costs a
+                // disk write rather than a day of candles.
                 let Some(tx) = sender else {
-                    dropped = dropped.saturating_add(1);
+                    match escalate_refused_seal(&seal) {
+                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
+                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
+                    }
                     return;
                 };
-                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
                 // `try_send` for the same reason the per-tick path uses it: a
                 // slow writer must never block the caller. At close the caller
                 // is the drain's own shutdown, and blocking it would hold the
                 // whole lane open past the session.
-                if tx.try_send(seal).is_err() {
-                    dropped = dropped.saturating_add(1);
+                // NEVER discard. Operator directive 2026-08-19: "never ever
+                // drop any ticks irrespective of any worst case". A refused
+                // seal goes to disk (spill, then DLQ); only a seal both disk
+                // tiers reject is counted as lost, and that fires
+                // AGGREGATOR-DROP-01.
+                if let Err(refused) = tx.try_send(seal) {
+                    match escalate_refused_seal(&refused.into_inner()) {
+                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
+                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
+                    }
                 } else {
                     emitted = emitted.saturating_add(1);
                 }
@@ -1156,12 +1198,16 @@ impl LiveIngest {
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
+        self.seals_rescued = self.seals_rescued.saturating_add(rescued);
         self.seals_skipped = self.seals_skipped.saturating_add(skipped);
         if emitted > 0 {
             counters().seals_emitted.increment(emitted);
         }
         if dropped > 0 {
             counters().seals_dropped.increment(dropped);
+        }
+        if rescued > 0 {
+            counters().seals_rescued.increment(rescued);
         }
         (emitted, dropped)
     }
@@ -1304,6 +1350,7 @@ impl LiveIngest {
         }
         let mut emitted = 0u64;
         let mut dropped = 0u64;
+        let mut rescued = 0u64;
         let mut skipped = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
         let bars = self.aggregator.catch_up_seal_all(
@@ -1332,13 +1379,28 @@ impl LiveIngest {
                     skipped = skipped.saturating_add(1);
                     return;
                 }
+                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
+                // No writer channel installed at all. Before 2026-08-19 this
+                // discarded the seal outright; it now takes the same durable
+                // route a full channel does, so a boot-order problem costs a
+                // disk write rather than a day of candles.
                 let Some(tx) = sender else {
-                    dropped = dropped.saturating_add(1);
+                    match escalate_refused_seal(&seal) {
+                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
+                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
+                    }
                     return;
                 };
-                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
-                if tx.try_send(seal).is_err() {
-                    dropped = dropped.saturating_add(1);
+                // NEVER discard. Operator directive 2026-08-19: "never ever
+                // drop any ticks irrespective of any worst case". A refused
+                // seal goes to disk (spill, then DLQ); only a seal both disk
+                // tiers reject is counted as lost, and that fires
+                // AGGREGATOR-DROP-01.
+                if let Err(refused) = tx.try_send(seal) {
+                    match escalate_refused_seal(&refused.into_inner()) {
+                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
+                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
+                    }
                 } else {
                     emitted = emitted.saturating_add(1);
                 }
@@ -1351,12 +1413,16 @@ impl LiveIngest {
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
+        self.seals_rescued = self.seals_rescued.saturating_add(rescued);
         self.seals_skipped = self.seals_skipped.saturating_add(skipped);
         if emitted > 0 {
             counters().seals_emitted.increment(emitted);
         }
         if dropped > 0 {
             counters().seals_dropped.increment(dropped);
+        }
+        if rescued > 0 {
+            counters().seals_rescued.increment(rescued);
         }
         (emitted, dropped)
     }
@@ -1377,13 +1443,26 @@ impl LiveIngest {
         self.seals_emitted
     }
 
-    /// Sealed candles LOST — no seal writer installed, or its queue was full.
-    /// Non-zero means candles were computed and discarded, which is the one
-    /// number that separates "the lane is producing candles" from "the lane is
-    /// burning CPU".
+    /// Sealed candles LOST — refused by the writer channel AND by both disk
+    /// tiers. Since 2026-08-19 this requires the data volume to be unwritable;
+    /// a merely-slow writer rescues to disk instead (see
+    /// [`Self::seals_rescued`]). Non-zero means candles were computed and are
+    /// gone.
     #[must_use]
     pub const fn seals_dropped(&self) -> u64 {
         self.seals_dropped
+    }
+
+    /// Sealed candles the writer channel refused that were written to disk
+    /// (spill or DLQ) rather than discarded. These are NOT lost — the boot
+    /// drain reads them back.
+    ///
+    /// A sustained non-zero value is a capacity signal: the seal writer is
+    /// chronically behind and the lane is paying a disk write per seal to stay
+    /// lossless.
+    #[must_use]
+    pub const fn seals_rescued(&self) -> u64 {
+        self.seals_rescued
     }
 
     /// Bars produced for a timeframe nobody asked for, and therefore not sent.
@@ -1436,6 +1515,7 @@ pub struct DrainCounters {
     refused_session: metrics::Counter,
     seals_emitted: metrics::Counter,
     seals_dropped: metrics::Counter,
+    seals_rescued: metrics::Counter,
     flush_ok: metrics::Counter,
     flush_failed: metrics::Counter,
     depth_unconsumed: metrics::Counter,
@@ -1493,6 +1573,7 @@ pub fn counters() -> &'static DrainCounters {
         refused_session: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "out_of_session"),
         seals_emitted: metrics::counter!(SEALS_EMITTED_COUNTER),
         seals_dropped: metrics::counter!(SEALS_DROPPED_COUNTER),
+        seals_rescued: metrics::counter!(SEALS_RESCUED_COUNTER),
         flush_ok: metrics::counter!(FLUSH_COUNTER, "outcome" => "ok"),
         flush_failed: metrics::counter!(FLUSH_COUNTER, "outcome" => "failed"),
         depth_unconsumed: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "depth_unconsumed"),
@@ -1516,9 +1597,24 @@ pub const XVERIFY_RUNS_COUNTER: &str = "tv_dhan_feed_xverify_runs_total";
 /// Counter: sealed candles handed to the process-wide seal writer.
 pub const SEALS_EMITTED_COUNTER: &str = "tv_dhan_feed_seals_emitted_total";
 
-/// Counter: sealed candles LOST — no seal writer installed, or its queue was
-/// full. Non-zero means candles were computed and discarded.
+/// Counter: sealed candles LOST — computed, refused by the writer channel,
+/// AND refused by both disk tiers. Since 2026-08-19 this requires the data
+/// volume to be unwritable; a merely-slow writer no longer reaches it.
+///
+/// Non-zero means candles were computed and are gone. Paired with
+/// AGGREGATOR-DROP-01 (Critical, paged).
 pub const SEALS_DROPPED_COUNTER: &str = "tv_dhan_feed_seals_dropped_total";
+
+/// Counter: sealed candles the writer channel refused that were RESCUED to
+/// disk (spill or DLQ) instead of discarded.
+///
+/// Added 2026-08-19 with the no-drop policy. It is deliberately its own name
+/// rather than an outcome label on `seals_dropped`: these candles are NOT
+/// lost — they are on disk awaiting the boot drain — and folding them into a
+/// loss counter would make the loss alarm fire for a working rescue. A
+/// sustained non-zero value means the seal writer is chronically behind,
+/// which is a capacity signal, not a data-loss one.
+pub const SEALS_RESCUED_COUNTER: &str = "tv_dhan_feed_seals_rescued_total";
 
 /// Counter: everything that happens to a depth packet, by `outcome`.
 ///
@@ -2434,6 +2530,12 @@ async fn run_frame_drain(
         close_seals_dropped = close_dropped,
         seals_emitted = ingest.seals_emitted(),
         seals_dropped = ingest.seals_dropped(),
+        // Reported beside `dropped` because the pair is only readable
+        // together: a non-zero `rescued` with a zero `dropped` is the no-drop
+        // policy WORKING — the writer fell behind and every seal went to disk
+        // — whereas the same `rescued` number alone reads like a loss. It is
+        // also the capacity signal for the seal writer.
+        seals_rescued = ingest.seals_rescued(),
         // Reported next to its siblings so the three are read together: a
         // large `skipped` beside a small `emitted` is the operator-timeframe
         // gate working as designed, and seeing it in isolation would invite
@@ -3088,6 +3190,65 @@ static WS_LAG_HANDLES: OnceLock<WsLagHandles> = OnceLock::new();
 
 fn ws_lag_handles() -> &'static WsLagHandles {
     WS_LAG_HANDLES.get_or_init(WsLagHandles::new)
+}
+
+/// What happened to a sealed candle the writer channel would not take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealRefusal {
+    /// Written to the spill or the DLQ. Recovered by the boot drain.
+    Rescued,
+    /// Neither disk tier accepted it. The candle is gone.
+    Lost,
+}
+
+/// Route a seal the writer channel refused to the durable tier, instead of
+/// discarding it.
+///
+/// **This function is the no-drop policy.** Operator directive 2026-08-19:
+/// *"never ever drop any ticks irrespective of any worst case"*, and
+/// *"never dropped or dleetd dude just mvoe it to db and s3 right?"* Before
+/// it existed, all three seal call sites in this file did
+/// `if tx.try_send(seal).is_err() { dropped += 1 }` — the sealed candle was
+/// counted and thrown away whenever the writer fell behind or was absent. The
+/// three-tier ring → spill → DLQ cascade already existed in
+/// `seal_absorption`, but only on the CONSUMER side of the channel; nothing
+/// on the producer side could reach it. This closes that.
+///
+/// Ordering is deliberate: spill first (binary, compact, drained on boot),
+/// DLQ second (NDJSON, recoverable as text by a human). `Lost` requires BOTH
+/// to fail, which means the data volume is unwritable — and the caller fires
+/// AGGREGATOR-DROP-01 (Critical, paged) for it.
+///
+/// Cost, stated honestly: this turns a channel refusal from a free discard
+/// into a synchronous disk append on the fold path. That is the intended
+/// trade — a slow write is recoverable, a discarded candle is not — and it
+/// only happens when the channel is already refusing, never on the happy
+/// path.
+///
+/// The spill/DLQ filename is derived from an IST date, and the seal carries
+/// its own bucket-open IST second — so the date comes from the DATA rather
+/// than from a clock. That is both cheaper (no syscall on the fold path, per
+/// locked decision L-H7) and more correct: a bar sealed at 15:29 that spills
+/// at 15:31 belongs to the 15:29 bar's day, and stays on the right side of an
+/// IST-midnight boundary no matter when the rescue happens.
+#[must_use]
+pub fn escalate_refused_seal(seal: &tickvault_trading::candles::BufferedSeal) -> SealRefusal {
+    let now_unix_secs = i64::from(seal.state.bucket_start_ist_secs).saturating_sub(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    let Some(overflow) = tickvault_storage::seal_writer_runner::global_seal_overflow() else {
+        // No durable tier installed. Saying "rescued" here would be the exact
+        // false-OK this policy exists to prevent, so it is a loss and it is
+        // reported as one.
+        return SealRefusal::Lost;
+    };
+    match overflow.escalate(seal, now_unix_secs) {
+        tickvault_storage::seal_writer_runner::OverflowOutcome::Spilled
+        | tickvault_storage::seal_writer_runner::OverflowOutcome::DlqWritten => {
+            SealRefusal::Rescued
+        }
+        tickvault_storage::seal_writer_runner::OverflowOutcome::Lost => SealRefusal::Lost,
+    }
 }
 
 /// `pub` so `crates/app/tests/dhat_ws_lag.rs` can measure it from an

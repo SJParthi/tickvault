@@ -101,9 +101,29 @@ pub const TF_VERIFY_1M_ROW_LIMIT: usize = 500;
 pub const TF_VERIFY_TF_UNION_ROW_LIMIT: usize = 2_000;
 
 /// Row CAP on the per-feed instrument-discovery query. Sized above the
-/// `MAX_DAILY_UNIVERSE_SIZE = 1200` envelope; fetched as `cap + 1`
-/// (LIMIT+1 probe), truncation = `> cap`.
-pub const TF_VERIFY_DISCOVERY_ROW_LIMIT: usize = 3_000;
+/// universe envelope; fetched as `cap + 1` (LIMIT+1 probe), truncation
+/// = `> cap`.
+///
+/// **Raised 3,000 → 26,000 on 2026-08-19**, in lockstep with
+/// `MAX_DAILY_UNIVERSE_SIZE` 1,200 → 25,000 (the 2026-08-15 full-universe
+/// authorization). The old value was explicitly "sized above the 1,200
+/// envelope" — so widening the universe without touching this would have made
+/// the daily timeframe-consistency pass truncate on **every single run**.
+///
+/// That failure would have been loud rather than silent (the LIMIT+1 probe
+/// fires `count_query_failure("truncated")` plus a `warn!`, and the pass reads
+/// degraded), which is exactly why it is worth fixing rather than tolerating:
+/// a monitor that reports degraded every day is one nobody reads, and its
+/// eventual real degradation is invisible inside the noise.
+///
+/// **Honest cost.** This is a once-a-day cold-path sweep, and at the top of
+/// the range it walks ~25,000 SIDs instead of ~1,200. The politeness pause
+/// (`TF_VERIFY_POLITENESS_SLEEP_MS` every `TF_VERIFY_POLITENESS_EVERY_SIDS`)
+/// alone then contributes ~5 s per 1,000 SIDs — roughly **2 minutes of
+/// deliberate sleep** across a full sweep, before any query time. Accepted:
+/// the pause exists so this sweep never competes with the 15:45 scoreboard,
+/// and a slow correct audit beats a fast truncated one.
+pub const TF_VERIFY_DISCOVERY_ROW_LIMIT: usize = 26_000;
 
 /// Audit-row blast-radius cap per run: a systemic bug (e.g. an anchoring
 /// change) would otherwise produce ~1M rows in one run. Beyond the cap the
@@ -3072,8 +3092,18 @@ mod tests {
         assert!(sql.contains("FROM candles_15m"), "{sql}");
         assert!(!sql.contains("candles_1d"), "{sql}");
         assert!(sql.contains("feed = 'dhan'"), "{sql}");
-        // 2026-07-18 LIMIT+1 probe: cap 3,000 → fetch 3,001.
-        assert!(sql.ends_with("LIMIT 3001"), "{sql}");
+        // 2026-07-18 LIMIT+1 probe. RE-BLESSED 2026-08-19: this pinned the
+        // literal `LIMIT 3001`, so raising the cap with the universe (3,000 →
+        // 26,000) broke it. Derived from the constant now — the property worth
+        // pinning is "exactly one row past the cap, so truncation is
+        // detectable", not the arithmetic of one particular cap.
+        assert!(
+            sql.ends_with(&format!(
+                "LIMIT {}",
+                TF_VERIFY_DISCOVERY_ROW_LIMIT.saturating_add(1)
+            )),
+            "{sql}"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -3383,7 +3413,10 @@ mod tests {
         assert_eq!(TF_VERIFY_RUN_BUDGET_SECS, 900);
         assert!(TF_VERIFY_1M_ROW_LIMIT > 375);
         assert!(TF_VERIFY_TF_UNION_ROW_LIMIT > 903);
-        assert!(TF_VERIFY_DISCOVERY_ROW_LIMIT > 1_200);
+        // Re-blessed 2026-08-19 with the universe cap (1,200 → 25,000): the
+        // discovery query must clear the WHOLE authorized universe, or the
+        // daily pass truncates on every run and reads degraded forever.
+        assert!(TF_VERIFY_DISCOVERY_ROW_LIMIT > 25_000);
         assert_eq!(TF_VERIFY_MAX_AUDIT_ROWS_PER_RUN, 10_000);
         assert_eq!(TF_VERIFY_PREV_DAY_LOOKBACK_DAYS, 7);
         assert_eq!(TF_VERIFY_MAX_RESPONSE_BYTES, 8 * 1024 * 1024);
