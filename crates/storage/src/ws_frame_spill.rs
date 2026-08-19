@@ -1071,6 +1071,11 @@ pub struct ArchivePruneOutcome {
     pub bytes_after: u64,
 }
 
+/// Pre-allocation hint for the archive prune's survivor list — a typical
+/// steady-state archive segment count, so the common case allocates once.
+/// Exceeding it only costs a realloc on a cold periodic path.
+const ARCHIVE_PRUNE_SURVIVOR_HINT: usize = 256;
+
 /// Prunes confirmed-replay WAL segments from `<wal_dir>/archive/` whose
 /// mtime is older than `retention_secs` — pure-testable core over an
 /// injected `now` (2026-07-13 disk-retention hardening).
@@ -1083,20 +1088,22 @@ pub struct ArchivePruneOutcome {
 ///   same-day 15:40 IST tick-conservation audit's `count_frames_for_ist_day`
 ///   scan — retired 2026-07-18 with the audit (dead-WS sweep follow-up);
 ///   it only ever counted CURRENT-day frames anyway
-///   (`WS_WAL_ARCHIVE_RETENTION_SECS` = 7 days, matching
-///   `SPILL_FILE_MAX_AGE_SECS`, comfortably exceeded that window AND — F3,
-///   review round 1 — preserves the confirm-on-channel residual's only
-///   copy across a long weekend for triage before it ages out).
+///   (`WS_WAL_ARCHIVE_RETENTION_SECS`, comfortably exceeded that window AND
+///   — F3, review round 1 — preserves the confirm-on-channel residual's only
+///   copy across a weekend for triage before it ages out). The value is
+///   deliberately NOT restated here: it read "7 days, matching
+///   `SPILL_FILE_MAX_AGE_SECS`" until 2026-08-19, when it became 3 days and
+///   stopped matching that constant — a number copied into prose is a claim
+///   with no way to stay true. Read the constant.
+/// - Bounded by BYTES as well as age since 2026-08-19
+///   (`WS_WAL_ARCHIVE_MAX_BYTES`, oldest-first after the age pass): an age
+///   bound alone scales with traffic, so it bounds the archive only for the
+///   traffic level its window was chosen against.
 /// - Only `*.wal` files are touched; anything else in the dir is kept.
 ///   A missing `archive/` dir is a no-op. Deletion failures are NOT
 ///   persist/flush failures — they log at WARN (bounded: once per file per
 ///   pass, passes run every 6 h) and retry next pass.
 #[must_use]
-/// Pre-allocation hint for the archive prune's survivor list — a typical
-/// steady-state archive segment count, so the common case allocates once.
-/// Exceeding it only costs a realloc on a cold periodic path.
-const ARCHIVE_PRUNE_SURVIVOR_HINT: usize = 256;
-
 pub fn prune_archived_segments_at<P: AsRef<Path>>(
     wal_dir: P,
     retention_secs: u64,
