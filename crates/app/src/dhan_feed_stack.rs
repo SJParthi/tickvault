@@ -784,16 +784,30 @@ impl LiveIngest {
                 // mattered: an operator reading it would treat a flush
                 // failure as deferred rather than as loss.
                 //
-                // Replay does not recover these. It runs at BOOT only, and
-                // when it runs, `main.rs` STAGE-C.2b logs the replayed
-                // live-feed frames and DROPS them — there is no re-fold path
-                // (the fold takes a live ring, not a replay batch). So the
-                // frames are preserved on disk as bytes and recoverable only
-                // by hand; nothing automatic puts these rows in QuestDB.
+                // CORRECTED 2026-08-19. This block used to say replay "logs
+                // the replayed live-feed frames and DROPS them — there is no
+                // re-fold path (the fold takes a live ring, not a replay
+                // batch)". That was true when written and became FALSE on
+                // 2026-08-15, when `refold_wal_frames` landed — it takes
+                // exactly the replay batch the comment said could not exist,
+                // and `main.rs` hands the staged frames to the lane whenever
+                // the lane will run.
                 //
-                // Kept aligned with the STAGE-C.2b wording deliberately: the
-                // two messages describe the same loss from the two ends of
-                // it, and they must not tell the operator different stories.
+                // The correction is not cosmetic: a same-day hostile audit
+                // read this comment, trusted it over the code, and reported
+                // the WAL as write-only — a false CRITICAL. A stale comment
+                // does not merely fail to inform, it manufactures findings,
+                // which is the exact failure this repo has hit before.
+                //
+                // What is TRUE today, both halves stated:
+                //   ACROSS A RESTART — recovered. The next boot re-folds
+                //   these frames, DEDUP-idempotently (`capture_seq` is read
+                //   back from the WAL record, never re-stamped).
+                //   INTRA-SESSION — NOT recovered. Nothing re-reads the WAL
+                //   while the process lives, so until a restart these rows
+                //   are absent from QuestDB.
+                // So a flush failure is deferred loss if the process later
+                // restarts, and standing loss if it does not.
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     %err,
@@ -3240,6 +3254,22 @@ pub fn escalate_refused_seal(seal: &tickvault_trading::candles::BufferedSeal) ->
         // No durable tier installed. Saying "rescued" here would be the exact
         // false-OK this policy exists to prevent, so it is a loss and it is
         // reported as one.
+        //
+        // 2026-08-19 (same-day hostile audit): this arm used to `return
+        // SealRefusal::Lost` with NO log. That is the worst case in the whole
+        // seal path, not the mildest: when `SealWriterRunner::new` fails at
+        // boot, `main.rs` installs neither the sender nor the overflow, so
+        // EVERY seal lands here for the life of the process — and the alarmed
+        // drain counter lives inside the writer loop that never spawned, so it
+        // reads a flat, healthy zero all day. An entire session of candles
+        // could evaporate with nothing paging. It now fires
+        // AGGREGATOR-DROP-01.
+        crate::seal_loss_alarm::record_lost_seal(
+            crate::seal_loss_alarm::SealLossReason::NoDurableTier,
+            seal.security_id,
+            seal.exchange_segment_code,
+            seal.tf.display_name(),
+        );
         return SealRefusal::Lost;
     };
     match overflow.escalate(seal, now_unix_secs) {
@@ -3247,7 +3277,19 @@ pub fn escalate_refused_seal(seal: &tickvault_trading::candles::BufferedSeal) ->
         | tickvault_storage::seal_writer_runner::OverflowOutcome::DlqWritten => {
             SealRefusal::Rescued
         }
-        tickvault_storage::seal_writer_runner::OverflowOutcome::Lost => SealRefusal::Lost,
+        tickvault_storage::seal_writer_runner::OverflowOutcome::Lost => {
+            // Both disk tiers refused — the case AGGREGATOR-DROP-01 was
+            // written for. The consumer-side triple-failure already pages
+            // (`seal_drop_paging_wiring_guard`); this is the PRODUCER side,
+            // which had no page at all.
+            crate::seal_loss_alarm::record_lost_seal(
+                crate::seal_loss_alarm::SealLossReason::BothDiskTiersFailed,
+                seal.security_id,
+                seal.exchange_segment_code,
+                seal.tf.display_name(),
+            );
+            SealRefusal::Lost
+        }
     }
 }
 
