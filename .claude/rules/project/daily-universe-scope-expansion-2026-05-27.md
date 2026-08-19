@@ -335,6 +335,103 @@ move the box away from it.
 **Cost is unchanged by this quote** — the Quote 13 envelope stands
 (~₹5,824–7,382/mo incl GST, ~6× the Quote 9 sub-₹1,000 target, knowingly
 
+**Quote 17 (2026-08-19, disk THROUGHPUT/IOPS raise + budget ceiling raise — preserve EXACTLY, typos included):**
+> "what the fuck as i already always told you nowheer the fuckign ticks lsos or not een a nano seocnd milliseocnd latency issues we hsodul afce dude alwyas veryhtign. needs to be fuckign preicse no ticks loss and no websocket discoencnt or no websocket reconenct issues dude okay? sow hatevr is eneded raise the ceiling dude okay? just raise whatevr yous aid and reocmemnded raise it accoridnly diue okay?"
+
+Given in DIRECT response to a message that named the disk change, its price, and
+its blocker: *"Raise disk throughput 3000/125 → 6000/500 · ~$20/mo · Removes the
+~8-second writeback stall — the most likely single cause of falling out of the
+fast lane · **Your kill-ceiling margin is $7.28. This needs the ceiling raised in
+the same change.**"* The operator answered by ordering the ceiling raised to
+whatever the recommendation requires. **This REVERSES his own answer given
+minutes earlier** in the same session (he had selected "alarms + code fixes only,
+disk waits for Saturday"); the later instruction governs, and the earlier choice
+is recorded here so the reversal is auditable rather than silent.
+
+**What this authorizes:** the root gp3 volume's **IOPS 3000 → 6000** and
+**throughput 125 → 500 MiB/s**, and the budget kill-ceiling **$100 → $130**.
+Nothing else — the instance stays r8g.xlarge (Quote 15, FINALISED), the AZ stays
+un-pinned, the schedule stays 08:30–17:30 IST, and the 200 GB size from Quote 16
+is unchanged.
+
+**Why the operator is right about the cause.** gp3's baseline 125 MiB/s is not a
+storage nicety here. `dirty_background_ratio = 3` on a 32 GiB host allows ~1 GiB
+of dirty pages before writeback starts; at 125 MiB/s draining that is **~8
+seconds of saturated device**. During it the ILP flush blocks, the frame drain
+blocks behind it, the socket receive buffer fills, and Dhan — whose published
+architecture skips a slow consumer forward to *"the latest available state"* —
+drops the intermediate ticks at THEIR side, with no sequence number for us to
+detect it. So this is not disk tuning; it is the most likely single mechanism by
+which the operator's "not even a nanosecond of latency, no tick loss" mandate is
+being violated today. 500 MiB/s takes the same drain to ~2 seconds. Evidence it
+is already binding: the 2026-08-18 measurement recorded **74% NVMe utilisation at
+3,121 writes/sec** — before the 25,000-instrument target and before depth
+persistence.
+
+**Honest cost.** gp3 charges $0.005/provisioned-IOPS above 3,000 and
+$0.040/provisioned-MiB/s above 125: (6000−3000) × $0.005 = **$15.00** +
+(500−125) × $0.040 = **$15.00** = **$30.00/mo**, ~₹3,043 incl GST — **higher than
+the ~$20 the recommendation quoted**, because that figure was stated before the
+per-unit split was derived. Recorded here rather than quietly absorbed: the
+operator approved "whatever is needed", and this is what it actually costs. The
+Quote 13/16 envelope moves ~₹6,739–8,297 → **~₹9,782–11,340/mo**. The Quote 9
+sub-₹1,000 target was already breached ~7× and is now breached ~10×, knowingly.
+
+**Ceiling $100 → $130 (the operative half of the quote).** The bill's high
+estimate moves $82.72 → **$112.72**. The budget's AUTOMATIC action is
+`STOP_EC2_INSTANCES` at 90% and 100% — so a $100 ceiling would put the 90% line
+at $90, *below* the new bill, and the safety net would switch the trading box off
+mid-session. $130 puts the 90% line at $117, above the $112.72 worst case with
+$4.28 of room. That margin is THINNER than the $7.28 this change was called in to
+fix, and it is stated plainly: the next cost increase of any size must raise the
+ceiling in the same change, and there is no longer room to defer that.
+
+**⚠ UNRESOLVED, carried forward from Quote 13 and NOT fixed by this raise:** the
+2026-07-31 ruling recorded BOTH `STOP_EC2_INSTANCES` budget actions stuck in
+`EXECUTION_FAILURE`, and the 2026-08-12 verification could not re-check them —
+`budgets:DescribeBudgetActionsForBudget` returns `AccessDeniedException` for
+`user/claude-code-agent`. **Raising a ceiling does not repair a broken action.**
+If those actions are still failing then the kill-switch does not fire at all, in
+which case this raise is protecting against a stop that cannot happen — which is
+safer in the short term and worse in the long term. Needs an identity with
+budgets read access.
+
+**Quote 17b (2026-08-19, minutes later — ALL THREE, including the CPU isolation
+I had recommended deferring; preserve EXACTLY, typos included):**
+> "tehse issues are nwohere fuckigna cceptabel bro okay? so reosleva nd fix all
+> of thes eude okay?"
+
+Given in DIRECT response to the plain-English restatement of all three items,
+including my own written caution on item 2: *"⚠️ The catch: it changes how the
+program runs. Tomorrow is a trading day, and the box would wake up in an
+arrangement it has never run in before. Saturday is the right day for this."*
+The operator read that caution and ordered all three anyway. **That is his call
+and it governs** — the deferral was my recommendation, not a constraint, and a
+reaffirmed instruction ends the discussion.
+
+**Additionally authorized by 17b: CPU isolation.** The host has 4 vCPU. Today
+the tokio runtime defaults to `worker_threads = num_cpus = 4`, QuestDB holds a
+`cpus: 3.0` quota, and NIC softirqs land wherever the kernel puts them — all on
+the same 4 cores. This has already been measured biting: the compose file
+records `nr_throttled 18,594 of nr_periods 85,149 = **21.8%**`. Authorized: an
+explicit QuestDB `cpuset`, an explicit tokio worker-thread count, and NIC IRQ
+steering away from the drain core. **Core 0 is NOT a valid pin target for the
+drain** — it services network softirq, so pinning the decoder there puts it in
+direct contention with the work it depends on (CLAUDE.md records this).
+
+**The honest risk, which the operator accepted after reading it:** the box wakes
+up tomorrow in a CPU arrangement it has never run in, on a trading day. If
+tomorrow looks wrong, attribution between "the feed" and "the change" is harder.
+Mitigation, since the risk cannot be removed: every part of this is
+config-reversible without a code change, and the rollback is a single revert plus
+a restart.
+
+**What is NOT authorized by Quote 17/17b:** any instance-type change, any AZ
+re-pin, any schedule change, any further EBS size change, live order fire, or any
+edit to the §28 frozen indicator/strategy area. The operator's "no tick loss / no
+disconnect" framing is the REASON for these changes, not a grant to make other
+changes in its name.
+
 **Quote 16 (2026-08-19, EBS grow 100 → 200 GB — preserve EXACTLY, typos included):**
 > "Grow gp3 100 → 200 GB yes even icnrease this also dude okay?"
 

@@ -422,8 +422,39 @@ impl AggregatorCell {
                 }
                 return ConsumeOutcome::DiscardLate;
             }
-            let use_day_open = self.armed_for_day_open[ord];
-            self.armed_for_day_open[ord] = false;
+            // 2026-08-19 — THE ARM IS CONSUMED ONLY WHEN IT IS ACTUALLY USED.
+            //
+            // This used to read `let use = armed[ord]; armed[ord] = false;` —
+            // consuming the arm UNCONDITIONALLY, before anyone checked whether
+            // `day_open` was usable. `open_bucket` then falls back to the
+            // tick's own price when `day_open <= 0.0`, so the two lines
+            // together burned the day's one chance at the official open on a
+            // tick that could not supply it.
+            //
+            // That fires EVERY trading day, not in some corner case. The
+            // persistence window opens at 09:00, so pre-open ticks reach this
+            // fold, and during the pre-open the vendor has no session open to
+            // report — `day_open` is 0. The first such tick burned the arm;
+            // every later bucket then saw `use_day_open == false`; and the
+            // real 09:15 open was never stamped into ANY candle that day.
+            //
+            // Consuming it only on use means a pre-open tick leaves the arm
+            // intact, and the first tick that actually carries a positive
+            // `day_open` — in practice the first tick at or after the official
+            // open — is the one that spends it.
+            //
+            // HONEST RESIDUAL: this makes the arm wait for a usable value, not
+            // for a particular clock time. If the vendor were to withhold
+            // `day_open` past 09:15, the first bucket that DOES see it would
+            // open at the session open rather than at its own first trade.
+            // That is a bounded, one-bucket inaccuracy and strictly better
+            // than losing the official open for the whole day; pinning it to a
+            // session-time window would put trading-calendar knowledge inside
+            // this cell, which is the wrong place for it.
+            let use_day_open = self.armed_for_day_open[ord] && prices.day_open > 0.0;
+            if use_day_open {
+                self.armed_for_day_open[ord] = false;
+            }
             self.slots[ord] = open_bucket(
                 tick,
                 prices,
@@ -440,13 +471,32 @@ impl AggregatorCell {
         // In-bucket — the common case, and the one that must survive many
         // ticks sharing one second.
         if bucket_start == open_start {
+            // A day_open that arrives AFTER the bucket opened still belongs to
+            // it. The arm is only ever live inside the day's first bucket (the
+            // roll below disarms on the way out), so this cannot stamp a later
+            // bar. Without it, an instrument whose first in-session tick
+            // carried no session open would lose the official open for the
+            // whole day — the bucket is already open, and `fold_in_bucket`
+            // deliberately never touches `open`.
+            if self.armed_for_day_open[ord] && prices.day_open > 0.0 {
+                self.armed_for_day_open[ord] = false;
+                self.slots[ord].open = prices.day_open;
+            }
             fold_in_bucket(&mut self.slots[ord], tick, prices, cumulative_volume);
             return ConsumeOutcome::Updated;
         }
 
         // Strictly newer bucket — seal the open one and open the new one at
         // the LTP (an intraday crossing is never the day's first bar).
+        //
+        // 2026-08-19 — the `false` is unchanged, but the DISARM beside it is
+        // new. Leaving here means the day's first bucket is behind us, so the
+        // official open can never legitimately be stamped again; disarming
+        // makes that structural rather than incidental, and is what lets the
+        // in-bucket path below stamp a late-arriving `day_open` without any
+        // risk of a later bucket claiming it.
         if bucket_start > open_start {
+            self.armed_for_day_open[ord] = false;
             let sealed_state = std::mem::replace(
                 &mut self.slots[ord],
                 open_bucket(
@@ -697,6 +747,73 @@ mod tests {
             volume: cum_volume,
             ..ParsedTick::default()
         }
+    }
+
+    #[test]
+    fn test_a_late_arriving_day_open_still_reaches_the_days_first_bucket() {
+        // WHAT THIS ACTUALLY PINS (operator asked 2026-08-19 whether the
+        // candle opens at the pre-market price; investigation below).
+        //
+        // I first believed pre-open ticks reached this fold and stamped the
+        // 09:15 candle with a pre-market price. THEY DO NOT — the aggregator
+        // refuses anything with `secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST`
+        // one layer up, so `bucket_start`'s clamp of pre-open timestamps into
+        // the 09:15 bucket is defence-in-depth for a caller that does not
+        // exist. The reported bug was not real, and this test exists for the
+        // NARROWER case that is.
+        //
+        // The real risk: the day's first IN-SESSION tick can carry
+        // `day_open == 0` — a thin instrument whose session open the vendor
+        // has not populated yet. The bucket opens at that tick's price, and
+        // `fold_in_bucket` never touches `open`, so without this path the
+        // official open would never reach any candle that day.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        // First in-session tick, but no session open published yet.
+        let first = tick_at(OPEN, 23_990.00, 5);
+        assert_eq!(first.day_open, 0.0, "fixture models the unpopulated case");
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 5);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).open,
+            f32_to_f64_clean(23_990.00),
+            "with nothing better available the bucket opens at the traded price"
+        );
+
+        // Same bucket, seconds later: the official open arrives.
+        let mut later = tick_at(OPEN + 10, 24_010.00, 12);
+        later.day_open = 24_000.25;
+        cell.consume_tick(TfIndex::M1, &later, 0, strategy, 12);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).open,
+            f32_to_f64_clean(24_000.25),
+            "a day_open arriving after the bucket opened still belongs to it"
+        );
+    }
+
+    #[test]
+    fn test_the_day_open_arm_cannot_be_spent_by_any_bucket_after_the_first() {
+        // The other half, and the reason the roll disarms: once the day's
+        // first bucket is behind us the official open must never be stamped
+        // again. A permanently-live arm would open every later bar at the
+        // session open — the opposite error, and equally wrong.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        // First bucket, no day_open available — arm stays live.
+        let first = tick_at(OPEN, 23_990.00, 5);
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 5);
+
+        // Roll into the next minute; day_open is on the wire now, but this
+        // bucket is NOT the day's first and must open at its own price.
+        let mut second = tick_at(OPEN + 60, 24_055.50, 20);
+        second.day_open = 24_000.25;
+        cell.consume_tick(TfIndex::M1, &second, 0, strategy, 20);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).open,
+            f32_to_f64_clean(24_055.50),
+            "every bucket after the first opens at its OWN first traded price"
+        );
     }
 
     #[test]

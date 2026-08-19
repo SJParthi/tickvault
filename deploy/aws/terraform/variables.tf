@@ -105,9 +105,9 @@ variable "ebs_gp3_size_gb" {
 # safe" is the one mistake here that cannot be undone without another recreate.
 
 variable "ebs_gp3_iops" {
-  description = "Root gp3 EBS provisioned IOPS. 3000 is the gp3 baseline (free, included). Range 3000-16000 — raise alongside throughput when the QuestDB write/read load grows (e.g. both feeds at ~2K SIDs). scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume; root_block_device[0].iops is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-bumped value. This var documents the intended IOPS for a FRESH provision."
+  description = "Root gp3 EBS provisioned IOPS. RAISED 3000 -> 6000 on 2026-08-19 per operator Quote 17 (daily-universe-scope-expansion-2026-05-27.md §0), alongside throughput 125 -> 500. Range 3000-16000. WHAT TERRAFORM DOES WITH THIS: nothing, to a running box — root_block_device[0].iops sits in the instance's lifecycle.ignore_changes (main.tf), so `terraform apply` never touches the live volume. This variable documents FRESH-PROVISION intent only; the LIVE change is an out-of-band `aws ec2 modify-volume --volume-id <id> --iops 6000 --throughput 500` (or scripts/aws-upgrade-instance.sh), online with no stop, and until that runs the live volume keeps its current settings. Same shape as the Quote 16 size raise. COST: gp3 charges $0.005 per provisioned IOPS above the free 3000 baseline, so (6000-3000) x $0.005 = $15.00/mo."
   type        = number
-  default     = 3000
+  default     = 6000
 
   validation {
     condition     = var.ebs_gp3_iops >= 3000 && var.ebs_gp3_iops <= 16000
@@ -116,9 +116,9 @@ variable "ebs_gp3_iops" {
 }
 
 variable "ebs_gp3_throughput" {
-  description = "Root gp3 EBS throughput in MiB/s. 125 is the gp3 baseline (free, included). Range 125-1000 — raise alongside IOPS for heavier QuestDB I/O. scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume; root_block_device[0].throughput is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-bumped value. This var documents the intended throughput for a FRESH provision."
+  description = "Root gp3 EBS throughput in MiB/s. RAISED 125 -> 500 on 2026-08-19 per operator Quote 17. Range 125-1000. WHY IT IS THE LOAD-BEARING HALF: dirty_background_ratio = 3 on a 32 GiB host lets ~1 GiB of dirty pages accumulate before writeback starts; draining that at the 125 MiB/s baseline is ~8 seconds of saturated device, during which the ILP flush blocks, the frame drain blocks behind it, the socket receive buffer fills, and Dhan skips a slow consumer forward to the latest available state — dropping intermediate ticks at THEIR side with no sequence number for us to detect it. 500 MiB/s takes the same drain to ~2 seconds. Already binding: 74% NVMe utilisation at 3,121 writes/sec was measured 2026-08-18, before the 25,000-instrument target and before depth persistence. WHAT TERRAFORM DOES WITH THIS: nothing, to a running box — root_block_device[0].throughput is in the instance's lifecycle.ignore_changes (main.tf), so `terraform apply` never touches the live volume. This variable documents FRESH-PROVISION intent only; the LIVE change is an out-of-band `aws ec2 modify-volume --volume-id <id> --iops 6000 --throughput 500`, online with no stop. COST: gp3 charges $0.040 per provisioned MiB/s above the free 125 baseline, so (500-125) x $0.040 = $15.00/mo. Combined with the IOPS raise: $30.00/mo (~₹3,043 incl GST) — HIGHER than the ~$20 the recommendation quoted the operator, because that figure predated the per-unit split; recorded rather than quietly absorbed."
   type        = number
-  default     = 125
+  default     = 500
 
   validation {
     condition     = var.ebs_gp3_throughput >= 125 && var.ebs_gp3_throughput <= 1000

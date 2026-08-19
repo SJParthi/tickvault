@@ -38,6 +38,30 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## OPERATOR RULING 2026-08-19 — kill-ceiling RAISED $100 → $130 (gp3 IOPS 3000→6000 + throughput 125→500)
+
+**The verbatim operator demand (2026-08-19 — typed directly in-session, preserve EXACTLY, typos included):**
+> "sow hatevr is eneded raise the ceiling dude okay? just raise whatevr yous aid and reocmemnded raise it accoridnly diue okay?"
+
+Full record + the tick-loss reasoning behind the disk raise: `daily-universe-scope-expansion-2026-05-27.md` §0 **Quote 17**.
+
+**What this authorizes:** the root gp3 volume's **IOPS 3000 → 6000** and **throughput 125 → 500 MiB/s**, and the kill-ceiling **$100 → $130**. Nothing else — instance stays r8g.xlarge, AZ stays un-pinned, schedule stays 08:30–17:30 IST, size stays 200 GB (Quote 16).
+
+**Honest cost.** gp3 charges $0.005 per provisioned IOPS above the free 3,000 baseline and $0.040 per provisioned MiB/s above the free 125: (6000−3000) × $0.005 = **$15.00** + (500−125) × $0.040 = **$15.00** = **$30.00/mo** (~₹3,043 incl GST). That is **higher than the ~$20 the recommendation quoted the operator**, because that figure predated the per-unit split — recorded rather than quietly absorbed. The envelope moves ~₹6,739–8,297 → **~₹9,782–11,340/mo**; the sub-₹1,000 target is now breached ~10× (was ~7×), knowingly, and the downward ratchet ladder stays PAUSED.
+
+**Why $130 (the AUTOMATIC actions fire at 90%/100% of the limit):**
+
+| Ceiling | 90% action line | vs the new $112.72 bill high estimate | Verdict |
+|---|---|---|---|
+| $100 (previous) | $90.00 | ❌ **below the bill** — `STOP_EC2_INSTANCES` mid-session | the 2026-07-31 failure mode |
+| **$130** | **$117.00** | ✅ clears by **$4.28** | **chosen** |
+
+**The margin is THINNER than the one this change was called in to fix** ($4.28 vs the $7.28 that triggered it), and that is stated plainly: the next cost increase of any size must raise this ceiling in the same change — there is no longer room to defer it.
+
+**4-WAY LOCKSTEP** (the header of `crates/aws-lambdas/tests/budget_ceiling_lockstep_guard.rs` is authoritative): `budget.tf limit_amount` · `budget-guards.tf BUDGET_KILL_USD` · `budget_digest.rs BUDGET_USD` · `hard_stop_guard.rs DEFAULT_BUDGET_KILL_USD` (the env-missing fallback, which must never sit BELOW the real ceiling — the defect the $35 → $100 raise created and this raise must not recreate).
+
+**⚠ STILL UNRESOLVED, and NOT fixed by this raise:** the 2026-07-31 ruling recorded BOTH `STOP_EC2_INSTANCES` actions in `EXECUTION_FAILURE`, and no session since has been able to re-check them (`budgets:DescribeBudgetActionsForBudget` → `AccessDeniedException` for `user/claude-code-agent`). Raising a ceiling does not repair a broken action. If they are still failing, the kill switch does not fire at all — safer short-term, worse long-term. Needs an identity with budgets read access.
+
 ## OPERATOR RULING 2026-08-08 — kill-ceiling RAISED $35 → $100 (r8g.xlarge + multi-AZ; TARGET formally BREACHED)
 
 **The verbatim operator demands (2026-08-08 — typed directly in-session, preserve EXACTLY, typos included):**

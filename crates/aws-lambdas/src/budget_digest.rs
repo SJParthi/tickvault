@@ -35,7 +35,7 @@ pub const GST_MULT: f64 = 1.18;
 /// block in budget.tf + aws-budget.md. KEEP IN SYNC with budget.tf
 /// limit_amount + budget-guards.tf BUDGET_KILL_USD — the digest reads
 /// BUDGET_USD, the native Budget Action + killswitch fire at limit_amount.
-pub const BUDGET_USD: f64 = 100.0;
+pub const BUDGET_USD: f64 = 130.0;
 
 /// SNS subject — legacy parity: `'[BUDGET] daily AWS cost'`.
 pub const DIGEST_SUBJECT: &str = "[BUDGET] daily AWS cost";
@@ -436,7 +436,26 @@ mod tests {
         // inr(0.53) = 53.159 → "₹53"; USD keeps 2dp with a SINGLE dollar sign.
         assert!(msg.contains("_Yesterday_:   ₹53   ($0.53)"), "{msg}");
         assert!(msg.contains("_This month_:  ₹1003   ($10.00)"), "{msg}");
-        assert!(msg.contains("_Of $100 stop-budget_: 10%"), "{msg}");
+        // Derived from the constant, not the literal. This assertion read
+        // `"_Of $100 stop-budget_: 10%"` and broke the moment the ceiling
+        // moved 100 -> 130 (2026-08-19, operator Quote 17). The property
+        // worth pinning is "the digest names the CURRENT ceiling and the
+        // right percentage of it", never one particular ceiling's arithmetic
+        // — a hardcoded number here just turns every authorized budget change
+        // into a spurious test failure.
+        // BOTH halves derived: the ceiling AND the percentage of it. The
+        // fixture spends $10.00, which was 10% of a $100 ceiling and is 8% of
+        // the $130 one — so hardcoding either number turns an authorized
+        // budget change into a spurious failure. What is worth pinning is
+        // that the digest names the CURRENT ceiling and the spend's true
+        // share of it.
+        let expected_pct = (10.00_f64 / BUDGET_USD * 100.0).round();
+        assert!(
+            msg.contains(&format!(
+                "_Of ${BUDGET_USD:.0} stop-budget_: {expected_pct:.0}%"
+            )),
+            "{msg}"
+        );
         assert!(msg.contains("_Days left_:   13"), "{msg}");
         assert!(msg.contains("*Where it goes (this month):*"));
         // Sorted descending by USD: CloudWatch (6.0) before EC2 (4.0),
@@ -453,7 +472,7 @@ mod tests {
         let (msg, pct) = render_digest(today, 0.0, 0.0, &[]);
         assert_eq!(pct, 0.0);
         assert!(msg.contains("  (no spend yet this month)"));
-        assert!(msg.contains("_Of $100 stop-budget_: 0%"));
+        assert!(msg.contains(&format!("_Of ${BUDGET_USD:.0} stop-budget_: 0%")));
     }
 
     #[test]
