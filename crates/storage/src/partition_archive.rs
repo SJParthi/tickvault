@@ -285,16 +285,54 @@ pub(crate) fn effective_hot_days(configured_days: u32) -> u32 {
     configured_days.max(MIN_HOT_DAYS)
 }
 
+/// Hard floor for the MARKET-DATA classes ([`RetentionClass::Depth`] and
+/// [`RetentionClass::Intraday`]): **1 day**, not 2.
+///
+/// Lowered from the general `MIN_HOT_DAYS` on 2026-08-19, on an operator
+/// correction — "why two days bro ... nowhere for the previous day it will
+/// never ever have any depths right dude". He is right, and the eligibility
+/// SQL is what proves it.
+///
+/// `build_detach_list_sql` selects on
+/// `minTimestamp < dateadd('d', -N, now())` — a ROLLING 24-hour window, not a
+/// calendar comparison. At `N = 1`:
+///
+/// - Yesterday's partitions have `minTimestamp` at least a full day back, so
+///   they ARE eligible and the previous day genuinely keeps no depth.
+/// - Today's partition has `minTimestamp >= today 00:00`, which is ALWAYS
+///   later than `now() - 24h`. It can never be selected — safe by
+///   construction, not by scheduling luck.
+///
+/// So the general floor of 2 was not protecting anything here; it was simply
+/// retaining a second day of the two heaviest tables on the box.
+///
+/// `0` remains forbidden and is exactly where the danger lives: the cutoff
+/// becomes `now()`, and the partition being actively written matches. The
+/// clamp below makes that unreachable from config.
+///
+/// The audit/Standard classes keep the 2-day floor: they are not tied to
+/// market hours, can receive writes at any hour, and are small enough that a
+/// second day costs nothing.
+pub(crate) const MIN_HOT_DAYS_MARKET_DATA: u32 = 1;
+
 /// The effective hot window (days) for a table under the given config —
 /// class window clamped to the [`MIN_HOT_DAYS`] floor.
 pub(crate) fn hot_window_days(table: &str, cfg: &PartitionRetentionConfig) -> u32 {
-    let class_days = match retention_class(table) {
+    let class = retention_class(table);
+    let class_days = match class {
         RetentionClass::MarketData => cfg.market_data_hot_days,
         RetentionClass::Standard => cfg.retention_days,
         RetentionClass::Depth => cfg.depth_hot_days,
         RetentionClass::Intraday => cfg.intraday_hot_days,
     };
-    effective_hot_days(class_days)
+    // Floor is per-class since 2026-08-19: the two current-day classes clamp
+    // at 1 so "current day only" is actually expressible, everything else
+    // keeps the 2-day floor. Never 0 — see MIN_HOT_DAYS_MARKET_DATA.
+    let floor = match class {
+        RetentionClass::Depth | RetentionClass::Intraday => MIN_HOT_DAYS_MARKET_DATA,
+        RetentionClass::MarketData | RetentionClass::Standard => MIN_HOT_DAYS,
+    };
+    class_days.max(floor)
 }
 
 // ---------------------------------------------------------------------------
@@ -1920,6 +1958,99 @@ mod tests {
     }
 
     #[test]
+    fn current_day_classes_floor_at_one_day_not_two() {
+        // The operator correction, 2026-08-19: "why two days bro ... nowhere
+        // for the previous day it will never ever have any depths". At a
+        // 2-day floor yesterday's depth was retained; at 1 it is dropped.
+        let mut c = cfg(90, 35);
+        c.depth_hot_days = 1;
+        c.intraday_hot_days = 1;
+        assert_eq!(
+            hot_window_days(crate::depth_persistence::MARKET_DEPTH_TABLE, &c),
+            1,
+            "depth must be able to express current-day-only"
+        );
+        assert_eq!(hot_window_days("ticks", &c), 1);
+        assert_eq!(hot_window_days("candles_1s", &c), 1);
+    }
+
+    #[test]
+    fn zero_is_still_forbidden_on_every_class() {
+        // The ONE genuinely dangerous value, and the reason a floor exists at
+        // all: at 0 the cutoff becomes `now()`, which matches the partition
+        // being actively written. No class may reach it from config.
+        let mut c = cfg(0, 0);
+        c.depth_hot_days = 0;
+        c.intraday_hot_days = 0;
+        for table in [
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            "ticks",
+            "candles_1s",
+            "candles_1m",
+            "ws_event_audit",
+        ] {
+            let days = hot_window_days(table, &c);
+            assert!(
+                days >= MIN_HOT_DAYS_MARKET_DATA,
+                "{table} reached {days} — a 0-day window would select the \
+                 partition currently being written"
+            );
+            assert_ne!(days, 0, "{table} must never resolve to a zero window");
+        }
+    }
+
+    #[test]
+    fn audit_classes_keep_the_two_day_floor() {
+        // The other half of the split. Audit tables are NOT tied to market
+        // hours and can receive writes at any hour, so their partitions are
+        // not reliably stable one day back. They keep the 2-day floor, and
+        // lowering the market-data floor must not have moved them.
+        let mut c = cfg(1, 1);
+        c.depth_hot_days = 1;
+        assert_eq!(hot_window_days("ws_event_audit", &c), MIN_HOT_DAYS);
+        assert_eq!(hot_window_days("partition_archive_audit", &c), MIN_HOT_DAYS);
+        // ...and minute-level history is on the audit-side floor too.
+        assert_eq!(hot_window_days("candles_1m", &c), MIN_HOT_DAYS);
+    }
+
+    #[test]
+    fn the_two_floors_are_ordered_and_neither_is_zero() {
+        // Guards the invariant rather than the literals: if someone raises
+        // the market-data floor above the general one, or drops either to 0,
+        // that is a design change and must fail here first.
+        assert!(
+            MIN_HOT_DAYS_MARKET_DATA >= 1,
+            "a zero floor makes the in-flight partition eligible"
+        );
+        assert!(
+            MIN_HOT_DAYS_MARKET_DATA <= MIN_HOT_DAYS,
+            "the current-day classes must not be forced to retain MORE than \
+             the audit classes"
+        );
+        assert_eq!(MIN_HOT_DAYS, 2, "audit floor unchanged");
+        assert_eq!(MIN_HOT_DAYS_MARKET_DATA, 1, "current-day floor");
+    }
+
+    #[test]
+    fn a_one_day_window_can_never_select_todays_partition() {
+        // The safety argument stated as a test on the real SQL builder rather
+        // than left in prose. `minTimestamp < dateadd('d', -1, now())` is a
+        // ROLLING 24h cutoff: today's partition starts at today 00:00, which
+        // is always later than now()-24h, so it cannot match. At 0 the cutoff
+        // is now() itself and it CAN match — which is what the floor stops.
+        let one = crate::partition_manager::build_detach_list_sql("market_depth", 1);
+        assert!(
+            one.contains("dateadd('d', -1, now())"),
+            "1-day window must build a rolling 24h cutoff, got: {one}"
+        );
+        let zero = crate::partition_manager::build_detach_list_sql("market_depth", 0);
+        assert!(
+            zero.contains("dateadd('d', -0, now())"),
+            "sanity: the 0 form is what the floor exists to prevent reaching"
+        );
+    }
+
+    #[test]
     fn intraday_hot_days_clamps_to_the_min_hot_days_floor() {
         // "Current day only" means the floor, because a day-partitioned
         // table's current partition cannot be dropped while rows still land
@@ -1928,8 +2059,8 @@ mod tests {
         cfg.intraday_hot_days = 0;
         assert_eq!(
             hot_window_days("ticks", &cfg),
-            MIN_HOT_DAYS,
-            "a zero intraday window must clamp to the floor, never to zero"
+            MIN_HOT_DAYS_MARKET_DATA,
+            "a zero intraday window must clamp to the current-day floor, never to zero"
         );
     }
     use super::*;
@@ -1983,14 +2114,18 @@ mod tests {
 
     #[test]
     fn depth_hot_window_respects_the_min_hot_days_floor() {
-        // Today and yesterday stay untouchable even if the operator sets 0 —
-        // the same floor every other class gets. A depth partition dropped on
-        // the day it was written would lose the session in progress.
+        // Re-blessed 2026-08-19: depth now floors at MIN_HOT_DAYS_MARKET_DATA
+        // (1 day), not the general 2. What this test actually protects is
+        // unchanged and is the part that matters — a 0 from config must never
+        // reach the sweep, because at 0 the cutoff is `now()` and the
+        // partition being written this second becomes eligible. TODAY stays
+        // untouchable; YESTERDAY is now correctly dropped, which is the whole
+        // point of the operator's current-day-only design.
         let mut c = cfg(90, 35);
         c.depth_hot_days = 0;
         assert_eq!(
             hot_window_days(crate::depth_persistence::MARKET_DEPTH_TABLE, &c),
-            MIN_HOT_DAYS
+            MIN_HOT_DAYS_MARKET_DATA
         );
     }
 

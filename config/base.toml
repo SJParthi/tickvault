@@ -220,7 +220,7 @@ market_data_hot_days = 35
 # not an executor one — but the arithmetic no longer fits beside depth, and
 # the honest options are a shorter market-data window or the 100 -> 200 GB
 # volume grow that variables.tf already permits.
-depth_hot_days = 2
+depth_hot_days = 1
 # INTRADAY hot window (2026-08-19) — `ticks` + the SIXTEEN sub-minute candle
 # tables (candles_1s..15s, 30s). Its own knob on an operator directive that
 # separates two things the single market-data window used to conflate:
@@ -248,7 +248,7 @@ depth_hot_days = 2
 #
 # NOT a retention cut: every partition is exported, uploaded and
 # row-count-VERIFIED in S3 before it leaves EBS.
-intraday_hot_days = 2
+intraday_hot_days = 1
 # Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
 # Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
 # and size-verified. ROLLBACK: set false (or delete the key) to restore the
