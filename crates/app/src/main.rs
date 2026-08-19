@@ -1899,10 +1899,17 @@ async fn main() -> Result<()> {
         // the operator reading "residual ... from a pre-retirement session"
         // would file it as housekeeping rather than as data loss.
         //
-        // The frames are genuinely preserved on disk, and re-folding them is
-        // real work (the fold path takes a live ring, not a replay batch), so
-        // this stays a drop for now. What changes is that it stops describing
-        // a live gap as historical tidying, and says plainly what was lost.
+        // CORRECTED 2026-08-19: the parenthetical "(the fold path takes a
+        // live ring, not a replay batch)" is FALSE since 2026-08-15 —
+        // `refold_wal_frames` takes precisely a replay batch, and the guard
+        // above (`dhan_lane_will_refold`) is why this block no longer fires on
+        // the normal path. It survived inside a block whose CONDITION had
+        // already been narrowed around it, which is how a comment outlives the
+        // fact it described.
+        //
+        // The block itself is still correct and still a real drop: it fires
+        // ONLY when the lane will not run, and then nothing will ever fold
+        // these frames. The message below is accurate for that branch.
         error!(
             code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
             frames = dropped,

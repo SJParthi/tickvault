@@ -233,3 +233,57 @@ fn seals_rescued_is_reported_beside_seals_dropped() {
          when the pair is logged together"
     );
 }
+
+/// A lost seal must PAGE, not just increment a counter.
+///
+/// This is the hole the same-day hostile audit found in the no-drop fix
+/// itself. `escalate_refused_seal` returned `SealRefusal::Lost` with no log at
+/// all, so the operator's only signal was `tv_dhan_feed_seals_dropped_total` —
+/// which the Dhan noise lock records as *visible but unpageable*.
+///
+/// The case that makes it fatal: if `SealWriterRunner::new` fails at boot,
+/// `main.rs` installs NEITHER the sender NOR the overflow, so every seal takes
+/// the no-tier path for the life of the process. The alarmed drain counter
+/// lives inside the writer loop that never spawned, so it reads a flat,
+/// healthy zero all day while a whole session of candles evaporates.
+#[test]
+fn every_lost_seal_path_fires_aggregator_drop_01() {
+    let code = strip_line_comments(&read("crates/app/src/dhan_feed_stack.rs"));
+
+    // Both Lost arms must record. Two call sites: no-tier, and both-tiers-failed.
+    assert_eq!(
+        code.matches("seal_loss_alarm::record_lost_seal(").count(),
+        2,
+        "both Lost arms — no durable tier installed, and both disk tiers refused — \
+         must record and page; a bare `return SealRefusal::Lost` is the false-OK \
+         this whole policy exists to prevent"
+    );
+    assert!(
+        code.contains("SealLossReason::NoDurableTier"),
+        "the no-durable-tier arm must be distinguishable — its operator action is a \
+         restart, not a disk fix"
+    );
+    assert!(
+        code.contains("SealLossReason::BothDiskTiersFailed"),
+        "the both-tiers-failed arm must be distinguishable"
+    );
+
+    let alarm = strip_line_comments(&read("crates/app/src/seal_loss_alarm.rs"));
+    assert!(
+        alarm.contains("ErrorCode::AggregatorDrop01"),
+        "a lost seal must carry the AGGREGATOR-DROP-01 code — that is what the \
+         error-code metric filter alarms on"
+    );
+    // The counter must be exact even though the log is throttled: at ~4,565
+    // instruments across 13 emitted timeframes the no-tier case fires on every
+    // seal, and an unthrottled log would bury the page and fill the disk.
+    assert!(
+        alarm.contains("is_power_of_two()"),
+        "the log must be throttled (powers of two, the indicator::engine idiom)"
+    );
+    assert!(
+        alarm.contains("seals_lost_total = total"),
+        "a throttled line must carry the running total, or it implies a single \
+         event when thousands were lost"
+    );
+}

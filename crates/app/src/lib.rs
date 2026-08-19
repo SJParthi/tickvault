@@ -70,6 +70,7 @@ pub mod orphan_position_watchdog_boot;
 // SPOT half): fetch each just-closed session minute's official 1m OHLCV
 // for the 3 IDX_I spot indices via POST /v2/charts/intraday and persist to
 // the `spot_1m_rest` table (SPOT1M-01/02).
+pub mod seal_loss_alarm;
 pub mod spot_1m_rest_boot;
 // Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
 // the OPTION-CHAIN half; config-gated DEFAULT-OFF pending the live
