@@ -466,7 +466,9 @@ impl SidFoldState {
         let mut sealed: Vec<SealedBucket> = Vec::new();
         for tf in TfIndex::ALL {
             if tf.is_second_scale() {
-                // Second-scale frames are GDF-feed-gated: never folded from REST 1m; their only future writer is the GDF 1s pipeline.
+                // Second-scale frames are never folded from REST 1m — a 1-minute
+                // vendor bar cannot open a sub-minute bucket. (Their writer is the
+                // live tick lane, not GDF; corrected 2026-08-19 with tf_index.rs.)
                 continue;
             }
             let idx = tf as usize;
