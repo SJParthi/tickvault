@@ -44,11 +44,105 @@ use std::collections::HashMap;
 
 use tickvault_common::types::ExchangeSegment;
 
+/// What kind of instrument a master row describes (`INSTRUMENT` column).
+///
+/// An enum rather than the raw `String` deliberately: the master is ~150,000
+/// rows and every row would otherwise carry a heap allocation for one of nine
+/// fixed words. It is also the difference between a typo comparing false
+/// forever and a typo failing to compile.
+///
+/// [`Other`](Self::Other) is the catch-all — currency, commodity, and anything
+/// Dhan adds later. Per `annexure-enums.md` an unknown code must never panic;
+/// it lands here and is simply not selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InstrumentClass {
+    /// `INDEX` — an index value. Not tradeable, has no order book.
+    Index,
+    /// `EQUITY` — cash equity.
+    Equity,
+    /// `FUTIDX` — index future.
+    IndexFuture,
+    /// `FUTSTK` — stock future.
+    StockFuture,
+    /// `OPTIDX` — index option.
+    IndexOption,
+    /// `OPTSTK` — stock option.
+    StockOption,
+    /// Anything else, including currency and commodity derivatives, which are
+    /// out of scope for this product.
+    Other,
+}
+
+impl InstrumentClass {
+    /// Classifies an already-uppercased `INSTRUMENT` value.
+    #[must_use]
+    pub fn from_master_field(value: &str) -> Self {
+        match value {
+            "INDEX" => Self::Index,
+            "EQUITY" => Self::Equity,
+            "FUTIDX" => Self::IndexFuture,
+            "FUTSTK" => Self::StockFuture,
+            "OPTIDX" => Self::IndexOption,
+            "OPTSTK" => Self::StockOption,
+            _ => Self::Other,
+        }
+    }
+
+    /// True for the two option classes — the only rows carrying a strike.
+    #[must_use]
+    pub fn is_option(self) -> bool {
+        matches!(self, Self::IndexOption | Self::StockOption)
+    }
+
+    /// True for the two futures classes.
+    #[must_use]
+    pub fn is_future(self) -> bool {
+        matches!(self, Self::IndexFuture | Self::StockFuture)
+    }
+}
+
+/// Which leg of an option pair a row is (`OPTION_TYPE` column).
+///
+/// [`None`](Self::None) covers every non-option row, so a futures row can
+/// never be mistaken for a call by a comparison that forgot to check the
+/// class first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OptionLeg {
+    /// `CE`.
+    Call,
+    /// `PE`.
+    Put,
+    /// Absent — every non-option row.
+    None,
+}
+
+impl OptionLeg {
+    /// Classifies an already-uppercased `OPTION_TYPE` value.
+    #[must_use]
+    pub fn from_master_field(value: &str) -> Self {
+        match value {
+            "CE" => Self::Call,
+            "PE" => Self::Put,
+            _ => Self::None,
+        }
+    }
+}
+
 /// A row of the Dhan detailed master, reduced to the columns the join needs.
 ///
 /// Deliberately NOT the full 20+ column row: carrying columns nothing reads
 /// would triple the memory of a ~150,000-row master for no benefit, and every
 /// unused field is a field that can silently go stale.
+///
+/// # Why the derivative fields are typed and compact
+///
+/// The five derivative columns (added 2026-08-19 for the contract universe)
+/// are `Copy` scalars wherever a scalar will do — a class enum, a `u32` date,
+/// an `i64` of paise, a leg enum — and only `underlying_symbol` keeps a
+/// `String`, because it is the grouping key and there is no fixed vocabulary
+/// for it. Storing the raw strings instead would have added five heap
+/// allocations to every one of ~150,000 rows for values that are compared,
+/// never printed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterRow {
     /// `SECURITY_ID` — the value the whole pipeline exists to resolve.
@@ -64,6 +158,36 @@ pub struct MasterRow {
     pub segment: String,
     /// `SERIES` — `EQ` for cash equity. Empty for non-equity rows.
     pub series: String,
+    /// `INSTRUMENT` — the instrument class.
+    ///
+    /// [`InstrumentClass::Other`] when the column is absent from the header,
+    /// which is what keeps a header carrying only the six join columns a valid
+    /// master: nothing selects `Other`, so an equity-only file behaves exactly
+    /// as it did before the derivative columns existed.
+    pub class: InstrumentClass,
+    /// `SM_EXPIRY_DATE` as `YYYYMMDD`, or `0` when absent.
+    ///
+    /// A packed integer rather than a date type so that "which expiry is
+    /// nearest" is an integer comparison with no parsing, no timezone, and no
+    /// dependency. Lexicographic and numeric order coincide for `YYYYMMDD`,
+    /// which is the whole reason this packing is the conventional one.
+    pub expiry_ymd: u32,
+    /// `STRIKE_PRICE` in paise, or `0` when absent.
+    ///
+    /// Integer paise, never `f64`: strikes are compared for equality and
+    /// sorted into a ladder, and `data-integrity.md` bans float equality on
+    /// prices. NSE tick sizes bottom out at 5 paise, so ×100 is exact.
+    pub strike_paise: i64,
+    /// `OPTION_TYPE` — which leg, or [`OptionLeg::None`].
+    pub option_leg: OptionLeg,
+    /// `UNDERLYING_SYMBOL`, uppercased. Empty for non-derivative rows.
+    ///
+    /// The grouping key for contract selection. `UNDERLYING_SECURITY_ID` is
+    /// deliberately NOT carried: it is an id without its segment, and an id
+    /// without its segment is not an instrument identity (I-P1-11). The symbol
+    /// is unambiguous within the NSE derivative segment and is what the
+    /// selection actually groups on.
+    pub underlying_symbol: String,
 }
 
 impl MasterRow {
@@ -154,6 +278,74 @@ const COL_SYMBOL_NAME: &str = "SYMBOL_NAME";
 const COL_EXCH_ID: &str = "EXCH_ID";
 const COL_SEGMENT: &str = "SEGMENT";
 const COL_SERIES: &str = "SERIES";
+/// Derivative columns. OPTIONAL, unlike the six above — see [`parse_master_csv`].
+const COL_INSTRUMENT: &str = "INSTRUMENT";
+const COL_EXPIRY: &str = "SM_EXPIRY_DATE";
+const COL_STRIKE: &str = "STRIKE_PRICE";
+const COL_OPTION_TYPE: &str = "OPTION_TYPE";
+const COL_UNDERLYING_SYMBOL: &str = "UNDERLYING_SYMBOL";
+
+/// Packs a `SM_EXPIRY_DATE` value into `YYYYMMDD`, or `0` when unusable.
+///
+/// Accepts the bare `YYYY-MM-DD` and the `YYYY-MM-DD HH:MM:SS` form, because
+/// the vendor has shipped both and a parser that accepts only one silently
+/// drops every derivative row on the day they switch. Anything else returns
+/// `0`, which reads downstream as "no expiry" and is never selected — a
+/// refusal, not a guess at a date.
+#[must_use]
+pub fn parse_expiry_ymd(value: &str) -> u32 {
+    let date = value.trim();
+    // Only the leading date part is read; a time suffix is ignored.
+    let mut parts = date.split(['-', ' ', 'T']);
+    let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
+        return 0;
+    };
+    let (Ok(y), Ok(m), Ok(d)) = (
+        y.parse::<u32>(),
+        m.parse::<u32>(),
+        // The day part can carry a time suffix when the separator was not one
+        // of the three above; take only leading digits.
+        d.trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap_or("")
+            .parse::<u32>(),
+    ) else {
+        return 0;
+    };
+    // Range-check rather than trust: a garbled row must not produce an expiry
+    // that sorts before every real one and captures the "nearest" slot.
+    if !(1970..=2999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return 0;
+    }
+    y * 10_000 + m * 100 + d
+}
+
+/// Parses a `STRIKE_PRICE` into integer paise, or `0` when unusable.
+///
+/// Rounds rather than truncates: `24500.999999` from a vendor float is
+/// `2450100` paise, not `2450099`. A non-finite or negative value returns `0`,
+/// which is never selected.
+#[must_use]
+pub fn parse_strike_paise(value: &str) -> i64 {
+    let Ok(rupees) = value.trim().parse::<f64>() else {
+        return 0;
+    };
+    if !rupees.is_finite() || rupees <= 0.0 {
+        return 0;
+    }
+    let paise = (rupees * 100.0).round();
+    // Above this the `as` cast is implementation-defined; no real strike is
+    // anywhere near it, so a value this large is corruption, not a strike.
+    if paise > 9_007_199_254_740_991.0 {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    // APPROVED: bounded above by the check on the line above, and below by the
+    // `<= 0.0` guard — the value is a whole number inside i64 range.
+    let paise = paise as i64;
+    paise
+}
 
 /// `numerator / denominator` as an exact `f64`, with no lossy cast.
 ///
@@ -273,6 +465,23 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
         col(COL_SEGMENT)?,
         col(COL_SERIES)?,
     );
+    // The five derivative columns are OPTIONAL, and that is deliberate. A
+    // header carrying only the six join columns is still a valid master —
+    // every existing caller, fixture and test predates these columns, and
+    // making them mandatory would have turned a widening into a breaking
+    // change. Absent column => the row's derivative fields read as "absent",
+    // and nothing selects an absent field.
+    let opt_col = |name: &'static str| -> Option<usize> { index.get(name).copied() };
+    let i_class = opt_col(COL_INSTRUMENT);
+    let i_expiry = opt_col(COL_EXPIRY);
+    let i_strike = opt_col(COL_STRIKE);
+    let i_leg = opt_col(COL_OPTION_TYPE);
+    let i_underlying = opt_col(COL_UNDERLYING_SYMBOL);
+
+    // `widest` bounds the mandatory columns ONLY. An optional column that
+    // lands beyond a short row is read as absent for that row, never as a bad
+    // row: a truncated trailing field on an equity row must not reject the
+    // equity row, which is the only thing the six mandatory columns describe.
     let widest = [i_sid, i_isin, i_sym, i_exch, i_seg, i_series]
         .into_iter()
         .max()
@@ -304,6 +513,25 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
             exch_id: fields[i_exch].trim().to_uppercase(),
             segment: fields[i_seg].trim().to_uppercase(),
             series: fields[i_series].trim().to_uppercase(),
+            class: i_class
+                .and_then(|i| fields.get(i))
+                .map_or(InstrumentClass::Other, |v| {
+                    InstrumentClass::from_master_field(&v.trim().to_uppercase())
+                }),
+            expiry_ymd: i_expiry
+                .and_then(|i| fields.get(i))
+                .map_or(0, |v| parse_expiry_ymd(v)),
+            strike_paise: i_strike
+                .and_then(|i| fields.get(i))
+                .map_or(0, |v| parse_strike_paise(v)),
+            option_leg: i_leg
+                .and_then(|i| fields.get(i))
+                .map_or(OptionLeg::None, |v| {
+                    OptionLeg::from_master_field(&v.trim().to_uppercase())
+                }),
+            underlying_symbol: i_underlying
+                .and_then(|i| fields.get(i))
+                .map_or_else(String::new, |v| v.trim().to_uppercase()),
         });
     }
 
@@ -745,6 +973,11 @@ mod tests {
             exch_id: "NSE".into(),
             segment: "E".into(),
             series: "EQ".into(),
+            class: InstrumentClass::Equity,
+            expiry_ymd: 0,
+            strike_paise: 0,
+            option_leg: OptionLeg::None,
+            underlying_symbol: String::new(),
         };
         assert!(base.is_nse_cash_equity());
         // BSE also lists series EQ — a constituent resolved there is a
@@ -774,6 +1007,158 @@ mod tests {
         );
     }
 
+    // ---- derivative columns (added 2026-08-19 for the contract universe) ----
+
+    /// The six-column header every fixture and caller used before the
+    /// derivative columns existed. If this ever fails, a widening became a
+    /// breaking change.
+    #[test]
+    fn test_a_six_column_master_still_parses_and_reads_as_no_derivatives() {
+        let body = master_with(HEADER, &["2885,INE002A01018,RELIANCE,NSE,E,EQ"]);
+        let rows = parse_master_csv(&body).expect("the six join columns are still sufficient");
+        let r = rows
+            .iter()
+            .find(|r| r.security_id == 2885)
+            .expect("present");
+        assert_eq!(
+            r.class,
+            InstrumentClass::Other,
+            "absent column reads as Other"
+        );
+        assert_eq!(r.expiry_ymd, 0);
+        assert_eq!(r.strike_paise, 0);
+        assert_eq!(r.option_leg, OptionLeg::None);
+        assert!(r.underlying_symbol.is_empty());
+        assert!(r.is_nse_cash_equity(), "the equity join is unaffected");
+    }
+
+    #[test]
+    fn test_a_detailed_master_row_carries_its_derivative_fields() {
+        let header = format!(
+            "{HEADER},INSTRUMENT,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,UNDERLYING_SYMBOL"
+        );
+        let body = master_with(
+            &header,
+            &["44311,,NIFTY28AUG2524500CE,NSE,D,,OPTIDX,2026-08-28,24500.000000,CE,NIFTY"],
+        );
+        let r = rows_by_id(&body, 44311);
+        assert_eq!(r.class, InstrumentClass::IndexOption);
+        assert_eq!(r.expiry_ymd, 2026_08_28);
+        assert_eq!(r.strike_paise, 2_450_000, "24500 rupees is 2,450,000 paise");
+        assert_eq!(r.option_leg, OptionLeg::Call);
+        assert_eq!(r.underlying_symbol, "NIFTY");
+    }
+
+    #[test]
+    fn test_expiry_accepts_both_vendor_forms_and_refuses_the_rest() {
+        assert_eq!(parse_expiry_ymd("2026-08-28"), 2026_08_28);
+        assert_eq!(parse_expiry_ymd("2026-08-28 14:30:00"), 2026_08_28);
+        assert_eq!(parse_expiry_ymd("2026-08-28T14:30:00"), 2026_08_28);
+        assert_eq!(parse_expiry_ymd("  2026-08-28  "), 2026_08_28);
+        // Refusals — every one of these must read as "no expiry", never as a
+        // date that could win the nearest-expiry slot.
+        assert_eq!(parse_expiry_ymd(""), 0);
+        assert_eq!(parse_expiry_ymd("0"), 0);
+        assert_eq!(parse_expiry_ymd("not-a-date"), 0);
+        assert_eq!(parse_expiry_ymd("2026-13-01"), 0, "month 13");
+        assert_eq!(parse_expiry_ymd("2026-08-32"), 0, "day 32");
+        assert_eq!(parse_expiry_ymd("1969-12-31"), 0, "before the floor");
+    }
+
+    #[test]
+    fn test_expiry_packing_orders_the_same_way_calendar_time_does() {
+        // The whole nearest-expiry selection is an integer comparison on this
+        // packing. If the packing ever stops being monotonic in calendar
+        // order, the selector silently picks the wrong month.
+        let mut days = [
+            parse_expiry_ymd("2027-01-01"),
+            parse_expiry_ymd("2026-09-01"),
+            parse_expiry_ymd("2026-08-28"),
+            parse_expiry_ymd("2026-12-31"),
+        ];
+        days.sort_unstable();
+        assert_eq!(days, [2026_08_28, 2026_09_01, 2026_12_31, 2027_01_01]);
+    }
+
+    #[test]
+    fn test_strike_rounds_to_paise_and_refuses_nonsense() {
+        assert_eq!(parse_strike_paise("24500.000000"), 2_450_000);
+        assert_eq!(parse_strike_paise("24500"), 2_450_000);
+        assert_eq!(parse_strike_paise("1234.55"), 123_455);
+        // Vendor float drift must round to the intended strike, not floor to
+        // one paise below it.
+        assert_eq!(parse_strike_paise("24500.999999"), 2_450_100);
+        assert_eq!(parse_strike_paise("0.000000"), 0, "a future has no strike");
+        assert_eq!(parse_strike_paise("-100"), 0);
+        assert_eq!(parse_strike_paise("NaN"), 0);
+        assert_eq!(parse_strike_paise("inf"), 0);
+        assert_eq!(parse_strike_paise(""), 0);
+    }
+
+    #[test]
+    fn test_unknown_instrument_and_option_codes_classify_rather_than_panic() {
+        // annexure-enums.md: no panic on an unknown code, ever.
+        assert_eq!(
+            InstrumentClass::from_master_field("SOMETHING_NEW"),
+            InstrumentClass::Other
+        );
+        assert_eq!(
+            InstrumentClass::from_master_field(""),
+            InstrumentClass::Other
+        );
+        assert_eq!(OptionLeg::from_master_field("XX"), OptionLeg::None);
+        assert_eq!(OptionLeg::from_master_field(""), OptionLeg::None);
+        // Currency and commodity derivatives are deliberately not their own
+        // variants: they are out of scope, so Other is the correct answer and
+        // nothing selects Other.
+        assert_eq!(
+            InstrumentClass::from_master_field("OPTCUR"),
+            InstrumentClass::Other
+        );
+        assert_eq!(
+            InstrumentClass::from_master_field("FUTCOM"),
+            InstrumentClass::Other
+        );
+    }
+
+    #[test]
+    fn test_class_predicates_split_options_from_futures() {
+        assert!(InstrumentClass::IndexOption.is_option());
+        assert!(InstrumentClass::StockOption.is_option());
+        assert!(!InstrumentClass::IndexFuture.is_option());
+        assert!(InstrumentClass::IndexFuture.is_future());
+        assert!(InstrumentClass::StockFuture.is_future());
+        assert!(!InstrumentClass::Equity.is_future());
+        assert!(!InstrumentClass::Equity.is_option());
+    }
+
+    #[test]
+    fn test_a_row_too_short_for_an_optional_column_is_kept_not_rejected() {
+        // A truncated trailing field on an equity row must not reject the row
+        // — the six mandatory columns are all it needs to be a valid equity.
+        let header = format!(
+            "{HEADER},INSTRUMENT,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,UNDERLYING_SYMBOL"
+        );
+        let body = master_with(&header, &["2885,INE002A01018,RELIANCE,NSE,E,EQ"]);
+        let r = rows_by_id(&body, 2885);
+        assert!(r.is_nse_cash_equity(), "the short row survives");
+        assert_eq!(
+            r.class,
+            InstrumentClass::Other,
+            "missing field reads absent"
+        );
+    }
+
+    /// Parses `body` and returns the row with `id`, panicking with a useful
+    /// message when absent. Keeps the derivative tests to one line each.
+    fn rows_by_id(body: &str, id: u64) -> MasterRow {
+        parse_master_csv(body)
+            .expect("fixture parses")
+            .into_iter()
+            .find(|r| r.security_id == id)
+            .unwrap_or_else(|| panic!("row {id} missing from the parsed master"))
+    }
+
     fn row(id: u64, isin: &str, sym: &str) -> MasterRow {
         MasterRow {
             security_id: id,
@@ -782,6 +1167,11 @@ mod tests {
             exch_id: "NSE".into(),
             segment: "E".into(),
             series: "EQ".into(),
+            class: InstrumentClass::Equity,
+            expiry_ymd: 0,
+            strike_paise: 0,
+            option_leg: OptionLeg::None,
+            underlying_symbol: String::new(),
         }
     }
 
