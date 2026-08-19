@@ -441,7 +441,7 @@ resource "aws_cloudwatch_metric_alarm" "dhan_wal_dropped" {
 # handles are pre-registered with `increment(0)` at construction, so the first
 # real increment is never swallowed as the agent's missing baseline sample.
 resource "aws_cloudwatch_metric_alarm" "ticks_lost_spill" {
-  alarm_name        = "tv-${var.environment}-ticks-lost-spill"
+  alarm_name = "tv-${var.environment}-ticks-lost-spill"
   # NOTE: AWS caps alarm_description at 1024 characters. The long-form
   # reasoning that used to live in this string is above; the description
   # itself is the pager text and must stay under the cap. A terraform

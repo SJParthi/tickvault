@@ -2949,6 +2949,31 @@ pub struct PartitionRetentionConfig {
     /// fail-closed by construction.
     #[serde(default = "default_depth_hot_days")]
     pub depth_hot_days: u32,
+    /// Hot window in days for the INTRADAY class — `ticks` plus the five
+    /// second-level candle tables (`candles_1s`/`5s`/`10s`/`15s`/`30s`).
+    ///
+    /// Its own knob since 2026-08-19, on an operator directive that separates
+    /// two things the old single `market_data_hot_days` window conflated:
+    /// *"for depth or whatever it is only current day, worst case busy day …
+    /// when it comes to historical we will just have minute levels, because
+    /// indicators, strategies and minute level of all these historical"*.
+    ///
+    /// Why it cannot share the market-data window: at the 25,000-instrument
+    /// target `ticks` runs ~14 GB/day and the second-level candles are the
+    /// heaviest tables on the box after depth. Holding either for 35 days
+    /// commits several hundred GB on a 200 GB root, and a full disk stops
+    /// EVERY table — the same reasoning that gave `market_depth` its own knob
+    /// on 2026-08-15, applied to the class directly beneath it.
+    ///
+    /// Minute-and-above candles are deliberately NOT in this class: they are
+    /// the history indicators and strategies read, they are two orders of
+    /// magnitude smaller per day, and they keep `market_data_hot_days`.
+    ///
+    /// This is NOT a retention cut. Every partition is exported, uploaded and
+    /// row-count-VERIFIED in S3 before it leaves EBS, and the floor clamps to
+    /// `MIN_HOT_DAYS` so today and yesterday stay local and untouchable.
+    #[serde(default = "default_intraday_hot_days")]
+    pub intraday_hot_days: u32,
     /// Master gate for the archive→verify→drop leg. serde default FALSE so
     /// the destructive behaviour must be explicitly configured on
     /// (config/base.toml sets it true for prod); flipping it off restores
@@ -3029,6 +3054,7 @@ impl Default for PartitionRetentionConfig {
             retention_days: default_retention_days(),
             market_data_hot_days: default_market_data_hot_days(),
             depth_hot_days: default_depth_hot_days(),
+            intraday_hot_days: default_intraday_hot_days(),
             archive_enabled: false,
             archive_bucket: String::new(),
             max_partitions_per_run: default_max_partitions_per_run(),
@@ -3060,6 +3086,18 @@ const fn default_market_data_hot_days() -> u32 {
 /// 100 GB root, so the sweep would never fire before the disk filled.
 const fn default_depth_hot_days() -> u32 {
     3
+}
+
+/// Default INTRADAY hot window: 2 days = the `MIN_HOT_DAYS` floor itself —
+/// today plus yesterday, which is the smallest window the sweep can honour
+/// without risking a partition that is still being written.
+///
+/// The operator's directive is "current day only"; 2 is what that means in
+/// practice, because a day-partitioned table's current partition cannot be
+/// dropped while rows are still landing in it. Setting this to 0 or 1 changes
+/// nothing — `effective_hot_days` clamps to the same floor.
+const fn default_intraday_hot_days() -> u32 {
+    2
 }
 
 /// Default per-run archive bound: 200 partitions. At ~8–24 hourly ticks

@@ -169,6 +169,16 @@ pub enum RetentionClass {
     /// Everything else (audit / daily-data tables) — the existing
     /// `retention_days` window (default 90).
     Standard,
+    /// `ticks` + the five second-level candle tables — their own class since
+    /// 2026-08-19, on the operator directive separating current-day intraday
+    /// data from the minute-level history indicators and strategies read.
+    ///
+    /// At the 25,000-instrument target `ticks` runs ~14 GB/day and the
+    /// second-level candles are the heaviest tables after depth; 35 days of
+    /// either commits several hundred GB on a 200 GB root, and a full disk
+    /// stops EVERY table. Same reasoning that carved out `Depth` in
+    /// 2026-08-15, applied one level down.
+    Intraday,
     /// `market_depth` — its own class because it is an order of magnitude
     /// heavier than anything else stored (2026-08-15). ~21 GB/day measured
     /// over the 24,000-second session at 72 B/row, ~104 GB/day at five
@@ -185,6 +195,34 @@ pub enum RetentionClass {
 /// the 35-day market-data window by virtue of that membership alone.
 const DEPTH_TABLES: [&str; 1] = [crate::depth_persistence::MARKET_DEPTH_TABLE];
 
+/// True when `table` belongs to the [`RetentionClass::Intraday`] window —
+/// `ticks` plus every SUB-MINUTE candle table.
+///
+/// DERIVED, not listed. The first version of this was a literal array, and it
+/// was wrong on the first run: the timeframe enum defines **16** sub-minute
+/// timeframes (1s..15s and 30s), not the five the list named, so
+/// `candles_2s` through `candles_14s` would have silently kept the 35-day
+/// window — the exact failure the split exists to prevent, hidden inside the
+/// fix for it. `intraday_class_covers_every_sub_minute_timeframe` caught it.
+///
+/// The predicate is now the semantic one: a timeframe whose bucket is shorter
+/// than a minute is intraday. A new sub-minute timeframe joins automatically;
+/// a minute-or-longer one cannot join by accident. That is worth the O(24)
+/// scan, which runs on the cold retention sweep and never on a tick.
+fn is_intraday_table(table: &str) -> bool {
+    if table == "ticks" {
+        return true;
+    }
+    (0..tickvault_trading::candles::TF_COUNT).any(|ordinal| {
+        tickvault_trading::candles::TfIndex::from_ordinal(ordinal).is_some_and(|tf| {
+            tf.table_name() == table && tf.seconds_per_bucket() < SECONDS_PER_MINUTE
+        })
+    })
+}
+
+/// One minute, in seconds — the boundary between "intraday, current-day only"
+/// and "history the indicator and strategy paths read".
+const SECONDS_PER_MINUTE: u32 = 60;
 /// The two per-minute option-chain capture tables (operator directive
 /// 2026-07-16: *"for only spots we will have minimum one month data …
 /// but option only for the current day"* — the chain tables are the
@@ -225,6 +263,12 @@ pub(crate) fn retention_class(table: &str) -> RetentionClass {
     // sweep would never fire before the disk filled.
     if DEPTH_TABLES.contains(&table) {
         RetentionClass::Depth
+    } else if is_intraday_table(table) {
+        // BEFORE the market-data test, for exactly the reason Depth is before
+        // both: `ticks` is HOUR_PARTITIONED and the second-level candles are
+        // in `candle_table_names()`, so either would otherwise be classified
+        // on the 35-day window by virtue of that membership alone.
+        RetentionClass::Intraday
     } else if HOUR_PARTITIONED_TABLES.contains(&table)
         || crate::shadow_persistence::candle_table_names().contains(&table)
         || CHAIN_MARKET_DATA_TABLES.contains(&table)
@@ -248,6 +292,7 @@ pub(crate) fn hot_window_days(table: &str, cfg: &PartitionRetentionConfig) -> u3
         RetentionClass::MarketData => cfg.market_data_hot_days,
         RetentionClass::Standard => cfg.retention_days,
         RetentionClass::Depth => cfg.depth_hot_days,
+        RetentionClass::Intraday => cfg.intraday_hot_days,
     };
     effective_hot_days(class_days)
 }
@@ -1794,6 +1839,99 @@ fn now_ist_nanos() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    // -----------------------------------------------------------------
+    // INTRADAY class (2026-08-19) — ticks + second-level candles are
+    // current-day; minute-level and above are the history that indicators
+    // and strategies read and keep the 35-day window.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn intraday_class_covers_ticks_and_every_second_level_candle() {
+        // These six are the heaviest tables on the box after depth. Before
+        // the split they inherited `market_data_hot_days`, which at the
+        // 25,000-instrument target commits several hundred GB on a 200 GB
+        // root — and a full disk stops EVERY table, not just these.
+        for table in [
+            "ticks",
+            "candles_1s",
+            "candles_2s",
+            "candles_14s",
+            "candles_30s",
+        ] {
+            assert_eq!(
+                retention_class(table),
+                RetentionClass::Intraday,
+                "{table} must be current-day, not on the 35-day market-data window"
+            );
+        }
+    }
+
+    #[test]
+    fn minute_and_above_candles_stay_on_the_market_data_window() {
+        // The other half, and the one that would silently destroy the
+        // operator's stated requirement if it regressed: minute-level history
+        // is what indicators and strategies read. Sweeping it at 2 days would
+        // leave them with nothing to warm up from.
+        for table in ["candles_1m", "candles_5m", "candles_15m", "candles_1d"] {
+            assert_eq!(
+                retention_class(table),
+                RetentionClass::MarketData,
+                "{table} is HISTORY — it must keep the market-data window"
+            );
+        }
+    }
+
+    #[test]
+    fn intraday_class_covers_every_sub_minute_timeframe() {
+        // Pins the literal list against the timeframe enum in the ONE
+        // direction that matters: a new second-level timeframe added to
+        // `TfIndex` without being added to `INTRADAY_TABLES` would silently
+        // inherit the 35-day window. The list stays literal on purpose (the
+        // class boundary is a retention decision, not an enum property), so
+        // this test is what keeps the two honest.
+        let second_level: Vec<&str> = crate::shadow_persistence::candle_table_names()
+            .into_iter()
+            .filter(|t| t.ends_with('s'))
+            .collect();
+        assert!(
+            !second_level.is_empty(),
+            "no second-level candle tables found — the filter has drifted and \
+             this guard is vacuous"
+        );
+        for table in second_level {
+            assert_eq!(
+                retention_class(table),
+                RetentionClass::Intraday,
+                "{table} is sub-minute but did not classify as Intraday"
+            );
+        }
+    }
+
+    #[test]
+    fn depth_still_outranks_intraday_and_market_data() {
+        // Ordering matters: market_depth is hour-partitioned like ticks, so a
+        // reordering that tested Intraday or MarketData first would move the
+        // single heaviest table onto a longer window.
+        assert_eq!(
+            retention_class(crate::depth_persistence::MARKET_DEPTH_TABLE),
+            RetentionClass::Depth
+        );
+    }
+
+    #[test]
+    fn intraday_hot_days_clamps_to_the_min_hot_days_floor() {
+        // "Current day only" means the floor, because a day-partitioned
+        // table's current partition cannot be dropped while rows still land
+        // in it. Configuring 0 must not be able to express something unsafe.
+        let mut cfg = PartitionRetentionConfig::default();
+        cfg.intraday_hot_days = 0;
+        assert_eq!(
+            hot_window_days("ticks", &cfg),
+            MIN_HOT_DAYS,
+            "a zero intraday window must clamp to the floor, never to zero"
+        );
+    }
     use super::*;
 
     fn cfg(retention_days: u32, market_data_hot_days: u32) -> PartitionRetentionConfig {
@@ -1821,18 +1959,24 @@ mod tests {
             RetentionClass::Depth,
             "market_depth must NOT inherit the 35-day market-data window"
         );
-        assert_eq!(retention_class("ticks"), RetentionClass::MarketData);
+        // Re-blessed 2026-08-19: `ticks` moved to the Intraday class, so the
+        // market-data comparator here is now a MINUTE candle — the data that
+        // actually still lives on the 35-day window.
+        assert_eq!(retention_class("candles_1m"), RetentionClass::MarketData);
     }
 
     #[test]
     fn depth_hot_window_is_far_shorter_than_the_market_data_window() {
         let c = cfg(90, 35);
         let depth = hot_window_days(crate::depth_persistence::MARKET_DEPTH_TABLE, &c);
-        let ticks = hot_window_days("ticks", &c);
+        // Re-blessed 2026-08-19: compares against a MINUTE candle. `ticks` is
+        // no longer market-data class, and comparing against it would now be
+        // comparing two current-day windows — which proves nothing.
+        let market = hot_window_days("candles_1m", &c);
         assert!(
-            depth < ticks,
-            "depth ({depth}d) must retain a SHORTER hot window than ticks ({ticks}d) — \
-             it is ~1000x the bytes per instrument-day"
+            depth < market,
+            "depth ({depth}d) must retain a SHORTER hot window than minute \
+             candles ({market}d) — it is ~1000x the bytes per instrument-day"
         );
         assert_eq!(depth, 3);
     }
@@ -1870,25 +2014,38 @@ mod tests {
         // classes read three DIFFERENT knobs.
         let c = cfg(90, 35);
         let standard = hot_window_days("ws_event_audit", &c);
-        let market = hot_window_days("ticks", &c);
+        // Re-blessed 2026-08-19 for the fourth class. `ticks` reads the
+        // INTRADAY window now; `candles_1m` is the market-data representative.
+        let market = hot_window_days("candles_1m", &c);
         let depth = hot_window_days(crate::depth_persistence::MARKET_DEPTH_TABLE, &c);
-        assert_eq!((standard, market, depth), (90, 35, 3));
+        let intraday = hot_window_days("ticks", &c);
+        assert_eq!(
+            (standard, market, depth, intraday),
+            (90, 35, 3, MIN_HOT_DAYS)
+        );
     }
 
     // ---- retention-class mapping -------------------------------------------
 
     #[test]
-    fn test_retention_class_ticks_is_market_data() {
-        assert_eq!(retention_class("ticks"), RetentionClass::MarketData);
+    fn test_retention_class_ticks_is_intraday() {
+        // Renamed and re-blessed 2026-08-19. `ticks` runs ~14 GB/day at the
+        // 25,000-instrument target; 35 days of it is ~480 GB on a 200 GB root.
+        assert_eq!(retention_class("ticks"), RetentionClass::Intraday);
     }
 
     #[test]
-    fn test_retention_class_every_candle_table_is_market_data() {
+    fn test_retention_class_every_candle_table_is_intraday_or_market_data() {
+        // Re-blessed 2026-08-19: the candle tables now split by bucket length
+        // rather than all landing in one class. Every table must still land in
+        // exactly one of the two — a candle table falling through to Standard
+        // (90 days) would be far worse than either.
         for table in crate::shadow_persistence::candle_table_names() {
-            assert_eq!(
-                retention_class(table),
-                RetentionClass::MarketData,
-                "candle table must be market-data class: {table}"
+            let class = retention_class(table);
+            assert!(
+                matches!(class, RetentionClass::Intraday | RetentionClass::MarketData),
+                "candle table {table} classified as {class:?} — must be \
+                 Intraday (sub-minute) or MarketData (minute and above)"
             );
         }
     }
@@ -1929,7 +2086,11 @@ mod tests {
     #[test]
     fn test_hot_window_days_maps_classes_to_config() {
         let c = cfg(90, 14);
-        assert_eq!(hot_window_days("ticks", &c), 14);
+        // Re-blessed 2026-08-19: `ticks` reads `intraday_hot_days` now, which
+        // the cfg() helper leaves at its default (the MIN_HOT_DAYS floor), NOT
+        // the market-data window this line used to assert.
+        assert_eq!(hot_window_days("ticks", &c), MIN_HOT_DAYS);
+        assert_eq!(hot_window_days("candles_1s", &c), MIN_HOT_DAYS);
         assert_eq!(hot_window_days("candles_1m", &c), 14);
         assert_eq!(hot_window_days("ws_event_audit", &c), 90);
         assert_eq!(hot_window_days("partition_archive_audit", &c), 90);

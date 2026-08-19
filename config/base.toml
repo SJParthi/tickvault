@@ -221,6 +221,34 @@ market_data_hot_days = 35
 # the honest options are a shorter market-data window or the 100 -> 200 GB
 # volume grow that variables.tf already permits.
 depth_hot_days = 2
+# INTRADAY hot window (2026-08-19) — `ticks` + the SIXTEEN sub-minute candle
+# tables (candles_1s..15s, 30s). Its own knob on an operator directive that
+# separates two things the single market-data window used to conflate:
+#
+#   "for depth or whatever it is only current day, worst case busy day ...
+#    when it comes to historical we will just have minute levels, because
+#    indicators, strategies and minute level of all these historical"
+#
+# Why they cannot share `market_data_hot_days = 35`, in numbers: at the
+# 25,000-instrument target `ticks` runs ~14 GB/day (scaled from the measured
+# ~2.5 GB/day at ~4,565 SIDs), so 35 days is ~480 GB on a 200 GB root. The
+# sixteen sub-minute tables are heavier still. Either alone overflows the
+# volume, and a full disk stops EVERY table — the same reasoning that gave
+# market_depth its own knob on 2026-08-15, applied one level down.
+#
+# Minute-and-above candles are deliberately NOT in this class. They are the
+# history the indicator and strategy paths read, they are two orders of
+# magnitude smaller per day (candles_1m at 25,000 instruments is ~0.9 GB/day),
+# and they keep the 35-day window unchanged.
+#
+# 2 = the MIN_HOT_DAYS floor: "current day only" in practice means today plus
+# yesterday, because a day-partitioned table's current partition cannot be
+# dropped while rows are still landing in it. Setting 0 or 1 changes nothing —
+# effective_hot_days clamps to the same floor.
+#
+# NOT a retention cut: every partition is exported, uploaded and
+# row-count-VERIFIED in S3 before it leaves EBS.
+intraday_hot_days = 2
 # Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
 # Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
 # and size-verified. ROLLBACK: set false (or delete the key) to restore the
