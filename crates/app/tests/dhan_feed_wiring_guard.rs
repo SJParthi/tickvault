@@ -401,3 +401,58 @@ fn drain_body() -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+// ---------------------------------------------------------------------------
+// Orphan 6 — a dead Dhan lane must be able to report dead
+// ---------------------------------------------------------------------------
+
+/// Every flush in the drain must report its row count to feed-health.
+///
+/// Until 2026-08-18 `record_ticks` had ZERO production callers anywhere in
+/// the workspace and the drain never touched feed-health at all, so the Dhan
+/// verdict could not fall to `Down` — `feed_health` answered a benign
+/// `Unknown, "not instrumented yet"` whether the lane was streaming, stalled,
+/// or absent. The one signal an operator checks to find out whether the feed
+/// is alive was structurally incapable of saying no.
+///
+/// This pins the SHAPE that fixes it: the drain flushes through
+/// `flush_and_record`, which pairs the flush with the report. The pairing is
+/// the point — the row count was already being computed and returned at every
+/// one of these sites, and every one of them threw it away.
+#[test]
+fn dhan_feed_drain_reports_flushed_rows_to_feed_health() {
+    let body = drain_body();
+    assert!(
+        body.contains("flush_and_record(&mut ingest, &feed_health)"),
+        "the frame drain must flush through `flush_and_record` so the rows it \
+         wrote reach the feed-health registry. Without it the Dhan health \
+         verdict can never fall to Down — a corpse reports \
+         `Unknown, \"not instrumented yet\"`."
+    );
+}
+
+/// No flush site may bypass the reporting wrapper.
+///
+/// This is the regression that would actually happen, and it is why the
+/// previous test is not sufficient on its own: adding a FOURTH flush site
+/// later — or reverting one of the three — leaves the other call sites intact,
+/// so a check for "does `flush_and_record` appear anywhere" still passes while
+/// a slice of the lane's output silently stops counting. Health would then
+/// decay on a feed that is in fact delivering, which produces a false page
+/// rather than a missing one.
+///
+/// Scoped to `run_frame_drain`'s body, with comments stripped, for the same
+/// two reasons the receipt-stamp guards above are: `refold_wal_frames`
+/// legitimately flushes outside the live path, and the drain carries a comment
+/// that names the old call shape while explaining why it went.
+#[test]
+fn no_drain_flush_site_bypasses_the_feed_health_report() {
+    let body = drain_body();
+    assert!(
+        !body.contains("blocking_flush(|| ingest.flush())"),
+        "a flush site in the drain calls `blocking_flush(|| ingest.flush())` \
+         directly, bypassing `flush_and_record`. The rows it writes will not \
+         reach feed-health, so that slice of the lane's output stops counting \
+         toward liveness while the feed is genuinely delivering."
+    );
+}

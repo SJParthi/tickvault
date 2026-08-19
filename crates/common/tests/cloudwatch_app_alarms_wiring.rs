@@ -658,10 +658,34 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // allowlist is what makes a metric reach CloudWatch at all, so dropping
     // either side's entries would silently un-ship metrics whose alarms and
     // dashboard widgets landed with them.
+    // 2026-08-18: 71 -> 72. Added `tv_dhan_feed_seals_emitted_total`.
+    //
+    // The loss widget charted "candles discarded" while NOTHING charted
+    // candles produced, so a flat-zero discard line read identically whether
+    // the lane was healthy or emitting nothing at all — the exact ambiguity
+    // the throughput widget's own header says it exists to kill, left open one
+    // stage further down the chain (frames -> ticks -> [gap] -> discarded).
+    // Dated cause: the "Candle seals emitted" widget was retired 2026-07-17
+    // when its metric died with the tick aggregator; the aggregator was
+    // REBUILT 2026-08-09 under a new name and nothing restored it.
+    //
+    // ON THE SIZE WARNING ABOVE: that paragraph says the template renders to
+    // 15,870 bytes against a 15,872 budget and that "the next selector
+    // addition WILL fail this guard". Measured today it renders to 15,740
+    // against the real 16,384 EC2 cap — 644 bytes free — and
+    // `user_data_size_guard` passes with this addition in place. The template
+    // shrank after that note was written. The note was not wrong when written;
+    // it went stale, which is why this one states the MEASURED number and the
+    // command that produces it rather than repeating a remembered one.
+    //
+    // COST: one additional EMF metric, ~$0.30/mo. This is a SUCCESS signal,
+    // deliberately: every one of the 2026-08-11/12 additions was a loss
+    // counter, and a dashboard that can only show failure cannot distinguish
+    // "nothing broke" from "nothing ran".
     assert_eq!(
         names.len(),
-        71,
-        "Z+ L2 VERIFY ratchet: expected exactly 71 names in the MAIN EMF \
+        72,
+        "Z+ L2 VERIFY ratchet: expected exactly 72 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
