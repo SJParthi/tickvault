@@ -912,12 +912,16 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
             return SocketEvent::Closed { code: None };
         };
 
-        // Loops ONLY over control frames (ping / pong / text), which carry no
-        // market data and cost nothing to skip. Every data frame returns
-        // immediately: nothing is done between two polls of the socket except
-        // hand the bytes up, which is what keeps the library's automatic pong
-        // flowing.
-        loop {
+        // ONE poll, ONE event — no loop (2026-08-19).
+        //
+        // This used to loop over control frames, skipping ping/pong/text as
+        // "carrying no market data and costing nothing to skip". They cost
+        // ~300 reconnects a morning: skipping a ping meant the supervisor
+        // never saw it, so the idle watchdog never reset and tore down a
+        // healthy socket every 27 seconds of pre-open quiet. A ping is not
+        // noise, it is the peer telling us it is alive, and the supervisor is
+        // the thing that needs to hear it. Every arm now returns an event.
+        {
             let Some(message) = stream.next().await else {
                 debug!(endpoint = endpoint.as_str(), "Dhan feed stream ended");
                 return SocketEvent::Closed { code: None };
@@ -954,12 +958,12 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
 
             match message {
                 Message::Binary(payload) => {
-                    return match classify_frame(endpoint, &payload) {
+                    match classify_frame(endpoint, &payload) {
                         FrameClass::Disconnect(code) => SocketEvent::Closed { code: Some(code) },
                         // `Bytes` -> `bytes::Bytes` is a refcount move, not a
                         // copy: the whole point of this type on this path.
                         FrameClass::Data => SocketEvent::Frame(ws_bytes_to_bytes(payload)),
-                    };
+                    }
                 }
                 Message::Close(_frame) => {
                     // A WebSocket close code is NOT a Dhan disconnect code
@@ -970,7 +974,7 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                         endpoint = endpoint.as_str(),
                         "Dhan feed sent a WebSocket close frame"
                     );
-                    return SocketEvent::Closed { code: None };
+                    SocketEvent::Closed { code: None }
                 }
                 Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => {
                     let kind = match message {
@@ -985,6 +989,23 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                         "kind" => kind,
                     )
                     .increment(1);
+                    // RETURN, do not loop (2026-08-19).
+                    //
+                    // This arm used to increment the counter and fall through
+                    // to the next loop iteration, so a Ping never reached the
+                    // supervisor and never reset the idle watchdog. Dhan pings
+                    // to keep the connection open; we counted the proof of
+                    // life and threw it away, then tore the socket down at 27s
+                    // of "silence" that was only silence of DATA.
+                    //
+                    // Measured on prod the morning this was found: 8–25
+                    // reconnects PER MINUTE from 08:31 to 08:59 IST — the
+                    // whole pre-open window, when no instrument ticks because
+                    // the market is shut — and exactly ZERO after 09:15 once
+                    // real data started resetting the watchdog on its own.
+                    // ~300 needless reconnects a morning, each one a full
+                    // re-auth plus a re-subscribe of the entire universe.
+                    SocketEvent::KeepAlive
                 }
             }
         }
