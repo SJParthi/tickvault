@@ -246,6 +246,31 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path.ends_with("/.cargo/config.toml")
         || path == "Cargo.toml"
         || path.ends_with("/Cargo.toml")
+        // 2026-08-19 SCOPE FIX #9 — TOOL CONFIGS UNDER `.config/`, PROVEN
+        // EXPLOITABLE, NOT THEORETICAL.
+        //
+        // The row above scoped to the cargo manifests "specifically rather
+        // than all `.toml`". Sound reasoning, incomplete enumeration: it
+        // listed the two TOMLs its author knew executed something.
+        // `.config/nextest.toml` is a third. nextest supports
+        // `[script.setup] command = ["...", "-c", "..."]`, which the test
+        // runner EXECUTES on every `cargo nextest` invocation — including in
+        // CI, on every PR.
+        //
+        // This was demonstrated, not reasoned about: adding
+        // `[script.setup] command = ["python3", "-c", "print(1)"]` to
+        // `.config/nextest.toml` left this guard reporting 12/12 GREEN. An
+        // interpreter could have run on every test invocation in the repo
+        // whose single loudest rule forbids exactly that.
+        //
+        // `.config/` is enumerated as a DIRECTORY rather than by filename,
+        // because the failure mode being closed is precisely that filenames
+        // get enumerated one at a time — `.config/` is where tools put
+        // configs, so the next tool that lands there is covered on arrival
+        // instead of after the next audit. Prose TOMLs live in `config/` and
+        // `quality/`, not `.config/`, so the false-positive concern the row
+        // above raises does not apply here.
+        || path.starts_with(".config/")
 }
 
 /// Does this file's FIRST LINE select an interpreter to execute it?

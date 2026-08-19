@@ -187,6 +187,8 @@ jobs:
 
       - name: Grow the filesystem (only possible while the box is running)
         if: steps.guard.outputs.noop == 'false'
+        env:
+          TARGET: ${{ inputs.target_size_gb }}
         run: |
           set -euo pipefail
           IID=$(aws ec2 describe-instances \
@@ -204,10 +206,20 @@ jobs:
             echo "the box is running and this step will verify and repair it."
             exit 0
           fi
+          # The root device is DISCOVERED, not assumed. `/dev/nvme0n1` is
+          # correct for today's single-EBS Nitro root, but NVMe enumeration is
+          # not ordered — attach a second volume and the name can move. So the
+          # remote script resolves the device backing `/` and acts on that.
+          #
+          # Every `|| true` is gone. The first version chained three of them
+          # and never asserted the SSM Status, so a completely failed resize
+          # exited GREEN — a 200 GB volume with a 100 GB filesystem reported as
+          # done. That is the false-OK class this repo forbids, written into
+          # the very step meant to prove the change landed.
           CMD=$(aws ssm send-command --instance-ids "$IID" \
             --document-name AWS-RunShellScript \
             --comment "grow root filesystem after EBS resize" \
-            --parameters 'commands=["set -x","lsblk","growpart /dev/nvme0n1 1 || true","resize2fs /dev/nvme0n1p1 || xfs_growfs -d / || true","df -h /"]' \
+            --parameters 'commands=["set -euo pipefail","ROOT=$(findmnt -no SOURCE /)","echo root-device=$ROOT","DISK=$(lsblk -no PKNAME \"$ROOT\")","PART=$(lsblk -no KNAME \"$ROOT\" | sed \"s/[^0-9]*//\")","growpart \"/dev/$DISK\" \"$PART\" || echo growpart-nochange","FSTYPE=$(findmnt -no FSTYPE /)","if [ \"$FSTYPE\" = xfs ]; then xfs_growfs -d /; else resize2fs \"$ROOT\"; fi","df -B1 --output=size / | tail -1"]' \
             --query 'Command.CommandId' --output text)
           for i in $(seq 1 30); do
             S=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
@@ -215,8 +227,26 @@ jobs:
             case "$S" in Success|Failed|TimedOut) break;; esac
             sleep 5
           done
-          aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
-            --query 'StandardOutputContent' --output text
+          OUT=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+            --query 'StandardOutputContent' --output text)
+          echo "$OUT"
+          # ASSERT the status. Without this the step passes on Failed.
+          if [ "$S" != "Success" ]; then
+            echo "::error::filesystem grow did not succeed (SSM status: $S)"
+            aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+              --query 'StandardErrorContent' --output text || true
+            exit 1
+          fi
+          # ASSERT the filesystem actually reached the target. A green SSM
+          # status only says the commands ran, not that the disk grew.
+          FS_BYTES=$(echo "$OUT" | tail -1 | tr -dc '0-9')
+          WANT=$(( TARGET * 1000 * 1000 * 1000 * 90 / 100 ))  # 90% of nominal GB
+          if [ -z "$FS_BYTES" ] || [ "$FS_BYTES" -lt "$WANT" ]; then
+            echo "::error::filesystem is ${FS_BYTES:-unknown} bytes — below 90% of ${TARGET} GB."
+            echo "The volume grew but the filesystem did not follow."
+            exit 1
+          fi
+          echo "filesystem confirmed at ${FS_BYTES} bytes"
 
       - name: Report the honest final state
         if: always()
