@@ -1320,13 +1320,14 @@ async fn async_main() -> Result<()> {
     });
 
     // 2026-07-13 disk-retention hardening: prune confirmed-replay WAL
-    // segments from `<wal_dir>/archive/` older than 7 days (F3: matches
-    // SPILL_FILE_MAX_AGE_SECS and preserves the confirm-on-channel
+    // segments from `<wal_dir>/archive/` older than
+    // WS_WAL_ARCHIVE_RETENTION_SECS (F3: preserves the confirm-on-channel
     // residual's only copy across a long weekend for triage). Archived
     // segments are post-confirmed-replay copies (frames re-injected +
     // durably persisted); the same-day 15:40 IST tick-conservation audit
-    // reads only the CURRENT day's frames, so a 7-day retention can never
-    // change it. Before this task, `archive/` grew ~0.15–0.6 GB/day
+    // reads only the CURRENT day's frames, so the retention window can never
+    // change it. (The window was 7 days until 2026-08-19; the number is no
+    // longer restated in prose — read the constant.) Before this task, `archive/` grew ~0.15–0.6 GB/day
     // unbounded on the prod 30 GB volume. Process-global boot prefix (both
     // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
     // which never runs on a Groww-only boot. Prunes once at task start
@@ -1339,6 +1340,19 @@ async fn async_main() -> Result<()> {
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
                 tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
+            );
+            // 2026-08-19: the SPILL retention sweep, wired for the first
+            // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
+            // unit-tested since 2026-07-13 with ZERO production consumers,
+            // and `clear_spill_for_date` — documented as "called by the
+            // writer task after read_all is fully replayed" — likewise had
+            // none. The writer chain only appends, so `data/spill/` grew for
+            // the life of the deployment with no age bound and no size bound.
+            // Rides this existing loop rather than spawning another task:
+            // same cadence, same cold path, one fewer thing to supervise.
+            let _spill = tickvault_storage::seal_spill::prune_spill_files(
+                std::path::Path::new("data/spill"),
+                tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
             );
             tokio::time::sleep(Duration::from_secs(
                 tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
