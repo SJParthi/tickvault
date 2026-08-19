@@ -883,6 +883,7 @@ pub fn spot_paise_by_symbol(
 /// selection is safe — the lane keeps its spot universe — but it is never
 /// silent, because "the market has no derivatives today" and "we could not
 /// read the file" look identical in an instrument count.
+// TEST-EXEMPT: async I/O composition (file read + HTTP GET); every pure part it calls — read_contract_artifact, parse_symbol_map, parse_spot_prices, spot_paise_by_symbol, select_contract_universe — is separately tested above.
 pub async fn load_contract_universe(
     questdb: &tickvault_common::config::QuestDbConfig,
     date_ist: &str,
@@ -1396,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn sensex_derivatives_map_to_bse_fno_and_nse_to_nse_fno() {
+    fn derivative_segment_maps_sensex_to_bse_fno_and_nse_to_nse_fno() {
         assert_eq!(derivative_segment("NSE"), Some(ExchangeSegment::NseFno));
         assert_eq!(derivative_segment("BSE"), Some(ExchangeSegment::BseFno));
         // Commodity and currency are outside the authorized scope, and a
@@ -1550,7 +1551,7 @@ mod tests {
     // ---- artifact + live wiring ----
 
     #[test]
-    fn the_artifact_round_trips_to_the_same_selection_as_a_parsed_master() {
+    fn contract_rows_from_master_round_trips_to_the_same_selection() {
         // The property that makes every test above meaningful in production:
         // the artifact path and the parsed-master path must select the SAME
         // instruments. If they diverge, the tests exercise one thing and the
@@ -1592,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn a_contract_row_survives_serialisation() {
+    fn to_master_row_survives_serialisation() {
         let rows = contract_rows_from_master(&[contract(
             5,
             InstrumentClass::StockOption,
@@ -1613,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn the_spot_query_bounds_to_today_and_keys_on_the_composite() {
+    fn build_spot_price_query_bounds_to_today_and_keys_on_the_composite() {
         let sql = build_spot_price_query(1_700_000_000_000_000_000);
         assert!(sql.contains("LATEST ON ts PARTITION BY security_id, segment"));
         assert!(
@@ -1635,7 +1636,7 @@ mod tests {
     /// producer's output is not a test, and this one is written from the
     /// producer.
     #[test]
-    fn spot_prices_parse_the_real_wire_format() {
+    fn parse_spot_prices_reads_the_real_wire_format() {
         let body = r#"{"dataset":[
             ["2885","NSE_EQ",1234.55],
             [26000,"IDX_I",24500.0],
@@ -1654,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn spot_prices_parse_to_paise_and_refuse_the_unusable() {
+    fn parse_spot_prices_to_paise_and_refuses_the_unusable() {
         let body = r#"{"dataset":[
             [2885,"NSE_EQ",1234.55],
             [26000,"IDX_I",24500.0],
@@ -1800,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn the_symbol_map_reads_names_and_survives_a_bad_row() {
+    fn parse_symbol_map_reads_names_and_survives_a_bad_row() {
         let body = r#"{"mappings":[
             {"index_name":"NIFTY 50","symbol":"reliance","isin":"X","security_id":2885,"exchange_segment":1},
             {"index_name":"NIFTY 100","symbol":"RELIANCE","isin":"X","security_id":2885,"exchange_segment":1},
@@ -1820,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn the_join_prices_only_symbols_that_actually_ticked() {
+    fn spot_paise_by_symbol_prices_only_symbols_that_actually_ticked() {
         let mut symbols = HashMap::new();
         symbols.insert("RELIANCE".to_string(), (2885u64, 1u8));
         symbols.insert("TCS".to_string(), (11_536u64, 1u8));
@@ -1847,14 +1848,64 @@ mod tests {
     }
 
     #[test]
-    fn the_artifact_path_is_dated_so_a_stale_day_is_never_read() {
+    fn test_write_contract_artifact_and_read_contract_artifact_round_trip_on_disk() {
+        // A real filesystem round trip, not a serde round trip — the atomic
+        // rename is the part that stops a half-written file being parsed into
+        // a partial contract set that looks complete, and only a real write
+        // exercises it.
+        //
+        // The date is deliberately impossible so this can never collide with,
+        // or be mistaken for, a real trading day's artifact.
+        let date = "1970-01-02";
+        let rows = contract_rows_from_master(&[
+            contract(
+                1,
+                InstrumentClass::IndexFuture,
+                "NSE",
+                "NIFTY",
+                2026_08_28,
+                0,
+                OptionLeg::None,
+            ),
+            contract(
+                2,
+                InstrumentClass::StockOption,
+                "NSE",
+                "RELIANCE",
+                2026_08_28,
+                1_000,
+                OptionLeg::Put,
+            ),
+        ]);
+        write_contract_artifact(date, &rows).expect("writes");
+        let back = read_contract_artifact(date).expect("reads");
+        assert_eq!(back, rows);
+
+        // No `.tmp` may survive: a leftover temp file is a partial artifact
+        // sitting next to the real one, waiting for a future glob to find it.
+        let tmp = contract_artifact_path(date).with_extension("json.tmp");
+        assert!(
+            !tmp.exists(),
+            "the temp file must be renamed, not left behind"
+        );
+
+        std::fs::remove_file(contract_artifact_path(date)).expect("cleanup");
+        assert!(
+            read_contract_artifact(date).is_err(),
+            "a missing artifact is an ERROR, never an empty contract set — \
+             the two look identical in an instrument count"
+        );
+    }
+
+    #[test]
+    fn contract_artifact_path_is_dated_so_a_stale_day_is_never_read() {
         let p = contract_artifact_path("2026-08-19");
         assert!(p.to_string_lossy().contains("2026-08-19"));
         assert_ne!(p, contract_artifact_path("2026-08-18"));
     }
 
     #[test]
-    fn a_full_shape_selection_reaches_the_authorized_scale() {
+    fn select_contract_universe_reaches_the_authorized_scale() {
         // The point of the whole module: prove the shape scales to the
         // authorized ~25,000 rather than asserting it in prose.
         let mut rows = Vec::new();

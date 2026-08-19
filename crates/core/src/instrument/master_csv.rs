@@ -1088,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expiry_accepts_both_vendor_forms_and_refuses_the_rest() {
+    fn test_parse_expiry_ymd_accepts_both_vendor_forms_and_refuses_the_rest() {
         assert_eq!(parse_expiry_ymd("2026-08-28"), 2026_08_28);
         assert_eq!(parse_expiry_ymd("2026-08-28 14:30:00"), 2026_08_28);
         assert_eq!(parse_expiry_ymd("2026-08-28T14:30:00"), 2026_08_28);
@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn test_strike_rounds_to_paise_and_refuses_nonsense() {
+    fn test_parse_strike_paise_rounds_and_refuses_nonsense() {
         assert_eq!(parse_strike_paise("24500.000000"), 2_450_000);
         assert_eq!(parse_strike_paise("24500"), 2_450_000);
         assert_eq!(parse_strike_paise("1234.55"), 123_455);
@@ -1174,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_instrument_and_option_codes_classify_rather_than_panic() {
+    fn test_from_master_field_classifies_unknown_codes_rather_than_panicking() {
         // annexure-enums.md: no panic on an unknown code, ever.
         assert_eq!(
             InstrumentClass::from_master_field("SOMETHING_NEW"),
@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_class_predicates_split_options_from_futures() {
+    fn test_is_option_and_is_future_split_the_classes() {
         assert!(InstrumentClass::IndexOption.is_option());
         assert!(InstrumentClass::StockOption.is_option());
         assert!(!InstrumentClass::IndexFuture.is_option());

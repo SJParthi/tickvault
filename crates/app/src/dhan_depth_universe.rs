@@ -967,7 +967,7 @@ mod tests {
     // ---- adaptive depth-20 window (2026-08-19) ----
 
     #[test]
-    fn the_depth_20_window_fills_the_envelope_without_exceeding_it() {
+    fn depth_20_strikes_each_side_fills_the_envelope_without_exceeding_it() {
         // The property that matters at every underlying count: use nearly all
         // 250 slots, never more. Before this was adaptive, two underlyings
         // used 84 of 250 and nothing reported it.
