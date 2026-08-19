@@ -919,4 +919,37 @@ mod tests {
         // claiming a rescue that did not happen.
         let _: Option<&'static SealOverflow> = global_seal_overflow();
     }
+
+    #[test]
+    fn test_set_global_seal_overflow_is_idempotent() {
+        // Mirrors `test_set_global_seal_sender_is_idempotent`. Idempotency is
+        // the safety property: a second install must NOT swap the durable tier
+        // out from under producers that already hold the first one, or a
+        // rescued seal would land in a directory the boot drain never reads.
+        let (spill, dlq) = temp_pair("overflow-idempotent");
+        let a = SealOverflow::new(
+            std::sync::Arc::new(crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(
+                spill.clone(),
+            )),
+            std::sync::Arc::new(crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(
+                dlq.clone(),
+            )),
+        );
+        let b = SealOverflow::new(
+            std::sync::Arc::new(crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(
+                spill.clone(),
+            )),
+            std::sync::Arc::new(crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(
+                dlq.clone(),
+            )),
+        );
+        let first = set_global_seal_overflow(a);
+        let second = set_global_seal_overflow(b);
+        assert!(
+            !(first && second),
+            "set_global_seal_overflow MUST be idempotent — both calls returning true \
+             would mean a later install can replace the tier producers already hold"
+        );
+        cleanup(&spill, &dlq);
+    }
 }
