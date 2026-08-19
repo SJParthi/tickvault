@@ -790,6 +790,31 @@ impl LiveIngest {
     /// the buffer by `TickWriter` contract — loudly, so the loss is counted
     /// rather than silently re-sent forever.
     pub fn flush(&mut self) -> u64 {
+        // Flush the inline-depth sink FIRST, and unconditionally.
+        //
+        // This sits above the `pending_rows == 0` early return deliberately.
+        // Depth rows and tick rows are appended on different conditions: a
+        // Full-mode packet whose tick the aggregator refuses still contributed
+        // depth rows, so `pending_rows` can be 0 while the depth buffer is not
+        // empty. Returning early would leave those rows appended-but-never-
+        // flushed — and by this function's own docstring, rows that are not
+        // flushed are rows that do not exist, however green the counters look.
+        //
+        // Failure is counted and logged, never propagated: the tick flush
+        // below is the lane's primary durability path and must not be skipped
+        // because the depth writer had a bad moment.
+        if let Some(sink) = self.inline_depth.as_mut()
+            && let Err(err) = sink.flush()
+        {
+            counters().depth_flush_failed.increment(1);
+            error!(
+                code = "TICK-FLUSH-01",
+                error = %format!("{err:#}"),
+                "inline-depth flush FAILED — those depth rows are lost (the \
+                 ILP buffer is discarded on a failed flush). Tick persistence \
+                 is unaffected."
+            );
+        }
         if self.pending_rows == 0 {
             return 0;
         }
@@ -1556,6 +1581,10 @@ pub struct DrainCounters {
     seals_rescued: metrics::Counter,
     flush_ok: metrics::Counter,
     flush_failed: metrics::Counter,
+    /// Inline-depth (`d5`) flush failures. Separate from `flush_failed` so a
+    /// depth-writer problem is never mistaken for tick loss, which is a far
+    /// more serious signal.
+    depth_flush_failed: metrics::Counter,
     depth_unconsumed: metrics::Counter,
     depth_rows: metrics::Counter,
     depth_refused: metrics::Counter,
@@ -1614,6 +1643,7 @@ pub fn counters() -> &'static DrainCounters {
         seals_rescued: metrics::counter!(SEALS_RESCUED_COUNTER),
         flush_ok: metrics::counter!(FLUSH_COUNTER, "outcome" => "ok"),
         flush_failed: metrics::counter!(FLUSH_COUNTER, "outcome" => "failed"),
+        depth_flush_failed: metrics::counter!(FLUSH_COUNTER, "outcome" => "depth_failed"),
         depth_unconsumed: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "depth_unconsumed"),
         depth_rows: metrics::counter!(DEPTH_COUNTER, "outcome" => "rows"),
         depth_refused: metrics::counter!(DEPTH_COUNTER, "outcome" => "refused"),
@@ -4371,10 +4401,25 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             capacity.saturating_sub(AGGREGATOR_MAX_SLOTS)
         );
     }
+    // INLINE DEPTH ON (operator, 2026-08-19: "i need all these" — all THREE
+    // depth sources kept, not a swap).
+    //
+    // Full mode already delivers 5 levels of bid/ask in every tick packet and
+    // this lane already pays 3.24x Quote-mode bandwidth to receive them. Until
+    // now the drain read the price and discarded the book. Enabling this keeps
+    // the third source alongside the dedicated 20-level and 200-level pools.
+    //
+    // Honest cost, from measured rows: ~8 GB/day at today's 4,565 instruments,
+    // ~44 GB/day at the 25,000 target. Alongside the dedicated pools that is
+    // ~126 GB/day of depth at target — which fits the 200 GB volume ONLY
+    // because depth retention is current-day (`depth_hot_days = 1`) and every
+    // partition is verified into S3 before it leaves local disk. Widen that
+    // window and this does not fit.
     let mut ingest = LiveIngest::new(
         TickWriter::new(&params.questdb, Feed::Dhan),
         capacity.max(1),
-    );
+    )
+    .with_inline_depth(DepthIngest::new(&params.questdb));
 
     // Seed BEFORE any socket opens, so an instrument that never delivers a
     // single tick is reported as silent rather than being invisible to the gap
@@ -8315,6 +8360,41 @@ mod inline_depth_tests {
             append_inline_depth(&mut sink, &tick, &levels, 1),
             0,
             "an unknown segment must produce NO rows"
+        );
+    }
+    #[test]
+    fn flush_reaches_the_depth_sink_even_with_no_pending_tick_rows() {
+        // The bug this pins: `flush()` early-returns when `pending_rows == 0`,
+        // and my first wiring put the depth flush BELOW that return. Depth and
+        // tick rows are appended on different conditions — a Full-mode packet
+        // whose tick the aggregator refuses still contributed depth rows — so
+        // `pending_rows` can be 0 while the depth buffer is not empty.
+        //
+        // Appended-but-never-flushed rows do not exist, however green the
+        // counters look. This asserts the depth flush runs regardless.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+            .with_inline_depth(DepthIngest::for_test());
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            ..Default::default()
+        }; 5];
+        let sink = ingest.inline_depth.as_mut().expect("enabled above");
+        let rows = append_inline_depth(sink, &tick, &levels, 1);
+        assert_eq!(rows, 10, "depth rows were appended");
+
+        // No ticks were folded, so pending_rows is 0 and the early return
+        // fires. The flush must still have reached the depth sink — it
+        // returns 0 (no tick rows covered) without panicking or skipping.
+        assert_eq!(ingest.flush(), 0, "no tick rows to cover");
+        assert!(
+            ingest.inline_depth.is_some(),
+            "the sink must survive the flush for the next packet"
         );
     }
 }
