@@ -261,7 +261,7 @@ resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
 # PAPER forensic chain lost a row — which is exactly the rehearsal you want to
 # have working before live orders, not a reason to leave it unwatched.
 resource "aws_cloudwatch_metric_alarm" "order_audit_chain_loss" {
-  alarm_name        = "tv-${var.environment}-order-audit-chain-loss"
+  alarm_name = "tv-${var.environment}-order-audit-chain-loss"
   # NOTE: AWS caps alarm_description at 1024 characters (terraform validate
   # failure, 2026-08-19). Long-form reasoning belongs in comments like this
   # one, which has no cap; the description is the pager text.
