@@ -146,6 +146,7 @@ pub mod ws_event_audit_persistence;
 // + depth_rebalance_audit modules DELETED. Audit tables stay on disk
 // per SEBI 5y retention.
 pub mod disk_health_watcher;
+pub mod disk_pressure;
 // BP-07 (2026-07-01): PROC-01 OOM-kill monitor — reads cgroup-v2
 // `memory.events` `oom_kill` vs boot baseline; mirrors disk_health_watcher.
 pub mod oom_monitor;

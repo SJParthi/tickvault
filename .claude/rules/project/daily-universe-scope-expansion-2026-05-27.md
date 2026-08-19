@@ -334,6 +334,61 @@ move the box away from it.
 
 **Cost is unchanged by this quote** — the Quote 13 envelope stands
 (~₹5,824–7,382/mo incl GST, ~6× the Quote 9 sub-₹1,000 target, knowingly
+
+**Quote 16 (2026-08-19, EBS grow 100 → 200 GB — preserve EXACTLY, typos included):**
+> "Grow gp3 100 → 200 GB yes even icnrease this also dude okay?"
+
+Given in DIRECT response to a three-row option table comparing r8gd.xlarge's local
+NVMe against growing the gp3 volume, in which the gp3 row read verbatim **"Grow gp3
+100 → 200 GB · survives daily stop ✅ · +$9.12/mo (~₹915) · **Yes** — online, one
+command, `variables.tf` already permits up to 200"**. This is the fresh dated quote
+§7 Mechanical Rule 3 requires before any EBS size change.
+
+**What this authorizes:** the root gp3 volume grows **100 → 200 GB**. Nothing else —
+the instance type stays r8g.xlarge (Quote 15, FINALISED), the AZ stays un-pinned, the
+schedule stays 08:30–17:30 IST.
+
+**Why the operator asked, and the correction that produced this quote.** The operator
+proposed **r8gd.xlarge** instead, on the belief that it "has more memory". It does
+not: r8gd.xlarge is **32 GiB, identical to r8g.xlarge** — the `d` denotes local NVMe
+instance store (~237 GB), not additional RAM. And that NVMe is **wiped on every
+instance stop**, while this box stops at 17:30 IST *every weekday*, so the current
+day's data would be destroyed nightly — the precise outcome the operator's
+same-session directive forbids (*"nothing shdou lbe missed or dleetd"*). r8gd was
+already REJECTED on these grounds in Quote 13; the rejection stands and is
+re-confirmed here rather than re-litigated.
+
+**Honest cost.** gp3 storage is $0.0912/GB-month, so +100 GB = **+$9.12/mo →
+~₹915/mo incl GST**. The Quote 13 envelope moves ~₹5,824–7,382 → **~₹6,739–8,297/mo**.
+The Quote 9 sub-₹1,000 target was already breached ~6× and is now breached ~7×,
+knowingly. The $100 kill-ceiling is unaffected: the bill's high estimate moves
+$73.60 → $82.72, still under the 90% action line at $90 — but the margin narrows from
+$16.40 to **$7.28**, which is worth stating plainly because the budget's AUTOMATIC
+action is `STOP_EC2_INSTANCES` on the prod box. A further grow would need the ceiling
+raised in the same change.
+
+**Two things this quote does NOT do (Rule 11, no false-OK):**
+
+1. **It does not grow the LIVE volume.** `root_block_device[0].volume_size` sits in
+   the instance's `lifecycle.ignore_changes`, so `terraform apply` never touches the
+   running root. The `variables.tf` default records FRESH-PROVISION intent; the live
+   grow is the out-of-band online command
+   (`aws ec2 modify-volume --volume-id <id> --size 200`, then grow the filesystem),
+   or `scripts/aws-upgrade-instance.sh --ebs-size 200`. Until one of those runs, the
+   live root stays at its current size.
+2. **It is a ONE-WAY door.** gp3 grows online and can **never** shrink — a smaller
+   `modify-volume` is refused and a 200 GB snapshot cannot restore into anything
+   smaller. Reversing 200 → 100 would require a terminate-and-recreate. That is the
+   reason the earlier 100 GB choice was deliberately taken over 250, and the same
+   reason 200 should be the measured answer rather than a comfortable one: the first
+   live session's real tick and depth volume is what should justify going further.
+
+**What the extra 100 GB actually buys, arithmetically:** at the depth table's
+measured 72 B/row the modelled load is ~21 GB/day at one snapshot/second and
+~104 GB/day at five. 100 → 200 GB therefore buys roughly **+4.8 days at the low
+estimate and +1 day at the high one**. It widens the runway; it does not remove the
+need for the pressure-triggered archival landing alongside it, and neither does it
+make a full disk impossible.
 breached; kill-ceiling $100).
 
 ---
@@ -446,7 +501,7 @@ per-minute-REST workload is NOT yet live-validated on credits — watch
 | Tenancy | Default (Shared) |
 | Pricing | On-demand **$0.0224/hr** (ap-south-1, console-verified 2026-05-18 — re-verify at execution) — no Reserved / Savings Plan / Spot |
 | Schedule | **Trading weekdays only (Mon–Fri), 08:30–16:30 IST auto** (start `cron(0 3 ? * MON-FRI *)`, stop `cron(0 11 ? * MON-FRI *)`) — narrowed back from 08:00–17:00 on 2026-06-05 per operator ("make the aws instance start and stop from 8.30 am till 4.30 pm"; supersedes the 2026-06-02 widening). Out-of-window runs = operator manual start. Weekends + holidays = OFF unless manually started. |
-| EBS | gp3 **100 GB LIVE — VERIFIED 2026-08-12** via `describe-volumes` on the recreated instance `i-0c3fe906dad5492fc` (in-use, gp3). This row said **"30 GB LIVE"** until now, which was true of the OLD box: the Quote 13 fresh-provision of 100 GB landed with the instance recreate, and gp3's grow-only constraint stopped applying the moment the volume was provisioned fresh rather than modified. History: 10 GB (2026-05-29) → 30 GB → [50 GB approved 2026-07-13, never applied] → 30 GB ACCEPTED (Quote 9) → 20 GB pre-staged target (executor, 2026-07-15) → **100 GB actual (Quote 13, applied at the 2026-08-12 recreate)**. The 20 GB pre-stage is therefore SUPERSEDED and did not happen — recorded so nobody re-plans a shrink toward it. |
+| EBS | gp3 **100 GB LIVE — VERIFIED 2026-08-12** via `describe-volumes` on the recreated instance `i-0c3fe906dad5492fc` (in-use, gp3). This row said **"30 GB LIVE"** until now, which was true of the OLD box: the Quote 13 fresh-provision of 100 GB landed with the instance recreate, and gp3's grow-only constraint stopped applying the moment the volume was provisioned fresh rather than modified. History: 10 GB (2026-05-29) → 30 GB → [50 GB approved 2026-07-13, never applied] → 30 GB ACCEPTED (Quote 9) → 20 GB pre-staged target (executor, 2026-07-15) → **100 GB actual (Quote 13, applied at the 2026-08-12 recreate)**. The 20 GB pre-stage is therefore SUPERSEDED and did not happen — recorded so nobody re-plans a shrink toward it. **AUTHORIZED 2026-08-19 (Quote 16): 100 → 200 GB.** The terraform default is raised in the same change; the LIVE volume is UNCHANGED until the out-of-band online grow runs (`root_block_device[0].volume_size` is in `lifecycle.ignore_changes`, so `terraform apply` never touches the running root). +$9.12/mo → ~₹915/mo incl GST, narrowing the $100 kill-ceiling margin from $16.40 to $7.28. One-way door: gp3 can never shrink. |
 | EIP | 1 (24/7) — **KEPT** (`enable_eip = true`, 2026-05-31 flip; without it the box has no public IP after a stop/modify/start → unreachable by SSM + Dhan). **2026-07-19 Quote 10 supersession note: release APPROVED for the no-real-orders period — execution ONLY via the bundled erase-window recreate** (a standalone release is VERIFIED-UNSAFE on the live ENI — launch-time attribute, live describe evidence, coordinator session, 2026-07-19; this row's "no public IP after stop/modify/start" claim CONFIRMED). Runbook: `docs/runbooks/eip-release.md`. Re-enable + Dhan setIP ≥7 days before live orders. |
 | Network | ENA enabled by default |
 
@@ -725,7 +780,23 @@ inside the ~210-hr Quote 13 envelope — so the recorded bill is unchanged.
    - **Total used: ~2.3 GB (app at the ~700 MB 4-SID actual) – ~3.1 GB (app at the 1.5 GB cap)** — the rows above sum to ~2.27 GB / ~3.07 GB (arithmetic corrected 2026-07-15; an earlier draft said "~2.6–3.1") *(2026-07-18: the seal-ring row replaced the 10 MB tick-ring row, +~19 MB — inside the ~ rounding, totals unchanged)*
    - **Headroom: ~0.9–1.7 GB** — above the 1 GB Linux kswapd floor only while the app stays at/under its cap. **FLAG (honest, unresolved — Assumed until measured; Rule 11, no false-OK):** the pre-downsize Rule 2 sizing formula this file has always carried (≈3.2 MB × SID for the 21-TF today+yesterday RAM-resident set) predicts an app working set of **~2.5 GB at ~770 SIDs** — with QuestDB at 1g that totals ~4.1 GB (2.5 app + 1.0 QDB + ~0.17 buffers + ~0.4 OS) and does **NOT fit in 4 GiB**. The ~700 MB "actual" and the formula cannot both hold at ~770 SIDs; **the first live session on t4g.medium is the measured gate** — read `tv_process_rss_bytes` / RESOURCE-02 and `mem_used_percent` before AND after cutover; if live RSS is materially above ~1.5 GB, 4 GiB does not fit and t4g.large (8 GiB) is the rip-cord. QuestDB at 1g serving today's ~770-SID Groww write load is likewise re-validated live (the old 1g-class budget served the 4-SID universe). BURSTABLE CPU: watch `CPUCreditBalance` after cutover.
 
-3. **EBS = 100 GB gp3 on the fresh volume (2026-08-08, Quote 13 — supersedes the 20 GB
+3. **EBS = 200 GB gp3 (2026-08-19, Quote 16 — raised from the Quote 13 figure of 100;
+   the paragraphs below are retained verbatim because every word of their reasoning
+   still holds, only the number moved).** The grow was authorized after r8gd.xlarge was
+   proposed and correctly rejected: its local NVMe is **wiped on every stop** and this
+   box stops nightly, so it would delete each day's data — while EBS survives the stop.
+   Cost +$9.12/mo (~₹915 incl GST); the $100 kill-ceiling margin narrows to $7.28, so a
+   FURTHER grow must raise the ceiling in the same change. `variables.tf` validation
+   already permits 10–200, so 200 sits exactly at the ceiling and going beyond it needs
+   a validation edit plus its own dated quote. **The default documents fresh-provision
+   intent only — the LIVE volume grows via the out-of-band online command**
+   (`aws ec2 modify-volume --size 200` + filesystem grow, or
+   `scripts/aws-upgrade-instance.sh --ebs-size 200`), never via `terraform apply`.
+
+   *(Quote 13 text retained below — the sizing arithmetic, the shrink-impossibility and
+   the archival doctrine are all unchanged by the raise.)*
+
+   **EBS = 100 GB gp3 on the fresh volume (2026-08-08, Quote 13 — supersedes the 20 GB
    fresh-provision target; the LIVE root remains 30 GB until the recreate).** Sized for
    the 13-TF + tick-retention load: ticks ≈ 44–141 GB/mo (**Assumed** 25–80 M rows/day,
    swings 3×) + 13 TFs sparse ≈ 61 GB/mo, held ~30 days on disk with S3 archival beyond.

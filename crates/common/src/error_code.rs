@@ -322,6 +322,23 @@ pub enum ErrorCode {
     StorageGap03AuditWriteFailed,
     /// STORAGE-GAP-04: S3 archive failure (partition upload).
     StorageGap04S3ArchiveFailed,
+    /// STORAGE-GAP-05: disk pressure could NOT be relieved — the volume is at
+    /// or above the high-water mark and every partition old enough to archive
+    /// has already been archived (or could not be verified into S3, so it was
+    /// correctly kept).
+    ///
+    /// Severity::Critical because the next state is a FULL volume, and a full
+    /// volume stops every writer — ticks, candles, depth and audit alike. The
+    /// failure is not "old data lingers", it is "today's capture stops".
+    ///
+    /// This code is the deliberate END of the automated response, not a step
+    /// in it. The pressure loop will NOT delete anything further to save
+    /// itself: the only partitions left are younger than the `MIN_HOT_DAYS`
+    /// floor (still being written to, so a drop could lose a tick) or have no
+    /// verified S3 copy. Both are data-loss trades, and the operator makes
+    /// those, not the process. Remedy is theirs too: grow the gp3 volume
+    /// (online, one command, never shrinkable) or reduce ingest scope.
+    StorageGap05DiskPressureUnrelievable,
     /// SELFTEST-01: market-open self-test passed (informational positive ping).
     Selftest01Passed,
     /// SELFTEST-02: market-open self-test detected a Critical or Degraded
@@ -1345,6 +1362,7 @@ impl ErrorCode {
             Self::AuditWs01EventWriteFailed => "AUDIT-WS-01",
             Self::StorageGap03AuditWriteFailed => "STORAGE-GAP-03",
             Self::StorageGap04S3ArchiveFailed => "STORAGE-GAP-04",
+            Self::StorageGap05DiskPressureUnrelievable => "STORAGE-GAP-05",
             // Wave 3 — Telegram dispatcher (Item 11)
             Self::Telegram01Dropped => "TELEGRAM-01",
             Self::Telegram02CoalescerStateInconsistency => "TELEGRAM-02",
@@ -1546,7 +1564,13 @@ impl ErrorCode {
             // an OCO sibling-leg cancel UNVERIFIED past the 30s deadline is
             // a DOUBLE-FILL exposure window — operator action required;
             // Critical is never auto-triaged (the blanket rule).
-            | Self::GrowwOco02SiblingCancelUnverified => Severity::Critical,
+            | Self::GrowwOco02SiblingCancelUnverified
+            // STORAGE-GAP-05 (feed-hardening Item 5, 2026-08-19): the volume
+            // is above high water and retention has nothing left it is
+            // ALLOWED to reclaim. The next state is a full disk, which stops
+            // every writer — so this is the loud end of the automated
+            // response, and Critical is never auto-triaged (blanket rule).
+            | Self::StorageGap05DiskPressureUnrelievable => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::AggregatorHb01Heartbeat => Severity::Info,
@@ -1902,7 +1926,10 @@ impl ErrorCode {
             | Self::Audit05SelftestWriteFailed
             | Self::Audit06OrderWriteFailed
             | Self::StorageGap03AuditWriteFailed
-            | Self::StorageGap04S3ArchiveFailed => "docs/error-runbooks/wave-2-error-codes.md",
+            | Self::StorageGap04S3ArchiveFailed
+            | Self::StorageGap05DiskPressureUnrelievable => {
+                "docs/error-runbooks/wave-2-error-codes.md"
+            }
             Self::AuditWs01EventWriteFailed => {
                 "docs/error-runbooks/ws-event-audit-error-codes.md"
             }
@@ -2285,6 +2312,7 @@ impl ErrorCode {
             Self::AuditWs01EventWriteFailed,
             Self::StorageGap03AuditWriteFailed,
             Self::StorageGap04S3ArchiveFailed,
+            Self::StorageGap05DiskPressureUnrelievable,
             Self::Telegram01Dropped,
             Self::Telegram02CoalescerStateInconsistency,
             Self::Telegram03EpisodeDegraded,
@@ -2817,7 +2845,10 @@ mod tests {
         // best-effort forensics degrade; Medium, auto-triage-safe) => 165.
         // +1 ORDER-PNL-01 (2026-07-19) => 166
         // +1 CADENCE-05 (2026-07-20, native-retry/cross-fill hedge) => 167
-        assert_eq!(ErrorCode::all().len(), 167);
+        // +1 STORAGE-GAP-05 (2026-08-19, feed-hardening Item 5 — pressure
+        // archival could not relieve the volume; Critical, alarmed via the
+        // `storage-gap-05` errcode filter) => 168
+        assert_eq!(ErrorCode::all().len(), 168);
     }
 
     #[test]

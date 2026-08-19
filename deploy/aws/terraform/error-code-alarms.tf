@@ -511,6 +511,36 @@ locals {
       ok_recovery = false # 2026-08-11: discrete PERMANENT data loss - the dropped raw frames are gone from the durable chain and do not come back when the episode ages out (Rule-11 false-recovery; aggregator-drop-01 precedent)
       desc        = "WS-SPILL-02: a raw WebSocket frame was DROPPED at the capture-at-receipt WAL (the spill writer was dead at the append instant) - the frame is lost BEFORE parse and broadcast, so no downstream tier can recover it. This is the raw-frame twin of AGGREGATOR-DROP-01 (sealed candles) and is the durable floor's own failure mode. Triage: df -h /data, ls -la data/spill/, host + container health; if the host is healthy and the dirs writable, restart the app. NO recovered/OK page: the loss is permanent - the auto-OK only means the episode aged out. Runbook: docs/error-runbooks/ws-frame-spill-error-codes.md"
     }
+    # STORAGE-GAP-05: pressure-triggered archival ran and could NOT relieve
+    # the volume (feed-hardening Item 5, 2026-08-19). Severity Critical.
+    #
+    # Why this pages rather than sitting in the log: the next state is a FULL
+    # volume, and a full volume does not merely stop retention - every QuestDB
+    # write blocks, so the ILP flush backs up, so the frame drain backs up, so
+    # the socket receive buffer overflows, and Dhan's published architecture
+    # skips a slow consumer forward to "the latest available state". A disk
+    # problem becomes a TICK-LOSS problem, upstream, at the vendor, silently.
+    #
+    # Why the automation stops here rather than deleting more: the only
+    # partitions left are younger than the hard MIN_HOT_DAYS=2 floor (still
+    # being written, so a drop can swallow an arriving tick) or have no
+    # verified S3 copy. Both are data-loss trades and belong to the operator.
+    #
+    # eval = 3 like its BOOT/WS-SPILL siblings: the emit is already
+    # edge-latched to ONCE per episode in the app, so this is about ride-out,
+    # not de-duplication. ok_recovery = TRUE, unlike ws-spill: nothing was
+    # lost here - the volume genuinely can recover (an operator grows it, or a
+    # later pass frees space once partitions age past the floor), and "the
+    # disk is healthy again" is a real state worth telling.
+    "storage-gap-05" = {
+      pattern     = "{ $.code = \"STORAGE-GAP-05\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true # 2026-08-19: no data was lost by this code - the volume can genuinely recover (grown, or partitions age past the floor), so an OK is honest here where it would be false for ws-spill
+      desc        = "STORAGE-GAP-05: the data volume is above high water and pressure archival has nothing left it is ALLOWED to reclaim. NOTHING further will be auto-deleted. A full volume does not just stop retention - it blocks every QuestDB write, backs up the drain, and Dhan then skips us forward as a slow consumer, dropping ticks at their side. Triage: df -h on the data volume; read partitions_dropped in the log payload. If 0 dropped, check S3: aws s3 ls s3://tv-<env>-cold/questdb-partitions/ and partition_archive_audit - a verify failure keeps partitions BY DESIGN. Remedy is yours: grow the gp3 volume (online, one command, NEVER shrinkable) or cut ingest scope (depth is the heaviest writer). Do NOT lower MIN_HOT_DAYS or hand-drop an unverified partition. Runbook: docs/error-runbooks/wave-2-error-codes.md"
+    }
     # 2026-08-15 (authority: dhan-rest-only-noise-lock-2026-07-14.md §2.3a,
     # operator quote same day) - the CONNECTED-BUT-SILENT page.
     #

@@ -83,7 +83,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: `crates/storage/src/oom_monitor.rs`, `crates/app/src/main.rs`
   - Tests: `task_heartbeat_guard.rs`
 
-- [ ] **Item 5 — Disk: automatic purge + raw ticks off the database (#33, #55)**
+- [~] **Item 5 — Disk: automatic purge + raw ticks off the database (#33, #55)**
   - Raw ticks stream to compressed object storage, never bulk-ingested. At the modelled
     rate 25,000 instruments produce ~152 GB/day against a 100 GB volume — the disk fills
     in ~16 hours without this.
@@ -189,3 +189,148 @@ memory killer is kernel-owned, and the 87th failure scenario is unknown by defin
 replay and no snapshot-on-subscribe, and measured reconnect windows of 7–11 s lose data at
 source. The honest guarantee is **capture-completeness of received frames**, never
 trade-completeness.
+
+---
+
+## ITEM 5 — DESIGN ADDENDUM (added 2026-08-19, operator: "yes go ahead dude but see clealry ensure that we shdou lneevr ever miss any ticks or websocket disconenction or reocnenction or no cnaldes loss no ticks liss ntohgin bro okay? … nothign shdou lbe missed or dleetd dude yous aid yo uwill put all thos into somwhere isnetad if our disk stroage right dude am ii rght dude tell me dude okay?")
+
+The operator's second sentence is a CONFIRMATION QUESTION, and the answer is yes: the
+data goes to **S3**, not to a delete. That is what this addendum builds a trigger for,
+and every choice below is subordinate to the first sentence — nothing missed, nothing
+deleted.
+
+### B1. What already exists, and is NOT being rebuilt
+
+`crates/storage/src/partition_archive.rs` already implements the whole dangerous part,
+fail-closed and in this order: export the partition to gzipped CSV → `HeadObject`
+never-overwrite check → conditional `PutObject` with a server-validated SHA-256 →
+verify (row-count re-query AFTER export, object exists, ContentLength matches, record
+count matches) → append the `verified` audit row and FLUSH it → only then `ALTER TABLE
+DROP PARTITION`. A `VerifiedArchive` type-state makes "drop without a verified copy"
+unrepresentable rather than merely unlikely.
+
+**This addendum adds no delete path.** It adds a *trigger* that calls that same
+function. That distinction is the whole safety argument: anything the pressure path
+drops has already been proven byte-present in S3 by code that predates this change and
+is already ratcheted.
+
+### B2. The defect (Verified in source, 2026-08-19)
+
+| Fact | Evidence |
+|---|---|
+| Archival runs ONCE per day, post-market | `crates/app/src/main.rs:3064`, inside the post-close block after the drain sleep |
+| Eligibility is AGE only | `hot_window_days()` → 35 (market data) / 3 (depth) / 90 (standard), clamped to `MIN_HOT_DAYS = 2` |
+| The disk watcher never acts | `disk_health_watcher.rs` publishes `tv_spill_dir_free_bytes` and logs; it has no remediation arm |
+
+At the authorized scale the modelled tick volume is ~152 GB/day against a 100 GB volume
+— the disk fills in **~16 hours**, which is INSIDE the 2-day minimum eligibility window
+and hours before the post-market run. **The existing cleanup can never fire in time.**
+A full volume stops every writer — ticks, candles, depth, audit — so the failure mode is
+not "old data lingers", it is "today's capture stops", which is the total-loss class the
+operator's first sentence forbids.
+
+### B3. The three constraints that shape the design (each one costs something)
+
+1. **`MIN_HOT_DAYS = 2` stays inviolate — today and yesterday are never eligible, at any
+   pressure.** The verify step re-counts AFTER the export, which closes the
+   export→count race; it does NOT close the count→drop race. On a partition that is
+   still receiving writes, a tick landing in that window would be dropped with the
+   partition. That is a one-tick loss, and one is too many. **Cost:** the floor means
+   pressure archival cannot reclaim today's or yesterday's bytes — if two days of data
+   alone exceeds the volume, no retention policy can help, and §B6 says so out loud
+   instead of deleting.
+2. **Pressure NEVER escalates into deletion.** When everything eligible has been
+   archived and the volume is still above the high-water mark, the loop stops and fires
+   a Critical coded error. A system that deletes unarchived data to save itself has
+   converted a disk problem into a data-loss problem.
+3. **Bounded and hysteretic.** One pass at a time, a cooldown between episodes, a
+   max-passes cap, and a low-water exit that is strictly below the high-water entry —
+   so a volume hovering at the threshold cannot thrash QuestDB with export queries
+   during the session.
+
+### B4. Design
+
+**New config (`PartitionRetentionConfig`), all serde-default OFF/inert:**
+
+| Key | Default | Meaning |
+|---|---|---|
+| `pressure_archive_enabled` | `false` (serde) | master gate; base.toml opts in |
+| `pressure_high_water_pct` | 75 | at/above this used-%, an episode starts |
+| `pressure_low_water_pct` | 60 | below this used-%, the episode ends |
+| `pressure_hot_days` | 2 | hot window used ONLY under pressure, still clamped to `MIN_HOT_DAYS` |
+| `pressure_min_interval_secs` | 900 | cooldown between episodes |
+| `pressure_max_passes` | 4 | passes per episode before escalating |
+
+**A pure decision function** — `decide_pressure_action(probe, state, cfg) -> PressureAction`
+— so every branch is unit-testable with no disk, no QuestDB and no S3:
+`Idle` · `StartEpisode` · `ContinueEpisode` · `EndEpisode` · `Escalate` · `Cooldown`.
+The loop that calls it does I/O only.
+
+**Wiring:** one supervised task in the app crate (the house respawn pattern), polling the
+QuestDB data volume; on `StartEpisode`/`ContinueEpisode` it constructs the existing
+`PartitionArchiver` with `market_data_hot_days`/`depth_hot_days` overridden to
+`pressure_hot_days` and calls `archive_and_drop_old_partitions()` unchanged.
+
+### B5. Edge Cases
+
+| # | Case | Behaviour |
+|---|---|---|
+| 1 | Volume above high-water at boot | Episode starts on the first poll — no warm-up grace, because a full disk is already losing writes |
+| 2 | `df` probe fails | Counted, logged, treated as **Idle** — never as pressure. A blind probe must not trigger drops |
+| 3 | Nothing eligible (all partitions < 2 days) | `Escalate` — Critical coded error, ONE per episode (edge-latched), loop keeps polling but takes no destructive action |
+| 4 | Archive pass fails (S3 down, verify mismatch) | The existing path keeps every partition; the pass counts as used; after `pressure_max_passes` → `Escalate` |
+| 5 | Pressure clears between passes | `EndEpisode` on the first probe below low-water; latch resets so the next episode can page again |
+| 6 | Volume hovers exactly at high-water | Hysteresis: exit requires `< low_water`, which is strictly below entry, so no thrash |
+| 7 | Post-market daily run overlaps a pressure episode | Both call the same idempotent function; a partition already dropped is simply not listed the second time |
+| 8 | `pressure_archive_enabled = false` | The task is not spawned. Byte-identical to today |
+
+### B6. Failure Modes
+
+- **Two days of data exceeds the volume.** Unfixable by retention, by construction of
+  the §B3.1 floor. Behaviour: `Escalate`, Critical, loud, no deletion. The remedy is an
+  operator decision (grow the volume — gp3 grows online in one command — or reduce
+  ingest scope), never an executor one.
+- **S3 unreachable during pressure.** No drops occur (verify cannot pass). The disk
+  continues filling and the escalation fires. Correct: an unverifiable copy is not a copy.
+- **Export load during the session.** Bounded by `pressure_max_passes` and the cooldown;
+  only partitions ≥2 days old are read, so the export never touches the partitions the
+  live writers are appending to.
+
+### B7. Test Plan
+
+Unit (pure, no I/O): every `PressureAction` branch incl. hysteresis, cooldown,
+max-passes escalation, probe-failure-is-Idle, and the `MIN_HOT_DAYS` clamp surviving a
+`pressure_hot_days = 0` config. Ratchet (`disk_purge_guard.rs`): the pressure path calls
+`archive_and_drop_old_partitions` and NOT any `DROP PARTITION` of its own — bite-proven
+in both directions; `MIN_HOT_DAYS` is still 2; the escalation arm carries a coded error.
+Config: an absent `[partition_retention]` pressure block deserializes to disabled.
+
+### B8. Rollback
+
+`pressure_archive_enabled = false` restores today's behaviour exactly — the task is not
+spawned and no other code path changes. The config keys are additive with serde
+defaults, so an older binary reading a newer config, or the reverse, both work.
+
+### B9. Observability
+
+`tv_data_disk_used_pct` (gauge) · `tv_disk_pressure_episodes_total` ·
+`tv_disk_pressure_passes_total` · `tv_disk_pressure_partitions_dropped_total` ·
+`tv_disk_pressure_unrelievable_total` · `tv_disk_pressure_probe_failed_total`.
+Escalation logs `STORAGE-GAP-05` (new, Critical) once per episode.
+
+### B10. Honest envelope
+
+**Claimed:** with the pressure trigger on, local disk usage is bounded to the pressure
+hot window (floor 2 days) *provided two days of data fits the volume*, and every byte
+that leaves local disk has a checksum- and row-count-verified S3 copy first.
+
+**NOT claimed:** (a) that this makes a full disk impossible — if two days exceeds the
+volume it escalates and stops, by design; (b) that "raw ticks never enter the database"
+in the Item 5 headline sense — they still land in QuestDB and leave via the verified
+archive, which is *how* they get off local disk; re-plumbing ingest to write object
+storage directly would break the `ticks` contract, the materialized views and the
+cross-verification, and is not attempted here; (c) any measurement at 25,000 instruments
+— the ~152 GB/day is arithmetic from row widths, and the trigger has never run against a
+real filling volume; (d) "never miss a tick" in the trade-completeness sense — the
+vendor protocol has no sequence number, no replay and no snapshot-on-subscribe, so the
+guarantee remains capture-completeness of RECEIVED frames.

@@ -1804,6 +1804,7 @@ mod tests {
             archive_enabled: true,
             archive_bucket: String::new(),
             max_partitions_per_run: 200,
+            ..PartitionRetentionConfig::default()
         }
     }
 
@@ -2844,6 +2845,7 @@ mod stub_integration_tests {
             archive_enabled: true,
             archive_bucket: "tv-test-cold".to_string(),
             max_partitions_per_run: max_per_run,
+            ..PartitionRetentionConfig::default()
         }
     }
 
