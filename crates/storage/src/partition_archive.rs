@@ -281,8 +281,12 @@ pub(crate) fn retention_class(table: &str) -> RetentionClass {
 
 /// Clamps a configured hot window to the [`MIN_HOT_DAYS`] floor — today's
 /// and yesterday's partitions are untouchable even under `hot_days = 0`.
-pub(crate) fn effective_hot_days(configured_days: u32) -> u32 {
-    configured_days.max(MIN_HOT_DAYS)
+/// Takes the FLOOR as a parameter since 2026-08-19, when the floor became
+/// per-class. Keeping a zero-argument version would have left production
+/// calling `.max()` inline while the test suite exercised a function nothing
+/// used — a test that passes forever regardless of what the sweep does.
+pub(crate) fn effective_hot_days(configured_days: u32, floor: u32) -> u32 {
+    configured_days.max(floor)
 }
 
 /// Hard floor for the MARKET-DATA classes ([`RetentionClass::Depth`] and
@@ -332,7 +336,7 @@ pub(crate) fn hot_window_days(table: &str, cfg: &PartitionRetentionConfig) -> u3
         RetentionClass::Depth | RetentionClass::Intraday => MIN_HOT_DAYS_MARKET_DATA,
         RetentionClass::MarketData | RetentionClass::Standard => MIN_HOT_DAYS,
     };
-    class_days.max(floor)
+    effective_hot_days(class_days, floor)
 }
 
 // ---------------------------------------------------------------------------
@@ -2240,11 +2244,17 @@ mod tests {
 
     #[test]
     fn test_effective_hot_days_floor_overrides_zero_and_one() {
-        assert_eq!(effective_hot_days(0), MIN_HOT_DAYS);
-        assert_eq!(effective_hot_days(1), MIN_HOT_DAYS);
-        assert_eq!(effective_hot_days(2), 2);
-        assert_eq!(effective_hot_days(14), 14);
-        assert_eq!(effective_hot_days(90), 90);
+        // Audit-class floor (2): 0 and 1 both clamp up.
+        assert_eq!(effective_hot_days(0, MIN_HOT_DAYS), MIN_HOT_DAYS);
+        assert_eq!(effective_hot_days(1, MIN_HOT_DAYS), MIN_HOT_DAYS);
+        assert_eq!(effective_hot_days(2, MIN_HOT_DAYS), 2);
+        assert_eq!(effective_hot_days(14, MIN_HOT_DAYS), 14);
+        assert_eq!(effective_hot_days(90, MIN_HOT_DAYS), 90);
+        // Current-day floor (1): 0 clamps up, 1 is honoured as-is — the whole
+        // point of the split. Neither floor can ever yield 0.
+        assert_eq!(effective_hot_days(0, MIN_HOT_DAYS_MARKET_DATA), 1);
+        assert_eq!(effective_hot_days(1, MIN_HOT_DAYS_MARKET_DATA), 1);
+        assert_eq!(effective_hot_days(35, MIN_HOT_DAYS_MARKET_DATA), 35);
     }
 
     #[test]
@@ -2262,7 +2272,7 @@ mod tests {
         // partition exactly N−1 days old fails the strict `<` and stays hot.
         // Pin the builder emits the effective (clamped) N verbatim so the
         // boundary lives server-side, unchanged from the detach path.
-        let n = effective_hot_days(14);
+        let n = effective_hot_days(14, MIN_HOT_DAYS);
         let sql = build_detach_list_sql("ticks", n);
         assert!(
             sql.contains("dateadd('d', -14, now())"),
