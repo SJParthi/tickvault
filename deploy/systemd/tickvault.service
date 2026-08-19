@@ -154,6 +154,58 @@ Environment=GROWW_MAX_SUBSCRIBE=1000
 # deploy, no config edit — the gate is read at boot.
 Environment=TICKVAULT_DHAN_LIVE_FEED=1
 
+# ---------------------------------------------------------------------------
+# CPU confinement (operator Quote 17b, 2026-08-19 — CPU isolation)
+# ---------------------------------------------------------------------------
+#
+# The box is r8g.xlarge: 4 vCPU, Graviton4, NOT burstable. Before this, three
+# tenants each believed they owned all four cores — this app's tokio runtime
+# defaulted to `worker_threads = num_cpus = 4`, QuestDB held a 3.0 CPU quota
+# with no cpuset, and NIC softirq landed wherever the kernel put it. Measured
+# consequence on 2026-08-18: 21.8% of QuestDB's scheduling periods throttled
+# (nr_throttled 18,594 / nr_periods 85,149).
+#
+# The partition, whose other halves live in deploy/docker/docker-compose.yml
+# (QuestDB + sidecars) and deploy/aws/host-tuning/apply-host-tuning.sh (IRQs):
+#
+#   core 0  OS + NIC IRQ/softirq + the log sidecars
+#   core 1  THIS PROCESS — exclusive
+#   core 2  shared burst: this process + QuestDB
+#   core 3  QuestDB — exclusive
+#
+# WHY NOT CORE 0. Core 0 services network softirq. Pinning the tick decoder
+# there would put it in direct contention with the very work that delivers its
+# packets — CLAUDE.md records this explicitly, and it is the reason the app's
+# set starts at 1 rather than 0.
+#
+# WHY `AllowedCPUs=` AND NOT `CPUAffinity=`. AllowedCPUs writes the unit's
+# cgroup-v2 `cpuset.cpus`, which is the exact same mechanism docker uses for
+# QuestDB — one concept, two tenants, symmetric and inspectable in the same
+# place. It is also the fail-SAFER of the two: if the cpuset controller is
+# unavailable systemd logs and carries on, whereas a CPUAffinity whose CPUs do
+# not exist can make sched_setaffinity fail and take the START with it. A host
+# with an untuned scheduler is slower; a host with no app is blind.
+#
+# HOST-SIZE SAFETY. This names CPUs 1-2, which requires at least 3 cores. On a
+# smaller host the tuning unit REMOVES this setting via a drop-in before the
+# app starts (see apply-host-tuning.sh) rather than letting it pin the app
+# into a set the kernel cannot honour.
+#
+# ROLLBACK — no code change, no rebuild, no redeploy:
+#   printf '[Service]\nAllowedCPUs=\n' \
+#     > /etc/systemd/system/tickvault.service.d/99-cpu-rollback.conf
+#   systemctl daemon-reload && systemctl restart tickvault
+# An EMPTY assignment resets the list, restoring all-cores behaviour. Reverting
+# this file in git and redeploying achieves the same thing.
+AllowedCPUs=1-2
+
+# Runtime width, read by main.rs. Must stay CONSISTENT with AllowedCPUs above:
+# more workers than allowed cores buys context switches, not throughput. The
+# app's own default is 2 (main.rs `DEFAULT_TOKIO_WORKER_THREADS`); this line
+# states it where an operator changing the core set will see it.
+# ROLLBACK to the pre-2026-08-19 `num_cpus` behaviour on this box: set 4.
+Environment=TICKVAULT_TOKIO_WORKER_THREADS=2
+
 # Resource limits
 LimitNOFILE=65536
 LimitNPROC=4096

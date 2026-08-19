@@ -126,10 +126,71 @@ services:
     # Partition manager keeps hot data bounded to ~90 days.
     mem_limit: ${QDB_MEM_LIMIT:-12g}
     mem_reservation: 2g
-    # 3.0 of the box's 4 vCPU. Was 2.0, sized for the t4g.medium's 2 vCPU —
-    # which capped QuestDB at half the new machine. The remaining core is left
-    # for the tickvault app + OS.
-    cpus: 3.0
+    # HISTORY: this was `cpus: 3.0` with the note "3.0 of the box's 4 vCPU …
+    # the remaining core is left for the tickvault app + OS". That reading was
+    # wrong in one word: a QUOTA does not leave a core for anyone. It caps
+    # total CPU-seconds while letting the scheduler put QuestDB's threads on
+    # every core, including the app's. See the CPU PARTITION block below.
+    # ------------------------------------------------------------------
+    # CPU PARTITION (operator Quote 17b, 2026-08-19 — CPU isolation)
+    # ------------------------------------------------------------------
+    # The box is r8g.xlarge: 4 vCPU, Graviton4, NOT burstable. Until now
+    # QuestDB held a 3.0 CPU QUOTA but no cpuset, so the CFS scheduler was
+    # free to place its 3 WAL-apply workers on ANY core — including whichever
+    # core the tick drain happened to be running on, and including the core
+    # servicing NIC softirq. A quota bounds how MUCH a container runs; only a
+    # cpuset bounds WHERE. Measured consequence, recorded below at
+    # QDB_WAL_APPLY_WORKER_COUNT: nr_throttled 18,594 of nr_periods 85,149 =
+    # 21.8% of scheduling periods throttled.
+    #
+    # The partition (see deploy/systemd/tickvault.service for the app half):
+    #
+    #   core 0  OS + NIC IRQ/softirq + the log/metric sidecars.
+    #           NEVER the drain's core — core 0 services network softirq, so
+    #           pinning the decoder there puts it in direct contention with
+    #           the very work that feeds it (CLAUDE.md records this rule).
+    #   core 1  tickvault app — EXCLUSIVE. QuestDB cannot be scheduled here.
+    #   core 2  shared burst: app + QuestDB. Neither is hard-capped at one core.
+    #   core 3  QuestDB — EXCLUSIVE.
+    #
+    # WHY QUESTDB LOSES A CORE (3.0 -> 2.0). Ranked harm, not preference: a
+    # slow QuestDB is ABSORBED by the ring -> NDJSON spill -> DLQ chain that
+    # exists for exactly this, and is recoverable. A descheduled drain fills
+    # the socket receive buffer, and Dhan skips a slow consumer forward to
+    # "the latest available state" — the ticks are dropped at THEIR side, with
+    # no sequence number for us to detect the loss. One is recoverable, the
+    # other is not, so the drain wins the tie.
+    #
+    # ROLLBACK — config only, no code change, no rebuild:
+    #   echo 'TV_QDB_CPUSET=0-3' >> deploy/docker/.env   # all 4 cores, as before
+    #   echo 'TV_QDB_CPUS=3.0'   >> deploy/docker/.env
+    #   echo 'TV_QDB_WAL_WORKERS=3' >> deploy/docker/.env
+    #   docker compose up -d tv-questdb
+    # Use `0-3`, never an empty value: an empty cpuset is rejected by the
+    # runtime and the container would not start.
+    #
+    # ⚠ DEV HOSTS WITH FEWER THAN 4 CORES — the one place this change is NOT
+    # fail-safe, stated plainly rather than discovered. Docker validates a
+    # cpuset against the host's ONLINE cpus and REFUSES to create the container
+    # otherwise ("Requested CPUs are not available - requested 2-3, available:
+    # 0-1"). On a laptop or CI runner with 2 cores, tv-questdb will not start
+    # until you set the override:
+    #
+    #   echo 'TV_QDB_CPUSET=0-1' >> deploy/docker/.env   # or 0-3, or your range
+    #
+    # This is deliberately NOT solved by defaulting the partition off: a
+    # silently-unpartitioned prod box is the failure this whole change exists
+    # to remove, and a loud docker error naming the exact fix is strictly
+    # better than a quiet box that lost the isolation. The APP half has no such
+    # hazard — apply-host-tuning.sh removes its confinement automatically below
+    # 3 cores, because systemd cannot name the fix for you.
+    cpuset: "${TV_QDB_CPUSET:-2,3}"
+    # Kept alongside the cpuset deliberately. The cpuset is the hard placement
+    # bound; this quota is the belt-and-braces ceiling that keeps the number
+    # visible to `docker inspect` and to anyone reading this file. It is set
+    # EQUAL to the cpuset width so it can never be the binding constraint on
+    # its own.
+    cpus: ${TV_QDB_CPUS:-2.0}
     # OOM protection: prefer killing other containers over QuestDB.
     # QuestDB holds all trading data — losing it mid-session is catastrophic.
     oom_score_adj: -500
@@ -210,16 +271,37 @@ services:
       # 3,121 writes/sec, IO pressure full=13.97% (every task stalled on IO
       # 14% of wall time) — with the app itself using 6.7% CPU.
       QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "16777216"
-      # Parallel WAL apply threads: 3, matching the container's `cpus: 3.0`
-      # quota below.
       #
-      # Was 4, justified as "matches the r8g.xlarge 4 vCPU" — but the container
-      # is capped at 3.0 CPUs, not 4, so the 4th worker bought only CFS
-      # throttling. Measured on the box 2026-08-18: nr_throttled 18,594 of
-      # nr_periods 85,149 = 21.8% of scheduling periods throttled, 232 seconds
-      # of throttled time. The host is 4 vCPU total and the app needs some of
-      # it, so the quota stays 3.0 and the worker count comes down to match.
-      QDB_WAL_APPLY_WORKER_COUNT: "3"
+      # Parallel WAL apply threads: 2, matching the 2-core cpuset above.
+      #
+      # This value has now been corrected twice in the same direction, and the
+      # pattern is the point: it was 4 ("matches the r8g.xlarge 4 vCPU") while
+      # the quota was 3.0, then 3 to match that quota. Both times the worker
+      # count was sized against a number that was not the real placement
+      # bound. Measured on the box 2026-08-18 at 4 workers: nr_throttled
+      # 18,594 of nr_periods 85,149 = 21.8% of scheduling periods throttled,
+      # 232 seconds of throttled time. Workers above the width of the cpuset
+      # buy CFS throttling and context switches, never throughput.
+      #
+      # ROLLBACK: TV_QDB_WAL_WORKERS=3 in deploy/docker/.env (raise the cpuset
+      # in the same edit, or this simply re-creates the throttling).
+      QDB_WAL_APPLY_WORKER_COUNT: "${TV_QDB_WAL_WORKERS:-2}"
+      # QuestDB's GENERAL worker pool, set EXPLICITLY for the same reason.
+      #
+      # Left unset, QuestDB sizes this pool from the number of CPUs it can SEE,
+      # and a container reads the HOST's CPU count, not its cgroup cpuset — so
+      # on a 2-core cpuset it would still start 4 general workers. That is the
+      # identical mismatch the WAL count above was corrected for twice, on a
+      # pool nobody had ever pinned. Setting it to the cpuset width is the
+      # whole fix.
+      #
+      # NOT claimed: that 2 general workers is the OPTIMAL value for this
+      # workload — it is the CONSISTENT one. It has not been measured against
+      # the live query mix, and the first session is the measurement.
+      #
+      # ROLLBACK: TV_QDB_SHARED_WORKERS=0 in deploy/docker/.env restores
+      # QuestDB's own auto-sizing (0 means "decide for me" in QuestDB).
+      QDB_SHARED_WORKER_COUNT: "${TV_QDB_SHARED_WORKERS:-2}"
       QDB_PG_USER: ${TV_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${TV_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     logging:
@@ -290,6 +372,10 @@ services:
       - logs
     restart: unless-stopped
     mem_limit: 384m
+    # Pinned to core 0 with the OS and the NIC IRQs (CPU PARTITION, above).
+    # Log shipping is best-effort background work and must never be scheduled
+    # on the app's core (1) or QuestDB's (3). ROLLBACK: TV_SIDECAR_CPUSET=0-3.
+    cpuset: "${TV_SIDECAR_CPUSET:-0}"
     cpus: 0.5
     command: -config.file=/etc/loki/loki-config.yml
     ports:
@@ -322,6 +408,9 @@ services:
       - logs
     restart: unless-stopped
     mem_limit: 256m
+    # Pinned to core 0 — see the tv-loki note above and the CPU PARTITION
+    # block on tv-questdb. ROLLBACK: TV_SIDECAR_CPUSET=0-3.
+    cpuset: "${TV_SIDECAR_CPUSET:-0}"
     cpus: 0.3
     command:
       - run

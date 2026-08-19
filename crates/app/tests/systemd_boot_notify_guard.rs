@@ -161,9 +161,16 @@ fn test_watchdog_pinger_is_shared_prefix_feed_unconditional_and_real() {
     // may exist anywhere above the spawn inside main(). Combined with the
     // source-order pins above (both dhan-gated regions START after the
     // spawn), the spawn is provably unconditional on feed config.
+    // 2026-08-19 (CPU isolation, operator Quote 17b): the entry point was
+    // renamed `main` -> `async_main` when the bare `#[tokio::main]` attribute
+    // was replaced by an explicitly-built runtime (the attribute forces
+    // `worker_threads = num_cpus`, which is the setting the 4-core partition
+    // exists to remove). The sync `main` now does nothing but build that
+    // runtime and `block_on(async_main())`, so `async_main` is the same
+    // boot prefix this pin has always meant — only the name moved.
     let main_fn_pos = main_src
-        .find("async fn main()")
-        .expect("async fn main must exist"); // APPROVED: test
+        .find("async fn async_main()")
+        .expect("async fn async_main must exist"); // APPROVED: test
     assert!(
         main_fn_pos < spawn_pos,
         "the pinger spawn must live inside main() (spawn @{spawn_pos}, \

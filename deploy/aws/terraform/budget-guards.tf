@@ -253,7 +253,13 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # budget.tf (Quote 13 — r8g.xlarge for the 13-timeframe + tick-retention
       # requirement; the bill's high estimate is $73.60 and the actions fire at
       # 90%/100%, so a ceiling under ~$82 would stop the box mid-session).
-      BUDGET_KILL_USD = "100"
+      # $100 -> $130 on 2026-08-19 per the operator ruling recorded verbatim in
+      # budget.tf (Quote 17 — gp3 IOPS 3000->6000 + throughput 125->500 adds
+      # $30.00/mo, moving the bill's high estimate $82.72 -> $112.72; the actions
+      # fire at 90%/100%, so a $100 ceiling would put the 90% line at $90, BELOW
+      # the new bill, and stop the trading box mid-session. $130 puts it at $117 —
+      # $4.28 of room, thinner than the $7.28 this change was called in to fix.)
+      BUDGET_KILL_USD = "130"
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).
       PING_STATE_PARAM = "/tickvault/${var.environment}/budget-guard/ping-state"

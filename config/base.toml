@@ -173,7 +173,27 @@ retention_days = 90
 # tables moved here from the 90d Standard class the same day (the operator's
 # "option only for the current day" direction — 35d is the smallest clean
 # change; a tighter chain-only knob is a follow-up if disk pressure demands).
-market_data_hot_days = 35
+# TRIMMED 35 -> 15 on 2026-08-19 by OPERATOR APPROVAL, verbatim:
+#   "yes bro i believ its betetr to have 15 dyas as yous aid dud eokay?
+#    do get there: trim minute history 35->15 days, okay?"
+#
+# This is precisely the change the FLAGGED note further down this file said
+# was "an operator scope call, not an executor one". It has now been made by
+# the operator, so the flag is resolved rather than carried forward.
+#
+# What this window still covers, after the 2026-08-19 Intraday split: ONLY
+# the eight minute-and-above candle tables (1m, 2m, 3m, 5m, 15m, 30m, 60m,
+# 1d). Ticks and the sixteen sub-minute tables left this class entirely and
+# are current-day. So this number is now a judgement about how much warmup
+# history indicators and strategies need — not about disk pressure.
+#
+# Measured saving (2026-08-18 live basis, all eight tables ~0.3 GB/day at the
+# ~4,565-SID universe): ~6 GB today, ~33 GB at the 25,000-instrument target.
+#
+# NOT a retention cut: every partition is exported, uploaded and row-count-
+# VERIFIED in S3 before it leaves EBS. Fifteen days is the LOCAL window; the
+# full history stays in S3 and is queryable from there.
+market_data_hot_days = 15
 # DEPTH hot window (2026-08-15) — its own knob because market_depth is an
 # order of magnitude heavier than anything else on the box.
 #
@@ -220,7 +240,58 @@ market_data_hot_days = 35
 # not an executor one — but the arithmetic no longer fits beside depth, and
 # the honest options are a shorter market-data window or the 100 -> 200 GB
 # volume grow that variables.tf already permits.
-depth_hot_days = 2
+#
+# RESOLVED 2026-08-19, on BOTH halves, and it is worth recording which half
+# fixed what because they are different problems:
+#
+#   (a) The "~87 GB of ticks" half was never a market-data-window problem at
+#       all. Ticks LEFT this class that day — the Intraday split made them
+#       current-day — so the window no longer implies any tick storage.
+#   (b) The remaining half (minute history) was trimmed 35 -> 15 by operator
+#       approval, quoted at the setting above.
+#
+# STILL OPEN and NOT resolved by either: the 100 -> 200 GB volume grow. It
+# was AUTHORIZED on 2026-08-19 (Quote 16) and VERIFIED UNAPPLIED the same day
+# by `aws ec2 describe-volumes` on vol-0c6ab6e593e39d8c8 — the live root is
+# 100 GB / 3000 IOPS / 125 MiB/s, not the 200 GB / 6000 / 500 the rule files
+# record. At today's ~4,565-SID shape everything fits with room; at the
+# 25,000-instrument target depth ALONE is ~114 GB/day and no window trim can
+# make that fit 100 GB. The grow is an out-of-band online command
+# (`aws ec2 modify-volume`), never `terraform apply`.
+depth_hot_days = 1
+# INTRADAY hot window (2026-08-19) — `ticks` + the SIXTEEN sub-minute candle
+# tables (candles_1s..15s, 30s). Its own knob on an operator directive that
+# separates two things the single market-data window used to conflate:
+#
+#   "for depth or whatever it is only current day, worst case busy day ...
+#    when it comes to historical we will just have minute levels, because
+#    indicators, strategies and minute level of all these historical"
+#
+# Why they cannot share `market_data_hot_days = 35`, in numbers: at the
+# 25,000-instrument target `ticks` runs ~14 GB/day (scaled from the measured
+# ~2.5 GB/day at ~4,565 SIDs), so 35 days is ~480 GB on a 200 GB root. The
+# sixteen sub-minute tables are heavier still. Either alone overflows the
+# volume, and a full disk stops EVERY table — the same reasoning that gave
+# market_depth its own knob on 2026-08-15, applied one level down.
+#
+# Minute-and-above candles are deliberately NOT in this class. They are the
+# history the indicator and strategy paths read, they are two orders of
+# magnitude smaller per day (candles_1m at 25,000 instruments is ~0.9 GB/day),
+# and they keep the 35-day window unchanged.
+#
+# 1 = current day only, and it is HONOURED (not clamped up). CORRECTED
+# 2026-08-19: this block previously said "2 = the MIN_HOT_DAYS floor ...
+# Setting 0 or 1 changes nothing - effective_hot_days clamps to the same
+# floor." That was written before the per-class floor existed and became
+# FALSE the moment MIN_HOT_DAYS_MARKET_DATA (1) was introduced hours later:
+# 1 is now honoured exactly, so the setting DOES change behaviour and a
+# reader trusting the old text would believe yesterday is retained when it
+# is not. Only 0 is clamped (up to 1) — at 0 the cutoff becomes now() and
+# the partition being written this second becomes eligible.
+#
+# NOT a retention cut: every partition is exported, uploaded and
+# row-count-VERIFIED in S3 before it leaves EBS.
+intraday_hot_days = 1
 # Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
 # Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
 # and size-verified. ROLLBACK: set false (or delete the key) to restore the

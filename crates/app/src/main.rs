@@ -307,8 +307,88 @@ async fn emit_boot_completed_when_feed_live(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// ---------------------------------------------------------------------------
+// Tokio worker threads — set EXPLICITLY (operator Quote 17b, 2026-08-19)
+// ---------------------------------------------------------------------------
+//
+// This binary used a bare `#[tokio::main]`, which means `worker_threads =
+// num_cpus`. On the r8g.xlarge that is 4 — and QuestDB was simultaneously
+// free to run its own workers on all 4 of the same cores, with NIC softirq
+// landing wherever the kernel chose. Everything wanted every core, and the
+// measured result was 21.8% of QuestDB's scheduling periods throttled
+// (nr_throttled 18,594 / nr_periods 85,149, box measurement 2026-08-18).
+//
+// The host CPU partition (deploy/docker/docker-compose.yml holds the other
+// half, and deploy/systemd/tickvault.service confines this process to it):
+//
+//   core 0  OS + NIC IRQ/softirq + log sidecars   — NEVER the drain's core
+//   core 1  this process — EXCLUSIVE
+//   core 2  shared burst (this process + QuestDB)
+//   core 3  QuestDB — EXCLUSIVE
+//
+// So this process is confined to 2 cores and gets exactly 2 workers. More
+// workers than cores does not make the frame drain faster: the drain is ONE
+// `tokio::select!` task and occupies one worker at a time whatever the pool
+// size. Extra workers only add threads that can be descheduled while holding
+// the runtime's queues, which is the failure this whole change exists to
+// remove.
+//
+// NOT claimed: that 2 is the measured-optimal width at the 25,000-instrument
+// / 16-socket target. It is the value CONSISTENT with the core partition, and
+// the app measured 6.7% of the box on 2026-08-18 — roughly 15x headroom
+// against one core, let alone two. The first live session at scale is the
+// measurement, and the override below is how it gets acted on without a
+// rebuild.
+const DEFAULT_TOKIO_WORKER_THREADS: usize = 2;
+
+/// Environment override for the worker-thread count.
+///
+/// The rollback path the operator was promised: this whole change must be
+/// reversible by configuration plus a restart, with no code edit. Setting this
+/// to `4` in `deploy/systemd/tickvault.service` restores the pre-2026-08-19
+/// `num_cpus` behaviour on this 4-vCPU box.
+const TOKIO_WORKER_THREADS_ENV: &str = "TICKVAULT_TOKIO_WORKER_THREADS";
+
+/// Upper bound on the override. A fat-fingered `TICKVAULT_TOKIO_WORKER_THREADS=400`
+/// would spawn 400 OS threads on a 4-core box and turn a tuning knob into an
+/// outage, so the parse clamps rather than trusts.
+const MAX_TOKIO_WORKER_THREADS: usize = 64;
+
+/// Resolve the runtime width from the raw environment value.
+///
+/// Fail-SAFE by construction: absent, empty, non-numeric, zero, or absurd all
+/// fall back to [`DEFAULT_TOKIO_WORKER_THREADS`]. There is no input that makes
+/// this return something the runtime builder would reject, because a process
+/// that refuses to boot over a malformed tuning hint is strictly worse than
+/// one that boots on the default.
+fn resolve_tokio_worker_threads(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        Some(v) if !v.is_empty() => match v.parse::<usize>() {
+            Ok(n) if (1..=MAX_TOKIO_WORKER_THREADS).contains(&n) => n,
+            _ => DEFAULT_TOKIO_WORKER_THREADS,
+        },
+        _ => DEFAULT_TOKIO_WORKER_THREADS,
+    }
+}
+
+fn main() -> Result<()> {
+    let raw = std::env::var(TOKIO_WORKER_THREADS_ENV).ok();
+    let worker_threads = resolve_tokio_worker_threads(raw.as_deref());
+
+    // `enable_all` matches what `#[tokio::main]` installed (IO + time drivers).
+    // Named threads so `top -H` / `perf` on the box can tell a runtime worker
+    // apart from a blocking-pool thread while attributing a stall.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_name("tv-worker")
+        .enable_all()
+        .build()
+        .context("failed to build the tokio runtime")?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // PROCESS-START anchor (IST epoch nanos) for the dual-feed scoreboard's
     // process-death reconciler — captured as the FIRST statement of main(),
     // BEFORE any boot path can connect a feed (hostile review round 2,
@@ -1240,13 +1320,14 @@ async fn main() -> Result<()> {
     });
 
     // 2026-07-13 disk-retention hardening: prune confirmed-replay WAL
-    // segments from `<wal_dir>/archive/` older than 7 days (F3: matches
-    // SPILL_FILE_MAX_AGE_SECS and preserves the confirm-on-channel
+    // segments from `<wal_dir>/archive/` older than
+    // WS_WAL_ARCHIVE_RETENTION_SECS (F3: preserves the confirm-on-channel
     // residual's only copy across a long weekend for triage). Archived
     // segments are post-confirmed-replay copies (frames re-injected +
     // durably persisted); the same-day 15:40 IST tick-conservation audit
-    // reads only the CURRENT day's frames, so a 7-day retention can never
-    // change it. Before this task, `archive/` grew ~0.15–0.6 GB/day
+    // reads only the CURRENT day's frames, so the retention window can never
+    // change it. (The window was 7 days until 2026-08-19; the number is no
+    // longer restated in prose — read the constant.) Before this task, `archive/` grew ~0.15–0.6 GB/day
     // unbounded on the prod 30 GB volume. Process-global boot prefix (both
     // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
     // which never runs on a Groww-only boot. Prunes once at task start
@@ -1258,7 +1339,30 @@ async fn main() -> Result<()> {
             let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
+                tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
             );
+            // 2026-08-19: the SPILL retention sweep, wired for the first
+            // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
+            // unit-tested since 2026-07-13 with ZERO production consumers,
+            // and `clear_spill_for_date` — documented as "called by the
+            // writer task after read_all is fully replayed" — likewise had
+            // none. The writer chain only appends, so `data/spill/` grew for
+            // the life of the deployment with no age bound and no size bound.
+            // Rides this existing loop rather than spawning another task:
+            // same cadence, same cold path, one fewer thing to supervise.
+            let _spill = tickvault_storage::seal_spill::prune_spill_files(
+                std::path::Path::new("data/spill"),
+                tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
+            );
+            // The DLQ is MEASURED, never pruned — deliberately asymmetric
+            // with the spill sweep above. It holds the operator-readable
+            // record of seals that were LOST; deleting it to reclaim disk
+            // would destroy the evidence it exists to preserve. Nothing is
+            // written there in normal operation, so a growing DLQ IS the
+            // incident signal — publishing it makes that observable instead
+            // of something discovered when the volume fills.
+            let _dlq =
+                tickvault_storage::seal_dlq::record_dlq_bytes(std::path::Path::new("data/dlq"));
             tokio::time::sleep(Duration::from_secs(
                 tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
             ))
@@ -1899,10 +2003,17 @@ async fn main() -> Result<()> {
         // the operator reading "residual ... from a pre-retirement session"
         // would file it as housekeeping rather than as data loss.
         //
-        // The frames are genuinely preserved on disk, and re-folding them is
-        // real work (the fold path takes a live ring, not a replay batch), so
-        // this stays a drop for now. What changes is that it stops describing
-        // a live gap as historical tidying, and says plainly what was lost.
+        // CORRECTED 2026-08-19: the parenthetical "(the fold path takes a
+        // live ring, not a replay batch)" is FALSE since 2026-08-15 —
+        // `refold_wal_frames` takes precisely a replay batch, and the guard
+        // above (`dhan_lane_will_refold`) is why this block no longer fires on
+        // the normal path. It survived inside a block whose CONDITION had
+        // already been narrowed around it, which is how a comment outlives the
+        // fact it described.
+        //
+        // The block itself is still correct and still a real drop: it fires
+        // ONLY when the lane will not run, and then nothing will ever fold
+        // these frames. The message below is accurate for that branch.
         error!(
             code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
             frames = dropped,
@@ -3380,6 +3491,72 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+
+    // ── resolve_tokio_worker_threads (CPU isolation, Quote 17b 2026-08-19) ──
+    //
+    // The runtime width is no longer `num_cpus`, so the parse that decides it
+    // is now on the boot path. Every one of these cases must yield a width the
+    // runtime builder accepts — a malformed tuning hint must never be able to
+    // stop the app from starting.
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_defaults_when_unset() {
+        assert_eq!(
+            resolve_tokio_worker_threads(None),
+            DEFAULT_TOKIO_WORKER_THREADS,
+            "an absent override must fall back to the partition-consistent default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_honours_a_valid_override() {
+        assert_eq!(resolve_tokio_worker_threads(Some("4")), 4);
+        assert_eq!(resolve_tokio_worker_threads(Some("1")), 1);
+        assert_eq!(
+            resolve_tokio_worker_threads(Some("  3  ")),
+            3,
+            "systemd Environment= values routinely carry surrounding whitespace"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_is_fail_safe_on_garbage() {
+        // Zero would make `Builder::worker_threads(0)` PANIC, which is the one
+        // outcome this function exists to make unreachable.
+        for bad in ["", "   ", "0", "-1", "two", "2.5", "99999999999999999999"] {
+            assert_eq!(
+                resolve_tokio_worker_threads(Some(bad)),
+                DEFAULT_TOKIO_WORKER_THREADS,
+                "{bad:?} must fall back to the default, never propagate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_clamps_absurd_values_to_the_default() {
+        assert_eq!(
+            resolve_tokio_worker_threads(Some("65")),
+            DEFAULT_TOKIO_WORKER_THREADS,
+            "above MAX_TOKIO_WORKER_THREADS the value is a typo, not a request"
+        );
+        assert_eq!(
+            resolve_tokio_worker_threads(Some(&MAX_TOKIO_WORKER_THREADS.to_string())),
+            MAX_TOKIO_WORKER_THREADS,
+            "the boundary itself is legal"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_never_returns_zero() {
+        // Property-ish sweep: no byte string in this space may produce 0.
+        for n in 0..=300u32 {
+            let s = n.to_string();
+            assert!(
+                resolve_tokio_worker_threads(Some(&s)) >= 1,
+                "input {s:?} produced a zero width — Builder::worker_threads(0) panics"
+            );
+        }
+    }
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
 

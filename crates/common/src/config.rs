@@ -2949,6 +2949,31 @@ pub struct PartitionRetentionConfig {
     /// fail-closed by construction.
     #[serde(default = "default_depth_hot_days")]
     pub depth_hot_days: u32,
+    /// Hot window in days for the INTRADAY class — `ticks` plus the five
+    /// second-level candle tables (`candles_1s`/`5s`/`10s`/`15s`/`30s`).
+    ///
+    /// Its own knob since 2026-08-19, on an operator directive that separates
+    /// two things the old single `market_data_hot_days` window conflated:
+    /// *"for depth or whatever it is only current day, worst case busy day …
+    /// when it comes to historical we will just have minute levels, because
+    /// indicators, strategies and minute level of all these historical"*.
+    ///
+    /// Why it cannot share the market-data window: at the 25,000-instrument
+    /// target `ticks` runs ~14 GB/day and the second-level candles are the
+    /// heaviest tables on the box after depth. Holding either for 35 days
+    /// commits several hundred GB on a 200 GB root, and a full disk stops
+    /// EVERY table — the same reasoning that gave `market_depth` its own knob
+    /// on 2026-08-15, applied to the class directly beneath it.
+    ///
+    /// Minute-and-above candles are deliberately NOT in this class: they are
+    /// the history indicators and strategies read, they are two orders of
+    /// magnitude smaller per day, and they keep `market_data_hot_days`.
+    ///
+    /// This is NOT a retention cut. Every partition is exported, uploaded and
+    /// row-count-VERIFIED in S3 before it leaves EBS, and the floor clamps to
+    /// `MIN_HOT_DAYS` so today and yesterday stay local and untouchable.
+    #[serde(default = "default_intraday_hot_days")]
+    pub intraday_hot_days: u32,
     /// Master gate for the archive→verify→drop leg. serde default FALSE so
     /// the destructive behaviour must be explicitly configured on
     /// (config/base.toml sets it true for prod); flipping it off restores
@@ -3029,6 +3054,7 @@ impl Default for PartitionRetentionConfig {
             retention_days: default_retention_days(),
             market_data_hot_days: default_market_data_hot_days(),
             depth_hot_days: default_depth_hot_days(),
+            intraday_hot_days: default_intraday_hot_days(),
             archive_enabled: false,
             archive_bucket: String::new(),
             max_partitions_per_run: default_max_partitions_per_run(),
@@ -3051,8 +3077,29 @@ const fn default_retention_days() -> u32 {
 /// — one month of spot history + weekend slack; was 14). Inert unless
 /// `archive_enabled`; safe-by-default because the archive→verify→drop flow
 /// is fail-closed (no verified S3 copy ⇒ no drop).
+/// Default MARKET-DATA hot window: **15 days** (2026-08-19, operator approval
+/// — "i believ its betetr to have 15 dyas ... trim minute history 35->15
+/// days"). Was 35 from the 2026-07-16 directive.
+///
+/// This is the operator scope call that `config/base.toml` had FLAGGED and
+/// deliberately left un-taken: the executor may not shorten a window an
+/// operator directive set. It is taken now, by the operator.
+///
+/// The class holds only minute-and-above candles since the 2026-08-19
+/// Intraday split, so this window no longer governs ticks or the sixteen
+/// sub-minute tables — it governs exactly the history the indicator and
+/// strategy paths warm up from, which is why 15 days is a judgement about
+/// warmup depth rather than about disk.
+///
+/// Measured basis (2026-08-18, live): all eight minute-and-above candle
+/// tables together run ~0.3 GB/day at the live ~4,565-SID universe, so
+/// 35 -> 15 frees ~6 GB today and ~33 GB at the 25,000-instrument target.
+///
+/// NOT a retention cut: every partition is exported, uploaded and
+/// row-count-VERIFIED in S3 before it leaves EBS. Only the local hot window
+/// shortens; the history itself is kept in full.
 const fn default_market_data_hot_days() -> u32 {
-    35
+    15
 }
 
 /// Default depth hot window: 3 days. See `depth_hot_days` for the arithmetic
@@ -3060,6 +3107,18 @@ const fn default_market_data_hot_days() -> u32 {
 /// 100 GB root, so the sweep would never fire before the disk filled.
 const fn default_depth_hot_days() -> u32 {
     3
+}
+
+/// Default INTRADAY hot window: 2 days = the `MIN_HOT_DAYS` floor itself —
+/// today plus yesterday, which is the smallest window the sweep can honour
+/// without risking a partition that is still being written.
+///
+/// The operator's directive is "current day only"; 2 is what that means in
+/// practice, because a day-partitioned table's current partition cannot be
+/// dropped while rows are still landing in it. Setting this to 0 or 1 changes
+/// nothing — `effective_hot_days` clamps to the same floor.
+const fn default_intraday_hot_days() -> u32 {
+    2
 }
 
 /// Default per-run archive bound: 200 partitions. At ~8–24 hourly ticks
@@ -4212,7 +4271,7 @@ mod tests {
             toml::from_str("retention_days = 90").expect("legacy section must parse");
         assert_eq!(cfg.retention_days, 90);
         // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
-        assert_eq!(cfg.market_data_hot_days, 35);
+        assert_eq!(cfg.market_data_hot_days, 15);
         assert!(!cfg.archive_enabled, "archive leg must default OFF");
         assert!(cfg.archive_bucket.is_empty(), "bucket must default derived");
         assert_eq!(cfg.max_partitions_per_run, 200);
@@ -4225,7 +4284,7 @@ mod tests {
         // (delete the key ⇒ detach-only legacy behaviour).
         assert!(!PartitionRetentionConfig::default().archive_enabled);
         // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
-        assert_eq!(default_market_data_hot_days(), 35);
+        assert_eq!(default_market_data_hot_days(), 15);
         assert_eq!(default_max_partitions_per_run(), 200);
         let cfg: PartitionRetentionConfig =
             toml::from_str("").expect("empty section must parse via defaults");
@@ -4240,6 +4299,9 @@ mod tests {
         .expect("full section must parse");
         assert!(cfg.archive_enabled);
         assert_eq!(cfg.archive_bucket, "tv-prod-cold");
+        // 35, NOT the 15 default: this test parses an EXPLICIT value and
+        // exists to prove an explicit setting overrides the default. If this
+        // ever tracks the default it stops testing anything.
         assert_eq!(cfg.market_data_hot_days, 35);
         assert_eq!(cfg.max_partitions_per_run, 50);
     }

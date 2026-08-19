@@ -68,6 +68,25 @@
 //! See the rule-file section for the same-day S3 archival that keeps "nothing
 //! is dropped" true regardless of which end of that range the feed lands on.
 //!
+//! ## `ts` is ARRIVAL time in IST — corrected 2026-08-19
+//!
+//! Operator, 2026-08-19: *"why the market depth ts has utc time it should be
+//! the precise ist"*. He was right, and this table was the only one getting it
+//! wrong: the caller passed raw `Utc::now()` nanos straight into `ts_nanos`,
+//! while `tick_persistence` and `partition_archive` both add
+//! `IST_UTC_OFFSET_NANOS` at their own stamping sites.
+//!
+//! The offset belongs at the stamping site, not at the source: the value the
+//! caller holds is deliberately true UTC because `ws_lag_ms` differences it
+//! against the vendor's IST exchange stamp converted back to UTC. Shifting it
+//! upstream would have corrupted the lag measurement to fix the column.
+//!
+//! Consequences of the old behaviour, for anyone reading historical rows:
+//! depth written before this fix is 5h30m behind every sibling table, and
+//! because `ts` is the DESIGNATED timestamp, rows captured between 18:30 and
+//! 23:59 IST landed in the PREVIOUS day's partition — the same key the
+//! archival and retention paths use.
+//!
 //! ## Honest: `ts` is ARRIVAL time, not exchange time
 //!
 //! The 12-byte depth header carries `message_length`, `feed_code`,

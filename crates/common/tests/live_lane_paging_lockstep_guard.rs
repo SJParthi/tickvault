@@ -72,6 +72,25 @@ const MUST_PAGE: &[(&str, &str)] = &[
         "a socket parked PERMANENTLY and will not dial again this session; the \
          pool silently carries fewer connections than planned until a restart",
     ),
+    // Added 2026-08-19 (operator Quote 17: "no ticks loss"). This is the LAST
+    // unwatched arm of the durable floor — `ws_frame_spill` shedding a frame
+    // because the spill channel was full or the writer task was dead. The
+    // bytes were never written anywhere, so it is the same unrecoverable class
+    // as tv_dhan_ws_wal_dropped_total above.
+    //
+    // Deliberately NOT listed: `tv_ws_frame_spill_drop_critical`. Verified in
+    // crates/storage/src/ws_frame_spill.rs (`SpillDropCounters`), it increments
+    // on the SAME two arms as tv_ticks_lost_total and has no other production
+    // emitter — the identical event counted twice. A second alarm would page
+    // twice for one frame, which is the family-of-pagers pattern the noise lock
+    // §2.3a argues against. tv_ticks_lost_total is the one kept because it also
+    // carries the `source` label naming which arm shed the frame.
+    (
+        "tv_ticks_lost_total",
+        "the spill writer shed the frame before it reached disk — no payload \
+         survives to replay, backfill or cross-verify, and this is the last \
+         arm of the durable floor that had no pager",
+    ),
 ];
 
 #[test]

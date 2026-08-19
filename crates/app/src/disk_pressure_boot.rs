@@ -58,12 +58,30 @@ pub const DISK_PRESSURE_RESPAWN_BACKOFF_SECS: u64 = 5;
 /// obligations, and compressing them would trade a forensic record for
 /// megabytes. Pressure comes from market data, so pressure acts on market
 /// data.
+/// # Pressure may only ever SHORTEN a window (fixed 2026-08-19)
+///
+/// Every field below takes `min(configured, pressure_days)`. The previous
+/// version assigned `pressure_days` unconditionally, which was a real defect
+/// once `depth_hot_days` dropped to 1 the same day: `pressure_hot_days`
+/// floors at `PRESSURE_MIN_HOT_DAYS` (2), so a disk-pressure episode
+/// **RAISED** the depth window 1 -> 2 and retained an EXTRA day of the
+/// single heaviest table on the box — measured at 505,807,280 rows in one
+/// session. The emergency path made the emergency worse, then escalated
+/// "pressure could not be relieved".
+///
+/// `intraday_hot_days` is now compressed too. It was carried through
+/// untouched by `..cfg.clone()`, so `ticks` plus the sixteen sub-minute
+/// candle tables — the heaviest class after depth — were structurally
+/// invisible to disk pressure. Benign only because the value happens to be 1
+/// today; at any larger value pressure could not touch them at all.
 #[must_use]
 pub fn pressure_config(cfg: &PartitionRetentionConfig) -> PartitionRetentionConfig {
     let days = pressure_hot_days(cfg);
     PartitionRetentionConfig {
-        market_data_hot_days: days,
-        depth_hot_days: days,
+        // min(), never a bare assignment: pressure SHORTENS or does nothing.
+        market_data_hot_days: cfg.market_data_hot_days.min(days),
+        depth_hot_days: cfg.depth_hot_days.min(days),
+        intraday_hot_days: cfg.intraday_hot_days.min(days),
         ..cfg.clone()
     }
 }
@@ -313,7 +331,12 @@ mod tests {
         PartitionRetentionConfig {
             retention_days: 90,
             market_data_hot_days: 35,
-            depth_hot_days: 3,
+            // 1, matching config/base.toml since 2026-08-19. The fixture used
+            // 3 before, which MASKED the widening defect: with 3 > the
+            // pressure floor of 2, min() and a bare assignment agree, so the
+            // bug was invisible to every test that used this fixture.
+            depth_hot_days: 1,
+            intraday_hot_days: 1,
             archive_enabled: true,
             pressure_archive_enabled: true,
             pressure_hot_days: 2,
@@ -324,13 +347,67 @@ mod tests {
     #[test]
     fn pressure_config_compresses_market_data_not_audit() {
         let p = pressure_config(&cfg());
-        assert_eq!(p.market_data_hot_days, 2, "ticks + candles compress");
-        assert_eq!(p.depth_hot_days, 2, "depth compresses — it is the heaviest");
+        assert_eq!(
+            p.market_data_hot_days, 2,
+            "minute history compresses 35 -> 2"
+        );
+        // 1, NOT 2. Re-blessed 2026-08-19: this line asserted 2, which was
+        // the DEFECT stated as the contract — pressure raising the depth
+        // window from the configured 1 to the floor of 2, retaining an extra
+        // day of the heaviest table exactly when the disk is full.
+        assert_eq!(
+            p.depth_hot_days, 1,
+            "pressure must never RAISE a window above what is configured"
+        );
+        assert_eq!(
+            p.intraday_hot_days, 1,
+            "intraday must be compressible by pressure, and never raised"
+        );
         assert_eq!(
             p.retention_days, 90,
             "audit/daily tables are small and several are SEBI 5y — pressure comes \
              from market data, so pressure acts on market data"
         );
+    }
+
+    #[test]
+    fn pressure_never_widens_any_window() {
+        // The general invariant, asserted per class rather than per literal:
+        // whatever pressure computes, no class may come back LARGER than it
+        // went in. This is the test whose absence let the depth defect ship.
+        for configured in [0_u32, 1, 2, 3, 15, 35, u32::MAX] {
+            let mut c = cfg();
+            c.market_data_hot_days = configured;
+            c.depth_hot_days = configured;
+            c.intraday_hot_days = configured;
+            let p = pressure_config(&c);
+            assert!(
+                p.market_data_hot_days <= configured,
+                "market_data widened {configured} -> {}",
+                p.market_data_hot_days
+            );
+            assert!(
+                p.depth_hot_days <= configured,
+                "depth widened {configured} -> {}",
+                p.depth_hot_days
+            );
+            assert!(
+                p.intraday_hot_days <= configured,
+                "intraday widened {configured} -> {}",
+                p.intraday_hot_days
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_leaves_audit_retention_alone_at_every_input() {
+        // The other half of the contract: SEBI/audit tables are never touched
+        // by pressure, whatever the market-data windows are set to.
+        for configured in [0_u32, 1, 35, u32::MAX] {
+            let mut c = cfg();
+            c.depth_hot_days = configured;
+            assert_eq!(pressure_config(&c).retention_days, 90);
+        }
     }
 
     #[test]
@@ -342,7 +419,9 @@ mod tests {
             p.market_data_hot_days, 2,
             "today and yesterday stay untouchable even when the config asks for 0"
         );
-        assert_eq!(p.depth_hot_days, 2);
+        // The configured 1 stands: min(1, floor 2) == 1. The floor bounds how
+        // far pressure may COMPRESS, never how much it may retain.
+        assert_eq!(p.depth_hot_days, 1);
     }
 
     #[test]

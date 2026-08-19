@@ -219,3 +219,140 @@ resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
   alarm_actions   = local.app_alarm_actions
   ok_actions      = []
 }
+
+# ---------------------------------------------------------------------------
+# 5. SEBI FORENSIC CHAIN LOSING ROWS — ONE composite alarm over FIVE counters
+#    (2026-08-19, operator Quote 17)
+# ---------------------------------------------------------------------------
+# The order/position audit tables are the SEBI five-year forensic chain. Five
+# counters report a row failing to reach them, and until now every one of them
+# was EMF-shipped to CloudWatch, billed, and consumed by NOTHING — not an
+# alarm, not a dashboard widget. A regulator-facing record was being lost with
+# no signal at all.
+#
+# WHY ONE ALARM AND NOT FIVE. The five counters are five MECHANISMS for one
+# CONDITION: "an order/position audit row did not make it into the chain".
+# The operator's response is the same in every case — go look at the coded
+# lines and find out which rows were lost — so five separate pagers would
+# deliver five different names for one incident and, per
+# dhan-rest-only-noise-lock-2026-07-14.md §2.3a, "a family of eleven pagers
+# for one subsystem trains an operator to ignore all of them". A metric-math
+# SUM pages ONCE and the description says how to tell the mechanisms apart.
+# It is also cheaper: one alarm, not five.
+#
+# EMIT SITES VERIFIED IN SOURCE 2026-08-19 (this repo forbids alarms on
+# metrics nothing emits — a filter that can never match is a permanently-green
+# dead monitor):
+#   tv_order_audit_rows_discarded_total          -> crates/storage/src/order_audit_persistence.rs:479
+#   tv_order_audit_persist_errors_total          -> crates/app/src/order_observability.rs:564,575
+#                                                   crates/app/src/dhan_order_push_observability.rs:195,206
+#   tv_order_update_events_dropped_total         -> crates/app/src/dhan_order_push_observability.rs:257
+#                                                   crates/trading/src/oms/groww/push/order_events.rs:384
+#   tv_order_update_events_persist_errors_total  -> crates/app/src/order_update_events_boot.rs:344,358,381,395
+#   tv_order_update_events_rows_discarded_total  -> crates/storage/src/order_update_events_persistence.rs:588
+#                                                   crates/storage/src/position_update_events_persistence.rs:473
+# All five are already in the EMF metric_selectors list in
+# user-data.sh.tftpl, so this adds NO new metric name and no new EMF cost —
+# it consumes five series we were already paying to ship.
+#
+# HONEST SCOPE: the order push channels run in PAPER mode today
+# (`[dhan_order_push] enabled`, `[groww_orders] order_push_enabled`, both
+# receive-only; GROWW_ORDER_LIVE_FIRE is false). So a breach today means the
+# PAPER forensic chain lost a row — which is exactly the rehearsal you want to
+# have working before live orders, not a reason to leave it unwatched.
+resource "aws_cloudwatch_metric_alarm" "order_audit_chain_loss" {
+  alarm_name = "tv-${var.environment}-order-audit-chain-loss"
+  # NOTE: AWS caps alarm_description at 1024 characters (terraform validate
+  # failure, 2026-08-19). Long-form reasoning belongs in comments like this
+  # one, which has no cap; the description is the pager text.
+  alarm_description = "SEBI order/position forensic chain LOST A ROW. Sums five counters: order_audit rows discarded, order_audit persist errors, order/position events dropped pre-persistence, order_update_events persist errors, order_update_events rows discarded. Five-year retention - these tables are the only record of what the system did with an order, and the broker event is not replayed. DO: (1) grep /tickvault/<env>/app for coded ORDER-AUDIT / ORDER-UPDATE lines - they name which mechanism, the stage (append vs flush) and the reason. (2) persist_errors points at QuestDB (ILP flush latency, WAL-suspended gauge); rows may still be re-appendable. (3) rows_discarded or events_dropped means it is already gone - record the window. Order push is receive-only PAPER today, so a breach now is the rehearsal failing, not live-order data."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  # notBreaching: the box is stopped outside 08:30-17:30 IST weekdays and the
+  # push channels only publish in-session, so no-data is the normal overnight
+  # state. `breaching` here would page every single night. This alarm reports
+  # LOST ROWS, never silence; a dead app is the boot-heartbeat and
+  # market-hours-liveness alarms' job.
+  treat_missing_data = "notBreaching"
+  alarm_actions      = local.app_alarm_actions
+  # NO ok_actions. These are cumulative loss counters: a delta returning to
+  # zero means no ADDITIONAL rows were lost, never that the lost ones came
+  # back. An OK page would tell the operator a regulator-facing record was
+  # restored when it was not (Rule 11, no false recovery).
+  ok_actions = []
+
+  # Metric math: SUM of the five, with each leg's own metric NOT returned, so
+  # only the total drives the alarm state and CloudWatch charges for one alarm.
+  # FILL(m, 0) on each leg is load-bearing: an expression over five series
+  # evaluates to no-data if ANY leg is missing, and a counter that never
+  # incremented in the window legitimately has no sample — without FILL, the
+  # arithmetic would be silenced by the four healthy legs.
+  metric_query {
+    id          = "audit_loss_total"
+    expression  = "FILL(m1,0)+FILL(m2,0)+FILL(m3,0)+FILL(m4,0)+FILL(m5,0)"
+    label       = "order/position audit rows lost (all five mechanisms)"
+    return_data = true
+  }
+
+  metric_query {
+    id          = "m1"
+    return_data = false
+    metric {
+      metric_name = "tv_order_audit_rows_discarded_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "m2"
+    return_data = false
+    metric {
+      metric_name = "tv_order_audit_persist_errors_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "m3"
+    return_data = false
+    metric {
+      metric_name = "tv_order_update_events_dropped_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "m4"
+    return_data = false
+    metric {
+      metric_name = "tv_order_update_events_persist_errors_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "m5"
+    return_data = false
+    metric {
+      metric_name = "tv_order_update_events_rows_discarded_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+}
