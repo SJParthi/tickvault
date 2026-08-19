@@ -190,3 +190,46 @@ fn guard_self_test_detects_the_reintroduced_discard() {
          call sites both quote it deliberately"
     );
 }
+
+/// Name-matched coverage for `escalate_refused_seal`, the free function that
+/// IS the no-drop policy.
+///
+/// It is exercised behaviourally through the source scans above and through
+/// the `SealOverflow` unit tests in `tickvault-storage`; this asserts the one
+/// property that is only visible from OUTSIDE those tests — the honest
+/// answer when no durable tier was ever installed.
+#[test]
+fn escalate_refused_seal_reports_lost_when_no_durable_tier_is_installed() {
+    use tickvault_common::feed::Feed;
+    use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
+
+    // This test binary never installs a global escalator, so the accessor
+    // returns `None`. Claiming "rescued" there would be exactly the false-OK
+    // the policy exists to prevent: the operator would read a healthy rescue
+    // count while candles evaporated.
+    let mut state = LiveCandleState::empty();
+    state.bucket_start_ist_secs = 34_200;
+    state.close = 101.0;
+    let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
+
+    assert_eq!(
+        tickvault_app::dhan_feed_stack::escalate_refused_seal(&seal),
+        tickvault_app::dhan_feed_stack::SealRefusal::Lost,
+        "with no durable tier installed the only honest answer is Lost"
+    );
+}
+
+/// Name-matched coverage for the `seals_rescued` accessor: it must be READ
+/// somewhere, not merely incremented. A counter with no read-out is the
+/// failure mode this lane has already shipped twice.
+#[test]
+fn seals_rescued_is_reported_beside_seals_dropped() {
+    let code = std::fs::read_to_string(repo_root().join("crates/app/src/dhan_feed_stack.rs"))
+        .expect("read dhan_feed_stack.rs");
+    assert!(
+        code.contains("seals_rescued = ingest.seals_rescued()"),
+        "the rescued count must appear in the drain summary — a non-zero `rescued` \
+         beside a zero `dropped` is the policy working, and that is only readable \
+         when the pair is logged together"
+    );
+}

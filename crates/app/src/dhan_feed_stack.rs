@@ -2530,6 +2530,12 @@ async fn run_frame_drain(
         close_seals_dropped = close_dropped,
         seals_emitted = ingest.seals_emitted(),
         seals_dropped = ingest.seals_dropped(),
+        // Reported beside `dropped` because the pair is only readable
+        // together: a non-zero `rescued` with a zero `dropped` is the no-drop
+        // policy WORKING — the writer fell behind and every seal went to disk
+        // — whereas the same `rescued` number alone reads like a loss. It is
+        // also the capacity signal for the seal writer.
+        seals_rescued = ingest.seals_rescued(),
         // Reported next to its siblings so the three are read together: a
         // large `skipped` beside a small `emitted` is the operator-timeframe
         // gate working as designed, and seeing it in isolation would invite

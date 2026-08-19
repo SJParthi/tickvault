@@ -743,4 +743,32 @@ mod tests {
         let _ = std::fs::remove_file(&spill_as_file);
         let _ = std::fs::remove_file(&dlq_as_file);
     }
+
+    #[test]
+    fn test_spill_handle_and_dlq_handle_share_the_pipelines_own_writers() {
+        // Sharing the INSTANCE is the contract, not the directory: two
+        // independent spill writers on one day-file each cache their own
+        // append handle behind their own mutex and interleave partial writes.
+        let dir = std::env::temp_dir().join(format!("tv-handle-share-{}", std::process::id()));
+        let spill_dir = dir.join("spill");
+        let dlq_dir = dir.join("dlq");
+        std::fs::create_dir_all(&spill_dir).expect("spill dir");
+        std::fs::create_dir_all(&dlq_dir).expect("dlq dir");
+
+        let pipeline =
+            SealAbsorptionPipeline::with_dirs_for_test(spill_dir.clone(), dlq_dir.clone());
+        let a = pipeline.spill_handle();
+        let b = pipeline.spill_handle();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "spill_handle must hand out the SAME writer, not a clone of its configuration"
+        );
+        let d1 = pipeline.dlq_handle();
+        let d2 = pipeline.dlq_handle();
+        assert!(
+            Arc::ptr_eq(&d1, &d2),
+            "dlq_handle must hand out the SAME writer for the same reason"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
