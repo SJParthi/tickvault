@@ -341,6 +341,33 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
         "instrument master parsed"
     );
 
+    // 1b. The derivative subset, written for the contract attach.
+    //
+    // Written HERE, while the parsed master is still in hand, because it is
+    // dropped a few lines below and the attach runs much later — it waits for
+    // live prices to locate at-the-money. Without this the attach would have
+    // to re-download the same ~15 MB file in the minutes after the open.
+    //
+    // NON-FATAL by construction: a failure here costs the session its
+    // contracts and leaves the spot universe untouched, so it must never
+    // abort the mapping build that the whole rider exists for.
+    let contract_rows = crate::dhan_contract_universe::contract_rows_from_master(&master);
+    match crate::dhan_contract_universe::write_contract_artifact(date, &contract_rows) {
+        Ok(()) => info!(
+            source = "dhan_master",
+            contracts = contract_rows.len(),
+            "contract artifact written"
+        ),
+        Err(err) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            %err,
+            date,
+            "contract artifact could NOT be written — the live lane will carry its spot \
+             universe only, with no futures and no option contracts, until this is fixed. \
+             The mapping build below is unaffected."
+        ),
+    }
+
     // 2. Every NSE India index list. A single list failing does NOT abort the
     // day: the tolerance gate below judges the RESULT, so one flaky index out
     // of ~49 degrades the fraction rather than losing the other 48. Aborting

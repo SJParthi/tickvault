@@ -172,6 +172,16 @@ pub struct DepthSelection {
     /// against 250 cannot tell a narrow window from a thin chain, and those
     /// need different responses.
     pub depth_20_strikes_each_side: usize,
+    /// depth-20 contracts dropped as duplicates of an already-chosen
+    /// `(security_id, exchange_segment)` composite (I-P1-11).
+    pub depth_20_deduped: usize,
+    /// True when candidates existed but NO depth-200 socket could be filled.
+    ///
+    /// Means no strike carried both legs. Distinct from "there were no
+    /// candidates at all", which is the ordinary pre-open state — this one
+    /// says the chain arrived and still produced nothing, which is worth
+    /// looking at rather than reading as silence.
+    pub depth_200_no_pair_available: bool,
     /// depth-20 instruments dropped because the pool envelope was exceeded.
     ///
     /// Should be 0 — the window is sized to fit. A non-zero value means an
@@ -330,6 +340,9 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     let each_side = depth_20_strikes_each_side(underlyings.len());
     out.depth_20_strikes_each_side = each_side;
 
+    let mut chosen_depth_20: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+        std::collections::HashSet::new();
+
     // Whole CE/PE pairs for depth-200, ranked across every underlying, so the
     // 2 pairs go to the 2 most at-the-money books rather than to whichever
     // underlying happens to sort first.
@@ -373,10 +386,22 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
 
             if rank < keep {
                 for (c, segment) in &legs {
-                    out.depth_20.push(SubscribeInstrument {
+                    let inst = SubscribeInstrument {
                         security_id: c.contract_security_id as SecurityId,
                         segment: *segment,
-                    });
+                    };
+                    // I-P1-11 dedup on the COMPOSITE, which this path did not
+                    // have. A chain snapshot can carry the same contract under
+                    // two `underlying_security_id` partitions, and a duplicate
+                    // here is not harmless: it burns one of Dhan's 50 wire
+                    // slots on that connection and inflates the count toward
+                    // the 250 envelope, so real contracts get squeezed out by
+                    // copies of ones already subscribed.
+                    if chosen_depth_20.insert((inst.security_id, inst.segment)) {
+                        out.depth_20.push(inst);
+                    } else {
+                        out.depth_20_deduped += 1;
+                    }
                 }
             }
 
@@ -423,6 +448,16 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
         }
         out.depth_200.push(ce);
         out.depth_200.push(pe);
+    }
+
+    // A chain that offered candidates but yielded no depth-200 socket is a
+    // real outcome and was previously invisible. It happens whenever no strike
+    // carries BOTH legs — a CE-only snapshot, say — because the lone-leg
+    // fallback fires only from a REJECTED pair and an empty pair pool never
+    // rejects anything. Five authorized 200-level sockets then sit idle with
+    // nothing in the result saying why.
+    if out.depth_200.is_empty() && !usable.is_empty() {
+        out.depth_200_no_pair_available = true;
     }
 
     // Last-resort envelope guard. The adaptive window is sized to fit, so
@@ -962,6 +997,46 @@ mod tests {
         let used = (each_side * 2 + 1) * 2 * 2;
         assert_eq!(each_side, 30);
         assert_eq!(used, 244, "244 of 250, against 84 before this change");
+    }
+
+    #[test]
+    fn the_same_contract_twice_burns_no_depth_20_slot() {
+        // A chain snapshot can carry the same contract under two
+        // underlying_security_id partitions. Without composite dedup the
+        // duplicate takes one of Dhan's 50 wire slots on that connection and
+        // pushes a real contract out of the 250-slot envelope.
+        let mut a = candidate("NIFTY", 42, 100.0, "CE");
+        a.spot = 100.0;
+        let mut b = candidate("NIFTY", 42, 100.0, "CE");
+        b.spot = 100.0;
+        let sel = select_depth_universe(&[a, b]);
+        assert_eq!(sel.depth_20.len(), 1);
+        assert_eq!(sel.depth_20_deduped, 1, "and the duplicate is COUNTED");
+    }
+
+    #[test]
+    fn a_ce_only_chain_reports_that_no_depth_200_pair_existed() {
+        // The lone-leg fallback fires only from a REJECTED pair, and an empty
+        // pair pool never rejects anything — so all 5 authorized 200-level
+        // sockets sat idle with nothing in the result saying why.
+        let mut c = candidate("NIFTY", 1, 100.0, "CE");
+        c.spot = 100.0;
+        let sel = select_depth_universe(&[c]);
+        assert!(sel.depth_200.is_empty());
+        assert!(
+            sel.depth_200_no_pair_available,
+            "candidates arrived and still produced no socket — that is a \
+             finding, not silence"
+        );
+        assert!(!sel.depth_20.is_empty(), "depth-20 is unaffected");
+    }
+
+    #[test]
+    fn no_candidates_at_all_is_not_reported_as_a_missing_pair() {
+        // The ordinary pre-open state must stay distinguishable from the
+        // chain-arrived-but-unpairable one above.
+        let sel = select_depth_universe(&[]);
+        assert!(!sel.depth_200_no_pair_available);
     }
 
     #[test]

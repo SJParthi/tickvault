@@ -285,6 +285,26 @@ const COL_STRIKE: &str = "STRIKE_PRICE";
 const COL_OPTION_TYPE: &str = "OPTION_TYPE";
 const COL_UNDERLYING_SYMBOL: &str = "UNDERLYING_SYMBOL";
 
+/// Days in `month` of `year`, Gregorian.
+///
+/// Local rather than a date dependency: this is the only calendar question the
+/// module asks, and the whole file's value is that it is pure and dependency-
+/// free enough to test against a table of hostile fixtures.
+const fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
 /// Packs a `SM_EXPIRY_DATE` value into `YYYYMMDD`, or `0` when unusable.
 ///
 /// Accepts the bare `YYYY-MM-DD` and the `YYYY-MM-DD HH:MM:SS` form, because
@@ -315,7 +335,15 @@ pub fn parse_expiry_ymd(value: &str) -> u32 {
     };
     // Range-check rather than trust: a garbled row must not produce an expiry
     // that sorts before every real one and captures the "nearest" slot.
-    if !(1970..=2999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    //
+    // The day bound is PER MONTH, not a flat 1..=31. A flat bound accepts
+    // 2026-02-31, which packs to 20260231 — earlier than every real February
+    // expiry and therefore exactly the value that would win the nearest-expiry
+    // slot and collapse a chain to one stub row.
+    if !(1970..=2999).contains(&y) || !(1..=12).contains(&m) {
+        return 0;
+    }
+    if d < 1 || d > days_in_month(y, m) {
         return 0;
     }
     y * 10_000 + m * 100 + d
@@ -445,10 +473,20 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
 
     let mut fields: Vec<String> = Vec::new();
     split_csv_line(header.trim_end_matches('\r'), &mut fields);
-    let index: HashMap<&str, usize> = fields
+    // Header names are UPPERCASED before indexing, exactly as every value is.
+    //
+    // They were not, and the asymmetry was dangerous in one direction only: a
+    // mandatory column arriving as `Security_Id` fails LOUD (`MissingColumn`
+    // rejects the file), but an optional one arriving as `Instrument` fails
+    // SILENT — every row would classify as `Other`, the whole derivative set
+    // would filter to empty, and the result would be indistinguishable from a
+    // market with no derivatives. Case-normalising costs nothing and removes
+    // the difference.
+    let upper: Vec<String> = fields.iter().map(|n| n.trim().to_uppercase()).collect();
+    let index: HashMap<&str, usize> = upper
         .iter()
         .enumerate()
-        .map(|(i, name)| (name.trim(), i))
+        .map(|(i, name)| (name.as_str(), i))
         .collect();
 
     let col = |name: &'static str| -> Result<usize, MasterParseError> {
@@ -1063,6 +1101,46 @@ mod tests {
         assert_eq!(parse_expiry_ymd("2026-13-01"), 0, "month 13");
         assert_eq!(parse_expiry_ymd("2026-08-32"), 0, "day 32");
         assert_eq!(parse_expiry_ymd("1969-12-31"), 0, "before the floor");
+    }
+
+    #[test]
+    fn test_an_impossible_calendar_date_is_refused_per_month() {
+        // A flat 1..=31 day bound accepts 2026-02-31, which packs to 20260231
+        // — earlier than every real February expiry, so it is exactly the
+        // value that wins the nearest-expiry slot and collapses a chain.
+        assert_eq!(parse_expiry_ymd("2026-02-31"), 0);
+        assert_eq!(parse_expiry_ymd("2026-02-30"), 0);
+        assert_eq!(parse_expiry_ymd("2026-04-31"), 0, "April has 30");
+        assert_eq!(parse_expiry_ymd("2026-06-31"), 0);
+        assert_eq!(parse_expiry_ymd("2026-09-31"), 0);
+        assert_eq!(parse_expiry_ymd("2026-11-31"), 0);
+        // Real dates still pass, leap years included.
+        assert_eq!(parse_expiry_ymd("2026-02-28"), 2026_02_28);
+        assert_eq!(parse_expiry_ymd("2028-02-29"), 2028_02_29, "leap year");
+        assert_eq!(parse_expiry_ymd("2026-02-29"), 0, "not a leap year");
+        assert_eq!(parse_expiry_ymd("2000-02-29"), 2000_02_29, "400-year rule");
+        assert_eq!(parse_expiry_ymd("1900-02-29"), 0, "100-year rule");
+        assert_eq!(parse_expiry_ymd("2026-12-31"), 2026_12_31);
+    }
+
+    #[test]
+    fn test_header_case_does_not_decide_whether_a_column_exists() {
+        // Values were uppercased and header names were not, and the asymmetry
+        // was dangerous in one direction only: a mandatory column in the wrong
+        // case fails LOUD, an optional one fails SILENT — every row would
+        // classify as Other and the whole derivative set would come back empty
+        // looking exactly like a market with no derivatives.
+        let header = "security_id,isin,Symbol_Name,exch_id,segment,series,\
+                      Instrument,sm_expiry_date,Strike_Price,option_type,underlying_symbol";
+        let body = master_with(
+            header,
+            &["44311,,NIFTY,NSE,D,,OPTIDX,2026-08-28,24500.000000,CE,NIFTY"],
+        );
+        let r = rows_by_id(&body, 44311);
+        assert_eq!(r.class, InstrumentClass::IndexOption);
+        assert_eq!(r.expiry_ymd, 2026_08_28);
+        assert_eq!(r.strike_paise, 2_450_000);
+        assert_eq!(r.option_leg, OptionLeg::Call);
     }
 
     #[test]

@@ -53,29 +53,173 @@
 
 use std::collections::{HashMap, HashSet};
 
+use tickvault_common::constants::STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::instrument::master_csv::{InstrumentClass, MasterRow, OptionLeg};
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
-/// Strikes each side of at-the-money that stock options subscribe.
+/// Directory the day's contract artifact lives in.
 ///
-/// The operator's figure, verbatim: *"for stocks the max atm plus or minus 25
-/// for both call and put"*. 25 each side plus the ATM strike itself is 51
-/// strikes × 2 legs = 102 contracts per stock.
+/// The same directory the mapping artifact uses, so one cleanup and one
+/// retention policy covers both.
+const CONTRACT_DIR: &str = "data/instrument-cache";
+
+/// Path of the day's contract artifact.
 ///
-/// This is the ELASTIC dimension of the whole selection — see
-/// [`select_contract_universe`]. Every other class is take-it-all; when the
-/// total exceeds the connection envelope this is the number that shrinks,
-/// because shrinking it drops the contracts furthest from the money, which is
-/// the only principled thing to drop.
-pub const STOCK_OPTION_ATM_STRIKES_EACH_SIDE: usize = 25;
+/// # Why an artifact at all
+///
+/// The daily rider fetches the ~15 MB master, parses it, writes the ISIN
+/// mapping, and drops the rows. The mapping is index constituents — cash
+/// equities — so it carries no contract. Selection needs the derivative rows,
+/// and it runs LATER than the rider (it waits for live prices to locate
+/// at-the-money), by which time those rows are gone.
+///
+/// Re-downloading the master at attach time would mean a second 15 MB fetch of
+/// a file we already had, in the minutes right after the open. Writing the
+/// derivative subset once costs a few megabytes of disk and no network at all.
+#[must_use]
+pub fn contract_artifact_path(date_ist: &str) -> std::path::PathBuf {
+    std::path::Path::new(CONTRACT_DIR).join(format!("dhan-contracts-{date_ist}.json"))
+}
+
+/// One derivative row, as written to and read from the artifact.
+///
+/// Field names are short because there are ~100,000 of them and the long
+/// forms would add megabytes of key text to a file nothing reads by eye.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContractRow {
+    /// `security_id`.
+    pub i: u64,
+    /// `EXCH_ID`.
+    pub x: String,
+    /// Instrument class, as the master's own word (`OPTIDX`, `FUTSTK`, …).
+    pub c: String,
+    /// Expiry `YYYYMMDD`.
+    pub e: u32,
+    /// Strike in paise.
+    pub s: i64,
+    /// `CE`, `PE`, or empty.
+    pub l: String,
+    /// Underlying symbol.
+    pub u: String,
+}
+
+impl ContractRow {
+    /// Rebuilds the [`MasterRow`] shape selection consumes.
+    ///
+    /// Round-tripping through `MasterRow` rather than teaching the selector a
+    /// second input type keeps ONE selection path: the artifact and a freshly
+    /// parsed master produce byte-identical selections, so a test against
+    /// parsed rows is a test of what production actually runs.
+    #[must_use]
+    pub fn to_master_row(&self) -> MasterRow {
+        MasterRow {
+            security_id: self.i,
+            isin: String::new(),
+            symbol_name: String::new(),
+            exch_id: self.x.clone(),
+            segment: "D".into(),
+            series: String::new(),
+            class: InstrumentClass::from_master_field(&self.c),
+            expiry_ymd: self.e,
+            strike_paise: self.s,
+            option_leg: OptionLeg::from_master_field(&self.l),
+            underlying_symbol: self.u.clone(),
+        }
+    }
+}
+
+/// The derivative subset of a master, ready to write.
+///
+/// Equities and indices are dropped: they are the spot universe's business and
+/// carry no expiry, so keeping them would roughly double the file for rows
+/// selection immediately skips.
+#[must_use]
+pub fn contract_rows_from_master(master: &[MasterRow]) -> Vec<ContractRow> {
+    master
+        .iter()
+        .filter(|r| r.class.is_future() || r.class.is_option())
+        .map(|r| ContractRow {
+            i: r.security_id,
+            x: r.exch_id.clone(),
+            c: match r.class {
+                InstrumentClass::IndexFuture => "FUTIDX",
+                InstrumentClass::StockFuture => "FUTSTK",
+                InstrumentClass::IndexOption => "OPTIDX",
+                InstrumentClass::StockOption => "OPTSTK",
+                _ => "",
+            }
+            .into(),
+            e: r.expiry_ymd,
+            s: r.strike_paise,
+            l: match r.option_leg {
+                OptionLeg::Call => "CE",
+                OptionLeg::Put => "PE",
+                OptionLeg::None => "",
+            }
+            .into(),
+            u: r.underlying_symbol.clone(),
+        })
+        .collect()
+}
+
+/// Writes the day's contract artifact atomically.
+///
+/// # Errors
+///
+/// Any filesystem or serialisation failure. The caller treats this as
+/// non-fatal: a missing artifact costs the session its contracts, never its
+/// spot universe.
+///
+/// # Why atomic
+///
+/// A half-written artifact that a later reader parses is worse than no
+/// artifact: it would yield a partial contract set that looks complete. Same
+/// reasoning, same mechanism as the mapping artifact beside it.
+pub fn write_contract_artifact(date_ist: &str, rows: &[ContractRow]) -> anyhow::Result<()> {
+    let path = contract_artifact_path(date_ist);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(rows)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Reads the day's contract artifact.
+///
+/// # Errors
+///
+/// Missing or unparseable file. Both are non-fatal to the caller and are
+/// reported as "contracts are NOT in effect" rather than as an empty set that
+/// looks like a market with no derivatives.
+pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<Vec<ContractRow>> {
+    let path = contract_artifact_path(date_ist);
+    let body = std::fs::read_to_string(&path)?;
+    Ok(serde_json::from_str(&body)?)
+}
 
 /// Index underlyings whose FULL option chain is subscribed.
 ///
-/// Exactly two, and that is the operator's own restriction: *"one and only
-/// for indices for nifty and banknifty entire options contracts should be
-/// fully subscribed"*. A third index here is a scope expansion needing its
-/// own dated quote — the arity is pinned by a test for exactly that reason.
+/// Exactly two, and that is the operator's own restriction (2026-08-15):
+/// *"one and only for indices for nifty and banknifty entire options contracts
+/// should be fully subscribed"*. A third index here is a scope expansion
+/// needing its own dated quote — the arity is pinned by a test for that reason.
+///
+/// # Why this differs from the older `FULL_CHAIN_INDEX_*` pair in `constants.rs`
+///
+/// Those list THREE — NIFTY, BANKNIFTY, SENSEX — from a 2026-04-25 sizing
+/// exercise, and they are dead code (no call site; the dead-const ratchet
+/// tracks them as such). Two dated things happened since and both cut the same
+/// way: the 2026-08-15 quote above names two underlyings, and SENSEX is
+/// `BSE_FNO` while the depth endpoints Dhan serves are NSE-only.
+///
+/// The divergence is recorded here rather than reconciled by using them,
+/// deliberately. Referencing a dead constant — even from a doc comment — makes
+/// the ratchet read it as wired, which would retire a real dead-code finding
+/// in exchange for a cross-reference. The older constants stay dead and stay
+/// tracked; this one is what the lane actually subscribes.
 pub const FULL_CHAIN_INDEX_UNDERLYINGS: [&str; 2] = ["NIFTY", "BANKNIFTY"];
 
 /// What a contract selection produced, and everything it refused.
@@ -104,8 +248,24 @@ pub struct ContractSelection {
     /// Underlyings whose options were REFUSED because no live spot price was
     /// available to locate at-the-money. Never guessed.
     pub underlyings_without_spot: usize,
-    /// Rows refused for carrying no usable expiry.
+    /// Rows refused for carrying no usable expiry at all.
     pub refused_no_expiry: usize,
+    /// Rows refused for having ALREADY expired.
+    ///
+    /// Separate from [`Self::refused_no_expiry`] because they mean different
+    /// things: a missing date is a vendor defect, while a large count here on
+    /// a normal day means the artifact is STALE — yesterday's file read after
+    /// IST midnight, in which case every row is expired and the selection is
+    /// empty for a reason that has nothing to do with the market.
+    pub refused_expired: usize,
+    /// Rows refused for naming no underlying.
+    pub refused_no_underlying: usize,
+    /// Expiries skipped for carrying too few legs to be a real chain.
+    ///
+    /// Non-zero means the nearest date in the master was a stub and the real
+    /// chain sits behind it — worth seeing, because the alternative behaviour
+    /// (taking the stub) silently discards a 400-leg chain.
+    pub expiries_skipped_as_stubs: usize,
     /// Rows refused for carrying no usable strike (options only).
     pub refused_no_strike: usize,
     /// Rows refused because their exchange maps to no segment we subscribe.
@@ -202,14 +362,23 @@ pub fn select_contract_universe(
         // An expiry of 0 is the parser's "absent or unusable" answer. A
         // contract with no expiry cannot be placed on a ladder, and guessing
         // one would let a garbled row win the nearest-expiry slot.
-        if row.expiry_ymd == 0 || row.expiry_ymd < today_ymd {
-            if row.expiry_ymd == 0 {
-                out.refused_no_expiry += 1;
-            }
+        if row.expiry_ymd == 0 {
+            out.refused_no_expiry += 1;
             continue;
         }
+        // Counted, not merely skipped. A stale artifact — yesterday's file
+        // read after IST midnight — is ALL expired rows, and without this
+        // counter it would select nothing while reporting zero refusals,
+        // which reads identically to a market with no derivatives.
+        if row.expiry_ymd < today_ymd {
+            out.refused_expired += 1;
+            continue;
+        }
+        // Its own counter, not the expiry one. A row with a good expiry and no
+        // underlying is a different defect, and filing it under
+        // `refused_no_expiry` sends triage at the wrong column.
         if row.underlying_symbol.is_empty() {
-            out.refused_no_expiry += 1;
+            out.refused_no_underlying += 1;
             continue;
         }
         let c = Contract {
@@ -276,7 +445,9 @@ pub fn select_contract_universe(
         let Some(bucket) = index_opt.get(underlying) else {
             continue;
         };
-        let Some(expiry) = nearest_expiry(&bucket.options) else {
+        let (expiry, skipped) = nearest_expiry(&bucket.options);
+        out.expiries_skipped_as_stubs += skipped;
+        let Some(expiry) = expiry else {
             continue;
         };
         for c in bucket.options.iter().filter(|c| c.expiry_ymd == expiry) {
@@ -377,12 +548,49 @@ fn push_contract(
     }
 }
 
-/// The nearest expiry at or after today within a bucket, or `None` if empty.
+/// Legs an expiry must carry before it is treated as a real chain.
 ///
-/// Every contract in the bucket is already filtered to `>= today` by the
-/// bucketing pass, so this is a plain minimum.
-fn nearest_expiry(contracts: &[Contract<'_>]) -> Option<u32> {
-    contracts.iter().map(|c| c.expiry_ymd).min()
+/// Two strikes, both legs. Below this it is not an option chain — it is one
+/// stray row, and treating it as the current expiry discards the real one.
+///
+/// Deliberately small. A genuinely thin weekly on an illiquid stock is real
+/// and must survive; the case this rejects is the single-row artefact, not the
+/// quiet market.
+const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
+
+/// The nearest expiry at or after today that carries a real chain.
+///
+/// # Why this is not a plain `min()`
+///
+/// It was, and that was a silent chain-collapse waiting to happen. Every
+/// contract here is already `>= today`, so `min()` looks obviously correct —
+/// but it hands the whole selection to whichever row has the earliest date,
+/// however few legs sit behind it. One master row carrying a stray-but-valid
+/// earlier expiry (a typo'd date, a vendor artefact, a delisted stub) would
+/// take the "current expiry" slot from a 400-leg chain, and the result would
+/// report `index_options = 1` with every refusal counter at zero — a chain
+/// that vanished with nothing saying so.
+///
+/// So expiries are tried in ascending order and the first one carrying at
+/// least [`MIN_LEGS_FOR_A_REAL_EXPIRY`] wins. Skipped expiries are returned so
+/// the caller can count them rather than discard the fact.
+///
+/// Returns `None` when no expiry qualifies. `usize` is the number skipped.
+fn nearest_expiry(contracts: &[Contract<'_>]) -> (Option<u32>, usize) {
+    let mut legs: HashMap<u32, usize> = HashMap::new();
+    for c in contracts {
+        *legs.entry(c.expiry_ymd).or_insert(0) += 1;
+    }
+    let mut expiries: Vec<u32> = legs.keys().copied().collect();
+    expiries.sort_unstable();
+    let mut skipped = 0usize;
+    for e in expiries {
+        if legs.get(&e).copied().unwrap_or(0) >= MIN_LEGS_FOR_A_REAL_EXPIRY {
+            return (Some(e), skipped);
+        }
+        skipped += 1;
+    }
+    (None, skipped)
 }
 
 /// One underlying's current-expiry option ladder, positioned at ATM.
@@ -441,7 +649,9 @@ fn build_ladders<'a>(
             out.underlyings_without_spot += 1;
             continue;
         }
-        let Some(expiry) = nearest_expiry(&bucket.options) else {
+        let (expiry, skipped) = nearest_expiry(&bucket.options);
+        out.expiries_skipped_as_stubs += skipped;
+        let Some(expiry) = expiry else {
             continue;
         };
         let contracts: Vec<Contract<'a>> = bucket
@@ -507,6 +717,276 @@ fn fit_atm_window(ladders: &[Ladder<'_>], remaining: usize) -> Option<usize> {
     (0..=STOCK_OPTION_ATM_STRIKES_EACH_SIDE)
         .rev()
         .find(|&w| total(w) <= remaining)
+}
+
+// ---------------------------------------------------------------------------
+// Live wiring: spot prices, the symbol map, and the composed load
+// ---------------------------------------------------------------------------
+
+/// Seconds a QuestDB `/exec` read may take before it is abandoned.
+///
+/// Matches the depth loader's budget. The attach retries, so a slow read costs
+/// one attempt rather than the session.
+const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
+
+/// The `/exec` query returning today's latest traded price per instrument.
+///
+/// `LATEST ON ts PARTITION BY security_id, segment` collapses the day's ticks
+/// to one row per instrument — the I-P1-11 composite, never the id alone, or
+/// two instruments sharing a numeric id across segments would collapse into
+/// one and one of them would get the other's price.
+///
+/// The `ts >= today` bound is what stops a stale price reaching ATM selection.
+/// Without it `LATEST ON` returns the newest row from ANY day, so a pre-open
+/// caller would locate at-the-money against yesterday's close — plausible,
+/// wrong, and completely silent.
+#[must_use]
+pub fn build_spot_price_query(today_ist_nanos: i64) -> String {
+    let today_micros = today_ist_nanos / 1_000;
+    format!(
+        "SELECT security_id, segment, ltp FROM ticks \
+         WHERE feed = 'dhan' AND ts >= {today_micros} AND ltp > 0 \
+         LATEST ON ts PARTITION BY security_id, segment;"
+    )
+}
+
+/// Extracts `symbol -> (security_id, segment_code)` from a mapping artifact.
+///
+/// A separate parser from `dhan_live_universe::parse_mapping_artifact`
+/// deliberately: that one returns ids only, because the live universe does not
+/// care what anything is called. Contract selection groups by underlying
+/// SYMBOL, so it needs the name the id belongs to.
+///
+/// # Errors
+///
+/// Malformed JSON, or no `mappings` array. A row missing any of the three
+/// fields is skipped rather than failing the parse — one bad row must not cost
+/// the other seven hundred.
+pub fn parse_symbol_map(body: &str) -> Result<HashMap<String, (u64, u8)>, String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Err("mapping artifact is not valid JSON".to_owned());
+    };
+    let Some(rows) = v.get("mappings").and_then(|m| m.as_array()) else {
+        return Err("mapping artifact has no `mappings` array".to_owned());
+    };
+    let mut out = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let (Some(symbol), Some(id), Some(seg)) = (
+            row.get("symbol").and_then(serde_json::Value::as_str),
+            row.get("security_id").and_then(serde_json::Value::as_u64),
+            row.get("exchange_segment")
+                .and_then(serde_json::Value::as_u64),
+        ) else {
+            continue;
+        };
+        let Ok(seg) = u8::try_from(seg) else { continue };
+        // A stock appears once per index it belongs to, so the same symbol
+        // arrives many times with the same id. Insert is idempotent.
+        out.insert(symbol.trim().to_uppercase(), (id, seg));
+    }
+    Ok(out)
+}
+
+/// Converts a QuestDB `/exec` dataset of `[security_id, segment, ltp]` into a
+/// price map keyed on the I-P1-11 composite, in paise.
+///
+/// # Errors
+///
+/// Malformed JSON or a missing `dataset` array.
+pub fn parse_spot_prices(body: &str) -> Result<HashMap<(u64, u8), i64>, String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Err("spot price response is not valid JSON".to_owned());
+    };
+    let Some(rows) = v.get("dataset").and_then(|d| d.as_array()) else {
+        return Err("spot price response has no `dataset` array".to_owned());
+    };
+    let mut out = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let Some(cols) = row.as_array() else { continue };
+        if cols.len() < 3 {
+            continue;
+        }
+        // Accepts the number AND the quoted-number form. QuestDB returns LONG
+        // as a JSON number today, but a serialiser that quotes large integers
+        // is a common and silent change, and here it would empty the price map
+        // rather than error — the same failure shape as the segment bug below.
+        let id = match &cols[0] {
+            serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+            other => other.as_u64(),
+        };
+        let Some(id) = id else { continue };
+        // The segment column is a SYMBOL holding the segment NAME — `NSE_EQ`,
+        // `IDX_I`, `NSE_FNO` — because `TickRow::from_parsed_tick` writes it
+        // through `segment_code_to_str`.
+        //
+        // This read used to `parse::<u8>()` the column, on the assumption that
+        // it held the numeric code as text. It does not, so EVERY row was
+        // skipped and the price map came back empty — every stock underlying
+        // then landed in `underlyings_without_spot`, `ladders` was empty, and
+        // `fit_atm_window` took its empty-ladders early return and reported a
+        // window of 25. The result claimed the operator had received ATM ± 25
+        // while ~22,000 authorized contracts were never subscribed. The
+        // original unit test passed because its fixture encoded the same wrong
+        // assumption; `spot_prices_parse_the_real_wire_format` now pins the
+        // format production actually writes.
+        let seg = match &cols[1] {
+            serde_json::Value::String(s) => {
+                tickvault_common::segment::segment_str_to_code(s.trim())
+            }
+            other => other.as_u64().and_then(|n| u8::try_from(n).ok()),
+        };
+        let Some(seg) = seg else { continue };
+        let Some(ltp) = cols[2].as_f64() else {
+            continue;
+        };
+        // Non-finite or non-positive is refused, not stored: a price of zero
+        // would place at-the-money at the bottom of every ladder.
+        if !ltp.is_finite() || ltp <= 0.0 {
+            continue;
+        }
+        let paise = (ltp * 100.0).round();
+        if paise > 9_007_199_254_740_991.0 {
+            continue;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: bounded above by the line before and below by the `<= 0.0`
+        // guard — a whole number well inside i64.
+        let paise = paise as i64;
+        out.insert((id, seg), paise);
+    }
+    Ok(out)
+}
+
+/// Joins the symbol map and the price map into the `symbol -> paise` form
+/// selection consumes.
+///
+/// Only spot segments are consulted. A derivative's own price is not the
+/// underlying's, and pricing at-the-money off a contract would put the window
+/// around the option's premium rather than the stock.
+#[must_use]
+pub fn spot_paise_by_symbol(
+    symbols: &HashMap<String, (u64, u8)>,
+    prices: &HashMap<(u64, u8), i64>,
+) -> HashMap<String, i64> {
+    let mut out = HashMap::with_capacity(symbols.len());
+    for (symbol, (id, seg)) in symbols {
+        if let Some(&paise) = prices.get(&(*id, *seg)) {
+            out.insert(symbol.clone(), paise);
+        }
+    }
+    out
+}
+
+/// Loads today's contract universe: artifact from disk, prices from QuestDB.
+///
+/// Returns an EMPTY selection on any failure, having said which one. An empty
+/// selection is safe — the lane keeps its spot universe — but it is never
+/// silent, because "the market has no derivatives today" and "we could not
+/// read the file" look identical in an instrument count.
+pub async fn load_contract_universe(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    date_ist: &str,
+    today_ymd: u32,
+    today_ist_nanos: i64,
+    capacity: usize,
+) -> ContractSelection {
+    let contracts = match read_contract_artifact(date_ist) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                %err,
+                date_ist,
+                path = %contract_artifact_path(date_ist).display(),
+                "contract universe: today's contract artifact is unreadable — the lane will \
+                 carry its spot universe only. No futures, no option contracts."
+            );
+            return ContractSelection::default();
+        }
+    };
+    let mapping_path = crate::dhan_universe::mapping_artifact_path(date_ist);
+    let symbols = match std::fs::read_to_string(&mapping_path)
+        .map_err(|e| e.to_string())
+        .and_then(|b| parse_symbol_map(&b))
+    {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                err,
+                path = %mapping_path.display(),
+                "contract universe: the symbol map is unreadable, so at-the-money cannot be \
+                 located for any stock. Futures and index chains are unaffected."
+            );
+            HashMap::new()
+        }
+    };
+
+    let prices = fetch_spot_prices(questdb, today_ist_nanos).await;
+    let spot = spot_paise_by_symbol(&symbols, &prices);
+
+    let rows: Vec<MasterRow> = contracts.iter().map(ContractRow::to_master_row).collect();
+    let selection = select_contract_universe(&rows, &spot, today_ymd, capacity);
+
+    tracing::info!(
+        contracts_in_artifact = contracts.len(),
+        priced_underlyings = spot.len(),
+        selected = selection.instruments.len(),
+        index_futures = selection.index_futures,
+        stock_futures = selection.stock_futures,
+        index_options = selection.index_options,
+        stock_options = selection.stock_options,
+        atm_window = selection.atm_window_used,
+        without_spot = selection.underlyings_without_spot,
+        dropped_for_capacity = selection.dropped_for_capacity,
+        "contract universe resolved"
+    );
+    selection
+}
+
+/// Reads today's latest price per instrument. Empty on any failure, said once.
+async fn fetch_spot_prices(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    today_ist_nanos: i64,
+) -> HashMap<(u64, u8), i64> {
+    let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()
+    else {
+        tracing::error!("contract universe: HTTP client build failed — no stock options");
+        return HashMap::new();
+    };
+    let sql = build_spot_price_query(today_ist_nanos);
+    let body = match client
+        .get(&url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::error!(?err, "contract universe: spot price response unreadable");
+                return HashMap::new();
+            }
+        },
+        Ok(resp) => {
+            tracing::error!(status = %resp.status(), "contract universe: spot price query non-2xx");
+            return HashMap::new();
+        }
+        Err(err) => {
+            tracing::error!(?err, "contract universe: spot price query failed");
+            return HashMap::new();
+        }
+    };
+    match parse_spot_prices(&body) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::error!(err, "contract universe: spot price response unparseable");
+            HashMap::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1065,6 +1545,312 @@ mod tests {
             }),
             "sorted, so a day-over-day diff of subscribe batches is meaningful"
         );
+    }
+
+    // ---- artifact + live wiring ----
+
+    #[test]
+    fn the_artifact_round_trips_to_the_same_selection_as_a_parsed_master() {
+        // The property that makes every test above meaningful in production:
+        // the artifact path and the parsed-master path must select the SAME
+        // instruments. If they diverge, the tests exercise one thing and the
+        // lane runs another.
+        let mut master = stock_ladder("RELIANCE");
+        master.push(contract(
+            9_001,
+            InstrumentClass::IndexFuture,
+            "NSE",
+            "NIFTY",
+            2026_08_28,
+            0,
+            OptionLeg::None,
+        ));
+        // Equities and indices must not survive into the artifact.
+        master.push(contract(
+            9_002,
+            InstrumentClass::Equity,
+            "NSE",
+            "",
+            0,
+            0,
+            OptionLeg::None,
+        ));
+
+        let rows = contract_rows_from_master(&master);
+        assert_eq!(
+            rows.len(),
+            master.len() - 1,
+            "the equity row is dropped; contracts are not"
+        );
+
+        let rebuilt: Vec<MasterRow> = rows.iter().map(ContractRow::to_master_row).collect();
+        let prices = spot("RELIANCE", 1000);
+        assert_eq!(
+            select_contract_universe(&master, &prices, TODAY, 25_000),
+            select_contract_universe(&rebuilt, &prices, TODAY, 25_000),
+        );
+    }
+
+    #[test]
+    fn a_contract_row_survives_serialisation() {
+        let rows = contract_rows_from_master(&[contract(
+            5,
+            InstrumentClass::StockOption,
+            "NSE",
+            "RELIANCE",
+            2026_08_28,
+            1_234,
+            OptionLeg::Put,
+        )]);
+        let json = serde_json::to_string(&rows).expect("serialises");
+        let back: Vec<ContractRow> = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(rows, back);
+        let m = back[0].to_master_row();
+        assert_eq!(m.class, InstrumentClass::StockOption);
+        assert_eq!(m.option_leg, OptionLeg::Put);
+        assert_eq!(m.strike_paise, 123_400);
+        assert_eq!(m.underlying_symbol, "RELIANCE");
+    }
+
+    #[test]
+    fn the_spot_query_bounds_to_today_and_keys_on_the_composite() {
+        let sql = build_spot_price_query(1_700_000_000_000_000_000);
+        assert!(sql.contains("LATEST ON ts PARTITION BY security_id, segment"));
+        assert!(
+            sql.contains("ts >= 1700000000000000"),
+            "micros, and bounded to today: an unbounded LATEST ON returns \
+             yesterday's close and prices at-the-money against it silently"
+        );
+        assert!(sql.contains("ltp > 0"));
+        assert!(sql.contains("feed = 'dhan'"));
+    }
+
+    /// The format production actually writes — segment NAMES, not codes.
+    ///
+    /// This test exists because its predecessor used `"1"` and `"0"` as the
+    /// segment column and passed while the code could not parse a single real
+    /// row. `TickRow::from_parsed_tick` writes the column through
+    /// `segment_code_to_str`, so the wire values are `NSE_EQ` and `IDX_I`.
+    /// A fixture that encodes the implementation's assumption instead of the
+    /// producer's output is not a test, and this one is written from the
+    /// producer.
+    #[test]
+    fn spot_prices_parse_the_real_wire_format() {
+        let body = r#"{"dataset":[
+            ["2885","NSE_EQ",1234.55],
+            [26000,"IDX_I",24500.0],
+            [1,"NSE_FNO",42.0]
+        ]}"#;
+        let p = parse_spot_prices(body).expect("parses");
+        assert_eq!(
+            p.get(&(2885, 1)),
+            Some(&123_455),
+            "NSE_EQ must resolve to code 1 — a parse::<u8>() here silently \
+             skipped EVERY row and produced zero stock options while the \
+             report still said the ATM window was 25"
+        );
+        assert_eq!(p.get(&(26_000, 0)), Some(&2_450_000), "IDX_I is code 0");
+        assert_eq!(p.get(&(1, 2)), Some(&4_200), "NSE_FNO is code 2");
+    }
+
+    #[test]
+    fn spot_prices_parse_to_paise_and_refuse_the_unusable() {
+        let body = r#"{"dataset":[
+            [2885,"NSE_EQ",1234.55],
+            [26000,"IDX_I",24500.0],
+            [1,"NSE_EQ",0.0],
+            [2,"NSE_EQ",-5.0],
+            [3,"NSE_EQ",null],
+            [4,"NOT_A_SEGMENT",100.0],
+            [5,"NSE_EQ"]
+        ]}"#;
+        let p = parse_spot_prices(body).expect("parses");
+        assert_eq!(p.get(&(2885, 1)), Some(&123_455));
+        assert_eq!(p.get(&(26_000, 0)), Some(&2_450_000));
+        assert_eq!(p.len(), 2, "zero, negative, null, bad segment, short row");
+    }
+
+    #[test]
+    fn a_stray_early_expiry_cannot_steal_the_chain() {
+        // One row with a valid but earlier date used to take the whole
+        // current-expiry slot from a real chain, reporting index_options = 1
+        // with every refusal counter at zero.
+        let mut rows = vec![contract(
+            999,
+            InstrumentClass::IndexOption,
+            "NSE",
+            "NIFTY",
+            2026_08_20,
+            24_000,
+            OptionLeg::Call,
+        )];
+        for (i, strike) in [24_000, 24_100, 24_200, 24_300].into_iter().enumerate() {
+            let base = 100 + (i as u64) * 2;
+            rows.push(contract(
+                base,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
+                2026_08_26,
+                strike,
+                OptionLeg::Call,
+            ));
+            rows.push(contract(
+                base + 1,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
+                2026_08_26,
+                strike,
+                OptionLeg::Put,
+            ));
+        }
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.index_options, 8, "the real chain, not the stub");
+        assert_eq!(sel.expiries_skipped_as_stubs, 1, "and the stub is COUNTED");
+        assert!(!sel.instruments.iter().any(|i| i.security_id == 999));
+    }
+
+    #[test]
+    fn a_genuinely_thin_expiry_still_counts_as_a_chain() {
+        // The guard must reject a one-row artefact WITHOUT rejecting a real
+        // but quiet expiry. Four legs is a chain.
+        let mut rows = Vec::new();
+        for (i, strike) in [100, 110].into_iter().enumerate() {
+            let base = 10 + (i as u64) * 2;
+            rows.push(contract(
+                base,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
+                2026_08_26,
+                strike,
+                OptionLeg::Call,
+            ));
+            rows.push(contract(
+                base + 1,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
+                2026_08_26,
+                strike,
+                OptionLeg::Put,
+            ));
+        }
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.index_options, 4);
+        assert_eq!(sel.expiries_skipped_as_stubs, 0);
+    }
+
+    #[test]
+    fn a_stale_artifact_reports_expired_rows_rather_than_an_empty_market() {
+        // Yesterday's artifact read after IST midnight is ALL expired. Without
+        // its own counter that returns an empty selection with zero refusals,
+        // which reads exactly like a market with no derivatives.
+        let rows = vec![
+            contract(
+                1,
+                InstrumentClass::IndexFuture,
+                "NSE",
+                "NIFTY",
+                2026_08_18,
+                0,
+                OptionLeg::None,
+            ),
+            contract(
+                2,
+                InstrumentClass::StockFuture,
+                "NSE",
+                "RELIANCE",
+                2026_08_01,
+                0,
+                OptionLeg::None,
+            ),
+        ];
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert!(sel.instruments.is_empty());
+        assert_eq!(sel.refused_expired, 2);
+        assert_eq!(sel.refused_no_expiry, 0, "expired is not missing");
+    }
+
+    #[test]
+    fn a_missing_underlying_is_filed_under_its_own_counter() {
+        let rows = vec![contract(
+            1,
+            InstrumentClass::IndexFuture,
+            "NSE",
+            "",
+            2026_08_28,
+            0,
+            OptionLeg::None,
+        )];
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.refused_no_underlying, 1);
+        assert_eq!(
+            sel.refused_no_expiry, 0,
+            "a good expiry with no underlying is not an expiry defect — \
+             filing it there sends triage at the wrong column"
+        );
+    }
+
+    #[test]
+    fn a_malformed_price_response_is_an_error_not_an_empty_market() {
+        assert!(parse_spot_prices("not json").is_err());
+        assert!(parse_spot_prices(r#"{"columns":[]}"#).is_err());
+    }
+
+    #[test]
+    fn the_symbol_map_reads_names_and_survives_a_bad_row() {
+        let body = r#"{"mappings":[
+            {"index_name":"NIFTY 50","symbol":"reliance","isin":"X","security_id":2885,"exchange_segment":1},
+            {"index_name":"NIFTY 100","symbol":"RELIANCE","isin":"X","security_id":2885,"exchange_segment":1},
+            {"index_name":"NIFTY 50","symbol":"TCS","security_id":11536},
+            {"index_name":"NIFTY 50","symbol":"INFY","isin":"Y","security_id":1594,"exchange_segment":1}
+        ]}"#;
+        let m = parse_symbol_map(body).expect("parses");
+        assert_eq!(m.get("RELIANCE"), Some(&(2885u64, 1u8)), "uppercased");
+        assert_eq!(m.get("INFY"), Some(&(1594u64, 1u8)));
+        assert_eq!(m.len(), 2, "the row missing exchange_segment is skipped");
+    }
+
+    #[test]
+    fn a_malformed_symbol_map_is_an_error_not_an_empty_universe() {
+        assert!(parse_symbol_map("not json").is_err());
+        assert!(parse_symbol_map(r#"{"resolved":7}"#).is_err());
+    }
+
+    #[test]
+    fn the_join_prices_only_symbols_that_actually_ticked() {
+        let mut symbols = HashMap::new();
+        symbols.insert("RELIANCE".to_string(), (2885u64, 1u8));
+        symbols.insert("TCS".to_string(), (11_536u64, 1u8));
+        let mut prices = HashMap::new();
+        prices.insert((2885u64, 1u8), 123_455i64);
+        // TCS has a symbol but no tick today — it must be absent, not zero.
+        let joined = spot_paise_by_symbol(&symbols, &prices);
+        assert_eq!(joined.get("RELIANCE"), Some(&123_455));
+        assert!(
+            !joined.contains_key("TCS"),
+            "a symbol with no tick is unpriced, and unpriced means refused"
+        );
+    }
+
+    #[test]
+    fn the_join_will_not_price_a_stock_off_its_own_derivative() {
+        // Same numeric id, different segment: the NSE_FNO row is a contract,
+        // not the underlying, and its premium must never become the spot.
+        let mut symbols = HashMap::new();
+        symbols.insert("RELIANCE".to_string(), (2885u64, 1u8));
+        let mut prices = HashMap::new();
+        prices.insert((2885u64, 2u8), 4_200i64);
+        assert!(spot_paise_by_symbol(&symbols, &prices).is_empty());
+    }
+
+    #[test]
+    fn the_artifact_path_is_dated_so_a_stale_day_is_never_read() {
+        let p = contract_artifact_path("2026-08-19");
+        assert!(p.to_string_lossy().contains("2026-08-19"));
+        assert_ne!(p, contract_artifact_path("2026-08-18"));
     }
 
     #[test]
