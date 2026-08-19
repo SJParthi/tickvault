@@ -58,6 +58,10 @@ pub struct TickGapTracker {
     total_warnings: u64,
     /// Total gap errors emitted (for metrics/alerting).
     total_errors: u64,
+    /// New instruments REFUSED because `states` is at capacity (2026-08-19).
+    /// Non-zero means gap detection is blind for at least that many
+    /// instruments — never silent, always counted.
+    refused_instruments: u64,
     /// Total stale LTP alerts emitted (for metrics/alerting).
     total_stale_alerts: u64,
     /// Aggregated warning gaps since last summary log (security_id, gap_secs).
@@ -75,11 +79,27 @@ impl TickGapTracker {
     ///
     /// # Arguments
     /// * `capacity` — Expected number of unique securities (avoids rehashing).
+    /// Hard ceiling on tracked instruments (2026-08-19).
+    ///
+    /// Matches `day_ohlc_tracker::MAX_TRACKED_INSTRUMENTS` deliberately: both
+    /// are per-instrument maps on the same universe, so a single figure means
+    /// one number to reason about rather than two that can drift apart. 25,000
+    /// is the authorized main-feed subscription capacity.
+    pub const MAX_TRACKED_INSTRUMENTS: usize = 25_000;
+
+    /// New instruments refused because the tracker is at capacity. Non-zero
+    /// means gap detection is blind for that many instruments.
+    #[must_use]
+    pub fn refused_instruments(&self) -> u64 {
+        self.refused_instruments
+    }
+
     pub fn new(capacity: usize) -> Self {
         Self {
             states: HashMap::with_capacity(capacity),
             total_warnings: 0,
             total_errors: 0,
+            refused_instruments: 0,
             total_stale_alerts: 0,
             pending_warn_gaps: Vec::with_capacity(64),
             last_summary_log: Instant::now(),
@@ -156,6 +176,46 @@ impl TickGapTracker {
         }
 
         let now = Instant::now();
+        // BOUND (2026-08-19, found by the O(1) audit). `states` grew per
+        // unseen security_id with no cap and no eviction — the `with_capacity`
+        // at construction is a pre-size, not a bound. Left alone it grows for
+        // the process lifetime, which is the class this file's own header
+        // never claimed to handle.
+        //
+        // FAIL-CLOSED on a NEW instrument, never evicting a tracked one — the
+        // `day_ohlc_tracker::MAX_TRACKED_INSTRUMENTS` precedent, and the right
+        // shape here for a specific reason: eviction would silently reset a
+        // tracked instrument's gap state, so the next tick after eviction
+        // would look like a first tick and its gap would go unreported. A
+        // detector that quietly forgets what it was watching is worse than one
+        // that refuses to watch more and says so.
+        //
+        // Refusing to TRACK a new instrument only costs gap detection for that
+        // instrument; refusing loudly means the operator learns the universe
+        // outgrew the bound rather than discovering silent blind spots.
+        if self.states.len() >= Self::MAX_TRACKED_INSTRUMENTS
+            && !self.states.contains_key(&security_id)
+        {
+            self.refused_instruments = self.refused_instruments.saturating_add(1);
+            metrics::counter!("tv_tick_gap_tracker_refused_total").increment(1);
+            // Power-of-two throttle: at the cap this fires per tick for every
+            // untracked instrument, and an unthrottled line would bury the
+            // signal it is raising.
+            if self.refused_instruments.is_power_of_two() {
+                tracing::error!(
+                    code = "RISK-GAP-02",
+                    security_id,
+                    tracked = self.states.len(),
+                    cap = Self::MAX_TRACKED_INSTRUMENTS,
+                    refused_total = self.refused_instruments,
+                    "tick-gap tracker at capacity — REFUSING to track a new \
+                     instrument. Gap detection is now blind for it; the \
+                     tracked set is unaffected. Raise the cap or shrink the \
+                     universe."
+                );
+            }
+            return TickGapResult::Ok;
+        }
         let state = self.states.entry(security_id).or_insert(SecurityFeedState {
             last_exchange_timestamp: exchange_timestamp,
             tick_count: 0,
@@ -1792,5 +1852,64 @@ mod tests {
         const _: () = assert!(BACKLOG_TICK_AGE_THRESHOLD_SECS <= 300);
         const _: () = assert!(BACKLOG_TICK_AGE_MAX_SECS > BACKLOG_TICK_AGE_THRESHOLD_SECS);
         const _: () = assert!(BACKLOG_TICK_AGE_MAX_SECS <= 7 * 24 * 3600);
+    }
+    #[test]
+    fn refused_instruments_counts_at_capacity_and_tracked_ones_are_never_evicted() {
+        // The map had no cap and no eviction. This drives it past the bound and
+        // asserts BOTH halves of fail-closed: new instruments are refused AND
+        // already-tracked ones keep their state.
+        //
+        // The second half is the one that matters. Eviction would silently
+        // reset a tracked instrument's gap state, so its next tick would look
+        // like a first tick and its gap would go unreported — a detector that
+        // quietly forgets what it was watching.
+        let mut t = TickGapTracker::new(4);
+        let base: u32 = 34_200; // 09:30 in seconds-of-day, the wire form
+        // Fill exactly to the cap using a small stand-in bound so the test is
+        // fast; the production cap is asserted separately below.
+        let cap = TickGapTracker::MAX_TRACKED_INSTRUMENTS;
+        for sid in 0..8_u64 {
+            let _ = t.record_tick(sid, base);
+        }
+        let tracked_before = t.states.len();
+        assert_eq!(tracked_before, 8, "all 8 fit well under the cap");
+        assert_eq!(t.refused_instruments(), 0, "nothing refused under the cap");
+        assert!(cap >= 25_000, "cap must stay at the authorized capacity");
+
+        // Now force the at-capacity path directly rather than inserting 25,000
+        // entries: fill the map to the cap with cheap synthetic state.
+        while t.states.len() < cap {
+            let next = t.states.len() as u64 + 1_000_000;
+            t.states.insert(
+                next,
+                SecurityFeedState {
+                    last_exchange_timestamp: base,
+                    tick_count: 1,
+                    last_wall_clock: Instant::now(),
+                    stale_alerted: false,
+                    error_gap_alerted: false,
+                },
+            );
+        }
+        let at_cap = t.states.len();
+        // A brand-new instrument must be REFUSED.
+        let _ = t.record_tick(9_999_999, base);
+        assert_eq!(t.states.len(), at_cap, "must not grow past the cap");
+        assert_eq!(t.refused_instruments(), 1, "the refusal must be counted");
+
+        // An ALREADY-TRACKED instrument must still work — the cap refuses new
+        // instruments, it does not stop tracking the ones already known.
+        let before = t.states.get(&0).map(|s| s.tick_count).unwrap_or(0);
+        let _ = t.record_tick(0, base + 1);
+        let after = t.states.get(&0).map(|s| s.tick_count).unwrap_or(0);
+        assert!(
+            after > before,
+            "a tracked instrument must keep being tracked"
+        );
+        assert_eq!(
+            t.refused_instruments(),
+            1,
+            "a tracked tick is not a refusal"
+        );
     }
 }
