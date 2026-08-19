@@ -182,6 +182,13 @@ pub mod dhan_order_push_observability;
 /// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
 pub mod dhan_rest_stack;
 pub mod dhan_universe;
+/// Pressure-triggered partition archival (feed-hardening Item 5, 2026-08-19).
+/// The disk-health watcher MEASURES a filling volume; this is the arm that
+/// acts on it, mid-session, because the daily age-triggered archive cannot
+/// fire in time at scale. Adds a TRIGGER, never a delete path — it calls the
+/// unchanged verified archive→drop and REFUSES to delete anything further
+/// when nothing reclaimable remains (STORAGE-GAP-05). DEFAULT-OFF via serde.
+pub mod disk_pressure_boot;
 /// Groww order/position PUSH channel — Stage D app consumer (2026-07-17,
 /// operator-authorized paper-mode receive-only build): bridges trading-side
 /// `BrokerOrderEvent`s from the supervised push runner into `order_audit`

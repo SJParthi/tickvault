@@ -58,6 +58,7 @@
 //! site to handle a failure that the design already absorbs.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tracing::warn;
 
@@ -95,8 +96,22 @@ pub enum SubmitOutcome {
 /// ahead of it. NO concurrent `submit()` calls.
 pub struct SealAbsorptionPipeline {
     ring: SealRing,
-    spill: SealSpillWriter,
-    dlq: SealDlqWriter,
+    /// `Arc` since 2026-08-19 so the SAME writer instance can be shared with
+    /// the producer-side overflow escalator (`seal_writer_runner`).
+    ///
+    /// Sharing the INSTANCE, not just the directory, is the point.
+    /// `SealSpillWriter` caches an open append handle behind its own
+    /// `Mutex`; two independent writers pointed at one day-file would each
+    /// hold their own handle and interleave `write` calls with no shared
+    /// lock, which is how a spilled seal becomes a half-written NDJSON line.
+    /// One instance means one mutex serialises every append, from either
+    /// side.
+    spill: Arc<SealSpillWriter>,
+    /// Same reasoning as `spill`. The DLQ writer is stateless today, so this
+    /// is defensive rather than load-bearing — but it keeps the two tiers
+    /// symmetric so a future cached handle on the DLQ side cannot
+    /// reintroduce the split-writer hazard silently.
+    dlq: Arc<SealDlqWriter>,
 }
 
 impl SealAbsorptionPipeline {
@@ -106,8 +121,8 @@ impl SealAbsorptionPipeline {
     pub fn new() -> Self {
         Self {
             ring: SealRing::new(),
-            spill: SealSpillWriter::new(),
-            dlq: SealDlqWriter::new(),
+            spill: Arc::new(SealSpillWriter::new()),
+            dlq: Arc::new(SealDlqWriter::new()),
         }
     }
 
@@ -118,8 +133,8 @@ impl SealAbsorptionPipeline {
     pub fn with_dirs_for_test(spill_dir: PathBuf, dlq_dir: PathBuf) -> Self {
         Self {
             ring: SealRing::new(),
-            spill: SealSpillWriter::with_spill_dir_for_test(spill_dir),
-            dlq: SealDlqWriter::with_dlq_dir_for_test(dlq_dir),
+            spill: Arc::new(SealSpillWriter::with_spill_dir_for_test(spill_dir)),
+            dlq: Arc::new(SealDlqWriter::with_dlq_dir_for_test(dlq_dir)),
         }
     }
 
@@ -135,9 +150,24 @@ impl SealAbsorptionPipeline {
     ) -> Self {
         Self {
             ring: SealRing::with_capacity(ring_capacity),
-            spill: SealSpillWriter::with_spill_dir_for_test(spill_dir),
-            dlq: SealDlqWriter::with_dlq_dir_for_test(dlq_dir),
+            spill: Arc::new(SealSpillWriter::with_spill_dir_for_test(spill_dir)),
+            dlq: Arc::new(SealDlqWriter::with_dlq_dir_for_test(dlq_dir)),
         }
+    }
+
+    /// The tier-2 writer, shareable. Handed to the producer-side overflow
+    /// escalator so a seal refused by the writer channel lands in the SAME
+    /// spill file this pipeline drains on boot — not a second one nobody
+    /// reads.
+    #[must_use]
+    pub fn spill_handle(&self) -> Arc<SealSpillWriter> {
+        Arc::clone(&self.spill)
+    }
+
+    /// The tier-3 writer, shareable. Same reasoning as [`Self::spill_handle`].
+    #[must_use]
+    pub fn dlq_handle(&self) -> Arc<SealDlqWriter> {
+        Arc::clone(&self.dlq)
     }
 
     /// Producer entry point. Infallible by design — every absorption
@@ -712,5 +742,33 @@ mod tests {
         assert_eq!(p.ring_len(), 1);
         let _ = std::fs::remove_file(&spill_as_file);
         let _ = std::fs::remove_file(&dlq_as_file);
+    }
+
+    #[test]
+    fn test_spill_handle_and_dlq_handle_share_the_pipelines_own_writers() {
+        // Sharing the INSTANCE is the contract, not the directory: two
+        // independent spill writers on one day-file each cache their own
+        // append handle behind their own mutex and interleave partial writes.
+        let dir = std::env::temp_dir().join(format!("tv-handle-share-{}", std::process::id()));
+        let spill_dir = dir.join("spill");
+        let dlq_dir = dir.join("dlq");
+        std::fs::create_dir_all(&spill_dir).expect("spill dir");
+        std::fs::create_dir_all(&dlq_dir).expect("dlq dir");
+
+        let pipeline =
+            SealAbsorptionPipeline::with_dirs_for_test(spill_dir.clone(), dlq_dir.clone());
+        let a = pipeline.spill_handle();
+        let b = pipeline.spill_handle();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "spill_handle must hand out the SAME writer, not a clone of its configuration"
+        );
+        let d1 = pipeline.dlq_handle();
+        let d2 = pipeline.dlq_handle();
+        assert!(
+            Arc::ptr_eq(&d1, &d2),
+            "dlq_handle must hand out the SAME writer for the same reason"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

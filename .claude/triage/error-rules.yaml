@@ -946,6 +946,27 @@ rules:
       next cycle will retry. Escalate so operator can verify
       AWS credentials + bucket reachability.
 
+  - name: storage-gap-05-disk-pressure-unrelievable-escalate
+    match:
+      code: STORAGE-GAP-05
+    action: escalate
+    runbook_path: docs/error-runbooks/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      Disk pressure could not be relieved: every partition older than the
+      2-day floor is already archived to S3 and dropped, or could not be
+      verified into S3 and was correctly kept. ESCALATE and nothing else —
+      there is deliberately no auto_fix, because the only remaining actions
+      are the two the automation refuses to take on its own: dropping a
+      partition that is still being written (a window in which an arriving
+      tick dies with it) or dropping one with no verified S3 copy. Both are
+      data-loss trades that belong to the operator. The real remedy is
+      outside this process entirely — grow the gp3 volume (online, one
+      command, never shrinkable) or reduce ingest scope. Cooldown 3600s
+      matches the emit's own once-per-episode edge latch, so a long
+      unrelieved episode pages once, not every poll.
+
   - name: telegram-01-dropped-escalate
     match:
       code: TELEGRAM-01

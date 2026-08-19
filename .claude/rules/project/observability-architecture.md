@@ -117,7 +117,7 @@ caller is still told the frame was durably captured, so the
 capture-at-receipt floor is gone and nothing upstream can tell. Same 3×300s
 shape and `ok_recovery = false` as its sibling — frames that arrived during
 the outage were never written, so a recovering disk does not restore
-them**)**, and **RISK-GAP-03 (added 2026-08-15** — the CONNECTED-BUT-SILENT
+them**)**, and **STORAGE-GAP-05 (added 2026-08-19** — the pressure-archival give-up page, feed-hardening Item 5. The Critical-severity coverage guard refused the new code without it, correctly: a filling volume that the automation has stopped acting on is precisely a silent failure. It pages beyond storage because a full volume blocks every QuestDB write, which backs up the ILP flush, the frame drain and finally the socket — and Dhan skips a slow consumer forward to "the latest available state", so a disk problem becomes upstream TICK LOSS. `ok_recovery = true`, unlike the ws-spill pair: nothing was lost by this code, so a genuine recovery is a real state worth telling**), and **RISK-GAP-03 (added 2026-08-15** — the CONNECTED-BUT-SILENT
 page, authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.3a. The 30s
 silence scan was wired on 2026-08-12 and its verdict left log-sink-only,
 which made the one detector for an otherwise-invisible failure itself

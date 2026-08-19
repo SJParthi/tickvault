@@ -262,6 +262,10 @@ pub enum ConnEvent {
     SubscribeFailed,
     /// One frame arrived.
     FrameReceived,
+    /// A control frame arrived proving the peer is alive, carrying no data
+    /// (a Ping/Pong). Resets the idle watchdog and NOTHING else — see
+    /// [`SocketEvent::KeepAlive`] for why the distinction is load-bearing.
+    KeepAliveReceived,
     /// The socket closed, optionally carrying a Dhan disconnect code.
     Disconnected { code: Option<DisconnectCode> },
     /// The watchdog fired: no traffic for the idle threshold.
@@ -502,6 +506,21 @@ impl ConnectionSupervisor {
                 if self.phase == ConnPhase::Subscribing {
                     self.phase = ConnPhase::Live;
                 }
+                SupervisorAction::Continue
+            }
+
+            // A ping proves the TRANSPORT is alive. It must reset the idle
+            // watchdog — and must do nothing else.
+            //
+            // It deliberately does NOT bump `frames` and does NOT set
+            // `proven_healthy`: those mean "this connection delivered market
+            // data", and a socket that only pings has delivered none. Letting
+            // a keep-alive claim health would hide a silently-failed subscribe
+            // behind a heartbeat. That condition has its own detector — the
+            // 30s silence scan (RISK-GAP-03), which is market-hours gated so
+            // the legitimately silent pre-open never pages.
+            ConnEvent::KeepAliveReceived => {
+                self.watchdog.record_activity(now);
                 SupervisorAction::Continue
             }
 
@@ -1359,6 +1378,28 @@ impl Default for PoolSupervisor {
 pub enum SocketEvent {
     /// One raw frame, exactly as it arrived. Never parsed here.
     Frame(Bytes),
+    /// A control frame proving the PEER IS ALIVE, carrying no market data —
+    /// a WebSocket Ping or Pong (and any text/raw control frame Dhan sends).
+    ///
+    /// This exists because omitting it cost ~300 self-inflicted reconnects
+    /// every trading morning (measured on prod, 2026-08-19: 8–25 per minute
+    /// from 08:31 to 08:59 IST, then ZERO once real ticks began at 09:15).
+    /// The pre-2026-08-19 read loop counted a Ping into a metric and then
+    /// LOOPED without returning anything, so the supervisor never learned the
+    /// socket was alive, the idle watchdog was never reset, and at
+    /// `IDLE_RECONNECT_TIMEOUT_SECS` we tore down a perfectly healthy
+    /// connection — re-authenticating and re-subscribing the whole universe
+    /// against a broker whose own docs warn that too many requests "may
+    /// result in user being blocked".
+    ///
+    /// Deliberately DISTINCT from [`SocketEvent::Frame`]: a ping proves
+    /// TRANSPORT liveness, never DATA liveness. It must reset the watchdog
+    /// and must NOT count as a data frame or mark the connection
+    /// proven-healthy — a socket that only ever pings has delivered nothing,
+    /// and that condition belongs to the silence scan (RISK-GAP-03), which
+    /// measures exactly it and is market-hours gated so the legitimately
+    /// silent pre-open never pages.
+    KeepAlive,
     /// The socket closed, optionally with a Dhan disconnect code.
     Closed { code: Option<DisconnectCode> },
 }
@@ -1539,6 +1580,12 @@ where
             biased;
             event = socket.recv() => {
                 match event {
+                    // A Ping/Pong: proof the peer is alive, carrying no data.
+                    // One watchdog reset, no sink write, no frame count.
+                    SocketEvent::KeepAlive => {
+                        action = supervisor
+                            .on_event(ConnEvent::KeepAliveReceived, Instant::now());
+                    }
                     SocketEvent::Frame(frame) => {
                         // Two operations. That is the whole loop body.
                         let outcome = sink.accept(frame);
@@ -1995,6 +2042,69 @@ mod tests {
             }
             other => panic!("expected RefreshTokenThenDial, got {other:?}"),
         }
+    }
+
+    /// The pre-open reconnect-storm regression.
+    ///
+    /// Measured on prod 2026-08-19: 8–25 reconnects PER MINUTE from 08:31 to
+    /// 08:59 IST, then exactly zero after the 09:15 open. The market is shut
+    /// pre-open, so no instrument ticks; Dhan pinged to hold the socket open;
+    /// the read loop counted the ping and looped without telling the
+    /// supervisor, so the watchdog expired on DATA silence and tore down a
+    /// healthy connection roughly 300 times a morning — each one a full
+    /// re-auth plus a re-subscribe of the whole universe.
+    ///
+    /// Pre-fix this test fails at the FIRST assertion: without the keep-alive
+    /// the poll at the timeout returns `SleepThenDial`.
+    #[test]
+    fn test_supervisor_keepalive_prevents_the_pre_open_reconnect_storm() {
+        use super::super::idle_watchdog::IDLE_RECONNECT_TIMEOUT_SECS;
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+
+        // Walk 10 minutes of pre-open silence, pinged every 20s the way Dhan
+        // holds a connection open. Not one of them may reconnect.
+        let mut at = now;
+        for _ in 0..30 {
+            at += Duration::from_secs(20);
+            assert_eq!(
+                s.on_event(ConnEvent::KeepAliveReceived, at),
+                SupervisorAction::Continue,
+                "a ping is proof of life, never a reason to redial"
+            );
+            assert_eq!(
+                s.poll(at + Duration::from_secs(IDLE_RECONNECT_TIMEOUT_SECS - 1)),
+                SupervisorAction::Continue,
+                "the watchdog must have been reset by the ping"
+            );
+        }
+        assert_eq!(
+            s.reconnects(),
+            0,
+            "ten minutes of pinged pre-open silence must cost ZERO reconnects \
+             (prod was paying ~300 a morning)"
+        );
+
+        // The other half of the contract: a ping proves the TRANSPORT is
+        // alive, never that DATA flows. It must not fake frames or health —
+        // a silently-failed subscribe belongs to the RISK-GAP-03 silence
+        // scan, and letting a heartbeat claim health would hide it.
+        assert_eq!(s.frames_received(), 0, "a ping is not a data frame");
+
+        // And the watchdog still bites when even the pings stop: that is a
+        // genuinely dead transport.
+        at += Duration::from_secs(20);
+        let _ = s.on_event(ConnEvent::KeepAliveReceived, at);
+        assert!(
+            matches!(
+                s.poll(at + Duration::from_secs(IDLE_RECONNECT_TIMEOUT_SECS)),
+                SupervisorAction::SleepThenDial { .. }
+            ),
+            "silence with NO pings at all is a dead socket and must still redial"
+        );
     }
 
     #[test]
