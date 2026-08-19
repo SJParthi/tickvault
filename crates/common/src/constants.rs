@@ -3271,7 +3271,33 @@ pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// weekend/holiday gap, matching the spill-file sweep. Before this
 /// retention existed, `archive/` grew ~0.15–0.6 GB/day unbounded on the
 /// prod 30 GB volume.
-pub const WS_WAL_ARCHIVE_RETENTION_SECS: u64 = 604_800;
+///
+/// # 2026-08-19: 7 days -> 3 days (the sizing premise above went stale by ~30x)
+///
+/// The weekend-triage rationale above is KEPT and is why this is 3 rather
+/// than 1: a Friday 17:30 IST crash must still be triageable on Monday
+/// morning, which is ~2.6 days. 3 covers it with margin; 7 covered until the
+/// FOLLOWING Friday, which nothing needs.
+///
+/// What changed is the cost, not the reasoning. The note above sizes the
+/// archive at "~0.15-0.6 GB/day ... on the prod 30 GB volume". Measured on
+/// the live box 2026-08-19, that is now wrong by more than an order of
+/// magnitude: `WalRingSink::accept` appends EVERY raw frame from EVERY
+/// socket before parse — including the depth-200 frames the drain discards
+/// unread — and `market_depth` alone logged 505,807,280 rows in one session.
+/// At the 25,000-instrument / 250-depth target the WAL runs ~19 GB/DAY, so
+/// 7 days is ~135 GB of steady-state disk: larger than every QuestDB table
+/// on the box COMBINED, on a 100 GB volume.
+///
+/// It is also the only retention class on the box with no S3 leg, no size
+/// ceiling, and no disk-pressure response — the archive sweep cannot touch
+/// it, so it is pure floor under everything else.
+///
+/// 3 days = ~57 GB at target, ~115 GB less than 7. FLAGGED, not fixed here:
+/// this is still an AGE bound with no BYTE bound, so an abnormal traffic day
+/// scales it linearly. A size ceiling that prunes oldest-first past N GB is
+/// the real fix and is a separate change to the prune logic.
+pub const WS_WAL_ARCHIVE_RETENTION_SECS: u64 = 259_200;
 
 /// Cadence of the WAL archive prune task (6 hours in seconds).
 pub const WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS: u64 = 6 * 3600;

@@ -3077,8 +3077,29 @@ const fn default_retention_days() -> u32 {
 /// — one month of spot history + weekend slack; was 14). Inert unless
 /// `archive_enabled`; safe-by-default because the archive→verify→drop flow
 /// is fail-closed (no verified S3 copy ⇒ no drop).
+/// Default MARKET-DATA hot window: **15 days** (2026-08-19, operator approval
+/// — "i believ its betetr to have 15 dyas ... trim minute history 35->15
+/// days"). Was 35 from the 2026-07-16 directive.
+///
+/// This is the operator scope call that `config/base.toml` had FLAGGED and
+/// deliberately left un-taken: the executor may not shorten a window an
+/// operator directive set. It is taken now, by the operator.
+///
+/// The class holds only minute-and-above candles since the 2026-08-19
+/// Intraday split, so this window no longer governs ticks or the sixteen
+/// sub-minute tables — it governs exactly the history the indicator and
+/// strategy paths warm up from, which is why 15 days is a judgement about
+/// warmup depth rather than about disk.
+///
+/// Measured basis (2026-08-18, live): all eight minute-and-above candle
+/// tables together run ~0.3 GB/day at the live ~4,565-SID universe, so
+/// 35 -> 15 frees ~6 GB today and ~33 GB at the 25,000-instrument target.
+///
+/// NOT a retention cut: every partition is exported, uploaded and
+/// row-count-VERIFIED in S3 before it leaves EBS. Only the local hot window
+/// shortens; the history itself is kept in full.
 const fn default_market_data_hot_days() -> u32 {
-    35
+    15
 }
 
 /// Default depth hot window: 3 days. See `depth_hot_days` for the arithmetic
@@ -4250,7 +4271,7 @@ mod tests {
             toml::from_str("retention_days = 90").expect("legacy section must parse");
         assert_eq!(cfg.retention_days, 90);
         // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
-        assert_eq!(cfg.market_data_hot_days, 35);
+        assert_eq!(cfg.market_data_hot_days, 15);
         assert!(!cfg.archive_enabled, "archive leg must default OFF");
         assert!(cfg.archive_bucket.is_empty(), "bucket must default derived");
         assert_eq!(cfg.max_partitions_per_run, 200);
@@ -4263,7 +4284,7 @@ mod tests {
         // (delete the key ⇒ detach-only legacy behaviour).
         assert!(!PartitionRetentionConfig::default().archive_enabled);
         // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
-        assert_eq!(default_market_data_hot_days(), 35);
+        assert_eq!(default_market_data_hot_days(), 15);
         assert_eq!(default_max_partitions_per_run(), 200);
         let cfg: PartitionRetentionConfig =
             toml::from_str("").expect("empty section must parse via defaults");
@@ -4278,6 +4299,9 @@ mod tests {
         .expect("full section must parse");
         assert!(cfg.archive_enabled);
         assert_eq!(cfg.archive_bucket, "tv-prod-cold");
+        // 35, NOT the 15 default: this test parses an EXPLICIT value and
+        // exists to prove an explicit setting overrides the default. If this
+        // ever tracks the default it stops testing anything.
         assert_eq!(cfg.market_data_hot_days, 35);
         assert_eq!(cfg.max_partitions_per_run, 50);
     }

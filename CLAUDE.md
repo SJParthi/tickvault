@@ -190,9 +190,22 @@ to operator/observability endpoints.
 
 > **Corrected 2026-08-10 (audit):** the sentence below is true of `/portal/*`
 > SPECIFICALLY, but is STALE read as a global "there is no frontend" claim.
-> **Four browser-facing surfaces are live today** (~1,053 lines of JavaScript):
-> `crates/api/src/handlers/{dashboard_page,feeds_page,board_page}.rs` and
-> `crates/aws-lambdas/src/operator_control_console.html`. They postdate the
+> **SEVEN browser-facing surfaces are live today** — CORRECTED 2026-08-19 by
+> audit; this row said FOUR and undercounted by three, including the largest
+> one. The six `.rs` surfaces are
+> `crates/api/src/handlers/{dashboard_page,feeds_page,board_page}.rs`,
+> **`crates/api/src/handlers/brutex_crossverify.rs`** (6 `<script>` blocks —
+> the biggest JS surface in the repo, omitted entirely),
+> **`crates/app/src/brutex_crossverify_compare.rs`** (1) and
+> **`crates/aws-lambdas/src/operator_control.rs`** (3), plus the one `.html`,
+> `crates/aws-lambdas/src/operator_control_console.html`.
+>
+> The count is worth stating precisely because the carve-out is what makes
+> "Rust only, except frontend" enforceable: a number that is quietly wrong is
+> a carve-out nobody can check. `browser_surface_and_toolchain_guard.rs`
+> pins the real set and has been correct throughout — the DOCUMENTATION was
+> the stale part, which is the same failure mode the O(1) table above has
+> recorded five times. They postdate the
 > 2026-05-19 retirement and are the legitimate frontend set under the operator's
 > "Rust only, except frontend" carve-out. Nothing else qualifies — server-side
 > shell and CI JavaScript cannot claim that exemption. The entire `/portal/*` HTML

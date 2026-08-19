@@ -13,7 +13,9 @@
 //!
 //! 1. **Eligibility** — partitions strictly older than the table's
 //!    retention-class hot window (market-data: `ticks` + the 21 `candles_*`
-//!    tables → `market_data_hot_days`, default 35 (2026-07-16, was 14) —
+//!    tables → `market_data_hot_days`, default 15 (2026-08-19 operator
+//!    approval, was 35; ticks + sub-minute candles left this class entirely
+//!    in the same day's Intraday split) —
 //!    incl. the per-minute chain tables since the same date; everything else →
 //!    `retention_days`, 90), clamped to a hard [`MIN_HOT_DAYS`] = 2 floor so
 //!    today's and yesterday's partitions are untouchable regardless of
@@ -210,7 +212,7 @@ const DEPTH_TABLES: [&str; 1] = [crate::depth_persistence::MARKET_DEPTH_TABLE];
 /// a minute-or-longer one cannot join by accident. That is worth the O(24)
 /// scan, which runs on the cold retention sweep and never on a tick.
 fn is_intraday_table(table: &str) -> bool {
-    if table == "ticks" {
+    if table == TICKS_TABLE {
         return true;
     }
     (0..tickvault_trading::candles::TF_COUNT).any(|ordinal| {
@@ -219,6 +221,13 @@ fn is_intraday_table(table: &str) -> bool {
         })
     })
 }
+
+/// The `ticks` table name, named rather than inlined so a rename is a compile
+/// error here. It was a bare literal until 2026-08-19: a rename would have
+/// silently reclassified ticks from current-day to the 15-day history window
+/// — ~87 GB at target — with nothing failing to say so. `DEPTH_TABLES` uses
+/// `MARKET_DEPTH_TABLE` for exactly this reason; this matches it.
+const TICKS_TABLE: &str = "ticks";
 
 /// One minute, in seconds — the boundary between "intraday, current-day only"
 /// and "history the indicator and strategy paths read".
