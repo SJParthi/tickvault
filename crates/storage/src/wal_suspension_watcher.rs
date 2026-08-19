@@ -52,6 +52,22 @@
 //! NEVER auto-executed (auto-resume can replay into a still-broken disk).
 //! Runbook: `.claude/rules/project/wal-suspension-error-codes.md`.
 //!
+//! **AMENDED 2026-08-19 — resume IS now auto-executed, CONDITIONALLY.** The
+//! paragraph above stands as the reasoning and is not withdrawn: replaying a
+//! WAL into a still-broken disk is exactly the failure it warns about, and
+//! nothing here does that. What changed is that the operator required the box
+//! to run unattended, and "wait for a human" was the only remaining path out
+//! of a suspended table — the terminal state in the whole self-management
+//! chain.
+//!
+//! [`crate::wal_auto_resume`] issues the statement only when the disk that
+//! caused the suspension has measurably recovered (a quarter of the volume
+//! free, well clear of where the disk-pressure loop stops reclaiming), and it
+//! refuses on a tight disk, refuses when `df` cannot be read at all, and stops
+//! after three attempts per episode — at which point the WAL-SUSPEND-01 page
+//! stands and this paragraph's original advice applies again. The caution was
+//! right; what it lacked was a condition.
+//!
 //! # Honest bound — the FAST crash-recovery boot arm (2026-07-10 review)
 //!
 //! The main.rs spawn site sits in the process-global supervised-monitor
@@ -419,6 +435,7 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
             "WAL-suspension watcher started (per-table wal_tables() probe)"
         );
         let mut tracker = WalSuspensionTracker::new();
+        let mut resume_ledger = crate::wal_auto_resume::ResumeLedger::new();
         // Edge-latch for parse/schema failures so a server-version drift
         // is loud ONCE per contiguous failure run, not every 60s forever.
         let mut schema_warned = false;
@@ -446,6 +463,17 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     }
                     let delta = tracker.observe(&rows);
                     emit_wal_delta(&delta);
+                    // Attempt recovery, CONDITIONALLY. The module header
+                    // above says a resume is an operator decision because it
+                    // "can replay into a still-broken disk" — which is right,
+                    // and is exactly what `attempt_auto_resume` checks before
+                    // issuing anything. It refuses on a tight disk, refuses on
+                    // an unmeasurable one, and hands back to the operator
+                    // after a bounded number of tries.
+                    for table in &delta.recovered {
+                        resume_ledger.clear(table);
+                    }
+                    attempt_auto_resume(&questdb, &rows, &mut resume_ledger).await;
                 }
                 Err(failure) => {
                     metrics::counter!(
@@ -475,6 +503,130 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
             }
         }
     })
+}
+
+/// Directory the disk-evidence probe measures.
+///
+/// The same relative path the disk-pressure loop watches, so the two agree
+/// about which volume they are talking about. Measuring a different
+/// filesystem than the one that suspended the table would make the resume
+/// decision confidently wrong.
+const RESUME_DISK_PROBE_PATH: &str = "data";
+
+/// Issues `ALTER TABLE … RESUME WAL` for suspended tables whose cause has
+/// demonstrably cleared.
+///
+/// Every refusal is logged with its reason, because "nothing happened" and
+/// "we decided not to" are different states and only one of them means the
+/// operator should look.
+// TEST-EXEMPT: async I/O composition (a `df` probe plus one /exec per resume); every decision it makes — the disk classification, the attempt budget, the give-up point and the SQL — is a pure function tested in `wal_auto_resume`.
+async fn attempt_auto_resume(
+    questdb: &QuestDbConfig,
+    rows: &[WalTableRow],
+    ledger: &mut crate::wal_auto_resume::ResumeLedger,
+) {
+    use crate::wal_auto_resume::{DiskEvidence, ResumeDecision, build_resume_sql};
+
+    let suspended: Vec<&WalTableRow> = rows.iter().filter(|r| r.suspended).collect();
+    if suspended.is_empty() {
+        return;
+    }
+
+    // Measured ONCE per poll, not per table: `df` is a subprocess, and the
+    // answer cannot differ between two tables on the same volume.
+    let disk = match crate::disk_health_watcher::probe_disk_free_bytes(std::path::Path::new(
+        RESUME_DISK_PROBE_PATH,
+    )) {
+        crate::disk_health_watcher::DiskHealthOutcome::Ok {
+            free_bytes,
+            total_bytes,
+        } => DiskEvidence::from_measurement(free_bytes, total_bytes),
+        crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { .. } => DiskEvidence::Unknown,
+    };
+
+    for row in suspended {
+        match ledger.decide(&row.name, disk) {
+            ResumeDecision::Resume { attempt } => {
+                let Some(sql) = build_resume_sql(&row.name) else {
+                    error!(
+                        code = ErrorCode::WalSuspend01TableSuspended.code_str(),
+                        table = %row.name,
+                        "auto-resume REFUSED: the table name is not a plain identifier, so no \
+                         statement was built. Resume it manually and check where that name \
+                         came from — wal_tables() should never emit one."
+                    );
+                    continue;
+                };
+                match exec_resume(questdb, &sql).await {
+                    Ok(()) => {
+                        metrics::counter!("tv_wal_auto_resume_total", "outcome" => "issued")
+                            .increment(1);
+                        info!(
+                            table = %row.name,
+                            attempt,
+                            "WAL auto-resume issued — the disk has recovered, so the replay \
+                             has somewhere to go. If the table re-suspends this will retry, \
+                             then stop and page."
+                        );
+                    }
+                    Err(err) => {
+                        metrics::counter!("tv_wal_auto_resume_total", "outcome" => "failed")
+                            .increment(1);
+                        warn!(
+                            table = %row.name,
+                            attempt,
+                            %err,
+                            "WAL auto-resume statement failed — the table stays suspended and \
+                             the attempt is spent."
+                        );
+                    }
+                }
+            }
+            ResumeDecision::WaitForDisk => {
+                metrics::counter!("tv_wal_auto_resume_total", "outcome" => "waiting_disk")
+                    .increment(1);
+                debug!(
+                    table = %row.name,
+                    "WAL auto-resume held: the disk is still too tight to replay into"
+                );
+            }
+            ResumeDecision::WaitForEvidence => {
+                metrics::counter!("tv_wal_auto_resume_total", "outcome" => "waiting_evidence")
+                    .increment(1);
+                debug!(
+                    table = %row.name,
+                    "WAL auto-resume held: free space could not be measured, and an \
+                     unmeasurable volume is treated exactly like a full one"
+                );
+            }
+            ResumeDecision::GiveUp => {
+                metrics::counter!("tv_wal_auto_resume_total", "outcome" => "gave_up").increment(1);
+                debug!(
+                    table = %row.name,
+                    "WAL auto-resume exhausted its attempts — the WAL-SUSPEND-01 page stands \
+                     and the operator owns this table now"
+                );
+            }
+        }
+    }
+}
+
+/// Executes one resume statement over `/exec`.
+async fn exec_resume(questdb: &QuestDbConfig, sql: &str) -> Result<(), String> {
+    let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
+    let client = crate::http_client::shared_probe_client()
+        .map_err(|e| format!("probe client unavailable: {e}"))?;
+    let resp = client
+        .get(&url)
+        .query(&[("query", sql)])
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("non-2xx: {}", resp.status()))
+    }
 }
 
 /// Supervise the WAL-suspension watcher: on task death (panic/cancel)
