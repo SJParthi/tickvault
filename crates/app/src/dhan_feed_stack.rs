@@ -94,6 +94,7 @@ use tickvault_common::constants::{
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
+use tickvault_common::ingest_shed::INGEST_SHED;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::auth::token_manager::global_token_manager;
@@ -1586,6 +1587,14 @@ pub struct DrainCounters {
     /// more serious signal.
     depth_flush_failed: metrics::Counter,
     depth_unconsumed: metrics::Counter,
+    /// Depth frames and inline-depth packets DROPPED because the ingest-shed
+    /// gate is closed (`tickvault_common::ingest_shed`). Separate from every
+    /// other depth counter on purpose: these rows were not refused as bad, and
+    /// nothing failed — the box deliberately stopped writing them to stay
+    /// alive on a full disk, and reading that as corruption would send an
+    /// operator hunting a bug that does not exist.
+    shed_inline_depth: metrics::Counter,
+    shed_dedicated_depth: metrics::Counter,
     depth_rows: metrics::Counter,
     depth_refused: metrics::Counter,
     depth_dropped: metrics::Counter,
@@ -1645,6 +1654,8 @@ pub fn counters() -> &'static DrainCounters {
         flush_failed: metrics::counter!(FLUSH_COUNTER, "outcome" => "failed"),
         depth_flush_failed: metrics::counter!(FLUSH_COUNTER, "outcome" => "depth_failed"),
         depth_unconsumed: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "depth_unconsumed"),
+        shed_inline_depth: metrics::counter!(DEPTH_COUNTER, "outcome" => "shed_inline"),
+        shed_dedicated_depth: metrics::counter!(DEPTH_COUNTER, "outcome" => "shed_dedicated"),
         depth_rows: metrics::counter!(DEPTH_COUNTER, "outcome" => "rows"),
         depth_refused: metrics::counter!(DEPTH_COUNTER, "outcome" => "refused"),
         depth_dropped: metrics::counter!(DEPTH_COUNTER, "outcome" => "dropped"),
@@ -2303,6 +2314,15 @@ async fn run_frame_drain(
                             DepthFeedKind::TwoHundred
                         };
                         match depth_ingest.as_mut() {
+                            // The ingest-shed gate, read here rather than
+                            // inside `drain_depth_frame`, so a shed frame
+                            // costs one relaxed atomic load and NOT a parse.
+                            // The frame is already durable in the WAL by this
+                            // point — shedding drops the DATABASE write, never
+                            // the capture.
+                            Some(_) if !INGEST_SHED.allows_dedicated_depth() => {
+                                c.shed_dedicated_depth.increment(1);
+                            }
                             Some(depth) => {
                                 let outcome = drain_depth_frame(
                                     depth, &frame, received_at_nanos, kind, c,
@@ -2727,12 +2747,23 @@ pub fn drain_main_feed_frame(
                 // trades 20 levels on 250 instruments for 5 levels on all
                 // 25,000 — less storage AND 100x the coverage. That swap is
                 // the operator's call, so this ships able but off.
+                //
+                // The ingest-shed gate is consulted FIRST and cheaply: one
+                // relaxed atomic load, before the sink is even taken. Inline
+                // depth is the first thing shed on a filling disk because it
+                // is the widest and most redundant — 10 rows per packet across
+                // the whole universe, on instruments the dedicated feeds
+                // already cover more deeply. The tick itself is NEVER shed.
                 if let (Some(sink), ParsedFrame::TickWithDepth(t, levels)) =
                     (ingest.inline_depth.as_mut(), &parsed)
                 {
-                    out.inline_depth_rows = out
-                        .inline_depth_rows
-                        .saturating_add(append_inline_depth(sink, t, levels, received_at_nanos));
+                    if INGEST_SHED.allows_inline_depth() {
+                        out.inline_depth_rows = out.inline_depth_rows.saturating_add(
+                            append_inline_depth(sink, t, levels, received_at_nanos),
+                        );
+                    } else {
+                        c.shed_inline_depth.increment(1);
+                    }
                 }
                 let tick = match parsed {
                     ParsedFrame::Tick(t) | ParsedFrame::TickWithDepth(t, _) => t,
@@ -5288,6 +5319,42 @@ mod tests {
             production.contains("c.depth_unconsumed.increment(1)"),
             "the no-ingest arm must still COUNT — a silently dropped depth frame \
              is what this whole path exists to eliminate"
+        );
+    }
+
+    #[test]
+    fn both_depth_write_paths_consult_the_ingest_shed_gate_and_ticks_never_do() {
+        // The gate is only a lever if BOTH paths read it. A version that
+        // gated inline depth and forgot the dedicated feeds would shed the
+        // cheap half and keep writing the expensive one, on a disk that is
+        // already full — worse than not shedding at all, because the counters
+        // would say shedding is working.
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("INGEST_SHED.allows_inline_depth()"),
+            "the inline-depth append must be gated"
+        );
+        assert!(
+            production.contains("INGEST_SHED.allows_dedicated_depth()"),
+            "the depth-20 / depth-200 routing must be gated"
+        );
+        assert!(
+            production.contains("c.shed_inline_depth.increment(1)")
+                && production.contains("c.shed_dedicated_depth.increment(1)"),
+            "a shed row must be COUNTED — silently writing less is the false-OK \
+             this whole design exists to avoid"
+        );
+
+        // And the guarantee that makes shedding acceptable: no tick path may
+        // ever consult the gate. If this ever fails, someone has taught the
+        // box to drop prices to save disk, which is the one thing it must not
+        // do.
+        assert!(
+            !production.contains("INGEST_SHED.allows_ticks"),
+            "ticks are NEVER shed — no tick path may consult the gate"
         );
     }
 

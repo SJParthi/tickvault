@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use tickvault_common::config::{PartitionRetentionConfig, QuestDbConfig};
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::ingest_shed::{INGEST_SHED, decide_shed_level, free_fraction_from_used_pct};
 use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 use tickvault_storage::disk_pressure::{
     PressureAction, PressureProbe, PressureState, apply_action, decide_pressure_action,
@@ -208,6 +209,39 @@ async fn run_disk_pressure_loop(
 
         let action = decide_pressure_action(probe, &state, &cfg, now_secs);
         let used = probe.used_pct.unwrap_or(0);
+
+        // The SECOND lever. Everything below this line reclaims space by
+        // deleting old data; this one stops writing new data, and it only
+        // engages once deleting has nothing left to give.
+        //
+        // `Escalate` is exactly that signal: it means every partition old
+        // enough to archive already is, so retention is at its floor. On a
+        // poll where it does NOT fire, `decide_shed_level` HOLDS the current
+        // level rather than lifting it — restoring is governed by the free
+        // space recovering, not by a quiet poll.
+        //
+        // A failed probe reports `used_pct: None`, which would read as 0%
+        // used = 100% free and RESTORE everything on a blind reading. So a
+        // blind poll skips the decision entirely and holds, matching the
+        // surrounding loop's rule that a blind probe never triggers an action.
+        if let Some(pct) = probe.used_pct {
+            let free = free_fraction_from_used_pct(pct);
+            let retention_at_floor = matches!(action, PressureAction::Escalate);
+            let next = decide_shed_level(INGEST_SHED.level(), free, retention_at_floor);
+            if INGEST_SHED.set(next) {
+                metrics::counter!("tv_ingest_shed_transitions_total", "level" => next.as_str())
+                    .increment(1);
+                warn!(
+                    level = next.as_str(),
+                    used_pct = pct,
+                    retention_at_floor,
+                    "ingest shedding CHANGED — the box is writing less to stay alive on a \
+                     full disk. Ticks are never shed at any level; order-book depth is \
+                     dropped first inline, then entirely, and comes back automatically \
+                     once free space recovers"
+                );
+            }
+        }
 
         match action {
             PressureAction::Disabled | PressureAction::Idle | PressureAction::Hold => {
@@ -454,6 +488,56 @@ mod tests {
             spawn_supervised_disk_pressure_loop(PathBuf::from("/tmp"), test_questdb(), c,)
                 .is_none(),
             "a threshold pair the operator did not mean must be visible, not quietly fixed"
+        );
+    }
+
+    #[test]
+    fn the_pressure_loop_decides_shedding_only_on_a_reading_it_actually_got() {
+        // The failure this pins: `probe.used_pct` is `None` on a blind probe,
+        // and `unwrap_or(0)` two lines above reads as 0% used = 100% free.
+        // Feeding that to the shed decision would RESTORE every depth feed on
+        // the exact poll where the loop cannot see the disk at all.
+        let src = include_str!("disk_pressure_boot.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("if let Some(pct) = probe.used_pct"),
+            "the shed decision must be inside a Some(pct) binding, never on the \
+             unwrap_or(0) fallback"
+        );
+        assert!(
+            production.contains("free_fraction_from_used_pct(pct)"),
+            "the loop measures USED and the gate decides on FREE — the named \
+             converter is what stops the two conventions being mixed"
+        );
+        assert!(
+            production.contains("matches!(action, PressureAction::Escalate)"),
+            "shedding must be gated on retention having nothing left to reclaim \
+             — reclaim first, shed second"
+        );
+        assert!(
+            production.contains("if INGEST_SHED.set(next)"),
+            "only a real transition may log — a level held for hours must not \
+             repeat the same warning every poll"
+        );
+    }
+
+    #[test]
+    fn a_blind_probe_would_have_restored_everything_if_it_reached_the_decision() {
+        // Why the guard above is worth a test rather than a comment: this is
+        // the actual arithmetic of the bug it prevents.
+        let blind_used = 0_u8; // what `unwrap_or(0)` produces
+        let free = free_fraction_from_used_pct(blind_used);
+        assert_eq!(
+            decide_shed_level(
+                tickvault_common::ingest_shed::ShedLevel::AllDepth,
+                free,
+                true
+            ),
+            tickvault_common::ingest_shed::ShedLevel::None,
+            "a blind probe fed through as 0% used restores everything — which \
+             is precisely why it must never reach the decision"
         );
     }
 }
