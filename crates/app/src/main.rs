@@ -2444,8 +2444,12 @@ async fn run_slow_boot_observability(
                     // Gap detection — the tracker fires its own log/metric on
                     // ERROR thresholds; no backfill request is published
                     // (in-market backfill disabled by user policy).
-                    let _ =
-                        tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+                    // I-P1-11 composite: security_id alone is not unique.
+                    let _ = tick_gap_tracker.record_tick(
+                        tick.security_id,
+                        tick.exchange_segment_code,
+                        tick.exchange_timestamp,
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(

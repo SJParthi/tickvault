@@ -52,8 +52,17 @@ struct SecurityFeedState {
 /// (>= 120s, possible disconnection) are logged immediately per-instrument.
 /// This prevents console flooding from illiquid F&O instruments.
 pub struct TickGapTracker {
-    /// Per-security feed state.
-    states: HashMap<u64, SecurityFeedState>,
+    /// Per-instrument feed state, keyed on the I-P1-11 COMPOSITE
+    /// `(security_id, exchange_segment_code)`.
+    ///
+    /// security_id ALONE is not unique: Dhan reuses the same numeric id across
+    /// segments (the live 2026-04-17 case had id 27 as both a FINNIFTY index
+    /// value and an NSE_EQ instrument). Keyed on the id alone, two genuinely
+    /// different instruments SHARE one gap state — each one's ticks reset the
+    /// other's timer, so a real silence on either is masked by activity on the
+    /// other and never reported. A gap detector that cannot tell two
+    /// instruments apart silently under-reports exactly what it exists to find.
+    states: HashMap<(u64, u8), SecurityFeedState>,
     /// Total gap warnings emitted (for metrics/alerting).
     total_warnings: u64,
     /// Total gap errors emitted (for metrics/alerting).
@@ -114,7 +123,12 @@ impl TickGapTracker {
     ///
     /// # Returns
     /// `TickGapResult` indicating whether a gap was detected.
-    pub fn record_tick(&mut self, security_id: u64, exchange_timestamp: u32) -> TickGapResult {
+    pub fn record_tick(
+        &mut self,
+        security_id: u64,
+        exchange_segment_code: u8,
+        exchange_timestamp: u32,
+    ) -> TickGapResult {
         // Compute current IST epoch seconds for the backlog-tick age check
         // inside `record_tick_with_now_ist`. The `#[cfg(test)]` twin
         // `record_tick_with_now_ist` below allows tests to inject a
@@ -124,7 +138,12 @@ impl TickGapTracker {
             .timestamp()
             .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
             .max(0) as u64;
-        self.record_tick_with_now_ist(security_id, exchange_timestamp, now_ist_secs)
+        self.record_tick_with_now_ist(
+            security_id,
+            exchange_segment_code,
+            exchange_timestamp,
+            now_ist_secs,
+        )
     }
 
     /// Inner form of [`Self::record_tick`] that accepts an injected
@@ -133,9 +152,12 @@ impl TickGapTracker {
     pub(crate) fn record_tick_with_now_ist(
         &mut self,
         security_id: u64,
+        exchange_segment_code: u8,
         exchange_timestamp: u32,
         now_ist_secs: u64,
     ) -> TickGapResult {
+        // I-P1-11: the composite is the only unique instrument key.
+        let key = (security_id, exchange_segment_code);
         // Backlog-tick filter — MUST run BEFORE any state mutation.
         //
         // On new Phase 2 subscription (or process restart), Dhan replays
@@ -193,9 +215,7 @@ impl TickGapTracker {
         // Refusing to TRACK a new instrument only costs gap detection for that
         // instrument; refusing loudly means the operator learns the universe
         // outgrew the bound rather than discovering silent blind spots.
-        if self.states.len() >= Self::MAX_TRACKED_INSTRUMENTS
-            && !self.states.contains_key(&security_id)
-        {
+        if self.states.len() >= Self::MAX_TRACKED_INSTRUMENTS && !self.states.contains_key(&key) {
             self.refused_instruments = self.refused_instruments.saturating_add(1);
             metrics::counter!("tv_tick_gap_tracker_refused_total").increment(1);
             // Power-of-two throttle: at the cap this fires per tick for every
@@ -216,7 +236,7 @@ impl TickGapTracker {
             }
             return TickGapResult::Ok;
         }
-        let state = self.states.entry(security_id).or_insert(SecurityFeedState {
+        let state = self.states.entry(key).or_insert(SecurityFeedState {
             last_exchange_timestamp: exchange_timestamp,
             tick_count: 0,
             last_wall_clock: now,
@@ -375,7 +395,8 @@ impl TickGapTracker {
             let elapsed = now.duration_since(state.last_wall_clock);
             if elapsed >= threshold && !state.stale_alerted {
                 error!(
-                    security_id = security_id,
+                    security_id = security_id.0,
+                    exchange_segment_code = security_id.1,
                     frozen_secs = elapsed.as_secs(),
                     last_exchange_ts = state.last_exchange_timestamp,
                     "stale LTP detected — no tick for >10 minutes"
@@ -416,10 +437,14 @@ impl TickGapTracker {
     ///
     /// Cold path — runs once per Phase 2 dispatch, not per tick. O(n)
     /// in `ids.len()`.
+    /// Removes every tracked entry whose security_id is in `ids`, across ALL
+    /// segments. Callers pass bare ids (they are unsubscribing an instrument,
+    /// not one segment of it), so this clears each id wherever it appears —
+    /// leaving a stale entry behind under another segment would resurrect the
+    /// masking this composite key exists to prevent.
     pub fn reset_for_securities(&mut self, ids: &[u64]) {
-        for sid in ids {
-            self.states.remove(sid);
-        }
+        // O(1) EXEMPT: cold path, once per dispatch, never per tick
+        self.states.retain(|(sid, _seg), _| !ids.contains(sid));
     }
 
     /// **P8.1 primitive** — snapshots the set of securities that have
@@ -448,17 +473,20 @@ impl TickGapTracker {
     /// feeding directly into [`GapBackfillRequest`] construction.
     /// Securities still in warmup are excluded (they have no real
     /// gap history yet).
-    pub fn snapshot_active_window(&self, window_secs: u64) -> Vec<(u64, u32)> {
+    /// Returns `(security_id, exchange_segment_code, last_exchange_timestamp)`
+    /// — the segment is carried so a caller can tell two same-id instruments
+    /// apart, which is the whole point of the composite key.
+    pub fn snapshot_active_window(&self, window_secs: u64) -> Vec<(u64, u8, u32)> {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(window_secs);
         let mut out = Vec::with_capacity(self.states.len());
-        for (&sid, state) in &self.states {
+        for (&(sid, seg), state) in &self.states {
             if state.tick_count <= TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
                 continue;
             }
             let age = now.duration_since(state.last_wall_clock);
             if age <= window {
-                out.push((sid, state.last_exchange_timestamp));
+                out.push((sid, seg, state.last_exchange_timestamp));
             }
         }
         out
@@ -476,7 +504,7 @@ impl TickGapTracker {
         &self,
         connection_label: &str,
         window_secs: u64,
-    ) -> Vec<(u64, u32)> {
+    ) -> Vec<(u64, u8, u32)> {
         let active = self.snapshot_active_window(window_secs);
         metrics::counter!(
             "tv_ws_reconnect_recently_active_securities_total",
@@ -548,11 +576,12 @@ impl TickGapTracker {
     pub fn detect_timestamp_backwards_jump(
         &mut self,
         security_id: u64,
+        exchange_segment_code: u8,
         exchange_timestamp: u32,
     ) -> BackwardsJumpResult {
         use std::collections::hash_map::Entry;
 
-        match self.states.entry(security_id) {
+        match self.states.entry((security_id, exchange_segment_code)) {
             Entry::Vacant(v) => {
                 v.insert(SecurityFeedState {
                     last_exchange_timestamp: exchange_timestamp,
@@ -634,7 +663,7 @@ mod tests {
         let base_ts = 1_700_000_000;
         // During warmup, even large gaps should not trigger alerts.
         for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            let result = tracker.record_tick(1001, base_ts + i * 100);
+            let result = tracker.record_tick(1001, 0, base_ts + i * 100);
             assert_eq!(result, TickGapResult::Ok);
         }
         assert_eq!(tracker.total_warnings(), 0);
@@ -647,11 +676,11 @@ mod tests {
         let base_ts = 1_700_000_000;
         // Fill warmup
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Normal 1-second intervals
         let post_warmup = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 1;
-        let result = tracker.record_tick(1001, post_warmup);
+        let result = tracker.record_tick(1001, 0, post_warmup);
         assert_eq!(result, TickGapResult::Ok);
         assert_eq!(tracker.total_warnings(), 0);
     }
@@ -662,11 +691,11 @@ mod tests {
         let base_ts = 1_700_000_000;
         // Fill warmup with 1-sec intervals
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Now send a tick with a gap at warning threshold
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         assert!(matches!(result, TickGapResult::Warning { .. }));
         assert_eq!(tracker.total_warnings(), 1);
         assert_eq!(tracker.total_errors(), 0);
@@ -678,11 +707,11 @@ mod tests {
         let base_ts = 1_700_000_000;
         // Fill warmup
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Send a tick with error-level gap
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         assert!(matches!(result, TickGapResult::Error { .. }));
         assert_eq!(tracker.total_errors(), 1);
     }
@@ -693,17 +722,17 @@ mod tests {
         let base_ts = 1_700_000_000;
         // Warm up both securities
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
-            tracker.record_tick(1002, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
+            tracker.record_tick(1002, 0, base_ts + i);
         }
         // Gap on security 1001 only
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
-        let r1 = tracker.record_tick(1001, gap_ts);
+        let r1 = tracker.record_tick(1001, 0, gap_ts);
         assert!(matches!(r1, TickGapResult::Warning { .. }));
 
         // Normal tick on security 1002
         let normal_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 1;
-        let r2 = tracker.record_tick(1002, normal_ts);
+        let r2 = tracker.record_tick(1002, 0, normal_ts);
         assert_eq!(r2, TickGapResult::Ok);
 
         assert_eq!(tracker.tracked_securities(), 2);
@@ -714,7 +743,7 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         assert_eq!(tracker.tracked_securities(), 1);
 
@@ -747,7 +776,7 @@ mod tests {
         let now_ist_2: u64 = 1_777_032_560; // wall clock ~2s later
 
         // Scenario: first-ever tick for this SID is a Dhan-replay backlog.
-        let r1 = tracker.record_tick_with_now_ist(76918, backlog_ts, now_ist_1);
+        let r1 = tracker.record_tick_with_now_ist(76918, 0, backlog_ts, now_ist_1);
         assert_eq!(r1, TickGapResult::Ok);
         // POST-FIX: no state created for backlog-only first tick.
         assert_eq!(
@@ -757,7 +786,7 @@ mod tests {
         );
 
         // Now a real-time tick arrives for the same SID.
-        let r2 = tracker.record_tick_with_now_ist(76918, realtime_ts, now_ist_2);
+        let r2 = tracker.record_tick_with_now_ist(76918, 0, realtime_ts, now_ist_2);
         assert_eq!(
             r2,
             TickGapResult::Ok,
@@ -774,7 +803,7 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let backlog_ts: u32 = 1_777_031_000;
         let now_ist: u64 = 1_777_032_558; // 1558s age — well inside [60, 86400]
-        let result = tracker.record_tick_with_now_ist(12345, backlog_ts, now_ist);
+        let result = tracker.record_tick_with_now_ist(12345, 0, backlog_ts, now_ist);
         assert_eq!(result, TickGapResult::Ok);
         assert_eq!(
             tracker.tracked_securities(),
@@ -794,20 +823,20 @@ mod tests {
         let base_ts: u32 = 1_777_032_550;
         let now_ist: u64 = u64::from(base_ts + 5);
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick_with_now_ist(7777, base_ts + i, now_ist);
+            tracker.record_tick_with_now_ist(7777, 0, base_ts + i, now_ist);
         }
         let before_count = tracker.tracked_securities();
         // Now inject a backlog tick from 10 minutes ago.
         let backlog_ts: u32 = base_ts - 600;
         let now_after_backlog: u64 = u64::from(base_ts + 10);
-        let result = tracker.record_tick_with_now_ist(7777, backlog_ts, now_after_backlog);
+        let result = tracker.record_tick_with_now_ist(7777, 0, backlog_ts, now_after_backlog);
         assert_eq!(result, TickGapResult::Ok);
         assert_eq!(tracker.tracked_securities(), before_count);
 
         // A subsequent real-time tick computes gap against the PRE-backlog
         // last_ts (not the backlog ts), so the gap is small.
         let realtime_ts: u32 = base_ts + 10;
-        let r = tracker.record_tick_with_now_ist(7777, realtime_ts, u64::from(realtime_ts));
+        let r = tracker.record_tick_with_now_ist(7777, 0, realtime_ts, u64::from(realtime_ts));
         assert_eq!(
             r,
             TickGapResult::Ok,
@@ -821,9 +850,9 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts: u32 = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
-            tracker.record_tick(1002, base_ts + i);
-            tracker.record_tick(1003, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
+            tracker.record_tick(1002, 0, base_ts + i);
+            tracker.record_tick(1003, 0, base_ts + i);
         }
         assert_eq!(tracker.tracked_securities(), 3);
 
@@ -836,7 +865,7 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts: u32 = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         assert_eq!(tracker.tracked_securities(), 1);
         tracker.reset_for_securities(&[]);
@@ -848,7 +877,7 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts: u32 = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         assert_eq!(tracker.tracked_securities(), 1);
         // Removing an unknown SID is a no-op, not a panic.
@@ -879,10 +908,10 @@ mod tests {
         let base_ts = 1_700_000_000;
         // Fill warmup
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Send an older timestamp (out-of-order) — saturating_sub → gap = 0 → Ok
-        let result = tracker.record_tick(1001, base_ts);
+        let result = tracker.record_tick(1001, 0, base_ts);
         assert_eq!(result, TickGapResult::Ok);
         assert_eq!(tracker.total_warnings(), 0);
         assert_eq!(tracker.total_errors(), 0);
@@ -893,10 +922,10 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         match result {
             TickGapResult::Warning { gap_secs } => {
                 assert_eq!(gap_secs, TICK_GAP_ALERT_THRESHOLD_SECS);
@@ -910,10 +939,10 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         match result {
             TickGapResult::Error { gap_secs } => {
                 assert_eq!(gap_secs, TICK_GAP_ERROR_THRESHOLD_SECS);
@@ -928,12 +957,12 @@ mod tests {
         let base_ts = 1_700_000_000;
         // Partial warmup
         for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE / 2 {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         tracker.reset();
 
         // After reset, warmup starts fresh — large gaps should still be suppressed
-        let result = tracker.record_tick(1001, base_ts + 1_000_000);
+        let result = tracker.record_tick(1001, 0, base_ts + 1_000_000);
         assert_eq!(result, TickGapResult::Ok);
         assert_eq!(tracker.total_warnings(), 0);
     }
@@ -943,11 +972,11 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Gap one second below warning threshold
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS - 1;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         assert_eq!(result, TickGapResult::Ok);
     }
 
@@ -956,13 +985,14 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         let last = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE;
         // Two consecutive warning-level gaps
-        tracker.record_tick(1001, last + TICK_GAP_ALERT_THRESHOLD_SECS);
+        tracker.record_tick(1001, 0, last + TICK_GAP_ALERT_THRESHOLD_SECS);
         tracker.record_tick(
             1001,
+            0,
             last + TICK_GAP_ALERT_THRESHOLD_SECS + TICK_GAP_ALERT_THRESHOLD_SECS,
         );
         assert_eq!(tracker.total_warnings(), 2);
@@ -971,7 +1001,7 @@ mod tests {
     #[test]
     fn zero_capacity_tracker_works() {
         let mut tracker = TickGapTracker::new(0);
-        let result = tracker.record_tick(1001, 1_700_000_000);
+        let result = tracker.record_tick(1001, 0, 1_700_000_000);
         assert_eq!(result, TickGapResult::Ok);
         assert_eq!(tracker.tracked_securities(), 1);
     }
@@ -988,7 +1018,7 @@ mod tests {
         // Feed exactly TICK_GAP_MIN_TICKS_BEFORE_ACTIVE ticks with large gaps.
         // The tick_count goes from 1..=threshold; tick at threshold should still be suppressed.
         for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            let result = tracker.record_tick(1001, base_ts + i * 1000); // 1000s gaps
+            let result = tracker.record_tick(1001, 0, base_ts + i * 1000); // 1000s gaps
             assert_eq!(
                 result,
                 TickGapResult::Ok,
@@ -1007,13 +1037,13 @@ mod tests {
 
         // Fill warmup with 1-sec intervals
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
 
         // The next tick (TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 1) is the first
         // post-warmup tick that CAN detect a gap.
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         assert!(
             matches!(result, TickGapResult::Warning { .. }),
             "first post-warmup tick must detect warning gap"
@@ -1033,17 +1063,17 @@ mod tests {
         let base_ts = 1_700_000_000;
         // Fill warmup
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
 
         // Trigger warning
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
-        tracker.record_tick(1001, gap_ts);
+        tracker.record_tick(1001, 0, gap_ts);
         assert_eq!(tracker.total_warnings(), u64::MAX);
 
         // Another warning should saturate at MAX, not overflow
         let gap_ts2 = gap_ts + TICK_GAP_ALERT_THRESHOLD_SECS;
-        tracker.record_tick(1001, gap_ts2);
+        tracker.record_tick(1001, 0, gap_ts2);
         assert_eq!(tracker.total_warnings(), u64::MAX);
     }
 
@@ -1054,15 +1084,15 @@ mod tests {
 
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
 
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        tracker.record_tick(1001, gap_ts);
+        tracker.record_tick(1001, 0, gap_ts);
         assert_eq!(tracker.total_errors(), u64::MAX);
 
         let gap_ts2 = gap_ts + TICK_GAP_ERROR_THRESHOLD_SECS;
-        tracker.record_tick(1001, gap_ts2);
+        tracker.record_tick(1001, 0, gap_ts2);
         assert_eq!(tracker.total_errors(), u64::MAX);
     }
 
@@ -1076,17 +1106,17 @@ mod tests {
         let base_ts = 1_700_000_000;
 
         // Insert first tick to create the entry
-        tracker.record_tick(1001, base_ts);
+        tracker.record_tick(1001, 0, base_ts);
 
         // Set tick_count to near max
-        tracker.states.get_mut(&1001).unwrap().tick_count = u32::MAX - 1;
+        tracker.states.get_mut(&(1001, 0)).unwrap().tick_count = u32::MAX - 1;
 
         // Two more ticks should saturate at MAX, not overflow
-        tracker.record_tick(1001, base_ts + 1);
-        assert_eq!(tracker.states.get(&1001).unwrap().tick_count, u32::MAX);
+        tracker.record_tick(1001, 0, base_ts + 1);
+        assert_eq!(tracker.states.get(&(1001, 0)).unwrap().tick_count, u32::MAX);
 
-        tracker.record_tick(1001, base_ts + 2);
-        assert_eq!(tracker.states.get(&1001).unwrap().tick_count, u32::MAX);
+        tracker.record_tick(1001, 0, base_ts + 2);
+        assert_eq!(tracker.states.get(&(1001, 0)).unwrap().tick_count, u32::MAX);
     }
 
     // -----------------------------------------------------------------------
@@ -1099,13 +1129,13 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Gap exactly at (alert + error) / 2 — should be Warning not Error
         let mid_gap = (TICK_GAP_ALERT_THRESHOLD_SECS + TICK_GAP_ERROR_THRESHOLD_SECS) / 2;
         if (TICK_GAP_ALERT_THRESHOLD_SECS..TICK_GAP_ERROR_THRESHOLD_SECS).contains(&mid_gap) {
             let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + mid_gap;
-            let result = tracker.record_tick(1001, gap_ts);
+            let result = tracker.record_tick(1001, 0, gap_ts);
             assert!(
                 matches!(result, TickGapResult::Warning { .. }),
                 "gap between alert and error threshold must be Warning"
@@ -1118,10 +1148,10 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS - 1;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         // If error - 1 >= alert, it should be Warning
         if TICK_GAP_ERROR_THRESHOLD_SECS > TICK_GAP_ALERT_THRESHOLD_SECS {
             assert!(matches!(result, TickGapResult::Warning { .. }));
@@ -1133,7 +1163,7 @@ mod tests {
         let mut tracker = TickGapTracker::new(100);
         let base_ts = 1_700_000_000;
         for sid in 1..=50 {
-            tracker.record_tick(sid, base_ts);
+            tracker.record_tick(sid, 0, base_ts);
         }
         assert_eq!(tracker.tracked_securities(), 50);
     }
@@ -1143,11 +1173,11 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Generate a warning
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ALERT_THRESHOLD_SECS;
-        tracker.record_tick(1001, gap_ts);
+        tracker.record_tick(1001, 0, gap_ts);
         assert_eq!(tracker.total_warnings(), 1);
 
         tracker.reset();
@@ -1195,13 +1225,13 @@ mod tests {
 
         // Feed exactly TICK_GAP_MIN_TICKS_BEFORE_ACTIVE ticks (tick_count goes 1..=threshold)
         for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
 
         // The NEXT tick (threshold+1) is the first active tick
         // Feed it with a huge gap → should detect warning
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE - 1 + TICK_GAP_ALERT_THRESHOLD_SECS;
-        let result = tracker.record_tick(1001, gap_ts);
+        let result = tracker.record_tick(1001, 0, gap_ts);
         assert!(
             matches!(result, TickGapResult::Warning { .. }),
             "first tick after warmup must detect gap"
@@ -1220,15 +1250,15 @@ mod tests {
 
         // Warmup
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
 
         // First ERROR-level gap — flag was false, must fire.
         let t1 = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        let r1 = tracker.record_tick(1001, t1);
+        let r1 = tracker.record_tick(1001, 0, t1);
         assert!(matches!(r1, TickGapResult::Error { .. }));
         assert!(
-            tracker.states.get(&1001).unwrap().error_gap_alerted,
+            tracker.states.get(&(1001, 0)).unwrap().error_gap_alerted,
             "first ERROR tick must set the edge-trigger flag"
         );
         assert_eq!(tracker.total_errors(), 1);
@@ -1238,10 +1268,10 @@ mod tests {
         // (We can't observe the log macro directly, but the flag gate proves
         // the error! path was skipped.)
         let t2 = t1 + TICK_GAP_ERROR_THRESHOLD_SECS;
-        let r2 = tracker.record_tick(1001, t2);
+        let r2 = tracker.record_tick(1001, 0, t2);
         assert!(matches!(r2, TickGapResult::Error { .. }));
         assert!(
-            tracker.states.get(&1001).unwrap().error_gap_alerted,
+            tracker.states.get(&(1001, 0)).unwrap().error_gap_alerted,
             "flag must stay set while instrument is still in the gap episode"
         );
         assert_eq!(
@@ -1258,19 +1288,19 @@ mod tests {
 
         // Warmup + first ERROR gap
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         let t1 = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        tracker.record_tick(1001, t1);
-        assert!(tracker.states.get(&1001).unwrap().error_gap_alerted);
+        tracker.record_tick(1001, 0, t1);
+        assert!(tracker.states.get(&(1001, 0)).unwrap().error_gap_alerted);
 
         // Recovery: a normal 1-second tick must CLEAR the flag so the
         // next ERROR episode fires fresh.
         let recovery = t1 + 1;
-        let rr = tracker.record_tick(1001, recovery);
+        let rr = tracker.record_tick(1001, 0, recovery);
         assert_eq!(rr, TickGapResult::Ok);
         assert!(
-            !tracker.states.get(&1001).unwrap().error_gap_alerted,
+            !tracker.states.get(&(1001, 0)).unwrap().error_gap_alerted,
             "normal tick must clear the error-gap edge-trigger flag"
         );
     }
@@ -1282,19 +1312,19 @@ mod tests {
 
         // Warmup + first ERROR episode
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         let t1 = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        tracker.record_tick(1001, t1);
+        tracker.record_tick(1001, 0, t1);
         // Recovery
-        tracker.record_tick(1001, t1 + 1);
-        assert!(!tracker.states.get(&1001).unwrap().error_gap_alerted);
+        tracker.record_tick(1001, 0, t1 + 1);
+        assert!(!tracker.states.get(&(1001, 0)).unwrap().error_gap_alerted);
 
         // Second ERROR episode (after recovery) — flag should re-arm.
         let t2 = t1 + 1 + TICK_GAP_ERROR_THRESHOLD_SECS;
-        tracker.record_tick(1001, t2);
+        tracker.record_tick(1001, 0, t2);
         assert!(
-            tracker.states.get(&1001).unwrap().error_gap_alerted,
+            tracker.states.get(&(1001, 0)).unwrap().error_gap_alerted,
             "second gap episode must re-set the edge-trigger flag"
         );
     }
@@ -1306,16 +1336,16 @@ mod tests {
 
         // Warmup two securities
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
-            tracker.record_tick(1002, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
+            tracker.record_tick(1002, 0, base_ts + i);
         }
 
         // Both hit an ERROR-level gap independently — both must fire once.
         let t_err = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        tracker.record_tick(1001, t_err);
-        tracker.record_tick(1002, t_err);
-        assert!(tracker.states.get(&1001).unwrap().error_gap_alerted);
-        assert!(tracker.states.get(&1002).unwrap().error_gap_alerted);
+        tracker.record_tick(1001, 0, t_err);
+        tracker.record_tick(1002, 0, t_err);
+        assert!(tracker.states.get(&(1001, 0)).unwrap().error_gap_alerted);
+        assert!(tracker.states.get(&(1002, 0)).unwrap().error_gap_alerted);
         assert_eq!(tracker.total_errors(), 2);
     }
 
@@ -1326,14 +1356,14 @@ mod tests {
 
         // Warmup
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
 
         let mut ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE;
         // Three consecutive error-level gaps
         for _ in 0..3 {
             ts += TICK_GAP_ERROR_THRESHOLD_SECS;
-            tracker.record_tick(1001, ts);
+            tracker.record_tick(1001, 0, ts);
         }
         assert_eq!(tracker.total_errors(), 3);
     }
@@ -1345,7 +1375,7 @@ mod tests {
 
         // Full warmup + active tracking
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 5 {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         assert_eq!(tracker.tracked_securities(), 1);
 
@@ -1355,7 +1385,7 @@ mod tests {
 
         // After reset, warmup suppresses gaps again
         for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            let result = tracker.record_tick(1001, base_ts + 100_000 + i * 1000);
+            let result = tracker.record_tick(1001, 0, base_ts + 100_000 + i * 1000);
             assert_eq!(
                 result,
                 TickGapResult::Ok,
@@ -1369,10 +1399,10 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
         // Same timestamp as last → gap_secs = 0 → Ok
-        let result = tracker.record_tick(1001, base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE);
+        let result = tracker.record_tick(1001, 0, base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE);
         assert_eq!(result, TickGapResult::Ok);
     }
 
@@ -1387,8 +1417,8 @@ mod tests {
 
         // Fill warmup so instruments become active
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
-            tracker.record_tick(1002, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
+            tracker.record_tick(1002, 0, base_ts + i);
         }
 
         // Immediately after ticks, nothing should be stale
@@ -1401,7 +1431,7 @@ mod tests {
     fn stale_ltp_warmup_instruments_skipped() {
         let mut tracker = TickGapTracker::new(10);
         // Only 1 tick — still in warmup phase
-        tracker.record_tick(1001, 1_700_000_000);
+        tracker.record_tick(1001, 0, 1_700_000_000);
 
         // Even if wall-clock time passes, warmup instruments are not checked
         let stale = tracker.detect_stale_instruments();
@@ -1414,11 +1444,11 @@ mod tests {
         let base_ts = 1_700_000_000;
 
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
 
         // Manually set wall clock to simulate staleness
-        tracker.states.get_mut(&1001).unwrap().last_wall_clock =
+        tracker.states.get_mut(&(1001, 0)).unwrap().last_wall_clock =
             Instant::now() - std::time::Duration::from_secs(STALE_LTP_THRESHOLD_SECS + 1);
 
         let stale1 = tracker.detect_stale_instruments();
@@ -1437,21 +1467,21 @@ mod tests {
         let base_ts = 1_700_000_000;
 
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
 
         // Simulate staleness
-        tracker.states.get_mut(&1001).unwrap().last_wall_clock =
+        tracker.states.get_mut(&(1001, 0)).unwrap().last_wall_clock =
             Instant::now() - std::time::Duration::from_secs(STALE_LTP_THRESHOLD_SECS + 1);
 
         let stale = tracker.detect_stale_instruments();
         assert_eq!(stale, 1);
-        assert!(tracker.states.get(&1001).unwrap().stale_alerted);
+        assert!(tracker.states.get(&(1001, 0)).unwrap().stale_alerted);
 
         // New tick arrives — resets stale flag
-        tracker.record_tick(1001, base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 100);
+        tracker.record_tick(1001, 0, base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + 100);
         assert!(
-            !tracker.states.get(&1001).unwrap().stale_alerted,
+            !tracker.states.get(&(1001, 0)).unwrap().stale_alerted,
             "stale flag must reset on new tick"
         );
 
@@ -1466,18 +1496,18 @@ mod tests {
         let base_ts = 1_700_000_000;
 
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
-            tracker.record_tick(1002, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
+            tracker.record_tick(1002, 0, base_ts + i);
         }
 
         // Only 1001 goes stale
-        tracker.states.get_mut(&1001).unwrap().last_wall_clock =
+        tracker.states.get_mut(&(1001, 0)).unwrap().last_wall_clock =
             Instant::now() - std::time::Duration::from_secs(STALE_LTP_THRESHOLD_SECS + 1);
 
         let stale = tracker.detect_stale_instruments();
         assert_eq!(stale, 1, "only 1001 should be stale");
-        assert!(tracker.states.get(&1001).unwrap().stale_alerted);
-        assert!(!tracker.states.get(&1002).unwrap().stale_alerted);
+        assert!(tracker.states.get(&(1001, 0)).unwrap().stale_alerted);
+        assert!(!tracker.states.get(&(1002, 0)).unwrap().stale_alerted);
     }
 
     #[test]
@@ -1486,10 +1516,10 @@ mod tests {
         let base_ts = 1_700_000_000;
 
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
 
-        tracker.states.get_mut(&1001).unwrap().last_wall_clock =
+        tracker.states.get_mut(&(1001, 0)).unwrap().last_wall_clock =
             Instant::now() - std::time::Duration::from_secs(STALE_LTP_THRESHOLD_SECS + 1);
         tracker.detect_stale_instruments();
         assert_eq!(tracker.total_stale_alerts(), 1);
@@ -1513,9 +1543,9 @@ mod tests {
         let base_ts = 1_700_000_000;
 
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1001, 0, base_ts + i);
         }
-        tracker.states.get_mut(&1001).unwrap().last_wall_clock =
+        tracker.states.get_mut(&(1001, 0)).unwrap().last_wall_clock =
             Instant::now() - std::time::Duration::from_secs(STALE_LTP_THRESHOLD_SECS + 1);
 
         tracker.detect_stale_instruments();
@@ -1541,7 +1571,7 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         // One security, still in warmup (tick_count ≤ TICK_GAP_MIN_TICKS_BEFORE_ACTIVE).
         for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(1001, 1_700_000_000 + i);
+            tracker.record_tick(1001, 0, 1_700_000_000 + i);
         }
         let snapshot = tracker.snapshot_active_window(300);
         assert!(
@@ -1556,7 +1586,7 @@ mod tests {
         // Push past warmup.
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(2002, base_ts + i);
+            tracker.record_tick(2002, 0, base_ts + i);
         }
         let snapshot = tracker.snapshot_active_window(300);
         assert_eq!(
@@ -1566,7 +1596,7 @@ mod tests {
         );
         assert_eq!(snapshot[0].0, 2002);
         assert_eq!(
-            snapshot[0].1,
+            snapshot[0].2,
             base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE,
             "last_exchange_timestamp must match the most recent tick"
         );
@@ -1577,10 +1607,10 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick(3003, base_ts + i);
+            tracker.record_tick(3003, 0, base_ts + i);
         }
         // Artificially age the last_wall_clock so it falls outside the window.
-        tracker.states.get_mut(&3003).unwrap().last_wall_clock =
+        tracker.states.get_mut(&(3003, 0)).unwrap().last_wall_clock =
             Instant::now() - std::time::Duration::from_secs(600);
         let snapshot = tracker.snapshot_active_window(300);
         assert!(
@@ -1596,7 +1626,7 @@ mod tests {
         // Two distinct active securities.
         for sid in [4004, 5005] {
             for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-                tracker.record_tick(sid, base_ts + i);
+                tracker.record_tick(sid, 0, base_ts + i);
             }
         }
         let active = tracker.record_reconnect_event("live-feed-0", 300);
@@ -1605,7 +1635,7 @@ mod tests {
             2,
             "both active securities must be returned on reconnect event"
         );
-        let ids: Vec<u64> = active.iter().map(|(s, _)| *s).collect();
+        let ids: Vec<u64> = active.iter().map(|(s, _seg, _ts)| *s).collect();
         assert!(ids.contains(&4004));
         assert!(ids.contains(&5005));
     }
@@ -1617,7 +1647,7 @@ mod tests {
     #[test]
     fn test_backwards_jump_first_seen_returns_firstseen() {
         let mut tracker = TickGapTracker::new(10);
-        let result = tracker.detect_timestamp_backwards_jump(9001, 1_700_000_000);
+        let result = tracker.detect_timestamp_backwards_jump(9001, 0, 1_700_000_000);
         assert_eq!(result, BackwardsJumpResult::FirstSeen);
     }
 
@@ -1625,11 +1655,11 @@ mod tests {
     fn test_backwards_jump_monotonic_returns_normal() {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
-        let _ = tracker.detect_timestamp_backwards_jump(9002, base_ts);
-        let r1 = tracker.detect_timestamp_backwards_jump(9002, base_ts + 1);
+        let _ = tracker.detect_timestamp_backwards_jump(9002, 0, base_ts);
+        let r1 = tracker.detect_timestamp_backwards_jump(9002, 0, base_ts + 1);
         assert_eq!(r1, BackwardsJumpResult::Normal);
         // Equal timestamp is still considered Normal (not backward).
-        let r2 = tracker.detect_timestamp_backwards_jump(9002, base_ts + 1);
+        let r2 = tracker.detect_timestamp_backwards_jump(9002, 0, base_ts + 1);
         assert_eq!(r2, BackwardsJumpResult::Normal);
     }
 
@@ -1637,8 +1667,8 @@ mod tests {
     fn test_backwards_jump_backwards_returns_backwards_with_correct_delta() {
         let mut tracker = TickGapTracker::new(10);
         let base_ts = 1_700_000_000;
-        let _ = tracker.detect_timestamp_backwards_jump(9003, base_ts + 100);
-        let result = tracker.detect_timestamp_backwards_jump(9003, base_ts + 10);
+        let _ = tracker.detect_timestamp_backwards_jump(9003, 0, base_ts + 100);
+        let result = tracker.detect_timestamp_backwards_jump(9003, 0, base_ts + 10);
         assert_eq!(
             result,
             BackwardsJumpResult::Backwards {
@@ -1653,8 +1683,8 @@ mod tests {
         let mut tracker = TickGapTracker::new(10);
         // Seed with a large timestamp, then send 0 — delta must saturate
         // (last - 0 = last) without panic.
-        let _ = tracker.detect_timestamp_backwards_jump(9004, u32::MAX);
-        let result = tracker.detect_timestamp_backwards_jump(9004, 0);
+        let _ = tracker.detect_timestamp_backwards_jump(9004, 0, u32::MAX);
+        let result = tracker.detect_timestamp_backwards_jump(9004, 0, 0);
         match result {
             BackwardsJumpResult::Backwards {
                 delta_secs,
@@ -1673,10 +1703,10 @@ mod tests {
         let errors_before = tracker.total_errors();
         let base_ts = 1_700_000_000;
         // Seed.
-        let _ = tracker.detect_timestamp_backwards_jump(9005, base_ts);
+        let _ = tracker.detect_timestamp_backwards_jump(9005, 0, base_ts);
         // Jump backwards by the error threshold — must increment total_errors.
         let jumped_ts = base_ts.saturating_sub(TICK_GAP_ERROR_THRESHOLD_SECS);
-        let result = tracker.detect_timestamp_backwards_jump(9005, jumped_ts);
+        let result = tracker.detect_timestamp_backwards_jump(9005, 0, jumped_ts);
         match result {
             BackwardsJumpResult::Backwards { delta_secs, .. } => {
                 assert!(delta_secs >= TICK_GAP_ERROR_THRESHOLD_SECS);
@@ -1692,8 +1722,8 @@ mod tests {
         // A small backward nudge below threshold must NOT increment errors.
         let errors_after_first = tracker.total_errors();
         // Reset the security to a known ts, then jump a tiny bit backward.
-        let _ = tracker.detect_timestamp_backwards_jump(9006, base_ts);
-        let _ = tracker.detect_timestamp_backwards_jump(9006, base_ts - 1);
+        let _ = tracker.detect_timestamp_backwards_jump(9006, 0, base_ts);
+        let _ = tracker.detect_timestamp_backwards_jump(9006, 0, base_ts - 1);
         assert_eq!(
             tracker.total_errors(),
             errors_after_first,
@@ -1709,8 +1739,8 @@ mod tests {
             // (a >= b case becomes Normal for a-then-b when b >= a) or Backwards.
             let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
             let sid = 9_999_u64;
-            let _ = tracker.detect_timestamp_backwards_jump(sid, hi);
-            let result = tracker.detect_timestamp_backwards_jump(sid, lo);
+            let _ = tracker.detect_timestamp_backwards_jump(sid, 0, hi);
+            let result = tracker.detect_timestamp_backwards_jump(sid, 0, lo);
             if hi == lo {
                 proptest::prop_assert_eq!(result, BackwardsJumpResult::Normal);
             } else {
@@ -1750,12 +1780,12 @@ mod tests {
         let base_ts = now as u32;
         // Fill warmup with fresh ticks (same-ish timestamps, live).
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick_with_now_ist(1001, base_ts + i, now);
+            tracker.record_tick_with_now_ist(1001, 0, base_ts + i, now);
         }
         // After warmup, simulate a 2-minute (ERROR-threshold) gap with
         // BOTH old and new tick being live (tick age 0 s, gap 120 s).
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        let result = tracker.record_tick_with_now_ist(1001, gap_ts, u64::from(gap_ts));
+        let result = tracker.record_tick_with_now_ist(1001, 0, gap_ts, u64::from(gap_ts));
         assert!(
             matches!(result, TickGapResult::Error { .. }),
             "fresh tick with >=120s gap must still fire ERROR (got {result:?})"
@@ -1772,13 +1802,13 @@ mod tests {
         let base_ts = now as u32;
         // Fill warmup using fresh ticks so gap detection is armed.
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick_with_now_ist(1001, base_ts + i, now);
+            tracker.record_tick_with_now_ist(1001, 0, base_ts + i, now);
         }
         // Post-warmup, inject a BACKLOG tick: exchange_timestamp is
         // 600 s (10 min) old relative to now. Should be filtered.
         let backlog_age: u64 = 600;
         let backlog_ts: u32 = (now - backlog_age) as u32;
-        let result = tracker.record_tick_with_now_ist(1001, backlog_ts, now);
+        let result = tracker.record_tick_with_now_ist(1001, 0, backlog_ts, now);
         assert_eq!(
             result,
             TickGapResult::Ok,
@@ -1799,7 +1829,7 @@ mod tests {
         let now: u64 = 1_776_000_000;
         let base_ts = now as u32;
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick_with_now_ist(1001, base_ts + i, now);
+            tracker.record_tick_with_now_ist(1001, 0, base_ts + i, now);
         }
         // Age exactly == THRESHOLD. Not filtered (filter uses `>`).
         let boundary_age: u64 = u64::from(BACKLOG_TICK_AGE_THRESHOLD_SECS);
@@ -1808,13 +1838,13 @@ mod tests {
         // state (last was ~base_ts + 5), which saturating_sub resolves
         // to 0 — hence Ok. The point of this test is just to prove
         // the filter did NOT short-circuit at the boundary.
-        let _ = tracker.record_tick_with_now_ist(1001, boundary_ts, now);
+        let _ = tracker.record_tick_with_now_ist(1001, 0, boundary_ts, now);
         // If the filter had incorrectly caught this tick, total_errors
         // would stay 0, same as the backlog case. To distinguish, we
         // drive a real gap from the boundary tick forward.
         let live_follow_up = boundary_ts + TICK_GAP_ERROR_THRESHOLD_SECS + 10;
         let follow_up_result =
-            tracker.record_tick_with_now_ist(1001, live_follow_up, u64::from(live_follow_up));
+            tracker.record_tick_with_now_ist(1001, 0, live_follow_up, u64::from(live_follow_up));
         assert!(
             matches!(follow_up_result, TickGapResult::Error { .. }),
             "gap from non-filtered boundary tick must fire ERROR (got {follow_up_result:?})"
@@ -1834,11 +1864,11 @@ mod tests {
         let now_realistic: u64 = u64::from(ancient_base)
             .saturating_add(u64::from(BACKLOG_TICK_AGE_MAX_SECS).saturating_mul(2));
         for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
-            tracker.record_tick_with_now_ist(1001, ancient_base + i, now_realistic);
+            tracker.record_tick_with_now_ist(1001, 0, ancient_base + i, now_realistic);
         }
         let gap_ts =
             ancient_base + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
-        let result = tracker.record_tick_with_now_ist(1001, gap_ts, now_realistic);
+        let result = tracker.record_tick_with_now_ist(1001, 0, gap_ts, now_realistic);
         assert!(
             matches!(result, TickGapResult::Error { .. }),
             "absurdly-old stub timestamps must bypass the backlog filter (got {result:?})"
@@ -1869,7 +1899,7 @@ mod tests {
         // fast; the production cap is asserted separately below.
         let cap = TickGapTracker::MAX_TRACKED_INSTRUMENTS;
         for sid in 0..8_u64 {
-            let _ = t.record_tick(sid, base);
+            let _ = t.record_tick(sid, 0, base);
         }
         let tracked_before = t.states.len();
         assert_eq!(tracked_before, 8, "all 8 fit well under the cap");
@@ -1881,7 +1911,7 @@ mod tests {
         while t.states.len() < cap {
             let next = t.states.len() as u64 + 1_000_000;
             t.states.insert(
-                next,
+                (next, 0),
                 SecurityFeedState {
                     last_exchange_timestamp: base,
                     tick_count: 1,
@@ -1893,15 +1923,15 @@ mod tests {
         }
         let at_cap = t.states.len();
         // A brand-new instrument must be REFUSED.
-        let _ = t.record_tick(9_999_999, base);
+        let _ = t.record_tick(9_999_999, 0, base);
         assert_eq!(t.states.len(), at_cap, "must not grow past the cap");
         assert_eq!(t.refused_instruments(), 1, "the refusal must be counted");
 
         // An ALREADY-TRACKED instrument must still work — the cap refuses new
         // instruments, it does not stop tracking the ones already known.
-        let before = t.states.get(&0).map(|s| s.tick_count).unwrap_or(0);
-        let _ = t.record_tick(0, base + 1);
-        let after = t.states.get(&0).map(|s| s.tick_count).unwrap_or(0);
+        let before = t.states.get(&(0, 0)).map(|s| s.tick_count).unwrap_or(0);
+        let _ = t.record_tick(0, 0, base + 1);
+        let after = t.states.get(&(0, 0)).map(|s| s.tick_count).unwrap_or(0);
         assert!(
             after > before,
             "a tracked instrument must keep being tracked"
@@ -1910,6 +1940,48 @@ mod tests {
             t.refused_instruments(),
             1,
             "a tracked tick is not a refusal"
+        );
+    }
+    #[test]
+    fn same_id_different_segments_do_not_mask_each_others_gaps() {
+        // I-P1-11, the real-world case: Dhan reused id 27 as BOTH a FINNIFTY
+        // index value (IDX_I) and an NSE_EQ instrument on 2026-04-17.
+        //
+        // Keyed on the id alone, these two share ONE gap state. The busy one's
+        // ticks keep resetting the timer, so a genuine silence on the quiet one
+        // is masked and never reported — the detector silently under-reports
+        // exactly what it exists to find. Keyed on the composite, they are
+        // independent.
+        let mut t = TickGapTracker::new(8);
+        const IDX_I: u8 = 0;
+        const NSE_EQ: u8 = 1;
+        let base: u32 = 34_200;
+
+        // Both instruments tick once.
+        let _ = t.record_tick(27, IDX_I, base);
+        let _ = t.record_tick(27, NSE_EQ, base);
+        assert_eq!(
+            t.states.len(),
+            2,
+            "same id in two segments must be TWO tracked instruments, not one"
+        );
+
+        // The equity keeps ticking; the index goes quiet.
+        for i in 1..10_u32 {
+            let _ = t.record_tick(27, NSE_EQ, base + i);
+        }
+
+        let idx = t.states.get(&(27, IDX_I)).expect("index still tracked");
+        let eq = t.states.get(&(27, NSE_EQ)).expect("equity still tracked");
+        assert_eq!(idx.tick_count, 1, "the quiet index must NOT inherit ticks");
+        assert!(
+            eq.tick_count > idx.tick_count,
+            "the busy equity's activity must not be credited to the index"
+        );
+        assert_eq!(
+            idx.last_exchange_timestamp, base,
+            "the index's last-seen stamp must be its OWN, not the equity's — \
+             this is precisely the masking a shared key produced"
         );
     }
 }
