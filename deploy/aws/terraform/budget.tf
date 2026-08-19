@@ -116,9 +116,37 @@ resource "aws_budgets_budget" "tv_monthly" {
   #   the kill switch works AT ALL is Unknown. Raising a ceiling does not repair a
   #   broken action. This needs a live check with budget-action read access before the
   #   safety net can be claimed to function.
-  # KEEP IN 3-WAY LOCKSTEP: budget-guards.tf BUDGET_KILL_USD + budget_digest.rs
-  #   BUDGET_USD (and its tests' "$100" assertions).
-  limit_amount      = "100"
+  # 2026-08-19 OPERATOR RULING (Quote 17) — LIMIT RAISED $100 -> $130.
+  # Operator verbatim (typed directly in-session, typos preserved):
+  #   "sow hatevr is eneded raise the ceiling dude okay? just raise whatevr yous aid
+  #    and reocmemnded raise it accoridnly diue okay?"
+  # Why: the root gp3 volume's IOPS 3000 -> 6000 and throughput 125 -> 500 MiB/s
+  #   (variables.tf, same change) cost $15.00 + $15.00 = $30.00/mo, so the bill's
+  #   HIGH estimate moves $82.72 -> $112.72. The budget's AUTOMATIC action is
+  #   STOP_EC2_INSTANCES at 90% and 100% of THIS limit, so leaving it at $100 would
+  #   put the 90% line at $90 — BELOW the new bill — and the safety net would switch
+  #   the trading box off mid-session. That is the 2026-07-31 failure mode, caused by
+  #   the guard rather than the spend.
+  # THE MARGIN IS THINNER THAN THE ONE THIS CHANGE FIXES, and that is stated rather
+  #   than glossed: $130 x 0.90 = $117.00 against a $112.72 high estimate leaves
+  #   $4.28 of room, where the raise this change was called in to make was worth
+  #   $7.28. So the next cost increase of ANY size must raise this ceiling in the
+  #   same change; there is no longer room to defer that to a follow-up.
+  # The sub-₹1,000/mo TARGET is now breached ~10x (was ~7x) and the downward ratchet
+  #   ladder stays PAUSED — recorded honestly, not silently dropped.
+  # The FLAGGED, UNRESOLVED item above still stands and is NOT fixed by this raise:
+  #   if both actions are still in EXECUTION_FAILURE then the kill switch does not
+  #   fire at all, in which case this raise protects against a stop that cannot
+  #   happen — safer short-term, worse long-term. Still needs an identity with
+  #   budgets:DescribeBudgetActionsForBudget.
+  # KEEP IN 4-WAY LOCKSTEP (the header of
+  #   crates/aws-lambdas/tests/budget_ceiling_lockstep_guard.rs is authoritative;
+  #   this comment previously said 3-way and undercounted site 4):
+  #     1. THIS FILE          limit_amount                  (the REAL AWS ceiling)
+  #     2. budget-guards.tf   BUDGET_KILL_USD               (injected into the guard Lambda)
+  #     3. budget_digest.rs   BUDGET_USD                    (the "% of stop-budget" the operator reads)
+  #     4. hard_stop_guard.rs DEFAULT_BUDGET_KILL_USD       (env-missing FALLBACK; must be >= this)
+  limit_amount      = "130"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

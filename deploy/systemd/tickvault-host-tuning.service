@@ -38,6 +38,18 @@ RemainAfterExit=yes
 # Runs as ROOT, unlike tickvault-holiday-gate.service: writing /etc/sysctl.d,
 # calling `sysctl --system`, and writing /sys/kernel/mm/transparent_hugepage
 # all require privilege. This is the narrowest thing on the box that needs it.
+# Optional operator override file — the rollback surface for everything this
+# unit applies, without a code change or a redeploy. The leading `-` means "use
+# it if it exists", so a box without one behaves exactly as before.
+#
+#   /etc/tickvault/host-tuning.env
+#     TV_IRQ_STEER=off     # leave NIC interrupts to the kernel / irqbalance
+#     TV_IRQ_CPU=0         # which core the NIC interrupts are pinned to
+#
+# Then: `systemctl restart tickvault-host-tuning` (and re-enable irqbalance if
+# it was stopped: `systemctl enable --now irqbalance`).
+EnvironmentFile=-/etc/tickvault/host-tuning.env
+
 WorkingDirectory=/opt/tickvault
 
 # 1. Re-install the sysctl file from the repo, so a deploy that changes tuning

@@ -2960,7 +2960,29 @@ fn drain_depth_frame(
                 quantity: i64::from(level.quantity),
                 orders: i64::from(level.orders),
                 capture_seq,
-                ts_nanos: received_at_nanos,
+                // 2026-08-19 — IST, not UTC. Operator: "why the market depth ts
+                // has utc time it should be the precise ist".
+                //
+                // He is right, and depth was the ONLY table getting this
+                // wrong. `received_at_nanos` is deliberately TRUE UTC —
+                // `ws_lag_ms` converts the vendor's IST exchange stamp back to
+                // UTC to difference against it, so that value must NOT be
+                // shifted at its source. Every table that PERSISTS a
+                // wall-clock instant adds the offset at its own stamping site
+                // (`tick_persistence` does exactly this for
+                // `received_at_ist_nanos`, as does `partition_archive`).
+                // Depth skipped that step and wrote raw UTC into a column
+                // every sibling table stores as IST.
+                //
+                // Two real consequences, not cosmetics: depth rows read 5h30m
+                // behind every other table in the console, so any join or
+                // eyeball comparison against ticks silently misaligns; and
+                // because `ts` is the DESIGNATED timestamp, rows between 18:30
+                // and 23:59 IST were partitioned into the PREVIOUS day —
+                // which is also the day the archival and retention paths key
+                // on.
+                ts_nanos: received_at_nanos
+                    .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
             };
             if depth.writer.append_row(&row).is_ok() {
                 out.rows = out.rows.saturating_add(1);

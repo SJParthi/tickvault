@@ -150,7 +150,15 @@ fn ceiling_brackets_the_recorded_bill_high_estimate() {
         &read(&root.join("deploy/aws/terraform/budget.tf")),
         "limit_amount",
     );
-    const BILL_HIGH_USD: f64 = 73.60;
+    // 2026-08-19 (operator Quote 17): the gp3 IOPS 3000->6000 + throughput
+    // 125->500 raise adds $30.00/mo, moving the recorded high estimate
+    // $82.72 -> $112.72 (daily-universe-scope-expansion-2026-05-27.md §0
+    // Quote 17). Leaving this at the stale $73.60 would have let the guard
+    // pass vacuously: 100 * 0.90 = $90 still "clears" $73.60 while sitting
+    // BELOW the real bill, which is precisely the mid-session stop this test
+    // exists to prevent. The number must track the recorded bill or the test
+    // guards nothing.
+    const BILL_HIGH_USD: f64 = 112.72;
     let ninety_pct = tf_limit * 0.90;
     assert!(
         ninety_pct > BILL_HIGH_USD,

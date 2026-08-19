@@ -81,7 +81,8 @@ use super::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, PoolBudget, PoolBudgetRefusal,
 };
 use super::reconnect_ladder::{
-    reconnect_delay_ms, reconnect_delay_with_jitter_ms, reconnect_jitter_ms,
+    FLAP_DAMPED_METRIC, FLAP_WINDOW_MS, FlapVerdict, ReconnectDecision, damped_reconnect_delay,
+    damped_reconnect_delay_with_jitter, reconnect_jitter_ms,
 };
 use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 
@@ -108,6 +109,16 @@ pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Counter: connection dropped and is being re-dialed. Labels: `endpoint`, `reason`.
 pub const RECONNECT_METRIC: &str = "tv_dhan_ws_reconnect_total";
+
+/// Ring capacity for the per-socket re-dial timestamps the flap damper counts.
+///
+/// Fixed-size and inline: the damper runs on the disconnect path of a socket
+/// that may be flapping thousands of times an hour, so it must not allocate.
+/// Eight is comfortably above `FLAP_REDIAL_CEILING` (3) — the count only ever
+/// needs to distinguish "below the ceiling" from "at or above it", so the ring
+/// saturating at eight loses nothing, while the extra headroom keeps the count
+/// honest if the ceiling is ever raised.
+pub const FLAP_HISTORY_SLOTS: usize = 8;
 
 /// Counter: connection parked permanently. Labels: `endpoint`, `reason`.
 pub const PARK_METRIC: &str = "tv_dhan_ws_park_total";
@@ -374,6 +385,23 @@ pub struct ConnectionSupervisor {
     /// anything is not healthy — resetting on dial would let such a socket
     /// re-dial instantly forever.
     proven_healthy: bool,
+    /// When the CURRENT socket delivered its FIRST frame. `None` until it does,
+    /// and cleared on every dial.
+    ///
+    /// This is the flap damper's health clock. `proven_healthy` above answers
+    /// "did a frame ever arrive on this socket", which a connection that dies
+    /// one millisecond after its prev-close packet satisfies — and that
+    /// connection then re-dialled instantly, forever. `healthy_since` answers
+    /// the question that actually matters: *for how long* did it carry frames.
+    healthy_since: Option<Instant>,
+    /// Monotonic timestamps of recent re-dials, newest overwriting oldest.
+    ///
+    /// A fixed inline array, never a `Vec`: this is written on the disconnect
+    /// path of a socket that may be flapping, and an allocation there is
+    /// exactly what THE ONE RULE forbids.
+    redial_history: [Option<Instant>; FLAP_HISTORY_SLOTS],
+    /// Next write position in [`Self::redial_history`].
+    redial_cursor: usize,
     frames: u64,
     reconnects: u64,
     /// Set exactly once, when the supervisor parks. Retained so the shell can
@@ -392,6 +420,9 @@ impl ConnectionSupervisor {
             attempt: 0,
             watchdog: IdleWatchdog::new(now),
             proven_healthy: false,
+            healthy_since: None,
+            redial_history: [None; FLAP_HISTORY_SLOTS],
+            redial_cursor: 0,
             frames: 0,
             reconnects: 0,
             park_reason: None,
@@ -460,6 +491,7 @@ impl ConnectionSupervisor {
             ConnEvent::BeginDial => {
                 self.phase = ConnPhase::Dialing;
                 self.proven_healthy = false;
+                self.healthy_since = None;
                 // Reset here, not on dial completion: the watchdog must also
                 // cover a dial that hangs forever without ever completing.
                 self.watchdog.record_activity(now);
@@ -499,6 +531,13 @@ impl ConnectionSupervisor {
                 if !self.proven_healthy {
                     self.proven_healthy = true;
                     self.attempt = 0;
+                    // Start the health clock at the FIRST frame. The attempt
+                    // reset above is retained for compatibility with the
+                    // ladder's own semantics, but it no longer implies an
+                    // instant re-dial on its own: the damper reads this
+                    // timestamp and withholds rung 0 until the socket has
+                    // actually carried frames for MIN_HEALTHY_SESSION_MS.
+                    self.healthy_since = Some(now);
                 }
                 // A frame can legitimately arrive before our own subscribe ack
                 // (the prev-close packet is pushed on subscribe). Treat it as
@@ -572,15 +611,26 @@ impl ConnectionSupervisor {
                         //
                         // Flooring the base first keeps the "wait at least
                         // 5 s" intent and restores the fan-out on top of it.
-                        let base = self.next_ladder_delay_ms().max(TOKEN_STALE_REDIAL_FLOOR_MS);
+                        //
+                        // 2026-08-19: the base is now the DAMPED ladder value
+                        // rather than the raw rung, so a socket flapping on a
+                        // token that keeps going stale is slowed by the same
+                        // ceiling as any other flapper. The floor-then-jitter
+                        // ordering is unchanged.
+                        let damped = self.damped_decision_without_jitter(now);
+                        let base = damped.delay_ms.max(TOKEN_STALE_REDIAL_FLOOR_MS);
                         let delay = base.saturating_add(self.jitter_ms());
-                        self.enter_backoff(ReconnectReason::TokenStale);
+                        self.enter_backoff(ReconnectReason::TokenStale, damped.verdict, now);
                         SupervisorAction::RefreshTokenThenDial { delay_ms: delay }
                     }
                     DisconnectClass::Transient => {
-                        let delay = self.next_delay_ms();
-                        self.enter_backoff(ReconnectReason::Disconnected);
-                        SupervisorAction::SleepThenDial { delay_ms: delay }
+                        // THE CASCADE ARM. `connection.rs` reports a bare TCP
+                        // reset as `Closed { code: None }`, which classifies
+                        // here — so this is the arm an 805-delivered-as-RST
+                        // lands in, and before the damper it re-dialled on
+                        // ladder rung 0 (`0ms`), evicting a healthy sibling
+                        // per Dhan's oldest-socket-dies semantics.
+                        self.schedule_redial(ReconnectReason::Disconnected, now)
                     }
                 }
             }
@@ -599,9 +649,7 @@ impl ConnectionSupervisor {
                     "socket silent past the idle threshold — reconnecting on our terms before \
                      Dhan closes it at 40s"
                 );
-                let delay = self.next_delay_ms();
-                self.enter_backoff(ReconnectReason::IdleSilence);
-                SupervisorAction::SleepThenDial { delay_ms: delay }
+                self.schedule_redial(ReconnectReason::IdleSilence, now)
             }
         }
     }
@@ -616,19 +664,71 @@ impl ConnectionSupervisor {
         self.on_event(ConnEvent::IdleElapsed, now)
     }
 
-    /// Ladder delay for the next attempt, including this connection's fixed
-    /// per-slot stagger. Does NOT mutate.
-    fn next_delay_ms(&self) -> u64 {
-        reconnect_delay_with_jitter_ms(self.attempt, self.slot.global_index)
+    /// How long the CURRENT socket has been delivering frames, in
+    /// milliseconds. Zero if it has delivered none.
+    ///
+    /// Saturating: a non-monotonic `now` (impossible with `Instant`, but the
+    /// function stays total anyway) yields 0, which is the fail-safe direction
+    /// — it makes the socket look UNhealthy and earns backoff rather than an
+    /// instant re-dial.
+    fn healthy_duration_ms(&self, now: Instant) -> u64 {
+        match self.healthy_since {
+            Some(since) => {
+                u64::try_from(now.saturating_duration_since(since).as_millis()).unwrap_or(u64::MAX)
+            }
+            None => 0,
+        }
     }
 
-    /// The ladder delay for this attempt WITHOUT this socket's stagger.
+    /// Re-dials by THIS socket inside [`FLAP_WINDOW_MS`], counting only
+    /// re-dials that already happened — the one being decided right now is
+    /// recorded afterwards, so it never counts itself.
+    ///
+    /// O([`FLAP_HISTORY_SLOTS`]) = O(1) with a fixed bound of eight, zero
+    /// allocation, monotonic clock only.
+    fn recent_redial_count(&self, now: Instant) -> u32 {
+        let window = Duration::from_millis(FLAP_WINDOW_MS);
+        let mut count: u32 = 0;
+        for stamp in &self.redial_history {
+            if let Some(at) = stamp
+                && now.saturating_duration_since(*at) <= window
+            {
+                count = count.saturating_add(1);
+            }
+        }
+        count
+    }
+
+    /// Records that a re-dial happened at `now`, oldest entry overwritten.
+    fn record_redial(&mut self, now: Instant) {
+        if let Some(slot) = self.redial_history.get_mut(self.redial_cursor) {
+            *slot = Some(now);
+        }
+        self.redial_cursor = (self.redial_cursor + 1) % FLAP_HISTORY_SLOTS;
+    }
+
+    /// The flap-damped delay for the next attempt, including this connection's
+    /// fixed per-slot stagger. Does NOT mutate.
+    fn damped_decision(&self, now: Instant) -> ReconnectDecision {
+        damped_reconnect_delay_with_jitter(
+            self.attempt,
+            self.healthy_duration_ms(now),
+            self.recent_redial_count(now),
+            self.slot.global_index,
+        )
+    }
+
+    /// The same decision WITHOUT this socket's stagger.
     ///
     /// Split out so a caller that needs to raise the floor can floor the
-    /// ladder and then add the stagger, rather than flooring the sum and
-    /// throwing the stagger away — see the `TokenStale` arm.
-    fn next_ladder_delay_ms(&self) -> u64 {
-        reconnect_delay_ms(self.attempt)
+    /// damped ladder and then add the stagger, rather than flooring the sum
+    /// and throwing the stagger away — see the `TokenStale` arm.
+    fn damped_decision_without_jitter(&self, now: Instant) -> ReconnectDecision {
+        damped_reconnect_delay(
+            self.attempt,
+            self.healthy_duration_ms(now),
+            self.recent_redial_count(now),
+        )
     }
 
     /// This socket's fixed fan-out offset. Index 0 always gets zero, so one
@@ -639,22 +739,38 @@ impl ConnectionSupervisor {
 
     /// Common tail for every retryable failure: compute the delay, count it,
     /// advance the ladder, drop into backoff.
-    fn schedule_redial(&mut self, reason: ReconnectReason, _now: Instant) -> SupervisorAction {
-        let delay = self.next_delay_ms();
-        self.enter_backoff(reason);
-        SupervisorAction::SleepThenDial { delay_ms: delay }
+    fn schedule_redial(&mut self, reason: ReconnectReason, now: Instant) -> SupervisorAction {
+        let decision = self.damped_decision(now);
+        self.enter_backoff(reason, decision.verdict, now);
+        SupervisorAction::SleepThenDial {
+            delay_ms: decision.delay_ms,
+        }
     }
 
-    fn enter_backoff(&mut self, reason: ReconnectReason) {
+    fn enter_backoff(&mut self, reason: ReconnectReason, verdict: FlapVerdict, now: Instant) {
         self.attempt = self.attempt.saturating_add(1);
         self.phase = ConnPhase::Backoff;
         self.proven_healthy = false;
+        self.healthy_since = None;
+        self.record_redial(now);
         metrics::counter!(
             RECONNECT_METRIC,
             "endpoint" => self.slot.endpoint.as_str(),
             "reason" => reason.as_str(),
         )
         .increment(1);
+        // The damper must never act in silence. A socket held at 30s while the
+        // operator believes the ladder is running is the false-OK class the
+        // house rules forbid, so every re-dial the damper actually slowed down
+        // is counted under the reason that provoked it.
+        if verdict.is_damped() {
+            metrics::counter!(
+                FLAP_DAMPED_METRIC,
+                "endpoint" => self.slot.endpoint.as_str(),
+                "verdict" => verdict.as_str(),
+            )
+            .increment(1);
+        }
     }
 
     fn park(&mut self, reason: ParkReason) -> SupervisorAction {
@@ -1264,6 +1380,20 @@ impl PoolSupervisor {
                 )
                 .increment(0);
             }
+            // Same baseline discipline for the flap damper. Only the verdicts
+            // that are actually EMITTED are registered — pre-registering
+            // `ladder` would publish a series that can never move, which is a
+            // different flavour of the same lie.
+            for verdict in FlapVerdict::ALL {
+                if verdict.is_damped() {
+                    metrics::counter!(
+                        FLAP_DAMPED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "verdict" => verdict.as_str(),
+                    )
+                    .increment(0);
+                }
+            }
         }
         Self {
             budget: PoolBudget::new(),
@@ -1661,7 +1791,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::super::reconnect_ladder::{
-        RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS, reconnect_delay_ms,
+        FLAP_CEILING_REDIAL_FLOOR_MS, FLAP_REDIAL_CEILING, MIN_HEALTHY_SESSION_MS,
+        RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS,
+        SHORT_SESSION_REDIAL_FLOOR_MS, reconnect_delay_ms,
     };
 
     #[test]
@@ -1881,12 +2013,20 @@ mod tests {
         );
         assert_eq!(s.phase(), ConnPhase::Dialing);
 
-        // First failure re-dials at the ladder's instant rung. global_index 0
-        // takes zero stagger, so at least one connection keeps the exact
-        // historical "instant first attempt" behaviour.
+        // A socket that has NEVER delivered a frame does NOT get the instant
+        // rung — the flap damper withholds it and applies
+        // SHORT_SESSION_REDIAL_FLOOR_MS instead. Before 2026-08-19 this
+        // asserted 0ms, and that 0ms is the cascade: a bare TCP reset arrives
+        // as `Closed { code: None }`, classifies Transient, and re-dialled
+        // instantly — evicting a healthy sibling under Dhan's 805
+        // oldest-socket-dies semantics. The instant rung is not gone; it is
+        // earned, and `..._instant_retry_survives_a_genuinely_healthy_session`
+        // below proves it still happens for the case it exists for.
         assert_eq!(
             s.on_event(ConnEvent::DialFailed, now),
-            SupervisorAction::SleepThenDial { delay_ms: 0 }
+            SupervisorAction::SleepThenDial {
+                delay_ms: SHORT_SESSION_REDIAL_FLOOR_MS
+            }
         );
         assert_eq!(s.phase(), ConnPhase::Backoff);
         assert_eq!(s.attempt(), 1);
@@ -1904,8 +2044,275 @@ mod tests {
                 other => panic!("expected SleepThenDial, got {other:?}"),
             }
         }
-        // Slot 0 has zero jitter, so these are the bare ladder rungs.
-        assert_eq!(seen, vec![0, 1_000, 2_000, 5_000, 15_000, 30_000, 30_000]);
+        // Slot 0 has zero jitter, so these are the bare ladder rungs — EXCEPT
+        // rung 0, which the flap damper floors because this socket has never
+        // delivered a frame (see the test above). Every later rung is the raw
+        // ladder, unchanged.
+        //
+        // That the ladder survives intact here is the whole reason
+        // FLAP_REDIAL_CEILING is 6 rather than 3: a ceiling of 3 would have
+        // clamped attempts 3+ to the 30s cap, swallowing the 5s and 15s rungs
+        // and turning a ten-second Dhan blip into a ~30s blind window on a
+        // feed with no snapshot-on-subscribe. The damper must not make the
+        // most common failure worse.
+        assert_eq!(
+            seen,
+            vec![
+                SHORT_SESSION_REDIAL_FLOOR_MS,
+                1_000,
+                2_000,
+                5_000,
+                15_000,
+                30_000,
+                30_000
+            ]
+        );
+    }
+
+    // -- flap damper (the RST-cascade fix, 2026-08-19) ----------------------
+
+    /// Drives one full connect -> frame -> disconnect cycle and returns the
+    /// re-dial delay the supervisor chose.
+    ///
+    /// `live_for` is how long the socket carries frames before it drops, which
+    /// is the input the damper actually judges. Returns `(delay_ms, now)` so
+    /// the caller can chain cycles on a single advancing clock.
+    fn one_session(
+        s: &mut ConnectionSupervisor,
+        now: Instant,
+        live_for: Duration,
+    ) -> (u64, Instant) {
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+        let dropped_at = now + live_for;
+        match s.on_event(ConnEvent::Disconnected { code: None }, dropped_at) {
+            SupervisorAction::SleepThenDial { delay_ms } => (delay_ms, dropped_at),
+            other => panic!("expected SleepThenDial, got {other:?}"),
+        }
+    }
+
+    /// The instant rung must SURVIVE for the case it exists for: a clean,
+    /// isolated drop after a genuinely healthy session. This is the latency
+    /// win the damper is not allowed to cost us.
+    #[test]
+    fn test_supervisor_instant_retry_survives_a_genuinely_healthy_session() {
+        let now = t0();
+        // Slot 0 of the main feed carries zero stagger, so any non-zero result
+        // here is the damper and nothing else.
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+
+        let live_for = Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1_000);
+        let (delay, _) = one_session(&mut s, now, live_for);
+
+        assert_eq!(
+            delay,
+            0,
+            "a socket that carried frames for {}ms then took ONE isolated drop must keep the \
+             instant first retry — the damper exists to withhold it from sockets that never \
+             earned it, not to remove it",
+            MIN_HEALTHY_SESSION_MS + 1_000
+        );
+    }
+
+    /// THE SECOND DEFECT (HIGH). The first `FrameReceived` sets
+    /// `proven_healthy` and resets `attempt` to 0, and the `Disconnected` arm
+    /// reads the CURRENT attempt before `enter_backoff` increments it — so a
+    /// socket that yields exactly one frame then drops re-dialled at 0ms,
+    /// forever, with no flap-rate ceiling at all.
+    #[test]
+    fn test_supervisor_one_frame_connection_never_re_dials_instantly() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+
+        // One frame, then gone 40ms later. Ten cycles in a row.
+        let mut clock = now;
+        for cycle in 0..10 {
+            let (delay, after) = one_session(&mut s, clock, Duration::from_millis(40));
+            assert!(
+                delay > 0,
+                "cycle {cycle}: a one-frame socket re-dialled instantly ({delay}ms) — this is \
+                 the unbounded flap the damper exists to stop"
+            );
+            assert!(
+                delay >= SHORT_SESSION_REDIAL_FLOOR_MS,
+                "cycle {cycle}: delay {delay}ms is below the short-session floor"
+            );
+            clock = after + Duration::from_millis(delay);
+        }
+    }
+
+    /// THE FIRST DEFECT (CRITICAL). A bare TCP reset arrives as
+    /// `Closed { code: None }` and classifies `Transient`. On a socket that
+    /// never delivered a frame that used to be an instant re-dial — which,
+    /// under Dhan's 805 oldest-socket-dies semantics, evicts a healthy sibling
+    /// and starts a self-sustaining cascade across the sixteen sockets.
+    #[test]
+    fn test_supervisor_bare_reset_on_an_unproven_socket_does_not_re_dial_instantly() {
+        let now = t0();
+        for pool_index in 0..5_u8 {
+            let mut s = sup(DhanEndpointType::MainFeed, pool_index, now);
+            let _ = s.on_event(ConnEvent::BeginDial, now);
+            let _ = s.on_event(ConnEvent::DialSucceeded, now);
+            // No frame ever arrives — the socket is RST'd during subscribe.
+            match s.on_event(ConnEvent::Disconnected { code: None }, now) {
+                SupervisorAction::SleepThenDial { delay_ms } => assert!(
+                    delay_ms >= SHORT_SESSION_REDIAL_FLOOR_MS,
+                    "pool_index {pool_index}: bare RST re-dialled in {delay_ms}ms"
+                ),
+                other => panic!("expected SleepThenDial, got {other:?}"),
+            }
+        }
+    }
+
+    /// The flap CEILING: a socket can look healthy on every single session and
+    /// still be flapping. Health alone cannot see that; the rate ceiling can.
+    #[test]
+    fn test_supervisor_flap_ceiling_forces_backoff_on_a_socket_that_looks_healthy() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+
+        // Each session is comfortably "healthy" by the duration test, and the
+        // whole run stays inside one flap window.
+        let live_for = Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1_000);
+        let mut clock = now;
+        let mut delays = Vec::new();
+        for _ in 0..=FLAP_REDIAL_CEILING {
+            let (delay, after) = one_session(&mut s, clock, live_for);
+            delays.push(delay);
+            clock = after;
+        }
+
+        let ceiling = usize::try_from(FLAP_REDIAL_CEILING).unwrap_or(usize::MAX);
+        for (i, delay) in delays.iter().take(ceiling).enumerate() {
+            assert_eq!(
+                *delay, 0,
+                "re-dial {i} is below the ceiling and each session looked healthy, so the \
+                 instant rung is still correct"
+            );
+        }
+        assert_eq!(
+            delays.get(ceiling).copied(),
+            Some(FLAP_CEILING_REDIAL_FLOOR_MS),
+            "re-dial {ceiling} crossed FLAP_REDIAL_CEILING inside FLAP_WINDOW_MS and MUST be \
+             forced onto backoff regardless of how healthy each session looked"
+        );
+        // And the clamp is sticky while the window still holds the history.
+        let (next, _) = one_session(&mut s, clock, live_for);
+        assert_eq!(next, FLAP_CEILING_REDIAL_FLOOR_MS);
+    }
+
+    /// The ceiling must RELEASE. A socket that recovers should not be punished
+    /// for the rest of the trading day — that is why the window is rolling.
+    #[test]
+    fn test_supervisor_flap_ceiling_releases_once_the_window_has_passed() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let live_for = Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1_000);
+
+        let mut clock = now;
+        for _ in 0..=FLAP_REDIAL_CEILING {
+            let (_, after) = one_session(&mut s, clock, live_for);
+            clock = after;
+        }
+        // Confirm we really are clamped before testing the release.
+        assert_eq!(s.recent_redial_count(clock), FLAP_REDIAL_CEILING + 1);
+
+        // Walk the clock past the whole window with no further re-dials.
+        let released = clock + Duration::from_millis(FLAP_WINDOW_MS + 1_000);
+        assert_eq!(
+            s.recent_redial_count(released),
+            0,
+            "every recorded re-dial has aged out of the rolling window"
+        );
+        let (delay, _) = one_session(&mut s, released, live_for);
+        assert_eq!(
+            delay, 0,
+            "a recovered socket gets its instant retry back once the window has passed"
+        );
+    }
+
+    /// The damper must never act in silence. `enter_backoff` counts exactly
+    /// the verdicts that `is_damped()` reports, so this pins the value that
+    /// drives `FLAP_DAMPED_METRIC` against the delay actually chosen — a
+    /// damped delay with an undamped verdict would be an uncounted action.
+    #[test]
+    fn test_supervisor_damped_redials_are_the_ones_reported_as_damped() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        // Slot 0 has zero stagger, so raw == damped whenever the verdict is
+        // Ladder and raw < damped exactly when it is not.
+        let raw = reconnect_delay_ms(s.attempt());
+
+        // Unproven socket -> damped, and the delay really did move.
+        let decision = s.damped_decision(now);
+        assert!(
+            decision.verdict.is_damped(),
+            "an unproven socket must be reported as damped"
+        );
+        assert!(
+            decision.delay_ms > raw,
+            "reported damped but the delay did not change"
+        );
+        assert_eq!(decision.verdict.as_str(), "short_session");
+
+        // Healthy socket -> undamped, and the delay is untouched.
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+        let healthy_at = now + Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1);
+        let decision = s.damped_decision(healthy_at);
+        assert!(!decision.verdict.is_damped());
+        assert_eq!(decision.delay_ms, reconnect_delay_ms(s.attempt()));
+    }
+
+    /// The health clock is per-SOCKET, not per-process: a dial wipes it, so a
+    /// previous session's health can never vouch for the next connection.
+    #[test]
+    fn test_supervisor_health_clock_resets_on_every_dial() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+
+        let much_later = now + Duration::from_millis(MIN_HEALTHY_SESSION_MS * 10);
+        assert!(s.healthy_duration_ms(much_later) >= MIN_HEALTHY_SESSION_MS);
+
+        // A fresh dial starts a NEW socket, which has proved nothing yet.
+        let _ = s.on_event(ConnEvent::BeginDial, much_later);
+        assert_eq!(
+            s.healthy_duration_ms(much_later + Duration::from_secs(1)),
+            0,
+            "the new socket must not inherit the old socket's health"
+        );
+    }
+
+    /// The re-dial history is a fixed inline ring — it must never allocate and
+    /// must stay accurate across wraparound.
+    #[test]
+    fn test_supervisor_recent_redial_count_wraps_without_losing_the_window() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        assert_eq!(s.recent_redial_count(now), 0);
+
+        // Overfill the ring; the count saturates at its capacity, which is all
+        // it ever needs to distinguish (it is only compared to the ceiling).
+        for i in 0..(FLAP_HISTORY_SLOTS * 3) {
+            s.record_redial(now + Duration::from_millis(i as u64));
+        }
+        let count = s.recent_redial_count(now + Duration::from_secs(1));
+        assert_eq!(count as usize, FLAP_HISTORY_SLOTS);
+        assert!(
+            count >= FLAP_REDIAL_CEILING,
+            "the ring must hold enough history to reach the ceiling"
+        );
+
+        // Everything ages out together once the window passes.
+        assert_eq!(
+            s.recent_redial_count(now + Duration::from_millis(FLAP_WINDOW_MS + 1_000)),
+            0
+        );
     }
 
     #[test]

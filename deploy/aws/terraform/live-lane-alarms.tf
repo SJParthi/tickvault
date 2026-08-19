@@ -406,3 +406,69 @@ resource "aws_cloudwatch_metric_alarm" "dhan_wal_dropped" {
   # recovery of data that does not exist.
   ok_actions = []
 }
+
+# ---------------------------------------------------------------------------
+# 10. TICKS LOST AT THE SPILL WRITER — the loss counter of LAST RESORT
+#     (2026-08-19, operator Quote 17: "no ticks loss ... needs to be
+#     fuckign preicse")
+# ---------------------------------------------------------------------------
+# Alarm 3 watches loss BETWEEN the write-ahead log and QuestDB (bytes still on
+# disk). Alarm 9 watches loss BEFORE the log at the ring sink. THIS one watches
+# the last remaining unwatched arm of the same durable floor: `ws_frame_spill`
+# itself shedding a frame because the spill CHANNEL was full, or because the
+# spill WRITER TASK was gone. Both arms are in
+# `crates/storage/src/ws_frame_spill.rs` (`SpillDropCounters`) and both mean
+# the same thing: the bytes were never written anywhere. No replay, no
+# backfill and no cross-verification can recover them.
+#
+# WHY ONE ALARM AND NOT TWO — `tv_ws_frame_spill_drop_critical` IS DELIBERATELY
+# NOT SEPARATELY ALARMED. Verified in source 2026-08-19: `SpillDropCounters`
+# increments `tv_ws_frame_spill_drop_critical{ws_type}` on BOTH drop arms, and
+# `tv_ticks_lost_total{source,ws_type}` on the SAME two arms
+# (source="spill_drop_critical" for the channel-Full arm, source="spill_writer_dead"
+# for the Disconnected arm). They are the identical event counted twice, and
+# `ws_frame_spill.rs` is the ONLY production emitter of either. A second alarm
+# would therefore page twice for one frame — the family-of-pagers-for-one-
+# condition pattern that dhan-rest-only-noise-lock-2026-07-14.md §2.3a argues
+# against, and which trains an operator to ignore both. `tv_ticks_lost_total`
+# is the one kept because it is the workspace's explicit tick-loss SLA name and
+# it carries the `source` label that says WHICH arm shed the frame. It stays on
+# the dashboard, and if a future emit site ever increments
+# `tv_ws_frame_spill_drop_critical` WITHOUT `tv_ticks_lost_total`, this comment
+# is the record that the coverage assumption must be re-checked.
+#
+# EMIT SITE VERIFIED 2026-08-19: crates/storage/src/ws_frame_spill.rs — the
+# handles are pre-registered with `increment(0)` at construction, so the first
+# real increment is never swallowed as the agent's missing baseline sample.
+resource "aws_cloudwatch_metric_alarm" "ticks_lost_spill" {
+  alarm_name        = "tv-${var.environment}-ticks-lost-spill"
+  alarm_description = "Ticks were LOST AT THE SPILL WRITER and are gone for good. tv_ticks_lost_total counts frames the capture-at-receipt spill shed before they reached disk — either the spill channel was full (source=spill_drop_critical) or the spill writer task was dead (source=spill_writer_dead). Nothing downstream can recover them: there is no payload left to replay, no backfill that covers them, and the 15:31 cross-verification cannot see what was never captured. This is the same class as the wal-dropped alarm and is the LAST unwatched arm of the durable floor. WHAT TO DO: (1) check disk first — tv_spill_dir_free_bytes and the WS-SPILL-01 alarm, a full or read-only data volume is the most common cause and it usually fires first; (2) WS-SPILL-02 in /tickvault/<env>/app means the channel was full at the append instant, i.e. the writer could not keep up — check ILP flush latency and QuestDB health, which is what backs the writer up; (3) the coded WS-SPILL lines name the ws_type, so you can tell whether it was the live feed or the order-update socket. Frames lost during the window do NOT come back when the cause clears."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_ticks_lost_total"
+  namespace           = local.app_namespace
+  # Threshold 1 / eval 1, identical to alarms 3 and 9 and for the same reason:
+  # there is no acceptable number of frames that missed the durable floor, and
+  # spending a second window to confirm only loses more of them.
+  period    = 300
+  statistic = "Sum"
+  # `{host}` — the EMF processor folds this metric's source/ws_type labels into
+  # the single declared dimension set. Folding is what this alarm wants: a loss
+  # on ANY arm, on ANY socket type, pages. The labels survive in the coded log
+  # lines, which is where triage reads them.
+  dimensions = local.app_dimensions
+  # notBreaching: the box is stopped outside 08:30-17:30 IST weekdays, so
+  # no-data is the NORMAL overnight state and `breaching` would page every
+  # night. This alarm reports LOSS, never silence — a dead app is the
+  # boot-heartbeat and market-hours-liveness alarms' job, and those two are the
+  # only ones in this repo that may use `breaching`.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. A delta returning to zero means no ADDITIONAL frames were
+  # lost — never that the lost ones came back. An OK page here would be a false
+  # recovery of data that does not exist (Rule 11).
+  ok_actions = []
+}
