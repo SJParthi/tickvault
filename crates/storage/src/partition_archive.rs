@@ -1381,6 +1381,63 @@ impl PartitionArchiver {
             return;
         }
 
+        // 4b. LAST-MOMENT RECOUNT (2026-08-19) — close the write-during-drop
+        //     window.
+        //
+        //     Steps 3 and 5 are not adjacent: the audit flush between them is
+        //     an ILP-over-HTTP ACK, a real network round-trip. A row landing
+        //     in the partition during that gap is in the DROP but not in the
+        //     archive — silent, unrecoverable loss, with nothing anywhere to
+        //     say it happened.
+        //
+        //     This was a theoretical concern while the floor was 2 days: a
+        //     48-hour-old partition has no writer. It became REACHABLE the
+        //     moment the market-data floor dropped to 1 day, because the
+        //     15:31 post-session sweep, WAL-spill replay and the seal-DLQ
+        //     drain all write into YESTERDAY's partition — which is exactly
+        //     what a 1-day window makes eligible.
+        //
+        //     Fail-closed: any change at all means KEEP the partition. The
+        //     export is stale by definition, so re-exporting next run is the
+        //     only correct answer. An UNAVAILABLE recount also refuses — the
+        //     same posture `verify_archive` already takes for a missing
+        //     count, because "I could not check" must never read as "safe".
+        //
+        //     This narrows the window to the single round-trip between this
+        //     check and the DROP statement; it cannot close it entirely
+        //     without a table lock QuestDB does not offer. What it converts
+        //     is the FAILURE MODE: silent loss becomes a counted, coded
+        //     refusal that retries.
+        match self.recount_rows(table, &start, &end).await {
+            Some(rows) if rows == proof.rows => {}
+            other => {
+                let detail = match other {
+                    Some(rows) => format!(
+                        "row count CHANGED between verify and drop: verified \
+                         {} rows, now {rows} — a writer touched this partition \
+                         (15:31 sweep / WAL replay / DLQ drain). The S3 copy is \
+                         stale, so the partition is KEPT and re-exported next run",
+                        proof.rows
+                    ),
+                    None => format!(
+                        "pre-drop recount UNAVAILABLE (verified {} rows) — \
+                         cannot prove the partition is unchanged, so the drop is \
+                         withheld and retried next run",
+                        proof.rows
+                    ),
+                };
+                metrics::counter!("tv_partition_drop_withheld_total").increment(1);
+                self.record_failure(
+                    table,
+                    partition,
+                    ArchiveOutcome::CountMismatch,
+                    &detail,
+                    summary,
+                );
+                return;
+            }
+        }
+
         // 5. Drop — the ONLY destructive step, gated on the type-state proof.
         match self.drop_partition(&proof).await {
             Ok(()) => {

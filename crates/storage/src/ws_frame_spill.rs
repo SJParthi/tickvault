@@ -1061,6 +1061,14 @@ pub struct ArchivePruneOutcome {
     pub failed: usize,
     /// Files inspected and kept (fresh, or not a `.wal` segment).
     pub kept: usize,
+    /// Segments deleted by the BYTE CEILING after the age prune, oldest
+    /// first (2026-08-19). Counted separately from `deleted` on purpose: a
+    /// non-zero value here means the age window is too long for the traffic
+    /// the box is actually seeing, which is a different operator signal from
+    /// routine age expiry.
+    pub size_deleted: usize,
+    /// Total bytes remaining in the archive after both passes.
+    pub bytes_after: u64,
 }
 
 /// Prunes confirmed-replay WAL segments from `<wal_dir>/archive/` whose
@@ -1084,13 +1092,28 @@ pub struct ArchivePruneOutcome {
 ///   persist/flush failures — they log at WARN (bounded: once per file per
 ///   pass, passes run every 6 h) and retry next pass.
 #[must_use]
+/// Pre-allocation hint for the archive prune's survivor list — a typical
+/// steady-state archive segment count, so the common case allocates once.
+/// Exceeding it only costs a realloc on a cold periodic path.
+const ARCHIVE_PRUNE_SURVIVOR_HINT: usize = 256;
+
 pub fn prune_archived_segments_at<P: AsRef<Path>>(
     wal_dir: P,
     retention_secs: u64,
+    max_bytes: u64,
     now: std::time::SystemTime,
 ) -> ArchivePruneOutcome {
     let archive_dir = wal_dir.as_ref().join(ARCHIVE_SUBDIR);
     let mut outcome = ArchivePruneOutcome::default();
+    // Segments surviving the age pass, as (mtime, len, path) — the byte
+    // ceiling's candidate set.
+    // Pre-allocated rather than grown from empty, per the banned-pattern
+    // rule. One entry per surviving archive segment; the capacity is a
+    // typical steady-state segment count, so the common case allocates
+    // exactly once. Cold path — one allocation per prune pass, never the
+    // per-frame append.
+    let mut survivors: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> =
+        Vec::with_capacity(ARCHIVE_PRUNE_SURVIVOR_HINT);
     // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
     let Ok(entries) = std::fs::read_dir(&archive_dir) else {
         return outcome; // missing archive dir — nothing to prune
@@ -1122,8 +1145,64 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
             },
             // Fresh, unreadable metadata, or a future mtime (clock skew):
             // keep — deleting on uncertainty would be the wrong default.
-            _ => outcome.kept += 1,
+            _ => {
+                outcome.kept += 1;
+                // Survivor of the age pass — a candidate for the byte
+                // ceiling below. mtime is already read above; reuse it as
+                // the sort key so the ceiling deletes genuinely oldest-first.
+                if let Ok(meta) = entry.metadata() {
+                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    survivors.push((mtime, meta.len(), path));
+                }
+            }
         }
+    }
+
+    // BYTE CEILING (2026-08-19) — the age pass alone bounds the archive only
+    // for the traffic level its window was chosen against. This bounds it
+    // unconditionally: while the total exceeds `max_bytes`, delete the OLDEST
+    // survivor. Oldest-first because the newest segment is the one a crash
+    // triage actually needs.
+    //
+    // Cold path, runs on the periodic prune task — never the per-frame append.
+    let total: u64 = survivors.iter().map(|(_, len, _)| *len).sum();
+    outcome.bytes_after = total;
+    if total > max_bytes {
+        // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
+        survivors.sort_by_key(|(mtime, _, _)| *mtime);
+        let mut remaining = total;
+        for (_, len, path) in &survivors {
+            if remaining <= max_bytes {
+                break;
+            }
+            // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
+            match std::fs::remove_file(path) {
+                Ok(()) => {
+                    outcome.size_deleted += 1;
+                    outcome.kept = outcome.kept.saturating_sub(1);
+                    remaining = remaining.saturating_sub(*len);
+                }
+                Err(err) => {
+                    outcome.failed += 1;
+                    warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "WAL archive byte-ceiling prune: remove_file failed — \
+                         retried next pass"
+                    );
+                }
+            }
+        }
+        outcome.bytes_after = remaining;
+        warn!(
+            deleted = outcome.size_deleted,
+            bytes_before = total,
+            bytes_after = remaining,
+            max_bytes,
+            "WAL archive exceeded its byte ceiling — deleted oldest segments. \
+             The age window is longer than this traffic level can afford; \
+             re-derive it against measured volume."
+        );
     }
     outcome
 }
@@ -1135,8 +1214,14 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
 pub fn prune_archived_segments<P: AsRef<Path>>(
     wal_dir: P,
     retention_secs: u64,
+    max_bytes: u64,
 ) -> ArchivePruneOutcome {
-    let outcome = prune_archived_segments_at(wal_dir, retention_secs, std::time::SystemTime::now());
+    let outcome = prune_archived_segments_at(
+        wal_dir,
+        retention_secs,
+        max_bytes,
+        std::time::SystemTime::now(),
+    );
     if outcome.deleted > 0 || outcome.failed > 0 {
         metrics::counter!("tv_ws_wal_archive_pruned_total").increment(outcome.deleted as u64);
         info!(
@@ -2080,12 +2165,122 @@ mod tests {
         path
     }
 
+    // ---- byte ceiling (2026-08-19) ---------------------------------------
+
+    /// Writes `n` archive segments of `bytes` each, oldest first, one second
+    /// apart so the ceiling's oldest-first ordering is unambiguous.
+    fn seed_archive(dir: &std::path::Path, n: usize, bytes: usize) -> Vec<PathBuf> {
+        let archive = dir.join(ARCHIVE_SUBDIR);
+        std::fs::create_dir_all(&archive).expect("archive dir");
+        let base = SystemTime::now() - std::time::Duration::from_secs(10_000);
+        let mut paths = Vec::new();
+        for idx in 0..n {
+            let path = archive.join(format!("seg-{idx:03}.wal"));
+            std::fs::write(&path, vec![0_u8; bytes]).expect("write segment");
+            // std, not the `filetime` crate — a new workspace dependency needs
+            // operator approval, and `File::set_times` does the job.
+            let mtime = base + std::time::Duration::from_secs(idx as u64);
+            let f = std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("reopen segment");
+            f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+                .expect("set mtime");
+            paths.push(path);
+        }
+        paths
+    }
+
+    #[test]
+    fn byte_ceiling_deletes_oldest_first_until_under_the_limit() {
+        let dir = tmp_dir("ceil-oldest");
+        // 5 segments x 1000 B = 5000 B; ceiling 2500 B must delete the three
+        // OLDEST, leaving the two newest (the ones a crash triage needs).
+        let paths = seed_archive(&dir, 5, 1000);
+        let out = prune_archived_segments_at(&dir, u64::MAX, 2500, SystemTime::now());
+        assert_eq!(out.deleted, 0, "nothing is age-expired here");
+        assert_eq!(out.size_deleted, 3, "three oldest removed by the ceiling");
+        assert!(out.bytes_after <= 2500, "must end under the ceiling");
+        assert!(!paths[0].exists() && !paths[1].exists() && !paths[2].exists());
+        assert!(paths[3].exists() && paths[4].exists(), "newest survive");
+    }
+
+    #[test]
+    fn byte_ceiling_is_inert_when_under_the_limit() {
+        let dir = tmp_dir("ceil-inert");
+        let paths = seed_archive(&dir, 4, 1000);
+        let out = prune_archived_segments_at(&dir, u64::MAX, 1_000_000, SystemTime::now());
+        assert_eq!(out.size_deleted, 0, "a generous ceiling must never bite");
+        assert_eq!(out.bytes_after, 4000);
+        for p in &paths {
+            assert!(p.exists(), "no segment may be touched under the ceiling");
+        }
+    }
+
+    #[test]
+    fn byte_ceiling_runs_after_the_age_pass_not_instead_of_it() {
+        let dir = tmp_dir("ceil-compose");
+        let paths = seed_archive(&dir, 4, 1000);
+        // Age window of 1s expires all four (seeded ~10_000s old), so the
+        // ceiling has nothing left to do — the two passes must compose, not
+        // double-count the same file.
+        let out = prune_archived_segments_at(&dir, 1, 1, SystemTime::now());
+        assert_eq!(out.deleted, 4, "all four age-expired");
+        assert_eq!(out.size_deleted, 0, "ceiling finds no survivors to trim");
+        assert_eq!(out.bytes_after, 0);
+        for p in &paths {
+            assert!(!p.exists());
+        }
+    }
+
+    #[test]
+    fn byte_ceiling_zero_empties_the_archive_and_never_underflows() {
+        // The extreme input. A 0 ceiling is not a configuration anyone should
+        // set, but it must terminate cleanly rather than underflow the running
+        // total or loop.
+        let dir = tmp_dir("ceil-zero");
+        seed_archive(&dir, 3, 500);
+        let out = prune_archived_segments_at(&dir, u64::MAX, 0, SystemTime::now());
+        assert_eq!(out.size_deleted, 3);
+        assert_eq!(out.bytes_after, 0);
+    }
+
+    #[test]
+    fn byte_ceiling_ignores_foreign_files_entirely() {
+        // A non-.wal file in the archive must never be deleted by either
+        // pass, and must not count toward the ceiling — deleting an
+        // operator's notes to satisfy a WAL budget would be indefensible.
+        let dir = tmp_dir("ceil-foreign");
+        seed_archive(&dir, 2, 1000);
+        let foreign = &dir.join(ARCHIVE_SUBDIR).join("operator-notes.txt");
+        std::fs::write(&foreign, vec![0_u8; 100_000]).expect("write foreign");
+        let out = prune_archived_segments_at(&dir, u64::MAX, 1500, SystemTime::now());
+        assert!(foreign.exists(), "foreign file must survive");
+        assert_eq!(out.size_deleted, 1, "only .wal segments are candidates");
+        assert!(
+            out.bytes_after <= 1500,
+            "foreign bytes must not count toward the ceiling"
+        );
+    }
+
+    #[test]
+    fn byte_ceiling_on_an_empty_or_missing_archive_is_a_no_op() {
+        let dir = tmp_dir("ceil-empty");
+        // missing archive dir
+        let out = prune_archived_segments_at(&dir, u64::MAX, 0, SystemTime::now());
+        assert_eq!((out.deleted, out.size_deleted, out.bytes_after), (0, 0, 0));
+        // present but empty
+        std::fs::create_dir_all(&dir.join(ARCHIVE_SUBDIR)).expect("mkdir");
+        let out = prune_archived_segments_at(&dir, u64::MAX, 0, SystemTime::now());
+        assert_eq!((out.deleted, out.size_deleted, out.bytes_after), (0, 0, 0));
+    }
+
     #[test]
     fn test_prune_preserves_fresh_archive_segments() {
         let dir = tmp_dir("prune-fresh");
         let now = SystemTime::now();
         let fresh = plant_archive_file(&dir, "ws-frames-00000000000000000001.wal", now, 3600);
-        let outcome = prune_archived_segments_at(&dir, 604_800, now);
+        let outcome = prune_archived_segments_at(&dir, 604_800, u64::MAX, now);
         assert_eq!(outcome.deleted, 0);
         assert_eq!(outcome.kept, 1);
         assert!(fresh.exists(), "a fresh segment must never be pruned");
@@ -2103,7 +2298,7 @@ mod tests {
             604_800 + 3600, // retention + 1h
         );
         let fresh = plant_archive_file(&dir, "ws-frames-00000000000000000003.wal", now, 60);
-        let outcome = prune_archived_segments_at(&dir, 604_800, now);
+        let outcome = prune_archived_segments_at(&dir, 604_800, u64::MAX, now);
         assert_eq!(outcome.deleted, 1);
         assert_eq!(outcome.kept, 1);
         assert!(!old.exists(), "a past-retention segment must be deleted");
@@ -2117,7 +2312,7 @@ mod tests {
         let now = SystemTime::now();
         let foreign = plant_archive_file(&dir, "notes.txt", now, 999_999_999);
         let marker = plant_archive_file(&dir, "replay-marker", now, 999_999_999);
-        let outcome = prune_archived_segments_at(&dir, 604_800, now);
+        let outcome = prune_archived_segments_at(&dir, 604_800, u64::MAX, now);
         assert_eq!(outcome.deleted, 0);
         assert_eq!(outcome.kept, 2);
         assert!(foreign.exists(), "non-.wal files must never be touched");
@@ -2129,7 +2324,7 @@ mod tests {
     fn test_prune_missing_dir_is_noop() {
         let dir = tmp_dir("prune-missing");
         // No archive/ subdir created at all.
-        let outcome = prune_archived_segments_at(&dir, 604_800, SystemTime::now());
+        let outcome = prune_archived_segments_at(&dir, 604_800, u64::MAX, SystemTime::now());
         assert_eq!(outcome, ArchivePruneOutcome::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2142,7 +2337,7 @@ mod tests {
         // evaluating "now" one day in the past.
         let past_now = now - Duration::from_secs(86_400);
         let skewed = plant_archive_file(&dir, "ws-frames-00000000000000000004.wal", now, 60);
-        let outcome = prune_archived_segments_at(&dir, 604_800, past_now);
+        let outcome = prune_archived_segments_at(&dir, 604_800, u64::MAX, past_now);
         assert_eq!(outcome.deleted, 0);
         assert!(
             skewed.exists(),
