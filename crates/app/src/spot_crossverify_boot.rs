@@ -1372,7 +1372,6 @@ mod tests {
         assert!(should_notify_summary("blind", false));
     }
 
-    #[test]
     /// The row cap must stay a STRUCTURAL bound, never an expectation.
     ///
     /// # The degrade this pins shut (prod evidence, 2026-08-14)
@@ -1436,6 +1435,13 @@ mod tests {
         );
     }
 
+    // Had no `#[test]`, so it never ran (found 2026-08-18). Its four
+    // assertions -- feed scoping, segment scoping, table name, and the
+    // LIMIT+1 completeness probe -- enforced nothing while reading exactly
+    // like a test that did. The compiler DID say so ("never used"), but only
+    // under `--all-targets`, which the CI clippy step deliberately omits, so
+    // the one signal that would have caught it was in the mode nobody runs.
+    #[test]
     fn select_sql_is_feed_and_segment_scoped_and_limited() {
         let sql = select_spot_1m_sql("dhan", 0);
         assert!(sql.contains("feed = 'dhan'"));

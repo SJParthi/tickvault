@@ -143,8 +143,49 @@ if [ -n "$TOML_STAGED" ]; then
     local_toml="$CWD/$toml_file"
     [ ! -f "$local_toml" ] && continue
 
-    # Check for ^, ~, *, >= in version specs (but not in comments)
-    pin_matches=$(grep -n -E 'version\s*=\s*"[\^~*>]' "$local_toml" 2>/dev/null | grep -v '^[[:space:]]*#' || true)
+    # A bare "1.2.3" IS the banned "^1.2.3": cargo defaults an unadorned
+    # version to a caret range. Grepping only for the literal sigil therefore
+    # banned the SPELLING and not the BEHAVIOUR, so 65 of 77 workspace deps
+    # passed this gate green while the lockfile silently drifted underneath
+    # them -- measured 2026-08-18: tokio 1.52.3 -> 1.53.1, rustls 0.23.40 ->
+    # 0.23.43, rkyv 0.8.16 -> 0.8.18, 21 crates in total. Same failure class
+    # as the 2026-08-01 pip correction in rust-only-forever-lock: a ban that
+    # permits the ecosystem default is not a ban.
+    #
+    # Detect BOTH forms. `sigil` = an explicit ^ ~ * >= range.
+    # `bare`  = `name = "1.2.3"` or `name = { version = "1.2.3", ... }`,
+    #           i.e. a version literal that does not start with '='.
+    # SECTION-AWARE, deliberately. A flat file-wide grep also matches
+    # `edition = "2024"`, `resolver = "2"`, `rust-version = "1.95.0"` and the
+    # package's OWN `version = "0.1.0"` -- none of which is a dependency. A
+    # gate whose first act is four false positives per manifest gets muted,
+    # and a muted gate is worth less than no gate. So only dependency tables
+    # are scanned.
+    #
+    # `# SECURITY-FLOOR: <reason>` on the PRECEDING line exempts one entry,
+    # mirroring the house `// APPROVED:` / `// DATA-INTEGRITY-EXEMPT:`
+    # convention. It exists for a real case: crates/common pins four
+    # transitive CVE remediations (aws-lc-sys, aws-lc-rs, rustls-webpki,
+    # rand) where a caret FLOOR is the correct semantic -- you want "at
+    # least the fixed version", and an `=` there would pin the tree to a
+    # version that later CVEs move past.
+    pin_matches=$(awk '
+      /^[[:space:]]*\[/ {
+        # A dependency table is [dependencies], [dev-dependencies],
+        # [build-dependencies], [workspace.dependencies], or any
+        # [target."cfg(...)".dependencies] variant.
+        indeps = ($0 ~ /dependencies\]/) ? 1 : 0
+        next
+      }
+      { prev_was_floor = floor_next; floor_next = ($0 ~ /^[[:space:]]*#[[:space:]]*SECURITY-FLOOR:/) ? 1 : 0 }
+      !indeps { next }
+      /^[[:space:]]*#/ { next }
+      prev_was_floor { next }
+      # name = "1.2.3"  |  name = { version = "1.2.3", ... }  -- any literal
+      # whose first character is not "=" is a RANGE, caret included.
+      /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=[[:space:]]*("[0-9]|\{[^}]*version[[:space:]]*=[[:space:]]*"[0-9])/ { print FILENAME ":" FNR ": " $0; next }
+      /version[[:space:]]*=[[:space:]]*"[\^~*>]/ { print FILENAME ":" FNR ": " $0 }
+    ' "$local_toml" 2>/dev/null || true)
     if [ -n "$pin_matches" ]; then
       echo "  FAIL: Unpinned versions in $toml_file:" >&2
       echo "$pin_matches" >&2
