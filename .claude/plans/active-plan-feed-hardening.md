@@ -160,6 +160,73 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     ISIN-join fail-closed + unresolved-named; a ratchet proving the OLD pass has no
     remaining scheduler call site (so the retirement cannot half-land)
 
+- [ ] **Item 9 — depth-200 = ATM CE/PE of the current expiry, NIFTY + BANKNIFTY only, with a
+  HYSTERESIS re-subscribe policy** — **QUEUED 2026-08-19 by operator directive** (verbatim,
+  typos preserved): *"see emanwhiel as of now for depth 200 always stick to atm ce pe of
+  ciurrent expiry aloen for both nifty and banknifty dude okay? see how will yo ualways ensrue
+  that see everytiem it needs ti be resusbcriebd as per the atm rigth ddue do you udnerstdn
+  what im aksign dude see is ti beeter to go ahead wirh atm resusbsitption alwats or jsut stick
+  tot eh entire day of the curretn day starting seocdn mintue atm as static tll eod dude
+  okay?"*
+  - **The set is exactly 4 instruments** — NIFTY CE, NIFTY PE, BANKNIFTY CE, BANKNIFTY PE, all
+    at the ATM strike of the current expiry. depth-200 permits **1 instrument per connection**,
+    and 5 connections are authorized, so this uses 4 and leaves 1 spare. It fits the socket
+    budget exactly; no arithmetic is being stretched.
+
+  - **THE ANSWER to "static or always re-subscribe": NEITHER — hysteresis.** Both options as
+    posed have a real defect, and the third shape is the one this repo already used before the
+    depth feeds were retired:
+
+    | Policy | What it gets right | Why it is wrong on its own |
+    |---|---|---|
+    | **Always re-subscribe on ATM change** | the book always describes the strike where liquidity actually is | every swap is `unsubscribe(25)` + `subscribe(23)` on that socket, so the book has a HOLE at exactly the moment of a fast move — the moment the depth is most worth having. On a trending day this churns repeatedly and the day's series is a stitched sequence of fragments, not one book |
+    | **Static from the 2nd minute to EOD** | one contiguous 200-level book per instrument, perfectly comparable all day, zero churn, zero gaps | a 2% index move leaves the "ATM" strike deep OTM by the close. Its book thins to almost nothing, so the back half of the day records depth for a strike nobody is trading — technically complete data about the wrong instrument |
+    | **HYSTERESIS (recommended)** | keeps the book on a strike that stays meaningful, while swapping rarely enough that the series stays readable | needs two named constants and a dwell timer — which is work, not a config flip |
+
+  - **The hysteresis contract to build:** select ATM at the 2nd minute (09:16, once the first
+    real prints exist — the pre-open cross can print a spot that is not the trading spot);
+    thereafter re-evaluate on a slow timer, and swap **only** when spot has drifted at least a
+    named threshold of strikes from the subscribed strike **and** the current subscription has
+    been held at least a named minimum dwell. Both thresholds are constants with their own
+    tests, never literals at the call site. Every swap writes an audit row naming the old
+    strike, the new strike, the spot that triggered it, and the exact instant — so the hole in
+    the book is explicit in the data rather than something an analyst has to infer from a gap.
+    This is the shape the deleted `depth_rebalancer` used (60s spot check, swap on ≥3 strike
+    drift, command-channel swap with **no disconnect**), and reusing it is deliberate: the
+    command-channel form is what makes a swap `unsubscribe`+`subscribe` on the SAME live
+    socket rather than a reconnect.
+
+  - **⚠ SEQUENCING — do NOT open a depth socket first.** The operator's own 2026-08-15 second
+    quote binds this: *"either the vertical lands, or the depth pools stay at zero
+    instruments"*, and today `ls crates/storage/src | grep -i depth` returns **nothing** —
+    depth-200 frames are pulled at 512 KiB each and every one is discarded. The order is
+    therefore: **(1)** writer + DDL + dedup key (with the `d20`/`d200` discriminator the same
+    quote requires, or the two pools silently overwrite each other) + same-day S3 archival →
+    **(2)** the 4-instrument ATM set → **(3)** the hysteresis policy. Opening sockets before
+    (1) means paying 512 KiB/frame to discard, and reporting them as "connected" is the
+    false-OK the scope lock forbids.
+
+  - **What makes the strike resolvable at all:** the ATM strike needs a live spot for
+    NIFTY/BANKNIFTY (the main feed carries both) and a current-expiry contract
+    `security_id` for that strike. The ONLY authorized source for the latter is the
+    per-minute option-chain pull's per-leg `contract_security_id` (2026-08-11 second quote) —
+    it self-rolls at expiry, costs no new fetch class, and a hardcoded contract list is a
+    REJECT because it goes stale weekly. A `contract_security_id` of `0` must be REFUSED and
+    counted, never subscribed: the parser defaults it to 0 when the field is absent, and
+    subscribing instrument 0 would look healthy while carrying nothing.
+
+  - **First live session should run STATIC anyway** — not as the policy, as the bring-up.
+    Depth-200 has never delivered a single packet to this system. Proving the socket connects,
+    the 200-level frames parse at the right offsets, and the writer persists them is a strictly
+    easier problem with the instrument held still. Turn hysteresis on once a static session has
+    produced verified rows. Recorded so "static" is understood as a bring-up step with an exit
+    condition, not as the answer.
+  - Files: `crates/storage/src/depth_persistence.rs` (new), `crates/app/src/dhan_feed_stack.rs`
+    (the depth arm that currently discards), `crates/core/src/instrument/` (ATM selection)
+  - Tests: dedup key carries the depth-kind discriminator; ATM selection at a boundary strike;
+    hysteresis does NOT swap inside the dwell window; a swap emits its audit row; a `0`
+    contract id is refused and counted
+
 ---
 
 ## Design
