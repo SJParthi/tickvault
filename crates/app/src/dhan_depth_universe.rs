@@ -39,17 +39,64 @@
 //! deliver.
 
 use tickvault_common::types::{ExchangeSegment, SecurityId};
+use tickvault_core::websocket::pool_budget::{
+    DEPTH_20_INSTRUMENTS_PER_CONNECTION, MAX_DEPTH_20_CONNECTIONS,
+};
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 use tickvault_storage::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE;
 
-/// Strikes each side of at-the-money that depth-20 subscribes, per underlying.
+/// Instruments the whole depth-20 pool can carry.
 ///
-/// Matches the retired depth selector's ATM ± 10 (`CLAUDE.md`, "depth strike
-/// selector (ATM ± 10)") rather than inventing a new number. 21 strikes × 2
-/// legs × 3 underlyings = 126 instruments, comfortably inside the 250-slot
-/// depth-20 envelope, which leaves headroom for a fourth underlying later
-/// without touching the connection budget.
-pub const DEPTH_20_ATM_STRIKES_EACH_SIDE: usize = 10;
+/// DERIVED from the two vendor limits rather than written as `250`, so it
+/// cannot drift away from what the pool will actually accept: 5 connections
+/// (`16-full-market-depth.md:183`) × 50 instruments each (`:54`).
+pub const DEPTH_20_MAX_INSTRUMENTS: usize =
+    MAX_DEPTH_20_CONNECTIONS as usize * DEPTH_20_INSTRUMENTS_PER_CONNECTION as usize;
+
+/// Ceiling on the adaptive half-window, however few underlyings there are.
+///
+/// With a single eligible underlying the budget arithmetic would allow ±62,
+/// which is 125 strikes of a chain whose far end is deep out of the money and
+/// barely quotes. A 20-level book on a strike nobody trades is a socket spent
+/// on nothing. 50 keeps the window wide while staying inside the range where
+/// a book still exists.
+pub const DEPTH_20_MAX_STRIKES_EACH_SIDE: usize = 50;
+
+/// The ATM half-window that fills the depth-20 envelope for `underlyings`
+/// eligible underlyings.
+///
+/// # Why this is computed rather than a constant
+///
+/// A fixed window under-fills or overflows the moment the eligible-underlying
+/// count changes, and that count is NOT stable: Dhan serves depth on NSE only
+/// (`04-full-market-depth-websocket.md:13`), so SENSEX — a `BSE_FNO`
+/// underlying — can never have a depth book, and the eligible set is whatever
+/// the chain happens to carry on NSE that day.
+///
+/// The failure this replaces was real and silent in both directions. At a
+/// fixed ±10 with two eligible underlyings the pool carried 84 of its 250
+/// slots — two thirds of the authorized depth budget idle, with nothing
+/// reporting it. Raising the constant to fill 250 at two underlyings would
+/// then OVERFLOW the moment a third became eligible, and `plan_pool` refuses
+/// the WHOLE pool rather than truncating — so the fix for an under-fill would
+/// have turned into a total depth outage on the day the chain widened.
+///
+/// Returns 0 when there are no eligible underlyings; the caller selects
+/// nothing, which is the correct answer to "depth on what?".
+#[must_use]
+pub fn depth_20_strikes_each_side(underlyings: usize) -> usize {
+    if underlyings == 0 {
+        return 0;
+    }
+    // Each strike costs both legs, so one strike of one underlying is 2 slots.
+    let strikes = DEPTH_20_MAX_INSTRUMENTS / (underlyings * 2);
+    if strikes == 0 {
+        return 0;
+    }
+    // `strikes` counts the ATM strike itself, so the half-window is what is
+    // left after removing it, split either side.
+    ((strikes - 1) / 2).min(DEPTH_20_MAX_STRIKES_EACH_SIDE)
+}
 
 /// Instruments depth-200 subscribes, across all underlyings.
 ///
@@ -118,6 +165,19 @@ pub struct DepthSelection {
     /// computes a cross-leg quantity can see that the data cannot support it,
     /// instead of computing a number from a book whose other half is absent.
     pub depth_200_lone_leg: bool,
+    /// The ATM half-window depth-20 actually used, from
+    /// [`depth_20_strikes_each_side`].
+    ///
+    /// Reported rather than inferred: a caller comparing `depth_20.len()`
+    /// against 250 cannot tell a narrow window from a thin chain, and those
+    /// need different responses.
+    pub depth_20_strikes_each_side: usize,
+    /// depth-20 instruments dropped because the pool envelope was exceeded.
+    ///
+    /// Should be 0 — the window is sized to fit. A non-zero value means an
+    /// assumption about the chain's shape broke, and is worth investigating
+    /// even though the truncation itself is safe.
+    pub depth_20_dropped_for_capacity: usize,
     /// Rows whose `contract_security_id` was 0 or negative.
     ///
     /// The chain parser defaults this field to `0` when absent, and the field
@@ -224,7 +284,9 @@ fn atm_distance(candidate: &DepthCandidate) -> f64 {
 /// Selection, per underlying:
 /// 1. keep only the NEAREST expiry (a far month is an illiquid book);
 /// 2. rank strikes by distance from spot;
-/// 3. depth-20 takes ATM ± [`DEPTH_20_ATM_STRIKES_EACH_SIDE`], both legs;
+/// 3. depth-20 takes ATM ± [`depth_20_strikes_each_side`], both legs — a
+///    window sized to the ELIGIBLE underlying count so the 250-slot pool is
+///    filled without being exceeded;
 /// 4. depth-200 takes whole CE/PE pairs nearest ATM, up to
 ///    [`DEPTH_200_MAX_PAIRS`] across ALL underlyings.
 #[must_use]
@@ -261,6 +323,13 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     underlyings.sort_unstable();
     underlyings.dedup();
 
+    // Sized to the underlyings that SURVIVED refusal, not to the ones the
+    // chain offered. SENSEX is offered every day and refused every day (BSE
+    // has no depth book), so sizing on the offered count would reserve a
+    // third of the pool for an underlying that can never use it.
+    let each_side = depth_20_strikes_each_side(underlyings.len());
+    out.depth_20_strikes_each_side = each_side;
+
     // Whole CE/PE pairs for depth-200, ranked across every underlying, so the
     // 2 pairs go to the 2 most at-the-money books rather than to whichever
     // underlying happens to sort first.
@@ -294,7 +363,7 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
             da.total_cmp(&db)
         });
 
-        let keep = DEPTH_20_ATM_STRIKES_EACH_SIDE * 2 + 1;
+        let keep = each_side * 2 + 1;
         for (rank, strike) in strikes.iter().enumerate() {
             let legs: Vec<(&DepthCandidate, ExchangeSegment)> = rows
                 .iter()
@@ -354,6 +423,16 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
         }
         out.depth_200.push(ce);
         out.depth_200.push(pe);
+    }
+
+    // Last-resort envelope guard. The adaptive window is sized to fit, so
+    // reaching here means an assumption broke — a chain carrying an uneven
+    // number of legs per strike, say. Truncating and COUNTING is strictly
+    // better than handing an oversized set to `plan_pool`, which refuses the
+    // WHOLE pool and would cost the session all depth rather than the excess.
+    if out.depth_20.len() > DEPTH_20_MAX_INSTRUMENTS {
+        out.depth_20_dropped_for_capacity = out.depth_20.len() - DEPTH_20_MAX_INSTRUMENTS;
+        out.depth_20.truncate(DEPTH_20_MAX_INSTRUMENTS);
     }
 
     out
@@ -819,28 +898,94 @@ mod tests {
     /// "nearest ATM" set would just be the lowest strikes.
     #[test]
     fn test_depth_20_keeps_the_strikes_nearest_atm_not_the_lowest() {
+        // The chain must be WIDER than the window or nothing is dropped and
+        // the ranking is untested. One underlying takes the ±50 cap, so 101
+        // strikes are kept — this chain offers 140.
         let mut rows = Vec::new();
-        // Spot is 100; strikes 1..=60 means the lowest are the FURTHEST out.
-        for i in 1..=60_i64 {
+        // Spot is 200; strikes 1..=140 means the lowest are the FURTHEST out.
+        for i in 1..=140_i64 {
             let mut c = candidate("NIFTY", i, i as f64, "CE");
-            c.spot = 100.0;
+            c.spot = 200.0;
             rows.push(c);
         }
         let sel = select_depth_universe(&rows);
         let ids: Vec<u64> = sel.depth_20.iter().map(|i| i.security_id).collect();
         assert!(
-            ids.contains(&60),
-            "strike 60 is nearest spot 100 and must be kept: {ids:?}"
+            ids.contains(&140),
+            "strike 140 is nearest spot 200 and must be kept: {ids:?}"
         );
         assert!(
             !ids.contains(&1),
-            "strike 1 is furthest from spot and must be dropped: {ids:?}"
+            "strike 1 is furthest from spot and must be dropped"
+        );
+        assert_eq!(
+            sel.depth_20_strikes_each_side, DEPTH_20_MAX_STRIKES_EACH_SIDE,
+            "a single underlying takes the cap, not the budget arithmetic"
         );
         assert_eq!(
             ids.len(),
-            DEPTH_20_ATM_STRIKES_EACH_SIDE * 2 + 1,
+            DEPTH_20_MAX_STRIKES_EACH_SIDE * 2 + 1,
             "one leg per strike here, so the count is the strike window"
         );
+    }
+
+    // ---- adaptive depth-20 window (2026-08-19) ----
+
+    #[test]
+    fn the_depth_20_window_fills_the_envelope_without_exceeding_it() {
+        // The property that matters at every underlying count: use nearly all
+        // 250 slots, never more. Before this was adaptive, two underlyings
+        // used 84 of 250 and nothing reported it.
+        for underlyings in 1..=8usize {
+            let each_side = depth_20_strikes_each_side(underlyings);
+            let used = (each_side * 2 + 1) * underlyings * 2;
+            assert!(
+                used <= DEPTH_20_MAX_INSTRUMENTS,
+                "{underlyings} underlyings would need {used} of {DEPTH_20_MAX_INSTRUMENTS}"
+            );
+            // Allow one strike of slack per underlying — the window is an odd
+            // count of strikes, so a perfect fill is not always reachable.
+            let slack = underlyings * 2 * 2;
+            assert!(
+                used + slack >= DEPTH_20_MAX_INSTRUMENTS
+                    || each_side == DEPTH_20_MAX_STRIKES_EACH_SIDE,
+                "{underlyings} underlyings used only {used} of {DEPTH_20_MAX_INSTRUMENTS}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_eligible_underlyings_case_fills_the_pool() {
+        // The case that actually runs today: Dhan serves depth on NSE only,
+        // so SENSEX is refused and the eligible set is NIFTY + BANKNIFTY.
+        let each_side = depth_20_strikes_each_side(2);
+        let used = (each_side * 2 + 1) * 2 * 2;
+        assert_eq!(each_side, 30);
+        assert_eq!(used, 244, "244 of 250, against 84 before this change");
+    }
+
+    #[test]
+    fn no_eligible_underlyings_selects_no_window_rather_than_dividing_by_zero() {
+        assert_eq!(depth_20_strikes_each_side(0), 0);
+    }
+
+    #[test]
+    fn a_very_wide_underlying_set_degrades_to_the_money_rather_than_overflowing() {
+        // 200 underlyings cannot each have a window; the arithmetic must
+        // return 0 (the ATM strike only) and never a negative or a panic.
+        let each_side = depth_20_strikes_each_side(200);
+        assert_eq!(each_side, 0);
+        assert!((0 * 2 + 1) * 200 * 2 > DEPTH_20_MAX_INSTRUMENTS);
+        // ...which is exactly why the last-resort truncate guard exists.
+    }
+
+    #[test]
+    fn the_pool_envelope_is_derived_from_the_vendor_limits_not_written_down() {
+        assert_eq!(
+            DEPTH_20_MAX_INSTRUMENTS,
+            MAX_DEPTH_20_CONNECTIONS as usize * DEPTH_20_INSTRUMENTS_PER_CONNECTION as usize
+        );
+        assert_eq!(DEPTH_20_MAX_INSTRUMENTS, 250, "5 connections x 50 each");
     }
 
     /// Segments are resolved PER UNDERLYING, and the BSE answer is then what
