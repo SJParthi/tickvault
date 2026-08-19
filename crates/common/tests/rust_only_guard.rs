@@ -141,6 +141,74 @@ fn stale_entries(allowlist: &[&str], tracked: &[String]) -> Vec<String> {
 /// terraform templates, plus the extension-less tracked bash scripts under
 /// `scripts/git-hooks/` (pre-push / pre-commit / commit-msg — hostile
 /// review round 1). `.py` and `.md` are excluded by construction.
+/// Files DELIBERATELY excluded from the invocation scan.
+///
+/// # Why this list is an exclusion list and not an inclusion list
+///
+/// This guard decided for a year by asking "is this one of the file types we
+/// listed?". That question has now been wrong SIX times, always the same way:
+/// `.cargo/config.toml` (the linker), `pip` as an installer rather than the
+/// interpreter, `GNUmakefile` shadowing `Makefile`, `.args([..])` spawn form,
+/// `.config/nextest.toml` (bite-proven), and `.githooks/` (a hooks path
+/// `core.hooksPath` makes executable, outside the enumerated
+/// `scripts/git-hooks/` prefix).
+///
+/// Each fix added one more name. Each time, the NEXT unlisted class stayed
+/// invisible. Six repetitions of the same failure is not six mistakes — it is
+/// one wrong question, asked six times.
+///
+/// So the question is inverted. The scan now covers EVERY tracked file, and
+/// this list is the small, named, justified set that opts out. A new file
+/// class arriving in the repo is scanned by default rather than ignored by
+/// default, which is the only shape that can be right about files nobody has
+/// thought of yet.
+///
+/// # What is safe to exclude, and why
+///
+/// * **Prose** (`.md`) — 1,084 files that legitimately DISCUSS banned runtimes:
+///   migration provenance, vendor API references, dated audit history. The
+///   rust-only lock's own §0 names these as deliberately retained. Scanning
+///   them would produce a thousand false positives on day one and the guard
+///   would be disabled within a week, which is worse than the gap.
+/// * **Rust** (`.rs`) — not unscanned, scanned DIFFERENTLY: the spawn-literal
+///   scan covers `Command::new`/`.arg`/`.args`/`run_with_timeout` there, and a
+///   plain token scan would fire on this very file, which must name the tokens
+///   in order to ban them.
+/// * **Lockfiles** (`.lock`) — machine-generated dependency graphs. Package
+///   NAMES legitimately contain banned substrings; nothing in them executes.
+/// * **This guard's own sources** — they must contain the tokens to ban them.
+///
+/// Everything else — every extension, every extension-less file, every
+/// directory, including ones that do not exist yet — is scanned.
+fn is_excluded_from_invocation_scan(path: &str) -> bool {
+    // Prose. See the docblock: a thousand legitimate mentions.
+    if path.ends_with(".md") {
+        return true;
+    }
+    // Rust is scanned by the spawn-literal pass instead.
+    if path.ends_with(".rs") {
+        return true;
+    }
+    // Machine-generated dependency graphs; nothing executes from them.
+    if path.ends_with(".lock") {
+        return true;
+    }
+    // Binary or opaque payloads — a token match would be meaningless.
+    for ext in [
+        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".woff", ".woff2", ".ttf", ".otf", ".zip",
+        ".gz", ".bin", ".wasm",
+    ] {
+        if path.ends_with(ext) {
+            return true;
+        }
+    }
+    false
+}
+
+/// LEGACY inclusion predicate, retained ONLY as the positive half of the
+/// self-test: every type it ever listed must still be scanned under the
+/// inversion above. If a future edit narrows the exclusion list wrongly, the
+/// self-test catches it by replaying the historical inclusion set.
 fn is_invocation_scan_target(path: &str) -> bool {
     path.ends_with(".sh")
         || path.ends_with(".yml")
@@ -828,14 +896,19 @@ fn load_invocation_scan_files() -> Vec<(String, String)> {
     git_ls_files(&["."])
         .into_iter()
         .filter_map(|p| {
-            if is_invocation_scan_target(&p) {
-                let content = std::fs::read_to_string(root.join(&p))
-                    .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{p}`: {e}"));
-                return Some((p, content));
+            // INVERTED 2026-08-19: scan everything tracked unless it is on the
+            // named exclusion list. Previously this asked "is p one of the
+            // types we listed?", which was wrong six times in the same
+            // direction. A file class nobody thought of is now scanned by
+            // default rather than ignored by default.
+            if is_excluded_from_invocation_scan(&p) {
+                return None;
             }
-            // Content-selected: unreadable => not a shebang script => skip.
+            // Unreadable => binary or vanished => nothing to scan. Never a
+            // panic: the tree legitimately contains binary assets, and a guard
+            // that crashes on one is a guard someone disables.
             let content = std::fs::read_to_string(root.join(&p)).ok()?;
-            has_interpreter_shebang(&content).then_some((p, content))
+            Some((p, content))
         })
         .collect()
 }
@@ -1113,6 +1186,82 @@ fn allowlists_are_pinned_at_zero() {
 
 /// (d) The scanner detects a synthetic NEW .py / stale entry / new site —
 /// proving the guard is non-vacuous (injected-list pure-fn design).
+/// The inversion must keep scanning everything the ENUMERATION ever listed.
+///
+/// This replays the historical inclusion set against the new exclusion
+/// predicate. If someone later widens the exclusions — "`.toml` is all config,
+/// let's skip it" — this fails, because every one of those types was added to
+/// the old list only after a real blind spot was found in it.
+///
+/// It also pins the classes that were blind at each of the six holes, so a
+/// regression to any individual past failure is caught by name.
+#[test]
+fn inversion_still_scans_everything_the_enumeration_ever_listed() {
+    for path in [
+        // the original enumerated set
+        "scripts/x.sh",
+        ".github/workflows/x.yml",
+        "deploy/x.yaml",
+        "deploy/aws/terraform/user-data.sh.tftpl",
+        "deploy/aws/terraform/main.tf",
+        "Makefile",
+        "GNUmakefile",
+        "makefile",
+        "build/x.mk",
+        "Cargo.toml",
+        ".cargo/config.toml",
+        "deploy/x.conf",
+        "deploy/systemd/tickvault.service",
+        "deploy/systemd/tickvault.timer",
+        "scripts/tv-tunnel/com.tickvault.tunnel.plist",
+        "x.json",
+        "x.xml",
+        // the six holes, by the exact path class each was found in
+        ".config/nextest.toml", // #5, bite-proven
+        ".githooks/pre-commit", // #6, bite-proven
+        // classes NEVER enumerated — the whole point of inverting
+        "Justfile",
+        "Taskfile.yml",
+        ".envrc",
+        ".tool-versions",
+        "lefthook.yml",
+        ".pre-commit-config.yaml",
+        "tools/deploy", // extension-less executable
+        "quality/x.toml",
+        "deploy/schema.sql",
+    ] {
+        assert!(
+            !is_excluded_from_invocation_scan(path),
+            "`{path}` must be SCANNED. Excluding it re-opens the \
+             decide-by-filename failure that has now been wrong six times."
+        );
+    }
+}
+
+/// The exclusions are deliberate and must stay small. Each entry here is
+/// justified in `is_excluded_from_invocation_scan`'s docblock; this pins that
+/// the set has not silently grown.
+#[test]
+fn only_the_justified_classes_are_excluded() {
+    for path in [
+        "docs/anything.md",
+        "crates/common/src/lib.rs",
+        "Cargo.lock",
+        "assets/logo.png",
+    ] {
+        assert!(
+            is_excluded_from_invocation_scan(path),
+            "`{path}` is a justified exclusion and must stay excluded"
+        );
+    }
+    // And the inverse: a `.md`-LOOKING path that is not prose must not slip
+    // through on a suffix match alone.
+    assert!(
+        !is_excluded_from_invocation_scan("scripts/build.md.sh"),
+        "suffix matching must not be fooled by a compound name"
+    );
+}
+
 #[test]
 fn guard_self_test() {
     // New .py detection.
