@@ -169,6 +169,7 @@ pub mod dhan_intraday_parse;
 /// packet-loss proxy). Integer-paise OHLC compare, quantified noise profile,
 /// and a `blind` outcome that makes a zero-comparison run structurally
 /// incapable of reading as a pass — the PR #1474 blind-since-birth lesson.
+pub mod dhan_lifecycle;
 pub mod dhan_live_crossverify;
 pub mod dhan_live_universe;
 /// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive

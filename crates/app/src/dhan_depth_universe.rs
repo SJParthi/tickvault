@@ -361,20 +361,28 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
         rows.retain(|(c, _)| c.expiry_micros == nearest_expiry);
 
         // Distinct strikes, nearest-ATM first.
+        //
+        // The distance is computed ONCE per strike and carried alongside it,
+        // rather than looked up inside the comparator. A linear `find` inside
+        // a `sort_by` makes each of the O(k log k) comparisons O(k) — a
+        // quadratic-with-a-log hidden where no call site can see it, and this
+        // one ran twice per comparison. Decorate-sort-undecorate instead: one
+        // O(k) pass to attach distances, then a plain O(k log k) sort.
         let mut strikes: Vec<f64> = rows.iter().map(|(c, _)| c.strike).collect();
         strikes.sort_by(|a, b| a.total_cmp(b));
         strikes.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
-        strikes.sort_by(|a, b| {
-            let da = rows
-                .iter()
-                .find(|(c, _)| (c.strike - *a).abs() < f64::EPSILON)
-                .map_or(f64::MAX, |(c, _)| atm_distance(c));
-            let db = rows
-                .iter()
-                .find(|(c, _)| (c.strike - *b).abs() < f64::EPSILON)
-                .map_or(f64::MAX, |(c, _)| atm_distance(c));
-            da.total_cmp(&db)
-        });
+        let mut ranked: Vec<(f64, f64)> = strikes
+            .iter()
+            .map(|s| {
+                let d = rows
+                    .iter()
+                    .find(|(c, _)| (c.strike - *s).abs() < f64::EPSILON)
+                    .map_or(f64::MAX, |(c, _)| atm_distance(c));
+                (d, *s)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let strikes: Vec<f64> = ranked.into_iter().map(|(_, s)| s).collect();
 
         let keep = each_side * 2 + 1;
         for (rank, strike) in strikes.iter().enumerate() {

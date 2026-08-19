@@ -3849,7 +3849,7 @@ fn main_feed_connections_for(instruments: usize) -> usize {
 /// date must not subscribe an expired contract, whose silence is
 /// indistinguishable from a quiet book.
 #[must_use]
-fn ymd_from_ist_date(date_ist: &str) -> u32 {
+pub fn ymd_from_ist_date(date_ist: &str) -> u32 {
     let mut parts = date_ist.split('-');
     let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
         return 0;
@@ -8413,7 +8413,7 @@ mod contract_attach_tests {
     }
 
     #[test]
-    fn a_malformed_date_selects_nothing_rather_than_an_expired_contract() {
+    fn ymd_from_ist_date_refuses_a_malformed_date_rather_than_selecting_an_expired_one() {
         assert_eq!(ymd_from_ist_date("2026-08-19"), 2026_08_19);
         // Every refusal returns 0, and 0 makes every expiry compare as "before
         // today" — so the fail-closed direction is "no contracts", never "an

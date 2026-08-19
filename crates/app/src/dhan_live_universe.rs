@@ -162,7 +162,17 @@ pub fn select_live_universe(
     // Seeded with the index set so a master entry that repeats an index SID
     // cannot be subscribed twice. `(security_id, segment)` is the composite
     // identity per I-P1-11 — a bare id would collapse two real instruments.
-    let mut seen: Vec<(SecurityId, ExchangeSegment)> = index_universe
+    //
+    // A `HashSet`, not a `Vec`. This was `Vec::contains` inside the loop
+    // below, which is O(n²): at today's 4,565 SIDs that is ~10M comparisons
+    // and survivable, but the authorized target is 25,000, where it becomes
+    // ~312M — a boot path doing a third of a billion comparisons to answer a
+    // question a hash answers in one probe.
+    //
+    // The sibling deduper `dhan_feed_stack::dedup_subscribe_set` has always
+    // used a `HashSet` on this exact key for this exact job. Two dedup paths,
+    // same key, different complexity; now the same.
+    let mut seen: std::collections::HashSet<(SecurityId, ExchangeSegment)> = index_universe
         .iter()
         .map(|i| (i.security_id, i.segment))
         .collect();
@@ -178,11 +188,10 @@ pub fn select_live_universe(
             continue;
         };
         let key = (entry.security_id as SecurityId, segment);
-        if seen.contains(&key) {
+        if !seen.insert(key) {
             deduped += 1;
             continue;
         }
-        seen.push(key);
         instruments.push(SubscribeInstrument {
             security_id: key.0,
             segment,
