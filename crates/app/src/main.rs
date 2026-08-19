@@ -2441,6 +2441,17 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
                     "global seal sender already installed (idempotent skip) — first installer wins"
                 );
             }
+            // The producer-side durable tier, installed on the line after the
+            // sender because a sender WITHOUT it is the pre-2026-08-19
+            // behaviour: a full or absent channel silently discarded the
+            // sealed candle. Both installs must happen before the runner moves
+            // into the spawn below, for the same reason — the handles are
+            // unreachable afterwards.
+            if !tickvault_storage::seal_writer_runner::set_global_seal_overflow(runner.overflow()) {
+                tracing::warn!(
+                    "global seal overflow already installed (idempotent skip) — first installer wins"
+                );
+            }
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
             // 2026-08-18 — GRACEFUL-SHUTDOWN WIRING (was `std::mem::forget`).
             //
