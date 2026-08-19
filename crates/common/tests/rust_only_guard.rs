@@ -367,10 +367,44 @@ fn banned_tokens() -> Vec<String> {
     tokens
 }
 
+/// Strips shell quoting so a token split across quotes still matches.
+///
+/// 2026-08-19 — EVASION HOLE, found by planting it. `I=pyt"hon"3` followed by
+/// `$I -c ...` executes the banned runtime, and the guard passed 12/12 on it:
+/// the file WAS scanned, but the literal never appears contiguously, so string
+/// matching cannot see it.
+///
+/// This is a different class from scope holes #1-#5. Those were files the
+/// guard never opened; this one it read and could not recognise. Removing `"`
+/// and `'` before matching closes the whole family of split-literal forms
+/// (`pyt"hon"3`, `'py'thon3`, `py""thon3`) for one pass over the line.
+fn strip_shell_quotes(line: &str) -> String {
+    line.chars().filter(|c| *c != '"' && *c != '\'').collect()
+}
+
+/// Does this line invoke a banned runtime?
+///
+/// # Threat model — stated, because an unstated one gets assumed to be total
+///
+/// This guard PREVENTS: accidental reintroduction, a dependency quietly
+/// pulling an interpreter in, a vendored script arriving with the rest of a
+/// change, and now split-literal obfuscation.
+///
+/// It does NOT prevent: a determined author who wants the runtime anyway.
+/// `$(echo cHl0aG9uMw== | base64 -d)`, `${X}${Y}` assembled from two
+/// variables, or a name read from a file all execute the same runtime and no
+/// static string scan can decide the general case — that reduces to knowing
+/// what a shell expands to, which is undecidable.
+///
+/// Saying so is the point. A guard whose limits are unstated gets read as
+/// airtight, and "the guard is green" then stands in for "the codebase is
+/// clean" — which is precisely the false-OK this repo forbids everywhere
+/// else. The guard is a ratchet against drift, not a sandbox.
 fn line_has_banned_token(line: &str) -> bool {
+    let unquoted = strip_shell_quotes(line);
     banned_tokens()
         .iter()
-        .any(|tok| line_has_token(line, tok.as_str()))
+        .any(|tok| line_has_token(line, tok.as_str()) || line_has_token(&unquoted, tok.as_str()))
 }
 
 fn line_has_token(line: &str, tok: &str) -> bool {
