@@ -188,7 +188,19 @@ pub fn next_wait(
         // Sleep to the next day's target. Computed from the target, not from
         // "24h from now", so a slow build cannot drift the schedule later
         // every day until it walks out of the market window entirely.
-        let secs_to_midnight = u64::from(SECS_PER_DAY as u32 - now_secs_of_day);
+        // `saturating_sub`, not `-`. This is a `pub fn` whose caller supplies
+        // `now_secs_of_day` freely, the release profile sets
+        // `overflow-checks = true` AND `panic = "abort"`, so a value at or
+        // past 86_400 would not return a wrong duration — it would KILL the
+        // trading process. Every sibling arithmetic in this file already
+        // saturates; this one line did not. Saturating yields 0, i.e. "the
+        // next target is today's target", which is the safe direction: it
+        // wakes early rather than never.
+        let secs_to_midnight = u64::from(
+            u32::try_from(SECS_PER_DAY)
+                .unwrap_or(u32::MAX)
+                .saturating_sub(now_secs_of_day),
+        );
         return Some(Duration::from_secs(
             secs_to_midnight.saturating_add(u64::from(target_secs_of_day)),
         ));
@@ -873,6 +885,28 @@ mod tests {
             Duration::from_secs((SECS_PER_DAY as u64 - 9 * 3600) + 8 * 3600),
             "sleep must land on TOMORROW's target, not 24h from now"
         );
+    }
+
+    #[test]
+    fn test_next_wait_survives_an_out_of_range_second_of_day() {
+        // `next_wait` is `pub` and its caller supplies this value freely. The
+        // release profile is `overflow-checks = true` + `panic = "abort"`, so
+        // before 2026-08-19 a value at or past 86_400 did not return a wrong
+        // duration — it ABORTED the trading process. These inputs are the
+        // reason the arithmetic saturates.
+        for bad in [86_400_u32, 86_401, 100_000, u32::MAX] {
+            let wait = next_wait(bad, 8 * 3600, true)
+                .expect("an out-of-range clock must still yield a wait, never a panic");
+            assert_eq!(
+                wait.as_secs(),
+                8 * 3600,
+                "saturating to zero seconds-to-midnight wakes EARLY (at today's \
+                 target), which is the safe direction — never late, never never"
+            );
+        }
+        // The exact boundary still behaves normally one second below.
+        let ok = next_wait(86_399, 8 * 3600, true).expect("must sleep");
+        assert_eq!(ok.as_secs(), 1 + 8 * 3600);
     }
 
     #[test]

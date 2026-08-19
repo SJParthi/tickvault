@@ -614,25 +614,78 @@ fn extract_spawn_literals(content: &str) -> Vec<String> {
             rest = &rest[i + marker.len()..];
         }
     }
-    // Plural form: take EVERY string literal inside the `[...]` group.
-    let mut rest = content;
-    while let Some(i) = rest.find(".args([") {
-        let after = &rest[i + ".args([".len()..];
-        // Bound the scan at the closing bracket so a later, unrelated literal
-        // on a following line is never attributed to this spawn.
-        let group = after.find(']').map_or(after, |end| &after[..end]);
-        let mut tail = group;
-        while let Some(open) = tail.find('"') {
-            let lit = &tail[open + 1..];
-            match lit.find('"') {
-                Some(close) => {
-                    out.push(lit[..close].to_string());
-                    tail = &lit[close + 1..];
-                }
-                None => break,
-            }
+    // 2026-08-19 SCOPE FIX #7 — THE SLICE-LITERAL WRAPPER (the fifth miss).
+    //
+    // HONEST LIMIT 2 above says a wrapper not named in the marker list "remains
+    // invisible", and calls that residual theoretical. It was not. A SECOND
+    // wrapper exists and has the whole time:
+    //
+    //     // crates/app/src/bin/tv_doctor.rs
+    //     fn run_cmd(args: &[&str]) -> Result<String, String> {
+    //         let output = Command::new(args[0]).args(&args[1..])
+    //
+    // called five times as `run_cmd(&["curl", "-s", …])`. That shape matches
+    // NOTHING: not `Command::new("` (the program is `args[0]`, a variable), not
+    // `.arg("`, not `.args([` (the slice is a bare `&[…]` ARGUMENT, not a
+    // `.args([…])` call), not `run_with_timeout("`. It also adds no new
+    // non-literal spawn site, so `NON_LITERAL_SPAWN_BUDGET` stays put and its
+    // shrink-only test still passes. `run_cmd(&["python3", "-c", "…"])` was
+    // fully green, and an inline `-c` payload dodges BOTH remaining backstops
+    // (the file-extension ban and the shebang fallback).
+    //
+    // The fix does NOT enumerate one more wrapper name — that is what has been
+    // wrong five times running. It scans EVERY `(&[…])` slice-literal group in
+    // the file. That is deliberately broader than "spawns": a bare
+    // `&["python3", …]` string literal has no legitimate purpose anywhere in
+    // this workspace, so failing on it regardless of the surrounding call is
+    // the stronger and simpler guarantee.
+    for marker in [".args([", "(&["] {
+        let mut rest = content;
+        while let Some(i) = rest.find(marker) {
+            let after = &rest[i + marker.len()..];
+            out.extend(literals_in_group(after));
+            rest = &rest[i + marker.len()..];
         }
-        rest = &rest[i + ".args([".len()..];
+    }
+    out
+}
+
+/// Every string literal in a `[...]` group, stopping at the group's closing
+/// bracket.
+///
+/// The bracket search is STRING-AWARE, which the previous inline version was
+/// not: it bounded the group at the first `]` anywhere, so a payload
+/// containing one — `.args(["sh", "-c", "a[1]"])` — truncated the group early
+/// and silently dropped every literal after it. A scanner that stops reading
+/// halfway through the exact payload an attacker controls is worse than no
+/// scanner, because it reports clean.
+fn literals_in_group(after: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = after.char_indices();
+    let mut in_string = false;
+    let mut lit_start = 0_usize;
+    let mut escaped = false;
+    while let Some((idx, ch)) = chars.next() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                out.push(after[lit_start..idx].to_string());
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                lit_start = idx + 1;
+            }
+            // Only a bracket OUTSIDE a string ends the group.
+            ']' => break,
+            _ => {}
+        }
     }
     out
 }
@@ -1002,6 +1055,62 @@ fn no_new_banned_invocations() {
         "SHRINK THE RATCHET: these INVOCATION_SITE_ALLOWLIST entries no longer carry a \
          non-comment the banned interpreter token (file cleaned or deleted): {stale:?}. Remove the entries \
          from crates/common/tests/rust_only_guard.rs in the same PR."
+    );
+}
+
+/// (d2) NO tracked EXECUTABLE may be excluded from the invocation scan.
+///
+/// 2026-08-19, found by the COMPILER: `has_interpreter_shebang` — SCOPE FIX #5,
+/// described above as "THE STRUCTURAL ONE", the fix that was supposed to stop
+/// this guard enumerating extensions forever — had **zero call sites** and was
+/// a `dead_code` warning.
+///
+/// It was not silently broken; it was SUPERSEDED. The same-day inversion of
+/// `load_invocation_scan_files` ("scan everything tracked unless excluded")
+/// covers extension-less executables by default, which is strictly stronger
+/// than asking each file for its shebang. So the enforcement was real and the
+/// function was redundant.
+///
+/// But a dead function whose doc-comment describes live enforcement is exactly
+/// the class this repo has recorded twice (`scan_silence` as a "cold-path
+/// sweep" with no callers; a "boot HALTS" that could not fire). Deleting it
+/// would also throw away the one guarantee the inversion does NOT make: the
+/// inversion is only as good as its EXCLUSION list, and nothing stops that
+/// list growing to cover a directory that holds an executable.
+///
+/// So the function gets the job the inversion cannot do — proving the
+/// exclusion list never hides something the kernel would execute. Adding
+/// `tools/` to `is_excluded_from_invocation_scan` while `tools/deploy` starts
+/// `#!/usr/bin/env <interpreter>` fails HERE, and nowhere else.
+#[test]
+fn every_tracked_executable_is_inside_the_invocation_scan() {
+    let root = repo_root();
+    let mut hidden: Vec<String> = Vec::new();
+    let mut executables = 0_usize;
+    for path in git_ls_files(&["."]) {
+        // Unreadable => binary => not a shebang script.
+        let Ok(content) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        if !has_interpreter_shebang(&content) {
+            continue;
+        }
+        executables += 1;
+        if is_excluded_from_invocation_scan(&path) {
+            hidden.push(path);
+        }
+    }
+    // Anti-vacuity, the shape this test needs: if NOTHING has a shebang the
+    // loop never runs and the emptiness assert below is trivially true. The
+    // tree has ~99 shebang files; 20 leaves headroom and still fails loudly
+    // if the enumeration collapses.
+    assert!(
+        executables > 20,
+        "RUST-ONLY GUARD IS BLIND: only {executables} tracked file(s) carry a shebang.          Expected >20. `git ls-files` or the read is broken, and this test is          enforcing nothing."
+    );
+    assert!(
+        hidden.is_empty(),
+        "RUST-ONLY VIOLATION: tracked executable(s) {hidden:?} carry a `#!` line but are          EXCLUDED from the invocation scan. The kernel will run them and this guard          cannot see what they invoke. Narrow is_excluded_from_invocation_scan() rather          than adding an allowlist entry."
     );
 }
 
@@ -1788,5 +1897,65 @@ fn scope_fix_2026_08_18_self_test() {
     assert!(
         ci_action_names("      # uses: evil/action@v1\n").is_empty(),
         "self-test: a commented-out action must never count"
+    );
+}
+
+/// BITE-PROOF for SCOPE FIX #7 (2026-08-19) — the slice-literal wrapper.
+///
+/// A scope fix that is not bite-proven is a claim. Every assertion below FAILS
+/// against the pre-fix extractor and PASSES against the current one, so this
+/// test is the difference between "we widened the scan" and "we widened the
+/// scan and it actually catches the shape".
+///
+/// The banned token is assembled at runtime rather than written as a literal,
+/// because this file is scanned by its own siblings and a literal here would
+/// make the guard fail on itself.
+#[test]
+fn scope_fix_2026_08_19_self_test() {
+    let banned = banned_token();
+
+    // (1) THE MISS. `run_cmd(&["<interpreter>", "-c", "…"])` — the real shape
+    // in `tv_doctor.rs`. Matches no marker the pre-fix extractor had: the
+    // program is `args[0]` (a variable, so `Command::new("` never sees it),
+    // and the slice is a bare `&[…]` ARGUMENT, not a `.args([…])` call.
+    let src = format!(r#"run_cmd(&["{banned}", "-c", "print(1)"])"#);
+    assert!(
+        !rust_spawn_violations(&src).is_empty(),
+        "self-test: a slice-literal wrapper call must be CAUGHT — this is the \
+         exact shape that passed green until 2026-08-19"
+    );
+
+    // (2) It generalises. The fix scans EVERY `(&[…])` group, not one more
+    // wrapper name, so a wrapper nobody has written yet is already covered.
+    let unknown = format!(r#"some_future_helper(&["{banned}", "script.x"])"#);
+    assert!(
+        !rust_spawn_violations(&unknown).is_empty(),
+        "self-test: the scan must not depend on the wrapper's NAME — enumerating \
+         names is what has been wrong five times running"
+    );
+
+    // (3) No false positive on a benign slice.
+    assert!(
+        rust_spawn_violations(r#"run_cmd(&["df", "-h", "/data"])"#).is_empty(),
+        "self-test: a benign slice must stay clean, or the first response to \
+         this guard will be to disable it"
+    );
+
+    // (4) The string-aware bracket bound. The old scanner stopped at the FIRST
+    // `]` anywhere, so a payload containing one truncated the group and
+    // silently dropped every literal after it — reporting clean on exactly the
+    // bytes an attacker controls.
+    let nested = format!(r#".args(["sh", "-c", "a[1]", "{banned}"])"#);
+    assert!(
+        !rust_spawn_violations(&nested).is_empty(),
+        "self-test: a `]` INSIDE a string must not end the group early"
+    );
+
+    // (5) An escaped quote must not end a literal early either.
+    let escaped = format!(r#".args(["say \"hi\"", "{banned}"])"#);
+    assert!(
+        !rust_spawn_violations(&escaped).is_empty(),
+        "self-test: an escaped quote inside a literal must not desynchronise \
+         the scanner and hide the literal after it"
     );
 }
