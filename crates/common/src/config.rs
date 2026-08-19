@@ -2966,6 +2966,61 @@ pub struct PartitionRetentionConfig {
     /// 0 = unlimited.
     #[serde(default = "default_max_partitions_per_run")]
     pub max_partitions_per_run: u32,
+    /// Master gate for PRESSURE-triggered archival (2026-08-19, feed-hardening
+    /// Item 5). serde default FALSE — an absent block is byte-identical to the
+    /// pre-2026-08-19 behaviour, and the supervised task is not even spawned.
+    ///
+    /// Why it exists: the daily archive leg above is triggered by partition
+    /// AGE and runs ONCE, post-market. At the authorized scale the modelled
+    /// tick volume fills a 100 GB volume in ~16 hours — inside the 2-day
+    /// minimum eligibility window and hours before the post-market run — so
+    /// the age-triggered leg can never fire in time. A full volume stops
+    /// EVERY writer, so the failure is "today's capture stops", not "old data
+    /// lingers".
+    ///
+    /// This gate adds a TRIGGER, never a delete path: the pressure loop calls
+    /// the same `archive_and_drop_old_partitions` whose `VerifiedArchive`
+    /// type-state makes a drop-without-verified-S3-copy unrepresentable.
+    #[serde(default)]
+    pub pressure_archive_enabled: bool,
+    /// Used-percentage at or above which a pressure episode STARTS.
+    ///
+    /// 75 leaves a quarter of the volume as runway while an episode works —
+    /// the export reads and the gzip temp file both need free space, so a
+    /// threshold too close to full would leave the remediation itself unable
+    /// to run.
+    #[serde(default = "default_pressure_high_water_pct")]
+    pub pressure_high_water_pct: u8,
+    /// Used-percentage strictly below which a pressure episode ENDS.
+    ///
+    /// MUST be below `pressure_high_water_pct` — the gap is the hysteresis
+    /// band that stops a volume hovering at the threshold from thrashing
+    /// QuestDB with export queries mid-session. Validated at use, not merely
+    /// documented: an inverted pair disables the trigger loudly rather than
+    /// oscillating.
+    #[serde(default = "default_pressure_low_water_pct")]
+    pub pressure_low_water_pct: u8,
+    /// Hot window in days used ONLY while a pressure episode is active.
+    ///
+    /// Still clamped to the same hard `MIN_HOT_DAYS = 2` floor as every other
+    /// class, so today's and yesterday's partitions stay untouchable AT ANY
+    /// PRESSURE. That floor is not tunable and is the reason this knob cannot
+    /// rescue a volume that two days of data alone would overflow — in that
+    /// case the loop escalates loudly instead of deleting.
+    #[serde(default = "default_pressure_hot_days")]
+    pub pressure_hot_days: u32,
+    /// Minimum seconds between the END of one pressure episode and the start
+    /// of the next. Bounds mid-session export load when usage sits near the
+    /// high-water mark for a long stretch.
+    #[serde(default = "default_pressure_min_interval_secs")]
+    pub pressure_min_interval_secs: u64,
+    /// Archive passes allowed within one episode before escalating.
+    ///
+    /// Bounded so a volume that cannot be relieved (nothing eligible, or S3
+    /// unreachable so nothing verifies) reaches the loud Critical escalation
+    /// instead of exporting in a loop forever.
+    #[serde(default = "default_pressure_max_passes")]
+    pub pressure_max_passes: u32,
 }
 
 impl Default for PartitionRetentionConfig {
@@ -2977,6 +3032,12 @@ impl Default for PartitionRetentionConfig {
             archive_enabled: false,
             archive_bucket: String::new(),
             max_partitions_per_run: default_max_partitions_per_run(),
+            pressure_archive_enabled: false,
+            pressure_high_water_pct: default_pressure_high_water_pct(),
+            pressure_low_water_pct: default_pressure_low_water_pct(),
+            pressure_hot_days: default_pressure_hot_days(),
+            pressure_min_interval_secs: default_pressure_min_interval_secs(),
+            pressure_max_passes: default_pressure_max_passes(),
         }
     }
 }
@@ -3006,6 +3067,48 @@ const fn default_depth_hot_days() -> u32 {
 /// several days of backlog while staying far inside the post-market window.
 const fn default_max_partitions_per_run() -> u32 {
     200
+}
+
+/// Default pressure entry threshold: 75% used.
+///
+/// The remediation itself needs headroom — the export streams a gzip temp
+/// file under `data/tmp/partition-archive/` before anything is dropped — so
+/// the trigger has to fire while there is still room to work. A quarter of
+/// the volume is that room.
+const fn default_pressure_high_water_pct() -> u8 {
+    75
+}
+
+/// Default pressure exit threshold: 60% used.
+///
+/// 15 points below the entry mark. The band is the anti-thrash mechanism: an
+/// episode that ended at 74% would restart on the next poll.
+const fn default_pressure_low_water_pct() -> u8 {
+    60
+}
+
+/// Default pressure hot window: 2 days — the `MIN_HOT_DAYS` floor itself.
+///
+/// Under pressure we compress the window as far as it is ALLOWED to go and
+/// no further. Setting this lower changes nothing (the clamp holds); it is
+/// expressed as 2 rather than 0 so the config states the real behaviour
+/// instead of relying on a clamp the reader has to go find.
+const fn default_pressure_hot_days() -> u32 {
+    2
+}
+
+/// Default cooldown between pressure episodes: 15 minutes.
+const fn default_pressure_min_interval_secs() -> u64 {
+    900
+}
+
+/// Default passes per episode: 4.
+///
+/// Each pass archives up to `max_partitions_per_run` partitions, so four
+/// passes is a substantial reclaim; if that has not moved the needle, the
+/// volume is not recoverable by retention and the operator needs to hear so.
+const fn default_pressure_max_passes() -> u32 {
+    4
 }
 
 // `ValkeyConfig` struct + `default_valkey_password` helper DELETED in

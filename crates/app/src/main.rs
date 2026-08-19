@@ -1467,6 +1467,31 @@ async fn main() -> Result<()> {
             std::path::PathBuf::from("data/spill"),
         );
 
+    // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
+    // volume and does nothing about it. This loop is the remediation arm.
+    //
+    // Why it cannot wait for the post-market archive: that leg is triggered by
+    // partition AGE and runs once, after the close. At the authorized scale the
+    // volume fills inside a session — hours before anything is age-eligible.
+    // And a full volume is not merely a housekeeping problem: every QuestDB
+    // write blocks, so the ILP flush backs up, so the frame drain backs up, so
+    // the socket receive buffer overflows — and Dhan's published architecture
+    // skips a slow consumer forward to "the latest available state", dropping
+    // the intermediate ticks at THEIR side. Bounding the disk is part of
+    // staying a fast consumer.
+    //
+    // It adds a TRIGGER, never a delete path: it calls the same
+    // archive→upload→verify→audit→drop whose `VerifiedArchive` type-state makes
+    // an unverified drop unrepresentable, and it REFUSES to delete anything
+    // further when nothing reclaimable remains (STORAGE-GAP-05, Critical).
+    // DEFAULT-OFF via serde, so an absent config block spawns nothing.
+    let _disk_pressure_supervisor =
+        tickvault_app::disk_pressure_boot::spawn_supervised_disk_pressure_loop(
+            std::path::PathBuf::from("data"),
+            config.questdb.clone(),
+            config.partition_retention.clone(),
+        );
+
     // W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
     // supervised per-table QuestDB WAL-suspension probe. Polls
     // `wal_tables()` every 60s via the shared probe client; a table whose

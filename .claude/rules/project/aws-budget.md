@@ -855,3 +855,76 @@ Total **≈ $0.60/mo pre-GST now (~₹51/mo incl. 18% GST at ₹85/$), ≈ $1.20
 inside the $35/mo pre-GST budget alarm ceiling and the ~₹3,101/mo envelope.
 
 > **[ARCHIVED 2026-07-20]** 2026-05-18/2026-05-20 historical body (CloudWatch-only decision, t4g.medium lock narrative, ₹1,022 bill, schedule, mechanical rules, risks, RAM-first architecture, coverage table, automation charter — retained as 2026-05-18 historical audit per the top banner; current contract = daily-universe-scope-expansion §7 + the 2026-07-19 rulings above) — moved verbatim to `docs/rules-archive/aws-budget-archive.md` (context-size incident; content unchanged).
+
+## COST NOTE 2026-08-19 — EBS 100 → 200 GB (+$9.12/mo ≈ ₹915 incl GST)
+
+Authority: `daily-universe-scope-expansion-2026-05-27.md` **Quote 16** (2026-08-19,
+verbatim: *"Grow gp3 100 → 200 GB yes even icnrease this also dude okay?"*), given in
+direct response to the option table that compared it against r8gd.xlarge.
+
+**What was rejected, and why it matters more than the raise.** The operator first
+proposed **r8gd.xlarge**, believing it had more memory. It does not — r8gd.xlarge is
+**32 GiB, identical to r8g.xlarge**; the `d` is a local NVMe instance store, not RAM.
+That NVMe is **wiped on every instance stop**, and this box stops at 17:30 IST every
+weekday, so the current day's data would be destroyed nightly. Choosing it would have
+cost ~25% more per hour to *delete the day* — against a same-session directive that
+nothing be missed or deleted. r8gd was already rejected on these grounds in Quote 13;
+the EBS grow is the lever that actually serves the intent, because EBS survives the stop.
+
+| Line | Before | After |
+|---|---|---|
+| EBS gp3 | 100 GB × $0.0912 = $9.12 | **200 GB × $0.0912 = $18.24** |
+| Bill (low–high, ~210 hrs) | $58.06–$73.60 | **$67.18–$82.72** |
+| ₹ incl 18% GST at ₹85/$ | ~₹5,824–7,382 | **~₹6,739–8,297** |
+
+**The margin, stated plainly.** The $100 kill-ceiling's AUTOMATIC action is
+`STOP_EC2_INSTANCES` on the prod box at the 90% line ($90). The high estimate moves
+$73.60 → $82.72, so headroom narrows from **$16.40 to $7.28**. That is still real
+margin, but it is no longer comfortable: **a further EBS grow, or any other material
+add, must raise the ceiling in the same change** or a busy month will stop the box
+mid-session. 200 GB is also now BOTH the `variables.tf` default and its validation
+ceiling, so the next grow is gated on a validation edit too.
+
+**The Quote 9 sub-₹1,000/month target moves from ~6× breached to ~7× breached**,
+knowingly, and the downward ratchet ladder stays PAUSED.
+
+**NOT claimed:** that this grows the live volume. `root_block_device[0].volume_size` is
+in the instance's `lifecycle.ignore_changes`, so `terraform apply` never touches the
+running root — the default records fresh-provision intent and the live grow is the
+out-of-band online `aws ec2 modify-volume --size 200` (plus a filesystem grow), or
+`scripts/aws-upgrade-instance.sh --ebs-size 200`. **NOT claimed:** that 200 GB makes a
+full disk impossible — at the modelled depth load (~21 GB/day at one snapshot/second,
+~104 GB/day at five) this buys roughly +4.8 days at the low estimate and +1 day at the
+high one. It widens the runway; the pressure-triggered archival landing alongside it is
+what bounds the disk, and even that escalates rather than deletes when two days of data
+exceeds the volume. **One-way door:** gp3 grows online and can never shrink.
+
+## COST NOTE 2026-08-19 — STORAGE-GAP-05 pressure-archival alarm (+~$0.10/mo)
+
+Authority: feed-hardening plan Item 5 design addendum. The Critical-severity
+coverage guard (`critical_errcode_alarm_coverage_guard.rs`) REFUSED the new code
+without an alarm, correctly — and the refusal is the interesting part: a filling
+volume that the automation has deliberately stopped acting on is the textbook
+silent failure, and the guard would not let it ship as one.
+
+**+1 errcode log-filter alarm ≈ $0.10/mo** (`error-code-alarms.tf`, 16 → 17 map
+entries). The derived metric is sparse and dimensionless — billed only in hours the
+code actually fires — so it is near-free at rest. Zero new EMF allowlist names, zero
+dashboards, zero Lambdas.
+
+**Why it earns the dime.** A full volume is not a storage inconvenience. Every
+QuestDB write blocks → the ILP flush backs up → the frame drain backs up → the
+socket receive buffer overflows → and per Dhan's own published architecture a slow
+consumer is *skipped forward to "the latest available state"*, with the intermediate
+ticks dropped at **their** side, silently, with no sequence number for us to detect
+it. So this alarm is a tick-loss pager wearing a storage label.
+
+**`ok_recovery = true`, unlike its ws-spill siblings.** Those are marked
+false because the frames they report are permanently gone and an auto-OK would be a
+false recovery. Nothing is lost by STORAGE-GAP-05 — the volume genuinely can recover
+(an operator grows it, or partitions age past the 2-day floor and the next pass frees
+them), so "the disk is healthy again" is a true statement worth sending.
+
+**NOT claimed:** that this prevents a full disk. It reports that the automation has
+reached the end of what it is permitted to do. The remedy — grow the volume, or cut
+ingest scope — is the operator's, deliberately.

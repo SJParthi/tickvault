@@ -233,6 +233,51 @@ archive_bucket = ""
 # post-market runs instead of overrunning the 16:30 IST box stop.
 max_partitions_per_run = 200
 
+# --- PRESSURE-triggered archival (feed-hardening Item 5, 2026-08-19) ---
+#
+# The knobs above trigger archival on partition AGE, once, after market
+# close. At the authorized scale the volume fills INSIDE a session, hours
+# before anything is age-eligible — so the age-triggered leg can never fire
+# in time, and a full volume stops every writer (ticks, candles, depth,
+# audit) rather than merely letting old data linger.
+#
+# This block adds a TRIGGER, never a delete path. When it fires it calls the
+# SAME archive -> upload -> verify (row count + object size + SHA-256) ->
+# audit -> drop flow as the daily leg. A partition that cannot be verified
+# into S3 is KEPT. When nothing reclaimable remains, it fires
+# STORAGE-GAP-05 (Critical) and STOPS — it never deletes unarchived data to
+# save itself.
+pressure_archive_enabled = true
+
+# Used-percentage at or above which an episode starts. 75 leaves a quarter
+# of the volume as working room: the export streams a gzip temp file before
+# anything is dropped, so a threshold too close to full would leave the
+# remediation itself unable to run.
+pressure_high_water_pct = 75
+
+# Used-percentage strictly below which the episode ends. The 15-point gap is
+# the anti-thrash band — an episode that ended at 74 would restart on the
+# next poll. An inverted pair DISABLES the loop loudly rather than
+# oscillating.
+pressure_low_water_pct = 60
+
+# Hot window used only while under pressure. Clamped UP to the same hard
+# MIN_HOT_DAYS = 2 floor as every other class, so today's and yesterday's
+# partitions are untouchable AT ANY PRESSURE: the archiver's verify
+# re-counts rows after the export (closing the export->count race) but not
+# the count->drop race, and on a partition still being written that window
+# can swallow an arriving tick. Setting this lower changes nothing.
+pressure_hot_days = 2
+
+# Cooldown between episodes. Bounds mid-session export load when usage sits
+# near the high-water mark for a long stretch.
+pressure_min_interval_secs = 900
+
+# Archive passes per episode before escalating. Each pass archives up to
+# max_partitions_per_run partitions; if four have not moved the needle the
+# volume is not recoverable by retention and the operator needs to hear so.
+pressure_max_passes = 4
+
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store
 # in PR #764.

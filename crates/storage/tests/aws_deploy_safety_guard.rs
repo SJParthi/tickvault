@@ -17,7 +17,8 @@
 //!   3. Revert the weekday-only schedule (MON-FRI) back to daily (Mon-Sun).
 //!   4. Flip `enable_eip` default to true (no orders for 3 months → no Dhan
 //!      static-IP need → EIP off saves ~₹430/mo).
-//!   5. Change the EBS default away from 50 GB (2026-07-13 disk-pressure grow; was 30).
+//!   5. Change the EBS default away from 200 GB (operator Quote 16, 2026-08-19;
+//!      was 100 per Quote 13, and 50/30 before that).
 //!
 //! Each assertion fails the build with an operator-readable message so the next
 //! session (or Cowork task) cannot regress the locked config by accident.
@@ -183,7 +184,14 @@ fn deploy_eip_is_enabled_by_default() {
     );
 }
 
-/// EBS FRESH-PROVISION default is 100 GB (operator Quote 13, 2026-08-08 —
+/// EBS FRESH-PROVISION default is 200 GB (operator Quote 16, 2026-08-19 —
+/// "Grow gp3 100 -> 200 GB yes even icnrease this also dude okay?"). Raised
+/// from the Quote 13 default of 100 after r8gd.xlarge was proposed and
+/// REJECTED: r8gd.xlarge has the SAME 32 GiB of RAM, and its local NVMe is
+/// wiped on every instance stop while this box stops nightly — it would have
+/// cost ~25% more per hour to delete each day. EBS survives the stop.
+///
+/// Quote 13 rationale, still current for the sizing itself (2026-08-08 —
 /// sized for the 13-timeframe current-day workload WITH raw-tick retention:
 /// ticks ~44-141 GB/mo (Assumed 25-80 M rows/day) + 13 sparse timeframes
 /// ~61 GB/mo, held ~30 days with S3 archival beyond). Supersedes the
@@ -199,17 +207,29 @@ fn deploy_eip_is_enabled_by_default() {
 /// never physically applied, live verified 30 GiB on 2026-07-19] -> 20 target
 /// (2026-07-15) -> 100 (2026-08-08).
 #[test]
-fn deploy_ebs_default_is_100gb() {
+fn deploy_ebs_default_is_200gb() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"ebs_gp3_size_gb\""),
         "variables.tf must declare `ebs_gp3_size_gb`."
     );
     assert!(
-        vars.contains("type = number default = 100"),
-        "ebs_gp3_size_gb must default to 100 GB (operator Quote 13, 2026-08-08 — \
-         the 13-timeframe + raw-tick-retention workload; supersedes the \
-         2026-07-15 20 GB pre-stage default)."
+        vars.contains("type = number default = 200"),
+        "ebs_gp3_size_gb must default to 200 GB (operator Quote 16, 2026-08-19 — \
+         'Grow gp3 100 -> 200 GB yes even icnrease this also dude okay?', given \
+         after r8gd.xlarge was proposed and rejected: its local NVMe is WIPED on \
+         every stop and this box stops nightly, so it would delete the day; EBS \
+         survives the stop. Raised from the Quote 13 default of 100)."
+    );
+    // 200 is now BOTH the default and the validation ceiling, so the next grow
+    // cannot be a drive-by: it needs a validation edit, its own dated quote,
+    // AND a budget-ceiling raise (+100 GB = +$9.12/mo leaves only $7.28 under
+    // the $100 kill line, whose AUTOMATIC action stops the prod box).
+    assert!(
+        vars.contains("var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 200"),
+        "the 10-200 GB validation range must stay — with the default AT the \
+         ceiling it is what makes a further grow a deliberate, quoted decision \
+         rather than a one-character edit."
     );
     // Inverted pin: 250+ is NOT the safe direction. gp3 grows online and can
     // never shrink, so over-provisioning is the irreversible mistake and pays
