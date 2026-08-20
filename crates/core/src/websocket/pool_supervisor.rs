@@ -2045,9 +2045,30 @@ where
                             }
                         }
                         Err(_) => {
-                            // `try_extend` already logged the refusal with the
-                            // numbers; counted here so it is visible as a
-                            // metric and not only as a log line.
+                            // LOUD at the emit site, not only inside
+                            // `try_extend`. The loss-counter visibility guard
+                            // caught the first version of this: `try_extend`
+                            // warns about the CAP ARITHMETIC, but that is a
+                            // different function, so the counter reached no
+                            // operator surface at all — measured loss,
+                            // discarded measurement, green dashboard.
+                            //
+                            // The two lines say different things and both are
+                            // worth having: `try_extend` explains WHY the set
+                            // was refused, this says WHAT IT COSTS — the
+                            // overflow contracts are not on the wire, so the
+                            // ATM window is narrower than the operator
+                            // authorized and nothing downstream can tell.
+                            error!(
+                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                endpoint = supervisor.slot().endpoint.as_str(),
+                                pool_index = supervisor.slot().pool_index,
+                                added,
+                                already = guard.len(),
+                                "live subscription top-up REFUSED — those contracts are NOT \
+                                 subscribed this session, so the ATM window is narrower than \
+                                 authorized. The pool-dialed contracts and depth are unaffected."
+                            );
                             metrics::counter!("tv_dhan_ws_topup_refused_total").increment(1);
                         }
                     }
