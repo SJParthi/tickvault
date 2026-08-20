@@ -1035,6 +1035,41 @@ exists to stop.
   instrument-less depth pool as "enabled".
 - Claims any of this is working before a non-zero `compared`.
 
+#### 2026-08-19 — APPLIED: the two constants this section's REJECT list names
+
+The 2026-08-15 authorization above listed four things it changes. **Two were
+recorded and never applied**, which is worth stating plainly: for four days the
+rule file said Full mode and 25,000 while the code said Quote and 1,200. This
+subsection closes that gap and is the lockstep record its own REJECT rows demand.
+
+| Constant | Was | Now | Ratchet re-blessed in the same change |
+|---|---|---|---|
+| `connection.rs::DEFAULT_MAIN_FEED_MODE` | `FeedMode::Quote` (code 17, 50 B) | **`FeedMode::Full`** (code 21, 162 B) | `test_the_default_feed_mode_is_the_scope_locked_full_mode` + `test_the_main_feed_payload_carries_the_full_request_code` |
+| `constants.rs::MAX_DAILY_UNIVERSE_SIZE` | `1200` | **`25_000`** | `max_daily_universe_size_pinned_at_25000` + the rule-file cross-ref |
+
+The second test on the mode row is the one that matters: a constant changed
+while `subscription_builder` still emitted 17 would subscribe Quote packets
+while every document claimed Full, and the only symptom would be a quiet
+`unparseable` counter. It asserts 21 is present **and** 17 is gone.
+
+**What the mode flip does NOT deliver (Rule 11).** Every Full packet carries 5
+levels of bid/ask, and the drain discards them — `ParsedFrame::TickWithDepth(tick, _)`
+folds the tick and drops the depth, because no depth writer and no depth table
+exist. So the lane now pays **3.24× the bandwidth** and consumes the tick half.
+That is deliberate, not an oversight: the same section's second quote binds
+depth to "either the vertical lands, or the depth pools stay at zero
+instruments", and a writer must exist before anything is claimed as captured.
+The 5-level depth inside Full is the *cheapest* future source for that writer —
+it arrives on a socket already open — but wiring it is its own unit of work.
+
+**Neither constant makes the feed work, and neither is the measurement.** The
+universe cap in particular enforces nothing at all — see the corrected §2
+envelope note in `daily-universe-scope-expansion-2026-05-27.md`, which records
+that the live lane ran at 4,565 SIDs for a week against a stated 1,200 "cap"
+with no halt, because the enforcing function was deleted on 2026-07-13. The
+measurement that settles whether any of this works remains a non-zero
+`compared` from the 15:31 cross-verification.
+
 ### 2026-08-15 (SAME DAY, SECOND QUOTE) — DEPTH IS CAPTURED IN FULL, INTO ONE COMMON TABLE; NOTHING IS DROPPED
 
 **The verbatim operator demand (2026-08-15, typed directly in-session — preserve
@@ -1161,3 +1196,73 @@ both counts: the recommendation AND the number behind it.)*
 - Opens depth sockets before the writer exists (the previous section's binding
   rule stands — a captured-then-discarded frame is still a discarded frame).
 - Reports depth as "captured" while `depth_unconsumed` is still incrementing.
+
+### 2026-08-20 — MAIN-FEED PACKS ITS FIRST PASS (the 2026-08-12 spread directive, amended so it can actually be delivered)
+
+**The verbatim operator demand (2026-08-20, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "See without building our entire plan why the fuck you stopped motjerfuxker youcfinaih everything entirely fully motherucker rokah"
+
+Given in DIRECT response to a report that said 6 of the 16 authorized sockets
+carry data, that contracts do not dial, and that closing it "needs your decision:
+pack the spot universe onto fewer sockets to leave room for contracts, or keep it
+spread across all 5." The operator's answer is that there was no decision to
+escalate — finish it. This section is the dated record that house law requires
+before the code changes.
+
+#### What this amends
+
+The 2026-08-12 directive told `plan_pool` to **SPREAD** across the authorized
+connections rather than pack into the fewest. That was correct for the shape it
+was written for: the main feed carried ONLY the ~4,565 spot universe, and four
+authorized sockets sat idle.
+
+The main feed is now dialed in **two passes** — spots at boot, and the ~20,000
+option/future contracts once post-open prices exist. Under spread, pass 1 takes
+`min(5, 4565)` = **all five** connections, so pass 2 is refused by the stateful
+`pool.admit`; and because `MainFeed` is the first endpoint in
+`build_feed_stack_plan`'s loop, that refusal aborted **Depth20 and Depth200
+planning as well**. Spreading the small first pass is precisely what starved the
+sockets the spread directive existed to fill.
+
+| pass | PACKED | SPREAD |
+|---|---|---|
+| boot spots (4,565) | 1 connection | 5 connections |
+| contracts (~20,000) | 4 connections | 0 — REFUSED |
+| **main-feed sockets carrying data** | **5** | **1** |
+| **depth planned at all?** | yes | **no — aborted by the main-feed refusal** |
+
+#### The amendment (narrow)
+
+**The MAIN FEED packs: `connections_to_use = ceil(len / cap).min(available)`.
+DEPTH continues to SPREAD, unchanged.**
+
+Depth must keep spreading and this is not a detail: depth-200 admits ONE
+instrument per connection, so packing it would open a single socket and strand
+four. The 2026-08-12 reasoning — failure isolation, head-of-line blocking,
+decode parallelism — stands verbatim for depth and stands for the main feed too
+once both passes have run, because the end state is the same five sockets.
+
+**At the 25,000 target the two policies converge exactly**
+(`ceil(25000/5000)` = 5 = `min(5, 25000)`), so this changes nothing at full
+scale and everything today.
+
+#### What this does NOT change
+
+The 16-connection budget; the four endpoint types; `dry_run` stays true; no live
+order fire; the §28 frozen indicator/strategy area; the per-minute REST KEEP; the
+Q3 ban on a hardcoded expiring contract list. Contract security-ids continue to
+come from the already-running option-chain leg, which self-rolls at expiry.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Packs DEPTH (strands four depth-200 sockets on one connection).
+- Lets `main_feed_connections_for` and `plan_pool`'s main-feed arm disagree —
+  that disagreement is the exact defect this amends, and it cost depth an entire
+  session while reporting a depth problem that did not exist.
+- Reports main-feed capacity without clamping to what the pool actually has
+  free (`.min(available)`), which asks for room that does not exist and earns a
+  refusal of the WHOLE pool.
+- Claims sockets are "carrying data" on the strength of a dial rather than a
+  received frame (see the same-day up-gauge correction).

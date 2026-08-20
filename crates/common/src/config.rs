@@ -2949,6 +2949,31 @@ pub struct PartitionRetentionConfig {
     /// fail-closed by construction.
     #[serde(default = "default_depth_hot_days")]
     pub depth_hot_days: u32,
+    /// Hot window in days for the INTRADAY class — `ticks` plus the five
+    /// second-level candle tables (`candles_1s`/`5s`/`10s`/`15s`/`30s`).
+    ///
+    /// Its own knob since 2026-08-19, on an operator directive that separates
+    /// two things the old single `market_data_hot_days` window conflated:
+    /// *"for depth or whatever it is only current day, worst case busy day …
+    /// when it comes to historical we will just have minute levels, because
+    /// indicators, strategies and minute level of all these historical"*.
+    ///
+    /// Why it cannot share the market-data window: at the 25,000-instrument
+    /// target `ticks` runs ~14 GB/day and the second-level candles are the
+    /// heaviest tables on the box after depth. Holding either for 35 days
+    /// commits several hundred GB on a 200 GB root, and a full disk stops
+    /// EVERY table — the same reasoning that gave `market_depth` its own knob
+    /// on 2026-08-15, applied to the class directly beneath it.
+    ///
+    /// Minute-and-above candles are deliberately NOT in this class: they are
+    /// the history indicators and strategies read, they are two orders of
+    /// magnitude smaller per day, and they keep `market_data_hot_days`.
+    ///
+    /// This is NOT a retention cut. Every partition is exported, uploaded and
+    /// row-count-VERIFIED in S3 before it leaves EBS, and the floor clamps to
+    /// `MIN_HOT_DAYS` so today and yesterday stay local and untouchable.
+    #[serde(default = "default_intraday_hot_days")]
+    pub intraday_hot_days: u32,
     /// Master gate for the archive→verify→drop leg. serde default FALSE so
     /// the destructive behaviour must be explicitly configured on
     /// (config/base.toml sets it true for prod); flipping it off restores
@@ -2966,6 +2991,61 @@ pub struct PartitionRetentionConfig {
     /// 0 = unlimited.
     #[serde(default = "default_max_partitions_per_run")]
     pub max_partitions_per_run: u32,
+    /// Master gate for PRESSURE-triggered archival (2026-08-19, feed-hardening
+    /// Item 5). serde default FALSE — an absent block is byte-identical to the
+    /// pre-2026-08-19 behaviour, and the supervised task is not even spawned.
+    ///
+    /// Why it exists: the daily archive leg above is triggered by partition
+    /// AGE and runs ONCE, post-market. At the authorized scale the modelled
+    /// tick volume fills a 100 GB volume in ~16 hours — inside the 2-day
+    /// minimum eligibility window and hours before the post-market run — so
+    /// the age-triggered leg can never fire in time. A full volume stops
+    /// EVERY writer, so the failure is "today's capture stops", not "old data
+    /// lingers".
+    ///
+    /// This gate adds a TRIGGER, never a delete path: the pressure loop calls
+    /// the same `archive_and_drop_old_partitions` whose `VerifiedArchive`
+    /// type-state makes a drop-without-verified-S3-copy unrepresentable.
+    #[serde(default)]
+    pub pressure_archive_enabled: bool,
+    /// Used-percentage at or above which a pressure episode STARTS.
+    ///
+    /// 75 leaves a quarter of the volume as runway while an episode works —
+    /// the export reads and the gzip temp file both need free space, so a
+    /// threshold too close to full would leave the remediation itself unable
+    /// to run.
+    #[serde(default = "default_pressure_high_water_pct")]
+    pub pressure_high_water_pct: u8,
+    /// Used-percentage strictly below which a pressure episode ENDS.
+    ///
+    /// MUST be below `pressure_high_water_pct` — the gap is the hysteresis
+    /// band that stops a volume hovering at the threshold from thrashing
+    /// QuestDB with export queries mid-session. Validated at use, not merely
+    /// documented: an inverted pair disables the trigger loudly rather than
+    /// oscillating.
+    #[serde(default = "default_pressure_low_water_pct")]
+    pub pressure_low_water_pct: u8,
+    /// Hot window in days used ONLY while a pressure episode is active.
+    ///
+    /// Still clamped to the same hard `MIN_HOT_DAYS = 2` floor as every other
+    /// class, so today's and yesterday's partitions stay untouchable AT ANY
+    /// PRESSURE. That floor is not tunable and is the reason this knob cannot
+    /// rescue a volume that two days of data alone would overflow — in that
+    /// case the loop escalates loudly instead of deleting.
+    #[serde(default = "default_pressure_hot_days")]
+    pub pressure_hot_days: u32,
+    /// Minimum seconds between the END of one pressure episode and the start
+    /// of the next. Bounds mid-session export load when usage sits near the
+    /// high-water mark for a long stretch.
+    #[serde(default = "default_pressure_min_interval_secs")]
+    pub pressure_min_interval_secs: u64,
+    /// Archive passes allowed within one episode before escalating.
+    ///
+    /// Bounded so a volume that cannot be relieved (nothing eligible, or S3
+    /// unreachable so nothing verifies) reaches the loud Critical escalation
+    /// instead of exporting in a loop forever.
+    #[serde(default = "default_pressure_max_passes")]
+    pub pressure_max_passes: u32,
 }
 
 impl Default for PartitionRetentionConfig {
@@ -2974,9 +3054,16 @@ impl Default for PartitionRetentionConfig {
             retention_days: default_retention_days(),
             market_data_hot_days: default_market_data_hot_days(),
             depth_hot_days: default_depth_hot_days(),
+            intraday_hot_days: default_intraday_hot_days(),
             archive_enabled: false,
             archive_bucket: String::new(),
             max_partitions_per_run: default_max_partitions_per_run(),
+            pressure_archive_enabled: false,
+            pressure_high_water_pct: default_pressure_high_water_pct(),
+            pressure_low_water_pct: default_pressure_low_water_pct(),
+            pressure_hot_days: default_pressure_hot_days(),
+            pressure_min_interval_secs: default_pressure_min_interval_secs(),
+            pressure_max_passes: default_pressure_max_passes(),
         }
     }
 }
@@ -2990,8 +3077,29 @@ const fn default_retention_days() -> u32 {
 /// — one month of spot history + weekend slack; was 14). Inert unless
 /// `archive_enabled`; safe-by-default because the archive→verify→drop flow
 /// is fail-closed (no verified S3 copy ⇒ no drop).
+/// Default MARKET-DATA hot window: **15 days** (2026-08-19, operator approval
+/// — "i believ its betetr to have 15 dyas ... trim minute history 35->15
+/// days"). Was 35 from the 2026-07-16 directive.
+///
+/// This is the operator scope call that `config/base.toml` had FLAGGED and
+/// deliberately left un-taken: the executor may not shorten a window an
+/// operator directive set. It is taken now, by the operator.
+///
+/// The class holds only minute-and-above candles since the 2026-08-19
+/// Intraday split, so this window no longer governs ticks or the sixteen
+/// sub-minute tables — it governs exactly the history the indicator and
+/// strategy paths warm up from, which is why 15 days is a judgement about
+/// warmup depth rather than about disk.
+///
+/// Measured basis (2026-08-18, live): all eight minute-and-above candle
+/// tables together run ~0.3 GB/day at the live ~4,565-SID universe, so
+/// 35 -> 15 frees ~6 GB today and ~33 GB at the 25,000-instrument target.
+///
+/// NOT a retention cut: every partition is exported, uploaded and
+/// row-count-VERIFIED in S3 before it leaves EBS. Only the local hot window
+/// shortens; the history itself is kept in full.
 const fn default_market_data_hot_days() -> u32 {
-    35
+    15
 }
 
 /// Default depth hot window: 3 days. See `depth_hot_days` for the arithmetic
@@ -3001,11 +3109,65 @@ const fn default_depth_hot_days() -> u32 {
     3
 }
 
+/// Default INTRADAY hot window: 2 days = the `MIN_HOT_DAYS` floor itself —
+/// today plus yesterday, which is the smallest window the sweep can honour
+/// without risking a partition that is still being written.
+///
+/// The operator's directive is "current day only"; 2 is what that means in
+/// practice, because a day-partitioned table's current partition cannot be
+/// dropped while rows are still landing in it. Setting this to 0 or 1 changes
+/// nothing — `effective_hot_days` clamps to the same floor.
+const fn default_intraday_hot_days() -> u32 {
+    2
+}
+
 /// Default per-run archive bound: 200 partitions. At ~8–24 hourly ticks
 /// partitions + ~22 daily candle partitions per aged-out day, one run covers
 /// several days of backlog while staying far inside the post-market window.
 const fn default_max_partitions_per_run() -> u32 {
     200
+}
+
+/// Default pressure entry threshold: 75% used.
+///
+/// The remediation itself needs headroom — the export streams a gzip temp
+/// file under `data/tmp/partition-archive/` before anything is dropped — so
+/// the trigger has to fire while there is still room to work. A quarter of
+/// the volume is that room.
+const fn default_pressure_high_water_pct() -> u8 {
+    75
+}
+
+/// Default pressure exit threshold: 60% used.
+///
+/// 15 points below the entry mark. The band is the anti-thrash mechanism: an
+/// episode that ended at 74% would restart on the next poll.
+const fn default_pressure_low_water_pct() -> u8 {
+    60
+}
+
+/// Default pressure hot window: 2 days — the `MIN_HOT_DAYS` floor itself.
+///
+/// Under pressure we compress the window as far as it is ALLOWED to go and
+/// no further. Setting this lower changes nothing (the clamp holds); it is
+/// expressed as 2 rather than 0 so the config states the real behaviour
+/// instead of relying on a clamp the reader has to go find.
+const fn default_pressure_hot_days() -> u32 {
+    2
+}
+
+/// Default cooldown between pressure episodes: 15 minutes.
+const fn default_pressure_min_interval_secs() -> u64 {
+    900
+}
+
+/// Default passes per episode: 4.
+///
+/// Each pass archives up to `max_partitions_per_run` partitions, so four
+/// passes is a substantial reclaim; if that has not moved the needle, the
+/// volume is not recoverable by retention and the operator needs to hear so.
+const fn default_pressure_max_passes() -> u32 {
+    4
 }
 
 // `ValkeyConfig` struct + `default_valkey_password` helper DELETED in
@@ -4109,7 +4271,7 @@ mod tests {
             toml::from_str("retention_days = 90").expect("legacy section must parse");
         assert_eq!(cfg.retention_days, 90);
         // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
-        assert_eq!(cfg.market_data_hot_days, 35);
+        assert_eq!(cfg.market_data_hot_days, 15);
         assert!(!cfg.archive_enabled, "archive leg must default OFF");
         assert!(cfg.archive_bucket.is_empty(), "bucket must default derived");
         assert_eq!(cfg.max_partitions_per_run, 200);
@@ -4122,7 +4284,7 @@ mod tests {
         // (delete the key ⇒ detach-only legacy behaviour).
         assert!(!PartitionRetentionConfig::default().archive_enabled);
         // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
-        assert_eq!(default_market_data_hot_days(), 35);
+        assert_eq!(default_market_data_hot_days(), 15);
         assert_eq!(default_max_partitions_per_run(), 200);
         let cfg: PartitionRetentionConfig =
             toml::from_str("").expect("empty section must parse via defaults");
@@ -4137,6 +4299,9 @@ mod tests {
         .expect("full section must parse");
         assert!(cfg.archive_enabled);
         assert_eq!(cfg.archive_bucket, "tv-prod-cold");
+        // 35, NOT the 15 default: this test parses an EXPLICIT value and
+        // exists to prove an explicit setting overrides the default. If this
+        // ever tracks the default it stops testing anything.
         assert_eq!(cfg.market_data_hot_days, 35);
         assert_eq!(cfg.max_partitions_per_run, 50);
     }

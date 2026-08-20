@@ -70,6 +70,7 @@ pub mod orphan_position_watchdog_boot;
 // SPOT half): fetch each just-closed session minute's official 1m OHLCV
 // for the 3 IDX_I spot indices via POST /v2/charts/intraday and persist to
 // the `spot_1m_rest` table (SPOT1M-01/02).
+pub mod seal_loss_alarm;
 pub mod spot_1m_rest_boot;
 // Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
 // the OPTION-CHAIN half; config-gated DEFAULT-OFF pending the live
@@ -132,6 +133,10 @@ pub mod boot_helpers;
 /// the 15:40 timeframe check's catch-up arm consults them so a
 /// post-15:40 restart never re-fires an already-delivered daily card.
 pub mod daily_task_marker;
+/// `[groww_universe]` process-global daily Groww watch-set + shared-master
+/// rider (2026-07-15 live-feed retirement re-home of the activation daily
+/// build loop + the sole persist_groww_instruments caller).
+pub mod dhan_contract_universe;
 /// Dhan runtime activation watcher (PR-2) — dormant supervisor that keeps the
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
@@ -144,9 +149,6 @@ pub mod daily_task_marker;
 /// (`dhan_activation` — the lane cold-start watcher that preceded this
 /// decl — was deleted in PR-C2 with the Dhan live-WS lane.)
 pub mod dhan_data_api_limiter;
-/// `[groww_universe]` process-global daily Groww watch-set + shared-master
-/// rider (2026-07-15 live-feed retirement re-home of the activation daily
-/// build loop + the sole persist_groww_instruments caller).
 pub mod dhan_depth_universe;
 /// Dhan 16-connection live-feed stack — boot wiring, DEFAULT-OFF behind BOTH
 /// `[feeds] dhan_enabled` and the `TICKVAULT_DHAN_LIVE_FEED=1` environment
@@ -167,6 +169,7 @@ pub mod dhan_intraday_parse;
 /// packet-loss proxy). Integer-paise OHLC compare, quantified noise profile,
 /// and a `blind` outcome that makes a zero-comparison run structurally
 /// incapable of reading as a pass — the PR #1474 blind-since-birth lesson.
+pub mod dhan_lifecycle;
 pub mod dhan_live_crossverify;
 pub mod dhan_live_universe;
 /// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive
@@ -182,6 +185,13 @@ pub mod dhan_order_push_observability;
 /// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
 pub mod dhan_rest_stack;
 pub mod dhan_universe;
+/// Pressure-triggered partition archival (feed-hardening Item 5, 2026-08-19).
+/// The disk-health watcher MEASURES a filling volume; this is the arm that
+/// acts on it, mid-session, because the daily age-triggered archive cannot
+/// fire in time at scale. Adds a TRIGGER, never a delete path — it calls the
+/// unchanged verified archive→drop and REFUSES to delete anything further
+/// when nothing reclaimable remains (STORAGE-GAP-05). DEFAULT-OFF via serde.
+pub mod disk_pressure_boot;
 /// Groww order/position PUSH channel — Stage D app consumer (2026-07-17,
 /// operator-authorized paper-mode receive-only build): bridges trading-side
 /// `BrokerOrderEvent`s from the supervised push runner into `order_audit`

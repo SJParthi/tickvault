@@ -53,8 +53,12 @@ fn test_tick_gap_tracker_has_backlog_before_state_mutation() {
     // The backlog-tick check MUST appear BEFORE `states.entry(...).or_insert(...)`.
     // If someone moves the `or_insert` back above the backlog filter, the
     // 2026-04-24 988-false-positive bug returns.
+    // 2026-08-19: the key became the I-P1-11 composite `(security_id,
+    // exchange_segment_code)`, bound to `key` just above. The INVARIANT this
+    // guard protects is unchanged — the backlog filter must still run before
+    // any state mutation — so only the literal moves.
     let or_insert_idx = src
-        .find("self.states.entry(security_id).or_insert(")
+        .find("self.states.entry(key).or_insert(")
         .expect("expected or_insert call in tick_gap_tracker");
     let backlog_idx = src
         .find("let is_backlog_tick = tick_age_secs > BACKLOG_TICK_AGE_THRESHOLD_SECS")

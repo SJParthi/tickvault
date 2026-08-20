@@ -20,9 +20,16 @@
 //! Mirrors `tick_persistence::TickPersistenceWriter`:
 //! - The `mpsc` is the **thread-safe wire** between the aggregator
 //!   hot path (zero-alloc, `&AtomicCell`) and the writer task (cold
-//!   path, allowed to allocate). `try_send` is non-blocking — if the
-//!   channel is full, the producer drops and increments a Prom
-//!   counter; it NEVER waits on I/O.
+//!   path, allowed to allocate). `try_send` is non-blocking and NEVER
+//!   waits on I/O.
+//!
+//!   **Corrected 2026-08-19:** this line read "if the channel is full,
+//!   the producer drops and increments a Prom counter". That was an
+//!   accurate description of a policy the operator has overruled —
+//!   *"never ever drop any ticks irrespective of any worst case"*. A
+//!   refused seal now goes through [`SealOverflow`] to the SAME spill →
+//!   DLQ tiers the ring uses, so the only remaining loss requires the
+//!   data volume to be unwritable.
 //! - The `SealRing` (inside the pipeline) is a **local single-threaded
 //!   buffer** owned by the writer task. It absorbs bursts when the
 //!   ILP send is briefly slow, and on overflow cascades to disk
@@ -116,13 +123,102 @@ pub fn set_global_seal_sender(sender: mpsc::Sender<BufferedSeal>) -> bool {
 ///
 /// Producers clone the returned sender (mpsc Senders are cheap to
 /// clone) and call `try_send(seal)` on the clone. `try_send` is
-/// non-blocking by design — if the mpsc is full (after the writer
-/// task has fallen behind for ~20 seconds at peak burst), the seal
-/// is dropped and the producer increments
-/// `tv_seal_producer_mpsc_full_total`.
+/// non-blocking by design.
+///
+/// **A refused seal must NEVER be discarded.** Operator directive
+/// 2026-08-19: *"never ever drop any ticks irrespective of any worst case"*
+/// and *"never dropped or dleetd dude just mvoe it to db and s3 right?"*.
+/// The doc here used to say the seal "is dropped and the producer increments
+/// `tv_seal_producer_mpsc_full_total`" — that was a truthful description of
+/// a policy the operator has now overruled. Route the refusal through
+/// [`global_seal_overflow`] instead; only a seal that fails BOTH the spill
+/// and the DLQ is genuinely lost, and that case fires AGGREGATOR-DROP-01.
 #[must_use]
 pub fn global_seal_sender() -> Option<&'static mpsc::Sender<BufferedSeal>> {
     GLOBAL_SEAL_SENDER.get()
+}
+
+/// Where a seal goes when the writer channel will not take it.
+///
+/// The producer path (`try_send` on the bounded mpsc) can refuse a seal for
+/// two reasons — the channel is full because the writer has fallen behind, or
+/// no writer was ever installed. Before 2026-08-19 both outcomes incremented a
+/// counter and threw the sealed candle away. This type is the durable
+/// alternative: the SAME tier-2 → tier-3 cascade the absorption pipeline uses
+/// for ring overflow, reachable from the producer side.
+///
+/// It deliberately holds `Arc`s of the pipeline's OWN writers rather than
+/// constructing its own, so a producer-side escalation lands in the same
+/// spill file the boot drain reads back. See
+/// [`crate::seal_absorption::SealAbsorptionPipeline::spill_handle`].
+pub struct SealOverflow {
+    spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
+    dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
+}
+
+/// What happened to a seal the writer channel refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverflowOutcome {
+    /// Written to the binary spill file. Recovered by the boot drain.
+    Spilled,
+    /// Spill failed; written to the NDJSON DLQ as recoverable text.
+    DlqWritten,
+    /// Both disk tiers failed. THE SEAL IS LOST — the caller MUST fire
+    /// `AGGREGATOR-DROP-01` (Critical, paged). This is the only remaining
+    /// path by which a sealed candle can disappear, and it requires the data
+    /// volume to be unwritable.
+    Lost,
+}
+
+impl SealOverflow {
+    /// Build an escalator over an existing pipeline's writers.
+    #[must_use]
+    pub fn new(
+        spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
+        dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
+    ) -> Self {
+        Self { spill, dlq }
+    }
+
+    /// Escalate one refused seal to disk. Never blocks on the network, never
+    /// awaits, never panics.
+    ///
+    /// `now_unix_secs` is passed in rather than read from the clock for the
+    /// same reason the absorption pipeline takes it (locked decision L-H7):
+    /// this runs inside the per-tick fold, and a clock syscall per seal is a
+    /// hot-path cost the design does not accept.
+    pub fn escalate(&self, seal: &BufferedSeal, now_unix_secs: i64) -> OverflowOutcome {
+        let serialised = crate::seal_spill::SerializedSeal::from(seal);
+        if self.spill.append_seal(&serialised, now_unix_secs).is_ok() {
+            return OverflowOutcome::Spilled;
+        }
+        let record = crate::seal_dlq::SealDlqRecord::from(&serialised);
+        if self.dlq.append_record(&record, now_unix_secs).is_ok() {
+            return OverflowOutcome::DlqWritten;
+        }
+        OverflowOutcome::Lost
+    }
+}
+
+static GLOBAL_SEAL_OVERFLOW: std::sync::OnceLock<SealOverflow> = std::sync::OnceLock::new();
+
+/// Install the process-wide overflow escalator. Idempotent, matching
+/// [`set_global_seal_sender`] — first call wins, later calls return `false`
+/// and change nothing.
+///
+/// The boot path MUST install this in the same place it installs the sender.
+/// A sender without an escalator is the pre-2026-08-19 behaviour: refusals
+/// become losses.
+pub fn set_global_seal_overflow(overflow: SealOverflow) -> bool {
+    GLOBAL_SEAL_OVERFLOW.set(overflow).is_ok()
+}
+
+/// Read-only accessor for the overflow escalator. `None` until boot installs
+/// one — a producer seeing `None` has no durable tier available and its only
+/// honest option is to count the seal as lost and fire AGGREGATOR-DROP-01.
+#[must_use]
+pub fn global_seal_overflow() -> Option<&'static SealOverflow> {
+    GLOBAL_SEAL_OVERFLOW.get()
 }
 
 /// Bounded mpsc capacity for the producer→consumer wire.
@@ -300,6 +396,17 @@ impl SealWriterRunner {
     #[must_use]
     pub fn sender(&self) -> mpsc::Sender<BufferedSeal> {
         self.sender.clone()
+    }
+
+    /// The producer-side overflow escalator for THIS runner's disk tiers.
+    ///
+    /// Boot installs the result via [`set_global_seal_overflow`] alongside
+    /// [`set_global_seal_sender`], and must do so BEFORE moving the runner
+    /// into its `tokio::spawn` — same constraint, same reason, so the two
+    /// installs belong on adjacent lines.
+    #[must_use]
+    pub fn overflow(&self) -> SealOverflow {
+        SealOverflow::new(self.pipeline.spill_handle(), self.pipeline.dlq_handle())
     }
 
     /// Currently buffered ring depth (item observed by future
@@ -685,5 +792,164 @@ mod tests {
             !(first && second),
             "set_global_seal_sender MUST be idempotent — both calls returning true violates the contract"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // SealOverflow — the producer-side durable tier (2026-08-19)
+    //
+    // Operator directive: "never ever drop any ticks irrespective of any
+    // worst case" / "never dropped or dleetd dude just mvoe it to db and s3
+    // right?". Before these, a seal the writer channel refused was counted
+    // and discarded.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_seal_overflow_escalate_spills_a_refused_seal_to_disk() {
+        let (spill, dlq) = temp_pair("overflow-spill");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let overflow = runner.overflow();
+
+        let outcome =
+            overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200, 101.5), jan1_noon_utc());
+
+        assert_eq!(
+            outcome,
+            OverflowOutcome::Spilled,
+            "a refused seal must reach the spill tier, not a counter"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_seal_overflow_writes_into_the_runners_own_spill_dir() {
+        // The point of sharing the pipeline's writer handles rather than
+        // building fresh ones: a producer-side rescue has to land where the
+        // BOOT DRAIN will read it back. A rescue into a directory nobody
+        // drains is a slower way of losing the candle.
+        let (spill, dlq) = temp_pair("overflow-same-dir");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let overflow = runner.overflow();
+
+        assert_eq!(
+            overflow.escalate(&mk_seal(25, 0, TfIndex::M1, 34_260, 99.0), jan1_noon_utc()),
+            OverflowOutcome::Spilled
+        );
+
+        let wrote_something = std::fs::read_dir(&spill)
+            .expect("spill dir readable")
+            .filter_map(Result::ok)
+            .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false));
+        assert!(
+            wrote_something,
+            "the escalated seal must be on disk in the runner's OWN spill dir ({}), \
+             which is the directory boot_drain reads",
+            spill.display()
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_seal_overflow_falls_through_to_dlq_when_spill_is_unwritable() {
+        // Tier-2 failure must escalate, never terminate. Pointing the spill at
+        // a path that cannot be a directory is the cheapest honest way to make
+        // the append fail without root or a full disk.
+        let (spill, dlq) = temp_pair("overflow-dlq");
+        let mut blocked = spill.clone();
+        blocked.push("not-a-dir");
+        std::fs::write(&blocked, b"x").expect("write blocker file");
+        let mut inner = blocked.clone();
+        inner.push("spill-here");
+
+        let overflow = SealOverflow::new(
+            std::sync::Arc::new(crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(
+                inner,
+            )),
+            std::sync::Arc::new(crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(
+                dlq.clone(),
+            )),
+        );
+
+        let outcome =
+            overflow.escalate(&mk_seal(51, 0, TfIndex::M1, 34_320, 77.7), jan1_noon_utc());
+        assert_eq!(
+            outcome,
+            OverflowOutcome::DlqWritten,
+            "an unwritable spill must fall through to the DLQ, not lose the seal"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_seal_overflow_reports_lost_only_when_both_tiers_fail() {
+        // `Lost` is the ONLY remaining path by which a sealed candle can
+        // disappear, and it must require BOTH disk tiers to refuse — that is
+        // what makes AGGREGATOR-DROP-01 mean "the volume is unwritable"
+        // rather than "the writer was busy".
+        let (spill, dlq) = temp_pair("overflow-lost");
+        let mut blocker = spill.clone();
+        blocker.push("blocked");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+
+        let mut spill_inner = blocker.clone();
+        spill_inner.push("nested");
+        let mut dlq_inner = blocker.clone();
+        dlq_inner.push("nested-dlq");
+
+        let overflow = SealOverflow::new(
+            std::sync::Arc::new(crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(
+                spill_inner,
+            )),
+            std::sync::Arc::new(crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(
+                dlq_inner,
+            )),
+        );
+
+        assert_eq!(
+            overflow.escalate(&mk_seal(21, 0, TfIndex::M1, 34_380, 12.0), jan1_noon_utc()),
+            OverflowOutcome::Lost,
+            "both tiers refusing is the only honest Lost"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_global_seal_overflow_is_none_before_install() {
+        // Mirrors the sender's own contract test. A producer that sees `None`
+        // has no durable tier and must count the seal as lost rather than
+        // claiming a rescue that did not happen.
+        let _: Option<&'static SealOverflow> = global_seal_overflow();
+    }
+
+    #[test]
+    fn test_set_global_seal_overflow_is_idempotent() {
+        // Mirrors `test_set_global_seal_sender_is_idempotent`. Idempotency is
+        // the safety property: a second install must NOT swap the durable tier
+        // out from under producers that already hold the first one, or a
+        // rescued seal would land in a directory the boot drain never reads.
+        let (spill, dlq) = temp_pair("overflow-idempotent");
+        let a = SealOverflow::new(
+            std::sync::Arc::new(crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(
+                spill.clone(),
+            )),
+            std::sync::Arc::new(crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(
+                dlq.clone(),
+            )),
+        );
+        let b = SealOverflow::new(
+            std::sync::Arc::new(crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(
+                spill.clone(),
+            )),
+            std::sync::Arc::new(crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(
+                dlq.clone(),
+            )),
+        );
+        let first = set_global_seal_overflow(a);
+        let second = set_global_seal_overflow(b);
+        assert!(
+            !(first && second),
+            "set_global_seal_overflow MUST be idempotent — both calls returning true \
+             would mean a later install can replace the tier producers already hold"
+        );
+        cleanup(&spill, &dlq);
     }
 }

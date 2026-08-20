@@ -77,11 +77,11 @@ variable "enable_eip" {
 variable "ebs_gp3_size_gb" {
   description = "Root EBS volume size in GB. 20 per the 2026-07-15 downsize pre-stage (executor decision recorded in daily-universe-scope-expansion-2026-05-27.md §0 under Quote 8 + §7 Rule 3 — NOT operator-quoted scope): gp3 can NEVER shrink (`modify-volume` grows only, and a larger snapshot cannot restore into a smaller volume), so the LIVE root stays at its current size until a deliberate terminate-and-recreate in the operator's post-market data-erase window replaces it (the box is fully cattle-provisioned by user-data.sh.tftpl; the pre-downsize snapshot is the rollback). LIVE SIZE CORRECTED 2026-07-19: describe-volumes on vol-073ccaa417a0f344b returned 30 GiB gp3 — the 2026-07-13 approved 30->50 grow was recorded but never physically applied (see daily-universe §7 2026-07-19 correction note). SAME-DAY RULING (daily-universe §0 Quote 9): 30 GB formally ACCEPTED, the grow CANCELLED — any future grow needs a fresh dated quote; the 20 GB fresh-provision target below stays a separate un-quoted executor pre-stage. History: 10 -> 30 (2026-05-29 Quote 6) -> [50 approved 2026-07-13, never applied; live verified 30 on 2026-07-19] -> 20 target (2026-07-15). The partition manager archives partitions >90d to the cheaper S3 cold bucket, so 20 GB holds the hot window on the erased fresh volume. root_block_device[0].volume_size is in the instance lifecycle.ignore_changes so a `terraform apply` does NOT touch the LIVE volume. This var documents the intended size for a FRESH provision only; any LIVE grow stays out-of-band via scripts/aws-upgrade-instance.sh --ebs-size (online aws ec2 modify-volume, no stop)."
   type        = number
-  default     = 100
+  default     = 200
 
   validation {
     condition     = var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 200
-    error_message = "EBS is sized 10-200 GB. 100 GB default per operator lock 2026-08-08 (Quote 13 — the 13-timeframe + current-day tick-retention workload; the live root is 30 GB and gp3 cannot shrink, so 100 lands only on the fresh volume at the multi-AZ recreate). gp3 grows online beyond this if needed."
+    error_message = "EBS is sized 10-200 GB. 200 GB default per operator lock 2026-08-19 (daily-universe-scope-expansion-2026-05-27.md Quote 16 - 'Grow gp3 100 -> 200 GB yes even icnrease this also dude okay?', given after r8gd.xlarge was proposed and rejected: its local NVMe is WIPED on every stop and this box stops nightly, so it would delete the day; EBS survives the stop). Raised from the 2026-08-08 Quote 13 default of 100. 200 is now BOTH the default and the validation ceiling, so any further grow needs a validation edit AND its own dated quote AND a budget-ceiling raise in the same change (+100 GB = +$9.12/mo leaves only $7.28 of margin under the $100 kill line, whose AUTOMATIC action stops the prod box). gp3 grows online but can NEVER shrink."
   }
 }
 
@@ -105,9 +105,9 @@ variable "ebs_gp3_size_gb" {
 # safe" is the one mistake here that cannot be undone without another recreate.
 
 variable "ebs_gp3_iops" {
-  description = "Root gp3 EBS provisioned IOPS. 3000 is the gp3 baseline (free, included). Range 3000-16000 — raise alongside throughput when the QuestDB write/read load grows (e.g. both feeds at ~2K SIDs). scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume; root_block_device[0].iops is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-bumped value. This var documents the intended IOPS for a FRESH provision."
+  description = "Root gp3 EBS provisioned IOPS. RAISED 3000 -> 6000 on 2026-08-19 per operator Quote 17 (daily-universe-scope-expansion-2026-05-27.md §0), alongside throughput 125 -> 500. Range 3000-16000. WHAT TERRAFORM DOES WITH THIS: nothing, to a running box — root_block_device[0].iops sits in the instance's lifecycle.ignore_changes (main.tf), so `terraform apply` never touches the live volume. This variable documents FRESH-PROVISION intent only; the LIVE change is an out-of-band `aws ec2 modify-volume --volume-id <id> --iops 6000 --throughput 500` (or scripts/aws-upgrade-instance.sh), online with no stop, and until that runs the live volume keeps its current settings. Same shape as the Quote 16 size raise. COST: gp3 charges $0.005 per provisioned IOPS above the free 3000 baseline, so (6000-3000) x $0.005 = $15.00/mo."
   type        = number
-  default     = 3000
+  default     = 6000
 
   validation {
     condition     = var.ebs_gp3_iops >= 3000 && var.ebs_gp3_iops <= 16000
@@ -116,9 +116,9 @@ variable "ebs_gp3_iops" {
 }
 
 variable "ebs_gp3_throughput" {
-  description = "Root gp3 EBS throughput in MiB/s. 125 is the gp3 baseline (free, included). Range 125-1000 — raise alongside IOPS for heavier QuestDB I/O. scripts/aws-upgrade-instance.sh can bump this online (no stop) via aws ec2 modify-volume; root_block_device[0].throughput is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-bumped value. This var documents the intended throughput for a FRESH provision."
+  description = "Root gp3 EBS throughput in MiB/s. RAISED 125 -> 500 on 2026-08-19 per operator Quote 17. Range 125-1000. WHY IT IS THE LOAD-BEARING HALF: dirty_background_ratio = 3 on a 32 GiB host lets ~1 GiB of dirty pages accumulate before writeback starts; draining that at the 125 MiB/s baseline is ~8 seconds of saturated device, during which the ILP flush blocks, the frame drain blocks behind it, the socket receive buffer fills, and Dhan skips a slow consumer forward to the latest available state — dropping intermediate ticks at THEIR side with no sequence number for us to detect it. 500 MiB/s takes the same drain to ~2 seconds. Already binding: 74% NVMe utilisation at 3,121 writes/sec was measured 2026-08-18, before the 25,000-instrument target and before depth persistence. WHAT TERRAFORM DOES WITH THIS: nothing, to a running box — root_block_device[0].throughput is in the instance's lifecycle.ignore_changes (main.tf), so `terraform apply` never touches the live volume. This variable documents FRESH-PROVISION intent only; the LIVE change is an out-of-band `aws ec2 modify-volume --volume-id <id> --iops 6000 --throughput 500`, online with no stop. COST: gp3 charges $0.040 per provisioned MiB/s above the free 125 baseline, so (500-125) x $0.040 = $15.00/mo. Combined with the IOPS raise: $30.00/mo (~₹3,043 incl GST) — HIGHER than the ~$20 the recommendation quoted the operator, because that figure predated the per-unit split; recorded rather than quietly absorbed."
   type        = number
-  default     = 125
+  default     = 500
 
   validation {
     condition     = var.ebs_gp3_throughput >= 125 && var.ebs_gp3_throughput <= 1000

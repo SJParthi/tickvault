@@ -191,6 +191,43 @@ const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 300;
 /// Poll cadence for the boot-completed feed-liveness wait.
 const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
 
+/// How many consecutive 30s stall scans must run with ZERO ticks observed
+/// before the starved-detector line fires.
+///
+/// Four scans is two minutes. Deliberately not one: a scan can legitimately
+/// precede the first tick right after boot (the lane dials, authenticates and
+/// subscribes before any frame arrives), and reporting starvation during that
+/// window would be a false alarm on every single start. Two minutes is far
+/// past any normal dial-to-first-frame, and the condition it detects is
+/// structural rather than transient — once true it stays true, so waiting
+/// costs nothing and guessing early costs credibility.
+const STALL_SCAN_STARVED_AFTER_SCANS: u32 = 4;
+
+/// Should the stall scan report that it is STARVED rather than healthy?
+///
+/// Pure, so the four-way condition can be asserted directly instead of
+/// inferred from a running task. Each argument rules out a way of being wrong:
+///
+/// - `live_ticks_expected` — on the REST-only runtime an empty tracker is the
+///   correct, expected state, and firing there would page on normal operation.
+/// - `ticks_observed == 0` — one arriving tick proves the wiring, and the scan
+///   is then reporting on something real.
+/// - `stale_scans >= STALL_SCAN_STARVED_AFTER_SCANS` — a scan can legitimately
+///   precede the first tick right after boot.
+/// - `!already_reported` — the condition is structural, so it stays true once
+///   it is true; repeating it every 30s would flood without adding anything.
+const fn stall_scan_is_starved(
+    live_ticks_expected: bool,
+    ticks_observed: u64,
+    stale_scans: u32,
+    already_reported: bool,
+) -> bool {
+    live_ticks_expected
+        && ticks_observed == 0
+        && !already_reported
+        && stale_scans >= STALL_SCAN_STARVED_AFTER_SCANS
+}
+
 /// Decide whether the boot-completed "the app is alive" signal
 /// (`tv_boot_completed`) may be emitted, given each feed's enabled flag and its
 /// observed lane-running state.
@@ -307,8 +344,88 @@ async fn emit_boot_completed_when_feed_live(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// ---------------------------------------------------------------------------
+// Tokio worker threads — set EXPLICITLY (operator Quote 17b, 2026-08-19)
+// ---------------------------------------------------------------------------
+//
+// This binary used a bare `#[tokio::main]`, which means `worker_threads =
+// num_cpus`. On the r8g.xlarge that is 4 — and QuestDB was simultaneously
+// free to run its own workers on all 4 of the same cores, with NIC softirq
+// landing wherever the kernel chose. Everything wanted every core, and the
+// measured result was 21.8% of QuestDB's scheduling periods throttled
+// (nr_throttled 18,594 / nr_periods 85,149, box measurement 2026-08-18).
+//
+// The host CPU partition (deploy/docker/docker-compose.yml holds the other
+// half, and deploy/systemd/tickvault.service confines this process to it):
+//
+//   core 0  OS + NIC IRQ/softirq + log sidecars   — NEVER the drain's core
+//   core 1  this process — EXCLUSIVE
+//   core 2  shared burst (this process + QuestDB)
+//   core 3  QuestDB — EXCLUSIVE
+//
+// So this process is confined to 2 cores and gets exactly 2 workers. More
+// workers than cores does not make the frame drain faster: the drain is ONE
+// `tokio::select!` task and occupies one worker at a time whatever the pool
+// size. Extra workers only add threads that can be descheduled while holding
+// the runtime's queues, which is the failure this whole change exists to
+// remove.
+//
+// NOT claimed: that 2 is the measured-optimal width at the 25,000-instrument
+// / 16-socket target. It is the value CONSISTENT with the core partition, and
+// the app measured 6.7% of the box on 2026-08-18 — roughly 15x headroom
+// against one core, let alone two. The first live session at scale is the
+// measurement, and the override below is how it gets acted on without a
+// rebuild.
+const DEFAULT_TOKIO_WORKER_THREADS: usize = 2;
+
+/// Environment override for the worker-thread count.
+///
+/// The rollback path the operator was promised: this whole change must be
+/// reversible by configuration plus a restart, with no code edit. Setting this
+/// to `4` in `deploy/systemd/tickvault.service` restores the pre-2026-08-19
+/// `num_cpus` behaviour on this 4-vCPU box.
+const TOKIO_WORKER_THREADS_ENV: &str = "TICKVAULT_TOKIO_WORKER_THREADS";
+
+/// Upper bound on the override. A fat-fingered `TICKVAULT_TOKIO_WORKER_THREADS=400`
+/// would spawn 400 OS threads on a 4-core box and turn a tuning knob into an
+/// outage, so the parse clamps rather than trusts.
+const MAX_TOKIO_WORKER_THREADS: usize = 64;
+
+/// Resolve the runtime width from the raw environment value.
+///
+/// Fail-SAFE by construction: absent, empty, non-numeric, zero, or absurd all
+/// fall back to [`DEFAULT_TOKIO_WORKER_THREADS`]. There is no input that makes
+/// this return something the runtime builder would reject, because a process
+/// that refuses to boot over a malformed tuning hint is strictly worse than
+/// one that boots on the default.
+fn resolve_tokio_worker_threads(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        Some(v) if !v.is_empty() => match v.parse::<usize>() {
+            Ok(n) if (1..=MAX_TOKIO_WORKER_THREADS).contains(&n) => n,
+            _ => DEFAULT_TOKIO_WORKER_THREADS,
+        },
+        _ => DEFAULT_TOKIO_WORKER_THREADS,
+    }
+}
+
+fn main() -> Result<()> {
+    let raw = std::env::var(TOKIO_WORKER_THREADS_ENV).ok();
+    let worker_threads = resolve_tokio_worker_threads(raw.as_deref());
+
+    // `enable_all` matches what `#[tokio::main]` installed (IO + time drivers).
+    // Named threads so `top -H` / `perf` on the box can tell a runtime worker
+    // apart from a blocking-pool thread while attributing a stall.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_name("tv-worker")
+        .enable_all()
+        .build()
+        .context("failed to build the tokio runtime")?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // PROCESS-START anchor (IST epoch nanos) for the dual-feed scoreboard's
     // process-death reconciler — captured as the FIRST statement of main(),
     // BEFORE any boot path can connect a feed (hostile review round 2,
@@ -1240,13 +1357,14 @@ async fn main() -> Result<()> {
     });
 
     // 2026-07-13 disk-retention hardening: prune confirmed-replay WAL
-    // segments from `<wal_dir>/archive/` older than 7 days (F3: matches
-    // SPILL_FILE_MAX_AGE_SECS and preserves the confirm-on-channel
+    // segments from `<wal_dir>/archive/` older than
+    // WS_WAL_ARCHIVE_RETENTION_SECS (F3: preserves the confirm-on-channel
     // residual's only copy across a long weekend for triage). Archived
     // segments are post-confirmed-replay copies (frames re-injected +
     // durably persisted); the same-day 15:40 IST tick-conservation audit
-    // reads only the CURRENT day's frames, so a 7-day retention can never
-    // change it. Before this task, `archive/` grew ~0.15–0.6 GB/day
+    // reads only the CURRENT day's frames, so the retention window can never
+    // change it. (The window was 7 days until 2026-08-19; the number is no
+    // longer restated in prose — read the constant.) Before this task, `archive/` grew ~0.15–0.6 GB/day
     // unbounded on the prod 30 GB volume. Process-global boot prefix (both
     // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
     // which never runs on a Groww-only boot. Prunes once at task start
@@ -1258,7 +1376,30 @@ async fn main() -> Result<()> {
             let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
+                tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
             );
+            // 2026-08-19: the SPILL retention sweep, wired for the first
+            // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
+            // unit-tested since 2026-07-13 with ZERO production consumers,
+            // and `clear_spill_for_date` — documented as "called by the
+            // writer task after read_all is fully replayed" — likewise had
+            // none. The writer chain only appends, so `data/spill/` grew for
+            // the life of the deployment with no age bound and no size bound.
+            // Rides this existing loop rather than spawning another task:
+            // same cadence, same cold path, one fewer thing to supervise.
+            let _spill = tickvault_storage::seal_spill::prune_spill_files(
+                std::path::Path::new("data/spill"),
+                tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
+            );
+            // The DLQ is MEASURED, never pruned — deliberately asymmetric
+            // with the spill sweep above. It holds the operator-readable
+            // record of seals that were LOST; deleting it to reclaim disk
+            // would destroy the evidence it exists to preserve. Nothing is
+            // written there in normal operation, so a growing DLQ IS the
+            // incident signal — publishing it makes that observable instead
+            // of something discovered when the volume fills.
+            let _dlq =
+                tickvault_storage::seal_dlq::record_dlq_bytes(std::path::Path::new("data/dlq"));
             tokio::time::sleep(Duration::from_secs(
                 tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
             ))
@@ -1384,6 +1525,21 @@ async fn main() -> Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             tickvault_app::boot_helpers::WATCHDOG_INTERVAL_SECS,
         ));
+        // DELAY, not the default BURST — 2026-08-20.
+        //
+        // Under Burst a stalled runtime pays back every missed tick the
+        // instant it recovers: the pinger fires N times back to back and the
+        // watchdog is satisfied as though nothing happened. That makes a
+        // runtime stall shorter than `WatchdogSec` invisible to the ONE
+        // mechanism whose entire job is to notice it — the beacon reports
+        // health it did not have, which is the false-OK class this repo's own
+        // rules forbid.
+        //
+        // Delay re-bases the schedule from the late tick, so a stall shows up
+        // as a genuine gap between pings. 24 of the other 28 intervals in this
+        // binary already set this explicitly; the liveness beacon was the one
+        // that most needed it and did not.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await; // skip the immediate first tick
         loop {
             interval.tick().await;
@@ -1465,6 +1621,31 @@ async fn main() -> Result<()> {
     let _disk_health_watcher_supervisor =
         tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
             std::path::PathBuf::from("data/spill"),
+        );
+
+    // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
+    // volume and does nothing about it. This loop is the remediation arm.
+    //
+    // Why it cannot wait for the post-market archive: that leg is triggered by
+    // partition AGE and runs once, after the close. At the authorized scale the
+    // volume fills inside a session — hours before anything is age-eligible.
+    // And a full volume is not merely a housekeeping problem: every QuestDB
+    // write blocks, so the ILP flush backs up, so the frame drain backs up, so
+    // the socket receive buffer overflows — and Dhan's published architecture
+    // skips a slow consumer forward to "the latest available state", dropping
+    // the intermediate ticks at THEIR side. Bounding the disk is part of
+    // staying a fast consumer.
+    //
+    // It adds a TRIGGER, never a delete path: it calls the same
+    // archive→upload→verify→audit→drop whose `VerifiedArchive` type-state makes
+    // an unverified drop unrepresentable, and it REFUSES to delete anything
+    // further when nothing reclaimable remains (STORAGE-GAP-05, Critical).
+    // DEFAULT-OFF via serde, so an absent config block spawns nothing.
+    let _disk_pressure_supervisor =
+        tickvault_app::disk_pressure_boot::spawn_supervised_disk_pressure_loop(
+            std::path::PathBuf::from("data"),
+            config.questdb.clone(),
+            config.partition_retention.clone(),
         );
 
     // W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
@@ -1874,10 +2055,17 @@ async fn main() -> Result<()> {
         // the operator reading "residual ... from a pre-retirement session"
         // would file it as housekeeping rather than as data loss.
         //
-        // The frames are genuinely preserved on disk, and re-folding them is
-        // real work (the fold path takes a live ring, not a replay batch), so
-        // this stays a drop for now. What changes is that it stops describing
-        // a live gap as historical tidying, and says plainly what was lost.
+        // CORRECTED 2026-08-19: the parenthetical "(the fold path takes a
+        // live ring, not a replay batch)" is FALSE since 2026-08-15 —
+        // `refold_wal_frames` takes precisely a replay batch, and the guard
+        // above (`dhan_lane_will_refold`) is why this block no longer fires on
+        // the normal path. It survived inside a block whose CONDITION had
+        // already been narrowed around it, which is how a comment outlives the
+        // fact it described.
+        //
+        // The block itself is still correct and still a real drop: it fires
+        // ONLY when the lane will not run, and then nothing will ever fold
+        // these frames. The message below is accurate for that branch.
         error!(
             code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
             frames = dropped,
@@ -2097,6 +2285,20 @@ async fn main() -> Result<()> {
     // only thing that fires it.
     let dhan_feed_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
 
+    // Close the boot race before the lane resolves its set. The daily rider
+    // (spawned above) WRITES today's mapping artifact; the lane READS it. Same
+    // boot, no ordering between them — and the filename is date-stamped, so
+    // yesterday's file cannot stand in. On 2026-08-17 the single 08:31 boot
+    // lost that race and the whole session ran on 4 instruments instead of
+    // 4,565, silently. This wait is bounded and fail-soft: on timeout the
+    // resolve below takes its existing, loudly-logged fallback.
+    let universe_date_ist = tickvault_app::dhan_universe::today_ist_date();
+    tickvault_app::dhan_live_universe::await_mapping_artifact(
+        &config.dhan_universe,
+        &universe_date_ist,
+    )
+    .await;
+
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),
@@ -2119,7 +2321,7 @@ async fn main() -> Result<()> {
             main_feed_instruments: tickvault_app::dhan_live_universe::resolve_live_universe(
                 &config.dhan_universe,
                 tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
-                &tickvault_app::dhan_universe::today_ist_date(),
+                &universe_date_ist,
                 tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
                     .subscription_capacity(),
             ),
@@ -2130,6 +2332,11 @@ async fn main() -> Result<()> {
             // So the lane can report whether it is ACTUALLY running, instead of
             // the console reading a flag nothing ever set (2026-08-14).
             feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            // And so a DEAD lane can report dead (2026-08-18). The drain
+            // records rows flushed to QuestDB, which is what lets the Dhan
+            // health verdict fall to `Down` instead of answering a benign
+            // "not instrumented yet" forever.
+            feed_health: std::sync::Arc::clone(&feed_health),
             // The process-wide WAL opened in STAGE-C above. This is the FIRST
             // frame-append consumer since PR-C2 retired the Dhan lane on
             // 2026-07-13 (the note there — "there is no frame APPEND site left
@@ -2230,6 +2437,9 @@ async fn run_slow_boot_observability(
     // task's 2s /exec ping is the surviving reachability probe, so it now
     // owns the flag write.
     health: tickvault_api::state::SharedHealthStatus,
+    // Whether a live tick SOURCE exists this session (both live-lane gates
+    // open). Load-bearing for the stall scan below — see its comment.
+    live_ticks_expected: bool,
 ) {
     info!("S4-T1d: slow-boot observability task started");
 
@@ -2254,6 +2464,15 @@ async fn run_slow_boot_observability(
     let stale_check_interval =
         std::time::Duration::from_secs(tickvault_common::constants::STALE_LTP_SCAN_INTERVAL_SECS);
     let mut last_stale_check = std::time::Instant::now();
+
+    // Starved-detector state. `ticks_observed` counts what actually arrived on
+    // the broadcast; `stale_scans` counts how many times the scan below ran.
+    // The pair is what separates "nothing is stalling" from "I can see
+    // nothing" — a distinction the scan's own return value cannot make, since
+    // an empty tracker and a healthy universe both yield zero.
+    let mut ticks_observed: u64 = 0;
+    let mut stale_scans: u32 = 0;
+    let mut starved_reported = false;
 
     // HTTP client for QuestDB /exec health ping. Uses a short timeout so
     // an unresponsive QDB is treated as disconnected within 1s.
@@ -2286,11 +2505,16 @@ async fn run_slow_boot_observability(
         tokio::select! {
             recv = tick_rx.recv() => match recv {
                 Ok(tick) => {
+                    ticks_observed = ticks_observed.saturating_add(1);
                     // Gap detection — the tracker fires its own log/metric on
                     // ERROR thresholds; no backfill request is published
                     // (in-market backfill disabled by user policy).
-                    let _ =
-                        tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+                    // I-P1-11 composite: security_id alone is not unique.
+                    let _ = tick_gap_tracker.record_tick(
+                        tick.security_id,
+                        tick.exchange_segment_code,
+                        tick.exchange_timestamp,
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(
@@ -2311,6 +2535,45 @@ async fn run_slow_boot_observability(
                     let newly_stale = tick_gap_tracker.detect_stale_instruments();
                     if newly_stale > 0 {
                         debug!(newly_stale, "per-instrument stall scan: newly-stale count");
+                    }
+                    stale_scans = stale_scans.saturating_add(1);
+                    // A DETECTOR THAT SEES NOTHING MUST NOT REPORT NOTHING WRONG.
+                    //
+                    // 2026-08-20. This scan is fed exclusively by the process
+                    // tick broadcast, and the revived Dhan live lane folds its
+                    // ticks internally without ever publishing to it. So with
+                    // the lane ON, the scan ran every 30 seconds over an empty
+                    // tracker and returned a reassuring zero — forever. An
+                    // operator watching a stall detector execute on schedule
+                    // and report nothing wrong would conclude no instrument
+                    // was stalling, while the detector could not see a single
+                    // one of them.
+                    //
+                    // Zero newly-stale is only good news when something is
+                    // arriving. Said once per process, edge-latched: the
+                    // condition is structural, so repeating it every 30s would
+                    // be a log flood carrying no new information.
+                    if stall_scan_is_starved(
+                        live_ticks_expected,
+                        ticks_observed,
+                        stale_scans,
+                        starved_reported,
+                    ) {
+                        starved_reported = true;
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::RiskGapTickGap
+                                .code_str(),
+                            stale_scans,
+                            "the per-instrument stall detector has run {stale_scans} scans and \
+                             observed ZERO ticks while the live feed is enabled. It is reporting \
+                             no stalled instruments because it can see no instruments — not \
+                             because none are stalling. Its input is the process tick broadcast, \
+                             which the live lane does not publish to; the lane's own 30s silence \
+                             scan (RISK-GAP-03) is the signal that IS wired. Treat this \
+                             detector's verdict as absent, not as healthy.",
+                            stale_scans = stale_scans
+                        );
+                        metrics::counter!("tv_stall_detector_starved_total").increment(1);
                     }
                     last_stale_check = std::time::Instant::now();
                 }
@@ -2386,15 +2649,60 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
     use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
     use tickvault_storage::seal_writer_runner::SealWriterRunner;
 
-    // 1024 seals × 100 ms cycle = ~10,240 seals/sec sustained — well above
-    // the ~99K-seal IST-midnight burst absorbed across ~10 cycles.
-    const SEAL_MAX_DRAIN_PER_CYCLE: usize = 1_024;
+    // MEASURED AND RAISED 2026-08-20 — the old value was a live ceiling, not
+    // a safety margin.
+    //
+    // It read: "1024 seals × 100 ms cycle = ~10,240 seals/sec sustained —
+    // well above the ~99K-seal IST-midnight burst absorbed across ~10
+    // cycles." The burst arithmetic was right. The SUSTAINED rate was never
+    // checked, and it is the one that bites.
+    //
+    // Live evidence, prod box, 2026-08-20, 753 instruments × 24 timeframes:
+    //
+    //   submitted 893,775 | rows_written 351,232 | spilled 541,519
+    //   cycles 343        | flush_failures 0     | ring_len 598,976/600,000
+    //
+    // 343 × 1024 = 351,232 EXACTLY. Every cycle drained precisely the cap and
+    // not one seal more, for hours — the definition of a saturated limit.
+    // `flush_failures: 0` says QuestDB accepted everything it was offered, so
+    // the database was never the constraint; this constant was. Arrival was
+    // ~26,000 seals/sec against a 10,240/sec ceiling, and the ~61% that did
+    // not fit went to disk spill: nothing LOST (the ring→spill→DLQ chain held,
+    // `dropped: 0` throughout) but not queryable until the next boot replays
+    // it.
+    //
+    // 16,384 × 100 ms = ~163,840 seals/sec, roughly 6x the measured arrival.
+    // The point is not the multiple — it is that the binding limit becomes
+    // QuestDB, which REPORTS when it cannot keep up (`flush_failures`), rather
+    // than a constant that silently redirects to disk. A ceiling that cannot
+    // announce itself is the failure mode here, and the counter added below
+    // closes that half.
+    //
+    // Shutdown is unaffected and in fact faster: the 75s final-drain budget
+    // was sized at 1,024/cycle for a 600k worst case (~59s); at 16,384 the
+    // same 600k drains in ~3.7s.
+    //
+    // NOT claimed: that this holds at 25,000 instruments. Arrival scales with
+    // the universe, and 753 is 3% of the target. The next raise must be driven
+    // by the saturation counter below, not by another guess.
+    const SEAL_MAX_DRAIN_PER_CYCLE: usize = 16_384;
 
     match SealWriterRunner::new(questdb_config, SEAL_MAX_DRAIN_PER_CYCLE) {
         Ok(runner) => {
             if !tickvault_storage::seal_writer_runner::set_global_seal_sender(runner.sender()) {
                 tracing::warn!(
                     "global seal sender already installed (idempotent skip) — first installer wins"
+                );
+            }
+            // The producer-side durable tier, installed on the line after the
+            // sender because a sender WITHOUT it is the pre-2026-08-19
+            // behaviour: a full or absent channel silently discarded the
+            // sealed candle. Both installs must happen before the runner moves
+            // into the spawn below, for the same reason — the handles are
+            // unreachable afterwards.
+            if !tickvault_storage::seal_writer_runner::set_global_seal_overflow(runner.overflow()) {
+                tracing::warn!(
+                    "global seal overflow already installed (idempotent skip) — first installer wins"
                 );
             }
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -2766,10 +3074,31 @@ async fn build_shared_infra(
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
         let obs_health = health_status.clone();
+        // Does a live tick SOURCE exist this session?
+        //
+        // Computed here because this is where config lives, and passed in
+        // because the detector cannot otherwise tell the difference between
+        // the two states that look identical from inside it: "every
+        // instrument is healthy" and "I am connected to nothing". On the
+        // REST-only runtime the second is correct and expected; with the live
+        // lane enabled it is a failure — and until 2026-08-20 the 30s scan
+        // reported a reassuring zero in both cases.
+        let live_ticks_expected = matches!(
+            tickvault_app::dhan_feed_stack::feed_stack_gate(
+                config.feeds.dhan_enabled,
+                std::env::var(tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+            tickvault_app::dhan_feed_stack::FeedStackGate::Enabled
+        );
         tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg, obs_health).await;
+            run_slow_boot_observability(obs_rx, questdb_cfg, obs_health, live_ticks_expected).await;
         });
-        info!("slow-boot observability consumer started");
+        info!(
+            live_ticks_expected,
+            "slow-boot observability consumer started"
+        );
     }
     // Dead-code cleanup — BATCH-5 (2026-07-19): the tick-storage broadcast
     // consumer was REMOVED (in the PrevDayCache/TickStorage cleanup). The tick
@@ -3325,6 +3654,144 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stall_scan_reports_starved_only_when_it_can_see_nothing_and_should() {
+        // The false-OK this closes: the 30s per-instrument stall scan is fed
+        // exclusively by the process tick broadcast, and the revived Dhan live
+        // lane folds its ticks internally without ever publishing to it. So
+        // with the lane ON, the scan ran on schedule over an empty tracker and
+        // returned zero newly-stale — indistinguishable, to an operator, from
+        // "every instrument is healthy".
+        //
+        // Fires once the lane is on, nothing has arrived, and enough scans
+        // have run to rule out the boot window.
+        assert!(stall_scan_is_starved(
+            true,
+            0,
+            STALL_SCAN_STARVED_AFTER_SCANS,
+            false
+        ));
+
+        // REST-only runtime: an empty tracker is correct and expected there,
+        // so firing would page on normal operation every single day.
+        assert!(!stall_scan_is_starved(
+            false,
+            0,
+            STALL_SCAN_STARVED_AFTER_SCANS,
+            false
+        ));
+
+        // One tick proves the wiring — the scan is now reporting on something
+        // real and its zero means what it says.
+        assert!(!stall_scan_is_starved(
+            true,
+            1,
+            STALL_SCAN_STARVED_AFTER_SCANS,
+            false
+        ));
+
+        // Boot window: the lane dials, authenticates and subscribes before any
+        // frame arrives, so an early scan legitimately precedes the first tick.
+        assert!(!stall_scan_is_starved(
+            true,
+            0,
+            STALL_SCAN_STARVED_AFTER_SCANS.saturating_sub(1),
+            false
+        ));
+
+        // Edge-latched: structural, so it stays true — repeating it every 30s
+        // would flood the sink with a line carrying no new information.
+        assert!(!stall_scan_is_starved(
+            true,
+            0,
+            STALL_SCAN_STARVED_AFTER_SCANS.saturating_mul(100),
+            true
+        ));
+    }
+
+    #[test]
+    fn stall_scan_starve_threshold_is_past_any_normal_dial_to_first_frame() {
+        // 4 scans x 30s = 2 minutes. Not a free number: one scan would fire on
+        // every boot before the first frame, and a large one would let a
+        // genuinely blind detector look healthy for most of a session.
+        assert!(
+            STALL_SCAN_STARVED_AFTER_SCANS >= 2,
+            "a single scan would false-alarm on every boot"
+        );
+        let window_secs = u64::from(STALL_SCAN_STARVED_AFTER_SCANS)
+            .saturating_mul(tickvault_common::constants::STALE_LTP_SCAN_INTERVAL_SECS);
+        assert!(
+            (60..=300).contains(&window_secs),
+            "starve window is {window_secs}s — outside the 1-5 minute band"
+        );
+    }
+
+    // ── resolve_tokio_worker_threads (CPU isolation, Quote 17b 2026-08-19) ──
+    //
+    // The runtime width is no longer `num_cpus`, so the parse that decides it
+    // is now on the boot path. Every one of these cases must yield a width the
+    // runtime builder accepts — a malformed tuning hint must never be able to
+    // stop the app from starting.
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_defaults_when_unset() {
+        assert_eq!(
+            resolve_tokio_worker_threads(None),
+            DEFAULT_TOKIO_WORKER_THREADS,
+            "an absent override must fall back to the partition-consistent default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_honours_a_valid_override() {
+        assert_eq!(resolve_tokio_worker_threads(Some("4")), 4);
+        assert_eq!(resolve_tokio_worker_threads(Some("1")), 1);
+        assert_eq!(
+            resolve_tokio_worker_threads(Some("  3  ")),
+            3,
+            "systemd Environment= values routinely carry surrounding whitespace"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_is_fail_safe_on_garbage() {
+        // Zero would make `Builder::worker_threads(0)` PANIC, which is the one
+        // outcome this function exists to make unreachable.
+        for bad in ["", "   ", "0", "-1", "two", "2.5", "99999999999999999999"] {
+            assert_eq!(
+                resolve_tokio_worker_threads(Some(bad)),
+                DEFAULT_TOKIO_WORKER_THREADS,
+                "{bad:?} must fall back to the default, never propagate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_clamps_absurd_values_to_the_default() {
+        assert_eq!(
+            resolve_tokio_worker_threads(Some("65")),
+            DEFAULT_TOKIO_WORKER_THREADS,
+            "above MAX_TOKIO_WORKER_THREADS the value is a typo, not a request"
+        );
+        assert_eq!(
+            resolve_tokio_worker_threads(Some(&MAX_TOKIO_WORKER_THREADS.to_string())),
+            MAX_TOKIO_WORKER_THREADS,
+            "the boundary itself is legal"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_never_returns_zero() {
+        // Property-ish sweep: no byte string in this space may produce 0.
+        for n in 0..=300u32 {
+            let s = n.to_string();
+            assert!(
+                resolve_tokio_worker_threads(Some(&s)) >= 1,
+                "input {s:?} produced a zero width — Builder::worker_threads(0) panics"
+            );
+        }
+    }
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
 

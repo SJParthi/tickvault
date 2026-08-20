@@ -90,11 +90,27 @@ fn min_daily_universe_size_pinned_at_100() {
 }
 
 #[test]
-fn max_daily_universe_size_pinned_at_1200() {
+fn max_daily_universe_size_pinned_at_25000() {
+    // RE-BLESSED 2026-08-19 (was 1200). Authority: the operator's 2026-08-15
+    // full-mode / full-universe authorization in
+    // `websocket-connection-scope-lock.md`, whose REJECT list requires this
+    // constant, that rule file, and this ratchet to move together — which is
+    // why the change is here and not only in `constants.rs`.
     assert_eq!(
-        MAX_DAILY_UNIVERSE_SIZE, 1200,
-        "Maximum universe size must be 1200 per rule file §2 + §31 (NTM expansion, 2026-06-06)"
+        MAX_DAILY_UNIVERSE_SIZE, 25_000,
+        "Maximum universe size must be 25,000 per the 2026-08-15 full-universe scope \
+         authorization (~24,600 authorized instruments, sized to the 5 × 5,000 main-feed \
+         subscription capacity)"
     );
+    // 25,000 is not an arbitrary round number: it is the main-feed
+    // subscription capacity (5 connections × 5,000 instruments) that
+    // `plan_pool` actually enforces fail-closed, and that `main.rs` already
+    // passes to `resolve_live_universe`. That side is pinned independently in
+    // `pool_budget.rs`'s own tests — this crate cannot assert the equality
+    // directly because `tickvault-storage` does not depend on `tickvault-core`,
+    // and adding a crate dependency to satisfy one assertion would be the
+    // wrong trade. Two pins on the same literal, each in the crate that owns
+    // its half.
 }
 
 #[test]
@@ -132,9 +148,17 @@ fn rule_file_pins_30s_ip_whitelist_deadline() {
 #[test]
 fn rule_file_pins_universe_size_envelope() {
     let body = rule_file_body();
+    // RE-BLESSED 2026-08-19 alongside the constant. The rule file keeps its
+    // historical `[100, 1200]` text as the 2026-06-06 audit record (house
+    // convention: annotate, never rewrite), so BOTH the old and the new
+    // envelope satisfy this — what the assertion exists to catch is the
+    // envelope disappearing from the contract doc entirely.
     assert!(
-        body.contains("[100, 1200]") || body.contains("MAX_DAILY_UNIVERSE_SIZE = 1200"),
-        "rule file §2 / §22 must pin the [100, 1200] universe envelope"
+        body.contains("[100, 25,000]")
+            || body.contains("MAX_DAILY_UNIVERSE_SIZE = 25,000")
+            || body.contains("[100, 1200]")
+            || body.contains("MAX_DAILY_UNIVERSE_SIZE = 1200"),
+        "rule file §2 / §22 must pin a universe-size envelope"
     );
 }
 

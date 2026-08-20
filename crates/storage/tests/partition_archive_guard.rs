@@ -50,8 +50,12 @@ fn archive_enabled_default_is_false_in_code() {
     );
     // The class windows keep their documented defaults.
     assert_eq!(cfg.retention_days, 90);
-    // 2026-07-16: default raised 14 → 35 (operator one-month spot window).
-    assert_eq!(cfg.market_data_hot_days, 35);
+    // 2026-07-16: default raised 14 -> 35 (operator one-month spot window).
+    // 2026-08-19: TRIMMED 35 -> 15 by operator approval. The class no longer
+    // holds ticks or the sixteen sub-minute candle tables (they moved to the
+    // Intraday current-day class the same day), so this window now governs
+    // ONLY the minute-and-above history indicators and strategies read.
+    assert_eq!(cfg.market_data_hot_days, 15);
 }
 
 #[test]
@@ -78,10 +82,13 @@ fn base_toml_enables_archive_with_market_data_window() {
         section
             .get("market_data_hot_days")
             .and_then(toml::Value::as_integer),
-        Some(35),
-        "base.toml must pin the market-data hot window (ticks + candles_* + \
-         the per-minute chain tables — 35d since the 2026-07-16 operator \
-         one-month directive)"
+        Some(15),
+        "base.toml must pin the market-data hot window. 15d since the \
+         2026-08-19 operator approval (was 35d, the 2026-07-16 one-month \
+         directive). The class ALSO narrowed that day: ticks and the sixteen \
+         sub-minute candle tables moved to the current-day Intraday class, \
+         so this window now governs only the minute-and-above history the \
+         indicator and strategy paths read"
     );
     assert_eq!(
         section

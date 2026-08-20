@@ -1,0 +1,259 @@
+# grow-ebs-volume.yml — guarded online growth of the prod root EBS volume.
+#
+# Authorization: operator Quote 16, 2026-08-19 ("Grow gp3 100 -> 200 GB yes
+# even icnrease this also dude okay?"), recorded in
+# .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md §0/§7
+# Rule 3, and reaffirmed the same evening ("I need the full plan with 200gb
+# ... for tomorrow run itself").
+#
+# WHY THIS WORKFLOW EXISTS AT ALL
+# ------------------------------------------------------------------------
+# The grow was authorized on 2026-08-19 and did NOT happen, because the only
+# identity available to the automation agent cannot perform it:
+#
+#   UnauthorizedOperation: user/claude-code-agent is not authorized to
+#   perform: ec2:ModifyVolume ... no identity-based policy allows it
+#
+# `secrets.AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are, per
+# downsize-instance.yml's own header, "the only stored creds with EC2
+# mutation grants". So the capability exists in CI and nowhere else, which is
+# why this is a workflow rather than a script someone runs by hand — the
+# operator's standing rule is zero manual intervention.
+#
+# WHY GROWING IS SAFE, AND WHY IT IS STILL ONE-WAY
+# ------------------------------------------------------------------------
+# gp3 grows ONLINE with no stop and no detach. It can NEVER shrink: a smaller
+# modify-volume is refused, and a 200 GB snapshot cannot restore into
+# anything smaller, so reversing needs a terminate-and-recreate. That is why
+# every guard below fails CLOSED and why the target is an explicit input
+# rather than a default anyone can trip over.
+#
+# THE FILESYSTEM HALF (the part a volume grow alone does NOT do)
+# ------------------------------------------------------------------------
+# A 200 GB volume with a 100 GB filesystem gains exactly nothing. The host is
+# Amazon Linux 2023 (variables.tf `ami_id`), whose cloud-init runs the
+# `growpart` + `resizefs` modules on EVERY boot — so the filesystem follows
+# the volume at the next 08:30 IST start with no action from us.
+#
+# That is a claim about someone else's default, so this workflow does NOT
+# rely on it silently: step 5 runs growpart + resize2fs over SSM when the
+# instance is RUNNING, and step 6 reports the honest post-state. When the box
+# is stopped (the normal dispatch window) it says so plainly and defers to
+# cloud-init, and the next run's verification is what proves it.
+#
+# SECURITY: workflow_dispatch inputs are NEVER template-interpolated into
+# run: scripts — every input flows through a step env: block (the GitHub
+# script-injection class; ${{ }} is text substitution before bash runs).
+
+name: grow-ebs-volume
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_volume_id:
+        description: 'Type the EXACT root volume id to confirm (aws ec2 describe-instances --filters Name=tag:Name,Values=tv-prod-app --query "Reservations[].Instances[].BlockDeviceMappings[0].Ebs.VolumeId").'
+        required: true
+      target_size_gb:
+        description: 'New size in GB. Must be >= the current size (gp3 cannot shrink) and <= 200 (the variables.tf ebs_gp3_size_gb ceiling).'
+        required: true
+        default: '200'
+
+concurrency:
+  group: grow-ebs-volume-prod
+  cancel-in-progress: false # never interrupt an in-flight modify-volume
+
+permissions:
+  contents: read
+
+jobs:
+  grow:
+    name: Grow root EBS volume (online, guarded)
+    runs-on: ubuntu-24.04
+    environment: prod
+    steps:
+      - name: Check the mutation credentials exist at all
+        env:
+          HAS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+          HAS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_KEY" != "true" ] || [ "$HAS_SECRET" != "true" ]; then
+            echo "::error::AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are not set."
+            echo "These are the only stored credentials with EC2 mutation"
+            echo "grants (see downsize-instance.yml). Without them this"
+            echo "workflow cannot grow the volume — failing before any AWS"
+            echo "call rather than half-way through."
+            exit 1
+          fi
+          echo "mutation credentials present"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Probe IAM BEFORE any mutation
+        env:
+          VOL_ID: ${{ inputs.confirm_volume_id }}
+        run: |
+          set -euo pipefail
+          echo "identity:"
+          aws sts get-caller-identity --output text
+          # A real READ probe, then a --dry-run of the exact mutation. A
+          # missing grant is discovered here, not half-way through.
+          aws ec2 describe-volumes --volume-ids "$VOL_ID" --output text >/dev/null
+          set +e
+          OUT=$(aws ec2 modify-volume --volume-id "$VOL_ID" --size 200 --dry-run 2>&1)
+          set -e
+          if echo "$OUT" | grep -q "DryRunOperation"; then
+            echo "ec2:ModifyVolume GRANTED (dry-run succeeded)"
+          else
+            echo "::error::ec2:ModifyVolume is NOT granted to these credentials."
+            echo "$OUT"
+            exit 1
+          fi
+
+      - name: Verify the target and refuse anything that is not a grow
+        id: guard
+        env:
+          VOL_ID: ${{ inputs.confirm_volume_id }}
+          TARGET: ${{ inputs.target_size_gb }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in ''|*[!0-9]*)
+            echo "::error::target_size_gb must be a positive integer."; exit 1;;
+          esac
+          # The instance this volume must belong to. Typing the id of some
+          # OTHER account volume should not silently grow it.
+          EXPECTED=$(aws ec2 describe-instances \
+            --filters Name=tag:Name,Values=tv-prod-app \
+            --query 'Reservations[].Instances[].BlockDeviceMappings[0].Ebs.VolumeId' \
+            --output text)
+          if [ "$VOL_ID" != "$EXPECTED" ]; then
+            echo "::error::$VOL_ID is not the tv-prod-app root volume (that is $EXPECTED)."
+            exit 1
+          fi
+          CUR=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
+                 --query 'Volumes[0].Size' --output text)
+          echo "current=${CUR} GB target=${TARGET} GB"
+          if [ "$TARGET" -lt "$CUR" ]; then
+            echo "::error::gp3 can NEVER shrink. ${TARGET} < ${CUR} — refusing."
+            exit 1
+          fi
+          if [ "$TARGET" -eq "$CUR" ]; then
+            echo "::notice::Already ${CUR} GB — nothing to do."
+            echo "noop=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$TARGET" -gt 200 ]; then
+            echo "::error::${TARGET} exceeds the variables.tf ebs_gp3_size_gb ceiling of 200."
+            echo "Raising it needs a validation edit AND its own dated operator quote."
+            exit 1
+          fi
+          echo "noop=false" >> "$GITHUB_OUTPUT"
+          echo "current=${CUR}" >> "$GITHUB_OUTPUT"
+
+      - name: Grow the volume
+        if: steps.guard.outputs.noop == 'false'
+        env:
+          VOL_ID: ${{ inputs.confirm_volume_id }}
+          TARGET: ${{ inputs.target_size_gb }}
+        run: |
+          set -euo pipefail
+          aws ec2 modify-volume --volume-id "$VOL_ID" --size "$TARGET" \
+            --query 'VolumeModification.[ModificationState,TargetSize]' --output text
+          # Poll until AWS reports the modification optimizing or complete.
+          # "optimizing" already means the new size is USABLE — waiting for
+          # "completed" can take hours and is not required.
+          for i in $(seq 1 60); do
+            STATE=$(aws ec2 describe-volumes-modifications --volume-ids "$VOL_ID" \
+                     --query 'VolumesModifications[0].ModificationState' --output text)
+            echo "poll $i: $STATE"
+            case "$STATE" in
+              optimizing|completed) break;;
+              failed) echo "::error::modification FAILED"; exit 1;;
+            esac
+            sleep 10
+          done
+          SIZE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
+                  --query 'Volumes[0].Size' --output text)
+          echo "volume is now ${SIZE} GB"
+          if [ "$SIZE" != "$TARGET" ]; then
+            echo "::error::expected ${TARGET} GB, AWS reports ${SIZE} GB"
+            exit 1
+          fi
+
+      - name: Grow the filesystem (only possible while the box is running)
+        if: steps.guard.outputs.noop == 'false'
+        env:
+          TARGET: ${{ inputs.target_size_gb }}
+        run: |
+          set -euo pipefail
+          IID=$(aws ec2 describe-instances \
+            --filters Name=tag:Name,Values=tv-prod-app \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          STATE=$(aws ec2 describe-instances --instance-ids "$IID" \
+            --query 'Reservations[].Instances[].State.Name' --output text)
+          echo "instance $IID is $STATE"
+          if [ "$STATE" != "running" ]; then
+            echo "::notice::Box is ${STATE} — the filesystem cannot be grown now."
+            echo "Amazon Linux 2023 runs cloud-init growpart + resizefs on EVERY"
+            echo "boot, so the filesystem expands by itself at the next start."
+            echo "That is someone else's default rather than our code, so it is"
+            echo "stated as expected-not-proven: re-dispatch this workflow once"
+            echo "the box is running and this step will verify and repair it."
+            exit 0
+          fi
+          # The root device is DISCOVERED, not assumed. `/dev/nvme0n1` is
+          # correct for today's single-EBS Nitro root, but NVMe enumeration is
+          # not ordered — attach a second volume and the name can move. So the
+          # remote script resolves the device backing `/` and acts on that.
+          #
+          # Every `|| true` is gone. The first version chained three of them
+          # and never asserted the SSM Status, so a completely failed resize
+          # exited GREEN — a 200 GB volume with a 100 GB filesystem reported as
+          # done. That is the false-OK class this repo forbids, written into
+          # the very step meant to prove the change landed.
+          CMD=$(aws ssm send-command --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --comment "grow root filesystem after EBS resize" \
+            --parameters 'commands=["set -euo pipefail","ROOT=$(findmnt -no SOURCE /)","echo root-device=$ROOT","DISK=$(lsblk -no PKNAME \"$ROOT\")","PART=$(lsblk -no KNAME \"$ROOT\" | sed \"s/[^0-9]*//\")","growpart \"/dev/$DISK\" \"$PART\" || echo growpart-nochange","FSTYPE=$(findmnt -no FSTYPE /)","if [ \"$FSTYPE\" = xfs ]; then xfs_growfs -d /; else resize2fs \"$ROOT\"; fi","df -B1 --output=size / | tail -1"]' \
+            --query 'Command.CommandId' --output text)
+          for i in $(seq 1 30); do
+            S=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+                 --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$S" in Success|Failed|TimedOut) break;; esac
+            sleep 5
+          done
+          OUT=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+            --query 'StandardOutputContent' --output text)
+          echo "$OUT"
+          # ASSERT the status. Without this the step passes on Failed.
+          if [ "$S" != "Success" ]; then
+            echo "::error::filesystem grow did not succeed (SSM status: $S)"
+            aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+              --query 'StandardErrorContent' --output text || true
+            exit 1
+          fi
+          # ASSERT the filesystem actually reached the target. A green SSM
+          # status only says the commands ran, not that the disk grew.
+          FS_BYTES=$(echo "$OUT" | tail -1 | tr -dc '0-9')
+          WANT=$(( TARGET * 1000 * 1000 * 1000 * 90 / 100 ))  # 90% of nominal GB
+          if [ -z "$FS_BYTES" ] || [ "$FS_BYTES" -lt "$WANT" ]; then
+            echo "::error::filesystem is ${FS_BYTES:-unknown} bytes — below 90% of ${TARGET} GB."
+            echo "The volume grew but the filesystem did not follow."
+            exit 1
+          fi
+          echo "filesystem confirmed at ${FS_BYTES} bytes"
+
+      - name: Report the honest final state
+        if: always()
+        env:
+          VOL_ID: ${{ inputs.confirm_volume_id }}
+        run: |
+          set -euo pipefail
+          aws ec2 describe-volumes --volume-ids "$VOL_ID" \
+            --query 'Volumes[0].{Size:Size,IOPS:Iops,Throughput:Throughput,State:State}' \
+            --output table || true

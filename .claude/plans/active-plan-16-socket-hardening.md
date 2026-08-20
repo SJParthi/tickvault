@@ -394,6 +394,57 @@ and does not apply to the deploy path, which cross-compiles for a KNOWN r8g.xlar
 only, leaving the local build generic. The portability comment stays and gains the
 carve-out so the next reader does not undo it.
 
+### Items 8, 12, 14 — closure record (2026-08-18)
+
+Verified in source on this branch before writing, not inferred from the item text above.
+
+**Item 12(a) — DONE by this change.** The drain no longer opens with its own
+`Utc::now()`. `CapturedFrame` carries `received_at`, a MONOTONIC instant stamped in the
+read task (`WalRingSink::accept`, before the WAL append), and the drain derives the
+receipt instant as `Utc::now() - frame.received_at.elapsed()`. A first attempt stamped a
+WALL CLOCK in `pool_supervisor` and was correctly rejected by the existing ratchet
+`test_pool_supervisor_source_never_reads_the_wall_clock` — that ban is load-bearing (an
+NTP step must not be able to expire all sixteen sockets at once). The monotonic shape
+respects it and is strictly better: a clock step landing between receipt and fold cancels
+out of the difference instead of corrupting the sample. Guarded by
+`dhan_feed_drain_consults_the_frames_receipt_stamp` and
+`dhan_feed_drain_actually_subtracts_the_queue_delay` — the second exists because
+computing `elapsed()` and then not applying it compiles, passes every unit test, and
+silently restores the exact wrong measurement.
+
+**Item 12(b) — already DONE by another route.** `CapturedFrame::connection_index: u8`
+(`pool_supervisor.rs`) already carries the slot, and `record_ws_lag` already resolves it
+to a per-slot histogram handle.
+
+**Item 12(c) — the LIVE path is covered; the named symbol is dormant, not fixed.** Stated
+precisely because this item names a specific symbol. The live per-connection path is
+covered: `ws_lag_ms` returns `WsLag::ClampedNegative` for a negative sample (recorded as
+0.0 and counted on `excluded_clamped_negative`) and `None` for an implausible LTT
+(counted on `excluded_implausible_ltt`). The symbol the item actually names —
+`DailyLagHistogram::record_ns` in `feed_lag_monitor.rs` — is STILL `u64` and is
+UNCHANGED. It is unreachable rather than repaired: it is private and has ZERO production
+producers (every call site is inside its own test module), which that file's own header
+already records. Recorded this way deliberately — calling it "fixed" would be the
+stale-row class this repo has had to correct repeatedly.
+
+**Item 8 — WITHDRAWN, not deferred.** The proposed respawn supervisor would be
+unreachable in production. The release profile sets `panic = "abort"` (`Cargo.toml:280`),
+so a panic in any drain arm aborts the PROCESS — there is no unwind for a supervisor to
+catch and no surviving task to respawn from. Recovery is already owned one layer up by
+systemd `Restart=always` (`deploy/systemd/tickvault.service:94`), which restarts the whole
+binary. Building the supervisor would add a respawn counter and a bounded-restart ladder
+that can never increment, i.e. a permanently-green monitor — the exact false-OK class
+Rule 11 forbids. The item's underlying concern (a dead drain must be visible) is real and
+is served by `tv_dhan_feed_stack_up < 1`, already alarmed under item 13.
+
+**Item 14 — already DONE, and deliberately `neoverse-n1`, not `-v2`.**
+`.cargo/config.toml:58` sets `rustflags = ["-C", "target-cpu=neoverse-n1"]` on the deploy
+target. The item text above proposes `neoverse-v2` (Graviton4). That is NOT an oversight
+to correct: the operator-sanctioned rollback path from r8g.xlarge runs t4g (Graviton2 =
+`neoverse-n1`), and a binary built for V2 would fault with SIGILL on a t4g box the moment
+that rollback was exercised. `n1` runs correctly on both, so it is the correct choice for
+a target set that includes the rollback host. Left as-is.
+
 ## Item 8–14 Edge Cases
 
 - Drain respawn must NOT restart into a poison frame forever — the restart budget is
@@ -691,3 +742,325 @@ addressed — it is NOT; replayed live-feed frames are still counted and dropped
 It is deliberately left to Item 2 because the fold path takes a live ring rather than a
 replay batch, and a half-done version risks the 5 working main-feed sockets. (d) Any
 measurement at 4,565 instruments — the lane has still never been observed receiving a tick.
+
+## ITEM 2 — DESIGN ADDENDUM (added 2026-08-18, operator: "fix ebrythgine ntirley ddue okay?")
+
+Item 2 above states the DEFECT and names the remedy ("re-fold from the WAL,
+DEDUP-idempotent via `capture_seq`"). This addendum is the DESIGN, written before any
+code, because the one-line remedy as stated is **not safe as written** — see §A2.
+
+**Status of the defect today (re-verified 2026-08-18, in source):** the loss is REAL but
+it is **not silent**. `WalRingSink::accept` returns `RingFull`; the frame is already in
+the WAL; `pool_supervisor.rs` then emits a coded `error!` per socket, throttled at
+1/2/4/8… occurrences, stating verbatim *"nothing re-folds WAL frames, so treat this as
+data loss until that changes."* It is counted (`tv_dhan_ws_ring_full_total`) and charted.
+What is missing is only the RECOVERY. Recording this so nobody re-reports "silent tick
+loss" — that half was fixed 2026-08-11.
+
+### A1. Why the boot path cannot simply be called mid-session
+
+`refold_wal_frames` has exactly ONE production call site, and its safety argument is
+positional, not defensive. The comment at that site states it is placed "AFTER seeding and
+BEFORE any socket opens" so a recovered frame "cannot race a live frame for the same
+`capture_seq`". Mid-session **every** premise of that sentence is false: sockets are live,
+seeding is done, and live frames are arriving concurrently. Calling it from the drain loop
+inherits none of its safety.
+
+### A2. The correctness trap — re-folding a SUPERSET is NOT idempotent
+
+Item 2's phrase "DEDUP-idempotent via `capture_seq`" is true of **ticks** and false of
+**candles**, and the difference decides the whole design:
+
+| Sink | Re-folding the same frame twice | Why |
+|---|---|---|
+| `ticks` table | **Safe** — collapses | DEDUP UPSERT KEYS `(ts, security_id, segment, capture_seq, feed)` include `capture_seq` |
+| Candle aggregator | **CORRUPTS** | The fold ACCUMULATES: `volume` and `tick_count` are summed, so a re-folded tick double-counts them |
+
+Therefore the recovery must re-fold **exactly** the refused frames — never "replay the
+segment and let dedup sort it out." That approach would silently inflate volume on every
+recovered candle, which is worse than the loss it repairs (wrong data beats missing data
+only when it is labelled wrong; here it would be neither).
+
+### A3. Design
+
+1. **Record the refusal, not the recovery.** `WalRingSink::accept` already knows the exact
+   moment a frame is refused. On `RingFull` it pushes that frame's `capture_seq` into a
+   fixed-capacity `RefusedSeqs` tracker (no allocation; a pre-sized ring of `u64`).
+2. **Bounded, fail-LOUD tracker.** Capacity is fixed at construction. If the tracker itself
+   overflows, we have lost the identity of the lost frames — that is unrecoverable and is
+   reported as such (`tv_dhan_refold_untracked_total` + a coded `error!`), never silently
+   truncated into a partial recovery that reads like a full one.
+3. **Recovery runs on the drain's own task, in its own bounded arm** — the established
+   house shape (`scan_silence` has a dedicated 30 s timer precisely because it is O(n);
+   `catch_up_seal_all` runs on the drain's `select!`). It must NOT run inside the flush
+   path it is recovering from, and it must NOT run while the channel is still backed up:
+   the trigger is "channel depth below a low-water mark AND `RefusedSeqs` non-empty."
+4. **Exactly-once fold.** Each recovered `capture_seq` is removed from the tracker only
+   after its fold returns, so a crash mid-recovery leaves it pending for the boot path.
+5. **Late arrival is an EXISTING solved problem, not a new one.** A recovered tick whose
+   bucket already sealed is a late tick, and the aggregator already has a late-tick policy
+   (`FeedStrategy` / `LatePolicy`, Dhan = Refold). The recovery reuses it rather than
+   inventing a second late path.
+
+### A4. Edge Cases
+
+| # | Case | Handling |
+|---|---|---|
+| 1 | Tracker overflows during a long stall | Unrecoverable-by-identity: count + coded error, never a partial recovery reported as whole |
+| 2 | WAL segment rotated/archived before recovery | Frame unreadable: count + coded error; recovery skips it and continues |
+| 3 | A second stall begins during recovery | Recovery is bounded per pass and re-armed; it never competes with live folding |
+| 4 | Socket reconnects mid-recovery | `capture_seq` is replay-stable, so identity survives the reconnect |
+| 5 | Recovered tick's bucket already sealed | Existing late-tick policy applies (§A3.5) |
+| 6 | Frame was refused but ALSO folded (double-path) | Impossible by construction: `accept` returns exactly one outcome per frame |
+| 7 | Recovery finds an empty tracker | No-op, no log, no cost |
+
+### A5. Failure Modes
+
+| Mode | Consequence if unhandled | Mitigation |
+|---|---|---|
+| Re-fold a superset | Inflated candle volume/tick_count — **wrong data** | §A2: exact-seq recovery only |
+| Recovery starves live folding | Live lag grows while repairing history | Bounded work per pass + low-water trigger |
+| Unbounded tracker | Memory growth under sustained stall | Fixed capacity, fail-loud on overflow |
+| Silent partial recovery | Loss reported as repaired | Overflow and unreadable-frame counters are separate and coded |
+
+### A6. Test Plan
+
+1. `refused_seq_is_recorded_on_ring_full` — accept returns `RingFull` ⇒ seq present.
+2. **`refold_twice_does_not_double_count_volume`** — the crux of §A2. Fold a tick, re-fold
+   the same frame, assert candle `volume`/`tick_count` unchanged. Expected to FAIL against
+   a superset-replay implementation; that is the point of writing it first.
+3. `tracker_overflow_is_counted_and_never_silently_truncated`.
+4. `recovery_is_bounded_per_pass` — N refused frames ⇒ ≤ budget folds per pass.
+5. `recovery_does_not_run_while_channel_is_backed_up`.
+6. `unreadable_wal_frame_is_counted_not_panicked`.
+7. DHAT: recovery path allocates zero per recovered frame in steady state.
+
+### A7. Rollback
+
+Recovery ships behind a config gate, serde default **OFF**. Flipping it off restores
+today's exact behaviour (loss + loud log). No schema change, no DEDUP-key change, no new
+table — so rollback is a config flip and a restart, never a migration.
+
+### A8. Observability
+
+New: `tv_dhan_refold_recovered_total`, `tv_dhan_refold_untracked_total`,
+`tv_dhan_refold_unreadable_total`. **Mandatory in the same PR:** the existing `RingFull`
+error text states *"nothing re-folds WAL frames"* — that sentence becomes FALSE the moment
+this lands, and a stale operator-facing message is the false-OK class the charter forbids.
+It must be updated in lockstep.
+
+### A9. Honest envelope
+
+100% inside the tested envelope: frames REFUSED by a full ring are recovered exactly-once
+from the durable WAL, bounded per pass, with overflow and unreadable frames counted
+separately and loudly. **NOT claimed:** recovery of frames the WAL never received (a frame
+lost before `accept` is not in scope and never was); recovery after WAL rotation (§A4.2 —
+counted, not repaired); that recovery is free (it competes for the drain's task and is
+therefore rate-limited by design); or any live verification — this design is UNVERIFIED
+against a real stall, and the first live stall is the probe.
+
+### A10. BLOCKER found while attempting implementation (2026-08-18) — the WAL has no bounded reader
+
+Implementation was attempted immediately after §A1–A9 and **stopped at a defect in
+this design's own §A3.4**, recorded here rather than worked around.
+
+§A3 says "re-fold from the durable WAL". The WAL's ONLY read API is
+`ws_frame_spill::replay_all(wal_dir) -> anyhow::Result<Vec<ReplayedFrame>>`, and it is
+**boot-shaped, not session-shaped**:
+
+| Property | Value | Consequence mid-session |
+|---|---|---|
+| Segment selection | globs **every** live `*.wal` plus `replaying/` leftovers | not "the stalled window" — the whole day so far |
+| Return type | `Vec<ReplayedFrame>`, each owning `frame: Vec<u8>` | every frame copied onto the heap at once |
+| When segments leave the glob | only after `confirm_replayed` moves them to `archive/` | nothing has left yet during a live session |
+
+At the documented envelope (~5,000 packets/sec, frames up to 256 KiB on the main feed)
+a mid-session `replay_all` would load the **entire session's captured frames** into
+memory in one allocation burst, on the drain task, on a 32 GiB box that is also running
+QuestDB. **That is an OOM, not a recovery** — and it would fire precisely during a
+database stall, i.e. exactly when the system is already degraded. Calling it would also
+be wrong in a second way: `confirm_replayed` must NOT run mid-session or it would
+archive segments the boot path still needs.
+
+**Therefore Item 2 gains a hard prerequisite** — a bounded, streaming WAL read:
+
+- read frames matching a supplied `capture_seq` set WITHOUT materialising the segment
+  (iterator/callback, not `Vec`);
+- bounded per call (a cap on frames returned per recovery pass);
+- tolerant of the ACTIVE segment being appended to concurrently — a torn final record
+  must be skipped, never parsed (the boot path only ever reads quiescent files, so this
+  requirement is genuinely new, not inherited);
+- must NOT mutate segment state (no `confirm_replayed`, no move to `replaying/`).
+
+`ReplayedFrame` already carries `frame_seq`, so the identity needed for exactly-once
+filtering exists — what is missing is a way to reach it without loading everything.
+
+**Honest consequence for sequencing:** Item 2 is NOT a single-crate change and cannot
+land as one PR. Order is (1) the bounded reader in `crates/storage`, with its own tests
+including the torn-tail case, then (2) the refused-seq tracker, then (3) the drain's
+recovery arm. Attempting (2) or (3) first produces code with nothing safe to call.
+
+**Status:** design AMENDED, implementation **NOT started** — deliberately. Shipping the
+naive version would have converted a bounded, loud, counted tick loss into an
+out-of-memory kill of the whole lane during a database stall. That trade is strictly
+worse than the defect it repairs.
+
+## ITEM 22 (added 2026-08-19) — the 25,000-instrument contract universe
+
+**Operator:** *"You motherucker I clelarug told yo uto Goa head with 25k
+sinturments with dperh 5 with full mode right motherfucker see is this clealry
+done built an dwored or not motherucker okay? Menabwile what about depth 20 of
+250 instruments dude and what about depth 200 of 5 instruments and order update
+entie capturing dude okay? I need all these now to be build wired integrated
+implemented dude okay?"* (2026-08-19)
+
+Authority for the SET is the 2026-08-15 "FULL-MODE, FULL-UNIVERSE SUBSCRIPTION
+SCOPE" section of `websocket-connection-scope-lock.md`. This item is the
+implementation of that authorization, which had been recorded and never built.
+
+### The finding that made it necessary
+
+Verified in source before any code was written: the live universe resolves
+through `master_csv::is_nse_cash_equity` — `NSE && E && EQ`. Cash equity only.
+The authorized ~24,600 set is ~90% option contracts, and a cash-equity filter
+can never emit one. The lane was subscribing ~4,565 spots in Full mode with
+depth on all of them, which is real and is not what was authorized.
+
+Second finding, same audit: depth-20 was carrying **84 of its 250 slots**. Its
+fixed ±10 window was justified in its own doc as "126 instruments across 3
+underlyings", but Dhan serves depth on NSE only, so SENSEX (BSE_FNO) is refused
+every day and the eligible set is two underlyings, not three.
+
+### Plan Items
+
+- [x] Parse the five derivative columns from the Dhan master (INSTRUMENT,
+      SM_EXPIRY_DATE, STRIKE_PRICE, OPTION_TYPE, UNDERLYING_SYMBOL), typed and
+      compact, all OPTIONAL so a six-column header still parses
+  - Files: crates/core/src/instrument/master_csv.rs
+  - Tests: test_a_six_column_master_still_parses_and_reads_as_no_derivatives,
+    test_a_detailed_master_row_carries_its_derivative_fields,
+    test_expiry_accepts_both_vendor_forms_and_refuses_the_rest,
+    test_expiry_packing_orders_the_same_way_calendar_time_does,
+    test_strike_rounds_to_paise_and_refuses_nonsense,
+    test_unknown_instrument_and_option_codes_classify_rather_than_panic,
+    test_class_predicates_split_options_from_futures,
+    test_a_row_too_short_for_an_optional_column_is_kept_not_rejected
+- [x] Contract selection: futures all expiries, index chains current expiry,
+      stock options ATM ± 25, capacity-bounded by shrinking the ATM window
+  - Files: crates/app/src/dhan_contract_universe.rs, crates/app/src/lib.rs
+  - Tests: a_full_shape_selection_reaches_the_authorized_scale,
+    the_atm_window_shrinks_rather_than_the_selection_truncating,
+    an_underlying_with_no_spot_price_is_refused_not_guessed,
+    every_underlying_gets_the_same_window_regardless_of_iteration_order,
+    futures_and_index_chains_outrank_stock_options_under_pressure,
+    the_same_id_in_two_segments_is_kept_as_two_instruments,
+    the_selection_is_deterministic_across_runs
+- [x] Adaptive depth-20 window sized to the ELIGIBLE underlying count, filling
+      244 of 250 instead of 84
+  - Files: crates/app/src/dhan_depth_universe.rs
+  - Tests: the_depth_20_window_fills_the_envelope_without_exceeding_it,
+    the_two_eligible_underlyings_case_fills_the_pool,
+    no_eligible_underlyings_selects_no_window_rather_than_dividing_by_zero,
+    a_very_wide_underlying_set_degrades_to_the_money_rather_than_overflowing,
+    the_pool_envelope_is_derived_from_the_vendor_limits_not_written_down
+- [x] Contract artifact written by the daily rider, read by the attach
+  - Files: crates/app/src/dhan_universe.rs, crates/app/src/dhan_contract_universe.rs
+  - Tests: the_artifact_round_trips_to_the_same_selection_as_a_parsed_master,
+    a_contract_row_survives_serialisation,
+    the_artifact_path_is_dated_so_a_stale_day_is_never_read
+- [x] Live spot prices from QuestDB, joined to underlyings via the symbol map
+  - Files: crates/app/src/dhan_contract_universe.rs
+  - Tests: the_spot_query_bounds_to_today_and_keys_on_the_composite,
+    spot_prices_parse_to_paise_and_refuse_the_unusable,
+    the_symbol_map_reads_names_and_survives_a_bad_row,
+    the_join_prices_only_symbols_that_actually_ticked,
+    the_join_will_not_price_a_stock_off_its_own_derivative
+- [x] Contract dial on the existing late-attach retry loop, bounded by the
+      connections the spot universe already consumed
+  - Files: crates/app/src/dhan_feed_stack.rs
+  - Tests: remaining_capacity_is_counted_in_whole_connections,
+    a_full_pool_leaves_no_room_rather_than_overflowing_it,
+    connection_count_rounds_up_because_a_partial_socket_is_still_a_socket,
+    the_two_helpers_can_never_together_exceed_the_authorized_pool,
+    a_malformed_date_selects_nothing_rather_than_an_expired_contract,
+    the_date_packing_matches_the_one_expiries_are_stored_in
+
+## Item 22 Design
+
+Two resolution times, because they need different evidence. The daily rider
+(08:30) has the master and writes the derivative subset as an artifact. The
+attach (post-open) has live prices and does the selection, because locating
+at-the-money needs a price that does not exist at boot.
+
+Contracts ride the EXISTING depth late-attach retry loop rather than a second
+task. Not for tidiness: both wait on post-open evidence, and both dial through
+a `PoolSupervisor` that cannot be owned by two tasks at once.
+
+Priority order under capacity pressure: index futures, stock futures, index
+chains, then stock options. The ATM window is the only elastic dimension, and
+it shrinks uniformly across underlyings — chosen before anything is pushed, so
+an early stock cannot take 25 strikes while a late one takes three.
+
+## Item 22 Edge Cases
+
+- Six-column master (every existing fixture): parses, derivative fields read
+  as absent, equity join unchanged.
+- Underlying with no tick today: options REFUSED and counted, never centred on
+  a guessed at-the-money.
+- Ladder shorter than the window: taken whole, no index panic on vendor data.
+- Same numeric id in two segments: kept as two instruments (I-P1-11).
+- Malformed IST date or expiry: packs to 0, which compares as "before today",
+  so nothing is selected rather than an expired contract being subscribed.
+- Spot universe already using all 5 main-feed connections: contracts get 0
+  capacity rather than a sixth connection.
+- Envelope smaller than the futures alone: truncated AND counted.
+
+## Item 22 Failure Modes
+
+- Contract artifact unwritable: coded error, spot universe unaffected, the
+  session carries no contracts and says so.
+- Artifact unreadable at attach: empty selection, coded error naming the path.
+- Symbol map unreadable: futures and index chains still selected; stock
+  options refused for want of prices.
+- QuestDB spot query fails: empty price map, stock options refused, futures
+  and index chains unaffected.
+- Every failure returns an EMPTY selection, never a partial one presented as
+  complete.
+
+## Item 22 Test Plan
+
+`cargo test -p tickvault-core --lib master_csv` (34) and
+`cargo test -p tickvault-app` (1,448 lib + 82 binaries). Pure functions
+throughout the selection path, so every hostile case is a fixture rather than
+a mock: no I/O, no clock, no network in `select_contract_universe`.
+
+## Item 22 Rollback
+
+Set `[dhan_universe] live_subscription_from_master = false` to restore the
+4-SID index universe. The contract attach then finds an artifact it does not
+need and selects nothing extra. No schema change, no migration; the artifact is
+a dated file that is simply not read.
+
+## Item 22 Observability
+
+`contract universe resolved` logs artifact size, priced underlyings, selected
+count, per-class counts, the ATM window actually used, underlyings without a
+spot, and contracts dropped for capacity. The late-attach success line reports
+the same alongside the depth counts. Every refusal in `ContractSelection` is a
+counted field, so a short selection is never mistaken for a thin market.
+
+## Item 22 Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: selection
+is a pure function proven to reach 22,660 instruments on a 220-stock shape, to
+stay inside the envelope at every underlying count from 1 to 8, and to refuse
+rather than guess when a price is missing.
+
+NOT claimed: that any of this has received a tick. The Dhan live lane has not
+reported a non-zero cross-verification `compared` count since the 2026-07-13
+retirement, so contract selection is code that is ready for a feed that is
+still unproven. NOT claimed: CPU at 25,000 instruments — the drain has never
+run above ~4,565 and the ~12,500 packet/sec figure is arithmetic, not a
+measurement. NOT claimed: index FUTURES depth, which no authorized Dhan source
+can reach. NOT claimed: that the ~24,600 figure will be met on any given day —
+it is whatever the master resolves, bounded by the connections left after spot.

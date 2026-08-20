@@ -38,6 +38,18 @@ RemainAfterExit=yes
 # Runs as ROOT, unlike tickvault-holiday-gate.service: writing /etc/sysctl.d,
 # calling `sysctl --system`, and writing /sys/kernel/mm/transparent_hugepage
 # all require privilege. This is the narrowest thing on the box that needs it.
+# Optional operator override file — the rollback surface for everything this
+# unit applies, without a code change or a redeploy. The leading `-` means "use
+# it if it exists", so a box without one behaves exactly as before.
+#
+#   /etc/tickvault/host-tuning.env
+#     TV_IRQ_STEER=off     # leave NIC interrupts to the kernel / irqbalance
+#     TV_IRQ_CPU=0         # which core the NIC interrupts are pinned to
+#
+# Then: `systemctl restart tickvault-host-tuning` (and re-enable irqbalance if
+# it was stopped: `systemctl enable --now irqbalance`).
+EnvironmentFile=-/etc/tickvault/host-tuning.env
+
 WorkingDirectory=/opt/tickvault
 
 # 1. Re-install the sysctl file from the repo, so a deploy that changes tuning
@@ -47,6 +59,37 @@ ExecStart=/usr/bin/install -m 0644 -o root -g root /opt/tickvault/repo/deploy/aw
 
 # 2. Apply it. Covers the BBR drop-in too, which user-data writes once and which
 #    persists across boots via /etc/modules-load.d.
+# BBR congestion control.
+#
+# Written HERE, not in user-data, because user-data runs ONCE PER INSTANCE and
+# this box proves that is not enough: i-0c3fe906dad5492fc was created
+# 2026-08-12 and on 2026-08-18 `sysctl net.ipv4.tcp_congestion_control`
+# still reported `cubic`, with /etc/sysctl.d/ holding only Amazon Linux's
+# 00-defaults.conf. The BBR drop-in user-data was supposed to write was never
+# there. A unit that reapplies on every boot cannot miss it that way.
+#
+# Leading `-` plus the modprobe guard: if tcp_bbr is unavailable, writing the
+# value would make `sysctl --system` below fail WHOLESALE and strip the receive
+# buffers along with it — trading a missing optimisation for a missing floor.
+ExecStart=-/bin/sh -c 'modprobe tcp_bbr 2>/dev/null && { echo "net.ipv4.tcp_congestion_control = bbr" > /etc/sysctl.d/99-tickvault-bbr.conf; echo tcp_bbr > /etc/modules-load.d/tickvault-bbr.conf; }'
+
+# NIC receive ring.
+#
+# Measured 2026-08-18: `ethtool -g ens34` reported RX 1024 against a hardware
+# maximum of 8192 — the stock ENA setting, never tuned anywhere in this repo
+# (`grep -rn ethtool` found nothing before this line). The ring is the FIRST
+# place inbound packets are dropped; net.core.netdev_max_backlog sits behind
+# it, so raising the backlog while leaving a 1024-entry ring tunes the second
+# bottleneck and not the first.
+#
+# Nothing is being dropped at this size today (rx_dropped 0 at ~550 ticks/sec),
+# so this is burst headroom for the 16-socket / 25,000-instrument target rather
+# than a repair. Leading `-`: a resize briefly resets the interface, and on a
+# NIC that refuses the value this must not fail the unit and take the sysctl
+# floor down with it. The unit runs at boot and on deploy, and deploys are
+# blocked 09:00-15:45 IST, so the reset never lands mid-session.
+ExecStart=-/sbin/ethtool -G ens34 rx 8192
+
 ExecStart=/sbin/sysctl --system
 
 # 3. Verify EVERY load-bearing value and write the verdict where it outlives the

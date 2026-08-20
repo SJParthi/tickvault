@@ -77,7 +77,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::feed::Feed;
@@ -726,6 +726,186 @@ pub const SEAL_SPILL_IO_TIMEOUT: Duration = Duration::from_secs(SEAL_SPILL_IO_TI
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Outcome of one spill-retention sweep.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SpillPruneOutcome {
+    /// Spill files deleted (older than the retention window).
+    pub deleted: usize,
+    /// Of those, how many still held records — i.e. seals that were never
+    /// replayed into QuestDB. NON-ZERO IS AN INCIDENT, not routine cleanup.
+    pub deleted_non_empty: usize,
+    /// Total unreplayed records in the deleted files (bytes / record size).
+    pub records_lost: u64,
+    /// Files that should have been deleted but could not be.
+    pub failed: usize,
+    /// Bytes still on disk after the sweep.
+    pub bytes_after: u64,
+    /// Files skipped because they are TODAY's file — the one the live writer
+    /// may hold an open descriptor to. Never deleted at any age.
+    pub skipped_live: usize,
+}
+
+/// Deletes spill files older than `max_age_secs` — pure-testable core over an
+/// injected `now`.
+///
+/// # Why this exists (2026-08-19)
+///
+/// `data/spill/` had **no retention of any kind**. `SPILL_FILE_MAX_AGE_SECS`
+/// was defined, documented and unit-tested, but a workspace scan found ZERO
+/// production consumers, and `clear_spill_for_date` — documented as "called by
+/// the writer task after `read_all` is fully replayed" — has zero production
+/// callers too. The writer chain only ever appends. So spill files accumulated
+/// for the life of the deployment, and a QuestDB outage grew them without any
+/// bound at all.
+///
+/// # Why this deletes LOUDLY, unlike the WAL archive sweep
+///
+/// The WAL archive holds frames already re-injected and durably persisted —
+/// deleting an aged copy loses nothing. Spill is the opposite: it holds seals
+/// that have NOT reached QuestDB. Deleting a non-empty spill file destroys
+/// data.
+///
+/// That is why the age window is generous and every non-empty deletion is
+/// counted and reported. A spill file a week old that still holds records
+/// means the replay path has been broken for a week — an incident that must
+/// be surfaced, never a quiet tidy-up.
+///
+/// The alternative — never deleting — is not the safe choice it appears to be:
+/// an unbounded directory fills the volume, and a full volume stops EVERY
+/// table on the box, including the live writes these seals would be replayed
+/// into. Bounded-and-loud beats unbounded-and-silent.
+#[must_use]
+pub fn prune_spill_files_at(
+    spill_dir: &Path,
+    max_age_secs: u64,
+    now: std::time::SystemTime,
+) -> SpillPruneOutcome {
+    let mut outcome = SpillPruneOutcome::default();
+    // NEVER delete a file the live writer may hold open (2026-08-19, found by
+    // the adversarial audit — this sweep as first written could do exactly
+    // that, and the consequence is the worst failure mode in this module).
+    //
+    // `SealSpillWriter` caches a LONG-LIVED append descriptor. On POSIX,
+    // unlinking a file an open descriptor still references keeps the inode
+    // alive: the writer goes on appending, `write_all` keeps returning Ok,
+    // absorption keeps reporting `Spilled` — and `read_all` opens a fresh
+    // empty path that can never see any of it. Seals reported durable would
+    // be silently gone. `close_open_handle`'s own doc states this contract
+    // and says it MUST be called whenever the file is unlinked; this sweep
+    // runs in a different task with no writer reference, so it CANNOT honour
+    // that contract and must not create the situation.
+    //
+    // The writer only ever opens TODAY's file (IST-date rotation), so
+    // excluding today's name is a complete defence, and a structural one.
+    //
+    // Age alone is NOT a defence, which is the part worth stating: it happens
+    // to hold today only because the 7-day window exceeds the ~9-hour process
+    // lifetime. That is an accidental invariant enforced by nothing — shorten
+    // the window, or leave a process running across the weekend, and the
+    // sweep starts deleting live files. Two unrelated constants silently
+    // holding a correctness property between them is precisely the shape this
+    // audit keeps finding.
+    let live_name = ist_date_filename(
+        now.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0),
+    );
+    // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
+    let Ok(entries) = std::fs::read_dir(spill_dir) else {
+        return outcome; // missing dir — nothing to prune
+    };
+    let cutoff = std::time::Duration::from_secs(max_age_secs);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only our own spill records. Anything else in the directory is left
+        // strictly alone — deleting a file we did not write, to satisfy our
+        // own budget, would be indefensible.
+        if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+            continue;
+        }
+        // The live-writer guard. Cheap, and it fails SAFE: an unreadable file
+        // name is treated as live and kept, never deleted on uncertainty.
+        if path.file_name().and_then(|n| n.to_str()) != Some(live_name.as_str()) {
+            // not today's file — eligible, fall through to the age check
+        } else {
+            outcome.skipped_live += 1;
+            if let Ok(meta) = entry.metadata() {
+                outcome.bytes_after = outcome.bytes_after.saturating_add(meta.len());
+            }
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue; // unreadable metadata — keep, never delete on uncertainty
+        };
+        let len = meta.len();
+        let aged_out = meta
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > cutoff);
+        if !aged_out {
+            outcome.bytes_after = outcome.bytes_after.saturating_add(len);
+            continue;
+        }
+        // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                outcome.deleted += 1;
+                if len > 0 {
+                    outcome.deleted_non_empty += 1;
+                    outcome.records_lost = outcome
+                        .records_lost
+                        .saturating_add(len / SEAL_SPILL_RECORD_SIZE as u64);
+                }
+            }
+            Err(err) => {
+                outcome.failed += 1;
+                outcome.bytes_after = outcome.bytes_after.saturating_add(len);
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "spill retention sweep: remove_file failed — retried next pass"
+                );
+            }
+        }
+    }
+    outcome
+}
+
+/// Wall-clock wrapper over [`prune_spill_files_at`]. Cold path — called from
+/// the periodic retention task in `main.rs`.
+///
+/// Reports at `error!` with a code when a deleted file still held records,
+/// because that is unreplayed data leaving the box.
+// TEST-EXEMPT: thin wall-clock wrapper — all deletion and accounting logic is
+// covered by the six spill_sweep_* tests against prune_spill_files_at; this
+// layer only supplies SystemTime::now(), emits the coded log and sets the
+// gauge. Mirrors the sibling ws_frame_spill::prune_archived_segments wrapper.
+#[must_use]
+pub fn prune_spill_files(spill_dir: &Path, max_age_secs: u64) -> SpillPruneOutcome {
+    let outcome = prune_spill_files_at(spill_dir, max_age_secs, std::time::SystemTime::now());
+    if outcome.deleted_non_empty > 0 {
+        error!(
+            code = "SPILL-RETENTION-01",
+            files = outcome.deleted_non_empty,
+            records_lost = outcome.records_lost,
+            max_age_secs,
+            "spill files aged out while STILL HOLDING unreplayed seals — the \
+             replay path has been broken for longer than the retention window. \
+             This is data loss, reported rather than hidden; investigate why \
+             the writer never drained these."
+        );
+    } else if outcome.deleted > 0 {
+        info!(
+            deleted = outcome.deleted,
+            bytes_after = outcome.bytes_after,
+            "spill retention sweep: removed aged empty spill files"
+        );
+    }
+    metrics::gauge!("tv_seal_spill_bytes").set(outcome.bytes_after as f64);
+    outcome
+}
 
 #[cfg(test)]
 mod tests {
@@ -1629,6 +1809,157 @@ mod tests {
         assert_ne!(r0, r1);
         assert_eq!(r0.exchange_segment_code, 0);
         assert_eq!(r1.exchange_segment_code, 1);
+    }
+    // ---- spill retention sweep (2026-08-19) -------------------------------
+
+    fn spill_tmp(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("tv-spill-prune-{name}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    fn write_aged(dir: &Path, name: &str, bytes: usize, age_secs: u64) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![0_u8; bytes]).expect("write");
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("reopen");
+        f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .expect("set mtime");
+        path
+    }
+
+    #[test]
+    fn spill_sweep_never_unlinks_the_live_writers_file() {
+        // THE CRITICAL ONE. The writer holds a long-lived append descriptor to
+        // TODAY's file. Unlinking it on POSIX keeps the inode alive, so the
+        // writer keeps appending to a file `read_all` can never see — seals
+        // reported durable, silently gone.
+        //
+        // Age is deliberately set to 0 and the file is aged far past it: even
+        // then, today's file must survive. If this ever fails, the sweep has
+        // gone back to relying on the accidental window-vs-process-lifetime
+        // ratio that made it safe by luck rather than by construction.
+        let dir = spill_tmp("live");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let live = ist_date_filename(now_secs);
+        let path = write_aged(&dir, &live, SEAL_SPILL_RECORD_SIZE * 4, 10_000_000);
+        let out = prune_spill_files_at(&dir, 0, std::time::SystemTime::now());
+        assert!(path.exists(), "today's file must NEVER be unlinked");
+        assert_eq!(out.deleted, 0);
+        assert_eq!(out.skipped_live, 1, "and it must be reported, not silent");
+        assert_eq!(out.records_lost, 0, "no loss may be claimed");
+    }
+
+    #[test]
+    fn spill_sweep_still_deletes_yesterdays_file() {
+        // The inverse: the live-writer guard must not accidentally spare
+        // EVERY file, which would silently restore the unbounded growth this
+        // sweep exists to stop.
+        let dir = spill_tmp("yesterday");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let older = ist_date_filename(now_secs - 3 * 86_400);
+        let path = write_aged(&dir, &older, 0, 10_000);
+        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        assert!(!path.exists(), "an old day's file is still eligible");
+        assert_eq!(out.deleted, 1);
+        assert_eq!(out.skipped_live, 0);
+    }
+
+    #[test]
+    fn spill_sweep_deletes_only_aged_files() {
+        let dir = spill_tmp("aged");
+        let old = write_aged(&dir, "seals-20260101.bin", 0, 10_000);
+        let fresh = write_aged(&dir, "seals-20260819.bin", 0, 10);
+        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        assert_eq!(out.deleted, 1);
+        assert!(!old.exists(), "aged file must go");
+        assert!(fresh.exists(), "fresh file must stay");
+    }
+
+    #[test]
+    fn spill_sweep_counts_unreplayed_records_it_destroys() {
+        // The property that matters most: deleting a NON-EMPTY spill file is
+        // data loss, and it must be counted and surfaced — never silent.
+        let dir = spill_tmp("nonempty");
+        write_aged(
+            &dir,
+            "seals-20260101.bin",
+            SEAL_SPILL_RECORD_SIZE * 7,
+            10_000,
+        );
+        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        assert_eq!(out.deleted, 1);
+        assert_eq!(out.deleted_non_empty, 1, "must flag it as non-empty");
+        assert_eq!(out.records_lost, 7, "must report the exact record count");
+    }
+
+    #[test]
+    fn spill_sweep_reports_zero_loss_for_aged_empty_files() {
+        // The inverse: an aged EMPTY file is routine cleanup and must NOT be
+        // reported as data loss, or the incident signal becomes noise.
+        let dir = spill_tmp("empty");
+        write_aged(&dir, "seals-20260101.bin", 0, 10_000);
+        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        assert_eq!(out.deleted, 1);
+        assert_eq!(out.deleted_non_empty, 0);
+        assert_eq!(out.records_lost, 0);
+    }
+
+    #[test]
+    fn spill_sweep_never_touches_foreign_files() {
+        let dir = spill_tmp("foreign");
+        let note = write_aged(&dir, "operator-notes.txt", 4096, 10_000);
+        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        assert_eq!(out.deleted, 0);
+        assert!(
+            note.exists(),
+            "a file we did not write is never ours to delete"
+        );
+    }
+
+    #[test]
+    fn spill_sweep_reports_remaining_bytes_and_handles_a_missing_dir() {
+        let dir = spill_tmp("bytes");
+        write_aged(&dir, "seals-20260819.bin", 512, 10);
+        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        assert_eq!(out.bytes_after, 512, "surviving bytes must be reported");
+        let missing = std::env::temp_dir().join("tv-spill-does-not-exist-xyz");
+        let out = prune_spill_files_at(&missing, 3_600, std::time::SystemTime::now());
+        assert_eq!(out, SpillPruneOutcome::default(), "missing dir is a no-op");
+    }
+
+    #[test]
+    fn spill_sweep_with_a_zero_window_still_spares_fresh_writes() {
+        // Extreme input. Even at max_age 0 the comparison is strictly
+        // greater-than, so a file written this instant is not eligible —
+        // deleting the file currently being appended would be catastrophic.
+        let dir = spill_tmp("zero");
+        let now = std::time::SystemTime::now();
+        let path = dir.join("seals-20260819.bin");
+        std::fs::write(&path, vec![0_u8; 128]).expect("write");
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        f.set_times(std::fs::FileTimes::new().set_modified(now))
+            .expect("mtime");
+        let out = prune_spill_files_at(&dir, 0, now);
+        assert_eq!(out.deleted, 0, "a file with zero age must survive");
+        assert!(path.exists());
     }
 }
 

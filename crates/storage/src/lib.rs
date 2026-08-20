@@ -146,6 +146,7 @@ pub mod ws_event_audit_persistence;
 // + depth_rebalance_audit modules DELETED. Audit tables stay on disk
 // per SEBI 5y retention.
 pub mod disk_health_watcher;
+pub mod disk_pressure;
 // BP-07 (2026-07-01): PROC-01 OOM-kill monitor — reads cgroup-v2
 // `memory.events` `oom_kill` vs boot baseline; mirrors disk_health_watcher.
 pub mod oom_monitor;
@@ -158,6 +159,7 @@ pub mod resource_monitor;
 // suspended table (post disk-full / apply error) silently stops applying
 // ILP-ACKed rows; this is the ONLY probe that sees it (boot probe +
 // questdb_health check reachability/connection, not per-table apply).
+pub mod wal_auto_resume;
 pub mod wal_suspension_watcher;
 // Sub-PR #10b-ε (2026-05-27): instrument_fetch_audit table contract —
 // schema constants + DEDUP key + FetchOutcome enum. Feature-gated under

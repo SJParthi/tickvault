@@ -81,7 +81,8 @@ use super::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, PoolBudget, PoolBudgetRefusal,
 };
 use super::reconnect_ladder::{
-    reconnect_delay_ms, reconnect_delay_with_jitter_ms, reconnect_jitter_ms,
+    FLAP_DAMPED_METRIC, FLAP_WINDOW_MS, FlapVerdict, ReconnectDecision, damped_reconnect_delay,
+    damped_reconnect_delay_with_jitter, reconnect_jitter_ms,
 };
 use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 
@@ -108,6 +109,16 @@ pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Counter: connection dropped and is being re-dialed. Labels: `endpoint`, `reason`.
 pub const RECONNECT_METRIC: &str = "tv_dhan_ws_reconnect_total";
+
+/// Ring capacity for the per-socket re-dial timestamps the flap damper counts.
+///
+/// Fixed-size and inline: the damper runs on the disconnect path of a socket
+/// that may be flapping thousands of times an hour, so it must not allocate.
+/// Eight is comfortably above `FLAP_REDIAL_CEILING` (3) — the count only ever
+/// needs to distinguish "below the ceiling" from "at or above it", so the ring
+/// saturating at eight loses nothing, while the extra headroom keeps the count
+/// honest if the ceiling is ever raised.
+pub const FLAP_HISTORY_SLOTS: usize = 8;
 
 /// Counter: connection parked permanently. Labels: `endpoint`, `reason`.
 pub const PARK_METRIC: &str = "tv_dhan_ws_park_total";
@@ -262,6 +273,10 @@ pub enum ConnEvent {
     SubscribeFailed,
     /// One frame arrived.
     FrameReceived,
+    /// A control frame arrived proving the peer is alive, carrying no data
+    /// (a Ping/Pong). Resets the idle watchdog and NOTHING else — see
+    /// [`SocketEvent::KeepAlive`] for why the distinction is load-bearing.
+    KeepAliveReceived,
     /// The socket closed, optionally carrying a Dhan disconnect code.
     Disconnected { code: Option<DisconnectCode> },
     /// The watchdog fired: no traffic for the idle threshold.
@@ -370,6 +385,23 @@ pub struct ConnectionSupervisor {
     /// anything is not healthy — resetting on dial would let such a socket
     /// re-dial instantly forever.
     proven_healthy: bool,
+    /// When the CURRENT socket delivered its FIRST frame. `None` until it does,
+    /// and cleared on every dial.
+    ///
+    /// This is the flap damper's health clock. `proven_healthy` above answers
+    /// "did a frame ever arrive on this socket", which a connection that dies
+    /// one millisecond after its prev-close packet satisfies — and that
+    /// connection then re-dialled instantly, forever. `healthy_since` answers
+    /// the question that actually matters: *for how long* did it carry frames.
+    healthy_since: Option<Instant>,
+    /// Monotonic timestamps of recent re-dials, newest overwriting oldest.
+    ///
+    /// A fixed inline array, never a `Vec`: this is written on the disconnect
+    /// path of a socket that may be flapping, and an allocation there is
+    /// exactly what THE ONE RULE forbids.
+    redial_history: [Option<Instant>; FLAP_HISTORY_SLOTS],
+    /// Next write position in [`Self::redial_history`].
+    redial_cursor: usize,
     frames: u64,
     reconnects: u64,
     /// Set exactly once, when the supervisor parks. Retained so the shell can
@@ -388,6 +420,9 @@ impl ConnectionSupervisor {
             attempt: 0,
             watchdog: IdleWatchdog::new(now),
             proven_healthy: false,
+            healthy_since: None,
+            redial_history: [None; FLAP_HISTORY_SLOTS],
+            redial_cursor: 0,
             frames: 0,
             reconnects: 0,
             park_reason: None,
@@ -456,6 +491,7 @@ impl ConnectionSupervisor {
             ConnEvent::BeginDial => {
                 self.phase = ConnPhase::Dialing;
                 self.proven_healthy = false;
+                self.healthy_since = None;
                 // Reset here, not on dial completion: the watchdog must also
                 // cover a dial that hangs forever without ever completing.
                 self.watchdog.record_activity(now);
@@ -495,6 +531,13 @@ impl ConnectionSupervisor {
                 if !self.proven_healthy {
                     self.proven_healthy = true;
                     self.attempt = 0;
+                    // Start the health clock at the FIRST frame. The attempt
+                    // reset above is retained for compatibility with the
+                    // ladder's own semantics, but it no longer implies an
+                    // instant re-dial on its own: the damper reads this
+                    // timestamp and withholds rung 0 until the socket has
+                    // actually carried frames for MIN_HEALTHY_SESSION_MS.
+                    self.healthy_since = Some(now);
                 }
                 // A frame can legitimately arrive before our own subscribe ack
                 // (the prev-close packet is pushed on subscribe). Treat it as
@@ -502,6 +545,21 @@ impl ConnectionSupervisor {
                 if self.phase == ConnPhase::Subscribing {
                     self.phase = ConnPhase::Live;
                 }
+                SupervisorAction::Continue
+            }
+
+            // A ping proves the TRANSPORT is alive. It must reset the idle
+            // watchdog — and must do nothing else.
+            //
+            // It deliberately does NOT bump `frames` and does NOT set
+            // `proven_healthy`: those mean "this connection delivered market
+            // data", and a socket that only pings has delivered none. Letting
+            // a keep-alive claim health would hide a silently-failed subscribe
+            // behind a heartbeat. That condition has its own detector — the
+            // 30s silence scan (RISK-GAP-03), which is market-hours gated so
+            // the legitimately silent pre-open never pages.
+            ConnEvent::KeepAliveReceived => {
+                self.watchdog.record_activity(now);
                 SupervisorAction::Continue
             }
 
@@ -553,15 +611,26 @@ impl ConnectionSupervisor {
                         //
                         // Flooring the base first keeps the "wait at least
                         // 5 s" intent and restores the fan-out on top of it.
-                        let base = self.next_ladder_delay_ms().max(TOKEN_STALE_REDIAL_FLOOR_MS);
+                        //
+                        // 2026-08-19: the base is now the DAMPED ladder value
+                        // rather than the raw rung, so a socket flapping on a
+                        // token that keeps going stale is slowed by the same
+                        // ceiling as any other flapper. The floor-then-jitter
+                        // ordering is unchanged.
+                        let damped = self.damped_decision_without_jitter(now);
+                        let base = damped.delay_ms.max(TOKEN_STALE_REDIAL_FLOOR_MS);
                         let delay = base.saturating_add(self.jitter_ms());
-                        self.enter_backoff(ReconnectReason::TokenStale);
+                        self.enter_backoff(ReconnectReason::TokenStale, damped.verdict, now);
                         SupervisorAction::RefreshTokenThenDial { delay_ms: delay }
                     }
                     DisconnectClass::Transient => {
-                        let delay = self.next_delay_ms();
-                        self.enter_backoff(ReconnectReason::Disconnected);
-                        SupervisorAction::SleepThenDial { delay_ms: delay }
+                        // THE CASCADE ARM. `connection.rs` reports a bare TCP
+                        // reset as `Closed { code: None }`, which classifies
+                        // here — so this is the arm an 805-delivered-as-RST
+                        // lands in, and before the damper it re-dialled on
+                        // ladder rung 0 (`0ms`), evicting a healthy sibling
+                        // per Dhan's oldest-socket-dies semantics.
+                        self.schedule_redial(ReconnectReason::Disconnected, now)
                     }
                 }
             }
@@ -580,9 +649,7 @@ impl ConnectionSupervisor {
                     "socket silent past the idle threshold — reconnecting on our terms before \
                      Dhan closes it at 40s"
                 );
-                let delay = self.next_delay_ms();
-                self.enter_backoff(ReconnectReason::IdleSilence);
-                SupervisorAction::SleepThenDial { delay_ms: delay }
+                self.schedule_redial(ReconnectReason::IdleSilence, now)
             }
         }
     }
@@ -597,19 +664,71 @@ impl ConnectionSupervisor {
         self.on_event(ConnEvent::IdleElapsed, now)
     }
 
-    /// Ladder delay for the next attempt, including this connection's fixed
-    /// per-slot stagger. Does NOT mutate.
-    fn next_delay_ms(&self) -> u64 {
-        reconnect_delay_with_jitter_ms(self.attempt, self.slot.global_index)
+    /// How long the CURRENT socket has been delivering frames, in
+    /// milliseconds. Zero if it has delivered none.
+    ///
+    /// Saturating: a non-monotonic `now` (impossible with `Instant`, but the
+    /// function stays total anyway) yields 0, which is the fail-safe direction
+    /// — it makes the socket look UNhealthy and earns backoff rather than an
+    /// instant re-dial.
+    fn healthy_duration_ms(&self, now: Instant) -> u64 {
+        match self.healthy_since {
+            Some(since) => {
+                u64::try_from(now.saturating_duration_since(since).as_millis()).unwrap_or(u64::MAX)
+            }
+            None => 0,
+        }
     }
 
-    /// The ladder delay for this attempt WITHOUT this socket's stagger.
+    /// Re-dials by THIS socket inside [`FLAP_WINDOW_MS`], counting only
+    /// re-dials that already happened — the one being decided right now is
+    /// recorded afterwards, so it never counts itself.
+    ///
+    /// O([`FLAP_HISTORY_SLOTS`]) = O(1) with a fixed bound of eight, zero
+    /// allocation, monotonic clock only.
+    fn recent_redial_count(&self, now: Instant) -> u32 {
+        let window = Duration::from_millis(FLAP_WINDOW_MS);
+        let mut count: u32 = 0;
+        for stamp in &self.redial_history {
+            if let Some(at) = stamp
+                && now.saturating_duration_since(*at) <= window
+            {
+                count = count.saturating_add(1);
+            }
+        }
+        count
+    }
+
+    /// Records that a re-dial happened at `now`, oldest entry overwritten.
+    fn record_redial(&mut self, now: Instant) {
+        if let Some(slot) = self.redial_history.get_mut(self.redial_cursor) {
+            *slot = Some(now);
+        }
+        self.redial_cursor = (self.redial_cursor + 1) % FLAP_HISTORY_SLOTS;
+    }
+
+    /// The flap-damped delay for the next attempt, including this connection's
+    /// fixed per-slot stagger. Does NOT mutate.
+    fn damped_decision(&self, now: Instant) -> ReconnectDecision {
+        damped_reconnect_delay_with_jitter(
+            self.attempt,
+            self.healthy_duration_ms(now),
+            self.recent_redial_count(now),
+            self.slot.global_index,
+        )
+    }
+
+    /// The same decision WITHOUT this socket's stagger.
     ///
     /// Split out so a caller that needs to raise the floor can floor the
-    /// ladder and then add the stagger, rather than flooring the sum and
-    /// throwing the stagger away — see the `TokenStale` arm.
-    fn next_ladder_delay_ms(&self) -> u64 {
-        reconnect_delay_ms(self.attempt)
+    /// damped ladder and then add the stagger, rather than flooring the sum
+    /// and throwing the stagger away — see the `TokenStale` arm.
+    fn damped_decision_without_jitter(&self, now: Instant) -> ReconnectDecision {
+        damped_reconnect_delay(
+            self.attempt,
+            self.healthy_duration_ms(now),
+            self.recent_redial_count(now),
+        )
     }
 
     /// This socket's fixed fan-out offset. Index 0 always gets zero, so one
@@ -620,22 +739,38 @@ impl ConnectionSupervisor {
 
     /// Common tail for every retryable failure: compute the delay, count it,
     /// advance the ladder, drop into backoff.
-    fn schedule_redial(&mut self, reason: ReconnectReason, _now: Instant) -> SupervisorAction {
-        let delay = self.next_delay_ms();
-        self.enter_backoff(reason);
-        SupervisorAction::SleepThenDial { delay_ms: delay }
+    fn schedule_redial(&mut self, reason: ReconnectReason, now: Instant) -> SupervisorAction {
+        let decision = self.damped_decision(now);
+        self.enter_backoff(reason, decision.verdict, now);
+        SupervisorAction::SleepThenDial {
+            delay_ms: decision.delay_ms,
+        }
     }
 
-    fn enter_backoff(&mut self, reason: ReconnectReason) {
+    fn enter_backoff(&mut self, reason: ReconnectReason, verdict: FlapVerdict, now: Instant) {
         self.attempt = self.attempt.saturating_add(1);
         self.phase = ConnPhase::Backoff;
         self.proven_healthy = false;
+        self.healthy_since = None;
+        self.record_redial(now);
         metrics::counter!(
             RECONNECT_METRIC,
             "endpoint" => self.slot.endpoint.as_str(),
             "reason" => reason.as_str(),
         )
         .increment(1);
+        // The damper must never act in silence. A socket held at 30s while the
+        // operator believes the ladder is running is the false-OK class the
+        // house rules forbid, so every re-dial the damper actually slowed down
+        // is counted under the reason that provoked it.
+        if verdict.is_damped() {
+            metrics::counter!(
+                FLAP_DAMPED_METRIC,
+                "endpoint" => self.slot.endpoint.as_str(),
+                "verdict" => verdict.as_str(),
+            )
+            .increment(1);
+        }
     }
 
     fn park(&mut self, reason: ParkReason) -> SupervisorAction {
@@ -883,6 +1018,72 @@ pub enum FrameSinkOutcome {
 pub trait FrameSink: Send + Sync + 'static {
     /// Accepts one raw frame. MUST NOT block, allocate, or await.
     fn accept(&self, frame: Bytes) -> FrameSinkOutcome;
+
+    /// Reports a socket LIFECYCLE transition — connected, lost, parked.
+    ///
+    /// Default is a no-op, so every existing implementation and every call
+    /// site is unchanged by construction.
+    ///
+    /// # Why this hangs off the sink rather than a new parameter
+    ///
+    /// `run_connection` is generic over four type parameters and is called
+    /// from tests, benches and the live stack. Threading an audit channel
+    /// through it would touch every one of those for a concern none of them
+    /// has. The sink is ALREADY the one app-owned object the supervisor
+    /// holds, and it already knows which socket it serves — so it is the
+    /// natural place to hang a per-socket side-channel.
+    ///
+    /// # Why this may allocate when `accept` may not
+    ///
+    /// `accept` runs per FRAME, thousands per second, between two `recv()`
+    /// calls — the window in which the automatic pong is not being emitted.
+    /// This runs per socket LIFECYCLE EVENT: a handful of times a day, and
+    /// never while a frame is waiting. It is the same cold-path budget the
+    /// order-update socket's audit emit has had since 2026-07-05.
+    ///
+    /// Implementations must still not block or await. The house pattern is a
+    /// `try_send` onto a bounded channel: a full channel costs a forensic
+    /// row, never a stalled socket.
+    fn on_lifecycle(
+        &self,
+        _kind: tickvault_common::ws_event_types::WsEventKind,
+        _reason: &'static str,
+    ) {
+    }
+}
+
+/// One socket lifecycle transition, WITHOUT a timestamp.
+///
+/// # Why there is no timestamp on this
+///
+/// `test_pool_supervisor_source_never_reads_the_wall_clock` bans every
+/// wall-clock call in this file, because the supervisor's ladder, its token
+/// expiry and its backoff are all monotonic — an NTP step must be unable to
+/// expire all sixteen sockets at once. That ban is a blanket one on purpose,
+/// so nobody has to re-litigate it per call site, and an audit row's
+/// timestamp is not special enough to earn a carve-out.
+///
+/// So the socket reports WHAT happened and the app crate — which already
+/// reads the wall clock for exactly this, and already owns the IST offset
+/// convention — stamps WHEN. Every field here is `Copy`, so building one
+/// allocates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WsLifecycleEvent {
+    /// Which endpoint's pool the socket belongs to. The row's `ws_type` is
+    /// derived from THIS, never from the sink's `ws_type` field — that one is
+    /// the WAL record discriminant and reads `LiveFeed` for all fifteen
+    /// market-data sockets, so a row built from it would file a depth-200
+    /// park under the main feed.
+    pub endpoint: DhanEndpointType,
+    /// The socket's own index, so one sick connection is not averaged away
+    /// by its siblings.
+    pub connection_index: u8,
+    /// Connected / Disconnected.
+    pub kind: tickvault_common::ws_event_types::WsEventKind,
+    /// A fixed machine cause slug. `&'static str` deliberately: it keeps this
+    /// type `Copy`, and it means no caller can put unbounded vendor text into
+    /// a forensic row.
+    pub reason: &'static str,
 }
 
 /// One captured frame and the sequence it was stamped with at the read
@@ -918,6 +1119,31 @@ pub struct CapturedFrame {
     /// A `u8` alongside the existing enum adds no allocation: `Bytes` remains
     /// the only heap member of this struct.
     pub connection_index: u8,
+    /// The monotonic instant this frame came off the socket.
+    ///
+    /// Stamped in the READ TASK, and monotonic on purpose — both halves
+    /// matter.
+    ///
+    /// **Why stamped here:** until 2026-08-18 the drain called the clock
+    /// itself and used that as the receive time, which measured
+    /// `Dhan's delivery + OUR time queued in the ring`. Those are different
+    /// quantities with different owners. Under a fold stall the ring backs up
+    /// and the drain falls behind, so every lag sample inflated precisely when
+    /// the cause was LOCAL — the lag alarm would fire hardest at our own
+    /// backlog while naming the vendor for it.
+    ///
+    /// **Why `Instant` and not a wall-clock stamp:** this module is forbidden
+    /// from reading the wall clock at all, and that ban is load-bearing rather
+    /// than stylistic — an NTP step must be unable to expire all sixteen
+    /// sockets at once (`test_pool_supervisor_source_never_reads_the_wall_clock`).
+    /// A monotonic stamp respects it, and is strictly better anyway: the
+    /// consumer derives the wall-clock receipt instant by subtracting
+    /// `elapsed()` from its own clock read, so a clock step landing between
+    /// receipt and fold cannot corrupt the measured lag.
+    ///
+    /// Costs one vDSO read per frame on a task that already performs one for
+    /// the watchdog. No allocation: `Bytes` remains the only heap member.
+    pub received_at: std::time::Instant,
     /// The frame exactly as it arrived. Never parsed on the read task.
     pub bytes: Bytes,
 }
@@ -1045,6 +1271,12 @@ pub struct WalRingSink {
     wal_dropped: metrics::Counter,
     ring_full: metrics::Counter,
     ring_bytes_full: metrics::Counter,
+    /// Optional forensic side-channel for socket lifecycle events.
+    ///
+    /// `None` by default and set only by [`WalRingSink::with_audit`], so a
+    /// sink built the old way behaves exactly as before — no channel, no
+    /// rows, no cost.
+    audit_tx: Option<tokio::sync::mpsc::Sender<WsLifecycleEvent>>,
 }
 
 impl WalRingSink {
@@ -1086,9 +1318,21 @@ impl WalRingSink {
             wal_dropped: metrics::counter!(WAL_DROP_METRIC, "endpoint" => endpoint_label),
             ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
             ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
+            audit_tx: None,
         };
         sink.pre_register();
         sink
+    }
+
+    /// Attaches the `ws_event_audit` side-channel to this socket.
+    ///
+    /// A builder rather than a `new` parameter so every existing construction
+    /// — tests, benches, the DHAT gates — is untouched, and opting in is one
+    /// visible line at the boot site.
+    #[must_use]
+    pub fn with_audit(mut self, tx: tokio::sync::mpsc::Sender<WsLifecycleEvent>) -> Self {
+        self.audit_tx = Some(tx);
+        self
     }
 
     /// Publishes a zero on every loss series this sink owns.
@@ -1113,7 +1357,38 @@ impl WalRingSink {
 }
 
 impl FrameSink for WalRingSink {
+    fn on_lifecycle(
+        &self,
+        kind: tickvault_common::ws_event_types::WsEventKind,
+        reason: &'static str,
+    ) {
+        let Some(tx) = self.audit_tx.as_ref() else {
+            return;
+        };
+        // No allocation and no clock read: every field is `Copy`. The app
+        // crate stamps the time and widens this into the audit row.
+        let event = WsLifecycleEvent {
+            endpoint: self.endpoint,
+            connection_index: self.connection_index,
+            kind,
+            reason,
+        };
+        // `try_send`, never `send`: a slow consumer may cost a forensic row,
+        // and must never stall a socket. The drop is COUNTED rather than
+        // swallowed — a silently lost audit row is the same false-OK the
+        // whole table exists to prevent.
+        if tx.try_send(event).is_err() {
+            metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => "live_feed_lifecycle")
+                .increment(1);
+        }
+    }
+
     fn accept(&self, frame: Bytes) -> FrameSinkOutcome {
+        // Stamped FIRST, before the WAL append and before the budget check.
+        // This is the frame's arrival instant; every microsecond of our own
+        // work after this line must NOT be charged to the vendor.
+        // Monotonic, never wall-clock — see `CapturedFrame::received_at`.
+        let received_at = Instant::now();
         // Minted ONCE, here, at the read instant — see `CapturedFrame`.
         let seq = next_frame_seq();
         // Step 1 — durability. `Bytes` into the WAL is an Arc refcount bump.
@@ -1144,6 +1419,7 @@ impl FrameSink for WalRingSink {
                 seq,
                 endpoint: self.endpoint,
                 connection_index: self.connection_index,
+                received_at,
                 bytes: frame,
             })
             .is_err()
@@ -1213,6 +1489,20 @@ impl PoolSupervisor {
                     "reason" => reason.as_str(),
                 )
                 .increment(0);
+            }
+            // Same baseline discipline for the flap damper. Only the verdicts
+            // that are actually EMITTED are registered — pre-registering
+            // `ladder` would publish a series that can never move, which is a
+            // different flavour of the same lie.
+            for verdict in FlapVerdict::ALL {
+                if verdict.is_damped() {
+                    metrics::counter!(
+                        FLAP_DAMPED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "verdict" => verdict.as_str(),
+                    )
+                    .increment(0);
+                }
             }
         }
         Self {
@@ -1328,6 +1618,28 @@ impl Default for PoolSupervisor {
 pub enum SocketEvent {
     /// One raw frame, exactly as it arrived. Never parsed here.
     Frame(Bytes),
+    /// A control frame proving the PEER IS ALIVE, carrying no market data —
+    /// a WebSocket Ping or Pong (and any text/raw control frame Dhan sends).
+    ///
+    /// This exists because omitting it cost ~300 self-inflicted reconnects
+    /// every trading morning (measured on prod, 2026-08-19: 8–25 per minute
+    /// from 08:31 to 08:59 IST, then ZERO once real ticks began at 09:15).
+    /// The pre-2026-08-19 read loop counted a Ping into a metric and then
+    /// LOOPED without returning anything, so the supervisor never learned the
+    /// socket was alive, the idle watchdog was never reset, and at
+    /// `IDLE_RECONNECT_TIMEOUT_SECS` we tore down a perfectly healthy
+    /// connection — re-authenticating and re-subscribing the whole universe
+    /// against a broker whose own docs warn that too many requests "may
+    /// result in user being blocked".
+    ///
+    /// Deliberately DISTINCT from [`SocketEvent::Frame`]: a ping proves
+    /// TRANSPORT liveness, never DATA liveness. It must reset the watchdog
+    /// and must NOT count as a data frame or mark the connection
+    /// proven-healthy — a socket that only ever pings has delivered nothing,
+    /// and that condition belongs to the silence scan (RISK-GAP-03), which
+    /// measures exactly it and is market-hours gated so the legitimately
+    /// silent pre-open never pages.
+    KeepAlive,
     /// The socket closed, optionally with a Dhan disconnect code.
     Closed { code: Option<DisconnectCode> },
 }
@@ -1408,6 +1720,18 @@ where
         match action {
             SupervisorAction::Park { reason } => {
                 socket.close().await;
+                // A park is PERMANENT — nothing re-dials this socket, and its
+                // shard of the universe stops delivering for the rest of the
+                // session. Until 2026-08-20 that fact reached a log line and a
+                // counter and nothing queryable: `ws_event_audit` had exactly
+                // one production producer (the order-update socket), so an
+                // operator asking "did any feed socket drop today?" got rows
+                // back, saw no live-feed rows, and read that as no drops
+                // rather than as not recorded.
+                sink.on_lifecycle(
+                    tickvault_common::ws_event_types::WsEventKind::Disconnected,
+                    reason.as_str(),
+                );
                 info!(
                     endpoint,
                     pool_index,
@@ -1434,6 +1758,14 @@ where
             SupervisorAction::SleepThenDial { delay_ms } => {
                 socket.close().await;
                 guard.mark_lost();
+                // `mark_lost` is the honest edge: the subscription is gone and
+                // will have to be re-sent. Recorded BEFORE the sleep so the
+                // row's timestamp is the moment we lost the socket, not the
+                // moment we got around to re-dialing.
+                sink.on_lifecycle(
+                    tickvault_common::ws_event_types::WsEventKind::Disconnected,
+                    "backoff_redial",
+                );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
             }
@@ -1441,6 +1773,10 @@ where
             SupervisorAction::RefreshTokenThenDial { delay_ms } => {
                 socket.close().await;
                 guard.mark_lost();
+                sink.on_lifecycle(
+                    tickvault_common::ws_event_types::WsEventKind::Disconnected,
+                    "token_refresh_redial",
+                );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 refresh_token().await;
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
@@ -1467,6 +1803,16 @@ where
                     continue;
                 }
                 guard.mark_confirmed();
+                // CONNECTED means subscribed-and-acked, not merely dialed.
+                // The 2026-08-12 blackout is why: twelve sockets dialed and
+                // every one died on the handshake, so a row written at dial
+                // time would have recorded twelve connections that never
+                // carried a byte. This edge is the first moment the socket can
+                // actually deliver.
+                sink.on_lifecycle(
+                    tickvault_common::ws_event_types::WsEventKind::Connected,
+                    "subscribe_acked",
+                );
                 action = supervisor.on_event(ConnEvent::SubscribeAcked, Instant::now());
                 // Drain until something changes.
                 action = drain(&mut socket, &mut supervisor, sink.as_ref(), action).await;
@@ -1508,6 +1854,12 @@ where
             biased;
             event = socket.recv() => {
                 match event {
+                    // A Ping/Pong: proof the peer is alive, carrying no data.
+                    // One watchdog reset, no sink write, no frame count.
+                    SocketEvent::KeepAlive => {
+                        action = supervisor
+                            .on_event(ConnEvent::KeepAliveReceived, Instant::now());
+                    }
                     SocketEvent::Frame(frame) => {
                         // Two operations. That is the whole loop body.
                         let outcome = sink.accept(frame);
@@ -1583,7 +1935,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::super::reconnect_ladder::{
-        RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS, reconnect_delay_ms,
+        FLAP_CEILING_REDIAL_FLOOR_MS, FLAP_REDIAL_CEILING, MIN_HEALTHY_SESSION_MS,
+        RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS,
+        SHORT_SESSION_REDIAL_FLOOR_MS, reconnect_delay_ms,
     };
 
     #[test]
@@ -1803,12 +2157,20 @@ mod tests {
         );
         assert_eq!(s.phase(), ConnPhase::Dialing);
 
-        // First failure re-dials at the ladder's instant rung. global_index 0
-        // takes zero stagger, so at least one connection keeps the exact
-        // historical "instant first attempt" behaviour.
+        // A socket that has NEVER delivered a frame does NOT get the instant
+        // rung — the flap damper withholds it and applies
+        // SHORT_SESSION_REDIAL_FLOOR_MS instead. Before 2026-08-19 this
+        // asserted 0ms, and that 0ms is the cascade: a bare TCP reset arrives
+        // as `Closed { code: None }`, classifies Transient, and re-dialled
+        // instantly — evicting a healthy sibling under Dhan's 805
+        // oldest-socket-dies semantics. The instant rung is not gone; it is
+        // earned, and `..._instant_retry_survives_a_genuinely_healthy_session`
+        // below proves it still happens for the case it exists for.
         assert_eq!(
             s.on_event(ConnEvent::DialFailed, now),
-            SupervisorAction::SleepThenDial { delay_ms: 0 }
+            SupervisorAction::SleepThenDial {
+                delay_ms: SHORT_SESSION_REDIAL_FLOOR_MS
+            }
         );
         assert_eq!(s.phase(), ConnPhase::Backoff);
         assert_eq!(s.attempt(), 1);
@@ -1826,8 +2188,275 @@ mod tests {
                 other => panic!("expected SleepThenDial, got {other:?}"),
             }
         }
-        // Slot 0 has zero jitter, so these are the bare ladder rungs.
-        assert_eq!(seen, vec![0, 1_000, 2_000, 5_000, 15_000, 30_000, 30_000]);
+        // Slot 0 has zero jitter, so these are the bare ladder rungs — EXCEPT
+        // rung 0, which the flap damper floors because this socket has never
+        // delivered a frame (see the test above). Every later rung is the raw
+        // ladder, unchanged.
+        //
+        // That the ladder survives intact here is the whole reason
+        // FLAP_REDIAL_CEILING is 6 rather than 3: a ceiling of 3 would have
+        // clamped attempts 3+ to the 30s cap, swallowing the 5s and 15s rungs
+        // and turning a ten-second Dhan blip into a ~30s blind window on a
+        // feed with no snapshot-on-subscribe. The damper must not make the
+        // most common failure worse.
+        assert_eq!(
+            seen,
+            vec![
+                SHORT_SESSION_REDIAL_FLOOR_MS,
+                1_000,
+                2_000,
+                5_000,
+                15_000,
+                30_000,
+                30_000
+            ]
+        );
+    }
+
+    // -- flap damper (the RST-cascade fix, 2026-08-19) ----------------------
+
+    /// Drives one full connect -> frame -> disconnect cycle and returns the
+    /// re-dial delay the supervisor chose.
+    ///
+    /// `live_for` is how long the socket carries frames before it drops, which
+    /// is the input the damper actually judges. Returns `(delay_ms, now)` so
+    /// the caller can chain cycles on a single advancing clock.
+    fn one_session(
+        s: &mut ConnectionSupervisor,
+        now: Instant,
+        live_for: Duration,
+    ) -> (u64, Instant) {
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+        let dropped_at = now + live_for;
+        match s.on_event(ConnEvent::Disconnected { code: None }, dropped_at) {
+            SupervisorAction::SleepThenDial { delay_ms } => (delay_ms, dropped_at),
+            other => panic!("expected SleepThenDial, got {other:?}"),
+        }
+    }
+
+    /// The instant rung must SURVIVE for the case it exists for: a clean,
+    /// isolated drop after a genuinely healthy session. This is the latency
+    /// win the damper is not allowed to cost us.
+    #[test]
+    fn test_supervisor_instant_retry_survives_a_genuinely_healthy_session() {
+        let now = t0();
+        // Slot 0 of the main feed carries zero stagger, so any non-zero result
+        // here is the damper and nothing else.
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+
+        let live_for = Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1_000);
+        let (delay, _) = one_session(&mut s, now, live_for);
+
+        assert_eq!(
+            delay,
+            0,
+            "a socket that carried frames for {}ms then took ONE isolated drop must keep the \
+             instant first retry — the damper exists to withhold it from sockets that never \
+             earned it, not to remove it",
+            MIN_HEALTHY_SESSION_MS + 1_000
+        );
+    }
+
+    /// THE SECOND DEFECT (HIGH). The first `FrameReceived` sets
+    /// `proven_healthy` and resets `attempt` to 0, and the `Disconnected` arm
+    /// reads the CURRENT attempt before `enter_backoff` increments it — so a
+    /// socket that yields exactly one frame then drops re-dialled at 0ms,
+    /// forever, with no flap-rate ceiling at all.
+    #[test]
+    fn test_supervisor_one_frame_connection_never_re_dials_instantly() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+
+        // One frame, then gone 40ms later. Ten cycles in a row.
+        let mut clock = now;
+        for cycle in 0..10 {
+            let (delay, after) = one_session(&mut s, clock, Duration::from_millis(40));
+            assert!(
+                delay > 0,
+                "cycle {cycle}: a one-frame socket re-dialled instantly ({delay}ms) — this is \
+                 the unbounded flap the damper exists to stop"
+            );
+            assert!(
+                delay >= SHORT_SESSION_REDIAL_FLOOR_MS,
+                "cycle {cycle}: delay {delay}ms is below the short-session floor"
+            );
+            clock = after + Duration::from_millis(delay);
+        }
+    }
+
+    /// THE FIRST DEFECT (CRITICAL). A bare TCP reset arrives as
+    /// `Closed { code: None }` and classifies `Transient`. On a socket that
+    /// never delivered a frame that used to be an instant re-dial — which,
+    /// under Dhan's 805 oldest-socket-dies semantics, evicts a healthy sibling
+    /// and starts a self-sustaining cascade across the sixteen sockets.
+    #[test]
+    fn test_supervisor_bare_reset_on_an_unproven_socket_does_not_re_dial_instantly() {
+        let now = t0();
+        for pool_index in 0..5_u8 {
+            let mut s = sup(DhanEndpointType::MainFeed, pool_index, now);
+            let _ = s.on_event(ConnEvent::BeginDial, now);
+            let _ = s.on_event(ConnEvent::DialSucceeded, now);
+            // No frame ever arrives — the socket is RST'd during subscribe.
+            match s.on_event(ConnEvent::Disconnected { code: None }, now) {
+                SupervisorAction::SleepThenDial { delay_ms } => assert!(
+                    delay_ms >= SHORT_SESSION_REDIAL_FLOOR_MS,
+                    "pool_index {pool_index}: bare RST re-dialled in {delay_ms}ms"
+                ),
+                other => panic!("expected SleepThenDial, got {other:?}"),
+            }
+        }
+    }
+
+    /// The flap CEILING: a socket can look healthy on every single session and
+    /// still be flapping. Health alone cannot see that; the rate ceiling can.
+    #[test]
+    fn test_supervisor_flap_ceiling_forces_backoff_on_a_socket_that_looks_healthy() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+
+        // Each session is comfortably "healthy" by the duration test, and the
+        // whole run stays inside one flap window.
+        let live_for = Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1_000);
+        let mut clock = now;
+        let mut delays = Vec::new();
+        for _ in 0..=FLAP_REDIAL_CEILING {
+            let (delay, after) = one_session(&mut s, clock, live_for);
+            delays.push(delay);
+            clock = after;
+        }
+
+        let ceiling = usize::try_from(FLAP_REDIAL_CEILING).unwrap_or(usize::MAX);
+        for (i, delay) in delays.iter().take(ceiling).enumerate() {
+            assert_eq!(
+                *delay, 0,
+                "re-dial {i} is below the ceiling and each session looked healthy, so the \
+                 instant rung is still correct"
+            );
+        }
+        assert_eq!(
+            delays.get(ceiling).copied(),
+            Some(FLAP_CEILING_REDIAL_FLOOR_MS),
+            "re-dial {ceiling} crossed FLAP_REDIAL_CEILING inside FLAP_WINDOW_MS and MUST be \
+             forced onto backoff regardless of how healthy each session looked"
+        );
+        // And the clamp is sticky while the window still holds the history.
+        let (next, _) = one_session(&mut s, clock, live_for);
+        assert_eq!(next, FLAP_CEILING_REDIAL_FLOOR_MS);
+    }
+
+    /// The ceiling must RELEASE. A socket that recovers should not be punished
+    /// for the rest of the trading day — that is why the window is rolling.
+    #[test]
+    fn test_supervisor_flap_ceiling_releases_once_the_window_has_passed() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let live_for = Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1_000);
+
+        let mut clock = now;
+        for _ in 0..=FLAP_REDIAL_CEILING {
+            let (_, after) = one_session(&mut s, clock, live_for);
+            clock = after;
+        }
+        // Confirm we really are clamped before testing the release.
+        assert_eq!(s.recent_redial_count(clock), FLAP_REDIAL_CEILING + 1);
+
+        // Walk the clock past the whole window with no further re-dials.
+        let released = clock + Duration::from_millis(FLAP_WINDOW_MS + 1_000);
+        assert_eq!(
+            s.recent_redial_count(released),
+            0,
+            "every recorded re-dial has aged out of the rolling window"
+        );
+        let (delay, _) = one_session(&mut s, released, live_for);
+        assert_eq!(
+            delay, 0,
+            "a recovered socket gets its instant retry back once the window has passed"
+        );
+    }
+
+    /// The damper must never act in silence. `enter_backoff` counts exactly
+    /// the verdicts that `is_damped()` reports, so this pins the value that
+    /// drives `FLAP_DAMPED_METRIC` against the delay actually chosen — a
+    /// damped delay with an undamped verdict would be an uncounted action.
+    #[test]
+    fn test_supervisor_damped_redials_are_the_ones_reported_as_damped() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        // Slot 0 has zero stagger, so raw == damped whenever the verdict is
+        // Ladder and raw < damped exactly when it is not.
+        let raw = reconnect_delay_ms(s.attempt());
+
+        // Unproven socket -> damped, and the delay really did move.
+        let decision = s.damped_decision(now);
+        assert!(
+            decision.verdict.is_damped(),
+            "an unproven socket must be reported as damped"
+        );
+        assert!(
+            decision.delay_ms > raw,
+            "reported damped but the delay did not change"
+        );
+        assert_eq!(decision.verdict.as_str(), "short_session");
+
+        // Healthy socket -> undamped, and the delay is untouched.
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+        let healthy_at = now + Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1);
+        let decision = s.damped_decision(healthy_at);
+        assert!(!decision.verdict.is_damped());
+        assert_eq!(decision.delay_ms, reconnect_delay_ms(s.attempt()));
+    }
+
+    /// The health clock is per-SOCKET, not per-process: a dial wipes it, so a
+    /// previous session's health can never vouch for the next connection.
+    #[test]
+    fn test_supervisor_health_clock_resets_on_every_dial() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+
+        let much_later = now + Duration::from_millis(MIN_HEALTHY_SESSION_MS * 10);
+        assert!(s.healthy_duration_ms(much_later) >= MIN_HEALTHY_SESSION_MS);
+
+        // A fresh dial starts a NEW socket, which has proved nothing yet.
+        let _ = s.on_event(ConnEvent::BeginDial, much_later);
+        assert_eq!(
+            s.healthy_duration_ms(much_later + Duration::from_secs(1)),
+            0,
+            "the new socket must not inherit the old socket's health"
+        );
+    }
+
+    /// The re-dial history is a fixed inline ring — it must never allocate and
+    /// must stay accurate across wraparound.
+    #[test]
+    fn test_supervisor_recent_redial_count_wraps_without_losing_the_window() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        assert_eq!(s.recent_redial_count(now), 0);
+
+        // Overfill the ring; the count saturates at its capacity, which is all
+        // it ever needs to distinguish (it is only compared to the ceiling).
+        for i in 0..(FLAP_HISTORY_SLOTS * 3) {
+            s.record_redial(now + Duration::from_millis(i as u64));
+        }
+        let count = s.recent_redial_count(now + Duration::from_secs(1));
+        assert_eq!(count as usize, FLAP_HISTORY_SLOTS);
+        assert!(
+            count >= FLAP_REDIAL_CEILING,
+            "the ring must hold enough history to reach the ceiling"
+        );
+
+        // Everything ages out together once the window passes.
+        assert_eq!(
+            s.recent_redial_count(now + Duration::from_millis(FLAP_WINDOW_MS + 1_000)),
+            0
+        );
     }
 
     #[test]
@@ -1964,6 +2593,69 @@ mod tests {
             }
             other => panic!("expected RefreshTokenThenDial, got {other:?}"),
         }
+    }
+
+    /// The pre-open reconnect-storm regression.
+    ///
+    /// Measured on prod 2026-08-19: 8–25 reconnects PER MINUTE from 08:31 to
+    /// 08:59 IST, then exactly zero after the 09:15 open. The market is shut
+    /// pre-open, so no instrument ticks; Dhan pinged to hold the socket open;
+    /// the read loop counted the ping and looped without telling the
+    /// supervisor, so the watchdog expired on DATA silence and tore down a
+    /// healthy connection roughly 300 times a morning — each one a full
+    /// re-auth plus a re-subscribe of the whole universe.
+    ///
+    /// Pre-fix this test fails at the FIRST assertion: without the keep-alive
+    /// the poll at the timeout returns `SleepThenDial`.
+    #[test]
+    fn test_supervisor_keepalive_prevents_the_pre_open_reconnect_storm() {
+        use super::super::idle_watchdog::IDLE_RECONNECT_TIMEOUT_SECS;
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+
+        // Walk 10 minutes of pre-open silence, pinged every 20s the way Dhan
+        // holds a connection open. Not one of them may reconnect.
+        let mut at = now;
+        for _ in 0..30 {
+            at += Duration::from_secs(20);
+            assert_eq!(
+                s.on_event(ConnEvent::KeepAliveReceived, at),
+                SupervisorAction::Continue,
+                "a ping is proof of life, never a reason to redial"
+            );
+            assert_eq!(
+                s.poll(at + Duration::from_secs(IDLE_RECONNECT_TIMEOUT_SECS - 1)),
+                SupervisorAction::Continue,
+                "the watchdog must have been reset by the ping"
+            );
+        }
+        assert_eq!(
+            s.reconnects(),
+            0,
+            "ten minutes of pinged pre-open silence must cost ZERO reconnects \
+             (prod was paying ~300 a morning)"
+        );
+
+        // The other half of the contract: a ping proves the TRANSPORT is
+        // alive, never that DATA flows. It must not fake frames or health —
+        // a silently-failed subscribe belongs to the RISK-GAP-03 silence
+        // scan, and letting a heartbeat claim health would hide it.
+        assert_eq!(s.frames_received(), 0, "a ping is not a data frame");
+
+        // And the watchdog still bites when even the pings stop: that is a
+        // genuinely dead transport.
+        at += Duration::from_secs(20);
+        let _ = s.on_event(ConnEvent::KeepAliveReceived, at);
+        assert!(
+            matches!(
+                s.poll(at + Duration::from_secs(IDLE_RECONNECT_TIMEOUT_SECS)),
+                SupervisorAction::SleepThenDial { .. }
+            ),
+            "silence with NO pings at all is a dead socket and must still redial"
+        );
     }
 
     #[test]
@@ -2391,6 +3083,183 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn with_audit_is_silent_until_opted_in_and_names_its_own_endpoint() {
+        // Two properties in one test because they are the same property from
+        // both sides: a sink built the old way must emit NOTHING (so every
+        // existing caller, test and bench is unchanged by construction), and
+        // an opted-in sink must report the endpoint it actually serves.
+        //
+        // The endpoint half is the one with teeth. The sink's `ws_type` field
+        // is `LiveFeed` for ALL fifteen market-data sockets — it is the WAL
+        // record discriminant, not the socket's identity — so a consumer that
+        // built the audit row from it would file a depth-200 park under the
+        // main feed and leave the table unable to answer which pool went dark,
+        // which is the only question it exists to answer. Carrying the
+        // ENDPOINT on the event is what makes that mistake unavailable
+        // downstream.
+        use tickvault_common::ws_event_types::WsEventKind;
+
+        let dir = wal_dir("lifecycle");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let budget = std::sync::Arc::new(RingByteBudget::new(usize::MAX));
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+
+        let plain = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            frames_tx.clone(),
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+        // No channel attached: the default path must not panic and must not
+        // need one.
+        plain.on_lifecycle(WsEventKind::Disconnected, "no_channel_attached");
+
+        for endpoint in [
+            DhanEndpointType::MainFeed,
+            DhanEndpointType::Depth20,
+            DhanEndpointType::Depth200,
+        ] {
+            let (audit_tx, mut audit_rx) = tokio::sync::mpsc::channel::<WsLifecycleEvent>(4);
+            let sink = WalRingSink::new(
+                std::sync::Arc::clone(&spill),
+                frames_tx.clone(),
+                std::sync::Arc::clone(&budget),
+                // Deliberately the SAME ws_type for every endpoint — that is
+                // exactly the real shape, and the reason the row must not be
+                // built from this field.
+                WsType::LiveFeed,
+                endpoint,
+                3,
+            )
+            .with_audit(audit_tx);
+
+            sink.on_lifecycle(WsEventKind::Disconnected, "park_fatal");
+            let event = audit_rx
+                .try_recv()
+                .expect("an opted-in sink must emit the lifecycle event");
+            assert_eq!(
+                event.endpoint, endpoint,
+                "the event must name the ENDPOINT, not the sink's WAL \
+                 discriminant — otherwise every socket files under one label \
+                 and the audit cannot say which pool went dark"
+            );
+            assert_eq!(event.kind, WsEventKind::Disconnected);
+            assert_eq!(event.connection_index, 3, "the socket's own index");
+            assert_eq!(event.reason, "park_fatal");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_supervisor_reports_connect_and_loss_to_the_sink() {
+        // A source pin, because the emit points are inside an async loop whose
+        // arms need a live socket and a real supervisor to reach. What must
+        // never silently disappear is the CALL — the sink's own emit is unit
+        // tested above, and a sink nobody tells about a park records nothing
+        // while looking wired.
+        //
+        // CONNECTED is anchored on the subscribe-ack arm on purpose. The
+        // 2026-08-12 blackout is the reason: twelve sockets dialed and every
+        // one died on the handshake, so a row written at dial time would have
+        // recorded twelve connections that never carried a byte.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        let park = production
+            // The match ARM, not the enum construction at `on_event`'s return
+            // — anchoring on the bare pattern matched that one first and
+            // captured the wrong span. A guard that fails for a reason
+            // unrelated to what it protects teaches the next reader to delete
+            // it, so the anchor has to be the thing itself.
+            .split("SupervisorAction::Park { reason } => {")
+            .nth(1)
+            .and_then(|s| s.split("return ConnectionExit::Parked").next())
+            .expect("the park arm must exist");
+        assert!(
+            park.contains("sink.on_lifecycle"),
+            "a park is PERMANENT — nothing re-dials that socket. It must reach \
+             the audit, not only a log line and a counter:\n{park}"
+        );
+
+        let subscribe = production
+            .split("guard.mark_confirmed();")
+            .nth(1)
+            .and_then(|s| s.split("action = supervisor.on_event").next())
+            .expect("the subscribe-ack arm must exist");
+        assert!(
+            subscribe.contains("sink.on_lifecycle"),
+            "CONNECTED must be recorded at subscribe-ack — the first instant \
+             the socket can actually deliver:\n{subscribe}"
+        );
+
+        let redial_arms = production.matches("guard.mark_lost();").count();
+        let audited_redials = production
+            .split("guard.mark_lost();")
+            .skip(1)
+            .filter(|s| {
+                s.split("action = supervisor.on_event")
+                    .next()
+                    .unwrap_or("")
+                    .contains("sink.on_lifecycle")
+            })
+            .count();
+        assert_eq!(
+            audited_redials, redial_arms,
+            "every arm that marks the subscription lost is a real disconnect \
+             and must be audited — {audited_redials} of {redial_arms} are"
+        );
+    }
+
+    #[test]
+    fn test_wal_ring_sink_stamps_receipt_time_in_the_read_task() {
+        // The published frame must carry a receipt stamp taken INSIDE
+        // `accept` — i.e. on the read task — not left for the drain to
+        // invent later. Bracketing the call proves the stamp belongs to the
+        // arrival instant and not to whenever a consumer got around to it.
+        //
+        // Why this matters enough to test: the drain used to call
+        // `Utc::now()` itself, so every lag sample measured
+        // `Dhan's delivery + our own time queued in the ring`. Under a fold
+        // stall the ring backs up and that number inflates — the lag alarm
+        // would fire hardest when the fault was LOCAL and name the vendor
+        // for it.
+        let dir = wal_dir("recvstamp");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+
+        let before = std::time::Instant::now();
+        assert_eq!(
+            sink.accept(Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0])),
+            FrameSinkOutcome::Captured
+        );
+        let after = std::time::Instant::now();
+
+        let published = rx.try_recv().expect("a captured frame must be published");
+        assert!(
+            published.received_at >= before && published.received_at <= after,
+            "the receipt stamp must be taken inside accept() — it fell outside the \
+             bracket taken around the call, so it was not stamped at receipt"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn test_wal_ring_sink_stamps_a_distinct_ascending_seq_per_frame() {
         // Two arrivals of BYTE-IDENTICAL content must still receive distinct

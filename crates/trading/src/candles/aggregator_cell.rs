@@ -422,14 +422,53 @@ impl AggregatorCell {
                 }
                 return ConsumeOutcome::DiscardLate;
             }
-            let use_day_open = self.armed_for_day_open[ord];
-            self.armed_for_day_open[ord] = false;
+            // 2026-08-19 — THE ARM IS CONSUMED ONLY WHEN IT IS ACTUALLY USED.
+            //
+            // This used to read `let use = armed[ord]; armed[ord] = false;` —
+            // consuming the arm UNCONDITIONALLY, before anyone checked whether
+            // `day_open` was usable. `open_bucket` then falls back to the
+            // tick's own price when `day_open <= 0.0`, so the two lines
+            // together burned the day's one chance at the official open on a
+            // tick that could not supply it.
+            //
+            // That fires EVERY trading day, not in some corner case. The
+            // persistence window opens at 09:00, so pre-open ticks reach this
+            // fold, and during the pre-open the vendor has no session open to
+            // report — `day_open` is 0. The first such tick burned the arm;
+            // every later bucket then saw `use_day_open == false`; and the
+            // real 09:15 open was never stamped into ANY candle that day.
+            //
+            // Consuming it only on use means a pre-open tick leaves the arm
+            // intact, and the first tick that actually carries a positive
+            // `day_open` — in practice the first tick at or after the official
+            // open — is the one that spends it.
+            //
+            // HONEST RESIDUAL: this makes the arm wait for a usable value, not
+            // for a particular clock time. If the vendor were to withhold
+            // `day_open` past 09:15, the first bucket that DOES see it would
+            // open at the session open rather than at its own first trade.
+            // That is a bounded, one-bucket inaccuracy and strictly better
+            // than losing the official open for the whole day; pinning it to a
+            // session-time window would put trading-calendar knowledge inside
+            // this cell, which is the wrong place for it.
+            let use_day_open = self.armed_for_day_open[ord] && prices.day_open > 0.0;
+            if use_day_open {
+                self.armed_for_day_open[ord] = false;
+            }
+            // "The day's first bucket" is DERIVED, not tracked: nothing has
+            // sealed for this timeframe yet today. `force_seal` (the day
+            // boundary) clears `last_sealed` and re-arms, so the signal resets
+            // across days on its own. Chosen over a new `[bool; TF_COUNT]`
+            // array because it costs 0 bytes and cannot drift out of sync with
+            // the seal path it is read from.
+            let first_bucket_of_day = self.last_sealed[ord].is_uninitialised();
             self.slots[ord] = open_bucket(
                 tick,
                 prices,
                 bucket_start,
                 bucket_start_cumulative,
                 use_day_open,
+                first_bucket_of_day,
                 cumulative_volume,
             );
             return ConsumeOutcome::Updated;
@@ -440,13 +479,43 @@ impl AggregatorCell {
         // In-bucket — the common case, and the one that must survive many
         // ticks sharing one second.
         if bucket_start == open_start {
+            // A day_open that arrives AFTER the bucket opened still belongs to
+            // it. The arm is only ever live inside the day's first bucket (the
+            // roll below disarms on the way out), so this cannot stamp a later
+            // bar. Without it, an instrument whose first in-session tick
+            // carried no session open would lose the official open for the
+            // whole day — the bucket is already open, and `fold_in_bucket`
+            // deliberately never touches `open`.
+            if self.armed_for_day_open[ord] && prices.day_open > 0.0 {
+                self.armed_for_day_open[ord] = false;
+                self.slots[ord].open = prices.day_open;
+                // The MORE dangerous of the two `day_open` stamp sites: this
+                // bucket has already folded ticks, so its range can be far
+                // from the official open by now. Without this widening the
+                // bar publishes an `open` outside its own `[low, high]`.
+                widen_range_to_include(&mut self.slots[ord], prices.day_open);
+            }
             fold_in_bucket(&mut self.slots[ord], tick, prices, cumulative_volume);
+            // Session extremes keep arriving through the first bucket's life,
+            // so re-adopt on every tick of it — `day_high` at the bucket's LAST
+            // tick is the one that matters, and max/min converge to it.
+            if self.last_sealed[ord].is_uninitialised() {
+                adopt_exchange_day_extremes(&mut self.slots[ord], tick);
+            }
             return ConsumeOutcome::Updated;
         }
 
         // Strictly newer bucket — seal the open one and open the new one at
         // the LTP (an intraday crossing is never the day's first bar).
+        //
+        // 2026-08-19 — the `false` is unchanged, but the DISARM beside it is
+        // new. Leaving here means the day's first bucket is behind us, so the
+        // official open can never legitimately be stamped again; disarming
+        // makes that structural rather than incidental, and is what lets the
+        // in-bucket path below stamp a late-arriving `day_open` without any
+        // risk of a later bucket claiming it.
         if bucket_start > open_start {
+            self.armed_for_day_open[ord] = false;
             let sealed_state = std::mem::replace(
                 &mut self.slots[ord],
                 open_bucket(
@@ -454,6 +523,10 @@ impl AggregatorCell {
                     prices,
                     bucket_start,
                     bucket_start_cumulative,
+                    false,
+                    // An intraday crossing is never the day's first bar, so
+                    // the running session extremes must NOT be adopted here —
+                    // this is the scope guarantee of plan Item 6.
                     false,
                     cumulative_volume,
                 ),
@@ -542,13 +615,55 @@ impl AggregatorCell {
 // ---------------------------------------------------------------------------
 // Fold primitives (free functions — the cell's slots are plain values)
 // ---------------------------------------------------------------------------
+/// Widens `[low, high]` so it contains `price`.
+///
+/// Every use of this in the fold is MONOTONE WIDENING: it can only ever
+/// enlarge a bar's range, never shrink it. That property is the entire safety
+/// argument for adopting exchange-published values — no input, however stale
+/// or corrupt, can narrow a range or discard a price we actually observed.
+#[inline]
+fn widen_range_to_include(state: &mut LiveCandleState, price: f64) {
+    if price > state.high {
+        state.high = price;
+    }
+    if price < state.low {
+        state.low = price;
+    }
+}
+
+/// True when `raw` is a usable exchange-published price.
+///
+/// `> 0.0` alone is NOT sufficient and the difference is load-bearing:
+/// - it correctly rejects `NaN` (every comparison with `NaN` is false), but
+/// - it ACCEPTS `+∞`, which would set a bar's `high` to infinity permanently.
+///
+/// `0.0` is the documented ABSENT sentinel — Ticker-mode packets carry no day
+/// fields at all, so a bare `0.0` must never be read as a real price of zero.
+#[inline]
+const fn usable_exchange_price(raw: f32) -> bool {
+    raw.is_finite() && raw > 0.0
+}
 
 /// Builds the state of a bucket being opened by `tick`.
 ///
 /// `use_day_open` makes the bar open at the exchange-published `day_open`
 /// (the day's FIRST bar of each timeframe); it falls back to the LTP when
-/// `day_open` is absent (`0.0` pre-open, or a malformed packet). `high` /
-/// `low` / `close` ALWAYS track the LTP — never `day_high` / `day_low`.
+/// `day_open` is absent (`0.0` pre-open, or a malformed packet).
+///
+/// `first_bucket_of_day` additionally adopts the exchange-published
+/// `day_high` / `day_low` as this bar's extremes (operator 2026-08-19, plan
+/// Item 6). It is correct for the day's FIRST bucket ONLY, because those
+/// fields are running SESSION extremes — for any later bucket they describe
+/// the whole day rather than that bucket, which is why every other bucket
+/// keeps tracking the LTP alone.
+///
+/// # The invariant this function is responsible for
+///
+/// `low <= open <= high` on the returned state. Before 2026-08-19 it was NOT
+/// upheld: `open` was stamped from `day_open` while `high`/`low` were seeded
+/// from the LTP, so a gap-open morning (`day_open = 100`, first trade `105`)
+/// published `open=100, high=105, low=105` — an open below its own low. See
+/// plan Item 6 / C1 for the consumers that corrupts.
 #[inline]
 fn open_bucket(
     tick: &ParsedTick,
@@ -556,6 +671,7 @@ fn open_bucket(
     bucket_start: u32,
     bucket_start_cumulative: u64,
     use_day_open: bool,
+    first_bucket_of_day: bool,
     cumulative_volume: u64,
 ) -> LiveCandleState {
     let price = prices.last_traded_price;
@@ -566,7 +682,7 @@ fn open_bucket(
     } else {
         price
     };
-    LiveCandleState {
+    let mut state = LiveCandleState {
         bucket_start_ist_secs: bucket_start,
         open,
         high: price,
@@ -592,6 +708,58 @@ fn open_bucket(
         },
         open_pct: 0.0,
         open_gap_pct: 0.0,
+    };
+    // The official open is a REAL matched trade (the pre-open call auction
+    // equilibrium), so it genuinely belongs inside this bar's range. Widen
+    // rather than clamp `open`: clamping would discard exchange truth to
+    // satisfy an invariant, which is backwards.
+    //
+    // The counter is the honest evidence of how real the defect was: every
+    // increment is a bar that WOULD have published an open outside its own
+    // range before 2026-08-19. On a calm morning it stays 0; on a gap-open
+    // it fires once per instrument per timeframe.
+    if open < state.low || open > state.high {
+        metrics::counter!("tv_candle_open_clamped_total").increment(1);
+    }
+    widen_range_to_include(&mut state, open);
+    if first_bucket_of_day {
+        adopt_exchange_day_extremes(&mut state, tick);
+    }
+    state
+}
+
+/// Adopts the exchange-published session extremes into a bar's range.
+///
+/// **Only ever call this for the day's FIRST bucket.** `day_high` / `day_low`
+/// are RUNNING SESSION extremes: during the first bucket they describe
+/// exactly that bucket (nothing earlier exists to have set them), but from the
+/// second bucket onward they describe the whole day and would smear the
+/// session range across every bar.
+///
+/// Both fields are read raw off `&ParsedTick` and widened inline here rather
+/// than being carried on [`TickPrices`]. That is deliberate: [`TickPrices`] is
+/// built once per tick for the whole session, so adding these two would pay
+/// ~100 ns of `f32_to_f64_clean` on EVERY tick to serve one bucket per day.
+/// Here the conversion runs during the first bucket only — roughly one minute
+/// out of 375 — and costs exactly zero for the rest of the session.
+///
+/// # Complexity
+/// O(1) — two validity checks, at most two widenings. No allocation.
+#[inline]
+fn adopt_exchange_day_extremes(state: &mut LiveCandleState, tick: &ParsedTick) {
+    if usable_exchange_price(tick.day_high) {
+        let dh = f32_to_f64_clean(tick.day_high);
+        if dh > state.high {
+            state.high = dh;
+            metrics::counter!("tv_candle_day_high_adopted_total").increment(1);
+        }
+    }
+    if usable_exchange_price(tick.day_low) {
+        let dl = f32_to_f64_clean(tick.day_low);
+        if dl < state.low {
+            state.low = dl;
+            metrics::counter!("tv_candle_day_low_adopted_total").increment(1);
+        }
     }
 }
 
@@ -697,6 +865,73 @@ mod tests {
             volume: cum_volume,
             ..ParsedTick::default()
         }
+    }
+
+    #[test]
+    fn test_a_late_arriving_day_open_still_reaches_the_days_first_bucket() {
+        // WHAT THIS ACTUALLY PINS (operator asked 2026-08-19 whether the
+        // candle opens at the pre-market price; investigation below).
+        //
+        // I first believed pre-open ticks reached this fold and stamped the
+        // 09:15 candle with a pre-market price. THEY DO NOT — the aggregator
+        // refuses anything with `secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST`
+        // one layer up, so `bucket_start`'s clamp of pre-open timestamps into
+        // the 09:15 bucket is defence-in-depth for a caller that does not
+        // exist. The reported bug was not real, and this test exists for the
+        // NARROWER case that is.
+        //
+        // The real risk: the day's first IN-SESSION tick can carry
+        // `day_open == 0` — a thin instrument whose session open the vendor
+        // has not populated yet. The bucket opens at that tick's price, and
+        // `fold_in_bucket` never touches `open`, so without this path the
+        // official open would never reach any candle that day.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        // First in-session tick, but no session open published yet.
+        let first = tick_at(OPEN, 23_990.00, 5);
+        assert_eq!(first.day_open, 0.0, "fixture models the unpopulated case");
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 5);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).open,
+            f32_to_f64_clean(23_990.00),
+            "with nothing better available the bucket opens at the traded price"
+        );
+
+        // Same bucket, seconds later: the official open arrives.
+        let mut later = tick_at(OPEN + 10, 24_010.00, 12);
+        later.day_open = 24_000.25;
+        cell.consume_tick(TfIndex::M1, &later, 0, strategy, 12);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).open,
+            f32_to_f64_clean(24_000.25),
+            "a day_open arriving after the bucket opened still belongs to it"
+        );
+    }
+
+    #[test]
+    fn test_the_day_open_arm_cannot_be_spent_by_any_bucket_after_the_first() {
+        // The other half, and the reason the roll disarms: once the day's
+        // first bucket is behind us the official open must never be stamped
+        // again. A permanently-live arm would open every later bar at the
+        // session open — the opposite error, and equally wrong.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        // First bucket, no day_open available — arm stays live.
+        let first = tick_at(OPEN, 23_990.00, 5);
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 5);
+
+        // Roll into the next minute; day_open is on the wire now, but this
+        // bucket is NOT the day's first and must open at its own price.
+        let mut second = tick_at(OPEN + 60, 24_055.50, 20);
+        second.day_open = 24_000.25;
+        cell.consume_tick(TfIndex::M1, &second, 0, strategy, 20);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).open,
+            f32_to_f64_clean(24_055.50),
+            "every bucket after the first opens at its OWN first traded price"
+        );
     }
 
     #[test]
@@ -1255,5 +1490,273 @@ mod tests {
         assert_eq!(FeedStrategy::default(), FeedStrategy::REFOLD);
         assert_eq!(FeedStrategy::DEFAULT.late_policy, LatePolicy::Refold);
         assert_eq!(FeedStrategy::DISCARD.late_policy, LatePolicy::Discard);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Item 6 (operator 2026-08-19) — 09:15 first-bucket open / high / low
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod first_bucket_ohlc_tests {
+    use super::tests::{DAY, OPEN, tick_at};
+    use super::*;
+
+    /// Builds a tick carrying exchange-published session fields.
+    fn tick_with_day(
+        ts: u32,
+        price: f32,
+        day_open: f32,
+        day_high: f32,
+        day_low: f32,
+    ) -> ParsedTick {
+        ParsedTick {
+            day_open,
+            day_high,
+            day_low,
+            ..tick_at(ts, price, 0)
+        }
+    }
+
+    fn fold(cell: &mut AggregatorCell, tick: &ParsedTick) -> ConsumeOutcome {
+        let prices = TickPrices::from_tick(tick);
+        cell.consume_tick_with_prices(TfIndex::M1, tick, prices, 0, FeedStrategy::DEFAULT, 0)
+    }
+
+    fn m1(cell: &AggregatorCell) -> LiveCandleState {
+        cell.snapshot(TfIndex::M1)
+    }
+
+    /// The invariant this whole item exists for.
+    fn assert_ohlc_valid(s: &LiveCandleState, label: &str) {
+        assert!(
+            s.low <= s.open,
+            "{label}: open {} is BELOW low {} — invalid candle",
+            s.open,
+            s.low
+        );
+        assert!(
+            s.open <= s.high,
+            "{label}: open {} is ABOVE high {} — invalid candle",
+            s.open,
+            s.high
+        );
+        assert!(
+            s.low <= s.close && s.close <= s.high,
+            "{label}: close outside range"
+        );
+        assert!(s.low <= s.high, "{label}: low above high");
+    }
+
+    /// THE BUG. Gap-up: official open 100, first trade 105. Before this item
+    /// the bar published `open=100, high=105, low=105` — open below its low.
+    #[test]
+    fn first_bucket_open_below_ltp_still_yields_valid_ohlc() {
+        let mut cell = AggregatorCell::empty();
+        fold(&mut cell, &tick_with_day(OPEN, 105.0, 100.0, 0.0, 0.0));
+        let s = m1(&cell);
+        assert_eq!(
+            s.open, 100.0,
+            "official open must be preserved, not clamped away"
+        );
+        assert_ohlc_valid(&s, "gap-up");
+        assert_eq!(
+            s.low, 100.0,
+            "range must widen DOWN to contain the official open"
+        );
+        assert_eq!(s.high, 105.0);
+    }
+
+    /// Gap-down mirror: official open 105, first trade 100.
+    #[test]
+    fn first_bucket_open_above_ltp_still_yields_valid_ohlc() {
+        let mut cell = AggregatorCell::empty();
+        fold(&mut cell, &tick_with_day(OPEN, 100.0, 105.0, 0.0, 0.0));
+        let s = m1(&cell);
+        assert_eq!(s.open, 105.0);
+        assert_ohlc_valid(&s, "gap-down");
+        assert_eq!(
+            s.high, 105.0,
+            "range must widen UP to contain the official open"
+        );
+        assert_eq!(s.low, 100.0);
+    }
+
+    /// The second, more dangerous stamp site: `day_open` arrives AFTER the
+    /// bucket has already folded ticks, so the range can be far from it.
+    #[test]
+    fn late_day_open_into_folded_bucket_keeps_ohlc_valid() {
+        let mut cell = AggregatorCell::empty();
+        // Bucket opens with NO day_open, then folds a long way from it.
+        fold(&mut cell, &tick_with_day(OPEN, 200.0, 0.0, 0.0, 0.0));
+        fold(&mut cell, &tick_with_day(OPEN + 5, 210.0, 0.0, 0.0, 0.0));
+        // Now the official open finally arrives, far below the folded range.
+        fold(&mut cell, &tick_with_day(OPEN + 10, 208.0, 150.0, 0.0, 0.0));
+        let s = m1(&cell);
+        assert_eq!(s.open, 150.0, "late official open must still be adopted");
+        assert_ohlc_valid(&s, "late day_open");
+        assert_eq!(s.low, 150.0, "range must widen to contain the late open");
+    }
+
+    /// Operator idea #2: the first bucket adopts the exchange's true extremes,
+    /// which include trades our sampled feed never saw.
+    #[test]
+    fn first_bucket_adopts_exchange_day_high_and_day_low() {
+        let mut cell = AggregatorCell::empty();
+        // We only ever OBSERVE 100..101, but the exchange saw 98..107.
+        fold(&mut cell, &tick_with_day(OPEN, 100.0, 100.0, 107.0, 98.0));
+        fold(
+            &mut cell,
+            &tick_with_day(OPEN + 30, 101.0, 100.0, 107.0, 98.0),
+        );
+        let s = m1(&cell);
+        assert_eq!(s.high, 107.0, "exchange day_high must be adopted");
+        assert_eq!(s.low, 98.0, "exchange day_low must be adopted");
+        assert_eq!(s.close, 101.0, "close still tracks the LTP");
+        assert_ohlc_valid(&s, "day extremes");
+    }
+
+    /// Ticker mode carries NO day fields — `0.0` is the documented ABSENT
+    /// sentinel. Adopting it would drag a low to zero.
+    #[test]
+    fn zero_day_high_low_sentinel_is_never_adopted() {
+        let mut cell = AggregatorCell::empty();
+        fold(&mut cell, &tick_with_day(OPEN, 100.0, 0.0, 0.0, 0.0));
+        let s = m1(&cell);
+        assert_eq!(s.low, 100.0, "sentinel 0.0 must NEVER become a price");
+        assert_eq!(s.high, 100.0);
+        assert_ohlc_valid(&s, "ticker-mode sentinel");
+    }
+
+    /// NaN AND +infinity. `> 0.0` alone rejects NaN but ACCEPTS +inf, which
+    /// would pin `high` at infinity permanently.
+    #[test]
+    fn non_finite_day_high_low_is_never_adopted() {
+        for (dh, dl, label) in [
+            (f32::NAN, f32::NAN, "NaN"),
+            (f32::INFINITY, f32::NEG_INFINITY, "infinity"),
+            (f32::INFINITY, 0.0, "+inf high only"),
+        ] {
+            let mut cell = AggregatorCell::empty();
+            fold(&mut cell, &tick_with_day(OPEN, 100.0, 0.0, dh, dl));
+            let s = m1(&cell);
+            assert!(s.high.is_finite(), "{label}: high went non-finite");
+            assert!(s.low.is_finite(), "{label}: low went non-finite");
+            assert_eq!(s.high, 100.0, "{label}: high must stay at the observed LTP");
+            assert_eq!(s.low, 100.0, "{label}: low must stay at the observed LTP");
+            assert_ohlc_valid(&s, label);
+        }
+    }
+
+    /// THE SCOPE GUARANTEE. `day_high`/`day_low` are RUNNING SESSION extremes;
+    /// applying them to a later bucket would smear the whole day's range
+    /// across every bar. The operator's scope is the 09:15 bucket alone.
+    #[test]
+    fn second_bucket_ignores_running_day_extremes() {
+        let mut cell = AggregatorCell::empty();
+        fold(&mut cell, &tick_with_day(OPEN, 100.0, 100.0, 100.0, 100.0));
+        // Roll into 09:16. The session has since ranged 90..150, but this
+        // bucket only traded at 120.
+        let out = fold(
+            &mut cell,
+            &tick_with_day(OPEN + 60, 120.0, 100.0, 150.0, 90.0),
+        );
+        assert!(
+            matches!(out, ConsumeOutcome::Sealed { .. }),
+            "should have sealed 09:15"
+        );
+        let s = m1(&cell);
+        assert_eq!(
+            s.high, 120.0,
+            "second bucket must NOT adopt the session high"
+        );
+        assert_eq!(s.low, 120.0, "second bucket must NOT adopt the session low");
+        assert_ohlc_valid(&s, "second bucket");
+    }
+
+    /// Monotone widening: an exchange value BELOW our observed high can never
+    /// shrink the range, and one ABOVE our observed low can never raise it.
+    #[test]
+    fn widening_never_narrows_an_observed_range() {
+        let mut cell = AggregatorCell::empty();
+        fold(&mut cell, &tick_with_day(OPEN, 100.0, 0.0, 0.0, 0.0));
+        fold(&mut cell, &tick_with_day(OPEN + 10, 130.0, 0.0, 0.0, 0.0));
+        fold(&mut cell, &tick_with_day(OPEN + 20, 90.0, 0.0, 0.0, 0.0));
+        // Exchange reports a NARROWER range than we observed (stale field).
+        fold(
+            &mut cell,
+            &tick_with_day(OPEN + 30, 110.0, 0.0, 120.0, 95.0),
+        );
+        let s = m1(&cell);
+        assert_eq!(s.high, 130.0, "observed high must survive a lower day_high");
+        assert_eq!(s.low, 90.0, "observed low must survive a higher day_low");
+        assert_ohlc_valid(&s, "monotone widening");
+    }
+
+    /// The invariant must hold for EVERY bar of a folded session, not just the
+    /// first — including the sealed ones.
+    #[test]
+    fn ohlc_invariant_holds_across_a_folded_session() {
+        let mut cell = AggregatorCell::empty();
+        let mut sealed = Vec::new();
+        // 30 minutes, prices sweeping up and down, day extremes always present.
+        for i in 0..1_800_u32 {
+            let price = 100.0 + ((i % 97) as f32) * 0.35 - ((i % 53) as f32) * 0.4;
+            let t = tick_with_day(OPEN + i, price, 100.0, 140.0, 70.0);
+            if let ConsumeOutcome::Sealed { sealed_state } = fold(&mut cell, &t) {
+                sealed.push(sealed_state);
+            }
+        }
+        assert!(
+            sealed.len() >= 25,
+            "expected ~29 sealed bars, got {}",
+            sealed.len()
+        );
+        for (n, s) in sealed.iter().enumerate() {
+            assert_ohlc_valid(s, &format!("sealed bar {n}"));
+        }
+        assert_ohlc_valid(&m1(&cell), "still-open bar");
+        // Only the FIRST sealed bar may carry the session extremes.
+        assert_eq!(sealed[0].high, 140.0, "first bar adopts the session high");
+        assert_eq!(sealed[0].low, 70.0, "first bar adopts the session low");
+        for (n, s) in sealed.iter().enumerate().skip(1) {
+            assert!(
+                s.high < 140.0,
+                "sealed bar {n} wrongly adopted the session high"
+            );
+            assert!(
+                s.low > 70.0,
+                "sealed bar {n} wrongly adopted the session low"
+            );
+        }
+    }
+
+    /// The derived first-bucket signal must reset across the day boundary,
+    /// otherwise day 2's 09:15 bar silently loses the treatment.
+    #[test]
+    fn day_boundary_rearms_the_first_bucket_treatment() {
+        let mut cell = AggregatorCell::empty();
+        fold(&mut cell, &tick_with_day(OPEN, 100.0, 100.0, 110.0, 95.0));
+        fold(
+            &mut cell,
+            &tick_with_day(OPEN + 60, 101.0, 100.0, 110.0, 95.0),
+        );
+        assert!(
+            cell.force_seal(TfIndex::M1).is_some(),
+            "day boundary seals the open bar"
+        );
+
+        // Day 2.
+        let open2 = OPEN + 86_400;
+        fold(&mut cell, &tick_with_day(open2, 200.0, 205.0, 215.0, 195.0));
+        let s = m1(&cell);
+        assert_eq!(s.open, 205.0, "day 2 must re-arm the official open");
+        assert_eq!(
+            s.high, 215.0,
+            "day 2 first bucket must adopt day_high again"
+        );
+        assert_eq!(s.low, 195.0, "day 2 first bucket must adopt day_low again");
+        assert_ohlc_valid(&s, "day 2 first bucket");
+        let _ = DAY;
     }
 }

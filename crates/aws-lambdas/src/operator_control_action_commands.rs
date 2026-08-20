@@ -59,7 +59,7 @@ pub const DOCKER_RESET_COMMANDS: [&str; 17] = [
 ];
 
 /// legacy: `lambda_handler docker-nuke-bare cmds` (handler.py:1338-1368) — captured from the RUNNING oracle.
-pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 10] = [
+pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 11] = [
     r#"set +e"#,
     r#"systemctl stop tickvault || true"#,
     r#"systemctl disable tickvault || true"#,
@@ -70,6 +70,21 @@ pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 10] = [
     r#"rm -rf /opt/tickvault/data/instrument-cache /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
     r#"C=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' '); I=$(docker images -aq 2>/dev/null | wc -l | tr -d ' '); V=$(docker volume ls -q 2>/dev/null | wc -l | tr -d ' '); echo "BARE-NUKE-RESULT containers=$C images=$I volumes=$V"; if [ "$C" = 0 ] && [ "$I" = 0 ] && [ "$V" = 0 ]; then echo bare-nuke-complete; else echo 'bare-nuke-PARTIAL: something is still present (likely in-use)'; fi"#,
+    // 2026-08-20 INCIDENT FIX — the auto-start guarantee. This action used to
+    // `disable` tickvault (line 65 above) and NEVER re-enable it. A disabled
+    // unit does NOT auto-start at the next 08:30 IST boot, AND
+    // `scripts/aws-autopilot.sh` reads a disabled unit as an INTENTIONAL
+    // kill-switch and REFUSES to self-heal it — so one bare-nuke silently cost
+    // an entire trading day (2026-08-20: box up 08:30:42, app dead, QuestDB
+    // gone, four alarms firing, discovered only because the operator asked).
+    //
+    // Its two sibling destructive actions both already restore: WIPE_QUESTDB
+    // does `enable`+`start`, DOCKER_RESET does `enable`. This one was the odd
+    // man out. The INTENTIONAL kill-switch stays the separate `stop-app`
+    // action, so aws-autopilot.sh's `disabled == operator meant it` semantics
+    // remain correct. Placed last so the BARE-NUKE-RESULT verification above
+    // still reports the true post-nuke counts.
+    r#"systemctl enable tickvault || true"#,
 ];
 
 /// legacy: `lambda_handler logs cmds` (handler.py:1414-1424) — captured from the RUNNING oracle.

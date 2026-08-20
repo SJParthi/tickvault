@@ -188,7 +188,19 @@ pub fn next_wait(
         // Sleep to the next day's target. Computed from the target, not from
         // "24h from now", so a slow build cannot drift the schedule later
         // every day until it walks out of the market window entirely.
-        let secs_to_midnight = u64::from(SECS_PER_DAY as u32 - now_secs_of_day);
+        // `saturating_sub`, not `-`. This is a `pub fn` whose caller supplies
+        // `now_secs_of_day` freely, the release profile sets
+        // `overflow-checks = true` AND `panic = "abort"`, so a value at or
+        // past 86_400 would not return a wrong duration — it would KILL the
+        // trading process. Every sibling arithmetic in this file already
+        // saturates; this one line did not. Saturating yields 0, i.e. "the
+        // next target is today's target", which is the safe direction: it
+        // wakes early rather than never.
+        let secs_to_midnight = u64::from(
+            u32::try_from(SECS_PER_DAY)
+                .unwrap_or(u32::MAX)
+                .saturating_sub(now_secs_of_day),
+        );
         return Some(Duration::from_secs(
             secs_to_midnight.saturating_add(u64::from(target_secs_of_day)),
         ));
@@ -340,6 +352,64 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
         ambiguous = index.ambiguous.len(),
         "instrument master parsed"
     );
+
+    // 1b. The derivative subset, written for the contract attach.
+    //
+    // Written HERE, while the parsed master is still in hand, because it is
+    // dropped a few lines below and the attach runs much later — it waits for
+    // live prices to locate at-the-money. Without this the attach would have
+    // to re-download the same ~15 MB file in the minutes after the open.
+    //
+    // NON-FATAL by construction: a failure here costs the session its
+    // contracts and leaves the spot universe untouched, so it must never
+    // abort the mapping build that the whole rider exists for.
+    let contract_rows = crate::dhan_contract_universe::contract_rows_from_master(&master);
+    match crate::dhan_contract_universe::write_contract_artifact(date, &contract_rows) {
+        Ok(()) => info!(
+            source = "dhan_master",
+            contracts = contract_rows.len(),
+            "contract artifact written"
+        ),
+        Err(err) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            %err,
+            date,
+            "contract artifact could NOT be written — the live lane will carry its spot \
+             universe only, with no futures and no option contracts, until this is fixed. \
+             The mapping build below is unaffected."
+        ),
+    }
+
+    // 1c. The never-delete lifecycle record.
+    //
+    // Operator directive 2026-08-19: an expired instrument is MARKED expired,
+    // never removed, so the table answers "was this tradeable on that day?"
+    // for every instrument that has ever existed.
+    //
+    // NON-FATAL, like the artifact above: the mapping build is what the rider
+    // exists for, and a lifecycle write that fails must not cost the day its
+    // universe. It also runs AFTER the artifact so a failure here cannot stop
+    // the live lane getting its contracts.
+    let today_ymd = crate::dhan_feed_stack::ymd_from_ist_date(date);
+    let today_nanos = ist_midnight_nanos(date);
+    match crate::dhan_lifecycle::write_dhan_lifecycle(questdb, &master, today_ymd, today_nanos, "")
+        .await
+    {
+        Ok(tally) => info!(
+            active = tally.active,
+            expired_by_date = tally.expired_by_date,
+            expired_by_absence = tally.expired_by_absence,
+            "instrument lifecycle recorded"
+        ),
+        Err(err) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            %err,
+            date,
+            "instrument lifecycle could NOT be written — nothing was deleted (the table is \
+             append-and-upsert only), but today's expiry marks are missing, so a query \
+             asking which instruments were tradeable today will read yesterday's answer."
+        ),
+    }
 
     // 2. Every NSE India index list. A single list failing does NOT abort the
     // day: the tolerance gate below judges the RESULT, so one flaky index out
@@ -815,6 +885,28 @@ mod tests {
             Duration::from_secs((SECS_PER_DAY as u64 - 9 * 3600) + 8 * 3600),
             "sleep must land on TOMORROW's target, not 24h from now"
         );
+    }
+
+    #[test]
+    fn test_next_wait_survives_an_out_of_range_second_of_day() {
+        // `next_wait` is `pub` and its caller supplies this value freely. The
+        // release profile is `overflow-checks = true` + `panic = "abort"`, so
+        // before 2026-08-19 a value at or past 86_400 did not return a wrong
+        // duration — it ABORTED the trading process. These inputs are the
+        // reason the arithmetic saturates.
+        for bad in [86_400_u32, 86_401, 100_000, u32::MAX] {
+            let wait = next_wait(bad, 8 * 3600, true)
+                .expect("an out-of-range clock must still yield a wait, never a panic");
+            assert_eq!(
+                wait.as_secs(),
+                8 * 3600,
+                "saturating to zero seconds-to-midnight wakes EARLY (at today's \
+                 target), which is the safe direction — never late, never never"
+            );
+        }
+        // The exact boundary still behaves normally one second below.
+        let ok = next_wait(86_399, 8 * 3600, true).expect("must sleep");
+        assert_eq!(ok.as_secs(), 1 + 8 * 3600);
     }
 
     #[test]

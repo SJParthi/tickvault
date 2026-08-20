@@ -162,7 +162,17 @@ pub fn select_live_universe(
     // Seeded with the index set so a master entry that repeats an index SID
     // cannot be subscribed twice. `(security_id, segment)` is the composite
     // identity per I-P1-11 — a bare id would collapse two real instruments.
-    let mut seen: Vec<(SecurityId, ExchangeSegment)> = index_universe
+    //
+    // A `HashSet`, not a `Vec`. This was `Vec::contains` inside the loop
+    // below, which is O(n²): at today's 4,565 SIDs that is ~10M comparisons
+    // and survivable, but the authorized target is 25,000, where it becomes
+    // ~312M — a boot path doing a third of a billion comparisons to answer a
+    // question a hash answers in one probe.
+    //
+    // The sibling deduper `dhan_feed_stack::dedup_subscribe_set` has always
+    // used a `HashSet` on this exact key for this exact job. Two dedup paths,
+    // same key, different complexity; now the same.
+    let mut seen: std::collections::HashSet<(SecurityId, ExchangeSegment)> = index_universe
         .iter()
         .map(|i| (i.security_id, i.segment))
         .collect();
@@ -178,11 +188,10 @@ pub fn select_live_universe(
             continue;
         };
         let key = (entry.security_id as SecurityId, segment);
-        if seen.contains(&key) {
+        if !seen.insert(key) {
             deduped += 1;
             continue;
         }
-        seen.push(key);
         instruments.push(SubscribeInstrument {
             security_id: key.0,
             segment,
@@ -500,4 +509,155 @@ mod tests {
             "data/instrument-cache/dhan-nse-mapping-2026-08-12.json"
         );
     }
+}
+
+// ===========================================================================
+// Boot-time wait for today's mapping artifact
+// ===========================================================================
+
+/// How long the boot path waits for today's mapping artifact before giving up
+/// and booting on the index universe.
+///
+/// Sized from the observed build, not guessed: the 2026-08-18 production build
+/// took **9 seconds** end to end (`downloading instrument master` 08:11:48 →
+/// `instrument mapping written` 08:11:57). 120 s is ~13× that, and still lands
+/// far inside the pre-open window — the box starts at 08:30 IST and the market
+/// opens at 09:15, so even a full timeout costs none of the session.
+pub const MAPPING_WAIT_DEADLINE_SECS: u64 = 120;
+
+/// Poll cadence while waiting. Cold path, once per boot: at the deadline above
+/// this is at most 240 `stat` calls total.
+const MAPPING_POLL_INTERVAL_MS: u64 = 500;
+
+/// Counter: how each boot's wait for the mapping artifact ended.
+///
+/// `outcome` is one of `not_requested`, `rider_disabled`, `already_present`,
+/// `became_ready`, `timed_out`.
+///
+/// # NOT shipped to CloudWatch — deliberately, and this is a real limitation
+///
+/// This counter is readable on the box's `/metrics` endpoint and nowhere else.
+/// Adding it to the EMF `metric_selectors` list was attempted and REVERTED:
+/// `user-data.sh.tftpl` currently renders to **15,870 bytes against a 15,872
+/// byte budget**, and the size guard that pins it explicitly forbids buying
+/// room by shaving unrelated blocks. Its prescribed remedy — moving content
+/// out of user-data into a file copied in after the repo clone — is a larger
+/// change than this fix should carry.
+///
+/// So a boot that timed out waiting is visible in the log line and on
+/// `/metrics`, but not in CloudWatch. Shipping it is a follow-up that has to
+/// deal with the byte budget first.
+pub const MAPPING_WAIT_COUNTER: &str = "tv_dhan_live_universe_mapping_wait_total";
+
+/// Wait — bounded — for today's mapping artifact to exist before the lane
+/// resolves its subscription set.
+///
+/// # The race this closes
+///
+/// The daily rider and the live lane are started from the same boot. The rider
+/// *writes* `dhan-nse-mapping-<today>.json`; the lane *reads* it. On
+/// 2026-08-18 the lane read it at 08:11:48 and the rider wrote it at 08:11:57
+/// — the lane lost by 9 seconds, fell back to 4 instruments, and only reached
+/// the full 4,565 because the box happened to boot a second time at 08:31.
+///
+/// Because the filename is date-stamped, yesterday's artifact cannot stand in
+/// for today's, so a box that boots **once** — the normal case — loses the race
+/// every single day. It is not intermittent. Production evidence: on
+/// 2026-08-17 the single 08:31:37 boot fell back and the **entire trading
+/// session ran on 4 instruments instead of 4,565**, with no page, because
+/// `MASTER_SOURCING_FALLBACK_COUNTER` has no alarm attached.
+///
+/// # Why a poll and not a signal from the rider
+///
+/// The artifact is the real contract here, and it has more than one legitimate
+/// producer: today's rider, or an earlier boot of the same IST day. A readiness
+/// channel would only cover the first. Polling the file covers both, and stays
+/// correct if the rider is ever restarted by its supervisor mid-build.
+///
+/// # This never blocks boot
+///
+/// Every exit is bounded and logged. If the flag is off, the rider is
+/// disabled, or the deadline expires, this returns and
+/// [`resolve_live_universe`] takes its existing fallback path — which already
+/// logs the collapse at `error!` and counts it. The wait can only ever turn a
+/// *guaranteed* fallback into a *possible* one; it can never turn a working
+/// boot into a failing one.
+// The behaviour this wraps is pinned by `universe_boot_race_guard.rs`; there is
+// no pure decision to isolate here, since every branch is an I/O or a timer
+// observation. The marker below MUST stay on the line immediately preceding
+// `pub async fn` — the guard reads exactly one line back, and anything inserted
+// between them silently orphans the exemption.
+// TEST-EXEMPT: filesystem polling + wall-clock sleep — see the note above.
+pub async fn await_mapping_artifact(
+    cfg: &tickvault_common::config::DhanUniverseConfig,
+    date_ist: &str,
+) {
+    // Nothing to wait for: the lane is not master-sourced this boot.
+    if !cfg.live_subscription_from_master {
+        metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "not_requested").increment(1);
+        return;
+    }
+
+    let path = crate::dhan_universe::mapping_artifact_path(date_ist);
+
+    if path.exists() {
+        metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "already_present").increment(1);
+        tracing::info!(
+            path = %path.display(),
+            "live universe: today's mapping artifact is already on disk — no wait needed"
+        );
+        return;
+    }
+
+    // The rider is the only writer. With it disabled nobody will ever produce
+    // the artifact, so waiting would burn the full deadline to reach the same
+    // fallback. Fail fast and say why.
+    if !cfg.enabled {
+        metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "rider_disabled").increment(1);
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            path = %path.display(),
+            "live universe: master sourcing is REQUESTED but [dhan_universe] enabled = false, \
+             so nothing will ever write today's mapping. Not waiting — the lane will subscribe \
+             the 4 index SIDs. Enable the rider or turn master sourcing off; the two flags \
+             disagree."
+        );
+        return;
+    }
+
+    tracing::info!(
+        path = %path.display(),
+        deadline_secs = MAPPING_WAIT_DEADLINE_SECS,
+        "live universe: today's mapping artifact is not written yet — waiting for the daily \
+         rider before subscribing, so the lane does not lose the boot race and collapse to 4 \
+         instruments"
+    );
+
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(MAPPING_WAIT_DEADLINE_SECS);
+    let interval = std::time::Duration::from_millis(MAPPING_POLL_INTERVAL_MS);
+
+    while started.elapsed() < deadline {
+        tokio::time::sleep(interval).await;
+        if path.exists() {
+            metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "became_ready").increment(1);
+            tracing::info!(
+                waited_secs = started.elapsed().as_secs_f64(),
+                path = %path.display(),
+                "live universe: mapping artifact is ready — subscribing the widened set"
+            );
+            return;
+        }
+    }
+
+    metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "timed_out").increment(1);
+    tracing::error!(
+        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+        waited_secs = started.elapsed().as_secs_f64(),
+        path = %path.display(),
+        "live universe: the daily rider did not produce today's mapping within \
+         {MAPPING_WAIT_DEADLINE_SECS}s. Subscribing the 4 index SIDs for this session. The \
+         rider keeps retrying, but the lane reads the artifact once at boot — so this session \
+         stays at 4 instruments until a restart."
+    );
 }

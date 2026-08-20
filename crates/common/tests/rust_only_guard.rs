@@ -141,6 +141,85 @@ fn stale_entries(allowlist: &[&str], tracked: &[String]) -> Vec<String> {
 /// terraform templates, plus the extension-less tracked bash scripts under
 /// `scripts/git-hooks/` (pre-push / pre-commit / commit-msg — hostile
 /// review round 1). `.py` and `.md` are excluded by construction.
+/// Files DELIBERATELY excluded from the invocation scan.
+///
+/// # Why this list is an exclusion list and not an inclusion list
+///
+/// This guard decided for a year by asking "is this one of the file types we
+/// listed?". That question has now been wrong SIX times, always the same way:
+/// `.cargo/config.toml` (the linker), `pip` as an installer rather than the
+/// interpreter, `GNUmakefile` shadowing `Makefile`, `.args([..])` spawn form,
+/// `.config/nextest.toml` (bite-proven), and `.githooks/` (a hooks path
+/// `core.hooksPath` makes executable, outside the enumerated
+/// `scripts/git-hooks/` prefix).
+///
+/// Each fix added one more name. Each time, the NEXT unlisted class stayed
+/// invisible. Six repetitions of the same failure is not six mistakes — it is
+/// one wrong question, asked six times.
+///
+/// So the question is inverted. The scan now covers EVERY tracked file, and
+/// this list is the small, named, justified set that opts out. A new file
+/// class arriving in the repo is scanned by default rather than ignored by
+/// default, which is the only shape that can be right about files nobody has
+/// thought of yet.
+///
+/// # What is safe to exclude, and why
+///
+/// * **Prose** (`.md`) — 1,084 files that legitimately DISCUSS banned runtimes:
+///   migration provenance, vendor API references, dated audit history. The
+///   rust-only lock's own §0 names these as deliberately retained. Scanning
+///   them would produce a thousand false positives on day one and the guard
+///   would be disabled within a week, which is worse than the gap.
+/// * **Rust** (`.rs`) — not unscanned, scanned DIFFERENTLY: the spawn-literal
+///   scan covers `Command::new`/`.arg`/`.args`/`run_with_timeout` there, and a
+///   plain token scan would fire on this very file, which must name the tokens
+///   in order to ban them.
+/// * **Lockfiles** (`.lock`) — machine-generated dependency graphs. Package
+///   NAMES legitimately contain banned substrings; nothing in them executes.
+/// * **This guard's own sources** — they must contain the tokens to ban them.
+///
+/// Everything else — every extension, every extension-less file, every
+/// directory, including ones that do not exist yet — is scanned.
+fn is_excluded_from_invocation_scan(path: &str) -> bool {
+    // Prose. See the docblock: a thousand legitimate mentions.
+    if path.ends_with(".md") {
+        return true;
+    }
+    // Rust is scanned by the spawn-literal pass instead.
+    if path.ends_with(".rs") {
+        return true;
+    }
+    // Machine-generated dependency graphs. Excluded from the TOKEN scan
+    // because a lockfile is not a script — but see
+    // `native_build_toolchain_only_shrinks` below, which scans it for a
+    // different and real hazard.
+    //
+    // CORRECTED 2026-08-20 (SCOPE FIX #8). This exclusion used to say
+    // "nothing executes from them", and that was false in exactly the way the
+    // 2026-08-01 `pip` miss was false: the lockfile does not execute, but it
+    // NAMES crates whose `build.rs` does. `aws-lc-sys` declares `cmake` as a
+    // build dependency, so a clean build drives CMake — a separate scripting
+    // language — to compile a C library. A comment asserting a hazard cannot
+    // exist is how the previous five misses each survived.
+    if path.ends_with(".lock") {
+        return true;
+    }
+    // Binary or opaque payloads — a token match would be meaningless.
+    for ext in [
+        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".woff", ".woff2", ".ttf", ".otf", ".zip",
+        ".gz", ".bin", ".wasm",
+    ] {
+        if path.ends_with(ext) {
+            return true;
+        }
+    }
+    false
+}
+
+/// LEGACY inclusion predicate, retained ONLY as the positive half of the
+/// self-test: every type it ever listed must still be scanned under the
+/// inversion above. If a future edit narrows the exclusion list wrongly, the
+/// self-test catches it by replaying the historical inclusion set.
 fn is_invocation_scan_target(path: &str) -> bool {
     path.ends_with(".sh")
         || path.ends_with(".yml")
@@ -185,6 +264,20 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path.ends_with(".xml")
         || path.ends_with(".alloy")
         || path.ends_with(".json")
+        // 2026-08-19 SCOPE FIX #8 — CONFIG FILES THAT CAN CARRY COMMANDS.
+        // `.conf` was structurally invisible: not an extension here, and
+        // config files carry no shebang so the first-line fallback misses
+        // them too. `deploy/aws/sysctl/99-tickvault-net.conf` is inert today
+        // (sysctl key=value only), but plenty of `.conf` formats — systemd
+        // units, supervisor, cron.d — take an executable command line, and
+        // "it happens to be inert right now" is not a scan boundary.
+        //
+        // `.service`/`.timer` are enumerated for the same reason: this repo
+        // SHIPS `deploy/systemd/tickvault.service`, whose ExecStart is a
+        // command line, and it was equally unscanned.
+        || path.ends_with(".conf")
+        || path.ends_with(".service")
+        || path.ends_with(".timer")
         // 2026-08-14 SCOPE FIX #7 — MAKE'S OTHER NAMES. The check was
         // `path == "Makefile" || path.ends_with("/Makefile")`, case-SENSITIVE
         // and single-name. GNU make's search order is `GNUmakefile`,
@@ -232,6 +325,31 @@ fn is_invocation_scan_target(path: &str) -> bool {
         || path.ends_with("/.cargo/config.toml")
         || path == "Cargo.toml"
         || path.ends_with("/Cargo.toml")
+        // 2026-08-19 SCOPE FIX #9 — TOOL CONFIGS UNDER `.config/`, PROVEN
+        // EXPLOITABLE, NOT THEORETICAL.
+        //
+        // The row above scoped to the cargo manifests "specifically rather
+        // than all `.toml`". Sound reasoning, incomplete enumeration: it
+        // listed the two TOMLs its author knew executed something.
+        // `.config/nextest.toml` is a third. nextest supports
+        // `[script.setup] command = ["...", "-c", "..."]`, which the test
+        // runner EXECUTES on every `cargo nextest` invocation — including in
+        // CI, on every PR.
+        //
+        // This was demonstrated, not reasoned about: adding
+        // `[script.setup] command = ["python3", "-c", "print(1)"]` to
+        // `.config/nextest.toml` left this guard reporting 12/12 GREEN. An
+        // interpreter could have run on every test invocation in the repo
+        // whose single loudest rule forbids exactly that.
+        //
+        // `.config/` is enumerated as a DIRECTORY rather than by filename,
+        // because the failure mode being closed is precisely that filenames
+        // get enumerated one at a time — `.config/` is where tools put
+        // configs, so the next tool that lands there is covered on arrival
+        // instead of after the next audit. Prose TOMLs live in `config/` and
+        // `quality/`, not `.config/`, so the false-positive concern the row
+        // above raises does not apply here.
+        || path.starts_with(".config/")
 }
 
 /// Does this file's FIRST LINE select an interpreter to execute it?
@@ -328,10 +446,44 @@ fn banned_tokens() -> Vec<String> {
     tokens
 }
 
+/// Strips shell quoting so a token split across quotes still matches.
+///
+/// 2026-08-19 — EVASION HOLE, found by planting it. `I=pyt"hon"3` followed by
+/// `$I -c ...` executes the banned runtime, and the guard passed 12/12 on it:
+/// the file WAS scanned, but the literal never appears contiguously, so string
+/// matching cannot see it.
+///
+/// This is a different class from scope holes #1-#5. Those were files the
+/// guard never opened; this one it read and could not recognise. Removing `"`
+/// and `'` before matching closes the whole family of split-literal forms
+/// (`pyt"hon"3`, `'py'thon3`, `py""thon3`) for one pass over the line.
+fn strip_shell_quotes(line: &str) -> String {
+    line.chars().filter(|c| *c != '"' && *c != '\'').collect()
+}
+
+/// Does this line invoke a banned runtime?
+///
+/// # Threat model — stated, because an unstated one gets assumed to be total
+///
+/// This guard PREVENTS: accidental reintroduction, a dependency quietly
+/// pulling an interpreter in, a vendored script arriving with the rest of a
+/// change, and now split-literal obfuscation.
+///
+/// It does NOT prevent: a determined author who wants the runtime anyway.
+/// `$(echo cHl0aG9uMw== | base64 -d)`, `${X}${Y}` assembled from two
+/// variables, or a name read from a file all execute the same runtime and no
+/// static string scan can decide the general case — that reduces to knowing
+/// what a shell expands to, which is undecidable.
+///
+/// Saying so is the point. A guard whose limits are unstated gets read as
+/// airtight, and "the guard is green" then stands in for "the codebase is
+/// clean" — which is precisely the false-OK this repo forbids everywhere
+/// else. The guard is a ratchet against drift, not a sandbox.
 fn line_has_banned_token(line: &str) -> bool {
+    let unquoted = strip_shell_quotes(line);
     banned_tokens()
         .iter()
-        .any(|tok| line_has_token(line, tok.as_str()))
+        .any(|tok| line_has_token(line, tok.as_str()) || line_has_token(&unquoted, tok.as_str()))
 }
 
 fn line_has_token(line: &str, tok: &str) -> bool {
@@ -450,7 +602,20 @@ fn stale_invocation_sites(files: &[(String, String)], allowlist: &[&str]) -> Vec
 // in what the scan LOOKED AT, not in what it banned.
 fn extract_spawn_literals(content: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for marker in ["Command::new(\"", ".arg(\""] {
+    // 2026-08-18 SCOPE FIX — WRAPPER FUNCTIONS (closes HONEST LIMIT 2's literal half).
+    //
+    // The marker set was `Command::new("` and `.arg("`, so a spawn routed through a
+    // helper was invisible even when the program name was a plain literal:
+    // `run_with_timeout("python3", ["-c", "…"])` contains NEITHER marker. That is
+    // not hypothetical — the wrapper already exists in the MCP crate and is called
+    // four times. An inline `-c` payload also dodges the file-extension ban AND the
+    // shebang fallback, so this was the one shape with no backstop at all.
+    //
+    // Listing the wrapper by name closes the literal form. A wrapper NOT listed here
+    // remains invisible — that residual is real and is why HONEST LIMIT 2 above stays
+    // on the record rather than being deleted. Adding a new wrapper is now a
+    // deliberate act, which is the most a string scan can honestly promise.
+    for marker in ["Command::new(\"", ".arg(\"", "run_with_timeout(\""] {
         let mut rest = content;
         while let Some(i) = rest.find(marker) {
             let after = &rest[i + marker.len()..];
@@ -460,25 +625,78 @@ fn extract_spawn_literals(content: &str) -> Vec<String> {
             rest = &rest[i + marker.len()..];
         }
     }
-    // Plural form: take EVERY string literal inside the `[...]` group.
-    let mut rest = content;
-    while let Some(i) = rest.find(".args([") {
-        let after = &rest[i + ".args([".len()..];
-        // Bound the scan at the closing bracket so a later, unrelated literal
-        // on a following line is never attributed to this spawn.
-        let group = after.find(']').map_or(after, |end| &after[..end]);
-        let mut tail = group;
-        while let Some(open) = tail.find('"') {
-            let lit = &tail[open + 1..];
-            match lit.find('"') {
-                Some(close) => {
-                    out.push(lit[..close].to_string());
-                    tail = &lit[close + 1..];
-                }
-                None => break,
-            }
+    // 2026-08-19 SCOPE FIX #7 — THE SLICE-LITERAL WRAPPER (the fifth miss).
+    //
+    // HONEST LIMIT 2 above says a wrapper not named in the marker list "remains
+    // invisible", and calls that residual theoretical. It was not. A SECOND
+    // wrapper exists and has the whole time:
+    //
+    //     // crates/app/src/bin/tv_doctor.rs
+    //     fn run_cmd(args: &[&str]) -> Result<String, String> {
+    //         let output = Command::new(args[0]).args(&args[1..])
+    //
+    // called five times as `run_cmd(&["curl", "-s", …])`. That shape matches
+    // NOTHING: not `Command::new("` (the program is `args[0]`, a variable), not
+    // `.arg("`, not `.args([` (the slice is a bare `&[…]` ARGUMENT, not a
+    // `.args([…])` call), not `run_with_timeout("`. It also adds no new
+    // non-literal spawn site, so `NON_LITERAL_SPAWN_BUDGET` stays put and its
+    // shrink-only test still passes. `run_cmd(&["python3", "-c", "…"])` was
+    // fully green, and an inline `-c` payload dodges BOTH remaining backstops
+    // (the file-extension ban and the shebang fallback).
+    //
+    // The fix does NOT enumerate one more wrapper name — that is what has been
+    // wrong five times running. It scans EVERY `(&[…])` slice-literal group in
+    // the file. That is deliberately broader than "spawns": a bare
+    // `&["python3", …]` string literal has no legitimate purpose anywhere in
+    // this workspace, so failing on it regardless of the surrounding call is
+    // the stronger and simpler guarantee.
+    for marker in [".args([", "(&["] {
+        let mut rest = content;
+        while let Some(i) = rest.find(marker) {
+            let after = &rest[i + marker.len()..];
+            out.extend(literals_in_group(after));
+            rest = &rest[i + marker.len()..];
         }
-        rest = &rest[i + ".args([".len()..];
+    }
+    out
+}
+
+/// Every string literal in a `[...]` group, stopping at the group's closing
+/// bracket.
+///
+/// The bracket search is STRING-AWARE, which the previous inline version was
+/// not: it bounded the group at the first `]` anywhere, so a payload
+/// containing one — `.args(["sh", "-c", "a[1]"])` — truncated the group early
+/// and silently dropped every literal after it. A scanner that stops reading
+/// halfway through the exact payload an attacker controls is worse than no
+/// scanner, because it reports clean.
+fn literals_in_group(after: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = after.char_indices();
+    let mut in_string = false;
+    let mut lit_start = 0_usize;
+    let mut escaped = false;
+    while let Some((idx, ch)) = chars.next() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                out.push(after[lit_start..idx].to_string());
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                lit_start = idx + 1;
+            }
+            // Only a bracket OUTSIDE a string ends the group.
+            ']' => break,
+            _ => {}
+        }
     }
     out
 }
@@ -742,14 +960,19 @@ fn load_invocation_scan_files() -> Vec<(String, String)> {
     git_ls_files(&["."])
         .into_iter()
         .filter_map(|p| {
-            if is_invocation_scan_target(&p) {
-                let content = std::fs::read_to_string(root.join(&p))
-                    .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{p}`: {e}"));
-                return Some((p, content));
+            // INVERTED 2026-08-19: scan everything tracked unless it is on the
+            // named exclusion list. Previously this asked "is p one of the
+            // types we listed?", which was wrong six times in the same
+            // direction. A file class nobody thought of is now scanned by
+            // default rather than ignored by default.
+            if is_excluded_from_invocation_scan(&p) {
+                return None;
             }
-            // Content-selected: unreadable => not a shebang script => skip.
+            // Unreadable => binary or vanished => nothing to scan. Never a
+            // panic: the tree legitimately contains binary assets, and a guard
+            // that crashes on one is a guard someone disables.
             let content = std::fs::read_to_string(root.join(&p)).ok()?;
-            has_interpreter_shebang(&content).then_some((p, content))
+            Some((p, content))
         })
         .collect()
 }
@@ -843,6 +1066,62 @@ fn no_new_banned_invocations() {
         "SHRINK THE RATCHET: these INVOCATION_SITE_ALLOWLIST entries no longer carry a \
          non-comment the banned interpreter token (file cleaned or deleted): {stale:?}. Remove the entries \
          from crates/common/tests/rust_only_guard.rs in the same PR."
+    );
+}
+
+/// (d2) NO tracked EXECUTABLE may be excluded from the invocation scan.
+///
+/// 2026-08-19, found by the COMPILER: `has_interpreter_shebang` — SCOPE FIX #5,
+/// described above as "THE STRUCTURAL ONE", the fix that was supposed to stop
+/// this guard enumerating extensions forever — had **zero call sites** and was
+/// a `dead_code` warning.
+///
+/// It was not silently broken; it was SUPERSEDED. The same-day inversion of
+/// `load_invocation_scan_files` ("scan everything tracked unless excluded")
+/// covers extension-less executables by default, which is strictly stronger
+/// than asking each file for its shebang. So the enforcement was real and the
+/// function was redundant.
+///
+/// But a dead function whose doc-comment describes live enforcement is exactly
+/// the class this repo has recorded twice (`scan_silence` as a "cold-path
+/// sweep" with no callers; a "boot HALTS" that could not fire). Deleting it
+/// would also throw away the one guarantee the inversion does NOT make: the
+/// inversion is only as good as its EXCLUSION list, and nothing stops that
+/// list growing to cover a directory that holds an executable.
+///
+/// So the function gets the job the inversion cannot do — proving the
+/// exclusion list never hides something the kernel would execute. Adding
+/// `tools/` to `is_excluded_from_invocation_scan` while `tools/deploy` starts
+/// `#!/usr/bin/env <interpreter>` fails HERE, and nowhere else.
+#[test]
+fn every_tracked_executable_is_inside_the_invocation_scan() {
+    let root = repo_root();
+    let mut hidden: Vec<String> = Vec::new();
+    let mut executables = 0_usize;
+    for path in git_ls_files(&["."]) {
+        // Unreadable => binary => not a shebang script.
+        let Ok(content) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        if !has_interpreter_shebang(&content) {
+            continue;
+        }
+        executables += 1;
+        if is_excluded_from_invocation_scan(&path) {
+            hidden.push(path);
+        }
+    }
+    // Anti-vacuity, the shape this test needs: if NOTHING has a shebang the
+    // loop never runs and the emptiness assert below is trivially true. The
+    // tree has ~99 shebang files; 20 leaves headroom and still fails loudly
+    // if the enumeration collapses.
+    assert!(
+        executables > 20,
+        "RUST-ONLY GUARD IS BLIND: only {executables} tracked file(s) carry a shebang.          Expected >20. `git ls-files` or the read is broken, and this test is          enforcing nothing."
+    );
+    assert!(
+        hidden.is_empty(),
+        "RUST-ONLY VIOLATION: tracked executable(s) {hidden:?} carry a `#!` line but are          EXCLUDED from the invocation scan. The kernel will run them and this guard          cannot see what they invoke. Narrow is_excluded_from_invocation_scan() rather          than adding an allowlist entry."
     );
 }
 
@@ -1027,6 +1306,82 @@ fn allowlists_are_pinned_at_zero() {
 
 /// (d) The scanner detects a synthetic NEW .py / stale entry / new site —
 /// proving the guard is non-vacuous (injected-list pure-fn design).
+/// The inversion must keep scanning everything the ENUMERATION ever listed.
+///
+/// This replays the historical inclusion set against the new exclusion
+/// predicate. If someone later widens the exclusions — "`.toml` is all config,
+/// let's skip it" — this fails, because every one of those types was added to
+/// the old list only after a real blind spot was found in it.
+///
+/// It also pins the classes that were blind at each of the six holes, so a
+/// regression to any individual past failure is caught by name.
+#[test]
+fn inversion_still_scans_everything_the_enumeration_ever_listed() {
+    for path in [
+        // the original enumerated set
+        "scripts/x.sh",
+        ".github/workflows/x.yml",
+        "deploy/x.yaml",
+        "deploy/aws/terraform/user-data.sh.tftpl",
+        "deploy/aws/terraform/main.tf",
+        "Makefile",
+        "GNUmakefile",
+        "makefile",
+        "build/x.mk",
+        "Cargo.toml",
+        ".cargo/config.toml",
+        "deploy/x.conf",
+        "deploy/systemd/tickvault.service",
+        "deploy/systemd/tickvault.timer",
+        "scripts/tv-tunnel/com.tickvault.tunnel.plist",
+        "x.json",
+        "x.xml",
+        // the six holes, by the exact path class each was found in
+        ".config/nextest.toml", // #5, bite-proven
+        ".githooks/pre-commit", // #6, bite-proven
+        // classes NEVER enumerated — the whole point of inverting
+        "Justfile",
+        "Taskfile.yml",
+        ".envrc",
+        ".tool-versions",
+        "lefthook.yml",
+        ".pre-commit-config.yaml",
+        "tools/deploy", // extension-less executable
+        "quality/x.toml",
+        "deploy/schema.sql",
+    ] {
+        assert!(
+            !is_excluded_from_invocation_scan(path),
+            "`{path}` must be SCANNED. Excluding it re-opens the \
+             decide-by-filename failure that has now been wrong six times."
+        );
+    }
+}
+
+/// The exclusions are deliberate and must stay small. Each entry here is
+/// justified in `is_excluded_from_invocation_scan`'s docblock; this pins that
+/// the set has not silently grown.
+#[test]
+fn only_the_justified_classes_are_excluded() {
+    for path in [
+        "docs/anything.md",
+        "crates/common/src/lib.rs",
+        "Cargo.lock",
+        "assets/logo.png",
+    ] {
+        assert!(
+            is_excluded_from_invocation_scan(path),
+            "`{path}` is a justified exclusion and must stay excluded"
+        );
+    }
+    // And the inverse: a `.md`-LOOKING path that is not prose must not slip
+    // through on a suffix match alone.
+    assert!(
+        !is_excluded_from_invocation_scan("scripts/build.md.sh"),
+        "suffix matching must not be fooled by a compound name"
+    );
+}
+
 #[test]
 fn guard_self_test() {
     // New .py detection.
@@ -1265,6 +1620,23 @@ fn guard_self_test() {
         "self-test: doc-comment prose must never false-positive (narrow-scan design)"
     );
 
+    // ---- SCOPE FIX (2026-08-18): spawn routed through a WRAPPER function.
+    //
+    // Both directions are asserted, and the second matters more than the first:
+    // the wrapper's four real callers pass `bash` / `git` / `docker` / `aws`, so a
+    // marker that fired on those would be deleted by the next reader as noise, and
+    // the hole would reopen permanently. A guard is only kept if it is quiet when
+    // it should be quiet.
+    assert_eq!(
+        rust_spawn_violations(&format!("let out = run_with_timeout(\"{t}3\", &args);")),
+        vec![format!("{t}3")],
+        "self-test: an interpreter spawned through the wrapper must be detected"
+    );
+    assert!(
+        rust_spawn_violations("let out = run_with_timeout(\"bash\", &args);").is_empty(),
+        "self-test: the wrapper's real callers must never false-positive"
+    );
+
     // ---- SCOPE FIX #5: inline-JavaScript counting + budget drift.
     let wf = "      - uses: actions/github-script@v7\n        with:\n          script: |\n            await x();\n";
     assert_eq!(count_github_script_uses(wf), 1);
@@ -1312,5 +1684,461 @@ fn guard_self_test() {
         stale_invocation_sites(&files, &site_allow),
         vec!["scripts/went_clean.sh".to_string()],
         "self-test: a cleaned/deleted site entry must be detected as stale"
+    );
+}
+
+// ============================================================================
+// SCOPE FIX (2026-08-18) — the two surfaces the 2026-08-14 audit left UNDEFINED
+// ============================================================================
+//
+// That audit closed four holes and RECORDED two it did not close. Recording a
+// hole is honest, but it is not a control: both stayed invisible to every gate,
+// so a new instance of either would land with no signal at all.
+//
+// Neither is made impossible here — a string scan cannot resolve a variable, and
+// vendor CI actions are genuinely not our source. What changes is the failure
+// mode: an UNDEFINED surface grows silently, a PINNED one fails the build. That
+// is the whole of the claim, and it is deliberately smaller than "fixed".
+
+/// Spawns whose program name is a VARIABLE — `Command::new(program)`.
+///
+/// HONEST LIMIT 1 explains why these cannot be resolved statically. What CAN be
+/// done is deny them room to multiply: the exact count per file is pinned, so a
+/// NEW variable-spawn site fails the build and has to be argued for in review.
+/// The six that exist launch operator tooling (docker / git / aws CLIs).
+const NON_LITERAL_SPAWN_BUDGET: &[(&str, usize)] = &[
+    ("crates/app/src/bin/tv_doctor.rs", 1),
+    ("crates/app/src/infra.rs", 4),
+    ("crates/tickvault-logs-mcp/src/tools.rs", 1),
+];
+
+/// Third-party GitHub Actions — every one a `node20` JavaScript runtime.
+///
+/// These run in CI, not in the product, and they are vendor code rather than
+/// ours, which is why the rust-only lock never banned them. But "not banned" had
+/// quietly become "not looked at". Pinning the SET — never the version, since
+/// tags and SHAs rotate legitimately — means a NEW vendor runtime entering CI
+/// fails the build instead of arriving unannounced.
+/// Crates in the resolved graph whose `build.rs` drives a NON-RUST build
+/// system during `cargo build`.
+///
+/// SCOPE FIX #8 (2026-08-20). Every prior fix asked "what does this repo's own
+/// source execute?". None asked what our DEPENDENCIES execute while being
+/// compiled. `aws-lc-sys` — reached through `aws-lc-rs`, the TLS provider
+/// CLAUDE.md mandates — declares `cmake` as a build dependency and drives
+/// CMake (and, on some targets, NASM) to compile the AWS-LC **C** library on
+/// every clean build, including the `aarch64-unknown-linux-musl` deploy
+/// cross-compile.
+///
+/// # This is a BUILD-time surface, not a runtime one
+///
+/// Nothing non-Rust runs in production: all thirteen Lambdas declare
+/// `provided.al2023` with a `bootstrap` handler, and the systemd unit runs
+/// `/opt/tickvault/bin/tickvault`. So this is bounded rather than banned —
+/// banning it would mean dropping the mandated TLS provider.
+///
+/// # Why a budget rather than a ban
+///
+/// Same shape as `CI_ACTION_ALLOWLIST`: the set may only SHRINK. A NEW native
+/// build system entering the dependency graph — a vendored C++ library, a Go
+/// toolchain, an autotools crate — now fails the build instead of arriving
+/// unannounced in a lockfile nobody reads.
+const NATIVE_BUILD_TOOLCHAIN_BUDGET: &[&str] = &["cc", "cmake", "pkg-config"];
+
+/// Package names declared in `Cargo.lock`, in file order.
+fn locked_package_names(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("name = \"")
+            && let Some(name) = rest.strip_suffix('"')
+        {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// BITE-PROOF for SCOPE FIX #8.
+///
+/// The real-tree test below cannot be bite-proven by planting a package in
+/// `Cargo.lock`: `cargo test` validates and rewrites the lockfile before the
+/// test binary runs, so the plant is gone by the time it is read. Discovered
+/// by trying it. So the DETECTION LOGIC is proven here against fixtures
+/// instead — which is stronger anyway, since it pins the parser too.
+#[test]
+fn native_build_toolchain_self_test() {
+    // The parser must find names, and only names.
+    let lock = "\
+[[package]]\n\
+name = \"serde\"\n\
+version = \"1.0.0\"\n\
+\n\
+[[package]]\n\
+name = \"cmake\"\n\
+version = \"0.1.57\"\n";
+    let names = locked_package_names(lock);
+    assert_eq!(names, vec!["serde".to_string(), "cmake".to_string()]);
+
+    // A version line must never be mistaken for a name.
+    assert!(
+        !locked_package_names("version = \"cmake\"\n")
+            .iter()
+            .any(|n| n == "cmake"),
+        "only `name = ` lines are package names"
+    );
+
+    // THE BITE. A new native build system in the graph must be detected as
+    // new — this is the assertion that would have caught `cmake` arriving
+    // unannounced, and it is what the real-tree test does against the live
+    // lockfile.
+    let present = ["cc", "cmake", "bindgen"];
+    let new: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|b| !NATIVE_BUILD_TOOLCHAIN_BUDGET.contains(b))
+        .collect();
+    assert_eq!(
+        new,
+        vec!["bindgen"],
+        "a native build system outside the budget must be reported as NEW"
+    );
+
+    // And the shrink half: a budget entry that has left the graph must be
+    // reported, so the ratchet cannot outlive what it bounds.
+    let present_after_removal = ["cc", "pkg-config"];
+    let gone: Vec<&str> = NATIVE_BUILD_TOOLCHAIN_BUDGET
+        .iter()
+        .copied()
+        .filter(|b| !present_after_removal.contains(b))
+        .collect();
+    assert_eq!(
+        gone,
+        vec!["cmake"],
+        "a budget entry no longer in the graph must be reported as stale"
+    );
+}
+
+/// (h) The native build toolchain the LOCKFILE pulls in may only shrink.
+#[test]
+fn native_build_toolchain_only_shrinks() {
+    assert_sorted_unique(
+        NATIVE_BUILD_TOOLCHAIN_BUDGET,
+        "NATIVE_BUILD_TOOLCHAIN_BUDGET",
+    );
+    let root = repo_root();
+    let lock = std::fs::read_to_string(root.join("Cargo.lock"))
+        .expect("rust_only_guard: Cargo.lock must exist — it is the pinned graph");
+    let names = locked_package_names(&lock);
+
+    // Anti-vacuity: a parser that returns nothing makes every assertion below
+    // trivially true, which is how a guard reports green while enforcing
+    // nothing. The graph has hundreds of packages.
+    assert!(
+        names.len() > 100,
+        "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from Cargo.lock. \
+         The lockfile format changed or the read failed, and this guard is \
+         enforcing nothing.",
+        names.len()
+    );
+
+    // Every native-build-system driver we know how to name. Absence from this
+    // list is not safety — it is the reason the list is a LIST and not a
+    // guess, and adding to it is how the next one gets caught.
+    const KNOWN_NATIVE_BUILDERS: &[&str] = &[
+        "autotools",
+        "bindgen",
+        "cc",
+        "cmake",
+        "cxx-build",
+        "meson-next",
+        "nasm-rs",
+        "pkg-config",
+        "system-deps",
+        "vcpkg",
+    ];
+
+    let mut present: Vec<&str> = KNOWN_NATIVE_BUILDERS
+        .iter()
+        .copied()
+        .filter(|b| names.iter().any(|n| n == b))
+        .collect();
+    present.sort_unstable();
+
+    let new: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|b| !NATIVE_BUILD_TOOLCHAIN_BUDGET.contains(b))
+        .collect();
+    assert!(
+        new.is_empty(),
+        "RUST-ONLY VIOLATION: new non-Rust build system(s) {new:?} entered the \
+         dependency graph. Their build scripts EXECUTE during `cargo build`, \
+         including the deploy cross-compile. Remove the dependency, or record \
+         it in NATIVE_BUILD_TOOLCHAIN_BUDGET with the reason it is unavoidable."
+    );
+
+    let gone: Vec<&str> = NATIVE_BUILD_TOOLCHAIN_BUDGET
+        .iter()
+        .copied()
+        .filter(|b| !present.contains(b))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "SHRINK THE RATCHET: {gone:?} no longer appear in Cargo.lock. Remove \
+         them from NATIVE_BUILD_TOOLCHAIN_BUDGET in the same PR — a budget that \
+         outlives what it bounds is a permission nobody is using."
+    );
+}
+
+const CI_ACTION_ALLOWLIST: &[&str] = &[
+    "Swatinem/rust-cache",
+    "actions/cache",
+    "actions/cache/restore",
+    "actions/cache/save",
+    "actions/checkout",
+    "actions/download-artifact",
+    "actions/github-script",
+    "actions/upload-artifact",
+    "anthropics/claude-code-action",
+    "aws-actions/configure-aws-credentials",
+    "dtolnay/rust-toolchain",
+    "hashicorp/setup-terraform",
+    "peter-evans/create-pull-request",
+    "taiki-e/install-action",
+];
+
+/// Count `Command::new(<not a quote>)` — i.e. a variable program name.
+/// Comment lines are excluded so prose describing the shape never counts.
+fn non_literal_spawn_count(content: &str) -> usize {
+    const M: &str = "Command::new(";
+    content
+        .lines()
+        // `is_comment_line` is the SHELL/YAML `#` form and is wrong here — this
+        // scans Rust. Using it silently counted every `///` line that merely
+        // DESCRIBES the shape. Caught by this module's own self-test.
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .map(|line| {
+            let mut n = 0usize;
+            let mut rest = line;
+            while let Some(i) = rest.find(M) {
+                let after = &rest[i + M.len()..];
+                // A quote means the program is a LITERAL, already covered by the
+                // spawn scan. The BACKSLASH-escaped form matters just as much: a
+                // guard file carries `"Command::new(\""` as its own scan marker,
+                // and reading that as a variable spawn would make every scanner
+                // in this repo look like a violation.
+                if !(after.starts_with('"') || after.starts_with("\\\"")) {
+                    n += 1;
+                }
+                rest = after;
+            }
+            n
+        })
+        .sum()
+}
+
+/// Action names referenced by `uses:`, with the version/SHA stripped.
+/// Local (`./…`) and container (`docker://…`) steps are not vendor runtimes.
+fn ci_action_names(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if is_comment_line(trimmed) {
+            continue;
+        }
+        // Both real YAML forms must count: `- uses: foo@v1` (the step's first
+        // key, so it carries the list dash) and a bare `uses:` (the step began
+        // with `- name:`). Handling only the second silently under-counts, and
+        // an under-counting allowlist is worse than none — it reads as full
+        // coverage while a whole syntax form walks past it.
+        let trimmed = trimmed
+            .strip_prefix("- ")
+            .map_or(trimmed, |rest| rest.trim_start());
+        let Some(value) = trimmed.strip_prefix("uses:") else {
+            continue;
+        };
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        if value.is_empty() || value.starts_with("./") || value.starts_with("docker://") {
+            continue;
+        }
+        out.push(value.split('@').next().unwrap_or(value).to_string());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+#[test]
+fn non_literal_spawn_sites_only_shrink() {
+    let root = repo_root();
+    let mut counted: Vec<(String, usize)> = Vec::new();
+    for path in git_ls_files(&["*.rs"]) {
+        // PRODUCTION source only. Test files legitimately carry this shape as
+        // DATA: scan markers in string literals, and raw-string fixtures like
+        // `r#"Command::new(program)"#` that exist precisely to prove a scanner
+        // ignores non-literals. Counting those would make the guards themselves
+        // the repo's top violators and turn this budget into noise — and a
+        // budget that reads as noise is one the next reader deletes.
+        if !path.contains("/src/") {
+            continue;
+        }
+        let content = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+        let n = non_literal_spawn_count(&content);
+        if n > 0 || NON_LITERAL_SPAWN_BUDGET.iter().any(|(p, _)| *p == path) {
+            counted.push((path, n));
+        }
+    }
+    let (over, under) = github_script_budget_drift(&counted, NON_LITERAL_SPAWN_BUDGET);
+    assert!(
+        over.is_empty(),
+        "RUST-ONLY VIOLATION: a NEW variable-program spawn site appeared {over:?} as \
+         (path, actual, budget). A spawn through a variable cannot be checked by any \
+         string scan — it is exactly the shape that can launch another runtime \
+         unseen. Prefer a literal program name; if the variable is unavoidable, \
+         validate it against an allowlist AT THE CALL SITE and raise this budget in \
+         the same PR with that justification."
+    );
+    assert!(
+        under.is_empty(),
+        "STALE BUDGET: fewer variable-program spawns than pinned {under:?} as \
+         (path, actual, budget). Good news — lower NON_LITERAL_SPAWN_BUDGET in the \
+         same PR so the ratchet keeps its grip."
+    );
+}
+
+#[test]
+fn ci_actions_are_pinned_to_the_allowlist() {
+    assert_sorted_unique(CI_ACTION_ALLOWLIST, "CI_ACTION_ALLOWLIST");
+    let root = repo_root();
+    let mut seen: Vec<String> = Vec::new();
+    for path in git_ls_files(&[".github/workflows/*.yml", ".github/workflows/*.yaml"]) {
+        let content = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+        seen.extend(ci_action_names(&content));
+    }
+    seen.sort();
+    seen.dedup();
+
+    let added: Vec<&String> = seen
+        .iter()
+        .filter(|a| !CI_ACTION_ALLOWLIST.contains(&a.as_str()))
+        .collect();
+    assert!(
+        added.is_empty(),
+        "NEW third-party CI action(s) {added:?}. Every one is a JavaScript (node20) \
+         runtime executing in our CI with access to the checkout and to secrets. \
+         Adding one is a supply-chain decision, not a workflow detail: pin it to a \
+         full commit SHA rather than a moving tag, then add its NAME here."
+    );
+
+    let stale: Vec<&&str> = CI_ACTION_ALLOWLIST
+        .iter()
+        .filter(|a| !seen.iter().any(|s| s.as_str() == **a))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "STALE ALLOWLIST: pinned CI action(s) no longer used anywhere {stale:?}. \
+         Remove them in the same PR — an allowlist that outlives its entries \
+         silently re-opens room for a vendor runtime to return unnoticed."
+    );
+}
+
+#[test]
+fn scope_fix_2026_08_18_self_test() {
+    // Variable-program detection: the whole point is telling the two apart.
+    assert_eq!(
+        non_literal_spawn_count("let c = Command::new(program);"),
+        1,
+        "self-test: a variable program name must count"
+    );
+    assert_eq!(
+        non_literal_spawn_count("let c = Command::new(\"git\");"),
+        0,
+        "self-test: a literal program name must NOT count — it is already covered"
+    );
+    assert_eq!(
+        non_literal_spawn_count("// we could use Command::new(program) here"),
+        0,
+        "self-test: prose describing the shape must never count"
+    );
+
+    // CI action extraction.
+    assert_eq!(
+        ci_action_names("      - uses: actions/checkout@v7.0.1\n"),
+        vec!["actions/checkout".to_string()],
+        "self-test: the version must be stripped so SHA rotation is not a failure"
+    );
+    assert_eq!(
+        ci_action_names("      - uses: actions/checkout@3d3c42e5aac5\n"),
+        vec!["actions/checkout".to_string()],
+        "self-test: a SHA pin must resolve to the same NAME as a tag pin"
+    );
+    assert!(
+        ci_action_names("      - uses: ./.github/actions/local\n").is_empty(),
+        "self-test: a local composite action is our own code, not a vendor runtime"
+    );
+    assert!(
+        ci_action_names("      # uses: evil/action@v1\n").is_empty(),
+        "self-test: a commented-out action must never count"
+    );
+}
+
+/// BITE-PROOF for SCOPE FIX #7 (2026-08-19) — the slice-literal wrapper.
+///
+/// A scope fix that is not bite-proven is a claim. Every assertion below FAILS
+/// against the pre-fix extractor and PASSES against the current one, so this
+/// test is the difference between "we widened the scan" and "we widened the
+/// scan and it actually catches the shape".
+///
+/// The banned token is assembled at runtime rather than written as a literal,
+/// because this file is scanned by its own siblings and a literal here would
+/// make the guard fail on itself.
+#[test]
+fn scope_fix_2026_08_19_self_test() {
+    let banned = banned_token();
+
+    // (1) THE MISS. `run_cmd(&["<interpreter>", "-c", "…"])` — the real shape
+    // in `tv_doctor.rs`. Matches no marker the pre-fix extractor had: the
+    // program is `args[0]` (a variable, so `Command::new("` never sees it),
+    // and the slice is a bare `&[…]` ARGUMENT, not a `.args([…])` call.
+    let src = format!(r#"run_cmd(&["{banned}", "-c", "print(1)"])"#);
+    assert!(
+        !rust_spawn_violations(&src).is_empty(),
+        "self-test: a slice-literal wrapper call must be CAUGHT — this is the \
+         exact shape that passed green until 2026-08-19"
+    );
+
+    // (2) It generalises. The fix scans EVERY `(&[…])` group, not one more
+    // wrapper name, so a wrapper nobody has written yet is already covered.
+    let unknown = format!(r#"some_future_helper(&["{banned}", "script.x"])"#);
+    assert!(
+        !rust_spawn_violations(&unknown).is_empty(),
+        "self-test: the scan must not depend on the wrapper's NAME — enumerating \
+         names is what has been wrong five times running"
+    );
+
+    // (3) No false positive on a benign slice.
+    assert!(
+        rust_spawn_violations(r#"run_cmd(&["df", "-h", "/data"])"#).is_empty(),
+        "self-test: a benign slice must stay clean, or the first response to \
+         this guard will be to disable it"
+    );
+
+    // (4) The string-aware bracket bound. The old scanner stopped at the FIRST
+    // `]` anywhere, so a payload containing one truncated the group and
+    // silently dropped every literal after it — reporting clean on exactly the
+    // bytes an attacker controls.
+    let nested = format!(r#".args(["sh", "-c", "a[1]", "{banned}"])"#);
+    assert!(
+        !rust_spawn_violations(&nested).is_empty(),
+        "self-test: a `]` INSIDE a string must not end the group early"
+    );
+
+    // (5) An escaped quote must not end a literal early either.
+    let escaped = format!(r#".args(["say \"hi\"", "{banned}"])"#);
+    assert!(
+        !rust_spawn_violations(&escaped).is_empty(),
+        "self-test: an escaped quote inside a literal must not desynchronise \
+         the scanner and hide the literal after it"
     );
 }

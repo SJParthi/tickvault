@@ -288,6 +288,55 @@ QuestDB partition to S3 and the upload failed. Idempotency-key
 
 **Source:** `crates/storage/src/s3_archive.rs` (Wave 2 Item 9.4)
 
+## STORAGE-GAP-05 — disk pressure could not be relieved
+
+**Severity: Critical.** Fires ONCE per pressure episode (edge-latched).
+
+**Trigger:** the data volume is at or above `pressure_high_water_pct` and the
+pressure-archival loop has run out of things it is ALLOWED to reclaim — either
+every partition older than the hard `MIN_HOT_DAYS = 2` floor has already been
+archived and dropped, or the remaining ones could not be verified into S3 and
+were therefore correctly KEPT.
+
+**What this code means, precisely:** the automated response has stopped on
+purpose. It is not a step in a retry — it is the end of what a process is
+permitted to decide. The only partitions left are (a) today's and yesterday's,
+which are still being written to, so exporting-then-dropping them has a window
+in which an arriving tick is lost, or (b) partitions with no verified S3 copy.
+Both are data-loss trades. The operator makes those, not the process.
+
+**Why this is Critical and not High:** the next state is a FULL volume, and a
+full volume stops every writer — ticks, candles, depth and audit alike. The
+failure is not "old data lingers", it is "today's capture stops".
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — the payload names used-%, the
+   high-water mark, passes used, and partitions dropped this episode.
+2. Partitions dropped > 0 but still above high water ⇒ ingest exceeds what a
+   2-day window fits. This is a SIZING problem, not a retention problem.
+3. Partitions dropped == 0 ⇒ check S3 first: `aws s3 ls s3://tv-<env>-cold/questdb-partitions/`
+   and the `partition_archive_audit` table. A verify failure keeps partitions by
+   design, so an S3 outage presents as unrelievable pressure.
+4. `SELECT count() FROM partition_archive_audit WHERE ts > dateadd('h', -24, now())`
+   — the forensic trail of what was verified and dropped.
+
+**Remedy (operator decision — deliberately NOT automated):**
+- **Grow the volume.** gp3 grows ONLINE in one command
+  (`aws ec2 modify-volume --volume-id <id> --size <GB>`, then grow the
+  filesystem). `variables.tf` permits up to 200 GB today. It can NEVER shrink,
+  so growing is the one-way door — size to the measurement, not the fear.
+- **Reduce ingest scope** — the depth pools are the heaviest writers by an
+  order of magnitude (`depth_hot_days`, and the instrument sets themselves).
+
+**What you must NOT do:** lower `MIN_HOT_DAYS` below 2, or hand-drop a
+partition that has no verified S3 copy. The first re-opens the count→drop race
+on a partition that is still being written; the second is the deletion this
+whole chain exists to prevent.
+
+**Source:** `crates/storage/src/disk_pressure.rs` (decision function),
+`crates/app/src/disk_pressure_boot.rs` (the supervised loop),
+`crates/storage/src/partition_archive.rs` (the unchanged verified drop path).
+
 ## DISK-WATCHER-01 — spill disk-health watcher respawned (zero-tick-loss PR-5, G3)
 
 **Trigger:** the spill disk-health watcher task

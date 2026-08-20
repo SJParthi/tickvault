@@ -1130,18 +1130,44 @@ pub const BOOT_STEP_QUESTDB_DDL_TIMEOUT_SECS: u64 = 60;
 /// failure → retry per §4 escalation ladder, not a permanent halt.
 pub const INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS: u64 = 60;
 
-/// Maximum daily-universe size (per rule file §2 + §4 + §15). Boot HALTS
-/// if computed universe size is outside `[MIN_DAILY_UNIVERSE_SIZE,
-/// MAX_DAILY_UNIVERSE_SIZE]`. Sub-PR #11 (boot-time-of-day guard) will
-/// enforce; this PR declares the bound.
+/// Minimum daily-universe size (per rule file §2 + §4 + §15).
+///
+/// ⚠ **CORRECTED 2026-08-19.** This doc read "Boot HALTS if computed universe
+/// size is outside `[MIN_DAILY_UNIVERSE_SIZE, MAX_DAILY_UNIVERSE_SIZE]`" —
+/// which was true of `build_daily_universe()` and stopped being true when that
+/// function was deleted with the Dhan instrument-fetch chain on 2026-07-13.
+/// Neither bound has a production reader today. See the honest note on
+/// `MAX_DAILY_UNIVERSE_SIZE` for what actually bounds the live set.
 pub const MIN_DAILY_UNIVERSE_SIZE: usize = 100;
 
-/// See `MIN_DAILY_UNIVERSE_SIZE`. Raised 400 → 1200 per rule file §31
-/// (operator authorization 2026-06-06) to fit the NIFTY Total Market
-/// stock expansion (~1,000 live SIDs + headroom). Still a boot-time
-/// validation bound only — not a pre-allocation (the aggregator is sized
-/// by the independent `AGGREGATOR_CAPACITY`).
-pub const MAX_DAILY_UNIVERSE_SIZE: usize = 1200;
+/// See `MIN_DAILY_UNIVERSE_SIZE`. Raised 1200 → 25,000 on 2026-08-19 per the
+/// operator's 2026-08-15 authorization in `websocket-connection-scope-lock.md`
+/// ("2026-08-15 — FULL-MODE, FULL-UNIVERSE SUBSCRIPTION SCOPE"), whose own
+/// REJECT list names raising this constant without the lockstep rule-file and
+/// ratchet edits. History: 400 → 1200 (§31, 2026-06-06, NTM stock expansion)
+/// → 25,000 (the ~24,600-instrument authorized set, sized to the 5 × 5,000
+/// main-feed subscription capacity with ~400 spare).
+///
+/// ⚠ **THIS CONSTANT ENFORCES NOTHING TODAY, and the doc above used to claim
+/// it did.** The "Boot HALTS if computed universe size is outside […]" wording
+/// on `MIN_DAILY_UNIVERSE_SIZE` described `build_daily_universe()`, which was
+/// DELETED with the Dhan instrument-fetch chain on 2026-07-13. A workspace
+/// scan on 2026-08-19 found ZERO production readers of either bound — only
+/// comments and the ratchet that pins the value. Recorded rather than quietly
+/// raised, because a documented boot-halt that cannot fire is exactly the
+/// false-OK class the codebase map's own header warns about: the live lane at
+/// 4,565 SIDs has been running *above* the old 1200 "cap" since 2026-08-12
+/// without halting, and nothing noticed.
+///
+/// The bound that ACTUALLY binds the live set is
+/// `DhanEndpointType::MainFeed.subscription_capacity()` (5 connections ×
+/// `MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION` = 25,000), which `main.rs`
+/// passes to `resolve_live_universe` and which `plan_pool` enforces
+/// fail-closed — refusing the WHOLE pool rather than truncating. This
+/// constant is now numerically consistent with that real bound, so a future
+/// reader who trusts it is not misled about the SIZE even while it is not the
+/// thing doing the enforcing.
+pub const MAX_DAILY_UNIVERSE_SIZE: usize = 25_000;
 
 /// CSV download body size cap (per rule file §18 hardening contract).
 /// Sub-PR #3 will enforce via `reqwest` bounded read. Expected real-world
@@ -3245,7 +3271,56 @@ pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// weekend/holiday gap, matching the spill-file sweep. Before this
 /// retention existed, `archive/` grew ~0.15–0.6 GB/day unbounded on the
 /// prod 30 GB volume.
-pub const WS_WAL_ARCHIVE_RETENTION_SECS: u64 = 604_800;
+///
+/// # 2026-08-19: 7 days -> 3 days (the sizing premise above went stale by ~30x)
+///
+/// The weekend-triage rationale above is KEPT and is why this is 3 rather
+/// than 1: a Friday 17:30 IST crash must still be triageable on Monday
+/// morning, which is ~2.6 days. 3 covers it with margin; 7 covered until the
+/// FOLLOWING Friday, which nothing needs.
+///
+/// What changed is the cost, not the reasoning. The note above sizes the
+/// archive at "~0.15-0.6 GB/day ... on the prod 30 GB volume". Measured on
+/// the live box 2026-08-19, that is now wrong by more than an order of
+/// magnitude: `WalRingSink::accept` appends EVERY raw frame from EVERY
+/// socket before parse — including the depth-200 frames the drain discards
+/// unread — and `market_depth` alone logged 505,807,280 rows in one session.
+/// At the 25,000-instrument / 250-depth target the WAL runs ~19 GB/DAY, so
+/// 7 days is ~135 GB of steady-state disk: larger than every QuestDB table
+/// on the box COMBINED, on a 100 GB volume.
+///
+/// It is also the only retention class on the box with no S3 leg, no size
+/// ceiling, and no disk-pressure response — the archive sweep cannot touch
+/// it, so it is pure floor under everything else.
+///
+/// 3 days = ~57 GB at target, ~115 GB less than 7. FLAGGED, not fixed here:
+/// this is still an AGE bound with no BYTE bound, so an abnormal traffic day
+/// scales it linearly. A size ceiling that prunes oldest-first past N GB is
+/// the real fix and is a separate change to the prune logic.
+pub const WS_WAL_ARCHIVE_RETENTION_SECS: u64 = 259_200;
+
+/// Byte ceiling on `<wal_dir>/archive/`, enforced oldest-first AFTER the age
+/// prune (2026-08-19 — the "FLAGGED, not fixed" follow-up above, now fixed).
+///
+/// An age bound alone scales linearly with traffic, so it bounds the archive
+/// only for the traffic level it was chosen against — which is precisely how
+/// the retention above went stale by ~30x without anything noticing. A byte
+/// bound holds regardless of what the market does.
+///
+/// 50 GB is a BACKSTOP, not the normal operating point. At today's live shape
+/// the archive runs ~8.5 GB/day, so 3 days is ~25 GB and this never engages.
+/// At the 25,000-instrument / 250-depth target it is ~19 GB/day = ~57 GB at
+/// 3 days, so the ceiling DOES engage there and shortens the effective window
+/// to ~2.6 days.
+///
+/// That is intended, and worth stating plainly rather than treating as a bug
+/// to tune away: when the disk cannot hold the configured window, something
+/// has to give, and dropping the OLDEST triage copy is strictly better than
+/// filling the volume and stopping every table on the box. The engagement is
+/// counted (`size_deleted`) and logged, never silent — so "the ceiling is
+/// biting" is an observable state that says the age window needs re-deriving
+/// against measured traffic.
+pub const WS_WAL_ARCHIVE_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 
 /// Cadence of the WAL archive prune task (6 hours in seconds).
 pub const WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS: u64 = 6 * 3600;

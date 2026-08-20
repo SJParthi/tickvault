@@ -323,3 +323,136 @@ fn the_two_sequence_generators_are_independent_and_can_collide() {
          independently-seeded counters can mint the same integer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Orphan 5 — the receipt stamp must come from the FRAME, not from the drain
+// ---------------------------------------------------------------------------
+
+/// The drain must consult the frame's own read-task receipt stamp.
+///
+/// Until 2026-08-18 the drain bound its receive time from a fresh wall-clock
+/// read, so every WebSocket lag sample measured
+/// `Dhan's delivery + however long the frame sat in the ring`. Those are two
+/// different quantities with two different owners, and only the first is the
+/// vendor's. The failure mode is worse than imprecision: under a fold stall
+/// the ring backs up and the drain falls behind, so the number inflates
+/// *precisely* when the cause is LOCAL — the lag alarm fires hardest at our
+/// own backlog while naming Dhan for it.
+#[test]
+fn dhan_feed_drain_consults_the_frames_receipt_stamp() {
+    assert!(
+        drain_body().contains("frame.received_at.elapsed()"),
+        "the frame drain must read the frame's own read-task receipt stamp \
+         (`frame.received_at.elapsed()`). Without it the drain is timing its \
+         own queueing delay and reporting it as Dhan's delivery lag."
+    );
+}
+
+/// Reading the queue delay is not enough — it has to be SUBTRACTED.
+///
+/// This is the regression that would actually happen. Deleting
+/// `frame.received_at` outright is a compile error and needs no guard; quietly
+/// computing `elapsed()` and then not applying it compiles, passes every unit
+/// test, and silently restores the exact wrong measurement. That is the shape
+/// this file exists to catch.
+#[test]
+fn dhan_feed_drain_actually_subtracts_the_queue_delay() {
+    let body = drain_body();
+    assert!(
+        body.contains("saturating_sub(queued_nanos)"),
+        "the frame drain computes the ring queueing delay but no longer \
+         subtracts it from the wall-clock read. The receipt instant is \
+         `now - queued`, not `now`; without the subtraction the lag metric is \
+         back to charging our own backlog to the vendor."
+    );
+}
+
+/// The body of `run_frame_drain`, comments stripped, from its signature to the
+/// next top-level item.
+///
+/// Two deliberate choices, both learned the hard way while writing this guard:
+///
+/// * **Scoped to the function**, because `refold_wal_frames` legitimately uses
+///   "now" as a receive time — a frame replayed from the WAL after a crash has
+///   no surviving receipt instant, and its lag reading is meaningless anyway
+///   since the tick's own exchange timestamp decides the candle bucket. A
+///   whole-file scan would flag it, and a false positive in a ratchet is worse
+///   than no ratchet: the next reader deletes it and the real regression walks
+///   through the hole afterwards.
+/// * **Comments stripped**, because the drain carries a comment explaining
+///   what the old clock read was and why it went. A scan that could not tell
+///   the explanation from the thing explained would fail on the very commit
+///   that fixed the defect.
+fn drain_body() -> String {
+    const NEEDLE: &str = "async fn run_frame_drain(";
+    let start = STACK_SRC
+        .find(NEEDLE)
+        .expect("run_frame_drain must exist — it is the ring's only consumer");
+    let rest = &STACK_SRC[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("run_frame_drain must be closed by a top-level brace");
+    rest[..end]
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Orphan 6 — a dead Dhan lane must be able to report dead
+// ---------------------------------------------------------------------------
+
+/// Every flush in the drain must report its row count to feed-health.
+///
+/// Until 2026-08-18 `record_ticks` had ZERO production callers anywhere in
+/// the workspace and the drain never touched feed-health at all, so the Dhan
+/// verdict could not fall to `Down` — `feed_health` answered a benign
+/// `Unknown, "not instrumented yet"` whether the lane was streaming, stalled,
+/// or absent. The one signal an operator checks to find out whether the feed
+/// is alive was structurally incapable of saying no.
+///
+/// This pins the SHAPE that fixes it: the drain flushes through
+/// `flush_and_record`, which pairs the flush with the report. The pairing is
+/// the point — the row count was already being computed and returned at every
+/// one of these sites, and every one of them threw it away.
+#[test]
+fn dhan_feed_drain_reports_flushed_rows_to_feed_health() {
+    let body = drain_body();
+    assert!(
+        body.contains("flush_and_record(&mut ingest, &feed_health)"),
+        "the frame drain must flush through `flush_and_record` so the rows it \
+         wrote reach the feed-health registry. Without it the Dhan health \
+         verdict can never fall to Down — a corpse reports \
+         `Unknown, \"not instrumented yet\"`."
+    );
+}
+
+/// No flush site may bypass the reporting wrapper.
+///
+/// This is the regression that would actually happen, and it is why the
+/// previous test is not sufficient on its own: adding a FOURTH flush site
+/// later — or reverting one of the three — leaves the other call sites intact,
+/// so a check for "does `flush_and_record` appear anywhere" still passes while
+/// a slice of the lane's output silently stops counting. Health would then
+/// decay on a feed that is in fact delivering, which produces a false page
+/// rather than a missing one.
+///
+/// Scoped to `run_frame_drain`'s body, with comments stripped, for the same
+/// two reasons the receipt-stamp guards above are: `refold_wal_frames`
+/// legitimately flushes outside the live path, and the drain carries a comment
+/// that names the old call shape while explaining why it went.
+#[test]
+fn no_drain_flush_site_bypasses_the_feed_health_report() {
+    let body = drain_body();
+    assert!(
+        !body.contains("blocking_flush(|| ingest.flush())"),
+        "a flush site in the drain calls `blocking_flush(|| ingest.flush())` \
+         directly, bypassing `flush_and_record`. The rows it writes will not \
+         reach feed-health, so that slice of the lane's output stops counting \
+         toward liveness while the feed is genuinely delivering."
+    );
+}

@@ -289,6 +289,15 @@ pub struct DhanGates {
     chain_expiry_stamps: Mutex<HashMap<(usize, u32), i64>>,
 }
 
+/// How long a per-(underlying, expiry) authorization stamp stays in the map
+/// before it is evicted as provably irrelevant (2026-08-19).
+///
+/// The gate compares stamps against a spacing of ~3s. 60s is a 20x margin —
+/// far beyond anything that can still affect a verdict, so eviction can never
+/// weaken the rate limit, while the map stays bounded by the number of
+/// underlyings actually firing rather than by every expiry ever seen.
+const CHAIN_EXPIRY_STAMP_EVICT_AFTER_MS: i64 = 60_000;
+
 impl DhanGates {
     /// Build the gate set from the validated `[cadence]` spacings + the
     /// spot window cap.
@@ -345,10 +354,33 @@ impl DhanGates {
         if verdict == GateVerdict::Acquired
             && let Some(expiry) = expiry_yyyymmdd
         {
-            self.chain_expiry_stamps
+            let mut stamps = self
+                .chain_expiry_stamps
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert((underlying.index(), expiry), now_monotonic_ms);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // BOUND (2026-08-19): evict provably-irrelevant stamps before
+            // inserting. This map had no eviction path at all — one entry per
+            // (underlying, expiry), never removed, so it grew for the life of
+            // the process as expiries rolled. Slow (weekly-ish) but unbounded,
+            // which is the same class the O(1) table opened a row for on
+            // `day_ohlc_tracker`.
+            //
+            // Staleness, not a hard cap, is the right bound here. The gate
+            // only ever compares a stamp against `now - spacing`; a stamp
+            // older than that window can never change a verdict, so dropping
+            // it is semantically free. A hard cap with a fail-closed refusal
+            // — the `day_ohlc_tracker` shape — would be WRONG here: refusing
+            // to record a stamp would silently weaken the rate gate it
+            // exists to enforce, trading a memory bound for a broker
+            // violation.
+            //
+            // O(n) over a map whose live size is the number of underlyings
+            // times their in-flight expiries — single digits — on a cold path
+            // touched a handful of times per minute. Never the tick path.
+            stamps.retain(|_, stamped| {
+                now_monotonic_ms.saturating_sub(*stamped) <= CHAIN_EXPIRY_STAMP_EVICT_AFTER_MS
+            });
+            stamps.insert((underlying.index(), expiry), now_monotonic_ms);
         }
         verdict
     }
@@ -1027,5 +1059,44 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn chain_expiry_stamps_do_not_grow_without_bound() {
+        // The map had NO eviction path: one entry per (underlying, expiry),
+        // never removed, growing for the life of the process as expiries
+        // rolled. This drives 500 distinct expiries an hour apart through a
+        // single underlying and asserts the map stays small.
+        let gates = DhanGates::new(3_000, 4);
+        let mut now = 0_i64;
+        for day in 0..500_u32 {
+            now += 3_600_000; // an hour between fires — every stamp goes stale
+            let _ = gates.try_acquire_chain(ChainUnderlying::Nifty, Some(20_260_000 + day), now);
+        }
+        let live = gates
+            .chain_expiry_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert!(
+            live <= 2,
+            "expiry stamps grew to {live} — the map is unbounded again"
+        );
+    }
+
+    #[test]
+    fn chain_expiry_eviction_never_drops_a_stamp_that_still_gates() {
+        // The half that matters for correctness: eviction must be
+        // semantically free. A stamp inside the spacing window must survive,
+        // because dropping it would silently weaken the broker rate gate.
+        let gates = DhanGates::new(3_000, 4);
+        let _ = gates.try_acquire_chain(ChainUnderlying::Nifty, Some(20_260_101), 1_000);
+        // A second fire on a DIFFERENT expiry, 1s later — well inside the
+        // 60s eviction window, so the first stamp must still be present.
+        let _ = gates.try_acquire_chain(ChainUnderlying::Nifty, Some(20_260_108), 2_000);
+        assert_eq!(
+            gates.chain_expiry_stamp(ChainUnderlying::Nifty, 20_260_101),
+            Some(1_000),
+            "a stamp inside the spacing window must never be evicted"
+        );
     }
 }
