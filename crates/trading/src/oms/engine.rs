@@ -164,6 +164,31 @@ pub trait OmsAlertSink: Send + Sync {
 pub struct OrderManagementSystem {
     /// Order state keyed by Dhan order ID.
     orders: HashMap<String, ManagedOrder>,
+    /// Broker `order_no` -> the canonical key in [`Self::orders`].
+    ///
+    /// Exists because a WebSocket update can arrive carrying a broker
+    /// `order_no` we have never keyed on: the order was stored under the id
+    /// `place_order` returned, and the broker later assigns a different one.
+    /// The old shape handled that by CLONING the record under the new key,
+    /// which was wrong in two ways at once.
+    ///
+    /// The clone was taken BEFORE the update was applied and the mutation then
+    /// landed on the OLD key, so the new key held a pre-update snapshot from
+    /// the instant it was created. Worse, it was never removed, so one order
+    /// occupied two entries for the process lifetime and the two DIVERGED with
+    /// every subsequent update — whichever key an update arrived under got the
+    /// change, and the other silently fell behind.
+    ///
+    /// That is not only a memory leak. The cancel gate consults the tracked
+    /// entry under the id its CALLER holds, so a fill recorded on one key
+    /// could read as pre-fill on the other — the naked-position race the
+    /// `entry_leg_cancel_allowed` guard exists to prevent.
+    ///
+    /// An alias resolves to the ONE record instead of copying it, so there is
+    /// nothing to diverge. The obvious alternative — moving the record to the
+    /// new key — would break every caller holding the id `place_order`
+    /// returned, cancellation included.
+    order_no_aliases: HashMap<String, String>,
     /// Correlation ID tracker for idempotency.
     correlations: CorrelationTracker,
     /// Dhan REST API client.
@@ -245,6 +270,7 @@ impl OrderManagementSystem {
     ) -> Self {
         Self {
             orders: HashMap::with_capacity(256),
+            order_no_aliases: HashMap::with_capacity(64),
             correlations: CorrelationTracker::new(),
             api_client,
             rate_limiter,
@@ -1015,9 +1041,15 @@ impl OrderManagementSystem {
 
         let order_id = &update.order_no;
 
-        // Try to find order by order_id first, then by correlation_id
+        // Resolve the update to the ONE record that represents this order.
+        //
+        // Three ways in, in order of directness: the update's own `order_no`
+        // is already a key; an alias maps a broker-assigned `order_no` back to
+        // the key we stored under; or the correlation id does.
         let found_order_id = if self.orders.contains_key(order_id) {
             Some(order_id.clone())
+        } else if let Some(canonical) = self.order_no_aliases.get(order_id) {
+            Some(canonical.clone())
         } else if !update.correlation_id.is_empty() {
             self.correlations
                 .get_order_id(&update.correlation_id)
@@ -1038,18 +1070,30 @@ impl OrderManagementSystem {
             }
         };
 
-        // If the update came via correlation_id with a different order_no,
-        // re-index so future updates (which may lack correlation_id) can find it.
+        // Record the broker's `order_no` as an ALIAS to the record we already
+        // hold, so a later update carrying only that number (WebSocket updates
+        // may omit the correlation id) resolves to the same one record.
+        //
+        // This used to clone the record under the new key. That was wrong
+        // twice over: the clone was taken BEFORE the mutation below, so the
+        // new key held a pre-update snapshot from birth; and nothing ever
+        // removed it, so one order occupied two entries that diverged with
+        // every subsequent update. See the `order_no_aliases` field docs for
+        // why moving the record instead would break cancellation.
         if update.order_no != order_id
             && !update.order_no.is_empty()
-            && let Some(order) = self.orders.get(&order_id).cloned()
+            && self.orders.contains_key(&order_id)
         {
-            self.orders.insert(update.order_no.clone(), order);
-            debug!(
-                old_order_id = %order_id,
-                new_order_no = %update.order_no,
-                "re-indexed order under new order_no from WebSocket"
-            );
+            let previous = self
+                .order_no_aliases
+                .insert(update.order_no.clone(), order_id.clone());
+            if previous.is_none() {
+                debug!(
+                    canonical_order_id = %order_id,
+                    broker_order_no = %update.order_no,
+                    "aliased broker order_no to the tracked order"
+                );
+            }
         }
 
         let new_status = match parse_order_status(&update.status) {
@@ -1411,9 +1455,23 @@ impl OrderManagementSystem {
         Ok(report)
     }
 
-    /// Returns an order by ID.
+    /// Returns an order by ID, resolving a broker `order_no` alias if the id
+    /// is not itself a key.
+    ///
+    /// The alias hop keeps this accessor answering for a broker-assigned
+    /// `order_no` exactly as it did when the re-index stored a duplicate
+    /// record under that key — except it now returns the ONE live record
+    /// rather than a snapshot frozen at the moment the alias was created.
+    ///
+    /// O(1): one hash probe, or two when the id is an alias.
+    #[must_use]
     pub fn order(&self, order_id: &str) -> Option<&ManagedOrder> {
-        self.orders.get(order_id)
+        if let Some(found) = self.orders.get(order_id) {
+            return Some(found);
+        }
+        self.order_no_aliases
+            .get(order_id)
+            .and_then(|canonical| self.orders.get(canonical))
     }
 
     /// Returns all active (non-terminal) orders.
@@ -1454,6 +1512,7 @@ impl OrderManagementSystem {
     /// Resets daily state (orders, correlations, counters).
     pub fn reset_daily(&mut self) {
         self.orders.clear();
+        self.order_no_aliases.clear();
         self.correlations.clear();
         self.super_orders.clear();
         self.verify_states.clear();
@@ -5258,32 +5317,65 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn handle_update_via_correlation_re_indexes_under_new_order_no() {
+    fn handle_update_via_correlation_aliases_rather_than_cloning_the_order() {
+        // REWRITTEN 2026-08-20. This test used to assert the DEFECT: it looked
+        // up the order under the broker's new number and required the STALE
+        // `Transit` status, with a comment explaining that the clone had been
+        // taken before the status update. That is the bug written down as an
+        // expectation.
+        //
+        // The old shape kept TWO records for one order — one under the id
+        // `place_order` returned, one under the broker's `order_no` — and they
+        // diverged with every update, because whichever key an update arrived
+        // under got the change and the other silently fell behind. That is a
+        // memory leak, and worse: the cancel gate consults the tracked entry
+        // under the id its CALLER holds, so a fill recorded on one key could
+        // read as pre-fill on the other.
+        //
+        // There is now ONE record and an alias pointing at it, so both ids
+        // must answer with the SAME, CURRENT state.
         let mut oms = make_oms_with_order("OLD-1", OrderStatus::Transit);
-        // Correlation is tracked as "corr-1" -> "OLD-1"
         oms.correlations
             .track("corr-1".to_owned(), "OLD-1".to_owned());
 
-        // Dhan assigns a new order_no "DHAN-999" via WS update
         let mut update = make_order_update("DHAN-999", "PENDING");
         update.correlation_id = "corr-1".to_owned();
+        assert!(oms.handle_order_update(&update).is_ok());
 
-        let result = oms.handle_order_update(&update);
-        assert!(result.is_ok());
+        let canonical = oms.order("OLD-1").expect("canonical key still resolves");
+        assert_eq!(canonical.status, OrderStatus::Pending);
 
-        // The original order should have its status updated
-        assert_eq!(oms.order("OLD-1").unwrap().status, OrderStatus::Pending);
-
-        // The re-indexed clone should be accessible under the new order_no.
-        // NOTE: the clone was made before the status update, so it retains
-        // the original Transit status. The re-index ensures future updates
-        // with the new order_no can find the entry.
-        let reindexed = oms.order("DHAN-999");
-        assert!(
-            reindexed.is_some(),
-            "order must be re-indexed under new order_no from WebSocket"
+        let via_alias = oms
+            .order("DHAN-999")
+            .expect("the broker order_no must still resolve");
+        assert_eq!(
+            via_alias.status,
+            OrderStatus::Pending,
+            "the alias must reach the LIVE record, not a snapshot frozen at alias time"
         );
-        assert_eq!(reindexed.unwrap().status, OrderStatus::Transit);
+
+        // The distinguishing assertion: one record, not two.
+        assert_eq!(
+            oms.orders.len(),
+            1,
+            "one order must occupy exactly one entry — the clone leaked an entry per re-index"
+        );
+
+        // And a later update carrying ONLY the broker number (WebSocket
+        // updates may omit the correlation id) must still land on that one
+        // record — the reason the re-index existed at all.
+        let later = make_order_update("DHAN-999", "TRADED");
+        assert!(oms.handle_order_update(&later).is_ok());
+        assert_eq!(
+            oms.order("OLD-1").expect("still there").status,
+            OrderStatus::Traded,
+            "an update arriving under the alias must mutate the canonical record"
+        );
+        assert_eq!(
+            oms.orders.len(),
+            1,
+            "still one record after the second update"
+        );
     }
 
     // -----------------------------------------------------------------------
