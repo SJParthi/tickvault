@@ -172,11 +172,16 @@ pub fn select_live_universe(
     // The sibling deduper `dhan_feed_stack::dedup_subscribe_set` has always
     // used a `HashSet` on this exact key for this exact job. Two dedup paths,
     // same key, different complexity; now the same.
+    // The hardcoded index seeds are held SEPARATELY from the master rows so
+    // they can be dropped if the master supplies real ones — see the swap
+    // below. They still seed `seen`, so a master row repeating a hardcoded id
+    // is deduped rather than subscribed twice.
     let mut seen: std::collections::HashSet<(SecurityId, ExchangeSegment)> = index_universe
         .iter()
         .map(|i| (i.security_id, i.segment))
         .collect();
     let mut instruments = index_universe.to_vec();
+    let mut master_indices = 0usize;
 
     for entry in master {
         if entry.security_id == 0 {
@@ -192,10 +197,56 @@ pub fn select_live_universe(
             deduped += 1;
             continue;
         }
+        if segment == ExchangeSegment::IdxI {
+            master_indices += 1;
+        }
         instruments.push(SubscribeInstrument {
             security_id: key.0,
             segment,
         });
+    }
+
+    // ---------------------------------------------------------------------
+    // Drop the hardcoded index seeds once the master supplies real ones.
+    //
+    // Dhan's own live-feed reference is emphatic: "SecurityId values come from
+    // the instrument master CSV — it is the sole source of truth. Do NOT
+    // hardcode or guess these values."
+    //
+    // The four seeds violate that. They are `SPOT_1M_REST_INDICES` — ids
+    // chosen for the REST Data API (`/v2/charts/intraday`, `/v2/optionchain`)
+    // and reused verbatim on the WebSocket because one constant was
+    // convenient. Nothing ever validated them against the master.
+    //
+    // Measured on the box: those four ids received ZERO packets of ANY
+    // response code, on every recorded day — including zero code-6 PrevClose,
+    // which Dhan support confirmed (Ticket #5525125) is emitted for IDX_I on
+    // ANY subscription in ANY mode. A subscription that never draws even its
+    // one guaranteed packet was not accepted. Master-sourced NSE_EQ and
+    // NSE_FNO ids on the SAME socket delivered normally throughout.
+    //
+    // So when the master yields indices, they REPLACE the seeds rather than
+    // joining them: keeping both would subscribe an id we have evidence is
+    // dead beside the one that should work, and then report the pair as
+    // healthy coverage.
+    //
+    // The swap is conditional, never unconditional. A master with no INDEX
+    // rows leaves the seeds in place — a broken master must degrade to the
+    // old behaviour, not to no indices at all, which would turn a data
+    // problem into an outage.
+    if master_indices > 0 {
+        instruments.retain(|i| i.segment != ExchangeSegment::IdxI);
+        for entry in master {
+            let Some(segment) = ExchangeSegment::from_byte(entry.exchange_segment_code) else {
+                continue;
+            };
+            if segment == ExchangeSegment::IdxI && entry.security_id != 0 {
+                instruments.push(SubscribeInstrument {
+                    security_id: entry.security_id as SecurityId,
+                    segment,
+                });
+            }
+        }
     }
 
     if instruments.len() > capacity {
@@ -388,6 +439,101 @@ mod tests {
     /// The default path must be byte-identical to the pre-existing behaviour.
     /// If this ever diverges, the "ships default-OFF" claim in the scope-lock
     /// is false and the third quote's carve-out has been breached in code.
+    /// The 2026-08-20 finding: the four hardcoded seeds are REST Data API ids
+    /// reused on the WebSocket, and they drew zero packets of any code on
+    /// every recorded day. When the master supplies real index ids they must
+    /// REPLACE the seeds, not sit beside them.
+    #[test]
+    fn master_indices_replace_the_hardcoded_seeds_rather_than_joining_them() {
+        let seeds = vec![
+            SubscribeInstrument {
+                security_id: 13,
+                segment: ExchangeSegment::IdxI,
+            },
+            SubscribeInstrument {
+                security_id: 51,
+                segment: ExchangeSegment::IdxI,
+            },
+        ];
+        let master = vec![
+            MasterEntry {
+                security_id: 900,
+                exchange_segment_code: 0,
+            },
+            MasterEntry {
+                security_id: 901,
+                exchange_segment_code: 0,
+            },
+            MasterEntry {
+                security_id: 500,
+                exchange_segment_code: 1,
+            },
+        ];
+        let out = select_live_universe(&seeds, Some(&master), 25_000);
+        let idx: Vec<u64> = out
+            .instruments
+            .iter()
+            .filter(|i| i.segment == ExchangeSegment::IdxI)
+            .map(|i| i.security_id)
+            .collect();
+        assert_eq!(
+            idx,
+            vec![900, 901],
+            "the seeds are gone, the master ids remain"
+        );
+        assert!(
+            out.instruments.iter().any(|i| i.security_id == 500),
+            "the equity is untouched by the index swap"
+        );
+    }
+
+    /// The conditional half, and the one that keeps a master problem from
+    /// becoming an outage: no INDEX rows means the seeds STAY.
+    #[test]
+    fn a_master_with_no_indices_leaves_the_hardcoded_seeds_in_place() {
+        let seeds = vec![SubscribeInstrument {
+            security_id: 13,
+            segment: ExchangeSegment::IdxI,
+        }];
+        let master = vec![MasterEntry {
+            security_id: 500,
+            exchange_segment_code: 1,
+        }];
+        let out = select_live_universe(&seeds, Some(&master), 25_000);
+        let idx: Vec<u64> = out
+            .instruments
+            .iter()
+            .filter(|i| i.segment == ExchangeSegment::IdxI)
+            .map(|i| i.security_id)
+            .collect();
+        assert_eq!(
+            idx,
+            vec![13],
+            "degrade to the old behaviour, never to zero indices"
+        );
+    }
+
+    /// A master id that repeats a seed must appear ONCE, not twice.
+    #[test]
+    fn a_master_index_repeating_a_seed_is_not_subscribed_twice() {
+        let seeds = vec![SubscribeInstrument {
+            security_id: 13,
+            segment: ExchangeSegment::IdxI,
+        }];
+        let master = vec![MasterEntry {
+            security_id: 13,
+            exchange_segment_code: 0,
+        }];
+        let out = select_live_universe(&seeds, Some(&master), 25_000);
+        let idx: Vec<u64> = out
+            .instruments
+            .iter()
+            .filter(|i| i.segment == ExchangeSegment::IdxI)
+            .map(|i| i.security_id)
+            .collect();
+        assert_eq!(idx, vec![13]);
+    }
+
     #[test]
     fn test_select_live_universe_without_master_returns_the_index_set_unchanged() {
         let sel = select_live_universe(&idx(), None, 25_000);
