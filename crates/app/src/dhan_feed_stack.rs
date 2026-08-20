@@ -2192,6 +2192,9 @@ async fn run_frame_drain(
     shutdown: Arc<tokio::sync::Notify>,
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
 ) -> DrainOutcome {
+    // Whether this drain has ever seen a frame. Owns the up-gauge's rising
+    // edge — see the first-frame arm below and the spawn site's correction.
+    let mut lane_up = false;
     let mut seen: u64 = 0;
     let mut folded: u64 = 0;
     let mut depth_unconsumed: u64 = 0;
@@ -2229,6 +2232,22 @@ async fn run_frame_drain(
             biased;
             maybe_frame = rx.recv() => {
                 let Some(frame) = maybe_frame else { break };
+                // The lane is UP the moment a frame actually arrives, and not
+                // one instant sooner (plan Item 7). Raised once per drain, from
+                // the only place in the process that has proof a socket both
+                // connected AND delivered — the bytes are in hand.
+                //
+                // A gauge rather than a counter, and set unconditionally on the
+                // first frame rather than tracked with an edge, because the
+                // drain is the single consumer: there is no second writer to
+                // race, and re-setting an already-1.0 gauge is free.
+                if !lane_up {
+                    lane_up = true;
+                    metrics::gauge!(FEED_STACK_UP_GAUGE).set(1.0);
+                    info!(
+                        "Dhan live lane is UP — first frame received and consumed by the fold"
+                    );
+                }
                 // Release the byte reservation the instant the frame leaves the
                 // ring — BEFORE any parsing, and on EVERY path out of this arm.
                 // Releasing after a successful parse instead would leak the
@@ -3862,14 +3881,53 @@ fn remaining_main_feed_capacity(connections_used: usize) -> usize {
 }
 
 /// Main-feed connections a set of `instruments` occupies.
+///
+/// # This must mirror `plan_pool`, not the packing arithmetic
+///
+/// CORRECTED 2026-08-20. This returned `instruments.div_ceil(per_connection)`
+/// — the number of connections the set would need if it were PACKED. But
+/// `plan_pool` does not pack; it SPREADS, deliberately, taking
+/// `min(available, set.len()).max(1)` connections so no socket carries the
+/// whole universe. The two answers diverge badly at the live scale:
+///
+/// | | connections |
+/// |---|---|
+/// | `plan_pool` dials for 4,565 spots | `min(5, 4565)` = **5** |
+/// | this function used to report | `ceil(4565 / 5000)` = **1** |
+///
+/// So the boot consumed every main-feed slot while the contract attach was
+/// told four were free — `remaining_main_feed_capacity(1)` = 20,000 — and
+/// asked the pool for room that did not exist. `pool.admit` is stateful and
+/// correctly refused, `plan_pool` returned `BudgetRefused`, and because
+/// `MainFeed` is the FIRST endpoint in `build_feed_stack_plan`'s loop that
+/// error aborted the whole plan **before Depth20 and Depth200 were ever
+/// planned**.
+///
+/// The consequence is the part worth recording: adding contract selection did
+/// not merely fail to dial contracts, it took DEPTH DOWN WITH IT — regressing
+/// depth from "possible once the chain populates" to "impossible", via an
+/// arithmetic disagreement between two functions that never call each other.
+/// The retry loop then re-failed identically until the deadline and reported
+/// that depth would carry no data this session, which reads as a depth problem
+/// and is not one.
+///
+/// Now mirrors `plan_pool` exactly. When the spot universe has already spread
+/// across every connection this returns the cap, `remaining_main_feed_capacity`
+/// returns 0, the attach selects no contracts, and the plan SUCCEEDS — so
+/// depth dials. That is the honest answer: there is genuinely no room, and
+/// saying so lets the sockets that can work, work.
+/// `available` is REQUIRED, and that is the whole correction: `plan_pool`
+/// spreads across `min(available, len)`, so occupancy is a function of how
+/// many connections are free at that moment, not of a global constant. A
+/// signature that omitted it could not express the right answer for the
+/// second planning pass even in principle.
 #[must_use]
-fn main_feed_connections_for(instruments: usize) -> usize {
-    let per_connection = usize::try_from(
-        tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
-    )
-    .unwrap_or(usize::MAX)
-    .max(1);
-    instruments.div_ceil(per_connection)
+fn main_feed_connections_for(instruments: usize, available: usize) -> usize {
+    if instruments == 0 || available == 0 {
+        return 0;
+    }
+    // Mirrors `plan_pool`: `min(available, set.len()).max(1)`.
+    available.min(instruments).max(1)
 }
 
 /// Packs an IST `YYYY-MM-DD` date into the `YYYYMMDD` form contract selection
@@ -4690,7 +4748,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             frame_tx.downgrade(),
             Arc::clone(&depth_budget),
             Arc::clone(&main_feed_budget),
-            main_feed_connections_for(params.main_feed_instruments.len()),
+            main_feed_connections_for(
+                params.main_feed_instruments.len(),
+                usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS),
+            ),
         ));
     }
 
@@ -4709,9 +4770,30 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         return;
     }
 
-    // Up means SOCKETS DIALED AND A FOLD CONSUMING THEM — not "config was
-    // enabled". It is set here and cleared by the drain when the ring closes.
-    metrics::gauge!(FEED_STACK_UP_GAUGE).set(1.0);
+    // CORRECTED 2026-08-20 (plan Item 7, which had never been implemented).
+    //
+    // This line used to `.set(1.0)` HERE, and the comment above it claimed the
+    // gauge meant "sockets dialed AND a fold consuming them". It did not. The
+    // `dialed` counter it sits behind is incremented immediately after
+    // `tokio::spawn`, and the connect happens INSIDE that task — so a socket
+    // that answers HTTP 400 forever still counts as dialed.
+    //
+    // That is not hypothetical. On 2026-08-12 the main feed failed twelve
+    // dials with `400 Bad Request`, produced ZERO candles for a 373-minute
+    // session, and this gauge would have read 1.0 for every minute of it —
+    // leaving `tv-<env>-dhan-live-lane-down` silent through precisely the
+    // outage it exists to catch. A monitor that cannot fire during its own
+    // scenario is worse than no monitor: it converts an outage into a clean
+    // dashboard.
+    //
+    // The gauge is now raised by the DRAIN, on the first frame it actually
+    // receives — the earliest moment at which "sockets dialed AND a fold
+    // consuming them" is a true statement rather than an intention. Here we
+    // only pre-register it at zero, which is the house first-sample-baseline
+    // discipline: the CloudWatch agent drops the first delta sample, and the
+    // sample it drops must be the harmless 0 rather than the session's first
+    // real transition.
+    metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
 
     // Tell the operator-facing feed state the same thing the gauge just said.
     //
@@ -7563,21 +7645,23 @@ mod tests {
     }
 
     #[test]
-    fn test_up_gauge_is_raised_only_after_sockets_are_dialed_and_cleared_when_they_die() {
-        // Rule 11, no false-OK. Until this round the guard read "nothing may
-        // set this gauge to 1" — because no transport existed and reporting
-        // the lane up would have been a lie. The transport now exists, so the
-        // invariant tightens rather than relaxes: `1` may only be written
-        // BELOW the dial loop (never on the config-gate path), and something
-        // must write `0` back when the ring closes, or a dead lane would keep
-        // reporting itself healthy forever.
+    fn test_up_gauge_is_raised_by_a_received_frame_and_never_by_a_spawn() {
+        // REWRITTEN 2026-08-20. The previous version of this guard asserted
+        // the raise came AFTER the dial loop — and that is exactly what made
+        // the defect permanent, because it pinned the wrong thing as correct.
+        //
+        // `dialed` counts `tokio::spawn` calls; the connect happens INSIDE the
+        // spawned task. So a socket answering HTTP 400 forever still counted
+        // as dialed, the gauge read 1.0, and `tv-<env>-dhan-live-lane-down`
+        // stayed silent. On 2026-08-12 that is precisely what a 373-minute,
+        // zero-candle session looked like from CloudWatch: healthy.
+        //
+        // The invariant is now about PROVENANCE, not source order: only code
+        // that is holding a received frame may claim the lane is up.
         let src = include_str!("dhan_feed_stack.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production_half = src.split(test_marker).next().unwrap_or(src);
 
-        let raise = production_half
-            .find("gauge!(FEED_STACK_UP_GAUGE).set(1.0)")
-            .expect("the lane must report itself up once it is actually carrying data");
         assert_eq!(
             production_half
                 .matches("FEED_STACK_UP_GAUGE).set(1.0)")
@@ -7586,29 +7670,42 @@ mod tests {
             "exactly ONE site may raise the up-gauge, so there is one place to audit"
         );
 
-        // The dial loop's own marker. `1` must come after it — a raise above
-        // this line would be reporting config, not connectivity.
-        let dialed = production_half
-            .find("dialed = dialed.saturating_add(1)")
-            .expect("the dial loop must count the sockets it opened");
+        // THE LOAD-BEARING ASSERTION. The raise must live inside the drain,
+        // which is the only code in the process that has proof a socket both
+        // connected AND delivered — it is holding the bytes.
+        let drain = production_half
+            .split_once("async fn run_frame_drain")
+            .expect("the drain function must exist")
+            .1;
         assert!(
-            raise > dialed,
-            "the up-gauge may only be raised after sockets have actually been dialed"
+            drain.contains("gauge!(FEED_STACK_UP_GAUGE).set(1.0)"),
+            "the up-gauge must be raised INSIDE run_frame_drain, on a frame that \
+             actually arrived — anywhere else is reporting an intention"
+        );
+        assert!(
+            drain.contains("if !lane_up"),
+            "the raise must be latched, so the rising edge is one event"
         );
 
-        // And something must clear it. Without this, a lane whose every socket
-        // died would sit at 1 until the process restarted. `find`, not
-        // `rfind`: there are legitimately TWO clear sites — the drain's normal
-        // exit (above the raise in source order) and the panic handler that
-        // catches a dead drain (below it). Asserting on the LAST one would
-        // demand the impossible, which is how this guard first went red.
-        let clear = production_half
-            .find("gauge!(FEED_STACK_UP_GAUGE).set(0.0)")
-            .expect("something must clear the up-gauge when the lane goes down");
-        assert!(
-            clear < raise,
-            "the drain's clear belongs above bring-up in source order"
-        );
+        // And the bring-up path must NOT raise it. This is the half that
+        // regressed: a `.set(1.0)` here means 'we spawned some tasks', which
+        // is not connectivity and must never be published as if it were.
+        let bringup = production_half
+            .rsplit_once("fn dial_planned_connections")
+            .map_or(production_half, |(before, _)| before);
+        let dial_marker = "dialed = dialed.saturating_add(1)";
+        if let Some(dialed_at) = bringup.find(dial_marker) {
+            let after_dial = &bringup[dialed_at..];
+            assert!(
+                !after_dial.contains("FEED_STACK_UP_GAUGE).set(1.0)"),
+                "the dial loop must not raise the up-gauge — `dialed` counts \
+                 tokio::spawn calls, and a socket that 400s forever still \
+                 increments it"
+            );
+        }
+
+        // Something must still clear it, or a lane whose every socket died
+        // would sit at 1 until the process restarted.
         assert!(
             production_half
                 .matches("FEED_STACK_UP_GAUGE).set(0.0)")
@@ -7619,6 +7716,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_main_feed_connections_for_mirrors_what_plan_pool_actually_dials() {
+        // THE REGRESSION. `plan_pool` SPREADS: it takes
+        // `min(available, set.len()).max(1)` connections. This function used
+        // to return the PACKED count, `ceil(len / 5000)`. At the live scale
+        // those disagree 5 vs 1, so the attach was told four connections were
+        // free when zero were — and the resulting BudgetRefused aborted the
+        // whole plan before depth was ever planned.
+        let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
+
+        assert_eq!(
+            main_feed_connections_for(0, max),
+            0,
+            "an empty set occupies nothing"
+        );
+        assert_eq!(
+            main_feed_connections_for(1, max),
+            1,
+            "one instrument still occupies a whole connection"
+        );
+        // The live universe on 2026-08-12. Packed arithmetic said 1; the pool
+        // dialed 5.
+        assert_eq!(
+            main_feed_connections_for(4_565, max),
+            max,
+            "4,565 instruments spread across every available connection — \
+             reporting 1 here is what took depth down"
+        );
+        assert_eq!(
+            main_feed_connections_for(25_000, max),
+            max,
+            "at the target scale packed and spread agree, which is why this \
+             defect was invisible in the sizing arithmetic"
+        );
+        // Fewer instruments than connections: the pool opens one socket per
+        // instrument, never an empty one.
+        assert_eq!(main_feed_connections_for(3, max), 3);
+
+        // And the consequence the attach reads.
+        assert_eq!(
+            remaining_main_feed_capacity(main_feed_connections_for(4_565, max)),
+            0,
+            "with the spot universe spread across every connection there is \
+             genuinely no room for contracts — saying so lets the plan SUCCEED \
+             and depth dial, instead of refusing the whole pool"
+        );
+    }
     #[test]
     fn test_the_lane_refuses_to_dial_without_a_wal_or_a_token_manager() {
         // Both refusals are `return`s on the bring-up path, not warnings that
@@ -8453,13 +8597,30 @@ mod contract_attach_tests {
     }
 
     #[test]
-    fn connection_count_rounds_up_because_a_partial_socket_is_still_a_socket() {
-        assert_eq!(main_feed_connections_for(0), 0);
-        assert_eq!(main_feed_connections_for(1), 1);
-        assert_eq!(main_feed_connections_for(5_000), 1);
-        assert_eq!(main_feed_connections_for(5_001), 2);
-        assert_eq!(main_feed_connections_for(4_565), 1, "today's spot universe");
-        assert_eq!(main_feed_connections_for(25_000), 5);
+    fn connection_count_matches_the_spread_the_pool_actually_dials() {
+        // CORRECTED 2026-08-20. This test used to assert the PACKED counts
+        // (`5_000 -> 1`, `5_001 -> 2`, `4_565 -> 1`) and it was the thing
+        // holding the defect in place: `plan_pool` SPREADS across
+        // `min(available, len)` connections, so the packed answer understated
+        // the real occupancy by 4 at the live scale. The attach then asked for
+        // room that did not exist, `plan_pool` refused the whole pool, and
+        // depth was never planned.
+        //
+        // The rule is now "mirror plan_pool", not "round up".
+        let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
+        assert_eq!(main_feed_connections_for(0, max), 0);
+        assert_eq!(main_feed_connections_for(1, max), 1);
+        // Fewer instruments than connections: one socket each, never an empty
+        // one — the same floor plan_pool applies.
+        assert_eq!(main_feed_connections_for(3, max), 3);
+        // At or past the connection count, the pool spreads across all of them.
+        assert_eq!(
+            main_feed_connections_for(4_565, max),
+            max,
+            "today's spot universe"
+        );
+        assert_eq!(main_feed_connections_for(5_000, max), max);
+        assert_eq!(main_feed_connections_for(25_000, max), max);
     }
 
     #[test]
@@ -8468,15 +8629,25 @@ mod contract_attach_tests {
         // reachable spot-universe size, connections used plus connections the
         // remaining capacity could need must stay inside the cap.
         let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
-        for spot in [0usize, 1, 4_565, 5_000, 5_001, 12_000, 24_999, 25_000] {
-            let used = main_feed_connections_for(spot);
+        for spot in [0usize, 1, 3, 4_565, 5_000, 5_001, 12_000, 24_999, 25_000] {
+            let used = main_feed_connections_for(spot, max);
             let remaining = remaining_main_feed_capacity(used);
-            let would_need = main_feed_connections_for(remaining);
+            // Contracts may only spread across what the spots LEFT.
+            let would_need = main_feed_connections_for(remaining, max.saturating_sub(used));
             assert!(
                 used + would_need <= max,
                 "spot={spot} used={used} + contracts={would_need} exceeds {max}"
             );
         }
+        // And the property that actually matters, stated directly: once the
+        // spot universe is at least as large as the connection count, it has
+        // spread across ALL of them and there is no room left. The attach must
+        // read zero here — reading 20,000 is what aborted the plan and took
+        // depth with it.
+        assert_eq!(
+            remaining_main_feed_capacity(main_feed_connections_for(4_565, max)),
+            0
+        );
     }
 
     #[test]
