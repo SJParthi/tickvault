@@ -1188,25 +1188,40 @@ impl LiveIngest {
         // timestamp folded into NOTHING and still fell through to the writer,
         // returning `Folded` — a row stamped at a garbage designated timestamp,
         // reported as success.
-        // OUT-OF-SESSION IS NOT A REFUSAL OF THE TICK, only of the candle.
+        // CANDLE-ONLY REFUSALS — the data is fine, only the BUCKET is missing.
         //
-        // Checked FIRST and separately: it is the one condition here where the
-        // data is fine and only the BUCKET is missing. The tick still gets its
-        // row, so the pre-open window is captured instead of discarded. The
-        // three below are different in kind — a NaN price, a timestamp outside
-        // a 30-year band, or an unidentifiable instrument — and writing any of
-        // them would put a corrupt row in `ticks` under a garbage designated
-        // timestamp, which is worse than losing it.
-        let candle_only_refusal = stats.out_of_session
-            && !stats.refused_price
-            && !stats.refused_timestamp
-            && !stats.slot_exhausted;
+        // Two conditions qualify, and both keep the tick row:
+        //
+        //   `out_of_session`      the pre-open window is real data with no
+        //                         bucket to fold into.
+        //   `untraded_sentinel`   an exact 0.0 price: the vendor saying "no
+        //                         last traded price", which is TRUE. Added
+        //                         2026-08-20 — see `ConsumeStats`. Folding a
+        //                         zero would corrupt the OHLC, so the candle
+        //                         is skipped, but discarding the ROW loses the
+        //                         ability to tell "did not trade" from "did
+        //                         not capture", and costs the packet's open
+        //                         interest and bid/ask with it. On the live
+        //                         box that was ~22,000 ticks a session.
+        //
+        // The three below are different IN KIND — a NaN price, a timestamp
+        // outside a 30-year band, or an unidentifiable instrument — and
+        // writing any of them would put a corrupt row in `ticks` under a
+        // garbage designated timestamp, which is worse than losing it.
+        // Three conditions refuse the WHOLE tick, because writing the row
+        // would put corrupt data in `ticks` under a garbage designated
+        // timestamp: a price outside `[0, MAX]` (NaN and both infinities fall
+        // outside by comparison), a timestamp beyond a 30-year band, and an
+        // instrument with no fold slot at all.
+        let hard_refusal = stats.refused_price || stats.refused_timestamp || stats.slot_exhausted;
 
-        if stats.refused_price
-            || (stats.out_of_session && !candle_only_refusal)
-            || stats.slot_exhausted
-            || stats.refused_timestamp
-        {
+        // Two refuse only the CANDLE and keep the row — see above. They are
+        // mutually exclusive with the three by construction, which is why this
+        // reads as a plain `!hard_refusal` rather than repeating them.
+        let candle_only_refusal =
+            (stats.out_of_session || stats.untraded_sentinel) && !hard_refusal;
+
+        if hard_refusal {
             let reason = if stats.refused_price {
                 self.refused_price = self.refused_price.saturating_add(1);
                 "price"

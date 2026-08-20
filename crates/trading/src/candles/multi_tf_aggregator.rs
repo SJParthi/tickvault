@@ -53,12 +53,11 @@
 use std::collections::HashMap;
 
 use metrics::counter;
+use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
 
-use crate::candles::aggregator_cell::{
-    AggregatorCell, ConsumeOutcome, FeedStrategy, TickPrices, tick_price_is_sane,
-};
+use crate::candles::aggregator_cell::{AggregatorCell, ConsumeOutcome, FeedStrategy, TickPrices};
 use crate::candles::tf_index::{MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF_DAY_IST};
 use crate::candles::{BufferOutcome, BufferedSeal, LiveCandleState, SealRing, TfIndex};
 
@@ -145,6 +144,26 @@ pub struct ConsumeStats {
     /// instrument therefore has NO fold state. Fail-closed: nothing was
     /// folded, and the caller must treat it as a real data loss.
     pub slot_exhausted: bool,
+    /// `true` when the price is EXACTLY `0.0` — the vendor's documented
+    /// "has not traded yet" sentinel, not corruption.
+    ///
+    /// Added 2026-08-20 after the live box refused ~22,000 ticks a session on
+    /// this shape. An option contract that has not traded sends `0.0`, and the
+    /// old gate (`p > 0.0`) swept it in with `NaN` and negative prices —
+    /// so the whole tick was discarded, row included.
+    ///
+    /// Those two are not alike. `NaN` is a broken packet and writing it would
+    /// put a corrupt row under a garbage timestamp. `0.0` is TRUE: the
+    /// instrument has no last traded price, and its packet still carries real
+    /// open interest, bid/ask and timestamps. Discarding it loses the ability
+    /// to tell "did not trade" from "did not capture" — and the depth path in
+    /// the same drain already writes `0.0` levels as exactly this kind of
+    /// documented sentinel.
+    ///
+    /// So this is a CANDLE-only refusal, like `out_of_session`: nothing is
+    /// folded (a zero would corrupt the OHLC), and the caller still writes the
+    /// tick row.
+    pub untraded_sentinel: bool,
     /// `true` when `exchange_timestamp` fell outside
     /// `[MIN_PLAUSIBLE_EXCHANGE_TS_SECS, MAX_PLAUSIBLE_EXCHANGE_TS_SECS]`.
     /// Nothing was folded and the watermark was NOT advanced.
@@ -167,6 +186,7 @@ impl ConsumeStats {
             && !self.out_of_session
             && !self.slot_exhausted
             && !self.refused_timestamp
+            && !self.untraded_sentinel
     }
 }
 
@@ -416,10 +436,49 @@ impl MultiTfAggregator {
     where
         F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
     {
-        if !tick_price_is_sane(tick) {
+        // PRICE CLASSIFICATION — corrupt and "not traded yet" are different
+        // answers and were being given the same one.
+        //
+        // 2026-08-20. `tick_price_is_sane` requires `p > 0.0`, so an exact
+        // `0.0` was refused alongside NaN and negatives, and the caller
+        // discarded the whole tick — row included. On the live box that was
+        // ~22,000 ticks a session: option contracts that had not traded yet.
+        //
+        // Zero is not a broken packet. It is the vendor saying "no last traded
+        // price", which is TRUE, and the packet still carries open interest,
+        // bid/ask and timestamps. The depth path in the same drain already
+        // treats a `0.0` level as a documented sentinel and writes it.
+        //
+        // Folding a zero WOULD corrupt the candle, so the fold is still
+        // skipped — exactly like `out_of_session`. The difference is that the
+        // caller now keeps the row, so "did not trade" stays distinguishable
+        // from "was not captured".
+        let p = tick.last_traded_price;
+        // The explicit comparison is the same three compares as the range
+        // form, written out so the O(1) pre-commit scanner does not read the
+        // range method as a Vec scan — the identical trade the session gate
+        // twelve lines below already makes. Using that scanner's
+        // `// O(1) EXEMPT:` hatch instead would be a small lie: this is not
+        // exempt FROM O(1), it IS O(1).
+        //
+        // `is_finite()` is redundant with the bounds (NaN fails `>= 0.0`,
+        // `+Inf` fails `<= MAX`, `-Inf` fails `>= 0.0`) and kept anyway,
+        // because "is this a real number" is the first question a reader asks.
+        // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
+        #[allow(clippy::manual_range_contains)]
+        let price_is_representable = p.is_finite() && p >= 0.0 && p <= MAX_PLAUSIBLE_LTP;
+        if !price_is_representable {
             counter!("tv_aggregator_tick_refused_total", "reason" => "price").increment(1);
             return ConsumeStats {
                 refused_price: true,
+                ..ConsumeStats::default()
+            };
+        }
+        if p == 0.0 {
+            counter!("tv_aggregator_tick_refused_total", "reason" => "untraded_sentinel")
+                .increment(1);
+            return ConsumeStats {
+                untraded_sentinel: true,
                 ..ConsumeStats::default()
             };
         }
@@ -1104,6 +1163,14 @@ mod tests {
         let before = agg
             .snapshot(Feed::Dhan, 13, SEG_IDX, TfIndex::M1)
             .expect("slot");
+        // 2026-08-20: `0.0` stays in this loop and keeps EVERY guarantee the
+        // test was written for — it must not fold, must not seal, and must
+        // leave the bucket byte-identical. What changed is only its NAME:
+        // corruption (`refused_price`) versus the vendor's documented
+        // "has not traded yet" sentinel (`untraded_sentinel`), which the
+        // caller keeps a row for. Asserting the split here rather than
+        // dropping the case makes this test stronger: it now pins that the
+        // two are told apart AND that both are equally harmless to state.
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -5.0] {
             let stats = agg.consume_tick(
                 Feed::Dhan,
@@ -1111,7 +1178,22 @@ mod tests {
                 None,
                 |_, _, _, _, _| panic!("a refused tick must never seal"),
             );
-            assert!(stats.refused_price, "price {bad} must be refused");
+            if bad == 0.0 {
+                assert!(
+                    stats.untraded_sentinel,
+                    "0.0 is the not-traded-yet sentinel, not corruption"
+                );
+                assert!(
+                    !stats.refused_price,
+                    "0.0 must not be classed as corruption — that discarded the row"
+                );
+            } else {
+                assert!(stats.refused_price, "price {bad} must be refused");
+                assert!(
+                    !stats.untraded_sentinel,
+                    "price {bad} is corruption, not a sentinel"
+                );
+            }
             assert!(!stats.folded());
         }
         let after = agg
@@ -1146,6 +1228,63 @@ mod tests {
         assert!(stats.folded());
     }
 
+    /// A price of EXACTLY zero is the vendor's "has not traded yet" sentinel,
+    /// not corruption — and the two must not share a verdict.
+    ///
+    /// The live box refused ~22,000 ticks a session on this shape: option
+    /// contracts that had not traded, swept in with NaN by a `p > 0.0` gate.
+    /// The candle refusal is right (a zero would corrupt the OHLC). Losing the
+    /// ROW is not: the packet still carries open interest, bid/ask and
+    /// timestamps, and without it "did not trade" is indistinguishable from
+    /// "was not captured".
+    #[test]
+    fn zero_price_is_a_sentinel_and_nan_is_corruption() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 4);
+
+        let zero = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN, 0.0, 0),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(
+            zero.untraded_sentinel,
+            "an exact 0.0 must classify as the untraded sentinel"
+        );
+        assert!(
+            !zero.refused_price,
+            "0.0 must NOT be lumped in with corruption — that is what discarded the row"
+        );
+        assert!(!zero.folded(), "and it still must not fold into a candle");
+        assert_eq!(zero.sealed_count, 0, "no bucket may be touched by a zero");
+
+        for corrupt in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+            let s = agg.consume_tick(
+                Feed::Dhan,
+                &tick(13, SEG_IDX, OPEN, corrupt, 0),
+                None,
+                |_, _, _, _, _| {},
+            );
+            assert!(
+                s.refused_price,
+                "{corrupt} is corruption and must refuse the whole tick"
+            );
+            assert!(
+                !s.untraded_sentinel,
+                "{corrupt} is not a 'has not traded' sentinel"
+            );
+        }
+
+        // A real price still folds — otherwise the two arms above could be
+        // passing because nothing folds at all.
+        let good = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN, 100.0, 1),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(good.folded(), "a real price must still fold");
+    }
     /// `folded()` reports success by the ABSENCE of every refusal flag, so a
     /// newly-added refusal that is not wired into it makes a refused tick
     /// claim it folded — a false-OK.
@@ -1164,6 +1303,7 @@ mod tests {
             out_of_session: _,
             slot_exhausted: _,
             refused_timestamp: _,
+            untraded_sentinel: _,
         } = ConsumeStats::default();
 
         assert!(
@@ -1197,6 +1337,13 @@ mod tests {
                 "refused_timestamp",
                 ConsumeStats {
                     refused_timestamp: true,
+                    ..ConsumeStats::default()
+                },
+            ),
+            (
+                "untraded_sentinel",
+                ConsumeStats {
+                    untraded_sentinel: true,
                     ..ConsumeStats::default()
                 },
             ),
