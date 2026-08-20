@@ -227,7 +227,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     hysteresis does NOT swap inside the dwell window; a swap emits its audit row; a `0`
     contract id is refused and counted
 
-- [ ] **Item 6 — 09:15 first-bucket open/high/low (operator 2026-08-19: "Yes go ahead only for this 9.15 am open high low alone dude okay?")**
+- [x] **Item 10 — 09:15 first-bucket open/high/low (operator 2026-08-19: "Yes go ahead only for this 9.15 am open high low alone dude okay?")**
   - Fix the live defect where the day's first candle can publish `open` OUTSIDE its own
     `[low, high]` (gap-open mornings): clamp the range to contain the exchange official
     open at BOTH `day_open` stamp sites.
@@ -246,7 +246,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     `widening_never_narrows_an_observed_range`,
     `ohlc_invariant_holds_across_a_folded_session`,
     `day_boundary_rearms_the_first_bucket_treatment`
-  - Full design: ITEM 6 addendum below (C1–C8)
+  - Full design: ITEM 10 addendum below (C1–C8)
 
 
 ---
@@ -483,7 +483,7 @@ guarantee remains capture-completeness of RECEIVED frames.
 
 ---
 
-## ITEM 6 — DESIGN ADDENDUM (added 2026-08-19, operator: "Yes go ahead only for this 9.15 am open high low alone dude okay?")
+## ITEM 10 — DESIGN ADDENDUM (added 2026-08-19, operator: "Yes go ahead only for this 9.15 am open high low alone dude okay?")
 
 Given in direct response to a finding that the day's FIRST candle can be published with
 its `open` OUTSIDE its own `[low, high]` range. Scope is exactly what the quote says:
