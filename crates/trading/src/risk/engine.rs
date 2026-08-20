@@ -195,6 +195,40 @@ impl RiskEngine {
         // Check 1: Daily loss threshold
         let (total_pnl, max_loss) = self.daily_loss_state();
 
+        // FAIL CLOSED ON A POISONED BOOK — the same arm `evaluate_daily_loss_halt`
+        // has carried since 2026-07-14, which this path did not.
+        //
+        // 2026-08-20. Both functions read the identical `(total_pnl, max_loss)`
+        // from the identical `daily_loss_state()` helper and then ask the
+        // identical question. Only one of them handled NaN. `NaN < 0.0` is
+        // false and `NaN >= max_loss` is false, so a poisoned accumulator read
+        // as "no loss" and the order was APPROVED — on the one path where the
+        // consequence is a live order rather than a missed halt.
+        //
+        // The two arms were written to never drift, and this is the drift.
+        // Defense-in-depth, not an exploitable hole today: `record_fill_in_segment`
+        // rejects non-finite fill prices, `unrealized_at` returns 0.0 on a
+        // non-finite mark, and `total_unrealized_pnl` only accumulates finite
+        // values — so no live path is known to reach here with NaN. That is
+        // exactly why it must be kept: a guard whose siblings make it
+        // unreachable is free, and the day one of those guards is relaxed is
+        // the day this one is the only thing left.
+        if !total_pnl.is_finite() {
+            error!(
+                code = ErrorCode::RiskGapPreTrade.code_str(),
+                total_pnl,
+                "RISK-GAP-01: total P&L is NON-FINITE at the pre-trade gate — \
+                 REFUSING the order and halting; a poisoned book must never trade"
+            );
+            self.trigger_halt(RiskBreach::MaxDailyLossExceeded);
+            self.total_rejections = self.total_rejections.saturating_add(1);
+            return RiskCheck::Rejected {
+                breach: RiskBreach::MaxDailyLossExceeded,
+                // O(1) EXEMPT: error path, only reached on a poisoned book
+                reason: "daily P&L is not a finite number — refusing to trade".to_string(),
+            };
+        }
+
         // P&L is negative for losses; compare absolute value against threshold
         if total_pnl < 0.0 && total_pnl.abs() >= max_loss {
             self.trigger_halt(RiskBreach::MaxDailyLossExceeded);
@@ -718,6 +752,80 @@ impl RiskEngine {
 mod tests {
     use super::*;
     use crate::risk::types::RiskBreach;
+
+    #[test]
+    fn a_poisoned_book_is_refused_at_the_pre_trade_gate_not_approved() {
+        // The asymmetry this closes: `evaluate_daily_loss_halt` has explicitly
+        // handled non-finite P&L since 2026-07-14, with a comment stating the
+        // reason — "`NaN < 0.0` is false, so treating it as 'no loss' would
+        // silently bypass the halt". `check_order` computed the SAME value
+        // from the SAME helper and asked the SAME question with no such arm.
+        //
+        // So on the one path whose output is a live order, a poisoned
+        // accumulator read as "no loss" and the order was APPROVED.
+        let mut engine = make_engine();
+        engine.total_realized_pnl = f64::NAN;
+
+        let result = engine.check_order(1001, 1);
+        assert!(
+            matches!(
+                result,
+                RiskCheck::Rejected {
+                    breach: RiskBreach::MaxDailyLossExceeded,
+                    ..
+                }
+            ),
+            "a NaN book must REFUSE the order, got {result:?}"
+        );
+        assert!(engine.is_halted(), "and must halt, not merely refuse once");
+        assert_eq!(engine.total_rejections(), 1);
+    }
+
+    #[test]
+    fn infinite_loss_is_refused_too_not_only_nan() {
+        // -inf is the other non-finite shape and reaches the same helper. It
+        // happens to pass the `< 0.0 && >= max_loss` test on its own, so it
+        // would halt anyway — asserted so a future edit that reorders the arms
+        // cannot leave it silently on the approving side.
+        let mut engine = make_engine();
+        engine.total_realized_pnl = f64::NEG_INFINITY;
+        assert!(matches!(
+            engine.check_order(1001, 1),
+            RiskCheck::Rejected { .. }
+        ));
+
+        // +inf is the dangerous one: a fictitious infinite PROFIT. Without the
+        // finite arm it is not a loss, not over any threshold, and trades.
+        let mut engine = make_engine();
+        engine.total_realized_pnl = f64::INFINITY;
+        assert!(
+            matches!(engine.check_order(1001, 1), RiskCheck::Rejected { .. }),
+            "an infinite phantom PROFIT must not be allowed to trade"
+        );
+    }
+
+    #[test]
+    fn both_daily_loss_paths_carry_the_finite_guard() {
+        // The two arms were written to never drift and drifted anyway, for a
+        // month, silently — because nothing compared them. A behavioural pin
+        // rather than a source scan: each path is driven with the same
+        // poisoned book and must reach the same verdict.
+        //
+        // Reverting either arm fails here, whichever one it is.
+        let mut a = make_engine();
+        a.total_realized_pnl = f64::NAN;
+        let order_path_refused = matches!(a.check_order(1001, 1), RiskCheck::Rejected { .. });
+
+        let mut b = make_engine();
+        b.total_realized_pnl = f64::NAN;
+        let halt_path_halted = b.evaluate_daily_loss_halt();
+
+        assert_eq!(
+            order_path_refused, halt_path_halted,
+            "the pre-trade gate and the halt evaluator disagree about a poisoned book"
+        );
+        assert!(order_path_refused, "and both must fail CLOSED, not open");
+    }
 
     fn make_engine() -> RiskEngine {
         // 2% max daily loss, 100 lots max per instrument, 10L capital
