@@ -104,15 +104,41 @@ jobs:
 
       - name: Resolve instance id
         id: iid
+        env:
+          SECRET_IID: ${{ secrets.EC2_INSTANCE_ID }}
         run: |
           set -euo pipefail
-          IID="${{ secrets.EC2_INSTANCE_ID }}"
-          if [ -z "$IID" ]; then
-            # Fall back to the Name tag if the secret isn't set.
-            IID=$(aws ec2 describe-instances --region "$AWS_REGION" \
-                    --filters "Name=tag:Name,Values=tv-prod-app" \
-                              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-                    --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          # 2026-08-20: the LIVE box is the authority, not the secret. This step
+          # used to trust `secrets.EC2_INSTANCE_ID` whenever it was non-empty and
+          # only tag-resolve when it was UNSET — so a STALE secret (set, but
+          # naming a terminated instance) silently aimed every aws-control action
+          # at a dead box. That is exactly the state the repo was in after the
+          # 2026-08-12 instance recreate: the secret still named the old
+          # i-0b956d..., the live box was i-0c3fe9....
+          #
+          # Tag-resolution first also removes the standing manual chore of
+          # rotating this secret after every recreate — the operator's
+          # no-manual-intervention mandate. The secret survives ONLY as a
+          # fallback for the case where the Name tag is missing.
+          RESOLVED=$(aws ec2 describe-instances --region "$AWS_REGION" \
+                      --filters "Name=tag:Name,Values=tv-prod-app" \
+                                "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+                      --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null || true)
+          COUNT=$(printf '%s\n' $RESOLVED | grep -c . || true)
+          if [ "$COUNT" -gt 1 ]; then
+            # Two boxes carrying the prod Name tag is itself the emergency —
+            # refuse rather than restart the wrong machine (autopilot does the same).
+            echo "::error::$COUNT instances carry tag Name=tv-prod-app — refusing to guess. Found: $RESOLVED"
+            exit 1
+          elif [ "$COUNT" -eq 1 ]; then
+            IID=$(printf '%s\n' $RESOLVED | head -1)
+            if [ -n "${SECRET_IID:-}" ] && [ "$SECRET_IID" != "$IID" ]; then
+              echo "::warning::EC2_INSTANCE_ID secret is stale (names a different instance) — using the tag-resolved live id $IID. The secret is now advisory only; no rotation required."
+            fi
+          else
+            IID="${SECRET_IID:-}"
+            [ -n "$IID" ] || { echo "::error::no instance carries tag Name=tv-prod-app and EC2_INSTANCE_ID is unset"; exit 1; }
+            echo "::warning::no instance carries tag Name=tv-prod-app — falling back to the EC2_INSTANCE_ID secret ($IID). Tag discovery is blind; verify the box's Name tag."
           fi
           [ -n "$IID" ] && [ "$IID" != "None" ] || { echo "::error::Could not resolve instance id"; exit 1; }
           echo "id=$IID" >> "$GITHUB_OUTPUT"
