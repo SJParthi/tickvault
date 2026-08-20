@@ -38,6 +38,22 @@
 /// is ordinal-stable — every pre-existing ordinal 0..=20 is unchanged,
 /// so `SEAL_SPILL_FORMAT_VERSION` stays 1 and previously-spilled
 /// segments still replay.
+///
+/// **CORRECTED 2026-08-19 — the "STRUCTURAL ONLY (GDF-feed-gated, zero
+/// rows)" sentence above is STALE and has been since 2026-08-11.** It was
+/// true when written: the second-scale frames were added while no live
+/// tick feed existed, and GDF was the expected 1-second producer. Then the
+/// Dhan live main-feed WS was revived (scope-lock 2026-08-09) and its
+/// default flipped ON (2026-08-11), and `MultiTfAggregator::consume_tick`
+/// folds every tick into `TfIndex::ALL` with NO feed gate anywhere — not in
+/// the fold, not in the seal sink, not in the ILP writer. So all 16
+/// second-scale frames produce real rows on the live Dhan lane today.
+///
+/// That matters beyond bookkeeping: the sentence understates the fold's
+/// real cost by 16 of 24 frames, and this repository has twice recorded a
+/// stale doc manufacturing a false finding (see the O(1) table in
+/// CLAUDE.md). The claim is retained above rather than deleted, per house
+/// convention, so the correction is auditable.
 pub const TF_COUNT: usize = 24;
 
 /// 09:15:00 IST expressed as seconds-of-day (`9*3600 + 15*60`).
@@ -85,40 +101,43 @@ pub enum TfIndex {
     // -- Second-scale frames (C3, operator directive 2026-07-21) ------
     // APPENDED after D1 so every pre-existing seal-spill ordinal
     // (0..=4) stays byte-stable (SEAL_SPILL_FORMAT_VERSION stays 1).
-    // STRUCTURAL ONLY: all 16 frames are GDF-feed-gated — ZERO rows
-    // until the GDF 1s live feed lands (separate lane); the REST 1m
-    // cadence fold never writes them.
-    /// 1-second candles (1 s). GDF-feed-gated (structural).
+    // WAS "STRUCTURAL ONLY: all 16 frames are GDF-feed-gated — ZERO rows
+    // until the GDF 1s live feed lands (separate lane)". CORRECTED
+    // 2026-08-19: the Dhan live lane was revived (2026-08-09) and switched
+    // on (2026-08-11), and the fold has no feed gate, so these frames carry
+    // real rows today. The REST 1m cadence fold half of that sentence still
+    // holds — a 1-minute vendor bar cannot open a sub-minute bucket.
+    /// 1-second candles (1 s). Live on the Dhan tick lane since 2026-08-11.
     S1 = 5,
-    /// 2-second candles (2 s). GDF-feed-gated (structural).
+    /// 2-second candles (2 s). Live on the Dhan tick lane since 2026-08-11.
     S2 = 6,
-    /// 3-second candles (3 s). GDF-feed-gated (structural).
+    /// 3-second candles (3 s). Live on the Dhan tick lane since 2026-08-11.
     S3 = 7,
-    /// 4-second candles (4 s). GDF-feed-gated (structural).
+    /// 4-second candles (4 s). Live on the Dhan tick lane since 2026-08-11.
     S4 = 8,
-    /// 5-second candles (5 s). GDF-feed-gated (structural).
+    /// 5-second candles (5 s). Live on the Dhan tick lane since 2026-08-11.
     S5 = 9,
-    /// 6-second candles (6 s). GDF-feed-gated (structural).
+    /// 6-second candles (6 s). Live on the Dhan tick lane since 2026-08-11.
     S6 = 10,
-    /// 7-second candles (7 s). GDF-feed-gated (structural).
+    /// 7-second candles (7 s). Live on the Dhan tick lane since 2026-08-11.
     S7 = 11,
-    /// 8-second candles (8 s). GDF-feed-gated (structural).
+    /// 8-second candles (8 s). Live on the Dhan tick lane since 2026-08-11.
     S8 = 12,
-    /// 9-second candles (9 s). GDF-feed-gated (structural).
+    /// 9-second candles (9 s). Live on the Dhan tick lane since 2026-08-11.
     S9 = 13,
-    /// 10-second candles (10 s). GDF-feed-gated (structural).
+    /// 10-second candles (10 s). Live on the Dhan tick lane since 2026-08-11.
     S10 = 14,
-    /// 11-second candles (11 s). GDF-feed-gated (structural).
+    /// 11-second candles (11 s). Live on the Dhan tick lane since 2026-08-11.
     S11 = 15,
-    /// 12-second candles (12 s). GDF-feed-gated (structural).
+    /// 12-second candles (12 s). Live on the Dhan tick lane since 2026-08-11.
     S12 = 16,
-    /// 13-second candles (13 s). GDF-feed-gated (structural).
+    /// 13-second candles (13 s). Live on the Dhan tick lane since 2026-08-11.
     S13 = 17,
-    /// 14-second candles (14 s). GDF-feed-gated (structural).
+    /// 14-second candles (14 s). Live on the Dhan tick lane since 2026-08-11.
     S14 = 18,
-    /// 15-second candles (15 s). GDF-feed-gated (structural).
+    /// 15-second candles (15 s). Live on the Dhan tick lane since 2026-08-11.
     S15 = 19,
-    /// 30-second candles (30 s). GDF-feed-gated (structural).
+    /// 30-second candles (30 s). Live on the Dhan tick lane since 2026-08-11.
     S30 = 20,
     // -- Minute frames completing the operator's 13-frame set ---------
     // APPENDED after S30 (2026-08-10) so every pre-existing ordinal

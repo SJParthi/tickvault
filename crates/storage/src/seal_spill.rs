@@ -741,6 +741,9 @@ pub struct SpillPruneOutcome {
     pub failed: usize,
     /// Bytes still on disk after the sweep.
     pub bytes_after: u64,
+    /// Files skipped because they are TODAY's file — the one the live writer
+    /// may hold an open descriptor to. Never deleted at any age.
+    pub skipped_live: usize,
 }
 
 /// Deletes spill files older than `max_age_secs` — pure-testable core over an
@@ -779,6 +782,35 @@ pub fn prune_spill_files_at(
     now: std::time::SystemTime,
 ) -> SpillPruneOutcome {
     let mut outcome = SpillPruneOutcome::default();
+    // NEVER delete a file the live writer may hold open (2026-08-19, found by
+    // the adversarial audit — this sweep as first written could do exactly
+    // that, and the consequence is the worst failure mode in this module).
+    //
+    // `SealSpillWriter` caches a LONG-LIVED append descriptor. On POSIX,
+    // unlinking a file an open descriptor still references keeps the inode
+    // alive: the writer goes on appending, `write_all` keeps returning Ok,
+    // absorption keeps reporting `Spilled` — and `read_all` opens a fresh
+    // empty path that can never see any of it. Seals reported durable would
+    // be silently gone. `close_open_handle`'s own doc states this contract
+    // and says it MUST be called whenever the file is unlinked; this sweep
+    // runs in a different task with no writer reference, so it CANNOT honour
+    // that contract and must not create the situation.
+    //
+    // The writer only ever opens TODAY's file (IST-date rotation), so
+    // excluding today's name is a complete defence, and a structural one.
+    //
+    // Age alone is NOT a defence, which is the part worth stating: it happens
+    // to hold today only because the 7-day window exceeds the ~9-hour process
+    // lifetime. That is an accidental invariant enforced by nothing — shorten
+    // the window, or leave a process running across the weekend, and the
+    // sweep starts deleting live files. Two unrelated constants silently
+    // holding a correctness property between them is precisely the shape this
+    // audit keeps finding.
+    let live_name = ist_date_filename(
+        now.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0),
+    );
     // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
     let Ok(entries) = std::fs::read_dir(spill_dir) else {
         return outcome; // missing dir — nothing to prune
@@ -790,6 +822,17 @@ pub fn prune_spill_files_at(
         // strictly alone — deleting a file we did not write, to satisfy our
         // own budget, would be indefensible.
         if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+            continue;
+        }
+        // The live-writer guard. Cheap, and it fails SAFE: an unreadable file
+        // name is treated as live and kept, never deleted on uncertainty.
+        if path.file_name().and_then(|n| n.to_str()) != Some(live_name.as_str()) {
+            // not today's file — eligible, fall through to the age check
+        } else {
+            outcome.skipped_live += 1;
+            if let Ok(meta) = entry.metadata() {
+                outcome.bytes_after = outcome.bytes_after.saturating_add(meta.len());
+            }
             continue;
         }
         let Ok(meta) = entry.metadata() else {
@@ -1791,6 +1834,49 @@ mod tests {
         f.set_times(std::fs::FileTimes::new().set_modified(mtime))
             .expect("set mtime");
         path
+    }
+
+    #[test]
+    fn spill_sweep_never_unlinks_the_live_writers_file() {
+        // THE CRITICAL ONE. The writer holds a long-lived append descriptor to
+        // TODAY's file. Unlinking it on POSIX keeps the inode alive, so the
+        // writer keeps appending to a file `read_all` can never see — seals
+        // reported durable, silently gone.
+        //
+        // Age is deliberately set to 0 and the file is aged far past it: even
+        // then, today's file must survive. If this ever fails, the sweep has
+        // gone back to relying on the accidental window-vs-process-lifetime
+        // ratio that made it safe by luck rather than by construction.
+        let dir = spill_tmp("live");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let live = ist_date_filename(now_secs);
+        let path = write_aged(&dir, &live, SEAL_SPILL_RECORD_SIZE * 4, 10_000_000);
+        let out = prune_spill_files_at(&dir, 0, std::time::SystemTime::now());
+        assert!(path.exists(), "today's file must NEVER be unlinked");
+        assert_eq!(out.deleted, 0);
+        assert_eq!(out.skipped_live, 1, "and it must be reported, not silent");
+        assert_eq!(out.records_lost, 0, "no loss may be claimed");
+    }
+
+    #[test]
+    fn spill_sweep_still_deletes_yesterdays_file() {
+        // The inverse: the live-writer guard must not accidentally spare
+        // EVERY file, which would silently restore the unbounded growth this
+        // sweep exists to stop.
+        let dir = spill_tmp("yesterday");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let older = ist_date_filename(now_secs - 3 * 86_400);
+        let path = write_aged(&dir, &older, 0, 10_000);
+        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        assert!(!path.exists(), "an old day's file is still eligible");
+        assert_eq!(out.deleted, 1);
+        assert_eq!(out.skipped_live, 0);
     }
 
     #[test]

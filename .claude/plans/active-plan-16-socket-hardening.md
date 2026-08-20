@@ -904,3 +904,163 @@ recovery arm. Attempting (2) or (3) first produces code with nothing safe to cal
 naive version would have converted a bounded, loud, counted tick loss into an
 out-of-memory kill of the whole lane during a database stall. That trade is strictly
 worse than the defect it repairs.
+
+## ITEM 22 (added 2026-08-19) — the 25,000-instrument contract universe
+
+**Operator:** *"You motherucker I clelarug told yo uto Goa head with 25k
+sinturments with dperh 5 with full mode right motherfucker see is this clealry
+done built an dwored or not motherucker okay? Menabwile what about depth 20 of
+250 instruments dude and what about depth 200 of 5 instruments and order update
+entie capturing dude okay? I need all these now to be build wired integrated
+implemented dude okay?"* (2026-08-19)
+
+Authority for the SET is the 2026-08-15 "FULL-MODE, FULL-UNIVERSE SUBSCRIPTION
+SCOPE" section of `websocket-connection-scope-lock.md`. This item is the
+implementation of that authorization, which had been recorded and never built.
+
+### The finding that made it necessary
+
+Verified in source before any code was written: the live universe resolves
+through `master_csv::is_nse_cash_equity` — `NSE && E && EQ`. Cash equity only.
+The authorized ~24,600 set is ~90% option contracts, and a cash-equity filter
+can never emit one. The lane was subscribing ~4,565 spots in Full mode with
+depth on all of them, which is real and is not what was authorized.
+
+Second finding, same audit: depth-20 was carrying **84 of its 250 slots**. Its
+fixed ±10 window was justified in its own doc as "126 instruments across 3
+underlyings", but Dhan serves depth on NSE only, so SENSEX (BSE_FNO) is refused
+every day and the eligible set is two underlyings, not three.
+
+### Plan Items
+
+- [x] Parse the five derivative columns from the Dhan master (INSTRUMENT,
+      SM_EXPIRY_DATE, STRIKE_PRICE, OPTION_TYPE, UNDERLYING_SYMBOL), typed and
+      compact, all OPTIONAL so a six-column header still parses
+  - Files: crates/core/src/instrument/master_csv.rs
+  - Tests: test_a_six_column_master_still_parses_and_reads_as_no_derivatives,
+    test_a_detailed_master_row_carries_its_derivative_fields,
+    test_expiry_accepts_both_vendor_forms_and_refuses_the_rest,
+    test_expiry_packing_orders_the_same_way_calendar_time_does,
+    test_strike_rounds_to_paise_and_refuses_nonsense,
+    test_unknown_instrument_and_option_codes_classify_rather_than_panic,
+    test_class_predicates_split_options_from_futures,
+    test_a_row_too_short_for_an_optional_column_is_kept_not_rejected
+- [x] Contract selection: futures all expiries, index chains current expiry,
+      stock options ATM ± 25, capacity-bounded by shrinking the ATM window
+  - Files: crates/app/src/dhan_contract_universe.rs, crates/app/src/lib.rs
+  - Tests: a_full_shape_selection_reaches_the_authorized_scale,
+    the_atm_window_shrinks_rather_than_the_selection_truncating,
+    an_underlying_with_no_spot_price_is_refused_not_guessed,
+    every_underlying_gets_the_same_window_regardless_of_iteration_order,
+    futures_and_index_chains_outrank_stock_options_under_pressure,
+    the_same_id_in_two_segments_is_kept_as_two_instruments,
+    the_selection_is_deterministic_across_runs
+- [x] Adaptive depth-20 window sized to the ELIGIBLE underlying count, filling
+      244 of 250 instead of 84
+  - Files: crates/app/src/dhan_depth_universe.rs
+  - Tests: the_depth_20_window_fills_the_envelope_without_exceeding_it,
+    the_two_eligible_underlyings_case_fills_the_pool,
+    no_eligible_underlyings_selects_no_window_rather_than_dividing_by_zero,
+    a_very_wide_underlying_set_degrades_to_the_money_rather_than_overflowing,
+    the_pool_envelope_is_derived_from_the_vendor_limits_not_written_down
+- [x] Contract artifact written by the daily rider, read by the attach
+  - Files: crates/app/src/dhan_universe.rs, crates/app/src/dhan_contract_universe.rs
+  - Tests: the_artifact_round_trips_to_the_same_selection_as_a_parsed_master,
+    a_contract_row_survives_serialisation,
+    the_artifact_path_is_dated_so_a_stale_day_is_never_read
+- [x] Live spot prices from QuestDB, joined to underlyings via the symbol map
+  - Files: crates/app/src/dhan_contract_universe.rs
+  - Tests: the_spot_query_bounds_to_today_and_keys_on_the_composite,
+    spot_prices_parse_to_paise_and_refuse_the_unusable,
+    the_symbol_map_reads_names_and_survives_a_bad_row,
+    the_join_prices_only_symbols_that_actually_ticked,
+    the_join_will_not_price_a_stock_off_its_own_derivative
+- [x] Contract dial on the existing late-attach retry loop, bounded by the
+      connections the spot universe already consumed
+  - Files: crates/app/src/dhan_feed_stack.rs
+  - Tests: remaining_capacity_is_counted_in_whole_connections,
+    a_full_pool_leaves_no_room_rather_than_overflowing_it,
+    connection_count_rounds_up_because_a_partial_socket_is_still_a_socket,
+    the_two_helpers_can_never_together_exceed_the_authorized_pool,
+    a_malformed_date_selects_nothing_rather_than_an_expired_contract,
+    the_date_packing_matches_the_one_expiries_are_stored_in
+
+## Item 22 Design
+
+Two resolution times, because they need different evidence. The daily rider
+(08:30) has the master and writes the derivative subset as an artifact. The
+attach (post-open) has live prices and does the selection, because locating
+at-the-money needs a price that does not exist at boot.
+
+Contracts ride the EXISTING depth late-attach retry loop rather than a second
+task. Not for tidiness: both wait on post-open evidence, and both dial through
+a `PoolSupervisor` that cannot be owned by two tasks at once.
+
+Priority order under capacity pressure: index futures, stock futures, index
+chains, then stock options. The ATM window is the only elastic dimension, and
+it shrinks uniformly across underlyings — chosen before anything is pushed, so
+an early stock cannot take 25 strikes while a late one takes three.
+
+## Item 22 Edge Cases
+
+- Six-column master (every existing fixture): parses, derivative fields read
+  as absent, equity join unchanged.
+- Underlying with no tick today: options REFUSED and counted, never centred on
+  a guessed at-the-money.
+- Ladder shorter than the window: taken whole, no index panic on vendor data.
+- Same numeric id in two segments: kept as two instruments (I-P1-11).
+- Malformed IST date or expiry: packs to 0, which compares as "before today",
+  so nothing is selected rather than an expired contract being subscribed.
+- Spot universe already using all 5 main-feed connections: contracts get 0
+  capacity rather than a sixth connection.
+- Envelope smaller than the futures alone: truncated AND counted.
+
+## Item 22 Failure Modes
+
+- Contract artifact unwritable: coded error, spot universe unaffected, the
+  session carries no contracts and says so.
+- Artifact unreadable at attach: empty selection, coded error naming the path.
+- Symbol map unreadable: futures and index chains still selected; stock
+  options refused for want of prices.
+- QuestDB spot query fails: empty price map, stock options refused, futures
+  and index chains unaffected.
+- Every failure returns an EMPTY selection, never a partial one presented as
+  complete.
+
+## Item 22 Test Plan
+
+`cargo test -p tickvault-core --lib master_csv` (34) and
+`cargo test -p tickvault-app` (1,448 lib + 82 binaries). Pure functions
+throughout the selection path, so every hostile case is a fixture rather than
+a mock: no I/O, no clock, no network in `select_contract_universe`.
+
+## Item 22 Rollback
+
+Set `[dhan_universe] live_subscription_from_master = false` to restore the
+4-SID index universe. The contract attach then finds an artifact it does not
+need and selects nothing extra. No schema change, no migration; the artifact is
+a dated file that is simply not read.
+
+## Item 22 Observability
+
+`contract universe resolved` logs artifact size, priced underlyings, selected
+count, per-class counts, the ATM window actually used, underlyings without a
+spot, and contracts dropped for capacity. The late-attach success line reports
+the same alongside the depth counts. Every refusal in `ContractSelection` is a
+counted field, so a short selection is never mistaken for a thin market.
+
+## Item 22 Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: selection
+is a pure function proven to reach 22,660 instruments on a 220-stock shape, to
+stay inside the envelope at every underlying count from 1 to 8, and to refuse
+rather than guess when a price is missing.
+
+NOT claimed: that any of this has received a tick. The Dhan live lane has not
+reported a non-zero cross-verification `compared` count since the 2026-07-13
+retirement, so contract selection is code that is ready for a feed that is
+still unproven. NOT claimed: CPU at 25,000 instruments — the drain has never
+run above ~4,565 and the ~12,500 packet/sec figure is arithmetic, not a
+measurement. NOT claimed: index FUTURES depth, which no authorized Dhan source
+can reach. NOT claimed: that the ~24,600 figure will be met on any given day —
+it is whatever the master resolves, bounded by the connections left after spot.

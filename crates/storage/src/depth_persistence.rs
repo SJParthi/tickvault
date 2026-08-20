@@ -168,6 +168,21 @@ pub const DEPTH_KIND_20: &str = "d20";
 /// `depth_kind` SYMBOL value for the 200-level feed.
 pub const DEPTH_KIND_200: &str = "d200";
 
+/// `depth_kind` SYMBOL value for the 5 levels carried INLINE in every Full-mode
+/// tick packet (2026-08-19).
+///
+/// A THIRD kind, not a variant of the other two, and the DEDUP key is why:
+/// `d5`, `d20` and `d200` can all describe level 3 of the same instrument at
+/// the same instant from three different sources. Without a distinct label they
+/// collide on the key and QuestDB silently upserts one over the others —
+/// destroying two of the three observations. The discriminator is what makes a
+/// single shared table safe.
+///
+/// This source is free in bandwidth terms: Full mode is already subscribed and
+/// the 5 levels already arrive in every packet. Until this landed, the drain
+/// read the price out of the packet and threw the book away.
+pub const DEPTH_KIND_5: &str = "d5";
+
 /// `side` SYMBOL value for the buy side (feed response code 41).
 pub const DEPTH_SIDE_BID: &str = "bid";
 
