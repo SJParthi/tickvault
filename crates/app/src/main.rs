@@ -191,6 +191,43 @@ const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 300;
 /// Poll cadence for the boot-completed feed-liveness wait.
 const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
 
+/// How many consecutive 30s stall scans must run with ZERO ticks observed
+/// before the starved-detector line fires.
+///
+/// Four scans is two minutes. Deliberately not one: a scan can legitimately
+/// precede the first tick right after boot (the lane dials, authenticates and
+/// subscribes before any frame arrives), and reporting starvation during that
+/// window would be a false alarm on every single start. Two minutes is far
+/// past any normal dial-to-first-frame, and the condition it detects is
+/// structural rather than transient — once true it stays true, so waiting
+/// costs nothing and guessing early costs credibility.
+const STALL_SCAN_STARVED_AFTER_SCANS: u32 = 4;
+
+/// Should the stall scan report that it is STARVED rather than healthy?
+///
+/// Pure, so the four-way condition can be asserted directly instead of
+/// inferred from a running task. Each argument rules out a way of being wrong:
+///
+/// - `live_ticks_expected` — on the REST-only runtime an empty tracker is the
+///   correct, expected state, and firing there would page on normal operation.
+/// - `ticks_observed == 0` — one arriving tick proves the wiring, and the scan
+///   is then reporting on something real.
+/// - `stale_scans >= STALL_SCAN_STARVED_AFTER_SCANS` — a scan can legitimately
+///   precede the first tick right after boot.
+/// - `!already_reported` — the condition is structural, so it stays true once
+///   it is true; repeating it every 30s would flood without adding anything.
+const fn stall_scan_is_starved(
+    live_ticks_expected: bool,
+    ticks_observed: u64,
+    stale_scans: u32,
+    already_reported: bool,
+) -> bool {
+    live_ticks_expected
+        && ticks_observed == 0
+        && !already_reported
+        && stale_scans >= STALL_SCAN_STARVED_AFTER_SCANS
+}
+
 /// Decide whether the boot-completed "the app is alive" signal
 /// (`tv_boot_completed`) may be emitted, given each feed's enabled flag and its
 /// observed lane-running state.
@@ -2400,6 +2437,9 @@ async fn run_slow_boot_observability(
     // task's 2s /exec ping is the surviving reachability probe, so it now
     // owns the flag write.
     health: tickvault_api::state::SharedHealthStatus,
+    // Whether a live tick SOURCE exists this session (both live-lane gates
+    // open). Load-bearing for the stall scan below — see its comment.
+    live_ticks_expected: bool,
 ) {
     info!("S4-T1d: slow-boot observability task started");
 
@@ -2424,6 +2464,15 @@ async fn run_slow_boot_observability(
     let stale_check_interval =
         std::time::Duration::from_secs(tickvault_common::constants::STALE_LTP_SCAN_INTERVAL_SECS);
     let mut last_stale_check = std::time::Instant::now();
+
+    // Starved-detector state. `ticks_observed` counts what actually arrived on
+    // the broadcast; `stale_scans` counts how many times the scan below ran.
+    // The pair is what separates "nothing is stalling" from "I can see
+    // nothing" — a distinction the scan's own return value cannot make, since
+    // an empty tracker and a healthy universe both yield zero.
+    let mut ticks_observed: u64 = 0;
+    let mut stale_scans: u32 = 0;
+    let mut starved_reported = false;
 
     // HTTP client for QuestDB /exec health ping. Uses a short timeout so
     // an unresponsive QDB is treated as disconnected within 1s.
@@ -2456,6 +2505,7 @@ async fn run_slow_boot_observability(
         tokio::select! {
             recv = tick_rx.recv() => match recv {
                 Ok(tick) => {
+                    ticks_observed = ticks_observed.saturating_add(1);
                     // Gap detection — the tracker fires its own log/metric on
                     // ERROR thresholds; no backfill request is published
                     // (in-market backfill disabled by user policy).
@@ -2485,6 +2535,45 @@ async fn run_slow_boot_observability(
                     let newly_stale = tick_gap_tracker.detect_stale_instruments();
                     if newly_stale > 0 {
                         debug!(newly_stale, "per-instrument stall scan: newly-stale count");
+                    }
+                    stale_scans = stale_scans.saturating_add(1);
+                    // A DETECTOR THAT SEES NOTHING MUST NOT REPORT NOTHING WRONG.
+                    //
+                    // 2026-08-20. This scan is fed exclusively by the process
+                    // tick broadcast, and the revived Dhan live lane folds its
+                    // ticks internally without ever publishing to it. So with
+                    // the lane ON, the scan ran every 30 seconds over an empty
+                    // tracker and returned a reassuring zero — forever. An
+                    // operator watching a stall detector execute on schedule
+                    // and report nothing wrong would conclude no instrument
+                    // was stalling, while the detector could not see a single
+                    // one of them.
+                    //
+                    // Zero newly-stale is only good news when something is
+                    // arriving. Said once per process, edge-latched: the
+                    // condition is structural, so repeating it every 30s would
+                    // be a log flood carrying no new information.
+                    if stall_scan_is_starved(
+                        live_ticks_expected,
+                        ticks_observed,
+                        stale_scans,
+                        starved_reported,
+                    ) {
+                        starved_reported = true;
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::RiskGapTickGap
+                                .code_str(),
+                            stale_scans,
+                            "the per-instrument stall detector has run {stale_scans} scans and \
+                             observed ZERO ticks while the live feed is enabled. It is reporting \
+                             no stalled instruments because it can see no instruments — not \
+                             because none are stalling. Its input is the process tick broadcast, \
+                             which the live lane does not publish to; the lane's own 30s silence \
+                             scan (RISK-GAP-03) is the signal that IS wired. Treat this \
+                             detector's verdict as absent, not as healthy.",
+                            stale_scans = stale_scans
+                        );
+                        metrics::counter!("tv_stall_detector_starved_total").increment(1);
                     }
                     last_stale_check = std::time::Instant::now();
                 }
@@ -2951,10 +3040,31 @@ async fn build_shared_infra(
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
         let obs_health = health_status.clone();
+        // Does a live tick SOURCE exist this session?
+        //
+        // Computed here because this is where config lives, and passed in
+        // because the detector cannot otherwise tell the difference between
+        // the two states that look identical from inside it: "every
+        // instrument is healthy" and "I am connected to nothing". On the
+        // REST-only runtime the second is correct and expected; with the live
+        // lane enabled it is a failure — and until 2026-08-20 the 30s scan
+        // reported a reassuring zero in both cases.
+        let live_ticks_expected = matches!(
+            tickvault_app::dhan_feed_stack::feed_stack_gate(
+                config.feeds.dhan_enabled,
+                std::env::var(tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+            tickvault_app::dhan_feed_stack::FeedStackGate::Enabled
+        );
         tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg, obs_health).await;
+            run_slow_boot_observability(obs_rx, questdb_cfg, obs_health, live_ticks_expected).await;
         });
-        info!("slow-boot observability consumer started");
+        info!(
+            live_ticks_expected,
+            "slow-boot observability consumer started"
+        );
     }
     // Dead-code cleanup — BATCH-5 (2026-07-19): the tick-storage broadcast
     // consumer was REMOVED (in the PrevDayCache/TickStorage cleanup). The tick
@@ -3510,6 +3620,78 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stall_scan_reports_starved_only_when_it_can_see_nothing_and_should() {
+        // The false-OK this closes: the 30s per-instrument stall scan is fed
+        // exclusively by the process tick broadcast, and the revived Dhan live
+        // lane folds its ticks internally without ever publishing to it. So
+        // with the lane ON, the scan ran on schedule over an empty tracker and
+        // returned zero newly-stale — indistinguishable, to an operator, from
+        // "every instrument is healthy".
+        //
+        // Fires once the lane is on, nothing has arrived, and enough scans
+        // have run to rule out the boot window.
+        assert!(stall_scan_is_starved(
+            true,
+            0,
+            STALL_SCAN_STARVED_AFTER_SCANS,
+            false
+        ));
+
+        // REST-only runtime: an empty tracker is correct and expected there,
+        // so firing would page on normal operation every single day.
+        assert!(!stall_scan_is_starved(
+            false,
+            0,
+            STALL_SCAN_STARVED_AFTER_SCANS,
+            false
+        ));
+
+        // One tick proves the wiring — the scan is now reporting on something
+        // real and its zero means what it says.
+        assert!(!stall_scan_is_starved(
+            true,
+            1,
+            STALL_SCAN_STARVED_AFTER_SCANS,
+            false
+        ));
+
+        // Boot window: the lane dials, authenticates and subscribes before any
+        // frame arrives, so an early scan legitimately precedes the first tick.
+        assert!(!stall_scan_is_starved(
+            true,
+            0,
+            STALL_SCAN_STARVED_AFTER_SCANS.saturating_sub(1),
+            false
+        ));
+
+        // Edge-latched: structural, so it stays true — repeating it every 30s
+        // would flood the sink with a line carrying no new information.
+        assert!(!stall_scan_is_starved(
+            true,
+            0,
+            STALL_SCAN_STARVED_AFTER_SCANS.saturating_mul(100),
+            true
+        ));
+    }
+
+    #[test]
+    fn stall_scan_starve_threshold_is_past_any_normal_dial_to_first_frame() {
+        // 4 scans x 30s = 2 minutes. Not a free number: one scan would fire on
+        // every boot before the first frame, and a large one would let a
+        // genuinely blind detector look healthy for most of a session.
+        assert!(
+            STALL_SCAN_STARVED_AFTER_SCANS >= 2,
+            "a single scan would false-alarm on every boot"
+        );
+        let window_secs = u64::from(STALL_SCAN_STARVED_AFTER_SCANS)
+            .saturating_mul(tickvault_common::constants::STALE_LTP_SCAN_INTERVAL_SECS);
+        assert!(
+            (60..=300).contains(&window_secs),
+            "starve window is {window_secs}s — outside the 1-5 minute band"
+        );
+    }
 
     // ── resolve_tokio_worker_threads (CPU isolation, Quote 17b 2026-08-19) ──
     //

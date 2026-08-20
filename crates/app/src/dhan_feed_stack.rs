@@ -3164,6 +3164,28 @@ fn append_inline_depth(
     let mut rows = 0_u64;
     for (idx, level) in levels.iter().enumerate() {
         let level_no = i64::try_from(idx).unwrap_or(i64::MAX).saturating_add(1);
+        // PRICE PRECISION — `f32_to_f64_clean`, never bare `f64::from`.
+        //
+        // 2026-08-20. These are the ONLY f32 prices in this file: the inline
+        // 5-level book rides inside the 162-byte Full packet, where Dhan
+        // sends prices as f32, while the dedicated depth-20/200 sockets send
+        // native f64. So the two writers a few hundred lines apart look
+        // superficially identical and are not — and the d5 half shipped with
+        // `f64::from`, widening the IEEE-754 bit pattern: 10.20 became
+        // 10.19999980926514, 23925.65 became 23925.650390625.
+        //
+        // Both land in the SAME `market_depth` table, so one instrument at one
+        // instant carried exact decimals on its d20 rows and 12-digit
+        // artifacts on its d5 rows, and any price equality against `ticks`
+        // (which has always applied this conversion) silently missed. Option
+        // premiums sit on x.05/x.20/x.35 constantly, so this bit almost every
+        // level rather than rarely.
+        //
+        // Rounding is deliberately NOT applied on top: after this conversion
+        // the value is already the shortest decimal that round-trips through
+        // f32, which for any real tick-size price IS the operator-visible
+        // number — and the d20/d200 rows in the same table are unrounded, so
+        // adding it here would trade one inconsistency for another.
         let plausible = |p: f32| -> bool {
             let p = f64::from(p);
             p.is_finite() && p >= 0.0 && p <= f64::from(MAX_PLAUSIBLE_LTP)
@@ -3175,7 +3197,7 @@ fn append_inline_depth(
                 depth_kind: DEPTH_KIND_5,
                 side: DEPTH_SIDE_BID,
                 level: level_no,
-                price: f64::from(level.bid_price),
+                price: tickvault_common::price_precision::f32_to_f64_clean(level.bid_price),
                 quantity: i64::from(level.bid_quantity),
                 orders: i64::from(level.bid_orders),
                 capture_seq,
@@ -3192,7 +3214,7 @@ fn append_inline_depth(
                 depth_kind: DEPTH_KIND_5,
                 side: DEPTH_SIDE_ASK,
                 level: level_no,
-                price: f64::from(level.ask_price),
+                price: tickvault_common::price_precision::f32_to_f64_clean(level.ask_price),
                 quantity: i64::from(level.ask_quantity),
                 orders: i64::from(level.ask_orders),
                 capture_seq,
@@ -9092,6 +9114,69 @@ mod inline_depth_tests {
             counters(),
         );
         assert_eq!(rows, 10, "5 levels x 2 sides");
+    }
+
+    #[test]
+    fn append_inline_depth_writes_clean_decimals_not_widening_artifacts() {
+        // The defect this pins, live for a day before it was caught: the
+        // inline 5-level book carries Dhan's f32 prices, and this writer
+        // widened them with a bare `f64::from`. 10.20 went into the
+        // `market_depth` table as 10.199999809265137 and 23925.65 as
+        // 23925.650390625 — while the depth-20/200 rows for the SAME
+        // instrument at the SAME instant, written a few hundred lines away
+        // from native-f64 wire values, carried the exact decimals.
+        //
+        // One table, two precisions, and no counter that could show it: `rows`
+        // counts ILP appends, not what the numbers say. Any price equality
+        // against `ticks` (which has always applied this conversion) silently
+        // missed, and option premiums sit on x.05/x.20/x.35 constantly, so it
+        // bit nearly every level rather than rarely.
+        //
+        // Bite-proven: reverting to `f64::from` fails on the first assert.
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+            // Both are exactly representable in DECIMAL and NOT in binary —
+            // the whole class of price this bug corrupts.
+            bid_price: 10.20,
+            ask_price: 23925.65,
+        }; 5];
+        let rows = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            1_700_000_000_000_000_000,
+            0,
+            0,
+            counters(),
+        );
+        assert_eq!(rows, 10, "5 levels x 2 sides");
+
+        let ilp = sink.pending_ilp();
+        assert!(
+            !ilp.contains("10.1999"),
+            "the f32 widening artifact for 10.20 reached the wire: {ilp}"
+        );
+        assert!(
+            !ilp.contains("23925.6503"),
+            "the f32 widening artifact for 23925.65 reached the wire: {ilp}"
+        );
+        assert!(
+            ilp.contains("price=10.2"),
+            "the operator-visible bid price is missing: {ilp}"
+        );
+        assert!(
+            ilp.contains("price=23925.65"),
+            "the operator-visible ask price is missing: {ilp}"
+        );
     }
 
     #[test]

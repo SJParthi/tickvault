@@ -282,6 +282,20 @@ scan_tick_price_precision 'f64::from(tick\.day_low)'            "$STAGED_FILES"
 scan_tick_price_precision 'f64::from(tick\.day_close)'          "$STAGED_FILES"
 scan_tick_price_precision 'f64::from(tick\.average_traded_price)' "$STAGED_FILES"
 
+# 2026-08-20: the MarketDepthLevel f32 price fields ADDED. The guard above
+# targets ParsedTick fields BY NAME, so the inline 5-level book — which rides
+# inside the same 162-byte Full packet and carries the same f32 prices — was
+# outside its scope, and `f64::from(level.bid_price)` shipped into the
+# `market_depth` table writing 10.19999980926514 next to the depth-20 rows'
+# exact 10.20. This is the THIRD time this guard's SCOPE, not its pattern, was
+# the defect (2026-05-25 crates/trading+core, 2026-08-07 crates/app,
+# 2026-08-20 the depth fields). A named-field guard only ever covers the
+# fields someone remembered to name.
+scan_tick_price_precision 'f64::from(level\.bid_price)'   "$STAGED_FILES"
+scan_tick_price_precision 'f64::from(level\.ask_price)'   "$STAGED_FILES"
+scan_tick_price_precision 'f64::from(l\.bid_price)'       "$STAGED_FILES"
+scan_tick_price_precision 'f64::from(l\.ask_price)'       "$STAGED_FILES"
+
 # ─────────────────────────────────────────────
 # CATEGORY 3: Hardcoded values (all prod code)
 # ─────────────────────────────────────────────
