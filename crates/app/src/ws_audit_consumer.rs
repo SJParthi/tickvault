@@ -37,6 +37,104 @@ pub fn spawn_ws_event_audit_consumer(
     tx
 }
 
+/// Creates the LIVE-FEED socket lifecycle channel and spawns a forwarder that
+/// stamps each event and widens it into a [`WsEventAuditRow`].
+///
+/// # Why the stamping happens HERE and not at the socket
+///
+/// `pool_supervisor.rs` is under a blanket ban on wall-clock reads
+/// (`test_pool_supervisor_source_never_reads_the_wall_clock`): the ladder,
+/// token expiry and backoff are all monotonic so an NTP step cannot expire all
+/// sixteen sockets at once. An audit timestamp is not special enough to earn a
+/// carve-out in a guard whose value is that it has none. So the socket reports
+/// WHAT happened — allocation-free, every field `Copy` — and this task, which
+/// already owns the IST convention, records WHEN.
+///
+/// [`WsEventAuditRow`]: tickvault_common::ws_event_types::WsEventAuditRow
+#[must_use]
+// TEST-EXEMPT: spawn wrapper — needs a tokio runtime and a live QuestDB to reach. Its LOGIC is `lifecycle_row`, which is tested directly below.
+pub fn spawn_live_feed_lifecycle_audit(
+    questdb_cfg: tickvault_common::config::QuestDbConfig,
+) -> tokio::sync::mpsc::Sender<tickvault_core::websocket::pool_supervisor::WsLifecycleEvent> {
+    use tickvault_core::websocket::pool_supervisor::WsLifecycleEvent;
+
+    let rows_tx = spawn_ws_event_audit_consumer(questdb_cfg);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<WsLifecycleEvent>(WS_EVENT_AUDIT_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let now_ist_nanos = chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+                .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+            if rows_tx
+                .try_send(lifecycle_row(event, now_ist_nanos))
+                .is_err()
+            {
+                metrics::counter!(
+                    "tv_ws_event_audit_dropped_total",
+                    "reason" => "live_feed_forward"
+                )
+                .increment(1);
+            }
+        }
+    });
+    tx
+}
+
+/// Widens one socket lifecycle event into the audit row, at a given instant.
+///
+/// Split out of the spawn wrapper so the mapping can be asserted without a
+/// tokio runtime or a live QuestDB — this is where every decision that could
+/// be silently wrong actually lives.
+fn lifecycle_row(
+    event: tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
+    now_ist_nanos: i64,
+) -> tickvault_common::ws_event_types::WsEventAuditRow {
+    use tickvault_common::ws_event_types::{WsEventAuditRow, WsType};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+
+    let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+    WsEventAuditRow {
+        event_ts_ist_nanos: now_ist_nanos,
+        trading_date_ist_nanos: now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day),
+        feed: tickvault_common::feed::Feed::Dhan,
+        // Derived from the ENDPOINT. The sink's own `ws_type` is the WAL
+        // discriminant and reads `LiveFeed` for all fifteen market-data
+        // sockets, so building the row from it would file a depth-200 park
+        // under the main feed — and "which pool went dark?" is the only
+        // question this table exists to answer.
+        ws_type: match event.endpoint {
+            DhanEndpointType::Depth20 => WsType::Depth20,
+            DhanEndpointType::Depth200 => WsType::Depth200,
+            _ => WsType::MainFeed,
+        },
+        connection_index: i64::from(event.connection_index),
+        // The authorized per-endpoint cap, not a live count: this row records
+        // ONE socket's event and must not imply a fleet-wide reading it
+        // cannot have.
+        pool_size: match event.endpoint {
+            DhanEndpointType::Depth20 => {
+                i64::try_from(tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS)
+                    .unwrap_or(i64::MAX)
+            }
+            DhanEndpointType::Depth200 => {
+                i64::try_from(tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS)
+                    .unwrap_or(i64::MAX)
+            }
+            _ => i64::try_from(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS)
+                .unwrap_or(i64::MAX),
+        },
+        event_kind: event.kind,
+        source: event.endpoint.as_str().to_string(),
+        reason: event.reason.to_string(),
+        dhan_code: tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+        down_secs: 0,
+        attempts: 0,
+        market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+    }
+}
+
 /// Drains the WS-event audit channel into the `ws_event_audit` QuestDB table.
 ///
 /// Owns the ILP writer for the table's lifetime, ensures the table exists once
@@ -204,6 +302,72 @@ mod tests {
             tx.try_send(row).is_err(),
             "at capacity try_send must return Full so the caller drops the \
              row — never block the WS read loop"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_row_tests {
+    use super::lifecycle_row;
+    use tickvault_common::ws_event_types::{WsEventKind, WsType};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::WsLifecycleEvent;
+
+    #[test]
+    fn the_row_names_the_endpoints_own_pool_not_the_wal_discriminant() {
+        // The load-bearing mapping. Every one of the fifteen market-data
+        // sockets carries the SAME `ws_type` on its sink — `LiveFeed`, the WAL
+        // record discriminant — so a row built from that field would file a
+        // depth-200 park under the main feed, and "which pool went dark?" is
+        // the only question this table exists to answer. The endpoint travels
+        // on the event precisely so that mistake is unavailable here.
+        for (endpoint, ws_type, pool) in [
+            (DhanEndpointType::MainFeed, WsType::MainFeed, 5_i64),
+            (DhanEndpointType::Depth20, WsType::Depth20, 5),
+            (DhanEndpointType::Depth200, WsType::Depth200, 5),
+        ] {
+            let row = lifecycle_row(
+                WsLifecycleEvent {
+                    endpoint,
+                    connection_index: 4,
+                    kind: WsEventKind::Disconnected,
+                    reason: "park_fatal",
+                },
+                1_700_000_000_000_000_000,
+            );
+            assert_eq!(row.ws_type, ws_type, "endpoint {endpoint:?}");
+            assert_eq!(row.pool_size, pool, "the AUTHORIZED cap, not a live count");
+            assert_eq!(row.connection_index, 4);
+            assert_eq!(row.source, endpoint.as_str());
+            assert_eq!(row.reason, "park_fatal");
+            assert_eq!(row.event_kind, WsEventKind::Disconnected);
+            assert_eq!(row.feed, tickvault_common::feed::Feed::Dhan);
+        }
+    }
+
+    #[test]
+    fn the_trading_date_is_the_ist_midnight_of_the_event_not_of_now() {
+        // `trading_date_ist_nanos` is a DEDUP key column. Deriving it from the
+        // wall clock at write time rather than from the event's own stamp
+        // would file a 23:59 event under the next day whenever the forwarder
+        // lagged across midnight — and the archival and retention paths key on
+        // exactly this column.
+        let nanos_per_day = 86_400_i64 * 1_000_000_000;
+        let midnight = 1_700_000_000_000_000_000_i64 - 1_700_000_000_000_000_000 % nanos_per_day;
+        let late = midnight + nanos_per_day - 1; // 23:59:59.999999999 IST
+        let row = lifecycle_row(
+            WsLifecycleEvent {
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                kind: WsEventKind::Connected,
+                reason: "subscribe_acked",
+            },
+            late,
+        );
+        assert_eq!(row.event_ts_ist_nanos, late);
+        assert_eq!(
+            row.trading_date_ist_nanos, midnight,
+            "the LAST nanosecond of a day must still belong to that day"
         );
     }
 }
