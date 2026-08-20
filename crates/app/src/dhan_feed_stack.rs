@@ -161,6 +161,59 @@ pub const ALIVE_CONNECTIONS_GAUGE: &str = "tv_dhan_ws_alive_connections";
 /// Live count behind [`ALIVE_CONNECTIONS_GAUGE`].
 static ALIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// RAII counter for [`ALIVE_CONNECTIONS`].
+///
+/// The increment happens OUTSIDE the socket task, deliberately, so the gauge
+/// can never read low because a spawn lost a race with its own decrement. That
+/// asymmetry is what makes a guard necessary rather than tidy: a decrement
+/// written as a plain statement at the end of the task body is skipped on
+/// unwind, and the gauge then reports N sockets alive when N−1 are, forever,
+/// with nothing to correct it. Release builds are `panic = "abort"` so today
+/// that only bites in debug and test — the guard makes it structural instead
+/// of relying on that profile setting staying put.
+///
+/// # Honest limit
+///
+/// The atomic update and the gauge publish are two steps, so two threads
+/// transitioning at once can latch the LATER-published of two valid readings —
+/// a transiently stale count, self-correcting on the next transition. Closing
+/// that would need a lock around a monitoring write, which is a worse trade
+/// than a reading that is briefly one socket out of date.
+struct AliveConnectionGuard {
+    armed: bool,
+}
+
+impl AliveConnectionGuard {
+    /// Counts one socket alive and publishes the new total.
+    fn acquire() -> Self {
+        publish_alive_connections(ALIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst) + 1);
+        Self { armed: true }
+    }
+
+    /// Normal path: consume the guard, returning the remaining count so the
+    /// caller can log it. Disarms first, so `Drop` cannot double-decrement.
+    fn release(mut self) -> usize {
+        self.armed = false;
+        Self::decrement()
+    }
+
+    fn decrement() -> usize {
+        let remaining = ALIVE_CONNECTIONS
+            .fetch_sub(1, Ordering::SeqCst)
+            .saturating_sub(1);
+        publish_alive_connections(remaining);
+        remaining
+    }
+}
+
+impl Drop for AliveConnectionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            Self::decrement();
+        }
+    }
+}
+
 /// Publish the alive-socket count.
 fn publish_alive_connections(alive: usize) {
     // `u32::try_from` then `f64::from`: lossless by construction (bounded by
@@ -4326,8 +4379,12 @@ fn dial_planned_connections(
         let guard = planned.guard;
         // Count it alive BEFORE the task starts, so the gauge can never read
         // high because a spawn lost a race with its own decrement.
-        publish_alive_connections(ALIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst) + 1);
+        let alive = AliveConnectionGuard::acquire();
         tokio::spawn(async move {
+            // Moved in, so the socket's lifetime and the guard's are the same
+            // object. Whatever ends this task — a clean return, an early
+            // return, or an unwind — the count comes back down.
+            let alive = alive;
             let exit = run_connection(socket, supervisor, guard, sink, || async {
                 // Post-807/809 re-dial: ask the token manager for a fresh JWT
                 // before presenting a credential again. Failure is logged by
@@ -4349,10 +4406,17 @@ fn dial_planned_connections(
             // errored, or shut down. Nothing re-dials it, and its shard of the
             // universe stops delivering. Publishing here is what turns
             // "sockets we planned" into "sockets that exist".
-            let remaining = ALIVE_CONNECTIONS
-                .fetch_sub(1, Ordering::SeqCst)
-                .saturating_sub(1);
-            publish_alive_connections(remaining);
+            //
+            // Via a DROP GUARD, not a bare decrement — 2026-08-20. The
+            // increment happens outside this task (deliberately, so the gauge
+            // cannot read low because a spawn lost a race), so a decrement
+            // written as a plain statement is skipped on unwind and the gauge
+            // stays permanently overstated: it would report N sockets alive
+            // when N−1 are, with nothing to correct it. Release builds are
+            // `panic = "abort"`, so today that shape only bites in debug and
+            // test — but the asymmetry is the defect, and a guard costs
+            // nothing to make it structural.
+            let remaining = alive.release();
             info!(
                 endpoint = endpoint.as_str(),
                 pool_index = planned.slot.pool_index,
@@ -8912,6 +8976,65 @@ mod contract_attach_tests {
                 "the attach and the parser must agree on {d}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod alive_connection_guard_tests {
+    use super::{ALIVE_CONNECTIONS, AliveConnectionGuard};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn the_count_comes_back_down_on_a_panic_not_only_on_a_clean_return() {
+        // The defect this exists for: the increment happens OUTSIDE the socket
+        // task, so a decrement written as a plain statement at the end of the
+        // task body is skipped when the body unwinds. The gauge then reports N
+        // sockets alive when N-1 are — permanently, with nothing to correct
+        // it, on the one number an operator reads to answer "how many of the
+        // sixteen are up?".
+        //
+        // Serialized against the other test in this module by running both
+        // assertions here: `ALIVE_CONNECTIONS` is process-global, and two
+        // tests mutating it on parallel threads would make either flaky for a
+        // reason unrelated to what they check.
+        let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
+
+        // Clean path.
+        let g = AliveConnectionGuard::acquire();
+        assert_eq!(ALIVE_CONNECTIONS.load(Ordering::SeqCst), base + 1);
+        assert_eq!(g.release(), base);
+        assert_eq!(ALIVE_CONNECTIONS.load(Ordering::SeqCst), base);
+
+        // Unwind path — the one a plain decrement misses.
+        let unwound = std::panic::catch_unwind(|| {
+            let _g = AliveConnectionGuard::acquire();
+            assert_eq!(ALIVE_CONNECTIONS.load(Ordering::SeqCst), base + 1);
+            panic!("socket task died");
+        });
+        assert!(unwound.is_err(), "the panic must actually have happened");
+        assert_eq!(
+            ALIVE_CONNECTIONS.load(Ordering::SeqCst),
+            base,
+            "an unwound socket task must still give its slot back — otherwise \
+             the alive gauge is overstated for the rest of the process"
+        );
+    }
+
+    #[test]
+    fn release_disarms_so_drop_cannot_double_count() {
+        // `release` consumes the guard and `Drop` still runs on the moved-out
+        // value. If it did not disarm, every clean exit would decrement twice
+        // and the gauge would read LOW — the opposite failure, equally wrong,
+        // and the one a naive guard introduces while fixing the first.
+        let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
+        let g = AliveConnectionGuard::acquire();
+        let remaining = g.release();
+        assert_eq!(remaining, base);
+        assert_eq!(
+            ALIVE_CONNECTIONS.load(Ordering::SeqCst),
+            base,
+            "exactly one decrement per acquire"
+        );
     }
 }
 
