@@ -5358,12 +5358,59 @@ pub fn spawn_daily_crossverify(
             {
                 Ok(report) => {
                     counters().xverify_ran.increment(1);
+                    let c = &report.comparison;
+                    // THE VERDICT AS FIELDS, not as a debug dump.
+                    //
+                    // 2026-08-20, measured on the box: this emitted `?report`,
+                    // which renders every finding. Today's run produced a
+                    // 1,048,374-character line — EXACTLY CloudWatch's 1 MiB
+                    // event ceiling, so it was truncated. `RunReport`'s Debug
+                    // puts `findings` before the totals, which means the
+                    // truncation ate precisely the summary: `minutes_compared`
+                    // — the non-vacuity denominator this whole job exists to
+                    // produce — was unreadable, while thousands of individual
+                    // findings were not.
+                    //
+                    // The single most important measurement in the system was
+                    // the one number the log could not carry. Named fields are
+                    // bounded by construction and queryable; the findings are
+                    // already persisted to the audit table, which is where
+                    // per-cell detail belongs.
                     info!(
                         targets = targets.len(),
-                        ?report,
+                        outcome = ?c.outcome,
+                        instruments = c.instruments,
+                        minutes_compared = c.minutes_compared,
+                        cells_diverged = c.cells_diverged,
+                        missing_live = c.missing_live,
+                        missing_rest = c.missing_rest,
+                        tail_unsealed = c.tail_unsealed,
+                        out_of_session = c.out_of_session,
+                        noise_p50_paise = c.noise_p50_paise,
+                        noise_p95_paise = c.noise_p95_paise,
+                        noise_max_paise = c.noise_max_paise,
+                        findings = c.findings.len(),
+                        rest_failures = report.rest_failures,
+                        malformed_rows = report.malformed_rows,
+                        budget_elapsed = report.budget_elapsed,
+                        degraded = report.degraded,
+                        vacuous = c.is_vacuous(),
                         "Dhan live-feed cross-verification finished — this is the honest \
                          measure of whether the revived feed agrees with Dhan's own record"
                     );
+                    if c.is_vacuous() {
+                        // A run that compared nothing proves nothing, and the
+                        // outcome field alone does not say so loudly enough.
+                        error!(
+                            code = ErrorCode::WsGapConnectionState.code_str(),
+                            targets = targets.len(),
+                            missing_live = c.missing_live,
+                            missing_rest = c.missing_rest,
+                            "Dhan live-feed cross-verification compared ZERO minutes — the day's \
+                             captured candles are UNVERIFIED. This is not a pass with no findings; \
+                             it is no measurement at all"
+                        );
+                    }
                 }
                 Err(err) => {
                     counters().xverify_failed.increment(1);
@@ -8262,6 +8309,54 @@ mod tests {
     /// Depth waits until ~09:16 IST. If that wait were inline, the main feed
     /// would dial 45 minutes late and the lane would miss the open — trading 5
     /// working sockets for 0, which is strictly worse than the 5-of-16 this
+
+    #[test]
+    fn the_cross_verify_verdict_is_logged_as_fields_not_a_debug_dump() {
+        // MEASURED DEFECT, prod box 2026-08-20: this site emitted `?report`,
+        // and the resulting log line was 1,048,374 characters — EXACTLY
+        // CloudWatch's 1 MiB event ceiling, therefore truncated.
+        //
+        // `RunReport`'s derived Debug prints `comparison.findings` BEFORE the
+        // totals, so the truncation ate precisely the summary. `minutes_compared`
+        // — the non-vacuity denominator, the one number that decides whether
+        // the day's captured candles were verified at all — was unreadable,
+        // while several thousand individual findings were not.
+        //
+        // A source scan rather than a runtime assertion because the emit sits
+        // inside the live cross-verify arm, which needs a token, QuestDB and a
+        // real REST leg to reach.
+        let src = include_str!("dhan_feed_stack.rs");
+        let marker = "cross-verification finished — this is the honest";
+        let idx = src.find(marker).expect("the cross-verify emit must exist");
+        // Look back over the emit's own argument list only.
+        let start = idx.saturating_sub(2_000);
+        let emit = &src[start..idx];
+
+        assert!(
+            emit.contains("minutes_compared = c.minutes_compared"),
+            "the non-vacuity denominator must be its own field — it is the number \
+             the 1 MiB truncation destroyed"
+        );
+        for field in [
+            "cells_diverged = c.cells_diverged",
+            "missing_live = c.missing_live",
+            "missing_rest = c.missing_rest",
+            "noise_p50_paise = c.noise_p50_paise",
+            "vacuous = c.is_vacuous()",
+        ] {
+            assert!(
+                emit.contains(field),
+                "the verdict emit lost `{field}` — every summary number must be a \
+                 bounded named field, not part of a dump that can be cut off"
+            );
+        }
+        assert!(
+            !emit.contains("?report"),
+            "the verdict must NOT debug-dump the whole report: its findings vector \
+             is unbounded and pushed the line onto CloudWatch's 1 MiB ceiling, \
+             truncating away the totals that follow it"
+        );
+    }
     /// change exists to improve on.
     #[test]
     fn test_depth_late_attach_cannot_delay_the_main_feed_dial() {
