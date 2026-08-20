@@ -2004,9 +2004,18 @@ const _: () = assert!(
 ///
 /// a depth-200 frame may be 512 KiB against a main-feed frame's ~4 KiB, so
 /// roughly **512 depth frames exhaust the entire budget** — and every main-feed
-/// frame behind them is then refused. Depth frames are `depth_unconsumed`:
-/// counted and DISCARDED, because nothing folds them today. So the shared
-/// budget let a stream we throw away evict the only stream we keep.
+/// frame behind them is then refused. So one endpoint's burst could starve the
+/// other, and the endpoint with the 128x larger frame always wins that race.
+///
+/// CORRECTED 2026-08-20: this paragraph used to end "Depth frames are
+/// `depth_unconsumed`: counted and DISCARDED, because nothing folds them
+/// today" — i.e. the argument that the evicting stream was one we threw away.
+/// That stopped being true on 2026-08-15, when depth gained a writer and a
+/// table. The SPLIT is still right and the number is unchanged; the reason is
+/// now simply frame-size asymmetry, which needs no claim about which stream
+/// matters. Recorded rather than silently reworded, because a reader
+/// re-deriving this budget from the old sentence would conclude depth stores
+/// nothing and could shrink its share — which would now drop real rows.
 ///
 /// Splitting the same total keeps the memory ceiling identical (the host is no
 /// worse off) and makes that eviction impossible: depth can exhaust depth.
@@ -2016,8 +2025,17 @@ pub const MAIN_FEED_RING_MAX_BYTES: usize = FRAME_RING_MAX_BYTES * 3 / 4;
 /// depth-200 together.
 ///
 /// The split is 3:1 toward the main feed rather than by socket count (5 vs 10)
-/// because the split follows the DATA, not the sockets: the main feed carries
-/// every tick that reaches the database, and depth currently carries none.
+/// because it follows the FRAME SIZE, not the socket count: a depth-200 frame
+/// is ~128x a main-feed frame, so equal byte budgets would be wildly unequal
+/// frame budgets.
+///
+/// CORRECTED 2026-08-20: this used to read "the split follows the DATA … the
+/// main feed carries every tick that reaches the database, and depth currently
+/// carries none." Depth has carried rows to `market_depth` since 2026-08-15.
+/// The 3:1 number is UNCHANGED and still defensible on frame size; only its
+/// stated reason was stale, and a stale reason on a live memory constant is
+/// what a future reader re-derives from.
+///
 /// A quarter of 256 MiB is 64 MiB — still 128 maximum-size depth-200 frames,
 /// so depth keeps a real burst absorber rather than a token allocation.
 pub const DEPTH_RING_MAX_BYTES: usize = FRAME_RING_MAX_BYTES - MAIN_FEED_RING_MAX_BYTES;
