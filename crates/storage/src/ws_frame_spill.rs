@@ -1191,11 +1191,26 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
                 }
                 Err(err) => {
                     outcome.failed += 1;
+                    // Decrement anyway (2026-08-19, adversarial audit). The
+                    // first version left `remaining` untouched on failure, so
+                    // a single un-deletable file made the loop keep deleting
+                    // NEWER segments chasing a budget it could not reach that
+                    // way — over-deleting exactly the recent copies a crash
+                    // triage needs, to satisfy a ceiling the failed file was
+                    // never going to free.
+                    //
+                    // Treating the file as accounted-for is the conservative
+                    // direction: at worst the archive sits slightly over the
+                    // ceiling for one pass, which the next pass corrects. The
+                    // failure is still counted and logged, so a permanently
+                    // un-deletable file is visible rather than absorbed.
+                    remaining = remaining.saturating_sub(*len);
                     warn!(
                         path = %path.display(),
                         error = %err,
                         "WAL archive byte-ceiling prune: remove_file failed — \
-                         retried next pass"
+                         counted against the budget so the pass cannot \
+                         over-delete newer segments; retried next pass"
                     );
                 }
             }

@@ -1236,6 +1236,12 @@ impl PartitionArchiver {
             return;
         };
         let s3_key = format!("{ARCHIVE_S3_PREFIX}/{table}/{partition}.csv.gz");
+        // Did THIS run put the object there, or did it reuse an existing one?
+        // The 4b mismatch arm below needs to tell those apart: deleting an
+        // object we did not write could destroy the only copy of already-
+        // dropped data, which is exactly what the never-overwrite policy
+        // exists to prevent.
+        let mut uploaded_this_run = false;
 
         // 1. Export (stream + gzip + count) — one partition on disk at a time.
         let exported = match self
@@ -1316,6 +1322,7 @@ impl PartitionArchiver {
                 return;
             }
             None => {
+                uploaded_this_run = true;
                 if let Err(err) = self
                     .upload_to_s3(&exported.path, &s3_key, &exported.gzip_sha256_b64)
                     .await
@@ -1416,7 +1423,8 @@ impl PartitionArchiver {
                         "row count CHANGED between verify and drop: verified \
                          {} rows, now {rows} — a writer touched this partition \
                          (15:31 sweep / WAL replay / DLQ drain). The S3 copy is \
-                         stale, so the partition is KEPT and re-exported next run",
+                         stale, so the partition is KEPT, the stale object is \
+                         removed, and it is re-exported next run",
                         proof.rows
                     ),
                     None => format!(
@@ -1427,6 +1435,38 @@ impl PartitionArchiver {
                     ),
                 };
                 metrics::counter!("tv_partition_drop_withheld_total").increment(1);
+                // CLEAR THE STALE OBJECT so the next run is not deadlocked
+                // (2026-08-19, found by the adversarial audit — the comment
+                // above said "re-exported next run", and that was FALSE).
+                //
+                // The partition changed, so the object we just uploaded no
+                // longer matches it. On the next run the export produces
+                // DIFFERENT bytes, the never-overwrite policy compares
+                // SHA-256, sees a mismatch, and raises S3Conflict — "keep the
+                // partition, never overwrite". That repeats forever: the
+                // partition is never dropped and the disk grows without
+                // bound. A safety check that silently converts into a
+                // permanent leak is worse than the race it closed.
+                //
+                // Deleting is safe ONLY for an object this run uploaded. If
+                // the object was REUSED, some earlier run wrote it and its
+                // partition may already have been dropped — deleting it could
+                // destroy the only surviving copy of that data, which is the
+                // precise scenario the never-overwrite policy protects. So a
+                // reused object is left alone and the operator is told, which
+                // is the honest end of the fail-closed path rather than a
+                // silent one.
+                if uploaded_this_run && let Err(err) = self.delete_s3_object(&s3_key).await {
+                    warn!(
+                            table,
+                            partition,
+                            s3_key = %s3_key,
+                            error = %format!("{err:#}"),
+                            "could not remove the stale archive object after a \
+                             pre-drop mismatch — the next run will raise \
+                             S3Conflict on this key until it is removed"
+                    );
+                }
                 self.record_failure(
                     table,
                     partition,
@@ -1635,6 +1675,27 @@ impl PartitionArchiver {
             .send()
             .await
             .context("S3 conditional PutObject (If-None-Match + checksum_sha256) failed")?;
+        Ok(())
+    }
+
+    /// Removes an archive object this run uploaded, after a pre-drop mismatch.
+    ///
+    /// Called ONLY for an object this run wrote (`uploaded_this_run`). Never
+    /// for a reused one: an object an earlier run uploaded may be the only
+    /// surviving copy of an already-dropped partition, and deleting it would
+    /// destroy exactly what the never-overwrite policy exists to protect.
+    ///
+    /// Best-effort by design. A failure here leaves the stale object in place,
+    /// which the next run reports as `S3Conflict` — visible and diagnosable,
+    /// never silent.
+    async fn delete_s3_object(&self, key: &str) -> Result<()> {
+        self.s3
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .context("S3 DeleteObject for a stale post-mismatch archive object")?;
         Ok(())
     }
 
