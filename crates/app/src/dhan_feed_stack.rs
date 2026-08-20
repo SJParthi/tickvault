@@ -4198,6 +4198,17 @@ async fn attach_depth_when_available(
     >,
 ) {
     let mut attempts: u32 = 0;
+    // Whether the PREVIOUS attempt resolved something dialable.
+    //
+    // The give-up arm below used to fire on the deadline alone, which was
+    // right when a selection was all-or-nothing. It is not any more: a
+    // selection can be genuinely partial — futures and index options
+    // resolved, stock options still waiting on a price — and the loop now
+    // holds out for the complete one. Holding out has to stop at the
+    // deadline, and stopping must mean "dial the partial answer", never
+    // "throw it away and dial nothing", or waiting for better would have
+    // cost the session the coverage it already had.
+    let mut last_had_instruments = false;
     let started = Instant::now();
     loop {
         // The deadline gates RETRIES, never the FIRST attempt.
@@ -4224,7 +4235,9 @@ async fn attach_depth_when_available(
         let past_deadline_and_window = now_ist >= DEPTH_ATTACH_DEADLINE_IST_SECS
             && window_elapsed >= DEPTH_ATTACH_MIN_WINDOW_SECS;
 
-        if attempts > 0 && (past_hard_stop || past_deadline_and_window) {
+        let out_of_time = past_hard_stop || past_deadline_and_window;
+
+        if attempts > 0 && out_of_time && !last_had_instruments {
             error!(
                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                 attempts,
@@ -4268,10 +4281,33 @@ async fn attach_depth_when_available(
 
         attempts = attempts.saturating_add(1);
 
-        if !selection.depth_20.is_empty()
+        let anything_resolved = !selection.depth_20.is_empty()
             || !selection.depth_200.is_empty()
-            || !contracts.instruments.is_empty()
-        {
+            || !contracts.instruments.is_empty();
+        last_had_instruments = anything_resolved;
+
+        // A selection whose stock options are merely PENDING a price is not
+        // an answer yet — see `stock_options_are_pending`. Dialing it would
+        // close the loop on a universe missing ~17,000 authorized contracts,
+        // which is exactly what happened live on 2026-08-20. Wait, unless
+        // waiting has run out of time.
+        let pending =
+            crate::dhan_contract_universe::stock_options_are_pending(&contracts) && !out_of_time;
+        if pending {
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                attempts,
+                contracts = contracts.instruments.len(),
+                underlyings_without_spot = contracts.underlyings_without_spot,
+                atm_window_reason = contracts.atm_window_reason,
+                "contract attach is holding: the master lists stock options but NO underlying \
+                 had a live spot price yet, so at-the-money cannot be located and every stock \
+                 option would be absent. Retrying rather than dialing a partial universe — \
+                 at the deadline the partial set is dialed anyway rather than dropped."
+            );
+        }
+
+        if anything_resolved && !pending {
             // Upgrade LAST, immediately before dialing. `None` means every
             // socket died and the ring closed while we waited — dialing into a
             // closed ring would open sockets whose frames reach nothing.
@@ -8394,10 +8430,19 @@ mod tests {
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);
         assert!(
-            production.contains("if attempts > 0 && (past_hard_stop || past_deadline_and_window)"),
+            production.contains("let out_of_time = past_hard_stop || past_deadline_and_window;"),
+            "the two deadline conditions must still be ORed into one `out_of_time` value — the \
+             give-up arm and the pending-hold arm both read it, and computing them separately \
+             would let the two disagree about whether waiting is still allowed"
+        );
+        assert!(
+            production.contains("if attempts > 0 && out_of_time && !last_had_instruments {"),
             "the depth give-up MUST be guarded by `attempts > 0` — an unguarded check makes a \
              mid-session restart give up before it has looked even once, exactly when the chain \
-             table is fullest"
+             table is fullest. It must ALSO be guarded by `!last_had_instruments`: since \
+             2026-08-20 the loop deliberately holds out for a complete contract selection, and \
+             a give-up that discarded an already-resolved partial set would turn waiting for \
+             better into losing what we had"
         );
     }
 
