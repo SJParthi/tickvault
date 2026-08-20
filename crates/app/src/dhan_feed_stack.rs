@@ -5015,7 +5015,6 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 params.main_feed_instruments.len(),
                 usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS),
             ),
-            ws_audit_tx.clone(),
         ));
     }
 
