@@ -189,7 +189,18 @@ fn is_excluded_from_invocation_scan(path: &str) -> bool {
     if path.ends_with(".rs") {
         return true;
     }
-    // Machine-generated dependency graphs; nothing executes from them.
+    // Machine-generated dependency graphs. Excluded from the TOKEN scan
+    // because a lockfile is not a script — but see
+    // `native_build_toolchain_only_shrinks` below, which scans it for a
+    // different and real hazard.
+    //
+    // CORRECTED 2026-08-20 (SCOPE FIX #8). This exclusion used to say
+    // "nothing executes from them", and that was false in exactly the way the
+    // 2026-08-01 `pip` miss was false: the lockfile does not execute, but it
+    // NAMES crates whose `build.rs` does. `aws-lc-sys` declares `cmake` as a
+    // build dependency, so a clean build drives CMake — a separate scripting
+    // language — to compile a C library. A comment asserting a hazard cannot
+    // exist is how the previous five misses each survived.
     if path.ends_with(".lock") {
         return true;
     }
@@ -1708,6 +1719,178 @@ const NON_LITERAL_SPAWN_BUDGET: &[(&str, usize)] = &[
 /// quietly become "not looked at". Pinning the SET — never the version, since
 /// tags and SHAs rotate legitimately — means a NEW vendor runtime entering CI
 /// fails the build instead of arriving unannounced.
+/// Crates in the resolved graph whose `build.rs` drives a NON-RUST build
+/// system during `cargo build`.
+///
+/// SCOPE FIX #8 (2026-08-20). Every prior fix asked "what does this repo's own
+/// source execute?". None asked what our DEPENDENCIES execute while being
+/// compiled. `aws-lc-sys` — reached through `aws-lc-rs`, the TLS provider
+/// CLAUDE.md mandates — declares `cmake` as a build dependency and drives
+/// CMake (and, on some targets, NASM) to compile the AWS-LC **C** library on
+/// every clean build, including the `aarch64-unknown-linux-musl` deploy
+/// cross-compile.
+///
+/// # This is a BUILD-time surface, not a runtime one
+///
+/// Nothing non-Rust runs in production: all thirteen Lambdas declare
+/// `provided.al2023` with a `bootstrap` handler, and the systemd unit runs
+/// `/opt/tickvault/bin/tickvault`. So this is bounded rather than banned —
+/// banning it would mean dropping the mandated TLS provider.
+///
+/// # Why a budget rather than a ban
+///
+/// Same shape as `CI_ACTION_ALLOWLIST`: the set may only SHRINK. A NEW native
+/// build system entering the dependency graph — a vendored C++ library, a Go
+/// toolchain, an autotools crate — now fails the build instead of arriving
+/// unannounced in a lockfile nobody reads.
+const NATIVE_BUILD_TOOLCHAIN_BUDGET: &[&str] = &["cc", "cmake", "pkg-config"];
+
+/// Package names declared in `Cargo.lock`, in file order.
+fn locked_package_names(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("name = \"")
+            && let Some(name) = rest.strip_suffix('"')
+        {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// BITE-PROOF for SCOPE FIX #8.
+///
+/// The real-tree test below cannot be bite-proven by planting a package in
+/// `Cargo.lock`: `cargo test` validates and rewrites the lockfile before the
+/// test binary runs, so the plant is gone by the time it is read. Discovered
+/// by trying it. So the DETECTION LOGIC is proven here against fixtures
+/// instead — which is stronger anyway, since it pins the parser too.
+#[test]
+fn native_build_toolchain_self_test() {
+    // The parser must find names, and only names.
+    let lock = "\
+[[package]]\n\
+name = \"serde\"\n\
+version = \"1.0.0\"\n\
+\n\
+[[package]]\n\
+name = \"cmake\"\n\
+version = \"0.1.57\"\n";
+    let names = locked_package_names(lock);
+    assert_eq!(names, vec!["serde".to_string(), "cmake".to_string()]);
+
+    // A version line must never be mistaken for a name.
+    assert!(
+        !locked_package_names("version = \"cmake\"\n")
+            .iter()
+            .any(|n| n == "cmake"),
+        "only `name = ` lines are package names"
+    );
+
+    // THE BITE. A new native build system in the graph must be detected as
+    // new — this is the assertion that would have caught `cmake` arriving
+    // unannounced, and it is what the real-tree test does against the live
+    // lockfile.
+    let present = ["cc", "cmake", "bindgen"];
+    let new: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|b| !NATIVE_BUILD_TOOLCHAIN_BUDGET.contains(b))
+        .collect();
+    assert_eq!(
+        new,
+        vec!["bindgen"],
+        "a native build system outside the budget must be reported as NEW"
+    );
+
+    // And the shrink half: a budget entry that has left the graph must be
+    // reported, so the ratchet cannot outlive what it bounds.
+    let present_after_removal = ["cc", "pkg-config"];
+    let gone: Vec<&str> = NATIVE_BUILD_TOOLCHAIN_BUDGET
+        .iter()
+        .copied()
+        .filter(|b| !present_after_removal.contains(b))
+        .collect();
+    assert_eq!(
+        gone,
+        vec!["cmake"],
+        "a budget entry no longer in the graph must be reported as stale"
+    );
+}
+
+/// (h) The native build toolchain the LOCKFILE pulls in may only shrink.
+#[test]
+fn native_build_toolchain_only_shrinks() {
+    assert_sorted_unique(
+        NATIVE_BUILD_TOOLCHAIN_BUDGET,
+        "NATIVE_BUILD_TOOLCHAIN_BUDGET",
+    );
+    let root = repo_root();
+    let lock = std::fs::read_to_string(root.join("Cargo.lock"))
+        .expect("rust_only_guard: Cargo.lock must exist — it is the pinned graph");
+    let names = locked_package_names(&lock);
+
+    // Anti-vacuity: a parser that returns nothing makes every assertion below
+    // trivially true, which is how a guard reports green while enforcing
+    // nothing. The graph has hundreds of packages.
+    assert!(
+        names.len() > 100,
+        "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from Cargo.lock. \
+         The lockfile format changed or the read failed, and this guard is \
+         enforcing nothing.",
+        names.len()
+    );
+
+    // Every native-build-system driver we know how to name. Absence from this
+    // list is not safety — it is the reason the list is a LIST and not a
+    // guess, and adding to it is how the next one gets caught.
+    const KNOWN_NATIVE_BUILDERS: &[&str] = &[
+        "autotools",
+        "bindgen",
+        "cc",
+        "cmake",
+        "cxx-build",
+        "meson-next",
+        "nasm-rs",
+        "pkg-config",
+        "system-deps",
+        "vcpkg",
+    ];
+
+    let mut present: Vec<&str> = KNOWN_NATIVE_BUILDERS
+        .iter()
+        .copied()
+        .filter(|b| names.iter().any(|n| n == b))
+        .collect();
+    present.sort_unstable();
+
+    let new: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|b| !NATIVE_BUILD_TOOLCHAIN_BUDGET.contains(b))
+        .collect();
+    assert!(
+        new.is_empty(),
+        "RUST-ONLY VIOLATION: new non-Rust build system(s) {new:?} entered the \
+         dependency graph. Their build scripts EXECUTE during `cargo build`, \
+         including the deploy cross-compile. Remove the dependency, or record \
+         it in NATIVE_BUILD_TOOLCHAIN_BUDGET with the reason it is unavoidable."
+    );
+
+    let gone: Vec<&str> = NATIVE_BUILD_TOOLCHAIN_BUDGET
+        .iter()
+        .copied()
+        .filter(|b| !present.contains(b))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "SHRINK THE RATCHET: {gone:?} no longer appear in Cargo.lock. Remove \
+         them from NATIVE_BUILD_TOOLCHAIN_BUDGET in the same PR — a budget that \
+         outlives what it bounds is a permission nobody is using."
+    );
+}
+
 const CI_ACTION_ALLOWLIST: &[&str] = &[
     "Swatinem/rust-cache",
     "actions/cache",

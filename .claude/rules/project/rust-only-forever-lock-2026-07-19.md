@@ -287,3 +287,55 @@ Always loaded (this file is under `.claude/rules/project/`). Reinforced on any s
 ---
 
 > Sir, the shop kitchen speaks ONE language forever — Rust — and every cook works the O(1) way. If anyone wants to sneak in a cook who speaks a different language, the kitchen door stays locked until you sign a fresh dated note on this very board.
+
+## §0.2. 2026-08-20 — SCOPE FIX #8: the dependency graph's own build systems (the SIXTH miss)
+
+A fresh adversarial sweep, told to assume the previous five fixes had missed
+something, found the sixth. It is the same shape as all five before it: **the
+hole was in what the scan LOOKED AT, and a comment asserted the hazard could
+not exist.**
+
+`rust_only_guard.rs` excluded `.lock` files from scanning with the comment
+*"Machine-generated dependency graphs; **nothing executes from them**."*
+
+That premise is false in exactly the way the 2026-08-01 `pip` premise was
+false. A lockfile does not execute — but it **NAMES crates whose `build.rs`
+does**:
+
+| Evidence | |
+|---|---|
+| `Cargo.lock` | `aws-lc-sys 0.44.0` declares build-deps `cc`, **`cmake`**, `pkg-config` |
+| `Cargo.lock` | `cmake 0.1.57` is resolved into the graph |
+| Upstream | `aws-lc-sys` drives **CMake** — a separate scripting language — and on some targets **NASM**, to compile the AWS-LC **C** library |
+| Reached via | `aws-lc-rs`, the TLS provider CLAUDE.md **mandates** |
+| When | every clean `cargo build`, including the `aarch64-unknown-linux-musl` deploy cross-compile |
+
+**This is a BUILD-time surface, not a runtime one — and that distinction is
+why it is BOUNDED rather than banned.** Nothing non-Rust runs in production:
+all thirteen Lambdas declare `provided.al2023` with a `bootstrap` handler
+(verified in `deploy/aws/terraform/*.tf`), and the systemd unit runs
+`/opt/tickvault/bin/tickvault`. Banning it would mean dropping the mandated
+TLS provider.
+
+**The fix:** `NATIVE_BUILD_TOOLCHAIN_BUDGET` — a shrink-only allowlist, the
+same shape as `CI_ACTION_ALLOWLIST` — pinning the three native build systems
+actually in the graph (`cc`, `cmake`, `pkg-config`). A NEW one entering (a
+vendored C++ library, a Go toolchain, an autotools crate) now fails the build
+instead of arriving unannounced in a lockfile nobody reads. The stale half is
+enforced too: a budget entry that leaves the graph must be removed in the same
+PR, so the ratchet cannot outlive what it bounds.
+
+**Bite-proof, and how it was earned.** The obvious proof — plant a package in
+`Cargo.lock` and watch the guard fail — DOES NOT WORK: `cargo test` validates
+and rewrites the lockfile before the test binary reads it, so the plant is
+gone by the time it matters. Discovered by trying it and getting a green run.
+The detection logic is therefore proven against fixtures
+(`native_build_toolchain_self_test`), which is stronger anyway because it pins
+the parser as well. Recorded because "I planted the exploit and the guard
+passed" is a result that could easily have been read as "the guard works".
+
+**Also found — documentation lag, not a hole:** §0.1's scanned-surface list
+omits `.plist`, `.xml`, `.alloy`, `.conf`, `.timer`, `.service` and
+`.config/nextest.toml`. The guard covers all seven
+(`rust_only_guard.rs:251-269`, `:1329`); the PROSE under-states real coverage.
+The opposite of the usual failure, and worth saying so.
