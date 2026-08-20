@@ -961,6 +961,100 @@ impl SubscribeGuard {
         self.batches().count()
     }
 
+    /// Appends instruments to a set that is already on the wire, returning the
+    /// index the new tail starts at.
+    ///
+    /// # Why a live connection is topped up rather than re-dialed
+    ///
+    /// Dhan caps a connection at 5,000 instruments and an account at 5
+    /// connections — 25,000 total, and both numbers are already the documented
+    /// maximum. The spot universe (~850) is dialed at boot and packs onto ONE
+    /// connection, so ~4,150 slots sit on a socket that will never use them.
+    /// The contract attach, which runs later once option prices exist, can only
+    /// claim WHOLE free connections: 4 × 5,000 = 20,000. The authorized
+    /// ATM ± 25 window needs ~23,000–23,750, so the window silently shrank to
+    /// ± 20 — not because the operator's scope was wrong, but because ~4,150
+    /// paid-for slots were unreachable.
+    ///
+    /// They are reachable by SUBSCRIBING MORE on the socket that already holds
+    /// them. Dhan's protocol allows exactly that: subscribe messages are
+    /// incremental, capped at 100 instruments each, and a connection accepts
+    /// them until it reaches 5,000. Re-dialing the connection would also work
+    /// and is strictly worse — it drops the spot feed mid-session, and the
+    /// close/reconnect race would briefly leave two tasks driving one slot.
+    ///
+    /// # Why the caller gets an index rather than the batches
+    ///
+    /// Only the NEW instruments may be sent. Re-sending the whole set would
+    /// re-subscribe several thousand already-live instruments, which is both
+    /// wasteful and a real risk: Dhan answers an over-limit subscribe with 804
+    /// and drops the socket. Returning the split point lets the caller batch
+    /// exactly the tail via [`SubscribeGuard::batches_from`].
+    ///
+    /// # Errors
+    ///
+    /// [`SubscribeGuardRefusal::TooManyInstruments`] when the COMBINED set
+    /// would exceed the endpoint's per-connection cap. Fail-closed, and the
+    /// guard is left untouched — a refused top-up must not half-apply, or the
+    /// in-memory set would claim instruments the socket never received and
+    /// every later reconnect would replay a subscription Dhan rejects.
+    pub fn try_extend(
+        &mut self,
+        more: Vec<SubscribeInstrument>,
+    ) -> Result<usize, SubscribeGuardRefusal> {
+        if more.is_empty() {
+            return Ok(self.instruments.len());
+        }
+        let max = self.endpoint.max_instruments_per_connection();
+        let combined = self.instruments.len().saturating_add(more.len());
+        if u64::try_from(combined).unwrap_or(u64::MAX) > u64::from(max) {
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = self.endpoint.as_str(),
+                already = self.instruments.len(),
+                adding = more.len(),
+                max,
+                "refusing a top-up that would take a live connection past its \
+                 per-connection cap — the guard is left unchanged so the \
+                 in-memory set never claims instruments the socket does not hold"
+            );
+            return Err(SubscribeGuardRefusal::TooManyInstruments {
+                endpoint: self.endpoint,
+                requested: combined,
+                max,
+            });
+        }
+        let start = self.instruments.len();
+        self.instruments.extend(more);
+        Ok(start)
+    }
+
+    /// Subscribe messages covering only the instruments from `start` onward.
+    ///
+    /// The tail counterpart of [`SubscribeGuard::batches`], used to send a
+    /// top-up without re-subscribing what the socket already holds. A `start`
+    /// past the end yields nothing rather than panicking: the caller is
+    /// reporting "no new instruments", which is a legal no-op.
+    pub fn batches_from(&self, start: usize) -> impl Iterator<Item = &[SubscribeInstrument]> {
+        let per_message = usize::try_from(self.endpoint.max_instruments_per_subscribe_message())
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let tail = self.instruments.get(start..).unwrap_or(&[]);
+        tail.chunks(per_message)
+    }
+
+    /// Free slots left on this connection before the endpoint's cap.
+    ///
+    /// This is the number the contract attach needs in order to stop stranding
+    /// capacity: without it, room on a partially-filled connection is invisible
+    /// and the attach asks only for whole free connections.
+    #[must_use]
+    pub fn spare_capacity(&self) -> usize {
+        let max =
+            usize::try_from(self.endpoint.max_instruments_per_connection()).unwrap_or(usize::MAX);
+        max.saturating_sub(self.instruments.len())
+    }
+
     /// Records that the live socket accepted the whole set.
     pub fn mark_confirmed(&mut self) {
         self.confirmed = true;
@@ -1700,11 +1794,40 @@ pub enum ConnectionExit {
 // `test_run_connection_*` cases below — dial retry, subscribe failure, 805,
 // token staleness and the already-parked entry are each covered.
 pub async fn run_connection<S, K, F, Fut>(
+    socket: S,
+    supervisor: ConnectionSupervisor,
+    guard: SubscribeGuard,
+    sink: std::sync::Arc<K>,
+    refresh_token: F,
+) -> ConnectionExit
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    run_connection_with_topup(socket, supervisor, guard, sink, refresh_token, None).await
+}
+
+/// [`run_connection`] plus a channel that can add instruments to the LIVE
+/// subscription.
+///
+/// See [`SubscribeGuard::try_extend`] for why a live top-up exists at all: it
+/// is the only way to reach the ~4,150 slots stranded on the boot-dialed spot
+/// connection, and those slots are exactly what the authorized ATM ± 25 window
+/// was short of.
+///
+/// `topup` is `None` for every connection that has nothing to add — depth
+/// sockets, and main-feed sockets the attach dialed itself with their final
+/// set. A `None` receiver compiles to a select arm that is never ready, so a
+/// connection without a top-up channel behaves byte-identically to before.
+pub async fn run_connection_with_topup<S, K, F, Fut>(
     mut socket: S,
     mut supervisor: ConnectionSupervisor,
     mut guard: SubscribeGuard,
     sink: std::sync::Arc<K>,
     mut refresh_token: F,
+    mut topup: Option<tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>>,
 ) -> ConnectionExit
 where
     S: DhanFeedSocket,
@@ -1815,7 +1938,15 @@ where
                 );
                 action = supervisor.on_event(ConnEvent::SubscribeAcked, Instant::now());
                 // Drain until something changes.
-                action = drain(&mut socket, &mut supervisor, sink.as_ref(), action).await;
+                action = drain(
+                    &mut socket,
+                    &mut supervisor,
+                    sink.as_ref(),
+                    action,
+                    &mut guard,
+                    topup.as_mut(),
+                )
+                .await;
             }
         }
     }
@@ -1832,6 +1963,8 @@ async fn drain<S, K>(
     supervisor: &mut ConnectionSupervisor,
     sink: &K,
     mut action: SupervisorAction,
+    guard: &mut SubscribeGuard,
+    mut topup: Option<&mut tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>>,
 ) -> SupervisorAction
 where
     S: DhanFeedSocket,
@@ -1850,6 +1983,106 @@ where
     let mut ring_full_seen: u64 = 0;
 
     while action == SupervisorAction::Continue {
+        // Top-up check, BEFORE the select and deliberately not an arm of it.
+        //
+        // It was a select arm first. That is wrong, and the fake transport
+        // proved it: with `biased`, the socket arm wins whenever it is ready,
+        // so a continuously-ready socket starves every later arm and the
+        // top-up never runs. A real socket is pending between frames, so it
+        // would usually land — "usually" is not a property worth shipping for
+        // the one event that must arrive at 09:16 on the dot.
+        //
+        // THE ONE RULE still holds, and the `Option` is what makes that true.
+        // In steady state `topup` is `None` — for every depth socket, every
+        // attach-dialed connection, and the spot connection itself once its
+        // single top-up has been consumed — so this compiles to a null check
+        // on an enum discriminant, not an atomic, not a syscall. The cost is
+        // present only in the handful of iterations between the socket coming
+        // up and the attach sending, and it disappears permanently after.
+        if let Some(rx) = topup.as_mut() {
+            match rx.try_recv() {
+                Ok(more) => {
+                    let added = more.len();
+                    match guard.try_extend(more) {
+                        Ok(start) => {
+                            let mut sent = 0usize;
+                            let mut failed = false;
+                            for batch in guard.batches_from(start) {
+                                if socket.send_subscribe(batch).await.is_err() {
+                                    failed = true;
+                                    break;
+                                }
+                                sent += batch.len();
+                            }
+                            if failed {
+                                // Do NOT mark the guard lost here — the
+                                // supervisor owns that transition and will see
+                                // the disconnect itself. The guard now names
+                                // instruments the socket may not hold; the
+                                // reconnect replay sends the WHOLE set, which
+                                // reconciles it.
+                                error!(
+                                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    added,
+                                    sent,
+                                    "live subscription top-up failed part-way — the reconnect \
+                                     replay sends the whole set and reconciles it"
+                                );
+                                metrics::counter!("tv_dhan_ws_topup_failed_total").increment(1);
+                            } else {
+                                info!(
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    added,
+                                    total = guard.len(),
+                                    "live subscription topped up — the slots stranded on this \
+                                     connection are now carrying contracts"
+                                );
+                                metrics::counter!("tv_dhan_ws_topup_instruments_total")
+                                    .increment(added as u64);
+                            }
+                        }
+                        Err(_) => {
+                            // LOUD at the emit site, not only inside
+                            // `try_extend`. The loss-counter visibility guard
+                            // caught the first version of this: `try_extend`
+                            // warns about the CAP ARITHMETIC, but that is a
+                            // different function, so the counter reached no
+                            // operator surface at all — measured loss,
+                            // discarded measurement, green dashboard.
+                            //
+                            // The two lines say different things and both are
+                            // worth having: `try_extend` explains WHY the set
+                            // was refused, this says WHAT IT COSTS — the
+                            // overflow contracts are not on the wire, so the
+                            // ATM window is narrower than the operator
+                            // authorized and nothing downstream can tell.
+                            error!(
+                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                endpoint = supervisor.slot().endpoint.as_str(),
+                                pool_index = supervisor.slot().pool_index,
+                                added,
+                                already = guard.len(),
+                                "live subscription top-up REFUSED — those contracts are NOT \
+                                 subscribed this session, so the ATM window is narrower than \
+                                 authorized. The pool-dialed contracts and depth are unaffected."
+                            );
+                            metrics::counter!("tv_dhan_ws_topup_refused_total").increment(1);
+                        }
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    // The attach sent its one overflow and dropped the sender.
+                    // Clearing the Option is what makes the steady-state cost
+                    // of this whole block exactly zero.
+                    topup = None;
+                }
+            }
+        }
+
         tokio::select! {
             biased;
             event = socket.recv() => {
@@ -1939,6 +2172,108 @@ mod tests {
         RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS,
         SHORT_SESSION_REDIAL_FLOOR_MS, reconnect_delay_ms,
     };
+
+    fn si(id: u64) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+        }
+    }
+
+    /// The whole point: reach the slots stranded on a live connection.
+    #[test]
+    fn try_extend_appends_and_reports_where_the_new_tail_starts() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..150).map(si).collect())
+            .expect("under cap");
+        let start = g.try_extend((150..260).map(si).collect()).expect("fits");
+        assert_eq!(start, 150, "the tail starts where the old set ended");
+        assert_eq!(g.len(), 260);
+    }
+
+    /// Only the NEW instruments may go on the wire. Re-sending the whole set
+    /// would re-subscribe thousands of live instruments and risk an 804.
+    #[test]
+    fn batches_from_covers_only_the_new_tail() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..150).map(si).collect())
+            .expect("under cap");
+        let start = g.try_extend((150..260).map(si).collect()).expect("fits");
+        let tail: Vec<usize> = g
+            .batches_from(start)
+            .map(<[SubscribeInstrument]>::len)
+            .collect();
+        assert_eq!(
+            tail,
+            vec![100, 10],
+            "110 new instruments, capped at 100/message"
+        );
+        assert_eq!(tail.iter().sum::<usize>(), 110);
+        // And the full set still batches over everything.
+        assert_eq!(g.batch_count(), 3, "260 total => 100+100+60");
+    }
+
+    /// Fail-closed AND atomic. A half-applied top-up would leave the guard
+    /// naming instruments the socket never got, and every later reconnect
+    /// would replay a subscription Dhan rejects with 804.
+    #[test]
+    fn try_extend_past_the_cap_is_refused_and_leaves_the_guard_untouched() {
+        let cap = usize::try_from(DhanEndpointType::MainFeed.max_instruments_per_connection())
+            .expect("cap fits");
+        let mut g = SubscribeGuard::try_new(
+            DhanEndpointType::MainFeed,
+            (0..cap as u64 - 10).map(si).collect(),
+        )
+        .expect("under cap");
+        let before = g.len();
+        let err = g.try_extend((0..50).map(|i| si(900_000 + i)).collect());
+        assert!(err.is_err(), "51st instrument past the cap must be refused");
+        assert_eq!(
+            g.len(),
+            before,
+            "the guard must be UNCHANGED after a refusal"
+        );
+    }
+
+    /// Exactly filling the connection is legal — the cap is inclusive.
+    #[test]
+    fn try_extend_to_exactly_the_cap_is_allowed() {
+        let cap = usize::try_from(DhanEndpointType::MainFeed.max_instruments_per_connection())
+            .expect("cap fits");
+        let mut g = SubscribeGuard::try_new(
+            DhanEndpointType::MainFeed,
+            (0..cap as u64 - 10).map(si).collect(),
+        )
+        .expect("under cap");
+        assert!(
+            g.try_extend((0..10).map(|i| si(900_000 + i)).collect())
+                .is_ok()
+        );
+        assert_eq!(g.len(), cap);
+        assert_eq!(g.spare_capacity(), 0);
+    }
+
+    /// The number the contract attach needs so room on a partially-filled
+    /// connection stops being invisible.
+    #[test]
+    fn spare_capacity_reports_the_room_the_attach_was_missing() {
+        let g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..850).map(si).collect())
+            .expect("under cap");
+        let cap = usize::try_from(DhanEndpointType::MainFeed.max_instruments_per_connection())
+            .expect("cap fits");
+        assert_eq!(g.spare_capacity(), cap - 850);
+        assert_eq!(g.spare_capacity(), 4_150, "the stranded slots, by name");
+    }
+
+    /// An empty top-up is a legal no-op, not an error — the attach may have
+    /// nothing to add, and that must not log or count as a refusal.
+    #[test]
+    fn an_empty_top_up_is_a_no_op() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..10).map(si).collect())
+            .expect("under cap");
+        let start = g.try_extend(Vec::new()).expect("no-op");
+        assert_eq!(start, 10);
+        assert_eq!(g.len(), 10);
+        assert_eq!(g.batches_from(start).count(), 0, "nothing to send");
+    }
 
     #[test]
     fn test_park_reason_all_covers_every_variant_so_no_series_goes_unbaselined() {
@@ -3710,6 +4045,82 @@ mod tests {
         let s = st.lock().expect("fake state");
         assert_eq!(s.connects, 1);
         assert_eq!(s.subscribes, 3, "250 instruments = three 100-cap messages");
+    }
+
+    /// The whole ATM +/- 25 mechanism, end to end through the real drain loop.
+    ///
+    /// A live socket carrying 250 instruments is topped up with 150 more, and
+    /// the assertion that matters is the SUBSCRIBE COUNT: 3 messages for the
+    /// initial 250, then exactly 2 for the 150 added — never 5, which is what
+    /// re-sending the whole set would produce and what Dhan answers with 804.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_with_topup_extends_a_live_subscription() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![
+                SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+                SocketEvent::Frame(Bytes::from_static(b"bbbbbbbb")),
+            ]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // Queued before the loop starts, so the arm is ready as soon as the
+        // scripted frames are drained.
+        tx.send(instruments(150)).await.expect("channel open");
+        drop(tx);
+
+        let exit = run_connection_with_topup(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.subscribes, 5,
+            "3 messages for the initial 250 + 2 for the 150 added — NOT 5 more \
+             for a full re-send"
+        );
+        assert_eq!(s.connects, 1, "a top-up must never re-dial");
+        assert_eq!(
+            sink.accepted.lock().map(|g| g.len()).unwrap_or(0),
+            2,
+            "frames still reach the sink — the top-up arm does not eat them"
+        );
+    }
+
+    /// A connection given NO channel must behave byte-identically to before.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_with_topup_none_is_unchanged_behaviour() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa"))]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+
+        let exit = run_connection_with_topup(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            None,
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.subscribes, 3, "only the initial set");
+        assert_eq!(s.connects, 1);
     }
 
     #[tokio::test(start_paused = true)]

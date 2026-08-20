@@ -115,7 +115,7 @@ use tickvault_core::websocket::pool_budget::{
 };
 use tickvault_core::websocket::pool_supervisor::{
     CapturedFrame, ConnectionSupervisor, PoolSupervisor, RingByteBudget, SubscribeGuard,
-    SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection,
+    SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection_with_topup,
 };
 use tickvault_storage::depth_persistence::{
     DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow,
@@ -4192,6 +4192,22 @@ async fn attach_depth_when_available(
     // would be asked for a sixth. The 16-connection lock is arithmetic, not a
     // hope, and this is the term that keeps it so.
     main_feed_connections_used: usize,
+    // The boot-dialed spot connection's top-up channel, and the room left on
+    // it. `None` when the boot dialed nothing (no spot universe) or when the
+    // spot set already fills its connection.
+    //
+    // This is what unstrands the ~4,150 slots. The spot universe (~850) packs
+    // onto ONE of five connections; the attach could previously claim only
+    // WHOLE free connections, so contracts were capped at 4 x 5,000 = 20,000
+    // while ATM +/- 25 needs ~23,000-23,750. Both Dhan caps (5,000 per
+    // connection, 5 connections) are already at their documented maximum, so
+    // the only slots that exist are the ones already paid for on this socket.
+    spot_topup: Option<(
+        tokio::sync::mpsc::Sender<
+            Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+        >,
+        usize,
+    )>,
     // Owned, not borrowed: this runs in its own task, hours after boot.
     ws_audit_tx: tokio::sync::mpsc::Sender<
         tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
@@ -4275,7 +4291,13 @@ async fn attach_depth_when_available(
             &today_date,
             ymd_from_ist_date(&today_date),
             today_nanos,
-            remaining_main_feed_capacity(main_feed_connections_used),
+            // Whole free connections PLUS the room stranded on the spot
+            // connection. Without the second term the attach cannot see
+            // ~4,150 already-paid-for slots, and the ATM window silently
+            // shrinks to fit a budget that is smaller than the one the
+            // operator authorized.
+            remaining_main_feed_capacity(main_feed_connections_used)
+                .saturating_add(spot_topup.as_ref().map_or(0, |(_, spare)| *spare)),
         )
         .await;
 
@@ -4323,23 +4345,83 @@ async fn attach_depth_when_available(
                 );
                 return;
             };
+            // Split the contracts: what the FREE connections can hold goes
+            // through the pool as usual; the remainder rides the top-up
+            // channel onto the already-live spot connection.
+            //
+            // The order matters and is deliberate. `select_contract_universe`
+            // returns futures and index options FIRST, then the ATM ladders,
+            // and it is the ladders that must reach the wire intact — so the
+            // OVERFLOW is taken from the tail, leaving the head to the pool.
+            // Taking the overflow from the head would scatter one underlying's
+            // ladder across two dial paths for no benefit.
+            let pool_room = remaining_main_feed_capacity(main_feed_connections_used);
+            let (pool_contracts, overflow): (&[SubscribeInstrument], &[SubscribeInstrument]) =
+                if contracts.instruments.len() > pool_room {
+                    contracts.instruments.split_at(pool_room)
+                } else {
+                    (contracts.instruments.as_slice(), &[])
+                };
+
+            if !overflow.is_empty() {
+                match spot_topup.as_ref() {
+                    Some((tx, _)) => {
+                        // A bounded send that CANNOT block the attach: the
+                        // connection task may be mid-frame, and waiting on it
+                        // here would stall the dial of every depth socket
+                        // behind a socket that is doing its job.
+                        match tx.try_send(overflow.to_vec()) {
+                            Ok(()) => info!(
+                                overflow = overflow.len(),
+                                pool_contracts = pool_contracts.len(),
+                                "contract overflow handed to the live spot connection — the \
+                                 slots stranded on it are what the ATM window was short of"
+                            ),
+                            Err(err) => error!(
+                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                overflow = overflow.len(),
+                                %err,
+                                "the spot connection's top-up channel would not accept the \
+                                 contract overflow — those contracts are NOT subscribed this \
+                                 session. The pool-dialed contracts and depth are unaffected."
+                            ),
+                        }
+                    }
+                    None => error!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        overflow = overflow.len(),
+                        "contract selection exceeded the free connections and there is no \
+                         top-up channel to absorb the remainder — those contracts are NOT \
+                         subscribed. This means capacity was budgeted against room the \
+                         attach cannot reach."
+                    ),
+                }
+            }
+
             match build_feed_stack_plan(
                 &mut pool,
                 Instant::now(),
-                &contracts.instruments,
+                pool_contracts,
                 &selection.depth_20,
                 &selection.depth_200,
             ) {
                 Ok(plan) => {
                     let dialed = dial_planned_connections(
                         plan,
-                        &mut pool,
-                        &client_id,
-                        &spill,
-                        &frame_tx,
-                        &main_feed_budget,
-                        &depth_budget,
-                        Some(&ws_audit_tx),
+                        DialContext {
+                            pool: &mut pool,
+                            client_id: &client_id,
+                            spill: &spill,
+                            frame_tx: &frame_tx,
+                            main_feed_budget: &main_feed_budget,
+                            depth_budget: &depth_budget,
+                            ws_audit_tx: Some(&ws_audit_tx),
+                            // The attach dials its own connections with their
+                            // FINAL set — nothing is added to them later, so
+                            // they need no top-up channel. Only the boot-dialed
+                            // spot connection has room worth reaching.
+                            out_topups: None,
+                        },
                     );
                     info!(
                         dialed,
@@ -4391,18 +4473,42 @@ async fn attach_depth_when_available(
 /// copies of this loop would be free to drift on the token-refresh closure —
 /// the one behaviour that must be identical on every endpoint, because a
 /// depth socket that re-dials with a stale JWT after an 807 never recovers.
-fn dial_planned_connections(
-    plan: FeedStackPlan,
-    pool: &mut PoolSupervisor,
-    client_id: &str,
-    spill: &Arc<WsFrameSpill>,
-    frame_tx: &tokio::sync::mpsc::Sender<CapturedFrame>,
-    main_feed_budget: &Arc<RingByteBudget>,
-    depth_budget: &Arc<RingByteBudget>,
+/// Everything a dial needs that is not the plan itself.
+///
+/// A struct rather than eight parameters: the list grew past what a reader can
+/// hold, and clippy's `too_many_arguments` was the messenger. Grouping them
+/// also makes the two call sites — boot and the late attach — differ in exactly
+/// the one field that actually differs between them (`out_topups`), instead of
+/// in a positional argument nine places along.
+struct DialContext<'a> {
+    pool: &'a mut PoolSupervisor,
+    client_id: &'a str,
+    spill: &'a Arc<WsFrameSpill>,
+    frame_tx: &'a tokio::sync::mpsc::Sender<CapturedFrame>,
+    main_feed_budget: &'a Arc<RingByteBudget>,
+    depth_budget: &'a Arc<RingByteBudget>,
     ws_audit_tx: Option<
-        &tokio::sync::mpsc::Sender<tickvault_core::websocket::pool_supervisor::WsLifecycleEvent>,
+        &'a tokio::sync::mpsc::Sender<tickvault_core::websocket::pool_supervisor::WsLifecycleEvent>,
     >,
-) -> usize {
+    /// Collects a top-up handle per MAIN-FEED connection dialed: the sender and
+    /// the room left on that connection. The boot path passes `Some` so the
+    /// later contract attach can reach the slots the spot universe does not
+    /// use; the attach passes `None`, because its own connections are dialed
+    /// with their final set and have nothing left to add.
+    out_topups: Option<&'a mut Vec<(tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize)>>,
+}
+
+fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
+    let DialContext {
+        pool,
+        client_id,
+        spill,
+        frame_tx,
+        main_feed_budget,
+        depth_budget,
+        ws_audit_tx,
+        mut out_topups,
+    } = ctx;
     let mut dialed = 0usize;
     for planned in plan.connections {
         let endpoint = planned.slot.endpoint;
@@ -4471,27 +4577,48 @@ fn dial_planned_connections(
         // Count it alive BEFORE the task starts, so the gauge can never read
         // high because a spawn lost a race with its own decrement.
         let alive = AliveConnectionGuard::acquire();
+        // A top-up channel only for MAIN-FEED connections whose caller asked
+        // for one. Capacity 1: the attach sends at most one overflow batch per
+        // session, and a bounded channel means a wedged connection task
+        // surfaces as a refused `try_send` the attach LOGS, never as an
+        // unbounded queue that hides it.
+        let topup_rx = match (endpoint, out_topups.as_deref_mut()) {
+            (DhanEndpointType::MainFeed, Some(sink_vec)) => {
+                let spare = guard.spare_capacity();
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                sink_vec.push((tx, spare));
+                Some(rx)
+            }
+            _ => None,
+        };
         tokio::spawn(async move {
             // Moved in, so the socket's lifetime and the guard's are the same
             // object. Whatever ends this task — a clean return, an early
             // return, or an unwind — the count comes back down.
             let alive = alive;
-            let exit = run_connection(socket, supervisor, guard, sink, || async {
-                // Post-807/809 re-dial: ask the token manager for a fresh JWT
-                // before presenting a credential again. Failure is logged by
-                // the manager and left to the reconnect ladder — re-dialing
-                // with the stale token is the supervisor's own next step and
-                // it will park after the ladder is exhausted.
-                if let Some(manager) = global_token_manager()
-                    && let Err(err) = manager.force_renewal().await
-                {
-                    warn!(
-                        code = ErrorCode::WsGapConnectionState.code_str(),
-                        %err,
-                        "Dhan live feed could not refresh its token before re-dialing"
-                    );
-                }
-            })
+            let exit = run_connection_with_topup(
+                socket,
+                supervisor,
+                guard,
+                sink,
+                || async {
+                    // Post-807/809 re-dial: ask the token manager for a fresh JWT
+                    // before presenting a credential again. Failure is logged by
+                    // the manager and left to the reconnect ladder — re-dialing
+                    // with the stale token is the supervisor's own next step and
+                    // it will park after the ladder is exhausted.
+                    if let Some(manager) = global_token_manager()
+                        && let Err(err) = manager.force_renewal().await
+                    {
+                        warn!(
+                            code = ErrorCode::WsGapConnectionState.code_str(),
+                            %err,
+                            "Dhan live feed could not refresh its token before re-dialing"
+                        );
+                    }
+                },
+                topup_rx,
+            )
             .await;
             // `run_connection` returning means this socket is GONE — parked,
             // errored, or shut down. Nothing re-dials it, and its shard of the
@@ -5010,16 +5137,35 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // exists to be found cannot be broken by rustfmt; an incidental text
     // pattern can, and when it does the guard fails for a reason that has
     // nothing to do with the invariant it protects.
+    // Collects the boot-dialed MAIN-FEED connections' top-up handles. The spot
+    // universe packs onto one connection and leaves the rest of it empty; this
+    // is how the later contract attach reaches that room instead of stranding
+    // it. See `SubscribeGuard::try_extend`.
+    let mut main_feed_topups: Vec<(tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize)> =
+        Vec::new();
     let dialed = dial_planned_connections(
         plan,
-        &mut pool,
-        &client_id,
-        &spill,
-        &frame_tx,
-        &main_feed_budget,
-        &depth_budget,
-        Some(&ws_audit_tx),
+        DialContext {
+            pool: &mut pool,
+            client_id: &client_id,
+            spill: &spill,
+            frame_tx: &frame_tx,
+            main_feed_budget: &main_feed_budget,
+            depth_budget: &depth_budget,
+            ws_audit_tx: Some(&ws_audit_tx),
+            out_topups: Some(&mut main_feed_topups),
+        },
     );
+
+    // The connection with the MOST room is the one worth topping up. With a
+    // single spot connection that is trivially the only one; picking by
+    // `max_by_key` rather than `first` keeps it correct if the spot universe
+    // ever spreads, and refuses a connection with zero room rather than
+    // handing the attach a channel that can only reject.
+    let spot_topup = main_feed_topups
+        .into_iter()
+        .filter(|(_, spare)| *spare > 0)
+        .max_by_key(|(_, spare)| *spare);
 
     // Depth late-attach. Depth's instrument set is derived from
     // `option_chain_1m`, which the option-chain leg does not populate until its
@@ -5051,6 +5197,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 params.main_feed_instruments.len(),
                 usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS),
             ),
+            spot_topup,
             ws_audit_tx.clone(),
         ));
     }
