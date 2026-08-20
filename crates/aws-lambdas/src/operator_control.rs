@@ -3284,6 +3284,54 @@ mod tests {
         assert!(joined.contains("TRUNCATE-FAILED"));
     }
 
+    /// AUTO-START GUARANTEE ratchet (2026-08-20 incident).
+    ///
+    /// A destructive maintenance action that `systemctl disable tickvault`
+    /// WITHOUT re-enabling it silently costs the next trading day: a disabled
+    /// unit does not auto-start at the 08:30 IST boot, and
+    /// `scripts/aws-autopilot.sh` treats a disabled unit as an INTENTIONAL
+    /// kill-switch and refuses to self-heal it.
+    ///
+    /// This is the same class `deploy_no_disable_on_failure_guard.rs` pinned
+    /// for `deploy-aws.yml` on 2026-06-09 — that guard never covered these
+    /// Lambda action lists, and `DOCKER_NUKE_BARE_COMMANDS` fell through the
+    /// hole on 2026-08-20 (box up 08:30:42, app dead all morning).
+    ///
+    /// The INTENTIONAL kill-switch is the separate `stop-app` action and is
+    /// deliberately NOT covered here — it is supposed to leave the unit down.
+    #[test]
+    fn test_destructive_actions_never_leave_tickvault_disabled() {
+        for (name, cmds) in [
+            ("wipe-questdb", WIPE_QUESTDB_COMMANDS.as_slice()),
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            let disable_at = cmds
+                .iter()
+                .position(|c| c.contains("systemctl disable tickvault"));
+            let Some(disable_at) = disable_at else {
+                continue; // never disables — nothing to restore
+            };
+            let enable_at = cmds
+                .iter()
+                .position(|c| c.contains("systemctl enable tickvault"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} runs `systemctl disable tickvault` but NEVER re-enables it. \
+                         A disabled unit does not auto-start at the next 08:30 IST boot and \
+                         aws-autopilot.sh refuses to self-heal it (it reads disabled as an \
+                         intentional kill-switch), so this silently costs a trading day. \
+                         Append `systemctl enable tickvault || true`. The intentional \
+                         kill-switch is the separate `stop-app` action."
+                    )
+                });
+            assert!(
+                enable_at > disable_at,
+                "{name}: the re-enable must come AFTER the disable (disable at {disable_at}, \
+                 enable at {enable_at}) — otherwise the disable wins and the unit stays off"
+            );
+        }
+    }
     #[test]
     fn test_docker_reset_and_bare_nuke_remove_feed_capture_sources() {
         // The full nuke + bare nuke must ALSO sweep the feed capture/replay

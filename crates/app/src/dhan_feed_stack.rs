@@ -528,7 +528,42 @@ fn plan_pool(
     // depth-200 instruments and a 1-per-connection cap, this opens 4 sockets,
     // NOT 5 with an empty one. An empty subscribe is a socket that reports
     // healthy while carrying nothing — the false-OK the scope lock bans.
-    let connections_to_use = usize::from(available).min(set.len()).max(1);
+    // ---- 2026-08-20: main-feed PACKS, depth keeps SPREADING ----
+    //
+    // The spread directive above was written when the main feed carried ONLY
+    // the ~4,565 spot universe and four authorized sockets sat idle. Spreading
+    // used what the operator had paid for, and it was right for that shape.
+    //
+    // The main feed is now dialed in TWO passes: spots at boot, and the
+    // ~20,000 option/future contracts once post-open prices exist. Under
+    // spread, pass 1 takes `min(5, 4565)` = ALL FIVE connections, so pass 2
+    // gets a stateful refusal from `pool.admit` — and because `MainFeed` is
+    // the first endpoint in `build_feed_stack_plan`'s loop, that refusal
+    // aborted Depth20 and Depth200 planning too. Spreading the small first
+    // pass is what starved the sockets the spread directive existed to fill.
+    //
+    // Packing pass 1 is what actually delivers the directive's intent:
+    //
+    // | pass | packed | spread |
+    // |---|---|---|
+    // | boot spots (4,565) | 1 conn | 5 conns |
+    // | contracts (~20,000) | 4 conns | 0 — REFUSED |
+    // | **main-feed sockets carrying data** | **5** | **1** |
+    //
+    // At the 25,000 target the two policies converge exactly
+    // (`ceil(25000/5000)` = 5 = `min(5, 25000)`), so this changes nothing at
+    // full scale and everything today.
+    //
+    // Depth keeps spreading, and must: depth-200 admits ONE instrument per
+    // connection, so packing it would open a single socket and strand four.
+    let connections_to_use = if matches!(endpoint, DhanEndpointType::MainFeed) {
+        set.len()
+            .div_ceil(cap_per_connection.max(1))
+            .max(1)
+            .min(usize::from(available))
+    } else {
+        usize::from(available).min(set.len()).max(1)
+    };
     let shard_width = set.len().div_ceil(connections_to_use).max(1);
     debug_assert!(
         shard_width <= cap_per_connection,
@@ -681,11 +716,20 @@ pub struct LiveIngest {
     /// Optional sink for the 5 depth levels that ride INLINE in every
     /// Full-mode tick packet (2026-08-19).
     ///
-    /// `None` unless `[dhan_feed] persist_full_mode_depth` is enabled, and
-    /// default-OFF deliberately — see that setting's documentation for the
-    /// volume arithmetic. Wiring it ON without deciding what happens to the
-    /// dedicated depth-20 pool ADDS storage rather than saving any; the saving
-    /// comes from the SWAP, which is an operator decision.
+    /// `None` unless a caller opts in via [`LiveIngest::with_inline_depth`].
+    ///
+    /// CORRECTED 2026-08-20: this said "`None` unless `[dhan_feed]
+    /// persist_full_mode_depth` is enabled, and default-OFF deliberately".
+    /// **No such config key exists** — not in `config.rs`, not in
+    /// `base.toml` — and the production boot site wires this ON
+    /// UNCONDITIONALLY, by a dated operator decision recorded at that site
+    /// (2026-08-19, all three depth sources kept rather than swapped). So the
+    /// comment named a setting a reader could not find and asserted the
+    /// opposite of what the lane does; anyone auditing "is inline depth on?"
+    /// from this line would have answered no while it wrote ~44 GB/day at
+    /// target. The `Option` is real and the default here is still `None` —
+    /// that part was always true, and it is what keeps every test and every
+    /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
     detector: TickGapDetector,
     aggregator: MultiTfAggregator,
@@ -2192,6 +2236,9 @@ async fn run_frame_drain(
     shutdown: Arc<tokio::sync::Notify>,
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
 ) -> DrainOutcome {
+    // Whether this drain has ever seen a frame. Owns the up-gauge's rising
+    // edge — see the first-frame arm below and the spawn site's correction.
+    let mut lane_up = false;
     let mut seen: u64 = 0;
     let mut folded: u64 = 0;
     let mut depth_unconsumed: u64 = 0;
@@ -2229,6 +2276,22 @@ async fn run_frame_drain(
             biased;
             maybe_frame = rx.recv() => {
                 let Some(frame) = maybe_frame else { break };
+                // The lane is UP the moment a frame actually arrives, and not
+                // one instant sooner (plan Item 7). Raised once per drain, from
+                // the only place in the process that has proof a socket both
+                // connected AND delivered — the bytes are in hand.
+                //
+                // A gauge rather than a counter, and set unconditionally on the
+                // first frame rather than tracked with an edge, because the
+                // drain is the single consumer: there is no second writer to
+                // race, and re-setting an already-1.0 gauge is free.
+                if !lane_up {
+                    lane_up = true;
+                    metrics::gauge!(FEED_STACK_UP_GAUGE).set(1.0);
+                    info!(
+                        "Dhan live lane is UP — first frame received and consumed by the fold"
+                    );
+                }
                 // Release the byte reservation the instant the frame leaves the
                 // ring — BEFORE any parsing, and on EVERY path out of this arm.
                 // Releasing after a successful parse instead would leak the
@@ -2741,12 +2804,17 @@ pub fn drain_main_feed_frame(
                 // book it discarded, while separately storing 20 levels for a
                 // 250-instrument subset at ~506M rows/day.
                 //
-                // Gated, because turning it on is not free: at the 25,000
-                // target it is ~611M rows/day of its own. It is only a WIN
-                // alongside standing the dedicated depth-20 pool down, which
-                // trades 20 levels on 250 instruments for 5 levels on all
-                // 25,000 — less storage AND 100x the coverage. That swap is
-                // the operator's call, so this ships able but off.
+                // Not free: at the 25,000 target it is ~611M rows/day of its
+                // own. The cheaper shape would have been a SWAP — standing the
+                // dedicated depth-20 pool down and trading 20 levels on 250
+                // instruments for 5 levels on all 25,000, which is less
+                // storage AND 100x the coverage. The operator was offered that
+                // swap on 2026-08-19 and chose to keep all THREE sources, so
+                // this runs alongside them rather than instead of them.
+                //
+                // CORRECTED 2026-08-20: this closed with "so this ships able
+                // but off", which stopped being true the same day it was
+                // written — the boot site wires the sink unconditionally.
                 //
                 // The ingest-shed gate is consulted FIRST and cheaply: one
                 // relaxed atomic load, before the sink is even taken. Inline
@@ -2758,9 +2826,20 @@ pub fn drain_main_feed_frame(
                     (ingest.inline_depth.as_mut(), &parsed)
                 {
                     if INGEST_SHED.allows_inline_depth() {
-                        out.inline_depth_rows = out.inline_depth_rows.saturating_add(
-                            append_inline_depth(sink, t, levels, received_at_nanos),
-                        );
+                        // `frame.seq` and `packets` are BOTH load-bearing — see
+                        // the `capture_seq` derivation inside. The frame stamp
+                        // alone repeats across every packet in the frame, and
+                        // the level ordinal alone repeats across every frame.
+                        out.inline_depth_rows =
+                            out.inline_depth_rows.saturating_add(append_inline_depth(
+                                sink,
+                                t,
+                                levels,
+                                received_at_nanos,
+                                frame.seq,
+                                packets,
+                                c,
+                            ));
                     } else {
                         c.shed_inline_depth.increment(1);
                     }
@@ -2840,7 +2919,10 @@ pub struct FrameOutcome {
     /// Packets refused by the parser or by an unknown response code.
     pub unparseable: u64,
     /// Depth rows appended from the 5 levels carried INLINE in Full-mode tick
-    /// packets. Zero unless `[dhan_feed] persist_full_mode_depth` is on.
+    /// packets. Zero unless the ingest was built with
+    /// [`LiveIngest::with_inline_depth`] — which the production boot site does
+    /// unconditionally. (CORRECTED 2026-08-20: said "unless `[dhan_feed]
+    /// persist_full_mode_depth` is on", a key that exists nowhere.)
     pub inline_depth_rows: u64,
 }
 
@@ -2967,11 +3049,36 @@ impl DepthIngest {
 /// table and 3 in another for the same instant, and the difference would look
 /// like data loss rather than a convention mismatch. Negative and implausible
 /// prices ARE refused, exactly as they are there.
+///
+/// # `capture_seq` is PER-PACKET, exactly as the dedicated drain derives it
+///
+/// A Dhan frame STACKS packets, `received_at_nanos` is computed ONCE for the
+/// whole frame, and `capture_seq` is a DEDUP key column. Until 2026-08-20 this
+/// stamped `level_no * 2 (+1)` — a value that depends only on the level and the
+/// side, so two Full packets for the SAME instrument in ONE frame produced ten
+/// rows whose EVERY key column matched ten earlier rows, and QuestDB upserted
+/// one book silently over the other. `rows` counts successful ILP APPENDS, not
+/// DB acceptance, so the loss did not even show as a shortfall in our own
+/// counter — invisible loss in the one table whose entire premise is that
+/// nothing is lost. That is the identical defect the dedicated depth drain
+/// fixed on 2026-08-15; this path was written four days later and repeated it.
+///
+/// The per-packet value is used for all ten rows because `side` and `level` are
+/// THEMSELVES key columns — they already separate the rows within one packet.
+/// What was missing was the packet's identity, not the level's.
+///
+/// An index that does not fit the bits `packet_capture_seq` reserves REFUSES
+/// the packet's depth and counts it. Never a fallback value: pinning every
+/// over-range packet onto one key would collapse them together, which is the
+/// same silent merge this exists to remove, reintroduced at the other end.
 fn append_inline_depth(
     sink: &mut DepthIngest,
     tick: &tickvault_common::tick_types::ParsedTick,
     levels: &[tickvault_common::tick_types::MarketDepthLevel; 5],
     received_at_nanos: i64,
+    frame_seq: u64,
+    packet_index: u32,
+    c: &DrainCounters,
 ) -> u64 {
     // Same posture as the dedicated depth drain: an unrecognised segment is
     // REFUSED, never written under a placeholder. A row labelled "UNKNOWN"
@@ -2984,12 +3091,26 @@ fn append_inline_depth(
     let Ok(security_id) = i64::try_from(tick.security_id) else {
         return 0;
     };
+    let Some(capture_seq) =
+        tickvault_storage::ws_frame_spill::packet_capture_seq(frame_seq, u64::from(packet_index))
+            .and_then(capture_seq_from_frame_seq)
+    else {
+        c.depth_refused.increment(1);
+        return 0;
+    };
+    // IST, not UTC — `received_at_nanos` is deliberately TRUE UTC because
+    // `ws_lag_ms` differences the vendor's IST stamp against it, so the offset
+    // is added at each PERSISTING site instead. The dedicated depth drain does
+    // exactly this; this path shipped without it on 2026-08-19, which put `d5`
+    // rows 5h30m behind `d20`/`d200` rows in the SAME table (any join or
+    // eyeball comparison silently misaligns) and, because `ts` is the
+    // DESIGNATED timestamp, partitioned every row stamped between 18:30 and
+    // 23:59 IST into the PREVIOUS day — the day archival and retention key on.
+    let ts_nanos =
+        received_at_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
     let mut rows = 0_u64;
     for (idx, level) in levels.iter().enumerate() {
         let level_no = i64::try_from(idx).unwrap_or(i64::MAX).saturating_add(1);
-        // capture_seq disambiguates rows sharing a timestamp. The two sides of
-        // one level are distinct observations, so they get distinct values.
-        let base_seq = level_no.saturating_mul(2);
         let plausible = |p: f32| -> bool {
             let p = f64::from(p);
             p.is_finite() && p >= 0.0 && p <= f64::from(MAX_PLAUSIBLE_LTP)
@@ -3004,8 +3125,8 @@ fn append_inline_depth(
                 price: f64::from(level.bid_price),
                 quantity: i64::from(level.bid_quantity),
                 orders: i64::from(level.bid_orders),
-                capture_seq: base_seq,
-                ts_nanos: received_at_nanos,
+                capture_seq,
+                ts_nanos,
             };
             if sink.writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
@@ -3021,8 +3142,8 @@ fn append_inline_depth(
                 price: f64::from(level.ask_price),
                 quantity: i64::from(level.ask_quantity),
                 orders: i64::from(level.ask_orders),
-                capture_seq: base_seq.saturating_add(1),
-                ts_nanos: received_at_nanos,
+                capture_seq,
+                ts_nanos,
             };
             if sink.writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
@@ -3862,14 +3983,60 @@ fn remaining_main_feed_capacity(connections_used: usize) -> usize {
 }
 
 /// Main-feed connections a set of `instruments` occupies.
+///
+/// # This must mirror `plan_pool`, not the packing arithmetic
+///
+/// CORRECTED 2026-08-20. This returned `instruments.div_ceil(per_connection)`
+/// — the number of connections the set would need if it were PACKED. But
+/// `plan_pool` does not pack; it SPREADS, deliberately, taking
+/// `min(available, set.len()).max(1)` connections so no socket carries the
+/// whole universe. The two answers diverge badly at the live scale:
+///
+/// | | connections |
+/// |---|---|
+/// | `plan_pool` dials for 4,565 spots | `min(5, 4565)` = **5** |
+/// | this function used to report | `ceil(4565 / 5000)` = **1** |
+///
+/// So the boot consumed every main-feed slot while the contract attach was
+/// told four were free — `remaining_main_feed_capacity(1)` = 20,000 — and
+/// asked the pool for room that did not exist. `pool.admit` is stateful and
+/// correctly refused, `plan_pool` returned `BudgetRefused`, and because
+/// `MainFeed` is the FIRST endpoint in `build_feed_stack_plan`'s loop that
+/// error aborted the whole plan **before Depth20 and Depth200 were ever
+/// planned**.
+///
+/// The consequence is the part worth recording: adding contract selection did
+/// not merely fail to dial contracts, it took DEPTH DOWN WITH IT — regressing
+/// depth from "possible once the chain populates" to "impossible", via an
+/// arithmetic disagreement between two functions that never call each other.
+/// The retry loop then re-failed identically until the deadline and reported
+/// that depth would carry no data this session, which reads as a depth problem
+/// and is not one.
+///
+/// Now mirrors `plan_pool` exactly. When the spot universe has already spread
+/// across every connection this returns the cap, `remaining_main_feed_capacity`
+/// returns 0, the attach selects no contracts, and the plan SUCCEEDS — so
+/// depth dials. That is the honest answer: there is genuinely no room, and
+/// saying so lets the sockets that can work, work.
+/// `available` is REQUIRED, and that is the whole correction: `plan_pool`
+/// spreads across `min(available, len)`, so occupancy is a function of how
+/// many connections are free at that moment, not of a global constant. A
+/// signature that omitted it could not express the right answer for the
+/// second planning pass even in principle.
 #[must_use]
-fn main_feed_connections_for(instruments: usize) -> usize {
+fn main_feed_connections_for(instruments: usize, available: usize) -> usize {
+    if instruments == 0 || available == 0 {
+        return 0;
+    }
     let per_connection = usize::try_from(
         tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
     )
     .unwrap_or(usize::MAX)
     .max(1);
-    instruments.div_ceil(per_connection)
+    // Mirrors `plan_pool`'s MAIN-FEED arm exactly: pack, then clamp to what is
+    // actually free. Both halves matter — packing is the policy, and the clamp
+    // is what stops this reporting capacity the pool would refuse.
+    instruments.div_ceil(per_connection).max(1).min(available)
 }
 
 /// Packs an IST `YYYY-MM-DD` date into the `YYYYMMDD` form contract selection
@@ -4690,7 +4857,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             frame_tx.downgrade(),
             Arc::clone(&depth_budget),
             Arc::clone(&main_feed_budget),
-            main_feed_connections_for(params.main_feed_instruments.len()),
+            main_feed_connections_for(
+                params.main_feed_instruments.len(),
+                usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS),
+            ),
         ));
     }
 
@@ -4709,9 +4879,30 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         return;
     }
 
-    // Up means SOCKETS DIALED AND A FOLD CONSUMING THEM — not "config was
-    // enabled". It is set here and cleared by the drain when the ring closes.
-    metrics::gauge!(FEED_STACK_UP_GAUGE).set(1.0);
+    // CORRECTED 2026-08-20 (plan Item 7, which had never been implemented).
+    //
+    // This line used to `.set(1.0)` HERE, and the comment above it claimed the
+    // gauge meant "sockets dialed AND a fold consuming them". It did not. The
+    // `dialed` counter it sits behind is incremented immediately after
+    // `tokio::spawn`, and the connect happens INSIDE that task — so a socket
+    // that answers HTTP 400 forever still counts as dialed.
+    //
+    // That is not hypothetical. On 2026-08-12 the main feed failed twelve
+    // dials with `400 Bad Request`, produced ZERO candles for a 373-minute
+    // session, and this gauge would have read 1.0 for every minute of it —
+    // leaving `tv-<env>-dhan-live-lane-down` silent through precisely the
+    // outage it exists to catch. A monitor that cannot fire during its own
+    // scenario is worse than no monitor: it converts an outage into a clean
+    // dashboard.
+    //
+    // The gauge is now raised by the DRAIN, on the first frame it actually
+    // receives — the earliest moment at which "sockets dialed AND a fold
+    // consuming them" is a true statement rather than an intention. Here we
+    // only pre-register it at zero, which is the house first-sample-baseline
+    // discipline: the CloudWatch agent drops the first delta sample, and the
+    // sample it drops must be the harmless 0 rather than the session's first
+    // real transition.
+    metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
 
     // Tell the operator-facing feed state the same thing the gauge just said.
     //
@@ -5510,7 +5701,7 @@ mod tests {
     /// and left four authorized ones idle — which is how "16 authorized" was
     /// really 7 in practice.
     #[test]
-    fn test_main_feed_spreads_a_fitting_set_across_all_five_connections() {
+    fn test_main_feed_packs_its_first_pass_so_contracts_still_fit() {
         let mut pool = PoolSupervisor::new();
         let now = std::time::Instant::now();
         // The real resolved-master size on the live box, 2026-08-12.
@@ -5518,9 +5709,17 @@ mod tests {
             .expect("4565 instruments must plan cleanly");
         assert_eq!(
             plan.count_for(DhanEndpointType::MainFeed),
-            5,
-            "4,565 instruments must SPREAD across all 5 authorized main-feed \
-             connections; packing put them on 1 and left 4 idle"
+            1,
+            "4,565 fits ONE 5,000-instrument socket. Spreading it across all \
+             five took the whole pool, so the ~20,000-contract second pass was \
+             refused — and because MainFeed is planned first, that refusal \
+             aborted depth planning too. Packing pass 1 is what ends with all \
+             five main-feed sockets carrying data."
+        );
+        assert_eq!(
+            pool.total_open(),
+            1,
+            "four connections must remain free for the contract pass"
         );
     }
 
@@ -5529,6 +5728,56 @@ mod tests {
     /// Spreading widens shards only when a set fits in FEWER connections than
     /// are authorized, so the width can only shrink relative to the cap — but
     /// this asserts the invariant directly rather than trusting that argument.
+    #[test]
+    fn all_sixteen_sockets_carry_data_at_the_authorized_scale() {
+        // THE END-TO-END ARITHMETIC, asserted rather than argued. This is the
+        // operator's actual requirement — 16 connections, all carrying data —
+        // and until 2026-08-20 the answer was 6, with depth structurally
+        // unable to plan at all.
+        //
+        // Two passes, exactly as the live lane runs them: spots at boot, then
+        // contracts once post-open prices exist.
+        let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
+
+        // Pass 1 — boot spots.
+        let mut pool = PoolSupervisor::new();
+        let now = std::time::Instant::now();
+        let boot = build_feed_stack_plan(&mut pool, now, &instruments(4_565), &[], &[])
+            .expect("the spot universe must plan");
+        assert_eq!(boot.count_for(DhanEndpointType::MainFeed), 1);
+
+        // Pass 2 — contracts sized by what pass 1 left, plus both depth pools.
+        // The SAME pool, so `admit` is stateful exactly as in production.
+        let used = boot.count_for(DhanEndpointType::MainFeed);
+        let room = remaining_main_feed_capacity(used);
+        let attach = build_feed_stack_plan(
+            &mut pool,
+            now,
+            &instruments(room),
+            &instruments(250),
+            &instruments(5),
+        )
+        .expect(
+            "the contract + depth pass must PLAN — a BudgetRefused here is the \
+             defect that cost depth an entire session, because MainFeed is \
+             planned first and its refusal aborts depth too",
+        );
+
+        assert_eq!(attach.count_for(DhanEndpointType::MainFeed), 4, "contracts");
+        assert_eq!(attach.count_for(DhanEndpointType::Depth20), 5);
+        assert_eq!(attach.count_for(DhanEndpointType::Depth200), 5);
+
+        // 5 main-feed (1 spots + 4 contracts) + 5 depth-20 + 5 depth-200 = 15,
+        // plus the order-update socket dialed by the REST stack = 16.
+        assert_eq!(used + attach.count_for(DhanEndpointType::MainFeed), max);
+        assert_eq!(
+            pool.total_open(),
+            15,
+            "fifteen market-data sockets; the sixteenth is order-update, dialed \
+             by dhan_rest_stack and counted against its own endpoint budget"
+        );
+    }
+
     #[test]
     fn test_spread_shard_width_never_exceeds_the_dhan_cap() {
         for n in [1usize, 2, 49, 50, 51, 200, 249, 250, 4565, 25_000] {
@@ -5695,11 +5944,12 @@ mod tests {
     // -- planning -----------------------------------------------------------
 
     #[test]
-    fn test_build_feed_stack_plan_spreads_the_index_universe_one_per_connection() {
-        // CHANGED 2026-08-12 (spread, not pack): four index SIDs now open FOUR
-        // main-feed sockets, one instrument each, where packing opened one.
-        // Bounded by the instrument count, so no socket is empty — four
-        // instruments can never justify a fifth connection.
+    fn test_build_feed_stack_plan_packs_the_index_universe_onto_one_connection() {
+        // CHANGED 2026-08-20 (main-feed PACKS again, depth still spreads —
+        // scope-lock amendment of that date). Four index SIDs fit one 5,000-
+        // instrument socket, and packing pass 1 is what leaves the other four
+        // connections for the contract pass. Under spread these four SIDs took
+        // four sockets and the contracts were refused.
         let mut pool = PoolSupervisor::new();
         let plan = build_feed_stack_plan(
             &mut pool,
@@ -5709,21 +5959,19 @@ mod tests {
             &[],
         )
         .expect("four indices plan cleanly");
-        assert_eq!(plan.len(), 4);
-        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 4);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 1);
         assert_eq!(plan.count_for(DhanEndpointType::Depth20), 0);
         assert_eq!(plan.count_for(DhanEndpointType::Depth200), 0);
-        assert_eq!(pool.total_open(), 4);
+        assert_eq!(pool.total_open(), 1);
     }
 
     #[test]
-    fn test_plan_count_for_spreads_across_the_authorized_connections() {
+    fn test_plan_count_for_packs_the_main_feed_and_spreads_depth() {
         let mut pool = PoolSupervisor::new();
-        // CHANGED 2026-08-12 (spread, not pack). Every set below fits inside
-        // the authorized pools, so each SPREADS across all 5 connections
-        // rather than packing into the fewest:
-        //   12,001 main-feed -> 5 conns of 2,401 (cap 5,000, well inside)
-        //      101 depth-20   -> 5 conns of 21    (cap 50)
+        // CHANGED 2026-08-20: the MAIN FEED packs, DEPTH still spreads.
+        //   12,001 main-feed -> ceil(12001/5000) = 3 conns (cap 5,000)
+        //      101 depth-20   -> 5 conns of 21    (cap 50, spread)
         // depth-200 is capped at 1 instrument per connection, so 3
         // instruments is 3 sockets — bounded by the set, never padded.
         let plan = build_feed_stack_plan(
@@ -5734,11 +5982,11 @@ mod tests {
             &instruments(3),
         )
         .expect("all three shards fit inside the authorized pools");
-        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 5);
+        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 3);
         assert_eq!(plan.count_for(DhanEndpointType::Depth20), 5);
         assert_eq!(plan.count_for(DhanEndpointType::Depth200), 3);
-        assert_eq!(plan.len(), 13);
-        assert_eq!(pool.total_open(), 13);
+        assert_eq!(plan.len(), 11);
+        assert_eq!(pool.total_open(), 11);
     }
 
     #[test]
@@ -5813,10 +6061,10 @@ mod tests {
             .expect("inside the pool");
         let total: usize = plan.connections.iter().map(|c| c.guard.len()).sum();
         assert_eq!(total, 7_777, "sharding must not drop or duplicate anything");
-        // CHANGED 2026-08-12: spread gives 5 conns of 1,556 rather than 2 of
-        // 5,000. Conservation above is the invariant that actually matters and
-        // is unchanged.
-        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 5);
+        // CHANGED 2026-08-20: the main feed packs, so 7,777 is 2 conns of
+        // 5,000 and 2,777. Conservation above is the invariant that actually
+        // matters and is unchanged by either policy.
+        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 2);
     }
 
     #[test]
@@ -7563,21 +7811,23 @@ mod tests {
     }
 
     #[test]
-    fn test_up_gauge_is_raised_only_after_sockets_are_dialed_and_cleared_when_they_die() {
-        // Rule 11, no false-OK. Until this round the guard read "nothing may
-        // set this gauge to 1" — because no transport existed and reporting
-        // the lane up would have been a lie. The transport now exists, so the
-        // invariant tightens rather than relaxes: `1` may only be written
-        // BELOW the dial loop (never on the config-gate path), and something
-        // must write `0` back when the ring closes, or a dead lane would keep
-        // reporting itself healthy forever.
+    fn test_up_gauge_is_raised_by_a_received_frame_and_never_by_a_spawn() {
+        // REWRITTEN 2026-08-20. The previous version of this guard asserted
+        // the raise came AFTER the dial loop — and that is exactly what made
+        // the defect permanent, because it pinned the wrong thing as correct.
+        //
+        // `dialed` counts `tokio::spawn` calls; the connect happens INSIDE the
+        // spawned task. So a socket answering HTTP 400 forever still counted
+        // as dialed, the gauge read 1.0, and `tv-<env>-dhan-live-lane-down`
+        // stayed silent. On 2026-08-12 that is precisely what a 373-minute,
+        // zero-candle session looked like from CloudWatch: healthy.
+        //
+        // The invariant is now about PROVENANCE, not source order: only code
+        // that is holding a received frame may claim the lane is up.
         let src = include_str!("dhan_feed_stack.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production_half = src.split(test_marker).next().unwrap_or(src);
 
-        let raise = production_half
-            .find("gauge!(FEED_STACK_UP_GAUGE).set(1.0)")
-            .expect("the lane must report itself up once it is actually carrying data");
         assert_eq!(
             production_half
                 .matches("FEED_STACK_UP_GAUGE).set(1.0)")
@@ -7586,29 +7836,42 @@ mod tests {
             "exactly ONE site may raise the up-gauge, so there is one place to audit"
         );
 
-        // The dial loop's own marker. `1` must come after it — a raise above
-        // this line would be reporting config, not connectivity.
-        let dialed = production_half
-            .find("dialed = dialed.saturating_add(1)")
-            .expect("the dial loop must count the sockets it opened");
+        // THE LOAD-BEARING ASSERTION. The raise must live inside the drain,
+        // which is the only code in the process that has proof a socket both
+        // connected AND delivered — it is holding the bytes.
+        let drain = production_half
+            .split_once("async fn run_frame_drain")
+            .expect("the drain function must exist")
+            .1;
         assert!(
-            raise > dialed,
-            "the up-gauge may only be raised after sockets have actually been dialed"
+            drain.contains("gauge!(FEED_STACK_UP_GAUGE).set(1.0)"),
+            "the up-gauge must be raised INSIDE run_frame_drain, on a frame that \
+             actually arrived — anywhere else is reporting an intention"
+        );
+        assert!(
+            drain.contains("if !lane_up"),
+            "the raise must be latched, so the rising edge is one event"
         );
 
-        // And something must clear it. Without this, a lane whose every socket
-        // died would sit at 1 until the process restarted. `find`, not
-        // `rfind`: there are legitimately TWO clear sites — the drain's normal
-        // exit (above the raise in source order) and the panic handler that
-        // catches a dead drain (below it). Asserting on the LAST one would
-        // demand the impossible, which is how this guard first went red.
-        let clear = production_half
-            .find("gauge!(FEED_STACK_UP_GAUGE).set(0.0)")
-            .expect("something must clear the up-gauge when the lane goes down");
-        assert!(
-            clear < raise,
-            "the drain's clear belongs above bring-up in source order"
-        );
+        // And the bring-up path must NOT raise it. This is the half that
+        // regressed: a `.set(1.0)` here means 'we spawned some tasks', which
+        // is not connectivity and must never be published as if it were.
+        let bringup = production_half
+            .rsplit_once("fn dial_planned_connections")
+            .map_or(production_half, |(before, _)| before);
+        let dial_marker = "dialed = dialed.saturating_add(1)";
+        if let Some(dialed_at) = bringup.find(dial_marker) {
+            let after_dial = &bringup[dialed_at..];
+            assert!(
+                !after_dial.contains("FEED_STACK_UP_GAUGE).set(1.0)"),
+                "the dial loop must not raise the up-gauge — `dialed` counts \
+                 tokio::spawn calls, and a socket that 400s forever still \
+                 increments it"
+            );
+        }
+
+        // Something must still clear it, or a lane whose every socket died
+        // would sit at 1 until the process restarted.
         assert!(
             production_half
                 .matches("FEED_STACK_UP_GAUGE).set(0.0)")
@@ -7619,6 +7882,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_main_feed_connections_for_mirrors_what_plan_pool_actually_dials() {
+        // THE REGRESSION. `plan_pool` SPREADS: it takes
+        // `min(available, set.len()).max(1)` connections. This function used
+        // to return the PACKED count, `ceil(len / 5000)`. At the live scale
+        // those disagree 5 vs 1, so the attach was told four connections were
+        // free when zero were — and the resulting BudgetRefused aborted the
+        // whole plan before depth was ever planned.
+        let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
+
+        assert_eq!(
+            main_feed_connections_for(0, max),
+            0,
+            "an empty set occupies nothing"
+        );
+        assert_eq!(
+            main_feed_connections_for(1, max),
+            1,
+            "one instrument still occupies a whole connection"
+        );
+        // The live universe. The main feed PACKS, so 4,565 spots occupy ONE
+        // connection and leave four for the contract pass.
+        assert_eq!(
+            main_feed_connections_for(4_565, max),
+            1,
+            "4,565 fits one 5,000-instrument socket — packing pass 1 is what \
+             leaves room for the ~20,000 contracts of pass 2"
+        );
+        assert_eq!(
+            main_feed_connections_for(25_000, max),
+            max,
+            "at the target scale packed and spread converge exactly"
+        );
+        // Never more than are actually free, whatever the arithmetic says.
+        assert_eq!(
+            main_feed_connections_for(25_000, 2),
+            2,
+            "clamped to what the pool has left — reporting 5 here is what \
+             asked for room that did not exist and refused the whole pool"
+        );
+        assert_eq!(main_feed_connections_for(3, max), 1, "three fit one socket");
+
+        // THE POINT OF THE WHOLE FIX: after the spots, contracts still fit.
+        let used = main_feed_connections_for(4_565, max);
+        let room = remaining_main_feed_capacity(used);
+        assert_eq!(
+            room, 20_000,
+            "four connections x 5,000 remain for contracts"
+        );
+        assert_eq!(
+            used + main_feed_connections_for(room, max.saturating_sub(used)),
+            max,
+            "spots + contracts together fill all five main-feed sockets — the \
+             spread directive's intent, delivered by packing the first pass"
+        );
+    }
     #[test]
     fn test_the_lane_refuses_to_dial_without_a_wal_or_a_token_manager() {
         // Both refusals are `return`s on the bring-up path, not warnings that
@@ -8453,30 +8772,84 @@ mod contract_attach_tests {
     }
 
     #[test]
-    fn connection_count_rounds_up_because_a_partial_socket_is_still_a_socket() {
-        assert_eq!(main_feed_connections_for(0), 0);
-        assert_eq!(main_feed_connections_for(1), 1);
-        assert_eq!(main_feed_connections_for(5_000), 1);
-        assert_eq!(main_feed_connections_for(5_001), 2);
-        assert_eq!(main_feed_connections_for(4_565), 1, "today's spot universe");
-        assert_eq!(main_feed_connections_for(25_000), 5);
+    fn connection_count_mirrors_the_main_feed_pack_policy() {
+        // History, because this line has now been wrong in BOTH directions and
+        // the reason is the same each time: it must mirror `plan_pool`'s
+        // main-feed arm, and nothing else.
+        //
+        //  - originally PACKED while plan_pool SPREAD  -> understated by 4,
+        //    the attach asked for room that did not exist, the pool refused
+        //    everything and depth was never planned;
+        //  - briefly SPREAD to match                   -> honest, but left
+        //    literally zero room for contracts;
+        //  - now PACKED, with plan_pool packing too    -> both passes fit.
+        let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
+        let cap = usize::try_from(
+            tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
+        )
+        .unwrap_or(usize::MAX);
+
+        assert_eq!(
+            main_feed_connections_for(0, max),
+            0,
+            "nothing occupies nothing"
+        );
+        assert_eq!(main_feed_connections_for(1, max), 1);
+        assert_eq!(main_feed_connections_for(3, max), 1, "three fit one socket");
+        assert_eq!(
+            main_feed_connections_for(cap, max),
+            1,
+            "exactly full is still one"
+        );
+        assert_eq!(
+            main_feed_connections_for(cap + 1, max),
+            2,
+            "one over spills"
+        );
+        assert_eq!(
+            main_feed_connections_for(4_565, max),
+            1,
+            "today's spot universe fits one socket — leaving four for contracts"
+        );
+        assert_eq!(main_feed_connections_for(25_000, max), max, "target scale");
+
+        // The clamp. Reporting more than the pool has free is what earns a
+        // BudgetRefused on the WHOLE pool.
+        assert_eq!(main_feed_connections_for(25_000, 2), 2);
+        assert_eq!(main_feed_connections_for(25_000, 0), 0);
     }
 
     #[test]
     fn the_two_helpers_can_never_together_exceed_the_authorized_pool() {
-        // The 16-connection lock has to be arithmetic, not a hope. For every
-        // reachable spot-universe size, connections used plus connections the
-        // remaining capacity could need must stay inside the cap.
+        // The 5-connection main-feed lock has to be arithmetic, not a hope:
+        // for every reachable spot-universe size, the connections the spots
+        // occupy plus the connections the remaining capacity could need must
+        // stay inside the cap.
         let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
-        for spot in [0usize, 1, 4_565, 5_000, 5_001, 12_000, 24_999, 25_000] {
-            let used = main_feed_connections_for(spot);
+        for spot in [0usize, 1, 3, 4_565, 5_000, 5_001, 12_000, 24_999, 25_000] {
+            let used = main_feed_connections_for(spot, max);
             let remaining = remaining_main_feed_capacity(used);
-            let would_need = main_feed_connections_for(remaining);
+            // Contracts may only occupy what the spots LEFT.
+            let would_need = main_feed_connections_for(remaining, max.saturating_sub(used));
             assert!(
                 used + would_need <= max,
                 "spot={spot} used={used} + contracts={would_need} exceeds {max}"
             );
         }
+
+        // And the property the whole fix exists for, stated directly: after
+        // today's spot universe, contracts still fit — and together they fill
+        // every authorized main-feed socket. Under the old arithmetic this
+        // line read 0 connections for contracts and a refused pool.
+        let used = main_feed_connections_for(4_565, max);
+        assert_eq!(used, 1);
+        let room = remaining_main_feed_capacity(used);
+        assert_eq!(room, 20_000, "four connections x 5,000 remain");
+        assert_eq!(
+            used + main_feed_connections_for(room, max.saturating_sub(used)),
+            max,
+            "spots + contracts together fill all five main-feed sockets"
+        );
     }
 
     #[test]
@@ -8526,9 +8899,16 @@ mod inline_depth_tests {
 
     #[test]
     fn append_inline_depth_writes_both_sides_of_every_level() {
-        // 5 levels x 2 sides = 10 rows, and each side of a level gets its own
-        // capture_seq — they are distinct observations sharing a timestamp, so
-        // a shared seq would let the DEDUP key collapse them.
+        // 5 levels x 2 sides = 10 rows.
+        //
+        // CORRECTED 2026-08-20: this comment used to justify a PER-SIDE
+        // capture_seq ("each side of a level gets its own ... a shared seq
+        // would let the DEDUP key collapse them"). That reasoning was wrong in
+        // both directions. `side` and `level` are THEMSELVES DEDUP key columns,
+        // so the ten rows of one packet were never at risk of collapsing; and
+        // encoding the level/side ordinal there consumed the one column that
+        // could carry the PACKET's identity, which is what actually collides.
+        // See `append_inline_depth`'s own docs.
         let mut sink = DepthIngest::for_test();
         let tick = tickvault_common::tick_types::ParsedTick {
             security_id: 13,
@@ -8543,7 +8923,15 @@ mod inline_depth_tests {
             bid_price: 100.5,
             ask_price: 100.75,
         }; 5];
-        let rows = append_inline_depth(&mut sink, &tick, &levels, 1_700_000_000_000_000_000);
+        let rows = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            1_700_000_000_000_000_000,
+            0,
+            0,
+            counters(),
+        );
         assert_eq!(rows, 10, "5 levels x 2 sides");
     }
 
@@ -8562,7 +8950,7 @@ mod inline_depth_tests {
         };
         let zero = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &zero, 1),
+            append_inline_depth(&mut sink, &tick, &zero, 1, 0, 0, counters()),
             10,
             "zero-priced levels are the absent sentinel and MUST be written"
         );
@@ -8570,9 +8958,99 @@ mod inline_depth_tests {
         let mut neg = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
         neg[0].bid_price = -1.0;
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &neg, 1),
+            append_inline_depth(&mut sink, &tick, &neg, 1, 0, 0, counters()),
             9,
             "a negative price is impossible and must be refused"
+        );
+    }
+
+    #[test]
+    fn two_packets_for_one_instrument_in_one_frame_get_distinct_capture_seqs() {
+        // THE REGRESSION. A Dhan frame STACKS packets and `received_at_nanos`
+        // is computed once for the whole frame, so when the same instrument
+        // ticks twice in one frame every DEDUP key column is fixed except
+        // `capture_seq`. Until 2026-08-20 that column held `level_no * 2 (+1)`
+        // — a function of the level and side ALONE — so the second packet's
+        // ten rows carried keys identical to the first packet's and QuestDB
+        // upserted one book silently over the other.
+        //
+        // It could not be caught by a row count: `append_row` succeeds for
+        // both packets, so `rows` reads 20 while the table ends up holding 10.
+        // The only way to see it is to read the emitted line protocol, which
+        // is exactly why `buffer_utf8` was made cross-crate `pub`.
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            ..Default::default()
+        }; 5];
+
+        // Same frame (seq 4096, base-aligned), packets 0 and 1.
+        let frame_seq = 4096_u64;
+        let a = append_inline_depth(&mut sink, &tick, &levels, 1, frame_seq, 0, counters());
+        let b = append_inline_depth(&mut sink, &tick, &levels, 1, frame_seq, 1, counters());
+        assert_eq!(a + b, 20, "both packets appended their ten rows");
+
+        let ilp = sink.writer.buffer_utf8();
+        let mut seqs: Vec<&str> = ilp
+            .lines()
+            .filter_map(|l| l.split("capture_seq=").nth(1))
+            .map(|rest| rest.split([',', ' ']).next().unwrap_or(""))
+            .collect();
+        assert_eq!(seqs.len(), 20, "every row carries a capture_seq");
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(
+            seqs.len(),
+            2,
+            "the two PACKETS must differ; the ten rows within a packet share a \
+             seq deliberately because `side` and `level` are key columns. Got \
+             {seqs:?} — one distinct value means the packet index is not folded \
+             in and one book silently overwrites the other"
+        );
+    }
+
+    #[test]
+    fn inline_depth_rows_are_stamped_ist_like_every_sibling_depth_row() {
+        // `d5`, `d20` and `d200` land in the SAME table. The dedicated drain
+        // adds the IST offset at its stamping site; this path shipped on
+        // 2026-08-19 without it, so `d5` rows sat 5h30m behind their siblings
+        // — any join or eyeball comparison misaligned silently — and, because
+        // `ts` is the DESIGNATED timestamp, every row stamped between 18:30 and
+        // 23:59 IST partitioned into the PREVIOUS day, which is the day
+        // retention and S3 archival key on.
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            ..Default::default()
+        }; 5];
+        let utc = 1_700_000_000_000_000_000_i64;
+        assert_eq!(
+            append_inline_depth(&mut sink, &tick, &levels, utc, 0, 0, counters()),
+            10
+        );
+        let expected = utc + tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        let ilp = sink.writer.buffer_utf8();
+        let stamped: Vec<&str> = ilp
+            .lines()
+            .filter_map(|l| l.rsplit(' ').next())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            stamped.iter().all(|s| *s == expected.to_string()),
+            "every d5 row must carry the IST-shifted stamp {expected}, not raw \
+             UTC {utc}. Got {stamped:?}"
         );
     }
 
@@ -8593,7 +9071,7 @@ mod inline_depth_tests {
             ..Default::default()
         }; 5];
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &levels, 1),
+            append_inline_depth(&mut sink, &tick, &levels, 1, 0, 0, counters()),
             0,
             "an unknown segment must produce NO rows"
         );
@@ -8621,7 +9099,7 @@ mod inline_depth_tests {
             ..Default::default()
         }; 5];
         let sink = ingest.inline_depth.as_mut().expect("enabled above");
-        let rows = append_inline_depth(sink, &tick, &levels, 1);
+        let rows = append_inline_depth(sink, &tick, &levels, 1, 0, 0, counters());
         assert_eq!(rows, 10, "depth rows were appended");
 
         // No ticks were folded, so pending_rows is 0 and the early return

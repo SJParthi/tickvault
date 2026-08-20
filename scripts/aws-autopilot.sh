@@ -44,6 +44,7 @@ SECRET_INSTANCE_ID="${EC2_INSTANCE_ID:-}"
 INSTANCE_ID=""
 SECRET_DRIFT_MSG=""
 
+SECRET_DRIFT_SEVERITY=""
 RESOLVED_IDS=$(aws ec2 describe-instances --region "$REGION" \
   --filters "Name=tag:Name,Values=tv-${ENVIRONMENT}-app" \
             "Name=instance-state-name,Values=pending,running,stopping,stopped" \
@@ -59,10 +60,11 @@ if [ "$RESOLVED_COUNT" -gt 1 ]; then
 elif [ "$RESOLVED_COUNT" -eq 1 ]; then
   INSTANCE_ID=$(printf '%s\n' $RESOLVED_IDS | head -1)
   if [ -n "$SECRET_INSTANCE_ID" ] && [ "$SECRET_INSTANCE_ID" != "$INSTANCE_ID" ]; then
+    SECRET_DRIFT_SEVERITY="cosmetic"
     SECRET_DRIFT_MSG="EC2_INSTANCE_ID secret is STALE — it names ${SECRET_INSTANCE_ID}, but the live \
 tv-${ENVIRONMENT}-app instance is ${INSTANCE_ID}. Autopilot healed itself by using the live id, so this \
-run is valid. Rotate the GitHub secret EC2_INSTANCE_ID to ${INSTANCE_ID} (Settings > Secrets and \
-variables > Actions) so every other lane that still reads it targets the right box."
+run is valid. Rotating the secret to ${INSTANCE_ID} (Settings > Secrets and \
+variables > Actions) is OPTIONAL TIDY-UP only: as of 2026-08-20 every lane (autopilot, deploy, resize, aws-control) tag-resolves the live box, so a stale secret can no longer misdirect anything."
   fi
 else
   # Tag lookup found nothing. Fall back to the secret rather than giving up —
@@ -72,6 +74,7 @@ else
     echo "::error::no instance carries tag Name=tv-${ENVIRONMENT}-app in $REGION and EC2_INSTANCE_ID is unset — nothing to check."
     exit 1
   fi
+  SECRET_DRIFT_SEVERITY="issue"
   SECRET_DRIFT_MSG="no instance carries tag Name=tv-${ENVIRONMENT}-app in ${REGION} — falling back to the \
 EC2_INSTANCE_ID secret (${INSTANCE_ID}). Either the box was terminated without being recreated, or its \
 Name tag is wrong. Every tag-discovery lane (deploy, resize) is blind until this is corrected."
@@ -85,12 +88,30 @@ note_ok()     { OK+=("$1");     echo "OK    : $1"; }
 note_heal()   { HEALED+=("$1"); echo "HEAL  : $1"; }
 note_issue()  { ISSUES+=("$1"); echo "ISSUE : $1"; }
 
-# Report instance-identity drift now that note_issue exists. Deliberately an
-# ISSUE and not a fatal: the run itself already healed around it.
+# Report instance-identity drift now that the note_* helpers exist.
+#
+# 2026-08-20 — SEVERITY SPLIT. This used to be an unconditional `note_issue`,
+# which fails the run AND pages Telegram. After the 2026-08-12 instance
+# recreate left `EC2_INSTANCE_ID` naming the old box, that meant a page and a
+# red run EVERY 15 MINUTES of every trading day — 30 of 30 recent runs failed
+# on this one cosmetic line. Alert fatigue on a self-healed condition is the
+# audit Rule 10 "edge-triggered only" violation, and it buried the REAL
+# 2026-08-20 outage (app down all morning) in identical-looking noise.
+#
+# The two drift cases are NOT the same severity:
+#   cosmetic — tag resolved fine, the secret merely disagrees. Every lane
+#              tag-resolves the live box now, so nothing can be misdirected.
+#              Informational: no page, no red run.
+#   issue    — the Name tag resolved NOTHING and we fell back to the secret.
+#              Tag discovery is blind, so deploy/resize really are at risk.
+#              Still a hard issue: page and fail.
 if [ -n "$SECRET_DRIFT_MSG" ]; then
-  note_issue "$SECRET_DRIFT_MSG"
+  if [ "$SECRET_DRIFT_SEVERITY" = "issue" ]; then
+    note_issue "$SECRET_DRIFT_MSG"
+  else
+    note_ok "$SECRET_DRIFT_MSG"
+  fi
 fi
-
 # --- helper: run a shell command ON the box via SSM, capture stdout ----------
 ssm_run() {
   local cmd="$1" cid out status
@@ -254,12 +275,12 @@ elif [ "$STATE" = "None" ] || [ -z "$STATE" ]; then
     INSTANCE_ID="$LIVE_ID"
     STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
       --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo None)
-    note_heal "adopted the live instance id ${LIVE_ID} for this run — every check below \
+    note_ok "adopted the live instance id ${LIVE_ID} by tag — this is now the NORMAL resolution path, not a heal; every check below \
 ran against the real box, not the dead id in the secret"
-    note_issue "EC2_INSTANCE_ID secret is STALE — it names an instance that no longer exists. \
-The live tv-${ENVIRONMENT}-app instance is ${LIVE_ID}. Rotate the GitHub secret EC2_INSTANCE_ID \
-to ${LIVE_ID} (Settings > Secrets and variables > Actions). Until then deploy-aws.yml cannot \
-reach the box and prod keeps running its launch-time binary."
+    note_ok "EC2_INSTANCE_ID secret names an instance that no longer exists. \
+The live tv-${ENVIRONMENT}-app instance is ${LIVE_ID}, adopted for this run. Rotating the secret \
+to ${LIVE_ID} (Settings > Secrets and variables > Actions) is OPTIONAL: as of 2026-08-20 deploy-aws, \
+resize, aws-control and autopilot all tag-resolve the live box, so a stale secret misdirects nothing."
     # Fall through to the running-box checks below with the healed id. If the
     # live box is stopped, `STATE` now says so honestly instead of "None".
   else
