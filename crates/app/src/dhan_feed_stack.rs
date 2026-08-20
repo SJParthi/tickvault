@@ -716,11 +716,20 @@ pub struct LiveIngest {
     /// Optional sink for the 5 depth levels that ride INLINE in every
     /// Full-mode tick packet (2026-08-19).
     ///
-    /// `None` unless `[dhan_feed] persist_full_mode_depth` is enabled, and
-    /// default-OFF deliberately — see that setting's documentation for the
-    /// volume arithmetic. Wiring it ON without deciding what happens to the
-    /// dedicated depth-20 pool ADDS storage rather than saving any; the saving
-    /// comes from the SWAP, which is an operator decision.
+    /// `None` unless a caller opts in via [`LiveIngest::with_inline_depth`].
+    ///
+    /// CORRECTED 2026-08-20: this said "`None` unless `[dhan_feed]
+    /// persist_full_mode_depth` is enabled, and default-OFF deliberately".
+    /// **No such config key exists** — not in `config.rs`, not in
+    /// `base.toml` — and the production boot site wires this ON
+    /// UNCONDITIONALLY, by a dated operator decision recorded at that site
+    /// (2026-08-19, all three depth sources kept rather than swapped). So the
+    /// comment named a setting a reader could not find and asserted the
+    /// opposite of what the lane does; anyone auditing "is inline depth on?"
+    /// from this line would have answered no while it wrote ~44 GB/day at
+    /// target. The `Option` is real and the default here is still `None` —
+    /// that part was always true, and it is what keeps every test and every
+    /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
     detector: TickGapDetector,
     aggregator: MultiTfAggregator,
@@ -2795,12 +2804,17 @@ pub fn drain_main_feed_frame(
                 // book it discarded, while separately storing 20 levels for a
                 // 250-instrument subset at ~506M rows/day.
                 //
-                // Gated, because turning it on is not free: at the 25,000
-                // target it is ~611M rows/day of its own. It is only a WIN
-                // alongside standing the dedicated depth-20 pool down, which
-                // trades 20 levels on 250 instruments for 5 levels on all
-                // 25,000 — less storage AND 100x the coverage. That swap is
-                // the operator's call, so this ships able but off.
+                // Not free: at the 25,000 target it is ~611M rows/day of its
+                // own. The cheaper shape would have been a SWAP — standing the
+                // dedicated depth-20 pool down and trading 20 levels on 250
+                // instruments for 5 levels on all 25,000, which is less
+                // storage AND 100x the coverage. The operator was offered that
+                // swap on 2026-08-19 and chose to keep all THREE sources, so
+                // this runs alongside them rather than instead of them.
+                //
+                // CORRECTED 2026-08-20: this closed with "so this ships able
+                // but off", which stopped being true the same day it was
+                // written — the boot site wires the sink unconditionally.
                 //
                 // The ingest-shed gate is consulted FIRST and cheaply: one
                 // relaxed atomic load, before the sink is even taken. Inline
@@ -2812,9 +2826,20 @@ pub fn drain_main_feed_frame(
                     (ingest.inline_depth.as_mut(), &parsed)
                 {
                     if INGEST_SHED.allows_inline_depth() {
-                        out.inline_depth_rows = out.inline_depth_rows.saturating_add(
-                            append_inline_depth(sink, t, levels, received_at_nanos),
-                        );
+                        // `frame.seq` and `packets` are BOTH load-bearing — see
+                        // the `capture_seq` derivation inside. The frame stamp
+                        // alone repeats across every packet in the frame, and
+                        // the level ordinal alone repeats across every frame.
+                        out.inline_depth_rows =
+                            out.inline_depth_rows.saturating_add(append_inline_depth(
+                                sink,
+                                t,
+                                levels,
+                                received_at_nanos,
+                                frame.seq,
+                                packets,
+                                c,
+                            ));
                     } else {
                         c.shed_inline_depth.increment(1);
                     }
@@ -2894,7 +2919,10 @@ pub struct FrameOutcome {
     /// Packets refused by the parser or by an unknown response code.
     pub unparseable: u64,
     /// Depth rows appended from the 5 levels carried INLINE in Full-mode tick
-    /// packets. Zero unless `[dhan_feed] persist_full_mode_depth` is on.
+    /// packets. Zero unless the ingest was built with
+    /// [`LiveIngest::with_inline_depth`] — which the production boot site does
+    /// unconditionally. (CORRECTED 2026-08-20: said "unless `[dhan_feed]
+    /// persist_full_mode_depth` is on", a key that exists nowhere.)
     pub inline_depth_rows: u64,
 }
 
@@ -3021,11 +3049,36 @@ impl DepthIngest {
 /// table and 3 in another for the same instant, and the difference would look
 /// like data loss rather than a convention mismatch. Negative and implausible
 /// prices ARE refused, exactly as they are there.
+///
+/// # `capture_seq` is PER-PACKET, exactly as the dedicated drain derives it
+///
+/// A Dhan frame STACKS packets, `received_at_nanos` is computed ONCE for the
+/// whole frame, and `capture_seq` is a DEDUP key column. Until 2026-08-20 this
+/// stamped `level_no * 2 (+1)` — a value that depends only on the level and the
+/// side, so two Full packets for the SAME instrument in ONE frame produced ten
+/// rows whose EVERY key column matched ten earlier rows, and QuestDB upserted
+/// one book silently over the other. `rows` counts successful ILP APPENDS, not
+/// DB acceptance, so the loss did not even show as a shortfall in our own
+/// counter — invisible loss in the one table whose entire premise is that
+/// nothing is lost. That is the identical defect the dedicated depth drain
+/// fixed on 2026-08-15; this path was written four days later and repeated it.
+///
+/// The per-packet value is used for all ten rows because `side` and `level` are
+/// THEMSELVES key columns — they already separate the rows within one packet.
+/// What was missing was the packet's identity, not the level's.
+///
+/// An index that does not fit the bits `packet_capture_seq` reserves REFUSES
+/// the packet's depth and counts it. Never a fallback value: pinning every
+/// over-range packet onto one key would collapse them together, which is the
+/// same silent merge this exists to remove, reintroduced at the other end.
 fn append_inline_depth(
     sink: &mut DepthIngest,
     tick: &tickvault_common::tick_types::ParsedTick,
     levels: &[tickvault_common::tick_types::MarketDepthLevel; 5],
     received_at_nanos: i64,
+    frame_seq: u64,
+    packet_index: u32,
+    c: &DrainCounters,
 ) -> u64 {
     // Same posture as the dedicated depth drain: an unrecognised segment is
     // REFUSED, never written under a placeholder. A row labelled "UNKNOWN"
@@ -3038,12 +3091,26 @@ fn append_inline_depth(
     let Ok(security_id) = i64::try_from(tick.security_id) else {
         return 0;
     };
+    let Some(capture_seq) =
+        tickvault_storage::ws_frame_spill::packet_capture_seq(frame_seq, u64::from(packet_index))
+            .and_then(capture_seq_from_frame_seq)
+    else {
+        c.depth_refused.increment(1);
+        return 0;
+    };
+    // IST, not UTC — `received_at_nanos` is deliberately TRUE UTC because
+    // `ws_lag_ms` differences the vendor's IST stamp against it, so the offset
+    // is added at each PERSISTING site instead. The dedicated depth drain does
+    // exactly this; this path shipped without it on 2026-08-19, which put `d5`
+    // rows 5h30m behind `d20`/`d200` rows in the SAME table (any join or
+    // eyeball comparison silently misaligns) and, because `ts` is the
+    // DESIGNATED timestamp, partitioned every row stamped between 18:30 and
+    // 23:59 IST into the PREVIOUS day — the day archival and retention key on.
+    let ts_nanos =
+        received_at_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
     let mut rows = 0_u64;
     for (idx, level) in levels.iter().enumerate() {
         let level_no = i64::try_from(idx).unwrap_or(i64::MAX).saturating_add(1);
-        // capture_seq disambiguates rows sharing a timestamp. The two sides of
-        // one level are distinct observations, so they get distinct values.
-        let base_seq = level_no.saturating_mul(2);
         let plausible = |p: f32| -> bool {
             let p = f64::from(p);
             p.is_finite() && p >= 0.0 && p <= f64::from(MAX_PLAUSIBLE_LTP)
@@ -3058,8 +3125,8 @@ fn append_inline_depth(
                 price: f64::from(level.bid_price),
                 quantity: i64::from(level.bid_quantity),
                 orders: i64::from(level.bid_orders),
-                capture_seq: base_seq,
-                ts_nanos: received_at_nanos,
+                capture_seq,
+                ts_nanos,
             };
             if sink.writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
@@ -3075,8 +3142,8 @@ fn append_inline_depth(
                 price: f64::from(level.ask_price),
                 quantity: i64::from(level.ask_quantity),
                 orders: i64::from(level.ask_orders),
-                capture_seq: base_seq.saturating_add(1),
-                ts_nanos: received_at_nanos,
+                capture_seq,
+                ts_nanos,
             };
             if sink.writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
@@ -8832,9 +8899,16 @@ mod inline_depth_tests {
 
     #[test]
     fn append_inline_depth_writes_both_sides_of_every_level() {
-        // 5 levels x 2 sides = 10 rows, and each side of a level gets its own
-        // capture_seq — they are distinct observations sharing a timestamp, so
-        // a shared seq would let the DEDUP key collapse them.
+        // 5 levels x 2 sides = 10 rows.
+        //
+        // CORRECTED 2026-08-20: this comment used to justify a PER-SIDE
+        // capture_seq ("each side of a level gets its own ... a shared seq
+        // would let the DEDUP key collapse them"). That reasoning was wrong in
+        // both directions. `side` and `level` are THEMSELVES DEDUP key columns,
+        // so the ten rows of one packet were never at risk of collapsing; and
+        // encoding the level/side ordinal there consumed the one column that
+        // could carry the PACKET's identity, which is what actually collides.
+        // See `append_inline_depth`'s own docs.
         let mut sink = DepthIngest::for_test();
         let tick = tickvault_common::tick_types::ParsedTick {
             security_id: 13,
@@ -8849,7 +8923,15 @@ mod inline_depth_tests {
             bid_price: 100.5,
             ask_price: 100.75,
         }; 5];
-        let rows = append_inline_depth(&mut sink, &tick, &levels, 1_700_000_000_000_000_000);
+        let rows = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            1_700_000_000_000_000_000,
+            0,
+            0,
+            counters(),
+        );
         assert_eq!(rows, 10, "5 levels x 2 sides");
     }
 
@@ -8868,7 +8950,7 @@ mod inline_depth_tests {
         };
         let zero = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &zero, 1),
+            append_inline_depth(&mut sink, &tick, &zero, 1, 0, 0, counters()),
             10,
             "zero-priced levels are the absent sentinel and MUST be written"
         );
@@ -8876,9 +8958,99 @@ mod inline_depth_tests {
         let mut neg = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
         neg[0].bid_price = -1.0;
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &neg, 1),
+            append_inline_depth(&mut sink, &tick, &neg, 1, 0, 0, counters()),
             9,
             "a negative price is impossible and must be refused"
+        );
+    }
+
+    #[test]
+    fn two_packets_for_one_instrument_in_one_frame_get_distinct_capture_seqs() {
+        // THE REGRESSION. A Dhan frame STACKS packets and `received_at_nanos`
+        // is computed once for the whole frame, so when the same instrument
+        // ticks twice in one frame every DEDUP key column is fixed except
+        // `capture_seq`. Until 2026-08-20 that column held `level_no * 2 (+1)`
+        // — a function of the level and side ALONE — so the second packet's
+        // ten rows carried keys identical to the first packet's and QuestDB
+        // upserted one book silently over the other.
+        //
+        // It could not be caught by a row count: `append_row` succeeds for
+        // both packets, so `rows` reads 20 while the table ends up holding 10.
+        // The only way to see it is to read the emitted line protocol, which
+        // is exactly why `buffer_utf8` was made cross-crate `pub`.
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            ..Default::default()
+        }; 5];
+
+        // Same frame (seq 4096, base-aligned), packets 0 and 1.
+        let frame_seq = 4096_u64;
+        let a = append_inline_depth(&mut sink, &tick, &levels, 1, frame_seq, 0, counters());
+        let b = append_inline_depth(&mut sink, &tick, &levels, 1, frame_seq, 1, counters());
+        assert_eq!(a + b, 20, "both packets appended their ten rows");
+
+        let ilp = sink.writer.buffer_utf8();
+        let mut seqs: Vec<&str> = ilp
+            .lines()
+            .filter_map(|l| l.split("capture_seq=").nth(1))
+            .map(|rest| rest.split([',', ' ']).next().unwrap_or(""))
+            .collect();
+        assert_eq!(seqs.len(), 20, "every row carries a capture_seq");
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(
+            seqs.len(),
+            2,
+            "the two PACKETS must differ; the ten rows within a packet share a \
+             seq deliberately because `side` and `level` are key columns. Got \
+             {seqs:?} — one distinct value means the packet index is not folded \
+             in and one book silently overwrites the other"
+        );
+    }
+
+    #[test]
+    fn inline_depth_rows_are_stamped_ist_like_every_sibling_depth_row() {
+        // `d5`, `d20` and `d200` land in the SAME table. The dedicated drain
+        // adds the IST offset at its stamping site; this path shipped on
+        // 2026-08-19 without it, so `d5` rows sat 5h30m behind their siblings
+        // — any join or eyeball comparison misaligned silently — and, because
+        // `ts` is the DESIGNATED timestamp, every row stamped between 18:30 and
+        // 23:59 IST partitioned into the PREVIOUS day, which is the day
+        // retention and S3 archival key on.
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            ..Default::default()
+        }; 5];
+        let utc = 1_700_000_000_000_000_000_i64;
+        assert_eq!(
+            append_inline_depth(&mut sink, &tick, &levels, utc, 0, 0, counters()),
+            10
+        );
+        let expected = utc + tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        let ilp = sink.writer.buffer_utf8();
+        let stamped: Vec<&str> = ilp
+            .lines()
+            .filter_map(|l| l.rsplit(' ').next())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            stamped.iter().all(|s| *s == expected.to_string()),
+            "every d5 row must carry the IST-shifted stamp {expected}, not raw \
+             UTC {utc}. Got {stamped:?}"
         );
     }
 
@@ -8899,7 +9071,7 @@ mod inline_depth_tests {
             ..Default::default()
         }; 5];
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &levels, 1),
+            append_inline_depth(&mut sink, &tick, &levels, 1, 0, 0, counters()),
             0,
             "an unknown segment must produce NO rows"
         );
@@ -8927,7 +9099,7 @@ mod inline_depth_tests {
             ..Default::default()
         }; 5];
         let sink = ingest.inline_depth.as_mut().expect("enabled above");
-        let rows = append_inline_depth(sink, &tick, &levels, 1);
+        let rows = append_inline_depth(sink, &tick, &levels, 1, 0, 0, counters());
         assert_eq!(rows, 10, "depth rows were appended");
 
         // No ticks were folded, so pending_rows is 0 and the early return
