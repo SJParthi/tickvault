@@ -1488,6 +1488,21 @@ async fn async_main() -> Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             tickvault_app::boot_helpers::WATCHDOG_INTERVAL_SECS,
         ));
+        // DELAY, not the default BURST — 2026-08-20.
+        //
+        // Under Burst a stalled runtime pays back every missed tick the
+        // instant it recovers: the pinger fires N times back to back and the
+        // watchdog is satisfied as though nothing happened. That makes a
+        // runtime stall shorter than `WatchdogSec` invisible to the ONE
+        // mechanism whose entire job is to notice it — the beacon reports
+        // health it did not have, which is the false-OK class this repo's own
+        // rules forbid.
+        //
+        // Delay re-bases the schedule from the late tick, so a stall shows up
+        // as a genuine gap between pings. 24 of the other 28 intervals in this
+        // binary already set this explicitly; the liveness beacon was the one
+        // that most needed it and did not.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await; // skip the immediate first tick
         loop {
             interval.tick().await;
