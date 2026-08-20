@@ -227,6 +227,28 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     hysteresis does NOT swap inside the dwell window; a swap emits its audit row; a `0`
     contract id is refused and counted
 
+- [ ] **Item 6 — 09:15 first-bucket open/high/low (operator 2026-08-19: "Yes go ahead only for this 9.15 am open high low alone dude okay?")**
+  - Fix the live defect where the day's first candle can publish `open` OUTSIDE its own
+    `[low, high]` (gap-open mornings): clamp the range to contain the exchange official
+    open at BOTH `day_open` stamp sites.
+  - Adopt `tick.day_high` / `tick.day_low` as the exchange-true extremes for the day's
+    FIRST bucket ONLY — monotone widening, `is_finite() && > 0.0` gated.
+  - Scope guard: buckets after the first are UNTOUCHED (a running session extreme does not
+    describe a later bucket). The D1 whole-day change is explicitly NOT in scope.
+  - Files: `crates/trading/src/candles/aggregator_cell.rs`
+  - Tests: `first_bucket_open_below_ltp_still_yields_valid_ohlc`,
+    `first_bucket_open_above_ltp_still_yields_valid_ohlc`,
+    `late_day_open_into_folded_bucket_keeps_ohlc_valid`,
+    `first_bucket_adopts_exchange_day_high_and_day_low`,
+    `zero_day_high_low_sentinel_is_never_adopted`,
+    `non_finite_day_high_low_is_never_adopted`,
+    `second_bucket_ignores_running_day_extremes`,
+    `widening_never_narrows_an_observed_range`,
+    `ohlc_invariant_holds_across_a_folded_session`,
+    `day_boundary_rearms_the_first_bucket_treatment`
+  - Full design: ITEM 6 addendum below (C1–C8)
+
+
 ---
 
 ## Design
@@ -458,3 +480,153 @@ cross-verification, and is not attempted here; (c) any measurement at 25,000 ins
 real filling volume; (d) "never miss a tick" in the trade-completeness sense — the
 vendor protocol has no sequence number, no replay and no snapshot-on-subscribe, so the
 guarantee remains capture-completeness of RECEIVED frames.
+
+---
+
+## ITEM 6 — DESIGN ADDENDUM (added 2026-08-19, operator: "Yes go ahead only for this 9.15 am open high low alone dude okay?")
+
+Given in direct response to a finding that the day's FIRST candle can be published with
+its `open` OUTSIDE its own `[low, high]` range. Scope is exactly what the quote says:
+the day's first bucket's open / high / low. The D1 whole-day change discussed in the
+same exchange is explicitly NOT taken.
+
+### C1. The defect (Verified in source, 2026-08-19)
+
+`open_bucket` stamps the exchange official open but seeds the range from the LTP:
+
+| Site | Line | What it does | Invariant safe? |
+|---|---|---|---|
+| Bucket open, armed | `aggregator_cell.rs:458` | `open = day_open`, `high = low = ltp` | ❌ **NO** |
+| Late `day_open` into an open bucket | `aggregator_cell.rs:483` | `slots[ord].open = day_open` on an already-folded bucket | ❌ **NO — worse: high/low may be far away by then** |
+| Intraday roll | `aggregator_cell.rs:502` | `use_day_open = false` → `open = high = low = ltp` | ✅ yes |
+
+Concrete failure, gap-up morning: pre-open equilibrium `day_open = 100`, first traded
+`ltp = 105` ⇒ published candle is `open=100, high=105, low=105` — **the open is below
+the low**. A workspace scan for any `open <= high` / `open >= low` style invariant
+returns ZERO matches: nothing anywhere catches it.
+
+Consumers this corrupts: ATR/true-range legs, any typical-price indicator, every
+charting renderer (body outside its own wick), and the worst-case-fill backtest rule
+(fills at a range that never contained the open).
+
+### C2. Design
+
+Two changes, both **monotone widening only** — they can enlarge `[low, high]`, never
+shrink it. That property is the whole safety argument: no input, however corrupt, can
+narrow a range or discard an observed extreme.
+
+**(a) Open clamp — unconditional, at both `day_open` stamp sites.**
+After `open` is set from `day_open`, widen the range to contain it:
+`high = max(high, open)`, `low = min(low, open)`. Justified because the pre-open
+equilibrium is a REAL matched trade, so it genuinely belongs inside the bar's range.
+Needs no new state — it applies exactly where `day_open` is stamped, which the existing
+arm already restricts to the day's first bucket.
+
+**(b) Exchange extremes on the day's FIRST bucket only.**
+Widen with `tick.day_high` / `tick.day_low`: `high = max(high, day_high)`,
+`low = min(low, day_low)`. Correct ONLY for the first bucket, because `day_high` is a
+running SESSION extreme — for any later bucket it describes the whole day, not that
+bucket. That is precisely the operator's scope.
+
+**First-bucket signal — derived, zero new state:** `last_sealed[ord].is_uninitialised()`.
+Nothing has sealed for that timeframe yet today. `force_seal` (day boundary) clears
+`last_sealed` and re-arms, so it resets correctly across days. Chosen over a new
+`[bool; TF_COUNT]` array because it costs 0 bytes and cannot drift out of sync with the
+seal path it is derived from.
+
+**Cost — deliberately kept off the 99.7% path:** `day_high`/`day_low` are read from
+`&ParsedTick` (already in hand at both sites) and widened inline ONLY when the
+first-bucket test passes. `TickPrices` is deliberately NOT extended: adding two f64
+fields there would pay ~100 ns of `f32_to_f64_clean` on EVERY tick of the session to
+serve one bucket per day. As designed the conversion runs during the first bucket only —
+roughly one minute out of 375 — and costs literally zero for the rest of the session.
+
+**Validity gate:** `v.is_finite() && v > 0.0`. `> 0.0` alone is insufficient —
+it rejects NaN (`NaN > 0.0` is false) but ACCEPTS `+∞`, which would set `high` to
+infinity permanently. `is_finite()` closes both.
+
+### C3. Edge Cases
+
+| # | Case | Behaviour |
+|---|---|---|
+| 1 | Ticker mode — `day_high/day_low = 0.0` (ABSENT sentinel) | Gate rejects; range untouched. **Never treated as a price of zero** |
+| 2 | `day_high = NaN` | `is_finite()` rejects |
+| 3 | `day_high = +∞` | `is_finite()` rejects — the case `> 0.0` alone would have let through |
+| 4 | `day_low = 0.0` on a real instrument | Rejected — cannot drag a low to zero |
+| 5 | `day_high < ltp` (stale/lagging field) | `max` keeps the ltp — widening only |
+| 6 | `day_low > ltp` | `min` keeps the ltp — widening only |
+| 7 | `day_high < day_low` (corrupt pair) | Each applied independently by max/min; range can only widen. No inversion possible |
+| 8 | `day_open` inside `[low, high]` already | Clamp is a no-op |
+| 9 | Pre-open auction included in `day_high` | First bar spans pre-open — CONSISTENT, because its `open` is the pre-open price too |
+| 10 | Pre-open NOT included | First bar spans 09:15 only — also consistent |
+| 11 | First tick arrives 09:47 (illiquid) | Keys on first bucket OPENED, not on clock 09:15 — correct by construction |
+| 12 | `catch_up_seal` drains the first bucket, then a late tick arrives | `last_sealed` now set ⇒ widening skipped. Safe: the widening already ran while the bucket was live |
+| 13 | Day 2 of the process | `force_seal` clears `last_sealed` + re-arms ⇒ signal resets |
+| 14 | Instrument never ticks | Slot uninitialised, emits nothing — sparsity preserved |
+| 15 | Intraday bucket (09:16 onward) | `last_sealed` initialised ⇒ untouched. **The scope guarantee** |
+
+### C4. Failure Modes
+
+| Mode | Blast radius | Containment |
+|---|---|---|
+| Corrupt `day_high` widens a bar too far | One instrument, one bucket, one day | Widening-only: an observed trade is never discarded; the bar stays a superset of truth |
+| Sentinel `0.0` adopted as a low | Would be catastrophic | Structurally impossible — `> 0.0` gate, ratcheted by a dedicated test |
+| `+∞` adopted as a high | Would poison the bar | `is_finite()` gate, ratcheted |
+| Derived first-bucket signal drifts | Widening applied to a later bucket | Signal is READ-ONLY off `last_sealed`, which only the seal path writes; a test pins that bucket 2 is untouched |
+| Hot-path regression | All instruments | Conversion is first-bucket-only; DHAT + Criterion budgets unchanged |
+
+### C5. Test Plan
+
+| # | Test | Pins |
+|---|---|---|
+| 1 | `first_bucket_open_below_ltp_still_yields_valid_ohlc` | The gap-up bug: `open=100, ltp=105` ⇒ `low <= open <= high` |
+| 2 | `first_bucket_open_above_ltp_still_yields_valid_ohlc` | Gap-down mirror |
+| 3 | `late_day_open_into_folded_bucket_keeps_ohlc_valid` | Site 2 (`:483`) — the worse one |
+| 4 | `first_bucket_adopts_exchange_day_high_and_day_low` | Operator idea #2 works |
+| 5 | `zero_day_high_low_sentinel_is_never_adopted` | Ticker-mode `0.0` |
+| 6 | `non_finite_day_high_low_is_never_adopted` | NaN **and** `+∞` |
+| 7 | `second_bucket_ignores_running_day_extremes` | **The scope guarantee** — 09:16 untouched |
+| 8 | `widening_never_narrows_an_observed_range` | Monotonicity: `day_high < ltp` cannot shrink |
+| 9 | `ohlc_invariant_holds_across_a_folded_session` | Property-style sweep over a synthetic session |
+| 10 | `day_boundary_rearms_the_first_bucket_treatment` | Cross-day reset |
+
+### C6. Rollback
+
+Pure revert — the change is confined to `aggregator_cell.rs`, adds no field, no config
+key, no table, no migration, and no wire format. Reverting restores byte-identical
+prior behaviour. No data written under the new code needs repair: every bar it produces
+is a superset-range version of what the old code produced, and the DEDUP key is
+unchanged so a re-fold UPSERTs in place.
+
+### C7. Observability
+
+Two counters, both first-bucket-only so cardinality and volume are trivially bounded:
+
+| Metric | Meaning |
+|---|---|
+| `tv_candle_open_clamped_total` | Times the official open fell outside the LTP-seeded range — i.e. **how often the live bug would have fired** |
+| `tv_candle_day_extreme_adopted_total{side="high"\|"low"}` | Times an exchange extreme genuinely widened the first bar |
+
+Deliberately NO new `ErrorCode` and NO alarm: neither event is a fault. A clamp is the
+NORMAL gap-open case, and paging on a normal morning is the alert-fatigue class this
+repo has retired before. The counters exist to MEASURE, and the first live session's
+value for the first counter is the honest evidence of how real the defect was.
+
+### C8. Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the OHLC invariant
+`low <= open <= high` holds for every bar the aggregator emits, proven by unit tests at
+both `day_open` stamp sites plus a folded-session sweep; the exchange extremes are
+adopted for the day's FIRST bucket only, pinned by a test asserting bucket 2 is
+untouched; and every adoption is monotone-widening, so no input can narrow a range or
+discard an observed trade.
+
+NOT claimed: (a) that the first bucket's high/low is EXACT — it is exact only if Dhan's
+`day_high`/`day_low` are populated and fresh on the tick that closes the bucket, which
+is **UNVERIFIED-LIVE** (no Dhan tick confirmed received since the 2026-07-13
+retirement; the 15:31 cross-verify reporting non-zero `compared` remains the only
+proof); (b) that any bucket AFTER the first gains accuracy — none does, by design;
+(c) that intra-second trades Dhan conflated upstream are recovered — they are lost at
+source and no field can return them; (d) whether Dhan's `day_high` includes the
+09:00–09:15 pre-open auction — Dhan does not document it, `docs/dhan-ref/` was searched,
+and both answers are handled correctly by construction (C3 rows 9–10).
