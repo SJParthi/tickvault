@@ -57,6 +57,14 @@ on:
         description: 'New size in GB. Must be >= the current size (gp3 cannot shrink) and <= 200 (the variables.tf ebs_gp3_size_gb ceiling).'
         required: true
         default: '200'
+      target_iops:
+        description: 'Provisioned IOPS, 3000-16000 (the variables.tf ebs_gp3_iops range). Default 6000 = operator Quote 17, 2026-08-19. Unlike size this CAN go down.'
+        required: true
+        default: '6000'
+      target_throughput:
+        description: 'Throughput in MiB/s, 125-1000 (the variables.tf ebs_gp3_throughput range). Default 500 = operator Quote 17, 2026-08-19. Unlike size this CAN go down.'
+        required: true
+        default: '500'
 
 concurrency:
   group: grow-ebs-volume-prod
@@ -115,18 +123,44 @@ jobs:
             exit 1
           fi
 
-      - name: Verify the target and refuse anything that is not a grow
+      - name: Verify every target and decide what actually changes
         id: guard
         env:
           VOL_ID: ${{ inputs.confirm_volume_id }}
           TARGET: ${{ inputs.target_size_gb }}
+          WANT_IOPS: ${{ inputs.target_iops }}
+          WANT_TP: ${{ inputs.target_throughput }}
         run: |
           set -euo pipefail
-          case "$TARGET" in ''|*[!0-9]*)
-            echo "::error::target_size_gb must be a positive integer."; exit 1;;
-          esac
+          # ---------------------------------------------------------------
+          # Three dimensions, and they do NOT share a rule.
+          #
+          #   size       — grows ONLY. gp3 refuses a smaller value and a
+          #                larger snapshot cannot restore into a smaller
+          #                volume, so a shrink is unrecoverable, not merely
+          #                wrong.
+          #   iops       — moves in BOTH directions, freely.
+          #   throughput — moves in BOTH directions, freely.
+          #
+          # Until 2026-08-20 this step knew only about size, and returned
+          # early the moment size matched. That is how the operator's Quote 17
+          # performance raise (IOPS 3000 -> 6000, throughput 125 -> 500,
+          # authorized and PAID FOR on 2026-08-19) never reached the live
+          # volume: the size half had already landed at 200 GB, so every
+          # dispatch reported "nothing to do" and stopped looking. The volume
+          # sat at the right SIZE and the wrong SPEED for a day, and the
+          # throughput half is the one the operator's own authorization calls
+          # load-bearing.
+          # ---------------------------------------------------------------
+          for v in TARGET WANT_IOPS WANT_TP; do
+            eval "val=\$$v"
+            case "$val" in ''|*[!0-9]*)
+              echo "::error::$v must be a positive integer (got '$val')."; exit 1;;
+            esac
+          done
+
           # The instance this volume must belong to. Typing the id of some
-          # OTHER account volume should not silently grow it.
+          # OTHER account volume should not silently modify it.
           EXPECTED=$(aws ec2 describe-instances \
             --filters Name=tag:Name,Values=tv-prod-app \
             --query 'Reservations[].Instances[].BlockDeviceMappings[0].Ebs.VolumeId' \
@@ -135,35 +169,84 @@ jobs:
             echo "::error::$VOL_ID is not the tv-prod-app root volume (that is $EXPECTED)."
             exit 1
           fi
-          CUR=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
-                 --query 'Volumes[0].Size' --output text)
-          echo "current=${CUR} GB target=${TARGET} GB"
+
+          read -r CUR CUR_IOPS CUR_TP <<EOF
+          $(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
+              --query 'Volumes[0].[Size,Iops,Throughput]' --output text)
+          EOF
+          echo "current: size=${CUR} GB iops=${CUR_IOPS} throughput=${CUR_TP} MiB/s"
+          echo "target : size=${TARGET} GB iops=${WANT_IOPS} throughput=${WANT_TP} MiB/s"
+
+          # --- size: grow-only, ceiling-bounded ---
           if [ "$TARGET" -lt "$CUR" ]; then
             echo "::error::gp3 can NEVER shrink. ${TARGET} < ${CUR} — refusing."
             exit 1
-          fi
-          if [ "$TARGET" -eq "$CUR" ]; then
-            echo "::notice::Already ${CUR} GB — nothing to do."
-            echo "noop=true" >> "$GITHUB_OUTPUT"
-            exit 0
           fi
           if [ "$TARGET" -gt 200 ]; then
             echo "::error::${TARGET} exceeds the variables.tf ebs_gp3_size_gb ceiling of 200."
             echo "Raising it needs a validation edit AND its own dated operator quote."
             exit 1
           fi
-          echo "noop=false" >> "$GITHUB_OUTPUT"
-          echo "current=${CUR}" >> "$GITHUB_OUTPUT"
 
-      - name: Grow the volume
+          # --- iops / throughput: range-bounded, either direction ---
+          if [ "$WANT_IOPS" -lt 3000 ] || [ "$WANT_IOPS" -gt 16000 ]; then
+            echo "::error::target_iops must be 3000-16000 (the variables.tf ebs_gp3_iops range)."
+            exit 1
+          fi
+          if [ "$WANT_TP" -lt 125 ] || [ "$WANT_TP" -gt 1000 ]; then
+            echo "::error::target_throughput must be 125-1000 (the variables.tf ebs_gp3_throughput range)."
+            exit 1
+          fi
+
+          # --- what actually changes ---
+          # `if` blocks, never `[ test ] && VAR=true`. Under `set -e` an
+          # AND-list whose left side is FALSE returns non-zero and kills the
+          # step — and here "false" is the ordinary case (a dimension that
+          # already matches). The terse form would have failed the run
+          # precisely when there was nothing wrong.
+          SIZE_CHANGE=false
+          PERF_CHANGE=false
+          if [ "$TARGET" -ne "$CUR" ]; then SIZE_CHANGE=true; fi
+          if [ "$WANT_IOPS" -ne "$CUR_IOPS" ]; then PERF_CHANGE=true; fi
+          if [ "$WANT_TP" -ne "$CUR_TP" ]; then PERF_CHANGE=true; fi
+
+          {
+            echo "size_change=${SIZE_CHANGE}"
+            echo "perf_change=${PERF_CHANGE}"
+            echo "current=${CUR}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$SIZE_CHANGE" = false ] && [ "$PERF_CHANGE" = false ]; then
+            echo "::notice::size, IOPS and throughput already match — nothing to do."
+            echo "noop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "noop=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply the modification (size + performance in ONE call)
         if: steps.guard.outputs.noop == 'false'
         env:
           VOL_ID: ${{ inputs.confirm_volume_id }}
           TARGET: ${{ inputs.target_size_gb }}
+          WANT_IOPS: ${{ inputs.target_iops }}
+          WANT_TP: ${{ inputs.target_throughput }}
         run: |
           set -euo pipefail
-          aws ec2 modify-volume --volume-id "$VOL_ID" --size "$TARGET" \
-            --query 'VolumeModification.[ModificationState,TargetSize]' --output text
+          # ONE call, never two, and that is a correctness requirement rather
+          # than tidiness: AWS enforces a cooldown (~6 hours) between
+          # modifications of the same volume. Two sequential calls would land
+          # the first and have the second refused, leaving the volume half
+          # changed — and the half that would lose is whichever ran second.
+          # Passing every dimension together makes a partial apply impossible.
+          #
+          # Unchanged dimensions are passed anyway. AWS treats a value equal
+          # to the current one as a no-op, and sending all three keeps the
+          # request a faithful statement of the intended end state instead of
+          # a diff that has to be reconstructed to be understood.
+          aws ec2 modify-volume --volume-id "$VOL_ID" \
+            --size "$TARGET" --iops "$WANT_IOPS" --throughput "$WANT_TP" \
+            --query 'VolumeModification.[ModificationState,TargetSize,TargetIops,TargetThroughput]' \
+            --output text
           # Poll until AWS reports the modification optimizing or complete.
           # "optimizing" already means the new size is USABLE — waiting for
           # "completed" can take hours and is not required.
@@ -177,16 +260,34 @@ jobs:
             esac
             sleep 10
           done
-          SIZE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
-                  --query 'Volumes[0].Size' --output text)
-          echo "volume is now ${SIZE} GB"
+          # Verify ALL THREE. Asserting only the size is how a performance
+          # change could report success while silently not landing — the same
+          # blind spot, one layer down, that lost the Quote 17 raise.
+          read -r SIZE IOPS TP <<EOF
+          $(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
+              --query 'Volumes[0].[Size,Iops,Throughput]' --output text)
+          EOF
+          echo "volume is now size=${SIZE} GB iops=${IOPS} throughput=${TP} MiB/s"
+          # Same `set -e` reasoning as the guard: `if`, not `&&`. Every
+          # assertion here PASSES on the happy path, so the terse form would
+          # have exited the step on a completely successful modification.
+          FAIL=0
           if [ "$SIZE" != "$TARGET" ]; then
-            echo "::error::expected ${TARGET} GB, AWS reports ${SIZE} GB"
-            exit 1
+            echo "::error::expected ${TARGET} GB, AWS reports ${SIZE} GB"; FAIL=1
           fi
+          if [ "$IOPS" != "$WANT_IOPS" ]; then
+            echo "::error::expected ${WANT_IOPS} IOPS, AWS reports ${IOPS}"; FAIL=1
+          fi
+          if [ "$TP" != "$WANT_TP" ]; then
+            echo "::error::expected ${WANT_TP} MiB/s, AWS reports ${TP}"; FAIL=1
+          fi
+          if [ "$FAIL" -ne 0 ]; then exit 1; fi
 
+      # Keyed on size_change, NOT on noop: a performance-only run changes no
+      # block count, so there is no filesystem to grow and running the resize
+      # would report a confusing no-change against a target it never moved.
       - name: Grow the filesystem (only possible while the box is running)
-        if: steps.guard.outputs.noop == 'false'
+        if: steps.guard.outputs.size_change == 'true'
         env:
           TARGET: ${{ inputs.target_size_gb }}
         run: |
