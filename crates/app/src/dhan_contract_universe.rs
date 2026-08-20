@@ -311,7 +311,23 @@ pub struct ContractSelection {
 pub fn derivative_segment(exch_id: &str) -> Option<ExchangeSegment> {
     match exch_id {
         "NSE" => Some(ExchangeSegment::NseFno),
-        "BSE" => Some(ExchangeSegment::BseFno),
+        // BSE is REFUSED, narrowed from the 2026-08-15 authorization by the
+        // operator's 2026-08-20 instruction: *"only for the nse alone"*, with
+        // the full-chain underlyings named as NIFTY and BANKNIFTY — both NSE.
+        //
+        // This is a narrowing, never a widening, so it cannot breach the scope
+        // lock's REJECT list in the direction that list guards. Two things
+        // follow from it that are worth having:
+        //
+        //  - SENSEX derivatives stop consuming main-feed slots, and those
+        //    slots are exactly what the ATM window was short of.
+        //  - Depth is NSE-only at the vendor anyway (`validate_depth_segment`),
+        //    so a BSE contract could only ever have been a main-feed row whose
+        //    depth counterpart was refused later — half a subscription.
+        //
+        // Refused rows are COUNTED as `refused_unknown_segment`, not dropped:
+        // a day where the master suddenly carries only BSE derivatives must
+        // read as a refusal, not as a market with no contracts.
         _ => None,
     }
 }
@@ -1603,9 +1619,10 @@ mod tests {
     }
 
     #[test]
-    fn derivative_segment_maps_sensex_to_bse_fno_and_nse_to_nse_fno() {
+    fn derivative_segment_maps_nse_only_and_refuses_every_other_exchange() {
         assert_eq!(derivative_segment("NSE"), Some(ExchangeSegment::NseFno));
-        assert_eq!(derivative_segment("BSE"), Some(ExchangeSegment::BseFno));
+        // BSE refused since 2026-08-20 (operator: "only for the nse alone").
+        assert_eq!(derivative_segment("BSE"), None);
         // Commodity and currency are outside the authorized scope, and a
         // wrong segment is a wrong-instrument subscription that looks healthy.
         assert_eq!(derivative_segment("MCX"), None);
@@ -1655,10 +1672,27 @@ mod tests {
         assert_eq!(sel.deduped, 1);
     }
 
+    /// A BSE row sharing an NSE row's id must be REFUSED and COUNTED — never
+    /// swallowed as a duplicate.
+    ///
+    /// Until 2026-08-20 this test read `the_same_id_in_two_segments_is_kept_as_
+    /// two_instruments` and asserted BOTH were selected, which was the correct
+    /// I-P1-11 pin while BSE was in scope. With BSE narrowed out by the
+    /// operator's "only for the nse alone", the two-segment case can no longer
+    /// arise inside this selector — every row it emits is `NseFno`.
+    ///
+    /// So the pin moves to the distinction that still matters and is easier to
+    /// get wrong: an out-of-scope row must land in `refused_unknown_segment`,
+    /// not in `deduped`. Those two counters send triage to opposite places —
+    /// "the master offered something we do not subscribe" versus "the master
+    /// listed the same contract twice" — and a refusal filed as a duplicate
+    /// would read as normal housekeeping.
+    ///
+    /// I-P1-11 itself is unchanged and still enforced: `push_contract` keys
+    /// `chosen` on `(security_id, segment)`, and the sibling test above proves
+    /// the same pair twice is deduped.
     #[test]
-    fn the_same_id_in_two_segments_is_kept_as_two_instruments() {
-        // The I-P1-11 case that matters: security_id alone is NOT unique, and
-        // deduping on it would silently drop one of two real instruments.
+    fn a_bse_row_sharing_an_nse_id_is_refused_and_counted_not_deduped() {
         let rows = vec![
             contract(
                 7,
@@ -1680,8 +1714,18 @@ mod tests {
             ),
         ];
         let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
-        assert_eq!(sel.instruments.len(), 2);
-        assert_eq!(sel.deduped, 0);
+        assert_eq!(sel.instruments.len(), 1, "only the NSE row survives");
+        assert_eq!(
+            sel.instruments[0].segment,
+            ExchangeSegment::NseFno,
+            "and it is the NSE one, not the BSE one"
+        );
+        assert_eq!(
+            sel.refused_unknown_segment, 1,
+            "the BSE row is refused BY SEGMENT — the counter that says \
+             'out of scope', not the one that says 'seen twice'"
+        );
+        assert_eq!(sel.deduped, 0, "it was never a duplicate");
     }
 
     #[test]

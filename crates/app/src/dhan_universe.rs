@@ -242,6 +242,63 @@ struct MappingEntry {
     exchange_segment: u8,
 }
 
+/// Every NSE index in the master, as mapping entries.
+///
+/// # Why the ISIN join structurally cannot produce these
+///
+/// The constituency join answers *"which cash equities make up each index?"*
+/// and filters to `NSE && SEGMENT=E && SERIES=EQ`. An index is none of those:
+/// it has no ISIN (the master leaves the column empty), no series, and no
+/// order book. So the join emits the ~750 CONSTITUENTS of NIFTY 50 and never
+/// NIFTY 50 itself — and the live universe, which is built from the join's
+/// output, inherited that hole.
+///
+/// The consequence, measured on the box 2026-08-20: the lane subscribed FOUR
+/// indices, and those four came from a hardcoded constant rather than from
+/// the master at all. Every other NSE index — and there are dozens, each one
+/// a reference price something is quoted against — was absent, not because
+/// anything refused it but because nothing ever asked for it.
+///
+/// These ride the SAME `mappings` array the constituents use, so the live
+/// universe widens through the path it already has: no new artifact, no new
+/// parser, no new consumer. They carry `IDX_I` (segment code 0), which is
+/// what makes them indices rather than equities on the wire.
+///
+/// `index_name` is the literal `NSE_INDEX` rather than a parent index, because
+/// an index is not a constituent OF anything — the field exists to say which
+/// list a row came from, and this row came from the master itself.
+///
+/// Deduped on `security_id` alone, deliberately, and that is NOT an I-P1-11
+/// violation: every row here is `IDX_I` by construction, so the segment half
+/// of the composite is a constant and a pair would add a field that cannot
+/// vary. The equality is documented at the filter rather than assumed.
+fn nse_index_mappings(
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+) -> Vec<MappingEntry> {
+    use tickvault_core::instrument::master_csv::InstrumentClass;
+
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in master {
+        if row.class != InstrumentClass::Index || row.exch_id != "NSE" {
+            continue;
+        }
+        // A zero id is the parser's "absent or unusable" answer. Subscribing
+        // instrument 0 would look healthy and receive nothing.
+        if row.security_id == 0 || !seen.insert(row.security_id) {
+            continue;
+        }
+        out.push(MappingEntry {
+            index_name: "NSE_INDEX".to_owned(),
+            symbol: row.symbol_name.clone(),
+            isin: String::new(),
+            security_id: row.security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::IdxI.binary_code(),
+        });
+    }
+    out
+}
+
 /// Fraction of index lists that failed, in `[0.0, 1.0]`.
 ///
 /// Routed through `u32` so `f64::from` is lossless — no precision-loss
@@ -676,6 +733,13 @@ fn write_mapping_atomic(
             })
             .collect(),
     };
+    // The indices go in AFTER the constituents so the join's own output is
+    // never reordered by this addition — a diff between two days stays a diff
+    // about the market, not about where a block was spliced.
+    let mut artifact = artifact;
+    let indices = nse_index_mappings(master);
+    let index_count = indices.len();
+    artifact.mappings.extend(indices);
     std::fs::create_dir_all(MAPPING_DIR)?;
     let path = mapping_artifact_path(date);
     let tmp = path.with_extension("json.tmp");
@@ -685,6 +749,8 @@ fn write_mapping_atomic(
         path = %path.display(),
         resolved = artifact.resolved,
         unresolved = artifact.unresolved,
+        nse_indices = index_count,
+        mappings = artifact.mappings.len(),
         "instrument mapping written"
     );
     Ok(())
@@ -1054,6 +1120,83 @@ mod tests {
         );
         assert_eq!(rows[1].symbol, "INFY");
         assert_eq!(rows[1].isin, "INE009A01021");
+    }
+
+    fn master_row(
+        security_id: u64,
+        symbol: &str,
+        exch: &str,
+        class: tickvault_core::instrument::master_csv::InstrumentClass,
+    ) -> tickvault_core::instrument::master_csv::MasterRow {
+        tickvault_core::instrument::master_csv::MasterRow {
+            security_id,
+            isin: String::new(),
+            symbol_name: symbol.to_owned(),
+            exch_id: exch.to_owned(),
+            segment: "I".into(),
+            series: String::new(),
+            class,
+            expiry_ymd: 0,
+            strike_paise: 0,
+            option_leg: tickvault_core::instrument::master_csv::OptionLeg::None,
+            underlying_symbol: String::new(),
+        }
+    }
+
+    /// The gap this closes: the ISIN join emits CONSTITUENTS, never the
+    /// indices themselves, so the live universe had four hardcoded indices
+    /// and no path to the rest.
+    #[test]
+    fn test_nse_index_mappings_collects_every_nse_index_as_idx_i() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![
+            master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index),
+            master_row(25, "NIFTY BANK", "NSE", InstrumentClass::Index),
+            master_row(999, "NIFTY MIDCAP 150", "NSE", InstrumentClass::Index),
+            // Not an index.
+            master_row(500, "RELIANCE", "NSE", InstrumentClass::Equity),
+            // An index, but not NSE — out of scope per the 2026-08-20 narrowing.
+            master_row(51, "SENSEX", "BSE", InstrumentClass::Index),
+        ];
+        let out = nse_index_mappings(&master);
+        assert_eq!(out.len(), 3, "three NSE indices, and only those");
+        assert!(
+            out.iter().all(|m| m.exchange_segment
+                == tickvault_common::types::ExchangeSegment::IdxI.binary_code())
+        );
+        assert!(out.iter().all(|m| m.index_name == "NSE_INDEX"));
+        let ids: Vec<u64> = out.iter().map(|m| m.security_id).collect();
+        assert_eq!(ids, vec![13, 25, 999]);
+        assert!(
+            !ids.contains(&51),
+            "SENSEX is BSE — the operator narrowed to NSE alone"
+        );
+        assert!(!ids.contains(&500), "an equity is not an index");
+    }
+
+    /// A zero id is the parser's "unusable" answer. Subscribing instrument 0
+    /// would look healthy on every counter and receive nothing.
+    #[test]
+    fn test_nse_index_mappings_refuses_a_zero_id_and_dedupes() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![
+            master_row(0, "BROKEN", "NSE", InstrumentClass::Index),
+            master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index),
+            master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index),
+        ];
+        let out = nse_index_mappings(&master);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].security_id, 13);
+    }
+
+    /// An empty answer must stay empty rather than inventing a fallback: a
+    /// master with no index rows is a master problem, and quietly substituting
+    /// the old hardcoded four would hide it.
+    #[test]
+    fn test_nse_index_mappings_on_a_master_with_no_indices_is_empty() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![master_row(500, "RELIANCE", "NSE", InstrumentClass::Equity)];
+        assert!(nse_index_mappings(&master).is_empty());
     }
 
     #[test]
