@@ -392,12 +392,27 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title  = "Feed alive? (1 = lane up) + open connections"
+          # 2026-08-20: the second series was labelled "open sockets" and is
+          # not one. `tv_dhan_feed_stack_connections` is set ONCE from the
+          # PLAN, before a single dial, and never again — the repo's own EMF
+          # note calls it "a BOOT-TIME CONSTANT that reports '5 depth-20'
+          # whether or not a single byte ever arrives". Through the 2026-08-12
+          # blackout (12 consecutive HTTP 400 dials, zero candles for 373
+          # minutes) this chart read "open sockets: 5" the entire session.
+          #
+          # The metric is fine; the LABEL was the lie, and it was the one an
+          # operator reads at a glance. Relabelled to what it is, and the gauge
+          # that actually tracks live sockets is charted beside it — that pair
+          # is the answer to "how many of the 16 are really up?", which until
+          # now needed a log grep. `tv_dhan_ws_alive_connections` was already
+          # alarmed and simply never charted.
+          title  = "Feed alive? (1 = lane up) + planned vs live sockets"
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
             [local.dash_namespace, "tv_dhan_feed_stack_up", { label = "lane up (1 = yes)", stat = "Minimum" }],
-            [local.dash_namespace, "tv_dhan_feed_stack_connections", { label = "open sockets", stat = "Maximum" }]
+            [local.dash_namespace, "tv_dhan_ws_alive_connections", { label = "sockets LIVE now", stat = "Minimum" }],
+            [local.dash_namespace, "tv_dhan_feed_stack_connections", { label = "sockets PLANNED at boot (constant)", stat = "Maximum" }]
           ]
           period = 60
         }
