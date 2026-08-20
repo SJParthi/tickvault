@@ -1525,6 +1525,24 @@ mod tests {
         );
     }
 
+    /// Both arms of `stock_options_are_pending` on hand-built values, so the
+    /// predicate is pinned independently of what `select_contract_universe`
+    /// happens to produce. The four fixtures below prove the same thing
+    /// end-to-end; this one proves the boolean itself cannot drift.
+    #[test]
+    fn test_stock_options_are_pending_reads_both_arms() {
+        let mut sel = ContractSelection::default();
+        sel.stock_options = 0;
+        sel.underlyings_without_spot = 0;
+        assert!(!stock_options_are_pending(&sel), "nothing to price");
+
+        sel.underlyings_without_spot = 208;
+        assert!(stock_options_are_pending(&sel), "priceable, unpriced");
+
+        sel.stock_options = 1;
+        assert!(!stock_options_are_pending(&sel), "some were selected");
+    }
+
     /// The live 2026-08-20 shape: a master full of stock options, not one
     /// priced, so nothing was selected. This must read as PENDING, not done.
     #[test]
