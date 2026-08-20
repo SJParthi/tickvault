@@ -8,7 +8,7 @@
 //! Single-threaded access assumed (owned by the trading pipeline task).
 //! For multi-threaded access, wrap in `Arc<Mutex<RiskEngine>>`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::ExchangeSegment;
@@ -72,6 +72,27 @@ pub struct RiskEngine {
     /// P&L). Keying marks on the bare id priced one leg with another leg's
     /// market price and fabricated the P&L the daily-loss halt reads.
     market_prices: HashMap<PositionKey, f64>,
+    /// The subset of [`Self::positions`] whose `net_lots != 0` — an INDEX,
+    /// never a second source of truth.
+    ///
+    /// `positions` is append-only within a trading day: `record_fill_in_segment`
+    /// inserts via `entry().or_default()` and nothing removes until
+    /// `reset_daily`. A closed round trip therefore leaves a FLAT row behind
+    /// forever, and `total_unrealized_pnl` walked every one of them —
+    /// `continue`-ing on the flat ones, but paying the iteration. That walk is
+    /// on the ORDER DECISION PATH (`check_order` → `daily_loss_state` →
+    /// here, on EVERY order), so its cost grew with instruments TRADED today
+    /// rather than instruments OPEN now. The function's own doc called it a
+    /// cold path; it is not one.
+    ///
+    /// Flat rows are deliberately NOT deleted. They carry `realized_pnl`, which
+    /// `position_for` exposes, and `position_security_ids` documents itself as
+    /// returning them "including flat rows" for the order runtime's reconcile
+    /// invariant. Removing them would be a silent behaviour change in two
+    /// consumers to buy a bound this index already provides. Space stays
+    /// bounded by instruments traded per day, i.e. by the 7,000/day order
+    /// GCRA — caller convention, stated plainly rather than claimed as a cap.
+    non_flat: HashSet<PositionKey>,
     /// Sum of all realized P&L from closed trades today.
     total_realized_pnl: f64,
     /// Whether trading is halted due to a risk breach.
@@ -110,6 +131,7 @@ impl RiskEngine {
             capital,
             positions: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             market_prices: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
+            non_flat: HashSet::with_capacity(POSITIONS_INITIAL_CAPACITY),
             total_realized_pnl: 0.0,
             halted: false,
             halt_reason: None,
@@ -354,6 +376,20 @@ impl RiskEngine {
             );
             pos.avg_entry_price = fill_price;
         }
+        // Keep the non-flat INDEX in step with the row we just mutated.
+        //
+        // This is the ONLY place `net_lots` changes, and `reset_daily` is the
+        // only other place the map is touched — so two sites maintain the
+        // index in full. Deliberately placed at the very end of the function,
+        // AFTER every early return above it: each of those returns rejects the
+        // fill without touching `net_lots`, so an index update before them
+        // could record a transition that never happened.
+        let key = (security_id, segment);
+        if self.positions.get(&key).is_some_and(|p| p.net_lots != 0) {
+            self.non_flat.insert(key);
+        } else {
+            self.non_flat.remove(&key);
+        }
     }
 
     /// Updates the mark-to-market price for an instrument (for unrealized P&L).
@@ -473,6 +509,7 @@ impl RiskEngine {
     /// Resets all daily state (P&L, positions, halt) for a new trading day.
     pub fn reset_daily(&mut self) {
         self.positions.clear();
+        self.non_flat.clear();
         self.market_prices.clear();
         self.total_realized_pnl = 0.0;
         self.halted = false;
@@ -535,10 +572,27 @@ impl RiskEngine {
     /// Returns the total unrealized P&L across all open positions.
     ///
     /// RISK-GAP-02: Conservative — skips securities with no market price.
-    /// O(N) where N = open positions (cold path, called during risk checks).
+    ///
+    /// # Complexity
+    /// O(OPEN) where OPEN = positions with `net_lots != 0`, via the `non_flat`
+    /// index. It used to walk every row `positions` had EVER held today,
+    /// `continue`-ing on the flat ones but paying the iteration — so a day of
+    /// closed round trips made this slower and slower while the number of open
+    /// positions stayed flat. It is called from `daily_loss_state`, which
+    /// `check_order` runs on EVERY order, so that growth sat on the order
+    /// decision path. The doc line here used to say "cold path"; it was not
+    /// one, and a comment asserting otherwise is how it stayed unexamined.
     pub fn total_unrealized_pnl(&self) -> f64 {
         let mut total = 0.0_f64;
-        for (key, pos) in &self.positions {
+        for key in &self.non_flat {
+            // The index can only contain keys the map has, and only while they
+            // are non-flat — both invariants are maintained at the single
+            // mutation site. A miss here would mean the index drifted, so it
+            // is skipped rather than defaulted: a fabricated zero would feed
+            // the daily-loss halt a number no position produced.
+            let Some(pos) = self.positions.get(key) else {
+                continue;
+            };
             if pos.net_lots == 0 {
                 continue;
             }
@@ -586,8 +640,12 @@ impl RiskEngine {
     }
 
     /// Returns the number of instruments with open positions.
+    ///
+    /// # Complexity
+    /// O(1) — the `non_flat` index IS this count. Was an O(N) scan of every
+    /// row touched today.
     pub fn open_position_count(&self) -> usize {
-        self.positions.values().filter(|p| p.net_lots != 0).count()
+        self.non_flat.len()
     }
 
     /// Returns total orders checked since startup/reset.
@@ -675,6 +733,154 @@ mod tests {
         assert_eq!(engine.total_checks(), 0);
         assert_eq!(engine.total_rejections(), 0);
         assert_eq!(engine.open_position_count(), 0);
+    }
+
+    /// The index and the map must agree after every reachable transition.
+    ///
+    /// Written as a re-derivation rather than a hand-listed expectation: it
+    /// recomputes what `non_flat` SHOULD be straight from `positions` and
+    /// compares. A hardcoded expected set would still pass if both the fix and
+    /// the test shared a wrong idea of the transitions.
+    fn assert_index_matches_map(engine: &RiskEngine, at: &str) {
+        let derived: HashSet<PositionKey> = engine
+            .positions
+            .iter()
+            .filter(|(_, p)| p.net_lots != 0)
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(
+            engine.non_flat, derived,
+            "non_flat index drifted from positions at: {at}"
+        );
+        assert_eq!(
+            engine.open_position_count(),
+            derived.len(),
+            "open_position_count reads the index, so it drifts with it: {at}"
+        );
+    }
+
+    #[test]
+    fn non_flat_index_tracks_open_close_reverse_and_reset() {
+        // Every transition `net_lots` can make, in one sequence: open, add,
+        // partial close, full close (-> FLAT, the case the whole index exists
+        // for), reopen, and reverse THROUGH zero (which must stay indexed, not
+        // be mistaken for a close).
+        let mut engine = make_engine();
+        assert_index_matches_map(&engine, "fresh");
+
+        engine.record_fill(1001, 10, 100.0, 25);
+        assert_eq!(engine.open_position_count(), 1);
+        assert_index_matches_map(&engine, "opened");
+
+        engine.record_fill(1001, 5, 101.0, 25);
+        assert_index_matches_map(&engine, "added");
+
+        engine.record_fill(1001, -5, 102.0, 25);
+        assert_index_matches_map(&engine, "partially closed");
+
+        // FLAT. The row REMAINS in `positions` (it carries realized_pnl and
+        // `position_security_ids` promises flat rows) but must leave the index
+        // — that divergence is the entire point.
+        engine.record_fill(1001, -10, 103.0, 25);
+        assert_eq!(engine.open_position_count(), 0, "flat is not open");
+        assert!(
+            engine.position(1001).is_some(),
+            "the flat ROW must survive — it carries realized P&L"
+        );
+        assert_index_matches_map(&engine, "closed flat");
+
+        engine.record_fill(1001, 3, 104.0, 25);
+        assert_index_matches_map(&engine, "reopened");
+
+        // Long 3 -> short 4: passes through zero without ever BEING zero.
+        engine.record_fill(1001, -7, 105.0, 25);
+        assert_eq!(engine.net_lots_for(1001), -4);
+        assert_eq!(engine.open_position_count(), 1, "reversed, still open");
+        assert_index_matches_map(&engine, "reversed through zero");
+
+        // A rejected fill must not move the index either.
+        engine.record_fill(1001, 1, f64::NAN, 25);
+        assert_index_matches_map(&engine, "after a rejected fill");
+        engine.record_fill(1001, 0, 106.0, 25);
+        assert_index_matches_map(&engine, "after a zero-lot no-op");
+
+        engine.reset_daily();
+        assert_eq!(engine.open_position_count(), 0);
+        assert_index_matches_map(&engine, "after reset_daily");
+    }
+
+    /// The COMPLEXITY pin, and the reason it is a source scan.
+    ///
+    /// My first attempt at this pinned behaviour instead: trade 200 instruments
+    /// closed, one open, assert `open_position_count() == 1`. It passed — and
+    /// then it ALSO passed when both readers were reverted to walking
+    /// `positions`, because the O(n) scan returns the same correct 1. A
+    /// complexity fix whose test is satisfied by the slow version is not a
+    /// test of the fix; it is a test of arithmetic that was never in doubt.
+    ///
+    /// Counting iterations from outside is not possible here without adding an
+    /// instrument to production code purely to be measured. So this asserts on
+    /// the SHAPE, the way this repo's other complexity ratchets do — the two
+    /// readers must reach the index, and must not reach the map.
+    #[test]
+    fn the_two_hot_readers_iterate_the_index_and_not_the_whole_map() {
+        let src = include_str!("engine.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        let unrealized = production
+            .split(concat!("pub ", "fn total_unrealized_pnl"))
+            .nth(1)
+            .and_then(|s| s.split("\n    ///").next())
+            .expect("total_unrealized_pnl must exist");
+        assert!(
+            unrealized.contains("for key in &self.non_flat"),
+            "total_unrealized_pnl must iterate the non_flat INDEX. It sits on \
+             the order decision path via check_order -> daily_loss_state, so \
+             iterating `positions` makes every order slower as the day's closed \
+             round trips accumulate. Found:\n{unrealized}"
+        );
+        assert!(
+            !unrealized.contains("&self.positions {")
+                && !unrealized.contains("self.positions.iter"),
+            "total_unrealized_pnl must not walk the whole map:\n{unrealized}"
+        );
+
+        let count = production
+            .split(concat!("pub ", "fn open_position_count"))
+            .nth(1)
+            .and_then(|s| s.split("\n    ///").next())
+            .expect("open_position_count must exist");
+        assert!(
+            count.contains("self.non_flat.len()"),
+            "open_position_count IS the index length — an O(n) filter+count \
+             returns the same number and hides the regression. Found:\n{count}"
+        );
+    }
+
+    #[test]
+    fn unrealized_pnl_does_not_walk_positions_closed_earlier_today() {
+        // The decision-path cost. 200 instruments traded and closed, one still
+        // open: `total_unrealized_pnl` must visit ONE row, not 201. The index
+        // length is the observable proxy — if the fix regresses to walking
+        // `positions`, this count is 201 and the assertion names it.
+        let mut engine = make_engine();
+        for sid in 0..200_u64 {
+            engine.record_fill(sid, 1, 100.0, 1);
+            engine.record_fill(sid, -1, 100.0, 1); // closed, now flat
+        }
+        engine.record_fill(9_999, 4, 50.0, 1); // the only open one
+        engine.update_market_price(9_999, 60.0);
+
+        assert_eq!(engine.positions.len(), 201, "every row is still retained");
+        assert_eq!(
+            engine.open_position_count(),
+            1,
+            "but only one is OPEN — this is what unrealized P&L iterates"
+        );
+        // And the number itself is unchanged by the optimisation: 4 lots,
+        // lot_size 1, 50 -> 60.
+        assert!((engine.total_unrealized_pnl() - 40.0).abs() < 1e-9);
     }
 
     #[test]
