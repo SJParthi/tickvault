@@ -1208,17 +1208,20 @@ impl LiveIngest {
         // outside a 30-year band, or an unidentifiable instrument — and
         // writing any of them would put a corrupt row in `ticks` under a
         // garbage designated timestamp, which is worse than losing it.
-        let candle_only_refusal = (stats.out_of_session || stats.untraded_sentinel)
-            && !stats.refused_price
-            && !stats.refused_timestamp
-            && !stats.slot_exhausted;
+        // Three conditions refuse the WHOLE tick, because writing the row
+        // would put corrupt data in `ticks` under a garbage designated
+        // timestamp: a price outside `[0, MAX]` (NaN and both infinities fall
+        // outside by comparison), a timestamp beyond a 30-year band, and an
+        // instrument with no fold slot at all.
+        let hard_refusal = stats.refused_price || stats.refused_timestamp || stats.slot_exhausted;
 
-        if (stats.refused_price
-            || (stats.out_of_session && !candle_only_refusal)
-            || stats.slot_exhausted
-            || stats.refused_timestamp)
-            && !candle_only_refusal
-        {
+        // Two refuse only the CANDLE and keep the row — see above. They are
+        // mutually exclusive with the three by construction, which is why this
+        // reads as a plain `!hard_refusal` rather than repeating them.
+        let candle_only_refusal =
+            (stats.out_of_session || stats.untraded_sentinel) && !hard_refusal;
+
+        if hard_refusal {
             let reason = if stats.refused_price {
                 self.refused_price = self.refused_price.saturating_add(1);
                 "price"

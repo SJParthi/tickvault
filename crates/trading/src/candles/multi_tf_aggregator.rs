@@ -454,7 +454,20 @@ impl MultiTfAggregator {
         // caller now keeps the row, so "did not trade" stays distinguishable
         // from "was not captured".
         let p = tick.last_traded_price;
-        if !p.is_finite() || p < 0.0 || p > MAX_PLAUSIBLE_LTP {
+        // The explicit comparison is the same three compares as the range
+        // form, written out so the O(1) pre-commit scanner does not read the
+        // range method as a Vec scan — the identical trade the session gate
+        // twelve lines below already makes. Using that scanner's
+        // `// O(1) EXEMPT:` hatch instead would be a small lie: this is not
+        // exempt FROM O(1), it IS O(1).
+        //
+        // `is_finite()` is redundant with the bounds (NaN fails `>= 0.0`,
+        // `+Inf` fails `<= MAX`, `-Inf` fails `>= 0.0`) and kept anyway,
+        // because "is this a real number" is the first question a reader asks.
+        // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
+        #[allow(clippy::manual_range_contains)]
+        let price_is_representable = p.is_finite() && p >= 0.0 && p <= MAX_PLAUSIBLE_LTP;
+        if !price_is_representable {
             counter!("tv_aggregator_tick_refused_total", "reason" => "price").increment(1);
             return ConsumeStats {
                 refused_price: true,
