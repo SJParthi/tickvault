@@ -528,7 +528,42 @@ fn plan_pool(
     // depth-200 instruments and a 1-per-connection cap, this opens 4 sockets,
     // NOT 5 with an empty one. An empty subscribe is a socket that reports
     // healthy while carrying nothing — the false-OK the scope lock bans.
-    let connections_to_use = usize::from(available).min(set.len()).max(1);
+    // ---- 2026-08-20: main-feed PACKS, depth keeps SPREADING ----
+    //
+    // The spread directive above was written when the main feed carried ONLY
+    // the ~4,565 spot universe and four authorized sockets sat idle. Spreading
+    // used what the operator had paid for, and it was right for that shape.
+    //
+    // The main feed is now dialed in TWO passes: spots at boot, and the
+    // ~20,000 option/future contracts once post-open prices exist. Under
+    // spread, pass 1 takes `min(5, 4565)` = ALL FIVE connections, so pass 2
+    // gets a stateful refusal from `pool.admit` — and because `MainFeed` is
+    // the first endpoint in `build_feed_stack_plan`'s loop, that refusal
+    // aborted Depth20 and Depth200 planning too. Spreading the small first
+    // pass is what starved the sockets the spread directive existed to fill.
+    //
+    // Packing pass 1 is what actually delivers the directive's intent:
+    //
+    // | pass | packed | spread |
+    // |---|---|---|
+    // | boot spots (4,565) | 1 conn | 5 conns |
+    // | contracts (~20,000) | 4 conns | 0 — REFUSED |
+    // | **main-feed sockets carrying data** | **5** | **1** |
+    //
+    // At the 25,000 target the two policies converge exactly
+    // (`ceil(25000/5000)` = 5 = `min(5, 25000)`), so this changes nothing at
+    // full scale and everything today.
+    //
+    // Depth keeps spreading, and must: depth-200 admits ONE instrument per
+    // connection, so packing it would open a single socket and strand four.
+    let connections_to_use = if matches!(endpoint, DhanEndpointType::MainFeed) {
+        set.len()
+            .div_ceil(cap_per_connection.max(1))
+            .max(1)
+            .min(usize::from(available))
+    } else {
+        usize::from(available).min(set.len()).max(1)
+    };
     let shard_width = set.len().div_ceil(connections_to_use).max(1);
     debug_assert!(
         shard_width <= cap_per_connection,
@@ -3926,8 +3961,15 @@ fn main_feed_connections_for(instruments: usize, available: usize) -> usize {
     if instruments == 0 || available == 0 {
         return 0;
     }
-    // Mirrors `plan_pool`: `min(available, set.len()).max(1)`.
-    available.min(instruments).max(1)
+    let per_connection = usize::try_from(
+        tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    // Mirrors `plan_pool`'s MAIN-FEED arm exactly: pack, then clamp to what is
+    // actually free. Both halves matter — packing is the policy, and the clamp
+    // is what stops this reporting capacity the pool would refuse.
+    instruments.div_ceil(per_connection).max(1).min(available)
 }
 
 /// Packs an IST `YYYY-MM-DD` date into the `YYYYMMDD` form contract selection
@@ -5592,7 +5634,7 @@ mod tests {
     /// and left four authorized ones idle — which is how "16 authorized" was
     /// really 7 in practice.
     #[test]
-    fn test_main_feed_spreads_a_fitting_set_across_all_five_connections() {
+    fn test_main_feed_packs_its_first_pass_so_contracts_still_fit() {
         let mut pool = PoolSupervisor::new();
         let now = std::time::Instant::now();
         // The real resolved-master size on the live box, 2026-08-12.
@@ -5600,9 +5642,17 @@ mod tests {
             .expect("4565 instruments must plan cleanly");
         assert_eq!(
             plan.count_for(DhanEndpointType::MainFeed),
-            5,
-            "4,565 instruments must SPREAD across all 5 authorized main-feed \
-             connections; packing put them on 1 and left 4 idle"
+            1,
+            "4,565 fits ONE 5,000-instrument socket. Spreading it across all \
+             five took the whole pool, so the ~20,000-contract second pass was \
+             refused — and because MainFeed is planned first, that refusal \
+             aborted depth planning too. Packing pass 1 is what ends with all \
+             five main-feed sockets carrying data."
+        );
+        assert_eq!(
+            pool.total_open(),
+            1,
+            "four connections must remain free for the contract pass"
         );
     }
 
@@ -5611,6 +5661,56 @@ mod tests {
     /// Spreading widens shards only when a set fits in FEWER connections than
     /// are authorized, so the width can only shrink relative to the cap — but
     /// this asserts the invariant directly rather than trusting that argument.
+    #[test]
+    fn all_sixteen_sockets_carry_data_at_the_authorized_scale() {
+        // THE END-TO-END ARITHMETIC, asserted rather than argued. This is the
+        // operator's actual requirement — 16 connections, all carrying data —
+        // and until 2026-08-20 the answer was 6, with depth structurally
+        // unable to plan at all.
+        //
+        // Two passes, exactly as the live lane runs them: spots at boot, then
+        // contracts once post-open prices exist.
+        let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
+
+        // Pass 1 — boot spots.
+        let mut pool = PoolSupervisor::new();
+        let now = std::time::Instant::now();
+        let boot = build_feed_stack_plan(&mut pool, now, &instruments(4_565), &[], &[])
+            .expect("the spot universe must plan");
+        assert_eq!(boot.count_for(DhanEndpointType::MainFeed), 1);
+
+        // Pass 2 — contracts sized by what pass 1 left, plus both depth pools.
+        // The SAME pool, so `admit` is stateful exactly as in production.
+        let used = boot.count_for(DhanEndpointType::MainFeed);
+        let room = remaining_main_feed_capacity(used);
+        let attach = build_feed_stack_plan(
+            &mut pool,
+            now,
+            &instruments(room),
+            &instruments(250),
+            &instruments(5),
+        )
+        .expect(
+            "the contract + depth pass must PLAN — a BudgetRefused here is the \
+             defect that cost depth an entire session, because MainFeed is \
+             planned first and its refusal aborts depth too",
+        );
+
+        assert_eq!(attach.count_for(DhanEndpointType::MainFeed), 4, "contracts");
+        assert_eq!(attach.count_for(DhanEndpointType::Depth20), 5);
+        assert_eq!(attach.count_for(DhanEndpointType::Depth200), 5);
+
+        // 5 main-feed (1 spots + 4 contracts) + 5 depth-20 + 5 depth-200 = 15,
+        // plus the order-update socket dialed by the REST stack = 16.
+        assert_eq!(used + attach.count_for(DhanEndpointType::MainFeed), max);
+        assert_eq!(
+            pool.total_open(),
+            15,
+            "fifteen market-data sockets; the sixteenth is order-update, dialed \
+             by dhan_rest_stack and counted against its own endpoint budget"
+        );
+    }
+
     #[test]
     fn test_spread_shard_width_never_exceeds_the_dhan_cap() {
         for n in [1usize, 2, 49, 50, 51, 200, 249, 250, 4565, 25_000] {
@@ -5777,11 +5877,12 @@ mod tests {
     // -- planning -----------------------------------------------------------
 
     #[test]
-    fn test_build_feed_stack_plan_spreads_the_index_universe_one_per_connection() {
-        // CHANGED 2026-08-12 (spread, not pack): four index SIDs now open FOUR
-        // main-feed sockets, one instrument each, where packing opened one.
-        // Bounded by the instrument count, so no socket is empty — four
-        // instruments can never justify a fifth connection.
+    fn test_build_feed_stack_plan_packs_the_index_universe_onto_one_connection() {
+        // CHANGED 2026-08-20 (main-feed PACKS again, depth still spreads —
+        // scope-lock amendment of that date). Four index SIDs fit one 5,000-
+        // instrument socket, and packing pass 1 is what leaves the other four
+        // connections for the contract pass. Under spread these four SIDs took
+        // four sockets and the contracts were refused.
         let mut pool = PoolSupervisor::new();
         let plan = build_feed_stack_plan(
             &mut pool,
@@ -5791,21 +5892,19 @@ mod tests {
             &[],
         )
         .expect("four indices plan cleanly");
-        assert_eq!(plan.len(), 4);
-        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 4);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 1);
         assert_eq!(plan.count_for(DhanEndpointType::Depth20), 0);
         assert_eq!(plan.count_for(DhanEndpointType::Depth200), 0);
-        assert_eq!(pool.total_open(), 4);
+        assert_eq!(pool.total_open(), 1);
     }
 
     #[test]
-    fn test_plan_count_for_spreads_across_the_authorized_connections() {
+    fn test_plan_count_for_packs_the_main_feed_and_spreads_depth() {
         let mut pool = PoolSupervisor::new();
-        // CHANGED 2026-08-12 (spread, not pack). Every set below fits inside
-        // the authorized pools, so each SPREADS across all 5 connections
-        // rather than packing into the fewest:
-        //   12,001 main-feed -> 5 conns of 2,401 (cap 5,000, well inside)
-        //      101 depth-20   -> 5 conns of 21    (cap 50)
+        // CHANGED 2026-08-20: the MAIN FEED packs, DEPTH still spreads.
+        //   12,001 main-feed -> ceil(12001/5000) = 3 conns (cap 5,000)
+        //      101 depth-20   -> 5 conns of 21    (cap 50, spread)
         // depth-200 is capped at 1 instrument per connection, so 3
         // instruments is 3 sockets — bounded by the set, never padded.
         let plan = build_feed_stack_plan(
@@ -5816,11 +5915,11 @@ mod tests {
             &instruments(3),
         )
         .expect("all three shards fit inside the authorized pools");
-        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 5);
+        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 3);
         assert_eq!(plan.count_for(DhanEndpointType::Depth20), 5);
         assert_eq!(plan.count_for(DhanEndpointType::Depth200), 3);
-        assert_eq!(plan.len(), 13);
-        assert_eq!(pool.total_open(), 13);
+        assert_eq!(plan.len(), 11);
+        assert_eq!(pool.total_open(), 11);
     }
 
     #[test]
@@ -5895,10 +5994,10 @@ mod tests {
             .expect("inside the pool");
         let total: usize = plan.connections.iter().map(|c| c.guard.len()).sum();
         assert_eq!(total, 7_777, "sharding must not drop or duplicate anything");
-        // CHANGED 2026-08-12: spread gives 5 conns of 1,556 rather than 2 of
-        // 5,000. Conservation above is the invariant that actually matters and
-        // is unchanged.
-        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 5);
+        // CHANGED 2026-08-20: the main feed packs, so 7,777 is 2 conns of
+        // 5,000 and 2,777. Conservation above is the invariant that actually
+        // matters and is unchanged by either policy.
+        assert_eq!(plan.count_for(DhanEndpointType::MainFeed), 2);
     }
 
     #[test]
@@ -7736,31 +7835,40 @@ mod tests {
             1,
             "one instrument still occupies a whole connection"
         );
-        // The live universe on 2026-08-12. Packed arithmetic said 1; the pool
-        // dialed 5.
+        // The live universe. The main feed PACKS, so 4,565 spots occupy ONE
+        // connection and leave four for the contract pass.
         assert_eq!(
             main_feed_connections_for(4_565, max),
-            max,
-            "4,565 instruments spread across every available connection — \
-             reporting 1 here is what took depth down"
+            1,
+            "4,565 fits one 5,000-instrument socket — packing pass 1 is what \
+             leaves room for the ~20,000 contracts of pass 2"
         );
         assert_eq!(
             main_feed_connections_for(25_000, max),
             max,
-            "at the target scale packed and spread agree, which is why this \
-             defect was invisible in the sizing arithmetic"
+            "at the target scale packed and spread converge exactly"
         );
-        // Fewer instruments than connections: the pool opens one socket per
-        // instrument, never an empty one.
-        assert_eq!(main_feed_connections_for(3, max), 3);
-
-        // And the consequence the attach reads.
+        // Never more than are actually free, whatever the arithmetic says.
         assert_eq!(
-            remaining_main_feed_capacity(main_feed_connections_for(4_565, max)),
-            0,
-            "with the spot universe spread across every connection there is \
-             genuinely no room for contracts — saying so lets the plan SUCCEED \
-             and depth dial, instead of refusing the whole pool"
+            main_feed_connections_for(25_000, 2),
+            2,
+            "clamped to what the pool has left — reporting 5 here is what \
+             asked for room that did not exist and refused the whole pool"
+        );
+        assert_eq!(main_feed_connections_for(3, max), 1, "three fit one socket");
+
+        // THE POINT OF THE WHOLE FIX: after the spots, contracts still fit.
+        let used = main_feed_connections_for(4_565, max);
+        let room = remaining_main_feed_capacity(used);
+        assert_eq!(
+            room, 20_000,
+            "four connections x 5,000 remain for contracts"
+        );
+        assert_eq!(
+            used + main_feed_connections_for(room, max.saturating_sub(used)),
+            max,
+            "spots + contracts together fill all five main-feed sockets — the \
+             spread directive's intent, delivered by packing the first pass"
         );
     }
     #[test]
@@ -8597,56 +8705,83 @@ mod contract_attach_tests {
     }
 
     #[test]
-    fn connection_count_matches_the_spread_the_pool_actually_dials() {
-        // CORRECTED 2026-08-20. This test used to assert the PACKED counts
-        // (`5_000 -> 1`, `5_001 -> 2`, `4_565 -> 1`) and it was the thing
-        // holding the defect in place: `plan_pool` SPREADS across
-        // `min(available, len)` connections, so the packed answer understated
-        // the real occupancy by 4 at the live scale. The attach then asked for
-        // room that did not exist, `plan_pool` refused the whole pool, and
-        // depth was never planned.
+    fn connection_count_mirrors_the_main_feed_pack_policy() {
+        // History, because this line has now been wrong in BOTH directions and
+        // the reason is the same each time: it must mirror `plan_pool`'s
+        // main-feed arm, and nothing else.
         //
-        // The rule is now "mirror plan_pool", not "round up".
+        //  - originally PACKED while plan_pool SPREAD  -> understated by 4,
+        //    the attach asked for room that did not exist, the pool refused
+        //    everything and depth was never planned;
+        //  - briefly SPREAD to match                   -> honest, but left
+        //    literally zero room for contracts;
+        //  - now PACKED, with plan_pool packing too    -> both passes fit.
         let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
-        assert_eq!(main_feed_connections_for(0, max), 0);
+        let cap = usize::try_from(
+            tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
+        )
+        .unwrap_or(usize::MAX);
+
+        assert_eq!(
+            main_feed_connections_for(0, max),
+            0,
+            "nothing occupies nothing"
+        );
         assert_eq!(main_feed_connections_for(1, max), 1);
-        // Fewer instruments than connections: one socket each, never an empty
-        // one — the same floor plan_pool applies.
-        assert_eq!(main_feed_connections_for(3, max), 3);
-        // At or past the connection count, the pool spreads across all of them.
+        assert_eq!(main_feed_connections_for(3, max), 1, "three fit one socket");
+        assert_eq!(
+            main_feed_connections_for(cap, max),
+            1,
+            "exactly full is still one"
+        );
+        assert_eq!(
+            main_feed_connections_for(cap + 1, max),
+            2,
+            "one over spills"
+        );
         assert_eq!(
             main_feed_connections_for(4_565, max),
-            max,
-            "today's spot universe"
+            1,
+            "today's spot universe fits one socket — leaving four for contracts"
         );
-        assert_eq!(main_feed_connections_for(5_000, max), max);
-        assert_eq!(main_feed_connections_for(25_000, max), max);
+        assert_eq!(main_feed_connections_for(25_000, max), max, "target scale");
+
+        // The clamp. Reporting more than the pool has free is what earns a
+        // BudgetRefused on the WHOLE pool.
+        assert_eq!(main_feed_connections_for(25_000, 2), 2);
+        assert_eq!(main_feed_connections_for(25_000, 0), 0);
     }
 
     #[test]
     fn the_two_helpers_can_never_together_exceed_the_authorized_pool() {
-        // The 16-connection lock has to be arithmetic, not a hope. For every
-        // reachable spot-universe size, connections used plus connections the
-        // remaining capacity could need must stay inside the cap.
+        // The 5-connection main-feed lock has to be arithmetic, not a hope:
+        // for every reachable spot-universe size, the connections the spots
+        // occupy plus the connections the remaining capacity could need must
+        // stay inside the cap.
         let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
         for spot in [0usize, 1, 3, 4_565, 5_000, 5_001, 12_000, 24_999, 25_000] {
             let used = main_feed_connections_for(spot, max);
             let remaining = remaining_main_feed_capacity(used);
-            // Contracts may only spread across what the spots LEFT.
+            // Contracts may only occupy what the spots LEFT.
             let would_need = main_feed_connections_for(remaining, max.saturating_sub(used));
             assert!(
                 used + would_need <= max,
                 "spot={spot} used={used} + contracts={would_need} exceeds {max}"
             );
         }
-        // And the property that actually matters, stated directly: once the
-        // spot universe is at least as large as the connection count, it has
-        // spread across ALL of them and there is no room left. The attach must
-        // read zero here — reading 20,000 is what aborted the plan and took
-        // depth with it.
+
+        // And the property the whole fix exists for, stated directly: after
+        // today's spot universe, contracts still fit — and together they fill
+        // every authorized main-feed socket. Under the old arithmetic this
+        // line read 0 connections for contracts and a refused pool.
+        let used = main_feed_connections_for(4_565, max);
+        assert_eq!(used, 1);
+        let room = remaining_main_feed_capacity(used);
+        assert_eq!(room, 20_000, "four connections x 5,000 remain");
         assert_eq!(
-            remaining_main_feed_capacity(main_feed_connections_for(4_565, max)),
-            0
+            used + main_feed_connections_for(room, max.saturating_sub(used)),
+            max,
+            "spots + contracts together fill all five main-feed sockets"
         );
     }
 

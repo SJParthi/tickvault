@@ -1196,3 +1196,73 @@ both counts: the recommendation AND the number behind it.)*
 - Opens depth sockets before the writer exists (the previous section's binding
   rule stands — a captured-then-discarded frame is still a discarded frame).
 - Reports depth as "captured" while `depth_unconsumed` is still incrementing.
+
+### 2026-08-20 — MAIN-FEED PACKS ITS FIRST PASS (the 2026-08-12 spread directive, amended so it can actually be delivered)
+
+**The verbatim operator demand (2026-08-20, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "See without building our entire plan why the fuck you stopped motjerfuxker youcfinaih everything entirely fully motherucker rokah"
+
+Given in DIRECT response to a report that said 6 of the 16 authorized sockets
+carry data, that contracts do not dial, and that closing it "needs your decision:
+pack the spot universe onto fewer sockets to leave room for contracts, or keep it
+spread across all 5." The operator's answer is that there was no decision to
+escalate — finish it. This section is the dated record that house law requires
+before the code changes.
+
+#### What this amends
+
+The 2026-08-12 directive told `plan_pool` to **SPREAD** across the authorized
+connections rather than pack into the fewest. That was correct for the shape it
+was written for: the main feed carried ONLY the ~4,565 spot universe, and four
+authorized sockets sat idle.
+
+The main feed is now dialed in **two passes** — spots at boot, and the ~20,000
+option/future contracts once post-open prices exist. Under spread, pass 1 takes
+`min(5, 4565)` = **all five** connections, so pass 2 is refused by the stateful
+`pool.admit`; and because `MainFeed` is the first endpoint in
+`build_feed_stack_plan`'s loop, that refusal aborted **Depth20 and Depth200
+planning as well**. Spreading the small first pass is precisely what starved the
+sockets the spread directive existed to fill.
+
+| pass | PACKED | SPREAD |
+|---|---|---|
+| boot spots (4,565) | 1 connection | 5 connections |
+| contracts (~20,000) | 4 connections | 0 — REFUSED |
+| **main-feed sockets carrying data** | **5** | **1** |
+| **depth planned at all?** | yes | **no — aborted by the main-feed refusal** |
+
+#### The amendment (narrow)
+
+**The MAIN FEED packs: `connections_to_use = ceil(len / cap).min(available)`.
+DEPTH continues to SPREAD, unchanged.**
+
+Depth must keep spreading and this is not a detail: depth-200 admits ONE
+instrument per connection, so packing it would open a single socket and strand
+four. The 2026-08-12 reasoning — failure isolation, head-of-line blocking,
+decode parallelism — stands verbatim for depth and stands for the main feed too
+once both passes have run, because the end state is the same five sockets.
+
+**At the 25,000 target the two policies converge exactly**
+(`ceil(25000/5000)` = 5 = `min(5, 25000)`), so this changes nothing at full
+scale and everything today.
+
+#### What this does NOT change
+
+The 16-connection budget; the four endpoint types; `dry_run` stays true; no live
+order fire; the §28 frozen indicator/strategy area; the per-minute REST KEEP; the
+Q3 ban on a hardcoded expiring contract list. Contract security-ids continue to
+come from the already-running option-chain leg, which self-rolls at expiry.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Packs DEPTH (strands four depth-200 sockets on one connection).
+- Lets `main_feed_connections_for` and `plan_pool`'s main-feed arm disagree —
+  that disagreement is the exact defect this amends, and it cost depth an entire
+  session while reporting a depth problem that did not exist.
+- Reports main-feed capacity without clamping to what the pool actually has
+  free (`.min(available)`), which asks for room that does not exist and earns a
+  refusal of the WHOLE pool.
+- Claims sockets are "carrying data" on the strength of a dial rather than a
+  received frame (see the same-day up-gauge correction).
