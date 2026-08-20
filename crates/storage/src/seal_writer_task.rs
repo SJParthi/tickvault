@@ -136,7 +136,13 @@ pub fn drain_once(
     // (so the ring is drained), THEN attempt flush. If flush fails,
     // every popped seal cascades to spill/DLQ/drop — they do NOT
     // re-enter the ring (would invert FIFO).
-    let mut popped: Vec<BufferedSeal> = Vec::with_capacity(max_drain);
+    // Sized to what is ACTUALLY waiting, not to the cap. With the cap at
+    // 1,024 this distinction did not matter; at 16,384 a mostly-empty ring
+    // would otherwise reserve ~2.4 MB ten times a second for a handful of
+    // seals. `ring_len` is the real bound on how many `pop_oldest` can yield
+    // this cycle, and the `.min` keeps the reservation exact in both
+    // directions — no over-reserve when idle, no re-alloc when saturated.
+    let mut popped: Vec<BufferedSeal> = Vec::with_capacity(max_drain.min(pipeline.ring_len()));
     while popped.len() < max_drain {
         match pipeline.pop_oldest() {
             Some(seal) => {
@@ -164,6 +170,26 @@ pub fn drain_once(
     }
 
     outcome.ring_seals_popped = popped.len();
+
+    // CAP SATURATION — the signal whose absence let a live ceiling hide.
+    //
+    // Added 2026-08-20. On the prod box the drain sat at EXACTLY
+    // `cycles × max_drain` for hours while 61% of sealed candles went to
+    // disk, and every counter that existed looked reasonable: seals were
+    // submitted, rows were written, `flush_failures` was 0, `dropped` was 0.
+    // The only way to see it was to notice that `rows_written` was an exact
+    // multiple of 1024 — arithmetic nobody runs on a dashboard.
+    //
+    // A cap that binds is a different condition from a cap that fits, and
+    // until now they produced identical telemetry. This one says which:
+    // non-zero means the ring had MORE waiting than we were allowed to take,
+    // so the overflow went to spill because of a CONSTANT, not because the
+    // database refused it. `flush_failures` stays the signal for the database
+    // genuinely being unable to keep up; these two must never be confused,
+    // because they have opposite fixes.
+    if outcome.ring_seals_popped == max_drain && pipeline.ring_len() > 0 {
+        metrics::counter!("tv_seal_drain_cap_saturated_total").increment(1);
+    }
 
     // Idle if nothing landed in the writer (ring was racing-empty by
     // the time we started, or every append failed).
@@ -1051,6 +1077,86 @@ mod tests {
             0,
             "rescued seals MUST go to spill, NOT re-buffer into ring"
         );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn drain_once_leaves_the_remainder_in_the_ring_when_the_cap_binds() {
+        // The prod defect this pins, 2026-08-20: the drain sat at EXACTLY
+        // `cycles × max_drain` for hours while 61% of sealed candles went to
+        // disk instead of the database, and NOTHING said the cap was the
+        // reason. `flush_failures` was 0, `dropped` was 0, seals were being
+        // submitted and rows written — every existing counter looked healthy.
+        //
+        // The cap binding and the cap fitting must be distinguishable, because
+        // their fixes are opposite: one raises a constant, the other means the
+        // database genuinely cannot keep up.
+        let (spill, dlq) = temp_pair("cap-binds");
+        let mut pipeline =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(64, spill.clone(), dlq.clone());
+        let now = jan1_noon_utc();
+        for i in 0..10 {
+            pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900 + i, 100.0), now);
+        }
+        let mut writer = ShadowCandleWriter::for_test();
+
+        // Cap of 4 against 10 waiting: takes exactly 4, and 6 stay queued.
+        let outcome = drain_once(&mut pipeline, &mut writer, 4, now);
+        assert_eq!(
+            outcome.ring_seals_popped, 4,
+            "the cap must bind at exactly its value"
+        );
+        assert_eq!(
+            pipeline.ring_len(),
+            6,
+            "the remainder must still be in the ring, not silently gone"
+        );
+
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn drain_once_takes_everything_when_the_cap_does_not_bind() {
+        // The other half of the same distinction. A generous cap against a
+        // short ring must drain it completely and leave nothing behind —
+        // otherwise "the cap binds" could never be told apart from "there was
+        // nothing more to take", which is precisely the confusion that let the
+        // live ceiling hide.
+        let (spill, dlq) = temp_pair("cap-free");
+        let mut pipeline =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(64, spill.clone(), dlq.clone());
+        let now = jan1_noon_utc();
+        for i in 0..3 {
+            pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900 + i, 100.0), now);
+        }
+        let mut writer = ShadowCandleWriter::for_test();
+
+        let outcome = drain_once(&mut pipeline, &mut writer, 4_096, now);
+        assert_eq!(outcome.ring_seals_popped, 3, "all three taken");
+        assert_eq!(pipeline.ring_len(), 0, "ring fully drained");
+
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn drain_once_reserves_for_what_waits_not_for_the_cap() {
+        // With the cap at 16,384 a mostly-empty ring would reserve ~2.4 MB
+        // ten times a second for a handful of seals. The reservation follows
+        // `ring_len` instead — asserted through behaviour, since capacity
+        // itself is not observable from here: a huge cap against one seal must
+        // still pop exactly one and drain the ring, with no panic and no
+        // re-allocation path taken.
+        let (spill, dlq) = temp_pair("cap-reserve");
+        let mut pipeline =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(8, spill.clone(), dlq.clone());
+        let now = jan1_noon_utc();
+        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0), now);
+        let mut writer = ShadowCandleWriter::for_test();
+
+        let outcome = drain_once(&mut pipeline, &mut writer, 16_384, now);
+        assert_eq!(outcome.ring_seals_popped, 1);
+        assert_eq!(pipeline.ring_len(), 0);
+
         cleanup(&spill, &dlq);
     }
 
