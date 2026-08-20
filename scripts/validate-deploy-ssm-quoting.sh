@@ -44,6 +44,35 @@ for f in "${FILES[@]}"; do
     echo "  Fix: use escaped double quotes \\\" for box-side strings; never a raw single quote." >&2
     rc=2
   fi
+
+  # 2026-08-20 INCIDENT CHECK — over-escaped box-side quotes.
+  #
+  # The deploy of f697016 FAILED on the box with:
+  #     awk: cmd. line:1: "/^MemTotal:/
+  #     awk: cmd. line:1:      ^ unterminated string
+  # and its failure path then STOPPED the app mid-session. The cause was not
+  # an apostrophe (the check above) but the ESCAPING LEVEL: the questdb-mem
+  # block added 2026-08-15 wrote \\\" (three backslashes + quote) where every
+  # working line in the same array writes \" (one backslash + quote). The
+  # extra pair survives into the JSON as a LITERAL backslash-quote, so the
+  # box-side program receives a stray " and dies.
+  #
+  # This is the same family as the 2026-07-02 rc=127 apostrophe bug the check
+  # above exists for — a quoting level that is wrong only on the box, so it is
+  # invisible until a real deploy runs. Every deploy silently failed and
+  # auto-stopped the app, which is why prod sat on a launch-time binary.
+  bad_esc=$(awk '
+    /--parameters '\''commands=\[/ && $0 !~ /\]'\''/ { inblock=1; next }
+    inblock && /^[[:space:]]*\]'\''/ { inblock=0; next }
+    inblock && /\\\\\\"/ { print FILENAME ":" NR ": " $0 }
+  ' "$f" || true)
+  if [ -n "$bad_esc" ]; then
+    echo "FAIL: over-escaped quote (\\\\\\\" ) inside SSM commands=[...] block:" >&2
+    echo "$bad_esc" >&2
+    echo "  The box receives a literal backslash-quote and the command dies." >&2
+    echo "  Fix: use \\\" (one backslash + quote), matching every working line." >&2
+    rc=2
+  fi
 done
 
 if [ "$rc" -eq 0 ]; then
