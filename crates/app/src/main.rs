@@ -2649,9 +2649,43 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
     use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
     use tickvault_storage::seal_writer_runner::SealWriterRunner;
 
-    // 1024 seals × 100 ms cycle = ~10,240 seals/sec sustained — well above
-    // the ~99K-seal IST-midnight burst absorbed across ~10 cycles.
-    const SEAL_MAX_DRAIN_PER_CYCLE: usize = 1_024;
+    // MEASURED AND RAISED 2026-08-20 — the old value was a live ceiling, not
+    // a safety margin.
+    //
+    // It read: "1024 seals × 100 ms cycle = ~10,240 seals/sec sustained —
+    // well above the ~99K-seal IST-midnight burst absorbed across ~10
+    // cycles." The burst arithmetic was right. The SUSTAINED rate was never
+    // checked, and it is the one that bites.
+    //
+    // Live evidence, prod box, 2026-08-20, 753 instruments × 24 timeframes:
+    //
+    //   submitted 893,775 | rows_written 351,232 | spilled 541,519
+    //   cycles 343        | flush_failures 0     | ring_len 598,976/600,000
+    //
+    // 343 × 1024 = 351,232 EXACTLY. Every cycle drained precisely the cap and
+    // not one seal more, for hours — the definition of a saturated limit.
+    // `flush_failures: 0` says QuestDB accepted everything it was offered, so
+    // the database was never the constraint; this constant was. Arrival was
+    // ~26,000 seals/sec against a 10,240/sec ceiling, and the ~61% that did
+    // not fit went to disk spill: nothing LOST (the ring→spill→DLQ chain held,
+    // `dropped: 0` throughout) but not queryable until the next boot replays
+    // it.
+    //
+    // 16,384 × 100 ms = ~163,840 seals/sec, roughly 6x the measured arrival.
+    // The point is not the multiple — it is that the binding limit becomes
+    // QuestDB, which REPORTS when it cannot keep up (`flush_failures`), rather
+    // than a constant that silently redirects to disk. A ceiling that cannot
+    // announce itself is the failure mode here, and the counter added below
+    // closes that half.
+    //
+    // Shutdown is unaffected and in fact faster: the 75s final-drain budget
+    // was sized at 1,024/cycle for a 600k worst case (~59s); at 16,384 the
+    // same 600k drains in ~3.7s.
+    //
+    // NOT claimed: that this holds at 25,000 instruments. Arrival scales with
+    // the universe, and 753 is 3% of the target. The next raise must be driven
+    // by the saturation counter below, not by another guess.
+    const SEAL_MAX_DRAIN_PER_CYCLE: usize = 16_384;
 
     match SealWriterRunner::new(questdb_config, SEAL_MAX_DRAIN_PER_CYCLE) {
         Ok(runner) => {
