@@ -545,6 +545,39 @@ pub fn select_contract_universe(
     out
 }
 
+/// Whether a selection is still WAITING on spot prices rather than finished.
+///
+/// # The failure this exists to stop
+///
+/// 2026-08-20, live: an app booted at 15:44 IST and its very first attach
+/// attempt read the price table sixteen seconds later, before QuestDB was
+/// serving. The price map came back empty, so no ladder could be built, so
+/// `stock_options` was **0** — and the attach then DIALED that selection and
+/// returned, because the retry loop's success test was "did we get any
+/// instruments at all?" and 2,536 futures and index options is not zero. One
+/// unlucky read at boot locked in a universe missing **every stock option**
+/// for the rest of the session, with no error anywhere: the report said
+/// `atm_window_reason = "no_ladders"` and was ignored, because nothing
+/// consumed it.
+///
+/// The distinction that makes this decidable is already recorded. A master
+/// that genuinely lists no stock options leaves
+/// [`ContractSelection::underlyings_without_spot`] at zero — there was
+/// nothing to price. A master that lists them while every one of them was
+/// refused for want of a price leaves it non-zero. So a non-zero count beside
+/// a zero selection is not "the market has no stock options today", it is
+/// "ask again once prices exist", and the two must never be answered the same
+/// way.
+///
+/// Deliberately NOT keyed on [`ContractSelection::atm_window_reason`]: the
+/// `"no_room"` case is also a zero-option outcome, and it is genuinely final
+/// — retrying cannot conjure envelope space. Only the price-source case is
+/// worth another attempt.
+#[must_use]
+pub fn stock_options_are_pending(selection: &ContractSelection) -> bool {
+    selection.stock_options == 0 && selection.underlyings_without_spot > 0
+}
+
 /// What happened to one attempted subscription.
 ///
 /// Three outcomes rather than a `bool`, because the two failure modes need
@@ -1490,6 +1523,83 @@ mod tests {
             sel.dropped_for_capacity, 1,
             "a truncation that is not counted is indistinguishable from a complete set"
         );
+    }
+
+    /// Both arms of `stock_options_are_pending` on hand-built values, so the
+    /// predicate is pinned independently of what `select_contract_universe`
+    /// happens to produce. The four fixtures below prove the same thing
+    /// end-to-end; this one proves the boolean itself cannot drift.
+    #[test]
+    fn test_stock_options_are_pending_reads_both_arms() {
+        let mut sel = ContractSelection::default();
+        sel.stock_options = 0;
+        sel.underlyings_without_spot = 0;
+        assert!(!stock_options_are_pending(&sel), "nothing to price");
+
+        sel.underlyings_without_spot = 208;
+        assert!(stock_options_are_pending(&sel), "priceable, unpriced");
+
+        sel.stock_options = 1;
+        assert!(!stock_options_are_pending(&sel), "some were selected");
+    }
+
+    /// The live 2026-08-20 shape: a master full of stock options, not one
+    /// priced, so nothing was selected. This must read as PENDING, not done.
+    #[test]
+    fn a_priceless_stock_option_master_reads_as_pending_not_finished() {
+        let rows = stock_ladder("RELIANCE");
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.atm_window_reason, "no_ladders");
+        assert!(
+            stock_options_are_pending(&sel),
+            "options exist and none could be priced — the attach must ask again"
+        );
+    }
+
+    /// The opposite reading, and the one that keeps the fix from hanging: a
+    /// master with no stock options at all is FINISHED, not pending. Without
+    /// this the retry loop would wait forever for options that do not exist.
+    #[test]
+    fn a_master_with_no_stock_options_is_finished_not_pending() {
+        let rows = vec![contract(
+            7,
+            InstrumentClass::IndexFuture,
+            "NSE",
+            "NIFTY",
+            2026_08_28,
+            0,
+            OptionLeg::None,
+        )];
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.underlyings_without_spot, 0);
+        assert!(!stock_options_are_pending(&sel));
+    }
+
+    /// A successful selection is never pending — the obvious direction, pinned
+    /// so a future edit cannot make the predicate fire on the happy path and
+    /// stall every attach.
+    #[test]
+    fn a_priced_selection_is_never_pending() {
+        let rows = stock_ladder("RELIANCE");
+        let sel = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 25_000);
+        assert!(sel.stock_options > 0, "the fixture must actually select");
+        assert!(!stock_options_are_pending(&sel));
+    }
+
+    /// `no_room` is a FINAL zero, not a pending one: retrying cannot create
+    /// envelope space, so the attach must dial what it has rather than spin.
+    /// This is why the predicate reads the WITHOUT-SPOT count and never
+    /// `atm_window_reason` — both reasons yield zero options, and only one of
+    /// them is worth asking again about.
+    #[test]
+    fn a_no_room_selection_is_final_not_pending() {
+        let rows = stock_ladder("RELIANCE");
+        let sel = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 0);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.underlyings_without_spot, 0, "it WAS priced");
+        assert!(!stock_options_are_pending(&sel));
     }
 
     #[test]
