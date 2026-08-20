@@ -4061,6 +4061,7 @@ pub fn ymd_from_ist_date(date_ist: &str) -> u32 {
     y * 10_000 + m * 100 + d
 }
 
+#[allow(clippy::too_many_arguments)] // APPROVED: private late-attach task over the boot scope's owned state — bundling would hide which of the two RING BUDGETS each socket gets, and that split is load-bearing (groww_contract_1m_boot precedent)
 async fn attach_depth_when_available(
     mut pool: PoolSupervisor,
     questdb: tickvault_common::config::QuestDbConfig,
@@ -4083,6 +4084,10 @@ async fn attach_depth_when_available(
     // would be asked for a sixth. The 16-connection lock is arithmetic, not a
     // hope, and this is the term that keeps it so.
     main_feed_connections_used: usize,
+    // Owned, not borrowed: this runs in its own task, hours after boot.
+    ws_audit_tx: tokio::sync::mpsc::Sender<
+        tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
+    >,
 ) {
     let mut attempts: u32 = 0;
     let started = Instant::now();
@@ -4190,6 +4195,7 @@ async fn attach_depth_when_available(
                         &frame_tx,
                         &main_feed_budget,
                         &depth_budget,
+                        Some(&ws_audit_tx),
                     );
                     info!(
                         dialed,
@@ -4249,6 +4255,9 @@ fn dial_planned_connections(
     frame_tx: &tokio::sync::mpsc::Sender<CapturedFrame>,
     main_feed_budget: &Arc<RingByteBudget>,
     depth_budget: &Arc<RingByteBudget>,
+    ws_audit_tx: Option<
+        &tokio::sync::mpsc::Sender<tickvault_core::websocket::pool_supervisor::WsLifecycleEvent>,
+    >,
 ) -> usize {
     let mut dialed = 0usize;
     for planned in plan.connections {
@@ -4288,7 +4297,7 @@ fn dial_planned_connections(
             DhanEndpointType::MainFeed => main_feed_budget,
             _ => depth_budget,
         };
-        let sink = Arc::new(WalRingSink::new(
+        let sink = WalRingSink::new(
             Arc::clone(spill),
             frame_tx.clone(),
             Arc::clone(budget),
@@ -4298,7 +4307,22 @@ fn dial_planned_connections(
             // across endpoints, so labelling by them would merge main-feed
             // socket 0 with depth-20 socket 0 and hide which one is sick.
             planned.slot.global_index,
-        ));
+        );
+        // Forensic lifecycle audit, per socket (2026-08-20).
+        //
+        // Until now `ws_event_audit` had exactly ONE production producer — the
+        // order-update socket — so the table covered 1 of the 16 authorized
+        // connections. It was not empty, which is what made it dangerous: an
+        // operator asking "did any feed socket drop today?" got rows back, saw
+        // no live-feed rows, and read that as no drops rather than as not
+        // recorded. Counters and alarms did cover the reconnect and park
+        // transitions, so this closed a forensics gap rather than a blind spot
+        // — but "which socket, when, and why" had no queryable answer.
+        let sink = match ws_audit_tx {
+            Some(tx) => sink.with_audit(tx.clone()),
+            None => sink,
+        };
+        let sink = Arc::new(sink);
         let guard = planned.guard;
         // Count it alive BEFORE the task starts, so the gauge can never read
         // high because a spawn lost a race with its own decrement.
@@ -4811,6 +4835,16 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         Arc::clone(&params.feed_health),
     ));
 
+    // ---- socket lifecycle audit -------------------------------------------
+    //
+    // ONE consumer for all fifteen market-data sockets, spawned before the
+    // first dial so no transition can arrive before a receiver exists. Built
+    // unconditionally for the same reason `depth_ingest` above is: the depth
+    // sockets attach LATER, and a boot-time conditional would leave them
+    // unaudited for the whole session while looking deliberate.
+    let ws_audit_tx =
+        crate::ws_audit_consumer::spawn_live_feed_lifecycle_audit(params.questdb.clone());
+
     // ---- the sockets -------------------------------------------------------
     //
     // MAIN-FEED-DIAL-SITE: a deliberate, greppable anchor. Two source-order
@@ -4829,6 +4863,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         &frame_tx,
         &main_feed_budget,
         &depth_budget,
+        Some(&ws_audit_tx),
     );
 
     // Depth late-attach. Depth's instrument set is derived from
@@ -4861,6 +4896,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 params.main_feed_instruments.len(),
                 usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS),
             ),
+            ws_audit_tx.clone(),
         ));
     }
 

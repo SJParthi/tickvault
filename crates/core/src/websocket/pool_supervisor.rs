@@ -1018,6 +1018,72 @@ pub enum FrameSinkOutcome {
 pub trait FrameSink: Send + Sync + 'static {
     /// Accepts one raw frame. MUST NOT block, allocate, or await.
     fn accept(&self, frame: Bytes) -> FrameSinkOutcome;
+
+    /// Reports a socket LIFECYCLE transition — connected, lost, parked.
+    ///
+    /// Default is a no-op, so every existing implementation and every call
+    /// site is unchanged by construction.
+    ///
+    /// # Why this hangs off the sink rather than a new parameter
+    ///
+    /// `run_connection` is generic over four type parameters and is called
+    /// from tests, benches and the live stack. Threading an audit channel
+    /// through it would touch every one of those for a concern none of them
+    /// has. The sink is ALREADY the one app-owned object the supervisor
+    /// holds, and it already knows which socket it serves — so it is the
+    /// natural place to hang a per-socket side-channel.
+    ///
+    /// # Why this may allocate when `accept` may not
+    ///
+    /// `accept` runs per FRAME, thousands per second, between two `recv()`
+    /// calls — the window in which the automatic pong is not being emitted.
+    /// This runs per socket LIFECYCLE EVENT: a handful of times a day, and
+    /// never while a frame is waiting. It is the same cold-path budget the
+    /// order-update socket's audit emit has had since 2026-07-05.
+    ///
+    /// Implementations must still not block or await. The house pattern is a
+    /// `try_send` onto a bounded channel: a full channel costs a forensic
+    /// row, never a stalled socket.
+    fn on_lifecycle(
+        &self,
+        _kind: tickvault_common::ws_event_types::WsEventKind,
+        _reason: &'static str,
+    ) {
+    }
+}
+
+/// One socket lifecycle transition, WITHOUT a timestamp.
+///
+/// # Why there is no timestamp on this
+///
+/// `test_pool_supervisor_source_never_reads_the_wall_clock` bans every
+/// wall-clock call in this file, because the supervisor's ladder, its token
+/// expiry and its backoff are all monotonic — an NTP step must be unable to
+/// expire all sixteen sockets at once. That ban is a blanket one on purpose,
+/// so nobody has to re-litigate it per call site, and an audit row's
+/// timestamp is not special enough to earn a carve-out.
+///
+/// So the socket reports WHAT happened and the app crate — which already
+/// reads the wall clock for exactly this, and already owns the IST offset
+/// convention — stamps WHEN. Every field here is `Copy`, so building one
+/// allocates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WsLifecycleEvent {
+    /// Which endpoint's pool the socket belongs to. The row's `ws_type` is
+    /// derived from THIS, never from the sink's `ws_type` field — that one is
+    /// the WAL record discriminant and reads `LiveFeed` for all fifteen
+    /// market-data sockets, so a row built from it would file a depth-200
+    /// park under the main feed.
+    pub endpoint: DhanEndpointType,
+    /// The socket's own index, so one sick connection is not averaged away
+    /// by its siblings.
+    pub connection_index: u8,
+    /// Connected / Disconnected.
+    pub kind: tickvault_common::ws_event_types::WsEventKind,
+    /// A fixed machine cause slug. `&'static str` deliberately: it keeps this
+    /// type `Copy`, and it means no caller can put unbounded vendor text into
+    /// a forensic row.
+    pub reason: &'static str,
 }
 
 /// One captured frame and the sequence it was stamped with at the read
@@ -1205,6 +1271,12 @@ pub struct WalRingSink {
     wal_dropped: metrics::Counter,
     ring_full: metrics::Counter,
     ring_bytes_full: metrics::Counter,
+    /// Optional forensic side-channel for socket lifecycle events.
+    ///
+    /// `None` by default and set only by [`WalRingSink::with_audit`], so a
+    /// sink built the old way behaves exactly as before — no channel, no
+    /// rows, no cost.
+    audit_tx: Option<tokio::sync::mpsc::Sender<WsLifecycleEvent>>,
 }
 
 impl WalRingSink {
@@ -1246,9 +1318,21 @@ impl WalRingSink {
             wal_dropped: metrics::counter!(WAL_DROP_METRIC, "endpoint" => endpoint_label),
             ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
             ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
+            audit_tx: None,
         };
         sink.pre_register();
         sink
+    }
+
+    /// Attaches the `ws_event_audit` side-channel to this socket.
+    ///
+    /// A builder rather than a `new` parameter so every existing construction
+    /// — tests, benches, the DHAT gates — is untouched, and opting in is one
+    /// visible line at the boot site.
+    #[must_use]
+    pub fn with_audit(mut self, tx: tokio::sync::mpsc::Sender<WsLifecycleEvent>) -> Self {
+        self.audit_tx = Some(tx);
+        self
     }
 
     /// Publishes a zero on every loss series this sink owns.
@@ -1273,6 +1357,32 @@ impl WalRingSink {
 }
 
 impl FrameSink for WalRingSink {
+    fn on_lifecycle(
+        &self,
+        kind: tickvault_common::ws_event_types::WsEventKind,
+        reason: &'static str,
+    ) {
+        let Some(tx) = self.audit_tx.as_ref() else {
+            return;
+        };
+        // No allocation and no clock read: every field is `Copy`. The app
+        // crate stamps the time and widens this into the audit row.
+        let event = WsLifecycleEvent {
+            endpoint: self.endpoint,
+            connection_index: self.connection_index,
+            kind,
+            reason,
+        };
+        // `try_send`, never `send`: a slow consumer may cost a forensic row,
+        // and must never stall a socket. The drop is COUNTED rather than
+        // swallowed — a silently lost audit row is the same false-OK the
+        // whole table exists to prevent.
+        if tx.try_send(event).is_err() {
+            metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => "live_feed_lifecycle")
+                .increment(1);
+        }
+    }
+
     fn accept(&self, frame: Bytes) -> FrameSinkOutcome {
         // Stamped FIRST, before the WAL append and before the budget check.
         // This is the frame's arrival instant; every microsecond of our own
@@ -1610,6 +1720,18 @@ where
         match action {
             SupervisorAction::Park { reason } => {
                 socket.close().await;
+                // A park is PERMANENT — nothing re-dials this socket, and its
+                // shard of the universe stops delivering for the rest of the
+                // session. Until 2026-08-20 that fact reached a log line and a
+                // counter and nothing queryable: `ws_event_audit` had exactly
+                // one production producer (the order-update socket), so an
+                // operator asking "did any feed socket drop today?" got rows
+                // back, saw no live-feed rows, and read that as no drops
+                // rather than as not recorded.
+                sink.on_lifecycle(
+                    tickvault_common::ws_event_types::WsEventKind::Disconnected,
+                    reason.as_str(),
+                );
                 info!(
                     endpoint,
                     pool_index,
@@ -1636,6 +1758,14 @@ where
             SupervisorAction::SleepThenDial { delay_ms } => {
                 socket.close().await;
                 guard.mark_lost();
+                // `mark_lost` is the honest edge: the subscription is gone and
+                // will have to be re-sent. Recorded BEFORE the sleep so the
+                // row's timestamp is the moment we lost the socket, not the
+                // moment we got around to re-dialing.
+                sink.on_lifecycle(
+                    tickvault_common::ws_event_types::WsEventKind::Disconnected,
+                    "backoff_redial",
+                );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
             }
@@ -1643,6 +1773,10 @@ where
             SupervisorAction::RefreshTokenThenDial { delay_ms } => {
                 socket.close().await;
                 guard.mark_lost();
+                sink.on_lifecycle(
+                    tickvault_common::ws_event_types::WsEventKind::Disconnected,
+                    "token_refresh_redial",
+                );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 refresh_token().await;
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
@@ -1669,6 +1803,16 @@ where
                     continue;
                 }
                 guard.mark_confirmed();
+                // CONNECTED means subscribed-and-acked, not merely dialed.
+                // The 2026-08-12 blackout is why: twelve sockets dialed and
+                // every one died on the handshake, so a row written at dial
+                // time would have recorded twelve connections that never
+                // carried a byte. This edge is the first moment the socket can
+                // actually deliver.
+                sink.on_lifecycle(
+                    tickvault_common::ws_event_types::WsEventKind::Connected,
+                    "subscribe_acked",
+                );
                 action = supervisor.on_event(ConnEvent::SubscribeAcked, Instant::now());
                 // Drain until something changes.
                 action = drain(&mut socket, &mut supervisor, sink.as_ref(), action).await;
@@ -2937,6 +3081,140 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_audit_is_silent_until_opted_in_and_names_its_own_endpoint() {
+        // Two properties in one test because they are the same property from
+        // both sides: a sink built the old way must emit NOTHING (so every
+        // existing caller, test and bench is unchanged by construction), and
+        // an opted-in sink must report the endpoint it actually serves.
+        //
+        // The endpoint half is the one with teeth. The sink's `ws_type` field
+        // is `LiveFeed` for ALL fifteen market-data sockets — it is the WAL
+        // record discriminant, not the socket's identity — so a consumer that
+        // built the audit row from it would file a depth-200 park under the
+        // main feed and leave the table unable to answer which pool went dark,
+        // which is the only question it exists to answer. Carrying the
+        // ENDPOINT on the event is what makes that mistake unavailable
+        // downstream.
+        use tickvault_common::ws_event_types::WsEventKind;
+
+        let dir = wal_dir("lifecycle");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let budget = std::sync::Arc::new(RingByteBudget::new(usize::MAX));
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+
+        let plain = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            frames_tx.clone(),
+            std::sync::Arc::clone(&budget),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+        // No channel attached: the default path must not panic and must not
+        // need one.
+        plain.on_lifecycle(WsEventKind::Disconnected, "no_channel_attached");
+
+        for endpoint in [
+            DhanEndpointType::MainFeed,
+            DhanEndpointType::Depth20,
+            DhanEndpointType::Depth200,
+        ] {
+            let (audit_tx, mut audit_rx) = tokio::sync::mpsc::channel::<WsLifecycleEvent>(4);
+            let sink = WalRingSink::new(
+                std::sync::Arc::clone(&spill),
+                frames_tx.clone(),
+                std::sync::Arc::clone(&budget),
+                // Deliberately the SAME ws_type for every endpoint — that is
+                // exactly the real shape, and the reason the row must not be
+                // built from this field.
+                WsType::LiveFeed,
+                endpoint,
+                3,
+            )
+            .with_audit(audit_tx);
+
+            sink.on_lifecycle(WsEventKind::Disconnected, "park_fatal");
+            let event = audit_rx
+                .try_recv()
+                .expect("an opted-in sink must emit the lifecycle event");
+            assert_eq!(
+                event.endpoint, endpoint,
+                "the event must name the ENDPOINT, not the sink's WAL \
+                 discriminant — otherwise every socket files under one label \
+                 and the audit cannot say which pool went dark"
+            );
+            assert_eq!(event.kind, WsEventKind::Disconnected);
+            assert_eq!(event.connection_index, 3, "the socket's own index");
+            assert_eq!(event.reason, "park_fatal");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_supervisor_reports_connect_and_loss_to_the_sink() {
+        // A source pin, because the emit points are inside an async loop whose
+        // arms need a live socket and a real supervisor to reach. What must
+        // never silently disappear is the CALL — the sink's own emit is unit
+        // tested above, and a sink nobody tells about a park records nothing
+        // while looking wired.
+        //
+        // CONNECTED is anchored on the subscribe-ack arm on purpose. The
+        // 2026-08-12 blackout is the reason: twelve sockets dialed and every
+        // one died on the handshake, so a row written at dial time would have
+        // recorded twelve connections that never carried a byte.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        let park = production
+            // The match ARM, not the enum construction at `on_event`'s return
+            // — anchoring on the bare pattern matched that one first and
+            // captured the wrong span. A guard that fails for a reason
+            // unrelated to what it protects teaches the next reader to delete
+            // it, so the anchor has to be the thing itself.
+            .split("SupervisorAction::Park { reason } => {")
+            .nth(1)
+            .and_then(|s| s.split("return ConnectionExit::Parked").next())
+            .expect("the park arm must exist");
+        assert!(
+            park.contains("sink.on_lifecycle"),
+            "a park is PERMANENT — nothing re-dials that socket. It must reach \
+             the audit, not only a log line and a counter:\n{park}"
+        );
+
+        let subscribe = production
+            .split("guard.mark_confirmed();")
+            .nth(1)
+            .and_then(|s| s.split("action = supervisor.on_event").next())
+            .expect("the subscribe-ack arm must exist");
+        assert!(
+            subscribe.contains("sink.on_lifecycle"),
+            "CONNECTED must be recorded at subscribe-ack — the first instant \
+             the socket can actually deliver:\n{subscribe}"
+        );
+
+        let redial_arms = production.matches("guard.mark_lost();").count();
+        let audited_redials = production
+            .split("guard.mark_lost();")
+            .skip(1)
+            .filter(|s| {
+                s.split("action = supervisor.on_event")
+                    .next()
+                    .unwrap_or("")
+                    .contains("sink.on_lifecycle")
+            })
+            .count();
+        assert_eq!(
+            audited_redials, redial_arms,
+            "every arm that marks the subscription lost is a real disconnect \
+             and must be audited — {audited_redials} of {redial_arms} are"
+        );
     }
 
     #[test]
