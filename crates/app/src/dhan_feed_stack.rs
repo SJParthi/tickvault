@@ -4413,8 +4413,28 @@ async fn attach_depth_when_available(
         // IST midnight, and a hoisted date would then query yesterday forever.
         let today_date = crate::dhan_universe::today_ist_date();
         let today_nanos = crate::dhan_universe::ist_midnight_nanos(&today_date);
-        let selection =
-            crate::dhan_depth_universe::load_depth_universe(&questdb, today_nanos).await;
+        // Depth prefers the DAILY CONTRACT ARTIFACT over the option chain.
+        //
+        // Both yield the same thing — a contract `security_id` with a strike,
+        // an expiry and a leg — but they become available three minutes
+        // apart. The chain's first publish is compile-time asserted to
+        // 09:16:00 IST; the artifact is on disk before 08:30. Preferring the
+        // artifact is what lets depth-20 and depth-200 carry data from the
+        // 09:15 open rather than from 09:16:30.
+        //
+        // The chain remains the FALLBACK, not a rival: the artifact is
+        // written by a separate daily rider, and if that rider had a bad
+        // morning, late depth beats no depth.
+        let selection = match crate::dhan_depth_universe::load_depth_universe_from_master(
+            &questdb,
+            &today_date,
+            ymd_from_ist_date(&today_date),
+        )
+        .await
+        {
+            Some(from_artifact) => from_artifact,
+            None => crate::dhan_depth_universe::load_depth_universe(&questdb, today_nanos).await,
+        };
 
         // The contract universe rides the SAME retry loop, and that is not a
         // convenience — both wait on evidence that only exists after the open
