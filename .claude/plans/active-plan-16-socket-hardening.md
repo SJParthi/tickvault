@@ -1797,3 +1797,38 @@ specific to this item:
   proved itself by refusing the change until the cost note was written.
 - **O(1)** — four new table rows, each with REACHABILITY stated, because a
   complexity number without reachability is not a decision.
+
+### ITEM 27 rider 3 — CI caught the coverage dilution, and the fix is tests
+
+`Coverage & Perf` failed on head `659c2499`: **storage 90.03% against a 90.1%
+floor**, short by 0.07 percentage points. The cause is exactly what a new
+621-line module does to a ratcheted per-crate average when its async I/O paths
+have no tests: `tick_spill_replay`'s success arm, its refuse arm, the
+supervisor and the error-kind mapper were all uncovered.
+
+**The floor was NOT lowered.** `quality/crate-coverage-thresholds.toml` records
+that floors only ever move up, and lowering one to admit undertested code is the
+ratchet-weakening move this repo has explicitly refused before. Six tests were
+added instead.
+
+The one that mattered is the SUCCESS arm — the arm that truncates the file and
+reports bytes as recovered. It is tested against a real `TcpListener` answering
+`204 No Content`, not a mock: a mock would prove only that the mock was called,
+whereas twenty lines of raw socket exercise the real `reqwest` round trip, the
+real status check and the real truncate, with no QuestDB and no new dependency.
+The others cover a 4xx refusal (bytes arrived and were rejected — the file must
+still survive), the stop-the-round rule (the SECOND file must not even be
+attempted), the multi-file drain, both reachable `describe_send_error` kinds via
+genuine connect-refused and timeout failures, and the supervisor's entry path.
+
+**Measured locally rather than pushed speculatively.** `cargo-llvm-cov` was
+installed for the purpose: `tick_spill_replay.rs` now sits at **387/428 =
+90.42%**, above the crate's own 90.1% floor — so the module lifts the average
+instead of diluting it. `lines.count` is invariant to which tests run, so the
+crate denominator (~21,759) is the same figure CI used: clearing 90.1% needed
+about **+15** covered lines, and the six tests cover roughly **60**.
+
+Honest note on the local measurement: the full lib+tests coverage run could not
+complete — the instrumented build tree exhausted the container's disk twice.
+The per-file number above is from the lib-only run and is the decisive one; the
+crate total is derived, not observed. CI is the confirmation.
