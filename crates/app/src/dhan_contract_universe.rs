@@ -222,6 +222,34 @@ pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<Vec<ContractRow>
 /// tracked; this one is what the lane actually subscribes.
 pub const FULL_CHAIN_INDEX_UNDERLYINGS: [&str; 2] = ["NIFTY", "BANKNIFTY"];
 
+/// Percentage of stock-option underlyings that must be PRICED before a
+/// contract selection is treated as final.
+///
+/// 60 sits deliberately between the two failure modes it separates.
+///
+/// Too low is what shipped: at one priced underlying out of ~208 (0.5%) the
+/// selection closed and every other stock lost its options for the day. Too
+/// high never dials at all on a thin morning — the illiquid tail of the F&O
+/// list can take minutes to print, and a 95% bar would spend the entire
+/// allowance waiting for names nobody trades. 60% means the liquid majority
+/// has printed, which is what "at-the-money is locatable" actually requires.
+///
+/// It is NOT a hard gate. The attach ANDs `stock_options_are_pending` with
+/// `!out_of_time`, so a morning that never reaches quorum still dials whatever
+/// it has at the deadline rather than nothing.
+///
+/// UNMEASURED, and stated as such: the real distribution of how many F&O
+/// underlyings have printed by 09:15:30 is not known. The first session after
+/// this lands should be read against the `underlyings_total` /
+/// `underlyings_without_spot` fields on the `contract universe resolved` line,
+/// and this number re-tuned from that evidence rather than defended.
+///
+/// Lives HERE rather than in `crates/common/src/constants.rs` deliberately: it
+/// has exactly one reader, and `testing-scope.md` escalates any `crates/common`
+/// edit to a full-workspace run — a 10-15 minute cost for a knob no other crate
+/// can see.
+pub const STOCK_OPTION_PRICING_QUORUM_PERCENT: usize = 60;
+
 /// What a contract selection produced, and everything it refused.
 ///
 /// Every refusal is a counted field rather than a silent drop. A selection
@@ -273,6 +301,16 @@ pub struct ContractSelection {
     /// Underlyings whose options were REFUSED because no live spot price was
     /// available to locate at-the-money. Never guessed.
     pub underlyings_without_spot: usize,
+    /// Stock underlyings the master listed an option chain for, priced or not.
+    ///
+    /// The DENOMINATOR of the pricing quorum, and the number
+    /// [`Self::underlyings_without_spot`] alone cannot supply: 207 unpriced out
+    /// of 208 and 207 unpriced out of 20,000 share a numerator and are opposite
+    /// situations. Without it the pending predicate could only ask "is anything
+    /// unpriced?", which a single priced underlying answers — and that is
+    /// exactly how one liquid stock printing at 09:15:30 used to close the
+    /// selection for every other stock in the master.
+    pub stock_option_underlyings: usize,
     /// Rows refused for carrying no usable expiry at all.
     pub refused_no_expiry: usize,
     /// Rows refused for having ALREADY expired.
@@ -589,9 +627,44 @@ pub fn select_contract_universe(
 /// `"no_room"` case is also a zero-option outcome, and it is genuinely final
 /// — retrying cannot conjure envelope space. Only the price-source case is
 /// worth another attempt.
+/// # The 2026-08-21 widening: a QUORUM, not "anything at all"
+///
+/// This used to read `stock_options == 0 && underlyings_without_spot > 0`.
+/// Every ladder under the fitted window pushes options, so ONE priced
+/// underlying made `stock_options > 0` and the predicate went false. The
+/// attach then dialed and returned; the spot top-up is a one-shot budget and
+/// there is no second pass — so every stock that had not printed at that
+/// instant lost its options for the whole session. At 09:15:30 only the liquid
+/// names have traded, which is how a few thousand of the ~22,440 authorized
+/// strikes could be locked in and the rest silently dropped.
+///
+/// It stays FAIL-OPEN: the caller ANDs this with `!out_of_time`, so a morning
+/// that never reaches quorum still dials the coverage it earned rather than
+/// nothing.
 #[must_use]
 pub fn stock_options_are_pending(selection: &ContractSelection) -> bool {
-    selection.stock_options == 0 && selection.underlyings_without_spot > 0
+    // Nothing to price is FINISHED, not pending. Without this arm a master
+    // carrying no stock options at all would hold the retry loop to the
+    // deadline every single day.
+    if selection.stock_option_underlyings == 0 {
+        return false;
+    }
+    // Everything the master offered was priced. Whatever happened next —
+    // including `no_room`, which retrying cannot fix — is final.
+    if selection.underlyings_without_spot == 0 {
+        return false;
+    }
+    let priced = selection
+        .stock_option_underlyings
+        .saturating_sub(selection.underlyings_without_spot);
+    // Integer cross-multiply, never a float ratio. A percentage computed in
+    // f64 and compared for ordering ties differently at the boundary depending
+    // on rounding, and this decides whether ~22,000 contracts are subscribed
+    // for the day.
+    priced.saturating_mul(100)
+        < selection
+            .stock_option_underlyings
+            .saturating_mul(STOCK_OPTION_PRICING_QUORUM_PERCENT)
 }
 
 /// What happened to one attempted subscription.
@@ -723,6 +796,9 @@ fn build_ladders<'a>(
     out: &mut ContractSelection,
 ) -> Vec<Ladder<'a>> {
     let mut ladders = Vec::with_capacity(stock_opt.len());
+    // Recorded BEFORE any refusal, so the pricing quorum's denominator is the
+    // master's full ask rather than whatever happened to survive.
+    out.stock_option_underlyings = stock_opt.len();
     // Sorted so the selection is deterministic regardless of hash order.
     let mut underlyings: Vec<&&str> = stock_opt.keys().collect();
     underlyings.sort_unstable();
@@ -1034,6 +1110,7 @@ pub async fn load_contract_universe(
         stock_options = selection.stock_options,
         atm_window = selection.atm_window_used,
         atm_window_reason = selection.atm_window_reason,
+        underlyings_total = selection.stock_option_underlyings,
         without_spot = selection.underlyings_without_spot,
         dropped_for_capacity = selection.dropped_for_capacity,
         "contract universe resolved"
@@ -1548,15 +1625,78 @@ mod tests {
     #[test]
     fn test_stock_options_are_pending_reads_both_arms() {
         let mut sel = ContractSelection::default();
+
+        // Nothing to price at all is FINISHED, never pending — otherwise a
+        // master with no stock options holds the loop to the deadline daily.
+        sel.stock_option_underlyings = 0;
         sel.stock_options = 0;
         sel.underlyings_without_spot = 0;
         assert!(!stock_options_are_pending(&sel), "nothing to price");
 
+        // A real master with nothing priced yet.
+        sel.stock_option_underlyings = 208;
         sel.underlyings_without_spot = 208;
         assert!(stock_options_are_pending(&sel), "priceable, unpriced");
 
+        // ONE priced underlying out of 208.
+        //
+        // This arm used to assert NOT pending, and in doing so it ENCODED the
+        // 2026-08-21 defect: a single liquid stock printing at 09:15:30 closed
+        // the selection, and every stock that had not yet traded lost its
+        // options for the whole session with no second pass. The assertion is
+        // inverted here deliberately — under the quorum this is still pending.
         sel.stock_options = 1;
-        assert!(!stock_options_are_pending(&sel), "some were selected");
+        sel.underlyings_without_spot = 207;
+        assert!(
+            stock_options_are_pending(&sel),
+            "one priced underlying out of 208 must NOT close the selection — that is precisely \
+             the defect the quorum exists to fix"
+        );
+
+        // 125 of 208 priced = 60.1%, just over the quorum.
+        sel.underlyings_without_spot = 83;
+        assert!(
+            !stock_options_are_pending(&sel),
+            "the quorum is a FLOOR, not 'all' — waiting for the illiquid tail would spend the \
+             whole allowance on names nobody trades"
+        );
+
+        // Everything priced: final, whatever happened next.
+        sel.underlyings_without_spot = 0;
+        assert!(!stock_options_are_pending(&sel), "all priced");
+    }
+
+    /// The quorum boundary, exactly. Integer cross-multiply rather than a
+    /// float ratio, so this cannot tie differently depending on rounding.
+    #[test]
+    fn the_quorum_boundary_is_inclusive_at_the_percentage() {
+        let mut sel = ContractSelection::default();
+        sel.stock_option_underlyings = 10;
+        sel.stock_options = 1;
+
+        sel.underlyings_without_spot = 4; // 6 priced = 60% exactly
+        assert!(
+            !stock_options_are_pending(&sel),
+            "exactly at the quorum must be FINISHED, not pending"
+        );
+
+        sel.underlyings_without_spot = 5; // 5 priced = 50%
+        assert!(
+            stock_options_are_pending(&sel),
+            "one under the quorum must still hold"
+        );
+    }
+
+    /// A selection that ran out of envelope room is FINAL. Retrying cannot
+    /// conjure connection slots, so holding for it would burn the allowance
+    /// and then dial the same thing anyway.
+    #[test]
+    fn a_no_room_selection_is_not_held_by_the_quorum() {
+        let mut sel = ContractSelection::default();
+        sel.stock_option_underlyings = 208;
+        sel.underlyings_without_spot = 0;
+        sel.atm_window_reason = "no_room";
+        assert!(!stock_options_are_pending(&sel));
     }
 
     /// The live 2026-08-20 shape: a master full of stock options, not one
