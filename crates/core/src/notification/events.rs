@@ -450,8 +450,6 @@ pub enum NotificationEvent {
     TfConsistencySummary {
         /// The Dhan trading day verified, `YYYY-MM-DD` IST.
         dhan_date_ist: String,
-        /// The Groww trading day verified (previous trading day), IST.
-        groww_date_ist: String,
         /// Instruments examined across both passes.
         instruments: u64,
         /// Higher-timeframe candles present on BOTH sides and compared.
@@ -492,42 +490,6 @@ pub enum NotificationEvent {
         detail: String,
     },
 
-    /// Daily 15:47 IST Dhan↔Groww spot cross-broker comparator summary
-    /// (operator 2026-07-17; SPOT-XVERIFY-01/02). Neither feed is ground
-    /// truth — a divergence-TREND signal.
-    SpotCrossverifySummary {
-        /// The trading day compared, `YYYY-MM-DD` IST.
-        trading_date_ist: String,
-        /// Indices seen across both feeds.
-        indices: u64,
-        /// Minutes present on BOTH feeds and compared.
-        minutes_compared: u64,
-        /// Field-cells where Dhan and Groww OHLC disagree beyond tolerance.
-        mismatches: u64,
-        /// Minutes present in Groww only (Dhan absent).
-        missing_dhan: u64,
-        /// Minutes present in Dhan only (Groww absent).
-        missing_groww: u64,
-        /// Rows outside [09:15, 15:30) IST — recorded, not classified.
-        out_of_session: u64,
-        /// True when any query/flush/budget leg degraded.
-        degraded: bool,
-        /// True when findings exceeded the stored-detail cap.
-        truncated: bool,
-        /// Stable verdict: `clean` / `diverged` / `partial` / `no_data` /
-        /// `blind` / `degraded`.
-        status_label: String,
-        /// Fix E severity gating (operator 2026-07-17): `true` = every
-        /// divergence is high/low-only sampling skew within the
-        /// `[spot_crossverify] noise_threshold_paise` band, nothing
-        /// missing, full coverage → Info trend line, never a High page.
-        noise_only: bool,
-        /// The day's biggest single delta in paise (0 = nothing diverged).
-        noise_max_paise: i64,
-        /// Up to 3 plain-English worst offenders (rupees, 12-hour IST).
-        top_detail: Vec<String>,
-    },
-
     /// The daily spot cross-verify TASK died before producing its summary.
     /// High so the absent verdict is impossible to miss. NOT fired on
     /// graceful shutdown/cancellation.
@@ -558,28 +520,6 @@ pub enum NotificationEvent {
         failed_minutes: u32,
     },
 
-    /// Groww per-minute spot 1m REST leg (operator grant 2026-07-13): the
-    /// per-minute pull of the just-closed minute's official index candle
-    /// from the SECOND broker (Groww) has fully failed for several minutes
-    /// in a row. Fires ONCE per failing episode (edge-triggered, Rule 4);
-    /// re-armed only after a successful minute. Severity::High.
-    GrowwSpot1mFetchDegraded {
-        /// How many minutes in a row have fully failed.
-        consecutive_failed_minutes: u32,
-        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
-        minute_ist: String,
-    },
-
-    /// The Groww per-minute index candle pull RECOVERED after a failing
-    /// episode (falling edge — one Info ping; the missing minutes stay
-    /// absent until re-pulled, never fabricated).
-    GrowwSpot1mFetchRecovered {
-        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
-        minute_ist: String,
-        /// How many minutes had fully failed during the episode.
-        failed_minutes: u32,
-    },
-
     /// Per-SID persistent-empty detector (operator scope addition
     /// 2026-07-13, relayed via the coordinator session — the INDIA VIX
     /// live-probe companion): ONE index accumulated N consecutive
@@ -603,127 +543,6 @@ pub enum NotificationEvent {
         symbol: String,
         /// How many counted minutes the index went unserved.
         not_served_minutes: u32,
-    },
-
-    /// Groww per-minute option-chain REST leg (operator grant 2026-07-13,
-    /// PR-3 of the Groww per-minute REST plan): the per-minute Groww
-    /// option-chain snapshot has fully failed for several minutes in a row
-    /// (edge-triggered ONCE per episode, Rule 4; re-armed only after a
-    /// successful minute). Severity::High.
-    GrowwChain1mFetchDegraded {
-        /// How many minutes in a row have fully failed.
-        consecutive_failed_minutes: u32,
-        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
-        minute_ist: String,
-    },
-
-    /// The Groww per-minute option-chain snapshot RECOVERED after a
-    /// failing episode (falling edge — one Info ping; the missing minutes
-    /// stay absent until re-pulled, never fabricated).
-    GrowwChain1mFetchRecovered {
-        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
-        minute_ist: String,
-        /// How many minutes had fully failed during the episode.
-        failed_minutes: u32,
-    },
-
-    /// Per-underlying not-served detector on the Groww chain leg
-    /// (2026-07-14 — the NIFTY expiry-day vendor-cutoff companion): ONE
-    /// underlying accumulated N consecutive empty/failed minutes in the
-    /// per-minute Groww option-chain pull WHILE the other underlyings
-    /// succeeded in those same minutes — the vendor is not serving THIS
-    /// underlying's chain, not a general outage. Fires ONCE per
-    /// underlying per episode (edge-latched, Rule 4); re-armed only by
-    /// that underlying's own recovery. Severity::High.
-    GrowwChain1mUnderlyingNotServed {
-        /// The affected underlying (a pinned plain symbol, e.g. "NIFTY").
-        underlying: &'static str,
-        /// How many counted minutes in a row this underlying's chain
-        /// went unserved.
-        empty_minutes: u32,
-    },
-
-    /// A previously-not-served underlying's chain is being served again
-    /// (falling edge — one Info ping; the missing minutes stay absent
-    /// until re-pulled, never fabricated).
-    GrowwChain1mUnderlyingServedRecovered {
-        /// The recovered underlying (a pinned plain symbol, e.g. "NIFTY").
-        underlying: &'static str,
-        /// How many counted minutes the underlying's chain went unserved.
-        empty_minutes: u32,
-    },
-
-    /// The Groww chain leg could not resolve today's option expiry for one
-    /// or more underlyings from the daily instruments list (list download
-    /// failed after bounded tries, or the list carried no usable option
-    /// rows) — those underlyings' chain recording stays OFF for the day
-    /// (expiry dates are never guessed). One HIGH page per day.
-    GrowwChain1mExpiryUnresolved {
-        /// Plain-English detail naming the affected underlyings / cause
-        /// (already secret-redacted + bounded at the emit site).
-        detail: String,
-    },
-
-    /// The two brokers' contract lists DISAGREE on today's option expiry
-    /// date for one underlying (cadence scheduler, coordinator ruling
-    /// 2026-07-16): Dhan's exchange-sourced date WINS and keys BOTH
-    /// lanes' option-chain timing; both raw dates stay recorded for
-    /// provenance. Edge-latched — one HIGH page per underlying per day.
-    CadenceExpiryDisagreement {
-        /// The underlying index name (NIFTY / BANKNIFTY / SENSEX).
-        underlying: String,
-        /// Dhan's resolved expiry date (ISO) — the winner.
-        dhan_date: String,
-        /// Groww's resolved expiry date (ISO).
-        groww_date: String,
-    },
-
-    /// The boot-time Groww option-chain probe verdict (pipeline switched
-    /// OFF, probe-and-report ON): one Info ping carrying the MEASURED
-    /// result — whether the chain answered, how many strikes, how fast, or
-    /// which reject class — so the operator can decide to turn recording
-    /// on. Nothing was recorded either way.
-    GrowwChain1mProbeVerdict {
-        /// `true` when every underlying's chain call answered with a
-        /// parseable chain.
-        ok: bool,
-        /// Plain-English measured detail (already secret-redacted +
-        /// bounded at the emit site).
-        detail: String,
-    },
-
-    /// Groww per-minute PER-CONTRACT candle REST leg (operator grant
-    /// 2026-07-13, PR-4 of the Groww per-minute REST plan — the fill-model
-    /// leg): the per-minute contract candle pull has fully failed for
-    /// several minutes in a row (edge-triggered ONCE per episode, Rule 4;
-    /// re-armed only after a successful minute). Severity::High.
-    GrowwContract1mFetchDegraded {
-        /// How many minutes in a row have fully failed.
-        consecutive_failed_minutes: u32,
-        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
-        minute_ist: String,
-    },
-
-    /// The Groww per-minute contract candle pull RECOVERED after a failing
-    /// episode (falling edge — one Info ping; the missing minutes stay
-    /// absent until re-pulled, never fabricated).
-    GrowwContract1mFetchRecovered {
-        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
-        minute_ist: String,
-        /// How many minutes had fully failed during the episode.
-        failed_minutes: u32,
-    },
-
-    /// The Groww contract leg could not build today's contract book for
-    /// one or more underlyings from the daily instruments list (list
-    /// download failed after bounded tries, or the list carried no usable
-    /// option contracts at the current expiry) — those underlyings'
-    /// per-contract recording stays OFF for the day (contract identities
-    /// are never guessed). One HIGH page per day.
-    GrowwContract1mBookUnresolved {
-        /// Plain-English detail naming the affected underlyings / cause
-        /// (already secret-redacted + bounded at the emit site).
-        detail: String,
     },
 
     /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
@@ -1417,84 +1236,6 @@ pub enum NotificationEvent {
         failed_checks_before_recovery: u32,
     },
 
-    // -----------------------------------------------------------------------
-    // Groww REGULAR-orders events (shared contracts PR-A0, operator
-    // authorization 2026-07-14; DORMANT/dry-run only). 10-commandments
-    // compliant, edge-triggered. Emit sites land in later serial Orders PRs.
-    // -----------------------------------------------------------------------
-    /// An order's outcome is UNCERTAIN — a mutation entered the ambiguity
-    /// resolution ladder and we are checking with the broker right now.
-    /// Edge-triggered (once per ambiguity episode). Severity::High.
-    GrowwOrderAmbiguous {
-        /// Local intent id (the `TV…` reference).
-        intent_id: String,
-        /// Which mutation ("place" / "modify" / "cancel").
-        op: &'static str,
-        /// The order's trading symbol.
-        symbol: String,
-    },
-
-    /// We could NOT confirm an order's fate — the resolution ladder exhausted
-    /// its bounded budget. The operator must open the Groww app NOW and check
-    /// the order book. Severity::Critical.
-    GrowwOrderAmbiguityUnresolved {
-        /// Local intent id (the `TV…` reference).
-        intent_id: String,
-        /// Which mutation ("place" / "modify" / "cancel").
-        op: &'static str,
-        /// The order's trading symbol.
-        symbol: String,
-        /// How long the ladder ran before giving up (seconds).
-        elapsed_secs: u64,
-    },
-
-    /// The broker rejected N order(s). Coalesced (one page per window) with a
-    /// plain-English sample reason. Severity::High.
-    GrowwOrderRejected {
-        /// How many rejects this page coalesces.
-        count: u32,
-        /// A plain-English sample rejection reason.
-        sample_reason: String,
-        /// A representative trading symbol.
-        symbol: String,
-    },
-
-    /// A cancel arrived too late — the order FILLED. A position now exists;
-    /// the operator must check it. Severity::High.
-    GrowwOrderCancelLostRace {
-        /// Local intent id (the `TV…` reference).
-        intent_id: String,
-        /// The order's trading symbol.
-        symbol: String,
-        /// The filled quantity that carried through despite the cancel.
-        filled_qty: i64,
-    },
-
-    /// Our order records and the broker's disagree — a reconcile mismatch is
-    /// being surfaced for operator judgment. Severity::High.
-    GrowwOrderReconcileMismatch {
-        /// The mismatch class ("status_drift" / "fill_drift" / "ghost_local"
-        /// / "ghost_broker" / "fill_monotonicity").
-        kind: &'static str,
-        /// How many orders show this mismatch class.
-        count: u32,
-        /// A representative trading symbol.
-        symbol: String,
-    },
-
-    /// Daily paper-mode digest of order activity. Sent ONLY when ≥1 paper
-    /// event occurred (Rule 11 — no false-OK). Severity::Info.
-    GrowwOrdersPaperDigest {
-        /// Orders placed in paper mode today.
-        placed: u32,
-        /// Orders that filled in paper mode today.
-        filled: u32,
-        /// Orders rejected in paper mode today.
-        rejected: u32,
-        /// Orders still open at digest time.
-        open: u32,
-    },
-
     /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
     /// holiday calendar's coverage horizon is running out (or already ran
     /// out). The holiday list covers one calendar year at a time and the
@@ -2123,22 +1864,6 @@ impl NotificationEvent {
             | Self::OrphanPositionsClean => Some(FeedBadge::Dhan.badge()),
             // ── Groww-scoped: per-minute REST legs (spot 1m + option
             //    chain + option contract) ──
-            Self::GrowwSpot1mFetchDegraded { .. }
-            | Self::GrowwSpot1mFetchRecovered { .. }
-            | Self::GrowwChain1mFetchDegraded { .. }
-            | Self::GrowwChain1mFetchRecovered { .. }
-            | Self::GrowwChain1mExpiryUnresolved { .. }
-            | Self::GrowwChain1mProbeVerdict { .. }
-            | Self::GrowwContract1mFetchDegraded { .. }
-            | Self::GrowwContract1mFetchRecovered { .. }
-            | Self::GrowwContract1mBookUnresolved { .. }
-            // ── Groww-scoped: regular-orders lane (PR-A0) ──
-            | Self::GrowwOrderAmbiguous { .. }
-            | Self::GrowwOrderAmbiguityUnresolved { .. }
-            | Self::GrowwOrderRejected { .. }
-            | Self::GrowwOrderCancelLostRace { .. }
-            | Self::GrowwOrderReconcileMismatch { .. }
-            | Self::GrowwOrdersPaperDigest { .. } => Some(FeedBadge::Groww.badge()),
             // ── WS sleep/wake: badge follows the `feed` field, falling
             //    back to Dhan — the live values are "main"/"order_update"
             //    (both Dhan WebSocket types); a future feed value like
@@ -2466,7 +2191,6 @@ impl NotificationEvent {
             }
             Self::TfConsistencySummary {
                 dhan_date_ist,
-                groww_date_ist,
                 instruments,
                 buckets_compared,
                 mismatches,
@@ -2521,7 +2245,7 @@ impl NotificationEvent {
                 } else if status_label == "no_data" {
                     format!(
                         "\u{1f515} <b>Daily timeframe check @ 3:40 PM IST — nothing to check</b>\n\
-                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Dhan day: {dhan_date_ist}\n\
                          No candles were recorded for these days (feeds were \
                          off). This is not a pass and not a failure — there \
                          was simply nothing to verify."
@@ -2535,7 +2259,7 @@ impl NotificationEvent {
                     // a blind day.
                     format!(
                         "\u{1f198} <b>Daily timeframe check @ 3:40 PM IST — BLIND</b>\n\
-                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Dhan day: {dhan_date_ist}\n\
                          Checked NOTHING today — could NOT verify a single \
                          candle. This is not a pass.{tail_note}\n\
                          What to do RIGHT NOW:\n\
@@ -2565,7 +2289,7 @@ impl NotificationEvent {
                     format!(
                         "\u{26a0}\u{fe0f} <b>Daily timeframe check @ 3:40 PM IST — \
                          NEEDS ATTENTION</b>\n\
-                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Dhan day: {dhan_date_ist}\n\
                          Instruments: {instruments} | Candles compared: {buckets_compared}\n\
                          Value differences: {mismatches} | Missing candles: {missing_tf_rows}\n\
                          Candles with no 1-minute data behind them: {no_coverage}\n\
@@ -2592,137 +2316,6 @@ impl NotificationEvent {
                      1. Check the app is still running.\n\
                      2. Restart the app to re-arm tomorrow's check."
                 )
-            }
-            Self::SpotCrossverifySummary {
-                trading_date_ist,
-                indices,
-                minutes_compared,
-                mismatches,
-                missing_dhan,
-                missing_groww,
-                out_of_session,
-                degraded,
-                truncated,
-                status_label,
-                noise_only,
-                noise_max_paise,
-                top_detail,
-            } => {
-                // The honest frame rides EVERY arm (operator Fix E).
-                const HONEST_FRAME: &str = "Neither broker is the single source of truth — \
-                     watch the trend over days, not one number.";
-                // APPROVED: display-only paise→rupee division on a cold path.
-                #[allow(clippy::cast_precision_loss)]
-                let biggest_rupees = *noise_max_paise as f64 / 100.0;
-                if status_label == "clean" {
-                    format!(
-                        "\u{2705} Spot cross-check 3:47 PM \u{b7} {trading_date_ist} — \
-                         \u{1f537} Dhan vs \u{1f7e2} Groww: {minutes_compared} minutes \
-                         across {indices} indices, all prices match.\n\
-                         {HONEST_FRAME}"
-                    )
-                } else if status_label == "no_data" {
-                    format!(
-                        "\u{1f515} <b>Spot cross-check @ 3:47 PM IST — nothing to compare</b>\n\
-                         Day: {trading_date_ist}\n\
-                         Neither Dhan nor Groww recorded index prices today \
-                         (feeds off). Not a pass and not a failure.\n\
-                         {HONEST_FRAME}"
-                    )
-                } else if *minutes_compared == 0 {
-                    format!(
-                        "\u{1f198} <b>Spot cross-check @ 3:47 PM IST — BLIND</b>\n\
-                         Day: {trading_date_ist}\n\
-                         Compared NOTHING — one broker had prices, the other \
-                         none overlapped. This is not a pass.\n\
-                         What to do RIGHT NOW:\n\
-                         1. Check the database is up and reachable.\n\
-                         2. Confirm BOTH brokers' minute prices recorded today.\n\
-                         {HONEST_FRAME}"
-                    )
-                } else if *noise_only {
-                    // Fix E: pure high/low sampling skew inside the noise
-                    // band, nothing missing, full coverage — a NORMAL day.
-                    format!(
-                        "\u{2705} <b>Spot cross-check 3:47 PM \u{b7} {trading_date_ist}</b>\n\
-                         \u{1f537} Dhan and \u{1f7e2} Groww prices agree closely today: \
-                         {mismatches} tiny timing differences out of {minutes_compared} \
-                         minutes — NORMAL.\n\
-                         Biggest gap: \u{20b9}{biggest_rupees:.2} (inside the normal band). \
-                         Open and close prices showed no real drift.\n\
-                         {HONEST_FRAME}"
-                    )
-                } else {
-                    let coverage_note = if *degraded {
-                        "\nSome of the day's data could not be read — the numbers \
-                         above cover only what was readable."
-                    } else {
-                        ""
-                    };
-                    let truncated_note = if *truncated {
-                        "\nMore minutes than the check can load — the loaded part \
-                         is compared exactly; the rest was not checked."
-                    } else {
-                        ""
-                    };
-                    // Fix E round 1: the lead already shows the worst line —
-                    // skip it in the example block (no duplicated line).
-                    let lead_used_worst = *mismatches > 0 && !top_detail.is_empty();
-                    let mut detail_block = String::new();
-                    for line in top_detail.iter().skip(usize::from(lead_used_worst)).take(3) {
-                        detail_block.push('\n');
-                        detail_block.push_str("• ");
-                        detail_block.push_str(&html_escape(line));
-                    }
-                    let lead = if lead_used_worst {
-                        format!(
-                            "\u{1f198} <b>Real price drift between \u{1f537} Dhan and \
-                             \u{1f7e2} Groww \u{b7} {trading_date_ist}</b>\n\
-                             Worst: {}",
-                            html_escape(&top_detail[0])
-                        )
-                    } else {
-                        format!(
-                            "\u{1f198} <b>Spot cross-check 3:47 PM \u{b7} {trading_date_ist} — \
-                             \u{1f537} Dhan vs \u{1f7e2} Groww needs a look</b>"
-                        )
-                    };
-                    // Fix E round 1: name WHICH gate paged, derived from the
-                    // same fields the severity gate used.
-                    let mut gates: Vec<&str> = Vec::new();
-                    if *missing_dhan > 0 || *missing_groww > 0 {
-                        gates.push("minutes missing on one broker");
-                    }
-                    if top_detail
-                        .iter()
-                        .any(|l| l.contains(" open:") || l.contains(" close:"))
-                    {
-                        gates.push("open/close price drift");
-                    }
-                    if gates.is_empty() {
-                        if *degraded || *truncated {
-                            gates.push("incomplete coverage");
-                        } else if *mismatches > 0 {
-                            gates.push("a price gap beyond the normal band");
-                        }
-                    }
-                    let why_note = if gates.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\nWhy this pages: {}", gates.join(" + "))
-                    };
-                    format!(
-                        "{lead}{why_note}\n\
-                         Indices: {indices} | Minutes compared: {minutes_compared}\n\
-                         Price differences: {mismatches} (biggest \
-                         \u{20b9}{biggest_rupees:.2})\n\
-                         Minutes missing on Dhan: {missing_dhan} | on Groww: \
-                         {missing_groww}\n\
-                         Outside market hours: {out_of_session}\
-                         {coverage_note}{truncated_note}{detail_block}\n\
-                         {HONEST_FRAME}"
-                    )
-                }
             }
             Self::SpotCrossverifyAborted { detail } => {
                 let detail = html_escape(detail);
@@ -2767,38 +2360,6 @@ impl NotificationEvent {
                      record until re-pulled — nothing is made up."
                 )
             }
-            Self::GrowwSpot1mFetchDegraded {
-                consecutive_failed_minutes,
-                minute_ist,
-            } => {
-                format!(
-                    "\u{1f198} <b>Groww minute-by-minute spot index candle pull is FAILING</b>\n\
-                     The per-minute pull of the official 1-minute candle for \
-                     NIFTY, BANKNIFTY and SENSEX from the second broker \
-                     (Groww) has failed {consecutive_failed_minutes} minutes \
-                     in a row (latest failed minute: {minute_ist} IST).\n\
-                     Live streaming prices are NOT affected — only Groww's \
-                     per-minute official record copy is missing.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Check the Groww account's daily access is active \
-                     (the shared morning key).\n\
-                     2. If Groww live streaming prices ALSO stopped, treat it \
-                     as a full Groww outage.\n\
-                     3. Missing minutes fill in safely once the pull recovers."
-                )
-            }
-            Self::GrowwSpot1mFetchRecovered {
-                minute_ist,
-                failed_minutes,
-            } => {
-                format!(
-                    "\u{2705} <b>Groww minute-by-minute spot index candle pull recovered</b>\n\
-                     The Groww per-minute official candle pull is working \
-                     again as of {minute_ist} IST, after {failed_minutes} \
-                     failed minute(s). The minutes that failed stay blank in \
-                     the record until re-pulled — nothing is made up."
-                )
-            }
             Self::Spot1mSidNotServed {
                 symbol,
                 consecutive_minutes,
@@ -2835,192 +2396,6 @@ impl NotificationEvent {
                      working again after {not_served_minutes} missed \
                      minute(s). The minutes that were missed stay blank in \
                      the record until re-pulled — nothing is made up."
-                )
-            }
-            Self::GrowwChain1mFetchDegraded {
-                consecutive_failed_minutes,
-                minute_ist,
-            } => {
-                format!(
-                    "\u{1f198} <b>Groww minute-by-minute option chain recording is FAILING</b>\n\
-                     The per-minute option chain snapshot for NIFTY, BANKNIFTY \
-                     and SENSEX from the second broker (Groww) has failed \
-                     {consecutive_failed_minutes} minutes in a row (latest \
-                     failed minute: {minute_ist} IST).\n\
-                     Live streaming prices are NOT affected — only Groww's \
-                     per-minute option chain record is missing.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Check the Groww account's daily access is active \
-                     (the shared morning key).\n\
-                     2. If Groww live streaming prices ALSO stopped, treat it \
-                     as a full Groww outage.\n\
-                     3. Missing minutes stay blank — nothing is made up."
-                )
-            }
-            Self::GrowwChain1mFetchRecovered {
-                minute_ist,
-                failed_minutes,
-            } => {
-                format!(
-                    "\u{2705} <b>Groww minute-by-minute option chain recording recovered</b>\n\
-                     The Groww per-minute option chain snapshot is working \
-                     again as of {minute_ist} IST, after {failed_minutes} \
-                     failed minute(s). The minutes that failed stay blank in \
-                     the record until re-pulled — nothing is made up."
-                )
-            }
-            Self::GrowwChain1mUnderlyingNotServed {
-                underlying,
-                empty_minutes,
-            } => {
-                format!(
-                    "\u{1f198} <b>Groww is not returning the option chain \
-                     for {underlying}</b>\n\
-                     For {empty_minutes} minutes in a row the per-minute \
-                     option chain for {underlying} came back empty from \
-                     Groww while the other indices came through fine — the \
-                     other indices are unaffected, so this looks like the \
-                     broker not serving THIS index's chain, not a general \
-                     outage.\n\
-                     Live streaming prices are NOT affected — only Groww's \
-                     per-minute option chain record for {underlying} is \
-                     missing; the same minutes may still be available from \
-                     the Dhan side.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Nothing urgent — the other indices keep recording \
-                     normally.\n\
-                     2. On an expiry day this is usually the broker cutting \
-                     off the expiring chain early — it comes back with the \
-                     next expiry.\n\
-                     3. Missing minutes stay blank — nothing is made up."
-                )
-            }
-            Self::GrowwChain1mUnderlyingServedRecovered {
-                underlying,
-                empty_minutes,
-            } => {
-                format!(
-                    "\u{2705} <b>Groww is serving the option chain for \
-                     {underlying} again</b>\n\
-                     The per-minute option chain for {underlying} is working \
-                     again after {empty_minutes} empty minute(s). The \
-                     minutes that were missed stay blank in the record until \
-                     re-pulled — nothing is made up."
-                )
-            }
-            Self::CadenceExpiryDisagreement {
-                underlying,
-                dhan_date,
-                groww_date,
-            } => {
-                let underlying = html_escape(underlying);
-                let dhan_date = html_escape(dhan_date);
-                let groww_date = html_escape(groww_date);
-                format!(
-                    "\u{26a0}\u{fe0f} <b>Dhan and Groww disagree on the \
-                     {underlying} option expiry date</b>\n\
-                     Dhan says {dhan_date}, Groww says {groww_date} — for \
-                     today the DHAN date wins, and BOTH brokers' option-chain \
-                     timing now uses Dhan's date. Both answers stay recorded.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Nothing urgent — the system already picked the Dhan \
-                     date (the exchange-sourced list).\n\
-                     2. Glance at the {underlying} option expiry in the Groww \
-                     app once today. If Groww's list was just stale this \
-                     clears tomorrow; if it repeats daily, the two brokers' \
-                     contract lists genuinely differ and need a look."
-                )
-            }
-            Self::GrowwChain1mExpiryUnresolved { detail } => {
-                let detail = html_escape(detail);
-                format!(
-                    "\u{1f198} <b>Groww option chain recording could NOT start \
-                     for some indices today</b>\n\
-                     Today's contract list from Groww did not give a usable \
-                     option expiry date, so those indices' option chain \
-                     recording stays OFF for today (expiry dates are never \
-                     guessed).\n\
-                     Detail: {detail}\n\
-                     Live streaming prices are NOT affected. Tomorrow's start \
-                     retries automatically.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Nothing urgent — the affected recording is off for \
-                     today only.\n\
-                     2. If this repeats daily, the Groww contract list has a \
-                     problem — check with Groww."
-                )
-            }
-            Self::GrowwChain1mProbeVerdict { ok, detail } => {
-                let detail = html_escape(detail);
-                if *ok {
-                    format!(
-                        "\u{2705} <b>Groww option chain check PASSED</b>\n\
-                         Today's one-time check pulled the Groww option chain \
-                         successfully. Measured: {detail}\n\
-                         Minute-by-minute recording is handled by the \
-                         minute-cadence engine — when that engine is on, \
-                         chains record automatically; nothing else to do."
-                    )
-                } else {
-                    format!(
-                        "\u{1f514} <b>Groww option chain check did NOT pass</b>\n\
-                         Today's one-time check could not pull a usable Groww \
-                         option chain. Measured: {detail}\n\
-                         Nothing is broken — tomorrow's start checks again. \
-                         If the minute-cadence engine is on, its own alerts \
-                         will say whether chain recording is affected."
-                    )
-                }
-            }
-            Self::GrowwContract1mFetchDegraded {
-                consecutive_failed_minutes,
-                minute_ist,
-            } => {
-                format!(
-                    "\u{1f198} <b>Groww minute-by-minute option CONTRACT price \
-                     recording is FAILING</b>\n\
-                     The per-minute price pull for the selected NIFTY, \
-                     BANKNIFTY and SENSEX option contracts from the second \
-                     broker (Groww) has failed {consecutive_failed_minutes} \
-                     minutes in a row (latest failed minute: {minute_ist} \
-                     IST).\n\
-                     Live streaming prices are NOT affected — only Groww's \
-                     per-minute contract price record is missing.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Check the Groww account's daily access is active \
-                     (the shared morning key).\n\
-                     2. If the Groww option chain recording ALSO failed, the \
-                     problem is upstream of this leg.\n\
-                     3. Missing minutes stay blank — nothing is made up."
-                )
-            }
-            Self::GrowwContract1mFetchRecovered {
-                minute_ist,
-                failed_minutes,
-            } => {
-                format!(
-                    "\u{2705} <b>Groww minute-by-minute option contract price \
-                     recording recovered</b>\n\
-                     The Groww per-minute contract price pull is working \
-                     again as of {minute_ist} IST, after {failed_minutes} \
-                     failed minute(s). The minutes that failed stay blank in \
-                     the record until re-pulled — nothing is made up."
-                )
-            }
-            Self::GrowwContract1mBookUnresolved { detail } => {
-                let detail = html_escape(detail);
-                format!(
-                    "\u{1f198} <b>Groww option contract recording could NOT \
-                     start for some indices today</b>\n\
-                     Today's contract list from Groww did not give usable \
-                     option contracts for the current expiry, so those \
-                     indices' per-minute contract recording stays OFF for \
-                     today (contract identities are never guessed).\n\
-                     Detail: {detail}\n\
-                     Live streaming prices are NOT affected. Tomorrow's start \
-                     retries automatically.\n\
-                     If this repeats for days, the contract list itself has a \
-                     problem — check with Groww."
                 )
             }
             Self::ChainFetchDegraded {
@@ -3155,14 +2530,12 @@ impl NotificationEvent {
             Self::DualFeedDailyScorecard {
                 trading_date_ist,
                 dhan,
-                groww,
                 session_minutes: _,
                 partial_coverage,
                 degraded,
                 early_run,
                 restart_partial,
                 dhan_feed_off,
-                groww_feed_off,
                 rest_legs,
                 rest_legs_read_failed,
             } => {
@@ -3176,8 +2549,13 @@ impl NotificationEvent {
                 // stays in the day's stored records and the portal.
                 let caveat =
                     *partial_coverage || *degraded || *restart_partial || *rest_legs_read_failed;
-                let (verdict_emoji, verdict_sentence) =
-                    scorecard_verdict(dhan, groww, *dhan_feed_off, *groww_feed_off);
+                // The cross-feed verdict was REMOVED with the Groww lane
+                // 2026-08-21 — one feed is not a contest.
+                let (verdict_emoji, verdict_sentence) = if *dhan_feed_off {
+                    ("\u{2139}\u{fe0f}", "feed OFF today".to_string())
+                } else {
+                    ("\u{2705}", "one-feed day".to_string())
+                };
                 // A caveat day renders the warning emoji up front — the
                 // verdict sentence itself is unchanged (still ONE decision).
                 let emoji = if caveat {
@@ -3209,8 +2587,8 @@ impl NotificationEvent {
                         render_pulls_per_leg(rest_legs, name)
                     }
                 };
-                let name_width = dhan.name.chars().count().max(groww.name.chars().count());
-                for (off, f) in [(dhan_feed_off, dhan), (groww_feed_off, groww)] {
+                let name_width = dhan.name.chars().count();
+                for (off, f) in [(dhan_feed_off, dhan)] {
                     if *off {
                         // A deliberately-switched-off feed is ONE honest
                         // line — never a wall of zeros, never a winner.
@@ -3233,7 +2611,7 @@ impl NotificationEvent {
                 // Incidents line: rendered ONLY when any blame/stall/
                 // restart count is positive (a clean day carries no
                 // incident noise; `-1` sentinels never count).
-                let any_incident = [dhan, groww].iter().any(|f| {
+                let any_incident = [dhan].iter().any(|f| {
                     f.blame_broker > 0
                         || f.blame_ours > 0
                         || f.blame_unclear > 0
@@ -3241,11 +2619,7 @@ impl NotificationEvent {
                         || f.restarts > 0
                 });
                 if any_incident {
-                    lines.push(format!(
-                        "Incidents: {} | {}",
-                        incident_segment(dhan),
-                        incident_segment(groww)
-                    ));
+                    lines.push(format!("Incidents: {}", incident_segment(dhan)));
                 }
                 if caveat {
                     // Exactly ONE caveat line, only when a partial/degraded
@@ -3922,78 +3296,6 @@ impl NotificationEvent {
                      No action needed unless this recurs."
                 )
             }
-            Self::GrowwOrderAmbiguous {
-                intent_id: _,
-                op,
-                symbol,
-            } => {
-                let symbol = html_escape(symbol);
-                format!(
-                    "⚠️ <b>Order outcome uncertain</b>\n\
-                     We are checking a {op} order for {symbol} with the broker right now."
-                )
-            }
-            Self::GrowwOrderAmbiguityUnresolved {
-                intent_id: _,
-                op,
-                symbol,
-                elapsed_secs,
-            } => {
-                let symbol = html_escape(symbol);
-                let mins = elapsed_secs / 60;
-                format!(
-                    "🆘 <b>Order fate UNCONFIRMED</b>\n\
-                     We could not confirm a {op} order for {symbol} after about {mins} min.\n\
-                     What you need to do RIGHT NOW:\n\
-                     1. Open the Groww app.\n\
-                     2. Check the order book for {symbol}.\n\
-                     3. Cancel or accept that order as needed."
-                )
-            }
-            Self::GrowwOrderRejected {
-                count,
-                sample_reason,
-                symbol,
-            } => {
-                let symbol = html_escape(symbol);
-                let sample_reason = html_escape(sample_reason);
-                format!("⚠️ <b>Broker rejected {count} order(s)</b>\n{symbol}: {sample_reason}")
-            }
-            Self::GrowwOrderCancelLostRace {
-                intent_id: _,
-                symbol,
-                filled_qty,
-            } => {
-                let symbol = html_escape(symbol);
-                format!(
-                    "⚠️ <b>Cancel too late — order FILLED</b>\n\
-                     A cancel for {symbol} arrived after {filled_qty} filled. \
-                     A position now exists — check it in the Groww app."
-                )
-            }
-            Self::GrowwOrderReconcileMismatch {
-                kind,
-                count,
-                symbol,
-            } => {
-                let symbol = html_escape(symbol);
-                format!(
-                    "⚠️ <b>Order records disagree</b>\n\
-                     {count} {symbol} order(s) show a {kind} mismatch between our \
-                     records and the broker — being reconciled."
-                )
-            }
-            Self::GrowwOrdersPaperDigest {
-                placed,
-                filled,
-                rejected,
-                open,
-            } => {
-                format!(
-                    "🟢 <b>Paper orders — daily summary</b>\n\
-                     Placed {placed} · Filled {filled} · Rejected {rejected} · Open {open}"
-                )
-            }
             Self::HolidayCalendarCoverageLow {
                 days_remaining,
                 coverage_end_display,
@@ -4068,26 +3370,11 @@ impl NotificationEvent {
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
             Self::TfConsistencySummary { .. } => "TfConsistencySummary",
             Self::TfConsistencyAborted { .. } => "TfConsistencyAborted",
-            Self::SpotCrossverifySummary { .. } => "SpotCrossverifySummary",
             Self::SpotCrossverifyAborted { .. } => "SpotCrossverifyAborted",
             Self::Spot1mFetchDegraded { .. } => "Spot1mFetchDegraded",
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
-            Self::GrowwSpot1mFetchDegraded { .. } => "GrowwSpot1mFetchDegraded",
-            Self::GrowwSpot1mFetchRecovered { .. } => "GrowwSpot1mFetchRecovered",
             Self::Spot1mSidNotServed { .. } => "Spot1mSidNotServed",
             Self::Spot1mSidServedRecovered { .. } => "Spot1mSidServedRecovered",
-            Self::GrowwChain1mFetchDegraded { .. } => "GrowwChain1mFetchDegraded",
-            Self::GrowwChain1mFetchRecovered { .. } => "GrowwChain1mFetchRecovered",
-            Self::GrowwChain1mUnderlyingNotServed { .. } => "GrowwChain1mUnderlyingNotServed",
-            Self::GrowwChain1mUnderlyingServedRecovered { .. } => {
-                "GrowwChain1mUnderlyingServedRecovered"
-            }
-            Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
-            Self::CadenceExpiryDisagreement { .. } => "CadenceExpiryDisagreement",
-            Self::GrowwChain1mProbeVerdict { .. } => "GrowwChain1mProbeVerdict",
-            Self::GrowwContract1mFetchDegraded { .. } => "GrowwContract1mFetchDegraded",
-            Self::GrowwContract1mFetchRecovered { .. } => "GrowwContract1mFetchRecovered",
-            Self::GrowwContract1mBookUnresolved { .. } => "GrowwContract1mBookUnresolved",
             Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
             Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
             Self::Chain1mUnderlyingNotServed { .. } => "Chain1mUnderlyingNotServed",
@@ -4145,12 +3432,6 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeHealthy { .. } => "RealtimeGuaranteeHealthy",
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
-            Self::GrowwOrderAmbiguous { .. } => "GrowwOrderAmbiguous",
-            Self::GrowwOrderAmbiguityUnresolved { .. } => "GrowwOrderAmbiguityUnresolved",
-            Self::GrowwOrderRejected { .. } => "GrowwOrderRejected",
-            Self::GrowwOrderCancelLostRace { .. } => "GrowwOrderCancelLostRace",
-            Self::GrowwOrderReconcileMismatch { .. } => "GrowwOrderReconcileMismatch",
-            Self::GrowwOrdersPaperDigest { .. } => "GrowwOrdersPaperDigest",
             Self::HolidayCalendarCoverageLow { .. } => "HolidayCalendarCoverageLow",
             Self::Custom { .. } => "Custom",
             Self::CustomStatus { .. } => "CustomStatus",
@@ -4330,31 +3611,6 @@ impl NotificationEvent {
                 family: EpisodeFamily::DhanRest,
                 conn: Self::chain_rest_slot(underlying),
             }),
-            Self::GrowwSpot1mFetchDegraded { .. } | Self::GrowwSpot1mFetchRecovered { .. } => {
-                Some(EpisodeKey {
-                    family: EpisodeFamily::GrowwRest,
-                    conn: 0,
-                })
-            }
-            Self::GrowwChain1mFetchDegraded { .. } | Self::GrowwChain1mFetchRecovered { .. } => {
-                Some(EpisodeKey {
-                    family: EpisodeFamily::GrowwRest,
-                    conn: 1,
-                })
-            }
-            Self::GrowwContract1mFetchDegraded { .. }
-            | Self::GrowwContract1mFetchRecovered { .. } => Some(EpisodeKey {
-                family: EpisodeFamily::GrowwRest,
-                conn: 2,
-            }),
-            // F1: same disjoint chain-slot range on the Groww side (no Groww
-            // spot per-symbol pair exists today — kept disjoint anyway so a
-            // future one can never collide).
-            Self::GrowwChain1mUnderlyingNotServed { underlying, .. }
-            | Self::GrowwChain1mUnderlyingServedRecovered { underlying, .. } => Some(EpisodeKey {
-                family: EpisodeFamily::GrowwRest,
-                conn: Self::chain_rest_slot(underlying),
-            }),
             _ => None,
         }
     }
@@ -4412,11 +3668,7 @@ impl NotificationEvent {
             | Self::Spot1mFetchRecovered { .. }
             | Self::ChainFetchRecovered { .. }
             | Self::Spot1mSidServedRecovered { .. }
-            | Self::Chain1mUnderlyingServedRecovered { .. }
-            | Self::GrowwSpot1mFetchRecovered { .. }
-            | Self::GrowwChain1mFetchRecovered { .. }
-            | Self::GrowwContract1mFetchRecovered { .. }
-            | Self::GrowwChain1mUnderlyingServedRecovered { .. } => EpisodeRole::Resolve,
+            | Self::Chain1mUnderlyingServedRecovered { .. } => EpisodeRole::Resolve,
             _ => EpisodeRole::Open,
         }
     }
@@ -4522,23 +3774,6 @@ impl NotificationEvent {
                 }
             }
             Self::TfConsistencyAborted { .. } => Severity::High,
-            // Spot cross-broker comparator (2026-07-17): clean/no_data are
-            // Info; Fix E gating — a diverged day whose every delta is
-            // high/low-only sampling skew inside the noise band with full
-            // coverage is Info too (a trend line, not a page). Open/close
-            // drift, a delta past the band, missing minutes, or degraded /
-            // partial / blind coverage stay High (audit Rule 11).
-            Self::SpotCrossverifySummary {
-                status_label,
-                noise_only,
-                ..
-            } => {
-                if status_label == "clean" || status_label == "no_data" || *noise_only {
-                    Severity::Info
-                } else {
-                    Severity::High
-                }
-            }
             Self::SpotCrossverifyAborted { .. } => Severity::High,
             // Per-minute spot 1m REST pipeline (2026-07-12): the degraded
             // page is the edge-triggered escalation (3 consecutive fully-
@@ -4548,27 +3783,15 @@ impl NotificationEvent {
             // Groww per-minute spot 1m REST leg (2026-07-13): same edge
             // semantics as the Dhan leg — one High page per episode, one
             // Info ping on the falling edge.
-            Self::GrowwSpot1mFetchDegraded { .. } => Severity::High,
-            Self::GrowwSpot1mFetchRecovered { .. } => Severity::Info,
             Self::Spot1mSidNotServed { .. } => Severity::High,
             Self::Spot1mSidServedRecovered { .. } => Severity::Info,
-            Self::GrowwChain1mFetchDegraded { .. } => Severity::High,
-            Self::GrowwChain1mFetchRecovered { .. } => Severity::Info,
-            Self::GrowwChain1mUnderlyingNotServed { .. } => Severity::High,
-            Self::GrowwChain1mUnderlyingServedRecovered { .. } => Severity::Info,
             // One page per day when an underlying's chain recording could
             // not start (never a guessed expiry) — actionable, not fatal.
-            Self::GrowwChain1mExpiryUnresolved { .. } => Severity::High,
-            Self::CadenceExpiryDisagreement { .. } => Severity::High,
             // The probe is informational either way — nothing was expected
             // to record while the pipeline is switched off.
-            Self::GrowwChain1mProbeVerdict { .. } => Severity::Info,
             // The contract leg mirrors the chain edge semantics: one HIGH
             // page per failing episode, one Info recovery, one HIGH per day
             // for an unresolvable contract book.
-            Self::GrowwContract1mFetchDegraded { .. } => Severity::High,
-            Self::GrowwContract1mFetchRecovered { .. } => Severity::Info,
-            Self::GrowwContract1mBookUnresolved { .. } => Severity::High,
             Self::ChainFetchDegraded { .. } => Severity::High,
             Self::ChainFetchRecovered { .. } => Severity::Info,
             // 2026-07-14 family-(2) extension (noise-lock §2.1): one HIGH
@@ -4673,12 +3896,6 @@ impl NotificationEvent {
             // Groww regular-orders lane (PR-A0): the ambiguity-unresolved page
             // is Critical (open the app NOW); the paper digest is Info; the
             // rest are High.
-            Self::GrowwOrderAmbiguityUnresolved { .. } => Severity::Critical,
-            Self::GrowwOrdersPaperDigest { .. } => Severity::Info,
-            Self::GrowwOrderAmbiguous { .. }
-            | Self::GrowwOrderRejected { .. }
-            | Self::GrowwOrderCancelLostRace { .. }
-            | Self::GrowwOrderReconcileMismatch { .. } => Severity::High,
             // W2 PR#5 (2026-07-10): the holiday-calendar coverage cliff
             // demands operator action (paste the next NSE circular) — High
             // pages Telegram; the watchdog's per-IST-date latch bounds it
@@ -4729,7 +3946,6 @@ impl NotificationEvent {
             // Spot cross-broker comparator (2026-07-17): the once-per-day
             // 15:47 IST post-close summary must arrive AT 15:47, not
             // coalesced — the TfConsistencySummary rationale above.
-            Self::SpotCrossverifySummary { .. } => DispatchPolicy::Immediate,
             Self::SpotCrossverifyAborted { .. } => DispatchPolicy::Immediate,
             // Dual-feed scorecard (2026-07-10): the once-per-day 15:45 IST
             // digest must arrive AT 15:45 (post-close = off-hours, so the
@@ -7682,57 +6898,6 @@ mod tests {
     }
 
     #[test]
-    fn test_groww_rest_leg_events_carry_groww_badge() {
-        // The Groww per-minute REST legs (spot 1m + option chain + option
-        // contract) lead with the Groww badge — trigger AND recovery
-        // pairwise. Ratchet: removing any arm fails this test.
-        let events = [
-            NotificationEvent::GrowwSpot1mFetchDegraded {
-                consecutive_failed_minutes: 3,
-                minute_ist: "10:15".to_string(),
-            },
-            NotificationEvent::GrowwSpot1mFetchRecovered {
-                minute_ist: "10:18".to_string(),
-                failed_minutes: 3,
-            },
-            NotificationEvent::GrowwChain1mFetchDegraded {
-                consecutive_failed_minutes: 3,
-                minute_ist: "10:15".to_string(),
-            },
-            NotificationEvent::GrowwChain1mFetchRecovered {
-                minute_ist: "10:18".to_string(),
-                failed_minutes: 3,
-            },
-            NotificationEvent::GrowwChain1mExpiryUnresolved {
-                detail: "no usable expiry".to_string(),
-            },
-            NotificationEvent::GrowwChain1mProbeVerdict {
-                ok: true,
-                detail: "3 chains".to_string(),
-            },
-            NotificationEvent::GrowwContract1mFetchDegraded {
-                consecutive_failed_minutes: 3,
-                minute_ist: "10:15".to_string(),
-            },
-            NotificationEvent::GrowwContract1mFetchRecovered {
-                minute_ist: "10:18".to_string(),
-                failed_minutes: 3,
-            },
-            NotificationEvent::GrowwContract1mBookUnresolved {
-                detail: "no usable contracts".to_string(),
-            },
-        ];
-        for ev in events {
-            assert_eq!(ev.feed_badge(), Some("🟢 GROWW"), "event: {}", ev.topic());
-            let msg = ev.to_message();
-            assert!(
-                msg.starts_with("🟢 GROWW — "),
-                "Groww REST-leg body must lead with the Groww badge: {msg}"
-            );
-        }
-    }
-
-    #[test]
     fn test_dhan_scoped_gate_and_order_events_carry_dhan_badge() {
         // The market-open milestones (they count the Dhan pool), the daily
         // candle cross-checks (Dhan REST vs our candles), the static-IP /
@@ -7849,13 +7014,6 @@ mod tests {
             slept_for_secs: 3600,
         };
         assert_eq!(order_update.feed_badge(), Some("🔷 DHAN"));
-        let groww = NotificationEvent::WebSocketTokenForceRenewedOnWake {
-            feed: "groww".to_string(),
-            connection_index: 0,
-            remaining_secs_before: 100,
-            threshold_secs: 14400,
-        };
-        assert_eq!(groww.feed_badge(), Some("🟢 GROWW"));
     }
 
     #[test]
@@ -8076,42 +7234,6 @@ mod tests {
     // Groww per-minute spot 1m REST leg, PR-2 of the Groww REST plan)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_groww_spot_1m_fetch_degraded_is_high_with_action_lines() {
-        let event = NotificationEvent::GrowwSpot1mFetchDegraded {
-            consecutive_failed_minutes: 3,
-            minute_ist: "10:42 AM".to_string(),
-        };
-        assert_eq!(event.topic(), "GrowwSpot1mFetchDegraded");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        assert!(msg.contains("Groww"), "got: {msg}");
-        assert!(msg.contains("FAILING"), "got: {msg}");
-        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
-        // IST 12-hour timestamp (Telegram commandment 9).
-        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        // Honest scope line: the live WS pipelines are untouched.
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_groww_spot_1m_fetch_recovered_is_info_positive_ping() {
-        let event = NotificationEvent::GrowwSpot1mFetchRecovered {
-            minute_ist: "10:45 AM".to_string(),
-            failed_minutes: 4,
-        };
-        assert_eq!(event.topic(), "GrowwSpot1mFetchRecovered");
-        assert_eq!(event.severity(), Severity::Info);
-        let msg = event.to_message();
-        assert!(msg.contains("Groww"), "got: {msg}");
-        assert!(msg.contains("recovered"), "got: {msg}");
-        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
-        assert!(msg.contains("4 failed"), "got: {msg}");
-        // No false-OK: recovery never claims the missing minutes came back.
-        assert!(msg.contains("nothing is made up"), "got: {msg}");
-    }
-
     // -----------------------------------------------------------------------
     // Spot1mSidNotServed + Spot1mSidServedRecovered (operator scope addition
     // 2026-07-13, relayed via the coordinator session — the INDIA VIX
@@ -8295,34 +7417,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cadence_expiry_disagreement_is_high_names_both_brokers_dhan_wins() {
-        // R6 (2026-07-16): the cadence expiry cross-broker disagreement
-        // page — both brokers named, both dates shown, Dhan wins, plain
-        // English (10 commandments), hostile input HTML-escaped.
-        let event = NotificationEvent::CadenceExpiryDisagreement {
-            underlying: "BANKNIFTY".to_string(),
-            dhan_date: "2026-07-28".to_string(),
-            groww_date: "2026-07-30<script>".to_string(),
-        };
-        assert_eq!(event.topic(), "CadenceExpiryDisagreement");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        assert!(
-            msg.contains("Dhan and Groww disagree on the BANKNIFTY option expiry"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("Dhan says 2026-07-28"), "got: {msg}");
-        assert!(msg.contains("DHAN date wins"), "got: {msg}");
-        assert!(
-            msg.contains("BOTH brokers"),
-            "must say both lanes now use Dhan's date: {msg}"
-        );
-        // Hostile date input is HTML-escaped, never raw.
-        assert!(!msg.contains("<script>"), "got: {msg}");
-        assert!(msg.contains("&lt;script&gt;"), "got: {msg}");
-    }
-
-    #[test]
     fn test_groww_chain_1m_expiry_unresolved_is_high_and_escapes_detail() {
         let event = NotificationEvent::GrowwChain1mExpiryUnresolved {
             detail: "SENSEX: no usable option rows <script>".to_string(),
@@ -8369,89 +7463,6 @@ mod tests {
     // SpotCrossverifySummary render/severity pins (Fix E review round 1,
     // 2026-07-17)
     // -----------------------------------------------------------------------
-
-    fn spot_xverify_summary(
-        noise_only: bool,
-        top_detail: Vec<String>,
-        missing_dhan: u64,
-    ) -> NotificationEvent {
-        NotificationEvent::SpotCrossverifySummary {
-            trading_date_ist: "2026-07-17".to_string(),
-            indices: 4,
-            minutes_compared: 375,
-            mismatches: 3,
-            missing_dhan,
-            missing_groww: 0,
-            out_of_session: 0,
-            degraded: false,
-            truncated: false,
-            status_label: "diverged".to_string(),
-            noise_only,
-            noise_max_paise: 250,
-            top_detail,
-        }
-    }
-
-    /// (a) A noise-only diverged day is Info with a green mark and the
-    /// honest frame — a trend line, never a page. Wording is
-    /// tolerance-aware (Fix E round 1): never "matched everywhere".
-    #[test]
-    fn test_spot_crossverify_summary_noise_only_is_info_with_honest_frame() {
-        let ev = spot_xverify_summary(true, vec![], 0);
-        assert_eq!(ev.severity(), Severity::Info);
-        let msg = ev.to_message();
-        assert!(msg.contains('\u{2705}'), "got: {msg}");
-        assert!(
-            msg.contains("Neither broker is the single source of truth"),
-            "honest frame missing: {msg}"
-        );
-        assert!(!msg.contains("matched everywhere"), "got: {msg}");
-        assert!(msg.contains("no real drift"), "got: {msg}");
-    }
-
-    /// (b) A diverged NON-noise day (open/close drift in the worst lines)
-    /// is High with the \u{1f198} mark, names WHICH gate paged, carries the
-    /// honest frame, and renders the worst line exactly ONCE (Fix E round
-    /// 1 — the lead and the example block must not duplicate it).
-    #[test]
-    fn test_spot_crossverify_summary_real_drift_is_high_and_names_gate() {
-        let worst = "NIFTY close: Dhan \u{20b9}100.00 vs Groww \u{20b9}90.00 \
-             (\u{20b9}10.00 apart) at 10:32 AM";
-        let ev = spot_xverify_summary(
-            false,
-            vec![worst.to_string(), "NIFTY high: second line".to_string()],
-            0,
-        );
-        assert_eq!(ev.severity(), Severity::High);
-        let msg = ev.to_message();
-        assert!(msg.contains('\u{1f198}'), "got: {msg}");
-        assert!(msg.contains("open/close price drift"), "gate name: {msg}");
-        assert!(
-            msg.contains("Neither broker is the single source of truth"),
-            "honest frame missing: {msg}"
-        );
-        assert_eq!(
-            msg.matches("(\u{20b9}10.00 apart) at 10:32 AM").count(),
-            1,
-            "worst line must render exactly once: {msg}"
-        );
-        assert!(
-            msg.contains("second line"),
-            "remaining examples kept: {msg}"
-        );
-    }
-
-    /// The missing-minutes gate is named when one broker has holes.
-    #[test]
-    fn test_spot_crossverify_summary_names_missing_minute_gate() {
-        let ev = spot_xverify_summary(false, vec![], 2);
-        assert_eq!(ev.severity(), Severity::High);
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("minutes missing on one broker"),
-            "gate name: {msg}"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // ChainFetchDegraded / ChainFetchRecovered / ChainEntitlementAbsent /
@@ -8621,7 +7632,6 @@ mod tests {
         NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan,
-            groww,
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
