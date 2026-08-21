@@ -437,37 +437,6 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
         ),
     }
 
-    // 1c. The never-delete lifecycle record.
-    //
-    // Operator directive 2026-08-19: an expired instrument is MARKED expired,
-    // never removed, so the table answers "was this tradeable on that day?"
-    // for every instrument that has ever existed.
-    //
-    // NON-FATAL, like the artifact above: the mapping build is what the rider
-    // exists for, and a lifecycle write that fails must not cost the day its
-    // universe. It also runs AFTER the artifact so a failure here cannot stop
-    // the live lane getting its contracts.
-    let today_ymd = crate::dhan_feed_stack::ymd_from_ist_date(date);
-    let today_nanos = ist_midnight_nanos(date);
-    match crate::dhan_lifecycle::write_dhan_lifecycle(questdb, &master, today_ymd, today_nanos, "")
-        .await
-    {
-        Ok(tally) => info!(
-            active = tally.active,
-            expired_by_date = tally.expired_by_date,
-            expired_by_absence = tally.expired_by_absence,
-            "instrument lifecycle recorded"
-        ),
-        Err(err) => error!(
-            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-            %err,
-            date,
-            "instrument lifecycle could NOT be written — nothing was deleted (the table is \
-             append-and-upsert only), but today's expiry marks are missing, so a query \
-             asking which instruments were tradeable today will read yesterday's answer."
-        ),
-    }
-
     // 2. Every NSE India index list. A single list failing does NOT abort the
     // day: the tolerance gate below judges the RESULT, so one flaky index out
     // of ~49 degrades the fraction rather than losing the other 48. Aborting
@@ -550,6 +519,53 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // record; writing it before the network call means a QuestDB outage
     // cannot cost us the day's mapping.
     write_mapping_atomic(date, &master, &index, &outcome)?;
+
+    // The never-delete lifecycle record.
+    //
+    // Operator directive 2026-08-19: an expired instrument is MARKED expired,
+    // never removed, so the table answers "was this tradeable on that day?"
+    // for every instrument that has ever existed.
+    //
+    // NON-FATAL: the mapping build is what the rider exists for, and a
+    // lifecycle write that fails must not cost the day its universe.
+    //
+    // MOVED BELOW `write_mapping_atomic` on 2026-08-21, and the move is the
+    // point. This is a ~150,000-row QuestDB round trip (a read of every
+    // instrument ever seen, then chunked ILP writes). It used to run BEFORE
+    // the mapping artifact — and the live lane blocks at boot waiting for
+    // exactly that artifact, bounded by `MAPPING_WAIT_DEADLINE_SECS`. So the
+    // lane's whole budget was being spent on a write nothing waits for, and
+    // when it ran out the session fell back to 4 index SIDs for the day.
+    //
+    // The budget was 120 s, derived from a 9-second production build measured
+    // on 2026-08-18 — before this write existed at all (it landed 2026-08-20
+    // in #1773). Nobody re-derived it, so the number described a build that
+    // no longer existed.
+    //
+    // This is the same "disk first, then the table" rule stated above for
+    // `write_mapping_atomic` / `persist_constituents`: the artifact is the
+    // cheaper, more reliable record and nothing slow may sit in front of it.
+    // Everything here is unchanged except WHEN it runs.
+    let today_ymd = crate::dhan_feed_stack::ymd_from_ist_date(date);
+    let today_nanos = ist_midnight_nanos(date);
+    match crate::dhan_lifecycle::write_dhan_lifecycle(questdb, &master, today_ymd, today_nanos, "")
+        .await
+    {
+        Ok(tally) => info!(
+            active = tally.active,
+            expired_by_date = tally.expired_by_date,
+            expired_by_absence = tally.expired_by_absence,
+            "instrument lifecycle recorded"
+        ),
+        Err(err) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            %err,
+            date,
+            "instrument lifecycle could NOT be written — nothing was deleted (the table is \
+             append-and-upsert only), but today's expiry marks are missing, so a query \
+             asking which instruments were tradeable today will read yesterday's answer."
+        ),
+    }
     persist_constituents(questdb, date, &outcome).await;
     Ok(outcome)
 }

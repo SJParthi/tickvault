@@ -664,12 +664,50 @@ mod tests {
 /// How long the boot path waits for today's mapping artifact before giving up
 /// and booting on the index universe.
 ///
-/// Sized from the observed build, not guessed: the 2026-08-18 production build
-/// took **9 seconds** end to end (`downloading instrument master` 08:11:48 →
-/// `instrument mapping written` 08:11:57). 120 s is ~13× that, and still lands
-/// far inside the pre-open window — the box starts at 08:30 IST and the market
-/// opens at 09:15, so even a full timeout costs none of the session.
-pub const MAPPING_WAIT_DEADLINE_SECS: u64 = 120;
+/// # Why this is 600 s and no longer 120 s (raised 2026-08-21)
+///
+/// The old 120 s was derived honestly and then went stale. It was sized from a
+/// real measurement — the 2026-08-18 production build took **9 seconds** end to
+/// end (`downloading instrument master` 08:11:48 → `instrument mapping written`
+/// 08:11:57) — and 120 s was ~13× that.
+///
+/// Two things then landed on top of that build and nobody re-derived the
+/// number:
+///
+/// * the instrument-lifecycle write (#1773, 2026-08-20) — a ~150,000-row
+///   QuestDB round trip. It did not exist when 120 s was chosen. It has since
+///   been moved BELOW the artifact write (`dhan_universe::build_once`), so it
+///   is off this critical path again;
+/// * the every-NSE-index expansion (#1790) — up to 49 index-constituent CSVs
+///   fetched SEQUENTIALLY, each with its own timeout. These still run BEFORE
+///   the artifact, and they are now the bulk of the build.
+///
+/// A budget measured against a 9-second build cannot describe that, and the
+/// cost of being wrong is the whole session: the lane reads the artifact ONCE
+/// at boot, so a timeout pins it to 4 index SIDs until someone restarts the
+/// process. `dhan_universe::BUILD_DEADLINE_SECS` — the build's own budget for
+/// the same work — is 900 s, so the two numbers disagreed by 7.5×.
+///
+/// 600 s is measured against the SLOW path rather than the fast one, and it
+/// still costs the session nothing on a normal morning: the box starts at
+/// 08:30 IST, so even a full timeout lands at ~08:41, well before the 09:15
+/// open. Waiting is strictly cheaper than the fallback it avoids.
+pub const MAPPING_WAIT_DEADLINE_SECS: u64 = 600;
+
+/// Wall-clock IST second-of-day past which the boot wait stops regardless of
+/// how much of the deadline is left. 09:10 IST.
+///
+/// The raised deadline above is safe on a normal 08:30 boot and dangerous on a
+/// late one: a box that comes up at 09:05 would otherwise still be waiting when
+/// the market opens, and dialing nothing at 09:15 is worse than dialing a
+/// partial set. So the wait is bounded by BOTH a duration and a clock, and
+/// whichever arrives first wins.
+///
+/// 09:10 leaves five minutes to resolve the universe, plan the pool and dial
+/// the sockets before the first tick. This makes the raise strictly safer than
+/// the 120 s it replaces in both directions: a normal morning gets 5× the
+/// budget, and a late morning is cut off EARLIER than a flat 600 s would.
+pub const MAPPING_WAIT_NEVER_PAST_IST_SECS: u32 = 9 * 3_600 + 10 * 60;
 
 /// Poll cadence while waiting. Cold path, once per boot: at the deadline above
 /// this is at most 240 `stat` calls total.
@@ -678,7 +716,7 @@ const MAPPING_POLL_INTERVAL_MS: u64 = 500;
 /// Counter: how each boot's wait for the mapping artifact ended.
 ///
 /// `outcome` is one of `not_requested`, `rider_disabled`, `already_present`,
-/// `became_ready`, `timed_out`.
+/// `became_ready`, `timed_out`, `pre_open_cutoff`.
 ///
 /// # NOT shipped to CloudWatch — deliberately, and this is a real limitation
 ///
@@ -784,6 +822,24 @@ pub async fn await_mapping_artifact(
     let interval = std::time::Duration::from_millis(MAPPING_POLL_INTERVAL_MS);
 
     while started.elapsed() < deadline {
+        // Bounded by the CLOCK as well as the duration — see
+        // `MAPPING_WAIT_NEVER_PAST_IST_SECS`. Checked first so a boot that is
+        // already past the cutoff exits without burning a poll interval.
+        if tickvault_common::market_hours::now_ist_secs_of_day() >= MAPPING_WAIT_NEVER_PAST_IST_SECS
+        {
+            metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "pre_open_cutoff").increment(1);
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                waited_secs = started.elapsed().as_secs_f64(),
+                path = %path.display(),
+                "live universe: stopped waiting for today's mapping at the 09:10 IST pre-open \
+                 cutoff — the market opens at 09:15 and dialing a partial set beats dialing \
+                 nothing. This session subscribes the 4 index SIDs. It means the box booted \
+                 late or the daily rider is failing; the rider keeps retrying, but the lane \
+                 reads the artifact once at boot, so only a restart widens this session."
+            );
+            return;
+        }
         tokio::time::sleep(interval).await;
         if path.exists() {
             metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "became_ready").increment(1);
