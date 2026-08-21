@@ -225,28 +225,6 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "FOLD-01",
     "FUTIDX-01",
     "FUTIDX-02",
-    "GROWW-MARG-01",
-    "GROWW-MARG-02",
-    "GROWW-MARG-03",
-    "GROWW-MARG-04",
-    "GROWW-OCO-01",
-    "GROWW-OCO-02",
-    "GROWW-OCO-03",
-    "GROWW-OCO-05",
-    "GROWW-ORD-01",
-    "GROWW-ORD-02",
-    "GROWW-ORD-03",
-    "GROWW-ORD-04",
-    "GROWW-ORD-06",
-    "GROWW-ORD-09",
-    "GROWW-ORD-10",
-    "GROWW-PORT-01",
-    "GROWW-PORT-02",
-    "GROWW-PORT-03",
-    "GROWW-PORT-04",
-    "GROWW-PUSH-01",
-    "GROWW-PUSH-02",
-    "GROWW-PUSH-04",
     "GROWW-SCALE-01",
     "GROWW-SCALE-02",
     "GROWW-SCALE-03",
@@ -397,10 +375,17 @@ so in a dated rule-file note and lower this floor deliberately. Found: {alarmed:
         alarmed.len()
     );
 
+    // 2026-08-21: floor lowered 100 -> 81 DELIBERATELY. The entire Groww feed
+    // was ordered removed (websocket-connection-scope-lock.md, "2026-08-21
+    // (THIRD quote of the day)"), so the 28 order-side variants whose only
+    // emit sites lived in crates/trading/src/oms/groww/** were RETIRED — 21 of
+    // them High/Critical. This is a real drop in what CAN page, and it is
+    // recorded rather than absorbed: no surviving code was re-graded downward,
+    // the variants ceased to exist along with the machinery they described.
     let hc = high_or_critical();
     assert!(
-        hc.len() >= 100,
-        "only {} High/Critical variants seen; 102 existed on 2026-08-10. Either \
+        hc.len() >= 81,
+        "only {} High/Critical variants seen; 81 existed on 2026-08-21. Either \
 ErrorCode::all() has shrunk or severity() was re-graded downward — both change \
 what pages an operator and neither should happen silently",
         hc.len()
