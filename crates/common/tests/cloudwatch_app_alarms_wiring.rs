@@ -748,8 +748,8 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // rationing and why it was not attempted blind.
     assert_eq!(
         names.len(),
-        76,
-        "Z+ L2 VERIFY ratchet: expected exactly 76 names in the MAIN EMF \
+        74,
+        "Z+ L2 VERIFY ratchet: expected exactly 74 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
@@ -786,7 +786,16 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
          explicitly forbids), the two unalarmed names were cut. That is the consistent call, \
          not a byte workaround: a metric shipped to CloudWatch with nothing watching it is \
          the paid-for-and-unwatched shape these very alarms were added to end. Both remain \
-         on /metrics for the operator console to scrape.); \
+         on /metrics for the operator console to scrape. \
+         \
+         2026-08-21, MINUS 2: tv_groww_spot1m_persist_errors_total and \
+         tv_groww_chain1m_persist_errors_total left the selector with the feed that \
+         wrote them. Both were persist-error counters on the Groww REST 1m legs, which \
+         the operator ordered removed entirely; with no producer they would have become \
+         permanently-empty paid series and two flat-zero dashboard lines that read as \
+         proof of health. Removed in lockstep with the two dashboard.tf widget rows and \
+         the /health runtime-subsystem rows, per the dated authorization in \
+         websocket-connection-scope-lock.md. -$0.60/mo.); \
          found {}: \
          {names:?}. Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose \
          budget actions STOP the prod box at 90% — update this count deliberately, \
@@ -829,7 +838,7 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
         // a partial revert of the widening fails loudly instead of silently
         // shrinking the operator's only metric sink:
         "tv_spot1m_persist_errors_total", // Dhan REST leg persist failure
-        "tv_groww_chain1m_persist_errors_total", // Groww REST leg persist failure
+        "tv_chain1m_persist_errors_total", // Dhan chain leg persist failure
         "tv_cadence_ladder_exhausted_total", // retry ladder gave up = minute lost
         "tv_questdb_wal_suspended_tables", // QuestDB silently stops accepting writes
         "tv_order_audit_rows_discarded_total", // SEBI 5-yr audit row loss

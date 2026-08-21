@@ -598,6 +598,7 @@ mod tests {
         use tickvault_common::config::FeedsConfig;
         let fr = Arc::new(FeedRuntimeState::from_config(&FeedsConfig {
             dhan_enabled: true,
+            truedata_enabled: true,
             ..Default::default()
         }));
         let state = SharedAppState::new_with_feed_runtime(

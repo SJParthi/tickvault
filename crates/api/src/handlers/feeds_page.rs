@@ -404,6 +404,7 @@ fn render_feeds_page_html() -> String {
 /// `/api/feeds` endpoints. Ships `X-Frame-Options: SAMEORIGIN` + a CSP with
 /// `frame-ancestors 'self'` to block click-jacking (security-review). The feed rows
 /// are rendered dynamically from [`Feed::ALL`].
+// WIRING-EXEMPT: wired at crates/api/src/lib.rs as `get(handlers::feeds_page::feeds_page)`. An axum route handler is passed by REFERENCE and never called by us, so the guard's `name(` call-shape matcher cannot see it — true of every page handler here, not a dormancy claim.
 pub async fn feeds_page() -> impl IntoResponse {
     (
         [
@@ -490,9 +491,12 @@ mod tests {
             "dhan row present (rendered)"
         );
         assert!(
-            html.contains("\"key\":\"groww\""),
-            "groww row present (rendered)"
+            html.contains("\"key\":\"truedata\""),
+            "truedata row present (rendered)"
         );
+        // Retargeted from the groww row on 2026-08-21: the claim under test is
+        // that EVERY Feed::ALL member is server-rendered as its own switch, so
+        // the second row has to be whatever the second feed is today.
         // PR-E: BOTH feeds are live-toggleable now (Dhan disable is safety-gated
         // server-side; the page shows the API's 409 + re-syncs on a gated reject).
         assert!(

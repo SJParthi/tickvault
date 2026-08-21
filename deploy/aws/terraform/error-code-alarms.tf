@@ -316,8 +316,9 @@ locals {
       desc        = "AUTH-GAP-05 forced re-mint FAILED: the mid-session watchdog detected a sustained dead Dhan token, issued its ONE forced re-mint for the episode, and the mint FAILED (permanent=true = a peer holds the dual-instance lock in-flight; permanent=false = mint HTTP/TOTP failure) - the token stays DEAD for the rest of the session (the retry-once latch holds; the 4h sweep backstop is lane-only per audit GAP-02). Successful self-heal re-mints deliberately do NOT page (trigger arm unmatched - silent-when-healing), and cooldown_skip=true mint-cooldown skips are excluded (non-terminal; the next re-arm window retries). NO recovered/OK page: recovery signal = tv_token_valid back to 1 / the next clean profile cycle. Runbook: .claude/rules/project/wave-4-error-codes.md (AUTH-GAP-05)"
     }
     # SPOT1M-01 escalation edge (added 2026-07-14 — REST-audit GAP-03):
-    # the per-minute spot-1m REST legs (Dhan spot + Groww spot + Groww
-    # contract — all emit SPOT1M-01) page HIGH via app Telegram at the
+    # the per-minute Dhan spot-1m REST leg (until 2026-08-21 the Groww spot +
+    # Groww contract legs emitted SPOT1M-01 too; they left with the Groww
+    # feed) pages HIGH via app Telegram at the
     # 3-consecutive-fully-failed-minutes edge; this filter is the CW
     # backstop for exactly that edge. Stage-scoped: stage="escalation" is
     # the ONCE-per-episode edge line (edge-latched, re-armed only after a
@@ -332,12 +333,12 @@ locals {
       eval        = 3
       dta         = 1
       ok_recovery = false # 2026-07-14: once-per-episode edge - the recovery signal is the leg's own typed Info recovery Telegram / rows landing again, not the datapoint aging out
-      desc        = "SPOT1M-01 escalation: a per-minute REST 1m candle leg (Dhan spot, Groww spot, or Groww contract - read the feed/leg fields in the errors-jsonl stream) fully failed 3+ consecutive minutes (persist-gated: fetch-ok-but-lost rows count as failed). Fires once per episode (edge-latched). Triage: cross-check DH-901 (REST surface/token; the REST canary was retired 2026-07-14 with the Dhan noise lock), tv_spot1m_fetch_total outcome rates, QuestDB health for persist-gated episodes. NO recovered/OK page: recovery = the leg's typed recovery Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
+      desc        = "SPOT1M-01 escalation: the per-minute Dhan REST 1m spot candle leg (the Groww spot + contract legs were removed 2026-08-21 with the Groww feed; the feed/leg fields in the errors-jsonl stream still name the leg) fully failed 3+ consecutive minutes (persist-gated: fetch-ok-but-lost rows count as failed). Fires once per episode (edge-latched). Triage: cross-check DH-901 (REST surface/token; the REST canary was retired 2026-07-14 with the Dhan noise lock), tv_spot1m_fetch_total outcome rates, QuestDB health for persist-gated episodes. NO recovered/OK page: recovery = the leg's typed recovery Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
     }
     # CHAIN-02 escalation edge (added 2026-07-14 — REST-audit GAP-03):
     # same contract as spot1m-01-escalation for the option-chain legs
-    # (Dhan + Groww). stage="escalation" only — per-minute sub-edge lines
-    # deliberately unmatched.
+    # (Dhan only since 2026-08-21). stage="escalation" only — per-minute
+    # sub-edge lines deliberately unmatched.
     "chain-02-escalation" = {
       pattern     = "{ $.code = \"CHAIN-02\" && $.level = \"ERROR\" && $.stage = \"escalation\" }"
       period      = 300
@@ -345,7 +346,7 @@ locals {
       eval        = 3
       dta         = 1
       ok_recovery = false # 2026-07-14: once-per-episode edge - same rationale as spot1m-01-escalation
-      desc        = "CHAIN-02 escalation: a per-minute option-chain REST leg (Dhan or Groww - read the feed field) fully failed 3+ consecutive minutes (persist-gated). Fires once per episode (edge-latched). Triage: spot leg healthy + chain failing = chain-API-surface problem (entitlement wobble short of CHAIN-01, gateway); both failing = REST/token (AUTH-GAP runbooks). NO recovered/OK page: recovery = the typed ChainFetchRecovered Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
+      desc        = "CHAIN-02 escalation: the per-minute Dhan option-chain REST leg (the Groww chain leg was removed 2026-08-21 with the Groww feed) fully failed 3+ consecutive minutes (persist-gated). Fires once per episode (edge-latched). Triage: spot leg healthy + chain failing = chain-API-surface problem (entitlement wobble short of CHAIN-01, gateway); both failing = REST/token (AUTH-GAP runbooks). NO recovered/OK page: recovery = the typed ChainFetchRecovered Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
     }
     # CHAIN-01 (added 2026-07-14 — REST-audit GAP-03): entitlement absent.
     # Plain coded filter is safe: BOTH stages (warmup = day-down at boot,
@@ -396,12 +397,12 @@ locals {
     # OrphanPositionDetected, RESILIENCE-01 -> DualInstanceDetected,
     # RESILIENCE-03 -> AuthenticationFailed, OMS-GAP-03 ->
     # CircuitBreakerOpened per dhan-rest-only-noise-lock §2a) and are NOT
-    # duplicated here on cost discipline; three are BLOCKED pending a dated
+    # duplicated here on cost discipline; two are BLOCKED pending a dated
     # operator quote (AUTH-GAP-01 / DATA-805 are Dhan-scoped, and
     # dhan-rest-only-noise-lock-2026-07-14.md §3 REJECTs any new Dhan-scoped
-    # page outside its 4-item family; GROWW-OCO-02 is compiled out by the
-    # non-default `groww_orders` cargo feature — Gate 2 of the §39 lattice —
-    # so an alarm for it would be dormant-by-construction). The FOUR below
+    # page outside its 4-item family; GROWW-OCO-02 was DELETED 2026-08-21 with the
+    # Groww order-side (its emit site is gone, so its ErrorCode variant is
+    # retired) — an alarm for it would have had no producer. The FOUR below
     # are the genuinely silent, genuinely reachable, genuinely unblocked
     # remainder. Ratchet: crates/storage/tests/
     # critical_errcode_alarm_coverage_guard.rs re-derives this whole

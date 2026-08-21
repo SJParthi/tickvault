@@ -328,7 +328,7 @@ impl DayLockedExpiryStore {
     /// Record one broker's POLICY date for `day` (first write wins per
     /// (broker, underlying, day) — re-resolution ONLY at a day flip,
     /// which this call performs when `day` differs from the locked one).
-    // TEST-EXEMPT: covered by test_cadence_expiry_store_day_lock_first_write_wins_and_day_flip + the disagreement/facade store tests (guard name-pattern mismatch).
+    // TEST-EXEMPT: covered by test_cadence_expiry_store_day_lock_first_write_wins_and_day_flip + test_cadence_expiry_store_winner_is_the_dhan_date_only + the facade store tests (guard name-pattern mismatch).
     pub fn record_policy_date(
         &self,
         day: NaiveDate,
@@ -357,9 +357,9 @@ impl DayLockedExpiryStore {
         state.day == Some(day) && state.raw[broker.index()][underlying.index()].is_some()
     }
 
-    /// The full day-checked view for `underlying` (winner + per-broker
-    /// raw provenance + the disagreement verdict). A `day` differing from
-    /// the locked one reads the empty default — never a stale answer.
+    /// The full day-checked view for `underlying` (winner + per-broker raw
+    /// provenance). A `day` differing from the locked one reads the empty
+    /// default — never a stale answer.
     #[must_use]
     pub fn view(&self, day: NaiveDate, underlying: ChainUnderlying) -> UnderlyingExpiryView {
         let state = self.lock();
@@ -396,8 +396,8 @@ impl DayLockedExpiryStore {
 /// The store IS the increment-1 [`ExpiryResolver`] seam's production
 /// implementation (its read facade): the runner stamps every chain
 /// request from the WINNING date. The `broker` parameter selects nothing
-/// here — the disagreement rule keys BOTH lanes on the Dhan-preferred
-/// winner (design: the exchange-sourced expirylist is authoritative).
+/// here — the winner IS the Dhan-sourced date and every lane keys on it
+/// (design: the exchange-sourced expirylist is authoritative).
 impl ExpiryResolver for DayLockedExpiryStore {
     fn resolved_expiry(
         &self,

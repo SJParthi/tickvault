@@ -315,7 +315,7 @@ mod tests {
         dir
     }
 
-    fn status(dhan: bool, groww: bool) -> FeedStatus {
+    fn status(dhan: bool) -> FeedStatus {
         FeedStatus {
             dhan_enabled: dhan,
             dhan_lane_running: false,
@@ -359,7 +359,7 @@ mod tests {
         let data = dir.join(FEED_STATE_DIR);
         std::fs::create_dir_all(&data).unwrap();
         let path = data.join(FEED_STATE_FILENAME);
-        persist_feed_state(&status(false, true), &path).expect("persist must succeed");
+        persist_feed_state(&status(false), &path).expect("persist must succeed");
         let loaded = load_feed_state(&path).expect("load must return Some");
         assert!(!loaded.dhan_enabled);
         assert!(
@@ -377,7 +377,7 @@ mod tests {
         let data = dir.join(FEED_STATE_DIR);
         std::fs::create_dir_all(&data).unwrap();
         let path = data.join(FEED_STATE_FILENAME);
-        persist_feed_state(&status(true, true), &path).expect("persist");
+        persist_feed_state(&status(true), &path).expect("persist");
         // No orphan tmp of ANY name (the unique `.<pid>.<nanos>.tmp` is renamed
         // away; scan the whole data dir so a unique-named leftover is caught too).
         let leftover_tmp = std::fs::read_dir(&data)
@@ -413,8 +413,8 @@ mod tests {
         );
         // Last-writer-wins: write two different snapshots; the final file is the
         // last one, always a complete valid snapshot.
-        persist_feed_state(&status(true, false), &path).expect("first persist");
-        persist_feed_state(&status(false, true), &path).expect("second persist");
+        persist_feed_state(&status(true), &path).expect("first persist");
+        persist_feed_state(&status(false), &path).expect("second persist");
         let loaded = load_feed_state(&path).expect("Some");
         assert!(!loaded.dhan_enabled, "last write wins");
         let _ = std::fs::remove_dir_all(&dir);
@@ -430,7 +430,7 @@ mod tests {
         let data = dir.join(FEED_STATE_DIR);
         std::fs::create_dir_all(&data).unwrap();
         let path = data.join(FEED_STATE_FILENAME);
-        persist_feed_state(&status(true, true), &path).expect("persist");
+        persist_feed_state(&status(true), &path).expect("persist");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "feed-state file must be owner read/write only");
         let _ = std::fs::remove_dir_all(&dir);
@@ -530,7 +530,10 @@ mod tests {
                 updated_at_ist: String::new(),
             }),
         );
-        // dhan: persisted-off narrows; groww: persisted-on cannot widen.
+        assert!(
+            !eff.dhan_enabled,
+            "a persisted dhan-off must narrow a config dhan-on"
+        );
     }
 
     /// A path that fails validation is rejected on BOTH read and write.
@@ -539,7 +542,7 @@ mod tests {
         let dir = unique_tmp_dir("badpath");
         let bad = dir.join("evil.json");
         // write rejected
-        let err = persist_feed_state(&status(true, true), &bad)
+        let err = persist_feed_state(&status(true), &bad)
             .expect_err("write to non-canonical path must error");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         // read rejected → None even if the file exists
@@ -612,36 +615,13 @@ mod tests {
         );
     }
 
-    /// 2026-07-15 operator directive ("remove the whole Groww live feed;
-    /// keep only spot 1m and option chain for both brokers"): a STALE
-    /// overlay written while Groww WAS the live feed (`groww_enabled:
-    /// true`) must NOT widen a config-off Groww — the exact Dhan
-    /// 2026-07-13 AND-gate, mirrored. Effective groww = config && persisted.
-    #[test]
-    fn test_overlay_feeds_groww_and_gate_suppresses_stale_widen() {
-        // Widen: config groww-off + persisted groww-on → stays OFF.
-        let widened = overlay_feeds(
-            FeedsConfig {
-                dhan_enabled: false,
-                ..Default::default()
-            },
-            Some(PersistedFeedState {
-                dhan_enabled: false,
-                updated_at_ist: "2026-07-14 15:00:00".to_string(),
-            }),
-        );
-        // Narrow: config groww-on + persisted groww-off → OFF.
-        let narrowed = overlay_feeds(
-            FeedsConfig {
-                dhan_enabled: false,
-                ..Default::default()
-            },
-            Some(PersistedFeedState {
-                dhan_enabled: false,
-                updated_at_ist: String::new(),
-            }),
-        );
-    }
+    // 2026-08-21: `test_overlay_feeds_groww_and_gate_suppresses_stale_widen`
+    // was deleted here. It pinned the Groww half of the narrow-only overlay
+    // rule, and `FeedsConfig` no longer has a `groww_enabled` field to widen
+    // or narrow. The Dhan half of that rule is still pinned by
+    // `test_overlay_feeds_narrows_only_and_none_is_identity` and by
+    // `test_dhan_overlay_suppressed_predicate` below, so the property itself
+    // keeps a test -- only the retired feed's mirror of it is gone.
 
     /// `dhan_overlay_suppressed` fires ONLY on the widening combination
     /// (config off + persisted on) — the one the 2026-07-13 AND-gate
@@ -672,25 +652,8 @@ mod tests {
         assert!(!dhan_overlay_suppressed(&cfg_off, None));
     }
 
-    /// `groww_overlay_suppressed` fires ONLY on the widening combination
-    /// (config off + persisted on) — the one the 2026-07-15 Groww AND-gate
-    /// suppresses — so the boot warn can never false-fire (mirror of the
-    /// Dhan predicate test).
-    #[test]
-    fn test_groww_overlay_suppressed_predicate() {
-        let cfg_off = FeedsConfig {
-            dhan_enabled: false,
-            ..Default::default()
-        };
-        let cfg_on = FeedsConfig {
-            dhan_enabled: false,
-            ..Default::default()
-        };
-        let p = |groww: bool| {
-            Some(PersistedFeedState {
-                dhan_enabled: false,
-                updated_at_ist: String::new(),
-            })
-        };
-    }
+    // 2026-08-21: `test_groww_overlay_suppressed_predicate` was deleted here
+    // together with the `groww_overlay_suppressed` function it exercised. The
+    // boot site it guarded -- one warn when a stale overlay tried to widen a
+    // config-off Groww -- cannot fire for a feed that no longer exists.
 }

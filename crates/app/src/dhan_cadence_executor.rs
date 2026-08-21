@@ -369,7 +369,7 @@ impl DhanCadenceExecutor {
             // counted the full 4-SID set incl. INDIA VIX
             // (spot_1m_rest_boot.rs `ok_count` over `SPOT_1M_REST_INDICES`
             // feeding `minute_fully_failed`) — mirrored, not core-keyed.
-            let finalized = esc.record(leg, minute_secs, ok, true);
+            let finalized = esc.record(leg, minute_secs, ok);
             let not_served = target.and_then(|(symbol, sid, outcome)| {
                 esc.record_target(leg, minute_secs, symbol, sid, outcome)
             });

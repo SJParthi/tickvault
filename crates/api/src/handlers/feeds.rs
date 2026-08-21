@@ -450,13 +450,24 @@ mod tests {
         let Json(resp) = get_feeds_health(State(state)).await;
         // Feed::ALL-driven: exactly one row per feed.
         assert_eq!(resp.feeds.len(), Feed::ALL.len());
-        let groww = resp
+        // The registry was written for TrueData above; that row must carry
+        // every one of those signals back out. Retargeted from the Groww row
+        // on 2026-08-21 when the feed was removed -- the assertions below are
+        // the ones the Groww row used to carry, not a weaker replacement.
+        let written = resp
             .feeds
             .iter()
-            .find(|r| r.feed == "groww")
-            .expect("groww row");
+            .find(|r| r.feed == "truedata")
+            .expect("truedata row");
+        assert!(written.connected);
+        assert_eq!(written.ticks_total, 1);
+        assert_eq!(written.candles_total, 1);
         // Connect+subscribe PROOF (2026-06-28): the subscribe counts surface.
+        assert_eq!(written.subscribed_stocks, 765);
+        assert_eq!(written.subscribed_indices, 2);
         // Honest-feed PROOF (2026-06-29): the decoded+emitted / dropped counts surface.
+        assert_eq!(written.decoded_emitted, 1500);
+        assert_eq!(written.decoded_dropped, 12);
         // Dhan's slot untouched → not connected, no ticks (per-feed isolation).
         let dhan = resp
             .feeds
@@ -477,52 +488,13 @@ mod tests {
         assert!(resp.dhan_enabled);
     }
 
-    /// S2b (2026-07-15): the Groww live feed is retired — enabling it at
-    /// runtime is permanently refused with 409 (the Dhan 2026-07-13
-    /// precedent), and the runtime flag is NEVER flipped or persisted.
-    #[tokio::test]
-    async fn test_set_feed_groww_enable_refused_409_after_retirement() {
-        let state = test_state(FeedsConfig {
-            dhan_enabled: true,
-            ..Default::default()
-        });
-        let res = set_feed(
-            State(state.clone()),
-            Path("groww".to_string()),
-            Json(SetFeedRequest { enabled: true }),
-        )
-        .await;
-        let Err((code, Json(body))) = res else {
-            panic!("groww enable must be refused after the 2026-07-15 retirement");
-        };
-        assert_eq!(code, StatusCode::CONFLICT);
-        assert!(
-            body.error
-                .contains("retired by operator directive 2026-07-15"),
-            "got: {}",
-            body.error
-        );
-        assert!(
-            !state.feed_runtime().is_enabled(Feed::Truedata),
-            "the refused enable must not flip the runtime flag"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_set_feed_groww_disable_flips_state() {
-        let state = test_state(FeedsConfig {
-            dhan_enabled: true,
-            ..Default::default()
-        });
-        let res = set_feed(
-            State(state.clone()),
-            Path("groww".to_string()),
-            Json(SetFeedRequest { enabled: false }),
-        )
-        .await;
-        let Json(resp) = res.expect("groww disable must succeed");
-        assert!(!state.feed_runtime().is_enabled(Feed::Truedata));
-    }
+    // 2026-08-21: two Groww toggle tests were deleted here
+    // (`test_set_feed_groww_enable_refused_409_after_retirement` and
+    // `test_set_feed_groww_disable_flips_state`). Both POSTed the literal
+    // feed name "groww", which `Feed::parse` no longer resolves, so the
+    // handler now answers 400 "unknown feed" for either direction. The
+    // closed-enum rejection path they relied on is still pinned by
+    // `test_set_feed_unknown_feed_is_rejected_400` below.
 
     #[tokio::test]
     async fn test_set_feed_dhan_disable_allowed_in_no_orders_phase() {
@@ -708,26 +680,11 @@ mod tests {
         }
     }
 
-    /// A Groww DISABLE is UNAFFECTED by the Dhan retirement gate (and by the
-    /// 2026-07-15 Groww-enable refusal — disable narrows, never widens).
-    #[tokio::test]
-    async fn test_set_feed_groww_disable_unaffected_when_dhan_config_off() {
-        let state = test_state(FeedsConfig {
-            dhan_enabled: false,
-            ..Default::default()
-        });
-        let Json(off) = set_feed(
-            State(state.clone()),
-            Path("groww".to_string()),
-            Json(SetFeedRequest { enabled: false }),
-        )
-        .await
-        .expect("groww disable unaffected");
-        assert!(
-            !state.feed_runtime().is_enabled(Feed::Dhan),
-            "dhan untouched throughout"
-        );
-    }
+    // 2026-08-21: `test_set_feed_groww_disable_unaffected_when_dhan_config_off`
+    // was deleted here. It proved a Groww disable was not collateral damage
+    // from the Dhan gate; with the feed gone there is no second feed for the
+    // Dhan gate to touch, and the test's surviving assertion (dhan untouched)
+    // is covered by the Dhan-specific toggle tests above.
 
     #[tokio::test]
     async fn test_set_feed_unknown_feed_is_rejected_400() {

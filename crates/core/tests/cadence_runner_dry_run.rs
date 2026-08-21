@@ -272,7 +272,6 @@ fn deps_with(
         expiry_store: None,
         gates,
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     (deps, shutdown)
@@ -550,7 +549,6 @@ async fn test_cadence_runner_reenable_after_both_disabled_park_still_cycles() {
         expiry_store: None,
         gates: test_gates(&CadenceConfig::default()),
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -686,7 +684,6 @@ async fn test_cadence_expiry_resolver_stamps_requests_when_resolved() {
         expiry_store: None,
         gates: test_gates(&CadenceConfig::default()),
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -890,7 +887,6 @@ async fn test_cadence_runner_expiry_boot_phase_resolves_and_stamps() {
         expiry_store: Some(Arc::clone(&store)),
         gates,
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date"); // Tuesday
@@ -1224,7 +1220,6 @@ async fn test_completion_after_midnight_suspend_abandons_cycle() {
         expiry_store: None,
         gates,
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(MidnightFlipClock {
@@ -1313,7 +1308,6 @@ async fn test_pristine_cycle_observes_disable_before_first_fire() {
         expiry_store: None,
         gates,
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -1392,7 +1386,6 @@ async fn test_pristine_cycle_observes_enable_before_first_fire() {
         expiry_store: None,
         gates,
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
@@ -1469,7 +1462,6 @@ async fn test_midcycle_disable_stops_not_yet_dispatched_fires() {
         expiry_store: None,
         gates,
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     let clock = Arc::new(TestClock {
