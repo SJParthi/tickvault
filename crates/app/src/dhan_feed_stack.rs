@@ -1713,6 +1713,9 @@ pub struct DrainCounters {
     depth_disconnects: metrics::Counter,
     depth_length_mismatch: metrics::Counter,
     truncated: metrics::Counter,
+    /// Bytes abandoned mid-frame by the two give-up arms. See
+    /// [`DRAIN_ABANDONED_BYTES_COUNTER`] for why this is bytes and not packets.
+    abandoned_bytes: metrics::Counter,
     xverify_ran: metrics::Counter,
     xverify_failed: metrics::Counter,
     xverify_no_token: metrics::Counter,
@@ -1774,6 +1777,7 @@ pub fn counters() -> &'static DrainCounters {
         depth_disconnects: metrics::counter!(DEPTH_COUNTER, "outcome" => "disconnects"),
         depth_length_mismatch: metrics::counter!(DEPTH_COUNTER, "outcome" => "length_mismatch"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
+        abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
         xverify_ran: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "ran"),
         xverify_failed: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed"),
         xverify_no_token: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token"),
@@ -2077,6 +2081,30 @@ const _: () = assert!(
 /// Counter: frames taken off the ring, labelled by what the parser made of
 /// them.
 pub const DRAIN_FRAMES_COUNTER: &str = "tv_dhan_feed_drain_frames_total";
+
+/// Counter: bytes of a frame ABANDONED without being decoded.
+///
+/// A single WebSocket message stacks up to ~1,600 packets. When the walk hits
+/// an unrecognised response code or a trailing partial packet it stops — and
+/// stopping is the RIGHT call, because resynchronising on a guess would
+/// fabricate ticks out of misaligned bytes, which is worse than losing them.
+///
+/// What was wrong was the ACCOUNTING. Both arms incremented the frame counter
+/// by ONE, so a frame that dropped 1,500 packets and a frame that dropped one
+/// reported the same number, and an operator reading `unparseable = 1` would
+/// reasonably conclude a single bad packet. This records the magnitude the
+/// outcome counter cannot: the remaining byte count at the moment the walk
+/// gave up. Non-zero here means ticks were lost and says roughly how many.
+///
+/// Deliberately BYTES, not packets: the packet count of the remainder is
+/// unknowable — that is exactly what "we could not decode it" means — and a
+/// divide-by-typical-size estimate would be a fabricated number in a counter
+/// whose whole purpose is to stop fabrication.
+///
+/// Not EMF-selected today, so it is visible on `/metrics` and not in
+/// CloudWatch. Stated rather than assumed: shipping it is a cost decision
+/// (~$0.30/mo) that belongs with the alarm that would read it.
+pub const DRAIN_ABANDONED_BYTES_COUNTER: &str = "tv_dhan_feed_abandoned_bytes_total";
 
 /// Gauge: rows appended to the ILP buffer but not yet flushed to QuestDB.
 /// A buffer is a staging area, not storage — a rising value means rows are
@@ -2875,11 +2903,21 @@ pub fn drain_main_feed_frame(
             // than resynchronising on a guess, which would fabricate ticks.
             c.unparseable.increment(1);
             out.unparseable = out.unparseable.saturating_add(1);
+            // The outcome counter above says "a frame gave up". THIS says how
+            // much of it was thrown away, which is the number that decides
+            // whether this was one stray packet or most of a 1,600-packet
+            // message.
+            let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
+            c.abandoned_bytes.increment(abandoned);
+            out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         };
         let end = offset.saturating_add(len);
         if end > frame.bytes.len() {
             c.truncated.increment(1);
+            let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
+            c.abandoned_bytes.increment(abandoned);
+            out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         }
         match dispatch_frame(&frame.bytes[offset..end], received_at_nanos) {
@@ -3010,6 +3048,11 @@ pub struct FrameOutcome {
     /// unconditionally. (CORRECTED 2026-08-20: said "unless `[dhan_feed]
     /// persist_full_mode_depth` is on", a key that exists nowhere.)
     pub inline_depth_rows: u64,
+    /// Bytes of this frame the walk never decoded, because it hit an unknown
+    /// response code or a trailing partial packet and stopped rather than
+    /// guessing. Returned as well as counted so a test can assert the
+    /// magnitude — the whole reason this struct exists.
+    pub abandoned_bytes: u64,
 }
 
 /// What one depth frame produced.
@@ -9884,6 +9927,135 @@ mod inline_depth_tests {
         assert!(
             ingest.inline_depth.is_some(),
             "the sink must survive the flush for the next packet"
+        );
+    }
+}
+
+/// Accounting for the two arms where the frame walk gives up part-way.
+#[cfg(test)]
+mod frame_walk_accounting_tests {
+    use super::*;
+
+    /// An arbitrary real epoch second. The session window does not matter
+    /// here: an out-of-session tick still WRITES A ROW and still counts as
+    /// folded, so these assertions hold whatever the clock says.
+    const ANY_LTT: u32 = 1_755_141_600;
+
+    fn ticker_packet(security_id: u32, ltp: f32, ltt: u32) -> [u8; 16] {
+        let mut p = [0u8; 16];
+        p[0] = 2; // response code: ticker
+        p[1] = 16; // message length
+        p[3] = 0; // exchange segment: IDX_I
+        p[4..8].copy_from_slice(&security_id.to_le_bytes());
+        p[8..12].copy_from_slice(&ltp.to_le_bytes());
+        p[12..16].copy_from_slice(&ltt.to_le_bytes());
+        p
+    }
+    /// A frame that stacks many packets and hits an unknown response code
+    /// part-way must report HOW MUCH it threw away, not just that it gave up.
+    ///
+    /// The give-up itself is correct and is not what this tests: resynchronising
+    /// on a guess would fabricate ticks out of misaligned bytes, which is worse
+    /// than losing them. What was wrong was the accounting — both give-up arms
+    /// bumped the frame counter by ONE, so a frame that dropped 1,500 packets
+    /// and a frame that dropped one reported the same number. An operator
+    /// reading `unparseable = 1` would reasonably conclude a single bad packet.
+    #[test]
+    fn an_unknown_packet_code_reports_the_bytes_it_abandoned() {
+        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&good);
+        // An unrecognised response code, followed by what would have been two
+        // more perfectly good ticker packets.
+        bytes.push(0xFE);
+        bytes.extend_from_slice(&[0u8; 15]);
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&good);
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+
+        assert_eq!(out.folded, 2, "the two packets before the bad code fold");
+        assert_eq!(out.unparseable, 1, "one give-up, as before");
+        assert_eq!(
+            out.abandoned_bytes, 48,
+            "16 bytes of the unknown packet plus the two 16-byte ticker packets \
+             behind it were thrown away — reporting 1 here is what made a \
+             large loss look like a small one. outcome={out:?}"
+        );
+    }
+
+    /// Non-vacuity: a frame that decodes cleanly must abandon NOTHING, or the
+    /// assertion above would pass against a counter that always fires.
+    #[test]
+    fn a_clean_frame_abandons_no_bytes() {
+        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&good);
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+
+        assert_eq!(out.folded, 2);
+        assert_eq!(out.unparseable, 0);
+        assert_eq!(out.abandoned_bytes, 0, "a clean frame loses nothing");
+    }
+
+    /// A trailing PARTIAL packet is the other give-up arm and must account the
+    /// same way — it was the second half of the same blind spot.
+    #[test]
+    fn a_truncated_trailing_packet_reports_its_abandoned_bytes() {
+        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        // A ticker header promising 16 bytes, with only 9 present.
+        bytes.extend_from_slice(&good[..9]);
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+
+        assert_eq!(out.folded, 1);
+        assert_eq!(
+            out.abandoned_bytes, 9,
+            "the 9 bytes of the partial packet are lost and must be counted"
         );
     }
 }
