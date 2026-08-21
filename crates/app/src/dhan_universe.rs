@@ -253,6 +253,10 @@ pub fn next_wait(
 /// truncated file that still parses as JSON is caught by comparing them, which
 /// is cheaper than trusting a length nobody checked.
 #[derive(serde::Serialize)]
+/// The narrowed spot artifact: NSE indices PLUS the F&O stock underlyings.
+/// The type and the filename keep the `fno` name for continuity with the
+/// path helper and its tests, but the CONTENTS are both halves — see
+/// `narrowed_spot_mappings` for why the indices half is not optional.
 struct FnoUnderlyingArtifact {
     count: usize,
     /// Named `mappings` -- the SAME key the mapping artifact uses -- so the
@@ -924,12 +928,17 @@ fn write_mapping_atomic(
     // behaviour rather than to a silently narrower universe. That is the
     // safe direction: too many instruments is a capacity error the lane
     // reports; too few is a coverage hole nothing reports.
-    let fno = fno_underlying_mappings(master);
-    let fno_count = fno.len();
-    match write_fno_underlying_artifact(date, fno) {
+    let narrowed = narrowed_spot_mappings(master);
+    let fno_count = narrowed
+        .iter()
+        .filter(|e| e.index_name == FNO_UNDERLYING_TAG)
+        .count();
+    let index_count_narrowed = narrowed.len() - fno_count;
+    match write_fno_underlying_artifact(date, narrowed) {
         Ok(fno_path) => info!(
             path = %fno_path.display(),
             fno_underlyings = fno_count,
+            nse_indices = index_count_narrowed,
             "F&O underlying set written"
         ),
         Err(e) => error!(
@@ -943,7 +952,29 @@ fn write_mapping_atomic(
     Ok(())
 }
 
-/// Serialise the F&O underlying set atomically (tmp then rename), so a reader
+/// The NARROWED spot universe: NSE indices PLUS the F&O stock underlyings.
+///
+/// The indices half is not optional and is the reason this function exists
+/// rather than the write site calling `fno_underlying_mappings` directly.
+/// `select_live_universe` REPLACES the hardcoded index seeds with the
+/// artifact's index rows and leaves the seeds standing when there are none —
+/// so an artifact carrying only underlyings would have produced 4 indices
+/// instead of ~119, silently, while every log line still read "widened".
+/// Composing both halves in ONE named function is what makes that a testable
+/// claim instead of an assumption about a call site.
+///
+/// Indices go FIRST: the file's whole point is "indices + underlyings", and a
+/// reader opening it should meet the anchor set at the top.
+fn narrowed_spot_mappings(
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+) -> Vec<MappingEntry> {
+    let mut out = nse_index_mappings(master);
+    out.extend(fno_underlying_mappings(master));
+    out
+}
+
+/// Serialise the NARROWED SPOT SET — NSE indices plus the F&O stock
+/// underlyings — atomically (tmp then rename), so a reader
 /// never observes a half-written file. Same shape as the mapping artifact's
 /// own write for exactly that reason.
 fn write_fno_underlying_artifact(
@@ -1131,6 +1162,70 @@ mod tests {
             option_leg: tickvault_core::instrument::master_csv::OptionLeg::None,
             underlying_symbol: underlying.to_owned(),
         }
+    }
+
+    #[test]
+    fn the_narrowed_spot_set_carries_the_indices_and_not_only_the_underlyings() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![
+            mrow(13, "NIFTY 50", InstrumentClass::Index, "", "", "NSE"),
+            mrow(25, "NIFTY BANK", InstrumentClass::Index, "", "", "NSE"),
+            mrow(500, "RELIANCE", InstrumentClass::Equity, "", "EQ", "NSE"),
+            mrow(
+                900,
+                "RELIANCE28AUGFUT",
+                InstrumentClass::StockFuture,
+                "RELIANCE",
+                "",
+                "NSE",
+            ),
+        ];
+
+        let out = narrowed_spot_mappings(&master);
+
+        // The defect this test exists for: an artifact of underlyings ALONE
+        // leaves `select_live_universe` standing on the 4 hardcoded seeds,
+        // so ~115 NSE indices vanish while the log still says "widened".
+        let indices: Vec<u64> = out
+            .iter()
+            .filter(|m| {
+                m.exchange_segment == tickvault_common::types::ExchangeSegment::IdxI.binary_code()
+            })
+            .map(|m| m.security_id)
+            .collect();
+        assert_eq!(
+            indices,
+            vec![13, 25],
+            "every NSE index must be in the narrowed set — it is half of what the operator named"
+        );
+
+        let underlyings: Vec<u64> = out
+            .iter()
+            .filter(|m| m.index_name == FNO_UNDERLYING_TAG)
+            .map(|m| m.security_id)
+            .collect();
+        assert_eq!(underlyings, vec![500], "and the F&O underlying half too");
+
+        assert_eq!(out.len(), 3, "indices + underlyings, nothing else");
+    }
+
+    #[test]
+    fn a_master_with_no_indices_narrows_to_the_underlyings_without_inventing_any() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![
+            mrow(500, "RELIANCE", InstrumentClass::Equity, "", "EQ", "NSE"),
+            mrow(
+                900,
+                "RELIANCE28AUGFUT",
+                InstrumentClass::StockFuture,
+                "RELIANCE",
+                "",
+                "NSE",
+            ),
+        ];
+        let out = narrowed_spot_mappings(&master);
+        assert_eq!(out.len(), 1, "no index rows are fabricated to fill a gap");
+        assert_eq!(out[0].security_id, 500);
     }
 
     #[test]
