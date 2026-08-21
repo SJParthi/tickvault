@@ -1463,6 +1463,88 @@ mod tests {
         rows
     }
 
+    /// The pre-open call auction settles at 09:08–09:12 IST and publishes a
+    /// real exchange equilibrium price for every scrip. That price is exactly
+    /// what the ATM window needs, and it exists THREE MINUTES BEFORE the
+    /// 09:15 open — so nothing about locating at-the-money requires waiting
+    /// for the continuous session to start.
+    ///
+    /// This is pinned because the opposite was ASSUMED. The reasoning ran
+    /// "ATM needs a spot price, our feed's ticks start at 09:15, therefore
+    /// contracts cannot resolve before 09:15" — and every step of that is
+    /// true except the middle one. There is no session filter anywhere in
+    /// this path:
+    ///
+    ///   * a pre-open tick IS persisted — `dhan_feed_stack`'s
+    ///     `test_pre_open_tick_is_written_even_though_it_opens_no_candle`
+    ///     pins that the candle-session rule stopped deciding what gets
+    ///     CAPTURED;
+    ///   * `build_spot_price_query` filters on `ts >= today AND ltp > 0` and
+    ///     nothing else, so a 09:10 price qualifies exactly like a 09:20 one;
+    ///   * and the selection below treats it as any other price.
+    ///
+    /// The chain was already built. What was missing was anybody checking,
+    /// which is why a capability we already had got written down as a
+    /// limitation we had to engineer around.
+    #[test]
+    fn a_pre_open_price_locates_at_the_money_exactly_like_a_session_price() {
+        let rows = stock_ladder("RELIANCE");
+
+        // The identical spot, reached two ways. The selector cannot tell them
+        // apart, and that indistinguishability IS the property under test.
+        let from_pre_open = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 25_000);
+        let from_session = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 25_000);
+
+        assert_eq!(
+            from_pre_open.atm_window_used, 25,
+            "a pre-open equilibrium price must yield the FULL authorized window, \
+             not a narrowed one"
+        );
+        assert_eq!(from_pre_open.stock_options, 102, "51 strikes x 2 legs");
+        assert_eq!(
+            from_pre_open.underlyings_without_spot, 0,
+            "the underlying is priced — there is nothing left to wait for"
+        );
+        assert_eq!(from_pre_open.stock_options, from_session.stock_options);
+        assert_eq!(from_pre_open.atm_window_used, from_session.atm_window_used);
+    }
+
+    /// The query half of the same claim, asserted against the SQL itself.
+    ///
+    /// A session predicate added here later would silently push contract
+    /// resolution back to 09:15 and nothing else in the tree would fail — the
+    /// symptom is three lost minutes every morning, which no test would catch
+    /// and no counter would report.
+    #[test]
+    fn the_spot_price_query_has_no_session_filter_so_pre_open_prices_qualify() {
+        let sql = build_spot_price_query(1_700_000_000_000_000_000);
+        let lower = sql.to_lowercase();
+        assert!(
+            lower.contains("ltp > 0"),
+            "an unpriced row must still be excluded — this test must not be \
+             read as licence to accept zeros"
+        );
+        for banned in ["session", "09:15", "33300", "market_hours", "continuous"] {
+            assert!(
+                !lower.contains(banned),
+                "`{banned}` appears in the spot price query. A session bound here \
+                 discards the 09:08-09:12 pre-open equilibrium price, which is a \
+                 real exchange print and the earliest at-the-money can be known. \
+                 sql={sql}"
+            );
+        }
+    }
+
+    /// Non-vacuity for the pair above: an underlying with NO price at all must
+    /// still be refused. Otherwise "pre-open prices are accepted" would be
+    /// indistinguishable from "anything is accepted".
+    #[test]
+    fn accepting_pre_open_prices_does_not_accept_the_absence_of_one() {
+        let rows = stock_ladder("RELIANCE");
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.underlyings_without_spot, 1);
+    }
     #[test]
     fn stock_options_take_the_atm_window_both_legs() {
         let rows = stock_ladder("RELIANCE");
