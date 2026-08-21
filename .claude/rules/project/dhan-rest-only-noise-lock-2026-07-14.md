@@ -79,6 +79,20 @@ never on a single-broker outage (those stay the log-only `expiry_unresolved` sta
 pre-market deadline page). Emit site: the `newly_disagreeing` arm in
 `crates/core/src/cadence/runner.rs`; sink threaded from boot via `cadence_boot.rs`.
 
+> **RETIRED 2026-08-21 -- this page can no longer fire, and the row stays as the
+> dated record of why.** The 2026-08-21 directive removed the second broker
+> entirely (authorization in `websocket-connection-scope-lock.md`, "2026-08-21
+> (THIRD quote of the day)"). A cross-broker disagreement needs two brokers to
+> resolve and disagree; with one, `newly_disagreeing` is unreachable. The
+> `CadenceExpiryDisagreement` variant, its emit arm and the `notifier` the boot
+> threaded to reach it are all deleted -- leaving them would have meant a
+> declared Telegram family that nothing can send, which is exactly the
+> permanently quiet surface this table's deleted rows exist to prevent. The
+> four-item Dhan family is UNCHANGED by this retirement: this was a
+> cross-broker data-integrity page, never a Dhan-failure family, so nothing in
+> the count moves. Re-introducing a cross-vendor parity page needs a second
+> live vendor AND a fresh dated quote here first.
+
 | Component | Disposition |
 |---|---|
 | Mid-session profile watchdog Telegram pages (`MidSessionProfileInvalidated` Critical + `TokenForcedRemintTriggered` High) | **Variants DELETED.** The 900s `/v2/profile` probe + the AUTH-GAP-05 forced re-mint machinery are KEPT and run SILENTLY (coded `error!` + counters only); a terminal re-mint failure routes to the family-(3) Critical. |
