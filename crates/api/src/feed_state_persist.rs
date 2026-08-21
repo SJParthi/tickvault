@@ -56,7 +56,6 @@ pub const FEED_STATE_FILENAME: &str = "feed-state.json";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedFeedState {
     pub dhan_enabled: bool,
-    pub groww_enabled: bool,
     #[serde(default)]
     pub updated_at_ist: String,
 }
@@ -174,7 +173,6 @@ pub fn persist_feed_state(status: &FeedStatus, path: &Path) -> std::io::Result<(
     }
     let payload = PersistedFeedState {
         dhan_enabled: status.dhan_enabled,
-        groww_enabled: status.groww_enabled,
         updated_at_ist: now_ist_stamp(),
     };
     let json = serde_json::to_vec_pretty(&payload)
@@ -273,7 +271,6 @@ pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>)
             // persisted `groww_enabled: true` can never re-enable it over
             // config-off. Persisted-off still honors the operator's last
             // disable on a config-on boot.
-            groww_enabled: config.groww_enabled && p.groww_enabled,
             // TrueData (feed #4): the persisted overlay carries only the
             // Dhan/Groww runtime toggles today, so the TrueData config
             // passes through unchanged (no overlay resurrection concern —
@@ -295,20 +292,6 @@ pub fn dhan_overlay_suppressed(
     persisted: Option<&PersistedFeedState>,
 ) -> bool {
     matches!(persisted, Some(p) if p.dhan_enabled && !config.dhan_enabled)
-}
-
-/// True when [`overlay_feeds`] would SUPPRESS a widening GROWW overlay —
-/// i.e. the persisted `data/feed-state.json` says `groww_enabled: true`
-/// while the config says `false`. Pure companion predicate (mirror of
-/// [`dhan_overlay_suppressed`]) so the boot site can log ONE `warn!`
-/// naming the 2026-07-15 Groww live-feed retirement without this module
-/// doing any I/O or logging.
-#[must_use]
-pub fn groww_overlay_suppressed(
-    config: &FeedsConfig,
-    persisted: Option<&PersistedFeedState>,
-) -> bool {
-    matches!(persisted, Some(p) if p.groww_enabled && !config.groww_enabled)
 }
 
 #[cfg(test)]
@@ -335,8 +318,6 @@ mod tests {
     fn status(dhan: bool, groww: bool) -> FeedStatus {
         FeedStatus {
             dhan_enabled: dhan,
-            groww_enabled: groww,
-            groww_lane_running: false,
             dhan_lane_running: false,
             dhan_disable_allowed: true,
         }
@@ -381,7 +362,6 @@ mod tests {
         persist_feed_state(&status(false, true), &path).expect("persist must succeed");
         let loaded = load_feed_state(&path).expect("load must return Some");
         assert!(!loaded.dhan_enabled);
-        assert!(loaded.groww_enabled);
         assert!(
             !loaded.updated_at_ist.is_empty(),
             "updated_at_ist stamp written"
@@ -407,7 +387,7 @@ mod tests {
         assert!(!leftover_tmp, "no .tmp file left after atomic rename");
         // Real file parses to the written flags.
         let loaded = load_feed_state(&path).expect("Some");
-        assert!(loaded.dhan_enabled && loaded.groww_enabled);
+        assert!(loaded.dhan_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -436,10 +416,7 @@ mod tests {
         persist_feed_state(&status(true, false), &path).expect("first persist");
         persist_feed_state(&status(false, true), &path).expect("second persist");
         let loaded = load_feed_state(&path).expect("Some");
-        assert!(
-            !loaded.dhan_enabled && loaded.groww_enabled,
-            "last write wins"
-        );
+        assert!(!loaded.dhan_enabled, "last write wins");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -468,21 +445,14 @@ mod tests {
         // suppressed by the 2026-07-15 Groww AND-gate.
         let config = FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: false,
             ..Default::default()
         };
         let persisted = Some(PersistedFeedState {
             dhan_enabled: false,
-            groww_enabled: true,
             updated_at_ist: "2026-06-26 14:31:07".to_string(),
         });
         let effective = overlay_feeds(config, persisted);
         assert!(!effective.dhan_enabled, "persisted dhan-off narrows");
-        assert!(
-            !effective.groww_enabled,
-            "stale persisted groww-on must NOT widen a config-off Groww \
-             (2026-07-15: the Groww live feed is retired)"
-        );
     }
 
     /// No overlay → the config default is returned unchanged.
@@ -490,12 +460,10 @@ mod tests {
     fn test_overlay_none_keeps_config_default() {
         let config = FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: false,
             ..Default::default()
         };
         let effective = overlay_feeds(config.clone(), None);
         assert_eq!(effective.dhan_enabled, config.dhan_enabled);
-        assert_eq!(effective.groww_enabled, config.groww_enabled);
     }
 
     /// A corrupt overlay file → load None → boot falls back to config default.
@@ -513,12 +481,10 @@ mod tests {
         // The boot then uses the config default unchanged.
         let config = FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: false,
             ..Default::default()
         };
         let effective = overlay_feeds(config.clone(), load_feed_state(&path));
         assert_eq!(effective.dhan_enabled, config.dhan_enabled);
-        assert_eq!(effective.groww_enabled, config.groww_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -553,22 +519,18 @@ mod tests {
     fn test_overlay_feeds_narrows_only_and_none_is_identity() {
         let cfg = FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: false,
             ..Default::default()
         };
         let identity = overlay_feeds(cfg.clone(), None);
         assert_eq!(identity.dhan_enabled, cfg.dhan_enabled);
-        assert_eq!(identity.groww_enabled, cfg.groww_enabled);
         let eff = overlay_feeds(
             cfg,
             Some(PersistedFeedState {
                 dhan_enabled: false,
-                groww_enabled: true,
                 updated_at_ist: String::new(),
             }),
         );
         // dhan: persisted-off narrows; groww: persisted-on cannot widen.
-        assert!(!eff.dhan_enabled && !eff.groww_enabled);
     }
 
     /// A path that fails validation is rejected on BOTH read and write.
@@ -591,7 +553,6 @@ mod tests {
     fn test_persisted_feed_state_serde_round_trip() {
         let s = PersistedFeedState {
             dhan_enabled: false,
-            groww_enabled: true,
             updated_at_ist: "2026-06-26 09:00:00".to_string(),
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -605,7 +566,6 @@ mod tests {
         let json = r#"{ "dhan_enabled": true, "groww_enabled": false }"#;
         let s: PersistedFeedState = serde_json::from_str(json).unwrap();
         assert!(s.dhan_enabled);
-        assert!(!s.groww_enabled);
         assert!(s.updated_at_ist.is_empty(), "missing field defaults empty");
     }
 
@@ -618,12 +578,10 @@ mod tests {
     fn test_overlay_feeds_dhan_and_gate_suppresses_stale_widen() {
         let config = FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: true,
             ..Default::default()
         };
         let persisted = Some(PersistedFeedState {
             dhan_enabled: true, // stale pre-directive webpage toggle
-            groww_enabled: true,
             updated_at_ist: "2026-07-12 15:00:00".to_string(),
         });
         let effective = overlay_feeds(config, persisted);
@@ -632,7 +590,6 @@ mod tests {
             "config dhan-off must win over a stale persisted dhan-on \
              (2026-07-13 directive: the live WS lane is retired)"
         );
-        assert!(effective.groww_enabled, "groww overlay unaffected");
     }
 
     /// The narrow direction is unchanged: config dhan-on + persisted
@@ -642,12 +599,10 @@ mod tests {
     fn test_overlay_feeds_dhan_narrow_still_wins() {
         let config = FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: false,
             ..Default::default()
         };
         let persisted = Some(PersistedFeedState {
             dhan_enabled: false,
-            groww_enabled: false,
             updated_at_ist: String::new(),
         });
         let effective = overlay_feeds(config, persisted);
@@ -668,36 +623,23 @@ mod tests {
         let widened = overlay_feeds(
             FeedsConfig {
                 dhan_enabled: false,
-                groww_enabled: false,
                 ..Default::default()
             },
             Some(PersistedFeedState {
                 dhan_enabled: false,
-                groww_enabled: true, // stale pre-retirement webpage toggle
                 updated_at_ist: "2026-07-14 15:00:00".to_string(),
             }),
-        );
-        assert!(
-            !widened.groww_enabled,
-            "config groww-off must win over a stale persisted groww-on \
-             (2026-07-15 directive: the Groww live feed is retired)"
         );
         // Narrow: config groww-on + persisted groww-off → OFF.
         let narrowed = overlay_feeds(
             FeedsConfig {
                 dhan_enabled: false,
-                groww_enabled: true,
                 ..Default::default()
             },
             Some(PersistedFeedState {
                 dhan_enabled: false,
-                groww_enabled: false,
                 updated_at_ist: String::new(),
             }),
-        );
-        assert!(
-            !narrowed.groww_enabled,
-            "persisted groww-off must still narrow"
         );
     }
 
@@ -708,18 +650,15 @@ mod tests {
     fn test_dhan_overlay_suppressed_predicate() {
         let cfg_off = FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: true,
             ..Default::default()
         };
         let cfg_on = FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: true,
             ..Default::default()
         };
         let p = |dhan: bool| {
             Some(PersistedFeedState {
                 dhan_enabled: dhan,
-                groww_enabled: true,
                 updated_at_ist: String::new(),
             })
         };
@@ -741,28 +680,17 @@ mod tests {
     fn test_groww_overlay_suppressed_predicate() {
         let cfg_off = FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: false,
             ..Default::default()
         };
         let cfg_on = FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: true,
             ..Default::default()
         };
         let p = |groww: bool| {
             Some(PersistedFeedState {
                 dhan_enabled: false,
-                groww_enabled: groww,
                 updated_at_ist: String::new(),
             })
         };
-        assert!(
-            groww_overlay_suppressed(&cfg_off, p(true).as_ref()),
-            "config off + persisted on = suppressed (warn fires)"
-        );
-        assert!(!groww_overlay_suppressed(&cfg_off, p(false).as_ref()));
-        assert!(!groww_overlay_suppressed(&cfg_on, p(true).as_ref()));
-        assert!(!groww_overlay_suppressed(&cfg_on, p(false).as_ref()));
-        assert!(!groww_overlay_suppressed(&cfg_off, None));
     }
 }

@@ -222,8 +222,6 @@ pub struct CadenceRunnerDeps<D> {
     pub dry_run: bool,
     /// Level-triggered Dhan lane enable flag (read per cycle per lane).
     pub dhan_enabled: Arc<AtomicBool>,
-    /// Level-triggered Groww lane enable flag.
-    pub groww_enabled: Arc<AtomicBool>,
     /// Typed Telegram sink (R6, 2026-07-16): the expiry cross-broker
     /// DISAGREEMENT page (`CadenceExpiryDisagreement`, edge-latched once
     /// per underlying per day) dispatches through this handle. `None` =
@@ -245,7 +243,6 @@ impl<D> Clone for CadenceRunnerDeps<D> {
             gates: Arc::clone(&self.gates),
             dry_run: self.dry_run,
             dhan_enabled: Arc::clone(&self.dhan_enabled),
-            groww_enabled: Arc::clone(&self.groww_enabled),
             notifier: self.notifier.as_ref().map(Arc::clone),
             shutdown: Arc::clone(&self.shutdown),
         }
@@ -427,8 +424,7 @@ where
         // minute). Missed boundaries are counted LOUD on resume by the
         // boundary_skipped check below.
         let dhan_on = deps.dhan_enabled.load(Ordering::Acquire);
-        let groww_on = deps.groww_enabled.load(Ordering::Acquire);
-        if !dhan_on && !groww_on {
+        if !dhan_on {
             if !lanes_parked {
                 lanes_parked = true;
                 info!(
@@ -521,7 +517,7 @@ where
             shutdown_fut.as_mut(),
         )
         .await;
-        let (dhan_dirty, dhan_spot_dirty, groww_dirty) = match outcome {
+        let (dhan_dirty, dhan_spot_dirty) = match outcome {
             CycleRun::Shutdown => return LoopExit::Shutdown,
             // The IST calendar date changed mid-cycle (suspend across
             // midnight) — the cycle was dropped with no partial emit; the
@@ -530,8 +526,8 @@ where
             CycleRun::Verdict {
                 dhan_dirty,
                 dhan_spot_dirty,
-                groww_dirty,
-            } => (dhan_dirty, dhan_spot_dirty, groww_dirty),
+                ..
+            } => (dhan_dirty, dhan_spot_dirty),
         };
         // Adaptive concurrency bookkeeping (2026-07-15): the spot/shape
         // ladders fold their own rate-limit dirty flags — degrade after
@@ -737,7 +733,6 @@ async fn run_expiry_resolution_loop<C, D>(
         let session_over = now_secs >= super::schedule::CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST;
         if deps.calendar.is_trading_day(today) && !session_over {
             let dhan_on = deps.dhan_enabled.load(Ordering::Acquire);
-            let groww_on = deps.groww_enabled.load(Ordering::Acquire);
             let mut attempted = [[false; ChainUnderlying::COUNT]; Feed::COUNT];
             if dhan_on {
                 attempted[Feed::Dhan.index()] = resolve_broker_expiries(
@@ -1108,7 +1103,6 @@ enum CycleRun {
     Verdict {
         dhan_dirty: bool,
         dhan_spot_dirty: bool,
-        groww_dirty: bool,
     },
 }
 
@@ -1165,7 +1159,6 @@ struct DegradeFlags {
     spot_empty: bool,
     /// A chain leg returned 2xx-without-usable-data (either lane).
     chain_empty: bool,
-    groww_fallback: bool,
     cross_fill: bool,
     chain_embedded_spot: bool,
     moneyness_unknown: bool,
@@ -1197,7 +1190,6 @@ impl DegradeFlags {
             || self.queue_delay
             || self.spot_empty
             || self.chain_empty
-            || self.groww_fallback
             || self.cross_fill
             || self.chain_embedded_spot
             || self.moneyness_unknown
@@ -1214,7 +1206,6 @@ impl DegradeFlags {
             (self.queue_delay, "queue_delay"),
             (self.spot_empty, "spot_empty"),
             (self.chain_empty, "chain_empty"),
-            (self.groww_fallback, "groww_fallback"),
             (self.cross_fill, "cross_fill"),
             (self.chain_embedded_spot, "chain_embedded_spot"),
             (self.moneyness_unknown, "moneyness_unknown"),
@@ -1373,7 +1364,6 @@ where
     D: CadenceExecutor + 'static,
 {
     let dhan_enabled = deps.dhan_enabled.load(Ordering::Acquire);
-    let groww_enabled = deps.groww_enabled.load(Ordering::Acquire);
     let cycle_date = clock.ist_date();
 
     let mut cycle = CycleState {
@@ -1382,8 +1372,6 @@ where
         chain_retries_used: [0; 3],
         spot_retries_used: [0; 4],
         next_chain_retry_slot: 0,
-        groww_verdict_passed: false,
-        groww_fallback_launched: false,
         late_wake_flagged: false,
         skew_flagged: false,
         last_observed_wall: i64::MIN,
@@ -1398,7 +1386,6 @@ where
         // reseed's one-slot hold is an EXPECTED deferral source.
         dispatch_ran_late: demote_nominal,
         dhan_spot_dirty: false,
-        groww_dirty: false,
         dispatched_any: false,
     };
     // Anchor FSM arming (level-triggered per cycle per lane).
@@ -1407,7 +1394,6 @@ where
         return CycleRun::Verdict {
             dhan_dirty: false,
             dhan_spot_dirty: false,
-            groww_dirty: false,
         };
     }
 
@@ -1501,11 +1487,9 @@ where
                 // wake chunk instead of being frozen at cycle entry.
                 if !cycle.dispatched_any {
                     let dhan_now = deps.dhan_enabled.load(Ordering::Acquire);
-                    let groww_now = deps.groww_enabled.load(Ordering::Acquire);
                     if dhan_now != cycle.dhan.enabled {
                         info!(
                             dhan_enabled = dhan_now,
-                            groww_enabled = groww_now,
                             "cadence: runtime lane toggle observed before the \
                              cycle's first fire — cycle re-armed from the \
                              fresh flags"
@@ -1607,7 +1591,6 @@ where
     CycleRun::Verdict {
         dhan_dirty: cycle.dhan.enabled && cycle.dhan.arming_failure,
         dhan_spot_dirty: cycle.dhan_spot_dirty,
-        groww_dirty: cycle.groww_dirty,
     }
 }
 
@@ -1619,17 +1602,6 @@ struct CycleState {
     chain_retries_used: [u32; 3],
     spot_retries_used: [u32; 4],
     next_chain_retry_slot: usize,
-    /// Per-leg Groww completion count (burst = 1st, fallback = 2nd): a
-    /// Per-leg dispatched-but-not-completed flags (F4, 2026-07-15): the
-    /// PHASE-B2 (item 2): per-leg Malformed latch for the Groww lane —
-    /// The GrowwVerdict instant passed (F4/L3): a leg completing Err on
-    /// its 1st attempt after it was skipped in flight has no later
-    /// verdict — the L3 DEFERRED fallback (2026-07-15) dispatches its one
-    /// fallback attempt AT that completion when it can still land inside
-    /// the lane cutoff; only when it cannot is the leg terminal on its
-    /// 1st attempt.
-    groww_verdict_passed: bool,
-    groww_fallback_launched: bool,
     late_wake_flagged: bool,
     /// Backward-wall-step already logged this cycle (coalesced).
     skew_flagged: bool,
@@ -1649,11 +1621,6 @@ struct CycleState {
     /// ≥1 Dhan SPOT outcome this cycle was RateLimited — feeds the
     /// spot-concurrency ladder's dirty streak (2026-07-15).
     dhan_spot_dirty: bool,
-    /// ≥1 Groww leg outcome this cycle was RateLimited — feeds the
-    /// fallback-shape ladder's dirty streak (2026-07-15; Assumed — the
-    /// coordinator's "persistent failure/rate-limit" read as the
-    /// rate-limit class only, mirroring the Dhan spot-dirty rule).
-    groww_dirty: bool,
     /// TRUE once the first cycle event has POPPED (CONC-NEW-1, hostile
     /// round 1 2026-07-15): while false the cycle is PRISTINE — nothing
     /// dispatched, no completion possible — so the timer arm may safely
@@ -1674,7 +1641,7 @@ fn arm_lane(lane: &mut LaneRun) {
         lane.fsm(CadenceEvent::OffSessionOrDisabled);
         // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
         lane.resolution = Some(resolution_token(
-            lane.flags.cross_fill || lane.flags.groww_fallback,
+            lane.flags.cross_fill,
             lane.late_retry_attempts,
         ));
         lane.resolved = true;
@@ -1734,7 +1701,7 @@ fn drop_lane_runtime_disabled(lane: &mut LaneRun) {
     lane.fsm(CadenceEvent::Shutdown);
     // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
     lane.resolution = Some(resolution_token(
-        lane.flags.cross_fill || lane.flags.groww_fallback,
+        lane.flags.cross_fill,
         lane.late_retry_attempts,
     ));
     lane.resolved = true;
@@ -2228,7 +2195,6 @@ fn handle_completion<C, D>(
                             // (2026-07-15). Dhan CHAIN 429s deliberately
                             // do NOT feed the SPOT concurrency ladder —
                             // the chain gates are unchanged.
-                            cycle.groww_dirty = true;
                         }
                         let mut retry_scheduled = false;
                         if lane_feed == Feed::Dhan {
@@ -2732,7 +2698,7 @@ fn decide_lane<C: CadenceClock>(
         );
         // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
         lane.resolution = Some(resolution_token(
-            lane.flags.cross_fill || lane.flags.groww_fallback,
+            lane.flags.cross_fill,
             lane.late_retry_attempts,
         ));
         lane.resolved = true;
@@ -2768,7 +2734,7 @@ fn decide_lane<C: CadenceClock>(
     );
     // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
     lane.resolution = Some(resolution_token(
-        lane.flags.cross_fill || lane.flags.groww_fallback,
+        lane.flags.cross_fill,
         lane.late_retry_attempts,
     ));
     lane.resolved = true;
@@ -2877,7 +2843,7 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
     if !latch.try_latch(lane.asm.feed, lane.asm.cycle_minute_ist) {
         // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
         lane.resolution = Some(resolution_token(
-            lane.flags.cross_fill || lane.flags.groww_fallback,
+            lane.flags.cross_fill,
             lane.late_retry_attempts,
         ));
         lane.resolved = true;
@@ -2903,7 +2869,7 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
     );
     // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
     lane.resolution = Some(resolution_token(
-        lane.flags.cross_fill || lane.flags.groww_fallback,
+        lane.flags.cross_fill,
         lane.late_retry_attempts,
     ));
     lane.resolved = true;
@@ -3128,7 +3094,6 @@ mod tests {
         let src = include_str!("runner.rs");
         assert!(src.contains("cycle.next_spot_retry_target_ms.max(now_wall)"));
         assert!(src.contains("!cfg.native_retry_enabled"));
-        assert!(src.contains("!cycle.groww_leg_malformed[leg]"));
     }
 
     /// ITEM 3: the resolution provenance vocabulary is LOCKED -
@@ -3159,11 +3124,6 @@ mod tests {
     fn ratchet_runner_spawns_history_repull_for_both_lanes() {
         let src = include_str!("runner.rs");
         let spawn = ["spawn_history_repull", "("].concat();
-        assert_eq!(
-            src.matches(spawn.as_str()).count(),
-            2,
-            "exactly one history-repull spawn per lane (dhan + groww)"
-        );
         let dry_gate = ["if !deps.", "dry_run {"].concat();
         assert!(
             src.contains(dry_gate.as_str()),

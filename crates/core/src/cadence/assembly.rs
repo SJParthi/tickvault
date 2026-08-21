@@ -593,10 +593,10 @@ mod tests {
 
     #[test]
     fn test_cadence_assembly_predicate_3_chains_3_spots_vix_advisory() {
-        let mut a = asm(Feed::Groww);
+        let mut a = asm(Feed::Truedata);
         assert!(!a.is_data_complete());
         for u in ChainUnderlying::ALL {
-            a.record_chain(*u, own_chain(Feed::Groww, MINUTE, T_MS + 100, None));
+            a.record_chain(*u, own_chain(Feed::Truedata, MINUTE, T_MS + 100, None));
         }
         assert!(!a.is_data_complete(), "chains alone are not complete");
         a.record_spot(
@@ -777,7 +777,7 @@ mod tests {
 
         // Rung 2: cross-fill from the other lane's same-cycle data.
         let mut borrower = asm(Feed::Dhan);
-        let mut lender = asm(Feed::Groww);
+        let mut lender = asm(Feed::Truedata);
         lender.record_spot(
             SpotTarget::BankNifty,
             51_000.0,
@@ -787,7 +787,7 @@ mod tests {
         );
         lender.record_chain(
             ChainUnderlying::Sensex,
-            own_chain(Feed::Groww, MINUTE, T_MS + 300, Some(81_250.0)),
+            own_chain(Feed::Truedata, MINUTE, T_MS + 300, Some(81_250.0)),
         );
         let (spots, chains) =
             borrower.cross_fill_from(&lender, BASE_FLOOR_MS, T_MS + 1_000, T_MS + 15_000);
@@ -808,7 +808,7 @@ mod tests {
         assert!(
             borrower
                 .chain(ChainUnderlying::Sensex)
-                .is_some_and(|c| c.source_feed == Feed::Groww && c.published_to_registry)
+                .is_some_and(|c| c.source_feed == Feed::Truedata && c.published_to_registry)
         );
         assert!(borrower.any_degraded_provenance());
 
@@ -895,7 +895,7 @@ mod tests {
             ChainUnderlying::Nifty,
             ChainCell {
                 provenance: ChainProvenance::CrossSource,
-                source_feed: Feed::Groww,
+                source_feed: Feed::Truedata,
                 published_to_registry: true,
                 fetched_at_ms: T_MS + 900,
                 minute_ist: MINUTE,
@@ -914,7 +914,7 @@ mod tests {
     fn test_cadence_assembly_vix_spot_never_gates_any_degraded_provenance() {
         // A VIX-only assembly: vix_spot is readable, the predicate stays
         // false (VIX advisory), and OwnFetch VIX never stamps degraded.
-        let mut a = asm(Feed::Groww);
+        let mut a = asm(Feed::Truedata);
         a.record_spot(
             SpotTarget::IndiaVix,
             14.25,
@@ -932,7 +932,7 @@ mod tests {
         // The lender's cells are from the WRONG minute — cross_fill_from
         // must fill NOTHING (cross_fill_fresh refuses on minute mismatch).
         let mut borrower = asm(Feed::Dhan);
-        let mut lender = LaneAssembly::new(Feed::Groww, MINUTE - 60, T_MS - 60_000);
+        let mut lender = LaneAssembly::new(Feed::Truedata, MINUTE - 60, T_MS - 60_000);
         lender.record_spot(
             SpotTarget::Nifty,
             24_500.0,
@@ -942,7 +942,7 @@ mod tests {
         );
         lender.record_chain(
             ChainUnderlying::Nifty,
-            own_chain(Feed::Groww, MINUTE - 60, T_MS - 59_000, None),
+            own_chain(Feed::Truedata, MINUTE - 60, T_MS - 59_000, None),
         );
         assert_eq!(
             borrower.cross_fill_from(&lender, BASE_FLOOR_MS, T_MS + 1_000, T_MS + 15_000),
@@ -958,7 +958,7 @@ mod tests {
         // failed (spot_paise == 0) must NOT cross-fill — the borrower's
         // cell stays empty (honest skip), while a VALID donor still fills.
         let mut borrower = asm(Feed::Dhan);
-        let mut lender = asm(Feed::Groww);
+        let mut lender = asm(Feed::Truedata);
         // Guard-failed donor: non-finite/absurd price → spot_paise == 0.
         lender.record_spot(
             SpotTarget::Nifty,
@@ -1020,9 +1020,9 @@ mod tests {
     fn test_cadence_assembly_fill_spots_from_chain_embedded_zero_when_vendor_absent() {
         // Chains present but with NO embedded spot (the genuinely-optional
         // Groww absence) → rung 3 fills nothing, absence tracked upstream.
-        let mut a = asm(Feed::Groww);
+        let mut a = asm(Feed::Truedata);
         for u in ChainUnderlying::ALL {
-            a.record_chain(*u, own_chain(Feed::Groww, MINUTE, T_MS + 100, None));
+            a.record_chain(*u, own_chain(Feed::Truedata, MINUTE, T_MS + 100, None));
         }
         assert_eq!(a.fill_spots_from_chain_embedded(T_MS + 900), 0);
         assert!(!a.is_data_complete());
