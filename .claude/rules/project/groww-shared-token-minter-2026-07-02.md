@@ -1,5 +1,20 @@
 # Groww Shared Token-Minter — Consumer-Only Lock (Operator 2026-07-02)
 
+> **⚠ ENTIRE GROWW FEED ORDERED REMOVED 2026-08-21 (operator directive — full dated
+> authorization, including the SEBI carve-out and the REJECT list, lives in
+> `websocket-connection-scope-lock.md` §"2026-08-21 (THIRD quote of the day)"):**
+> operator verbatim: *"Dude along with all these see clealry note whqtber is entirely
+> related to groww feed remove everything entilrey dude okay? Do you understand what I'm
+> asking dude"*. This REVERSES the 2026-08-11 explicit KEEP of the Groww per-minute REST
+> legs (the DHAN half of that KEEP is UNTOUCHED and still binds). Every Groww contract in
+> THIS file — the feed contract, the §38 REST grants, the §39 order-side lattice, the §36
+> Groww futures leg, the §37 BruteX cross-verify consumption — is RETIRED as a live path
+> and retained below as historical audit only. **NOT retired: the SEBI never-delete
+> obligation.** `instrument_lifecycle`, `instrument_lifecycle_audit` and
+> `index_constituency` rows tagged `feed='groww'` are NEVER deleted — removing the writer
+> is authorized, deleting the rows is not. Where sections below conflict with this
+> banner, the banner wins.
+
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > `groww-second-feed-scope-2026-06-19.md` > this file > `no-rest-except-live-feed-2026-06-27.md` (Groww-auth row SUPERSEDED by this file) > defaults.
 > **Scope:** PERMANENT. Every environment, every PR, every future Claude/Cowork session.
 > **Operator-locked:** 2026-07-02 (verbatim directive below).

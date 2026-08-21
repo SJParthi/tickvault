@@ -1354,3 +1354,83 @@ tradeable instruments off depth-5); sends a mixed-segment batch as ONE message
 (one Dhan message carries exactly one RequestCode, so one half would get the
 wrong mode); or reports the index set as covered while its never-ticked count
 is non-zero.
+
+### 2026-08-21 (THIRD quote of the day) — THE ENTIRE GROWW FEED IS ORDERED REMOVED
+
+**The verbatim operator demand (2026-08-21, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Dude along with all these see clealry note whqtber is entirely related to groww feed remove everything entilrey dude okay? Do you understand what I'm asking dude"
+
+This is the fresh dated quote that this file's own §"2026-08-11 (SAME DAY, SECOND
+QUOTE)" REJECT list demands before any Groww surface is stood down. It is recorded
+HERE, BEFORE any code change, per the rule-file-first law.
+
+#### What this REVERSES — stated plainly, because it is a reversal
+
+The 2026-08-11 second quote said, verbatim: *"Meanwhile elt the current rest api
+hit of evry minute for btoh dhan and groww shodu land let ir run dude okay?"* —
+and this file turned that into a REJECT row reading **"Stands down, disables, or
+starves ANY per-minute REST leg for Dhan or Groww in the name of the live lane"**.
+
+Ten days later the operator has ordered the opposite for the Groww half. The later
+instruction governs; the earlier one is recorded here rather than quietly
+overwritten, so the reversal is auditable. **The DHAN half of that KEEP is
+UNTOUCHED** — Dhan's per-minute spot-1m and option-chain legs keep running exactly
+as they do today. Nothing in this quote mentions Dhan.
+
+#### What is authorized
+
+| Surface | Disposition |
+|---|---|
+| Groww live NATS-over-WS market-data feed | already RETIRED 2026-07-15 — nothing to remove |
+| Groww per-minute REST legs (spot-1m, option-chain, per-contract 1m) | **REMOVED** — reverses the 2026-08-11 KEEP |
+| Groww order/position/trade PUSH channel + the §39 order-side lattice | **REMOVED** |
+| Groww daily master CSV / watch build / universe rider | **REMOVED** as a live path |
+| Groww cadence-scheduler executor arm | **REMOVED** |
+| Groww CloudWatch alarms, dashboard widgets, EMF metric names | **REMOVED in lockstep** — see the dead-monitor rule below |
+| Groww SSM token READ (`fetch_groww_access_token`) | **REMOVED** — tickvault never minted it (the bruteX Lambda owns minting; that Lambda is not ours and is unaffected) |
+
+#### ⚠ What this quote CANNOT mean, and must not be read as (SEBI)
+
+**`instrument_lifecycle`, `instrument_lifecycle_audit` and `index_constituency`
+rows carrying `feed='groww'` are NEVER deleted.** §5/§6/§25 of
+`daily-universe-scope-expansion-2026-05-27.md` bind them to SEBI 5-year
+point-in-time retention, and that obligation does not depend on whether we still
+consume the feed that produced them. Removing the WRITER is authorized; deleting
+the ROWS is not, and no PR under this quote may issue a `DROP`, `DELETE` or
+`TRUNCATE` against those tables. This is the single most important line in this
+section: "remove everything related to Groww" is a CODE instruction, and reading
+it as a DATA instruction would destroy regulatory history that cannot be rebuilt.
+
+#### ⚠ What is LOST by this removal (Rule 11 — no false-OK)
+
+1. **Dhan becomes single-source with no independent parity check.** The §37/§38
+   cross-verification compares our data against a Groww-derived record. With Groww
+   gone there is no second vendor to disagree with us, so a Dhan-side error becomes
+   undetectable by comparison — only by internal consistency. The 15:31 REST
+   cross-verify against Dhan's OWN historical API remains, and that is a weaker
+   signal: it can only catch us disagreeing with Dhan, never Dhan being wrong.
+2. **Any comparator left pointing at a feed that no longer publishes will report a
+   vacuous pass** — `compared = 0` rendering as "no mismatches". That is the
+   false-OK class this repo has retired twice. Every such comparator must be
+   removed or made to fail loudly on a zero-row comparison, in the SAME change.
+3. **Alarms on `tv_groww_*` metrics become permanently-green dead monitors** the
+   moment nothing publishes them. They must be deleted in lockstep, not left
+   sitting green.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Deletes, drops or truncates any `feed='groww'` row from the SEBI tables.
+- Stands down, disables or starves any **DHAN** per-minute REST leg under cover of
+  this quote — the 2026-08-11 KEEP still binds the Dhan half.
+- Leaves a `tv_groww_*` alarm, dashboard widget or EMF metric name in place after
+  its producer is gone (a permanently-green dead monitor).
+- Leaves a cross-verify or parity path that now compares against nothing and
+  renders `compared = 0` as success.
+- Removes shared, feed-generic machinery (the cadence scheduler, the `Feed` enum,
+  `spot_1m_rest` / `option_chain_1m` / `rest_fetch_audit` tables and their
+  writers) because "only Dhan is left" — the pluggable seam must stay clean for
+  GDF and TrueData, whose scope locks are untouched by this quote.
+- Ships the removal without the ratchet re-blessing it forces (the EMF
+  metric-name count, the Groww guard tests, the alarm-wiring pins).
