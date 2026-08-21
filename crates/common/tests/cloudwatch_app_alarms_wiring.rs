@@ -710,26 +710,42 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // COST: one additional EMF metric, ~$0.30/mo, plus its alarm at ~$0.10/mo.
     // One series, since the reason label folds. Authorization for the alarm is
     // the dated §2.3b row in dhan-rest-only-noise-lock-2026-07-14.md.
-    // 2026-08-21 — 73 -> 76: the SPILL TIER becomes visible.
     //
-    // tv_ticks_spilled_total, tv_tick_spill_replay_failed_total and
-    // tv_tick_spill_replayed_bytes_total. The rescue tier had NO CloudWatch
-    // presence at all: an ILP flush failing and being rescued to disk, and the
-    // automatic drain failing to put it back, were both visible only in the
-    // box's own log. A spill that is never drained becomes a real tick loss at
-    // the 512 MiB cap, and nothing outside the box would have said so.
+    // 2026-08-21, SAME DAY, on the merge with the operator-lock branch:
+    // 73 -> 76. Net +3, from four additions and one removal.
     //
-    // Two carry alarms (tv-<env>-ticks-spilling, tv-<env>-tick-spill-replay-failing,
-    // both market-hours gated); replayed_bytes ships WITHOUT one deliberately —
-    // it is the SUCCESS signal, and a chart of recoveries belongs beside the two
-    // failure alarms without adding a third pager. That is the one exception to
-    // this ratchet's own "a metric with nothing watching it is the
-    // paid-for-and-unwatched shape" rule, and it is exercised knowingly: the
-    // success series is what makes the two failure alarms interpretable.
+    //   + tv_dhan_feed_last_tick_age_secs   the no-ticks alarm's new source.
+    //     It replaced tv_dhan_feed_ingest_ticks_total because a COUNTER's
+    //     meaning depends on whether the agent publishes per-scrape deltas or
+    //     the running total, and under the second reading `Sum < 1` stops
+    //     being true after the first tick of the morning — the alarm written
+    //     to prove ticks are flowing would have reported health all day. A
+    //     gauge means the same thing under either reading.
+    //   + tv_depth_rows_dropped_total       depth row LOSS, emitted for months
+    //   + tv_depth_persist_errors_total     and shipped by NOTHING, while the
+    //     rows-WRITTEN counter beside them WAS shipped. Depth read healthy
+    //     off-box while its losses were unobservable, and HOT-PATH-02 has no
+    //     errcode alarm either, so there was no second path.
+    //   + tv_ilp_rows_discarded_total       the new ILP retention bound. A
+    //     bound that discards invisibly is worse than the leak it replaced.
+    //   - tv_order_fill_lag_seconds         the ONLY entry in this whole list
+    //     with zero emit sites in crates/*/src. Nothing could ever publish it,
+    //     so removing it changes no observable behaviour — but it DOES change
+    //     the Phase-1 arming contract, and order-side-alarms.tf now records
+    //     that the arming PR must restore it alongside the emit site or it
+    //     arms a permanently-INSUFFICIENT_DATA pager.
     //
-    // +3 names ~= $0.90/mo, +2 alarms ~= $0.20/mo => ~$1.10/mo against the $130
-    // kill-ceiling (90% action line $117). Authorization: the dated §2.3c row in
-    // dhan-rest-only-noise-lock-2026-07-14.md.
+    // COST: +4 names, -1 name = net +3 x ~$0.30/mo ~= +$0.90/mo, plus one
+    // alarm at ~$0.10/mo (the no-ticks alarm was repointed, not added).
+    //
+    // The comment above says the NEXT addition should move content OUT of
+    // user-data rather than shave comments. That prescription was FOLLOWED,
+    // and it is why two further signals are absent: tv_risk_mark_rejected_total
+    // and tv_dhan_feed_silence_detector_refused are emitted by production code
+    // and reach NO selector, because they did not fit. Nothing was shaved to
+    // make room for them. deploy/aws/EMF-METRIC-SELECTOR-NOTES.md carries the
+    // full record, including the append-config restructure that ends the
+    // rationing and why it was not attempted blind.
     assert_eq!(
         names.len(),
         76,
@@ -785,7 +801,30 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
         "tv_rest_1m_fire_heartbeat",
         // 2026-07-14 cluster-C order-side (dormant until cluster A / Phase-1):
         "tv_daily_pnl",
-        "tv_order_fill_lag_seconds",
+        // tv_order_fill_lag_seconds REMOVED from this required list 2026-08-21,
+        // deliberately and not to make an unrelated change fit.
+        //
+        // It was the ONLY entry in the whole selector with zero emit sites in
+        // crates/*/src — `grep -rl tv_order_fill_lag_seconds crates/*/src`
+        // returns nothing — so shipping it published nothing at all. Its own
+        // alarm is `actions_enabled = false` and its description says so.
+        //
+        // The user-data byte budget is a hard 16,384-byte AWS limit that
+        // terraform refuses a PLAN above, and on 2026-08-21 three genuinely
+        // BLIND live counters (depth row drops, depth persist errors, the ILP
+        // overflow bound) could not fit beside it. Between a name nothing can
+        // publish and three that report real data loss, the three won.
+        //
+        // This is NOT the silent shrinkage this list exists to catch. That
+        // failure is a live family quietly losing a member; this is a staging
+        // placeholder for work Phase-1 owns, and the staging contract survived
+        // the removal rather than being dropped with it:
+        // order-side-alarms.tf now records that the Phase-1 arming PR must
+        // restore this name to BOTH selector copies in the same change as the
+        // emit site, and re-check the byte budget, or it arms a
+        // permanently-INSUFFICIENT_DATA pager.
+        //
+        // Re-adding it here is correct AT THAT POINT and wrong before it.
         // 2026-08-09 metric-blindness fix — one representative per family, so
         // a partial revert of the widening fails loudly instead of silently
         // shrinking the operator's only metric sink:
