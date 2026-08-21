@@ -48,6 +48,17 @@ type PositionKey = (u64, ExchangeSegment);
 /// for today's runtime rather than silently re-bucketing it.
 const LEGACY_DEFAULT_SEGMENT: ExchangeSegment = ExchangeSegment::IdxI;
 
+/// Counter for marks refused as non-finite or non-positive.
+///
+/// Labelled by `reason` (`nan` / `infinite` / `non_positive`) because the
+/// three have different causes: NaN is a decode or vendor fault, infinite is
+/// almost always an arithmetic overflow upstream, and non-positive is a
+/// sentinel leaking out of a path that should have filtered it. The EMF
+/// processor folds labels to `{host}` by summing, so one selector entry
+/// alarms on "the risk engine is refusing marks" while the label survives in
+/// the log line, which is where triage reads it.
+pub const MARK_REJECTED_COUNTER: &str = "tv_risk_mark_rejected_total";
+
 // ---------------------------------------------------------------------------
 // RiskEngine
 // ---------------------------------------------------------------------------
@@ -96,6 +107,10 @@ pub struct RiskEngine {
     /// Sum of all realized P&L from closed trades today.
     total_realized_pnl: f64,
     /// Whether trading is halted due to a risk breach.
+    /// Marks refused as non-finite or non-positive this session. Drives the
+    /// power-of-two log throttle, so a NaN storm reports at 1, 2, 4, 8 ...
+    /// rather than once per tick.
+    marks_rejected: u64,
     halted: bool,
     /// The breach that caused the halt (if any).
     halt_reason: Option<RiskBreach>,
@@ -132,6 +147,7 @@ impl RiskEngine {
             positions: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             market_prices: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             non_flat: HashSet::with_capacity(POSITIONS_INITIAL_CAPACITY),
+            marks_rejected: 0,
             total_realized_pnl: 0.0,
             halted: false,
             halt_reason: None,
@@ -442,8 +458,22 @@ impl RiskEngine {
 
     /// Updates the mark price for the COMPOSITE `(security_id, segment)` row.
     ///
+    /// A refused mark is COUNTED and LOGGED rather than silently dropped. The
+    /// distinction matters more here than almost anywhere else in the crate:
+    /// this value feeds `daily_loss_state`, which feeds the daily-loss
+    /// auto-halt — the kill switch. A feed emitting NaN for one leg silently
+    /// freezes that leg's mark at its last good value, so the halt keeps
+    /// evaluating against a price that stopped tracking the market, and
+    /// nothing anywhere says so. Freezing is still the right BEHAVIOUR (a
+    /// NaN mark would poison the sum), so what changes is only that it is
+    /// now visible.
+    ///
+    /// Log lines are throttled to powers of two so a poisoned feed cannot
+    /// flood the sink — a NaN storm is exactly the case that would.
+    ///
     /// # Performance
-    /// O(1) — HashMap lookup + field update.
+    /// O(1) — one HashMap insert, or one counter increment on refusal. No
+    /// allocation on either path.
     pub fn update_market_price_in_segment(
         &mut self,
         security_id: u64,
@@ -452,6 +482,31 @@ impl RiskEngine {
     ) {
         // RISK-GAP-02: Reject non-positive and non-finite prices.
         if !current_price.is_finite() || current_price <= 0.0 {
+            let reason = if current_price.is_nan() {
+                "nan"
+            } else if current_price.is_infinite() {
+                "infinite"
+            } else {
+                "non_positive"
+            };
+            metrics::counter!(MARK_REJECTED_COUNTER, "reason" => reason).increment(1);
+            self.marks_rejected = self.marks_rejected.saturating_add(1);
+            if self.marks_rejected.is_power_of_two() {
+                tracing::error!(
+                    code = ErrorCode::RiskGapPositionPnl.code_str(),
+                    security_id,
+                    segment = segment.as_str(),
+                    reason,
+                    rejected_total = self.marks_rejected,
+                    "risk engine refused a mark price. The position keeps its \
+                     LAST GOOD mark, so the daily-loss auto-halt is now \
+                     evaluating against a price that has stopped tracking the \
+                     market for this leg. Freezing is correct - a non-finite \
+                     mark would poison the whole unrealised sum - but a frozen \
+                     mark is not a fresh one, and until the feed recovers the \
+                     halt is being decided on stale data."
+                );
+            }
             return;
         }
         self.market_prices
@@ -549,6 +604,10 @@ impl RiskEngine {
         self.halted = false;
         self.halt_reason = None;
         self.total_checks = 0;
+        // Re-arms the log throttle: a NaN episode on a NEW day must report
+        // from 1 again rather than inheriting yesterday's power-of-two stride,
+        // which after a bad session would suppress the first several hundred.
+        self.marks_rejected = 0;
         self.total_rejections = 0;
         info!("risk engine daily state reset");
     }
