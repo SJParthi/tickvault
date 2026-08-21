@@ -8117,6 +8117,102 @@ mod tests {
         );
     }
 
+    fn silent_at(id: u64, ms: u64) -> SilentInstrument {
+        SilentInstrument {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+            silent_millis: ms,
+            expected_millis: 1_000,
+            never_ticked: false,
+        }
+    }
+
+    /// The ranking keeps the QUIETEST, which is the whole point: at 25,000
+    /// instruments only a handful can be named, so naming the wrong handful
+    /// is the same as naming none.
+    #[test]
+    fn rank_silent_keeps_the_quietest_in_descending_order() {
+        let mut buf = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+        let mut n = 0usize;
+        for (id, ms) in [(1, 50), (2, 900), (3, 300), (4, 10)] {
+            n = rank_silent(&mut buf, n, silent_at(id, ms));
+        }
+        assert_eq!(n, 4);
+        assert_eq!(
+            buf[..n].iter().map(|s| s.security_id).collect::<Vec<_>>(),
+            vec![2, 3, 1, 4],
+            "quietest first — the operator reads the top of the list"
+        );
+    }
+
+    /// Past capacity it must DROP the least-quiet, not the newest arrival.
+    /// Dropping by arrival order would make the named set depend on detector
+    /// iteration order rather than on silence, which is arbitrary.
+    #[test]
+    fn rank_silent_evicts_the_least_silent_once_full() {
+        let mut buf = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+        let mut n = 0usize;
+        // Fill with an ascending run, so the buffer holds 8..1 descending.
+        for id in 1..=WORST_SILENT_NAMED as u64 {
+            n = rank_silent(&mut buf, n, silent_at(id, id * 10));
+        }
+        assert_eq!(n, WORST_SILENT_NAMED, "the buffer is full");
+
+        // A new WORST arrival must land first and push the smallest out.
+        n = rank_silent(&mut buf, n, silent_at(99, 10_000));
+        assert_eq!(n, WORST_SILENT_NAMED, "the length never exceeds the cap");
+        assert_eq!(buf[0].security_id, 99, "the quietest must lead");
+        assert!(
+            !buf.iter().any(|s| s.security_id == 1),
+            "the least-silent entry is the one evicted"
+        );
+
+        // A new entry quieter than NOTHING in the buffer must be refused
+        // rather than displacing a genuinely quieter one.
+        n = rank_silent(&mut buf, n, silent_at(1_000, 1));
+        assert!(
+            !buf[..n].iter().any(|s| s.security_id == 1_000),
+            "an entry that beats nothing in the buffer must not enter it"
+        );
+    }
+
+    /// The named scan must agree with the counting scan, or the page's count
+    /// and its names describe different things.
+    #[test]
+    fn scan_silence_named_agrees_with_the_counting_scan() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let mut buf = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+
+        let (silent_a, never_a, named_a) = ingest.scan_silence_named(u64::MAX, &mut buf);
+        assert_eq!(
+            (silent_a, never_a),
+            ingest.scan_silence(u64::MAX),
+            "the two entry points must report the same counts"
+        );
+        assert_eq!(
+            named_a, 0,
+            "an empty book names nobody — reporting a name here would page on \
+             every boot before the first subscribe"
+        );
+
+        // Seed one and let it cross the silence floor: it must now be NAMED,
+        // not merely counted, which is the defect this whole path fixes.
+        ingest.seed(13, ExchangeSegment::IdxI, 0);
+        let (silent_b, _, named_b) = ingest.scan_silence_named(u64::MAX, &mut buf);
+        assert!(silent_b >= 1, "a long-quiet seeded instrument counts");
+        assert!(named_b >= 1, "and it must be NAMED, not just counted");
+        assert_eq!(
+            buf[0].security_id, 13,
+            "the name must be the real security_id — a count with no id is \
+             exactly what made this unanswerable before"
+        );
+        assert!(
+            buf[0].never_ticked,
+            "an instrument that produced nothing since being seeded must say so \
+             — that is the shape of a subscribe that did not take"
+        );
+    }
+
     /// The detector's own blindness, and the reason it needs an accessor.
     ///
     /// `scan_silence` reports how many tracked instruments are quiet. It
@@ -9875,7 +9971,7 @@ mod silence_latch_tests {
         // The suppressed episodes must stay COUNTABLE. Rate-limiting the page
         // while also gating the gauge would trade a noisy signal for no signal.
         let scan_arm = production
-            .split("let (silent, never) = ingest.scan_silence(now_millis);")
+            .split("ingest.scan_silence_named(now_millis, &mut worst_silent);")
             .nth(1)
             .unwrap_or_default();
         let gauge = scan_arm
