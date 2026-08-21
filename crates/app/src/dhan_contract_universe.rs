@@ -271,8 +271,16 @@ pub const CONTRACT_UNIVERSE_FAILED_COUNTER: &str = "tv_dhan_contract_universe_fa
 /// drops each series' FIRST observed sample as its baseline, so a reason that
 /// is not pre-registered loses its first increment — and on a once-per-session
 /// counter, its first increment is its only one.
-pub const CONTRACT_FAILURE_REASONS: [&str; 6] = [
+pub const CONTRACT_FAILURE_REASONS: [&str; 7] = [
     "artifact_unreadable",
+    // The late-attach loop reached its deadline or the 15:30 hard stop with
+    // contracts never on the wire. Emitted by `record_contract_give_up`, NOT
+    // by the classifier: at a give-up there is no `ContractSelection` to
+    // classify, which is exactly why this path had no signal at all until
+    // 2026-08-21 -- the give-up `return`s bypassed the only emitter, so the
+    // alarm built for a contract-less session could only ever observe its own
+    // pre-registered zero.
+    "gave_up",
     "symbol_map_unreadable",
     "no_contracts",
     "no_ladders",
@@ -321,6 +329,30 @@ pub fn record_contract_verdict(selection: &ContractSelection) {
     for reason in contract_verdict_reasons(selection) {
         metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(1);
     }
+}
+
+/// Record that the late-attach loop STOPPED with contracts never on the wire.
+///
+/// Separate from [`record_contract_verdict`] because the two answer different
+/// questions and only one of them had an emitter. The verdict classifies a
+/// selection that was actually produced; this fires when the loop gave up and
+/// there is no selection to classify — the session simply ends carrying spot
+/// instruments and nothing else.
+///
+/// That was the gap: both give-up arms in `attach_depth_when_available`
+/// `return`ed straight past the only call to `record_contract_verdict`, which
+/// lives inside the SUCCESSFUL dial branch. So a session that resolved zero
+/// contracts by the deadline — the precise condition
+/// `tv_dhan_contract_universe_failed_total` exists to page on — left that
+/// counter reading its pre-registered zero, and the only trace was an
+/// unalarmed log line.
+///
+/// Caller must gate on the half actually being incomplete. Firing this when
+/// contracts DID reach the wire and only depth did not would page for a
+/// failure that did not happen, which is the fastest way to teach an operator
+/// to ignore the alarm.
+pub fn record_contract_give_up() {
+    metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "gave_up").increment(1);
 }
 
 /// What a contract selection produced, and everything it refused.
@@ -1914,6 +1946,39 @@ mod tests {
 
     /// The emit wrappers must be callable with no recorder installed — which
     /// is the state in every unit test and in the seconds before boot Step 3.
+
+    /// `gave_up` must be pre-registered like every other reason, or the ONE
+    /// increment it will ever make in a session is eaten as the CloudWatch
+    /// delta baseline — which would leave the give-up path exactly as silent
+    /// after this fix as it was before it.
+    #[test]
+    fn record_contract_give_up_uses_a_pre_registered_reason() {
+        assert!(
+            CONTRACT_FAILURE_REASONS.contains(&"gave_up"),
+            "the give-up reason must be pre-registered at 0"
+        );
+        // Safe with no recorder installed, like its siblings.
+        record_contract_give_up();
+    }
+
+    /// The classifier must NOT be able to produce `gave_up`. It classifies a
+    /// selection that exists; a give-up is the case where none does. If both
+    /// could emit it, a single failing session would count twice and the
+    /// reason would stop meaning anything specific.
+    #[test]
+    fn the_classifier_never_produces_the_give_up_reason() {
+        let empty = ContractSelection::default();
+        assert!(!contract_verdict_reasons(&empty).contains(&"gave_up"));
+        let mut full = ContractSelection::default();
+        full.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        full.stock_options = 500;
+        full.atm_window_reason = "applied";
+        full.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        assert!(!contract_verdict_reasons(&full).contains(&"gave_up"));
+    }
     #[test]
     fn record_contract_verdict_is_safe_without_a_recorder() {
         pre_register_contract_failure_counters();
