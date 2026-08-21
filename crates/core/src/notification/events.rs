@@ -2466,7 +2466,7 @@ impl NotificationEvent {
                     // Unmeasured is NEVER rendered as a clean day.
                     (
                         "\u{26a0}\u{fe0f}",
-                        "coverage not measured today".to_string(),
+                        "no coverage figures recorded today".to_string(),
                     )
                 } else {
                     let covered = dhan.exclusive_minutes;
@@ -7280,7 +7280,7 @@ mod tests {
         let msg = scorecard(d).to_message();
         let first = msg.lines().next().unwrap_or_default();
         assert!(
-            first.contains("coverage not measured today"),
+            first.contains("no coverage figures recorded today"),
             "unmeasured coverage must say so: {msg}"
         );
         assert!(

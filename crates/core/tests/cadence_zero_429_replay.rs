@@ -897,15 +897,25 @@ fn test_minute_boundary_race_no_double_fire() {
     let t = 36_000; // 10:00:00
     let t_ms = i64::from(t) * 1_000;
     // Wake 1ms BEFORE T with the previous boundary already completed —
-    // every fire is post-close (earliest at T+0, the Groww anchor), so
-    // T IS still joinable: nothing has begun.
+    // every fire is post-close, so T IS still joinable: nothing has begun.
     assert_eq!(
         next_joinable_boundary(t_ms - 1, Some(t - 60), &cfg),
         Some(t)
     );
-    // Wake 1ms AFTER T: T's earliest fire (T+0) already began → skip.
+    // Wake 1ms AFTER T: the earliest fire is now the Dhan burst at
+    // T+`dhan_burst_offset_ms` (1000 ms), not the retired second lane's T+0
+    // anchor — so a wake at T+1ms is still a full second early and joins T.
     assert_eq!(
         next_joinable_boundary(t_ms + 1, Some(t - 60), &cfg),
+        Some(t)
+    );
+    // Past the burst instant, T has begun → skip to the next boundary.
+    assert_eq!(
+        next_joinable_boundary(
+            t_ms + i64::from(cfg.dhan_burst_offset_ms),
+            Some(t - 60),
+            &cfg
+        ),
         Some(t + 60)
     );
     // An instant-completing cycle AT T never re-selects T.

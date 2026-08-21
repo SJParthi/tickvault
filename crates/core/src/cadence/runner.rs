@@ -1597,6 +1597,7 @@ fn arm_lane(lane: &mut LaneRun) {
         lane.fsm(CadenceEvent::AnchorReached);
     } else {
         lane.fsm(CadenceEvent::OffSessionOrDisabled);
+        // SEAM(#1688): resolution provenance recorded exactly once per site.
         lane.resolution = Some(resolution_token(lane.late_retry_attempts));
         lane.resolved = true;
         debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
@@ -1653,6 +1654,7 @@ fn drop_lane_runtime_disabled(lane: &mut LaneRun) {
          dropped (no partial emit; in-flight requests complete audit-only)"
     );
     lane.fsm(CadenceEvent::Shutdown);
+    // SEAM(#1688): resolution provenance recorded exactly once per site.
     lane.resolution = Some(resolution_token(lane.late_retry_attempts));
     lane.resolved = true;
     debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
@@ -2646,6 +2648,7 @@ fn decide_lane<C: CadenceClock>(
             "CADENCE-03: decision double-latch attempt refused (exactly-\
              once guard held; should-never scheduler-logic signal)"
         );
+        // SEAM(#1688): resolution provenance recorded exactly once per site.
         lane.resolution = Some(resolution_token(lane.late_retry_attempts));
         lane.resolved = true;
         debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
@@ -2678,6 +2681,7 @@ fn decide_lane<C: CadenceClock>(
         },
         dry_run,
     );
+    // SEAM(#1688): resolution provenance recorded exactly once per site.
     lane.resolution = Some(resolution_token(lane.late_retry_attempts));
     lane.resolved = true;
     debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
@@ -2776,6 +2780,7 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
         SkipReason::Cutoff
     };
     if !latch.try_latch(lane.asm.feed, lane.asm.cycle_minute_ist) {
+        // SEAM(#1688): resolution provenance recorded exactly once per site.
         lane.resolution = Some(resolution_token(lane.late_retry_attempts));
         lane.resolved = true;
         debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
@@ -2798,6 +2803,7 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
         },
         dry_run,
     );
+    // SEAM(#1688): resolution provenance recorded exactly once per site.
     lane.resolution = Some(resolution_token(lane.late_retry_attempts));
     lane.resolved = true;
     debug_assert!(lane.resolution.is_some(), "resolution set before resolved");

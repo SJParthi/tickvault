@@ -282,11 +282,16 @@ fn guard_scorecard_verdict_line_is_first_with_emoji_and_header() {
     ] {
         let body = ev.to_message();
         let first = first_line(&body);
+        // ℹ️ joined the set on 2026-08-21 with the single-feed verdict: a
+        // DELIBERATELY switched-off feed is informational, and neither ⚠️
+        // (which would imply a fault) nor 📊 (which says nothing) is honest
+        // for it. 🏆 left with the cross-broker contest.
         assert!(
-            first.starts_with('\u{1f3c6}')
-                || first.starts_with("\u{26a0}\u{fe0f}")
+            first.starts_with("\u{26a0}\u{fe0f}")
+                || first.starts_with("\u{2139}\u{fe0f}")
+                || first.starts_with('\u{2705}')
                 || first.starts_with('\u{1f4ca}'),
-            "scorecard line 1 must start with 🏆/⚠️/📊: {body}"
+            "scorecard line 1 must start with ⚠️/ℹ️/✅/📊: {body}"
         );
         assert!(
             first.contains("<b>"),
@@ -307,28 +312,18 @@ fn guard_tf_pass_line_starts_with_ok_emoji() {
 // ---------------------------------------------------------------------------
 // 4. <code> alignment of the feed stat lines
 // ---------------------------------------------------------------------------
-
 #[test]
-fn guard_scorecard_feed_stat_lines_are_code_wrapped_and_aligned() {
+fn guard_scorecard_feed_stat_line_is_code_wrapped() {
+    // The equal-width padding this once asserted existed to align TWO feeds
+    // into monospace columns. With one feed there is nothing to align
+    // against, so what survives is the <code> wrapper itself — which is what
+    // keeps the stat line monospaced on a phone.
     let body = scorecard_clean().to_message();
     let stat_lines: Vec<&str> = body.lines().filter(|l| l.starts_with("<code>")).collect();
-    assert_eq!(stat_lines.len(), 2, "one <code> stat line per feed: {body}");
-    // The feed-name prefixes (up to the first ':') must be equal width so
-    // the monospace columns align.
-    let widths: Vec<usize> = stat_lines
-        .iter()
-        .map(|l| {
-            l.trim_start_matches("<code>")
-                .split(':')
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .count()
-        })
-        .collect();
-    assert_eq!(
-        widths[0], widths[1],
-        "feed-name prefixes must pad to equal width: {stat_lines:?}"
+    assert_eq!(stat_lines.len(), 1, "exactly one <code> stat line: {body}");
+    assert!(
+        stat_lines[0].ends_with("</code>"),
+        "the stat line must be fully wrapped: {stat_lines:?}"
     );
 }
 

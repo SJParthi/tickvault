@@ -3293,7 +3293,6 @@ mod tests {
         assert!(page.contains("tickvault starting — NEW CODE deployed"));
         assert!(page.contains("(build a1b2c3d)"));
         assert!(page.contains("\u{23f3} Dhan login"));
-        assert!(page.contains("\u{23f3} Groww feed"));
         assert!(page.contains("Boot finishing"));
         assert!(page.contains("updates itself"));
         // Mid-boot: some ✅, some ⏳, fixed template order (Dhan login
@@ -3308,7 +3307,6 @@ mod tests {
         assert!(login_idx < instr_idx && instr_idx < feed_idx, "fixed order");
         assert!(mid_render.contains("last real price 2s ago"));
         assert!(mid_render.contains("Order confirmations — connected and confirmed"));
-        assert!(mid_render.contains("Groww feed — signed in \u{b7} 768 instruments"));
         // Final: Complete folds in → checklist header + footer.
         let mut done = full_checklist(now);
         done.fold(BootMilestone::Complete { mode: "sandbox" }, now + 94_000);
@@ -3340,7 +3338,6 @@ mod tests {
         let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: now });
         assert!(r.contains("\u{2705} Dhan login"));
         assert!(!r.contains("\u{23f3} Instruments"));
-        assert!(!r.contains("\u{23f3} Groww feed"));
         assert!(r.contains("Boot finishing"), "generic pending line stays");
         // No false "NEW CODE" flavor when new_code=false.
         assert!(!r.contains("NEW CODE"));
@@ -3497,7 +3494,7 @@ mod tests {
         assert!(cl.mini);
         let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: mid_day });
         assert!(r.contains("\u{1f504} Feed update"), "neutral header: {r:?}");
-        assert!(r.contains("Groww feed"), "component line renders: {r:?}");
+        assert!(r.contains("Dhan login"), "component line renders: {r:?}");
         assert!(!r.contains("tickvault starting"), "no false boot claim");
         assert!(!r.contains("Boot finishing"), "no broken promise footer");
         assert!(!r.contains("updates itself"), "no broken promise footer");

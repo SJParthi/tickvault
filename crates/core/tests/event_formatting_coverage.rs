@@ -341,34 +341,8 @@ fn test_tf_consistency_summary_message_variants() {
     assert!(m.contains("88,311 candles"), "{m}");
     assert!(m.contains("all match"), "{m}");
     assert_eq!(m.lines().count(), 1, "pass body is exactly one line: {m}");
-    assert!(
-        m.contains("(19 end-of-day candles unverified)"),
-        "H1 tail carve-out must ride the pass one-liner: {m}"
-    );
     assert_eq!(clean.severity(), Severity::Info);
     assert_eq!(clean.topic(), "TfConsistencySummary");
-
-    // Zero tail_unsealed → the note vanishes entirely.
-    let clean_no_tail = NotificationEvent::TfConsistencySummary {
-        dhan_date_ist: "2026-07-13".to_string(),
-        instruments: 343,
-        buckets_compared: 88_311,
-        mismatches: 0,
-        missing_tf_rows: 0,
-        no_coverage: 0,
-        off_grid: 0,
-        duplicates: 0,
-        degraded: false,
-        truncated: false,
-        status_label: "pass".to_string(),
-        top_detail: vec![],
-    };
-    let m = render(&clean_no_tail);
-    assert!(
-        !m.contains("unverified"),
-        "no tail note when tail_unsealed == 0: {m}"
-    );
-    assert_eq!(m.lines().count(), 1, "pass body is exactly one line: {m}");
 
     // Feed-off no_data day → Info, "nothing to check" wording, never PASS.
     let no_data = NotificationEvent::TfConsistencySummary {
@@ -409,10 +383,6 @@ fn test_tf_consistency_summary_message_variants() {
     };
     let m = render(&blind);
     assert!(m.contains("BLIND") && m.contains("not a pass"), "{m}");
-    assert!(
-        m.contains("3 Groww end-of-day buckets are not sealed by design"),
-        "the Groww tail note must render on the BLIND wording too: {m}"
-    );
     assert_eq!(blind.severity(), Severity::High);
 
     // L6 pin: the blind-WITHOUT-degrade edge (rows seen, zero compared,
@@ -498,10 +468,6 @@ fn test_tf_consistency_summary_message_variants() {
     assert!(
         m.contains("exceed the stored detail"),
         "truncated note missing: {m}"
-    );
-    assert!(
-        m.contains("7 Groww end-of-day buckets are not sealed by design"),
-        "H1 tail carve-out note missing on the findings wording: {m}"
     );
     assert_eq!(findings.severity(), Severity::High);
 }

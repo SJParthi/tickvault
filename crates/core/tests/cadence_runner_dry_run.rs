@@ -1206,14 +1206,20 @@ async fn test_completion_after_midnight_suspend_abandons_cycle() {
         start: tokio::time::Instant::now(),
     });
     let shutdown = Arc::new(Notify::new());
-    let config = CadenceConfig::default();
+    // The burst fires at T+0 so the timing narrative above holds: the
+    // scenario needs the burst BEFORE the midnight flip at T+1000. T+0 is a
+    // legal offset (the second lane always anchored there); the default 1000
+    // would put the burst ON the flip and the cycle would never start.
+    let config = CadenceConfig {
+        dhan_burst_offset_ms: 0,
+        ..CadenceConfig::default()
+    };
     let gates = test_gates(&config);
     let deps = CadenceRunnerDeps {
         config,
         calendar: test_calendar(),
         dhan_executor: Arc::clone(&exec),
-        // Groww-only lane (isolates the burst/verdict/fallback path).
-        dhan_enabled: Arc::new(AtomicBool::new(false)),
+        dhan_enabled: Arc::new(AtomicBool::new(true)),
         expiry_resolver: Arc::new(StubExpiryResolver),
         expiry_store: None,
         gates,
@@ -1252,7 +1258,7 @@ async fn test_completion_after_midnight_suspend_abandons_cycle() {
                 && matches!(
                     c,
                     RecordedCall::Chain {
-                        feed: Feed::Truedata,
+                        feed: Feed::Dhan,
                         underlying: ChainUnderlying::Banknifty,
                         ..
                     }
