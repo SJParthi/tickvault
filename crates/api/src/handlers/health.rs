@@ -128,16 +128,6 @@ pub const LIVE_RUNTIME_SUBSYSTEMS: &[RuntimeSubsystem] = &[
         metric: "tv_chain1m_persist_errors_total",
     },
     RuntimeSubsystem {
-        name: "groww_spot_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_groww_spot1m_persist_errors_total",
-    },
-    RuntimeSubsystem {
-        name: "groww_option_chain_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_groww_chain1m_persist_errors_total",
-    },
-    RuntimeSubsystem {
         name: "seal_writer",
         status: STATUS_UNWIRED,
         metric: "tv_seal_writer_drain_total",

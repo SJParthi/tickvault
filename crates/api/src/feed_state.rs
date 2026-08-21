@@ -344,6 +344,7 @@ mod tests {
     fn test_from_config_seeds_atomics() {
         let feeds = FeedsConfig {
             dhan_enabled: true,
+            truedata_enabled: true,
             ..Default::default()
         };
         let state = FeedRuntimeState::from_config(&feeds);

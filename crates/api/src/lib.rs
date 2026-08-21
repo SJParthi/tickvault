@@ -681,7 +681,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method(axum::http::Method::POST)
-                        .uri("/api/feeds/groww")
+                        .uri("/api/feeds/truedata")
                         .header("content-type", "application/json")
                         .body(Body::from(r#"{"enabled":true}"#))
                         .unwrap(),
@@ -705,10 +705,12 @@ mod tests {
         use tower::ServiceExt;
 
         // Companion ratchet to the 401 test above: the gate OPENS for the real
-        // token in BOTH modes — the 2026-07-04 gating must never lock the
-        // operator out. S2b (2026-07-15): a groww ENABLE now hits the
-        // retired-feed 409 INSIDE the handler — the assertion is "past the
-        // auth gate" (never 401), so use a groww DISABLE which flows through.
+        // token in BOTH modes, so the 2026-07-04 gating can never lock the
+        // operator out. The probe is a TrueData DISABLE: it is runtime-toggleable
+        // and narrowing is always permitted, so a 200 here means "past the auth
+        // gate" and nothing else. (It probed "groww" until 2026-08-21; that name
+        // now answers 400 "unknown feed", which would have passed the auth gate
+        // too but for the wrong reason.)
         for feed_toggle_public in [true, false] {
             let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
             let router = build_router_with_auth(auth_test_state(), &[], auth, feed_toggle_public);
@@ -717,7 +719,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method(axum::http::Method::POST)
-                        .uri("/api/feeds/groww")
+                        .uri("/api/feeds/truedata")
                         .header("content-type", "application/json")
                         .header("authorization", "Bearer secret-tok")
                         .body(Body::from(r#"{"enabled":false}"#))

@@ -490,9 +490,12 @@ mod tests {
             "dhan row present (rendered)"
         );
         assert!(
-            html.contains("\"key\":\"groww\""),
-            "groww row present (rendered)"
+            html.contains("\"key\":\"truedata\""),
+            "truedata row present (rendered)"
         );
+        // Retargeted from the groww row on 2026-08-21: the claim under test is
+        // that EVERY Feed::ALL member is server-rendered as its own switch, so
+        // the second row has to be whatever the second feed is today.
         // PR-E: BOTH feeds are live-toggleable now (Dhan disable is safety-gated
         // server-side; the page shows the API's 409 + re-syncs on a gated reject).
         assert!(

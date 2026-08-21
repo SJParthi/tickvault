@@ -348,6 +348,31 @@ mod tests {
         );
     }
 
+    /// Every source down must degrade to honest nulls, never a panic and
+    /// never a fabricated zero. `test_state` points QuestDB at port 1, so
+    /// every probe is refused immediately.
+    ///
+    /// Restored 2026-08-21: this test was deleted alongside the cross-fill
+    /// tile, but its subject is the always-200-honest-nulls contract, which
+    /// has nothing to do with cross-fill. Its `TEST-EXEMPT` reference on
+    /// `compute_board_data` had been left pointing at a test that no longer
+    /// existed — a coverage claim with nothing behind it.
+    #[tokio::test]
+    async fn test_compute_board_data_all_sources_down_returns_nulls_not_panics() {
+        let state = test_state();
+        let body = compute_board_data(&state).await;
+        assert!(
+            !body.db.reachable,
+            "a refused QuestDB connection must report unreachable"
+        );
+        assert!(
+            body.db.candles_1m_today.is_none(),
+            "a failed count query must be null, never a fabricated 0"
+        );
+        // The endpoint still answers with whatever IS known.
+        assert!(!body.status.build_sha_short.is_empty());
+    }
+
     // (parity/scan_connections/parse_status_json test suites deleted
     // 2026-07-17 with their subject fns — dashboard tidy.)
 

@@ -148,7 +148,7 @@
 #   daily (the exact Phase-A failure shape, one knob later).
 #   New signal: tv_rest_1m_fire_heartbeat — an unlabeled gauge set ONCE PER
 #   PER-MINUTE FIRE by BOTH retained REST 1m spot legs
-#   (crates/app/src/spot_1m_rest_boot.rs + groww_spot_1m_boot.rs,
+#   (crates/app/src/spot_1m_rest_boot.rs and dhan_cadence_executor.rs,
 #   fire_one_minute). Deliberately NOT pre-registered at boot: the first
 #   set at the 09:16:01 IST fire IS the session-start signal, and
 #   metrics-exporter-prometheus re-renders the last value on every scrape
@@ -172,7 +172,7 @@
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
   alarm_name        = "tv-${var.environment}-market-hours-liveness-missing"
-  alarm_description = "App liveness signal ABSENT during MARKET HOURS — tv_rest_1m_fire_heartbeat (set once per per-minute REST 1m fire by the retained Dhan + Groww spot legs, crates/app/src/spot_1m_rest_boot.rs + groww_spot_1m_boot.rs) has not been published for ~5 min. Signal moved 2026-07-15: the Groww live feed (the previous lag gauge's only sample producer) is retired per the operator directive; missing heartbeat in-window now means the app is WEDGED/CRASH-LOOPING/OOM-killed/DEAD OR both per-minute REST legs stopped firing — both need operator action between 09:15-15:30 IST. Check: SSM → the box → 'systemctl status tickvault' + 'systemctl is-failed tickvault' + 'docker ps' + tail /opt/tickvault/logs/errors.jsonl + the SPOT1M-01/CHAIN-02 runbook (rest-1m-pipeline-error-codes.md). See operator-charter-forever.md §C."
+  alarm_description = "App liveness signal ABSENT during MARKET HOURS — tv_rest_1m_fire_heartbeat (set once per per-minute REST 1m fire by the retained Dhan spot leg, crates/app/src/spot_1m_rest_boot.rs and dhan_cadence_executor.rs) has not been published for ~5 min. Signal moved 2026-07-15: the Groww live feed (the previous lag gauge's only sample producer) is retired per the operator directive; missing heartbeat in-window now means the app is WEDGED/CRASH-LOOPING/OOM-killed/DEAD OR the per-minute REST spot leg stopped firing — both need operator action between 09:15-15:30 IST. Check: SSM → the box → 'systemctl status tickvault' + 'systemctl is-failed tickvault' + 'docker ps' + tail /opt/tickvault/logs/errors.jsonl + the SPOT1M-01/CHAIN-02 runbook (rest-1m-pipeline-error-codes.md). See operator-charter-forever.md §C."
 
   # LessThanThreshold / threshold=0 / statistic=Maximum: the lag p99 is >= 0,
   # so a present value never satisfies <0 (present = OK); a MISSING metric is
@@ -540,7 +540,7 @@ resource "aws_lambda_permission" "tv_market_hours_liveness_close" {
 }
 
 output "market_hours_liveness_alarm_name" {
-  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a session where NO REST 1m leg ever fired, in the 09:20-15:35 IST window). Signal: the tv_rest_1m_fire_heartbeat gauge MISSING (treat_missing_data=breaching) — set once per per-minute fire by the retained REST 1m spot legs (spot_1m_rest_boot.rs + groww_spot_1m_boot.rs), in the CW-agent filter (user-data.sh.tftpl). Signal moved off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entry (app-log-ingestion-silent — list trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain; previously trimmed to 4 on 2026-07-15 with the Groww live-feed retirement)."
+  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a session where the REST 1m spot leg never fired, in the 09:20-15:35 IST window). Signal: the tv_rest_1m_fire_heartbeat gauge MISSING (treat_missing_data=breaching) — set once per per-minute fire by the retained Dhan REST 1m spot leg (spot_1m_rest_boot.rs + dhan_cadence_executor.rs), in the CW-agent filter (user-data.sh.tftpl). Signal moved off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entry (app-log-ingestion-silent — list trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain; previously trimmed to 4 on 2026-07-15 with the Groww live-feed retirement)."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }
 
