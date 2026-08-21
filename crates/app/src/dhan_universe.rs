@@ -255,7 +255,13 @@ pub fn next_wait(
 #[derive(serde::Serialize)]
 struct FnoUnderlyingArtifact {
     count: usize,
-    underlyings: Vec<MappingEntry>,
+    /// Named `mappings` -- the SAME key the mapping artifact uses -- so the
+    /// consumer reads this file with `parse_mapping_artifact`, the parser
+    /// already hardened to fail LOUD on garbage and to distinguish "parsed to
+    /// an empty list" from "did not parse". A second bespoke parser for a
+    /// second shape would be a second place for that distinction to be got
+    /// wrong.
+    mappings: Vec<MappingEntry>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -949,7 +955,7 @@ fn write_fno_underlying_artifact(
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_vec_pretty(&FnoUnderlyingArtifact {
         count: entries.len(),
-        underlyings: entries,
+        mappings: entries,
     })
     .map_err(std::io::Error::other)?;
     std::fs::write(&tmp, body)?;
@@ -1176,13 +1182,13 @@ mod tests {
         let body = std::fs::read_to_string(&path).expect("written file must be readable");
         let v: serde_json::Value = serde_json::from_str(&body).expect("must be valid JSON");
         assert_eq!(v["count"], 1, "count must match what was written");
-        assert_eq!(v["underlyings"][0]["security_id"], 2885);
+        assert_eq!(v["mappings"][0]["security_id"], 2885);
         assert_eq!(
-            v["underlyings"][0]["index_name"], FNO_UNDERLYING_TAG,
+            v["mappings"][0]["index_name"], FNO_UNDERLYING_TAG,
             "the tag is how a consumer tells these from constituent rows"
         );
         assert_eq!(
-            v["underlyings"].as_array().map(Vec::len),
+            v["mappings"].as_array().map(Vec::len),
             Some(v["count"].as_u64().unwrap() as usize),
             "count and list length must agree — that mismatch is how a \
              truncated-but-still-parseable file is caught"
