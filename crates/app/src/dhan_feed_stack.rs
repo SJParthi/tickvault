@@ -4342,6 +4342,7 @@ async fn attach_depth_when_available(
     // un-pre-registered reason would have its first — and only — increment
     // eaten, and the alarm would never see the defect it exists to catch.
     crate::dhan_contract_universe::pre_register_contract_failure_counters();
+    crate::dhan_depth_universe::pre_register_depth_failure_counters();
 
     let mut attempts: u32 = 0;
     // Whether the PREVIOUS attempt resolved something dialable.

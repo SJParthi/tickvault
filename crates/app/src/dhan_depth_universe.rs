@@ -786,6 +786,52 @@ pub async fn load_depth_universe_from_master(
     );
     Some(selection)
 }
+
+/// Counter: a depth-universe resolution that ended with ZERO sockets.
+///
+/// This module had **no metrics at all** until 2026-08-21, and six failure
+/// arms whose `tracing::error!` carried no `code=` field — so no metric filter
+/// could match them either. QuestDB down, a non-2xx, an unparseable body or an
+/// empty chain all produced the same outcome: ten of the sixteen authorized
+/// sockets carry nothing for the whole session, and every operator surface
+/// reads exactly as it does on a healthy day.
+///
+/// The `reason` label is what turns "depth is dark" into something actionable
+/// — a transport failure and an empty chain need opposite responses, and the
+/// morning after an expiry the empty case is EXPECTED.
+pub const DEPTH_UNIVERSE_FAILED_COUNTER: &str = "tv_dhan_depth_universe_failed_total";
+
+/// Every `reason` value [`DEPTH_UNIVERSE_FAILED_COUNTER`] can carry.
+///
+/// Enumerated so they can be pre-registered at zero. The CloudWatch delta
+/// pipeline drops each series' FIRST observed sample as its baseline, and this
+/// counter fires at most a handful of times per session — so an
+/// un-pre-registered reason would lose its first increment and, on a session
+/// that failed once, its only one.
+pub const DEPTH_FAILURE_REASONS: [&str; 6] = [
+    "client_build",
+    "response_unreadable",
+    "non_2xx",
+    "request_failed",
+    "unparseable",
+    "empty_selection",
+];
+
+/// Publish a 0 for every reason before the first attempt.
+pub fn pre_register_depth_failure_counters() {
+    for reason in DEPTH_FAILURE_REASONS {
+        metrics::counter!(DEPTH_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(0);
+    }
+}
+
+/// Record one depth-universe failure.
+///
+/// `reason` must be a member of [`DEPTH_FAILURE_REASONS`]; a `&'static str`
+/// rather than a `String` because a dynamic label allocates, and this is
+/// called from a path the drain's own budget covers.
+pub fn record_depth_failure(reason: &'static str) {
+    metrics::counter!(DEPTH_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(1);
+}
 /// `/exec` HTTP timeout. Matches the sibling boot readers.
 const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 
@@ -823,7 +869,10 @@ pub async fn load_depth_universe(
     {
         Ok(c) => c,
         Err(err) => {
+            record_depth_failure("client_build");
             tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
                 ?err,
                 "depth universe: HTTP client build failed — depth-20 and depth-200 will \
                  open ZERO sockets this session"
@@ -841,7 +890,10 @@ pub async fn load_depth_universe(
         Ok(resp) if resp.status().is_success() => match resp.text().await {
             Ok(b) => b,
             Err(err) => {
+                record_depth_failure("response_unreadable");
                 tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching
+                        .code_str(),
                     ?err,
                     "depth universe: could not read the chain snapshot response — \
                      depth-20 and depth-200 will open ZERO sockets this session"
@@ -850,7 +902,9 @@ pub async fn load_depth_universe(
             }
         },
         Ok(resp) => {
+            record_depth_failure("non_2xx");
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
                 status = %resp.status(),
                 "depth universe: chain snapshot query returned non-2xx — depth-20 and \
                  depth-200 will open ZERO sockets this session"
@@ -858,7 +912,10 @@ pub async fn load_depth_universe(
             return DepthSelection::default();
         }
         Err(err) => {
+            record_depth_failure("request_failed");
             tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
                 ?err,
                 "depth universe: chain snapshot query failed — depth-20 and depth-200 \
                  will open ZERO sockets this session"
@@ -870,7 +927,10 @@ pub async fn load_depth_universe(
     let candidates = match parse_depth_candidates_dataset(&body) {
         Ok(c) => c,
         Err(reason) => {
+            record_depth_failure("unparseable");
             tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
                 reason,
                 "depth universe: chain snapshot did not parse — depth-20 and depth-200 \
                  will open ZERO sockets this session"
@@ -881,7 +941,9 @@ pub async fn load_depth_universe(
 
     let selection = select_depth_universe(&candidates);
     if selection.depth_20.is_empty() && selection.depth_200.is_empty() {
+        record_depth_failure("empty_selection");
         tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
             candidates = candidates.len(),
             refused_zero_id = selection.refused_zero_id,
             refused_unknown_underlying = selection.refused_unknown_underlying,
@@ -1620,5 +1682,100 @@ mod master_sourced_tests {
         assert!(ymd_to_epoch_micros(20_260_230).is_none(), "30 February");
         assert!(ymd_to_epoch_micros(20_261_301).is_none(), "month 13");
         assert!(ymd_to_epoch_micros(20_260_828).is_some());
+    }
+}
+
+#[cfg(test)]
+mod failure_metric_tests {
+    use super::*;
+
+    /// Every reason the code can emit must be pre-registered at zero.
+    ///
+    /// This counter fires at most a handful of times per session, and the
+    /// CloudWatch delta pipeline drops each series' first observed sample as
+    /// its baseline. An un-pre-registered reason therefore loses its first
+    /// increment — and on a session that failed once, its only one, leaving
+    /// the module exactly as silent as it was before this existed.
+    #[test]
+    fn pre_register_depth_failure_counters_covers_every_record_depth_failure_reason() {
+        let src = include_str!("dhan_depth_universe.rs");
+        let mut emitted: Vec<&str> = Vec::new();
+        for (idx, _) in src.match_indices("record_depth_failure(\"") {
+            let rest = &src[idx + "record_depth_failure(\"".len()..];
+            if let Some(end) = rest.find('"') {
+                emitted.push(&rest[..end]);
+            }
+        }
+        assert!(
+            emitted.len() >= 6,
+            "expected every failure arm to record a reason, found {}",
+            emitted.len()
+        );
+        for reason in emitted {
+            assert!(
+                DEPTH_FAILURE_REASONS.contains(&reason),
+                "`{reason}` is emitted but not pre-registered — its first increment \
+                 would be eaten as the CloudWatch baseline"
+            );
+        }
+        // Safe with no recorder installed.
+        pre_register_depth_failure_counters();
+        record_depth_failure("empty_selection");
+    }
+
+    /// Every failure arm must carry a `code=` field.
+    ///
+    /// Without one, no CloudWatch metric filter can ever match the line — and
+    /// that is precisely why six loud-looking `error!`s produced no operator
+    /// signal at all. A log nobody can filter is a log nobody reads.
+    #[test]
+    fn every_depth_failure_log_carries_an_error_code() {
+        // Production code only. Scanning the whole file makes the test match
+        // ITS OWN source and fail on strings it wrote itself — which is how
+        // the first version of this test failed.
+        let src = include_str!("dhan_depth_universe.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let errors = prod.matches("tracing::error!(").count();
+        assert!(errors >= 6, "expected the six failure arms, found {errors}");
+        let mut uncoded = 0;
+        for (idx, _) in prod.match_indices("tracing::error!(") {
+            // CHARS, not bytes. These messages are full of em-dashes, and a
+            // byte-index window lands mid-character and panics — which is how
+            // the second version of this test failed.
+            let window: String = prod[idx..].chars().take(220).collect();
+            if !window.contains("code =") {
+                uncoded += 1;
+            }
+        }
+        assert_eq!(
+            uncoded, 0,
+            "{uncoded} depth failure log(s) carry no `code=` field, so no alarm \
+             can ever match them"
+        );
+    }
+
+    /// `record_depth_failure` must be callable with no recorder installed,
+    /// and must reject nothing — a metrics call that panicked inside a failure
+    /// arm would turn a degraded depth selection into a dead task.
+    #[test]
+    fn record_depth_failure_is_safe_without_a_recorder() {
+        for reason in DEPTH_FAILURE_REASONS {
+            record_depth_failure(reason);
+        }
+    }
+    /// Non-vacuity: the reason list must not contain entries nothing emits.
+    /// A pre-registered reason with no emit site is a permanently-flat series
+    /// that reads as health — the dead-monitor class this repo has retired
+    /// twice before.
+    #[test]
+    fn no_pre_registered_depth_reason_is_unreachable() {
+        let src = include_str!("dhan_depth_universe.rs");
+        for reason in DEPTH_FAILURE_REASONS {
+            assert!(
+                src.contains(&format!("record_depth_failure(\"{reason}\")")),
+                "`{reason}` is pre-registered but nothing emits it — a flat series \
+                 that reads as health forever"
+            );
+        }
     }
 }
