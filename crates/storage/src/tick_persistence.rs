@@ -342,14 +342,24 @@ impl TickRow {
         let opt_price = |v: f32| (v != 0.0).then(|| round_to_2dp(f32_to_f64_clean(v)));
         let opt_qty = |v: u32| (v != 0).then(|| i64::from(v));
 
+        // Hoisted: the receipt time is now needed TWICE — once as its own
+        // column and once as the fallback designated timestamp for a row whose
+        // LTT is the vendor's never-traded sentinel.
+        let received_at_ist_nanos = (tick.received_at_nanos != 0).then_some(
+            tick.received_at_nanos
+                .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+        );
+
         Ok(Self {
             security_id,
             segment: segment_code_to_str(tick.exchange_segment_code),
             ltp: round_to_2dp(f32_to_f64_clean(tick.last_traded_price)),
             volume: saturate_volume_to_i64(u64::from(tick.volume), security_id),
             // Dhan sends exchange_timestamp already in IST epoch SECONDS — no
-            // +19800 offset (`.claude/rules/dhan/live-market-feed.md`).
-            ts_ist_nanos: i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000),
+            // +19800 offset (`.claude/rules/dhan/live-market-feed.md`). A
+            // never-traded SENTINEL falls back to the receipt time — see
+            // [`row_timestamp_ist_nanos`].
+            ts_ist_nanos: row_timestamp_ist_nanos(tick.exchange_timestamp, received_at_ist_nanos),
             capture_seq,
             open: opt_price(tick.day_open),
             high: opt_price(tick.day_high),
@@ -362,10 +372,7 @@ impl TickRow {
             total_buy_qty: opt_qty(tick.total_buy_quantity),
             total_sell_qty: opt_qty(tick.total_sell_quantity),
             exchange_timestamp: Some(i64::from(tick.exchange_timestamp)),
-            received_at_ist_nanos: (tick.received_at_nanos != 0).then_some(
-                tick.received_at_nanos
-                    .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
-            ),
+            received_at_ist_nanos,
             payload_hash: None,
         })
     }
@@ -617,6 +624,60 @@ fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
         "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
         config.host, config.http_port
     )
+}
+
+/// The designated timestamp for a `ticks` row, in IST-epoch nanoseconds.
+///
+/// # The problem this solves
+///
+/// Dhan signals "this contract has not traded today" with an LTT that is not a
+/// time at all — measured on the live box 2026-08-21, it is **315,532,800**
+/// (1980-01-01) for 945,501 rows and a literal `0` for 7,282 more. Those rows
+/// are NOT empty: 99.2% of them carry a real `total_buy_qty`, `total_sell_qty`
+/// and previous `close`. They are contracts with a live order book that simply
+/// have no last trade yet, and the drain keeps them deliberately — discarding
+/// them would lose the ability to tell "did not trade" from "did not capture",
+/// and would throw away the book with it.
+///
+/// Stamping the row with the vendor's sentinel put ~950,000 rows of real data
+/// per session into a permanent `1980-01-01` partition, where **no time-range
+/// query can ever reach them**. Data that cannot be found is not kept in any
+/// useful sense, and every one of those writes also lands out-of-order against
+/// the current partition rather than appending to it.
+///
+/// # The rule
+///
+/// An LTT below [`MIN_PLAUSIBLE_EXCHANGE_TS_SECS`] is a sentinel, not a time,
+/// so the row is stamped with its RECEIPT time — which is the only real time
+/// such an observation has. The raw sentinel is NOT destroyed: it stays in the
+/// `exchange_timestamp` column, so "never traded" remains recoverable, and the
+/// same floor the aggregator uses to refuse the candle is the one used here, so
+/// the two cannot drift apart.
+///
+/// # Convention safety
+///
+/// Both inputs are already IST-epoch (`.claude/rules/project/data-integrity.md`
+/// calls the WebSocket timestamp rule "THE SINGLE MOST CRITICAL DATA INTEGRITY
+/// RULE"): `exchange_timestamp` arrives IST-epoch with NO `+19800` applied, and
+/// `received_at_ist_nanos` has already had the offset added by its caller. So
+/// this function only ever CHOOSES between two values in one space — it never
+/// converts, and cannot introduce the sign error that rule warns about.
+///
+/// # Fail-safe
+///
+/// If the LTT is a sentinel AND no receipt time was carried, there is no real
+/// time available, so the sentinel is kept unchanged. That row stays out of the
+/// live range exactly as it does today — a guess would be worse than a value
+/// that is visibly wrong.
+#[must_use]
+pub fn row_timestamp_ist_nanos(exchange_timestamp: u32, received_at_ist_nanos: Option<i64>) -> i64 {
+    let ltt_nanos = i64::from(exchange_timestamp).saturating_mul(1_000_000_000);
+    if exchange_timestamp
+        >= tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+    {
+        return ltt_nanos;
+    }
+    received_at_ist_nanos.unwrap_or(ltt_nanos)
 }
 
 /// Batched `ticks` ILP writer — one per feed CONNECTION.
@@ -945,6 +1006,29 @@ impl TickWriter {
                 .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
             match spill_failed_ilp(&self.spill_dir, self.buffer.as_bytes(), self.feed, now) {
                 Ok(path) => {
+                    // BOTH counters, and the alarmed one is not optional.
+                    //
+                    // `tv_ticks_dropped_total` is EMF-selected and carries the
+                    // `dhan_ticks_dropped` alarm (`live-lane-alarms.tf`).
+                    // `tv_ticks_spilled_total` carries NEITHER. Incrementing
+                    // only the new name would have DIVERTED the common flush
+                    // failure — the exact 2026-08-21 timeout — off the only
+                    // pager that watches it, so the operator would have been
+                    // told less than before the rescue existed. That is a
+                    // false-OK (audit Rule 11), and a rescue that blinds the
+                    // alarm is a worse outcome than the loss it prevents.
+                    //
+                    // The alarmed counter is also the SEMANTICALLY correct one
+                    // here: it means "rows left the buffer without reaching
+                    // QuestDB", which is TRUE of a rescued row — the file is on
+                    // disk, the database does not have it. `spilled` is the
+                    // strictly narrower fact "and it is recoverable", which is
+                    // why it is a second increment rather than a replacement.
+                    metrics::counter!(
+                        "tv_ticks_dropped_total",
+                        "feed" => self.feed.as_str()
+                    )
+                    .increment(dropped as u64);
                     metrics::counter!(
                         "tv_ticks_spilled_total",
                         "feed" => self.feed.as_str()
@@ -1920,5 +2004,141 @@ mod tests {
             "a zero-byte rescue would report success while losing the rows"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- never-traded sentinel timestamp (2026-08-21) -----------------------
+
+    /// Dhan's measured never-traded LTT sentinel: 1980-01-01, IST-epoch secs.
+    const SENTINEL_LTT: u32 = 315_532_800;
+
+    #[test]
+    fn row_timestamp_ist_nanos_keeps_a_real_exchange_time_untouched() {
+        // Non-vacuity, and the one that protects every NORMAL row: a traded
+        // tick must keep the exchange's own time. If this ever returned the
+        // receipt time, every price in the database would be stamped with when
+        // WE saw it rather than when it TRADED -- silently, and for everything.
+        let ltt: u32 = 1_787_000_000;
+        assert_eq!(
+            row_timestamp_ist_nanos(ltt, Some(9_999_999_999_999_999)),
+            i64::from(ltt) * 1_000_000_000,
+            "a plausible LTT wins over the receipt time, always"
+        );
+    }
+
+    #[test]
+    fn row_timestamp_ist_nanos_falls_back_for_the_1980_sentinel() {
+        // The measured case: 945,501 rows on 2026-08-21 carried this exact
+        // value, and 99.2% of them carried a real order book with it.
+        let received = 1_787_300_000_000_000_000_i64;
+        assert_eq!(
+            row_timestamp_ist_nanos(SENTINEL_LTT, Some(received)),
+            received,
+            "a sentinel is not a time — the row takes its receipt time"
+        );
+    }
+
+    #[test]
+    fn row_timestamp_ist_nanos_falls_back_for_a_literal_zero_ltt() {
+        // The other 7,282 rows. Both sentinel shapes must behave identically,
+        // or one of them silently keeps landing in 1970.
+        let received = 1_787_300_000_000_000_000_i64;
+        assert_eq!(row_timestamp_ist_nanos(0, Some(received)), received);
+    }
+
+    #[test]
+    fn row_timestamp_ist_nanos_keeps_the_sentinel_when_no_receipt_time_exists() {
+        // Fail-safe. With no real time available, a GUESS would be worse than a
+        // value that is visibly wrong: the row stays out of the live range and
+        // stays findable as an anomaly, exactly as it does today.
+        assert_eq!(
+            row_timestamp_ist_nanos(SENTINEL_LTT, None),
+            315_532_800_000_000_000
+        );
+        assert_eq!(row_timestamp_ist_nanos(0, None), 0);
+    }
+
+    #[test]
+    fn row_timestamp_ist_nanos_agrees_with_the_aggregators_own_floor() {
+        // The floor is SHARED with the aggregator rather than re-declared, so
+        // the candle refusal and the timestamp fallback can never disagree
+        // about what counts as a real time. Pinned at the exact boundary.
+        let floor = tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS;
+        let received = 1_787_300_000_000_000_000_i64;
+        assert_eq!(
+            row_timestamp_ist_nanos(floor, Some(received)),
+            i64::from(floor) * 1_000_000_000,
+            "exactly AT the floor is plausible and must be kept"
+        );
+        assert_eq!(
+            row_timestamp_ist_nanos(floor - 1, Some(received)),
+            received,
+            "one second below the floor is a sentinel"
+        );
+    }
+
+    #[test]
+    fn a_sentinel_row_keeps_its_raw_ltt_and_its_order_book() {
+        // The whole reason these rows are kept rather than dropped: they carry
+        // a live book. This drives the REAL row builder and asserts the row is
+        // now findable in the live time range while losing NOTHING -- the raw
+        // sentinel survives in its own column, so "never traded" is still
+        // recoverable.
+        let mut tick = sample_tick();
+        tick.exchange_timestamp = SENTINEL_LTT;
+        tick.last_traded_price = 0.0;
+        tick.total_buy_quantity = 8_397_000;
+        tick.total_sell_quantity = 9_019_000;
+        tick.received_at_nanos = 1_787_300_000_000_000_000;
+
+        let row = TickRow::from_parsed_tick(&tick, 1).expect("a sentinel tick still builds a row");
+
+        assert_ne!(
+            row.ts_ist_nanos,
+            i64::from(SENTINEL_LTT) * 1_000_000_000,
+            "the row must no longer be stamped into the 1980 partition"
+        );
+        assert_eq!(
+            row.exchange_timestamp,
+            Some(i64::from(SENTINEL_LTT)),
+            "the raw sentinel is preserved — nothing is destroyed"
+        );
+        assert_eq!(row.total_buy_qty, Some(8_397_000), "the book survives");
+        assert_eq!(row.total_sell_qty, Some(9_019_000), "the book survives");
+    }
+
+    #[test]
+    fn the_rescue_path_still_increments_the_alarmed_counter() {
+        // REGRESSION RATCHET (2026-08-21). The first version of the spill
+        // rescue incremented ONLY `tv_ticks_spilled_total`, which is neither
+        // EMF-selected nor alarmed, and thereby diverted the common flush
+        // failure off `dhan_ticks_dropped` — the only pager watching it. The
+        // rescue made the loss recoverable and simultaneously made it
+        // INVISIBLE, which is a strictly worse trade and the exact false-OK
+        // this repo forbids.
+        //
+        // Source-scan rather than a recorder assertion, deliberately: what
+        // must never regress is that the ALARMED NAME appears on the success
+        // arm. A behavioural test on a metrics recorder would still pass if
+        // someone renamed the counter to another unalarmed one.
+        let src = include_str!("tick_persistence.rs");
+        let ok_arm = src
+            .split("Ok(path) => {")
+            .nth(1)
+            .expect("the spill-success arm exists");
+        let arm_body = ok_arm
+            .split("Err(err) => {")
+            .next()
+            .expect("bounded by the failure arm");
+        assert!(
+            arm_body.contains("tv_ticks_dropped_total"),
+            "the ALARMED counter must fire on a rescue too — a rescued row is \
+             still absent from QuestDB, which is what dhan_ticks_dropped pages \
+             on. Removing it silently un-pages the flush failure."
+        );
+        assert!(
+            arm_body.contains("tv_ticks_spilled_total"),
+            "the recoverable-subset counter must also fire, or the operator \
+             cannot tell a rescued loss from a permanent one"
+        );
     }
 }

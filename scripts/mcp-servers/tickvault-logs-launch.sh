@@ -2,9 +2,11 @@
 # tickvault-logs MCP launcher (rust-only phase 2c cutover, 2026-07-18).
 #
 # Launches the Rust MCP server (crates/tickvault-logs-mcp) for the
-# `.mcp.json` `tickvault-logs` entry. The legacy server.py it replaces is
-# DELETED from git (the parity harness re-materializes it from pinned git
-# history for regression testing only). Rust-only: no interpreter fallback.
+# `.mcp.json` `tickvault-logs` entry. The legacy interpreted server it
+# replaces is DELETED from git and nothing resurrects it: the parity harness
+# that used to re-materialize it from pinned history was itself retired on
+# 2026-08-01 (rust-only-forever-lock §0, second pass), so no test writes it
+# back to disk either. Rust-only: no interpreter fallback.
 #
 # Launch policy (coordinator decision, phase-2c open Unknown resolved):
 #   1. A prebuilt release binary, if present, launches instantly.
