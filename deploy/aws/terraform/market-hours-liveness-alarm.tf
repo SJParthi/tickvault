@@ -384,6 +384,20 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # binding constraints are the dated §2.3b row in
         # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 4 alarms.
         aws_cloudwatch_metric_alarm.dhan_no_ticks_flowing.alarm_name,
+        # 2026-08-21: the two SPILL-TIER alarms JOIN the gate.
+        #
+        # Unlike the two directly above, these are notBreaching — a stopped box
+        # publishes nothing and that is health, not a failing drain. So they do
+        # not NEED the gate to avoid a missing-data page. They join it for the
+        # other reason: both fire at threshold 1 on a cumulative Sum, and the
+        # box's own shutdown flush is exactly when a last-moment spill is most
+        # likely. Without the gate that lands as a 17:30 page every evening it
+        # happens, on a box that is deliberately going away.
+        #
+        # Authorization and the binding constraints are the dated §2.3c row in
+        # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 6 alarms.
+        aws_cloudwatch_metric_alarm.tick_spill_replay_failing.alarm_name,
+        aws_cloudwatch_metric_alarm.ticks_spilling.alarm_name,
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS
         # sweep — its metric's writer, the tick aggregator, is deleted).

@@ -367,3 +367,155 @@ fn frame_drain_gate_is_not_vacuous() {
     );
     assert!(ingest.tracked_instruments() > 0);
 }
+
+/// The PRODUCTION shape: a Full (code 8) packet through a lane with the
+/// inline-depth sink wired.
+///
+/// # Why this exists as a separate gate
+///
+/// Every gate above builds a **Quote** packet (code 4, 50 bytes) and a
+/// `LiveIngest` with **no depth sink**. Production is neither:
+/// `DEFAULT_MAIN_FEED_MODE` is `FeedMode::Full` (code 8, 162 bytes, five depth
+/// levels) since 2026-08-19, and the boot site wires `with_inline_depth`
+/// UNCONDITIONALLY. So the branch that does the most per-packet work in
+/// production — the depth fold, ten `DepthRow` appends per packet — was
+/// measured by nothing.
+///
+/// That is the `record_ws_lag` failure mode exactly. That path allocated twice
+/// per tick for months, roughly 36 million allocations an hour, while three
+/// correct comments warned against precisely it. Comments did not catch it; a
+/// DHAT test did. A gate that measures a packet type production does not send
+/// is a comment with a test's reputation.
+///
+/// # What the budget means
+///
+/// Full does strictly more work than Quote — a 162-byte parse and ten depth
+/// rows instead of a 50-byte parse and none — so its ceiling is higher than the
+/// Quote gate's and says nothing about zero-allocation. It is a RATCHET at the
+/// measured rate. It catches a doubling, which is the regression class that has
+/// actually happened here; it does not certify the path allocation-free, and no
+/// comment here should be read as saying so.
+#[test]
+fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use tickvault_app::dhan_feed_stack::DepthIngest;
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    /// One 162-byte Full packet, built to the wire layout in
+    /// `crates/core/src/parser/full_packet.rs`.
+    ///
+    /// The depth levels are filled with non-zero values on purpose: a block of
+    /// zeros can be folded by a short-circuit that a real book would not take,
+    /// and the gate would then measure less work than production does.
+    fn full_packet(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; tickvault_common::constants::FULL_QUOTE_PACKET_SIZE];
+        buf[0] = tickvault_common::constants::RESPONSE_CODE_FULL;
+        buf[1..3].copy_from_slice(
+            &(tickvault_common::constants::FULL_QUOTE_PACKET_SIZE as u16).to_le_bytes(),
+        );
+        buf[3] = 1; // NSE_EQ — a segment that HAS an order book
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[tickvault_common::constants::QUOTE_OFFSET_LTP
+            ..tickvault_common::constants::QUOTE_OFFSET_LTP + 4]
+            .copy_from_slice(&ltp.to_le_bytes());
+        buf[tickvault_common::constants::QUOTE_OFFSET_LTT
+            ..tickvault_common::constants::QUOTE_OFFSET_LTT + 4]
+            .copy_from_slice(&ltt.to_le_bytes());
+        for level in 0..tickvault_common::constants::MARKET_DEPTH_LEVELS {
+            let base = tickvault_common::constants::FULL_OFFSET_DEPTH_START
+                + level * tickvault_common::constants::MARKET_DEPTH_LEVEL_SIZE;
+            let step = level as u32 + 1;
+            buf[base..base + 4].copy_from_slice(&(100u32 * step).to_le_bytes());
+            buf[base + 4..base + 8].copy_from_slice(&(200u32 * step).to_le_bytes());
+        }
+        buf
+    }
+
+    /// Four packets stacked in ONE frame — the real shape, as above.
+    fn frame(seq: u64, n: u64) -> CapturedFrame {
+        let mut bytes = Vec::with_capacity(4 * tickvault_common::constants::FULL_QUOTE_PACKET_SIZE);
+        for i in 0..4u32 {
+            bytes.extend_from_slice(&full_packet(
+                5000 + i,
+                100.0 + (n % 97) as f32 * 0.05,
+                SESSION_EPOCH_SECS + (n % 600) as u32,
+            ));
+        }
+        CapturedFrame {
+            seq,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: (n % 4) as u8,
+            received_at: std::time::Instant::now(),
+            bytes: bytes.into(),
+        }
+    }
+
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+        .with_inline_depth(DepthIngest::for_test());
+    let c = counters();
+
+    // Warm-up OUTSIDE the window: first touch of an instrument allocates its
+    // slot and registers its metric keys, and that cost is per-universe, not
+    // per-tick.
+    for n in 0..4u64 {
+        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), 1_000_000, 1_000, c);
+    }
+
+    const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks
+
+    // EVERY FIXTURE BUILT BEFORE THE PROFILER STARTS, so the measurement is of
+    // the drain and not of the test's own Vec growth.
+    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n)).collect();
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    let mut folded = 0u64;
+    let mut depth_rows = 0u64;
+    for f in &frames {
+        let out = drain_main_feed_frame(&mut ingest, f, 1_000_000, 1_000, c);
+        folded += out.folded;
+        depth_rows += out.inline_depth_rows;
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    // NON-VACUITY FIRST. A Full packet that parses but is refused would make
+    // every allocation number below meaningless while looking like a pass —
+    // which is exactly how the 1970-timestamp bug hid in the gate above.
+    assert_eq!(
+        folded,
+        FRAMES * 4,
+        "every packet must FOLD, or the budget measures the refusal path"
+    );
+
+    // And the depth half specifically must have run — with the EXACT row count
+    // production would produce. `> 0` would pass on a single stray append; ten
+    // rows per packet (five levels, both sides) is the shape that proves the
+    // whole fold ran for every packet, which is the gap this gate closes.
+    assert_eq!(
+        depth_rows,
+        FRAMES * 4 * 10,
+        "the inline-depth sink must append ten rows per packet, or this gate \
+         measures a Full packet with the depth branch skipped — the very shape \
+         it exists to cover"
+    );
+
+    // Ceiling. MEASURED: 19 blocks over 10,000 ticks AND 100,000 depth-row
+    // appends — the depth fold is allocation-free at production scale, which is
+    // worth stating because it was previously unmeasured rather than known.
+    //
+    // 500, not a round 60,000: a per-tick allocation here would land at 10,000+,
+    // so hundreds is already a 25x signal, and a slack ceiling is a gate that
+    // passes while the thing it guards regresses. This is still a RATCHET at the
+    // measured rate, not a zero-allocation claim.
+    const MAX_BLOCKS_FULL: u64 = 500;
+    assert!(
+        stats.total_blocks <= MAX_BLOCKS_FULL,
+        "Full-mode frame drain with inline depth allocated {} blocks over {} ticks \
+         (ceiling {MAX_BLOCKS_FULL}). This is the production packet shape; a rise \
+         here is a per-tick allocation on the live path.",
+        stats.total_blocks,
+        FRAMES * 4
+    );
+}
