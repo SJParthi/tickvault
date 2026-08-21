@@ -98,78 +98,6 @@ fn routed_rest_events() -> Vec<(NotificationEvent, EpisodeFamily, u8, bool)> {
             12,
             true,
         ),
-        (
-            NotificationEvent::GrowwSpot1mFetchDegraded {
-                consecutive_failed_minutes: 3,
-                minute_ist: m("10:42 AM"),
-            },
-            EpisodeFamily::GrowwRest,
-            0,
-            false,
-        ),
-        (
-            NotificationEvent::GrowwSpot1mFetchRecovered {
-                minute_ist: m("10:45 AM"),
-                failed_minutes: 3,
-            },
-            EpisodeFamily::GrowwRest,
-            0,
-            true,
-        ),
-        (
-            NotificationEvent::GrowwChain1mFetchDegraded {
-                consecutive_failed_minutes: 3,
-                minute_ist: m("10:42 AM"),
-            },
-            EpisodeFamily::GrowwRest,
-            1,
-            false,
-        ),
-        (
-            NotificationEvent::GrowwChain1mFetchRecovered {
-                minute_ist: m("10:45 AM"),
-                failed_minutes: 3,
-            },
-            EpisodeFamily::GrowwRest,
-            1,
-            true,
-        ),
-        (
-            NotificationEvent::GrowwContract1mFetchDegraded {
-                consecutive_failed_minutes: 3,
-                minute_ist: m("10:42 AM"),
-            },
-            EpisodeFamily::GrowwRest,
-            2,
-            false,
-        ),
-        (
-            NotificationEvent::GrowwContract1mFetchRecovered {
-                minute_ist: m("10:45 AM"),
-                failed_minutes: 3,
-            },
-            EpisodeFamily::GrowwRest,
-            2,
-            true,
-        ),
-        (
-            NotificationEvent::GrowwChain1mUnderlyingNotServed {
-                underlying: "BANKNIFTY",
-                empty_minutes: 10,
-            },
-            EpisodeFamily::GrowwRest,
-            13,
-            false,
-        ),
-        (
-            NotificationEvent::GrowwChain1mUnderlyingServedRecovered {
-                underlying: "BANKNIFTY",
-                empty_minutes: 10,
-            },
-            EpisodeFamily::GrowwRest,
-            13,
-            true,
-        ),
     ]
 }
 
@@ -266,24 +194,14 @@ fn guard_chain_slot_map_per_underlying_and_distinct_catch_all() {
         ("MIDCPNIFTY", 7),
         ("", 7),
     ] {
-        for (label, key) in [
-            (
-                "Chain1mUnderlyingNotServed",
-                NotificationEvent::Chain1mUnderlyingNotServed {
-                    underlying,
-                    empty_minutes: 10,
-                }
-                .episode_key(),
-            ),
-            (
-                "GrowwChain1mUnderlyingNotServed",
-                NotificationEvent::GrowwChain1mUnderlyingNotServed {
-                    underlying,
-                    empty_minutes: 10,
-                }
-                .episode_key(),
-            ),
-        ] {
+        for (label, key) in [(
+            "Chain1mUnderlyingNotServed",
+            NotificationEvent::Chain1mUnderlyingNotServed {
+                underlying,
+                empty_minutes: 10,
+            }
+            .episode_key(),
+        )] {
             let key = key.unwrap_or_else(|| panic!("{label}({underlying}) must be routed"));
             assert_eq!(
                 key.conn, slot,

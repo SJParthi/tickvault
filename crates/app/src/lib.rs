@@ -83,7 +83,6 @@ pub mod feed_scoreboard_boot;
 // recompute every higher-TF candle (3m..15m) from the stored 1m rows and
 // compare against the persisted TF tables — Dhan verifies TODAY, Groww
 // verifies the PREVIOUS trading day (TF-VERIFY-01/02).
-pub mod spot_crossverify_boot;
 pub mod tf_consistency_boot;
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
 // `tick_conservation_boot` module DELETED — the 15:40 IST WAL-vs-DB daily

@@ -569,7 +569,6 @@ async fn async_main() -> Result<()> {
     // exists anymore).
     info!(
         dhan_enabled = feeds.dhan_enabled,
-        both_enabled = feeds.both_enabled(),
         "feed selection: which market-data feeds are configured"
     );
     if !feeds.any_enabled() {
@@ -1769,16 +1768,6 @@ async fn async_main() -> Result<()> {
     // once-per-process AtomicBool inside makes the fast-arm + prefix
     // dual-spawn safe. See `tf_consistency_boot::spawn_tf_consistency_tasks`.
     tickvault_app::tf_consistency_boot::spawn_tf_consistency_tasks(
-        &config,
-        &trading_calendar,
-        &notifier,
-    );
-
-    // Post-close Dhan↔Groww spot_1m_rest cross-broker OHLC comparator
-    // (SPOT-XVERIFY-01/02) — PROCESS-GLOBAL, config-gated (`[spot_crossverify]
-    // enabled`), 15:47 IST, DEDUP-idempotent. See
-    // `spot_crossverify_boot::spawn_spot_crossverify_tasks`.
-    tickvault_app::spot_crossverify_boot::spawn_spot_crossverify_tasks(
         &config,
         &trading_calendar,
         &notifier,
@@ -4381,17 +4370,7 @@ fn spawn_feed_scoreboard_tasks(
         match inner.await {
             Ok(Ok(Some(summary))) => {
                 if sb_telegram_enabled {
-                    // Scoreboard PR-B (2026-07-10): the round-2 Groww
-                    // drops blind spot is CLOSED for its dominant failure
-                    // mode — the sidecar socket-death family now writes
-                    // `stall_restarted` rows (counted in the Stalls column),
-                    // so Groww's drops count (feed-disable + bridge-death)
-                    // renders as a measured number again. Honest residual
-                    // (runbook §6): in-sidecar reconnects that recover
-                    // FASTER than the 30s stall threshold remain invisible
-                    // to both columns on both card sides.
-                    let groww_line = to_line("Groww", &summary.groww);
-                    // Groww REST plan PR-5 (operator Quote 2, 2026-07-13):
+                    // REST plan PR-5 (operator Quote 2, 2026-07-13):
                     // the official minute-candle pull digest lines — the
                     // four canonical feed/leg pairs always render (honest
                     // "not measured yet" when a source is absent); the
@@ -4403,14 +4382,12 @@ fn spawn_feed_scoreboard_tasks(
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
-                        groww: groww_line,
                         session_minutes: summary.session_minutes,
                         partial_coverage: summary.partial_coverage,
                         degraded: summary.degraded,
                         early_run: summary.early_run,
                         restart_partial: summary.restart_partial,
                         dhan_feed_off: summary.dhan_feed_off,
-                        groww_feed_off: summary.groww_feed_off,
                         rest_legs,
                         rest_legs_read_failed: summary.rest_legs_read_failed,
                     });

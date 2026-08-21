@@ -464,10 +464,6 @@ pub enum NotificationEvent {
         off_grid: u64,
         /// Duplicate rows sharing one storage key.
         duplicates: u64,
-        /// Groww end-of-day buckets that are never sealed on the
-        /// production schedule (the system stops before midnight) — not
-        /// verified BY DESIGN, never a page (H1 carve-out).
-        tail_unsealed: u64,
         /// True when any query/flush/budget leg degraded — the run cannot
         /// vouch for the full universe.
         degraded: bool,
@@ -2198,40 +2194,22 @@ impl NotificationEvent {
                 no_coverage,
                 off_grid,
                 duplicates,
-                tail_unsealed,
                 degraded,
                 truncated,
                 status_label,
                 top_detail,
             } => {
-                // H1: name the Groww end-of-day buckets that are never
-                // sealed on the production schedule — honest coverage
-                // note, never a finding.
-                let tail_note = if *tail_unsealed > 0 {
-                    format!(
-                        "\n{tail_unsealed} Groww end-of-day buckets are not \
-                         sealed by design (the system stops before the \
-                         midnight seal) — not verified."
-                    )
-                } else {
-                    String::new()
-                };
                 // L6: wording derives from status_label — the verifier's
                 // flush-adjusted verdict — never re-derived from counts.
                 if status_label == "pass" {
                     // 2026-07-15 cleanliness overhaul: a green daily check
-                    // is ONE line — the H1 tail carve-out rides inline.
+                    // is ONE line.
                     let candles = usize::try_from(*buckets_compared)
                         .map(format_with_commas)
                         .unwrap_or_else(|_| buckets_compared.to_string());
                     let instruments_fmt = usize::try_from(*instruments)
                         .map(format_with_commas)
                         .unwrap_or_else(|_| instruments.to_string());
-                    let tail_inline = if *tail_unsealed > 0 {
-                        format!(" ({tail_unsealed} end-of-day candles unverified)")
-                    } else {
-                        String::new()
-                    };
                     // G3 (fix round 2): the one-liner ALWAYS carries the
                     // compact verified date (the run's Dhan-side target
                     // day — the run's identity date) so a forced
@@ -2240,7 +2218,7 @@ impl NotificationEvent {
                     let date = render_compact_date_ist(dhan_date_ist);
                     format!(
                         "\u{2705} Timeframe check 3:40 PM \u{b7} {date} — {candles} candles \
-                         across {instruments_fmt} instruments, all match.{tail_inline}"
+                         across {instruments_fmt} instruments, all match."
                     )
                 } else if status_label == "no_data" {
                     format!(
@@ -2261,7 +2239,7 @@ impl NotificationEvent {
                         "\u{1f198} <b>Daily timeframe check @ 3:40 PM IST — BLIND</b>\n\
                          Dhan day: {dhan_date_ist}\n\
                          Checked NOTHING today — could NOT verify a single \
-                         candle. This is not a pass.{tail_note}\n\
+                         candle. This is not a pass.\n\
                          What to do RIGHT NOW:\n\
                          1. Check the database is up and reachable.\n\
                          2. Confirm the live feeds recorded candles today.\n\
@@ -2294,7 +2272,7 @@ impl NotificationEvent {
                          Value differences: {mismatches} | Missing candles: {missing_tf_rows}\n\
                          Candles with no 1-minute data behind them: {no_coverage}\n\
                          Off-grid timestamps: {off_grid} | Duplicates: {duplicates}\
-                         {tail_note}{coverage_note}{truncated_note}{detail_block}\n\
+                         {coverage_note}{truncated_note}{detail_block}\n\
                          What to do RIGHT NOW:\n\
                          1. Review the worst offenders above — do they cluster \
                          on one timeframe or one time of day?\n\
