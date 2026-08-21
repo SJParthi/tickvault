@@ -687,13 +687,9 @@ impl BrutexCrossverifyWriter {
                 &mut self.pending,
                 "brutex_crossverify",
             );
-            if dropped > 0 {
-                return Err(anyhow::Error::new(err).context(format!(
-                    "brutex_crossverify ILP flush failed and the retained buffer hit its {}-row bound; those rows were discarded so memory stays bounded and a poisoned buffer cannot keep this table dead",
-                    crate::ilp_overflow::MAX_PENDING_ROWS
-                )));
-            }
-            return Err(anyhow::Error::new(err).context("brutex_crossverify ILP flush"));
+            return Err(anyhow::Error::new(err).context(
+                crate::ilp_overflow::flush_failure_context("brutex_crossverify ILP flush", dropped),
+            ));
         }
         self.pending = 0;
         Ok(())
