@@ -262,7 +262,23 @@ fn scan_corpus_exists_and_is_substantial() {
 /// for exactly this failure and names two of those same files in its own
 /// header. The lesson worth keeping is that a guard measuring the wrong
 /// number still reports a number, and nothing about a green run says which.
-const UNCODED_ERROR_BUDGET: usize = 107;
+///
+/// # Movement
+///
+/// 107 (measured) → 91. Sixteen sites coded, all in QuestDB persistence
+/// modules and none of them a guess: `order_audit_persistence.rs` already
+/// tags its `ensure_ddl` failure with its own table write-failure code, so
+/// the seven in `ws_event_audit_persistence.rs` take
+/// `AuditWs01EventWriteFailed` and the nine across
+/// `index_constituency_persistence.rs` +
+/// `instrument_lifecycle_persistence.rs` take
+/// `StorageGap03AuditWriteFailed` ("audit-table write failure, any table"),
+/// which `pnl_audit_persistence.rs` already uses for the same shape. Neither
+/// code is alarmed, so this changes no paging behaviour — only whether a
+/// failure can be found by code in triage. The one that most needed it: a
+/// failed `DEDUP ENABLE UPSERT KEYS` leaves a SEBI table silently accepting
+/// duplicate rows.
+const UNCODED_ERROR_BUDGET: usize = 91;
 
 /// Sites where an `error!` carries no code and that is CORRECT.
 ///
