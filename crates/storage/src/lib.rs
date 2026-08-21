@@ -283,6 +283,11 @@ pub mod rest_fetch_audit_persistence;
 // second).
 pub mod depth_persistence;
 pub mod tick_persistence;
+// Automatic drain for the live-tick spill tier (2026-08-21): posts spilled
+// ILP bodies back to QuestDB's /write endpoint and truncates on success, so
+// the ITEM 24 rescue recovers without a human running curl. Reinstates the
+// `tick_spill_drain` deleted in the 2026-07-17 stage-2 sweep (see above).
+pub mod tick_spill_replay;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;
