@@ -2349,6 +2349,17 @@ async fn run_frame_drain(
     depth_budget: Arc<RingByteBudget>,
     shutdown: Arc<tokio::sync::Notify>,
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    // Instruments that attach AFTER boot — the ~20,000 futures and option
+    // contracts the late-attach pass dials once a price exists.
+    //
+    // They need a channel because by the time they are selected, the ingest
+    // belongs to THIS task. Before this existed, only the boot spot universe
+    // was ever seeded, so a contract that subscribed and then silently
+    // delivered nothing was invisible to the gap detector: there is no
+    // payload to count, no parse to fail and no error to log, so absence
+    // against a seeded key is the ONLY evidence that exists. Roughly 80% of
+    // the authorized universe had no silence detection at all.
+    mut seed_rx: tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>,
 ) -> DrainOutcome {
     // Whether this drain has ever seen a frame. Owns the up-gauge's rising
     // edge — see the first-frame arm below and the spawn site's correction.
@@ -2621,6 +2632,41 @@ async fn run_frame_drain(
             // The detector's read-out. Until 2026-08-12 the lane fed this
             // detector on every tick and never asked it anything, so a
             // subscribe that silently did not take produced no signal at all.
+            // Seed instruments that attached after boot. Placed in the drain
+            // because the drain owns the ingest, and NOT biased ahead of
+            // frames: seeding is bookkeeping, and a queued frame is data.
+            //
+            // Deliberately seeds on the SUBSCRIBE, not on the first tick. A
+            // detector that learned instruments from arriving ticks could
+            // never report the one failure that matters here — an instrument
+            // that arrives never.
+            maybe_seed = seed_rx.recv() => {
+                if let Some(batch) = maybe_seed {
+                    let now_millis = u64::try_from(
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000,
+                    )
+                    .unwrap_or(0);
+                    // `seed` returns whether the slot allocator ACCEPTED the
+                    // instrument, not whether it was new -- a repeat seed is a
+                    // successful no-op. So this counts accepted, and a value
+                    // below `requested` means slots ran out.
+                    let mut added = 0usize;
+                    for inst in &batch {
+                        if ingest.seed(inst.security_id, inst.segment, now_millis) {
+                            added = added.saturating_add(1);
+                        }
+                    }
+                    info!(
+                        requested = batch.len(),
+                        seeded = added,
+                        tracked = ingest.tracked_instruments(),
+                        "late-attached instruments seeded into the silence detector"
+                    );
+                }
+                // A closed channel is NORMAL — the attach task finishes and
+                // drops its sender. `recv` then returns None forever, so this
+                // arm must not treat that as a reason to end the drain.
+            }
             _ = silence_timer.tick() => {
                 let now_millis = u64::try_from(
                     chrono::Utc::now().timestamp_millis().max(0)
@@ -4280,6 +4326,14 @@ async fn attach_depth_when_available(
     ws_audit_tx: tokio::sync::mpsc::Sender<
         tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
     >,
+    // Where late-attached instruments go to become VISIBLE to the silence
+    // detector. Without it, everything this task dials — the contracts and the
+    // depth legs, roughly 80% of the authorized universe — could subscribe and
+    // then deliver nothing at all, with no counter, no error, and no way for
+    // anyone to find out.
+    seed_tx: tokio::sync::mpsc::Sender<
+        Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+    >,
 ) {
     // Publish a 0 for every contract-failure reason BEFORE the first attempt.
     //
@@ -4609,6 +4663,23 @@ async fn attach_depth_when_available(
                         // per-attempt emit would page every healthy morning.
                         crate::dhan_contract_universe::record_contract_verdict(&contracts);
                         contracts_done = true;
+                        // Make them VISIBLE to the silence detector, at the
+                        // moment they reach the wire and not before. Seeding a
+                        // set that failed to dial would report silence for
+                        // instruments nobody ever asked for.
+                        //
+                        // `try_send` rather than `send`: this task must never
+                        // block on the drain, and a full 8-slot buffer means
+                        // the drain is wedged — which its own alarms cover.
+                        if let Err(err) = seed_tx.try_send(contracts.instruments.clone()) {
+                            warn!(
+                                %err,
+                                count = contracts.instruments.len(),
+                                "contracts dialed but could not be seeded into the silence \
+                                 detector — they will tick normally, but an instrument that \
+                                 goes silent among them will not be reported"
+                            );
+                        }
                         // Keeps `remaining_main_feed_capacity` honest for the
                         // depth half and any later reader. Without it the
                         // used-count still describes boot-only occupancy.
@@ -4661,6 +4732,18 @@ async fn attach_depth_when_available(
                             },
                         );
                         depth_done = true;
+                        // Same as the contract half: depth legs are real
+                        // subscriptions and a silently-dead one has no other
+                        // evidence.
+                        let mut depth_seed = selection.depth_20.clone();
+                        depth_seed.extend(selection.depth_200.iter().copied());
+                        if let Err(err) = seed_tx.try_send(depth_seed) {
+                            warn!(
+                                %err,
+                                "depth legs dialed but could not be seeded into the silence \
+                                 detector"
+                            );
+                        }
                         info!(
                             dialed,
                             attempts,
@@ -5339,6 +5422,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // stays idle if depth never attaches. In exchange `depth_unconsumed` keeps
     // its meaning as a pure wiring-bug signal and should now be unreachable.
     let depth_ingest = Some(DepthIngest::new(&params.questdb));
+    // Bounded, and small on purpose: the late-attach pass sends at most a
+    // handful of batches in a session. A large buffer here would only delay
+    // discovering that nobody is receiving.
+    let (seed_tx, seed_rx) = tokio::sync::mpsc::channel::<Vec<SubscribeInstrument>>(8);
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
@@ -5347,6 +5434,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         Arc::clone(&depth_budget),
         Arc::clone(&params.shutdown),
         Arc::clone(&params.feed_health),
+        seed_rx,
     ));
 
     // ---- socket lifecycle audit -------------------------------------------
@@ -5431,6 +5519,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             ),
             spot_topup,
             ws_audit_tx.clone(),
+            seed_tx.clone(),
         ));
     }
 
@@ -7967,6 +8056,7 @@ mod tests {
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
                 Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+                tokio::sync::mpsc::channel(1).1,
             ),
         )
         .await
@@ -8032,6 +8122,7 @@ mod tests {
             Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
             Arc::clone(&shutdown),
             Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+            tokio::sync::mpsc::channel(1).1,
         ));
 
         // `notify_one` is permit-based, so this is safe to fire before the
@@ -8131,6 +8222,7 @@ mod tests {
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
                 Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+                tokio::sync::mpsc::channel(1).1,
             ),
         )
         .await
@@ -10091,6 +10183,88 @@ mod frame_walk_accounting_tests {
         assert_eq!(
             out.abandoned_bytes, 9,
             "the 9 bytes of the partial packet are lost and must be counted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod late_seed_tests {
+    use super::*;
+
+    /// The drain must accept a seed batch and make those instruments visible
+    /// to the silence detector.
+    ///
+    /// This is the whole point: ~20,000 contracts attach after boot, and a
+    /// subscribe that silently delivers nothing has NO other evidence — no
+    /// payload to count, no parse to fail, no error to log. Absence measured
+    /// against a seeded key is the only thing that can ever report it.
+    #[test]
+    fn seeding_after_boot_makes_an_instrument_visible_to_the_detector() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 64);
+        let before = ingest.tracked_instruments();
+        assert!(ingest.seed(48_100, ExchangeSegment::NseFno, 1_000));
+        assert_eq!(
+            ingest.tracked_instruments(),
+            before + 1,
+            "a late-attached contract must become tracked, or it can never be \
+             reported silent"
+        );
+    }
+
+    /// Seeding the same instrument twice must not grow the tracked count. The
+    /// attach loop can legitimately re-dial after a refusal, and a detector
+    /// whose count drifted upward on every retry would make the silence
+    /// gauges meaningless.
+    ///
+    /// Note what `seed` returns: whether the slot allocator ACCEPTED the
+    /// instrument, not whether it was new. A repeat seed is a successful
+    /// no-op and returns true — which is why the assertion below is on the
+    /// COUNT and not on the return value.
+    #[test]
+    fn re_seeding_the_same_instrument_is_idempotent() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 64);
+        assert!(ingest.seed(48_100, ExchangeSegment::NseFno, 1_000));
+        let after_first = ingest.tracked_instruments();
+        assert!(
+            ingest.seed(48_100, ExchangeSegment::NseFno, 2_000),
+            "a repeat seed still succeeds — it is a no-op, not a refusal"
+        );
+        assert_eq!(
+            ingest.tracked_instruments(),
+            after_first,
+            "but it must not grow the tracked count"
+        );
+    }
+    /// The composite key, not the id alone. Two instruments can share a
+    /// numeric id across segments, and collapsing them would leave one of two
+    /// real contracts unmonitored while the count looked right.
+    #[test]
+    fn the_same_id_in_two_segments_seeds_two_instruments() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 64);
+        assert!(ingest.seed(27, ExchangeSegment::IdxI, 1_000));
+        assert!(ingest.seed(27, ExchangeSegment::NseEquity, 1_000));
+        assert_eq!(ingest.tracked_instruments(), 2);
+    }
+
+    /// The drain must carry a seed arm at all, and it must not be biased ahead
+    /// of frames. Seeding is bookkeeping; a queued frame is data.
+    #[test]
+    fn the_drain_has_a_seed_arm_that_does_not_outrank_frames() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let drain = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain must exist")
+            .1;
+        let seed_arm = drain
+            .find("maybe_seed = seed_rx.recv()")
+            .expect("the drain must have a seed arm, or late-attached instruments are invisible");
+        let frame_arm = drain
+            .find("maybe_frame = rx.recv()")
+            .expect("the drain must have a frame arm");
+        assert!(
+            frame_arm < seed_arm,
+            "the frame arm must come FIRST under `biased;` — seeding must never \
+             preempt draining queued frames"
         );
     }
 }
