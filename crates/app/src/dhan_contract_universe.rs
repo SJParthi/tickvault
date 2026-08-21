@@ -321,6 +321,29 @@ pub fn contract_verdict_reasons(selection: &ContractSelection) -> Vec<&'static s
         }
         _ => {}
     }
+    // Contracts pushed out by capacity BEFORE the stock-option window is
+    // fitted (2026-08-21).
+    //
+    // The four reasons above all describe the stock-option window. Nothing
+    // described the three push sites that run first — index futures, stock
+    // futures, and the full index-option chains. Those increment
+    // `dropped_for_capacity` on `NoRoom`, and if the window then fits its
+    // authorized size the verdict is `applied` with the full width, so NOT ONE
+    // reason fires. The counter reads its pre-registered zero, the alarm stays
+    // green, and contracts the operator authorized never reached the wire.
+    //
+    // That is the same silent-shortfall shape `record_contract_give_up` was
+    // added for, one layer in: the give-up arms had no emitter, and these
+    // drops had no reason.
+    //
+    // Deliberately independent of the window reasons rather than folded into
+    // them: a drop is a shortfall whatever the window did, and `no_room` and
+    // this can legitimately both fire for one selection. Two labels on one
+    // counter is the honest description of two distinct facts — collapsing
+    // them would hide whichever came second.
+    if selection.dropped_for_capacity > 0 {
+        reasons.push("dropped_for_capacity");
+    }
     reasons
 }
 
@@ -867,16 +890,37 @@ struct Ladder<'a> {
     atm: usize,
     /// Every current-expiry contract, kept for the final filter.
     contracts: Vec<Contract<'a>>,
+    /// Running count of contracts at strike indices `0..i`, so
+    /// `prefix[hi + 1] - prefix[lo]` is the number inside any strike-index
+    /// range in O(1).
+    ///
+    /// Built once per ladder because `fit_atm_window` probes 26 window sizes
+    /// across every ladder. Counting by filtering `contracts` each time made
+    /// that O(26 x total contracts) — at ~220 underlyings with full chains,
+    /// hundreds of thousands of comparisons to answer a question that is
+    /// arithmetic on a table already sorted. Sizing the window is now
+    /// O(26 x ladders); only the final push is proportional to what it
+    /// actually selects.
+    prefix: Vec<usize>,
 }
 
 impl<'a> Ladder<'a> {
+    /// The strike-index range `window` covers, clamped to the ladder.
+    ///
+    /// `min` rather than a bare index: the ladder can be shorter than the
+    /// window on either side, and an out-of-range index is a panic on a path
+    /// that runs against vendor data.
+    fn range(&self, window: usize) -> (usize, usize) {
+        (
+            self.atm.saturating_sub(window),
+            (self.atm + window).min(self.strikes.len().saturating_sub(1)),
+        )
+    }
+
     /// Contracts within `window` strikes each side of ATM, both legs.
     fn within(&self, window: usize) -> impl Iterator<Item = &Contract<'a>> {
-        let lo = self.strikes[self.atm.saturating_sub(window)];
-        // `min` rather than a bare index: the ladder can be shorter than the
-        // window on either side, and an out-of-range index is a panic on a
-        // path that runs against vendor data.
-        let hi_idx = (self.atm + window).min(self.strikes.len() - 1);
+        let (lo_idx, hi_idx) = self.range(window);
+        let lo = self.strikes[lo_idx];
         let hi = self.strikes[hi_idx];
         self.contracts
             .iter()
@@ -885,8 +929,16 @@ impl<'a> Ladder<'a> {
 
     /// How many contracts `window` would select. Used to size the window
     /// before anything is pushed.
+    ///
+    /// O(1) — two prefix reads. This is called 26 times per ladder by
+    /// `fit_atm_window`, which is why it must not be a scan.
     fn count_within(&self, window: usize) -> usize {
-        self.within(window).count()
+        let (lo_idx, hi_idx) = self.range(window);
+        self.prefix
+            .get(hi_idx + 1)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(self.prefix.get(lo_idx).copied().unwrap_or(0))
     }
 }
 
@@ -948,10 +1000,34 @@ fn build_ladders<'a>(
             let above = strikes[idx] - spot;
             if below <= above { idx - 1 } else { idx }
         };
+        // One pass over the contracts to count how many sit at each strike
+        // index, then a running total. `partition_point` is a binary search on
+        // the already-sorted distinct strikes, so this is O(n log k) once —
+        // paid to make all 26 later window probes O(1) each.
+        let mut per_strike = vec![0usize; strikes.len()];
+        for c in &contracts {
+            let idx = strikes.partition_point(|&s| s < c.strike_paise);
+            // A contract whose strike is not in `strikes` is impossible —
+            // `strikes` was built FROM these contracts — but indexing on that
+            // assumption would panic on vendor data if it ever stopped being
+            // true. Skipping is the fail-closed choice: it undercounts the
+            // window, which shrinks it, rather than crashing the boot.
+            if let Some(slot) = per_strike.get_mut(idx) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+        let mut prefix = Vec::with_capacity(strikes.len() + 1);
+        prefix.push(0usize);
+        let mut running = 0usize;
+        for n in &per_strike {
+            running = running.saturating_add(*n);
+            prefix.push(running);
+        }
         ladders.push(Ladder {
             strikes,
             atm,
             contracts,
+            prefix,
         });
     }
     ladders
@@ -1583,6 +1659,60 @@ mod tests {
         assert_eq!(sel.stock_options, 0);
         assert_eq!(sel.underlyings_without_spot, 1);
     }
+
+    /// `count_within` is now arithmetic on a prefix table while `within` still
+    /// filters the contracts. They must agree at EVERY window size, or the
+    /// selector sizes a window against one number and then pushes a different
+    /// one — silently over- or under-filling the connection budget while every
+    /// log reads correct.
+    ///
+    /// This is the test that makes the optimisation safe: it compares the fast
+    /// path against the slow one it replaced, rather than asserting the fast
+    /// path's own answer.
+    #[test]
+    fn count_within_agrees_with_within_at_every_window_size() {
+        let rows = stock_ladder("RELIANCE");
+        // Route through the REAL selector so the ladder under test is the one
+        // production builds; then rebuild it directly to reach the private
+        // window helpers.
+        let mut bucket = UnderlyingBucket::default();
+        for r in &rows {
+            if r.strike_paise == 0 || r.option_leg == OptionLeg::None {
+                continue;
+            }
+            bucket.options.push(Contract {
+                security_id: r.security_id,
+                segment: ExchangeSegment::NseFno,
+                expiry_ymd: r.expiry_ymd,
+                strike_paise: r.strike_paise,
+                leg: r.option_leg,
+                underlying: r.underlying_symbol.as_str(),
+            });
+        }
+        let mut stock_opt: HashMap<&str, UnderlyingBucket<'_>> = HashMap::new();
+        stock_opt.insert("RELIANCE", bucket);
+
+        let mut sel = ContractSelection::default();
+        let ladders = build_ladders(&stock_opt, &spot("RELIANCE", 1000), &mut sel);
+        assert!(!ladders.is_empty(), "the fixture must produce a ladder");
+
+        for ladder in &ladders {
+            for window in 0..=STOCK_OPTION_ATM_STRIKES_EACH_SIDE {
+                assert_eq!(
+                    ladder.count_within(window),
+                    ladder.within(window).count(),
+                    "prefix count disagrees with the real filter at window {window}"
+                );
+            }
+            // Past the end of the ladder the answer must saturate at the whole
+            // ladder rather than run off the table.
+            assert_eq!(
+                ladder.count_within(10_000),
+                ladder.contracts.len(),
+                "an over-wide window selects the whole ladder"
+            );
+        }
+    }
     #[test]
     fn stock_options_take_the_atm_window_both_legs() {
         let rows = stock_ladder("RELIANCE");
@@ -1906,6 +2036,65 @@ mod tests {
             "a healthy selection must report NOTHING — a counter that fires on a good day \
              trains the operator to ignore it"
         );
+    }
+
+    /// The gap this closes: contracts dropped by the push sites that run
+    /// BEFORE the stock-option window is fitted — index futures, stock
+    /// futures, index chains — while the window itself then applies at its
+    /// authorized width. Every other reason describes the window, so this
+    /// selection previously reported a clean verdict while contracts the
+    /// operator authorized never reached the wire.
+    #[test]
+    fn contract_verdict_reasons_flags_drops_even_when_the_window_applied_in_full() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        sel.dropped_for_capacity = 1;
+        assert_eq!(
+            contract_verdict_reasons(&sel),
+            vec!["dropped_for_capacity"],
+            "a full-width window does not make a dropped contract acceptable — the \
+             selection is still smaller than the operator authorized, and this was the \
+             one shortfall shape no reason described"
+        );
+    }
+
+    /// Both facts are reported, not one. A window that could not fit AND
+    /// contracts pushed out are two distinct failures of the same selection;
+    /// reporting only the first would hide however many contracts were lost.
+    #[test]
+    fn contract_verdict_reasons_reports_no_room_and_drops_together() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.atm_window_reason = "no_room";
+        sel.dropped_for_capacity = 42;
+        let reasons = contract_verdict_reasons(&sel);
+        assert!(reasons.contains(&"no_room"), "got {reasons:?}");
+        assert!(reasons.contains(&"dropped_for_capacity"), "got {reasons:?}");
+    }
+
+    /// Non-vacuity: zero drops must stay silent, or the alarm fires on every
+    /// healthy session and the operator learns to ignore it.
+    #[test]
+    fn contract_verdict_reasons_stay_silent_when_nothing_was_dropped() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        sel.dropped_for_capacity = 0;
+        assert!(contract_verdict_reasons(&sel).is_empty());
     }
 
     #[test]

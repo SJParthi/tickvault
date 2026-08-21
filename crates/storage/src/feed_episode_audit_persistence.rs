@@ -348,9 +348,20 @@ impl FeedEpisodeAuditWriter {
         let Some(sender) = self.sender.as_mut() else {
             anyhow::bail!("feed_episode_audit: no ILP sender (QuestDB unreachable)");
         };
-        sender
-            .flush(&mut self.buffer)
-            .context("feed_episode_audit ILP flush")?;
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            // RETAIN on failure (the questdb-rs contract), but BOUNDED: a
+            // sustained outage or a server-side reject would otherwise grow
+            // this buffer without limit and, for a reject, keep it poisoned
+            // for the process lifetime. See ilp_overflow.
+            let dropped = crate::ilp_overflow::discard_if_overflowing(
+                &mut self.buffer,
+                &mut self.pending,
+                "feed_episode_audit",
+            );
+            return Err(anyhow::Error::new(err).context(
+                crate::ilp_overflow::flush_failure_context("feed_episode_audit ILP flush", dropped),
+            ));
+        }
         self.pending = 0;
         Ok(())
     }

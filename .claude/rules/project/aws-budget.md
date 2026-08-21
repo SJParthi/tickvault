@@ -923,6 +923,60 @@ high one. It widens the runway; the pressure-triggered archival landing alongsid
 what bounds the disk, and even that escalates rather than deletes when two days of data
 exceeds the volume. **One-way door:** gp3 grows online and can never shrink.
 
+### 2026-08-21 — BOTH raises are APPLIED AND VERIFIED LIVE, and the first full-scale session measured the burn
+
+Verified post-close (box stopped, 17:47 IST) against the live account, not inferred:
+
+| Fact | Live reading |
+|---|---|
+| Root volume | **`vol-0c6ab6e593e39d8c8`** — 200 GiB gp3, **6000 IOPS**, **500 MiB/s**, in-use |
+| Instance | `i-0c3fe906dad5492fc`, r8g.xlarge, ap-south-1b, stopped |
+| IOPS modification | 3000 → 6000, state `completed`, started 2026-08-20T12:15:58Z |
+| Filesystem followed? | **yes** — `tv_spill_dir_free_bytes` read **200.6 GB free** at 09:30 IST |
+
+So Quote 16 (size) and Quote 17 (IOPS + throughput) are both LIVE, and the
++$9.12 + $30.00 = **$39.12/mo** they authorize is now actually being billed. The
+$130 ceiling raised in the same change is what covers it.
+
+**⚠ The volume id recorded in the rule files was the RETIRED box's.**
+`vol-073ccaa417a0f344b` is gone with `i-0b956d0209231a48b`. Any volume operation
+must re-describe first; a fail-closed `confirm_volume_id` guard fed from a rule
+file would have targeted a volume that no longer exists.
+
+**The measurement that matters more than the grow — the burn rate.**
+`tv_spill_dir_free_bytes` across the first full-universe Full-mode session:
+
+| 2026-08-21 IST | Free |
+|---|---|
+| 09:30 | 200.6 GB |
+| 11:30 | 179.3 GB |
+| 13:30 | 158.0 GB |
+| 15:30 | 138.1 GB |
+
+**~71 GB consumed in one session** (209.5 GB free at 00:00Z → 138.1 GB at 10:00Z),
+against **~10–20 GB/day** for the whole week of 14–18 August. That is a **4–7×
+step change**, and it is not a surprise: Full mode went live 2026-08-19 (162 B
+packets replacing 50 B — the 3.24× this file predicted) and the ~24,600-contract
+universe landed on top of it. The modelled range in the Quote 16 note was
+21 GB/day at one depth snapshot per second and 104 GB/day at five; the measured
+71 GB/day sits inside it, nearer the top.
+
+**Runway, stated plainly.** Usable filesystem ≈ 210 GB. The `tv-prod-disk-used-high`
+alarm fires at 75% ≈ 157.5 GB used, i.e. ~52.5 GB free. From Friday's close at
+138.1 GB free, one more session of this size lands near that line. What is
+supposed to prevent it is the STORAGE-GAP-05 pressure archival added 2026-08-19,
+which frees partitions past its 2-day floor — at 71 GB/day that implies a steady
+state near 142 GB resident, about 68% of usable, roughly **15 GB under the alarm**.
+Thin, by design, and **UNMEASURED across a weekend**: free space did NOT visibly
+reclaim between 20 and 21 August (209.5 → 209.5 GB), so whether the archival keeps
+pace at this new rate is a Monday measurement, not a claim.
+
+**NOT claimed:** that a further grow is needed, or authorized. Quote 17's own
+warning binds here — the $130 ceiling clears the $112.72 bill by **$4.28**, so the
+next cost increase of any size must raise the ceiling in the same change. If
+Monday shows archival failing to keep pace, the choice between growing again
+(one-way, and over the ceiling) and cutting ingest scope is the operator's.
+
 ## COST NOTE 2026-08-19 — STORAGE-GAP-05 pressure-archival alarm (+~$0.10/mo)
 
 Authority: feed-hardening plan Item 5 design addendum. The Critical-severity

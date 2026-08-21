@@ -677,9 +677,20 @@ impl BrutexCrossverifyWriter {
         let Some(sender) = self.sender.as_mut() else {
             anyhow::bail!("brutex_crossverify: no ILP sender (QuestDB unreachable)");
         };
-        sender
-            .flush(&mut self.buffer)
-            .context("brutex_crossverify ILP flush")?;
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            // RETAIN on failure (the questdb-rs contract), but BOUNDED: a
+            // sustained outage or a server-side reject would otherwise grow
+            // this buffer without limit and, for a reject, keep it poisoned
+            // for the process lifetime. See ilp_overflow.
+            let dropped = crate::ilp_overflow::discard_if_overflowing(
+                &mut self.buffer,
+                &mut self.pending,
+                "brutex_crossverify",
+            );
+            return Err(anyhow::Error::new(err).context(
+                crate::ilp_overflow::flush_failure_context("brutex_crossverify ILP flush", dropped),
+            ));
+        }
         self.pending = 0;
         Ok(())
     }

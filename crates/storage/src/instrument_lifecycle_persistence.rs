@@ -452,6 +452,8 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
                 table = QUESTDB_TABLE_INSTRUMENT_LIFECYCLE,
                 ?err,
                 "DDL request failed"
@@ -506,6 +508,8 @@ async fn run_lifecycle_feed_self_heal(
             }
             Err(err) => {
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                        .code_str(),
                     table,
                     ?err,
                     ddl = ddl.as_str(),
@@ -889,6 +893,8 @@ pub async fn ensure_instrument_lifecycle_audit_table(questdb_config: &QuestDbCon
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
                 table = QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT,
                 ?err,
                 "DDL request failed"

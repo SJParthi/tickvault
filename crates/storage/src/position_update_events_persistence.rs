@@ -467,10 +467,17 @@ impl PositionUpdateEventsWriter {
 
     /// Drop every buffered-but-unflushed row (poisoned-buffer defense).
     /// Returns the discarded row count; counted so a discard is never silent.
+    ///
+    /// The `kind` label is what separates this from the ORDER writer, which
+    /// increments the same counter name. Without it a lost POSITION capture is
+    /// indistinguishable from a lost order capture in CloudWatch — and the two
+    /// have different causes and different triage. The label folds to `{host}`
+    /// in the EMF processor, so the alarm still fires on either; the label
+    /// survives in the log line, which is where triage reads it.
     pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
         if dropped > 0 {
-            metrics::counter!("tv_order_update_events_rows_discarded_total")
+            metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "position")
                 .increment(dropped as u64);
         }
         self.buffer.clear();
