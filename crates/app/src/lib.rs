@@ -198,8 +198,6 @@ pub mod disk_pressure_boot;
 /// forensic rows (`feed='groww'`). Gated on the non-default `groww_orders`
 /// cargo feature (§39.2 Gate 2) AND the runtime
 /// `[groww_orders] order_push_enabled` flag (Gate 1, default OFF).
-#[cfg(feature = "groww_orders")]
-pub mod groww_order_observability;
 pub mod groww_universe;
 pub mod groww_watch_paths;
 /// RAM residency stores boot (operator directive 2026-07-16, PR-2):

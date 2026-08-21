@@ -77,7 +77,6 @@ default = []
 # order/position PUSH channel + the common-side gate/config surface so the
 # Stage D app consumer (`groww_order_observability`) can compile. NEVER in
 # `default` — a default build carries no Groww order code.
-groww_orders = ["tickvault-trading/groww_orders", "tickvault-common/groww_orders"]
 
 [[bench]]
 name = "order_gate"
