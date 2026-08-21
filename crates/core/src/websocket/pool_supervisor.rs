@@ -1689,11 +1689,41 @@ impl PoolSupervisor {
     }
 
     /// Releases one connection of `endpoint` back to the budget and forgets its
-    /// supervisor. Used when a parked connection is retired.
+    /// supervisor.
+    ///
+    /// # Deliberately UNCALLED in production, and that is not an oversight
+    ///
+    /// A park is PERMANENT by design — the park arm of `run_supervised_socket`
+    /// says so in as many words, and nothing in the tree re-dials a parked
+    /// socket. So retiring one would hand a budget slot back that no caller
+    /// ever asks for. A 2026-08-21 sweep reported the missing call as "a
+    /// permanent silent loss of one of the 16 authorized sockets per park";
+    /// that reading is wrong in the direction that matters. The socket is lost
+    /// to the PARK. Releasing its budget entry would not bring it back,
+    /// because nothing dials a replacement.
+    ///
+    /// It is kept rather than deleted because it is the primitive a future
+    /// re-dial-after-park feature needs, and it is now safe to call.
+    ///
+    /// # Idempotent since 2026-08-21
+    ///
+    /// It previously released the budget UNCONDITIONALLY, even when `retain`
+    /// removed nothing — an unknown slot, or the same slot retired twice. Since
+    /// `PoolBudget::release` saturates at zero it cannot underflow and report
+    /// the problem; it would simply undercount, and the pool would then admit
+    /// a connection PAST the 5-per-endpoint cap. That is the one invariant the
+    /// 16-connection lock rests on, so a dormant function that breaks it when
+    /// called is worse than one that does nothing: it makes wiring it later a
+    /// trap.
+    ///
+    /// Now the budget moves only if a connection was actually removed.
     pub fn retire(&mut self, slot: ConnectionSlot) {
+        let before = self.connections.len();
         self.connections
             .retain(|c| c.slot().global_index != slot.global_index);
-        self.budget.release(slot.endpoint);
+        if self.connections.len() < before {
+            self.budget.release(slot.endpoint);
+        }
     }
 }
 
@@ -3918,6 +3948,71 @@ mod tests {
         );
     }
 
+    /// Retiring the same slot twice must NOT hand back two budget entries.
+    ///
+    /// `retire` used to call `budget.release` unconditionally, even when
+    /// `retain` removed nothing. `PoolBudget::release` saturates at zero, so it
+    /// cannot underflow and report the problem — it simply undercounts, and the
+    /// pool then admits a connection PAST the 5-per-endpoint cap. That cap is
+    /// the entire basis of the 16-connection lock.
+    ///
+    /// It was unreachable only because `retire` has no production caller. A
+    /// dormant function that breaks the system's core invariant when called is
+    /// worse than one that does nothing: it makes wiring it later a trap.
+    #[test]
+    fn retiring_the_same_slot_twice_does_not_over_admit_past_the_cap() {
+        let now = t0();
+        let mut pool = PoolSupervisor::new();
+        let mut slots = Vec::new();
+        for _ in 0..5 {
+            if let Ok(s) = pool.admit(DhanEndpointType::MainFeed, now) {
+                slots.push(s);
+            }
+        }
+        assert_eq!(slots.len(), 5, "the cap is 5 main-feed connections");
+        assert!(pool.admit(DhanEndpointType::MainFeed, now).is_err());
+
+        let first = *slots.first().expect("five slots were admitted");
+        pool.retire(first);
+        // The SAME slot again — already gone.
+        pool.retire(first);
+        assert_eq!(pool.len(), 4, "the second retire removes nothing");
+
+        assert!(
+            pool.admit(DhanEndpointType::MainFeed, now).is_ok(),
+            "the one genuinely retired slot comes back"
+        );
+        assert!(
+            pool.admit(DhanEndpointType::MainFeed, now).is_err(),
+            "and ONLY one — a second admit here means the double-retire handed \
+             back a slot that was never occupied, and the 16-connection lock is \
+             arithmetic, not a hope"
+        );
+    }
+
+    /// The same guarantee for a slot the pool never admitted at all.
+    #[test]
+    fn retiring_an_unknown_slot_does_not_move_the_budget() {
+        let now = t0();
+        let mut pool = PoolSupervisor::new();
+        for _ in 0..5 {
+            let _ = pool.admit(DhanEndpointType::MainFeed, now);
+        }
+        assert!(pool.admit(DhanEndpointType::MainFeed, now).is_err());
+
+        // A slot with a global index the pool has never issued.
+        let bogus = ConnectionSlot {
+            endpoint: DhanEndpointType::MainFeed,
+            global_index: u8::MAX,
+            pool_index: u8::MAX,
+        };
+        pool.retire(bogus);
+        assert_eq!(pool.len(), 5, "nothing was removed");
+        assert!(
+            pool.admit(DhanEndpointType::MainFeed, now).is_err(),
+            "and nothing was released — an unknown slot must never create capacity"
+        );
+    }
     #[test]
     fn test_pool_supervisor_connection_mut_addresses_by_global_index() {
         let now = t0();

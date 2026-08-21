@@ -1621,6 +1621,45 @@ mod tests {
             assert!(!s.folded(), "{s:?} must not report as folded");
         }
     }
+    /// MEASUREMENT (not a CI gate — `#[ignore]`d, run on demand):
+    /// what does the 5-second `catch_up_seal_all` sweep actually cost at the
+    /// authorized 25,000-instrument ceiling?
+    ///
+    /// CLAUDE.md's O(1) table records this path as O(slots x TF_COUNT) with no
+    /// early exit, running on the frame drain's OWN task, and states plainly
+    /// that it is "UNMEASURED at the 25,000-instrument target". This turns that
+    /// into a number. Ignored rather than asserted because a wall-clock bound
+    /// on a shared CI runner is a flake, and a flaky gate is worse than none.
+    ///
+    ///     cargo test -p tickvault-trading --release \
+    ///       catch_up_seal_all_sweep_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement harness, not a gate — see doc comment"]
+    fn catch_up_seal_all_sweep_cost_at_the_authorized_ceiling() {
+        let cap = crate::candles::AGGREGATOR_MAX_SLOTS;
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, cap);
+        // Populate every slot so the sweep visits the real worst case.
+        for sid in 0..cap as u64 {
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(sid, SEG_EQ, OPEN, 100.0, 1),
+                None,
+                |_, _, _, _, _| {},
+            );
+        }
+        let slots = agg.len();
+        // Cutoff far in the past: every cell is visited, none seals. This is
+        // the pure traversal cost — the shape that runs on 99% of sweeps.
+        let t0 = std::time::Instant::now();
+        let emitted = agg.catch_up_seal_all(OPEN, |_, _, _, _, _| {});
+        let elapsed = t0.elapsed();
+        println!(
+            "catch_up_seal_all: {slots} slots x {TF_COUNT} TF = {} cells, \
+             {emitted} sealed, {elapsed:?} ({:.1} ns/cell)",
+            slots * TF_COUNT,
+            elapsed.as_nanos() as f64 / (slots * TF_COUNT).max(1) as f64
+        );
+    }
 }
 
 #[cfg(test)]

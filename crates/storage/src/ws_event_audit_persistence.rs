@@ -44,6 +44,7 @@ use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::redact_url_params;
 pub use tickvault_common::ws_event_types::{WS_EVENT_NO_DHAN_CODE, WsEventAuditRow};
 #[cfg(test)]
@@ -99,6 +100,7 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(c) => c,
         Err(err) => {
             error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
                 ?err,
                 "ws_event_audit: HTTP client build failed — table not ensured"
             );
@@ -116,10 +118,15 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
+            error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: CREATE TABLE returned non-2xx");
         }
-        Err(err) => error!(?err, "ws_event_audit: CREATE TABLE request failed"),
+        Err(err) => error!(
+            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+            ?err,
+            "ws_event_audit: CREATE TABLE request failed"
+        ),
     }
 
     // Per-feed identity (operator 2026-06-23): `feed` is now a DEDUP-key column —
@@ -139,10 +146,15 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
+            error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: ALTER ADD COLUMN feed returned non-2xx");
         }
-        Err(err) => error!(?err, "ws_event_audit: ALTER ADD COLUMN feed request failed"),
+        Err(err) => error!(
+            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+            ?err,
+            "ws_event_audit: ALTER ADD COLUMN feed request failed"
+        ),
     }
 
     // Re-apply the DEDUP key (now including `feed`) on tables created before the
@@ -162,10 +174,12 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
+            error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: DEDUP ENABLE UPSERT KEYS returned non-2xx");
         }
         Err(err) => error!(
+            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
             ?err,
             "ws_event_audit: DEDUP ENABLE UPSERT KEYS request failed"
         ),
@@ -314,9 +328,20 @@ impl WsEventAuditWriter {
         let Some(sender) = self.sender.as_mut() else {
             anyhow::bail!("ws_event_audit: no ILP sender (QuestDB unreachable)");
         };
-        sender
-            .flush(&mut self.buffer)
-            .context("ws_event_audit ILP flush")?;
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            // RETAIN on failure (the questdb-rs contract), but BOUNDED: a
+            // sustained outage or a server-side reject would otherwise grow
+            // this buffer without limit and, for a reject, keep it poisoned
+            // for the process lifetime. See ilp_overflow.
+            let dropped = crate::ilp_overflow::discard_if_overflowing(
+                &mut self.buffer,
+                &mut self.pending,
+                "ws_event_audit",
+            );
+            return Err(anyhow::Error::new(err).context(
+                crate::ilp_overflow::flush_failure_context("ws_event_audit ILP flush", dropped),
+            ));
+        }
         self.pending = 0;
         Ok(())
     }

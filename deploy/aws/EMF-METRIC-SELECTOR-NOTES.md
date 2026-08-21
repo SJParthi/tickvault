@@ -32,12 +32,19 @@ runtime.
   `tv_*_close_to_data_ms`, …) — they answer "how much", not "what broke"; the
   `/metrics` endpoint + `errors.jsonl` keep them for post-hoc triage.
 - **Names whose ONLY emit sites are the stood-down per-minute boot legs**
-  (`[spot_1m_rest]` / `[option_chain_1m]` / `[groww_*_1m]` `enabled=false` since
-  2026-07-17 — the cadence executors own the pulls), e.g.
-  `tv_spot1m_sid_not_served_total`, `tv_*_sweep_still_missing_total`.
-- **Names behind the non-default `groww_orders` cargo feature** (Gate 2 of the
-  §39.2 lattice — not compiled into the deploy build), e.g.
-  `tv_groww_push_supervisor_respawn_total`.
+  (`[spot_1m_rest]` / `[option_chain_1m]` `enabled=false` since 2026-07-17 —
+  the cadence executors own the pulls), e.g. `tv_spot1m_sid_not_served_total`,
+  `tv_*_sweep_still_missing_total`.
+- ~~**Names behind the non-default `groww_orders` cargo feature**~~ **MOOT
+  2026-08-21** — that feature and the order-side tree behind it were removed
+  with the Groww feed, so the names have no emit sites at all rather than
+  merely uncompiled ones. The two Groww REST persist-error counters left the
+  selector in the same change, freeing bytes.
+- **`tv_tick_spill_replayed_bytes_total`** — the spill drain's SUCCESS counter,
+  added 2026-08-21 and excluded the same day. It was to ship unalarmed so a
+  chart of recoveries could sit beside the two spill FAILURE alarms; with it in
+  the list the rendered user-data came out past the 16,384-byte cap. Given a
+  real byte budget the alarmed names win. Still on `/metrics`.
 - ~~**`tv_ws_frame_spill_write_errors_total`** — no WS frame producer exists (both
   live feeds retired 2026-07-13/15)~~ **STALE, CORRECTED 2026-08-12 — now
   SELECTED.** The Dhan live WS lane was revived 2026-08-09/11 and IS a WS frame
@@ -72,3 +79,61 @@ The selector literal MUST stay byte-identical between
 `deploy/aws/terraform/user-data.sh.tftpl` and `deploy/aws/cloudwatch-agent.json`
 — pinned by `crates/storage/tests/cw_agent_selector_lockstep_guard.rs`. The
 exact count is pinned by `crates/common/tests/cloudwatch_app_alarms_wiring.rs`.
+
+---
+
+## 2026-08-21 — the user-data byte budget is now the binding constraint on observability
+
+EC2 user-data has a hard **16,384-byte** limit and terraform refuses the PLAN
+above it, failing every unrelated resource in the same run. The selector list
+is duplicated inline in `user-data.sh.tftpl`, so every metric name is spent
+twice: once in `deploy/aws/cloudwatch-agent.json`, once in the template that
+must fit the limit.
+
+The margin is now small enough that **adding a metric means removing one.**
+
+That happened on 2026-08-21, and it is recorded because the trade was real:
+
+| Metric | Outcome | Why |
+|---|---|---|
+| `tv_depth_rows_dropped_total` | **shipped** | depth row LOSS; emitted for months, shipped by nothing, while the rows-WRITTEN counter beside it was shipped — depth read healthy off-box while its losses were unobservable |
+| `tv_depth_persist_errors_total` | **shipped** | same blindness; its `HOT-PATH-02` coded line has no errcode alarm either, so there was no second path |
+| `tv_ilp_rows_discarded_total` | **shipped** | the new ILP retention bound; a bound that discards invisibly is worse than the leak it replaced |
+| `tv_order_fill_lag_seconds` | **removed** | the only entry in the whole allowlist with ZERO emit sites in `crates/*/src` — a name nothing could ever publish |
+| `tv_risk_mark_rejected_total` | **NOT shipped** | ~28 bytes short |
+| `tv_dhan_feed_silence_detector_refused` | **NOT shipped** | ~37 bytes short |
+
+The last two are emitted by production code and are visible on the box's own
+`:9091/metrics` and in coded log lines. They do **not** reach CloudWatch, so
+no alarm can read them and no dashboard can chart them. That is a real gap and
+it is stated here rather than left to be discovered from a quiet panel.
+
+This is a scaling wall, not a tight fit, and it fails in the worst direction:
+the thing it silently rations is the ability to SEE failures.
+
+### The fix, and why it was deliberately not taken in that change
+
+The EMF/prometheus half of the agent config is *already* a repo file
+(`deploy/aws/cloudwatch-agent.json`), and the lockstep guard already pins the
+two selector literals byte-identical. The structural move is to stop inlining
+it: keep only the host-metrics and log-collection base in user-data, and after
+the Step 5 repo clone apply the prometheus half with the agent's documented
+multi-config mechanism —
+
+```
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a append-config -m ec2 -s -c file:/opt/tickvault/repo/deploy/aws/cloudwatch-agent.json
+```
+
+— after substituting the environment into its log-group names (the repo file
+hardcodes `prod`; the template uses `$${ENVIRONMENT}`). Then the selector can
+grow to any size, and a failed clone degrades to host metrics and logs instead
+of taking the whole terraform plan down.
+
+It was not done in the same change because it moves the boot path and cannot
+be tested anywhere but a real EC2 first boot. If `append-config` were wrong,
+**every app metric would vanish silently** — precisely the failure the change
+existed to prevent. It wants its own change, with a boot verified on the box.
+
+Until then, every new metric costs an existing one. Make that trade
+explicitly; do not discover it at 16,385 bytes.

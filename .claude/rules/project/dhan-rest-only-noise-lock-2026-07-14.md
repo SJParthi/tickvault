@@ -419,6 +419,84 @@ every counter we own. The 15:31 REST cross-verification remains the only ground 
 for that class, and a non-zero `compared` from it remains the only evidence this
 repository can offer that the feed works at all.
 
+#### §2.3b-i — 2026-08-21 (SAME DAY): the tick-flow alarm reads a GAUGE, because the counter's meaning was never verified
+
+**No new authorization is claimed or needed.** §2.3b above authorizes exactly one
+alarm — "is the feed producing anything" — and this note records that its SIGNAL was
+corrected within hours of landing, before the terraform ever applied. The alarm name,
+the market-hours gate membership, and the count of alarms in family (5) are all
+unchanged. This is an implementation correction, recorded here rather than made
+quietly, because the reason is worth more than the change.
+
+**What was wrong.** The alarm read the counter `tv_dhan_feed_ingest_ticks_total` with
+`Sum < 1` over two 300-second windows. Its own header conceded the residual that
+undoes it: this repository has never verified, from the sandbox, whether the
+CloudWatch agent's prometheus pipeline publishes each scrape's DELTA or the running
+CUMULATIVE total. `auth-failed-alarm.tf` records the same uncertainty and lands on the
+over-paging side of it; this alarm landed on the other side.
+
+The two readings are not equally survivable here:
+
+| | delta reading | cumulative reading |
+|---|---|---|
+| `Sum` over 300 s | ticks in the window | ≈ 5 × the running session total |
+| `Sum < 1` | true only when nothing arrived — **correct** | false forever after the first tick of the morning — **blind** |
+| Operator sees | a page when the feed dies | green, all day, whatever the feed does |
+
+So the one alarm written to prove ticks are flowing was, on a coin flip, the alarm
+most likely to prove nothing. That is the false-OK class this file exists to stop, and
+it was sitting inside the change that closed a false-OK.
+
+**The fix is not a better guess.** `tv_dhan_feed_last_tick_age_secs` is a GAUGE, and a
+gauge is published verbatim by both pipelines — there is no delta to compute for a
+value that is free to go down. The alarm now reads `Maximum >= 300` over two windows
+and means the same thing under either reading, so the unverifiable pipeline detail
+stops being load-bearing.
+
+**Three things it improves beyond removing the ambiguity**, each of which was a real
+weakness of the counter version:
+
+1. **It measures PERSISTENCE, not decode.** The gauge is stamped in `flush_and_record`
+   only when a flush actually wrote rows, so a QuestDB outage decays it while the
+   socket is busy — correct, because during one the feed is not delivering. The
+   counter incremented on a decoded tick, which can be true while nothing reaches
+   disk.
+2. **The series is DENSE from the drain's first second**, published on the 30-second
+   silence timer regardless of whether a frame ever arrives. The counter's handles are
+   built lazily inside the frame arm, so a lane that received nothing never registered
+   the series at all — the exact case the alarm was for, and the reason it needed
+   `breaching` to catch it.
+3. **Before the first tick it reports the drain's own uptime**, not zero. A lane that
+   dialled, connected, subscribed and received nothing therefore pages instead of
+   reporting perfect health — the 2026-08-12 shape.
+
+**Cost delta, stated rather than absorbed.** §2.3b costed this as "+1 alarm ≈ $0.10/mo
+and no new EMF name". It is now +1 alarm and +1 EMF name ≈ **$0.40/mo**, because the
+gauge needs a selector entry in both copies. Against the $130 kill-ceiling whose 90%
+action line is $117, and whose current margin is $4.28, that is real money and it is
+named here rather than discovered on an invoice.
+
+**Ratchet:** `crates/app/tests/no_ticks_alarm_gauge_guard.rs` (7 tests) pins that the
+alarm reads the gauge and **not** the counter, that it uses `Maximum` with a
+`GreaterThanOrEqualToThreshold` comparison (an age gauge breaches when it GROWS — the
+counter-era `LessThanThreshold` would fire whenever the feed is healthy), that the
+alarm name survives so the gate still arms it, that the metric is in both EMF selector
+copies, and that production — not only a test — publishes it.
+
+**⚠ Still not claimed.** A correct alarm does not make ticks flow, and this one still
+cannot see loss that happens upstream at Dhan's side. The 15:31 cross-verification's
+`compared` count remains the only evidence this repository can offer that the feed
+works at all. What changed is narrower and worth stating exactly: the alarm that
+reports a dead lane can no longer be silently disabled by a pipeline detail nobody
+here has been able to check.
+
+**The residual this does NOT fix, named so it is not mistaken for fixed:** every OTHER
+alarm in this file's family (5) still reads a `_total` counter and still inherits the
+same unverified assumption. Their failure direction is milder — a loss counter under
+the cumulative reading pages correctly on the FIRST loss and then latches, so a second
+episode in the same session is silent — but milder is not fixed, and it is a separate
+piece of work rather than something this note closed.
+
 ### §2.3c — 2026-08-21: the SPILL tier joins family (5); and one gap this file was told about did not exist
 
 **The verbatim operator authorization (2026-08-21, typed directly in-session — preserve

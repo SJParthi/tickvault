@@ -585,7 +585,7 @@ impl OrderUpdateEventsWriter {
     pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
         if dropped > 0 {
-            metrics::counter!("tv_order_update_events_rows_discarded_total")
+            metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "order")
                 .increment(dropped as u64);
         }
         self.buffer.clear();

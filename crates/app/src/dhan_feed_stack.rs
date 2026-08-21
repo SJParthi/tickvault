@@ -125,7 +125,7 @@ use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
 use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
 use tickvault_trading::candles::{BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Environment opt-in that must be `1` for the lane to run, on top of
 /// `[feeds] dhan_enabled`. Absent means OFF, which is the whole point.
@@ -975,10 +975,14 @@ impl LiveIngest {
                     %err,
                     rows = covered,
                     "live tick flush to QuestDB FAILED — these rows are NOT in the database. \
-                     They are NOT lost: the writer rescues the failed batch to a tick spill \
-                     file (see the WS-GAP-03 line beside this one for the exact path) and it \
-                     re-ingests with a single curl, safely repeatable. The raw frames are also \
-                     in the write-ahead log. Do not wait for a restart — replay the spill file."
+                     They are NOT lost, and there are TWO recoveries. Immediately: the writer \
+                     rescues the failed batch to a tick spill file (the WS-GAP-03 line beside \
+                     this one names the exact path) and it re-ingests with a single curl, \
+                     safely repeatable. Failing that, the raw frames are in the write-ahead \
+                     log and the next boot re-folds them idempotently, \
+                     so a restart recovers this window. \
+                     Fix the database first, then replay the spill file."
+
                 );
                 0
             }
@@ -1438,14 +1442,53 @@ impl LiveIngest {
     /// over stack locals, not a `Vec`). COLD — every
     /// [`SILENCE_SCAN_INTERVAL`], never per tick.
     pub fn scan_silence(&self, now_millis: u64) -> (u64, u64) {
+        let mut discard = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+        let (silent, never, _) = self.scan_silence_named(now_millis, &mut discard);
+        (silent, never)
+    }
+
+    /// [`Self::scan_silence`], but it also hands back the IDENTITIES of the
+    /// quietest instruments.
+    ///
+    /// # Why a second entry point exists
+    ///
+    /// Until 2026-08-21 the silence page reported COUNTS only — "47 subscribed
+    /// instruments are quiet" — and no `security_id` was written to any log,
+    /// metric or table. The single worst offender was captured and then logged
+    /// at `debug!`, which does not reach `errors.jsonl` and therefore never
+    /// reaches CloudWatch.
+    ///
+    /// So the question an operator actually asks the morning after — *which*
+    /// instruments went silent — was unanswerable by construction. Not hard to
+    /// answer, not slow to answer: the information was computed, used to
+    /// increment a counter, and discarded. And it is the one failure with no
+    /// other evidence anywhere in the system, because a stream that never
+    /// arrives leaves nothing to count and nothing to fail to parse.
+    ///
+    /// # Why a fixed buffer rather than a `Vec`
+    ///
+    /// The caller owns the storage, so this stays allocation-free on a path
+    /// that already sweeps every tracked instrument. `WORST_SILENT_NAMED`
+    /// bounds what a single episode can write to the log: at 25,000
+    /// instruments an unbounded list would be a 25,000-line burst into the
+    /// sink, which buries the very signal it is reporting.
+    ///
+    /// Returns `(silent, never_ticked, named)` where `named` is how many
+    /// entries of `worst` were filled — never more than its length.
+    ///
+    /// # Complexity
+    /// O(n) in tracked instruments — unchanged, and inherent: "which are
+    /// silent?" is a question about all of them at once. The ranking adds a
+    /// bounded insertion into a `WORST_SILENT_NAMED`-element array per
+    /// alarm-worthy report, so it is O(n × K) with K = 8 and no allocation.
+    pub fn scan_silence_named(
+        &self,
+        now_millis: u64,
+        worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
+    ) -> (u64, u64, usize) {
         let mut silent = 0u64;
         let mut never = 0u64;
-        // Worst offender, kept for the log line so the operator gets a name
-        // and not just a count. One `Copy` key, no allocation.
-        let mut worst: Option<(
-            u64,
-            tickvault_core::pipeline::tick_gap_detector::SilenceReport,
-        )> = None;
+        let mut named = 0usize;
         self.detector.scan_silence(now_millis, |report| {
             if !report.counts_toward_alarm() {
                 return;
@@ -1469,24 +1512,21 @@ impl LiveIngest {
             if report.verdict == SilenceVerdict::NeverTicked {
                 never = never.saturating_add(1);
             }
-            if worst.is_none_or(|(w, _)| report.silent_millis > w) {
-                worst = Some((report.silent_millis, report));
-            }
+            named = rank_silent(
+                worst,
+                named,
+                SilentInstrument {
+                    security_id: report.key.0,
+                    segment: report.key.1,
+                    silent_millis: report.silent_millis,
+                    expected_millis: report.expected_millis,
+                    never_ticked: report.verdict == SilenceVerdict::NeverTicked,
+                },
+            );
         });
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
-        if let Some((_, w)) = worst {
-            debug!(
-                security_id = w.key.0,
-                segment = w.key.1.as_str(),
-                silent_millis = w.silent_millis,
-                expected_millis = w.expected_millis,
-                baseline_millis = w.baseline_millis,
-                samples = w.samples,
-                "quietest tracked instrument this scan"
-            );
-        }
-        (silent, never)
+        (silent, never, named)
     }
 
     /// Seals every bucket the watermark has moved past, mid-session.
@@ -1625,6 +1665,19 @@ impl LiveIngest {
     #[must_use]
     pub fn tracked_instruments(&self) -> usize {
         self.detector.tracked_instruments()
+    }
+    /// Observations the silence detector REFUSED because its slot table was
+    /// full — the detector's own blindness.
+    ///
+    /// Non-zero means [`Self::scan_silence`] describes a SUBSET of the
+    /// universe while reading exactly as though it describes all of it. The
+    /// detector's own doc has always said callers must surface this rather
+    /// than assume silence means health; this is the accessor that lets them.
+    ///
+    /// O(1) — one field read.
+    #[must_use]
+    pub fn detector_refused(&self) -> u64 {
+        self.detector.refused_count()
     }
 
     /// Sealed candles handed to the process-wide seal writer.
@@ -2146,6 +2199,148 @@ pub const INSTRUMENTS_SILENT_GAUGE: &str = "tv_dhan_feed_instruments_silent";
 /// error to log. Absence against a seeded key is the only evidence.
 pub const INSTRUMENTS_NEVER_TICKED_GAUGE: &str = "tv_dhan_feed_instruments_never_ticked";
 
+/// How many silent instruments a single episode may NAME in the log.
+///
+/// The page fires once per episode behind a 30-minute cooldown, so this bounds
+/// what one episode can write. Unbounded naming at the 25,000-instrument
+/// target would be a 25,000-line burst into the sink, which buries the signal
+/// it is reporting — and the operator does not need all of them to act: a
+/// subscribe that did not take fails in groups, so the quietest handful
+/// identifies the group.
+pub const WORST_SILENT_NAMED: usize = 8;
+
+/// One named silent instrument, for the log line.
+///
+/// `Copy` and scalar-only so ranking stays allocation-free on a path that
+/// already sweeps every tracked instrument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SilentInstrument {
+    pub security_id: u64,
+    pub segment: ExchangeSegment,
+    /// How long it has been quiet.
+    pub silent_millis: u64,
+    /// The cadence it had EARNED before going quiet — the number that makes
+    /// the silence meaningful. A contract that ticks once an hour being quiet
+    /// for five minutes is not news; an index quiet for five minutes is.
+    pub expected_millis: u64,
+    /// True when it has produced nothing at all since being subscribed, which
+    /// usually means the subscribe did not take.
+    pub never_ticked: bool,
+}
+
+impl SilentInstrument {
+    /// Filler for the caller's fixed buffer. `security_id` 0 is not a real
+    /// instrument, so an unfilled slot is recognisable if one ever escapes
+    /// the `named` bound.
+    pub const EMPTY: Self = Self {
+        security_id: 0,
+        segment: ExchangeSegment::IdxI,
+        silent_millis: 0,
+        expected_millis: 0,
+        never_ticked: false,
+    };
+}
+
+/// Insert `candidate` into a descending-by-silence top-K buffer.
+///
+/// Returns the new filled length. Pure, `O(K)`, no allocation — extracted so
+/// the ordering is testable on its own rather than only reachable through a
+/// full detector sweep.
+///
+/// Ties keep the incumbent: a scan that reports many instruments at exactly
+/// the same silence (the shape a failed subscribe produces, since they all
+/// went quiet together) then names them in detector order rather than
+/// reshuffling on every equal comparison.
+#[must_use]
+pub fn rank_silent(
+    worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
+    filled: usize,
+    candidate: SilentInstrument,
+) -> usize {
+    let mut pos = filled.min(WORST_SILENT_NAMED);
+    while pos > 0 && worst[pos - 1].silent_millis < candidate.silent_millis {
+        pos -= 1;
+    }
+    if pos >= WORST_SILENT_NAMED {
+        return filled.min(WORST_SILENT_NAMED);
+    }
+    let end = filled.min(WORST_SILENT_NAMED - 1);
+    let mut i = end;
+    while i > pos {
+        worst[i] = worst[i - 1];
+        i -= 1;
+    }
+    worst[pos] = candidate;
+    (filled + 1).min(WORST_SILENT_NAMED)
+}
+
+/// Gauge: observations the silence detector REFUSED because its slot table
+/// was full. Non-zero means the two gauges above describe only part of the
+/// universe while reading as though they describe all of it — the detector is
+/// blind, and a blind detector reporting zero silent instruments looks exactly
+/// like a healthy feed.
+pub const SILENCE_DETECTOR_REFUSED_GAUGE: &str = "tv_dhan_feed_silence_detector_refused";
+
+/// Gauge: seconds since the lane last persisted a tick, or — when no tick has
+/// arrived at all this session — seconds since the drain started.
+///
+/// # Why a gauge exists for something a counter already counts
+///
+/// `tv_dhan_feed_ingest_ticks_total` answers "is the feed producing anything",
+/// and the alarm that reads it is the one signal in this lane that separates
+/// "nothing broke" from "nothing ran". But it answers it through a COUNTER,
+/// and a counter's meaning in CloudWatch depends on a pipeline detail this
+/// repository has never been able to verify from the sandbox: whether the
+/// agent publishes each scrape's DELTA or the running CUMULATIVE total.
+///
+/// The two readings are not equally forgiving. Under deltas, `Sum < 1` over a
+/// window means no ticks folded in that window — correct. Under cumulative
+/// values, `Sum` is roughly five times the session total and `< 1` can never
+/// be true once a single tick has ever arrived, so the alarm reports health
+/// forever after the first tick of the morning — silently, which is the
+/// failure direction that matters. `auth-failed-alarm.tf` records the same
+/// uncertainty and lands on the opposite side of it (over-paging), and
+/// `live-lane-alarms.tf` names this exact residual in its own header.
+///
+/// A GAUGE has no such ambiguity: both pipelines publish it verbatim, because
+/// there is no delta to compute for a value that is free to go down. So the
+/// question "is the feed alive" is asked of a signal that means the same thing
+/// under either answer, instead of being decided by a coin flip nobody in this
+/// repo has been able to call.
+///
+/// # What it measures
+///
+/// Feed-level liveness from [`FeedHealthRegistry`], which is stamped in
+/// `flush_and_record` when a flush actually PERSISTS rows — not when a frame
+/// is decoded and not when a row is appended to the ILP buffer. So a QuestDB
+/// outage decays this value even while the socket is busy, which is correct:
+/// during one, the feed genuinely is not delivering.
+///
+/// [`FeedHealthRegistry`]: tickvault_common::feed_health::FeedHealthRegistry
+pub const LAST_TICK_AGE_GAUGE: &str = "tv_dhan_feed_last_tick_age_secs";
+
+/// The value [`LAST_TICK_AGE_GAUGE`] publishes.
+///
+/// `age` is `None` until the first flush persists a row. Publishing 0 for that
+/// case would read as perfect health during the exact outage the gauge exists
+/// to catch — a lane that dials, connects, subscribes and never receives
+/// anything is the 2026-08-12 shape, and it must page rather than reassure.
+/// Publishing a magic sentinel instead would page correctly but tell a
+/// dashboard reader nothing, so the never-ticked value is the drain's own
+/// uptime: it grows for exactly as long as the silence has lasted, which is
+/// the same thing the ticked branch reports, measured from the only other
+/// moment that means anything here.
+///
+/// O(1), no allocation, and pure so the substitution above is testable rather
+/// than asserted.
+#[must_use]
+pub fn last_tick_age_gauge_value(age: Option<u64>, drain_uptime_secs: u64) -> f64 {
+    match age {
+        Some(secs) => secs as f64,
+        None => drain_uptime_secs as f64,
+    }
+}
+
 /// How often the lane seals buckets the watermark has already moved past.
 ///
 /// 5s is chosen against the SHORTEST timeframe the aggregator carries (1s):
@@ -2378,6 +2573,11 @@ async fn run_frame_drain(
     // Whether this drain has ever seen a frame. Owns the up-gauge's rising
     // edge — see the first-frame arm below and the spawn site's correction.
     let mut lane_up = false;
+    // Anchor for the never-ticked branch of `LAST_TICK_AGE_GAUGE`. Taken here
+    // rather than at the stack's boot so it measures the drain's OWN silence:
+    // the drain is the thing that would be reporting ticks, and dialing time
+    // before it exists is not silence anyone can act on.
+    let drain_started = std::time::Instant::now();
     let mut seen: u64 = 0;
     let mut folded: u64 = 0;
     let mut depth_unconsumed: u64 = 0;
@@ -2399,6 +2599,12 @@ async fn run_frame_drain(
     // once, the falling edge logs recovery at info and re-arms.
     let mut silent_scans: u32 = 0;
     let mut silence_reported = false;
+    // Latch for the detector-blindness report below. Once the slot table is
+    // full it stays full, so this fires once per session rather than every 30s.
+    let mut detector_blind_reported = false;
+    // Caller-owned storage for the named silent instruments, so the 30s scan
+    // stays allocation-free. Reused every scan; `named` bounds what is read.
+    let mut worst_silent = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
     /// Shortest gap between two RISK-GAP-03 pages, however many separate
     /// silence episodes occur inside it. See `last_silence_page` below.
     const SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800;
@@ -2715,7 +2921,63 @@ async fn run_frame_drain(
                     last_refusals = now;
                 }
 
-                let (silent, never) = ingest.scan_silence(now_millis);
+                let (silent, never, named) =
+                    ingest.scan_silence_named(now_millis, &mut worst_silent);
+
+                // The detector's own blindness, reported ONCE per episode.
+                //
+                // The gauge inside `scan_silence` publishes this every scan,
+                // but the gauge does not reach CloudWatch: it did not fit the
+                // EC2 user-data byte budget (see EMF-METRIC-SELECTOR-NOTES.md).
+                // A counter that measures a blind spot and reaches nobody is
+                // worse than no counter — the loss is measured, the
+                // measurement is discarded, and the dashboard stays green — so
+                // the coded log line is what carries it to the operator.
+                //
+                // Edge-latched rather than per-scan: once the slot table is
+                // full it stays full, so an unlatched line would repeat every
+                // 30 seconds for the rest of the session and bury everything
+                // else in the sink.
+                let refused_now = ingest.detector_refused();
+                metrics::gauge!(SILENCE_DETECTOR_REFUSED_GAUGE).set(refused_now as f64);
+                if refused_now > 0 && !detector_blind_reported {
+                    detector_blind_reported = true;
+                    error!(
+                        code = ErrorCode::RiskGapTickGap.code_str(),
+                        refused = refused_now,
+                        tracked = ingest.tracked_instruments(),
+                        "the silence detector ran out of slots and is now BLIND to \
+                         part of the universe. Its silent and never-ticked counts \
+                         describe only the instruments it still tracks, while \
+                         reading exactly as though they describe all of them — so a \
+                         silently-unsubscribed instrument among the refused ones \
+                         cannot be reported by anything. Raise the detector's \
+                         capacity or reduce the subscribed set."
+                    );
+                }
+
+                // Feed-level liveness, published UNCONDITIONALLY and before
+                // the market-hours gate below — same reasoning as the two
+                // gauges `scan_silence` sets: a gauge that stops publishing
+                // makes "no data" and "nothing wrong" indistinguishable, and
+                // this is the one signal whose whole job is telling those two
+                // apart.
+                //
+                // Reading the registry rather than a local counter is
+                // deliberate: `flush_and_record` stamps it only when a flush
+                // PERSISTED rows, so this decays during a QuestDB outage even
+                // while the socket is busy. That is the honest answer to "is
+                // the feed delivering".
+                metrics::gauge!(LAST_TICK_AGE_GAUGE).set(last_tick_age_gauge_value(
+                    feed_health.last_tick_age_secs(
+                        Feed::Dhan,
+                        chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .unwrap_or(0)
+                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+                    ),
+                    drain_started.elapsed().as_secs(),
+                ));
                 // Gauges publish unconditionally — a dashboard reading zero
                 // outside market hours is correct, and gating the gauge would
                 // make "no data" and "nothing wrong" indistinguishable.
@@ -2819,6 +3081,43 @@ async fn run_frame_drain(
                          arrives leaves nothing to count or fail to parse. \
                          Legitimately-sparse instruments are excluded from this count."
                     );
+                    // NAME them. The line above says how many; these say WHICH.
+                    //
+                    // Until 2026-08-21 no `security_id` reached any log, metric
+                    // or table on this path, so "which instruments went silent
+                    // yesterday?" had no answer anywhere in the system — the
+                    // information was computed, counted, and thrown away. It is
+                    // also the one failure with no other evidence: a stream
+                    // that never arrives leaves nothing to count and nothing to
+                    // fail to parse, so absence against a seeded key is all
+                    // there is.
+                    //
+                    // One line per instrument rather than one line listing
+                    // them: each is greppable by `security_id`, each carries
+                    // its own cadence context, and no line needs a formatted
+                    // collection — so this stays allocation-free. Bounded by
+                    // `named` (<= WORST_SILENT_NAMED) and by the same
+                    // once-per-episode latch as the page above.
+                    for entry in worst_silent.iter().take(named) {
+                        error!(
+                            code = ErrorCode::RiskGapTickGap.code_str(),
+                            security_id = entry.security_id,
+                            segment = entry.segment.as_str(),
+                            silent_millis = entry.silent_millis,
+                            expected_millis = entry.expected_millis,
+                            never_ticked = entry.never_ticked,
+                            "silent instrument named: quiet for {}ms against an earned cadence \
+                             of {}ms{}",
+                            entry.silent_millis,
+                            entry.expected_millis,
+                            if entry.never_ticked {
+                                " — and it has produced NOTHING since being subscribed, which \
+                                 usually means the subscribe did not take"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
                 }
             }
         }
@@ -4356,6 +4655,7 @@ async fn attach_depth_when_available(
     // un-pre-registered reason would have its first — and only — increment
     // eaten, and the alarm would never see the defect it exists to catch.
     crate::dhan_contract_universe::pre_register_contract_failure_counters();
+    crate::dhan_depth_universe::pre_register_depth_failure_counters();
 
     let mut attempts: u32 = 0;
     // Whether the PREVIOUS attempt resolved something dialable.
@@ -4539,6 +4839,41 @@ async fn attach_depth_when_available(
         // close the loop on a universe missing ~17,000 authorized contracts,
         // which is exactly what happened live on 2026-08-20. Wait, unless
         // waiting has run out of time.
+        // ── Why the price-INDEPENDENT contracts wait here too ──────────────
+        //
+        // Index futures, stock futures and the two full index option chains
+        // (~1,380 contracts) need NO spot price — `select_contract_universe`
+        // says so at its own class-3 comment, and selects them with an empty
+        // price map. So holding them behind a STOCK-pricing quorum looks
+        // obviously wrong, and splitting the dial into "price-independent
+        // now, stock options later" looks like the fix.
+        //
+        // It is not. Analysed 2026-08-21 with the real arithmetic, and it
+        // makes the session WORSE:
+        //
+        //   5 main-feed connections x 5,000 = 25,000 slots.
+        //   The spot universe (~4,565) packs onto ONE, leaving 4 whole
+        //   connections plus ~435 spare on the spot socket ≈ 20,435 for
+        //   contracts. The authorized contract set is ~23,820, so it ALREADY
+        //   does not fit and `fit_atm_window` shrinks the window to suit.
+        //
+        //   Dialing the ~1,380 price-independent contracts FIRST gives them a
+        //   connection of their own, of which they use 28%. The other ~3,620
+        //   slots are then stranded — `plan_pool` cannot retroactively pack a
+        //   later set onto a socket already dialed — so stock options lose
+        //   ~3,620 slots, which is roughly EIGHT strikes each side off the ATM
+        //   window, every day, forever.
+        //
+        // Trading eight strikes of permanent option coverage for an earlier
+        // start on 1,380 futures is a bad trade, and the loss it avoids is
+        // bounded anyway: `pending` is ANDed with `!out_of_time` directly
+        // below, so the whole set dials at the deadline regardless of whether
+        // a single stock ever priced. The wait is bounded; the strike loss
+        // would not have been.
+        //
+        // Recorded because the split is an attractive-looking change that a
+        // reader arrives at independently — I did — and the arithmetic that
+        // rejects it is not visible from this call site.
         let pending =
             crate::dhan_contract_universe::stock_options_are_pending(&contracts) && !out_of_time;
         if pending {
@@ -5438,6 +5773,35 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 outcome.lost
             );
         }
+
+        // CRASH-SAFETY CONFIRM — deliberately HERE, not at boot (2026-08-21).
+        //
+        // `confirm_replayed` moves the staged segments out of `replaying/` so
+        // they never re-stage. Its own doc says to call it "ONLY after the
+        // frames returned by `replay_all` have been durably re-captured into
+        // the live pipeline". Boot called it unconditionally, several thousand
+        // lines BEFORE this refold — the only code that makes that sentence
+        // true. Between those two points the segments sat in `archive/`,
+        // where the next boot does not look, while the frames they contained
+        // were still only in memory. A crash in that window lost them for
+        // good, and the archive pruner then deleted the raw bytes on a timer
+        // under a doc-comment asserting they were already persisted.
+        //
+        // Confirming here closes that window. If this process dies before
+        // reaching this line, the segments stay in `replaying/` and the next
+        // boot replays them again — which is idempotent, because every
+        // affected table dedups on its upsert key.
+        //
+        // Confirmed even when `outcome.lost > 0`: the frames we COULD fold are
+        // in the database, and the ones we could not are unfoldable rather
+        // than unread — re-replaying them next boot would fail identically
+        // while re-staging forever (the WS-REINJECT-01 growth-storm class).
+        // The `error!` above is what carries those, and it names the count.
+        // Resolved the same way boot resolves it (`TV_WS_WAL_DIR`, else the
+        // default) rather than threaded through the params struct: one shared
+        // helper cannot drift out of sync with itself, whereas a second copy
+        // of the path in a struct field can.
+        tickvault_storage::ws_frame_spill::confirm_replayed(crate::boot_helpers::ws_wal_dir());
     }
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
@@ -6741,6 +7105,56 @@ mod tests {
         assert_eq!(pool.total_open(), 1);
     }
 
+    /// The arithmetic that makes splitting the contract dial a BAD trade.
+    ///
+    /// Dialing the ~1,380 price-independent contracts on their own connection
+    /// first looks like an obvious win — they need no spot price, so why hold
+    /// them behind a stock-pricing quorum? Because `plan_pool` cannot pack a
+    /// later set onto a socket already dialed, so that connection's unused
+    /// slots are stranded and come straight out of the ATM window.
+    ///
+    /// This pins the numbers rather than the prose. If the connection count or
+    /// the per-connection cap ever changes such that the split becomes
+    /// harmless, this test fails and the comment above gets revisited — which
+    /// is the only way a rejected-alternative note stays trustworthy.
+    #[test]
+    fn splitting_the_contract_dial_would_strand_slots_and_shrink_the_window() {
+        let per_conn = usize::try_from(
+            tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
+        )
+        .expect("per-connection cap fits usize");
+
+        // Spot packs onto one connection, so the contract half starts with
+        // four whole connections free.
+        let spot_connections = 1usize;
+        let single_dial = remaining_main_feed_capacity(spot_connections);
+
+        // A split would spend one of those four on ~1,380 contracts.
+        let price_independent = 1_380usize;
+        assert!(
+            price_independent < per_conn,
+            "the price-independent set fits in ONE connection, which is exactly \
+             why splitting strands the rest of it"
+        );
+        let after_split = remaining_main_feed_capacity(spot_connections + 1);
+
+        let stranded = single_dial
+            .saturating_sub(price_independent)
+            .saturating_sub(after_split);
+        assert!(
+            stranded > 3_000,
+            "expected a split to strand thousands of slots, computed {stranded} — \
+             if this is now small, the comment above rejecting the split is stale"
+        );
+
+        // Two legs per strike, so the stranded slots cost half that many
+        // strikes each side, spread across the priced underlyings.
+        assert!(
+            stranded / 2 > 1_500,
+            "the stranded slots are option LEGS; halving them is the strike count \
+             the ATM window loses"
+        );
+    }
     #[test]
     fn test_plan_count_for_packs_the_main_feed_and_spreads_depth() {
         let mut pool = PoolSupervisor::new();
@@ -7802,6 +8216,150 @@ mod tests {
             oos, 0,
             "an in-session tick must not be booked as out-of-session — that \
              bucket is deliberately excluded from the page"
+        );
+    }
+
+    fn silent_at(id: u64, ms: u64) -> SilentInstrument {
+        SilentInstrument {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+            silent_millis: ms,
+            expected_millis: 1_000,
+            never_ticked: false,
+        }
+    }
+
+    /// The ranking keeps the QUIETEST, which is the whole point: at 25,000
+    /// instruments only a handful can be named, so naming the wrong handful
+    /// is the same as naming none.
+    #[test]
+    fn rank_silent_keeps_the_quietest_in_descending_order() {
+        let mut buf = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+        let mut n = 0usize;
+        for (id, ms) in [(1, 50), (2, 900), (3, 300), (4, 10)] {
+            n = rank_silent(&mut buf, n, silent_at(id, ms));
+        }
+        assert_eq!(n, 4);
+        assert_eq!(
+            buf[..n].iter().map(|s| s.security_id).collect::<Vec<_>>(),
+            vec![2, 3, 1, 4],
+            "quietest first — the operator reads the top of the list"
+        );
+    }
+
+    /// Past capacity it must DROP the least-quiet, not the newest arrival.
+    /// Dropping by arrival order would make the named set depend on detector
+    /// iteration order rather than on silence, which is arbitrary.
+    #[test]
+    fn rank_silent_evicts_the_least_silent_once_full() {
+        let mut buf = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+        let mut n = 0usize;
+        // Fill with an ascending run, so the buffer holds 8..1 descending.
+        for id in 1..=WORST_SILENT_NAMED as u64 {
+            n = rank_silent(&mut buf, n, silent_at(id, id * 10));
+        }
+        assert_eq!(n, WORST_SILENT_NAMED, "the buffer is full");
+
+        // A new WORST arrival must land first and push the smallest out.
+        n = rank_silent(&mut buf, n, silent_at(99, 10_000));
+        assert_eq!(n, WORST_SILENT_NAMED, "the length never exceeds the cap");
+        assert_eq!(buf[0].security_id, 99, "the quietest must lead");
+        assert!(
+            !buf.iter().any(|s| s.security_id == 1),
+            "the least-silent entry is the one evicted"
+        );
+
+        // A new entry quieter than NOTHING in the buffer must be refused
+        // rather than displacing a genuinely quieter one.
+        n = rank_silent(&mut buf, n, silent_at(1_000, 1));
+        assert!(
+            !buf[..n].iter().any(|s| s.security_id == 1_000),
+            "an entry that beats nothing in the buffer must not enter it"
+        );
+    }
+
+    /// The named scan must agree with the counting scan, or the page's count
+    /// and its names describe different things.
+    #[test]
+    fn scan_silence_named_agrees_with_the_counting_scan() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let mut buf = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+
+        let (silent_a, never_a, named_a) = ingest.scan_silence_named(u64::MAX, &mut buf);
+        assert_eq!(
+            (silent_a, never_a),
+            ingest.scan_silence(u64::MAX),
+            "the two entry points must report the same counts"
+        );
+        assert_eq!(
+            named_a, 0,
+            "an empty book names nobody — reporting a name here would page on \
+             every boot before the first subscribe"
+        );
+
+        // Seed one and let it cross the silence floor: it must now be NAMED,
+        // not merely counted, which is the defect this whole path fixes.
+        ingest.seed(13, ExchangeSegment::IdxI, 0);
+        let (silent_b, _, named_b) = ingest.scan_silence_named(u64::MAX, &mut buf);
+        assert!(silent_b >= 1, "a long-quiet seeded instrument counts");
+        assert!(named_b >= 1, "and it must be NAMED, not just counted");
+        assert_eq!(
+            buf[0].security_id, 13,
+            "the name must be the real security_id — a count with no id is \
+             exactly what made this unanswerable before"
+        );
+        assert!(
+            buf[0].never_ticked,
+            "an instrument that produced nothing since being seeded must say so \
+             — that is the shape of a subscribe that did not take"
+        );
+    }
+
+    /// The detector's own blindness, and the reason it needs an accessor.
+    ///
+    /// `scan_silence` reports how many tracked instruments are quiet. It
+    /// cannot report the ones it never accepted, and past capacity that is a
+    /// growing set — so a full detector returns a small, calm number that
+    /// reads exactly like health. This accessor is the only way a caller can
+    /// tell "nothing is silent" from "I can no longer see".
+    #[test]
+    fn detector_refused_separates_a_quiet_universe_from_a_blind_detector() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 2);
+        assert_eq!(
+            ingest.detector_refused(),
+            0,
+            "a fresh detector has turned nobody away"
+        );
+
+        // Fill the slot table exactly.
+        assert!(ingest.seed(13, ExchangeSegment::IdxI, 0));
+        assert!(ingest.seed(25, ExchangeSegment::IdxI, 0));
+        assert_eq!(ingest.tracked_instruments(), 2);
+        assert_eq!(
+            ingest.detector_refused(),
+            0,
+            "seeding up to capacity refuses nobody"
+        );
+
+        // One past it. The seed is refused fail-closed, which is correct —
+        // what matters is that the refusal is now VISIBLE.
+        assert!(
+            !ingest.seed(51, ExchangeSegment::IdxI, 0),
+            "past capacity the allocator must refuse rather than grow"
+        );
+        assert!(
+            ingest.detector_refused() >= 1,
+            "the refusal must be counted, or the detector goes blind silently \
+             and its silent-instrument count keeps reading like health"
+        );
+
+        // The trap this guards: the visible counts stay calm while the
+        // detector is blind to instrument 51 entirely.
+        assert_eq!(
+            ingest.tracked_instruments(),
+            2,
+            "the refused instrument is genuinely absent from the book, which \
+             is exactly why nothing else can report it"
         );
     }
 
@@ -9515,7 +10073,7 @@ mod silence_latch_tests {
         // The suppressed episodes must stay COUNTABLE. Rate-limiting the page
         // while also gating the gauge would trade a noisy signal for no signal.
         let scan_arm = production
-            .split("let (silent, never) = ingest.scan_silence(now_millis);")
+            .split("ingest.scan_silence_named(now_millis, &mut worst_silent);")
             .nth(1)
             .unwrap_or_default();
         let gauge = scan_arm
@@ -9786,6 +10344,12 @@ mod alive_connection_guard_tests {
     /// real there; nextest gives each test its own process, which is why CI
     /// never showed it.
     ///
+    /// Fixed independently on `main` the same day with an inline
+    /// `static SERIALIZE: Mutex<()>`; the two are equivalent and this side's
+    /// helper is kept because the test bodies here already call it. The same
+    /// class was fixed the same way in `tv_api_token_prod_guard.rs` after
+    /// PR #1411 merged red on it (merge-gate-lock section 3.2).
+    ///
     /// This replaces a comment that CLAIMED the tests were "serialized ... by
     /// running both assertions here" — true when this module held one test,
     /// and quietly false from the moment a second one was added beside it.
@@ -9807,6 +10371,12 @@ mod alive_connection_guard_tests {
         // sockets alive when N-1 are — permanently, with nothing to correct
         // it, on the one number an operator reads to answer "how many of the
         // sixteen are up?".
+        //
+        // CORRECTED 2026-08-21: this comment used to claim the module was
+        // "serialized ... by running both assertions here". It was not — the
+        // second test below mutates the same global, so the two raced, and the
+        // comment asserting safety is exactly what stopped anyone looking.
+        // The real serialization is the `serial()` guard taken above.
         let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
 
         // Clean path.

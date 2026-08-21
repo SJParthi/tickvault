@@ -499,9 +499,7 @@ resource "aws_cloudwatch_metric_alarm" "ticks_lost_spill" {
 # Every alarm above answers "did something BREAK". None answers "is the feed
 # PRODUCING anything", and those are different questions.
 #
-# `tv_dhan_feed_ingest_ticks_total` has been EMF-shipped since 2026-08-14 and
-# charted on the operator dashboard since — and no alarm has ever read it. A
-# lane that dials, connects, subscribes and delivers nothing reports fully
+# A lane that dials, connects, subscribes and delivers nothing reports fully
 # green: the lane-up gauge reads 1, the connection gauge reads healthy, and
 # every loss counter reads zero, because nothing was lost — nothing arrived.
 # That is exactly what the 2026-08-12 session looked like (compared: 0,
@@ -509,42 +507,66 @@ resource "aws_cloudwatch_metric_alarm" "ticks_lost_spill" {
 # cross-verify log line rather than by being told.
 #
 # Authorization + binding constraints: the dated §2.3b row in
-# .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
+# .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md, with the
+# same-day implementation-correction note recorded beneath it.
 #
-# COUNTER SHAPE: the CW agent's prometheus pipeline publishes per-scrape
-# DELTAS (the model documented at length in auth-failed-alarm.tf), so Sum over
-# the window = ticks folded in that window, and `< 1` means the fold produced
-# nothing at all. Honest residual inherited from that file: if the field ever
-# proved CUMULATIVE, Sum would be large and this alarm would go BLIND rather
-# than over-page — the opposite failure direction from the auth alarm. That is
-# why the market-hours-liveness heartbeat GAUGE remains the independent
-# process-death signal instead of being replaced by this one.
+# WHY A GAUGE, AND NOT THE TICK COUNTER (corrected 2026-08-21, same day)
 #
-# WHY breaching AND THE GATE, AS ONE CHANGE: a dead app publishes no datapoint,
-# and a lane that never receives a frame never registers the series at all
-# (the drain's counter handles are built lazily inside the frame arm), so
-# notBreaching would read both as health. But a bare flip to breaching pages
-# every evening at 17:30 and all weekend — the fastest possible way to train an
-# operator to ignore an alarm. Membership in the market-hours gate's
-# ALARM_NAMES list is what makes the flip safe; separating the two re-creates
-# the nightly false page.
+# The first version of this alarm read `tv_dhan_feed_ingest_ticks_total` with
+# `Sum < 1`, and its own header conceded the residual that killed it: the CW
+# agent's prometheus pipeline is BELIEVED to publish per-scrape deltas, but
+# that has never been verified from this sandbox, and "if the field ever
+# proved CUMULATIVE, Sum would be large and this alarm would go BLIND".
+#
+# Blind is the whole problem. Under cumulative values `Sum` over 300s is
+# roughly five times the running session total, so `< 1` stops being true the
+# instant the first tick of the morning lands — and the alarm written to prove
+# ticks are flowing would report health for the rest of the day no matter what
+# the feed did. A signal whose correctness rests on an unverified pipeline
+# detail is not a signal; it is a coin flip, and this is the one alarm in the
+# lane that must not be one.
+#
+# `tv_dhan_feed_last_tick_age_secs` removes the question instead of answering
+# it. A GAUGE is published verbatim by both pipelines — there is no delta to
+# compute for a value that is free to go down — so this alarm means exactly the
+# same thing whichever reading is true. The counter stays as-is for the
+# dashboard, where either reading is legible to a human.
+#
+# The gauge is also a STRICTLY better liveness definition than the counter was.
+# It is stamped in `flush_and_record` only when a flush actually PERSISTED
+# rows, so a QuestDB outage decays it while the socket is busy — correct,
+# because during one the feed is not delivering. And it is published every 30s
+# from the moment the drain starts, so the series is DENSE rather than being
+# born on the first frame: the counter's handles are built lazily inside the
+# frame arm, which is why the counter version needed `breaching` to catch a
+# lane that never received anything at all.
+#
+# WHY breaching AND THE GATE, AS ONE THING: a dead app publishes no datapoint
+# at all, so `breaching` is what makes process death visible here. But a bare
+# flip to breaching pages every evening at 17:30 and all weekend — the fastest
+# possible way to train an operator to ignore an alarm. Membership in the
+# market-hours gate's ALARM_NAMES list is what makes it safe, and the alarm
+# NAME is unchanged by this correction precisely so that membership survives.
 resource "aws_cloudwatch_metric_alarm" "dhan_no_ticks_flowing" {
   alarm_name        = "tv-${var.environment}-dhan-no-ticks-flowing"
-  alarm_description = "The Dhan live lane folded ZERO ticks for ~10 minutes DURING MARKET HOURS. This is the 'is it actually working' signal: sockets can be connected, the lane-up gauge can read 1, every loss counter can read zero, and still no market data reaches the candle fold - that is what the 2026-08-12 session looked like. Missing data breaches deliberately: a dead app publishes nothing, and a lane that dials but never receives a frame never registers this series at all. Triage in order: (1) tv_dhan_ws_alive_connections and tv_dhan_ws_dial_failed_total - are the sockets up. (2) tv_dhan_feed_drain_frames_total - are frames arriving but not folding, then read tv_dhan_feed_ingest_refused_total whose reason label names why. (3) journalctl -u tickvault for WS-GAP-03 and the subscribe batching lines. If frames arrive and ticks do not, the fault is ours; if no frames arrive, it is the socket or the subscription."
+  alarm_description = "The Dhan live lane has not PERSISTED a tick for ~10 minutes DURING MARKET HOURS. This is the 'is it actually working' signal: sockets can be connected, the lane-up gauge can read 1, every loss counter can read zero, and still no market data reaches QuestDB - that is what the 2026-08-12 session looked like. Before the session's first tick the gauge reports the drain's own uptime, so a lane that dials and never receives anything pages instead of reassuring. Missing data breaches deliberately: a dead app publishes nothing at all. Triage: (1) tv_dhan_ws_alive_connections and tv_dhan_ws_dial_failed_total - are the sockets up. (2) tv_dhan_feed_drain_frames_total and tv_dhan_feed_ingest_ticks_total - if frames arrive but ticks do not, read tv_dhan_feed_ingest_refused_total whose reason label names why. (3) Is QuestDB accepting writes - this gauge is stamped on a flush that PERSISTED rows, so an ILP outage decays it while the socket is busy. (4) journalctl -u tickvault for WS-GAP-03 and the subscribe lines."
 
-  comparison_operator = "LessThanThreshold"
-  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  # 300s of silence. The gauge is refreshed every 30s, so it crosses this
+  # threshold five minutes after the last persisted tick and keeps climbing.
+  threshold = 300
   # 2 x 300s. One aligned window can legitimately be quiet at the session
   # edges - the gate opens 09:20, five minutes after the 09:15 open, and closes
-  # 15:35, five minutes after the 15:30 close. Ten consecutive minutes of zero
-  # ticks INSIDE the session is not an edge effect.
+  # 15:35, five minutes after the 15:30 close. Ten consecutive minutes without
+  # a persisted tick INSIDE the session is not an edge effect.
   evaluation_periods = 2
-  metric_name        = "tv_dhan_feed_ingest_ticks_total"
+  metric_name        = "tv_dhan_feed_last_tick_age_secs"
   namespace          = local.app_namespace
   period             = 300
-  # Sum of per-scrape deltas = ticks folded in the window. NOT Minimum: a
-  # single quiet scrape inside an otherwise busy window is normal.
-  statistic = "Sum"
+  # Maximum, not Average: a window that contains one fresh scrape and four
+  # stale ones is still a window in which the feed was silent, and averaging
+  # would let a single late tick erase four minutes of nothing.
+  statistic = "Maximum"
   # `{host}` - the metric is unlabelled and the EMF processor declares exactly
   # one dimension set. Same folding note as alarm 2.
   dimensions = local.app_dimensions
@@ -639,10 +661,15 @@ resource "aws_cloudwatch_metric_alarm" "dhan_contract_universe_failed" {
 # deferred recovery, and between "the drain is working" and "the countdown to
 # the cap has started".
 #
-# The SUCCESS counter (tv_tick_spill_replayed_bytes_total) is shipped to
-# CloudWatch WITHOUT an alarm, deliberately: a chart of successful recoveries
-# belongs beside these two, but paging when recovery WORKS is the false-OK's
-# mirror image.
+# The SUCCESS counter (tv_tick_spill_replayed_bytes_total) has NO alarm --
+# paging when recovery WORKS is the false-OK's mirror image -- and as of
+# 2026-08-21 it does not reach CloudWatch at all. It was to ship unalarmed so a
+# chart of successful recoveries could sit beside these two, but with it in the
+# selector the rendered EC2 user-data came out past AWS's hard 16,384-byte cap.
+# Given a real byte budget the ALARMED names win. The counter is still emitted
+# and still readable on the box's :9091/metrics; it is simply not chartable
+# off-box until the selector has room. deploy/aws/EMF-METRIC-SELECTOR-NOTES.md
+# carries the wider record of that rationing.
 resource "aws_cloudwatch_metric_alarm" "tick_spill_replay_failing" {
   alarm_name        = "tv-${var.environment}-tick-spill-replay-failing"
   alarm_description = "The automatic drain could not return rescued ticks to the database. The rows are NOT lost — they are on the box as valid line protocol in data/spill/ticks/ — but they are not queryable, and the spill directory is now growing toward its 512 MiB cap, past which the writer stops rescuing and starts dropping. Causes, in order of likelihood: QuestDB is down or refusing writes; or the disk is full so the drained file cannot be emptied. Triage: journalctl -u tickvault for TICK-FLUSH-01 and for the drain's round summary, then ls -la data/spill/ticks/ — a non-empty .ilp file is unrecovered ticks. Manual recovery, unchanged and always available: curl --data-binary @<file> http://<questdb>:9000/write"

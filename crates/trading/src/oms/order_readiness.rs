@@ -318,7 +318,13 @@ pub async fn refresh_order_readiness(
 #[must_use]
 pub fn next_readiness_probe_wait_secs(now_ist_secs_of_day: u32) -> u64 {
     let trigger = ORDER_READINESS_PREMARKET_TRIGGER_SECS_OF_DAY_IST;
-    // 15:30 IST — reuse the persist-window close (same wall-clock instant).
+    // Reuse the persist-window close — the same wall-clock instant, whatever
+    // it is. That constant moved 15:30 -> 15:40 on 2026-08-07 with the NSE
+    // closing-auction session change of 2026-08-03, and this comment kept
+    // saying 15:30 for two weeks. Naming no hour here is deliberate: the
+    // constant is const-asserted against `MARKET_CLOSE_IST_NANOS`, so it
+    // cannot drift from the real close, while a restated hour has nothing
+    // holding it true and is what the next reader trusts instead of the code.
     let close = TICK_PERSIST_END_SECS_OF_DAY_IST;
     if now_ist_secs_of_day < trigger {
         u64::from(trigger - now_ist_secs_of_day)

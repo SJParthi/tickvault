@@ -98,6 +98,7 @@ pub mod console_views;
 // a silent tokio-task death).
 pub mod http_client;
 pub mod ilp_flush_reconnect;
+pub mod ilp_overflow;
 // SP5 (parity plan, operator directive 2026-06-02 narrowed cross-verify): ONE
 // unified post-market live-vs-backtest 1m parity audit table + writer + CSV
 // (`feed` IN the DEDUP key). Merges the two former siloed modules
@@ -105,14 +106,6 @@ pub mod ilp_flush_reconnect;
 // Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
-/// BruteX↔TickVault daily cross-verification (operator 2026-07-11): the two
-/// forensic tables — one row per divergent CELL + one per-day summary row
-/// with a keep-better outcome guard — written via ILP-over-HTTP (per-flush
-/// server ACK). See `.claude/rules/project/brutex-crossverify-error-codes.md`.
-/// Cadence cross-fill visibility (operator 2026-07-20): one forensic row per
-/// cross-fill / Groww-fallback event with the precise minute + latency —
-/// the "every day, week, month, precisely at what time" system-of-record.
-/// See `.claude/rules/project/cadence-error-codes.md` §4 (CADENCE-04).
 /// Daily 15:31 IST Dhan LIVE-vs-REST cross-verification audit (the revived
 /// Dhan live feed's ONLY ground truth — the wire carries no sequence number,
 /// so Dhan's own 1m tape is the only packet-loss proxy available). Cell-level
