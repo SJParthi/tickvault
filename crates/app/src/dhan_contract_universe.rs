@@ -250,6 +250,79 @@ pub const FULL_CHAIN_INDEX_UNDERLYINGS: [&str; 2] = ["NIFTY", "BANKNIFTY"];
 /// can see.
 pub const STOCK_OPTION_PRICING_QUORUM_PERCENT: usize = 60;
 
+/// Counter: a TERMINAL defect in the day's contract selection. Label: `reason`.
+///
+/// Until 2026-08-21 this module carried **zero** `metrics::` calls. "No options
+/// resolved today", "the ATM window shrank to three", "the artifact was
+/// unreadable" were `error!` lines and struct fields that nothing consumed — a
+/// session missing ~22,000 authorized contracts left no number anywhere for an
+/// alarm or a triage path to read. The 2026-08-20 incident is the shape:
+/// `atm_window_reason = "no_ladders"` was recorded, printed, and ignored.
+///
+/// EVERY label value is a real defect, deliberately. The CloudWatch EMF
+/// processor folds labels into the single declared dimension set by SUMMING,
+/// so a name that also carried successes would alarm on a healthy day. The
+/// success side stays on the `contract universe resolved` info line.
+pub const CONTRACT_UNIVERSE_FAILED_COUNTER: &str = "tv_dhan_contract_universe_failed_total";
+
+/// Every `reason` value [`CONTRACT_UNIVERSE_FAILED_COUNTER`] can carry.
+///
+/// Enumerated so they can be pre-registered: the CloudWatch delta pipeline
+/// drops each series' FIRST observed sample as its baseline, so a reason that
+/// is not pre-registered loses its first increment — and on a once-per-session
+/// counter, its first increment is its only one.
+pub const CONTRACT_FAILURE_REASONS: [&str; 6] = [
+    "artifact_unreadable",
+    "symbol_map_unreadable",
+    "no_contracts",
+    "no_ladders",
+    "no_room",
+    "window_shrunk",
+];
+
+/// Publish a 0 baseline for every reason. Call ONCE, before the first attempt.
+pub fn pre_register_contract_failure_counters() {
+    for reason in CONTRACT_FAILURE_REASONS {
+        metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(0);
+    }
+}
+
+/// Classify the TERMINAL verdict for a contract selection.
+///
+/// Pure, so the classification is testable without a metrics recorder — the
+/// emit below is a thin loop over what this returns.
+///
+/// Called ONCE, when the selection is dialed or abandoned, never per retry.
+/// That distinction is the whole design: `no_ladders` on a pre-open attempt is
+/// NORMAL — no tick has landed yet, and this module's own docs say so — so a
+/// per-attempt emit would fire ~46 times between 08:30 and 09:16 on a perfectly
+/// healthy morning and page for it.
+#[must_use]
+pub fn contract_verdict_reasons(selection: &ContractSelection) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if selection.instruments.is_empty() {
+        reasons.push("no_contracts");
+    }
+    match selection.atm_window_reason {
+        // Guarded on the denominator: a master with genuinely no stock options
+        // reports `no_ladders` legitimately and must not page for it.
+        "no_ladders" if selection.stock_option_underlyings > 0 => reasons.push("no_ladders"),
+        "no_room" => reasons.push("no_room"),
+        "applied" if selection.atm_window_used < STOCK_OPTION_ATM_STRIKES_EACH_SIDE => {
+            reasons.push("window_shrunk");
+        }
+        _ => {}
+    }
+    reasons
+}
+
+/// Record the terminal verdict. One increment per reason, once per session.
+pub fn record_contract_verdict(selection: &ContractSelection) {
+    for reason in contract_verdict_reasons(selection) {
+        metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(1);
+    }
+}
+
 /// What a contract selection produced, and everything it refused.
 ///
 /// Every refusal is a counted field rather than a silent drop. A selection
@@ -1073,6 +1146,11 @@ pub async fn load_contract_universe(
                 "contract universe: today's contract artifact is unreadable — the lane will \
                  carry its spot universe only. No futures, no option contracts."
             );
+            // Bumped HERE rather than through `record_contract_verdict`: this
+            // path returns a default selection, which carries none of the
+            // information needed to classify what went wrong.
+            metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "artifact_unreadable")
+                .increment(1);
             return ContractSelection::default();
         }
     };
@@ -1090,6 +1168,12 @@ pub async fn load_contract_universe(
                 "contract universe: the symbol map is unreadable, so at-the-money cannot be \
                  located for any stock. Futures and index chains are unaffected."
             );
+            // Same reasoning as the artifact arm: the selection continues from
+            // here with an empty map and would classify only as `no_ladders`,
+            // which reads as "no stock priced yet" — a normal pre-open state —
+            // rather than "the map itself is broken".
+            metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "symbol_map_unreadable")
+                .increment(1);
             HashMap::new()
         }
     };
@@ -1664,6 +1748,94 @@ mod tests {
         // Everything priced: final, whatever happened next.
         sel.underlyings_without_spot = 0;
         assert!(!stock_options_are_pending(&sel), "all priced");
+    }
+
+    /// An ATM window narrowed below the authorized 25 IS a defect, even though
+    /// options were selected and every other field looks healthy.
+    ///
+    /// This is the case that produces NO signal of any kind today: the
+    /// selection succeeds, the log line prints a smaller number than the
+    /// operator authorized, and nothing counts it.
+    #[test]
+    fn contract_verdict_reasons_flags_a_shrunk_window_even_when_options_were_selected() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = 3;
+        assert_eq!(contract_verdict_reasons(&sel), vec!["window_shrunk"]);
+    }
+
+    /// Non-vacuity. Without this the guard above would pass on a function that
+    /// reported a defect unconditionally.
+    #[test]
+    fn contract_verdict_reasons_reports_nothing_for_a_full_window() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        assert!(
+            contract_verdict_reasons(&sel).is_empty(),
+            "a healthy selection must report NOTHING — a counter that fires on a good day \
+             trains the operator to ignore it"
+        );
+    }
+
+    #[test]
+    fn contract_verdict_reasons_report_no_contracts_for_an_empty_selection() {
+        let sel = ContractSelection::default();
+        assert!(contract_verdict_reasons(&sel).contains(&"no_contracts"));
+    }
+
+    /// A master that genuinely lists no stock options reports `no_ladders`
+    /// legitimately. Paging for it would fire on every such day forever.
+    #[test]
+    fn contract_verdict_reasons_holds_no_ladders_harmless_at_zero_underlyings() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.atm_window_reason = "no_ladders";
+        sel.stock_option_underlyings = 0;
+        assert!(contract_verdict_reasons(&sel).is_empty());
+
+        // ...but with a real master behind it, it IS the 2026-08-20 defect.
+        sel.stock_option_underlyings = 208;
+        assert_eq!(contract_verdict_reasons(&sel), vec!["no_ladders"]);
+    }
+
+    /// Every reason the classifier can produce must be in the pre-registration
+    /// list, or its first — and on a once-per-session counter, its only —
+    /// increment is eaten as the CloudWatch delta baseline.
+    #[test]
+    fn pre_register_contract_failure_counters_covers_every_classified_reason() {
+        for reason in ["no_contracts", "no_ladders", "no_room", "window_shrunk"] {
+            assert!(
+                CONTRACT_FAILURE_REASONS.contains(&reason),
+                "`{reason}` can be emitted but is not pre-registered at 0"
+            );
+        }
+        // The two the classifier cannot produce, because their call sites have
+        // no ContractSelection to classify.
+        for reason in ["artifact_unreadable", "symbol_map_unreadable"] {
+            assert!(CONTRACT_FAILURE_REASONS.contains(&reason));
+        }
+    }
+
+    /// The emit wrappers must be callable with no recorder installed — which
+    /// is the state in every unit test and in the seconds before boot Step 3.
+    #[test]
+    fn record_contract_verdict_is_safe_without_a_recorder() {
+        pre_register_contract_failure_counters();
+        record_contract_verdict(&ContractSelection::default());
     }
 
     /// The quorum boundary, exactly. Integer cross-multiply rather than a

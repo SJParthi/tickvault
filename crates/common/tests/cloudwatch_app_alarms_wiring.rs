@@ -682,9 +682,37 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // deliberately: every one of the 2026-08-11/12 additions was a loss
     // counter, and a dashboard that can only show failure cannot distinguish
     // "nothing broke" from "nothing ran".
+    // 2026-08-21: 72 -> 73. Added `tv_dhan_contract_universe_failed_total`.
+    //
+    // `dhan_contract_universe.rs` carried ZERO metrics calls until this date.
+    // "No options resolved today", "the ATM window shrank to three", "the
+    // artifact was unreadable" were error! lines and struct fields that nothing
+    // consumed — a session missing ~22,000 authorized contracts left no number
+    // anywhere for an alarm or a triage path to read. The 2026-08-20 incident
+    // is the shape: atm_window_reason = "no_ladders" was recorded, printed, and
+    // ignored.
+    //
+    // ONE name, not six, and the `reason` label carries the classification.
+    // That is forced by two things: the EMF processor folds labels into the
+    // single declared dimension set by summing, so a name that also carried
+    // successes would alarm on a healthy day (hence every reason value is a
+    // defect); and the rendered user-data template has limited headroom, so
+    // each added name is measured rather than assumed.
+    //
+    // MEASURED with this addition in place: user-data.sh.tftpl renders to
+    // 15,795 bytes against the 15,872 budget (16,384 EC2 cap minus the 512
+    // required margin) — 77 bytes free, and `user_data_size_guard` passes.
+    // Reproduce with `wc -c deploy/aws/terraform/user-data.sh.tftpl`. That is
+    // thin: the NEXT selector addition should follow the size guard's own
+    // prescription and move content OUT of user-data rather than shave
+    // comments to make room.
+    //
+    // COST: one additional EMF metric, ~$0.30/mo, plus its alarm at ~$0.10/mo.
+    // One series, since the reason label folds. Authorization for the alarm is
+    // the dated §2.3b row in dhan-rest-only-noise-lock-2026-07-14.md.
     assert_eq!(
         names.len(),
-        72,
+        73,
         "Z+ L2 VERIFY ratchet: expected exactly 72 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
