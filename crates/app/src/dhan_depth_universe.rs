@@ -274,6 +274,34 @@ pub const fn segment_supports_depth(segment: ExchangeSegment) -> bool {
     )
 }
 
+/// A strike as an exact, hashable key: integer paise.
+///
+/// A float cannot key a map, and comparing strikes with `abs() < EPSILON`
+/// forces a pairwise scan — which is precisely how two O(k^2) passes ended up
+/// under a comment claiming O(k). Rounding to paise expresses the same
+/// equality those compares did (strikes are whole paise at source) while
+/// making the grouping a hash lookup.
+///
+/// Saturating rather than wrapping: a garbage strike must land on a far-away
+/// key and be ranked last, never alias onto a real strike's bucket and quietly
+/// join its legs.
+#[must_use]
+fn strike_key(strike: f64) -> i64 {
+    let paise = (strike * 100.0).round();
+    if paise.is_finite() {
+        // `as` saturates at the i64 bounds for finite floats in Rust.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "saturating by design; a strike beyond i64 paise is not a real contract \
+                      and must sort last rather than alias onto a real bucket"
+        )]
+        {
+            paise as i64
+        }
+    } else {
+        i64::MAX
+    }
+}
 /// Distance from at-the-money. `f64::MAX` for unusable prices so they sort last
 /// and are refused before selection rather than silently ranked first.
 fn atm_distance(candidate: &DepthCandidate) -> f64 {
@@ -362,21 +390,35 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
 
         // Distinct strikes, nearest-ATM first.
         //
-        // The distance is computed ONCE per strike and carried alongside it,
-        // rather than looked up inside the comparator. A linear `find` inside
-        // a `sort_by` makes each of the O(k log k) comparisons O(k) — a
-        // quadratic-with-a-log hidden where no call site can see it, and this
-        // one ran twice per comparison. Decorate-sort-undecorate instead: one
-        // O(k) pass to attach distances, then a plain O(k log k) sort.
+        // ONE index pass, then O(1) lookups. The previous shape claimed to be
+        // "one O(k) pass to attach distances" in this very comment while
+        // doing `rows.iter().find()` PER STRIKE — O(strikes x rows), i.e.
+        // quadratic — and the loop below then filtered `rows` again per
+        // strike, a second quadratic pass. Two O(k^2) scans sitting under a
+        // comment asserting O(k).
+        //
+        // Keyed on integer paise rather than the f64 itself: a float is not
+        // hashable, and rounding to paise is the same equality the old
+        // `abs() < EPSILON` compare expressed, without the pairwise scan
+        // needed to evaluate it.
+        let mut by_strike: std::collections::HashMap<i64, Vec<(&DepthCandidate, ExchangeSegment)>> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for (c, seg) in &rows {
+            by_strike
+                .entry(strike_key(c.strike))
+                .or_default()
+                .push((*c, *seg));
+        }
+
         let mut strikes: Vec<f64> = rows.iter().map(|(c, _)| c.strike).collect();
         strikes.sort_by(|a, b| a.total_cmp(b));
         strikes.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
         let mut ranked: Vec<(f64, f64)> = strikes
             .iter()
             .map(|s| {
-                let d = rows
-                    .iter()
-                    .find(|(c, _)| (c.strike - *s).abs() < f64::EPSILON)
+                let d = by_strike
+                    .get(&strike_key(*s))
+                    .and_then(|legs| legs.first())
                     .map_or(f64::MAX, |(c, _)| atm_distance(c));
                 (d, *s)
             })
@@ -386,14 +428,14 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
 
         let keep = each_side * 2 + 1;
         for (rank, strike) in strikes.iter().enumerate() {
-            let legs: Vec<(&DepthCandidate, ExchangeSegment)> = rows
-                .iter()
-                .filter(|(c, _)| (c.strike - *strike).abs() < f64::EPSILON)
-                .copied()
-                .collect();
+            // O(1) lookup replacing the second per-strike scan of `rows`.
+            // `legs` is empty only if a strike vanished between the two
+            // passes, which cannot happen — both read the same `rows`.
+            let empty: Vec<(&DepthCandidate, ExchangeSegment)> = Vec::new();
+            let legs = by_strike.get(&strike_key(*strike)).unwrap_or(&empty);
 
             if rank < keep {
-                for (c, segment) in &legs {
+                for (c, segment) in legs {
                     let inst = SubscribeInstrument {
                         security_id: c.contract_security_id as SecurityId,
                         segment: *segment,
@@ -879,6 +921,57 @@ mod tests {
             spot: 100.0,
             leg: leg.to_owned(),
         }
+    }
+
+    /// The index that replaced two O(k^2) scans must group exactly what the
+    /// pairwise `abs() < EPSILON` compares grouped — no more, no less.
+    ///
+    /// Getting this wrong is silent in the worst way: legs that fail to group
+    /// leave a strike looking like a lone leg, which the never-split-a-pair
+    /// rule then skips, and depth-200 quietly carries fewer pairs than it
+    /// should while every counter reads healthy.
+    #[test]
+    fn strike_key_groups_exactly_what_the_epsilon_compare_grouped() {
+        assert_eq!(strike_key(25_000.0), strike_key(25_000.0));
+        // A float that is not bit-identical but IS the same strike.
+        assert_eq!(strike_key(0.1 + 0.2), strike_key(0.3));
+        // Genuinely different strikes must never collide.
+        assert_ne!(strike_key(25_000.0), strike_key(25_050.0));
+        // One paise apart is a real difference and must stay distinct.
+        assert_ne!(strike_key(100.00), strike_key(100.01));
+    }
+
+    /// A garbage strike must land far away and sort last, never alias onto a
+    /// real strike's bucket and silently join its legs.
+    #[test]
+    fn strike_key_sends_unusable_values_far_away_instead_of_aliasing() {
+        assert_eq!(strike_key(f64::NAN), i64::MAX);
+        assert_eq!(strike_key(f64::INFINITY), i64::MAX);
+        assert_ne!(strike_key(f64::NAN), strike_key(25_000.0));
+    }
+
+    /// Behaviour parity: the same candidates must produce the same selection
+    /// after the quadratic scans were replaced. Ordering is part of it —
+    /// depth-20 fills nearest-ATM first, and an index that reordered legs
+    /// would change which contracts make the 250 envelope.
+    #[test]
+    fn the_indexed_ranking_is_deterministic_and_nearest_atm_first() {
+        let mut cands = Vec::new();
+        for i in 0..30i64 {
+            #[expect(clippy::cast_precision_loss, reason = "small test strikes")]
+            let strike = 24_000.0 + (i as f64) * 50.0;
+            cands.push(candidate("NIFTY", 1000 + i, strike, "CE"));
+            cands.push(candidate("NIFTY", 2000 + i, strike, "PE"));
+        }
+        let a = select_depth_universe(&cands);
+        let b = select_depth_universe(&cands);
+        assert_eq!(
+            a.depth_20, b.depth_20,
+            "selection must be deterministic — a HashMap in the grouping must \
+             never leak its iteration order into the result"
+        );
+        assert_eq!(a.depth_200, b.depth_200);
+        assert!(!a.depth_20.is_empty());
     }
 
     /// Two of the three underlyings map to `NseFno`, so a default-to-NseFno
