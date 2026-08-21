@@ -748,8 +748,8 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // rationing and why it was not attempted blind.
     assert_eq!(
         names.len(),
-        74,
-        "Z+ L2 VERIFY ratchet: expected exactly 74 names in the MAIN EMF \
+        76,
+        "Z+ L2 VERIFY ratchet: expected exactly 76 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \

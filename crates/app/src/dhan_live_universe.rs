@@ -283,6 +283,54 @@ pub fn select_live_universe(
 // the writer never produces, finds nothing, falls back, and the result is
 // indistinguishable from "the master resolved nothing usable".
 
+/// Why a daily artifact could not be turned into a master list.
+///
+/// Two variants rather than one because they mean different things and want
+/// different triage: `Unreadable` is "the rider never wrote the file" (a
+/// scheduling, timing or permissions problem) and `Unparseable` is "the rider
+/// wrote something wrong" (a producer bug). Collapsing them into one reason
+/// label would send both to the same runbook, and only one of them is ours.
+enum ArtifactFailure {
+    Unreadable(String),
+    Unparseable(String),
+}
+
+impl ArtifactFailure {
+    /// The counter label when the FULL master artifact failed. These two
+    /// strings predate the narrowed set and are kept verbatim so an existing
+    /// alarm or dashboard filter on them keeps matching.
+    const fn mapping_reason(&self) -> &'static str {
+        match self {
+            Self::Unreadable(_) => "artifact_unreadable",
+            Self::Unparseable(_) => "artifact_unparseable",
+        }
+    }
+
+    /// The counter label when the NARROWED F&O artifact failed. Distinct from
+    /// `mapping_reason` because the consequence is the opposite: this one
+    /// widens the session, the other one collapses it to four instruments.
+    const fn fno_reason(&self) -> &'static str {
+        match self {
+            Self::Unreadable(_) => "fno_artifact_unreadable",
+            Self::Unparseable(_) => "fno_artifact_unparseable",
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Unreadable(d) | Self::Unparseable(d) => d,
+        }
+    }
+}
+
+/// Read one daily artifact and parse it, keeping the read failure and the
+/// parse failure distinguishable all the way to the log line.
+fn read_master_artifact(path: &std::path::Path) -> Result<Vec<MasterEntry>, ArtifactFailure> {
+    let body = std::fs::read_to_string(path)
+        .map_err(|err| ArtifactFailure::Unreadable(err.to_string()))?;
+    parse_mapping_artifact(&body).map_err(ArtifactFailure::Unparseable)
+}
+
 /// Counter: master sourcing was REQUESTED but did not take effect, by reason.
 ///
 /// Non-zero means the live lane is subscribing the 4 hardcoded index SIDs while
@@ -340,35 +388,68 @@ pub fn resolve_live_universe(
         return index_universe;
     }
 
-    let path = crate::dhan_universe::mapping_artifact_path(date_ist);
-    let body = match std::fs::read_to_string(&path) {
-        Ok(b) => b,
-        Err(err) => {
-            record_master_sourcing_fallback("artifact_unreadable", index_universe.len());
-            tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                ?err,
-                path = %path.display(),
-                "live universe: today's mapping artifact is unreadable — falling back to \
-                 the index universe. Master sourcing was REQUESTED and is NOT in effect; \
-                 the subscribed set is 4 instruments, not the widened set."
-            );
-            return index_universe;
+    // The narrowed spot universe (operator 2026-08-21): NSE indices + the F&O
+    // stock underlyings, instead of every constituent the master resolves. It
+    // is read from its OWN daily artifact, written by the same rider, in the
+    // SAME shape — so `parse_mapping_artifact`, already hardened to fail loud
+    // on garbage, stays the one parser for both files.
+    //
+    // An unreadable or unparseable F&O artifact falls THROUGH to the full
+    // master, loudly, rather than to the index universe. That direction is
+    // deliberate: the wide set is a superset, so no coverage is silently lost,
+    // and if it does not fit the authorized envelope the capacity refusal below
+    // reports it. The reverse — quietly narrowing when a file is missing —
+    // would drop roughly 4,200 instruments with nothing anywhere to say so.
+    let mut master: Option<Vec<MasterEntry>> = None;
+    if cfg.spot_universe_fno_underlyings_only {
+        let fno_path = crate::dhan_universe::fno_underlying_artifact_path(date_ist);
+        match read_master_artifact(&fno_path) {
+            Ok(m) => master = Some(m),
+            Err(failure) => {
+                // Counted but NOT gauged: this is not the final subscribed size,
+                // it is a widening of what was asked for, and the success path
+                // below publishes the real number.
+                metrics::counter!(
+                    MASTER_SOURCING_FALLBACK_COUNTER,
+                    "reason" => failure.fno_reason()
+                )
+                .increment(1);
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    detail = failure.detail(),
+                    path = %fno_path.display(),
+                    "live universe: the narrowed spot set (indices + F&O underlyings) was \
+                     REQUESTED but today's F&O artifact is unusable — falling through to the \
+                     full master-sourced set. This session subscribes MORE than was asked \
+                     for, never less."
+                );
+            }
         }
-    };
+    }
+    let narrowed = master.is_some();
 
-    let master = match parse_mapping_artifact(&body) {
-        Ok(m) => m,
-        Err(reason) => {
-            record_master_sourcing_fallback("artifact_unparseable", index_universe.len());
-            tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                reason,
-                path = %path.display(),
-                "live universe: mapping artifact did not parse — falling back to the index \
-                 universe. Master sourcing was REQUESTED and is NOT in effect."
-            );
-            return index_universe;
+    let master = match master {
+        Some(m) => m,
+        None => {
+            let path = crate::dhan_universe::mapping_artifact_path(date_ist);
+            match read_master_artifact(&path) {
+                Ok(m) => m,
+                Err(failure) => {
+                    record_master_sourcing_fallback(failure.mapping_reason(), index_universe.len());
+                    tracing::error!(
+                        code =
+                            tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                .code_str(),
+                        detail = failure.detail(),
+                        path = %path.display(),
+                        "live universe: today's mapping artifact is unusable — falling back \
+                         to the index universe. Master sourcing was REQUESTED and is NOT in \
+                         effect; the subscribed set is the index universe, not the widened \
+                         set."
+                    );
+                    return index_universe;
+                }
+            }
         }
     };
 
@@ -385,6 +466,11 @@ pub fn resolve_live_universe(
             tracing::info!(
                 instruments = selection.instruments.len(),
                 master_entries = master.len(),
+                spot_universe = if narrowed {
+                    "fno_underlyings"
+                } else {
+                    "full_master"
+                },
                 refused_zero_id = selection.refused_zero_id,
                 refused_unknown_segment = selection.refused_unknown_segment,
                 deduped = selection.deduped,
@@ -398,6 +484,11 @@ pub fn resolve_live_universe(
             tracing::error!(
                 code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                 master_entries = master.len(),
+                spot_universe = if narrowed {
+                    "fno_underlyings"
+                } else {
+                    "full_master"
+                },
                 refused_zero_id = selection.refused_zero_id,
                 refused_unknown_segment = selection.refused_unknown_segment,
                 deduped = selection.deduped,
@@ -597,9 +688,18 @@ mod tests {
         );
     }
 
-    /// `plan_pool` refuses the ENTIRE pool when a set does not fit, so an
-    /// oversized set would take the main feed down. Falling back keeps the feed
-    /// alive; truncating to fit would silently subscribe an arbitrary subset.
+    /// Over capacity, THIS function returns the index universe — the live set
+    /// collapses to the index count rather than dialing an oversize pool.
+    /// Falling back keeps the feed alive; truncating to fit would silently
+    /// subscribe an arbitrary subset, which is the outcome this pins against.
+    ///
+    /// CORRECTED 2026-08-21: this comment used to credit `plan_pool` with
+    /// refusing the whole pool. `plan_pool` does that for sets that REACH it —
+    /// but an oversize set never does, because the arm under test returns
+    /// first. Same behaviour, wrong mechanism named, and the misattribution
+    /// (repeated in `MAX_DAILY_UNIVERSE_SIZE`'s own docs) produced a false
+    /// CRITICAL audit finding. The collapse is alarmed via
+    /// `tv_dhan_live_universe_fallback_total`.
     #[test]
     fn test_select_live_universe_falls_back_whole_when_over_the_envelope() {
         let master: Vec<MasterEntry> = (1..=10).map(|i| entry(1000 + i, 1)).collect();
@@ -654,6 +754,75 @@ mod tests {
             path.to_string_lossy(),
             "data/instrument-cache/dhan-nse-mapping-2026-08-12.json"
         );
+    }
+
+    #[test]
+    fn artifact_failure_labels_name_the_file_and_the_kind() {
+        let unreadable = ArtifactFailure::Unreadable("no such file".to_owned());
+        let unparseable = ArtifactFailure::Unparseable("not JSON".to_owned());
+
+        // The two artifacts get DIFFERENT labels for the same failure kind,
+        // because the consequence is opposite: a broken F&O artifact widens
+        // the session, a broken mapping artifact collapses it to the index
+        // universe. One shared label would hide that on every dashboard.
+        assert_eq!(unreadable.mapping_reason(), "artifact_unreadable");
+        assert_eq!(unreadable.fno_reason(), "fno_artifact_unreadable");
+        assert_eq!(unparseable.mapping_reason(), "artifact_unparseable");
+        assert_eq!(unparseable.fno_reason(), "fno_artifact_unparseable");
+
+        // And the two kinds stay distinguishable within each artifact — a
+        // file the rider never wrote and a file the rider wrote wrong are
+        // different problems with different owners.
+        assert_ne!(unreadable.mapping_reason(), unparseable.mapping_reason());
+        assert_ne!(unreadable.fno_reason(), unparseable.fno_reason());
+
+        assert_eq!(unreadable.detail(), "no such file");
+        assert_eq!(unparseable.detail(), "not JSON");
+    }
+
+    #[test]
+    fn read_master_artifact_separates_missing_from_malformed() {
+        let dir = std::env::temp_dir().join("tv-read-master-artifact-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let missing = dir.join("absent.json");
+        let _ = std::fs::remove_file(&missing);
+        assert!(
+            matches!(
+                read_master_artifact(&missing),
+                Err(ArtifactFailure::Unreadable(_))
+            ),
+            "a file the rider never wrote must read as Unreadable, never as an empty list"
+        );
+
+        let malformed = dir.join("malformed.json");
+        std::fs::write(&malformed, "{\"resolved\":3}").expect("write");
+        assert!(
+            matches!(
+                read_master_artifact(&malformed),
+                Err(ArtifactFailure::Unparseable(_))
+            ),
+            "a body with no `mappings` array must fail LOUD, not silently resolve to zero \
+             instruments — an empty universe is what falls back, and it must say why"
+        );
+
+        let good = dir.join("good.json");
+        std::fs::write(
+            &good,
+            "{\"count\":1,\"mappings\":[{\"security_id\":11536,\"exchange_segment\":1}]}",
+        )
+        .expect("write");
+        assert_eq!(
+            read_master_artifact(&good).ok(),
+            Some(vec![MasterEntry {
+                security_id: 11536,
+                exchange_segment_code: 1,
+            }]),
+            "the F&O artifact and the mapping artifact share one shape and one parser"
+        );
+
+        let _ = std::fs::remove_file(&malformed);
+        let _ = std::fs::remove_file(&good);
     }
 }
 

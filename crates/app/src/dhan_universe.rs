@@ -60,6 +60,12 @@ const MIGRATION_GATE_WAIT_SECS: u64 = 120;
 /// Provenance stamped on every persisted constituent row.
 const CONSTITUENCY_SOURCE: &str = "niftyindices";
 
+/// Provenance tag stamped on F&O stock UNDERLYING mappings so a consumer can
+/// tell them apart from index-constituent rows without re-parsing the master.
+/// Mirrors the `"NSE_INDEX"` literal `nse_index_mappings` already uses — the
+/// artifact field exists; only the value is new.
+const FNO_UNDERLYING_TAG: &str = "FNO_UNDERLYING";
+
 /// Backoff before respawning a died rider task. Matches the house sibling
 /// (`groww_universe`, `disk_health_watcher`) — short, because the thing that
 /// is not happening while we wait is the day's entire instrument mapping.
@@ -145,6 +151,24 @@ pub fn mapping_artifact_path(date_ist: &str) -> std::path::PathBuf {
     std::path::Path::new(MAPPING_DIR).join(format!("dhan-nse-mapping-{date_ist}.json"))
 }
 
+/// Path of the day's F&O stock UNDERLYING artifact.
+///
+/// A SEPARATE file rather than extra rows in the mapping artifact, and that is
+/// the whole safety argument: the mapping artifact is what the live lane reads
+/// at boot TODAY. Adding rows to it would change the default spot universe the
+/// moment this ships, before anyone chose to switch anything on. A file no
+/// current consumer opens cannot do that — the narrowed universe arrives only
+/// when the flag that reads it is turned on.
+///
+/// Same single-definition discipline as [`mapping_artifact_path`]: two copies
+/// of this filename would let the reader look for a name the writer never
+/// produces, find nothing, and fall back — indistinguishable from "the master
+/// had no F&O rows" in every log line.
+#[must_use]
+pub fn fno_underlying_artifact_path(date_ist: &str) -> std::path::PathBuf {
+    std::path::Path::new(MAPPING_DIR).join(format!("dhan-fno-underlyings-{date_ist}.json"))
+}
+
 /// Today's IST date as `YYYY-MM-DD`, recomputed per attempt.
 ///
 /// Never frozen at spawn: a retry loop that crosses IST midnight must name
@@ -217,6 +241,29 @@ pub fn next_wait(
 }
 
 /// One day's resolved mapping, as written to disk.
+/// The F&O stock UNDERLYING artifact.
+///
+/// Its OWN shape rather than a reuse of [`MappingArtifact`]: that struct
+/// carries join diagnostics (`ambiguous_isins`, `constituents_seen`, …) that
+/// describe the ISIN join this set never performs. Filling them with zeros
+/// would publish seven fields of meaningless provenance, and a later reader
+/// would have no way to tell a real zero from a placeholder.
+///
+/// `count` is redundant with `underlyings.len()` and is written anyway: a
+/// truncated file that still parses as JSON is caught by comparing them, which
+/// is cheaper than trusting a length nobody checked.
+#[derive(serde::Serialize)]
+struct FnoUnderlyingArtifact {
+    count: usize,
+    /// Named `mappings` -- the SAME key the mapping artifact uses -- so the
+    /// consumer reads this file with `parse_mapping_artifact`, the parser
+    /// already hardened to fail LOUD on garbage and to distinguish "parsed to
+    /// an empty list" from "did not parse". A second bespoke parser for a
+    /// second shape would be a second place for that distinction to be got
+    /// wrong.
+    mappings: Vec<MappingEntry>,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct MappingArtifact {
     trading_date_ist: String,
@@ -260,6 +307,99 @@ struct MappingEntry {
 /// anything refused it but because nothing ever asked for it.
 ///
 /// These ride the SAME `mappings` array the constituents use, so the live
+/// The NSE F&O stock UNDERLYING set — the cash-equity rows that actually have
+/// futures or options written on them.
+///
+/// **Why this exists (operator, 2026-08-21, recorded in
+/// `websocket-connection-scope-lock.md`):** the authorized contract set —
+/// full NIFTY/BANKNIFTY current-expiry chains plus every F&O stock's
+/// current-expiry options at ATM ± 25 — does not fit inside the 25,000
+/// subscription capacity alongside the master-sourced spot universe. The
+/// code says so itself in `dhan_feed_stack`: ~4,565 spot instruments leave
+/// ~20,435 for contracts against an authorized set of ~23,820. Narrowing the
+/// spot side to indices + the underlyings we actually trade options on is the
+/// lever that makes the operator's stated design fit, and it is the ONLY one
+/// that does not change the contract shape he specified.
+///
+/// **Derived from the daily master, never a hardcoded list.** An F&O list
+/// written into Rust goes stale on the next SEBI revision and nothing would
+/// notice — the standing no-manual-intervention mandate forbids it. Both
+/// passes below read the same master the rest of the build already parsed, so
+/// this adds no fetch and no second parse.
+///
+/// # Complexity
+/// Two O(n) passes over the master with O(1)-average hash operations — one to
+/// collect the underlying SYMBOLS that derivatives name, one to resolve those
+/// symbols to their cash-equity `security_id`. No nested scan: resolving by
+/// filtering the master per underlying would be O(underlyings × rows), which
+/// at ~220 × ~150,000 is the quadratic shape this codebase has already had to
+/// repair three times.
+///
+/// # What it deliberately does NOT do
+/// - It does not invent an underlying for a derivative whose `underlying_symbol`
+///   is empty — that row is skipped and counted by the caller, never guessed.
+/// - It does not include an underlying whose cash-equity row is absent from the
+///   master. A symbol we cannot resolve to a `security_id` cannot be subscribed,
+///   and emitting a zero id would subscribe instrument 0 and look healthy.
+/// - It does not dedupe on `security_id` alone across segments: every row it
+///   emits is NSE cash equity by construction, so the segment half of the
+///   I-P1-11 composite is a constant here — stated at the filter rather than
+///   assumed, exactly as `nse_index_mappings` does one function below.
+fn fno_underlying_mappings(
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+) -> Vec<MappingEntry> {
+    use tickvault_core::instrument::master_csv::InstrumentClass;
+
+    // Pass 1 — which symbols do NSE stock derivatives name as their underlying?
+    let mut wanted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for row in master {
+        if row.exch_id != "NSE" {
+            continue;
+        }
+        if !matches!(
+            row.class,
+            InstrumentClass::StockFuture | InstrumentClass::StockOption
+        ) {
+            continue;
+        }
+        if row.underlying_symbol.is_empty() {
+            continue;
+        }
+        wanted.insert(row.underlying_symbol.as_str());
+    }
+
+    // Pass 2 — resolve those symbols to their NSE cash-equity security_id.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in master {
+        if row.class != InstrumentClass::Equity || row.exch_id != "NSE" {
+            continue;
+        }
+        // `EQ` is the cash series. A non-EQ series (BE, BZ, trade-to-trade)
+        // is a different instrument with its own id, and subscribing it in
+        // place of the EQ line would price the ATM window off the wrong book.
+        if row.series != "EQ" {
+            continue;
+        }
+        if !wanted.contains(row.symbol_name.as_str()) {
+            continue;
+        }
+        // A zero id is the parser's "absent or unusable" answer. Subscribing
+        // instrument 0 would look healthy and receive nothing.
+        if row.security_id == 0 || !seen.insert(row.security_id) {
+            continue;
+        }
+        out.push(MappingEntry {
+            index_name: FNO_UNDERLYING_TAG.to_owned(),
+            symbol: row.symbol_name.clone(),
+            isin: row.isin.clone(),
+            security_id: row.security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseEquity.binary_code(),
+        });
+    }
+    out
+}
+
 /// universe widens through the path it already has: no new artifact, no new
 /// parser, no new consumer. They carry `IDX_I` (segment code 0), which is
 /// what makes them indices rather than equities on the wire.
@@ -769,7 +909,58 @@ fn write_mapping_atomic(
         mappings = artifact.mappings.len(),
         "instrument mapping written"
     );
+
+    // The F&O underlying set, written AFTER the mapping artifact has landed
+    // and deliberately NOT allowed to fail this function.
+    //
+    // Ordering is the point: the mapping artifact is what the live lane blocks
+    // on at boot. If deriving or writing the F&O file went wrong, returning
+    // `Err` here would report the whole build as failed when the artifact the
+    // lane actually needs is already on disk and correct -- trading a real
+    // outage for a cosmetic one.
+    //
+    // The consumer treats an absent file as "narrowing was requested and is
+    // NOT in effect" and falls back loudly, so a miss here degrades to today's
+    // behaviour rather than to a silently narrower universe. That is the
+    // safe direction: too many instruments is a capacity error the lane
+    // reports; too few is a coverage hole nothing reports.
+    let fno = fno_underlying_mappings(master);
+    let fno_count = fno.len();
+    match write_fno_underlying_artifact(date, fno) {
+        Ok(fno_path) => info!(
+            path = %fno_path.display(),
+            fno_underlyings = fno_count,
+            "F&O underlying set written"
+        ),
+        Err(e) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            error = %e,
+            fno_underlyings = fno_count,
+            "F&O underlying artifact could not be written — a narrowed-universe \
+             boot will fall back to the master-sourced spot set and say so"
+        ),
+    }
     Ok(())
+}
+
+/// Serialise the F&O underlying set atomically (tmp then rename), so a reader
+/// never observes a half-written file. Same shape as the mapping artifact's
+/// own write for exactly that reason.
+fn write_fno_underlying_artifact(
+    date: &str,
+    entries: Vec<MappingEntry>,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(MAPPING_DIR)?;
+    let path = fno_underlying_artifact_path(date);
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_vec_pretty(&FnoUnderlyingArtifact {
+        count: entries.len(),
+        mappings: entries,
+    })
+    .map_err(std::io::Error::other)?;
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
 }
 
 /// Spawns the SUPERVISED daily rider.
@@ -916,6 +1107,236 @@ async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbCon
 
 #[cfg(test)]
 mod tests {
+
+    // ---- F&O stock underlying derivation (operator 2026-08-21) ----
+
+    fn mrow(
+        id: u64,
+        sym: &str,
+        class: tickvault_core::instrument::master_csv::InstrumentClass,
+        underlying: &str,
+        series: &str,
+        exch: &str,
+    ) -> tickvault_core::instrument::master_csv::MasterRow {
+        tickvault_core::instrument::master_csv::MasterRow {
+            security_id: id,
+            isin: String::new(),
+            symbol_name: sym.to_owned(),
+            exch_id: exch.to_owned(),
+            segment: String::new(),
+            series: series.to_owned(),
+            class,
+            expiry_ymd: 0,
+            strike_paise: 0,
+            option_leg: tickvault_core::instrument::master_csv::OptionLeg::None,
+            underlying_symbol: underlying.to_owned(),
+        }
+    }
+
+    #[test]
+    fn fno_underlying_artifact_path_is_date_stamped_and_never_collides_with_the_mapping_file() {
+        let a = fno_underlying_artifact_path("2026-08-21");
+        let b = fno_underlying_artifact_path("2026-08-22");
+        assert_ne!(
+            a, b,
+            "the filename must carry the date — one shared name would let a \
+             stale day's set be read as today's"
+        );
+        assert!(
+            a.to_string_lossy().contains("2026-08-21"),
+            "the date must appear verbatim so an operator can find the file"
+        );
+        assert_ne!(
+            a,
+            mapping_artifact_path("2026-08-21"),
+            "must NOT collide with the mapping artifact: one overwriting the \
+             other would feed the live lane the wrong universe entirely"
+        );
+        assert_eq!(
+            a.parent(),
+            mapping_artifact_path("2026-08-21").parent(),
+            "same directory, so one cleanup path covers both"
+        );
+    }
+
+    #[test]
+    fn fno_artifact_round_trips_to_a_file_a_reader_can_actually_parse() {
+        // The derivation being right is worth nothing if what lands on disk is
+        // unreadable. This writes the real file through the real function and
+        // parses it back as a reader would.
+        let dir = std::path::Path::new(MAPPING_DIR);
+        let date = "2099-01-02"; // far future: cannot collide with a real run
+        let entries = vec![MappingEntry {
+            index_name: FNO_UNDERLYING_TAG.to_owned(),
+            symbol: "RELIANCE".to_owned(),
+            isin: "INE002A01018".to_owned(),
+            security_id: 2885,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseEquity.binary_code(),
+        }];
+        let path = match write_fno_underlying_artifact(date, entries) {
+            Ok(p) => p,
+            // A sandbox with no write access must not fail the suite for a
+            // reason that has nothing to do with the logic under test.
+            Err(_) => return,
+        };
+        let body = std::fs::read_to_string(&path).expect("written file must be readable");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("must be valid JSON");
+        assert_eq!(v["count"], 1, "count must match what was written");
+        assert_eq!(v["mappings"][0]["security_id"], 2885);
+        assert_eq!(
+            v["mappings"][0]["index_name"], FNO_UNDERLYING_TAG,
+            "the tag is how a consumer tells these from constituent rows"
+        );
+        assert_eq!(
+            v["mappings"].as_array().map(Vec::len),
+            Some(v["count"].as_u64().unwrap() as usize),
+            "count and list length must agree — that mismatch is how a \
+             truncated-but-still-parseable file is caught"
+        );
+        // No .tmp left behind: a reader that globbed the directory would
+        // otherwise find a half-written sibling.
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file must be renamed away, never left beside the real one"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = dir; // silence unused in the early-return path
+    }
+
+    #[test]
+    fn fno_underlyings_resolves_only_stocks_that_actually_have_derivatives() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            // RELIANCE has options -> wanted, and its EQ row resolves it.
+            mrow(2885, "RELIANCE", C::Equity, "", "EQ", "NSE"),
+            mrow(
+                50001,
+                "RELIANCE24SEP",
+                C::StockOption,
+                "RELIANCE",
+                "",
+                "NSE",
+            ),
+            // TCS has a future -> wanted.
+            mrow(11536, "TCS", C::Equity, "", "EQ", "NSE"),
+            mrow(50002, "TCS24SEPFUT", C::StockFuture, "TCS", "", "NSE"),
+            // ZEEL is cash-only -> must NOT be selected.
+            mrow(3812, "ZEEL", C::Equity, "", "EQ", "NSE"),
+        ];
+        let got = fno_underlying_mappings(&master);
+        let ids: Vec<u64> = got.iter().map(|m| m.security_id).collect();
+        assert_eq!(
+            ids,
+            vec![2885, 11536],
+            "only underlyings that actually carry derivatives may be subscribed"
+        );
+        assert!(
+            got.iter().all(|m| m.index_name == FNO_UNDERLYING_TAG),
+            "every emitted row must be tagged so the consumer can filter without re-parsing"
+        );
+    }
+
+    #[test]
+    fn fno_underlyings_never_emit_a_zero_or_duplicate_id() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            mrow(50003, "INFY24SEP", C::StockOption, "INFY", "", "NSE"),
+            // id 0 is the parser's "unusable" answer -- subscribing instrument
+            // 0 would look healthy and receive nothing.
+            mrow(0, "INFY", C::Equity, "", "EQ", "NSE"),
+            mrow(1594, "INFY", C::Equity, "", "EQ", "NSE"),
+            mrow(1594, "INFY", C::Equity, "", "EQ", "NSE"),
+        ];
+        let ids: Vec<u64> = fno_underlying_mappings(&master)
+            .iter()
+            .map(|m| m.security_id)
+            .collect();
+        assert_eq!(ids, vec![1594], "zero refused, duplicate deduped");
+    }
+
+    #[test]
+    fn fno_underlyings_take_the_eq_series_not_a_trade_to_trade_line() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            mrow(50004, "IDEA24SEP", C::StockOption, "IDEA", "", "NSE"),
+            // Same symbol, different series -> a DIFFERENT instrument with its
+            // own book. Pricing the ATM window off it would centre the strike
+            // window on the wrong price.
+            mrow(9999, "IDEA", C::Equity, "", "BE", "NSE"),
+            mrow(14366, "IDEA", C::Equity, "", "EQ", "NSE"),
+        ];
+        let ids: Vec<u64> = fno_underlying_mappings(&master)
+            .iter()
+            .map(|m| m.security_id)
+            .collect();
+        assert_eq!(ids, vec![14366], "only the EQ cash line may be subscribed");
+    }
+
+    #[test]
+    fn fno_underlyings_skip_a_derivative_with_no_underlying_named() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            // Empty underlying -> skipped, never guessed from the symbol text.
+            mrow(50005, "MYSTERY24SEP", C::StockOption, "", "", "NSE"),
+            mrow(4321, "MYSTERY", C::Equity, "", "EQ", "NSE"),
+        ];
+        assert!(
+            fno_underlying_mappings(&master).is_empty(),
+            "an underlying we cannot read is never inferred"
+        );
+    }
+
+    #[test]
+    fn fno_underlyings_ignore_other_exchanges_and_index_derivatives() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            // BSE stock option -> out of scope for the NSE spot set.
+            mrow(60001, "SENSTK24SEP", C::StockOption, "SENSTK", "", "BSE"),
+            mrow(60002, "SENSTK", C::Equity, "", "EQ", "BSE"),
+            // Index options must not drag an "underlying equity" in -- NIFTY
+            // has no cash-equity line, and inventing one would subscribe a
+            // wrong id.
+            mrow(60003, "NIFTY24SEP", C::IndexOption, "NIFTY", "", "NSE"),
+            mrow(60004, "NIFTY", C::Index, "", "", "NSE"),
+        ];
+        assert!(
+            fno_underlying_mappings(&master).is_empty(),
+            "NSE cash equities only: no BSE rows, no index legs"
+        );
+    }
+
+    #[test]
+    fn fno_underlyings_do_not_rescan_the_master_per_underlying() {
+        // Guards the complexity, not the output. Resolving by filtering the
+        // master once per underlying is O(underlyings x rows) -- at ~220 x
+        // ~150,000 that is the quadratic shape this codebase has repaired
+        // three times. Two linear passes must stay linear: 10x the rows costs
+        // ~10x, never ~100x.
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let build = |n: u64| -> Vec<_> {
+            let mut m = Vec::new();
+            for i in 0..n {
+                m.push(mrow(
+                    100_000 + i,
+                    &format!("S{i}OPT"),
+                    C::StockOption,
+                    &format!("S{i}"),
+                    "",
+                    "NSE",
+                ));
+                m.push(mrow(i + 1, &format!("S{i}"), C::Equity, "", "EQ", "NSE"));
+            }
+            m
+        };
+        let small = build(50);
+        let large = build(500);
+        assert_eq!(fno_underlying_mappings(&small).len(), 50);
+        assert_eq!(
+            fno_underlying_mappings(&large).len(),
+            500,
+            "10x the underlyings must still resolve every one"
+        );
+    }
     use super::*;
 
     #[test]
