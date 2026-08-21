@@ -80,12 +80,52 @@ fn the_lane_down_alarm_can_actually_see_a_dead_process() {
 #[test]
 fn a_breaching_alarm_is_disarmed_outside_the_trading_window() {
     let gate = code_only(GATE);
+    let lane = code_only(LIVE_LANE);
+
+    // GENERALISED 2026-08-21. This used to name `dhan_live_lane_down` and only
+    // that alarm, so the second breaching alarm to arrive
+    // (`dhan_no_ticks_flowing`) would have been ungated and silently paged
+    // every evening — the guard would have passed while the thing it exists to
+    // prevent happened. It now DERIVES the set from the terraform, so it bites
+    // for every future breaching alarm without anyone remembering to add it.
+    let mut checked = 0usize;
+    for block in lane
+        .split("resource \"aws_cloudwatch_metric_alarm\" \"")
+        .skip(1)
+    {
+        let Some(name_end) = block.find('"') else {
+            continue;
+        };
+        let name = &block[..name_end];
+        // Bound the scan to this resource block, so a later block's
+        // `breaching` cannot be attributed to this alarm.
+        let body_end = block.find("\n}").unwrap_or(block.len());
+        let body = &block[..body_end];
+        if !body.contains(r#"treat_missing_data = "breaching""#) {
+            continue;
+        }
+        checked += 1;
+
+        assert!(
+            gate.contains(&format!("aws_cloudwatch_metric_alarm.{name}.alarm_name")),
+            "`{name}` treats missing data as breaching, so it MUST appear in the \
+             market-hours gate's ALARM_NAMES list. Without the gate it pages every evening \
+             the box shuts down and all weekend — which is worse than the blindness it was \
+             meant to fix, because it teaches the operator to ignore the alarm."
+        );
+        assert!(
+            body.contains("actions_enabled = false"),
+            "`{name}` is breaching and gated, but does not set `actions_enabled = false`. \
+             The gate Lambda ENABLES actions during the session; it cannot disarm an alarm \
+             that ships armed, so the nightly page would return."
+        );
+    }
+
     assert!(
-        gate.contains("aws_cloudwatch_metric_alarm.dhan_live_lane_down.alarm_name"),
-        "dhan_live_lane_down treats missing data as breaching, so it MUST be in the \
-         market-hours gate's ALARM_NAMES list. Without the gate it pages every evening the \
-         box shuts down — which is worse than the blindness it was meant to fix, because it \
-         teaches the operator to ignore the alarm."
+        checked >= 2,
+        "expected at least two breaching live-lane alarms to check, found {checked}. \
+         Either the extraction broke or a breaching alarm was removed — both need a look, \
+         because a vacuous pass here is exactly the false-OK this guard exists to stop."
     );
 }
 
