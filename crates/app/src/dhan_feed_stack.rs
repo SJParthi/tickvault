@@ -1713,6 +1713,9 @@ pub struct DrainCounters {
     depth_disconnects: metrics::Counter,
     depth_length_mismatch: metrics::Counter,
     truncated: metrics::Counter,
+    /// Bytes abandoned mid-frame by the two give-up arms. See
+    /// [`DRAIN_ABANDONED_BYTES_COUNTER`] for why this is bytes and not packets.
+    abandoned_bytes: metrics::Counter,
     xverify_ran: metrics::Counter,
     xverify_failed: metrics::Counter,
     xverify_no_token: metrics::Counter,
@@ -1774,6 +1777,7 @@ pub fn counters() -> &'static DrainCounters {
         depth_disconnects: metrics::counter!(DEPTH_COUNTER, "outcome" => "disconnects"),
         depth_length_mismatch: metrics::counter!(DEPTH_COUNTER, "outcome" => "length_mismatch"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
+        abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
         xverify_ran: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "ran"),
         xverify_failed: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed"),
         xverify_no_token: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token"),
@@ -2078,6 +2082,30 @@ const _: () = assert!(
 /// them.
 pub const DRAIN_FRAMES_COUNTER: &str = "tv_dhan_feed_drain_frames_total";
 
+/// Counter: bytes of a frame ABANDONED without being decoded.
+///
+/// A single WebSocket message stacks up to ~1,600 packets. When the walk hits
+/// an unrecognised response code or a trailing partial packet it stops — and
+/// stopping is the RIGHT call, because resynchronising on a guess would
+/// fabricate ticks out of misaligned bytes, which is worse than losing them.
+///
+/// What was wrong was the ACCOUNTING. Both arms incremented the frame counter
+/// by ONE, so a frame that dropped 1,500 packets and a frame that dropped one
+/// reported the same number, and an operator reading `unparseable = 1` would
+/// reasonably conclude a single bad packet. This records the magnitude the
+/// outcome counter cannot: the remaining byte count at the moment the walk
+/// gave up. Non-zero here means ticks were lost and says roughly how many.
+///
+/// Deliberately BYTES, not packets: the packet count of the remainder is
+/// unknowable — that is exactly what "we could not decode it" means — and a
+/// divide-by-typical-size estimate would be a fabricated number in a counter
+/// whose whole purpose is to stop fabrication.
+///
+/// Not EMF-selected today, so it is visible on `/metrics` and not in
+/// CloudWatch. Stated rather than assumed: shipping it is a cost decision
+/// (~$0.30/mo) that belongs with the alarm that would read it.
+pub const DRAIN_ABANDONED_BYTES_COUNTER: &str = "tv_dhan_feed_abandoned_bytes_total";
+
 /// Gauge: rows appended to the ILP buffer but not yet flushed to QuestDB.
 /// A buffer is a staging area, not storage — a rising value means rows are
 /// accumulating in the process rather than landing in the database.
@@ -2321,6 +2349,17 @@ async fn run_frame_drain(
     depth_budget: Arc<RingByteBudget>,
     shutdown: Arc<tokio::sync::Notify>,
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    // Instruments that attach AFTER boot — the ~20,000 futures and option
+    // contracts the late-attach pass dials once a price exists.
+    //
+    // They need a channel because by the time they are selected, the ingest
+    // belongs to THIS task. Before this existed, only the boot spot universe
+    // was ever seeded, so a contract that subscribed and then silently
+    // delivered nothing was invisible to the gap detector: there is no
+    // payload to count, no parse to fail and no error to log, so absence
+    // against a seeded key is the ONLY evidence that exists. Roughly 80% of
+    // the authorized universe had no silence detection at all.
+    mut seed_rx: tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>,
 ) -> DrainOutcome {
     // Whether this drain has ever seen a frame. Owns the up-gauge's rising
     // edge — see the first-frame arm below and the spawn site's correction.
@@ -2593,6 +2632,41 @@ async fn run_frame_drain(
             // The detector's read-out. Until 2026-08-12 the lane fed this
             // detector on every tick and never asked it anything, so a
             // subscribe that silently did not take produced no signal at all.
+            // Seed instruments that attached after boot. Placed in the drain
+            // because the drain owns the ingest, and NOT biased ahead of
+            // frames: seeding is bookkeeping, and a queued frame is data.
+            //
+            // Deliberately seeds on the SUBSCRIBE, not on the first tick. A
+            // detector that learned instruments from arriving ticks could
+            // never report the one failure that matters here — an instrument
+            // that arrives never.
+            maybe_seed = seed_rx.recv() => {
+                if let Some(batch) = maybe_seed {
+                    let now_millis = u64::try_from(
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000,
+                    )
+                    .unwrap_or(0);
+                    // `seed` returns whether the slot allocator ACCEPTED the
+                    // instrument, not whether it was new -- a repeat seed is a
+                    // successful no-op. So this counts accepted, and a value
+                    // below `requested` means slots ran out.
+                    let mut added = 0usize;
+                    for inst in &batch {
+                        if ingest.seed(inst.security_id, inst.segment, now_millis) {
+                            added = added.saturating_add(1);
+                        }
+                    }
+                    info!(
+                        requested = batch.len(),
+                        seeded = added,
+                        tracked = ingest.tracked_instruments(),
+                        "late-attached instruments seeded into the silence detector"
+                    );
+                }
+                // A closed channel is NORMAL — the attach task finishes and
+                // drops its sender. `recv` then returns None forever, so this
+                // arm must not treat that as a reason to end the drain.
+            }
             _ = silence_timer.tick() => {
                 let now_millis = u64::try_from(
                     chrono::Utc::now().timestamp_millis().max(0)
@@ -2875,11 +2949,21 @@ pub fn drain_main_feed_frame(
             // than resynchronising on a guess, which would fabricate ticks.
             c.unparseable.increment(1);
             out.unparseable = out.unparseable.saturating_add(1);
+            // The outcome counter above says "a frame gave up". THIS says how
+            // much of it was thrown away, which is the number that decides
+            // whether this was one stray packet or most of a 1,600-packet
+            // message.
+            let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
+            c.abandoned_bytes.increment(abandoned);
+            out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         };
         let end = offset.saturating_add(len);
         if end > frame.bytes.len() {
             c.truncated.increment(1);
+            let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
+            c.abandoned_bytes.increment(abandoned);
+            out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         }
         match dispatch_frame(&frame.bytes[offset..end], received_at_nanos) {
@@ -3010,6 +3094,11 @@ pub struct FrameOutcome {
     /// unconditionally. (CORRECTED 2026-08-20: said "unless `[dhan_feed]
     /// persist_full_mode_depth` is on", a key that exists nowhere.)
     pub inline_depth_rows: u64,
+    /// Bytes of this frame the walk never decoded, because it hit an unknown
+    /// response code or a trailing partial packet and stopped rather than
+    /// guessing. Returned as well as counted so a test can assert the
+    /// magnitude — the whole reason this struct exists.
+    pub abandoned_bytes: u64,
 }
 
 /// What one depth frame produced.
@@ -4079,6 +4168,31 @@ fn ist_second_of_day_now() -> u32 {
 ///
 /// Returns 0 when the spot universe already used every connection: the correct
 /// answer is then "no contracts", not "squeeze them in somewhere".
+/// Which halves of the late attach still need dialing this iteration.
+///
+/// Extracted as a pure function because it IS the 2026-08-21 defect, and it is
+/// the only part of the attach testable without a live pool and a QuestDB. The
+/// pre-fix code could not even express the state this returns — a single
+/// boolean gated both halves, so "contracts are on the wire, depth still needs
+/// to dial" had no representation and the loop simply exited.
+///
+/// `pending` (see `stock_options_are_pending`) holds the CONTRACT half only.
+/// Depth must never be held by it: depth does not read spot prices, so waiting
+/// for a stock to print cannot make the option chain arrive any sooner.
+#[must_use]
+fn outstanding_halves(
+    depth_resolved: bool,
+    contracts_resolved: bool,
+    depth_done: bool,
+    contracts_done: bool,
+    pending: bool,
+) -> (bool, bool) {
+    (
+        contracts_resolved && !contracts_done && !pending,
+        depth_resolved && !depth_done,
+    )
+}
+
 #[must_use]
 fn remaining_main_feed_capacity(connections_used: usize) -> usize {
     let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
@@ -4191,7 +4305,7 @@ async fn attach_depth_when_available(
     // would be planned as if all 5 main-feed sockets were free and the pool
     // would be asked for a sixth. The 16-connection lock is arithmetic, not a
     // hope, and this is the term that keeps it so.
-    main_feed_connections_used: usize,
+    mut main_feed_connections_used: usize,
     // The boot-dialed spot connection's top-up channel, and the room left on
     // it. `None` when the boot dialed nothing (no spot universe) or when the
     // spot set already fills its connection.
@@ -4212,7 +4326,23 @@ async fn attach_depth_when_available(
     ws_audit_tx: tokio::sync::mpsc::Sender<
         tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
     >,
+    // Where late-attached instruments go to become VISIBLE to the silence
+    // detector. Without it, everything this task dials — the contracts and the
+    // depth legs, roughly 80% of the authorized universe — could subscribe and
+    // then deliver nothing at all, with no counter, no error, and no way for
+    // anyone to find out.
+    seed_tx: tokio::sync::mpsc::Sender<
+        Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+    >,
 ) {
+    // Publish a 0 for every contract-failure reason BEFORE the first attempt.
+    //
+    // The CloudWatch delta pipeline drops each series' first observed sample as
+    // its baseline. `record_contract_verdict` fires ONCE per session, so an
+    // un-pre-registered reason would have its first — and only — increment
+    // eaten, and the alarm would never see the defect it exists to catch.
+    crate::dhan_contract_universe::pre_register_contract_failure_counters();
+
     let mut attempts: u32 = 0;
     // Whether the PREVIOUS attempt resolved something dialable.
     //
@@ -4225,6 +4355,30 @@ async fn attach_depth_when_available(
     // "throw it away and dial nothing", or waiting for better would have
     // cost the session the coverage it already had.
     let mut last_had_instruments = false;
+    // Which half has already reached the wire. Set ONLY on a successful dial.
+    //
+    // # The 2026-08-21 defect these two booleans exist to end
+    //
+    // Depth and contracts shared ONE `anything_resolved` gate and ONE
+    // terminating `return`, so whichever half resolved FIRST closed the loop
+    // for BOTH. Contracts read `ticks` (filled from 09:15:00) and resolve
+    // ~09:15:30; depth reads `option_chain_1m` under a `ts >= today` filter
+    // that cannot match before the cadence leg's first fire at 09:16:00.
+    // Contracts therefore won that race every single session, the loop
+    // returned, and depth-20 + depth-200 never dialed at all — 10 authorized
+    // sockets dark, every day, while every alarm read healthy.
+    //
+    // They must be tracked rather than simply re-attempted: `pool.admit` is
+    // STATEFUL, so re-planning an already-dialed half consumes a second set of
+    // connection slots.
+    let mut contracts_done = false;
+    let mut depth_done = false;
+    // The contract overflow may be handed to the live spot connection exactly
+    // once. `SubscribeGuard::try_extend` refuses only PAST the per-connection
+    // cap — below it a second send silently DOUBLE-SUBSCRIBES the same
+    // instruments on a live socket, and Dhan answers an over-limit subscribe
+    // with 804 and drops the connection.
+    let mut spot_topup_used = false;
     let started = Instant::now();
     loop {
         // The deadline gates RETRIES, never the FIRST attempt.
@@ -4253,6 +4407,33 @@ async fn attach_depth_when_available(
 
         let out_of_time = past_hard_stop || past_deadline_and_window;
 
+        // A terminal stop that does NOT consult `last_had_instruments`.
+        //
+        // The give-up arm below deliberately keeps waiting while a half is
+        // still resolving. With the two halves now independent, one half can
+        // resolve every minute and fail to PLAN every minute — nothing would
+        // set `last_had_instruments` false, and the task would poll into the
+        // evening for contracts that will not trade again today.
+        if attempts > 0 && past_hard_stop {
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                attempts,
+                contracts_done,
+                depth_done,
+                "late-attach stopped at the 15:30 IST hard stop. Any half showing `false` \
+                 above never reached the wire and carries NO data for the rest of this \
+                 session."
+            );
+            // The counter, not just the log. Gated on the half that actually
+            // failed: contracts reaching the wire while only depth stayed dark
+            // is a DEPTH failure, and paging it as a contract failure would
+            // teach the operator to distrust the alarm.
+            if !contracts_done {
+                crate::dhan_contract_universe::record_contract_give_up();
+            }
+            return;
+        }
+
         if attempts > 0 && out_of_time && !last_had_instruments {
             error!(
                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
@@ -4272,14 +4453,42 @@ async fn attach_depth_when_available(
                  contract artifact. If `attempts` is small, this app started late — the chain \
                  leg publishes from 09:16 IST and cannot have run before the app did."
             );
+            // Same gate as the hard-stop arm above. Reaching here means
+            // NEITHER half ever yielded instruments, so contracts are
+            // necessarily incomplete -- checked anyway rather than assumed,
+            // because a later edit to the give-up predicate would otherwise
+            // silently turn this into a false page.
+            if !contracts_done {
+                crate::dhan_contract_universe::record_contract_give_up();
+            }
             return;
         }
         // Re-derived every attempt, never hoisted: this task can outlive an
         // IST midnight, and a hoisted date would then query yesterday forever.
         let today_date = crate::dhan_universe::today_ist_date();
         let today_nanos = crate::dhan_universe::ist_midnight_nanos(&today_date);
-        let selection =
-            crate::dhan_depth_universe::load_depth_universe(&questdb, today_nanos).await;
+        // Depth prefers the DAILY CONTRACT ARTIFACT over the option chain.
+        //
+        // Both yield the same thing — a contract `security_id` with a strike,
+        // an expiry and a leg — but they become available three minutes
+        // apart. The chain's first publish is compile-time asserted to
+        // 09:16:00 IST; the artifact is on disk before 08:30. Preferring the
+        // artifact is what lets depth-20 and depth-200 carry data from the
+        // 09:15 open rather than from 09:16:30.
+        //
+        // The chain remains the FALLBACK, not a rival: the artifact is
+        // written by a separate daily rider, and if that rider had a bad
+        // morning, late depth beats no depth.
+        let selection = match crate::dhan_depth_universe::load_depth_universe_from_master(
+            &questdb,
+            &today_date,
+            ymd_from_ist_date(&today_date),
+        )
+        .await
+        {
+            Some(from_artifact) => from_artifact,
+            None => crate::dhan_depth_universe::load_depth_universe(&questdb, today_nanos).await,
+        };
 
         // The contract universe rides the SAME retry loop, and that is not a
         // convenience — both wait on evidence that only exists after the open
@@ -4303,9 +4512,12 @@ async fn attach_depth_when_available(
 
         attempts = attempts.saturating_add(1);
 
-        let anything_resolved = !selection.depth_20.is_empty()
-            || !selection.depth_200.is_empty()
-            || !contracts.instruments.is_empty();
+        // TWO gates, not one. A single `anything_resolved` let whichever half
+        // resolved FIRST close the loop for BOTH — see `contracts_done` /
+        // `depth_done` above for why that emptied the depth pools every day.
+        let depth_resolved = !selection.depth_20.is_empty() || !selection.depth_200.is_empty();
+        let contracts_resolved = !contracts.instruments.is_empty();
+        let anything_resolved = depth_resolved || contracts_resolved;
         last_had_instruments = anything_resolved;
 
         // A selection whose stock options are merely PENDING a price is not
@@ -4329,136 +4541,239 @@ async fn attach_depth_when_available(
             );
         }
 
-        if anything_resolved && !pending {
-            // Upgrade LAST, immediately before dialing. `None` means every
-            // socket died and the ring closed while we waited — dialing into a
-            // closed ring would open sockets whose frames reach nothing.
+        let (dial_contracts, dial_depth) = outstanding_halves(
+            depth_resolved,
+            contracts_resolved,
+            depth_done,
+            contracts_done,
+            pending,
+        );
+
+        if dial_contracts || dial_depth {
+            // Upgrade LAST, immediately before dialing, and RE-upgraded on
+            // every dialing iteration. The two halves can now dial minutes
+            // apart, so a ring that closed between them has to be able to stop
+            // the second dial as well as the first.
             let Some(frame_tx) = frame_weak.upgrade() else {
                 warn!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     attempts,
+                    contracts_done,
+                    depth_done,
                     depth_20 = selection.depth_20.len(),
                     depth_200 = selection.depth_200.len(),
-                    "depth late-attach resolved its instruments but the frame ring had already \
-                     closed — the lane went dark while it waited. Refusing to dial sockets whose \
-                     frames would reach no consumer."
+                    "late-attach resolved its instruments but the frame ring had already \
+                     closed — the lane went dark while it waited. Refusing to dial sockets \
+                     whose frames would reach no consumer."
                 );
                 return;
             };
-            // Split the contracts: what the FREE connections can hold goes
-            // through the pool as usual; the remainder rides the top-up
-            // channel onto the already-live spot connection.
-            //
-            // The order matters and is deliberate. `select_contract_universe`
-            // returns futures and index options FIRST, then the ATM ladders,
-            // and it is the ladders that must reach the wire intact — so the
-            // OVERFLOW is taken from the tail, leaving the head to the pool.
-            // Taking the overflow from the head would scatter one underlying's
-            // ladder across two dial paths for no benefit.
-            let pool_room = remaining_main_feed_capacity(main_feed_connections_used);
-            let (pool_contracts, overflow): (&[SubscribeInstrument], &[SubscribeInstrument]) =
-                if contracts.instruments.len() > pool_room {
-                    contracts.instruments.split_at(pool_room)
-                } else {
-                    (contracts.instruments.as_slice(), &[])
-                };
 
-            if !overflow.is_empty() {
-                match spot_topup.as_ref() {
-                    Some((tx, _)) => {
-                        // A bounded send that CANNOT block the attach: the
-                        // connection task may be mid-frame, and waiting on it
-                        // here would stall the dial of every depth socket
-                        // behind a socket that is doing its job.
-                        match tx.try_send(overflow.to_vec()) {
-                            Ok(()) => info!(
-                                overflow = overflow.len(),
-                                pool_contracts = pool_contracts.len(),
-                                "contract overflow handed to the live spot connection — the \
-                                 slots stranded on it are what the ATM window was short of"
-                            ),
-                            Err(err) => error!(
-                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                                overflow = overflow.len(),
-                                %err,
-                                "the spot connection's top-up channel would not accept the \
-                                 contract overflow — those contracts are NOT subscribed this \
-                                 session. The pool-dialed contracts and depth are unaffected."
-                            ),
+            // ---- half 1: the CONTRACT half of the main feed ----
+            if dial_contracts {
+                // Split the contracts: what the FREE connections can hold goes
+                // through the pool as usual; the remainder rides the top-up
+                // channel onto the already-live spot connection.
+                //
+                // The order matters and is deliberate. `select_contract_universe`
+                // returns futures and index options FIRST, then the ATM ladders,
+                // and it is the ladders that must reach the wire intact — so the
+                // OVERFLOW is taken from the tail, leaving the head to the pool.
+                let pool_room = remaining_main_feed_capacity(main_feed_connections_used);
+                let (pool_contracts, overflow): (&[SubscribeInstrument], &[SubscribeInstrument]) =
+                    if contracts.instruments.len() > pool_room {
+                        contracts.instruments.split_at(pool_room)
+                    } else {
+                        (contracts.instruments.as_slice(), &[])
+                    };
+
+                // `spot_topup_used` is not belt-and-braces. The channel is a
+                // one-shot budget: `try_extend` refuses only PAST the
+                // per-connection cap, and below it a second send silently
+                // DOUBLE-SUBSCRIBES on a live socket. Dhan answers an
+                // over-limit subscribe with 804 and drops the connection.
+                if !overflow.is_empty() && !spot_topup_used {
+                    match spot_topup.as_ref() {
+                        Some((tx, _)) => {
+                            // A bounded send that CANNOT block the attach: the
+                            // connection task may be mid-frame, and waiting on
+                            // it here would stall the depth dial behind a
+                            // socket that is doing its job.
+                            match tx.try_send(overflow.to_vec()) {
+                                Ok(()) => {
+                                    spot_topup_used = true;
+                                    info!(
+                                        overflow = overflow.len(),
+                                        pool_contracts = pool_contracts.len(),
+                                        "contract overflow handed to the live spot connection \
+                                         — the slots stranded on it are what the ATM window \
+                                         was short of"
+                                    );
+                                }
+                                Err(err) => error!(
+                                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    overflow = overflow.len(),
+                                    %err,
+                                    "the spot connection's top-up channel would not accept \
+                                     the contract overflow — those contracts are NOT \
+                                     subscribed this session. The pool-dialed contracts and \
+                                     depth are unaffected."
+                                ),
+                            }
                         }
+                        None => error!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            overflow = overflow.len(),
+                            "contract selection exceeded the free connections and there is no \
+                             top-up channel to absorb the remainder — those contracts are NOT \
+                             subscribed. This means capacity was budgeted against room the \
+                             attach cannot reach."
+                        ),
                     }
-                    None => error!(
+                }
+
+                // Depth slices deliberately EMPTY here. `build_feed_stack_plan`
+                // plans MainFeed FIRST and `plan_pool` returns on the first
+                // refusal, so a shared call lets a main-feed budget refusal
+                // abort Depth20/Depth200 planning before they are attempted at
+                // all. Planning the halves separately is the second half of
+                // this fix; `plan_pool` returns Ok immediately on an empty set,
+                // so the split costs nothing.
+                match build_feed_stack_plan(&mut pool, Instant::now(), pool_contracts, &[], &[]) {
+                    Ok(plan) => {
+                        let dialed = dial_planned_connections(
+                            plan,
+                            DialContext {
+                                pool: &mut pool,
+                                client_id: &client_id,
+                                spill: &spill,
+                                frame_tx: &frame_tx,
+                                main_feed_budget: &main_feed_budget,
+                                depth_budget: &depth_budget,
+                                ws_audit_tx: Some(&ws_audit_tx),
+                                // The attach dials its own connections with
+                                // their FINAL set — nothing is added to them
+                                // later, so they need no top-up channel.
+                                out_topups: None,
+                            },
+                        );
+                        // The TERMINAL verdict for today's selection, recorded
+                        // once at the moment it reaches the wire. Never per
+                        // retry: `no_ladders` before 09:16 is normal, so a
+                        // per-attempt emit would page every healthy morning.
+                        crate::dhan_contract_universe::record_contract_verdict(&contracts);
+                        contracts_done = true;
+                        // Make them VISIBLE to the silence detector, at the
+                        // moment they reach the wire and not before. Seeding a
+                        // set that failed to dial would report silence for
+                        // instruments nobody ever asked for.
+                        //
+                        // `try_send` rather than `send`: this task must never
+                        // block on the drain, and a full 8-slot buffer means
+                        // the drain is wedged — which its own alarms cover.
+                        if let Err(err) = seed_tx.try_send(contracts.instruments.clone()) {
+                            warn!(
+                                %err,
+                                count = contracts.instruments.len(),
+                                "contracts dialed but could not be seeded into the silence \
+                                 detector — they will tick normally, but an instrument that \
+                                 goes silent among them will not be reported"
+                            );
+                        }
+                        // Keeps `remaining_main_feed_capacity` honest for the
+                        // depth half and any later reader. Without it the
+                        // used-count still describes boot-only occupancy.
+                        main_feed_connections_used =
+                            main_feed_connections_used.saturating_add(dialed);
+                        info!(
+                            dialed,
+                            attempts,
+                            contracts = contracts.instruments.len(),
+                            stock_options = contracts.stock_options,
+                            index_options = contracts.index_options,
+                            futures = contracts.index_futures + contracts.stock_futures,
+                            atm_window = contracts.atm_window_used,
+                            depth_done,
+                            "late-attach dialed the CONTRACT half of the main feed"
+                        );
+                    }
+                    Err(err) => error!(
                         code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                        overflow = overflow.len(),
-                        "contract selection exceeded the free connections and there is no \
-                         top-up channel to absorb the remainder — those contracts are NOT \
-                         subscribed. This means capacity was budgeted against room the \
-                         attach cannot reach."
+                        ?err,
+                        contracts = contracts.instruments.len(),
+                        "contract planning refused the selection. RETRYING until the deadline \
+                         — a refusal can be transient (a connection budget that frees up). \
+                         DEPTH IS PLANNED SEPARATELY AND IS UNAFFECTED by this failure."
                     ),
                 }
             }
 
-            match build_feed_stack_plan(
-                &mut pool,
-                Instant::now(),
-                pool_contracts,
-                &selection.depth_20,
-                &selection.depth_200,
-            ) {
-                Ok(plan) => {
-                    let dialed = dial_planned_connections(
-                        plan,
-                        DialContext {
-                            pool: &mut pool,
-                            client_id: &client_id,
-                            spill: &spill,
-                            frame_tx: &frame_tx,
-                            main_feed_budget: &main_feed_budget,
-                            depth_budget: &depth_budget,
-                            ws_audit_tx: Some(&ws_audit_tx),
-                            // The attach dials its own connections with their
-                            // FINAL set — nothing is added to them later, so
-                            // they need no top-up channel. Only the boot-dialed
-                            // spot connection has room worth reaching.
-                            out_topups: None,
-                        },
-                    );
-                    info!(
-                        dialed,
-                        attempts,
-                        depth_20 = selection.depth_20.len(),
-                        depth_200 = selection.depth_200.len(),
-                        contracts = contracts.instruments.len(),
-                        stock_options = contracts.stock_options,
-                        index_options = contracts.index_options,
-                        futures = contracts.index_futures + contracts.stock_futures,
-                        atm_window = contracts.atm_window_used,
-                        "late-attach opened its sockets: today's contracts resolved and both \
-                         depth and the contract universe dialed against them without a restart"
-                    );
-                    return;
-                }
-                Err(err) => {
-                    error!(
+            // ---- half 2: DEPTH ----
+            if dial_depth {
+                match build_feed_stack_plan(
+                    &mut pool,
+                    Instant::now(),
+                    &[],
+                    &selection.depth_20,
+                    &selection.depth_200,
+                ) {
+                    Ok(plan) => {
+                        let dialed = dial_planned_connections(
+                            plan,
+                            DialContext {
+                                pool: &mut pool,
+                                client_id: &client_id,
+                                spill: &spill,
+                                frame_tx: &frame_tx,
+                                main_feed_budget: &main_feed_budget,
+                                depth_budget: &depth_budget,
+                                ws_audit_tx: Some(&ws_audit_tx),
+                                out_topups: None,
+                            },
+                        );
+                        depth_done = true;
+                        // Same as the contract half: depth legs are real
+                        // subscriptions and a silently-dead one has no other
+                        // evidence.
+                        let mut depth_seed = selection.depth_20.clone();
+                        depth_seed.extend(selection.depth_200.iter().copied());
+                        if let Err(err) = seed_tx.try_send(depth_seed) {
+                            warn!(
+                                %err,
+                                "depth legs dialed but could not be seeded into the silence \
+                                 detector"
+                            );
+                        }
+                        info!(
+                            dialed,
+                            attempts,
+                            depth_20 = selection.depth_20.len(),
+                            depth_200 = selection.depth_200.len(),
+                            contracts_done,
+                            "late-attach dialed the DEPTH sockets"
+                        );
+                    }
+                    Err(err) => error!(
                         code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                         ?err,
                         depth_20 = selection.depth_20.len(),
                         depth_200 = selection.depth_200.len(),
-                        "depth late-attach resolved its instruments but planning refused them. \
-                         RETRYING until the 10:00 IST deadline — a refusal can be transient \
-                         (a connection budget that frees up), and giving up on the first one \
-                         would cost the whole session's depth."
-                    );
-                    // FALL THROUGH to the sleep, do NOT return.
-                    //
-                    // Until 2026-08-15 the `return` below sat outside this
-                    // match, so an Err ended the retry loop permanently. A
-                    // refusal at 09:17 IST killed depth for the entire day
-                    // despite ~43 attempts still remaining before the deadline
-                    // — and refusals like a connection-budget denial are by
-                    // nature transient. The Ok arm keeps its return: once the
-                    // sockets are dialed there is nothing left to retry.
+                        "depth planning refused its instruments. RETRYING until the deadline \
+                         — a refusal can be transient (a connection budget that frees up), \
+                         and giving up on the first one would cost the whole session's depth."
+                    ),
                 }
+            }
+
+            // The ONLY success return. Both halves, or keep waiting — the
+            // single `return` that used to sit in one shared Ok arm is exactly
+            // what left depth dark once contracts won the race.
+            if contracts_done && depth_done {
+                info!(
+                    attempts,
+                    "late-attach complete: contracts and depth are both on the wire"
+                );
+                return;
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(DEPTH_ATTACH_RETRY_SECS)).await;
@@ -5107,6 +5422,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // stays idle if depth never attaches. In exchange `depth_unconsumed` keeps
     // its meaning as a pure wiring-bug signal and should now be unreachable.
     let depth_ingest = Some(DepthIngest::new(&params.questdb));
+    // Bounded, and small on purpose: the late-attach pass sends at most a
+    // handful of batches in a session. A large buffer here would only delay
+    // discovering that nobody is receiving.
+    let (seed_tx, seed_rx) = tokio::sync::mpsc::channel::<Vec<SubscribeInstrument>>(8);
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
@@ -5115,6 +5434,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         Arc::clone(&depth_budget),
         Arc::clone(&params.shutdown),
         Arc::clone(&params.feed_health),
+        seed_rx,
     ));
 
     // ---- socket lifecycle audit -------------------------------------------
@@ -5199,6 +5519,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             ),
             spot_topup,
             ws_audit_tx.clone(),
+            seed_tx.clone(),
         ));
     }
 
@@ -7735,6 +8056,7 @@ mod tests {
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
                 Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+                tokio::sync::mpsc::channel(1).1,
             ),
         )
         .await
@@ -7800,6 +8122,7 @@ mod tests {
             Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
             Arc::clone(&shutdown),
             Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+            tokio::sync::mpsc::channel(1).1,
         ));
 
         // `notify_one` is permit-based, so this is safe to fire before the
@@ -7899,6 +8222,7 @@ mod tests {
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
                 Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+                tokio::sync::mpsc::channel(1).1,
             ),
         )
         .await
@@ -8525,6 +8849,63 @@ mod tests {
             production.contains("tokio::spawn(attach_depth_when_available("),
             "the depth late-attach MUST be spawned, never awaited inline — an inline await \
              would block the bring-up (and therefore the template-sender drop) for the whole wait"
+        );
+    }
+
+    /// THE BITE for the 2026-08-21 depth-starvation defect.
+    ///
+    /// This state — contracts already on the wire, depth still resolving — is
+    /// the one the pre-fix code could not express. A single `anything_resolved`
+    /// boolean gated both halves and a single `return` ended the loop, so the
+    /// moment contracts dialed (~09:15:30, off the `ticks` table) the task
+    /// exited and depth (which cannot resolve before the 09:16:00 chain fire)
+    /// never dialed at all. Ten authorized sockets, dark every session.
+    #[test]
+    fn outstanding_halves_lets_depth_dial_after_contracts_already_did() {
+        assert_eq!(
+            outstanding_halves(true, true, false, true, false),
+            (false, true),
+            "with contracts dialed and depth resolved, DEPTH must still dial. Returning \
+             (false, false) here is precisely the defect: it is what made the loop exit \
+             before depth ever reached the wire."
+        );
+    }
+
+    /// `pool.admit` is stateful, so re-planning a dialed half consumes a second
+    /// set of connection slots and re-sends an overflow the live socket holds.
+    #[test]
+    fn outstanding_halves_never_redials_a_finished_half() {
+        assert_eq!(
+            outstanding_halves(true, true, true, true, false),
+            (false, false),
+            "both halves are done; neither may be planned again"
+        );
+    }
+
+    /// The pricing quorum holds CONTRACTS. It must never hold DEPTH — depth
+    /// reads the option chain, not spot prices, so waiting for a stock to
+    /// print cannot make its instruments arrive any sooner.
+    #[test]
+    fn outstanding_halves_holds_contracts_while_pending_but_never_depth() {
+        assert_eq!(
+            outstanding_halves(true, true, false, false, true),
+            (false, true),
+            "a pending contract selection must not re-starve depth — that would trade one \
+             defect for the other"
+        );
+    }
+
+    /// Non-vacuity: the ordinary both-outstanding case must dial both.
+    #[test]
+    fn outstanding_halves_dials_both_when_both_are_ready() {
+        assert_eq!(
+            outstanding_halves(true, true, false, false, false),
+            (true, true)
+        );
+        assert_eq!(
+            outstanding_halves(false, false, false, false, false),
+            (false, false),
+            "nothing resolved means nothing to dial"
         );
     }
 
@@ -9673,6 +10054,217 @@ mod inline_depth_tests {
         assert!(
             ingest.inline_depth.is_some(),
             "the sink must survive the flush for the next packet"
+        );
+    }
+}
+
+/// Accounting for the two arms where the frame walk gives up part-way.
+#[cfg(test)]
+mod frame_walk_accounting_tests {
+    use super::*;
+
+    /// An arbitrary real epoch second. The session window does not matter
+    /// here: an out-of-session tick still WRITES A ROW and still counts as
+    /// folded, so these assertions hold whatever the clock says.
+    const ANY_LTT: u32 = 1_755_141_600;
+
+    fn ticker_packet(security_id: u32, ltp: f32, ltt: u32) -> [u8; 16] {
+        let mut p = [0u8; 16];
+        p[0] = 2; // response code: ticker
+        p[1] = 16; // message length
+        p[3] = 0; // exchange segment: IDX_I
+        p[4..8].copy_from_slice(&security_id.to_le_bytes());
+        p[8..12].copy_from_slice(&ltp.to_le_bytes());
+        p[12..16].copy_from_slice(&ltt.to_le_bytes());
+        p
+    }
+    /// A frame that stacks many packets and hits an unknown response code
+    /// part-way must report HOW MUCH it threw away, not just that it gave up.
+    ///
+    /// The give-up itself is correct and is not what this tests: resynchronising
+    /// on a guess would fabricate ticks out of misaligned bytes, which is worse
+    /// than losing them. What was wrong was the accounting — both give-up arms
+    /// bumped the frame counter by ONE, so a frame that dropped 1,500 packets
+    /// and a frame that dropped one reported the same number. An operator
+    /// reading `unparseable = 1` would reasonably conclude a single bad packet.
+    #[test]
+    fn an_unknown_packet_code_reports_the_bytes_it_abandoned() {
+        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&good);
+        // An unrecognised response code, followed by what would have been two
+        // more perfectly good ticker packets.
+        bytes.push(0xFE);
+        bytes.extend_from_slice(&[0u8; 15]);
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&good);
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+
+        assert_eq!(out.folded, 2, "the two packets before the bad code fold");
+        assert_eq!(out.unparseable, 1, "one give-up, as before");
+        assert_eq!(
+            out.abandoned_bytes, 48,
+            "16 bytes of the unknown packet plus the two 16-byte ticker packets \
+             behind it were thrown away — reporting 1 here is what made a \
+             large loss look like a small one. outcome={out:?}"
+        );
+    }
+
+    /// Non-vacuity: a frame that decodes cleanly must abandon NOTHING, or the
+    /// assertion above would pass against a counter that always fires.
+    #[test]
+    fn a_clean_frame_abandons_no_bytes() {
+        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&good);
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+
+        assert_eq!(out.folded, 2);
+        assert_eq!(out.unparseable, 0);
+        assert_eq!(out.abandoned_bytes, 0, "a clean frame loses nothing");
+    }
+
+    /// A trailing PARTIAL packet is the other give-up arm and must account the
+    /// same way — it was the second half of the same blind spot.
+    #[test]
+    fn a_truncated_trailing_packet_reports_its_abandoned_bytes() {
+        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        // A ticker header promising 16 bytes, with only 9 present.
+        bytes.extend_from_slice(&good[..9]);
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+
+        assert_eq!(out.folded, 1);
+        assert_eq!(
+            out.abandoned_bytes, 9,
+            "the 9 bytes of the partial packet are lost and must be counted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod late_seed_tests {
+    use super::*;
+
+    /// The drain must accept a seed batch and make those instruments visible
+    /// to the silence detector.
+    ///
+    /// This is the whole point: ~20,000 contracts attach after boot, and a
+    /// subscribe that silently delivers nothing has NO other evidence — no
+    /// payload to count, no parse to fail, no error to log. Absence measured
+    /// against a seeded key is the only thing that can ever report it.
+    #[test]
+    fn seeding_after_boot_makes_an_instrument_visible_to_the_detector() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 64);
+        let before = ingest.tracked_instruments();
+        assert!(ingest.seed(48_100, ExchangeSegment::NseFno, 1_000));
+        assert_eq!(
+            ingest.tracked_instruments(),
+            before + 1,
+            "a late-attached contract must become tracked, or it can never be \
+             reported silent"
+        );
+    }
+
+    /// Seeding the same instrument twice must not grow the tracked count. The
+    /// attach loop can legitimately re-dial after a refusal, and a detector
+    /// whose count drifted upward on every retry would make the silence
+    /// gauges meaningless.
+    ///
+    /// Note what `seed` returns: whether the slot allocator ACCEPTED the
+    /// instrument, not whether it was new. A repeat seed is a successful
+    /// no-op and returns true — which is why the assertion below is on the
+    /// COUNT and not on the return value.
+    #[test]
+    fn re_seeding_the_same_instrument_is_idempotent() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 64);
+        assert!(ingest.seed(48_100, ExchangeSegment::NseFno, 1_000));
+        let after_first = ingest.tracked_instruments();
+        assert!(
+            ingest.seed(48_100, ExchangeSegment::NseFno, 2_000),
+            "a repeat seed still succeeds — it is a no-op, not a refusal"
+        );
+        assert_eq!(
+            ingest.tracked_instruments(),
+            after_first,
+            "but it must not grow the tracked count"
+        );
+    }
+    /// The composite key, not the id alone. Two instruments can share a
+    /// numeric id across segments, and collapsing them would leave one of two
+    /// real contracts unmonitored while the count looked right.
+    #[test]
+    fn the_same_id_in_two_segments_seeds_two_instruments() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 64);
+        assert!(ingest.seed(27, ExchangeSegment::IdxI, 1_000));
+        assert!(ingest.seed(27, ExchangeSegment::NseEquity, 1_000));
+        assert_eq!(ingest.tracked_instruments(), 2);
+    }
+
+    /// The drain must carry a seed arm at all, and it must not be biased ahead
+    /// of frames. Seeding is bookkeeping; a queued frame is data.
+    #[test]
+    fn the_drain_has_a_seed_arm_that_does_not_outrank_frames() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let drain = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain must exist")
+            .1;
+        let seed_arm = drain
+            .find("maybe_seed = seed_rx.recv()")
+            .expect("the drain must have a seed arm, or late-attached instruments are invisible");
+        let frame_arm = drain
+            .find("maybe_frame = rx.recv()")
+            .expect("the drain must have a frame arm");
+        assert!(
+            frame_arm < seed_arm,
+            "the frame arm must come FIRST under `biased;` — seeding must never \
+             preempt draining queued frames"
         );
     }
 }

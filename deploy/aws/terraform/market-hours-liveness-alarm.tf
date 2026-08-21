@@ -369,6 +369,21 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # are one change: separating them re-creates the nightly false page the
         # old comment correctly warned about.
         aws_cloudwatch_metric_alarm.dhan_live_lane_down.alarm_name,
+        # 2026-08-21: dhan_no_ticks_flowing JOINS the gate, for the same reason
+        # and under the same rule as dhan_live_lane_down directly above.
+        #
+        # It treats missing data as breaching because a lane that dials and
+        # never receives a frame never REGISTERS its counter series at all —
+        # the drain's counter handles are built lazily inside the frame arm —
+        # so notBreaching would read a completely dark feed as health. That is
+        # the same blindness the flip above was made to fix, arriving from a
+        # different direction.
+        #
+        # `breaching` is only safe while something disables the actions
+        # overnight, and this list is that something. Authorization and the
+        # binding constraints are the dated §2.3b row in
+        # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 4 alarms.
+        aws_cloudwatch_metric_alarm.dhan_no_ticks_flowing.alarm_name,
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS
         # sweep — its metric's writer, the tick aggregator, is deleted).

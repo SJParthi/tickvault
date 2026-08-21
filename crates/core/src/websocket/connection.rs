@@ -83,7 +83,7 @@ use tickvault_common::constants::{
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::redact_url_params;
-use tickvault_common::types::FeedMode;
+use tickvault_common::types::{ExchangeSegment, FeedMode};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -463,6 +463,88 @@ fn safe_err(err: &impl std::fmt::Display) -> String {
 /// exist before any depth is claimed as captured.
 pub const DEFAULT_MAIN_FEED_MODE: FeedMode = FeedMode::Full;
 
+/// The mode Dhan actually serves for `IDX_I`, which is NOT the configured one.
+///
+/// **An index is a computed number, not a traded instrument.** It has no order
+/// book, so there are no bid/ask levels for a Full (code 21) packet to carry.
+/// Dhan does not answer that request with an error — it accepts the subscribe
+/// and sends NOTHING AT ALL, which is indistinguishable from a quiet
+/// instrument and is why this survived three sessions undetected.
+///
+/// **Measured on the box, 2026-08-21.** 163,934 packets were walked frame by
+/// frame out of the live capture log. Every one was `code 8 / segment 1 or 2`
+/// (Full, NSE_EQ or NSE_FNO). There were ZERO packets on segment 0 — including
+/// zero `code 6` PrevClose, which Dhan support CONFIRMED (Ticket #5525125) is
+/// emitted for IDX_I on ANY subscription in ANY mode. A subscription that
+/// never draws even its one guaranteed packet was never accepted. The lane's
+/// own detector agreed independently: `never_ticked` has equalled the IDX_I
+/// count exactly, every day — 4 when four seeds were subscribed, 119 once the
+/// master-sourced indices arrived.
+///
+/// **This restores a partition that already existed and was lost.** The
+/// pre-retirement lane sorted indices into their own Quote-mode batch;
+/// `docs/rules-archive/live-market-feed-subscription.md:279` records it as the
+/// `idx_instruments` partition, chosen so the Quote packet's `day_open` /
+/// `day_high` / `day_low` come from the exchange rather than being tracked
+/// app-side. The lane was deleted 2026-07-17 and rebuilt in the 2026-08-09
+/// revival with ONE global mode and no partition, so `idx_instruments` has
+/// zero occurrences on the tree today.
+///
+/// **Nothing is given up by not asking for depth here.** An index has no depth
+/// to lose. Full stays the mode for every instrument that has a book.
+///
+/// **UNVERIFIED-LIVE, and deliberately loud rather than assumed.** Whether
+/// Quote (17) is served for IDX_I on this account is not settled in this
+/// repository: `docs/dhan-support/2026-05-18-idx-i-quote-full-mode-support.md`
+/// asked Dhan this exact question and no answer is recorded, and an older
+/// uncited note claimed Dhan forces Ticker (15) for indices. If Quote is also
+/// refused, the failure is IDENTICAL in shape to today's — silence — so the
+/// verification is the RISK-GAP-03 never-ticked count, which must fall to zero
+/// for the index set on the first session after this lands. If it does not,
+/// `Ticker` is the next value to try, and this constant is the one line to
+/// change.
+pub const IDX_I_FEED_MODE: FeedMode = FeedMode::Quote;
+
+/// The mode to subscribe `segment` in, given the configured main-feed mode.
+///
+/// Total and O(1). Indices take [`IDX_I_FEED_MODE`]; everything else takes the
+/// caller's configured mode unchanged.
+#[must_use]
+pub fn feed_mode_for_segment(segment: ExchangeSegment, configured: FeedMode) -> FeedMode {
+    if matches!(segment, ExchangeSegment::IdxI) {
+        IDX_I_FEED_MODE
+    } else {
+        configured
+    }
+}
+
+/// Splits a main-feed batch into `(indices, others)`.
+///
+/// # Zero-loss property
+///
+/// `indices.len() + others.len() == batch.len()`, and concatenating the two
+/// reproduces every instrument in `batch` exactly once. That is the property
+/// worth pinning: a partition that dropped or duplicated an instrument would
+/// leave it unsubscribed (silent, since a stream that never arrives leaves
+/// nothing to count) or double-subscribed against the per-connection cap.
+#[must_use]
+pub fn partition_index_batch(
+    batch: &[SubscribeInstrument],
+) -> (Vec<SubscribeInstrument>, Vec<SubscribeInstrument>) {
+    // O(1) EXEMPT: begin — cold path, runs at connect/top-up time, not per tick.
+    let mut indices: Vec<SubscribeInstrument> = Vec::new();
+    let mut others: Vec<SubscribeInstrument> = Vec::new();
+    for instrument in batch {
+        if matches!(instrument.segment, ExchangeSegment::IdxI) {
+            indices.push(*instrument);
+        } else {
+            others.push(*instrument);
+        }
+    }
+    (indices, others)
+    // O(1) EXEMPT: end
+}
+
 /// Why a subscribe payload could not be built.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SubscribePayloadError {
@@ -709,6 +791,92 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
         )
         .increment(1);
     }
+    async fn send_subscribe_in_mode(
+        &mut self,
+        batch: &[SubscribeInstrument],
+        feed_mode: FeedMode,
+    ) -> Result<(), SocketFailure> {
+        let endpoint = self.params.endpoint;
+        let payload = match build_subscribe_payload(endpoint, feed_mode, batch) {
+            Ok(p) => p,
+            Err(err) => {
+                metrics::counter!(
+                    SUBSCRIBE_FAILED_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "reason" => "payload",
+                )
+                .increment(1);
+                error!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments = batch.len(),
+                    reason = %err,
+                    "Dhan subscribe payload could not be built — the socket would be live but \
+                     blind, so the connection is torn down instead"
+                );
+                return Err(SocketFailure);
+            }
+        };
+
+        let Some(stream) = self.stream.as_mut() else {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => "not_connected",
+            )
+            .increment(1);
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = endpoint.as_str(),
+                "subscribe attempted with no live Dhan socket"
+            );
+            return Err(SocketFailure);
+        };
+
+        let send = stream.send(Message::Text(payload.into()));
+        match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
+            Ok(Ok(())) => {
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    instruments = batch.len(),
+                    "Dhan subscribe batch sent"
+                );
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                metrics::counter!(
+                    SUBSCRIBE_FAILED_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "reason" => "send",
+                )
+                .increment(1);
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments = batch.len(),
+                    reason = %safe_err(&err),
+                    "Dhan subscribe batch could not be written to the socket"
+                );
+                Err(SocketFailure)
+            }
+            Err(_elapsed) => {
+                metrics::counter!(
+                    SUBSCRIBE_FAILED_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "reason" => "timeout",
+                )
+                .increment(1);
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments = batch.len(),
+                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
+                    "Dhan subscribe write stalled past its deadline"
+                );
+                Err(SocketFailure)
+            }
+        }
+    }
 }
 
 impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
@@ -842,87 +1010,40 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         }
     }
 
+    /// Subscribes `batch`, splitting indices into their own message.
+    ///
+    /// Indices are subscribed in [`IDX_I_FEED_MODE`] and everything else in the
+    /// configured mode, because Dhan serves an `IDX_I` Full subscription with
+    /// SILENCE rather than an error (see [`IDX_I_FEED_MODE`] for the measured
+    /// evidence). One Dhan message carries exactly one `RequestCode`, so the
+    /// two modes cannot share a message and the split is structural, not a
+    /// preference.
+    ///
+    /// Only the main feed splits. The depth endpoints refuse a non-NSE segment
+    /// outright and never carry an index, so partitioning there would add a
+    /// branch that can never be taken.
+    ///
+    /// Both halves must reach the wire for the subscribe to count as sent: a
+    /// partial success would leave the socket live and blind for one half of
+    /// its universe, which is the exact shape this whole change exists to
+    /// remove.
     async fn send_subscribe(&mut self, batch: &[SubscribeInstrument]) -> Result<(), SocketFailure> {
-        let endpoint = self.params.endpoint;
-        let payload = match build_subscribe_payload(endpoint, self.params.feed_mode, batch) {
-            Ok(p) => p,
-            Err(err) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "payload",
-                )
-                .increment(1);
-                error!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    reason = %err,
-                    "Dhan subscribe payload could not be built — the socket would be live but \
-                     blind, so the connection is torn down instead"
-                );
-                return Err(SocketFailure);
-            }
-        };
-
-        let Some(stream) = self.stream.as_mut() else {
-            metrics::counter!(
-                SUBSCRIBE_FAILED_METRIC,
-                "endpoint" => endpoint.as_str(),
-                "reason" => "not_connected",
-            )
-            .increment(1);
-            warn!(
-                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                endpoint = endpoint.as_str(),
-                "subscribe attempted with no live Dhan socket"
-            );
-            return Err(SocketFailure);
-        };
-
-        let send = stream.send(Message::Text(payload.into()));
-        match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
-            Ok(Ok(())) => {
-                debug!(
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    "Dhan subscribe batch sent"
-                );
-                Ok(())
-            }
-            Ok(Err(err)) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "send",
-                )
-                .increment(1);
-                warn!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    reason = %safe_err(&err),
-                    "Dhan subscribe batch could not be written to the socket"
-                );
-                Err(SocketFailure)
-            }
-            Err(_elapsed) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "timeout",
-                )
-                .increment(1);
-                warn!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
-                    "Dhan subscribe write stalled past its deadline"
-                );
-                Err(SocketFailure)
-            }
+        let configured = self.params.feed_mode;
+        if self.params.endpoint != DhanEndpointType::MainFeed {
+            return self.send_subscribe_in_mode(batch, configured).await;
         }
+
+        let (indices, others) = partition_index_batch(batch);
+
+        // Nothing to split — send the batch exactly as before.
+        if indices.is_empty() {
+            return self.send_subscribe_in_mode(batch, configured).await;
+        }
+
+        if !others.is_empty() {
+            self.send_subscribe_in_mode(&others, configured).await?;
+        }
+        self.send_subscribe_in_mode(&indices, IDX_I_FEED_MODE).await
     }
 
     async fn recv(&mut self) -> SocketEvent {
@@ -1720,15 +1841,152 @@ mod tests {
         // half of the flip that would silently fail: a constant changed with a
         // builder that still emitted 17 would subscribe Quote while every doc
         // claimed Full.
-        let batch = [instrument(13, ExchangeSegment::IdxI)];
+        //
+        // FIXTURE CORRECTED 2026-08-21. This asserted that an `IDX_I`
+        // instrument gets code 21 — the defect itself, written down as
+        // expected behaviour, exactly like the `stock_options == 0` assertion
+        // corrected in a2acb6a. Indices are the ONE segment that must not get
+        // 21 (see `IDX_I_FEED_MODE`), so the fixture is now a tradeable
+        // instrument, which is what this test was always about.
+        let batch = [instrument(59099, ExchangeSegment::NseFno)];
         let json =
             build_subscribe_payload(DhanEndpointType::MainFeed, DEFAULT_MAIN_FEED_MODE, &batch)
-                .expect("a single index subscribes");
+                .expect("a single derivative subscribes");
         assert!(json.contains("\"RequestCode\":21"), "{json}");
         assert!(
             !json.contains("\"RequestCode\":17"),
             "the Quote code must be gone, not merely joined: {json}"
         );
+    }
+
+    // -- IDX_I mode partition (2026-08-21) ---------------------------------
+
+    #[test]
+    fn feed_mode_for_segment_gives_an_index_quote_not_full() {
+        // The whole fix in one assertion. Dhan answers an IDX_I Full
+        // subscribe with silence, so a payload carrying 21 for segment 0 is
+        // the bug — measured as 0 IDX_I packets in 163,934 captured frames.
+        let batch = [instrument(13, ExchangeSegment::IdxI)];
+        let json = build_subscribe_payload(
+            DhanEndpointType::MainFeed,
+            feed_mode_for_segment(ExchangeSegment::IdxI, DEFAULT_MAIN_FEED_MODE),
+            &batch,
+        )
+        .expect("a single index subscribes");
+        assert!(json.contains("\"RequestCode\":17"), "{json}");
+        assert!(
+            !json.contains("\"RequestCode\":21"),
+            "an index must not ask for depth it does not have: {json}"
+        );
+    }
+
+    #[test]
+    fn feed_mode_for_segment_keeps_full_for_every_other_segment() {
+        // Non-vacuity. Without this, `feed_mode_for_segment` returning Quote
+        // unconditionally would satisfy the test above while silently
+        // downgrading all ~24,600 tradeable instruments off depth-5 — a far
+        // worse regression than the one being fixed.
+        for segment in [
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::BseFno,
+        ] {
+            assert_eq!(
+                feed_mode_for_segment(segment, FeedMode::Full),
+                FeedMode::Full,
+                "{segment:?} has an order book and must keep Full"
+            );
+        }
+    }
+
+    #[test]
+    fn feed_mode_for_segment_passes_the_configured_mode_through() {
+        // Guards the OTHER direction: if the scope lock ever moves the
+        // main-feed mode again, non-index instruments must follow it. A
+        // `FeedMode::Full` literal inside the helper would pass the test above
+        // and quietly pin the lane to Full forever.
+        assert_eq!(
+            feed_mode_for_segment(ExchangeSegment::NseFno, FeedMode::Ticker),
+            FeedMode::Ticker
+        );
+        assert_eq!(
+            feed_mode_for_segment(ExchangeSegment::IdxI, FeedMode::Ticker),
+            IDX_I_FEED_MODE,
+            "the index override wins over the configured mode, whatever it is"
+        );
+    }
+
+    #[test]
+    fn feed_mode_for_segment_makes_a_mixed_batch_two_messages() {
+        // Why the split is structural rather than stylistic: one Dhan message
+        // carries exactly one RequestCode, so a batch holding both an index
+        // and a derivative CANNOT be sent as a single payload without one of
+        // them getting the wrong mode. This pins the property that forces
+        // `send_subscribe` to emit two messages.
+        let idx = feed_mode_for_segment(ExchangeSegment::IdxI, DEFAULT_MAIN_FEED_MODE);
+        let fno = feed_mode_for_segment(ExchangeSegment::NseFno, DEFAULT_MAIN_FEED_MODE);
+        assert_ne!(
+            idx, fno,
+            "if these ever match, the partition in send_subscribe is dead code and \
+             should be removed rather than left to rot"
+        );
+    }
+
+    #[test]
+    fn partition_index_batch_loses_nothing_and_duplicates_nothing() {
+        // A partition that dropped an instrument would leave it unsubscribed
+        // and SILENT — there is no other evidence for that, which is the whole
+        // reason this class of bug survives. A duplicate would double-count
+        // against the per-connection cap.
+        let batch = [
+            instrument(13, ExchangeSegment::IdxI),
+            instrument(59099, ExchangeSegment::NseFno),
+            instrument(21, ExchangeSegment::IdxI),
+            instrument(2885, ExchangeSegment::NseEquity),
+        ];
+        let (indices, others) = partition_index_batch(&batch);
+        assert_eq!(indices.len(), 2);
+        assert_eq!(others.len(), 2);
+        assert_eq!(indices.len() + others.len(), batch.len());
+        assert!(indices.iter().all(|i| i.segment == ExchangeSegment::IdxI));
+        assert!(others.iter().all(|i| i.segment != ExchangeSegment::IdxI));
+        let mut seen: Vec<u64> = indices
+            .iter()
+            .chain(others.iter())
+            .map(|i| i.security_id)
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![13, 21, 2885, 59099],
+            "every id survives exactly once"
+        );
+    }
+
+    #[test]
+    fn partition_index_batch_puts_an_all_index_batch_on_one_side() {
+        let batch = [
+            instrument(13, ExchangeSegment::IdxI),
+            instrument(25, ExchangeSegment::IdxI),
+        ];
+        let (indices, others) = partition_index_batch(&batch);
+        assert_eq!(indices.len(), 2);
+        assert!(
+            others.is_empty(),
+            "an all-index batch must not emit an empty second message — \
+             build_subscribe_payload refuses EmptyBatch and would tear the socket down"
+        );
+    }
+
+    #[test]
+    fn partition_index_batch_with_no_index_leaves_the_original_path() {
+        // Non-vacuity for the fast path in send_subscribe: with no index the
+        // batch is sent exactly as it was before this change.
+        let batch = [instrument(59099, ExchangeSegment::NseFno)];
+        let (indices, others) = partition_index_batch(&batch);
+        assert!(indices.is_empty());
+        assert_eq!(others.len(), 1);
     }
 
     // -- disconnect classification -----------------------------------------

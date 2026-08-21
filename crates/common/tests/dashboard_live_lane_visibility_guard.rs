@@ -164,8 +164,32 @@ fn every_published_live_lane_metric_is_visible_somewhere() {
         let charted = dashboard.contains(&format!("\"{name}\""));
         // `metric_name = "..."` is the alarm form; a bare comment mention is
         // not, so the quoted form is again what distinguishes them.
-        let alarmed = alarms.contains(&format!("metric_name         = \"{name}\""))
-            || alarms.contains(&format!("metric_name = \"{name}\""));
+        // Whitespace-INSENSITIVE since 2026-08-21. This used to match two
+        // hardcoded spacings — one space, or exactly nine. HCL aligns `=` to
+        // the longest key in its own block, so the correct spacing depends on
+        // what other attributes that particular alarm happens to declare. A
+        // new alarm whose longest key was `comparison_operator` aligned to
+        // EIGHT spaces, matched neither pattern, and the metric was reported
+        // as unalarmed while its alarm sat in the file being scanned.
+        //
+        // That is the failure mode this guard exists to prevent, arriving
+        // through the guard itself: it would have sent someone to add a
+        // duplicate alarm for a metric that already had one.
+        let alarmed = alarms.lines().any(|line| {
+            let squeezed: String = {
+                let mut out = String::with_capacity(line.len());
+                let mut prev_space = false;
+                for ch in line.trim().chars() {
+                    let is_space = ch == ' ' || ch == '\t';
+                    if !(is_space && prev_space) {
+                        out.push(if is_space { ' ' } else { ch });
+                    }
+                    prev_space = is_space;
+                }
+                out
+            };
+            squeezed == format!("metric_name = \"{name}\"")
+        });
         let excused = DELIBERATELY_NOT_CHARTED.iter().any(|(m, _)| m == *name);
 
         if !charted && !alarmed && !excused {

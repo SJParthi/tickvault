@@ -88,7 +88,23 @@ resource "aws_cloudwatch_metric_alarm" "dhan_live_lane_down" {
   # valid before 09:20 — deliberately not done here.
   treat_missing_data = "breaching"
 
-  alarm_actions = local.app_alarm_actions
+  # ADDED 2026-08-21, and it closes a latent defect rather than tidying style.
+  #
+  # This alarm is `breaching` and relies on the market-hours gate Lambda to
+  # disarm it overnight — but it never declared a default, and terraform's
+  # default for `actions_enabled` is TRUE. So every `terraform apply` shipped
+  # it ARMED, against a metric whose absence breaches, on a box that is
+  # deliberately stopped outside 08:30-17:30 IST. An apply at any hour outside
+  # the session — and terraform-apply runs path-filtered on push and via the
+  # post-merge catch-up dispatcher, so that is most hours — armed a breaching
+  # alarm against a stopped box until the gate's next close run at 15:35 IST.
+  #
+  # Found by the generalised `breaching_alarms_are_gated_guard`, which was
+  # widened in the same change to derive the breaching set from this file
+  # instead of naming one alarm. The old guard checked gate MEMBERSHIP only,
+  # which this alarm had, and passed.
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
   # The lane coming back up IS meaningful and self-explanatory, so the
   # recovery page is wanted here (unlike the permanent-loss alarms below).
   ok_actions = local.app_alarm_ok
@@ -474,5 +490,124 @@ resource "aws_cloudwatch_metric_alarm" "ticks_lost_spill" {
   # NO ok_actions. A delta returning to zero means no ADDITIONAL frames were
   # lost — never that the lost ones came back. An OK page here would be a false
   # recovery of data that does not exist (Rule 11).
+  ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# 11. NO TICKS ARE FLOWING (2026-08-21)
+# ---------------------------------------------------------------------------
+# Every alarm above answers "did something BREAK". None answers "is the feed
+# PRODUCING anything", and those are different questions.
+#
+# `tv_dhan_feed_ingest_ticks_total` has been EMF-shipped since 2026-08-14 and
+# charted on the operator dashboard since — and no alarm has ever read it. A
+# lane that dials, connects, subscribes and delivers nothing reports fully
+# green: the lane-up gauge reads 1, the connection gauge reads healthy, and
+# every loss counter reads zero, because nothing was lost — nothing arrived.
+# That is exactly what the 2026-08-12 session looked like (compared: 0,
+# missing_live: 373, 12 dial failures), and it was found by reading a
+# cross-verify log line rather than by being told.
+#
+# Authorization + binding constraints: the dated §2.3b row in
+# .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
+#
+# COUNTER SHAPE: the CW agent's prometheus pipeline publishes per-scrape
+# DELTAS (the model documented at length in auth-failed-alarm.tf), so Sum over
+# the window = ticks folded in that window, and `< 1` means the fold produced
+# nothing at all. Honest residual inherited from that file: if the field ever
+# proved CUMULATIVE, Sum would be large and this alarm would go BLIND rather
+# than over-page — the opposite failure direction from the auth alarm. That is
+# why the market-hours-liveness heartbeat GAUGE remains the independent
+# process-death signal instead of being replaced by this one.
+#
+# WHY breaching AND THE GATE, AS ONE CHANGE: a dead app publishes no datapoint,
+# and a lane that never receives a frame never registers the series at all
+# (the drain's counter handles are built lazily inside the frame arm), so
+# notBreaching would read both as health. But a bare flip to breaching pages
+# every evening at 17:30 and all weekend — the fastest possible way to train an
+# operator to ignore an alarm. Membership in the market-hours gate's
+# ALARM_NAMES list is what makes the flip safe; separating the two re-creates
+# the nightly false page.
+resource "aws_cloudwatch_metric_alarm" "dhan_no_ticks_flowing" {
+  alarm_name        = "tv-${var.environment}-dhan-no-ticks-flowing"
+  alarm_description = "The Dhan live lane folded ZERO ticks for ~10 minutes DURING MARKET HOURS. This is the 'is it actually working' signal: sockets can be connected, the lane-up gauge can read 1, every loss counter can read zero, and still no market data reaches the candle fold - that is what the 2026-08-12 session looked like. Missing data breaches deliberately: a dead app publishes nothing, and a lane that dials but never receives a frame never registers this series at all. Triage in order: (1) tv_dhan_ws_alive_connections and tv_dhan_ws_dial_failed_total - are the sockets up. (2) tv_dhan_feed_drain_frames_total - are frames arriving but not folding, then read tv_dhan_feed_ingest_refused_total whose reason label names why. (3) journalctl -u tickvault for WS-GAP-03 and the subscribe batching lines. If frames arrive and ticks do not, the fault is ours; if no frames arrive, it is the socket or the subscription."
+
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  # 2 x 300s. One aligned window can legitimately be quiet at the session
+  # edges - the gate opens 09:20, five minutes after the 09:15 open, and closes
+  # 15:35, five minutes after the 15:30 close. Ten consecutive minutes of zero
+  # ticks INSIDE the session is not an edge effect.
+  evaluation_periods = 2
+  metric_name        = "tv_dhan_feed_ingest_ticks_total"
+  namespace          = local.app_namespace
+  period             = 300
+  # Sum of per-scrape deltas = ticks folded in the window. NOT Minimum: a
+  # single quiet scrape inside an otherwise busy window is normal.
+  statistic = "Sum"
+  # `{host}` - the metric is unlabelled and the EMF processor declares exactly
+  # one dimension set. Same folding note as alarm 2.
+  dimensions = local.app_dimensions
+
+  treat_missing_data = "breaching"
+
+  # Actions OFF by default; the market-hours gate Lambda flips them ON
+  # 09:20-15:35 IST Mon-Fri. WITHOUT THIS LINE THIS ALARM PAGES EVERY EVENING.
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
+  # Ticks resuming IS a real, self-explanatory recovery - unlike the loss
+  # alarms above, where a delta returning to zero can never mean the lost data
+  # came back.
+  ok_actions = local.app_alarm_ok
+}
+
+# ---------------------------------------------------------------------------
+# 12. THE CONTRACT UNIVERSE DID NOT RESOLVE (2026-08-21)
+# ---------------------------------------------------------------------------
+# `dhan_contract_universe.rs` carried ZERO metrics calls until today. Its
+# failures — an unreadable artifact, an unreadable symbol map, no ladder built
+# because no underlying priced, an ATM window silently shrunk below the
+# authorized 25 — were `error!` lines and struct fields that nothing consumed.
+# The 2026-08-20 incident is the shape: `atm_window_reason = "no_ladders"` was
+# recorded, printed, and ignored, and the session ran without a single stock
+# option.
+#
+# Authorization: the dated §2.3b row in
+# .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
+#
+# Every `reason` label value is a defect, deliberately: the EMF processor folds
+# labels to {host} by summing, so a name carrying successes too would fire on a
+# healthy day. Emitted ONCE per session at the terminal verdict, never per
+# retry — `no_ladders` before 09:16 is normal (no tick has landed yet) and a
+# per-attempt emit would page every trading morning.
+resource "aws_cloudwatch_metric_alarm" "dhan_contract_universe_failed" {
+  alarm_name        = "tv-${var.environment}-dhan-contract-universe-failed"
+  alarm_description = "The Dhan contract universe did not resolve cleanly for today's session. reason=no_contracts: nothing was selected at all, so the main feed carries its spot universe only - no futures, no option contracts. reason=artifact_unreadable or symbol_map_unreadable: the daily rider's output is missing or malformed. reason=no_ladders: the master lists stock options and NOT ONE underlying had a live spot price, so at-the-money could not be located and every stock option is absent - the 2026-08-20 shape. reason=no_room: the connection envelope could not fit even the at-the-money strike. reason=window_shrunk: the ATM window was narrowed below the authorized 25 strikes per side. Fires ONCE per session at the terminal verdict. Triage: journalctl -u tickvault for the 'contract universe resolved' line, which names the counts, the window, the reason and now underlyings_total; then check the daily rider wrote today's contract artifact and mapping files."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  # Once-per-session emit, so one 300s window at threshold 1 catches the lone
+  # increment. A second period would only delay a page for a condition that
+  # cannot repeat.
+  evaluation_periods = 1
+  metric_name        = "tv_dhan_contract_universe_failed_total"
+  namespace          = local.app_namespace
+  period             = 300
+  statistic          = "Sum"
+  # `{host}` - the reason label folds, and folding is what this alarm wants:
+  # any defect on any reason pages. The label survives in the log line, which
+  # is where triage reads it.
+  dimensions = local.app_dimensions
+  # notBreaching, NOT breaching: the box is stopped overnight, so no-data is
+  # the normal off-hours state. This alarm reports a DEFECT, never silence -
+  # the dark-lane case belongs to alarms 1 and 11. No market-hours gate is
+  # needed for the same reason, which is why this one is NOT in the gate list.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. The universe is resolved ONCE per session. The counter
+  # falling back to zero deltas means no ADDITIONAL defect - never that this
+  # session's universe was repaired. Only a restart changes it, and that is a
+  # new session.
   ok_actions = []
 }

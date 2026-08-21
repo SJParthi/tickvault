@@ -342,3 +342,79 @@ several are downstream symptoms that the two alarms above would already have fir
 and a family of eleven pagers for one subsystem trains an operator to ignore all of
 them. Listed here so the gap is a decision on the record, not something to be discovered
 from a quiet dashboard.
+
+### §2.3b — 2026-08-21: the lane can carry ZERO ticks and page nobody; and the contract path has no counters at all
+
+**The verbatim operator authorization (2026-08-21, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "fix evrythgin entiley dude okay i cannot miss even a single ticks and neevr eevr due to ebs iops volume mibs or because of any fucking issues like codes configruatiosn aws instance kernel memory pressure or confirguation or it can be any issues or any extreme worst case permutations an dcombiantions of entire worst cases also this should never ever fuckign happen bro okay? so whatevr is needed or reocmmeneded go ahead with the entire fixes and solutions dude oaky?"
+
+Given in DIRECT response to a plan whose Phase 2 named exactly these two items and
+stated plainly that both were **blocked on a dated row in this file** — this file's §3
+makes any new Dhan-scoped page a REJECT without one. This row is that authorization,
+recorded HERE first, before the terraform, per the rule-file-first law.
+
+**Why the first one matters more than any alarm already in family (5).** Every one of
+the ten live-lane alarms answers *"did something break"*. Not one answers *"is the feed
+producing anything"* — and those are different questions. `tv_dhan_feed_ingest_ticks_total`
+has been EMF-shipped since 2026-08-14 and charted on the operator dashboard since, and
+**no alarm has ever read it**. A lane that dials, connects, subscribes and delivers
+nothing reports fully green: the lane-up gauge reads 1, the connection gauge reads
+healthy, and every loss counter reads zero — because nothing was lost, nothing arrived.
+That is exactly what the 2026-08-12 session looked like (`compared: 0`,
+`missing_live: 373`, 12 dial failures), and it was found by reading a cross-verify log
+line rather than by being told. This is the paid-for-and-unwatched shape that §2.3
+alarms 3 and 9 were created to end, on the one signal that separates "nothing broke"
+from "nothing ran".
+
+**Why the second one is not optional either.** `dhan_contract_universe.rs` carries
+**zero** `metrics::` calls. "No options resolved today", "the ATM window shrank to
+three", "the artifact was unreadable" are `error!` lines and struct fields that nothing
+consumes. A session missing ~22,000 authorized contracts leaves no number anywhere for
+an alarm or a triage path to read. The 2026-08-20 incident is the shape:
+`atm_window_reason = "no_ladders"` was recorded, printed, and ignored.
+
+**Family (5) therefore gains two members** — `dhan-no-ticks-flowing` and
+`dhan-contract-universe-failed`. Both are LIVE-LANE alarms; the §2 four-item REST family
+is UNCHANGED, and every "deleted or silenced" row in §2's second table stays deleted and
+silenced.
+
+**Binding constraints on the implementation, each of which is a REJECT if broken:**
+
+1. **The tick-flow alarm MUST be market-hours gated.** It treats missing data as
+   breaching — necessarily, because a dead app publishes no datapoint and a lane that
+   never receives a frame never registers the series at all, so `notBreaching` would
+   read both as health. But `breaching` without a gate pages every evening at 17:30 and
+   all weekend, which this file's own §2.3a calls the fastest way to train an operator
+   to ignore an alarm. It joins the `market_hours_liveness_gate` Lambda's `ALARM_NAMES`
+   list in the SAME change, taking that gate from 3 alarms to 4. Landing the flip
+   without the gate membership re-creates the nightly false page.
+2. **The contract alarm is `notBreaching` and ungated**, deliberately: the box is
+   stopped overnight, so no-data is the normal off-hours state, and this alarm reports a
+   DEFECT rather than silence. The dark-lane case belongs to the alarm above.
+3. **Every `reason` label on the contract counter must be a real defect.** The EMF
+   processor folds labels to `{host}` by summing, so a name carrying successes too would
+   fire on a healthy day. The success side stays on the existing info line.
+4. **The contract counter emits ONCE per session at the terminal verdict, never per
+   retry.** `no_ladders` before 09:16 is NORMAL — no tick has landed yet — so a
+   per-attempt emit would page every healthy trading morning.
+5. **Any new EMF name must land in BOTH selector copies** (`cloudwatch-agent.json` and
+   `user-data.sh.tftpl`), which `cw_agent_selector_lockstep_guard.rs` pins byte-for-byte,
+   and must respect the `user_data_size_guard.rs` budget.
+
+**Cost.** `tv_dhan_feed_ingest_ticks_total` is already shipped, so its alarm is **+1
+alarm ≈ $0.10/mo and no new EMF name**. The contract counter is **+1 EMF name ≈ $0.30/mo
+and +1 alarm ≈ $0.10/mo** — one series, since the `reason` label folds. **~$0.50/mo
+total** against the $130 kill-ceiling whose 90% line is $117.
+
+**⚠ What this row does NOT do (Rule 11, no false-OK).** An alarm on tick flow does not
+make ticks flow. It converts a silent all-day outage into a page within ~10 minutes of
+the session opening — that is the entire claim, and it is worth making precisely because
+the 2026-08-12 outage ran a full session undetected. It does not address the reasons a
+lane might carry nothing, and it cannot see loss that happens UPSTREAM at Dhan's side:
+their published architecture skips a slow consumer forward to "the latest available
+state" with no sequence number, so intermediate ticks discarded there are invisible to
+every counter we own. The 15:31 REST cross-verification remains the only ground truth
+for that class, and a non-zero `compared` from it remains the only evidence this
+repository can offer that the feed works at all.

@@ -222,6 +222,139 @@ pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<Vec<ContractRow>
 /// tracked; this one is what the lane actually subscribes.
 pub const FULL_CHAIN_INDEX_UNDERLYINGS: [&str; 2] = ["NIFTY", "BANKNIFTY"];
 
+/// Percentage of stock-option underlyings that must be PRICED before a
+/// contract selection is treated as final.
+///
+/// 60 sits deliberately between the two failure modes it separates.
+///
+/// Too low is what shipped: at one priced underlying out of ~208 (0.5%) the
+/// selection closed and every other stock lost its options for the day. Too
+/// high never dials at all on a thin morning — the illiquid tail of the F&O
+/// list can take minutes to print, and a 95% bar would spend the entire
+/// allowance waiting for names nobody trades. 60% means the liquid majority
+/// has printed, which is what "at-the-money is locatable" actually requires.
+///
+/// It is NOT a hard gate. The attach ANDs `stock_options_are_pending` with
+/// `!out_of_time`, so a morning that never reaches quorum still dials whatever
+/// it has at the deadline rather than nothing.
+///
+/// UNMEASURED, and stated as such: the real distribution of how many F&O
+/// underlyings have printed by 09:15:30 is not known. The first session after
+/// this lands should be read against the `underlyings_total` /
+/// `underlyings_without_spot` fields on the `contract universe resolved` line,
+/// and this number re-tuned from that evidence rather than defended.
+///
+/// Lives HERE rather than in `crates/common/src/constants.rs` deliberately: it
+/// has exactly one reader, and `testing-scope.md` escalates any `crates/common`
+/// edit to a full-workspace run — a 10-15 minute cost for a knob no other crate
+/// can see.
+pub const STOCK_OPTION_PRICING_QUORUM_PERCENT: usize = 60;
+
+/// Counter: a TERMINAL defect in the day's contract selection. Label: `reason`.
+///
+/// Until 2026-08-21 this module carried **zero** `metrics::` calls. "No options
+/// resolved today", "the ATM window shrank to three", "the artifact was
+/// unreadable" were `error!` lines and struct fields that nothing consumed — a
+/// session missing ~22,000 authorized contracts left no number anywhere for an
+/// alarm or a triage path to read. The 2026-08-20 incident is the shape:
+/// `atm_window_reason = "no_ladders"` was recorded, printed, and ignored.
+///
+/// EVERY label value is a real defect, deliberately. The CloudWatch EMF
+/// processor folds labels into the single declared dimension set by SUMMING,
+/// so a name that also carried successes would alarm on a healthy day. The
+/// success side stays on the `contract universe resolved` info line.
+pub const CONTRACT_UNIVERSE_FAILED_COUNTER: &str = "tv_dhan_contract_universe_failed_total";
+
+/// Every `reason` value [`CONTRACT_UNIVERSE_FAILED_COUNTER`] can carry.
+///
+/// Enumerated so they can be pre-registered: the CloudWatch delta pipeline
+/// drops each series' FIRST observed sample as its baseline, so a reason that
+/// is not pre-registered loses its first increment — and on a once-per-session
+/// counter, its first increment is its only one.
+pub const CONTRACT_FAILURE_REASONS: [&str; 7] = [
+    "artifact_unreadable",
+    // The late-attach loop reached its deadline or the 15:30 hard stop with
+    // contracts never on the wire. Emitted by `record_contract_give_up`, NOT
+    // by the classifier: at a give-up there is no `ContractSelection` to
+    // classify, which is exactly why this path had no signal at all until
+    // 2026-08-21 -- the give-up `return`s bypassed the only emitter, so the
+    // alarm built for a contract-less session could only ever observe its own
+    // pre-registered zero.
+    "gave_up",
+    "symbol_map_unreadable",
+    "no_contracts",
+    "no_ladders",
+    "no_room",
+    "window_shrunk",
+];
+
+/// Publish a 0 baseline for every reason. Call ONCE, before the first attempt.
+pub fn pre_register_contract_failure_counters() {
+    for reason in CONTRACT_FAILURE_REASONS {
+        metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(0);
+    }
+}
+
+/// Classify the TERMINAL verdict for a contract selection.
+///
+/// Pure, so the classification is testable without a metrics recorder — the
+/// emit below is a thin loop over what this returns.
+///
+/// Called ONCE, when the selection is dialed or abandoned, never per retry.
+/// That distinction is the whole design: `no_ladders` on a pre-open attempt is
+/// NORMAL — no tick has landed yet, and this module's own docs say so — so a
+/// per-attempt emit would fire ~46 times between 08:30 and 09:16 on a perfectly
+/// healthy morning and page for it.
+#[must_use]
+pub fn contract_verdict_reasons(selection: &ContractSelection) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if selection.instruments.is_empty() {
+        reasons.push("no_contracts");
+    }
+    match selection.atm_window_reason {
+        // Guarded on the denominator: a master with genuinely no stock options
+        // reports `no_ladders` legitimately and must not page for it.
+        "no_ladders" if selection.stock_option_underlyings > 0 => reasons.push("no_ladders"),
+        "no_room" => reasons.push("no_room"),
+        "applied" if selection.atm_window_used < STOCK_OPTION_ATM_STRIKES_EACH_SIDE => {
+            reasons.push("window_shrunk");
+        }
+        _ => {}
+    }
+    reasons
+}
+
+/// Record the terminal verdict. One increment per reason, once per session.
+pub fn record_contract_verdict(selection: &ContractSelection) {
+    for reason in contract_verdict_reasons(selection) {
+        metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(1);
+    }
+}
+
+/// Record that the late-attach loop STOPPED with contracts never on the wire.
+///
+/// Separate from [`record_contract_verdict`] because the two answer different
+/// questions and only one of them had an emitter. The verdict classifies a
+/// selection that was actually produced; this fires when the loop gave up and
+/// there is no selection to classify — the session simply ends carrying spot
+/// instruments and nothing else.
+///
+/// That was the gap: both give-up arms in `attach_depth_when_available`
+/// `return`ed straight past the only call to `record_contract_verdict`, which
+/// lives inside the SUCCESSFUL dial branch. So a session that resolved zero
+/// contracts by the deadline — the precise condition
+/// `tv_dhan_contract_universe_failed_total` exists to page on — left that
+/// counter reading its pre-registered zero, and the only trace was an
+/// unalarmed log line.
+///
+/// Caller must gate on the half actually being incomplete. Firing this when
+/// contracts DID reach the wire and only depth did not would page for a
+/// failure that did not happen, which is the fastest way to teach an operator
+/// to ignore the alarm.
+pub fn record_contract_give_up() {
+    metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "gave_up").increment(1);
+}
+
 /// What a contract selection produced, and everything it refused.
 ///
 /// Every refusal is a counted field rather than a silent drop. A selection
@@ -273,6 +406,16 @@ pub struct ContractSelection {
     /// Underlyings whose options were REFUSED because no live spot price was
     /// available to locate at-the-money. Never guessed.
     pub underlyings_without_spot: usize,
+    /// Stock underlyings the master listed an option chain for, priced or not.
+    ///
+    /// The DENOMINATOR of the pricing quorum, and the number
+    /// [`Self::underlyings_without_spot`] alone cannot supply: 207 unpriced out
+    /// of 208 and 207 unpriced out of 20,000 share a numerator and are opposite
+    /// situations. Without it the pending predicate could only ask "is anything
+    /// unpriced?", which a single priced underlying answers — and that is
+    /// exactly how one liquid stock printing at 09:15:30 used to close the
+    /// selection for every other stock in the master.
+    pub stock_option_underlyings: usize,
     /// Rows refused for carrying no usable expiry at all.
     pub refused_no_expiry: usize,
     /// Rows refused for having ALREADY expired.
@@ -589,9 +732,44 @@ pub fn select_contract_universe(
 /// `"no_room"` case is also a zero-option outcome, and it is genuinely final
 /// — retrying cannot conjure envelope space. Only the price-source case is
 /// worth another attempt.
+/// # The 2026-08-21 widening: a QUORUM, not "anything at all"
+///
+/// This used to read `stock_options == 0 && underlyings_without_spot > 0`.
+/// Every ladder under the fitted window pushes options, so ONE priced
+/// underlying made `stock_options > 0` and the predicate went false. The
+/// attach then dialed and returned; the spot top-up is a one-shot budget and
+/// there is no second pass — so every stock that had not printed at that
+/// instant lost its options for the whole session. At 09:15:30 only the liquid
+/// names have traded, which is how a few thousand of the ~22,440 authorized
+/// strikes could be locked in and the rest silently dropped.
+///
+/// It stays FAIL-OPEN: the caller ANDs this with `!out_of_time`, so a morning
+/// that never reaches quorum still dials the coverage it earned rather than
+/// nothing.
 #[must_use]
 pub fn stock_options_are_pending(selection: &ContractSelection) -> bool {
-    selection.stock_options == 0 && selection.underlyings_without_spot > 0
+    // Nothing to price is FINISHED, not pending. Without this arm a master
+    // carrying no stock options at all would hold the retry loop to the
+    // deadline every single day.
+    if selection.stock_option_underlyings == 0 {
+        return false;
+    }
+    // Everything the master offered was priced. Whatever happened next —
+    // including `no_room`, which retrying cannot fix — is final.
+    if selection.underlyings_without_spot == 0 {
+        return false;
+    }
+    let priced = selection
+        .stock_option_underlyings
+        .saturating_sub(selection.underlyings_without_spot);
+    // Integer cross-multiply, never a float ratio. A percentage computed in
+    // f64 and compared for ordering ties differently at the boundary depending
+    // on rounding, and this decides whether ~22,000 contracts are subscribed
+    // for the day.
+    priced.saturating_mul(100)
+        < selection
+            .stock_option_underlyings
+            .saturating_mul(STOCK_OPTION_PRICING_QUORUM_PERCENT)
 }
 
 /// What happened to one attempted subscription.
@@ -723,6 +901,9 @@ fn build_ladders<'a>(
     out: &mut ContractSelection,
 ) -> Vec<Ladder<'a>> {
     let mut ladders = Vec::with_capacity(stock_opt.len());
+    // Recorded BEFORE any refusal, so the pricing quorum's denominator is the
+    // master's full ask rather than whatever happened to survive.
+    out.stock_option_underlyings = stock_opt.len();
     // Sorted so the selection is deterministic regardless of hash order.
     let mut underlyings: Vec<&&str> = stock_opt.keys().collect();
     underlyings.sort_unstable();
@@ -997,6 +1178,11 @@ pub async fn load_contract_universe(
                 "contract universe: today's contract artifact is unreadable — the lane will \
                  carry its spot universe only. No futures, no option contracts."
             );
+            // Bumped HERE rather than through `record_contract_verdict`: this
+            // path returns a default selection, which carries none of the
+            // information needed to classify what went wrong.
+            metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "artifact_unreadable")
+                .increment(1);
             return ContractSelection::default();
         }
     };
@@ -1014,6 +1200,12 @@ pub async fn load_contract_universe(
                 "contract universe: the symbol map is unreadable, so at-the-money cannot be \
                  located for any stock. Futures and index chains are unaffected."
             );
+            // Same reasoning as the artifact arm: the selection continues from
+            // here with an empty map and would classify only as `no_ladders`,
+            // which reads as "no stock priced yet" — a normal pre-open state —
+            // rather than "the map itself is broken".
+            metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "symbol_map_unreadable")
+                .increment(1);
             HashMap::new()
         }
     };
@@ -1034,6 +1226,7 @@ pub async fn load_contract_universe(
         stock_options = selection.stock_options,
         atm_window = selection.atm_window_used,
         atm_window_reason = selection.atm_window_reason,
+        underlyings_total = selection.stock_option_underlyings,
         without_spot = selection.underlyings_without_spot,
         dropped_for_capacity = selection.dropped_for_capacity,
         "contract universe resolved"
@@ -1041,8 +1234,14 @@ pub async fn load_contract_universe(
     selection
 }
 
-/// Reads today's latest price per instrument. Empty on any failure, said once.
-async fn fetch_spot_prices(
+/// Reads each underlying's LAST price today from `ticks`, keyed on the I-P1-11
+/// composite.
+///
+/// `pub` since 2026-08-21 so the depth selector can share the ONE spot fetch
+/// rather than issue a second identical query on the same 60s retry tick.
+///
+// TEST-EXEMPT: async HTTP I/O; the pure parts it composes — build_spot_price_query and parse_spot_prices — are separately tested, including the pin that the query carries no session filter.
+pub async fn fetch_spot_prices(
     questdb: &tickvault_common::config::QuestDbConfig,
     today_ist_nanos: i64,
 ) -> HashMap<(u64, u8), i64> {
@@ -1302,6 +1501,88 @@ mod tests {
         rows
     }
 
+    /// The pre-open call auction settles at 09:08–09:12 IST and publishes a
+    /// real exchange equilibrium price for every scrip. That price is exactly
+    /// what the ATM window needs, and it exists THREE MINUTES BEFORE the
+    /// 09:15 open — so nothing about locating at-the-money requires waiting
+    /// for the continuous session to start.
+    ///
+    /// This is pinned because the opposite was ASSUMED. The reasoning ran
+    /// "ATM needs a spot price, our feed's ticks start at 09:15, therefore
+    /// contracts cannot resolve before 09:15" — and every step of that is
+    /// true except the middle one. There is no session filter anywhere in
+    /// this path:
+    ///
+    ///   * a pre-open tick IS persisted — `dhan_feed_stack`'s
+    ///     `test_pre_open_tick_is_written_even_though_it_opens_no_candle`
+    ///     pins that the candle-session rule stopped deciding what gets
+    ///     CAPTURED;
+    ///   * `build_spot_price_query` filters on `ts >= today AND ltp > 0` and
+    ///     nothing else, so a 09:10 price qualifies exactly like a 09:20 one;
+    ///   * and the selection below treats it as any other price.
+    ///
+    /// The chain was already built. What was missing was anybody checking,
+    /// which is why a capability we already had got written down as a
+    /// limitation we had to engineer around.
+    #[test]
+    fn a_pre_open_price_locates_at_the_money_exactly_like_a_session_price() {
+        let rows = stock_ladder("RELIANCE");
+
+        // The identical spot, reached two ways. The selector cannot tell them
+        // apart, and that indistinguishability IS the property under test.
+        let from_pre_open = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 25_000);
+        let from_session = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 25_000);
+
+        assert_eq!(
+            from_pre_open.atm_window_used, 25,
+            "a pre-open equilibrium price must yield the FULL authorized window, \
+             not a narrowed one"
+        );
+        assert_eq!(from_pre_open.stock_options, 102, "51 strikes x 2 legs");
+        assert_eq!(
+            from_pre_open.underlyings_without_spot, 0,
+            "the underlying is priced — there is nothing left to wait for"
+        );
+        assert_eq!(from_pre_open.stock_options, from_session.stock_options);
+        assert_eq!(from_pre_open.atm_window_used, from_session.atm_window_used);
+    }
+
+    /// The query half of the same claim, asserted against the SQL itself.
+    ///
+    /// A session predicate added here later would silently push contract
+    /// resolution back to 09:15 and nothing else in the tree would fail — the
+    /// symptom is three lost minutes every morning, which no test would catch
+    /// and no counter would report.
+    #[test]
+    fn the_spot_price_query_has_no_session_filter_so_pre_open_prices_qualify() {
+        let sql = build_spot_price_query(1_700_000_000_000_000_000);
+        let lower = sql.to_lowercase();
+        assert!(
+            lower.contains("ltp > 0"),
+            "an unpriced row must still be excluded — this test must not be \
+             read as licence to accept zeros"
+        );
+        for banned in ["session", "09:15", "33300", "market_hours", "continuous"] {
+            assert!(
+                !lower.contains(banned),
+                "`{banned}` appears in the spot price query. A session bound here \
+                 discards the 09:08-09:12 pre-open equilibrium price, which is a \
+                 real exchange print and the earliest at-the-money can be known. \
+                 sql={sql}"
+            );
+        }
+    }
+
+    /// Non-vacuity for the pair above: an underlying with NO price at all must
+    /// still be refused. Otherwise "pre-open prices are accepted" would be
+    /// indistinguishable from "anything is accepted".
+    #[test]
+    fn accepting_pre_open_prices_does_not_accept_the_absence_of_one() {
+        let rows = stock_ladder("RELIANCE");
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.underlyings_without_spot, 1);
+    }
     #[test]
     fn stock_options_take_the_atm_window_both_legs() {
         let rows = stock_ladder("RELIANCE");
@@ -1548,15 +1829,199 @@ mod tests {
     #[test]
     fn test_stock_options_are_pending_reads_both_arms() {
         let mut sel = ContractSelection::default();
+
+        // Nothing to price at all is FINISHED, never pending — otherwise a
+        // master with no stock options holds the loop to the deadline daily.
+        sel.stock_option_underlyings = 0;
         sel.stock_options = 0;
         sel.underlyings_without_spot = 0;
         assert!(!stock_options_are_pending(&sel), "nothing to price");
 
+        // A real master with nothing priced yet.
+        sel.stock_option_underlyings = 208;
         sel.underlyings_without_spot = 208;
         assert!(stock_options_are_pending(&sel), "priceable, unpriced");
 
+        // ONE priced underlying out of 208.
+        //
+        // This arm used to assert NOT pending, and in doing so it ENCODED the
+        // 2026-08-21 defect: a single liquid stock printing at 09:15:30 closed
+        // the selection, and every stock that had not yet traded lost its
+        // options for the whole session with no second pass. The assertion is
+        // inverted here deliberately — under the quorum this is still pending.
         sel.stock_options = 1;
-        assert!(!stock_options_are_pending(&sel), "some were selected");
+        sel.underlyings_without_spot = 207;
+        assert!(
+            stock_options_are_pending(&sel),
+            "one priced underlying out of 208 must NOT close the selection — that is precisely \
+             the defect the quorum exists to fix"
+        );
+
+        // 125 of 208 priced = 60.1%, just over the quorum.
+        sel.underlyings_without_spot = 83;
+        assert!(
+            !stock_options_are_pending(&sel),
+            "the quorum is a FLOOR, not 'all' — waiting for the illiquid tail would spend the \
+             whole allowance on names nobody trades"
+        );
+
+        // Everything priced: final, whatever happened next.
+        sel.underlyings_without_spot = 0;
+        assert!(!stock_options_are_pending(&sel), "all priced");
+    }
+
+    /// An ATM window narrowed below the authorized 25 IS a defect, even though
+    /// options were selected and every other field looks healthy.
+    ///
+    /// This is the case that produces NO signal of any kind today: the
+    /// selection succeeds, the log line prints a smaller number than the
+    /// operator authorized, and nothing counts it.
+    #[test]
+    fn contract_verdict_reasons_flags_a_shrunk_window_even_when_options_were_selected() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = 3;
+        assert_eq!(contract_verdict_reasons(&sel), vec!["window_shrunk"]);
+    }
+
+    /// Non-vacuity. Without this the guard above would pass on a function that
+    /// reported a defect unconditionally.
+    #[test]
+    fn contract_verdict_reasons_reports_nothing_for_a_full_window() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        assert!(
+            contract_verdict_reasons(&sel).is_empty(),
+            "a healthy selection must report NOTHING — a counter that fires on a good day \
+             trains the operator to ignore it"
+        );
+    }
+
+    #[test]
+    fn contract_verdict_reasons_report_no_contracts_for_an_empty_selection() {
+        let sel = ContractSelection::default();
+        assert!(contract_verdict_reasons(&sel).contains(&"no_contracts"));
+    }
+
+    /// A master that genuinely lists no stock options reports `no_ladders`
+    /// legitimately. Paging for it would fire on every such day forever.
+    #[test]
+    fn contract_verdict_reasons_holds_no_ladders_harmless_at_zero_underlyings() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.atm_window_reason = "no_ladders";
+        sel.stock_option_underlyings = 0;
+        assert!(contract_verdict_reasons(&sel).is_empty());
+
+        // ...but with a real master behind it, it IS the 2026-08-20 defect.
+        sel.stock_option_underlyings = 208;
+        assert_eq!(contract_verdict_reasons(&sel), vec!["no_ladders"]);
+    }
+
+    /// Every reason the classifier can produce must be in the pre-registration
+    /// list, or its first — and on a once-per-session counter, its only —
+    /// increment is eaten as the CloudWatch delta baseline.
+    #[test]
+    fn pre_register_contract_failure_counters_covers_every_classified_reason() {
+        for reason in ["no_contracts", "no_ladders", "no_room", "window_shrunk"] {
+            assert!(
+                CONTRACT_FAILURE_REASONS.contains(&reason),
+                "`{reason}` can be emitted but is not pre-registered at 0"
+            );
+        }
+        // The two the classifier cannot produce, because their call sites have
+        // no ContractSelection to classify.
+        for reason in ["artifact_unreadable", "symbol_map_unreadable"] {
+            assert!(CONTRACT_FAILURE_REASONS.contains(&reason));
+        }
+    }
+
+    /// The emit wrappers must be callable with no recorder installed — which
+    /// is the state in every unit test and in the seconds before boot Step 3.
+
+    /// `gave_up` must be pre-registered like every other reason, or the ONE
+    /// increment it will ever make in a session is eaten as the CloudWatch
+    /// delta baseline — which would leave the give-up path exactly as silent
+    /// after this fix as it was before it.
+    #[test]
+    fn record_contract_give_up_uses_a_pre_registered_reason() {
+        assert!(
+            CONTRACT_FAILURE_REASONS.contains(&"gave_up"),
+            "the give-up reason must be pre-registered at 0"
+        );
+        // Safe with no recorder installed, like its siblings.
+        record_contract_give_up();
+    }
+
+    /// The classifier must NOT be able to produce `gave_up`. It classifies a
+    /// selection that exists; a give-up is the case where none does. If both
+    /// could emit it, a single failing session would count twice and the
+    /// reason would stop meaning anything specific.
+    #[test]
+    fn the_classifier_never_produces_the_give_up_reason() {
+        let empty = ContractSelection::default();
+        assert!(!contract_verdict_reasons(&empty).contains(&"gave_up"));
+        let mut full = ContractSelection::default();
+        full.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        full.stock_options = 500;
+        full.atm_window_reason = "applied";
+        full.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        assert!(!contract_verdict_reasons(&full).contains(&"gave_up"));
+    }
+    #[test]
+    fn record_contract_verdict_is_safe_without_a_recorder() {
+        pre_register_contract_failure_counters();
+        record_contract_verdict(&ContractSelection::default());
+    }
+
+    /// The quorum boundary, exactly. Integer cross-multiply rather than a
+    /// float ratio, so this cannot tie differently depending on rounding.
+    #[test]
+    fn the_quorum_boundary_is_inclusive_at_the_percentage() {
+        let mut sel = ContractSelection::default();
+        sel.stock_option_underlyings = 10;
+        sel.stock_options = 1;
+
+        sel.underlyings_without_spot = 4; // 6 priced = 60% exactly
+        assert!(
+            !stock_options_are_pending(&sel),
+            "exactly at the quorum must be FINISHED, not pending"
+        );
+
+        sel.underlyings_without_spot = 5; // 5 priced = 50%
+        assert!(
+            stock_options_are_pending(&sel),
+            "one under the quorum must still hold"
+        );
+    }
+
+    /// A selection that ran out of envelope room is FINAL. Retrying cannot
+    /// conjure connection slots, so holding for it would burn the allowance
+    /// and then dial the same thing anyway.
+    #[test]
+    fn a_no_room_selection_is_not_held_by_the_quorum() {
+        let mut sel = ContractSelection::default();
+        sel.stock_option_underlyings = 208;
+        sel.underlyings_without_spot = 0;
+        sel.atm_window_reason = "no_room";
+        assert!(!stock_options_are_pending(&sel));
     }
 
     /// The live 2026-08-20 shape: a master full of stock options, not one
