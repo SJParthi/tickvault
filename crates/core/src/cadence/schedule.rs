@@ -14,11 +14,11 @@
 
 use tickvault_common::config::CadenceConfig;
 use tickvault_common::constants::{
-    CADENCE_GROWW_WAVE_STEP_MS, CADENCE_SPOT_WINDOW_MS, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
+    CADENCE_SPOT_WINDOW_MS, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
     SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 
-use super::ladder::{groww_wave_indices, spot_second_buckets};
+use super::ladder::spot_second_buckets;
 use crate::pipeline::chain_snapshot::ChainUnderlying;
 
 /// First cadence cycle boundary of the session: T = 09:16:00 IST (the
@@ -185,7 +185,7 @@ pub fn next_joinable_boundary(
     last_boundary: Option<u32>,
     cfg: &CadenceConfig,
 ) -> Option<u32> {
-    let earliest_offset_ms = cfg.groww_anchor_offset_ms.min(cfg.dhan_burst_offset_ms);
+    let earliest_offset_ms = cfg.dhan_burst_offset_ms;
     // Horizon: strictly after the last completed boundary.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     // APPROVED: ms-of-day / 1000 is within [0, 86_400) — fits u32.
@@ -248,24 +248,12 @@ pub struct CycleSlots {
     /// later 1000ms buckets. Base clamped ≥ T + `spot_min_post_close_ms`
     /// (the just-closed candle cannot exist pre-close).
     pub dhan_spot_slots_ms: [i64; 4],
-    /// The Groww fallback-shape ladder step this table was built at
-    /// (2026-07-15 three-choice ladder: 0 = `:00` all-7 burst;
-    /// 1 = `:01` chains / `:02` all 4 spots; 2 = `:01` / `:02` core
-    /// spots / `:03` VIX alone).
-    pub groww_shape: u8,
     /// Groww chain-wave instant (all 3 chains in parallel).
-    pub groww_chain_wave_ms: i64,
     /// Groww core-spot-wave instant (NIFTY/BANKNIFTY/SENSEX spots).
-    pub groww_spot_wave_ms: i64,
     /// Groww VIX-spot-wave instant (equals the spot wave except at
-    /// choice 3, where VIX fires alone last — context-only priority).
-    pub groww_vix_wave_ms: i64,
     /// Groww wave-failure verdict instant (LAST wave + burst timeout).
-    pub groww_verdict_ms: i64,
     /// Dhan lane staleness cutoff (absolute).
     pub dhan_cutoff_ms: i64,
-    /// Groww lane staleness cutoff (absolute).
-    pub groww_cutoff_ms: i64,
     /// TRUE for the session's LAST cycle (T = 15:30:00) — its event
     /// decisions are stamped `post_close=true`.
     pub post_close: bool,
@@ -281,7 +269,6 @@ pub fn build_cycle_slots(
     boundary_secs_of_day: u32,
     dhan_shape: u8,
     spot_step: u8,
-    groww_shape: u8,
     cfg: &CadenceConfig,
 ) -> CycleSlots {
     let t_ms = i64::from(boundary_secs_of_day) * MS_PER_SEC;
@@ -311,19 +298,6 @@ pub fn build_cycle_slots(
         *slot = spot_base.saturating_add(bucket_offset);
     }
 
-    let groww_anchor_ms = t_ms.saturating_add(cfg.groww_anchor_offset_ms);
-    let (chain_wave, spot_wave, vix_wave) = groww_wave_indices(groww_shape);
-    let wave_ms = |wave: usize| -> i64 {
-        // APPROVED: wave indices are 0..=3 — the cast is safe.
-        #[allow(clippy::cast_possible_wrap)]
-        groww_anchor_ms.saturating_add((wave as i64).saturating_mul(CADENCE_GROWW_WAVE_STEP_MS))
-    };
-    let groww_chain_wave_ms = wave_ms(chain_wave);
-    let groww_spot_wave_ms = wave_ms(spot_wave);
-    let groww_vix_wave_ms = wave_ms(vix_wave);
-    let last_wave_ms = groww_chain_wave_ms
-        .max(groww_spot_wave_ms)
-        .max(groww_vix_wave_ms);
     CycleSlots {
         boundary_secs_of_day,
         cycle_minute_ist: boundary_secs_of_day.saturating_sub(SECS_PER_CYCLE),
@@ -333,13 +307,7 @@ pub fn build_cycle_slots(
         dhan_chain_retry_slots_ms,
         spot_step,
         dhan_spot_slots_ms,
-        groww_shape,
-        groww_chain_wave_ms,
-        groww_spot_wave_ms,
-        groww_vix_wave_ms,
-        groww_verdict_ms: last_wave_ms.saturating_add(cfg.groww_burst_timeout_ms),
         dhan_cutoff_ms: t_ms.saturating_add(cfg.dhan_lane_cutoff_ms),
-        groww_cutoff_ms: t_ms.saturating_add(cfg.groww_lane_cutoff_ms),
         post_close: boundary_secs_of_day == CADENCE_LAST_CYCLE_BOUNDARY_SECS_OF_DAY_IST,
     }
 }
@@ -462,13 +430,7 @@ mod tests {
         assert_eq!(slots.spot_step, 0);
         assert_eq!(slots.dhan_spot_slots_ms, [ms(10, 0, 1, 0); 4]);
         // Groww shape 0 (choice 1): all waves at T+0, verdict at T+800.
-        assert_eq!(slots.groww_shape, 0);
-        assert_eq!(slots.groww_chain_wave_ms, ms(10, 0, 0, 0));
-        assert_eq!(slots.groww_spot_wave_ms, ms(10, 0, 0, 0));
-        assert_eq!(slots.groww_vix_wave_ms, ms(10, 0, 0, 0));
-        assert_eq!(slots.groww_verdict_ms, ms(10, 0, 0, 800));
         // Cutoffs :06 / :15.
-        assert_eq!(slots.groww_cutoff_ms, ms(10, 0, 6, 0));
         assert_eq!(slots.dhan_cutoff_ms, ms(10, 0, 15, 0));
         assert!(!slots.post_close);
     }
@@ -567,43 +529,6 @@ mod tests {
         // retry round (window-stepped appends) sits inside the :15 Dhan
         // cutoff.
         assert!(r1s3.dhan_spot_slots_ms[3] + 4 * 1_000 <= r1s3.dhan_cutoff_ms);
-    }
-
-    #[test]
-    fn test_cadence_schedule_groww_three_choice_wave_instants_no_overlap() {
-        // The coordinator-relayed three-choice ladder (2026-07-15).
-        let c = cfg();
-        // Choice 2 (shape 1): :01 chains, :02 ALL 4 spots (VIX included);
-        // verdict = last wave + 800.
-        let s1 = build_cycle_slots(10 * 3600, 0, 0, 1, &c);
-        assert_eq!(s1.groww_shape, 1);
-        assert_eq!(s1.groww_chain_wave_ms, ms(10, 0, 1, 0));
-        assert_eq!(s1.groww_spot_wave_ms, ms(10, 0, 2, 0));
-        assert_eq!(s1.groww_vix_wave_ms, ms(10, 0, 2, 0));
-        assert_eq!(s1.groww_verdict_ms, ms(10, 0, 2, 800));
-        // Choice 3 (shape 2, LAST resort): :01 chains, :02 core spots,
-        // :03 VIX alone.
-        let s2 = build_cycle_slots(10 * 3600, 0, 0, 2, &c);
-        assert_eq!(s2.groww_chain_wave_ms, ms(10, 0, 1, 0));
-        assert_eq!(s2.groww_spot_wave_ms, ms(10, 0, 2, 0));
-        assert_eq!(s2.groww_vix_wave_ms, ms(10, 0, 3, 0));
-        assert_eq!(s2.groww_verdict_ms, ms(10, 0, 3, 800));
-        // NO-OVERLAP-INTO-NEXT-BURST: for EVERY shape, the last wave, the
-        // verdict, the cutoff AND the worst-case fully-sequential 7-leg
-        // fallback tail end strictly before the NEXT minute's burst
-        // anchor (the config validate() pins the same bound at boot).
-        let next_burst_ms = i64::from(10 * 3600 + 60) * 1_000 + c.groww_anchor_offset_ms;
-        for shape in 0..=2u8 {
-            let s = build_cycle_slots(10 * 3600, 0, 0, shape, &c);
-            let worst_tail = s.groww_verdict_ms + 7 * c.groww_request_timeout_ms;
-            assert!(s.groww_vix_wave_ms < next_burst_ms, "shape {shape} wave");
-            assert!(
-                s.groww_verdict_ms < s.groww_cutoff_ms,
-                "shape {shape} verdict"
-            );
-            assert!(s.groww_cutoff_ms < next_burst_ms, "shape {shape} cutoff");
-            assert!(worst_tail < next_burst_ms, "shape {shape} fallback tail");
-        }
     }
 
     #[test]

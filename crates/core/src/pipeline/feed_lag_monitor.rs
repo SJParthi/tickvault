@@ -184,7 +184,6 @@ impl DailyLagHistogram {
 /// Per-feed day histograms — const-initialized statics (no OnceLock needed;
 /// the arrays are fixed-size atomics).
 static DHAN_DAY_LAG_HIST: DailyLagHistogram = DailyLagHistogram::new();
-static GROWW_DAY_LAG_HIST: DailyLagHistogram = DailyLagHistogram::new();
 // TrueData (feed #4) is a live-tick feed, so it gets its own day-lag
 // histogram exactly like Dhan/Groww (const-initialized, zero cost).
 static TRUEDATA_DAY_LAG_HIST: DailyLagHistogram = DailyLagHistogram::new();
@@ -192,7 +191,6 @@ static TRUEDATA_DAY_LAG_HIST: DailyLagHistogram = DailyLagHistogram::new();
 fn day_hist(feed: Feed) -> &'static DailyLagHistogram {
     match feed {
         Feed::Dhan => &DHAN_DAY_LAG_HIST,
-        Feed::Groww => &GROWW_DAY_LAG_HIST,
         Feed::Truedata => &TRUEDATA_DAY_LAG_HIST,
     }
 }
@@ -302,24 +300,24 @@ mod tests {
 
     #[test]
     fn test_reset_day_lag_histogram_and_day_lag_summary_route_to_the_right_feed() {
-        // The pub wrappers must route Groww→Groww (and never clear Dhan).
+        // The pub wrappers must route TrueData→TrueData (and never clear Dhan).
         // Uses the process-global statics with relative assertions only —
         // sibling tests may also touch them.
         for _ in 0..MIN_LAG_SAMPLES {
-            GROWW_DAY_LAG_HIST.record_ns(180 * NANOS_PER_MS as u64);
+            TRUEDATA_DAY_LAG_HIST.record_ns(180 * NANOS_PER_MS as u64);
         }
-        let s = day_lag_summary(Feed::Groww).expect("groww day summary");
+        let s = day_lag_summary(Feed::Truedata).expect("truedata day summary");
         assert!(s.samples >= i64::try_from(MIN_LAG_SAMPLES).unwrap_or(i64::MAX));
         assert!(
             s.p50_ms > 0 && s.p50_ms < 1_000,
-            "Groww ms-precision keeps a 180 ms median sub-second: {}",
+            "TrueData ms-precision keeps a 180 ms median sub-second: {}",
             s.p50_ms
         );
-        reset_day_lag_histogram(Feed::Groww);
+        reset_day_lag_histogram(Feed::Truedata);
         assert_eq!(
-            day_lag_summary(Feed::Groww),
+            day_lag_summary(Feed::Truedata),
             None,
-            "reset must clear the Groww day histogram"
+            "reset must clear the TrueData day histogram"
         );
     }
 }

@@ -260,8 +260,6 @@ pub struct UnderlyingExpiryView {
     /// Dhan's raw policy date (provenance — kept even when it loses
     /// nothing: the winner IS this when present).
     pub dhan_raw: Option<ExpiryDate>,
-    /// Groww's raw policy date (provenance).
-    pub groww_raw: Option<ExpiryDate>,
     /// TRUE when both brokers resolved for the day and their policy dates
     /// differ — Dhan won, loudly (CADENCE-01 `expiry_disagreement`),
     /// never a silent override.
@@ -313,13 +311,9 @@ impl StoreState {
 
     fn view(&self, underlying: ChainUnderlying) -> UnderlyingExpiryView {
         let dhan_raw = self.raw[Feed::Dhan.index()][underlying.index()];
-        let groww_raw = self.raw[Feed::Groww.index()][underlying.index()];
         UnderlyingExpiryView {
-            // Dhan (exchange-sourced expirylist) WINS for keying BOTH
-            // lanes whenever it resolved; Groww's date drives otherwise.
-            winner: dhan_raw.or(groww_raw),
+            winner: dhan_raw,
             dhan_raw,
-            groww_raw,
             disagreement: self.disagreement[underlying.index()],
         }
     }
@@ -358,14 +352,9 @@ impl DayLockedExpiryStore {
             *slot = Some(date);
             true
         };
-        let view = state.view(underlying);
-        let newly_disagreeing = match (view.dhan_raw, view.groww_raw) {
-            (Some(d), Some(g)) if d != g && !state.disagreement[underlying.index()] => {
-                state.disagreement[underlying.index()] = true;
-                true
-            }
-            _ => false,
-        };
+        // Cross-broker disagreement was REMOVED with the Groww lane
+        // 2026-08-21 — a single broker has nothing to disagree with.
+        let newly_disagreeing = false;
         RecordVerdict {
             recorded,
             newly_disagreeing,

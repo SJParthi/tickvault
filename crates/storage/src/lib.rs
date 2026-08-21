@@ -97,6 +97,7 @@ pub mod console_views;
 // panic fallback (Client::new() panics on TLS/resolver/fd init failure —
 // a silent tokio-task death).
 pub mod http_client;
+pub mod ilp_flush_reconnect;
 // SP5 (parity plan, operator directive 2026-06-02 narrowed cross-verify): ONE
 // unified post-market live-vs-backtest 1m parity audit table + writer + CSV
 // (`feed` IN the DEDUP key). Merges the two former siloed modules

@@ -188,15 +188,13 @@ impl CadenceClock for SystemCadenceClock {
 // ---------------------------------------------------------------------------
 
 /// Everything the runner needs (built by `crates/app`'s boot wiring).
-pub struct CadenceRunnerDeps<D, G> {
+pub struct CadenceRunnerDeps<D> {
     /// The validated `[cadence]` config.
     pub config: CadenceConfig,
     /// Trading-day calendar.
     pub calendar: Arc<TradingCalendar>,
     /// The Dhan lane executor (the dry-run logger in this PR).
     pub dhan_executor: Arc<D>,
-    /// The Groww lane executor (the dry-run logger in this PR).
-    pub groww_executor: Arc<G>,
     /// The day-locked expiry lookup SEAM (2026-07-15). Stamped onto
     /// every chain request at build time; the scheduler NEVER guesses.
     /// Production wiring passes the process-global
@@ -236,13 +234,12 @@ pub struct CadenceRunnerDeps<D, G> {
     pub shutdown: Arc<Notify>,
 }
 
-impl<D, G> Clone for CadenceRunnerDeps<D, G> {
+impl<D> Clone for CadenceRunnerDeps<D> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
             calendar: Arc::clone(&self.calendar),
             dhan_executor: Arc::clone(&self.dhan_executor),
-            groww_executor: Arc::clone(&self.groww_executor),
             expiry_resolver: Arc::clone(&self.expiry_resolver),
             expiry_store: self.expiry_store.as_ref().map(Arc::clone),
             gates: Arc::clone(&self.gates),
@@ -262,10 +259,9 @@ impl<D, G> Clone for CadenceRunnerDeps<D, G> {
 /// (`tv_cadence_runner_respawn_total{reason}`), logged as CADENCE-03
 /// `stage="respawn"`, backed off and respawned.
 // TEST-EXEMPT: tokio supervision shell over the unit-tested pure engine (run_cadence_loop / run_cycle); the spawn site is pinned by crates/app/tests/cadence_boot_wiring_guard.rs and the graceful-shutdown supervisor path is exercised by test_cadence_supervisor_graceful_shutdown_not_respawning; the respawn/backoff arms are the WS-GAP-05 house pattern (unwind-build self-heal only — release panic=abort).
-pub fn spawn_supervised_cadence_runner<D, G>(deps: CadenceRunnerDeps<D, G>) -> JoinHandle<()>
+pub fn spawn_supervised_cadence_runner<D>(deps: CadenceRunnerDeps<D>) -> JoinHandle<()>
 where
     D: CadenceExecutor + 'static,
-    G: CadenceExecutor + 'static,
 {
     tokio::spawn(async move {
         loop {
@@ -318,11 +314,10 @@ pub enum LoopExit {
 /// resets. Generic over the injected clock so the dry-run integration
 /// test drives it under paused tokio time.
 // TEST-EXEMPT: tokio orchestration over unit-tested pure parts (schedule/gate/ladder/assembly/decision); exercised end-to-end by test_cadence_runner_dry_run_full_cycle_emits_decisions_or_skips.
-pub async fn run_cadence_loop<C, D, G>(clock: Arc<C>, deps: CadenceRunnerDeps<D, G>) -> LoopExit
+pub async fn run_cadence_loop<C, D>(clock: Arc<C>, deps: CadenceRunnerDeps<D>) -> LoopExit
 where
     C: CadenceClock,
     D: CadenceExecutor + 'static,
-    G: CadenceExecutor + 'static,
 {
     let cfg = deps.config.clone();
     // ONE pinned shutdown future for the WHOLE loop (created before any
@@ -381,7 +376,6 @@ where
     // cannot admit the full step-0 simultaneous group).
     let spot_step_floor = min_spot_step_for_cap(cfg.spot_window_cap);
     let mut spot_ladder = StreakLadder::starting_at(spot_step_floor);
-    let mut groww_ladder = StreakLadder::starting_at(0);
     let mut latch = DecisionLatch::new();
     let mut last_boundary: Option<u32> = None;
     // M9 (audit 2026-07-20): once-per-day latch for the session-tail
@@ -392,7 +386,6 @@ where
     let mut lanes_parked = false;
     metrics::gauge!("tv_cadence_dhan_shape_step").set(f64::from(dhan_shape_ladder.step));
     metrics::gauge!("tv_cadence_spot_concurrency_step").set(f64::from(spot_ladder.step));
-    metrics::gauge!("tv_cadence_groww_shape_step").set(f64::from(groww_ladder.step));
 
     loop {
         // Day-start reset: rung 0, fresh boundary horizon (design §1).
@@ -409,7 +402,6 @@ where
             // RS1(b): the day-start reset re-arms the rung-0 re-entry cap.
             dhan_rung0_cap = DhanRung0ReentryCap::default();
             spot_ladder = StreakLadder::starting_at(spot_step_floor);
-            groww_ladder = StreakLadder::starting_at(0);
             exhausted_episode = false;
             last_boundary = None;
             final_tail_accounted = false;
@@ -425,7 +417,6 @@ where
             latch = DecisionLatch::new();
             metrics::gauge!("tv_cadence_dhan_shape_step").set(0.0);
             metrics::gauge!("tv_cadence_spot_concurrency_step").set(f64::from(spot_ladder.step));
-            metrics::gauge!("tv_cadence_groww_shape_step").set(0.0);
         }
 
         // BOTH lanes disabled ⇒ PARK level-triggered WITHOUT consuming
@@ -517,13 +508,7 @@ where
         }
         last_boundary = Some(boundary);
 
-        let slots = build_cycle_slots(
-            boundary,
-            dhan_shape_ladder.step,
-            spot_ladder.step,
-            groww_ladder.step,
-            &cfg,
-        );
+        let slots = build_cycle_slots(boundary, dhan_shape_ladder.step, spot_ladder.step, &cfg);
         let demote_nominal = first_cycle_after_reseed;
         first_cycle_after_reseed = false;
         let outcome = run_cycle(
@@ -568,21 +553,6 @@ where
             );
         }
         metrics::gauge!("tv_cadence_spot_concurrency_step").set(f64::from(spot_ladder.step));
-        if let Some(shift) = groww_ladder.advance(
-            groww_dirty,
-            cfg.concurrency_degrade_after_dirty_cycles,
-            cfg.concurrency_recover_after_clean_cycles,
-            0,
-            GROWW_SHAPE_MAX_STEP,
-        ) {
-            log_concurrency_shift(
-                "groww_shape_shift",
-                "tv_cadence_groww_shape_shifts_total",
-                shift,
-                groww_ladder.step,
-            );
-        }
-        metrics::gauge!("tv_cadence_groww_shape_step").set(f64::from(groww_ladder.step));
         // Dhan SHAPE ladder bookkeeping (day-scoped; operator directive
         // 2026-07-16): a dirty cycle while ALREADY at the split-fallback
         // rung is the exhausted edge (cross-source steady state) —
@@ -716,14 +686,13 @@ impl Drop for AbortOnDrop {
 /// (15:30 IST). Lanes run degraded meanwhile (chains fire
 /// `expiry_yyyymmdd = None`).
 // TEST-EXEMPT: tokio retry shell over the unit-tested pure policy/store/page primitives (resolve_policy_expiry / DayLockedExpiryStore / expiry_page_due) + the unit-tested resolve_broker_expiries attempt fn; exercised end-to-end by test_cadence_runner_expiry_boot_phase_resolves_and_stamps.
-async fn run_expiry_resolution_loop<C, D, G>(
+async fn run_expiry_resolution_loop<C, D>(
     clock: Arc<C>,
-    deps: CadenceRunnerDeps<D, G>,
+    deps: CadenceRunnerDeps<D>,
     store: Arc<DayLockedExpiryStore>,
 ) where
     C: CadenceClock,
     D: CadenceExecutor + 'static,
-    G: CadenceExecutor + 'static,
 {
     let interval_ms = deps.config.expiry_retry_interval_ms.max(1);
     let deadline_secs = deps.config.expiry_deadline_secs_of_day_ist;
@@ -783,23 +752,10 @@ async fn run_expiry_resolution_loop<C, D, G>(
                 )
                 .await;
             }
-            if groww_on {
-                attempted[Feed::Groww.index()] = resolve_broker_expiries(
-                    clock.as_ref(),
-                    deps.groww_executor.as_ref(),
-                    store.as_ref(),
-                    deps.gates.as_ref(),
-                    Feed::Groww,
-                    today,
-                    paged[Feed::Groww.index()],
-                    deps.notifier.as_ref(),
-                )
-                .await;
-            }
             // E4 + R3: fold this iteration's wave into the per-pair
             // REAL-failed counters — only pairs whose fetch was actually
             // dispatched AND that stayed unresolved advance.
-            for feed in [Feed::Dhan, Feed::Groww] {
+            for feed in [Feed::Dhan] {
                 for underlying in ChainUnderlying::ALL {
                     let cell = &mut failed_waves[feed.index()][underlying.index()];
                     *cell = next_failed_wave_count(
@@ -811,7 +767,7 @@ async fn run_expiry_resolution_loop<C, D, G>(
             }
             // The deadline PAGE (edge-latched per pair per day; disabled
             // lanes never page — nothing fires for them).
-            for (feed, enabled) in [(Feed::Dhan, dhan_on), (Feed::Groww, groww_on)] {
+            for (feed, enabled) in [(Feed::Dhan, dhan_on)] {
                 if !enabled {
                     continue;
                 }
@@ -1128,52 +1084,6 @@ where
                 );
             }
         }
-        if verdict.newly_disagreeing {
-            let view = store.view(today, *underlying);
-            metrics::counter!(
-                "tv_cadence_expiry_disagreement_total",
-                "underlying" => underlying.as_str()
-            )
-            .increment(1);
-            error!(
-                code = ErrorCode::Cadence01LaneDegraded.code_str(),
-                stage = "expiry_disagreement",
-                underlying = underlying.as_str(),
-                dhan = view
-                    .dhan_raw
-                    .map(super::expiry::ExpiryDate::yyyymmdd)
-                    .unwrap_or(0),
-                groww = view
-                    .groww_raw
-                    .map(super::expiry::ExpiryDate::yyyymmdd)
-                    .unwrap_or(0),
-                winner = view
-                    .winner
-                    .map(super::expiry::ExpiryDate::yyyymmdd)
-                    .unwrap_or(0),
-                "CADENCE-01: brokers disagree on the policy expiry — Dhan \
-                 WINS for keying BOTH lanes (edge-latched per underlying \
-                 per day; both raws recorded for provenance)"
-            );
-            // R6 (2026-07-16): the REAL typed Telegram page — rides the
-            // SAME `newly_disagreeing` edge latch (once per underlying
-            // per day; the store latches, never per wave). `None` sink =
-            // log-only (test wiring); production threads the boot
-            // NotificationService. Dated authority row:
-            // `dhan-rest-only-noise-lock-2026-07-14.md` §2.2.
-            if let Some(sink) = notifier {
-                let iso = |d: Option<super::expiry::ExpiryDate>| {
-                    d.map_or_else(|| "unknown".to_owned(), |d| d.as_iso_string())
-                };
-                sink.notify(
-                    crate::notification::NotificationEvent::CadenceExpiryDisagreement {
-                        underlying: underlying.as_str().to_owned(),
-                        dhan_date: iso(view.dhan_raw),
-                        groww_date: iso(view.groww_raw),
-                    },
-                );
-            }
-        }
     }
     attempted
 }
@@ -1202,22 +1112,6 @@ enum CycleRun {
     },
 }
 
-/// Which legs one Groww wave fires (the 2026-07-15 three-choice ladder:
-/// shape 0 fires all three legs at ONE instant — the classic all-7
-/// burst; shapes 1/2 spread them across 1000ms-spaced waves). `pub` so
-/// the zero-429 replay proof drives [`build_cycle_events`] DIRECTLY
-/// (verifier F3, 2026-07-15) — no runtime consumer outside this module.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GrowwWaveLeg {
-    /// All 3 option chains in parallel.
-    Chains,
-    /// The 3 core underlying spots (NIFTY/BANKNIFTY/SENSEX) in parallel.
-    CoreSpots,
-    /// The advisory INDIA VIX spot (alone last at choice 3 — deliberately
-    /// lowest priority, context-only).
-    VixSpot,
-}
-
 /// One scheduled instant inside the cycle. `pub` for the F3 replay-proof
 /// parity drive of [`build_cycle_events`] (2026-07-15).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1229,13 +1123,6 @@ pub enum CycleAction {
     },
     /// A Dhan spot fire (`nominal` = a primary schedule slot).
     DhanSpot { target_idx: usize, nominal: bool },
-    /// One Groww primary wave (shape 0: three same-instant waves = the
-    /// all-7 burst).
-    GrowwWave { leg: GrowwWaveLeg },
-    /// The Groww wave-failure verdict + fallback launch.
-    GrowwVerdict,
-    /// The Groww lane staleness cutoff.
-    GrowwCutoff,
     /// The Dhan lane staleness cutoff.
     DhanCutoff,
     /// The boundary+deadline native-retry chain deadline slot (item 3).
@@ -1423,7 +1310,6 @@ impl LaneRun {
 pub fn build_cycle_events(
     slots: &CycleSlots,
     dhan_enabled: bool,
-    groww_enabled: bool,
     native_retry_enabled: bool,
 ) -> Vec<(i64, CycleAction)> {
     let mut events: Vec<(i64, CycleAction)> = Vec::with_capacity(16);
@@ -1447,30 +1333,6 @@ pub fn build_cycle_events(
             ));
         }
         events.push((slots.dhan_cutoff_ms, CycleAction::DhanCutoff));
-    }
-    if groww_enabled {
-        // The shape ladder's waves (shape 0: all three at the burst
-        // anchor = the classic all-7 burst; shapes 1/2 spread them).
-        events.push((
-            slots.groww_chain_wave_ms,
-            CycleAction::GrowwWave {
-                leg: GrowwWaveLeg::Chains,
-            },
-        ));
-        events.push((
-            slots.groww_spot_wave_ms,
-            CycleAction::GrowwWave {
-                leg: GrowwWaveLeg::CoreSpots,
-            },
-        ));
-        events.push((
-            slots.groww_vix_wave_ms,
-            CycleAction::GrowwWave {
-                leg: GrowwWaveLeg::VixSpot,
-            },
-        ));
-        events.push((slots.groww_verdict_ms, CycleAction::GrowwVerdict));
-        events.push((slots.groww_cutoff_ms, CycleAction::GrowwCutoff));
     }
     if native_retry_enabled {
         events.push((
@@ -1497,9 +1359,9 @@ const fn chain_gate_key(underlying_idx: usize) -> &'static str {
 /// bounded, cold-path allocations.
 // APPROVED: the single-cycle event loop is deliberately one function — splitting the select! arms would scatter the lane-state invariants.
 #[allow(clippy::too_many_lines)]
-async fn run_cycle<C, D, G>(
+async fn run_cycle<C, D>(
     clock: &Arc<C>,
-    deps: &CadenceRunnerDeps<D, G>,
+    deps: &CadenceRunnerDeps<D>,
     gates: &Arc<DhanGates>,
     slots: &CycleSlots,
     latch: &mut DecisionLatch,
@@ -1509,7 +1371,6 @@ async fn run_cycle<C, D, G>(
 where
     C: CadenceClock,
     D: CadenceExecutor + 'static,
-    G: CadenceExecutor + 'static,
 {
     let dhan_enabled = deps.dhan_enabled.load(Ordering::Acquire);
     let groww_enabled = deps.groww_enabled.load(Ordering::Acquire);
@@ -1517,15 +1378,10 @@ where
 
     let mut cycle = CycleState {
         dhan: LaneRun::new(Feed::Dhan, dhan_enabled, slots),
-        groww: LaneRun::new(Feed::Groww, groww_enabled, slots),
         events: Vec::new(),
         chain_retries_used: [0; 3],
         spot_retries_used: [0; 4],
         next_chain_retry_slot: 0,
-        groww_leg_ok: [false; 7],
-        groww_leg_attempts: [0; 7],
-        groww_leg_inflight: [false; 7],
-        groww_leg_malformed: [false; 7],
         groww_verdict_passed: false,
         groww_fallback_launched: false,
         late_wake_flagged: false,
@@ -1547,8 +1403,7 @@ where
     };
     // Anchor FSM arming (level-triggered per cycle per lane).
     arm_lane(&mut cycle.dhan);
-    arm_lane(&mut cycle.groww);
-    if cycle.dhan.resolved && cycle.groww.resolved {
+    if cycle.dhan.resolved {
         return CycleRun::Verdict {
             dhan_dirty: false,
             dhan_spot_dirty: false,
@@ -1556,17 +1411,12 @@ where
         };
     }
 
-    cycle.events = build_cycle_events(
-        slots,
-        cycle.dhan.enabled,
-        cycle.groww.enabled,
-        deps.config.native_retry_enabled,
-    );
+    cycle.events = build_cycle_events(slots, cycle.dhan.enabled, deps.config.native_retry_enabled);
 
     let (tx, mut rx) = mpsc::channel::<Completion>(CADENCE_COMPLETION_CHANNEL_CAPACITY);
 
     loop {
-        if cycle.dhan.resolved && cycle.groww.resolved && cycle.events.is_empty() {
+        if cycle.dhan.resolved && cycle.events.is_empty() {
             break;
         }
         let next_event_at = cycle.events.first().map(|(ms, _)| *ms);
@@ -1601,7 +1451,6 @@ where
             () = shutdown_fut.as_mut() => {
                 // Drop the cycle — no partial emit (design §7).
                 cycle.dhan.fsm(CadenceEvent::Shutdown);
-                cycle.groww.fsm(CadenceEvent::Shutdown);
                 return CycleRun::Shutdown;
             }
             Some(completion) = rx.recv() => {
@@ -1653,7 +1502,7 @@ where
                 if !cycle.dispatched_any {
                     let dhan_now = deps.dhan_enabled.load(Ordering::Acquire);
                     let groww_now = deps.groww_enabled.load(Ordering::Acquire);
-                    if dhan_now != cycle.dhan.enabled || groww_now != cycle.groww.enabled {
+                    if dhan_now != cycle.dhan.enabled {
                         info!(
                             dhan_enabled = dhan_now,
                             groww_enabled = groww_now,
@@ -1662,13 +1511,10 @@ where
                              fresh flags"
                         );
                         cycle.dhan = LaneRun::new(Feed::Dhan, dhan_now, slots);
-                        cycle.groww = LaneRun::new(Feed::Groww, groww_now, slots);
                         arm_lane(&mut cycle.dhan);
-                        arm_lane(&mut cycle.groww);
                         cycle.events = build_cycle_events(
                             slots,
                             dhan_now,
-                            groww_now,
                             deps.config.native_retry_enabled,
                         );
                         continue;
@@ -1697,7 +1543,7 @@ where
     // demoted to info! with a dry_run=true field. REAL failure classes
     // (fetch_failed / rate_limited) keep the coded error! even in
     // dry-run (they cannot come from the dry-run executors).
-    for lane in [&cycle.dhan, &cycle.groww] {
+    for lane in [&cycle.dhan] {
         if lane.enabled && lane.flags.any() {
             if deps.dry_run && !lane.flags.fetch_failed && !lane.flags.rate_limited {
                 info!(
@@ -1729,7 +1575,6 @@ where
     // scheduler, ratcheted by cadence_history_repull_isolation_guard.rs).
     if !deps.dry_run {
         let dhan_cross = cycle.dhan.resolution == Some("cross_fill");
-        let groww_cross = cycle.groww.resolution == Some("cross_fill");
         if deps.config.history_repull_enabled {
             let repull_elapsed_ms = clock.ist_ms_of_day().saturating_sub(slots.boundary_ms);
             if cycle.dhan.enabled && dhan_cross {
@@ -1751,25 +1596,6 @@ where
                     elapsed_in_cycle_ms: repull_elapsed_ms,
                 });
             }
-            if cycle.groww.enabled && groww_cross {
-                spawn_history_repull(history_repull::HistoryRepullCtx {
-                    feed: Feed::Groww,
-                    cycle_minute_ist: cycle.groww.asm.cycle_minute_ist,
-                    executor: Arc::clone(&deps.groww_executor),
-                    gates: None,
-                    chain_expiries: repull_chain_expiries(
-                        deps.expiry_resolver.as_ref(),
-                        Feed::Groww,
-                        clock.ist_date(),
-                    ),
-                    anchor: history_repull::RepullAnchor {
-                        spawn_mono_ms: clock.monotonic_ms(),
-                        spawn_epoch_ms: clock.epoch_ms(),
-                        spawn_instant: tokio::time::Instant::now(),
-                    },
-                    elapsed_in_cycle_ms: repull_elapsed_ms,
-                });
-            }
         }
     }
 
@@ -1777,9 +1603,6 @@ where
     // OffSessionOrDisabled — Idle + Rollover is deliberately illegal).
     if cycle.dhan.enabled {
         cycle.dhan.fsm(CadenceEvent::Rollover);
-    }
-    if cycle.groww.enabled {
-        cycle.groww.fsm(CadenceEvent::Rollover);
     }
     CycleRun::Verdict {
         dhan_dirty: cycle.dhan.enabled && cycle.dhan.arming_failure,
@@ -1792,32 +1615,13 @@ where
 /// hygiene for the action/completion dispatchers).
 struct CycleState {
     dhan: LaneRun,
-    groww: LaneRun,
     events: Vec<(i64, CycleAction)>,
     chain_retries_used: [u32; 3],
     spot_retries_used: [u32; 4],
     next_chain_retry_slot: usize,
-    /// Which of the 7 Groww burst legs completed Ok (chains 0..3, spots
-    /// 3..7) by the verdict instant.
-    groww_leg_ok: [bool; 7],
     /// Per-leg Groww completion count (burst = 1st, fallback = 2nd): a
-    /// failure is TERMINAL for the leg only on its 2nd attempt (the
-    /// verdict — or the L3 DEFERRED per-leg fallback — refetches every
-    /// failed leg exactly once).
-    groww_leg_attempts: [u8; 7],
     /// Per-leg dispatched-but-not-completed flags (F4, 2026-07-15): the
-    /// verdict must NOT refetch a leg whose ORIGINAL request is still in
-    /// flight — the pre-fix behavior fired a duplicate concurrent
-    /// same-leg request (double request volume on a slow broker). A
-    /// still-in-flight leg is SKIPPED by the fallback (await-or-skip;
-    /// first-write-wins on completion stays).
-    groww_leg_inflight: [bool; 7],
     /// PHASE-B2 (item 2): per-leg Malformed latch for the Groww lane —
-    /// chains `0..3` by underlying index, spots `3..7` by
-    /// `target_idx + ChainUnderlying::COUNT`. A malformed answer is NEVER
-    /// retried (ladder budget 0) and the leg is NEVER selected as an L3
-    /// cross-fill candidate (the ONE combined filter below).
-    groww_leg_malformed: [bool; 7],
     /// The GrowwVerdict instant passed (F4/L3): a leg completing Err on
     /// its 1st attempt after it was skipped in flight has no later
     /// verdict — the L3 DEFERRED fallback (2026-07-15) dispatches its one
@@ -1894,7 +1698,6 @@ fn abandon_dead_day_cycle(cycle: &mut CycleState) {
          abandoned, day loop resets"
     );
     cycle.dhan.fsm(CadenceEvent::Shutdown);
-    cycle.groww.fsm(CadenceEvent::Shutdown);
 }
 
 /// CONC-NEW-1 (hostile round 1, 2026-07-15): re-observe the runtime lane
@@ -1909,16 +1712,12 @@ fn abandon_dead_day_cycle(cycle: &mut CycleState) {
 /// audit-only late responses. The ENABLE direction pre-first-fire is the
 /// pristine re-arm in the `run_cycle` timer arm; post-first-fire an
 /// enable joins at the next minute boundary.
-fn observe_runtime_lane_toggles<D, G>(deps: &CadenceRunnerDeps<D, G>, cycle: &mut CycleState)
+fn observe_runtime_lane_toggles<D>(deps: &CadenceRunnerDeps<D>, cycle: &mut CycleState)
 where
     D: CadenceExecutor + 'static,
-    G: CadenceExecutor + 'static,
 {
     if cycle.dhan.enabled && !deps.dhan_enabled.load(Ordering::Acquire) {
         drop_lane_runtime_disabled(&mut cycle.dhan);
-    }
-    if cycle.groww.enabled && !deps.groww_enabled.load(Ordering::Acquire) {
-        drop_lane_runtime_disabled(&mut cycle.groww);
     }
 }
 
@@ -1971,9 +1770,9 @@ fn observe_wake_lateness<C: CadenceClock>(clock: &C, target_ms: i64, cycle: &mut
 /// Handle one scheduled instant.
 // APPROVED: the action dispatcher threads the whole cycle state — one private fn with one call site; a further split would scatter it.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn handle_action<C, D, G>(
+fn handle_action<C, D>(
     clock: &Arc<C>,
-    deps: &CadenceRunnerDeps<D, G>,
+    deps: &CadenceRunnerDeps<D>,
     gates: &Arc<DhanGates>,
     slots: &CycleSlots,
     action: CycleAction,
@@ -1983,7 +1782,6 @@ fn handle_action<C, D, G>(
 ) where
     C: CadenceClock,
     D: CadenceExecutor + 'static,
-    G: CadenceExecutor + 'static,
 {
     // CONC-NEW-1: dispatch-time re-read of the runtime lane toggles — a
     // lane disabled via /api/feeds after cycle entry must not fire.
@@ -2111,227 +1909,6 @@ fn handle_action<C, D, G>(
                 }
             }
         }
-        CycleAction::GrowwWave { leg } => {
-            if !cycle.groww.enabled || cycle.groww.resolved {
-                return;
-            }
-            if cycle.groww.state == CadenceState::Armed {
-                cycle.groww.fsm(CadenceEvent::FirstFetchDispatched);
-            }
-            // Per-wave dispatch (gate-free lane by construction; design
-            // §4: the Groww arms never touch DhanGates). Shape 0 places
-            // all three waves at ONE instant (= the classic all-7 burst);
-            // shapes 1/2 spread them across 1000ms-spaced wave anchors
-            // (the 2026-07-15 three-choice fallback-shape ladder — at
-            // choice 2 CoreSpots + VixSpot share the :02 anchor, so ALL
-            // 4 spots still fire together).
-            match leg {
-                GrowwWaveLeg::Chains => {
-                    for (i, underlying) in ChainUnderlying::ALL.iter().enumerate() {
-                        // ExpiryResolver seam (2026-07-15): `None` =
-                        // unresolved — never guessed; coalesced
-                        // `expiry_unresolved` stage on the lane.
-                        let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
-                            Feed::Groww,
-                            *underlying,
-                            clock.ist_date(),
-                        );
-                        if expiry_yyyymmdd.is_none() {
-                            cycle.groww.flags.expiry_unresolved = true;
-                        }
-                        let req = ChainFetchRequest {
-                            feed: Feed::Groww,
-                            underlying: *underlying,
-                            expiry_yyyymmdd,
-                            cycle_minute_ist: slots.cycle_minute_ist,
-                            deadline_epoch_ms: clock
-                                .epoch_ms()
-                                .saturating_add(deps.config.groww_request_timeout_ms),
-                        };
-                        cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
-                        cycle.groww_leg_inflight[i] = true;
-                        spawn_chain_fetch(
-                            Arc::clone(&deps.groww_executor),
-                            tx.clone(),
-                            req,
-                            i,
-                            deps.config.groww_request_timeout_ms,
-                        );
-                    }
-                }
-                GrowwWaveLeg::CoreSpots | GrowwWaveLeg::VixSpot => {
-                    let want_vix = leg == GrowwWaveLeg::VixSpot;
-                    for (k, target) in SpotTarget::ALL.iter().enumerate() {
-                        if target.chain_underlying().is_none() != want_vix {
-                            continue;
-                        }
-                        let req = SpotFetchRequest {
-                            feed: Feed::Groww,
-                            target: *target,
-                            cycle_minute_ist: slots.cycle_minute_ist,
-                            deadline_epoch_ms: clock
-                                .epoch_ms()
-                                .saturating_add(deps.config.groww_request_timeout_ms),
-                        };
-                        cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
-                        cycle.groww_leg_inflight[k + ChainUnderlying::COUNT] = true;
-                        spawn_spot_fetch(
-                            Arc::clone(&deps.groww_executor),
-                            tx.clone(),
-                            req,
-                            k,
-                            deps.config.groww_request_timeout_ms,
-                        );
-                    }
-                }
-            }
-        }
-        CycleAction::GrowwVerdict => {
-            if !cycle.groww.enabled || cycle.groww.resolved || cycle.groww_fallback_launched {
-                return;
-            }
-            cycle.groww_verdict_passed = true;
-            // A leg is refetched iff it FAILED (Err completed) — never a
-            // leg whose ORIGINAL request is still IN FLIGHT (verifier F4,
-            // dated 2026-07-15: the pre-fix "Err OR still pending" read
-            // fired a duplicate concurrent same-leg request while the
-            // original was mid-flight — double request volume against a
-            // slow broker for zero data gain). A still-in-flight leg is
-            // SKIPPED (await-or-skip; its completion still lands
-            // first-write-wins, and an Err completion after the verdict
-            // is terminal on its 1st attempt — see `groww_leg_attempts`).
-            // Failures re-fetch sequentially: chains first, then spots;
-            // successes never re-fetched.
-            let failed_chains: Vec<usize> = (0..ChainUnderlying::COUNT)
-                .filter(|i| !cycle.groww_leg_ok[*i] && !cycle.groww_leg_inflight[*i])
-                .collect();
-            let failed_spots: Vec<usize> = (0..SpotTarget::ALL.len())
-                .filter(|k| {
-                    let leg = k + ChainUnderlying::COUNT;
-                    !cycle.groww_leg_ok[leg]
-                        && !cycle.groww_leg_inflight[leg]
-                        && !cycle.groww_leg_malformed[leg]
-                })
-                .collect();
-            if failed_chains.is_empty() && failed_spots.is_empty() {
-                return;
-            }
-            cycle.groww_fallback_launched = true;
-            cycle.groww.flags.groww_fallback = true;
-            // ExpiryResolver seam (2026-07-15): the fallback task runs
-            // detached, so the expiry stamps + the coalesced
-            // `expiry_unresolved` flag are resolved HERE at launch time
-            // and moved into the task.
-            let failed_chain_reqs: Vec<(usize, Option<u32>)> = failed_chains
-                .iter()
-                .map(|&i| {
-                    let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
-                        Feed::Groww,
-                        ChainUnderlying::ALL[i],
-                        clock.ist_date(),
-                    );
-                    if expiry_yyyymmdd.is_none() {
-                        cycle.groww.flags.expiry_unresolved = true;
-                    }
-                    (i, expiry_yyyymmdd)
-                })
-                .collect();
-            for i in &failed_chains {
-                metrics::counter!("tv_cadence_groww_fallback_total", "leg" => "chain").increment(1);
-                debug!(underlying_idx = i, "cadence: groww chain fallback queued");
-                cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
-                cycle.groww_leg_inflight[*i] = true;
-            }
-            for k in &failed_spots {
-                metrics::counter!("tv_cadence_groww_fallback_total", "leg" => "spot").increment(1);
-                debug!(target_idx = k, "cadence: groww spot fallback queued");
-                cycle.groww.inflight = cycle.groww.inflight.saturating_add(1);
-                cycle.groww_leg_inflight[*k + ChainUnderlying::COUNT] = true;
-            }
-            // Cross-fill visibility (operator 2026-07-20): one forensic
-            // audit event per fallback LAUNCH (the lane's own late retry —
-            // `resolution = native_late_retry`); the resolution instant is
-            // unknown at launch, so `resolved_at_ms_after_close = -1`.
-            {
-                let (ts_ist_nanos, trading_date_ist_nanos) =
-                    cross_fill_audit_stamp(clock.as_ref(), slots.cycle_minute_ist);
-                emit_cross_fill_audit(CrossFillAuditEvent {
-                    ts_ist_nanos,
-                    trading_date_ist_nanos,
-                    lane: Feed::Groww.as_str(),
-                    source_lane: Feed::Groww.as_str(),
-                    stage: "groww_fallback",
-                    cycle_minute_ist: slots.cycle_minute_ist,
-                    spots: failed_spots.len() as u32,
-                    chains: failed_chains.len() as u32,
-                    cycle_latency_ms: clock.ist_ms_of_day().saturating_sub(slots.boundary_ms),
-                    ladder_rung: slots.groww_shape,
-                    resolved_at_ms_after_close: -1,
-                    resolution: "native_late_retry",
-                    retry_attempts: cycle.groww.late_retry_attempts,
-                });
-            }
-            let exec = Arc::clone(&deps.groww_executor);
-            let fallback_tx = tx.clone();
-            let timeout_ms = deps.config.groww_request_timeout_ms;
-            let cycle_minute = slots.cycle_minute_ist;
-            let task_clock = Arc::clone(clock);
-            // Fire-and-forget by design: the task is bounded by the
-            // per-request timeouts and dies with the channel.
-            drop(tokio::spawn(async move {
-                // Sequential: failed CHAINS first, then failed SPOTS
-                // (second-1 / second-2 windows, design §1). Each leg's
-                // deadline is stamped AT ITS OWN DISPATCH instant —
-                // `groww_request_timeout_ms` bounds each individual
-                // request (design §0); a shared verdict-time base would
-                // hand legs 2..N already-consumed deadlines.
-                for (i, expiry_yyyymmdd) in failed_chain_reqs {
-                    let req = ChainFetchRequest {
-                        feed: Feed::Groww,
-                        underlying: ChainUnderlying::ALL[i],
-                        expiry_yyyymmdd,
-                        cycle_minute_ist: cycle_minute,
-                        deadline_epoch_ms: task_clock.epoch_ms().saturating_add(timeout_ms),
-                    };
-                    let result = bound_chain_fetch(exec.as_ref(), req, timeout_ms).await;
-                    if fallback_tx
-                        .send(Completion {
-                            lane: Feed::Groww,
-                            kind: CompletionKind::Chain {
-                                underlying_idx: i,
-                                result,
-                            },
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return; // cycle ended — receiver gone
-                    }
-                }
-                for k in failed_spots {
-                    let req = SpotFetchRequest {
-                        feed: Feed::Groww,
-                        target: SpotTarget::ALL[k],
-                        cycle_minute_ist: cycle_minute,
-                        deadline_epoch_ms: task_clock.epoch_ms().saturating_add(timeout_ms),
-                    };
-                    let result = bound_spot_fetch(exec.as_ref(), req, timeout_ms).await;
-                    if fallback_tx
-                        .send(Completion {
-                            lane: Feed::Groww,
-                            kind: CompletionKind::Spot {
-                                target_idx: k,
-                                result,
-                            },
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }));
-        }
         CycleAction::NativeDeadline => {
             // ITEM 3: ONE gate-paced chain deadline slot per underlying at
             // boundary + CADENCE_DECISION_DEADLINE_MS - history-repair only
@@ -2382,40 +1959,16 @@ fn handle_action<C, D, G>(
                     }
                 }
             }
-            // SPEC: force BOTH finalize calls with own_path_exhausted: true.
-            let CycleState { dhan, groww, .. } = cycle;
-            finalize_if_complete(
-                clock.as_ref(),
-                slots,
-                dhan,
-                groww,
-                latch,
-                true,
-                deps.dry_run,
-            );
-            finalize_if_complete(
-                clock.as_ref(),
-                slots,
-                groww,
-                dhan,
-                latch,
-                true,
-                deps.dry_run,
-            );
-        }
-        CycleAction::GrowwCutoff => {
-            let CycleState { dhan, groww, .. } = cycle;
-            // PHASE-B2 (item 2): CADENCE-05 recovery wrap-up reads the
-            // PRE-finalize resolved state — the lane's own-path outcome.
-            emit_recovery_wrapup(groww);
-            finalize_lane_at_cutoff(clock.as_ref(), slots, groww, dhan, latch, deps.dry_run);
+            // SPEC: force the finalize call with own_path_exhausted: true.
+            let CycleState { dhan, .. } = cycle;
+            finalize_if_complete(clock.as_ref(), slots, dhan, latch, true, deps.dry_run);
         }
         CycleAction::DhanCutoff => {
-            let CycleState { dhan, groww, .. } = cycle;
+            let CycleState { dhan, .. } = cycle;
             // PHASE-B2 (item 2): CADENCE-05 recovery wrap-up reads the
             // PRE-finalize resolved state — the lane's own-path outcome.
             emit_recovery_wrapup(dhan);
-            finalize_lane_at_cutoff(clock.as_ref(), slots, dhan, groww, latch, deps.dry_run);
+            finalize_lane_at_cutoff(clock.as_ref(), slots, dhan, latch, deps.dry_run);
         }
     }
 }
@@ -2581,9 +2134,9 @@ async fn bound_spot_fetch<E: CadenceExecutor>(
 /// event-driven finalize for BOTH lanes (cross-fill runs inside).
 // APPROVED: the completion dispatcher threads the whole cycle state + the runner deps — one private fn with one call site.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn handle_completion<C, D, G>(
+fn handle_completion<C, D>(
     clock: &Arc<C>,
-    deps: &CadenceRunnerDeps<D, G>,
+    deps: &CadenceRunnerDeps<D>,
     slots: &CycleSlots,
     completion: Completion,
     cycle: &mut CycleState,
@@ -2592,7 +2145,6 @@ fn handle_completion<C, D, G>(
 ) where
     C: CadenceClock,
     D: CadenceExecutor + 'static,
-    G: CadenceExecutor + 'static,
 {
     let cfg = &deps.config;
     let dry_run = deps.dry_run;
@@ -2627,7 +2179,6 @@ fn handle_completion<C, D, G>(
     {
         let lane: &mut LaneRun = match lane_feed {
             Feed::Dhan => &mut cycle.dhan,
-            Feed::Groww => &mut cycle.groww,
             // TrueData (feed #4) is a live-tick feed, never a REST cadence
             // lane — the cadence scheduler only ever drives Dhan/Groww
             // lanes (CycleState has no TrueData LaneRun), so this arm is
@@ -2649,16 +2200,8 @@ fn handle_completion<C, D, G>(
                 result,
             } => {
                 let underlying = ChainUnderlying::ALL[underlying_idx];
-                if lane_feed == Feed::Groww {
-                    cycle.groww_leg_attempts[underlying_idx] =
-                        cycle.groww_leg_attempts[underlying_idx].saturating_add(1);
-                    cycle.groww_leg_inflight[underlying_idx] = false;
-                }
                 match result {
                     Ok(ok) => {
-                        if lane_feed == Feed::Groww {
-                            cycle.groww_leg_ok[underlying_idx] = true;
-                        }
                         lane.asm.record_chain(
                             underlying,
                             ChainCell {
@@ -2672,12 +2215,6 @@ fn handle_completion<C, D, G>(
                         );
                     }
                     Err(err) => {
-                        if lane_feed == Feed::Groww && matches!(err, CadenceFetchError::Malformed) {
-                            // PHASE-B2 (item 2): latch the malformed leg —
-                            // never retried (budget 0), never an L3
-                            // cross-fill candidate.
-                            cycle.groww_leg_malformed[underlying_idx] = true;
-                        }
                         if matches!(err, CadenceFetchError::Empty) {
                             // Chain 200-empty: its own coalesced stage
                             // (never conflated with a transport-class
@@ -2685,8 +2222,6 @@ fn handle_completion<C, D, G>(
                             lane.flags.chain_empty = true;
                         }
                         record_failure(lane, &err);
-                        if lane_feed == Feed::Groww
-                            && matches!(err, CadenceFetchError::RateLimited { .. })
                         {
                             // Any RateLimited Groww leg (chain OR spot)
                             // marks the fallback-shape cycle dirty
@@ -2746,51 +2281,6 @@ fn handle_completion<C, D, G>(
                         // concurrent duplicate — the original already
                         // completed).
                         let mut deferred_fallback = false;
-                        if lane_feed == Feed::Groww
-                            && cycle.groww_verdict_passed
-                            && cycle.groww_leg_attempts[underlying_idx] == 1
-                            && !lane.resolved
-                            && now_wall.saturating_add(CADENCE_RETRY_LATENCY_ALLOWANCE_MS)
-                                <= slots.groww_cutoff_ms
-                        {
-                            deferred_fallback = true;
-                            lane.flags.groww_fallback = true;
-                            metrics::counter!(
-                                "tv_cadence_groww_fallback_total",
-                                "leg" => "chain"
-                            )
-                            .increment(1);
-                            debug!(
-                                underlying_idx,
-                                "cadence: groww chain DEFERRED fallback dispatched (L3)"
-                            );
-                            let expiry_yyyymmdd = deps.expiry_resolver.resolved_expiry(
-                                Feed::Groww,
-                                underlying,
-                                clock.ist_date(),
-                            );
-                            if expiry_yyyymmdd.is_none() {
-                                lane.flags.expiry_unresolved = true;
-                            }
-                            let req = ChainFetchRequest {
-                                feed: Feed::Groww,
-                                underlying,
-                                expiry_yyyymmdd,
-                                cycle_minute_ist: slots.cycle_minute_ist,
-                                deadline_epoch_ms: clock
-                                    .epoch_ms()
-                                    .saturating_add(deps.config.groww_request_timeout_ms),
-                            };
-                            lane.inflight = lane.inflight.saturating_add(1);
-                            cycle.groww_leg_inflight[underlying_idx] = true;
-                            spawn_chain_fetch(
-                                Arc::clone(&deps.groww_executor),
-                                tx.clone(),
-                                req,
-                                underlying_idx,
-                                deps.config.groww_request_timeout_ms,
-                            );
-                        }
                         // `fetch_failed` = the rule-file definition: a
                         // non-Empty failure AFTER the retry budget (Dhan:
                         // no retry admitted; Groww: the fallback attempt
@@ -2803,11 +2293,6 @@ fn handle_completion<C, D, G>(
                         // transport-class fetch_failed.
                         let terminal = match lane_feed {
                             Feed::Dhan => !retry_scheduled,
-                            Feed::Groww => {
-                                !deferred_fallback
-                                    && (cycle.groww_leg_attempts[underlying_idx] >= 2
-                                        || cycle.groww_verdict_passed)
-                            }
                             // TrueData is a live-tick feed, never a cadence lane.
                             Feed::Truedata => unreachable!("cadence has no TrueData lane"),
                         };
@@ -2825,16 +2310,8 @@ fn handle_completion<C, D, G>(
             }
             CompletionKind::Spot { target_idx, result } => {
                 let target = SpotTarget::ALL[target_idx];
-                if lane_feed == Feed::Groww {
-                    let leg = target_idx + ChainUnderlying::COUNT;
-                    cycle.groww_leg_attempts[leg] = cycle.groww_leg_attempts[leg].saturating_add(1);
-                    cycle.groww_leg_inflight[leg] = false;
-                }
                 match result {
                     Ok(snap) => {
-                        if lane_feed == Feed::Groww {
-                            cycle.groww_leg_ok[target_idx + ChainUnderlying::COUNT] = true;
-                        }
                         if lane.late_retry_attempts > 0 {
                             // Native spot retry ladder: success after >= 1 native rung.
                             metrics::counter!(
@@ -2865,12 +2342,6 @@ fn handle_completion<C, D, G>(
                         );
                     }
                     Err(err) => {
-                        if lane_feed == Feed::Groww && matches!(err, CadenceFetchError::Malformed) {
-                            // PHASE-B2 (item 2): latch the malformed leg —
-                            // never retried (budget 0), never an L3
-                            // cross-fill candidate.
-                            cycle.groww_leg_malformed[target_idx + ChainUnderlying::COUNT] = true;
-                        }
                         if matches!(err, CadenceFetchError::Empty) {
                             // 200-empty: coalesced spot_empty stage
                             // (either lane); does NOT arm the ladder
@@ -2886,7 +2357,6 @@ fn handle_completion<C, D, G>(
                             // fallback-shape cycle dirty.
                             match lane_feed {
                                 Feed::Dhan => cycle.dhan_spot_dirty = true,
-                                Feed::Groww => cycle.groww_dirty = true,
                                 // TrueData is a live-tick feed, never a cadence lane.
                                 Feed::Truedata => {
                                     unreachable!("cadence has no TrueData lane")
@@ -2994,51 +2464,8 @@ fn handle_completion<C, D, G>(
                         // for an in-flight-skipped SPOT leg — see the
                         // chain arm above.
                         let mut deferred_fallback = false;
-                        if lane_feed == Feed::Groww
-                            && cycle.groww_verdict_passed
-                            && cycle.groww_leg_attempts[target_idx + ChainUnderlying::COUNT] == 1
-                            && !lane.resolved
-                            && now_wall.saturating_add(CADENCE_RETRY_LATENCY_ALLOWANCE_MS)
-                                <= slots.groww_cutoff_ms
-                        {
-                            deferred_fallback = true;
-                            lane.flags.groww_fallback = true;
-                            metrics::counter!(
-                                "tv_cadence_groww_fallback_total",
-                                "leg" => "spot"
-                            )
-                            .increment(1);
-                            debug!(
-                                target_idx,
-                                "cadence: groww spot DEFERRED fallback dispatched (L3)"
-                            );
-                            let req = SpotFetchRequest {
-                                feed: Feed::Groww,
-                                target,
-                                cycle_minute_ist: slots.cycle_minute_ist,
-                                deadline_epoch_ms: clock
-                                    .epoch_ms()
-                                    .saturating_add(deps.config.groww_request_timeout_ms),
-                            };
-                            lane.inflight = lane.inflight.saturating_add(1);
-                            cycle.groww_leg_inflight[target_idx + ChainUnderlying::COUNT] = true;
-                            spawn_spot_fetch(
-                                Arc::clone(&deps.groww_executor),
-                                tx.clone(),
-                                req,
-                                target_idx,
-                                deps.config.groww_request_timeout_ms,
-                            );
-                        }
                         let terminal = match lane_feed {
                             Feed::Dhan => !retry_scheduled,
-                            Feed::Groww => {
-                                !deferred_fallback
-                                    && (cycle.groww_leg_attempts
-                                        [target_idx + ChainUnderlying::COUNT]
-                                        >= 2
-                                        || cycle.groww_verdict_passed)
-                            }
                             // TrueData is a live-tick feed, never a cadence lane.
                             Feed::Truedata => unreachable!("cadence has no TrueData lane"),
                         };
@@ -3066,36 +2493,17 @@ fn handle_completion<C, D, G>(
     // exhausted (design §5 resolution order — own fetch first, fallback
     // never preempts a still-scheduled own fire).
     let dhan_exhausted = lane_own_path_exhausted(Feed::Dhan, cycle);
-    let groww_exhausted = lane_own_path_exhausted(Feed::Groww, cycle);
-    let CycleState { dhan, groww, .. } = cycle;
-    finalize_if_complete(
-        clock.as_ref(),
-        slots,
-        dhan,
-        groww,
-        latch,
-        dhan_exhausted,
-        dry_run,
-    );
-    finalize_if_complete(
-        clock.as_ref(),
-        slots,
-        groww,
-        dhan,
-        latch,
-        groww_exhausted,
-        dry_run,
-    );
+    let CycleState { dhan, .. } = cycle;
+    finalize_if_complete(clock.as_ref(), slots, dhan, latch, dhan_exhausted, dry_run);
 }
 
 /// Is the lane's OWN fetch path exhausted for this cycle? TRUE when the
 /// lane has no in-flight fetch AND no remaining scheduled own event
-/// (primaries, retries, the Groww waves/verdict — cutoffs are not own
+/// (primaries, retries — cutoffs are not own
 /// work). Only then may the fallback rungs run before the cutoff.
 fn lane_own_path_exhausted(feed: Feed, cycle: &CycleState) -> bool {
     let lane = match feed {
         Feed::Dhan => &cycle.dhan,
-        Feed::Groww => &cycle.groww,
         // TrueData is a live-tick feed, never a cadence lane.
         Feed::Truedata => unreachable!("cadence has no TrueData lane"),
     };
@@ -3106,10 +2514,6 @@ fn lane_own_path_exhausted(feed: Feed, cycle: &CycleState) -> bool {
         Feed::Dhan => matches!(
             action,
             CycleAction::DhanChain { .. } | CycleAction::DhanSpot { .. }
-        ),
-        Feed::Groww => matches!(
-            action,
-            CycleAction::GrowwWave { .. } | CycleAction::GrowwVerdict
         ),
         // TrueData is a live-tick feed, never a cadence lane.
         Feed::Truedata => false,
@@ -3158,7 +2562,6 @@ fn finalize_if_complete<C: CadenceClock>(
     clock: &C,
     slots: &CycleSlots,
     lane: &mut LaneRun,
-    other: &LaneRun,
     latch: &mut DecisionLatch,
     own_path_exhausted: bool,
     dry_run: bool,
@@ -3167,11 +2570,7 @@ fn finalize_if_complete<C: CadenceClock>(
         return;
     }
     let now_wall = clock.ist_ms_of_day();
-    let cutoff = if lane.asm.feed == Feed::Dhan {
-        slots.dhan_cutoff_ms
-    } else {
-        slots.groww_cutoff_ms
-    };
+    let cutoff = slots.dhan_cutoff_ms;
     if !may_decide_at_completion(now_wall, cutoff) {
         // Past the cutoff there is NO decide path — the queued cutoff
         // event emits the honest skip ("never a late decision"). A
@@ -3191,57 +2590,9 @@ fn finalize_if_complete<C: CadenceClock>(
             // at ~T+0.3 and suppress every Dhan own fire).
             return;
         }
-        // Rung 2: cross-source fill from the other lane's same-cycle data
-        // (freshness-checked against the plain base floor T − 5000 —
-        // every fire is post-close since the 2026-07-16 shape change, so
-        // the retired lender-aware widening is unnecessary; valid up to
-        // AND INCLUDING the cutoff).
-        let floor = cross_fill_freshness_floor_ms(slots);
-        let (spots, chains) = lane
-            .asm
-            .cross_fill_from(&other.asm, floor, now_wall, cutoff);
-        if spots + chains > 0 {
-            lane.flags.cross_fill = true;
-            let direction = if lane.asm.feed == Feed::Dhan {
-                "dhan_from_groww"
-            } else {
-                "groww_from_dhan"
-            };
-            metrics::counter!("tv_cadence_cross_fill_total", "direction" => direction)
-                .increment(u64::from(spots + chains));
-            if spots > 0 {
-                metrics::counter!("tv_cadence_spot_fallback_total", "source" => "cross_source")
-                    .increment(u64::from(spots));
-            }
-            // Cross-fill visibility (operator 2026-07-20): one forensic
-            // audit event per cross-fill firing, fire-and-forget off the
-            // decision path — the precise minute + latency land in the
-            // `cross_fill_audit` table via the app-side consumer.
-            let ladder_rung = if lane.asm.feed == Feed::Dhan {
-                slots.dhan_shape
-            } else {
-                slots.groww_shape
-            };
-            let latency_ms = now_wall.saturating_sub(slots.boundary_ms);
-            let (ts_ist_nanos, trading_date_ist_nanos) =
-                cross_fill_audit_stamp(clock, lane.asm.cycle_minute_ist);
-            emit_cross_fill_audit(CrossFillAuditEvent {
-                ts_ist_nanos,
-                trading_date_ist_nanos,
-                lane: lane.asm.feed.as_str(),
-                source_lane: other.asm.feed.as_str(),
-                stage: "cross_fill",
-                cycle_minute_ist: lane.asm.cycle_minute_ist,
-                spots,
-                chains,
-                cycle_latency_ms: latency_ms,
-                ladder_rung,
-                resolved_at_ms_after_close: latency_ms,
-                resolution: "cross_fill",
-                retry_attempts: lane.late_retry_attempts,
-            });
-        }
-        // Rung 3: the lane's own chain-embedded spot.
+        // Rung 2 (cross-source fill from a second lane) was REMOVED with the
+        // Groww lane 2026-08-21 — a single-lane cadence has no donor.
+        // Rung 3: the lane.s own chain-embedded spot.
         let embedded = lane.asm.fill_spots_from_chain_embedded(now_wall);
         if embedded > 0 {
             lane.flags.chain_embedded_spot = true;
@@ -3252,58 +2603,10 @@ fn finalize_if_complete<C: CadenceClock>(
     if !lane.asm.is_data_complete() {
         return;
     }
-    // ADVISORY cross-broker coherence band (H2-partial/M14, audit
-    // 2026-07-20): when BOTH lanes hold OWN-fetch spots for the same
-    // underlying + minute, a >0.5% disagreement flags cross-source
-    // divergence (wrong-instrument / corporate-action-adjustment /
-    // vendor-staleness proxy — no leg's response carries an instrument
-    // echo to validate directly). Opportunistic by completion order:
-    // checked on the lane that decides while the other lane's same-cycle
-    // cell already exists. Flag + counter only — never blocking.
-    for u in ChainUnderlying::ALL {
-        if let (Some(own), Some(foreign)) = (lane.asm.spot(*u), other.asm.spot(*u))
-            && own.provenance == SpotProvenance::OwnFetch
-            && foreign.provenance == SpotProvenance::OwnFetch
-            && own.minute_ist == foreign.minute_ist
-            && spots_diverge_paise(own.spot_paise, foreign.spot_paise)
-        {
-            // Coalesced ADVISORY emission (2026-07-20, adversarial review):
-            // decoupled from CADENCE-01 — one plain info! per lane per
-            // cycle (first offender named), NO ErrorCode, counter kept.
-            if !lane.flags.cross_source_spot_divergence {
-                info!(
-                    kind = "cross_source_spot_divergence",
-                    lane = lane.asm.feed.as_str(),
-                    underlying = u.as_str(),
-                    own_spot_paise = own.spot_paise,
-                    foreign_spot_paise = foreign.spot_paise,
-                    delta_paise = (own.spot_paise - foreign.spot_paise).abs(),
-                    "cadence advisory: cross-broker spot divergence beyond the \
-                     0.5% band (info-only, coalesced — not a CADENCE-01 stage)"
-                );
-            }
-            lane.flags.cross_source_spot_divergence = true;
-            metrics::counter!(
-                "tv_cadence_cross_source_spot_divergence_total",
-                "underlying" => u.as_str()
-            )
-            .increment(1);
-        }
-    }
+    // The ADVISORY cross-broker coherence band was REMOVED with the Groww
+    // lane 2026-08-21 — it compared two lanes; one lane has nothing to
+    // compare against.
     decide_lane(clock, slots, lane, latch, dry_run);
-}
-
-/// The (minute-open `ts`, IST-midnight `trading_date_ist`) nanosecond
-/// stamps for a cross-fill audit event, derived from the injected clock
-/// (cold path, once per cross-fill/fallback event). Pure arithmetic over
-/// the clock reads.
-fn cross_fill_audit_stamp<C: CadenceClock>(clock: &C, cycle_minute_ist: u32) -> (i64, i64) {
-    let now_ist_nanos = ist_epoch_nanos(clock);
-    let midnight_ist_nanos =
-        now_ist_nanos.saturating_sub(clock.ist_ms_of_day().saturating_mul(1_000_000));
-    let ts_ist_nanos = midnight_ist_nanos
-        .saturating_add(i64::from(cycle_minute_ist).saturating_mul(1_000_000_000));
-    (ts_ist_nanos, midnight_ist_nanos)
 }
 
 /// IST-epoch nanoseconds "now" (the `chain_snapshot` registry's time
@@ -3547,7 +2850,6 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
     clock: &C,
     slots: &CycleSlots,
     lane: &mut LaneRun,
-    other: &mut LaneRun,
     latch: &mut DecisionLatch,
     dry_run: bool,
 ) {
@@ -3557,7 +2859,7 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
     // Last chance: the cross-fill window is valid up to AND INCLUDING
     // the cutoff instant (a cutoff event popping even 1ms late finds the
     // finalize guard refusing — fail-closed, the skip below owns it).
-    finalize_if_complete(clock, slots, lane, other, latch, true, dry_run);
+    finalize_if_complete(clock, slots, lane, latch, true, dry_run);
     if lane.resolved {
         return;
     }
@@ -3567,10 +2869,7 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
     let lane_empty = ChainUnderlying::ALL
         .iter()
         .all(|u| lane.asm.chain(*u).is_none() && lane.asm.spot(*u).is_none());
-    let other_empty = ChainUnderlying::ALL
-        .iter()
-        .all(|u| other.asm.chain(*u).is_none() && other.asm.spot(*u).is_none());
-    let reason = if lane_empty && (other_empty || !other.enabled) {
+    let reason = if lane_empty {
         SkipReason::BothSourcesDead
     } else {
         SkipReason::Cutoff

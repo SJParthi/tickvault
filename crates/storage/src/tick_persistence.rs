@@ -147,9 +147,6 @@ pub const DEDUP_KEY_TICKS: &str = "ts, security_id, segment, capture_seq, feed";
 /// [`Feed`] enum so the wire label can never drift from a duplicated literal.
 pub const TICK_FEED_DHAN: &str = Feed::Dhan.as_str();
 
-/// `feed` SYMBOL value for Groww-sourced rows.
-pub const TICK_FEED_GROWW: &str = Feed::Groww.as_str();
-
 /// `feed` SYMBOL value for TrueData-sourced rows.
 pub const TICK_FEED_TRUEDATA: &str = Feed::Truedata.as_str();
 
@@ -1819,11 +1816,7 @@ mod tests {
     /// a Groww observation of the same instrument-second-sequence are BOTH kept.
     #[test]
     fn test_feed_symbol_is_stamped_per_writer() {
-        for (feed, label) in [
-            (Feed::Dhan, "dhan"),
-            (Feed::Groww, "groww"),
-            (Feed::Truedata, "truedata"),
-        ] {
+        for (feed, label) in [(Feed::Dhan, "dhan"), (Feed::Truedata, "truedata")] {
             let mut w = TickWriter::for_test(feed);
             w.append_row(&sample_row()).expect("append");
             assert!(
@@ -1832,7 +1825,6 @@ mod tests {
             );
         }
         assert_eq!(TICK_FEED_DHAN, "dhan");
-        assert_eq!(TICK_FEED_GROWW, "groww");
         assert_eq!(TICK_FEED_TRUEDATA, "truedata");
     }
 
