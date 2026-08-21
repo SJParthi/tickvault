@@ -1401,3 +1401,118 @@ that the spill is automatically replayed — it still needs one curl, which does
 not meet the zero-manual-intervention bar and remains open. **NOT claimed:** that
 the audit was exhaustive — it found this table incomplete for the fourth time,
 which is itself evidence that a source scan finds what it is pointed at.
+
+---
+
+## ITEM 26 (added 2026-08-21) — operator: "Go ahead wirh your recommendation"
+
+**Status:** VERIFIED
+
+### Design
+
+Close the silent-loss hole between `confirm_replayed` and the WAL re-fold.
+
+`main.rs` skips its own drop-and-log for recovered live-feed frames whenever
+`dhan_lane_will_refold` is true, then calls `confirm_replayed`, which MOVES the
+staged segments into the archive so they can never be offered again. Only after
+that does the Dhan lane spawn and re-fold. The gate reads config plus one env
+var — it is the same gate the lane uses, so the two can never disagree about
+ENABLEMENT, and that is exactly why the hole is invisible: it opens on RUNTIME
+refusal, which the gate cannot see.
+
+Six bring-up paths return before the re-fold: an unplannable pool, a
+`[rest_candle_fold]` collision, missing cross-verify deps, a missing WAL, a
+token manager that never registered, and a duplicate spawn. Each returns loudly
+about ITSELF and says nothing about the frames it was handed. So captured ticks
+disappeared with no line anywhere — the silent-loss class the whole
+capture-at-receipt chain exists to prevent.
+
+`report_unfolded_wal_frames(frames, refusal)` is called at all six. It emits the
+same `WS-GAP-03`-coded error and increments the SAME
+`tv_ws_frame_wal_reinjected_dropped_total{ws_type="live_feed"}` counter that
+`main.rs` uses for its own drop path, so the two paths sum into one number
+instead of two. The gate-disabled return in `spawn_dhan_feed_stack` deliberately
+does NOT call it: `main.rs` reads the identical gate and has already logged
+those frames, and reporting again would double-count them.
+
+### Edge Cases
+
+- **Empty batch** — the normal boot. Returns without logging; a loss line
+  printed every morning is a loss line nobody reads.
+- **Gate disabled** — covered by `main.rs`, deliberately not covered here
+  (double-count).
+- **Duplicate spawn** — production has one call site and `FEED_STACK_SPAWNED`
+  makes a second impossible, so this is test-only today. Covered anyway,
+  because "impossible today" is how the other five started.
+- **A seventh refusal added later** — the ratchet fails the build.
+
+### Failure Modes
+
+What this does NOT fix, stated plainly: it buys VISIBILITY, not recovery. The
+raw frames stay in the WAL archive and still need a manual replay, which is the
+same open item ITEM 24 records. Moving the confirm after the fold would buy
+recovery, but the lane is a spawned task the boot path cannot await, and not
+confirming at all re-stages the segments every boot forever (the WS-REINJECT-01
+growth-storm class). That trade is recorded at the confirm site rather than
+silently taken.
+
+### Test Plan
+
+- `report_unfolded_wal_frames_is_silent_on_an_empty_batch`
+- `report_unfolded_wal_frames_names_the_refusal_it_was_given` — pins the
+  structured field AND that the counter matches `main.rs`'s
+- `every_lane_refusal_before_the_refold_reports_its_unfolded_frames` — the
+  ratchet. Scans `run_dhan_feed_stack` up to the re-fold call and fails if any
+  `return;` is not immediately preceded by a report. Bite-proven: removing the
+  `wal_missing` call turns it red and names the offending line. Carries a
+  non-vacuity assertion so a collapsed scan window cannot pass silently.
+
+Verification: 1,536 app lib tests ok; 42 integration guard binaries that scan
+`dhan_feed_stack.rs` or `main.rs` all ok; `cargo fmt --check` clean; CI-equivalent
+`cargo clippy --workspace --no-deps -- -D warnings` clean.
+
+### Rollback
+
+Revert the commit. The reporter is additive — removing it restores the previous
+(silent) behaviour exactly; no data path changes.
+
+### Observability
+
+`tv_ws_frame_wal_reinjected_dropped_total{ws_type="live_feed"}` — existing
+counter, now incremented from six previously-silent paths. **FLAGGED, not
+fixed:** this counter has no CloudWatch alarm, so the loss is now *loggable and
+countable* but still not *pageable*. It joins the ~8 metrics absent from the EMF
+selectors that ITEM 25's audit recorded; alarming it is its own change with its
+own cost line.
+
+### Rider — a stated property that had become false
+
+`alive_connection_guard_tests` carried a comment claiming its tests were
+"serialized ... by running both assertions here". That was true when the module
+held one test and became false the moment a second one was added beside it: both
+mutate the process-global `ALIVE_CONNECTIONS` and assert EXACT values, so under
+`cargo test` (one process, many threads) they race. Adding tests to the same
+binary shifted the scheduling and exposed it — 2 failures that vanish under
+`--test-threads=1`.
+
+Fixed the way this repo already fixed the identical class in
+`tv_api_token_prod_guard.rs` (recorded in `merge-gate-lock-2026-07-04.md` §3.2):
+a module-scoped `Mutex` with poisoning recovered rather than propagated, since
+one of these tests raises a panic deliberately. The false comment is replaced by
+one that says why the lock exists. nextest gives each test its own process,
+which is why CI never showed this.
+
+### Per-Item Guarantee Matrix
+
+Carried by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
+(15-row + 7-row). Rows specific to this item:
+
+- **Zero ticks lost** — no new drop path; this item makes an EXISTING silent
+  drop audible. Honest: it does not recover the frames.
+- **Logging** — every new path uses `error!` with
+  `code = ErrorCode::WsGapConnectionState.code_str()`.
+- **Extreme check** — the ratchet fails the build on a seventh unguarded return,
+  bite-proven in both directions.
+- **O(1)** — the reporter is O(1): a length read, one log, one counter
+  increment. No allocation beyond the log record itself, and it runs only on a
+  refusal path, never on the hot path.

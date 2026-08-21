@@ -2093,6 +2093,28 @@ async fn async_main() -> Result<()> {
         // Acceptable post-retirement: no consumer exists to re-replay into,
         // and NOT confirming would re-stage the unreadable segments forever
         // (the WS-REINJECT-01 growth-storm class).
+        //
+        // AMENDED 2026-08-21 — this confirm runs BEFORE the lane folds.
+        // When `dhan_lane_will_refold` is true the block above deliberately
+        // does not drop-and-log, because the frames are handed to the lane;
+        // the segments are nevertheless archived right here, so they cannot
+        // be offered again on the next boot. That gap is real: the gate reads
+        // config and one env var, and cannot see a RUNTIME refusal inside the
+        // lane (unplannable pool, [rest_candle_fold] collision, missing
+        // cross-verify deps, missing WAL, token manager never registered, a
+        // duplicate spawn). Six such paths returned before the re-fold and
+        // none of them said anything, so the frames vanished with no line
+        // anywhere — the silent-loss class this chain exists to prevent.
+        //
+        // The lane now calls `report_unfolded_wal_frames` on every one of
+        // them, incrementing this same counter so the two paths sum into one
+        // number, and `every_lane_refusal_before_the_refold_reports_its_
+        // unfolded_frames` fails the build if a seventh is added without it.
+        // What that buys is VISIBILITY, not recovery: the raw frames stay in
+        // the archive and still need a manual replay. Moving the confirm
+        // after the fold would buy recovery, but the lane is a spawned task
+        // this boot path cannot await, and not confirming at all re-stages
+        // the segments every boot forever (the WS-REINJECT-01 class).
         let confirm_ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
         tickvault_storage::ws_frame_spill::confirm_replayed(&confirm_ws_wal_path);
     }

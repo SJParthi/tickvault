@@ -5028,6 +5028,55 @@ pub struct WalRefoldOutcome {
     /// Frames whose bytes could not be parsed at all.
     pub unparseable: u64,
 }
+/// Reports live-feed frames the lane recovered from the write-ahead log but
+/// will never fold, because bring-up refused before reaching the re-fold.
+///
+/// # Why this has to exist
+///
+/// `main.rs` decides whether to drop-and-log these frames itself by asking
+/// `feed_stack_gate` whether the lane will run. That gate reads config and one
+/// env var — it is the same gate the lane uses, so the two can never disagree
+/// about *enablement*. What it cannot see is a RUNTIME refusal: an unplannable
+/// pool, a `[rest_candle_fold]` collision, missing cross-verify deps, a missing
+/// WAL, or a token manager that never registered. On any of those, `main.rs`
+/// has already skipped its own drop-and-log (it believed the lane would fold),
+/// and `confirm_replayed` has already MOVED the segments into the archive so
+/// they cannot re-stage next boot.
+///
+/// The frames are therefore gone from the replay path with nobody saying so —
+/// captured ticks, silently unrecoverable-by-automation. A silent loss is the
+/// one outcome this whole capture chain exists to prevent, so every refusal
+/// path that returns before the re-fold calls this first.
+///
+/// This does not save the frames. The raw bytes remain on disk in the WAL
+/// archive (`confirm_replayed` moves, never deletes) and can be recovered by
+/// hand; what this restores is the operator's ability to KNOW that is needed.
+///
+/// The gate-disabled path in `spawn_dhan_feed_stack` deliberately does NOT call
+/// this: `main.rs` reads the identical gate and has already logged the drop
+/// itself, so reporting again would double-count the same frames.
+pub fn report_unfolded_wal_frames(frames: &[(u64, bytes::Bytes)], refusal: &str) {
+    if frames.is_empty() {
+        return;
+    }
+    let dropped = frames.len() as u64;
+    error!(
+        code = ErrorCode::WsGapConnectionState.code_str(),
+        frames = dropped,
+        refusal,
+        "{dropped} live-feed frame(s) were recovered from the write-ahead log but will NOT be \
+         folded — the live lane refused to start ({refusal}), and the write-ahead log segments \
+         were already archived, so they will not be offered again on the next boot. The ticks \
+         and candles they contain are NOT in the database. The raw frames are preserved in the \
+         write-ahead log archive and can be recovered manually. If this session followed an \
+         unclean stop during market hours, this is real data loss for that window."
+    );
+    metrics::counter!(
+        "tv_ws_frame_wal_reinjected_dropped_total",
+        "ws_type" => "live_feed"
+    )
+    .increment(dropped);
+}
 
 /// Re-folds live-feed frames recovered from the write-ahead log.
 ///
@@ -5147,6 +5196,7 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
              stacks would share one sixteen-socket budget and Dhan answers an over-limit \
              pool by silently killing its OLDEST socket."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "duplicate_spawn");
         return None;
     }
     // Installed BEFORE the bring-up task is spawned, so neither the silence
@@ -5185,6 +5235,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 %err,
                 "Dhan live-feed stack could not be planned — no socket opened this session"
             );
+            report_unfolded_wal_frames(&params.wal_replay_live_feed, "plan_failed");
             return;
         }
     };
@@ -5221,6 +5272,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
              cross-verification compare the REST record against itself and always agree. \
              Turn OFF [rest_candle_fold] to run the live lane, or leave the live lane off."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "rest_candle_fold_collision");
         return;
     }
 
@@ -5255,6 +5307,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
              from a quiet one. Call install_crossverify_deps() during boot, before this stack \
              spawns."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "crossverify_deps_missing");
         return;
     };
     // Held for the lane's lifetime so the comparator cannot be dropped while
@@ -5274,6 +5327,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
              any socket. Capture-at-receipt is the durability floor; without it a process kill \
              would silently erase every frame received since the last flush."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "wal_missing");
         return;
     };
 
@@ -5323,6 +5377,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
              socket. The Dhan REST stack registers the manager after authentication — this \
              means authentication did not complete in time (check AUTH-GAP-* and DH-901)."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "token_manager_missing");
         return;
     };
 
@@ -9807,38 +9862,38 @@ mod alive_connection_guard_tests {
     use super::{ALIVE_CONNECTIONS, AliveConnectionGuard};
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    /// Serializes the tests in this module.
+    /// Serializes every test in this module.
     ///
-    /// `ALIVE_CONNECTIONS` is a process-global `AtomicUsize`, and both tests
-    /// read a `base` and then assert an exact `base + 1`. Run on parallel
-    /// threads they interleave and either can fail for a reason that has
-    /// nothing to do with what it checks — which is worse than a plain bug,
-    /// because a test that fails at random teaches people to re-run CI
-    /// instead of reading it.
+    /// `ALIVE_CONNECTIONS` is process-global and these tests read EXACT values
+    /// around it (`base`, `base + 1`), so two of them on parallel threads see
+    /// each other's increments and fail for a reason unrelated to what they
+    /// check. `cargo test` shares one process across threads, so the race is
+    /// real there; nextest gives each test its own process, which is why CI
+    /// never showed it.
     ///
-    /// The same class was fixed the same way in `tv_api_token_prod_guard.rs`
-    /// after PR #1411 merged red on it (merge-gate-lock §3.2). Poisoning is
-    /// absorbed rather than propagated: one test panicking on purpose — which
-    /// the unwind case below does — must not convert every sibling into a
-    /// poisoned-lock failure.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
+    /// This replaces a comment that CLAIMED the tests were "serialized ... by
+    /// running both assertions here" — true when this module held one test,
+    /// and quietly false from the moment a second one was added beside it.
+    /// Poisoning is recovered rather than propagated: a panic inside one test
+    /// (which one of them raises deliberately) must not convert every other
+    /// test in the module into a spurious failure.
+    fn serial() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     #[test]
     fn the_count_comes_back_down_on_a_panic_not_only_on_a_clean_return() {
+        let _serial = serial();
         // The defect this exists for: the increment happens OUTSIDE the socket
         // task, so a decrement written as a plain statement at the end of the
         // task body is skipped when the body unwinds. The gauge then reports N
         // sockets alive when N-1 are — permanently, with nothing to correct
         // it, on the one number an operator reads to answer "how many of the
         // sixteen are up?".
-        //
-        // CORRECTED 2026-08-21: this comment used to claim the module was
-        // "serialized ... by running both assertions here". It was not — the
-        // second test below mutates the same global, so the two raced, and the
-        // comment asserting safety is exactly what stopped anyone looking.
-        // The real serialization is the mutex above.
-        let _lock = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
         let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
 
         // Clean path.
@@ -9864,6 +9919,7 @@ mod alive_connection_guard_tests {
 
     #[test]
     fn release_disarms_so_drop_cannot_double_count() {
+        let _serial = serial();
         // `release` consumes the guard and `Drop` still runs on the moved-out
         // value. If it did not disarm, every clean exit would decrement twice
         // and the gauge would read LOW — the opposite failure, equally wrong,
@@ -10385,6 +10441,82 @@ mod late_seed_tests {
             frame_arm < seed_arm,
             "the frame arm must come FIRST under `biased;` — seeding must never \
              preempt draining queued frames"
+        );
+    }
+
+    #[test]
+    fn report_unfolded_wal_frames_is_silent_on_an_empty_batch() {
+        // A boot with nothing to recover is the normal case. Reporting there
+        // would make the loss line meaningless by printing it every morning.
+        report_unfolded_wal_frames(&[], "plan_failed");
+    }
+
+    #[test]
+    fn report_unfolded_wal_frames_names_the_refusal_it_was_given() {
+        // The refusal string is the whole diagnostic value of the line: it is
+        // what separates "the pool could not be planned" from "authentication
+        // did not finish", which need different responses from the operator.
+        let frames = vec![(1u64, bytes::Bytes::from_static(&[8, 0, 0, 0]))];
+        report_unfolded_wal_frames(&frames, "token_manager_missing");
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split("pub fn report_unfolded_wal_frames")
+            .nth(1)
+            .expect("report_unfolded_wal_frames must exist");
+        let decl = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            decl.contains("refusal,"),
+            "the refusal must be a structured field, not only interpolated prose"
+        );
+        assert!(
+            decl.contains("tv_ws_frame_wal_reinjected_dropped_total"),
+            "the report must increment the same counter main.rs uses for its own \
+             drop path, so the two paths sum into one number instead of two"
+        );
+    }
+
+    #[test]
+    fn every_lane_refusal_before_the_refold_reports_its_unfolded_frames() {
+        // THE RATCHET. `main.rs` skips its own drop-and-log whenever
+        // `feed_stack_gate` says the lane will run, and `confirm_replayed`
+        // archives the segments immediately — before this lane has folded
+        // anything. So a refusal that returns before the re-fold without
+        // reporting makes captured ticks disappear with no line anywhere.
+        //
+        // Five such refusals existed and none of them reported. This test
+        // fails the build if a sixth is added the same way.
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split("async fn run_dhan_feed_stack")
+            .nth(1)
+            .expect("run_dhan_feed_stack must exist");
+        let upto = body
+            .find("let outcome = refold_wal_frames(")
+            .expect("the re-fold call must exist — it is what these returns precede");
+        let before_refold = &body[..upto];
+
+        let mut unguarded = Vec::new();
+        let mut previous = "";
+        for (idx, raw) in before_refold.lines().enumerate() {
+            let line = raw.trim();
+            if line == "return;" && !previous.contains("report_unfolded_wal_frames(") {
+                unguarded.push(format!("{}: {previous}", idx + 1));
+            }
+            if !line.is_empty() {
+                previous = line;
+            }
+        }
+        assert!(
+            unguarded.is_empty(),
+            "every early return before the WAL re-fold must first call \
+             report_unfolded_wal_frames — otherwise frames main.rs handed over, and \
+             whose segments are already archived, vanish with no log line. Unguarded: {unguarded:?}"
+        );
+
+        // Non-vacuous: the scan must actually be looking at real returns.
+        assert!(
+            before_refold.matches("return;").count() >= 5,
+            "the scan window collapsed — it should span every bring-up refusal"
         );
     }
 }
