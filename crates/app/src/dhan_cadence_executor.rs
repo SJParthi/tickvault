@@ -40,6 +40,7 @@
 
 use std::sync::Arc;
 
+use crate::dhan_depth_universe::contract_segment_for_underlying;
 use chrono::NaiveDate;
 use secrecy::ExposeSecret;
 use tickvault_common::config::QuestDbConfig;
@@ -282,6 +283,27 @@ pub struct DhanCadenceExecutor {
     /// Typed Telegram sink for the escalation/recovery events (`None` in
     /// tests — the coded `error!` lines still fire).
     notifier: Option<Arc<NotificationService>>,
+    /// Order-runtime mark tap (2026-08-21).
+    ///
+    /// **This field is new, and the comment it replaces said the Dhan
+    /// executor must NEVER carry it.** That 2026-07-18 rule was right for
+    /// the shape it was written in: with BOTH brokers live, Dhan's small
+    /// integer sids (13/25/51) and Groww's namespace-banded u64s are
+    /// different id spaces for the SAME instrument, so marking one paper
+    /// book from both would file NIFTY under two keys and leave a position
+    /// opened against one of them permanently unmarked.
+    ///
+    /// The operator's 2026-08-21 removal directive dissolves that premise
+    /// rather than overriding it: once Groww is gone there is only ONE id
+    /// space, so the double-keying hazard has nothing to collide with. The
+    /// ORDERING is therefore load-bearing and is enforced at the single
+    /// wiring site — this tap and the Groww lane's stand-down must land
+    /// together. Arming this while the Groww lane still marks is the
+    /// original hazard, re-created.
+    ///
+    /// `None` ⇒ `[order_runtime]` disabled; the tap is a single relaxed
+    /// load and then nothing.
+    mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
 }
 
 impl DhanCadenceExecutor {
@@ -293,6 +315,7 @@ impl DhanCadenceExecutor {
         rest_api_base_url: &str,
         questdb: &QuestDbConfig,
         notifier: Option<Arc<NotificationService>>,
+        mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
@@ -318,6 +341,7 @@ impl DhanCadenceExecutor {
             moneyness_latches: Mutex::new(MoneynessWarnLatches::default()),
             escalation: Mutex::new(LaneEscalation::new(Feed::Dhan)),
             notifier,
+            mark_forwarder,
         })
     }
 
@@ -583,6 +607,28 @@ impl CadenceExecutor for DhanCadenceExecutor {
                         &candle,
                     ),
                 ]);
+                // Order-runtime mark tap (2026-08-21) — the Dhan half of the
+                // mark source, added as Groww's is removed.
+                //
+                // Placed HERE, inside the `if flush_ok` guard and after the
+                // flush ACK, for the same reason the fold handoff is: a mark
+                // must never reference a price the audit record does not
+                // back. A paper fill priced off a bar that failed to persist
+                // is a fill nobody can reconstruct afterwards.
+                //
+                // Own-fire closes only. This arm is the just-closed-minute
+                // fetch; the backfill and sweep paths do not reach it, which
+                // is deliberate — a repaired minute is record-completeness
+                // data, and filling a paper order at a price recovered
+                // minutes late is exactly the staleness the decision-freshness
+                // gate forbids.
+                if let Some(forwarder) = self.mark_forwarder.as_ref() {
+                    forwarder.mark_forward(
+                        security_id,
+                        EXCHANGE_SEGMENT_IDX_I,
+                        candle.close as f32,
+                    );
+                }
             }
             metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
             #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
@@ -900,6 +946,70 @@ impl CadenceExecutor for DhanCadenceExecutor {
                     );
                 }
             }
+            // Order-runtime mark tap for the OPTION LEGS (2026-08-21), the
+            // second half of the Dhan mark source. Persist-gated like the
+            // spot tap: `!persist_failed` means the flush ACKed.
+            //
+            // Two refusals here, both fail-closed, because an option mark
+            // needs two things the chain response does not give us:
+            //
+            // 1. THE CONTRACT'S SEGMENT. The response carries the
+            //    UNDERLYING's segment (IDX_I — an index), never the
+            //    contract's. `contract_segment_for_underlying` is the single
+            //    tested place that inference lives; an underlying it does not
+            //    recognise is REFUSED, not guessed. Guessing is seductive
+            //    precisely because NseFno is right for two of the three and
+            //    silently wrong for SENSEX.
+            //
+            // 2. A REAL CONTRACT ID. `contract_security_id` defaults to 0
+            //    when the vendor omits the field, and 0 is a well-formed
+            //    integer that would key a paper position against an
+            //    instrument that does not exist. Refused and counted.
+            //
+            // Both refusals increment one counter with a `reason` label
+            // rather than logging per leg: a missing field is missing for
+            // every leg of the chain, so a per-leg line would be a
+            // ~200-line burst per minute for one fact.
+            if !persist_failed && let Some(forwarder) = self.mark_forwarder.as_ref() {
+                match contract_segment_for_underlying(symbol) {
+                    Some(seg) => {
+                        let seg_code = seg.binary_code();
+                        let mut refused_zero_id = 0u64;
+                        for leg in chain.legs.iter() {
+                            // `<= 0` first, then a checked widen. The
+                            // check makes the conversion infallible, so the
+                            // `else` arm is unreachable in practice — but it
+                            // is written as a refusal rather than an unwrap
+                            // so that a future edit to the guard above
+                            // degrades into a counted skip instead of a
+                            // panic on the paper-trading path.
+                            if leg.contract_security_id <= 0 {
+                                refused_zero_id += 1;
+                                continue;
+                            }
+                            let Ok(contract_id) = u64::try_from(leg.contract_security_id) else {
+                                refused_zero_id += 1;
+                                continue;
+                            };
+                            forwarder.mark_forward(contract_id, seg_code, leg.last_price as f32);
+                        }
+                        if refused_zero_id > 0 {
+                            metrics::counter!(
+                                "tv_chain_mark_refused_total",
+                                "reason" => "no_contract_id"
+                            )
+                            .increment(refused_zero_id);
+                        }
+                    }
+                    None => {
+                        metrics::counter!(
+                            "tv_chain_mark_refused_total",
+                            "reason" => "unknown_underlying"
+                        )
+                        .increment(chain.legs.len() as u64);
+                    }
+                }
+            }
             {
                 let mut audit = self.audit_writer.lock().await;
                 if persist_failed {
@@ -1199,6 +1309,76 @@ mod tests {
             DHAN_CADENCE_HTTP_TIMEOUT_SECS * 1_000
         );
         assert_eq!(DHAN_CADENCE_MAX_REQUEST_BUDGET_MS, 10_000);
+    }
+
+    // ---- order-runtime mark tap (2026-08-21) --------------------------
+
+    #[test]
+    fn the_spot_mark_is_persist_gated_like_the_fold_handoff() {
+        // A mark must never reference a price the audit record does not
+        // back. If this tap ever drifts ABOVE the `if flush_ok` guard, a
+        // paper order could fill at a price from a bar that failed to
+        // persist -- a fill nobody can reconstruct afterwards.
+        let src = include_str!("dhan_cadence_executor.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or_default();
+        let guard = prod.find("if flush_ok {").expect("flush_ok guard present");
+        let tap = prod
+            .find("forwarder.mark_forward(")
+            .expect("spot mark tap present");
+        assert!(
+            tap > guard,
+            "the spot mark tap must sit INSIDE the flush_ok guard, not before it"
+        );
+    }
+
+    #[test]
+    fn the_option_mark_refuses_rather_than_guessing_a_segment() {
+        // The chain response carries the UNDERLYING's segment, never the
+        // contract's. NseFno is right for NIFTY and BANKNIFTY and silently
+        // WRONG for SENSEX, so a default would be right twice and wrong in
+        // the way that survives review. The mapping must be the single
+        // tested one, and an unknown underlying must be counted, not
+        // guessed.
+        let src = include_str!("dhan_cadence_executor.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(
+            prod.contains("contract_segment_for_underlying(symbol)"),
+            "option marks must derive the segment from the single tested mapping"
+        );
+        assert!(
+            prod.contains(r#""reason" => "unknown_underlying""#),
+            "an unrecognised underlying must be COUNTED, never defaulted to a segment"
+        );
+        // And the mapping itself must still be fail-closed.
+        assert!(contract_segment_for_underlying("NIFTY").is_some());
+        assert!(contract_segment_for_underlying("SENSEX").is_some());
+        assert_ne!(
+            contract_segment_for_underlying("NIFTY"),
+            contract_segment_for_underlying("SENSEX"),
+            "NIFTY and SENSEX must NOT resolve to the same segment"
+        );
+        assert!(
+            contract_segment_for_underlying("NOT_A_REAL_UNDERLYING").is_none(),
+            "an unknown underlying must refuse"
+        );
+    }
+
+    #[test]
+    fn a_missing_contract_id_is_refused_not_marked_as_instrument_zero() {
+        // `contract_security_id` defaults to 0 when the vendor omits the
+        // field. Zero is a well-formed integer, so without this refusal a
+        // paper position would be keyed against an instrument that does
+        // not exist -- and it would look completely ordinary.
+        let src = include_str!("dhan_cadence_executor.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(
+            prod.contains("leg.contract_security_id <= 0"),
+            "a zero/absent contract id must be refused before it becomes a mark key"
+        );
+        assert!(
+            prod.contains(r#""reason" => "no_contract_id""#),
+            "the refusal must be counted, not silent"
+        );
     }
 
     #[test]

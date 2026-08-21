@@ -193,23 +193,35 @@ fn test_groww_cadence_chain_seam_forwards_resolved_marks_after_flush_ack() {
 }
 
 #[test]
-fn test_dhan_cadence_executor_carries_no_mark_tap() {
-    // ID-SPACE BAN: the paper book keys on the Groww-native u64 id space
-    // (bit-62 `stable_index_security_id` indices — order-runtime-dryrun.md
-    // §3/E9). Dhan cadence spot sids are the Dhan IDX_I space (NIFTY=13,
-    // BANKNIFTY=25, SENSEX=51). Feeding Dhan marks alongside Groww marks
-    // would DOUBLE-KEY the same instrument as two book entries — invisible
-    // to the first-seen-SEGMENT tripwire, because both entries carry the
-    // SAME segment code (IDX_I) under different ids. Marks come from the
-    // GROWW lane only.
+fn test_dhan_cadence_executor_is_now_the_mark_producer() {
+    // INVERTED 2026-08-21. This test previously asserted the OPPOSITE --
+    // that `dhan_cadence_executor.rs` must never mention a mark tap -- on
+    // this reasoning, preserved verbatim because it is still correct about
+    // the hazard:
+    //
+    //   "ID-SPACE BAN: the paper book keys on the Groww-native u64 id space
+    //    ... Feeding Dhan marks alongside Groww marks would DOUBLE-KEY the
+    //    same instrument as two book entries -- invisible to the
+    //    first-seen-SEGMENT tripwire, because both entries carry the SAME
+    //    segment code (IDX_I) under different ids."
+    //
+    // The operator's 2026-08-21 directive removes Groww entirely, which
+    // dissolves the premise rather than overruling the rule: "alongside
+    // Groww marks" describes a state that no longer exists. One id space
+    // remains, so there is nothing for a Dhan mark to double-key against.
+    //
+    // The invariant that survives is ONE marking broker, and it is pinned
+    // by `mark_source_single_id_space_guard.rs`. This test now pins the
+    // other half: Dhan actually produces marks, so the paper book is not
+    // left silently unmarked -- the failure this whole sequence exists to
+    // prevent.
     let scan = scan_region("src/dhan_cadence_executor.rs");
     for needle in ["mark_forward", "MarkForwarder", "mark_forwarder"] {
         assert!(
-            !scan.contains(needle),
-            "dhan_cadence_executor.rs production region mentions `{needle}` \
-             — the Dhan cadence lane must NEVER produce order-runtime marks \
-             (cross-ID-SPACE double-keying of the paper book; see the \
-             rationale comment in this test)"
+            scan.contains(needle),
+            "dhan_cadence_executor.rs production region lost `{needle}` -- \
+             Dhan is now the sole mark producer; without it the paper book \
+             and risk engine run unmarked with no error anywhere"
         );
     }
 }
@@ -231,27 +243,33 @@ fn test_main_threads_forwarder_into_cadence_boot() {
 }
 
 #[test]
-fn test_cadence_boot_passes_forwarder_to_groww_executor_only() {
+fn test_cadence_boot_passes_forwarder_to_dhan_executor_only() {
+    // INVERTED 2026-08-21 alongside the test above -- same reason, same
+    // surviving invariant: exactly ONE executor may receive the tap. The
+    // direction flipped when Groww was ordered removed; "only one" did not.
     let scan = scan_region("src/cadence_boot.rs");
-    // The GROWW constructor window carries the forwarder…
-    let groww_at = scan
-        .find("GrowwCadenceExecutor::new(")
-        .expect("cadence_boot.rs lost GrowwCadenceExecutor::new(");
-    let groww_window = &scan[groww_at..(groww_at + 200).min(scan.len())];
-    assert!(
-        groww_window.contains("groww_mark_forwarder"),
-        "cadence_boot.rs must pass groww_mark_forwarder into \
-         GrowwCadenceExecutor::new — the sole live mark producer"
-    );
-    // …and the DHAN constructor window must NOT (the id-space ban).
     let dhan_at = scan
         .find("DhanCadenceExecutor::new(")
         .expect("cadence_boot.rs lost DhanCadenceExecutor::new(");
-    let dhan_window = &scan[dhan_at..(dhan_at + 300).min(scan.len())];
+    let groww_at = scan
+        .find("GrowwCadenceExecutor::new(")
+        .expect("cadence_boot.rs lost GrowwCadenceExecutor::new(");
+
+    let dhan_window = &scan[dhan_at..groww_at];
     assert!(
-        !dhan_window.contains("mark_forwarder"),
-        "cadence_boot.rs passes a mark forwarder into the DHAN executor — \
-         forbidden (cross-ID-SPACE double-keying of the paper book)"
+        dhan_window.contains("mark_forwarder"),
+        "cadence_boot.rs must pass the mark tap into DhanCadenceExecutor::new -- \
+         it is the sole live mark producer"
+    );
+
+    let groww_window = &scan[groww_at..];
+    let groww_window = &groww_window[..groww_window
+        .find("leg_identity_index")
+        .unwrap_or(groww_window.len())];
+    assert!(
+        !groww_window.contains("mark_forwarder"),
+        "the Groww executor must NOT receive the mark tap -- two marking brokers \
+         file one instrument under two keys, and nothing reports it"
     );
 }
 
