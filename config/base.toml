@@ -914,8 +914,7 @@ enabled = true
 # (which is untouched). Zero Telegram, zero order-path involvement, cold
 # path only. Serde default is OFF (fail-safe) — this section opts in;
 # `enabled = false` is the rollback switch. Producers feed the channels
-# only when their own gates run ([dhan_order_push] / [groww_orders]
-# order_push_enabled) — with both producer gates off the consumer idles.
+# only when their own gates run ([dhan_order_push] order_push_enabled) — with both producer gates off the consumer idles.
 # ===========================================================================
 [order_update_events]
 enabled = true
@@ -1015,55 +1014,6 @@ interval_secs = 300
 # NOTE: `trading_hours_only = false` skips the SESSION-WINDOW gate AND the
 # trading-DAY (calendar/weekday) gate — runs then fire on weekends/holidays too.
 trading_hours_only = true
-
-# ===========================================================================
-# Groww ORDER-SIDE build gate (operator authorization 2026-07-14 —
-# groww-second-feed-scope-2026-06-19.md §39, no-rest-except-live-feed §10).
-# GATE 1 of the 4-gate live-fire lattice. EVERY key is false: the entire
-# Groww order-side ships DARK. Read-only order/portfolio/margin/user GETs run
-# ONLY when their per-area flag here is true AND during market hours. Live
-# order PLACEMENT is additionally hard-locked behind Gate 2 (the non-default
-# `groww_orders` cargo feature) + Gate 3 (the GROWW_ORDER_LIVE_FIRE = false
-# source const): flipping live_fire_requested alone fires NOTHING. Flipping
-# any of these to true for live orders is a SEPARATE future dated operator
-# action that edits §39 + Gate 3 first. Absent section = fully disabled.
-# ===========================================================================
-[groww_orders]
-orders_read = false
-portfolio_read = false
-margin_read = false
-user_read = false
-live_fire_requested = false
-smart_orders_read = false # read-only GTT/OCO get/list (the OCO reconcile poller's read surface)
-smart_orders_write = false # smart-order create/modify/cancel INTENT — inert without Gates 2+3
-oco_reconcile_poll_secs = 15 # OCO reconcile poller cadence (seconds; Smart Orders area design value)
-oco_sibling_cancel_deadline_secs = 30 # sibling-cancel verification deadline (seconds) — past it = GROWW-OCO-02
-# paper_enabled: the zero-HTTP paper executor + intent ledger lane. Default
-# OFF; makes ZERO HTTP calls (incl. GETs) when on — separate from orders_read.
-paper_enabled = false
-# max_order_quantity: fail-closed cap; 0 = refuse-all (pending the operator's
-# 0-vs-1 answer). A larger requested qty is refused before any HTTP (GROWW-ORD-09).
-max_order_quantity = 0
-# order_push_enabled: receive-only order/position PUSH channel (Stage A,
-# 2026-07-16) — paper-mode observability only; places no order.
-order_push_enabled = true
-
-# ===========================================================================
-# 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via
-# the coordinator session — the Funds & Margin surface runs as its own
-# dedicated build). Code-ready, DEFAULT-OFF: even with enabled = true the
-# REST legs stay dark until the code-change master lock
-# DHAN_MARGIN_GATE_REST_ALLOWED (constants.rs) flips with a fresh dated
-# operator quote recorded in .claude/rules/dhan/funds-margin.md (the
-# umbrella-plan E2 hold). Shared account with BruteX: tenant_budget_percent
-# caps EACH entry to <=50% of the then-current pooled availabelBalance
-# (per-entry, not cumulative); rest_self_cap_per_sec self-caps our
-# funds/margin REST usage — the endpoints' rate bucket is NOT named by
-# Dhan's docs (Assumed Non-Trading 20/sec; 5/sec stays <=50% even under the
-# more conservative 10/sec reading; live-probe before raising). The
-# self-cap is per gate instance — the OMS wiring PR constructs exactly one
-# gate per process and ratchets it. Exits are NEVER margin-gated.
-# ===========================================================================
 [dhan_margin_gate]
 enabled = false
 tenant_budget_percent = 50

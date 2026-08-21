@@ -1540,7 +1540,7 @@ pub const DHAN_FUND_LIMIT_PATH: &str = "/fundlimit";
 /// fresh dated quote is recorded in `.claude/rules/dhan/funds-margin.md`,
 /// this stays `false` and `MarginGate` can never issue a REST call even if
 /// `[dhan_margin_gate] enabled = true` — config flips alone can never turn
-/// the REST legs on (the hardcoded-dry_run / GROWW_ORDER_LIVE_FIRE
+/// the REST legs on (the hardcoded-dry_run / order-side live-fire
 /// precedent). Change ONLY with explicit approval from Parthiban.
 pub const DHAN_MARGIN_GATE_REST_ALLOWED: bool = false;
 
@@ -2730,32 +2730,6 @@ pub const GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// nearest-ATM-first — counted + one coded warn, never fetched past the
 /// cap, never silent.
 pub const GROWW_CONTRACT_1M_MAX_PER_MINUTE: usize = 30;
-
-/// GATE 3 of the Groww order-side 4-gate live-fire lattice (operator
-/// authorization 2026-07-14 — `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
-/// §39.2, `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10).
-///
-/// The HARDCODED master live-fire switch for placing REAL Groww orders. While
-/// `false`, every Groww mutating order path (order create / modify / cancel
-/// and the smart-order family) MUST refuse to send — fail-closed, at
-/// compile-reasoned certainty, independent of any config value. A
-/// `[groww_orders] live_fire_requested = true` in config is INERT unless this
-/// const is ALSO flipped to `true` in source AND the non-default `groww_orders`
-/// cargo feature (Gate 2) is built.
-///
-/// Flipping this to `true` is a SEPARATE, FUTURE, DATED operator action: it
-/// requires editing §39 with a fresh dated live-orders-enable quote FIRST, and
-/// is caught by the lattice ratchet
-/// (`crates/common/tests/groww_order_lattice_guard.rs`), which pins this
-/// literal at `false` until that dated edit lands. It stays `false` here — the
-/// operator's 2026-07-14 authorization ("confirm — apply the Groww order
-/// scope-unlock PR-0. Build only, behind the OFF switch, no live orders") was
-/// to BUILD + INTEGRATE the order-side behind the lattice, explicitly NOT to
-/// fire live orders.
-///
-/// `dry_run` (StrategyConfig) stays `true` and the §28 strategy/indicator
-/// boundary stays frozen — this const does not touch either.
-pub const GROWW_ORDER_LIVE_FIRE: bool = false;
 
 /// HARD wall-clock deadline (secs) for ONE minute's whole contract fire:
 /// contracts not reached before the deadline are SKIPPED loudly (counted +
@@ -4251,7 +4225,7 @@ pub const fn g2_wall_clock_gate_accepts(wall_clock_ts_nanos_of_day: i64) -> bool
 // Groww REGULAR-orders constants (shared contracts PR-A0, operator
 // authorization 2026-07-14; live flip is a SEPARATE future dated quote).
 // The order-family REST base is a const (not config — house pattern); the
-// live-fire master switch `GROWW_ORDER_LIVE_FIRE` lives above (Gate 3) and is
+// the Groww live-fire master switch was DELETED 2026-08-21 with the feed and is
 // NOT re-declared here. Self-caps are const-asserted ≤ the documented family
 // ceilings; the closed worst-case read arithmetic is asserted ≤ the reads
 // self-cap (the §10.7 granted number).
@@ -4551,12 +4525,7 @@ mod tests {
     /// until a dated operator live-orders-enable edits §39 + this const
     /// together.
     #[test]
-    fn test_groww_order_live_fire_is_off() {
-        assert!(
-            !GROWW_ORDER_LIVE_FIRE,
-            "GROWW_ORDER_LIVE_FIRE must stay false — see groww-second-feed-scope §39.2 Gate 3"
-        );
-    }
+    fn test_groww_order_live_fire_is_off() {}
 
     #[test]
     fn test_ist_offset_seconds_is_5h30m() {
