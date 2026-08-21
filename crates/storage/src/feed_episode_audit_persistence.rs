@@ -358,13 +358,9 @@ impl FeedEpisodeAuditWriter {
                 &mut self.pending,
                 "feed_episode_audit",
             );
-            if dropped > 0 {
-                return Err(anyhow::Error::new(err).context(format!(
-                    "feed_episode_audit ILP flush failed and the retained buffer hit its {}-row bound; those rows were discarded so memory stays bounded and a poisoned buffer cannot keep this table dead",
-                    crate::ilp_overflow::MAX_PENDING_ROWS
-                )));
-            }
-            return Err(anyhow::Error::new(err).context("feed_episode_audit ILP flush"));
+            return Err(anyhow::Error::new(err).context(
+                crate::ilp_overflow::flush_failure_context("feed_episode_audit ILP flush", dropped),
+            ));
         }
         self.pending = 0;
         Ok(())

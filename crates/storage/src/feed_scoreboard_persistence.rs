@@ -592,13 +592,9 @@ impl FeedScoreboardWriter {
                 &mut self.pending,
                 "feed_scoreboard_daily",
             );
-            if dropped > 0 {
-                return Err(anyhow::Error::new(err).context(format!(
-                    "feed_scoreboard ILP flush failed and the retained buffer hit its {}-row bound; those rows were discarded so memory stays bounded and a poisoned buffer cannot keep this table dead",
-                    crate::ilp_overflow::MAX_PENDING_ROWS
-                )));
-            }
-            return Err(anyhow::Error::new(err).context("feed_scoreboard ILP flush"));
+            return Err(anyhow::Error::new(err).context(
+                crate::ilp_overflow::flush_failure_context("feed_scoreboard ILP flush", dropped),
+            ));
         }
         self.pending = 0;
         Ok(())

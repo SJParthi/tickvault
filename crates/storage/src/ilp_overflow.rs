@@ -82,10 +82,74 @@ pub fn discard_if_overflowing(
     dropped
 }
 
+/// The context line for a failed flush, naming whether the bound discarded.
+///
+/// Extracted from the four writers rather than repeated in each, for two
+/// reasons. The dull one is that four copies of a message drift. The real one
+/// is coverage: the `dropped > 0` branch needs a genuine ILP failure with a
+/// full buffer behind it, which no unit test can stage without a QuestDB — so
+/// four inline copies are four blocks of production code that testing can
+/// never reach, and the crate's ratcheted coverage floor is what notices.
+///
+/// Here the wording is a pure function of two arguments and is tested
+/// directly, so the writers keep only the part that genuinely needs a live
+/// broker to exercise.
+#[must_use]
+pub fn flush_failure_context(what: &'static str, dropped: usize) -> String {
+    if dropped > 0 {
+        format!(
+            "{what} failed and the retained buffer hit its {MAX_PENDING_ROWS}-row bound; \
+             {dropped} row(s) were discarded so memory stays bounded and a poisoned \
+             buffer cannot keep this table dead"
+        )
+    } else {
+        format!("{what} failed; rows are RETAINED for the next attempt")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use questdb::ingress::ProtocolVersion;
+
+    #[test]
+    fn flush_failure_context_distinguishes_retained_from_discarded() {
+        let retained = flush_failure_context("t ILP flush", 0);
+        assert!(
+            retained.contains("RETAINED"),
+            "a failure below the bound must say the rows are still there — an \
+             operator reading this decides whether data was lost, and the two \
+             cases have opposite answers: {retained}"
+        );
+        assert!(
+            !retained.contains("discarded"),
+            "the retained case must not read as a loss: {retained}"
+        );
+
+        let discarded = flush_failure_context("t ILP flush", 123);
+        assert!(
+            discarded.contains("123 row(s) were discarded"),
+            "a discard must name HOW MANY, or the log records that something \
+             was lost without recording how much: {discarded}"
+        );
+        assert!(
+            discarded.contains(&MAX_PENDING_ROWS.to_string()),
+            "and it must name the bound that caused it, so the reader can tell \
+             a capacity problem from a transient one: {discarded}"
+        );
+    }
+
+    #[test]
+    fn flush_failure_context_always_names_the_failing_operation() {
+        for dropped in [0usize, MAX_PENDING_ROWS] {
+            assert!(
+                flush_failure_context("ws_event_audit ILP flush", dropped)
+                    .starts_with("ws_event_audit ILP flush"),
+                "four writers share this text, so the line is useless unless it \
+                 says WHICH one failed"
+            );
+        }
+    }
 
     #[test]
     fn discard_if_overflowing_retains_rows_below_the_cap() {
