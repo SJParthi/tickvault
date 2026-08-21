@@ -131,6 +131,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     // selector, so the "periodic report is good enough" exemption no longer
     // applies — it ships and is checked like any other loss counter.
     (
+        "tv_dhan_depth_universe_failed_total",
+        "logged — VERIFIED 2026-08-21: the emit lives in the shared helper record_depth_failure(), and every one of its SIX call sites in dhan_depth_universe.rs places it immediately before a tracing::error! carrying code=WS-GAP-02. The log therefore reaches errors.jsonl on every increment; it is simply one function away from the counter, which is the one thing this scanner cannot see. Pinned in-crate by failure_metric_tests::every_depth_failure_log_carries_an_error_code, which fails the build if any arm loses its code field. EMF-shipping it remains available as a ~$0.30/mo decision; the cheaper path is an errcode log-filter alarm on WS-GAP-02, which the code field above already makes possible and which needs a dated row in dhan-rest-only-noise-lock-2026-07-14.md first.",
+    ),
+    (
         "tv_dhan_feed_ingest_seq_refused_total",
         "logged — the emit is counters().ingest_seq_refused, three levels of indirection from the literal (const -> struct field -> method), and the error! sits directly beside it; the scanner cannot follow that chain (verified 2026-08-12)",
     ),
