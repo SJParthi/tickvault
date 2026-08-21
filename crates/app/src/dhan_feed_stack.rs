@@ -7965,6 +7965,54 @@ mod tests {
         );
     }
 
+    /// The detector's own blindness, and the reason it needs an accessor.
+    ///
+    /// `scan_silence` reports how many tracked instruments are quiet. It
+    /// cannot report the ones it never accepted, and past capacity that is a
+    /// growing set — so a full detector returns a small, calm number that
+    /// reads exactly like health. This accessor is the only way a caller can
+    /// tell "nothing is silent" from "I can no longer see".
+    #[test]
+    fn detector_refused_separates_a_quiet_universe_from_a_blind_detector() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 2);
+        assert_eq!(
+            ingest.detector_refused(),
+            0,
+            "a fresh detector has turned nobody away"
+        );
+
+        // Fill the slot table exactly.
+        assert!(ingest.seed(13, ExchangeSegment::IdxI, 0));
+        assert!(ingest.seed(25, ExchangeSegment::IdxI, 0));
+        assert_eq!(ingest.tracked_instruments(), 2);
+        assert_eq!(
+            ingest.detector_refused(),
+            0,
+            "seeding up to capacity refuses nobody"
+        );
+
+        // One past it. The seed is refused fail-closed, which is correct —
+        // what matters is that the refusal is now VISIBLE.
+        assert!(
+            !ingest.seed(51, ExchangeSegment::IdxI, 0),
+            "past capacity the allocator must refuse rather than grow"
+        );
+        assert!(
+            ingest.detector_refused() >= 1,
+            "the refusal must be counted, or the detector goes blind silently \
+             and its silent-instrument count keeps reading like health"
+        );
+
+        // The trap this guards: the visible counts stay calm while the
+        // detector is blind to instrument 51 entirely.
+        assert_eq!(
+            ingest.tracked_instruments(),
+            2,
+            "the refused instrument is genuinely absent from the book, which \
+             is exactly why nothing else can report it"
+        );
+    }
+
     /// An empty book is not a silent book.
     #[test]
     fn test_scan_silence_on_an_empty_book_reports_nothing() {
