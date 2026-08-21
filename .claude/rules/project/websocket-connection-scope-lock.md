@@ -1266,3 +1266,91 @@ come from the already-running option-chain leg, which self-rolls at expiry.
   refusal of the WHOLE pool.
 - Claims sockets are "carrying data" on the strength of a dial rather than a
   received frame (see the same-day up-gauge correction).
+
+### 2026-08-21 — FULL MODE EVERYWHERE, and the ONE segment that cannot take it
+
+**The verbatim operator demands (2026-08-21, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see evrythgin enitlrey it shdou lbe always full mode with depth 5 dude okay? why ti fialed bro what ahppened what si the issue we need evryhtign in palce and shdou lwork roght dude?"
+
+> "yes fix evrythgin. dude see i need the entire websokcet coenctions of 16 websocket coennections shdou lebe fully started to recieve the ticks startign from 9 am pre makret price and even market price startign 91.5 am also right dude am i irght dude tlem e dude okay?  so fix an dreoslev evrythgind dude okay?"
+
+Given in DIRECT response to a report that the 119 subscribed NSE indices had
+produced ZERO ticks since being subscribed, while 8,868 tradeable instruments
+were flowing normally at 17.5M ticks/session. This dated section is the
+rule-file-first record the 2026-08-15 §"APPLIED" subsection's own REJECT list
+requires before `DEFAULT_MAIN_FEED_MODE` behaviour changes.
+
+**Full mode with 5-level depth is CONFIRMED and is NOT changed.** Measured on
+the box the same day: 163,934 packets walked frame-by-frame out of the live
+capture log were **every one** `code 8` (Full, 162 bytes, 5 depth levels) —
+135,892 NSE_FNO and 28,042 NSE_EQ. The operator's requirement is already met
+for every instrument that has an order book, and this change does not touch it.
+
+**What this section authorizes is narrow: `IDX_I` — and ONLY `IDX_I` —
+subscribes in Quote (17) instead of Full (21).**
+
+| Segment class | Mode | Depth levels |
+|---|---|---|
+| NSE_EQ, NSE_FNO, BSE_EQ, BSE_FNO — everything with a book | **Full (21)** — unchanged | 5 |
+| **IDX_I only** | **Quote (17)** | none exist |
+
+**Why this is not a downgrade of anything real.** An index is a computed
+number, not a traded instrument. NIFTY has no bids, no asks, no order book —
+there is no depth-5 for Dhan to send. Asking for it requests something that
+does not exist, and Dhan's answer is not an error but SILENCE, which is
+indistinguishable from a quiet instrument. Quote still carries LTP plus day
+open/high/low/close at fixed offsets. Nothing is lost, because indices have no
+depth to lose.
+
+**The evidence (all measured 2026-08-21, not inferred):**
+
+| Finding | Value |
+|---|---|
+| IDX_I packets in 163,934 captured frames | **0** |
+| `code 6` PrevClose for IDX_I — which Dhan support CONFIRMED (Ticket #5525125) is emitted for IDX_I on ANY subscription in ANY mode | **0** |
+| `RISK-GAP-03` never-ticked count | **119** — exactly the index count (it was **4** on 2026-08-20, when four seeds were subscribed) |
+| IDX_I rows in `ticks`, any day on record | **0** |
+| Index IDs correct? | yes — master-sourced, segment 0, NIFTY=13 / BANKNIFTY=25 present in `instrument_lifecycle` |
+
+A subscription that never draws even its one guaranteed packet was never
+accepted. This is not a parser, registry or persistence fault — nothing arrived
+to parse.
+
+**This RESTORES a partition that already existed and was lost in the rebuild.**
+`docs/rules-archive/live-market-feed-subscription.md:279` records the
+pre-retirement design: *"the `WebSocketConnection` constructor pre-sorts IDX_I
+instruments into a separate Quote-mode subscription batch (`connection.rs`, the
+`idx_instruments` partition)"*, chosen so the exchange-computed day OHLC came
+from the packet rather than being tracked app-side. The lane was hard-deleted
+2026-07-17 and rebuilt in the 2026-08-09 revival with ONE global mode and no
+partition — `idx_instruments` has zero occurrences on the tree. The 2026-08-19
+flip to Full and the 2026-08-20 arrival of the 119 master index ids then made
+the loss visible for the first time.
+
+**⚠ UNVERIFIED-LIVE, and deliberately not claimed (Rule 11).** Whether Quote
+(17) is SERVED for IDX_I on this account is not settled in this repository:
+`docs/dhan-support/2026-05-18-idx-i-quote-full-mode-support.md` asked Dhan this
+exact question and **no answer is recorded**, and an older uncited note claimed
+Dhan forces Ticker (15) for indices. If Quote is also refused the failure is
+identical in shape — silence — so the verification is explicit: the
+`RISK-GAP-03` never-ticked count for the index set must fall to **zero** on the
+first session after this lands, and `SELECT count() FROM ticks WHERE
+segment='IDX_I'` must be non-zero. If it does not, `IDX_I_FEED_MODE` is the one
+line to change and `Ticker` is the next value to try. **Nothing here claims the
+indices now work; it claims the request we send is no longer one Dhan is known
+to answer with silence.**
+
+**What this section does NOT authorize:** any change to the mode of any other
+segment; a fifth endpoint type; more than 16 connections; any universe
+widening; any live order fire (`dry_run` stays true); or any edit to the §28
+frozen indicator/strategy area.
+
+**What a PR that violates this section looks like (REJECT):** subscribes IDX_I
+in Full or Ticker without a fresh dated quote here; applies the index override
+to a segment that has an order book (that would silently drop all ~24,600
+tradeable instruments off depth-5); sends a mixed-segment batch as ONE message
+(one Dhan message carries exactly one RequestCode, so one half would get the
+wrong mode); or reports the index set as covered while its never-ticked count
+is non-zero.
