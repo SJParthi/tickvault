@@ -7245,76 +7245,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_groww_contract_1m_fetch_degraded_is_high_with_action_lines() {
-        let event = NotificationEvent::GrowwContract1mFetchDegraded {
-            consecutive_failed_minutes: 3,
-            minute_ist: "10:42 AM".to_string(),
-        };
-        assert_eq!(event.topic(), "GrowwContract1mFetchDegraded");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        assert!(msg.contains("Groww"), "got: {msg}");
-        assert!(msg.contains("FAILING"), "got: {msg}");
-        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
-        // IST 12-hour timestamp (Telegram commandment 9).
-        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        // Honest scope line: the live WS pipelines are untouched.
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_groww_contract_1m_fetch_recovered_is_info_positive_ping() {
-        let event = NotificationEvent::GrowwContract1mFetchRecovered {
-            minute_ist: "10:45 AM".to_string(),
-            failed_minutes: 4,
-        };
-        assert_eq!(event.topic(), "GrowwContract1mFetchRecovered");
-        assert_eq!(event.severity(), Severity::Info);
-        let msg = event.to_message();
-        assert!(msg.contains("Groww"), "got: {msg}");
-        assert!(msg.contains("recovered"), "got: {msg}");
-        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
-        assert!(msg.contains("4 failed"), "got: {msg}");
-        // No false-OK: recovery never claims the missing minutes came back.
-        assert!(msg.contains("nothing is made up"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_groww_contract_1m_book_unresolved_is_high_and_escapes_detail() {
-        let event = NotificationEvent::GrowwContract1mBookUnresolved {
-            detail: "SENSEX: no usable contracts <script>".to_string(),
-        };
-        assert_eq!(event.topic(), "GrowwContract1mBookUnresolved");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        assert!(msg.contains("could NOT"), "got: {msg}");
-        assert!(msg.contains("never guessed"), "got: {msg}");
-        // Hostile detail is HTML-escaped, never raw.
-        assert!(!msg.contains("<script>"), "got: {msg}");
-        assert!(msg.contains("&lt;script&gt;"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_groww_chain_1m_fetch_degraded_is_high_with_action_lines() {
-        let event = NotificationEvent::GrowwChain1mFetchDegraded {
-            consecutive_failed_minutes: 3,
-            minute_ist: "10:42 AM".to_string(),
-        };
-        assert_eq!(event.topic(), "GrowwChain1mFetchDegraded");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        assert!(msg.contains("Groww"), "got: {msg}");
-        assert!(msg.contains("FAILING"), "got: {msg}");
-        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
-        // IST 12-hour timestamp (Telegram commandment 9).
-        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        // Honest scope line: the live WS pipelines are untouched.
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-    }
-
-    #[test]
     fn test_spot_1m_sid_served_recovered_is_info_positive_ping() {
         let event = NotificationEvent::Spot1mSidServedRecovered {
             symbol: "INDIA VIX".to_string(),
@@ -7330,111 +7260,6 @@ mod tests {
         assert!(msg.contains("12 missed"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came back.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_groww_chain_1m_fetch_recovered_is_info_positive_ping() {
-        let event = NotificationEvent::GrowwChain1mFetchRecovered {
-            minute_ist: "10:45 AM".to_string(),
-            failed_minutes: 4,
-        };
-        assert_eq!(event.topic(), "GrowwChain1mFetchRecovered");
-        assert_eq!(event.severity(), Severity::Info);
-        let msg = event.to_message();
-        assert!(msg.contains("Groww"), "got: {msg}");
-        assert!(msg.contains("recovered"), "got: {msg}");
-        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
-        assert!(msg.contains("4 failed"), "got: {msg}");
-        // No false-OK: recovery never claims the missing minutes came back.
-        assert!(msg.contains("nothing is made up"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_groww_chain_1m_underlying_not_served_is_high_names_the_underlying() {
-        let event = NotificationEvent::GrowwChain1mUnderlyingNotServed {
-            underlying: "NIFTY",
-            empty_minutes: 10,
-        };
-        assert_eq!(event.topic(), "GrowwChain1mUnderlyingNotServed");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        // The operator-mandated plain-English core wording.
-        assert!(
-            msg.contains("not returning the option chain for NIFTY"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("other indices are unaffected"), "got: {msg}");
-        assert!(msg.contains("10 minutes in a row"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        // Honest scope lines: the live WS pipeline is untouched, and the
-        // Dhan-side availability is stated as MAY (no false-OK — Dhan's
-        // chain leg has its own independent state).
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-        assert!(
-            msg.contains("may still be available from the Dhan side"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_groww_chain_1m_underlying_served_recovered_is_info_positive_ping() {
-        let event = NotificationEvent::GrowwChain1mUnderlyingServedRecovered {
-            underlying: "NIFTY",
-            empty_minutes: 12,
-        };
-        assert_eq!(event.topic(), "GrowwChain1mUnderlyingServedRecovered");
-        assert_eq!(event.severity(), Severity::Info);
-        let msg = event.to_message();
-        assert!(
-            msg.contains("serving the option chain for NIFTY again"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("12 empty"), "got: {msg}");
-        // No false-OK: recovery never claims the missing minutes came back.
-        assert!(msg.contains("nothing is made up"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_groww_chain_1m_expiry_unresolved_is_high_and_escapes_detail() {
-        let event = NotificationEvent::GrowwChain1mExpiryUnresolved {
-            detail: "SENSEX: no usable option rows <script>".to_string(),
-        };
-        assert_eq!(event.topic(), "GrowwChain1mExpiryUnresolved");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        assert!(msg.contains("could NOT start"), "got: {msg}");
-        assert!(msg.contains("never"), "expiry never guessed: {msg}");
-        // Hostile detail is HTML-escaped, never raw.
-        assert!(!msg.contains("<script>"), "got: {msg}");
-        assert!(msg.contains("&lt;script&gt;"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_groww_chain_1m_probe_verdict_is_info_both_ways() {
-        let passed = NotificationEvent::GrowwChain1mProbeVerdict {
-            ok: true,
-            detail: "NIFTY: 102 strikes in 0.8s".to_string(),
-        };
-        assert_eq!(passed.topic(), "GrowwChain1mProbeVerdict");
-        assert_eq!(passed.severity(), Severity::Info);
-        let msg = passed.to_message();
-        assert!(msg.contains("PASSED"), "got: {msg}");
-        assert!(msg.contains("102 strikes"), "got: {msg}");
-        // Fix E round 1 (2026-07-17): the cadence engine records chains —
-        // never claim recording is OFF; point at the engine instead.
-        assert!(msg.contains("minute-cadence engine"), "honest state: {msg}");
-        assert!(!msg.contains("switched OFF"), "stale OFF claim: {msg}");
-
-        let failed = NotificationEvent::GrowwChain1mProbeVerdict {
-            ok: false,
-            detail: "http 403 <b>hostile</b>".to_string(),
-        };
-        assert_eq!(failed.severity(), Severity::Info);
-        let msg = failed.to_message();
-        assert!(msg.contains("did NOT pass"), "got: {msg}");
-        assert!(!msg.contains("<b>hostile</b>"), "escaped: {msg}");
-        assert!(msg.contains("Nothing is broken"), "got: {msg}");
     }
 
     // -----------------------------------------------------------------------
@@ -7616,7 +7441,6 @@ mod tests {
             early_run: false,
             restart_partial: false,
             dhan_feed_off: false,
-            groww_feed_off: false,
             rest_legs: vec![],
             rest_legs_read_failed: false,
         }
@@ -7814,14 +7638,12 @@ mod tests {
             let ev = NotificationEvent::DualFeedDailyScorecard {
                 trading_date_ist: "2026-07-10".to_string(),
                 dhan: score_line("Dhan"),
-                groww: score_line("Groww"),
                 session_minutes: 375,
                 partial_coverage: partial,
                 degraded,
                 early_run: false,
                 restart_partial: restart,
                 dhan_feed_off: false,
-                groww_feed_off: false,
                 rest_legs: vec![],
                 rest_legs_read_failed: rest_failed,
             };
@@ -7844,14 +7666,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan: score_line("Dhan"),
-            groww: score_line("Groww"),
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: true,
             restart_partial: false,
             dhan_feed_off: false,
-            groww_feed_off: false,
             rest_legs: vec![],
             rest_legs_read_failed: false,
         };
@@ -7875,14 +7695,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan: score_line("Dhan"),
-            groww: g,
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: false,
             restart_partial: false,
             dhan_feed_off: false,
-            groww_feed_off: true,
             rest_legs: vec![],
             rest_legs_read_failed: false,
         };
@@ -7909,14 +7727,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan: d,
-            groww: g,
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: false,
             restart_partial: false,
             dhan_feed_off: true,
-            groww_feed_off: true,
             rest_legs: vec![],
             rest_legs_read_failed: false,
         };
@@ -7956,14 +7772,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-15".to_string(),
             dhan: d,
-            groww: score_line("Groww"),
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: false,
             restart_partial: false,
             dhan_feed_off: true,
-            groww_feed_off: false,
             rest_legs,
             rest_legs_read_failed: false,
         };
@@ -7988,14 +7802,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-15".to_string(),
             dhan: d,
-            groww: score_line("Groww"),
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: false,
             restart_partial: false,
             dhan_feed_off: true,
-            groww_feed_off: false,
             rest_legs: vec![rest_line("Dhan", "spot candles")],
             rest_legs_read_failed: false,
         };
@@ -8039,14 +7851,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-13".to_string(),
             dhan: score_line("Dhan"),
-            groww: score_line("Groww"),
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: false,
             restart_partial: false,
             dhan_feed_off: false,
-            groww_feed_off: false,
             rest_legs,
             rest_legs_read_failed: false,
         };
@@ -8106,14 +7916,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-14".to_string(),
             dhan: score_line("Dhan"),
-            groww: score_line("Groww"),
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: false,
             restart_partial: false,
             dhan_feed_off: false,
-            groww_feed_off: false,
             rest_legs,
             rest_legs_read_failed: false,
         };
@@ -8133,14 +7941,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-14".to_string(),
             dhan: score_line("Dhan"),
-            groww: score_line("Groww"),
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: false,
             restart_partial: false,
             dhan_feed_off: false,
-            groww_feed_off: false,
             rest_legs,
             rest_legs_read_failed: false,
         };
@@ -8167,14 +7973,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-14".to_string(),
             dhan: score_line("Dhan"),
-            groww: score_line("Groww"),
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: false,
             restart_partial: false,
             dhan_feed_off: false,
-            groww_feed_off: false,
             rest_legs,
             rest_legs_read_failed: false,
         };
@@ -8199,14 +8003,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-14".to_string(),
             dhan: d,
-            groww: score_line("Groww"),
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
             early_run: false,
             restart_partial: false,
             dhan_feed_off: true,
-            groww_feed_off: false,
             rest_legs: vec![],
             rest_legs_read_failed: true,
         };
@@ -8250,14 +8052,12 @@ mod tests {
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan: d,
-            groww: g,
             session_minutes: 375,
             partial_coverage: true,
             degraded: true,
             early_run: true,
             restart_partial: true,
             dhan_feed_off: false,
-            groww_feed_off: false,
             rest_legs: vec![RestLegScoreLine {
                 ok_fetches: 735,
                 failed_fetches: 0,

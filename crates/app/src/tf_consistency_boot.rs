@@ -2718,7 +2718,7 @@ mod tests {
             row(33_420, 101.5, 101.75, 98.0, 99.0, 30, 5),
         ];
         let stored = vec![row(33_300, 100.0, 102.0, 98.0, 99.0, 60, 12)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
         assert_eq!(counts.bucket_gaps, 1, "3 of 5 minutes present");
@@ -2730,7 +2730,7 @@ mod tests {
         let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
         // Stored high + volume wrong.
         let stored = vec![row(33_300, 100.0, 105.0, 99.0, 100.5, 11, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert_eq!(counts.buckets_compared, 1);
         let cats: Vec<_> = findings.iter().map(|f| (f.category, f.field)).collect();
         assert!(cats.contains(&(FindingCategory::Mismatch, "high")));
@@ -2748,7 +2748,7 @@ mod tests {
     #[test]
     fn test_compare_tf_missing_tf_row_pages_when_1m_present() {
         let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START);
         assert_eq!(counts.buckets_compared, 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
@@ -2759,7 +2759,7 @@ mod tests {
     #[test]
     fn test_compare_tf_no_1m_coverage_when_stored_over_nothing() {
         let stored = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &[], &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &[], &stored, DAY_START);
         assert_eq!(counts.buckets_compared, 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::No1mCoverage);
@@ -2769,7 +2769,7 @@ mod tests {
     fn test_compare_tf_off_grid_stored_ts_detected() {
         // A 09:16:00 "5m" row is off the 09:15-anchored grid.
         let stored = vec![row(33_360, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, _) = compare_tf(TfIndex::M5, &[], &stored, DAY_START, false);
+        let (findings, _) = compare_tf(TfIndex::M5, &[], &stored, DAY_START);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::OffGridTs);
         assert_eq!(findings[0].bucket_secs_of_day, 33_360);
@@ -2781,7 +2781,7 @@ mod tests {
         let first = row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3);
         let mut second = first;
         second.close = 999.0;
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[first, second], DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[first, second], DAY_START);
         // The duplicate is flagged; the compare ran on the FIRST row and
         // matched, so no mismatch rows.
         assert_eq!(counts.buckets_compared, 1);
@@ -2800,7 +2800,7 @@ mod tests {
             row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 1),
             row(33_600, 2.0, 2.0, 2.0, 2.0, 2, 1),
         ];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 2);
     }
@@ -2814,7 +2814,7 @@ mod tests {
             row(55_740, 10.5, 12.0, 10.0, 11.0, 5, 2), // 15:29
         ];
         let stored = vec![row(54_900, 10.0, 12.0, 9.0, 11.0, 10, 4)];
-        let (findings, counts) = compare_tf(TfIndex::M15, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M15, &ones, &stored, DAY_START);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
     }
@@ -2823,7 +2823,7 @@ mod tests {
     fn test_compare_tf_tick_count_divergence_is_soft() {
         let ones = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 5)];
         let stored = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 6)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert!(findings.is_empty(), "soft signal must not page");
         assert_eq!(counts.soft_tick_count, 1);
     }
@@ -2835,7 +2835,7 @@ mod tests {
             row(33_360, 1.0, 1.0, 1.0, 1.0, 1, 1),
         ];
         let stored = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 1)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert_eq!(counts.volume_overflows, 1);
         assert_eq!(counts.buckets_compared, 0, "corrupt window not compared");
         assert!(findings.is_empty());
@@ -3263,150 +3263,6 @@ mod tests {
     // H1 — Groww final-window tail carve-out
     // -------------------------------------------------------------------
 
-    /// H1: with the Groww carve-out ON, an ABSENT stored row on the FINAL
-    /// window counts `tail_unsealed` (no finding, no page) — the final
-    /// buckets never seal on the prod schedule.
-    #[test]
-    fn test_compare_tf_groww_final_missing_is_tail_unsealed_not_paging() {
-        // M5 final window is [15:35, 15:40) — start 56_100 (2026-08-03 NSE
-        // CAS change moved the close; 385 min still divides evenly by 5).
-        let ones = vec![row(56_100, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
-        assert!(
-            findings.is_empty(),
-            "groww final-window absence must not page: {findings:?}"
-        );
-        assert_eq!(counts.tail_unsealed, 1, "counted, never silent");
-        assert_eq!(counts.buckets_compared, 0);
-    }
-
-    /// H1: the carve-out is FINAL-window-only — a missing NON-final Groww
-    /// row is still the genuine dead-seal-leg `missing_tf_row` page.
-    #[test]
-    fn test_compare_tf_groww_nonfinal_missing_still_pages() {
-        let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
-        assert_eq!(counts.tail_unsealed, 0);
-    }
-
-    /// H1: Dhan (carve-out OFF) keeps paging a missing FINAL row — the
-    /// 15:30:05 close-time force-seal covers Dhan finals, so absence is a
-    /// real lost seal.
-    #[test]
-    fn test_compare_tf_dhan_final_missing_still_pages() {
-        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, false);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
-        assert_eq!(findings[0].bucket_secs_of_day, 55_500);
-        assert_eq!(counts.tail_unsealed, 0);
-    }
-
-    /// H1 widened (refuter round 2): the margin exemption for a NON-final
-    /// window. The historical compare_tf carrier was the retired 2m
-    /// PENULTIMATE window `[15:27, 15:29)` (E = 55_740; 55_740 + 60 ≥
-    /// 55_800 → `tail_unsealed`, never paging). With the C2 5-frame live
-    /// set NO verify target has a non-final window inside the 60 s margin
-    /// (penultimate E: 3m → 55_620, 5m → 55_500, 15m → 54_900), so only
-    /// FINAL windows (E = 55_800) are exempt — covered by
-    /// `test_compare_tf_groww_final_missing_is_tail_unsealed_not_paging`;
-    /// the exact 60 s boundary stays pinned at the predicate level in
-    /// `test_groww_uncatchupable_tail_boundaries`. This pin asserts the
-    /// structural fact itself and FIRES if a future frame (e.g. a C3
-    /// second-scale TF) re-introduces an in-margin non-final window as a
-    /// compare target — forcing a conscious compare_tf-level re-pin.
-    #[test]
-    fn test_no_verify_target_has_nonfinal_window_inside_catchup_margin() {
-        for tf in tf_verify_targets() {
-            let penult_end = SESSION_CLOSE_SECS_OF_DAY_IST - tf.seconds_per_bucket();
-            assert!(
-                !groww_uncatchupable_tail(penult_end),
-                "{tf:?} penultimate window (E = {penult_end}) sits inside \
-                 the 60 s catch-up margin — the non-final exemption case is \
-                 reachable again; re-pin a compare_tf-level test for it"
-            );
-        }
-    }
-
-    /// H1 widened: the 3m PENULTIMATE window (`[15:24, 15:27)`,
-    /// E = 55_620; 55_620 + 60 < 55_800) is catch-up-able — an absent
-    /// Groww row there still pages `missing_tf_row`.
-    #[test]
-    fn test_compare_tf_groww_3m_penultimate_missing_still_pages() {
-        let ones = vec![row(55_440, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M3, &ones, &[], DAY_START, true);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
-        assert_eq!(findings[0].bucket_secs_of_day, 55_440);
-        assert_eq!(counts.tail_unsealed, 0);
-    }
-
-    /// H1 widened: the 5m PENULTIMATE window `[15:20, 15:25)` has
-    /// E = 55_500; 55_500 + 60 < 55_800 → NOT exempt — an absent Groww row
-    /// there still pages (the widening is margin-exact, not
-    /// last-two-windows).
-    #[test]
-    fn test_compare_tf_groww_5m_penultimate_missing_still_pages() {
-        let ones = vec![row(55_200, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
-        assert_eq!(findings[0].bucket_secs_of_day, 55_200);
-        assert_eq!(counts.tail_unsealed, 0);
-    }
-
-    /// Refuter round 2: the pure tail predicate — boundary-exact against
-    /// the 60s catch-up margin.
-    #[test]
-    fn test_groww_uncatchupable_tail_boundaries() {
-        // Final windows always end at 15:30:00 → exempt.
-        assert!(groww_uncatchupable_tail(SESSION_CLOSE_SECS_OF_DAY_IST));
-        // Exactly margin before the close (E = 55_740) → exempt.
-        assert!(groww_uncatchupable_tail(
-            SESSION_CLOSE_SECS_OF_DAY_IST - GROWW_CATCHUP_MARGIN_SECS
-        ));
-        // One second earlier (E = 55_739) → catch-up-able, NOT exempt.
-        assert!(!groww_uncatchupable_tail(
-            SESSION_CLOSE_SECS_OF_DAY_IST - GROWW_CATCHUP_MARGIN_SECS - 1
-        ));
-        // Mid-session windows are never exempt.
-        assert!(!groww_uncatchupable_tail(
-            SESSION_OPEN_SECS_OF_DAY_IST + 300
-        ));
-    }
-
-    /// The verifier's margin is FROZEN at the historical aggregator value
-    /// (60 s). The cross-crate tripwire against
-    /// `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW` was retired with the tick
-    /// aggregator (stage-3 dead-WS sweep, 2026-07-17) — this local pin keeps
-    /// the historical carve-out value asserted.
-    #[test]
-    fn test_groww_catchup_margin_frozen_at_historical_value() {
-        assert_eq!(
-            GROWW_CATCHUP_MARGIN_SECS, 60,
-            "GROWW_CATCHUP_MARGIN_SECS is the FROZEN historical Groww \
-             catch-up margin — changing it silently re-classifies which \
-             live-era tail buckets the carve-out exempts"
-        );
-    }
-
-    /// H1: a PRESENT Groww final row is sealed data — it is compared
-    /// normally and a mismatch still pages even with the carve-out ON.
-    #[test]
-    fn test_compare_tf_groww_final_present_mismatch_still_pages() {
-        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        // Stored final row exists but its high disagrees.
-        let stored = vec![row(55_500, 100.0, 105.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, true);
-        assert_eq!(counts.buckets_compared, 1);
-        assert_eq!(counts.tail_unsealed, 0);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::Mismatch);
-        assert_eq!(findings[0].field, "high");
-    }
-
     // -------------------------------------------------------------------
     // H2 — state-independent always-on exclusion
     // -------------------------------------------------------------------
@@ -3446,7 +3302,7 @@ mod tests {
         // still a paging finding (the exclusion never swallows off_grid
         // for normal instruments), carve-out flag irrelevant.
         let stored = vec![row(33_360, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, _) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, true);
+        let (findings, _) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert!(
             findings
                 .iter()

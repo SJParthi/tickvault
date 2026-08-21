@@ -2,7 +2,7 @@
 //! coordinator-relayed Telegram-cleanliness directive, S4).
 //!
 //! Pins the FULL routing table: every surviving REST Degraded/Recovered
-//! pair folds into a `DhanRest` / `GrowwRest` episode bubble with the
+//! pair folds into a `DhanRest` episode bubble with the
 //! designed `(family, conn)` slot; every `*Recovered` variant is the
 //! bubble's `Resolve` edge; the once-per-day pages with no recovery edge
 //! stay on the legacy lane (`episode_key() == None`); and the family-(3)
@@ -111,16 +111,6 @@ fn legacy_once_per_day_events() -> Vec<NotificationEvent> {
         NotificationEvent::ChainEntitlementConfirmed,
         NotificationEvent::ChainExpirylistFailed {
             detail: m("expiry list failed after bounded tries"),
-        },
-        NotificationEvent::GrowwChain1mExpiryUnresolved {
-            detail: m("no usable option rows for NIFTY"),
-        },
-        NotificationEvent::GrowwChain1mProbeVerdict {
-            ok: true,
-            detail: m("all chains answered"),
-        },
-        NotificationEvent::GrowwContract1mBookUnresolved {
-            detail: m("no usable contracts at the current expiry"),
         },
     ]
 }
@@ -243,22 +233,13 @@ fn guard_spot_and_chain_slot_sets_are_disjoint() {
     let chain_slots: std::collections::BTreeSet<u8> = probes
         .iter()
         .flat_map(|s| {
-            [
-                NotificationEvent::Chain1mUnderlyingNotServed {
-                    underlying: s,
-                    empty_minutes: 10,
-                }
-                .episode_key()
-                .expect("dhan chain not-served must be routed")
-                .conn,
-                NotificationEvent::GrowwChain1mUnderlyingNotServed {
-                    underlying: s,
-                    empty_minutes: 10,
-                }
-                .episode_key()
-                .expect("groww chain not-served must be routed")
-                .conn,
-            ]
+            [NotificationEvent::Chain1mUnderlyingNotServed {
+                underlying: s,
+                empty_minutes: 10,
+            }
+            .episode_key()
+            .expect("dhan chain not-served must be routed")
+            .conn]
         })
         .collect();
     let overlap: Vec<u8> = spot_slots.intersection(&chain_slots).copied().collect();
@@ -367,10 +348,7 @@ fn guard_no_routed_rest_event_is_critical_and_first_page_severity_shape() {
 
 #[test]
 fn guard_rest_family_snapshot_labels_round_trip() {
-    for (family, label) in [
-        (EpisodeFamily::DhanRest, "dhan_rest"),
-        (EpisodeFamily::GrowwRest, "groww_rest"),
-    ] {
+    for (family, label) in [(EpisodeFamily::DhanRest, "dhan_rest")] {
         assert_eq!(family.snapshot_label(), label);
         assert_eq!(EpisodeFamily::from_snapshot_label(label), Some(family));
     }
@@ -379,14 +357,9 @@ fn guard_rest_family_snapshot_labels_round_trip() {
 #[test]
 fn guard_rest_family_badges_and_descriptions_name_the_broker() {
     assert!(EpisodeFamily::DhanRest.badge().contains("DHAN"));
-    assert!(EpisodeFamily::GrowwRest.badge().contains("GROWW"));
     assert_eq!(
         EpisodeFamily::DhanRest.feed_desc(),
         "Per-minute candle pull"
-    );
-    assert_eq!(
-        EpisodeFamily::GrowwRest.feed_desc(),
-        "Groww per-minute candle pull"
     );
 }
 
@@ -401,11 +374,9 @@ fn guard_rest_families_are_down_stale_expiry_exempt() {
     // holds; the family predicate is condition 1 of 3 (see the envelope
     // guard below).
     assert!(EpisodeFamily::DhanRest.down_stale_expiry_exempt());
-    assert!(EpisodeFamily::GrowwRest.down_stale_expiry_exempt());
     // The fold-fed families keep expiring (unchanged semantics).
     assert!(!EpisodeFamily::MainFeedWs.down_stale_expiry_exempt());
     assert!(!EpisodeFamily::OrderUpdateWs.down_stale_expiry_exempt());
-    assert!(!EpisodeFamily::GrowwFeed.down_stale_expiry_exempt());
 }
 
 #[test]
@@ -484,7 +455,7 @@ fn guard_rest_slot_descs_match_the_routing_slot_table() {
     // G2 (fix round 2): the per-slot bubble qualifier must stay lockstep
     // with the events.rs slot table (rest_slot / chain_rest_slot) — a
     // drifted label would mis-name which pull an edit/close refers to.
-    for family in [EpisodeFamily::DhanRest, EpisodeFamily::GrowwRest] {
+    for family in [EpisodeFamily::DhanRest] {
         for (conn, label) in [
             (0_u8, "spot pull"),
             (1, "chain pull"),
@@ -510,14 +481,13 @@ fn guard_rest_slot_descs_match_the_routing_slot_table() {
     }
     // Non-REST families carry no slot qualifier (renders stay generic).
     assert_eq!(EpisodeFamily::MainFeedWs.slot_desc(0), "");
-    assert_eq!(EpisodeFamily::GrowwFeed.slot_desc(0), "");
 }
 
 #[test]
 fn guard_rest_family_config_is_default() {
     // EpisodeConfig carries no PartialEq — Debug-compare pins the values.
     let default = format!("{:?}", EpisodeConfig::default());
-    for family in [EpisodeFamily::DhanRest, EpisodeFamily::GrowwRest] {
+    for family in [EpisodeFamily::DhanRest] {
         assert_eq!(
             format!("{:?}", episode_config_for(family)),
             default,

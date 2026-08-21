@@ -71,46 +71,33 @@ fn rest_leg(feed_name: &str, ok: i64, failed: i64) -> RestLegScoreLine {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn scorecard(
     dhan: FeedScoreLine,
-    groww: FeedScoreLine,
     partial: bool,
     dhan_off: bool,
-    groww_off: bool,
     rest_legs: Vec<RestLegScoreLine>,
 ) -> NotificationEvent {
     NotificationEvent::DualFeedDailyScorecard {
         trading_date_ist: "2026-07-15".to_string(),
         dhan,
-        groww,
         session_minutes: 375,
         partial_coverage: partial,
         degraded: false,
         early_run: false,
         restart_partial: false,
         dhan_feed_off: dhan_off,
-        groww_feed_off: groww_off,
         rest_legs,
         rest_legs_read_failed: false,
     }
 }
 
 fn scorecard_clean() -> NotificationEvent {
-    scorecard(
-        feed("Dhan"),
-        feed("Groww"),
-        false,
-        false,
-        false,
-        vec![rest_leg("Dhan", 735, 0), rest_leg("Groww", 733, 2)],
-    )
+    scorecard(feed("Dhan"), false, false, vec![rest_leg("Dhan", 735, 0)])
 }
 
-fn tf_pass(tail_unsealed: u64) -> NotificationEvent {
+fn tf_pass() -> NotificationEvent {
     NotificationEvent::TfConsistencySummary {
         dhan_date_ist: "2026-07-15".to_string(),
-        groww_date_ist: "2026-07-14".to_string(),
         instruments: 214,
         buckets_compared: 692_171,
         mismatches: 0,
@@ -118,7 +105,6 @@ fn tf_pass(tail_unsealed: u64) -> NotificationEvent {
         no_coverage: 0,
         off_grid: 0,
         duplicates: 0,
-        tail_unsealed,
         degraded: false,
         truncated: false,
         status_label: "pass".to_string(),
@@ -154,20 +140,13 @@ fn brutex_clean() -> NotificationEvent {
 fn routine_fixtures() -> Vec<NotificationEvent> {
     vec![
         NotificationEvent::TokenRenewed,
-        tf_pass(0),
-        tf_pass(9),
+        tf_pass(),
+        tf_pass(),
         shutdown(ShutdownClass::ScheduledStop),
         shutdown(ShutdownClass::OperatorStop),
         scorecard_clean(),
-        scorecard(
-            sentinel_feed("Dhan"),
-            sentinel_feed("Groww"),
-            false,
-            false,
-            false,
-            vec![],
-        ),
-        scorecard(feed("Dhan"), feed("Groww"), false, true, false, vec![]),
+        scorecard(sentinel_feed("Dhan"), false, false, vec![]),
+        scorecard(feed("Dhan"), false, true, vec![]),
         NotificationEvent::Spot1mFetchRecovered {
             minute_ist: "10:45 AM".to_string(),
             failed_minutes: 3,
@@ -194,7 +173,7 @@ fn guard_daily_cards_carry_the_compact_date() {
         first_line(&body).contains("Feed scorecard 3:45 PM \u{b7} 15 Jul"),
         "scorecard header must carry the compact date: {body}"
     );
-    let body = tf_pass(0).to_message();
+    let body = tf_pass().to_message();
     assert!(
         body.contains("Timeframe check 3:40 PM \u{b7} 15 Jul"),
         "TF pass one-liner must carry the compact date: {body}"
@@ -203,7 +182,7 @@ fn guard_daily_cards_carry_the_compact_date() {
 
 #[test]
 fn guard_tf_pass_body_is_exactly_one_line() {
-    for ev in [tf_pass(0), tf_pass(9)] {
+    for ev in [tf_pass()] {
         let body = ev.to_message();
         assert_eq!(body.lines().count(), 1, "TF pass must be ONE line: {body}");
     }
@@ -230,21 +209,12 @@ fn guard_scorecard_fully_measured_within_six_lines() {
         scorecard_clean(),
         scorecard(
             feed("Dhan"),
-            feed("Groww"),
             true, // partial → caveat line
             false,
-            false,
-            vec![rest_leg("Dhan", 735, 0), rest_leg("Groww", 700, 35)],
+            vec![rest_leg("Dhan", 735, 0)],
         ),
-        scorecard(feed("Dhan"), feed("Groww"), false, true, false, vec![]),
-        scorecard(
-            sentinel_feed("Dhan"),
-            sentinel_feed("Groww"),
-            false,
-            false,
-            false,
-            vec![],
-        ),
+        scorecard(feed("Dhan"), false, true, vec![]),
+        scorecard(sentinel_feed("Dhan"), false, false, vec![]),
     ] {
         let body = ev.to_message();
         assert!(
@@ -295,16 +265,9 @@ fn guard_no_sentinel_placeholder_phrases_in_routine_scorecards() {
     // rendered "?" / "not measured yet" walls — omission must now be
     // structural.
     let fixtures = [
-        scorecard(
-            sentinel_feed("Dhan"),
-            sentinel_feed("Groww"),
-            false,
-            false,
-            false,
-            vec![],
-        ),
-        scorecard(feed("Dhan"), feed("Groww"), false, true, false, vec![]),
-        scorecard(feed("Dhan"), feed("Groww"), false, false, true, vec![]),
+        scorecard(sentinel_feed("Dhan"), false, false, vec![]),
+        scorecard(feed("Dhan"), false, true, vec![]),
+        scorecard(feed("Dhan"), false, false, vec![]),
         scorecard_clean(),
     ];
     for ev in fixtures {
@@ -341,8 +304,8 @@ fn guard_no_sentinel_placeholder_phrases_in_routine_scorecards() {
 fn guard_scorecard_verdict_line_is_first_with_emoji_and_header() {
     for ev in [
         scorecard_clean(),
-        scorecard(feed("Dhan"), feed("Groww"), true, false, false, vec![]),
-        scorecard(feed("Dhan"), feed("Groww"), false, true, false, vec![]),
+        scorecard(feed("Dhan"), true, false, vec![]),
+        scorecard(feed("Dhan"), false, true, vec![]),
     ] {
         let body = ev.to_message();
         let first = first_line(&body);
@@ -361,7 +324,7 @@ fn guard_scorecard_verdict_line_is_first_with_emoji_and_header() {
 
 #[test]
 fn guard_tf_pass_line_starts_with_ok_emoji() {
-    let body = tf_pass(0).to_message();
+    let body = tf_pass().to_message();
     assert!(
         body.starts_with('\u{2705}'),
         "TF pass must lead with ✅: {body}"
@@ -407,7 +370,7 @@ fn guard_caveat_line_renders_iff_partial_flag_and_exactly_once() {
         !clean.contains("Counts are a floor"),
         "clean day must carry no caveat: {clean}"
     );
-    let partial = scorecard(feed("Dhan"), feed("Groww"), true, false, false, vec![]).to_message();
+    let partial = scorecard(feed("Dhan"), true, false, vec![]).to_message();
     assert_eq!(
         partial.matches("Counts are a floor").count(),
         1,
@@ -439,7 +402,7 @@ fn guard_routine_bodies_never_carry_action_lists() {
 
 #[test]
 fn guard_feed_off_renders_exactly_one_off_line() {
-    let body = scorecard(feed("Dhan"), feed("Groww"), false, true, false, vec![]).to_message();
+    let body = scorecard(feed("Dhan"), false, true, vec![]).to_message();
     assert_eq!(
         body.matches("Dhan: OFF today (excluded from verdict)")
             .count(),

@@ -27,16 +27,7 @@ fn feed_runtime_lane_flag_round_trips_idempotently() {
         // Start NOT running (default mirrors prod for both lanes).
         assert!(!state.lane_running(feed));
     }
-    // Groww: true, true (idempotent), false, false (idempotent).
-    state.set_groww_lane_running(true);
-    assert!(state.is_groww_lane_running());
-    state.set_groww_lane_running(true);
-    assert!(state.is_groww_lane_running(), "repeat-true is idempotent");
-    state.set_groww_lane_running(false);
-    assert!(!state.is_groww_lane_running());
-    state.set_groww_lane_running(false);
-    assert!(!state.is_groww_lane_running(), "repeat-false is idempotent");
-    // Dhan: same round-trip (flag only — no reconciler exists since PR-C2).
+    // Dhan round-trip (flag only — no reconciler exists since PR-C2).
     state.set_dhan_lane_running(true);
     assert!(state.is_dhan_lane_running());
     state.set_dhan_lane_running(true);

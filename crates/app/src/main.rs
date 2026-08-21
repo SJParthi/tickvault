@@ -228,6 +228,19 @@ const fn stall_scan_is_starved(
         && stale_scans >= STALL_SCAN_STARVED_AFTER_SCANS
 }
 
+/// Pure decision behind [`emit_boot_completed_when_feed_live`]: should the
+/// alive signal (`tv_boot_completed`) be published?
+///
+/// A deliberately feed-less run (`!dhan_enabled`) emits — a headless
+/// shared-infra-only boot must not false-page the boot-heartbeat alarm.
+/// Otherwise the signal is published only when the enabled feed is genuinely
+/// running, so a boot whose feed died WITHHOLDS it and the alarm pages on the
+/// missing metric. A running flag on a DISABLED feed never counts.
+#[must_use]
+pub fn boot_completed_should_emit(dhan_enabled: bool, dhan_running: bool) -> bool {
+    !dhan_enabled || dhan_running
+}
+
 /// Emit `tv_boot_completed` ONLY once at least one enabled feed's lane is
 /// genuinely running — waiting up to [`BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS`]
 /// for an async-starting feed to come up. Withholds the metric (and logs an
@@ -267,7 +280,7 @@ async fn emit_boot_completed_when_feed_live(
         // BUG-2 fix: a poolless-idle Dhan lane counts as "alive" for the
         // boot signal — the boot completed; there is simply no market today.
         let dhan_running = feed_runtime.is_dhan_lane_running() || dhan_poolless_idle;
-        if dhan_running {
+        if boot_completed_should_emit(dhan_enabled, dhan_running) {
             info!(
                 dhan_enabled,
                 dhan_running,
@@ -3707,14 +3720,13 @@ mod tests {
 
     // ── build_feed_status_lines (Telegram feed parity, 2026-07-03) ──
     // The readiness + end-of-day messages must list EVERY enabled feed
-    // (Dhan, Groww, future) with honest unknowns — never fabricated data.
+    // with honest unknowns — never fabricated data.
 
     // ── boot_completed_should_emit truth table ──
-    // The alive signal (tv_boot_completed) must be published only when at least
-    // one ENABLED feed is running — so a boot where every enabled feed died
-    // withholds it and the boot-heartbeat alarm pages. No feed enabled emits
-    // (headless run must not false-page). A running-but-disabled feed never
-    // counts.
+    // The alive signal (tv_boot_completed) must be published only when the
+    // ENABLED feed is running — so a boot whose feed died withholds it and
+    // the boot-heartbeat alarm pages. No feed enabled emits (a headless run
+    // must not false-page). A running-but-disabled feed never counts.
 
     // ── compute_tick_freshness (SLO fractional coverage, 2026-07-03) ──
     // Pins the D2 fix: tick_freshness is 1 − silent/universe (clamped),
@@ -3722,43 +3734,23 @@ mod tests {
     // fails these tests.
 
     #[test]
-    fn test_boot_completed_should_emit_both_off_emits() {
-        // No feed enabled at all → emit (deliberately feed-less run must not
-        // false-page). Feed-running values are irrelevant here.
-        assert!(boot_completed_should_emit(false, false, false, false));
-        assert!(boot_completed_should_emit(false, false, true, true));
+    fn test_boot_completed_should_emit_feed_disabled_emits() {
+        // Deliberately feed-less run → emit; a headless shared-infra-only
+        // boot must not false-page. The running flag is irrelevant here.
+        assert!(boot_completed_should_emit(false, false));
+        assert!(boot_completed_should_emit(false, true));
     }
 
     #[test]
-    fn test_boot_completed_should_emit_dhan_only_live() {
-        assert!(boot_completed_should_emit(true, false, true, false));
+    fn test_boot_completed_should_emit_feed_enabled_and_live() {
+        assert!(boot_completed_should_emit(true, true));
     }
 
     #[test]
-    fn test_boot_completed_should_emit_dhan_only_dead() {
-        // Dhan enabled but not running, Groww disabled → withhold (page).
-        assert!(!boot_completed_should_emit(true, false, false, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_both_enabled_only_dhan_live() {
-        assert!(boot_completed_should_emit(true, true, true, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_both_enabled_none_live() {
-        // Both enabled, neither running → withhold (page). This is the core
-        // alerting-hole case: previously the metric was published unconditionally.
-        assert!(!boot_completed_should_emit(true, true, false, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_running_but_disabled_feed_does_not_count() {
-        // Dhan DISABLED but its running flag is somehow true (stale) — it must NOT
-        // count; only the ENABLED Groww matters, and Groww is dead → withhold.
-        assert!(!boot_completed_should_emit(false, true, true, false));
-        // Symmetric: Groww disabled-but-running, Dhan enabled-and-dead → withhold.
-        assert!(!boot_completed_should_emit(true, false, false, true));
+    fn test_boot_completed_should_emit_feed_enabled_and_dead_withholds() {
+        // The core alerting-hole case: the metric was once published
+        // unconditionally, so a dead feed still reported a healthy boot.
+        assert!(!boot_completed_should_emit(true, false));
     }
 
     // PR-C (2026-05-26): historical-fetch source-scan guards removed —

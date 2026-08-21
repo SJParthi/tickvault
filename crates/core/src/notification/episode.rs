@@ -2268,20 +2268,12 @@ mod tests {
     #[test]
     fn test_down_stale_expiry_exempt_family_predicate() {
         // G1 (fix round 2, 2026-07-15): Boot + the REST families are
-        // exempt; the WS/GrowwFeed families keep expiring (their Down
+        // exempt; the WS families keep expiring (their Down
         // bubbles receive per-cooldown folds while genuinely down).
-        for family in [
-            EpisodeFamily::Boot,
-            EpisodeFamily::DhanRest,
-            EpisodeFamily::GrowwRest,
-        ] {
+        for family in [EpisodeFamily::Boot, EpisodeFamily::DhanRest] {
             assert!(family.down_stale_expiry_exempt(), "{family:?}");
         }
-        for family in [
-            EpisodeFamily::MainFeedWs,
-            EpisodeFamily::OrderUpdateWs,
-            EpisodeFamily::GrowwFeed,
-        ] {
+        for family in [EpisodeFamily::MainFeedWs, EpisodeFamily::OrderUpdateWs] {
             assert!(!family.down_stale_expiry_exempt(), "{family:?}");
         }
     }
@@ -2293,7 +2285,7 @@ mod tests {
         // the routed emitters are once-per-episode edge-latched, so an
         // event-less Down bubble here is a STILL-FAILING incident. Only a
         // Resolve edge may close it while the envelope holds.
-        for family in [EpisodeFamily::DhanRest, EpisodeFamily::GrowwRest] {
+        for family in [EpisodeFamily::DhanRest] {
             let k = EpisodeKey { family, conn: 1 };
             let reg = EpisodeRegistry::new();
             let opened = ist_ms(9, 30);
@@ -2375,7 +2367,7 @@ mod tests {
         // restart, and a LATER real outage opens a FRESH episode with a
         // fresh first page (the stale expiry writes NO tombstone).
         let k = EpisodeKey {
-            family: EpisodeFamily::GrowwRest,
+            family: EpisodeFamily::DhanRest,
             conn: 3,
         };
         let reg = EpisodeRegistry::new();
@@ -2520,16 +2512,16 @@ mod tests {
             stale.contains("chain pull (NIFTY)"),
             "stale close must name the slot: {stale}"
         );
-        // A Groww spot-leg bubble names its own slot + broker.
+        // A spot-leg bubble names its own slot + broker.
         let gk = EpisodeKey {
-            family: EpisodeFamily::GrowwRest,
+            family: EpisodeFamily::DhanRest,
             conn: 0,
         };
         let gst = EpisodeState::open(gk, Severity::High, NOW);
         let gsteady = render_episode_steady(&gst, &ctx);
         assert!(
-            gsteady.contains("\u{1f7e2} GROWW — spot pull failing"),
-            "groww steady must name the slot: {gsteady}"
+            gsteady.contains("spot pull failing"),
+            "steady must name the slot: {gsteady}"
         );
         // Non-REST families keep the family description (byte-identical —
         // the WS regression ratchet also pins this).
@@ -2930,9 +2922,7 @@ mod tests {
             EpisodeFamily::MainFeedWs,
             EpisodeFamily::OrderUpdateWs,
             EpisodeFamily::Boot,
-            EpisodeFamily::GrowwFeed,
             EpisodeFamily::DhanRest,
-            EpisodeFamily::GrowwRest,
         ] {
             assert_eq!(
                 EpisodeFamily::from_snapshot_label(family.snapshot_label()),
@@ -2945,8 +2935,7 @@ mod tests {
             EpisodeFamily::MainFeedWs
             | EpisodeFamily::OrderUpdateWs
             | EpisodeFamily::Boot
-            | EpisodeFamily::DhanRest
-            | EpisodeFamily::GrowwRest => (),
+            | EpisodeFamily::DhanRest => (),
         };
         assert_eq!(EpisodeFamily::from_snapshot_label("alien_ws"), None);
         for phase in [EpisodePhase::Down, EpisodePhase::Recovering] {
@@ -3062,19 +3051,13 @@ mod tests {
         );
     }
 
-    // -- GrowwFeed runtime incident family (2026-07-14 noise fold) ----------
+    // -- Runtime incident family FSM (2026-07-14 noise fold) ---------------
 
-    fn groww_key() -> EpisodeKey {
+    fn incident_key() -> EpisodeKey {
         EpisodeKey {
-            family: EpisodeFamily::GrowwFeed,
+            family: EpisodeFamily::MainFeedWs,
             conn: 0,
         }
-    }
-
-    fn groww_state(message_id: Option<i64>) -> EpisodeState {
-        let mut st = EpisodeState::open(groww_key(), Severity::High, NOW);
-        st.message_id = message_id;
-        st
     }
 
     /// RATCHET (render regression): the renderer generalization must keep
@@ -3130,69 +3113,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_groww_feed_render_phrasing_no_ws_literals() {
-        let mut st = groww_state(Some(1));
-        st.occurrences = 5;
-        st.attempts = 9;
-        let ctx = EpisodeRenderCtx {
-            now_ms: NOW + 60_000,
-        };
-        let steady = render_episode_steady(&st, &ctx);
-        assert!(steady.starts_with("\u{1f7e2} GROWW"), "{steady:?}");
-        assert!(steady.contains("Groww price feed not receiving prices"));
-        assert!(steady.contains("5 rejections"));
-        // FIX-F (2026-07-14 hostile review): the attempts counter counts
-        // folded notify events — an ~12× undercount of the sidecar's real
-        // retries — so the Groww bubble OMITS it entirely.
-        assert!(!steady.contains("attempts"), "{steady:?}");
-        assert!(steady.contains("Now: retrying automatically"));
-        let recovering = render_episode_recovering(&st, &ctx);
-        assert!(recovering.contains("confirming"), "{recovering:?}");
-        let recovered = render_episode_recovered(&st, &ctx);
-        assert!(
-            recovered.contains("Groww price feed streaming again"),
-            "{recovered:?}"
-        );
-        assert!(!recovered.contains("attempts"), "{recovered:?}");
-        // No WS-flavored literals where inappropriate + commandment scan
-        // (plain English, no library names, no file paths, no jargon).
-        for r in [&steady, &recovering, &recovered] {
-            assert!(!r.contains("reconnect"), "WS literal leaked: {r:?}");
-            assert!(!r.contains("DOWN"), "WS literal leaked: {r:?}");
-            for banned in [
-                "rkyv",
-                "papaya",
-                "mpsc",
-                ".rs",
-                "data/",
-                "QuestDB",
-                "ring buffer",
-                "spill",
-                "editMessageText",
-            ] {
-                assert!(!r.contains(banned), "banned {banned:?} in {r:?}");
-            }
-        }
-    }
-
-    /// RATCHET (FSM): first Groww reject pages; recurrences edit-in-place
+    /// RATCHET (FSM): a first reject pages; recurrences edit-in-place
     /// (never a second page); FeedRecovered flips to Recovering; the
     /// stability tick closes green.
     #[test]
-    fn test_groww_reject_open_then_progress_edits_no_second_page() {
+    fn test_reject_open_then_progress_edits_no_second_page() {
         let reg = EpisodeRegistry::new();
         let c = cfg();
         // First reject → first page (the preserved High bypass + SMS leg).
-        let d1 = reg.apply_event(groww_key(), EpisodeRole::Open, Severity::High, 0, NOW, &c);
+        let d1 = reg.apply_event(
+            incident_key(),
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            NOW,
+            &c,
+        );
         assert_eq!(d1.action, EpisodeAction::SendFirstPage);
-        reg.record_sent(groww_key(), Some(77), NOW);
+        reg.record_sent(incident_key(), Some(77), NOW);
         // Recurring rejects (outside the edit throttle) → in-place edits,
         // NEVER a fresh page; occurrence counter advances.
         let mut now = NOW;
         for i in 2..=4u32 {
             now += (c.edit_min_interval_secs + 1) * 1000;
-            let d = reg.apply_event(groww_key(), EpisodeRole::Open, Severity::High, 0, now, &c);
+            let d = reg.apply_event(
+                incident_key(),
+                EpisodeRole::Open,
+                Severity::High,
+                0,
+                now,
+                &c,
+            );
             assert_eq!(
                 d.action,
                 EpisodeAction::Edit {
@@ -3202,12 +3153,12 @@ mod tests {
                 "recurrence {i} must edit in place"
             );
             assert_eq!(d.state.occurrences, i);
-            reg.record_edit_applied(groww_key(), now, i.into());
+            reg.record_edit_applied(incident_key(), now, i.into());
         }
         // Recovery → Recovering phase edit (amber confirming, no green yet).
         now += 1000;
         let dr = reg.apply_event(
-            groww_key(),
+            incident_key(),
             EpisodeRole::Resolve,
             Severity::Medium,
             0,
@@ -3225,31 +3176,38 @@ mod tests {
         // Stability window quiet → the tick closes it green.
         let out = reg.tick(now + (c.stability_secs + 1) * 1000, &c);
         assert_eq!(out.closed.len(), 1);
-        assert_eq!(out.closed[0].key, groww_key());
+        assert_eq!(out.closed[0].key, incident_key());
         assert_eq!(reg.live_count(), 0);
     }
 
-    /// RATCHET (Boot-exclusion inverse): the GrowwFeed family IS admitted
+    /// RATCHET (Boot-exclusion inverse): a non-Boot family IS admitted
     /// to the tick promote/expire scans and the cross-restart snapshot —
     /// only Boot stays excluded.
     #[test]
-    fn test_groww_feed_included_in_tick_scans_and_snapshot() {
+    fn test_non_boot_family_included_in_tick_scans_and_snapshot() {
         let c = cfg();
-        // Stale-Down expiry admits GrowwFeed.
+        // Stale-Down expiry admits a non-Boot family.
         let reg = EpisodeRegistry::new();
-        let _ = reg.apply_event(groww_key(), EpisodeRole::Open, Severity::High, 0, NOW, &c);
-        reg.record_sent(groww_key(), Some(5), NOW);
-        // Snapshot encode includes the live GrowwFeed episode (unlike Boot).
+        let _ = reg.apply_event(
+            incident_key(),
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            NOW,
+            &c,
+        );
+        reg.record_sent(incident_key(), Some(5), NOW);
+        // Snapshot encode includes the live episode (unlike Boot).
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 1);
         let encoded = episode_snapshot::encode(&snap);
         assert!(
-            encoded.contains("groww_feed"),
-            "GrowwFeed must be persisted: {encoded}"
+            encoded.contains("main_feed_ws"),
+            "a non-Boot family must be persisted: {encoded}"
         );
         let out = reg.tick(NOW + (c.down_stale_expire_secs + 1) * 1000, &c);
         assert_eq!(out.expired.len(), 1, "event-less Down must stale-expire");
-        assert_eq!(out.expired[0].key, groww_key());
+        assert_eq!(out.expired[0].key, incident_key());
         assert_eq!(reg.live_count(), 0);
     }
 
@@ -3257,7 +3215,7 @@ mod tests {
 
     fn full_checklist(now: u64) -> BootChecklist {
         let mut cl = BootChecklist::new(now, true, "a1b2c3d".to_string());
-        cl.expectations = Some((true, true));
+        cl.expectations = Some(true);
         cl.fold(
             BootMilestone::Services {
                 healthy: 3,
@@ -3277,15 +3235,6 @@ mod tests {
         );
         cl.fold(BootMilestone::OrderUpdateConnected, now + 4000);
         cl.fold(BootMilestone::OrderUpdateAuthenticated, now + 4500);
-        cl.fold(BootMilestone::GrowwAuth, now + 5000);
-        cl.fold(
-            BootMilestone::GrowwInstruments { subscribed: 768 },
-            now + 5500,
-        );
-        cl.fold(
-            BootMilestone::GrowwConnected { market_open: true },
-            now + 6000,
-        );
         cl
     }
 
@@ -3297,7 +3246,6 @@ mod tests {
             BootMilestone::DhanAuth,
             BootMilestone::Instruments { count: 1046 },
             BootMilestone::OrderUpdateAuthenticated,
-            BootMilestone::GrowwAuth,
             BootMilestone::Services {
                 healthy: 3,
                 total: 3,
@@ -3333,7 +3281,7 @@ mod tests {
         let ctx = EpisodeRenderCtx { now_ms: now };
         // First page: only Services folded, expectations set → ⏳ lines.
         let mut first = BootChecklist::new(now, true, "a1b2c3d".to_string());
-        first.expectations = Some((true, true));
+        first.expectations = Some(true);
         first.fold(
             BootMilestone::Services {
                 healthy: 3,
@@ -3515,7 +3463,7 @@ mod tests {
         assert!(reg.boot_checklist().is_none());
         // A post-retire milestone opens a FRESH mini bubble.
         let (decision, cl) = reg.apply_boot_milestone(
-            BootMilestone::GrowwConnected { market_open: true },
+            BootMilestone::DhanAuth,
             NOW + 20_000 + BOOT_BUBBLE_RETIRE_SECS * 1000,
             &cfg,
         );
@@ -3543,13 +3491,9 @@ mod tests {
         let _ = reg.apply_boot_milestone(BootMilestone::Complete { mode: "sandbox" }, NOW, &cfg);
         reg.mark_boot_delivered();
         assert!(reg.retire_boot(NOW + BOOT_BUBBLE_RETIRE_SECS * 1000));
-        // A Groww reconnect edge 3 hours later.
+        // A feed reconnect edge 3 hours later.
         let mid_day = NOW + 3 * 3600 * 1000;
-        let (_, cl) = reg.apply_boot_milestone(
-            BootMilestone::GrowwConnected { market_open: true },
-            mid_day,
-            &cfg,
-        );
+        let (_, cl) = reg.apply_boot_milestone(BootMilestone::DhanAuth, mid_day, &cfg);
         assert!(cl.mini);
         let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: mid_day });
         assert!(r.contains("\u{1f504} Feed update"), "neutral header: {r:?}");
@@ -3570,7 +3514,7 @@ mod tests {
                 close: false
             }
         );
-        assert!(cl2.mini && cl2.groww_connected.is_some() && cl2.dhan_auth);
+        assert!(cl2.mini && cl2.dhan_auth);
         reg.mark_boot_delivered();
         // The mini bubble retires on the idle window despite never seeing
         // `Complete` — no permanently-stuck bubble.
@@ -3640,11 +3584,11 @@ mod tests {
         let reg = EpisodeRegistry::new();
         let cfg = episode_config_for(EpisodeFamily::Boot);
         reg.set_boot_flavor(true, "a1b2c3d", NOW);
-        reg.set_boot_expectations(true, true, NOW);
+        reg.set_boot_expectations(true, NOW);
         let (d1, cl1) = reg.apply_boot_milestone(BootMilestone::DhanAuth, NOW + 100, &cfg);
         assert_eq!(d1.action, EpisodeAction::SendFirstPage);
         assert!(cl1.new_code && cl1.build_sha_short == "a1b2c3d");
-        assert_eq!(cl1.expectations, Some((true, true)));
+        assert_eq!(cl1.expectations, Some(true));
         assert!(cl1.dirty);
         reg.record_sent(BOOT_EPISODE_KEY, Some(64), NOW + 100);
         reg.mark_boot_delivered();
