@@ -193,7 +193,7 @@ fn classify(i: FeedHealthInput) -> (FeedHealthVerdict, &'static str) {
         return (Ok, "market closed — idle is normal");
     }
     // --- Market hours below: silence / disconnection IS a real fault. ---
-    // The provider REJECTED our auth credential (Groww answered with a non-2xx,
+    // The provider REJECTED our auth credential (the vendor answered non-2xx,
     // e.g. "Token key not found or inactive"). This is a confirmed, actionable
     // failure — it must win over the generic disconnected / no-ticks reasons so
     // the operator sees WHAT to fix, not just a bare Down. It is checked DURING
@@ -205,7 +205,7 @@ fn classify(i: FeedHealthInput) -> (FeedHealthVerdict, &'static str) {
     // not show a misleading auth-rejected. The message is a fixed `&'static str`
     // (security contract — no runtime/error data interpolated).
     if i.auth_rejected {
-        return (Down, "auth rejected — refresh the Groww SSM api-key");
+        return (Down, "auth rejected — refresh the feed SSM api-key");
     }
     // Enabled + lane running + instrumented, but the socket is down → not delivering.
     if !i.connected {
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn test_disabled_when_switched_off() {
         let r = evaluate_feed_health(
-            Feed::Groww,
+            Feed::Truedata,
             FeedHealthInput {
                 enabled: false,
                 ..base()
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn test_degraded_when_lane_not_running() {
         let r = evaluate_feed_health(
-            Feed::Groww,
+            Feed::Truedata,
             FeedHealthInput {
                 lane_running: false,
                 ..base()
@@ -706,7 +706,7 @@ mod tests {
         // Off + disconnected + no ticks → still reported as the intentional
         // Disabled, never a scary Down.
         let r = evaluate_feed_health(
-            Feed::Groww,
+            Feed::Truedata,
             FeedHealthInput {
                 enabled: false,
                 connected: false,
@@ -722,14 +722,14 @@ mod tests {
         // A confirmed provider rejection surfaces as an actionable Down naming
         // the fix — not a bare "disconnected".
         let r = evaluate_feed_health(
-            Feed::Groww,
+            Feed::Truedata,
             FeedHealthInput {
                 auth_rejected: true,
                 ..base()
             },
         );
         assert_eq!(r.verdict, FeedHealthVerdict::Down);
-        assert_eq!(r.reason, "auth rejected — refresh the Groww SSM api-key");
+        assert_eq!(r.reason, "auth rejected — refresh the feed SSM api-key");
     }
 
     #[test]
@@ -737,14 +737,14 @@ mod tests {
         // The default (no rejection) must NOT show the auth-rejected message —
         // a healthy feed stays Ok.
         let r = evaluate_feed_health(
-            Feed::Groww,
+            Feed::Truedata,
             FeedHealthInput {
                 auth_rejected: false,
                 ..base()
             },
         );
         assert_eq!(r.verdict, FeedHealthVerdict::Ok);
-        assert_ne!(r.reason, "auth rejected — refresh the Groww SSM api-key");
+        assert_ne!(r.reason, "auth rejected — refresh the feed SSM api-key");
     }
 
     #[test]
@@ -752,7 +752,7 @@ mod tests {
         // A switched-off feed is intentional even if a stale auth-rejected flag
         // lingers — show the calm Disabled, never the scary auth-rejected Down.
         let r = evaluate_feed_health(
-            Feed::Groww,
+            Feed::Truedata,
             FeedHealthInput {
                 enabled: false,
                 auth_rejected: true,
@@ -771,7 +771,7 @@ mod tests {
         // Down — market-closed idle wins (false-RED avoidance). During market
         // hours the SAME flag IS a real Down (see the two tests below).
         let r = evaluate_feed_health(
-            Feed::Groww,
+            Feed::Truedata,
             FeedHealthInput {
                 auth_rejected: true,
                 connected: false,
@@ -786,7 +786,7 @@ mod tests {
             "stale auth-reject outside market hours must not be a false-RED Down"
         );
         assert_eq!(r.reason, "market closed — idle is normal");
-        assert_ne!(r.reason, "auth rejected — refresh the Groww SSM api-key");
+        assert_ne!(r.reason, "auth rejected — refresh the feed SSM api-key");
     }
 
     #[test]
@@ -794,7 +794,7 @@ mod tests {
         // During market hours, a confirmed auth-rejection must name the fix
         // rather than the generic "disconnected — reconnecting".
         let r = evaluate_feed_health(
-            Feed::Groww,
+            Feed::Truedata,
             FeedHealthInput {
                 auth_rejected: true,
                 connected: false,
@@ -803,7 +803,7 @@ mod tests {
             },
         );
         assert_eq!(r.verdict, FeedHealthVerdict::Down);
-        assert_eq!(r.reason, "auth rejected — refresh the Groww SSM api-key");
+        assert_eq!(r.reason, "auth rejected — refresh the feed SSM api-key");
     }
 
     #[test]
@@ -849,9 +849,9 @@ mod tests {
         // The honest-counter helper: increment ticks_total by exactly N in one
         // atomic add (Groww counts PERSISTED rows in flush-sized batches).
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.record_ticks(Feed::Groww, 5, T0);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        reg.set_connected(Feed::Truedata, true);
+        reg.record_ticks(Feed::Truedata, 5, T0);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0 + 1_000_000_000);
         assert_eq!(r.input.ticks_total, 5, "record_ticks must add exactly N");
         assert_eq!(r.input.last_tick_age_secs, Some(1), "ts stamped");
     }
@@ -862,9 +862,9 @@ mod tests {
         // stall watchdog sees a DELIVERING feed even while QuestDB is down —
         // but never bumps the persist-honest tick count.
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.record_feed_liveness(Feed::Groww, T0);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 2_000_000_000);
+        reg.set_connected(Feed::Truedata, true);
+        reg.record_feed_liveness(Feed::Truedata, T0);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0 + 2_000_000_000);
         assert_eq!(
             r.input.last_tick_age_secs,
             Some(2),
@@ -881,10 +881,10 @@ mod tests {
         // Flush success later stamps a newer ts + the count; both helpers write
         // the same last-tick slot (last-writer-wins, both are "now").
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.record_feed_liveness(Feed::Groww, T0);
-        reg.record_ticks(Feed::Groww, 3, T0 + 1_000_000_000);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        reg.set_connected(Feed::Truedata, true);
+        reg.record_feed_liveness(Feed::Truedata, T0);
+        reg.record_ticks(Feed::Truedata, 3, T0 + 1_000_000_000);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0 + 1_000_000_000);
         assert_eq!(r.input.ticks_total, 3);
         assert_eq!(r.input.last_tick_age_secs, Some(0), "newest stamp wins");
     }
@@ -894,9 +894,9 @@ mod tests {
         // A flush that persisted 0 rows must NOT bump the count or stamp the time
         // (no false "tick arrived" signal — audit Rule 11).
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.record_ticks(Feed::Groww, 0, T0);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0);
+        reg.set_connected(Feed::Truedata, true);
+        reg.record_ticks(Feed::Truedata, 0, T0);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0);
         assert_eq!(r.input.ticks_total, 0, "n=0 must not bump the count");
         assert_eq!(r.input.last_tick_age_secs, None, "n=0 must not stamp ts");
     }
@@ -904,8 +904,8 @@ mod tests {
     #[test]
     fn test_registry_no_tick_yet_is_down_during_market() {
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0);
+        reg.set_connected(Feed::Truedata, true);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0);
         assert_eq!(r.input.last_tick_age_secs, None);
         assert_eq!(r.verdict, FeedHealthVerdict::Down);
     }
@@ -937,7 +937,7 @@ mod tests {
         let reg = FeedHealthRegistry::new();
         reg.record_tick(Feed::Dhan, T0);
         reg.record_drops(Feed::Dhan, 9);
-        let g = reg.snapshot(Feed::Groww, true, true, true, T0);
+        let g = reg.snapshot(Feed::Truedata, true, true, true, T0);
         assert_eq!(
             g.input.ticks_total, 0,
             "Groww slot untouched by Dhan writes"
@@ -967,19 +967,19 @@ mod tests {
     #[test]
     fn test_registry_is_auth_rejected_round_trip_and_clear() {
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.record_tick(Feed::Groww, T0);
+        reg.set_connected(Feed::Truedata, true);
+        reg.record_tick(Feed::Truedata, T0);
         // Provider rejected the credential → actionable Down even with a fresh tick.
-        reg.set_auth_rejected(Feed::Groww, true);
-        assert!(reg.is_auth_rejected(Feed::Groww));
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        reg.set_auth_rejected(Feed::Truedata, true);
+        assert!(reg.is_auth_rejected(Feed::Truedata));
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0 + 1_000_000_000);
         assert!(r.input.auth_rejected);
         assert_eq!(r.verdict, FeedHealthVerdict::Down);
-        assert_eq!(r.reason, "auth rejected — refresh the Groww SSM api-key");
+        assert_eq!(r.reason, "auth rejected — refresh the feed SSM api-key");
         // Auth recovers → flag cleared → resolves back to a normal verdict.
-        reg.set_auth_rejected(Feed::Groww, false);
-        assert!(!reg.is_auth_rejected(Feed::Groww));
-        let r2 = reg.snapshot(Feed::Groww, true, true, true, T0 + 2 * 1_000_000_000);
+        reg.set_auth_rejected(Feed::Truedata, false);
+        assert!(!reg.is_auth_rejected(Feed::Truedata));
+        let r2 = reg.snapshot(Feed::Truedata, true, true, true, T0 + 2 * 1_000_000_000);
         assert!(!r2.input.auth_rejected);
         assert_eq!(r2.verdict, FeedHealthVerdict::Ok);
     }
@@ -991,14 +991,14 @@ mod tests {
         // n>0 — rows actually flushed) must clear it so the page stops showing a
         // permanent "auth rejected" Down after the feed recovered + is streaming.
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.set_auth_rejected(Feed::Groww, true);
-        let down = reg.snapshot(Feed::Groww, true, true, true, T0);
+        reg.set_connected(Feed::Truedata, true);
+        reg.set_auth_rejected(Feed::Truedata, true);
+        let down = reg.snapshot(Feed::Truedata, true, true, true, T0);
         assert!(down.input.auth_rejected);
         assert_eq!(down.verdict, FeedHealthVerdict::Down);
         // Rows flow again → flag self-heals, verdict resolves to live.
-        reg.record_ticks(Feed::Groww, 3, T0);
-        let live = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        reg.record_ticks(Feed::Truedata, 3, T0);
+        let live = reg.snapshot(Feed::Truedata, true, true, true, T0 + 1_000_000_000);
         assert!(
             !live.input.auth_rejected,
             "a successful tick flow must clear the stale auth-rejected flag"
@@ -1013,10 +1013,10 @@ mod tests {
         // "recovered" signal; audit Rule 11). The early-return on n==0 means the
         // clear is never reached.
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.set_auth_rejected(Feed::Groww, true);
-        reg.record_ticks(Feed::Groww, 0, T0);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        reg.set_connected(Feed::Truedata, true);
+        reg.set_auth_rejected(Feed::Truedata, true);
+        reg.record_ticks(Feed::Truedata, 0, T0);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0 + 1_000_000_000);
         assert!(
             r.input.auth_rejected,
             "a 0-row flush must NOT clear the auth-rejected flag"
@@ -1032,17 +1032,17 @@ mod tests {
         // so a tick-silent window can no longer latch the false-RED for the
         // whole session.
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        assert!(!reg.is_auth_rejected(Feed::Groww));
-        reg.set_auth_rejected(Feed::Groww, true);
+        reg.set_connected(Feed::Truedata, true);
+        assert!(!reg.is_auth_rejected(Feed::Truedata));
+        reg.set_auth_rejected(Feed::Truedata, true);
         // §34 getter mirrors the stored flag (the ladder's advance gate).
-        assert!(reg.is_auth_rejected(Feed::Groww));
-        let down = reg.snapshot(Feed::Groww, true, true, true, T0);
+        assert!(reg.is_auth_rejected(Feed::Truedata));
+        let down = reg.snapshot(Feed::Truedata, true, true, true, T0);
         assert!(down.input.auth_rejected);
         assert_eq!(down.verdict, FeedHealthVerdict::Down);
         // Streaming/auth-OK edge — NO tick recorded.
-        reg.clear_auth_rejected(Feed::Groww);
-        let after = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        reg.clear_auth_rejected(Feed::Truedata);
+        let after = reg.snapshot(Feed::Truedata, true, true, true, T0 + 1_000_000_000);
         assert!(
             !after.input.auth_rejected,
             "a confirmed non-tick recovery edge must clear the stale auth-reject"
@@ -1057,15 +1057,15 @@ mod tests {
         // (no spurious instrumentation, no state change) — the load short-
         // circuits before any compare_exchange.
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.record_tick(Feed::Groww, T0);
+        reg.set_connected(Feed::Truedata, true);
+        reg.record_tick(Feed::Truedata, T0);
         assert!(
-            !reg.snapshot(Feed::Groww, true, true, true, T0)
+            !reg.snapshot(Feed::Truedata, true, true, true, T0)
                 .input
                 .auth_rejected
         );
-        reg.clear_auth_rejected(Feed::Groww);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        reg.clear_auth_rejected(Feed::Truedata);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0 + 1_000_000_000);
         assert!(!r.input.auth_rejected, "no-op clear leaves the flag clear");
         assert_eq!(r.verdict, FeedHealthVerdict::Ok);
     }
@@ -1074,15 +1074,15 @@ mod tests {
     fn test_registry_record_tick_clears_auth_rejected_on_recovery() {
         // The single-tick path clears the stale flag symmetrically.
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.set_auth_rejected(Feed::Groww, true);
+        reg.set_connected(Feed::Truedata, true);
+        reg.set_auth_rejected(Feed::Truedata, true);
         assert!(
-            reg.snapshot(Feed::Groww, true, true, true, T0)
+            reg.snapshot(Feed::Truedata, true, true, true, T0)
                 .input
                 .auth_rejected
         );
-        reg.record_tick(Feed::Groww, T0);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        reg.record_tick(Feed::Truedata, T0);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0 + 1_000_000_000);
         assert!(
             !r.input.auth_rejected,
             "a single recovered tick must clear the stale auth-rejected flag"
@@ -1095,8 +1095,8 @@ mod tests {
         // A confirmed rejection is a real signal — it must instrument the slot so
         // the page shows the actionable Down, not the Unknown placeholder.
         let reg = FeedHealthRegistry::new();
-        reg.set_auth_rejected(Feed::Groww, true);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0);
+        reg.set_auth_rejected(Feed::Truedata, true);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0);
         assert!(r.input.instrumented);
         assert_eq!(r.verdict, FeedHealthVerdict::Down);
     }
@@ -1108,8 +1108,8 @@ mod tests {
         // surfaces them. It is display-only — it does NOT by itself flip the
         // verdict (a subscribed-but-silent feed during market hours is still Down).
         let reg = FeedHealthRegistry::new();
-        reg.set_subscribed(Feed::Groww, 765, 2);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0);
+        reg.set_subscribed(Feed::Truedata, 765, 2);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0);
         assert_eq!(r.input.subscribed_stocks, 765);
         assert_eq!(r.input.subscribed_indices, 2);
         assert!(
@@ -1121,8 +1121,8 @@ mod tests {
         assert_eq!(d.input.subscribed_stocks, 0);
         assert_eq!(d.input.subscribed_indices, 0);
         // Idempotent overwrite (a re-subscribe updates the counts).
-        reg.set_subscribed(Feed::Groww, 770, 3);
-        let r2 = reg.snapshot(Feed::Groww, true, true, true, T0);
+        reg.set_subscribed(Feed::Truedata, 770, 3);
+        let r2 = reg.snapshot(Feed::Truedata, true, true, true, T0);
         assert_eq!(r2.input.subscribed_stocks, 770);
         assert_eq!(r2.input.subscribed_indices, 3);
     }
@@ -1136,10 +1136,10 @@ mod tests {
         // still Ok even with drops surfaced; drops drive Degraded via record_drops,
         // which is a separate signal — decode_dropped is a producer-side count).
         let reg = FeedHealthRegistry::new();
-        reg.set_connected(Feed::Groww, true);
-        reg.record_tick(Feed::Groww, T0);
-        reg.set_decode_counts(Feed::Groww, 765, 12);
-        let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
+        reg.set_connected(Feed::Truedata, true);
+        reg.record_tick(Feed::Truedata, T0);
+        reg.set_decode_counts(Feed::Truedata, 765, 12);
+        let r = reg.snapshot(Feed::Truedata, true, true, true, T0 + 1_000_000_000);
         assert_eq!(r.input.decoded_emitted, 765);
         assert_eq!(r.input.decoded_dropped, 12);
         assert!(
@@ -1155,8 +1155,8 @@ mod tests {
         assert_eq!(d.input.decoded_emitted, 0);
         assert_eq!(d.input.decoded_dropped, 0);
         // Idempotent overwrite (the producer reports cumulative totals).
-        reg.set_decode_counts(Feed::Groww, 800, 13);
-        let r2 = reg.snapshot(Feed::Groww, true, true, true, T0 + 2_000_000_000);
+        reg.set_decode_counts(Feed::Truedata, 800, 13);
+        let r2 = reg.snapshot(Feed::Truedata, true, true, true, T0 + 2_000_000_000);
         assert_eq!(r2.input.decoded_emitted, 800);
         assert_eq!(r2.input.decoded_dropped, 13);
     }
@@ -1184,9 +1184,9 @@ mod tests {
     #[test]
     fn test_last_tick_age_secs_reports_correct_age() {
         let reg = FeedHealthRegistry::new();
-        reg.record_ticks(Feed::Groww, 5, T0);
+        reg.record_ticks(Feed::Truedata, 5, T0);
         // 31s later → age 31 (NANOS_PER_SEC apart).
-        let age = reg.last_tick_age_secs(Feed::Groww, T0 + 31 * NANOS_PER_SEC);
+        let age = reg.last_tick_age_secs(Feed::Truedata, T0 + 31 * NANOS_PER_SEC);
         assert_eq!(age, Some(31));
         // A different feed is independent (per-feed array).
         assert_eq!(
@@ -1202,10 +1202,10 @@ mod tests {
         // reference (a floored-age reconstruction is banned; review CRITICAL
         // 2026-07-14).
         let reg = FeedHealthRegistry::new();
-        assert_eq!(reg.last_tick_ist_nanos(Feed::Groww), None, "no tick yet");
+        assert_eq!(reg.last_tick_ist_nanos(Feed::Truedata), None, "no tick yet");
         let ts = T0 + 123_456_789; // deliberately NOT whole-second aligned
-        reg.record_tick(Feed::Groww, ts);
-        assert_eq!(reg.last_tick_ist_nanos(Feed::Groww), Some(ts));
+        reg.record_tick(Feed::Truedata, ts);
+        assert_eq!(reg.last_tick_ist_nanos(Feed::Truedata), Some(ts));
         assert_eq!(reg.last_tick_ist_nanos(Feed::Dhan), None, "per-feed");
     }
 
@@ -1214,8 +1214,8 @@ mod tests {
         // A BACKWARD NTP step (now < last_tick) must clamp to age 0 so a clock
         // step can never false-trigger a stall restart.
         let reg = FeedHealthRegistry::new();
-        reg.record_tick(Feed::Groww, T0);
-        let age = reg.last_tick_age_secs(Feed::Groww, T0 - 5 * NANOS_PER_SEC);
+        reg.record_tick(Feed::Truedata, T0);
+        let age = reg.last_tick_age_secs(Feed::Truedata, T0 - 5 * NANOS_PER_SEC);
         assert_eq!(age, Some(0));
     }
 }

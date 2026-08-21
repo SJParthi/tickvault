@@ -629,21 +629,6 @@ pub enum ErrorCode {
     /// restart.
     IndexOhlc02DailyResetFailed,
 
-    // C4 sweep (2026-07-15): PREVDAY-01 variant RETIRED — the boot-time
-    // prev-day OHLCV fetch died with the Dhan lane (C3; the `prev_day_ohlcv`
-    // table stays, forensic). DHAN-LANE-01..04 variants RETIRED — the
-    // runtime lane FSM (`start_dhan_lane`/`stop_dhan_lane`/`LaneState`) was
-    // deleted in Phase C2 (#1522); auth-failure visibility for the retained
-    // Dhan REST surface lives in the `dhan_rest_stack` backoff arms + the
-    // AUTH-GAP-* codes (dhan-lane-error-codes.md retirement banner).
-    /// GROWW-MASTER-01 (PR-A 2026-06-28) — the best-effort cold-path write of
-    /// the Groww instrument set into the SHARED `instrument_lifecycle` /
-    /// `index_constituency` master tables (tagged `feed='groww'`) failed
-    /// (QuestDB ILP unreachable / flush error). The Groww feed activation and
-    /// the live tick path are UNAFFECTED — this is a forensic master/metadata
-    /// write, never on the data-correctness or recovery path. Idempotent DEDUP
-    /// UPSERT, so the next boot re-runs. Severity::Medium (auto-triage-safe).
-    GrowwMaster01PersistFailed,
     /// FEED-STALL-01 (2026-06-30) — a live-feed sidecar was ALIVE but streaming
     /// NOTHING across its whole subscribed universe for longer than the stall
     /// threshold during market hours (the silently-closed NATS socket that left
@@ -684,92 +669,14 @@ pub enum ErrorCode {
     /// operator inspects the fd/resolver pressure — cross-check
     /// RESOURCE-01).
     HttpClient01BuildFailed,
-    /// GROWW-SCALE-01 (§34 auto-scale, 2026-07-03) — the Groww auto-scale
-    /// ladder ROLLED BACK a failed rung advance: the newly added connections
-    /// were killed (verified older connections untouched), the last
-    /// KNOWN-healthy connection count was restored, and an exponential hold
-    /// (`min(10m × 2^k, 4h)`) was armed before the next attempt. This IS the
-    /// operator-demanded auto-correction ("if there is any failure how that
-    /// can be auto corrected") — Severity::High so the operator sees every
-    /// rollback; auto-triage-safe (the correction already applied).
-    GrowwScale01RollbackFired,
     /// GROWW-SCALE-02 (§34 auto-scale, 2026-07-03) — ALL active Groww
-    /// connections failed within a 60s window: classified as an ACCOUNT-LEVEL
-    /// throttle (provider rejecting us), NOT a single-rung failure. The
-    /// ladder applied a 5-minute global cooldown, HALVED the connection count
-    /// (`N → max(ceil(N/2), 1)`), and resumed PROBING with staggered
-    /// reconnects. Severity::High, auto-triage-safe (self-applied); a
-    /// REPEATING halve down to 1 conn is the honest "Groww refuses
-    /// multi-connection" signal per §34.3.
-    GrowwScale02GlobalHalve,
     /// GROWW-SCALE-03 (§34 auto-scale, 2026-07-03) — the fail-closed shard
-    /// invariant was violated: two shards claimed the same
-    /// `(exchange, segment, security_id)` OR the shard union did not cover
-    /// the watch-set. The ladder step HALTs; the younger conflicting
-    /// connection is killed. Should be unreachable (the `cut_shards` ratchet
-    /// tests pin disjointness + coverage) — a firing means a real cutter/
-    /// ladder bug. Severity::Critical (never auto-triaged).
-    ///
-    /// CORRECTED 2026-07-04 (Session-B verdict): the `ticks` DEDUP key
-    /// `(ts, security_id, segment, capture_seq, feed)` does NOT collapse
-    /// cross-connection overlap — `capture_seq` is globally unique and IN
-    /// the key, so two connections streaming the SAME instrument produce
-    /// DISTINCT `capture_seq` values → TWO rows per tick (silent duplicate
-    /// rows). The cut-time fail-closed cutter is the actual protection;
-    /// until the PR-2 runtime duplicate-SID detector ships, an overlap that
-    /// escapes the cutter IS silent data duplication — which is exactly why
-    /// this code is Critical, not Medium.
-    GrowwScale03ShardOverlap,
     /// GROWW-SCALE-04 (§34 auto-scale, 2026-07-03) — a `groww_scale_audit`
-    /// rung-transition row could not be persisted (ILP down / QuestDB
-    /// unreachable / disk full). Best-effort forensic side-record (mirror of
-    /// AUDIT-WS-01): ladder decisions continue on in-memory state; a restart
-    /// during the outage rehydrates from the last PERSISTED (always
-    /// previously-verified) rung. Severity::Medium, auto-triage-safe.
-    GrowwScale04AuditWriteFailed,
     /// GROWW-SCALE-05 (Session-B fix, operator go 2026-07-04) — the Groww
-    /// scale-FLEET spawn was REFUSED by the fleet dual-instance SSM lock
-    /// (`/tickvault/<env>/instance-lock-groww-scale`, reusing the
-    /// RESILIENCE-01 `instance_lock` machinery via the named-lock knob).
-    /// Fires when (a) another tickvault instance ALREADY holds the fleet
-    /// lock (Mac + AWS, or two Macs, scaling the SAME Groww account — a
-    /// failure that previously masqueraded as provider throttle), (b) SSM
-    /// was unavailable after the bounded 3-attempt / 2s-4s retry budget
-    /// (fail-closed: we cannot prove there is no peer), or (c) the fleet
-    /// lock was lost mid-run to a foreign takeover. The boot degrades to
-    /// the SINGLE-CONNECTION Groww path (same fallback as a failed scale
-    /// PREFLIGHT — capture continues; only the multi-conn fleet is
-    /// refused). Severity::Critical (never auto-triaged — the operator
-    /// must decide which host runs the scale test).
-    GrowwScale05DualFleetDetected,
     /// GROWW-NATIVE-01 (PR-R1 shadow client, 2026-07-04) — the native-Rust
-    /// Groww NATS-over-WebSocket shadow client failed to connect / lost the
-    /// connection / had its supervised task respawned. Bounded expo backoff
-    /// reconnect (`GROWW_NATIVE_RECONNECT_*_SECS`); shadow-only — the legacy
-    /// sidecar capture chain is UNAFFECTED. Severity::Medium,
-    /// auto-triage-safe (self-healing reconnect; a sustained rate is the
-    /// live-probe answer the shadow run exists to collect).
-    GrowwNative01ConnectFailed,
     /// GROWW-NATIVE-02 (PR-R1 shadow client, 2026-07-04) — the per-session
-    /// socket-token mint (`GROWW_SOCKET_TOKEN_URL`, live-feed-AUTH KEEP
-    /// class) failed, or the NATS `CONNECT` was rejected with an auth-class
-    /// `-ERR`. Recovery: fresh ed25519 keypair + fresh socket-token mint;
-    /// the ACCESS token is only ever RE-READ from SSM at
-    /// `GROWW_NATIVE_AUTH_RETRY_FLOOR_SECS` pacing — NEVER minted
-    /// (token-minter lock 2026-07-02). Severity::Medium, auto-triage-safe.
-    GrowwNative02AuthFailed,
     /// GROWW-NATIVE-03 (PR-R1 shadow client, 2026-07-04) — a NATS frame or
-    /// protobuf tick payload failed to decode (typed error, never a panic).
-    /// Proto-level failures are counted + skipped; framing-level failures
-    /// close + reconnect the socket. Severity::Medium, auto-triage-safe.
-    GrowwNative03DecodeFailed,
     /// GROWW-NATIVE-04 (PR-R1 shadow client, 2026-07-04) — the shadow NDJSON
-    /// writer failed a write / flush / IST-midnight rotation, or its bounded
-    /// channel overflowed. Capture continues (rotation failures retry next
-    /// midnight, mirroring the sidecar); the loss is shadow comparison data
-    /// only — the production capture chain is untouched. Severity::Medium,
-    /// auto-triage-safe.
-    GrowwNative04WriterFailed,
     /// FUTIDX-01 (§36 2026-07-08; §36.7 all monthly expiries 2026-07-10) —
     /// the index-future selection degraded on one feed: a whole underlying
     /// (no FUT rows / all expiries past / unparsable expiry / monthly serial
@@ -1231,7 +1138,6 @@ impl ErrorCode {
             // Boot-time previous-day OHLCV fetch (PR4 2026-06-01)
             // D2b — runtime Dhan-lane cold-start FSM (2026-06-26)
             // PR-A (2026-06-28): Groww shared-master persist
-            Self::GrowwMaster01PersistFailed => "GROWW-MASTER-01",
             Self::FeedStall01SidecarRestarted => "FEED-STALL-01",
             Self::FeedSupervisor01Respawned => "FEED-SUPERVISOR-01",
             // 2026-07-09: bounded sidecar reject-cause signature surfacing
@@ -1239,16 +1145,7 @@ impl ErrorCode {
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed => "HTTP-CLIENT-01",
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
-            Self::GrowwScale01RollbackFired => "GROWW-SCALE-01",
-            Self::GrowwScale02GlobalHalve => "GROWW-SCALE-02",
-            Self::GrowwScale03ShardOverlap => "GROWW-SCALE-03",
-            Self::GrowwScale04AuditWriteFailed => "GROWW-SCALE-04",
-            Self::GrowwScale05DualFleetDetected => "GROWW-SCALE-05",
             // PR-R1 (2026-07-04): Groww native-Rust shadow client
-            Self::GrowwNative01ConnectFailed => "GROWW-NATIVE-01",
-            Self::GrowwNative02AuthFailed => "GROWW-NATIVE-02",
-            Self::GrowwNative03DecodeFailed => "GROWW-NATIVE-03",
-            Self::GrowwNative04WriterFailed => "GROWW-NATIVE-04",
             Self::Futidx01SelectionDegraded => "FUTIDX-01",
             Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
             // Dual-feed scoreboard PR-A (2026-07-10)
@@ -1331,11 +1228,9 @@ impl ErrorCode {
             | Self::Proc01OomKillDetected
             // GROWW-SCALE-03 — shard disjointness/coverage contract violated
             // (a cutter/ladder bug; ladder step HALTs fail-closed)
-            | Self::GrowwScale03ShardOverlap
             // GROWW-SCALE-05 (Session-B 2026-07-04) — dual scale-fleet
             // instance detected / lock unprovable: fleet spawn refused
             // fail-closed; operator must pick the winning host.
-            | Self::GrowwScale05DualFleetDetected
             // STORAGE-GAP-05 (feed-hardening Item 5, 2026-08-19): the volume
             // is above high water and retention has nothing left it is
             // ALLOWED to reclaim. The next state is a full disk, which stops
@@ -1413,8 +1308,6 @@ impl ErrorCode {
             // auto-correction already applied; the operator must see every
             // rollback (a repeat at the same rung = the discovered
             // server-side cap).
-            | Self::GrowwScale01RollbackFired
-            | Self::GrowwScale02GlobalHalve
             // SPOT1M-01/02 (operator grant 2026-07-12) — the per-minute
             // spot 1m REST fetch/persist degraded. High: the operator must
             // see a failing exchange-record pull (the escalation is
@@ -1530,18 +1423,12 @@ impl ErrorCode {
             | Self::Boundary01CatchupSeal
             // GROWW-MASTER-01 (PR-A 2026-06-28): best-effort cold-path master
             // write failed; feed + ticks unaffected, next boot re-runs. Medium.
-            | Self::GrowwMaster01PersistFailed
             // GROWW-SCALE-04 (§34 2026-07-03): best-effort groww_scale_audit
             // row write failed; ladder continues on in-memory state. Medium.
-            | Self::GrowwScale04AuditWriteFailed
             // GROWW-NATIVE-01..04 (PR-R1 2026-07-04): shadow-only validation
             // client — failures lose comparison data for the window, never
             // production capture. Medium so the operator sees sustained
             // rates without paging on every live-probe reject.
-            | Self::GrowwNative01ConnectFailed
-            | Self::GrowwNative02AuthFailed
-            | Self::GrowwNative03DecodeFailed
-            | Self::GrowwNative04WriterFailed
             // SCOREBOARD-01 (2026-07-10): best-effort daily forensic
             // aggregate degraded; feeds/capture/trading unaffected, the
             // DEDUP-idempotent re-run backfills. Medium.
@@ -1717,9 +1604,6 @@ impl ErrorCode {
                 "docs/error-runbooks/index-day-ohlc-tracker-error-codes.md"
             }
             // PR-A (2026-06-28): Groww shared-master persist
-            Self::GrowwMaster01PersistFailed => {
-                "docs/error-runbooks/groww-shared-master-error-codes.md"
-            }
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
             Self::FeedStall01SidecarRestarted
             | Self::FeedSupervisor01Respawned
@@ -1731,20 +1615,7 @@ impl ErrorCode {
                 "docs/error-runbooks/http-client-error-codes.md"
             }
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
-            Self::GrowwScale01RollbackFired
-            | Self::GrowwScale02GlobalHalve
-            | Self::GrowwScale03ShardOverlap
-            | Self::GrowwScale04AuditWriteFailed
-            | Self::GrowwScale05DualFleetDetected => {
-                "docs/error-runbooks/groww-scale-error-codes.md"
-            }
             // PR-R1 (2026-07-04): Groww native-Rust shadow client
-            Self::GrowwNative01ConnectFailed
-            | Self::GrowwNative02AuthFailed
-            | Self::GrowwNative03DecodeFailed
-            | Self::GrowwNative04WriterFailed => {
-                "docs/error-runbooks/groww-native-rust-error-codes.md"
-            }
             Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
                 "docs/error-runbooks/futidx-4-error-codes.md"
             }
@@ -1855,7 +1726,7 @@ impl ErrorCode {
                 // dataPlan/segment/token is an operator/broker ACCOUNT decision
                 // (CHAIN-01 precedent); no auto-triage action may ever touch the
                 // ORDER path, so this is severity-independently operator-only.
-                | Self::OrderReady01GateRefused // GROWW-PORT-03 (§39.3, 2026-07-14): NO — severity-independent
+                | Self::OrderReady01GateRefused // NO — severity-independent
                                                 // override arm (FUTIDX-02 precedent: data-comparability
                                                 // divergence is never auto-actioned). The operator judges
                                                 // which book — ours, the broker's, or the co-tenant's
@@ -1987,7 +1858,6 @@ impl ErrorCode {
             // Day OHLC tracker for IDX_I (Ticker mode)
             Self::IndexOhlc02DailyResetFailed,
             // PR-A (2026-06-28): Groww shared-master persist
-            Self::GrowwMaster01PersistFailed,
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
             Self::FeedStall01SidecarRestarted,
             Self::FeedSupervisor01Respawned,
@@ -1995,17 +1865,8 @@ impl ErrorCode {
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed,
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
-            Self::GrowwScale01RollbackFired,
-            Self::GrowwScale02GlobalHalve,
-            Self::GrowwScale03ShardOverlap,
-            Self::GrowwScale04AuditWriteFailed,
             // Session-B fix (2026-07-04): Groww fleet dual-instance lock
-            Self::GrowwScale05DualFleetDetected,
             // PR-R1 (2026-07-04): Groww native-Rust shadow client
-            Self::GrowwNative01ConnectFailed,
-            Self::GrowwNative02AuthFailed,
-            Self::GrowwNative03DecodeFailed,
-            Self::GrowwNative04WriterFailed,
             Self::Futidx01SelectionDegraded,
             Self::Futidx02CrossFeedExpiryMismatch,
             // Dual-feed scoreboard PR-A (2026-07-10)
@@ -2486,33 +2347,6 @@ mod tests {
     }
 
     #[test]
-    fn test_groww_scale_05_dual_fleet_contract() {
-        // Session-B fix (operator go 2026-07-04): the Groww scale fleet's
-        // dual-instance lock refusal signal. Critical + never auto-triaged —
-        // the operator must pick which host runs the scale test.
-        let code = ErrorCode::GrowwScale05DualFleetDetected;
-        assert_eq!(code.code_str(), "GROWW-SCALE-05");
-        assert_eq!("GROWW-SCALE-05".parse::<ErrorCode>(), Ok(code));
-        assert_eq!(code.severity(), Severity::Critical);
-        assert!(!code.is_auto_triage_safe());
-        assert_eq!(
-            code.runbook_path(),
-            "docs/error-runbooks/groww-scale-error-codes.md"
-        );
-        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .map(|root| root.join(code.runbook_path()))
-            .expect("workspace root");
-        let shown = abs.display().to_string();
-        assert!(
-            abs.exists(),
-            "GROWW-SCALE-05 runbook missing on disk: {shown}"
-        );
-        assert!(ErrorCode::all().contains(&code));
-    }
-
-    #[test]
     fn test_cadence_codes_contract() {
         // Cadence scheduler (operator directive 2026-07-14, judge-locked
         // design rev-8): 3 variants, rich stage taxonomy per the house
@@ -2786,11 +2620,8 @@ mod tests {
                 // variant (`TickConserve01DailyResidual` — every audit
                 // input died with the dead tick chain, stage-2 sweep).
                 // PR-A 2026-06-28: Groww shared-master persist
-                || s.starts_with("GROWW-MASTER-")
                 // §34 (2026-07-03): Groww multi-connection auto-scale ladder
-                || s.starts_with("GROWW-SCALE-")
                 // PR-R1 (2026-07-04): Groww native-Rust shadow client
-                || s.starts_with("GROWW-NATIVE-")
                 // 2026-06-30: feed-agnostic sidecar stall-watchdog + respawn
                 || s.starts_with("FEED-STALL-")
                 || s.starts_with("FEED-SUPERVISOR-")

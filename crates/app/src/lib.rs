@@ -56,10 +56,6 @@ pub mod candle_ddl_boot;
 /// Real Dhan cadence executor — limiter-free, gate-pacing honored (the runner
 /// pre-acquires gates; this executor issues ONE bounded request per call).
 pub mod dhan_cadence_executor;
-/// Real Groww cadence executor — the Groww twin (gate-free lane by
-/// construction; ONE bounded request per call; token = shared-minter SSM
-/// READ-ONLY, never minted).
-pub mod groww_cadence_executor;
 // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
 // watchdog — daily open-position safety gate (alert-only in sandbox/dry-run).
 pub mod orphan_position_watchdog_boot;
@@ -79,29 +75,6 @@ pub mod spot_1m_rest_boot;
 // chain for the 3 underlyings via POST /v2/optionchain and persist to the
 // `option_chain_1m` table (CHAIN-01..04).
 pub mod option_chain_1m_boot;
-// Groww REST burst auto-ladder (operator approval 2026-07-14): the shared
-// tier/demotion state + wave schedule for the per-minute Groww REST legs,
-// plus the env-gated off-hours rate probe that gates the
-// seven_concurrent promotion.
-pub mod groww_rate_probe;
-pub mod groww_rest_burst;
-// Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
-// the Groww per-minute REST plan): the just-closed minute's official Groww
-// 1m OHLCV for the 3 spot indices → `spot_1m_rest` feed='groww' + the
-// `rest_fetch_audit` per-fetch forensics rows.
-pub mod groww_spot_1m_boot;
-// Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
-// of the Groww per-minute REST plan): the current-expiry chain for the 3
-// underlyings, sequenced after the Groww spot leg → `option_chain_1m`
-// feed='groww' + `rest_fetch_audit` leg='chain_1m' forensics rows.
-pub mod groww_option_chain_1m_boot;
-// Groww per-minute PER-CONTRACT 1m candle REST leg (operator grant
-// 2026-07-13 — PR-4 of the Groww per-minute REST plan, the fill-model
-// leg): the just-closed minute's 1m candle for a bounded ATM-window
-// contract selection, sequenced after the Groww chain leg →
-// `option_contract_1m_rest` feed='groww' + `rest_fetch_audit`
-// leg='contract_1m' forensics rows.
-pub mod groww_contract_1m_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).
@@ -192,14 +165,6 @@ pub mod dhan_universe;
 /// unchanged verified archive→drop and REFUSES to delete anything further
 /// when nothing reclaimable remains (STORAGE-GAP-05). DEFAULT-OFF via serde.
 pub mod disk_pressure_boot;
-/// Groww order/position PUSH channel — Stage D app consumer (2026-07-17,
-/// operator-authorized paper-mode receive-only build): bridges trading-side
-/// `BrokerOrderEvent`s from the supervised push runner into `order_audit`
-/// forensic rows (`feed='groww'`). Gated on the non-default `groww_orders`
-/// cargo feature (§39.2 Gate 2) AND the runtime
-/// `[groww_orders] order_push_enabled` flag (Gate 1, default OFF).
-pub mod groww_universe;
-pub mod groww_watch_paths;
 /// RAM residency stores boot (operator directive 2026-07-16, PR-2):
 /// installs the month-deep spot bar rings + current-day chain minute ring,
 /// runs the bounded chain-day rehydrate, and publishes the depth gauges.

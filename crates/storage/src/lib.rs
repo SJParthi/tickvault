@@ -161,13 +161,6 @@ pub mod resource_monitor;
 // questdb_health check reachability/connection, not per-table apply).
 pub mod wal_auto_resume;
 pub mod wal_suspension_watcher;
-// Sub-PR #10b-ε (2026-05-27): instrument_fetch_audit table contract —
-// schema constants + DEDUP key + FetchOutcome enum. Feature-gated under
-// `daily_universe_fetcher` per
-// `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
-// Groww second-feed live-tick persistence (operator lock 2026-06-19 §32).
-// Isolated `groww_*` namespace; the Dhan path is untouched.
-pub mod groww_persistence;
 // Groww second-feed 1-minute candle persistence (operator lock §32).
 // (SP5) The Groww live-vs-backtest 1m parity audit writer was merged into a
 // unified `feed_parity_1m_audit_persistence` module, then DELETED 2026-07-15
