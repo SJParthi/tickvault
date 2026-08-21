@@ -955,16 +955,30 @@ impl LiveIngest {
                 //   are absent from QuestDB.
                 // So a flush failure is deferred loss if the process later
                 // restarts, and standing loss if it does not.
+                //
+                // AMENDED 2026-08-21. The INTRA-SESSION half above is no
+                // longer true, and this is the third dated correction to this
+                // one block — which is itself the point the block makes.
+                // `TickWriter::discard_pending` now rescues the failed batch
+                // to a tick spill file holding the ILP verbatim, so the rows
+                // are replayable WITHOUT a restart by one curl against
+                // QuestDB's /write, idempotently (the dedup key carries
+                // `capture_seq`). So there is no longer a "standing loss"
+                // case while the process lives: the honest statement is that
+                // the rows are absent from the database until someone replays
+                // the file or the box reboots, and BOTH recoveries exist.
+                // The `error!` below was rewritten in the same change — it
+                // still said recovery was impossible, which contradicted the
+                // WS-GAP-03 line printed beside it for the same event.
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     %err,
                     rows = covered,
-                    "live tick flush to QuestDB FAILED — the buffered rows were discarded by \
-                     the writer contract and are a counted loss: these ticks are NOT in the \
-                     database and nothing re-inserts them. The raw frames are preserved in the \
-                     write-ahead log and can be recovered manually, but boot replay DROPS \
-                     live-feed frames (there is no re-fold path), so do not wait for a restart \
-                     to fix this."
+                    "live tick flush to QuestDB FAILED — these rows are NOT in the database. \
+                     They are NOT lost: the writer rescues the failed batch to a tick spill \
+                     file (see the WS-GAP-03 line beside this one for the exact path) and it \
+                     re-ingests with a single curl, safely repeatable. The raw frames are also \
+                     in the write-ahead log. Do not wait for a restart — replay the spill file."
                 );
                 0
             }

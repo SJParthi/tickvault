@@ -1251,10 +1251,25 @@ the bare discard. One function, one file.
 New counter `tv_ticks_spilled_total{feed}`, pre-registered at 0 in
 `register_drop_baseline` for the same delta-baseline reason the drop counter is
 — a rescue episode is rare, so its first increment would otherwise be consumed
-as the baseline and go unreported. **Honestly flagged: it is NOT EMF-selected
-and has NO alarm**, matching the neighbouring counters; shipping it to
-CloudWatch is a ~$0.30/mo decision that belongs with the alarm that would read
-it. Today it is visible on `/metrics` and in the coded `error!`.
+as the baseline and go unreported.
+
+**CORRECTED 2026-08-21, same day, by the failure audit.** The first version of
+this item said the new counter being unalarmed was fine, "matching the
+neighbouring counters". That justification was FALSE, and its wrongness is
+exactly what concealed a regression: `tv_ticks_dropped_total` — the counter the
+rescue diverts traffic AWAY from — IS EMF-selected and IS alarmed
+(`dhan_ticks_dropped`, `live-lane-alarms.tf`). So the change was not "one more
+unwatched counter"; it was a DIVERSION that took the common flush failure off
+the only pager watching it. Net paging coverage went DOWN, and a reader of the
+original note would have concluded nothing changed.
+
+Fixed by incrementing BOTH on the rescue arm. The alarmed counter is also the
+semantically correct one there: it means "rows left the buffer without reaching
+QuestDB", which is true of a rescued row. `tv_ticks_spilled_total` is the
+narrower "and it is recoverable". Pinned by
+`the_rescue_path_still_increments_the_alarmed_counter`, a source-scan ratchet
+chosen over a recorder assertion because what must never regress is the ALARMED
+NAME, and a recorder test would still pass against a different unalarmed name.
 
 ## Item 24 Honest envelope
 
@@ -1267,3 +1282,122 @@ in QuestDB until someone runs the documented curl, and past the 512 MiB cap
 they still drop. **NOT claimed: that the flush timeouts stop** — the cause is
 QuestDB write latency under the live load and is untouched here; this bounds
 the consequence, not the cause.
+
+## ITEM 25 (added 2026-08-21) — operator: "go ahead with the recommendation" + "one and only RUST O(1) in the entire workspace"
+
+**Scope authority:** no scope change — no socket, no universe, no `dry_run`, no
+§28 edit, no new Telegram page. Three defects and two documentation corrections,
+all found by a three-agent audit run in parallel.
+
+## Item 25 Design
+
+**A. The never-traded sentinel timestamp (`row_timestamp_ist_nanos`).**
+Measured live: **959,671 rows/session** carried `exchange_timestamp = 315,532,800`
+(1980-01-01, Dhan's never-traded sentinel) or a literal `0`, stamping them into
+permanent `1980-01-01` / `1970-01-01` partitions where **no time-range query can
+reach them**.
+
+The first recommendation was to DROP these rows. **That was wrong and the
+verification caught it:** 99.2% of them carry a real `total_buy_qty` (max
+8,397,000), `total_sell_qty` (max 9,019,000) and previous `close` (max 73,186.8).
+They are contracts with a live order book that have not traded yet — the drain
+keeps them deliberately, and the existing code comment saying discarding them
+"costs the packet's open interest and bid/ask" is correct.
+
+So the row is KEPT and its designated timestamp is taken from the RECEIPT time,
+which is the only real time such an observation has. The raw sentinel survives
+in `exchange_timestamp`, so "never traded" stays recoverable. The plausibility
+floor is SHARED with the aggregator (`MIN_PLAUSIBLE_EXCHANGE_TS_SECS`) so the
+candle refusal and the timestamp fallback cannot drift apart. Convention-safe by
+construction: both inputs are already IST-epoch, so the function only CHOOSES
+between two values in one space and can never introduce the `+19800` sign error
+that `data-integrity.md` calls the single most critical rule.
+
+**B. The alarm regression Item 24 introduced (`discard_pending`).**
+Item 24's spill rescue incremented ONLY `tv_ticks_spilled_total`, which is
+neither EMF-selected nor alarmed, and thereby DIVERTED the common flush failure
+off `dhan_ticks_dropped` — the only pager watching it. Net paging coverage went
+DOWN. Item 24's own note called that acceptable "matching the neighbouring
+counters"; that justification was FALSE and its wrongness is what concealed the
+regression. Fixed by incrementing BOTH; that Observability section is corrected
+in place.
+
+**C. Two now-false operator-facing claims** in `dhan_feed_stack`: the flush
+`error!` still said the rows were "a counted loss", "nothing re-inserts them"
+and "boot replay DROPS live-feed frames (there is no re-fold path)". All three
+are false — the rescue exists and `refold_wal_frames` exists — so two ERROR
+lines fired for one event with OPPOSITE verdicts, telling the operator recovery
+was impossible when two recoveries work.
+
+**D. Rust-only.** The audit found **zero executing violations** workspace-wide.
+Two mentions fixed: an operator runbook (ours, not vendor reference, so outside
+every carve-out) carried two Python blocks instructing a human to run them —
+re-expressed as `curl` with identical headers and cookie warm-up; and a launcher
+comment claimed a parity harness "re-materializes" a deleted interpreted server,
+which was retired 2026-08-01. One mention KEPT deliberately: a third-party PyPI
+package named in a REJECTED-options table, where removing the name would make
+the table unable to say what was rejected.
+
+**E. CLAUDE.md honesty.** The codebase map's `pipeline/` row named a
+tick-processor module that does not exist and said 21 timeframes where
+`TF_COUNT` is 24. Four unbounded-growth paths were missing from the O(1) table.
+
+Files: `crates/storage/src/tick_persistence.rs`,
+`crates/app/src/dhan_feed_stack.rs`, `CLAUDE.md`,
+`docs/operator/nse-trading-calendar-2026.md`,
+`scripts/mcp-servers/tickvault-logs-launch.sh`.
+
+## Item 25 Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Plausible LTT | Exchange time kept — unchanged for every normal row |
+| LTT exactly AT the floor | Plausible, kept (boundary pinned) |
+| LTT one second below | Sentinel, falls back |
+| Sentinel LTT **and** no receipt time | Sentinel kept — a guess is worse than a visibly wrong value |
+| Spill succeeds | BOTH counters fire, so the alarm still pages |
+| Spill fails | Drop counter only, as before |
+
+## Item 25 Failure Modes
+
+| Failure | Result |
+|---|---|
+| Fallback wrongly applied to a real tick | Every price stamped with receipt time instead of trade time — pinned against by the plausible-LTT test |
+| Someone re-diverts the rescue off the alarmed counter | `the_rescue_path_still_increments_the_alarmed_counter` fails the build |
+| Floor drifts from the aggregator's | Impossible — the constant is shared, and pinned at the boundary |
+
+## Item 25 Test Plan
+
+Seven new tests, 38 green in `tick_persistence` (46 storage suites, 65 common,
+1,533 app lib). **Bite-proven twice:** removing the timestamp fallback fails 4;
+the alarm ratchet is a source-scan chosen over a recorder assertion because what
+must never regress is the ALARMED NAME, and a recorder test would still pass
+against a different unalarmed name.
+
+Also demonstrated: the first draft of the CLAUDE.md correction NAMED the missing
+module and `claude_md_codebase_map_guard` REJECTED it — the guard bites on
+corrective prose too, which is the right behaviour.
+
+## Item 25 Rollback
+
+Each part is independent: drop the `row_timestamp_ist_nanos` call to restore
+sentinel stamping; drop one `metrics::counter!` to restore Item 24's behaviour;
+the rest are documentation.
+
+## Item 25 Observability
+
+No new metric. The change RESTORES `dhan_ticks_dropped` paging on the rescue
+path. Sentinel rows become visible to time-range queries for the first time —
+which will raise apparent tick counts by ~3%; those are real observations, and
+consumers wanting traded ticks only should filter `ltp > 0`.
+
+## Item 25 Honest envelope
+
+100% inside the tested envelope, with bite-proven ratcheted coverage. **NOT
+claimed:** that the flush timeouts stop — their cause is QuestDB write latency,
+untouched here, though removing ~950k out-of-order writes per session should
+reduce the pressure and that is a hypothesis, not a measurement. **NOT claimed:**
+that the spill is automatically replayed — it still needs one curl, which does
+not meet the zero-manual-intervention bar and remains open. **NOT claimed:** that
+the audit was exhaustive — it found this table incomplete for the fourth time,
+which is itself evidence that a source scan finds what it is pointed at.
