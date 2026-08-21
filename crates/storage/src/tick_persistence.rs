@@ -86,6 +86,8 @@
 //! acceptable; it is still kept modest (`&'static str` symbols, one reusable
 //! ILP buffer, no per-row `String`).
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -518,6 +520,95 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
 // Writer
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tick ILP spill — the rescue tier the ticks writer never had
+// ---------------------------------------------------------------------------
+
+/// Directory the failed-flush ILP payloads are appended to.
+///
+/// Sibling of the frame WAL (`data/ws_wal`) and the seal spill, deliberately
+/// under the same `data/` root so one retention sweep can see all three.
+pub const TICK_SPILL_DIR: &str = "data/spill/ticks";
+
+/// Hard ceiling on the spill directory, in bytes (512 MiB).
+///
+/// A rescue that can fill the root volume is not a rescue — QuestDB and the
+/// frame WAL share this disk, so an unbounded spill would trade a bounded tick
+/// loss for an unbounded outage of everything. Past the cap the rows ARE
+/// dropped and counted, which is the same honest failure as today rather than
+/// a worse one.
+pub const TICK_SPILL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Appends a failed flush's ILP payload to the spill directory.
+///
+/// # Why the payload is stored verbatim
+///
+/// `Buffer::as_bytes()` is InfluxDB line protocol — exactly the body
+/// QuestDB's own `/write` endpoint accepts. So a spill file is not an archive
+/// format needing a bespoke parser; it is directly re-ingestable:
+///
+/// ```text
+/// curl --data-binary @data/spill/ticks/<file> http://localhost:9000/write
+/// ```
+///
+/// Re-ingest is idempotent because the `ticks` DEDUP key
+/// `(ts, security_id, segment, capture_seq, feed)` carries `capture_seq`, so a
+/// replayed row UPSERTs onto itself rather than duplicating.
+///
+/// # Errors
+///
+/// `Err` when the directory cannot be created or the append fails. The caller
+/// treats that as "rescue unavailable" and falls back to the counted drop —
+/// a spill that cannot be written must never mask the loss.
+fn spill_failed_ilp(
+    dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    now_unix_secs: i64,
+) -> std::io::Result<PathBuf> {
+    // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
+    std::fs::create_dir_all(dir)?;
+
+    if spill_dir_bytes(dir) >= TICK_SPILL_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            format!("tick spill dir at or past its {TICK_SPILL_MAX_BYTES}-byte cap"),
+        ));
+    }
+
+    // One file per feed per hour: bounded file count, and an operator replaying
+    // a known-bad window does not have to read a single ever-growing file.
+    let hour = now_unix_secs / 3_600;
+    let path = dir.join(format!("ticks-{}-{hour}.ilp", feed.as_str()));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(payload)?;
+    file.flush()?;
+    Ok(path)
+    // O(1) EXEMPT: end
+}
+
+/// Total bytes currently held in the spill directory.
+///
+/// Non-recursive and best-effort: an unreadable entry contributes 0 rather
+/// than aborting the sweep, because failing to measure the cap must not also
+/// fail the rescue the cap is protecting.
+fn spill_dir_bytes(dir: &Path) -> u64 {
+    // O(1) EXEMPT: begin — cold path, bounded by the per-feed-per-hour file count.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|e| e.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.len())
+        .sum()
+    // O(1) EXEMPT: end
+}
+
 /// ILP-over-HTTP conf: per-flush server ACK (the 2026-07-05 fire-and-forget
 /// lesson) with `retry_timeout=0` (the caller owns retry cadence) and a bounded
 /// `request_timeout` so a hung flush cannot wedge the pipeline.
@@ -543,6 +634,12 @@ pub struct TickWriter {
     /// Highest `capture_seq` this connection has stamped — the per-connection
     /// monotonicity witness (`0` before the first row).
     last_capture_seq: i64,
+    /// Where a failed flush rescues its ILP payload.
+    ///
+    /// A field rather than a constant so the rescue PATH itself is testable:
+    /// a test that can only exercise the helper proves the file format and
+    /// not that `discard_pending` actually calls it.
+    spill_dir: PathBuf,
 }
 
 /// Publish a zero on this feed's drop series before any row can be written.
@@ -567,6 +664,10 @@ pub struct TickWriter {
 /// `increment(0)` on an already-registered series is a no-op.
 fn register_drop_baseline(feed: Feed) {
     metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str()).increment(0);
+    // The rescue counter needs the SAME treatment for the same reason: a
+    // spill episode is rare, so its first increment would otherwise be
+    // consumed as the delta baseline and the episode would go unreported.
+    metrics::counter!("tv_ticks_spilled_total", "feed" => feed.as_str()).increment(0);
 }
 
 impl TickWriter {
@@ -586,6 +687,7 @@ impl TickWriter {
                     pending: 0,
                     feed,
                     last_capture_seq: 0,
+                    spill_dir: PathBuf::from(TICK_SPILL_DIR),
                 }
             }
             Err(err) => {
@@ -600,6 +702,7 @@ impl TickWriter {
                     pending: 0,
                     feed,
                     last_capture_seq: 0,
+                    spill_dir: PathBuf::from(TICK_SPILL_DIR),
                 }
             }
         }
@@ -615,6 +718,15 @@ impl TickWriter {
     /// lives in one shared place that both constructors call.
     #[must_use]
     // TEST-EXEMPT: test-only helper used by the append/flush unit tests below.
+    /// Redirects the rescue tier at a scratch dir.
+    ///
+    /// Test-only: production always uses [`TICK_SPILL_DIR`].
+    #[cfg(test)]
+    pub fn with_spill_dir_for_test(mut self, dir: PathBuf) -> Self {
+        self.spill_dir = dir;
+        self
+    }
+
     pub fn for_test(feed: Feed) -> Self {
         register_drop_baseline(feed);
         Self {
@@ -623,6 +735,7 @@ impl TickWriter {
             pending: 0,
             feed,
             last_capture_seq: 0,
+            spill_dir: PathBuf::from(TICK_SPILL_DIR),
         }
     }
 
@@ -806,23 +919,70 @@ impl TickWriter {
         }
     }
 
-    /// Drops every buffered-but-unflushed row (poisoned-buffer defence).
+    /// Rescues every buffered-but-unflushed row to the spill tier, then clears.
     ///
-    /// Returns the discarded count and reports it LOUDLY —
-    /// `tv_ticks_dropped_total` plus a coded `error!` — so tick loss is never
-    /// silent.
+    /// Replaces a bare discard. The rows are good — today's live evidence is
+    /// `Could not flush buffer: http://localhost:9000/write: timeout: per
+    /// call`, a CLIENT-side timeout with no matching error in QuestDB's own
+    /// log, so nothing was rejected and the buffer was never poisoned. The
+    /// "poisoned-buffer defence" rationale is real but applies to a row the
+    /// SERVER refused; it was being applied to every failure alike, and 1,377
+    /// unrepeatable ticks were dropped on 2026-08-21 because of it.
+    ///
+    /// Ticks are the one payload class that cannot be re-fetched — the REST
+    /// legs' rows carry "rows are re-fetchable" in their own discard message
+    /// and are genuinely fine to drop. So this writer, and not those, gets the
+    /// rescue tier that `seal_absorption` has always had for seals.
+    ///
+    /// Returns the number of rows that left the buffer, whether rescued or
+    /// dropped, so the caller's accounting is unchanged.
     pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
         if dropped > 0 {
-            metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str())
-                .increment(dropped as u64);
-            error!(
-                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                feed = self.feed.as_str(),
-                dropped,
-                "tick auto-flush failed — buffered tick rows discarded from the \
-                 ILP buffer; these ticks are NOT in QuestDB"
-            );
+            let payload_len = self.buffer.as_bytes().len();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+            match spill_failed_ilp(&self.spill_dir, self.buffer.as_bytes(), self.feed, now) {
+                Ok(path) => {
+                    metrics::counter!(
+                        "tv_ticks_spilled_total",
+                        "feed" => self.feed.as_str()
+                    )
+                    .increment(dropped as u64);
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        feed = self.feed.as_str(),
+                        rescued = dropped,
+                        bytes = payload_len,
+                        path = %path.display(),
+                        "tick flush failed — the buffered rows were RESCUED to the tick \
+                         spill file named here, not lost. They are NOT in QuestDB yet. \
+                         Re-ingest is one command and is safe to repeat, because the \
+                         ticks dedup key carries capture_seq: \
+                         curl --data-binary @<path> http://<questdb>:9000/write"
+                    );
+                }
+                Err(err) => {
+                    // The rescue itself failed (disk full, cap reached, no
+                    // permission). Fall back to the counted drop — a spill that
+                    // cannot be written must never mask the loss.
+                    metrics::counter!(
+                        "tv_ticks_dropped_total",
+                        "feed" => self.feed.as_str()
+                    )
+                    .increment(dropped as u64);
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        feed = self.feed.as_str(),
+                        dropped,
+                        spill_error = %err,
+                        "tick flush failed AND the spill rescue also failed — these ticks \
+                         are permanently lost and nothing re-inserts them. The raw frames \
+                         remain in the write-ahead log for manual recovery."
+                    );
+                }
+            }
         }
         self.buffer.clear();
         self.pending = 0;
@@ -1624,5 +1784,141 @@ mod tests {
         w.append_tick(&sample_tick())
             .expect("append must succeed without network");
         assert_eq!(w.pending(), 1);
+    }
+
+    // -- tick ILP spill rescue (2026-08-21) ---------------------------------
+
+    /// Unique scratch dir per test — no `tempfile` dep (adding one needs
+    /// operator approval per CLAUDE.md's dependency rule).
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("tv-tick-spill-{tag}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn spill_failed_ilp_writes_the_payload_verbatim_so_it_can_be_replayed() {
+        // The whole point of storing ILP text rather than a bespoke format:
+        // the file IS a valid QuestDB /write body. If this ever stored a
+        // re-encoded shape, the documented one-command recovery would be a
+        // lie and nobody would find out until they needed it.
+        let dir = scratch_dir("verbatim");
+        let payload = b"ticks,feed=dhan,segment=IDX_I security_id=13i 1700000000000000000\n";
+        let path = spill_failed_ilp(&dir, payload, Feed::Dhan, 1_700_000_000)
+            .expect("spill writes to a fresh dir");
+        let written = std::fs::read(&path).expect("spill file is readable");
+        assert_eq!(
+            written.as_slice(),
+            payload,
+            "the spill must be byte-identical to the ILP the flush would have sent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_failed_ilp_appends_rather_than_truncating_a_second_failure() {
+        // Two failures in one hour land in the same file. Truncating would
+        // silently discard the first episode's rows while reporting both as
+        // rescued -- a false-OK inside the rescue itself.
+        let dir = scratch_dir("append");
+        let first = b"ticks first=1i 1700000000000000000\n";
+        let second = b"ticks second=2i 1700000000000000001\n";
+        let p1 = spill_failed_ilp(&dir, first, Feed::Dhan, 1_700_000_000).expect("first spill");
+        let p2 = spill_failed_ilp(&dir, second, Feed::Dhan, 1_700_000_000).expect("second spill");
+        assert_eq!(p1, p2, "same feed, same hour, same file");
+        let written = std::fs::read(&p1).expect("readable");
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(second);
+        assert_eq!(written, expected, "both episodes survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_failed_ilp_separates_feeds_and_hours() {
+        // Bounded file count with a replayable granularity: an operator
+        // repairing a known-bad window must not have to re-ingest the day.
+        let dir = scratch_dir("split");
+        let a = spill_failed_ilp(&dir, b"a\n", Feed::Dhan, 1_700_000_000).expect("a");
+        let b = spill_failed_ilp(&dir, b"b\n", Feed::Dhan, 1_700_003_600).expect("b");
+        assert_ne!(a, b, "a different hour is a different file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_dir_bytes_sums_only_files_and_survives_an_unreadable_dir() {
+        // Non-vacuity plus the fail-soft arm: failing to MEASURE the cap must
+        // not fail the rescue the cap protects, so a missing dir reads 0
+        // rather than propagating.
+        let dir = scratch_dir("bytes");
+        assert_eq!(
+            spill_dir_bytes(&dir),
+            0,
+            "a dir that does not exist reads 0"
+        );
+        spill_failed_ilp(&dir, b"0123456789", Feed::Dhan, 1_700_000_000).expect("spill");
+        assert_eq!(spill_dir_bytes(&dir), 10, "exactly the bytes written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_spill_cap_is_a_real_ceiling_not_a_suggestion() {
+        // A rescue that can fill the root volume is not a rescue: QuestDB and
+        // the frame WAL share this disk. Past the cap the rows are dropped and
+        // counted -- the same honest failure as before, never a worse one.
+        assert!(
+            TICK_SPILL_MAX_BYTES > 0 && TICK_SPILL_MAX_BYTES <= 1024 * 1024 * 1024,
+            "the cap must be a real bound well under the 200 GB volume"
+        );
+        assert_eq!(TICK_SPILL_DIR, "data/spill/ticks");
+    }
+
+    #[test]
+    fn discard_pending_on_an_empty_buffer_writes_no_spill_file() {
+        // Non-vacuity for the whole rescue: a healthy writer must never touch
+        // the spill path. Without this, a rescue that fired unconditionally
+        // would pass every test above while writing a file per flush.
+        let mut writer = TickWriter::for_test(Feed::Dhan);
+        assert_eq!(
+            writer.discard_pending(),
+            0,
+            "nothing pending, nothing rescued"
+        );
+    }
+
+    #[test]
+    fn discard_pending_rescues_real_rows_to_the_spill_instead_of_dropping_them() {
+        // The behaviour that actually matters, exercised through the REAL
+        // path rather than the helper. 1,377 unrepeatable ticks were dropped
+        // on 2026-08-21 by the code this replaces; this asserts they would
+        // now be on disk and replayable.
+        let dir = scratch_dir("rescue");
+        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        writer
+            .append_tick(&sample_tick())
+            .expect("a tick buffers without a sender");
+        assert_eq!(writer.pending(), 1, "one row is pending");
+
+        let moved = writer.discard_pending();
+
+        assert_eq!(moved, 1, "the row left the buffer");
+        assert_eq!(writer.pending(), 0, "the buffer is cleared either way");
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one spill file");
+        let body = std::fs::read_to_string(files[0].path()).expect("readable");
+        assert!(
+            body.contains("ticks"),
+            "the spill holds the ILP row, not an empty file: {body}"
+        );
+        assert!(
+            !body.is_empty(),
+            "a zero-byte rescue would report success while losing the rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

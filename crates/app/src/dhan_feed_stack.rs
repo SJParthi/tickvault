@@ -1461,20 +1461,6 @@ impl LiveIngest {
         });
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
-        // The detector's own blindness, published where its findings are.
-        //
-        // `refused_count` is non-zero when the detector ran out of slots and
-        // turned instruments away — fail-closed, which is correct, but it
-        // means the two gauges above describe a SUBSET of the universe while
-        // reading exactly like they describe all of it. Its doc comment has
-        // said "callers must surface it rather than assume silence means
-        // health" since it was written, and no caller did: every reference
-        // outside this line was a test.
-        //
-        // A detector that goes blind and reports zero silent instruments is
-        // indistinguishable from a healthy feed. That is the whole failure
-        // this detector exists to catch, arriving through the detector.
-        metrics::gauge!(SILENCE_DETECTOR_REFUSED_GAUGE).set(self.detector.refused_count() as f64);
         if let Some((_, w)) = worst {
             debug!(
                 security_id = w.key.0,
@@ -1625,6 +1611,19 @@ impl LiveIngest {
     #[must_use]
     pub fn tracked_instruments(&self) -> usize {
         self.detector.tracked_instruments()
+    }
+    /// Observations the silence detector REFUSED because its slot table was
+    /// full — the detector's own blindness.
+    ///
+    /// Non-zero means [`Self::scan_silence`] describes a SUBSET of the
+    /// universe while reading exactly as though it describes all of it. The
+    /// detector's own doc has always said callers must surface this rather
+    /// than assume silence means health; this is the accessor that lets them.
+    ///
+    /// O(1) — one field read.
+    #[must_use]
+    pub fn detector_refused(&self) -> u64 {
+        self.detector.refused_count()
     }
 
     /// Sealed candles handed to the process-wide seal writer.
@@ -2471,6 +2470,9 @@ async fn run_frame_drain(
     // once, the falling edge logs recovery at info and re-arms.
     let mut silent_scans: u32 = 0;
     let mut silence_reported = false;
+    // Latch for the detector-blindness report below. Once the slot table is
+    // full it stays full, so this fires once per session rather than every 30s.
+    let mut detector_blind_reported = false;
     /// Shortest gap between two RISK-GAP-03 pages, however many separate
     /// silence episodes occur inside it. See `last_silence_page` below.
     const SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800;
@@ -2788,6 +2790,38 @@ async fn run_frame_drain(
                 }
 
                 let (silent, never) = ingest.scan_silence(now_millis);
+
+                // The detector's own blindness, reported ONCE per episode.
+                //
+                // The gauge inside `scan_silence` publishes this every scan,
+                // but the gauge does not reach CloudWatch: it did not fit the
+                // EC2 user-data byte budget (see EMF-METRIC-SELECTOR-NOTES.md).
+                // A counter that measures a blind spot and reaches nobody is
+                // worse than no counter — the loss is measured, the
+                // measurement is discarded, and the dashboard stays green — so
+                // the coded log line is what carries it to the operator.
+                //
+                // Edge-latched rather than per-scan: once the slot table is
+                // full it stays full, so an unlatched line would repeat every
+                // 30 seconds for the rest of the session and bury everything
+                // else in the sink.
+                let refused_now = ingest.detector_refused();
+                metrics::gauge!(SILENCE_DETECTOR_REFUSED_GAUGE).set(refused_now as f64);
+                if refused_now > 0 && !detector_blind_reported {
+                    detector_blind_reported = true;
+                    error!(
+                        code = ErrorCode::RiskGapTickGap.code_str(),
+                        refused = refused_now,
+                        tracked = ingest.tracked_instruments(),
+                        "the silence detector ran out of slots and is now BLIND to \
+                         part of the universe. Its silent and never-ticked counts \
+                         describe only the instruments it still tracks, while \
+                         reading exactly as though they describe all of them — so a \
+                         silently-unsubscribed instrument among the refused ones \
+                         cannot be reported by anything. Raise the detector's \
+                         capacity or reduce the subscribed set."
+                    );
+                }
 
                 // Feed-level liveness, published UNCONDITIONALLY and before
                 // the market-hours gate below — same reasoning as the two

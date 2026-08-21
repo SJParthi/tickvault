@@ -1064,3 +1064,206 @@ run above ~4,565 and the ~12,500 packet/sec figure is arithmetic, not a
 measurement. NOT claimed: index FUTURES depth, which no authorized Dhan source
 can reach. NOT claimed: that the ~24,600 figure will be met on any given day —
 it is whatever the master resolves, bounded by the connections left after spot.
+
+## ITEM 23 (added 2026-08-21) — operator: "see evrythgin enitlrey it shdou lbe always full mode with depth 5" / "yes fix evrythgin"
+
+**Scope authority:** the dated 2026-08-21 section in
+`websocket-connection-scope-lock.md` ("FULL MODE EVERYWHERE, and the ONE segment
+that cannot take it"), recorded BEFORE this code change per the rule-file-first
+law. No new scope: no socket opened, no universe widened, `dry_run` untouched,
+§28 frozen area untouched.
+
+## Item 23 Design
+
+The 119 subscribed NSE indices have produced zero ticks since being subscribed,
+while 8,868 tradeable instruments flow normally. Root cause: the rebuilt lane
+applies ONE global feed mode to every instrument. Since 2026-08-19 that mode is
+Full (21), which requests 5 levels of order-book depth. An index has no order
+book, and Dhan answers the request with silence rather than an error.
+
+Fix: restore the per-segment split the pre-retirement lane had
+(`idx_instruments`, lost in the 2026-07-17 delete / 2026-08-09 rebuild).
+
+- `IDX_I_FEED_MODE: FeedMode = FeedMode::Quote` — one constant, one line to
+  change if the live probe says Ticker instead.
+- `feed_mode_for_segment(segment, configured)` — pure, total, O(1). Indices
+  take the override; every other segment returns `configured` UNCHANGED, so a
+  future scope-lock mode move still propagates.
+- `partition_index_batch(batch)` — pure, cold-path, zero-loss.
+- `send_subscribe` splits main-feed batches and sends one message per mode.
+  One Dhan message carries exactly one `RequestCode`, so this is structural.
+  Depth endpoints are untouched (they refuse non-NSE segments and never carry
+  an index).
+
+Files: `crates/core/src/websocket/connection.rs`.
+
+## Item 23 Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Batch with no index | Original path, byte-identical to before |
+| All-index batch | One Quote message; no empty second message (`EmptyBatch` would tear the socket down) |
+| Mixed batch | Two messages: others in configured mode, indices in Quote |
+| Non-main-feed endpoint | Never splits |
+| Batch ≤100 mixed | Each half is ≤100, so neither can trip `BatchSplit` |
+
+## Item 23 Failure Modes
+
+| Failure | Result |
+|---|---|
+| The non-index half fails to send | `?` propagates, socket torn down — indices are NOT sent against a half-subscribed socket |
+| The index half fails to send | Returned as failure; the supervisor re-subscribes |
+| Quote also refused by Dhan for IDX_I | Identical symptom (silence), caught by the unchanged RISK-GAP-03 never-ticked count — the stated verification |
+| Override wrongly applied to a real segment | Would drop ~24,600 instruments off depth-5 — pinned against by `every_other_segment_keeps_the_configured_full_mode` |
+
+## Item 23 Test Plan
+
+Seven tests in `connection.rs`, all green (51 in module):
+`feed_mode_for_segment_gives_an_index_quote_not_full`,
+`feed_mode_for_segment_keeps_full_for_every_other_segment` (non-vacuity),
+`feed_mode_for_segment_passes_the_configured_mode_through`,
+`feed_mode_for_segment_makes_a_mixed_batch_two_messages`,
+`partition_index_batch_loses_nothing_and_duplicates_nothing` (zero-loss),
+`partition_index_batch_puts_an_all_index_batch_on_one_side`,
+`partition_index_batch_with_no_index_leaves_the_original_path`.
+
+**Bite-proven:** reverting `IDX_I_FEED_MODE` to `Full` fails
+`feed_mode_for_segment_gives_an_index_quote_not_full` and
+`feed_mode_for_segment_makes_a_mixed_batch_two_messages` (verified 2026-08-21).
+
+Also CORRECTS `test_the_main_feed_payload_carries_the_full_request_code`, whose
+fixture was an `IDX_I` instrument asserting it gets code 21 — the defect written
+down as expected behaviour, the same shape as the assertion corrected in
+`a2acb6a`. Fixture is now a tradeable instrument.
+
+## Item 23 Rollback
+
+Single constant: set `IDX_I_FEED_MODE = FeedMode::Full` to restore today's
+behaviour exactly (the partition then sends two messages carrying the same
+code, which is harmless). Full revert is one file.
+
+## Item 23 Observability
+
+No new metric or alarm. The existing `RISK-GAP-03` never-ticked counter is the
+verification and is already alarmed: it has read exactly the IDX_I count every
+day (4, then 119) and must read 0 for the index set after this lands.
+
+## Item 23 Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the mode
+selection is a pure total function with non-vacuity and pass-through pins, and
+the partition has a zero-loss property test. **NOT claimed: that indices now
+tick.** Whether Dhan SERVES Quote for IDX_I on this account is UNVERIFIED-LIVE —
+the May 2026 support ticket asking exactly that has no recorded answer, and an
+older uncited note claimed Ticker is forced. If Quote is also refused the
+symptom is identical (silence) and `IDX_I_FEED_MODE` is the one line to change.
+What IS claimed: the lane no longer sends indices a request Dhan is measured to
+answer with nothing, and the failure remains loud rather than silent.
+
+## ITEM 24 (added 2026-08-21) — operator: "fix everythgin dude okay?" — live ticks had no rescue tier
+
+**Scope authority:** no scope change — no socket, no universe, no `dry_run`,
+no §28 edit, no new Telegram page (so no noise-lock row is required). This
+repairs a loss path inside code that already shipped.
+
+## Item 24 Design
+
+**Measured today:** two flush failures discarded **1,377 unrepeatable ticks**.
+Root cause, from the live error chain:
+
+```
+Caused by: Could not flush buffer: http://localhost:9000/write: timeout: per call
+```
+
+A CLIENT-side HTTP timeout. QuestDB's own container log has no error at either
+timestamp, so nothing was rejected and the buffer was never poisoned. Three
+different writers (ticks, `spot_1m_rest`, `option_chain_1m`) hit it in the same
+window, which is the signature of shared write-latency pressure rather than a
+bad row. The disk is NOT the cause — the Quote-17 EBS raise is already applied
+live (200 GB / 6000 IOPS / 500 MiB/s, verified via `describe-volumes`).
+
+`TickWriter::discard_pending` was clearing the whole buffer on ANY flush error.
+The "poisoned-buffer defence" rationale is real but applies to a row the SERVER
+refused; it was being applied to every failure alike. `seal_absorption` has had
+a ring → spill → DLQ chain for seals since the beginning; the ticks writer —
+carrying the one payload class that CANNOT be re-fetched — had no rescue tier
+at all. The REST writers' own message says "rows are re-fetchable", which is
+true for them and is exactly why they keep the plain discard.
+
+Fix: rescue to a spill tier instead of dropping.
+
+- `spill_failed_ilp(dir, payload, feed, now)` appends `Buffer::as_bytes()`
+  **verbatim**. That payload is InfluxDB line protocol — the exact body
+  QuestDB's `/write` accepts — so recovery is one command, not a bespoke
+  parser: `curl --data-binary @<file> http://<questdb>:9000/write`. Replay is
+  idempotent because the `ticks` DEDUP key carries `capture_seq`.
+- One file per feed per hour: bounded file count, and a known-bad window can be
+  replayed without re-ingesting the day.
+- `TICK_SPILL_MAX_BYTES` (512 MiB) is a real ceiling. QuestDB and the frame WAL
+  share this volume, so an unbounded rescue would trade a bounded tick loss for
+  an unbounded outage of everything. Past the cap the rows drop and are counted
+  — the same honest failure as today, never a worse one.
+- `spill_dir` is a FIELD, not a constant, so the rescue path itself is testable.
+
+Files: `crates/storage/src/tick_persistence.rs`.
+
+## Item 24 Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Empty buffer | No file written (non-vacuity test) |
+| Two failures, same feed, same hour | Appended to one file; never truncated |
+| Different hour / different feed | Separate file |
+| Spill dir missing | Created |
+| Cap reached, disk full, no permission | Falls back to the counted drop, loudly |
+| Successful flush | Rescue never runs |
+
+## Item 24 Failure Modes
+
+| Failure | Result |
+|---|---|
+| Rescue write fails | `tv_ticks_dropped_total` + `error!` naming the spill error — the loss is never masked |
+| Cap reached during a long outage | Bounded: drops resume, counted, disk protected |
+| Operator never replays a spill file | Rows are not in QuestDB. Stated plainly — this makes loss RECOVERABLE, not automatically recovered |
+
+## Item 24 Test Plan
+
+Seven tests, all green (31 in module, 46 storage suites, zero failures):
+`spill_failed_ilp_writes_the_payload_verbatim_so_it_can_be_replayed` (the
+replayability contract), `..._appends_rather_than_truncating_a_second_failure`,
+`..._separates_feeds_and_hours`,
+`spill_dir_bytes_sums_only_files_and_survives_an_unreadable_dir`,
+`the_spill_cap_is_a_real_ceiling_not_a_suggestion`,
+`discard_pending_on_an_empty_buffer_writes_no_spill_file` (non-vacuity), and
+`discard_pending_rescues_real_rows_to_the_spill_instead_of_dropping_them` —
+the last exercising the REAL path, not the helper.
+
+**Bite-proven:** forcing the rescue to fail makes 5 of them fail, including the
+end-to-end one.
+
+## Item 24 Rollback
+
+Delete the `spill_failed_ilp` call from `discard_pending`; behaviour returns to
+the bare discard. One function, one file.
+
+## Item 24 Observability
+
+New counter `tv_ticks_spilled_total{feed}`, pre-registered at 0 in
+`register_drop_baseline` for the same delta-baseline reason the drop counter is
+— a rescue episode is rare, so its first increment would otherwise be consumed
+as the baseline and go unreported. **Honestly flagged: it is NOT EMF-selected
+and has NO alarm**, matching the neighbouring counters; shipping it to
+CloudWatch is a ~$0.30/mo decision that belongs with the alarm that would read
+it. Today it is visible on `/metrics` and in the coded `error!`.
+
+## Item 24 Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the spill
+is byte-verbatim (pinned), append-not-truncate (pinned), capped (pinned),
+fail-soft to the counted drop (pinned), and never fires on a healthy writer
+(pinned) — all bite-proven. **NOT claimed: that no tick is lost.** This converts
+a permanent in-memory discard into a replayable on-disk file; the rows are not
+in QuestDB until someone runs the documented curl, and past the 512 MiB cap
+they still drop. **NOT claimed: that the flush timeouts stop** — the cause is
+QuestDB write latency under the live load and is untouched here; this bounds
+the consequence, not the cause.
