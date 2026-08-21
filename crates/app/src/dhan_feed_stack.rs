@@ -4526,6 +4526,41 @@ async fn attach_depth_when_available(
         // close the loop on a universe missing ~17,000 authorized contracts,
         // which is exactly what happened live on 2026-08-20. Wait, unless
         // waiting has run out of time.
+        // ── Why the price-INDEPENDENT contracts wait here too ──────────────
+        //
+        // Index futures, stock futures and the two full index option chains
+        // (~1,380 contracts) need NO spot price — `select_contract_universe`
+        // says so at its own class-3 comment, and selects them with an empty
+        // price map. So holding them behind a STOCK-pricing quorum looks
+        // obviously wrong, and splitting the dial into "price-independent
+        // now, stock options later" looks like the fix.
+        //
+        // It is not. Analysed 2026-08-21 with the real arithmetic, and it
+        // makes the session WORSE:
+        //
+        //   5 main-feed connections x 5,000 = 25,000 slots.
+        //   The spot universe (~4,565) packs onto ONE, leaving 4 whole
+        //   connections plus ~435 spare on the spot socket ≈ 20,435 for
+        //   contracts. The authorized contract set is ~23,820, so it ALREADY
+        //   does not fit and `fit_atm_window` shrinks the window to suit.
+        //
+        //   Dialing the ~1,380 price-independent contracts FIRST gives them a
+        //   connection of their own, of which they use 28%. The other ~3,620
+        //   slots are then stranded — `plan_pool` cannot retroactively pack a
+        //   later set onto a socket already dialed — so stock options lose
+        //   ~3,620 slots, which is roughly EIGHT strikes each side off the ATM
+        //   window, every day, forever.
+        //
+        // Trading eight strikes of permanent option coverage for an earlier
+        // start on 1,380 futures is a bad trade, and the loss it avoids is
+        // bounded anyway: `pending` is ANDed with `!out_of_time` directly
+        // below, so the whole set dials at the deadline regardless of whether
+        // a single stock ever priced. The wait is bounded; the strike loss
+        // would not have been.
+        //
+        // Recorded because the split is an attractive-looking change that a
+        // reader arrives at independently — I did — and the arithmetic that
+        // rejects it is not visible from this call site.
         let pending =
             crate::dhan_contract_universe::stock_options_are_pending(&contracts) && !out_of_time;
         if pending {
@@ -6673,6 +6708,56 @@ mod tests {
         assert_eq!(pool.total_open(), 1);
     }
 
+    /// The arithmetic that makes splitting the contract dial a BAD trade.
+    ///
+    /// Dialing the ~1,380 price-independent contracts on their own connection
+    /// first looks like an obvious win — they need no spot price, so why hold
+    /// them behind a stock-pricing quorum? Because `plan_pool` cannot pack a
+    /// later set onto a socket already dialed, so that connection's unused
+    /// slots are stranded and come straight out of the ATM window.
+    ///
+    /// This pins the numbers rather than the prose. If the connection count or
+    /// the per-connection cap ever changes such that the split becomes
+    /// harmless, this test fails and the comment above gets revisited — which
+    /// is the only way a rejected-alternative note stays trustworthy.
+    #[test]
+    fn splitting_the_contract_dial_would_strand_slots_and_shrink_the_window() {
+        let per_conn = usize::try_from(
+            tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
+        )
+        .expect("per-connection cap fits usize");
+
+        // Spot packs onto one connection, so the contract half starts with
+        // four whole connections free.
+        let spot_connections = 1usize;
+        let single_dial = remaining_main_feed_capacity(spot_connections);
+
+        // A split would spend one of those four on ~1,380 contracts.
+        let price_independent = 1_380usize;
+        assert!(
+            price_independent < per_conn,
+            "the price-independent set fits in ONE connection, which is exactly \
+             why splitting strands the rest of it"
+        );
+        let after_split = remaining_main_feed_capacity(spot_connections + 1);
+
+        let stranded = single_dial
+            .saturating_sub(price_independent)
+            .saturating_sub(after_split);
+        assert!(
+            stranded > 3_000,
+            "expected a split to strand thousands of slots, computed {stranded} — \
+             if this is now small, the comment above rejecting the split is stale"
+        );
+
+        // Two legs per strike, so the stranded slots cost half that many
+        // strikes each side, spread across the priced underlyings.
+        assert!(
+            stranded / 2 > 1_500,
+            "the stranded slots are option LEGS; halving them is the strike count \
+             the ATM window loses"
+        );
+    }
     #[test]
     fn test_plan_count_for_packs_the_main_feed_and_spreads_depth() {
         let mut pool = PoolSupervisor::new();
