@@ -137,20 +137,19 @@ fn test_configs_lock_dhan_live_ws_on() {
              updated in the same PR."
         );
     }
-    // 2026-07-15: the Groww LIVE feed is retired too — prod is REST-only.
-    // (Supersedes the 2026-07-13 "Groww stays THE live feed" pin.)
+    // 2026-07-15 retired the second live feed; 2026-08-21 REMOVED it (dated
+    // authorization in websocket-connection-scope-lock.md, "2026-08-21 (THIRD
+    // quote of the day)"). The pin here used to assert its enable key was
+    // present-and-false. `FeedsConfig` now has no field to bind that key to,
+    // and there is no `deny_unknown_fields`, so serde would silently ignore a
+    // line that still reads like a live switch. Pin ABSENCE instead, in either
+    // direction — strictly stronger than the pair it replaces.
     let prod = strip_line_comments(&read("config/production.toml"));
     assert!(
-        prod.contains("groww_enabled = false"),
-        "config/production.toml must carry `groww_enabled = false` — the \
-         Groww live feed is retired (operator directive 2026-07-15; the \
-         REST-only boot emits tv_boot_completed directly)"
-    );
-    assert!(
-        !prod.contains("groww_enabled = true"),
-        "config/production.toml must NOT carry `groww_enabled = true` — \
-         re-enabling the retired Groww live lane requires a fresh dated \
-         operator quote + updating this guard in the same PR"
+        !prod.contains("groww_enabled"),
+        "config/production.toml must not carry an enable key for the removed \
+         feed — it binds to no FeedsConfig field, so serde ignores it while \
+         the line still reads as a switch that controls something"
     );
 }
 
