@@ -264,16 +264,6 @@ pub struct ApplicationConfig {
     /// opts in.
     #[serde(default)]
     pub dhan_universe: DhanUniverseConfig,
-    /// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
-    /// 2026-07-14, `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
-    /// §39). GATE 1 of the 4-gate live-fire lattice: every key default-OFF, so
-    /// an absent section leaves the entire Groww order-side dark. Read-only
-    /// order/portfolio/margin/user GETs are per-area config-gated + market-hours
-    /// -only when enabled; live order placement is hard-locked behind Gates
-    /// 2 (cargo feature) + 3 (the `GROWW_ORDER_LIVE_FIRE` const) regardless of
-    /// this config. Absent section ⇒ fully DISABLED (fail-safe default off).
-    #[serde(default)]
-    pub groww_orders: GrowwOrdersConfig,
     /// `[dhan_margin_gate]` — 🔷 DHAN pre-trade margin gate (operator
     /// directive 2026-07-14, relayed via the coordinator session — the
     /// Funds & Margin surface runs as its own dedicated build; umbrella
@@ -2151,150 +2141,11 @@ impl GrowwRestBurstTier {
     }
 }
 
-/// `[groww_orders]` — Groww ORDER-SIDE build gate (operator authorization
-/// 2026-07-14; `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
-/// §39, `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10).
-///
-/// This is GATE 1 of the 4-gate live-fire lattice (§39.2). Every field is
-/// `#[serde(default)]` = `false`, so an absent `[groww_orders]` section (or a
-/// TOML written before this build) leaves the ENTIRE Groww order-side dark —
-/// no read-only order GET, no margin/portfolio poll, and (independently)
-/// NO mutating order request. `config/base.toml` ships the section with every
-/// key `false`.
-///
-/// Two independent classes of gate:
-/// - Per-area READ-ONLY GETs (`orders_read`, `portfolio_read`, `margin_read`,
-///   `user_read`) — order/trade list+detail+status, positions, holdings,
-///   margins, user profile. When flipped `true` these run CONFIG-GATED +
-///   MARKET-HOURS-ONLY (the cold-path scheduled-read discipline). They place
-///   NO order.
-/// - `live_fire_requested` — a DECLARED INTENT flag ONLY. It is IGNORED unless
-///   Gate 3 (the hardcoded [`crate::constants::GROWW_ORDER_LIVE_FIRE`] const)
-///   is ALSO flipped in source AND the `groww_orders` cargo feature (Gate 2)
-///   is built in. Setting it `true` alone fires nothing — a config value can
-///   never, by itself, place a live Groww order. Flipping the actual
-///   live-orders enable is a SEPARATE, future, dated operator action that
-///   edits §39 + Gate 3 first.
-///
-/// Extension point: every FUTURE field on this struct MUST also be
-/// `#[serde(default)]` so older TOMLs keep deserializing byte-identically
-/// (the `GrowwSpot1mConfig` / `Spot1mRestConfig` precedent).
-#[derive(Debug, Clone, Deserialize)]
-pub struct GrowwOrdersConfig {
-    /// Read-only order/trade GETs (list, detail, status, status-by-reference,
-    /// trades). Default OFF. Market-hours-gated when enabled.
-    #[serde(default)]
-    pub orders_read: bool,
-    /// Read-only portfolio GETs (positions user + by-symbol, holdings).
-    /// Default OFF. Market-hours-gated when enabled.
-    #[serde(default)]
-    pub portfolio_read: bool,
-    /// Read-only margin GETs (user margin detail + margin calculator).
-    /// Default OFF. Market-hours-gated when enabled.
-    #[serde(default)]
-    pub margin_read: bool,
-    /// Read-only user-profile GET (the user-detail endpoint) + exceptions
-    /// surface.
-    /// Default OFF. Market-hours-gated when enabled.
-    #[serde(default)]
-    pub user_read: bool,
-    /// DECLARED-INTENT flag for placing live Groww orders. IGNORED unless the
-    /// hardcoded [`crate::constants::GROWW_ORDER_LIVE_FIRE`] const (Gate 3) is
-    /// ALSO `true` AND the `groww_orders` cargo feature (Gate 2) is built —
-    /// a config value alone can NEVER fire an order. Default OFF; flipping the
-    /// real enable is a separate future dated operator action.
-    #[serde(default)]
-    pub live_fire_requested: bool,
-    /// Read-only smart-order (GTT/OCO) GETs (get / list — the OCO reconcile
-    /// poller's read surface). Default OFF. Market-hours-gated when enabled.
-    /// (Smart Orders area, 2026-07-15.)
-    #[serde(default)]
-    pub smart_orders_read: bool,
-    /// Smart-order (GTT/OCO) MUTATION intent flag (create / modify /
-    /// cancel). Like `live_fire_requested`, IGNORED unless Gate 2 (the
-    /// `groww_orders` cargo feature) + Gate 3 (the
-    /// [`crate::constants::GROWW_ORDER_LIVE_FIRE`] const) are ALSO flipped —
-    /// a config value alone can NEVER fire a smart-order mutation.
-    /// Default OFF.
-    #[serde(default)]
-    pub smart_orders_write: bool,
-    /// OCO reconcile poller cadence in seconds (the GROWW-OCO-05 poller's
-    /// design value). Default 15.
-    #[serde(default = "default_groww_oco_reconcile_poll_secs")]
-    pub oco_reconcile_poll_secs: u64,
-    /// OCO sibling-leg cancel verification deadline in seconds — past it an
-    /// unverified sibling cancel is the GROWW-OCO-02 double-fill exposure
-    /// window. Default 30.
-    #[serde(default = "default_groww_oco_sibling_cancel_deadline_secs")]
-    pub oco_sibling_cancel_deadline_secs: u64,
-    /// Gates the zero-HTTP PAPER executor + intent ledger + paper reconciler
-    /// (ledger-only). Default OFF. Deliberately SEPARATE from `orders_read`
-    /// (which authorizes read GETs): paper mode makes ZERO HTTP calls,
-    /// including GETs — the paper lane can NEVER reach any HTTP endpoint
-    /// regardless of every other flag (enforced type-level: the reqwest
-    /// transport lives only in `oms/groww/api_client.rs`, + an import-scan
-    /// ratchet). Read GETs stay gated ONLY by the per-area `*_read` flags;
-    /// `paper_enabled` neither enables nor blocks them. Live mutations require
-    /// ALL of: the `groww_orders` cargo feature + an `orders_read`-area
-    /// runtime + `live_fire_requested = true` + `GROWW_ORDER_LIVE_FIRE = true`
-    /// — and are UNAFFECTED by `paper_enabled`. At the future live flip,
-    /// `paper_enabled == true` together with live is REFUSED at boot (one
-    /// account, one lane).
-    #[serde(default)]
-    pub paper_enabled: bool,
-    /// Fail-closed maximum order quantity a single order may request. Default
-    /// `0` = refuse-all (pending the operator's 0-vs-1 answer). A requested
-    /// quantity above this is refused BEFORE any HTTP with `GROWW-ORD-09` —
-    /// the fail-closed verdict for Groww's absent slicing endpoint (there is
-    /// no client-side split). Raising it is a conscious config change;
-    /// exchange freeze limits are exchange-published and changing, never
-    /// hardcoded.
-    #[serde(default)]
-    pub max_order_quantity: i64,
-    /// Receive-only order/position PUSH channel (Stage A, 2026-07-16) —
-    /// paper-mode observability of broker-pushed order/position updates.
-    /// Default OFF. Places NO order; a config value alone can never fire
-    /// a mutation (the §39.2 lattice is untouched).
-    #[serde(default)]
-    pub order_push_enabled: bool,
-}
-
-fn default_groww_oco_reconcile_poll_secs() -> u64 {
-    15
-}
-
-fn default_groww_oco_sibling_cancel_deadline_secs() -> u64 {
-    30
-}
-
-impl Default for GrowwOrdersConfig {
-    /// MANUAL impl (2026-07-15, Smart Orders area): the derived `Default`
-    /// would zero the u64 cadences and break the Default↔serde-default
-    /// parity (an absent `[groww_orders]` section must produce exactly
-    /// these values). Every gate bool stays FALSE (Gate 1 dark default).
-    fn default() -> Self {
-        Self {
-            orders_read: false,
-            portfolio_read: false,
-            margin_read: false,
-            user_read: false,
-            live_fire_requested: false,
-            smart_orders_read: false,
-            smart_orders_write: false,
-            oco_reconcile_poll_secs: default_groww_oco_reconcile_poll_secs(),
-            oco_sibling_cancel_deadline_secs: default_groww_oco_sibling_cancel_deadline_secs(),
-            paper_enabled: false,
-            max_order_quantity: 0,
-            order_push_enabled: false,
-        }
-    }
-}
-
 // NOTE: the pure `decide_orders_runtime(cfg, live_fire) -> RuntimeLanes`
 // resolver (the 7-row truth table, spec-flags-response FLAG-1) lands in
 // PR-A core (`oms/groww/`), NOT here — its first truth-table column is the
 // compile-time `groww_orders` cargo feature, which a pure runtime fn over
-// `(&GrowwOrdersConfig, bool)` cannot express; forcing it into `common`
+// a broker-specific config pair cannot express; forcing it into `common`
 // would misrepresent the feature gate.
 
 /// 🔷 DHAN pre-trade margin gate (`[dhan_margin_gate]`).
@@ -4694,87 +4545,10 @@ mod tests {
             order_leg_pnl: OrderLegPnlConfig::default(),
             groww_universe: GrowwUniverseConfig::default(),
             dhan_universe: DhanUniverseConfig::default(),
-            groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
             cadence: CadenceConfig::default(),
         }
-    }
-
-    /// PR-0 (Groww order-side build, §39.2 Gate 1): every `[groww_orders]`
-    /// gate defaults OFF — the safe, dark default. A missing section must
-    /// produce exactly this.
-    #[test]
-    fn test_groww_orders_config_defaults_all_off() {
-        let cfg = GrowwOrdersConfig::default();
-        assert!(!cfg.orders_read, "orders_read must default off");
-        assert!(!cfg.portfolio_read, "portfolio_read must default off");
-        assert!(!cfg.margin_read, "margin_read must default off");
-        assert!(!cfg.user_read, "user_read must default off");
-        assert!(
-            !cfg.live_fire_requested,
-            "live_fire_requested must default off — and is inert without Gate 3"
-        );
-        // Smart Orders area (2026-07-15): the two new gate bools default
-        // off; the two OCO cadences carry their design values (the manual
-        // impl Default — a derive would zero them and break the
-        // Default↔serde-default parity for an absent section).
-        assert!(!cfg.smart_orders_read, "smart_orders_read must default off");
-        assert!(
-            !cfg.smart_orders_write,
-            "smart_orders_write must default off"
-        );
-        assert_eq!(
-            cfg.oco_reconcile_poll_secs, 15,
-            "oco_reconcile_poll_secs must default to the 15s design value"
-        );
-        assert_eq!(
-            cfg.oco_sibling_cancel_deadline_secs, 30,
-            "oco_sibling_cancel_deadline_secs must default to the 30s design value"
-        );
-        assert!(
-            !cfg.paper_enabled,
-            "paper_enabled must default off (Gate 1) — the zero-HTTP paper lane is dark by default"
-        );
-        assert_eq!(
-            cfg.max_order_quantity, 0,
-            "max_order_quantity must default 0 (refuse-all) pending the operator's 0-vs-1 answer"
-        );
-        // Order-push Stage A (2026-07-16): the receive-only push channel
-        // defaults off.
-        assert!(
-            !cfg.order_push_enabled,
-            "order_push_enabled must default off (Gate 1) — the push channel is dark by default"
-        );
-    }
-
-    /// PR-0 / Smart Orders area (2026-07-15): an ABSENT `[groww_orders]`
-    /// section (empty TOML) must deserialize to EXACTLY `Default`. This pins
-    /// Default↔serde-default parity so a future removal of any
-    /// `#[serde(default…)]` attribute — which would make an absent field a
-    /// hard deserialize ERROR (the two OCO cadences) or silently zero a u64 —
-    /// fails the build. (`GrowwOrdersConfig` derives no `PartialEq`, so the
-    /// twelve fields are compared explicitly against `Default`.)
-    #[test]
-    fn test_groww_orders_config_absent_section_serde_parity() {
-        let parsed: GrowwOrdersConfig = toml::from_str("")
-            .expect("absent [groww_orders] section must parse via serde defaults");
-        let def = GrowwOrdersConfig::default();
-        assert_eq!(parsed.orders_read, def.orders_read);
-        assert_eq!(parsed.portfolio_read, def.portfolio_read);
-        assert_eq!(parsed.margin_read, def.margin_read);
-        assert_eq!(parsed.user_read, def.user_read);
-        assert_eq!(parsed.live_fire_requested, def.live_fire_requested);
-        assert_eq!(parsed.smart_orders_read, def.smart_orders_read);
-        assert_eq!(parsed.smart_orders_write, def.smart_orders_write);
-        assert_eq!(parsed.oco_reconcile_poll_secs, def.oco_reconcile_poll_secs);
-        assert_eq!(
-            parsed.oco_sibling_cancel_deadline_secs,
-            def.oco_sibling_cancel_deadline_secs
-        );
-        assert_eq!(parsed.paper_enabled, def.paper_enabled);
-        assert_eq!(parsed.max_order_quantity, def.max_order_quantity);
-        assert_eq!(parsed.order_push_enabled, def.order_push_enabled);
     }
 
     // -----------------------------------------------------------------------
