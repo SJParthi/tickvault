@@ -71,7 +71,7 @@ use tickvault_storage::option_chain_1m_persistence::{
 use tickvault_storage::rest_fetch_audit_persistence::{RestFetchAuditWriter, RestFetchOutcome};
 use tickvault_storage::spot_1m_rest_persistence::Spot1mRestWriter;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::option_chain_1m_boot::{
     ChainFetchUnpacedFailure, MoneynessWarnLatches, build_dhan_chain_audit_row,
@@ -999,6 +999,22 @@ impl CadenceExecutor for DhanCadenceExecutor {
                                 "reason" => "no_contract_id"
                             )
                             .increment(refused_zero_id);
+                            // ONE line per fire carrying the count, not one
+                            // per leg: the field is missing for the whole
+                            // chain at once, so per-leg lines would be a
+                            // ~200-line burst restating a single fact. The
+                            // count is what an operator needs -- it separates
+                            // "a few odd legs" from "the vendor stopped
+                            // sending the field", which are different
+                            // problems with different fixes.
+                            warn!(
+                                symbol,
+                                refused = refused_zero_id,
+                                legs = chain.legs.len(),
+                                "option marks refused: the chain carried no contract id \
+                                 for these legs, so they cannot be marked -- paper \
+                                 positions on them keep their last mark until it returns"
+                            );
                         }
                     }
                     None => {
@@ -1007,6 +1023,18 @@ impl CadenceExecutor for DhanCadenceExecutor {
                             "reason" => "unknown_underlying"
                         )
                         .increment(chain.legs.len() as u64);
+                        // The whole chain is unmarkable, so this is louder
+                        // than the per-leg case: it means an underlying
+                        // reached the chain leg that the segment mapping does
+                        // not know, and every option on it is silently
+                        // unpriced until the mapping learns it.
+                        warn!(
+                            symbol,
+                            legs = chain.legs.len(),
+                            "option marks refused for the ENTIRE chain: no contract \
+                             segment is known for this underlying, so none of its \
+                             options can be marked -- add it to the segment mapping"
+                        );
                     }
                 }
             }
