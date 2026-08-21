@@ -1685,3 +1685,115 @@ a comment saying why — and the comment itself had to avoid a bare brace for th
 same reason, which is a fair measure of how easy this is to trip. Hardening the
 scanner to ignore braces inside string and comment tokens is a real improvement
 and a separate change to a hook; it is deliberately not bundled here.
+
+---
+
+## ITEM 28 (added 2026-08-21) — operator: "Go ahead wirh your recommendation… check this every nook and corner with assurance and guarantee"
+
+**Status:** VERIFIED
+
+### Design
+
+Four parallel audits (Rust-only, O(1)/uniqueness/dedup, hot-path allocation,
+common-runtime/scalable) plus the two fixes and the alarms they justified.
+
+**1. The spill tier becomes visible (alarms).** Authorized by the dated §2.3c row
+in `dhan-rest-only-noise-lock-2026-07-14.md`. Three metrics join the EMF selector
+(both copies, byte-identical); two carry market-hours-gated alarms;
+`replayed_bytes` ships without one deliberately — it is the SUCCESS signal, and a
+chart of recoveries makes the two failure alarms interpretable without adding a
+third pager. ~$1.10/mo.
+
+**2. A gap I invented, corrected.** The message asking for that authorization
+claimed `tv_ws_frame_wal_reinjected_dropped_total` was "not EMF-selected and has
+no alarm". **Both halves were false** — it is in the selector, and
+`live-lane-alarms.tf:354` pages on it at threshold 1. So ITEM 26's six refusal
+paths already feed a counter that ships and pages, which is a better outcome than
+was claimed. Recorded in §2.3c rather than quietly enjoyed: an over-stated gap
+sends the next session hunting for something that is not there.
+
+**3. Hot path — the DHAT gate did not measure production.** Every existing gate
+built a **Quote** (code 4, 50 B) packet with **no depth sink**. Production is
+`FeedMode::Full` (code 8, 162 B, five depth levels) and the boot site wires
+`with_inline_depth` unconditionally — so the branch doing the most per-packet work
+was measured by nothing. That is the `record_ws_lag` failure mode exactly: that
+path allocated twice per tick for months while three correct comments warned
+against it, and a DHAT test, not a comment, is what caught it.
+`full_mode_frame_with_inline_depth_does_not_allocate_per_tick` closes it.
+**MEASURED: 19 allocation blocks over 10,000 ticks and 100,000 depth-row appends**
+— the depth fold is allocation-free at production scale, which was previously
+unknown rather than known. Ceiling set at 500, not a round 60,000: a per-tick
+allocation would land at 10,000+, and a slack ceiling is a gate that passes while
+the thing it guards regresses.
+
+**4. Rust-only hole SEVEN.** `is_command_position` asked whether the prefix ENDED
+WITH one of nine strings. `run: npx`, `RUN npm ci`, `ExecStart=/usr/bin/node`,
+`sudo`, `exec`, `env` end with none of them — and it is the ONLY detector for
+eleven runtimes, so all eleven were invisible in the dominant CI, Docker and
+systemd forms simultaneously. Replaced with a prefix PARSER: the question moved
+from "does it end with a known separator?" to "is the prefix entirely made of
+things that precede a command?". The second has a bounded answer; the first has
+the endless list that has now been wrong seven times. Live tree was and is clean.
+
+### Edge Cases
+
+- `echo "SSM managed node"` must NOT count — `echo` is deliberately not a command
+  introducer. Six must-NOT-count fixtures pin this; the false-positive half is the
+  half that matters, because a guard whose first act is a false positive teaches
+  the reader to allowlist it.
+- `node_modules` is not `node` — a fixture that started on the must-count list by
+  mistake, where the guard was right and the test was wrong. Moved to the
+  must-NOT-count list, where it is a genuinely useful assertion.
+- A depth packet of all zeros could be short-circuited, so the DHAT fixture fills
+  every level with non-zero values and asserts the EXACT row count
+  (`FRAMES × 4 × 10`), not `> 0`.
+
+### Failure Modes
+
+- **HONEST LIMIT, recorded not papered over:** an env-var prefix
+  (`FOO=bar node app.js`) is still not covered. After the `=` split the remainder
+  is a bare word, and accepting bare words makes `managed node` a hit. A miss is a
+  false negative; the alternative is a false-positive engine.
+- The browser guard counts `<script` TAGS, not JavaScript — so §0.1's claim that
+  it "pins browser code inside `.rs`" overstates it. Verified clean today.
+- The lockfile check lists native BUILD systems, not embedded INTERPRETERS
+  (`pyo3`, `mlua`, `rhai`, `deno_core`, …), which would ship an interpreter inside
+  the Rust binary with nothing to detect. Verified: zero present today.
+
+### Test Plan
+
+- `full_mode_frame_with_inline_depth_does_not_allocate_per_tick` — measured, tight
+  ceiling, exact-row-count non-vacuity.
+- SCOPE FIX #10: eleven must-count forms, six must-NOT-count forms. **Bite-proven
+  both ways** — deleting one introducer turns `RUN npm ci` red; restoring it green.
+- EMF name-count ratchet updated 73 → 76 with a dated cost note, as that guard
+  requires; it caught the change exactly as designed.
+
+Verification: 65 common suites · 928 storage lib · 1,536 app lib · the four app
+guards touching changed files — all ok. fmt clean; CI-equivalent clippy clean.
+
+### Rollback
+
+Every part is additive and independently revertible: the alarms are two terraform
+resources plus three selector names; the DHAT gate is one test; the parser is one
+function with its fixtures.
+
+### Observability
+
+Three metrics now ship; two page. See §2.3c for the cost line and the deliberate
+no-alarm-on-success decision.
+
+### Per-Item Guarantee Matrix
+
+Cross-referenced to `.claude/rules/project/per-wave-guarantee-matrix.md`. Rows
+specific to this item:
+
+- **Monitoring** — the spill tier goes from log-only to shipped-and-paged.
+- **Code performance** — the production packet shape is now DHAT-gated and
+  measured at 19 blocks / 10,000 ticks.
+- **Security hardening** — the interpreter ban now detects the invocation forms
+  that dominate CI, Docker and systemd.
+- **Extreme check** — three ratchets, all bite-proven; the EMF count ratchet
+  proved itself by refusing the change until the cost note was written.
+- **O(1)** — four new table rows, each with REACHABILITY stated, because a
+  complexity number without reachability is not a decision.

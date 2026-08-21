@@ -683,10 +683,30 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // COST: one additional EMF metric, ~$0.30/mo, plus its alarm at ~$0.10/mo.
     // One series, since the reason label folds. Authorization for the alarm is
     // the dated §2.3b row in dhan-rest-only-noise-lock-2026-07-14.md.
+    // 2026-08-21 — 73 -> 76: the SPILL TIER becomes visible.
+    //
+    // tv_ticks_spilled_total, tv_tick_spill_replay_failed_total and
+    // tv_tick_spill_replayed_bytes_total. The rescue tier had NO CloudWatch
+    // presence at all: an ILP flush failing and being rescued to disk, and the
+    // automatic drain failing to put it back, were both visible only in the
+    // box's own log. A spill that is never drained becomes a real tick loss at
+    // the 512 MiB cap, and nothing outside the box would have said so.
+    //
+    // Two carry alarms (tv-<env>-ticks-spilling, tv-<env>-tick-spill-replay-failing,
+    // both market-hours gated); replayed_bytes ships WITHOUT one deliberately —
+    // it is the SUCCESS signal, and a chart of recoveries belongs beside the two
+    // failure alarms without adding a third pager. That is the one exception to
+    // this ratchet's own "a metric with nothing watching it is the
+    // paid-for-and-unwatched shape" rule, and it is exercised knowingly: the
+    // success series is what makes the two failure alarms interpretable.
+    //
+    // +3 names ~= $0.90/mo, +2 alarms ~= $0.20/mo => ~$1.10/mo against the $130
+    // kill-ceiling (90% action line $117). Authorization: the dated §2.3c row in
+    // dhan-rest-only-noise-lock-2026-07-14.md.
     assert_eq!(
         names.len(),
-        73,
-        "Z+ L2 VERIFY ratchet: expected exactly 72 names in the MAIN EMF \
+        76,
+        "Z+ L2 VERIFY ratchet: expected exactly 76 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
