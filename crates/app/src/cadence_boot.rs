@@ -78,13 +78,29 @@ pub fn spawn_cadence_scheduler(
     // flags (fix round 2026-07-17) — see the deps wiring below.
     _feed_runtime: &Arc<FeedRuntimeState>,
     notifier: &Arc<NotificationService>,
-    // Order-runtime mark tap (2026-07-18): threaded into the GROWW
-    // executor ONLY — the Dhan executor must NEVER carry it (Dhan sids
-    // 13/25/51 are a different id space than the Groww-native u64s the
-    // paper book keys on; cross-feeding would double-key instruments
-    // invisibly to the first-seen-segment tripwire). `None` when
-    // `[order_runtime]` is disabled.
-    groww_mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
+    // Order-runtime mark tap. `None` when `[order_runtime]` is disabled.
+    //
+    // 2026-08-21 — THIS NOW GOES TO DHAN, and the rule it replaces was the
+    // exact opposite: "threaded into the GROWW executor ONLY — the Dhan
+    // executor must NEVER carry it (Dhan sids 13/25/51 are a different id
+    // space than the Groww-native u64s the paper book keys on;
+    // cross-feeding would double-key instruments invisibly to the
+    // first-seen-segment tripwire)."
+    //
+    // That rule was correct and is not being overruled — its PREMISE is
+    // gone. It described two live brokers marking one paper book in two id
+    // spaces, where the same NIFTY is filed under two keys and a position
+    // opened against one is never marked. The operator's 2026-08-21
+    // directive removes Groww, so exactly one id space remains and there is
+    // nothing left to collide with.
+    //
+    // The ordering is therefore load-bearing, and this is the ONE site that
+    // enforces it: the Groww executor is handed `None` in the SAME
+    // expression that hands the tap to Dhan. Arming Dhan while Groww still
+    // marks would re-create the original hazard, and keeping the parameter
+    // singular is what makes that impossible to do by accident — there is
+    // no second forwarder to give away.
+    mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
     // Shared leg-identity handle (2026-07-19): the cadence executor publishes
     // the daily option-leg identity index into this ArcSwap; the order-leg
     // P&L boot consumer reads it lock-free.
@@ -105,6 +121,9 @@ pub fn spawn_cadence_scheduler(
         // executors own the SPOT1M-01/CHAIN-02 escalation edges now that
         // the legacy per-minute loops stand down.
         Some(Arc::clone(notifier)),
+        // The mark tap (2026-08-21) — see the parameter's own note for why
+        // this moved here from Groww and why the two must move together.
+        mark_forwarder,
     ) {
         Ok(exec) => Arc::new(exec),
         Err(err) => {
@@ -122,7 +141,11 @@ pub fn spawn_cadence_scheduler(
     let groww_executor = match GrowwCadenceExecutor::new(
         &config.questdb,
         Some(Arc::clone(notifier)),
-        groww_mark_forwarder,
+        // 2026-08-21: the Groww lane no longer marks the paper book. NOT a
+        // config flag — a structural `None`, so the Groww lane cannot mark
+        // even if its config is re-enabled by hand. One id space, one
+        // producer.
+        None,
         leg_identity_index,
     ) {
         Ok(exec) => Arc::new(exec),
