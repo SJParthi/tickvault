@@ -908,8 +908,64 @@ const REPLAYING_SUBDIR: &str = "replaying";
 /// re-captured into the live pipeline. NEVER re-globbed by `replay_all`.
 const ARCHIVE_SUBDIR: &str = "archive";
 
+/// Largest total frame payload `replay_all` will hold in RAM at once.
+///
+/// # The failure this bounds
+///
+/// `replay_all` globbed every live `*.wal` segment and materialised EVERY
+/// frame into one `Vec` with no cap. That is survivable when the WAL holds a
+/// crash's worth of frames, and it is not what the WAL holds: `confirm_replayed`
+/// has exactly ONE production call site — at boot — so live segments are never
+/// archived DURING a session. Every morning's boot therefore re-read the whole
+/// previous trading session.
+///
+/// At the authorized 25,000-instrument scale that is Full mode's 162 B/packet
+/// × ~12,500 packets/sec × a 6.7-hour session ≈ **48 GB** on a 32 GiB host —
+/// an OOM at boot, before a single tick of the new session. At today's 4,565
+/// SIDs it is already ≈ 9 GB. The process would die in the one place where
+/// dying costs the most: holding the only copy of yesterday's unconfirmed
+/// frames.
+///
+/// # Why a byte budget is SAFE here, specifically
+///
+/// A segment that `replay_all` does not consume is left as `*.wal`, and this
+/// module's own crash-safety invariant already says such a segment is
+/// re-globbed on the next boot — verbatim, "which is STILL re-globbed next
+/// boot — never worse". So a partial replay strands nothing: it defers. The
+/// budget converts an unbounded allocation into a bounded one whose remainder
+/// is picked up by machinery that already exists and is already tested.
+///
+/// # Honest cost
+///
+/// Frames past the budget are recovered on a LATER boot rather than this one,
+/// and until then they are on disk rather than in the database. That is a real
+/// degradation and it is the right trade: bounded-and-late beats
+/// unbounded-and-dead, because an OOM recovers nothing at all and takes the
+/// box down with it. The deferral is COUNTED and logged, never silent.
+///
+/// 512 MiB is ~3.3 M Full-mode packets — far more than any real crash window —
+/// and 1/64th of the 32 GiB host, so it cannot itself be the thing that OOMs.
+pub const WAL_REPLAY_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+/// Counter: segments `replay_all` deferred to the next boot for the budget.
+pub const WAL_REPLAY_DEFERRED_COUNTER: &str = "tv_wal_replay_deferred_segments_total";
+
 // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_replay_handles_missing_dir + test_replay_detects_crc_corruption + test_unconfirmed_segment_is_rereplayed_on_next_boot + test_confirmed_segment_is_not_rereplayed
 pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
+    replay_all_with_budget(wal_dir, WAL_REPLAY_MAX_BYTES)
+}
+
+/// [`replay_all`] with an injectable RAM budget.
+///
+/// Separated so the budget's SAFETY can be tested without a 512 MiB fixture.
+/// What needs proving is not the number — it is that a segment the budget
+/// stopped short of is still a `*.wal` file afterwards, and a test that has to
+/// allocate half a gigabyte to reach that branch would not be written.
+// TEST-EXEMPT: covered by replay_budget_defers_unread_segments_instead_of_staging_them + every replay_all test above
+pub fn replay_all_with_budget<P: AsRef<Path>>(
+    wal_dir: P,
+    budget_bytes: usize,
+) -> anyhow::Result<Vec<ReplayedFrame>> {
     let wal_dir = wal_dir.as_ref();
     if !wal_dir.exists() {
         return Ok(Vec::new()); // APPROVED: boot-time WAL replay, cold path
@@ -938,15 +994,47 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
 
     let mut frames = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut corrupted = 0usize;
+    // Bytes of frame payload held so far, and how many segments were actually
+    // read. Only the CONSUMED ones are staged below: a segment left as `*.wal`
+    // is re-globbed next boot, so deferring is safe by this module's own
+    // crash-safety invariant rather than by anything new.
+    let mut bytes_held = 0usize;
+    let mut consumed = 0usize;
 
     for path in &segments {
+        if bytes_held >= budget_bytes && consumed > 0 {
+            break;
+        }
         match replay_segment(path) {
-            Ok(mut batch) => frames.append(&mut batch),
+            Ok(mut batch) => {
+                for f in &batch {
+                    bytes_held = bytes_held.saturating_add(f.frame.len());
+                }
+                frames.append(&mut batch);
+            }
             Err(err) => {
                 corrupted += 1;
                 error!(segment = ?path, error = %err, "WAL segment corrupted; skipping");
             }
         }
+        consumed += 1;
+    }
+    let deferred = segments.len().saturating_sub(consumed);
+    if deferred > 0 {
+        metrics::counter!(WAL_REPLAY_DEFERRED_COUNTER).increment(deferred as u64);
+        error!(
+            code = ErrorCode::WsSpill02FrameDropped.code_str(),
+            deferred_segments = deferred,
+            consumed_segments = consumed,
+            bytes_held,
+            budget_bytes,
+            "WAL replay hit its RAM budget and DEFERRED the remaining segments \
+             to the next boot. Nothing is stranded — an unconsumed segment stays \
+             a `*.wal` file and is re-globbed next boot — but those frames are on \
+             disk rather than in the database until then. A budget hit every boot \
+             means the WAL is growing faster than replay drains it, which is a \
+             capacity problem, not a recovery one."
+        );
     }
 
     info!(
@@ -974,7 +1062,11 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
     // Best-effort, like the prior archive move: a failed move leaves the
     // segment as `*.wal`, which is STILL re-globbed next boot — never worse.
     drop(std::fs::create_dir_all(&replaying_dir)); // O(1) EXEMPT: boot replay staging move, cold path
-    for seg in &segments {
+    // ONLY the segments actually read. Staging one that was never replayed
+    // would hand it to `confirm_replayed`, which archives it — and an archived
+    // segment is NEVER re-globbed, so its frames would be lost for good. This
+    // slice is the whole safety of the budget above.
+    for seg in segments.iter().take(consumed) {
         if let Some(name) = seg.file_name() {
             let dst = replaying_dir.join(name);
             // A leftover that was re-read from `replaying/` renames onto
@@ -1717,6 +1809,60 @@ mod tests {
         );
         assert_eq!(recovered[0].frame, vec![3, 1, 4, 1]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// The budget must DEFER, never DROP.
+    ///
+    /// The whole safety of `WAL_REPLAY_MAX_BYTES` rests on one thing: a
+    /// segment the budget stopped short of must still be a `*.wal` file
+    /// afterwards, so the next boot re-globs it. If it were staged into
+    /// `replaying/` instead, `confirm_replayed` would archive it — and an
+    /// archived segment is never re-globbed, so its frames would be gone for
+    /// good. That is the difference between deferring recovery and destroying
+    /// it, and nothing about the two paths looks different at the call site.
+    #[test]
+    fn replay_budget_defers_unread_segments_instead_of_staging_them() {
+        let dir = tmp_dir("replay-budget-defer");
+
+        // Two segments: each spill instance closes its own file on drop, so
+        // two sequential lifetimes give two separate `*.wal` segments.
+        for _ in 0..2 {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![7u8; 64]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let before = wal_segments_in(&dir).len();
+        assert!(
+            before >= 2,
+            "fixture must produce at least two segments, found {before}"
+        );
+
+        // Budget 1 byte: the first segment is read (the `consumed > 0` guard
+        // guarantees forward progress), the rest are deferred.
+        let first = replay_all_with_budget(&dir, 1).expect("replay");
+        assert!(
+            !first.is_empty(),
+            "at least one segment must always be read — otherwise an oversized \
+             segment would be deferred on every boot forever, which is a \
+             permanent loss wearing a deferral's clothes"
+        );
+        assert_eq!(
+            wal_segments_in(&dir).len(),
+            before - 1,
+            "exactly the consumed segment may leave `*.wal`; every deferred one \
+             must remain, or confirm_replayed will archive frames that were \
+             never replayed and they are gone for good"
+        );
+
+        // A later boot recovers the remainder: the deferral was a delay.
+        let rest = replay_all_with_budget(&dir, usize::MAX).expect("replay");
+        assert!(
+            !rest.is_empty(),
+            "the deferred frames must be recoverable on a later boot"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
