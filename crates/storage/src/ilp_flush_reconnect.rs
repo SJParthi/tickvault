@@ -1,19 +1,9 @@
 //! Shared ILP flush-reconnect ladder primitives.
 //!
-//! **The Groww live-tick writer that originally lived here was DELETED
-//! 2026-07-15** with the Groww live feed (operator directive: "remove the
-//! whole Groww live feed; keep only spot 1m and option chain for both
-//! brokers"). Groww rows in the shared `ticks` table are historical; the
-//! REST legs write their own tables (`spot_1m_rest` / `option_chain_1m` /
-//! `option_contract_1m_rest`).
-//!
-//! What remains is the bounded reconnect+replay ladder contract that the
-//! shared candle chain adopted from the deleted writer:
-//! [`is_connection_error`] (the pure SocketError classifier) +
-//! [`GROWW_FLUSH_RECONNECT_MAX_RETRIES`] / [`GROWW_FLUSH_RECONNECT_BACKOFF_MS`]
-//! — consumed by `shadow_candle_writer.rs` for every sealed-candle ILP flush
-//! (both feeds). Renaming the module/constants is deliberately deferred to a
-//! cosmetic follow-up (5 call sites in the shared candle writer).
+//! The bounded reconnect+replay ladder contract used by the shared candle
+//! chain: [`is_connection_error`] (the pure SocketError classifier) +
+//! [`ILP_FLUSH_RECONNECT_MAX_RETRIES`] / [`ILP_FLUSH_RECONNECT_BACKOFF_MS`]
+//! — consumed by `shadow_candle_writer.rs` for every sealed-candle ILP flush.
 
 use questdb::ErrorCode as QuestErrorCode;
 
@@ -22,13 +12,12 @@ use questdb::ErrorCode as QuestErrorCode;
 /// QuestDB outage degrades to the producer's capture-at-receipt spill/DLQ net
 /// (lock §32) instead of stalling the bridge wake forever. After these are
 /// exhausted, `flush` returns `Err` with the buffer + pending RETAINED.
-pub const GROWW_FLUSH_RECONNECT_MAX_RETRIES: usize = 3;
+pub const ILP_FLUSH_RECONNECT_MAX_RETRIES: usize = 3;
 
 /// Exponential backoff (milliseconds) slept BETWEEN reconnect attempts. Indexed
 /// by `attempt - 1`. Total wall-clock across all 3 retries ≤ 350ms, so the bridge
 /// wake is never blocked for long — well inside the open-burst recovery budget.
-pub const GROWW_FLUSH_RECONNECT_BACKOFF_MS: [u64; GROWW_FLUSH_RECONNECT_MAX_RETRIES] =
-    [50, 100, 200];
+pub const ILP_FLUSH_RECONNECT_BACKOFF_MS: [u64; ILP_FLUSH_RECONNECT_MAX_RETRIES] = [50, 100, 200];
 
 /// Pure classifier: is this questdb error a recoverable CONNECTION fault (so a
 /// reconnect + replay is worth attempting), as opposed to a structural error
@@ -86,21 +75,21 @@ mod tests {
     fn test_reconnect_backoff_schedule_caps_at_three() {
         // The retry budget is bounded — total wall-clock ≤ 350ms so the bridge
         // wake never stalls, and a sustained outage degrades to the spill net.
-        assert_eq!(GROWW_FLUSH_RECONNECT_MAX_RETRIES, 3);
-        assert_eq!(GROWW_FLUSH_RECONNECT_BACKOFF_MS, [50, 100, 200]);
+        assert_eq!(ILP_FLUSH_RECONNECT_MAX_RETRIES, 3);
+        assert_eq!(ILP_FLUSH_RECONNECT_BACKOFF_MS, [50, 100, 200]);
         assert_eq!(
-            GROWW_FLUSH_RECONNECT_BACKOFF_MS.len(),
-            GROWW_FLUSH_RECONNECT_MAX_RETRIES,
+            ILP_FLUSH_RECONNECT_BACKOFF_MS.len(),
+            ILP_FLUSH_RECONNECT_MAX_RETRIES,
             "backoff schedule length must match the retry count"
         );
-        let total_ms: u64 = GROWW_FLUSH_RECONNECT_BACKOFF_MS.iter().sum();
+        let total_ms: u64 = ILP_FLUSH_RECONNECT_BACKOFF_MS.iter().sum();
         assert!(
             total_ms <= 350,
             "total backoff must stay bounded (≤350ms), got {total_ms}ms"
         );
         // The schedule is monotonic non-decreasing (exponential-ish).
         assert!(
-            GROWW_FLUSH_RECONNECT_BACKOFF_MS
+            ILP_FLUSH_RECONNECT_BACKOFF_MS
                 .windows(2)
                 .all(|w| w[0] <= w[1]),
             "backoff must be non-decreasing"

@@ -7,7 +7,7 @@
 //! `Feed` enum lived in `api::feed_state` (the WRONG layer — `core`/`trading`/
 //! `storage` all sit BELOW `api` in the dependency flow `common ← core ← trading
 //! ← storage ← api ← app`, so they could not import it and duplicated the
-//! `"dhan"`/`"groww"` labels as scattered raw consts). Moving it to `common` —
+//! `"dhan"` labels as scattered raw consts). Moving it to `common` —
 //! which every crate depends on — gives ONE enum + ONE label fn that the writers,
 //! aggregators, parity engine, and API all share.
 //!
@@ -30,8 +30,6 @@
 pub enum Feed {
     /// Dhan (feed #1) — the primary trading feed. Binary WebSocket producer.
     Dhan,
-    /// Groww (feed #2) — sidecar NDJSON producer. Default OFF.
-    Groww,
     /// TrueData (feed #4) — the intended LIVE-TICK source (operator lock
     /// 2026-07-24, `truedata-feed-scope-2026-07-24.md`). Native Rust
     /// `wss://push.truedata.in` binary-tick producer, default OFF; its
@@ -41,9 +39,9 @@ pub enum Feed {
 
 impl Feed {
     /// The single-source list of every feed. Build every iteration / allowed-list
-    /// from this — never a hand-written `[Feed::Dhan, Feed::Groww]` literal — so a
+    /// from this — never a hand-written `[Feed::Dhan]` literal — so a
     /// future feed cannot be silently dropped from a list (NTM 2→3 lesson).
-    pub const ALL: &'static [Feed] = &[Feed::Dhan, Feed::Groww, Feed::Truedata];
+    pub const ALL: &'static [Feed] = &[Feed::Dhan, Feed::Truedata];
 
     /// The number of feeds — derived from [`Feed::ALL`] so fixed-size per-feed
     /// arrays (e.g. the live-feed health registry) grow automatically with a new
@@ -57,18 +55,16 @@ impl Feed {
     pub const fn index(self) -> usize {
         match self {
             Self::Dhan => 0,
-            Self::Groww => 1,
-            Self::Truedata => 2,
+            Self::Truedata => 1,
         }
     }
 
-    /// The stable wire-format label (`"dhan"` / `"groww"`). `const fn` so it can
+    /// The stable wire-format label (`"dhan"`). `const fn` so it can
     /// seed `const` label declarations in the storage/core writers.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Dhan => "dhan",
-            Self::Groww => "groww",
             Self::Truedata => "truedata",
         }
     }
@@ -81,18 +77,18 @@ impl Feed {
         Self::ALL.iter().copied().find(|f| f.as_str() == name)
     }
 
-    /// Whether this feed may be toggled at runtime. BOTH Dhan and Groww are
+    /// Whether this feed may be toggled at runtime. Dhan is
     /// runtime-toggleable as of PR-E (2026-06-21, operator-authorized — see
     /// `websocket-connection-scope-lock.md` "DHAN RUNTIME-TOGGLE AUTHORIZED").
     /// The Dhan *disable* direction is additionally safety-gated (orders-live) in
     /// the handler via `FeedRuntimeState::can_disable_dhan`.
     #[must_use]
     pub const fn is_runtime_toggleable(self) -> bool {
-        matches!(self, Self::Groww | Self::Dhan | Self::Truedata)
+        matches!(self, Self::Dhan | Self::Truedata)
     }
 
     /// True for lanes whose LIVE-WS transport was RETIRED by operator
-    /// directive (Dhan 2026-07-13, Groww 2026-07-15) — market data now
+    /// directive (Dhan 2026-07-13) — market data now
     /// arrives via the per-minute REST cadence pulls. Drives the honest
     /// "off by design" wording on the /feeds panel instead of the scary
     /// "switched off by operator" (operator-scare fix, 2026-07-20). A
@@ -101,7 +97,7 @@ impl Feed {
     #[must_use]
     pub const fn live_ws_retired(self) -> bool {
         match self {
-            Self::Dhan | Self::Groww => true,
+            Self::Dhan => true,
             Self::Truedata => false,
         }
     }
@@ -113,7 +109,6 @@ impl Feed {
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Dhan => "Dhan",
-            Self::Groww => "Groww",
             Self::Truedata => "TrueData",
         }
     }
@@ -130,7 +125,6 @@ mod tests {
             assert_eq!(Feed::parse(feed.as_str()), Some(feed));
         }
         assert_eq!(Feed::parse("DHAN"), None, "parse is case-sensitive");
-        assert_eq!(Feed::parse("groww_live"), None);
         assert_eq!(Feed::parse(""), None);
     }
 
@@ -144,7 +138,6 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), labels.len(), "feed labels must be unique");
         assert!(Feed::ALL.contains(&Feed::Dhan));
-        assert!(Feed::ALL.contains(&Feed::Groww));
         assert!(Feed::ALL.contains(&Feed::Truedata));
     }
 
@@ -161,12 +154,11 @@ mod tests {
 
     #[test]
     fn test_live_ws_retired_true_for_both_retired_lanes() {
-        // Operator-scare fix (2026-07-20): the Dhan + Groww live-WS lanes are
-        // retired (Dhan 2026-07-13, Groww 2026-07-15) — OFF is the designed
+        // Operator-scare fix (2026-07-20): the Dhan live-WS lane is
+        // retired (Dhan 2026-07-13) — OFF is the designed
         // state. TrueData (feed #4, operator lock 2026-07-24) is the intended
         // live-tick source, so its lane is NOT retired.
         assert!(Feed::Dhan.live_ws_retired());
-        assert!(Feed::Groww.live_ws_retired());
         assert!(
             !Feed::Truedata.live_ws_retired(),
             "TrueData live-WS lane is the intended tick source, not retired"
@@ -177,7 +169,6 @@ mod tests {
     fn test_labels_are_stable_wire_format() {
         // Pin the exact wire labels — storage DEDUP keys + the API depend on them.
         assert_eq!(Feed::Dhan.as_str(), "dhan");
-        assert_eq!(Feed::Groww.as_str(), "groww");
         assert_eq!(Feed::Truedata.as_str(), "truedata");
     }
 
@@ -190,7 +181,6 @@ mod tests {
             assert!(!feed.display_name().is_empty(), "{name} needs display_name");
         }
         assert_eq!(Feed::Dhan.display_name(), "Dhan");
-        assert_eq!(Feed::Groww.display_name(), "Groww");
         assert_eq!(Feed::Truedata.display_name(), "TrueData");
     }
 

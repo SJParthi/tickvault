@@ -30,7 +30,7 @@ use tickvault_storage::order_leg_pnl_persistence::{
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use crate::groww_cadence_executor::SharedLegIdentityIndex;
+use crate::leg_identity::SharedLegIdentityIndex;
 use crate::order_runtime::{LegPnlEvent, LegPnlKind};
 
 /// Seconds between supervised consumer respawns after an abnormal exit.
@@ -279,9 +279,7 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::*;
-    use crate::groww_cadence_executor::{
-        LegIdentityIndex, OptionLegIdentity, new_shared_leg_identity_index,
-    };
+    use crate::leg_identity::{LegIdentityIndex, OptionLegIdentity, new_shared_leg_identity_index};
 
     fn questdb_config() -> QuestDbConfig {
         QuestDbConfig {

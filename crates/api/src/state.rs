@@ -598,7 +598,6 @@ mod tests {
         use tickvault_common::config::FeedsConfig;
         let fr = Arc::new(FeedRuntimeState::from_config(&FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: true,
             ..Default::default()
         }));
         let state = SharedAppState::new_with_feed_runtime(
@@ -614,10 +613,10 @@ mod tests {
             Arc::clone(&fr),
         );
         // The accessor returns the SAME shared runtime instance we injected.
-        assert!(state.feed_runtime().is_enabled(Feed::Groww));
-        fr.set_enabled(Feed::Groww, false);
+        assert!(state.feed_runtime().is_enabled(Feed::Truedata));
+        fr.set_enabled(Feed::Truedata, false);
         assert!(
-            !state.feed_runtime().is_enabled(Feed::Groww),
+            !state.feed_runtime().is_enabled(Feed::Truedata),
             "AppState shares the one Arc — a flip is observed through it"
         );
     }

@@ -8,28 +8,12 @@
 //! 15:45 scoreboard), recompute every stored higher-timeframe candle — the
 //! 3 TFs `3m..15m` (`TfIndex::ALL` minus `M1` the baseline minus `D1`,
 //! which is excluded by design: Dhan drops D1 at the write boundary per
-//! `live-feed-purity.md` rule 10, and Groww D1 is a partial-day
-//! midnight-sealed bucket) — from its constituent `candles_1m` rows and
+//! `live-feed-purity.md` rule 10) — from its constituent `candles_1m` rows and
 //! compare EXACTLY (integer-paise OHLC, exact i64 volume).
 //!
-//! Two passes per run:
-//! - `feed='dhan'` verifies **TODAY** (amend-frozen after the close seal);
-//! - `feed='groww'` verifies the **PREVIOUS trading day**. Groww has NO
-//!   close-time force-seal — its session-tail buckets would only seal at
-//!   the IST-midnight force-seal, which NEVER RUNS on the prod schedule
-//!   (the box auto-stops at 16:30 IST and the bridge resumes from a
-//!   persisted NDJSON offset, so the tails are never rebuilt). The Groww
-//!   catch-up seal additionally requires a window end E ≤ watermark −
-//!   60s with a max pre-close watermark of 15:29:59, so EVERY window
-//!   whose effective end lands within [`GROWW_CATCHUP_MARGIN_SECS`] of
-//!   the 15:30:00 close is STRUCTURALLY absent for Groww — every final
-//!   window PLUS e.g. the 2m penultimate `[15:27, 15:29)` window
-//!   (refuter round 2, 2026-07-13). A missing un-catch-up-able tail row
-//!   takes the NON-PAGING `tail_unsealed` carve-out (counter only — no
-//!   audit row, no page); a PRESENT tail row is sealed data and is
-//!   compared normally; earlier Groww windows keep full paging
-//!   classification. Dhan finals are covered by the 15:30:05 close-time
-//!   force-seal and are never carved out.
+//! One pass per run: `feed='dhan'` verifies **TODAY** (amend-frozen after
+//! the close seal; Dhan finals are covered by the 15:30:05 close-time
+//! force-seal).
 //!
 //! The bucket grid is REIMPLEMENTED here independently (windows
 //! `[33_300 + k*S, min(+S, 55_800))` per trading day) and cross-pinned
@@ -167,20 +151,6 @@ const _: () = assert!(
     SESSION_CLOSE_SECS_OF_DAY_IST as i64 * NANOS_PER_SEC == MARKET_CLOSE_IST_NANOS,
     "session close drifted from the canonical common-crate constant"
 );
-
-/// The Groww aggregator's catch-up-seal lateness margin (refuter round 2,
-/// 2026-07-13). The Groww catch-up seal only seals a window whose end E
-/// satisfies E ≤ watermark − margin, and the max pre-close watermark is
-/// 15:29:59 — so any window whose effective end lands within this margin
-/// of the 15:30:00 close can NEVER seal intraday on the prod schedule
-/// (e.g. the 2m penultimate `[15:27, 15:29)` window, E = 55_740, plus
-/// every final window). Historically mirrored the tick aggregator's
-/// `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW` (= 60); the aggregator was
-/// DELETED in the stage-3 dead-WS sweep (2026-07-17), so this value is
-/// FROZEN here as the historical margin — it still governs the carve-out
-/// when verifying live-era Groww days (whose tail buckets were left
-/// unsealed by exactly that margin).
-pub const GROWW_CATCHUP_MARGIN_SECS: u32 = 60;
 
 /// Task slug for the once-per-trading-day delivery marker
 /// (`data/state/daily/tf-consistency-YYYY-MM-DD.marker` — Telegram
@@ -390,22 +360,6 @@ pub fn is_on_grid(secs_of_day: i64, tf_secs: u32) -> bool {
     secs_of_day >= open && secs_of_day < close && (secs_of_day - open) % i64::from(tf_secs) == 0
 }
 
-/// NEW-MEDIUM (refuter round 2): `true` when a Groww window can NEVER be
-/// catch-up-sealed intraday on the prod schedule — its effective end lands
-/// within [`GROWW_CATCHUP_MARGIN_SECS`] of the 15:30:00 close, so the
-/// `end ≤ watermark − margin` seal condition is unsatisfiable before the
-/// midnight force-seal (which never runs on the prod schedule). Catches
-/// every final window (E = 55_800); with the C2 5-frame live set no verify
-/// target has a NON-final window inside the margin (the historical carrier
-/// was the retired 2m penultimate `[15:27, 15:29)`, E = 55_740 — the exact
-/// boundary stays pinned in `test_groww_uncatchupable_tail_boundaries`).
-/// Pure.
-#[must_use]
-pub fn groww_uncatchupable_tail(end_effective_secs_of_day: u32) -> bool {
-    end_effective_secs_of_day.saturating_add(GROWW_CATCHUP_MARGIN_SECS)
-        >= SESSION_CLOSE_SECS_OF_DAY_IST
-}
-
 // ---------------------------------------------------------------------------
 // Rows, recompute + compare (pure)
 // ---------------------------------------------------------------------------
@@ -585,34 +539,17 @@ pub struct TfCompareCounts {
     pub bucket_gaps: u64,
     pub soft_tick_count: u64,
     pub volume_overflows: u64,
-    /// Un-catch-up-able tail-window stored rows ABSENT under the Groww
-    /// carve-out (window end within [`GROWW_CATCHUP_MARGIN_SECS`] of the
-    /// close — structurally unsealed on the prod schedule) — counted,
-    /// never a finding, never a page.
-    pub tail_unsealed: u64,
 }
 
 /// Compare ONE instrument's stored rows of ONE higher TF against the
 /// recompute over its (sorted, de-duplicated) 1m rows. Pure — O(rows) with
 /// a single sweep over the grid.
-///
-/// `exempt_unsealable_tail` is the Groww tail carve-out: when `true`, an
-/// ABSENT stored row on any [`groww_uncatchupable_tail`] window (its
-/// effective end within [`GROWW_CATCHUP_MARGIN_SECS`] of the 15:30 close
-/// — every final window plus e.g. the 2m penultimate `[15:27, 15:29)`
-/// window) counts `tail_unsealed` instead of a paging `missing_tf_row`
-/// (those windows never seal on the prod schedule — the 16:30 IST
-/// auto-stop precedes the midnight force-seal, and the catch-up seal's
-/// 60s lateness margin blocks them intraday). A PRESENT tail row is
-/// still compared normally, and earlier windows keep full
-/// classification. Dhan passes `false`.
 #[must_use]
 pub fn compare_tf(
     tf: TfIndex,
     rows_1m_sorted: &[CandleRow],
     stored_rows: &[CandleRow],
     day_start_ist_nanos: i64,
-    exempt_unsealable_tail: bool,
 ) -> (Vec<FindingDraft>, TfCompareCounts) {
     let tf_secs = tf.seconds_per_bucket();
     let tf_label = tf.display_name();
@@ -722,27 +659,17 @@ pub fn compare_tf(
                 }
             }
             (None, Some(rec)) => {
-                if exempt_unsealable_tail && groww_uncatchupable_tail(w.end_effective_secs_of_day) {
-                    // H1 (widened, refuter round 2) Groww tail carve-out:
-                    // an un-catch-up-able tail bucket is STRUCTURALLY
-                    // absent (no close-time force-seal; the catch-up
-                    // seal's 60s margin blocks any window ending within
-                    // it of the close; the 16:30 IST auto-stop precedes
-                    // the midnight seal) — counted, no audit row, no page.
-                    counts.tail_unsealed = counts.tail_unsealed.saturating_add(1);
-                } else {
-                    findings.push(FindingDraft {
-                        tf: tf_label,
-                        bucket_secs_of_day: start,
-                        category: FindingCategory::MissingTfRow,
-                        field: "n/a",
-                        stored_value: 0.0,
-                        recomputed_value: rec.close,
-                        stored_volume: 0,
-                        recomputed_volume: rec.volume,
-                        one_m_rows,
-                    });
-                }
+                findings.push(FindingDraft {
+                    tf: tf_label,
+                    bucket_secs_of_day: start,
+                    category: FindingCategory::MissingTfRow,
+                    field: "n/a",
+                    stored_value: 0.0,
+                    recomputed_value: rec.close,
+                    stored_volume: 0,
+                    recomputed_volume: rec.volume,
+                    one_m_rows,
+                });
             }
             (Some(s), None) => {
                 findings.push(FindingDraft {
@@ -1106,10 +1033,6 @@ pub struct PassStats {
     pub duplicates: u64,
     pub bucket_gaps: u64,
     pub soft_tick_count: u64,
-    /// Groww un-catch-up-able tail-window carve-out count (structurally
-    /// unsealed on the prod schedule) — a counter, never a finding,
-    /// never a page.
-    pub tail_unsealed: u64,
     pub query_failures: u64,
     pub rows_seen: bool,
     pub degraded: bool,
@@ -1132,7 +1055,6 @@ impl PassStats {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TfConsistencySummaryData {
     pub dhan_date_ist: String,
-    pub groww_date_ist: String,
     pub instruments: u64,
     pub buckets_compared: u64,
     pub mismatches: u64,
@@ -1140,9 +1062,6 @@ pub struct TfConsistencySummaryData {
     pub no_coverage: u64,
     pub off_grid: u64,
     pub duplicates: u64,
-    /// Groww end-of-day buckets absent BY DESIGN (never sealed on the prod
-    /// schedule) — not verified, not paged; named in the Telegram summary.
-    pub tail_unsealed: u64,
     pub degraded: bool,
     pub truncated: bool,
     pub status_label: String,
@@ -1487,12 +1406,6 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
     }
     stats.rows_seen = true;
 
-    // H1 (widened, refuter round 2): the Groww pass carves out ABSENT
-    // rows on un-catch-up-able tail windows (effective end within the
-    // 60s catch-up margin of the close — structurally unsealed on the
-    // prod schedule); Dhan finals are close-time-sealed.
-    let exempt_unsealable_tail = p.feed == "groww";
-
     // ── Per-instrument sweep ──
     let mut pass_samples: Vec<String> = Vec::new();
     let mut bad_segments: u64 = 0;
@@ -1663,20 +1576,13 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
             if stored.is_empty() && rows_1m_sorted.is_empty() {
                 continue;
             }
-            let (tf_drafts, counts) = compare_tf(
-                tf,
-                &rows_1m_sorted,
-                &stored,
-                day_start_nanos,
-                exempt_unsealable_tail,
-            );
+            let (tf_drafts, counts) = compare_tf(tf, &rows_1m_sorted, &stored, day_start_nanos);
             drafts.extend(tf_drafts);
             stats.buckets_compared = stats
                 .buckets_compared
                 .saturating_add(counts.buckets_compared);
             stats.bucket_gaps = stats.bucket_gaps.saturating_add(counts.bucket_gaps);
             stats.soft_tick_count = stats.soft_tick_count.saturating_add(counts.soft_tick_count);
-            stats.tail_unsealed = stats.tail_unsealed.saturating_add(counts.tail_unsealed);
             if counts.volume_overflows > 0 {
                 // Corrupt data — Σ(volume) overflowed i64. Degrades the run
                 // under the query_failed stage (the data was unusable).
@@ -1751,7 +1657,6 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
     // H1 (widened): Groww un-catch-up-able tail windows absent by design
     // (never sealed on the prod schedule) — visible, never silent, never
     // a page.
-    metrics::counter!("tv_tf_verify_tail_unsealed_total").increment(stats.tail_unsealed);
 
     // Soft tick_count divergence is a counter, never a page.
     metrics::counter!("tv_tf_verify_soft_divergence_total", "field" => "tick_count")
@@ -1833,15 +1738,13 @@ fn emit_pass_degrade_signal(feed: &'static str, stats: &PassStats) {
     }
 }
 
-/// Run the full daily verification: the Dhan pass for `dhan_date` (today)
-/// and the Groww pass for `groww_date` (the previous trading day; `None`
-/// degrades that leg loudly). Cold path, fail-soft; never blocks. Returns
-/// the summary for the caller to emit the typed Telegram event.
+/// Run the full daily verification: the Dhan pass for `dhan_date` (today,
+/// amend-frozen after the close seal). Cold path, fail-soft; never blocks.
+/// Returns the summary for the caller to emit the typed Telegram event.
 // TEST-EXEMPT: live-deps async orchestrator (grid/recompute/compare/classify/SQL/parse decisions are pure fns unit-tested below); wiring pinned by crates/app/tests/tf_consistency_wiring_guard.rs.
 pub async fn run_tf_consistency(
     questdb_config: &QuestDbConfig,
     dhan_date: NaiveDate,
-    groww_date: Option<NaiveDate>,
 ) -> TfConsistencySummaryData {
     ensure_tf_consistency_audit_table(questdb_config).await;
 
@@ -1850,9 +1753,6 @@ pub async fn run_tf_consistency(
         questdb_config.host, questdb_config.http_port
     );
     let dhan_label = dhan_date.format("%Y-%m-%d").to_string();
-    let groww_label = groww_date
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(TF_VERIFY_HTTP_TIMEOUT_SECS))
@@ -1870,10 +1770,9 @@ pub async fn run_tf_consistency(
                 "TF-VERIFY-02: HTTP client build failed — verification skipped (blind)"
             );
             metrics::counter!("tv_tf_verify_runs_total", "status" => RunStatus::Blind.as_str())
-                .increment(2);
+                .increment(1);
             return TfConsistencySummaryData {
                 dhan_date_ist: dhan_label,
-                groww_date_ist: groww_label,
                 instruments: 0,
                 buckets_compared: 0,
                 mismatches: 0,
@@ -1881,7 +1780,6 @@ pub async fn run_tf_consistency(
                 no_coverage: 0,
                 off_grid: 0,
                 duplicates: 0,
-                tail_unsealed: 0,
                 degraded: true,
                 truncated: false,
                 status_label: RunStatus::Blind.as_str().to_string(),
@@ -1913,40 +1811,6 @@ pub async fn run_tf_consistency(
     )
     .await;
 
-    // ── Pass 2: Groww verifies the PREVIOUS trading day (its tails seal
-    // at IST midnight — D-1 is fully stable, final buckets included).
-    let groww_stats = if let Some(date) = groww_date {
-        run_tf_pass(
-            PassParams {
-                client: &client,
-                exec_url: &exec_url,
-                feed: "groww",
-                date,
-                always_on: &always_on,
-                run_started,
-            },
-            &mut state,
-        )
-        .await
-    } else {
-        error!(
-            code = ErrorCode::TfVerify02RunDegraded.code_str(),
-            stage = "discovery",
-            feed = "groww",
-            "TF-VERIFY-02: no previous trading day found within the lookback \
-             window — the Groww pass is skipped (degraded, never a guessed date)"
-        );
-        metrics::counter!("tv_tf_verify_query_failures_total", "stage" => "discovery").increment(1);
-        // L5: no runs-verdict counter here — the flush-adjusted final
-        // classification below emits it (this synthetic degraded stats
-        // block classifies Blind there).
-        PassStats {
-            date_label: groww_label.clone(),
-            degraded: true,
-            ..PassStats::default()
-        }
-    };
-
     // ── Final audit flush (skip-when-empty is the writer's contract). A
     // failed flush discards pending rows (poisoned-buffer defense) and the
     // run must not read Pass over unpersisted findings.
@@ -1970,44 +1834,23 @@ pub async fn run_tf_consistency(
         dhan_stats.degraded || flush_degraded,
         dhan_stats.rows_seen,
     );
-    let groww_status = classify_run_status(
-        groww_stats.buckets_compared,
-        groww_stats.paging_findings(),
-        groww_stats.degraded || flush_degraded,
-        groww_stats.rows_seen,
-    );
-    let combined = combine_statuses(dhan_status, groww_status);
+    let combined = dhan_status;
 
     // L5: the runs-verdict counters are emitted HERE — after the final
     // flush fed into the per-pass classification above — so a failed
     // flush can never record status="pass" while the run reads degraded.
     metrics::counter!("tv_tf_verify_runs_total", "status" => dhan_status.as_str()).increment(1);
-    metrics::counter!("tv_tf_verify_runs_total", "status" => groww_status.as_str()).increment(1);
 
     let summary = TfConsistencySummaryData {
         dhan_date_ist: dhan_stats.date_label.clone(),
-        groww_date_ist: groww_stats.date_label.clone(),
-        instruments: dhan_stats
-            .instruments
-            .saturating_add(groww_stats.instruments),
-        buckets_compared: dhan_stats
-            .buckets_compared
-            .saturating_add(groww_stats.buckets_compared),
-        mismatches: dhan_stats
-            .mismatch_cells
-            .saturating_add(groww_stats.mismatch_cells),
-        missing_tf_rows: dhan_stats
-            .missing_tf_rows
-            .saturating_add(groww_stats.missing_tf_rows),
-        no_coverage: dhan_stats
-            .no_coverage
-            .saturating_add(groww_stats.no_coverage),
-        off_grid: dhan_stats.off_grid.saturating_add(groww_stats.off_grid),
-        duplicates: dhan_stats.duplicates.saturating_add(groww_stats.duplicates),
-        tail_unsealed: dhan_stats
-            .tail_unsealed
-            .saturating_add(groww_stats.tail_unsealed),
-        degraded: dhan_stats.degraded || groww_stats.degraded || flush_degraded,
+        instruments: dhan_stats.instruments,
+        buckets_compared: dhan_stats.buckets_compared,
+        mismatches: dhan_stats.mismatch_cells,
+        missing_tf_rows: dhan_stats.missing_tf_rows,
+        no_coverage: dhan_stats.no_coverage,
+        off_grid: dhan_stats.off_grid,
+        duplicates: dhan_stats.duplicates,
+        degraded: dhan_stats.degraded || flush_degraded,
         truncated: state.truncated,
         status_label: combined.as_str().to_string(),
         top_detail: state.top_detail,
@@ -2015,7 +1858,6 @@ pub async fn run_tf_consistency(
     info!(
         status = %summary.status_label,
         dhan_date = %summary.dhan_date_ist,
-        groww_date = %summary.groww_date_ist,
         instruments = summary.instruments,
         buckets_compared = summary.buckets_compared,
         mismatches = summary.mismatches,
@@ -2023,7 +1865,6 @@ pub async fn run_tf_consistency(
         no_coverage = summary.no_coverage,
         off_grid = summary.off_grid,
         duplicates = summary.duplicates,
-        tail_unsealed = summary.tail_unsealed,
         "tf_consistency: daily timeframe-consistency verification complete"
     );
     summary
@@ -2185,8 +2026,7 @@ pub fn spawn_tf_consistency_tasks(
                 }
             }
             let target = date_override.unwrap_or(today_ist);
-            let groww_date = previous_trading_day(&calendar, target);
-            let summary = run_tf_consistency(&qcfg, target, groww_date).await;
+            let summary = run_tf_consistency(&qcfg, target).await;
             info!("PROOF: tf_consistency verifier fired @ 15:40:00 IST");
             // F4: the forced flag rides along so the notify predicate can
             // keep a forced run's answer LOUD (no_data included).
@@ -2211,7 +2051,6 @@ pub fn spawn_tf_consistency_tasks(
                 if should_notify_summary(&status_label, forced_run) {
                     tf_notifier.notify(NotificationEvent::TfConsistencySummary {
                         dhan_date_ist: s.dhan_date_ist,
-                        groww_date_ist: s.groww_date_ist,
                         instruments: s.instruments,
                         buckets_compared: s.buckets_compared,
                         mismatches: s.mismatches,
@@ -2219,7 +2058,6 @@ pub fn spawn_tf_consistency_tasks(
                         no_coverage: s.no_coverage,
                         off_grid: s.off_grid,
                         duplicates: s.duplicates,
-                        tail_unsealed: s.tail_unsealed,
                         degraded: s.degraded,
                         truncated: s.truncated,
                         status_label: s.status_label,
@@ -2263,7 +2101,6 @@ pub fn spawn_tf_consistency_tasks(
                     warn!(
                         status = %status_label,
                         dhan_date = %s.dhan_date_ist,
-                        groww_date = %s.groww_date_ist,
                         "tf_consistency: nothing to check today (trading day) — \
                          Telegram summary suppressed (log-only; pass, failure \
                          and FORCED days still notify). If the feeds DID run \
@@ -2881,7 +2718,7 @@ mod tests {
             row(33_420, 101.5, 101.75, 98.0, 99.0, 30, 5),
         ];
         let stored = vec![row(33_300, 100.0, 102.0, 98.0, 99.0, 60, 12)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
         assert_eq!(counts.bucket_gaps, 1, "3 of 5 minutes present");
@@ -2893,7 +2730,7 @@ mod tests {
         let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
         // Stored high + volume wrong.
         let stored = vec![row(33_300, 100.0, 105.0, 99.0, 100.5, 11, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert_eq!(counts.buckets_compared, 1);
         let cats: Vec<_> = findings.iter().map(|f| (f.category, f.field)).collect();
         assert!(cats.contains(&(FindingCategory::Mismatch, "high")));
@@ -2911,7 +2748,7 @@ mod tests {
     #[test]
     fn test_compare_tf_missing_tf_row_pages_when_1m_present() {
         let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START);
         assert_eq!(counts.buckets_compared, 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
@@ -2922,7 +2759,7 @@ mod tests {
     #[test]
     fn test_compare_tf_no_1m_coverage_when_stored_over_nothing() {
         let stored = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &[], &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &[], &stored, DAY_START);
         assert_eq!(counts.buckets_compared, 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::No1mCoverage);
@@ -2932,7 +2769,7 @@ mod tests {
     fn test_compare_tf_off_grid_stored_ts_detected() {
         // A 09:16:00 "5m" row is off the 09:15-anchored grid.
         let stored = vec![row(33_360, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, _) = compare_tf(TfIndex::M5, &[], &stored, DAY_START, false);
+        let (findings, _) = compare_tf(TfIndex::M5, &[], &stored, DAY_START);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::OffGridTs);
         assert_eq!(findings[0].bucket_secs_of_day, 33_360);
@@ -2944,7 +2781,7 @@ mod tests {
         let first = row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3);
         let mut second = first;
         second.close = 999.0;
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[first, second], DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[first, second], DAY_START);
         // The duplicate is flagged; the compare ran on the FIRST row and
         // matched, so no mismatch rows.
         assert_eq!(counts.buckets_compared, 1);
@@ -2963,7 +2800,7 @@ mod tests {
             row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 1),
             row(33_600, 2.0, 2.0, 2.0, 2.0, 2, 1),
         ];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 2);
     }
@@ -2977,7 +2814,7 @@ mod tests {
             row(55_740, 10.5, 12.0, 10.0, 11.0, 5, 2), // 15:29
         ];
         let stored = vec![row(54_900, 10.0, 12.0, 9.0, 11.0, 10, 4)];
-        let (findings, counts) = compare_tf(TfIndex::M15, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M15, &ones, &stored, DAY_START);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
     }
@@ -2986,7 +2823,7 @@ mod tests {
     fn test_compare_tf_tick_count_divergence_is_soft() {
         let ones = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 5)];
         let stored = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 6)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert!(findings.is_empty(), "soft signal must not page");
         assert_eq!(counts.soft_tick_count, 1);
     }
@@ -2998,7 +2835,7 @@ mod tests {
             row(33_360, 1.0, 1.0, 1.0, 1.0, 1, 1),
         ];
         let stored = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 1)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert_eq!(counts.volume_overflows, 1);
         assert_eq!(counts.buckets_compared, 0, "corrupt window not compared");
         assert!(findings.is_empty());
@@ -3426,150 +3263,6 @@ mod tests {
     // H1 — Groww final-window tail carve-out
     // -------------------------------------------------------------------
 
-    /// H1: with the Groww carve-out ON, an ABSENT stored row on the FINAL
-    /// window counts `tail_unsealed` (no finding, no page) — the final
-    /// buckets never seal on the prod schedule.
-    #[test]
-    fn test_compare_tf_groww_final_missing_is_tail_unsealed_not_paging() {
-        // M5 final window is [15:35, 15:40) — start 56_100 (2026-08-03 NSE
-        // CAS change moved the close; 385 min still divides evenly by 5).
-        let ones = vec![row(56_100, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
-        assert!(
-            findings.is_empty(),
-            "groww final-window absence must not page: {findings:?}"
-        );
-        assert_eq!(counts.tail_unsealed, 1, "counted, never silent");
-        assert_eq!(counts.buckets_compared, 0);
-    }
-
-    /// H1: the carve-out is FINAL-window-only — a missing NON-final Groww
-    /// row is still the genuine dead-seal-leg `missing_tf_row` page.
-    #[test]
-    fn test_compare_tf_groww_nonfinal_missing_still_pages() {
-        let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
-        assert_eq!(counts.tail_unsealed, 0);
-    }
-
-    /// H1: Dhan (carve-out OFF) keeps paging a missing FINAL row — the
-    /// 15:30:05 close-time force-seal covers Dhan finals, so absence is a
-    /// real lost seal.
-    #[test]
-    fn test_compare_tf_dhan_final_missing_still_pages() {
-        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, false);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
-        assert_eq!(findings[0].bucket_secs_of_day, 55_500);
-        assert_eq!(counts.tail_unsealed, 0);
-    }
-
-    /// H1 widened (refuter round 2): the margin exemption for a NON-final
-    /// window. The historical compare_tf carrier was the retired 2m
-    /// PENULTIMATE window `[15:27, 15:29)` (E = 55_740; 55_740 + 60 ≥
-    /// 55_800 → `tail_unsealed`, never paging). With the C2 5-frame live
-    /// set NO verify target has a non-final window inside the 60 s margin
-    /// (penultimate E: 3m → 55_620, 5m → 55_500, 15m → 54_900), so only
-    /// FINAL windows (E = 55_800) are exempt — covered by
-    /// `test_compare_tf_groww_final_missing_is_tail_unsealed_not_paging`;
-    /// the exact 60 s boundary stays pinned at the predicate level in
-    /// `test_groww_uncatchupable_tail_boundaries`. This pin asserts the
-    /// structural fact itself and FIRES if a future frame (e.g. a C3
-    /// second-scale TF) re-introduces an in-margin non-final window as a
-    /// compare target — forcing a conscious compare_tf-level re-pin.
-    #[test]
-    fn test_no_verify_target_has_nonfinal_window_inside_catchup_margin() {
-        for tf in tf_verify_targets() {
-            let penult_end = SESSION_CLOSE_SECS_OF_DAY_IST - tf.seconds_per_bucket();
-            assert!(
-                !groww_uncatchupable_tail(penult_end),
-                "{tf:?} penultimate window (E = {penult_end}) sits inside \
-                 the 60 s catch-up margin — the non-final exemption case is \
-                 reachable again; re-pin a compare_tf-level test for it"
-            );
-        }
-    }
-
-    /// H1 widened: the 3m PENULTIMATE window (`[15:24, 15:27)`,
-    /// E = 55_620; 55_620 + 60 < 55_800) is catch-up-able — an absent
-    /// Groww row there still pages `missing_tf_row`.
-    #[test]
-    fn test_compare_tf_groww_3m_penultimate_missing_still_pages() {
-        let ones = vec![row(55_440, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M3, &ones, &[], DAY_START, true);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
-        assert_eq!(findings[0].bucket_secs_of_day, 55_440);
-        assert_eq!(counts.tail_unsealed, 0);
-    }
-
-    /// H1 widened: the 5m PENULTIMATE window `[15:20, 15:25)` has
-    /// E = 55_500; 55_500 + 60 < 55_800 → NOT exempt — an absent Groww row
-    /// there still pages (the widening is margin-exact, not
-    /// last-two-windows).
-    #[test]
-    fn test_compare_tf_groww_5m_penultimate_missing_still_pages() {
-        let ones = vec![row(55_200, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
-        assert_eq!(findings[0].bucket_secs_of_day, 55_200);
-        assert_eq!(counts.tail_unsealed, 0);
-    }
-
-    /// Refuter round 2: the pure tail predicate — boundary-exact against
-    /// the 60s catch-up margin.
-    #[test]
-    fn test_groww_uncatchupable_tail_boundaries() {
-        // Final windows always end at 15:30:00 → exempt.
-        assert!(groww_uncatchupable_tail(SESSION_CLOSE_SECS_OF_DAY_IST));
-        // Exactly margin before the close (E = 55_740) → exempt.
-        assert!(groww_uncatchupable_tail(
-            SESSION_CLOSE_SECS_OF_DAY_IST - GROWW_CATCHUP_MARGIN_SECS
-        ));
-        // One second earlier (E = 55_739) → catch-up-able, NOT exempt.
-        assert!(!groww_uncatchupable_tail(
-            SESSION_CLOSE_SECS_OF_DAY_IST - GROWW_CATCHUP_MARGIN_SECS - 1
-        ));
-        // Mid-session windows are never exempt.
-        assert!(!groww_uncatchupable_tail(
-            SESSION_OPEN_SECS_OF_DAY_IST + 300
-        ));
-    }
-
-    /// The verifier's margin is FROZEN at the historical aggregator value
-    /// (60 s). The cross-crate tripwire against
-    /// `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW` was retired with the tick
-    /// aggregator (stage-3 dead-WS sweep, 2026-07-17) — this local pin keeps
-    /// the historical carve-out value asserted.
-    #[test]
-    fn test_groww_catchup_margin_frozen_at_historical_value() {
-        assert_eq!(
-            GROWW_CATCHUP_MARGIN_SECS, 60,
-            "GROWW_CATCHUP_MARGIN_SECS is the FROZEN historical Groww \
-             catch-up margin — changing it silently re-classifies which \
-             live-era tail buckets the carve-out exempts"
-        );
-    }
-
-    /// H1: a PRESENT Groww final row is sealed data — it is compared
-    /// normally and a mismatch still pages even with the carve-out ON.
-    #[test]
-    fn test_compare_tf_groww_final_present_mismatch_still_pages() {
-        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        // Stored final row exists but its high disagrees.
-        let stored = vec![row(55_500, 100.0, 105.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, true);
-        assert_eq!(counts.buckets_compared, 1);
-        assert_eq!(counts.tail_unsealed, 0);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].category, FindingCategory::Mismatch);
-        assert_eq!(findings[0].field, "high");
-    }
-
     // -------------------------------------------------------------------
     // H2 — state-independent always-on exclusion
     // -------------------------------------------------------------------
@@ -3609,7 +3302,7 @@ mod tests {
         // still a paging finding (the exclusion never swallows off_grid
         // for normal instruments), carve-out flag irrelevant.
         let stored = vec![row(33_360, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, _) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, true);
+        let (findings, _) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
         assert!(
             findings
                 .iter()
@@ -3750,10 +3443,12 @@ mod tests {
             .expect("the M3 once-per-pass emission block must exist");
         assert!(loop_start < post_loop);
         let loop_region = &body[loop_start..post_loop];
+        // `tv_tf_verify_tail_unsealed_total` left this list on 2026-08-21:
+        // the tail carve-out it counted only ever applied to the retired
+        // feed's structurally-unsealed session tails.
         for counter in [
             "tv_tf_verify_buckets_compared_total",
             "tv_tf_verify_bucket_gap_total",
-            "tv_tf_verify_tail_unsealed_total",
         ] {
             assert!(
                 !loop_region.contains(counter),

@@ -7,7 +7,7 @@
 //!
 //! Since 2026-07-17 BOTH lanes run the REAL broker executors
 //! ([`crate::dhan_cadence_executor::DhanCadenceExecutor`] +
-//! [`crate::groww_cadence_executor::GrowwCadenceExecutor`]) — one bounded
+//! the Dhan cadence executor) — one bounded
 //! request per fire, runner-owned pacing/retry/ladder, persist-then-fold
 //! spot bars, RAM chain-snapshot publish. The RS3 mutual exclusion
 //! (config.rs) guarantees the legacy per-minute legs are OFF whenever the
@@ -37,7 +37,6 @@ use tokio::sync::Notify;
 use tracing::{error, info};
 
 use crate::dhan_cadence_executor::DhanCadenceExecutor;
-use crate::groww_cadence_executor::GrowwCadenceExecutor;
 
 /// Once-per-process guard: the fast crash-recovery arm and the
 /// process-global prefix both call [`spawn_cadence_scheduler`]; only the
@@ -104,7 +103,7 @@ pub fn spawn_cadence_scheduler(
     // Shared leg-identity handle (2026-07-19): the cadence executor publishes
     // the daily option-leg identity index into this ArcSwap; the order-leg
     // P&L boot consumer reads it lock-free.
-    leg_identity_index: crate::groww_cadence_executor::SharedLegIdentityIndex,
+    leg_identity_index: crate::leg_identity::SharedLegIdentityIndex,
 ) -> Option<Arc<Notify>> {
     if !config.cadence.enabled {
         info!("cadence: disabled by [cadence] config — nothing spawned");
@@ -138,29 +137,12 @@ pub fn spawn_cadence_scheduler(
             return None;
         }
     };
-    let groww_executor = match GrowwCadenceExecutor::new(
-        &config.questdb,
-        Some(Arc::clone(notifier)),
-        // 2026-08-21: the Groww lane no longer marks the paper book. NOT a
-        // config flag — a structural `None`, so the Groww lane cannot mark
-        // even if its config is re-enabled by hand. One id space, one
-        // producer.
-        None,
-        leg_identity_index,
-    ) {
-        Ok(exec) => Arc::new(exec),
-        Err(err) => {
-            metrics::counter!("tv_http_client_build_failed_total", "site" => "cadence_groww_executor")
-                .increment(1);
-            error!(
-                code = ErrorCode::HttpClient01BuildFailed.code_str(),
-                site = "cadence_groww_executor",
-                %err,
-                "HTTP-CLIENT-01: Groww cadence executor client build failed — cadence scheduler NOT spawned this attempt"
-            );
-            return None;
-        }
-    };
+    // 2026-08-21: the Groww cadence executor was the SOLE publisher of the
+    // leg-identity index. With the Groww feed removed there is no publisher,
+    // so `order_leg_pnl_boot` reads `None` and persists counted identity
+    // sentinels. FLAGGED: wiring the Dhan executor to publish this index is
+    // a follow-up, not part of the removal.
+    let _ = leg_identity_index;
     if CADENCE_SPAWNED.swap(true, Ordering::SeqCst) {
         // The other boot path already spawned it this process.
         return None;
@@ -196,18 +178,13 @@ pub fn spawn_cadence_scheduler(
                 &questdb,
             )
             .await;
-            tickvault_storage::cross_fill_audit_persistence::ensure_cross_fill_audit_table(
-                &questdb,
-            )
-            .await;
         }));
     }
     // 2026-07-17 (review fix S7): the legacy 15:33:30 IST post-session
     // repair sweep died with the leg loops — without it a cadence
     // per-minute miss is a PERMANENT spot_1m_rest gap. One-shot Dhan-lane
     // sweep task reusing the legacy sweep body + PACED fetch (post-session
-    // — limiter pacing is fine). Groww residual: the Groww sweep needs the
-    // leg's target resolution + token cache; not wired here.
+    // — limiter pacing is fine).
     if config.cadence.dhan_lane {
         drop(tokio::spawn(
             crate::spot_1m_rest_boot::run_cadence_post_session_sweep(
@@ -217,16 +194,6 @@ pub fn spawn_cadence_scheduler(
             ),
         ));
     }
-    // Cross-fill visibility (operator 2026-07-20): install the audit sink +
-    // consumer BEFORE the runner spawns (no emit can race the install), and
-    // arm the 15:47 IST daily digest. Both best-effort, never on the
-    // decision path — see crates/app/src/cross_fill_visibility.rs.
-    crate::cross_fill_visibility::spawn_cross_fill_audit_consumer(config.questdb.clone());
-    crate::cross_fill_visibility::spawn_cross_fill_digest(
-        Arc::clone(trading_calendar),
-        config.questdb.clone(),
-        Arc::clone(notifier),
-    );
     let shutdown = Arc::new(Notify::new());
     // Park the handle for the teardown path (F2, 2026-07-15).
     drop(CADENCE_SHUTDOWN.set(Arc::clone(&shutdown)));
@@ -248,7 +215,6 @@ pub fn spawn_cadence_scheduler(
         // REAL broker executors both lanes (2026-07-17): one bounded
         // request per fire, runner-owned pacing/retry/ladder.
         dhan_executor,
-        groww_executor,
         // Lane gates seeded from `[cadence] dhan_lane`/`groww_lane`
         // (fix round 2026-07-17, CRITICAL): the cadence REST lanes are
         // deliberately INDEPENDENT of the RETIRED live-WS feed flags
@@ -257,7 +223,6 @@ pub fn spawn_cadence_scheduler(
         // both lanes forever = zero market-data capture). Config +
         // restart to change; no runtime toggle.
         dhan_enabled: Arc::new(AtomicBool::new(config.cadence.dhan_lane)),
-        groww_enabled: Arc::new(AtomicBool::new(config.cadence.groww_lane)),
         // ExpiryResolver seam (2026-07-15): the day-locked store IS the
         // production read facade — chains are stamped from the WINNING
         // (Dhan-preferred) policy date; unresolved days carry the

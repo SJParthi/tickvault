@@ -14,9 +14,8 @@ use tracing::{info, instrument, warn};
 use tickvault_common::constants::{
     DEFAULT_SSM_ENVIRONMENT, DHAN_ACCESS_TOKEN_SECRET, DHAN_CLIENT_ID_SECRET,
     DHAN_CLIENT_SECRET_SECRET, DHAN_SANDBOX_CLIENT_ID_SECRET, DHAN_SANDBOX_TOKEN_SECRET,
-    DHAN_TOTP_SECRET, GROWW_ACCESS_TOKEN_SECRET, QUESTDB_PG_PASSWORD_SECRET,
-    QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE, SSM_GROWW_SERVICE, SSM_QUESTDB_SERVICE,
-    SSM_SECRET_BASE_PATH,
+    DHAN_TOTP_SECRET, QUESTDB_PG_PASSWORD_SECRET, QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE,
+    SSM_QUESTDB_SERVICE, SSM_SECRET_BASE_PATH,
 };
 use tickvault_common::error::ApplicationError;
 
@@ -218,45 +217,6 @@ pub async fn fetch_dhan_credentials() -> Result<DhanCredentials, ApplicationErro
         client_secret,
         totp_secret,
     })
-}
-
-/// Fetches the Groww ACCESS TOKEN from AWS SSM Parameter Store — READ-ONLY
-/// (shared token-minter architecture, operator lock 2026-07-02 —
-/// `.claude/rules/project/groww-shared-token-minter-2026-07-02.md`).
-///
-/// The token at `/tickvault/<env>/groww/access-token` is minted DAILY by the
-/// bruteX-owned `groww-token-minter` Lambda (~06:05 IST, EventBridge);
-/// TickVault is a read-only consumer via IAM role
-/// `groww-token-minter-reader-tickvault` (`ssm:GetParameter` on this ONE
-/// parameter + `kms:Decrypt`, delivered through the default AWS credential
-/// chain). TickVault NEVER mints a Groww token, NEVER reads the
-/// `api-key`/`totp-secret` credential parameters (Lambda-only by IAM design),
-/// and NEVER writes any `/tickvault/*/groww/*` parameter. Only called when the
-/// Groww feed is enabled (`feeds.groww_enabled`); the Dhan path is untouched.
-///
-/// # Errors
-///
-/// Returns `ApplicationError::SecretRetrieval` if the token cannot be fetched.
-#[instrument(skip_all, fields(environment))]
-// TEST-EXEMPT: live AWS SSM fetch — mirrors the TEST-EXEMPT fetch_dhan_credentials; path construction is covered by build_ssm_path tests.
-pub async fn fetch_groww_access_token() -> Result<SecretString, ApplicationError> {
-    let environment = resolve_environment()?;
-    tracing::Span::current().record("environment", environment.as_str());
-
-    let ssm_client = create_ssm_client().await;
-
-    let token_path = build_ssm_path(&environment, SSM_GROWW_SERVICE, GROWW_ACCESS_TOKEN_SECRET);
-
-    info!(
-        token_path = %token_path,
-        "fetching Groww access token from SSM (read-only; minted by the bruteX groww-token-minter Lambda)"
-    );
-
-    let token = fetch_secret(&ssm_client, &token_path).await?;
-
-    info!("Groww access token fetched successfully from SSM");
-
-    Ok(token)
 }
 
 /// Fetches the SHARED Dhan access token from SSM — READ-ONLY, never a mint.
@@ -1394,63 +1354,6 @@ mod tests {
             "main.rs MUST run the boot-time process-death reconciler — without \
              it a mid-session process death leaves NO episode row and the \
              month verdict silently under-counts our own restarts."
-        );
-    }
-
-    /// BRUTEX-XVERIFY (2026-07-12): `main.rs` MUST spawn the BruteX↔TickVault
-    /// daily cross-verify runner
-    /// (`brutex_crossverify_boot::spawn_brutex_crossverify_task`) from the
-    /// process-global boot prefix. PR-C2 (2026-07-13, merged 2026-07-14): the
-    /// FAST crash-recovery arm — this guard's original SECOND spawn path —
-    /// was DELETED with the Dhan live-WS lane, so main.rs has a SINGLE boot
-    /// path and the guard pins EXACTLY 1 call site (the scoreboard-guard
-    /// precedent): a mid-market crash-restart now boots through the same
-    /// prefix, so the day's 15:50 IST cross-verify still fires. The spawn is
-    /// config-gated (`[brutex_crossverify] enabled`, default OFF).
-    /// The boot module must also keep its Telegram emit sites
-    /// (`BrutexCrossverifySummary` on success, `BrutexCrossverifyAborted` on
-    /// the Err/panic arms) — the daily signal must never be silently dropped
-    /// (audit Rule 11).
-    #[test]
-    fn test_brutex_crossverify_is_wired_into_main() {
-        let main_rs = std::fs::read_to_string("../app/src/main.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
-            .expect("main.rs must be readable");
-        assert!(
-            main_rs.contains("brutex_crossverify_boot"),
-            "main.rs MUST reference the brutex_crossverify_boot module — \
-             without it the BruteX cross-verify runner is dead code."
-        );
-        // Call sites (call head only), excluding any fn definition.
-        let spawn_sites: Vec<usize> = main_rs
-            .match_indices("spawn_brutex_crossverify_task(")
-            .map(|(i, _)| i)
-            .filter(|&i| !main_rs[..i].ends_with("fn "))
-            .collect();
-        assert_eq!(
-            spawn_sites.len(),
-            1,
-            "main.rs must call spawn_brutex_crossverify_task( at EXACTLY 1 \
-             site (the process-global boot prefix — single boot path since \
-             PR-C2); found {} call site(s). Without it the runner is dead \
-             code on every boot.",
-            spawn_sites.len()
-        );
-        // The boot module keeps its Telegram emit sites (never a silent day).
-        let boot_rs = std::fs::read_to_string("../app/src/brutex_crossverify_boot.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/brutex_crossverify_boot.rs"))
-            .expect("brutex_crossverify_boot.rs must be readable");
-        assert!(
-            boot_rs.contains("NotificationEvent::BrutexCrossverifySummary {"),
-            "brutex_crossverify_boot.rs MUST emit \
-             `NotificationEvent::BrutexCrossverifySummary` — the daily \
-             operator digest per the 2026-07-12 BRUTEX-XVERIFY directive."
-        );
-        assert!(
-            boot_rs.contains("NotificationEvent::BrutexCrossverifyAborted {"),
-            "brutex_crossverify_boot.rs MUST emit `BrutexCrossverifyAborted` \
-             on the Err/panic arms — the daily signal must never be silently \
-             dropped (audit Rule 11)."
         );
     }
 

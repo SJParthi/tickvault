@@ -253,19 +253,17 @@ pub fn next_failed_wave_count(prev: u32, attempt_dispatched: bool, resolved: boo
 /// DELEGATION section of `cadence-error-codes.md`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UnderlyingExpiryView {
-    /// The WINNING expiry keying BOTH lanes: Dhan's policy date when
-    /// present (exchange-sourced expirylist — the disagreement-arm
-    /// authority), else Groww's.
+    /// The WINNING expiry keying the lane: Dhan's policy date, sourced
+    /// from the exchange expirylist.
+    ///
+    /// This was once a cross-broker arbitration ("Dhan when present, else
+    /// the other broker") with a disagreement latch. With one broker there
+    /// is nothing to arbitrate, so the winner IS Dhan's date and the
+    /// `disagreement` flag was removed rather than left permanently false —
+    /// a flag that can never be set reads as a check that passed.
     pub winner: Option<ExpiryDate>,
-    /// Dhan's raw policy date (provenance — kept even when it loses
-    /// nothing: the winner IS this when present).
+    /// Dhan's raw policy date (provenance — equals `winner` when present).
     pub dhan_raw: Option<ExpiryDate>,
-    /// Groww's raw policy date (provenance).
-    pub groww_raw: Option<ExpiryDate>,
-    /// TRUE when both brokers resolved for the day and their policy dates
-    /// differ — Dhan won, loudly (CADENCE-01 `expiry_disagreement`),
-    /// never a silent override.
-    pub disagreement: bool,
 }
 
 /// The verdict of one [`DayLockedExpiryStore::record_policy_date`] call.
@@ -274,10 +272,6 @@ pub struct RecordVerdict {
     /// TRUE when the write landed (first write for the pair this day);
     /// FALSE when the day lock kept the existing value.
     pub recorded: bool,
-    /// TRUE exactly once per (underlying, day): this write made both
-    /// brokers' dates present AND differing — the caller emits the
-    /// edge-latched disagreement page.
-    pub newly_disagreeing: bool,
 }
 
 /// Per-(broker, underlying, IST-trading-day) resolution state, locked for
@@ -295,8 +289,6 @@ struct StoreState {
     day: Option<NaiveDate>,
     /// Raw policy dates per `[feed][underlying]` (first write wins).
     raw: [[Option<ExpiryDate>; ChainUnderlying::COUNT]; Feed::COUNT],
-    /// Per-underlying disagreement latch (edge — fires once per day).
-    disagreement: [bool; ChainUnderlying::COUNT],
 }
 
 impl StoreState {
@@ -313,14 +305,9 @@ impl StoreState {
 
     fn view(&self, underlying: ChainUnderlying) -> UnderlyingExpiryView {
         let dhan_raw = self.raw[Feed::Dhan.index()][underlying.index()];
-        let groww_raw = self.raw[Feed::Groww.index()][underlying.index()];
         UnderlyingExpiryView {
-            // Dhan (exchange-sourced expirylist) WINS for keying BOTH
-            // lanes whenever it resolved; Groww's date drives otherwise.
-            winner: dhan_raw.or(groww_raw),
+            winner: dhan_raw,
             dhan_raw,
-            groww_raw,
-            disagreement: self.disagreement[underlying.index()],
         }
     }
 }
@@ -358,18 +345,7 @@ impl DayLockedExpiryStore {
             *slot = Some(date);
             true
         };
-        let view = state.view(underlying);
-        let newly_disagreeing = match (view.dhan_raw, view.groww_raw) {
-            (Some(d), Some(g)) if d != g && !state.disagreement[underlying.index()] => {
-                state.disagreement[underlying.index()] = true;
-                true
-            }
-            _ => false,
-        };
-        RecordVerdict {
-            recorded,
-            newly_disagreeing,
-        }
+        RecordVerdict { recorded }
     }
 
     /// Is `(broker, underlying)` resolved for `day`? (A different locked
@@ -602,7 +578,7 @@ mod tests {
         let d2 = ExpiryDate::from_yyyymmdd(20_260_723).expect("valid");
         assert!(!store.is_resolved(day, Feed::Dhan, ChainUnderlying::Nifty));
         let v = store.record_policy_date(day, Feed::Dhan, ChainUnderlying::Nifty, d1);
-        assert!(v.recorded && !v.newly_disagreeing);
+        assert!(v.recorded);
         // First write wins for the day — a re-resolution attempt is a
         // no-op (day-locked; NEVER re-resolved mid-day).
         let v = store.record_policy_date(day, Feed::Dhan, ChainUnderlying::Nifty, d2);
@@ -633,44 +609,50 @@ mod tests {
     }
 
     #[test]
-    fn test_cadence_expiry_store_disagreement_dhan_wins_edge_latched() {
+    fn test_cadence_expiry_store_winner_is_the_dhan_date_only() {
+        // This replaces the cross-broker disagreement test. That mechanism
+        // arbitrated between two brokers' policy dates and latched an
+        // edge-triggered page when they differed; with one broker there is
+        // nothing to arbitrate, so what remains worth pinning is the
+        // narrower property: ONLY the Dhan lane's date becomes the winner.
+        //
+        // The non-Dhan record below is deliberate. The store still accepts a
+        // write from any feed (the array is per-feed), so a future feed
+        // writing into it must NOT silently start keying the chain lane —
+        // that would re-point every chain fetch at another vendor's expiry
+        // without a single failing test.
         let store = DayLockedExpiryStore::new();
         let day = NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid");
-        let groww_date = ExpiryDate::from_yyyymmdd(20_260_723).expect("valid");
+        let other = ExpiryDate::from_yyyymmdd(20_260_723).expect("valid");
         let dhan_date = ExpiryDate::from_yyyymmdd(20_260_716).expect("valid");
-        // Groww resolves first — it drives the winner alone.
-        let v = store.record_policy_date(day, Feed::Groww, ChainUnderlying::Nifty, groww_date);
-        assert!(v.recorded && !v.newly_disagreeing);
+
+        let v = store.record_policy_date(day, Feed::Truedata, ChainUnderlying::Nifty, other);
+        assert!(v.recorded, "the write lands");
         assert_eq!(
             store.view(day, ChainUnderlying::Nifty).winner,
-            Some(groww_date)
+            None,
+            "a non-Dhan record must NEVER become the winner"
         );
-        // Dhan resolves later with a DIFFERENT date: Dhan WINS for keying
-        // BOTH lanes, the disagreement fires exactly once (edge), and
-        // both raw dates stay recorded (provenance).
+
         let v = store.record_policy_date(day, Feed::Dhan, ChainUnderlying::Nifty, dhan_date);
-        assert!(v.recorded && v.newly_disagreeing);
+        assert!(v.recorded);
         let view = store.view(day, ChainUnderlying::Nifty);
-        assert_eq!(view.winner, Some(dhan_date), "Dhan wins on disagreement");
-        assert_eq!(view.dhan_raw, Some(dhan_date));
-        assert_eq!(view.groww_raw, Some(groww_date));
-        assert!(view.disagreement);
-        // A repeat write can never re-fire the edge.
-        let v = store.record_policy_date(day, Feed::Dhan, ChainUnderlying::Nifty, dhan_date);
-        assert!(!v.recorded && !v.newly_disagreeing);
-        // Agreement on another underlying never flags.
-        let v = store.record_policy_date(day, Feed::Dhan, ChainUnderlying::Sensex, dhan_date);
-        assert!(v.recorded && !v.newly_disagreeing);
-        let v = store.record_policy_date(day, Feed::Groww, ChainUnderlying::Sensex, dhan_date);
-        assert!(v.recorded && !v.newly_disagreeing);
-        assert!(!store.view(day, ChainUnderlying::Sensex).disagreement);
+        assert_eq!(view.winner, Some(dhan_date));
+        assert_eq!(view.dhan_raw, Some(dhan_date), "provenance is kept");
+
+        // The day lock still holds: a repeat write is a no-op.
+        let v = store.record_policy_date(day, Feed::Dhan, ChainUnderlying::Nifty, other);
+        assert!(!v.recorded, "day-locked — the first resolution holds");
+        assert_eq!(
+            store.view(day, ChainUnderlying::Nifty).winner,
+            Some(dhan_date)
+        );
     }
 
     #[test]
-    fn test_cadence_expiry_store_resolver_facade_reads_winner_for_both_brokers() {
-        // The increment-1 ExpiryResolver trait IS the store's read
-        // facade: both brokers' lookups read the ONE winning date (the
-        // disagreement rule keys BOTH lanes on it).
+    fn test_cadence_expiry_store_resolver_facade_reads_the_dhan_winner() {
+        // The ExpiryResolver trait IS the store's read facade. Every caller
+        // reads the ONE winning date, which is the Dhan lane's.
         let store = DayLockedExpiryStore::new();
         let day = NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid");
         assert_eq!(
@@ -678,8 +660,8 @@ mod tests {
             None
         );
         let date = ExpiryDate::from_yyyymmdd(20_260_728).expect("valid");
-        let _ = store.record_policy_date(day, Feed::Groww, ChainUnderlying::Banknifty, date);
-        for broker in [Feed::Dhan, Feed::Groww] {
+        let _ = store.record_policy_date(day, Feed::Dhan, ChainUnderlying::Banknifty, date);
+        for broker in [Feed::Dhan, Feed::Truedata] {
             assert_eq!(
                 store.resolved_expiry(broker, ChainUnderlying::Banknifty, day),
                 Some(20_260_728)
@@ -689,8 +671,6 @@ mod tests {
         // caller (the future capture-leg delegation seam).
         assert!(Arc::ptr_eq(global_expiry_store(), global_expiry_store()));
     }
-
-    #[test]
     fn test_cadence_expiry_winning_facade_never_serves_yesterdays_winner_across_day_flip() {
         // E1 (verifier, 2026-07-15): Tuesday resolves + day-locks the
         // expiry-day contract; Wednesday morning the vendor is DOWN, so

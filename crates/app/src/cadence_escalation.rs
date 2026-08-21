@@ -37,10 +37,6 @@ use tickvault_core::cadence::executor::CadenceFetchError;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tracing::{error, info};
 
-use crate::groww_option_chain_1m_boot::{
-    UnderlyingEdgeAction as GrowwUnderlyingEdgeAction,
-    UnderlyingServedTracker as GrowwChainServedTracker,
-};
 use crate::option_chain_1m_boot::{
     UnderlyingEdgeAction as DhanUnderlyingEdgeAction,
     UnderlyingServedTracker as DhanChainServedTracker,
@@ -236,14 +232,6 @@ pub(crate) struct LaneEscalation {
     /// Dhan lane only: the legacy per-underlying chain detector
     /// (`CHAIN-02 stage="underlying_not_served"`, field-less on `feed`).
     dhan_chain_served: DhanChainServedTracker,
-    /// Groww lane only: the legacy per-underlying chain detector
-    /// (`CHAIN-02 stage="underlying_not_served"`, `feed = "groww"`).
-    /// The Groww SPOT leg deliberately has NO per-SID detector — the
-    /// legacy leg had only the VIX-specific arms (`vix_unresolved`,
-    /// ported into the Groww executor's identity resolution; the
-    /// sweep-time `vix_not_served` belongs to the Groww post-session
-    /// sweep, a named residual).
-    groww_chain_served: GrowwChainServedTracker,
 }
 
 impl LaneEscalation {
@@ -257,7 +245,6 @@ impl LaneEscalation {
             chain_targets: MinuteTargets::default(),
             dhan_spot_served: SidServedTracker::default(),
             dhan_chain_served: DhanChainServedTracker::default(),
-            groww_chain_served: GrowwChainServedTracker::default(),
         }
     }
 
@@ -282,7 +269,6 @@ impl LaneEscalation {
                 self.chain_targets = MinuteTargets::default();
                 self.dhan_spot_served = SidServedTracker::default();
                 self.dhan_chain_served = DhanChainServedTracker::default();
-                self.groww_chain_served = GrowwChainServedTracker::default();
                 self.day = Some(today);
                 Some(cur)
             }
@@ -310,9 +296,6 @@ impl LaneEscalation {
         ok: bool,
         core: bool,
     ) -> Option<(u32, EdgeAction)> {
-        if !core && matches!((self.feed, leg), (Feed::Groww, EscalationLeg::Spot)) {
-            return None;
-        }
         match leg {
             EscalationLeg::Spot => self.spot.record(minute_secs, ok),
             EscalationLeg::Chain => self.chain.record(minute_secs, ok),
@@ -324,8 +307,7 @@ impl LaneEscalation {
     /// minute finalizes and its per-target verdicts feed the reused
     /// legacy tracker for `(self.feed, leg)` — returning emit-ready
     /// actions. An `AuthHold` anywhere in the finalized batch HOLDs the
-    /// whole minute (nothing fed, nothing reset). `(Groww, Spot)` is a
-    /// structural no-op (no legacy detector existed).
+    /// whole minute (nothing fed, nothing reset).
     pub(crate) fn record_target(
         &mut self,
         leg: EscalationLeg,
@@ -334,9 +316,6 @@ impl LaneEscalation {
         security_id: SecurityId,
         outcome: TargetOutcome,
     ) -> Option<(u32, Vec<NotServedEmit>)> {
-        if matches!((self.feed, leg), (Feed::Groww, EscalationLeg::Spot)) {
-            return None;
-        }
         let bucket = match leg {
             EscalationLeg::Spot => &mut self.spot_targets,
             EscalationLeg::Chain => &mut self.chain_targets,
@@ -410,33 +389,7 @@ impl LaneEscalation {
                     })
                     .collect()
             }
-            (Feed::Groww, EscalationLeg::Chain) => {
-                let verdicts: Vec<(&'static str, bool)> = batch
-                    .iter()
-                    .map(|&(symbol, _, o)| (symbol, o == TargetOutcome::Served))
-                    .collect();
-                let actions = self.groww_chain_served.record_minute(&verdicts);
-                batch
-                    .iter()
-                    .zip(actions)
-                    .map(|(&(symbol, sid, o), (_, action))| NotServedEmit {
-                        symbol,
-                        security_id: sid,
-                        counted: o != TargetOutcome::Served && any_served,
-                        action: match action {
-                            GrowwUnderlyingEdgeAction::None => NotServedAction::None,
-                            GrowwUnderlyingEdgeAction::Page { consecutive } => {
-                                NotServedAction::Page { consecutive }
-                            }
-                            GrowwUnderlyingEdgeAction::Recover { not_served_minutes } => {
-                                NotServedAction::Recover { not_served_minutes }
-                            }
-                        },
-                    })
-                    .collect()
-            }
-            // (Groww, Spot) is guarded in record_target; any future feed
-            // has no legacy detector — nothing to emit.
+            // A live-tick feed has no legacy REST detector — nothing to emit.
             _ => Vec::new(),
         }
     }
@@ -551,53 +504,6 @@ pub(crate) fn emit_not_served(
                     NotServedAction::None => {}
                 }
             }
-            (Feed::Groww, EscalationLeg::Chain) => {
-                if emit.counted {
-                    metrics::counter!(
-                        "tv_groww_chain1m_underlying_not_served_total",
-                        "underlying" => emit.symbol
-                    )
-                    .increment(1);
-                }
-                match emit.action {
-                    NotServedAction::Page { consecutive } => {
-                        error!(
-                            code = ErrorCode::Chain02FetchDegraded.code_str(),
-                            stage = "underlying_not_served",
-                            feed = "groww",
-                            underlying = emit.symbol,
-                            consecutive_minutes = consecutive,
-                            minute = %minute_label,
-                            "CHAIN-02: Groww is not serving this underlying's option \
-                             chain while the other underlyings succeed — paging once \
-                             per underlying (edge-latched; re-armed on this \
-                             underlying's own recovery)"
-                        );
-                        if let Some(n) = notifier {
-                            n.notify(NotificationEvent::GrowwChain1mUnderlyingNotServed {
-                                underlying: emit.symbol,
-                                empty_minutes: consecutive,
-                            });
-                        }
-                    }
-                    NotServedAction::Recover { not_served_minutes } => {
-                        info!(
-                            underlying = emit.symbol,
-                            not_served_minutes,
-                            minute = %minute_label,
-                            "cadence: this underlying's Groww chain is being served \
-                             again after a paged not-served episode"
-                        );
-                        if let Some(n) = notifier {
-                            n.notify(NotificationEvent::GrowwChain1mUnderlyingServedRecovered {
-                                underlying: emit.symbol,
-                                empty_minutes: not_served_minutes,
-                            });
-                        }
-                    }
-                    NotServedAction::None => {}
-                }
-            }
             // (Groww, Spot) never produces emits (no legacy detector);
             // future feeds likewise.
             _ => {}
@@ -674,66 +580,6 @@ pub(crate) fn emit_edge_action(
             );
             if let Some(n) = notifier {
                 n.notify(NotificationEvent::ChainFetchRecovered {
-                    minute_ist: minute_label,
-                    failed_minutes,
-                });
-            }
-        }
-        (Feed::Groww, EscalationLeg::Spot, EdgeAction::Page { consecutive }) => {
-            error!(
-                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
-                stage = "escalation",
-                feed = "groww",
-                consecutive,
-                minute = %minute_label,
-                "SPOT1M-01: Groww per-minute spot fetch fully failed for \
-                 consecutive minutes — paging (edge-triggered)"
-            );
-            if let Some(n) = notifier {
-                n.notify(NotificationEvent::GrowwSpot1mFetchDegraded {
-                    consecutive_failed_minutes: consecutive,
-                    minute_ist: minute_label,
-                });
-            }
-        }
-        (Feed::Groww, EscalationLeg::Spot, EdgeAction::Recover { failed_minutes }) => {
-            info!(
-                failed_minutes,
-                minute = %minute_label,
-                "cadence: Groww per-minute spot fetch recovered after a paged episode"
-            );
-            if let Some(n) = notifier {
-                n.notify(NotificationEvent::GrowwSpot1mFetchRecovered {
-                    minute_ist: minute_label,
-                    failed_minutes,
-                });
-            }
-        }
-        (Feed::Groww, EscalationLeg::Chain, EdgeAction::Page { consecutive }) => {
-            error!(
-                code = ErrorCode::Chain02FetchDegraded.code_str(),
-                stage = "escalation",
-                feed = "groww",
-                consecutive,
-                minute = %minute_label,
-                "CHAIN-02: Groww per-minute chain fetch fully failed for \
-                 consecutive minutes — paging (edge-triggered)"
-            );
-            if let Some(n) = notifier {
-                n.notify(NotificationEvent::GrowwChain1mFetchDegraded {
-                    consecutive_failed_minutes: consecutive,
-                    minute_ist: minute_label,
-                });
-            }
-        }
-        (Feed::Groww, EscalationLeg::Chain, EdgeAction::Recover { failed_minutes }) => {
-            info!(
-                failed_minutes,
-                minute = %minute_label,
-                "cadence: Groww per-minute chain fetch recovered after a paged episode"
-            );
-            if let Some(n) = notifier {
-                n.notify(NotificationEvent::GrowwChain1mFetchRecovered {
                     minute_ist: minute_label,
                     failed_minutes,
                 });
@@ -878,73 +724,6 @@ mod tests {
             lane.record(EscalationLeg::Spot, minute(1), true, true),
             Some((minute(0), EdgeAction::None))
         );
-    }
-
-    #[test]
-    fn test_groww_spot_edge_is_core_keyed_vix_ok_never_masks_core_all_failed() {
-        // Legacy contract: groww_spot_1m_boot.rs::MinuteEdgeTally (:386-416)
-        // keys the Groww spot escalation edge on the 3 CORE indices ONLY —
-        // core-all-failed pages even when INDIA VIX alone succeeded.
-        let mut lane = LaneEscalation::new(Feed::Groww);
-        let t = SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD;
-        let mut paged = 0u32;
-        for i in 0..=t {
-            if let Some((_, EdgeAction::Page { consecutive })) =
-                lane.record(EscalationLeg::Spot, minute(i), false, true)
-            {
-                paged += 1;
-                assert_eq!(consecutive, t);
-                assert_eq!(i, t, "page fires when the t-th failed minute finalizes");
-            }
-            lane.record(EscalationLeg::Spot, minute(i), false, true);
-            lane.record(EscalationLeg::Spot, minute(i), false, true);
-            // INDIA VIX succeeds every minute — a structural no-op on the
-            // Groww spot tally (its ok=true must NOT keep ok >= 1).
-            assert_eq!(
-                lane.record(EscalationLeg::Spot, minute(i), true, false),
-                None,
-                "a VIX outcome never feeds the Groww spot tally"
-            );
-        }
-        assert_eq!(
-            paged, 1,
-            "core-all-failed pages even when VIX alone succeeded"
-        );
-    }
-
-    #[test]
-    fn test_groww_spot_vix_only_failed_minutes_never_count_or_finalize() {
-        // Legacy contract (groww_spot_1m_boot.rs + rest-1m §1-item-5): a
-        // VIX-only failure is non-edge; a VIX outcome must not even roll /
-        // finalize the core minute bucket.
-        let mut lane = LaneEscalation::new(Feed::Groww);
-        // Core minute 0 fails on all 3 targets.
-        for _ in 0..3 {
-            lane.record(EscalationLeg::Spot, minute(0), false, true);
-        }
-        // A VIX outcome for minute 1 arrives FIRST — excluded: it neither
-        // finalizes minute 0 nor opens minute 1.
-        assert_eq!(
-            lane.record(EscalationLeg::Spot, minute(1), false, false),
-            None
-        );
-        // The first CORE outcome of minute 1 is still the finalizer.
-        assert_eq!(
-            lane.record(EscalationLeg::Spot, minute(1), true, true),
-            Some((minute(0), EdgeAction::None))
-        );
-        // A long run of VIX-only failures (core all ok) never pages.
-        for i in 2..40u32 {
-            for _ in 0..3 {
-                if let Some((_, action)) = lane.record(EscalationLeg::Spot, minute(i), true, true) {
-                    assert_eq!(action, EdgeAction::None, "VIX-only failure never pages");
-                }
-            }
-            assert_eq!(
-                lane.record(EscalationLeg::Spot, minute(i), false, false),
-                None
-            );
-        }
     }
 
     #[test]
@@ -1176,50 +955,6 @@ mod tests {
             rec_spot(&mut lane, 1, "NIFTY", 13, TargetOutcome::Served).expect("finalize");
         let vix = emits.iter().find(|e| e.symbol == "INDIA VIX").unwrap();
         assert!(!vix.counted, "retry-served minute never counts");
-    }
-
-    #[test]
-    fn test_groww_spot_has_no_not_served_detector() {
-        let mut lane = LaneEscalation::new(Feed::Groww);
-        for i in 0..40u32 {
-            assert_eq!(
-                lane.record_target(
-                    EscalationLeg::Spot,
-                    minute(i),
-                    "INDIA VIX",
-                    21,
-                    TargetOutcome::NotServed,
-                ),
-                None,
-                "the legacy Groww spot leg had only the VIX arms — no per-SID detector"
-            );
-        }
-    }
-
-    #[test]
-    fn test_groww_chain_not_served_pages_via_the_groww_tracker() {
-        let mut lane = LaneEscalation::new(Feed::Groww);
-        let mut pages = 0u32;
-        for i in 0..=NS_T {
-            if let Some((_, emits)) = lane.record_target(
-                EscalationLeg::Chain,
-                minute(i),
-                "BANKNIFTY",
-                0,
-                TargetOutcome::Served,
-            ) && page_for(&emits, "NIFTY").is_some()
-            {
-                pages += 1;
-            }
-            lane.record_target(
-                EscalationLeg::Chain,
-                minute(i),
-                "NIFTY",
-                0,
-                TargetOutcome::NotServed,
-            );
-        }
-        assert_eq!(pages, 1, "the Groww chain lane pages at the threshold");
     }
 
     #[test]

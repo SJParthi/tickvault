@@ -76,7 +76,7 @@ use tickvault_core::cadence::ladder::{
     DHAN_SHAPE_MAX_STEP, GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
     failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap,
 };
-use tickvault_core::cadence::runner::{CycleAction, GrowwWaveLeg, build_cycle_events};
+use tickvault_core::cadence::runner::{CycleAction, build_cycle_events};
 use tickvault_core::cadence::schedule::{
     CADENCE_RETRY_LATENCY_ALLOWANCE_MS, CycleSlots, build_cycle_slots, next_expiry_wave_instant_ms,
     next_joinable_boundary,
@@ -670,7 +670,6 @@ proptest! {
         let mut dhan_shapes_seen = [false; 2];
         let spot_step_floor = min_spot_step_for_cap(cfg.spot_window_cap);
         let mut spot_ladder = StreakLadder::starting_at(spot_step_floor);
-        let mut groww_ladder = StreakLadder::starting_at(0);
         let mut last_boundary = None;
         let mut nominal_denials = 0_u32;
         let mut cycles = 0_u32;
@@ -706,21 +705,10 @@ proptest! {
                 boundary,
                 dhan_shape_ladder.step,
                 spot_ladder.step,
-                groww_ladder.step,
                 &cfg,
             );
             spot_steps_seen[usize::from(spot_ladder.step.min(3))] = true;
             dhan_shapes_seen[usize::from(dhan_shape_ladder.step.min(1))] = true;
-            // No-overlap invariant (coordinator 2026-07-15): even the
-            // WORST Groww shape's last wave + verdict + a full sequential
-            // fallback tail can never reach the next minute's :00 burst.
-            prop_assert!(
-                slots.groww_verdict_ms
-                    + 7 * cfg.groww_request_timeout_ms
-                    <= slots.boundary_ms + 60_000,
-                "groww fallback tail overlaps the next :00 burst (shape {})",
-                slots.groww_shape
-            );
 
             let (arming, spot_dirty, dhan) = sim_dhan_cycle(
                 &mut clock,
@@ -746,14 +734,6 @@ proptest! {
                 cfg.concurrency_recover_after_clean_cycles,
                 spot_step_floor,
                 SPOT_CONCURRENCY_MAX_STEP,
-            );
-            let groww_dirty = rng.below(100) < fail_bias_pct;
-            let _ = groww_ladder.advance(
-                groww_dirty,
-                cfg.concurrency_degrade_after_dirty_cycles,
-                cfg.concurrency_recover_after_clean_cycles,
-                0,
-                GROWW_SHAPE_MAX_STEP,
             );
 
             // Exactly-once decision latch per (lane, cycle); a DECIDED
@@ -782,7 +762,7 @@ proptest! {
             prop_assert!(!latch.try_latch(Feed::Dhan, slots.cycle_minute_ist));
             // The Groww lane is gate-free BY CONSTRUCTION (no Groww arm
             // in this sim touches DhanGates); its latch is independent.
-            if latch.try_latch(Feed::Groww, slots.cycle_minute_ist) {
+            if latch.try_latch(Feed::Truedata, slots.cycle_minute_ist) {
                 emitted += 1;
             }
             decisions_per_cycle.push(emitted);
@@ -917,15 +897,25 @@ fn test_minute_boundary_race_no_double_fire() {
     let t = 36_000; // 10:00:00
     let t_ms = i64::from(t) * 1_000;
     // Wake 1ms BEFORE T with the previous boundary already completed —
-    // every fire is post-close (earliest at T+0, the Groww anchor), so
-    // T IS still joinable: nothing has begun.
+    // every fire is post-close, so T IS still joinable: nothing has begun.
     assert_eq!(
         next_joinable_boundary(t_ms - 1, Some(t - 60), &cfg),
         Some(t)
     );
-    // Wake 1ms AFTER T: T's earliest fire (T+0) already began → skip.
+    // Wake 1ms AFTER T: the earliest fire is now the Dhan burst at
+    // T+`dhan_burst_offset_ms` (1000 ms), not the retired second lane's T+0
+    // anchor — so a wake at T+1ms is still a full second early and joins T.
     assert_eq!(
         next_joinable_boundary(t_ms + 1, Some(t - 60), &cfg),
+        Some(t)
+    );
+    // Past the burst instant, T has begun → skip to the next boundary.
+    assert_eq!(
+        next_joinable_boundary(
+            t_ms + i64::from(cfg.dhan_burst_offset_ms),
+            Some(t - 60),
+            &cfg
+        ),
         Some(t + 60)
     );
     // An instant-completing cycle AT T never re-selects T.
@@ -1007,7 +997,7 @@ fn test_retry_through_gate_never_compresses_chain_spacing() {
     // the concurrent primaries).
     let cfg = CadenceConfig::default();
     let t = 36_000_u32;
-    let slots = build_cycle_slots(t, 0, 0, 0, &cfg);
+    let slots = build_cycle_slots(t, 0, 0, &cfg);
     let mut clock = SimClock {
         wall_ms: slots.dhan_chain_slots_ms[0] - 10_000,
         mono_origin: 0,
@@ -1160,7 +1150,7 @@ fn test_cadence_200_empty_spot_fallback_chain_end_to_end() {
     // published rows against it.
     let embedded_spot = 81_002.0; // SENSEX step 100.00 → ATM 81_000.00
     publish_chain_snapshot(ChainMoneynessSnapshot {
-        feed: Feed::Groww,
+        feed: Feed::Truedata,
         underlying: ChainUnderlying::Sensex,
         minute_ts_ist_nanos: 10,
         fetched_at_ist_nanos: 20,
@@ -1190,12 +1180,12 @@ fn test_cadence_200_empty_spot_fallback_chain_end_to_end() {
             },
         ],
     });
-    let mut a = LaneAssembly::new(Feed::Groww, 35_940, 36_000_000);
+    let mut a = LaneAssembly::new(Feed::Truedata, 35_940, 36_000_000);
     a.record_chain(
         ChainUnderlying::Sensex,
         ChainCell {
             provenance: ChainProvenance::OwnFetch,
-            source_feed: Feed::Groww,
+            source_feed: Feed::Truedata,
             published_to_registry: true,
             fetched_at_ms: 36_000_400,
             minute_ist: 35_940,
@@ -1215,7 +1205,7 @@ fn test_cadence_200_empty_spot_fallback_chain_end_to_end() {
     // The fold against the resolved anchor sees the published rows.
     let anchor = cell.map(|c| (c.spot_paise, c.atm_paise));
     let fold =
-        anchor.map(|(s, m)| fold_chain_moneyness(Feed::Groww, ChainUnderlying::Sensex, s, m));
+        anchor.map(|(s, m)| fold_chain_moneyness(Feed::Truedata, ChainUnderlying::Sensex, s, m));
     assert!(fold.is_some_and(|f| f.rows == 3
         && f.atm == 1
         && f.itm == 1
@@ -1236,7 +1226,7 @@ fn test_cadence_guarded_fold_reads_source_feed_slot_and_rejects_stale_minute() {
     let minute_nanos = (day * 86_400 + i64::from(minute)) * 1_000_000_000;
     let now_nanos = minute_nanos + 61 * 1_000_000_000; // ~T+1s of the cycle
     publish_chain_snapshot(ChainMoneynessSnapshot {
-        feed: Feed::Groww,
+        feed: Feed::Truedata,
         underlying: ChainUnderlying::Banknifty,
         minute_ts_ist_nanos: minute_nanos,
         fetched_at_ist_nanos: minute_nanos + 400_000_000,
@@ -1263,7 +1253,7 @@ fn test_cadence_guarded_fold_reads_source_feed_slot_and_rejects_stale_minute() {
     // The Dhan lane's cross-filled cell KEEPS the lender's identity.
     let cell = ChainCell {
         provenance: ChainProvenance::CrossSource,
-        source_feed: Feed::Groww,
+        source_feed: Feed::Truedata,
         published_to_registry: true,
         fetched_at_ms: 36_000_400,
         minute_ist: minute,
@@ -1314,14 +1304,12 @@ proptest! {
         boundary_min in 0_u32..374,
         dhan_shape in 0_u8..=1,
         spot_step in 0_u8..=3,
-        groww_step in 0_u8..=2,
         dhan_enabled in any::<bool>(),
-        groww_enabled in any::<bool>(),
     ) {
         let cfg = CadenceConfig::default();
         let boundary = 9 * 3600 + 16 * 60 + boundary_min * 60;
-        let slots = build_cycle_slots(boundary, dhan_shape, spot_step, groww_step, &cfg);
-        let events = build_cycle_events(&slots, dhan_enabled, groww_enabled, false);
+        let slots = build_cycle_slots(boundary, dhan_shape, spot_step, &cfg);
+        let events = build_cycle_events(&slots, dhan_enabled, false);
 
         // Time-sorted, always.
         for w in events.windows(2) {
@@ -1377,57 +1365,6 @@ proptest! {
                 "a disabled Dhan lane contributes NO events"
             );
         }
-        let groww_waves: Vec<(i64, GrowwWaveLeg)> = events
-            .iter()
-            .filter_map(|(ms, a)| match a {
-                CycleAction::GrowwWave { leg } => Some((*ms, *leg)),
-                _ => None,
-            })
-            .collect();
-        let groww_verdicts = events
-            .iter()
-            .filter(|(_, a)| matches!(a, CycleAction::GrowwVerdict))
-            .count();
-        let groww_cutoffs = events
-            .iter()
-            .filter(|(_, a)| matches!(a, CycleAction::GrowwCutoff))
-            .count();
-        if groww_enabled {
-            prop_assert_eq!(groww_waves.len(), 3, "three Groww waves");
-            prop_assert_eq!(groww_verdicts, 1, "one Groww verdict");
-            prop_assert_eq!(groww_cutoffs, 1, "one Groww cutoff");
-            // Wave targets equal their slot-table instants, per leg.
-            for (ms, leg) in &groww_waves {
-                let expected = match leg {
-                    GrowwWaveLeg::Chains => slots.groww_chain_wave_ms,
-                    GrowwWaveLeg::CoreSpots => slots.groww_spot_wave_ms,
-                    GrowwWaveLeg::VixSpot => slots.groww_vix_wave_ms,
-                };
-                prop_assert_eq!(*ms, expected, "wave target must equal its slot");
-            }
-            // The verdict sits AT/AFTER every wave; the cutoff last.
-            let max_wave = groww_waves.iter().map(|(ms, _)| *ms).max().unwrap_or(0);
-            prop_assert!(slots.groww_verdict_ms >= max_wave);
-            let last_groww = events
-                .iter()
-                .rev()
-                .find(|(_, a)| {
-                    matches!(
-                        a,
-                        CycleAction::GrowwWave { .. }
-                            | CycleAction::GrowwVerdict
-                            | CycleAction::GrowwCutoff
-                    )
-                })
-                .map(|(_, a)| *a);
-            prop_assert_eq!(last_groww, Some(CycleAction::GrowwCutoff));
-        } else {
-            prop_assert_eq!(
-                groww_waves.len() + groww_verdicts + groww_cutoffs,
-                0,
-                "a disabled Groww lane contributes NO events"
-            );
-        }
     }
 }
 
@@ -1453,7 +1390,7 @@ fn test_cadence_shape_and_concurrency_ladders_never_oscillate_against_each_other
     let mut step_history = vec![spot_ladder.step];
 
     let assert_legal = |shape: u8, step: u8| {
-        let slots = build_cycle_slots(boundary, shape, step, 0, &cfg);
+        let slots = build_cycle_slots(boundary, shape, step, &cfg);
         // Chains all CONCURRENT at the burst second (2026-07-16); every
         // spot bucket still lands before the Dhan cutoff.
         assert!(

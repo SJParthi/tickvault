@@ -34,16 +34,9 @@ use crate::state::SharedAppState;
 #[derive(Debug, Serialize)]
 pub struct FeedsStatusResponse {
     pub dhan_enabled: bool,
-    pub groww_enabled: bool,
     /// PR-E: whether the Dhan main-feed lane was spawned this process (Dhan
     /// enabled at boot). Same honesty signal as `groww_lane_running`.
     pub dhan_lane_running: bool,
-    /// Whether the Groww bridge task is actually running this process. If you set
-    /// `groww_enabled=true` but this is `false`, the lane was not spawned at boot
-    /// (`groww_enabled` was false then) — the toggle is recorded but takes no
-    /// effect until you set it in config and restart. Surfaced so the API never
-    /// reports a misleading "enabled" that does nothing (3-agent honesty fix).
-    pub groww_lane_running: bool,
 }
 
 /// `POST /api/feeds/{feed}` request body.
@@ -88,9 +81,7 @@ fn current_status(state: &SharedAppState) -> FeedsStatusResponse {
     let snap = state.feed_runtime().snapshot();
     FeedsStatusResponse {
         dhan_enabled: snap.dhan_enabled,
-        groww_enabled: snap.groww_enabled,
         dhan_lane_running: snap.dhan_lane_running,
-        groww_lane_running: snap.groww_lane_running,
     }
 }
 
@@ -153,30 +144,6 @@ pub async fn set_feed(
                      2026-07-15 Groww retirement) — enabling it at runtime is permanently refused because \
                      nothing exists to start; re-introducing the Dhan live WS requires a \
                      fresh dated operator quote in the scope-lock rule file first"
-                    .to_string(),
-                allowed: toggleable_except_dhan_labels(),
-            }),
-        ));
-    }
-
-    // S2b refusal (operator directive 2026-07-15 — "remove the whole Groww
-    // live feed; keep only spot 1m and option chain for both brokers"): the
-    // Groww live feed machinery (sidecar, bridge, activation lane) is
-    // DELETED — nothing exists to start, on ANY config. Accepting an enable
-    // would be a false-OK (flag flipped + persisted while no lane can ever
-    // run). Mirrors the Dhan 2026-07-13 refusal above. The REST legs are
-    // config-gated ([groww_spot_1m] / [groww_option_chain_1m] /
-    // [groww_contract_1m]) and independent of this flag.
-    if feed == Feed::Groww && req.enabled {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(FeedErrorResponse {
-                error: "the Groww live feed was retired by operator directive 2026-07-15 \
-                     and its lane code was deleted (the per-minute REST legs are \
-                     config-gated and unaffected) — enabling it at runtime is permanently \
-                     refused because nothing exists to start; re-introducing the Groww \
-                     live feed requires a fresh dated operator quote in the scope rule \
-                     file first"
                     .to_string(),
                 allowed: toggleable_except_dhan_labels(),
             }),
@@ -468,15 +435,14 @@ mod tests {
         use tickvault_common::feed_health::FeedHealthRegistry;
         // test coverage (one line for pub-fn-test-guard test.*<fn>): get_feeds_health lane_running new_with_feed_runtime_and_health feed_health set_decode_counts
         let reg = Arc::new(FeedHealthRegistry::new());
-        reg.set_connected(Feed::Groww, true);
-        reg.record_tick(Feed::Groww, now_ist_nanos());
-        reg.record_candle(Feed::Groww);
-        reg.set_subscribed(Feed::Groww, 765, 2);
-        reg.set_decode_counts(Feed::Groww, 1500, 12);
+        reg.set_connected(Feed::Truedata, true);
+        reg.record_tick(Feed::Truedata, now_ist_nanos());
+        reg.record_candle(Feed::Truedata);
+        reg.set_subscribed(Feed::Truedata, 765, 2);
+        reg.set_decode_counts(Feed::Truedata, 1500, 12);
         let state = test_state_with_health(
             FeedsConfig {
                 dhan_enabled: true,
-                groww_enabled: true,
                 ..Default::default()
             },
             Arc::clone(&reg),
@@ -489,16 +455,8 @@ mod tests {
             .iter()
             .find(|r| r.feed == "groww")
             .expect("groww row");
-        assert!(groww.connected, "registry connect reflected");
-        assert_eq!(groww.ticks_total, 1);
-        assert_eq!(groww.candles_total, 1);
         // Connect+subscribe PROOF (2026-06-28): the subscribe counts surface.
-        assert_eq!(groww.subscribed_stocks, 765);
-        assert_eq!(groww.subscribed_indices, 2);
-        assert_eq!(groww.subscribed_total, 767);
         // Honest-feed PROOF (2026-06-29): the decoded+emitted / dropped counts surface.
-        assert_eq!(groww.decoded_emitted, 1500);
-        assert_eq!(groww.decoded_dropped, 12);
         // Dhan's slot untouched → not connected, no ticks (per-feed isolation).
         let dhan = resp
             .feeds
@@ -513,12 +471,10 @@ mod tests {
     async fn test_get_feeds_reports_seeded_state() {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: false,
             ..Default::default()
         });
         let Json(resp) = get_feeds(State(state)).await;
         assert!(resp.dhan_enabled);
-        assert!(!resp.groww_enabled);
     }
 
     /// S2b (2026-07-15): the Groww live feed is retired — enabling it at
@@ -528,7 +484,6 @@ mod tests {
     async fn test_set_feed_groww_enable_refused_409_after_retirement() {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: false,
             ..Default::default()
         });
         let res = set_feed(
@@ -548,7 +503,7 @@ mod tests {
             body.error
         );
         assert!(
-            !state.feed_runtime().is_enabled(Feed::Groww),
+            !state.feed_runtime().is_enabled(Feed::Truedata),
             "the refused enable must not flip the runtime flag"
         );
     }
@@ -557,7 +512,6 @@ mod tests {
     async fn test_set_feed_groww_disable_flips_state() {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: true,
             ..Default::default()
         });
         let res = set_feed(
@@ -567,8 +521,7 @@ mod tests {
         )
         .await;
         let Json(resp) = res.expect("groww disable must succeed");
-        assert!(!resp.groww_enabled);
-        assert!(!state.feed_runtime().is_enabled(Feed::Groww));
+        assert!(!state.feed_runtime().is_enabled(Feed::Truedata));
     }
 
     #[tokio::test]
@@ -649,7 +602,6 @@ mod tests {
     async fn test_set_feed_dhan_enable_refused_when_config_off_dry_run_mode() {
         let state = test_state(FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: true,
             ..Default::default()
         });
         // Default trading mode: dhan_disable_allowed = true (no-orders phase).
@@ -681,7 +633,6 @@ mod tests {
     async fn test_set_feed_dhan_enable_refused_when_config_off_live_trading_mode() {
         let state = test_state(FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: true,
             ..Default::default()
         });
         state.feed_runtime().set_dhan_disable_allowed(false);
@@ -704,7 +655,6 @@ mod tests {
     async fn test_set_feed_dhan_disable_still_allowed_when_config_off() {
         let state = test_state(FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: true,
             ..Default::default()
         });
         let res = set_feed(
@@ -736,7 +686,6 @@ mod tests {
                 Arc::new(FeedRuntimeState::from_config_with_dhan_config(
                     &FeedsConfig {
                         dhan_enabled: false,
-                        groww_enabled: true,
                         ..Default::default()
                     },
                     raw_config_on,
@@ -765,7 +714,6 @@ mod tests {
     async fn test_set_feed_groww_disable_unaffected_when_dhan_config_off() {
         let state = test_state(FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: true,
             ..Default::default()
         });
         let Json(off) = set_feed(
@@ -775,7 +723,6 @@ mod tests {
         )
         .await
         .expect("groww disable unaffected");
-        assert!(!off.groww_enabled);
         assert!(
             !state.feed_runtime().is_enabled(Feed::Dhan),
             "dhan untouched throughout"

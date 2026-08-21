@@ -8,7 +8,7 @@
 //! here is importable everywhere — the same reasoning that moved [`crate::feed::Feed`]
 //! down to `common` (SP1 of the common-feed-engine convergence). The
 //! broker id REUSES [`crate::feed::Feed`] — there is NO second broker enum
-//! (Dhan = `Feed::Dhan`, Groww = `Feed::Groww`).
+//! (Dhan = `Feed::Dhan`, Groww = `Feed::Truedata`).
 //!
 //! ## Scope (Groww order-side build, operator authorization 2026-07-14)
 //! This is the neutral order-event contract for the GATED Groww order-side
@@ -44,7 +44,7 @@ use tokio::sync::watch;
 /// [`Feed::as_str`] / [`BrokerOrderStatus::as_str`] for the wire labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerOrderEvent {
-    /// Which broker produced this event (`Feed::Dhan` / `Feed::Groww`).
+    /// Which broker produced this event (`Feed::Dhan` / `Feed::Truedata`).
     pub broker: Feed,
     /// The broker-assigned order id (Dhan `orderNo` / Groww `groww_order_id`).
     pub broker_order_id: String,
@@ -707,7 +707,7 @@ mod tests {
             assert_ne!(
                 BrokerOrderStatus::from_groww_status(v),
                 BrokerOrderStatus::Unknown,
-                "documented Groww status `{v}` must not map to Unknown"
+                "documented vendor status `{v}` must not map to Unknown"
             );
         }
     }
@@ -859,7 +859,7 @@ mod tests {
     fn test_broker_order_event_preserves_raw_status_when_unknown() {
         let raw = "SOME_FUTURE_STATE";
         let ev = BrokerOrderEvent {
-            broker: Feed::Groww,
+            broker: Feed::Truedata,
             broker_order_id: "GRW-123".to_owned(),
             reference_id: Some("ref-0001".to_owned()),
             status: BrokerOrderStatus::from_groww_status(raw),
@@ -874,7 +874,7 @@ mod tests {
         // Un-mapped wire value is Unknown, but never lost.
         assert_eq!(ev.status, BrokerOrderStatus::Unknown);
         assert_eq!(ev.raw_status, "SOME_FUTURE_STATE");
-        assert_eq!(ev.broker, Feed::Groww);
+        assert_eq!(ev.broker, Feed::Truedata);
         assert_eq!(ev.avg_fill_price_paise, None);
     }
 
@@ -1032,7 +1032,7 @@ mod tests {
     fn test_position_update_event_record_construction() {
         let rec = PositionUpdateEventRecord {
             ts_ist_nanos: 1_760_000_000_000_000_000,
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             event_seq: next_event_seq(),
             symbol_isin: "NIFTY26JUL24500CE".to_owned(),
             security_id: -1,
@@ -1060,7 +1060,7 @@ mod tests {
             bse_debit_price: None,
             detail_raw: String::new(),
         };
-        assert_eq!(rec.feed, Feed::Groww);
+        assert_eq!(rec.feed, Feed::Truedata);
         // Absent BSE leg stays None (never a fabricated 0.0) while the
         // served NSE zero stays Some(0.0) — the two are distinguishable.
         assert!(rec.bse_credit_qty.is_none());

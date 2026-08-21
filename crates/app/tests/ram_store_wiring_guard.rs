@@ -197,18 +197,13 @@ fn chain_publish_helper_records_into_the_day_store_after_the_registry_publish() 
         "day-store resolution + record must live inside the helper"
     );
 
-    // Both chain legs still route through the ONE shared helper — the
-    // single hook site covers Dhan AND Groww by construction.
+    // The chain leg routes through the ONE shared helper. This once checked
+    // BOTH legs, which is what made "one shared helper" meaningful — with a
+    // single leg the assertion is that the leg calls the helper at all.
     let dhan_calls = call_site_indices(prod, "publish_chain_moneyness_snapshot(");
     assert!(
         !dhan_calls.is_empty(),
-        "the Dhan chain leg must call publish_chain_moneyness_snapshot"
-    );
-    let groww = read_source("crates/app/src/groww_option_chain_1m_boot.rs");
-    let groww_prod = production_region(&groww);
-    assert!(
-        !call_site_indices(groww_prod, "publish_chain_moneyness_snapshot(").is_empty(),
-        "the Groww chain leg must call publish_chain_moneyness_snapshot"
+        "the chain leg must call publish_chain_moneyness_snapshot"
     );
 }
 

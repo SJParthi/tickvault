@@ -228,41 +228,17 @@ const fn stall_scan_is_starved(
         && stale_scans >= STALL_SCAN_STARVED_AFTER_SCANS
 }
 
-/// Decide whether the boot-completed "the app is alive" signal
-/// (`tv_boot_completed`) may be emitted, given each feed's enabled flag and its
-/// observed lane-running state.
+/// Pure decision behind [`emit_boot_completed_when_feed_live`]: should the
+/// alive signal (`tv_boot_completed`) be published?
 ///
-/// FEED-AGNOSTIC by construction: the signal is warranted iff AT LEAST ONE
-/// ENABLED feed is running — a live Groww satisfies it when only Groww is
-/// enabled, a live Dhan when only Dhan is enabled, and either when both are
-/// enabled. A running-but-DISABLED feed never counts (an operator-off feed is
-/// not a reason to claim "alive").
-///
-/// The one exception: when NO feed is enabled (a deliberately feed-less run —
-/// shared-infra-only), the signal IS emitted so the boot-heartbeat alarm does
-/// not false-page a legitimately headless boot. The caller logs that case
-/// explicitly.
-///
-/// This closes the alerting hole where a boot that reached the emit line with
-/// EVERY enabled feed dead still published `tv_boot_completed=1` — so the
-/// boot-heartbeat alarm (`treat_missing_data="breaching"`) never paged. With
-/// this gate, "every enabled feed failed to come up" withholds the metric →
-/// MISSING → the alarm pages, exactly the intended signal.
-///
-/// Pure + O(1) — unit-tested truth table.
-fn boot_completed_should_emit(
-    dhan_enabled: bool,
-    groww_enabled: bool,
-    dhan_running: bool,
-    groww_running: bool,
-) -> bool {
-    // Deliberately feed-less run: nothing to be "live", so emit to avoid a
-    // false page on a headless shared-infra-only boot.
-    if !dhan_enabled && !groww_enabled {
-        return true;
-    }
-    // At least one feed enabled: emit iff at least one ENABLED feed is running.
-    (dhan_enabled && dhan_running) || (groww_enabled && groww_running)
+/// A deliberately feed-less run (`!dhan_enabled`) emits — a headless
+/// shared-infra-only boot must not false-page the boot-heartbeat alarm.
+/// Otherwise the signal is published only when the enabled feed is genuinely
+/// running, so a boot whose feed died WITHHOLDS it and the alarm pages on the
+/// missing metric. A running flag on a DISABLED feed never counts.
+#[must_use]
+pub fn boot_completed_should_emit(dhan_enabled: bool, dhan_running: bool) -> bool {
+    !dhan_enabled || dhan_running
 }
 
 /// Emit `tv_boot_completed` ONLY once at least one enabled feed's lane is
@@ -276,7 +252,6 @@ fn boot_completed_should_emit(
 async fn emit_boot_completed_when_feed_live(
     feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     dhan_enabled: bool,
-    groww_enabled: bool,
     // BUG-2 fix (2026-07-05): `true` when the Dhan lane COMPLETED its boot
     // but deliberately built no pool (non-trading day / offline slow boot).
     // The lane is honestly NOT running (`dhan_running=false` on the feeds
@@ -286,14 +261,14 @@ async fn emit_boot_completed_when_feed_live(
     // waits for the lane-running flag).
     dhan_poolless_idle: bool,
 ) {
-    if !dhan_enabled && !groww_enabled {
+    if !dhan_enabled {
         // Deliberately feed-less run — emit immediately (no feed to wait for),
         // logged explicitly so the operator sees WHY the "alive" signal fired
         // with no live feed.
         info!(
-            "boot-completed: no feed enabled (dhan_enabled=false, groww_enabled=false) — \
-             emitting the alive signal immediately for the REST-only boot (the per-minute \
-             Dhan/Groww REST legs are config-gated by their own sections, not these flags)"
+            "boot-completed: no feed enabled (dhan_enabled=false) — emitting the alive \
+             signal immediately for the REST-only boot (the per-minute Dhan REST \
+             legs are config-gated by their own sections, not this flag)"
         );
         emit_boot_completed();
         return;
@@ -305,13 +280,10 @@ async fn emit_boot_completed_when_feed_live(
         // BUG-2 fix: a poolless-idle Dhan lane counts as "alive" for the
         // boot signal — the boot completed; there is simply no market today.
         let dhan_running = feed_runtime.is_dhan_lane_running() || dhan_poolless_idle;
-        let groww_running = feed_runtime.is_groww_lane_running();
-        if boot_completed_should_emit(dhan_enabled, groww_enabled, dhan_running, groww_running) {
+        if boot_completed_should_emit(dhan_enabled, dhan_running) {
             info!(
                 dhan_enabled,
-                groww_enabled,
                 dhan_running,
-                groww_running,
                 dhan_poolless_idle,
                 "boot-completed: a live feed is up (or the Dhan lane completed a \
                  pool-less non-trading-day boot) — emitting the alive signal"
@@ -325,9 +297,7 @@ async fn emit_boot_completed_when_feed_live(
             // MISSING metric, and name the dead feed(s) for the operator.
             error!(
                 dhan_enabled,
-                groww_enabled,
                 dhan_running,
-                groww_running,
                 wait_secs = BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS,
                 "boot-completed: NO enabled feed reached a live state within the wait window — \
                  WITHHOLDING the alive signal (tv_boot_completed) so the boot-heartbeat alarm \
@@ -579,17 +549,6 @@ async fn async_main() -> Result<()> {
         // resurrect the retired feed over the production.toml flip (the
         // boot-heartbeat false-page class). One boot-time warn makes the
         // suppression visible (never silent).
-        if tickvault_api::feed_state_persist::groww_overlay_suppressed(
-            &config.feeds,
-            persisted.as_ref(),
-        ) {
-            warn!(
-                "feed-state overlay requested groww_enabled=true but the config says false — \
-                 overlay SUPPRESSED: the Groww live feed is retired by operator directive \
-                 2026-07-15 (both brokers are REST-only for market data). Re-enabling requires \
-                 a config change + restart."
-            );
-        }
         config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
     }
     let feeds = &config.feeds;
@@ -623,13 +582,11 @@ async fn async_main() -> Result<()> {
     // exists anymore).
     info!(
         dhan_enabled = feeds.dhan_enabled,
-        groww_enabled = feeds.groww_enabled,
-        both_enabled = feeds.both_enabled(),
         "feed selection: which market-data feeds are configured"
     );
     if !feeds.any_enabled() {
         warn!(
-            "[feeds] both dhan_enabled and groww_enabled are false — no market-data \
+            "[feeds] dhan_enabled is false — no market-data \
              feed is configured; the Dhan boot path still runs as today until the \
              feed-gating PR lands"
         );
@@ -1492,18 +1449,10 @@ async fn async_main() -> Result<()> {
     // path.
     // =======================================================================
     if !config.feeds.dhan_enabled {
-        if config.feeds.groww_enabled {
-            info!(
-                "GROWW-ONLY MODE — Dhan boot skipped; Groww lane running, shared infra (API + \
-                 seal-writer + aggregator) coming up via the unified hoisted prefix"
-            );
-        } else {
-            warn!(
-                "NO FEED ENABLED — both dhan_enabled and groww_enabled are false; \
-                 shared-infra-only runtime (API + seal-writer + aggregator) coming up via the \
-                 unified hoisted prefix"
-            );
-        }
+        warn!(
+            "NO FEED ENABLED — dhan_enabled is false; shared-infra-only runtime \
+             (API + seal-writer + aggregator) coming up via the unified hoisted prefix"
+        );
     }
 
     // =====================================================================
@@ -1737,16 +1686,6 @@ async fn async_main() -> Result<()> {
         config.questdb.clone(),
     );
 
-    if config.groww_universe.enabled {
-        let _groww_universe_rider =
-            tickvault_app::groww_universe::spawn_groww_universe_rider(config.questdb.clone());
-    } else {
-        info!(
-            "[groww_universe] disabled — daily Groww watch-set rider not spawned \
-             (spot-leg VIX resolution + feed='groww' master continuity degrade)"
-        );
-    }
-
     // Tick-conservation retirement (2026-07-18): the daily 15:40 IST
     // conservation audit spawn was DELETED — its inputs (live WAL frames,
     // processor counters, `ticks` writes) all died with the live-WS
@@ -1793,16 +1732,6 @@ async fn async_main() -> Result<()> {
         &feed_runtime,
     );
 
-    // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12) —
-    // PROCESS-GLOBAL spawn like the scoreboard above: the 15:50 IST runner
-    // + supervisor. Config-gated ([brutex_crossverify] enabled, default OFF);
-    // disabled = one info! + return, nothing spawned.
-    tickvault_app::brutex_crossverify_boot::spawn_brutex_crossverify_task(
-        &config,
-        &trading_calendar,
-        &notifier,
-    );
-
     // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
     // the Groww per-minute REST plan) — the slow-path call site; the FAST
     // crash-recovery arm carries its own (hostile round 1 item 1 — the
@@ -1814,15 +1743,6 @@ async fn async_main() -> Result<()> {
     // Order-runtime mark tap (re-homed 2026-07-16): the forwarder rides
     // into the Groww REST legs (spot + contract) — the only mark sources
     // since the live bridge retired. `None` when `[order_runtime]` is off.
-    spawn_groww_spot_1m_leg(
-        &config,
-        &notifier,
-        &trading_calendar,
-        // Clone: the ORIGINAL rides into the cadence scheduler below —
-        // since PR #1624 the cadence Groww executor is the LIVE mark
-        // producer (these legacy legs are config-OFF at HEAD).
-        order_runtime_mark_forwarder.clone(),
-    );
 
     // Full-fidelity order/position PUSH-event capture (ORDER-EVT-01,
     // 2026-07-18 — `.claude/rules/project/order-update-events-error-codes.md`):
@@ -1856,16 +1776,6 @@ async fn async_main() -> Result<()> {
         &notifier,
     );
 
-    // Post-close Dhan↔Groww spot_1m_rest cross-broker OHLC comparator
-    // (SPOT-XVERIFY-01/02) — PROCESS-GLOBAL, config-gated (`[spot_crossverify]
-    // enabled`), 15:47 IST, DEDUP-idempotent. See
-    // `spot_crossverify_boot::spawn_spot_crossverify_tasks`.
-    tickvault_app::spot_crossverify_boot::spawn_spot_crossverify_tasks(
-        &config,
-        &trading_calendar,
-        &notifier,
-    );
-
     // Judge-locked cadence scheduler — PROCESS-GLOBAL like the verifier
     // above (2026-07-14): per-minute chain + spot fire timing with
     // structural zero-429 gates, failure ladder, and event-driven dry-run
@@ -1874,7 +1784,7 @@ async fn async_main() -> Result<()> {
     // PR; the once-per-process AtomicBool inside makes the fast-arm +
     // prefix dual-spawn safe. See `cadence_boot::spawn_cadence_scheduler`.
     // Order-leg P&L (2026-07-19): shared leg-identity handle + boot consumer.
-    let leg_identity_index = tickvault_app::groww_cadence_executor::new_shared_leg_identity_index();
+    let leg_identity_index = tickvault_app::leg_identity::new_shared_leg_identity_index();
     let order_leg_pnl_tx = tickvault_app::order_leg_pnl_boot::spawn_order_leg_pnl_capture(
         config.order_runtime.enabled,
         &config.order_leg_pnl,
@@ -2391,15 +2301,8 @@ async fn async_main() -> Result<()> {
     {
         let bc_feed_runtime = std::sync::Arc::clone(&feed_runtime);
         let bc_dhan_enabled = config.feeds.dhan_enabled;
-        let bc_groww_enabled = config.feeds.groww_enabled;
         tokio::spawn(async move {
-            emit_boot_completed_when_feed_live(
-                &bc_feed_runtime,
-                bc_dhan_enabled,
-                bc_groww_enabled,
-                false,
-            )
-            .await;
+            emit_boot_completed_when_feed_live(&bc_feed_runtime, bc_dhan_enabled, false).await;
         });
     }
 
@@ -2932,7 +2835,7 @@ async fn build_shared_infra(
     };
     // Boot bubble (2026-07-09): declare which feed lines the checklist
     // shows as pending from its first page.
-    notifier.set_boot_expectations(config.feeds.dhan_enabled, config.feeds.groww_enabled);
+    notifier.set_boot_expectations(config.feeds.dhan_enabled);
 
     // Positive boot signal (audit-findings Rule 11): the once-per-boot
     // BootHealthCheck ping with the real healthy/total container counts —
@@ -3813,14 +3716,13 @@ mod tests {
 
     // ── build_feed_status_lines (Telegram feed parity, 2026-07-03) ──
     // The readiness + end-of-day messages must list EVERY enabled feed
-    // (Dhan, Groww, future) with honest unknowns — never fabricated data.
+    // with honest unknowns — never fabricated data.
 
     // ── boot_completed_should_emit truth table ──
-    // The alive signal (tv_boot_completed) must be published only when at least
-    // one ENABLED feed is running — so a boot where every enabled feed died
-    // withholds it and the boot-heartbeat alarm pages. No feed enabled emits
-    // (headless run must not false-page). A running-but-disabled feed never
-    // counts.
+    // The alive signal (tv_boot_completed) must be published only when the
+    // ENABLED feed is running — so a boot whose feed died withholds it and
+    // the boot-heartbeat alarm pages. No feed enabled emits (a headless run
+    // must not false-page). A running-but-disabled feed never counts.
 
     // ── compute_tick_freshness (SLO fractional coverage, 2026-07-03) ──
     // Pins the D2 fix: tick_freshness is 1 − silent/universe (clamped),
@@ -3828,58 +3730,23 @@ mod tests {
     // fails these tests.
 
     #[test]
-    fn test_boot_completed_should_emit_both_off_emits() {
-        // No feed enabled at all → emit (deliberately feed-less run must not
-        // false-page). Feed-running values are irrelevant here.
-        assert!(boot_completed_should_emit(false, false, false, false));
-        assert!(boot_completed_should_emit(false, false, true, true));
+    fn test_boot_completed_should_emit_feed_disabled_emits() {
+        // Deliberately feed-less run → emit; a headless shared-infra-only
+        // boot must not false-page. The running flag is irrelevant here.
+        assert!(boot_completed_should_emit(false, false));
+        assert!(boot_completed_should_emit(false, true));
     }
 
     #[test]
-    fn test_boot_completed_should_emit_dhan_only_live() {
-        assert!(boot_completed_should_emit(true, false, true, false));
+    fn test_boot_completed_should_emit_feed_enabled_and_live() {
+        assert!(boot_completed_should_emit(true, true));
     }
 
     #[test]
-    fn test_boot_completed_should_emit_dhan_only_dead() {
-        // Dhan enabled but not running, Groww disabled → withhold (page).
-        assert!(!boot_completed_should_emit(true, false, false, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_groww_only_live() {
-        assert!(boot_completed_should_emit(false, true, false, true));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_groww_only_dead() {
-        assert!(!boot_completed_should_emit(false, true, false, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_both_enabled_only_dhan_live() {
-        assert!(boot_completed_should_emit(true, true, true, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_both_enabled_only_groww_live() {
-        assert!(boot_completed_should_emit(true, true, false, true));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_both_enabled_none_live() {
-        // Both enabled, neither running → withhold (page). This is the core
-        // alerting-hole case: previously the metric was published unconditionally.
-        assert!(!boot_completed_should_emit(true, true, false, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_running_but_disabled_feed_does_not_count() {
-        // Dhan DISABLED but its running flag is somehow true (stale) — it must NOT
-        // count; only the ENABLED Groww matters, and Groww is dead → withhold.
-        assert!(!boot_completed_should_emit(false, true, true, false));
-        // Symmetric: Groww disabled-but-running, Dhan enabled-and-dead → withhold.
-        assert!(!boot_completed_should_emit(true, false, false, true));
+    fn test_boot_completed_should_emit_feed_enabled_and_dead_withholds() {
+        // The core alerting-hole case: the metric was once published
+        // unconditionally, so a dead feed still reported a healthy boot.
+        assert!(!boot_completed_should_emit(true, false));
     }
 
     // PR-C (2026-05-26): historical-fetch source-scan guards removed —
@@ -4049,21 +3916,6 @@ mod tests {
              default"
         );
     }
-
-    /// Step C ratchet: both run-mode log branches must exist — Groww-only
-    /// (Dhan off, Groww on) and idle (neither on, no crash).
-    #[test]
-    fn test_step_c_groww_only_and_idle_branches() {
-        let src = include_str!("main.rs");
-        assert!(
-            src.contains("GROWW-ONLY MODE"),
-            "Step C: the Groww-only run-mode branch must exist"
-        );
-        assert!(
-            src.contains("NO FEED ENABLED"),
-            "Step C: the no-feed idle branch must exist (idle, not crash)"
-        );
-    }
 }
 
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up): the
@@ -4074,197 +3926,6 @@ mod tests {
 // QuestDB `tick_conservation_audit` TABLE is retained (SEBI, forensic).
 // Runbook retirement banner:
 // `.claude/rules/project/tick-conservation-audit-error-codes.md`.
-
-/// Dual-feed scoreboard (operator directive 2026-07-10) — PROCESS-GLOBAL,
-/// spawned exactly once from `main()`'s prefix, gated on `[scoreboard]
-/// enabled` (the B12 rollback switch: `false` ⇒ nothing here spawns).
-///
-/// Two tasks:
-/// 1. Boot-time process-death reconciler — after a settle delay it
-///    synthesizes `process_death` episodes (blame `ours`, deterministic ts
-///    ⇒ DEDUP-idempotent) for connections that were "up" when the previous
-///    process died. See `feed_scoreboard_boot::reconcile_process_death_episodes`.
-/// 2. The daily aggregation at `[scoreboard] trigger_secs_of_day_ist`
-///    (default 15:45:00 IST) with the inner/outer supervisor idiom (the
-///    cross_verify_1m pattern): the inner task returns the summary; the
-///    outer watcher sends the `DualFeedDailyScorecard` Telegram on success
-///    and `DualFeedScorecardAborted` on Err/panic — the daily signal can
-///    never be silently dropped. Graceful-shutdown cancellation stays
-///    silent (normal teardown, not an abort).
-/// Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
-/// the Groww per-minute REST plan), called from the single process-global
-/// boot prefix (PR-C2, 2026-07-13: the FAST crash-recovery arm and its
-/// second call site are deleted). PROCESS-GLOBAL and deliberately NOT the
-/// deleted Dhan-gated `spawn_post_market_tasks` seam: this leg's token is
-/// the shared-minter SSM read (never the Dhan JWT), so a Dhan-off
-/// (Groww-only) session still runs it. Config-gated fail-safe: an absent
-/// `[groww_spot_1m]` section disables it. Supervised respawn wrapper;
-/// self-skips on non-trading days / past 15:30 IST (post the one bounded
-/// ~15:31 repair sweep).
-// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested boot modules; the call site + the config gates pinned by crates/app/tests/groww_spot_1m_wiring_guard.rs + crates/app/tests/groww_chain_1m_wiring_guard.rs.
-fn spawn_groww_spot_1m_leg(
-    config: &ApplicationConfig,
-    notifier: &std::sync::Arc<NotificationService>,
-    trading_calendar: &std::sync::Arc<TradingCalendar>,
-    // Order-runtime mark tap (re-homed 2026-07-16 — the live-bridge tap
-    // died with the retired Groww live feed): rides into the spot +
-    // contract legs; `None` ⇒ `[order_runtime]` disabled, taps inert.
-    mark_forwarder: Option<tickvault_app::order_runtime::MarkForwarder>,
-) {
-    // 2026-07-14 auto-ladder (operator approval — the two-wave / seven
-    // burst tiers): the spot→chain sequencing channel is RETIRED — each
-    // Groww REST leg fires on its OWN minute-boundary timer; the shared
-    // session-scoped burst state below carries the configured tier + the
-    // 429 auto-demote latch across ALL Groww REST legs (one pooled Groww
-    // rate bucket ⇒ one demotion signal). Boot resets to the configured
-    // tier by construction (fresh state per process).
-    let chain_enabled = config.groww_option_chain_1m.enabled;
-    let burst = tickvault_app::groww_rest_burst::GrowwRestBurstState::new(
-        config.groww_rest_burst.tier,
-        config.groww_rest_burst.warm_up,
-    );
-    // PR-4 sequencing + selection handoff: the chain→contract channel +
-    // anchor store exist ONLY when BOTH legs are on (contract-off keeps
-    // the chain leg byte-identical to PR-3). The contract leg DEPENDS on
-    // the chain leg's per-minute anchors — enabled-without-chain is
-    // refused loudly, never a silent anchor-less loop.
-    let contract_enabled = config.groww_contract_1m.enabled && chain_enabled;
-    if config.groww_contract_1m.enabled && !chain_enabled {
-        warn!(
-            code = tickvault_common::error_code::ErrorCode::Spot1m01FetchDegraded.code_str(),
-            stage = "enabled_without_chain",
-            feed = "groww",
-            leg = "contract_1m",
-            "SPOT1M-01: [groww_contract_1m] is enabled but the chain leg \
-             ([groww_option_chain_1m]) is OFF — the contract leg needs the \
-             chain's per-minute ATM anchors; NOT spawned (enable the chain \
-             leg first)"
-        );
-    }
-    let (chain_minute_done_tx, chain_minute_done_rx, contract_anchor_store) = if contract_enabled {
-        let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
-        let store: tickvault_app::groww_option_chain_1m_boot::GrowwChainAnchorStore =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        (Some(tx), Some(rx), Some(store))
-    } else {
-        (None, None, None)
-    };
-    if config.groww_spot_1m.enabled {
-        let _groww_spot1m_supervisor =
-            tickvault_app::groww_spot_1m_boot::spawn_supervised_groww_spot_1m(
-                tickvault_app::groww_spot_1m_boot::GrowwSpot1mTaskParams {
-                    notifier: notifier.clone(),
-                    calendar: std::sync::Arc::clone(trading_calendar),
-                    questdb: config.questdb.clone(),
-                    burst: std::sync::Arc::clone(&burst),
-                    // OWN-FIRE spot closes → the dry-run runtime's marks.
-                    mark_forwarder: mark_forwarder.clone(),
-                },
-            );
-        info!(
-            tier = config.groww_rest_burst.tier.as_str(),
-            "groww_spot_1m: Groww per-minute spot 1m REST leg spawned \
-             (fires each minute close 09:16:00-15:30:00 IST; concurrent \
-             spot wave per the configured burst tier)"
-        );
-    } else {
-        info!("groww_spot_1m: disabled by config — Groww per-minute spot fetch not spawned");
-    }
-    // Groww per-minute option-chain leg: fires on its OWN minute-boundary
-    // timer (2026-07-14 auto-ladder — the spot→chain sequencing wait is
-    // retired); concurrent underlying wave per the shared burst tier.
-    // DEFAULT-OFF pending the first live probe — the probe-and-report
-    // path runs instead while disabled (one bounded chain call per
-    // underlying, Info verdict).
-    if chain_enabled {
-        let _groww_chain1m_supervisor =
-            tickvault_app::groww_option_chain_1m_boot::spawn_supervised_groww_chain_1m(
-                tickvault_app::groww_option_chain_1m_boot::GrowwChain1mTaskParams {
-                    notifier: notifier.clone(),
-                    calendar: std::sync::Arc::clone(trading_calendar),
-                    questdb: config.questdb.clone(),
-                    burst: std::sync::Arc::clone(&burst),
-                    minute_done_tx: chain_minute_done_tx,
-                    anchor_store: contract_anchor_store.clone(),
-                    cadence_enabled: config.cadence.enabled,
-                },
-            );
-        info!(
-            tier = config.groww_rest_burst.tier.as_str(),
-            "groww_chain_1m: Groww per-minute option-chain leg spawned \
-             (fires each minute close on its own timer; concurrent \
-             underlying wave per the configured burst tier)"
-        );
-        // Groww per-contract 1m leg (PR-4, the fill-model leg): sequenced
-        // after the chain fire via the watch signal + fallback timer;
-        // selection = ATM window from the chain's in-memory anchors,
-        // hard-capped per minute. DEFAULT-OFF (depends on the chain leg).
-        if contract_enabled {
-            let _groww_contract1m_supervisor =
-                tickvault_app::groww_contract_1m_boot::spawn_supervised_groww_contract_1m(
-                    tickvault_app::groww_contract_1m_boot::GrowwContract1mTaskParams {
-                        notifier: notifier.clone(),
-                        calendar: std::sync::Arc::clone(trading_calendar),
-                        questdb: config.questdb.clone(),
-                        chain_minute_done: chain_minute_done_rx,
-                        anchor_store: contract_anchor_store,
-                        strikes_each_side: config.groww_contract_1m.strikes_each_side,
-                        burst: std::sync::Arc::clone(&burst),
-                        // OWN-FIRE contract closes → the option-leg marks.
-                        mark_forwarder: mark_forwarder.clone(),
-                    },
-                );
-            info!(
-                "groww_contract_1m: Groww per-minute contract candle leg \
-                 spawned (fires each minute close right after the Groww \
-                 chain fetch; ATM-window selection, sequential contract \
-                 pacing)"
-            );
-        } else {
-            info!(
-                "groww_contract_1m: disabled by config — Groww per-minute \
-                 contract fetch not spawned"
-            );
-        }
-    } else if config.groww_option_chain_1m.probe_and_report {
-        let _groww_chain1m_probe = tokio::spawn(
-            tickvault_app::groww_option_chain_1m_boot::run_groww_chain_1m_probe(
-                tickvault_app::groww_option_chain_1m_boot::GrowwChain1mTaskParams {
-                    notifier: notifier.clone(),
-                    calendar: std::sync::Arc::clone(trading_calendar),
-                    questdb: config.questdb.clone(),
-                    burst: std::sync::Arc::clone(&burst),
-                    minute_done_tx: None,
-                    anchor_store: None,
-                    cadence_enabled: config.cadence.enabled,
-                },
-            ),
-        );
-        info!(
-            "groww_chain_1m: pipeline OFF — one boot-time chain probe \
-             spawned (verdict via Telegram; persists nothing)"
-        );
-    } else {
-        info!("groww_chain_1m: disabled by config (probe off) — nothing spawned");
-    }
-    // 2026-07-14 off-hours rate probe (env-gated, DEFAULT OFF): arm with
-    // TICKVAULT_GROWW_RATE_PROBE=1 on an off-hours run to measure
-    // Groww's real burst tolerance (4→6→8→11 req/s steps). Refused
-    // inside the [08:30, 16:00) IST wall-clock blackout on ANY day
-    // (SECURITY-MEDIUM 2026-07-14 — no calendar dependency, so a stale
-    // holiday list can never fire the burst mid-session); the operator
-    // must also coordinate the run with BruteX's nightly bulk window
-    // (§9.7). Results are structured logs + counters only — NO data
-    // tables.
-    if std::env::var(tickvault_app::groww_rate_probe::GROWW_RATE_PROBE_ENV).as_deref() == Ok("1") {
-        tokio::spawn(tickvault_app::groww_rate_probe::run_groww_rate_probe());
-        info!(
-            "groww_rate_probe: armed via TICKVAULT_GROWW_RATE_PROBE=1 — \
-             escalating off-hours burst probe spawned (refuses to run \
-             inside the [08:30, 16:00) IST wall-clock blackout window)"
-        );
-    }
-}
 
 // TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (decide_scoreboard_start / synthesize_process_death_episodes / SQL builders / parsers); spawn site pinned by test_feed_scoreboard_task_is_wired_into_main.
 fn spawn_feed_scoreboard_tasks(
@@ -4635,7 +4296,7 @@ fn spawn_feed_scoreboard_tasks(
         let runtime_enabled_now = if target_ist_day == today_day {
             Some((
                 sb_feed_runtime.is_enabled(tickvault_common::feed::Feed::Dhan),
-                sb_feed_runtime.is_enabled(tickvault_common::feed::Feed::Groww),
+                sb_feed_runtime.is_enabled(tickvault_common::feed::Feed::Truedata),
             ))
         } else {
             None
@@ -4697,17 +4358,7 @@ fn spawn_feed_scoreboard_tasks(
         match inner.await {
             Ok(Ok(Some(summary))) => {
                 if sb_telegram_enabled {
-                    // Scoreboard PR-B (2026-07-10): the round-2 Groww
-                    // drops blind spot is CLOSED for its dominant failure
-                    // mode — the sidecar socket-death family now writes
-                    // `stall_restarted` rows (counted in the Stalls column),
-                    // so Groww's drops count (feed-disable + bridge-death)
-                    // renders as a measured number again. Honest residual
-                    // (runbook §6): in-sidecar reconnects that recover
-                    // FASTER than the 30s stall threshold remain invisible
-                    // to both columns on both card sides.
-                    let groww_line = to_line("Groww", &summary.groww);
-                    // Groww REST plan PR-5 (operator Quote 2, 2026-07-13):
+                    // REST plan PR-5 (operator Quote 2, 2026-07-13):
                     // the official minute-candle pull digest lines — the
                     // four canonical feed/leg pairs always render (honest
                     // "not measured yet" when a source is absent); the
@@ -4719,14 +4370,12 @@ fn spawn_feed_scoreboard_tasks(
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
-                        groww: groww_line,
                         session_minutes: summary.session_minutes,
                         partial_coverage: summary.partial_coverage,
                         degraded: summary.degraded,
                         early_run: summary.early_run,
                         restart_partial: summary.restart_partial,
                         dhan_feed_off: summary.dhan_feed_off,
-                        groww_feed_off: summary.groww_feed_off,
                         rest_legs,
                         rest_legs_read_failed: summary.rest_legs_read_failed,
                     });

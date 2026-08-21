@@ -498,7 +498,7 @@ mod tests {
     fn sample_record() -> PositionUpdateEventRecord {
         PositionUpdateEventRecord {
             ts_ist_nanos: 1_770_000_900_000_000_000,
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             event_seq: 7,
             symbol_isin: "INE002A01018".to_string(),
             security_id: -1,

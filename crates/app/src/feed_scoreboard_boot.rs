@@ -63,8 +63,8 @@ use tickvault_storage::feed_episode_audit_persistence::{
 };
 use tickvault_storage::feed_scoreboard_persistence::{
     CoverageSource, FeedScoreboardDailyRow, FeedScoreboardWriter, LAG_FLOOR_MS_DHAN,
-    LAG_FLOOR_MS_GROWW, LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_SESSION_MINUTES,
-    SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables,
+    LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_SESSION_MINUTES, SCOREBOARD_UNAVAILABLE_SENTINEL,
+    ScoreboardOutcome, ensure_feed_scoreboard_tables,
 };
 use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 
@@ -3852,7 +3852,6 @@ pub async fn run_feed_scoreboard(
             lag_samples: n.lag_samples,
             lag_floor_ms: match *feed {
                 tickvault_common::feed::Feed::Dhan => LAG_FLOOR_MS_DHAN,
-                tickvault_common::feed::Feed::Groww => LAG_FLOOR_MS_GROWW,
                 tickvault_common::feed::Feed::Truedata => LAG_FLOOR_MS_TRUEDATA,
             },
             disconnects_market: n.disconnects_market,

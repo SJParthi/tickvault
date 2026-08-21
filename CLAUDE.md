@@ -174,7 +174,21 @@ crates/
 > market-data feeds retired 2026-07-13/15) — so it misdescribed the architecture, not just
 > the paths. Rows below are the real modules; descriptions are taken from each module's own
 > `//!` header. Ratcheted by
-> `crates/common/tests/claude_md_codebase_map_guard.rs`.
+> `crates/common/tests/claude_md_codebase_map_guard.rs`.>
+> **Corrected 2026-08-21 (the Groww feed removal):** this table carried a row for
+> `brutex_crossverify_persistence.rs` / `spot_crossverify_persistence.rs`,
+> "Cross-verification audit tables". Both are DELETED. Each was a cross-BROKER
+> comparator that joined on `feed='groww'` — one against BruteX's S3 CSVs, one
+> against our own stored Dhan rows — so with a single broker they would have
+> compared against a table that can never gain another row, and reported
+> `compared = 0` as a clean day. That is the false-OK class this repository has
+> already retired twice, and the 2026-08-21 scope-lock REJECT list names it
+> explicitly. The row is replaced by `dhan_live_crossverify_persistence.rs`,
+> which compares our own aggregation against the vendor's own 1-minute tape and
+> therefore needs no second broker. It is now the ONLY ground truth the revived
+> Dhan feed has, and its error code moved from the borrowed `SPOT-XVERIFY-02` to
+> its own `DHAN-LIVE-XVERIFY-01`.
+
 
 | File | Contains |
 |------|----------|
@@ -190,14 +204,14 @@ crates/
 | `instrument_lifecycle_persistence.rs` | `instrument_lifecycle` + `instrument_lifecycle_audit` (SEBI never-delete) |
 | `order_audit_persistence.rs` | `order_audit` table — SEBI 5-year order-lifecycle forensics |
 | `order_update_events_persistence.rs` / `position_update_events_persistence.rs` | Broker order/position push events (paper mode) |
-| `order_leg_pnl_persistence.rs` / `pnl_audit_persistence.rs` / `cross_fill_audit_persistence.rs` | Order-leg P&L + P&L audit + cross-fill forensics |
+| `order_leg_pnl_persistence.rs` / `pnl_audit_persistence.rs` | Order-leg P&L + P&L audit |
 | `ws_event_audit_persistence.rs` | `ws_event_audit` table — WebSocket lifecycle audit (AUDIT-WS-01) |
 | `partition_manager.rs` / `partition_archive.rs` | QuestDB partition lifecycle + archive→verify→drop retention (S3 cold) |
 | `questdb_health.rs` | QuestDB health poller |
 | `console_views.rs` | Analyst console views — `ticks_named` + `candles_named` |
 | `feed_scoreboard_persistence.rs` / `feed_episode_audit_persistence.rs` | Daily feed scoreboard + feed-episode audit tables |
 | `shadow_candle_writer.rs` / `shadow_persistence.rs` / `shadow_seal_columns.rs` | Shadow candle-engine ILP append path |
-| `brutex_crossverify_persistence.rs` / `spot_crossverify_persistence.rs` | Cross-verification audit tables |
+| `dhan_live_crossverify_persistence.rs` | Live-vs-REST cross-verification audit tables — the revived feed's only ground truth |
 | `tf_consistency_audit_persistence.rs` | Timeframe-consistency audit table |
 | `index_constituency_persistence.rs` | `index_constituency` table (SEBI point-in-time) |
 | `lifecycle_reconciler.rs` | Pure `classify_transition` — lifecycle state-transition classification |

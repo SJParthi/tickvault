@@ -15,7 +15,6 @@ use tickvault_common::moneyness::{
 };
 
 use super::executor::SpotTarget;
-use super::schedule::{CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS, CycleSlots};
 use crate::pipeline::chain_snapshot::{
     ChainMoneynessSnapshot, ChainUnderlying, load_chain_snapshot,
 };
@@ -282,88 +281,6 @@ impl LaneAssembly {
         }
         filled
     }
-
-    /// Second rung: cross-fill still-missing cells from the OTHER lane's
-    /// same-cycle assembly, freshness-checked per [`cross_fill_fresh`]
-    /// against the caller-supplied `freshness_floor_abs_ms` (the base
-    /// floor from [`cross_fill_freshness_floor_ms`] — simplified
-    /// 2026-07-16 with the pre-close schedule's retirement). Returns
-    /// `(spots_filled, chains_filled)`.
-    pub fn cross_fill_from(
-        &mut self,
-        other: &LaneAssembly,
-        freshness_floor_abs_ms: i64,
-        now_ms: i64,
-        cutoff_abs_ms: i64,
-    ) -> (u32, u32) {
-        let mut spots_filled = 0;
-        let mut chains_filled = 0;
-        for u in ChainUnderlying::ALL {
-            let i = u.index();
-            // M4 (audit 2026-07-20, Dim B): a donor spot whose paise guard
-            // FAILED (`spot_paise == 0` — invalid/absurd price) is refused;
-            // borrowing it would mint a CrossSource cell that anchors every
-            // strike Unknown-at-best (or wrong via the raw f64). The cell
-            // stays empty — the honest skip/degrade path.
-            if let (None, Some(foreign)) = (self.spots[i], other.spots[i])
-                && foreign.spot_paise > 0
-                && cross_fill_fresh(
-                    foreign.minute_ist,
-                    self.cycle_minute_ist,
-                    foreign.fetched_at_ms,
-                    freshness_floor_abs_ms,
-                    now_ms,
-                    cutoff_abs_ms,
-                )
-            {
-                self.spots[i] = Some(SpotCell {
-                    provenance: SpotProvenance::CrossSource,
-                    ..foreign
-                });
-                spots_filled += 1;
-            }
-            if let (None, Some(foreign)) = (self.chains[i], other.chains[i])
-                && cross_fill_fresh(
-                    foreign.minute_ist,
-                    self.cycle_minute_ist,
-                    foreign.fetched_at_ms,
-                    freshness_floor_abs_ms,
-                    now_ms,
-                    cutoff_abs_ms,
-                )
-            {
-                self.chains[i] = Some(ChainCell {
-                    provenance: ChainProvenance::CrossSource,
-                    ..foreign
-                });
-                chains_filled += 1;
-            }
-        }
-        (spots_filled, chains_filled)
-    }
-}
-
-/// The cross-fill freshness window, BOTH directions (design §5, LOCKED):
-/// a foreign snapshot is valid iff its `minute_ts` equals the borrowing
-/// cycle's minute AND it was fetched at/after `freshness_floor_abs_ms`
-/// AND the borrow happens at/before the borrowing lane's cutoff. The
-/// floor is the absolute instant from
-/// [`cross_fill_freshness_floor_ms`]: the plain base T − 5000ms window
-/// (2026-07-16 — every fire on both lanes is POST-close, so same-cycle
-/// completions trivially pass; the floor belts against cross-CYCLE
-/// staleness). Pure.
-#[must_use]
-pub fn cross_fill_fresh(
-    foreign_minute_ist: u32,
-    cycle_minute_ist: u32,
-    foreign_fetched_at_ms: i64,
-    freshness_floor_abs_ms: i64,
-    now_ms: i64,
-    borrowing_cutoff_abs_ms: i64,
-) -> bool {
-    foreign_minute_ist == cycle_minute_ist
-        && foreign_fetched_at_ms >= freshness_floor_abs_ms
-        && now_ms <= borrowing_cutoff_abs_ms
 }
 
 /// The advisory spot price-coherence band, basis points (H3/H2-partial/M14,
@@ -389,22 +306,6 @@ pub fn spots_diverge_paise(a_paise: i64, b_paise: i64) -> bool {
     let denom = a_paise.min(b_paise);
     // diff/denom > BPS/10_000  ⇔  diff * 10_000 > denom * BPS (denom > 0).
     diff.saturating_mul(10_000) > denom.saturating_mul(CADENCE_SPOT_DIVERGENCE_MAX_BPS)
-}
-
-/// The cross-fill freshness floor (absolute IST ms-of-day) for the
-/// cycle described by `slots`: the plain base T − 5000ms
-/// ([`CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS`]). SIMPLIFIED 2026-07-16
-/// (coordinator addendum item 3): retiring the pre-close schedule + the
-/// anchor-shift ladder removed the rung-shifted PRE-fires the
-/// lender-aware widening (CADENCE-XFILL-RUNG-1, 2026-07-15) was built
-/// around — every fire on both lanes is POST-close now, so any
-/// same-cycle completion trivially satisfies the base floor and the
-/// floor is a belt against cross-CYCLE staleness only. Pure.
-#[must_use]
-pub fn cross_fill_freshness_floor_ms(slots: &CycleSlots) -> i64 {
-    slots
-        .boundary_ms
-        .saturating_sub(CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS)
 }
 
 /// One underlying's moneyness classification counts over the registry
@@ -593,10 +494,10 @@ mod tests {
 
     #[test]
     fn test_cadence_assembly_predicate_3_chains_3_spots_vix_advisory() {
-        let mut a = asm(Feed::Groww);
+        let mut a = asm(Feed::Truedata);
         assert!(!a.is_data_complete());
         for u in ChainUnderlying::ALL {
-            a.record_chain(*u, own_chain(Feed::Groww, MINUTE, T_MS + 100, None));
+            a.record_chain(*u, own_chain(Feed::Truedata, MINUTE, T_MS + 100, None));
         }
         assert!(!a.is_data_complete(), "chains alone are not complete");
         a.record_spot(
@@ -644,188 +545,6 @@ mod tests {
     }
 
     /// The rung-0 base floor: T − 5000ms absolute.
-    const BASE_FLOOR_MS: i64 = T_MS - CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS;
-
-    #[test]
-    fn test_cross_source_freshness_window_spans_the_base_floor() {
-        // Data fetched at the floor edge (T−5000) IS fresh for the
-        // borrowing lane's same cycle — the window deliberately keeps
-        // the 5s slack even though every 2026-07-16 fire is post-close.
-        assert!(cross_fill_fresh(
-            MINUTE,
-            MINUTE,
-            T_MS - 5_000,
-            BASE_FLOOR_MS,
-            T_MS + 900,
-            T_MS + 6_000
-        ));
-        // Groww's :00 spot (all fires are post-close) likewise.
-        assert!(cross_fill_fresh(
-            MINUTE,
-            MINUTE,
-            T_MS + 400,
-            BASE_FLOOR_MS,
-            T_MS + 4_500,
-            T_MS + 15_000
-        ));
-        // One ms OLDER than the floor → stale, refused.
-        assert!(!cross_fill_fresh(
-            MINUTE,
-            MINUTE,
-            T_MS - 5_001,
-            BASE_FLOOR_MS,
-            T_MS + 900,
-            T_MS + 6_000
-        ));
-        // Wrong minute → refused regardless of freshness.
-        assert!(!cross_fill_fresh(
-            MINUTE - 60,
-            MINUTE,
-            T_MS + 400,
-            BASE_FLOOR_MS,
-            T_MS + 900,
-            T_MS + 6_000
-        ));
-        // Past the borrowing lane's cutoff → refused.
-        assert!(!cross_fill_fresh(
-            MINUTE,
-            MINUTE,
-            T_MS + 400,
-            BASE_FLOOR_MS,
-            T_MS + 6_001,
-            T_MS + 6_000
-        ));
-    }
-
-    #[test]
-    fn test_cross_fill_freshness_floor_ms_is_the_plain_base_floor() {
-        // 2026-07-16 (coordinator addendum item 3): the lender-aware
-        // widening (CADENCE-XFILL-RUNG-1) retired with the pre-close
-        // schedule — the floor is the PLAIN base T − 5000 for every
-        // shape/tier permutation, and every POST-close completion
-        // (fetched at/after its own scheduled fire ≥ T+0) trivially
-        // passes it.
-        use super::super::schedule::build_cycle_slots;
-        use tickvault_common::config::CadenceConfig;
-        let cfg = CadenceConfig::default();
-        let boundary_secs = 10 * 3600; // 10:00:00 IST — matches T_MS.
-
-        for shape in 0..=1u8 {
-            for step in 0..=3u8 {
-                let slots = build_cycle_slots(boundary_secs, shape, step, 0, &cfg);
-                assert_eq!(
-                    cross_fill_freshness_floor_ms(&slots),
-                    BASE_FLOOR_MS,
-                    "shape {shape} step {step}: the floor is the plain base"
-                );
-                // Every scheduled fire instant is post-close, so a
-                // completion at its own slot always clears the floor.
-                for slot in slots
-                    .dhan_chain_slots_ms
-                    .iter()
-                    .chain(slots.dhan_spot_slots_ms.iter())
-                {
-                    assert!(*slot >= BASE_FLOOR_MS);
-                }
-            }
-        }
-        // A same-minute completion at T+900 is FRESH under the base
-        // floor; a PREVIOUS-cycle leftover (fetched a minute earlier)
-        // is refused — the cross-CYCLE staleness belt the floor exists
-        // for.
-        assert!(cross_fill_fresh(
-            MINUTE,
-            MINUTE,
-            T_MS + 900,
-            BASE_FLOOR_MS,
-            T_MS + 1_000,
-            T_MS + 6_000
-        ));
-        assert!(!cross_fill_fresh(
-            MINUTE,
-            MINUTE,
-            T_MS - 59_000,
-            BASE_FLOOR_MS,
-            T_MS + 1_000,
-            T_MS + 6_000
-        ));
-    }
-
-    #[test]
-    fn test_spot_provenance_order_own_crossfill_chain_embedded() {
-        // Rung 1: own fetch wins and is never overwritten.
-        let mut own = asm(Feed::Dhan);
-        own.record_spot(
-            SpotTarget::Nifty,
-            24_500.0,
-            SpotProvenance::OwnFetch,
-            T_MS + 100,
-            MINUTE,
-        );
-        own.record_spot(
-            SpotTarget::Nifty,
-            99_999.0,
-            SpotProvenance::CrossSource,
-            T_MS + 200,
-            MINUTE,
-        );
-        assert!(
-            own.spot(ChainUnderlying::Nifty)
-                .is_some_and(|s| s.provenance == SpotProvenance::OwnFetch
-                    && (s.price - 24_500.0).abs() < f64::EPSILON)
-        );
-
-        // Rung 2: cross-fill from the other lane's same-cycle data.
-        let mut borrower = asm(Feed::Dhan);
-        let mut lender = asm(Feed::Groww);
-        lender.record_spot(
-            SpotTarget::BankNifty,
-            51_000.0,
-            SpotProvenance::OwnFetch,
-            T_MS + 300,
-            MINUTE,
-        );
-        lender.record_chain(
-            ChainUnderlying::Sensex,
-            own_chain(Feed::Groww, MINUTE, T_MS + 300, Some(81_250.0)),
-        );
-        let (spots, chains) =
-            borrower.cross_fill_from(&lender, BASE_FLOOR_MS, T_MS + 1_000, T_MS + 15_000);
-        assert_eq!((spots, chains), (1, 1));
-        assert!(
-            borrower
-                .spot(ChainUnderlying::Banknifty)
-                .is_some_and(|s| s.provenance == SpotProvenance::CrossSource)
-        );
-        assert!(
-            borrower
-                .chain(ChainUnderlying::Sensex)
-                .is_some_and(|c| c.provenance == ChainProvenance::CrossSource)
-        );
-        // A cross-filled chain KEEPS the lender's registry identity — the
-        // decide-time fold must read the LENDER's slot, never the
-        // borrower's (design §3(e)).
-        assert!(
-            borrower
-                .chain(ChainUnderlying::Sensex)
-                .is_some_and(|c| c.source_feed == Feed::Groww && c.published_to_registry)
-        );
-        assert!(borrower.any_degraded_provenance());
-
-        // Rung 3: chain-embedded fallback fills ONLY still-missing spots.
-        let filled = borrower.fill_spots_from_chain_embedded(T_MS + 1_100);
-        assert_eq!(filled, 1, "only SENSEX lacked a spot and had a chain");
-        assert!(
-            borrower
-                .spot(ChainUnderlying::Sensex)
-                .is_some_and(
-                    |s| s.provenance == SpotProvenance::ChainEmbedded && s.spot_paise == 8_125_000
-                )
-        );
-        // BANKNIFTY keeps its cross-source cell (embedded never
-        // overwrites), NIFTY stays missing (no chain to embed from).
-        assert!(borrower.spot(ChainUnderlying::Nifty).is_none());
-    }
 
     #[test]
     fn test_cadence_record_spot_invalid_price_yields_zero_anchor() {
@@ -895,7 +614,7 @@ mod tests {
             ChainUnderlying::Nifty,
             ChainCell {
                 provenance: ChainProvenance::CrossSource,
-                source_feed: Feed::Groww,
+                source_feed: Feed::Truedata,
                 published_to_registry: true,
                 fetched_at_ms: T_MS + 900,
                 minute_ist: MINUTE,
@@ -914,7 +633,7 @@ mod tests {
     fn test_cadence_assembly_vix_spot_never_gates_any_degraded_provenance() {
         // A VIX-only assembly: vix_spot is readable, the predicate stays
         // false (VIX advisory), and OwnFetch VIX never stamps degraded.
-        let mut a = asm(Feed::Groww);
+        let mut a = asm(Feed::Truedata);
         a.record_spot(
             SpotTarget::IndiaVix,
             14.25,
@@ -925,74 +644,6 @@ mod tests {
         assert!(a.vix_spot().is_some_and(|v| v.atm_paise == 0));
         assert!(!a.is_data_complete());
         assert!(!a.any_degraded_provenance());
-    }
-
-    #[test]
-    fn test_cadence_assembly_cross_fill_from_refuses_when_cross_fill_fresh_false() {
-        // The lender's cells are from the WRONG minute — cross_fill_from
-        // must fill NOTHING (cross_fill_fresh refuses on minute mismatch).
-        let mut borrower = asm(Feed::Dhan);
-        let mut lender = LaneAssembly::new(Feed::Groww, MINUTE - 60, T_MS - 60_000);
-        lender.record_spot(
-            SpotTarget::Nifty,
-            24_500.0,
-            SpotProvenance::OwnFetch,
-            T_MS - 59_000,
-            MINUTE - 60,
-        );
-        lender.record_chain(
-            ChainUnderlying::Nifty,
-            own_chain(Feed::Groww, MINUTE - 60, T_MS - 59_000, None),
-        );
-        assert_eq!(
-            borrower.cross_fill_from(&lender, BASE_FLOOR_MS, T_MS + 1_000, T_MS + 15_000),
-            (0, 0)
-        );
-        assert!(borrower.spot(ChainUnderlying::Nifty).is_none());
-        assert!(borrower.chain(ChainUnderlying::Nifty).is_none());
-    }
-
-    #[test]
-    fn cross_fill_refuses_nonpositive_donor_spot() {
-        // M4 (audit 2026-07-20, Dim B): a donor spot whose paise guard
-        // failed (spot_paise == 0) must NOT cross-fill — the borrower's
-        // cell stays empty (honest skip), while a VALID donor still fills.
-        let mut borrower = asm(Feed::Dhan);
-        let mut lender = asm(Feed::Groww);
-        // Guard-failed donor: non-finite/absurd price → spot_paise == 0.
-        lender.record_spot(
-            SpotTarget::Nifty,
-            -1.0,
-            SpotProvenance::OwnFetch,
-            T_MS + 300,
-            MINUTE,
-        );
-        assert!(
-            lender
-                .spot(ChainUnderlying::Nifty)
-                .is_some_and(|s| s.spot_paise == 0),
-            "precondition: the guard must have failed the donor price"
-        );
-        // Valid donor on a second underlying.
-        lender.record_spot(
-            SpotTarget::BankNifty,
-            51_000.0,
-            SpotProvenance::OwnFetch,
-            T_MS + 300,
-            MINUTE,
-        );
-        let (spots, chains) =
-            borrower.cross_fill_from(&lender, BASE_FLOOR_MS, T_MS + 1_000, T_MS + 15_000);
-        assert_eq!((spots, chains), (1, 0), "only the valid donor fills");
-        assert!(
-            borrower.spot(ChainUnderlying::Nifty).is_none(),
-            "the paise-0 donor was refused"
-        );
-        assert!(
-            borrower
-                .spot(ChainUnderlying::Banknifty)
-                .is_some_and(|s| s.provenance == SpotProvenance::CrossSource)
-        );
     }
 
     #[test]
@@ -1020,9 +671,9 @@ mod tests {
     fn test_cadence_assembly_fill_spots_from_chain_embedded_zero_when_vendor_absent() {
         // Chains present but with NO embedded spot (the genuinely-optional
         // Groww absence) → rung 3 fills nothing, absence tracked upstream.
-        let mut a = asm(Feed::Groww);
+        let mut a = asm(Feed::Truedata);
         for u in ChainUnderlying::ALL {
-            a.record_chain(*u, own_chain(Feed::Groww, MINUTE, T_MS + 100, None));
+            a.record_chain(*u, own_chain(Feed::Truedata, MINUTE, T_MS + 100, None));
         }
         assert_eq!(a.fill_spots_from_chain_embedded(T_MS + 900), 0);
         assert!(!a.is_data_complete());
