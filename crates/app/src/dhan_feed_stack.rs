@@ -9791,7 +9791,24 @@ mod contract_attach_tests {
 #[cfg(test)]
 mod alive_connection_guard_tests {
     use super::{ALIVE_CONNECTIONS, AliveConnectionGuard};
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+
+    /// Serializes the tests in this module.
+    ///
+    /// `ALIVE_CONNECTIONS` is a process-global `AtomicUsize`, and both tests
+    /// read a `base` and then assert an exact `base + 1`. Run on parallel
+    /// threads they interleave and either can fail for a reason that has
+    /// nothing to do with what it checks — which is worse than a plain bug,
+    /// because a test that fails at random teaches people to re-run CI
+    /// instead of reading it.
+    ///
+    /// The same class was fixed the same way in `tv_api_token_prod_guard.rs`
+    /// after PR #1411 merged red on it (merge-gate-lock §3.2). Poisoning is
+    /// absorbed rather than propagated: one test panicking on purpose — which
+    /// the unwind case below does — must not convert every sibling into a
+    /// poisoned-lock failure.
+    static SERIALIZE: Mutex<()> = Mutex::new(());
 
     #[test]
     fn the_count_comes_back_down_on_a_panic_not_only_on_a_clean_return() {
@@ -9802,10 +9819,12 @@ mod alive_connection_guard_tests {
         // it, on the one number an operator reads to answer "how many of the
         // sixteen are up?".
         //
-        // Serialized against the other test in this module by running both
-        // assertions here: `ALIVE_CONNECTIONS` is process-global, and two
-        // tests mutating it on parallel threads would make either flaky for a
-        // reason unrelated to what they check.
+        // CORRECTED 2026-08-21: this comment used to claim the module was
+        // "serialized ... by running both assertions here". It was not — the
+        // second test below mutates the same global, so the two raced, and the
+        // comment asserting safety is exactly what stopped anyone looking.
+        // The real serialization is the mutex above.
+        let _lock = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
         let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
 
         // Clean path.
@@ -9835,6 +9854,7 @@ mod alive_connection_guard_tests {
         // value. If it did not disarm, every clean exit would decrement twice
         // and the gauge would read LOW — the opposite failure, equally wrong,
         // and the one a naive guard introduces while fixing the first.
+        let _lock = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
         let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
         let g = AliveConnectionGuard::acquire();
         let remaining = g.release();
