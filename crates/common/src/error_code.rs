@@ -2277,8 +2277,11 @@ mod tests {
         // 2026-08-21 (operator directive — the entire Groww feed is ordered
         // removed; websocket-connection-scope-lock.md "2026-08-21 (THIRD quote
         // of the day)"): -28 for the Groww ORDER-SIDE families whose only emit
-        // sites were deleted with crates/trading/src/oms/groww/** —
-        assert_eq!(ErrorCode::all().len(), 140);
+        // sites were deleted with crates/trading/src/oms/groww/**; then -2
+        // BRUTEX-XVERIFY and -2 SPOT-XVERIFY with the two Groww-scoped
+        // comparators, and +1 DHAN-LIVE-XVERIFY-01 so the SURVIVING
+        // live-vs-REST comparator stops borrowing a retired code => 127.
+        assert_eq!(ErrorCode::all().len(), 127);
     }
 
     #[test]
@@ -2604,7 +2607,9 @@ mod tests {
                 || s.starts_with("EXIT-ORDER-")
                 || s.starts_with("EXIT-VERIFY-")
                 // Operator 2026-07-14: broker-agnostic fetch-cadence scheduler
-                || s.starts_with("CADENCE-");
+                || s.starts_with("CADENCE-")
+                // The revived Dhan feed's live-vs-REST ground-truth check
+                || s.starts_with("DHAN-LIVE-XVERIFY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

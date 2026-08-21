@@ -567,6 +567,8 @@ mod tests {
 
     #[test]
     fn test_disabled_when_switched_off() {
+        // A feed whose live-WS lane is NOT retired reads the plain operator
+        // wording — the relabel below is scoped to retired lanes only.
         let r = evaluate_feed_health(
             Feed::Truedata,
             FeedHealthInput {
@@ -576,8 +578,21 @@ mod tests {
         );
         assert_eq!(r.verdict, FeedHealthVerdict::Disabled);
         assert_eq!(r.verdict.as_str(), "disabled");
-        // Operator-scare fix (2026-07-20): the retired live-WS lanes read
+        assert_eq!(r.reason, "switched off by operator");
+    }
+
+    #[test]
+    fn test_disabled_retired_lane_reads_off_by_design() {
+        // Operator-scare fix (2026-07-20): a retired live-WS lane reads
         // "off by design", never the scary "switched off by operator".
+        let r = evaluate_feed_health(
+            Feed::Dhan,
+            FeedHealthInput {
+                enabled: false,
+                ..base()
+            },
+        );
+        assert_eq!(r.verdict, FeedHealthVerdict::Disabled);
         assert_eq!(r.reason, "live-WS lane (retired) — off by design");
     }
 

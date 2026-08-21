@@ -227,7 +227,7 @@ mod tests {
     fn test_all_arrays_match_variant_counts() {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
-        assert_eq!(WsType::all().len(), 7);
+        assert_eq!(WsType::all().len(), 5);
         assert_eq!(WsEventKind::all().len(), 7);
     }
 

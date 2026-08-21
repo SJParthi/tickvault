@@ -1623,29 +1623,6 @@ rules:
   # C4 sweep (2026-07-15): rule `dhan-lane-04-teardown-timeout-silence` retired — the DHAN-LANE-04 ErrorCode
   # variant was deleted with the Dhan live-WS retirement (operator 2026-07-13).
 
-  - name: groww-master-01-persist-failed-silence
-    match:
-      code: GROWW-MASTER-01
-    action: silence
-    runbook_path: docs/error-runbooks/groww-shared-master-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GROWW-MASTER-01 = the Groww shared-master persist (instrument_lifecycle +
-      index_constituency, feed='groww') failed via QuestDB ILP. Best-effort
-      cold-path forensic write — the Groww feed, the live tick path, and the
-      Dhan master rows are unaffected, and the idempotent DEDUP UPSERT means the
-      next boot re-runs. Silence (counter records it); escalate only if it
-      persists, which is the same QuestDB-ILP-degraded condition as BOOT-01/02.
-
-  # FEED-STALL-01 = the feed-agnostic stall-watchdog killed + relaunched a
-  # sidecar that was ALIVE but streaming NOTHING across its whole universe for
-  # longer than the threshold during market hours (the silently-closed NATS
-  # socket that left Groww dead at 10:31 IST). A single restart that recovers is
-  # healthy self-heal, but a flapping restart STORM (escalated with the
-  # rapid-restart count) points at a persistent provider-side reject the relaunch
-  # alone cannot fix — so escalate: the operator must see a stall restart and
-  # check the credential / entitlement if it recurs.
   - name: feed-stall-01-sidecar-restarted-escalate
     match:
       code: FEED-STALL-01
@@ -1726,187 +1703,6 @@ rules:
       cooldown so a sustained-pressure window pages once per 5 minutes, not
       once per probe tick.
 
-  # GROWW-SCALE-01 = the auto-scale ladder rolled a failed rung back to the
-  # last KNOWN-healthy connection count (newest conns killed, exponential hold
-  # before retry). The rollback IS the auto-correction — it already fired — but
-  # a rung that keeps failing means the box or the provider refuses that scale
-  # (CPU / capture lag / auth rejects at rung N), which is exactly the live
-  # capacity answer the operator is running the scale test to learn. Escalate
-  # with a cooldown: one page per rollback episode, not per retry.
-  - name: groww-scale-01-rollback-fired-escalate
-    match:
-      code: GROWW-SCALE-01
-    action: escalate
-    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 300
-    justification: >-
-      GROWW-SCALE-01 = the ladder auto-rolled a failed rung back to the last
-      healthy N and armed an exponential hold. Self-corrected, but the operator
-      must see WHICH rung failed and WHY (gate snapshot in the audit row) —
-      that measured ceiling is the scale test's deliverable. 300s cooldown so
-      the expo-hold retry loop pages once per episode.
-
-  # GROWW-SCALE-02 = ALL Groww connections failed inside the 60s window —
-  # classified as an ACCOUNT-level throttle/reject (provider-side), not a
-  # single-rung failure. The ladder already applied the global cooldown and
-  # HALVED the connection count. Escalate: a provider throttle needs the
-  # operator to check the Groww account / token / entitlement before the
-  # ladder re-probes.
-  - name: groww-scale-02-global-halve-escalate
-    match:
-      code: GROWW-SCALE-02
-    action: escalate
-    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 300
-    justification: >-
-      GROWW-SCALE-02 = fleet-wide simultaneous failure (account-level throttle
-      signature). The ladder already cooled down 5 min + halved N; the operator
-      must verify the Groww account/token/entitlement because repeated global
-      halves mean the provider is rejecting the whole fleet, which no local
-      auto-fix can cure.
-
-  # GROWW-SCALE-03 = the shard cutter emitted overlapping / non-covering
-  # shards or the runtime detected the same (exchange, segment, security_id)
-  # in two connections' shards. This is a CUTTER BUG class (Critical): a
-  # double-subscribe burns the per-account subscription budget and a coverage
-  # gap silently drops instruments. The ladder step HALTs fail-closed.
-  # Critical is never auto-triaged — escalate.
-  - name: groww-scale-03-shard-overlap-escalate
-    match:
-      code: GROWW-SCALE-03
-    action: escalate
-    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GROWW-SCALE-03 = shard disjointness/coverage invariant broke at runtime —
-      a cutter bug (the PR-1 ratchets make this near-unreachable). The ladder
-      HALTed fail-closed; no auto-fix applies because the correct action is a
-      code fix, never a resubscribe. Critical severity is never auto-triage-safe.
-
-  # GROWW-SCALE-04 = a groww_scale_audit forensic row failed to persist via
-  # QuestDB ILP. Best-effort mirror of AUDIT-WS-01: ladder decisions continue
-  # on in-memory state; only the queryable forensic row for that transition is
-  # missing until QuestDB recovers (the counter records it). Silence — a
-  # sustained failure surfaces as the same QuestDB-ILP-degraded condition as
-  # BOOT-01/02, which have their own escalation.
-  - name: groww-scale-04-audit-write-failed-silence
-    match:
-      code: GROWW-SCALE-04
-    action: silence
-    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GROWW-SCALE-04 = best-effort audit-row write failed (QuestDB ILP). The
-      ladder is unaffected and the write is idempotent on retry (DEDUP UPSERT).
-      Silence: the tv_groww_scale_audit_write_errors_total counter records it;
-      persistence-layer degradation already escalates via BOOT-01/02.
-
-  # GROWW-SCALE-05 = the Groww scale-FLEET spawn was REFUSED by the fleet
-  # dual-instance SSM lock (a peer instance already holds it, SSM was
-  # unreachable past the bounded retry budget, or the lock was lost mid-run
-  # to a foreign takeover). The boot already degraded fail-closed to the
-  # SINGLE-CONNECTION Groww path (capture continues) — but two hosts scaling
-  # the SAME Groww account is exactly the failure that masquerades as
-  # provider throttle, so the operator MUST decide which host runs the scale
-  # test. Critical is never auto-triage-safe — escalate.
-  - name: groww-scale-05-dual-fleet-detected-escalate
-    match:
-      code: GROWW-SCALE-05
-    action: escalate
-    runbook_path: docs/error-runbooks/groww-scale-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GROWW-SCALE-05 = dual scale-fleet detected (or fleet lock unprovable /
-      lost). Severity::Critical. The refusal already self-degraded to the
-      single-connection Groww path, but only the operator can decide which
-      host owns the multi-connection scale test — shutting the peer down or
-      forcing takeover is never auto-actioned (mirror of RESILIENCE-01/03).
-
-  # GROWW-NATIVE-01 = the native-Rust SHADOW client (PR-R1, default-OFF)
-  # disconnected / failed to connect / had its supervised runner respawned.
-  # Bounded expo backoff + supervisor respawn already self-heal; shadow-only —
-  # the Python sidecar capture chain is untouched. Silence: a sustained rate
-  # during an enabled run is the live-probe measurement the shadow exists to
-  # collect (counter tv_groww_native_reconnects_total carries it), not an
-  # operator emergency.
-  - name: groww-native-01-connect-failed-silence
-    match:
-      code: GROWW-NATIVE-01
-    action: silence
-    runbook_path: docs/error-runbooks/groww-native-rust-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GROWW-NATIVE-01 = shadow-client transport failure/reconnect/respawn.
-      Self-healing (bounded backoff + supervisor) and validation-only: losing
-      shadow lines never touches production capture. The reconnect counters
-      ARE the deliverable of the shadow run.
-
-  # GROWW-NATIVE-02 = the shadow client's per-session socket-token mint or
-  # NATS CONNECT was rejected (auth class). The re-key + re-mint ladder (SSM
-  # re-read >=60s, NEVER minting the access token) already applied. Silence:
-  # around 06:00 IST this is the daily token reset; any persistent reject with
-  # a healthy sidecar is a recorded live-probe finding, not a production
-  # incident.
-  - name: groww-native-02-auth-failed-silence
-    match:
-      code: GROWW-NATIVE-02
-    action: silence
-    runbook_path: docs/error-runbooks/groww-native-rust-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GROWW-NATIVE-02 = shadow-client auth-class failure with the re-key +
-      re-mint ladder already applied (token-minter lock honored: SSM re-read
-      only). Shadow validation artifact; the sidecar keeps capturing.
-
-  # GROWW-NATIVE-03 = a NATS frame / protobuf payload / daily watch file
-  # failed to decode in the shadow client. Skip-or-reconnect already applied;
-  # counted by tv_groww_native_decode_errors_total{kind}. Silence — the
-  # decode-error counters are parity-run telemetry.
-  - name: groww-native-03-decode-failed-silence
-    match:
-      code: GROWW-NATIVE-03
-    action: silence
-    runbook_path: docs/error-runbooks/groww-native-rust-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GROWW-NATIVE-03 = shadow-client decode failure, already skipped or
-      reconnected, fail-closed on the watch file. A high proto rate = schema
-      drift to re-extract from the wheel — an engineering follow-up, not an
-      operator page.
-
-  # GROWW-NATIVE-04 = the shadow NDJSON writer failed a write/rotation or its
-  # bounded channel overflowed. Capture retries next write / next midnight
-  # (sidecar-identical semantics); only SHADOW comparison lines are lost —
-  # the parity comparer surfaces them as missing-in-rust. Silence.
-  - name: groww-native-04-writer-failed-silence
-    match:
-      code: GROWW-NATIVE-04
-    action: silence
-    runbook_path: docs/error-runbooks/groww-native-rust-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 0
-    justification: >-
-      GROWW-NATIVE-04 = shadow capture-file write/rotation/channel failure,
-      already retried; a shadow-only data gap that the parity comparer
-      reports honestly. Disk-full class root causes page via the existing
-      disk watchers (DISK-WATCHER-01 / RESOURCE-03).
-
-  # FUTIDX-01 (§36 2026-07-08) = the nearest-expiry index-future selection
-  # degraded for >=1 of the 4 authorized underlyings on one feed (no FUT rows /
-  # all expiries past / ambiguous duplicate expiry / unparsable expiry). The
-  # degrade already happened — that feed runs WITHOUT that future for the day;
-  # the spot universe is unaffected and boot never HALTs. Escalate with a
-  # cooldown: the operator must see it (a vendor-master regression or an
-  # INDEX_SYMBOL_ALIASES drift, esp. MIDCPNIFTY) but a repeated per-underlying
-  # emit inside one build pages once.
   - name: futidx-01-selection-degraded-escalate
     match:
       code: FUTIDX-01
@@ -2014,97 +1810,33 @@ rules:
       auto-executed. Recovery confirmed by the falling-edge log +
       tv_questdb_wal_suspended_tables returning to 0.
 
-  # BRUTEX-XVERIFY-01 (BruteX crossverify Commit 1, 2026-07-12) = the daily
-  # 15:50 IST BruteX-vs-live 1m cross-verify found >=1 divergent cell
-  # (diverged / missing_live / missing_brutex). Escalate — NOT auto-triage
-  # safe (is_auto_triage_safe() == false severity-independent override, the
-  # FUTIDX-02 / WAL-SUSPEND-01 precedent): a data-comparability signal is
-  # never auto-actioned; the operator decides which capture chain (TickVault
-  # live vs BruteX) is wrong. Both sides re-produce tomorrow; the audit rows
-  # are the durable record — never hand-patch either table.
-  - name: brutex-xverify-01-divergence-found-escalate
+  # DHAN-LIVE-XVERIFY-01 = the daily Dhan live-vs-REST cross-verification ran
+  # degraded or blind (HTTP client build, /exec read, truncation, audit flush,
+  # wall-clock cap). Escalate — NEVER auto-actioned: this is the ONLY ground
+  # truth the revived Dhan feed has, since the India feed carries no sequence
+  # number and no snapshot-on-subscribe, so a degraded run means the day is
+  # unvouched-for rather than clean. Its predecessor compared nanosecond
+  # literals against a microsecond column and matched ZERO rows for the entire
+  # life of the feature — honestly reporting compared=0 and therefore never
+  # paging anyone. Escalating a blind run is precisely the response that
+  # history calls for; the re-run is DEDUP-idempotent once the underlying
+  # QuestDB or REST condition is fixed.
+  - name: dhan-live-xverify-01-run-degraded-escalate
     match:
-      code: BRUTEX-XVERIFY-01
+      code: DHAN-LIVE-XVERIFY-01
     action: escalate
-    runbook_path: docs/error-runbooks/brutex-crossverify-error-codes.md
+    runbook_path: docs/error-runbooks/dhan-live-crossverify-error-codes.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
-      BRUTEX-XVERIFY-01 = the daily BruteX-vs-live 1-minute cross-verify
-      found divergent cells. Data-comparability signal — never auto-actioned
-      (severity-independent is_auto_triage_safe override): the operator
-      inspects brutex_crossverify_cell_audit (field/kind breakdown), the
-      /crossverify trend page, and the day's Groww feed health to decide
-      which capture chain drifted. Track the trend, not the absolute count —
-      both sides sample the same vendor stream at different capture points.
+      DHAN-LIVE-XVERIFY-01 = the daily live-vs-REST comparison degraded or
+      went blind. Read-only cold path — capture and trading are unaffected —
+      but a blind run means we cannot vouch for the day's candles against the
+      vendor's own tape, which is the single check that would catch silent
+      packet loss on a feed with no sequence number. Escalate so the operator
+      re-runs it after fixing the underlying condition; never auto-action a
+      data-comparability signal.
 
-  # BRUTEX-XVERIFY-02 (BruteX crossverify Commit 1, 2026-07-12) = a leg of
-  # the daily run failed (s3_list/s3_fetch/csv_parse/wall_clock_cap/
-  # questdb_read/questdb_write/outcome_regression). The degrade already
-  # happened and is honestly stamped (partial/no_data/degraded — never a
-  # false clean); the run is DEDUP-idempotent and the keep-better guard
-  # protects a previously measured day, so escalate = the operator re-runs
-  # the backfill after fixing the underlying S3/QuestDB condition.
-  - name: brutex-xverify-02-run-degraded-escalate
-    match:
-      code: BRUTEX-XVERIFY-02
-    action: escalate
-    runbook_path: docs/error-runbooks/brutex-crossverify-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 600
-    justification: >-
-      BRUTEX-XVERIFY-02 = the daily BruteX cross-verify run degraded on one
-      leg — the stage field names it (S3 list/fetch, CSV parse, 16:05 IST
-      wall-clock cap, QuestDB read/write, suppressed outcome regression).
-      Best-effort cold-path forensic compare — feeds/capture/trading are
-      unaffected; escalate so the operator knows the day is
-      partial/no_data/degraded and can backfill via the DEDUP-idempotent
-      re-run once the underlying condition (BruteX producer publish, S3
-      reachability, QuestDB health per BOOT-01/02) is fixed.
-
-  # SPOT-XVERIFY-01 (spot cross-verify comparator) = the daily 15:47 IST
-  # Dhan-vs-Groww spot 1m cross-verify found >=1 divergent / missing cell.
-  # Escalate — NOT auto-triage safe (severity-independent is_auto_triage_safe
-  # override, the BRUTEX-XVERIFY-01 / FUTIDX-02 precedent): a data-
-  # comparability signal is never auto-actioned; the operator decides which
-  # capture chain drifted. Both feeds re-produce tomorrow; the audit rows are
-  # the durable record — never hand-patch either table.
-  - name: spot-xverify-01-divergence-found-escalate
-    match:
-      code: SPOT-XVERIFY-01
-    action: escalate
-    runbook_path: docs/error-runbooks/spot-crossverify-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 600
-    justification: >-
-      SPOT-XVERIFY-01 = the daily Dhan-vs-Groww spot 1-minute cross-verify
-      found divergent / missing cells. Data-comparability signal — never
-      auto-actioned (severity-independent is_auto_triage_safe override): the
-      operator inspects spot_crossverify_cell_audit (field/kind breakdown)
-      and the day's per-feed spot 1m REST health to decide which capture
-      chain drifted. Track the trend, not the absolute count.
-
-  # SPOT-XVERIFY-02 (spot cross-verify comparator) = a leg of the daily run
-  # degraded (questdb read/write, join/parse, wall-clock cap, keep-better
-  # suppression). The degrade is honestly stamped (partial/no_data/blind/
-  # degraded — never a false clean); the run is DEDUP-idempotent and the
-  # keep-better guard protects a measured day, so escalate = the operator
-  # re-runs after fixing the underlying QuestDB condition.
-  - name: spot-xverify-02-run-degraded-escalate
-    match:
-      code: SPOT-XVERIFY-02
-    action: escalate
-    runbook_path: docs/error-runbooks/spot-crossverify-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 600
-    justification: >-
-      SPOT-XVERIFY-02 = the daily spot cross-verify run degraded on one leg
-      (QuestDB read/write, join/parse, wall-clock cap, keep-better
-      suppression). Best-effort cold-path forensic compare — feeds/capture/
-      trading are unaffected; escalate so the operator knows the day is
-      partial/no_data/blind/degraded and can backfill via the DEDUP-
-      idempotent re-run once the underlying QuestDB condition (per
-      BOOT-01/02) is fixed.
 
   # -----------------------------------------------------------------------
   # Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2)

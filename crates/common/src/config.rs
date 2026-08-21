@@ -5799,13 +5799,10 @@ mod tests {
             err.to_string().contains("chain_min_spacing_ms"),
             "unexpected error: {err}"
         );
-        // A Groww cutoff at/below the burst verdict is degenerate.
         cfg.chain_min_spacing_ms = 3_000;
-        assert!(cfg.validate().is_err());
-        // The burst is a POST-close fire: NEGATIVE is refused, T+0 is
-        // LEGAL (2026-07-31 — Dhan fires at the same instant as Groww,
-        // whose anchor has always been 0; refusing 0 for one lane and
-        // allowing it for the other was an unjustified asymmetry).
+        // The burst is a POST-close fire: NEGATIVE is refused, T+0 is LEGAL
+        // (2026-07-31 — refusing 0 for one lane while allowing it for
+        // another was an unjustified asymmetry).
         cfg.dhan_burst_offset_ms = 0;
         assert!(cfg.validate().is_ok(),);
         cfg.dhan_burst_offset_ms = -1_000;
@@ -5838,9 +5835,7 @@ mod tests {
         );
         cfg.dhan_lane_cutoff_ms = 60_000;
         assert!(cfg.validate().is_err(), "exactly 60000 is degenerate");
-        // Same ceiling on the Groww side.
         cfg.dhan_lane_cutoff_ms = 15_000;
-        assert!(cfg.validate().is_err());
         assert!(cfg.validate().is_ok());
         // A nominal burst at/after the Dhan cutoff is silently discarded
         // every cycle (the CAD-NEW-3 class) — refused, exact boundary
@@ -6172,6 +6167,7 @@ mod tests {
         config.option_chain_1m.enabled = true;
         assert!(config.validate().is_err(), "chain leg alone also refuses");
         // Cadence ON + all legs OFF → ok (the stand-down shape).
+        config.option_chain_1m.enabled = false;
         assert!(config.validate().is_ok(), "cadence on + legs off is legal");
         // Cadence OFF + legs ON (the pre-2026-07-17 base.toml shape —
         // still a legal permutation) → ok.
@@ -6239,34 +6235,19 @@ mod tests {
     /// every feed is disabled.
     #[test]
     fn test_feeds_any_enabled_false_only_when_all_off() {
-        assert!(
-            !FeedsConfig {
-                dhan_enabled: false,
+        for (dhan, truedata) in [(false, false), (true, false), (false, true), (true, true)] {
+            let cfg = FeedsConfig {
+                dhan_enabled: dhan,
+                truedata_enabled: truedata,
                 ..Default::default()
-            }
-            .any_enabled()
-        );
-        assert!(
-            FeedsConfig {
-                dhan_enabled: true,
-                ..Default::default()
-            }
-            .any_enabled()
-        );
-        assert!(
-            FeedsConfig {
-                dhan_enabled: false,
-                ..Default::default()
-            }
-            .any_enabled()
-        );
-        assert!(
-            FeedsConfig {
-                dhan_enabled: true,
-                ..Default::default()
-            }
-            .any_enabled()
-        );
+            };
+            assert_eq!(
+                cfg.any_enabled(),
+                dhan || truedata,
+                "any_enabled must be false ONLY when every feed is off \
+                 (dhan={dhan}, truedata={truedata})"
+            );
+        }
     }
 }
 
