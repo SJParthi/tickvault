@@ -44,6 +44,7 @@ use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::redact_url_params;
 pub use tickvault_common::ws_event_types::{WS_EVENT_NO_DHAN_CODE, WsEventAuditRow};
 #[cfg(test)]
@@ -99,6 +100,7 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(c) => c,
         Err(err) => {
             error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
                 ?err,
                 "ws_event_audit: HTTP client build failed — table not ensured"
             );
@@ -116,10 +118,15 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
+            error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: CREATE TABLE returned non-2xx");
         }
-        Err(err) => error!(?err, "ws_event_audit: CREATE TABLE request failed"),
+        Err(err) => error!(
+            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+            ?err,
+            "ws_event_audit: CREATE TABLE request failed"
+        ),
     }
 
     // Per-feed identity (operator 2026-06-23): `feed` is now a DEDUP-key column —
@@ -139,10 +146,15 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
+            error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: ALTER ADD COLUMN feed returned non-2xx");
         }
-        Err(err) => error!(?err, "ws_event_audit: ALTER ADD COLUMN feed request failed"),
+        Err(err) => error!(
+            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+            ?err,
+            "ws_event_audit: ALTER ADD COLUMN feed request failed"
+        ),
     }
 
     // Re-apply the DEDUP key (now including `feed`) on tables created before the
@@ -162,10 +174,12 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
+            error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: DEDUP ENABLE UPSERT KEYS returned non-2xx");
         }
         Err(err) => error!(
+            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
             ?err,
             "ws_event_audit: DEDUP ENABLE UPSERT KEYS request failed"
         ),

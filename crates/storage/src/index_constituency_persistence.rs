@@ -562,6 +562,8 @@ async fn migrate_index_constituency_truncate_once_inner(questdb_config: &QuestDb
         Ok(c) => c,
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
                 ?err,
                 table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
                 "index_constituency ts-pin migration: HTTP client build failed — \
@@ -586,6 +588,7 @@ async fn migrate_index_constituency_truncate_once_inner(questdb_config: &QuestDb
         }
         Ok(resp) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
                 table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
                 status = %resp.status(),
                 "index_constituency ts-pin migration: TRUNCATE non-2xx — \
@@ -595,6 +598,8 @@ async fn migrate_index_constituency_truncate_once_inner(questdb_config: &QuestDb
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
                 ?err,
                 table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
                 "index_constituency ts-pin migration: TRUNCATE request failed — \
@@ -800,6 +805,8 @@ pub async fn mark_missing_index_constituents_expired(
         Ok(c) => c,
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
                 ?err,
                 table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
                 "index_constituency rebalance-expiry: HTTP client build failed — \
@@ -824,6 +831,7 @@ pub async fn mark_missing_index_constituents_expired(
         }
         Ok(resp) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
                 table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
                 status = %resp.status(),
                 feed,
@@ -834,6 +842,8 @@ pub async fn mark_missing_index_constituents_expired(
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
                 ?err,
                 table = QUESTDB_TABLE_INDEX_CONSTITUENCY,
                 feed,
