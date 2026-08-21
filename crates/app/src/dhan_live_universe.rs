@@ -597,9 +597,18 @@ mod tests {
         );
     }
 
-    /// `plan_pool` refuses the ENTIRE pool when a set does not fit, so an
-    /// oversized set would take the main feed down. Falling back keeps the feed
-    /// alive; truncating to fit would silently subscribe an arbitrary subset.
+    /// Over capacity, THIS function returns the index universe — the live set
+    /// collapses to the index count rather than dialing an oversize pool.
+    /// Falling back keeps the feed alive; truncating to fit would silently
+    /// subscribe an arbitrary subset, which is the outcome this pins against.
+    ///
+    /// CORRECTED 2026-08-21: this comment used to credit `plan_pool` with
+    /// refusing the whole pool. `plan_pool` does that for sets that REACH it —
+    /// but an oversize set never does, because the arm under test returns
+    /// first. Same behaviour, wrong mechanism named, and the misattribution
+    /// (repeated in `MAX_DAILY_UNIVERSE_SIZE`'s own docs) produced a false
+    /// CRITICAL audit finding. The collapse is alarmed via
+    /// `tv_dhan_live_universe_fallback_total`.
     #[test]
     fn test_select_live_universe_falls_back_whole_when_over_the_envelope() {
         let master: Vec<MasterEntry> = (1..=10).map(|i| entry(1000 + i, 1)).collect();
