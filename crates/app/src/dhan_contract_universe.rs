@@ -250,6 +250,79 @@ pub const FULL_CHAIN_INDEX_UNDERLYINGS: [&str; 2] = ["NIFTY", "BANKNIFTY"];
 /// can see.
 pub const STOCK_OPTION_PRICING_QUORUM_PERCENT: usize = 60;
 
+/// Counter: a TERMINAL defect in the day's contract selection. Label: `reason`.
+///
+/// Until 2026-08-21 this module carried **zero** `metrics::` calls. "No options
+/// resolved today", "the ATM window shrank to three", "the artifact was
+/// unreadable" were `error!` lines and struct fields that nothing consumed — a
+/// session missing ~22,000 authorized contracts left no number anywhere for an
+/// alarm or a triage path to read. The 2026-08-20 incident is the shape:
+/// `atm_window_reason = "no_ladders"` was recorded, printed, and ignored.
+///
+/// EVERY label value is a real defect, deliberately. The CloudWatch EMF
+/// processor folds labels into the single declared dimension set by SUMMING,
+/// so a name that also carried successes would alarm on a healthy day. The
+/// success side stays on the `contract universe resolved` info line.
+pub const CONTRACT_UNIVERSE_FAILED_COUNTER: &str = "tv_dhan_contract_universe_failed_total";
+
+/// Every `reason` value [`CONTRACT_UNIVERSE_FAILED_COUNTER`] can carry.
+///
+/// Enumerated so they can be pre-registered: the CloudWatch delta pipeline
+/// drops each series' FIRST observed sample as its baseline, so a reason that
+/// is not pre-registered loses its first increment — and on a once-per-session
+/// counter, its first increment is its only one.
+pub const CONTRACT_FAILURE_REASONS: [&str; 6] = [
+    "artifact_unreadable",
+    "symbol_map_unreadable",
+    "no_contracts",
+    "no_ladders",
+    "no_room",
+    "window_shrunk",
+];
+
+/// Publish a 0 baseline for every reason. Call ONCE, before the first attempt.
+pub fn pre_register_contract_failure_counters() {
+    for reason in CONTRACT_FAILURE_REASONS {
+        metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(0);
+    }
+}
+
+/// Classify the TERMINAL verdict for a contract selection.
+///
+/// Pure, so the classification is testable without a metrics recorder — the
+/// emit below is a thin loop over what this returns.
+///
+/// Called ONCE, when the selection is dialed or abandoned, never per retry.
+/// That distinction is the whole design: `no_ladders` on a pre-open attempt is
+/// NORMAL — no tick has landed yet, and this module's own docs say so — so a
+/// per-attempt emit would fire ~46 times between 08:30 and 09:16 on a perfectly
+/// healthy morning and page for it.
+#[must_use]
+pub fn contract_verdict_reasons(selection: &ContractSelection) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if selection.instruments.is_empty() {
+        reasons.push("no_contracts");
+    }
+    match selection.atm_window_reason {
+        // Guarded on the denominator: a master with genuinely no stock options
+        // reports `no_ladders` legitimately and must not page for it.
+        "no_ladders" if selection.stock_option_underlyings > 0 => reasons.push("no_ladders"),
+        "no_room" => reasons.push("no_room"),
+        "applied" if selection.atm_window_used < STOCK_OPTION_ATM_STRIKES_EACH_SIDE => {
+            reasons.push("window_shrunk");
+        }
+        _ => {}
+    }
+    reasons
+}
+
+/// Record the terminal verdict. One increment per reason, once per session.
+pub fn record_contract_verdict(selection: &ContractSelection) {
+    for reason in contract_verdict_reasons(selection) {
+        metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(1);
+    }
+}
+
 /// What a contract selection produced, and everything it refused.
 ///
 /// Every refusal is a counted field rather than a silent drop. A selection
@@ -1073,6 +1146,11 @@ pub async fn load_contract_universe(
                 "contract universe: today's contract artifact is unreadable — the lane will \
                  carry its spot universe only. No futures, no option contracts."
             );
+            // Bumped HERE rather than through `record_contract_verdict`: this
+            // path returns a default selection, which carries none of the
+            // information needed to classify what went wrong.
+            metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "artifact_unreadable")
+                .increment(1);
             return ContractSelection::default();
         }
     };
@@ -1090,6 +1168,12 @@ pub async fn load_contract_universe(
                 "contract universe: the symbol map is unreadable, so at-the-money cannot be \
                  located for any stock. Futures and index chains are unaffected."
             );
+            // Same reasoning as the artifact arm: the selection continues from
+            // here with an empty map and would classify only as `no_ladders`,
+            // which reads as "no stock priced yet" — a normal pre-open state —
+            // rather than "the map itself is broken".
+            metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "symbol_map_unreadable")
+                .increment(1);
             HashMap::new()
         }
     };

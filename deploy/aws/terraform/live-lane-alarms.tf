@@ -560,3 +560,54 @@ resource "aws_cloudwatch_metric_alarm" "dhan_no_ticks_flowing" {
   # came back.
   ok_actions = local.app_alarm_ok
 }
+
+# ---------------------------------------------------------------------------
+# 12. THE CONTRACT UNIVERSE DID NOT RESOLVE (2026-08-21)
+# ---------------------------------------------------------------------------
+# `dhan_contract_universe.rs` carried ZERO metrics calls until today. Its
+# failures — an unreadable artifact, an unreadable symbol map, no ladder built
+# because no underlying priced, an ATM window silently shrunk below the
+# authorized 25 — were `error!` lines and struct fields that nothing consumed.
+# The 2026-08-20 incident is the shape: `atm_window_reason = "no_ladders"` was
+# recorded, printed, and ignored, and the session ran without a single stock
+# option.
+#
+# Authorization: the dated §2.3b row in
+# .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md.
+#
+# Every `reason` label value is a defect, deliberately: the EMF processor folds
+# labels to {host} by summing, so a name carrying successes too would fire on a
+# healthy day. Emitted ONCE per session at the terminal verdict, never per
+# retry — `no_ladders` before 09:16 is normal (no tick has landed yet) and a
+# per-attempt emit would page every trading morning.
+resource "aws_cloudwatch_metric_alarm" "dhan_contract_universe_failed" {
+  alarm_name        = "tv-${var.environment}-dhan-contract-universe-failed"
+  alarm_description = "The Dhan contract universe did not resolve cleanly for today's session. reason=no_contracts: nothing was selected at all, so the main feed carries its spot universe only - no futures, no option contracts. reason=artifact_unreadable or symbol_map_unreadable: the daily rider's output is missing or malformed. reason=no_ladders: the master lists stock options and NOT ONE underlying had a live spot price, so at-the-money could not be located and every stock option is absent - the 2026-08-20 shape. reason=no_room: the connection envelope could not fit even the at-the-money strike. reason=window_shrunk: the ATM window was narrowed below the authorized 25 strikes per side. Fires ONCE per session at the terminal verdict. Triage: journalctl -u tickvault for the 'contract universe resolved' line, which names the counts, the window, the reason and now underlyings_total; then check the daily rider wrote today's contract artifact and mapping files."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  # Once-per-session emit, so one 300s window at threshold 1 catches the lone
+  # increment. A second period would only delay a page for a condition that
+  # cannot repeat.
+  evaluation_periods = 1
+  metric_name        = "tv_dhan_contract_universe_failed_total"
+  namespace          = local.app_namespace
+  period             = 300
+  statistic          = "Sum"
+  # `{host}` - the reason label folds, and folding is what this alarm wants:
+  # any defect on any reason pages. The label survives in the log line, which
+  # is where triage reads it.
+  dimensions = local.app_dimensions
+  # notBreaching, NOT breaching: the box is stopped overnight, so no-data is
+  # the normal off-hours state. This alarm reports a DEFECT, never silence -
+  # the dark-lane case belongs to alarms 1 and 11. No market-hours gate is
+  # needed for the same reason, which is why this one is NOT in the gate list.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. The universe is resolved ONCE per session. The counter
+  # falling back to zero deltas means no ADDITIONAL defect - never that this
+  # session's universe was repaired. Only a restart changes it, and that is a
+  # new session.
+  ok_actions = []
+}

@@ -4238,6 +4238,14 @@ async fn attach_depth_when_available(
         tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
     >,
 ) {
+    // Publish a 0 for every contract-failure reason BEFORE the first attempt.
+    //
+    // The CloudWatch delta pipeline drops each series' first observed sample as
+    // its baseline. `record_contract_verdict` fires ONCE per session, so an
+    // un-pre-registered reason would have its first — and only — increment
+    // eaten, and the alarm would never see the defect it exists to catch.
+    crate::dhan_contract_universe::pre_register_contract_failure_counters();
+
     let mut attempts: u32 = 0;
     // Whether the PREVIOUS attempt resolved something dialable.
     //
@@ -4517,6 +4525,11 @@ async fn attach_depth_when_available(
                                 out_topups: None,
                             },
                         );
+                        // The TERMINAL verdict for today's selection, recorded
+                        // once at the moment it reaches the wire. Never per
+                        // retry: `no_ladders` before 09:16 is normal, so a
+                        // per-attempt emit would page every healthy morning.
+                        crate::dhan_contract_universe::record_contract_verdict(&contracts);
                         contracts_done = true;
                         // Keeps `remaining_main_feed_capacity` honest for the
                         // depth half and any later reader. Without it the

@@ -557,6 +557,14 @@ resource "aws_cloudwatch_dashboard" "operator" {
           metrics = [
             [local.dash_namespace, "tv_dhan_feed_drain_frames_total", { label = "frames received", stat = "Sum" }],
             [local.dash_namespace, "tv_dhan_feed_ingest_ticks_total", { label = "ticks folded into candles", stat = "Sum" }],
+            # Added 2026-08-21. Belongs on THIS widget rather than the loss
+            # widget because it explains a flat line here: when the contract
+            # universe fails to resolve, the ticks line stays low all session
+            # for a reason that is not a feed fault at all — the lane simply
+            # never subscribed the ~22,000 contracts it was authorized to.
+            # Reading the two lines together separates "the feed is broken"
+            # from "the feed is fine and carrying almost nothing".
+            [local.dash_namespace, "tv_dhan_contract_universe_failed_total", { label = "contract universe defects (by reason, folded)", stat = "Sum" }],
             # Added 2026-08-18. The chain this widget exists to make legible
             # ran frames -> ticks and then STOPPED, while the loss widget
             # separately charted "candles discarded". So the operator could
