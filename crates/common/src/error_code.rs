@@ -1336,10 +1336,6 @@ impl ErrorCode {
             // instance detected / lock unprovable: fleet spawn refused
             // fail-closed; operator must pick the winning host.
             | Self::GrowwScale05DualFleetDetected
-            // GROWW-OCO-02 (Groww order fan-out contract stubs, 2026-07-15):
-            // an OCO sibling-leg cancel UNVERIFIED past the 30s deadline is
-            // a DOUBLE-FILL exposure window — operator action required;
-            // Critical is never auto-triaged (the blanket rule).
             // STORAGE-GAP-05 (feed-hardening Item 5, 2026-08-19): the volume
             // is above high water and retention has nothing left it is
             // ALLOWED to reclaim. The next state is a full disk, which stops
@@ -1485,20 +1481,6 @@ impl ErrorCode {
             // order stays tracked and reconcile owns the follow-up. Both
             // LOG-SINK-ONLY (no pager entry — 2026-07-14 Dhan noise lock).
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => Severity::High,
-            // GROWW-PORT-01..04 (§39.3, 2026-07-14) — broker-account snapshot
-            // degrade / persist failure / recon residual / foreign position.
-            // High: operator eyes on every occurrence; never a halt (cold
-            // path; consumers fail closed on staleness; dry-run = no orders).
-            // GROWW-OCO-01/03/05 (Groww order fan-out contract stubs,
-            // 2026-07-15) — smart-order placement/reconcile/poller degrades.
-            // High: operator eyes on every occurrence; never a halt — every
-            // leg is cold-path behind the §39 4-gate live-fire lattice, and
-            // ZERO emit sites exist until the area code PRs land
-            // (log-sink-only contract stubs).
-            // Groww margin surface (§39.3 area slot #4, 2026-07-15): fetch
-            // degrade, audit persist, stale-gate-closed, enforce-mode
-            // rejection — all High (funds visibility / a blocked or
-            // refused entry on the shared account).
             // CADENCE-01/02 (operator 2026-07-14) — a cadence lane degraded
             // this cycle / a lane decision was honest-skipped. High:
             // operator eyes on every occurrence (a skip means no decision
@@ -1567,22 +1549,6 @@ impl ErrorCode {
             // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
             // annotation-only side record; capture/recovery unaffected. Medium.
             Self::FeedGap01EpisodeDegraded => Severity::Medium,
-            // GROWW-OCO-04 (Groww order fan-out contract stubs, 2026-07-15):
-            // a broker-rejected smart-order modify — bounded,
-            // next-cycle-visible degrade. Medium.
-            // GROWW-MARG-05 (2026-07-15): calculator divergence — visibility
-            // only; the conservative local buffer stands. Medium.
-            // GROWW-ORD-01..10 (Groww orders PR-A0, 2026-07-15). Critical: an
-            // unresolved order fate demands the operator open the app NOW.
-            // High: definitive reject / ambiguity opened / reconcile drift /
-            // ledger-refused mutation / quantity gate / auth-stale.
-            // GROWW-PUSH-01/02/04 (order-push Stage A, 2026-07-16). High:
-            // connect / auth / supervisor-respawn degrades on the push
-            // channel — self-healing, but the operator must see them.
-            // GROWW-PUSH-03 (2026-07-16): a decode failure is counted +
-            // skipped — bounded visibility degrade. Medium.
-            // Medium: broker 429 (co-tenant hypothesis) / open-set status /
-            // best-effort order_audit write failure.
             // CADENCE-03 (operator 2026-07-14): the cadence scheduler
             // degraded (ladder shift / late wake / boundary skip / respawn)
             // — self-correcting scheduling telemetry, never data loss;
@@ -1830,14 +1796,6 @@ impl ErrorCode {
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
                 ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
             }
-            // Groww Portfolio area (§39.3, 2026-07-14)
-            // Groww Smart Orders (GTT/OCO) fan-out contract stubs
-            // (2026-07-15): one runbook per §39.3 area.
-            // Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15)
-            // Groww orders shared contracts (PR-A0, 2026-07-15) — one runbook
-            // for the whole GROWW-ORD-* family.
-            // Groww order/position push channel (Stage A, 2026-07-16) — one
-            // runbook for the whole GROWW-PUSH-* family.
             // Cadence scheduler (operator directive 2026-07-14)
             Self::Cadence01LaneDegraded
             | Self::Cadence02DecisionSkipped
@@ -1870,14 +1828,6 @@ impl ErrorCode {
     ///   TickVault) data-comparability verdict is an operator judgment —
     ///   the operator decides which capture chain is at fault (the
     ///   FUTIDX-02 precedent); auto-triage must never act on it.
-    /// - GROWW-PORT-03 (§39.3, 2026-07-14): a reconciliation verdict is an operator judgment — the FUTIDX-02 precedent.
-    /// - GROWW-OCO-03 (2026-07-15): an OCO-pair reconcile mismatch vs the
-    ///   broker is a data-comparability signal — the FUTIDX-02 precedent.
-    /// - `GROWW-MARG-04` (Groww margin area, 2026-07-15): an
-    ///   insufficient-funds verdict on the SHARED (BruteX co-tenant) Groww
-    ///   account is an operator judgment — top up, resize, re-tune the
-    ///   buffer, or accept the no-trade; auto-triage must never act on a
-    ///   funds verdict (the FUTIDX-02 precedent).
     #[must_use]
     pub const fn is_auto_triage_safe(self) -> bool {
         if matches!(
@@ -1910,19 +1860,6 @@ impl ErrorCode {
                                                 // divergence is never auto-actioned). The operator judges
                                                 // which book — ours, the broker's, or the co-tenant's
                                                 // activity — explains the residual (§37 doctrine).
-                                                // GROWW-OCO-03 (Groww order fan-out contract stubs,
-                                                // 2026-07-15): an OCO-pair reconcile mismatch vs the broker
-                                                // is a data-comparability signal — never auto-actioned; the
-                                                // operator decides which side is wrong (the FUTIDX-02
-                                                // precedent).
-                                                // GROWW-MARG-04 (2026-07-15): a funds verdict on the shared
-                                                // account is an operator judgment — never auto-actioned
-                                                // despite High severity (the FUTIDX-02 precedent).
-                                                // GROWW-ORD-04 (Groww orders PR-A0, 2026-07-15): a reconcile
-                                                // status/fill drift is a data-integrity VERDICT — the operator
-                                                // judges which side (our records or the broker) drifted; never
-                                                // auto-actioned despite High severity (the Futidx02 precedent).
-                                                // GROWW-ORD-03 is already covered by the Critical fallthrough.
         ) {
             return false;
         }
@@ -2529,11 +2466,6 @@ mod tests {
         // removed; websocket-connection-scope-lock.md "2026-08-21 (THIRD quote
         // of the day)"): -28 for the Groww ORDER-SIDE families whose only emit
         // sites were deleted with crates/trading/src/oms/groww/** —
-        // GROWW-PORT-01..04, GROWW-OCO-01..05, GROWW-MARG-01..05,
-        // GROWW-ORD-01..10, GROWW-PUSH-01..04. A Critical/High variant with a
-        // runbook and no emitter advertises coverage that does not exist
-        // (critical_errcode_alarm_coverage_guard names exactly this class), so
-        // the variants are RETIRED rather than left dangling => 140.
         assert_eq!(ErrorCode::all().len(), 140);
     }
 
@@ -2889,19 +2821,6 @@ mod tests {
                 // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
                 || s.starts_with("EXIT-ORDER-")
                 || s.starts_with("EXIT-VERIFY-")
-                // §39.3 Portfolio area (2026-07-14)
-                || s.starts_with("GROWW-PORT-")
-                // Groww order fan-out contract stubs (2026-07-15): Smart
-                // Orders (GTT/OCO) family.
-                || s.starts_with("GROWW-OCO-")
-                // Groww order-side margin area (§39.3 slot #4, 2026-07-15).
-                || s.starts_with("GROWW-MARG-")
-                // Groww orders shared contracts (PR-A0, 2026-07-15). Does NOT
-                // auto-accept via any other GROWW-* arm (GROWW-MASTER-/SCALE-/
-                // NATIVE- are enumerated separately) — this arm is required.
-                || s.starts_with("GROWW-ORD-")
-                // Groww order/position push channel (Stage A, 2026-07-16).
-                || s.starts_with("GROWW-PUSH-")
                 // Operator 2026-07-14: broker-agnostic fetch-cadence scheduler
                 || s.starts_with("CADENCE-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
