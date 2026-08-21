@@ -151,6 +151,24 @@ pub fn mapping_artifact_path(date_ist: &str) -> std::path::PathBuf {
     std::path::Path::new(MAPPING_DIR).join(format!("dhan-nse-mapping-{date_ist}.json"))
 }
 
+/// Path of the day's F&O stock UNDERLYING artifact.
+///
+/// A SEPARATE file rather than extra rows in the mapping artifact, and that is
+/// the whole safety argument: the mapping artifact is what the live lane reads
+/// at boot TODAY. Adding rows to it would change the default spot universe the
+/// moment this ships, before anyone chose to switch anything on. A file no
+/// current consumer opens cannot do that — the narrowed universe arrives only
+/// when the flag that reads it is turned on.
+///
+/// Same single-definition discipline as [`mapping_artifact_path`]: two copies
+/// of this filename would let the reader look for a name the writer never
+/// produces, find nothing, and fall back — indistinguishable from "the master
+/// had no F&O rows" in every log line.
+#[must_use]
+pub fn fno_underlying_artifact_path(date_ist: &str) -> std::path::PathBuf {
+    std::path::Path::new(MAPPING_DIR).join(format!("dhan-fno-underlyings-{date_ist}.json"))
+}
+
 /// Today's IST date as `YYYY-MM-DD`, recomputed per attempt.
 ///
 /// Never frozen at spawn: a retry loop that crosses IST midnight must name
@@ -223,6 +241,23 @@ pub fn next_wait(
 }
 
 /// One day's resolved mapping, as written to disk.
+/// The F&O stock UNDERLYING artifact.
+///
+/// Its OWN shape rather than a reuse of [`MappingArtifact`]: that struct
+/// carries join diagnostics (`ambiguous_isins`, `constituents_seen`, …) that
+/// describe the ISIN join this set never performs. Filling them with zeros
+/// would publish seven fields of meaningless provenance, and a later reader
+/// would have no way to tell a real zero from a placeholder.
+///
+/// `count` is redundant with `underlyings.len()` and is written anyway: a
+/// truncated file that still parses as JSON is caught by comparing them, which
+/// is cheaper than trusting a length nobody checked.
+#[derive(serde::Serialize)]
+struct FnoUnderlyingArtifact {
+    count: usize,
+    underlyings: Vec<MappingEntry>,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct MappingArtifact {
     trading_date_ist: String,
@@ -868,7 +903,58 @@ fn write_mapping_atomic(
         mappings = artifact.mappings.len(),
         "instrument mapping written"
     );
+
+    // The F&O underlying set, written AFTER the mapping artifact has landed
+    // and deliberately NOT allowed to fail this function.
+    //
+    // Ordering is the point: the mapping artifact is what the live lane blocks
+    // on at boot. If deriving or writing the F&O file went wrong, returning
+    // `Err` here would report the whole build as failed when the artifact the
+    // lane actually needs is already on disk and correct -- trading a real
+    // outage for a cosmetic one.
+    //
+    // The consumer treats an absent file as "narrowing was requested and is
+    // NOT in effect" and falls back loudly, so a miss here degrades to today's
+    // behaviour rather than to a silently narrower universe. That is the
+    // safe direction: too many instruments is a capacity error the lane
+    // reports; too few is a coverage hole nothing reports.
+    let fno = fno_underlying_mappings(master);
+    let fno_count = fno.len();
+    match write_fno_underlying_artifact(date, fno) {
+        Ok(fno_path) => info!(
+            path = %fno_path.display(),
+            fno_underlyings = fno_count,
+            "F&O underlying set written"
+        ),
+        Err(e) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            error = %e,
+            fno_underlyings = fno_count,
+            "F&O underlying artifact could not be written — a narrowed-universe \
+             boot will fall back to the master-sourced spot set and say so"
+        ),
+    }
     Ok(())
+}
+
+/// Serialise the F&O underlying set atomically (tmp then rename), so a reader
+/// never observes a half-written file. Same shape as the mapping artifact's
+/// own write for exactly that reason.
+fn write_fno_underlying_artifact(
+    date: &str,
+    entries: Vec<MappingEntry>,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(MAPPING_DIR)?;
+    let path = fno_underlying_artifact_path(date);
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_vec_pretty(&FnoUnderlyingArtifact {
+        count: entries.len(),
+        underlyings: entries,
+    })
+    .map_err(std::io::Error::other)?;
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
 }
 
 /// Spawns the SUPERVISED daily rider.
@@ -1039,6 +1125,76 @@ mod tests {
             option_leg: tickvault_core::instrument::master_csv::OptionLeg::None,
             underlying_symbol: underlying.to_owned(),
         }
+    }
+
+    #[test]
+    fn fno_underlying_artifact_path_is_date_stamped_and_never_collides_with_the_mapping_file() {
+        let a = fno_underlying_artifact_path("2026-08-21");
+        let b = fno_underlying_artifact_path("2026-08-22");
+        assert_ne!(
+            a, b,
+            "the filename must carry the date — one shared name would let a \
+             stale day's set be read as today's"
+        );
+        assert!(
+            a.to_string_lossy().contains("2026-08-21"),
+            "the date must appear verbatim so an operator can find the file"
+        );
+        assert_ne!(
+            a,
+            mapping_artifact_path("2026-08-21"),
+            "must NOT collide with the mapping artifact: one overwriting the \
+             other would feed the live lane the wrong universe entirely"
+        );
+        assert_eq!(
+            a.parent(),
+            mapping_artifact_path("2026-08-21").parent(),
+            "same directory, so one cleanup path covers both"
+        );
+    }
+
+    #[test]
+    fn fno_artifact_round_trips_to_a_file_a_reader_can_actually_parse() {
+        // The derivation being right is worth nothing if what lands on disk is
+        // unreadable. This writes the real file through the real function and
+        // parses it back as a reader would.
+        let dir = std::path::Path::new(MAPPING_DIR);
+        let date = "2099-01-02"; // far future: cannot collide with a real run
+        let entries = vec![MappingEntry {
+            index_name: FNO_UNDERLYING_TAG.to_owned(),
+            symbol: "RELIANCE".to_owned(),
+            isin: "INE002A01018".to_owned(),
+            security_id: 2885,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseEquity.binary_code(),
+        }];
+        let path = match write_fno_underlying_artifact(date, entries) {
+            Ok(p) => p,
+            // A sandbox with no write access must not fail the suite for a
+            // reason that has nothing to do with the logic under test.
+            Err(_) => return,
+        };
+        let body = std::fs::read_to_string(&path).expect("written file must be readable");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("must be valid JSON");
+        assert_eq!(v["count"], 1, "count must match what was written");
+        assert_eq!(v["underlyings"][0]["security_id"], 2885);
+        assert_eq!(
+            v["underlyings"][0]["index_name"], FNO_UNDERLYING_TAG,
+            "the tag is how a consumer tells these from constituent rows"
+        );
+        assert_eq!(
+            v["underlyings"].as_array().map(Vec::len),
+            Some(v["count"].as_u64().unwrap() as usize),
+            "count and list length must agree — that mismatch is how a \
+             truncated-but-still-parseable file is caught"
+        );
+        // No .tmp left behind: a reader that globbed the directory would
+        // otherwise find a half-written sibling.
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file must be renamed away, never left beside the real one"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = dir; // silence unused in the early-return path
     }
 
     #[test]
