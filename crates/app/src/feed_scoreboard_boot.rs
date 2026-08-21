@@ -1030,57 +1030,18 @@ pub fn parse_minute_set(body: &str) -> Option<HashSet<String>> {
     Some(out)
 }
 
-/// Feed-level minute overlap: `(a_only, b_only, both)`. Pure, O(minutes ≤ 375).
-#[must_use]
-pub fn compute_minute_overlap(a: &HashSet<String>, b: &HashSet<String>) -> (i64, i64, i64) {
-    let both = a.intersection(b).count();
-    let to_i64 = |v: usize| i64::try_from(v).unwrap_or(i64::MAX);
-    (
-        to_i64(a.len().saturating_sub(both)),
-        to_i64(b.len().saturating_sub(both)),
-        to_i64(both),
-    )
-}
-
-/// Step 5: stamp each feed's `unique_win_minutes` / `both_minutes` from
-/// the two session minute sets — UNLESS the PARTNER feed was off for the
-/// day, in which case the comparison columns take the `-1` sentinel
-/// (round 5, 2026-07-10 — MEDIUM): exclusive-vs-nothing is not a
-/// measurement, and the running feed's ~375 "unique win" minutes on a
-/// one-horse day flowed straight into the month verdict's headline
-/// `sum(unique_win_minutes)` (the runbook's row-level
-/// `outcome != 'feed_off'` filter removed only the OFF feed's row). The
-/// DB row itself must not carry a fabricated competitive win — the `-1`
-/// is skipped by the runbook's sentinel-guarded sums, and the month SQL
-/// additionally excludes the whole day (day-level subquery, runbook §2).
-/// Pure.
-pub fn apply_minute_overlap_and_feed_off_sentinels(
-    feed_numbers: &mut BTreeMap<&'static str, FeedDayNumbers>,
-    minute_sets: &BTreeMap<&'static str, Option<HashSet<String>>>,
-    feed_off: &BTreeMap<&'static str, bool>,
-) {
-    if let (Some(Some(dhan_set)), Some(Some(groww_set))) =
-        (minute_sets.get("dhan"), minute_sets.get("groww"))
-    {
-        let (dhan_only, groww_only, both) = compute_minute_overlap(dhan_set, groww_set);
-        if let Some(n) = feed_numbers.get_mut("dhan") {
-            n.unique_win_minutes = dhan_only;
-            n.both_minutes = both;
-        }
-        if let Some(n) = feed_numbers.get_mut("groww") {
-            n.unique_win_minutes = groww_only;
-            n.both_minutes = both;
-        }
-    }
-    for (feed, partner) in [("dhan", "groww"), ("groww", "dhan")] {
-        if feed_off.get(partner).copied().unwrap_or(false)
-            && let Some(n) = feed_numbers.get_mut(feed)
-        {
-            n.unique_win_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
-            n.both_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
-        }
-    }
-}
+// Feed-vs-feed contest math — RETIRED 2026-08-21 (second-feed removal).
+// `compute_minute_overlap` and `apply_minute_overlap_and_feed_off_sentinels`
+// stamped each feed's `unique_win_minutes` / `both_minutes` from the two
+// session minute sets, and blanked them to the sentinel when the PARTNER feed
+// was off. Both are comparative by definition and had already gone
+// unreachable: `minute_sets` and `feed_off` are keyed from `Feed::ALL`, so the
+// removed feed's lookups always missed and neither branch could fire. The two
+// columns therefore already carried the -1 unavailable sentinel every run —
+// which is what they carry now, unchanged, and what the runbook's
+// sentinel-guarded `sum(unique_win_minutes)` already skips. The columns stay
+// in the schema and are still round-tripped from an existing row on a
+// catch-up rerun; nothing computes them while one feed is live.
 
 // Scoreboard PR-D presence-coverage fold — RETIRED 2026-07-18 (stage-4
 // dead-producer sweep): `apply_presence_coverage`,
@@ -2925,7 +2886,6 @@ impl FeedDayNumbers {
 pub struct ScoreboardSummary {
     pub trading_date_ist: String,
     pub dhan: FeedDayNumbers,
-    pub groww: FeedDayNumbers,
     pub session_minutes: i64,
     /// A data SOURCE was unavailable mid-run (read/parse/flush failure) —
     /// distinct from `early_run` so the Telegram footnotes stay honest
@@ -2944,8 +2904,7 @@ pub struct ScoreboardSummary {
     /// stamps the distinct 'feed_off' outcome and the card says "no
     /// contest" instead of declaring a one-horse winner.
     pub dhan_feed_off: bool,
-    /// Groww was switched OFF for the day (round 4, 2026-07-10).
-    pub groww_feed_off: bool,
+
     /// REST 1m pull digest aggregates per (feed, leg) — the Quote-2 daily
     /// answer (Groww REST plan PR-5). Empty on days with no measurable
     /// pull records (pre-deploy days / read failure — see the flag below).
@@ -3364,7 +3323,6 @@ pub async fn run_feed_scoreboard(
     // 4. Per-feed tick / instrument / minute coverage (SQL over the day's
     //    ticks partition — flagged O(day-rows), server-side, cold).
     let mut feed_numbers: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-    let mut minute_sets: BTreeMap<&'static str, Option<HashSet<String>>> = BTreeMap::new();
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
         let mut n = FeedDayNumbers::unavailable();
@@ -3393,7 +3351,6 @@ pub async fn run_feed_scoreboard(
         if n.ticks < 0 || n.instruments < 0 || set.is_none() {
             sources_complete = false;
         }
-        minute_sets.insert(label, set);
         feed_numbers.insert(label, n);
     }
 
@@ -3498,12 +3455,9 @@ pub async fn run_feed_scoreboard(
         feed_off.insert(label, inferred || kept);
     }
 
-    // 5c. Feed-level unique-win / both minutes from the two minute sets —
-    //     with the `-1` sentinel on the PARTNER's comparison columns on a
-    //     feed-off day (round 5, 2026-07-10 — MEDIUM: exclusive-vs-nothing
-    //     is not a measurement; the phantom ~375 unique minutes skewed the
-    //     month verdict's headline sum).
-    apply_minute_overlap_and_feed_off_sentinels(&mut feed_numbers, &minute_sets, &feed_off);
+    // 5c. Feed-level unique-win / both minutes — RETIRED 2026-08-21 with the
+    //     second feed; see the dated note beside `parse_minute_set`. The two
+    //     columns keep the -1 unavailable sentinel they already carried.
 
     // 5d. Per-instrument presence drain — RETIRED 2026-07-18 (stage-4
     //     dead-producer sweep): the in-memory presence registry was deleted
@@ -3932,18 +3886,19 @@ pub async fn run_feed_scoreboard(
         .get("dhan")
         .copied()
         .unwrap_or_else(FeedDayNumbers::unavailable);
-    let groww = feed_numbers
-        .get("groww")
-        .copied()
-        .unwrap_or_else(FeedDayNumbers::unavailable);
     // Total blackout (nothing measured at all) → the caller pages Aborted.
-    if dhan.ticks < 0 && groww.ticks < 0 && tallies.is_none() {
+    //
+    // 2026-08-21: the second feed dropped out of this condition with the feed
+    // itself. Its `feed_numbers` lookup always missed, so its `ticks` was the
+    // -1 unavailable sentinel on every run and the `&&` term was already
+    // vacuously true — the check has always been the Dhan-and-no-tallies one
+    // it now says it is.
+    if dhan.ticks < 0 && tallies.is_none() {
         return Err("every data source was unreachable — nothing measured".to_string());
     }
     Ok(ScoreboardSummary {
         trading_date_ist: trading_date_label,
         dhan,
-        groww,
         session_minutes: SCOREBOARD_SESSION_MINUTES,
         partial_coverage,
         degraded,
@@ -3952,7 +3907,6 @@ pub async fn run_feed_scoreboard(
         // partial while the card rendered no restart caveat).
         restart_partial: restart_day_floor,
         dhan_feed_off: feed_off.get("dhan").copied().unwrap_or(false),
-        groww_feed_off: feed_off.get("groww").copied().unwrap_or(false),
         rest_legs,
         rest_legs_read_failed,
     })
@@ -4244,19 +4198,6 @@ mod tests {
         assert_eq!(rows[2].feed, "groww");
         // Unparsable body → None (caller records sentinels).
         assert_eq!(parse_ws_events("not json"), None);
-    }
-
-    #[test]
-    fn test_compute_minute_overlap() {
-        let a: HashSet<String> = ["09:15", "09:16", "09:17"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let b: HashSet<String> = ["09:16", "09:17", "09:18", "09:19"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        assert_eq!(compute_minute_overlap(&a, &b), (1, 2, 2));
     }
 
     #[test]
@@ -6284,49 +6225,6 @@ mod tests {
         // The Some(true) veto stays load-bearing for the NO-marker
         // enabled-but-broker-dead arm.
         assert!(!is_feed_off_day(false, true, false, 0, Some(true)));
-    }
-
-    #[test]
-    fn test_apply_minute_overlap_and_feed_off_sentinels() {
-        // Round-5 MEDIUM: on a feed-off day the PARTNER's comparison
-        // columns take the -1 sentinel — exclusive-vs-nothing is not a
-        // measurement, and the phantom ~375 unique minutes skewed the
-        // month verdict's headline sum.
-        let minute = |h: i64, m: i64| format!("2026-07-10T{h:02}:{m:02}:00.000000Z");
-        let dhan_set: HashSet<String> = [minute(9, 15), minute(9, 16), minute(9, 17)]
-            .into_iter()
-            .collect();
-        let mk = |dhan_set: HashSet<String>, groww_set: HashSet<String>| {
-            let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-            nums.insert("dhan", FeedDayNumbers::unavailable());
-            nums.insert("groww", FeedDayNumbers::unavailable());
-            let mut sets: BTreeMap<&'static str, Option<HashSet<String>>> = BTreeMap::new();
-            sets.insert("dhan", Some(dhan_set));
-            sets.insert("groww", Some(groww_set));
-            (nums, sets)
-        };
-        // Normal dual-feed day: real overlap, no sentinels.
-        let (mut nums, sets) = mk(dhan_set.clone(), [minute(9, 15)].into_iter().collect());
-        let both_on: BTreeMap<&'static str, bool> =
-            [("dhan", false), ("groww", false)].into_iter().collect();
-        apply_minute_overlap_and_feed_off_sentinels(&mut nums, &sets, &both_on);
-        assert_eq!(nums["dhan"].unique_win_minutes, 2);
-        assert_eq!(nums["dhan"].both_minutes, 1);
-        assert_eq!(nums["groww"].unique_win_minutes, 0);
-        // Groww-off day: dhan's "3 exclusive minutes vs nothing" is NOT a
-        // measurement — sentinel, never a phantom month-sum win.
-        let (mut nums, sets) = mk(dhan_set, HashSet::new());
-        let groww_off: BTreeMap<&'static str, bool> =
-            [("dhan", false), ("groww", true)].into_iter().collect();
-        apply_minute_overlap_and_feed_off_sentinels(&mut nums, &sets, &groww_off);
-        assert_eq!(
-            nums["dhan"].unique_win_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL,
-            "the RUNNING feed's row on a feed-off day carries no phantom win"
-        );
-        assert_eq!(nums["dhan"].both_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL);
-        // The OFF feed's own measured zeros stay (its row is feed_off and
-        // excluded day-level by the runbook SQL anyway).
-        assert_eq!(nums["groww"].unique_win_minutes, 0);
     }
 
     #[test]
