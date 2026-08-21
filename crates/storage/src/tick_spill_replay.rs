@@ -618,4 +618,196 @@ mod tests {
             "the supervisor must respawn, not exit after one death"
         );
     }
+
+    /// A one-shot local HTTP server that answers `n` requests with `status`.
+    ///
+    /// # Why a real socket rather than a mock
+    ///
+    /// The success arm of [`replay_spill_dir`] is the arm that matters: it is
+    /// what truncates the file and reports the bytes as recovered. A mock would
+    /// prove only that the mock was called. Twenty lines of `TcpListener`
+    /// exercise the real `reqwest` round trip, the real status check, and the
+    /// real truncate — with no QuestDB and no new dependency.
+    fn tiny_server(status: &'static str, n: usize) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..n {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                // One read is enough: we never inspect the body, and draining it
+                // fully would block on a request larger than the buffer.
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(status.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/write"), handle)
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-spill-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn replay_spill_dir_truncates_a_file_the_database_accepted() {
+        // THE success arm. Everything else in this module is scaffolding around
+        // this one outcome: rescued ticks reach the database and the file is
+        // left empty rather than deleted, so the retention sweep can still tell
+        // a drained file from an abandoned one.
+        let dir = temp_dir("ok");
+        let path = dir.join("ticks-dhan-1.ilp");
+        let payload = b"ticks value=1i 1\nticks value=2i 2\n";
+        std::fs::write(&path, payload).expect("write");
+
+        let (url, server) = tiny_server("HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n", 1);
+        let client = crate::http_client::build_probe_client(5).expect("client");
+        let outcome = replay_spill_dir(&dir, &url, &client).await;
+        let _ = server.join();
+
+        assert_eq!(outcome.files_replayed, 1);
+        assert_eq!(outcome.files_failed, 0);
+        assert_eq!(outcome.bytes_replayed, payload.len() as u64);
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").len(),
+            0,
+            "a drained file must be EMPTY, not absent — prune_spill_files \
+             distinguishes the two and fires SPILL-RETENTION-01 on the other"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn replay_spill_dir_keeps_the_file_when_the_database_refuses_it() {
+        // A 4xx is not a transport failure: the bytes arrived and were rejected.
+        // The file must survive that just as it survives an unreachable server,
+        // because the operator's manual replay is still available either way.
+        let dir = temp_dir("refused");
+        let path = dir.join("ticks-dhan-1.ilp");
+        std::fs::write(&path, b"ticks value=1i 1\n").expect("write");
+
+        let (url, server) = tiny_server("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n", 1);
+        let client = crate::http_client::build_probe_client(5).expect("client");
+        let outcome = replay_spill_dir(&dir, &url, &client).await;
+        let _ = server.join();
+
+        assert_eq!(outcome.files_failed, 1);
+        assert_eq!(outcome.files_replayed, 0);
+        assert_eq!(outcome.bytes_replayed, 0);
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"ticks value=1i 1\n",
+            "a refused replay must leave the payload byte-for-byte intact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failing_file_stops_the_whole_round() {
+        // The spill exists because the database was already too slow. Pushing
+        // the rest of the backlog at it is how a bounded tick loss becomes an
+        // unbounded outage — so the SECOND file must not even be attempted.
+        let dir = temp_dir("stop");
+        let first = dir.join("ticks-dhan-1.ilp");
+        let second = dir.join("ticks-dhan-2.ilp");
+        std::fs::write(&first, b"ticks value=1i 1\n").expect("write");
+        std::fs::write(&second, b"ticks value=2i 2\n").expect("write");
+
+        let (url, server) =
+            tiny_server("HTTP/1.1 500 Server Error\r\ncontent-length: 0\r\n\r\n", 1);
+        let client = crate::http_client::build_probe_client(5).expect("client");
+        let outcome = replay_spill_dir(&dir, &url, &client).await;
+        let _ = server.join();
+
+        assert_eq!(outcome.files_failed, 1, "exactly ONE file may be attempted");
+        assert_eq!(outcome.files_replayed, 0);
+        assert!(
+            !std::fs::read(&second).expect("read").is_empty(),
+            "the second file must be untouched — the round stops at the first failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn replay_spill_dir_drains_every_file_when_all_succeed() {
+        // The multi-file loop: oldest hour first, and the round continues.
+        let dir = temp_dir("many");
+        for n in 1..=3 {
+            std::fs::write(dir.join(format!("ticks-dhan-{n}.ilp")), b"ticks v=1i 1\n")
+                .expect("write");
+        }
+        let (url, server) = tiny_server("HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n", 3);
+        let client = crate::http_client::build_probe_client(5).expect("client");
+        let outcome = replay_spill_dir(&dir, &url, &client).await;
+        let _ = server.join();
+
+        assert_eq!(outcome.files_replayed, 3);
+        assert_eq!(outcome.files_failed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn describe_send_error_reports_connect_and_timeout_by_kind() {
+        // Both real failures, because the point of this function is that a
+        // reqwest error's Display embeds the URL and must never be logged.
+        let client = crate::http_client::build_probe_client(1).expect("client");
+
+        let refused = client
+            .post("http://127.0.0.1:1/write")
+            .body(vec![1u8])
+            .send()
+            .await
+            .expect_err("port 1 must refuse");
+        assert_eq!(describe_send_error(&refused), "connect");
+
+        // A listener that accepts and never answers: the client times out.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hang = std::thread::spawn(move || {
+            let _keep = listener.accept();
+            std::thread::sleep(std::time::Duration::from_millis(2_500));
+        });
+        let timed_out = client
+            .post(format!("http://127.0.0.1:{port}/write"))
+            .body(vec![1u8])
+            .send()
+            .await
+            .expect_err("a server that never answers must time out");
+        assert_eq!(describe_send_error(&timed_out), "timeout");
+        let _ = hang.join();
+    }
+
+    #[tokio::test]
+    async fn the_supervised_drain_starts_and_stays_running() {
+        // `run_replay_loop` builds its HTTP client and pre-registers both
+        // counters BEFORE its first sleep, so a plain spawn-and-yield covers
+        // that entry path — and the assertion that matters is that the
+        // supervisor is still alive, because a drain that exits quietly is how
+        // rescued ticks accumulate to the 512 MiB cap unnoticed.
+        //
+        // Paused time is deliberately NOT used: it needs tokio's `test-util`
+        // feature, and adding a dependency feature to reach one sleep would be
+        // a worse trade than covering the entry path directly.
+        let dir = temp_dir("supervised");
+        let handle = spawn_supervised_tick_spill_replay(dir.clone(), "127.0.0.1", 1);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "the supervisor must keep running — a drain that exits quietly is \
+             how rescued ticks accumulate to the cap unnoticed"
+        );
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
