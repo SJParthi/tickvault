@@ -1064,3 +1064,98 @@ run above ~4,565 and the ~12,500 packet/sec figure is arithmetic, not a
 measurement. NOT claimed: index FUTURES depth, which no authorized Dhan source
 can reach. NOT claimed: that the ~24,600 figure will be met on any given day —
 it is whatever the master resolves, bounded by the connections left after spot.
+
+## ITEM 23 (added 2026-08-21) — operator: "see evrythgin enitlrey it shdou lbe always full mode with depth 5" / "yes fix evrythgin"
+
+**Scope authority:** the dated 2026-08-21 section in
+`websocket-connection-scope-lock.md` ("FULL MODE EVERYWHERE, and the ONE segment
+that cannot take it"), recorded BEFORE this code change per the rule-file-first
+law. No new scope: no socket opened, no universe widened, `dry_run` untouched,
+§28 frozen area untouched.
+
+## Item 23 Design
+
+The 119 subscribed NSE indices have produced zero ticks since being subscribed,
+while 8,868 tradeable instruments flow normally. Root cause: the rebuilt lane
+applies ONE global feed mode to every instrument. Since 2026-08-19 that mode is
+Full (21), which requests 5 levels of order-book depth. An index has no order
+book, and Dhan answers the request with silence rather than an error.
+
+Fix: restore the per-segment split the pre-retirement lane had
+(`idx_instruments`, lost in the 2026-07-17 delete / 2026-08-09 rebuild).
+
+- `IDX_I_FEED_MODE: FeedMode = FeedMode::Quote` — one constant, one line to
+  change if the live probe says Ticker instead.
+- `feed_mode_for_segment(segment, configured)` — pure, total, O(1). Indices
+  take the override; every other segment returns `configured` UNCHANGED, so a
+  future scope-lock mode move still propagates.
+- `partition_index_batch(batch)` — pure, cold-path, zero-loss.
+- `send_subscribe` splits main-feed batches and sends one message per mode.
+  One Dhan message carries exactly one `RequestCode`, so this is structural.
+  Depth endpoints are untouched (they refuse non-NSE segments and never carry
+  an index).
+
+Files: `crates/core/src/websocket/connection.rs`.
+
+## Item 23 Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Batch with no index | Original path, byte-identical to before |
+| All-index batch | One Quote message; no empty second message (`EmptyBatch` would tear the socket down) |
+| Mixed batch | Two messages: others in configured mode, indices in Quote |
+| Non-main-feed endpoint | Never splits |
+| Batch ≤100 mixed | Each half is ≤100, so neither can trip `BatchSplit` |
+
+## Item 23 Failure Modes
+
+| Failure | Result |
+|---|---|
+| The non-index half fails to send | `?` propagates, socket torn down — indices are NOT sent against a half-subscribed socket |
+| The index half fails to send | Returned as failure; the supervisor re-subscribes |
+| Quote also refused by Dhan for IDX_I | Identical symptom (silence), caught by the unchanged RISK-GAP-03 never-ticked count — the stated verification |
+| Override wrongly applied to a real segment | Would drop ~24,600 instruments off depth-5 — pinned against by `every_other_segment_keeps_the_configured_full_mode` |
+
+## Item 23 Test Plan
+
+Seven tests in `connection.rs`, all green (51 in module):
+`feed_mode_for_segment_gives_an_index_quote_not_full`,
+`feed_mode_for_segment_keeps_full_for_every_other_segment` (non-vacuity),
+`feed_mode_for_segment_passes_the_configured_mode_through`,
+`feed_mode_for_segment_makes_a_mixed_batch_two_messages`,
+`partition_index_batch_loses_nothing_and_duplicates_nothing` (zero-loss),
+`partition_index_batch_puts_an_all_index_batch_on_one_side`,
+`partition_index_batch_with_no_index_leaves_the_original_path`.
+
+**Bite-proven:** reverting `IDX_I_FEED_MODE` to `Full` fails
+`feed_mode_for_segment_gives_an_index_quote_not_full` and
+`feed_mode_for_segment_makes_a_mixed_batch_two_messages` (verified 2026-08-21).
+
+Also CORRECTS `test_the_main_feed_payload_carries_the_full_request_code`, whose
+fixture was an `IDX_I` instrument asserting it gets code 21 — the defect written
+down as expected behaviour, the same shape as the assertion corrected in
+`a2acb6a`. Fixture is now a tradeable instrument.
+
+## Item 23 Rollback
+
+Single constant: set `IDX_I_FEED_MODE = FeedMode::Full` to restore today's
+behaviour exactly (the partition then sends two messages carrying the same
+code, which is harmless). Full revert is one file.
+
+## Item 23 Observability
+
+No new metric or alarm. The existing `RISK-GAP-03` never-ticked counter is the
+verification and is already alarmed: it has read exactly the IDX_I count every
+day (4, then 119) and must read 0 for the index set after this lands.
+
+## Item 23 Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the mode
+selection is a pure total function with non-vacuity and pass-through pins, and
+the partition has a zero-loss property test. **NOT claimed: that indices now
+tick.** Whether Dhan SERVES Quote for IDX_I on this account is UNVERIFIED-LIVE —
+the May 2026 support ticket asking exactly that has no recorded answer, and an
+older uncited note claimed Ticker is forced. If Quote is also refused the
+symptom is identical (silence) and `IDX_I_FEED_MODE` is the one line to change.
+What IS claimed: the lane no longer sends indices a request Dhan is measured to
+answer with nothing, and the failure remains loud rather than silent.
