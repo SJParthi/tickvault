@@ -4079,6 +4079,31 @@ fn ist_second_of_day_now() -> u32 {
 ///
 /// Returns 0 when the spot universe already used every connection: the correct
 /// answer is then "no contracts", not "squeeze them in somewhere".
+/// Which halves of the late attach still need dialing this iteration.
+///
+/// Extracted as a pure function because it IS the 2026-08-21 defect, and it is
+/// the only part of the attach testable without a live pool and a QuestDB. The
+/// pre-fix code could not even express the state this returns — a single
+/// boolean gated both halves, so "contracts are on the wire, depth still needs
+/// to dial" had no representation and the loop simply exited.
+///
+/// `pending` (see `stock_options_are_pending`) holds the CONTRACT half only.
+/// Depth must never be held by it: depth does not read spot prices, so waiting
+/// for a stock to print cannot make the option chain arrive any sooner.
+#[must_use]
+fn outstanding_halves(
+    depth_resolved: bool,
+    contracts_resolved: bool,
+    depth_done: bool,
+    contracts_done: bool,
+    pending: bool,
+) -> (bool, bool) {
+    (
+        contracts_resolved && !contracts_done && !pending,
+        depth_resolved && !depth_done,
+    )
+}
+
 #[must_use]
 fn remaining_main_feed_capacity(connections_used: usize) -> usize {
     let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
@@ -4191,7 +4216,7 @@ async fn attach_depth_when_available(
     // would be planned as if all 5 main-feed sockets were free and the pool
     // would be asked for a sixth. The 16-connection lock is arithmetic, not a
     // hope, and this is the term that keeps it so.
-    main_feed_connections_used: usize,
+    mut main_feed_connections_used: usize,
     // The boot-dialed spot connection's top-up channel, and the room left on
     // it. `None` when the boot dialed nothing (no spot universe) or when the
     // spot set already fills its connection.
@@ -4225,6 +4250,30 @@ async fn attach_depth_when_available(
     // "throw it away and dial nothing", or waiting for better would have
     // cost the session the coverage it already had.
     let mut last_had_instruments = false;
+    // Which half has already reached the wire. Set ONLY on a successful dial.
+    //
+    // # The 2026-08-21 defect these two booleans exist to end
+    //
+    // Depth and contracts shared ONE `anything_resolved` gate and ONE
+    // terminating `return`, so whichever half resolved FIRST closed the loop
+    // for BOTH. Contracts read `ticks` (filled from 09:15:00) and resolve
+    // ~09:15:30; depth reads `option_chain_1m` under a `ts >= today` filter
+    // that cannot match before the cadence leg's first fire at 09:16:00.
+    // Contracts therefore won that race every single session, the loop
+    // returned, and depth-20 + depth-200 never dialed at all — 10 authorized
+    // sockets dark, every day, while every alarm read healthy.
+    //
+    // They must be tracked rather than simply re-attempted: `pool.admit` is
+    // STATEFUL, so re-planning an already-dialed half consumes a second set of
+    // connection slots.
+    let mut contracts_done = false;
+    let mut depth_done = false;
+    // The contract overflow may be handed to the live spot connection exactly
+    // once. `SubscribeGuard::try_extend` refuses only PAST the per-connection
+    // cap — below it a second send silently DOUBLE-SUBSCRIBES the same
+    // instruments on a live socket, and Dhan answers an over-limit subscribe
+    // with 804 and drops the connection.
+    let mut spot_topup_used = false;
     let started = Instant::now();
     loop {
         // The deadline gates RETRIES, never the FIRST attempt.
@@ -4252,6 +4301,26 @@ async fn attach_depth_when_available(
             && window_elapsed >= DEPTH_ATTACH_MIN_WINDOW_SECS;
 
         let out_of_time = past_hard_stop || past_deadline_and_window;
+
+        // A terminal stop that does NOT consult `last_had_instruments`.
+        //
+        // The give-up arm below deliberately keeps waiting while a half is
+        // still resolving. With the two halves now independent, one half can
+        // resolve every minute and fail to PLAN every minute — nothing would
+        // set `last_had_instruments` false, and the task would poll into the
+        // evening for contracts that will not trade again today.
+        if attempts > 0 && past_hard_stop {
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                attempts,
+                contracts_done,
+                depth_done,
+                "late-attach stopped at the 15:30 IST hard stop. Any half showing `false` \
+                 above never reached the wire and carries NO data for the rest of this \
+                 session."
+            );
+            return;
+        }
 
         if attempts > 0 && out_of_time && !last_had_instruments {
             error!(
@@ -4303,9 +4372,12 @@ async fn attach_depth_when_available(
 
         attempts = attempts.saturating_add(1);
 
-        let anything_resolved = !selection.depth_20.is_empty()
-            || !selection.depth_200.is_empty()
-            || !contracts.instruments.is_empty();
+        // TWO gates, not one. A single `anything_resolved` let whichever half
+        // resolved FIRST close the loop for BOTH — see `contracts_done` /
+        // `depth_done` above for why that emptied the depth pools every day.
+        let depth_resolved = !selection.depth_20.is_empty() || !selection.depth_200.is_empty();
+        let contracts_resolved = !contracts.instruments.is_empty();
+        let anything_resolved = depth_resolved || contracts_resolved;
         last_had_instruments = anything_resolved;
 
         // A selection whose stock options are merely PENDING a price is not
@@ -4329,136 +4401,205 @@ async fn attach_depth_when_available(
             );
         }
 
-        if anything_resolved && !pending {
-            // Upgrade LAST, immediately before dialing. `None` means every
-            // socket died and the ring closed while we waited — dialing into a
-            // closed ring would open sockets whose frames reach nothing.
+        let (dial_contracts, dial_depth) = outstanding_halves(
+            depth_resolved,
+            contracts_resolved,
+            depth_done,
+            contracts_done,
+            pending,
+        );
+
+        if dial_contracts || dial_depth {
+            // Upgrade LAST, immediately before dialing, and RE-upgraded on
+            // every dialing iteration. The two halves can now dial minutes
+            // apart, so a ring that closed between them has to be able to stop
+            // the second dial as well as the first.
             let Some(frame_tx) = frame_weak.upgrade() else {
                 warn!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     attempts,
+                    contracts_done,
+                    depth_done,
                     depth_20 = selection.depth_20.len(),
                     depth_200 = selection.depth_200.len(),
-                    "depth late-attach resolved its instruments but the frame ring had already \
-                     closed — the lane went dark while it waited. Refusing to dial sockets whose \
-                     frames would reach no consumer."
+                    "late-attach resolved its instruments but the frame ring had already \
+                     closed — the lane went dark while it waited. Refusing to dial sockets \
+                     whose frames would reach no consumer."
                 );
                 return;
             };
-            // Split the contracts: what the FREE connections can hold goes
-            // through the pool as usual; the remainder rides the top-up
-            // channel onto the already-live spot connection.
-            //
-            // The order matters and is deliberate. `select_contract_universe`
-            // returns futures and index options FIRST, then the ATM ladders,
-            // and it is the ladders that must reach the wire intact — so the
-            // OVERFLOW is taken from the tail, leaving the head to the pool.
-            // Taking the overflow from the head would scatter one underlying's
-            // ladder across two dial paths for no benefit.
-            let pool_room = remaining_main_feed_capacity(main_feed_connections_used);
-            let (pool_contracts, overflow): (&[SubscribeInstrument], &[SubscribeInstrument]) =
-                if contracts.instruments.len() > pool_room {
-                    contracts.instruments.split_at(pool_room)
-                } else {
-                    (contracts.instruments.as_slice(), &[])
-                };
 
-            if !overflow.is_empty() {
-                match spot_topup.as_ref() {
-                    Some((tx, _)) => {
-                        // A bounded send that CANNOT block the attach: the
-                        // connection task may be mid-frame, and waiting on it
-                        // here would stall the dial of every depth socket
-                        // behind a socket that is doing its job.
-                        match tx.try_send(overflow.to_vec()) {
-                            Ok(()) => info!(
-                                overflow = overflow.len(),
-                                pool_contracts = pool_contracts.len(),
-                                "contract overflow handed to the live spot connection — the \
-                                 slots stranded on it are what the ATM window was short of"
-                            ),
-                            Err(err) => error!(
-                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                                overflow = overflow.len(),
-                                %err,
-                                "the spot connection's top-up channel would not accept the \
-                                 contract overflow — those contracts are NOT subscribed this \
-                                 session. The pool-dialed contracts and depth are unaffected."
-                            ),
+            // ---- half 1: the CONTRACT half of the main feed ----
+            if dial_contracts {
+                // Split the contracts: what the FREE connections can hold goes
+                // through the pool as usual; the remainder rides the top-up
+                // channel onto the already-live spot connection.
+                //
+                // The order matters and is deliberate. `select_contract_universe`
+                // returns futures and index options FIRST, then the ATM ladders,
+                // and it is the ladders that must reach the wire intact — so the
+                // OVERFLOW is taken from the tail, leaving the head to the pool.
+                let pool_room = remaining_main_feed_capacity(main_feed_connections_used);
+                let (pool_contracts, overflow): (&[SubscribeInstrument], &[SubscribeInstrument]) =
+                    if contracts.instruments.len() > pool_room {
+                        contracts.instruments.split_at(pool_room)
+                    } else {
+                        (contracts.instruments.as_slice(), &[])
+                    };
+
+                // `spot_topup_used` is not belt-and-braces. The channel is a
+                // one-shot budget: `try_extend` refuses only PAST the
+                // per-connection cap, and below it a second send silently
+                // DOUBLE-SUBSCRIBES on a live socket. Dhan answers an
+                // over-limit subscribe with 804 and drops the connection.
+                if !overflow.is_empty() && !spot_topup_used {
+                    match spot_topup.as_ref() {
+                        Some((tx, _)) => {
+                            // A bounded send that CANNOT block the attach: the
+                            // connection task may be mid-frame, and waiting on
+                            // it here would stall the depth dial behind a
+                            // socket that is doing its job.
+                            match tx.try_send(overflow.to_vec()) {
+                                Ok(()) => {
+                                    spot_topup_used = true;
+                                    info!(
+                                        overflow = overflow.len(),
+                                        pool_contracts = pool_contracts.len(),
+                                        "contract overflow handed to the live spot connection \
+                                         — the slots stranded on it are what the ATM window \
+                                         was short of"
+                                    );
+                                }
+                                Err(err) => error!(
+                                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    overflow = overflow.len(),
+                                    %err,
+                                    "the spot connection's top-up channel would not accept \
+                                     the contract overflow — those contracts are NOT \
+                                     subscribed this session. The pool-dialed contracts and \
+                                     depth are unaffected."
+                                ),
+                            }
                         }
+                        None => error!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            overflow = overflow.len(),
+                            "contract selection exceeded the free connections and there is no \
+                             top-up channel to absorb the remainder — those contracts are NOT \
+                             subscribed. This means capacity was budgeted against room the \
+                             attach cannot reach."
+                        ),
                     }
-                    None => error!(
+                }
+
+                // Depth slices deliberately EMPTY here. `build_feed_stack_plan`
+                // plans MainFeed FIRST and `plan_pool` returns on the first
+                // refusal, so a shared call lets a main-feed budget refusal
+                // abort Depth20/Depth200 planning before they are attempted at
+                // all. Planning the halves separately is the second half of
+                // this fix; `plan_pool` returns Ok immediately on an empty set,
+                // so the split costs nothing.
+                match build_feed_stack_plan(&mut pool, Instant::now(), pool_contracts, &[], &[]) {
+                    Ok(plan) => {
+                        let dialed = dial_planned_connections(
+                            plan,
+                            DialContext {
+                                pool: &mut pool,
+                                client_id: &client_id,
+                                spill: &spill,
+                                frame_tx: &frame_tx,
+                                main_feed_budget: &main_feed_budget,
+                                depth_budget: &depth_budget,
+                                ws_audit_tx: Some(&ws_audit_tx),
+                                // The attach dials its own connections with
+                                // their FINAL set — nothing is added to them
+                                // later, so they need no top-up channel.
+                                out_topups: None,
+                            },
+                        );
+                        contracts_done = true;
+                        // Keeps `remaining_main_feed_capacity` honest for the
+                        // depth half and any later reader. Without it the
+                        // used-count still describes boot-only occupancy.
+                        main_feed_connections_used =
+                            main_feed_connections_used.saturating_add(dialed);
+                        info!(
+                            dialed,
+                            attempts,
+                            contracts = contracts.instruments.len(),
+                            stock_options = contracts.stock_options,
+                            index_options = contracts.index_options,
+                            futures = contracts.index_futures + contracts.stock_futures,
+                            atm_window = contracts.atm_window_used,
+                            depth_done,
+                            "late-attach dialed the CONTRACT half of the main feed"
+                        );
+                    }
+                    Err(err) => error!(
                         code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                        overflow = overflow.len(),
-                        "contract selection exceeded the free connections and there is no \
-                         top-up channel to absorb the remainder — those contracts are NOT \
-                         subscribed. This means capacity was budgeted against room the \
-                         attach cannot reach."
+                        ?err,
+                        contracts = contracts.instruments.len(),
+                        "contract planning refused the selection. RETRYING until the deadline \
+                         — a refusal can be transient (a connection budget that frees up). \
+                         DEPTH IS PLANNED SEPARATELY AND IS UNAFFECTED by this failure."
                     ),
                 }
             }
 
-            match build_feed_stack_plan(
-                &mut pool,
-                Instant::now(),
-                pool_contracts,
-                &selection.depth_20,
-                &selection.depth_200,
-            ) {
-                Ok(plan) => {
-                    let dialed = dial_planned_connections(
-                        plan,
-                        DialContext {
-                            pool: &mut pool,
-                            client_id: &client_id,
-                            spill: &spill,
-                            frame_tx: &frame_tx,
-                            main_feed_budget: &main_feed_budget,
-                            depth_budget: &depth_budget,
-                            ws_audit_tx: Some(&ws_audit_tx),
-                            // The attach dials its own connections with their
-                            // FINAL set — nothing is added to them later, so
-                            // they need no top-up channel. Only the boot-dialed
-                            // spot connection has room worth reaching.
-                            out_topups: None,
-                        },
-                    );
-                    info!(
-                        dialed,
-                        attempts,
-                        depth_20 = selection.depth_20.len(),
-                        depth_200 = selection.depth_200.len(),
-                        contracts = contracts.instruments.len(),
-                        stock_options = contracts.stock_options,
-                        index_options = contracts.index_options,
-                        futures = contracts.index_futures + contracts.stock_futures,
-                        atm_window = contracts.atm_window_used,
-                        "late-attach opened its sockets: today's contracts resolved and both \
-                         depth and the contract universe dialed against them without a restart"
-                    );
-                    return;
-                }
-                Err(err) => {
-                    error!(
+            // ---- half 2: DEPTH ----
+            if dial_depth {
+                match build_feed_stack_plan(
+                    &mut pool,
+                    Instant::now(),
+                    &[],
+                    &selection.depth_20,
+                    &selection.depth_200,
+                ) {
+                    Ok(plan) => {
+                        let dialed = dial_planned_connections(
+                            plan,
+                            DialContext {
+                                pool: &mut pool,
+                                client_id: &client_id,
+                                spill: &spill,
+                                frame_tx: &frame_tx,
+                                main_feed_budget: &main_feed_budget,
+                                depth_budget: &depth_budget,
+                                ws_audit_tx: Some(&ws_audit_tx),
+                                out_topups: None,
+                            },
+                        );
+                        depth_done = true;
+                        info!(
+                            dialed,
+                            attempts,
+                            depth_20 = selection.depth_20.len(),
+                            depth_200 = selection.depth_200.len(),
+                            contracts_done,
+                            "late-attach dialed the DEPTH sockets"
+                        );
+                    }
+                    Err(err) => error!(
                         code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                         ?err,
                         depth_20 = selection.depth_20.len(),
                         depth_200 = selection.depth_200.len(),
-                        "depth late-attach resolved its instruments but planning refused them. \
-                         RETRYING until the 10:00 IST deadline — a refusal can be transient \
-                         (a connection budget that frees up), and giving up on the first one \
-                         would cost the whole session's depth."
-                    );
-                    // FALL THROUGH to the sleep, do NOT return.
-                    //
-                    // Until 2026-08-15 the `return` below sat outside this
-                    // match, so an Err ended the retry loop permanently. A
-                    // refusal at 09:17 IST killed depth for the entire day
-                    // despite ~43 attempts still remaining before the deadline
-                    // — and refusals like a connection-budget denial are by
-                    // nature transient. The Ok arm keeps its return: once the
-                    // sockets are dialed there is nothing left to retry.
+                        "depth planning refused its instruments. RETRYING until the deadline \
+                         — a refusal can be transient (a connection budget that frees up), \
+                         and giving up on the first one would cost the whole session's depth."
+                    ),
                 }
+            }
+
+            // The ONLY success return. Both halves, or keep waiting — the
+            // single `return` that used to sit in one shared Ok arm is exactly
+            // what left depth dark once contracts won the race.
+            if contracts_done && depth_done {
+                info!(
+                    attempts,
+                    "late-attach complete: contracts and depth are both on the wire"
+                );
+                return;
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(DEPTH_ATTACH_RETRY_SECS)).await;
@@ -8525,6 +8666,63 @@ mod tests {
             production.contains("tokio::spawn(attach_depth_when_available("),
             "the depth late-attach MUST be spawned, never awaited inline — an inline await \
              would block the bring-up (and therefore the template-sender drop) for the whole wait"
+        );
+    }
+
+    /// THE BITE for the 2026-08-21 depth-starvation defect.
+    ///
+    /// This state — contracts already on the wire, depth still resolving — is
+    /// the one the pre-fix code could not express. A single `anything_resolved`
+    /// boolean gated both halves and a single `return` ended the loop, so the
+    /// moment contracts dialed (~09:15:30, off the `ticks` table) the task
+    /// exited and depth (which cannot resolve before the 09:16:00 chain fire)
+    /// never dialed at all. Ten authorized sockets, dark every session.
+    #[test]
+    fn outstanding_halves_lets_depth_dial_after_contracts_already_did() {
+        assert_eq!(
+            outstanding_halves(true, true, false, true, false),
+            (false, true),
+            "with contracts dialed and depth resolved, DEPTH must still dial. Returning \
+             (false, false) here is precisely the defect: it is what made the loop exit \
+             before depth ever reached the wire."
+        );
+    }
+
+    /// `pool.admit` is stateful, so re-planning a dialed half consumes a second
+    /// set of connection slots and re-sends an overflow the live socket holds.
+    #[test]
+    fn outstanding_halves_never_redials_a_finished_half() {
+        assert_eq!(
+            outstanding_halves(true, true, true, true, false),
+            (false, false),
+            "both halves are done; neither may be planned again"
+        );
+    }
+
+    /// The pricing quorum holds CONTRACTS. It must never hold DEPTH — depth
+    /// reads the option chain, not spot prices, so waiting for a stock to
+    /// print cannot make its instruments arrive any sooner.
+    #[test]
+    fn outstanding_halves_holds_contracts_while_pending_but_never_depth() {
+        assert_eq!(
+            outstanding_halves(true, true, false, false, true),
+            (false, true),
+            "a pending contract selection must not re-starve depth — that would trade one \
+             defect for the other"
+        );
+    }
+
+    /// Non-vacuity: the ordinary both-outstanding case must dial both.
+    #[test]
+    fn outstanding_halves_dials_both_when_both_are_ready() {
+        assert_eq!(
+            outstanding_halves(true, true, false, false, false),
+            (true, true)
+        );
+        assert_eq!(
+            outstanding_halves(false, false, false, false, false),
+            (false, false),
+            "nothing resolved means nothing to dial"
         );
     }
 
