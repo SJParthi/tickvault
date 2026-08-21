@@ -23,9 +23,30 @@
 # RiskEngine::daily_loss_state publishes the gauge (the shared helper both
 # the order gate and the standalone halt evaluation call, so the published
 # value is by construction the value the halt decided on).
-# tv_order_fill_lag_seconds still has NO Rust emit site — Phase-1 owns it,
-# and its alarm arms on data arrival with zero further tf changes. The
-# emit-site guard (cloudwatch_app_alarms_wiring.rs
+# tv_order_fill_lag_seconds still has NO Rust emit site — Phase-1 owns it.
+#
+# ⚠ CHANGED 2026-08-21: "its alarm arms on data arrival with zero further tf
+# changes" is NO LONGER TRUE, and the arming PR must know why. The name was
+# REMOVED from the EMF `metric_selectors` allowlist (both copies) on that date
+# to free bytes in the EC2 user-data budget, which is a hard 16,384-byte AWS
+# limit that terraform refuses a PLAN above. It was the only selector entry in
+# the whole allowlist with zero emit sites anywhere in `crates/*/src`, so it
+# was shipping a name nothing could ever publish while three live counters —
+# depth row drops, depth persist errors, and the new ILP overflow bound — had
+# no CloudWatch presence at all.
+#
+# Nothing observable changed: a selector entry for a metric with no emitter
+# publishes nothing either way. What changed is the arming contract. The
+# Phase-1 arming PR MUST now restore `tv_order_fill_lag_seconds` to BOTH
+# selector copies (`deploy/aws/cloudwatch-agent.json` and
+# `deploy/aws/terraform/user-data.sh.tftpl`, pinned byte-identical by
+# cw_agent_selector_lockstep_guard.rs) in the same change as the emit site —
+# and must re-check the user-data byte budget, since restoring it costs those
+# bytes back. Arming the alarm without the selector entry produces a
+# permanently-INSUFFICIENT_DATA pager: the exact dead-monitor shape this
+# alarm's own dormancy note was written to avoid.
+#
+# The emit-site guard (cloudwatch_app_alarms_wiring.rs
 # test_every_alarm_metric_has_a_rust_emit_site) deliberately does NOT scan
 # this file — the dormant names would fail it; the shape guard
 # crates/app/tests/order_side_paging_wiring_guard.rs covers this file

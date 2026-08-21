@@ -314,9 +314,24 @@ impl WsEventAuditWriter {
         let Some(sender) = self.sender.as_mut() else {
             anyhow::bail!("ws_event_audit: no ILP sender (QuestDB unreachable)");
         };
-        sender
-            .flush(&mut self.buffer)
-            .context("ws_event_audit ILP flush")?;
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            // RETAIN on failure (the questdb-rs contract), but BOUNDED: a
+            // sustained outage or a server-side reject would otherwise grow
+            // this buffer without limit and, for a reject, keep it poisoned
+            // for the process lifetime. See ilp_overflow.
+            let dropped = crate::ilp_overflow::discard_if_overflowing(
+                &mut self.buffer,
+                &mut self.pending,
+                "ws_event_audit",
+            );
+            if dropped > 0 {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "ws_event_audit ILP flush failed and the retained buffer hit its {}-row bound; those rows were discarded so memory stays bounded and a poisoned buffer cannot keep this table dead",
+                    crate::ilp_overflow::MAX_PENDING_ROWS
+                )));
+            }
+            return Err(anyhow::Error::new(err).context("ws_event_audit ILP flush"));
+        }
         self.pending = 0;
         Ok(())
     }
