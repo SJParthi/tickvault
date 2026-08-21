@@ -256,6 +256,37 @@ pub enum TickRowError {
         /// The raw wire id that could not be represented.
         raw: u64,
     },
+    /// A price field on the tick is NON-FINITE (`NaN` / `±Inf`).
+    ///
+    /// Fail-closed on purpose, and this is a REAL wire shape rather than a
+    /// theoretical one: `parse_quote_packet` is proven by its own test
+    /// (`quote.rs::…day_open.is_nan()`) to propagate `f32::NAN` into
+    /// `day_open/high/low/close`, and IDX_I moved to Quote mode on
+    /// 2026-08-21, so the packet type that carries it is live.
+    ///
+    /// The old `opt_price` gate was `(v != 0.0).then(…)`, which **NaN
+    /// passes** (NaN compares unequal to everything), and
+    /// [`f32_to_f64_clean`] returns non-finite values unchanged — so a NaN
+    /// reached the ILP line, QuestDB REJECTED the whole batch, the rejected
+    /// buffer was rescued to the spill tier, and `tick_spill_replay` retries
+    /// a permanently-unacceptable file first in every round (files are
+    /// sorted, and there is no DLQ for this tier). One malformed field
+    /// therefore disabled tick recovery for every hour that followed.
+    /// Refusing ONE loud row is strictly better than losing the batch and
+    /// wedging the recovery tier behind it.
+    ///
+    /// The depth path in the same drain already does this
+    /// (`dhan_feed_stack.rs` — "the depth twin of `tick_price_is_sane`");
+    /// the tick path did not.
+    #[error(
+        "tick price field `{field}` is non-finite (NaN/Inf) — row refused \
+         rather than emitted as a NaN/Inf ILP value that QuestDB rejects, \
+         which would spill the whole batch and wedge the replay tier"
+    )]
+    PriceNotFinite {
+        /// Which column carried the non-finite value.
+        field: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -337,8 +368,46 @@ impl TickRow {
             }
         })?;
 
+        // Fail-closed on non-finite prices BEFORE any of them can reach an
+        // ILP line. NaN compares unequal to everything, so the `!= 0.0`
+        // gate below does NOT stop it, and `f32_to_f64_clean` passes
+        // non-finite through unchanged — see `TickRowError::PriceNotFinite`
+        // for the full chain this closes (rejected batch -> spilled buffer
+        // -> permanently-wedged replay round).
+        //
+        // `0.0` stays legal: it is the documented "not carried" sentinel for
+        // a Ticker (16-byte) packet and becomes NULL below. Only NaN/Inf are
+        // refused. Zero-alloc: five register compares, no branch on the
+        // happy path beyond the `is_finite` test itself.
+        for (field, value) in [
+            ("ltp", tick.last_traded_price),
+            ("open", tick.day_open),
+            ("high", tick.day_high),
+            ("low", tick.day_low),
+            ("close", tick.day_close),
+        ] {
+            if !value.is_finite() {
+                metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite")
+                    .increment(1);
+                error!(
+                    code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+                    security_id = tick.security_id,
+                    segment = segment_code_to_str(tick.exchange_segment_code),
+                    field,
+                    value = %value,
+                    "tick row refused — price field is non-finite (NaN/Inf); \
+                     emitting it would make QuestDB reject the whole batch, \
+                     spill the rescued buffer, and wedge the replay tier \
+                     behind a file it can never accept. Row NOT written."
+                );
+                return Err(TickRowError::PriceNotFinite { field });
+            }
+        }
+
         // A Ticker (16-byte) packet carries only LTP + LTT; Quote/Full add the
-        // rest. Zero means "not carried" for those, so it becomes NULL.
+        // rest. Zero means "not carried" for those, so it becomes NULL. Every
+        // value reaching here is finite (refused above), so the `!= 0.0` gate
+        // now means exactly what it reads as.
         let opt_price = |v: f32| (v != 0.0).then(|| round_to_2dp(f32_to_f64_clean(v)));
         let opt_qty = |v: u32| (v != 0).then(|| i64::from(v));
 
@@ -1118,6 +1187,65 @@ mod tests {
         }
     }
 
+    /// 2026-08-21 — the NaN chain, closed at the source.
+    ///
+    /// `parse_quote_packet` is proven by its OWN test to propagate
+    /// `f32::NAN` into `day_open/high/low/close`, and IDX_I moved to Quote
+    /// mode on 2026-08-21, so this is a live wire shape and not a
+    /// hypothetical. The pre-fix `opt_price` gate was `(v != 0.0).then(..)`,
+    /// which NaN PASSES (NaN compares unequal to everything), and
+    /// `f32_to_f64_clean` returns non-finite unchanged — so a NaN reached
+    /// the ILP line, QuestDB rejected the whole batch, the rescued buffer
+    /// was spilled, and `tick_spill_replay` then retried a file it can never
+    /// accept FIRST in every round (files are sorted; this tier has no DLQ).
+    ///
+    /// BITE PROOF: delete the `is_finite` loop in `from_parsed_tick` and
+    /// this test fails — the row is built and `high` comes back `Some(NaN)`.
+    #[test]
+    fn a_non_finite_price_is_refused_not_emitted_as_a_poison_ilp_row() {
+        for (field, mutate) in [
+            (
+                "ltp",
+                (|t: &mut ParsedTick| t.last_traded_price = f32::NAN) as fn(&mut ParsedTick),
+            ),
+            ("open", |t: &mut ParsedTick| t.day_open = f32::NAN),
+            ("high", |t: &mut ParsedTick| t.day_high = f32::NAN),
+            ("low", |t: &mut ParsedTick| t.day_low = f32::NAN),
+            ("close", |t: &mut ParsedTick| t.day_close = f32::NAN),
+            ("high", |t: &mut ParsedTick| t.day_high = f32::INFINITY),
+            ("low", |t: &mut ParsedTick| t.day_low = f32::NEG_INFINITY),
+        ] {
+            let mut tick = sample_tick();
+            mutate(&mut tick);
+            let err = TickRow::from_parsed_tick(&tick, 1)
+                .expect_err("a non-finite price MUST be refused, never built into a row");
+            assert_eq!(
+                err,
+                TickRowError::PriceNotFinite { field },
+                "the refusal must name the offending column"
+            );
+        }
+    }
+
+    /// The zero sentinel is NOT non-finite and must still be accepted — a
+    /// Ticker (16-byte) packet carries only LTP + LTT, so `0.0` legitimately
+    /// means "not carried" and becomes NULL. Refusing it would silently drop
+    /// every Ticker-mode instrument, which is strictly worse than the bug
+    /// being fixed.
+    #[test]
+    fn the_zero_not_carried_sentinel_is_still_accepted() {
+        let mut tick = sample_tick();
+        tick.day_open = 0.0;
+        tick.day_high = 0.0;
+        tick.day_low = 0.0;
+        tick.day_close = 0.0;
+        let row = TickRow::from_parsed_tick(&tick, 1)
+            .expect("0.0 is the documented not-carried sentinel, not a bad price");
+        assert!(row.open.is_none(), "0.0 must still become NULL");
+        assert!(row.high.is_none());
+        assert!(row.low.is_none());
+        assert!(row.close.is_none());
+    }
     fn sample_row() -> TickRow {
         TickRow::from_parsed_tick(&sample_tick(), 42).expect("sample tick must build")
     }
