@@ -2083,16 +2083,44 @@ async fn async_main() -> Result<()> {
         .increment(dropped);
         ws_wal_replay_live_feed.clear();
     }
-    {
-        // Both legs settled (loudly archived) — archive the staged segments
-        // so they never re-stage. `confirm_replayed` MOVES segments into the
-        // WAL archive dir (never deletes). Honest envelope (round-2 note,
-        // 2026-07-14): this confirm also runs when `replay_all` itself
-        // ERRORED above — segments staged but never read are archived with
-        // a zero count (raw frames preserved on disk, count lost).
-        // Acceptable post-retirement: no consumer exists to re-replay into,
-        // and NOT confirming would re-stage the unreadable segments forever
-        // (the WS-REINJECT-01 growth-storm class).
+    if dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty() {
+        // DELIBERATELY NOT CONFIRMING HERE (2026-08-21).
+        //
+        // The live-feed frames have been read into memory but NOT yet folded
+        // into the database — the Dhan lane does that, thousands of lines
+        // below, right after `LiveIngest` exists. `confirm_replayed` moves the
+        // staged segments out of `replaying/`, where the next boot looks, and
+        // its own doc says to call it "ONLY after the frames have been durably
+        // re-captured into the live pipeline".
+        //
+        // Calling it here made that sentence false: between this point and the
+        // refold the segments sat in `archive/` while their frames existed
+        // only in memory, so a crash in that window lost them permanently —
+        // and `prune_archived_segments` then deleted the raw bytes on a timer,
+        // under a doc-comment asserting they were already persisted. That is
+        // the foundation of the zero-tick-loss claim, inverted.
+        //
+        // The lane now confirms after its refold. If this process dies first,
+        // the segments stay in `replaying/` and the next boot replays them
+        // again — idempotent, because every affected table dedups on its
+        // upsert key.
+        info!(
+            frames = ws_wal_replay_live_feed.len(),
+            "STAGE-C.2c: staged write-ahead-log segments are held UNCONFIRMED — the Dhan \
+             lane will fold these frames and confirm them itself. A crash before that \
+             replays them again next boot rather than losing them."
+        );
+    } else {
+        // No refold is coming — either the lane will not run (the frames were
+        // just dropped loudly above) or there were none. Archiving here is
+        // correct and necessary: NOT confirming would re-stage the same
+        // unreadable segments on every boot forever (the WS-REINJECT-01
+        // growth-storm class).
+        //
+        // Honest envelope (round-2 note, 2026-07-14): this also runs when
+        // `replay_all` itself ERRORED above — segments staged but never read
+        // are archived with a zero count (raw frames preserved on disk, count
+        // lost).
         let confirm_ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
         tickvault_storage::ws_frame_spill::confirm_replayed(&confirm_ws_wal_path);
     }

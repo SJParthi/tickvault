@@ -961,10 +961,11 @@ impl LiveIngest {
                     rows = covered,
                     "live tick flush to QuestDB FAILED — the buffered rows were discarded by \
                      the writer contract and are a counted loss: these ticks are NOT in the \
-                     database and nothing re-inserts them. The raw frames are preserved in the \
-                     write-ahead log and can be recovered manually, but boot replay DROPS \
-                     live-feed frames (there is no re-fold path), so do not wait for a restart \
-                     to fix this."
+                     database and nothing re-inserts them WHILE THIS PROCESS LIVES. The raw \
+                     frames ARE preserved in the write-ahead log, and the next boot re-folds \
+                     them into the database automatically — so a restart recovers this window, \
+                     idempotently. Fix the database first; the restart is what recovers the \
+                     ticks."
                 );
                 0
             }
@@ -5700,6 +5701,35 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 outcome.lost
             );
         }
+
+        // CRASH-SAFETY CONFIRM — deliberately HERE, not at boot (2026-08-21).
+        //
+        // `confirm_replayed` moves the staged segments out of `replaying/` so
+        // they never re-stage. Its own doc says to call it "ONLY after the
+        // frames returned by `replay_all` have been durably re-captured into
+        // the live pipeline". Boot called it unconditionally, several thousand
+        // lines BEFORE this refold — the only code that makes that sentence
+        // true. Between those two points the segments sat in `archive/`,
+        // where the next boot does not look, while the frames they contained
+        // were still only in memory. A crash in that window lost them for
+        // good, and the archive pruner then deleted the raw bytes on a timer
+        // under a doc-comment asserting they were already persisted.
+        //
+        // Confirming here closes that window. If this process dies before
+        // reaching this line, the segments stay in `replaying/` and the next
+        // boot replays them again — which is idempotent, because every
+        // affected table dedups on its upsert key.
+        //
+        // Confirmed even when `outcome.lost > 0`: the frames we COULD fold are
+        // in the database, and the ones we could not are unfoldable rather
+        // than unread — re-replaying them next boot would fail identically
+        // while re-staging forever (the WS-REINJECT-01 growth-storm class).
+        // The `error!` above is what carries those, and it names the count.
+        // Resolved the same way boot resolves it (`TV_WS_WAL_DIR`, else the
+        // default) rather than threaded through the params struct: one shared
+        // helper cannot drift out of sync with itself, whereas a second copy
+        // of the path in a struct field can.
+        tickvault_storage::ws_frame_spill::confirm_replayed(crate::boot_helpers::ws_wal_dir());
     }
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
