@@ -321,6 +321,29 @@ pub fn contract_verdict_reasons(selection: &ContractSelection) -> Vec<&'static s
         }
         _ => {}
     }
+    // Contracts pushed out by capacity BEFORE the stock-option window is
+    // fitted (2026-08-21).
+    //
+    // The four reasons above all describe the stock-option window. Nothing
+    // described the three push sites that run first — index futures, stock
+    // futures, and the full index-option chains. Those increment
+    // `dropped_for_capacity` on `NoRoom`, and if the window then fits its
+    // authorized size the verdict is `applied` with the full width, so NOT ONE
+    // reason fires. The counter reads its pre-registered zero, the alarm stays
+    // green, and contracts the operator authorized never reached the wire.
+    //
+    // That is the same silent-shortfall shape `record_contract_give_up` was
+    // added for, one layer in: the give-up arms had no emitter, and these
+    // drops had no reason.
+    //
+    // Deliberately independent of the window reasons rather than folded into
+    // them: a drop is a shortfall whatever the window did, and `no_room` and
+    // this can legitimately both fire for one selection. Two labels on one
+    // counter is the honest description of two distinct facts — collapsing
+    // them would hide whichever came second.
+    if selection.dropped_for_capacity > 0 {
+        reasons.push("dropped_for_capacity");
+    }
     reasons
 }
 
@@ -2013,6 +2036,65 @@ mod tests {
             "a healthy selection must report NOTHING — a counter that fires on a good day \
              trains the operator to ignore it"
         );
+    }
+
+    /// The gap this closes: contracts dropped by the push sites that run
+    /// BEFORE the stock-option window is fitted — index futures, stock
+    /// futures, index chains — while the window itself then applies at its
+    /// authorized width. Every other reason describes the window, so this
+    /// selection previously reported a clean verdict while contracts the
+    /// operator authorized never reached the wire.
+    #[test]
+    fn contract_verdict_reasons_flags_drops_even_when_the_window_applied_in_full() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        sel.dropped_for_capacity = 1;
+        assert_eq!(
+            contract_verdict_reasons(&sel),
+            vec!["dropped_for_capacity"],
+            "a full-width window does not make a dropped contract acceptable — the \
+             selection is still smaller than the operator authorized, and this was the \
+             one shortfall shape no reason described"
+        );
+    }
+
+    /// Both facts are reported, not one. A window that could not fit AND
+    /// contracts pushed out are two distinct failures of the same selection;
+    /// reporting only the first would hide however many contracts were lost.
+    #[test]
+    fn contract_verdict_reasons_reports_no_room_and_drops_together() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.atm_window_reason = "no_room";
+        sel.dropped_for_capacity = 42;
+        let reasons = contract_verdict_reasons(&sel);
+        assert!(reasons.contains(&"no_room"), "got {reasons:?}");
+        assert!(reasons.contains(&"dropped_for_capacity"), "got {reasons:?}");
+    }
+
+    /// Non-vacuity: zero drops must stay silent, or the alarm fires on every
+    /// healthy session and the operator learns to ignore it.
+    #[test]
+    fn contract_verdict_reasons_stay_silent_when_nothing_was_dropped() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        sel.dropped_for_capacity = 0;
+        assert!(contract_verdict_reasons(&sel).is_empty());
     }
 
     #[test]
