@@ -251,6 +251,12 @@ pub enum ErrorCode {
     /// B6 (2026-07-03): this worker is what keeps the blocking questdb ILP
     /// TCP flush OFF the tick-consumer thread. Severity::High (a flapping
     /// flush worker means QuestDB ILP or the host is degrading).
+    ///
+    /// **REVIVED 2026-08-21:** the original emit site died in the 2026-07-17
+    /// sweep and this variant sat dormant. It is live again from a DIFFERENT
+    /// off-thread tick-ILP worker — the tick spill drain supervisor
+    /// (`tick_spill_replay::spawn_supervised_tick_spill_replay`). Same meaning,
+    /// same severity; `path` and `reason` in the log line say which worker.
     TickFlush01WorkerRespawn,
     /// WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED — the 60s
     /// `wal_tables()` probe (W2 PR#6, 2026-07-10, audit follow-up row 10)

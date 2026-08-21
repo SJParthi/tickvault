@@ -1516,3 +1516,172 @@ Carried by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.m
 - **O(1)** — the reporter is O(1): a length read, one log, one counter
   increment. No allocation beyond the log record itself, and it runs only on a
   refusal path, never on the hot path.
+
+---
+
+## ITEM 27 (added 2026-08-21) — operator: "Go ahead wirh your recommendation"
+
+**Status:** VERIFIED
+
+### Design
+
+Drain the tick spill automatically, so the rescue tier stops depending on a
+human running curl.
+
+ITEM 24 gave live ticks a spill tier: on a flush failure the ILP buffer is
+written to `data/spill/ticks/ticks-{feed}-{hour}.ilp` instead of being
+discarded. That converted a permanent in-memory loss into a replayable file —
+and then stopped, because replay was a documented `curl` command. A rescue
+whose recovery step needs a human fails the operator's standing
+no-manual-intervention mandate, and worse, it fails it SILENTLY: the file sits
+on disk looking like success.
+
+This is not a new invention. `crates/storage/src/tick_spill_drain` existed and
+was deleted in the 2026-07-17 stage-2 sweep with the rest of the dead Dhan tick
+chain (`lib.rs` records it). The rescue came back in ITEM 24; its drain did not.
+
+`tick_spill_replay` reinstates it:
+
+- **Pure core, fully testable:** `ilp_chunk_ranges(payload, max)` splits an ILP
+  body into line-aligned chunks. ILP is newline-delimited, so a chunk boundary
+  that lands mid-line would corrupt two rows. A single line longer than the cap
+  becomes its own oversized chunk — never split, never dropped, never
+  truncated. Bounding the POST matters because a spill file may be up to
+  `TICK_SPILL_MAX_BYTES` (512 MiB) and one 512 MiB body is exactly the write
+  pressure that caused the spill.
+- **Truncate on success, never delete.** This matches the seal precedent
+  exactly: `prune_spill_files` distinguishes `deleted` (aged-out EMPTY) from
+  `deleted_non_empty`, and fires `SPILL-RETENTION-01` on the latter with "the
+  replay path has been broken for longer than the retention window". A drained
+  file must therefore be EMPTY, not absent, or that distinction stops working.
+- **Crash-safe by idempotency, not by bookkeeping.** A crash between the POST
+  and the truncate re-POSTs the file next round. That is harmless because the
+  `ticks` DEDUP key carries `capture_seq`, so a replayed row UPSERTs onto
+  itself. No offset file, no state to corrupt.
+- **A failing round stops the round.** The spill exists because QuestDB was
+  already slow; hammering it with the backlog is how a bounded tick loss
+  becomes an unbounded outage. First non-2xx or transport error ends the file
+  AND the round.
+
+### Edge Cases
+
+- **Empty file** — skipped, left for the age-based pruner. Truncating an
+  already-empty file every round would rewrite mtime forever and the file would
+  never age out.
+- **A line longer than the chunk cap** — emitted whole as an oversized chunk.
+  Splitting it would corrupt a row; dropping it would be the silent loss this
+  exists to end.
+- **Payload with no trailing newline** — the final chunk runs to end-of-buffer.
+- **Partial success** (chunks 1..k succeed, k+1 fails) — the file is NOT
+  truncated and is re-POSTed whole next round. Re-writing the already-accepted
+  prefix is safe (DEDUP) and is strictly better than rewriting the file
+  mid-recovery.
+- **Non-`.ilp` files / subdirectories** — ignored, never read.
+- **Directory absent** — a no-op, not an error. A box that never spilled has no
+  such directory.
+
+### Failure Modes
+
+- QuestDB down → every round fails, nothing is truncated, files accumulate to
+  the 512 MiB cap and then the writer drops-and-counts as before. Degrades to
+  exactly ITEM 24's behaviour; never worse.
+- Disk full → the truncate fails; counted, and the file is re-POSTed next round.
+  Duplicate writes are absorbed by DEDUP.
+- **NOT fixed:** the flush timeouts themselves. Their cause is QuestDB write
+  latency under live load and is untouched here. This closes the recovery gap,
+  not the cause.
+
+### Test Plan
+
+Pure-core tests (no I/O, no QuestDB):
+- chunk boundaries land only on newlines
+- an over-long single line survives whole
+- a payload with no trailing newline loses nothing
+- chunk ranges concatenate back to the exact input (the zero-loss property)
+- an empty payload yields no chunks
+
+I/O tests against a temp dir (no QuestDB): file discovery ignores non-`.ilp`,
+an empty file is skipped rather than truncated, a missing directory is a no-op.
+
+The POST itself is NOT unit-testable without a live QuestDB and is honestly
+flagged rather than faked with a mock that would prove only that the mock was
+called.
+
+### Rollback
+
+The spawn site is one call. Removing it restores ITEM 24 behaviour exactly:
+files accumulate and wait for the documented curl. No data path changes, no
+schema changes.
+
+### Observability
+
+`tv_tick_spill_replayed_bytes_total` and `tv_tick_spill_replay_failed_total`,
+both pre-registered at 0 so a first increment is not consumed as the CloudWatch
+delta baseline. **FLAGGED, not fixed:** neither is EMF-selected and neither has
+an alarm — the same open item ITEM 26 records. Adding a Dhan-scoped alarm needs
+a dated operator row in `dhan-rest-only-noise-lock-2026-07-14.md` §2 first, and
+no such quote exists, so this change deliberately does not add one.
+
+### Per-Item Guarantee Matrix
+
+Carried by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
+(15-row + 7-row). Rows specific to this item:
+
+- **Zero ticks lost** — this is the item that makes ITEM 24's rescue actually
+  recover. Honest bound: rows land only when QuestDB accepts them; past the
+  512 MiB cap the writer still drops and counts.
+- **O(1)** — the chunker is a single forward pass over the payload, O(n) in
+  bytes with no allocation per line and no backtracking; it is a cold-path
+  recovery routine, never on the tick hot path. Flagged as O(n), not relabelled
+  O(1), per the standing rule.
+- **Extreme check** — the concatenation property test fails the build if the
+  chunker ever loses or duplicates a byte.
+
+### ITEM 27 rider — TICK-FLUSH-01 is revived, and its runbook said otherwise
+
+The drain supervisor needs a coded error, and `TICK-FLUSH-01` already means
+exactly "the off-thread tick ILP flush worker died and the supervisor respawned
+it". Its original emit site was deleted in the 2026-07-17 sweep and the variant
+was retained for crossref, so it was dormant rather than gone. Reusing it beats
+inventing a near-duplicate whose only distinction would be *which* tick-ILP
+worker died — a distinction the log line already carries in `path` and `reason`.
+
+Reviving it meant two documents were now wrong and are corrected in the same
+change: the runbook's title asserted `[RETIRED 2026-07-17]`, and the ErrorCode
+docstring described only the deleted worker. Both now carry dated revival notes.
+Leaving them would have been the same false-claim class this branch has been
+correcting all along — a document asserting a code is dead while it pages.
+
+**Verification:** 928 storage lib tests · 45 storage integration binaries ·
+1,536 app lib tests · 65 common suites — all ok, zero failures. `cargo fmt
+--check` clean; CI-equivalent clippy clean; plan-gate, banned-pattern,
+data-integrity, pub-fn-test, pub-fn-wiring all PASS. The chunker's zero-loss
+property is bite-proven: a one-byte off-by-one turns three tests red.
+
+### ITEM 27 rider 2 — the banned-pattern scanner can be blinded by a brace in a string
+
+Writing `body.find("\n}\n")` inside this module's test block made the
+pre-commit gate reject ten `.expect()` calls that are all inside
+`#[cfg(test)]`. The cause is in `banned-pattern-scanner.sh`: it strips test
+code by tracking brace DEPTH, counting `{` and `}` per line with `gsub`, which
+cannot tell a brace in code from a brace inside a string or a comment. One
+unmatched `}` drops the depth to zero, the skip block ends early, and every
+line after it is scanned as production.
+
+The direction I hit is the SAFE one — it scans too much and produces false
+positives, which is loud and self-correcting. The dangerous direction is the
+mirror image: an unmatched `{` inside a test-block string would leave the depth
+permanently above zero, and every line after it — including real production
+code — would be skipped silently. That is a guard reading green because it
+stopped looking.
+
+**Surveyed, and it does not occur today.** A sweep over every `crates/*/src`
+`.rs` file for "a skip block that opens and never closes while production lines
+follow" returned zero hits. So this is recorded as a known fragility with a
+clean current state, not an open defect.
+
+Fixed locally by writing the brace as `\u{7d}` (which balances in source) with
+a comment saying why — and the comment itself had to avoid a bare brace for the
+same reason, which is a fair measure of how easy this is to trip. Hardening the
+scanner to ignore braces inside string and comment tokens is a real improvement
+and a separate change to a hook; it is deliberately not bundled here.

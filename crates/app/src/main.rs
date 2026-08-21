@@ -1623,6 +1623,28 @@ async fn async_main() -> Result<()> {
             std::path::PathBuf::from("data/spill"),
         );
 
+    // 2026-08-21 — the spill tier's RECOVERY arm.
+    //
+    // The watcher above measures the spill volume; the loop below empties it.
+    // `tick_persistence` rescues a failed ILP flush by writing the buffer to
+    // `data/spill/ticks/` instead of discarding it, which converted a
+    // permanent in-memory loss into a replayable file — and then stopped,
+    // because the documented recovery was a `curl` a human had to run. That
+    // fails the no-manual-intervention rule silently: the file sits on disk
+    // looking exactly like success.
+    //
+    // The drain posts each spill body back to QuestDB's own /write endpoint
+    // (the file IS line protocol, so there is no format to keep in sync) and
+    // truncates on success. Replay is idempotent because the `ticks` DEDUP key
+    // carries `capture_seq`, so a row written twice UPSERTs onto itself — which
+    // is what makes a crash between POST and truncate cost nothing.
+    let _tick_spill_drain_supervisor =
+        tickvault_storage::tick_spill_replay::spawn_supervised_tick_spill_replay(
+            std::path::PathBuf::from(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+            &config.questdb.host,
+            config.questdb.http_port,
+        );
+
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
     // volume and does nothing about it. This loop is the remediation arm.
     //
