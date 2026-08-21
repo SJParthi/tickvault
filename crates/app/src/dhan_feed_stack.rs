@@ -1461,6 +1461,20 @@ impl LiveIngest {
         });
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
+        // The detector's own blindness, published where its findings are.
+        //
+        // `refused_count` is non-zero when the detector ran out of slots and
+        // turned instruments away — fail-closed, which is correct, but it
+        // means the two gauges above describe a SUBSET of the universe while
+        // reading exactly like they describe all of it. Its doc comment has
+        // said "callers must surface it rather than assume silence means
+        // health" since it was written, and no caller did: every reference
+        // outside this line was a test.
+        //
+        // A detector that goes blind and reports zero silent instruments is
+        // indistinguishable from a healthy feed. That is the whole failure
+        // this detector exists to catch, arriving through the detector.
+        metrics::gauge!(SILENCE_DETECTOR_REFUSED_GAUGE).set(self.detector.refused_count() as f64);
         if let Some((_, w)) = worst {
             debug!(
                 security_id = w.key.0,
@@ -2131,6 +2145,13 @@ pub const INSTRUMENTS_SILENT_GAUGE: &str = "tv_dhan_feed_instruments_silent";
 /// lane produces — there is no payload to count, no parse to fail, and no
 /// error to log. Absence against a seeded key is the only evidence.
 pub const INSTRUMENTS_NEVER_TICKED_GAUGE: &str = "tv_dhan_feed_instruments_never_ticked";
+
+/// Gauge: observations the silence detector REFUSED because its slot table
+/// was full. Non-zero means the two gauges above describe only part of the
+/// universe while reading as though they describe all of it — the detector is
+/// blind, and a blind detector reporting zero silent instruments looks exactly
+/// like a healthy feed.
+pub const SILENCE_DETECTOR_REFUSED_GAUGE: &str = "tv_dhan_feed_silence_detector_refused";
 
 /// Gauge: seconds since the lane last persisted a tick, or — when no tick has
 /// arrived at all this session — seconds since the drain started.
