@@ -419,76 +419,80 @@ every counter we own. The 15:31 REST cross-verification remains the only ground 
 for that class, and a non-zero `compared` from it remains the only evidence this
 repository can offer that the feed works at all.
 
-### §2.3c — 2026-08-21: the SPILL tier joins family (5); and one gap this file was told about did not exist
+#### §2.3b-i — 2026-08-21 (SAME DAY): the tick-flow alarm reads a GAUGE, because the counter's meaning was never verified
 
-**The verbatim operator authorization (2026-08-21, typed directly in-session — preserve
-EXACTLY, typos included):**
+**No new authorization is claimed or needed.** §2.3b above authorizes exactly one
+alarm — "is the feed producing anything" — and this note records that its SIGNAL was
+corrected within hours of landing, before the terraform ever applied. The alarm name,
+the market-hours gate membership, and the count of alarms in family (5) are all
+unchanged. This is an implementation correction, recorded here rather than made
+quietly, because the reason is worth more than the change.
 
-> "Go ahead wirh your recommendation. Dude okay"
+**What was wrong.** The alarm read the counter `tv_dhan_feed_ingest_ticks_total` with
+`Sum < 1` over two 300-second windows. Its own header conceded the residual that
+undoes it: this repository has never verified, from the sandbox, whether the
+CloudWatch agent's prometheus pipeline publishes each scrape's DELTA or the running
+CUMULATIVE total. `auth-failed-alarm.tf` records the same uncertainty and lands on the
+over-paging side of it; this alarm landed on the other side.
 
-Given in DIRECT response to a message that ended: *"Making these losses actually page you
-is a decision only you can authorize — say the word and I'll draft the dated row and the
-alarm together, with its cost line."* This dated row is that draft, recorded BEFORE the
-terraform, per §3.
+The two readings are not equally survivable here:
 
-#### First, a correction to what that message claimed (Rule 11 — an over-stated gap is
-#### still a false claim, and it manufactures work)
-
-The message asked for authorization partly on the grounds that
-`tv_ws_frame_wal_reinjected_dropped_total` was "not EMF-selected and has no alarm". **Both
-halves are FALSE.** Verified by source scan the same day: the metric IS in the EMF selector
-(`cloudwatch-agent.json`), and `live-lane-alarms.tf:354` carries
-`tv-<env>-wal-frames-not-recovered` on it at `threshold = 1`,
-`GreaterThanOrEqualToThreshold`, one evaluation period — it pages on the FIRST unrecovered
-frame.
-
-So the WAL half of the work was already done, and the six refusal paths wired on 2026-08-21
-feed a counter that already ships and already pages. That is a better outcome than was
-claimed, and it is recorded here rather than quietly enjoyed: an executor that over-states a
-gap sends the next session hunting for something that is not there, which is the same waste
-a stale O(1)-table row causes in the other direction.
-
-#### What IS genuinely dark, and what this row authorizes
-
-The SPILL tier — not the WAL tier — has no CloudWatch presence at all:
-
-| Metric | EMF-selected? | Alarmed? |
+| | delta reading | cumulative reading |
 |---|---|---|
-| `tv_ticks_spilled_total` | **no** | no |
-| `tv_tick_spill_replay_failed_total` | **no** (new 2026-08-21) | no |
-| `tv_tick_spill_replayed_bytes_total` | **no** (new 2026-08-21) | no |
+| `Sum` over 300 s | ticks in the window | ≈ 5 × the running session total |
+| `Sum < 1` | true only when nothing arrived — **correct** | false forever after the first tick of the morning — **blind** |
+| Operator sees | a page when the feed dies | green, all day, whatever the feed does |
 
-That matters because the two tiers fail differently. The WAL tier's counter means "frames
-we could not re-fold" — a discrete, already-pageable loss. The spill tier's counters mean
-"an ILP flush failed and we rescued the buffer to disk" and "the automatic drain could not
-put it back". A spill that is never drained becomes a real tick loss at the 512 MiB cap, and
-today nothing outside the box's own log would say so.
+So the one alarm written to prove ticks are flowing was, on a coin flip, the alarm
+most likely to prove nothing. That is the false-OK class this file exists to stop, and
+it was sitting inside the change that closed a false-OK.
 
-**Family (5) therefore gains two members:**
+**The fix is not a better guess.** `tv_dhan_feed_last_tick_age_secs` is a GAUGE, and a
+gauge is published verbatim by both pipelines — there is no delta to compute for a
+value that is free to go down. The alarm now reads `Maximum >= 300` over two windows
+and means the same thing under either reading, so the unverifiable pipeline detail
+stops being load-bearing.
 
-| Alarm | Fires when | Why it is not noise |
-|---|---|---|
-| `tv-<env>-tick-spill-replay-failing` | `tv_tick_spill_replay_failed_total >= 1` in a period | The drain is the recovery arm. If it cannot put rescued ticks back, the rescue is a countdown to the cap, not a save. |
-| `tv-<env>-ticks-spilling` | `tv_ticks_spilled_total >= 1` in a period | An ILP flush failed. Distinct from `tv_ticks_dropped_total`, which both counters now increment: the drop alarm says "a flush failed"; this says "and it went to disk", which is the difference between loss and deferred recovery. |
+**Three things it improves beyond removing the ambiguity**, each of which was a real
+weakness of the counter version:
 
-**Both are market-hours gated**, joining the `market_hours_liveness_gate` Lambda's
-`ALARM_NAMES` list in the same change. Without the gate they page every evening and all
-weekend, which this file's own §2.3a calls the fastest way to train an operator to ignore an
-alarm.
+1. **It measures PERSISTENCE, not decode.** The gauge is stamped in `flush_and_record`
+   only when a flush actually wrote rows, so a QuestDB outage decays it while the
+   socket is busy — correct, because during one the feed is not delivering. The
+   counter incremented on a decoded tick, which can be true while nothing reaches
+   disk.
+2. **The series is DENSE from the drain's first second**, published on the 30-second
+   silence timer regardless of whether a frame ever arrives. The counter's handles are
+   built lazily inside the frame arm, so a lane that received nothing never registered
+   the series at all — the exact case the alarm was for, and the reason it needed
+   `breaching` to catch it.
+3. **Before the first tick it reports the drain's own uptime**, not zero. A lane that
+   dialled, connected, subscribed and received nothing therefore pages instead of
+   reporting perfect health — the 2026-08-12 shape.
 
-**Cost:** +3 EMF metric names ≈ $0.90/mo, +2 alarms ≈ $0.20/mo ⇒ **~$1.10/mo** against the
-$130 kill-ceiling whose 90% action line is $117. `tv_tick_spill_replayed_bytes_total` is
-shipped without an alarm deliberately — it is the SUCCESS signal, and a chart of successful
-recoveries is worth having beside the two failure alarms without adding a third pager.
+**Cost delta, stated rather than absorbed.** §2.3b costed this as "+1 alarm ≈ $0.10/mo
+and no new EMF name". It is now +1 alarm and +1 EMF name ≈ **$0.40/mo**, because the
+gauge needs a selector entry in both copies. Against the $130 kill-ceiling whose 90%
+action line is $117, and whose current margin is $4.28, that is real money and it is
+named here rather than discovered on an invoice.
 
-**⚠ What this does NOT do (Rule 11).** An alarm on a spill does not stop the flush timeouts
-that cause spills; their cause is QuestDB write latency under live load and is untouched. It
-converts a loss visible only in the box's own log into one that reaches the operator — that
-is the entire claim.
+**Ratchet:** `crates/app/tests/no_ticks_alarm_gauge_guard.rs` (7 tests) pins that the
+alarm reads the gauge and **not** the counter, that it uses `Maximum` with a
+`GreaterThanOrEqualToThreshold` comparison (an age gauge breaches when it GROWS — the
+counter-era `LessThanThreshold` would fire whenever the feed is healthy), that the
+alarm name survives so the gate still arms it, that the metric is in both EMF selector
+copies, and that production — not only a test — publishes it.
 
-**What a PR that violates §2.3c looks like (REJECT):** adds either alarm without the
-market-hours gate membership in the same change; adds an alarm on the SUCCESS counter
-(`replayed_bytes`), which would page on recovery working; adds a per-INSTRUMENT dimension to
-any of the three (the §2.3 cardinality rule stands — 4,565 per-instrument metrics ≈
-$1,369/mo against a budget whose automatic action stops the trading box); or re-states the
-corrected claim above as though the WAL counter were unalarmed.
+**⚠ Still not claimed.** A correct alarm does not make ticks flow, and this one still
+cannot see loss that happens upstream at Dhan's side. The 15:31 cross-verification's
+`compared` count remains the only evidence this repository can offer that the feed
+works at all. What changed is narrower and worth stating exactly: the alarm that
+reports a dead lane can no longer be silently disabled by a pipeline detail nobody
+here has been able to check.
+
+**The residual this does NOT fix, named so it is not mistaken for fixed:** every OTHER
+alarm in this file's family (5) still reads a `_total` counter and still inherits the
+same unverified assumption. Their failure direction is milder — a loss counter under
+the cumulative reading pages correctly on the FIRST loss and then latches, so a second
+episode in the same session is silent — but milder is not fixed, and it is a separate
+piece of work rather than something this note closed.
