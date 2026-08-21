@@ -753,10 +753,11 @@ mod tests {
 
     #[test]
     fn test_append_seal_stamps_feed_from_seal_not_hardcoded() {
-        // ONE feed-parameterized writer: a non-Dhan seal MUST stamp
-        // `feed=groww` (NOT the old hardcoded `feed=dhan`), so the SAME
-        // append_seal path serves both feeds and Groww candles never collide
-        // with Dhan candles under the (ts, security_id, segment, feed) DEDUP key.
+        // ONE feed-parameterized writer: a non-Dhan seal MUST stamp ITS OWN
+        // feed label, never the old hardcoded `feed=dhan`, so the same
+        // append_seal path serves every feed and their candles can never
+        // collide under the (ts, security_id, segment, feed) DEDUP key.
+        // Probed with Groww until 2026-08-21; TrueData is the non-Dhan feed now.
         let mut w = ShadowCandleWriter::for_test();
         w.append_seal(&mk_seal_feed(
             13,
@@ -769,12 +770,12 @@ mod tests {
         .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         assert!(
-            s.contains("feed=groww"),
-            "Groww seal must stamp feed=groww (the writer is feed-parameterized), got {s}"
+            s.contains("feed=truedata"),
+            "a TrueData seal must stamp feed=truedata (the writer is feed-parameterized), got {s}"
         );
         assert!(
             !s.contains("feed=dhan"),
-            "a Groww seal must NOT stamp feed=dhan, got {s}"
+            "a non-Dhan seal must NOT stamp feed=dhan, got {s}"
         );
     }
 
@@ -1052,7 +1053,7 @@ mod tests {
             "the candle path must stamp the ARBITRARY feed verbatim (feed-agnostic), got {s}"
         );
         assert!(
-            !s.contains("feed=dhan") && !s.contains("feed=groww"),
+            !s.contains("feed=dhan") && !s.contains("feed=truedata"),
             "a novel-feed candle must NOT be relabelled to a known feed, got {s}"
         );
     }

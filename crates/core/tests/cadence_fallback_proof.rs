@@ -202,7 +202,6 @@ fn deps_with(
         expiry_store: None,
         gates,
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     (deps, shutdown)

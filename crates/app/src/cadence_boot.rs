@@ -235,10 +235,6 @@ pub fn spawn_cadence_scheduler(
         // F10 (2026-07-15) semantics: false since the REAL executor PR
         // (2026-07-17) — skips/degrades keep their coded error! levels.
         dry_run: false,
-        // R6 (2026-07-16): the typed Telegram sink for the expiry
-        // cross-broker disagreement page (`CadenceExpiryDisagreement`,
-        // edge-latched once per underlying per day).
-        notifier: Some(Arc::clone(notifier)),
         shutdown: Arc::clone(&shutdown),
     };
     // Fire-and-forget: the supervisor owns respawn; graceful teardown

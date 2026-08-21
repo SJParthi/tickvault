@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(w.pending(), 1);
         let line = w.buffer_utf8();
         assert!(line.starts_with(POSITION_UPDATE_EVENTS_TABLE));
-        assert!(line.contains(",feed=groww"), "feed tag: {line}");
+        assert!(line.contains(",feed=truedata"), "feed tag: {line}");
         assert!(
             line.contains(",symbol_isin=INE002A01018"),
             "symbol_isin tag: {line}"

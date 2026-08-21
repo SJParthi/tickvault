@@ -219,12 +219,12 @@ pub struct CadenceRunnerDeps<D> {
     pub dry_run: bool,
     /// Level-triggered Dhan lane enable flag (read per cycle per lane).
     pub dhan_enabled: Arc<AtomicBool>,
-    /// Typed Telegram sink (R6, 2026-07-16): the expiry cross-broker
-    /// DISAGREEMENT page (`CadenceExpiryDisagreement`, edge-latched once
-    /// per underlying per day) dispatches through this handle. `None` =
-    /// log-only (the dry-run integration tests); production wiring
-    /// passes the boot `NotificationService`.
-    pub notifier: Option<Arc<crate::notification::NotificationService>>,
+    // 2026-08-21: the `notifier` field was REMOVED here. Its only consumer
+    // was the expiry cross-broker DISAGREEMENT page, and a disagreement
+    // needs two brokers to disagree; with one, the latch that fed it can
+    // never be set. Keeping the field would have had boot hand the runner a
+    // Telegram sink that nothing could ever send through -- a wired sensor
+    // with no read-out, which reads greener than no sink at all.
     /// Graceful-shutdown signal (`notify_waiters` at teardown).
     pub shutdown: Arc<Notify>,
 }
@@ -240,7 +240,6 @@ impl<D> Clone for CadenceRunnerDeps<D> {
             gates: Arc::clone(&self.gates),
             dry_run: self.dry_run,
             dhan_enabled: Arc::clone(&self.dhan_enabled),
-            notifier: self.notifier.as_ref().map(Arc::clone),
             shutdown: Arc::clone(&self.shutdown),
         }
     }
