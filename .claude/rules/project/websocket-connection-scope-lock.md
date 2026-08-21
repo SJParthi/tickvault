@@ -1354,3 +1354,82 @@ tradeable instruments off depth-5); sends a mixed-segment batch as ONE message
 (one Dhan message carries exactly one RequestCode, so one half would get the
 wrong mode); or reports the index set as covered while its never-ticked count
 is non-zero.
+
+### 2026-08-21 — SPOT UNIVERSE NARROWED to indices + F&O underlyings (the change that makes the authorized contract set fit)
+
+**The verbatim operator demands (2026-08-21, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "See for nifty and banknifty indices alone only enifr cuurent options of current expiry right dude but for entire stocks options of fno alone only w ehsoud always pull current expiries of atm plus minus 25 alone right dude oaky."
+
+> "Go ahead and fix evrfhbrin fuxd eokay?"
+
+The first quote SPECIFIES the contract shape; the second authorizes the work.
+Both are recorded here BEFORE any code, per this file's own rule-file-first law.
+
+#### What the first quote CONFIRMS (already true — no change authorized or needed)
+
+| Operator's words | Code today | Status |
+|---|---|---|
+| NIFTY + BANKNIFTY: "entire options of current expiry" | `FULL_CHAIN_INDEX_UNDERLYINGS = ["NIFTY","BANKNIFTY"]`, full chain, current expiry, NO ATM window (`dhan_contract_universe.rs:223,655`) | **already correct** |
+| F&O stocks: "current expiries of atm plus minus 25 alone" | `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25` (`constants.rs:995`) | **already correct** |
+
+This retires the executor's earlier recommendation to CAP the index chains. The
+operator has now explicitly ruled the opposite: index chains stay UNCAPPED. That
+is a decision on the record, not a loose end — and it means index-chain depth
+(measured 542 contracts on 2026-07-13, and 2,037 for three indices on
+2026-04-25) is a vendor-controlled swing the design accepts.
+
+#### What the second quote AUTHORIZES (the actual change)
+
+**The spot universe narrows from the master-sourced constituent set to NSE
+indices + F&O stock underlyings only.**
+
+The arithmetic, on MEASURED figures:
+
+| Component | Slots | Source |
+|---|---|---|
+| NSE indices (spot) | 119 | MEASURED — never-ticked count, 2026-08-21 |
+| F&O stock spots (required to compute ATM) | 216 | MEASURED — live QuestDB, 2026-04-25 (`constants.rs:981-983`) |
+| NIFTY+BANKNIFTY current-expiry options, full chain | 542–~1,200 | MEASURED range |
+| NIFTY+BANKNIFTY futures, all expiries | 6 | 2 × 3 |
+| F&O stock futures, all expiries | 648 | 216 × 3 |
+| F&O stock options, ATM ± 25 | 22,042 | MEASURED (`constants.rs:981-983`) |
+| **TOTAL** | **23,573–24,231** | **fits, 769–1,427 spare** |
+
+Against the CURRENT spot universe (`live_subscription_from_master = true`,
+measured **4,565** SIDs) the same contract set totals **~27,800–28,500** —
+over by ~3,000. The code says so itself at `dhan_feed_stack.rs:4855-4862`:
+*"leaving 4 whole connections plus ~435 spare ≈ 20,435 for contracts. The
+authorized contract set is ~23,820, so it ALREADY does not fit."*
+
+**So the spot universe is the ONLY lever left, and narrowing it is what makes
+the operator's stated design fit.** Nothing about the contract shape changes.
+
+#### The mechanical contract
+
+| Aspect | Locked value |
+|---|---|
+| New spot set | NSE indices (all, as today) + the F&O stock UNDERLYING set derived from `FUTSTK`/`OPTSTK` rows of the daily master |
+| Derivation point | artifact build time — `dhan_universe.rs` already holds `&[MasterRow]` with `InstrumentClass` (`:276`), so no new fetch and no new parse pass |
+| Artifact shape | a SEPARATE artifact listing F&O underlying ids. The existing mapping artifact is **not** re-shaped — an additive file cannot break a consumer that never reads it |
+| Default | **OFF.** Serde default false; an absent section keeps today's behaviour byte-for-byte |
+| Fail-soft | an unreadable/absent F&O artifact falls back to today's master-sourced set with a coded error — never a silent narrowing, and never an empty spot set |
+| Unchanged | the 16-connection budget, the 4 endpoint types, `dry_run`, the §28 frozen area, the per-minute REST legs, and the contract selection in every respect |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships the narrowed spot universe **enabled by default**, in any config file, env var, deploy script, or serde default.
+- Caps, windows, or otherwise narrows the NIFTY/BANKNIFTY option chains — the operator explicitly ruled them UNCAPPED in the first quote above.
+- Changes `STOCK_OPTION_ATM_STRIKES_EACH_SIDE` away from 25.
+- Derives the F&O underlying set from anything other than the daily master's own `FUTSTK`/`OPTSTK` rows (a hardcoded list goes stale weekly — the standing no-manual-intervention mandate).
+- Lets an unreadable F&O artifact produce a SILENT fallback, or an empty spot set.
+- Re-shapes the existing mapping artifact rather than adding a separate one.
+
+#### Honest envelope
+
+The 22,042 stock-option figure is **2026-04-25** at **216** stocks. If today's
+F&O list or ladder depth has grown, the 769–1,427 spare shrinks accordingly —
+and at the top of the measured index-chain range the margin is already under
+800. `scripts/count-current-expiry-universe.sh` exists to replace April's
+number with a measured one; until it has been run on the box, **this section's
+"fits" verdict rests on a four-month-old measurement** and is stated as such.
