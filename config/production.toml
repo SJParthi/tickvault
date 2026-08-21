@@ -66,13 +66,14 @@ sns_enabled = true
 [feeds]
 # 2026-07-13 operator directive: Dhan live WS feed removed from runtime; Dhan
 # retained for REST pulls only (spot_1m_rest / option_chain_1m / historical).
-# 2026-07-15 operator directive: the Groww LIVE WebSocket feed is retired too
-# — the runtime is REST-only (Dhan + Groww per-minute REST legs, each
-# config-gated by its own [.*_1m] section). groww_enabled=false here means NO
-# live lane; the REST legs do NOT read this flag. (Supersedes the 2026-07-13
-# "Groww is the live feed" note; the Dhan REST retained surface is brought up
-# WITHOUT the WS lane by crates/app/src/dhan_rest_stack.rs.)
-# Neither feed places orders — dry_run=true above gates all order placement.
+# 2026-07-15 operator directive retired the second live WebSocket feed; the
+# 2026-08-21 directive then removed that feed entirely (dated authorization in
+# websocket-connection-scope-lock.md, "2026-08-21 (THIRD quote of the day)"),
+# so its enable key is gone from here too — FeedsConfig has no field to bind
+# it to, and an unbound key reads like a switch that still controls something.
+# The Dhan REST retained surface is brought up WITHOUT the WS lane by
+# crates/app/src/dhan_rest_stack.rs.
+# No feed places orders — dry_run=true above gates all order placement.
 #
 # 2026-08-11 — dhan_enabled flipped false -> TRUE (operator quote, verbatim in
 # websocket-connection-scope-lock.md "2026-08-11 — THE DEFAULT IS FLIPPED ON").
@@ -82,4 +83,3 @@ sns_enabled = true
 # change: [rest_candle_fold] is OFF in base.toml — the two cannot both write
 # candles_<tf> under feed='dhan'.
 dhan_enabled = true
-groww_enabled = false

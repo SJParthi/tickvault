@@ -30,6 +30,8 @@ use tickvault_storage::order_leg_pnl_persistence::{
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use tickvault_common::feed::Feed;
+
 use crate::leg_identity::SharedLegIdentityIndex;
 use crate::order_runtime::{LegPnlEvent, LegPnlKind};
 
@@ -125,7 +127,7 @@ fn record_from_event(
     };
     OrderLegPnlRecord {
         ts_ist_nanos: event.ts_utc_ns.saturating_add(IST_OFFSET_NANOS),
-        feed: "groww",
+        feed: Feed::Dhan.as_str(),
         security_id: i64::try_from(event.sid).unwrap_or(-1),
         segment: segment_slug(event.segment_code),
         event_seq: next_event_seq(),
@@ -188,7 +190,7 @@ async fn run_order_leg_pnl_consumer(
     let mut writer = OrderLegPnlWriter::new(&questdb);
     info!(
         "order_leg_pnl: consumer running — draining leg P&L events to QuestDB \
-         (feed=groww, paper mode)"
+         (feed=dhan, paper mode)"
     );
     while let Some(event) = guard.recv().await {
         persist_leg_pnl_record(&mut writer, &record_from_event(&event, &identity_index));
@@ -269,7 +271,7 @@ pub fn spawn_order_leg_pnl_capture(
     let _supervisor = spawn_supervised_order_leg_pnl_consumer(questdb.clone(), rx, identity_index);
     info!(
         channel_capacity = capacity,
-        "order_leg_pnl: supervised QuestDB consumer spawned (feed=groww, paper mode)"
+        "order_leg_pnl: supervised QuestDB consumer spawned (feed=dhan, paper mode)"
     );
     Some(tx)
 }
@@ -350,7 +352,7 @@ mod tests {
         assert_eq!(record.expiry, "n/a");
         assert_eq!(record.option_type, "n/a");
         assert_eq!(record.strike_paise, 0);
-        assert_eq!(record.feed, "groww");
+        assert_eq!(record.feed, Feed::Dhan.as_str());
         assert_eq!(record.segment, "NSE_FNO");
         assert_eq!(record.event_kind, "mark");
         assert_eq!(record.security_id, 42);

@@ -974,13 +974,15 @@ impl LiveIngest {
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     %err,
                     rows = covered,
-                    "live tick flush to QuestDB FAILED — the buffered rows were discarded by \
-                     the writer contract and are a counted loss: these ticks are NOT in the \
-                     database and nothing re-inserts them WHILE THIS PROCESS LIVES. The raw \
-                     frames ARE preserved in the write-ahead log, and the next boot re-folds \
-                     them into the database automatically — so a restart recovers this window, \
-                     idempotently. Fix the database first; the restart is what recovers the \
-                     ticks."
+                    "live tick flush to QuestDB FAILED — these rows are NOT in the database. \
+                     They are NOT lost, and there are TWO recoveries. Immediately: the writer \
+                     rescues the failed batch to a tick spill file (the WS-GAP-03 line beside \
+                     this one names the exact path) and it re-ingests with a single curl, \
+                     safely repeatable. Failing that, the raw frames are in the write-ahead \
+                     log and the next boot re-folds them idempotently, \
+                     so a restart recovers this window. \
+                     Fix the database first, then replay the spill file."
+
                 );
                 0
             }
@@ -10330,26 +10332,36 @@ mod contract_attach_tests {
 #[cfg(test)]
 mod alive_connection_guard_tests {
     use super::{ALIVE_CONNECTIONS, AliveConnectionGuard};
-    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    /// Serializes the tests in this module.
+    /// Serializes every test in this module.
     ///
-    /// `ALIVE_CONNECTIONS` is a process-global `AtomicUsize`, and both tests
-    /// read a `base` and then assert an exact `base + 1`. Run on parallel
-    /// threads they interleave and either can fail for a reason that has
-    /// nothing to do with what it checks — which is worse than a plain bug,
-    /// because a test that fails at random teaches people to re-run CI
-    /// instead of reading it.
+    /// `ALIVE_CONNECTIONS` is process-global and these tests read EXACT values
+    /// around it (`base`, `base + 1`), so two of them on parallel threads see
+    /// each other's increments and fail for a reason unrelated to what they
+    /// check. `cargo test` shares one process across threads, so the race is
+    /// real there; nextest gives each test its own process, which is why CI
+    /// never showed it.
     ///
-    /// The same class was fixed the same way in `tv_api_token_prod_guard.rs`
-    /// after PR #1411 merged red on it (merge-gate-lock §3.2). Poisoning is
-    /// absorbed rather than propagated: one test panicking on purpose — which
-    /// the unwind case below does — must not convert every sibling into a
-    /// poisoned-lock failure.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
+    /// Fixed independently on `main` the same day with an inline
+    /// `static SERIALIZE: Mutex<()>`; the two are equivalent and this side's
+    /// helper is kept because the test bodies here already call it. The same
+    /// class was fixed the same way in `tv_api_token_prod_guard.rs` after
+    /// PR #1411 merged red on it (merge-gate-lock section 3.2).
+    ///
+    /// This replaces a comment that CLAIMED the tests were "serialized ... by
+    /// running both assertions here" — true when this module held one test,
+    /// and quietly false from the moment a second one was added beside it.
+    /// Poisoning is recovered rather than propagated: a panic inside one test
+    /// (which one of them raises deliberately) must not convert every other
+    /// test in the module into a spurious failure.
+    fn serial() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     #[test]
     fn the_count_comes_back_down_on_a_panic_not_only_on_a_clean_return() {
         let _serial = serial();
@@ -10364,8 +10376,7 @@ mod alive_connection_guard_tests {
         // "serialized ... by running both assertions here". It was not — the
         // second test below mutates the same global, so the two raced, and the
         // comment asserting safety is exactly what stopped anyone looking.
-        // The real serialization is the mutex above.
-        let _lock = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        // The real serialization is the `serial()` guard taken above.
         let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
 
         // Clean path.
@@ -10396,7 +10407,6 @@ mod alive_connection_guard_tests {
         // value. If it did not disarm, every clean exit would decrement twice
         // and the gauge would read LOW — the opposite failure, equally wrong,
         // and the one a naive guard introduces while fixing the first.
-        let _lock = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
         let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
         let g = AliveConnectionGuard::acquire();
         let remaining = g.release();

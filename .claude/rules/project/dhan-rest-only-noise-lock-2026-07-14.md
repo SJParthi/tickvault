@@ -496,3 +496,77 @@ same unverified assumption. Their failure direction is milder — a loss counter
 the cumulative reading pages correctly on the FIRST loss and then latches, so a second
 episode in the same session is silent — but milder is not fixed, and it is a separate
 piece of work rather than something this note closed.
+
+### §2.3c — 2026-08-21: the SPILL tier joins family (5); and one gap this file was told about did not exist
+
+**The verbatim operator authorization (2026-08-21, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Go ahead wirh your recommendation. Dude okay"
+
+Given in DIRECT response to a message that ended: *"Making these losses actually page you
+is a decision only you can authorize — say the word and I'll draft the dated row and the
+alarm together, with its cost line."* This dated row is that draft, recorded BEFORE the
+terraform, per §3.
+
+#### First, a correction to what that message claimed (Rule 11 — an over-stated gap is
+#### still a false claim, and it manufactures work)
+
+The message asked for authorization partly on the grounds that
+`tv_ws_frame_wal_reinjected_dropped_total` was "not EMF-selected and has no alarm". **Both
+halves are FALSE.** Verified by source scan the same day: the metric IS in the EMF selector
+(`cloudwatch-agent.json`), and `live-lane-alarms.tf:354` carries
+`tv-<env>-wal-frames-not-recovered` on it at `threshold = 1`,
+`GreaterThanOrEqualToThreshold`, one evaluation period — it pages on the FIRST unrecovered
+frame.
+
+So the WAL half of the work was already done, and the six refusal paths wired on 2026-08-21
+feed a counter that already ships and already pages. That is a better outcome than was
+claimed, and it is recorded here rather than quietly enjoyed: an executor that over-states a
+gap sends the next session hunting for something that is not there, which is the same waste
+a stale O(1)-table row causes in the other direction.
+
+#### What IS genuinely dark, and what this row authorizes
+
+The SPILL tier — not the WAL tier — has no CloudWatch presence at all:
+
+| Metric | EMF-selected? | Alarmed? |
+|---|---|---|
+| `tv_ticks_spilled_total` | **no** | no |
+| `tv_tick_spill_replay_failed_total` | **no** (new 2026-08-21) | no |
+| `tv_tick_spill_replayed_bytes_total` | **no** (new 2026-08-21) | no |
+
+That matters because the two tiers fail differently. The WAL tier's counter means "frames
+we could not re-fold" — a discrete, already-pageable loss. The spill tier's counters mean
+"an ILP flush failed and we rescued the buffer to disk" and "the automatic drain could not
+put it back". A spill that is never drained becomes a real tick loss at the 512 MiB cap, and
+today nothing outside the box's own log would say so.
+
+**Family (5) therefore gains two members:**
+
+| Alarm | Fires when | Why it is not noise |
+|---|---|---|
+| `tv-<env>-tick-spill-replay-failing` | `tv_tick_spill_replay_failed_total >= 1` in a period | The drain is the recovery arm. If it cannot put rescued ticks back, the rescue is a countdown to the cap, not a save. |
+| `tv-<env>-ticks-spilling` | `tv_ticks_spilled_total >= 1` in a period | An ILP flush failed. Distinct from `tv_ticks_dropped_total`, which both counters now increment: the drop alarm says "a flush failed"; this says "and it went to disk", which is the difference between loss and deferred recovery. |
+
+**Both are market-hours gated**, joining the `market_hours_liveness_gate` Lambda's
+`ALARM_NAMES` list in the same change. Without the gate they page every evening and all
+weekend, which this file's own §2.3a calls the fastest way to train an operator to ignore an
+alarm.
+
+**Cost:** +3 EMF metric names ≈ $0.90/mo, +2 alarms ≈ $0.20/mo ⇒ **~$1.10/mo** against the
+$130 kill-ceiling whose 90% action line is $117. `tv_tick_spill_replayed_bytes_total` is
+shipped without an alarm deliberately — it is the SUCCESS signal, and a chart of successful
+recoveries is worth having beside the two failure alarms without adding a third pager.
+
+**⚠ What this does NOT do (Rule 11).** An alarm on a spill does not stop the flush timeouts
+that cause spills; their cause is QuestDB write latency under live load and is untouched. It
+converts a loss visible only in the box's own log into one that reaches the operator — that
+is the entire claim.
+
+**What a PR that violates §2.3c looks like (REJECT):** adds either alarm without the
+market-hours gate membership in the same change; adds an alarm on the SUCCESS counter
+(`replayed_bytes`), which would page on recovery working; adds a per-INSTRUMENT dimension to
+any of the three (the §2.3 cardinality rule stands — 4,565 per-instrument metrics ≈
+$1,369/mo against a budget whose automatic action stops the trading box); or re-states the
+corrected claim above as though the WAL counter were unalarmed.

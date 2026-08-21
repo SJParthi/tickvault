@@ -2721,13 +2721,13 @@ pub fn build_rest_leg_score_lines(
             },
         }
     };
-    const CANONICAL: [(&str, &str); 4] = [
-        ("dhan", "spot_1m"),
-        ("dhan", "chain_1m"),
-        ("groww", "spot_1m"),
-        ("groww", "chain_1m"),
-    ];
-    let mut out = Vec::with_capacity(summaries.len().max(4));
+    // 2026-08-21: was 4 pairs (Dhan x the removed second feed). Its two
+    // rows rendered every single day carrying the -1 "absent" sentinels,
+    // and `unmeasured_canonical_rest_pairs` then named them "not measured
+    // today" in the operator digest — which reads as a leg that should
+    // have run and did not, never as a feed that no longer exists.
+    const CANONICAL: [(&str, &str); 2] = [("dhan", "spot_1m"), ("dhan", "chain_1m")];
+    let mut out = Vec::with_capacity(summaries.len().max(CANONICAL.len()));
     for (feed, leg) in CANONICAL {
         let s = summaries.iter().find(|s| s.feed == feed && s.leg == leg);
         out.push(to_line(feed, leg, s));
@@ -2800,15 +2800,13 @@ pub fn log_rest_leg_measurement_gaps(summaries: &[RestLegDaySummary]) {
     }
 }
 
-/// The four canonical card pairs (display names) the §2b contract names.
-const CANONICAL_DISPLAY: [(&str, &str); 4] = [
-    ("Dhan", "spot candles"),
-    ("Dhan", "option chain"),
-    ("Groww", "spot candles"),
-    ("Groww", "option chain"),
-];
+/// The canonical card pairs (display names) the §2b contract names.
+///
+/// 2026-08-21: two, not four — the second feed was removed, and its pair
+/// names must not keep appearing in the digest as legs awaiting data.
+const CANONICAL_DISPLAY: [(&str, &str); 2] = [("Dhan", "spot candles"), ("Dhan", "option chain")];
 
-/// The CANONICAL card pairs (Dhan/Groww × spot candles/option chain) with
+/// The CANONICAL card pairs (Dhan x spot candles/option chain) with
 /// NOTHING measured today — no pull counts AND no latency samples. Pure so
 /// the F3 not-measured logging is unit-testable.
 ///
@@ -6803,7 +6801,7 @@ mod tests {
     fn test_build_rest_leg_score_lines_canonical_order_and_extras() {
         let summaries = vec![
             RestLegDaySummary {
-                feed: "groww".to_string(),
+                feed: "dhan".to_string(),
                 leg: "spot_1m".to_string(),
                 ok_fetches: 1_496,
                 failed_fetches: 4,
@@ -6817,7 +6815,7 @@ mod tests {
                 close_samples: 1_494,
             },
             RestLegDaySummary {
-                feed: "groww".to_string(),
+                feed: "dhan".to_string(),
                 leg: "contract_1m".to_string(),
                 ok_fetches: 10,
                 failed_fetches: 0,
@@ -6841,21 +6839,22 @@ mod tests {
             vec![
                 ("Dhan".to_string(), "spot candles".to_string()),
                 ("Dhan".to_string(), "option chain".to_string()),
-                ("Groww".to_string(), "spot candles".to_string()),
-                ("Groww".to_string(), "option chain".to_string()),
-                ("Groww".to_string(), "option contracts".to_string()),
+                ("Dhan".to_string(), "option contracts".to_string()),
             ]
         );
         // The measured pair carries its numbers; an absent pair carries
         // the honest -1 sentinels everywhere.
-        let groww_spot = &lines[2];
-        assert_eq!(groww_spot.ok_fetches, 1_496);
-        assert_eq!(groww_spot.close_p99_ms, 3_200);
+        let dhan_spot = &lines[0];
+        assert_eq!(dhan_spot.ok_fetches, 1_496);
+        assert_eq!(dhan_spot.close_p99_ms, 3_200);
         let dhan_chain = &lines[1];
         assert_eq!(dhan_chain.ok_fetches, -1);
         assert_eq!(dhan_chain.close_samples, -1);
-        // Empty summaries still render the four canonical placeholders.
-        assert_eq!(build_rest_leg_score_lines(&[]).len(), 4);
+        // Empty summaries still render every canonical placeholder.
+        assert_eq!(
+            build_rest_leg_score_lines(&[]).len(),
+            CANONICAL_DISPLAY.len()
+        );
     }
 
     #[test]
@@ -6865,7 +6864,7 @@ mod tests {
         // helper names exactly the canonical pairs with no measured pull
         // source (the §2b always-render contract's log-side leg).
         let summaries = vec![RestLegDaySummary {
-            feed: "groww".to_string(),
+            feed: "dhan".to_string(),
             leg: "spot_1m".to_string(),
             ok_fetches: 1_496,
             failed_fetches: 4,
@@ -6881,15 +6880,11 @@ mod tests {
         let lines = build_rest_leg_score_lines(&summaries);
         assert_eq!(
             unmeasured_canonical_rest_pairs(&lines),
-            vec![
-                ("Dhan".to_string(), "spot candles".to_string()),
-                ("Dhan".to_string(), "option chain".to_string()),
-                ("Groww".to_string(), "option chain".to_string()),
-            ]
+            vec![("Dhan".to_string(), "option chain".to_string())]
         );
         // Every canonical pair measured → nothing to log.
         let all = ["spot_1m", "chain_1m"];
-        let full: Vec<RestLegDaySummary> = ["dhan", "groww"]
+        let full: Vec<RestLegDaySummary> = ["dhan"]
             .iter()
             .flat_map(|f| {
                 all.iter().map(|l| RestLegDaySummary {
@@ -6910,10 +6905,10 @@ mod tests {
             .collect();
         let lines = build_rest_leg_score_lines(&full);
         assert!(unmeasured_canonical_rest_pairs(&lines).is_empty());
-        // Empty build → all four pairs named.
+        // Empty build → every canonical pair named.
         assert_eq!(
             unmeasured_canonical_rest_pairs(&build_rest_leg_score_lines(&[])).len(),
-            4
+            CANONICAL_DISPLAY.len()
         );
     }
 
@@ -6944,8 +6939,8 @@ mod tests {
             !unmeasured.contains(&("Dhan".to_string(), "spot candles".to_string())),
             "a latency-only pair must never be logged 'not measured': {unmeasured:?}"
         );
-        // The other three canonical pairs stay honestly unmeasured.
-        assert_eq!(unmeasured.len(), 3);
+        // The remaining canonical pair stays honestly unmeasured.
+        assert_eq!(unmeasured.len(), CANONICAL_DISPLAY.len() - 1);
         // ...and the latency-only classifier names exactly this pair.
         assert_eq!(
             latency_only_canonical_rest_pairs(&lines),

@@ -32,12 +32,19 @@ runtime.
   `tv_*_close_to_data_ms`, …) — they answer "how much", not "what broke"; the
   `/metrics` endpoint + `errors.jsonl` keep them for post-hoc triage.
 - **Names whose ONLY emit sites are the stood-down per-minute boot legs**
-  (`[spot_1m_rest]` / `[option_chain_1m]` / `[groww_*_1m]` `enabled=false` since
-  2026-07-17 — the cadence executors own the pulls), e.g.
-  `tv_spot1m_sid_not_served_total`, `tv_*_sweep_still_missing_total`.
-- **Names behind the non-default `groww_orders` cargo feature** (Gate 2 of the
-  §39.2 lattice — not compiled into the deploy build), e.g.
-  `tv_groww_push_supervisor_respawn_total`.
+  (`[spot_1m_rest]` / `[option_chain_1m]` `enabled=false` since 2026-07-17 —
+  the cadence executors own the pulls), e.g. `tv_spot1m_sid_not_served_total`,
+  `tv_*_sweep_still_missing_total`.
+- ~~**Names behind the non-default `groww_orders` cargo feature**~~ **MOOT
+  2026-08-21** — that feature and the order-side tree behind it were removed
+  with the Groww feed, so the names have no emit sites at all rather than
+  merely uncompiled ones. The two Groww REST persist-error counters left the
+  selector in the same change, freeing bytes.
+- **`tv_tick_spill_replayed_bytes_total`** — the spill drain's SUCCESS counter,
+  added 2026-08-21 and excluded the same day. It was to ship unalarmed so a
+  chart of recoveries could sit beside the two spill FAILURE alarms; with it in
+  the list the rendered user-data came out past the 16,384-byte cap. Given a
+  real byte budget the alarmed names win. Still on `/metrics`.
 - ~~**`tv_ws_frame_spill_write_errors_total`** — no WS frame producer exists (both
   live feeds retired 2026-07-13/15)~~ **STALE, CORRECTED 2026-08-12 — now
   SELECTED.** The Dhan live WS lane was revived 2026-08-09/11 and IS a WS frame

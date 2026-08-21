@@ -661,10 +661,15 @@ resource "aws_cloudwatch_metric_alarm" "dhan_contract_universe_failed" {
 # deferred recovery, and between "the drain is working" and "the countdown to
 # the cap has started".
 #
-# The SUCCESS counter (tv_tick_spill_replayed_bytes_total) is shipped to
-# CloudWatch WITHOUT an alarm, deliberately: a chart of successful recoveries
-# belongs beside these two, but paging when recovery WORKS is the false-OK's
-# mirror image.
+# The SUCCESS counter (tv_tick_spill_replayed_bytes_total) has NO alarm --
+# paging when recovery WORKS is the false-OK's mirror image -- and as of
+# 2026-08-21 it does not reach CloudWatch at all. It was to ship unalarmed so a
+# chart of successful recoveries could sit beside these two, but with it in the
+# selector the rendered EC2 user-data came out past AWS's hard 16,384-byte cap.
+# Given a real byte budget the ALARMED names win. The counter is still emitted
+# and still readable on the box's :9091/metrics; it is simply not chartable
+# off-box until the selector has room. deploy/aws/EMF-METRIC-SELECTOR-NOTES.md
+# carries the wider record of that rationing.
 resource "aws_cloudwatch_metric_alarm" "tick_spill_replay_failing" {
   alarm_name        = "tv-${var.environment}-tick-spill-replay-failing"
   alarm_description = "The automatic drain could not return rescued ticks to the database. The rows are NOT lost — they are on the box as valid line protocol in data/spill/ticks/ — but they are not queryable, and the spill directory is now growing toward its 512 MiB cap, past which the writer stops rescuing and starts dropping. Causes, in order of likelihood: QuestDB is down or refusing writes; or the disk is full so the drained file cannot be emptied. Triage: journalctl -u tickvault for TICK-FLUSH-01 and for the drain's round summary, then ls -la data/spill/ticks/ — a non-empty .ilp file is unrecovered ticks. Manual recovery, unchanged and always available: curl --data-binary @<file> http://<questdb>:9000/write"
