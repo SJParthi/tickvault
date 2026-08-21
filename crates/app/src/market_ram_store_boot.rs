@@ -1087,7 +1087,7 @@ mod tests {
         assert_eq!(snaps[1].rows[0].moneyness, Moneyness::Unknown);
         // A zero-spot minute is honest: spot_missing + no fabricated ATM.
         let zero_spot = [row(m1, 24_500.0, "CE", "ITM", 0.0)];
-        let s = build_minute_snapshots(Feed::Groww, ChainUnderlying::Sensex, &zero_spot);
+        let s = build_minute_snapshots(Feed::Truedata, ChainUnderlying::Sensex, &zero_spot);
         assert_eq!(s.len(), 1);
         assert!(s[0].spot_missing);
         assert_eq!(s[0].atm_strike_paise, 0);

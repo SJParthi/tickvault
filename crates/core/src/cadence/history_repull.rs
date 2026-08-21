@@ -345,7 +345,7 @@ mod tests {
     async fn test_run_history_repull_dedup_recovered_leg_not_refetched() {
         let exec = Arc::new(ScriptedExecutor::default());
         let ctx = HistoryRepullCtx {
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             cycle_minute_ist: 34_200,
             executor: Arc::clone(&exec),
             gates: None,
@@ -368,7 +368,7 @@ mod tests {
                 retry_after_ms: None,
             }));
         let ctx = HistoryRepullCtx {
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             cycle_minute_ist: 34_200,
             executor: Arc::clone(&exec),
             gates: None,
@@ -414,7 +414,7 @@ mod tests {
     async fn test_run_history_repull_expiry_unresolved_skips_leg() {
         let exec = Arc::new(ScriptedExecutor::default());
         let ctx = HistoryRepullCtx {
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             cycle_minute_ist: 34_200,
             executor: Arc::clone(&exec),
             gates: None,

@@ -712,7 +712,7 @@ mod tests {
 
         for shape in 0..=1u8 {
             for step in 0..=3u8 {
-                let slots = build_cycle_slots(boundary_secs, shape, step, 0, &cfg);
+                let slots = build_cycle_slots(boundary_secs, shape, step, &cfg);
                 assert_eq!(
                     cross_fill_freshness_floor_ms(&slots),
                     BASE_FLOOR_MS,

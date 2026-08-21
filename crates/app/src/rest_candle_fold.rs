@@ -1332,7 +1332,7 @@ type DirtyDayKey = (u8, SecurityId, u8, NaiveDate);
 fn feed_ordinal(feed: Feed) -> u8 {
     match feed {
         Feed::Dhan => 0,
-        Feed::Groww => 1,
+        Feed::Truedata => 1,
         Feed::Truedata => 2,
     }
 }
@@ -2678,7 +2678,7 @@ mod tests {
 
     #[test]
     fn test_out_of_session_bar_is_skipped() {
-        let mut e = SidFoldState::new(Feed::Groww, 21, 0);
+        let mut e = SidFoldState::new(Feed::Truedata, 21, 0);
         // 09:14 (one minute before open).
         let pre_open = ConfirmedBar {
             minute_ts_ist_nanos: i64::from(OPEN - 60) * 1_000_000_000,
@@ -2699,7 +2699,7 @@ mod tests {
         // M3: an overflowing Σ SATURATES at i64::MAX — the fold stays
         // atomic (no torn TF state), the watermark advances, later bars
         // keep folding normally.
-        let mut e = SidFoldState::new(Feed::Groww, 25, 0);
+        let mut e = SidFoldState::new(Feed::Truedata, 25, 0);
         assert!(matches!(
             e.fold_bar(&bar_at(0, 1.0, 1.0, 1.0, 1.0, i64::MAX)),
             FoldOutcome::Folded(_)
@@ -2969,11 +2969,11 @@ mod tests {
                 last_bar_ist_secs: OPEN + 240,
             },
         };
-        let seal = sealed_bucket_to_seal(Feed::Groww, 13, 0, &sealed);
+        let seal = sealed_bucket_to_seal(Feed::Truedata, 13, 0, &sealed);
         assert_eq!(seal.security_id, 13);
         assert_eq!(seal.exchange_segment_code, 0);
         assert_eq!(seal.tf, TfIndex::M5);
-        assert_eq!(seal.feed, Feed::Groww);
+        assert_eq!(seal.feed, Feed::Truedata);
         assert_eq!(seal.state.open, 100.0);
         assert_eq!(seal.state.high, 105.0);
         assert_eq!(seal.state.low, 98.0);
@@ -3216,12 +3216,12 @@ mod tests {
         let mut with_gap = all_bars.clone();
         let late = with_gap.remove(3);
 
-        let mut state = SidDayFold::new(Feed::Groww, 25, 0);
+        let mut state = SidDayFold::new(Feed::Truedata, 25, 0);
         apply_all(&mut state, &with_gap, day0_date());
         let LiveBarAction::Refolded(_) = state.apply_live_bar(&late, day0_date()) else {
             panic!("a late previously-missing minute must refold");
         };
-        let mut reference = SidFoldState::new(Feed::Groww, 25, 0);
+        let mut reference = SidFoldState::new(Feed::Truedata, 25, 0);
         fold_all(&mut reference, &all_bars);
         assert_eq!(state.day_map_len(), 6);
         assert_eq!(state.engine.force_seal_open(), reference.force_seal_open());
@@ -3363,7 +3363,7 @@ mod tests {
         let bars: Vec<ConfirmedBar> = (0..10)
             .map(|i| bar_at(i, 50.0 + f64::from(i), 51.0, 49.0, 50.5, 2))
             .collect();
-        let mut catchup_engine = SidFoldState::new(Feed::Groww, 51, 0);
+        let mut catchup_engine = SidFoldState::new(Feed::Truedata, 51, 0);
         fold_all(&mut catchup_engine, &bars);
         let day = ist_date_of_nanos(bars[0].minute_ts_ist_nanos).expect("date");
         let mut state = SidDayFold::from_catchup(catchup_engine, day, &bars);
@@ -3378,7 +3378,7 @@ mod tests {
         };
         let mut updated = bars.clone();
         updated[4] = repair;
-        let mut reference = SidFoldState::new(Feed::Groww, 51, 0);
+        let mut reference = SidFoldState::new(Feed::Truedata, 51, 0);
         fold_all(&mut reference, &updated);
         assert_eq!(state.engine.force_seal_open(), reference.force_seal_open());
     }
@@ -3404,8 +3404,8 @@ mod tests {
     fn test_note_unfoldable_identity_counts_and_never_panics() {
         // LOW-6: counted + one coalesced warn — repeated calls must be
         // safe (the latch coalesces, the counter keeps counting).
-        note_unfoldable_identity(Feed::Groww, -1);
-        note_unfoldable_identity(Feed::Groww, i64::MIN);
+        note_unfoldable_identity(Feed::Truedata, -1);
+        note_unfoldable_identity(Feed::Truedata, i64::MIN);
     }
 
     #[test]
@@ -3659,7 +3659,7 @@ mod tests {
             (Feed::Dhan, 13_u64, 0_u8),
             (Feed::Dhan, 25, 0),
             (Feed::Dhan, 51, 0),
-            (Feed::Groww, 13, 0),
+            (Feed::Truedata, 13, 0),
         ];
         for (feed, sid, seg) in identities {
             assert!(
@@ -3683,7 +3683,7 @@ mod tests {
         }
 
         // A miss stays a miss and allocates nothing.
-        assert!(slots.lookup(Feed::Groww, 999, 0).is_none());
+        assert!(slots.lookup(Feed::Truedata, 999, 0).is_none());
         assert!(slots.lookup(Feed::Dhan, 13, 2).is_none());
         assert_eq!(slots.len(), identities.len(), "lookup never allocates");
     }
@@ -3747,23 +3747,23 @@ mod tests {
         // need distinct fold slots too.
         let mut slots = FoldSlots::new();
         slots.slot_mut(Feed::Dhan, 13, 0).expect("dhan slot");
-        slots.slot_mut(Feed::Groww, 13, 0).expect("groww slot");
+        slots.slot_mut(Feed::Truedata, 13, 0).expect("groww slot");
         slots
             .slot_mut(Feed::Truedata, 13, 0)
             .expect("truedata slot");
         assert_eq!(slots.len(), 3, "same (id, segment), three feeds => 3 slots");
 
         let dhan = slots.lookup(Feed::Dhan, 13, 0).expect("dhan");
-        let groww = slots.lookup(Feed::Groww, 13, 0).expect("groww");
+        let groww = slots.lookup(Feed::Truedata, 13, 0).expect("groww");
         let truedata = slots.lookup(Feed::Truedata, 13, 0).expect("truedata");
         assert!(dhan != groww && groww != truedata && dhan != truedata);
         assert_eq!(slots[dhan].engine.feed, Feed::Dhan);
-        assert_eq!(slots[groww].engine.feed, Feed::Groww);
+        assert_eq!(slots[groww].engine.feed, Feed::Truedata);
         assert_eq!(slots[truedata].engine.feed, Feed::Truedata);
 
         // Re-resolving an existing identity must REUSE its slot, never push.
         slots.slot_mut(Feed::Dhan, 13, 0).expect("reuse");
-        slots.slot_mut(Feed::Groww, 13, 0).expect("reuse");
+        slots.slot_mut(Feed::Truedata, 13, 0).expect("reuse");
         assert_eq!(slots.len(), 3, "known identities must not grow the table");
     }
 
@@ -3813,7 +3813,7 @@ mod tests {
         );
         // replace_or_insert refuses a NEW identity at capacity too.
         assert!(
-            !slots.replace_or_insert(SidDayFold::new(Feed::Groww, 7, 0)),
+            !slots.replace_or_insert(SidDayFold::new(Feed::Truedata, 7, 0)),
             "catch-up seeding of a NEW identity must fail closed at capacity"
         );
         assert_eq!(slots.len(), FOLD_MAX_SLOTS);
@@ -3867,7 +3867,7 @@ mod tests {
         let identities = [
             (Feed::Dhan, 13_u64, 0_u8),
             (Feed::Dhan, 25, 0),
-            (Feed::Groww, 13, 0),
+            (Feed::Truedata, 13, 0),
             (Feed::Dhan, 27, 1),
         ];
         // Interleaved batch: instrument-major order is deliberately NOT used.
@@ -3957,7 +3957,7 @@ mod tests {
         assert_eq!(slots[original_idx].current_day(), Some(day0_date()));
 
         // Differing feed / segment / id each INSERT a new slot.
-        assert!(slots.replace_or_insert(SidDayFold::new(Feed::Groww, 13, 0)));
+        assert!(slots.replace_or_insert(SidDayFold::new(Feed::Truedata, 13, 0)));
         assert!(slots.replace_or_insert(SidDayFold::new(Feed::Dhan, 13, 1)));
         assert!(slots.replace_or_insert(SidDayFold::new(Feed::Dhan, 14, 0)));
         assert_eq!(slots.len(), 4);

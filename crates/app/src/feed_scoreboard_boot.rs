@@ -3852,7 +3852,7 @@ pub async fn run_feed_scoreboard(
             lag_samples: n.lag_samples,
             lag_floor_ms: match *feed {
                 tickvault_common::feed::Feed::Dhan => LAG_FLOOR_MS_DHAN,
-                tickvault_common::feed::Feed::Groww => LAG_FLOOR_MS_GROWW,
+                tickvault_common::feed::Feed::Truedata => LAG_FLOOR_MS_GROWW,
                 tickvault_common::feed::Feed::Truedata => LAG_FLOOR_MS_TRUEDATA,
             },
             disconnects_market: n.disconnects_market,

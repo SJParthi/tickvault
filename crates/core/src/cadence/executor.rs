@@ -393,7 +393,7 @@ mod tests {
         // expiry.
         let stub = StubExpiryResolver;
         let day = NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid");
-        for feed in [Feed::Dhan, Feed::Groww] {
+        for feed in [Feed::Dhan] {
             for u in ChainUnderlying::ALL {
                 assert_eq!(stub.resolved_expiry(feed, *u, day), None);
             }
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(chain.unwrap_err(), CadenceFetchError::Empty);
         let spot = ex
             .fetch_spot(SpotFetchRequest {
-                feed: Feed::Groww,
+                feed: Feed::Truedata,
                 target: SpotTarget::IndiaVix,
                 cycle_minute_ist: 33_300,
                 deadline_epoch_ms: 1,

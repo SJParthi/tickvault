@@ -284,7 +284,7 @@ pub fn rupees_to_paise(rupees: f64) -> Option<i64> {
 /// (`(expiry_date / 1)`) so the parser never touches ISO strings.
 #[must_use]
 pub fn lifecycle_select_sql() -> String {
-    let feed = Feed::Groww.as_str();
+    let feed = Feed::Truedata.as_str();
     format!(
         "SELECT security_id, exchange_segment, instrument_type, symbol_name, \
          underlying_symbol, (expiry_date / 1) AS expiry_micros \
@@ -306,7 +306,7 @@ pub fn lifecycle_select_sql() -> String {
 pub fn live_candles_select_sql(day_start_ist_nanos: i64) -> String {
     let a = day_start_ist_nanos / 1_000;
     let b = a.saturating_add(MICROS_PER_DAY);
-    let feed = Feed::Groww.as_str();
+    let feed = Feed::Truedata.as_str();
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, security_id, segment, open, high, \
          low, close, volume, tick_count \
@@ -320,7 +320,7 @@ pub fn live_candles_select_sql(day_start_ist_nanos: i64) -> String {
 #[must_use]
 pub fn existing_run_outcome_sql(day_start_ist_nanos: i64) -> String {
     let d = day_start_ist_nanos / 1_000;
-    let feed = Feed::Groww.as_str();
+    let feed = Feed::Truedata.as_str();
     format!(
         "SELECT outcome FROM {BRUTEX_CROSSVERIFY_DAILY_TABLE} \
          WHERE feed = '{feed}' AND symbol = '{BRUTEX_CROSSVERIFY_RUN_ROW_SYMBOL}' \
@@ -623,7 +623,7 @@ pub fn cell_row_from_finding(
     BrutexCrossverifyCellRow {
         ts_ist_nanos: f.minute_nanos,
         trading_date_ist_nanos,
-        feed: Feed::Groww.as_str(),
+        feed: Feed::Truedata.as_str(),
         symbol: f.symbol.clone(),
         security_id,
         exchange_segment: segment,
@@ -878,7 +878,7 @@ pub fn run_daily_row(
     BrutexCrossverifyDailyRow {
         ts_ist_nanos: run_ts_nanos,
         trading_date_ist_nanos,
-        feed: Feed::Groww.as_str(),
+        feed: Feed::Truedata.as_str(),
         symbol: BRUTEX_CROSSVERIFY_RUN_ROW_SYMBOL.to_owned(),
         security_id: s,
         exchange_segment: "none".to_owned(),
@@ -1460,7 +1460,7 @@ pub async fn run_brutex_crossverify(
             let row = BrutexCrossverifyCellRow {
                 ts_ist_nanos: run_ts_nanos,
                 trading_date_ist_nanos: day_start_nanos,
-                feed: Feed::Groww.as_str(),
+                feed: Feed::Truedata.as_str(),
                 symbol: sym.clone(),
                 security_id: BRUTEX_CROSSVERIFY_MISSING_SENTINEL,
                 exchange_segment: "none".to_owned(),
@@ -1487,7 +1487,7 @@ pub async fn run_brutex_crossverify(
             let row = BrutexCrossverifyDailyRow {
                 ts_ist_nanos: run_ts_nanos,
                 trading_date_ist_nanos: day_start_nanos,
-                feed: Feed::Groww.as_str(),
+                feed: Feed::Truedata.as_str(),
                 symbol: sym.clone(),
                 security_id: sid,
                 exchange_segment: seg,

@@ -23,7 +23,7 @@ fn feed_runtime_lane_flag_round_trips_idempotently() {
     // deletion (the /feeds page + the 409 Dhan-enable refusal still read it), so
     // BOTH feeds' flag round-trips stay pinned here.
     let state = FeedRuntimeState::default();
-    for feed in [Feed::Dhan, Feed::Groww] {
+    for feed in [Feed::Dhan] {
         // Start NOT running (default mirrors prod for both lanes).
         assert!(!state.lane_running(feed));
     }

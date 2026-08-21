@@ -803,7 +803,7 @@ mod tests {
             |_, _, _, _, _| {},
         );
         assert_eq!(agg.lookup(Feed::Dhan, 13, SEG_IDX), Some(0));
-        assert_eq!(agg.lookup(Feed::Groww, 13, SEG_IDX), None);
+        assert_eq!(agg.lookup(Feed::Truedata, 13, SEG_IDX), None);
     }
 
     #[test]
@@ -1027,7 +1027,7 @@ mod tests {
             |_, _, _, _, _| {},
         );
         let _ = agg.consume_tick(
-            Feed::Groww,
+            Feed::Truedata,
             &tick(27, SEG_IDX, OPEN, 300.0, 30),
             None,
             |_, _, _, _, _| {},
@@ -1041,7 +1041,7 @@ mod tests {
             .snapshot(Feed::Dhan, 27, SEG_EQ, TfIndex::M1)
             .expect("dhan/eq");
         let idx_groww = agg
-            .snapshot(Feed::Groww, 27, SEG_IDX, TfIndex::M1)
+            .snapshot(Feed::Truedata, 27, SEG_IDX, TfIndex::M1)
             .expect("groww/idx");
         assert_eq!(idx_dhan.close, 100.0);
         assert_eq!(eq_dhan.close, 200.0);

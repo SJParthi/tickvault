@@ -823,8 +823,6 @@ pub enum NotificationEvent {
         trading_date_ist: String,
         /// The Dhan side of the scorecard.
         dhan: FeedScoreLine,
-        /// The Groww side of the scorecard.
-        groww: FeedScoreLine,
         /// Session denominator in minutes (375 on a regular NSE day).
         session_minutes: i64,
         /// `true` when the day's coverage could not be fully vouched for
@@ -846,8 +844,6 @@ pub enum NotificationEvent {
         /// race: the verdict says "no contest" instead of declaring a
         /// winner (round-4 hostile review 2026-07-10).
         dhan_feed_off: bool,
-        /// `true` when Groww was switched OFF for the day (round 4).
-        groww_feed_off: bool,
         /// Official minute-candle pull digest lines (Groww REST plan PR-5,
         /// operator Quote 2 2026-07-13): one plain-English line per
         /// feed/pull-family answering "within how many seconds precisely"
@@ -1698,109 +1694,6 @@ pub struct RestLegScoreLine {
 /// LAG_FLOOR_MS_DHAN = 1000`; core cannot depend on storage — both values
 /// are pinned to 1000 by their own unit tests).
 const VERDICT_LAG_CLOCK_FLOOR_MS: i64 = 1000;
-
-/// The scorecard's ONE decision (Telegram commandment 8): who won today —
-/// returned as `(header emoji, one sentence)` for the verdict-FIRST line
-/// (Telegram cleanliness overhaul, 2026-07-15). Tiebreak ladder unchanged
-/// from the 2026-07-10/11 reviews: feed-off no-contest (round 4: a
-/// switched-off feed's measured zeros are a one-horse race, never a win
-/// for the other) → exclusive minutes → worst-1% delay beyond the clock
-/// floor (only when BOTH are measured AND the delta exceeds
-/// [`VERDICT_LAG_CLOCK_FLOOR_MS`]; a −1 sentinel never decides, and a
-/// sub-floor delta is clock asymmetry, not speed) → broker-blamed
-/// incidents → even day. "No contest" / feed-off wording appears ONLY in
-/// this line.
-fn scorecard_verdict(
-    dhan: &FeedScoreLine,
-    groww: &FeedScoreLine,
-    dhan_feed_off: bool,
-    groww_feed_off: bool,
-) -> (&'static str, String) {
-    // Rung 0 (round 4, 2026-07-10): a feed switched OFF for the day makes
-    // every comparison rung a one-horse race — no winner is declared.
-    if dhan_feed_off && groww_feed_off {
-        return (
-            "\u{1f4ca}",
-            "both feeds were off today, no contest.".to_string(),
-        );
-    }
-    if dhan_feed_off || groww_feed_off {
-        let on = if dhan_feed_off {
-            &groww.name
-        } else {
-            &dhan.name
-        };
-        return ("\u{1f4ca}", format!("{on}-only day."));
-    }
-    // Rung 1: exclusive coverage minutes.
-    if dhan.exclusive_minutes >= 0
-        && groww.exclusive_minutes >= 0
-        && dhan.exclusive_minutes != groww.exclusive_minutes
-    {
-        let (w, l) = if dhan.exclusive_minutes > groww.exclusive_minutes {
-            (dhan, groww)
-        } else {
-            (groww, dhan)
-        };
-        return (
-            "\u{1f3c6}",
-            format!(
-                "{} won today ({} vs {} solo minutes).",
-                w.name, w.exclusive_minutes, l.exclusive_minutes
-            ),
-        );
-    }
-    // Rung 2: worst-1% delay (lower wins; only when both are measured AND
-    // the delta exceeds the Dhan whole-second clock floor — PR-C review
-    // round 1, 2026-07-11: Dhan's p99 physically cannot read below ~1s, so
-    // a raw compare would crown Groww "faster" on every healthy day from
-    // clock asymmetry, exactly the sub-floor comparison the runbook bans).
-    // A sub-floor delta falls through to the incident rung / "even day".
-    if dhan.lag_p99_ms >= 0
-        && groww.lag_p99_ms >= 0
-        && dhan.lag_p99_ms.saturating_sub(groww.lag_p99_ms).abs() > VERDICT_LAG_CLOCK_FLOOR_MS
-    {
-        let (w, l) = if dhan.lag_p99_ms < groww.lag_p99_ms {
-            (dhan, groww)
-        } else {
-            (groww, dhan)
-        };
-        return (
-            "\u{1f3c6}",
-            format!(
-                "{} won today (faster prices beyond the clock floor: worst 1% delay {} vs {}).",
-                w.name,
-                render_ms(w.lag_p99_ms),
-                render_ms(l.lag_p99_ms)
-            ),
-        );
-    }
-    // Rung 3: fewer broker-caused INCIDENTS wins — the broker blame tally
-    // covers drops + stalls (restarts are always ours, so they never
-    // inflate it). The blame tallies must BOTH be measured — a -1 sentinel
-    // would otherwise "win" (-1 < N) and render as gibberish (hostile
-    // review 2026-07-10); sentinel days fall through to "even day".
-    if dhan.drops_market >= 0
-        && groww.drops_market >= 0
-        && dhan.blame_broker >= 0
-        && groww.blame_broker >= 0
-        && dhan.blame_broker != groww.blame_broker
-    {
-        let (w, l) = if dhan.blame_broker < groww.blame_broker {
-            (dhan, groww)
-        } else {
-            (groww, dhan)
-        };
-        return (
-            "\u{1f3c6}",
-            format!(
-                "{} won today (fewer broker-caused incidents: {} vs {}).",
-                w.name, w.blame_broker, l.blame_broker
-            ),
-        );
-    }
-    ("\u{1f4ca}", "even day.".to_string())
-}
 
 /// Renders a millisecond delay for the scorecard: `-1` = honest "not
 /// measured yet"; ≥1s renders in seconds for readability.

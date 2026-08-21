@@ -415,7 +415,7 @@ mod tests {
         // 3 chains + ALL 4 spots concurrent — the spots sit in the
         // Data-API bucket (4 ≤ 5), the chains in the option-chain API's
         // own per-(underlying, expiry) budget (two-bucket model).
-        let slots = build_cycle_slots(10 * 3600, 0, 0, 0, &cfg());
+        let slots = build_cycle_slots(10 * 3600, 0, 0, &cfg());
         assert_eq!(slots.cycle_minute_ist, 10 * 3600 - 60);
         assert_eq!(slots.dhan_shape, 0);
         // Chains: ALL THREE concurrent at the burst second T+1.0
@@ -439,7 +439,7 @@ mod tests {
     fn test_cadence_schedule_rung1_split_fallback_slots() {
         // Shape rung 1 (the operator's 2026-07-16 fallback): second 1 =
         // 3 chains only; second 2 = ALL 4 spots.
-        let slots = build_cycle_slots(10 * 3600, 1, 0, 0, &cfg());
+        let slots = build_cycle_slots(10 * 3600, 1, 0, &cfg());
         assert_eq!(slots.dhan_shape, 1);
         assert_eq!(slots.dhan_chain_slots_ms, [ms(10, 0, 1, 0); 3]);
         assert_eq!(slots.dhan_chain_retry_slots_ms, [ms(10, 0, 4, 0); 3]);
@@ -447,7 +447,7 @@ mod tests {
         // The chain slots are IDENTICAL across rungs — the shape ladder
         // reshapes only the SPOT packing (chains are per-key-gated, not
         // rescheduled).
-        let s0 = build_cycle_slots(10 * 3600, 0, 0, 0, &cfg());
+        let s0 = build_cycle_slots(10 * 3600, 0, 0, &cfg());
         assert_eq!(s0.dhan_chain_slots_ms, slots.dhan_chain_slots_ms);
         assert_eq!(
             s0.dhan_chain_retry_slots_ms,
@@ -463,7 +463,7 @@ mod tests {
         // Shape 0: tier degradation happens WITHIN the burst group,
         // greedy overflow spilling to the next 1000ms buckets; tier 3
         // spills to singles T+1/2/3/4.
-        let s1 = build_cycle_slots(10 * 3600, 0, 1, 0, &c);
+        let s1 = build_cycle_slots(10 * 3600, 0, 1, &c);
         assert_eq!(
             s1.dhan_spot_slots_ms,
             [
@@ -473,7 +473,7 @@ mod tests {
                 ms(10, 0, 2, 0)
             ]
         );
-        let s2 = build_cycle_slots(10 * 3600, 0, 2, 0, &c);
+        let s2 = build_cycle_slots(10 * 3600, 0, 2, &c);
         assert_eq!(
             s2.dhan_spot_slots_ms,
             [
@@ -483,7 +483,7 @@ mod tests {
                 ms(10, 0, 2, 0)
             ]
         );
-        let s3 = build_cycle_slots(10 * 3600, 0, 3, 0, &c);
+        let s3 = build_cycle_slots(10 * 3600, 0, 3, &c);
         assert_eq!(
             s3.dhan_spot_slots_ms,
             [
@@ -495,7 +495,7 @@ mod tests {
         );
         // Shape 1: tier degradation happens WITHIN second 2, spilling
         // overflow to later seconds (per-second-group tier math).
-        let r1s1 = build_cycle_slots(10 * 3600, 1, 1, 0, &c);
+        let r1s1 = build_cycle_slots(10 * 3600, 1, 1, &c);
         assert_eq!(
             r1s1.dhan_spot_slots_ms,
             [
@@ -505,7 +505,7 @@ mod tests {
                 ms(10, 0, 3, 0)
             ]
         );
-        let r1s2 = build_cycle_slots(10 * 3600, 1, 2, 0, &c);
+        let r1s2 = build_cycle_slots(10 * 3600, 1, 2, &c);
         assert_eq!(
             r1s2.dhan_spot_slots_ms,
             [
@@ -515,7 +515,7 @@ mod tests {
                 ms(10, 0, 3, 0)
             ]
         );
-        let r1s3 = build_cycle_slots(10 * 3600, 1, 3, 0, &c);
+        let r1s3 = build_cycle_slots(10 * 3600, 1, 3, &c);
         assert_eq!(
             r1s3.dhan_spot_slots_ms,
             [
@@ -543,7 +543,7 @@ mod tests {
         let c = cfg();
         for shape in 0..=1u8 {
             for step in 0..=3u8 {
-                let s = build_cycle_slots(10 * 3600, shape, step, 0, &c);
+                let s = build_cycle_slots(10 * 3600, shape, step, &c);
                 let burst = s.dhan_chain_slots_ms[0];
                 for probe in 0..=5i64 {
                     let second = burst + probe * 1_000;
@@ -580,13 +580,13 @@ mod tests {
         // snapshots, not just-closed candles).
         let mut c = cfg();
         c.dhan_burst_offset_ms = 100;
-        let s = build_cycle_slots(10 * 3600, 0, 0, 0, &c);
+        let s = build_cycle_slots(10 * 3600, 0, 0, &c);
         assert_eq!(s.dhan_chain_slots_ms, [ms(10, 0, 0, 100); 3]);
         assert_eq!(s.dhan_spot_slots_ms, [ms(10, 0, 0, 300); 4]);
         // Never pre-close, on ANY shape and ANY concurrency step.
         for shape in 0..=1u8 {
             for step in 0..=3u8 {
-                for slot in build_cycle_slots(10 * 3600, shape, step, 0, &c).dhan_spot_slots_ms {
+                for slot in build_cycle_slots(10 * 3600, shape, step, &c).dhan_spot_slots_ms {
                     assert!(slot >= s.boundary_ms + 300);
                 }
             }
@@ -627,8 +627,8 @@ mod tests {
         assert!(boundary_in_window(56_400)); // 15:40:00 — last, inclusive
         assert!(!boundary_in_window(56_460)); // 15:41:00 — past
         // The last cycle carries the post_close stamp.
-        assert!(build_cycle_slots(56_400, 0, 0, 0, &cfg()).post_close);
-        assert!(!build_cycle_slots(56_340, 0, 0, 0, &cfg()).post_close);
+        assert!(build_cycle_slots(56_400, 0, 0, &cfg()).post_close);
+        assert!(!build_cycle_slots(56_340, 0, 0, &cfg()).post_close);
     }
 
     #[test]
@@ -671,7 +671,7 @@ mod tests {
         let mut seen = 0_u32;
         while let Some(b) = boundary {
             assert!(boundary_in_window(b), "emitted boundary {b} in window");
-            let slots = build_cycle_slots(b, 0, 0, 0, &c);
+            let slots = build_cycle_slots(b, 0, 0, &c);
             assert_eq!(slots.boundary_secs_of_day, b);
             assert_eq!(slots.cycle_minute_ist, b - 60);
             assert_eq!(slots.boundary_ms, i64::from(b) * 1_000);

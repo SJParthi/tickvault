@@ -628,7 +628,7 @@ mod tests {
         let groww_date = ExpiryDate::from_yyyymmdd(20_260_723).expect("valid");
         let dhan_date = ExpiryDate::from_yyyymmdd(20_260_716).expect("valid");
         // Groww resolves first — it drives the winner alone.
-        let v = store.record_policy_date(day, Feed::Groww, ChainUnderlying::Nifty, groww_date);
+        let v = store.record_policy_date(day, Feed::Truedata, ChainUnderlying::Nifty, groww_date);
         assert!(v.recorded && !v.newly_disagreeing);
         assert_eq!(
             store.view(day, ChainUnderlying::Nifty).winner,
@@ -642,7 +642,6 @@ mod tests {
         let view = store.view(day, ChainUnderlying::Nifty);
         assert_eq!(view.winner, Some(dhan_date), "Dhan wins on disagreement");
         assert_eq!(view.dhan_raw, Some(dhan_date));
-        assert_eq!(view.groww_raw, Some(groww_date));
         assert!(view.disagreement);
         // A repeat write can never re-fire the edge.
         let v = store.record_policy_date(day, Feed::Dhan, ChainUnderlying::Nifty, dhan_date);
@@ -650,7 +649,7 @@ mod tests {
         // Agreement on another underlying never flags.
         let v = store.record_policy_date(day, Feed::Dhan, ChainUnderlying::Sensex, dhan_date);
         assert!(v.recorded && !v.newly_disagreeing);
-        let v = store.record_policy_date(day, Feed::Groww, ChainUnderlying::Sensex, dhan_date);
+        let v = store.record_policy_date(day, Feed::Truedata, ChainUnderlying::Sensex, dhan_date);
         assert!(v.recorded && !v.newly_disagreeing);
         assert!(!store.view(day, ChainUnderlying::Sensex).disagreement);
     }
@@ -667,8 +666,8 @@ mod tests {
             None
         );
         let date = ExpiryDate::from_yyyymmdd(20_260_728).expect("valid");
-        let _ = store.record_policy_date(day, Feed::Groww, ChainUnderlying::Banknifty, date);
-        for broker in [Feed::Dhan, Feed::Groww] {
+        let _ = store.record_policy_date(day, Feed::Truedata, ChainUnderlying::Banknifty, date);
+        for broker in [Feed::Dhan, Feed::Truedata] {
             assert_eq!(
                 store.resolved_expiry(broker, ChainUnderlying::Banknifty, day),
                 Some(20_260_728)
