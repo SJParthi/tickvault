@@ -2132,6 +2132,66 @@ pub const INSTRUMENTS_SILENT_GAUGE: &str = "tv_dhan_feed_instruments_silent";
 /// error to log. Absence against a seeded key is the only evidence.
 pub const INSTRUMENTS_NEVER_TICKED_GAUGE: &str = "tv_dhan_feed_instruments_never_ticked";
 
+/// Gauge: seconds since the lane last persisted a tick, or — when no tick has
+/// arrived at all this session — seconds since the drain started.
+///
+/// # Why a gauge exists for something a counter already counts
+///
+/// `tv_dhan_feed_ingest_ticks_total` answers "is the feed producing anything",
+/// and the alarm that reads it is the one signal in this lane that separates
+/// "nothing broke" from "nothing ran". But it answers it through a COUNTER,
+/// and a counter's meaning in CloudWatch depends on a pipeline detail this
+/// repository has never been able to verify from the sandbox: whether the
+/// agent publishes each scrape's DELTA or the running CUMULATIVE total.
+///
+/// The two readings are not equally forgiving. Under deltas, `Sum < 1` over a
+/// window means no ticks folded in that window — correct. Under cumulative
+/// values, `Sum` is roughly five times the session total and `< 1` can never
+/// be true once a single tick has ever arrived, so the alarm reports health
+/// forever after the first tick of the morning — silently, which is the
+/// failure direction that matters. `auth-failed-alarm.tf` records the same
+/// uncertainty and lands on the opposite side of it (over-paging), and
+/// `live-lane-alarms.tf` names this exact residual in its own header.
+///
+/// A GAUGE has no such ambiguity: both pipelines publish it verbatim, because
+/// there is no delta to compute for a value that is free to go down. So the
+/// question "is the feed alive" is asked of a signal that means the same thing
+/// under either answer, instead of being decided by a coin flip nobody in this
+/// repo has been able to call.
+///
+/// # What it measures
+///
+/// Feed-level liveness from [`FeedHealthRegistry`], which is stamped in
+/// `flush_and_record` when a flush actually PERSISTS rows — not when a frame
+/// is decoded and not when a row is appended to the ILP buffer. So a QuestDB
+/// outage decays this value even while the socket is busy, which is correct:
+/// during one, the feed genuinely is not delivering.
+///
+/// [`FeedHealthRegistry`]: tickvault_common::feed_health::FeedHealthRegistry
+pub const LAST_TICK_AGE_GAUGE: &str = "tv_dhan_feed_last_tick_age_secs";
+
+/// The value [`LAST_TICK_AGE_GAUGE`] publishes.
+///
+/// `age` is `None` until the first flush persists a row. Publishing 0 for that
+/// case would read as perfect health during the exact outage the gauge exists
+/// to catch — a lane that dials, connects, subscribes and never receives
+/// anything is the 2026-08-12 shape, and it must page rather than reassure.
+/// Publishing a magic sentinel instead would page correctly but tell a
+/// dashboard reader nothing, so the never-ticked value is the drain's own
+/// uptime: it grows for exactly as long as the silence has lasted, which is
+/// the same thing the ticked branch reports, measured from the only other
+/// moment that means anything here.
+///
+/// O(1), no allocation, and pure so the substitution above is testable rather
+/// than asserted.
+#[must_use]
+pub fn last_tick_age_gauge_value(age: Option<u64>, drain_uptime_secs: u64) -> f64 {
+    match age {
+        Some(secs) => secs as f64,
+        None => drain_uptime_secs as f64,
+    }
+}
+
 /// How often the lane seals buckets the watermark has already moved past.
 ///
 /// 5s is chosen against the SHORTEST timeframe the aggregator carries (1s):
@@ -2364,6 +2424,11 @@ async fn run_frame_drain(
     // Whether this drain has ever seen a frame. Owns the up-gauge's rising
     // edge — see the first-frame arm below and the spawn site's correction.
     let mut lane_up = false;
+    // Anchor for the never-ticked branch of `LAST_TICK_AGE_GAUGE`. Taken here
+    // rather than at the stack's boot so it measures the drain's OWN silence:
+    // the drain is the thing that would be reporting ticks, and dialing time
+    // before it exists is not silence anyone can act on.
+    let drain_started = std::time::Instant::now();
     let mut seen: u64 = 0;
     let mut folded: u64 = 0;
     let mut depth_unconsumed: u64 = 0;
@@ -2702,6 +2767,29 @@ async fn run_frame_drain(
                 }
 
                 let (silent, never) = ingest.scan_silence(now_millis);
+
+                // Feed-level liveness, published UNCONDITIONALLY and before
+                // the market-hours gate below — same reasoning as the two
+                // gauges `scan_silence` sets: a gauge that stops publishing
+                // makes "no data" and "nothing wrong" indistinguishable, and
+                // this is the one signal whose whole job is telling those two
+                // apart.
+                //
+                // Reading the registry rather than a local counter is
+                // deliberate: `flush_and_record` stamps it only when a flush
+                // PERSISTED rows, so this decays during a QuestDB outage even
+                // while the socket is busy. That is the honest answer to "is
+                // the feed delivering".
+                metrics::gauge!(LAST_TICK_AGE_GAUGE).set(last_tick_age_gauge_value(
+                    feed_health.last_tick_age_secs(
+                        Feed::Dhan,
+                        chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .unwrap_or(0)
+                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+                    ),
+                    drain_started.elapsed().as_secs(),
+                ));
                 // Gauges publish unconditionally — a dashboard reading zero
                 // outside market hours is correct, and gating the gauge would
                 // make "no data" and "nothing wrong" indistinguishable.
