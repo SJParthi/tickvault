@@ -116,25 +116,6 @@ fn shutdown(class: ShutdownClass) -> NotificationEvent {
     NotificationEvent::ShutdownInitiated { class }
 }
 
-fn brutex_clean() -> NotificationEvent {
-    NotificationEvent::BrutexCrossverifySummary {
-        trading_date_ist: "2026-07-15".to_string(),
-        outcome: "clean".to_string(),
-        files_read: 5,
-        symbols_compared: 742,
-        matched: 276_490,
-        diverged: 0,
-        missing_brutex: 12,
-        missing_live: 3,
-        tail_unsealed: 742,
-        unmapped: 6,
-        noise_p95_paise: 5,
-        noise_max_paise: 40,
-        top_offenders: String::new(),
-        hint: String::new(),
-    }
-}
-
 /// The routine (Info/Low) fixture set the line-budget + phrase pins run
 /// over. High/Critical bodies are exempt (failure detail is wanted).
 fn routine_fixtures() -> Vec<NotificationEvent> {
@@ -245,14 +226,6 @@ fn guard_routine_info_low_bodies_within_four_lines() {
             body.lines().count()
         );
     }
-    // Topic-keyed allowlist: the BruteX daily digest keeps its wider body
-    // (≤ 8 lines on a clean day) — its diet is an explicitly DEFERRED item.
-    let brutex = brutex_clean().to_message();
-    assert!(
-        brutex.lines().count() <= 8,
-        "BruteX clean-day digest must stay ≤ 8 lines, got {}: {brutex}",
-        brutex.lines().count()
-    );
 }
 
 // ---------------------------------------------------------------------------

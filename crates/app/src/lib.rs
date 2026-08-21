@@ -34,11 +34,9 @@ pub mod calendar_staleness;
 // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12): PURE
 // comparison core — CSV parse, symbol mapping, day compare. No I/O; the
 // boot/runner shell lives in brutex_crossverify_boot (Unit 5).
-pub mod brutex_crossverify_compare;
 // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12): the
 // 15:50 IST I/O shell — S3 CSV fetch, QuestDB reads, compare orchestration,
 // persistence, Telegram summary + supervised spawn (Unit 7).
-pub mod brutex_crossverify_boot;
 // Judge-locked cadence scheduler boot wiring (2026-07-14): config-gated
 // dual-spawn of the supervised per-minute fire scheduler (dry-run
 // executors both lanes day 1 — no REST caller). Runbook:

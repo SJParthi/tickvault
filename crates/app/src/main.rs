@@ -1732,16 +1732,6 @@ async fn async_main() -> Result<()> {
         &feed_runtime,
     );
 
-    // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12) —
-    // PROCESS-GLOBAL spawn like the scoreboard above: the 15:50 IST runner
-    // + supervisor. Config-gated ([brutex_crossverify] enabled, default OFF);
-    // disabled = one info! + return, nothing spawned.
-    tickvault_app::brutex_crossverify_boot::spawn_brutex_crossverify_task(
-        &config,
-        &trading_calendar,
-        &notifier,
-    );
-
     // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
     // the Groww per-minute REST plan) — the slow-path call site; the FAST
     // crash-recovery arm carries its own (hostile round 1 item 1 — the

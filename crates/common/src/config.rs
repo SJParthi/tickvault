@@ -87,15 +87,6 @@ pub struct ApplicationConfig {
     /// off is the whole-subsystem rollback switch (B12).
     #[serde(default)]
     pub scoreboard: ScoreboardConfig,
-    /// `[brutex_crossverify]` — daily BruteX↔TickVault Groww 1-minute
-    /// cross-verification (operator authorization tracked in
-    /// `.claude/rules/project/brutex-crossverify-error-codes.md`). Reads
-    /// BruteX-produced OHLCV CSVs from S3 at 15:50 IST and compares them
-    /// against live `candles_1m` rows tagged `feed='groww'`. Default OFF —
-    /// a missing section keeps today's behaviour byte-identical; flipping
-    /// `enabled = false` is the whole-subsystem rollback switch (B12).
-    #[serde(default)]
-    pub brutex_crossverify: BrutexCrossverifyConfig,
     /// `[spot_1m_rest]` — per-minute spot 1m REST pipeline (operator grant
     /// 2026-07-12, `no-rest-except-live-feed-2026-06-27.md` §8): every
     /// trading-day minute close in session, fetch that just-closed minute's
@@ -137,13 +128,6 @@ pub struct ApplicationConfig {
     /// Absent section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub tf_consistency: TfConsistencyConfig,
-    /// `[spot_crossverify]` — daily 15:47 IST Dhan↔Groww `spot_1m_rest`
-    /// cross-broker OHLC comparator (operator 2026-07-17). Compares stored
-    /// `feed='dhan'` vs `feed='groww'` IDX_I rows minute-by-minute; findings
-    /// land in `spot_crossverify_cell_audit` + `spot_crossverify_daily` + one
-    /// Telegram summary. Cold path only. Absent section ⇒ DISABLED.
-    #[serde(default)]
-    pub spot_crossverify: SpotCrossverifyConfig,
     /// `[rest_candle_fold]` — REST-era multi-TF candle derivation (operator
     /// directive 2026-07-16: *"why the fuck remaining candles 1m till 1day
     /// is not yet generated and populated — resolve these"*). Folds
@@ -495,129 +479,6 @@ impl Default for ScoreboardConfig {
             coverage_detail_rows: default_scoreboard_enabled(),
             presence_fold_enabled: default_scoreboard_enabled(),
             trigger_secs_of_day_ist: default_scoreboard_trigger_secs(),
-        }
-    }
-}
-
-/// `[brutex_crossverify]` — daily BruteX↔TickVault Groww 1-minute
-/// cross-verification. At 15:50 IST the runner lists + downloads the
-/// BruteX-produced OHLCV CSVs from S3 (`s3://<bucket>/<prefix>/<date>/…`)
-/// and compares them cell-by-cell (paise-integer, tolerance INCLUSIVE)
-/// against live `candles_1m` rows tagged `feed='groww'`. All fields
-/// serde-defaulted so a missing section is safe. `enabled = false` is
-/// SAFE-OFF: nothing spawns until the operator flips it — the flip back
-/// to `false` is the whole-subsystem rollback switch (B12; pinned by
-/// `brutex_crossverify_flag_rollback`).
-#[derive(Debug, Clone, Deserialize)]
-pub struct BrutexCrossverifyConfig {
-    /// Master switch for the whole subsystem (15:50 IST daily runner +
-    /// forensic tables + Telegram summary + `/crossverify` page data).
-    /// Default OFF — cold-path S3 reads only begin once enabled.
-    #[serde(default = "default_brutex_xverify_enabled")]
-    pub enabled: bool,
-    /// Send the daily Telegram summary (the comparison + tables still run
-    /// when this is off — forensic record without the ping).
-    #[serde(default = "default_brutex_xverify_telegram_enabled")]
-    pub telegram_enabled: bool,
-    /// S3 bucket carrying the BruteX-produced CSVs. Reuses the existing
-    /// cold-archive bucket (instance role already has read access —
-    /// zero IAM change).
-    #[serde(default = "default_brutex_xverify_bucket")]
-    pub bucket: String,
-    /// Key prefix under the bucket; the runner lists
-    /// `<prefix>/<YYYY-MM-DD>/` for the trading day.
-    #[serde(default = "default_brutex_xverify_prefix")]
-    pub prefix: String,
-    /// IST seconds-of-day for the daily trigger. Default 57_000 =
-    /// 15:50:00 IST (after the 15:31 cross-verify, the 15:40
-    /// tick-conservation audit and the 15:45 scoreboard).
-    #[serde(default = "default_brutex_xverify_trigger_secs")]
-    pub trigger_secs_of_day_ist: u32,
-    /// IST seconds-of-day wall-clock cap. An empty S3 listing re-polls
-    /// every `repoll_interval_secs` until this cap (default 57_900 =
-    /// 16:05:00 IST — well before the AWS 16:30 IST auto-stop), then the
-    /// day records NO_DATA / degraded honestly (stage `wall_clock_cap`).
-    #[serde(default = "default_brutex_xverify_deadline_secs")]
-    pub deadline_secs_of_day_ist: u32,
-    /// Seconds between re-polls while the day's S3 listing is empty.
-    #[serde(default = "default_brutex_xverify_repoll_secs")]
-    pub repoll_interval_secs: u64,
-    /// Per-object size cap (bytes). A CSV larger than this is refused
-    /// (degraded, loud) — bounds memory on a corrupt/hostile object.
-    #[serde(default = "default_brutex_xverify_max_object_bytes")]
-    pub max_object_bytes: u64,
-    /// Cap on the number of listed keys per day (bounds a runaway
-    /// producer; beyond it the run degrades loudly).
-    #[serde(default = "default_brutex_xverify_max_keys")]
-    pub max_keys: u32,
-    /// Bounded download attempts per S3 object (with backoff) before
-    /// that object is counted failed for the day.
-    #[serde(default = "default_brutex_xverify_fetch_attempts")]
-    pub fetch_attempts_per_object: u32,
-    /// INCLUSIVE per-cell price tolerance in paise (integer compare —
-    /// `|live - brutex| <= tolerance` matches). Default 0 = exact match.
-    #[serde(default = "default_brutex_xverify_price_tolerance_paise")]
-    pub price_tolerance_paise: i64,
-    /// Classify volume divergences. Default OFF — Groww live volume is
-    /// always 0 (LTP-only feed), so volume classification for the groww
-    /// feed is hard-refused regardless of this flag; both sides are
-    /// still STORED for forensics.
-    #[serde(default = "default_brutex_xverify_compare_volume")]
-    pub compare_volume: bool,
-}
-
-fn default_brutex_xverify_enabled() -> bool {
-    false
-}
-fn default_brutex_xverify_telegram_enabled() -> bool {
-    true
-}
-fn default_brutex_xverify_bucket() -> String {
-    String::from("tv-prod-cold")
-}
-fn default_brutex_xverify_prefix() -> String {
-    String::from("crossverify/groww")
-}
-fn default_brutex_xverify_trigger_secs() -> u32 {
-    15 * 3600 + 50 * 60 // 57_000 = 15:50:00 IST
-}
-fn default_brutex_xverify_deadline_secs() -> u32 {
-    16 * 3600 + 5 * 60 // 57_900 = 16:05:00 IST
-}
-fn default_brutex_xverify_repoll_secs() -> u64 {
-    120
-}
-fn default_brutex_xverify_max_object_bytes() -> u64 {
-    5 * 1024 * 1024 // 5 MiB per CSV object
-}
-fn default_brutex_xverify_max_keys() -> u32 {
-    2_000
-}
-fn default_brutex_xverify_fetch_attempts() -> u32 {
-    3
-}
-fn default_brutex_xverify_price_tolerance_paise() -> i64 {
-    0
-}
-fn default_brutex_xverify_compare_volume() -> bool {
-    false
-}
-
-impl Default for BrutexCrossverifyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_brutex_xverify_enabled(),
-            telegram_enabled: default_brutex_xverify_telegram_enabled(),
-            bucket: default_brutex_xverify_bucket(),
-            prefix: default_brutex_xverify_prefix(),
-            trigger_secs_of_day_ist: default_brutex_xverify_trigger_secs(),
-            deadline_secs_of_day_ist: default_brutex_xverify_deadline_secs(),
-            repoll_interval_secs: default_brutex_xverify_repoll_secs(),
-            max_object_bytes: default_brutex_xverify_max_object_bytes(),
-            max_keys: default_brutex_xverify_max_keys(),
-            fetch_attempts_per_object: default_brutex_xverify_fetch_attempts(),
-            price_tolerance_paise: default_brutex_xverify_price_tolerance_paise(),
-            compare_volume: default_brutex_xverify_compare_volume(),
         }
     }
 }
@@ -1039,65 +900,6 @@ pub struct TfConsistencyConfig {
     /// explicitly.
     #[serde(default)]
     pub enabled: bool,
-}
-
-/// `[spot_crossverify]` — daily Dhan↔Groww `spot_1m_rest` cross-broker OHLC
-/// comparator (operator 2026-07-17; SPOT-XVERIFY-01/02). An absent
-/// `[spot_crossverify]` section (or a TOML written before this PR) disables
-/// the comparator entirely (fail-safe); `config/base.toml` explicitly sets
-/// `enabled = true`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SpotCrossverifyConfig {
-    /// Master switch for the daily 15:47 IST spot cross-broker comparator.
-    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Severity-gating noise band in PAISE (operator Fix E, 2026-07-17):
-    /// a divergence run pages High ONLY when an OPEN/CLOSE field diverged,
-    /// a minute is missing on one broker, or any single delta exceeds
-    /// this knob; high/low-only skew within it is Info (a trend line).
-    /// Default 2000 paise = ₹20 — index-level cross-broker sampling skew
-    /// on 20,000–85,000-point indices routinely reaches a few rupees on
-    /// high/low (the two brokers sample the same prices at slightly
-    /// different instants); ₹20 is ~0.02–0.1% of index value — far above
-    /// observed timing noise, far below any real feed drift. The exact
-    /// 0-paise COMPARE is untouched — counts stay exact; only the
-    /// Telegram severity is gated.
-    #[serde(default = "default_spot_xverify_noise_threshold_paise")]
-    pub noise_threshold_paise: i64,
-}
-
-impl Default for SpotCrossverifyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            noise_threshold_paise: default_spot_xverify_noise_threshold_paise(),
-        }
-    }
-}
-
-fn default_spot_xverify_noise_threshold_paise() -> i64 {
-    2_000
-}
-
-impl SpotCrossverifyConfig {
-    /// Boot-time validation (Fix E review round 1, 2026-07-17): the noise
-    /// band must stay inside 0..=10_000 paise (₹0..=₹100). A negative value
-    /// is nonsense; an absurdly large one would demote ALL real drift to
-    /// Info (a silent-page hole) — both rejected at boot.
-    ///
-    /// # Errors
-    /// Returns a descriptive error when `noise_threshold_paise` is outside
-    /// the legal range.
-    pub fn validate(&self) -> Result<()> {
-        if !(0..=10_000).contains(&self.noise_threshold_paise) {
-            bail!(
-                "spot_crossverify.noise_threshold_paise ({}) must be within 0..=10000",
-                self.noise_threshold_paise
-            );
-        }
-        Ok(())
-    }
 }
 
 /// `[cadence]` — broker-agnostic fetch-cadence + decision-timing scheduler
@@ -3456,7 +3258,6 @@ impl ApplicationConfig {
         // Fix E (2026-07-17): the spot cross-verify severity noise band
         // must stay inside 0..=10_000 paise — an absurd value would demote
         // all real drift to Info.
-        self.spot_crossverify.validate()?;
 
         // 2026-07-14: scheduled OMS reconcile cadence must stay inside the
         // 60..=3600s envelope — rejected at boot, BEFORE the pipeline spawns.
@@ -4176,13 +3977,11 @@ mod tests {
             // in_mem: InMemConfig retired 2026-07-19 (BATCH-5 dead-code cleanup).
             feeds: FeedsConfig::default(),
             scoreboard: ScoreboardConfig::default(),
-            brutex_crossverify: BrutexCrossverifyConfig::default(),
             spot_1m_rest: Spot1mRestConfig::default(),
             oms_reconcile: OmsReconcileConfig::default(),
             dhan_data_api: DhanDataApiConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
-            spot_crossverify: SpotCrossverifyConfig::default(),
             rest_candle_fold: RestCandleFoldConfig::default(),
             market_ram_store: MarketRamStoreConfig::default(),
             order_runtime: OrderRuntimeConfig::default(),
@@ -5237,73 +5036,6 @@ mod tests {
         assert!(missing.scoreboard.enabled);
     }
 
-    /// BruteX crossverify (2026-07-12): the `[brutex_crossverify]` section
-    /// defaults SAFE-OFF (a NEW subsystem must not activate on deploy day
-    /// without an explicit config flip), trigger at 15:50:00 IST, S3
-    /// wall-clock deadline at 16:05:00 IST, and a missing section must
-    /// default, never error.
-    #[test]
-    fn test_brutex_crossverify_config_defaults_disabled_safe_off() {
-        let bx = BrutexCrossverifyConfig::default();
-        assert!(!bx.enabled, "brutex_crossverify must default OFF");
-        assert!(bx.telegram_enabled);
-        assert_eq!(
-            bx.trigger_secs_of_day_ist, 57_000,
-            "trigger must default to 15:50:00 IST"
-        );
-        assert_eq!(
-            bx.deadline_secs_of_day_ist, 57_900,
-            "S3 wall-clock deadline must default to 16:05:00 IST"
-        );
-        assert!(
-            bx.trigger_secs_of_day_ist < bx.deadline_secs_of_day_ist,
-            "trigger must precede the deadline"
-        );
-        assert_eq!(bx.bucket, "tv-prod-cold");
-        assert_eq!(bx.prefix, "crossverify/groww");
-        assert_eq!(bx.repoll_interval_secs, 120);
-        assert_eq!(bx.max_object_bytes, 5 * 1024 * 1024);
-        assert_eq!(bx.max_keys, 2_000);
-        assert_eq!(bx.fetch_attempts_per_object, 3);
-        assert_eq!(bx.price_tolerance_paise, 0, "exact match by default");
-        assert!(!bx.compare_volume, "volume classification defaults OFF");
-    }
-
-    /// B12 rollback test (`brutex_crossverify_flag_rollback`): flipping
-    /// `[brutex_crossverify] enabled = true` must round-trip through TOML
-    /// (the tested ON-switch path — the subsystem is default-OFF, so the
-    /// rollback IS the default), a partial section must fill every other
-    /// field from serde defaults, and a MISSING section must default to
-    /// the safe-off state, never error.
-    #[test]
-    fn brutex_crossverify_flag_rollback() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            brutex_crossverify: BrutexCrossverifyConfig,
-        }
-        // ON shape: enabled=true parses and turns the subsystem on.
-        let on: Wrapper = Figment::new()
-            .merge(Toml::string("[brutex_crossverify]\nenabled = true\n"))
-            .extract()
-            .expect("brutex_crossverify enable TOML must parse");
-        assert!(on.brutex_crossverify.enabled, "enable flag must stick");
-        // Partial section: unspecified keys fill from serde defaults.
-        assert!(on.brutex_crossverify.telegram_enabled);
-        assert_eq!(on.brutex_crossverify.trigger_secs_of_day_ist, 57_000);
-        assert_eq!(on.brutex_crossverify.deadline_secs_of_day_ist, 57_900);
-        assert_eq!(on.brutex_crossverify.bucket, "tv-prod-cold");
-        // Missing section entirely → full defaults (OFF), never an error.
-        let missing: Wrapper = Figment::new()
-            .merge(Toml::string("[feeds]\ndhan_enabled = true\n"))
-            .extract()
-            .expect("missing [brutex_crossverify] must default");
-        assert!(!missing.brutex_crossverify.enabled);
-    }
-
     /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
     /// `[spot_1m_rest]` section is FAIL-SAFE default OFF — via `Default`,
     /// via a missing section, and via an empty section — and an explicit
@@ -5766,70 +5498,6 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.tf_consistency.enabled);
-    }
-
-    /// Fix E review round 1 (2026-07-17): the noise-band knob is
-    /// range-checked 0..=10_000 paise at boot — a negative or absurdly
-    /// large value (which would demote ALL real drift to Info) is rejected;
-    /// the boundaries themselves are legal.
-    #[test]
-    fn test_spot_crossverify_noise_threshold_validate_range() {
-        let mut cfg = SpotCrossverifyConfig::default();
-        assert!(cfg.validate().is_ok(), "default (2000) must validate");
-        cfg.noise_threshold_paise = 0;
-        assert!(cfg.validate().is_ok(), "0 (exact-match gating) is legal");
-        cfg.noise_threshold_paise = 10_000;
-        assert!(cfg.validate().is_ok(), "10_000 boundary is legal");
-        cfg.noise_threshold_paise = -1;
-        assert!(cfg.validate().is_err(), "negative must be rejected");
-        cfg.noise_threshold_paise = 10_001;
-        assert!(
-            cfg.validate().is_err(),
-            "an absurd band (> \u{20b9}100) must be rejected — it would \
-             demote all real drift to Info"
-        );
-    }
-
-    /// Daily spot cross-broker comparator (operator 2026-07-17): the
-    /// `[spot_crossverify]` section is fail-safe DEFAULT-OFF — via `Default`,
-    /// via a missing section, and via an empty section — and the explicit
-    /// base.toml opt-in round-trips.
-    #[test]
-    fn test_spot_crossverify_config_default_off_and_round_trip() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        assert!(
-            !SpotCrossverifyConfig::default().enabled,
-            "spot_crossverify must default OFF (fail-safe; base.toml opts in)"
-        );
-        assert_eq!(
-            SpotCrossverifyConfig::default().noise_threshold_paise,
-            2_000,
-            "the severity-gating noise band defaults to 2000 paise = \u{20b9}20 \
-             (Fix E, 2026-07-17 — see the field doc for the rationale)"
-        );
-
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            spot_crossverify: SpotCrossverifyConfig,
-        }
-        let missing: Wrapper = Figment::new()
-            .merge(Toml::string("[other]\nx = 1\n"))
-            .extract()
-            .expect("missing [spot_crossverify] must default, not error");
-        assert!(!missing.spot_crossverify.enabled);
-        let empty: Wrapper = Figment::new()
-            .merge(Toml::string("[spot_crossverify]\n"))
-            .extract()
-            .expect("empty [spot_crossverify] must default, not error");
-        assert!(!empty.spot_crossverify.enabled);
-        let on: Wrapper = Figment::new()
-            .merge(Toml::string("[spot_crossverify]\nenabled = true\n"))
-            .extract()
-            .expect("explicit enabled = true must round-trip");
-        assert!(on.spot_crossverify.enabled);
     }
 
     /// Order runtime (2026-07-14, cluster A): the `[order_runtime]` section

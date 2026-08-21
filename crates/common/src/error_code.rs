@@ -710,49 +710,18 @@ pub enum ErrorCode {
     /// (`TICKVAULT_SCOREBOARD_NOW`) backfill the day. Severity::Medium,
     /// auto-triage-safe.
     Scoreboard01AggregationDegraded,
-    /// BRUTEX-XVERIFY-01 (BruteX↔TickVault daily cross-verify, 2026-07-12) —
-    /// the 15:50 IST run found ≥1 divergent cell (or missing-live /
-    /// missing-brutex minute) between the BruteX-produced Groww 1-minute
-    /// OHLCV CSVs (S3 `crossverify/groww/<date>/`) and the live
-    /// `candles_1m` (`feed='groww'`) — paise-integer compare, inclusive
-    /// tolerance. Each cell is a `brutex_crossverify_cell_audit` row; the
-    /// daily verdict row + Telegram summary carry the counts. Severity::High;
-    /// NOT auto-triage-safe (severity-independent override — a cross-system
-    /// data-comparability verdict is an OPERATOR judgment: which side's
-    /// pipeline drifted; the FUTIDX-02 precedent).
-    BrutexXverify01DivergenceFound,
-    /// BRUTEX-XVERIFY-02 (BruteX↔TickVault daily cross-verify, 2026-07-12) —
-    /// the 15:50 IST run itself DEGRADED: S3 list/get failed after bounded
-    /// retries, no objects appeared by the 16:05 IST wall-clock cap
-    /// (NO_DATA), CSV parse rejected, the symbol→security_id mapping read
-    /// failed, the live `candles_1m` read failed, or the forensic ILP write
-    /// was rejected. The day is stamped `no_data` / `blind` / `degraded` —
-    /// never a fabricated clean verdict (Rule 11). Best-effort cold path:
-    /// the live feeds, tick capture and trading are NEVER affected; the
-    /// DEDUP-idempotent tables let a healthy re-run backfill the day.
-    /// Severity::High, auto-triage-safe (the degrade already happened —
-    /// the operator inspects; the next trading day re-runs).
-    BrutexXverify02RunDegraded,
-    /// SPOT-XVERIFY-01 (Dhan↔Groww spot cross-broker comparator) — the
-    /// 15:47 IST run found ≥1 divergent OHLC cell (or a minute present in
-    /// only one feed) between our stored `spot_1m_rest` rows `feed='dhan'`
-    /// vs `feed='groww'` for the same (trading day, minute, canonical
-    /// index). Neither feed is ground truth — a divergence-TREND signal.
-    /// Severity::High; NOT auto-triage-safe (severity-independent override
-    /// — the operator judges which capture is wrong; the FUTIDX-02
-    /// precedent). Fires ONE coalesced emission per run, never per row.
-    SpotXverify01MismatchFound,
-    /// SPOT-XVERIFY-02 (Dhan↔Groww spot cross-broker comparator) — the
-    /// 15:47 IST run itself DEGRADED: the QuestDB `/exec` read failed, a
-    /// query truncated at its row cap, the response exceeded the body cap,
-    /// the DDL ensure failed, the forensic ILP write was rejected, or the
-    /// run budget elapsed. The day is stamped `no_data` / `blind` /
-    /// `degraded` — never a fabricated clean verdict (Rule 11).
-    /// Best-effort cold path: the live feeds, tick capture and trading are
-    /// NEVER affected; DEDUP-idempotent tables let a healthy re-run backfill.
-    /// Severity::High, auto-triage-safe (the degrade already happened —
-    /// the operator inspects; the next trading day re-runs).
-    SpotXverify02RunDegraded,
+    /// DHAN-LIVE-XVERIFY-01 — the daily Dhan live-vs-REST cross-verification
+    /// run degraded: an HTTP client build failure, an `/exec` query failure or
+    /// truncation, an audit-flush failure, or a run past its wall-clock
+    /// budget. Read-only over `candles_1m` and the REST tape; writes only its
+    /// own audit tables, so the live feed and tick capture are NEVER affected.
+    ///
+    /// This comparator is the ONLY ground truth the revived Dhan feed has —
+    /// the India feed carries no sequence number and no snapshot-on-subscribe,
+    /// so packet loss is undetectable at the protocol level. A degraded or
+    /// blind run therefore means we cannot vouch for the day, and it must
+    /// never render as a pass. Severity::High, auto-triage-safe.
+    DhanLiveXverify01RunDegraded,
     /// SPOT1M-01 (per-minute REST pipeline PR-2, operator grant 2026-07-12)
     /// — the per-minute spot 1m REST fetch degraded: a whole minute failed
     /// for one/all of the 3 IDX_I spot indices (transport error, non-2xx,
@@ -1151,12 +1120,9 @@ impl ErrorCode {
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
             // BruteX↔TickVault daily cross-verify (2026-07-12)
-            Self::BrutexXverify01DivergenceFound => "BRUTEX-XVERIFY-01",
-            Self::BrutexXverify02RunDegraded => "BRUTEX-XVERIFY-02",
             // Dhan↔Groww spot cross-broker comparator
-            Self::SpotXverify01MismatchFound => "SPOT-XVERIFY-01",
-            Self::SpotXverify02RunDegraded => "SPOT-XVERIFY-02",
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
+            Self::DhanLiveXverify01RunDegraded => "DHAN-LIVE-XVERIFY-01",
             Self::Spot1m01FetchDegraded => "SPOT1M-01",
             Self::Spot1m02PersistFailed => "SPOT1M-02",
             // Per-minute option-chain REST pipeline (PR-3, 2026-07-12)
@@ -1331,18 +1297,10 @@ impl ErrorCode {
             Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
                 Severity::High
             }
-            // BRUTEX-XVERIFY-01/02 (2026-07-12) — daily cross-verify
-            // divergence / degraded run. Loud (Telegram High), never a
-            // halt; the live feeds + tick capture are unaffected.
-            Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
-                Severity::High
-            }
-            // SPOT-XVERIFY-01/02 (Dhan↔Groww spot cross-broker comparator)
-            // — divergence found / run degraded. Loud (Telegram High),
-            // never a halt; both live feeds + tick capture are unaffected.
-            Self::SpotXverify01MismatchFound | Self::SpotXverify02RunDegraded => {
-                Severity::High
-            }
+            // DHAN-LIVE-XVERIFY-01 — the revived Dhan feed's only ground-truth
+            // check ran degraded or blind. Loud (High), never a halt; the
+            // feed and tick capture are unaffected.
+            Self::DhanLiveXverify01RunDegraded => Severity::High,
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
             // ran degraded. High: operator eyes required on every occurrence
@@ -1623,13 +1581,9 @@ impl ErrorCode {
             Self::Scoreboard01AggregationDegraded => {
                 "docs/error-runbooks/dual-feed-scoreboard-error-codes.md"
             }
-            // BruteX↔TickVault daily cross-verify (2026-07-12)
-            Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
-                "docs/error-runbooks/brutex-crossverify-error-codes.md"
-            }
-            // Dhan↔Groww spot cross-broker comparator
-            Self::SpotXverify01MismatchFound | Self::SpotXverify02RunDegraded => {
-                "docs/error-runbooks/spot-crossverify-error-codes.md"
+            // Dhan live-vs-REST cross-verification
+            Self::DhanLiveXverify01RunDegraded => {
+                "docs/error-runbooks/dhan-live-crossverify-error-codes.md"
             }
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded | Self::Spot1m02PersistFailed => {
@@ -1705,12 +1659,12 @@ impl ErrorCode {
             self,
             Self::Futidx02CrossFeedExpiryMismatch
                 | Self::WalSuspend01TableSuspended
-                | Self::BrutexXverify01DivergenceFound
+
                 // SPOT-XVERIFY-01 (Dhan↔Groww spot cross-broker
                 // comparator): a cross-broker OHLC divergence is a
                 // data-comparability VERDICT — the operator judges which
                 // capture is wrong; the FUTIDX-02 precedent.
-                | Self::SpotXverify01MismatchFound
+
                 // CHAIN-01 (PR-3, 2026-07-12): restoring the option-chain
                 // Data-API entitlement is an operator/broker ACCOUNT
                 // decision — never auto-actioned despite High severity.
@@ -1872,12 +1826,9 @@ impl ErrorCode {
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded,
             // BruteX↔TickVault daily cross-verify (2026-07-12)
-            Self::BrutexXverify01DivergenceFound,
-            Self::BrutexXverify02RunDegraded,
             // Dhan↔Groww spot cross-broker comparator
-            Self::SpotXverify01MismatchFound,
-            Self::SpotXverify02RunDegraded,
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
+            Self::DhanLiveXverify01RunDegraded,
             Self::Spot1m01FetchDegraded,
             Self::Spot1m02PersistFailed,
             // Per-minute option-chain REST pipeline (PR-3, 2026-07-12)

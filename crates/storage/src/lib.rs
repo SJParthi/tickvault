@@ -109,7 +109,6 @@ pub mod ilp_flush_reconnect;
 /// forensic tables — one row per divergent CELL + one per-day summary row
 /// with a keep-better outcome guard — written via ILP-over-HTTP (per-flush
 /// server ACK). See `.claude/rules/project/brutex-crossverify-error-codes.md`.
-pub mod brutex_crossverify_persistence;
 /// Cadence cross-fill visibility (operator 2026-07-20): one forensic row per
 /// cross-fill / Groww-fallback event with the precise minute + latency —
 /// the "every day, week, month, precisely at what time" system-of-record.
