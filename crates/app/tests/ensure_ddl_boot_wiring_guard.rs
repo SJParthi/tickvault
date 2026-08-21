@@ -105,25 +105,15 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         ("ensure_shadow_candle_tables", "src/candle_ddl_boot.rs"),
         // analyst console views (read-only projections)
         ("ensure_named_views", "src/candle_ddl_boot.rs"),
-        // spot_1m_rest — Dhan/Groww/cadence spot legs
+        // spot_1m_rest — the spot legs
         ("ensure_spot_1m_rest_table", "src/spot_1m_rest_boot.rs"),
         ("ensure_spot_1m_rest_table", "src/cadence_boot.rs"),
-        ("ensure_spot_1m_rest_table", "src/groww_spot_1m_boot.rs"),
         // option_chain_1m — chain legs
         (
             "ensure_option_chain_1m_table",
             "src/option_chain_1m_boot.rs",
         ),
-        (
-            "ensure_option_chain_1m_table",
-            "src/groww_option_chain_1m_boot.rs",
-        ),
         ("ensure_option_chain_1m_table", "src/cadence_boot.rs"),
-        // option_contract_1m_rest — contract leg
-        (
-            "ensure_option_contract_1m_rest_table",
-            "src/groww_contract_1m_boot.rs",
-        ),
         // market_depth — the depth-20 + depth-200 common table (2026-08-15).
         // Its DEDUP key carries a `depth_kind` discriminator no other table
         // needs; an ILP-auto-created table arrives without it and the two
@@ -135,16 +125,6 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         (
             "ensure_tf_consistency_audit_table",
             "src/tf_consistency_boot.rs",
-        ),
-        // spot_crossverify_* — 15:47 IST comparator
-        (
-            "ensure_spot_crossverify_tables",
-            "src/spot_crossverify_boot.rs",
-        ),
-        // brutex_crossverify_* — 15:50 IST comparator
-        (
-            "ensure_brutex_crossverify_tables",
-            "src/brutex_crossverify_boot.rs",
         ),
         // order_audit / pnl_audit — order-side observability consumers
         ("ensure_order_audit_table", "src/order_observability.rs"),

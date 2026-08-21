@@ -1346,32 +1346,6 @@ pub struct RestLegScoreLine {
     pub close_samples: i64,
 }
 
-/// The Dhan exchange-clock quantization floor in milliseconds — Dhan LTT
-/// carries WHOLE IST seconds, so its measured lag has a uniform [0,1)s
-/// inflation Groww's millisecond clock does not. The verdict's delay rung
-/// declares a winner ONLY when the cross-feed p99 delta EXCEEDS this floor
-/// (PR-C review round 1, 2026-07-11): a sub-floor "Groww faster by <1s" is
-/// unprovable against Dhan's whole-second clock — the runbook caveat made
-/// mechanical. MUST stay lockstep with the persisted `lag_floor_ms` column
-/// value for Dhan (`tickvault_storage::feed_scoreboard_persistence::
-/// LAG_FLOOR_MS_DHAN = 1000`; core cannot depend on storage — both values
-/// are pinned to 1000 by their own unit tests).
-const VERDICT_LAG_CLOCK_FLOOR_MS: i64 = 1000;
-
-/// Renders a millisecond delay for the scorecard: `-1` = honest "not
-/// measured yet"; ≥1s renders in seconds for readability.
-fn render_ms(ms: i64) -> String {
-    if ms < 0 {
-        return "not measured yet".to_string();
-    }
-    if ms >= 1000 {
-        #[allow(clippy::cast_precision_loss)]
-        // APPROVED: display-only division of a bounded daily lag value.
-        return format!("{:.1} s", ms as f64 / 1000.0);
-    }
-    format!("{ms} ms")
-}
-
 /// Compact IST date for card headers (`"2026-07-14"` → `"14 Jul"`) so a
 /// past-day backfill / forced-run card is distinguishable from today's at
 /// a glance (G3, fix round 2 — the documented `TICKVAULT_SCOREBOARD_DATE`
@@ -2470,7 +2444,7 @@ impl NotificationEvent {
                     )
                 } else {
                     let covered = dhan.exclusive_minutes;
-                    let total = i64::from(*session_minutes);
+                    let total = *session_minutes;
                     let emoji = if covered >= total {
                         "\u{2705}"
                     } else {
@@ -8032,10 +8006,6 @@ mod tests {
 
     #[test]
     fn test_scorecard_render_helpers() {
-        // render_ms: sentinel / sub-second / ≥1s bands.
-        assert_eq!(render_ms(-1), "not measured yet");
-        assert_eq!(render_ms(180), "180 ms");
-        assert_eq!(render_ms(2900), "2.9 s");
         // render_count: sentinel = honest "?", never a fabricated zero;
         // big measured counts get thousands separators (commandment 6).
         assert_eq!(render_count(-1), "?");

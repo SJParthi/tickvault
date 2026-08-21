@@ -78,10 +78,6 @@ pub const SCOREBOARD_UNAVAILABLE_SENTINEL: i64 = -1;
 /// rule 6) ⇒ sub-second lag is unmeasurable; healthy p99 reads ~1-2s.
 pub const LAG_FLOOR_MS_DHAN: i64 = 1000;
 
-/// Groww lag measurement floor: `tsInMillis` is true milliseconds (the
-/// receipt clock is the sidecar callback capture — one hop downstream).
-pub const LAG_FLOOR_MS_GROWW: i64 = 1;
-
 /// TrueData lag measurement floor: the v2.6 binary tick carries a whole-second
 /// `Timestamp(i32)` (precision UNVERIFIED-LIVE per the scope lock), so sub-second
 /// lag is unmeasurable and the floor is 1000ms (Dhan-class). Feed #4, operator
@@ -755,7 +751,6 @@ mod tests {
         // (≥1s floor); Groww tsInMillis is true-ms; -1 = never a
         // fabricated zero (Rule 11).
         assert_eq!(LAG_FLOOR_MS_DHAN, 1000);
-        assert_eq!(LAG_FLOOR_MS_GROWW, 1);
         assert_eq!(SCOREBOARD_UNAVAILABLE_SENTINEL, -1);
         assert_eq!(SCOREBOARD_SESSION_MINUTES, 375);
     }

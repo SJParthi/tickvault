@@ -15,7 +15,6 @@ use tickvault_common::moneyness::{
 };
 
 use super::executor::SpotTarget;
-use super::schedule::CycleSlots;
 use crate::pipeline::chain_snapshot::{
     ChainMoneynessSnapshot, ChainUnderlying, load_chain_snapshot,
 };

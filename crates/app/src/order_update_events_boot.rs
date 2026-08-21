@@ -25,8 +25,6 @@
 //! - **Cold path.** A handful of events per session; no tick-path
 //!   involvement anywhere.
 
-use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -35,9 +33,7 @@ use tickvault_common::broker_order_events::{
     ORDER_UPDATE_EVENTS_CHANNEL_CAPACITY, OrderUpdateEventRecord, PositionUpdateEventRecord,
 };
 use tickvault_common::config::{OrderUpdateEventsConfig, QuestDbConfig};
-use tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64;
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::feed::Feed;
 use tickvault_storage::order_update_events_persistence::{
     OrderUpdateEventsWriter, ensure_order_update_events_table,
 };
@@ -45,14 +41,10 @@ use tickvault_storage::position_update_events_persistence::{
     PositionUpdateEventsWriter, ensure_position_update_events_table,
 };
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Supervisor respawn backoff (the house 5s).
 const CONSUMER_RESPAWN_BACKOFF_SECS: u64 = 5;
-
-/// The record builders' honest "unresolvable" security-id sentinel
-/// (`broker_order_events.rs`: "`-1` ONLY when unresolvable").
-const UNRESOLVED_SECURITY_ID: i64 = -1;
 
 /// Bounded + sanitized broker identity for LOG interpolation (the
 /// `order_runtime.rs::log_safe_id` house pattern) — strips control/BiDi
@@ -127,14 +119,6 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
 // ---------------------------------------------------------------------------
 // Best-effort Groww security-id resolution (review round 1 Fix 5 — hostile #1)
 // ---------------------------------------------------------------------------
-
-/// Today's IST date (`YYYY-MM-DD`) — the watch-file naming key.
-fn today_ist_date_string() -> String {
-    (chrono::Utc::now() + chrono::TimeDelta::seconds(IST_UTC_OFFSET_SECONDS_I64))
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string()
-}
 
 /// Append + flush one ORDER capture record (cold path, per-record flush —
 /// a handful of events per session). Failures are coded + counted; a
@@ -250,7 +234,7 @@ async fn run_order_update_events_consumer(
                 }
             }, if order_open => {
                 match record {
-                    Some(mut r) => {
+                    Some(r) => {
                         persist_order_record(&mut order_writer, &r);
                     }
                     None => order_open = false,
@@ -263,7 +247,7 @@ async fn run_order_update_events_consumer(
                 }
             }, if position_open => {
                 match record {
-                    Some(mut r) => {
+                    Some(r) => {
                         persist_position_record(&mut position_writer, &r);
                     }
                     None => position_open = false,

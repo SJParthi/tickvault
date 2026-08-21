@@ -740,7 +740,6 @@ async fn run_expiry_resolution_loop<C, D>(
                     Feed::Dhan,
                     today,
                     paged[Feed::Dhan.index()],
-                    deps.notifier.as_ref(),
                 )
                 .await;
             }
@@ -918,7 +917,6 @@ async fn resolve_broker_expiries<C, E>(
     broker: Feed,
     today: NaiveDate,
     paged_row: [bool; ChainUnderlying::COUNT],
-    notifier: Option<&Arc<crate::notification::NotificationService>>,
 ) -> [bool; ChainUnderlying::COUNT]
 where
     C: CadenceClock,
@@ -1452,7 +1450,6 @@ where
                     completion,
                     &mut cycle,
                     latch,
-                    &tx,
                 );
             }
             () = tokio::time::sleep(sleep_dur) => {
@@ -2060,7 +2057,6 @@ fn handle_completion<C, D>(
     completion: Completion,
     cycle: &mut CycleState,
     latch: &mut DecisionLatch,
-    tx: &mpsc::Sender<Completion>,
 ) where
     C: CadenceClock,
     D: CadenceExecutor + 'static,
@@ -2198,7 +2194,6 @@ fn handle_completion<C, D>(
                         // first-write-wins on completion; never a
                         // concurrent duplicate — the original already
                         // completed).
-                        let mut deferred_fallback = false;
                         // `fetch_failed` = the rule-file definition: a
                         // non-Empty failure AFTER the retry budget (Dhan:
                         // no retry admitted; Groww: the fallback attempt
@@ -2381,7 +2376,6 @@ fn handle_completion<C, D>(
                         // L3 (2026-07-15): the DEFERRED per-leg fallback
                         // for an in-flight-skipped SPOT leg — see the
                         // chain arm above.
-                        let mut deferred_fallback = false;
                         let terminal = match lane_feed {
                             Feed::Dhan => !retry_scheduled,
                             // TrueData is a live-tick feed, never a cadence lane.
@@ -2732,21 +2726,6 @@ fn resolution_token(late_retry_attempts: u32) -> &'static str {
     } else {
         "native_first_try"
     }
-}
-
-/// ITEM 5: resolve today's day-locked expiry per chain underlying for a
-/// history re-pull - FRESH from the injected resolver at spawn time (the
-/// scheduler NEVER guesses; `None` = unresolved, the re-pull skips that
-/// chain leg).
-fn repull_chain_expiries(
-    resolver: &dyn ExpiryResolver,
-    feed: Feed,
-    ist_date: NaiveDate,
-) -> Vec<(ChainUnderlying, Option<u32>)> {
-    ChainUnderlying::ALL
-        .iter()
-        .map(|u| (*u, resolver.resolved_expiry(feed, *u, ist_date)))
-        .collect()
 }
 
 /// Cutoff handling: one final finalize attempt, else HONEST-SKIP with

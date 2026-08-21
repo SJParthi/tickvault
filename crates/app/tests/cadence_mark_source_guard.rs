@@ -91,108 +91,6 @@ fn scan_region(rel: &str) -> String {
 }
 
 #[test]
-fn test_groww_cadence_executor_forwards_marks_after_persist_confirm() {
-    let scan = scan_region("src/groww_cadence_executor.rs");
-
-    // EXACTLY TWO forward sites (the 1-tap-per-seam discipline of
-    // order_runtime_spawn_site_guard::ratchet_groww_rest_leg_mark_taps_pinned
-    // applied to the cadence producer; widened 1 → 2 on 2026-07-18 for
-    // the chain seam): a THIRD site would mean a non-own-fire arm
-    // started producing marks (the stale-price class).
-    let forwards = scan.matches(".mark_forward(").count();
-    assert_eq!(
-        forwards, 2,
-        "groww_cadence_executor.rs production region must forward marks at \
-         EXACTLY TWO sites (the spot persist-confirm seam + the chain \
-         persist-confirm seam — 2026-07-18 deliberate widening) — found \
-         {forwards}; fewer re-opens the PR #1624 producer-less mark \
-         channel class (paper fills + P&L marks silently dead), more \
-         means a non-own-fire arm started producing marks (the \
-         stale-price class)"
-    );
-
-    // Option-gate pin: the tap must be a no-op when [order_runtime] is off.
-    assert!(
-        scan.contains("if let Some(forwarder) = self.mark_forwarder.as_ref()"),
-        "groww_cadence_executor.rs lost the Option-gate on the mark forward \
-         — the tap must be a no-op when [order_runtime] is disabled"
-    );
-
-    // Source-order pin: persist (append) → flush ACK → heartbeat → fold
-    // handoff → mark forward. First occurrences all live in the spot
-    // fetch; a mark forwarded BEFORE the flush ACK would reference a
-    // price the audit record does not back.
-    let needles = [
-        "writer.append_row(&row)",
-        "flush_off_worker(|| writer.flush())",
-        "if flush_ok {",
-        "metrics::gauge!(\"tv_rest_1m_fire_heartbeat\")",
-        "send_confirmed_bars(",
-        ".mark_forward(",
-    ];
-    let mut last = 0usize;
-    for needle in needles {
-        let at = scan.find(needle).unwrap_or_else(|| {
-            panic!("groww_cadence_executor.rs production region lost `{needle}`")
-        });
-        assert!(
-            at > last,
-            "ordering violated: `{needle}` at byte {at} must come after the \
-             previous needle (byte {last}) — the persist → flush-ACK → \
-             heartbeat → fold → mark contract"
-        );
-        last = at;
-    }
-}
-
-#[test]
-fn test_groww_cadence_chain_seam_forwards_resolved_marks_after_flush_ack() {
-    // Item 3 (2026-07-18): the CHAIN mark tap. Ordering pin scoped to the
-    // fetch_chain region (sliced from the chain writer's own
-    // `append_row_ext(` anchor so the SPOT seam's needles can never
-    // vacuously satisfy it): persist append → flush → the
-    // persist-gated Option-gate → mark forward.
-    let scan = scan_region("src/groww_cadence_executor.rs");
-    let chain_at = scan
-        .find(".append_row_ext(")
-        .expect("groww_cadence_executor.rs lost the chain writer append_row_ext anchor");
-    let chain_region = &scan[chain_at..];
-    let needles = [
-        "flush_off_worker(|| writer.flush())",
-        "if !persist_failed && let Some(forwarder) = self.mark_forwarder.as_ref()",
-        ".mark_forward(",
-    ];
-    let mut last = 0usize;
-    for needle in needles {
-        let at = chain_region.find(needle).unwrap_or_else(|| {
-            panic!("groww_cadence_executor.rs chain-seam region lost `{needle}`")
-        });
-        assert!(
-            at > last,
-            "chain-seam ordering violated: `{needle}` at byte {at} must come \
-             after the previous needle (byte {last}) — the persist → \
-             flush-ACK → mark contract"
-        );
-        last = at;
-    }
-    // Identity discipline: REAL exchange_token ids via the day-cached
-    // master-derived index (never a synthetic id), unresolved legs
-    // COUNTED (never guessed), and the index built OFF the chain fire's
-    // critical path (piggybacked on the expiry-list master download).
-    for needle in [
-        "resolve_groww_contract_books(",
-        "build_contract_mark_index(",
-        "tv_cadence_option_mark_unresolved_total",
-    ] {
-        assert!(
-            scan.contains(needle),
-            "groww_cadence_executor.rs production region lost `{needle}` — \
-             the chain mark tap's real-identity/counted-unresolved contract"
-        );
-    }
-}
-
-#[test]
 fn test_dhan_cadence_executor_is_now_the_mark_producer() {
     // INVERTED 2026-08-21. This test previously asserted the OPPOSITE --
     // that `dhan_cadence_executor.rs` must never mention a mark tap -- on
@@ -243,33 +141,32 @@ fn test_main_threads_forwarder_into_cadence_boot() {
 }
 
 #[test]
-fn test_cadence_boot_passes_forwarder_to_dhan_executor_only() {
+fn test_cadence_boot_passes_the_forwarder_to_the_sole_executor() {
     // INVERTED 2026-08-21 alongside the test above -- same reason, same
     // surviving invariant: exactly ONE executor may receive the tap. The
     // direction flipped when Groww was ordered removed; "only one" did not.
+    //
+    // With one executor left, "only one" can no longer be checked by
+    // proving a SECOND executor lacks the tap -- there is no second
+    // executor to point at. What is still checkable, and is what the
+    // failure mode actually needs, is that the sole executor DOES receive
+    // it: without the tap the paper book and risk engine run unmarked with
+    // no error anywhere. The "never two" half now lives only in
+    // mark_source_single_id_space_guard.rs, and that is a real reduction in
+    // coverage rather than a relocation -- a future second executor added
+    // here with its own tap would not fail this test.
     let scan = scan_region("src/cadence_boot.rs");
     let dhan_at = scan
         .find("DhanCadenceExecutor::new(")
         .expect("cadence_boot.rs lost DhanCadenceExecutor::new(");
-    let groww_at = scan
-        .find("GrowwCadenceExecutor::new(")
-        .expect("cadence_boot.rs lost GrowwCadenceExecutor::new(");
-
-    let dhan_window = &scan[dhan_at..groww_at];
+    let dhan_window = &scan[dhan_at..];
+    let dhan_window = &dhan_window[..dhan_window
+        .find("leg_identity_index")
+        .unwrap_or(dhan_window.len())];
     assert!(
         dhan_window.contains("mark_forwarder"),
         "cadence_boot.rs must pass the mark tap into DhanCadenceExecutor::new -- \
          it is the sole live mark producer"
-    );
-
-    let groww_window = &scan[groww_at..];
-    let groww_window = &groww_window[..groww_window
-        .find("leg_identity_index")
-        .unwrap_or(groww_window.len())];
-    assert!(
-        !groww_window.contains("mark_forwarder"),
-        "the Groww executor must NOT receive the mark tap -- two marking brokers \
-         file one instrument under two keys, and nothing reports it"
     );
 }
 

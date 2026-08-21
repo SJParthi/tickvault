@@ -160,19 +160,6 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
     }
 }
 
-/// IST seconds-of-day → 12-hour clock text ("9:16 AM"). Pure.
-fn format_secs_of_day_12h(secs_of_day: u32) -> String {
-    let h24 = (secs_of_day / 3_600) % 24;
-    let m = (secs_of_day / 60) % 60;
-    let (h12, half) = match h24 {
-        0 => (12, "AM"),
-        1..=11 => (h24, "AM"),
-        12 => (12, "PM"),
-        _ => (h24 - 12, "PM"),
-    };
-    format!("{h12}:{m:02} {half}")
-}
-
 /// Resident memory of this process in bytes; `None` on hosts without procfs.
 fn read_proc_rss_bytes() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/self/status").ok()?;

@@ -1333,7 +1333,6 @@ fn feed_ordinal(feed: Feed) -> u8 {
     match feed {
         Feed::Dhan => 0,
         Feed::Truedata => 1,
-        Feed::Truedata => 2,
     }
 }
 
@@ -3743,28 +3742,25 @@ mod tests {
     #[test]
     fn test_fold_slots_same_security_id_across_feeds_get_separate_slots() {
         // (b, feed half) The 2026-06-28 feed-in-key override: a Dhan row and
-        // a Groww row for the same instrument are DISTINCT rows, so they
-        // need distinct fold slots too.
+        // another feed's row for the same instrument are DISTINCT rows, so
+        // they need distinct fold slots too.
         let mut slots = FoldSlots::new();
         slots.slot_mut(Feed::Dhan, 13, 0).expect("dhan slot");
-        slots.slot_mut(Feed::Truedata, 13, 0).expect("groww slot");
         slots
             .slot_mut(Feed::Truedata, 13, 0)
             .expect("truedata slot");
-        assert_eq!(slots.len(), 3, "same (id, segment), three feeds => 3 slots");
+        assert_eq!(slots.len(), 2, "same (id, segment), two feeds => 2 slots");
 
         let dhan = slots.lookup(Feed::Dhan, 13, 0).expect("dhan");
-        let groww = slots.lookup(Feed::Truedata, 13, 0).expect("groww");
         let truedata = slots.lookup(Feed::Truedata, 13, 0).expect("truedata");
-        assert!(dhan != groww && groww != truedata && dhan != truedata);
+        assert!(dhan != truedata);
         assert_eq!(slots[dhan].engine.feed, Feed::Dhan);
-        assert_eq!(slots[groww].engine.feed, Feed::Truedata);
         assert_eq!(slots[truedata].engine.feed, Feed::Truedata);
 
         // Re-resolving an existing identity must REUSE its slot, never push.
         slots.slot_mut(Feed::Dhan, 13, 0).expect("reuse");
         slots.slot_mut(Feed::Truedata, 13, 0).expect("reuse");
-        assert_eq!(slots.len(), 3, "known identities must not grow the table");
+        assert_eq!(slots.len(), 2, "known identities must not grow the table");
     }
 
     #[test]

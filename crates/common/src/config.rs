@@ -3297,12 +3297,10 @@ impl ApplicationConfig {
         // must not be this invariant's only wall.) Fail-closed at the
         // root: cadence + ANY legacy leg of the same broker is refused,
         // whatever the feed flags say.
-        if self.cadence.enabled {
-            if self.spot_1m_rest.enabled || self.option_chain_1m.enabled {
-                bail!(
-                    "cadence.enabled requires the legacy Dhan per-minute legs to stand down first: set [spot_1m_rest].enabled = false and [option_chain_1m].enabled = false (no double demand on the Dhan Data-API budget is ever legal — coordinator ruling B, 2026-07-16; keyed on the leg configs alone since RS3, regardless of feeds.dhan_enabled)"
-                );
-            }
+        if self.cadence.enabled && (self.spot_1m_rest.enabled || self.option_chain_1m.enabled) {
+            bail!(
+                "cadence.enabled requires the legacy Dhan per-minute legs to stand down first: set [spot_1m_rest].enabled = false and [option_chain_1m].enabled = false (no double demand on the Dhan Data-API budget is ever legal — coordinator ruling B, 2026-07-16; keyed on the leg configs alone since RS3, regardless of feeds.dhan_enabled)"
+            );
         }
 
         // 2026-07-16 REST-era candle derivation: the boot catch-up window

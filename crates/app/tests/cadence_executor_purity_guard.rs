@@ -19,10 +19,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-const EXECUTOR_FILES: [&str; 2] = [
-    "src/dhan_cadence_executor.rs",
-    "src/groww_cadence_executor.rs",
-];
+const EXECUTOR_FILES: [&str; 1] = ["src/dhan_cadence_executor.rs"];
 
 /// Forbidden needles in the (comment-stripped) executor sources.
 /// `record_chain_moneyness_observability` is a legitimate NON-gate call,
@@ -171,10 +168,10 @@ fn test_contains_call_identifier_boundary_self_check() {
     ));
     // Match at position 0 matches.
     assert!(contains_call("chain_fetch_once(x)", "chain_fetch_once("));
-    // A longer-identifier suffix does NOT match (the Groww executor's
-    // legal limiter-free `groww_chain_fetch_once(`).
+    // A longer-identifier PREFIX does NOT match — the boundary check is
+    // what keeps a legal `<prefix>_chain_fetch_once(` out of the ban.
     assert!(!contains_call(
-        "groww_chain_fetch_once(client, url)",
+        "inner_chain_fetch_once(client, url)",
         "chain_fetch_once("
     ));
     // The `*_unpaced` inner never matches the paced needle (different

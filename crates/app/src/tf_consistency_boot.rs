@@ -3443,10 +3443,12 @@ mod tests {
             .expect("the M3 once-per-pass emission block must exist");
         assert!(loop_start < post_loop);
         let loop_region = &body[loop_start..post_loop];
+        // `tv_tf_verify_tail_unsealed_total` left this list on 2026-08-21:
+        // the tail carve-out it counted only ever applied to the retired
+        // feed's structurally-unsealed session tails.
         for counter in [
             "tv_tf_verify_buckets_compared_total",
             "tv_tf_verify_bucket_gap_total",
-            "tv_tf_verify_tail_unsealed_total",
         ] {
             assert!(
                 !loop_region.contains(counter),

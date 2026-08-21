@@ -3510,9 +3510,6 @@ pub const CADENCE_NATIVE_RETRY_MAX_ATTEMPTS: usize = 6;
 /// wins; at the deadline the pre-prepared cross-fill fires with no extra wait.
 pub const CADENCE_DECISION_DEADLINE_MS: i64 = 4_000;
 
-/// Background history re-pull offsets (post-cross-fill repair of the degraded
-/// broker's OWN rows; history-repair only, never a decision input).
-
 /// HTTP keep-alive knobs for the cadence Dhan REST client (hedge plan item 4).
 /// The pool idle timeout MUST exceed the 60 s cadence period, or every minute's
 /// volley pays a fresh TCP+TLS handshake (measured 2026-07-20: Dhan cycles
