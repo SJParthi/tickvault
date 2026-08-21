@@ -2454,7 +2454,7 @@ impl NotificationEvent {
             Self::DualFeedDailyScorecard {
                 trading_date_ist,
                 dhan,
-                session_minutes: _,
+                session_minutes,
                 partial_coverage,
                 degraded,
                 early_run,
@@ -2473,12 +2473,33 @@ impl NotificationEvent {
                 // stays in the day's stored records and the portal.
                 let caveat =
                     *partial_coverage || *degraded || *restart_partial || *rest_legs_read_failed;
-                // The cross-feed verdict was REMOVED with the Groww lane
-                // 2026-08-21 — one feed is not a contest.
+                // The cross-feed CONTEST verdict was removed with the second
+                // broker on 2026-08-21 — one feed cannot win against nobody.
+                // What replaces it is not "one-feed day", which was a
+                // non-statement that rendered a green tick whether the feed
+                // covered five minutes or the whole session. The verdict now
+                // reports the feed's OWN day: how many session minutes it
+                // delivered, which is the number an operator actually needs.
                 let (verdict_emoji, verdict_sentence) = if *dhan_feed_off {
                     ("\u{2139}\u{fe0f}", "feed OFF today".to_string())
+                } else if dhan.exclusive_minutes < 0 || *session_minutes == 0 {
+                    // Unmeasured is NEVER rendered as a clean day.
+                    (
+                        "\u{26a0}\u{fe0f}",
+                        "coverage not measured today".to_string(),
+                    )
                 } else {
-                    ("\u{2705}", "one-feed day".to_string())
+                    let covered = dhan.exclusive_minutes;
+                    let total = i64::from(*session_minutes);
+                    let emoji = if covered >= total {
+                        "\u{2705}"
+                    } else {
+                        "\u{26a0}\u{fe0f}"
+                    };
+                    (
+                        emoji,
+                        format!("delivered {covered} of {total} session minutes"),
+                    )
                 };
                 // A caveat day renders the warning emoji up front — the
                 // verdict sentence itself is unchanged (still ONE decision).
@@ -7251,7 +7272,7 @@ mod tests {
         }
     }
 
-    fn scorecard(dhan: FeedScoreLine, groww: FeedScoreLine) -> NotificationEvent {
+    fn scorecard(dhan: FeedScoreLine) -> NotificationEvent {
         NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan,
@@ -7285,7 +7306,7 @@ mod tests {
 
     #[test]
     fn test_dual_feed_scorecard_topic_severity_policy() {
-        let ev = scorecard(score_line("Dhan"), score_line("Groww"));
+        let ev = scorecard(score_line("Dhan"));
         assert_eq!(ev.topic(), "DualFeedDailyScorecard");
         assert_eq!(ev.severity(), Severity::Info);
         // The once-per-day 15:45 digest must arrive AT 15:45 — post-close is
@@ -7293,102 +7314,83 @@ mod tests {
         // (CrossVerify1mSummary precedent).
         assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
     }
-
     #[test]
-    fn test_dual_feed_scorecard_body_verdict_first_ladder() {
-        // Rung 1: exclusive (solo) minutes decide — and the verdict is the
-        // FIRST line of the body (2026-07-15 redesign).
-        let mut groww = score_line("Groww");
-        groww.exclusive_minutes = 63;
-        let msg = scorecard(score_line("Dhan"), groww).to_message();
-        let first = msg.lines().next().unwrap_or_default();
+    fn test_dual_feed_scorecard_verdict_reports_this_feed_s_own_coverage() {
+        // The four-rung CONTEST ladder (solo minutes, then p99 delay, then
+        // broker blame, then "even day") was removed with the second broker
+        // on 2026-08-21 — a contest needs two entrants.
+        //
+        // What replaced it is deliberately NOT the "one-feed day" placeholder
+        // that briefly stood here: that rendered a green tick whether the
+        // feed had delivered five minutes or the whole session, which is the
+        // false-OK class this repo has retired repeatedly. The verdict now
+        // reports the feed's OWN coverage, and only a full session is green.
+        let mut d = score_line("Dhan");
+        d.exclusive_minutes = 375;
+        let msg = scorecard(d).to_message();
         assert_eq!(
-            first,
-            "\u{1f3c6} <b>Feed scorecard 3:45 PM \u{b7} 10 Jul</b> \u{2014} Groww won today \
-                 (63 vs 14 solo minutes).",
-            "rung-1 verdict-first line wrong: {msg}"
+            msg.lines().next().unwrap_or_default(),
+            "\u{2705} <b>Feed scorecard 3:45 PM \u{b7} 10 Jul</b> \u{2014} \
+             delivered 375 of 375 session minutes",
+            "a full session is the only green verdict: {msg}"
         );
-        // Rung 2: tied solo minutes → measured worst-1% delay decides
-        // (delta 2160 ms > the 1000 ms clock floor).
+
+        // A PARTIAL day must not read green.
         let mut d = score_line("Dhan");
-        let mut g = score_line("Groww");
-        d.lag_p99_ms = 2900;
-        g.lag_p99_ms = 740;
-        let msg = scorecard(d, g).to_message();
+        d.exclusive_minutes = 200;
+        let msg = scorecard(d).to_message();
+        let first = msg.lines().next().unwrap_or_default();
         assert!(
-            msg.lines()
-                .next()
-                .unwrap_or_default()
-                .contains("Groww won today (faster prices beyond the clock floor"),
-            "rung-2 verdict wrong: {msg}"
+            first.starts_with('\u{26a0}'),
+            "a partial day must carry the warning emoji: {msg}"
         );
-        // Rung-2 clock-floor guard (PR-C review round 1, 2026-07-11): a
-        // sub-floor delta is Dhan's whole-second quantization, not speed —
-        // 1400 vs 700 (delta 700 ≤ 1000) must NOT declare a lag winner.
+        assert!(
+            first.contains("delivered 200 of 375 session minutes"),
+            "the verdict must name the real numbers: {msg}"
+        );
+
+        // UNMEASURED must never render as a clean day, and must never leak
+        // the -1 sentinel into operator-facing text.
         let mut d = score_line("Dhan");
-        let mut g = score_line("Groww");
-        d.lag_p99_ms = 1400;
-        g.lag_p99_ms = 700;
-        let msg = scorecard(d, g).to_message();
+        d.exclusive_minutes = -1;
+        let msg = scorecard(d).to_message();
+        let first = msg.lines().next().unwrap_or_default();
         assert!(
-            !msg.contains("faster prices"),
-            "a sub-floor p99 delta must never decide the delay rung: {msg}"
+            first.contains("coverage not measured today"),
+            "unmeasured coverage must say so: {msg}"
         );
         assert!(
-            msg.contains("even day."),
-            "sub-floor delta falls through the ladder: {msg}"
-        );
-        // The floor const must stay lockstep with the persisted Dhan
-        // lag_floor_ms value (LAG_FLOOR_MS_DHAN = 1000 in
-        // tickvault-storage — core cannot import it; both pin 1000).
-        assert_eq!(VERDICT_LAG_CLOCK_FLOOR_MS, 1000);
-        // Rung 3: a −1 lag sentinel never decides; broker blame does.
-        let mut d = score_line("Dhan");
-        let g = score_line("Groww"); // lag -1 both sides
-        d.blame_broker = 5;
-        let msg = scorecard(d, g).to_message();
-        assert!(
-            msg.lines()
-                .next()
-                .unwrap_or_default()
-                .contains("Groww won today (fewer broker-caused incidents: 2 vs 5)."),
-            "rung-3 verdict wrong: {msg}"
-        );
-        // Rung 3 skip (hostile review 2026-07-10): a −1 blame sentinel must
-        // never win the incidents rung nor render "-1" — falls to even day.
-        let mut d = score_line("Dhan");
-        let g = score_line("Groww");
-        d.blame_broker = -1; // drops_market still >= 0
-        let msg = scorecard(d, g).to_message();
-        assert!(
-            msg.contains("even day."),
-            "a -1 blame sentinel must not decide rung 3: {msg}"
+            first.starts_with('\u{26a0}'),
+            "and must not read green: {msg}"
         );
         assert!(
             !msg.contains("-1"),
-            "the -1 sentinel must never render anywhere: {msg}"
+            "the -1 sentinel must never render: {msg}"
         );
-        // Rung 4: identical evidence → even day.
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
-        assert!(msg.contains("even day."), "{msg}");
+
+        // A feed switched OFF is an info day, not a failure.
+        let mut ev = scorecard(score_line("Dhan"));
+        if let NotificationEvent::DualFeedDailyScorecard { dhan_feed_off, .. } = &mut ev {
+            *dhan_feed_off = true;
+        }
+        assert!(
+            ev.to_message().contains("feed OFF today"),
+            "a switched-off feed reads as OFF, never as a coverage failure"
+        );
     }
 
     #[test]
-    fn test_dual_feed_scorecard_feed_lines_are_code_wrapped_and_aligned() {
+    fn test_dual_feed_scorecard_feed_line_is_code_wrapped() {
+        // The name padding this once asserted existed to align two feeds
+        // in monospace; with one feed there is nothing to align against,
+        // so the name renders unpadded. The <code> wrapper stays — it is
+        // what keeps the stat line monospaced on the phone.
         let mut d = score_line("Dhan");
-        let mut g = score_line("Groww");
         d.lag_p99_ms = 1400;
-        g.lag_p99_ms = 400;
-        let msg = scorecard(d, g).to_message();
-        // One <code>-wrapped stat line per feed, names padded to equal
-        // width ("Dhan " vs "Groww") so the columns align in monospace.
+        let msg = scorecard(d).to_message();
         assert!(
-            msg.contains("<code>Dhan : 1.84M ticks \u{b7} delay 1.4s \u{b7} drops 3</code>"),
-            "aligned Dhan line wrong: {msg}"
-        );
-        assert!(
-            msg.contains("<code>Groww: 1.84M ticks \u{b7} delay 0.4s \u{b7} drops 3</code>"),
-            "aligned Groww line wrong: {msg}"
+            msg.contains("<code>Dhan: 1.84M ticks \u{b7} delay 1.4s \u{b7} drops 3</code>"),
+            "feed stat line wrong: {msg}"
         );
         // Big tick counts render compact (1.84M), never a raw integer wall.
         assert!(!msg.contains("1842551"), "{msg}");
@@ -7398,7 +7400,7 @@ mod tests {
     fn test_dual_feed_scorecard_sentinels_are_omitted_never_rendered() {
         // Default fixture: lag is -1 on both sides — the delay segment is
         // simply OMITTED (2026-07-15: never "?", never "not measured").
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        let msg = scorecard(score_line("Dhan")).to_message();
         assert!(
             !msg.contains("delay"),
             "unmeasured delay must be omitted: {msg}"
@@ -7406,42 +7408,36 @@ mod tests {
         assert!(!msg.contains("not measured"), "{msg}");
         assert!(!msg.contains('?'), "{msg}");
         // A wholly-unmeasured feed renders ONE honest line — not silence.
-        let msg = scorecard(score_line("Dhan"), sentinel_line("Groww")).to_message();
+        let msg = scorecard(sentinel_line("Dhan")).to_message();
         assert!(
-            msg.contains("Groww: no numbers recorded today \u{26a0}\u{fe0f}"),
+            msg.contains("Dhan: no numbers recorded today \u{26a0}\u{fe0f}"),
             "wholly-unmeasured feed must render the honest line: {msg}"
         );
-        assert!(!msg.contains("<code>Groww"), "{msg}");
+        assert!(!msg.contains("<code>Dhan"), "{msg}");
     }
-
     #[test]
     fn test_dual_feed_scorecard_incidents_line_only_when_nonzero() {
         // Fixture blame: broker 2 / ours 0 / unclear 1 → the line renders
         // with the non-zero split only.
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        let msg = scorecard(score_line("Dhan")).to_message();
         assert!(
-            msg.contains(
-                "Incidents: Dhan 3 (broker 2 / unclear 1) | Groww 3 (broker 2 / unclear 1)"
-            ),
+            msg.contains("Incidents: Dhan 3 (broker 2 / unclear 1)"),
             "incidents line wrong: {msg}"
         );
         // Zero-incident day: the line is absent entirely.
         let mut d = score_line("Dhan");
-        let mut g = score_line("Groww");
-        for f in [&mut d, &mut g] {
-            f.blame_broker = 0;
-            f.blame_ours = 0;
-            f.blame_unclear = 0;
-        }
-        let msg = scorecard(d, g).to_message();
+        d.blame_broker = 0;
+        d.blame_ours = 0;
+        d.blame_unclear = 0;
+        let msg = scorecard(d).to_message();
         assert!(!msg.contains("Incidents:"), "{msg}");
         // Stall / restart counts ride the segment when positive.
-        let mut g = score_line("Groww");
-        g.stalls = 1;
-        g.restarts = 2;
-        let msg = scorecard(score_line("Dhan"), g).to_message();
+        let mut d = score_line("Dhan");
+        d.stalls = 1;
+        d.restarts = 2;
+        let msg = scorecard(d).to_message();
         assert!(
-            msg.contains("Groww 3 (broker 2 / unclear 1) \u{b7} stalls 1 \u{b7} restarts 2"),
+            msg.contains("Dhan 3 (broker 2 / unclear 1) \u{b7} stalls 1 \u{b7} restarts 2"),
             "stall/restart segment wrong: {msg}"
         );
     }
@@ -7477,7 +7473,7 @@ mod tests {
             assert!(msg.starts_with("\u{26a0}\u{fe0f}"), "{msg}");
         }
         // A clean day carries NO caveat and no warning header.
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        let msg = scorecard(score_line("Dhan")).to_message();
         assert!(!msg.contains("Counts are a floor"), "{msg}");
     }
 
@@ -7504,46 +7500,17 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_feed_scorecard_feed_off_single_line_no_contest() {
-        // Round-4 semantics kept (2026-07-15 re-render): a switched-off
-        // feed is a one-horse race — line 1 says "-only day", the OFF feed
-        // renders exactly ONE line, and no winner is ever declared.
-        let mut g = score_line("Groww");
-        g.ticks = 0;
-        g.exclusive_minutes = 0;
-        g.streaming_minutes = 0;
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-10".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs: vec![],
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        let first = msg.lines().next().unwrap_or_default();
-        assert_eq!(
-            first,
-            "\u{1f4ca} <b>Feed scorecard 3:45 PM \u{b7} 10 Jul</b> \u{2014} Dhan-only day."
-        );
-        assert!(
-            msg.contains("Groww: OFF today (excluded from verdict)"),
-            "feed-off single line missing: {msg}"
-        );
-        assert!(!msg.contains("won today"), "{msg}");
-        assert!(
-            !msg.contains("<code>Groww"),
-            "an OFF feed must not render a stat line: {msg}"
-        );
-        // Both feeds off — "no contest" appears ONLY on line 1.
+    fn test_dual_feed_scorecard_feed_off_renders_one_honest_line() {
+        // This once asserted the one-horse-race semantics of a two-feed
+        // card ("Dhan-only day", the OFF feed reduced to a single line, no
+        // winner declared). With one feed there is no race, so what remains
+        // worth pinning is narrower and still load-bearing: a switched-off
+        // feed reads as OFF — never as a coverage failure, and never as a
+        // wall of zeros that looks like a dead feed.
         let mut d = score_line("Dhan");
         d.ticks = 0;
-        let mut g = score_line("Groww");
-        g.ticks = 0;
+        d.exclusive_minutes = 0;
+        d.streaming_minutes = 0;
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan: d,
@@ -7557,15 +7524,24 @@ mod tests {
             rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
-        let first = msg.lines().next().unwrap_or_default();
         assert!(
-            first.contains("both feeds were off today, no contest."),
-            "{msg}"
+            msg.lines()
+                .next()
+                .unwrap_or_default()
+                .contains("feed OFF today"),
+            "an OFF feed must say so on line 1: {msg}"
         );
-        let rest: String = msg.lines().skip(1).collect::<Vec<_>>().join("\n");
         assert!(
-            !rest.contains("no contest"),
-            "no-contest wording may appear ONLY in line 1: {msg}"
+            msg.contains("Dhan: OFF today (excluded from verdict)"),
+            "feed-off single line missing: {msg}"
+        );
+        assert!(
+            !msg.contains("<code>Dhan"),
+            "an OFF feed must not render a stat line: {msg}"
+        );
+        assert!(
+            !msg.contains("delivered 0 of 375"),
+            "an OFF day must never be reported as zero coverage: {msg}"
         );
     }
 
@@ -7654,19 +7630,14 @@ mod tests {
                 ..rest_line("Dhan", "spot candles")
             },
             RestLegScoreLine {
-                ok_fetches: 700,
-                failed_fetches: 33,
-                named_gaps: 2,
-                pre_boot_gaps: 0,
-                ..rest_line("Groww", "spot candles")
-            },
-            RestLegScoreLine {
                 ok_fetches: 33,
                 failed_fetches: 2,
-                ..rest_line("Groww", "option chain")
+                named_gaps: 2,
+                pre_boot_gaps: 0,
+                ..rest_line("Dhan", "option chain")
             },
             // All-sentinel leg: contributes nothing, fabricates nothing.
-            rest_line("Groww", "option contracts"),
+            rest_line("Dhan", "option contracts"),
         ];
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-13".to_string(),
@@ -7682,20 +7653,16 @@ mod tests {
         };
         let msg = ev.to_message();
         assert!(
-            msg.contains("pulls spot 735/735 \u{2705}"),
-            "clean pulls segment wrong: {msg}"
-        );
-        assert!(
             msg.contains(
-                "pulls spot 700/733, chain 33/35 \u{26a0}\u{fe0f}; 2 never recovered \u{26a0}\u{fe0f}"
+                "pulls spot 735/735, chain 33/35 \u{26a0}\u{fe0f}; 2 never recovered \u{26a0}\u{fe0f}"
             ),
-            "degraded pulls segment wrong: {msg}"
+            "pulls segment wrong: {msg}"
         );
         // The retired per-leg digest section must never come back.
         assert!(!msg.contains("Official minute candles"), "{msg}");
         assert!(!msg.contains("after close"), "{msg}");
         // An empty rest_legs vec omits the pulls segment entirely.
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        let msg = scorecard(score_line("Dhan")).to_message();
         assert!(!msg.contains("pulls"), "{msg}");
     }
 
@@ -7809,7 +7776,7 @@ mod tests {
         );
         // All-sentinel legs (nothing measured) still render nothing —
         // the honest suppress-on-phone arm is unchanged.
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        let msg = scorecard(score_line("Dhan")).to_message();
         assert!(!msg.contains("pulls"), "{msg}");
     }
 
@@ -7840,13 +7807,27 @@ mod tests {
             ),
             "OFF line must carry the unreadable token on a read-failed day: {msg}"
         );
-        let groww_line = msg
+        // The MEASURED shape carries the same token on its stat line.
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-14".to_string(),
+            dhan: score_line("Dhan"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: true,
+        };
+        let measured = ev.to_message();
+        let feed_line = measured
             .lines()
-            .find(|l| l.contains("<code>Groww"))
+            .find(|l| l.contains("<code>Dhan"))
             .unwrap_or_default();
         assert!(
-            groww_line.contains("pulls: records unreadable \u{26a0}\u{fe0f}"),
-            "the measured feed line must carry the unreadable token too: {msg}"
+            feed_line.contains("pulls: records unreadable \u{26a0}\u{fe0f}"),
+            "the measured feed line must carry the unreadable token too: {measured}"
         );
         // The shared floor caveat still rides along (read-failed is a
         // caveat class), and the line budget holds.
@@ -7909,7 +7890,7 @@ mod tests {
 
     #[test]
     fn test_dual_feed_scorecard_body_obeys_telegram_commandments() {
-        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        let msg = scorecard(score_line("Dhan")).to_message();
         assert!(msg.contains("3:45 PM"), "IST 12-hour time: {msg}");
         for banned in ["data/", "QuestDB", "ILP", "DEDUP", ".rs", "SQL"] {
             assert!(

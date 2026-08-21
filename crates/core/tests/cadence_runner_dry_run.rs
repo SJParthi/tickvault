@@ -924,7 +924,6 @@ async fn test_cadence_runner_expiry_boot_phase_resolves_and_stamps() {
         Some(20_260_730),
         "BANKNIFTY = the nearest active month's LAST date, never flat min"
     );
-    assert!(!nifty.disagreement, "identical broker lists never disagree");
     // Every chain request carries the store's winning stamp.
     // APPROVED (test-only): poisoned mutex propagates the panic.
     #[allow(clippy::unwrap_used)]
@@ -953,75 +952,6 @@ async fn test_cadence_runner_expiry_boot_phase_resolves_and_stamps() {
             .any(|c| matches!(c, RecordedCall::Chain { .. })),
         "the cycle must have fired chains"
     );
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_cadence_runner_expiry_disagreement_dhan_wins_both_lanes() {
-    // The DISAGREEMENT arm (operator spec 2026-07-15): both brokers
-    // resolve, dates differ ⇒ Dhan WINS for keying BOTH lanes; the store
-    // records both raws + the disagreement verdict (the edge-latched
-    // CADENCE-01 `expiry_disagreement` fires once — asserted here via
-    // the store's latch, the log side is the tag-guard's domain).
-    fn expiry_list(req: &ExpiryListRequest) -> Result<Vec<u32>, CadenceFetchError> {
-        match req.broker {
-            Feed::Dhan => Ok(vec![20_260_716]),
-            Feed::Truedata => Ok(vec![20_260_717]),
-            Feed::Truedata => unreachable!("cadence has no TrueData lane"),
-        }
-    }
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let exec = Arc::new(RecordingExecutor {
-        log: Arc::clone(&log),
-        start: tokio::time::Instant::now(),
-        chain_verdict: empty_chain,
-        spot_verdict: empty_spot,
-        expiry_verdict: expiry_list,
-    });
-    let shutdown = Arc::new(Notify::new());
-    let store = Arc::new(DayLockedExpiryStore::new());
-    let config = CadenceConfig::default();
-    let gates = test_gates(&config);
-    let deps = CadenceRunnerDeps {
-        config,
-        calendar: test_calendar(),
-        dhan_executor: Arc::clone(&exec),
-        dhan_enabled: Arc::new(AtomicBool::new(true)),
-        expiry_resolver: Arc::clone(&store) as Arc<dyn ExpiryResolver>,
-        expiry_store: Some(Arc::clone(&store)),
-        gates,
-        dry_run: false,
-        notifier: None,
-        shutdown: Arc::clone(&shutdown),
-    };
-    let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
-    let clock = Arc::new(TestClock {
-        anchor: tokio::time::Instant::now(),
-        base_wall_ms: BASE_WALL_MS,
-        date,
-    });
-    let task = tokio::spawn(run_cadence_loop(clock, deps));
-    for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    shutdown.notify_waiters();
-    let exit = tokio::time::timeout(std::time::Duration::from_secs(120), task)
-        .await
-        .expect("runner must exit after shutdown")
-        .expect("runner task must not panic");
-    assert_eq!(exit, LoopExit::Shutdown);
-
-    let view = store.view(date, ChainUnderlying::Nifty);
-    assert_eq!(view.dhan_raw.map(|d| d.yyyymmdd()), Some(20_260_716));
-    assert_eq!(
-        view.winner.map(|d| d.yyyymmdd()),
-        Some(20_260_716),
-        "Dhan WINS the disagreement"
-    );
-    assert!(view.disagreement, "the disagreement verdict is recorded");
-    // BOTH lanes' chain requests are keyed on the DHAN date.
-    // APPROVED (test-only): poisoned mutex propagates the panic.
-    #[allow(clippy::unwrap_used)]
-    let calls = log.lock().unwrap().clone();
 }
 
 // ---------------------------------------------------------------------------
