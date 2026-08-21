@@ -4370,6 +4370,13 @@ async fn attach_depth_when_available(
                  above never reached the wire and carries NO data for the rest of this \
                  session."
             );
+            // The counter, not just the log. Gated on the half that actually
+            // failed: contracts reaching the wire while only depth stayed dark
+            // is a DEPTH failure, and paging it as a contract failure would
+            // teach the operator to distrust the alarm.
+            if !contracts_done {
+                crate::dhan_contract_universe::record_contract_give_up();
+            }
             return;
         }
 
@@ -4392,6 +4399,14 @@ async fn attach_depth_when_available(
                  contract artifact. If `attempts` is small, this app started late — the chain \
                  leg publishes from 09:16 IST and cannot have run before the app did."
             );
+            // Same gate as the hard-stop arm above. Reaching here means
+            // NEITHER half ever yielded instruments, so contracts are
+            // necessarily incomplete -- checked anyway rather than assumed,
+            // because a later edit to the give-up predicate would otherwise
+            // silently turn this into a false page.
+            if !contracts_done {
+                crate::dhan_contract_universe::record_contract_give_up();
+            }
             return;
         }
         // Re-derived every attempt, never hoisted: this task can outlive an
