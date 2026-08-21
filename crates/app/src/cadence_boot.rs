@@ -178,18 +178,13 @@ pub fn spawn_cadence_scheduler(
                 &questdb,
             )
             .await;
-            tickvault_storage::cross_fill_audit_persistence::ensure_cross_fill_audit_table(
-                &questdb,
-            )
-            .await;
         }));
     }
     // 2026-07-17 (review fix S7): the legacy 15:33:30 IST post-session
     // repair sweep died with the leg loops — without it a cadence
     // per-minute miss is a PERMANENT spot_1m_rest gap. One-shot Dhan-lane
     // sweep task reusing the legacy sweep body + PACED fetch (post-session
-    // — limiter pacing is fine). Groww residual: the Groww sweep needs the
-    // leg's target resolution + token cache; not wired here.
+    // — limiter pacing is fine).
     if config.cadence.dhan_lane {
         drop(tokio::spawn(
             crate::spot_1m_rest_boot::run_cadence_post_session_sweep(
@@ -199,16 +194,6 @@ pub fn spawn_cadence_scheduler(
             ),
         ));
     }
-    // Cross-fill visibility (operator 2026-07-20): install the audit sink +
-    // consumer BEFORE the runner spawns (no emit can race the install), and
-    // arm the 15:47 IST daily digest. Both best-effort, never on the
-    // decision path — see crates/app/src/cross_fill_visibility.rs.
-    crate::cross_fill_visibility::spawn_cross_fill_audit_consumer(config.questdb.clone());
-    crate::cross_fill_visibility::spawn_cross_fill_digest(
-        Arc::clone(trading_calendar),
-        config.questdb.clone(),
-        Arc::clone(notifier),
-    );
     let shutdown = Arc::new(Notify::new());
     // Park the handle for the teardown path (F2, 2026-07-15).
     drop(CADENCE_SHUTDOWN.set(Arc::clone(&shutdown)));

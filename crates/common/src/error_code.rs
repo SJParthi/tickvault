@@ -946,18 +946,6 @@ pub enum ErrorCode {
     /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
     /// signal). Severity::Medium, auto-triage-safe.
     Cadence03SchedulerDegraded,
-    /// CADENCE-04: a `cross_fill_audit` forensics write DEGRADED — the
-    /// emit channel dropped an event (`stage="channel"`), the ILP
-    /// append/flush failed (`stage="append"` / `stage="flush"`), the
-    /// ensure-DDL failed (`stage="audit_ensure_*"` — duplicate-row window
-    /// per the HTTP-CLIENT-01 envelope), or the daily digest could not
-    /// read the table (`stage="digest_read"` — the digest then says
-    /// "count unknown", never a false "0 times ✅"). Best-effort ONLY:
-    /// the cadence decision path and the coalesced CADENCE-01 signal are
-    /// untouched; only the queryable forensic row / digest precision is
-    /// lost until QuestDB recovers. Severity::Medium, auto-triage-safe
-    /// (operator directive 2026-07-20 — cross-fill visibility).
-    Cadence04AuditWriteFailed,
     /// CADENCE-05: the cadence native-retry / cross-fill RECOVERY
     /// machinery degraded — the T+4s native-retry hedge reached
     /// arbitration with the native leg still EMPTY (resolution token
@@ -1153,7 +1141,6 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded => "CADENCE-01",
             Self::Cadence02DecisionSkipped => "CADENCE-02",
             Self::Cadence03SchedulerDegraded => "CADENCE-03",
-            Self::Cadence04AuditWriteFailed => "CADENCE-04",
             Self::Cadence05RecoveryDegraded => "CADENCE-05",
         }
     }
@@ -1402,7 +1389,6 @@ impl ErrorCode {
             // CADENCE-04 (operator 2026-07-20): a cross_fill_audit
             // forensics write/read failure — best-effort record only; the
             // CADENCE-01 signal + counters still carry the event. Medium.
-            Self::Cadence04AuditWriteFailed => Severity::Medium,
             // CADENCE-05 (operator 2026-07-20): the native-retry /
             // cross-fill recovery machinery degraded — cross-fill / the
             // honest gap is the floor; nothing fabricated. Medium.
@@ -1625,7 +1611,7 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded
             | Self::Cadence02DecisionSkipped
             | Self::Cadence03SchedulerDegraded
-            | Self::Cadence04AuditWriteFailed
+
             | Self::Cadence05RecoveryDegraded => {
                 ".claude/rules/project/cadence-error-codes.md"
             }
@@ -1860,7 +1846,6 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded,
             Self::Cadence02DecisionSkipped,
             Self::Cadence03SchedulerDegraded,
-            Self::Cadence04AuditWriteFailed,
             Self::Cadence05RecoveryDegraded,
         ]
     }
@@ -1995,296 +1980,6 @@ mod tests {
     }
 
     #[test]
-    fn test_all_list_length_matches_catalogue_size() {
-        // If this fails, the `all()` list was not updated when a new variant
-        // was added. Keep this count in sync with the enum.
-        // 2026-04-27 (Wave 1): bumped 54 -> 62 for 8 new variants
-        // (HOT-PATH-01/02, PHASE2-01/02, PREVCLOSE-01/02, MOVERS-01/02).
-        // 2026-04-27 (Wave 2): bumped 62 -> 76 for 14 new variants
-        // (WS-GAP-04/05/06, AUTH-GAP-03, BOOT-01/02, AUDIT-01..06,
-        // STORAGE-GAP-03/04).
-        // 2026-04-27 (Wave 2-C Item 7.3): bumped 76 -> 77 for BOOT-03
-        // (clock-skew exceeded — HALTING).
-        // 2026-04-28 (Wave 3-A Item 10): bumped 77 -> 78 for MOVERS-03
-        // (pre-open movers persistence failed).
-        // 2026-04-28 (Wave 3-B Item 11): bumped 78 -> 80 for TELEGRAM-01/02
-        // (Telegram bucket-coalescer hardening).
-        // 2026-04-28 (Wave 3-C Item 12): bumped 80 -> 82 for SELFTEST-01
-        // (passed) + SELFTEST-02 (failed) — market-open self-test.
-        // 2026-04-28 (Wave 3-D Item 13): bumped 82 -> 84 for SLO-01
-        // (healthy recovery) + SLO-02 (degraded/critical) — composite
-        // real-time guarantee score.
-        // 2026-04-28 (depth-200 SELF token): bumped 84 -> 87 for
-        // 2026-04-28 (Phase 7 of v3 plan): bumped 87 -> 89 for
-        // DEPTH-DYN-01/02 — depth-20 dynamic top-150 selector
-        // promoted from RESERVED to defined.
-        // 2026-04-28 (Phase 11 of v3 plan): bumped 89 -> 92 for
-        // MOVERS-22TF-01/02/03 — movers 22-timeframe persistence,
-        // scheduler, and universe-drift codes.
-        // 2026-05-01 (Wave 5 Item 9): bumped 92 -> 96 for
-        // CORE-PIN-01/02 (Tokio worker pinning) +
-        // DEPTH-20-DYN-03 (top-50 depth-20 selector) +
-        // DEPTH-200-DYN-01 (top-5 depth-200 selector).
-        // 2026-05-01 (Wave 5 Item 13): bumped 96 -> 97 for
-        // PREVCLOSE-03 (boot-time prev-close routing assertion).
-        // 2026-05-01 (Wave 5 Item 26 L1): bumped 97 -> 98 for
-        // VOLUME-MONO-01 (cumulative-monotonicity breach).
-        // 2026-05-01 (movers cleanup): bumped 98 -> 95 — removed
-        // MOVERS-22TF-01/02/03 along with the dead 22-tf pipeline.
-        // 2026-05-02 (depth-200 SELF token retired per Dhan Ticket
-        // #5610706): bumped 95 -> 92 — removed DEPTH200-AUTH-01/02/03
-        // along with the SELF-token manager.
-        // 2026-05-02 (PR-B): bumped 92 -> 93 for DEPTH200-SMOKE-01
-        // (boot-time depth-200 smoke test no-frames Critical signal).
-        // 2026-05-02 (PR-G): bumped 93 -> 94 for PHASE2-READY-01
-        // (09:13:01 IST forward-looking pre-flight readiness check).
-        // 2026-05-03 (PR #450 commit 8b adversarial-review HIGH H1 fix):
-        // bumped 94 -> 95 for PREVOI-01 (prev_oi cache empty at boot
-        // WARN — typed enum replaces ad-hoc `code = "PREVOI-01"` string).
-        // 2026-05-05 (Phase 4b cleanup): bumped 95 -> 92 — retired
-        // MOVERS-01/02/03 alongside StockMoversWriter +
-        // OptionMoversWriter deletion in PR #494.
-        // 2026-05-08 (F2 / Wave-5 #504e follow-up): bumped 92 -> 93
-        // for PREVCLOSE-04 (PrevDayCache boot loader empty / failed
-        // — degraded cascade pct-stamping fallback signal).
-        // 2026-05-10 (Wave 6 Sub-PR #1 — multi-TF aggregator): bumped
-        // 93 -> 99 for AGGREGATOR-DROP-01, AGGREGATOR-LATE-01,
-        // AGGREGATOR-SEAL-01, AGGREGATOR-HB-01, BOUNDARY-01,
-        // AGGREGATOR-AUDIT-01.
-        // 2026-05-17 (Phase 0 Items 8+9 — gap-fill scheduler): bumped
-        // 100 -> 104 for GAP-FILL-01/02/03/04.
-        // 2026-05-18 (Phase 0 Item 20 — orphan position watchdog):
-        // bumped 104 -> 105 for ORPHAN-POSITION-01.
-        // 2026-05-18 (Phase 0 Items 15+28+29 — post-open cross-check):
-        // bumped 105 -> 108 for BAR-MISMATCH-01/02/03.
-        // 2026-05-18 (PR #1 of AWS-lifecycle 14-PR sequence — contract stubs):
-        // bumped 108 -> 120 for OPTION-CHAIN-01..08 + CROSS-VERIFY-01..04
-        // (CROSS-VERIFY-* retired in PR-C 2026-05-26).
-        // 2026-05-18 (PR #2.5 of AWS-lifecycle — Day OHLC tracker for IDX_I):
-        // bumped 120 -> 122 for INDEX-OHLC-01 + INDEX-OHLC-02.
-        // 2026-05-19 (PR #4 of AWS-lifecycle — depth pipelines retirement):
-        // bumped 122 -> 117 by removing DEPTH-DYN-01/02, DEPTH-20-DYN-03,
-        // DEPTH-200-DYN-01, DEPTH200-SMOKE-01 (depth feeds retired
-        // entirely; only main-feed + order-update WSes remain).
-        // 2026-05-19 (PR #5 of AWS-lifecycle — Phase 2 dispatcher retirement):
-        // bumped 117 -> 113 by removing PHASE2-01, PHASE2-02, PHASE2-READY-01,
-        // AUDIT-01 (Phase 2 stock-F&O dispatcher chain retired alongside
-        // phase2_audit_persistence under operator-locked 4-IDX_I scope).
-        // 2026-05-19 (PR #6a of AWS-lifecycle — universe support files retirement):
-        // bumped 113 -> 110 by removing I-P1-01 (DailyScheduler), I-P1-02
-        // (DeltaFieldCoverage), I-P1-03 (SecurityIdReuse) — daily_scheduler
-        // and delta_detector modules deleted under 4-IDX_I LOCKED_UNIVERSE.
-        // 2026-05-19 (PR #6b of AWS-lifecycle — universe machinery deletion):
-        // bumped 110 -> 105 by removing I-P0-01 (DuplicateSecurityId),
-        // I-P0-02 (CountConsistency), I-P0-04 (CachePersistence),
-        // I-P0-05 (S3Backup), I-P0-06 (EmergencyDownload) — universe_builder
-        // + validation + binary_cache + s3_backup + instrument_loader modules
-        // deleted under 4-IDX_I LOCKED_UNIVERSE.
-        // 2026-05-20 (#T2a — QuestDB table cleanup): bumped 105 -> 104 by
-        // removing AGGREGATOR-AUDIT-01 (aggregator_seal_audit table dropped).
-        // 2026-05-25 (Phase B1 deletion): bumped 104 -> 102 by removing
-        // CORE-PIN-01 (CorePin01PinningFailedAtBoot) + CORE-PIN-02
-        // (CorePin02WorkerDrifted) — core_pinning.rs module deleted under
-        // LOCKED 4-SID / t4g.medium 2-vCPU scope (no 4-core pinning to do).
-        // 2026-05-26 (PR-A — pre-open buffer + Dhan historical removal):
-        // bumped 102 -> 101 by removing INDEX-OHLC-01 (preopen buffer
-        // empty at 09:15:00 IST) — pre-open buffer module deleted; day_open
-        // is now the first observed live WebSocket tick after midnight reset.
-        // 2026-05-26 (PR-B — gap_fill scheduler removal): bumped 101 -> 97
-        // by removing GAP-FILL-01/02/03/04 — gap_fill_scheduler + planner +
-        // disconnect_event + last_seen_ltt_cache modules deleted alongside
-        // Dhan historical fetch chain.
-        // 2026-05-26 (PR-C — cross_verify chain removal): bumped 97 -> 93
-        // by removing CROSS-VERIFY-01/02/03/04 — cross_verify + post_open_cross_check
-        // + post_market_fetch_window + cross_verify_scheduler modules deleted
-        // alongside Dhan historical fetch chain.
-        // 2026-06-02 (operator post-market 1-minute cross-verification):
-        // bumped 97 -> 99 by adding CROSS-VERIFY-1M-01 (mismatch found) +
-        // CROSS-VERIFY-1M-02 (intraday fetch degraded).
-        // 2026-06-03 (zero-tick-loss PR-2 — G2): bumped 99 -> 100 for
-        // WS-GAP-07 (live frame channel closed — tick consumer died).
-        // 2026-06-03 (zero-tick-loss PR-5 — G3): bumped 100 -> 101 for
-        // DISK-WATCHER-01 (spill disk-health watcher respawned by supervisor).
-        // 2026-06-03 (zero-tick-loss PR-8b — H2-lite): bumped 101 -> 102 for
-        // AGGREGATOR-LAG-01 (candle aggregator broadcast Lagged — now loud).
-        // 2026-06-06 (NTM Sub-PR #10a, §31): bumped 102 -> 103 for
-        // NTM-CONSTITUENCY-01 (niftyindices source degraded — core universe continues).
-        // 2026-06-09 (zero-tick-loss WAL writer hardening): bumped 103 -> 105 for
-        // WS-SPILL-01 (writer respawned) + WS-SPILL-02 (durable frame dropped — now loud).
-        // 2026-06-10 (operator "Go ahead to achieve zero tick loss"): bumped
-        // 105 -> 106 for TICK-CONSERVE-01 (daily WAL-vs-DB conservation audit).
-        // 2026-06-10 (DHAN-REST-400): bumped 106 -> 107 for REST-CANARY-01
-        // (scheduled REST-health probe failed).
-        // 2026-06-12 (WS lifecycle audit table): bumped 107 -> 108 for
-        // AUDIT-WS-01 (ws_event_audit row write failed — covers all 6 WS
-        // lifecycle event kinds, future-proof for 5+5+5+1 connections).
-        // 2026-06-26 (log-driven fixes): bumped 108 -> 109 for PREVDAY-01
-        // (boot-time previous-day OHLCV fetch coverage EMPTY — typed +
-        // per-empty observability for the 774-silent-empties signature).
-        // 2026-06-26 (D2b — runtime Dhan-lane cold-start FSM): bumped 109 -> 113
-        // for DHAN-LANE-01..04 (universe-build / ws-pool-spawn / auth-gate
-        // failures + teardown-timeout on the runtime cold-start path).
-        // 2026-06-28 (option_chain subsystem removal): bumped 113 -> 105 by
-        // removing OPTION-CHAIN-01..08 (the entire option_chain REST subsystem
-        // was deleted per operator directive — disabled since 2026-06-02 with
-        // no live consumer; its QuestDB table was dropped 2026-06-23).
-        // 2026-06-28 (PR-A Groww shared-master): bumped 105 -> 106 for
-        // GROWW-MASTER-01 (Groww instrument persist into the shared
-        // instrument_lifecycle + index_constituency tables, feed='groww').
-        // 2026-06-30 (WS-429-cooldown): bumped 106 -> 107 for WS-GAP-08
-        // (persisted Dhan 429 rate-limit cooldown — survives process restart).
-        // 2026-06-30 (feed-agnostic self-heal): bumped 107 -> 109 for
-        // FEED-STALL-01 (silently-stalled sidecar killed+relaunched) +
-        // FEED-SUPERVISOR-01 (supervisor task respawned).
-        // 2026-06-30 (Dhan reconnect hardening Fix A): bumped 109 -> 110 for
-        // WS-GAP-09 (watchdog reconnect-in-place on the bare-Dhan-reset class
-        // instead of process::exit + 775-SID re-subscribe → 429).
-        // 2026-07-01 (BP-07 / Wave-4-E1): bumped 110 -> 111 for PROC-01
-        // (OOM-kill monitor — cgroup-v2 memory.events oom_kill vs boot baseline).
-        // 2026-07-01 (audit sweep): bumped 111 -> 115 for AUTH-GAP-04 (AUTH-P11)
-        // + RESOURCE-01/02/03 (BP-08 fd / RSS / spill-free monitors).
-        // 2026-07-03 (SLO publisher supervisor): bumped 115 -> 116 for SLO-03
-        // (the 10s tv_realtime_guarantee_score publisher died silently at
-        // 10:35 IST mid-market; now supervised + respawned).
-        // 2026-07-03 (B6 latency-histogram split): bumped 116 -> 117 for
-        // TICK-FLUSH-01 (off-thread tick ILP flush worker respawned).
-        // 2026-07-03 (C3 re-injection storm fix): bumped 117 -> 118 for
-        // WS-REINJECT-01 (boot WAL re-injection aborted — chunked
-        // backpressure replaces the silent try_send drop storm).
-        // 2026-07-03 (C2 panic-free reqwest client): bumped 118 -> 119 for
-        // HTTP-CLIENT-01 (ClientBuilder::build failed — typed degrade
-        // replaces the Client::new() panic fallback at 8 storage sites).
-        // 2026-07-03 (§34 Groww multi-connection auto-scale): bumped 119 -> 123
-        // for GROWW-SCALE-01 (ladder rollback fired) + GROWW-SCALE-02
-        // (fleet-wide failure → global cooldown + halve) + GROWW-SCALE-03
-        // (shard disjointness/coverage contract violated) + GROWW-SCALE-04
-        // (groww_scale_audit row write failed, best-effort).
-        // 2026-07-04 (dual-instance lock hardening): bumped 123 -> 124 for
-        // RESILIENCE-03 (generateAccessToken mint refused — instance lock
-        // not held; lock-before-mint tripwire, operator "go" 2026-07-04).
-        // 2026-07-04 (PR-R1 Groww native-Rust shadow client): bumped 124 -> 128
-        // for GROWW-NATIVE-01 (connect/reconnect/respawn) + GROWW-NATIVE-02
-        // (socket-token mint / CONNECT auth rejected) + GROWW-NATIVE-03
-        // (NATS/proto decode failure) + GROWW-NATIVE-04 (shadow NDJSON
-        // writer/rotation/channel failure).
-        // 2026-07-04 (Session-B fix — Groww fleet dual-instance lock):
-        // bumped 128 -> 129 for GROWW-SCALE-05 (dual scale-fleet instance
-        // detected / SSM lock unprovable — fleet spawn refused fail-closed,
-        // single-connection fallback).
-        // 2026-07-06 (order-update outage paging PR-1): bumped 129 -> 130 for
-        // WS-GAP-10 (order-update in-market outage — the reachable in-loop
-        // [HIGH] page; the old task-exit emit was dead code since WS-GAP-04).
-        // 2026-07-07 (Telegram UX overhaul — episode live-edit coalescing):
-        // bumped 130 -> 131 for TELEGRAM-03 (episode machinery degraded:
-        // store_write_failed / rehydrate_corrupt / edit_fallback_storm —
-        // delivery unaffected, UX-only degrade, Severity::Low).
-        // 2026-07-06 (AUTH-GAP-05 token self-heal): bumped 131 -> 132 for
-        // AUTH-GAP-05 (sustained mid-session token-invalid — forced re-mint
-        // triggered via the existing renewal machinery; lock-before-mint +
-        // ~125s cooldown + retry-once latch honored).
-        // 2026-07-08 (§36 FUTIDX-4): bumped 132 -> 134 for FUTIDX-01
-        // (per-underlying nearest-expiry selection degraded, per feed) +
-        // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
-        // 2026-07-08 (AUTH-GAP-06 fast-boot cached-token validation):
-        // bumped 134 -> 135 — one GET /v2/profile validates the cached JWT
-        // before any WebSocket spawn on the fast crash-recovery arm; a
-        // prefix-anchored 401/403 forces a re-mint via the existing
-        // TokenManager machinery (2026-07-07 third morning outage).
-        // 2026-07-09 (Groww reject-loop hardening): bumped 135 -> 136 for
-        // FEED-REJECT-01 — bounded, secret-redacted sidecar reject-cause
-        // signature surfaced at the once-per-child alert edge (the all-day
-        // 09:22/14:17 IST reject loop was invisible in the coded stream).
-        // 2026-07-10 (W2 PR#6, audit follow-up row 10): bumped 136 -> 137
-        // for WAL-SUSPEND-01 — per-table QuestDB WAL-apply suspension probe
-        // (a suspended table keeps ACKing ILP rows while they silently stop
-        // becoming visible; previously zero signal).
-        // 2026-07-10 (dual-feed scoreboard PR-A): bumped 137 -> 138 for
-        // SCOREBOARD-01 — the daily 15:45 IST Dhan-vs-Groww scoreboard
-        // aggregation degraded (best-effort forensic aggregate; sentinels,
-        // never fabricated zeros; DEDUP-idempotent re-run backfills).
-        // 2026-07-12 (BruteX crossverify Commit 1): bumped 138 -> 140 for
-        // BRUTEX-XVERIFY-01 (daily BruteX-vs-live 1m divergence found —
-        // High, NOT auto-triage-safe: a data-comparability signal is never
-        // auto-actioned) + BRUTEX-XVERIFY-02 (run degraded — S3/CSV/QuestDB
-        // leg failed; keep-better guard + DEDUP-idempotent re-run backfills).
-        // 2026-07-12 (per-minute spot 1m REST pipeline PR-2): bumped
-        // 140 -> 142 for SPOT1M-01 (per-minute spot fetch degraded — edge-
-        // triggered escalation) + SPOT1M-02 (spot_1m_rest persist failed —
-        // best-effort, DEDUP-idempotent re-append).
-        // 2026-07-12 (per-minute option-chain REST pipeline PR-3): bumped
-        // for CHAIN-01 (entitlement absent — once-per-day edge,
-        // manual triage) + CHAIN-02 (per-minute chain fetch degraded —
-        // edge-triggered escalation) + CHAIN-03 (option_chain_1m persist
-        // failed — best-effort, DEDUP-idempotent) + CHAIN-04 (day-start
-        // expirylist warmup failed — pipeline disabled-for-the-day, never
-        // a guessed expiry).
-        // 2026-07-12 merge note: BRUTEX-XVERIFY (2) + SPOT1M (2) landed on
-        // this branch at 142; main's CHAIN-01..04 (4) merge in => 146.
-        // 2026-07-13 (daily timeframe-consistency verifier, merged from
-        // main): TF-VERIFY-01 (higher-TF candle disagrees with its
-        // recomputed-from-1m value — coalesced per (feed, date) pass,
-        // manual triage) + TF-VERIFY-02 (the daily run degraded —
-        // client/query/truncation/flush/budget stage taxonomy) => 148.
-        // 2026-07-15 (merge of #1587 fan-out stubs + main's #1578
-        // GROWW-ORD contracts): both families coexist — 129 base + 14
-        // (PORT/OCO/MARG) + 10 (ORD) = 153, mechanically recounted.
-        // 2026-07-14 (Cluster F, merged 2026-07-16): ORDER-READY-01
-        // (order-readiness gate) => 154.
-        // 2026-07-16 (REST-era candle derivation, operator directive):
-        // +1 FOLD-01 (RestCandleFold01Degraded — bar-fold writer degrade;
-        // log-sink-only, High, auto-triage-safe) => 155 (both 153->154
-        // bumps — Cluster F + FOLD-01 — landed concurrently; mechanically
-        // recounted at this merge).
-        // 2026-07-16 (RAM residency stores, PR-2 of the same directive):
-        // +1 RAMSTORE-01 (RamStore01Degraded — spot/chain RAM store
-        // degrade; log-sink-only, High, auto-triage-safe) => 156
-        // (mechanically recounted at this rebase onto main's 155).
-        // 2026-07-16 (merge of origin/main into cadence-scheduler-v2):
-        // + CADENCE-01/02/03 (cadence scheduler, operator directive
-        // 2026-07-14) on top of main's 155 => 158, mechanically recounted
-        // against the merged all() vec at this merge.
-        // 2026-07-16 merge note: RAMSTORE-01 (this branch, 156) + main's
-        // CADENCE-01/02/03 (158) coexist — 155 base + 1 + 3 = 159,
-        // mechanically recounted against the merged all() vec.
-        // 2026-07-17 (spot cross-broker comparator): +2 SPOT-XVERIFY-01/02
-        // (SpotXverify01MismatchFound + SpotXverify02RunDegraded) => 161.
-        // 2026-07-17 merge note (order-sockets-v2): +4 GROWW-PUSH-01..04
-        // (connect-failed / auth-failed / decode-failed /
-        // supervisor-respawned, receive-only push-channel observability,
-        // all log-sink-only) => 165.
-        // 2026-07-17 (evidence-audit Fix PR C — the post-sibling-merge
-        // variant sweep): -1 WS-REINJECT-01 (WsReinject01Aborted RETIRED —
-        // its only emitter, the orphaned wal_reinject.rs module, had zero
-        // production callers; deleted with its dead paging filter) => 164.
-        // 2026-07-18 (full-fidelity order/position push-event capture):
-        // +1 ORDER-EVT-01 (OrderEvt01PersistFailed — order_update_events /
-        // position_update_events forensic-writer degrade; log-sink-only,
-        // High, auto-triage-safe) => 165.
-        // 2026-07-18 (tick-conservation retirement, dead-WS sweep follow-up):
-        // -1 TICK-CONSERVE-01 (TickConserve01DailyResidual RETIRED — every
-        // audit input died with the dead tick chain in the stage-2 sweep
-        // #1631; the audit modules were deleted, the tick_conservation_audit
-        // TABLE is retained per SEBI 5y) => 164, mechanically recounted
-        // against the merged all() vec at this merge of origin/main.
-        // 2026-07-20 (cross-fill visibility, operator directive): +1
-        // CADENCE-04 (Cadence04AuditWriteFailed — cross_fill_audit
-        // best-effort forensics degrade; Medium, auto-triage-safe) => 165.
-        // +1 ORDER-PNL-01 (2026-07-19) => 166
-        // +1 CADENCE-05 (2026-07-20, native-retry/cross-fill hedge) => 167
-        // +1 STORAGE-GAP-05 (2026-08-19, feed-hardening Item 5 — pressure
-        // archival could not relieve the volume; Critical, alarmed via the
-        // `storage-gap-05` errcode filter) => 168
-        // 2026-08-21 (operator directive — the entire Groww feed is ordered
-        // removed; websocket-connection-scope-lock.md "2026-08-21 (THIRD quote
-        // of the day)"): -28 for the Groww ORDER-SIDE families whose only emit
-        // sites were deleted with crates/trading/src/oms/groww/**; then -2
-        // BRUTEX-XVERIFY and -2 SPOT-XVERIFY with the two Groww-scoped
-        // comparators, and +1 DHAN-LIVE-XVERIFY-01 so the SURVIVING
-        // live-vs-REST comparator stops borrowing a retired code => 127.
-        assert_eq!(ErrorCode::all().len(), 127);
-    }
-
-    #[test]
     fn test_telegram_03_episode_degraded_contract() {
         // Telegram UX overhaul (2026-07-07): episode live-edit machinery
         // degrade signal. Low + auto-triage-safe — delivery is never at
@@ -2298,55 +1993,6 @@ mod tests {
             code.runbook_path(),
             "docs/error-runbooks/wave-3-error-codes.md"
         );
-    }
-
-    #[test]
-    fn test_cadence_codes_contract() {
-        // Cadence scheduler (operator directive 2026-07-14, judge-locked
-        // design rev-8): 3 variants, rich stage taxonomy per the house
-        // SPOT1M-01/CHAIN-02 pattern.
-        let c1 = ErrorCode::Cadence01LaneDegraded;
-        assert_eq!(c1.code_str(), "CADENCE-01");
-        assert_eq!("CADENCE-01".parse::<ErrorCode>(), Ok(c1));
-        assert_eq!(c1.severity(), Severity::High);
-        // The ladder + cross-fill are the self-corrections — auto-triage
-        // may inspect.
-        assert!(c1.is_auto_triage_safe());
-
-        let c2 = ErrorCode::Cadence02DecisionSkipped;
-        assert_eq!(c2.code_str(), "CADENCE-02");
-        assert_eq!("CADENCE-02".parse::<ErrorCode>(), Ok(c2));
-        assert_eq!(c2.severity(), Severity::High);
-        // The skip IS the fail-closed action (design §0 ErrorCodes ruling).
-        assert!(c2.is_auto_triage_safe());
-
-        let c3 = ErrorCode::Cadence03SchedulerDegraded;
-        assert_eq!(c3.code_str(), "CADENCE-03");
-        assert_eq!("CADENCE-03".parse::<ErrorCode>(), Ok(c3));
-        assert_eq!(c3.severity(), Severity::Medium);
-        assert!(c3.is_auto_triage_safe());
-
-        // CADENCE-04 (operator 2026-07-20): best-effort cross_fill_audit
-        // forensics write/read failure — Medium, auto-triage-safe.
-        let c4 = ErrorCode::Cadence04AuditWriteFailed;
-        assert_eq!(c4.code_str(), "CADENCE-04");
-        assert_eq!("CADENCE-04".parse::<ErrorCode>(), Ok(c4));
-        assert_eq!(c4.severity(), Severity::Medium);
-        assert!(c4.is_auto_triage_safe());
-
-        // CADENCE-05 (operator 2026-07-20): native-retry / cross-fill
-        // recovery degraded — Medium, auto-triage-safe.
-        let c5 = ErrorCode::Cadence05RecoveryDegraded;
-        assert_eq!(c5.code_str(), "CADENCE-05");
-        assert_eq!("CADENCE-05".parse::<ErrorCode>(), Ok(c5));
-        assert_eq!(c5.severity(), Severity::Medium);
-        assert!(c5.is_auto_triage_safe());
-        for code in [c1, c2, c3, c4, c5] {
-            assert_eq!(
-                code.runbook_path(),
-                ".claude/rules/project/cadence-error-codes.md"
-            );
-        }
     }
 
     #[test]

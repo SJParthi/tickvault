@@ -113,7 +113,6 @@ pub mod ilp_flush_reconnect;
 /// cross-fill / Groww-fallback event with the precise minute + latency —
 /// the "every day, week, month, precisely at what time" system-of-record.
 /// See `.claude/rules/project/cadence-error-codes.md` §4 (CADENCE-04).
-pub mod cross_fill_audit_persistence;
 /// Daily 15:31 IST Dhan LIVE-vs-REST cross-verification audit (the revived
 /// Dhan live feed's ONLY ground truth — the wire carries no sequence number,
 /// so Dhan's own 1m tape is the only packet-loss proxy available). Cell-level

@@ -1025,9 +1025,6 @@ pub struct CadenceConfig {
     /// Native micro-retry hedge for 2xx-empty cadence legs (2026-07-20 directive).
     #[serde(default = "cadence_default_true")]
     pub native_retry_enabled: bool,
-    /// Post-cross-fill background history re-pull (T+30s/T+50s, repair only).
-    #[serde(default = "cadence_default_true")]
-    pub history_repull_enabled: bool,
 }
 fn cadence_default_true() -> bool {
     true
@@ -1120,7 +1117,6 @@ impl Default for CadenceConfig {
             expiry_retry_interval_ms: default_cadence_expiry_retry_interval_ms(),
             expiry_deadline_secs_of_day_ist: default_cadence_expiry_deadline_secs_of_day_ist(),
             native_retry_enabled: true,
-            history_repull_enabled: true,
         }
     }
 }
@@ -6261,10 +6257,6 @@ mod cadence_retry_flag_tests {
         assert!(
             cfg.native_retry_enabled,
             "native_retry_enabled must default ON"
-        );
-        assert!(
-            cfg.history_repull_enabled,
-            "history_repull_enabled must default ON"
         );
     }
 }

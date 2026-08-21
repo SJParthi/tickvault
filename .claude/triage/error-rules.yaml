@@ -2109,37 +2109,6 @@ rules:
       backtrace; gate_deferred_nominal is a schedule/gate consistency
       bug to file — never widen spacings as a reaction.
 
-  # CADENCE-04 = the cross_fill_audit best-effort forensics chain degraded
-  # (emit channel drop / ILP append+flush / ensure-DDL / 15:47 IST daily
-  # digest read). Escalate (not auto_fix): the cadence decision path is
-  # untouched by construction and every event is still carried by the
-  # coalesced CADENCE-01 log + the cross-fill/fallback counters — only the
-  # queryable forensic rows / digest precision for the outage window are
-  # lost; the operator checks QuestDB health (make doctor, BOOT-01/02
-  # correlation) and lets the next event / next digest re-attempt.
-  - name: cadence-04-cross-fill-audit-degraded-escalate
-    match:
-      code: CADENCE-04
-    action: escalate
-    runbook_path: .claude/rules/project/cadence-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 600
-    justification: >-
-      CADENCE-04 = cross_fill_audit forensics write/read degraded
-      (best-effort; Medium). Sustained rate = QuestDB ILP/HTTP degraded —
-      inspect via make doctor; a digest_read stage means the daily
-      Telegram honestly reported count-UNKNOWN instead of a false zero.
-      Nothing on the fetch/decision path needs repair; rows re-append
-      DEDUP-idempotently once QuestDB recovers.
-
-  # CADENCE-05 = the cadence native-retry/cross-fill recovery machinery
-  # degraded (the T+4s native-retry hedge arbitrated with the native leg
-  # still empty => cross_fill resolution, or the bounded T+30s/T+50s
-  # background history re-pull exhausted both attempts without repairing
-  # the minute). Escalate (not auto_fix): the decision minute is carried
-  # by the cross-fill leg or honestly gapped — nothing fabricated; the
-  # operator inspects the cross_fill_audit rows (vendor-side serving
-  # delay) and lets the next cycle re-attempt.
   - name: cadence-05-recovery-degraded-escalate
     match:
       code: CADENCE-05

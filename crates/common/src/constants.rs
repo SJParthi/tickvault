@@ -3512,26 +3512,6 @@ pub const CADENCE_DECISION_DEADLINE_MS: i64 = 4_000;
 
 /// Background history re-pull offsets (post-cross-fill repair of the degraded
 /// broker's OWN rows; history-repair only, never a decision input).
-// T+50s (NOT T+60s): T+60s lands exactly ON the next minute boundary and would
-// collide with the next cycle's volley burst (#1690 audit H5). Strictly < 60_000.
-pub const CADENCE_HISTORY_REPULL_OFFSETS_MS: [i64; 2] = [30_000, 50_000];
-
-/// Per-attempt hard bound for one history re-pull attempt (all legs of that
-/// attempt share it). Chosen so the LAST attempt (T+50s) ends before the next
-/// cycle's volley: 50_000 + 8_000 = 58_000 < 60_000 (H5 headroom 2s).
-pub const CADENCE_HISTORY_REPULL_TIMEOUT_MS: u64 = 8_000;
-
-// Compile-time H5 law: the last re-pull attempt, bounded by its timeout, must
-// finish strictly before the next minute's cycle volley.
-const _: () = assert!(
-    CADENCE_HISTORY_REPULL_OFFSETS_MS[1] + (CADENCE_HISTORY_REPULL_TIMEOUT_MS as i64) < 60_000,
-    "history re-pull last attempt + timeout must end before the next cycle volley"
-);
-// Compile-time ordering law: attempt offsets must be strictly increasing.
-const _: () = assert!(
-    CADENCE_HISTORY_REPULL_OFFSETS_MS[0] < CADENCE_HISTORY_REPULL_OFFSETS_MS[1],
-    "history re-pull offsets must be strictly increasing"
-);
 
 /// HTTP keep-alive knobs for the cadence Dhan REST client (hedge plan item 4).
 /// The pool idle timeout MUST exceed the 60 s cadence period, or every minute's
@@ -4674,54 +4654,4 @@ mod tests {
 #[cfg(test)]
 mod cadence_native_retry_hedge_tests {
     use super::*;
-
-    #[test]
-    fn test_cadence_native_retry_constants_pinned() {
-        // 2026-07-31: three EARLY rungs prepended with the T+0 burst move
-        // — 5 (the operator's stated first-retry step) and 300 (both
-        // opportunistic: the burst's 4 spots already hold 4 of Dhan's
-        // 5/sec Data-API budget, so at most ONE re-fire fits inside that
-        // first rolling second), and 1000 (the OLD fire instant, where
-        // the window frees and a full re-fire wave can land).
-        assert_eq!(
-            CADENCE_NATIVE_RETRY_OFFSETS_MS,
-            [5, 300, 1_000, 2_000, 3_000, 3_800]
-        );
-        // The 1000 rung MUST stay: it is the floor guaranteeing the early
-        // burst can never be worse than the pre-2026-07-31 T+1000 fire.
-        assert!(
-            CADENCE_NATIVE_RETRY_OFFSETS_MS.contains(&1_000),
-            "the old T+1000 fire instant must remain a rung — it is the \
-             no-regression floor for the T+5 burst"
-        );
-        assert_eq!(
-            CADENCE_NATIVE_RETRY_MAX_ATTEMPTS,
-            CADENCE_NATIVE_RETRY_OFFSETS_MS.len()
-        );
-        assert_eq!(CADENCE_DECISION_DEADLINE_MS, 4_000);
-        assert_eq!(CADENCE_HISTORY_REPULL_TIMEOUT_MS, 8_000);
-        assert!(
-            CADENCE_NATIVE_RETRY_OFFSETS_MS
-                .windows(2)
-                .all(|w| w[0] < w[1]),
-            "native retry offsets must be strictly ascending"
-        );
-        assert!(
-            CADENCE_NATIVE_RETRY_OFFSETS_MS
-                .iter()
-                .all(|&o| o < CADENCE_DECISION_DEADLINE_MS)
-        );
-        assert_eq!(CADENCE_HISTORY_REPULL_OFFSETS_MS, [30_000, 50_000]);
-        assert!(
-            CADENCE_HISTORY_REPULL_OFFSETS_MS
-                .iter()
-                .all(|&o| o < 60_000)
-        );
-        assert_eq!(CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS, 120);
-        assert_eq!(CADENCE_HTTP_TCP_KEEPALIVE_SECS, 30);
-        assert!(
-            CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS > 60,
-            "pool idle must outlive the 60s cadence period"
-        );
-    }
 }

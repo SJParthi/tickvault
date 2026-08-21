@@ -32,10 +32,8 @@ use tracing::{debug, error, info, warn};
 
 use super::assembly::{
     ChainCell, ChainProvenance, LaneAssembly, MoneynessFold, SpotProvenance,
-    chain_moneyness_anchor, cross_fill_freshness_floor_ms, fold_chain_cell_moneyness,
-    spots_diverge_paise,
+    chain_moneyness_anchor, fold_chain_cell_moneyness, spots_diverge_paise,
 };
-use super::audit::{CrossFillAuditEvent, emit_cross_fill_audit};
 use super::decision::{
     CadenceEvent, CadenceState, DecisionLatch, DecisionOutcome, DecisionSnapshot, SkipReason,
     emit_decision, may_decide_at_completion, next_cadence_state,
@@ -49,11 +47,10 @@ use super::expiry::{
     policy_for, resolve_policy_expiry,
 };
 use super::gate::{DhanGates, GateVerdict};
-use super::history_repull;
 use super::ladder::{
     CADENCE_DHAN_RUNG0_REENTRY_CAP_PER_DAY, DHAN_SHAPE_MAX_STEP, DhanRung0ReentryCap,
-    GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder, StreakShift,
-    failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap,
+    SPOT_CONCURRENCY_MAX_STEP, StreakLadder, StreakShift, failure_arms_ladder, may_retry_in_cycle,
+    min_spot_step_for_cap,
 };
 use super::schedule::{
     CADENCE_RETRY_LATENCY_ALLOWANCE_MS, CycleSlots, build_cycle_slots, next_joinable_boundary,
@@ -1159,7 +1156,6 @@ struct DegradeFlags {
     spot_empty: bool,
     /// A chain leg returned 2xx-without-usable-data (either lane).
     chain_empty: bool,
-    cross_fill: bool,
     chain_embedded_spot: bool,
     moneyness_unknown: bool,
     /// ADVISORY (H3/H2-partial, audit 2026-07-20): a chain body's embedded
@@ -1170,12 +1166,6 @@ struct DegradeFlags {
     /// (adversarial review): EXCLUDED from `any()`/`stages()` — advisory
     /// info-level + counter only, never a CADENCE-01 degrade stage.
     chain_spot_divergence: bool,
-    /// ADVISORY (H2-partial/M14, audit 2026-07-20): both lanes' OWN-fetch
-    /// spots for one underlying + minute diverged beyond the band —
-    /// cross-broker divergence / wrong-instrument proxy. 2026-07-20
-    /// (adversarial review): EXCLUDED from `any()`/`stages()` — advisory
-    /// info-level + counter only, never a CADENCE-01 degrade stage.
-    cross_source_spot_divergence: bool,
     /// ≥1 chain request was stamped `expiry_yyyymmdd = None` (the
     /// resolver seam is unresolved — the scheduler never guesses; the
     /// executor impl may fall back to its warmup expiry). Always set in
@@ -1190,7 +1180,6 @@ impl DegradeFlags {
             || self.queue_delay
             || self.spot_empty
             || self.chain_empty
-            || self.cross_fill
             || self.chain_embedded_spot
             || self.moneyness_unknown
             || self.expiry_unresolved
@@ -1206,7 +1195,6 @@ impl DegradeFlags {
             (self.queue_delay, "queue_delay"),
             (self.spot_empty, "spot_empty"),
             (self.chain_empty, "chain_empty"),
-            (self.cross_fill, "cross_fill"),
             (self.chain_embedded_spot, "chain_embedded_spot"),
             (self.moneyness_unknown, "moneyness_unknown"),
             (self.expiry_unresolved, "expiry_unresolved"),
@@ -1553,36 +1541,6 @@ where
             }
         }
     }
-    // ITEM 5 (E6): history_repull_enabled consumer - fire-and-forget history
-    // re-pull for cross-filled lanes (the T+30s/T+50s ladder lives in
-    // history_repull::run_history_repull; detached, never blocks the
-    // scheduler, ratcheted by cadence_history_repull_isolation_guard.rs).
-    if !deps.dry_run {
-        let dhan_cross = cycle.dhan.resolution == Some("cross_fill");
-        if deps.config.history_repull_enabled {
-            let repull_elapsed_ms = clock.ist_ms_of_day().saturating_sub(slots.boundary_ms);
-            if cycle.dhan.enabled && dhan_cross {
-                spawn_history_repull(history_repull::HistoryRepullCtx {
-                    feed: Feed::Dhan,
-                    cycle_minute_ist: cycle.dhan.asm.cycle_minute_ist,
-                    executor: Arc::clone(&deps.dhan_executor),
-                    gates: Some(Arc::clone(gates)),
-                    chain_expiries: repull_chain_expiries(
-                        deps.expiry_resolver.as_ref(),
-                        Feed::Dhan,
-                        clock.ist_date(),
-                    ),
-                    anchor: history_repull::RepullAnchor {
-                        spawn_mono_ms: clock.monotonic_ms(),
-                        spawn_epoch_ms: clock.epoch_ms(),
-                        spawn_instant: tokio::time::Instant::now(),
-                    },
-                    elapsed_in_cycle_ms: repull_elapsed_ms,
-                });
-            }
-        }
-    }
-
     // Rollover only from a lane that ran (a disabled lane parked Idle via
     // OffSessionOrDisabled — Idle + Rollover is deliberately illegal).
     if cycle.dhan.enabled {
@@ -1639,11 +1597,7 @@ fn arm_lane(lane: &mut LaneRun) {
         lane.fsm(CadenceEvent::AnchorReached);
     } else {
         lane.fsm(CadenceEvent::OffSessionOrDisabled);
-        // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
-        lane.resolution = Some(resolution_token(
-            lane.flags.cross_fill,
-            lane.late_retry_attempts,
-        ));
+        lane.resolution = Some(resolution_token(lane.late_retry_attempts));
         lane.resolved = true;
         debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
     }
@@ -1699,11 +1653,7 @@ fn drop_lane_runtime_disabled(lane: &mut LaneRun) {
          dropped (no partial emit; in-flight requests complete audit-only)"
     );
     lane.fsm(CadenceEvent::Shutdown);
-    // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
-    lane.resolution = Some(resolution_token(
-        lane.flags.cross_fill,
-        lane.late_retry_attempts,
-    ));
+    lane.resolution = Some(resolution_token(lane.late_retry_attempts));
     lane.resolved = true;
     debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
     lane.enabled = false;
@@ -2696,11 +2646,7 @@ fn decide_lane<C: CadenceClock>(
             "CADENCE-03: decision double-latch attempt refused (exactly-\
              once guard held; should-never scheduler-logic signal)"
         );
-        // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
-        lane.resolution = Some(resolution_token(
-            lane.flags.cross_fill,
-            lane.late_retry_attempts,
-        ));
+        lane.resolution = Some(resolution_token(lane.late_retry_attempts));
         lane.resolved = true;
         debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
         return;
@@ -2732,11 +2678,7 @@ fn decide_lane<C: CadenceClock>(
         },
         dry_run,
     );
-    // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
-    lane.resolution = Some(resolution_token(
-        lane.flags.cross_fill,
-        lane.late_retry_attempts,
-    ));
+    lane.resolution = Some(resolution_token(lane.late_retry_attempts));
     lane.resolved = true;
     debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
 }
@@ -2774,25 +2716,18 @@ fn native_rung_label(attempts: u32) -> &'static str {
         .unwrap_or("beyond_table")
 }
 
-/// Resolution provenance vocabulary - LOCKED: "cross_fill" |
-/// "native_late_retry" | "native_first_try" (item 3).
-fn resolution_token(cross_filled: bool, late_retry_attempts: u32) -> &'static str {
-    if cross_filled {
-        "cross_fill"
-    } else if late_retry_attempts > 0 {
+/// Resolution provenance vocabulary — LOCKED: "native_late_retry" |
+/// "native_first_try".
+///
+/// The third token, "cross_fill", was retired with the second broker on
+/// 2026-08-21: it meant "this lane's minute was filled from the other
+/// broker's same-cycle data", which one lane cannot do.
+fn resolution_token(late_retry_attempts: u32) -> &'static str {
+    if late_retry_attempts > 0 {
         "native_late_retry"
     } else {
         "native_first_try"
     }
-}
-
-/// ITEM 5: the real fire-and-forget history re-pull detachment point for a
-/// cross-filled lane - spawns `history_repull::run_history_repull` on a
-/// detached task (never blocks the scheduler; the module's isolation from
-/// assembly/decision/audit is ratcheted by
-/// `cadence_history_repull_isolation_guard.rs`).
-fn spawn_history_repull<E: CadenceExecutor + 'static>(ctx: history_repull::HistoryRepullCtx<E>) {
-    tokio::spawn(history_repull::run_history_repull(ctx));
 }
 
 /// ITEM 5: resolve today's day-locked expiry per chain underlying for a
@@ -2841,11 +2776,7 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
         SkipReason::Cutoff
     };
     if !latch.try_latch(lane.asm.feed, lane.asm.cycle_minute_ist) {
-        // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
-        lane.resolution = Some(resolution_token(
-            lane.flags.cross_fill,
-            lane.late_retry_attempts,
-        ));
+        lane.resolution = Some(resolution_token(lane.late_retry_attempts));
         lane.resolved = true;
         debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
         return;
@@ -2867,11 +2798,7 @@ fn finalize_lane_at_cutoff<C: CadenceClock>(
         },
         dry_run,
     );
-    // SEAM(#1688): resolution provenance recorded for the cross-fill audit seam.
-    lane.resolution = Some(resolution_token(
-        lane.flags.cross_fill,
-        lane.late_retry_attempts,
-    ));
+    lane.resolution = Some(resolution_token(lane.late_retry_attempts));
     lane.resolved = true;
     debug_assert!(lane.resolution.is_some(), "resolution set before resolved");
 }
@@ -2941,15 +2868,15 @@ mod tests {
         );
     }
 
-    /// 2026-07-20 (adversarial review): the two ADVISORY divergence flags
-    /// are DECOUPLED from CADENCE-01 — alone they never read as a degrade
-    /// (`any()` false, `stages()` empty), so a routine 0.5% cross-broker
-    /// divergence can never false-fire the High degrade line.
+    /// 2026-07-20 (adversarial review): the ADVISORY divergence flag is
+    /// DECOUPLED from CADENCE-01 — alone it never reads as a degrade
+    /// (`any()` false, `stages()` empty), so a routine 0.5% divergence can
+    /// never false-fire the High degrade line. (The second, cross-BROKER
+    /// divergence flag retired with the second broker on 2026-08-21.)
     #[test]
     fn divergence_flags_alone_never_degrade() {
         let flags = DegradeFlags {
             chain_spot_divergence: true,
-            cross_source_spot_divergence: true,
             ..DegradeFlags::default()
         };
         assert!(!flags.any());
@@ -2967,14 +2894,12 @@ mod tests {
         let flags = DegradeFlags {
             fetch_failed: true,
             chain_spot_divergence: true,
-            cross_source_spot_divergence: true,
             ..DegradeFlags::default()
         };
         assert!(flags.any());
         let s = flags.stages();
         assert_eq!(s, "fetch_failed");
         assert!(!s.contains("chain_spot_divergence"));
-        assert!(!s.contains("cross_source_spot_divergence"));
     }
 
     // ⚠ ORPHANED DOC — 2026-08-11. The block below documents a PHASE-B2
@@ -3096,16 +3021,6 @@ mod tests {
         assert!(src.contains("!cfg.native_retry_enabled"));
     }
 
-    /// ITEM 3: the resolution provenance vocabulary is LOCKED -
-    /// "cross_fill" | "native_late_retry" | "native_first_try".
-    #[test]
-    fn resolution_token_vocabulary_locked() {
-        assert_eq!(super::resolution_token(true, 0), "cross_fill");
-        assert_eq!(super::resolution_token(true, 3), "cross_fill");
-        assert_eq!(super::resolution_token(false, 2), "native_late_retry");
-        assert_eq!(super::resolution_token(false, 0), "native_first_try");
-    }
-
     /// ITEM 3 ratchet: LaneRun's ctor initializes the resolution token to None.
     #[test]
     fn ratchet_lane_run_ctor_initializes_resolution_none() {
@@ -3114,36 +3029,6 @@ mod tests {
         assert!(
             src.contains(needle.as_str()),
             "LaneRun ctor must initialize resolution: None"
-        );
-    }
-
-    /// ITEM 3 ratchet: the E6 history-repull consumer spawns for BOTH lanes,
-    /// gated on cross_fill resolution + history_repull_enabled + !dry_run,
-    /// and the NativeDeadline slot rides CADENCE_DECISION_DEADLINE_MS.
-    #[test]
-    fn ratchet_runner_spawns_history_repull_for_both_lanes() {
-        let src = include_str!("runner.rs");
-        let spawn = ["spawn_history_repull", "("].concat();
-        let dry_gate = ["if !deps.", "dry_run {"].concat();
-        assert!(
-            src.contains(dry_gate.as_str()),
-            "repull intent must be dry-run gated"
-        );
-        let cross = [".resolution == Some(", "\"cross_fill\")"].concat();
-        assert_eq!(
-            src.matches(cross.as_str()).count(),
-            2,
-            "repull gated on cross_fill resolution for both lanes"
-        );
-        let deadline_variant = ["CycleAction::Native", "Deadline,"].concat();
-        assert!(
-            src.contains(deadline_variant.as_str()),
-            "NativeDeadline slot must be pushed in build_cycle_events"
-        );
-        let deadline_const = ["CADENCE_DECISION_", "DEADLINE_MS"].concat();
-        assert!(
-            src.contains(deadline_const.as_str()),
-            "the chain deadline slot must ride CADENCE_DECISION_DEADLINE_MS"
         );
     }
 

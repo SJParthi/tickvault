@@ -199,7 +199,7 @@ crates/
 | `instrument_lifecycle_persistence.rs` | `instrument_lifecycle` + `instrument_lifecycle_audit` (SEBI never-delete) |
 | `order_audit_persistence.rs` | `order_audit` table — SEBI 5-year order-lifecycle forensics |
 | `order_update_events_persistence.rs` / `position_update_events_persistence.rs` | Broker order/position push events (paper mode) |
-| `order_leg_pnl_persistence.rs` / `pnl_audit_persistence.rs` / `cross_fill_audit_persistence.rs` | Order-leg P&L + P&L audit + cross-fill forensics |
+| `order_leg_pnl_persistence.rs` / `pnl_audit_persistence.rs` | Order-leg P&L + P&L audit |
 | `ws_event_audit_persistence.rs` | `ws_event_audit` table — WebSocket lifecycle audit (AUDIT-WS-01) |
 | `partition_manager.rs` / `partition_archive.rs` | QuestDB partition lifecycle + archive→verify→drop retention (S3 cold) |
 | `questdb_health.rs` | QuestDB health poller |

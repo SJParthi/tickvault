@@ -54,15 +54,6 @@ const _: () = assert!(
 /// design also uses for the Groww per-request timeout.
 pub const CADENCE_RETRY_LATENCY_ALLOWANCE_MS: i64 = 1_500;
 
-/// Cross-fill freshness floor (design §5): a foreign snapshot is valid
-/// for the borrowing lane only when fetched at/after T − this. Since the
-/// 2026-07-16 reshape ALL fires on both lanes are POST-close (Dhan burst
-/// second 1–2, Groww waves :00–:03), so every same-cycle completion
-/// trivially passes; the floor is a belt against cross-CYCLE staleness
-/// (the retired pre-close schedule needed a lender-aware widening —
-/// CADENCE-XFILL-RUNG-1, 2026-07-15 — which is retired with it).
-pub const CADENCE_CROSS_FILL_FRESHNESS_FLOOR_MS: i64 = 5_000;
-
 /// Number of Dhan chain in-cycle retry slots (≤1 per failed underlying,
 /// ≤3 total — design §1 retry row).
 pub const CADENCE_CHAIN_RETRY_SLOTS: usize = ChainUnderlying::COUNT;
@@ -634,13 +625,18 @@ mod tests {
     #[test]
     fn test_cadence_schedule_next_joinable_boundary_no_mid_cycle_join() {
         let c = cfg();
-        // All fires are POST-close (2026-07-16): the earliest fire of
-        // the 10:00:00 cycle is the Groww burst at T+0 exactly — a boot
-        // AT 10:00:00.000 must skip to 10:01:00…
+        // The earliest fire of a cycle is now the Dhan burst at
+        // T+`dhan_burst_offset_ms` (1000 ms by default). It used to be the
+        // second lane's anchor at T+0 exactly, which made a boot AT
+        // 10:00:00.000 too late to join; with that lane gone a boot at the
+        // boundary is still a full second ahead of the first fire and joins.
         let now = ms_of(10, 0, 0, 0);
+        assert_eq!(next_joinable_boundary(now, None, &c), Some(36_000));
+        // A boot AT the burst instant itself is too late — skip to 10:01.
+        let now = ms_of(10, 0, 1, 0);
         assert_eq!(next_joinable_boundary(now, None, &c), Some(36_060));
-        // …while a boot 1ms earlier still joins 10:00:00.
-        let now = ms_of(9, 59, 59, 999);
+        // A boot 1 ms before the burst still joins 10:00:00.
+        let now = ms_of(10, 0, 0, 999);
         assert_eq!(next_joinable_boundary(now, None, &c), Some(36_000));
         // No pre-close fire exists anymore: even :56 of the previous
         // minute joins the imminent boundary (the retired :55 pre-fire
