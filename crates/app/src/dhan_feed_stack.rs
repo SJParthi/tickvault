@@ -125,7 +125,7 @@ use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
 use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
 use tickvault_trading::candles::{BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Environment opt-in that must be `1` for the lane to run, on top of
 /// `[feeds] dhan_enabled`. Absent means OFF, which is the whole point.
@@ -1424,14 +1424,53 @@ impl LiveIngest {
     /// over stack locals, not a `Vec`). COLD — every
     /// [`SILENCE_SCAN_INTERVAL`], never per tick.
     pub fn scan_silence(&self, now_millis: u64) -> (u64, u64) {
+        let mut discard = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
+        let (silent, never, _) = self.scan_silence_named(now_millis, &mut discard);
+        (silent, never)
+    }
+
+    /// [`Self::scan_silence`], but it also hands back the IDENTITIES of the
+    /// quietest instruments.
+    ///
+    /// # Why a second entry point exists
+    ///
+    /// Until 2026-08-21 the silence page reported COUNTS only — "47 subscribed
+    /// instruments are quiet" — and no `security_id` was written to any log,
+    /// metric or table. The single worst offender was captured and then logged
+    /// at `debug!`, which does not reach `errors.jsonl` and therefore never
+    /// reaches CloudWatch.
+    ///
+    /// So the question an operator actually asks the morning after — *which*
+    /// instruments went silent — was unanswerable by construction. Not hard to
+    /// answer, not slow to answer: the information was computed, used to
+    /// increment a counter, and discarded. And it is the one failure with no
+    /// other evidence anywhere in the system, because a stream that never
+    /// arrives leaves nothing to count and nothing to fail to parse.
+    ///
+    /// # Why a fixed buffer rather than a `Vec`
+    ///
+    /// The caller owns the storage, so this stays allocation-free on a path
+    /// that already sweeps every tracked instrument. `WORST_SILENT_NAMED`
+    /// bounds what a single episode can write to the log: at 25,000
+    /// instruments an unbounded list would be a 25,000-line burst into the
+    /// sink, which buries the very signal it is reporting.
+    ///
+    /// Returns `(silent, never_ticked, named)` where `named` is how many
+    /// entries of `worst` were filled — never more than its length.
+    ///
+    /// # Complexity
+    /// O(n) in tracked instruments — unchanged, and inherent: "which are
+    /// silent?" is a question about all of them at once. The ranking adds a
+    /// bounded insertion into a `WORST_SILENT_NAMED`-element array per
+    /// alarm-worthy report, so it is O(n × K) with K = 8 and no allocation.
+    pub fn scan_silence_named(
+        &self,
+        now_millis: u64,
+        worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
+    ) -> (u64, u64, usize) {
         let mut silent = 0u64;
         let mut never = 0u64;
-        // Worst offender, kept for the log line so the operator gets a name
-        // and not just a count. One `Copy` key, no allocation.
-        let mut worst: Option<(
-            u64,
-            tickvault_core::pipeline::tick_gap_detector::SilenceReport,
-        )> = None;
+        let mut named = 0usize;
         self.detector.scan_silence(now_millis, |report| {
             if !report.counts_toward_alarm() {
                 return;
@@ -1455,24 +1494,21 @@ impl LiveIngest {
             if report.verdict == SilenceVerdict::NeverTicked {
                 never = never.saturating_add(1);
             }
-            if worst.is_none_or(|(w, _)| report.silent_millis > w) {
-                worst = Some((report.silent_millis, report));
-            }
+            named = rank_silent(
+                worst,
+                named,
+                SilentInstrument {
+                    security_id: report.key.0,
+                    segment: report.key.1,
+                    silent_millis: report.silent_millis,
+                    expected_millis: report.expected_millis,
+                    never_ticked: report.verdict == SilenceVerdict::NeverTicked,
+                },
+            );
         });
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
-        if let Some((_, w)) = worst {
-            debug!(
-                security_id = w.key.0,
-                segment = w.key.1.as_str(),
-                silent_millis = w.silent_millis,
-                expected_millis = w.expected_millis,
-                baseline_millis = w.baseline_millis,
-                samples = w.samples,
-                "quietest tracked instrument this scan"
-            );
-        }
-        (silent, never)
+        (silent, never, named)
     }
 
     /// Seals every bucket the watermark has moved past, mid-session.
@@ -2145,6 +2181,81 @@ pub const INSTRUMENTS_SILENT_GAUGE: &str = "tv_dhan_feed_instruments_silent";
 /// error to log. Absence against a seeded key is the only evidence.
 pub const INSTRUMENTS_NEVER_TICKED_GAUGE: &str = "tv_dhan_feed_instruments_never_ticked";
 
+/// How many silent instruments a single episode may NAME in the log.
+///
+/// The page fires once per episode behind a 30-minute cooldown, so this bounds
+/// what one episode can write. Unbounded naming at the 25,000-instrument
+/// target would be a 25,000-line burst into the sink, which buries the signal
+/// it is reporting — and the operator does not need all of them to act: a
+/// subscribe that did not take fails in groups, so the quietest handful
+/// identifies the group.
+pub const WORST_SILENT_NAMED: usize = 8;
+
+/// One named silent instrument, for the log line.
+///
+/// `Copy` and scalar-only so ranking stays allocation-free on a path that
+/// already sweeps every tracked instrument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SilentInstrument {
+    pub security_id: u64,
+    pub segment: ExchangeSegment,
+    /// How long it has been quiet.
+    pub silent_millis: u64,
+    /// The cadence it had EARNED before going quiet — the number that makes
+    /// the silence meaningful. A contract that ticks once an hour being quiet
+    /// for five minutes is not news; an index quiet for five minutes is.
+    pub expected_millis: u64,
+    /// True when it has produced nothing at all since being subscribed, which
+    /// usually means the subscribe did not take.
+    pub never_ticked: bool,
+}
+
+impl SilentInstrument {
+    /// Filler for the caller's fixed buffer. `security_id` 0 is not a real
+    /// instrument, so an unfilled slot is recognisable if one ever escapes
+    /// the `named` bound.
+    pub const EMPTY: Self = Self {
+        security_id: 0,
+        segment: ExchangeSegment::IdxI,
+        silent_millis: 0,
+        expected_millis: 0,
+        never_ticked: false,
+    };
+}
+
+/// Insert `candidate` into a descending-by-silence top-K buffer.
+///
+/// Returns the new filled length. Pure, `O(K)`, no allocation — extracted so
+/// the ordering is testable on its own rather than only reachable through a
+/// full detector sweep.
+///
+/// Ties keep the incumbent: a scan that reports many instruments at exactly
+/// the same silence (the shape a failed subscribe produces, since they all
+/// went quiet together) then names them in detector order rather than
+/// reshuffling on every equal comparison.
+#[must_use]
+pub fn rank_silent(
+    worst: &mut [SilentInstrument; WORST_SILENT_NAMED],
+    filled: usize,
+    candidate: SilentInstrument,
+) -> usize {
+    let mut pos = filled.min(WORST_SILENT_NAMED);
+    while pos > 0 && worst[pos - 1].silent_millis < candidate.silent_millis {
+        pos -= 1;
+    }
+    if pos >= WORST_SILENT_NAMED {
+        return filled.min(WORST_SILENT_NAMED);
+    }
+    let end = filled.min(WORST_SILENT_NAMED - 1);
+    let mut i = end;
+    while i > pos {
+        worst[i] = worst[i - 1];
+        i -= 1;
+    }
+    worst[pos] = candidate;
+    (filled + 1).min(WORST_SILENT_NAMED)
+}
+
 /// Gauge: observations the silence detector REFUSED because its slot table
 /// was full. Non-zero means the two gauges above describe only part of the
 /// universe while reading as though they describe all of it — the detector is
@@ -2473,6 +2584,9 @@ async fn run_frame_drain(
     // Latch for the detector-blindness report below. Once the slot table is
     // full it stays full, so this fires once per session rather than every 30s.
     let mut detector_blind_reported = false;
+    // Caller-owned storage for the named silent instruments, so the 30s scan
+    // stays allocation-free. Reused every scan; `named` bounds what is read.
+    let mut worst_silent = [SilentInstrument::EMPTY; WORST_SILENT_NAMED];
     /// Shortest gap between two RISK-GAP-03 pages, however many separate
     /// silence episodes occur inside it. See `last_silence_page` below.
     const SILENCE_PAGE_COOLDOWN_SECS: u64 = 1_800;
@@ -2789,7 +2903,8 @@ async fn run_frame_drain(
                     last_refusals = now;
                 }
 
-                let (silent, never) = ingest.scan_silence(now_millis);
+                let (silent, never, named) =
+                    ingest.scan_silence_named(now_millis, &mut worst_silent);
 
                 // The detector's own blindness, reported ONCE per episode.
                 //
@@ -2948,6 +3063,43 @@ async fn run_frame_drain(
                          arrives leaves nothing to count or fail to parse. \
                          Legitimately-sparse instruments are excluded from this count."
                     );
+                    // NAME them. The line above says how many; these say WHICH.
+                    //
+                    // Until 2026-08-21 no `security_id` reached any log, metric
+                    // or table on this path, so "which instruments went silent
+                    // yesterday?" had no answer anywhere in the system — the
+                    // information was computed, counted, and thrown away. It is
+                    // also the one failure with no other evidence: a stream
+                    // that never arrives leaves nothing to count and nothing to
+                    // fail to parse, so absence against a seeded key is all
+                    // there is.
+                    //
+                    // One line per instrument rather than one line listing
+                    // them: each is greppable by `security_id`, each carries
+                    // its own cadence context, and no line needs a formatted
+                    // collection — so this stays allocation-free. Bounded by
+                    // `named` (<= WORST_SILENT_NAMED) and by the same
+                    // once-per-episode latch as the page above.
+                    for entry in worst_silent.iter().take(named) {
+                        error!(
+                            code = ErrorCode::RiskGapTickGap.code_str(),
+                            security_id = entry.security_id,
+                            segment = entry.segment.as_str(),
+                            silent_millis = entry.silent_millis,
+                            expected_millis = entry.expected_millis,
+                            never_ticked = entry.never_ticked,
+                            "silent instrument named: quiet for {}ms against an earned cadence \
+                             of {}ms{}",
+                            entry.silent_millis,
+                            entry.expected_millis,
+                            if entry.never_ticked {
+                                " — and it has produced NOTHING since being subscribed, which \
+                                 usually means the subscribe did not take"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
                 }
             }
         }
