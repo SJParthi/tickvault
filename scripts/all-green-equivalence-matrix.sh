@@ -75,7 +75,7 @@ fi
 # omission. Adding a job that defaults to success does not change any frozen
 # expected stdout (only NON-success jobs are named in the output), so the 88
 # fixtures stand unchanged - verified by running them.
-JOBS_RECORDED=(local-runtime-block commit-lint design-first-wall deploy-lint build-and-verify test test-trading-groww-orders security-and-audit coverage-and-perf repo-guards dhat-zero-alloc loom-concurrency)
+JOBS_RECORDED=(local-runtime-block commit-lint design-first-wall deploy-lint build-and-verify test security-and-audit coverage-and-perf repo-guards dhat-zero-alloc loom-concurrency)
 
 CI_YML="${CI_YML:-.github/workflows/ci.yml}"
 mapfile -t JOBS_LIVE < <(

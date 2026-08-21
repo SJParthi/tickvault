@@ -1837,46 +1837,10 @@ async fn async_main() -> Result<()> {
             &config.order_update_events,
             &config.questdb,
         );
-    #[cfg(not(feature = "groww_orders"))]
-    // The position producer is groww_orders-only — without the feature the
-    // sender drops here (the consumer handles the closed side gracefully).
+    // The position-update producer was the Groww push channel, removed
+    // 2026-08-21 with the feed. The sender drops here; the consumer handles
+    // a closed side gracefully.
     let _ = position_update_events_tx;
-
-    // Groww order/position PUSH channel — Stage D (operator-authorized
-    // paper-mode receive-only build, 2026-07-17): the supervised
-    // NATS-over-WS push runner fanning full-fidelity order events into the
-    // bounded order_audit sink. Gated BOTH on the non-default
-    // `groww_orders` cargo feature (§39.2 Gate 2 — a default build carries
-    // no Groww order code) AND the runtime `[groww_orders]
-    // order_push_enabled` flag (Gate 1, default OFF).
-    #[cfg(feature = "groww_orders")]
-    {
-        if config.groww_orders.order_push_enabled {
-            // The ADDITIVE capture lane rides only when [order_update_events]
-            // is enabled; disabled ⇒ the push runner runs capture-free.
-            let capture = match (
-                order_update_events_tx.clone(),
-                position_update_events_tx.clone(),
-            ) {
-                (Some(orders), Some(positions)) => {
-                    tickvault_trading::oms::groww::push::order_events::GrowwPushCapture::new(
-                        orders, positions,
-                    )
-                }
-                _ => {
-                    tickvault_trading::oms::groww::push::order_events::GrowwPushCapture::disabled()
-                }
-            };
-            tickvault_app::groww_order_observability::spawn_groww_order_push(
-                &config.questdb,
-                capture,
-            );
-        } else {
-            info!(
-                "groww order push disabled (config) — receive-only order/position channel not spawned"
-            );
-        }
-    }
 
     // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
     // the conservation audit + scoreboard above (operator 2026-07-13):

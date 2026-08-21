@@ -24,23 +24,12 @@ metrics = { workspace = true }
 papaya = { workspace = true }
 parking_lot = { workspace = true }
 loom = { workspace = true, optional = true }
-# Order-push Stage B (2026-07-16): NATS-over-WS transport deps for the gated
-# `oms/groww/push` module — optional, pulled in ONLY by `groww_orders`.
-aws-lc-rs = { workspace = true, optional = true }
-tokio-tungstenite = { workspace = true, optional = true }
-# Order-push Stage C (2026-07-16): SinkExt/StreamExt for the supervised
-# runner's split WebSocket read/write halves. Already workspace-pinned
-# (0.3.32, used by tickvault-core) — optional, pulled in ONLY by
-# `groww_orders`.
-futures-util = { workspace = true, optional = true }
+# The NATS-over-WS transport deps (aws-lc-rs, tokio-tungstenite,
+# futures-util) were pulled in ONLY by the Groww order-push module and are
+# removed with it (2026-08-21). They stay workspace-pinned for other crates.
 
 [features]
 loom = ["dep:loom"]
-# Gate 2 of the Groww order-side live-fire lattice (groww-second-feed-scope
-# §39.2). NON-DEFAULT: a default build excludes the entire
-# crates/trading/src/oms/groww subtree. Order-push Stage B adds the transport
-# deps (ed25519 nkey signing + the WS client for Stage C).
-groww_orders = ["dep:aws-lc-rs", "dep:tokio-tungstenite", "dep:futures-util"]
 
 [dev-dependencies]
 # (bruteX trading-core parity oracle removed 2026-08-07 — its upstream rev was
