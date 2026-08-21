@@ -565,6 +565,185 @@ pub fn parse_depth_candidates_dataset(body: &str) -> Result<Vec<DepthCandidate>,
     Ok(out)
 }
 
+/// Build depth candidates from the DAILY CONTRACT ARTIFACT plus spot prices,
+/// instead of from the per-minute option chain.
+///
+/// # Why this exists — the constraint was historical, not real
+///
+/// Depth needs a tradeable contract's `security_id`. When this module was
+/// written on 2026-08-11 the Dhan instrument-master download was FORBIDDEN by
+/// Q3 of the 2026-07-13 amendment, so the per-minute option chain was the only
+/// authorized source of one. That is why depth waits for `option_chain_1m`.
+///
+/// Q3 was reversed the SAME DAY by the third 2026-08-11 quote, which ordered
+/// the daily master download back. This file's own header records that ("the
+/// instrument-master CSV — allowed again since the 2026-08-11 third quote")
+/// and rejected it anyway, on the grounds that it was "a whole extra parse for
+/// ids we already receive".
+///
+/// That reasoning weighed COST and ignored TIME, and time is the whole
+/// problem. The chain's ids arrive at 09:16:00 at the earliest, because the
+/// cadence leg's first boundary is compile-time asserted to that minute. The
+/// artifact's ids are on disk before 08:30. And the parse is not extra at all:
+/// `dhan_contract_universe::load_contract_universe` already reads this exact
+/// artifact every attempt, so the rows are in memory regardless.
+///
+/// The consequence of the old source is that ten of the sixteen authorized
+/// sockets cannot carry a byte until after the market has been open for a
+/// full minute — on a system whose stated requirement is that nothing is
+/// missed. Nothing about the exchange forces that; only the choice of source
+/// did.
+///
+/// # What still has to be true
+///
+/// At-the-money needs a price, and the NSE pre-open call auction settles at
+/// 09:08–09:12 and publishes an equilibrium price for every scrip. Feed that
+/// in and depth is selectable at 09:12 and on the wire before 09:15. An
+/// underlying with no price is SKIPPED, never guessed — an ATM window
+/// centred on an invented spot would subscribe the wrong strikes and look
+/// entirely healthy doing it.
+///
+/// # Not a scope change
+///
+/// No new fetch, no new endpoint, no widened universe, and nothing hardcoded:
+/// the artifact is rebuilt from the master every morning, so the contract set
+/// self-rolls at expiry exactly as the chain-sourced one did. The REJECT rows
+/// in the scope lock forbid a hardcoded expiring list and a fifth endpoint
+/// type; this is neither.
+#[must_use]
+pub fn depth_candidates_from_master(
+    rows: &[crate::dhan_contract_universe::ContractRow],
+    spot_paise: &std::collections::HashMap<String, i64>,
+    today_ymd: u32,
+) -> Vec<DepthCandidate> {
+    let mut out = Vec::new();
+    for r in rows {
+        // Options only. A future has no strike and no leg, so it can never be
+        // ranked by distance from at-the-money.
+        if r.c != "OPTIDX" && r.c != "OPTSTK" {
+            continue;
+        }
+        if r.l != "CE" && r.l != "PE" {
+            continue;
+        }
+        // An expired contract will not trade again today. The chain-sourced
+        // path gets this from its `expiry >= today` SQL predicate; here it is
+        // explicit.
+        if r.e < today_ymd {
+            continue;
+        }
+        // No price means no at-the-money. Skipping is the only honest option:
+        // a window centred on a guessed spot subscribes the wrong strikes and
+        // reports success.
+        let Some(&spot) = spot_paise.get(&r.u) else {
+            continue;
+        };
+        if spot <= 0 || r.s <= 0 {
+            continue;
+        }
+        let Some(expiry_micros) = ymd_to_epoch_micros(r.e) else {
+            continue;
+        };
+        // Rupees on both sides, matching the chain-sourced builder. Only the
+        // DIFFERENCE decides the ranking, so a consistent unit is what
+        // matters — but mixing paise and rupees across the two sources would
+        // produce a plausible, wrong window rather than an error.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "strike and spot in paise are far below f64's exact-integer range; \
+                      the chain-sourced path carries the same f64 and they must agree"
+        )]
+        out.push(DepthCandidate {
+            underlying: r.u.clone(),
+            contract_security_id: i64::try_from(r.i).unwrap_or(0),
+            expiry_micros,
+            strike: r.s as f64 / 100.0,
+            spot: spot as f64 / 100.0,
+            leg: r.l.clone(),
+        });
+    }
+    out
+}
+
+/// `YYYYMMDD` to epoch micros at UTC midnight.
+///
+/// The selector uses this only to keep the nearest expiry per underlying, so
+/// a consistent monotonic mapping is what it needs; a real timestamp is
+/// produced anyway so the field never becomes a number that means nothing.
+#[must_use]
+pub fn ymd_to_epoch_micros(ymd: u32) -> Option<i64> {
+    let (y, m, d) = (ymd / 10_000, (ymd / 100) % 100, ymd % 100);
+    let date = chrono::NaiveDate::from_ymd_opt(i32::try_from(y).ok()?, m, d)?;
+    Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros())
+}
+
+/// Select depth from the daily contract artifact — available before 08:30 —
+/// rather than from the option chain, which cannot publish before 09:16:00.
+///
+/// Returns `None` when the artifact is unreadable or yields no candidate, so
+/// the caller falls back to the chain-sourced path. A fallback rather than a
+/// hard failure because the artifact is written by a separate daily rider: if
+/// that rider had a bad morning, late depth beats no depth.
+///
+/// # Errors
+///
+/// None — every failure degrades to `None` and is logged with its reason.
+// TEST-EXEMPT: async composition of read_contract_artifact + fetch_spot_prices + depth_candidates_from_master + select_depth_universe, each separately tested.
+pub async fn load_depth_universe_from_master(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    date_ist: &str,
+    today_ymd: u32,
+) -> Option<DepthSelection> {
+    let rows = match crate::dhan_contract_universe::read_contract_artifact(date_ist) {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(
+                code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                %err,
+                "depth: contract artifact unreadable, falling back to the option chain \
+                 (which cannot publish before 09:16 IST)"
+            );
+            return None;
+        }
+    };
+    let prices = crate::dhan_contract_universe::fetch_spot_prices(questdb, {
+        // Same day bound the contract path uses; the artifact rows are
+        // already today's by filename.
+        crate::dhan_universe::ist_midnight_nanos(date_ist)
+    })
+    .await;
+    // The same symbol map the contract path reads: depth groups by underlying
+    // SYMBOL, and the spot prices come back keyed on (security_id, segment).
+    let mapping_path = crate::dhan_universe::mapping_artifact_path(date_ist);
+    let symbols = std::fs::read_to_string(&mapping_path)
+        .map_err(|e| e.to_string())
+        .and_then(|b| crate::dhan_contract_universe::parse_symbol_map(&b))
+        .unwrap_or_default();
+    let spot = crate::dhan_contract_universe::spot_paise_by_symbol(&symbols, &prices);
+    if spot.is_empty() {
+        // Pre-open has not settled yet (or the feed is not delivering). This
+        // is the NORMAL state before ~09:08 and must not be an error.
+        tracing::debug!("depth: no underlying priced yet — nothing to centre a window on");
+        return None;
+    }
+    let candidates = depth_candidates_from_master(&rows, &spot, today_ymd);
+    if candidates.is_empty() {
+        return None;
+    }
+    let selection = select_depth_universe(&candidates);
+    if selection.depth_20.is_empty() && selection.depth_200.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        source = "contract_artifact",
+        priced_underlyings = spot.len(),
+        candidates = candidates.len(),
+        depth_20 = selection.depth_20.len(),
+        depth_200 = selection.depth_200.len(),
+        "depth universe resolved from the daily artifact — no wait for the 09:16 chain"
+    );
+    Some(selection)
+}
 /// `/exec` HTTP timeout. Matches the sibling boot readers.
 const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 
@@ -1216,5 +1395,137 @@ mod tests {
             sql.contains(&format!("expiry >= {micros}")),
             "the expiry filter must survive alongside the day bound. sql={sql}"
         );
+    }
+}
+
+#[cfg(test)]
+mod master_sourced_tests {
+    use super::*;
+    use crate::dhan_contract_universe::ContractRow;
+    use std::collections::HashMap;
+
+    fn opt(u: &str, sid: u64, strike_paise: i64, leg: &str, e: u32) -> ContractRow {
+        ContractRow {
+            i: sid,
+            x: "NSE".into(),
+            c: "OPTIDX".into(),
+            e,
+            s: strike_paise,
+            l: leg.into(),
+            u: u.into(),
+        }
+    }
+
+    fn spot(u: &str, paise: i64) -> HashMap<String, i64> {
+        let mut m = HashMap::new();
+        m.insert(u.to_string(), paise);
+        m
+    }
+
+    /// The point of the whole change: the artifact carries everything a depth
+    /// candidate needs except the price, and the price exists at 09:12.
+    #[test]
+    fn depth_candidates_from_master_needs_only_the_artifact_and_a_price() {
+        let rows = vec![
+            opt("NIFTY", 101, 2_500_000, "CE", 20_260_828),
+            opt("NIFTY", 102, 2_500_000, "PE", 20_260_828),
+        ];
+        let got = depth_candidates_from_master(&rows, &spot("NIFTY", 2_500_000), 20_260_821);
+        assert_eq!(got.len(), 2, "both legs of a priced strike are candidates");
+        assert!(
+            (got[0].strike - 25_000.0).abs() < f64::EPSILON,
+            "paise -> rupees"
+        );
+        assert!(
+            (got[0].spot - 25_000.0).abs() < f64::EPSILON,
+            "same unit on both sides"
+        );
+        assert_eq!(got[0].underlying, "NIFTY");
+        assert!(got[0].expiry_micros > 0);
+    }
+
+    /// An unpriced underlying is SKIPPED, never centred on a guess. A window
+    /// built around an invented spot subscribes the wrong strikes and reports
+    /// success doing it — the exact false-OK shape this repo forbids.
+    #[test]
+    fn an_unpriced_underlying_is_skipped_rather_than_guessed() {
+        let rows = vec![opt("RELIANCE", 201, 300_000, "CE", 20_260_828)];
+        assert!(depth_candidates_from_master(&rows, &HashMap::new(), 20_260_821).is_empty());
+    }
+
+    /// Futures have no strike and no leg, so they can never be ranked by
+    /// distance from at-the-money. Including them would put bandwidth on a
+    /// book the selector cannot order.
+    #[test]
+    fn futures_and_legless_rows_are_not_depth_candidates() {
+        let mut fut = opt("NIFTY", 301, 0, "", 20_260_828);
+        fut.c = "FUTIDX".into();
+        let rows = vec![fut];
+        assert!(
+            depth_candidates_from_master(&rows, &spot("NIFTY", 2_500_000), 20_260_821).is_empty()
+        );
+    }
+
+    /// An expired contract will not trade again today. The chain-sourced path
+    /// gets this from its SQL predicate; this path must do it explicitly or a
+    /// stale artifact would subscribe dead strikes.
+    #[test]
+    fn an_expired_contract_is_dropped() {
+        let rows = vec![opt("NIFTY", 401, 2_500_000, "CE", 20_260_820)];
+        assert!(
+            depth_candidates_from_master(&rows, &spot("NIFTY", 2_500_000), 20_260_821).is_empty()
+        );
+        // Same-day expiry is still tradeable and must survive.
+        let today = vec![opt("NIFTY", 402, 2_500_000, "CE", 20_260_821)];
+        assert_eq!(
+            depth_candidates_from_master(&today, &spot("NIFTY", 2_500_000), 20_260_821).len(),
+            1,
+            "expiry day is a trading day"
+        );
+    }
+
+    /// A zero or negative id can never be subscribed. The selector refuses it
+    /// downstream too, but a candidate list that carries it makes the refusal
+    /// counter fire for a row this builder should never have emitted.
+    #[test]
+    fn a_zero_strike_or_zero_spot_never_becomes_a_candidate() {
+        let rows = vec![opt("NIFTY", 501, 0, "CE", 20_260_828)];
+        assert!(
+            depth_candidates_from_master(&rows, &spot("NIFTY", 2_500_000), 20_260_821).is_empty()
+        );
+        let ok = vec![opt("NIFTY", 502, 2_500_000, "CE", 20_260_828)];
+        assert!(depth_candidates_from_master(&ok, &spot("NIFTY", 0), 20_260_821).is_empty());
+    }
+
+    /// The candidates must survive the real selector, not just look right.
+    /// Without this the builder could emit a shape the ranking silently
+    /// refuses, and depth would still be dark.
+    #[test]
+    fn master_sourced_candidates_are_accepted_by_the_real_selector() {
+        let mut rows = Vec::new();
+        let mut sid = 1000u64;
+        for i in 0..40i64 {
+            let strike = 2_400_000 + i * 5_000;
+            rows.push(opt("NIFTY", sid, strike, "CE", 20_260_828));
+            sid += 1;
+            rows.push(opt("NIFTY", sid, strike, "PE", 20_260_828));
+            sid += 1;
+        }
+        let cands = depth_candidates_from_master(&rows, &spot("NIFTY", 2_500_000), 20_260_821);
+        assert_eq!(cands.len(), 80);
+        let sel = select_depth_universe(&cands);
+        assert!(
+            !sel.depth_20.is_empty(),
+            "the selector must actually pick from master-sourced candidates — \
+             otherwise depth stays dark and this whole path buys nothing"
+        );
+        assert_eq!(sel.refused_zero_id, 0, "no zero ids reach the selector");
+    }
+
+    #[test]
+    fn ymd_to_epoch_micros_rejects_impossible_dates_instead_of_wrapping() {
+        assert!(ymd_to_epoch_micros(20_260_230).is_none(), "30 February");
+        assert!(ymd_to_epoch_micros(20_261_301).is_none(), "month 13");
+        assert!(ymd_to_epoch_micros(20_260_828).is_some());
     }
 }

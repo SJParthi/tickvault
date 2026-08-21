@@ -1234,8 +1234,14 @@ pub async fn load_contract_universe(
     selection
 }
 
-/// Reads today's latest price per instrument. Empty on any failure, said once.
-async fn fetch_spot_prices(
+/// Reads each underlying's LAST price today from `ticks`, keyed on the I-P1-11
+/// composite.
+///
+/// `pub` since 2026-08-21 so the depth selector can share the ONE spot fetch
+/// rather than issue a second identical query on the same 60s retry tick.
+///
+// TEST-EXEMPT: async HTTP I/O; the pure parts it composes — build_spot_price_query and parse_spot_prices — are separately tested, including the pin that the query carries no session filter.
+pub async fn fetch_spot_prices(
     questdb: &tickvault_common::config::QuestDbConfig,
     today_ist_nanos: i64,
 ) -> HashMap<(u64, u8), i64> {
