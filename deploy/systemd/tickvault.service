@@ -229,8 +229,34 @@ ProtectHome=true
 ReadWritePaths=/opt/tickvault/data /opt/tickvault/config -/var/run/docker.sock -/run/docker.sock
 PrivateTmp=true
 
-# Graceful shutdown: send SIGTERM, wait 30s, then SIGKILL.
-TimeoutStopSec=30
+# Graceful shutdown: send SIGTERM, wait, then SIGKILL.
+#
+# MEASURED AND RAISED 2026-08-21 (was 30s, which SIGKILLed the day's tail).
+# The app's shutdown path runs TWO bounded waits SEQUENTIALLY, both in
+# crates/app/src/main.rs:
+#
+#   DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = 20   (lane flush, runs first)
+#   SEAL_WRITER_SHUTDOWN_BUDGET_SECS     = 75   (final seal drain, second)
+#   worst case                           = 95s
+#
+# At 30s the seal writer could receive at most 10s of its 75s budget, and at
+# the measured ~10,200 seals/sec that drains ~102,000 of a possible 600,000
+# seals at the 25,000-instrument ceiling — the rest, INCLUDING every
+# instrument's final daily bar, died on SIGKILL. The 75s constant was sized
+# from a live drain-rate measurement on 2026-08-20 and its own comment warns
+# that "overrunning systemd's stop timeout earns a SIGKILL, which loses the
+# very tail this exists to save" — the two files had simply drifted, with
+# nothing pinning them together.
+#
+# 120 = the 95s worst case + 25s margin. Raising it is fail-SAFE: it only
+# ever grants more time, never less. The daily 17:30 IST auto-stop is
+# unaffected — a 95s shutdown completes by ~17:31:35, and the stop-verify
+# lambda does not fire until 17:45 IST.
+#
+# Pinned by crates/app/tests/shutdown_budget_fits_systemd_guard.rs — the
+# relationship, not the number: raising either app budget past this timeout
+# now fails the build.
+TimeoutStopSec=120
 KillMode=mixed
 KillSignal=SIGTERM
 
