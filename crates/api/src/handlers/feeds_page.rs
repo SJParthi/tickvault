@@ -404,6 +404,7 @@ fn render_feeds_page_html() -> String {
 /// `/api/feeds` endpoints. Ships `X-Frame-Options: SAMEORIGIN` + a CSP with
 /// `frame-ancestors 'self'` to block click-jacking (security-review). The feed rows
 /// are rendered dynamically from [`Feed::ALL`].
+// WIRING-EXEMPT: wired at crates/api/src/lib.rs as `get(handlers::feeds_page::feeds_page)`. An axum route handler is passed by REFERENCE and never called by us, so the guard's `name(` call-shape matcher cannot see it — true of every page handler here, not a dormancy claim.
 pub async fn feeds_page() -> impl IntoResponse {
     (
         [
