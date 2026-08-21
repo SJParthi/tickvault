@@ -470,10 +470,15 @@ fn free_path(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
 
 /// Decodes every fixed-size record in a staged spill file.
 /// Returns `(records, undecodable_count)`.
-fn read_staged_spill(path: &Path) -> (Vec<SerializedSeal>, usize) {
+fn read_staged_spill(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
     let Ok(file) = std::fs::File::open(path) else {
+        // `None`, NOT an empty vec. Until 2026-08-21 both arms returned
+        // `(Vec::new(), 0)`, which is indistinguishable from "read fine, found
+        // nothing" — so the caller archived the file as fully recovered and
+        // the seals inside it were lost permanently, with a success line in
+        // the boot log. The caller now refuses to archive on `None`.
         warn!(?path, "cannot open staged spill file");
-        return (Vec::new(), 0);
+        return None;
     };
     let mut reader = BufReader::new(file);
     let mut out = Vec::new();
@@ -495,15 +500,15 @@ fn read_staged_spill(path: &Path) -> (Vec<SerializedSeal>, usize) {
             None => undecodable += 1,
         }
     }
-    (out, undecodable)
+    Some((out, undecodable))
 }
 
 /// Decodes every NDJSON line in a staged DLQ file.
 /// Returns `(records, undecodable_count)`.
-fn read_staged_dlq(path: &Path) -> (Vec<SerializedSeal>, usize) {
+fn read_staged_dlq(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
     let Ok(file) = std::fs::File::open(path) else {
         warn!(?path, "cannot open staged dlq file");
-        return (Vec::new(), 0);
+        return None;
     };
     let mut out = Vec::new();
     let mut undecodable = 0usize;
@@ -520,7 +525,7 @@ fn read_staged_dlq(path: &Path) -> (Vec<SerializedSeal>, usize) {
             Err(_) => undecodable += 1,
         }
     }
-    (out, undecodable)
+    Some((out, undecodable))
 }
 
 /// Moves a confirmed file from `replaying/` to `archive/`.
@@ -609,10 +614,38 @@ pub fn drain_recovered_seals<S: SealSink>(
             outcome.files_left_pending += 1;
             continue;
         }
-        let (records, undecodable) = match staged_kind(path) {
+        // A file we could not READ is never a file we may ARCHIVE.
+        //
+        // The defect this closes (found 2026-08-21): all three unreadable
+        // paths — spill open failure, dlq open failure, and an unrecognised
+        // filename — returned an empty record vec, which is byte-identical to
+        // "read successfully, contained nothing". `file_ok` then stayed true,
+        // the record loop did not run, and `archive_staged` renamed the file
+        // out of `replaying/` into `archive/`. Boot counted `files_archived`
+        // and printed its success line. Those seals never reached QuestDB and
+        // the next boot could not retry them, because the file was no longer
+        // staged. The unrecognised-filename arm did not even log.
+        //
+        // Leaving it staged means a permanently unreadable file is reported on
+        // every boot. That is the correct trade: loud forever beats silent
+        // once, and an operator can inspect and remove a named file, whereas
+        // nobody can recover a seal that was archived as if it had landed.
+        let Some((records, undecodable)) = (match staged_kind(path) {
             Some(StagedKind::Spill) => read_staged_spill(path),
             Some(StagedKind::Dlq) => read_staged_dlq(path),
-            None => (Vec::new(), 0),
+            None => None,
+        }) else {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?path,
+                "seal recovery: staged file could not be read or classified — it is \
+                 NOT archived and stays staged for the next boot. Every seal in it is \
+                 unrecovered. Inspect the file: an unreadable one needs its permissions \
+                 or disk checked, and a file with an unrecognised name does not belong \
+                 in the staging directory at all."
+            );
+            outcome.files_left_pending += 1;
+            continue;
         };
         outcome.records_undecodable += undecodable;
         outcome.seals_recovered += records.len();
@@ -715,6 +748,96 @@ pub fn drain_recovered_seals<S: SealSink>(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// The three unreadable paths must be DISTINGUISHABLE from an empty file.
+    ///
+    /// This is the whole defect. Until 2026-08-21 an unopenable spill file, an
+    /// unopenable DLQ file, and a file whose name could not be classified all
+    /// produced an empty record vec — byte-identical to "read fine, contained
+    /// nothing". The caller then archived the file as fully recovered, so
+    /// every seal inside it was lost permanently AND could never be retried,
+    /// while boot printed its success line.
+    ///
+    /// `None` vs `Some(empty)` is the entire fix, so it is what the test
+    /// asserts.
+    #[test]
+    fn an_unreadable_staged_file_is_none_not_an_empty_recovery() {
+        let dir = std::env::temp_dir().join(format!("tv-seal-unreadable-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // A path that does not exist cannot be opened.
+        let missing = dir.join("seal-spill-2026-08-21.bin");
+        let _ = std::fs::remove_file(&missing);
+        assert!(
+            read_staged_spill(&missing).is_none(),
+            "an unopenable spill file must report NOT-READ, never an empty recovery — \
+             an empty recovery gets the file archived and its seals lost"
+        );
+
+        let missing_dlq = dir.join("seal-dlq-2026-08-21.ndjson");
+        let _ = std::fs::remove_file(&missing_dlq);
+        assert!(
+            read_staged_dlq(&missing_dlq).is_none(),
+            "an unopenable dlq file must report NOT-READ"
+        );
+
+        // Non-vacuity: a file that EXISTS and is genuinely empty must read as
+        // a successful recovery of zero records, not as unreadable. Without
+        // this the fix could have been "always return None", which would stage
+        // every file forever.
+        let empty = dir.join("seal-spill-2026-08-20.bin");
+        std::fs::write(&empty, b"").expect("write empty spill");
+        let read = read_staged_spill(&empty);
+        assert!(
+            read.is_some(),
+            "an EMPTY but readable file is a successful recovery of nothing, and must \
+             still be archivable — otherwise it stages forever"
+        );
+        assert_eq!(read.map(|(r, u)| (r.len(), u)), Some((0, 0)));
+
+        let empty_dlq = dir.join("seal-dlq-2026-08-20.ndjson");
+        std::fs::write(&empty_dlq, b"").expect("write empty dlq");
+        assert_eq!(
+            read_staged_dlq(&empty_dlq).map(|(r, u)| (r.len(), u)),
+            Some((0, 0))
+        );
+
+        let _ = std::fs::remove_file(&empty);
+        let _ = std::fs::remove_file(&empty_dlq);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A filename the classifier does not recognise must not be silently
+    /// archived either — that arm did not even log before this change.
+    #[test]
+    fn an_unclassifiable_staged_filename_is_refused_by_the_classifier() {
+        assert!(
+            staged_kind(Path::new("/tmp/replaying/not-a-seal-file.txt")).is_none(),
+            "the classifier must refuse an unrecognised name, so the caller can \
+             refuse to archive it"
+        );
+    }
+
+    /// The recovery loop must refuse to archive on the not-read path, and must
+    /// say so with a coded error rather than a bare warn.
+    #[test]
+    fn the_recovery_loop_refuses_to_archive_what_it_could_not_read() {
+        let src = include_str!("seal_writer_task.rs");
+        // Split on the module header, NOT on `#[cfg(test)]`: that attribute
+        // also appears inside a doc comment earlier in this file, which
+        // truncated the scan to the first 271 lines and made this test fail
+        // against code it never reached.
+        let prod = src.split("\nmod tests {").next().unwrap_or(src);
+        assert!(
+            prod.contains("outcome.files_left_pending += 1;\n            continue;"),
+            "the not-read arm must count the file as still pending and skip it, \
+             never fall through to archive_staged"
+        );
+        assert!(
+            prod.contains("could not be read or classified"),
+            "the not-read arm must name what happened"
+        );
+    }
     use std::path::PathBuf;
     use tickvault_common::feed::Feed;
     use tickvault_trading::candles::{LiveCandleState, TfIndex};
