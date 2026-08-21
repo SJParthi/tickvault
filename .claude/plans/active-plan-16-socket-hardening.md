@@ -1159,3 +1159,111 @@ older uncited note claimed Ticker is forced. If Quote is also refused the
 symptom is identical (silence) and `IDX_I_FEED_MODE` is the one line to change.
 What IS claimed: the lane no longer sends indices a request Dhan is measured to
 answer with nothing, and the failure remains loud rather than silent.
+
+## ITEM 24 (added 2026-08-21) — operator: "fix everythgin dude okay?" — live ticks had no rescue tier
+
+**Scope authority:** no scope change — no socket, no universe, no `dry_run`,
+no §28 edit, no new Telegram page (so no noise-lock row is required). This
+repairs a loss path inside code that already shipped.
+
+## Item 24 Design
+
+**Measured today:** two flush failures discarded **1,377 unrepeatable ticks**.
+Root cause, from the live error chain:
+
+```
+Caused by: Could not flush buffer: http://localhost:9000/write: timeout: per call
+```
+
+A CLIENT-side HTTP timeout. QuestDB's own container log has no error at either
+timestamp, so nothing was rejected and the buffer was never poisoned. Three
+different writers (ticks, `spot_1m_rest`, `option_chain_1m`) hit it in the same
+window, which is the signature of shared write-latency pressure rather than a
+bad row. The disk is NOT the cause — the Quote-17 EBS raise is already applied
+live (200 GB / 6000 IOPS / 500 MiB/s, verified via `describe-volumes`).
+
+`TickWriter::discard_pending` was clearing the whole buffer on ANY flush error.
+The "poisoned-buffer defence" rationale is real but applies to a row the SERVER
+refused; it was being applied to every failure alike. `seal_absorption` has had
+a ring → spill → DLQ chain for seals since the beginning; the ticks writer —
+carrying the one payload class that CANNOT be re-fetched — had no rescue tier
+at all. The REST writers' own message says "rows are re-fetchable", which is
+true for them and is exactly why they keep the plain discard.
+
+Fix: rescue to a spill tier instead of dropping.
+
+- `spill_failed_ilp(dir, payload, feed, now)` appends `Buffer::as_bytes()`
+  **verbatim**. That payload is InfluxDB line protocol — the exact body
+  QuestDB's `/write` accepts — so recovery is one command, not a bespoke
+  parser: `curl --data-binary @<file> http://<questdb>:9000/write`. Replay is
+  idempotent because the `ticks` DEDUP key carries `capture_seq`.
+- One file per feed per hour: bounded file count, and a known-bad window can be
+  replayed without re-ingesting the day.
+- `TICK_SPILL_MAX_BYTES` (512 MiB) is a real ceiling. QuestDB and the frame WAL
+  share this volume, so an unbounded rescue would trade a bounded tick loss for
+  an unbounded outage of everything. Past the cap the rows drop and are counted
+  — the same honest failure as today, never a worse one.
+- `spill_dir` is a FIELD, not a constant, so the rescue path itself is testable.
+
+Files: `crates/storage/src/tick_persistence.rs`.
+
+## Item 24 Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Empty buffer | No file written (non-vacuity test) |
+| Two failures, same feed, same hour | Appended to one file; never truncated |
+| Different hour / different feed | Separate file |
+| Spill dir missing | Created |
+| Cap reached, disk full, no permission | Falls back to the counted drop, loudly |
+| Successful flush | Rescue never runs |
+
+## Item 24 Failure Modes
+
+| Failure | Result |
+|---|---|
+| Rescue write fails | `tv_ticks_dropped_total` + `error!` naming the spill error — the loss is never masked |
+| Cap reached during a long outage | Bounded: drops resume, counted, disk protected |
+| Operator never replays a spill file | Rows are not in QuestDB. Stated plainly — this makes loss RECOVERABLE, not automatically recovered |
+
+## Item 24 Test Plan
+
+Seven tests, all green (31 in module, 46 storage suites, zero failures):
+`spill_failed_ilp_writes_the_payload_verbatim_so_it_can_be_replayed` (the
+replayability contract), `..._appends_rather_than_truncating_a_second_failure`,
+`..._separates_feeds_and_hours`,
+`spill_dir_bytes_sums_only_files_and_survives_an_unreadable_dir`,
+`the_spill_cap_is_a_real_ceiling_not_a_suggestion`,
+`discard_pending_on_an_empty_buffer_writes_no_spill_file` (non-vacuity), and
+`discard_pending_rescues_real_rows_to_the_spill_instead_of_dropping_them` —
+the last exercising the REAL path, not the helper.
+
+**Bite-proven:** forcing the rescue to fail makes 5 of them fail, including the
+end-to-end one.
+
+## Item 24 Rollback
+
+Delete the `spill_failed_ilp` call from `discard_pending`; behaviour returns to
+the bare discard. One function, one file.
+
+## Item 24 Observability
+
+New counter `tv_ticks_spilled_total{feed}`, pre-registered at 0 in
+`register_drop_baseline` for the same delta-baseline reason the drop counter is
+— a rescue episode is rare, so its first increment would otherwise be consumed
+as the baseline and go unreported. **Honestly flagged: it is NOT EMF-selected
+and has NO alarm**, matching the neighbouring counters; shipping it to
+CloudWatch is a ~$0.30/mo decision that belongs with the alarm that would read
+it. Today it is visible on `/metrics` and in the coded `error!`.
+
+## Item 24 Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the spill
+is byte-verbatim (pinned), append-not-truncate (pinned), capped (pinned),
+fail-soft to the counted drop (pinned), and never fires on a healthy writer
+(pinned) — all bite-proven. **NOT claimed: that no tick is lost.** This converts
+a permanent in-memory discard into a replayable on-disk file; the rows are not
+in QuestDB until someone runs the documented curl, and past the 512 MiB cap
+they still drop. **NOT claimed: that the flush timeouts stop** — the cause is
+QuestDB write latency under the live load and is untouched here; this bounds
+the consequence, not the cause.
