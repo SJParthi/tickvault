@@ -1750,6 +1750,94 @@ mod tests {
         assert!(!stock_options_are_pending(&sel), "all priced");
     }
 
+    /// An ATM window narrowed below the authorized 25 IS a defect, even though
+    /// options were selected and every other field looks healthy.
+    ///
+    /// This is the case that produces NO signal of any kind today: the
+    /// selection succeeds, the log line prints a smaller number than the
+    /// operator authorized, and nothing counts it.
+    #[test]
+    fn contract_verdict_reasons_flags_a_shrunk_window_even_when_options_were_selected() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = 3;
+        assert_eq!(contract_verdict_reasons(&sel), vec!["window_shrunk"]);
+    }
+
+    /// Non-vacuity. Without this the guard above would pass on a function that
+    /// reported a defect unconditionally.
+    #[test]
+    fn contract_verdict_reasons_reports_nothing_for_a_full_window() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        assert!(
+            contract_verdict_reasons(&sel).is_empty(),
+            "a healthy selection must report NOTHING — a counter that fires on a good day \
+             trains the operator to ignore it"
+        );
+    }
+
+    #[test]
+    fn contract_verdict_reasons_report_no_contracts_for_an_empty_selection() {
+        let sel = ContractSelection::default();
+        assert!(contract_verdict_reasons(&sel).contains(&"no_contracts"));
+    }
+
+    /// A master that genuinely lists no stock options reports `no_ladders`
+    /// legitimately. Paging for it would fire on every such day forever.
+    #[test]
+    fn contract_verdict_reasons_holds_no_ladders_harmless_at_zero_underlyings() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.atm_window_reason = "no_ladders";
+        sel.stock_option_underlyings = 0;
+        assert!(contract_verdict_reasons(&sel).is_empty());
+
+        // ...but with a real master behind it, it IS the 2026-08-20 defect.
+        sel.stock_option_underlyings = 208;
+        assert_eq!(contract_verdict_reasons(&sel), vec!["no_ladders"]);
+    }
+
+    /// Every reason the classifier can produce must be in the pre-registration
+    /// list, or its first — and on a once-per-session counter, its only —
+    /// increment is eaten as the CloudWatch delta baseline.
+    #[test]
+    fn pre_register_contract_failure_counters_covers_every_classified_reason() {
+        for reason in ["no_contracts", "no_ladders", "no_room", "window_shrunk"] {
+            assert!(
+                CONTRACT_FAILURE_REASONS.contains(&reason),
+                "`{reason}` can be emitted but is not pre-registered at 0"
+            );
+        }
+        // The two the classifier cannot produce, because their call sites have
+        // no ContractSelection to classify.
+        for reason in ["artifact_unreadable", "symbol_map_unreadable"] {
+            assert!(CONTRACT_FAILURE_REASONS.contains(&reason));
+        }
+    }
+
+    /// The emit wrappers must be callable with no recorder installed — which
+    /// is the state in every unit test and in the seconds before boot Step 3.
+    #[test]
+    fn record_contract_verdict_is_safe_without_a_recorder() {
+        pre_register_contract_failure_counters();
+        record_contract_verdict(&ContractSelection::default());
+    }
+
     /// The quorum boundary, exactly. Integer cross-multiply rather than a
     /// float ratio, so this cannot tie differently depending on rounding.
     #[test]
