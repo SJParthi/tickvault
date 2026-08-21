@@ -653,12 +653,13 @@ resource "aws_cloudwatch_metric_alarm" "tick_spill_replay_failing" {
   metric_name         = "tv_tick_spill_replay_failed_total"
   namespace           = local.app_namespace
   # The drain runs every 5 minutes, so one period matches one round.
-  period             = 300
-  statistic          = "Sum"
-  dimensions         = local.app_dimensions
+  #
   # notBreaching: the box is stopped overnight and publishes nothing, which is
   # health, not a failing drain. The dark-lane case belongs to
   # dhan_no_ticks_flowing, which treats missing data as breaching and is gated.
+  period             = 300
+  statistic          = "Sum"
+  dimensions         = local.app_dimensions
   treat_missing_data = "notBreaching"
 
   alarm_actions = local.app_alarm_actions
