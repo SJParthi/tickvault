@@ -1832,3 +1832,54 @@ Honest note on the local measurement: the full lib+tests coverage run could not
 complete — the instrumented build tree exhausted the container's disk twice.
 The per-file number above is from the lib-only run and is the decisive one; the
 crate total is derived, not observed. CI is the confirmation.
+
+### ITEM 28 — the last audit failure: a budget pinned to one machine
+
+The four-agent audit returned three passes and one failure. `Scalable ❌` rested
+on a single line: `RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES = 10 GiB`, whose own doc
+comment said *"sized against the r8g.xlarge 32 GiB host"*. That is the same
+shape the frame ring was repaired for — correct only while the host never
+changes, and silently wrong the moment it does, in both directions: too generous
+on a smaller box (the projection check under-reports and the operator is not
+warned), needlessly tight on a larger one.
+
+**The budget is now derived**: an exact 5/16 fraction of
+`min(/proc/meminfo MemTotal, cgroup limit)`, resolved once into a `OnceLock` so
+every read is O(1) and the enforcement can never disagree with the log line.
+
+Three decisions carry the weight.
+
+**5/16 rather than a percentage.** 5/16 of 32 GiB is 10 GiB *to the byte*, so
+the live box's budget is unchanged by this refactor. The percentage form is
+31.25%, and the moment someone rounds it to 31% the live budget silently
+tightens by 80 MiB while appearing to preserve it. A fraction cannot be rounded
+by accident.
+
+**The minimum of machine RAM and the cgroup limit**, not just `/proc/meminfo`.
+Both bind, and the smaller is what the OOM killer actually enforces. This is
+what makes it the same code on the AWS box (no container limit) and in a Docker
+dev run (limit set) — the common-runtime property a constant cannot have. Both
+cgroup dialects are handled, and "unlimited" is recognised in both: v2 writes
+the literal `max`, v1 saturates near `i64::MAX`. Reading either as a real limit
+would produce an astronomical budget and disable the check entirely.
+
+**Refuse rather than guess.** An unrecognised `/proc/meminfo` shape returns
+`None` and falls back to the 10 GiB figure with a coded `warn!`. A guessed
+memory figure produces a wrong budget that looks authoritative, which is worse
+than an honest fallback that says so.
+
+Seven tests. The bite-proof is the interesting part: reintroducing the bug — a
+`budget_from_host_bytes` that ignores its argument — turns exactly two of them
+red, and **`the_reference_host_reproduces_the_operator_budget_exactly` stays
+GREEN**, because the bug returns 10 GiB which is the right answer on that one
+host. Had that been the only test, it would have certified the defect. The test
+that bites is `the_budget_tracks_the_host_up_and_down`: half the host must halve
+the budget. A test written against the reference configuration cannot catch a
+bug whose whole nature is that it only shows up off the reference configuration.
+
+**What this does NOT fix, and the row in CLAUDE.md says so.** It still fails
+LOUD rather than closed — the install proceeds after the `error!` — and the
+documented remediation is still the operator lowering `spot_days`. Deriving a
+ceiling does not enforce it. What changes is that the breach point is no longer
+a fixed ~10,600 instruments: it now scales with the machine, which is what the
+word "scalable" was failing on.
