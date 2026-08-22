@@ -211,6 +211,124 @@ fn count_in_rust_sources(root: &Path, needles: &[&str]) -> usize {
     acc
 }
 
+/// Distinct `tv_*` measurement names defined anywhere in the Rust sources.
+///
+/// Distinct NAMES, not call sites: one metric is often incremented from
+/// several places, and comparing "76 names shipped" against a count of call
+/// sites would be an apples-to-oranges ratio dressed up as a coverage figure.
+/// Templated names (`"tv_errcode_{}"`) count once, though they expand to
+/// several real metrics -- stated because the denominator is a definition
+/// count, not a runtime series count.
+fn distinct_tv_names(root: &Path) -> usize {
+    fn walk(dir: &Path, acc: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Production sources only. A test asserting on a
+                // metric name is not a measurement the system takes,
+                // and counting it would inflate the denominator of
+                // the one ratio on this page that reports a gap.
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "target" || n == "tests" || n == "benches")
+                {
+                    continue;
+                }
+                walk(&path, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                for line in text.lines() {
+                    let t = line.trim_start();
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    let mut rest = line;
+                    while let Some(at) = rest.find("\"tv_") {
+                        rest = &rest[at + 1..];
+                        if let Some(close) = rest.find('"') {
+                            acc.insert(rest[..close].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = std::collections::BTreeSet::new();
+    walk(root, &mut acc);
+    acc.len()
+}
+/// Count lines CONTAINING any needle, anywhere in the line.
+///
+/// Sibling to [`count_in_rust_sources`], which anchors at the start of the
+/// trimmed line. That anchoring is correct for its own rows and wrong for
+/// declarations: `pub const DEDUP_KEY_CANDLES: &str = "..."` and
+/// `Self::Foo => "BAR-01"` both carry the interesting text mid-line, so the
+/// anchored matcher scores them zero. The 2026-08-22 addition of section 6
+/// hit exactly that and briefly reported a healthy dedup key as BROKEN --
+/// a false alarm in the very report built to stop false alarms. Two matchers
+/// with names that say which is which is the fix.
+fn count_lines_containing(root: &Path, needles: &[&str]) -> usize {
+    fn walk(dir: &Path, needles: &[&str], acc: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Production sources only. A test asserting on a
+                // metric name is not a measurement the system takes,
+                // and counting it would inflate the denominator of
+                // the one ratio on this page that reports a gap.
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "target" || n == "tests" || n == "benches")
+                {
+                    continue;
+                }
+                walk(&path, needles, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                for line in text.lines() {
+                    // Comment lines mention these strings constantly --
+                    // dated rationale, retired-table notes, doc sketches.
+                    // Counting prose as a declaration is how a report
+                    // ends up with a number that does not mean what its
+                    // own label says.
+                    let t = line.trim_start();
+                    if t.starts_with("//") || t.starts_with("*") {
+                        continue;
+                    }
+                    if needles.iter().any(|n| line.contains(n)) {
+                        *acc += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = 0;
+    // A single file is a legitimate root: the error-code table lives in
+    // exactly one file, and walking its whole directory would sweep in
+    // every other match arm in the crate.
+    if root.is_file() {
+        if let Ok(text) = std::fs::read_to_string(root) {
+            for line in text.lines() {
+                let t = line.trim_start();
+                if !t.starts_with("//") && needles.iter().any(|n| line.contains(n)) {
+                    acc += 1;
+                }
+            }
+        }
+        return acc;
+    }
+    walk(root, needles, &mut acc);
+    acc
+}
+
 /// Render one section as a fixed-width table.
 ///
 /// Deliberately plain text. The operator's standing deliverable rule is
@@ -722,6 +840,123 @@ fn main() {
     ];
 
     // ---------------------------------------------------------------
+    // Section 6 — the data itself: stored, deduplicated, searchable, watched
+    //
+    // Added 2026-08-22. The operator's standing demand names this dimension
+    // in every restatement -- "saving into db and auditing logging tracking
+    // capturing debugging finding searching monitoring dashboard
+    // visualising" -- and it was the one dimension this report never
+    // measured. Five green sections read as "everything is checked", which
+    // is the same false-OK this whole binary exists to prevent.
+    //
+    // These rows assert PROPERTIES, not a census. The first draft counted
+    // "lines mentioning CREATE TABLE" and reported 52 for a system with 17
+    // tables, because doc comments and test fixtures say the words too. A
+    // number that does not mean what its label says is worse than no row:
+    // it looks like evidence.
+    // ---------------------------------------------------------------
+    let storage_src = Path::new("crates/storage/src");
+
+    // THE uniqueness invariant, stated as a property. Two different
+    // instruments really do share a numeric id on different exchanges
+    // (I-P1-11), and a Dhan candle and a Groww candle for the same minute
+    // are different observations. A key naming security_id without segment
+    // merges rows that are not the same row -- invisibly, no error anywhere.
+    let keys_with_id = count_lines_containing(storage_src, &["DEDUP_KEY_"]);
+    let canonical_candle_key = count_lines_containing(storage_src, &["security_id, segment, feed"]);
+
+    let runbooks = std::fs::read_dir("docs/error-runbooks")
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+                .count()
+        })
+        .unwrap_or(0);
+
+    let tf = std::fs::read_dir("deploy/aws/terraform")
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "tf"))
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let alarms = tf
+        .matches("resource \"aws_cloudwatch_metric_alarm\"")
+        .count();
+    let log_filters = tf
+        .matches("resource \"aws_cloudwatch_log_metric_filter\"")
+        .count();
+
+    // Shipped vs taken, MEASURED both ends. The first draft hardcoded
+    // "76 of 371" -- a document number in a binary whose entire premise is
+    // that documents cannot stay true. The gap is a deliberate cost
+    // decision (all 371 would cost ~$111/mo against a budget whose
+    // automatic action switches the trading box off), so both numbers are
+    // shown rather than the flattering one.
+    let selector =
+        std::fs::read_to_string("deploy/aws/terraform/user-data.sh.tftpl").unwrap_or_default();
+    let shipped = selector
+        .split("\"metric_selectors\"")
+        .nth(1)
+        .map(|tail| {
+            let end = tail.find(']').unwrap_or(0);
+            tail[..end].matches("tv_").count()
+        })
+        .unwrap_or(0);
+    let emitted = distinct_tv_names(Path::new("crates"));
+
+    let observability = vec![
+        Row::new(
+            "Dedup keys, all named constants",
+            if keys_with_id > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{keys_with_id} refs"),
+            "never an inline literal: an inline key evades the feed-in-key guard",
+        ),
+        Row::new(
+            "Candle key carries segment AND feed",
+            if canonical_candle_key > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{canonical_candle_key} const"),
+            "I-P1-11 + feed: same id on two exchanges, two brokers, stay distinct rows",
+        ),
+        Row::new(
+            "Written runbooks",
+            if runbooks > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{runbooks} files"),
+            "every code maps to a fix; error_code_rule_file_crossref fails without one",
+        ),
+        Row::new(
+            "CloudWatch alarms",
+            if alarms > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{alarms} + {log_filters} log"),
+            "alarm_metric_has_a_route_guard: none may watch an unreachable metric",
+        ),
+        Row::new(
+            "Measurements shipped vs taken",
+            Verdict::Bounded,
+            format!("{shipped} of {emitted}"),
+            "a cost decision, not an oversight: all of them would trip the budget kill-switch",
+        ),
+    ];
+
+    // ---------------------------------------------------------------
     // Report
     // ---------------------------------------------------------------
     println!("TICKVAULT GUARANTEE REPORT");
@@ -731,6 +966,13 @@ fn main() {
     print!("{}", render("3. AUTOMATION", &auto));
     print!("{}", render("4. TEST SURFACE", &testing));
     print!("{}", render("5. EVERY VERSION PINNED", &pinning));
+    print!(
+        "{}",
+        render(
+            "6. DATA — STORED, DEDUPED, SEARCHABLE, WATCHED",
+            &observability
+        )
+    );
 
     let all: Vec<Row> = lang
         .into_iter()
@@ -738,6 +980,7 @@ fn main() {
         .chain(auto)
         .chain(testing)
         .chain(pinning)
+        .chain(observability)
         .collect();
     let broken = all.iter().filter(|r| r.verdict == Verdict::Broken).count();
     let bounded = all.iter().filter(|r| r.verdict == Verdict::Bounded).count();
