@@ -1,5 +1,5 @@
 //! AWS SigV4 request signing for CloudWatch Logs `FilterLogEvents` —
-//! faithful port of server.py:897-991 (`_sigv4_signing_key` +
+//! faithful port of the retired reference implementation:897-991 (`_sigv4_signing_key` +
 //! `build_cloudwatch_sigv4_request`) plus the pure CLI/portal parsers.
 //!
 //! HMAC-SHA256 is hand-rolled on top of the workspace-pinned `sha2`
@@ -255,7 +255,7 @@ pub fn tail_limit(v: Vec<serde_json::Value>, limit: i64) -> Vec<serde_json::Valu
 pub fn parse_portal_logs_raw(raw: &str) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     let mut section: Option<&str> = None;
-    for line in crate::pycompat::py_splitlines(raw) {
+    for line in crate::legacy_compat::legacy_splitlines(raw) {
         let stripped = line.trim();
         match stripped {
             "ERR_BEGIN" => {
@@ -334,7 +334,7 @@ mod tests {
         );
     }
 
-    /// Golden derived from the LIVE server.py `_sigv4_signing_key`
+    /// Golden derived from the LIVE the retired reference implementation `_sigv4_signing_key`
     /// (2026-07-18).
     #[test]
     fn signing_key_matches_legacy_golden() {
@@ -350,7 +350,7 @@ mod tests {
         );
     }
 
-    /// Goldens generated from the LIVE server.py
+    /// Goldens generated from the LIVE the retired reference implementation
     /// `build_cloudwatch_sigv4_request` (2026-07-18) — url, body bytes and
     /// every header must be byte-identical, signature included.
     #[test]

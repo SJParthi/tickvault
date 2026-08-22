@@ -1,4 +1,4 @@
-//! The 14 MCP tools — behavior-parity ports of server.py's tool functions
+//! The 14 MCP tools — behavior-parity ports of the retired reference implementation's tool functions
 //! (`tool_tail_errors` .. `tool_cloudwatch_logs`) + the advertised registry
 //! (byte-identical names / descriptions / inputSchema values; object key
 //! ORDER is normalized by the parity harness, array order is preserved).
@@ -24,9 +24,9 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use crate::config::{self, Ctx, Env, RealEnv};
-use crate::pycompat::{
-    decode_utf8_ignore, decode_utf8_replace, py_fnmatch, py_int, py_slice_chars, py_splitlines,
-    py_tail_chars, py_urllib_quote,
+use crate::legacy_compat::{
+    decode_utf8_ignore, decode_utf8_replace, legacy_fnmatch, legacy_int, legacy_slice_chars,
+    legacy_splitlines, legacy_tail_chars, legacy_urllib_quote,
 };
 use crate::signature::signature_hash;
 use crate::sigv4::{
@@ -39,15 +39,15 @@ pub const SUMMARY_FILENAME: &str = "errors.summary.md";
 pub const AUTO_FIX_LOG: &str = "auto-fix.log";
 
 /// Subprocess poll granularity while waiting on a spawned child
-/// (parity: server.py subprocess timeout loop).
+/// (parity: the retired reference implementation subprocess timeout loop).
 const PROC_POLL_INTERVAL_MS: u64 = 25;
-/// Subprocess timeout for `scripts/doctor.sh` (parity: server.py timeout=120).
+/// Subprocess timeout for `scripts/doctor.sh` (parity: the retired reference implementation timeout=120).
 const DOCTOR_TIMEOUT_SECS: u64 = 120;
-/// Subprocess timeout for `git log` (parity: server.py timeout=10).
+/// Subprocess timeout for `git log` (parity: the retired reference implementation timeout=10).
 const GIT_LOG_TIMEOUT_SECS: u64 = 10;
-/// Subprocess timeout for `docker compose ps` (parity: server.py timeout=15).
+/// Subprocess timeout for `docker compose ps` (parity: the retired reference implementation timeout=15).
 const DOCKER_PS_TIMEOUT_SECS: u64 = 15;
-/// Subprocess timeout for the read-only aws CLI fallback (parity: server.py timeout=30).
+/// Subprocess timeout for the read-only aws CLI fallback (parity: the retired reference implementation timeout=30).
 const AWS_CLI_TIMEOUT_SECS: u64 = 30;
 
 /// Raw bytes of the retired runtime's own name. WIRE VALUE, not prose — two
@@ -81,16 +81,16 @@ fn grep_pattern_description() -> String {
 // ---------------------------------------------------------------------------
 
 /// legacy text-mode universal-newline translation (`\r\n`/`\r` -> `\n`) —
-/// applied everywhere server.py reads files / subprocess output in text
+/// applied everywhere the retired reference implementation reads files / subprocess output in text
 /// mode (read_text, open(..., "r"), subprocess text=True).
-fn py_textmode(text: &str) -> String {
+fn legacy_textmode(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// legacy file-object line iteration semantics AFTER universal-newline
 /// translation, with terminators stripped: `"a\nb\n"` -> ["a","b"],
 /// `"a\nb"` -> ["a","b"], `""` -> [].
-fn py_file_lines(text: &str) -> Vec<&str> {
+fn legacy_file_lines(text: &str) -> Vec<&str> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -102,7 +102,7 @@ fn py_file_lines(text: &str) -> Vec<&str> {
 }
 
 /// legacy `lines[-limit:]` slice (handles 0 => everything, negatives).
-fn py_neg_slice<T>(lines: &[T], limit: i64) -> &[T] {
+fn legacy_neg_slice<T>(lines: &[T], limit: i64) -> &[T] {
     let n = lines.len() as i64;
     let start = if limit > 0 {
         (n - limit).max(0)
@@ -114,7 +114,7 @@ fn py_neg_slice<T>(lines: &[T], limit: i64) -> &[T] {
 
 /// legacy `datetime.isoformat()` for an offset-aware datetime: seconds,
 /// `.ffffff` only when the microseconds are non-zero, offset as `+HH:MM`.
-fn py_isoformat(dt: &chrono::DateTime<chrono::FixedOffset>) -> String {
+fn legacy_isoformat(dt: &chrono::DateTime<chrono::FixedOffset>) -> String {
     use chrono::{Offset, Timelike};
     let micros = dt.nanosecond() / 1_000;
     let mut s = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -134,7 +134,7 @@ fn env_truthy(env: &dyn Env, key: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// errors.jsonl.* discovery + event parsing (server.py:209-237)
+// errors.jsonl.* discovery + event parsing (the retired reference implementation:209-237)
 // ---------------------------------------------------------------------------
 
 /// Newest-first list of errors.jsonl.* files, with the 2026-07-05 grace
@@ -196,7 +196,7 @@ fn event_signature(ev: &Map<String, Value>) -> String {
 // File-backed tools
 // ---------------------------------------------------------------------------
 
-/// server.py `tool_tail_errors`.
+/// the retired reference implementation `tool_tail_errors`.
 pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
@@ -213,8 +213,8 @@ pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
             continue;
         };
         let raw = decode_utf8_replace(&bytes);
-        let text = py_textmode(&raw);
-        let lines = py_splitlines(&text);
+        let text = legacy_textmode(&raw);
+        let lines = legacy_splitlines(&text);
         for line in lines.iter().rev() {
             let Some(ev) = parse_event(line) else {
                 continue;
@@ -273,7 +273,7 @@ fn parse_event_ts(ev: &Map<String, Value>) -> Option<chrono::DateTime<chrono::Fi
 /// `chrono::Duration::minutes` aborted the whole server for
 /// |m| >= 153_722_867_280_913). `Err` replicates the legacy runtime's exception
 /// bands BYTE-EXACTLY (empirically mapped against the merge-base
-/// server.py, 2026-07-18; each `str(exc)` is wrapped by the dispatch
+/// the retired reference implementation, 2026-07-18; each `str(exc)` is wrapped by the dispatch
 /// into `-32000 tool list_novel_signatures failed: {msg}`):
 ///  1. `timedelta(minutes=m)` computes `days = floor(m / 1440)` and
 ///     converts it to a C int (32-bit) BEFORE the magnitude check —
@@ -307,14 +307,14 @@ fn novel_cutoff(
     // checked_sub_signed None == outside chrono's ±262k-year range,
     // which is strictly outside legacy's year 1..=9999 range too.
     let cutoff = now.checked_sub_signed(delta).ok_or_else(out_of_range)?;
-    if cutoff < py_datetime_min() || cutoff > py_datetime_max() {
+    if cutoff < legacy_datetime_min() || cutoff > legacy_datetime_max() {
         return Err(out_of_range());
     }
     Ok(cutoff)
 }
 
 /// legacy `datetime.min` as aware-UTC: 0001-01-01T00:00:00.
-fn py_datetime_min() -> chrono::DateTime<chrono::Utc> {
+fn legacy_datetime_min() -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
     chrono::Utc
         .with_ymd_and_hms(1, 1, 1, 0, 0, 0)
@@ -323,7 +323,7 @@ fn py_datetime_min() -> chrono::DateTime<chrono::Utc> {
 }
 
 /// legacy `datetime.max` as aware-UTC: 9999-12-31T23:59:59.999999.
-fn py_datetime_max() -> chrono::DateTime<chrono::Utc> {
+fn legacy_datetime_max() -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
     chrono::Utc
         .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
@@ -332,7 +332,7 @@ fn py_datetime_max() -> chrono::DateTime<chrono::Utc> {
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
 }
 
-/// server.py `tool_list_novel_signatures`. `Err` == the legacy
+/// the retired reference implementation `tool_list_novel_signatures`. `Err` == the legacy
 /// OverflowError bands of `novel_cutoff` (computed FIRST, before any
 /// file I/O — same order as legacy's line-312 cutoff).
 pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value, String> {
@@ -355,8 +355,8 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
             continue;
         };
         let raw = decode_utf8_replace(&bytes);
-        let text = py_textmode(&raw);
-        for line in py_splitlines(&text) {
+        let text = legacy_textmode(&raw);
+        for line in legacy_splitlines(&text) {
             let Some(ev) = parse_event(line) else {
                 continue;
             };
@@ -382,7 +382,7 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
                         code: obj.get("code").cloned().unwrap_or(Value::Null),
                         severity: obj.get("severity").cloned().unwrap_or(Value::Null),
                         target: obj.get("target").cloned().unwrap_or(Value::Null),
-                        message_trunc: py_slice_chars(
+                        message_trunc: legacy_slice_chars(
                             obj.get("message").and_then(Value::as_str).unwrap_or(""),
                             200,
                         )
@@ -408,7 +408,7 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
                 "severity": info.severity,
                 "target": info.target,
                 "message": info.message_trunc,
-                "first_seen_ts": py_isoformat(ts),
+                "first_seen_ts": legacy_isoformat(ts),
             }));
         }
     }
@@ -419,13 +419,13 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
     Ok(json!({
         "dir": dir_path.to_string_lossy(),
         "since_minutes": since_minutes,
-        "cutoff_utc": py_isoformat(&cutoff_fixed),
+        "cutoff_utc": legacy_isoformat(&cutoff_fixed),
         "novel_count": novel.len(),
         "novel": novel,
     }))
 }
 
-/// server.py `tool_summary_snapshot`.
+/// the retired reference implementation `tool_summary_snapshot`.
 pub fn tool_summary_snapshot(ctx: &Ctx) -> Value {
     let mut path = ctx.machine_logs_dir().join(SUMMARY_FILENAME);
     if !path.exists() {
@@ -449,7 +449,7 @@ pub fn tool_summary_snapshot(ctx: &Ctx) -> Value {
             "markdown": "",
         }),
         Ok(raw) => {
-            let markdown = py_textmode(&raw);
+            let markdown = legacy_textmode(&raw);
             let line_count = markdown.matches('\n').count();
             json!({
                 "path": path.to_string_lossy(),
@@ -461,7 +461,7 @@ pub fn tool_summary_snapshot(ctx: &Ctx) -> Value {
     }
 }
 
-/// server.py `tool_triage_log_tail`.
+/// the retired reference implementation `tool_triage_log_tail`.
 pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
     let path = ctx.logs_dir().join(AUTO_FIX_LOG);
     if !path.exists() {
@@ -478,10 +478,10 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
             });
         }
     };
-    let text = py_textmode(&raw);
-    let lines = py_splitlines(&text);
+    let text = legacy_textmode(&raw);
+    let lines = legacy_splitlines(&text);
     let tail: &[&str] = if lines.len() as i64 > limit {
-        py_neg_slice(&lines, limit)
+        legacy_neg_slice(&lines, limit)
     } else {
         &lines
     };
@@ -494,7 +494,7 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
     })
 }
 
-/// server.py `tool_signature_history`. `signature` is echoed verbatim
+/// the retired reference implementation `tool_signature_history`. `signature` is echoed verbatim
 /// (legacy echoes whatever JSON value was passed).
 pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value {
     let want = signature.as_str();
@@ -513,8 +513,8 @@ pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value
             continue;
         };
         let raw = decode_utf8_replace(&bytes);
-        let text = py_textmode(&raw);
-        for line in py_splitlines(&text) {
+        let text = legacy_textmode(&raw);
+        for line in legacy_splitlines(&text) {
             let Some(ev) = parse_event(line) else {
                 continue;
             };
@@ -553,14 +553,14 @@ fn rglob_md(dir: &Path, out: &mut Vec<PathBuf>) {
             rglob_md(&path, out);
         } else if ft.is_file() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if py_fnmatch(&name, "*.md") {
+            if legacy_fnmatch(&name, "*.md") {
                 out.push(path);
             }
         }
     }
 }
 
-/// server.py `tool_find_runbook_for_code`.
+/// the retired reference implementation `tool_find_runbook_for_code`.
 pub fn tool_find_runbook_for_code(ctx: &Ctx, code: &str) -> Value {
     let root = &ctx.repo_root;
     let runbooks_dir = root.join("docs").join("runbooks");
@@ -577,11 +577,11 @@ pub fn tool_find_runbook_for_code(ctx: &Ctx, code: &str) -> Value {
             let Ok(raw) = std::fs::read_to_string(&md) else {
                 continue;
             };
-            let text = py_textmode(&raw);
+            let text = legacy_textmode(&raw);
             if !text.contains(code) {
                 continue;
             }
-            let lines = py_splitlines(&text);
+            let lines = legacy_splitlines(&text);
             for (idx, line) in lines.iter().enumerate() {
                 if line.contains(code) {
                     let start = idx.saturating_sub(2);
@@ -620,7 +620,7 @@ fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("http client build failed: {e}"))
 }
 
-/// server.py `tool_questdb_sql`.
+/// the retired reference implementation `tool_questdb_sql`.
 pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
     let env = RealEnv;
     let qdb = config::endpoint_url(
@@ -631,7 +631,7 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
         "http://127.0.0.1:9000",
         None,
     );
-    let full = format!("{qdb}/exec?query={}", py_urllib_quote(query));
+    let full = format!("{qdb}/exec?query={}", legacy_urllib_quote(query));
     let client = match http_client(15) {
         Ok(c) => c,
         Err(e) => return json!({"ok": false, "query": query, "error": e}),
@@ -698,7 +698,7 @@ fn split_scheme_host(url: &str) -> (String, Option<String>) {
     }
 }
 
-/// server.py `tool_tickvault_api`.
+/// the retired reference implementation `tool_tickvault_api`.
 pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Value {
     let env = RealEnv;
     let api_url = config::endpoint_url(
@@ -725,11 +725,11 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
         Err(e) => return json!({"ok": false, "error": e, "url": full}),
     };
     if !bearer.is_empty() {
-        // Security parity with server.py (adversarial re-review 2026-07-04):
+        // Security parity with the retired reference implementation (adversarial re-review 2026-07-04):
         // never send the bearer over plaintext http to a non-local host.
         let (scheme, host) = split_scheme_host(&full);
         let host = host.unwrap_or_default();
-        // APPROVED: loopback allowlist for the plaintext-bearer refusal guard, never a connection target (security parity with server.py).
+        // APPROVED: loopback allowlist for the plaintext-bearer refusal guard, never a connection target (security parity with the retired reference implementation).
         let is_local = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
         if scheme != "https" && !is_local {
             return json!({
@@ -768,7 +768,7 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
             "ok": true,
             "status": status_code,
             "url": full,
-            "text": py_slice_chars(&body, 4000),
+            "text": legacy_slice_chars(&body, 4000),
         }),
     }
 }
@@ -842,8 +842,8 @@ fn run_with_timeout(
                 };
                 return Ok(ProcResult {
                     code,
-                    stdout: py_textmode(&decode_utf8_replace(&stdout)),
-                    stderr: py_textmode(&decode_utf8_replace(&stderr)),
+                    stdout: legacy_textmode(&decode_utf8_replace(&stdout)),
+                    stderr: legacy_textmode(&decode_utf8_replace(&stderr)),
                 });
             }
             Ok(None) => {
@@ -867,7 +867,7 @@ pub fn parse_doctor_stdout(stdout: &str) -> (Vec<Value>, i64, i64) {
     let mut rows: Vec<Value> = Vec::new();
     let mut pass_count = 0i64;
     let mut fail_count = 0i64;
-    for line in py_splitlines(stdout) {
+    for line in legacy_splitlines(stdout) {
         let line = line.trim_end();
         for status in ["[PASS]", "[FAIL]", "[WARN]", "[SKIP]"] {
             if let Some(stripped) = line.strip_prefix(status) {
@@ -886,7 +886,7 @@ pub fn parse_doctor_stdout(stdout: &str) -> (Vec<Value>, i64, i64) {
     (rows, pass_count, fail_count)
 }
 
-/// server.py `tool_run_doctor`.
+/// the retired reference implementation `tool_run_doctor`.
 pub fn tool_run_doctor(ctx: &Ctx) -> Value {
     let out = match run_with_timeout(
         "bash",
@@ -909,7 +909,7 @@ pub fn tool_run_doctor(ctx: &Ctx) -> Value {
         "pass_count": pass_count,
         "fail_count": fail_count,
         "rows": rows,
-        "raw_stdout_tail": if out.stdout.is_empty() { "" } else { py_tail_chars(&out.stdout, 2000) },
+        "raw_stdout_tail": if out.stdout.is_empty() { "" } else { legacy_tail_chars(&out.stdout, 2000) },
     })
 }
 
@@ -917,13 +917,13 @@ pub fn tool_run_doctor(ctx: &Ctx) -> Value {
 /// output (unit-testable).
 pub fn parse_git_log_stdout(stdout: &str) -> Vec<Value> {
     let mut commits: Vec<Value> = Vec::new();
-    for line in py_splitlines(stdout) {
+    for line in legacy_splitlines(stdout) {
         let parts: Vec<&str> = line.split('\u{1f}').collect();
         if parts.len() != 4 {
             continue;
         }
         commits.push(json!({
-            "sha": py_slice_chars(parts[0], 12),
+            "sha": legacy_slice_chars(parts[0], 12),
             "author": parts[1],
             "date": parts[2],
             "subject": parts[3],
@@ -932,7 +932,7 @@ pub fn parse_git_log_stdout(stdout: &str) -> Vec<Value> {
     commits
 }
 
-/// server.py `tool_git_recent_log`.
+/// the retired reference implementation `tool_git_recent_log`.
 pub fn tool_git_recent_log(ctx: &Ctx, limit: i64) -> Value {
     let fmt = "%H%x1f%an%x1f%aI%x1f%s";
     let out = match run_with_timeout(
@@ -956,7 +956,7 @@ pub fn tool_git_recent_log(ctx: &Ctx, limit: i64) -> Value {
     json!({"ok": true, "count": commits.len(), "commits": commits})
 }
 
-/// server.py `tool_docker_status`.
+/// the retired reference implementation `tool_docker_status`.
 pub fn tool_docker_status(ctx: &Ctx) -> Value {
     let compose_file = ctx
         .repo_root
@@ -994,11 +994,11 @@ pub fn tool_docker_status(ctx: &Ctx) -> Value {
         return json!({
             "ok": false,
             "exit_code": out.code,
-            "stderr": py_slice_chars(out.stderr.trim(), 1000),
+            "stderr": legacy_slice_chars(out.stderr.trim(), 1000),
         });
     }
     let mut containers: Vec<Value> = Vec::new();
-    for line in py_splitlines(&out.stdout) {
+    for line in legacy_splitlines(&out.stdout) {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -1010,7 +1010,7 @@ pub fn tool_docker_status(ctx: &Ctx) -> Value {
     json!({"ok": true, "count": containers.len(), "containers": containers})
 }
 
-/// server.py `tool_app_log_tail`.
+/// the retired reference implementation `tool_app_log_tail`.
 pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
     let log_dir = ctx.logs_dir();
     let date = match date {
@@ -1040,10 +1040,10 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
             });
         }
     };
-    let text = py_textmode(&decode_utf8_replace(&bytes));
-    let lines = py_file_lines(&text);
+    let text = legacy_textmode(&decode_utf8_replace(&bytes));
+    let lines = legacy_file_lines(&text);
     let tail: &[&str] = if limit > 0 {
-        py_neg_slice(&lines, limit)
+        legacy_neg_slice(&lines, limit)
     } else {
         &lines
     };
@@ -1072,7 +1072,7 @@ const GREP_SKIP_DIRS: [&str; 5] = ["target", ".git", "node_modules", "data", ".t
 /// (a normalized root never carries a trailing slash). The bare `/` and
 /// `//` roots are special-cased for totality: their string form IS the
 /// separator, and pathlib still refuses `/` vs `//` cross-root strips.
-fn py_relative_to(path: &Path, root: &Path) -> Option<String> {
+fn legacy_relative_to(path: &Path, root: &Path) -> Option<String> {
     let p = path.to_string_lossy();
     let r = root.to_string_lossy();
     if r == "/" {
@@ -1115,7 +1115,7 @@ fn grep_walk(
             continue;
         }
         if let Some(glob) = file_glob
-            && !py_fnmatch(&name, glob)
+            && !legacy_fnmatch(&name, glob)
         {
             continue;
         }
@@ -1128,8 +1128,8 @@ fn grep_walk(
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
-        let text = py_textmode(&decode_utf8_ignore(&bytes));
-        for (idx, line) in py_file_lines(&text).iter().enumerate() {
+        let text = legacy_textmode(&decode_utf8_ignore(&bytes));
+        for (idx, line) in legacy_file_lines(&text).iter().enumerate() {
             if regex.is_match(line) {
                 // PARITY (review r3 LOW-a): legacy's
                 // `full_path.relative_to(root)` raises ValueError on the
@@ -1155,7 +1155,7 @@ fn grep_walk(
                 // via pathlib_lexical; repo root at config load), so a
                 // plain `<root>/` string prefix is exactly pathlib's
                 // parts-prefix rule for a multi-component root.
-                let rel = match py_relative_to(&path, root) {
+                let rel = match legacy_relative_to(&path, root) {
                     Some(p) => p,
                     None => {
                         return Err(format!(
@@ -1168,7 +1168,7 @@ fn grep_walk(
                 matches.push(json!({
                     "file": rel,
                     "line": idx + 1,
-                    "text": py_slice_chars(line, 500),
+                    "text": legacy_slice_chars(line, 500),
                 }));
                 if matches.len() >= max_matches {
                     break;
@@ -1190,7 +1190,7 @@ fn grep_walk(
     Ok(())
 }
 
-/// server.py `tool_grep_codebase` (max_matches fixed at 200 — the legacy
+/// the retired reference implementation `tool_grep_codebase` (max_matches fixed at 200 — the legacy
 /// registry never passes it). `Err` = the legacy runtime `Path.relative_to`
 /// ValueError for a match under an absolute `path` outside the repo root;
 /// the dispatcher maps it to the -32000 `tool grep_codebase failed: ...`
@@ -1347,7 +1347,7 @@ fn cloudwatch_via_sigv4(
                 "region": region,
                 "error": format!(
                     "CloudWatch FilterLogEvents failed: reqwest::Error: {}",
-                    py_slice_chars(&text, 300)
+                    legacy_slice_chars(&text, 300)
                 ),
             });
         }
@@ -1357,7 +1357,7 @@ fn cloudwatch_via_sigv4(
         let reason = status.canonical_reason().unwrap_or("").to_string();
         let err_body = resp
             .bytes()
-            .map(|b| py_slice_chars(&decode_utf8_replace(&b), 400).to_string())
+            .map(|b| legacy_slice_chars(&decode_utf8_replace(&b), 400).to_string())
             .unwrap_or_default();
         let detail = if err_body.is_empty() {
             reason
@@ -1470,7 +1470,7 @@ fn cloudwatch_via_portal(env: &dyn Env, filter_pattern: Option<&str>, limit: i64
             "source": "portal",
             "portal_url": url,
             "error": "portal returned ok=false (check the bearer token / box state)",
-            "portal_response": py_slice_chars(&parsed.to_string(), 400),
+            "portal_response": legacy_slice_chars(&parsed.to_string(), 400),
         });
     }
     let raw = parsed.get("raw").and_then(Value::as_str).unwrap_or("");
@@ -1497,7 +1497,7 @@ fn legacy_truthy(v: &Value) -> bool {
     }
 }
 
-/// server.py `tool_cloudwatch_logs` — SigV4 -> portal -> aws CLI.
+/// the retired reference implementation `tool_cloudwatch_logs` — SigV4 -> portal -> aws CLI.
 pub fn tool_cloudwatch_logs(
     ctx: &Ctx,
     minutes: i64,
@@ -1543,7 +1543,7 @@ pub fn tool_cloudwatch_logs(
             "ok": false,
             "exit_code": out.code,
             "error": "aws logs call failed — most likely no read-only AWS credentials in this environment yet. Prefer the direct SigV4 path (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY) or the portal path (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). stderr below.",
-            "stderr": py_slice_chars(out.stderr.trim(), 800),
+            "stderr": legacy_slice_chars(out.stderr.trim(), 800),
             "log_group": group,
         });
     }
@@ -1561,7 +1561,7 @@ pub fn tool_cloudwatch_logs(
 }
 
 // ---------------------------------------------------------------------------
-// Registry — names / descriptions / schemas byte-identical to server.py
+// Registry — names / descriptions / schemas byte-identical to the retired reference implementation
 // ---------------------------------------------------------------------------
 
 pub const TOOL_NAMES: [&str; 14] = [
@@ -1618,7 +1618,7 @@ pub fn tool_descriptions() -> Vec<(&'static str, &'static str)> {
 }
 
 /// The `tools/list` result array — same names, descriptions and
-/// inputSchema VALUES as server.py's TOOLS registry (object key order is
+/// inputSchema VALUES as the retired reference implementation's TOOLS registry (object key order is
 /// normalized by the harness; array order — incl. `required` — preserved).
 pub fn tools_list_json() -> Value {
     json!([
@@ -1836,7 +1836,7 @@ pub fn tools_list_json() -> Value {
 fn get_int(args: &Map<String, Value>, key: &str, default: i64) -> Result<i64, String> {
     match args.get(key) {
         None => Ok(default),
-        Some(v) => py_int(v),
+        Some(v) => legacy_int(v),
     }
 }
 
@@ -2006,7 +2006,7 @@ mod tests {
 
     /// PR #1644 R6 CRITICAL: `novel_cutoff` must NEVER panic and must
     /// replicate the legacy runtime's OverflowError bands byte-exactly. Thresholds
-    /// below were binary-searched against the merge-base server.py's
+    /// below were binary-searched against the merge-base the retired reference implementation's
     /// `timedelta(minutes=m)` / `now - td` on 2026-07-18 with the SAME
     /// injected `now` (2026-07-18T10:00:00Z).
     #[test]
@@ -2103,20 +2103,20 @@ mod tests {
     }
 
     #[test]
-    fn py_neg_slice_matches_legacy_semantics() {
+    fn legacy_neg_slice_matches_legacy_semantics() {
         let v = [1, 2, 3, 4, 5];
-        assert_eq!(py_neg_slice(&v, 2), &[4, 5]);
-        assert_eq!(py_neg_slice(&v, 10), &v);
-        assert_eq!(py_neg_slice(&v, 0), &v); // lines[-0:] == lines[0:]
-        assert_eq!(py_neg_slice(&v, -2), &[3, 4, 5]); // lines[2:]
+        assert_eq!(legacy_neg_slice(&v, 2), &[4, 5]);
+        assert_eq!(legacy_neg_slice(&v, 10), &v);
+        assert_eq!(legacy_neg_slice(&v, 0), &v); // lines[-0:] == lines[0:]
+        assert_eq!(legacy_neg_slice(&v, -2), &[3, 4, 5]); // lines[2:]
     }
 
     #[test]
-    fn py_file_lines_matches_legacy_iteration() {
-        assert_eq!(py_file_lines("a\nb\n"), vec!["a", "b"]);
-        assert_eq!(py_file_lines("a\nb"), vec!["a", "b"]);
-        assert_eq!(py_file_lines(""), Vec::<&str>::new());
-        assert_eq!(py_file_lines("\n"), vec![""]);
+    fn legacy_file_lines_matches_legacy_iteration() {
+        assert_eq!(legacy_file_lines("a\nb\n"), vec!["a", "b"]);
+        assert_eq!(legacy_file_lines("a\nb"), vec!["a", "b"]);
+        assert_eq!(legacy_file_lines(""), Vec::<&str>::new());
+        assert_eq!(legacy_file_lines("\n"), vec![""]);
     }
 
     #[test]
@@ -2241,11 +2241,11 @@ mod tests {
     }
 
     #[test]
-    fn py_isoformat_matches_legacy() {
+    fn legacy_isoformat_matches_legacy() {
         let dt = chrono::DateTime::parse_from_rfc3339("2026-07-18T05:30:00+00:00").unwrap();
-        assert_eq!(py_isoformat(&dt), "2026-07-18T05:30:00+00:00");
+        assert_eq!(legacy_isoformat(&dt), "2026-07-18T05:30:00+00:00");
         let dt2 = chrono::DateTime::parse_from_rfc3339("2026-07-18T05:30:00.123456+05:30").unwrap();
-        assert_eq!(py_isoformat(&dt2), "2026-07-18T05:30:00.123456+05:30");
+        assert_eq!(legacy_isoformat(&dt2), "2026-07-18T05:30:00.123456+05:30");
     }
 
     #[test]
@@ -2311,7 +2311,7 @@ mod tests {
         // in the subpath of `/<root>` — the legacy runtime raises the -32000
         // ValueError on the first match. Rust `strip_prefix` collapses
         // `//` and would fail OPEN (ok:true); the pathlib-parts
-        // `py_relative_to` must error with the `//`-quoted text.
+        // `legacy_relative_to` must error with the `//`-quoted text.
         let base = std::env::temp_dir().join(format!("tv-mcp-grepds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("sub")).unwrap();

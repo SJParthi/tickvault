@@ -4349,7 +4349,7 @@ data-pull phase, so the system is never blinded mid-trade";
     #[tokio::test]
     async fn test_logs_route_kept_for_mcp_server() {
         // The tickvault-logs MCP server POSTs {"action":"logs"} to this portal
-        // (scripts/mcp-servers/tickvault-logs/server.py) — the API route must
+        // (the retired reference implementation, formerly under scripts/mcp-servers/) — the API route must
         // survive the tab removal.
         let shell = MockShell {
             sync_output: "ERR_BEGIN\nERR_END\nAPP_BEGIN\nAPP_END\n".to_string(),
