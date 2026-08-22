@@ -292,6 +292,7 @@ impl OrderManagementSystem {
         if tracked >= Self::MAX_TRACKED_ORDERS {
             metrics::counter!("tv_oms_order_book_full_total").increment(1);
             tracing::error!(
+                code = ErrorCode::OmsGapRateLimit.code_str(),
                 tracked,
                 max = Self::MAX_TRACKED_ORDERS,
                 "OMS order book is FULL for today - refusing the placement. No \
