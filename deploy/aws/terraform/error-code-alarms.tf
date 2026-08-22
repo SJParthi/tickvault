@@ -637,7 +637,7 @@ locals {
       eval        = 1
       dta         = 1
       ok_recovery = false # chosen once per boot - an auto-OK means the datapoint aged out, not that the next session widened
-      desc = "WS-GAP-03 universe collapse: the DHAN live feed fell back to the 4-instrument index universe. Either today's master exceeded the authorized capacity envelope, or it produced no usable widening (artifact unreadable, absent or empty). The session is running 4 instruments instead of the authorized ~24,600 - a 99.98% loss of market data - and nothing else reports it: the 4 indices still tick, so the no-ticks alarm stays green and every loss counter reads a healthy zero. Triage from the same log line: capacity vs master_entries at/over the cap means the universe outgrew 25,000 (a vendor option-chain expansion is the usual cause); master_entries 0 means the artifact did not load. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+      desc        = "WS-GAP-03 universe collapse: the DHAN live feed fell back to the 4-instrument index universe. Either today's master exceeded the authorized capacity envelope, or it produced no usable widening (artifact unreadable, absent or empty). The session is running 4 instruments instead of the authorized ~24,600 - a 99.98% loss of market data - and nothing else reports it: the 4 indices still tick, so the no-ticks alarm stays green and every loss counter reads a healthy zero. Triage from the same log line: capacity vs master_entries at/over the cap means the universe outgrew 25,000 (a vendor option-chain expansion is the usual cause); master_entries 0 means the artifact did not load. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
     }
   }
 }
