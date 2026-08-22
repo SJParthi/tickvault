@@ -41,6 +41,23 @@
 //!   DEDUP UPSERT KEYS(ts, trading_date_ist, feed);
 //! ```
 //!
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS feed_coverage_daily (
+//!     ts TIMESTAMP, trading_date_ist TIMESTAMP,
+//!     security_id LONG, exchange_segment SYMBOL, feed SYMBOL,
+//!     symbol_name SYMBOL,
+//!     dhan_minutes LONG, groww_minutes LONG,
+//!     dhan_only_minutes LONG, groww_only_minutes LONG, both_minutes LONG,
+//!     mapped BOOLEAN, partial_coverage BOOLEAN
+//! ) timestamp(ts) PARTITION BY DAY
+//!   DEDUP UPSERT KEYS(ts, trading_date_ist, security_id, exchange_segment, feed);
+//! ```
+//!
+//! The `groww_*` columns are RETAINED after the 2026-08-21 Groww removal:
+//! historical rows carry real values in them and the SEBI never-delete rule
+//! makes those rows permanent, so dropping the columns would make committed
+//! history unreadable. Nothing writes them any more.
+//!
 //! `feed_scoreboard_daily` is per-RUN-per-feed (no instrument key) so
 //! I-P1-11's `(security_id, exchange_segment)` pair is N/A there — it IS in
 //! `feed_coverage_daily`'s key (the per-instrument table).
