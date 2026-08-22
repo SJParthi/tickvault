@@ -1514,3 +1514,61 @@ small.
 - Changes the contract shape (chain scope, ATM ±25, futures expiries) under
   cover of this quote — it says nothing about contracts.
 - Flips `dry_run`, touches the §28 frozen area, or arms live order fire.
+
+#### 2026-08-22 (SAME DAY) — MEASURED ON THE BOX: the "~4,565 spot" figure in the section above is WRONG, and so is its capacity table
+
+The section above was written from source and from the figures this repository
+has been repeating since 2026-08-12. Both were then checked against the live
+box (`aws logs filter-log-events`, `/tickvault/prod/app`, session of
+2026-08-21). The correction matters more than the change it corrects.
+
+**The live spot set is 868. It has been 868. Nothing was ever subscribing 4,565.**
+
+```
+"live universe: widened from today's resolved master"
+  instruments: 868   master_entries: 4636   deduped: 3771   capacity: 25000
+```
+
+`4,565` / `4,636` is the **artifact ROW count** — one row per
+(index list, stock) membership pair, because `join_constituents` dedupes per
+list. `select_live_universe` then dedupes on `(security_id, segment)` and
+**3,771 of those rows collapse**. The union of 49 NSE index lists is ~749
+distinct stocks, which is essentially Nifty Total Market's own membership,
+because NTM is the superset the other broad lists are drawn from.
+
+**What this does to the capacity table above.** Measured the same session:
+
+| Line | This file said | Box says |
+|---|---:|---:|
+| Spot | ~4,565 | **868** |
+| F&O underlyings with ladders | 216 | **208** |
+| Index futures | ~6 | **18** |
+| Stock futures | ~648 | **640** |
+| Index options (current expiry) | 542–2,037 | **1,250** |
+| Stock options at ATM ±25 | 22,032 | **20,220** |
+| **Total subscribed** | ~28,385 (OVER by 3,385) | **22,996 — 2,004 spare** |
+| ATM window actually applied | "would silently shrink" | **25, `dropped_for_capacity: 0`** |
+
+So the capacity problem the section above was written to solve **did not
+exist**. ±25 fits at full width today with 2,004 slots spare.
+
+**What the NTM change therefore is, honestly.** Not a capacity fix — it
+changes the subscribed count by roughly nothing (868 → ~869). What it does
+buy is real but narrower: the set becomes **deliberately** NSE indices + Nifty
+Total Market instead of **incidentally** the union of 49 lists that happens to
+dedupe to the same membership. That removes a dependency on 48 lists nobody
+selected, makes the set reproducible from one named source, and shrinks the
+artifact from ~4,600 rows to ~869. The commit message and the section above
+claim a ~3,700-instrument saving. **That claim is withdrawn.**
+
+**How this file came to carry a wrong number for ten days.** The 4,565 figure
+entered on 2026-08-12 from a log line, was copied into `config/base.toml`'s
+comments, into `dhan_feed_stack`'s own reasoning ("~4,565 spot instruments
+leave ~20,435 for contracts"), into `config.rs`'s doc comment, and into the
+2026-08-21 narrowing rationale — each copy citing the last. Nobody re-read the
+line it came from, which reports `instruments` and `master_entries` as
+separate fields. A number that is only ever quoted is not evidence.
+
+**Still true, and unaffected by the correction:** the NTM rows really were
+being resolved and never selected; BSE really is excluded; the ISIN join
+really does run fail-closed. Those were checked in source, not quoted.
