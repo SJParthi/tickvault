@@ -672,6 +672,51 @@ fn dedup_key_composite_coverage() -> (usize, usize, usize) {
     (total, with_sid, sid_and_segment)
 }
 
+/// Every distinct `tv_*` metric name appearing in a file.
+///
+/// Deliberately a token scan rather than a JSON/HCL parse: the selector is a
+/// list of names and the terraform is a mix of alarm resources, dashboard
+/// widget bodies and interpolated strings. A parser would have to understand
+/// three shapes to answer one question -- does this name appear at all.
+fn metric_names_in(path: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while let Some(at) = text[i..].find("tv_") {
+        let start = i + at;
+        // Not a name if it is mid-identifier (`x_tv_y`).
+        let prev_ok = start == 0 || !matches!(bytes[start - 1], b'a'..=b'z' | b'0'..=b'9' | b'_');
+        let mut end = start;
+        while end < bytes.len() && matches!(bytes[end], b'a'..=b'z' | b'0'..=b'9' | b'_') {
+            end += 1;
+        }
+        if prev_ok && end > start + 3 {
+            out.insert(text[start..end].to_string());
+        }
+        i = end.max(start + 1);
+    }
+    out
+}
+
+/// The names in every `*.tf` under the terraform directory.
+fn metric_names_in_terraform() -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir("deploy/aws/terraform") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "tf")
+            && let Some(p) = path.to_str()
+        {
+            out.extend(metric_names_in(p));
+        }
+    }
+    out
+}
 /// Every workspace dependency name that at least one member crate actually
 /// references via `{ workspace = true }`.
 ///
@@ -1145,31 +1190,36 @@ fn main() {
     ];
 
     // ---------------------------------------------------------------
-    // Section 6 — the data itself: stored, deduplicated, searchable, watched
+    // Section 6 — observability
     //
-    // Added 2026-08-22. The operator's standing demand names this dimension
-    // in every restatement -- "saving into db and auditing logging tracking
-    // capturing debugging finding searching monitoring dashboard
-    // visualising" -- and it was the one dimension this report never
-    // measured. Five green sections read as "everything is checked", which
-    // is the same false-OK this whole binary exists to prevent.
+    // The brief asks for auditing, logging, tracking, capturing, debugging,
+    // monitoring and dashboards "covering every nook and corner". Those had
+    // been answered in prose. These are the countable parts.
     //
-    // These rows assert PROPERTIES, not a census. The first draft counted
-    // "lines mentioning CREATE TABLE" and reported 52 for a system with 17
-    // tables, because doc comments and test fixtures say the words too. A
-    // number that does not mean what its label says is worse than no row:
-    // it looks like evidence.
+    // The last row is the one worth having. A metric in the CloudWatch
+    // selector is SHIPPED — it costs money every session whether or not
+    // anything reads it. A name that appears in no alarm and no dashboard
+    // widget is being paid for and watched by nobody, which is the class this
+    // repo has retired twice under other names.
     // ---------------------------------------------------------------
-    let storage_src = Path::new("crates/storage/src");
-
-    // THE uniqueness invariant, stated as a property. Two different
-    // instruments really do share a numeric id on different exchanges
-    // (I-P1-11), and a Dhan candle and a Groww candle for the same minute
-    // are different observations. A key naming security_id without segment
-    // merges rows that are not the same row -- invisibly, no error anywhere.
-    let keys_with_id = count_lines_containing(storage_src, &["DEDUP_KEY_"]);
-    let canonical_candle_key = count_lines_containing(storage_src, &["security_id, segment, feed"]);
-
+    let shipped = metric_names_in("deploy/aws/cloudwatch-agent.json");
+    let in_terraform = metric_names_in_terraform();
+    let unwatched: Vec<&String> = shipped
+        .iter()
+        .filter(|m| !in_terraform.contains(*m))
+        .collect();
+    let codes = std::fs::read_to_string("crates/common/src/error_code.rs")
+        .map(|t| {
+            t.lines()
+                .filter(|l| {
+                    let t = l.trim_end();
+                    t.ends_with(',')
+                        && t.trim_start().len() + 4 == t.len()
+                        && t.trim_start().starts_with(|c: char| c.is_ascii_uppercase())
+                })
+                .count()
+        })
+        .unwrap_or(0);
     let runbooks = std::fs::read_dir("docs/error-runbooks")
         .map(|d| {
             d.flatten()
@@ -1178,89 +1228,44 @@ fn main() {
         })
         .unwrap_or(0);
 
-    let tf = std::fs::read_dir("deploy/aws/terraform")
-        .map(|d| {
-            d.flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "tf"))
-                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    let alarms = tf
-        .matches("resource \"aws_cloudwatch_metric_alarm\"")
-        .count();
-    let log_filters = tf
-        .matches("resource \"aws_cloudwatch_log_metric_filter\"")
-        .count();
-
-    // Shipped vs taken, MEASURED both ends. The first draft hardcoded
-    // "76 of 371" -- a document number in a binary whose entire premise is
-    // that documents cannot stay true. The gap is a deliberate cost
-    // decision (all 371 would cost ~$111/mo against a budget whose
-    // automatic action switches the trading box off), so both numbers are
-    // shown rather than the flattering one.
-    let selector =
-        std::fs::read_to_string("deploy/aws/terraform/user-data.sh.tftpl").unwrap_or_default();
-    let shipped = selector
-        .split("\"metric_selectors\"")
-        .nth(1)
-        .map(|tail| {
-            let end = tail.find(']').unwrap_or(0);
-            tail[..end].matches("tv_").count()
-        })
-        .unwrap_or(0);
-    let emitted = distinct_tv_names(Path::new("crates"));
-
     let observability = vec![
         Row::new(
-            "Dedup keys, all named constants",
-            if keys_with_id > 0 {
+            "Typed error codes",
+            if codes > 0 {
                 Verdict::Guaranteed
             } else {
                 Verdict::Broken
             },
-            format!("{keys_with_id} refs"),
-            "never an inline literal: an inline key evades the feed-in-key guard",
+            format!("{codes}"),
+            "each must be named in a rule file — error_code_rule_file_crossref",
         ),
         Row::new(
-            "Candle key carries segment AND feed",
-            if canonical_candle_key > 0 {
-                Verdict::Guaranteed
-            } else {
-                Verdict::Broken
-            },
-            format!("{canonical_candle_key} const"),
-            "I-P1-11 + feed: same id on two exchanges, two brokers, stay distinct rows",
-        ),
-        Row::new(
-            "Written runbooks",
+            "Runbooks on disk",
             if runbooks > 0 {
                 Verdict::Guaranteed
             } else {
                 Verdict::Broken
             },
             format!("{runbooks} files"),
-            "every code maps to a fix; error_code_rule_file_crossref fails without one",
+            "runbook_path() must resolve — every_runbook_path_exists_on_disk",
         ),
         Row::new(
-            "CloudWatch alarms",
-            if alarms > 0 {
-                Verdict::Guaranteed
-            } else {
+            "Metrics shipped to CloudWatch",
+            if shipped.is_empty() {
                 Verdict::Broken
+            } else {
+                Verdict::Guaranteed
             },
-            format!("{alarms} + {log_filters} log"),
-            "alarm_metric_has_a_route_guard: none may watch an unreachable metric",
+            format!("{} names", shipped.len()),
+            "the EMF selector; both copies pinned byte-identical by a guard",
         ),
         Row::new(
-            "Measurements shipped vs taken",
+            "Shipped but in no alarm or dashboard",
             Verdict::Bounded,
-            format!("{shipped} of {emitted}"),
-            "a cost decision, not an oversight: all of them would trip the budget kill-switch",
+            format!("{} of {}", unwatched.len(), shipped.len()),
+            "billed every session, named in no alarm and no widget",
         ),
     ];
-
     // ---------------------------------------------------------------
     // Report
     // ---------------------------------------------------------------
@@ -1297,13 +1302,7 @@ fn main() {
     print!("{}", render("3. AUTOMATION", &auto));
     print!("{}", render("4. TEST SURFACE", &testing));
     print!("{}", render("5. EVERY VERSION PINNED", &pinning));
-    print!(
-        "{}",
-        render(
-            "6. DATA — STORED, DEDUPED, SEARCHABLE, WATCHED",
-            &observability
-        )
-    );
+    print!("{}", render("6. OBSERVABILITY", &observability));
 
     let all: Vec<Row> = lang
         .into_iter()
