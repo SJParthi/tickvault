@@ -66,6 +66,16 @@ const CONSTITUENCY_SOURCE: &str = "niftyindices";
 /// artifact field exists; only the value is new.
 const FNO_UNDERLYING_TAG: &str = "FNO_UNDERLYING";
 
+/// The niftyindices DISPLAY NAME of the Nifty Total Market list.
+///
+/// This string is a JOIN KEY, not a label: `join_constituents` stamps
+/// `index_name` from the display name in [`INDEX_CONSTITUENCY_SLUGS`], and
+/// [`ntm_spot_mappings`] selects on it. A typo here does not fail loudly — it
+/// selects ZERO constituents and the session quietly carries indices alone,
+/// which is why `ntm_display_name_matches_a_real_slug` pins the two together
+/// rather than trusting that two copies of a string stay equal.
+const NTM_INDEX_NAME: &str = "Nifty Total Market";
+
 /// Backoff before respawning a died rider task. Matches the house sibling
 /// (`groww_universe`, `disk_health_watcher`) — short, because the thing that
 /// is not happening while we wait is the day's entire instrument mapping.
@@ -167,6 +177,20 @@ pub fn mapping_artifact_path(date_ist: &str) -> std::path::PathBuf {
 #[must_use]
 pub fn fno_underlying_artifact_path(date_ist: &str) -> std::path::PathBuf {
     std::path::Path::new(MAPPING_DIR).join(format!("dhan-fno-underlyings-{date_ist}.json"))
+}
+
+/// Path of the day's NSE-indices + Nifty-Total-Market spot artifact.
+///
+/// A THIRD file, for the same reason the F&O one is a second: the live lane
+/// reads the mapping artifact by default, and a set that arrives only when its
+/// own flag is on cannot change anybody's universe by merely shipping.
+///
+/// The filename must not collide with either sibling — a collision would have
+/// one writer overwrite the other and the reader would subscribe whichever ran
+/// last, silently. Pinned by `ntm_spot_artifact_path_never_collides_with_its_two_siblings`.
+#[must_use]
+pub fn ntm_spot_artifact_path(date_ist: &str) -> std::path::PathBuf {
+    std::path::Path::new(MAPPING_DIR).join(format!("dhan-ntm-spot-{date_ist}.json"))
 }
 
 /// Today's IST date as `YYYY-MM-DD`, recomputed per attempt.
@@ -949,9 +973,116 @@ fn write_mapping_atomic(
              boot will fall back to the master-sourced spot set and say so"
         ),
     }
+
+    // The NTM spot set (NSE indices + Nifty Total Market), written on the same
+    // terms as the F&O one directly above and for the same reasons: AFTER the
+    // mapping artifact the live lane blocks on, and never able to fail this
+    // function. A miss here degrades to today's behaviour — the wider set —
+    // not to a silently narrower universe.
+    let ntm = ntm_spot_mappings(master, outcome);
+    let ntm_constituents = ntm
+        .iter()
+        .filter(|e| e.index_name == NTM_INDEX_NAME)
+        .count();
+    let ntm_indices = ntm.len() - ntm_constituents;
+    if ntm_constituents == 0 {
+        // Counted as an ERROR, not a warning, and deliberately not fatal.
+        // Writing the file anyway would hand the reader an indices-only set
+        // that looks like a successful narrowing; refusing to write it makes
+        // the consumer fall THROUGH to the full master and say so, which is
+        // the direction that never loses coverage silently.
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            date,
+            list = NTM_INDEX_NAME,
+            "the Nifty Total Market list resolved ZERO constituents — the NTM spot artifact \
+             was NOT written, so an NTM-narrowed boot falls through to the full \
+             master-sourced set. Indices alone would have looked like a successful narrowing."
+        );
+    } else {
+        match write_spot_artifact(ntm_spot_artifact_path(date), ntm) {
+            Ok(p) => info!(
+                path = %p.display(),
+                ntm_constituents,
+                nse_indices = ntm_indices,
+                "NTM spot set written"
+            ),
+            Err(e) => error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                error = %e,
+                ntm_constituents,
+                "NTM spot artifact could not be written — an NTM-narrowed boot will fall \
+                 back to the master-sourced spot set and say so"
+            ),
+        }
+    }
+
     Ok(())
 }
 
+/// The NTM spot universe: NSE indices PLUS the Nifty Total Market constituents.
+///
+/// # Why this exists as its own function (operator, 2026-08-22)
+///
+/// Every one of the ~750 Nifty Total Market rows was ALREADY being resolved —
+/// `build_once` downloads `ind_niftytotalmarket_list` with the other 48 lists
+/// and `join_constituents` matches each row to the Dhan master by ISIN. What
+/// did not exist was anything that took THAT list back out: the join's dedup
+/// key is `(index_name, security_id, segment)`, scoped per list, so the
+/// artifact carries the UNION of all 49 and the live selector dedupes it to
+/// ~4,565 SIDs. The operator asked for one list and got the pile.
+///
+/// So this is a SELECTION, not a new fetch: no extra download, no second
+/// parser, no new failure mode on the network path.
+///
+/// # Why the indices half is not optional
+///
+/// Same argument as `narrowed_spot_mappings`, and it is not theoretical:
+/// `select_live_universe` REPLACES the four hardcoded index seeds with the
+/// artifact's `IDX_I` rows and leaves the seeds standing only when there are
+/// none. An artifact of constituents alone would therefore ship 4 indices
+/// instead of ~119 while every log line still read "widened".
+///
+/// # What it deliberately does NOT do
+/// - It does not fall back to a different list when NTM resolves to nothing.
+///   An empty NTM half means the vendor served us something wrong, and
+///   substituting Nifty 500 would answer a different question than the one
+///   asked while looking identical downstream. The caller counts and reports
+///   it; `resolve_live_universe` falls THROUGH to the full master.
+/// - It does not re-filter by exchange. Every resolved constituent is NSE
+///   cash equity by construction (`build_isin_index` indexes only that
+///   subset), and every index row comes from `nse_index_mappings`, which
+///   filters `exch_id == "NSE"` itself. Stated here rather than assumed,
+///   because "skip BSE" is an operator lock and a reader must be able to see
+///   where it holds.
+///
+/// # Complexity
+///
+/// O(indices + resolved constituents) — one pass over the master for the
+/// index half and one pass over the join's output for the other, with a
+/// string equality per row. Cold path, once per day, off the tick path.
+fn ntm_spot_mappings(
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+    outcome: &JoinOutcome,
+) -> Vec<MappingEntry> {
+    let mut out = nse_index_mappings(master);
+    for r in &outcome.resolved {
+        if r.index_name != NTM_INDEX_NAME {
+            continue;
+        }
+        out.push(MappingEntry {
+            index_name: r.index_name.clone(),
+            symbol: r.symbol.clone(),
+            isin: r.isin.clone(),
+            security_id: r.security_id,
+            // `binary_code()`, never `as u8`: Dhan's wire codes have a gap at
+            // 6, so declaration order and wire value diverge above it. Same
+            // reasoning as the mapping artifact's own write.
+            exchange_segment: r.exchange_segment.binary_code(),
+        });
+    }
+    out
+}
 /// The NARROWED spot universe: NSE indices PLUS the F&O stock underlyings.
 ///
 /// The indices half is not optional and is the reason this function exists
@@ -981,8 +1112,27 @@ fn write_fno_underlying_artifact(
     date: &str,
     entries: Vec<MappingEntry>,
 ) -> std::io::Result<std::path::PathBuf> {
+    write_spot_artifact(fno_underlying_artifact_path(date), entries)
+}
+
+/// Serialise ONE narrowed spot set atomically (tmp then rename) to `path`.
+///
+/// One function for both narrowed sets rather than two near-identical writers.
+/// The duplication it removes is not cosmetic: the tmp-then-rename is the only
+/// thing stopping a reader from parsing a half-written file, and a second copy
+/// is a second place for that to be got subtly wrong — the exact shape of bug
+/// this file has already recorded twice for duplicated filenames.
+///
+/// The envelope stays [`FnoUnderlyingArtifact`] for both, deliberately: the
+/// consumer is `parse_mapping_artifact`, which reads `mappings` and nothing
+/// else, so a second envelope type would add a second parser for an identical
+/// payload. The type name now under-describes what it carries; renaming it
+/// would touch the F&O artifact's on-disk shape, which is a separate change.
+fn write_spot_artifact(
+    path: std::path::PathBuf,
+    entries: Vec<MappingEntry>,
+) -> std::io::Result<std::path::PathBuf> {
     std::fs::create_dir_all(MAPPING_DIR)?;
-    let path = fno_underlying_artifact_path(date);
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_vec_pretty(&FnoUnderlyingArtifact {
         count: entries.len(),
@@ -1673,6 +1823,149 @@ mod tests {
             option_leg: tickvault_core::instrument::master_csv::OptionLeg::None,
             underlying_symbol: String::new(),
         }
+    }
+
+    /// Builds one resolved constituent, tagged with the list it came from.
+    fn resolved(
+        index_name: &str,
+        symbol: &str,
+        security_id: u64,
+    ) -> tickvault_core::instrument::master_csv::ResolvedConstituent {
+        tickvault_core::instrument::master_csv::ResolvedConstituent {
+            index_name: index_name.to_owned(),
+            symbol: symbol.to_owned(),
+            isin: format!("INE{security_id:09}"),
+            security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseEquity,
+        }
+    }
+
+    /// `NTM_INDEX_NAME` is a JOIN KEY, not a label — `join_constituents`
+    /// stamps `index_name` from the slug table's display name and
+    /// `ntm_spot_mappings` selects on it. A typo would not fail loudly: it
+    /// would select ZERO constituents, the artifact would not be written, and
+    /// the session would fall through to the full 4,565 set — which is exactly
+    /// the state the operator was complaining about, restored silently.
+    #[test]
+    fn ntm_display_name_matches_a_real_slug() {
+        assert!(
+            tickvault_common::constants::INDEX_CONSTITUENCY_SLUGS
+                .iter()
+                .any(|(display, _)| *display == NTM_INDEX_NAME),
+            "NTM_INDEX_NAME {NTM_INDEX_NAME:?} is not a display name in \
+             INDEX_CONSTITUENCY_SLUGS — the join stamps index_name from that table, so this \
+             selector would match nothing and narrow to indices alone"
+        );
+    }
+
+    /// Three writers, three readers, one directory. A collision would have one
+    /// set overwrite another and the lane would subscribe whichever ran last,
+    /// with every log line still naming the set that was asked for.
+    #[test]
+    fn ntm_spot_artifact_path_never_collides_with_its_two_siblings() {
+        let d = "2026-08-22";
+        let paths = [
+            mapping_artifact_path(d),
+            fno_underlying_artifact_path(d),
+            ntm_spot_artifact_path(d),
+        ];
+        for (i, a) in paths.iter().enumerate() {
+            for b in paths.iter().skip(i + 1) {
+                assert_ne!(a, b, "two spot artifacts share a filename: {a:?}");
+            }
+        }
+        // And the date must actually reach the name, or every day overwrites
+        // the last and a stale set is served as today's.
+        assert!(
+            ntm_spot_artifact_path(d).to_string_lossy().contains(d),
+            "NTM artifact name drops the date"
+        );
+    }
+
+    /// The whole point of the 2026-08-22 change: ONE list out of the 49, not
+    /// the union. A selector that let a sibling list through would reproduce
+    /// the ~4,565 pile under a name that claims to be ~750.
+    #[test]
+    fn ntm_spot_mappings_selects_only_the_total_market_list() {
+        use tickvault_core::instrument::master_csv::{InstrumentClass, JoinOutcome};
+        let master = vec![master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index)];
+        let outcome = JoinOutcome {
+            resolved: vec![
+                resolved(NTM_INDEX_NAME, "RELIANCE", 2885),
+                resolved(NTM_INDEX_NAME, "TCS", 11536),
+                resolved("Nifty 500", "SOMEOTHER", 4444),
+                resolved("Nifty Microcap 250", "TINYCO", 5555),
+            ],
+            unresolved: Vec::new(),
+        };
+        let out = ntm_spot_mappings(&master, &outcome);
+        let ids: Vec<u64> = out
+            .iter()
+            .filter(|e| e.index_name == NTM_INDEX_NAME)
+            .map(|e| e.security_id)
+            .collect();
+        assert_eq!(ids, vec![2885, 11536], "took rows from a non-NTM list");
+        assert!(
+            !out.iter()
+                .any(|e| e.security_id == 4444 || e.security_id == 5555),
+            "a sibling list leaked into the NTM set"
+        );
+    }
+
+    /// `select_live_universe` REPLACES the four hardcoded index seeds with the
+    /// artifact's IDX_I rows whenever there is at least one. An NTM set of
+    /// constituents alone would therefore ship 4 indices instead of ~119 while
+    /// every log line still read "widened" — so the anchor set is not optional
+    /// and this asserts it is present, with the right segment code.
+    #[test]
+    fn ntm_spot_mappings_carries_the_index_anchor_set() {
+        use tickvault_core::instrument::master_csv::{InstrumentClass, JoinOutcome};
+        let master = vec![
+            master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index),
+            master_row(25, "NIFTY BANK", "NSE", InstrumentClass::Index),
+            // BSE stays out — the operator lock, asserted where it holds.
+            master_row(51, "SENSEX", "BSE", InstrumentClass::Index),
+        ];
+        let outcome = JoinOutcome {
+            resolved: vec![resolved(NTM_INDEX_NAME, "RELIANCE", 2885)],
+            unresolved: Vec::new(),
+        };
+        let out = ntm_spot_mappings(&master, &outcome);
+        let idx: Vec<u64> = out
+            .iter()
+            .filter(|e| {
+                e.exchange_segment == tickvault_common::types::ExchangeSegment::IdxI.binary_code()
+            })
+            .map(|e| e.security_id)
+            .collect();
+        assert_eq!(
+            idx,
+            vec![13, 25],
+            "index anchor set wrong (BSE must not appear)"
+        );
+        assert_eq!(out.len(), 3, "expected 2 indices + 1 NTM constituent");
+    }
+
+    /// An NTM half that resolves to nothing must NOT be written. Writing it
+    /// would hand the reader an indices-only file that parses cleanly and
+    /// looks like a successful narrowing; not writing it makes the consumer
+    /// fall through to the full master and say so.
+    #[test]
+    fn ntm_spot_mappings_with_no_constituents_is_indices_only_so_the_caller_can_refuse() {
+        use tickvault_core::instrument::master_csv::{InstrumentClass, JoinOutcome};
+        let master = vec![master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index)];
+        let outcome = JoinOutcome {
+            resolved: vec![resolved("Nifty 50", "RELIANCE", 2885)],
+            unresolved: Vec::new(),
+        };
+        let out = ntm_spot_mappings(&master, &outcome);
+        assert_eq!(
+            out.iter()
+                .filter(|e| e.index_name == NTM_INDEX_NAME)
+                .count(),
+            0,
+            "the caller's zero-constituent refusal would never trigger"
+        );
     }
 
     /// The gap this closes: the ISIN join emits CONSTITUENTS, never the

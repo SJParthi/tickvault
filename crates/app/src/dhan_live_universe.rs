@@ -316,6 +316,17 @@ impl ArtifactFailure {
         }
     }
 
+    /// The counter label when the NTM artifact failed. A THIRD distinct pair
+    /// rather than reusing the F&O one: all three narrowings fail through to
+    /// different sets, and a shared label would make a dashboard unable to say
+    /// which set the session actually ended up carrying.
+    const fn ntm_reason(&self) -> &'static str {
+        match self {
+            Self::Unreadable(_) => "ntm_artifact_unreadable",
+            Self::Unparseable(_) => "ntm_artifact_unparseable",
+        }
+    }
+
     fn detail(&self) -> &str {
         match self {
             Self::Unreadable(d) | Self::Unparseable(d) => d,
@@ -401,7 +412,35 @@ pub fn resolve_live_universe(
     // reports it. The reverse — quietly narrowing when a file is missing —
     // would drop roughly 4,200 instruments with nothing anywhere to say so.
     let mut master: Option<Vec<MasterEntry>> = None;
-    if cfg.spot_universe_fno_underlyings_only {
+
+    // NTM is tried FIRST and, when it succeeds, the F&O branch below never
+    // runs. That ordering IS the precedence rule (operator 2026-08-22 is later
+    // than 2026-08-21), and it is pinned by
+    // `ntm_wins_when_both_narrowing_flags_are_on` so it cannot be reversed by
+    // someone tidying the two branches into a different order.
+    if cfg.spot_universe_ntm_only {
+        let ntm_path = crate::dhan_universe::ntm_spot_artifact_path(date_ist);
+        match read_master_artifact(&ntm_path) {
+            Ok(m) => master = Some(m),
+            Err(failure) => {
+                metrics::counter!(
+                    MASTER_SOURCING_FALLBACK_COUNTER,
+                    "reason" => failure.ntm_reason()
+                )
+                .increment(1);
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    detail = failure.detail(),
+                    path = %ntm_path.display(),
+                    "live universe: the NTM spot set (NSE indices + Nifty Total Market) was \
+                     REQUESTED but today's NTM artifact is unusable — falling through. This \
+                     session subscribes MORE than was asked for, never less."
+                );
+            }
+        }
+    }
+
+    if master.is_none() && cfg.spot_universe_fno_underlyings_only {
         let fno_path = crate::dhan_universe::fno_underlying_artifact_path(date_ist);
         match read_master_artifact(&fno_path) {
             Ok(m) => master = Some(m),
@@ -505,6 +544,36 @@ pub fn resolve_live_universe(
 
 #[cfg(test)]
 mod tests {
+    /// Precedence is expressed by ORDER — the NTM branch runs first and the
+    /// F&O branch is guarded by `master.is_none()`. That is a real decision
+    /// (operator 2026-08-22 supersedes 2026-08-21) sitting in a form that a
+    /// tidy-up could silently reverse, so it is pinned here rather than left
+    /// to whichever `if` someone wrote first.
+    ///
+    /// A source scan and not a behavioural test because `resolve_live_universe`
+    /// is `TEST-EXEMPT: filesystem I/O` — the branch it guards reads two dated
+    /// artifacts from disk. This asserts the exact property that matters and
+    /// that the exemption otherwise leaves unchecked: with both flags on, the
+    /// F&O read cannot run once NTM has produced a set.
+    #[test]
+    fn ntm_wins_when_both_narrowing_flags_are_on() {
+        let src = include_str!("dhan_live_universe.rs");
+        let ntm_at = src
+            .find("if cfg.spot_universe_ntm_only {")
+            .expect("the NTM branch is gone — the 2026-08-22 narrowing no longer exists");
+        let fno_at = src
+            .find("if master.is_none() && cfg.spot_universe_fno_underlyings_only {")
+            .expect(
+                "the F&O branch lost its `master.is_none()` guard — with both flags on it \
+                 would now overwrite the NTM set and silently narrow to ~335 instruments",
+            );
+        assert!(
+            ntm_at < fno_at,
+            "the F&O branch runs before NTM — precedence is inverted against the operator's \
+             later dated instruction"
+        );
+    }
+
     use super::*;
 
     fn idx() -> Vec<SubscribeInstrument> {
