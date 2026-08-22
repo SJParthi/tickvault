@@ -35,16 +35,35 @@
 //! grow with tick count**. A byte ceiling here would either be permanently red
 //! or so loose it proved nothing.
 //!
-//! Blocks are the honest signal. The same 10,000 folds took **276 blocks** —
-//! amortised growth (a handful of buffer doublings), not one allocation per
-//! tick. A reintroduced per-tick `to_string()` would add ~10,000 blocks and be
-//! impossible to miss, while adding only ~100 KB of bytes, which would have
-//! hidden comfortably inside a byte budget.
+//! Blocks are the honest signal. A reintroduced per-tick `to_string()` would
+//! add ~10,000 blocks and be impossible to miss, while adding only ~100 KB of
+//! bytes -- which would have hidden comfortably inside a byte budget.
 //!
-//! So: **≤ 512 blocks across 10,000 folds.** That is ~20× headroom over
-//! today's 276 and still ~20× below a genuine per-tick regression. Bytes are
-//! recorded in the failure message for diagnosis but are deliberately NOT
-//! asserted.
+//! So: **<= 256 blocks across 10,000 folds**, against a measured **11**.
+//!
+//! **CORRECTED 2026-08-22, twice over.** This paragraph read "<= 512 blocks
+//! ... ~20x headroom over today's 276" while the constant below said 7_000 --
+//! and the constant's own comment claimed the seam allocates "~5,100 blocks per
+//! 10,000 ticks: roughly one every two ticks", called that a real finding, and
+//! set the budget as a ratchet at that rate.
+//!
+//! Re-measured today, three ways, the seam allocates **11 blocks per 10,000
+//! folds** -- 4.19 MB of row-buffer doublings, amortised, with no per-tick
+//! allocation at all. The 5,100 figure was the cross-contaminated measurement
+//! that `DHAT_LOCK` was added to eliminate; that lock's own doc names the same
+//! number. The lock fixed the measurement and nobody re-measured, so the
+//! budget kept the bad number and the comment promoted it into a property of
+//! the code.
+//!
+//! Two wrong numbers pointing in opposite directions, in one file, both read
+//! before the constant they describe. The correction that matters is not the
+//! header: it is that a 7,000 ceiling could not catch what this gate exists to
+//! catch. Anything up to ~0.7 allocations per tick passed it silently.
+//!
+//! Bytes are recorded in the failure message for diagnosis but are deliberately
+//! NOT asserted -- this seam appends each tick to the row buffer, so bytes are
+//! SUPPOSED to grow with tick count, and a byte ceiling would be either
+//! permanently red or so loose it proved nothing.
 //!
 //! CI ENFORCEMENT: deliberately UN-gated (no `#![cfg(feature = "dhat")]`) — the
 //! house pattern — so the normal Test (app) lane runs it on every PR, while the
@@ -66,22 +85,32 @@ const FOLDS: u64 = 10_000;
 
 /// Ceilings. Deliberately generous in absolute terms and tight in SCALING
 /// terms: 10,000 folds may not cost 10,000 allocations.
-// MEASURED, and deliberately NOT called zero-alloc.
+// MEASURED 2026-08-22: **11 blocks** for 10,000 folds, and 9 for the frame
+// gate below. Both are amortised buffer growth -- 4.19 MB of row-buffer
+// doublings -- not one allocation per tick. The seam does NOT allocate per
+// tick.
 //
-// This was 512 while the fixtures carried a 1970 timestamp, so every tick was
-// refused and the gate measured the REFUSAL path — 276 blocks for work that
-// never happened. With real session timestamps the fold actually runs, and it
-// allocates ~5,100 blocks per 10,000 ticks: roughly one every two ticks.
+// This constant was 7_000, on a comment stating that the fold "allocates
+// ~5,100 blocks per 10,000 ticks: roughly one every two ticks", called a REAL
+// FINDING and left as a ratchet at that rate. It was not a finding. It was the
+// cross-contaminated measurement that `DHAT_LOCK`, forty lines below, was added
+// to eliminate -- its own doc names the number: *"reported 5,114 then 10,515
+// blocks for identical work on consecutive runs"*. `dhat::Profiler` is
+// PROCESS-global, so two profiled tests in one binary measure each other. The
+// lock fixed the measurement; nobody re-measured afterwards, so the budget kept
+// the contaminated number and the comment promoted it to a property of the
+// code.
 //
-// That is a REAL FINDING about the seam, not a budget to wave through, and it
-// is recorded rather than absorbed: the fold path allocates per tick today.
-// Chasing it needs a DHAT breakdown by call site and is beyond this change.
+// The cost of leaving it: at 7,000 this ratchet could not catch what it was
+// written for. The 2026-08-14 regression added ~1 block per tick (~10,000) and
+// would still fail -- but anything up to ~0.7 allocations per tick sailed
+// through a gate whose entire purpose is to catch per-tick allocation.
 //
-// So this is a RATCHET at the measured rate, not a zero-allocation claim. It
-// still catches a doubling — the 2026-08-14 regression added ~1 block per tick,
-// which would land near 15,000 and fail this by 2x. It does not certify the
-// seam as allocation-free, and no comment here should be read as saying so.
-const MAX_BLOCKS: u64 = 7_000;
+// 256 is ~23x headroom over the measured 11 (buffer doublings grow
+// logarithmically, so real growth cannot approach it) and ~39x below a
+// one-per-tick regression. If this ever goes red, find the allocation -- do NOT
+// raise the ceiling.
+const MAX_BLOCKS: u64 = 256;
 
 /// An exchange timestamp inside a real trading session (epoch seconds).
 ///
