@@ -950,8 +950,8 @@ fn main() {
         Row::new(
             "catch_up_seal_all",
             Verdict::Bounded,
-            "~10ms / 600k cells",
-            "every 5s at the 25,000 ceiling = 0.2% of the interval",
+            "O(slots x 24)",
+            "every 5s; zero-alloc; 9.67ms/sweep measured at the 25,000x24 ceiling",
         ),
         Row::new(
             "O(1) SPACE for n instruments",
