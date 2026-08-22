@@ -1208,25 +1208,91 @@ fn main() {
         .iter()
         .filter(|m| !in_terraform.contains(*m))
         .collect();
-    let codes = std::fs::read_to_string("crates/common/src/error_code.rs")
-        .map(|t| {
-            t.lines()
-                .filter(|l| {
-                    let t = l.trim_end();
-                    t.ends_with(',')
-                        && t.trim_start().len() + 4 == t.len()
-                        && t.trim_start().starts_with(|c: char| c.is_ascii_uppercase())
-                })
-                .count()
+    // Scoped to the ErrorCode enum BODY. The previous version filtered the
+    // whole file for "4-space indented, starts uppercase, ends with a comma",
+    // which also matched the `Severity` enum's 5 variants -- so it reported
+    // 131 for a 126-variant enum and the number reached the operator report
+    // and the published page. A count is only as good as the thing it is
+    // scoped to.
+    let error_code_src =
+        std::fs::read_to_string("crates/common/src/error_code.rs").unwrap_or_default();
+    let variant_names: Vec<String> = error_code_src
+        .lines()
+        .skip_while(|l| !l.starts_with("pub enum ErrorCode {"))
+        .skip(1)
+        .take_while(|l| !l.starts_with('}'))
+        .filter_map(|l| {
+            let t = l.trim_end();
+            let name = t.strip_suffix(',')?;
+            let trimmed = name.trim_start();
+            (trimmed.len() + 4 == name.len()
+                && trimmed.starts_with(|c: char| c.is_ascii_uppercase())
+                && trimmed.chars().all(|c| c.is_ascii_alphanumeric()))
+            .then(|| trimmed.to_string())
         })
-        .unwrap_or(0);
-    let runbooks = std::fs::read_dir("docs/error-runbooks")
-        .map(|d| {
-            d.flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
-                .count()
-        })
-        .unwrap_or(0);
+        .collect();
+    let codes = variant_names.len();
+
+    // How many of those can actually be reached from production source? A code
+    // with a runbook that nothing can emit is searchable coverage that cannot
+    // fire -- the same shape as a metric name with no producer.
+    let mut production_src = String::new();
+    let mut stack = vec![std::path::PathBuf::from("crates")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if !matches!(n, "target" | "tests" | "benches" | "fuzz") {
+                    stack.push(p);
+                }
+                continue;
+            }
+            if p.extension().and_then(|s| s.to_str()) == Some("rs")
+                && p.file_name().and_then(|s| s.to_str()) != Some("error_code.rs")
+                && let Ok(body) = std::fs::read_to_string(&p)
+            {
+                production_src.push_str(&body);
+            }
+        }
+    }
+    let reachable = variant_names
+        .iter()
+        .filter(|v| production_src.contains(&format!("ErrorCode::{v}")))
+        .count();
+    // Runbook files live in TWO directories. The previous version counted only
+    // `docs/error-runbooks` (48) while labelling the row "Runbook files on disk",
+    // which silently excluded the 42 in `docs/runbooks`. Count both, and say so.
+    let count_md = |dir: &str| {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let runbooks = count_md("docs/error-runbooks") + count_md("docs/runbooks");
+    // How many DISTINCT files the codes actually resolve to. Far fewer than the
+    // files on disk, because many codes share a runbook -- so "90 runbooks"
+    // never meant "90 destinations", and the page said it did.
+    let runbook_targets = {
+        let mut t: Vec<&str> = error_code_src
+            .match_indices("\"docs/")
+            .filter_map(|(i, _)| {
+                let rest = &error_code_src[i + 1..];
+                let end = rest.find('"')?;
+                let s = &rest[..end];
+                s.ends_with(".md").then_some(s)
+            })
+            .collect();
+        t.sort_unstable();
+        t.dedup();
+        t.len()
+    };
 
     let tf = std::fs::read_dir("deploy/aws/terraform")
         .map(|d| {
@@ -1312,7 +1378,13 @@ fn main() {
             "each must be named in a rule file — error_code_rule_file_crossref",
         ),
         Row::new(
-            "Runbooks on disk",
+            "Codes reachable from production",
+            Verdict::Bounded,
+            format!("{reachable} of {codes}"),
+            "the rest are searchable but cannot fire — measured, not deleted",
+        ),
+        Row::new(
+            "Runbook files on disk",
             if runbooks > 0 {
                 Verdict::Guaranteed
             } else {
@@ -1320,6 +1392,12 @@ fn main() {
             },
             format!("{runbooks} files"),
             "runbook_path() must resolve — every_runbook_path_exists_on_disk",
+        ),
+        Row::new(
+            "Distinct runbook destinations",
+            Verdict::Guaranteed,
+            format!("{runbook_targets}"),
+            "many codes share one runbook — files on disk is not destinations",
         ),
         Row::new(
             "Metrics shipped to CloudWatch",
