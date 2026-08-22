@@ -850,6 +850,66 @@ mod tests {
         }
     }
 
+    /// MEASUREMENT (not a CI gate -- `#[ignore]`d, run on demand):
+    /// what does the 30-second `scan_silence` sweep actually cost at the
+    /// authorized 25,000-instrument ceiling?
+    ///
+    /// CLAUDE.md's O(1) table records this path as O(n) in tracked instruments
+    /// and closes with "Still UNMEASURED at the 25,000 target". It is the last
+    /// row in that table making an unmeasured cost claim, and an unmeasured
+    /// cost claim is indistinguishable from an unbounded one to the next
+    /// reader. This turns it into a number.
+    ///
+    /// RESULT, 2026-08-22, `--release`, x86 dev container:
+    ///
+    /// ```text
+    /// scan_silence: 25000 instruments, 69.78us (2.8 ns/instrument),
+    ///               0.0002% of the 30s cadence
+    /// ```
+    ///
+    /// So the O(n) is real and the constant is negligible: at the authorized
+    /// ceiling the sweep costs ~70 microseconds against a 30-second interval.
+    /// The row stays BOUNDED rather than becoming GUARANTEED because the shape
+    /// is still linear -- doubling the universe doubles the cost, and only the
+    /// measurement says how much headroom that leaves.
+    ///
+    /// Ignored rather than asserted for the same reason as the aggregator's
+    /// sweep harness: a wall-clock bound on a shared CI runner is a flake, and
+    /// a flaky gate is worse than none. Not measured on the prod r8g.xlarge
+    /// (Graviton4); this is an order-of-magnitude answer.
+    ///
+    ///     cargo test -p tickvault-core --release --lib \
+    ///       scan_silence_sweep_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement harness, not a gate — see doc comment"]
+    fn scan_silence_sweep_cost_at_the_authorized_ceiling() {
+        const N: usize = 25_000;
+        let mut d = TickGapDetector::with_capacity(N, DetectorConfig::default());
+        // Seed every slot AND drive each past warmup, so the sweep classifies
+        // real baselines rather than short-circuiting on unwarmed state --
+        // the shape the live lane actually presents after the open.
+        for sid in 0..N as u64 {
+            let key = (sid, ExchangeSegment::NseEquity);
+            assert!(d.seed(key, 0), "seed {sid} must fit the 25,000 ceiling");
+            for i in 1..=4u32 {
+                d.observe(obs(key, 1_000 + i, i * 100, 500, u64::from(i) * 1_000));
+            }
+        }
+        assert_eq!(d.tracked_instruments(), N, "every slot must be occupied");
+
+        let mut seen = 0usize;
+        let t0 = std::time::Instant::now();
+        d.scan_silence(60_000, |_| seen += 1);
+        let elapsed = t0.elapsed();
+
+        assert_eq!(seen, N, "the sweep must report on every tracked instrument");
+        println!(
+            "scan_silence: {N} instruments, {elapsed:?} ({:.1} ns/instrument), \
+             {:.4}% of the 30s cadence",
+            elapsed.as_nanos() as f64 / N as f64,
+            elapsed.as_secs_f64() / 30.0 * 100.0
+        );
+    }
     // -- classify_ltt --------------------------------------------------------
 
     #[test]
