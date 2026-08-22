@@ -1050,12 +1050,50 @@ fn main() {
                 .join("\n")
         })
         .unwrap_or_default();
-    let alarms = tf
-        .matches("resource \"aws_cloudwatch_metric_alarm\"")
-        .count();
-    let log_filters = tf
-        .matches("resource \"aws_cloudwatch_log_metric_filter\"")
-        .count();
+    // Count DEPLOYED alarms, not resource BLOCKS. One block carrying
+    // `for_each = local.error_code_alerts` becomes one alarm per map entry,
+    // so counting `resource "..."` strings reports the number of things
+    // WRITTEN rather than the number of things that EXIST in AWS.
+    //
+    // Corrected 2026-08-22 after this row read "47 + 6 log" on a tree whose
+    // real figures are 65 and 24. The understatement was 38% on alarms and
+    // 4x on filters -- and it was invisible precisely because a source-string
+    // count LOOKS like a measurement. That is the failure this whole report
+    // exists to catch, so finding it here rather than in a document is the
+    // point, not an embarrassment.
+    let alert_map_entries = {
+        let n = tf
+            .split("error_code_alerts = {")
+            .nth(1)
+            .map(|rest| {
+                rest.lines()
+                    .take_while(|l| *l != "  }")
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        t.starts_with('"') && t.contains("\" = {")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        // A map we cannot parse must not silently deflate the count to the
+        // block figure; 1 keeps `blocks - 1 + n` equal to the block count.
+        if n == 0 { 1 } else { n }
+    };
+    let expand = |resource: &str| -> usize {
+        let blocks = tf.matches(resource).count();
+        let for_each_blocks = tf
+            .split(resource)
+            .skip(1)
+            .filter(|body| {
+                body.lines()
+                    .take(8)
+                    .any(|l| l.contains("for_each") && l.contains("local.error_code_alerts"))
+            })
+            .count();
+        blocks - for_each_blocks + for_each_blocks * alert_map_entries
+    };
+    let alarms = expand("resource \"aws_cloudwatch_metric_alarm\"");
+    let log_filters = expand("resource \"aws_cloudwatch_log_metric_filter\"");
 
     // Shipped vs taken, MEASURED both ends. The first draft hardcoded
     // "76 of 371" -- a document number in a binary whose entire premise is
