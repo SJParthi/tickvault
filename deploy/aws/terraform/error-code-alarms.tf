@@ -704,3 +704,69 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # future alarm PR.
   ok_actions = each.value.ok_recovery ? local.app_alarm_ok : []
 }
+
+# ---------------------------------------------------------------------------
+# Pre-open readiness — did the attach finish by 09:12 IST?
+# (operator 2026-08-22, recorded in dhan-rest-only-noise-lock-2026-07-14.md
+#  §2.3d BEFORE this terraform, per the rule-file-first law)
+#
+# A SEPARATE pair rather than another `local.error_code_alerts` entry, because
+# that map's shared metric_transformation hardcodes `value = "1"` — a COUNT.
+# This one needs the NUMBER: `value = "$.ready_at_ist_secs"` extracts the field
+# itself, so the metric IS the readiness second.
+#
+# Why that matters beyond tidiness: it costs ZERO user-data bytes. The gauge
+# `tv_dhan_preopen_ready_secs` cannot ship — the EMF selector is an explicit
+# list and the user-data template renders at exactly its 15,872-byte budget
+# with nothing free (§2.3c-ii). Pulling the value out of the log line reaches
+# CloudWatch through a lane that is already in place.
+#
+# Filtered on the INFO completion line, NOT the ERROR line that fires on a
+# miss. The ERROR line would only ever produce a datapoint on a BAD morning —
+# alarmable, but it could never answer "how early were we today?", which is the
+# question that re-tunes STOCK_OPTION_PRICING_QUORUM_PERCENT from evidence
+# instead of defending it.
+resource "aws_cloudwatch_log_metric_filter" "preopen_ready" {
+  name           = "tv-${var.environment}-preopen-ready-secs"
+  log_group_name = aws_cloudwatch_log_group.tv_app.name
+  # Anchored on the FIELD, not on the message text: the message is prose and
+  # will be reworded, the field name is a contract the alarm depends on.
+  pattern = "{ $.fields.ready_at_ist_secs = * }"
+  metric_transformation {
+    name      = "tv_dhan_preopen_ready_secs"
+    namespace = "Tickvault/Prod"
+    value     = "$.fields.ready_at_ist_secs"
+    # NOT "Seconds": this is an absolute second-of-day, not an elapsed
+    # duration, and labelling it a duration would make every chart read as a
+    # nine-hour latency.
+    unit = "None"
+    # Sparse by design — one datapoint per session. No default_value, so the
+    # metric is billed only in hours where an attach actually completed.
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "preopen_ready_late" {
+  alarm_name        = "tv-${var.environment}-preopen-ready-late"
+  alarm_description = "The DHAN live lane finished its contract and depth attach AFTER 09:12:00 IST (32120 = 9*3600+12*60 seconds of day). The session opened without its full ~23,000-instrument set on the wire: everything dialed, just late, so the first minutes after 09:15 carry spot only. Usual cause is the 60% stock-option pricing quorum arriving late on a thin pre-open - read underlyings_without_spot on the same 'late-attach complete' line, and re-tune STOCK_OPTION_PRICING_QUORUM_PERCENT from that rather than defending it. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+  # GreaterThan, not GreaterThanOrEqual: 09:12:00 exactly is MET, matching the
+  # code's `ready_at <= PREOPEN_READY_DEADLINE_IST_SECS`. An off-by-one here
+  # would page on the one morning that hit the deadline precisely.
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  metric_name         = "tv_dhan_preopen_ready_secs"
+  namespace           = local.app_namespace
+  period              = 3600
+  # Maximum, not Average: one datapoint per session, and on a restart day the
+  # LATEST attach is the one that matters. An average would let a good 09:08
+  # hide a 10:30 re-attach.
+  statistic = "Maximum"
+  threshold = 33120
+  # notBreaching: the box is stopped overnight and does not attach at weekends,
+  # so absent data is the normal off-hours state. A lane that never attaches at
+  # all is a DIFFERENT alarm (dhan-no-ticks-flowing, breaching + gated).
+  treat_missing_data = "notBreaching"
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
+  tags               = local.common_tags
+}

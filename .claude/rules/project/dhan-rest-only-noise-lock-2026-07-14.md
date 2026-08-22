@@ -625,3 +625,62 @@ ship one gauge is the wrong trade even with a strong equivalence proof. The
 guard's own prescription — move content to a file `cp`'d in after the Step 5
 repo clone — remains the correct fix, and remains a prod boot-path change that
 needs someone who can watch a real instance boot.
+
+### §2.3d — 2026-08-22: the pre-open readiness deadline joins family (5)
+
+**The verbatim operator demand (2026-08-22, typed directly in-session, repeated
+four times across the day — preserve EXACTLY, typos included):**
+
+> "9.13 am evryhtign dude okay?"
+
+> "see i said 9.13 am eveyrhtign shdou lbe entiltey conencted an subscribe of entire around 25k instruemnts right dude okay?"
+
+> "see i ened at 9.13 am it shdu lebe ntirely subscribed conencted rigth dude"
+
+> "solvign and fixing due okay?"
+
+This is the dated quote the rule-file-first law requires, recorded BEFORE the
+terraform.
+
+**What it answers.** `PREOPEN_READY_DEADLINE_IST_SECS = 09:12:00` landed in
+`6f328c99` and forces the contract dial rather than waiting on the 60% pricing
+quorum (whose only previous escape was `out_of_time` — **10:00 IST**). The
+deadline is enforced in code. Whether it is MET on a given morning was, until
+this row, invisible to every operator surface.
+
+**The gap this closes, and it is one I created.** The commit publishes
+`tv_dhan_preopen_ready_secs`, and I described the requirement as "now
+measurable". It is not, on its own: the EMF selector is an EXPLICIT LIST, the
+gauge is not in it, and the user-data template renders at **exactly** its
+15,872-byte budget with **zero** free (measured 2026-08-22, §2.3c-ii) — so the
+name cannot be added without the boot-path restructure that section defers. The
+gauge reaches the local exporter and stops there.
+
+**The route that costs no user-data byte.** A CloudWatch metric filter can
+extract a NUMERIC JSON field as the metric value — `value = "$.field"` rather
+than the `value = "1"` every existing filter in `error-code-alarms.tf` uses. The
+readiness ERROR line already carries `ready_at_ist_secs`, so the same log
+stream yields both the page and the trendable number, through the metric-filter
+lane that is already in place.
+
+**Family (5) therefore gains an EIGHTH signal**: a session that finishes its
+attach after 09:12. `notBreaching` on missing data and deliberately so — the
+box is stopped overnight and does not attach on weekends, so no-data is the
+normal off-hours state; this alarm reports a LATE attach, never a silent one.
+The dark-lane case is already owned by `dhan-no-ticks-flowing` (§2.3b-i).
+
+**Cost:** one metric filter + one alarm on an existing log stream ≈ **$0.10/mo**,
+no new EMF name, no user-data byte. Against the $130 kill-ceiling whose 90%
+action line is $117.
+
+**⚠ What this does NOT do (Rule 11).** An alarm on lateness does not make the
+attach early. It converts "did we make 09:12?" from unanswerable into a page,
+which is the entire claim. The deadline itself can still be missed for reasons
+outside this lane — pre-open prices arriving late is the exchange's business —
+and depth has still never faced a market open (§2.3b's residual stands).
+
+**What a PR that violates this section looks like (REJECT):** alarms the gauge
+instead of the log field (the gauge does not reach CloudWatch); makes the
+filter `breaching` on missing data (pages every night and weekend); adds the
+EMF name without the byte-budget restructure §2.3c-ii describes; or reports the
+deadline as met on the strength of a dial rather than a completed attach.
