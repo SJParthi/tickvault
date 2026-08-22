@@ -646,6 +646,17 @@ fn main() {
     // ---------------------------------------------------------------
     // Section 4 — test surface
     // ---------------------------------------------------------------
+    //
+    // This DELIBERATELY disagrees with `.test-count-baseline` (10243 today),
+    // and the gap is the point. The ratchet counts the attribute ANYWHERE on a
+    // line, so it also counts every `// ... #[test] ...` in a comment; that is
+    // fine for a ratchet, which only has to be monotonic. This row claims to
+    // report the number of TESTS, so it requires the attribute at line start
+    // and comes out ~100 lower. `#[async_std::test]` is not in the needle list
+    // because the workspace has zero of them (verified 2026-08-22) -- adding a
+    // needle for a class that does not exist would be decoration, not rigour.
+    // If one ever appears, add it here: an invisible test class is worse than
+    // a wrong total.
     let tests = count_in_rust_sources(Path::new("crates"), &["#[test]", "#[tokio::test]"]);
     let cov = std::fs::read_to_string("quality/crate-coverage-thresholds.toml").unwrap_or_default();
     // A `key = value` line, NOT merely a line containing '='.
@@ -680,7 +691,7 @@ fn main() {
                 Verdict::Broken
             },
             format!("{tests}"),
-            "counted from source, not from a document",
+            "line-start #[test]/#[tokio::test] under crates/ -- see note",
         ),
         Row::new(
             "Coverage floors",
