@@ -133,6 +133,45 @@ pub trait RiskAlertSink: Send + Sync {
 }
 
 impl RiskEngine {
+    /// Hard ceiling on distinct `(security_id, exchange_segment)` positions.
+    ///
+    /// # Why this exists (added 2026-08-22)
+    ///
+    /// `positions`, `market_prices` and `non_flat` had no cap. Their only
+    /// bound was caller convention -- `reset_daily()` clears them, and the box
+    /// stops at 17:30 each weekday. That is a deploy schedule, not a property
+    /// of the code, and this engine is LIVE today in paper mode. The workspace
+    /// audit named it the last unbounded per-entity growth on a reachable
+    /// path.
+    ///
+    /// # Why the response is a HALT, not a refusal
+    ///
+    /// The obvious move is the `day_ohlc_tracker` shape: refuse the new entry,
+    /// count it, log loudly. **That shape is wrong here, and dangerously so.**
+    /// Refusing to record a fill does not stop us from HOLDING the position --
+    /// it only stops the risk engine from KNOWING about it. Every downstream
+    /// check would then be evaluated against a book that is missing a leg:
+    /// the position-size limit would under-count, and the daily-loss halt
+    /// would under-measure the loss. A silent gap in the risk engine's own
+    /// picture of the book is strictly worse than memory growth.
+    ///
+    /// So the fill is ALWAYS recorded, and reaching the ceiling triggers the
+    /// same auto-halt a daily-loss breach does. That is what actually bounds
+    /// the map: a halt blocks every new order, so no further instrument can be
+    /// opened. Growth past the ceiling is limited to fills for orders already
+    /// in flight when the halt fired -- itself bounded by the 7,000/day order
+    /// rate limiter, and in practice single digits.
+    ///
+    /// The honest statement of the bound is therefore
+    /// `MAX_TRACKED_POSITIONS + in-flight orders`, not `MAX_TRACKED_POSITIONS`.
+    /// It is a real bound with a named residual, which is what the previous
+    /// state -- no bound at all -- did not have.
+    ///
+    /// Set to the same 25,000 used by the aggregator, the indicator engine and
+    /// both gap trackers, so the bounds agree rather than each inventing a
+    /// number.
+    pub const MAX_TRACKED_POSITIONS: usize = 25_000;
+
     /// Creates a new risk engine with the given configuration.
     ///
     /// # Arguments
@@ -348,7 +387,17 @@ impl RiskEngine {
             // never emits zero-lot FillEvents).
             return;
         }
-        let pos = self.positions.entry((security_id, segment)).or_default();
+        // 2026-08-22 capacity halt: a NEW instrument past the ceiling still
+        // gets its fill recorded -- see MAX_TRACKED_POSITIONS for why refusing
+        // would corrupt the risk picture -- but it halts trading, which is
+        // what stops the map growing any further.
+        let key = (security_id, segment);
+        if !self.positions.contains_key(&key) && self.positions.len() >= Self::MAX_TRACKED_POSITIONS
+        {
+            metrics::counter!("tv_risk_position_capacity_halt_total").increment(1);
+            self.trigger_halt(RiskBreach::PositionCapacityExhausted);
+        }
+        let pos = self.positions.entry(key).or_default();
         // 2026-07-14 unrealized-P&L fix: store the lot size so mark-to-market
         // P&L multiplies by the SAME contract multiplier realized P&L uses.
         pos.lot_size = lot_size.max(1);
@@ -509,8 +558,22 @@ impl RiskEngine {
             }
             return;
         }
-        self.market_prices
-            .insert((security_id, segment), current_price);
+        // 2026-08-22 capacity guard. Unlike the positions map above, refusing
+        // here is SAFE and free -- but only for an instrument we do not hold.
+        // `total_unrealized_pnl` iterates POSITIONS and looks each key up in
+        // this map, so a mark for an instrument with no position is never
+        // read by anything. A mark for a HELD position is always admitted,
+        // because dropping it would freeze the daily-loss halt on stale data
+        // (the same harm the non-finite arm above documents).
+        let key = (security_id, segment);
+        if !self.market_prices.contains_key(&key)
+            && self.market_prices.len() >= Self::MAX_TRACKED_POSITIONS
+            && !self.positions.contains_key(&key)
+        {
+            metrics::counter!("tv_risk_mark_capacity_refused_total").increment(1);
+            return;
+        }
+        self.market_prices.insert(key, current_price);
     }
 
     /// Mark-to-market daily-loss evaluation OUTSIDE the order path
@@ -783,6 +846,7 @@ impl RiskEngine {
                     RiskBreach::MaxDailyLossExceeded => "MaxDailyLossExceeded",
                     RiskBreach::PositionSizeLimitExceeded => "PositionSizeLimitExceeded",
                     RiskBreach::ManualHalt => "ManualHalt",
+                    RiskBreach::PositionCapacityExhausted => "PositionCapacityExhausted",
                 };
                 sink.fire_risk_halt(reason);
             }
@@ -2167,5 +2231,106 @@ mod tests {
         let mut sids: Vec<u64> = engine.position_security_ids().collect();
         sids.sort_unstable();
         assert_eq!(sids, vec![1001, 2002]);
+    }
+
+    // -- 2026-08-22: the per-instrument maps are bounded ---------------------
+
+    /// Fills the positions map to its ceiling using distinct instruments.
+    fn fill_to_position_ceiling(engine: &mut RiskEngine) {
+        for i in 0..RiskEngine::MAX_TRACKED_POSITIONS as u64 {
+            engine.record_fill_in_segment(i, ExchangeSegment::NseFno, 1, 100.0, 1);
+        }
+    }
+
+    #[test]
+    fn position_ceiling_halts_trading_and_still_records_the_fill() {
+        // The whole point of choosing a halt over a refusal: the engine must
+        // never stop knowing about a position it actually holds. Refusing the
+        // fill would leave the book short a leg while orders kept flowing.
+        let mut engine = make_engine();
+        fill_to_position_ceiling(&mut engine);
+        assert!(!engine.is_halted(), "the ceiling itself must not halt");
+
+        let beyond = RiskEngine::MAX_TRACKED_POSITIONS as u64;
+        engine.record_fill_in_segment(beyond, ExchangeSegment::NseFno, 3, 250.0, 1);
+
+        assert!(
+            engine.is_halted(),
+            "a new instrument past the ceiling must halt trading"
+        );
+        let pos = engine
+            .position_in_segment(beyond, ExchangeSegment::NseFno)
+            .expect(
+                "the fill is recorded even at the ceiling — refusing it would corrupt the book",
+            );
+        assert_eq!(pos.net_lots, 3);
+    }
+
+    #[test]
+    fn an_already_tracked_instrument_never_trips_the_position_ceiling() {
+        // The check is on the INSERT path only. A full book must keep booking
+        // fills for everything it already holds, forever.
+        let mut engine = make_engine();
+        fill_to_position_ceiling(&mut engine);
+        engine.record_fill_in_segment(0, ExchangeSegment::NseFno, 5, 100.0, 1);
+        assert!(!engine.is_halted());
+        assert_eq!(
+            engine
+                .position_in_segment(0, ExchangeSegment::NseFno)
+                .expect("still tracked")
+                .net_lots,
+            6
+        );
+    }
+
+    #[test]
+    fn a_mark_for_a_held_position_is_admitted_even_at_the_mark_ceiling() {
+        // Refusing this one would freeze the daily-loss halt on a stale price
+        // — the exact harm the non-finite arm documents. Held positions always
+        // get their mark.
+        let mut engine = make_engine();
+        for i in 0..RiskEngine::MAX_TRACKED_POSITIONS as u64 {
+            engine.update_market_price_in_segment(i, ExchangeSegment::NseFno, 10.0);
+        }
+        let held = RiskEngine::MAX_TRACKED_POSITIONS as u64 + 1;
+        engine.record_fill_in_segment(held, ExchangeSegment::NseFno, 1, 100.0, 1);
+        engine.update_market_price_in_segment(held, ExchangeSegment::NseFno, 111.0);
+
+        assert_eq!(
+            engine.market_prices.get(&(held, ExchangeSegment::NseFno)),
+            Some(&111.0),
+            "a mark for an instrument we HOLD must never be refused"
+        );
+    }
+
+    #[test]
+    fn a_mark_for_an_unheld_instrument_is_refused_at_the_ceiling() {
+        // Nothing reads it: total_unrealized_pnl iterates positions and looks
+        // each key up here, so a mark with no position is dead weight.
+        let mut engine = make_engine();
+        for i in 0..RiskEngine::MAX_TRACKED_POSITIONS as u64 {
+            engine.update_market_price_in_segment(i, ExchangeSegment::NseFno, 10.0);
+        }
+        let unheld = RiskEngine::MAX_TRACKED_POSITIONS as u64 + 7;
+        engine.update_market_price_in_segment(unheld, ExchangeSegment::NseFno, 99.0);
+
+        assert!(
+            engine
+                .market_prices
+                .get(&(unheld, ExchangeSegment::NseFno))
+                .is_none(),
+            "an unheld instrument's mark is refused once the map is full"
+        );
+        assert_eq!(
+            engine.market_prices.len(),
+            RiskEngine::MAX_TRACKED_POSITIONS
+        );
+    }
+
+    #[test]
+    fn the_capacity_bounds_agree_with_every_other_per_instrument_ceiling() {
+        // Five ceilings, one number. A per-map figure invented locally is how
+        // a fleet of "bounds" ends up disagreeing about what the box holds.
+        assert_eq!(RiskEngine::MAX_TRACKED_POSITIONS, 25_000);
     }
 }

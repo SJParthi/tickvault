@@ -747,6 +747,58 @@ struct BookState {
 }
 
 impl BookState {
+    /// Hard ceiling on distinct security ids this book tracks per day.
+    ///
+    /// # Why this exists (added 2026-08-22)
+    ///
+    /// `mirror`, `tripwire` and `tripwire_reported` had no cap. The
+    /// `with_capacity` figures above are pre-sizes, not bounds, and the doc on
+    /// `tripwire` reasons about how small the set *should* stay -- a statement
+    /// about the caller, not a property of the code. `clear()` at the daily
+    /// reset was the only thing holding them, and the box being switched off
+    /// at 17:30 was the backstop behind that.
+    ///
+    /// `pending_paper` is deliberately NOT checked here: it is rebuilt from
+    /// scratch out of the OMS book on every order event, so capping
+    /// `OrderManagementSystem::MAX_TRACKED_ORDERS` bounds it transitively. A
+    /// second check would suggest a second source of growth that does not
+    /// exist.
+    ///
+    /// Refusal is the safe direction on this path. The tripwire's job is to
+    /// make a cross-segment collision LOUD; a refused new sid simply is not
+    /// watched, and it is counted and logged rather than dropped in silence.
+    /// The mirror is a reconciliation aid, not the book of record -- the OMS
+    /// and the risk engine each hold their own, and both are now capped in
+    /// their own right.
+    ///
+    /// Set to 25,000, matching every other per-entity ceiling in the
+    /// workspace.
+    const MAX_TRACKED_SIDS: usize = 25_000;
+
+    /// `true` when a NEW sid can still be admitted to the per-sid maps.
+    ///
+    /// Already-tracked sids are never refused: the check runs only where a
+    /// fresh key would be created.
+    fn can_admit_sid(&self, sid: u64) -> bool {
+        if self.tripwire.contains_key(&sid) || self.mirror.contains_key(&sid) {
+            return true;
+        }
+        let tracked = self.tripwire.len().max(self.mirror.len());
+        if tracked >= Self::MAX_TRACKED_SIDS {
+            metrics::counter!("tv_order_runtime_sid_refused_total").increment(1);
+            error!(
+                security_id = sid,
+                tracked,
+                max = Self::MAX_TRACKED_SIDS,
+                "paper book is FULL - refusing a new security id. Its fills are \
+                 not mirrored and its segment is not tripwired today. Already \
+                 tracked ids are unaffected; cleared by the daily reset."
+            );
+            return false;
+        }
+        true
+    }
+
     fn new() -> Self {
         Self {
             mirror: HashMap::with_capacity(64),
@@ -795,6 +847,13 @@ impl BookState {
         }
         match self.tripwire.get(&sid) {
             None => {
+                // 2026-08-22: refuse a NEW sid once the book is full. Counted
+                // and logged in `can_admit_sid`, never silent. Returning
+                // `true` keeps the caller processing the event; what is
+                // refused is the permanent per-sid slot, not the tick.
+                if !self.can_admit_sid(sid) {
+                    return true;
+                }
                 self.tripwire.insert(sid, segment_code);
                 true
             }
@@ -977,7 +1036,12 @@ fn apply_fill(
         fill.avg_price,
         fill.lot_size,
     );
-    *book.mirror.entry(fill.security_id).or_insert(0) += i64::from(fill.fill_lots);
+    // 2026-08-22: the mirror is bounded by the same per-sid ceiling. A
+    // refused id is counted and logged; the OMS and risk engine keep their
+    // own books of record, each capped in its own right.
+    if book.can_admit_sid(fill.security_id) {
+        *book.mirror.entry(fill.security_id).or_insert(0) += i64::from(fill.fill_lots);
+    }
     let kind = if fill.order_id.starts_with("PAPER-") {
         "paper"
     } else {
@@ -3080,5 +3144,47 @@ mod tests {
             rx.try_recv().is_err(),
             "pending-paper-only mark (no position) must NOT emit a row"
         );
+    }
+
+    // -- 2026-08-22: the paper book's per-sid maps are bounded ---------------
+
+    #[test]
+    fn paper_book_refuses_a_new_sid_at_the_ceiling() {
+        let mut book = BookState::new();
+        for sid in 0..BookState::MAX_TRACKED_SIDS as u64 {
+            assert!(book.tripwire_ok(sid, 2));
+        }
+        assert_eq!(book.tripwire.len(), BookState::MAX_TRACKED_SIDS);
+
+        let beyond = BookState::MAX_TRACKED_SIDS as u64;
+        assert!(
+            book.tripwire_ok(beyond, 2),
+            "a refused sid must not block the event"
+        );
+        assert!(
+            !book.tripwire.contains_key(&beyond),
+            "but it must not take a permanent slot either"
+        );
+        assert_eq!(book.tripwire.len(), BookState::MAX_TRACKED_SIDS);
+    }
+
+    #[test]
+    fn an_already_tracked_sid_is_never_refused() {
+        // The collision tripwire is the whole point of this map — a full book
+        // must keep watching every sid it already holds.
+        let mut book = BookState::new();
+        for sid in 0..BookState::MAX_TRACKED_SIDS as u64 {
+            assert!(book.tripwire_ok(sid, 2));
+        }
+        // sid 0 is tracked at segment 2; a DIVERGENT segment must still fire.
+        assert!(
+            !book.tripwire_ok(0, 8),
+            "a tracked sid's collision must still be detected at the ceiling"
+        );
+    }
+
+    #[test]
+    fn the_paper_book_ceiling_agrees_with_the_others() {
+        assert_eq!(BookState::MAX_TRACKED_SIDS, 25_000);
     }
 }
