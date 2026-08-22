@@ -336,6 +336,51 @@ fn workspace_dep_pins(manifest: &str) -> Vec<DepPin> {
     out
 }
 
+/// Every workspace dependency name that at least one member crate actually
+/// references via `{ workspace = true }`.
+///
+/// This is the check the "declared but never referenced" row always CLAIMED to
+/// make and did not. That row asked a weaker question -- "does this name appear
+/// anywhere in `Cargo.lock`?" -- which a dead declaration passes whenever some
+/// OTHER crate pulls the same package in transitively. On 2026-08-22 the gap
+/// was measured: nine workspace declarations had no member reference, and the
+/// old row could see only seven of them; `quanta` and `clap` were invisible
+/// because unrelated crates resolved them anyway. A row that under-reports
+/// reads exactly like a complete one, which is why the question moved here.
+fn referenced_workspace_deps() -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir("crates") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("Cargo.toml")) else {
+            continue;
+        };
+        for raw in text.lines() {
+            let line = raw.trim_start();
+            if line.starts_with('#') || !line.contains("workspace") {
+                continue;
+            }
+            let Some((name, rest)) = line.split_once('=') else {
+                continue;
+            };
+            if !rest.contains("workspace = true") && !rest.contains("workspace=true") {
+                continue;
+            }
+            let name = name.trim();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                continue;
+            }
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
 /// Every `(name, version)` pair `Cargo.lock` actually resolved.
 fn lock_pairs(lock: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -666,15 +711,19 @@ fn main() {
     let ranged = pins.iter().filter(|p| p.exact.is_none()).count();
     let exact = pins.len() - ranged;
 
-    // A dep the lock never resolved is DECLARED BUT UNUSED -- not a pinning
+    // A dep no member crate references is DECLARED BUT UNUSED -- not a pinning
     // failure, so it is counted separately rather than folded into a verdict
     // it did not cause.
+    let referenced = referenced_workspace_deps();
     let mut drifted = 0usize;
-    let mut unresolved = 0usize;
+    let mut unreferenced = 0usize;
     for p in &pins {
         let Some(want) = p.exact.as_deref() else {
             continue;
         };
+        if !referenced.contains(&p.name) {
+            unreferenced += 1;
+        }
         let mut seen_name = false;
         let mut matched = false;
         for (n, v) in &pairs {
@@ -685,9 +734,7 @@ fn main() {
                 }
             }
         }
-        if !seen_name {
-            unresolved += 1;
-        } else if !matched {
+        if seen_name && !matched {
             drifted += 1;
         }
     }
@@ -714,10 +761,14 @@ fn main() {
             "the version we declare is the version we build",
         ),
         Row::new(
-            "Declared but never resolved",
-            Verdict::Bounded,
-            format!("{unresolved} deps"),
-            "dead declarations: no member crate references them",
+            "Declared but never referenced",
+            if unreferenced == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Bounded
+            },
+            format!("{unreferenced} deps"),
+            "every declaration is reachable from a member crate manifest",
         ),
     ];
 
