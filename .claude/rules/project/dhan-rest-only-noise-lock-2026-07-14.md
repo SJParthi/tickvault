@@ -511,7 +511,81 @@ the cumulative reading pages correctly on the FIRST loss and then latches, so a 
 episode in the same session is silent — but milder is not fixed, and it is a separate
 piece of work rather than something this note closed.
 
-### §2.3c — 2026-08-22 FINDING (no authorization claimed): the universe can collapse 24,600 → 4 with every signal green
+### §2.3c — 2026-08-21: the SPILL tier joins family (5); and one gap this file was told about did not exist
+
+**The verbatim operator authorization (2026-08-21, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Go ahead wirh your recommendation. Dude okay"
+
+Given in DIRECT response to a message that ended: *"Making these losses actually page you
+is a decision only you can authorize — say the word and I'll draft the dated row and the
+alarm together, with its cost line."* This dated row is that draft, recorded BEFORE the
+terraform, per §3.
+
+#### First, a correction to what that message claimed (Rule 11 — an over-stated gap is
+#### still a false claim, and it manufactures work)
+
+The message asked for authorization partly on the grounds that
+`tv_ws_frame_wal_reinjected_dropped_total` was "not EMF-selected and has no alarm". **Both
+halves are FALSE.** Verified by source scan the same day: the metric IS in the EMF selector
+(`cloudwatch-agent.json`), and `live-lane-alarms.tf:354` carries
+`tv-<env>-wal-frames-not-recovered` on it at `threshold = 1`,
+`GreaterThanOrEqualToThreshold`, one evaluation period — it pages on the FIRST unrecovered
+frame.
+
+So the WAL half of the work was already done, and the six refusal paths wired on 2026-08-21
+feed a counter that already ships and already pages. That is a better outcome than was
+claimed, and it is recorded here rather than quietly enjoyed: an executor that over-states a
+gap sends the next session hunting for something that is not there, which is the same waste
+a stale O(1)-table row causes in the other direction.
+
+#### What IS genuinely dark, and what this row authorizes
+
+The SPILL tier — not the WAL tier — has no CloudWatch presence at all:
+
+| Metric | EMF-selected? | Alarmed? |
+|---|---|---|
+| `tv_ticks_spilled_total` | **no** | no |
+| `tv_tick_spill_replay_failed_total` | **no** (new 2026-08-21) | no |
+| `tv_tick_spill_replayed_bytes_total` | **no** (new 2026-08-21) | no |
+
+That matters because the two tiers fail differently. The WAL tier's counter means "frames
+we could not re-fold" — a discrete, already-pageable loss. The spill tier's counters mean
+"an ILP flush failed and we rescued the buffer to disk" and "the automatic drain could not
+put it back". A spill that is never drained becomes a real tick loss at the 512 MiB cap, and
+today nothing outside the box's own log would say so.
+
+**Family (5) therefore gains two members:**
+
+| Alarm | Fires when | Why it is not noise |
+|---|---|---|
+| `tv-<env>-tick-spill-replay-failing` | `tv_tick_spill_replay_failed_total >= 1` in a period | The drain is the recovery arm. If it cannot put rescued ticks back, the rescue is a countdown to the cap, not a save. |
+| `tv-<env>-ticks-spilling` | `tv_ticks_spilled_total >= 1` in a period | An ILP flush failed. Distinct from `tv_ticks_dropped_total`, which both counters now increment: the drop alarm says "a flush failed"; this says "and it went to disk", which is the difference between loss and deferred recovery. |
+
+**Both are market-hours gated**, joining the `market_hours_liveness_gate` Lambda's
+`ALARM_NAMES` list in the same change. Without the gate they page every evening and all
+weekend, which this file's own §2.3a calls the fastest way to train an operator to ignore an
+alarm.
+
+**Cost:** +3 EMF metric names ≈ $0.90/mo, +2 alarms ≈ $0.20/mo ⇒ **~$1.10/mo** against the
+$130 kill-ceiling whose 90% action line is $117. `tv_tick_spill_replayed_bytes_total` is
+shipped without an alarm deliberately — it is the SUCCESS signal, and a chart of successful
+recoveries is worth having beside the two failure alarms without adding a third pager.
+
+**⚠ What this does NOT do (Rule 11).** An alarm on a spill does not stop the flush timeouts
+that cause spills; their cause is QuestDB write latency under live load and is untouched. It
+converts a loss visible only in the box's own log into one that reaches the operator — that
+is the entire claim.
+
+**What a PR that violates §2.3c looks like (REJECT):** adds either alarm without the
+market-hours gate membership in the same change; adds an alarm on the SUCCESS counter
+(`replayed_bytes`), which would page on recovery working; adds a per-INSTRUMENT dimension to
+any of the three (the §2.3 cardinality rule stands — 4,565 per-instrument metrics ≈
+$1,369/mo against a budget whose automatic action stops the trading box); or re-states the
+corrected claim above as though the WAL counter were unalarmed.
+
+### §2.3d — 2026-08-22 FINDING (no authorization claimed): the universe can collapse 24,600 → 4 with every signal green
 
 **This section authorizes NOTHING.** It records a verified defect found by an
 adversarial permutation sweep, and the reason it was NOT fixed in the same pass.
@@ -565,7 +639,7 @@ falling below a floor during market hours. (b) Cheaper and rule-cheaper: add
 the log-filter machinery already in place, costs ~$0.10/mo, and needs no user-data
 byte. Either way the alarm itself needs the §3 dated quote first.
 
-#### §2.3c-i — 2026-08-22 AUTHORIZED AND SHIPPED (the dated quote §3 requires)
+#### §2.3d-i — 2026-08-22 AUTHORIZED AND SHIPPED (the dated quote §3 requires)
 
 **The verbatim operator authorization (2026-08-22, typed directly in-session):**
 
@@ -598,7 +672,7 @@ that the next session widened correctly.
 **Family (5) therefore gains a SEVENTH signal.** Cost: one log-filter alarm on an
 existing metric-filter lane, ~$0.10/mo, no new EMF name and no user-data byte —
 which is why this route was taken over shipping the gauge (that path is still
-blocked at 33 bytes over the user-data budget, per §2.3c).
+blocked at 33 bytes over the user-data budget, per §2.3d).
 
 **What this does NOT fix, and is not claimed:** the collapse is now PAGED, not
 PREVENTED. The 400–1,427-instrument margin, the UNCAPPED index chains, and the
@@ -607,9 +681,9 @@ operator woken by this alarm still has to decide whether to raise the cap or
 narrow the set. The gauge remains unshipped, so there is still no way to watch the
 number CREEP toward the cap — only to be told after it crossed.
 
-#### §2.3c-ii — 2026-08-22 MEASURED: the user-data template has ZERO bytes free
+#### §2.3d-ii — 2026-08-22 MEASURED: the user-data template has ZERO bytes free
 
-§2.3c records the headroom gauge as blocked "33 bytes over the budget", which
+§2.3d records the headroom gauge as blocked "33 bytes over the budget", which
 reads like a shortfall specific to that one metric. Measured today, it is not:
 
 | | bytes |
@@ -626,7 +700,7 @@ inferred.)
 
 **The consequence is not about one gauge.** EVERY future addition to user-data
 is blocked: one more metric in the EMF selector, one environment variable, one
-line of boot script. The next person to try will read "33 bytes over" in §2.3c,
+line of boot script. The next person to try will read "33 bytes over" in §2.3d,
 assume their smaller change fits, and discover it does not.
 
 **Two routes remain, and the cheap-looking one was rejected on evidence.** The
@@ -640,7 +714,7 @@ guard's own prescription — move content to a file `cp`'d in after the Step 5
 repo clone — remains the correct fix, and remains a prod boot-path change that
 needs someone who can watch a real instance boot.
 
-### §2.3d — 2026-08-22: the pre-open readiness deadline joins family (5)
+### §2.3e — 2026-08-22: the pre-open readiness deadline joins family (5)
 
 **The verbatim operator demand (2026-08-22, typed directly in-session, repeated
 four times across the day — preserve EXACTLY, typos included):**
@@ -666,7 +740,7 @@ this row, invisible to every operator surface.
 `tv_dhan_preopen_ready_secs`, and I described the requirement as "now
 measurable". It is not, on its own: the EMF selector is an EXPLICIT LIST, the
 gauge is not in it, and the user-data template renders at **exactly** its
-15,872-byte budget with **zero** free (measured 2026-08-22, §2.3c-ii) — so the
+15,872-byte budget with **zero** free (measured 2026-08-22, §2.3d-ii) — so the
 name cannot be added without the boot-path restructure that section defers. The
 gauge reaches the local exporter and stops there.
 
@@ -696,5 +770,5 @@ and depth has still never faced a market open (§2.3b's residual stands).
 **What a PR that violates this section looks like (REJECT):** alarms the gauge
 instead of the log field (the gauge does not reach CloudWatch); makes the
 filter `breaching` on missing data (pages every night and weekend); adds the
-EMF name without the byte-budget restructure §2.3c-ii describes; or reports the
+EMF name without the byte-budget restructure §2.3d-ii describes; or reports the
 deadline as met on the strength of a dial rather than a completed attach.

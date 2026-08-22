@@ -616,7 +616,7 @@ locals {
 
     # 2026-08-22 (operator: "Fix and resolve wvrytni fdude okay", given in direct
     # response to a message naming this fix, its cost and that it needed his go —
-    # the §2.3c dated authorization).
+    # the §2.3d dated authorization).
     #
     # The pattern carries THREE conditions, not the usual two, and that is the
     # whole design. WS-GAP-03 is the WebSocket connection-state code with ~50
@@ -709,7 +709,7 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
 # ---------------------------------------------------------------------------
 # Pre-open readiness — did the attach finish by 09:12 IST?
 # (operator 2026-08-22, recorded in dhan-rest-only-noise-lock-2026-07-14.md
-#  §2.3d BEFORE this terraform, per the rule-file-first law)
+#  §2.3e BEFORE this terraform, per the rule-file-first law)
 #
 # A SEPARATE pair rather than another `local.error_code_alerts` entry, because
 # that map's shared metric_transformation hardcodes `value = "1"` — a COUNT.
@@ -719,7 +719,7 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
 # Why that matters beyond tidiness: it costs ZERO user-data bytes. The gauge
 # `tv_dhan_preopen_ready_secs` cannot ship — the EMF selector is an explicit
 # list and the user-data template renders at exactly its 15,872-byte budget
-# with nothing free (§2.3c-ii). Pulling the value out of the log line reaches
+# with nothing free (§2.3d-ii). Pulling the value out of the log line reaches
 # CloudWatch through a lane that is already in place.
 #
 # Filtered on the INFO completion line, NOT the ERROR line that fires on a

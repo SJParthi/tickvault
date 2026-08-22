@@ -194,8 +194,16 @@ fn error_code_liveness(root: &Path) -> (usize, usize) {
     let enum_src =
         std::fs::read_to_string(root.join("crates/common/src/error_code.rs")).unwrap_or_default();
     // Variant lines are exactly four-space-indented `Name,` inside the enum.
+    //
+    // Scoped to the ErrorCode enum BODY. Filtering the whole FILE also matches
+    // the `Severity` enum's 5 variants -- it reported 131 for a 126-variant
+    // enum, and that number reached the operator report. A count is only as
+    // good as the thing it is scoped to.
     let variants: Vec<String> = enum_src
         .lines()
+        .skip_while(|l| !l.starts_with("pub enum ErrorCode {"))
+        .skip(1)
+        .take_while(|l| !l.starts_with('}'))
         .filter_map(|l| {
             let t = l.strip_prefix("    ")?.strip_suffix(',')?;
             let first = t.chars().next()?;
@@ -1269,6 +1277,13 @@ fn main() {
     // tables, because doc comments and test fixtures say the words too. A
     // number that does not mean what its label says is worse than no row:
     // it looks like evidence.
+    //
+    // Merged 2026-08-22 with the runbook-reachability and shipped-but-
+    // unwatched rows developed in parallel. They measure different things
+    // and both are kept: one asks whether an operator sent to a runbook
+    // finds files that still exist, the other whether a metric we PAY to
+    // ship is named in any alarm or widget. A metric billed every session
+    // and watched by nobody is the class this repo has retired twice.
     // ---------------------------------------------------------------
     let storage_src = Path::new("crates/storage/src");
 
@@ -1279,14 +1294,81 @@ fn main() {
     // merges rows that are not the same row -- invisibly, no error anywhere.
     let keys_with_id = count_lines_containing(storage_src, &["DEDUP_KEY_"]);
     let canonical_candle_key = count_lines_containing(storage_src, &["security_id, segment, feed"]);
+    let error_code_src =
+        std::fs::read_to_string("crates/common/src/error_code.rs").unwrap_or_default();
 
-    let runbooks = std::fs::read_dir("docs/error-runbooks")
-        .map(|d| {
-            d.flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
-                .count()
-        })
-        .unwrap_or(0);
+    // Runbook files live in TWO directories. The previous version counted only
+    // `docs/error-runbooks` (48) while labelling the row "Runbook files on disk",
+    // which silently excluded the 42 in `docs/runbooks`. Count both, and say so.
+    let count_md = |dir: &str| {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let runbooks = count_md("docs/error-runbooks") + count_md("docs/runbooks");
+    // How many DISTINCT files the codes actually resolve to. Far fewer than the
+    // files on disk, because many codes share a runbook -- so "90 runbooks"
+    // never meant "90 destinations", and the page said it did.
+    let runbook_target_paths: Vec<String> = {
+        let mut t: Vec<&str> = error_code_src
+            .match_indices("\"docs/")
+            .filter_map(|(i, _)| {
+                let rest = &error_code_src[i + 1..];
+                let end = rest.find('"')?;
+                let s = &rest[..end];
+                s.ends_with(".md").then_some(s)
+            })
+            .collect();
+        t.sort_unstable();
+        t.dedup();
+        t.into_iter().map(str::to_string).collect()
+    };
+    let runbook_targets = runbook_target_paths.len();
+
+    // Do the runbooks a REACHABLE code points to still name files that exist?
+    //
+    // Scoped to reachable codes on purpose. Plenty of runbooks cover retired
+    // subsystems and legitimately name deleted modules in their retirement
+    // notes -- that is correct history, not rot. What matters is the runbook an
+    // operator is sent to at 3am by a code that can still fire.
+    //
+    // Reported, NOT gated. The citations are a mix of live pointers, dated
+    // history ("previously logged this"), and machine-read frontmatter, and
+    // telling them apart needs judgement. A blanket assertion would fail on
+    // correct retirement notes, and a guard whose first act is a false positive
+    // gets allowlisted within a week. So this row makes the number visible
+    // every run and leaves the cleanup a deliberate decision.
+    let (runbook_citations_total, runbook_citations_live) = {
+        let mut seen: Vec<String> = Vec::new();
+        let mut live = 0usize;
+        for rb in &runbook_target_paths {
+            let Ok(body) = std::fs::read_to_string(rb) else {
+                continue;
+            };
+            let mut rest = body.as_str();
+            while let Some(i) = rest.find("crates/") {
+                let after = &rest[i..];
+                let end = after
+                    .find(|c: char| {
+                        !(c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
+                    })
+                    .unwrap_or(after.len());
+                let cand = &after[..end];
+                if cand.ends_with(".rs") && !seen.iter().any(|s| s == cand) {
+                    seen.push(cand.to_string());
+                    if std::path::Path::new(cand).exists() {
+                        live += 1;
+                    }
+                }
+                rest = &after[end.max(1)..];
+            }
+        }
+        (seen.len(), live)
+    };
 
     let tf = std::fs::read_dir("deploy/aws/terraform")
         .map(|d| {
@@ -1362,6 +1444,16 @@ fn main() {
 
     let (total_codes, live_codes) = error_code_liveness(Path::new("."));
 
+    // A metric in the CloudWatch selector is SHIPPED — it costs money every
+    // session whether or not anything reads it. A name that appears in no
+    // alarm and no dashboard widget is being paid for and watched by nobody.
+    let shipped_names = metric_names_in("deploy/aws/cloudwatch-agent.json");
+    let in_terraform = metric_names_in_terraform();
+    let unwatched: Vec<&String> = shipped_names
+        .iter()
+        .filter(|m| !in_terraform.contains(*m))
+        .collect();
+
     let observability = vec![
         Row::new(
             "Dedup keys, all named constants",
@@ -1391,13 +1483,21 @@ fn main() {
         ),
         Row::new(
             "Written runbooks",
-            if runbooks > 0 {
-                Verdict::Guaranteed
-            } else {
-                Verdict::Broken
-            },
+            Verdict::Guaranteed,
             format!("{runbooks} files"),
-            "every code maps to a fix; error_code_rule_file_crossref fails without one",
+            "runbook_path() must resolve — every_runbook_path_exists_on_disk",
+        ),
+        Row::new(
+            "Distinct runbook destinations",
+            Verdict::Guaranteed,
+            format!("{runbook_targets}"),
+            "many codes share one runbook — files on disk is not destinations",
+        ),
+        Row::new(
+            "Distinct source paths cited in runbooks",
+            Verdict::Bounded,
+            format!("{runbook_citations_live} of {runbook_citations_total}"),
+            "in every runbook a code points to — the rest name deleted files",
         ),
         Row::new(
             "CloudWatch alarms",
@@ -1414,6 +1514,12 @@ fn main() {
             Verdict::Bounded,
             format!("{shipped} of {emitted}"),
             "a cost decision, not an oversight: all of them would trip the budget kill-switch",
+        ),
+        Row::new(
+            "Shipped but in no alarm or dashboard",
+            Verdict::Bounded,
+            format!("{} of {}", unwatched.len(), shipped_names.len()),
+            "billed every session, named in no alarm and no widget",
         ),
     ];
 
