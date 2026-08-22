@@ -245,11 +245,6 @@ pub fn install_health_reporter(health: tickvault_api::state::SharedHealthStatus)
     HEALTH_REPORTER.set(health).is_ok()
 }
 
-/// Whether a `/health` reporter has been installed.
-#[must_use]
-pub fn health_reporter_installed() -> bool {
-    HEALTH_REPORTER.get().is_some()
-}
 /// Publish the alive-socket count -- to the gauge AND to `/health`.
 ///
 /// Both edges of [`AliveConnectionGuard`] land here, so wiring the health push
@@ -5541,6 +5536,22 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
         report_unfolded_wal_frames(&params.wal_replay_live_feed, "duplicate_spawn");
         return None;
     }
+    // ARM the `/health` websocket row with the count as it stands right now
+    // (zero -- no socket has dialed yet).
+    //
+    // Without this the row only arms on the FIRST successful dial, so a lane
+    // that is enabled and dials NOTHING -- empty universe, every endpoint
+    // refused, credentials rejected -- reads `retired`: the same answer a box
+    // with the feature switched off gives. That is the worst permutation of
+    // the three, because it is the one where something is actually wrong.
+    // Armed here it reads `disconnected` with a count of 0, and
+    // `overall_status` degrades, which is the truth.
+    //
+    // Deliberately routed through `publish_alive_connections` rather than
+    // pushing 0 directly: one function owns the health push, so there is no
+    // second path to drift.
+    publish_alive_connections(ALIVE_CONNECTIONS.load(Ordering::SeqCst));
+
     // Installed BEFORE the bring-up task is spawned, so neither the silence
     // detector nor the 15:31 cross-verification can ever observe an empty cell
     // and fall back to its fail-open branch on a real trading day.

@@ -2233,7 +2233,18 @@ async fn async_main() -> Result<()> {
     // dead lane and a healthy one rendered identically on the endpoint whose
     // whole job is telling them apart. The API side needed no change — its
     // own doc calls the flag "arm-on-arrival"; this is the arrival.
-    tickvault_app::dhan_feed_stack::install_health_reporter(std::sync::Arc::clone(&health_status));
+    if !tickvault_app::dhan_feed_stack::install_health_reporter(std::sync::Arc::clone(
+        &health_status,
+    )) {
+        // First writer wins. Unreachable in production -- one boot, one call --
+        // so a hit here means a second boot path appeared and the row is
+        // reporting through a handle this boot does not own. Silent would make
+        // that indistinguishable from working.
+        warn!(
+            "the /health websocket reporter was already installed — this boot is NOT the \
+             one arming that row"
+        );
+    }
 
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {

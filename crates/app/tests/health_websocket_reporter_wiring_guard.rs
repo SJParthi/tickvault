@@ -107,3 +107,65 @@ fn health_no_longer_claims_a_retirement_that_was_reversed() {
          reversed on 2026-08-09; say why there is no count instead"
     );
 }
+
+/// The permutation that used to read as healthy-by-omission.
+///
+/// Three boots, three different truths, and before this wiring two of them
+/// rendered identically:
+///
+/// | boot | sockets | `/health` before | `/health` now |
+/// |---|---|---|---|
+/// | feature off | — | `retired` | `retired` |
+/// | on, none dialed | 0 | **`retired`** | `disconnected`, 0, degraded |
+/// | on, N dialed | N | `retired` | `connected`, N |
+///
+/// The middle row is the dangerous one: a lane that is enabled and dials
+/// NOTHING — empty universe, every endpoint refusing, credentials rejected —
+/// gave the same answer as a box with the feature switched off. It is the one
+/// case where something is actually wrong.
+#[test]
+fn the_row_arms_when_the_lane_commits_to_spawning_not_on_the_first_dial() {
+    let stack = read(&app_src("dhan_feed_stack.rs"));
+    let at = stack
+        .find("pub fn spawn_dhan_feed_stack(")
+        .expect("spawn entry must exist");
+    let body = &stack[at..];
+    let arm = body
+        .find("publish_alive_connections(ALIVE_CONNECTIONS.load(")
+        .expect(
+            "spawn_dhan_feed_stack must arm the /health row with the current \
+             count, or an enabled lane that dials nothing reads `retired` — \
+             the same answer as the feature being off",
+        );
+    let spawn = body
+        .find("tokio::spawn(run_dhan_feed_stack(")
+        .expect("bring-up spawn");
+    assert!(
+        arm < spawn,
+        "arm the row BEFORE the bring-up task, or the window between them \
+         reports `retired` on a lane that is already starting"
+    );
+}
+
+/// The arming must sit AFTER the gate, or a feature-off boot reports a live
+/// subsystem with zero connections instead of the truth.
+#[test]
+fn a_disabled_lane_never_arms_the_row() {
+    let stack = read(&app_src("dhan_feed_stack.rs"));
+    let at = stack
+        .find("pub fn spawn_dhan_feed_stack(")
+        .expect("spawn entry must exist");
+    let body = &stack[at..];
+    let gate_return = body
+        .find("return None;")
+        .expect("the disabled gate must return early");
+    let arm = body
+        .find("publish_alive_connections(ALIVE_CONNECTIONS.load(")
+        .expect("arming call");
+    assert!(
+        gate_return < arm,
+        "the disabled-gate early return must come BEFORE the arming, or a box \
+         with the feature off reports `disconnected` and degrades — claiming a \
+         fault where there is only a switch in the off position"
+    );
+}
