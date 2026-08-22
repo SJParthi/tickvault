@@ -834,6 +834,12 @@ fn main() {
             "every 5s; zero-alloc; 9.67ms/sweep measured at the 25,000x24 ceiling",
         ),
         Row::new(
+            "Fold CPU at the 25,000 ceiling",
+            Verdict::Bounded,
+            "2451 ns/tick",
+            "408k ticks/s on ONE core = 32.6x the 12,500/s open burst; FOLD ONLY, x86 not Graviton",
+        ),
+        Row::new(
             "O(1) SPACE for n instruments",
             Verdict::Impossible,
             "O(n)",
